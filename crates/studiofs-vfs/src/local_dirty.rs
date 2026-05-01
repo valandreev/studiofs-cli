@@ -3212,6 +3212,7 @@ impl StudioVfs {
             .snapshot_pending_local_dirty_inodes()
             .into_iter()
             .collect();
+        inos.extend(self.state.writer_stack.snapshot_dirty_inodes_by_bytes());
         {
             let dirty_attrs = self.state.namespace.dirty_attrs.lock();
             inos.extend(dirty_attrs.keys().copied());

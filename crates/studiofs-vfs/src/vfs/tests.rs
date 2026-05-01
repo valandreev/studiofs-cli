@@ -384,6 +384,73 @@ fn reopen_existing_test_vfs(tmp: &TempDir) -> (Arc<Runtime>, Arc<StudioVfs>, Arc
     (rt, vfs, meta)
 }
 
+fn assert_writer_state_only_boundary(
+    vfs: &Arc<StudioVfs>,
+    meta: &Arc<RedbMetaEngine>,
+    ino: Ino,
+    len: u64,
+    label: &str,
+) {
+    assert!(
+        vfs.state.writer_stack.has_dirty_writers(ino),
+        "{label}: accepted bytes should still be owned by active writer state"
+    );
+    let spans = meta
+        .lookup_regular_file_slices(ino, 0, len)
+        .expect("lookup local slice view");
+    assert!(
+        spans.iter().all(|span| span.payload.is_none()),
+        "{label}: writer-state-only bytes should not have materialized local payload slices: {spans:?}"
+    );
+    assert!(
+        vfs.pending_uploads_for_inode(ino).is_empty(),
+        "{label}: writer-state-only bytes should not be queued for remote upload"
+    );
+}
+
+fn assert_local_durable_not_remote_ready_boundary(
+    vfs: &Arc<StudioVfs>,
+    meta: &Arc<RedbMetaEngine>,
+    ino: Ino,
+    len: u64,
+    label: &str,
+) {
+    assert!(
+        !vfs.state.writer_stack.has_dirty_writers(ino),
+        "{label}: local durability boundary should drain active writer state"
+    );
+    let spans = meta
+        .lookup_regular_file_slices(ino, 0, len)
+        .expect("lookup local slice view");
+    assert!(
+        spans.iter().any(|span| span.payload.is_some()),
+        "{label}: local durability boundary should materialize payload-backed local slices: {spans:?}"
+    );
+    assert!(
+        !vfs.pending_uploads_for_inode(ino).is_empty(),
+        "{label}: locally durable unpublished bytes should remain queued for remote upload"
+    );
+
+    let attr = meta.get_attr(ino).expect("load locally durable attr");
+    assert_eq!(
+        attr.size, len,
+        "{label}: local metadata view should expose the accepted file size"
+    );
+    assert_eq!(
+        attr.committed_size, 0,
+        "{label}: local durability must not make a new file remotely visible"
+    );
+    assert!(
+        attr.content_epoch > attr.committed_content_epoch,
+        "{label}: local content epoch should stay ahead of the remote-visible epoch"
+    );
+    assert_ne!(
+        attr.upload_state,
+        MetaUploadState::Ready,
+        "{label}: local durability must not mark the inode remote-ready"
+    );
+}
+
 fn mark_all_overlay_objects_uploaded(
     vfs: &Arc<StudioVfs>,
     meta: &Arc<RedbMetaEngine>,
@@ -938,6 +1005,185 @@ fn flush_queues_runtime_upload_immediately_after_local_durability() {
     assert_eq!(runtime_pending.len(), 1);
     assert_eq!(runtime_pending[0].ino, ino);
     assert_eq!(runtime_pending[0].object_id, pending_uploads[0].1);
+}
+
+#[test]
+fn sfs312_write_is_visible_from_writer_state_before_local_durability_boundary() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs-312-writer-state-visible");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-312-writer-state-visible.bin", 0, 0, 0o644)
+            .expect("create writer-state file");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open writer-state handle");
+        let payload = b"writer-state-before-flush";
+
+        vfs.write_fh(fh, attr.ino, 0, payload)
+            .await
+            .expect("accept writer-state payload");
+
+        let read = vfs
+            .read(attr.ino, 0, payload.len() as u32)
+            .await
+            .expect("read writer-state payload");
+        assert_eq!(
+            read.as_ref(),
+            payload,
+            "same-mount reads should observe accepted bytes through active writer state"
+        );
+        assert_writer_state_only_boundary(
+            &vfs,
+            &meta,
+            attr.ino,
+            payload.len() as u64,
+            "write-before-flush",
+        );
+
+        vfs.release_fh(fh).await.expect("release writer handle");
+    });
+}
+
+#[test]
+fn sfs312_flush_materializes_local_slice_boundary_without_remote_visibility() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs-312-flush-boundary");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-312-flush-boundary.bin", 0, 0, 0o644)
+            .expect("create flush-boundary file");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open flush-boundary handle");
+        let payload = b"flush-local-not-remote";
+
+        vfs.write_fh(fh, attr.ino, 0, payload)
+            .await
+            .expect("accept flush-boundary payload");
+        assert_writer_state_only_boundary(
+            &vfs,
+            &meta,
+            attr.ino,
+            payload.len() as u64,
+            "flush-before-boundary",
+        );
+
+        let outcome = vfs
+            .flush_fh_with_outcome(fh)
+            .await
+            .expect("flush handle boundary");
+        assert!(
+            outcome.flushed_local_dirty_state,
+            "flush should report materializing the accepted local dirty state"
+        );
+        assert_local_durable_not_remote_ready_boundary(
+            &vfs,
+            &meta,
+            attr.ino,
+            payload.len() as u64,
+            "flush-after-boundary",
+        );
+
+        vfs.release_fh(fh).await.expect("release flushed handle");
+    });
+}
+
+#[test]
+fn sfs312_fsync_persists_local_state_without_remote_visibility() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs-312-fsync-boundary");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-312-fsync-boundary.bin", 0, 0, 0o644)
+            .expect("create fsync-boundary file");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open fsync-boundary handle");
+        let payload = b"fsync-local-not-remote";
+
+        vfs.write_fh(fh, attr.ino, 0, payload)
+            .await
+            .expect("accept fsync-boundary payload");
+        let outcome = vfs
+            .fsync_with_outcome(attr.ino, false)
+            .await
+            .expect("fsync local boundary");
+        assert!(
+            outcome.flushed_file_data,
+            "fsync should report persisting caller-requested local file data"
+        );
+        assert_local_durable_not_remote_ready_boundary(
+            &vfs,
+            &meta,
+            attr.ino,
+            payload.len() as u64,
+            "fsync-after-boundary",
+        );
+
+        let release = vfs
+            .release_fh_with_outcome(fh)
+            .await
+            .expect("release fsynced handle");
+        assert!(
+            release.closed_last_handle,
+            "single handle release should still close the last local writer handle"
+        );
+        assert!(
+            !release.flushed_local_dirty_state,
+            "release after fsync should not report another local dirty drain"
+        );
+    });
+}
+
+#[test]
+fn sfs312_last_handle_release_drains_local_durability_boundary() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs-312-release-boundary");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-312-release-boundary.bin", 0, 0, 0o644)
+            .expect("create release-boundary file");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open release-boundary handle");
+        let payload = b"release-local-not-remote";
+
+        vfs.write_fh(fh, attr.ino, 0, payload)
+            .await
+            .expect("accept release-boundary payload");
+        assert_writer_state_only_boundary(
+            &vfs,
+            &meta,
+            attr.ino,
+            payload.len() as u64,
+            "release-before-boundary",
+        );
+
+        let outcome = vfs
+            .release_fh_with_outcome(fh)
+            .await
+            .expect("release last handle boundary");
+        assert!(
+            outcome.closed_last_handle,
+            "the only handle should own the last-handle release boundary"
+        );
+        assert!(
+            outcome.flushed_local_dirty_state,
+            "last-handle release should report draining accepted local dirty state"
+        );
+        assert_local_durable_not_remote_ready_boundary(
+            &vfs,
+            &meta,
+            attr.ino,
+            payload.len() as u64,
+            "release-after-boundary",
+        );
+    });
 }
 
 #[test]
@@ -2041,6 +2287,84 @@ fn zeroio_snapshot_loads_last_graceful_shutdown_after_restart() {
     assert_eq!(shutdown.metadata_flush_outcome, "success");
     assert!(shutdown.local_payload_sync_ok);
     assert!(shutdown.recoverable_on_restart);
+}
+
+#[test]
+fn local_first_shutdown_reports_and_recovers_memory_only_writer_state() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "sfs-312-shutdown-writer-state");
+    let _guard = rt.enter();
+    let payload = b"sfs-312-memory-only-before-shutdown";
+
+    let ino = rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-312-shutdown-writer-state.bin", 0, 0, 0o644)
+            .expect("create shutdown writer-state file");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open writer-state handle");
+
+        vfs.write_fh_with_local_sync_policy(
+            fh,
+            attr.ino,
+            0,
+            payload,
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .expect("accept writer-state bytes");
+        assert!(
+            vfs.state.writer_stack.has_dirty_writers(attr.ino),
+            "setup should leave accepted bytes in memory-only writer state before shutdown"
+        );
+
+        let read = vfs
+            .read(attr.ino, 0, payload.len() as u32)
+            .await
+            .expect("read accepted writer-state bytes before shutdown");
+        assert_eq!(
+            read.as_ref(),
+            payload,
+            "same-mount reads should observe accepted writer-state bytes before a durability boundary"
+        );
+
+        vfs.shutdown(std::time::Duration::ZERO).await;
+        attr.ino
+    });
+    drop(vfs);
+    drop(meta);
+    drop(rt);
+
+    let (reopen_rt, reopened, _reopened_meta) = reopen_existing_test_vfs(&tmp);
+    let _reopen_guard = reopen_rt.enter();
+    let snapshot = reopened.zeroio_runtime_snapshot();
+    let shutdown = snapshot
+        .last_graceful_shutdown
+        .expect("shutdown diagnostics should survive metadata/cache reopen");
+    assert!(
+        shutdown.accepted_local_dirty_bytes_before >= payload.len() as u64,
+        "shutdown should report memory-only accepted bytes before the local durability drain"
+    );
+    assert_eq!(
+        shutdown.accepted_local_dirty_bytes_after, 0,
+        "shutdown should drain accepted bytes across the local durability boundary"
+    );
+    assert!(
+        shutdown.recoverable_on_restart,
+        "shutdown with accepted writer-state bytes should report a recoverable local view"
+    );
+
+    reopen_rt.block_on(async {
+        let read = reopened
+            .read(ino, 0, payload.len() as u32)
+            .await
+            .expect("read recovered local writer-state bytes after reopen");
+        assert_eq!(
+            read.as_ref(),
+            payload,
+            "metadata/cache reopen should recover bytes that graceful shutdown moved across the local durability boundary"
+        );
+    });
 }
 
 #[test]

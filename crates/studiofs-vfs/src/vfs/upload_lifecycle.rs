@@ -299,7 +299,7 @@ impl StudioVfs {
 
         // Phase 1: flush pending local dirty state inline into the local backend
         // + metadata so local durability is established before shutdown.
-        let dirty_before = self.total_pending_local_dirty_bytes();
+        let dirty_before = self.total_pending_write_buffer_bytes();
         info!(
             dirty_bytes = dirty_before,
             pending_uploads = self.pending_uploads_snapshot().len(),
@@ -378,7 +378,7 @@ impl StudioVfs {
         // redb::Database::drop() to run cleanly.
         self.sync_meta().prepare_for_close();
         let local_payload_sync_ok = self.persist_cache().await;
-        let dirty_after = self.total_pending_local_dirty_bytes();
+        let dirty_after = self.total_pending_write_buffer_bytes();
         let pending_uploads_after = self.pending_uploads_snapshot().len();
         let recoverable_on_restart = dirty_after == 0 && local_payload_sync_ok;
         let shutdown_snapshot = VfsZeroIoShutdownSnapshot {
