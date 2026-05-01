@@ -29,6 +29,7 @@ pub(super) enum PendingOverlayBlockSource {
 #[derive(Debug, Clone, Default)]
 pub(super) struct PendingUploadCatalog {
     by_block: HashMap<(Ino, u64), Vec<PendingUpload>>,
+    by_inode: HashMap<Ino, Vec<PendingUpload>>,
 }
 
 impl PendingUploadCatalog {
@@ -41,6 +42,7 @@ impl PendingUploadCatalog {
     }
 
     fn insert(&mut self, op: PendingUpload) {
+        self.by_inode.entry(op.ino).or_default().push(op.clone());
         self.by_block
             .entry((op.ino, op.offset))
             .or_default()
@@ -48,22 +50,18 @@ impl PendingUploadCatalog {
     }
 
     pub(super) fn has_inode(&self, ino: Ino) -> bool {
-        self.by_block.keys().any(|(candidate, _)| *candidate == ino)
+        self.by_inode.contains_key(&ino)
     }
 
     pub(super) fn ops(&self) -> Vec<PendingUpload> {
-        self.by_block
+        self.by_inode
             .values()
             .flat_map(|ops| ops.iter().cloned())
             .collect()
     }
 
-    pub(super) fn ops_for_inode(&self, ino: Ino) -> Vec<PendingUpload> {
-        self.by_block
-            .iter()
-            .filter(|((candidate, _), _)| *candidate == ino)
-            .flat_map(|(_, ops)| ops.iter().cloned())
-            .collect()
+    pub(super) fn ops_for_inode(&self, ino: Ino) -> &[PendingUpload] {
+        self.by_inode.get(&ino).map(Vec::as_slice).unwrap_or(&[])
     }
 
     pub(super) fn latest_extent_record(

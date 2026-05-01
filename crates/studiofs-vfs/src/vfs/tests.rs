@@ -613,7 +613,7 @@ fn startup_replay_cancels_ready_inode_stale_pending_upload() {
         "test setup should install one stale runtime upload"
     );
 
-    vfs.replay_dirty_uploads_from_local_backend(&pending_uploads, &[attr]);
+    vfs.replay_dirty_uploads_from_local_backend(&pending_uploads, std::slice::from_ref(&attr));
 
     assert!(
         vfs.live_extent_records_for_inode(ino).is_empty(),
@@ -626,6 +626,16 @@ fn startup_replay_cancels_ready_inode_stale_pending_upload() {
     assert!(
         !vfs.cached_store().is_pinned(stale_object_id),
         "canceling the stale pending upload should release its runtime pin"
+    );
+
+    vfs.replay_dirty_uploads_from_local_backend(&pending_uploads, std::slice::from_ref(&attr));
+    assert!(
+        vfs.pending_uploads_for_inode(ino).is_empty(),
+        "replaying the same stale pending upload cancellation should remain idempotent"
+    );
+    assert!(
+        !vfs.cached_store().is_pinned(stale_object_id),
+        "replaying stale cancellation must not restore the canceled runtime pin"
     );
 }
 

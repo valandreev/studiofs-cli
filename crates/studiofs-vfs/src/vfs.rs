@@ -2933,9 +2933,11 @@ impl<'a> StartupReplayCoordinator<'a> {
 
     fn process_attr(&mut self, attr: &InodeAttr) {
         let ino = attr.ino;
-        self.seen_replay_inodes.insert(ino);
         let needs_finalization = StudioVfs::needs_epoch_finalization(attr);
         let has_pending_uploads = self.pending_catalog.has_inode(ino);
+        if has_pending_uploads {
+            self.seen_replay_inodes.insert(ino);
+        }
         if !self.needs_scan(attr) && !has_pending_uploads {
             return;
         }
@@ -2979,7 +2981,7 @@ impl<'a> StartupReplayCoordinator<'a> {
             .collect();
 
         for op in self.pending_catalog.ops_for_inode(attr.ino) {
-            let key = pending_upload_key(&op);
+            let key = pending_upload_key(op);
             let is_live = attr.upload_state != MetaUploadState::Ready
                 && op.content_epoch == attr.content_epoch
                 && current_graph_objects.contains(&(op.offset, op.object_id));
@@ -2987,7 +2989,7 @@ impl<'a> StartupReplayCoordinator<'a> {
                 self.valid_pending_uploads.insert(key);
                 self.stale_pending_uploads.remove(&key);
             } else if !self.valid_pending_uploads.contains(&key) {
-                self.stale_pending_uploads.insert(key, op);
+                self.stale_pending_uploads.insert(key, op.clone());
             }
         }
     }
