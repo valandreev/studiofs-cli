@@ -365,3 +365,45 @@ fn contract_core_harness_reports_reachable_pending_deletion_conflict() {
         "unexpected diagnostics: {err}"
     );
 }
+
+#[test]
+fn contract_core_harness_accepts_open_unlink_pending_overlay_cleanup() {
+    let fixture = ContractCoreFixture::new("redb-contract-open-unlink-pending-cleanup")
+        .expect("create fixture");
+    let meta = fixture.meta();
+
+    let file = meta
+        .create_file(ROOT_INO, b"open-unlink-overwrite.bin", 1000, 1000, 0o644)
+        .expect("create file");
+    let mut attr = meta.get_attr(file.ino).expect("load file attr");
+    attr.size = 4096;
+    attr.content_epoch = 1;
+    meta.set_attr(&attr).expect("set published attr");
+    meta.stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(90_101, 4096))
+        .expect("stage published object");
+    assert!(
+        meta.mark_regular_file_overlay_object_uploaded_if_matches(file.ino, 1, 90_101)
+            .expect("mark published object uploaded")
+    );
+    assert!(
+        meta.publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
+            .expect("publish base object")
+    );
+
+    let mut attr = meta.get_attr(file.ino).expect("reload file attr");
+    attr.content_epoch = 2;
+    meta.set_attr(&attr).expect("set local overlay attr");
+    meta.stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(90_102, 4096))
+        .expect("stage replacement object");
+    assert!(
+        meta.mark_regular_file_overlay_object_uploaded_if_matches(file.ino, 2, 90_102)
+            .expect("mark replacement object uploaded")
+    );
+
+    meta.unlink_open_handle(ROOT_INO, b"open-unlink-overwrite.bin")
+        .expect("open-unlink file");
+
+    fixture
+        .assert_invariants("open-unlink pending overlay cleanup")
+        .expect("open-unlink cleanup state should satisfy contract invariants");
+}

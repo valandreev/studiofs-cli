@@ -181,7 +181,6 @@ regressions:
   - `local_first_shutdown_reports_and_recovers_memory_only_writer_state`
 
 - Publication and visibility
-  - `redb_partial_update_does_not_expose_new_blocks_before_publish`
   - `sfs314_publish_requires_all_overlay_payloads_uploaded`
   - `sfs314_uploaded_payload_does_not_replace_peer_visible_base_before_publish`
   - `sfs314_partial_publish_preserves_base_tail_and_committed_size`
@@ -223,7 +222,7 @@ binary prefix where applicable.
 ```bash
 cargo test -p studiofs-meta test_contract_core_slice_graph_resolves_logical_byte_view_after_reopen -- --nocapture
 cargo test -p studiofs-meta test_resolve_chunk_slice_spans_overlay_over_base_with_hole -- --nocapture
-cargo test -p studiofs-meta redb_partial_update_does_not_expose_new_blocks_before_publish -- --nocapture
+cargo test -p studiofs-meta sfs314_partial_publish_preserves_base_tail_and_committed_size -- --nocapture
 cargo test -p studiofs-vfs --test vfs_test offline_s3_does_not_break_local_read_after_write -- --nocapture
 cargo test -p studiofs-vfs --test vfs_test background_epoch_finalizer_keeps_non_publish_ready_epoch_local_after_restart -- --ignored --nocapture --test-threads=1
 ```
@@ -294,9 +293,21 @@ strategy document covering hosted vs self-hosted responsibilities.
 
 To ensure regression names in this document do not drift from code:
 
+Windows:
+
 ```powershell
 pwsh -File tools/check-doc-test-names.ps1
 ```
+
+Linux / macOS:
+
+```bash
+sh tools/check-doc-test-names.sh
+```
+
+Both launchers call the same portable checker in
+`tools/check-doc-test-names.py`; the PowerShell launcher delegates to the shell
+launcher when it is run under PowerShell Core on Linux or macOS.
 
 PowerShell one-liner with `.env` + proxy cleanup (recommended for infra tests):
 

@@ -8,7 +8,7 @@ use crate::schema::{
 };
 use crate::{
     MetaError, MetaFormat, MetaFsOps, MetaInodes, MetaNamespace, MetaPayloadObjects, MetaRecovery,
-    MetaResult, RedbMetaEngine,
+    MetaResult, MetaSnapshots, RedbMetaEngine,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -540,24 +540,6 @@ impl ContractCoreFixture {
             .deferred_deletes
             .sort_by_key(|record| record.ino);
 
-        let mut referenced_object_ids: Vec<u64> =
-            meta.get_referenced_object_ids()?.into_iter().collect();
-        referenced_object_ids.sort_unstable();
-
-        let mut pending_deletions = meta.get_pending_deletions()?;
-        pending_deletions.sort_unstable_by_key(|(object_id, _timestamp)| *object_id);
-
-        for (object_id, timestamp) in &pending_deletions {
-            if referenced_object_ids.binary_search(object_id).is_ok() {
-                diagnostics.push_violation(format!(
-                    "object_id {object_id} is marked for pending deletion (timestamp={timestamp}) but is still reachable from metadata"
-                ));
-            }
-        }
-
-        diagnostics.referenced_object_ids = referenced_object_ids;
-        diagnostics.pending_deletions = pending_deletions;
-
         let lifecycles = meta.list_inode_lifecycles()?;
         let lifecycle_by_ino: BTreeMap<u64, InodeLifecycleRecord> = lifecycles
             .iter()
@@ -568,6 +550,81 @@ impl ContractCoreFixture {
             .map(ContractLifecycleSnapshot::from)
             .collect();
         diagnostics.lifecycles.sort_by_key(|record| record.ino);
+
+        let mut snapshot_pinned_object_ids = BTreeSet::new();
+        for snapshot in meta.list_snapshots()? {
+            snapshot_pinned_object_ids.extend(snapshot.pinned_object_ids);
+        }
+
+        let mut object_graph_ref_inos = BTreeMap::<u64, BTreeSet<u64>>::new();
+        for attr in attr_by_ino.values() {
+            if attr.kind == FileType::RegularFile {
+                match meta.get_regular_file_graph_object_usage(attr.ino) {
+                    Ok(mut object_usage) => {
+                        object_usage.sort_unstable();
+                        for (object_id, _bytes) in &object_usage {
+                            object_graph_ref_inos
+                                .entry(*object_id)
+                                .or_default()
+                                .insert(attr.ino);
+                        }
+                        diagnostics.object_graphs.push(ContractObjectGraphSnapshot {
+                            ino: attr.ino,
+                            object_usage,
+                        });
+                    }
+                    Err(err) => diagnostics.push_violation(format!(
+                        "failed to read object graph for inode {}: {err}",
+                        attr.ino
+                    )),
+                }
+            }
+        }
+        diagnostics.object_graphs.sort_by_key(|graph| graph.ino);
+
+        let mut deferred_cleanup_object_owners = BTreeMap::<u64, BTreeSet<u64>>::new();
+        for lifecycle in lifecycle_by_ino.values() {
+            let is_open_unlink_cleanup = lifecycle.state
+                == InodeLifecycleState::DeletedBeforePublish
+                && deferred_delete_by_ino.contains_key(&lifecycle.ino)
+                && matches!(
+                    attr_by_ino.get(&lifecycle.ino),
+                    Some(attr) if attr.kind == FileType::RegularFile && attr.nlink == 0
+                );
+            if is_open_unlink_cleanup {
+                for object_id in &lifecycle.deferred_cleanup_object_ids {
+                    deferred_cleanup_object_owners
+                        .entry(*object_id)
+                        .or_default()
+                        .insert(lifecycle.ino);
+                }
+            }
+        }
+
+        let mut referenced_object_ids: Vec<u64> =
+            meta.get_referenced_object_ids()?.into_iter().collect();
+        referenced_object_ids.sort_unstable();
+
+        let mut pending_deletions = meta.get_pending_deletions()?;
+        pending_deletions.sort_unstable_by_key(|(object_id, _timestamp)| *object_id);
+
+        for (object_id, timestamp) in &pending_deletions {
+            if referenced_object_ids.binary_search(object_id).is_ok()
+                && !Self::pending_deletion_ref_is_deferred_cleanup(
+                    *object_id,
+                    &object_graph_ref_inos,
+                    &deferred_cleanup_object_owners,
+                    &snapshot_pinned_object_ids,
+                )
+            {
+                diagnostics.push_violation(format!(
+                    "object_id {object_id} is marked for pending deletion (timestamp={timestamp}) but is still reachable from metadata"
+                ));
+            }
+        }
+
+        diagnostics.referenced_object_ids = referenced_object_ids;
+        diagnostics.pending_deletions = pending_deletions;
 
         let mut visited_dirs = BTreeSet::new();
         let mut reachable_inos = BTreeSet::from([ROOT_INO]);
@@ -621,25 +678,8 @@ impl ContractCoreFixture {
                     ));
                 }
             }
-
-            if attr.kind == FileType::RegularFile {
-                match meta.get_regular_file_graph_object_usage(attr.ino) {
-                    Ok(mut object_usage) => {
-                        object_usage.sort_unstable();
-                        diagnostics.object_graphs.push(ContractObjectGraphSnapshot {
-                            ino: attr.ino,
-                            object_usage,
-                        });
-                    }
-                    Err(err) => diagnostics.push_violation(format!(
-                        "failed to read object graph for inode {}: {err}",
-                        attr.ino
-                    )),
-                }
-            }
         }
 
-        diagnostics.object_graphs.sort_by_key(|graph| graph.ino);
         for lifecycle in lifecycle_by_ino.values() {
             match attr_by_ino.get(&lifecycle.ino) {
                 Some(attr) if attr.kind == FileType::RegularFile => {}
@@ -674,6 +714,24 @@ impl ContractCoreFixture {
             }
         }
         Ok(())
+    }
+
+    fn pending_deletion_ref_is_deferred_cleanup(
+        object_id: u64,
+        object_graph_ref_inos: &BTreeMap<u64, BTreeSet<u64>>,
+        deferred_cleanup_object_owners: &BTreeMap<u64, BTreeSet<u64>>,
+        snapshot_pinned_object_ids: &BTreeSet<u64>,
+    ) -> bool {
+        if snapshot_pinned_object_ids.contains(&object_id) {
+            return false;
+        }
+        let Some(ref_inos) = object_graph_ref_inos.get(&object_id) else {
+            return false;
+        };
+        let Some(cleanup_owners) = deferred_cleanup_object_owners.get(&object_id) else {
+            return false;
+        };
+        !ref_inos.is_empty() && ref_inos.iter().all(|ino| cleanup_owners.contains(ino))
     }
 
     fn collect_tree_iterative(
