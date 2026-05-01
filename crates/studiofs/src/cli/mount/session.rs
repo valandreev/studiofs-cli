@@ -1826,9 +1826,9 @@ mod tests {
     }
 
     fn resolve_default_cache_for_client_root(root: &Path, name: &str) -> PathBuf {
-        let _env = utils::ScopedClientRootEnv::set(root);
+        let root = std::path::absolute(root).expect("absolute client root");
         let temp = tempfile::tempdir().expect("tempdir");
-        let meta_dir = utils::get_default_meta_dir(name).expect("metadata dir");
+        let meta_dir = root.join("meta").join(name);
         std::fs::create_dir_all(&meta_dir).expect("create meta dir");
         let mount_point = startup_mount_point(&temp);
         let plan = MountPlan::resolve(MountRequest {

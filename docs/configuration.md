@@ -21,10 +21,10 @@ CLI flags are omitted.
 Local per-client runtime state lives under the StudioFS client root. By default
 that root is `~/.studiofs`. Set `STUDIOFS_CLIENT_ROOT=<path>` to isolate a
 client sandbox without changing remote volume identity, PostgreSQL metadata, or
-S3 object layout. The root contains local metadata databases, mount records,
-daemon logs, investigation artifacts, and the default cache path
-`<client-root>/meta/<name>/cache` when neither `--cache-dir` nor persisted
-`cache_dir` is set.
+S3 object layout. Relative values are resolved to absolute paths when the client
+starts. The root contains local metadata databases, mount records, daemon logs,
+investigation artifacts, and the default cache path `<client-root>/meta/<name>/cache`
+when neither `--cache-dir` nor persisted `cache_dir` is set.
 
 The operator-facing mount surface intentionally stays small. Regular operators
 should primarily use:

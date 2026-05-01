@@ -1868,6 +1868,82 @@ fn epoch_finalizer_publishes_slice_graph_zero_length_epoch() {
 }
 
 #[test]
+fn epoch_finalizer_invalidates_kernel_when_published_dirty_attr_was_visible() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "graph-finalizer-dirty-attr-invalidate");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"slice-graph-finalizer-dirty-attr.bin", 0, 0, 0o644)
+            .expect("create test file");
+        let payload = b"slice-graph-finalization";
+        vfs.write(attr.ino, 0, payload)
+            .await
+            .expect("write test payload");
+        vfs.flush(attr.ino)
+            .await
+            .expect("materialize unpublished slice payloads before publish setup");
+
+        let (published_epoch, published_blocks) =
+            mark_all_overlay_objects_uploaded(&vfs, &meta, attr.ino);
+        publish_current_file_graph(&meta, attr.ino, published_epoch, &published_blocks);
+
+        let mut staged_attr = meta.get_attr(attr.ino).expect("load published attr");
+        staged_attr.size = 0;
+        staged_attr.content_epoch = staged_attr.content_epoch.saturating_add(1);
+        staged_attr.upload_state = MetaUploadState::Updating;
+        meta.set_attr(&staged_attr)
+            .expect("stage slice-graph zero-length epoch");
+        meta.remove_regular_file_graph(attr.ino)
+            .expect("remove unpublished slice graph for zero-length truncate");
+
+        let unpublished_attr = meta.get_attr(attr.ino).expect("load unpublished attr");
+        vfs.state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .insert(attr.ino, unpublished_attr.clone());
+        assert!(
+            !vfs.state
+                .namespace
+                .attr_read_cache
+                .lock()
+                .contains(attr.ino),
+            "regression setup should exercise the dirty-attr resolver path without attr cache"
+        );
+
+        let invalidator = Arc::new(RecordingKernelInvalidator::default());
+        vfs.set_kernel_invalidator(invalidator.clone());
+
+        let status = super::commit::CommitCoordinator::finalize_inode_epoch(
+            &vfs,
+            attr.ino,
+            unpublished_attr.content_epoch,
+        )
+        .await
+        .expect("finalize zero-length dirty-attr epoch");
+        assert!(
+            matches!(status, super::commit::EpochFinalizeStatus::Published),
+            "slice-graph zero-length epoch should still publish"
+        );
+        assert!(
+            !vfs.state
+                .namespace
+                .dirty_attrs
+                .lock()
+                .contains_key(&attr.ino),
+            "finalization should clear the matching dirty attr"
+        );
+        assert_eq!(
+            invalidator.snapshot(),
+            vec![attr.ino],
+            "a dirty attr visible to getattr must invalidate the kernel after publication"
+        );
+    });
+}
+
+#[test]
 fn size_change_after_unpublished_flush_advances_content_epoch() {
     let tmp = TempDir::new().expect("tempdir");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "setattr-size-advances-epoch");

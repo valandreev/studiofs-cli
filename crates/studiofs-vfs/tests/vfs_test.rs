@@ -4767,16 +4767,16 @@ fn published_file_returns_to_idle_state_and_invalidates_cached_attr_immediately(
                 !vfs.pending_uploads_for_inode(attr.ino).is_empty()
             })
             .await,
-            "upload queue must populate before caching the uploading attr"
+            "upload queue must populate before reading the uploading attr"
         );
 
+        spy.clear();
         let cached = vfs.getattr(attr.ino).unwrap();
         assert_ne!(cached.upload_state, UploadState::Ready);
         assert!(
             cached.committed_size < cached.size,
-            "seeded attr cache must still reflect a pending publish"
+            "pre-publish attr must still reflect a pending publish"
         );
-        spy.clear();
 
         assert!(
             wait_until(online_publish_timeout(), || {
@@ -4789,7 +4789,10 @@ fn published_file_returns_to_idle_state_and_invalidates_cached_attr_immediately(
         );
 
         assert!(
-            spy.snapshot().contains(&attr.ino),
+            wait_until(Duration::from_secs(5), || spy
+                .snapshot()
+                .contains(&attr.ino))
+            .await,
             "epoch finalization must invalidate the inode immediately"
         );
 

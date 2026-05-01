@@ -1,6 +1,7 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -8,73 +9,56 @@ use uuid::Uuid;
 pub(crate) const CLIENT_ROOT_ENV: &str = "STUDIOFS_CLIENT_ROOT";
 
 pub(crate) fn get_client_root() -> Result<PathBuf> {
-    if let Some(root) = std::env::var_os(CLIENT_ROOT_ENV) {
-        let root = PathBuf::from(root);
-        if root.as_os_str().is_empty() {
-            return Err(anyhow!("{CLIENT_ROOT_ENV} must not be empty when set"));
-        }
-        return Ok(root);
+    get_client_root_with(|key| std::env::var_os(key))
+}
+
+fn get_client_root_with<F>(read_var: F) -> Result<PathBuf>
+where
+    F: FnOnce(&str) -> Option<OsString>,
+{
+    if let Some(root) = read_var(CLIENT_ROOT_ENV) {
+        return normalize_client_root(PathBuf::from(root));
     }
 
     let home = home::home_dir().ok_or_else(|| anyhow!("Could not find home directory"))?;
     Ok(home.join(".studiofs"))
 }
 
-#[cfg(test)]
-fn client_root_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| std::sync::Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-#[cfg(test)]
-pub(crate) struct ScopedClientRootEnv {
-    old: Option<std::ffi::OsString>,
-    _lock: std::sync::MutexGuard<'static, ()>,
-}
-
-#[cfg(test)]
-impl ScopedClientRootEnv {
-    pub(crate) fn set(value: impl AsRef<std::ffi::OsStr>) -> Self {
-        let lock = client_root_env_test_lock();
-        let old = std::env::var_os(CLIENT_ROOT_ENV);
-        // SAFETY: This guard holds a process-wide lock while mutating and restoring
-        // STUDIOFS_CLIENT_ROOT, and the guarded tests do not spawn other threads.
-        unsafe {
-            std::env::set_var(CLIENT_ROOT_ENV, value);
-        }
-        Self { old, _lock: lock }
+fn normalize_client_root(root: PathBuf) -> Result<PathBuf> {
+    if root.as_os_str().is_empty() {
+        return Err(anyhow!("{CLIENT_ROOT_ENV} must not be empty when set"));
     }
 
-    pub(crate) fn unset() -> Self {
-        let lock = client_root_env_test_lock();
-        let old = std::env::var_os(CLIENT_ROOT_ENV);
-        // SAFETY: This guard holds a process-wide lock while mutating and restoring
-        // STUDIOFS_CLIENT_ROOT, and the guarded tests do not spawn other threads.
-        unsafe {
-            std::env::remove_var(CLIENT_ROOT_ENV);
-        }
-        Self { old, _lock: lock }
-    }
+    std::path::absolute(&root)
+        .with_context(|| format!("resolve {CLIENT_ROOT_ENV} '{}'", root.display()))
 }
 
-#[cfg(test)]
-impl Drop for ScopedClientRootEnv {
-    fn drop(&mut self) {
-        // SAFETY: The guard holds the same process-wide lock for its full lifetime,
-        // so restoration cannot race with another guarded test in this crate.
-        unsafe {
-            match &self.old {
-                Some(value) => std::env::set_var(CLIENT_ROOT_ENV, value),
-                None => std::env::remove_var(CLIENT_ROOT_ENV),
-            }
-        }
-    }
+fn default_meta_dir_in_client_root(client_root: &Path, volume_name: &str) -> PathBuf {
+    client_root.join("meta").join(volume_name)
+}
+
+fn mounts_dir_in_client_root(client_root: &Path) -> PathBuf {
+    client_root.join("mounts")
+}
+
+fn logs_dir_in_client_root(client_root: &Path) -> PathBuf {
+    client_root.join("logs")
+}
+
+fn mount_record_path_in_mounts_dir(
+    mounts_dir: &Path,
+    mount_point: &str,
+    extension: &str,
+) -> PathBuf {
+    let sanitized = sanitize_mount_point(&normalize_mount_point(mount_point));
+    mounts_dir.join(format!("{sanitized}.{extension}"))
 }
 
 pub fn get_default_meta_dir(volume_name: &str) -> Result<PathBuf> {
-    Ok(get_client_root()?.join("meta").join(volume_name))
+    Ok(default_meta_dir_in_client_root(
+        &get_client_root()?,
+        volume_name,
+    ))
 }
 
 // ─── Mount / PID management ─────────────────────────────────────────────────
@@ -106,14 +90,14 @@ pub fn normalize_mount_point(mp: &str) -> String {
 
 /// `<client-root>/mounts/`, defaulting to `~/.studiofs/mounts/`.
 pub fn get_mounts_dir() -> Result<PathBuf> {
-    let dir = get_client_root()?.join("mounts");
+    let dir = mounts_dir_in_client_root(&get_client_root()?);
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
 
 /// `<client-root>/logs/`, defaulting to `~/.studiofs/logs/`.
 pub fn get_logs_dir() -> Result<PathBuf> {
-    let dir = get_client_root()?.join("logs");
+    let dir = logs_dir_in_client_root(&get_client_root()?);
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
@@ -175,15 +159,13 @@ impl Drop for MountLockGuard {
 /// Full path to the JSON mount record for a given mount point.
 pub fn pid_file_path(mount_point: &str) -> Result<PathBuf> {
     let dir = get_mounts_dir()?;
-    let sanitized = sanitize_mount_point(&normalize_mount_point(mount_point));
-    Ok(dir.join(format!("{sanitized}.json")))
+    Ok(mount_record_path_in_mounts_dir(&dir, mount_point, "json"))
 }
 
 /// Full path to the lifecycle lock file for a given mount point.
 pub(crate) fn mount_lock_file_path(mount_point: &str) -> Result<PathBuf> {
     let dir = get_mounts_dir()?;
-    let sanitized = sanitize_mount_point(&normalize_mount_point(mount_point));
-    Ok(dir.join(format!("{sanitized}.lock")))
+    Ok(mount_record_path_in_mounts_dir(&dir, mount_point, "lock"))
 }
 
 fn open_mount_lock_file(mount_point: &str) -> Result<File> {
@@ -441,13 +423,14 @@ pub fn format_throughput(bytes_per_sec: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
 
     #[test]
     fn client_root_absent_preserves_home_studiofs_metadata_layout() {
-        let _env = ScopedClientRootEnv::unset();
         let home = home::home_dir().expect("home dir");
 
-        let meta_dir = get_default_meta_dir("projectfs").expect("default metadata dir");
+        let root = get_client_root_with(|_| None).expect("default client root");
+        let meta_dir = default_meta_dir_in_client_root(&root, "projectfs");
 
         assert_eq!(
             meta_dir,
@@ -458,30 +441,43 @@ mod tests {
     #[test]
     fn client_root_env_scopes_metadata_mounts_and_logs() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path().join("client-a");
-        let _env = ScopedClientRootEnv::set(&root);
+        let configured_root = temp.path().join("client-a");
+        let root = get_client_root_with(|_| Some(configured_root.clone().into_os_string()))
+            .expect("client root");
+        let mounts_dir = mounts_dir_in_client_root(&root);
 
         assert_eq!(
-            get_default_meta_dir("projectfs").expect("metadata dir"),
+            default_meta_dir_in_client_root(&root, "projectfs"),
             root.join("meta").join("projectfs")
         );
-        assert_eq!(get_mounts_dir().expect("mounts dir"), root.join("mounts"));
-        assert_eq!(get_logs_dir().expect("logs dir"), root.join("logs"));
+        assert_eq!(mounts_dir, root.join("mounts"));
+        assert_eq!(logs_dir_in_client_root(&root), root.join("logs"));
         assert_eq!(
-            pid_file_path("Z:").expect("pid path"),
+            mount_record_path_in_mounts_dir(&mounts_dir, "Z:", "json"),
             root.join("mounts").join("z.json")
         );
         assert_eq!(
-            mount_lock_file_path("Z:").expect("lock path"),
+            mount_record_path_in_mounts_dir(&mounts_dir, "Z:", "lock"),
             root.join("mounts").join("z.lock")
         );
     }
 
     #[test]
-    fn client_root_env_rejects_empty_value() {
-        let _env = ScopedClientRootEnv::set("");
+    fn client_root_env_normalizes_relative_value_to_absolute_path() {
+        let root = get_client_root_with(|_| Some(OsString::from("relative-client-root")))
+            .expect("client root");
 
-        let error = get_default_meta_dir("projectfs").expect_err("empty client root rejected");
+        assert!(root.is_absolute());
+        assert_eq!(
+            root,
+            std::path::absolute("relative-client-root").expect("absolute path")
+        );
+    }
+
+    #[test]
+    fn client_root_env_rejects_empty_value() {
+        let error = get_client_root_with(|_| Some(OsString::new()))
+            .expect_err("empty client root rejected");
 
         assert!(error.to_string().contains(CLIENT_ROOT_ENV));
     }

@@ -85,6 +85,7 @@ fn random_name(prefix: &str) -> String {
 fn set_home_env(cmd: &mut Command, home: &Path) {
     cmd.env("HOME", home);
     cmd.env("USERPROFILE", home);
+    cmd.env_remove("STUDIOFS_CLIENT_ROOT");
 }
 
 fn run_studiofs(home: &Path, args: &[&str]) -> Output {
