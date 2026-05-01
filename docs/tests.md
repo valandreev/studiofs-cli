@@ -40,6 +40,7 @@ Focused harness checks:
 ```powershell
 cargo test -p studiofs-meta contract_core_harness_runs_ops_and_reopens_with_invariants -- --nocapture
 cargo test -p studiofs-meta contract_core_harness -- --nocapture
+cargo test -p studiofs-meta sfs314_ -- --nocapture
 cargo test -p studiofs-vfs contract_vfs_harness_reopens_fixture_and_runs_core_invariants -- --nocapture
 cargo test -p studiofs-vfs sfs312_ -- --nocapture
 cargo test -p studiofs-vfs local_first_shutdown_reports_and_recovers_memory_only_writer_state -- --nocapture
@@ -179,6 +180,10 @@ regressions:
 
 - Publication and visibility
   - `redb_partial_update_does_not_expose_new_blocks_before_publish`
+  - `sfs314_publish_requires_all_overlay_payloads_uploaded`
+  - `sfs314_uploaded_payload_does_not_replace_peer_visible_base_before_publish`
+  - `sfs314_partial_publish_preserves_base_tail_and_committed_size`
+  - `sfs314_metadata_only_apply_keeps_attrs_and_file_graph_consistent`
   - `test_publish_regular_file_overlay_to_base_if_matches_promotes_base_rows`
   - `test_publish_regular_file_overlay_to_base_keeps_sparse_tail_committed_size_below_size`
   - `background_epoch_finalizer_keeps_non_publish_ready_epoch_local_after_restart` *(requires S3 env)*

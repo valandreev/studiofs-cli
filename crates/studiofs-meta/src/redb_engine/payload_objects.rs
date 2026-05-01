@@ -424,8 +424,11 @@ impl MetaPayloadObjects for RedbMetaEngine {
                 return Ok(false);
             }
 
-            let (committed_size, removed_object_ids) =
-                Self::publish_regular_file_overlay_to_base_in_txn(&txn, ino)?;
+            let Some((committed_size, removed_object_ids)) =
+                Self::publish_regular_file_overlay_to_base_in_txn(&txn, ino)?
+            else {
+                return Ok(false);
+            };
             let published_base_chunks = Self::regular_file_chunk_rows_for_inode_in_write_txn(
                 &txn,
                 REGULAR_FILE_BASE_TABLE,

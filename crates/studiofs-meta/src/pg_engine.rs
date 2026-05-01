@@ -4478,6 +4478,26 @@ mod tests {
             .collect())
     }
 
+    fn mark_overlay_objects_uploaded(
+        engine: &PgMetaEngine,
+        ino: Ino,
+        expected_epoch: u64,
+        object_ids: &[u64],
+    ) {
+        for object_id in object_ids {
+            assert!(
+                engine
+                    .mark_regular_file_overlay_object_uploaded_if_matches(
+                        ino,
+                        expected_epoch,
+                        *object_id,
+                    )
+                    .expect("mark overlay object uploaded"),
+                "object {object_id} should still belong to inode {ino} epoch {expected_epoch}"
+            );
+        }
+    }
+
     impl PgFileGraphFixture for PgMetaEngine {
         fn stage_payload_slice(
             &self,
@@ -4858,6 +4878,7 @@ mod tests {
         engine
             .stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(object_id, 64))
             .expect("set published payload slice");
+        mark_overlay_objects_uploaded(engine, file.ino, 1, &[object_id]);
         assert!(
             engine
                 .publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
@@ -6615,6 +6636,7 @@ mod tests {
         writer
             .stage_payload_slice(file.ino, 0, &block)
             .expect("set payload slice");
+        mark_overlay_objects_uploaded(&writer, file.ino, 1, &[block.object_id]);
         assert!(
             writer
                 .publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
@@ -6664,6 +6686,7 @@ mod tests {
         writer
             .stage_payload_slice(file.ino, 1, &second)
             .expect("set second block");
+        mark_overlay_objects_uploaded(&writer, file.ino, 1, &[first.object_id, second.object_id]);
         assert!(
             writer
                 .publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
@@ -6691,6 +6714,7 @@ mod tests {
         writer
             .stage_payload_slice(file.ino, 0, &replacement)
             .expect("set replacement payload slice");
+        mark_overlay_objects_uploaded(&writer, file.ino, 2, &[replacement.object_id]);
         assert!(
             writer
                 .publish_regular_file_overlay_to_base_if_matches(file.ino, 2)
@@ -6760,6 +6784,7 @@ mod tests {
         writer
             .stage_payload_slice(file.ino, 1, &block1)
             .expect("set payload slice 1");
+        mark_overlay_objects_uploaded(&writer, file.ino, 1, &[block0.object_id, block1.object_id]);
         assert!(
             writer
                 .publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
@@ -6811,6 +6836,7 @@ mod tests {
         writer
             .stage_payload_slice(old.ino, 0, &old_block)
             .expect("set old block");
+        mark_overlay_objects_uploaded(&writer, old.ino, 1, &[old_block.object_id]);
         assert!(
             writer
                 .publish_regular_file_overlay_to_base_if_matches(old.ino, 1)
@@ -6840,6 +6866,12 @@ mod tests {
         writer
             .stage_payload_slice(temp.ino, 1, &new_block1)
             .expect("set replacement payload slice 1");
+        mark_overlay_objects_uploaded(
+            &writer,
+            temp.ino,
+            2,
+            &[new_block0.object_id, new_block1.object_id],
+        );
         assert!(
             writer
                 .publish_regular_file_overlay_to_base_if_matches(temp.ino, 2)
@@ -6898,6 +6930,7 @@ mod tests {
         writer
             .stage_payload_slice(file.ino, 0, &published)
             .expect("set published payload slice");
+        mark_overlay_objects_uploaded(&writer, file.ino, 1, &[published.object_id]);
         assert!(
             writer
                 .publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
@@ -7294,6 +7327,7 @@ mod tests {
         let block = PayloadRef::new_partial(77, 4096);
         a.stage_payload_slice(file.ino, 0, &block)
             .expect("set staged payload slice");
+        mark_overlay_objects_uploaded(&a, file.ino, 2, &[block.object_id]);
         assert!(
             a.publish_regular_file_overlay_to_base_if_matches(file.ino, 2)
                 .expect("publish committed base graph")
@@ -7393,6 +7427,7 @@ mod tests {
         let block = PayloadRef::new_partial(511, 4096);
         a.stage_payload_slice(file.ino, 0, &block)
             .expect("set nested block");
+        mark_overlay_objects_uploaded(&a, file.ino, 1, &[block.object_id]);
         assert!(
             a.publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
                 .expect("publish nested base graph")
@@ -7483,6 +7518,7 @@ mod tests {
             .expect("set payload slice 0");
         a.stage_payload_slice(file.ino, 1, &block1)
             .expect("set payload slice 1");
+        mark_overlay_objects_uploaded(&a, file.ino, 1, &[block0.object_id, block1.object_id]);
         assert!(
             a.publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
                 .expect("publish renamed nested base graph")
@@ -7543,6 +7579,7 @@ mod tests {
         let baseline = PayloadRef::new_partial(701, 4096);
         a.stage_payload_slice(file.ino, 0, &baseline)
             .expect("set baseline block");
+        mark_overlay_objects_uploaded(&a, file.ino, 1, &[baseline.object_id]);
         assert!(
             a.publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
                 .expect("publish baseline base graph")
@@ -7619,6 +7656,7 @@ mod tests {
             .expect("set baseline block 0");
         a.stage_payload_slice(file.ino, 1, &baseline1)
             .expect("set baseline block 1");
+        mark_overlay_objects_uploaded(&a, file.ino, 1, &[baseline0.object_id, baseline1.object_id]);
         assert!(
             a.publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
                 .expect("publish baseline base graph")
@@ -7652,6 +7690,12 @@ mod tests {
                     .unwrap_or(false)
         }));
 
+        mark_overlay_objects_uploaded(
+            &a,
+            file.ino,
+            2,
+            &[replacement0.object_id, replacement1.object_id],
+        );
         assert!(
             a.publish_regular_file_overlay_to_base_if_matches(file.ino, 2)
                 .expect("publish replacement base graph")
@@ -7817,6 +7861,7 @@ mod tests {
         set_file_state(&a, file.ino, 4096, 1);
         a.stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(87, 4096))
             .expect("set baseline remote block");
+        mark_overlay_objects_uploaded(&a, file.ino, 1, &[87]);
         assert!(
             a.publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
                 .expect("publish baseline base graph")
@@ -7838,6 +7883,7 @@ mod tests {
         let block = PayloadRef::new_partial(88, 4096);
         a.stage_payload_slice(file.ino, 0, &block)
             .expect("set staged remote slice");
+        mark_overlay_objects_uploaded(&a, file.ino, 2, &[block.object_id]);
         assert!(
             a.publish_regular_file_overlay_to_base_if_matches(file.ino, 2)
                 .expect("publish remote slice graph")
@@ -8068,6 +8114,7 @@ mod tests {
         set_file_state(&a, file.ino, 4096, 1);
         a.stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(776, 4096))
             .expect("set baseline uploading block");
+        mark_overlay_objects_uploaded(&a, file.ino, 1, &[776]);
         assert!(
             a.publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
                 .expect("publish baseline base graph")
@@ -8730,8 +8777,10 @@ mod tests {
         if let Ok(entry) = a.lookup(ROOT_INO, b"victim") {
             if a.get_attr(entry.ino).map(|attr| attr.kind).ok() == Some(FileType::RegularFile) {
                 set_file_state(&a, entry.ino, 64, 1);
-                a.stage_payload_slice(entry.ino, 0, &PayloadRef::new_partial(50_320, 64))
+                let block = PayloadRef::new_partial(50_320, 64);
+                a.stage_payload_slice(entry.ino, 0, &block)
                     .expect("set winner block on a");
+                mark_overlay_objects_uploaded(&a, entry.ino, 1, &[block.object_id]);
                 assert!(
                     a.publish_regular_file_overlay_to_base_if_matches(entry.ino, 1)
                         .expect("publish winner on a")
@@ -8741,8 +8790,10 @@ mod tests {
         } else if let Ok(entry) = b.lookup(ROOT_INO, b"victim") {
             if b.get_attr(entry.ino).map(|attr| attr.kind).ok() == Some(FileType::RegularFile) {
                 set_file_state(&b, entry.ino, 64, 1);
-                b.stage_payload_slice(entry.ino, 0, &PayloadRef::new_partial(50_321, 64))
+                let block = PayloadRef::new_partial(50_321, 64);
+                b.stage_payload_slice(entry.ino, 0, &block)
                     .expect("set winner block on b");
+                mark_overlay_objects_uploaded(&b, entry.ino, 1, &[block.object_id]);
                 assert!(
                     b.publish_regular_file_overlay_to_base_if_matches(entry.ino, 1)
                         .expect("publish winner on b")
@@ -8821,8 +8872,10 @@ mod tests {
         if let Ok(entry) = a.lookup(ROOT_INO, b"victim") {
             if a.get_attr(entry.ino).map(|attr| attr.kind).ok() == Some(FileType::RegularFile) {
                 set_file_state(&a, entry.ino, 64, 1);
-                a.stage_payload_slice(entry.ino, 0, &PayloadRef::new_partial(50_322, 64))
+                let block = PayloadRef::new_partial(50_322, 64);
+                a.stage_payload_slice(entry.ino, 0, &block)
                     .expect("set winner block on a");
+                mark_overlay_objects_uploaded(&a, entry.ino, 1, &[block.object_id]);
                 assert!(
                     a.publish_regular_file_overlay_to_base_if_matches(entry.ino, 1)
                         .expect("publish winner on a")
@@ -8832,8 +8885,10 @@ mod tests {
         } else if let Ok(entry) = b.lookup(ROOT_INO, b"victim") {
             if b.get_attr(entry.ino).map(|attr| attr.kind).ok() == Some(FileType::RegularFile) {
                 set_file_state(&b, entry.ino, 64, 1);
-                b.stage_payload_slice(entry.ino, 0, &PayloadRef::new_partial(50_323, 64))
+                let block = PayloadRef::new_partial(50_323, 64);
+                b.stage_payload_slice(entry.ino, 0, &block)
                     .expect("set winner block on b");
+                mark_overlay_objects_uploaded(&b, entry.ino, 1, &[block.object_id]);
                 assert!(
                     b.publish_regular_file_overlay_to_base_if_matches(entry.ino, 1)
                         .expect("publish winner on b")

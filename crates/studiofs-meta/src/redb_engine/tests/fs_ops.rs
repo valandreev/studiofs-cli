@@ -184,6 +184,15 @@ fn zeroio_unlink_open_handle_marks_unpublished_epoch_deleted_before_publish() {
     engine
         .stage_payload_slice(file.ino, 0, &published)
         .unwrap();
+    assert!(
+        engine
+            .mark_regular_file_overlay_object_uploaded_if_matches(
+                file.ino,
+                1,
+                published.object_id,
+            )
+            .unwrap()
+    );
     assert!(engine.publish_regular_file_overlay_to_base_if_matches(file.ino, 1).unwrap());
 
     let mut overwrite_attr = engine.get_attr(file.ino).unwrap();
@@ -510,6 +519,11 @@ fn redb_rename_keeps_same_inode_and_incarnation_ids() {
     engine
         .stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(401, 4096))
         .unwrap();
+    assert!(
+        engine
+            .mark_regular_file_overlay_object_uploaded_if_matches(file.ino, 7, 401)
+            .unwrap()
+    );
     assert!(engine.publish_regular_file_overlay_to_base_if_matches(file.ino, 7).unwrap());
 
     engine

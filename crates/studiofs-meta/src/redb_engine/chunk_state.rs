@@ -859,7 +859,7 @@ impl RedbMetaEngine {
     pub(super) fn publish_regular_file_overlay_to_base_in_txn(
         txn: &redb::WriteTransaction,
         ino: Ino,
-    ) -> MetaResult<(u64, Vec<u64>)> {
+    ) -> MetaResult<Option<(u64, Vec<u64>)>> {
         // Publication semantics are "overlay becomes the new remote-visible
         // base" for the inode, so base rows are reconciled to exactly match the
         // normalized overlay graph.
@@ -868,6 +868,9 @@ impl RedbMetaEngine {
             REGULAR_FILE_OVERLAY_TABLE,
             ino,
         )?;
+        if !Self::regular_file_overlay_payloads_publish_ready(&overlay_chunks) {
+            return Ok(None);
+        }
         let existing_base = Self::regular_file_chunk_states_for_inode_in_write_txn(
             txn,
             REGULAR_FILE_BASE_TABLE,
@@ -934,13 +937,27 @@ impl RedbMetaEngine {
         // Overlay rows are local/staging state. Once promoted to committed base,
         // clear them to avoid unbounded growth and stale finalize gates.
         Self::clear_regular_file_chunk_rows_in_txn(txn, REGULAR_FILE_OVERLAY_TABLE, ino)?;
-        Ok((
-            Self::regular_file_committed_size_from_chunks(&overlay_chunks),
+        Ok(Some((
+            Self::regular_file_committed_size_from_chunks(&desired_base),
             existing_object_ids
                 .difference(&desired_object_ids)
                 .copied()
                 .collect(),
-        ))
+        )))
+    }
+
+    fn regular_file_overlay_payloads_publish_ready(
+        overlay_chunks: &BTreeMap<ChunkId, RegularFileChunkState>,
+    ) -> bool {
+        overlay_chunks.values().all(|chunk_state| {
+            chunk_state.slices.values().all(|slice| {
+                slice.payload.is_none()
+                    || matches!(
+                        slice.payload_state,
+                        PayloadRefState::Uploaded | PayloadRefState::Published
+                    )
+            })
+        })
     }
 
     #[cfg(test)]
