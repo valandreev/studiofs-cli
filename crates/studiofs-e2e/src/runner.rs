@@ -91,6 +91,18 @@ pub struct CleanRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanOutcome {
+    pub removed: Vec<PathBuf>,
+    pub skipped: Vec<CleanSkipped>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanSkipped {
+    pub path: PathBuf,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScenarioOutcome {
     pub name: String,
     pub status: ScenarioStatus,
@@ -113,6 +125,8 @@ pub enum RunnerError {
     UnknownScenario(String),
     #[error("run ID must not be empty")]
     EmptyRunId,
+    #[error("run ID must be a safe single directory name: {0}")]
+    UnsafeRunId(String),
     #[error("unsafe cleanup root: {0}")]
     UnsafeCleanupRoot(String),
     #[error("runner I/O failed: {0}")]
@@ -127,6 +141,7 @@ pub enum RunnerError {
 struct ScenarioLifecycleOutcome {
     report: ScenarioReport,
     outcome: ScenarioOutcome,
+    cleanup_error: Option<String>,
 }
 
 pub fn run(request: RunRequest) -> Result<RunOutcome, RunnerError> {
@@ -138,6 +153,7 @@ pub fn run(request: RunRequest) -> Result<RunOutcome, RunnerError> {
         Some(run_id) => run_id,
         None => generated_run_id(),
     };
+    validate_run_id(&run_id)?;
     let scenario_names = if request.scenarios.is_empty() {
         vec![scenario::BASIC_MULTI_CLIENT_SMOKE.to_string()]
     } else {
@@ -182,6 +198,7 @@ pub fn run(request: RunRequest) -> Result<RunOutcome, RunnerError> {
 
     let mut scenario_reports = Vec::new();
     let mut scenario_outcomes = Vec::new();
+    let mut cleanup_errors = Vec::new();
     for requested_name in scenario_names {
         let Some(scenario) = scenario::resolve_scenario(&requested_name) else {
             return Err(RunnerError::UnknownScenario(requested_name));
@@ -198,6 +215,9 @@ pub fn run(request: RunRequest) -> Result<RunOutcome, RunnerError> {
         };
 
         let lifecycle = run_scenario_lifecycle(&events_path, &run_id, scenario.as_ref(), &context)?;
+        if let Some(cleanup_error) = &lifecycle.cleanup_error {
+            cleanup_errors.push(format!("{}: {cleanup_error}", lifecycle.outcome.name));
+        }
         scenario_reports.push(lifecycle.report);
         scenario_outcomes.push(lifecycle.outcome);
     }
@@ -205,19 +225,41 @@ pub fn run(request: RunRequest) -> Result<RunOutcome, RunnerError> {
     record_event(&events_path, &run_id, None, "run", "finished")?;
 
     let cleanup = CleanupReport {
-        status: RunStatus::Passed,
+        status: if cleanup_errors.is_empty() {
+            RunStatus::Passed
+        } else {
+            RunStatus::CleanupFailed
+        },
         actions: Vec::new(),
-        errors: Vec::new(),
+        errors: cleanup_errors,
     };
     write_pretty_json(&sandbox.join("cleanup.json"), &cleanup)?;
 
     let finished_at = timestamp();
+    let scenario_failed = scenario_outcomes
+        .iter()
+        .any(|scenario| scenario.status != ScenarioStatus::Passed);
+    let cleanup_failed = cleanup.status == RunStatus::CleanupFailed;
+    let status = if scenario_failed {
+        RunStatus::Failed
+    } else if cleanup_failed {
+        RunStatus::CleanupFailed
+    } else {
+        RunStatus::Passed
+    };
+    let exit_code = if scenario_failed {
+        1
+    } else if cleanup_failed {
+        4
+    } else {
+        0
+    };
     let report = RunReport {
         schema_version: SCHEMA_VERSION,
         run_id: run_id.clone(),
         seed: request.seed,
-        status: RunStatus::Passed,
-        exit_code: 0,
+        status,
+        exit_code,
         started_at,
         finished_at,
         duration_ms: duration_millis(started_instant),
@@ -249,43 +291,72 @@ pub fn run(request: RunRequest) -> Result<RunOutcome, RunnerError> {
 
     Ok(RunOutcome {
         run_id,
-        status: RunStatus::Passed,
-        exit_code: 0,
+        status,
+        exit_code,
         sandbox,
         report_path,
         scenarios: scenario_outcomes,
     })
 }
 
-pub fn clean(request: CleanRequest) -> Result<Vec<PathBuf>, RunnerError> {
+pub fn clean(request: CleanRequest) -> Result<CleanOutcome, RunnerError> {
     if !request.root.exists() {
-        return Ok(Vec::new());
+        return Ok(CleanOutcome {
+            removed: Vec::new(),
+            skipped: Vec::new(),
+        });
     }
     let root = canonicalize_cleanup_root(&request.root)?;
     let mut removed = Vec::new();
-    for entry in fs::read_dir(&root)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
-        }
+    let mut skipped = Vec::new();
+    for entry_result in fs::read_dir(&root)? {
+        let entry = match entry_result {
+            Ok(entry) => entry,
+            Err(err) => {
+                skipped.push(CleanSkipped {
+                    path: root.clone(),
+                    error: err.to_string(),
+                });
+                continue;
+            }
+        };
         let path = entry.path();
-        if !is_runner_owned_sandbox(&path)? {
-            continue;
+        match clean_entry(entry, &root) {
+            Ok(Some(name)) => removed.push(name),
+            Ok(None) => {}
+            Err(err) => skipped.push(CleanSkipped {
+                path: path
+                    .strip_prefix(&root)
+                    .map(Path::to_path_buf)
+                    .unwrap_or(path),
+                error: err.to_string(),
+            }),
         }
-        let canonical = path.canonicalize()?;
-        if !canonical.starts_with(&root) {
-            return Err(RunnerError::UnsafeCleanupRoot(format!(
-                "{} escapes {}",
-                canonical.display(),
-                root.display()
-            )));
-        }
-        let name = entry.file_name();
-        fs::remove_dir_all(&path)?;
-        removed.push(PathBuf::from(name));
     }
     removed.sort();
-    Ok(removed)
+    skipped.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(CleanOutcome { removed, skipped })
+}
+
+fn clean_entry(entry: fs::DirEntry, root: &Path) -> Result<Option<PathBuf>, RunnerError> {
+    if !entry.file_type()?.is_dir() {
+        return Ok(None);
+    }
+    let path = entry.path();
+    if !is_runner_owned_sandbox(&path)? {
+        return Ok(None);
+    }
+    let canonical = path.canonicalize()?;
+    if !canonical.starts_with(root) {
+        return Err(RunnerError::UnsafeCleanupRoot(format!(
+            "{} escapes {}",
+            canonical.display(),
+            root.display()
+        )));
+    }
+    let name = entry.file_name();
+    fs::remove_dir_all(&path)?;
+    Ok(Some(PathBuf::from(name)))
 }
 
 fn create_sandbox_layout(sandbox: &Path, scenarios: &[String]) -> Result<(), RunnerError> {
@@ -391,10 +462,41 @@ fn run_scenario_lifecycle(
                     status: ScenarioStatus::Passed,
                     artifacts,
                 },
+                cleanup_error: None,
             })
         }
-        (Err(primary), Ok(())) => Err(primary),
-        (Ok(_), Err(cleanup)) | (Err(_), Err(cleanup)) => Err(cleanup),
+        (body_result, cleanup_result) => {
+            let scenario_failed = body_result.is_err();
+            let primary_error = body_result.err().map(|err| err.to_string());
+            let cleanup_error = cleanup_result.err().map(|err| err.to_string());
+            let finished_at = timestamp();
+            Ok(ScenarioLifecycleOutcome {
+                report: ScenarioReport {
+                    name: definition.name.to_string(),
+                    seed: context.seed,
+                    status: if primary_error.is_some() {
+                        ScenarioStatus::Failed
+                    } else {
+                        ScenarioStatus::Passed
+                    },
+                    started_at,
+                    finished_at,
+                    duration_ms: duration_millis(started_instant),
+                    artifacts: Vec::new(),
+                    error: primary_error,
+                },
+                outcome: ScenarioOutcome {
+                    name: definition.name.to_string(),
+                    status: if scenario_failed {
+                        ScenarioStatus::Failed
+                    } else {
+                        ScenarioStatus::Passed
+                    },
+                    artifacts: Vec::new(),
+                },
+                cleanup_error,
+            })
+        }
     }
 }
 
@@ -592,6 +694,21 @@ fn canonicalize_cleanup_root(root: &Path) -> Result<PathBuf, RunnerError> {
     Ok(canonical)
 }
 
+fn validate_run_id(run_id: &str) -> Result<(), RunnerError> {
+    let safe = !run_id.is_empty()
+        && run_id != "."
+        && run_id != ".."
+        && !run_id.starts_with('.')
+        && run_id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'));
+    if safe {
+        Ok(())
+    } else {
+        Err(RunnerError::UnsafeRunId(run_id.to_string()))
+    }
+}
+
 fn absolutize(path: &Path) -> Result<PathBuf, RunnerError> {
     if path.is_absolute() {
         Ok(path.to_path_buf())
@@ -689,9 +806,10 @@ mod tests {
         };
         let scenario = FailingValidateScenario::new();
 
-        let result = run_scenario_lifecycle(&events_path, "run-1", &scenario, &context);
+        let outcome = run_scenario_lifecycle(&events_path, "run-1", &scenario, &context).unwrap();
 
-        assert!(result.is_err());
+        assert_eq!(outcome.outcome.status, ScenarioStatus::Failed);
+        assert!(outcome.report.error.unwrap().contains("validation failed"));
         assert!(scenario.cleaned.get());
         assert_eq!(
             scenario.calls.borrow().as_slice(),
@@ -725,6 +843,76 @@ mod tests {
                 "artifacts/scenarios/a/logs.txt",
                 "artifacts/scenarios/b/logs.txt"
             ]
+        );
+    }
+
+    #[test]
+    fn run_writes_report_when_scenario_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let outcome = run(RunRequest {
+            root: temp.path().join("e2e-runs"),
+            run_id: Some("failed-run".to_string()),
+            scenarios: vec![scenario::TEST_FAILING_VALIDATE.to_string()],
+            seed: 1,
+            studiofs_bin: None,
+            platform: PlatformSelection::Auto,
+            retention: RetentionPolicy::Always,
+            report: None,
+            port_range: None,
+            timeout: None,
+        })
+        .unwrap();
+
+        assert_eq!(outcome.status, RunStatus::Failed);
+        assert_eq!(outcome.exit_code, 1);
+        assert!(outcome.report_path.exists());
+
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(outcome.report_path).unwrap()).unwrap();
+        assert_eq!(report["status"], "failed");
+        assert_eq!(report["exit_code"], 1);
+        assert_eq!(report["scenarios"][0]["status"], "failed");
+        assert!(
+            report["scenarios"][0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("validation failed")
+        );
+    }
+
+    #[test]
+    fn run_preserves_primary_scenario_error_when_cleanup_also_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let outcome = run(RunRequest {
+            root: temp.path().join("e2e-runs"),
+            run_id: Some("failed-with-cleanup-run".to_string()),
+            scenarios: vec![scenario::TEST_FAILING_VALIDATE_AND_CLEANUP.to_string()],
+            seed: 1,
+            studiofs_bin: None,
+            platform: PlatformSelection::Auto,
+            retention: RetentionPolicy::Always,
+            report: None,
+            port_range: None,
+            timeout: None,
+        })
+        .unwrap();
+
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(outcome.report_path).unwrap()).unwrap();
+        assert_eq!(report["status"], "failed");
+        assert_eq!(report["exit_code"], 1);
+        assert!(
+            report["scenarios"][0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("validation failed")
+        );
+        assert_eq!(report["cleanup"]["status"], "cleanup_failed");
+        assert!(
+            report["cleanup"]["errors"][0]
+                .as_str()
+                .unwrap()
+                .contains("cleanup failed")
         );
     }
 }

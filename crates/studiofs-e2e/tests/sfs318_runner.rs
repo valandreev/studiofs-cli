@@ -5,7 +5,8 @@ use clap::Parser as _;
 use serde_json::Value;
 use studiofs_e2e::cli::{CleanArgs, Cli, Commands, RunArgs};
 use studiofs_e2e::runner::{
-    CleanRequest, PlatformSelection, RetentionPolicy, RunRequest, RunStatus, ScenarioStatus,
+    CleanRequest, PlatformSelection, RetentionPolicy, RunRequest, RunStatus, RunnerError,
+    ScenarioStatus,
 };
 use tempfile::tempdir;
 
@@ -170,7 +171,9 @@ fn clean_removes_only_runner_owned_sandboxes() {
     fs::create_dir_all(&unrelated).unwrap();
     fs::write(unrelated.join("notes.txt"), "operator-owned").unwrap();
 
-    let removed = studiofs_e2e::runner::clean(CleanRequest { root }).unwrap();
+    let removed = studiofs_e2e::runner::clean(CleanRequest { root })
+        .unwrap()
+        .removed;
 
     assert_eq!(removed, vec![PathBuf::from("owned-run")]);
     assert!(!temp.path().join("e2e-runs").join("owned-run").exists());
@@ -189,10 +192,70 @@ fn clean_ignores_manifest_only_directories_without_runner_marker_and_layout() {
     )
     .unwrap();
 
-    let removed = studiofs_e2e::runner::clean(CleanRequest { root }).unwrap();
+    let removed = studiofs_e2e::runner::clean(CleanRequest { root })
+        .unwrap()
+        .removed;
 
     assert!(removed.is_empty());
     assert!(fake.join("run.json").exists());
+}
+
+#[test]
+fn run_rejects_run_id_path_traversal_before_creating_sandbox() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().join("e2e-runs");
+    let request = RunRequest {
+        root,
+        run_id: Some("../escape".to_string()),
+        scenarios: vec!["basic-multi-client-smoke".to_string()],
+        seed: 1,
+        studiofs_bin: None,
+        platform: PlatformSelection::Auto,
+        retention: RetentionPolicy::Always,
+        report: None,
+        port_range: None,
+        timeout: None,
+    };
+
+    let err = studiofs_e2e::runner::run(request).unwrap_err();
+
+    assert!(matches!(err, RunnerError::UnsafeRunId(_)));
+    assert!(!temp.path().join("escape").exists());
+}
+
+#[test]
+fn clean_continues_after_malformed_owned_candidate() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().join("e2e-runs");
+    let valid = RunRequest {
+        root: root.clone(),
+        run_id: Some("valid-run".to_string()),
+        scenarios: vec!["basic-multi-client-smoke".to_string()],
+        seed: 11,
+        studiofs_bin: None,
+        platform: PlatformSelection::Auto,
+        retention: RetentionPolicy::Always,
+        report: None,
+        port_range: None,
+        timeout: None,
+    };
+    studiofs_e2e::runner::run(valid).unwrap();
+
+    let malformed = root.join("malformed-run");
+    fs::create_dir_all(&malformed).unwrap();
+    fs::write(malformed.join(".studiofs-e2e-runner.json"), "{").unwrap();
+    fs::write(
+        malformed.join("run.json"),
+        r#"{"runner_crate":"studiofs-e2e","run_id":"malformed-run"}"#,
+    )
+    .unwrap();
+
+    let outcome = studiofs_e2e::runner::clean(CleanRequest { root }).unwrap();
+
+    assert_eq!(outcome.removed, vec![PathBuf::from("valid-run")]);
+    assert_eq!(outcome.skipped.len(), 1);
+    assert!(malformed.join("run.json").exists());
+    assert!(!temp.path().join("e2e-runs").join("valid-run").exists());
 }
 
 fn assert_required_sandbox_files(sandbox: &Path) {

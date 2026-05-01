@@ -56,7 +56,7 @@ Required initial run flags:
 | `--scenario <name>` | Repeatable. Initial accepted values are `basic-multi-client-smoke` and the `smoke` alias; later gates add convergence, outage, and collision names. |
 | `--studiofs-bin <path>` | Path to the product CLI under test. The initial placeholder scenario records but does not require it; real mount scenarios must require it. The runner may build it only when an explicit build flag is added. |
 | `--root <path>` | Parent run directory. Defaults to `target/e2e-runs`. |
-| `--run-id <id>` | Optional stable run ID. If omitted, use an ISO-like UTC timestamp plus short random suffix. |
+| `--run-id <id>` | Optional stable run ID. If omitted, use an ISO-like UTC timestamp plus short random suffix. Explicit IDs must be safe single directory names: no separators, drive prefixes, traversal segments, leading dots, or other shell/path metacharacters. |
 | `--platform auto|linux-fuse|macos-fuse|windows-winfsp` | Mount backend selection. `auto` resolves from host OS and installed driver checks. |
 | `--retain always|on-failure|never` | Sandbox retention policy. Default is `on-failure`. |
 | `--report <path>` | Optional copy target for the final `report.json`. The canonical report remains in the run sandbox while the sandbox is retained. |
@@ -317,6 +317,9 @@ Rules:
   identify `studiofs-e2e`, the run ID matches the directory name, the manifest
   sandbox path canonicalizes back to that directory, and the required sandbox
   layout is present.
+- A malformed or undeletable candidate inside the cleanup root must be retained
+  and recorded as skipped; it must not prevent cleanup from attempting later
+  valid runner-owned sandboxes in the same root.
 - Delete a path only when it is inside `target/e2e-runs/<run-id>` or exactly
   matches an explicit client root recorded in `run.json`.
 - Treat symlinks and junctions as leaf entries. Do not recursively follow them

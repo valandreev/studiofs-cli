@@ -8,6 +8,11 @@ use thiserror::Error;
 
 pub const BASIC_MULTI_CLIENT_SMOKE: &str = "basic-multi-client-smoke";
 
+#[cfg(test)]
+pub(crate) const TEST_FAILING_VALIDATE: &str = "__test-failing-validate";
+#[cfg(test)]
+pub(crate) const TEST_FAILING_VALIDATE_AND_CLEANUP: &str = "__test-failing-validate-and-cleanup";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScenarioDefinition {
     pub name: &'static str,
@@ -45,6 +50,14 @@ pub fn available_scenarios() -> Vec<ScenarioDefinition> {
 pub(crate) fn resolve_scenario(name: &str) -> Option<Box<dyn Scenario>> {
     match name {
         BASIC_MULTI_CLIENT_SMOKE | "smoke" => Some(Box::new(BasicMultiClientSmoke)),
+        #[cfg(test)]
+        TEST_FAILING_VALIDATE => Some(Box::new(TestFailingScenario {
+            cleanup_fails: false,
+        })),
+        #[cfg(test)]
+        TEST_FAILING_VALIDATE_AND_CLEANUP => Some(Box::new(TestFailingScenario {
+            cleanup_fails: true,
+        })),
         _ => None,
     }
 }
@@ -98,5 +111,48 @@ impl Scenario for BasicMultiClientSmoke {
 
     fn cleanup(&self, _context: &ScenarioContext) -> Result<(), ScenarioError> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+struct TestFailingScenario {
+    cleanup_fails: bool,
+}
+
+#[cfg(test)]
+impl Scenario for TestFailingScenario {
+    fn definition(&self) -> ScenarioDefinition {
+        ScenarioDefinition {
+            name: if self.cleanup_fails {
+                TEST_FAILING_VALIDATE_AND_CLEANUP
+            } else {
+                TEST_FAILING_VALIDATE
+            },
+            description: "test-only failing scenario",
+        }
+    }
+
+    fn setup(&self, context: &ScenarioContext) -> Result<(), ScenarioError> {
+        fs::create_dir_all(&context.scenario_dir)?;
+        Ok(())
+    }
+
+    fn run(&self, _context: &ScenarioContext) -> Result<(), ScenarioError> {
+        Ok(())
+    }
+
+    fn validate(&self, _context: &ScenarioContext) -> Result<Vec<String>, ScenarioError> {
+        Err(ScenarioError::Io(std::io::Error::other(
+            "validation failed",
+        )))
+    }
+
+    fn cleanup(&self, _context: &ScenarioContext) -> Result<(), ScenarioError> {
+        if self.cleanup_fails {
+            Err(ScenarioError::Io(std::io::Error::other("cleanup failed")))
+        } else {
+            Ok(())
+        }
     }
 }

@@ -129,9 +129,12 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             Ok(outcome.exit_code)
         }
         Commands::Clean(args) => {
-            let removed = runner::clean(CleanRequest { root: args.root })?;
-            for path in removed {
+            let outcome = runner::clean(CleanRequest { root: args.root })?;
+            for path in outcome.removed {
                 println!("{}", path.display());
+            }
+            for skipped in outcome.skipped {
+                eprintln!("skipped {}: {}", skipped.path.display(), skipped.error);
             }
             Ok(0)
         }
