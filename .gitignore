@@ -25,3 +25,4 @@ test*.txt
 /.qwen/*
 .worktrees/
 deslop*.txt
+.rwx/bin/

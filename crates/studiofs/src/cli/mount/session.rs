@@ -1682,7 +1682,9 @@ mod tests {
     use std::collections::HashSet;
     use std::io;
     use std::path::Path;
-    use std::sync::{Arc, Mutex, OnceLock};
+    #[cfg(windows)]
+    use std::sync::OnceLock;
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
     use studiofs_meta::{ROOT_INO, RedbMetaEngine};
