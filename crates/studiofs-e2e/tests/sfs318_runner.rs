@@ -224,6 +224,35 @@ fn run_rejects_run_id_path_traversal_before_creating_sandbox() {
 }
 
 #[test]
+fn run_rejects_unknown_scenario_before_creating_sandbox() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().join("e2e-runs");
+    let request = RunRequest {
+        root,
+        run_id: Some("unknown-scenario-run".to_string()),
+        scenarios: vec!["missing-scenario".to_string()],
+        seed: 1,
+        studiofs_bin: None,
+        platform: PlatformSelection::Auto,
+        retention: RetentionPolicy::Always,
+        report: None,
+        port_range: None,
+        timeout: None,
+    };
+
+    let err = studiofs_e2e::runner::run(request).unwrap_err();
+
+    assert!(matches!(err, RunnerError::UnknownScenario(_)));
+    assert!(
+        !temp
+            .path()
+            .join("e2e-runs")
+            .join("unknown-scenario-run")
+            .exists()
+    );
+}
+
+#[test]
 fn clean_continues_after_malformed_owned_candidate() {
     let temp = tempdir().unwrap();
     let root = temp.path().join("e2e-runs");

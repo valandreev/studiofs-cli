@@ -144,6 +144,11 @@ struct ScenarioLifecycleOutcome {
     cleanup_error: Option<String>,
 }
 
+struct ResolvedScenario {
+    definition: scenario::ScenarioDefinition,
+    scenario: Box<dyn scenario::Scenario>,
+}
+
 pub fn run(request: RunRequest) -> Result<RunOutcome, RunnerError> {
     let started_instant = Instant::now();
     let started_at = timestamp();
@@ -159,10 +164,11 @@ pub fn run(request: RunRequest) -> Result<RunOutcome, RunnerError> {
     } else {
         request.scenarios
     };
+    let scenarios = resolve_scenarios(&scenario_names)?;
     let sandbox = root.join(&run_id);
     let selected_platform = request.platform.resolved().to_string();
 
-    create_sandbox_layout(&sandbox, &scenario_names)?;
+    create_sandbox_layout(&sandbox, &scenarios)?;
     let manifest = build_manifest(ManifestInput {
         run_id: &run_id,
         seed: request.seed,
@@ -199,11 +205,8 @@ pub fn run(request: RunRequest) -> Result<RunOutcome, RunnerError> {
     let mut scenario_reports = Vec::new();
     let mut scenario_outcomes = Vec::new();
     let mut cleanup_errors = Vec::new();
-    for requested_name in scenario_names {
-        let Some(scenario) = scenario::resolve_scenario(&requested_name) else {
-            return Err(RunnerError::UnknownScenario(requested_name));
-        };
-        let definition = scenario.definition();
+    for resolved in scenarios {
+        let definition = resolved.definition;
         let context = ScenarioContext {
             run_id: run_id.clone(),
             seed: request.seed,
@@ -214,7 +217,8 @@ pub fn run(request: RunRequest) -> Result<RunOutcome, RunnerError> {
                 .join(definition.name),
         };
 
-        let lifecycle = run_scenario_lifecycle(&events_path, &run_id, scenario.as_ref(), &context)?;
+        let lifecycle =
+            run_scenario_lifecycle(&events_path, &run_id, resolved.scenario.as_ref(), &context)?;
         if let Some(cleanup_error) = &lifecycle.cleanup_error {
             cleanup_errors.push(format!("{}: {cleanup_error}", lifecycle.outcome.name));
         }
@@ -359,7 +363,24 @@ fn clean_entry(entry: fs::DirEntry, root: &Path) -> Result<Option<PathBuf>, Runn
     Ok(Some(PathBuf::from(name)))
 }
 
-fn create_sandbox_layout(sandbox: &Path, scenarios: &[String]) -> Result<(), RunnerError> {
+fn resolve_scenarios(names: &[String]) -> Result<Vec<ResolvedScenario>, RunnerError> {
+    names
+        .iter()
+        .map(|name| {
+            let scenario = scenario::resolve_scenario(name)
+                .ok_or_else(|| RunnerError::UnknownScenario(name.clone()))?;
+            Ok(ResolvedScenario {
+                definition: scenario.definition(),
+                scenario,
+            })
+        })
+        .collect()
+}
+
+fn create_sandbox_layout(
+    sandbox: &Path,
+    scenarios: &[ResolvedScenario],
+) -> Result<(), RunnerError> {
     fs::create_dir_all(sandbox)?;
     fs::create_dir_all(sandbox.join("artifacts/docker"))?;
     fs::create_dir_all(sandbox.join("artifacts/commands"))?;
@@ -373,10 +394,11 @@ fn create_sandbox_layout(sandbox: &Path, scenarios: &[String]) -> Result<(), Run
         fs::create_dir_all(sandbox.join("artifacts/clients").join(client).join("mount"))?;
     }
     for scenario in scenarios {
-        let name = scenario::resolve_scenario(scenario)
-            .map(|scenario| scenario.definition().name)
-            .unwrap_or(scenario);
-        fs::create_dir_all(sandbox.join("artifacts/scenarios").join(name))?;
+        fs::create_dir_all(
+            sandbox
+                .join("artifacts/scenarios")
+                .join(scenario.definition.name),
+        )?;
     }
     Ok(())
 }
