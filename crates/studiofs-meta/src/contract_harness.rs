@@ -543,10 +543,19 @@ impl ContractCoreFixture {
         let mut referenced_object_ids: Vec<u64> =
             meta.get_referenced_object_ids()?.into_iter().collect();
         referenced_object_ids.sort_unstable();
-        diagnostics.referenced_object_ids = referenced_object_ids;
 
         let mut pending_deletions = meta.get_pending_deletions()?;
         pending_deletions.sort_unstable_by_key(|(object_id, _timestamp)| *object_id);
+
+        for (object_id, timestamp) in &pending_deletions {
+            if referenced_object_ids.binary_search(object_id).is_ok() {
+                diagnostics.push_violation(format!(
+                    "object_id {object_id} is marked for pending deletion (timestamp={timestamp}) but is still reachable from metadata"
+                ));
+            }
+        }
+
+        diagnostics.referenced_object_ids = referenced_object_ids;
         diagnostics.pending_deletions = pending_deletions;
 
         let lifecycles = meta.list_inode_lifecycles()?;

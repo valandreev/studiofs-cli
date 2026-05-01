@@ -337,3 +337,31 @@ fn contract_core_harness_reports_stale_deferred_delete_record() {
         "unexpected diagnostics: {err}"
     );
 }
+
+#[test]
+fn contract_core_harness_reports_reachable_pending_deletion_conflict() {
+    let fixture = ContractCoreFixture::new("redb-contract-reachable-pending-deletion")
+        .expect("create fixture");
+    let meta = fixture.meta();
+    let file = meta
+        .create_file(ROOT_INO, b"reachable-pending.bin", 1000, 1000, 0o644)
+        .expect("create file");
+    let mut attr = meta.get_attr(file.ino).expect("load file attr");
+    attr.size = 4096;
+    attr.content_epoch = 1;
+    meta.set_attr(&attr).expect("set file attr");
+    meta.stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(90_001, 4096))
+        .expect("stage reachable object");
+    meta.add_pending_deletion(90_001, 123)
+        .expect("mark reachable object pending deletion");
+
+    let err = fixture
+        .assert_invariants("reachable pending deletion conflict")
+        .expect_err("reachable pending deletion conflict should fail invariants");
+    assert!(
+        err.to_string().contains(
+            "object_id 90001 is marked for pending deletion (timestamp=123) but is still reachable from metadata"
+        ),
+        "unexpected diagnostics: {err}"
+    );
+}
