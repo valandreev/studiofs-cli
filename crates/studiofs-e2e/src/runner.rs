@@ -11,6 +11,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::infra::{
+    CommandExecutor, ComposeConfig, DockerComposeStack, InfraCheck, InfraError, InfraMode,
+    SystemCommandExecutor,
+};
 use crate::report::{
     ArtifactReport, CleanupReport, EventRecord, HostReport, PreflightCheckReport, PreflightReport,
     RunManifest, RunReport, RunnerReport, SandboxReport, ScenarioReport,
@@ -83,6 +87,7 @@ pub struct RunRequest {
     pub report: Option<PathBuf>,
     pub port_range: Option<String>,
     pub timeout: Option<String>,
+    pub infra: InfraMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,6 +140,8 @@ pub enum RunnerError {
     Json(#[from] serde_json::Error),
     #[error("scenario hook failed: {0}")]
     Scenario(#[from] scenario::ScenarioError),
+    #[error("runner infra failed: {0}")]
+    Infra(#[from] InfraError),
 }
 
 #[derive(Debug)]
@@ -150,6 +157,14 @@ struct ResolvedScenario {
 }
 
 pub fn run(request: RunRequest) -> Result<RunOutcome, RunnerError> {
+    let executor = SystemCommandExecutor;
+    run_with_executor(request, &executor)
+}
+
+pub fn run_with_executor(
+    request: RunRequest,
+    executor: &dyn CommandExecutor,
+) -> Result<RunOutcome, RunnerError> {
     let started_instant = Instant::now();
     let started_at = timestamp();
     let root = absolutize(&request.root)?;
@@ -167,6 +182,22 @@ pub fn run(request: RunRequest) -> Result<RunOutcome, RunnerError> {
     let scenarios = resolve_scenarios(&scenario_names)?;
     let sandbox = root.join(&run_id);
     let selected_platform = request.platform.resolved().to_string();
+    let infra_mode = request.infra;
+    let compose_stack = match infra_mode {
+        InfraMode::Disabled => None,
+        InfraMode::Compose => Some(DockerComposeStack::new(ComposeConfig::for_run(
+            &run_id,
+            &sandbox,
+            request.port_range.clone(),
+        ))?),
+    };
+    let compose_project = compose_stack
+        .as_ref()
+        .map(|stack| stack.project_name().to_string());
+    let allocated_ports = compose_stack
+        .as_ref()
+        .map(|stack| stack.ports().to_vec())
+        .unwrap_or_default();
 
     create_sandbox_layout(&sandbox, &scenarios)?;
     let manifest = build_manifest(ManifestInput {
@@ -176,6 +207,9 @@ pub fn run(request: RunRequest) -> Result<RunOutcome, RunnerError> {
         scenarios: &scenario_names,
         retention: request.retention,
         selected_platform: &selected_platform,
+        infra: infra_mode,
+        compose_project: compose_project.as_deref(),
+        allocated_ports: allocated_ports.clone(),
         studiofs_bin: request.studiofs_bin.as_deref(),
         port_range: request.port_range.as_deref(),
         timeout: request.timeout.as_deref(),
@@ -184,19 +218,49 @@ pub fn run(request: RunRequest) -> Result<RunOutcome, RunnerError> {
     write_pretty_json(&sandbox.join("run.json"), &manifest)?;
     write_runner_marker(&sandbox, &run_id)?;
     write_log_files(&sandbox)?;
-    write_pretty_json(
-        &sandbox.join("ports.json"),
-        &serde_json::json!({ "ports": [] }),
-    )?;
 
-    let preflight = PreflightReport {
-        status: RunStatus::Passed,
-        checks: vec![PreflightCheckReport {
-            name: "runner-skeleton".to_string(),
-            status: RunStatus::Passed,
-            detail: "placeholder scenario does not start Docker or mount processes".to_string(),
-        }],
-    };
+    let prepared_preflight = prepare_preflight(&sandbox, compose_stack.as_ref(), executor)?;
+    let preflight = prepared_preflight.report;
+    let mut compose_cleanup_guard = ComposeCleanupGuard::new(
+        if prepared_preflight.compose_start_attempted {
+            compose_stack.as_ref()
+        } else {
+            None
+        },
+        executor,
+    );
+    if preflight.status == RunStatus::PreflightFailed {
+        write_pretty_json(&sandbox.join("preflight.json"), &preflight)?;
+        let mut cleanup_actions = Vec::new();
+        let mut cleanup_errors = Vec::new();
+        compose_cleanup_guard.collect_into(&mut cleanup_actions, &mut cleanup_errors);
+        let cleanup = CleanupReport {
+            status: if cleanup_errors.is_empty() {
+                RunStatus::Passed
+            } else {
+                RunStatus::CleanupFailed
+            },
+            actions: cleanup_actions,
+            errors: cleanup_errors,
+        };
+        write_pretty_json(&sandbox.join("cleanup.json"), &cleanup)?;
+        return finish_run(FinishRunInput {
+            run_id,
+            seed: request.seed,
+            status: RunStatus::PreflightFailed,
+            exit_code: 2,
+            started_at,
+            duration_ms: duration_millis(started_instant),
+            selected_platform,
+            sandbox,
+            retention: request.retention,
+            report_copy: request.report,
+            preflight,
+            scenario_reports: Vec::new(),
+            scenario_outcomes: Vec::new(),
+            cleanup,
+        });
+    }
     write_pretty_json(&sandbox.join("preflight.json"), &preflight)?;
 
     let events_path = sandbox.join("events.ndjson");
@@ -227,6 +291,8 @@ pub fn run(request: RunRequest) -> Result<RunOutcome, RunnerError> {
     }
 
     record_event(&events_path, &run_id, None, "run", "finished")?;
+    let mut cleanup_actions = Vec::new();
+    compose_cleanup_guard.collect_into(&mut cleanup_actions, &mut cleanup_errors);
 
     let cleanup = CleanupReport {
         status: if cleanup_errors.is_empty() {
@@ -234,12 +300,11 @@ pub fn run(request: RunRequest) -> Result<RunOutcome, RunnerError> {
         } else {
             RunStatus::CleanupFailed
         },
-        actions: Vec::new(),
+        actions: cleanup_actions,
         errors: cleanup_errors,
     };
     write_pretty_json(&sandbox.join("cleanup.json"), &cleanup)?;
 
-    let finished_at = timestamp();
     let scenario_failed = scenario_outcomes
         .iter()
         .any(|scenario| scenario.status != ScenarioStatus::Passed);
@@ -258,15 +323,87 @@ pub fn run(request: RunRequest) -> Result<RunOutcome, RunnerError> {
     } else {
         0
     };
-    let report = RunReport {
-        schema_version: SCHEMA_VERSION,
-        run_id: run_id.clone(),
+    finish_run(FinishRunInput {
+        run_id,
         seed: request.seed,
         status,
         exit_code,
         started_at,
-        finished_at,
         duration_ms: duration_millis(started_instant),
+        selected_platform,
+        sandbox,
+        retention: request.retention,
+        report_copy: request.report,
+        preflight,
+        scenario_reports,
+        scenario_outcomes,
+        cleanup,
+    })
+}
+
+struct ComposeCleanupGuard<'a> {
+    stack: Option<&'a DockerComposeStack>,
+    executor: &'a dyn CommandExecutor,
+}
+
+impl<'a> ComposeCleanupGuard<'a> {
+    fn new(stack: Option<&'a DockerComposeStack>, executor: &'a dyn CommandExecutor) -> Self {
+        Self { stack, executor }
+    }
+
+    fn collect_into(
+        &mut self,
+        cleanup_actions: &mut Vec<String>,
+        cleanup_errors: &mut Vec<String>,
+    ) {
+        if let Some(stack) = self.stack.take() {
+            collect_compose_cleanup(stack, self.executor, cleanup_actions, cleanup_errors);
+        }
+    }
+}
+
+impl Drop for ComposeCleanupGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(stack) = self.stack.take() {
+            let mut cleanup_actions = Vec::new();
+            let mut cleanup_errors = Vec::new();
+            collect_compose_cleanup(
+                stack,
+                self.executor,
+                &mut cleanup_actions,
+                &mut cleanup_errors,
+            );
+        }
+    }
+}
+
+struct FinishRunInput {
+    run_id: String,
+    seed: u64,
+    status: RunStatus,
+    exit_code: i32,
+    started_at: String,
+    duration_ms: u64,
+    selected_platform: String,
+    sandbox: PathBuf,
+    retention: RetentionPolicy,
+    report_copy: Option<PathBuf>,
+    preflight: PreflightReport,
+    scenario_reports: Vec<ScenarioReport>,
+    scenario_outcomes: Vec<ScenarioOutcome>,
+    cleanup: CleanupReport,
+}
+
+fn finish_run(input: FinishRunInput) -> Result<RunOutcome, RunnerError> {
+    let report = RunReport {
+        schema_version: SCHEMA_VERSION,
+        run_id: input.run_id.clone(),
+        seed: input.seed,
+        status: input.status,
+        exit_code: input.exit_code,
+        started_at: input.started_at,
+        finished_at: timestamp(),
+        duration_ms: input.duration_ms,
         runner: RunnerReport {
             crate_name: RUNNER_CRATE.to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -275,32 +412,137 @@ pub fn run(request: RunRequest) -> Result<RunOutcome, RunnerError> {
         host: HostReport {
             os: std::env::consts::OS.to_string(),
             arch: std::env::consts::ARCH.to_string(),
-            platform: selected_platform,
+            platform: input.selected_platform,
         },
         sandbox: SandboxReport {
-            root: sandbox.display().to_string(),
-            retention: request.retention,
+            root: input.sandbox.display().to_string(),
+            retention: input.retention,
         },
-        preflight,
-        scenarios: scenario_reports,
-        artifacts: required_artifacts(&scenario_outcomes),
-        cleanup,
+        preflight: input.preflight,
+        scenarios: input.scenario_reports,
+        artifacts: required_artifacts(&input.scenario_outcomes),
+        cleanup: input.cleanup,
     };
 
-    let report_path = sandbox.join("report.json");
+    let report_path = input.sandbox.join("report.json");
     write_pretty_json(&report_path, &report)?;
-    if let Some(copy_target) = request.report {
+    if let Some(copy_target) = input.report_copy {
         write_pretty_json(&copy_target, &report)?;
     }
 
     Ok(RunOutcome {
-        run_id,
-        status,
-        exit_code,
-        sandbox,
+        run_id: input.run_id,
+        status: input.status,
+        exit_code: input.exit_code,
+        sandbox: input.sandbox,
         report_path,
-        scenarios: scenario_outcomes,
+        scenarios: input.scenario_outcomes,
     })
+}
+
+struct PreparedPreflight {
+    report: PreflightReport,
+    compose_start_attempted: bool,
+}
+
+fn prepare_preflight(
+    sandbox: &Path,
+    compose_stack: Option<&DockerComposeStack>,
+    executor: &dyn CommandExecutor,
+) -> Result<PreparedPreflight, RunnerError> {
+    let Some(stack) = compose_stack else {
+        write_pretty_json(
+            &sandbox.join("ports.json"),
+            &serde_json::json!({ "ports": [] }),
+        )?;
+        return Ok(PreparedPreflight {
+            report: PreflightReport {
+                status: RunStatus::Passed,
+                checks: vec![PreflightCheckReport {
+                    name: "runner-skeleton".to_string(),
+                    status: RunStatus::Passed,
+                    detail: "external infrastructure disabled for this run".to_string(),
+                }],
+            },
+            compose_start_attempted: false,
+        });
+    };
+
+    stack.prepare_artifacts()?;
+    let mut checks: Vec<_> = stack
+        .preflight(executor)
+        .into_iter()
+        .map(preflight_check_report)
+        .collect();
+    if checks.iter().any(|check| check.status != RunStatus::Passed) {
+        return Ok(PreparedPreflight {
+            report: PreflightReport {
+                status: RunStatus::PreflightFailed,
+                checks,
+            },
+            compose_start_attempted: false,
+        });
+    }
+
+    match stack.start(executor) {
+        Ok(()) => checks.push(PreflightCheckReport {
+            name: "docker compose up --wait".to_string(),
+            status: RunStatus::Passed,
+            detail: "required services are running or healthy".to_string(),
+        }),
+        Err(err) => {
+            checks.push(PreflightCheckReport {
+                name: "docker compose up --wait".to_string(),
+                status: RunStatus::PreflightFailed,
+                detail: err.to_string(),
+            });
+            return Ok(PreparedPreflight {
+                report: PreflightReport {
+                    status: RunStatus::PreflightFailed,
+                    checks,
+                },
+                compose_start_attempted: true,
+            });
+        }
+    }
+
+    Ok(PreparedPreflight {
+        report: PreflightReport {
+            status: RunStatus::Passed,
+            checks,
+        },
+        compose_start_attempted: true,
+    })
+}
+
+fn preflight_check_report(check: InfraCheck) -> PreflightCheckReport {
+    PreflightCheckReport {
+        name: check.name,
+        status: if check.passed {
+            RunStatus::Passed
+        } else {
+            RunStatus::PreflightFailed
+        },
+        detail: check.detail,
+    }
+}
+
+fn collect_compose_cleanup(
+    stack: &DockerComposeStack,
+    executor: &dyn CommandExecutor,
+    cleanup_actions: &mut Vec<String>,
+    cleanup_errors: &mut Vec<String>,
+) {
+    match stack.collect_logs(executor) {
+        Ok(_) => cleanup_actions.push("docker compose logs".to_string()),
+        Err(err) => cleanup_errors.push(format!("docker compose logs: {err}")),
+    }
+    match stack.teardown(executor) {
+        Ok(()) => {
+            cleanup_actions.push("docker compose down --volumes --remove-orphans".to_string());
+        }
+        Err(err) => cleanup_errors.push(format!("docker compose down: {err}")),
+    }
 }
 
 pub fn clean(request: CleanRequest) -> Result<CleanOutcome, RunnerError> {
@@ -410,6 +652,9 @@ struct ManifestInput<'a> {
     scenarios: &'a [String],
     retention: RetentionPolicy,
     selected_platform: &'a str,
+    infra: InfraMode,
+    compose_project: Option<&'a str>,
+    allocated_ports: Vec<crate::infra::ServicePort>,
     studiofs_bin: Option<&'a Path>,
     port_range: Option<&'a str>,
     timeout: Option<&'a str>,
@@ -441,6 +686,9 @@ fn build_manifest(input: ManifestInput<'_>) -> RunManifest {
         scenarios: input.scenarios.to_vec(),
         retention: input.retention,
         selected_platform: input.selected_platform.to_string(),
+        infra: input.infra,
+        compose_project: input.compose_project.map(str::to_string),
+        allocated_ports: input.allocated_ports,
         studiofs_bin: input.studiofs_bin.map(|path| path.display().to_string()),
         port_range: input.port_range.map(str::to_string),
         timeout: input.timeout.map(str::to_string),
@@ -764,6 +1012,7 @@ fn host_platform() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::infra::{CommandExecutor, CommandOutput, InfraMode};
     use std::cell::{Cell, RefCell};
 
     #[derive(Debug)]
@@ -882,6 +1131,7 @@ mod tests {
             report: None,
             port_range: None,
             timeout: None,
+            infra: InfraMode::Disabled,
         })
         .unwrap();
 
@@ -916,6 +1166,7 @@ mod tests {
             report: None,
             port_range: None,
             timeout: None,
+            infra: InfraMode::Disabled,
         })
         .unwrap();
 
@@ -936,5 +1187,152 @@ mod tests {
                 .unwrap()
                 .contains("cleanup failed")
         );
+    }
+
+    #[test]
+    fn run_with_compose_infra_waits_collects_logs_and_tears_down() {
+        let temp = tempfile::tempdir().unwrap();
+        let executor = RecordingExecutor::default();
+
+        let outcome = run_with_executor(
+            RunRequest {
+                root: temp.path().join("e2e-runs"),
+                run_id: Some("compose-runner-run".to_string()),
+                scenarios: vec![scenario::BASIC_MULTI_CLIENT_SMOKE.to_string()],
+                seed: 319,
+                studiofs_bin: None,
+                platform: PlatformSelection::Auto,
+                retention: RetentionPolicy::Always,
+                report: None,
+                port_range: Some("33000-33010".to_string()),
+                timeout: None,
+                infra: InfraMode::Compose,
+            },
+            &executor,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.status, RunStatus::Passed);
+        assert!(
+            outcome
+                .sandbox
+                .join("artifacts/docker/compose.e2e.yml")
+                .exists()
+        );
+        assert_eq!(
+            std::fs::read_to_string(outcome.sandbox.join("artifacts/docker/compose.log")).unwrap(),
+            "compose logs\n"
+        );
+
+        let ports: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(outcome.sandbox.join("ports.json")).unwrap())
+                .unwrap();
+        assert_eq!(ports["ports"][0]["service"], "postgres");
+        assert_eq!(ports["ports"][0]["host_port"], 33000);
+
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(outcome.report_path).unwrap()).unwrap();
+        assert!(
+            report["preflight"]["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|check| check["name"] == "docker compose up --wait"
+                    && check["status"] == "passed")
+        );
+        assert!(
+            report["cleanup"]["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|action| action == "docker compose down --volumes --remove-orphans")
+        );
+
+        let calls = executor.calls.borrow();
+        let up_index = calls
+            .iter()
+            .position(|call| call.args.contains(&"up".to_string()))
+            .unwrap();
+        let logs_index = calls
+            .iter()
+            .position(|call| call.args.contains(&"logs".to_string()))
+            .unwrap();
+        let down_index = calls
+            .iter()
+            .position(|call| call.args.contains(&"down".to_string()))
+            .unwrap();
+        assert!(up_index < logs_index);
+        assert!(logs_index < down_index);
+    }
+
+    #[test]
+    fn run_with_compose_infra_tears_down_when_post_start_io_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("e2e-runs");
+        let run_id = "compose-post-start-error";
+        let sandbox = root.join(run_id);
+        let executor = RecordingExecutor {
+            poison_events_path_after_up: RefCell::new(Some(sandbox.join("events.ndjson"))),
+            ..RecordingExecutor::default()
+        };
+
+        let err = run_with_executor(
+            RunRequest {
+                root,
+                run_id: Some(run_id.to_string()),
+                scenarios: vec![scenario::BASIC_MULTI_CLIENT_SMOKE.to_string()],
+                seed: 319,
+                studiofs_bin: None,
+                platform: PlatformSelection::Auto,
+                retention: RetentionPolicy::Always,
+                report: None,
+                port_range: Some("33100-33110".to_string()),
+                timeout: None,
+                infra: InfraMode::Compose,
+            },
+            &executor,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, RunnerError::Io(_)));
+        let calls = executor.calls.borrow();
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.args.contains(&"up".to_string()))
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.args.contains(&"down".to_string())),
+            "compose stack should be torn down after post-start runner errors"
+        );
+    }
+
+    #[derive(Default)]
+    struct RecordingExecutor {
+        calls: RefCell<Vec<crate::infra::CommandSpec>>,
+        poison_events_path_after_up: RefCell<Option<PathBuf>>,
+    }
+
+    impl CommandExecutor for RecordingExecutor {
+        fn run(&self, command: &crate::infra::CommandSpec) -> std::io::Result<CommandOutput> {
+            self.calls.borrow_mut().push(command.clone());
+            if command.args.contains(&"up".to_string()) {
+                if let Some(events_path) = self.poison_events_path_after_up.borrow_mut().take() {
+                    std::fs::create_dir_all(events_path)?;
+                }
+            }
+            let stdout = if command.args.contains(&"logs".to_string()) {
+                "compose logs\n"
+            } else {
+                ""
+            };
+            Ok(CommandOutput {
+                status: 0,
+                stdout: stdout.to_string(),
+                stderr: String::new(),
+            })
+        }
     }
 }

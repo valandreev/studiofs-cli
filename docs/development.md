@@ -132,7 +132,8 @@ Targeted:
 cargo test -p studiofs-meta pg_engine::tests::test_pg_ -- --ignored --nocapture --test-threads=1
 cargo test -p studiofs-vfs --test vfs_test -- --ignored --nocapture --test-threads=1
 cargo test -p studiofs-data --test integration_test -- --ignored --nocapture
-cargo test -p studiofs-e2e --test sfs318_runner
+cargo test -p studiofs-e2e --test runner_contract
+cargo test -p studiofs-e2e --test compose_infra
 ```
 
 ## Multi-Client Dev Flow

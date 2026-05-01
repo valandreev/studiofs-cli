@@ -138,10 +138,17 @@ cargo run -p studiofs-e2e -- run basic-multi-client-smoke
 cargo run -p studiofs-e2e -- clean
 ```
 
+`run` uses Docker Compose infrastructure by default. The stack is defined in
+`docker/compose.e2e.yml` and includes PostgreSQL 18, RustFS, and a Toxiproxy
+placeholder. Use `--port-range <start-end>` to allocate deterministic
+project-scoped ports for concurrent local runs, or `--infra disabled` only for
+runner self-tests that must not touch Docker.
+
 Focused runner skeleton check:
 
 ```powershell
-cargo test -p studiofs-e2e --test sfs318_runner
+cargo test -p studiofs-e2e --test runner_contract
+cargo test -p studiofs-e2e --test compose_infra
 ```
 
 ## Platform-Gated Unit Tests

@@ -2,8 +2,7 @@
 
 This document defines the implementation contract for the real mounted E2E
 runner before scenario-specific logic is added. It is the shared contract for
-the runner skeleton, artifact collection, and CI upload/reporting work tracked
-by SFS-318, SFS-323, and SFS-329.
+the runner skeleton, artifact collection, and CI upload/reporting work.
 
 The runner is not part of the default fast test suite. It is an explicit,
 operator-started workflow for tests that need Docker, PostgreSQL, S3-compatible
@@ -44,11 +43,12 @@ studiofs-e2e run \
   --root target/e2e-runs \
   --run-id <run-id> \
   --platform auto \
+  --infra compose \
   --retain on-failure \
   --report target/e2e-runs/<run-id>/report.json
 ```
 
-Required initial run flags:
+Required initial run flags and environment:
 
 | Flag | Contract |
 |---|---|
@@ -58,9 +58,11 @@ Required initial run flags:
 | `--root <path>` | Parent run directory. Defaults to `target/e2e-runs`. |
 | `--run-id <id>` | Optional stable run ID. If omitted, use an ISO-like UTC timestamp plus short random suffix. Explicit IDs must be safe single directory names: no separators, drive prefixes, traversal segments, leading dots, or other shell/path metacharacters. |
 | `--platform auto|linux-fuse|macos-fuse|windows-winfsp` | Mount backend selection. `auto` resolves from host OS and installed driver checks. |
+| `--infra compose|disabled` | External infrastructure mode. `compose` starts `docker/compose.e2e.yml`, waits for healthy required services, collects Docker logs, and tears the stack down. `disabled` is reserved for runner self-tests and skeleton-only validation. |
 | `--retain always|on-failure|never` | Sandbox retention policy. Default is `on-failure`. |
 | `--report <path>` | Optional copy target for the final `report.json`. The canonical report remains in the run sandbox while the sandbox is retained. |
-| `--port-range <start-end>` | Optional deterministic host port pool for Docker services. |
+| `--port-range <start-end>` | Optional deterministic host port pool for Docker services. The compose runner allocates PostgreSQL, RustFS S3, RustFS console, and Toxiproxy API ports in that order. |
+| `STUDIOFS_E2E_COMPOSE_FILE` | Optional environment override for the compose file path. Defaults to `docker/compose.e2e.yml` discovered from the current directory or executable location. |
 | `--timeout <duration>` | Whole-run timeout; per-hook timeouts are derived from it unless overridden later. |
 
 The initial runner implements `list`, `run`, and `clean`. Future subcommands
@@ -139,13 +141,14 @@ Retention behavior:
   `stdout.log`, `stderr.log`, `preflight.json`, and `cleanup.json` are copied
   to the explicit `--report` destination or CI artifact staging directory.
 
-CI-oriented callers should use `on-failure` or `always` until SFS-323 artifact
+CI-oriented callers should use `on-failure` or `always` until artifact
 collection is stable.
 
 ## JSON Report Shape
 
 `report.json` is UTF-8 pretty JSON. Unknown fields are allowed, but existing
-field names and enum values are append-only once SFS-318 depends on them.
+field names and enum values are append-only once downstream runner tooling
+depends on them.
 
 Minimum shape:
 
@@ -278,6 +281,11 @@ Required checks:
 
 - Docker: `docker version` succeeds, Docker compose is available, and the
   daemon can start required PostgreSQL and S3-compatible services.
+- Compose stack: `docker/compose.e2e.yml` defines PostgreSQL 18, RustFS, and a
+  Toxiproxy placeholder using version-pinned service images for reproducible
+  runs. Published ports bind to `127.0.0.1` only. The runner invokes
+  `docker compose up --detach --wait` with a project-scoped name and records the
+  copied compose file plus logs under `artifacts/docker/`.
 - Mount support:
   - Linux requires a usable `/dev/fuse`, mountpoint creation rights, and the
     FUSE backend expected by `studiofs-fuse`.
@@ -291,7 +299,9 @@ Required checks:
   by cleanup.
 - Port allocation: all service ports come from the configured range or an
   explicit allocator. The runner writes `ports.json` before starting Docker and
-  must fail preflight when a selected port is already bound.
+  must fail preflight when a selected port is already bound. This check is early
+  conflict detection; Docker's bind during `compose up` remains the final
+  authority because host ports can change state after preflight.
 - stale mounts: requested mount points or drive letters must be unused, or must
   match a prior runner manifest that explicitly authorizes cleanup. Unknown
   mounted paths are a `preflight_failed` result, not an implicit force-unmount.
@@ -330,7 +340,9 @@ Rules:
 - If unmount fails, retain the affected path and record the failure in
   `cleanup.json`.
 - Docker cleanup must target run-labeled containers, networks, and volumes
-  only. Labels must include the run ID.
+  only. Labels must include the run ID. Compose teardown uses
+  `docker compose down --volumes --remove-orphans` so PostgreSQL and RustFS
+  named volumes do not persist after cleanup.
 
 When cleanup cannot prove ownership, it must retain the resource and mark the
 run `cleanup_failed`.

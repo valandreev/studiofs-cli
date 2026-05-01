@@ -209,6 +209,13 @@ cargo run -p studiofs-e2e -- run basic-multi-client-smoke
 cargo run -p studiofs-e2e -- clean
 ```
 
+The E2E runner starts `docker/compose.e2e.yml` by default. The compose stack
+contains PostgreSQL 18, RustFS, and a Toxiproxy placeholder, waits for healthy
+required services, writes Docker logs under `artifacts/docker/`, and tears down
+containers, networks, and volumes during cleanup. Use `--port-range <start-end>`
+to choose deterministic host ports, or `--infra disabled` for runner self-tests
+that must not start Docker.
+
 Local development and infra-backed tests use RustFS as the default
 S3-compatible backend together with PostgreSQL.
 

@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 
+use crate::infra::InfraMode;
 use crate::runner::{self, CleanRequest, PlatformSelection, RetentionPolicy, RunRequest};
 use crate::scenario;
 
@@ -71,6 +72,10 @@ pub struct RunArgs {
     /// Optional whole-run timeout string reserved for future hook enforcement.
     #[arg(long)]
     pub timeout: Option<String>,
+
+    /// External infrastructure mode for the run.
+    #[arg(long, value_enum, default_value = "compose")]
+    pub infra: InfraMode,
 }
 
 #[derive(Args, Debug)]
@@ -106,6 +111,7 @@ impl RunArgs {
             report: self.report,
             port_range: self.port_range,
             timeout: self.timeout,
+            infra: self.infra,
         }
     }
 }
