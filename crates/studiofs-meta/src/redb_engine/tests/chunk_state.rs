@@ -65,6 +65,38 @@ fn resolved_byte_view(
     view
 }
 
+fn mark_overlay_objects_uploaded(
+    engine: &RedbMetaEngine,
+    ino: Ino,
+    expected_epoch: u64,
+    object_ids: &[u64],
+) {
+    for object_id in object_ids {
+        assert!(
+            engine
+                .mark_regular_file_overlay_object_uploaded_if_matches(
+                    ino,
+                    expected_epoch,
+                    *object_id,
+                )
+                .unwrap(),
+            "object {object_id} should still belong to inode {ino} epoch {expected_epoch}"
+        );
+    }
+}
+
+fn remote_payload_object_ids(engine: &RedbMetaEngine, ino: Ino, length: u64) -> Vec<u64> {
+    let snapshot = engine.export_remote_snapshot().unwrap();
+    let remote = temp_engine();
+    remote.import_remote_snapshot(&snapshot).unwrap();
+    remote
+        .lookup_regular_file_slices(ino, 0, length)
+        .unwrap()
+        .into_iter()
+        .filter_map(|span| span.payload.map(|payload| payload.object_id))
+        .collect()
+}
+
 #[test]
 fn test_regular_file_prefix_scan_is_exact_per_inode() {
     let engine = temp_engine();
@@ -1357,6 +1389,7 @@ fn test_publish_regular_file_overlay_to_base_if_matches_promotes_base_rows() {
             .publish_regular_file_overlay_to_base_if_matches(file.ino, 6)
             .unwrap()
     );
+    mark_overlay_objects_uploaded(&engine, file.ino, 7, &[1601]);
     assert!(
         engine
             .publish_regular_file_overlay_to_base_if_matches(file.ino, 7)
@@ -1438,6 +1471,7 @@ fn test_publish_regular_file_overlay_to_base_preserves_untouched_base_ranges() {
         &[(ChunkId(0), base_chunk)],
     );
 
+    mark_overlay_objects_uploaded(&engine, file.ino, 3, &[3202]);
     assert!(
         engine
             .publish_regular_file_overlay_to_base_if_matches(file.ino, 3)
@@ -1478,6 +1512,7 @@ fn test_publish_regular_file_overlay_to_base_keeps_sparse_tail_committed_size_be
     ));
     set_regular_file_chunk_rows(&engine, file.ino, &[(ChunkId(0), overlay_chunk)], &[]);
 
+    mark_overlay_objects_uploaded(&engine, file.ino, 5, &[2601]);
     assert!(
         engine
             .publish_regular_file_overlay_to_base_if_matches(file.ino, 5)
@@ -1520,6 +1555,7 @@ fn test_publish_regular_file_overlay_to_base_accepts_fragmented_slice_graph() {
         .flush_regular_file_overlay_slices(file.ino, &[(chunk_id, incoming)])
         .unwrap();
 
+    mark_overlay_objects_uploaded(&engine, file.ino, 9, &[4_201, 4_202]);
     assert!(
         engine
             .publish_regular_file_overlay_to_base_if_matches(file.ino, 9)
@@ -1589,6 +1625,7 @@ fn redb_base_graph_publish_sets_committed_head() {
         .stage_payload_slice(file.ino, 1, &block1)
         .unwrap();
 
+    mark_overlay_objects_uploaded(&engine, file.ino, 1, &[101, 102]);
     assert!(engine.publish_regular_file_overlay_to_base_if_matches(file.ino, 1).unwrap());
 
     let published_attr = engine.get_attr(file.ino).unwrap();
@@ -1613,4 +1650,279 @@ fn redb_base_graph_publish_sets_committed_head() {
         .map(|span| span.payload.expect("published payload slice"))
         .collect();
     assert_eq!(remote_blocks, vec![block0, block1]);
+}
+
+#[test]
+fn sfs314_publish_requires_all_overlay_payloads_uploaded() {
+    let engine = temp_engine();
+    let file = engine
+        .create_file(
+            ROOT_INO,
+            b"sfs314-publish-ready-boundary.bin",
+            1000,
+            1000,
+            0o644,
+        )
+        .unwrap();
+    let mut attr = engine.get_attr(file.ino).unwrap();
+    attr.size = 8192;
+    attr.content_epoch = 1;
+    engine.set_attr(&attr).unwrap();
+
+    let mut ready_slice = SliceRecord::new(
+        SliceId(1),
+        SliceOrder(1),
+        SliceRange::new(0, 4096).expect("valid ready range"),
+        PayloadRef::new_partial(31_401, 4096),
+    );
+    ready_slice.payload_state = PayloadRefState::Uploaded;
+    let local_only_slice = SliceRecord::new(
+        SliceId(2),
+        SliceOrder(2),
+        SliceRange::new(4096, 8192).expect("valid local-only range"),
+        PayloadRef::new_partial(31_402, 4096),
+    );
+    let mut overlay_chunk = RegularFileChunkState::default();
+    overlay_chunk.insert_slice(ready_slice);
+    overlay_chunk.insert_slice(local_only_slice);
+    set_regular_file_chunk_rows(&engine, file.ino, &[(ChunkId(0), overlay_chunk)], &[]);
+
+    assert!(
+        !engine
+            .publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
+            .unwrap(),
+        "publish must wait until every referenced overlay payload object is uploaded"
+    );
+
+    let remote_snapshot = engine.export_remote_snapshot().unwrap();
+    assert!(
+        !remote_snapshot
+            .inodes
+            .iter()
+            .any(|(ino, _)| *ino == file.ino),
+        "uploaded-but-unpublished payload must not make a new file peer-visible"
+    );
+    assert_eq!(engine.get_attr(file.ino).unwrap().committed_content_epoch, 0);
+
+    mark_overlay_objects_uploaded(&engine, file.ino, 1, &[31_402]);
+    assert!(
+        engine
+            .publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
+            .unwrap(),
+        "publish should succeed once epoch and payload readiness match"
+    );
+    assert_eq!(
+        remote_payload_object_ids(&engine, file.ino, 8192),
+        vec![31_401, 31_402]
+    );
+}
+
+#[test]
+fn sfs314_uploaded_payload_does_not_replace_peer_visible_base_before_publish() {
+    let engine = temp_engine();
+    let file = engine
+        .create_file(
+            ROOT_INO,
+            b"sfs314-peer-visibility-boundary.bin",
+            1000,
+            1000,
+            0o644,
+        )
+        .unwrap();
+    let mut attr = engine.get_attr(file.ino).unwrap();
+    attr.size = 4096;
+    attr.content_epoch = 1;
+    engine.set_attr(&attr).unwrap();
+
+    engine
+        .stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(31_410, 4096))
+        .unwrap();
+    mark_overlay_objects_uploaded(&engine, file.ino, 1, &[31_410]);
+    assert!(
+        engine
+            .publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
+            .unwrap()
+    );
+    assert_eq!(
+        remote_payload_object_ids(&engine, file.ino, 4096),
+        vec![31_410]
+    );
+
+    let mut next_attr = engine.get_attr(file.ino).unwrap();
+    next_attr.content_epoch = 2;
+    next_attr.upload_state = UploadState::Updating;
+    engine.set_attr(&next_attr).unwrap();
+    engine
+        .stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(31_411, 4096))
+        .unwrap();
+    mark_overlay_objects_uploaded(&engine, file.ino, 2, &[31_411]);
+
+    let local_object_ids: Vec<_> = engine
+        .lookup_regular_file_slices(file.ino, 0, 4096)
+        .unwrap()
+        .into_iter()
+        .filter_map(|span| span.payload.map(|payload| payload.object_id))
+        .collect();
+    assert_eq!(local_object_ids, vec![31_411]);
+    assert_eq!(
+        remote_payload_object_ids(&engine, file.ino, 4096),
+        vec![31_410],
+        "upload completion alone must leave peers on the previous committed version"
+    );
+
+    assert!(
+        !engine
+            .publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
+            .unwrap(),
+        "stale publish attempts must not mutate visible base state"
+    );
+    assert_eq!(
+        remote_payload_object_ids(&engine, file.ino, 4096),
+        vec![31_410]
+    );
+
+    assert!(
+        engine
+            .publish_regular_file_overlay_to_base_if_matches(file.ino, 2)
+            .unwrap()
+    );
+    assert_eq!(
+        remote_payload_object_ids(&engine, file.ino, 4096),
+        vec![31_411]
+    );
+}
+
+#[test]
+fn sfs314_partial_publish_preserves_base_tail_and_committed_size() {
+    let engine = temp_engine();
+    let file = engine
+        .create_file(
+            ROOT_INO,
+            b"sfs314-partial-publish-base-tail.bin",
+            1000,
+            1000,
+            0o644,
+        )
+        .unwrap();
+    let mut attr = engine.get_attr(file.ino).unwrap();
+    attr.size = 12 * 1024;
+    attr.committed_size = 12 * 1024;
+    attr.content_epoch = 1;
+    attr.committed_content_epoch = 1;
+    attr.upload_state = UploadState::Ready;
+    engine.set_attr(&attr).unwrap();
+
+    let mut base_chunk = RegularFileChunkState::default();
+    for (slice_id, start, object_id) in [
+        (SliceId(1), 0, 31_420),
+        (SliceId(2), 4096, 31_421),
+        (SliceId(3), 8192, 31_422),
+    ] {
+        let mut slice = SliceRecord::new(
+            slice_id,
+            SliceOrder(slice_id.0),
+            SliceRange::new(start, start + 4096).expect("valid base range"),
+            PayloadRef::new_partial(object_id, 4096),
+        );
+        slice.payload_state = PayloadRefState::Published;
+        base_chunk.insert_slice(slice);
+    }
+
+    let mut overlay_chunk = RegularFileChunkState::default();
+    let mut replacement = SliceRecord::new(
+        SliceId(1),
+        SliceOrder(1),
+        SliceRange::new(4096, 8192).expect("valid replacement range"),
+        PayloadRef::new_partial(31_423, 4096),
+    );
+    replacement.payload_state = PayloadRefState::Uploaded;
+    overlay_chunk.insert_slice(replacement);
+    set_regular_file_chunk_rows(
+        &engine,
+        file.ino,
+        &[(ChunkId(0), overlay_chunk)],
+        &[(ChunkId(0), base_chunk)],
+    );
+
+    let mut next_attr = engine.get_attr(file.ino).unwrap();
+    next_attr.content_epoch = 2;
+    next_attr.upload_state = UploadState::Updating;
+    engine.set_attr(&next_attr).unwrap();
+
+    assert!(
+        engine
+            .publish_regular_file_overlay_to_base_if_matches(file.ino, 2)
+            .unwrap()
+    );
+
+    let published_attr = engine.get_attr(file.ino).unwrap();
+    assert_eq!(published_attr.committed_content_epoch, 2);
+    assert_eq!(
+        published_attr.committed_size, 12 * 1024,
+        "publishing a partial overlay must keep untouched committed base ranges in the new head"
+    );
+    assert_eq!(
+        remote_payload_object_ids(&engine, file.ino, 12 * 1024),
+        vec![31_420, 31_423, 31_422]
+    );
+}
+
+#[test]
+fn sfs314_metadata_only_apply_keeps_attrs_and_file_graph_consistent() {
+    let engine = temp_engine();
+    let file = engine
+        .create_file(
+            ROOT_INO,
+            b"sfs314-metadata-only-apply.bin",
+            1000,
+            1000,
+            0o644,
+        )
+        .unwrap();
+    let mut attr = engine.get_attr(file.ino).unwrap();
+    attr.size = 4096;
+    attr.content_epoch = 1;
+    engine.set_attr(&attr).unwrap();
+
+    engine
+        .stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(31_430, 4096))
+        .unwrap();
+    mark_overlay_objects_uploaded(&engine, file.ino, 1, &[31_430]);
+    assert!(
+        engine
+            .publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
+            .unwrap()
+    );
+
+    let mut metadata_only_attr = engine.get_attr(file.ino).unwrap();
+    metadata_only_attr.mode = 0o600;
+    metadata_only_attr.ctime = metadata_only_attr.ctime.saturating_add(1);
+    let event = MetaEvent::SetAttr {
+        attr: metadata_only_attr.clone(),
+    };
+
+    let remote_snapshot = engine.export_remote_snapshot().unwrap();
+    let remote = temp_engine();
+    remote.import_remote_snapshot(&remote_snapshot).unwrap();
+    remote
+        .apply_replica_events_to_base(std::slice::from_ref(&event))
+        .unwrap();
+    remote
+        .apply_replica_serving_state(std::slice::from_ref(&event))
+        .unwrap();
+
+    let remote_attr = remote.get_attr(file.ino).unwrap();
+    assert_eq!(remote_attr.mode, 0o600);
+    assert_eq!(remote_attr.size, 4096);
+    assert_eq!(remote_attr.committed_size, 4096);
+    assert_eq!(
+        remote
+            .lookup_regular_file_slices(file.ino, 0, 4096)
+            .unwrap()
+            .into_iter()
+            .filter_map(|span| span.payload.map(|payload| payload.object_id))
+            .collect::<Vec<_>>(),
+        vec![31_430],
+        "metadata-only apply must not rewrite or clear the published file graph"
+    );
 }

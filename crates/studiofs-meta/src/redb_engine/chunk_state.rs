@@ -935,12 +935,32 @@ impl RedbMetaEngine {
         // clear them to avoid unbounded growth and stale finalize gates.
         Self::clear_regular_file_chunk_rows_in_txn(txn, REGULAR_FILE_OVERLAY_TABLE, ino)?;
         Ok((
-            Self::regular_file_committed_size_from_chunks(&overlay_chunks),
+            Self::regular_file_committed_size_from_chunks(&desired_base),
             existing_object_ids
                 .difference(&desired_object_ids)
                 .copied()
                 .collect(),
         ))
+    }
+
+    pub(super) fn regular_file_overlay_payloads_publish_ready_in_txn(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+    ) -> MetaResult<bool> {
+        let overlay_chunks = Self::regular_file_chunk_states_for_inode_in_write_txn(
+            txn,
+            REGULAR_FILE_OVERLAY_TABLE,
+            ino,
+        )?;
+        Ok(overlay_chunks.values().all(|chunk_state| {
+            chunk_state.slices.values().all(|slice| {
+                slice.payload.is_none()
+                    || matches!(
+                        slice.payload_state,
+                        PayloadRefState::Uploaded | PayloadRefState::Published
+                    )
+            })
+        }))
     }
 
     #[cfg(test)]

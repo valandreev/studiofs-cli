@@ -610,7 +610,8 @@ pub trait MetaPayloadObjects: Send + Sync + MetaInodes {
     /// graph for a specific inode/content epoch.
     ///
     /// Returns `Ok(true)` when promotion succeeds and `Ok(false)` when
-    /// preconditions fail (inode missing or epoch mismatch).
+    /// preconditions fail (inode missing, epoch mismatch, or referenced
+    /// overlay payloads are not uploaded yet).
     fn publish_regular_file_overlay_to_base_if_matches(
         &self,
         ino: Ino,
