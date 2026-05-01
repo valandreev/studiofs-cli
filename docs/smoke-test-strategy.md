@@ -165,6 +165,9 @@ If self-hosted runners are provisioned:
   resolved S3 endpoint is reachable. On hosted CI without a live backend they
   self-skip and the job still validates the basic mount/unmount and I/O smoke
   path.
+- **Throughput coverage**: hosted Windows uses a conservative AJA sequential
+  writer floor as a path-health check. Treat sustained performance validation
+  as self-hosted hardware coverage, not a GitHub-hosted runner SLA.
 
 ### VFS setup (shared)
 
@@ -190,6 +193,7 @@ online coverage when a reachable S3 endpoint is configured.
 |----------|----------|---------|---------|
 | `STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS` | Yes | — | Gate: must be `1` to enable smoke tests |
 | `STUDIOFS_WINFSP_TEST_MOUNT_POINT` | Windows only | — | Drive letter for WinFSP mount (e.g. `Z:`) |
+| `STUDIOFS_WINFSP_AJA_MIN_THROUGHPUT_MIB_PER_SEC` | Windows only | `64` in test code, `16` in hosted CI | Minimum AJA sequential write throughput floor |
 
 ---
 
