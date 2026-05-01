@@ -57,18 +57,17 @@ advisory on a `windows-sys` crate) are surfaced in the same audit run.
 
 ## CI Ownership
 
-### Required PR gates
+### Manual PR verification
 
-The RWX Linux gate is intended to be required for a PR to merge. GitHub Actions
-macOS and Windows jobs are intentionally manual-only and should not be required
-PR gates while this policy is in effect. Required checks are enforced via
-**GitHub Branch Protection Rules** (Settings → Branches → require status
-checks) — it is not a property of the workflow YAML itself. The high-level
-execution model is:
+RWX Linux, GitHub Actions macOS, and GitHub Actions Windows verification are
+manual-only and do not run automatically on PRs. Required checks, if enabled,
+are enforced via **GitHub Branch Protection Rules** (Settings → Branches →
+require status checks) — it is not a property of the workflow YAML itself. The
+high-level execution model is:
 
 ```
-RWX linux  →  ubuntu-linux
-           →  rocky-linux
+Manual RWX linux  →  ubuntu-linux
+                  →  rocky-linux
 
 Manual GitHub Actions  →  macOS
                        →  Windows
@@ -76,7 +75,7 @@ Manual GitHub Actions  →  macOS
 
 | Job | Runner | Gate status |
 |-----|--------|-------------|
-| **Linux** | RWX `ubuntu:24.04` + `rockylinux:9` | Required |
+| **Linux** | RWX `ubuntu:24.04` + `rockylinux:9` | Manual only |
 | **macOS** | `macos-latest` | Manual only |
 | **Windows** | `windows-latest` | Manual only |
 

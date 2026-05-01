@@ -57,10 +57,10 @@ cargo check --workspace
 
 ## CI Matrix
 
-Linux verification runs in RWX (`.rwx/ci.yml`). GitHub Actions
-(`.github/workflows/rust.yml`) remains responsible for hosted macOS and
-Windows verification that RWX does not currently provide, but those workflows
-are manual-only and do not run automatically on PRs.
+Linux verification is defined in RWX (`.rwx/ci.yml`) and is manual-only; it
+does not run automatically on PRs. GitHub Actions (`.github/workflows/rust.yml`)
+remains responsible for hosted macOS and Windows verification that RWX does
+not currently provide, and those workflows are also manual-only.
 
 | Job | Runner | Purpose |
 |-----|--------|---------|
@@ -76,8 +76,8 @@ are immediately attributable in the CI job log rather than buried inside the
 broad workspace run. Failures that originate from platform-specific code
 should call out the backend step name directly.
 
-The GitHub-hosted macOS and Windows jobs are independent from RWX. Required
-branch protection should include the RWX Linux gate; hosted macOS and Windows
+The GitHub-hosted macOS and Windows jobs are independent from RWX. Start the
+RWX Linux gate manually when Linux signal is needed; hosted macOS and Windows
 Actions can be started manually from the GitHub Actions UI when needed.
 
 ### RWX local CLI and logs

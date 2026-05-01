@@ -2,10 +2,6 @@ on:
   cli:
     init:
       ref: ${{ event.git.sha }}
-  github:
-    pull_request:
-      init:
-        ref: ${{ event.git.sha }}
 
 base:
   image: ubuntu:24.04
