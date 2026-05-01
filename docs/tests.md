@@ -39,6 +39,7 @@ Focused harness checks:
 
 ```powershell
 cargo test -p studiofs-meta contract_core_harness_runs_ops_and_reopens_with_invariants -- --nocapture
+cargo test -p studiofs-meta contract_core_harness -- --nocapture
 cargo test -p studiofs-vfs contract_vfs_harness_reopens_fixture_and_runs_core_invariants -- --nocapture
 ```
 

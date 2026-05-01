@@ -1,12 +1,13 @@
 //! Shared Contract/Core fixtures for fast local metadata tests.
 
+use crate::engine::DeferredDeleteRecord;
 use crate::schema::{
-    CURRENT_FORMAT_VERSION, FileType, FormatInfo, InodeAttr, InodeLifecycleState, MetadataConfig,
-    ROOT_INO, RenameAtomicResult,
+    CURRENT_FORMAT_VERSION, FileType, FormatInfo, InodeAttr, InodeLifecycleRecord,
+    InodeLifecycleState, MetadataConfig, ROOT_INO, RenameAtomicResult,
 };
 use crate::{
-    MetaError, MetaFormat, MetaFsOps, MetaInodes, MetaNamespace, MetaPayloadObjects, MetaResult,
-    RedbMetaEngine,
+    MetaError, MetaFormat, MetaFsOps, MetaInodes, MetaNamespace, MetaPayloadObjects, MetaRecovery,
+    MetaResult, RedbMetaEngine,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -60,6 +61,14 @@ pub enum ContractCoreOp {
     },
     /// Unlink a regular file or symlink.
     Unlink {
+        /// Parent directory inode.
+        parent: u64,
+        /// Entry name bytes.
+        name: Vec<u8>,
+    },
+    /// Open-unlink a regular file, removing the dentry while keeping the inode
+    /// alive for deferred cleanup.
+    OpenUnlink {
         /// Parent directory inode.
         parent: u64,
         /// Entry name bytes.
@@ -155,6 +164,66 @@ pub struct ContractObjectGraphSnapshot {
     pub object_usage: Vec<(u64, u64)>,
 }
 
+/// Regular-file lifecycle snapshot included in invariant diagnostics.
+#[derive(Debug, Clone)]
+pub struct ContractLifecycleSnapshot {
+    /// Regular-file inode.
+    pub ino: u64,
+    /// Current lifecycle state.
+    pub state: InodeLifecycleState,
+    /// Locally visible file size for the lifecycle epoch.
+    pub local_visible_size: u64,
+    /// Published file size for the lifecycle epoch.
+    pub published_size: u64,
+    /// Locally visible content epoch.
+    pub local_content_epoch: u64,
+    /// Published content epoch.
+    pub published_content_epoch: u64,
+    /// Whether this lifecycle has a published base.
+    pub has_published_base: bool,
+    /// Object ids awaiting deferred cleanup for deleted-before-publish epochs.
+    pub deferred_cleanup_object_ids: Vec<u64>,
+}
+
+impl From<&InodeLifecycleRecord> for ContractLifecycleSnapshot {
+    fn from(record: &InodeLifecycleRecord) -> Self {
+        Self {
+            ino: record.ino,
+            state: record.state,
+            local_visible_size: record.local_visible_size,
+            published_size: record.published_size,
+            local_content_epoch: record.local_content_epoch,
+            published_content_epoch: record.published_content_epoch,
+            has_published_base: record.has_published_base,
+            deferred_cleanup_object_ids: record.deferred_cleanup_object_ids.clone(),
+        }
+    }
+}
+
+/// Deferred delete snapshot included in invariant diagnostics.
+#[derive(Debug, Clone)]
+pub struct ContractDeferredDeleteSnapshot {
+    /// Orphaned inode awaiting deferred cleanup.
+    pub ino: u64,
+    /// Parent directory from which the dentry was removed.
+    pub parent: u64,
+    /// Original dentry name removed from the parent.
+    pub name: Vec<u8>,
+    /// Unix timestamp when the record was created.
+    pub created_at: i64,
+}
+
+impl From<&DeferredDeleteRecord> for ContractDeferredDeleteSnapshot {
+    fn from(record: &DeferredDeleteRecord) -> Self {
+        Self {
+            ino: record.ino,
+            parent: record.parent,
+            name: record.name.clone(),
+            created_at: record.created_at,
+        }
+    }
+}
+
 /// Collected diagnostics for a Contract/Core invariant check.
 #[derive(Debug, Clone, Default)]
 pub struct ContractInvariantDiagnostics {
@@ -166,6 +235,10 @@ pub struct ContractInvariantDiagnostics {
     pub entries: Vec<ContractDentrySnapshot>,
     /// Object graph usage snapshots for regular files.
     pub object_graphs: Vec<ContractObjectGraphSnapshot>,
+    /// Lifecycle rows visible through metadata recovery state.
+    pub lifecycles: Vec<ContractLifecycleSnapshot>,
+    /// Deferred-delete records that explain open-unlink orphan inodes.
+    pub deferred_deletes: Vec<ContractDeferredDeleteSnapshot>,
     /// Human-readable invariant violations.
     pub violations: Vec<String>,
 }
@@ -217,6 +290,34 @@ impl fmt::Display for ContractInvariantDiagnostics {
         writeln!(f, "object_graphs:")?;
         for graph in &self.object_graphs {
             writeln!(f, "  - ino={} usage={:?}", graph.ino, graph.object_usage)?;
+        }
+
+        writeln!(f, "lifecycles:")?;
+        for lifecycle in &self.lifecycles {
+            writeln!(
+                f,
+                "  - ino={} state={:?} local_size={} published_size={} epoch={}/{} has_published_base={} deferred_cleanup={:?}",
+                lifecycle.ino,
+                lifecycle.state,
+                lifecycle.local_visible_size,
+                lifecycle.published_size,
+                lifecycle.local_content_epoch,
+                lifecycle.published_content_epoch,
+                lifecycle.has_published_base,
+                lifecycle.deferred_cleanup_object_ids
+            )?;
+        }
+
+        writeln!(f, "deferred_deletes:")?;
+        for record in &self.deferred_deletes {
+            writeln!(
+                f,
+                "  - ino={} parent={} name={} created_at={}",
+                record.ino,
+                record.parent,
+                String::from_utf8_lossy(&record.name),
+                record.created_at
+            )?;
         }
         Ok(())
     }
@@ -362,6 +463,9 @@ impl ContractCoreFixture {
             ContractCoreOp::Unlink { parent, name } => meta
                 .unlink(parent, &name)
                 .map(ContractCoreOpOutcome::Unlinked),
+            ContractCoreOp::OpenUnlink { parent, name } => meta
+                .unlink_open_handle(parent, &name)
+                .map(ContractCoreOpOutcome::Unlinked),
             ContractCoreOp::Rmdir { parent, name } => {
                 meta.rmdir(parent, &name)?;
                 Ok(ContractCoreOpOutcome::RemovedDirectory)
@@ -411,6 +515,30 @@ impl ContractCoreFixture {
         diagnostics.attrs = attrs.iter().map(ContractAttrSnapshot::from).collect();
         diagnostics.attrs.sort_by_key(|attr| attr.ino);
 
+        let deferred_deletes = meta.list_deferred_deletes()?;
+        let deferred_delete_by_ino: BTreeMap<u64, DeferredDeleteRecord> = deferred_deletes
+            .iter()
+            .map(|record| (record.ino, record.clone()))
+            .collect();
+        diagnostics.deferred_deletes = deferred_deletes
+            .iter()
+            .map(ContractDeferredDeleteSnapshot::from)
+            .collect();
+        diagnostics
+            .deferred_deletes
+            .sort_by_key(|record| record.ino);
+
+        let lifecycles = meta.list_inode_lifecycles()?;
+        let lifecycle_by_ino: BTreeMap<u64, InodeLifecycleRecord> = lifecycles
+            .iter()
+            .map(|record| (record.ino, record.clone()))
+            .collect();
+        diagnostics.lifecycles = lifecycles
+            .iter()
+            .map(ContractLifecycleSnapshot::from)
+            .collect();
+        diagnostics.lifecycles.sort_by_key(|record| record.ino);
+
         let mut visited_dirs = BTreeSet::new();
         let mut reachable_inos = BTreeSet::from([ROOT_INO]);
         let mut dentry_counts = BTreeMap::<u64, usize>::new();
@@ -435,6 +563,11 @@ impl ContractCoreFixture {
                 diagnostics.push_violation(format!(
                     "inode {} has nlink={} but is not reachable from root",
                     attr.ino, attr.nlink
+                ));
+            } else if !deferred_delete_by_ino.contains_key(&attr.ino) {
+                diagnostics.push_violation(format!(
+                    "inode {} has zero nlink but is not reachable from root and has no deferred delete record",
+                    attr.ino
                 ));
             }
 
@@ -477,17 +610,36 @@ impl ContractCoreFixture {
         }
 
         diagnostics.object_graphs.sort_by_key(|graph| graph.ino);
-        for lifecycle in meta.list_inode_lifecycles()? {
+        for lifecycle in lifecycle_by_ino.values() {
             match attr_by_ino.get(&lifecycle.ino) {
                 Some(attr) if attr.kind == FileType::RegularFile => {}
                 Some(attr) => diagnostics.push_violation(format!(
-                    "lifecycle row for inode {} points at {:?}, expected RegularFile",
-                    lifecycle.ino, attr.kind
+                    "lifecycle row for inode {} state {:?} points at {:?}, expected RegularFile",
+                    lifecycle.ino, lifecycle.state, attr.kind
                 )),
                 None if lifecycle.state == InodeLifecycleState::DeletedBeforePublish => {}
                 None => diagnostics.push_violation(format!(
-                    "lifecycle row for inode {} has no matching inode attr",
-                    lifecycle.ino
+                    "lifecycle row for inode {} state {:?} has no matching inode attr",
+                    lifecycle.ino, lifecycle.state
+                )),
+            }
+        }
+        for record in deferred_delete_by_ino.values() {
+            match attr_by_ino.get(&record.ino) {
+                Some(attr) if attr.kind == FileType::RegularFile && attr.nlink == 0 => {}
+                Some(attr) => diagnostics.push_violation(format!(
+                    "deferred delete record ino={} parent={} name={} points at {:?} nlink={}, expected zero-link RegularFile",
+                    record.ino,
+                    record.parent,
+                    String::from_utf8_lossy(&record.name),
+                    attr.kind,
+                    attr.nlink
+                )),
+                None => diagnostics.push_violation(format!(
+                    "deferred delete record ino={} parent={} name={} has no matching inode attr",
+                    record.ino,
+                    record.parent,
+                    String::from_utf8_lossy(&record.name)
                 )),
             }
         }

@@ -47,10 +47,13 @@ invariants over:
 - regular-file object graph readability
 - lifecycle rows that still point at live regular-file attrs, except retained
   deleted-before-publish tombstones
+- deferred-delete records that explain open-unlink zero-link inodes
 
 Invariant failures include a diagnostic snapshot of attrs, dentries, object
-graphs, and all violated rules. VFS-level contract tests reuse the same runner
-through `studiofs_vfs::contract_harness`.
+graphs, lifecycle rows, deferred-delete records, and all violated rules. A
+zero-link inode that is no longer root-reachable must have a deferred-delete
+record; otherwise the harness reports the orphaned inode directly. VFS-level
+contract tests reuse the same runner through `studiofs_vfs::contract_harness`.
 
 ## Capability Dependency Map
 
