@@ -5,9 +5,76 @@ use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-pub fn get_default_meta_dir(volume_name: &str) -> Result<PathBuf> {
+pub(crate) const CLIENT_ROOT_ENV: &str = "STUDIOFS_CLIENT_ROOT";
+
+pub(crate) fn get_client_root() -> Result<PathBuf> {
+    if let Some(root) = std::env::var_os(CLIENT_ROOT_ENV) {
+        let root = PathBuf::from(root);
+        if root.as_os_str().is_empty() {
+            return Err(anyhow!("{CLIENT_ROOT_ENV} must not be empty when set"));
+        }
+        return Ok(root);
+    }
+
     let home = home::home_dir().ok_or_else(|| anyhow!("Could not find home directory"))?;
-    Ok(home.join(".studiofs").join("meta").join(volume_name))
+    Ok(home.join(".studiofs"))
+}
+
+#[cfg(test)]
+fn client_root_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+pub(crate) struct ScopedClientRootEnv {
+    old: Option<std::ffi::OsString>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl ScopedClientRootEnv {
+    pub(crate) fn set(value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let lock = client_root_env_test_lock();
+        let old = std::env::var_os(CLIENT_ROOT_ENV);
+        // SAFETY: This guard holds a process-wide lock while mutating and restoring
+        // STUDIOFS_CLIENT_ROOT, and the guarded tests do not spawn other threads.
+        unsafe {
+            std::env::set_var(CLIENT_ROOT_ENV, value);
+        }
+        Self { old, _lock: lock }
+    }
+
+    pub(crate) fn unset() -> Self {
+        let lock = client_root_env_test_lock();
+        let old = std::env::var_os(CLIENT_ROOT_ENV);
+        // SAFETY: This guard holds a process-wide lock while mutating and restoring
+        // STUDIOFS_CLIENT_ROOT, and the guarded tests do not spawn other threads.
+        unsafe {
+            std::env::remove_var(CLIENT_ROOT_ENV);
+        }
+        Self { old, _lock: lock }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ScopedClientRootEnv {
+    fn drop(&mut self) {
+        // SAFETY: The guard holds the same process-wide lock for its full lifetime,
+        // so restoration cannot race with another guarded test in this crate.
+        unsafe {
+            match &self.old {
+                Some(value) => std::env::set_var(CLIENT_ROOT_ENV, value),
+                None => std::env::remove_var(CLIENT_ROOT_ENV),
+            }
+        }
+    }
+}
+
+pub fn get_default_meta_dir(volume_name: &str) -> Result<PathBuf> {
+    Ok(get_client_root()?.join("meta").join(volume_name))
 }
 
 // ─── Mount / PID management ─────────────────────────────────────────────────
@@ -37,18 +104,16 @@ pub fn normalize_mount_point(mp: &str) -> String {
     mp.to_string()
 }
 
-/// `~/.studiofs/mounts/`
+/// `<client-root>/mounts/`, defaulting to `~/.studiofs/mounts/`.
 pub fn get_mounts_dir() -> Result<PathBuf> {
-    let home = home::home_dir().ok_or_else(|| anyhow!("Could not find home directory"))?;
-    let dir = home.join(".studiofs").join("mounts");
+    let dir = get_client_root()?.join("mounts");
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
 
-/// `~/.studiofs/logs/`
+/// `<client-root>/logs/`, defaulting to `~/.studiofs/logs/`.
 pub fn get_logs_dir() -> Result<PathBuf> {
-    let home = home::home_dir().ok_or_else(|| anyhow!("Could not find home directory"))?;
-    let dir = home.join(".studiofs").join("logs");
+    let dir = get_client_root()?.join("logs");
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
@@ -270,7 +335,7 @@ pub fn is_process_running(pid: u32) -> bool {
 }
 
 // ─── PID-file helpers that accept an explicit directory ──────────────────────
-// These variants allow unit tests to use a temp directory instead of ~/.studiofs.
+// These variants allow unit tests to use a temp directory instead of the client root.
 
 /// Write a PID file into the given directory.
 #[cfg(test)]
@@ -376,6 +441,50 @@ pub fn format_throughput(bytes_per_sec: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_root_absent_preserves_home_studiofs_metadata_layout() {
+        let _env = ScopedClientRootEnv::unset();
+        let home = home::home_dir().expect("home dir");
+
+        let meta_dir = get_default_meta_dir("projectfs").expect("default metadata dir");
+
+        assert_eq!(
+            meta_dir,
+            home.join(".studiofs").join("meta").join("projectfs")
+        );
+    }
+
+    #[test]
+    fn client_root_env_scopes_metadata_mounts_and_logs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("client-a");
+        let _env = ScopedClientRootEnv::set(&root);
+
+        assert_eq!(
+            get_default_meta_dir("projectfs").expect("metadata dir"),
+            root.join("meta").join("projectfs")
+        );
+        assert_eq!(get_mounts_dir().expect("mounts dir"), root.join("mounts"));
+        assert_eq!(get_logs_dir().expect("logs dir"), root.join("logs"));
+        assert_eq!(
+            pid_file_path("Z:").expect("pid path"),
+            root.join("mounts").join("z.json")
+        );
+        assert_eq!(
+            mount_lock_file_path("Z:").expect("lock path"),
+            root.join("mounts").join("z.lock")
+        );
+    }
+
+    #[test]
+    fn client_root_env_rejects_empty_value() {
+        let _env = ScopedClientRootEnv::set("");
+
+        let error = get_default_meta_dir("projectfs").expect_err("empty client root rejected");
+
+        assert!(error.to_string().contains(CLIENT_ROOT_ENV));
+    }
 
     // ── sanitize_mount_point ─────────────────────────────────────────────
 

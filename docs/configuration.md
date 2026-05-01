@@ -17,6 +17,15 @@ StudioFS stores global defaults for mount in the OS-standard config path under:
 
 Values in the config file are used by `studiofs mount` when the corresponding
 CLI flags are omitted.
+
+Local per-client runtime state lives under the StudioFS client root. By default
+that root is `~/.studiofs`. Set `STUDIOFS_CLIENT_ROOT=<path>` to isolate a
+client sandbox without changing remote volume identity, PostgreSQL metadata, or
+S3 object layout. The root contains local metadata databases, mount records,
+daemon logs, investigation artifacts, and the default cache path
+`<client-root>/meta/<name>/cache` when neither `--cache-dir` nor persisted
+`cache_dir` is set.
+
 The operator-facing mount surface intentionally stays small. Regular operators
 should primarily use:
 
@@ -426,6 +435,7 @@ Operator stance:
 | `--readahead` | `18` | Sequential readahead width in blocks |
 | `--prefetch` | `8` | Background prefetch batch concurrency budget |
 | `--principal` / `STUDIOFS_PRINCIPAL` | `*` | Principal used for ACL checks |
+| `STUDIOFS_CLIENT_ROOT` | `~/.studiofs` | Local per-client metadata, mount records, logs, investigations, and default cache root |
 
 For cold sequential reads, leave `--read-buffer` at `300MB` or higher unless
 memory is constrained. The runtime derives the foreground fetch AIMD ceiling

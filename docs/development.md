@@ -111,15 +111,21 @@ cargo test -p studiofs-data --test integration_test -- --ignored --nocapture
 
 1. Client A:
 ```bash
+export STUDIOFS_CLIENT_ROOT=/tmp/studiofs-client-a
 studiofs init <name> ... --meta <postgres-server-dsn>
 studiofs mount <name> <mount-point>
 ```
 
 2. Client B/C/...:
 ```bash
+export STUDIOFS_CLIENT_ROOT=/tmp/studiofs-client-b
 studiofs discover <name> --meta <postgres-server-dsn>
 studiofs mount <name> <mount-point>
 ```
+
+Use a different `STUDIOFS_CLIENT_ROOT` for each local client on the same host so
+their `redb` metadata databases, mount records, logs, and default cache roots do
+not overlap.
 
 ## Related Docs
 

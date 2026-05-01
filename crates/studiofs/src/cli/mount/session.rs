@@ -1466,7 +1466,7 @@ fn resolve_mount_meta_session(
 // ─── Daemon spawn ────────────────────────────────────────────────────────────
 
 /// Re-execute the current process without `-d`/`--detach`, detached from the
-/// terminal. The child enables daily-rotated tracing logs under `~/.studiofs/logs/`.
+/// terminal. The child enables daily-rotated tracing logs under the client root.
 fn spawn_daemon(name: &str, mount_point: &str, meta_dir: &Path) -> anyhow::Result<()> {
     let logs_dir = utils::get_logs_dir()?;
     let log_stem = daemon_log_stem(name, meta_dir)?;
@@ -1681,11 +1681,8 @@ mod tests {
     #[cfg(windows)]
     use std::collections::HashSet;
     use std::io;
-    #[cfg(windows)]
     use std::path::Path;
-    #[cfg(windows)]
-    use std::sync::OnceLock;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, OnceLock};
     use tempfile::TempDir;
 
     use studiofs_meta::{ROOT_INO, RedbMetaEngine};
@@ -1828,6 +1825,20 @@ mod tests {
         }
     }
 
+    fn resolve_default_cache_for_client_root(root: &Path, name: &str) -> PathBuf {
+        let _env = utils::ScopedClientRootEnv::set(root);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let meta_dir = utils::get_default_meta_dir(name).expect("metadata dir");
+        std::fs::create_dir_all(&meta_dir).expect("create meta dir");
+        let mount_point = startup_mount_point(&temp);
+        let plan = MountPlan::resolve(MountRequest {
+            command: mount_command(name, &meta_dir, Some(mount_point.clone()), None, None),
+            settings_config: startup_settings_config(mount_point, None, None),
+        })
+        .expect("mount plan resolved");
+        plan.base_cache_path
+    }
+
     #[test]
     fn validate_endpoint_override_accepts_http_urls_and_bare_host_port() {
         validate_endpoint_override(Some("http://127.0.0.1:9000")).expect("full url");
@@ -1935,6 +1946,20 @@ mod tests {
         assert!(plan.run_in_foreground);
         assert!(!plan.read_only_mount);
         assert_eq!(plan.vfs_config.principal, "alice");
+    }
+
+    #[test]
+    fn mount_plan_default_cache_tracks_client_root_metadata_dir() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root_a = temp.path().join("client-a");
+        let root_b = temp.path().join("client-b");
+
+        let cache_a = resolve_default_cache_for_client_root(&root_a, "projectfs");
+        let cache_b = resolve_default_cache_for_client_root(&root_b, "projectfs");
+
+        assert_eq!(cache_a, root_a.join("meta").join("projectfs").join("cache"));
+        assert_eq!(cache_b, root_b.join("meta").join("projectfs").join("cache"));
+        assert_ne!(cache_a, cache_b);
     }
 
     #[test]
