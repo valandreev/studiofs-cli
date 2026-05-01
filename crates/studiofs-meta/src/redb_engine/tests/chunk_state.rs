@@ -10,23 +10,51 @@ fn resolved_byte_view(
     length: u64,
     objects: &std::collections::BTreeMap<u64, Vec<u8>>,
 ) -> Vec<u8> {
+    let requested_end = offset
+        .checked_add(length)
+        .expect("test range end fits in file coordinates");
     let mut view = vec![0; usize::try_from(length).expect("test range fits in memory")];
     for span in spans {
-        let Some(payload) = span.payload.as_ref() else {
-            continue;
-        };
         let file_start = chunk_start_offset(span.chunk_id, DEFAULT_CHUNK_SIZE)
             .checked_add(u64::from(span.range.start))
             .expect("span file offset fits");
+        let file_end = file_start
+            .checked_add(u64::from(span.range.len()))
+            .expect("span end offset fits");
+        assert!(
+            file_start >= offset,
+            "resolved span starts before requested view: span={span:?}, offset={offset}"
+        );
+        assert!(
+            file_end <= requested_end,
+            "resolved span ends after requested view: span={span:?}, requested_end={requested_end}"
+        );
+        let Some(payload) = span.payload.as_ref() else {
+            continue;
+        };
         let dst_start =
             usize::try_from(file_start - offset).expect("span starts inside requested view");
         let payload_len = usize::try_from(payload.length).expect("payload length fits");
-        let dst_end = dst_start + payload_len;
+        let dst_end = dst_start
+            .checked_add(payload_len)
+            .expect("destination span end fits");
+        assert!(
+            dst_end <= view.len(),
+            "resolved span exceeds destination view: span={span:?}, view_len={}",
+            view.len()
+        );
         let src_start = usize::try_from(payload.offset).expect("payload offset fits");
-        let src_end = src_start + payload_len;
+        let src_end = src_start
+            .checked_add(payload_len)
+            .expect("source span end fits");
         let object = objects
             .get(&payload.object_id)
             .expect("payload object is available in test map");
+        assert!(
+            src_end <= object.len(),
+            "resolved span exceeds payload object: span={span:?}, object_len={}",
+            object.len()
+        );
         view[dst_start..dst_end].copy_from_slice(&object[src_start..src_end]);
     }
     view
@@ -864,16 +892,21 @@ fn test_contract_core_slice_graph_resolves_logical_byte_view_after_reopen() {
     }
 
     let mut expected = Vec::new();
+    // Chunk 0 tail: base bytes followed by overlay bytes crossing the boundary.
     expected.extend_from_slice(&objects[&101][4..8]);
     expected.extend_from_slice(&objects[&201][2..6]);
+    // Chunk 1: overlay shadows base, then later base order wins inside base.
     expected.extend_from_slice(&objects[&102][0..4]);
     expected.extend_from_slice(&objects[&201][6..14]);
     expected.extend_from_slice(&objects[&103][8..12]);
+    // Tombstone masks lower-precedence base and resolves as zero-filled bytes.
     expected.extend_from_slice(&objects[&102][16..18]);
     expected.extend_from_slice(&[0; 4]);
     expected.extend_from_slice(&objects[&102][22..24]);
+    // Fragmented slices read disjoint ranges from one payload object.
     expected.extend_from_slice(&objects[&202][2..6]);
     expected.extend_from_slice(&objects[&202][6..10]);
+    // Sparse tail remains zero-filled.
     expected.extend_from_slice(&[0; 8]);
     assert_eq!(expected.len(), usize::try_from(query_len).unwrap());
 
