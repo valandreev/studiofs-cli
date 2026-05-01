@@ -19,7 +19,8 @@ studiofs-cli/
   │   ├── studiofs-cache/     # L1/L2 cache
   │   ├── studiofs-vfs/       # filesystem core
   │   ├── studiofs-fuse/      # Unix bridge
-  │   └── studiofs-winfsp/    # Windows bridge
+  │   ├── studiofs-winfsp/    # Windows bridge
+  │   └── studiofs-e2e/       # real mounted E2E runner
   └── docs/
 ```
 
@@ -131,6 +132,7 @@ Targeted:
 cargo test -p studiofs-meta pg_engine::tests::test_pg_ -- --ignored --nocapture --test-threads=1
 cargo test -p studiofs-vfs --test vfs_test -- --ignored --nocapture --test-threads=1
 cargo test -p studiofs-data --test integration_test -- --ignored --nocapture
+cargo test -p studiofs-e2e --test sfs318_runner
 ```
 
 ## Multi-Client Dev Flow

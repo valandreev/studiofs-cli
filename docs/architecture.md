@@ -31,7 +31,8 @@ studiofs (CLI)
   ├── studiofs-cache      local cache backend + upload runtime
   ├── studiofs-vfs        filesystem core
   ├── studiofs-fuse       Linux/macOS bridge
-  └── studiofs-winfsp     Windows bridge
+  ├── studiofs-winfsp     Windows bridge
+  └── studiofs-e2e        real mounted E2E runner
 ```
 
 ## Metadata Architecture

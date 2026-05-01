@@ -1,0 +1,21 @@
+[package]
+name = "studiofs-e2e"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "studiofs-e2e"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[dev-dependencies]
+tempfile.workspace = true

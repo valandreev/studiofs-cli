@@ -123,12 +123,26 @@ complete smoke-test strategy, CI integration, and self-hosted runner contract.
 
 ### Real mounted E2E runner contract
 
-The future real E2E runner must follow
+The real E2E runner lives in the `studiofs-e2e` workspace crate and must follow
 [docs/e2e-runner-contract.md](e2e-runner-contract.md). That contract fixes the
 runner crate boundary, CLI shape, `target/e2e-runs/<run-id>` sandbox layout,
 required artifact names, report schema, preflight gates, cleanup safety rules,
 and the smoke-first scenario rollout. Real E2E runs stay outside the default
 fast suite.
+
+Initial runner commands:
+
+```powershell
+cargo run -p studiofs-e2e -- list
+cargo run -p studiofs-e2e -- run basic-multi-client-smoke
+cargo run -p studiofs-e2e -- clean
+```
+
+Focused runner skeleton check:
+
+```powershell
+cargo test -p studiofs-e2e --test sfs318_runner
+```
 
 ## Platform-Gated Unit Tests
 
