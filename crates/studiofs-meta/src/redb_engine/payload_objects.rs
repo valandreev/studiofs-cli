@@ -423,12 +423,12 @@ impl MetaPayloadObjects for RedbMetaEngine {
             if attr.content_epoch != expected_epoch {
                 return Ok(false);
             }
-            if !Self::regular_file_overlay_payloads_publish_ready_in_txn(&txn, ino)? {
-                return Ok(false);
-            }
 
-            let (committed_size, removed_object_ids) =
-                Self::publish_regular_file_overlay_to_base_in_txn(&txn, ino)?;
+            let Some((committed_size, removed_object_ids)) =
+                Self::publish_regular_file_overlay_to_base_in_txn(&txn, ino)?
+            else {
+                return Ok(false);
+            };
             let published_base_chunks = Self::regular_file_chunk_rows_for_inode_in_write_txn(
                 &txn,
                 REGULAR_FILE_BASE_TABLE,
