@@ -75,6 +75,8 @@ fn test_online_endpoint() -> String {
 const DEFAULT_AJA_SEQUENTIAL_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_AJA_SEQUENTIAL_CHUNK_COUNT: usize = 8;
 const DEFAULT_AJA_MIN_THROUGHPUT_MIB_PER_SEC: f64 = 64.0;
+const AJA_MIN_THROUGHPUT_ENV: &str = "STUDIOFS_WINFSP_AJA_MIN_THROUGHPUT_MIB_PER_SEC";
+const LEGACY_AJA_MIN_THROUGHPUT_ENV: &str = "STUDIOFS_WINFSP_WRITE_MIN_THROUGHPUT_MIB_PER_SEC";
 const MAX_AJA_SEQUENTIAL_CHUNK_BYTES: usize = 64 * 1024 * 1024;
 const MAX_AJA_SEQUENTIAL_CHUNK_COUNT: usize = 128;
 const MAX_AJA_SEQUENTIAL_TOTAL_BYTES: usize = 512 * 1024 * 1024;
@@ -258,12 +260,16 @@ fn test_mount_usize_env_var(key: &str, default: usize) -> usize {
 }
 
 fn test_mount_f64_env_var(key: &str, default: f64) -> Result<f64, String> {
+    test_mount_f64_env_var_any(&[key], default)
+}
+
+fn test_mount_f64_env_var_any(keys: &[&str], default: f64) -> Result<f64, String> {
     load_test_env();
-    match std::env::var(key) {
-        Ok(value) => {
+    for key in keys {
+        if let Ok(value) = std::env::var(key) {
             let trimmed = value.trim();
             if trimmed.is_empty() {
-                return Ok(default);
+                continue;
             }
             let parsed = trimmed.parse::<f64>().map_err(|err| {
                 format!("{key} must be a positive MiB/s value, got '{trimmed}': {err}")
@@ -273,10 +279,10 @@ fn test_mount_f64_env_var(key: &str, default: f64) -> Result<f64, String> {
                     "{key} must be a positive MiB/s value, got '{trimmed}'"
                 ));
             }
-            Ok(parsed)
+            return Ok(parsed);
         }
-        Err(_) => Ok(default),
     }
+    Ok(default)
 }
 
 fn aja_sequential_chunk_bytes() -> usize {
@@ -294,8 +300,8 @@ fn aja_sequential_chunk_count() -> usize {
 }
 
 fn aja_sequential_min_throughput_mib_per_sec() -> Result<f64, String> {
-    test_mount_f64_env_var(
-        "STUDIOFS_WINFSP_WRITE_MIN_THROUGHPUT_MIB_PER_SEC",
+    test_mount_f64_env_var_any(
+        &[AJA_MIN_THROUGHPUT_ENV, LEGACY_AJA_MIN_THROUGHPUT_ENV],
         DEFAULT_AJA_MIN_THROUGHPUT_MIB_PER_SEC,
     )
 }
@@ -1767,12 +1773,13 @@ fn winfsp_mount_write_wall_and_gate_contention_smoke() {
         }
     };
 
-    // Keep the dirty cap valid for the writer stack by matching it to the test
-    // block size. Values below one block fail before they can exercise the
-    // mounted backpressure path.
+    // Keep the dirty cap large enough for Windows/WinFSP cached-write
+    // coalescing. Hosted Windows runners can deliver a single callback larger
+    // than the user-mode write_all chunk; values below that callback granule
+    // fail in the writer buffer before they exercise the mounted write path.
     const CHUNK_BYTES: usize = 512 * 1024;
     const CHUNK_COUNT: usize = 16;
-    const MAX_DIRTY_BYTES: usize = CHUNK_BYTES;
+    const MAX_DIRTY_BYTES: usize = 4 * 1024 * 1024;
     const TOTAL_BYTES: usize = CHUNK_BYTES * CHUNK_COUNT;
     const MAX_ELAPSED_SECS: u64 = 120;
 

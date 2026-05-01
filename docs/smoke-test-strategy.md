@@ -193,7 +193,7 @@ online coverage when a reachable S3 endpoint is configured.
 |----------|----------|---------|---------|
 | `STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS` | Yes | — | Gate: must be `1` to enable smoke tests |
 | `STUDIOFS_WINFSP_TEST_MOUNT_POINT` | Windows only | — | Drive letter for WinFSP mount (e.g. `Z:`) |
-| `STUDIOFS_WINFSP_AJA_MIN_THROUGHPUT_MIB_PER_SEC` | Windows only | `64` in test code, `16` in hosted CI | Minimum AJA sequential write throughput floor |
+| `STUDIOFS_WINFSP_AJA_MIN_THROUGHPUT_MIB_PER_SEC` | Windows only | `64` in test code, `16` in hosted CI | Minimum AJA sequential write throughput floor; legacy alias: `STUDIOFS_WINFSP_WRITE_MIN_THROUGHPUT_MIB_PER_SEC` |
 
 ---
 
