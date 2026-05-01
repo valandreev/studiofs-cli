@@ -31,7 +31,7 @@ pub struct RunReport {
     pub exit_code: i32,
     pub started_at: String,
     pub finished_at: String,
-    pub duration_ms: u128,
+    pub duration_ms: u64,
     pub runner: RunnerReport,
     pub host: HostReport,
     pub sandbox: SandboxReport,
@@ -82,7 +82,7 @@ pub struct ScenarioReport {
     pub status: ScenarioStatus,
     pub started_at: String,
     pub finished_at: String,
-    pub duration_ms: u128,
+    pub duration_ms: u64,
     pub artifacts: Vec<String>,
     pub error: Option<String>,
 }
@@ -108,4 +108,62 @@ pub struct EventRecord {
     pub scenario: Option<String>,
     pub hook: String,
     pub phase: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn report_duration_fields_accept_u64_values() {
+        let duration: u64 = 42;
+        let scenario = ScenarioReport {
+            name: "basic-multi-client-smoke".to_string(),
+            seed: 1,
+            status: ScenarioStatus::Passed,
+            started_at: "2026-05-01T00:00:00Z".to_string(),
+            finished_at: "2026-05-01T00:00:01Z".to_string(),
+            duration_ms: duration,
+            artifacts: Vec::new(),
+            error: None,
+        };
+        let report = RunReport {
+            schema_version: 1,
+            run_id: "run-1".to_string(),
+            seed: 1,
+            status: RunStatus::Passed,
+            exit_code: 0,
+            started_at: "2026-05-01T00:00:00Z".to_string(),
+            finished_at: "2026-05-01T00:00:01Z".to_string(),
+            duration_ms: duration,
+            runner: RunnerReport {
+                crate_name: "studiofs-e2e".to_string(),
+                version: "0.1.0".to_string(),
+                git_sha: "unknown".to_string(),
+            },
+            host: HostReport {
+                os: "windows".to_string(),
+                arch: "x86_64".to_string(),
+                platform: "windows-winfsp".to_string(),
+            },
+            sandbox: SandboxReport {
+                root: "target/e2e-runs/run-1".to_string(),
+                retention: RetentionPolicy::Always,
+            },
+            preflight: PreflightReport {
+                status: RunStatus::Passed,
+                checks: Vec::new(),
+            },
+            scenarios: vec![scenario],
+            artifacts: Vec::new(),
+            cleanup: CleanupReport {
+                status: RunStatus::Passed,
+                actions: Vec::new(),
+                errors: Vec::new(),
+            },
+        };
+
+        assert_eq!(report.duration_ms, duration);
+        assert_eq!(report.scenarios[0].duration_ms, duration);
+    }
 }

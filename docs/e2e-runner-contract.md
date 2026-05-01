@@ -73,6 +73,7 @@ Every run creates exactly one canonical sandbox:
 
 ```text
 target/e2e-runs/<run-id>/
+  .studiofs-e2e-runner.json
   run.json
   report.json
   events.ndjson
@@ -114,6 +115,7 @@ The following artifact names are required and stable:
 
 | Artifact | Purpose |
 |---|---|
+| `.studiofs-e2e-runner.json` | Hidden ownership marker used by safe cleanup before deleting a sandbox. |
 | `report.json` | Final machine-readable report. |
 | `events.ndjson` | Append-only event stream for progress and post-mortem timeline. |
 | `stdout.log` | Runner stdout mirror. |
@@ -311,6 +313,10 @@ Rules:
 - Canonicalize every path before deletion.
 - Refuse to delete empty paths, drive roots, filesystem roots, the repository
   root, user home directories, and broad temp roots.
+- Delete a sandbox only when both `run.json` and `.studiofs-e2e-runner.json`
+  identify `studiofs-e2e`, the run ID matches the directory name, the manifest
+  sandbox path canonicalizes back to that directory, and the required sandbox
+  layout is present.
 - Delete a path only when it is inside `target/e2e-runs/<run-id>` or exactly
   matches an explicit client root recorded in `run.json`.
 - Treat symlinks and junctions as leaf entries. Do not recursively follow them

@@ -85,6 +85,7 @@ fn run_creates_per_run_sandbox_manifest_report_and_validation_artifact() {
 
     let sandbox = temp.path().join("e2e-runs").join("sfs318-test-run");
     assert_required_sandbox_files(&sandbox);
+    assert!(sandbox.join(".studiofs-e2e-runner.json").exists());
 
     let run_manifest = read_json(sandbox.join("run.json"));
     assert_eq!(run_manifest["run_id"], "sfs318-test-run");
@@ -103,6 +104,13 @@ fn run_creates_per_run_sandbox_manifest_report_and_validation_artifact() {
     assert_eq!(
         report["scenarios"][0]["artifacts"][0],
         "artifacts/scenarios/basic-multi-client-smoke/validation.json"
+    );
+    assert!(
+        report["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|artifact| artifact["path"] == ".studiofs-e2e-runner.json")
     );
 
     let validation =
@@ -167,6 +175,24 @@ fn clean_removes_only_runner_owned_sandboxes() {
     assert_eq!(removed, vec![PathBuf::from("owned-run")]);
     assert!(!temp.path().join("e2e-runs").join("owned-run").exists());
     assert!(unrelated.join("notes.txt").exists());
+}
+
+#[test]
+fn clean_ignores_manifest_only_directories_without_runner_marker_and_layout() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().join("e2e-runs");
+    let fake = root.join("fake-run");
+    fs::create_dir_all(&fake).unwrap();
+    fs::write(
+        fake.join("run.json"),
+        r#"{"runner_crate":"studiofs-e2e","run_id":"fake-run"}"#,
+    )
+    .unwrap();
+
+    let removed = studiofs_e2e::runner::clean(CleanRequest { root }).unwrap();
+
+    assert!(removed.is_empty());
+    assert!(fake.join("run.json").exists());
 }
 
 fn assert_required_sandbox_files(sandbox: &Path) {

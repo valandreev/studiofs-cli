@@ -19,6 +19,8 @@ use crate::scenario::{self, ScenarioContext};
 
 const SCHEMA_VERSION: u32 = 1;
 const RUNNER_CRATE: &str = "studiofs-e2e";
+const RUNNER_MARKER_FILE: &str = ".studiofs-e2e-runner.json";
+const INITIAL_CLIENTS: &[&str] = &["client-a", "client-b"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -121,6 +123,12 @@ pub enum RunnerError {
     Scenario(#[from] scenario::ScenarioError),
 }
 
+#[derive(Debug)]
+struct ScenarioLifecycleOutcome {
+    report: ScenarioReport,
+    outcome: ScenarioOutcome,
+}
+
 pub fn run(request: RunRequest) -> Result<RunOutcome, RunnerError> {
     let started_instant = Instant::now();
     let started_at = timestamp();
@@ -152,6 +160,7 @@ pub fn run(request: RunRequest) -> Result<RunOutcome, RunnerError> {
         created_at: &started_at,
     });
     write_pretty_json(&sandbox.join("run.json"), &manifest)?;
+    write_runner_marker(&sandbox, &run_id)?;
     write_log_files(&sandbox)?;
     write_pretty_json(
         &sandbox.join("ports.json"),
@@ -178,8 +187,6 @@ pub fn run(request: RunRequest) -> Result<RunOutcome, RunnerError> {
             return Err(RunnerError::UnknownScenario(requested_name));
         };
         let definition = scenario.definition();
-        let scenario_started_instant = Instant::now();
-        let scenario_started_at = timestamp();
         let context = ScenarioContext {
             run_id: run_id.clone(),
             seed: request.seed,
@@ -190,35 +197,9 @@ pub fn run(request: RunRequest) -> Result<RunOutcome, RunnerError> {
                 .join(definition.name),
         };
 
-        run_hook(&events_path, &run_id, definition.name, "setup", || {
-            scenario.setup(&context)
-        })?;
-        run_hook(&events_path, &run_id, definition.name, "run", || {
-            scenario.run(&context)
-        })?;
-        let artifacts = run_hook(&events_path, &run_id, definition.name, "validate", || {
-            scenario.validate(&context)
-        })?;
-        run_hook(&events_path, &run_id, definition.name, "cleanup", || {
-            scenario.cleanup(&context)
-        })?;
-        let scenario_finished_at = timestamp();
-        let duration_ms = scenario_started_instant.elapsed().as_millis();
-        scenario_reports.push(ScenarioReport {
-            name: definition.name.to_string(),
-            seed: request.seed,
-            status: ScenarioStatus::Passed,
-            started_at: scenario_started_at,
-            finished_at: scenario_finished_at,
-            duration_ms,
-            artifacts: artifacts.clone(),
-            error: None,
-        });
-        scenario_outcomes.push(ScenarioOutcome {
-            name: definition.name.to_string(),
-            status: ScenarioStatus::Passed,
-            artifacts,
-        });
+        let lifecycle = run_scenario_lifecycle(&events_path, &run_id, scenario.as_ref(), &context)?;
+        scenario_reports.push(lifecycle.report);
+        scenario_outcomes.push(lifecycle.outcome);
     }
 
     record_event(&events_path, &run_id, None, "run", "finished")?;
@@ -239,7 +220,7 @@ pub fn run(request: RunRequest) -> Result<RunOutcome, RunnerError> {
         exit_code: 0,
         started_at,
         finished_at,
-        duration_ms: started_instant.elapsed().as_millis(),
+        duration_ms: duration_millis(started_instant),
         runner: RunnerReport {
             crate_name: RUNNER_CRATE.to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -309,15 +290,16 @@ pub fn clean(request: CleanRequest) -> Result<Vec<PathBuf>, RunnerError> {
 
 fn create_sandbox_layout(sandbox: &Path, scenarios: &[String]) -> Result<(), RunnerError> {
     fs::create_dir_all(sandbox)?;
-    for path in [
-        sandbox.join("artifacts/docker"),
-        sandbox.join("artifacts/commands"),
-        sandbox.join("artifacts/clients/client-a/client-root"),
-        sandbox.join("artifacts/clients/client-a/mount"),
-        sandbox.join("artifacts/clients/client-b/client-root"),
-        sandbox.join("artifacts/clients/client-b/mount"),
-    ] {
-        fs::create_dir_all(path)?;
+    fs::create_dir_all(sandbox.join("artifacts/docker"))?;
+    fs::create_dir_all(sandbox.join("artifacts/commands"))?;
+    for client in INITIAL_CLIENTS {
+        fs::create_dir_all(
+            sandbox
+                .join("artifacts/clients")
+                .join(client)
+                .join("client-root"),
+        )?;
+        fs::create_dir_all(sandbox.join("artifacts/clients").join(client).join("mount"))?;
     }
     for scenario in scenarios {
         let name = scenario::resolve_scenario(scenario)
@@ -342,8 +324,21 @@ struct ManifestInput<'a> {
 }
 
 fn build_manifest(input: ManifestInput<'_>) -> RunManifest {
-    let client_a = input.sandbox.join("artifacts/clients/client-a/client-root");
-    let client_b = input.sandbox.join("artifacts/clients/client-b/client-root");
+    let explicit_client_roots: Vec<_> = INITIAL_CLIENTS
+        .iter()
+        .map(|client| {
+            input
+                .sandbox
+                .join("artifacts/clients")
+                .join(client)
+                .join("client-root")
+                .display()
+                .to_string()
+        })
+        .collect();
+    let mut cleanup_allowlist = Vec::with_capacity(explicit_client_roots.len() + 1);
+    cleanup_allowlist.push(input.sandbox.display().to_string());
+    cleanup_allowlist.extend(explicit_client_roots.iter().cloned());
     RunManifest {
         schema_version: SCHEMA_VERSION,
         runner_crate: RUNNER_CRATE.to_string(),
@@ -356,17 +351,69 @@ fn build_manifest(input: ManifestInput<'_>) -> RunManifest {
         studiofs_bin: input.studiofs_bin.map(|path| path.display().to_string()),
         port_range: input.port_range.map(str::to_string),
         timeout: input.timeout.map(str::to_string),
-        explicit_client_roots: vec![
-            client_a.display().to_string(),
-            client_b.display().to_string(),
-        ],
-        cleanup_allowlist: vec![
-            input.sandbox.display().to_string(),
-            client_a.display().to_string(),
-            client_b.display().to_string(),
-        ],
+        explicit_client_roots,
+        cleanup_allowlist,
         created_at: input.created_at.to_string(),
     }
+}
+
+fn run_scenario_lifecycle(
+    events_path: &Path,
+    run_id: &str,
+    scenario: &dyn scenario::Scenario,
+    context: &ScenarioContext,
+) -> Result<ScenarioLifecycleOutcome, RunnerError> {
+    let definition = scenario.definition();
+    let started_at = timestamp();
+    let started_instant = Instant::now();
+
+    let result = run_scenario_body(events_path, run_id, scenario, context);
+    let cleanup_result = run_hook(events_path, run_id, definition.name, "cleanup", || {
+        scenario.cleanup(context)
+    });
+
+    match (result, cleanup_result) {
+        (Ok(artifacts), Ok(())) => {
+            let finished_at = timestamp();
+            Ok(ScenarioLifecycleOutcome {
+                report: ScenarioReport {
+                    name: definition.name.to_string(),
+                    seed: context.seed,
+                    status: ScenarioStatus::Passed,
+                    started_at,
+                    finished_at,
+                    duration_ms: duration_millis(started_instant),
+                    artifacts: artifacts.clone(),
+                    error: None,
+                },
+                outcome: ScenarioOutcome {
+                    name: definition.name.to_string(),
+                    status: ScenarioStatus::Passed,
+                    artifacts,
+                },
+            })
+        }
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(_), Err(cleanup)) | (Err(_), Err(cleanup)) => Err(cleanup),
+    }
+}
+
+fn run_scenario_body(
+    events_path: &Path,
+    run_id: &str,
+    scenario: &dyn scenario::Scenario,
+    context: &ScenarioContext,
+) -> Result<Vec<String>, RunnerError> {
+    let definition = scenario.definition();
+    run_hook(events_path, run_id, definition.name, "setup", || {
+        scenario.setup(context)
+    })?;
+    run_hook(events_path, run_id, definition.name, "run", || {
+        scenario.run(context)
+    })?;
+    run_hook(events_path, run_id, definition.name, "validate", || {
+        scenario.validate(context)
+    })
 }
 
 fn run_hook<T>(
@@ -377,9 +424,15 @@ fn run_hook<T>(
     f: impl FnOnce() -> Result<T, scenario::ScenarioError>,
 ) -> Result<T, RunnerError> {
     record_event(events_path, run_id, Some(scenario), hook, "started")?;
-    let result = f()?;
-    record_event(events_path, run_id, Some(scenario), hook, "finished")?;
-    Ok(result)
+    let result = f();
+    record_event(
+        events_path,
+        run_id,
+        Some(scenario),
+        hook,
+        if result.is_ok() { "finished" } else { "failed" },
+    )?;
+    Ok(result?)
 }
 
 fn record_event(
@@ -407,6 +460,11 @@ fn record_event(
 
 fn required_artifacts(scenarios: &[ScenarioOutcome]) -> Vec<ArtifactReport> {
     let mut artifacts = vec![
+        ArtifactReport {
+            name: RUNNER_MARKER_FILE.to_string(),
+            path: RUNNER_MARKER_FILE.to_string(),
+            required: true,
+        },
         ArtifactReport {
             name: "report.json".to_string(),
             path: "report.json".to_string(),
@@ -436,17 +494,22 @@ fn required_artifacts(scenarios: &[ScenarioOutcome]) -> Vec<ArtifactReport> {
     for scenario in scenarios {
         for path in &scenario.artifacts {
             artifacts.push(ArtifactReport {
-                name: Path::new(path)
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("artifact")
-                    .to_string(),
+                name: artifact_name(path),
                 path: path.clone(),
                 required: false,
             });
         }
     }
     artifacts
+}
+
+fn artifact_name(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    if normalized.trim_matches('/').is_empty() {
+        "artifact".to_string()
+    } else {
+        normalized
+    }
 }
 
 fn write_log_files(sandbox: &Path) -> Result<(), RunnerError> {
@@ -463,13 +526,60 @@ fn write_pretty_json<T: Serialize>(path: &Path, value: &T) -> Result<(), RunnerE
     Ok(())
 }
 
+fn write_runner_marker(sandbox: &Path, run_id: &str) -> Result<(), RunnerError> {
+    write_pretty_json(
+        &sandbox.join(RUNNER_MARKER_FILE),
+        &serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "runner_crate": RUNNER_CRATE,
+            "run_id": run_id,
+            "sandbox": sandbox.display().to_string(),
+        }),
+    )
+}
+
 fn is_runner_owned_sandbox(path: &Path) -> Result<bool, RunnerError> {
     let manifest = path.join("run.json");
-    if !manifest.exists() {
+    let marker = path.join(RUNNER_MARKER_FILE);
+    if !manifest.exists() || !marker.exists() {
         return Ok(false);
     }
     let value: serde_json::Value = serde_json::from_slice(&fs::read(manifest)?)?;
-    Ok(value["runner_crate"] == RUNNER_CRATE)
+    let marker_value: serde_json::Value = serde_json::from_slice(&fs::read(marker)?)?;
+    if value["runner_crate"] != RUNNER_CRATE || marker_value["runner_crate"] != RUNNER_CRATE {
+        return Ok(false);
+    }
+    let Some(run_id) = value["run_id"].as_str() else {
+        return Ok(false);
+    };
+    if marker_value["run_id"] != run_id {
+        return Ok(false);
+    }
+    if path.file_name().and_then(|name| name.to_str()) != Some(run_id) {
+        return Ok(false);
+    }
+    let Some(manifest_sandbox) = value["sandbox"].as_str() else {
+        return Ok(false);
+    };
+    if !Path::new(manifest_sandbox).exists()
+        || Path::new(manifest_sandbox).canonicalize()? != path.canonicalize()?
+    {
+        return Ok(false);
+    }
+    for required in [
+        RUNNER_MARKER_FILE,
+        "run.json",
+        "report.json",
+        "events.ndjson",
+        "preflight.json",
+        "cleanup.json",
+        "artifacts",
+    ] {
+        if !path.join(required).exists() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn canonicalize_cleanup_root(root: &Path) -> Result<PathBuf, RunnerError> {
@@ -499,11 +609,122 @@ fn timestamp() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
+fn duration_millis(started_at: Instant) -> u64 {
+    u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
 fn host_platform() -> &'static str {
     match std::env::consts::OS {
         "windows" => "windows-winfsp",
         "macos" => "macos-fuse",
         "linux" => "linux-fuse",
         _ => "auto",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+
+    #[derive(Debug)]
+    struct FailingValidateScenario {
+        calls: RefCell<Vec<&'static str>>,
+        cleaned: Cell<bool>,
+    }
+
+    impl FailingValidateScenario {
+        fn new() -> Self {
+            Self {
+                calls: RefCell::new(Vec::new()),
+                cleaned: Cell::new(false),
+            }
+        }
+    }
+
+    impl scenario::Scenario for FailingValidateScenario {
+        fn definition(&self) -> scenario::ScenarioDefinition {
+            scenario::ScenarioDefinition {
+                name: "failing-validate",
+                description: "test scenario",
+            }
+        }
+
+        fn setup(&self, _context: &ScenarioContext) -> Result<(), scenario::ScenarioError> {
+            self.calls.borrow_mut().push("setup");
+            Ok(())
+        }
+
+        fn run(&self, _context: &ScenarioContext) -> Result<(), scenario::ScenarioError> {
+            self.calls.borrow_mut().push("run");
+            Ok(())
+        }
+
+        fn validate(
+            &self,
+            _context: &ScenarioContext,
+        ) -> Result<Vec<String>, scenario::ScenarioError> {
+            self.calls.borrow_mut().push("validate");
+            Err(scenario::ScenarioError::Json(serde_json::Error::io(
+                std::io::Error::other("validation failed"),
+            )))
+        }
+
+        fn cleanup(&self, _context: &ScenarioContext) -> Result<(), scenario::ScenarioError> {
+            self.calls.borrow_mut().push("cleanup");
+            self.cleaned.set(true);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn scenario_lifecycle_runs_cleanup_after_validate_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let events_path = temp.path().join("events.ndjson");
+        let context = ScenarioContext {
+            run_id: "run-1".to_string(),
+            seed: 1,
+            sandbox: temp.path().to_path_buf(),
+            scenario_dir: temp.path().join("scenario"),
+        };
+        let scenario = FailingValidateScenario::new();
+
+        let result = run_scenario_lifecycle(&events_path, "run-1", &scenario, &context);
+
+        assert!(result.is_err());
+        assert!(scenario.cleaned.get());
+        assert_eq!(
+            scenario.calls.borrow().as_slice(),
+            ["setup", "run", "validate", "cleanup"]
+        );
+    }
+
+    #[test]
+    fn artifact_report_names_include_relative_path_context() {
+        let artifacts = required_artifacts(&[
+            ScenarioOutcome {
+                name: "a".to_string(),
+                status: ScenarioStatus::Passed,
+                artifacts: vec!["artifacts/scenarios/a/logs.txt".to_string()],
+            },
+            ScenarioOutcome {
+                name: "b".to_string(),
+                status: ScenarioStatus::Passed,
+                artifacts: vec!["artifacts/scenarios/b/logs.txt".to_string()],
+            },
+        ]);
+        let names: Vec<_> = artifacts
+            .iter()
+            .filter(|artifact| artifact.path.ends_with("logs.txt"))
+            .map(|artifact| artifact.name.as_str())
+            .collect();
+
+        assert_eq!(
+            names,
+            [
+                "artifacts/scenarios/a/logs.txt",
+                "artifacts/scenarios/b/logs.txt"
+            ]
+        );
     }
 }
