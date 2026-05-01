@@ -48,7 +48,8 @@ studiofs (CLI)
   ├── studiofs-cache      local payload backend + upload queue
   ├── studiofs-vfs        filesystem core
   ├── studiofs-fuse       Linux/macOS bridge
-  └── studiofs-winfsp     Windows bridge
+  ├── studiofs-winfsp     Windows bridge
+  └── studiofs-e2e        real mounted E2E runner
 ```
 
 Key points:
@@ -198,6 +199,14 @@ Focused Local-First regression:
 
 ```bash
 cargo test -p studiofs-vfs --test vfs_test foreground_read_baseline_during_and_post_upload_are_comparable -- --ignored --nocapture --test-threads=1
+```
+
+Real mounted E2E runner skeleton:
+
+```bash
+cargo run -p studiofs-e2e -- list
+cargo run -p studiofs-e2e -- run basic-multi-client-smoke
+cargo run -p studiofs-e2e -- clean
 ```
 
 Local development and infra-backed tests use RustFS as the default

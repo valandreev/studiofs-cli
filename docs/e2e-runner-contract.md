@@ -11,8 +11,8 @@ object storage, and a real FUSE, macFUSE, or WinFSP mount.
 
 ## Runner Boundaries And CLI
 
-The runner belongs in a dedicated workspace crate, expected to be named
-`studiofs-e2e-runner`, with a binary named `studiofs-e2e`. The crate owns
+The runner belongs in a dedicated workspace crate named `studiofs-e2e`, with a
+binary named `studiofs-e2e`. The crate owns
 orchestration only:
 
 - preflight checks and run planning;
@@ -27,7 +27,15 @@ reach into VFS, metadata, cache, FUSE, or WinFSP internals to make a scenario
 pass. Shared helpers are acceptable only for stable test utilities that do not
 change mounted-runtime semantics.
 
-Expected CLI shape:
+Initial operator commands:
+
+```text
+cargo run -p studiofs-e2e -- list
+cargo run -p studiofs-e2e -- run basic-multi-client-smoke
+cargo run -p studiofs-e2e -- clean
+```
+
+Expanded run CLI shape:
 
 ```text
 studiofs-e2e run \
@@ -40,23 +48,24 @@ studiofs-e2e run \
   --report target/e2e-runs/<run-id>/report.json
 ```
 
-Required initial flags:
+Required initial run flags:
 
 | Flag | Contract |
 |---|---|
-| `--scenario <name>` | Repeatable. Initial accepted value is `smoke`; later gates add convergence, outage, and collision names. |
-| `--studiofs-bin <path>` | Path to the product CLI under test. The runner may build it only when an explicit build flag is added. |
+| `basic-multi-client-smoke` | Positional shorthand for the initial placeholder smoke scenario. |
+| `--scenario <name>` | Repeatable. Initial accepted values are `basic-multi-client-smoke` and the `smoke` alias; later gates add convergence, outage, and collision names. |
+| `--studiofs-bin <path>` | Path to the product CLI under test. The initial placeholder scenario records but does not require it; real mount scenarios must require it. The runner may build it only when an explicit build flag is added. |
 | `--root <path>` | Parent run directory. Defaults to `target/e2e-runs`. |
-| `--run-id <id>` | Optional stable run ID. If omitted, use an ISO-like UTC timestamp plus short random suffix. |
+| `--run-id <id>` | Optional stable run ID. If omitted, use an ISO-like UTC timestamp plus short random suffix. Explicit IDs must be safe single directory names: no separators, drive prefixes, traversal segments, leading dots, or other shell/path metacharacters. |
 | `--platform auto|linux-fuse|macos-fuse|windows-winfsp` | Mount backend selection. `auto` resolves from host OS and installed driver checks. |
 | `--retain always|on-failure|never` | Sandbox retention policy. Default is `on-failure`. |
 | `--report <path>` | Optional copy target for the final `report.json`. The canonical report remains in the run sandbox while the sandbox is retained. |
 | `--port-range <start-end>` | Optional deterministic host port pool for Docker services. |
 | `--timeout <duration>` | Whole-run timeout; per-hook timeouts are derived from it unless overridden later. |
 
-The initial runner should implement `run` only. Future subcommands may add
-`list-scenarios`, `preflight`, and `cleanup`, but those must reuse the same
-report schema and cleanup safety checks.
+The initial runner implements `list`, `run`, and `clean`. Future subcommands
+may add dedicated `preflight` or artifact commands, but those must reuse the
+same report schema and cleanup safety checks.
 
 ## Sandbox Layout
 
@@ -64,6 +73,7 @@ Every run creates exactly one canonical sandbox:
 
 ```text
 target/e2e-runs/<run-id>/
+  .studiofs-e2e-runner.json
   run.json
   report.json
   events.ndjson
@@ -105,6 +115,7 @@ The following artifact names are required and stable:
 
 | Artifact | Purpose |
 |---|---|
+| `.studiofs-e2e-runner.json` | Hidden ownership marker used by safe cleanup before deleting a sandbox. |
 | `report.json` | Final machine-readable report. |
 | `events.ndjson` | Append-only event stream for progress and post-mortem timeline. |
 | `stdout.log` | Runner stdout mirror. |
@@ -148,7 +159,7 @@ Minimum shape:
   "finished_at": "2026-05-01T18:16:12Z",
   "duration_ms": 42000,
   "runner": {
-    "crate": "studiofs-e2e-runner",
+    "crate": "studiofs-e2e",
     "version": "0.1.0",
     "git_sha": "unknown"
   },
@@ -302,6 +313,13 @@ Rules:
 - Canonicalize every path before deletion.
 - Refuse to delete empty paths, drive roots, filesystem roots, the repository
   root, user home directories, and broad temp roots.
+- Delete a sandbox only when both `run.json` and `.studiofs-e2e-runner.json`
+  identify `studiofs-e2e`, the run ID matches the directory name, the manifest
+  sandbox path canonicalizes back to that directory, and the required sandbox
+  layout is present.
+- A malformed or undeletable candidate inside the cleanup root must be retained
+  and recorded as skipped; it must not prevent cleanup from attempting later
+  valid runner-owned sandboxes in the same root.
 - Delete a path only when it is inside `target/e2e-runs/<run-id>` or exactly
   matches an explicit client root recorded in `run.json`.
 - Treat symlinks and junctions as leaf entries. Do not recursively follow them
