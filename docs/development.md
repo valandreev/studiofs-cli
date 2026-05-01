@@ -80,6 +80,32 @@ The GitHub-hosted macOS and Windows jobs are independent from RWX. Required
 branch protection should include the RWX Linux gate; hosted macOS and Windows
 Actions can be started manually from the GitHub Actions UI when needed.
 
+### RWX local CLI and logs
+
+RWX workflow definitions live in `.rwx/`:
+
+- `.rwx/ci.yml` — Ubuntu quality gates and Ubuntu Linux tests.
+- `.rwx/rocky.yml` — Rocky Linux tests.
+
+When diagnosing RWX failures locally, keep the RWX CLI binary under
+`.rwx/bin/`. That directory is ignored by Git and is only a local tool cache;
+do not vendor the binary into commits. On Windows the local path is typically:
+
+```powershell
+.\.rwx\bin\rwx-windows-x86_64.exe
+```
+
+Fetch task logs with the local binary:
+
+```powershell
+.\.rwx\bin\rwx-windows-x86_64.exe logs <task-id> --output-dir .rwx\downloads\current\<task-name>
+```
+
+Downloaded logs belong under `.rwx/downloads/`; that directory has its own
+`.gitignore` and should remain uncommitted. If `.rwx/bin/` is empty, download
+the matching RWX CLI release binary from the official RWX GitHub release before
+running `rwx logs`.
+
 ## Tests
 
 Fast suite:
