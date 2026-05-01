@@ -1,0 +1,183 @@
+use std::cell::RefCell;
+use std::path::PathBuf;
+
+use studiofs_e2e::infra::{
+    CommandExecutor, CommandOutput, ComposeConfig, DockerComposeStack, InfraError,
+};
+use tempfile::tempdir;
+
+#[test]
+fn compose_file_defines_required_services_healthchecks_and_project_ports() {
+    let compose = std::fs::read_to_string(repo_root().join("docker/compose.e2e.yml")).unwrap();
+
+    for service in ["postgres:", "rustfs:", "toxiproxy:"] {
+        assert!(compose.contains(service), "missing service {service}");
+    }
+    assert!(
+        compose.contains("postgres:18-alpine"),
+        "PostgreSQL image must match the planned production major version"
+    );
+    assert!(
+        compose.contains("pg_isready"),
+        "postgres healthcheck must use pg_isready"
+    );
+    assert!(
+        compose.contains("http://localhost:9000/health"),
+        "rustfs healthcheck must probe the S3 service health endpoint"
+    );
+    assert!(
+        compose.contains("STUDIOFS_E2E_POSTGRES_PORT")
+            && compose.contains("STUDIOFS_E2E_RUSTFS_PORT")
+            && compose.contains("STUDIOFS_E2E_TOXIPROXY_API_PORT"),
+        "compose file must use runner-provided host port env vars"
+    );
+    assert!(
+        compose.contains("postgres-data:") && compose.contains("rustfs-data:"),
+        "named volumes must be explicit so down --volumes can remove them"
+    );
+    assert!(
+        compose.contains("rustfs/rustfs:1.0.0-alpha.94"),
+        "RustFS image must be pinned to a versioned tag"
+    );
+    assert!(
+        !compose.contains("rustfs/rustfs:latest"),
+        "RustFS image must not use latest in reproducible E2E infra"
+    );
+}
+
+#[test]
+fn compose_stack_allocates_project_scoped_ports_and_builds_waiting_up_command() {
+    let temp = tempdir().unwrap();
+    let stack = DockerComposeStack::new(ComposeConfig {
+        run_id: "Compose.Run".to_string(),
+        sandbox: temp.path().join("compose-infra-run"),
+        compose_file: repo_root().join("docker/compose.e2e.yml"),
+        port_range: Some("31000-31010".to_string()),
+        wait_timeout_secs: 90,
+    })
+    .unwrap();
+
+    assert_eq!(stack.project_name(), "studiofs-e2e-compose-run");
+    assert_eq!(
+        stack
+            .ports()
+            .iter()
+            .map(|port| (port.service.as_str(), port.host_port))
+            .collect::<Vec<_>>(),
+        vec![
+            ("postgres", 31000),
+            ("rustfs", 31001),
+            ("rustfs-console", 31002),
+            ("toxiproxy-api", 31003),
+        ]
+    );
+
+    let command = stack.up_command();
+    assert_eq!(command.program, "docker");
+    assert!(
+        command
+            .args
+            .windows(2)
+            .any(|pair| pair == ["compose", "--project-name"])
+    );
+    assert!(command.args.contains(&"up".to_string()));
+    assert!(command.args.contains(&"--wait".to_string()));
+    assert!(command.args.contains(&"--wait-timeout".to_string()));
+    assert!(command.args.contains(&"90".to_string()));
+    assert!(
+        command
+            .env
+            .iter()
+            .any(|(key, value)| key == "STUDIOFS_E2E_POSTGRES_PORT" && value == "31000")
+    );
+}
+
+#[test]
+fn compose_stack_lifecycle_collects_logs_and_tears_down_volumes() {
+    let temp = tempdir().unwrap();
+    let stack = DockerComposeStack::new(ComposeConfig {
+        run_id: "compose-lifecycle".to_string(),
+        sandbox: temp.path().join("compose-lifecycle"),
+        compose_file: repo_root().join("docker/compose.e2e.yml"),
+        port_range: Some("32000-32010".to_string()),
+        wait_timeout_secs: 120,
+    })
+    .unwrap();
+    let executor = RecordingExecutor::default();
+
+    stack.prepare_artifacts().unwrap();
+    stack.start(&executor).unwrap();
+    stack.restart(&executor).unwrap();
+    let log_path = stack.collect_logs(&executor).unwrap();
+    stack.stop(&executor).unwrap();
+    stack.teardown(&executor).unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(log_path).unwrap(),
+        "postgres ready\nrustfs ready\n"
+    );
+    let calls = executor.calls.borrow();
+    assert!(calls.iter().any(|call| {
+        call.args.contains(&"up".to_string()) && call.args.contains(&"--wait".to_string())
+    }));
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.args.contains(&"restart".to_string()))
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.args.contains(&"stop".to_string()))
+    );
+    assert!(calls.iter().any(|call| {
+        call.args.contains(&"down".to_string()) && call.args.contains(&"--volumes".to_string())
+    }));
+}
+
+#[test]
+fn compose_stack_rejects_port_ranges_smaller_than_required_service_ports() {
+    let temp = tempdir().unwrap();
+    let err = DockerComposeStack::new(ComposeConfig {
+        run_id: "compose-small-range".to_string(),
+        sandbox: temp.path().join("compose-small-range"),
+        compose_file: repo_root().join("docker/compose.e2e.yml"),
+        port_range: Some("32000-32002".to_string()),
+        wait_timeout_secs: 120,
+    })
+    .unwrap_err();
+
+    match err {
+        InfraError::PortRangeTooSmall {
+            available, needed, ..
+        } => {
+            assert_eq!(available, 3);
+            assert_eq!(needed, 4);
+        }
+        other => panic!("expected small port range error, got {other:?}"),
+    }
+}
+
+#[derive(Default)]
+struct RecordingExecutor {
+    calls: RefCell<Vec<studiofs_e2e::infra::CommandSpec>>,
+}
+
+impl CommandExecutor for RecordingExecutor {
+    fn run(&self, command: &studiofs_e2e::infra::CommandSpec) -> std::io::Result<CommandOutput> {
+        self.calls.borrow_mut().push(command.clone());
+        Ok(CommandOutput {
+            status: 0,
+            stdout: "postgres ready\nrustfs ready\n".to_string(),
+            stderr: String::new(),
+        })
+    }
+}
+
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .unwrap()
+        .to_path_buf()
+}

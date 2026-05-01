@@ -1,4 +1,4 @@
-# SFS-278 Read Planning Allocation Note
+# Read Planning Allocation Note
 
 `DataReader::claim_unresolved_ranges` now uses reusable `SmallVec<[ReadRange; 8]>`
 buffers for unresolved and claimed range lists. The common fragmented

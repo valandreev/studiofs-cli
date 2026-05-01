@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::infra::{InfraMode, ServicePort};
 use crate::runner::{RetentionPolicy, RunStatus, ScenarioStatus};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,6 +15,9 @@ pub struct RunManifest {
     pub scenarios: Vec<String>,
     pub retention: RetentionPolicy,
     pub selected_platform: String,
+    pub infra: InfraMode,
+    pub compose_project: Option<String>,
+    pub allocated_ports: Vec<ServicePort>,
     pub studiofs_bin: Option<String>,
     pub port_range: Option<String>,
     pub timeout: Option<String>,
