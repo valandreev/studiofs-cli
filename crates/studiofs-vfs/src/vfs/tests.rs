@@ -7801,6 +7801,18 @@ fn read_only_metadata_authority_blocks_new_mutations_but_keeps_reads_open() {
     let fh = vfs
         .open_file(attr.ino, OpenFlags::RDWR, false)
         .expect("open writer before authority degrades");
+    let payload = b"known-readable-before-read-only";
+
+    rt.block_on(async {
+        let written = vfs
+            .write_fh(fh, attr.ino, 0, payload)
+            .await
+            .expect("write known readable payload before authority degrades");
+        assert_eq!(written as usize, payload.len());
+        vfs.flush_fh(fh)
+            .await
+            .expect("flush known readable payload before authority degrades");
+    });
 
     vfs.set_metadata_authority_status_for_test(Some(MetadataAuthorityStatus::read_only()));
 
@@ -7823,6 +7835,12 @@ fn read_only_metadata_authority_blocks_new_mutations_but_keeps_reads_open() {
     assert_eq!(ro_open.flags.bits(), OpenFlags::RDONLY.bits());
 
     rt.block_on(async {
+        let readable = vfs
+            .read(attr.ino, 0, payload.len() as u32)
+            .await
+            .expect("known readable state should stay readable after authority downgrade");
+        assert_eq!(readable.as_ref(), payload);
+
         let write_error = vfs
             .write_fh(fh, attr.ino, 0, b"abc")
             .await

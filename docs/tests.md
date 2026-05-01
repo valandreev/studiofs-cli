@@ -41,6 +41,7 @@ Focused harness checks:
 cargo test -p studiofs-meta contract_core_harness_runs_ops_and_reopens_with_invariants -- --nocapture
 cargo test -p studiofs-meta contract_core_harness -- --nocapture
 cargo test -p studiofs-meta sfs314_ -- --nocapture
+cargo test -p studiofs-meta sfs315_ -- --nocapture
 cargo test -p studiofs-vfs contract_vfs_harness_reopens_fixture_and_runs_core_invariants -- --nocapture
 cargo test -p studiofs-vfs sfs312_ -- --nocapture
 cargo test -p studiofs-vfs local_first_shutdown_reports_and_recovers_memory_only_writer_state -- --nocapture
@@ -194,6 +195,7 @@ regressions:
 - Recovery and replay
   - `test_pg_reopen_after_publish_before_local_persist_recovers_without_discover`
   - `test_pg_reopen_after_unpublished_local_create_flushes_without_discover`
+  - `sfs315_reopen_consumes_persisted_inode_and_object_headroom_without_pg`
   - `startup_replay_cancels_ready_inode_stale_pending_upload`
   - `test_truncate_shrink_then_extend_zero_fills_old_tail`
   - `test_write_at_exact_block_boundary_transition`
@@ -203,6 +205,11 @@ regressions:
   - `path_shortcut_cache_is_bounded_and_supports_negative_entries`
   - `dentry_cache_rejects_stale_namespace_tokens_lazily`
   - `attr_read_cache_is_bounded_and_tracks_hotset_hits`
+
+- Metadata authority and headroom
+  - `sfs315_failed_object_batch_preserves_smaller_inode_headroom`
+  - `sfs315_large_object_batch_replaces_undersized_prefetched_window`
+  - `read_only_metadata_authority_blocks_new_mutations_but_keeps_reads_open`
 
 Run a single focused regression:
 

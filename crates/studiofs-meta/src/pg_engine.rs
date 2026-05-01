@@ -744,10 +744,12 @@ impl PgMetaEngine {
     fn inode_window_reservation_needed(
         state: InodeAllocatorState,
         reason: InodeWindowReservationReason,
+        minimum_window_size: u64,
     ) -> bool {
         match reason {
             InodeWindowReservationReason::Current => {
-                !state.current.has_headroom() && !state.prefetched.has_headroom()
+                state.current.remaining() < minimum_window_size
+                    && state.prefetched.remaining() < minimum_window_size
             }
             InodeWindowReservationReason::Prefetch => {
                 state.current.has_headroom()
@@ -761,18 +763,21 @@ impl PgMetaEngine {
         state: &mut InodeAllocatorState,
         reason: InodeWindowReservationReason,
         window: InodeWindow,
+        minimum_window_size: u64,
     ) -> bool {
         match reason {
             InodeWindowReservationReason::Current => {
-                if !state.current.has_headroom() && !state.prefetched.has_headroom() {
-                    state.current = window;
-                    state.prefetched = InodeWindow::default();
-                    true
-                } else if state.current.has_headroom() && !state.prefetched.has_headroom() {
+                let current_fits = state.current.remaining() >= minimum_window_size;
+                let prefetched_fits = state.prefetched.remaining() >= minimum_window_size;
+                if current_fits || prefetched_fits {
+                    false
+                } else if state.current.has_headroom() {
                     state.prefetched = window;
                     true
                 } else {
-                    false
+                    state.current = window;
+                    state.prefetched = InodeWindow::default();
+                    true
                 }
             }
             InodeWindowReservationReason::Prefetch => {
@@ -836,7 +841,7 @@ impl PgMetaEngine {
                 .map_err(|_| MetaError::Storage("inode allocator lock poisoned".to_string()))?;
             let state = self.load_runtime_inode_allocator_state(slot)?;
             self.update_inode_headroom_flag(state);
-            if !Self::inode_window_reservation_needed(state, reason) {
+            if !Self::inode_window_reservation_needed(state, reason, minimum_window_size) {
                 return Ok(state);
             }
             self.inode_window_seed_hint(state, reason)?
@@ -848,7 +853,8 @@ impl PgMetaEngine {
             .lock()
             .map_err(|_| MetaError::Storage("inode allocator lock poisoned".to_string()))?;
         let mut state = self.load_runtime_inode_allocator_state(slot)?;
-        let applied = Self::apply_reserved_inode_window(&mut state, reason, window);
+        let applied =
+            Self::apply_reserved_inode_window(&mut state, reason, window, minimum_window_size);
         if applied {
             self.persist_inode_allocator_state(state)?;
         }
@@ -888,15 +894,11 @@ impl PgMetaEngine {
                     .lock()
                     .map_err(|_| MetaError::Storage("inode allocator lock poisoned".to_string()))?;
                 let mut state = self.load_runtime_inode_allocator_state(slot)?;
-                if state.current.remaining() < count && state.prefetched.has_headroom() {
+                if state.current.remaining() < count && state.prefetched.remaining() >= count {
                     state.current = state.prefetched;
                     state.prefetched = InodeWindow::default();
                 }
                 if state.current.remaining() < count {
-                    if state.current.has_headroom() {
-                        state.current.next = state.current.end;
-                        self.persist_inode_allocator_state(state)?;
-                    }
                     self.update_inode_headroom_flag(state);
                     None
                 } else {
@@ -914,10 +916,12 @@ impl PgMetaEngine {
                     let needs_current_refill = Self::inode_window_reservation_needed(
                         state,
                         InodeWindowReservationReason::Current,
+                        1,
                     );
                     let needs_prefetch = Self::inode_window_reservation_needed(
                         state,
                         InodeWindowReservationReason::Prefetch,
+                        1,
                     );
                     self.persist_inode_allocator_state(state)?;
                     self.update_inode_headroom_flag(state);
@@ -1828,8 +1832,11 @@ impl PgMetaEngine {
                 self.update_inode_headroom_flag(state);
                 state
             };
-            if !Self::inode_window_reservation_needed(state, InodeWindowReservationReason::Current)
-            {
+            if !Self::inode_window_reservation_needed(
+                state,
+                InodeWindowReservationReason::Current,
+                1,
+            ) {
                 return Ok(());
             }
             let _ =
@@ -5421,6 +5428,119 @@ mod tests {
     }
 
     #[test]
+    fn sfs315_reopen_consumes_persisted_inode_and_object_headroom_without_pg() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("meta.redb");
+        let local = RedbMetaEngine::open(&path).expect("open local redb");
+        local.init_root(0, 0).expect("init root");
+        local
+            .set_format_info(&format_info(
+                "sfs315-offline-reopen-headroom",
+                "sfs315-offline-reopen-headroom-uuid",
+                "postgres://127.0.0.1:1/studiofs",
+                1,
+            ))
+            .expect("set format info");
+
+        PgMetaEngine::persist_client_slot(&local, 5).expect("persist client slot");
+        persist_inode_state(
+            &local,
+            InodeAllocatorState {
+                current: InodeWindow {
+                    start: 8_000,
+                    next: 8_001,
+                    end: 8_005,
+                },
+                prefetched: InodeWindow::default(),
+            },
+        );
+        drop(local);
+
+        let reopened = PgMetaEngine::open_with_options(
+            &path,
+            PgOpenOptions {
+                background_poll: false,
+            },
+        )
+        .expect("reopen from persisted local allocation state");
+
+        let status = MetaReplication::metadata_authority_status(&*reopened);
+        assert!(
+            status.inode_id_headroom,
+            "reopened allocator should report remaining inode headroom"
+        );
+        assert!(
+            status.object_id_headroom,
+            "reopened allocator should report remaining object ID headroom separately"
+        );
+
+        let ino = reopened
+            .next_inode()
+            .expect("allocate inode from persisted headroom");
+        assert_eq!(ino, 8_001);
+        let object_ids = reopened
+            .next_object_ids(2)
+            .expect("allocate object IDs from persisted headroom");
+        assert_eq!(object_ids, vec![8_002, 8_003]);
+
+        assert_eq!(
+            load_inode_state(&reopened.local).current.next,
+            8_004,
+            "inode/object allocation progress must persist after offline reopen"
+        );
+    }
+
+    #[test]
+    fn sfs315_failed_object_batch_preserves_smaller_inode_headroom() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+        let _inode_window_override =
+            set_inode_window_reservation_override([Err("pg local inode window exhausted".into())]);
+
+        persist_inode_state(
+            &pg.local,
+            InodeAllocatorState {
+                current: InodeWindow {
+                    start: 9_000,
+                    next: 9_000,
+                    end: 9_002,
+                },
+                prefetched: InodeWindow::default(),
+            },
+        );
+        pg.update_inode_headroom_flag(load_inode_state(&pg.local));
+
+        let object_error = pg
+            .next_object_ids(3)
+            .expect_err("object batch should fail when it cannot fit in local headroom");
+        assert!(
+            object_error
+                .to_string()
+                .contains("failed to ensure current local inode window"),
+            "object batch failure should report refill failure without declaring smaller local headroom exhausted: {object_error}"
+        );
+
+        let status = MetaReplication::metadata_authority_status(&pg);
+        assert!(
+            status.inode_id_headroom,
+            "failed larger object batch must not consume the smaller inode headroom that remains"
+        );
+        assert!(
+            status.object_id_headroom,
+            "object ID status should still expose the remaining smaller local ID headroom"
+        );
+
+        let ino = pg
+            .next_inode()
+            .expect("smaller inode allocation should still use remaining local headroom");
+        assert_eq!(ino, 9_000);
+        assert_eq!(
+            load_inode_state(&pg.local).current.next,
+            9_001,
+            "failed object batch must not burn the tail of the persisted window"
+        );
+    }
+
+    #[test]
     fn open_with_persisted_slot_and_legacy_inode_ranges_survives_pg_unavailable() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("meta.redb");
@@ -5660,6 +5780,46 @@ mod tests {
 
         assert_eq!(object_ids, vec![500, 501, 502]);
         assert_eq!(load_inode_state(&pg.local).current.next, 503);
+    }
+
+    #[test]
+    fn sfs315_large_object_batch_replaces_undersized_prefetched_window() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+        let _inode_window_override = set_inode_window_reservation_override([
+            Ok(InodeWindow {
+                start: 500,
+                next: 500,
+                end: 510,
+            }),
+            Err("second reservation should not be needed".into()),
+        ]);
+
+        persist_inode_state(
+            &pg.local,
+            InodeAllocatorState {
+                current: InodeWindow {
+                    start: 100,
+                    next: 101,
+                    end: 102,
+                },
+                prefetched: InodeWindow {
+                    start: 200,
+                    next: 200,
+                    end: 202,
+                },
+            },
+        );
+
+        let object_ids = pg
+            .next_object_ids(3)
+            .expect("allocate object IDs from a replacement window");
+
+        assert_eq!(object_ids, vec![500, 501, 502]);
+        assert_eq!(
+            load_inode_state(&pg.local).current.next,
+            503,
+            "a too-small prefetched window must not block applying a larger replacement"
+        );
     }
 
     #[test]

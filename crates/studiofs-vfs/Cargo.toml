@@ -27,8 +27,8 @@ smallvec.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 bytes.workspace = true
-aws-sdk-s3 = "1"
-aws-smithy-http-client = "1"
+aws-sdk-s3 = { version = "1", default-features = false, features = ["http-1x", "rt-tokio"] }
+aws-smithy-http-client = { version = "1", features = ["rustls-aws-lc"] }
 dotenvy.workspace = true
 tokio-postgres.workspace = true
 uuid.workspace = true
