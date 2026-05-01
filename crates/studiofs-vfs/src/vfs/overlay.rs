@@ -14,6 +14,12 @@ pub(super) struct ExtentRecordId {
     pub(super) content_epoch: u64,
 }
 
+pub(super) type PendingUploadKey = (Ino, u64, u64, u64);
+
+pub(super) fn pending_upload_key(op: &PendingUpload) -> PendingUploadKey {
+    (op.ino, op.offset, op.object_id, op.content_epoch)
+}
+
 #[derive(Debug, Clone)]
 pub(super) enum PendingOverlayBlockSource {
     Pending(Bytes),
@@ -23,6 +29,7 @@ pub(super) enum PendingOverlayBlockSource {
 #[derive(Debug, Clone, Default)]
 pub(super) struct PendingUploadCatalog {
     by_block: HashMap<(Ino, u64), Vec<PendingUpload>>,
+    by_inode: HashMap<Ino, Vec<PendingUpload>>,
 }
 
 impl PendingUploadCatalog {
@@ -35,10 +42,23 @@ impl PendingUploadCatalog {
     }
 
     fn insert(&mut self, op: PendingUpload) {
+        self.by_inode.entry(op.ino).or_default().push(op.clone());
         self.by_block
             .entry((op.ino, op.offset))
             .or_default()
             .push(op);
+    }
+
+    pub(super) fn has_inode(&self, ino: Ino) -> bool {
+        self.by_inode.contains_key(&ino)
+    }
+
+    pub(super) fn ops(&self) -> impl Iterator<Item = &PendingUpload> {
+        self.by_inode.values().flatten()
+    }
+
+    pub(super) fn ops_for_inode(&self, ino: Ino) -> &[PendingUpload] {
+        self.by_inode.get(&ino).map(Vec::as_slice).unwrap_or(&[])
     }
 
     pub(super) fn latest_extent_record(
@@ -60,6 +80,7 @@ impl PendingUploadCatalog {
         &self,
         block_size: u32,
         quarantined_inodes: &HashSet<Ino>,
+        valid_pending_uploads: &HashSet<PendingUploadKey>,
     ) -> Vec<(Ino, u32, u64, u64)> {
         let mut live_extents = Vec::new();
         for (&(ino, offset), ops) in &self.by_block {
@@ -69,6 +90,9 @@ impl PendingUploadCatalog {
             let Some(op) = Self::latest_matching_op(ops, None) else {
                 continue;
             };
+            if !valid_pending_uploads.contains(&pending_upload_key(op)) {
+                continue;
+            }
             let block_index = (offset / block_size as u64) as u32;
             live_extents.push((ino, block_index, op.object_id, op.content_epoch));
         }

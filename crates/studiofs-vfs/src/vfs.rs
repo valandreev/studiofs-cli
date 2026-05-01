@@ -97,7 +97,7 @@ use handle_table::HandleTable;
 use ignored_entries::IgnoredEntryRegistry;
 use locking::{DistributedFlock, FileLockState};
 use namespace::{DentryCacheValue, NamespaceState};
-use overlay::{ExtentRecordId, PendingUploadCatalog};
+use overlay::{ExtentRecordId, PendingUploadCatalog, PendingUploadKey, pending_upload_key};
 use prefetch::{
     PrefetchBatch, PrefetchHintRange, PrefetchHintUpdate, PrefetchReadContext, PrefetchWorkItem,
     PrefetchWorker,
@@ -2866,6 +2866,9 @@ struct StartupReplayCoordinator<'a> {
     replay_ops: Vec<(u64, u64, u64, u64)>,
     live_extents: HashMap<(Ino, u32), ExtentRecordId>,
     pending_epoch_finalizations: Vec<(Ino, u64)>,
+    seen_replay_inodes: HashSet<Ino>,
+    valid_pending_uploads: HashSet<PendingUploadKey>,
+    stale_pending_uploads: HashMap<PendingUploadKey, PendingUpload>,
     restored_live_extents: usize,
     replay_failures: u64,
     orphan_dirty_payloads_removed: u64,
@@ -2911,6 +2914,9 @@ impl<'a> StartupReplayCoordinator<'a> {
             replay_ops: Vec::new(),
             live_extents: HashMap::new(),
             pending_epoch_finalizations: Vec::new(),
+            seen_replay_inodes: HashSet::new(),
+            valid_pending_uploads: HashSet::new(),
+            stale_pending_uploads: HashMap::new(),
             restored_live_extents: 0,
             replay_failures: 0,
             orphan_dirty_payloads_removed: 0,
@@ -2928,7 +2934,11 @@ impl<'a> StartupReplayCoordinator<'a> {
     fn process_attr(&mut self, attr: &InodeAttr) {
         let ino = attr.ino;
         let needs_finalization = StudioVfs::needs_epoch_finalization(attr);
-        if !self.needs_scan(attr) {
+        let has_pending_uploads = self.pending_catalog.has_inode(ino);
+        if has_pending_uploads {
+            self.seen_replay_inodes.insert(ino);
+        }
+        if !self.needs_scan(attr) && !has_pending_uploads {
             return;
         }
 
@@ -2945,6 +2955,10 @@ impl<'a> StartupReplayCoordinator<'a> {
             }
         };
 
+        if has_pending_uploads {
+            self.classify_pending_uploads_for_attr(attr, graph_objects.as_slice());
+        }
+
         if self.has_dirty_or_recovered_objects() {
             for graph_object in &graph_objects {
                 self.record_recovered_graph_object_if_local(ino, graph_object, attr.content_epoch);
@@ -2953,6 +2967,30 @@ impl<'a> StartupReplayCoordinator<'a> {
 
         if needs_finalization {
             self.record_epoch_finalization(ino, attr.content_epoch, graph_objects.as_slice());
+        }
+    }
+
+    fn classify_pending_uploads_for_attr(
+        &mut self,
+        attr: &InodeAttr,
+        graph_objects: &[StartupGraphObject],
+    ) {
+        let current_graph_objects: HashSet<_> = graph_objects
+            .iter()
+            .map(|graph_object| (graph_object.absolute_offset, graph_object.object_id))
+            .collect();
+
+        for op in self.pending_catalog.ops_for_inode(attr.ino) {
+            let key = pending_upload_key(op);
+            let is_live = attr.upload_state != MetaUploadState::Ready
+                && op.content_epoch == attr.content_epoch
+                && current_graph_objects.contains(&(op.offset, op.object_id));
+            if is_live {
+                self.valid_pending_uploads.insert(key);
+                self.stale_pending_uploads.remove(&key);
+            } else if !self.valid_pending_uploads.contains(&key) {
+                self.stale_pending_uploads.insert(key, op.clone());
+            }
         }
     }
 
@@ -3074,11 +3112,43 @@ impl<'a> StartupReplayCoordinator<'a> {
     }
 
     fn merge_pending_live_extents(&mut self) {
-        let live_extents = self
-            .pending_catalog
-            .live_extents(self.vfs.block_size, &self.quarantined_inodes);
+        let live_extents = self.pending_catalog.live_extents(
+            self.vfs.block_size,
+            &self.quarantined_inodes,
+            &self.valid_pending_uploads,
+        );
         for (ino, block_index, object_id, content_epoch) in live_extents {
             self.record_pending_live_extent(ino, block_index, object_id, content_epoch);
+        }
+    }
+
+    fn mark_pending_uploads_without_attrs_stale(&mut self) {
+        for op in self.pending_catalog.ops() {
+            if self.seen_replay_inodes.contains(&op.ino) {
+                continue;
+            }
+            let key = pending_upload_key(op);
+            if !self.valid_pending_uploads.contains(&key) {
+                self.stale_pending_uploads.insert(key, op.clone());
+            }
+        }
+    }
+
+    fn cancel_stale_pending_uploads(&self) {
+        if self.stale_pending_uploads.is_empty() {
+            return;
+        }
+
+        for op in self.stale_pending_uploads.values() {
+            self.vfs.cached_store.cancel_upload(op);
+            self.vfs
+                .state
+                .upload
+                .pending_evictions
+                .lock()
+                .remove(&op.object_id);
+            self.vfs
+                .debug_pending_inode_state(op.ino, "startup_stale_pending_upload_canceled");
         }
     }
 
@@ -3281,6 +3351,7 @@ impl<'a> StartupReplayCoordinator<'a> {
     }
 
     fn finish(mut self) {
+        self.mark_pending_uploads_without_attrs_stale();
         self.discard_quarantined_dirty_objects();
         self.merge_pending_live_extents();
         let replayed_blocks = self.restored_live_extents as u64;
@@ -3352,6 +3423,7 @@ impl<'a> StartupReplayCoordinator<'a> {
                 "seeded epoch finalizer queue from metadata"
             );
         }
+        self.cancel_stale_pending_uploads();
         {
             let mut replay_counts = self.vfs.state.upload.startup_replay_counts.lock();
             for (ino, content_epoch) in replayed_epochs.iter().copied() {
