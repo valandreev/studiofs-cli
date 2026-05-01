@@ -32,6 +32,12 @@ fn compose_file_defines_required_services_healthchecks_and_project_ports() {
         "compose file must use runner-provided host port env vars"
     );
     assert!(
+        compose.contains("127.0.0.1:${STUDIOFS_E2E_POSTGRES_PORT")
+            && compose.contains("127.0.0.1:${STUDIOFS_E2E_RUSTFS_PORT")
+            && compose.contains("127.0.0.1:${STUDIOFS_E2E_TOXIPROXY_API_PORT"),
+        "compose services must bind to loopback only"
+    );
+    assert!(
         compose.contains("postgres-data:") && compose.contains("rustfs-data:"),
         "named volumes must be explicit so down --volumes can remove them"
     );
@@ -89,6 +95,10 @@ fn compose_stack_allocates_project_scoped_ports_and_builds_waiting_up_command() 
             .env
             .iter()
             .any(|(key, value)| key == "STUDIOFS_E2E_POSTGRES_PORT" && value == "31000")
+    );
+    assert_eq!(
+        command.cwd,
+        Some(repo_root().join("docker").canonicalize().unwrap())
     );
 }
 
@@ -156,6 +166,22 @@ fn compose_stack_rejects_port_ranges_smaller_than_required_service_ports() {
         }
         other => panic!("expected small port range error, got {other:?}"),
     }
+}
+
+#[test]
+fn compose_stack_accepts_whitespace_around_port_range_bounds() {
+    let temp = tempdir().unwrap();
+    let stack = DockerComposeStack::new(ComposeConfig {
+        run_id: "compose-whitespace-range".to_string(),
+        sandbox: temp.path().join("compose-whitespace-range"),
+        compose_file: repo_root().join("docker/compose.e2e.yml"),
+        port_range: Some(" 32100 - 32110 ".to_string()),
+        wait_timeout_secs: 120,
+    })
+    .unwrap();
+
+    assert_eq!(stack.ports()[0].host_port, 32100);
+    assert_eq!(stack.ports()[3].host_port, 32103);
 }
 
 #[derive(Default)]

@@ -3,7 +3,7 @@
 use std::fs;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
@@ -113,7 +113,13 @@ impl CommandExecutor for SystemCommandExecutor {
     fn run(&self, command: &CommandSpec) -> std::io::Result<CommandOutput> {
         let mut process = Command::new(&command.program);
         process.args(&command.args);
-        process.envs(command.env.iter().map(|(key, value)| (key, value)));
+        process.envs(
+            command
+                .env
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        );
+        process.stdin(Stdio::null());
         if let Some(cwd) = &command.cwd {
             process.current_dir(cwd);
         }
@@ -172,12 +178,13 @@ impl DockerComposeStack {
         if !config.compose_file.exists() {
             return Err(InfraError::MissingComposeFile(config.compose_file));
         }
+        let compose_file = config.compose_file.canonicalize()?;
         let ports = allocate_ports(config.port_range.as_deref())?;
         Ok(Self {
             project_name: compose_project_name(&config.run_id),
             run_id: config.run_id,
             sandbox: config.sandbox,
-            compose_file: config.compose_file,
+            compose_file,
             ports,
             wait_timeout_secs: config.wait_timeout_secs,
         })
@@ -307,7 +314,7 @@ impl DockerComposeStack {
                 self.compose_file.display().to_string(),
             ],
             env: self.compose_environment(),
-            cwd: default_repo_root(),
+            cwd: self.compose_file.parent().map(Path::to_path_buf),
         }
     }
 
@@ -374,7 +381,7 @@ impl DockerComposeStack {
 }
 
 fn port_check(port: &ServicePort) -> InfraCheck {
-    match TcpListener::bind(("127.0.0.1", port.host_port)) {
+    match TcpListener::bind((port.host.as_str(), port.host_port)) {
         Ok(listener) => {
             drop(listener);
             InfraCheck {
@@ -421,9 +428,11 @@ fn parse_port_range(range: &str, needed: usize) -> Result<Vec<u16>, InfraError> 
         return Err(InfraError::InvalidPortRange(range.to_string()));
     };
     let start = start
+        .trim()
         .parse::<u16>()
         .map_err(|_| InfraError::InvalidPortRange(range.to_string()))?;
     let end = end
+        .trim()
         .parse::<u16>()
         .map_err(|_| InfraError::InvalidPortRange(range.to_string()))?;
     if start > end {
@@ -465,14 +474,23 @@ fn compose_project_name(run_id: &str) -> String {
 }
 
 fn default_compose_file() -> PathBuf {
-    default_repo_root()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("docker/compose.e2e.yml")
-}
-
-fn default_repo_root() -> Option<PathBuf> {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .map(Path::to_path_buf)
+    const COMPOSE_FILE: &str = "docker/compose.e2e.yml";
+    if let Some(path) = std::env::var_os("STUDIOFS_E2E_COMPOSE_FILE") {
+        return PathBuf::from(path);
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        let from_cwd = cwd.join(COMPOSE_FILE);
+        if from_cwd.exists() {
+            return from_cwd;
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        for ancestor in exe.ancestors() {
+            let candidate = ancestor.join(COMPOSE_FILE);
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+    PathBuf::from(COMPOSE_FILE)
 }

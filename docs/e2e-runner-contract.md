@@ -48,7 +48,7 @@ studiofs-e2e run \
   --report target/e2e-runs/<run-id>/report.json
 ```
 
-Required initial run flags:
+Required initial run flags and environment:
 
 | Flag | Contract |
 |---|---|
@@ -62,6 +62,7 @@ Required initial run flags:
 | `--retain always|on-failure|never` | Sandbox retention policy. Default is `on-failure`. |
 | `--report <path>` | Optional copy target for the final `report.json`. The canonical report remains in the run sandbox while the sandbox is retained. |
 | `--port-range <start-end>` | Optional deterministic host port pool for Docker services. The compose runner allocates PostgreSQL, RustFS S3, RustFS console, and Toxiproxy API ports in that order. |
+| `STUDIOFS_E2E_COMPOSE_FILE` | Optional environment override for the compose file path. Defaults to `docker/compose.e2e.yml` discovered from the current directory or executable location. |
 | `--timeout <duration>` | Whole-run timeout; per-hook timeouts are derived from it unless overridden later. |
 
 The initial runner implements `list`, `run`, and `clean`. Future subcommands
@@ -282,9 +283,9 @@ Required checks:
   daemon can start required PostgreSQL and S3-compatible services.
 - Compose stack: `docker/compose.e2e.yml` defines PostgreSQL 18, RustFS, and a
   Toxiproxy placeholder using version-pinned service images for reproducible
-  runs. The runner invokes `docker compose up --detach --wait` with a
-  project-scoped name and records the copied compose file plus logs under
-  `artifacts/docker/`.
+  runs. Published ports bind to `127.0.0.1` only. The runner invokes
+  `docker compose up --detach --wait` with a project-scoped name and records the
+  copied compose file plus logs under `artifacts/docker/`.
 - Mount support:
   - Linux requires a usable `/dev/fuse`, mountpoint creation rights, and the
     FUSE backend expected by `studiofs-fuse`.

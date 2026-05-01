@@ -8,7 +8,7 @@ services:
       POSTGRES_PASSWORD: studiofs
       POSTGRES_DB: studiofs
     ports:
-      - "${STUDIOFS_E2E_POSTGRES_PORT:-25432}:5432"
+      - "127.0.0.1:${STUDIOFS_E2E_POSTGRES_PORT:-25432}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U studiofs -d studiofs"]
       interval: 2s
@@ -30,8 +30,8 @@ services:
       RUSTFS_SECRET_KEY: rustfsadmin
       RUSTFS_CONSOLE_ENABLE: "true"
     ports:
-      - "${STUDIOFS_E2E_RUSTFS_PORT:-29000}:9000"
-      - "${STUDIOFS_E2E_RUSTFS_CONSOLE_PORT:-29001}:9001"
+      - "127.0.0.1:${STUDIOFS_E2E_RUSTFS_PORT:-29000}:9000"
+      - "127.0.0.1:${STUDIOFS_E2E_RUSTFS_CONSOLE_PORT:-29001}:9001"
     healthcheck:
       test:
         [
@@ -51,7 +51,7 @@ services:
   toxiproxy:
     image: ghcr.io/shopify/toxiproxy:2.12.0
     ports:
-      - "${STUDIOFS_E2E_TOXIPROXY_API_PORT:-28474}:8474"
+      - "127.0.0.1:${STUDIOFS_E2E_TOXIPROXY_API_PORT:-28474}:8474"
     healthcheck:
       test: ["CMD", "/toxiproxy-cli", "list"]
       interval: 2s
