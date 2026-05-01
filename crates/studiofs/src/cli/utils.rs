@@ -16,12 +16,22 @@ fn get_client_root_with<F>(read_var: F) -> Result<PathBuf>
 where
     F: FnOnce(&str) -> Option<OsString>,
 {
+    get_client_root_with_home(read_var, home::home_dir)
+}
+
+fn get_client_root_with_home<F, H>(read_var: F, home_dir: H) -> Result<PathBuf>
+where
+    F: FnOnce(&str) -> Option<OsString>,
+    H: FnOnce() -> Option<PathBuf>,
+{
     if let Some(root) = read_var(CLIENT_ROOT_ENV) {
         return normalize_client_root(PathBuf::from(root));
     }
 
-    let home = home::home_dir().ok_or_else(|| anyhow!("Could not find home directory"))?;
-    Ok(home.join(".studiofs"))
+    let home = home_dir().ok_or_else(|| anyhow!("Could not find home directory"))?;
+    let root = home.join(".studiofs");
+    std::path::absolute(&root)
+        .with_context(|| format!("resolve default client root '{}'", root.display()))
 }
 
 fn normalize_client_root(root: PathBuf) -> Result<PathBuf> {
@@ -428,13 +438,26 @@ mod tests {
     #[test]
     fn client_root_absent_preserves_home_studiofs_metadata_layout() {
         let home = home::home_dir().expect("home dir");
+        let expected_root =
+            std::path::absolute(home.join(".studiofs")).expect("absolute default client root");
 
         let root = get_client_root_with(|_| None).expect("default client root");
         let meta_dir = default_meta_dir_in_client_root(&root, "projectfs");
 
+        assert_eq!(root, expected_root);
+        assert_eq!(meta_dir, expected_root.join("meta").join("projectfs"));
+    }
+
+    #[test]
+    fn client_root_absent_normalizes_default_home_to_absolute_path() {
+        let relative_home = std::path::PathBuf::from("relative-home");
+        let root = get_client_root_with_home(|_| None, || Some(relative_home.clone()))
+            .expect("default client root");
+
+        assert!(root.is_absolute());
         assert_eq!(
-            meta_dir,
-            home.join(".studiofs").join("meta").join("projectfs")
+            root,
+            std::path::absolute(relative_home.join(".studiofs")).expect("absolute path")
         );
     }
 
