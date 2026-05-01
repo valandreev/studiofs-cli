@@ -221,15 +221,19 @@ pub fn run_with_executor(
 
     let prepared_preflight = prepare_preflight(&sandbox, compose_stack.as_ref(), executor)?;
     let preflight = prepared_preflight.report;
+    let mut compose_cleanup_guard = ComposeCleanupGuard::new(
+        if prepared_preflight.compose_start_attempted {
+            compose_stack.as_ref()
+        } else {
+            None
+        },
+        executor,
+    );
     if preflight.status == RunStatus::PreflightFailed {
         write_pretty_json(&sandbox.join("preflight.json"), &preflight)?;
         let mut cleanup_actions = Vec::new();
         let mut cleanup_errors = Vec::new();
-        if prepared_preflight.compose_start_attempted {
-            if let Some(stack) = &compose_stack {
-                collect_compose_cleanup(stack, executor, &mut cleanup_actions, &mut cleanup_errors);
-            }
-        }
+        compose_cleanup_guard.collect_into(&mut cleanup_actions, &mut cleanup_errors);
         let cleanup = CleanupReport {
             status: if cleanup_errors.is_empty() {
                 RunStatus::Passed
@@ -288,9 +292,7 @@ pub fn run_with_executor(
 
     record_event(&events_path, &run_id, None, "run", "finished")?;
     let mut cleanup_actions = Vec::new();
-    if let Some(stack) = &compose_stack {
-        collect_compose_cleanup(stack, executor, &mut cleanup_actions, &mut cleanup_errors);
-    }
+    compose_cleanup_guard.collect_into(&mut cleanup_actions, &mut cleanup_errors);
 
     let cleanup = CleanupReport {
         status: if cleanup_errors.is_empty() {
@@ -337,6 +339,42 @@ pub fn run_with_executor(
         scenario_outcomes,
         cleanup,
     })
+}
+
+struct ComposeCleanupGuard<'a> {
+    stack: Option<&'a DockerComposeStack>,
+    executor: &'a dyn CommandExecutor,
+}
+
+impl<'a> ComposeCleanupGuard<'a> {
+    fn new(stack: Option<&'a DockerComposeStack>, executor: &'a dyn CommandExecutor) -> Self {
+        Self { stack, executor }
+    }
+
+    fn collect_into(
+        &mut self,
+        cleanup_actions: &mut Vec<String>,
+        cleanup_errors: &mut Vec<String>,
+    ) {
+        if let Some(stack) = self.stack.take() {
+            collect_compose_cleanup(stack, self.executor, cleanup_actions, cleanup_errors);
+        }
+    }
+}
+
+impl Drop for ComposeCleanupGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(stack) = self.stack.take() {
+            let mut cleanup_actions = Vec::new();
+            let mut cleanup_errors = Vec::new();
+            collect_compose_cleanup(
+                stack,
+                self.executor,
+                &mut cleanup_actions,
+                &mut cleanup_errors,
+            );
+        }
+    }
 }
 
 struct FinishRunInput {
@@ -1227,14 +1265,64 @@ mod tests {
         assert!(logs_index < down_index);
     }
 
+    #[test]
+    fn run_with_compose_infra_tears_down_when_post_start_io_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("e2e-runs");
+        let run_id = "compose-post-start-error";
+        let sandbox = root.join(run_id);
+        let executor = RecordingExecutor {
+            poison_events_path_after_up: RefCell::new(Some(sandbox.join("events.ndjson"))),
+            ..RecordingExecutor::default()
+        };
+
+        let err = run_with_executor(
+            RunRequest {
+                root,
+                run_id: Some(run_id.to_string()),
+                scenarios: vec![scenario::BASIC_MULTI_CLIENT_SMOKE.to_string()],
+                seed: 319,
+                studiofs_bin: None,
+                platform: PlatformSelection::Auto,
+                retention: RetentionPolicy::Always,
+                report: None,
+                port_range: Some("33100-33110".to_string()),
+                timeout: None,
+                infra: InfraMode::Compose,
+            },
+            &executor,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, RunnerError::Io(_)));
+        let calls = executor.calls.borrow();
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.args.contains(&"up".to_string()))
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.args.contains(&"down".to_string())),
+            "compose stack should be torn down after post-start runner errors"
+        );
+    }
+
     #[derive(Default)]
     struct RecordingExecutor {
         calls: RefCell<Vec<crate::infra::CommandSpec>>,
+        poison_events_path_after_up: RefCell<Option<PathBuf>>,
     }
 
     impl CommandExecutor for RecordingExecutor {
         fn run(&self, command: &crate::infra::CommandSpec) -> std::io::Result<CommandOutput> {
             self.calls.borrow_mut().push(command.clone());
+            if command.args.contains(&"up".to_string()) {
+                if let Some(events_path) = self.poison_events_path_after_up.borrow_mut().take() {
+                    std::fs::create_dir_all(events_path)?;
+                }
+            }
             let stdout = if command.args.contains(&"logs".to_string()) {
                 "compose logs\n"
             } else {
