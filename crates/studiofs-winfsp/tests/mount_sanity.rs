@@ -1758,6 +1758,7 @@ fn winfsp_mount_mmap_reader_during_upload_stays_readable_after_finalize_smoke() 
 #[ignore = "requires WinFSP runtime + STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
 fn winfsp_mount_write_wall_and_gate_contention_smoke() {
     use std::io::Write;
+    use std::os::windows::fs::OpenOptionsExt;
 
     if std::env::var("STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS").as_deref() != Ok("1") {
         return;
@@ -1773,10 +1774,10 @@ fn winfsp_mount_write_wall_and_gate_contention_smoke() {
         }
     };
 
-    // Keep the dirty cap large enough for Windows/WinFSP cached-write
-    // coalescing. Hosted Windows runners can deliver a single callback larger
-    // than the user-mode write_all chunk; values below that callback granule
-    // fail in the writer buffer before they exercise the mounted write path.
+    // Use write-through/no-buffering so WinFSP receives deterministic aligned
+    // chunks. Hosted Windows cached writes can otherwise arrive at the callback
+    // layer as larger coalesced requests and trip the writer-stack buffer limit
+    // before this smoke reaches the mounted write-wall path.
     const CHUNK_BYTES: usize = 512 * 1024;
     const CHUNK_COUNT: usize = 16;
     const MAX_DIRTY_BYTES: usize = 4 * 1024 * 1024;
@@ -1831,6 +1832,7 @@ fn winfsp_mount_write_wall_and_gate_contention_smoke() {
             .create(true)
             .write(true)
             .truncate(true)
+            .custom_flags(AJA_CACHE_OFF_OPEN_OPTIONS_FLAGS)
             .open(&sequential_file)
             .expect("open write-wall gate-contention file through WinFSP mount");
 
@@ -1839,9 +1841,21 @@ fn winfsp_mount_write_wall_and_gate_contention_smoke() {
         for chunk_index in 0..CHUNK_COUNT {
             let fill = b'A' + (chunk_index % 26) as u8;
             let chunk = vec![fill; CHUNK_BYTES];
-            writer
-                .write_all(&chunk)
-                .expect("write chunk through WinFSP mount (write-wall test)");
+            if let Err(err) = writer.write_all(&chunk) {
+                let snapshot = vfs_observer.write_path_observability_snapshot();
+                panic!(
+                    "write chunk {chunk_index} through WinFSP mount (write-wall test): {err}; \
+                     winfsp_avg_write_bytes={:.0} vfs_avg_write_bytes={:.0} \
+                     writer_stack_dirty_bytes={} total_dirty_bytes={} dirty_limit_bytes={} \
+                     hard_backpressure_events={}",
+                    snapshot.winfsp_write_path.avg_write_bytes,
+                    snapshot.vfs_write_path.avg_write_bytes,
+                    snapshot.dirty_pressure.writer_stack_dirty_bytes,
+                    snapshot.dirty_pressure.total_dirty_bytes,
+                    snapshot.dirty_pressure.dirty_limit_bytes,
+                    snapshot.write_backpressure.hard_events
+                );
+            }
         }
         writer
             .flush()
