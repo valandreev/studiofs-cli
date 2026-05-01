@@ -11,6 +11,7 @@ const WINDOWS_VOLUME_PATH_BUFFER_U16: usize = 32_768;
 
 #[derive(Debug, Default)]
 pub struct UnbufferedWriteBuffer {
+    #[cfg(any(windows, test))]
     backing: Vec<u8>,
 }
 
