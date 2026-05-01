@@ -189,6 +189,7 @@ regressions:
 - Recovery and replay
   - `test_pg_reopen_after_publish_before_local_persist_recovers_without_discover`
   - `test_pg_reopen_after_unpublished_local_create_flushes_without_discover`
+  - `startup_replay_cancels_ready_inode_stale_pending_upload`
   - `test_truncate_shrink_then_extend_zero_fills_old_tail`
   - `test_write_at_exact_block_boundary_transition`
 

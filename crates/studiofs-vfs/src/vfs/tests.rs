@@ -584,6 +584,52 @@ fn startup_replay_does_not_override_current_epoch_live_extent_with_stale_pending
 }
 
 #[test]
+fn startup_replay_cancels_ready_inode_stale_pending_upload() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "startup-replay-ready-stale-pending");
+
+    let created = vfs
+        .create(1, b"startup-ready-stale-pending.bin", 0, 0, 0o644)
+        .expect("create test file");
+    let ino = created.ino;
+    let current_object_id = 9_001;
+    let stale_object_id = 7_001;
+    let mut attr = meta.get_attr(ino).expect("load test attr");
+    attr.size = 4096;
+    attr.committed_size = 4096;
+    attr.content_epoch = 5;
+    attr.committed_content_epoch = 5;
+    attr.upload_state = MetaUploadState::Ready;
+    meta.set_attr(&attr).expect("persist ready attr");
+    meta.stage_payload_slice(ino, 0, &PayloadRef::new_partial(current_object_id, 4096))
+        .expect("persist current payload slice");
+
+    vfs.cached_store()
+        .submit_upload(ino, 0, stale_object_id, attr.content_epoch - 1);
+    let pending_uploads = vfs.cached_store().snapshot_pending_uploads();
+    assert_eq!(
+        pending_uploads.len(),
+        1,
+        "test setup should install one stale runtime upload"
+    );
+
+    vfs.replay_dirty_uploads_from_local_backend(&pending_uploads, &[attr]);
+
+    assert!(
+        vfs.live_extent_records_for_inode(ino).is_empty(),
+        "startup replay must not resurrect stale pending upload live extents for a ready inode"
+    );
+    assert!(
+        vfs.pending_uploads_for_inode(ino).is_empty(),
+        "startup replay should cancel pending uploads that metadata has already made obsolete"
+    );
+    assert!(
+        !vfs.cached_store().is_pinned(stale_object_id),
+        "canceling the stale pending upload should release its runtime pin"
+    );
+}
+
+#[test]
 fn upload_pipeline_runtime_events_only_emit_active_samples_and_transitions() {
     assert_eq!(
         StudioVfs::upload_pipeline_runtime_event(true, false, true),

@@ -14,6 +14,12 @@ pub(super) struct ExtentRecordId {
     pub(super) content_epoch: u64,
 }
 
+pub(super) type PendingUploadKey = (Ino, u64, u64, u64);
+
+pub(super) fn pending_upload_key(op: &PendingUpload) -> PendingUploadKey {
+    (op.ino, op.offset, op.object_id, op.content_epoch)
+}
+
 #[derive(Debug, Clone)]
 pub(super) enum PendingOverlayBlockSource {
     Pending(Bytes),
@@ -41,6 +47,25 @@ impl PendingUploadCatalog {
             .push(op);
     }
 
+    pub(super) fn has_inode(&self, ino: Ino) -> bool {
+        self.by_block.keys().any(|(candidate, _)| *candidate == ino)
+    }
+
+    pub(super) fn ops(&self) -> Vec<PendingUpload> {
+        self.by_block
+            .values()
+            .flat_map(|ops| ops.iter().cloned())
+            .collect()
+    }
+
+    pub(super) fn ops_for_inode(&self, ino: Ino) -> Vec<PendingUpload> {
+        self.by_block
+            .iter()
+            .filter(|((candidate, _), _)| *candidate == ino)
+            .flat_map(|(_, ops)| ops.iter().cloned())
+            .collect()
+    }
+
     pub(super) fn latest_extent_record(
         &self,
         ino: Ino,
@@ -60,6 +85,7 @@ impl PendingUploadCatalog {
         &self,
         block_size: u32,
         quarantined_inodes: &HashSet<Ino>,
+        valid_pending_uploads: &HashSet<PendingUploadKey>,
     ) -> Vec<(Ino, u32, u64, u64)> {
         let mut live_extents = Vec::new();
         for (&(ino, offset), ops) in &self.by_block {
@@ -69,6 +95,9 @@ impl PendingUploadCatalog {
             let Some(op) = Self::latest_matching_op(ops, None) else {
                 continue;
             };
+            if !valid_pending_uploads.contains(&pending_upload_key(op)) {
+                continue;
+            }
             let block_index = (offset / block_size as u64) as u32;
             live_extents.push((ino, block_index, op.object_id, op.content_epoch));
         }
