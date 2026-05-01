@@ -2296,7 +2296,7 @@ fn zeroio_snapshot_loads_last_graceful_shutdown_after_restart() {
 #[test]
 fn local_first_shutdown_reports_and_recovers_memory_only_writer_state() {
     let tmp = TempDir::new().expect("tempdir");
-    let (rt, vfs, meta) = make_test_vfs(&tmp, "sfs-312-shutdown-writer-state");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs-312-shutdown-writer-state");
     let _guard = rt.enter();
     let payload = b"sfs-312-memory-only-before-shutdown";
 
