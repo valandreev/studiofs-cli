@@ -479,6 +479,59 @@ fn validation_docs_drop_durable_mode_callback_wording() {
 }
 
 #[test]
+fn e2e_runner_contract_covers_required_sfs341_surfaces() {
+    let doc = read_workspace_file("docs/e2e-runner-contract.md");
+    let required_terms = [
+        "# Real E2E Runner Contract",
+        "## Runner Boundaries And CLI",
+        "target/e2e-runs/<run-id>",
+        "## Artifact Layout And Retention",
+        "report.json",
+        "stdout.log",
+        "stderr.log",
+        "events.ndjson",
+        "## JSON Report Shape",
+        "## Status And Exit-Code Semantics",
+        "passed",
+        "failed",
+        "skipped",
+        "preflight_failed",
+        "cleanup_failed",
+        "## Lifecycle Hooks",
+        "setup",
+        "run",
+        "validate",
+        "cleanup",
+        "## Preflight Gates",
+        "Docker",
+        "/dev/fuse",
+        "WinFSP",
+        "macFUSE",
+        "port allocation",
+        "stale mounts",
+        "## Cleanup Safety",
+        "must never delete outside",
+        "explicit client roots",
+        "## Initial Scenario Gating",
+        "smoke",
+        "outage",
+        "collision",
+    ];
+
+    let missing: Vec<_> = required_terms
+        .iter()
+        .copied()
+        .filter(|term| !doc.contains(term))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "SFS-341 E2E runner contract is missing required surfaces:\n{}",
+        missing.join("\n")
+    );
+}
+
+#[test]
 fn cli_and_regression_surfaces_drop_buffered_first_wording() {
     let files = [
         "crates/studiofs/src/cli/test_cache/reporting/human.rs",
