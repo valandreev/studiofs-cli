@@ -113,6 +113,212 @@ fn test_referenced_object_ids_include_committed_blocks() {
     assert_eq!(refs.len(), 2);
 }
 
+fn unix_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+#[test]
+fn sfs316_reachability_reports_active_base_overlay_and_snapshot_pins() {
+    let fixture = ContractCoreFixture::new("sfs316-reachability")
+        .expect("create contract fixture");
+    let engine = fixture.meta();
+
+    let file = engine
+        .create_file(ROOT_INO, b"reachability.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let mut attr = engine.get_attr(file.ino).unwrap();
+    attr.size = 4096;
+    attr.content_epoch = 1;
+    engine.set_attr(&attr).unwrap();
+
+    engine
+        .stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(31, 4096))
+        .unwrap();
+    assert!(
+        engine
+            .mark_regular_file_overlay_object_uploaded_if_matches(file.ino, 1, 31)
+            .unwrap()
+    );
+    assert!(
+        engine
+            .publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
+            .unwrap()
+    );
+    let snapshot = engine.create_snapshot(ROOT_INO).unwrap();
+    assert_eq!(snapshot.pinned_object_ids, vec![31]);
+
+    let mut attr = engine.get_attr(file.ino).unwrap();
+    attr.content_epoch = 2;
+    engine.set_attr(&attr).unwrap();
+    engine
+        .stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(32, 4096))
+        .unwrap();
+
+    let diagnostics = fixture
+        .assert_invariants("sfs316 active graph and snapshot pins")
+        .expect("contract invariants");
+    let referenced: std::collections::BTreeSet<_> =
+        diagnostics.referenced_object_ids.iter().copied().collect();
+    assert_eq!(
+        referenced,
+        std::collections::BTreeSet::from([31, 32]),
+        "snapshot-pinned base and active overlay objects should be reachable: {diagnostics}"
+    );
+    assert!(
+        diagnostics
+            .object_graphs
+            .iter()
+            .any(|graph| graph.ino == file.ino
+                && graph.object_usage.contains(&(31, 4096))
+                && graph.object_usage.contains(&(32, 4096))),
+        "object graph diagnostics should name active base and overlay objects: {diagnostics}"
+    );
+}
+
+#[test]
+fn sfs316_publish_queues_displaced_objects_and_reachability_scan_is_idempotent() {
+    let fixture = ContractCoreFixture::new("sfs316-pending-deletion")
+        .expect("create contract fixture");
+    let engine = fixture.meta();
+
+    let file = engine
+        .create_file(ROOT_INO, b"overwrite.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let mut attr = engine.get_attr(file.ino).unwrap();
+    attr.size = 4096;
+    attr.content_epoch = 1;
+    engine.set_attr(&attr).unwrap();
+    engine
+        .stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(41, 4096))
+        .unwrap();
+    assert!(
+        engine
+            .mark_regular_file_overlay_object_uploaded_if_matches(file.ino, 1, 41)
+            .unwrap()
+    );
+    assert!(
+        engine
+            .publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
+            .unwrap()
+    );
+
+    let mut attr = engine.get_attr(file.ino).unwrap();
+    attr.content_epoch = 2;
+    engine.set_attr(&attr).unwrap();
+    engine
+        .stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(42, 4096))
+        .unwrap();
+    assert!(
+        engine
+            .mark_regular_file_overlay_object_uploaded_if_matches(file.ino, 2, 42)
+            .unwrap()
+    );
+    let before_publish = unix_now_secs();
+    assert!(
+        engine
+            .publish_regular_file_overlay_to_base_if_matches(file.ino, 2)
+            .unwrap()
+    );
+    let after_publish = unix_now_secs();
+
+    let first_refs = engine.get_referenced_object_ids().unwrap();
+    let first_pending = engine.get_pending_deletions().unwrap();
+    let second_refs = engine.get_referenced_object_ids().unwrap();
+    let second_pending = engine.get_pending_deletions().unwrap();
+
+    assert_eq!(first_refs, second_refs, "reachability scans must be idempotent");
+    assert_eq!(
+        first_pending, second_pending,
+        "pending deletion scans must be idempotent"
+    );
+    assert!(
+        first_refs.contains(&42),
+        "replacement object should be reachable after publish"
+    );
+    assert!(
+        !first_refs.contains(&41),
+        "displaced object should leave the live graph"
+    );
+    assert!(
+        first_pending
+            .iter()
+            .any(|(object_id, _timestamp)| *object_id == 41),
+        "displaced object should be moved to pending deletion"
+    );
+    let displaced_timestamp = first_pending
+        .iter()
+        .find_map(|(object_id, timestamp)| (*object_id == 41).then_some(*timestamp))
+        .expect("displaced object pending deletion timestamp");
+    assert!(
+        (before_publish..=after_publish).contains(&displaced_timestamp),
+        "pending deletion timestamp should be recorded when the displaced object is queued"
+    );
+
+    let diagnostics = fixture
+        .assert_invariants("sfs316 displaced object pending deletion")
+        .expect("contract invariants");
+    assert!(
+        diagnostics
+            .pending_deletions
+            .iter()
+            .any(|(object_id, _timestamp)| *object_id == 41),
+        "diagnostics should identify pending deletion object IDs: {diagnostics}"
+    );
+}
+
+#[test]
+fn sfs316_delete_before_publish_tombstone_does_not_publish_deleted_content() {
+    let fixture = ContractCoreFixture::new("sfs316-delete-before-publish")
+        .expect("create contract fixture");
+    let engine = fixture.meta();
+
+    let file = engine
+        .create_file(ROOT_INO, b"deleted-local.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let mut attr = engine.get_attr(file.ino).unwrap();
+    attr.size = 4096;
+    attr.content_epoch = 1;
+    engine.set_attr(&attr).unwrap();
+    engine
+        .stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(51, 4096))
+        .unwrap();
+    assert!(
+        engine
+            .mark_regular_file_overlay_object_uploaded_if_matches(file.ino, 1, 51)
+            .unwrap()
+    );
+
+    let before_unlink = unix_now_secs();
+    engine.unlink(ROOT_INO, b"deleted-local.bin").unwrap();
+    let after_unlink = unix_now_secs();
+
+    assert!(
+        !engine
+            .publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
+            .unwrap(),
+        "deleted-before-publish inode must not publish its uploaded overlay"
+    );
+    let lifecycle = engine.get_inode_lifecycle(file.ino).unwrap().unwrap();
+    assert_eq!(lifecycle.state, InodeLifecycleState::DeletedBeforePublish);
+    assert_eq!(lifecycle.deferred_cleanup_object_ids, vec![51]);
+    assert!(
+        !engine.get_referenced_object_ids().unwrap().contains(&51),
+        "deleted-before-publish payload should not remain in the live graph"
+    );
+    let pending_deletions = engine.get_pending_deletions().unwrap();
+    let deleted_before_publish_timestamp = pending_deletions
+        .iter()
+        .find_map(|(object_id, timestamp)| (*object_id == 51).then_some(*timestamp))
+        .expect("deleted-before-publish object pending deletion timestamp");
+    assert!(
+        (before_unlink..=after_unlink).contains(&deleted_before_publish_timestamp),
+        "uploaded deleted-before-publish payload should be queued for cleanup"
+    );
+}
+
 #[test]
 fn test_regular_file_graph_tables_roundtrip_and_project_remote_overlay() {
     let engine = temp_engine();

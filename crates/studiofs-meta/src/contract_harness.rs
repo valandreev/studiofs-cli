@@ -1,6 +1,7 @@
 //! Shared Contract/Core fixtures for fast local metadata tests.
 
 use crate::engine::DeferredDeleteRecord;
+use crate::engine::MetaGc;
 use crate::schema::{
     CURRENT_FORMAT_VERSION, FileType, FormatInfo, InodeAttr, InodeLifecycleRecord,
     InodeLifecycleState, MetadataConfig, ROOT_INO, RenameAtomicResult,
@@ -235,6 +236,10 @@ pub struct ContractInvariantDiagnostics {
     pub entries: Vec<ContractDentrySnapshot>,
     /// Object graph usage snapshots for regular files.
     pub object_graphs: Vec<ContractObjectGraphSnapshot>,
+    /// Full metadata reachability result for payload object ids.
+    pub referenced_object_ids: Vec<u64>,
+    /// Pending object deletions visible to GC.
+    pub pending_deletions: Vec<(u64, i64)>,
     /// Lifecycle rows visible through metadata recovery state.
     pub lifecycles: Vec<ContractLifecycleSnapshot>,
     /// Deferred-delete records that explain open-unlink orphan inodes.
@@ -290,6 +295,13 @@ impl fmt::Display for ContractInvariantDiagnostics {
         writeln!(f, "object_graphs:")?;
         for graph in &self.object_graphs {
             writeln!(f, "  - ino={} usage={:?}", graph.ino, graph.object_usage)?;
+        }
+
+        writeln!(f, "referenced_object_ids: {:?}", self.referenced_object_ids)?;
+
+        writeln!(f, "pending_deletions:")?;
+        for (object_id, timestamp) in &self.pending_deletions {
+            writeln!(f, "  - object_id={} timestamp={}", object_id, timestamp)?;
         }
 
         writeln!(f, "lifecycles:")?;
@@ -527,6 +539,24 @@ impl ContractCoreFixture {
         diagnostics
             .deferred_deletes
             .sort_by_key(|record| record.ino);
+
+        let mut referenced_object_ids: Vec<u64> =
+            meta.get_referenced_object_ids()?.into_iter().collect();
+        referenced_object_ids.sort_unstable();
+
+        let mut pending_deletions = meta.get_pending_deletions()?;
+        pending_deletions.sort_unstable_by_key(|(object_id, _timestamp)| *object_id);
+
+        for (object_id, timestamp) in &pending_deletions {
+            if referenced_object_ids.binary_search(object_id).is_ok() {
+                diagnostics.push_violation(format!(
+                    "object_id {object_id} is marked for pending deletion (timestamp={timestamp}) but is still reachable from metadata"
+                ));
+            }
+        }
+
+        diagnostics.referenced_object_ids = referenced_object_ids;
+        diagnostics.pending_deletions = pending_deletions;
 
         let lifecycles = meta.list_inode_lifecycles()?;
         let lifecycle_by_ino: BTreeMap<u64, InodeLifecycleRecord> = lifecycles
