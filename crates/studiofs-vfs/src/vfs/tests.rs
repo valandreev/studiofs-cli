@@ -413,6 +413,7 @@ fn assert_local_durable_not_remote_ready_boundary(
     meta: &Arc<RedbMetaEngine>,
     ino: Ino,
     len: u64,
+    expected_committed_size: u64,
     label: &str,
 ) {
     assert!(
@@ -437,8 +438,8 @@ fn assert_local_durable_not_remote_ready_boundary(
         "{label}: local metadata view should expose the accepted file size"
     );
     assert_eq!(
-        attr.committed_size, 0,
-        "{label}: local durability must not make a new file remotely visible"
+        attr.committed_size, expected_committed_size,
+        "{label}: local durability must not change the remote-visible committed size"
     );
     assert!(
         attr.content_epoch > attr.committed_content_epoch,
@@ -1084,6 +1085,7 @@ fn sfs312_flush_materializes_local_slice_boundary_without_remote_visibility() {
             &meta,
             attr.ino,
             payload.len() as u64,
+            0,
             "flush-after-boundary",
         );
 
@@ -1121,6 +1123,7 @@ fn sfs312_fsync_persists_local_state_without_remote_visibility() {
             &meta,
             attr.ino,
             payload.len() as u64,
+            0,
             "fsync-after-boundary",
         );
 
@@ -1181,6 +1184,7 @@ fn sfs312_last_handle_release_drains_local_durability_boundary() {
             &meta,
             attr.ino,
             payload.len() as u64,
+            0,
             "release-after-boundary",
         );
     });
