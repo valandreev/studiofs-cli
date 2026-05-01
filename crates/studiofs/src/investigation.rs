@@ -1423,8 +1423,11 @@ fn default_store_dir() -> Result<PathBuf> {
         return Ok(path);
     }
 
-    let home = home::home_dir().ok_or_else(|| anyhow!("Could not find home directory"))?;
-    let dir = home.join(".studiofs").join("investigations");
+    default_store_dir_in_client_root(&crate::cli::utils::get_client_root()?)
+}
+
+fn default_store_dir_in_client_root(client_root: &Path) -> Result<PathBuf> {
+    let dir = client_root.join("investigations");
     ensure_private_directory(&dir)?;
     Ok(dir)
 }
@@ -1598,6 +1601,19 @@ mod tests {
                 max_connections: 16,
             },
         }
+    }
+
+    #[test]
+    fn client_root_scopes_default_investigation_store_dir() {
+        let _guard = lock_investigation_test_mutex();
+        set_test_store_base_dir(None);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = std::path::absolute(temp.path().join("client-a")).expect("absolute root");
+
+        let dir = default_store_dir_in_client_root(&root).expect("default store dir");
+
+        assert_eq!(dir, root.join("investigations"));
+        assert!(dir.is_dir());
     }
 
     #[test]

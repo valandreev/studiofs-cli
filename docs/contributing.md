@@ -82,6 +82,10 @@ Manual GitHub Actions  →  macOS
 
 ### Reading CI failures
 
+For RWX task logs, see
+[development.md#rwx-local-cli-and-logs](development.md#rwx-local-cli-and-logs)
+for the local CLI location and `.rwx/downloads/` log layout.
+
 - **RWX quality failed** → fix formatting, clippy, doc, or audit issue.
 - **RWX Ubuntu failed** → a regression in portable Linux behavior, Ubuntu package/runtime compatibility, or the explicit local-first VFS fast checks.
 - **RWX Rocky failed** → a regression in Rocky/RHEL-family package/runtime compatibility or a Linux backend compile/unit path that differs from Ubuntu.

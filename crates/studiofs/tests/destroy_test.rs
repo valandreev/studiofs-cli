@@ -108,6 +108,7 @@ fn home_meta_dir(home: &Path, name: &str) -> PathBuf {
 fn set_home_env(cmd: &mut Command, home: &Path) {
     cmd.env("HOME", home);
     cmd.env("USERPROFILE", home);
+    cmd.env_remove("STUDIOFS_CLIENT_ROOT");
 }
 
 fn run_destroy_cmd(home: &Path, name: &str, local_only: bool, confirm_name: &str) -> Output {

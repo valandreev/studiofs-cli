@@ -148,15 +148,17 @@ impl CommitCoordinator {
         // Only remove the entry when content_epoch matches to avoid dropping a
         // dirty_attr that was written by a concurrent new write or setattr after
         // this publication completed (those will carry a different epoch).
-        {
+        let was_dirty_visible = {
             let mut dirty_attrs = vfs.state.namespace.dirty_attrs.lock();
+            let present = dirty_attrs.contains_key(&ino);
             if dirty_attrs
                 .get(&ino)
                 .is_some_and(|a| a.content_epoch == content_epoch)
             {
                 dirty_attrs.remove(&ino);
             }
-        }
+            present
+        };
 
         if let Ok(attr) = run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
             engine.get_attr(ino)
@@ -167,9 +169,12 @@ impl CommitCoordinator {
         } else {
             vfs.clear_inode_incarnation(ino);
         }
-        let removed_cached_attrs = vfs.invalidate_attr_read_cache([ino]);
-        if !removed_cached_attrs.is_empty() {
-            vfs.invalidate_kernel_inodes(removed_cached_attrs);
+        let removed_cached_attr = !vfs.invalidate_attr_read_cache([ino]).is_empty();
+        // `getattr` can expose pending attrs from dirty_attrs without populating
+        // attr_read_cache. A newer dirty attr must be preserved, but its presence
+        // still means the kernel may hold stale attrs for the epoch just published.
+        if was_dirty_visible || removed_cached_attr {
+            vfs.invalidate_kernel_inodes([ino]);
         }
 
         Ok(EpochFinalizeStatus::Published)

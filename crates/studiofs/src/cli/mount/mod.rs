@@ -138,7 +138,7 @@ pub(crate) struct MountArgs {
     foreground: bool,
 
     /// Detach and run mount in the background (daemon mode).
-    /// Logs are written to ~/.studiofs/logs/.
+    /// Logs are written to `<client-root>/logs/`, defaulting to `~/.studiofs/logs/`.
     /// Use `studiofs umount <mount_point>` to stop.
     #[arg(short = 'd', long, conflicts_with = "foreground")]
     detach: bool,

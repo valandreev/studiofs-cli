@@ -1,13 +1,74 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
+pub(crate) const CLIENT_ROOT_ENV: &str = "STUDIOFS_CLIENT_ROOT";
+
+pub(crate) fn get_client_root() -> Result<PathBuf> {
+    get_client_root_with(|key| std::env::var_os(key))
+}
+
+fn get_client_root_with<F>(read_var: F) -> Result<PathBuf>
+where
+    F: FnOnce(&str) -> Option<OsString>,
+{
+    get_client_root_with_home(read_var, home::home_dir)
+}
+
+fn get_client_root_with_home<F, H>(read_var: F, home_dir: H) -> Result<PathBuf>
+where
+    F: FnOnce(&str) -> Option<OsString>,
+    H: FnOnce() -> Option<PathBuf>,
+{
+    if let Some(root) = read_var(CLIENT_ROOT_ENV) {
+        return normalize_client_root(PathBuf::from(root));
+    }
+
+    let home = home_dir().ok_or_else(|| anyhow!("Could not find home directory"))?;
+    let root = home.join(".studiofs");
+    std::path::absolute(&root)
+        .with_context(|| format!("resolve default client root '{}'", root.display()))
+}
+
+fn normalize_client_root(root: PathBuf) -> Result<PathBuf> {
+    if root.as_os_str().is_empty() {
+        return Err(anyhow!("{CLIENT_ROOT_ENV} must not be empty when set"));
+    }
+
+    std::path::absolute(&root)
+        .with_context(|| format!("resolve {CLIENT_ROOT_ENV} '{}'", root.display()))
+}
+
+fn default_meta_dir_in_client_root(client_root: &Path, volume_name: &str) -> PathBuf {
+    client_root.join("meta").join(volume_name)
+}
+
+fn mounts_dir_in_client_root(client_root: &Path) -> PathBuf {
+    client_root.join("mounts")
+}
+
+fn logs_dir_in_client_root(client_root: &Path) -> PathBuf {
+    client_root.join("logs")
+}
+
+fn mount_record_path_in_mounts_dir(
+    mounts_dir: &Path,
+    mount_point: &str,
+    extension: &str,
+) -> PathBuf {
+    let sanitized = sanitize_mount_point(&normalize_mount_point(mount_point));
+    mounts_dir.join(format!("{sanitized}.{extension}"))
+}
+
 pub fn get_default_meta_dir(volume_name: &str) -> Result<PathBuf> {
-    let home = home::home_dir().ok_or_else(|| anyhow!("Could not find home directory"))?;
-    Ok(home.join(".studiofs").join("meta").join(volume_name))
+    Ok(default_meta_dir_in_client_root(
+        &get_client_root()?,
+        volume_name,
+    ))
 }
 
 // ─── Mount / PID management ─────────────────────────────────────────────────
@@ -37,18 +98,16 @@ pub fn normalize_mount_point(mp: &str) -> String {
     mp.to_string()
 }
 
-/// `~/.studiofs/mounts/`
+/// `<client-root>/mounts/`, defaulting to `~/.studiofs/mounts/`.
 pub fn get_mounts_dir() -> Result<PathBuf> {
-    let home = home::home_dir().ok_or_else(|| anyhow!("Could not find home directory"))?;
-    let dir = home.join(".studiofs").join("mounts");
+    let dir = mounts_dir_in_client_root(&get_client_root()?);
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
 
-/// `~/.studiofs/logs/`
+/// `<client-root>/logs/`, defaulting to `~/.studiofs/logs/`.
 pub fn get_logs_dir() -> Result<PathBuf> {
-    let home = home::home_dir().ok_or_else(|| anyhow!("Could not find home directory"))?;
-    let dir = home.join(".studiofs").join("logs");
+    let dir = logs_dir_in_client_root(&get_client_root()?);
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
@@ -110,15 +169,13 @@ impl Drop for MountLockGuard {
 /// Full path to the JSON mount record for a given mount point.
 pub fn pid_file_path(mount_point: &str) -> Result<PathBuf> {
     let dir = get_mounts_dir()?;
-    let sanitized = sanitize_mount_point(&normalize_mount_point(mount_point));
-    Ok(dir.join(format!("{sanitized}.json")))
+    Ok(mount_record_path_in_mounts_dir(&dir, mount_point, "json"))
 }
 
 /// Full path to the lifecycle lock file for a given mount point.
 pub(crate) fn mount_lock_file_path(mount_point: &str) -> Result<PathBuf> {
     let dir = get_mounts_dir()?;
-    let sanitized = sanitize_mount_point(&normalize_mount_point(mount_point));
-    Ok(dir.join(format!("{sanitized}.lock")))
+    Ok(mount_record_path_in_mounts_dir(&dir, mount_point, "lock"))
 }
 
 fn open_mount_lock_file(mount_point: &str) -> Result<File> {
@@ -270,7 +327,7 @@ pub fn is_process_running(pid: u32) -> bool {
 }
 
 // ─── PID-file helpers that accept an explicit directory ──────────────────────
-// These variants allow unit tests to use a temp directory instead of ~/.studiofs.
+// These variants allow unit tests to use a temp directory instead of the client root.
 
 /// Write a PID file into the given directory.
 #[cfg(test)]
@@ -376,6 +433,77 @@ pub fn format_throughput(bytes_per_sec: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+
+    #[test]
+    fn client_root_absent_preserves_home_studiofs_metadata_layout() {
+        let home = home::home_dir().expect("home dir");
+        let expected_root =
+            std::path::absolute(home.join(".studiofs")).expect("absolute default client root");
+
+        let root = get_client_root_with(|_| None).expect("default client root");
+        let meta_dir = default_meta_dir_in_client_root(&root, "projectfs");
+
+        assert_eq!(root, expected_root);
+        assert_eq!(meta_dir, expected_root.join("meta").join("projectfs"));
+    }
+
+    #[test]
+    fn client_root_absent_normalizes_default_home_to_absolute_path() {
+        let relative_home = std::path::PathBuf::from("relative-home");
+        let root = get_client_root_with_home(|_| None, || Some(relative_home.clone()))
+            .expect("default client root");
+
+        assert!(root.is_absolute());
+        assert_eq!(
+            root,
+            std::path::absolute(relative_home.join(".studiofs")).expect("absolute path")
+        );
+    }
+
+    #[test]
+    fn client_root_env_scopes_metadata_mounts_and_logs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let configured_root = temp.path().join("client-a");
+        let root = get_client_root_with(|_| Some(configured_root.clone().into_os_string()))
+            .expect("client root");
+        let mounts_dir = mounts_dir_in_client_root(&root);
+
+        assert_eq!(
+            default_meta_dir_in_client_root(&root, "projectfs"),
+            root.join("meta").join("projectfs")
+        );
+        assert_eq!(mounts_dir, root.join("mounts"));
+        assert_eq!(logs_dir_in_client_root(&root), root.join("logs"));
+        assert_eq!(
+            mount_record_path_in_mounts_dir(&mounts_dir, "Z:", "json"),
+            root.join("mounts").join("z.json")
+        );
+        assert_eq!(
+            mount_record_path_in_mounts_dir(&mounts_dir, "Z:", "lock"),
+            root.join("mounts").join("z.lock")
+        );
+    }
+
+    #[test]
+    fn client_root_env_normalizes_relative_value_to_absolute_path() {
+        let root = get_client_root_with(|_| Some(OsString::from("relative-client-root")))
+            .expect("client root");
+
+        assert!(root.is_absolute());
+        assert_eq!(
+            root,
+            std::path::absolute("relative-client-root").expect("absolute path")
+        );
+    }
+
+    #[test]
+    fn client_root_env_rejects_empty_value() {
+        let error = get_client_root_with(|_| Some(OsString::new()))
+            .expect_err("empty client root rejected");
+
+        assert!(error.to_string().contains(CLIENT_ROOT_ENV));
+    }
 
     // ── sanitize_mount_point ─────────────────────────────────────────────
 
