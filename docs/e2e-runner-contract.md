@@ -272,7 +272,7 @@ Required checks:
     FUSE backend expected by `studiofs-fuse`.
   - Windows requires WinFSP installed, `winfsp-x64.dll` loadable by the
     product CLI, a free drive letter, and either elevation or a configured
-    Mount Manager path such as `MountUseMountmgrFromFSD=1`.
+    WinFSP registry setting such as `MountUseMountmgrFromFSD=1`.
   - macOS requires macFUSE or the configured FUSE provider installed and loaded,
     plus a writable mount directory.
 - Required commands: `studiofs` binary, `cargo` only when an explicit build mode
