@@ -1,6 +1,6 @@
 use crate::cli::mount::MountArgs;
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 mod supported {
     use super::MountArgs;
     use crate::diagnostics::{
@@ -722,10 +722,10 @@ mod supported {
     }
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 pub(crate) use supported::dispatch_mount_with_auto_tray;
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 pub(crate) fn dispatch_mount_with_auto_tray(args: MountArgs) -> anyhow::Result<()> {
     tracing::debug!("tray auto-init is unsupported on this platform; continuing without tray");
     args.dispatch()

@@ -161,12 +161,12 @@ pub(crate) struct MountArgs {
 }
 
 impl MountArgs {
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     pub(crate) fn should_detach(&self) -> bool {
         self.detach
     }
 
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     pub(crate) fn volume_name(&self) -> &str {
         &self.name
     }
