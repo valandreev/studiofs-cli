@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::client::{
@@ -14,7 +15,7 @@ use crate::client::{
     SystemClientProcessExecutor, VolumeBootstrapOptions, VolumeBootstrapSummary,
 };
 use crate::infra::{
-    CommandExecutor, ComposeServiceControl, InfraError, POSTGRES_SERVICE_NAME,
+    CommandExecutor, ComposeServiceControl, InfraError, POSTGRES_SERVICE_NAME, RUSTFS_SERVICE_NAME,
     SystemCommandExecutor,
 };
 use crate::mounted_tree::{
@@ -23,6 +24,7 @@ use crate::mounted_tree::{
 
 pub const BASIC_MULTI_CLIENT_SMOKE: &str = "basic-multi-client-smoke";
 pub const POSTGRES_OUTAGE_MULTI_CLIENT_RECOVERY: &str = "postgres-outage-multi-client-recovery";
+pub const RUSTFS_OUTAGE_MULTI_CLIENT_RECOVERY: &str = "rustfs-outage-multi-client-recovery";
 const SMOKE_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
 const OUTAGE_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
 const SMOKE_FILE_NAME: &str = "studiofs-e2e-smoke.txt";
@@ -32,6 +34,10 @@ const SMOKE_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const OUTAGE_INITIAL_FILE_NAME: &str = "studiofs-e2e-outage-initial.txt";
 const OUTAGE_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(60);
 const OUTAGE_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const RUSTFS_OUTAGE_FILE_NAME: &str = "studiofs-e2e-rustfs-outage.txt";
+const RUSTFS_OUTAGE_INITIAL_PAYLOAD: &[u8] = b"initial healthy RustFS payload\n";
+const RUSTFS_OUTAGE_RECOVERED_PAYLOAD: &[u8] =
+    b"initial healthy RustFS payload\naccepted local payload while RustFS is down\n";
 
 #[cfg(test)]
 pub(crate) const TEST_FAILING_VALIDATE: &str = "__test-failing-validate";
@@ -68,6 +74,8 @@ pub enum ScenarioError {
     MountedSmokeUnmountAfterFailure { primary: String, cleanup: String },
     #[error("PostgreSQL outage scenario failed: {primary}; unmount also failed: {cleanup}")]
     PostgresOutageUnmountAfterFailure { primary: String, cleanup: String },
+    #[error("RustFS/S3 outage scenario failed: {primary}; unmount also failed: {cleanup}")]
+    RustfsOutageUnmountAfterFailure { primary: String, cleanup: String },
     #[error("mounted tree validation failed: {0}")]
     MountedTree(#[from] MountedTreeError),
     #[error("scenario infrastructure failed: {0}")]
@@ -78,6 +86,8 @@ pub enum ScenarioError {
     MissingRunManifest { path: PathBuf },
     #[error("PostgreSQL outage operations rejected {rejected} of {total} expected local writes")]
     RejectedOutageOperations { rejected: usize, total: usize },
+    #[error("peer client observed the RustFS/S3 outage write before recovery: {checksum}")]
+    PeerObservedOutageWrite { checksum: String },
     #[error("mounted smoke scenario requires at least {expected} clients, got {actual}")]
     InsufficientMountedClients { expected: usize, actual: usize },
     #[error("PostgreSQL outage scenario requires at least {expected} clients, got {actual}")]
@@ -96,6 +106,7 @@ pub fn available_scenarios() -> Vec<ScenarioDefinition> {
     vec![
         BasicMultiClientSmoke.definition(),
         PostgresOutageMultiClientRecovery.definition(),
+        RustfsOutageMultiClientRecovery.definition(),
     ]
 }
 
@@ -104,6 +115,9 @@ pub(crate) fn resolve_scenario(name: &str) -> Option<Box<dyn Scenario>> {
         BASIC_MULTI_CLIENT_SMOKE | "smoke" => Some(Box::new(BasicMultiClientSmoke)),
         POSTGRES_OUTAGE_MULTI_CLIENT_RECOVERY | "postgres-outage" => {
             Some(Box::new(PostgresOutageMultiClientRecovery))
+        }
+        RUSTFS_OUTAGE_MULTI_CLIENT_RECOVERY | "rustfs-outage" | "s3-outage" => {
+            Some(Box::new(RustfsOutageMultiClientRecovery))
         }
         #[cfg(test)]
         TEST_FAILING_VALIDATE => Some(Box::new(TestFailingScenario {
@@ -296,6 +310,87 @@ impl Scenario for PostgresOutageMultiClientRecovery {
                 "artifacts/scenarios/{POSTGRES_OUTAGE_MULTI_CLIENT_RECOVERY}/postgres-outage-recovery-summary.json"
             ),
             format!("artifacts/scenarios/{POSTGRES_OUTAGE_MULTI_CLIENT_RECOVERY}/validation.json"),
+        ])
+    }
+
+    fn cleanup(&self, _context: &ScenarioContext) -> Result<(), ScenarioError> {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RustfsOutageMultiClientRecovery;
+
+impl Scenario for RustfsOutageMultiClientRecovery {
+    fn definition(&self) -> ScenarioDefinition {
+        ScenarioDefinition {
+            name: RUSTFS_OUTAGE_MULTI_CLIENT_RECOVERY,
+            description: "mounted multi-client RustFS/S3 outage recovery scenario",
+            requires_studiofs_bin: true,
+        }
+    }
+
+    fn setup(&self, context: &ScenarioContext) -> Result<(), ScenarioError> {
+        fs::create_dir_all(&context.scenario_dir)?;
+        Ok(())
+    }
+
+    fn run(&self, context: &ScenarioContext) -> Result<(), ScenarioError> {
+        let Some(config) = &context.client_controller_config else {
+            return Err(ScenarioError::MissingComposeInfrastructure);
+        };
+        let compose_control = compose_control_from_manifest(context)?;
+        let mut driver = RealRustfsOutageDriver {
+            controller: MultiClientController::new(config.clone(), SystemClientProcessExecutor),
+            compose_control,
+            executor: SystemCommandExecutor,
+        };
+        run_rustfs_outage_with_driver(
+            context,
+            &mut driver,
+            OUTAGE_CONVERGENCE_TIMEOUT,
+            OUTAGE_CONVERGENCE_POLL_INTERVAL,
+        )?;
+        Ok(())
+    }
+
+    fn validate(&self, context: &ScenarioContext) -> Result<Vec<String>, ScenarioError> {
+        let summary_path = context
+            .scenario_dir
+            .join("rustfs-outage-recovery-summary.json");
+        if !summary_path.exists() {
+            return Err(ScenarioError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("missing summary artifact: {}", summary_path.display()),
+            )));
+        }
+        let summary: RustfsOutageRecoverySummary =
+            serde_json::from_slice(&fs::read(&summary_path)?)?;
+        let validation = json!({
+            "scenario": RUSTFS_OUTAGE_MULTI_CLIENT_RECOVERY,
+            "run_id": context.run_id,
+            "seed": context.seed,
+            "status": if summary.final_validator.converged { "passed" } else { "failed" },
+            "outage_duration_ms": summary.outage_duration_ms,
+            "upload_recovery_time_ms": summary.upload_recovery_time_ms,
+            "outage_file": summary.outage_file,
+            "local_read_checksum_sha256": summary.local_read_checksum_sha256,
+            "peer_visible_during_outage": summary.peer_visible_during_outage,
+            "final_checksum_sha256": summary.final_checksum_sha256,
+            "final_validator": summary.final_validator,
+        });
+        fs::write(
+            context.scenario_dir.join("validation.json"),
+            serde_json::to_vec_pretty(&validation)?,
+        )?;
+        Ok(vec![
+            format!(
+                "artifacts/scenarios/{RUSTFS_OUTAGE_MULTI_CLIENT_RECOVERY}/rustfs-outage-operations.ndjson"
+            ),
+            format!(
+                "artifacts/scenarios/{RUSTFS_OUTAGE_MULTI_CLIENT_RECOVERY}/rustfs-outage-recovery-summary.json"
+            ),
+            format!("artifacts/scenarios/{RUSTFS_OUTAGE_MULTI_CLIENT_RECOVERY}/validation.json"),
         ])
     }
 
@@ -665,6 +760,248 @@ fn perform_outage_operations(
     Ok(accepted)
 }
 
+trait RustfsOutageDriver {
+    fn bootstrap_volume(
+        &mut self,
+        options: VolumeBootstrapOptions,
+    ) -> Result<VolumeBootstrapSummary, ScenarioError>;
+    fn mount_all(&mut self) -> Result<(), ScenarioError>;
+    fn clients(&self) -> Vec<ClientSpec>;
+    // Test drivers use this hook to make the healthy pre-outage payload visible
+    // before the normal mounted-tree convergence gate.
+    fn after_initial_write(
+        &mut self,
+        clients: &[ClientSpec],
+        relative_path: &str,
+    ) -> Result<(), ScenarioError>;
+    fn stop_rustfs(&mut self) -> Result<(), ScenarioError>;
+    fn assert_peer_not_visible(
+        &mut self,
+        peer: &ClientSpec,
+        relative_path: &str,
+        forbidden_checksum: &str,
+    ) -> Result<Option<String>, ScenarioError>;
+    fn start_rustfs(&mut self) -> Result<(), ScenarioError>;
+    fn unmount_all(&mut self) -> Result<(), ScenarioError>;
+}
+
+struct RealRustfsOutageDriver<E> {
+    controller: MultiClientController<SystemClientProcessExecutor>,
+    compose_control: ComposeServiceControl,
+    executor: E,
+}
+
+impl<E: CommandExecutor> RustfsOutageDriver for RealRustfsOutageDriver<E> {
+    fn bootstrap_volume(
+        &mut self,
+        options: VolumeBootstrapOptions,
+    ) -> Result<VolumeBootstrapSummary, ScenarioError> {
+        Ok(self.controller.bootstrap_volume(options)?)
+    }
+
+    fn mount_all(&mut self) -> Result<(), ScenarioError> {
+        Ok(self.controller.mount_all()?)
+    }
+
+    fn clients(&self) -> Vec<ClientSpec> {
+        self.controller.clients().into_iter().cloned().collect()
+    }
+
+    fn after_initial_write(
+        &mut self,
+        _clients: &[ClientSpec],
+        _relative_path: &str,
+    ) -> Result<(), ScenarioError> {
+        Ok(())
+    }
+
+    fn stop_rustfs(&mut self) -> Result<(), ScenarioError> {
+        Ok(self
+            .compose_control
+            .stop_service(RUSTFS_SERVICE_NAME, &self.executor)?)
+    }
+
+    fn assert_peer_not_visible(
+        &mut self,
+        peer: &ClientSpec,
+        relative_path: &str,
+        forbidden_checksum: &str,
+    ) -> Result<Option<String>, ScenarioError> {
+        assert_peer_not_visible(peer, relative_path, forbidden_checksum)
+    }
+
+    fn start_rustfs(&mut self) -> Result<(), ScenarioError> {
+        Ok(self
+            .compose_control
+            .start_service(RUSTFS_SERVICE_NAME, &self.executor)?)
+    }
+
+    fn unmount_all(&mut self) -> Result<(), ScenarioError> {
+        Ok(self.controller.unmount_all()?)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RustfsOutageRecoverySummary {
+    bootstrap: VolumeBootstrapSummary,
+    outage_file: String,
+    outage_duration_ms: u128,
+    upload_recovery_time_ms: u128,
+    local_read_checksum_sha256: String,
+    peer_visible_during_outage: Option<String>,
+    final_checksum_sha256: String,
+    final_validator: TreeComparison,
+}
+
+fn run_rustfs_outage_with_driver(
+    context: &ScenarioContext,
+    driver: &mut dyn RustfsOutageDriver,
+    convergence_timeout: Duration,
+    poll_interval: Duration,
+) -> Result<RustfsOutageRecoverySummary, ScenarioError> {
+    let result = run_rustfs_outage_body(context, driver, convergence_timeout, poll_interval);
+    let unmount_result = driver.unmount_all();
+    match (result, unmount_result) {
+        (Ok(summary), Ok(())) => Ok(summary),
+        (Err(primary), Err(cleanup)) => Err(ScenarioError::RustfsOutageUnmountAfterFailure {
+            primary: primary.to_string(),
+            cleanup: cleanup.to_string(),
+        }),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+fn run_rustfs_outage_body(
+    context: &ScenarioContext,
+    driver: &mut dyn RustfsOutageDriver,
+    convergence_timeout: Duration,
+    poll_interval: Duration,
+) -> Result<RustfsOutageRecoverySummary, ScenarioError> {
+    let bootstrap = driver.bootstrap_volume(VolumeBootstrapOptions {
+        client_names: OUTAGE_CLIENT_NAMES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect(),
+        clean_existing_local_metadata: true,
+    })?;
+    write_bootstrap_summary(context, &bootstrap)?;
+
+    driver.mount_all()?;
+    let clients = driver.clients();
+    if clients.len() < OUTAGE_CLIENT_NAMES.len() {
+        return Err(ScenarioError::InsufficientOutageClients {
+            expected: OUTAGE_CLIENT_NAMES.len(),
+            actual: clients.len(),
+        });
+    }
+
+    let relative_path = RUSTFS_OUTAGE_FILE_NAME;
+    let source_file = clients[0].mount_point.join(relative_path);
+    fs::write(&source_file, RUSTFS_OUTAGE_INITIAL_PAYLOAD)?;
+    driver.after_initial_write(&clients, relative_path)?;
+    let initial_mounts = clients
+        .iter()
+        .take(OUTAGE_CLIENT_NAMES.len())
+        .map(|client| ClientMount::new(client.name.clone(), client.mount_point.clone()))
+        .collect::<Vec<_>>();
+    wait_for_convergence(
+        &initial_mounts,
+        context.scenario_dir.join("healthy-validation"),
+        convergence_timeout,
+        poll_interval,
+    )?;
+
+    let outage_started = Instant::now();
+    driver.stop_rustfs()?;
+    fs::write(&source_file, RUSTFS_OUTAGE_RECOVERED_PAYLOAD)?;
+    let local_read_checksum_sha256 = bytes_sha256(&fs::read(&source_file)?);
+    let outage_duration_ms = outage_started.elapsed().as_millis();
+    let peer_visible_during_outage =
+        driver.assert_peer_not_visible(&clients[1], relative_path, &local_read_checksum_sha256)?;
+
+    let recovery_started = Instant::now();
+    driver.start_rustfs()?;
+    let convergence = wait_for_convergence(
+        &initial_mounts,
+        context.scenario_dir.join("validation"),
+        convergence_timeout,
+        poll_interval,
+    )?;
+    let upload_recovery_time_ms = recovery_started.elapsed().as_millis();
+    let final_checksum_sha256 =
+        bytes_sha256(&fs::read(clients[1].mount_point.join(relative_path))?);
+
+    let summary = RustfsOutageRecoverySummary {
+        bootstrap,
+        outage_file: relative_path.to_string(),
+        outage_duration_ms,
+        upload_recovery_time_ms,
+        local_read_checksum_sha256,
+        peer_visible_during_outage,
+        final_checksum_sha256,
+        final_validator: convergence.comparison,
+    };
+    write_rustfs_outage_operation(context, &summary)?;
+    fs::write(
+        context
+            .scenario_dir
+            .join("rustfs-outage-recovery-summary.json"),
+        serde_json::to_vec_pretty(&summary)?,
+    )?;
+    Ok(summary)
+}
+
+fn assert_peer_not_visible(
+    peer: &ClientSpec,
+    relative_path: &str,
+    forbidden_checksum: &str,
+) -> Result<Option<String>, ScenarioError> {
+    match fs::read(peer.mount_point.join(relative_path)) {
+        Ok(payload) => {
+            let checksum = bytes_sha256(&payload);
+            if checksum == forbidden_checksum {
+                Err(ScenarioError::PeerObservedOutageWrite { checksum })
+            } else {
+                Ok(Some(checksum))
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn write_rustfs_outage_operation(
+    context: &ScenarioContext,
+    summary: &RustfsOutageRecoverySummary,
+) -> Result<(), ScenarioError> {
+    let record = json!({
+        "scenario": RUSTFS_OUTAGE_MULTI_CLIENT_RECOVERY,
+        "client": OUTAGE_CLIENT_NAMES[0],
+        "path": summary.outage_file,
+        "bytes": RUSTFS_OUTAGE_RECOVERED_PAYLOAD.len(),
+        "accepted": true,
+        "local_read_checksum_sha256": summary.local_read_checksum_sha256,
+        "peer_visible_during_outage": summary.peer_visible_during_outage,
+        "final_checksum_sha256": summary.final_checksum_sha256,
+    });
+    for artifact in ["rustfs-outage-operations.ndjson", "operations.ndjson"] {
+        let mut log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(context.scenario_dir.join(artifact))?;
+        serde_json::to_writer(&mut log, &record)?;
+        log.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
+fn bytes_sha256(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 struct TestFailingScenario {
@@ -991,6 +1328,116 @@ mod tests {
         }
     }
 
+    struct RecordingRustfsOutageDriver {
+        clients: Vec<ClientSpec>,
+        actions: RefCell<Vec<&'static str>>,
+        peer_probe_delay: Duration,
+    }
+
+    impl RecordingRustfsOutageDriver {
+        fn new(clients: Vec<ClientSpec>) -> Self {
+            Self {
+                clients,
+                actions: RefCell::new(Vec::new()),
+                peer_probe_delay: Duration::from_millis(0),
+            }
+        }
+
+        fn with_peer_probe_delay(mut self, delay: Duration) -> Self {
+            self.peer_probe_delay = delay;
+            self
+        }
+    }
+
+    impl RustfsOutageDriver for RecordingRustfsOutageDriver {
+        fn bootstrap_volume(
+            &mut self,
+            options: VolumeBootstrapOptions,
+        ) -> Result<VolumeBootstrapSummary, ScenarioError> {
+            self.actions.borrow_mut().push("bootstrap");
+            assert_eq!(
+                options.client_names,
+                OUTAGE_CLIENT_NAMES
+                    .iter()
+                    .copied()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            );
+            Ok(VolumeBootstrapSummary {
+                volume_name: "projectfs".to_string(),
+                init_client: OUTAGE_CLIENT_NAMES[0].to_string(),
+                discovered_clients: OUTAGE_CLIENT_NAMES[1..]
+                    .iter()
+                    .map(|name| (*name).to_string())
+                    .collect(),
+                clients: self
+                    .clients
+                    .iter()
+                    .map(|client| crate::client::ClientBootstrapRecord {
+                        name: client.name.clone(),
+                        local_metadata_db: client.local_metadata_db.clone(),
+                        state: ClientLifecycleState::Discovered,
+                    })
+                    .collect(),
+            })
+        }
+
+        fn mount_all(&mut self) -> Result<(), ScenarioError> {
+            self.actions.borrow_mut().push("mount_all");
+            Ok(())
+        }
+
+        fn clients(&self) -> Vec<ClientSpec> {
+            self.clients.clone()
+        }
+
+        fn after_initial_write(
+            &mut self,
+            clients: &[ClientSpec],
+            relative_path: &str,
+        ) -> Result<(), ScenarioError> {
+            self.actions.borrow_mut().push("after_initial_write");
+            let payload = std::fs::read(clients[0].mount_point.join(relative_path))?;
+            for client in clients.iter().skip(1) {
+                std::fs::write(client.mount_point.join(relative_path), &payload)?;
+            }
+            Ok(())
+        }
+
+        fn stop_rustfs(&mut self) -> Result<(), ScenarioError> {
+            self.actions.borrow_mut().push("stop_rustfs");
+            Ok(())
+        }
+
+        fn assert_peer_not_visible(
+            &mut self,
+            peer: &ClientSpec,
+            relative_path: &str,
+            forbidden_checksum: &str,
+        ) -> Result<Option<String>, ScenarioError> {
+            self.actions.borrow_mut().push("assert_peer_not_visible");
+            if !self.peer_probe_delay.is_zero() {
+                thread::sleep(self.peer_probe_delay);
+            }
+            assert_peer_not_visible(peer, relative_path, forbidden_checksum)
+        }
+
+        fn start_rustfs(&mut self) -> Result<(), ScenarioError> {
+            self.actions.borrow_mut().push("start_rustfs");
+            let source = self.clients[0].mount_point.join(RUSTFS_OUTAGE_FILE_NAME);
+            let payload = std::fs::read(source)?;
+            for client in self.clients.iter().skip(1) {
+                std::fs::write(client.mount_point.join(RUSTFS_OUTAGE_FILE_NAME), &payload)?;
+            }
+            Ok(())
+        }
+
+        fn unmount_all(&mut self) -> Result<(), ScenarioError> {
+            self.actions.borrow_mut().push("unmount_all");
+            Ok(())
+        }
+    }
+
     #[test]
     fn mounted_smoke_reports_unmount_error_when_body_also_fails() {
         let temp = tempdir().unwrap();
@@ -1082,6 +1529,20 @@ mod tests {
     }
 
     #[test]
+    fn registry_exposes_rustfs_outage_recovery_scenario() {
+        let scenarios = available_scenarios();
+
+        assert!(scenarios.iter().any(|scenario| {
+            scenario.name == RUSTFS_OUTAGE_MULTI_CLIENT_RECOVERY
+                && scenario.requires_studiofs_bin
+                && scenario.description.contains("RustFS/S3 outage")
+        }));
+        assert!(resolve_scenario(RUSTFS_OUTAGE_MULTI_CLIENT_RECOVERY).is_some());
+        assert!(resolve_scenario("rustfs-outage").is_some());
+        assert!(resolve_scenario("s3-outage").is_some());
+    }
+
+    #[test]
     fn postgres_outage_records_local_operations_and_recovery_metrics() {
         let temp = tempdir().unwrap();
         let sandbox = temp.path().join("run-1");
@@ -1150,6 +1611,145 @@ mod tests {
         let operations_log =
             std::fs::read_to_string(context.scenario_dir.join("operations.ndjson")).unwrap();
         assert!(operations_log.contains("\"accepted\":true"));
+    }
+
+    #[test]
+    fn rustfs_outage_keeps_local_writes_private_until_recovery_and_records_checksums() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(RUSTFS_OUTAGE_MULTI_CLIENT_RECOVERY);
+        let clients = OUTAGE_CLIENT_NAMES
+            .iter()
+            .copied()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(&mount).unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let mut driver = RecordingRustfsOutageDriver::new(clients);
+        let context = ScenarioContext {
+            run_id: "run-1".to_string(),
+            seed: 326,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+
+        let summary = run_rustfs_outage_with_driver(
+            &context,
+            &mut driver,
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+
+        assert_eq!(summary.bootstrap.init_client, "client-a");
+        assert_eq!(summary.outage_file, "studiofs-e2e-rustfs-outage.txt");
+        assert_eq!(
+            summary.local_read_checksum_sha256,
+            summary.final_checksum_sha256
+        );
+        let initial_checksum = bytes_sha256(RUSTFS_OUTAGE_INITIAL_PAYLOAD);
+        assert_eq!(
+            summary.peer_visible_during_outage.as_deref(),
+            Some(initial_checksum.as_str())
+        );
+        assert!(summary.final_validator.converged);
+        assert_eq!(
+            driver.actions.borrow().as_slice(),
+            [
+                "bootstrap",
+                "mount_all",
+                "after_initial_write",
+                "stop_rustfs",
+                "assert_peer_not_visible",
+                "start_rustfs",
+                "unmount_all"
+            ]
+        );
+
+        let summary_json: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                context
+                    .scenario_dir
+                    .join("rustfs-outage-recovery-summary.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(summary_json["upload_recovery_time_ms"].is_number());
+        assert_eq!(
+            summary_json["local_read_checksum_sha256"],
+            summary_json["final_checksum_sha256"]
+        );
+        assert!(
+            context
+                .scenario_dir
+                .join("rustfs-outage-operations.ndjson")
+                .exists()
+        );
+        let operations_log =
+            std::fs::read_to_string(context.scenario_dir.join("operations.ndjson")).unwrap();
+        assert!(operations_log.contains("\"scenario\":\"rustfs-outage-multi-client-recovery\""));
+    }
+
+    #[test]
+    fn rustfs_outage_duration_excludes_peer_visibility_probe_latency() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(RUSTFS_OUTAGE_MULTI_CLIENT_RECOVERY);
+        let clients = OUTAGE_CLIENT_NAMES
+            .iter()
+            .copied()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(&mount).unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let mut driver = RecordingRustfsOutageDriver::new(clients)
+            .with_peer_probe_delay(Duration::from_millis(200));
+        let context = ScenarioContext {
+            run_id: "run-1".to_string(),
+            seed: 326,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+
+        let summary = run_rustfs_outage_with_driver(
+            &context,
+            &mut driver,
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+
+        assert!(
+            summary.outage_duration_ms < 100,
+            "outage duration should exclude the peer visibility probe latency, got {}ms",
+            summary.outage_duration_ms
+        );
+    }
+
+    #[test]
+    fn rustfs_peer_visibility_probe_propagates_unexpected_io_errors() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let mount = temp.path().join("mounts").join("client-b");
+        std::fs::create_dir_all(mount.join(RUSTFS_OUTAGE_FILE_NAME)).unwrap();
+        let peer = client_spec_for(&sandbox, "projectfs", "client-b", mount);
+
+        let err = assert_peer_not_visible(&peer, RUSTFS_OUTAGE_FILE_NAME, "forbidden").unwrap_err();
+
+        assert!(matches!(err, ScenarioError::Io(_)));
     }
 
     #[test]

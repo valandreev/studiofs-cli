@@ -32,6 +32,7 @@ Initial operator commands:
 cargo run -p studiofs-e2e -- list
 cargo run -p studiofs-e2e -- run basic-multi-client-smoke
 cargo run -p studiofs-e2e -- run postgres-outage-multi-client-recovery --studiofs-bin <path-to-studiofs>
+cargo run -p studiofs-e2e -- run rustfs-outage-multi-client-recovery --studiofs-bin <path-to-studiofs>
 cargo run -p studiofs-e2e -- clean
 ```
 
@@ -54,7 +55,7 @@ Required initial run flags and environment:
 | Flag | Contract |
 |---|---|
 | `basic-multi-client-smoke` | Positional shorthand for the mounted three-client happy-path smoke scenario. |
-| `--scenario <name>` | Repeatable. Accepted values include `basic-multi-client-smoke` (`smoke`) and `postgres-outage-multi-client-recovery` (`postgres-outage`). Later gates add collision names. |
+| `--scenario <name>` | Repeatable. Accepted values include `basic-multi-client-smoke` (`smoke`), `postgres-outage-multi-client-recovery` (`postgres-outage`), and `rustfs-outage-multi-client-recovery` (`rustfs-outage`, `s3-outage`). Later gates add collision names. |
 | `--studiofs-bin <path>` | Path to the product CLI under test. Real mounted scenarios require it when `--infra compose` is used. The runner may build it only when an explicit build flag is added. |
 | `--root <path>` | Parent run directory. Defaults to `target/e2e-runs`. |
 | `--run-id <id>` | Optional stable run ID. If omitted, use an ISO-like UTC timestamp plus short random suffix. Explicit IDs must be safe single directory names: no separators, drive prefixes, traversal segments, leading dots, or other shell/path metacharacters. |
@@ -212,6 +213,19 @@ accepted-operation count, recovery time, and the final validator result.
 `recovery_time_ms` starts before the PostgreSQL compose service is brought back
 with `docker compose up --wait`, so it includes the PostgreSQL healthcheck
 readiness gate as well as mounted tree convergence time.
+
+`rustfs-outage-multi-client-recovery` uses the same three-client mounted
+bootstrap, writes and converges an initial file while RustFS/S3 is healthy,
+stops only the RustFS compose service, writes a new complete version through
+`client-a`, verifies that `client-a` can read the accepted local version, and
+checks that a peer client does not observe that new checksum before RustFS/S3
+is restored. After `docker compose up --wait rustfs`, the scenario waits for
+mounted tree convergence and records the local read checksum, any peer-visible
+pre-recovery checksum, the final checksum, upload recovery time, and final
+validator result in `rustfs-outage-recovery-summary.json`.
+`outage_duration_ms` covers the RustFS stopped window through the accepted
+local write/read boundary; the peer visibility probe runs after that boundary
+so peer I/O latency does not inflate the outage-duration metric.
 
 ## Mounted Tree Convergence Validation
 

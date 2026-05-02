@@ -16,7 +16,7 @@ const DEFAULT_RUSTFS_CONSOLE_PORT: u16 = 29_001;
 const DEFAULT_TOXIPROXY_API_PORT: u16 = 28_474;
 
 pub const POSTGRES_SERVICE_NAME: &str = "postgres";
-const RUSTFS_SERVICE_NAME: &str = "rustfs";
+pub const RUSTFS_SERVICE_NAME: &str = "rustfs";
 const RUSTFS_CONSOLE_SERVICE_NAME: &str = "rustfs-console";
 const TOXIPROXY_API_SERVICE_NAME: &str = "toxiproxy-api";
 
