@@ -119,12 +119,38 @@ fn compose_stack_lifecycle_collects_logs_and_tears_down_volumes() {
     stack.start(&executor).unwrap();
     stack.restart(&executor).unwrap();
     let log_path = stack.collect_logs(&executor).unwrap();
+    let diagnostics = stack.collect_optional_diagnostics(&executor).unwrap();
     stack.stop(&executor).unwrap();
     stack.teardown(&executor).unwrap();
 
     assert_eq!(
         std::fs::read_to_string(log_path).unwrap(),
         "postgres ready\nrustfs ready\n"
+    );
+    assert_eq!(
+        diagnostics,
+        vec![
+            "postgres metadata dump".to_string(),
+            "rustfs object listing".to_string()
+        ]
+    );
+    assert_eq!(
+        std::fs::read_to_string(
+            temp.path()
+                .join("compose-lifecycle")
+                .join("artifacts/docker/postgres-schema.sql")
+        )
+        .unwrap(),
+        "postgres schema\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(
+            temp.path()
+                .join("compose-lifecycle")
+                .join("artifacts/docker/rustfs-object-listing.txt")
+        )
+        .unwrap(),
+        "/data/studiofs-e2e/object\n"
     );
     let calls = executor.calls.borrow();
     assert!(calls.iter().any(|call| {
@@ -143,6 +169,53 @@ fn compose_stack_lifecycle_collects_logs_and_tears_down_volumes() {
     assert!(calls.iter().any(|call| {
         call.args.contains(&"down".to_string()) && call.args.contains(&"--volumes".to_string())
     }));
+    assert!(calls.iter().any(|call| {
+        call.args.contains(&"exec".to_string())
+            && call.args.contains(&"-T".to_string())
+            && call.args.contains(&"postgres".to_string())
+            && call.args.contains(&"pg_dump".to_string())
+    }));
+    assert!(calls.iter().any(|call| {
+        call.args.contains(&"exec".to_string())
+            && call.args.contains(&"-T".to_string())
+            && call.args.contains(&"rustfs".to_string())
+            && call
+                .args
+                .contains(&"find /data -mindepth 1 -maxdepth 8 -print | sort".to_string())
+    }));
+}
+
+#[test]
+fn optional_diagnostics_preserve_stdout_when_command_fails() {
+    let temp = tempdir().unwrap();
+    let stack = DockerComposeStack::new(ComposeConfig {
+        run_id: "compose-diagnostic-failure".to_string(),
+        sandbox: temp.path().join("compose-diagnostic-failure"),
+        compose_file: repo_root().join("docker/compose.e2e.yml"),
+        port_range: Some("32200-32210".to_string()),
+        wait_timeout_secs: 120,
+    })
+    .unwrap();
+    let executor = FailingDiagnosticsExecutor;
+
+    let diagnostics = stack.collect_optional_diagnostics(&executor).unwrap();
+
+    assert_eq!(diagnostics, vec!["rustfs object listing".to_string()]);
+    let artifact_dir = temp
+        .path()
+        .join("compose-diagnostic-failure")
+        .join("artifacts/docker");
+    assert_eq!(
+        std::fs::read_to_string(artifact_dir.join("postgres-schema.sql")).unwrap(),
+        "partial schema stdout before failure\n"
+    );
+    let status: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(artifact_dir.join("postgres-schema.status.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(status["action"], "postgres metadata dump");
+    assert_eq!(status["status"], 17);
+    assert_eq!(status["collected"], false);
 }
 
 #[test]
@@ -192,9 +265,38 @@ struct RecordingExecutor {
 impl CommandExecutor for RecordingExecutor {
     fn run(&self, command: &studiofs_e2e::infra::CommandSpec) -> std::io::Result<CommandOutput> {
         self.calls.borrow_mut().push(command.clone());
+        let stdout = if command.args.contains(&"pg_dump".to_string()) {
+            "postgres schema\n"
+        } else if command
+            .args
+            .contains(&"find /data -mindepth 1 -maxdepth 8 -print | sort".to_string())
+        {
+            "/data/studiofs-e2e/object\n"
+        } else {
+            "postgres ready\nrustfs ready\n"
+        };
         Ok(CommandOutput {
             status: 0,
-            stdout: "postgres ready\nrustfs ready\n".to_string(),
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+        })
+    }
+}
+
+struct FailingDiagnosticsExecutor;
+
+impl CommandExecutor for FailingDiagnosticsExecutor {
+    fn run(&self, command: &studiofs_e2e::infra::CommandSpec) -> std::io::Result<CommandOutput> {
+        if command.args.contains(&"pg_dump".to_string()) {
+            return Ok(CommandOutput {
+                status: 17,
+                stdout: "partial schema stdout before failure\n".to_string(),
+                stderr: "pg_dump failed\n".to_string(),
+            });
+        }
+        Ok(CommandOutput {
+            status: 0,
+            stdout: "/data/studiofs-e2e/object\n".to_string(),
             stderr: String::new(),
         })
     }
