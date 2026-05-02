@@ -58,8 +58,8 @@ pub enum ScenarioError {
     MountedSmokeUnmountAfterFailure { primary: String, cleanup: String },
     #[error("mounted tree validation failed: {0}")]
     MountedTree(#[from] MountedTreeError),
-    #[error("mounted smoke scenario requires at least 3 clients, got {count}")]
-    InsufficientMountedClients { count: usize },
+    #[error("mounted smoke scenario requires at least {expected} clients, got {actual}")]
+    InsufficientMountedClients { expected: usize, actual: usize },
 }
 
 pub trait Scenario {
@@ -291,7 +291,8 @@ fn run_mounted_smoke_body(
     let clients = driver.clients();
     if clients.len() < SMOKE_CLIENT_NAMES.len() {
         return Err(ScenarioError::InsufficientMountedClients {
-            count: clients.len(),
+            expected: SMOKE_CLIENT_NAMES.len(),
+            actual: clients.len(),
         });
     }
 
@@ -612,6 +613,49 @@ mod tests {
         ));
         assert!(message.contains("requires at least 3 clients"));
         assert!(message.contains("umount failed"));
+    }
+
+    #[test]
+    fn mounted_smoke_reports_expected_and_actual_client_count() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(BASIC_MULTI_CLIENT_SMOKE);
+        let clients = SMOKE_CLIENT_NAMES[..2]
+            .iter()
+            .copied()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(&mount).unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let mut driver = RecordingSmokeDriver::new(clients);
+        let context = ScenarioContext {
+            run_id: "run-1".to_string(),
+            seed: 324,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+
+        let err = run_mounted_smoke_with_driver(
+            &context,
+            &mut driver,
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ScenarioError::InsufficientMountedClients {
+                expected: 3,
+                actual: 2
+            }
+        ));
     }
 
     fn _test_config(root: &Path) -> ClientControllerConfig {
