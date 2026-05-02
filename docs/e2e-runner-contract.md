@@ -163,6 +163,38 @@ mount readiness, and supports graceful `studiofs umount`, forced child-process
 kill, and restart/remount. Scenarios must use this controller rather than
 sharing one local metadata DB or falling back to direct VFS calls.
 
+## Mounted Tree Convergence Validation
+
+Mounted scenarios validate client-visible invariants through the
+`studiofs-e2e::mounted_tree` validator. The validator snapshots public
+mountpoints only; it must not inspect private VFS, metadata, cache, PostgreSQL,
+or object-store state to decide whether a scenario passed.
+
+The portable equality contract is intentionally narrow:
+
+- required comparison fields: relative path, entry type, regular-file size, and
+  regular-file SHA-256 content checksum;
+- required symlink comparison field: symlink target path, when symlink entries
+  are present in a mounted tree;
+- diagnostic-only fields: mtimes and other platform-derived metadata;
+- out-of-initial-scope metadata: xattrs, hard links, and platform-specific file
+  attributes unless a later StudioFS contract explicitly makes them mandatory.
+
+Snapshot JSON must be deterministic across repeated runs and operating systems:
+entries are sorted by forward-slash relative path, and per-client snapshots are
+written as `tree-client-N.json`. When convergence times out, validation writes
+one tree snapshot per client plus `diff.json` in the scenario validation
+artifact directory. Temporary divergence during the convergence window is
+recorded by repeated polling but is not a failure until the timeout expires.
+Transient snapshot I/O failures, such as files being renamed during traversal or
+temporary Windows sharing violations, are treated the same way: retry until the
+convergence deadline, then report the last stable divergence or snapshot error.
+Snapshot paths and symlink targets must be valid UTF-8 because artifacts are
+JSON; non-UTF-8 paths fail validation instead of using lossy replacement that
+could hide collisions. The validator hashes every regular file on each
+successful poll, so mounted convergence scenarios should keep trees bounded
+until a separate checksum cache/invalidation contract exists.
+
 Retention behavior:
 
 - `always` keeps the full sandbox after cleanup.
