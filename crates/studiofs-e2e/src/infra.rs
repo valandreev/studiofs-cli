@@ -400,8 +400,7 @@ impl DockerComposeStack {
     }
 
     fn compose_command(&self) -> CommandSpec {
-        self.service_control()
-            .compose_command(self.compose_environment())
+        self.service_control().compose_command()
     }
 
     fn compose_environment(&self) -> Vec<(String, String)> {
@@ -452,6 +451,7 @@ impl DockerComposeStack {
             project_name: self.project_name.clone(),
             compose_file: self.compose_file.clone(),
             wait_timeout_secs: self.wait_timeout_secs,
+            env: self.compose_environment(),
         }
     }
 }
@@ -461,10 +461,18 @@ pub struct ComposeServiceControl {
     pub project_name: String,
     pub compose_file: PathBuf,
     pub wait_timeout_secs: u64,
+    env: Vec<(String, String)>,
 }
 
 impl ComposeServiceControl {
     pub fn for_project(project_name: String) -> Result<Self, InfraError> {
+        Self::for_project_with_environment(project_name, Vec::new())
+    }
+
+    pub fn for_project_with_environment(
+        project_name: String,
+        env: Vec<(String, String)>,
+    ) -> Result<Self, InfraError> {
         let compose_file = default_compose_file();
         if !compose_file.exists() {
             return Err(InfraError::MissingComposeFile(compose_file));
@@ -473,6 +481,7 @@ impl ComposeServiceControl {
             project_name,
             compose_file: compose_file.canonicalize()?,
             wait_timeout_secs: DEFAULT_WAIT_TIMEOUT_SECS,
+            env,
         })
     }
 
@@ -481,7 +490,7 @@ impl ComposeServiceControl {
         service: &str,
         executor: &dyn CommandExecutor,
     ) -> Result<(), InfraError> {
-        let mut command = self.compose_command(Vec::new());
+        let mut command = self.compose_command();
         command
             .args
             .extend(["stop".to_string(), service.to_string()]);
@@ -494,7 +503,7 @@ impl ComposeServiceControl {
         service: &str,
         executor: &dyn CommandExecutor,
     ) -> Result<(), InfraError> {
-        let mut command = self.compose_command(Vec::new());
+        let mut command = self.compose_command();
         command.args.extend([
             "up".to_string(),
             "--detach".to_string(),
@@ -511,7 +520,7 @@ impl ComposeServiceControl {
         Ok(())
     }
 
-    fn compose_command(&self, env: Vec<(String, String)>) -> CommandSpec {
+    fn compose_command(&self) -> CommandSpec {
         CommandSpec {
             program: "docker".to_string(),
             args: vec![
@@ -521,7 +530,7 @@ impl ComposeServiceControl {
                 "--file".to_string(),
                 self.compose_file.display().to_string(),
             ],
-            env,
+            env: self.env.clone(),
             cwd: self.compose_file.parent().map(Path::to_path_buf),
         }
     }

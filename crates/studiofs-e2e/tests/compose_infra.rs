@@ -167,9 +167,26 @@ fn compose_stack_lifecycle_collects_logs_and_tears_down_volumes() {
         call.args.contains(&"stop".to_string()) && call.args.contains(&"postgres".to_string())
     }));
     assert!(calls.iter().any(|call| {
+        call.args.contains(&"stop".to_string())
+            && call.args.contains(&"postgres".to_string())
+            && call
+                .env
+                .iter()
+                .any(|(key, value)| key == "STUDIOFS_E2E_POSTGRES_PORT" && value == "32000")
+    }));
+    assert!(calls.iter().any(|call| {
         call.args.contains(&"up".to_string())
             && call.args.contains(&"--wait".to_string())
             && call.args.contains(&"postgres".to_string())
+    }));
+    assert!(calls.iter().any(|call| {
+        call.args.contains(&"up".to_string())
+            && call.args.contains(&"--wait".to_string())
+            && call.args.contains(&"postgres".to_string())
+            && call
+                .env
+                .iter()
+                .any(|(key, value)| key == "STUDIOFS_E2E_POSTGRES_PORT" && value == "32000")
     }));
     assert!(
         calls

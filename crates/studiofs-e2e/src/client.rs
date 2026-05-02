@@ -16,7 +16,9 @@ use crate::infra::ServicePort;
 
 pub const DEFAULT_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c", "client-d"];
 #[cfg(windows)]
-const DEFAULT_WINDOWS_MOUNT_LETTERS: &[char] = &['Z', 'Y', 'X', 'W'];
+const DEFAULT_WINDOWS_MOUNT_LETTERS: &[char] = &[
+    'Z', 'Y', 'X', 'W', 'V', 'U', 'T', 'S', 'R', 'Q', 'P', 'O', 'N', 'M', 'L', 'K',
+];
 const MAX_COMMAND_OUTPUT_CHARS: usize = 4096;
 const S3_BUCKET_NAME_MAX_CHARS: usize = 63;
 const E2E_BUCKET_PREFIX: &str = "studiofs-e2e-";
@@ -254,6 +256,8 @@ pub enum ClientControllerError {
     UnknownClient(String),
     #[error("E2E client index {index} is out of range for {len} clients")]
     ClientIndexOutOfRange { index: usize, len: usize },
+    #[error("E2E client {client} mount point is already active before mount: {path}")]
+    MountPointAlreadyActive { client: String, path: PathBuf },
     #[error("Docker compose service port is missing for {0}")]
     MissingServicePort(String),
     #[error(
@@ -461,6 +465,12 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
 
     fn mount_index(&mut self, index: usize) -> Result<(), ClientControllerError> {
         let command = self.mount_command(index)?;
+        if self.executor.is_mount_ready(&command)? {
+            return Err(ClientControllerError::MountPointAlreadyActive {
+                client: command.client,
+                path: command.mount_point,
+            });
+        }
         let mut process = self.executor.spawn(&command)?;
         let process_id = process.id();
         if let Err(err) = self.wait_until_mount_ready(&command, process.as_mut()) {
@@ -939,8 +949,10 @@ fn write_mount_metadata(spec: &ClientSpec) -> Result<(), ClientControllerError> 
 #[cfg(windows)]
 fn default_client_mount_point(sandbox: &Path, client: &str, index: usize) -> PathBuf {
     DEFAULT_WINDOWS_MOUNT_LETTERS
-        .get(index)
-        .map(|letter| PathBuf::from(format!("{letter}:")))
+        .iter()
+        .copied()
+        .filter_map(windows_available_drive_root)
+        .nth(index)
         .unwrap_or_else(|| client_mount_point(sandbox, client))
 }
 
@@ -1166,6 +1178,12 @@ fn windows_drive_root(path: &Path) -> Option<PathBuf> {
         return None;
     }
     Some(PathBuf::from(format!("{}:\\", char::from(drive))))
+}
+
+#[cfg(windows)]
+fn windows_available_drive_root(letter: char) -> Option<PathBuf> {
+    let root = PathBuf::from(format!("{letter}:\\"));
+    (!root.exists()).then_some(root)
 }
 
 #[cfg(not(any(unix, windows)))]

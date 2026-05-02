@@ -25,6 +25,7 @@ use crate::mounted_tree::{
     ClientMount, ConvergenceOutcome, MountedTreeError, NamespaceInvariantViolation, TreeComparison,
     validate_namespace_invariants, wait_for_convergence,
 };
+use crate::report::RunManifest;
 
 pub const BASIC_MULTI_CLIENT_SMOKE: &str = "basic-multi-client-smoke";
 pub const POSTGRES_OUTAGE_MULTI_CLIENT_RECOVERY: &str = "postgres-outage-multi-client-recovery";
@@ -556,11 +557,21 @@ fn compose_control_from_manifest(
             path: manifest_path,
         });
     }
-    let manifest: serde_json::Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
-    let Some(project) = manifest["compose_project"].as_str() else {
+    let manifest: RunManifest = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+    let Some(project) = manifest.compose_project.as_deref() else {
         return Err(ScenarioError::MissingComposeInfrastructure);
     };
-    Ok(ComposeServiceControl::for_project(project.to_string())?)
+    let mut env = vec![("STUDIOFS_E2E_RUN_ID".to_string(), manifest.run_id)];
+    env.extend(
+        manifest
+            .allocated_ports
+            .into_iter()
+            .map(|port| (port.env_var, port.host_port.to_string())),
+    );
+    Ok(ComposeServiceControl::for_project_with_environment(
+        project.to_string(),
+        env,
+    )?)
 }
 
 fn write_bootstrap_summary(

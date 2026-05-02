@@ -306,7 +306,7 @@ fn configured_mount_points_override_client_artifact_metadata_dirs() {
 
 #[cfg(windows)]
 #[test]
-fn default_windows_mount_points_are_drive_letters_not_metadata_dirs() {
+fn default_windows_mount_points_are_drive_roots_not_metadata_dirs() {
     let temp = tempdir().unwrap();
     let mut controller =
         MultiClientController::new(test_config(temp.path()), RecordingExecutor::new());
@@ -314,9 +314,43 @@ fn default_windows_mount_points_are_drive_letters_not_metadata_dirs() {
     controller.create_clients(["client-a", "client-b"]).unwrap();
 
     let clients = controller.clients();
-    assert_eq!(clients[0].mount_point, Path::new("Z:"));
-    assert_eq!(clients[1].mount_point, Path::new("Y:"));
-    assert_ne!(clients[0].mount_point, clients[0].mount_metadata_dir);
+    assert_eq!(clients.len(), 2);
+    assert!(clients.iter().all(|client| client.mount_point.has_root()));
+    assert!(clients.iter().all(|client| {
+        client
+            .mount_point
+            .as_os_str()
+            .to_string_lossy()
+            .ends_with(":\\")
+    }));
+    assert_ne!(clients[0].mount_point, clients[1].mount_point);
+    assert!(clients[0].mount_point.join("smoke.txt").has_root());
+    assert!(
+        clients
+            .iter()
+            .all(|client| client.mount_point != client.mount_metadata_dir)
+    );
+}
+
+#[test]
+fn mount_rejects_already_active_mount_point_before_spawning() {
+    let temp = tempdir().unwrap();
+    let executor = RecordingExecutor {
+        mount_ready_before_spawn: true,
+        ..RecordingExecutor::new()
+    };
+    let calls = Rc::clone(&executor.calls);
+    let mut controller = MultiClientController::new(test_config(temp.path()), executor);
+    controller.create_clients(["client-a"]).unwrap();
+    controller.init_first_client().unwrap();
+
+    let err = controller.mount_all().unwrap_err();
+
+    assert!(matches!(
+        err,
+        ClientControllerError::MountPointAlreadyActive { client, .. } if client == "client-a"
+    ));
+    assert!(!calls.borrow().iter().any(|call| call.action == "mount"));
 }
 
 #[test]
@@ -511,8 +545,10 @@ struct RecordingExecutor {
     stale_remount_cleanups: Rc<Cell<usize>>,
     readiness_calls: Rc<Cell<usize>>,
     process_wait_calls: Rc<Cell<usize>>,
+    spawned_mount_point: Rc<RefCell<Option<std::path::PathBuf>>>,
     next_pid: Cell<u32>,
     mount_ready: Cell<bool>,
+    mount_ready_before_spawn: bool,
     process_exit_status: Cell<i32>,
     run_status: Cell<i32>,
     run_stdout: String,
@@ -530,8 +566,10 @@ impl RecordingExecutor {
             stale_remount_cleanups: Rc::new(Cell::new(0)),
             readiness_calls: Rc::new(Cell::new(0)),
             process_wait_calls: Rc::new(Cell::new(0)),
+            spawned_mount_point: Rc::new(RefCell::new(None)),
             next_pid: Cell::new(100),
             mount_ready: Cell::new(true),
+            mount_ready_before_spawn: false,
             process_exit_status: Cell::new(0),
             run_status: Cell::new(0),
             run_stdout: String::new(),
@@ -574,6 +612,9 @@ impl ClientProcessExecutor for RecordingExecutor {
 
     fn spawn(&self, command: &ClientCommand) -> io::Result<Box<dyn ClientProcess>> {
         self.calls.borrow_mut().push(command.clone());
+        self.spawned_mount_point
+            .borrow_mut()
+            .replace(command.mount_point.clone());
         let pid = self.next_pid.get();
         self.next_pid.set(pid + 1);
         Ok(Box::new(RecordingProcess {
@@ -586,9 +627,15 @@ impl ClientProcessExecutor for RecordingExecutor {
         }))
     }
 
-    fn is_mount_ready(&self, _command: &ClientCommand) -> io::Result<bool> {
+    fn is_mount_ready(&self, command: &ClientCommand) -> io::Result<bool> {
         self.readiness_calls.set(self.readiness_calls.get() + 1);
-        Ok(self.mount_ready.get())
+        Ok(self.mount_ready.get()
+            && (self.mount_ready_before_spawn
+                || self
+                    .spawned_mount_point
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|mount_point| mount_point == &command.mount_point)))
     }
 
     fn cleanup_stale_mount_before_remount(&self, _command: &ClientCommand) -> io::Result<()> {
