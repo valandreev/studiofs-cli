@@ -102,7 +102,7 @@ tasks:
           path: target/e2e-runs
 
   - key: e2e-smoke
-    use: [e2e-preflight, build-studiofs, linux-e2e-packages]
+    use: [linux-e2e-packages, e2e-preflight, build-studiofs]
     docker: true
     run: |
       set -euo pipefail
