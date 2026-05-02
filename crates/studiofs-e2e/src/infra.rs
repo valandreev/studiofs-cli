@@ -270,6 +270,22 @@ impl DockerComposeStack {
         Ok(())
     }
 
+    pub fn stop_service(
+        &self,
+        service: &str,
+        executor: &dyn CommandExecutor,
+    ) -> Result<(), InfraError> {
+        self.service_control().stop_service(service, executor)
+    }
+
+    pub fn start_service(
+        &self,
+        service: &str,
+        executor: &dyn CommandExecutor,
+    ) -> Result<(), InfraError> {
+        self.service_control().start_service(service, executor)
+    }
+
     pub fn collect_logs(&self, executor: &dyn CommandExecutor) -> Result<PathBuf, InfraError> {
         fs::create_dir_all(self.docker_artifact_dir())?;
         let mut command = self.compose_command();
@@ -379,18 +395,8 @@ impl DockerComposeStack {
     }
 
     fn compose_command(&self) -> CommandSpec {
-        CommandSpec {
-            program: "docker".to_string(),
-            args: vec![
-                "compose".to_string(),
-                "--project-name".to_string(),
-                self.project_name.clone(),
-                "--file".to_string(),
-                self.compose_file.display().to_string(),
-            ],
-            env: self.compose_environment(),
-            cwd: self.compose_file.parent().map(Path::to_path_buf),
-        }
+        self.service_control()
+            .compose_command(self.compose_environment())
     }
 
     fn compose_environment(&self) -> Vec<(String, String)> {
@@ -452,6 +458,102 @@ impl DockerComposeStack {
 
     fn artifact_compose_file(&self) -> PathBuf {
         self.docker_artifact_dir().join("compose.e2e.yml")
+    }
+
+    fn service_control(&self) -> ComposeServiceControl {
+        ComposeServiceControl {
+            project_name: self.project_name.clone(),
+            compose_file: self.compose_file.clone(),
+            wait_timeout_secs: self.wait_timeout_secs,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComposeServiceControl {
+    pub project_name: String,
+    pub compose_file: PathBuf,
+    pub wait_timeout_secs: u64,
+}
+
+impl ComposeServiceControl {
+    pub fn for_project(project_name: String) -> Result<Self, InfraError> {
+        let compose_file = default_compose_file();
+        if !compose_file.exists() {
+            return Err(InfraError::MissingComposeFile(compose_file));
+        }
+        Ok(Self {
+            project_name,
+            compose_file: compose_file.canonicalize()?,
+            wait_timeout_secs: DEFAULT_WAIT_TIMEOUT_SECS,
+        })
+    }
+
+    pub fn stop_service(
+        &self,
+        service: &str,
+        executor: &dyn CommandExecutor,
+    ) -> Result<(), InfraError> {
+        let mut command = self.compose_command(Vec::new());
+        command
+            .args
+            .extend(["stop".to_string(), service.to_string()]);
+        run_success(executor, &format!("docker compose stop {service}"), command)?;
+        Ok(())
+    }
+
+    pub fn start_service(
+        &self,
+        service: &str,
+        executor: &dyn CommandExecutor,
+    ) -> Result<(), InfraError> {
+        let mut command = self.compose_command(Vec::new());
+        command.args.extend([
+            "up".to_string(),
+            "--detach".to_string(),
+            "--wait".to_string(),
+            "--wait-timeout".to_string(),
+            self.wait_timeout_secs.to_string(),
+            service.to_string(),
+        ]);
+        run_success(
+            executor,
+            &format!("docker compose up --wait {service}"),
+            command,
+        )?;
+        Ok(())
+    }
+
+    fn compose_command(&self, env: Vec<(String, String)>) -> CommandSpec {
+        CommandSpec {
+            program: "docker".to_string(),
+            args: vec![
+                "compose".to_string(),
+                "--project-name".to_string(),
+                self.project_name.clone(),
+                "--file".to_string(),
+                self.compose_file.display().to_string(),
+            ],
+            env,
+            cwd: self.compose_file.parent().map(Path::to_path_buf),
+        }
+    }
+}
+
+fn run_success(
+    executor: &dyn CommandExecutor,
+    action: &str,
+    command: CommandSpec,
+) -> Result<CommandOutput, InfraError> {
+    let output = executor.run(&command)?;
+    if output.status == 0 {
+        Ok(output)
+    } else {
+        Err(InfraError::CommandFailed {
+            action: action.to_string(),
+            status: output.status,
+            stderr: output.stderr,
+        })
     }
 }
 

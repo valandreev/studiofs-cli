@@ -1,8 +1,9 @@
 //! Scenario registry and lifecycle hooks for mounted E2E runs.
 
 use std::fs;
+use std::io::Write as _;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -12,16 +13,22 @@ use crate::client::{
     ClientControllerConfig, ClientControllerError, ClientSpec, MultiClientController,
     SystemClientProcessExecutor, VolumeBootstrapOptions, VolumeBootstrapSummary,
 };
+use crate::infra::{CommandExecutor, ComposeServiceControl, InfraError, SystemCommandExecutor};
 use crate::mounted_tree::{
     ClientMount, ConvergenceOutcome, MountedTreeError, TreeComparison, wait_for_convergence,
 };
 
 pub const BASIC_MULTI_CLIENT_SMOKE: &str = "basic-multi-client-smoke";
+pub const POSTGRES_OUTAGE_MULTI_CLIENT_RECOVERY: &str = "postgres-outage-multi-client-recovery";
 const SMOKE_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
+const OUTAGE_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
 const SMOKE_FILE_NAME: &str = "studiofs-e2e-smoke.txt";
 const SMOKE_FILE_PAYLOAD: &[u8] = b"studiofs e2e mounted multi-client smoke\n";
 const SMOKE_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(30);
 const SMOKE_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const OUTAGE_INITIAL_FILE_NAME: &str = "studiofs-e2e-outage-initial.txt";
+const OUTAGE_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(60);
+const OUTAGE_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 #[cfg(test)]
 pub(crate) const TEST_FAILING_VALIDATE: &str = "__test-failing-validate";
@@ -56,10 +63,18 @@ pub enum ScenarioError {
     Client(#[from] ClientControllerError),
     #[error("mounted smoke scenario failed: {primary}; unmount also failed: {cleanup}")]
     MountedSmokeUnmountAfterFailure { primary: String, cleanup: String },
+    #[error("PostgreSQL outage scenario failed: {primary}; unmount also failed: {cleanup}")]
+    PostgresOutageUnmountAfterFailure { primary: String, cleanup: String },
     #[error("mounted tree validation failed: {0}")]
     MountedTree(#[from] MountedTreeError),
+    #[error("scenario infrastructure failed: {0}")]
+    Infra(#[from] InfraError),
+    #[error("PostgreSQL outage scenario requires compose infrastructure")]
+    MissingComposeInfrastructure,
     #[error("mounted smoke scenario requires at least {expected} clients, got {actual}")]
     InsufficientMountedClients { expected: usize, actual: usize },
+    #[error("PostgreSQL outage scenario requires at least {expected} clients, got {actual}")]
+    InsufficientOutageClients { expected: usize, actual: usize },
 }
 
 pub trait Scenario {
@@ -71,12 +86,18 @@ pub trait Scenario {
 }
 
 pub fn available_scenarios() -> Vec<ScenarioDefinition> {
-    vec![BasicMultiClientSmoke.definition()]
+    vec![
+        BasicMultiClientSmoke.definition(),
+        PostgresOutageMultiClientRecovery.definition(),
+    ]
 }
 
 pub(crate) fn resolve_scenario(name: &str) -> Option<Box<dyn Scenario>> {
     match name {
         BASIC_MULTI_CLIENT_SMOKE | "smoke" => Some(Box::new(BasicMultiClientSmoke)),
+        POSTGRES_OUTAGE_MULTI_CLIENT_RECOVERY | "postgres-outage" => {
+            Some(Box::new(PostgresOutageMultiClientRecovery))
+        }
         #[cfg(test)]
         TEST_FAILING_VALIDATE => Some(Box::new(TestFailingScenario {
             cleanup_fails: false,
@@ -196,6 +217,95 @@ impl Scenario for BasicMultiClientSmoke {
     fn cleanup(&self, _context: &ScenarioContext) -> Result<(), ScenarioError> {
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PostgresOutageMultiClientRecovery;
+
+impl Scenario for PostgresOutageMultiClientRecovery {
+    fn definition(&self) -> ScenarioDefinition {
+        ScenarioDefinition {
+            name: POSTGRES_OUTAGE_MULTI_CLIENT_RECOVERY,
+            description: "mounted multi-client PostgreSQL outage recovery scenario",
+            requires_studiofs_bin: true,
+        }
+    }
+
+    fn setup(&self, context: &ScenarioContext) -> Result<(), ScenarioError> {
+        fs::create_dir_all(&context.scenario_dir)?;
+        Ok(())
+    }
+
+    fn run(&self, context: &ScenarioContext) -> Result<(), ScenarioError> {
+        let Some(config) = &context.client_controller_config else {
+            return Err(ScenarioError::MissingComposeInfrastructure);
+        };
+        let compose_control = compose_control_from_manifest(context)?;
+        let mut driver = RealPostgresOutageDriver {
+            controller: MultiClientController::new(config.clone(), SystemClientProcessExecutor),
+            compose_control,
+            executor: SystemCommandExecutor,
+        };
+        run_postgres_outage_with_driver(
+            context,
+            &mut driver,
+            OUTAGE_CONVERGENCE_TIMEOUT,
+            OUTAGE_CONVERGENCE_POLL_INTERVAL,
+        )?;
+        Ok(())
+    }
+
+    fn validate(&self, context: &ScenarioContext) -> Result<Vec<String>, ScenarioError> {
+        let summary_path = context
+            .scenario_dir
+            .join("postgres-outage-recovery-summary.json");
+        if !summary_path.exists() {
+            return Err(ScenarioError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("missing summary artifact: {}", summary_path.display()),
+            )));
+        }
+        let summary: PostgresOutageRecoverySummary =
+            serde_json::from_slice(&fs::read(&summary_path)?)?;
+        let validation = json!({
+            "scenario": POSTGRES_OUTAGE_MULTI_CLIENT_RECOVERY,
+            "run_id": context.run_id,
+            "seed": context.seed,
+            "status": if summary.final_validator.converged { "passed" } else { "failed" },
+            "outage_duration_ms": summary.outage_duration_ms,
+            "recovery_time_ms": summary.recovery_time_ms,
+            "operations_accepted_during_outage": summary.operations_accepted_during_outage,
+            "final_validator": summary.final_validator,
+        });
+        fs::write(
+            context.scenario_dir.join("validation.json"),
+            serde_json::to_vec_pretty(&validation)?,
+        )?;
+        Ok(vec![
+            format!(
+                "artifacts/scenarios/{POSTGRES_OUTAGE_MULTI_CLIENT_RECOVERY}/outage-operations.ndjson"
+            ),
+            format!(
+                "artifacts/scenarios/{POSTGRES_OUTAGE_MULTI_CLIENT_RECOVERY}/postgres-outage-recovery-summary.json"
+            ),
+            format!("artifacts/scenarios/{POSTGRES_OUTAGE_MULTI_CLIENT_RECOVERY}/validation.json"),
+        ])
+    }
+
+    fn cleanup(&self, _context: &ScenarioContext) -> Result<(), ScenarioError> {
+        Ok(())
+    }
+}
+
+fn compose_control_from_manifest(
+    context: &ScenarioContext,
+) -> Result<ComposeServiceControl, ScenarioError> {
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(context.sandbox.join("run.json"))?)?;
+    let Some(project) = manifest["compose_project"].as_str() else {
+        return Err(ScenarioError::MissingComposeInfrastructure);
+    };
+    Ok(ComposeServiceControl::for_project(project.to_string())?)
 }
 
 fn write_bootstrap_summary(
@@ -341,6 +451,194 @@ fn write_smoke_summary(
     Ok(())
 }
 
+trait PostgresOutageDriver {
+    fn bootstrap_volume(
+        &mut self,
+        options: VolumeBootstrapOptions,
+    ) -> Result<VolumeBootstrapSummary, ScenarioError>;
+    fn mount_all(&mut self) -> Result<(), ScenarioError>;
+    fn clients(&self) -> Vec<ClientSpec>;
+    fn stop_postgres(&mut self) -> Result<(), ScenarioError>;
+    fn start_postgres(&mut self) -> Result<(), ScenarioError>;
+    fn unmount_all(&mut self) -> Result<(), ScenarioError>;
+}
+
+struct RealPostgresOutageDriver<E> {
+    controller: MultiClientController<SystemClientProcessExecutor>,
+    compose_control: ComposeServiceControl,
+    executor: E,
+}
+
+impl<E: CommandExecutor> PostgresOutageDriver for RealPostgresOutageDriver<E> {
+    fn bootstrap_volume(
+        &mut self,
+        options: VolumeBootstrapOptions,
+    ) -> Result<VolumeBootstrapSummary, ScenarioError> {
+        Ok(self.controller.bootstrap_volume(options)?)
+    }
+
+    fn mount_all(&mut self) -> Result<(), ScenarioError> {
+        Ok(self.controller.mount_all()?)
+    }
+
+    fn clients(&self) -> Vec<ClientSpec> {
+        self.controller.clients().into_iter().cloned().collect()
+    }
+
+    fn stop_postgres(&mut self) -> Result<(), ScenarioError> {
+        Ok(self
+            .compose_control
+            .stop_service("postgres", &self.executor)?)
+    }
+
+    fn start_postgres(&mut self) -> Result<(), ScenarioError> {
+        Ok(self
+            .compose_control
+            .start_service("postgres", &self.executor)?)
+    }
+
+    fn unmount_all(&mut self) -> Result<(), ScenarioError> {
+        Ok(self.controller.unmount_all()?)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct OutageOperationRecord {
+    client: String,
+    path: String,
+    bytes: usize,
+    accepted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PostgresOutageRecoverySummary {
+    bootstrap: VolumeBootstrapSummary,
+    outage_duration_ms: u128,
+    operations_accepted_during_outage: usize,
+    recovery_time_ms: u128,
+    final_validator: TreeComparison,
+}
+
+fn run_postgres_outage_with_driver(
+    context: &ScenarioContext,
+    driver: &mut dyn PostgresOutageDriver,
+    convergence_timeout: Duration,
+    poll_interval: Duration,
+) -> Result<PostgresOutageRecoverySummary, ScenarioError> {
+    let result = run_postgres_outage_body(context, driver, convergence_timeout, poll_interval);
+    let unmount_result = driver.unmount_all();
+    match (result, unmount_result) {
+        (Ok(summary), Ok(())) => Ok(summary),
+        (Err(primary), Err(cleanup)) => Err(ScenarioError::PostgresOutageUnmountAfterFailure {
+            primary: primary.to_string(),
+            cleanup: cleanup.to_string(),
+        }),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+fn run_postgres_outage_body(
+    context: &ScenarioContext,
+    driver: &mut dyn PostgresOutageDriver,
+    convergence_timeout: Duration,
+    poll_interval: Duration,
+) -> Result<PostgresOutageRecoverySummary, ScenarioError> {
+    let bootstrap = driver.bootstrap_volume(VolumeBootstrapOptions {
+        client_names: OUTAGE_CLIENT_NAMES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect(),
+        clean_existing_local_metadata: true,
+    })?;
+    write_bootstrap_summary(context, &bootstrap)?;
+
+    driver.mount_all()?;
+    let clients = driver.clients();
+    if clients.len() < OUTAGE_CLIENT_NAMES.len() {
+        return Err(ScenarioError::InsufficientOutageClients {
+            expected: OUTAGE_CLIENT_NAMES.len(),
+            actual: clients.len(),
+        });
+    }
+
+    fs::write(
+        clients[0].mount_point.join(OUTAGE_INITIAL_FILE_NAME),
+        b"initial healthy PostgreSQL write\n",
+    )?;
+
+    let outage_started = Instant::now();
+    driver.stop_postgres()?;
+    let accepted_operations = perform_outage_operations(context, &clients[1..3])?;
+    let outage_duration_ms = outage_started.elapsed().as_millis();
+
+    let recovery_started = Instant::now();
+    driver.start_postgres()?;
+    let mounts = clients
+        .iter()
+        .take(OUTAGE_CLIENT_NAMES.len())
+        .map(|client| ClientMount::new(client.name.clone(), client.mount_point.clone()))
+        .collect::<Vec<_>>();
+    let convergence = wait_for_convergence(
+        &mounts,
+        context.scenario_dir.join("validation"),
+        convergence_timeout,
+        poll_interval,
+    )?;
+    let recovery_time_ms = recovery_started.elapsed().as_millis();
+
+    let summary = PostgresOutageRecoverySummary {
+        bootstrap,
+        outage_duration_ms,
+        operations_accepted_during_outage: accepted_operations,
+        recovery_time_ms,
+        final_validator: convergence.comparison,
+    };
+    fs::write(
+        context
+            .scenario_dir
+            .join("postgres-outage-recovery-summary.json"),
+        serde_json::to_vec_pretty(&summary)?,
+    )?;
+    Ok(summary)
+}
+
+fn perform_outage_operations(
+    context: &ScenarioContext,
+    clients: &[ClientSpec],
+) -> Result<usize, ScenarioError> {
+    fs::create_dir_all(&context.scenario_dir)?;
+    let mut log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(context.scenario_dir.join("outage-operations.ndjson"))?;
+    let mut operations_log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(context.scenario_dir.join("operations.ndjson"))?;
+    let mut accepted = 0;
+    for (index, client) in clients.iter().enumerate() {
+        let relative = format!("outage-local-write-{}.txt", index + 1);
+        let payload = format!(
+            "accepted local-first outage write from {} in {}\n",
+            client.name, context.run_id
+        );
+        fs::write(client.mount_point.join(&relative), payload.as_bytes())?;
+        accepted += 1;
+        let record = OutageOperationRecord {
+            client: client.name.clone(),
+            path: relative,
+            bytes: payload.len(),
+            accepted: true,
+        };
+        serde_json::to_writer(&mut log, &record)?;
+        log.write_all(b"\n")?;
+        serde_json::to_writer(&mut operations_log, &record)?;
+        operations_log.write_all(b"\n")?;
+    }
+    Ok(accepted)
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 struct TestFailingScenario {
@@ -419,7 +717,7 @@ impl Scenario for TestPassingScenario {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::path::{Path, PathBuf};
     use std::thread;
     use std::time::Duration;
@@ -581,6 +879,92 @@ mod tests {
         }
     }
 
+    struct RecordingOutageDriver {
+        clients: Vec<ClientSpec>,
+        actions: RefCell<Vec<&'static str>>,
+    }
+
+    impl RecordingOutageDriver {
+        fn new(clients: Vec<ClientSpec>) -> Self {
+            Self {
+                clients,
+                actions: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl PostgresOutageDriver for RecordingOutageDriver {
+        fn bootstrap_volume(
+            &mut self,
+            options: VolumeBootstrapOptions,
+        ) -> Result<VolumeBootstrapSummary, ScenarioError> {
+            self.actions.borrow_mut().push("bootstrap");
+            assert_eq!(
+                options.client_names,
+                OUTAGE_CLIENT_NAMES
+                    .iter()
+                    .copied()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            );
+            Ok(VolumeBootstrapSummary {
+                volume_name: "projectfs".to_string(),
+                init_client: OUTAGE_CLIENT_NAMES[0].to_string(),
+                discovered_clients: OUTAGE_CLIENT_NAMES[1..]
+                    .iter()
+                    .map(|name| (*name).to_string())
+                    .collect(),
+                clients: self
+                    .clients
+                    .iter()
+                    .map(|client| crate::client::ClientBootstrapRecord {
+                        name: client.name.clone(),
+                        local_metadata_db: client.local_metadata_db.clone(),
+                        state: ClientLifecycleState::Discovered,
+                    })
+                    .collect(),
+            })
+        }
+
+        fn mount_all(&mut self) -> Result<(), ScenarioError> {
+            self.actions.borrow_mut().push("mount_all");
+            Ok(())
+        }
+
+        fn clients(&self) -> Vec<ClientSpec> {
+            self.clients.clone()
+        }
+
+        fn stop_postgres(&mut self) -> Result<(), ScenarioError> {
+            self.actions.borrow_mut().push("stop_postgres");
+            Ok(())
+        }
+
+        fn start_postgres(&mut self) -> Result<(), ScenarioError> {
+            self.actions.borrow_mut().push("start_postgres");
+            let mut entries = Vec::new();
+            for client in &self.clients {
+                for entry in std::fs::read_dir(&client.mount_point).unwrap() {
+                    let entry = entry.unwrap();
+                    if entry.file_type().unwrap().is_file() {
+                        entries.push((entry.file_name(), std::fs::read(entry.path()).unwrap()));
+                    }
+                }
+            }
+            for client in &self.clients {
+                for (name, payload) in &entries {
+                    std::fs::write(client.mount_point.join(name), payload).unwrap();
+                }
+            }
+            Ok(())
+        }
+
+        fn unmount_all(&mut self) -> Result<(), ScenarioError> {
+            self.actions.borrow_mut().push("unmount_all");
+            Ok(())
+        }
+    }
+
     #[test]
     fn mounted_smoke_reports_unmount_error_when_body_also_fails() {
         let temp = tempdir().unwrap();
@@ -656,6 +1040,90 @@ mod tests {
                 actual: 2
             }
         ));
+    }
+
+    #[test]
+    fn registry_exposes_postgres_outage_recovery_scenario() {
+        let scenarios = available_scenarios();
+
+        assert!(scenarios.iter().any(|scenario| {
+            scenario.name == POSTGRES_OUTAGE_MULTI_CLIENT_RECOVERY
+                && scenario.requires_studiofs_bin
+                && scenario.description.contains("PostgreSQL outage")
+        }));
+        assert!(resolve_scenario(POSTGRES_OUTAGE_MULTI_CLIENT_RECOVERY).is_some());
+        assert!(resolve_scenario("postgres-outage").is_some());
+    }
+
+    #[test]
+    fn postgres_outage_records_local_operations_and_recovery_metrics() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(POSTGRES_OUTAGE_MULTI_CLIENT_RECOVERY);
+        let clients = OUTAGE_CLIENT_NAMES
+            .iter()
+            .copied()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(&mount).unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let mut driver = RecordingOutageDriver::new(clients);
+        let context = ScenarioContext {
+            run_id: "run-1".to_string(),
+            seed: 325,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+
+        let summary = run_postgres_outage_with_driver(
+            &context,
+            &mut driver,
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+
+        assert_eq!(summary.bootstrap.init_client, "client-a");
+        assert_eq!(summary.operations_accepted_during_outage, 2);
+        assert!(summary.outage_duration_ms > 0);
+        assert!(summary.recovery_time_ms > 0);
+        assert!(summary.final_validator.converged);
+        assert_eq!(
+            driver.actions.borrow().as_slice(),
+            [
+                "bootstrap",
+                "mount_all",
+                "stop_postgres",
+                "start_postgres",
+                "unmount_all"
+            ]
+        );
+
+        let summary_json: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                context
+                    .scenario_dir
+                    .join("postgres-outage-recovery-summary.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(summary_json["operations_accepted_during_outage"], 2);
+        assert!(
+            context
+                .scenario_dir
+                .join("outage-operations.ndjson")
+                .exists()
+        );
+        let operations_log =
+            std::fs::read_to_string(context.scenario_dir.join("operations.ndjson")).unwrap();
+        assert!(operations_log.contains("\"accepted\":true"));
     }
 
     fn _test_config(root: &Path) -> ClientControllerConfig {

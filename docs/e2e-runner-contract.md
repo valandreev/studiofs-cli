@@ -31,6 +31,7 @@ Initial operator commands:
 ```text
 cargo run -p studiofs-e2e -- list
 cargo run -p studiofs-e2e -- run basic-multi-client-smoke
+cargo run -p studiofs-e2e -- run postgres-outage-multi-client-recovery --studiofs-bin <path-to-studiofs>
 cargo run -p studiofs-e2e -- clean
 ```
 
@@ -53,7 +54,7 @@ Required initial run flags and environment:
 | Flag | Contract |
 |---|---|
 | `basic-multi-client-smoke` | Positional shorthand for the mounted three-client happy-path smoke scenario. |
-| `--scenario <name>` | Repeatable. Initial accepted values are `basic-multi-client-smoke` and the `smoke` alias; later gates add convergence, outage, and collision names. |
+| `--scenario <name>` | Repeatable. Accepted values include `basic-multi-client-smoke` (`smoke`) and `postgres-outage-multi-client-recovery` (`postgres-outage`). Later gates add collision names. |
 | `--studiofs-bin <path>` | Path to the product CLI under test. Real mounted scenarios require it when `--infra compose` is used. The runner may build it only when an explicit build flag is added. |
 | `--root <path>` | Parent run directory. Defaults to `target/e2e-runs`. |
 | `--run-id <id>` | Optional stable run ID. If omitted, use an ISO-like UTC timestamp plus short random suffix. Explicit IDs must be safe single directory names: no separators, drive prefixes, traversal segments, leading dots, or other shell/path metacharacters. |
@@ -196,6 +197,18 @@ same file from all three mount points, writes `bootstrap-summary.json`,
 `smoke-summary.json`, and `validation.json`, and then unmounts the clients.
 The `--infra disabled` path remains limited to runner self-tests and writes only
 the skeleton validation artifact.
+
+`postgres-outage-multi-client-recovery` uses the same three-client mounted
+bootstrap, writes an initial file while PostgreSQL is healthy, stops only the
+PostgreSQL compose service, performs accepted local-first writes from multiple
+mounted clients, starts PostgreSQL again with compose health waiting, and then
+uses the mounted tree validator for final convergence. Temporary peer
+invisibility while PostgreSQL is stopped is not a failure; only local write
+failures and post-recovery convergence failure fail the scenario. The scenario
+writes accepted outage operations to `operations.ndjson` and
+`outage-operations.ndjson`, and writes
+`postgres-outage-recovery-summary.json` with outage duration,
+accepted-operation count, recovery time, and the final validator result.
 
 ## Mounted Tree Convergence Validation
 
@@ -455,9 +468,8 @@ Scenario growth is deliberately staged:
 2. Basic convergence next: two clients with separate explicit client roots,
    PostgreSQL and S3-compatible services, publish/apply visibility, and stable
    report fields.
-3. Outage scenarios only after smoke and convergence are stable: stop/restart
-   PostgreSQL or S3-compatible services and validate local-first behavior,
-   replay, and failure reporting.
+3. PostgreSQL outage recovery: stop/restart PostgreSQL and validate
+   local-first writes, replay, convergence, and failure reporting.
 4. Collision scenarios only after outage reporting is stable: concurrent
    writes, renames, deletes, locks, and conflict cases.
 
