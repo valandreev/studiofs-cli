@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::client::DEFAULT_CLIENT_NAMES;
 use crate::infra::{
     CommandExecutor, ComposeConfig, DockerComposeStack, InfraCheck, InfraError, InfraMode,
     SystemCommandExecutor,
@@ -24,7 +25,6 @@ use crate::scenario::{self, ScenarioContext};
 const SCHEMA_VERSION: u32 = 1;
 const RUNNER_CRATE: &str = "studiofs-e2e";
 const RUNNER_MARKER_FILE: &str = ".studiofs-e2e-runner.json";
-const INITIAL_CLIENTS: &[&str] = &["client-a", "client-b"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -626,7 +626,7 @@ fn create_sandbox_layout(
     fs::create_dir_all(sandbox)?;
     fs::create_dir_all(sandbox.join("artifacts/docker"))?;
     fs::create_dir_all(sandbox.join("artifacts/commands"))?;
-    for client in INITIAL_CLIENTS {
+    for client in DEFAULT_CLIENT_NAMES {
         fs::create_dir_all(
             sandbox
                 .join("artifacts/clients")
@@ -662,7 +662,7 @@ struct ManifestInput<'a> {
 }
 
 fn build_manifest(input: ManifestInput<'_>) -> RunManifest {
-    let explicit_client_roots: Vec<_> = INITIAL_CLIENTS
+    let explicit_client_roots: Vec<_> = DEFAULT_CLIENT_NAMES
         .iter()
         .map(|client| {
             input

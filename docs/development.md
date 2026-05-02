@@ -156,6 +156,14 @@ Use a different `STUDIOFS_CLIENT_ROOT` for each local client on the same host so
 their `redb` metadata databases, mount records, logs, and default cache roots do
 not overlap.
 
+The `studiofs-e2e` crate provides a reusable multi-client process controller
+for mounted scenarios. It prepares `client-a` through `client-d` style layouts
+under `target/e2e-runs/<run-id>/artifacts/clients/`, runs `init` for the first
+client, runs `discover` for peers, mounts each client with a separate
+`STUDIOFS_CLIENT_ROOT` and `--cache-dir`, captures per-client stdout/stderr and
+tracing logs, and owns graceful unmount, forced kill, and restart/remount
+lifecycle transitions.
+
 ## Related Docs
 
 - [Contributing](contributing.md) — contribution rules
