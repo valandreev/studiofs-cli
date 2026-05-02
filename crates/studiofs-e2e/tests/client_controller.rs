@@ -44,6 +44,7 @@ fn controller_bootstraps_mounts_restarts_and_kills_isolated_clients() {
     assert!(clients[0].stdout_log.ends_with("studiofs.stdout.log"));
     assert!(clients[0].stderr_log.ends_with("studiofs.stderr.log"));
     assert!(clients[0].tracing_log.ends_with("studiofs-tracing.log"));
+    assert!(clients[0].mount_metadata_dir.ends_with("mount"));
     assert!(
         clients
             .iter()
@@ -82,6 +83,64 @@ fn controller_bootstraps_mounts_restarts_and_kills_isolated_clients() {
 }
 
 #[test]
+fn create_clients_rejects_path_traversal_client_names() {
+    let temp = tempdir().unwrap();
+    let executor = RecordingExecutor::new();
+    let mut controller = MultiClientController::new(test_config(temp.path()), executor);
+
+    for name in [
+        "../escape",
+        "nested/client",
+        r"nested\client",
+        ".hidden",
+        "",
+    ] {
+        let err = controller.create_clients([name]).unwrap_err();
+        assert!(matches!(err, ClientControllerError::UnsafeClientName(_)));
+    }
+
+    assert!(!temp.path().join("escape").exists());
+}
+
+#[test]
+fn configured_mount_points_override_client_artifact_metadata_dirs() {
+    let temp = tempdir().unwrap();
+    let mut config = test_config(temp.path());
+    let mount_a = temp.path().join("mount-a");
+    let mount_b = temp.path().join("mount-b");
+    config.mount_points = vec![mount_a.clone(), mount_b];
+    let executor = RecordingExecutor::new();
+    let mut controller = MultiClientController::new(config, executor);
+
+    controller.create_clients(["client-a", "client-b"]).unwrap();
+
+    let clients = controller.clients();
+    assert_eq!(clients[0].mount_point, mount_a);
+    assert_ne!(clients[0].mount_point, clients[0].mount_metadata_dir);
+    assert!(clients[0].mount_metadata_dir.exists());
+    let mount_metadata: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(clients[0].mount_metadata_dir.join("mount-point.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(mount_metadata["mount_point"], mount_a.display().to_string());
+}
+
+#[cfg(windows)]
+#[test]
+fn default_windows_mount_points_are_drive_letters_not_metadata_dirs() {
+    let temp = tempdir().unwrap();
+    let mut controller =
+        MultiClientController::new(test_config(temp.path()), RecordingExecutor::new());
+
+    controller.create_clients(["client-a", "client-b"]).unwrap();
+
+    let clients = controller.clients();
+    assert_eq!(clients[0].mount_point, Path::new("Z:"));
+    assert_eq!(clients[1].mount_point, Path::new("Y:"));
+    assert_ne!(clients[0].mount_point, clients[0].mount_metadata_dir);
+}
+
+#[test]
 fn system_readiness_does_not_accept_precreated_mount_directory() {
     let temp = tempdir().unwrap();
     let executor = studiofs_e2e::client::SystemClientProcessExecutor;
@@ -89,6 +148,21 @@ fn system_readiness_does_not_accept_precreated_mount_directory() {
     std::fs::create_dir_all(&command.mount_point).unwrap();
 
     assert!(!executor.is_mount_ready(&command).unwrap());
+}
+
+#[test]
+fn client_index_out_of_range_is_distinct_from_no_clients() {
+    let temp = tempdir().unwrap();
+    let mut controller =
+        MultiClientController::new(test_config(temp.path()), RecordingExecutor::new());
+    controller.create_clients(["client-a"]).unwrap();
+
+    let err = controller.client_at(9).unwrap_err();
+
+    assert!(matches!(
+        err,
+        ClientControllerError::ClientIndexOutOfRange { index: 9, len: 1 }
+    ));
 }
 
 #[test]
@@ -169,6 +243,24 @@ fn command_failure_includes_stdout_and_stderr() {
 
     assert!(message.contains("stdout diagnostics"));
     assert!(message.contains("stderr diagnostics"));
+}
+
+#[test]
+fn command_failure_truncates_large_stdout_and_stderr() {
+    let temp = tempdir().unwrap();
+    let executor = RecordingExecutor {
+        run_status: Cell::new(17),
+        run_stdout: "o".repeat(10_000),
+        run_stderr: "e".repeat(10_000),
+        ..RecordingExecutor::new()
+    };
+    let mut controller = MultiClientController::new(test_config(temp.path()), executor);
+    controller.create_clients(["client-a"]).unwrap();
+
+    let message = controller.init_first_client().unwrap_err().to_string();
+
+    assert!(message.len() < 9_000);
+    assert!(message.contains("truncated"));
 }
 
 #[derive(Clone)]
@@ -271,6 +363,9 @@ fn test_config(root: &Path) -> ClientControllerConfig {
             region: "us-east-1".to_string(),
         },
         mount_ready_timeout: Duration::from_millis(1),
+        mount_exit_timeout: Duration::from_secs(15),
+        poll_interval: Duration::from_millis(20),
+        mount_points: Vec::new(),
     }
 }
 

@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub const DEFAULT_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c", "client-d"];
+#[cfg(windows)]
+const DEFAULT_WINDOWS_MOUNT_LETTERS: &[char] = &['Z', 'Y', 'X', 'W'];
+const MAX_COMMAND_OUTPUT_CHARS: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientControllerConfig {
@@ -19,6 +22,9 @@ pub struct ClientControllerConfig {
     pub meta_dsn: String,
     pub s3: S3Config,
     pub mount_ready_timeout: Duration,
+    pub mount_exit_timeout: Duration,
+    pub poll_interval: Duration,
+    pub mount_points: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +55,7 @@ pub struct ClientSpec {
     pub local_metadata_dir: PathBuf,
     pub local_metadata_db: PathBuf,
     pub cache_dir: PathBuf,
+    pub mount_metadata_dir: PathBuf,
     pub mount_point: PathBuf,
     pub stdout_log: PathBuf,
     pub stderr_log: PathBuf,
@@ -161,8 +168,12 @@ pub enum ClientControllerError {
     NoClients,
     #[error("cannot replace E2E clients while mount processes are still tracked")]
     ClientsStillMounted,
+    #[error("client name must be a safe single directory name: {0}")]
+    UnsafeClientName(String),
     #[error("unknown E2E client: {0}")]
     UnknownClient(String),
+    #[error("E2E client index {index} is out of range for {len} clients")]
+    ClientIndexOutOfRange { index: usize, len: usize },
     #[error(
         "client command {action} for {client} failed with exit status {status}: stderr: {stderr}; stdout: {stdout}"
     )]
@@ -200,9 +211,17 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         if self.clients.iter().any(|runtime| runtime.process.is_some()) {
             return Err(ClientControllerError::ClientsStillMounted);
         }
+        let names: Vec<String> = names
+            .into_iter()
+            .map(|name| name.as_ref().to_string())
+            .collect();
+        for name in &names {
+            validate_client_name(name)?;
+        }
+
         self.clients.clear();
-        for name in names {
-            let spec = self.create_client_spec(name.as_ref())?;
+        for (index, name) in names.iter().enumerate() {
+            let spec = self.create_client_spec(index, name)?;
             self.clients.push(ClientRuntime {
                 spec,
                 process: None,
@@ -216,6 +235,10 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
             .iter()
             .map(|runtime| &runtime.spec)
             .collect::<Vec<_>>()
+    }
+
+    pub fn client_at(&self, index: usize) -> Result<&ClientSpec, ClientControllerError> {
+        self.client(index)
     }
 
     pub fn init_first_client(&mut self) -> Result<(), ClientControllerError> {
@@ -279,7 +302,9 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         let mut process = self.executor.spawn(&command)?;
         let process_id = process.id();
         if let Err(err) = self.wait_until_mount_ready(&command, process.as_mut()) {
-            let _ = process.kill();
+            if let Err(kill_error) = process.kill() {
+                debug_log_kill_error(&command.client, "mount readiness failure", &kill_error);
+            }
             self.clients[index].spec.state =
                 if matches!(err, ClientControllerError::CommandFailed { .. }) {
                     ClientLifecycleState::Exited
@@ -299,7 +324,11 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         let output = self.executor.run(&command)?;
         ensure_success(&command, output)?;
         if let Some(process) = self.clients[index].process.as_mut() {
-            wait_for_process_exit(process.as_mut(), Duration::from_secs(15))?;
+            wait_for_process_exit(
+                process.as_mut(),
+                self.config.mount_exit_timeout,
+                self.config.poll_interval,
+            )?;
         }
         self.clients[index].process = None;
         self.clients[index].spec.process_id = None;
@@ -314,12 +343,31 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
             .ok_or_else(|| ClientControllerError::UnknownClient(client.to_string()))
     }
 
-    fn create_client_spec(&self, name: &str) -> Result<ClientSpec, ClientControllerError> {
-        let spec = client_spec_for(&self.config.sandbox, &self.config.volume_name, name);
+    fn create_client_spec(
+        &self,
+        index: usize,
+        name: &str,
+    ) -> Result<ClientSpec, ClientControllerError> {
+        let mount_point = self
+            .config
+            .mount_points
+            .get(index)
+            .cloned()
+            .unwrap_or_else(|| default_client_mount_point(&self.config.sandbox, name, index));
+        let spec = client_spec_for(
+            &self.config.sandbox,
+            &self.config.volume_name,
+            name,
+            mount_point,
+        );
         fs::create_dir_all(&spec.client_root)?;
         fs::create_dir_all(&spec.local_metadata_dir)?;
         fs::create_dir_all(&spec.cache_dir)?;
-        fs::create_dir_all(&spec.mount_point)?;
+        fs::create_dir_all(&spec.mount_metadata_dir)?;
+        write_mount_metadata(&spec)?;
+        if should_create_mount_point_dir(&spec.mount_point, &spec.mount_metadata_dir) {
+            fs::create_dir_all(&spec.mount_point)?;
+        }
         Ok(spec)
     }
 
@@ -398,10 +446,12 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
     }
 
     fn client(&self, index: usize) -> Result<&ClientSpec, ClientControllerError> {
-        self.clients
-            .get(index)
-            .map(|runtime| &runtime.spec)
-            .ok_or(ClientControllerError::NoClients)
+        self.clients.get(index).map(|runtime| &runtime.spec).ok_or(
+            ClientControllerError::ClientIndexOutOfRange {
+                index,
+                len: self.clients.len(),
+            },
+        )
     }
 
     fn wait_until_mount_ready(
@@ -435,7 +485,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
                     ),
                 )));
             }
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(nonzero_poll_interval(self.config.poll_interval));
         }
     }
 }
@@ -444,7 +494,9 @@ impl<E> Drop for MultiClientController<E> {
     fn drop(&mut self) {
         for runtime in &mut self.clients {
             if let Some(process) = runtime.process.as_mut() {
-                let _ = process.kill();
+                if let Err(error) = process.kill() {
+                    debug_log_kill_error(&runtime.spec.name, "controller drop", &error);
+                }
             }
         }
     }
@@ -466,8 +518,8 @@ fn ensure_success(
             client: command.client.clone(),
             action: command.action.clone(),
             status: output.status,
-            stdout: output.stdout,
-            stderr: output.stderr,
+            stdout: diagnostic_excerpt(&output.stdout),
+            stderr: diagnostic_excerpt(&output.stderr),
         })
     }
 }
@@ -500,16 +552,23 @@ pub fn client_tracing_log(sandbox: &Path, client: &str) -> PathBuf {
     client_artifact_dir(sandbox, client).join("studiofs-tracing.log")
 }
 
-pub fn client_spec_for(sandbox: &Path, volume_name: &str, client: &str) -> ClientSpec {
+pub fn client_spec_for(
+    sandbox: &Path,
+    volume_name: &str,
+    client: &str,
+    mount_point: PathBuf,
+) -> ClientSpec {
     let client_root = client_root_dir(sandbox, client);
     let local_metadata_dir = client_root.join("meta").join(volume_name);
+    let mount_metadata_dir = client_mount_point(sandbox, client);
     ClientSpec {
         name: client.to_string(),
         local_metadata_db: local_metadata_dir.join(format!("{volume_name}.db")),
         local_metadata_dir,
         client_root,
         cache_dir: client_cache_dir(sandbox, client),
-        mount_point: client_mount_point(sandbox, client),
+        mount_metadata_dir,
+        mount_point,
         stdout_log: client_stdout_log(sandbox, client),
         stderr_log: client_stderr_log(sandbox, client),
         tracing_log: client_tracing_log(sandbox, client),
@@ -521,6 +580,7 @@ pub fn client_spec_for(sandbox: &Path, volume_name: &str, client: &str) -> Clien
 fn wait_for_process_exit(
     process: &mut dyn ClientProcess,
     timeout: Duration,
+    poll_interval: Duration,
 ) -> Result<(), ClientControllerError> {
     let deadline = Instant::now() + timeout;
     loop {
@@ -533,7 +593,7 @@ fn wait_for_process_exit(
                 "mount process did not exit after graceful unmount",
             )));
         }
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(nonzero_poll_interval(poll_interval));
     }
 }
 
@@ -571,7 +631,7 @@ fn base_command(command: &ClientCommand) -> Command {
     process
 }
 
-fn append_log(path: &PathBuf, bytes: &[u8]) -> io::Result<()> {
+fn append_log(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -579,6 +639,78 @@ fn append_log(path: &PathBuf, bytes: &[u8]) -> io::Result<()> {
     file.write_all(bytes)?;
     Ok(())
 }
+
+fn validate_client_name(name: &str) -> Result<(), ClientControllerError> {
+    let safe = !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.starts_with('.')
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'));
+    if safe {
+        Ok(())
+    } else {
+        Err(ClientControllerError::UnsafeClientName(name.to_string()))
+    }
+}
+
+fn write_mount_metadata(spec: &ClientSpec) -> Result<(), ClientControllerError> {
+    let payload = serde_json::json!({
+        "client": spec.name,
+        "mount_point": spec.mount_point.display().to_string(),
+    });
+    fs::write(
+        spec.mount_metadata_dir.join("mount-point.json"),
+        serde_json::to_vec_pretty(&payload).map_err(io::Error::other)?,
+    )?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn default_client_mount_point(sandbox: &Path, client: &str, index: usize) -> PathBuf {
+    DEFAULT_WINDOWS_MOUNT_LETTERS
+        .get(index)
+        .map(|letter| PathBuf::from(format!("{letter}:")))
+        .unwrap_or_else(|| client_mount_point(sandbox, client))
+}
+
+#[cfg(not(windows))]
+fn default_client_mount_point(sandbox: &Path, client: &str, _index: usize) -> PathBuf {
+    client_mount_point(sandbox, client)
+}
+
+fn should_create_mount_point_dir(mount_point: &Path, mount_metadata_dir: &Path) -> bool {
+    mount_point == mount_metadata_dir || !is_windows_drive_mount_point(mount_point)
+}
+
+fn nonzero_poll_interval(interval: Duration) -> Duration {
+    if interval.is_zero() {
+        Duration::from_millis(1)
+    } else {
+        interval
+    }
+}
+
+fn diagnostic_excerpt(value: &str) -> String {
+    let mut chars = value.chars();
+    let excerpt: String = chars.by_ref().take(MAX_COMMAND_OUTPUT_CHARS).collect();
+    if chars.next().is_some() {
+        format!(
+            "{excerpt}\n[truncated after {MAX_COMMAND_OUTPUT_CHARS} chars; full output is in the per-client log files]"
+        )
+    } else {
+        excerpt
+    }
+}
+
+#[cfg(debug_assertions)]
+fn debug_log_kill_error(client: &str, context: &str, error: &io::Error) {
+    eprintln!("studiofs-e2e: failed to kill client {client} during {context}: {error}");
+}
+
+#[cfg(not(debug_assertions))]
+fn debug_log_kill_error(_client: &str, _context: &str, _error: &io::Error) {}
 
 #[cfg(unix)]
 fn mount_point_is_active(path: &Path) -> io::Result<bool> {
@@ -602,6 +734,16 @@ fn mount_point_is_active(path: &Path) -> io::Result<bool> {
         return Ok(false);
     };
     Ok(root.exists())
+}
+
+#[cfg(windows)]
+fn is_windows_drive_mount_point(path: &Path) -> bool {
+    windows_drive_root(path).is_some()
+}
+
+#[cfg(not(windows))]
+fn is_windows_drive_mount_point(_path: &Path) -> bool {
+    false
 }
 
 #[cfg(windows)]
