@@ -263,6 +263,12 @@ pub enum ClientControllerError {
     MissingLocalMetadataDb { client: String, path: PathBuf },
     #[error("E2E local metadata DB path is shared by multiple clients: {0}")]
     DuplicateLocalMetadataDb(PathBuf),
+    #[error("failed to canonicalize local metadata DB for E2E client {client} at {path}: {source}")]
+    CanonicalizeLocalMetadataDbFailed {
+        client: String,
+        path: PathBuf,
+        source: io::Error,
+    },
     #[error("failed to clean local metadata for E2E client {client} at {path}: {source}")]
     CleanLocalMetadataFailed {
         client: String,
@@ -469,7 +475,8 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
                     path: path.clone(),
                 });
             }
-            let unique_path = path.canonicalize()?.into_os_string();
+            let unique_path =
+                canonical_local_metadata_db_path(&runtime.spec.name, path)?.into_os_string();
             if !seen.insert(unique_path) {
                 return Err(ClientControllerError::DuplicateLocalMetadataDb(
                     path.clone(),
@@ -871,6 +878,19 @@ fn prefixed_dns_name(prefix: &str, stem: &str, max_chars: usize) -> String {
     name
 }
 
+fn canonical_local_metadata_db_path(
+    client: &str,
+    path: &Path,
+) -> Result<PathBuf, ClientControllerError> {
+    path.canonicalize().map_err(
+        |source| ClientControllerError::CanonicalizeLocalMetadataDbFailed {
+            client: client.to_string(),
+            path: path.to_path_buf(),
+            source,
+        },
+    )
+}
+
 fn write_mount_metadata(spec: &ClientSpec) -> Result<(), ClientControllerError> {
     let payload = serde_json::json!({
         "client": spec.name,
@@ -980,4 +1000,27 @@ fn windows_drive_root(path: &Path) -> Option<PathBuf> {
 #[cfg(not(any(unix, windows)))]
 fn mount_point_is_active(path: &Path) -> io::Result<bool> {
     Ok(path.exists())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_local_metadata_db_path_errors_include_client_and_path() {
+        let path = Path::new("missing-client-root")
+            .join("meta")
+            .join("projectfs")
+            .join("projectfs.db");
+
+        let err = canonical_local_metadata_db_path("client-a", &path).unwrap_err();
+        let message = err.to_string();
+
+        assert!(matches!(
+            err,
+            ClientControllerError::CanonicalizeLocalMetadataDbFailed { .. }
+        ));
+        assert!(message.contains("client-a"));
+        assert!(message.contains(&path.display().to_string()));
+    }
 }
