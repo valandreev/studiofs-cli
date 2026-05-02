@@ -47,6 +47,8 @@ pub struct TreeEntry {
     pub modified_unix_ms: Option<u128>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checksum_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symlink_target: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,6 +106,17 @@ pub enum MountedTreeError {
         artifact_dir: PathBuf,
         comparison: Box<TreeComparison>,
     },
+    #[error(
+        "mounted filesystem trees could not be snapshotted after {attempts} attempts in {elapsed_ms}ms; last error: {source}"
+    )]
+    SnapshotUnavailableTimedOut {
+        attempts: usize,
+        elapsed_ms: u128,
+        artifact_dir: PathBuf,
+        source: Box<MountedTreeError>,
+    },
+    #[error("mounted tree path is not valid UTF-8: {path}")]
+    NonUtf8Path { path: PathBuf },
 }
 
 pub fn snapshot_client_tree(
@@ -119,7 +132,7 @@ pub fn snapshot_client_tree(
     Ok(MountedTreeSnapshot {
         schema_version: SNAPSHOT_SCHEMA_VERSION,
         client,
-        mount_point: mount_point.display().to_string(),
+        mount_point: path_to_json_string(mount_point)?,
         entries,
     })
 }
@@ -241,14 +254,22 @@ pub fn wait_for_convergence(
         let elapsed_ms = started.elapsed().as_millis();
         if Instant::now() >= deadline {
             let Some((snapshots, comparison)) = last_divergence else {
-                if let Some(error) = last_snapshot_error {
-                    return Err(error);
-                }
-                return Err(MountedTreeError::ConvergenceTimedOut {
+                let source = last_snapshot_error.unwrap_or(MountedTreeError::ConvergenceTimedOut {
                     attempts,
                     elapsed_ms,
                     artifact_dir: artifact_dir.to_path_buf(),
-                    comparison: Box::new(compare_snapshots(&[])),
+                    comparison: Box::new(TreeComparison {
+                        converged: false,
+                        reference_client: None,
+                        compared_clients: mounts.iter().map(|mount| mount.client.clone()).collect(),
+                        differences: Vec::new(),
+                    }),
+                });
+                return Err(MountedTreeError::SnapshotUnavailableTimedOut {
+                    attempts,
+                    elapsed_ms,
+                    artifact_dir: artifact_dir.to_path_buf(),
+                    source: Box::new(source),
                 });
             };
             write_divergence_artifacts(artifact_dir, &snapshots, &comparison)?;
@@ -273,7 +294,7 @@ fn scan_dir(
     for child in children {
         let path = child.path();
         let metadata = symlink_metadata(&path)?;
-        let relative_path = relative_path(root, &path);
+        let relative_path = relative_path(root, &path)?;
         let file_type = metadata.file_type();
 
         if file_type.is_dir() {
@@ -283,6 +304,7 @@ fn scan_dir(
                 size: None,
                 modified_unix_ms: modified_unix_ms(&metadata),
                 checksum_sha256: None,
+                symlink_target: None,
             });
             scan_dir(root, &path, entries)?;
         } else if file_type.is_file() {
@@ -292,8 +314,14 @@ fn scan_dir(
                 size: Some(metadata.len()),
                 modified_unix_ms: modified_unix_ms(&metadata),
                 checksum_sha256: Some(file_sha256(&path)?),
+                symlink_target: None,
             });
         } else {
+            let symlink_target = if file_type.is_symlink() {
+                Some(read_link_target(&path)?)
+            } else {
+                None
+            };
             entries.push(TreeEntry {
                 path: relative_path,
                 entry_type: if file_type.is_symlink() {
@@ -304,6 +332,7 @@ fn scan_dir(
                 size: None,
                 modified_unix_ms: modified_unix_ms(&metadata),
                 checksum_sha256: None,
+                symlink_target,
             });
         }
     }
@@ -369,6 +398,19 @@ fn compare_entry(
             actual: actual.checksum_sha256.clone(),
         });
     }
+
+    if expected.entry_type == TreeEntryKind::Symlink
+        && expected.symlink_target != actual.symlink_target
+    {
+        differences.push(TreeDifference {
+            client: client.to_string(),
+            reference_client: Some(reference_client.to_string()),
+            path: path.to_string(),
+            message: "symlink target differs".to_string(),
+            expected: expected.symlink_target.clone(),
+            actual: actual.symlink_target.clone(),
+        });
+    }
 }
 
 fn snapshot_mounts(mounts: &[ClientMount]) -> Result<Vec<MountedTreeSnapshot>, MountedTreeError> {
@@ -378,13 +420,21 @@ fn snapshot_mounts(mounts: &[ClientMount]) -> Result<Vec<MountedTreeSnapshot>, M
         .collect()
 }
 
-fn relative_path(root: &Path, path: &Path) -> String {
+fn relative_path(root: &Path, path: &Path) -> Result<String, MountedTreeError> {
     path.strip_prefix(root)
         .unwrap_or(path)
         .components()
-        .map(|component| component.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/")
+        .map(|component| {
+            component
+                .as_os_str()
+                .to_str()
+                .map(str::to_string)
+                .ok_or_else(|| MountedTreeError::NonUtf8Path {
+                    path: path.to_path_buf(),
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(|components| components.join("/"))
 }
 
 fn file_sha256(path: &Path) -> Result<String, MountedTreeError> {
@@ -401,6 +451,20 @@ fn file_sha256(path: &Path) -> Result<String, MountedTreeError> {
         hasher.update(&buffer[..read]);
     }
     Ok(hex_lower(&hasher.finalize()))
+}
+
+fn read_link_target(path: &Path) -> Result<String, MountedTreeError> {
+    let target = fs::read_link(path).map_err(|source| io_error(path, source))?;
+    path_to_json_string(&target)
+}
+
+fn path_to_json_string(path: &Path) -> Result<String, MountedTreeError> {
+    path.as_os_str()
+        .to_str()
+        .map(str::to_string)
+        .ok_or_else(|| MountedTreeError::NonUtf8Path {
+            path: path.to_path_buf(),
+        })
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -430,7 +494,10 @@ fn entry_contract(entry: &TreeEntry) -> String {
             entry.checksum_sha256.as_deref().unwrap_or("unknown")
         ),
         TreeEntryKind::Directory => "directory".to_string(),
-        TreeEntryKind::Symlink => "symlink".to_string(),
+        TreeEntryKind::Symlink => format!(
+            "symlink target={}",
+            entry.symlink_target.as_deref().unwrap_or("unknown")
+        ),
         TreeEntryKind::Other => "other".to_string(),
     }
 }

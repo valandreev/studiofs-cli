@@ -3,8 +3,8 @@ use std::thread;
 use std::time::Duration;
 
 use studiofs_e2e::mounted_tree::{
-    ClientMount, TreeEntryKind, compare_snapshots, snapshot_client_tree, wait_for_convergence,
-    write_divergence_artifacts,
+    ClientMount, MountedTreeError, MountedTreeSnapshot, TreeEntry, TreeEntryKind,
+    compare_snapshots, snapshot_client_tree, wait_for_convergence, write_divergence_artifacts,
 };
 use tempfile::tempdir;
 
@@ -171,4 +171,104 @@ fn wait_for_convergence_treats_transient_snapshot_io_errors_as_not_yet_converged
     assert!(outcome.comparison.converged);
     assert!(outcome.attempts > 1);
     assert!(!artifact_dir.join("diff.json").exists());
+}
+
+#[test]
+fn wait_for_convergence_reports_timeout_when_snapshots_never_succeed() {
+    let temp = tempdir().unwrap();
+    let missing_client = temp.path().join("missing-client");
+
+    let err = wait_for_convergence(
+        &[ClientMount::new("client-a", missing_client)],
+        temp.path().join("validation"),
+        Duration::from_millis(30),
+        Duration::from_millis(5),
+    )
+    .unwrap_err();
+
+    match err {
+        MountedTreeError::SnapshotUnavailableTimedOut {
+            attempts, source, ..
+        } => {
+            assert!(attempts > 1);
+            assert!(matches!(*source, MountedTreeError::Io { .. }));
+        }
+        other => panic!("expected snapshot-unavailable timeout, got {other:?}"),
+    }
+}
+
+#[test]
+fn comparison_detects_symlink_target_divergence() {
+    let snapshots = vec![
+        symlink_snapshot("client-a", "target-a"),
+        symlink_snapshot("client-b", "target-b"),
+    ];
+
+    let comparison = compare_snapshots(&snapshots);
+
+    assert!(!comparison.converged);
+    assert!(
+        comparison
+            .differences
+            .iter()
+            .any(|difference| difference.path == "link"
+                && difference.message.contains("symlink target differs"))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn snapshot_records_symlink_target() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempdir().unwrap();
+    let client_a = temp.path().join("client-a");
+    fs::create_dir_all(&client_a).unwrap();
+    symlink("target-a", client_a.join("link")).unwrap();
+
+    let snapshot = snapshot_client_tree("client-a", &client_a).unwrap();
+
+    let link = snapshot
+        .entries
+        .iter()
+        .find(|entry| entry.path == "link")
+        .unwrap();
+    assert_eq!(link.entry_type, TreeEntryKind::Symlink);
+    assert_eq!(link.symlink_target.as_deref(), Some("target-a"));
+}
+
+#[cfg(unix)]
+#[test]
+fn snapshot_rejects_non_utf8_relative_paths_instead_of_lossy_encoding() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let temp = tempdir().unwrap();
+    let mount = temp.path().join("client-a");
+    fs::create_dir_all(&mount).unwrap();
+    fs::write(
+        mount.join(OsString::from_vec(vec![b'f', 0x80, b'e'])),
+        b"data",
+    )
+    .unwrap();
+
+    let err = snapshot_client_tree("client-a", &mount).unwrap_err();
+
+    assert!(matches!(err, MountedTreeError::NonUtf8Path { .. }));
+}
+
+fn symlink_snapshot(client: &str, target: &str) -> MountedTreeSnapshot {
+    MountedTreeSnapshot {
+        schema_version: 1,
+        client: client.to_string(),
+        mount_point: format!("/mnt/{client}"),
+        entries: vec![TreeEntry {
+            path: "link".to_string(),
+            entry_type: TreeEntryKind::Symlink,
+            size: None,
+            modified_unix_ms: None,
+            checksum_sha256: None,
+            symlink_target: Some(target.to_string()),
+        }],
+    }
 }
