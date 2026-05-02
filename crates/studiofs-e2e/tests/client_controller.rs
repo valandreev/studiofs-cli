@@ -71,6 +71,11 @@ fn controller_bootstraps_mounts_restarts_and_kills_isolated_clients() {
             .iter()
             .any(|(key, _)| key == "STUDIOFS_DAEMON_LOG_DIR")
     }));
+    assert!(calls.iter().all(|call| {
+        call.env.iter().any(|(key, value)| {
+            key == "STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS" && value == "250"
+        })
+    }));
     assert!(
         calls
             .iter()
