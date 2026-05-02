@@ -767,6 +767,8 @@ trait RustfsOutageDriver {
     ) -> Result<VolumeBootstrapSummary, ScenarioError>;
     fn mount_all(&mut self) -> Result<(), ScenarioError>;
     fn clients(&self) -> Vec<ClientSpec>;
+    // Test drivers use this hook to make the healthy pre-outage payload visible
+    // before the normal mounted-tree convergence gate.
     fn after_initial_write(
         &mut self,
         clients: &[ClientSpec],
@@ -964,7 +966,8 @@ fn assert_peer_not_visible(
                 Ok(Some(checksum))
             }
         }
-        Err(_) => Ok(None),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err.into()),
     }
 }
 
@@ -1734,6 +1737,19 @@ mod tests {
             "outage duration should exclude the peer visibility probe latency, got {}ms",
             summary.outage_duration_ms
         );
+    }
+
+    #[test]
+    fn rustfs_peer_visibility_probe_propagates_unexpected_io_errors() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let mount = temp.path().join("mounts").join("client-b");
+        std::fs::create_dir_all(mount.join(RUSTFS_OUTAGE_FILE_NAME)).unwrap();
+        let peer = client_spec_for(&sandbox, "projectfs", "client-b", mount);
+
+        let err = assert_peer_not_visible(&peer, RUSTFS_OUTAGE_FILE_NAME, "forbidden").unwrap_err();
+
+        assert!(matches!(err, ScenarioError::Io(_)));
     }
 
     #[test]
