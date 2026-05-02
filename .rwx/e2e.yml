@@ -1,0 +1,182 @@
+on:
+  cli:
+    init:
+      ref: ${{ event.git.sha }}
+
+base:
+  image: ubuntu:24.04
+  config: rwx/base 1.0.3
+
+tasks:
+  - key: code
+    call: git/clone 2.0.7
+    with:
+      repository: https://github.com/valandreev/studiofs-cli.git
+      ref: ${{ init.ref }}
+      github-token: ${{ github.token }}
+
+  - key: rust
+    call: rust-lang/install 1.0.7
+    with:
+      rust-version: 1.95.0
+
+  - key: linux-e2e-packages
+    run: |
+      set -euo pipefail
+
+      sudo apt-get update
+      sudo apt-get install -y \
+        ca-certificates \
+        curl \
+        fuse3 \
+        jq \
+        libfuse3-dev \
+        libgtk-3-dev \
+        libxdo-dev \
+        pkg-config \
+        python3
+      sudo apt-get install -y libappindicator3-dev || sudo apt-get install -y libayatana-appindicator3-dev
+      sudo sed -i 's/^#user_allow_other/user_allow_other/' /etc/fuse.conf
+      grep -q '^user_allow_other' /etc/fuse.conf || echo user_allow_other | sudo tee -a /etc/fuse.conf
+      sudo apt-get clean
+
+  - key: cargo-fetch
+    use: [code, rust]
+    filter:
+      - Cargo.lock
+      - Cargo.toml
+      - crates/*/Cargo.toml
+      - crates/*/src/lib.rs
+      - crates/*/src/main.rs
+    run: cargo fetch --locked
+
+  - key: build-studiofs
+    use: [code, rust, linux-e2e-packages, cargo-fetch]
+    run: cargo build -p studiofs --locked
+    env:
+      RUSTFLAGS: "-Dwarnings"
+
+  - key: e2e-preflight
+    use: [code, rust, linux-e2e-packages, cargo-fetch]
+    docker: true
+    run: |
+      set -euo pipefail
+
+      case "${RWX_RUN_ID:-}" in
+        ""|*[!A-Za-z0-9_-]*)
+          echo "preflight failed: RWX_RUN_ID must use only ASCII letters, digits, underscores, or hyphens"
+          exit 2
+          ;;
+      esac
+
+      PREFLIGHT_DIR="target/e2e-runs/preflight-rwx-${RWX_RUN_ID}"
+      mkdir -p "${PREFLIGHT_DIR}"
+
+      exec > >(tee "${PREFLIGHT_DIR}/stdout.log") 2> >(tee "${PREFLIGHT_DIR}/stderr.log" >&2)
+
+      docker version
+      docker compose version
+
+      if [ ! -c /dev/fuse ]; then
+        echo "preflight failed: /dev/fuse is not available or is not a character device"
+        exit 2
+      fi
+
+      if ! command -v fusermount3 >/dev/null 2>&1; then
+        echo "preflight failed: fusermount3 is not installed"
+        exit 2
+      fi
+
+      if ! grep -q '^user_allow_other' /etc/fuse.conf; then
+        echo "preflight failed: /etc/fuse.conf must enable user_allow_other for StudioFS FUSE mounts"
+        exit 2
+      fi
+
+      cargo run -p studiofs-e2e -- list
+      cargo test -p studiofs-e2e --test runner_contract -- --nocapture
+    env:
+      RUSTFLAGS: "-Dwarnings"
+    outputs:
+      artifacts:
+        - key: e2e-preflight
+          path: target/e2e-runs
+
+  - key: e2e-smoke
+    use: [linux-e2e-packages, e2e-preflight, build-studiofs]
+    docker: true
+    run: |
+      set -euo pipefail
+
+      case "${RWX_RUN_ID:-}" in
+        ""|*[!A-Za-z0-9_-]*)
+          echo "e2e smoke failed: RWX_RUN_ID must use only ASCII letters, digits, underscores, or hyphens"
+          exit 2
+          ;;
+      esac
+
+      RUN_ID="rwx-${RWX_RUN_ID}"
+      RUN_ROOT="target/e2e-runs"
+      ARTIFACT_DIR="${RUN_ROOT}/${RUN_ID}"
+
+      echo "Starting StudioFS real E2E smoke"
+      echo "run_id=${RUN_ID}"
+      echo "artifact_path=${ARTIFACT_DIR}"
+
+      set +e
+      cargo run -p studiofs-e2e -- run basic-multi-client-smoke \
+        --studiofs-bin target/debug/studiofs \
+        --root "${RUN_ROOT}" \
+        --run-id "${RUN_ID}" \
+        --platform linux-fuse \
+        --infra compose \
+        --retain always
+      STATUS=$?
+      set -e
+
+      python3 - "${ARTIFACT_DIR}" "${STATUS}" <<'PY'
+      import json
+      import pathlib
+      import sys
+
+      artifact_dir = pathlib.Path(sys.argv[1])
+      status = int(sys.argv[2])
+      report_path = artifact_dir / "report.json"
+
+      print(f"artifact_path={artifact_dir}")
+      if not report_path.exists():
+          print(f"report_missing={report_path}")
+          sys.exit(status)
+
+      report = json.loads(report_path.read_text(encoding="utf-8"))
+      print(f"run_id={report.get('run_id')}")
+      print(f"status={report.get('status')}")
+      print(f"report={report_path}")
+
+      for scenario in report.get("scenarios", []):
+          name = scenario.get("name")
+          scenario_status = scenario.get("status")
+          print(f"scenario={name} status={scenario_status}")
+          error = scenario.get("error")
+          if error:
+              print(f"failed_invariant={error}")
+          for artifact in scenario.get("artifacts", []):
+              print(f"scenario_artifact={artifact}")
+
+      preflight = report.get("preflight", {})
+      if preflight.get("status") != "passed":
+          for check in preflight.get("checks", []):
+              if check.get("status") != "passed":
+                  print(
+                      "preflight_failed="
+                      f"{check.get('name')}: {check.get('detail')}"
+                  )
+
+      sys.exit(status)
+      PY
+    env:
+      RUSTFLAGS: "-Dwarnings"
+      RUST_BACKTRACE: "1"
+    outputs:
+      artifacts:
+        - key: e2e-run
+          path: target/e2e-runs

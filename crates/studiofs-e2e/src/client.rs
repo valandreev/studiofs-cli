@@ -553,6 +553,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
             .get(index)
             .cloned()
             .unwrap_or_else(|| default_client_mount_point(&self.config.sandbox, name, index));
+        let mount_point = product_mount_path(&self.config.volume_name, mount_point);
         let spec = client_spec_for(
             &self.config.sandbox,
             &self.config.volume_name,
@@ -948,6 +949,19 @@ fn default_client_mount_point(sandbox: &Path, client: &str, _index: usize) -> Pa
     client_mount_point(sandbox, client)
 }
 
+fn product_mount_path(volume_name: &str, requested_mount_point: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    if is_windows_drive_mount_point(&requested_mount_point) {
+        return requested_mount_point;
+    }
+
+    if requested_mount_point.ends_with(volume_name) {
+        requested_mount_point
+    } else {
+        requested_mount_point.join(volume_name)
+    }
+}
+
 fn should_create_mount_point_dir(mount_point: &Path, mount_metadata_dir: &Path) -> bool {
     mount_point == mount_metadata_dir || !is_windows_drive_mount_point(mount_point)
 }
@@ -993,7 +1007,74 @@ fn mount_point_is_active(path: &Path) -> io::Result<bool> {
         return Ok(false);
     };
     let parent = fs::metadata(parent)?;
-    Ok(metadata.dev() != parent.dev())
+    if metadata.dev() != parent.dev() {
+        return Ok(true);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let mountinfo = fs::read("/proc/self/mountinfo")?;
+        Ok(mountinfo_contains_mount_point(&mountinfo, path))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(false)
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn mountinfo_contains_mount_point(mountinfo: &[u8], path: &Path) -> bool {
+    mountinfo.split(|byte| *byte == b'\n').any(|line| {
+        let Some(encoded_mount_point) = line
+            .split(|byte| *byte == b' ')
+            .filter(|field| !field.is_empty())
+            .nth(4)
+        else {
+            return false;
+        };
+        decode_mountinfo_path(encoded_mount_point)
+            .is_some_and(|decoded_mount_point| mountinfo_path_matches(&decoded_mount_point, path))
+    })
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn mountinfo_path_matches(decoded_mount_point: &Path, expected: &Path) -> bool {
+    decoded_mount_point.components().eq(expected.components())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn decode_mountinfo_path(value: &[u8]) -> Option<PathBuf> {
+    let mut decoded = Vec::with_capacity(value.len());
+    let mut index = 0;
+    while index < value.len() {
+        // Linux mountinfo path fields escape bytes as backslash plus three
+        // octal digits; see proc_pid_mountinfo(5).
+        if value[index] == b'\\' && index + 3 < value.len() {
+            let octal = &value[index + 1..index + 4];
+            if octal.iter().all(|byte| matches!(byte, b'0'..=b'7')) {
+                let byte = octal
+                    .iter()
+                    .fold(0, |value, digit| (value << 3) + (digit - b'0'));
+                decoded.push(byte);
+                index += 4;
+                continue;
+            }
+        }
+        decoded.push(value[index]);
+        index += 1;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        Some(PathBuf::from(OsString::from_vec(decoded)))
+    }
+
+    #[cfg(not(unix))]
+    {
+        String::from_utf8(decoded).ok().map(PathBuf::from)
+    }
 }
 
 #[cfg(windows)]
@@ -1112,5 +1193,45 @@ mod tests {
         ));
         assert!(message.contains("client-a"));
         assert!(message.contains(&path.display().to_string()));
+    }
+
+    #[test]
+    fn linux_mountinfo_fallback_matches_escaped_mount_point() {
+        let path = Path::new("/var/mint-workspace/target/e2e-runs/run with space/mount");
+        let mountinfo = "\
+42 31 0:49 / / rw,relatime - overlay overlay rw\n\
+88 42 0:77 / /var/mint-workspace/target/e2e-runs/run\\040with\\040space/mount rw,nosuid,nodev - fuse.studiofs studiofs rw\n";
+
+        assert!(mountinfo_contains_mount_point(mountinfo.as_bytes(), path));
+    }
+
+    #[test]
+    fn linux_mountinfo_fallback_ignores_trailing_slash_difference() {
+        let path = Path::new("/var/mint-workspace/target/e2e-runs/run/mount");
+        let mountinfo = "\
+42 31 0:49 / / rw,relatime - overlay overlay rw\n\
+88 42 0:77 / /var/mint-workspace/target/e2e-runs/run/mount/ rw,nosuid,nodev - fuse.studiofs studiofs rw\n";
+
+        assert!(mountinfo_contains_mount_point(mountinfo.as_bytes(), path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_mountinfo_fallback_matches_non_utf8_mount_point_bytes() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let path = PathBuf::from(OsString::from_vec(
+            b"/var/mint-workspace/mount-\xff".to_vec(),
+        ));
+        let mountinfo = b"42 31 0:49 / / rw,relatime - overlay overlay rw\n\
+88 42 0:77 / /var/mint-workspace/mount-\xff rw,nosuid,nodev - fuse.studiofs studiofs rw\n";
+
+        assert!(mountinfo_contains_mount_point(mountinfo, &path));
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn decode_mountinfo_path_rejects_invalid_utf8_without_lossy_replacement() {
+        assert!(decode_mountinfo_path(b"/var/mint-workspace/mount-\xff").is_none());
     }
 }
