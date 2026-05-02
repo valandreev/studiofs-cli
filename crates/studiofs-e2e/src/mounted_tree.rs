@@ -210,11 +210,6 @@ pub fn validate_namespace_invariants(
 ) -> Vec<NamespaceInvariantViolation> {
     let mut violations = Vec::new();
     let mut seen = BTreeSet::new();
-    let entry_paths = snapshot
-        .entries
-        .iter()
-        .map(|entry| entry.path.as_str())
-        .collect::<BTreeSet<_>>();
     let directory_paths = snapshot
         .entries
         .iter()
@@ -244,7 +239,7 @@ pub fn validate_namespace_invariants(
         }
 
         if let Some(parent) = parent_path(&entry.path) {
-            if !entry_paths.contains(parent) || !directory_paths.contains(parent) {
+            if !directory_paths.contains(parent) {
                 violations.push(NamespaceInvariantViolation {
                     client: snapshot.client.clone(),
                     path: entry.path.clone(),

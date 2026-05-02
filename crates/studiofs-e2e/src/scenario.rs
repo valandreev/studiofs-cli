@@ -125,10 +125,15 @@ pub enum ScenarioError {
     InsufficientCrashRestartClients { expected: usize, actual: usize },
     #[error("namespace collision scenario requires at least {expected} clients, got {actual}")]
     InsufficientCollisionClients { expected: usize, actual: usize },
+    #[error("namespace collision scenario failed: {primary}; unmount also failed: {cleanup}")]
+    NamespaceCollisionUnmountAfterFailure { primary: String, cleanup: String },
     #[error("namespace collision validation failed: {violations:?}")]
     NamespaceInvariantViolations {
         violations: Vec<NamespaceInvariantViolation>,
     },
+    #[cfg(test)]
+    #[error("namespace collision recording replication failed: {errors:?}")]
+    ReplicationFailure { errors: Vec<String> },
 }
 
 pub trait Scenario {
@@ -1628,6 +1633,10 @@ fn run_namespace_collision_with_driver(
     let unmount_result = driver.unmount_all();
     match (result, unmount_result) {
         (Ok(summary), Ok(())) => Ok(summary),
+        (Err(primary), Err(cleanup)) => Err(ScenarioError::NamespaceCollisionUnmountAfterFailure {
+            primary: primary.to_string(),
+            cleanup: cleanup.to_string(),
+        }),
         (Err(error), _) => Err(error),
         (Ok(_), Err(error)) => Err(error),
     }
@@ -2698,6 +2707,7 @@ mod tests {
     struct RecordingNamespaceCollisionDriver {
         clients: Vec<ClientSpec>,
         actions: RefCell<Vec<&'static str>>,
+        unmount_error: Option<&'static str>,
     }
 
     impl RecordingNamespaceCollisionDriver {
@@ -2705,15 +2715,28 @@ mod tests {
             Self {
                 clients,
                 actions: RefCell::new(Vec::new()),
+                unmount_error: None,
             }
+        }
+
+        fn with_unmount_error(mut self, error: &'static str) -> Self {
+            self.unmount_error = Some(error);
+            self
         }
 
         fn replicate_from_first_client(&self) -> Result<(), ScenarioError> {
             let source = &self.clients[0].mount_point;
+            let mut errors = Vec::new();
             for client in self.clients.iter().skip(1) {
-                replace_dir_contents(source, &client.mount_point)?;
+                if let Err(error) = replace_dir_contents(source, &client.mount_point) {
+                    errors.push(format!("{}: {error}", client.name));
+                }
             }
-            Ok(())
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(ScenarioError::ReplicationFailure { errors })
+            }
         }
     }
 
@@ -2770,6 +2793,9 @@ mod tests {
 
         fn unmount_all(&mut self) -> Result<(), ScenarioError> {
             self.actions.borrow_mut().push("unmount_all");
+            if let Some(error) = self.unmount_error {
+                return Err(ScenarioError::Io(std::io::Error::other(error)));
+            }
             Ok(())
         }
     }
@@ -2897,6 +2923,69 @@ mod tests {
                 .scenario_dir
                 .join("namespace-collision-summary.json")
                 .exists()
+        );
+    }
+
+    #[test]
+    fn namespace_collision_preserves_primary_error_when_unmount_also_fails() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(COLLISION_RENAME_VS_UNLINK);
+        let mut driver =
+            RecordingNamespaceCollisionDriver::new(Vec::new()).with_unmount_error("umount failed");
+        let context = ScenarioContext {
+            run_id: "run-1".to_string(),
+            seed: 328,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+
+        let err = run_namespace_collision_with_driver(
+            &context,
+            NamespaceCollisionKind::RenameVsUnlink,
+            &mut driver,
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+        )
+        .unwrap_err();
+
+        let message = err.to_string();
+        assert!(matches!(
+            err,
+            ScenarioError::NamespaceCollisionUnmountAfterFailure { .. }
+        ));
+        assert!(message.contains("requires at least 3 clients"));
+        assert!(message.contains("umount failed"));
+    }
+
+    #[test]
+    fn namespace_collision_recording_replication_collects_errors_after_all_clients() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let source_mount = temp.path().join("mounts").join("client-a");
+        let bad_mount = temp.path().join("mounts").join("client-b");
+        let copied_mount = temp.path().join("mounts").join("client-c");
+        std::fs::create_dir_all(&source_mount).unwrap();
+        std::fs::write(source_mount.join("copied.txt"), b"payload").unwrap();
+        std::fs::create_dir_all(bad_mount.parent().unwrap()).unwrap();
+        std::fs::write(&bad_mount, b"not a directory").unwrap();
+        std::fs::create_dir_all(&copied_mount).unwrap();
+        let driver = RecordingNamespaceCollisionDriver::new(vec![
+            client_spec_for(&sandbox, "projectfs", "client-a", source_mount),
+            client_spec_for(&sandbox, "projectfs", "client-b", bad_mount),
+            client_spec_for(&sandbox, "projectfs", "client-c", copied_mount.clone()),
+        ]);
+
+        let err = driver.replicate_from_first_client().unwrap_err();
+
+        assert!(matches!(err, ScenarioError::ReplicationFailure { .. }));
+        assert_eq!(
+            std::fs::read(copied_mount.join("copied.txt")).unwrap(),
+            b"payload"
         );
     }
 
