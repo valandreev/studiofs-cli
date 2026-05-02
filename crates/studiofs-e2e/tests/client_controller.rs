@@ -171,6 +171,35 @@ fn bootstrap_workflow_can_clean_stale_local_metadata_before_cli_commands() {
 }
 
 #[test]
+fn bootstrap_workflow_reports_local_metadata_cleanup_failures_with_client_path() {
+    let temp = tempdir().unwrap();
+    let metadata_path = temp
+        .path()
+        .join("run-1")
+        .join("artifacts")
+        .join("clients")
+        .join("client-a")
+        .join("client-root")
+        .join("meta")
+        .join("projectfs");
+    std::fs::create_dir_all(metadata_path.parent().unwrap()).unwrap();
+    std::fs::write(&metadata_path, "not a directory").unwrap();
+    let mut controller =
+        MultiClientController::new(test_config(temp.path()), RecordingExecutor::new());
+
+    let err = controller
+        .bootstrap_volume(VolumeBootstrapOptions {
+            client_names: vec!["client-a".to_string()],
+            clean_existing_local_metadata: true,
+        })
+        .unwrap_err();
+
+    let message = err.to_string();
+    assert!(message.contains("client-a"));
+    assert!(message.contains(&metadata_path.display().to_string()));
+}
+
+#[test]
 fn compose_service_config_derives_unique_volume_and_docker_endpoints() {
     let temp = tempdir().unwrap();
     let config = ClientControllerConfig::from_compose_services(
@@ -195,6 +224,37 @@ fn compose_service_config_derives_unique_volume_and_docker_endpoints() {
     assert_eq!(config.s3.bucket, "studiofs-e2e-run-1-20260502");
     assert_eq!(config.s3.access_key, "rustfsadmin");
     assert_eq!(config.s3.secret_key, "rustfsadmin");
+}
+
+#[test]
+fn compose_service_config_keeps_bucket_name_within_s3_length_limit() {
+    let temp = tempdir().unwrap();
+    let config = ClientControllerConfig::from_compose_services(
+        Path::new("studiofs-test-bin").to_path_buf(),
+        temp.path().join("run-1"),
+        "Run_1.20260502.with.an.extremely.long.unique.identifier.for.parallel-ci-workers",
+        321,
+        &[
+            service_port("postgres", 35432),
+            service_port("rustfs", 39000),
+        ],
+    )
+    .unwrap();
+
+    assert!(config.s3.bucket.len() <= 63, "{}", config.s3.bucket);
+    assert!(
+        config
+            .s3
+            .bucket
+            .starts_with(|ch: char| ch.is_ascii_alphanumeric())
+    );
+    assert!(
+        config
+            .s3
+            .bucket
+            .ends_with(|ch: char| ch.is_ascii_alphanumeric())
+    );
+    assert!(config.volume_name.len() <= 63, "{}", config.volume_name);
 }
 
 #[test]

@@ -5,7 +5,9 @@ use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
-use std::{collections::HashSet, ffi::OsString};
+use std::{
+    collections::HashSet, collections::hash_map::DefaultHasher, ffi::OsString, hash::Hasher,
+};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -16,6 +18,9 @@ pub const DEFAULT_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c", 
 #[cfg(windows)]
 const DEFAULT_WINDOWS_MOUNT_LETTERS: &[char] = &['Z', 'Y', 'X', 'W'];
 const MAX_COMMAND_OUTPUT_CHARS: usize = 4096;
+const S3_BUCKET_NAME_MAX_CHARS: usize = 63;
+const E2E_BUCKET_PREFIX: &str = "studiofs-e2e-";
+const E2E_VOLUME_PREFIX: &str = "sfs-e2e-";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientControllerConfig {
@@ -41,17 +46,27 @@ impl ClientControllerConfig {
         let postgres = service_port(ports, "postgres")?;
         let rustfs = service_port(ports, "rustfs")?;
         let sanitized_run_id = sanitize_dns_label(run_id);
+        let bucket = prefixed_dns_name(
+            E2E_BUCKET_PREFIX,
+            &sanitized_run_id,
+            S3_BUCKET_NAME_MAX_CHARS,
+        );
+        let volume_stem = prefixed_dns_name(
+            E2E_VOLUME_PREFIX,
+            &format!("{sanitized_run_id}-{seed}"),
+            S3_BUCKET_NAME_MAX_CHARS,
+        );
         Ok(Self {
             studiofs_bin,
             sandbox,
-            volume_name: format!("sfs-e2e-{sanitized_run_id}-{seed}"),
+            volume_name: volume_stem,
             meta_dsn: format!(
                 "postgres://studiofs:studiofs@{}:{}",
                 postgres.host, postgres.host_port
             ),
             s3: S3Config {
                 endpoint: format!("http://{}:{}", rustfs.host, rustfs.host_port),
-                bucket: format!("studiofs-e2e-{sanitized_run_id}"),
+                bucket,
                 access_key: "rustfsadmin".to_string(),
                 secret_key: "rustfsadmin".to_string(),
                 region: "us-east-1".to_string(),
@@ -248,6 +263,12 @@ pub enum ClientControllerError {
     MissingLocalMetadataDb { client: String, path: PathBuf },
     #[error("E2E local metadata DB path is shared by multiple clients: {0}")]
     DuplicateLocalMetadataDb(PathBuf),
+    #[error("failed to clean local metadata for E2E client {client} at {path}: {source}")]
+    CleanLocalMetadataFailed {
+        client: String,
+        path: PathBuf,
+        source: io::Error,
+    },
     #[error("client controller I/O failed: {0}")]
     Io(#[from] io::Error),
 }
@@ -426,7 +447,13 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         for runtime in &self.clients {
             let path = &runtime.spec.local_metadata_dir;
             if path.exists() {
-                fs::remove_dir_all(path)?;
+                fs::remove_dir_all(path).map_err(|source| {
+                    ClientControllerError::CleanLocalMetadataFailed {
+                        client: runtime.spec.name.clone(),
+                        path: path.clone(),
+                        source,
+                    }
+                })?;
             }
         }
         Ok(())
@@ -824,6 +851,24 @@ fn sanitize_dns_label(value: &str) -> String {
     } else {
         sanitized
     }
+}
+
+fn prefixed_dns_name(prefix: &str, stem: &str, max_chars: usize) -> String {
+    let mut name = format!("{prefix}{stem}");
+    if name.len() <= max_chars {
+        return name;
+    }
+
+    let mut hasher = DefaultHasher::new();
+    hasher.write(name.as_bytes());
+    let suffix = format!("-{:016x}", hasher.finish());
+    let keep = max_chars.saturating_sub(suffix.len());
+    name.truncate(keep);
+    while name.ends_with('-') {
+        name.pop();
+    }
+    name.push_str(&suffix);
+    name
 }
 
 fn write_mount_metadata(spec: &ClientSpec) -> Result<(), ClientControllerError> {
