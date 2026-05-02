@@ -95,7 +95,7 @@ tasks:
           path: target/e2e-runs
 
   - key: e2e-smoke
-    use: [e2e-preflight, build-studiofs]
+    use: [e2e-preflight, build-studiofs, linux-e2e-packages]
     docker: true
     run: |
       set -euo pipefail
@@ -161,6 +161,7 @@ tasks:
       PY
     env:
       RUSTFLAGS: "-Dwarnings"
+      RUST_BACKTRACE: "1"
     outputs:
       artifacts:
         - key: e2e-run

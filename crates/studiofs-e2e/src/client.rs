@@ -1024,13 +1024,19 @@ fn mount_point_is_active(path: &Path) -> io::Result<bool> {
 
 #[cfg(any(target_os = "linux", test))]
 fn mountinfo_contains_mount_point(mountinfo: &str, path: &Path) -> bool {
-    let expected = path.to_string_lossy();
     mountinfo.lines().any(|line| {
         let Some(encoded_mount_point) = line.split_whitespace().nth(4) else {
             return false;
         };
-        decode_mountinfo_path(encoded_mount_point) == expected
+        mountinfo_path_matches(&decode_mountinfo_path(encoded_mount_point), path)
     })
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn mountinfo_path_matches(decoded_mount_point: &str, expected: &Path) -> bool {
+    Path::new(decoded_mount_point)
+        .components()
+        .eq(expected.components())
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -1039,6 +1045,8 @@ fn decode_mountinfo_path(value: &str) -> String {
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
+        // Linux mountinfo path fields escape bytes as backslash plus three
+        // octal digits; see proc_pid_mountinfo(5).
         if bytes[index] == b'\\' && index + 3 < bytes.len() {
             let octal = &value[index + 1..index + 4];
             if octal.bytes().all(|byte| matches!(byte, b'0'..=b'7')) {
@@ -1179,6 +1187,16 @@ mod tests {
         let mountinfo = "\
 42 31 0:49 / / rw,relatime - overlay overlay rw\n\
 88 42 0:77 / /var/mint-workspace/target/e2e-runs/run\\040with\\040space/mount rw,nosuid,nodev - fuse.studiofs studiofs rw\n";
+
+        assert!(mountinfo_contains_mount_point(mountinfo, path));
+    }
+
+    #[test]
+    fn linux_mountinfo_fallback_ignores_trailing_slash_difference() {
+        let path = Path::new("/var/mint-workspace/target/e2e-runs/run/mount");
+        let mountinfo = "\
+42 31 0:49 / / rw,relatime - overlay overlay rw\n\
+88 42 0:77 / /var/mint-workspace/target/e2e-runs/run/mount/ rw,nosuid,nodev - fuse.studiofs studiofs rw\n";
 
         assert!(mountinfo_contains_mount_point(mountinfo, path));
     }
