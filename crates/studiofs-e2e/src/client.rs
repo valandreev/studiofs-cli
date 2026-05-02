@@ -825,6 +825,10 @@ fn client_env(client: &ClientSpec) -> Vec<(String, String)> {
             "STUDIOFS_DAEMON_LOG_STEM".to_string(),
             "studiofs-tracing".to_string(),
         ),
+        (
+            "STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS".to_string(),
+            "250".to_string(),
+        ),
     ]
 }
 

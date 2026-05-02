@@ -232,6 +232,7 @@ trait UploadPolicyPort: Clone + Send + Sync + 'static {
     fn clear_upload_sticky_error(&self, ino: Ino);
     fn debug_pending_inode_state(&self, ino: Ino, event: &'static str);
     async fn refresh_incarnation_state(&self, ino: Ino);
+    async fn finalize_completed_upload_epoch(&self, ino: Ino, content_epoch: u64);
 }
 
 #[derive(Clone)]
@@ -572,6 +573,9 @@ where
         self.coordinator.complete_upload(op);
 
         self.policy.refresh_incarnation_state(op.ino).await;
+        self.policy
+            .finalize_completed_upload_epoch(op.ino, op.content_epoch)
+            .await;
         self.policy.clear_upload_sticky_error(op.ino);
         self.policy
             .debug_pending_inode_state(op.ino, "upload_completed");
@@ -1289,6 +1293,13 @@ impl UploadPolicyPort for VfsUploadPolicyPort {
             self.vfs.clear_inode_incarnation(ino);
         }
     }
+
+    async fn finalize_completed_upload_epoch(&self, ino: Ino, content_epoch: u64) {
+        if self.vfs.shutdown_requested() || self.vfs.inode_has_pending_uploads(ino) {
+            return;
+        }
+        self.vfs.queue_epoch_finalization(ino, content_epoch);
+    }
 }
 
 #[derive(Clone)]
@@ -1529,6 +1540,11 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use studiofs_data::DataStoreConfig;
+    use studiofs_meta::schema::{CURRENT_FORMAT_VERSION, FormatInfo, MetadataConfig};
+    use studiofs_meta::{MetaFormat, RedbMetaEngine};
+    use tempfile::TempDir;
+    use tokio::runtime::Runtime;
 
     type FakePendingInodes = Arc<Mutex<HashSet<Ino>>>;
     type FakeProcessor = UploadProcessor<
@@ -1863,6 +1879,7 @@ mod tests {
         sticky_errors: Arc<Mutex<Vec<(Ino, String)>>>,
         quarantines: Arc<Mutex<Vec<(Ino, u64, String)>>>,
         refreshed: Arc<Mutex<Vec<Ino>>>,
+        finalized_upload_epochs: Arc<Mutex<Vec<(Ino, u64)>>>,
         invalid_graph: Arc<AtomicBool>,
     }
 
@@ -1890,12 +1907,64 @@ mod tests {
         async fn refresh_incarnation_state(&self, ino: Ino) {
             self.refreshed.lock().push(ino);
         }
+
+        async fn finalize_completed_upload_epoch(&self, ino: Ino, content_epoch: u64) {
+            self.finalized_upload_epochs
+                .lock()
+                .push((ino, content_epoch));
+        }
     }
 
     fn make_attr(ino: Ino, content_epoch: u64) -> InodeAttr {
         let mut attr = InodeAttr::new_file(ino, 1, 0, 0, 0o644);
         attr.content_epoch = content_epoch;
         attr
+    }
+
+    fn test_format_info(volume_suffix: &str) -> FormatInfo {
+        let volume_name = format!("upload-worker-{volume_suffix}-{}", std::process::id());
+        FormatInfo {
+            format_version: CURRENT_FORMAT_VERSION,
+            name: volume_name.clone(),
+            uuid: format!("upload-worker-uuid-{volume_suffix}"),
+            endpoint: "http://127.0.0.1:9000".into(),
+            bucket: "studiofs-test".into(),
+            access_key: "test".into(),
+            secret_key: "test".into(),
+            region: "us-east-1".into(),
+            data_prefix: format!("{volume_name}/objects/"),
+            metadata: MetadataConfig::default(),
+            block_size: 4 * 1024 * 1024,
+        }
+    }
+
+    fn make_unstarted_test_vfs(
+        tmp: &TempDir,
+        volume_suffix: &str,
+    ) -> (Arc<Runtime>, Arc<StudioVfs>, Arc<RedbMetaEngine>) {
+        let db_path = tmp.path().join("meta.redb");
+        let meta = Arc::new(RedbMetaEngine::open(&db_path).expect("open RedbMetaEngine"));
+        meta.init_root(0, 0).expect("init root");
+
+        let format_info = test_format_info(volume_suffix);
+        meta.set_format_info(&format_info).expect("set format info");
+        let data_config = DataStoreConfig::from(&format_info);
+
+        let cache_dir = tmp.path().join("cache");
+        let rt = Arc::new(Runtime::new().expect("runtime"));
+        let _guard = rt.enter();
+        let vfs = StudioVfs::new(
+            meta.clone(),
+            &data_config,
+            cache_dir.to_str().expect("cache dir str"),
+            64 * 1024 * 1024,
+            32 * 1024 * 1024,
+            crate::VfsConfig::default()
+                .try_into()
+                .expect("default VFS config should validate"),
+        )
+        .expect("create vfs");
+        (rt, vfs, meta)
     }
 
     fn processor_fixture() -> (
@@ -2047,6 +2116,81 @@ mod tests {
         assert_eq!(local_payloads.upload_hot_removed.lock().as_slice(), &[77]);
         assert_eq!(local_payloads.upload_stage_removed.lock().as_slice(), &[77]);
         assert_eq!(policy.refreshed.lock().as_slice(), &[11]);
+    }
+
+    #[tokio::test]
+    async fn process_upload_attempts_epoch_finalization_after_upload_completion() {
+        let (processor, _coordinator, _local_payloads, meta, _remote, _shutdown, policy) =
+            processor_fixture();
+        let op = make_pending_upload();
+        meta.attrs
+            .lock()
+            .insert(op.ino, Some(make_attr(op.ino, op.content_epoch)));
+        meta.overlay_objects
+            .lock()
+            .insert(op.ino, HashSet::from([op.object_id]));
+
+        let outcome = processor.process_upload(op.clone()).await;
+
+        assert_eq!(outcome, UploadOutcome::Completed);
+        assert_eq!(
+            *policy.finalized_upload_epochs.lock(),
+            vec![(op.ino, op.content_epoch)],
+            "completed uploads must immediately drive epoch finalization so crash-replayed data becomes peer-visible"
+        );
+    }
+
+    #[test]
+    fn vfs_policy_queues_finalization_only_after_last_pending_inode_upload() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "finalize-last-pending");
+        let ino = vfs
+            .create(1, b"multi-block-upload.bin", 0, 0, 0o644)
+            .expect("create test file")
+            .ino;
+        let content_epoch = 7;
+        vfs.cached_store()
+            .submit_upload(ino, 0, 7_101, content_epoch);
+        vfs.cached_store()
+            .submit_upload(ino, u64::from(vfs.block_size), 7_102, content_epoch);
+        let policy = VfsUploadPolicyPort { vfs: vfs.clone() };
+        let rt = Runtime::new().expect("test runtime");
+        let pending = vfs.pending_uploads_snapshot();
+        let first = pending
+            .iter()
+            .find(|op| op.object_id == 7_101)
+            .expect("first pending upload")
+            .clone();
+        let second = pending
+            .iter()
+            .find(|op| op.object_id == 7_102)
+            .expect("second pending upload")
+            .clone();
+
+        vfs.cached_store().complete_upload(&first);
+        rt.block_on(policy.finalize_completed_upload_epoch(ino, content_epoch));
+        assert!(
+            vfs.state
+                .upload
+                .pending_epoch_finalizations
+                .lock()
+                .is_empty(),
+            "finalization should wait until all pending uploads for the inode complete"
+        );
+
+        vfs.cached_store().complete_upload(&second);
+        rt.block_on(policy.finalize_completed_upload_epoch(ino, content_epoch));
+        assert_eq!(
+            vfs.state
+                .upload
+                .pending_epoch_finalizations
+                .lock()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![(ino, content_epoch)],
+            "the final pending upload should enqueue epoch finalization"
+        );
     }
 
     #[tokio::test]
