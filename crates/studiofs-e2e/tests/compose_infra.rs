@@ -119,11 +119,37 @@ fn compose_stack_lifecycle_collects_logs_and_tears_down_volumes() {
     stack.start(&executor).unwrap();
     stack.restart(&executor).unwrap();
     let log_path = stack.collect_logs(&executor).unwrap();
+    let diagnostics = stack.collect_optional_diagnostics(&executor).unwrap();
     stack.stop(&executor).unwrap();
     stack.teardown(&executor).unwrap();
 
     assert_eq!(
         std::fs::read_to_string(log_path).unwrap(),
+        "postgres ready\nrustfs ready\n"
+    );
+    assert_eq!(
+        diagnostics,
+        vec![
+            "postgres metadata dump".to_string(),
+            "rustfs object listing".to_string()
+        ]
+    );
+    assert_eq!(
+        std::fs::read_to_string(
+            temp.path()
+                .join("compose-lifecycle")
+                .join("artifacts/docker/postgres-schema.sql")
+        )
+        .unwrap(),
+        "postgres ready\nrustfs ready\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(
+            temp.path()
+                .join("compose-lifecycle")
+                .join("artifacts/docker/rustfs-object-listing.txt")
+        )
+        .unwrap(),
         "postgres ready\nrustfs ready\n"
     );
     let calls = executor.calls.borrow();
@@ -142,6 +168,20 @@ fn compose_stack_lifecycle_collects_logs_and_tears_down_volumes() {
     );
     assert!(calls.iter().any(|call| {
         call.args.contains(&"down".to_string()) && call.args.contains(&"--volumes".to_string())
+    }));
+    assert!(calls.iter().any(|call| {
+        call.args.contains(&"exec".to_string())
+            && call.args.contains(&"-T".to_string())
+            && call.args.contains(&"postgres".to_string())
+            && call.args.contains(&"pg_dump".to_string())
+    }));
+    assert!(calls.iter().any(|call| {
+        call.args.contains(&"exec".to_string())
+            && call.args.contains(&"-T".to_string())
+            && call.args.contains(&"rustfs".to_string())
+            && call
+                .args
+                .contains(&"find /data -mindepth 1 -maxdepth 8 -print | sort".to_string())
     }));
 }
 

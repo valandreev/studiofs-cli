@@ -288,6 +288,50 @@ impl DockerComposeStack {
         Ok(log_path)
     }
 
+    pub fn collect_optional_diagnostics(
+        &self,
+        executor: &dyn CommandExecutor,
+    ) -> Result<Vec<String>, InfraError> {
+        fs::create_dir_all(self.docker_artifact_dir())?;
+        let mut collected = Vec::new();
+        if self.collect_optional_command(
+            executor,
+            "postgres metadata dump",
+            &[
+                "exec",
+                "-T",
+                "postgres",
+                "pg_dump",
+                "--username",
+                "studiofs",
+                "--dbname",
+                "studiofs",
+                "--schema-only",
+            ],
+            "postgres-schema.sql",
+            "postgres-schema.stderr.log",
+        )? {
+            collected.push("postgres metadata dump".to_string());
+        }
+        if self.collect_optional_command(
+            executor,
+            "rustfs object listing",
+            &[
+                "exec",
+                "-T",
+                "rustfs",
+                "sh",
+                "-c",
+                "find /data -mindepth 1 -maxdepth 8 -print | sort",
+            ],
+            "rustfs-object-listing.txt",
+            "rustfs-object-listing.stderr.log",
+        )? {
+            collected.push("rustfs object listing".to_string());
+        }
+        Ok(collected)
+    }
+
     pub fn teardown(&self, executor: &dyn CommandExecutor) -> Result<(), InfraError> {
         let mut command = self.compose_command();
         command.args.extend([
@@ -301,6 +345,33 @@ impl DockerComposeStack {
             command,
         )?;
         Ok(())
+    }
+
+    fn collect_optional_command(
+        &self,
+        executor: &dyn CommandExecutor,
+        action: &str,
+        args: &[&str],
+        stdout_file: &str,
+        stderr_file: &str,
+    ) -> Result<bool, InfraError> {
+        let mut command = self.compose_command();
+        command
+            .args
+            .extend(args.iter().map(|arg| (*arg).to_string()));
+        let output = executor.run(&command)?;
+        let artifact_dir = self.docker_artifact_dir();
+        fs::write(artifact_dir.join(stderr_file), &output.stderr)?;
+        if output.status == 0 {
+            fs::write(artifact_dir.join(stdout_file), output.stdout)?;
+            Ok(true)
+        } else {
+            fs::write(
+                artifact_dir.join(stdout_file),
+                format!("{action} skipped: exit status {}\n", output.status),
+            )?;
+            Ok(false)
+        }
     }
 
     fn compose_command(&self) -> CommandSpec {

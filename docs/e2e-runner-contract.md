@@ -145,8 +145,26 @@ The following artifact names are required and stable:
 | `cleanup.json` | Cleanup actions attempted, skipped, and failed. |
 | `artifacts/docker/` | Docker compose file, service logs, and container inspect output when Docker is used. |
 | `artifacts/commands/` | Per-command stdout/stderr/status records for child commands. |
-| `artifacts/scenarios/<scenario-name>/` | Scenario-specific inputs, probes, and validation output. |
-| `artifacts/clients/<client>/` | Client root, mount metadata, mount logs, and post-run status snapshots. |
+| `artifacts/scenarios/<scenario-name>/` | Scenario-specific inputs, probes, `operations.ndjson`, and validation output. |
+| `artifacts/clients/<client>/` | Client root, mount metadata, mount stdout/stderr logs, structured tracing logs when emitted, and post-run status snapshots. |
+
+The final report lists all required top-level artifacts and recursively
+discovers files under `artifacts/` before writing `report.json`. This makes
+client logs, Docker logs, mounted tree snapshots, validator diffs, and
+scenario-specific diagnostics visible to CI uploaders without every scenario
+having to duplicate report-linking code.
+
+When Docker Compose infrastructure has started, cleanup collects best-effort
+diagnostics before teardown:
+
+| Artifact | Source |
+|---|---|
+| `artifacts/docker/compose.log` | `docker compose logs --no-color --timestamps` stdout for all services. |
+| `artifacts/docker/compose.stderr.log` | stderr from Docker Compose log collection. |
+| `artifacts/docker/postgres-schema.sql` | Optional PostgreSQL schema dump from the running `postgres` service. |
+| `artifacts/docker/postgres-schema.stderr.log` | stderr from optional PostgreSQL dump collection. |
+| `artifacts/docker/rustfs-object-listing.txt` | Optional RustFS `/data` object listing from the running `rustfs` service. |
+| `artifacts/docker/rustfs-object-listing.stderr.log` | stderr from optional RustFS listing collection. |
 
 ## Multi-Client Process Controller
 

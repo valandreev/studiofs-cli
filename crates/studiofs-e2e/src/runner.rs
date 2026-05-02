@@ -1,5 +1,6 @@
 //! Runner orchestration, sandbox creation, reports, and cleanup.
 
+use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -437,7 +438,7 @@ fn finish_run(input: FinishRunInput) -> Result<RunOutcome, RunnerError> {
         },
         preflight: input.preflight,
         scenarios: input.scenario_reports,
-        artifacts: required_artifacts(&input.scenario_outcomes),
+        artifacts: collect_report_artifacts(&input.sandbox, &input.scenario_outcomes)?,
         cleanup: input.cleanup,
     };
 
@@ -554,6 +555,10 @@ fn collect_compose_cleanup(
         Ok(_) => cleanup_actions.push("docker compose logs".to_string()),
         Err(err) => cleanup_errors.push(format!("docker compose logs: {err}")),
     }
+    match stack.collect_optional_diagnostics(executor) {
+        Ok(actions) => cleanup_actions.extend(actions),
+        Err(err) => cleanup_actions.push(format!("optional docker diagnostics skipped: {err}")),
+    }
     match stack.teardown(executor) {
         Ok(()) => {
             cleanup_actions.push("docker compose down --volumes --remove-orphans".to_string());
@@ -647,6 +652,12 @@ fn create_sandbox_layout(
         fs::create_dir_all(client_root_dir(sandbox, client))?;
         fs::create_dir_all(client_cache_dir(sandbox, client))?;
         fs::create_dir_all(client_mount_point(sandbox, client))?;
+        fs::write(
+            crate::client::client_stdout_log(sandbox, client),
+            "studiofs client stdout log reserved\n",
+        )?;
+        fs::write(crate::client::client_stderr_log(sandbox, client), "")?;
+        fs::write(crate::client::client_tracing_log(sandbox, client), "")?;
     }
     for scenario in scenarios {
         fs::create_dir_all(
@@ -712,15 +723,23 @@ fn run_scenario_lifecycle(
     let definition = scenario.definition();
     let started_at = timestamp();
     let started_instant = Instant::now();
+    let operation_log = context.scenario_dir.join("operations.ndjson");
+    let operation_artifact = scenario_artifact_path(definition.name, "operations.ndjson");
 
-    let result = run_scenario_body(events_path, run_id, scenario, context);
-    let cleanup_result = run_hook(events_path, run_id, definition.name, "cleanup", || {
-        scenario.cleanup(context)
-    });
+    let result = run_scenario_body(events_path, &operation_log, run_id, scenario, context);
+    let cleanup_result = run_hook(
+        events_path,
+        &operation_log,
+        run_id,
+        definition.name,
+        "cleanup",
+        || scenario.cleanup(context),
+    );
 
     match (result, cleanup_result) {
-        (Ok(artifacts), Ok(())) => {
+        (Ok(mut artifacts), Ok(())) => {
             let finished_at = timestamp();
+            artifacts.insert(0, operation_artifact);
             Ok(ScenarioLifecycleOutcome {
                 report: ScenarioReport {
                     name: definition.name.to_string(),
@@ -745,6 +764,7 @@ fn run_scenario_lifecycle(
             let primary_error = body_result.err().map(|err| err.to_string());
             let cleanup_error = cleanup_result.err().map(|err| err.to_string());
             let finished_at = timestamp();
+            let artifacts = vec![operation_artifact];
             Ok(ScenarioLifecycleOutcome {
                 report: ScenarioReport {
                     name: definition.name.to_string(),
@@ -757,7 +777,7 @@ fn run_scenario_lifecycle(
                     started_at,
                     finished_at,
                     duration_ms: duration_millis(started_instant),
-                    artifacts: Vec::new(),
+                    artifacts: artifacts.clone(),
                     error: primary_error,
                 },
                 outcome: ScenarioOutcome {
@@ -767,7 +787,7 @@ fn run_scenario_lifecycle(
                     } else {
                         ScenarioStatus::Passed
                     },
-                    artifacts: Vec::new(),
+                    artifacts,
                 },
                 cleanup_error,
             })
@@ -777,38 +797,52 @@ fn run_scenario_lifecycle(
 
 fn run_scenario_body(
     events_path: &Path,
+    operation_log: &Path,
     run_id: &str,
     scenario: &dyn scenario::Scenario,
     context: &ScenarioContext,
 ) -> Result<Vec<String>, RunnerError> {
     let definition = scenario.definition();
-    run_hook(events_path, run_id, definition.name, "setup", || {
-        scenario.setup(context)
-    })?;
-    run_hook(events_path, run_id, definition.name, "run", || {
-        scenario.run(context)
-    })?;
-    run_hook(events_path, run_id, definition.name, "validate", || {
-        scenario.validate(context)
-    })
+    run_hook(
+        events_path,
+        operation_log,
+        run_id,
+        definition.name,
+        "setup",
+        || scenario.setup(context),
+    )?;
+    run_hook(
+        events_path,
+        operation_log,
+        run_id,
+        definition.name,
+        "run",
+        || scenario.run(context),
+    )?;
+    run_hook(
+        events_path,
+        operation_log,
+        run_id,
+        definition.name,
+        "validate",
+        || scenario.validate(context),
+    )
 }
 
 fn run_hook<T>(
     events_path: &Path,
+    operation_log: &Path,
     run_id: &str,
     scenario: &str,
     hook: &str,
     f: impl FnOnce() -> Result<T, scenario::ScenarioError>,
 ) -> Result<T, RunnerError> {
     record_event(events_path, run_id, Some(scenario), hook, "started")?;
+    record_event(operation_log, run_id, Some(scenario), hook, "started")?;
     let result = f();
-    record_event(
-        events_path,
-        run_id,
-        Some(scenario),
-        hook,
-        if result.is_ok() { "finished" } else { "failed" },
-    )?;
+    let phase = if result.is_ok() { "finished" } else { "failed" };
+    record_event(events_path, run_id, Some(scenario), hook, phase)?;
+    record_event(operation_log, run_id, Some(scenario), hook, phase)?;
     Ok(result?)
 }
 
@@ -826,6 +860,9 @@ fn record_event(
         hook: hook.to_string(),
         phase: phase.to_string(),
     };
+    if let Some(parent) = events_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -833,6 +870,24 @@ fn record_event(
     serde_json::to_writer(&mut file, &record)?;
     file.write_all(b"\n")?;
     Ok(())
+}
+
+fn collect_report_artifacts(
+    sandbox: &Path,
+    scenarios: &[ScenarioOutcome],
+) -> Result<Vec<ArtifactReport>, RunnerError> {
+    let mut artifacts = Vec::new();
+    let mut seen = BTreeSet::new();
+    for artifact in required_artifacts(scenarios) {
+        add_artifact(&mut artifacts, &mut seen, artifact);
+    }
+    collect_existing_artifacts(
+        sandbox,
+        &sandbox.join("artifacts"),
+        &mut artifacts,
+        &mut seen,
+    )?;
+    Ok(artifacts)
 }
 
 fn required_artifacts(scenarios: &[ScenarioOutcome]) -> Vec<ArtifactReport> {
@@ -853,6 +908,16 @@ fn required_artifacts(scenarios: &[ScenarioOutcome]) -> Vec<ArtifactReport> {
             required: true,
         },
         ArtifactReport {
+            name: "stdout.log".to_string(),
+            path: "stdout.log".to_string(),
+            required: true,
+        },
+        ArtifactReport {
+            name: "stderr.log".to_string(),
+            path: "stderr.log".to_string(),
+            required: true,
+        },
+        ArtifactReport {
             name: "run.json".to_string(),
             path: "run.json".to_string(),
             required: true,
@@ -860,6 +925,11 @@ fn required_artifacts(scenarios: &[ScenarioOutcome]) -> Vec<ArtifactReport> {
         ArtifactReport {
             name: "preflight.json".to_string(),
             path: "preflight.json".to_string(),
+            required: true,
+        },
+        ArtifactReport {
+            name: "ports.json".to_string(),
+            path: "ports.json".to_string(),
             required: true,
         },
         ArtifactReport {
@@ -880,6 +950,48 @@ fn required_artifacts(scenarios: &[ScenarioOutcome]) -> Vec<ArtifactReport> {
     artifacts
 }
 
+fn collect_existing_artifacts(
+    sandbox: &Path,
+    dir: &Path,
+    artifacts: &mut Vec<ArtifactReport>,
+    seen: &mut BTreeSet<String>,
+) -> Result<(), RunnerError> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    let mut entries = fs::read_dir(dir)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.path());
+    for entry in entries {
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            collect_existing_artifacts(sandbox, &path, artifacts, seen)?;
+        } else if file_type.is_file() {
+            let relative = normalize_relative_path(&path, sandbox);
+            add_artifact(
+                artifacts,
+                seen,
+                ArtifactReport {
+                    name: artifact_name(&relative),
+                    path: relative,
+                    required: false,
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+fn add_artifact(
+    artifacts: &mut Vec<ArtifactReport>,
+    seen: &mut BTreeSet<String>,
+    artifact: ArtifactReport,
+) {
+    if seen.insert(artifact.path.clone()) {
+        artifacts.push(artifact);
+    }
+}
+
 fn artifact_name(path: &str) -> String {
     let normalized = path.replace('\\', "/");
     if normalized.trim_matches('/').is_empty() {
@@ -887,6 +999,19 @@ fn artifact_name(path: &str) -> String {
     } else {
         normalized
     }
+}
+
+fn scenario_artifact_path(scenario: &str, artifact: &str) -> String {
+    format!("artifacts/scenarios/{scenario}/{artifact}")
+}
+
+fn normalize_relative_path(path: &Path, root: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn write_log_files(sandbox: &Path) -> Result<(), RunnerError> {

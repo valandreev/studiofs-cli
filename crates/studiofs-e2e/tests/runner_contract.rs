@@ -104,9 +104,15 @@ fn run_creates_per_run_sandbox_manifest_report_and_validation_artifact() {
     assert_eq!(report["scenarios"][0]["seed"], 42);
     assert_eq!(report["scenarios"][0]["status"], "passed");
     assert!(report["scenarios"][0]["duration_ms"].is_number());
-    assert_eq!(
-        report["scenarios"][0]["artifacts"][0],
-        "artifacts/scenarios/basic-multi-client-smoke/validation.json"
+    let scenario_artifacts = report["scenarios"][0]["artifacts"].as_array().unwrap();
+    assert!(scenario_artifacts.iter().any(
+        |artifact| artifact == "artifacts/scenarios/basic-multi-client-smoke/operations.ndjson"
+    ));
+    assert!(
+        scenario_artifacts
+            .iter()
+            .any(|artifact| artifact
+                == "artifacts/scenarios/basic-multi-client-smoke/validation.json")
     );
     assert!(
         report["artifacts"]
@@ -120,6 +126,51 @@ fn run_creates_per_run_sandbox_manifest_report_and_validation_artifact() {
         read_json(sandbox.join("artifacts/scenarios/basic-multi-client-smoke/validation.json"));
     assert_eq!(validation["scenario"], "basic-multi-client-smoke");
     assert_eq!(validation["seed"], 42);
+}
+
+#[test]
+fn report_links_runner_scenario_and_client_diagnostic_artifacts() {
+    let temp = tempdir().unwrap();
+    let request = RunRequest {
+        root: temp.path().join("e2e-runs"),
+        run_id: Some("diagnostic-artifacts-run".to_string()),
+        scenarios: vec!["basic-multi-client-smoke".to_string()],
+        seed: 43,
+        studiofs_bin: None,
+        platform: PlatformSelection::Auto,
+        retention: RetentionPolicy::Always,
+        report: None,
+        port_range: None,
+        timeout: None,
+        infra: InfraMode::Disabled,
+    };
+
+    let outcome = studiofs_e2e::runner::run(request).unwrap();
+    let report = read_json(outcome.report_path);
+    let artifacts = report["artifacts"].as_array().unwrap();
+
+    for expected in [
+        "report.json",
+        "stdout.log",
+        "stderr.log",
+        "ports.json",
+        "artifacts/scenarios/basic-multi-client-smoke/operations.ndjson",
+        "artifacts/scenarios/basic-multi-client-smoke/validation.json",
+        "artifacts/clients/client-a/studiofs.stdout.log",
+        "artifacts/clients/client-a/studiofs.stderr.log",
+        "artifacts/clients/client-a/studiofs-tracing.log",
+    ] {
+        assert!(
+            artifacts
+                .iter()
+                .any(|artifact| artifact["path"] == expected),
+            "expected report artifact {expected}"
+        );
+    }
+    assert_eq!(
+        report["scenarios"][0]["artifacts"][0],
+        "artifacts/scenarios/basic-multi-client-smoke/operations.ndjson"
+    );
 }
 
 #[test]
