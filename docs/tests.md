@@ -138,6 +138,7 @@ cargo build -p studiofs
 cargo run -p studiofs-e2e -- run basic-multi-client-smoke --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run rustfs-outage-multi-client-recovery --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run mounted-client-crash-restart-recovery --studiofs-bin target\debug\studiofs.exe
+cargo run -p studiofs-e2e -- run collision-rename-vs-unlink --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- clean
 ```
 
@@ -158,7 +159,12 @@ convergence for both `after_local_durability_boundary` and
 `before_remote_publication_completes` modes. On Linux, crash-style remount
 attempts lazy stale FUSE mount cleanup before starting the replacement process;
 publication readiness is validated through mounted-tree convergence rather than
-private backend inspection.
+private backend inspection. The mounted namespace collision scenarios use three
+isolated clients and barrier-start conflicting operations covering
+rename/rename, rename/unlink, unlink/append, overwrite/read, mkdir/rmdir/create,
+and readdir/stat while mutations are in flight. The overwrite/read scenario
+records repeated read loops during the overwrite. Each collision run writes `operations.ndjson`,
+`namespace-collision-summary.json`, and `validation.json`.
 
 Focused runner skeleton check:
 
@@ -166,6 +172,7 @@ Focused runner skeleton check:
 cargo test -p studiofs-e2e --test runner_contract
 cargo test -p studiofs-e2e --test compose_infra
 cargo test -p studiofs-e2e --test mounted_tree_validator
+cargo test -p studiofs-e2e namespace_collision_records_operations_and_validates_three_client_convergence -- --exact --nocapture
 cargo test -p studiofs-e2e scenario::tests::crash_restart_recovery_runs_both_modes_reuses_client_root_and_converges -- --exact --nocapture
 cargo test -p studiofs-e2e --test client_controller force_kill_then_remount_reuses_same_client_root_without_graceful_umount -- --exact --nocapture
 ```

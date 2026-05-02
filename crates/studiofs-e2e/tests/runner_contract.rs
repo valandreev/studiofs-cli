@@ -58,6 +58,86 @@ fn list_scenarios_exposes_initial_basic_smoke_scenario() {
 }
 
 #[test]
+fn list_scenarios_exposes_namespace_collision_suite() {
+    let scenarios = studiofs_e2e::scenario::available_scenarios();
+    let names = scenarios
+        .iter()
+        .map(|scenario| scenario.name)
+        .collect::<Vec<_>>();
+
+    for expected in [
+        "collision-rename-vs-rename",
+        "collision-rename-vs-unlink",
+        "collision-unlink-vs-append",
+        "collision-overwrite-vs-read",
+        "collision-mkdir-rmdir-vs-create",
+        "collision-readdir-stat-during-mutation",
+    ] {
+        assert!(
+            names.contains(&expected),
+            "expected namespace collision scenario {expected}"
+        );
+    }
+}
+
+#[test]
+fn namespace_collision_scenario_disabled_run_writes_reproducible_artifacts() {
+    let temp = tempdir().unwrap();
+    let request = RunRequest {
+        root: temp.path().join("e2e-runs"),
+        run_id: Some("collision-contract-run".to_string()),
+        scenarios: vec!["collision-rename-vs-unlink".to_string()],
+        seed: 328,
+        studiofs_bin: None,
+        platform: PlatformSelection::Auto,
+        retention: RetentionPolicy::Always,
+        report: None,
+        port_range: None,
+        timeout: None,
+        infra: InfraMode::Disabled,
+    };
+
+    let outcome = studiofs_e2e::runner::run(request).unwrap();
+
+    assert_eq!(outcome.status, RunStatus::Passed);
+    assert_eq!(outcome.scenarios[0].name, "collision-rename-vs-unlink");
+    assert!(
+        outcome.scenarios[0].artifacts.contains(
+            &"artifacts/scenarios/collision-rename-vs-unlink/namespace-collision-summary.json"
+                .to_string()
+        )
+    );
+    assert!(
+        outcome.scenarios[0].artifacts.contains(
+            &"artifacts/scenarios/collision-rename-vs-unlink/validation.json".to_string()
+        )
+    );
+
+    let sandbox = temp.path().join("e2e-runs").join("collision-contract-run");
+    let summary =
+        read_json(sandbox.join(
+            "artifacts/scenarios/collision-rename-vs-unlink/namespace-collision-summary.json",
+        ));
+    assert_eq!(summary["scenario"], "collision-rename-vs-unlink");
+    assert_eq!(summary["clients"], 3);
+    assert!(
+        summary["operation_log"]
+            .as_str()
+            .unwrap()
+            .ends_with("operations.ndjson")
+    );
+
+    let operations = fs::read_to_string(
+        sandbox.join("artifacts/scenarios/collision-rename-vs-unlink/operations.ndjson"),
+    )
+    .unwrap();
+    assert!(operations.contains("\"client\""));
+    assert!(operations.contains("\"operation\""));
+    assert!(operations.contains("\"order\""));
+    assert!(operations.contains("\"result\""));
+}
+
+#[test]
 fn run_creates_per_run_sandbox_manifest_report_and_validation_artifact() {
     let temp = tempdir().unwrap();
     let request = RunRequest {

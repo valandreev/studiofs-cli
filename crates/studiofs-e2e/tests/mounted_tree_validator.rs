@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use studiofs_e2e::mounted_tree::{
     ClientMount, MountedTreeError, MountedTreeSnapshot, TreeEntry, TreeEntryKind,
-    compare_snapshots, snapshot_client_tree, wait_for_convergence, write_divergence_artifacts,
+    compare_snapshots, snapshot_client_tree, validate_namespace_invariants, wait_for_convergence,
+    write_divergence_artifacts,
 };
 use tempfile::tempdir;
 
@@ -66,6 +67,59 @@ fn comparison_requires_file_content_checksum_not_only_size() {
             .any(|difference| difference.path == "same-size.bin"
                 && difference.message.contains("checksum differs"))
     );
+}
+
+#[test]
+fn namespace_invariants_detect_duplicate_paths_missing_parents_and_resurrection() {
+    let snapshot = MountedTreeSnapshot {
+        schema_version: 1,
+        client: "client-a".to_string(),
+        mount_point: "/mnt/client-a".to_string(),
+        entries: vec![
+            TreeEntry {
+                path: "dir/file.txt".to_string(),
+                entry_type: TreeEntryKind::File,
+                size: Some(5),
+                modified_unix_ms: None,
+                checksum_sha256: Some("checksum-a".to_string()),
+                symlink_target: None,
+            },
+            TreeEntry {
+                path: "dup.txt".to_string(),
+                entry_type: TreeEntryKind::File,
+                size: Some(1),
+                modified_unix_ms: None,
+                checksum_sha256: Some("checksum-b".to_string()),
+                symlink_target: None,
+            },
+            TreeEntry {
+                path: "dup.txt".to_string(),
+                entry_type: TreeEntryKind::File,
+                size: Some(1),
+                modified_unix_ms: None,
+                checksum_sha256: Some("checksum-b".to_string()),
+                symlink_target: None,
+            },
+            TreeEntry {
+                path: "deleted.txt".to_string(),
+                entry_type: TreeEntryKind::File,
+                size: Some(7),
+                modified_unix_ms: None,
+                checksum_sha256: Some("checksum-c".to_string()),
+                symlink_target: None,
+            },
+        ],
+    };
+
+    let violations = validate_namespace_invariants(&snapshot, &["deleted.txt"]);
+    let messages = violations
+        .iter()
+        .map(|violation| violation.message.as_str())
+        .collect::<Vec<_>>();
+
+    assert!(messages.contains(&"duplicate canonical path"));
+    assert!(messages.contains(&"missing parent directory"));
+    assert!(messages.contains(&"unexpected resurrection"));
 }
 
 #[test]

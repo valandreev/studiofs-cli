@@ -1,6 +1,6 @@
 //! Mounted filesystem tree snapshots and convergence validation.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{self, Read as _};
@@ -78,6 +78,13 @@ pub struct TreeDifference {
     pub expected: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub actual: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamespaceInvariantViolation {
+    pub client: String,
+    pub path: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,6 +202,59 @@ pub fn compare_snapshots(snapshots: &[MountedTreeSnapshot]) -> TreeComparison {
         compared_clients,
         differences,
     }
+}
+
+pub fn validate_namespace_invariants(
+    snapshot: &MountedTreeSnapshot,
+    expected_absent_paths: &[&str],
+) -> Vec<NamespaceInvariantViolation> {
+    let mut violations = Vec::new();
+    let mut seen = BTreeSet::new();
+    let entry_paths = snapshot
+        .entries
+        .iter()
+        .map(|entry| entry.path.as_str())
+        .collect::<BTreeSet<_>>();
+    let directory_paths = snapshot
+        .entries
+        .iter()
+        .filter(|entry| entry.entry_type == TreeEntryKind::Directory)
+        .map(|entry| entry.path.as_str())
+        .collect::<BTreeSet<_>>();
+    let expected_absent = expected_absent_paths
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+
+    for entry in &snapshot.entries {
+        if !seen.insert(entry.path.as_str()) {
+            violations.push(NamespaceInvariantViolation {
+                client: snapshot.client.clone(),
+                path: entry.path.clone(),
+                message: "duplicate canonical path".to_string(),
+            });
+        }
+
+        if expected_absent.contains(entry.path.as_str()) {
+            violations.push(NamespaceInvariantViolation {
+                client: snapshot.client.clone(),
+                path: entry.path.clone(),
+                message: "unexpected resurrection".to_string(),
+            });
+        }
+
+        if let Some(parent) = parent_path(&entry.path) {
+            if !entry_paths.contains(parent) || !directory_paths.contains(parent) {
+                violations.push(NamespaceInvariantViolation {
+                    client: snapshot.client.clone(),
+                    path: entry.path.clone(),
+                    message: "missing parent directory".to_string(),
+                });
+            }
+        }
+    }
+
+    violations
 }
 
 pub fn write_divergence_artifacts(
@@ -353,6 +413,10 @@ fn entries_by_path(snapshot: &MountedTreeSnapshot) -> BTreeMap<&str, &TreeEntry>
         .iter()
         .map(|entry| (entry.path.as_str(), entry))
         .collect()
+}
+
+fn parent_path(path: &str) -> Option<&str> {
+    path.rsplit_once('/').map(|(parent, _)| parent)
 }
 
 fn compare_entry(
