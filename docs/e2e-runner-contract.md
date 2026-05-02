@@ -52,9 +52,9 @@ Required initial run flags and environment:
 
 | Flag | Contract |
 |---|---|
-| `basic-multi-client-smoke` | Positional shorthand for the initial placeholder smoke scenario. |
+| `basic-multi-client-smoke` | Positional shorthand for the mounted three-client happy-path smoke scenario. |
 | `--scenario <name>` | Repeatable. Initial accepted values are `basic-multi-client-smoke` and the `smoke` alias; later gates add convergence, outage, and collision names. |
-| `--studiofs-bin <path>` | Path to the product CLI under test. The initial placeholder scenario records but does not require it; real mount scenarios must require it. The runner may build it only when an explicit build flag is added. |
+| `--studiofs-bin <path>` | Path to the product CLI under test. Real mounted scenarios require it when `--infra compose` is used. The runner may build it only when an explicit build flag is added. |
 | `--root <path>` | Parent run directory. Defaults to `target/e2e-runs`. |
 | `--run-id <id>` | Optional stable run ID. If omitted, use an ISO-like UTC timestamp plus short random suffix. Explicit IDs must be safe single directory names: no separators, drive prefixes, traversal segments, leading dots, or other shell/path metacharacters. |
 | `--platform auto|linux-fuse|macos-fuse|windows-winfsp` | Mount backend selection. `auto` resolves from host OS and installed driver checks. |
@@ -187,6 +187,15 @@ same volume for additional clients with `studiofs discover`, spawns foreground
 mount readiness, and supports graceful `studiofs umount`, forced child-process
 kill, and restart/remount. Scenarios must use this controller rather than
 sharing one local metadata DB or falling back to direct VFS calls.
+
+`basic-multi-client-smoke` uses the first three default clients. It initializes
+one shared remote volume from `client-a`, discovers it from `client-b` and
+`client-c`, mounts all three clients, writes `studiofs-e2e-smoke.txt` through
+`client-a`'s mount point, waits for the mounted tree validator to observe the
+same file from all three mount points, writes `bootstrap-summary.json`,
+`smoke-summary.json`, and `validation.json`, and then unmounts the clients.
+The `--infra disabled` path remains limited to runner self-tests and writes only
+the skeleton validation artifact.
 
 ## Mounted Tree Convergence Validation
 

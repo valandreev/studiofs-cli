@@ -134,7 +134,8 @@ Initial runner commands:
 
 ```powershell
 cargo run -p studiofs-e2e -- list
-cargo run -p studiofs-e2e -- run basic-multi-client-smoke
+cargo build -p studiofs
+cargo run -p studiofs-e2e -- run basic-multi-client-smoke --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- clean
 ```
 
@@ -142,7 +143,10 @@ cargo run -p studiofs-e2e -- clean
 `docker/compose.e2e.yml` and includes PostgreSQL 18, RustFS, and a Toxiproxy
 placeholder. Use `--port-range <start-end>` to allocate deterministic
 project-scoped ports for concurrent local runs, or `--infra disabled` only for
-runner self-tests that must not touch Docker.
+runner self-tests that must not touch Docker. The basic mounted smoke scenario
+uses three isolated StudioFS clients, mounts each client separately, writes a
+small file through the first mount, and validates convergence through the public
+mounted trees.
 
 Focused runner skeleton check:
 

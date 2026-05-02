@@ -132,6 +132,8 @@ pub struct RunOutcome {
 pub enum RunnerError {
     #[error("unknown E2E scenario: {0}")]
     UnknownScenario(String),
+    #[error("E2E scenario {scenario} requires --studiofs-bin when --infra compose is used")]
+    MissingStudiofsBin { scenario: String },
     #[error("run ID must not be empty")]
     EmptyRunId,
     #[error("run ID must be a safe single directory name: {0}")]
@@ -192,6 +194,17 @@ pub fn run_with_executor(
         request.scenarios
     };
     let scenarios = resolve_scenarios(&scenario_names)?;
+    if request.infra == InfraMode::Compose && request.studiofs_bin.is_none() {
+        if let Some(definition) = scenarios
+            .iter()
+            .map(|resolved| resolved.definition)
+            .find(|definition| definition.requires_studiofs_bin)
+        {
+            return Err(RunnerError::MissingStudiofsBin {
+                scenario: definition.name.to_string(),
+            });
+        }
+    }
     let sandbox = root.join(&run_id);
     let selected_platform = request.platform.resolved().to_string();
     let infra_mode = request.infra;
@@ -1195,6 +1208,7 @@ mod tests {
             scenario::ScenarioDefinition {
                 name: "failing-validate",
                 description: "test scenario",
+                requires_studiofs_bin: false,
             }
         }
 
@@ -1425,6 +1439,33 @@ mod tests {
     }
 
     #[test]
+    fn compose_basic_smoke_requires_product_binary() {
+        let temp = tempfile::tempdir().unwrap();
+        let executor = RecordingExecutor::default();
+
+        let err = run_with_executor(
+            RunRequest {
+                root: temp.path().join("e2e-runs"),
+                run_id: Some("missing-studiofs-bin".to_string()),
+                scenarios: vec![scenario::BASIC_MULTI_CLIENT_SMOKE.to_string()],
+                seed: 324,
+                studiofs_bin: None,
+                platform: PlatformSelection::Auto,
+                retention: RetentionPolicy::Always,
+                report: None,
+                port_range: Some("33200-33210".to_string()),
+                timeout: None,
+                infra: InfraMode::Compose,
+            },
+            &executor,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, RunnerError::MissingStudiofsBin { scenario }
+            if scenario == scenario::BASIC_MULTI_CLIENT_SMOKE));
+    }
+
+    #[test]
     fn run_with_compose_infra_waits_collects_logs_and_tears_down() {
         let temp = tempfile::tempdir().unwrap();
         let executor = RecordingExecutor::default();
@@ -1433,7 +1474,7 @@ mod tests {
             RunRequest {
                 root: temp.path().join("e2e-runs"),
                 run_id: Some("compose-runner-run".to_string()),
-                scenarios: vec![scenario::BASIC_MULTI_CLIENT_SMOKE.to_string()],
+                scenarios: vec![scenario::TEST_PASSING.to_string()],
                 seed: 319,
                 studiofs_bin: None,
                 platform: PlatformSelection::Auto,
@@ -1515,7 +1556,7 @@ mod tests {
             RunRequest {
                 root,
                 run_id: Some(run_id.to_string()),
-                scenarios: vec![scenario::BASIC_MULTI_CLIENT_SMOKE.to_string()],
+                scenarios: vec![scenario::TEST_PASSING.to_string()],
                 seed: 319,
                 studiofs_bin: None,
                 platform: PlatformSelection::Auto,
