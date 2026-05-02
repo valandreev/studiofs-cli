@@ -377,6 +377,43 @@ fn unmount_waits_for_mount_process_to_exit() {
 }
 
 #[test]
+fn force_kill_then_remount_reuses_same_client_root_without_graceful_umount() {
+    let temp = tempdir().unwrap();
+    let executor = RecordingExecutor::new();
+    let calls = Rc::clone(&executor.calls);
+    let killed = Rc::clone(&executor.killed);
+    let stale_remount_cleanups = Rc::clone(&executor.stale_remount_cleanups);
+    let mut controller = MultiClientController::new(test_config(temp.path()), executor);
+    controller.create_clients(["client-a", "client-b"]).unwrap();
+    controller.init_first_client().unwrap();
+    controller.discover_additional_clients().unwrap();
+    controller.mount_all().unwrap();
+    let original_root = controller.clients()[0].client_root.clone();
+
+    controller.force_kill("client-a").unwrap();
+    assert_eq!(controller.clients()[0].state, ClientLifecycleState::Killed);
+    controller.remount("client-a").unwrap();
+
+    let clients = controller.clients();
+    assert_eq!(clients[0].client_root, original_root);
+    assert_eq!(clients[0].state, ClientLifecycleState::Mounted);
+    assert_eq!(killed.get(), 1);
+    assert_eq!(stale_remount_cleanups.get(), 1);
+    let calls = calls.borrow();
+    let mount_calls = calls
+        .iter()
+        .filter(|call| call.client == "client-a" && call.action == "mount")
+        .collect::<Vec<_>>();
+    assert_eq!(mount_calls.len(), 2);
+    assert!(
+        !calls
+            .iter()
+            .any(|call| call.client == "client-a" && call.action == "umount"),
+        "abrupt crash recovery must not model a clean unmount"
+    );
+}
+
+#[test]
 fn mount_reports_process_exit_while_waiting_for_readiness() {
     let temp = tempdir().unwrap();
     let executor = RecordingExecutor {
@@ -442,6 +479,7 @@ fn command_failure_truncates_large_stdout_and_stderr() {
 struct RecordingExecutor {
     calls: Rc<RefCell<Vec<ClientCommand>>>,
     killed: Rc<Cell<usize>>,
+    stale_remount_cleanups: Rc<Cell<usize>>,
     readiness_calls: Rc<Cell<usize>>,
     process_wait_calls: Rc<Cell<usize>>,
     next_pid: Cell<u32>,
@@ -459,6 +497,7 @@ impl RecordingExecutor {
         Self {
             calls: Rc::new(RefCell::new(Vec::new())),
             killed: Rc::new(Cell::new(0)),
+            stale_remount_cleanups: Rc::new(Cell::new(0)),
             readiness_calls: Rc::new(Cell::new(0)),
             process_wait_calls: Rc::new(Cell::new(0)),
             next_pid: Cell::new(100),
@@ -518,6 +557,12 @@ impl ClientProcessExecutor for RecordingExecutor {
     fn is_mount_ready(&self, _command: &ClientCommand) -> io::Result<bool> {
         self.readiness_calls.set(self.readiness_calls.get() + 1);
         Ok(self.mount_ready.get())
+    }
+
+    fn cleanup_stale_mount_before_remount(&self, _command: &ClientCommand) -> io::Result<()> {
+        self.stale_remount_cleanups
+            .set(self.stale_remount_cleanups.get() + 1);
+        Ok(())
     }
 }
 

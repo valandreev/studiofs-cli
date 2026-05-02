@@ -137,6 +137,7 @@ cargo run -p studiofs-e2e -- list
 cargo build -p studiofs
 cargo run -p studiofs-e2e -- run basic-multi-client-smoke --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run rustfs-outage-multi-client-recovery --studiofs-bin target\debug\studiofs.exe
+cargo run -p studiofs-e2e -- run mounted-client-crash-restart-recovery --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- clean
 ```
 
@@ -150,7 +151,14 @@ small file through the first mount, and validates convergence through the public
 mounted trees. The RustFS/S3 outage scenario stops only the RustFS compose
 service, keeps accepted writes locally readable, verifies a peer does not see
 the new outage checksum before recovery, and reports upload recovery time plus
-final checksum convergence.
+final checksum convergence. The mounted client crash/restart scenario kills and
+remounts one mounted client with the same `STUDIOFS_CLIENT_ROOT`, verifies
+locally durable data remains readable after restart, and validates peer
+convergence for both `after_local_durability_boundary` and
+`before_remote_publication_completes` modes. On Linux, crash-style remount
+attempts lazy stale FUSE mount cleanup before starting the replacement process;
+publication readiness is validated through mounted-tree convergence rather than
+private backend inspection.
 
 Focused runner skeleton check:
 
@@ -158,6 +166,8 @@ Focused runner skeleton check:
 cargo test -p studiofs-e2e --test runner_contract
 cargo test -p studiofs-e2e --test compose_infra
 cargo test -p studiofs-e2e --test mounted_tree_validator
+cargo test -p studiofs-e2e scenario::tests::crash_restart_recovery_runs_both_modes_reuses_client_root_and_converges -- --exact --nocapture
+cargo test -p studiofs-e2e --test client_controller force_kill_then_remount_reuses_same_client_root_without_graceful_umount -- --exact --nocapture
 ```
 
 ## Platform-Gated Unit Tests

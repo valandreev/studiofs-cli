@@ -1,6 +1,7 @@
 //! Scenario registry and lifecycle hooks for mounted E2E runs.
 
 use std::fs;
+use std::fs::OpenOptions;
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -25,8 +26,10 @@ use crate::mounted_tree::{
 pub const BASIC_MULTI_CLIENT_SMOKE: &str = "basic-multi-client-smoke";
 pub const POSTGRES_OUTAGE_MULTI_CLIENT_RECOVERY: &str = "postgres-outage-multi-client-recovery";
 pub const RUSTFS_OUTAGE_MULTI_CLIENT_RECOVERY: &str = "rustfs-outage-multi-client-recovery";
+pub const MOUNTED_CLIENT_CRASH_RESTART_RECOVERY: &str = "mounted-client-crash-restart-recovery";
 const SMOKE_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
 const OUTAGE_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
+const CRASH_RESTART_CLIENT_NAMES: &[&str] = &["client-a", "client-b"];
 const SMOKE_FILE_NAME: &str = "studiofs-e2e-smoke.txt";
 const SMOKE_FILE_PAYLOAD: &[u8] = b"studiofs e2e mounted multi-client smoke\n";
 const SMOKE_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -38,6 +41,11 @@ const RUSTFS_OUTAGE_FILE_NAME: &str = "studiofs-e2e-rustfs-outage.txt";
 const RUSTFS_OUTAGE_INITIAL_PAYLOAD: &[u8] = b"initial healthy RustFS payload\n";
 const RUSTFS_OUTAGE_RECOVERED_PAYLOAD: &[u8] =
     b"initial healthy RustFS payload\naccepted local payload while RustFS is down\n";
+const CRASH_RESTART_LOCAL_DURABLE_FILE_NAME: &str = "studiofs-e2e-crash-after-local-durability.txt";
+const CRASH_RESTART_BEFORE_PUBLICATION_FILE_NAME: &str =
+    "studiofs-e2e-crash-before-remote-publication.txt";
+const CRASH_RESTART_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(60);
+const CRASH_RESTART_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 #[cfg(test)]
 pub(crate) const TEST_FAILING_VALIDATE: &str = "__test-failing-validate";
@@ -76,6 +84,10 @@ pub enum ScenarioError {
     PostgresOutageUnmountAfterFailure { primary: String, cleanup: String },
     #[error("RustFS/S3 outage scenario failed: {primary}; unmount also failed: {cleanup}")]
     RustfsOutageUnmountAfterFailure { primary: String, cleanup: String },
+    #[error(
+        "mounted client crash/restart scenario failed: {primary}; unmount also failed: {cleanup}"
+    )]
+    CrashRestartUnmountAfterFailure { primary: String, cleanup: String },
     #[error("mounted tree validation failed: {0}")]
     MountedTree(#[from] MountedTreeError),
     #[error("scenario infrastructure failed: {0}")]
@@ -92,6 +104,10 @@ pub enum ScenarioError {
     InsufficientMountedClients { expected: usize, actual: usize },
     #[error("PostgreSQL outage scenario requires at least {expected} clients, got {actual}")]
     InsufficientOutageClients { expected: usize, actual: usize },
+    #[error(
+        "mounted client crash/restart scenario requires at least {expected} clients, got {actual}"
+    )]
+    InsufficientCrashRestartClients { expected: usize, actual: usize },
 }
 
 pub trait Scenario {
@@ -107,6 +123,7 @@ pub fn available_scenarios() -> Vec<ScenarioDefinition> {
         BasicMultiClientSmoke.definition(),
         PostgresOutageMultiClientRecovery.definition(),
         RustfsOutageMultiClientRecovery.definition(),
+        MountedClientCrashRestartRecovery.definition(),
     ]
 }
 
@@ -118,6 +135,9 @@ pub(crate) fn resolve_scenario(name: &str) -> Option<Box<dyn Scenario>> {
         }
         RUSTFS_OUTAGE_MULTI_CLIENT_RECOVERY | "rustfs-outage" | "s3-outage" => {
             Some(Box::new(RustfsOutageMultiClientRecovery))
+        }
+        MOUNTED_CLIENT_CRASH_RESTART_RECOVERY | "client-crash-restart" | "crash-restart" => {
+            Some(Box::new(MountedClientCrashRestartRecovery))
         }
         #[cfg(test)]
         TEST_FAILING_VALIDATE => Some(Box::new(TestFailingScenario {
@@ -391,6 +411,83 @@ impl Scenario for RustfsOutageMultiClientRecovery {
                 "artifacts/scenarios/{RUSTFS_OUTAGE_MULTI_CLIENT_RECOVERY}/rustfs-outage-recovery-summary.json"
             ),
             format!("artifacts/scenarios/{RUSTFS_OUTAGE_MULTI_CLIENT_RECOVERY}/validation.json"),
+        ])
+    }
+
+    fn cleanup(&self, _context: &ScenarioContext) -> Result<(), ScenarioError> {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MountedClientCrashRestartRecovery;
+
+impl Scenario for MountedClientCrashRestartRecovery {
+    fn definition(&self) -> ScenarioDefinition {
+        ScenarioDefinition {
+            name: MOUNTED_CLIENT_CRASH_RESTART_RECOVERY,
+            description: "mounted multi-client crash/restart recovery scenario",
+            requires_studiofs_bin: true,
+        }
+    }
+
+    fn setup(&self, context: &ScenarioContext) -> Result<(), ScenarioError> {
+        fs::create_dir_all(&context.scenario_dir)?;
+        Ok(())
+    }
+
+    fn run(&self, context: &ScenarioContext) -> Result<(), ScenarioError> {
+        let Some(config) = &context.client_controller_config else {
+            return Err(ScenarioError::MissingComposeInfrastructure);
+        };
+        let mut driver = RealCrashRestartDriver(MultiClientController::new(
+            config.clone(),
+            SystemClientProcessExecutor,
+        ));
+        run_crash_restart_with_driver(
+            context,
+            &mut driver,
+            CRASH_RESTART_CONVERGENCE_TIMEOUT,
+            CRASH_RESTART_CONVERGENCE_POLL_INTERVAL,
+        )?;
+        Ok(())
+    }
+
+    fn validate(&self, context: &ScenarioContext) -> Result<Vec<String>, ScenarioError> {
+        let summary_path = context
+            .scenario_dir
+            .join("crash-restart-recovery-summary.json");
+        if !summary_path.exists() {
+            return Err(ScenarioError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("missing summary artifact: {}", summary_path.display()),
+            )));
+        }
+        let summary: CrashRestartRecoverySummary =
+            serde_json::from_slice(&fs::read(&summary_path)?)?;
+        let validation = json!({
+            "scenario": MOUNTED_CLIENT_CRASH_RESTART_RECOVERY,
+            "run_id": context.run_id,
+            "seed": context.seed,
+            "status": if summary.modes.iter().all(|mode| mode.final_validator.converged) {
+                "passed"
+            } else {
+                "failed"
+            },
+            "modes": summary.modes,
+        });
+        fs::write(
+            context.scenario_dir.join("validation.json"),
+            serde_json::to_vec_pretty(&validation)?,
+        )?;
+        Ok(vec![
+            format!(
+                "artifacts/scenarios/{MOUNTED_CLIENT_CRASH_RESTART_RECOVERY}/operations.ndjson"
+            ),
+            format!(
+                "artifacts/scenarios/{MOUNTED_CLIENT_CRASH_RESTART_RECOVERY}/crash-restart-recovery-summary.json"
+            ),
+            format!("artifacts/scenarios/{MOUNTED_CLIENT_CRASH_RESTART_RECOVERY}/validation.json"),
         ])
     }
 
@@ -996,6 +1093,256 @@ fn write_rustfs_outage_operation(
     Ok(())
 }
 
+trait CrashRestartDriver {
+    fn bootstrap_volume(
+        &mut self,
+        options: VolumeBootstrapOptions,
+    ) -> Result<VolumeBootstrapSummary, ScenarioError>;
+    fn mount_all(&mut self) -> Result<(), ScenarioError>;
+    fn clients(&self) -> Vec<ClientSpec>;
+    fn force_kill(&mut self, client: &str) -> Result<(), ScenarioError>;
+    fn remount(&mut self, client: &str) -> Result<(), ScenarioError>;
+    fn unmount_all(&mut self) -> Result<(), ScenarioError>;
+}
+
+struct RealCrashRestartDriver(MultiClientController<SystemClientProcessExecutor>);
+
+impl CrashRestartDriver for RealCrashRestartDriver {
+    fn bootstrap_volume(
+        &mut self,
+        options: VolumeBootstrapOptions,
+    ) -> Result<VolumeBootstrapSummary, ScenarioError> {
+        Ok(self.0.bootstrap_volume(options)?)
+    }
+
+    fn mount_all(&mut self) -> Result<(), ScenarioError> {
+        Ok(self.0.mount_all()?)
+    }
+
+    fn clients(&self) -> Vec<ClientSpec> {
+        self.0.clients().into_iter().cloned().collect()
+    }
+
+    fn force_kill(&mut self, client: &str) -> Result<(), ScenarioError> {
+        Ok(self.0.force_kill(client)?)
+    }
+
+    fn remount(&mut self, client: &str) -> Result<(), ScenarioError> {
+        Ok(self.0.remount(client)?)
+    }
+
+    fn unmount_all(&mut self) -> Result<(), ScenarioError> {
+        Ok(self.0.unmount_all()?)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CrashRestartMode {
+    AfterLocalDurabilityBoundary,
+    BeforeRemotePublicationCompletes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CrashRestartModeSummary {
+    mode: CrashRestartMode,
+    restarted_client: String,
+    restart_client_root: String,
+    relative_path: String,
+    bytes: usize,
+    local_read_checksum_sha256: String,
+    peer_visible_before_convergence: Option<String>,
+    final_checksum_sha256: String,
+    restart_elapsed_ms: u128,
+    convergence_elapsed_ms: u128,
+    final_validator: TreeComparison,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CrashRestartRecoverySummary {
+    bootstrap: VolumeBootstrapSummary,
+    modes: Vec<CrashRestartModeSummary>,
+}
+
+fn run_crash_restart_with_driver(
+    context: &ScenarioContext,
+    driver: &mut dyn CrashRestartDriver,
+    convergence_timeout: Duration,
+    poll_interval: Duration,
+) -> Result<CrashRestartRecoverySummary, ScenarioError> {
+    let result = run_crash_restart_body(context, driver, convergence_timeout, poll_interval);
+    let unmount_result = driver.unmount_all();
+    match (result, unmount_result) {
+        (Ok(summary), Ok(())) => Ok(summary),
+        (Err(primary), Err(cleanup)) => Err(ScenarioError::CrashRestartUnmountAfterFailure {
+            primary: primary.to_string(),
+            cleanup: cleanup.to_string(),
+        }),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+fn run_crash_restart_body(
+    context: &ScenarioContext,
+    driver: &mut dyn CrashRestartDriver,
+    convergence_timeout: Duration,
+    poll_interval: Duration,
+) -> Result<CrashRestartRecoverySummary, ScenarioError> {
+    let bootstrap = driver.bootstrap_volume(VolumeBootstrapOptions {
+        client_names: CRASH_RESTART_CLIENT_NAMES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect(),
+        clean_existing_local_metadata: true,
+    })?;
+    write_bootstrap_summary(context, &bootstrap)?;
+
+    driver.mount_all()?;
+    let clients = driver.clients();
+    if clients.len() < CRASH_RESTART_CLIENT_NAMES.len() {
+        return Err(ScenarioError::InsufficientCrashRestartClients {
+            expected: CRASH_RESTART_CLIENT_NAMES.len(),
+            actual: clients.len(),
+        });
+    }
+
+    let modes = vec![
+        run_crash_restart_mode(
+            context,
+            driver,
+            &clients,
+            CrashRestartMode::AfterLocalDurabilityBoundary,
+            CRASH_RESTART_LOCAL_DURABLE_FILE_NAME,
+            b"accepted local durable payload before abrupt crash\n",
+            convergence_timeout,
+            poll_interval,
+        )?,
+        run_crash_restart_mode(
+            context,
+            driver,
+            &clients,
+            CrashRestartMode::BeforeRemotePublicationCompletes,
+            CRASH_RESTART_BEFORE_PUBLICATION_FILE_NAME,
+            b"accepted local payload killed before remote publication completes\n",
+            convergence_timeout,
+            poll_interval,
+        )?,
+    ];
+
+    let summary = CrashRestartRecoverySummary { bootstrap, modes };
+    fs::write(
+        context
+            .scenario_dir
+            .join("crash-restart-recovery-summary.json"),
+        serde_json::to_vec_pretty(&summary)?,
+    )?;
+    Ok(summary)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_crash_restart_mode(
+    context: &ScenarioContext,
+    driver: &mut dyn CrashRestartDriver,
+    clients: &[ClientSpec],
+    mode: CrashRestartMode,
+    relative_path: &str,
+    payload: &[u8],
+    convergence_timeout: Duration,
+    poll_interval: Duration,
+) -> Result<CrashRestartModeSummary, ScenarioError> {
+    let crashed = &clients[0];
+    write_local_durable_payload(crashed.mount_point.join(relative_path), payload)?;
+    let restart_started = Instant::now();
+    driver.force_kill(&crashed.name)?;
+    driver.remount(&crashed.name)?;
+    let local_read_checksum_sha256 =
+        bytes_sha256(&fs::read(crashed.mount_point.join(relative_path))?);
+    let restart_elapsed_ms = restart_started.elapsed().as_millis();
+
+    let convergence_started = Instant::now();
+    let peer_visible_before_convergence =
+        if mode == CrashRestartMode::BeforeRemotePublicationCompletes {
+            assert_peer_not_visible(&clients[1], relative_path, &local_read_checksum_sha256)?
+        } else {
+            None
+        };
+    let mounts = clients
+        .iter()
+        .take(CRASH_RESTART_CLIENT_NAMES.len())
+        .map(|client| ClientMount::new(client.name.clone(), client.mount_point.clone()))
+        .collect::<Vec<_>>();
+    let convergence = wait_for_convergence(
+        &mounts,
+        context
+            .scenario_dir
+            .join(format!("validation-{}", crash_restart_mode_slug(mode))),
+        convergence_timeout,
+        poll_interval,
+    )?;
+    let convergence_elapsed_ms = convergence_started.elapsed().as_millis();
+    let final_checksum_sha256 =
+        bytes_sha256(&fs::read(clients[1].mount_point.join(relative_path))?);
+
+    let summary = CrashRestartModeSummary {
+        mode,
+        restarted_client: crashed.name.clone(),
+        restart_client_root: crashed.client_root.display().to_string(),
+        relative_path: relative_path.to_string(),
+        bytes: payload.len(),
+        local_read_checksum_sha256,
+        peer_visible_before_convergence,
+        final_checksum_sha256,
+        restart_elapsed_ms,
+        convergence_elapsed_ms,
+        final_validator: convergence.comparison,
+    };
+    write_crash_restart_operation(context, &summary)?;
+    Ok(summary)
+}
+
+fn write_crash_restart_operation(
+    context: &ScenarioContext,
+    summary: &CrashRestartModeSummary,
+) -> Result<(), ScenarioError> {
+    let record = json!({
+        "scenario": MOUNTED_CLIENT_CRASH_RESTART_RECOVERY,
+        "mode": summary.mode,
+        "client": summary.restarted_client,
+        "path": summary.relative_path,
+        "bytes": summary.bytes,
+        "accepted": true,
+        "local_read_checksum_sha256": summary.local_read_checksum_sha256,
+        "peer_visible_before_convergence": summary.peer_visible_before_convergence,
+        "final_checksum_sha256": summary.final_checksum_sha256,
+    });
+    let mut log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(context.scenario_dir.join("operations.ndjson"))?;
+    serde_json::to_writer(&mut log, &record)?;
+    log.write_all(b"\n")?;
+    Ok(())
+}
+
+fn write_local_durable_payload(path: PathBuf, payload: &[u8]) -> Result<(), ScenarioError> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path)?;
+    file.write_all(payload)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn crash_restart_mode_slug(mode: CrashRestartMode) -> &'static str {
+    match mode {
+        CrashRestartMode::AfterLocalDurabilityBoundary => "after-local-durability-boundary",
+        CrashRestartMode::BeforeRemotePublicationCompletes => "before-remote-publication-completes",
+    }
+}
+
 fn bytes_sha256(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -1438,6 +1785,80 @@ mod tests {
         }
     }
 
+    struct RecordingCrashRestartDriver {
+        clients: Vec<ClientSpec>,
+        actions: RefCell<Vec<String>>,
+    }
+
+    impl RecordingCrashRestartDriver {
+        fn new(clients: Vec<ClientSpec>) -> Self {
+            Self {
+                clients,
+                actions: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl CrashRestartDriver for RecordingCrashRestartDriver {
+        fn bootstrap_volume(
+            &mut self,
+            options: VolumeBootstrapOptions,
+        ) -> Result<VolumeBootstrapSummary, ScenarioError> {
+            self.actions.borrow_mut().push("bootstrap".to_string());
+            assert_eq!(
+                options.client_names,
+                CRASH_RESTART_CLIENT_NAMES
+                    .iter()
+                    .copied()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            );
+            Ok(VolumeBootstrapSummary {
+                volume_name: "projectfs".to_string(),
+                init_client: CRASH_RESTART_CLIENT_NAMES[0].to_string(),
+                discovered_clients: CRASH_RESTART_CLIENT_NAMES[1..]
+                    .iter()
+                    .map(|name| (*name).to_string())
+                    .collect(),
+                clients: self
+                    .clients
+                    .iter()
+                    .map(|client| crate::client::ClientBootstrapRecord {
+                        name: client.name.clone(),
+                        local_metadata_db: client.local_metadata_db.clone(),
+                        state: ClientLifecycleState::Discovered,
+                    })
+                    .collect(),
+            })
+        }
+
+        fn mount_all(&mut self) -> Result<(), ScenarioError> {
+            self.actions.borrow_mut().push("mount_all".to_string());
+            Ok(())
+        }
+
+        fn clients(&self) -> Vec<ClientSpec> {
+            self.clients.clone()
+        }
+
+        fn force_kill(&mut self, client: &str) -> Result<(), ScenarioError> {
+            self.actions
+                .borrow_mut()
+                .push(format!("force_kill_{client}"));
+            Ok(())
+        }
+
+        fn remount(&mut self, client: &str) -> Result<(), ScenarioError> {
+            self.actions.borrow_mut().push(format!("remount_{client}"));
+            Ok(())
+        }
+
+        fn unmount_all(&mut self) -> Result<(), ScenarioError> {
+            self.actions.borrow_mut().push("unmount_all".to_string());
+            Ok(())
+        }
+    }
+
     #[test]
     fn mounted_smoke_reports_unmount_error_when_body_also_fails() {
         let temp = tempdir().unwrap();
@@ -1540,6 +1961,126 @@ mod tests {
         assert!(resolve_scenario(RUSTFS_OUTAGE_MULTI_CLIENT_RECOVERY).is_some());
         assert!(resolve_scenario("rustfs-outage").is_some());
         assert!(resolve_scenario("s3-outage").is_some());
+    }
+
+    #[test]
+    fn registry_exposes_mounted_client_crash_restart_recovery_scenario() {
+        let scenarios = available_scenarios();
+
+        assert!(scenarios.iter().any(|scenario| {
+            scenario.name == MOUNTED_CLIENT_CRASH_RESTART_RECOVERY
+                && scenario.requires_studiofs_bin
+                && scenario.description.contains("crash/restart")
+        }));
+        assert!(resolve_scenario(MOUNTED_CLIENT_CRASH_RESTART_RECOVERY).is_some());
+        assert!(resolve_scenario("client-crash-restart").is_some());
+        assert!(resolve_scenario("crash-restart").is_some());
+    }
+
+    #[test]
+    fn crash_restart_recovery_runs_both_modes_reuses_client_root_and_converges() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(MOUNTED_CLIENT_CRASH_RESTART_RECOVERY);
+        let clients = CRASH_RESTART_CLIENT_NAMES
+            .iter()
+            .copied()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(&mount).unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let source_mount = temp
+            .path()
+            .join("mounts")
+            .join(CRASH_RESTART_CLIENT_NAMES[0]);
+        let peer_mount = temp
+            .path()
+            .join("mounts")
+            .join(CRASH_RESTART_CLIENT_NAMES[1]);
+        thread::spawn(move || {
+            let files = [
+                CRASH_RESTART_LOCAL_DURABLE_FILE_NAME,
+                CRASH_RESTART_BEFORE_PUBLICATION_FILE_NAME,
+            ];
+            for file in files {
+                let source = source_mount.join(file);
+                for _ in 0..100 {
+                    if let Ok(payload) = std::fs::read(&source) {
+                        thread::sleep(Duration::from_millis(50));
+                        std::fs::write(peer_mount.join(file), &payload).unwrap();
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+        });
+        let original_client_root = clients[0].client_root.clone();
+        let mut driver = RecordingCrashRestartDriver::new(clients);
+        let context = ScenarioContext {
+            run_id: "run-1".to_string(),
+            seed: 327,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+
+        let summary = run_crash_restart_with_driver(
+            &context,
+            &mut driver,
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+
+        assert_eq!(summary.bootstrap.init_client, "client-a");
+        assert_eq!(summary.modes.len(), 2);
+        assert_eq!(
+            summary.modes[0].mode,
+            CrashRestartMode::AfterLocalDurabilityBoundary
+        );
+        assert_eq!(
+            summary.modes[1].mode,
+            CrashRestartMode::BeforeRemotePublicationCompletes
+        );
+        assert!(summary.modes.iter().all(|mode| {
+            mode.restart_client_root == original_client_root.display().to_string()
+                && mode.local_read_checksum_sha256 == mode.final_checksum_sha256
+                && mode.final_validator.converged
+        }));
+        assert!(summary.modes[0].peer_visible_before_convergence.is_none());
+        assert!(summary.modes[1].peer_visible_before_convergence.is_none());
+        assert_eq!(
+            driver.actions.borrow().as_slice(),
+            [
+                "bootstrap",
+                "mount_all",
+                "force_kill_client-a",
+                "remount_client-a",
+                "force_kill_client-a",
+                "remount_client-a",
+                "unmount_all",
+            ]
+        );
+
+        let summary_json: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                context
+                    .scenario_dir
+                    .join("crash-restart-recovery-summary.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(summary_json["modes"].as_array().unwrap().len(), 2);
+        let operations_log =
+            std::fs::read_to_string(context.scenario_dir.join("operations.ndjson")).unwrap();
+        assert!(operations_log.contains("after_local_durability_boundary"));
+        assert!(operations_log.contains("before_remote_publication_completes"));
     }
 
     #[test]

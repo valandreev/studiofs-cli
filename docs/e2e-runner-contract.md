@@ -33,6 +33,7 @@ cargo run -p studiofs-e2e -- list
 cargo run -p studiofs-e2e -- run basic-multi-client-smoke
 cargo run -p studiofs-e2e -- run postgres-outage-multi-client-recovery --studiofs-bin <path-to-studiofs>
 cargo run -p studiofs-e2e -- run rustfs-outage-multi-client-recovery --studiofs-bin <path-to-studiofs>
+cargo run -p studiofs-e2e -- run mounted-client-crash-restart-recovery --studiofs-bin <path-to-studiofs>
 cargo run -p studiofs-e2e -- clean
 ```
 
@@ -55,7 +56,7 @@ Required initial run flags and environment:
 | Flag | Contract |
 |---|---|
 | `basic-multi-client-smoke` | Positional shorthand for the mounted three-client happy-path smoke scenario. |
-| `--scenario <name>` | Repeatable. Accepted values include `basic-multi-client-smoke` (`smoke`), `postgres-outage-multi-client-recovery` (`postgres-outage`), and `rustfs-outage-multi-client-recovery` (`rustfs-outage`, `s3-outage`). Later gates add collision names. |
+| `--scenario <name>` | Repeatable. Accepted values include `basic-multi-client-smoke` (`smoke`), `postgres-outage-multi-client-recovery` (`postgres-outage`), `rustfs-outage-multi-client-recovery` (`rustfs-outage`, `s3-outage`), and `mounted-client-crash-restart-recovery` (`client-crash-restart`, `crash-restart`). Later gates add collision names. |
 | `--studiofs-bin <path>` | Path to the product CLI under test. Real mounted scenarios require it when `--infra compose` is used. The runner may build it only when an explicit build flag is added. |
 | `--root <path>` | Parent run directory. Defaults to `target/e2e-runs`. |
 | `--run-id <id>` | Optional stable run ID. If omitted, use an ISO-like UTC timestamp plus short random suffix. Explicit IDs must be safe single directory names: no separators, drive prefixes, traversal segments, leading dots, or other shell/path metacharacters. |
@@ -189,6 +190,11 @@ same volume for additional clients with `studiofs discover`, spawns foreground
 mount readiness, and supports graceful `studiofs umount`, forced child-process
 kill, and restart/remount. Scenarios must use this controller rather than
 sharing one local metadata DB or falling back to direct VFS calls.
+Crash-style remounts do not run `studiofs umount` for the killed client. On
+Linux, before spawning the replacement mount process, the controller attempts a
+lazy stale-mount cleanup for leftover FUSE mountpoints with `fusermount3 -u -z`,
+`fusermount -u -z`, or `umount -l`. Other platforms keep the existing remount
+path unless a platform-specific stale-mount cleanup is added.
 
 `basic-multi-client-smoke` uses the first three default clients. It initializes
 one shared remote volume from `client-a`, discovers it from `client-b` and
@@ -226,6 +232,31 @@ validator result in `rustfs-outage-recovery-summary.json`.
 `outage_duration_ms` covers the RustFS stopped window through the accepted
 local write/read boundary; the peer visibility probe runs after that boundary
 so peer I/O latency does not inflate the outage-duration metric.
+
+`mounted-client-crash-restart-recovery` uses at least two mounted clients with
+separate `STUDIOFS_CLIENT_ROOT` values. It writes accepted data through
+`client-a`, crosses an explicit local durability boundary with `fsync`, kills
+only the `client-a` mount process without running `studiofs umount`, remounts
+`client-a` with the same client root, verifies the durable data is still
+readable after restart, waits for upload/publication and peer convergence, and
+then validates matching mounted tree checksums from all clients. The scenario
+runs two modes in one invocation:
+
+- `after_local_durability_boundary`, which crashes immediately after the
+  documented local durability boundary is crossed.
+- `before_remote_publication_completes`, which crashes after local durability
+  but before the scenario waits for remote publication and peer convergence.
+
+The scenario writes `operations.ndjson`,
+`crash-restart-recovery-summary.json`, and `validation.json`. The summary
+records the restarted client, reused client root, per-mode local and final
+checksums, whether a peer saw any pre-convergence checksum in the
+`before_remote_publication_completes` mode, restart timing, convergence timing,
+and mounted tree validator result. Publication waiting is intentionally the
+public mounted-tree convergence loop; the scenario must not inspect private S3,
+PostgreSQL, VFS, cache, or redb state to decide success. It must not delete
+local metadata, rerun `discover`, or share one local metadata database between
+clients during recovery.
 
 ## Mounted Tree Convergence Validation
 

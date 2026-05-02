@@ -169,6 +169,9 @@ pub trait ClientProcessExecutor {
     fn run(&self, command: &ClientCommand) -> io::Result<ClientCommandOutput>;
     fn spawn(&self, command: &ClientCommand) -> io::Result<Box<dyn ClientProcess>>;
     fn is_mount_ready(&self, command: &ClientCommand) -> io::Result<bool>;
+    fn cleanup_stale_mount_before_remount(&self, _command: &ClientCommand) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -211,6 +214,10 @@ impl ClientProcessExecutor for SystemClientProcessExecutor {
 
     fn is_mount_ready(&self, command: &ClientCommand) -> io::Result<bool> {
         mount_point_is_active(&command.mount_point)
+    }
+
+    fn cleanup_stale_mount_before_remount(&self, command: &ClientCommand) -> io::Result<()> {
+        cleanup_stale_mount_before_remount(&command.mount_point)
     }
 }
 
@@ -408,6 +415,24 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         self.mount_index(index)
     }
 
+    pub fn force_kill(&mut self, client: &str) -> Result<(), ClientControllerError> {
+        let index = self.client_index(client)?;
+        if let Some(process) = self.clients[index].process.as_mut() {
+            process.kill()?;
+        }
+        self.clients[index].process = None;
+        self.clients[index].spec.process_id = None;
+        self.clients[index].spec.state = ClientLifecycleState::Killed;
+        Ok(())
+    }
+
+    pub fn remount(&mut self, client: &str) -> Result<(), ClientControllerError> {
+        let index = self.client_index(client)?;
+        let command = self.mount_command(index)?;
+        self.executor.cleanup_stale_mount_before_remount(&command)?;
+        self.mount_index(index)
+    }
+
     pub fn unmount_all(&mut self) -> Result<(), ClientControllerError> {
         for index in 0..self.clients.len() {
             self.unmount_index(index)?;
@@ -416,13 +441,13 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
     }
 
     pub fn force_kill_all(&mut self) -> Result<(), ClientControllerError> {
-        for runtime in &mut self.clients {
-            if let Some(process) = runtime.process.as_mut() {
+        for index in 0..self.clients.len() {
+            if let Some(process) = self.clients[index].process.as_mut() {
                 process.kill()?;
             }
-            runtime.process = None;
-            runtime.spec.process_id = None;
-            runtime.spec.state = ClientLifecycleState::Killed;
+            self.clients[index].process = None;
+            self.clients[index].spec.process_id = None;
+            self.clients[index].spec.state = ClientLifecycleState::Killed;
         }
         Ok(())
     }
@@ -980,6 +1005,64 @@ fn is_windows_drive_mount_point(path: &Path) -> bool {
 #[cfg(not(windows))]
 fn is_windows_drive_mount_point(_path: &Path) -> bool {
     false
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_stale_mount_before_remount(path: &Path) -> io::Result<()> {
+    match mount_point_is_active(path) {
+        Ok(false) => Ok(()),
+        Ok(true) => lazy_unmount_stale_mount(path, None),
+        Err(err) => lazy_unmount_stale_mount(path, Some(err)),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cleanup_stale_mount_before_remount(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn lazy_unmount_stale_mount(path: &Path, readiness_error: Option<io::Error>) -> io::Result<()> {
+    let attempts: &[(&str, &[&str])] = &[
+        ("fusermount3", &["-u", "-z"]),
+        ("fusermount", &["-u", "-z"]),
+        ("umount", &["-l"]),
+    ];
+    let mut diagnostics = Vec::new();
+    for (program, args) in attempts {
+        match Command::new(program).args(*args).arg(path).output() {
+            Ok(output) if output.status.success() => return Ok(()),
+            Ok(output) => diagnostics.push(format!(
+                "{} {} {} exited with {}; stderr: {}; stdout: {}",
+                program,
+                args.join(" "),
+                path.display(),
+                output.status.code().unwrap_or(-1),
+                diagnostic_excerpt(&String::from_utf8_lossy(&output.stderr)),
+                diagnostic_excerpt(&String::from_utf8_lossy(&output.stdout))
+            )),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => diagnostics.push(format!(
+                "{} was not found while cleaning stale mount {}",
+                program,
+                path.display()
+            )),
+            Err(err) => diagnostics.push(format!(
+                "{} failed while cleaning stale mount {}: {}",
+                program,
+                path.display(),
+                err
+            )),
+        }
+    }
+    let readiness = readiness_error
+        .map(|err| format!("; mount readiness check failed before cleanup: {err}"))
+        .unwrap_or_default();
+    Err(io::Error::other(format!(
+        "failed to lazily unmount stale mount point {}{}; attempts: {}",
+        path.display(),
+        readiness,
+        diagnostics.join(" | ")
+    )))
 }
 
 #[cfg(windows)]
