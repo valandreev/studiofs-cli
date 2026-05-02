@@ -34,6 +34,7 @@ cargo run -p studiofs-e2e -- run basic-multi-client-smoke
 cargo run -p studiofs-e2e -- run postgres-outage-multi-client-recovery --studiofs-bin <path-to-studiofs>
 cargo run -p studiofs-e2e -- run rustfs-outage-multi-client-recovery --studiofs-bin <path-to-studiofs>
 cargo run -p studiofs-e2e -- run mounted-client-crash-restart-recovery --studiofs-bin <path-to-studiofs>
+cargo run -p studiofs-e2e -- run collision-rename-vs-unlink --studiofs-bin <path-to-studiofs>
 cargo run -p studiofs-e2e -- clean
 ```
 
@@ -56,7 +57,7 @@ Required initial run flags and environment:
 | Flag | Contract |
 |---|---|
 | `basic-multi-client-smoke` | Positional shorthand for the mounted three-client happy-path smoke scenario. |
-| `--scenario <name>` | Repeatable. Accepted values include `basic-multi-client-smoke` (`smoke`), `postgres-outage-multi-client-recovery` (`postgres-outage`), `rustfs-outage-multi-client-recovery` (`rustfs-outage`, `s3-outage`), and `mounted-client-crash-restart-recovery` (`client-crash-restart`, `crash-restart`). Later gates add collision names. |
+| `--scenario <name>` | Repeatable. Accepted values include `basic-multi-client-smoke` (`smoke`), `postgres-outage-multi-client-recovery` (`postgres-outage`), `rustfs-outage-multi-client-recovery` (`rustfs-outage`, `s3-outage`), `mounted-client-crash-restart-recovery` (`client-crash-restart`, `crash-restart`), and the mounted namespace collision scenarios `collision-rename-vs-rename`, `collision-rename-vs-unlink`, `collision-unlink-vs-append`, `collision-overwrite-vs-read`, `collision-mkdir-rmdir-vs-create`, and `collision-readdir-stat-during-mutation`. |
 | `--studiofs-bin <path>` | Path to the product CLI under test. Real mounted scenarios require it when `--infra compose` is used. The runner may build it only when an explicit build flag is added. |
 | `--root <path>` | Parent run directory. Defaults to `target/e2e-runs`. |
 | `--run-id <id>` | Optional stable run ID. If omitted, use an ISO-like UTC timestamp plus short random suffix. Explicit IDs must be safe single directory names: no separators, drive prefixes, traversal segments, leading dots, or other shell/path metacharacters. |
@@ -257,6 +258,29 @@ public mounted-tree convergence loop; the scenario must not inspect private S3,
 PostgreSQL, VFS, cache, or redb state to decide success. It must not delete
 local metadata, rerun `discover`, or share one local metadata database between
 clients during recovery.
+
+Mounted namespace collision scenarios use the first three default clients
+against one shared remote volume. Each scenario establishes a bounded initial
+tree, starts conflicting operations from multiple clients through a shared
+barrier, writes every attempted operation to `operations.ndjson`, waits for
+mounted tree convergence, and writes `namespace-collision-summary.json` plus
+`validation.json`. Operation records include client, operation, path, result,
+error, timestamp, and deterministic order marker. The suite currently includes:
+
+- `collision-rename-vs-rename`
+- `collision-rename-vs-unlink`
+- `collision-unlink-vs-append`
+- `collision-overwrite-vs-read`
+- `collision-mkdir-rmdir-vs-create`
+- `collision-readdir-stat-during-mutation`
+
+Collision validation does not assume a specific winning operation unless a
+scenario explicitly defines an absent path, such as the original source path
+after rename collisions. Final validation requires all mounted clients to
+converge on the same public tree and rejects duplicate canonical paths, missing
+parent directories, unexpected resurrection, and checksum mismatch. The
+overwrite/read scenario records repeated read loops while another client
+overwrites the committed file version.
 
 ## Mounted Tree Convergence Validation
 

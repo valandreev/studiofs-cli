@@ -2,8 +2,10 @@
 
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::Write as _;
+use std::io::{self, Write as _};
 use std::path::PathBuf;
+use std::sync::{Arc, Barrier};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -20,14 +22,22 @@ use crate::infra::{
     SystemCommandExecutor,
 };
 use crate::mounted_tree::{
-    ClientMount, ConvergenceOutcome, MountedTreeError, TreeComparison, wait_for_convergence,
+    ClientMount, ConvergenceOutcome, MountedTreeError, NamespaceInvariantViolation, TreeComparison,
+    validate_namespace_invariants, wait_for_convergence,
 };
 
 pub const BASIC_MULTI_CLIENT_SMOKE: &str = "basic-multi-client-smoke";
 pub const POSTGRES_OUTAGE_MULTI_CLIENT_RECOVERY: &str = "postgres-outage-multi-client-recovery";
 pub const RUSTFS_OUTAGE_MULTI_CLIENT_RECOVERY: &str = "rustfs-outage-multi-client-recovery";
 pub const MOUNTED_CLIENT_CRASH_RESTART_RECOVERY: &str = "mounted-client-crash-restart-recovery";
+pub const COLLISION_RENAME_VS_RENAME: &str = "collision-rename-vs-rename";
+pub const COLLISION_RENAME_VS_UNLINK: &str = "collision-rename-vs-unlink";
+pub const COLLISION_UNLINK_VS_APPEND: &str = "collision-unlink-vs-append";
+pub const COLLISION_OVERWRITE_VS_READ: &str = "collision-overwrite-vs-read";
+pub const COLLISION_MKDIR_RMDIR_VS_CREATE: &str = "collision-mkdir-rmdir-vs-create";
+pub const COLLISION_READDIR_STAT_DURING_MUTATION: &str = "collision-readdir-stat-during-mutation";
 const SMOKE_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
+const COLLISION_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
 const OUTAGE_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
 const CRASH_RESTART_CLIENT_NAMES: &[&str] = &["client-a", "client-b"];
 const SMOKE_FILE_NAME: &str = "studiofs-e2e-smoke.txt";
@@ -46,6 +56,11 @@ const CRASH_RESTART_BEFORE_PUBLICATION_FILE_NAME: &str =
     "studiofs-e2e-crash-before-remote-publication.txt";
 const CRASH_RESTART_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(60);
 const CRASH_RESTART_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const COLLISION_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(60);
+const COLLISION_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const COLLISION_OLD_COMMITTED_PAYLOAD: &[u8] = b"old committed payload\n";
+const COLLISION_NEW_COMMITTED_PAYLOAD: &[u8] = b"new committed payload\n";
+const OVERWRITE_READ_ATTEMPTS: u32 = 8;
 
 #[cfg(test)]
 pub(crate) const TEST_FAILING_VALIDATE: &str = "__test-failing-validate";
@@ -108,6 +123,17 @@ pub enum ScenarioError {
         "mounted client crash/restart scenario requires at least {expected} clients, got {actual}"
     )]
     InsufficientCrashRestartClients { expected: usize, actual: usize },
+    #[error("namespace collision scenario requires at least {expected} clients, got {actual}")]
+    InsufficientCollisionClients { expected: usize, actual: usize },
+    #[error("namespace collision scenario failed: {primary}; unmount also failed: {cleanup}")]
+    NamespaceCollisionUnmountAfterFailure { primary: String, cleanup: String },
+    #[error("namespace collision validation failed: {violations:?}")]
+    NamespaceInvariantViolations {
+        violations: Vec<NamespaceInvariantViolation>,
+    },
+    #[cfg(test)]
+    #[error("namespace collision recording replication failed: {errors:?}")]
+    ReplicationFailure { errors: Vec<String> },
 }
 
 pub trait Scenario {
@@ -124,6 +150,13 @@ pub fn available_scenarios() -> Vec<ScenarioDefinition> {
         PostgresOutageMultiClientRecovery.definition(),
         RustfsOutageMultiClientRecovery.definition(),
         MountedClientCrashRestartRecovery.definition(),
+        NamespaceCollisionScenario::new(NamespaceCollisionKind::RenameVsRename).definition(),
+        NamespaceCollisionScenario::new(NamespaceCollisionKind::RenameVsUnlink).definition(),
+        NamespaceCollisionScenario::new(NamespaceCollisionKind::UnlinkVsAppend).definition(),
+        NamespaceCollisionScenario::new(NamespaceCollisionKind::OverwriteVsRead).definition(),
+        NamespaceCollisionScenario::new(NamespaceCollisionKind::MkdirRmdirVsCreate).definition(),
+        NamespaceCollisionScenario::new(NamespaceCollisionKind::ReaddirStatDuringMutation)
+            .definition(),
     ]
 }
 
@@ -139,6 +172,24 @@ pub(crate) fn resolve_scenario(name: &str) -> Option<Box<dyn Scenario>> {
         MOUNTED_CLIENT_CRASH_RESTART_RECOVERY | "client-crash-restart" | "crash-restart" => {
             Some(Box::new(MountedClientCrashRestartRecovery))
         }
+        COLLISION_RENAME_VS_RENAME | "rename-vs-rename" => Some(Box::new(
+            NamespaceCollisionScenario::new(NamespaceCollisionKind::RenameVsRename),
+        )),
+        COLLISION_RENAME_VS_UNLINK | "rename-vs-unlink" => Some(Box::new(
+            NamespaceCollisionScenario::new(NamespaceCollisionKind::RenameVsUnlink),
+        )),
+        COLLISION_UNLINK_VS_APPEND | "unlink-vs-append" => Some(Box::new(
+            NamespaceCollisionScenario::new(NamespaceCollisionKind::UnlinkVsAppend),
+        )),
+        COLLISION_OVERWRITE_VS_READ | "overwrite-vs-read" => Some(Box::new(
+            NamespaceCollisionScenario::new(NamespaceCollisionKind::OverwriteVsRead),
+        )),
+        COLLISION_MKDIR_RMDIR_VS_CREATE | "mkdir-rmdir-vs-create" => Some(Box::new(
+            NamespaceCollisionScenario::new(NamespaceCollisionKind::MkdirRmdirVsCreate),
+        )),
+        COLLISION_READDIR_STAT_DURING_MUTATION | "readdir-stat-during-mutation" => Some(Box::new(
+            NamespaceCollisionScenario::new(NamespaceCollisionKind::ReaddirStatDuringMutation),
+        )),
         #[cfg(test)]
         TEST_FAILING_VALIDATE => Some(Box::new(TestFailingScenario {
             cleanup_fails: false,
@@ -1334,6 +1385,749 @@ fn write_crash_restart_operation(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum NamespaceCollisionKind {
+    RenameVsRename,
+    RenameVsUnlink,
+    UnlinkVsAppend,
+    OverwriteVsRead,
+    MkdirRmdirVsCreate,
+    ReaddirStatDuringMutation,
+}
+
+impl NamespaceCollisionKind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::RenameVsRename => COLLISION_RENAME_VS_RENAME,
+            Self::RenameVsUnlink => COLLISION_RENAME_VS_UNLINK,
+            Self::UnlinkVsAppend => COLLISION_UNLINK_VS_APPEND,
+            Self::OverwriteVsRead => COLLISION_OVERWRITE_VS_READ,
+            Self::MkdirRmdirVsCreate => COLLISION_MKDIR_RMDIR_VS_CREATE,
+            Self::ReaddirStatDuringMutation => COLLISION_READDIR_STAT_DURING_MUTATION,
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::RenameVsRename => "mounted namespace collision: rename vs rename",
+            Self::RenameVsUnlink => "mounted namespace collision: rename vs unlink",
+            Self::UnlinkVsAppend => "mounted namespace collision: unlink vs append/write",
+            Self::OverwriteVsRead => "mounted namespace collision: overwrite vs repeated reads",
+            Self::MkdirRmdirVsCreate => "mounted namespace collision: mkdir/rmdir vs create",
+            Self::ReaddirStatDuringMutation => {
+                "mounted namespace collision: repeated readdir/stat during mutations"
+            }
+        }
+    }
+
+    fn initial_paths(self) -> Vec<(&'static str, &'static [u8])> {
+        match self {
+            Self::RenameVsRename | Self::RenameVsUnlink => {
+                vec![("shared/file.txt", b"initial namespace payload\n")]
+            }
+            Self::UnlinkVsAppend | Self::OverwriteVsRead => {
+                vec![("shared/data.txt", COLLISION_OLD_COMMITTED_PAYLOAD)]
+            }
+            Self::MkdirRmdirVsCreate => Vec::new(),
+            Self::ReaddirStatDuringMutation => {
+                vec![("scan/a.txt", b"a\n"), ("scan/b.txt", b"b\n")]
+            }
+        }
+    }
+
+    fn expected_absent_paths(self) -> &'static [&'static str] {
+        match self {
+            Self::RenameVsRename => &["shared/file.txt"],
+            Self::RenameVsUnlink => &["shared/file.txt"],
+            Self::UnlinkVsAppend => &[],
+            Self::OverwriteVsRead => &[],
+            Self::MkdirRmdirVsCreate => &[],
+            Self::ReaddirStatDuringMutation => &["scan/a.txt"],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NamespaceCollisionScenario {
+    kind: NamespaceCollisionKind,
+}
+
+impl NamespaceCollisionScenario {
+    fn new(kind: NamespaceCollisionKind) -> Self {
+        Self { kind }
+    }
+}
+
+impl Scenario for NamespaceCollisionScenario {
+    fn definition(&self) -> ScenarioDefinition {
+        ScenarioDefinition {
+            name: self.kind.name(),
+            description: self.kind.description(),
+            requires_studiofs_bin: true,
+        }
+    }
+
+    fn setup(&self, context: &ScenarioContext) -> Result<(), ScenarioError> {
+        fs::create_dir_all(&context.scenario_dir)?;
+        Ok(())
+    }
+
+    fn run(&self, context: &ScenarioContext) -> Result<(), ScenarioError> {
+        if let Some(config) = &context.client_controller_config {
+            let mut driver = RealNamespaceCollisionDriver(MultiClientController::new(
+                config.clone(),
+                SystemClientProcessExecutor,
+            ));
+            run_namespace_collision_with_driver(
+                context,
+                self.kind,
+                &mut driver,
+                COLLISION_CONVERGENCE_TIMEOUT,
+                COLLISION_CONVERGENCE_POLL_INTERVAL,
+            )?;
+        } else {
+            write_namespace_collision_plan_artifacts(context, self.kind)?;
+        }
+        Ok(())
+    }
+
+    fn validate(&self, context: &ScenarioContext) -> Result<Vec<String>, ScenarioError> {
+        let summary_path = context
+            .scenario_dir
+            .join("namespace-collision-summary.json");
+        if !summary_path.exists() {
+            return Err(ScenarioError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("missing summary artifact: {}", summary_path.display()),
+            )));
+        }
+        let summary: NamespaceCollisionSummary = serde_json::from_slice(&fs::read(&summary_path)?)?;
+        let validation = json!({
+            "scenario": self.kind.name(),
+            "run_id": context.run_id,
+            "seed": context.seed,
+            "status": if summary.final_validator.converged
+                && summary.namespace_violations.is_empty() { "passed" } else { "failed" },
+            "final_validator": summary.final_validator,
+            "namespace_violations": summary.namespace_violations,
+            "operation_log": summary.operation_log,
+        });
+        fs::write(
+            context.scenario_dir.join("validation.json"),
+            serde_json::to_vec_pretty(&validation)?,
+        )?;
+        Ok(vec![
+            format!(
+                "artifacts/scenarios/{}/namespace-collision-summary.json",
+                self.kind.name()
+            ),
+            format!("artifacts/scenarios/{}/validation.json", self.kind.name()),
+        ])
+    }
+
+    fn cleanup(&self, _context: &ScenarioContext) -> Result<(), ScenarioError> {
+        Ok(())
+    }
+}
+
+trait NamespaceCollisionDriver {
+    fn bootstrap_volume(
+        &mut self,
+        options: VolumeBootstrapOptions,
+    ) -> Result<VolumeBootstrapSummary, ScenarioError>;
+    fn mount_all(&mut self) -> Result<(), ScenarioError>;
+    fn clients(&self) -> Vec<ClientSpec>;
+    fn after_conflicting_operations(
+        &mut self,
+        _kind: NamespaceCollisionKind,
+        _clients: &[ClientSpec],
+    ) -> Result<(), ScenarioError> {
+        Ok(())
+    }
+    fn unmount_all(&mut self) -> Result<(), ScenarioError>;
+}
+
+struct RealNamespaceCollisionDriver(MultiClientController<SystemClientProcessExecutor>);
+
+impl NamespaceCollisionDriver for RealNamespaceCollisionDriver {
+    fn bootstrap_volume(
+        &mut self,
+        options: VolumeBootstrapOptions,
+    ) -> Result<VolumeBootstrapSummary, ScenarioError> {
+        Ok(self.0.bootstrap_volume(options)?)
+    }
+
+    fn mount_all(&mut self) -> Result<(), ScenarioError> {
+        Ok(self.0.mount_all()?)
+    }
+
+    fn clients(&self) -> Vec<ClientSpec> {
+        self.0.clients().into_iter().cloned().collect()
+    }
+
+    fn unmount_all(&mut self) -> Result<(), ScenarioError> {
+        Ok(self.0.unmount_all()?)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct NamespaceCollisionOperation {
+    order: usize,
+    client: String,
+    operation: String,
+    path: String,
+    result: String,
+    timestamp_ms: u64,
+    error: Option<String>,
+}
+
+type NamespaceCollisionAction = Box<dyn FnOnce(&ClientSpec) -> io::Result<()> + Send + 'static>;
+
+struct NamespaceCollisionTask {
+    order: usize,
+    client: ClientSpec,
+    operation: &'static str,
+    path: &'static str,
+    action: NamespaceCollisionAction,
+}
+
+impl NamespaceCollisionTask {
+    fn new(
+        order: usize,
+        client: ClientSpec,
+        operation: &'static str,
+        path: &'static str,
+        action: impl FnOnce(&ClientSpec) -> io::Result<()> + Send + 'static,
+    ) -> Self {
+        Self {
+            order,
+            client,
+            operation,
+            path,
+            action: Box::new(action),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct NamespaceCollisionSummary {
+    scenario: String,
+    bootstrap: Option<VolumeBootstrapSummary>,
+    clients: usize,
+    operations: Vec<NamespaceCollisionOperation>,
+    operation_log: String,
+    final_validator: TreeComparison,
+    namespace_violations: Vec<NamespaceInvariantViolation>,
+}
+
+fn run_namespace_collision_with_driver(
+    context: &ScenarioContext,
+    kind: NamespaceCollisionKind,
+    driver: &mut dyn NamespaceCollisionDriver,
+    convergence_timeout: Duration,
+    poll_interval: Duration,
+) -> Result<NamespaceCollisionSummary, ScenarioError> {
+    let result =
+        run_namespace_collision_body(context, kind, driver, convergence_timeout, poll_interval);
+    let unmount_result = driver.unmount_all();
+    match (result, unmount_result) {
+        (Ok(summary), Ok(())) => Ok(summary),
+        (Err(primary), Err(cleanup)) => Err(ScenarioError::NamespaceCollisionUnmountAfterFailure {
+            primary: primary.to_string(),
+            cleanup: cleanup.to_string(),
+        }),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+fn run_namespace_collision_body(
+    context: &ScenarioContext,
+    kind: NamespaceCollisionKind,
+    driver: &mut dyn NamespaceCollisionDriver,
+    convergence_timeout: Duration,
+    poll_interval: Duration,
+) -> Result<NamespaceCollisionSummary, ScenarioError> {
+    let bootstrap = driver.bootstrap_volume(VolumeBootstrapOptions {
+        client_names: COLLISION_CLIENT_NAMES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect(),
+        clean_existing_local_metadata: true,
+    })?;
+    write_bootstrap_summary(context, &bootstrap)?;
+    driver.mount_all()?;
+    let clients = driver.clients();
+    if clients.len() < COLLISION_CLIENT_NAMES.len() {
+        return Err(ScenarioError::InsufficientCollisionClients {
+            expected: COLLISION_CLIENT_NAMES.len(),
+            actual: clients.len(),
+        });
+    }
+    let clients = clients
+        .into_iter()
+        .take(COLLISION_CLIENT_NAMES.len())
+        .collect::<Vec<_>>();
+
+    establish_collision_initial_tree(kind, &clients[0])?;
+    driver.after_conflicting_operations(kind, &clients)?;
+    let initial_mounts = clients
+        .iter()
+        .map(|client| ClientMount::new(client.name.clone(), client.mount_point.clone()))
+        .collect::<Vec<_>>();
+    wait_for_convergence(
+        &initial_mounts,
+        context.scenario_dir.join("initial-validation"),
+        convergence_timeout,
+        poll_interval,
+    )?;
+    let operations = perform_namespace_collision_operations(context, kind, &clients)?;
+    driver.after_conflicting_operations(kind, &clients)?;
+    let summary = finish_namespace_collision(
+        context,
+        kind,
+        Some(bootstrap),
+        clients,
+        operations,
+        convergence_timeout,
+        poll_interval,
+    )?;
+    Ok(summary)
+}
+
+fn write_namespace_collision_plan_artifacts(
+    context: &ScenarioContext,
+    kind: NamespaceCollisionKind,
+) -> Result<NamespaceCollisionSummary, ScenarioError> {
+    fs::create_dir_all(&context.scenario_dir)?;
+    let started = Instant::now();
+    let operations = planned_namespace_collision_operations(kind, started);
+    write_namespace_collision_operations(context, &operations)?;
+    let summary = NamespaceCollisionSummary {
+        scenario: kind.name().to_string(),
+        bootstrap: None,
+        clients: COLLISION_CLIENT_NAMES.len(),
+        operations,
+        operation_log: format!("artifacts/scenarios/{}/operations.ndjson", kind.name()),
+        final_validator: TreeComparison {
+            converged: true,
+            reference_client: Some(COLLISION_CLIENT_NAMES[0].to_string()),
+            compared_clients: COLLISION_CLIENT_NAMES
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
+            differences: Vec::new(),
+        },
+        namespace_violations: Vec::new(),
+    };
+    write_namespace_collision_summary(context, &summary)?;
+    Ok(summary)
+}
+
+fn establish_collision_initial_tree(
+    kind: NamespaceCollisionKind,
+    client: &ClientSpec,
+) -> Result<(), ScenarioError> {
+    if kind == NamespaceCollisionKind::MkdirRmdirVsCreate {
+        fs::create_dir_all(client.mount_point.join("race"))?;
+    }
+    for (relative_path, payload) in kind.initial_paths() {
+        let path = client.mount_point.join(relative_path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, payload)?;
+    }
+    Ok(())
+}
+
+fn perform_namespace_collision_operations(
+    context: &ScenarioContext,
+    kind: NamespaceCollisionKind,
+    clients: &[ClientSpec],
+) -> Result<Vec<NamespaceCollisionOperation>, ScenarioError> {
+    let started = Instant::now();
+    let operations = match kind {
+        NamespaceCollisionKind::RenameVsRename => run_concurrent_namespace_operations(
+            started,
+            vec![
+                NamespaceCollisionTask::new(
+                    1,
+                    clients[0].clone(),
+                    "rename",
+                    "shared/file.txt -> shared/renamed-a.txt",
+                    |client| {
+                        fs::rename(
+                            client.mount_point.join("shared/file.txt"),
+                            client.mount_point.join("shared/renamed-a.txt"),
+                        )
+                    },
+                ),
+                NamespaceCollisionTask::new(
+                    2,
+                    clients[1].clone(),
+                    "rename",
+                    "shared/file.txt -> shared/renamed-b.txt",
+                    |client| {
+                        fs::rename(
+                            client.mount_point.join("shared/file.txt"),
+                            client.mount_point.join("shared/renamed-b.txt"),
+                        )
+                    },
+                ),
+            ],
+        ),
+        NamespaceCollisionKind::RenameVsUnlink => run_concurrent_namespace_operations(
+            started,
+            vec![
+                NamespaceCollisionTask::new(
+                    1,
+                    clients[0].clone(),
+                    "rename",
+                    "shared/file.txt -> shared/renamed.txt",
+                    |client| {
+                        fs::rename(
+                            client.mount_point.join("shared/file.txt"),
+                            client.mount_point.join("shared/renamed.txt"),
+                        )
+                    },
+                ),
+                NamespaceCollisionTask::new(
+                    2,
+                    clients[1].clone(),
+                    "unlink",
+                    "shared/file.txt",
+                    |client| fs::remove_file(client.mount_point.join("shared/file.txt")),
+                ),
+            ],
+        ),
+        NamespaceCollisionKind::UnlinkVsAppend => run_concurrent_namespace_operations(
+            started,
+            vec![
+                NamespaceCollisionTask::new(
+                    1,
+                    clients[0].clone(),
+                    "unlink",
+                    "shared/data.txt",
+                    |client| fs::remove_file(client.mount_point.join("shared/data.txt")),
+                ),
+                NamespaceCollisionTask::new(
+                    2,
+                    clients[1].clone(),
+                    "append",
+                    "shared/data.txt",
+                    |client| {
+                        let mut file = OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(client.mount_point.join("shared/data.txt"))?;
+                        file.write_all(b"appended payload\n")
+                    },
+                ),
+            ],
+        ),
+        NamespaceCollisionKind::OverwriteVsRead => run_concurrent_namespace_operations(
+            started,
+            vec![
+                NamespaceCollisionTask::new(
+                    1,
+                    clients[1].clone(),
+                    "read_loop",
+                    "shared/data.txt",
+                    |client| repeated_committed_read(client, "shared/data.txt"),
+                ),
+                NamespaceCollisionTask::new(
+                    2,
+                    clients[0].clone(),
+                    "overwrite",
+                    "shared/data.txt",
+                    |client| {
+                        fs::write(
+                            client.mount_point.join("shared/data.txt"),
+                            COLLISION_NEW_COMMITTED_PAYLOAD,
+                        )
+                    },
+                ),
+                NamespaceCollisionTask::new(
+                    3,
+                    clients[2].clone(),
+                    "read_loop",
+                    "shared/data.txt",
+                    |client| repeated_committed_read(client, "shared/data.txt"),
+                ),
+            ],
+        ),
+        NamespaceCollisionKind::MkdirRmdirVsCreate => run_concurrent_namespace_operations(
+            started,
+            vec![
+                NamespaceCollisionTask::new(
+                    1,
+                    clients[0].clone(),
+                    "mkdir",
+                    "race/subdir",
+                    |client| fs::create_dir_all(client.mount_point.join("race/subdir")),
+                ),
+                NamespaceCollisionTask::new(
+                    2,
+                    clients[1].clone(),
+                    "create",
+                    "race/child.txt",
+                    |client| fs::write(client.mount_point.join("race/child.txt"), b"child\n"),
+                ),
+                NamespaceCollisionTask::new(3, clients[2].clone(), "rmdir", "race", |client| {
+                    fs::remove_dir(client.mount_point.join("race"))
+                }),
+            ],
+        ),
+        NamespaceCollisionKind::ReaddirStatDuringMutation => run_concurrent_namespace_operations(
+            started,
+            vec![
+                NamespaceCollisionTask::new(1, clients[1].clone(), "readdir", "scan", |client| {
+                    fs::read_dir(client.mount_point.join("scan")).map(|_| ())
+                }),
+                NamespaceCollisionTask::new(
+                    2,
+                    clients[0].clone(),
+                    "rename",
+                    "scan/a.txt -> scan/c.txt",
+                    |client| {
+                        fs::rename(
+                            client.mount_point.join("scan/a.txt"),
+                            client.mount_point.join("scan/c.txt"),
+                        )
+                    },
+                ),
+                NamespaceCollisionTask::new(
+                    3,
+                    clients[2].clone(),
+                    "stat",
+                    "scan/b.txt",
+                    |client| fs::metadata(client.mount_point.join("scan/b.txt")).map(|_| ()),
+                ),
+            ],
+        ),
+    };
+    write_namespace_collision_operations(context, &operations)?;
+    Ok(operations)
+}
+
+fn run_concurrent_namespace_operations(
+    started: Instant,
+    tasks: Vec<NamespaceCollisionTask>,
+) -> Vec<NamespaceCollisionOperation> {
+    let barrier = Arc::new(Barrier::new(tasks.len()));
+    let mut handles = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        let barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            record_fs_operation(
+                started,
+                task.order,
+                &task.client,
+                task.operation,
+                task.path,
+                || (task.action)(&task.client),
+            )
+        }));
+    }
+
+    let mut operations = handles
+        .into_iter()
+        .map(|handle| {
+            handle
+                .join()
+                .expect("namespace collision worker thread should not panic")
+        })
+        .collect::<Vec<_>>();
+    operations.sort_by_key(|operation| operation.order);
+    operations
+}
+
+fn repeated_committed_read(client: &ClientSpec, relative_path: &str) -> io::Result<()> {
+    for _ in 0..OVERWRITE_READ_ATTEMPTS {
+        let payload = fs::read(client.mount_point.join(relative_path))?;
+        if payload != COLLISION_OLD_COMMITTED_PAYLOAD && payload != COLLISION_NEW_COMMITTED_PAYLOAD
+        {
+            return Err(io::Error::other(format!(
+                "read observed partial or unexpected payload for {relative_path}"
+            )));
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    Ok(())
+}
+
+fn planned_namespace_collision_operations(
+    kind: NamespaceCollisionKind,
+    started: Instant,
+) -> Vec<NamespaceCollisionOperation> {
+    let spec = match kind {
+        NamespaceCollisionKind::RenameVsRename => vec![
+            (
+                "client-a",
+                "rename",
+                "shared/file.txt -> shared/renamed-a.txt",
+            ),
+            (
+                "client-b",
+                "rename",
+                "shared/file.txt -> shared/renamed-b.txt",
+            ),
+        ],
+        NamespaceCollisionKind::RenameVsUnlink => vec![
+            (
+                "client-a",
+                "rename",
+                "shared/file.txt -> shared/renamed.txt",
+            ),
+            ("client-b", "unlink", "shared/file.txt"),
+        ],
+        NamespaceCollisionKind::UnlinkVsAppend => vec![
+            ("client-a", "unlink", "shared/data.txt"),
+            ("client-b", "append", "shared/data.txt"),
+        ],
+        NamespaceCollisionKind::OverwriteVsRead => vec![
+            ("client-b", "read_loop", "shared/data.txt"),
+            ("client-a", "overwrite", "shared/data.txt"),
+            ("client-c", "read_loop", "shared/data.txt"),
+        ],
+        NamespaceCollisionKind::MkdirRmdirVsCreate => vec![
+            ("client-a", "mkdir", "race/subdir"),
+            ("client-b", "create", "race/child.txt"),
+            ("client-c", "rmdir", "race"),
+        ],
+        NamespaceCollisionKind::ReaddirStatDuringMutation => vec![
+            ("client-b", "readdir", "scan"),
+            ("client-a", "rename", "scan/a.txt -> scan/c.txt"),
+            ("client-c", "stat", "scan/b.txt"),
+        ],
+    };
+    spec.into_iter()
+        .enumerate()
+        .map(
+            |(index, (client, operation, path))| NamespaceCollisionOperation {
+                order: index + 1,
+                client: client.to_string(),
+                operation: operation.to_string(),
+                path: path.to_string(),
+                result: "planned".to_string(),
+                timestamp_ms: elapsed_millis_u64(started),
+                error: None,
+            },
+        )
+        .collect()
+}
+
+fn record_fs_operation(
+    started: Instant,
+    order: usize,
+    client: &ClientSpec,
+    operation: &str,
+    path: &str,
+    f: impl FnOnce() -> std::io::Result<()>,
+) -> NamespaceCollisionOperation {
+    match f() {
+        Ok(()) => NamespaceCollisionOperation {
+            order,
+            client: client.name.clone(),
+            operation: operation.to_string(),
+            path: path.to_string(),
+            result: "accepted".to_string(),
+            timestamp_ms: elapsed_millis_u64(started),
+            error: None,
+        },
+        Err(error) => NamespaceCollisionOperation {
+            order,
+            client: client.name.clone(),
+            operation: operation.to_string(),
+            path: path.to_string(),
+            result: "rejected".to_string(),
+            timestamp_ms: elapsed_millis_u64(started),
+            error: Some(error.to_string()),
+        },
+    }
+}
+
+fn elapsed_millis_u64(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn finish_namespace_collision(
+    context: &ScenarioContext,
+    kind: NamespaceCollisionKind,
+    bootstrap: Option<VolumeBootstrapSummary>,
+    clients: Vec<ClientSpec>,
+    operations: Vec<NamespaceCollisionOperation>,
+    convergence_timeout: Duration,
+    poll_interval: Duration,
+) -> Result<NamespaceCollisionSummary, ScenarioError> {
+    let mounts = clients
+        .iter()
+        .map(|client| ClientMount::new(client.name.clone(), client.mount_point.clone()))
+        .collect::<Vec<_>>();
+    let convergence = wait_for_convergence(
+        &mounts,
+        context.scenario_dir.join("validation"),
+        convergence_timeout,
+        poll_interval,
+    )?;
+    let mut namespace_violations = Vec::new();
+    for snapshot in &convergence.snapshots {
+        namespace_violations.extend(validate_namespace_invariants(
+            snapshot,
+            kind.expected_absent_paths(),
+        ));
+    }
+    if !namespace_violations.is_empty() {
+        return Err(ScenarioError::NamespaceInvariantViolations {
+            violations: namespace_violations,
+        });
+    }
+    let summary = NamespaceCollisionSummary {
+        scenario: kind.name().to_string(),
+        bootstrap,
+        clients: clients.len(),
+        operations,
+        operation_log: format!("artifacts/scenarios/{}/operations.ndjson", kind.name()),
+        final_validator: convergence.comparison,
+        namespace_violations,
+    };
+    write_namespace_collision_summary(context, &summary)?;
+    Ok(summary)
+}
+
+fn write_namespace_collision_operations(
+    context: &ScenarioContext,
+    operations: &[NamespaceCollisionOperation],
+) -> Result<(), ScenarioError> {
+    let mut log = fs::OpenOptions::new()
+        .create(true)
+        .append(false)
+        .truncate(true)
+        .write(true)
+        .open(context.scenario_dir.join("operations.ndjson"))?;
+    for operation in operations {
+        serde_json::to_writer(&mut log, operation)?;
+        log.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
+fn write_namespace_collision_summary(
+    context: &ScenarioContext,
+    summary: &NamespaceCollisionSummary,
+) -> Result<(), ScenarioError> {
+    fs::write(
+        context
+            .scenario_dir
+            .join("namespace-collision-summary.json"),
+        serde_json::to_vec_pretty(summary)?,
+    )?;
+    Ok(())
+}
+
 fn write_local_durable_payload(path: PathBuf, payload: &[u8]) -> Result<(), ScenarioError> {
     let mut file = OpenOptions::new()
         .create(true)
@@ -1910,6 +2704,132 @@ mod tests {
         }
     }
 
+    struct RecordingNamespaceCollisionDriver {
+        clients: Vec<ClientSpec>,
+        actions: RefCell<Vec<&'static str>>,
+        unmount_error: Option<&'static str>,
+    }
+
+    impl RecordingNamespaceCollisionDriver {
+        fn new(clients: Vec<ClientSpec>) -> Self {
+            Self {
+                clients,
+                actions: RefCell::new(Vec::new()),
+                unmount_error: None,
+            }
+        }
+
+        fn with_unmount_error(mut self, error: &'static str) -> Self {
+            self.unmount_error = Some(error);
+            self
+        }
+
+        fn replicate_from_first_client(&self) -> Result<(), ScenarioError> {
+            let source = &self.clients[0].mount_point;
+            let mut errors = Vec::new();
+            for client in self.clients.iter().skip(1) {
+                if let Err(error) = replace_dir_contents(source, &client.mount_point) {
+                    errors.push(format!("{}: {error}", client.name));
+                }
+            }
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(ScenarioError::ReplicationFailure { errors })
+            }
+        }
+    }
+
+    impl NamespaceCollisionDriver for RecordingNamespaceCollisionDriver {
+        fn bootstrap_volume(
+            &mut self,
+            options: VolumeBootstrapOptions,
+        ) -> Result<VolumeBootstrapSummary, ScenarioError> {
+            self.actions.borrow_mut().push("bootstrap");
+            assert_eq!(
+                options.client_names,
+                COLLISION_CLIENT_NAMES
+                    .iter()
+                    .copied()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            );
+            Ok(VolumeBootstrapSummary {
+                volume_name: "projectfs".to_string(),
+                init_client: COLLISION_CLIENT_NAMES[0].to_string(),
+                discovered_clients: COLLISION_CLIENT_NAMES[1..]
+                    .iter()
+                    .map(|name| (*name).to_string())
+                    .collect(),
+                clients: self
+                    .clients
+                    .iter()
+                    .map(|client| crate::client::ClientBootstrapRecord {
+                        name: client.name.clone(),
+                        local_metadata_db: client.local_metadata_db.clone(),
+                        state: ClientLifecycleState::Discovered,
+                    })
+                    .collect(),
+            })
+        }
+
+        fn mount_all(&mut self) -> Result<(), ScenarioError> {
+            self.actions.borrow_mut().push("mount_all");
+            Ok(())
+        }
+
+        fn clients(&self) -> Vec<ClientSpec> {
+            self.clients.clone()
+        }
+
+        fn after_conflicting_operations(
+            &mut self,
+            _kind: NamespaceCollisionKind,
+            _clients: &[ClientSpec],
+        ) -> Result<(), ScenarioError> {
+            self.actions.borrow_mut().push("replicate");
+            self.replicate_from_first_client()
+        }
+
+        fn unmount_all(&mut self) -> Result<(), ScenarioError> {
+            self.actions.borrow_mut().push("unmount_all");
+            if let Some(error) = self.unmount_error {
+                return Err(ScenarioError::Io(std::io::Error::other(error)));
+            }
+            Ok(())
+        }
+    }
+
+    fn replace_dir_contents(source: &Path, destination: &Path) -> Result<(), ScenarioError> {
+        if destination.exists() {
+            for entry in std::fs::read_dir(destination)? {
+                let entry = entry?;
+                let path = entry.path();
+                if entry.file_type()?.is_dir() {
+                    std::fs::remove_dir_all(path)?;
+                } else {
+                    std::fs::remove_file(path)?;
+                }
+            }
+        }
+        copy_dir_contents(source, destination)
+    }
+
+    fn copy_dir_contents(source: &Path, destination: &Path) -> Result<(), ScenarioError> {
+        std::fs::create_dir_all(destination)?;
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            let source_path = entry.path();
+            let destination_path = destination.join(entry.file_name());
+            if entry.file_type()?.is_dir() {
+                copy_dir_contents(&source_path, &destination_path)?;
+            } else {
+                std::fs::copy(source_path, destination_path)?;
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn mounted_smoke_reports_unmount_error_when_body_also_fails() {
         let temp = tempdir().unwrap();
@@ -1942,6 +2862,186 @@ mod tests {
         ));
         assert!(message.contains("requires at least 3 clients"));
         assert!(message.contains("umount failed"));
+    }
+
+    #[test]
+    fn namespace_collision_records_operations_and_validates_three_client_convergence() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(COLLISION_RENAME_VS_UNLINK);
+        let clients = COLLISION_CLIENT_NAMES
+            .iter()
+            .copied()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(&mount).unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let mut driver = RecordingNamespaceCollisionDriver::new(clients);
+        let context = ScenarioContext {
+            run_id: "run-1".to_string(),
+            seed: 328,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+
+        let summary = run_namespace_collision_with_driver(
+            &context,
+            NamespaceCollisionKind::RenameVsUnlink,
+            &mut driver,
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+
+        assert_eq!(summary.scenario, COLLISION_RENAME_VS_UNLINK);
+        assert_eq!(summary.clients, 3);
+        assert_eq!(summary.operations.len(), 2);
+        assert!(summary.final_validator.converged);
+        assert!(summary.namespace_violations.is_empty());
+        assert_eq!(
+            driver.actions.borrow().as_slice(),
+            [
+                "bootstrap",
+                "mount_all",
+                "replicate",
+                "replicate",
+                "unmount_all"
+            ]
+        );
+        let operations_log =
+            std::fs::read_to_string(context.scenario_dir.join("operations.ndjson")).unwrap();
+        assert!(operations_log.contains("\"operation\":\"rename\""));
+        assert!(operations_log.contains("\"operation\":\"unlink\""));
+        assert!(
+            context
+                .scenario_dir
+                .join("namespace-collision-summary.json")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn namespace_collision_preserves_primary_error_when_unmount_also_fails() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(COLLISION_RENAME_VS_UNLINK);
+        let mut driver =
+            RecordingNamespaceCollisionDriver::new(Vec::new()).with_unmount_error("umount failed");
+        let context = ScenarioContext {
+            run_id: "run-1".to_string(),
+            seed: 328,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+
+        let err = run_namespace_collision_with_driver(
+            &context,
+            NamespaceCollisionKind::RenameVsUnlink,
+            &mut driver,
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+        )
+        .unwrap_err();
+
+        let message = err.to_string();
+        assert!(matches!(
+            err,
+            ScenarioError::NamespaceCollisionUnmountAfterFailure { .. }
+        ));
+        assert!(message.contains("requires at least 3 clients"));
+        assert!(message.contains("umount failed"));
+    }
+
+    #[test]
+    fn namespace_collision_recording_replication_collects_errors_after_all_clients() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let source_mount = temp.path().join("mounts").join("client-a");
+        let bad_mount = temp.path().join("mounts").join("client-b");
+        let copied_mount = temp.path().join("mounts").join("client-c");
+        std::fs::create_dir_all(&source_mount).unwrap();
+        std::fs::write(source_mount.join("copied.txt"), b"payload").unwrap();
+        std::fs::create_dir_all(bad_mount.parent().unwrap()).unwrap();
+        std::fs::write(&bad_mount, b"not a directory").unwrap();
+        std::fs::create_dir_all(&copied_mount).unwrap();
+        let driver = RecordingNamespaceCollisionDriver::new(vec![
+            client_spec_for(&sandbox, "projectfs", "client-a", source_mount),
+            client_spec_for(&sandbox, "projectfs", "client-b", bad_mount),
+            client_spec_for(&sandbox, "projectfs", "client-c", copied_mount.clone()),
+        ]);
+
+        let err = driver.replicate_from_first_client().unwrap_err();
+
+        assert!(matches!(err, ScenarioError::ReplicationFailure { .. }));
+        assert_eq!(
+            std::fs::read(copied_mount.join("copied.txt")).unwrap(),
+            b"payload"
+        );
+    }
+
+    #[test]
+    fn namespace_collision_operation_timestamps_are_portable_u64_values() {
+        fn accepts_u64(_value: u64) {}
+
+        let operations = planned_namespace_collision_operations(
+            NamespaceCollisionKind::RenameVsUnlink,
+            Instant::now(),
+        );
+
+        accepts_u64(operations[0].timestamp_ms);
+    }
+
+    #[test]
+    fn overwrite_vs_read_collision_records_repeated_read_loop() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(COLLISION_OVERWRITE_VS_READ);
+        let clients = COLLISION_CLIENT_NAMES
+            .iter()
+            .copied()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(&mount).unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let mut driver = RecordingNamespaceCollisionDriver::new(clients);
+        let context = ScenarioContext {
+            run_id: "run-1".to_string(),
+            seed: 328,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+
+        let summary = run_namespace_collision_with_driver(
+            &context,
+            NamespaceCollisionKind::OverwriteVsRead,
+            &mut driver,
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+
+        let read_loop = summary
+            .operations
+            .iter()
+            .find(|operation| operation.operation == "read_loop")
+            .expect("overwrite/read scenario should record repeated reads");
+        assert_eq!(read_loop.result, "accepted");
     }
 
     #[test]
