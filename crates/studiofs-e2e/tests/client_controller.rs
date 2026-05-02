@@ -283,6 +283,7 @@ fn configured_mount_points_override_client_artifact_metadata_dirs() {
     let mut config = test_config(temp.path());
     let mount_a = temp.path().join("mount-a");
     let mount_b = temp.path().join("mount-b");
+    let expected_mount_a = mount_a.join("projectfs");
     config.mount_points = vec![mount_a.clone(), mount_b];
     let executor = RecordingExecutor::new();
     let mut controller = MultiClientController::new(config, executor);
@@ -290,14 +291,17 @@ fn configured_mount_points_override_client_artifact_metadata_dirs() {
     controller.create_clients(["client-a", "client-b"]).unwrap();
 
     let clients = controller.clients();
-    assert_eq!(clients[0].mount_point, mount_a);
+    assert_eq!(clients[0].mount_point, expected_mount_a);
     assert_ne!(clients[0].mount_point, clients[0].mount_metadata_dir);
     assert!(clients[0].mount_metadata_dir.exists());
     let mount_metadata: serde_json::Value = serde_json::from_slice(
         &std::fs::read(clients[0].mount_metadata_dir.join("mount-point.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(mount_metadata["mount_point"], mount_a.display().to_string());
+    assert_eq!(
+        mount_metadata["mount_point"],
+        expected_mount_a.display().to_string()
+    );
 }
 
 #[cfg(windows)]

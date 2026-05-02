@@ -166,6 +166,19 @@ and readdir/stat while mutations are in flight. The overwrite/read scenario
 records repeated read loops during the overwrite. Each collision run writes `operations.ndjson`,
 `namespace-collision-summary.json`, and `validation.json`.
 
+Hosted Linux real mounted E2E is available as a manual RWX workflow:
+
+```powershell
+rwx run .rwx/e2e.yml --target e2e-smoke --wait --open
+```
+
+The first RWX target runs `basic-multi-client-smoke` only. It requires RWX
+Docker support, `/dev/fuse`, `fusermount3`, and readable FUSE configuration on
+the hosted Linux task. It does not add a GitHub Actions workflow, PR trigger, or
+schedule. RWX uploads `target/e2e-runs/<run-id>/` as the `e2e-run` artifact so
+`report.json`, `preflight.json`, Docker diagnostics, scenario artifacts, and
+client logs remain available on failure.
+
 Focused runner skeleton check:
 
 ```powershell
