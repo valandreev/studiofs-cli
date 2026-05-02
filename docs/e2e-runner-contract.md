@@ -185,6 +185,9 @@ written as `tree-client-N.json`. When convergence times out, validation writes
 one tree snapshot per client plus `diff.json` in the scenario validation
 artifact directory. Temporary divergence during the convergence window is
 recorded by repeated polling but is not a failure until the timeout expires.
+Transient snapshot I/O failures, such as files being renamed during traversal or
+temporary Windows sharing violations, are treated the same way: retry until the
+convergence deadline, then report the last stable divergence or snapshot error.
 
 Retention behavior:
 

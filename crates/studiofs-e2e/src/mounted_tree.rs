@@ -66,12 +66,6 @@ pub struct TreeComparison {
     pub differences: Vec<TreeDifference>,
 }
 
-impl TreeComparison {
-    pub fn from_snapshots(snapshots: &[MountedTreeSnapshot]) -> Self {
-        compare_snapshots(snapshots)
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TreeDifference {
     pub client: String,
@@ -161,7 +155,7 @@ pub fn compare_snapshots(snapshots: &[MountedTreeSnapshot]) -> TreeComparison {
                 None => differences.push(TreeDifference {
                     client: snapshot.client.clone(),
                     reference_client: Some(reference.client.clone()),
-                    path: path.clone(),
+                    path: (*path).to_string(),
                     message: "entry is missing".to_string(),
                     expected: Some(entry_contract(expected)),
                     actual: None,
@@ -173,7 +167,7 @@ pub fn compare_snapshots(snapshots: &[MountedTreeSnapshot]) -> TreeComparison {
                 differences.push(TreeDifference {
                     client: snapshot.client.clone(),
                     reference_client: Some(reference.client.clone()),
-                    path: path.clone(),
+                    path: (*path).to_string(),
                     message: "entry is extra".to_string(),
                     expected: None,
                     actual: Some(entry_contract(actual)),
@@ -220,21 +214,43 @@ pub fn wait_for_convergence(
     let started = Instant::now();
     let deadline = started + timeout;
     let mut attempts = 0;
+    let mut last_divergence = None;
+    let mut last_snapshot_error = None;
 
     loop {
         attempts += 1;
-        let snapshots = snapshot_mounts(mounts)?;
-        let comparison = compare_snapshots(&snapshots);
-        let elapsed_ms = started.elapsed().as_millis();
-        if comparison.converged {
-            return Ok(ConvergenceOutcome {
-                attempts,
-                elapsed_ms,
-                snapshots,
-                comparison,
-            });
+        match snapshot_mounts(mounts) {
+            Ok(snapshots) => {
+                let comparison = compare_snapshots(&snapshots);
+                let elapsed_ms = started.elapsed().as_millis();
+                if comparison.converged {
+                    return Ok(ConvergenceOutcome {
+                        attempts,
+                        elapsed_ms,
+                        snapshots,
+                        comparison,
+                    });
+                }
+                last_divergence = Some((snapshots, comparison));
+            }
+            Err(error) => {
+                last_snapshot_error = Some(error);
+            }
         }
+
+        let elapsed_ms = started.elapsed().as_millis();
         if Instant::now() >= deadline {
+            let Some((snapshots, comparison)) = last_divergence else {
+                if let Some(error) = last_snapshot_error {
+                    return Err(error);
+                }
+                return Err(MountedTreeError::ConvergenceTimedOut {
+                    attempts,
+                    elapsed_ms,
+                    artifact_dir: artifact_dir.to_path_buf(),
+                    comparison: Box::new(compare_snapshots(&[])),
+                });
+            };
             write_divergence_artifacts(artifact_dir, &snapshots, &comparison)?;
             return Err(MountedTreeError::ConvergenceTimedOut {
                 attempts,
@@ -252,8 +268,8 @@ fn scan_dir(
     current: &Path,
     entries: &mut Vec<TreeEntry>,
 ) -> Result<(), MountedTreeError> {
-    let mut children = read_dir_sorted(current)?;
-    children.sort_by_key(|left| left.path());
+    let mut children = read_dir_entries(current)?;
+    children.sort_by_key(|left| left.file_name());
     for child in children {
         let path = child.path();
         let metadata = symlink_metadata(&path)?;
@@ -294,7 +310,7 @@ fn scan_dir(
     Ok(())
 }
 
-fn read_dir_sorted(path: &Path) -> Result<Vec<fs::DirEntry>, MountedTreeError> {
+fn read_dir_entries(path: &Path) -> Result<Vec<fs::DirEntry>, MountedTreeError> {
     let mut children = Vec::new();
     for child in fs::read_dir(path).map_err(|source| io_error(path, source))? {
         children.push(child.map_err(|source| io_error(path, source))?);
@@ -302,11 +318,11 @@ fn read_dir_sorted(path: &Path) -> Result<Vec<fs::DirEntry>, MountedTreeError> {
     Ok(children)
 }
 
-fn entries_by_path(snapshot: &MountedTreeSnapshot) -> BTreeMap<String, &TreeEntry> {
+fn entries_by_path(snapshot: &MountedTreeSnapshot) -> BTreeMap<&str, &TreeEntry> {
     snapshot
         .entries
         .iter()
-        .map(|entry| (entry.path.clone(), entry))
+        .map(|entry| (entry.path.as_str(), entry))
         .collect()
 }
 

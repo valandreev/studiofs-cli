@@ -3,8 +3,8 @@ use std::thread;
 use std::time::Duration;
 
 use studiofs_e2e::mounted_tree::{
-    ClientMount, TreeComparison, TreeEntryKind, compare_snapshots, snapshot_client_tree,
-    wait_for_convergence, write_divergence_artifacts,
+    ClientMount, TreeEntryKind, compare_snapshots, snapshot_client_tree, wait_for_convergence,
+    write_divergence_artifacts,
 };
 use tempfile::tempdir;
 
@@ -86,7 +86,7 @@ fn divergence_artifacts_include_each_client_snapshot_and_readable_diff() {
         snapshot_client_tree("client-b", &client_b).unwrap(),
         snapshot_client_tree("client-c", &client_c).unwrap(),
     ];
-    let comparison = TreeComparison::from_snapshots(&snapshots);
+    let comparison = compare_snapshots(&snapshots);
     let artifact_dir = temp.path().join("artifacts");
 
     let artifacts = write_divergence_artifacts(&artifact_dir, &snapshots, &comparison).unwrap();
@@ -121,6 +121,38 @@ fn wait_for_convergence_retries_until_trees_match_without_failure_artifacts() {
     let delayed_client = client_b.clone();
     thread::spawn(move || {
         thread::sleep(Duration::from_millis(50));
+        fs::write(delayed_client.join("eventual.txt"), b"settled").unwrap();
+    });
+
+    let artifact_dir = temp.path().join("validation");
+    let outcome = wait_for_convergence(
+        &[
+            ClientMount::new("client-a", client_a),
+            ClientMount::new("client-b", client_b),
+        ],
+        &artifact_dir,
+        Duration::from_secs(1),
+        Duration::from_millis(10),
+    )
+    .unwrap();
+
+    assert!(outcome.comparison.converged);
+    assert!(outcome.attempts > 1);
+    assert!(!artifact_dir.join("diff.json").exists());
+}
+
+#[test]
+fn wait_for_convergence_treats_transient_snapshot_io_errors_as_not_yet_converged() {
+    let temp = tempdir().unwrap();
+    let client_a = temp.path().join("client-a");
+    let client_b = temp.path().join("client-b");
+    fs::create_dir_all(&client_a).unwrap();
+    fs::write(client_a.join("eventual.txt"), b"settled").unwrap();
+
+    let delayed_client = client_b.clone();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(50));
+        fs::create_dir_all(&delayed_client).unwrap();
         fs::write(delayed_client.join("eventual.txt"), b"settled").unwrap();
     });
 
