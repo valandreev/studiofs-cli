@@ -1256,8 +1256,13 @@ fn run_crash_restart_mode(
     let restart_started = Instant::now();
     driver.force_kill(&crashed.name)?;
     driver.remount(&crashed.name)?;
-    let local_read_checksum_sha256 =
-        bytes_sha256(&fs::read(crashed.mount_point.join(relative_path))?);
+    let local_read_payload = fs::read(crashed.mount_point.join(relative_path))?;
+    if local_read_payload != payload {
+        return Err(ScenarioError::Io(std::io::Error::other(format!(
+            "durability failure: data read after restart does not match written payload for {relative_path}"
+        ))));
+    }
+    let local_read_checksum_sha256 = bytes_sha256(&local_read_payload);
     let restart_elapsed_ms = restart_started.elapsed().as_millis();
 
     let convergence_started = Instant::now();
@@ -1269,7 +1274,6 @@ fn run_crash_restart_mode(
         };
     let mounts = clients
         .iter()
-        .take(CRASH_RESTART_CLIENT_NAMES.len())
         .map(|client| ClientMount::new(client.name.clone(), client.mount_point.clone()))
         .collect::<Vec<_>>();
     let convergence = wait_for_convergence(
@@ -1281,8 +1285,13 @@ fn run_crash_restart_mode(
         poll_interval,
     )?;
     let convergence_elapsed_ms = convergence_started.elapsed().as_millis();
-    let final_checksum_sha256 =
-        bytes_sha256(&fs::read(clients[1].mount_point.join(relative_path))?);
+    let final_payload = fs::read(clients[1].mount_point.join(relative_path))?;
+    if final_payload != payload {
+        return Err(ScenarioError::Io(std::io::Error::other(format!(
+            "convergence failure: peer data does not match written payload for {relative_path}"
+        ))));
+    }
+    let final_checksum_sha256 = bytes_sha256(&final_payload);
 
     let summary = CrashRestartModeSummary {
         mode,
@@ -1788,6 +1797,8 @@ mod tests {
     struct RecordingCrashRestartDriver {
         clients: Vec<ClientSpec>,
         actions: RefCell<Vec<String>>,
+        corrupt_local_on_remount: bool,
+        corrupt_converged_payload_after_remount: bool,
     }
 
     impl RecordingCrashRestartDriver {
@@ -1795,7 +1806,19 @@ mod tests {
             Self {
                 clients,
                 actions: RefCell::new(Vec::new()),
+                corrupt_local_on_remount: false,
+                corrupt_converged_payload_after_remount: false,
             }
+        }
+
+        fn corrupt_local_on_remount(mut self) -> Self {
+            self.corrupt_local_on_remount = true;
+            self
+        }
+
+        fn corrupt_converged_payload_after_remount(mut self) -> Self {
+            self.corrupt_converged_payload_after_remount = true;
+            self
         }
     }
 
@@ -1850,6 +1873,34 @@ mod tests {
 
         fn remount(&mut self, client: &str) -> Result<(), ScenarioError> {
             self.actions.borrow_mut().push(format!("remount_{client}"));
+            if self.corrupt_local_on_remount {
+                let client = self
+                    .clients
+                    .iter()
+                    .find(|candidate| candidate.name == client)
+                    .expect("recording driver client exists");
+                std::fs::write(
+                    client
+                        .mount_point
+                        .join(CRASH_RESTART_LOCAL_DURABLE_FILE_NAME),
+                    b"corrupted payload after restart\n",
+                )?;
+            }
+            if self.corrupt_converged_payload_after_remount {
+                let clients = self.clients.clone();
+                thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(20));
+                    for client in clients {
+                        std::fs::write(
+                            client
+                                .mount_point
+                                .join(CRASH_RESTART_LOCAL_DURABLE_FILE_NAME),
+                            b"wrong converged payload after restart\n",
+                        )
+                        .unwrap();
+                    }
+                });
+            }
             Ok(())
         }
 
@@ -2081,6 +2132,152 @@ mod tests {
             std::fs::read_to_string(context.scenario_dir.join("operations.ndjson")).unwrap();
         assert!(operations_log.contains("after_local_durability_boundary"));
         assert!(operations_log.contains("before_remote_publication_completes"));
+    }
+
+    #[test]
+    fn crash_restart_fails_when_restart_read_differs_from_written_payload() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(MOUNTED_CLIENT_CRASH_RESTART_RECOVERY);
+        let clients = CRASH_RESTART_CLIENT_NAMES
+            .iter()
+            .copied()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(&mount).unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let mut driver = RecordingCrashRestartDriver::new(clients).corrupt_local_on_remount();
+        let context = ScenarioContext {
+            run_id: "run-1".to_string(),
+            seed: 327,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+
+        let err = run_crash_restart_with_driver(
+            &context,
+            &mut driver,
+            Duration::from_millis(100),
+            Duration::from_millis(10),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("does not match written payload"));
+    }
+
+    #[test]
+    fn crash_restart_fails_when_final_peer_payload_differs_from_written_payload() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(MOUNTED_CLIENT_CRASH_RESTART_RECOVERY);
+        let clients = CRASH_RESTART_CLIENT_NAMES
+            .iter()
+            .copied()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(&mount).unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let mut driver =
+            RecordingCrashRestartDriver::new(clients).corrupt_converged_payload_after_remount();
+        let context = ScenarioContext {
+            run_id: "run-1".to_string(),
+            seed: 327,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+
+        let err = run_crash_restart_with_driver(
+            &context,
+            &mut driver,
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("peer data does not match written payload")
+        );
+    }
+
+    #[test]
+    fn crash_restart_convergence_includes_every_available_client() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(MOUNTED_CLIENT_CRASH_RESTART_RECOVERY);
+        let client_names = ["client-a", "client-b", "client-c"];
+        let clients = client_names
+            .iter()
+            .copied()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(&mount).unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let source_mount = temp.path().join("mounts").join("client-a");
+        let peer_mounts = ["client-b", "client-c"]
+            .into_iter()
+            .map(|name| temp.path().join("mounts").join(name))
+            .collect::<Vec<_>>();
+        thread::spawn(move || {
+            let files = [
+                CRASH_RESTART_LOCAL_DURABLE_FILE_NAME,
+                CRASH_RESTART_BEFORE_PUBLICATION_FILE_NAME,
+            ];
+            for file in files {
+                let source = source_mount.join(file);
+                for _ in 0..100 {
+                    if let Ok(payload) = std::fs::read(&source) {
+                        thread::sleep(Duration::from_millis(50));
+                        for peer in &peer_mounts {
+                            std::fs::write(peer.join(file), &payload).unwrap();
+                        }
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+        });
+        let mut driver = RecordingCrashRestartDriver::new(clients);
+        let context = ScenarioContext {
+            run_id: "run-1".to_string(),
+            seed: 327,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+
+        let summary = run_crash_restart_with_driver(
+            &context,
+            &mut driver,
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+
+        assert!(summary.modes.iter().all(|mode| {
+            mode.final_validator.compared_clients
+                == client_names
+                    .iter()
+                    .map(|name| (*name).to_string())
+                    .collect::<Vec<_>>()
+        }));
     }
 
     #[test]

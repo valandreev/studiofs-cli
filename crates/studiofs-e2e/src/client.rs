@@ -441,15 +441,22 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
     }
 
     pub fn force_kill_all(&mut self) -> Result<(), ClientControllerError> {
+        let mut kill_error = None;
         for index in 0..self.clients.len() {
             if let Some(process) = self.clients[index].process.as_mut() {
-                process.kill()?;
+                if let Err(err) = process.kill() {
+                    kill_error.get_or_insert(err);
+                }
             }
             self.clients[index].process = None;
             self.clients[index].spec.process_id = None;
             self.clients[index].spec.state = ClientLifecycleState::Killed;
         }
-        Ok(())
+        if let Some(err) = kill_error {
+            Err(err.into())
+        } else {
+            Ok(())
+        }
     }
 
     fn mount_index(&mut self, index: usize) -> Result<(), ClientControllerError> {
