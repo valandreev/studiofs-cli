@@ -136,6 +136,7 @@ Initial runner commands:
 cargo run -p studiofs-e2e -- list
 cargo build -p studiofs
 cargo run -p studiofs-e2e -- run basic-multi-client-smoke --studiofs-bin target\debug\studiofs.exe
+cargo run -p studiofs-e2e -- run rustfs-outage-multi-client-recovery --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- clean
 ```
 
@@ -146,7 +147,10 @@ project-scoped ports for concurrent local runs, or `--infra disabled` only for
 runner self-tests that must not touch Docker. The basic mounted smoke scenario
 uses three isolated StudioFS clients, mounts each client separately, writes a
 small file through the first mount, and validates convergence through the public
-mounted trees.
+mounted trees. The RustFS/S3 outage scenario stops only the RustFS compose
+service, keeps accepted writes locally readable, verifies a peer does not see
+the new outage checksum before recovery, and reports upload recovery time plus
+final checksum convergence.
 
 Focused runner skeleton check:
 
