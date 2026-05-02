@@ -209,6 +209,9 @@ writes accepted outage operations to `operations.ndjson` and
 `outage-operations.ndjson`, and writes
 `postgres-outage-recovery-summary.json` with outage duration,
 accepted-operation count, recovery time, and the final validator result.
+`recovery_time_ms` starts before the PostgreSQL compose service is brought back
+with `docker compose up --wait`, so it includes the PostgreSQL healthcheck
+readiness gate as well as mounted tree convergence time.
 
 ## Mounted Tree Convergence Validation
 

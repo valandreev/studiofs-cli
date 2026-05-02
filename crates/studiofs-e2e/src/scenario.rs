@@ -13,7 +13,10 @@ use crate::client::{
     ClientControllerConfig, ClientControllerError, ClientSpec, MultiClientController,
     SystemClientProcessExecutor, VolumeBootstrapOptions, VolumeBootstrapSummary,
 };
-use crate::infra::{CommandExecutor, ComposeServiceControl, InfraError, SystemCommandExecutor};
+use crate::infra::{
+    CommandExecutor, ComposeServiceControl, InfraError, POSTGRES_SERVICE_NAME,
+    SystemCommandExecutor,
+};
 use crate::mounted_tree::{
     ClientMount, ConvergenceOutcome, MountedTreeError, TreeComparison, wait_for_convergence,
 };
@@ -71,6 +74,10 @@ pub enum ScenarioError {
     Infra(#[from] InfraError),
     #[error("PostgreSQL outage scenario requires compose infrastructure")]
     MissingComposeInfrastructure,
+    #[error("missing E2E run manifest: {path}")]
+    MissingRunManifest { path: PathBuf },
+    #[error("PostgreSQL outage operations rejected {rejected} of {total} expected local writes")]
+    RejectedOutageOperations { rejected: usize, total: usize },
     #[error("mounted smoke scenario requires at least {expected} clients, got {actual}")]
     InsufficientMountedClients { expected: usize, actual: usize },
     #[error("PostgreSQL outage scenario requires at least {expected} clients, got {actual}")]
@@ -300,8 +307,13 @@ impl Scenario for PostgresOutageMultiClientRecovery {
 fn compose_control_from_manifest(
     context: &ScenarioContext,
 ) -> Result<ComposeServiceControl, ScenarioError> {
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&fs::read(context.sandbox.join("run.json"))?)?;
+    let manifest_path = context.sandbox.join("run.json");
+    if !manifest_path.exists() {
+        return Err(ScenarioError::MissingRunManifest {
+            path: manifest_path,
+        });
+    }
+    let manifest: serde_json::Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
     let Some(project) = manifest["compose_project"].as_str() else {
         return Err(ScenarioError::MissingComposeInfrastructure);
     };
@@ -488,13 +500,13 @@ impl<E: CommandExecutor> PostgresOutageDriver for RealPostgresOutageDriver<E> {
     fn stop_postgres(&mut self) -> Result<(), ScenarioError> {
         Ok(self
             .compose_control
-            .stop_service("postgres", &self.executor)?)
+            .stop_service(POSTGRES_SERVICE_NAME, &self.executor)?)
     }
 
     fn start_postgres(&mut self) -> Result<(), ScenarioError> {
         Ok(self
             .compose_control
-            .start_service("postgres", &self.executor)?)
+            .start_service(POSTGRES_SERVICE_NAME, &self.executor)?)
     }
 
     fn unmount_all(&mut self) -> Result<(), ScenarioError> {
@@ -508,6 +520,7 @@ struct OutageOperationRecord {
     path: String,
     bytes: usize,
     accepted: bool,
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -572,6 +585,8 @@ fn run_postgres_outage_body(
     let accepted_operations = perform_outage_operations(context, &clients[1..3])?;
     let outage_duration_ms = outage_started.elapsed().as_millis();
 
+    // `start_postgres` uses `docker compose up --wait`, so this includes
+    // PostgreSQL healthcheck readiness before mounted convergence polling.
     let recovery_started = Instant::now();
     driver.start_postgres()?;
     let mounts = clients
@@ -623,18 +638,30 @@ fn perform_outage_operations(
             "accepted local-first outage write from {} in {}\n",
             client.name, context.run_id
         );
-        fs::write(client.mount_point.join(&relative), payload.as_bytes())?;
-        accepted += 1;
+        let write_result = fs::write(client.mount_point.join(&relative), payload.as_bytes());
+        let error = write_result.err().map(|err| err.to_string());
+        let operation_accepted = error.is_none();
+        if operation_accepted {
+            accepted += 1;
+        }
         let record = OutageOperationRecord {
             client: client.name.clone(),
             path: relative,
             bytes: payload.len(),
-            accepted: true,
+            accepted: operation_accepted,
+            error,
         };
         serde_json::to_writer(&mut log, &record)?;
         log.write_all(b"\n")?;
         serde_json::to_writer(&mut operations_log, &record)?;
         operations_log.write_all(b"\n")?;
+    }
+    let rejected = clients.len() - accepted;
+    if rejected > 0 {
+        return Err(ScenarioError::RejectedOutageOperations {
+            rejected,
+            total: clients.len(),
+        });
     }
     Ok(accepted)
 }
@@ -1124,6 +1151,62 @@ mod tests {
         let operations_log =
             std::fs::read_to_string(context.scenario_dir.join("operations.ndjson")).unwrap();
         assert!(operations_log.contains("\"accepted\":true"));
+    }
+
+    #[test]
+    fn compose_control_reports_missing_run_manifest_path() {
+        let temp = tempdir().unwrap();
+        let context = ScenarioContext {
+            run_id: "run-1".to_string(),
+            seed: 325,
+            sandbox: temp.path().join("run-1"),
+            scenario_dir: temp.path().join("scenario"),
+            client_controller_config: None,
+        };
+
+        let err = compose_control_from_manifest(&context).unwrap_err();
+
+        assert!(matches!(err, ScenarioError::MissingRunManifest { .. }));
+        assert!(err.to_string().contains("run.json"));
+    }
+
+    #[test]
+    fn outage_operations_log_rejected_write_before_failing_expected_operation() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(POSTGRES_OUTAGE_MULTI_CLIENT_RECOVERY);
+        let accepted_mount = temp.path().join("mounts").join("client-b");
+        let rejected_mount = temp.path().join("mounts").join("client-c");
+        std::fs::create_dir_all(&accepted_mount).unwrap();
+        std::fs::write(&rejected_mount, "not a directory").unwrap();
+        let clients = vec![
+            client_spec_for(&sandbox, "projectfs", "client-b", accepted_mount),
+            client_spec_for(&sandbox, "projectfs", "client-c", rejected_mount),
+        ];
+        let context = ScenarioContext {
+            run_id: "run-1".to_string(),
+            seed: 325,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+
+        let err = perform_outage_operations(&context, &clients).unwrap_err();
+
+        assert!(matches!(
+            err,
+            ScenarioError::RejectedOutageOperations {
+                rejected: 1,
+                total: 2
+            }
+        ));
+        let log =
+            std::fs::read_to_string(context.scenario_dir.join("outage-operations.ndjson")).unwrap();
+        assert!(log.contains("\"accepted\":true"));
+        assert!(log.contains("\"accepted\":false"));
     }
 
     fn _test_config(root: &Path) -> ClientControllerConfig {

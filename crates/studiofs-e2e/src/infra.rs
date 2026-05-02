@@ -15,27 +15,32 @@ const DEFAULT_RUSTFS_PORT: u16 = 29_000;
 const DEFAULT_RUSTFS_CONSOLE_PORT: u16 = 29_001;
 const DEFAULT_TOXIPROXY_API_PORT: u16 = 28_474;
 
+pub const POSTGRES_SERVICE_NAME: &str = "postgres";
+const RUSTFS_SERVICE_NAME: &str = "rustfs";
+const RUSTFS_CONSOLE_SERVICE_NAME: &str = "rustfs-console";
+const TOXIPROXY_API_SERVICE_NAME: &str = "toxiproxy-api";
+
 const SERVICE_PORTS: &[ServicePortSpec] = &[
     ServicePortSpec {
-        service: "postgres",
+        service: POSTGRES_SERVICE_NAME,
         default_host_port: DEFAULT_POSTGRES_PORT,
         container_port: 5432,
         env_var: "STUDIOFS_E2E_POSTGRES_PORT",
     },
     ServicePortSpec {
-        service: "rustfs",
+        service: RUSTFS_SERVICE_NAME,
         default_host_port: DEFAULT_RUSTFS_PORT,
         container_port: 9000,
         env_var: "STUDIOFS_E2E_RUSTFS_PORT",
     },
     ServicePortSpec {
-        service: "rustfs-console",
+        service: RUSTFS_CONSOLE_SERVICE_NAME,
         default_host_port: DEFAULT_RUSTFS_CONSOLE_PORT,
         container_port: 9001,
         env_var: "STUDIOFS_E2E_RUSTFS_CONSOLE_PORT",
     },
     ServicePortSpec {
-        service: "toxiproxy-api",
+        service: TOXIPROXY_API_SERVICE_NAME,
         default_host_port: DEFAULT_TOXIPROXY_API_PORT,
         container_port: 8474,
         env_var: "STUDIOFS_E2E_TOXIPROXY_API_PORT",
@@ -251,21 +256,21 @@ impl DockerComposeStack {
     }
 
     pub fn start(&self, executor: &dyn CommandExecutor) -> Result<(), InfraError> {
-        self.run_success(executor, "docker compose up --wait", self.up_command())?;
+        run_success(executor, "docker compose up --wait", self.up_command())?;
         Ok(())
     }
 
     pub fn stop(&self, executor: &dyn CommandExecutor) -> Result<(), InfraError> {
         let mut command = self.compose_command();
         command.args.push("stop".to_string());
-        self.run_success(executor, "docker compose stop", command)?;
+        run_success(executor, "docker compose stop", command)?;
         Ok(())
     }
 
     pub fn restart(&self, executor: &dyn CommandExecutor) -> Result<(), InfraError> {
         let mut command = self.compose_command();
         command.args.push("restart".to_string());
-        self.run_success(executor, "docker compose restart", command)?;
+        run_success(executor, "docker compose restart", command)?;
         self.start(executor)?;
         Ok(())
     }
@@ -294,7 +299,7 @@ impl DockerComposeStack {
             "--no-color".to_string(),
             "--timestamps".to_string(),
         ]);
-        let output = self.run_success(executor, "docker compose logs", command)?;
+        let output = run_success(executor, "docker compose logs", command)?;
         let log_path = self.docker_artifact_dir().join("compose.log");
         fs::write(&log_path, output.stdout)?;
         fs::write(
@@ -316,7 +321,7 @@ impl DockerComposeStack {
             &[
                 "exec",
                 "-T",
-                "postgres",
+                POSTGRES_SERVICE_NAME,
                 "pg_dump",
                 "--username",
                 "studiofs",
@@ -336,7 +341,7 @@ impl DockerComposeStack {
             &[
                 "exec",
                 "-T",
-                "rustfs",
+                RUSTFS_SERVICE_NAME,
                 "sh",
                 "-c",
                 "find /data -mindepth 1 -maxdepth 8 -print | sort",
@@ -357,7 +362,7 @@ impl DockerComposeStack {
             "--volumes".to_string(),
             "--remove-orphans".to_string(),
         ]);
-        self.run_success(
+        run_success(
             executor,
             "docker compose down --volumes --remove-orphans",
             command,
@@ -431,24 +436,6 @@ impl DockerComposeStack {
                 passed: false,
                 detail: err.to_string(),
             },
-        }
-    }
-
-    fn run_success(
-        &self,
-        executor: &dyn CommandExecutor,
-        action: &str,
-        command: CommandSpec,
-    ) -> Result<CommandOutput, InfraError> {
-        let output = executor.run(&command)?;
-        if output.status == 0 {
-            Ok(output)
-        } else {
-            Err(InfraError::CommandFailed {
-                action: action.to_string(),
-                status: output.status,
-                stderr: output.stderr,
-            })
         }
     }
 
