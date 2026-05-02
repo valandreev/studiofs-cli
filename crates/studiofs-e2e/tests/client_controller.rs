@@ -5,35 +5,18 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use studiofs_e2e::client::{
-    ClientCommand, ClientCommandOutput, ClientControllerConfig, ClientLifecycleState,
-    ClientProcess, ClientProcessExecutor, MultiClientController, S3Config,
+    ClientCommand, ClientCommandOutput, ClientControllerConfig, ClientControllerError,
+    ClientLifecycleState, ClientProcess, ClientProcessExecutor, MultiClientController, S3Config,
 };
 use tempfile::tempdir;
 
 #[test]
 fn controller_bootstraps_mounts_restarts_and_kills_isolated_clients() {
     let temp = tempdir().unwrap();
-    let calls = Rc::new(RefCell::new(Vec::new()));
-    let killed = Rc::new(Cell::new(0));
-    let executor = RecordingExecutor {
-        calls: Rc::clone(&calls),
-        killed: Rc::clone(&killed),
-        next_pid: Cell::new(100),
-    };
-    let config = ClientControllerConfig {
-        studiofs_bin: Path::new("studiofs-test-bin").to_path_buf(),
-        sandbox: temp.path().join("run-1"),
-        volume_name: "projectfs".to_string(),
-        meta_dsn: "postgres://studiofs:studiofs@127.0.0.1:25432".to_string(),
-        s3: S3Config {
-            endpoint: "http://127.0.0.1:29000".to_string(),
-            bucket: "studiofs-e2e".to_string(),
-            access_key: "studiofs".to_string(),
-            secret_key: "studiofs123".to_string(),
-            region: "us-east-1".to_string(),
-        },
-        mount_ready_timeout: Duration::from_millis(1),
-    };
+    let executor = RecordingExecutor::new();
+    let calls = Rc::clone(&executor.calls);
+    let killed = Rc::clone(&executor.killed);
+    let config = test_config(temp.path());
     let mut controller = MultiClientController::new(config, executor);
 
     controller
@@ -98,20 +81,134 @@ fn controller_bootstraps_mounts_restarts_and_kills_isolated_clients() {
     assert_eq!(killed.get(), 3);
 }
 
+#[test]
+fn system_readiness_does_not_accept_precreated_mount_directory() {
+    let temp = tempdir().unwrap();
+    let executor = studiofs_e2e::client::SystemClientProcessExecutor;
+    let command = client_command_for_mount_point(temp.path().join("mount"));
+    std::fs::create_dir_all(&command.mount_point).unwrap();
+
+    assert!(!executor.is_mount_ready(&command).unwrap());
+}
+
+#[test]
+fn create_clients_refuses_to_drop_running_process_handles() {
+    let temp = tempdir().unwrap();
+    let executor = RecordingExecutor::new();
+    let killed = Rc::clone(&executor.killed);
+    let mut controller = MultiClientController::new(test_config(temp.path()), executor);
+    controller.create_clients(["client-a"]).unwrap();
+    controller.init_first_client().unwrap();
+    controller.mount_all().unwrap();
+
+    let err = controller.create_clients(["client-b"]).unwrap_err();
+
+    assert!(matches!(err, ClientControllerError::ClientsStillMounted));
+    assert_eq!(killed.get(), 0);
+    assert_eq!(controller.clients()[0].name, "client-a");
+}
+
+#[test]
+fn unmount_waits_for_mount_process_to_exit() {
+    let temp = tempdir().unwrap();
+    let executor = RecordingExecutor::new();
+    let process_wait_calls = Rc::clone(&executor.process_wait_calls);
+    let mut controller = MultiClientController::new(test_config(temp.path()), executor);
+    controller.create_clients(["client-a"]).unwrap();
+    controller.init_first_client().unwrap();
+    controller.mount_all().unwrap();
+
+    controller.unmount_all().unwrap();
+
+    assert!(process_wait_calls.get() >= 2);
+    assert_eq!(
+        controller.clients()[0].state,
+        ClientLifecycleState::Unmounted
+    );
+}
+
+#[test]
+fn mount_reports_process_exit_while_waiting_for_readiness() {
+    let temp = tempdir().unwrap();
+    let executor = RecordingExecutor {
+        mount_ready: Cell::new(false),
+        process_exit_status: Cell::new(42),
+        ..RecordingExecutor::new()
+    };
+    let mut controller = MultiClientController::new(test_config(temp.path()), executor);
+    controller.create_clients(["client-a"]).unwrap();
+    controller.init_first_client().unwrap();
+
+    let err = controller.mount_all().unwrap_err();
+
+    assert!(matches!(
+        err,
+        ClientControllerError::CommandFailed {
+            action,
+            status: 42,
+            ..
+        } if action == "mount"
+    ));
+    assert_eq!(controller.clients()[0].state, ClientLifecycleState::Exited);
+}
+
+#[test]
+fn command_failure_includes_stdout_and_stderr() {
+    let temp = tempdir().unwrap();
+    let executor = RecordingExecutor {
+        run_status: Cell::new(17),
+        run_stdout: "stdout diagnostics".to_string(),
+        run_stderr: "stderr diagnostics".to_string(),
+        ..RecordingExecutor::new()
+    };
+    let mut controller = MultiClientController::new(test_config(temp.path()), executor);
+    controller.create_clients(["client-a"]).unwrap();
+
+    let err = controller.init_first_client().unwrap_err();
+    let message = err.to_string();
+
+    assert!(message.contains("stdout diagnostics"));
+    assert!(message.contains("stderr diagnostics"));
+}
+
 #[derive(Clone)]
 struct RecordingExecutor {
     calls: Rc<RefCell<Vec<ClientCommand>>>,
     killed: Rc<Cell<usize>>,
+    readiness_calls: Rc<Cell<usize>>,
+    process_wait_calls: Rc<Cell<usize>>,
     next_pid: Cell<u32>,
+    mount_ready: Cell<bool>,
+    process_exit_status: Cell<i32>,
+    run_status: Cell<i32>,
+    run_stdout: String,
+    run_stderr: String,
+}
+
+impl RecordingExecutor {
+    fn new() -> Self {
+        Self {
+            calls: Rc::new(RefCell::new(Vec::new())),
+            killed: Rc::new(Cell::new(0)),
+            readiness_calls: Rc::new(Cell::new(0)),
+            process_wait_calls: Rc::new(Cell::new(0)),
+            next_pid: Cell::new(100),
+            mount_ready: Cell::new(true),
+            process_exit_status: Cell::new(0),
+            run_status: Cell::new(0),
+            run_stdout: String::new(),
+            run_stderr: String::new(),
+        }
+    }
 }
 
 impl ClientProcessExecutor for RecordingExecutor {
     fn run(&self, command: &ClientCommand) -> io::Result<ClientCommandOutput> {
         self.calls.borrow_mut().push(command.clone());
         Ok(ClientCommandOutput {
-            status: 0,
-            stdout: String::new(),
-            stderr: String::new(),
+            status: self.run_status.get(),
+            stdout: self.run_stdout.clone(),
+            stderr: self.run_stderr.clone(),
         })
     }
 
@@ -122,21 +219,24 @@ impl ClientProcessExecutor for RecordingExecutor {
         Ok(Box::new(RecordingProcess {
             pid,
             killed: Rc::clone(&self.killed),
+            wait_calls: Rc::clone(&self.process_wait_calls),
+            try_wait_calls: Cell::new(0),
+            exit_status: self.process_exit_status.get(),
         }))
     }
 
-    fn wait_until_mount_ready(
-        &self,
-        _command: &ClientCommand,
-        _timeout: Duration,
-    ) -> io::Result<()> {
-        Ok(())
+    fn is_mount_ready(&self, _command: &ClientCommand) -> io::Result<bool> {
+        self.readiness_calls.set(self.readiness_calls.get() + 1);
+        Ok(self.mount_ready.get())
     }
 }
 
 struct RecordingProcess {
     pid: u32,
     killed: Rc<Cell<usize>>,
+    wait_calls: Rc<Cell<usize>>,
+    try_wait_calls: Cell<usize>,
+    exit_status: i32,
 }
 
 impl ClientProcess for RecordingProcess {
@@ -145,11 +245,47 @@ impl ClientProcess for RecordingProcess {
     }
 
     fn try_wait(&mut self) -> io::Result<Option<i32>> {
-        Ok(None)
+        self.wait_calls.set(self.wait_calls.get() + 1);
+        let calls = self.try_wait_calls.get() + 1;
+        self.try_wait_calls.set(calls);
+        Ok((calls > 1).then_some(self.exit_status))
     }
 
     fn kill(&mut self) -> io::Result<()> {
         self.killed.set(self.killed.get() + 1);
         Ok(())
+    }
+}
+
+fn test_config(root: &Path) -> ClientControllerConfig {
+    ClientControllerConfig {
+        studiofs_bin: Path::new("studiofs-test-bin").to_path_buf(),
+        sandbox: root.join("run-1"),
+        volume_name: "projectfs".to_string(),
+        meta_dsn: "postgres://studiofs:studiofs@127.0.0.1:25432".to_string(),
+        s3: S3Config {
+            endpoint: "http://127.0.0.1:29000".to_string(),
+            bucket: "studiofs-e2e".to_string(),
+            access_key: "studiofs".to_string(),
+            secret_key: "studiofs123".to_string(),
+            region: "us-east-1".to_string(),
+        },
+        mount_ready_timeout: Duration::from_millis(1),
+    }
+}
+
+fn client_command_for_mount_point(mount_point: std::path::PathBuf) -> ClientCommand {
+    ClientCommand {
+        client: "client-a".to_string(),
+        action: "mount".to_string(),
+        program: "studiofs-test-bin".to_string(),
+        args: Vec::new(),
+        env: Vec::new(),
+        client_root: mount_point.join("client-root"),
+        cache_dir: mount_point.join("cache"),
+        mount_point,
+        stdout_log: Path::new("stdout.log").to_path_buf(),
+        stderr_log: Path::new("stderr.log").to_path_buf(),
+        tracing_log: Path::new("tracing.log").to_path_buf(),
     }
 }

@@ -2,7 +2,7 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write as _};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -88,7 +88,7 @@ pub trait ClientProcess {
 pub trait ClientProcessExecutor {
     fn run(&self, command: &ClientCommand) -> io::Result<ClientCommandOutput>;
     fn spawn(&self, command: &ClientCommand) -> io::Result<Box<dyn ClientProcess>>;
-    fn wait_until_mount_ready(&self, command: &ClientCommand, timeout: Duration) -> io::Result<()>;
+    fn is_mount_ready(&self, command: &ClientCommand) -> io::Result<bool>;
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -129,24 +129,8 @@ impl ClientProcessExecutor for SystemClientProcessExecutor {
         Ok(Box::new(SystemClientProcess { child }))
     }
 
-    fn wait_until_mount_ready(&self, command: &ClientCommand, timeout: Duration) -> io::Result<()> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if command.mount_point.exists() {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!(
-                        "mount point for {} was not ready: {}",
-                        command.client,
-                        command.mount_point.display()
-                    ),
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
+    fn is_mount_ready(&self, command: &ClientCommand) -> io::Result<bool> {
+        mount_point_is_active(&command.mount_point)
     }
 }
 
@@ -175,13 +159,18 @@ impl ClientProcess for SystemClientProcess {
 pub enum ClientControllerError {
     #[error("no E2E clients have been created")]
     NoClients,
+    #[error("cannot replace E2E clients while mount processes are still tracked")]
+    ClientsStillMounted,
     #[error("unknown E2E client: {0}")]
     UnknownClient(String),
-    #[error("client command {action} for {client} failed with exit status {status}: {stderr}")]
+    #[error(
+        "client command {action} for {client} failed with exit status {status}: stderr: {stderr}; stdout: {stdout}"
+    )]
     CommandFailed {
         client: String,
         action: String,
         status: i32,
+        stdout: String,
         stderr: String,
     },
     #[error("client controller I/O failed: {0}")]
@@ -208,6 +197,9 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         I: IntoIterator<Item = N>,
         N: AsRef<str>,
     {
+        if self.clients.iter().any(|runtime| runtime.process.is_some()) {
+            return Err(ClientControllerError::ClientsStillMounted);
+        }
         self.clients.clear();
         for name in names {
             let spec = self.create_client_spec(name.as_ref())?;
@@ -286,17 +278,16 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         let command = self.mount_command(index)?;
         let mut process = self.executor.spawn(&command)?;
         let process_id = process.id();
-        if let Some(exit_code) = process.try_wait()? {
-            self.clients[index].spec.state = ClientLifecycleState::Exited;
-            return Err(ClientControllerError::CommandFailed {
-                client: command.client,
-                action: command.action,
-                status: exit_code,
-                stderr: format!("mount process exited before readiness with status {exit_code}"),
-            });
+        if let Err(err) = self.wait_until_mount_ready(&command, process.as_mut()) {
+            let _ = process.kill();
+            self.clients[index].spec.state =
+                if matches!(err, ClientControllerError::CommandFailed { .. }) {
+                    ClientLifecycleState::Exited
+                } else {
+                    ClientLifecycleState::Killed
+                };
+            return Err(err);
         }
-        self.executor
-            .wait_until_mount_ready(&command, self.config.mount_ready_timeout)?;
         self.clients[index].spec.process_id = Some(process_id);
         self.clients[index].spec.state = ClientLifecycleState::Mounted;
         self.clients[index].process = Some(process);
@@ -307,6 +298,9 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         let command = self.unmount_command(index)?;
         let output = self.executor.run(&command)?;
         ensure_success(&command, output)?;
+        if let Some(process) = self.clients[index].process.as_mut() {
+            wait_for_process_exit(process.as_mut(), Duration::from_secs(15))?;
+        }
         self.clients[index].process = None;
         self.clients[index].spec.process_id = None;
         self.clients[index].spec.state = ClientLifecycleState::Unmounted;
@@ -321,34 +315,12 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
     }
 
     fn create_client_spec(&self, name: &str) -> Result<ClientSpec, ClientControllerError> {
-        let client_dir = self
-            .config
-            .sandbox
-            .join("artifacts")
-            .join("clients")
-            .join(name);
-        let client_root = client_dir.join("client-root");
-        let local_metadata_dir = client_root.join("meta").join(&self.config.volume_name);
-        let local_metadata_db = local_metadata_dir.join(format!("{}.db", self.config.volume_name));
-        let cache_dir = client_dir.join("cache");
-        let mount_point = client_dir.join("mount");
-        fs::create_dir_all(&client_root)?;
-        fs::create_dir_all(&local_metadata_dir)?;
-        fs::create_dir_all(&cache_dir)?;
-        fs::create_dir_all(&mount_point)?;
-        Ok(ClientSpec {
-            name: name.to_string(),
-            client_root,
-            local_metadata_dir,
-            local_metadata_db,
-            cache_dir,
-            mount_point,
-            stdout_log: client_dir.join("studiofs.stdout.log"),
-            stderr_log: client_dir.join("studiofs.stderr.log"),
-            tracing_log: client_dir.join("studiofs-tracing.log"),
-            process_id: None,
-            state: ClientLifecycleState::Planned,
-        })
+        let spec = client_spec_for(&self.config.sandbox, &self.config.volume_name, name);
+        fs::create_dir_all(&spec.client_root)?;
+        fs::create_dir_all(&spec.local_metadata_dir)?;
+        fs::create_dir_all(&spec.cache_dir)?;
+        fs::create_dir_all(&spec.mount_point)?;
+        Ok(spec)
     }
 
     fn init_command(&self, index: usize) -> Result<ClientCommand, ClientControllerError> {
@@ -431,6 +403,51 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
             .map(|runtime| &runtime.spec)
             .ok_or(ClientControllerError::NoClients)
     }
+
+    fn wait_until_mount_ready(
+        &self,
+        command: &ClientCommand,
+        process: &mut dyn ClientProcess,
+    ) -> Result<(), ClientControllerError> {
+        let deadline = Instant::now() + self.config.mount_ready_timeout;
+        loop {
+            if let Some(exit_code) = process.try_wait()? {
+                return Err(ClientControllerError::CommandFailed {
+                    client: command.client.clone(),
+                    action: command.action.clone(),
+                    status: exit_code,
+                    stdout: String::new(),
+                    stderr: format!(
+                        "mount process exited before readiness with status {exit_code}"
+                    ),
+                });
+            }
+            if self.executor.is_mount_ready(command)? {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(ClientControllerError::Io(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "mount point for {} was not ready: {}",
+                        command.client,
+                        command.mount_point.display()
+                    ),
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+impl<E> Drop for MultiClientController<E> {
+    fn drop(&mut self) {
+        for runtime in &mut self.clients {
+            if let Some(process) = runtime.process.as_mut() {
+                let _ = process.kill();
+            }
+        }
+    }
 }
 
 struct ClientRuntime {
@@ -449,8 +466,74 @@ fn ensure_success(
             client: command.client.clone(),
             action: command.action.clone(),
             status: output.status,
+            stdout: output.stdout,
             stderr: output.stderr,
         })
+    }
+}
+
+pub fn client_artifact_dir(sandbox: &Path, client: &str) -> PathBuf {
+    sandbox.join("artifacts").join("clients").join(client)
+}
+
+pub fn client_root_dir(sandbox: &Path, client: &str) -> PathBuf {
+    client_artifact_dir(sandbox, client).join("client-root")
+}
+
+pub fn client_cache_dir(sandbox: &Path, client: &str) -> PathBuf {
+    client_artifact_dir(sandbox, client).join("cache")
+}
+
+pub fn client_mount_point(sandbox: &Path, client: &str) -> PathBuf {
+    client_artifact_dir(sandbox, client).join("mount")
+}
+
+pub fn client_stdout_log(sandbox: &Path, client: &str) -> PathBuf {
+    client_artifact_dir(sandbox, client).join("studiofs.stdout.log")
+}
+
+pub fn client_stderr_log(sandbox: &Path, client: &str) -> PathBuf {
+    client_artifact_dir(sandbox, client).join("studiofs.stderr.log")
+}
+
+pub fn client_tracing_log(sandbox: &Path, client: &str) -> PathBuf {
+    client_artifact_dir(sandbox, client).join("studiofs-tracing.log")
+}
+
+pub fn client_spec_for(sandbox: &Path, volume_name: &str, client: &str) -> ClientSpec {
+    let client_root = client_root_dir(sandbox, client);
+    let local_metadata_dir = client_root.join("meta").join(volume_name);
+    ClientSpec {
+        name: client.to_string(),
+        local_metadata_db: local_metadata_dir.join(format!("{volume_name}.db")),
+        local_metadata_dir,
+        client_root,
+        cache_dir: client_cache_dir(sandbox, client),
+        mount_point: client_mount_point(sandbox, client),
+        stdout_log: client_stdout_log(sandbox, client),
+        stderr_log: client_stderr_log(sandbox, client),
+        tracing_log: client_tracing_log(sandbox, client),
+        process_id: None,
+        state: ClientLifecycleState::Planned,
+    }
+}
+
+fn wait_for_process_exit(
+    process: &mut dyn ClientProcess,
+    timeout: Duration,
+) -> Result<(), ClientControllerError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if process.try_wait()?.is_some() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(ClientControllerError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "mount process did not exit after graceful unmount",
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -495,4 +578,48 @@ fn append_log(path: &PathBuf, bytes: &[u8]) -> io::Result<()> {
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     file.write_all(bytes)?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn mount_point_is_active(path: &Path) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err),
+    };
+    let Some(parent) = path.parent() else {
+        return Ok(false);
+    };
+    let parent = fs::metadata(parent)?;
+    Ok(metadata.dev() != parent.dev())
+}
+
+#[cfg(windows)]
+fn mount_point_is_active(path: &Path) -> io::Result<bool> {
+    let Some(root) = windows_drive_root(path) else {
+        return Ok(false);
+    };
+    Ok(root.exists())
+}
+
+#[cfg(windows)]
+fn windows_drive_root(path: &Path) -> Option<PathBuf> {
+    let value = path.as_os_str().to_string_lossy();
+    let bytes = value.as_bytes();
+    let drive = bytes.first().copied()?;
+    if !drive.is_ascii_alphabetic() || bytes.get(1).copied() != Some(b':') {
+        return None;
+    }
+    let suffix = &value[2..];
+    if !matches!(suffix, "" | "\\" | "/") {
+        return None;
+    }
+    Some(PathBuf::from(format!("{}:\\", char::from(drive))))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn mount_point_is_active(path: &Path) -> io::Result<bool> {
+    Ok(path.exists())
 }
