@@ -92,14 +92,32 @@ target/e2e-runs/<run-id>/
     clients/
       client-a/
         client-root/
+        cache/
         mount/
         studiofs.stdout.log
         studiofs.stderr.log
+        studiofs-tracing.log
       client-b/
         client-root/
+        cache/
         mount/
         studiofs.stdout.log
         studiofs.stderr.log
+        studiofs-tracing.log
+      client-c/
+        client-root/
+        cache/
+        mount/
+        studiofs.stdout.log
+        studiofs.stderr.log
+        studiofs-tracing.log
+      client-d/
+        client-root/
+        cache/
+        mount/
+        studiofs.stdout.log
+        studiofs.stderr.log
+        studiofs-tracing.log
 ```
 
 On Windows, `artifacts/clients/<client>/mount/` is a metadata directory for the
@@ -129,6 +147,21 @@ The following artifact names are required and stable:
 | `artifacts/commands/` | Per-command stdout/stderr/status records for child commands. |
 | `artifacts/scenarios/<scenario-name>/` | Scenario-specific inputs, probes, and validation output. |
 | `artifacts/clients/<client>/` | Client root, mount metadata, mount logs, and post-run status snapshots. |
+
+## Multi-Client Process Controller
+
+Mounted multi-client scenarios use the `studiofs-e2e::client` controller to
+create isolated logical clients in `artifacts/clients/<client>/`. Each client
+gets a dedicated `STUDIOFS_CLIENT_ROOT`, local metadata path
+`client-root/meta/<volume>/<volume>.db`, cache directory, mount point,
+stdout/stderr logs, tracing log stem, and lifecycle state.
+
+The controller bootstraps the first client with `studiofs init`, discovers the
+same volume for additional clients with `studiofs discover`, spawns foreground
+`studiofs mount` processes with per-client environment variables, waits for
+mount readiness, and supports graceful `studiofs umount`, forced child-process
+kill, and restart/remount. Scenarios must use this controller rather than
+sharing one local metadata DB or falling back to direct VFS calls.
 
 Retention behavior:
 
