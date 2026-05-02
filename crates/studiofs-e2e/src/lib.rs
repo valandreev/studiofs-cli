@@ -3,6 +3,7 @@
 pub mod cli;
 pub mod client;
 pub mod infra;
+pub mod mounted_tree;
 pub mod report;
 pub mod runner;
 pub mod scenario;

@@ -163,6 +163,29 @@ mount readiness, and supports graceful `studiofs umount`, forced child-process
 kill, and restart/remount. Scenarios must use this controller rather than
 sharing one local metadata DB or falling back to direct VFS calls.
 
+## Mounted Tree Convergence Validation
+
+Mounted scenarios validate client-visible invariants through the
+`studiofs-e2e::mounted_tree` validator. The validator snapshots public
+mountpoints only; it must not inspect private VFS, metadata, cache, PostgreSQL,
+or object-store state to decide whether a scenario passed.
+
+The portable equality contract is intentionally narrow:
+
+- required comparison fields: relative path, entry type, regular-file size, and
+  regular-file SHA-256 content checksum;
+- diagnostic-only fields: mtimes and other platform-derived metadata;
+- out-of-initial-scope metadata: symlinks, xattrs, hard links, and
+  platform-specific file attributes unless a later StudioFS contract explicitly
+  makes them mandatory.
+
+Snapshot JSON must be deterministic across repeated runs and operating systems:
+entries are sorted by forward-slash relative path, and per-client snapshots are
+written as `tree-client-N.json`. When convergence times out, validation writes
+one tree snapshot per client plus `diff.json` in the scenario validation
+artifact directory. Temporary divergence during the convergence window is
+recorded by repeated polling but is not a failure until the timeout expires.
+
 Retention behavior:
 
 - `always` keeps the full sandbox after cleanup.

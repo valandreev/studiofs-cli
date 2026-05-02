@@ -149,6 +149,7 @@ Focused runner skeleton check:
 ```powershell
 cargo test -p studiofs-e2e --test runner_contract
 cargo test -p studiofs-e2e --test compose_infra
+cargo test -p studiofs-e2e --test mounted_tree_validator
 ```
 
 ## Platform-Gated Unit Tests
