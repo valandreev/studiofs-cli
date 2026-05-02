@@ -726,6 +726,7 @@ fn run_scenario_lifecycle(
     let operation_log = context.scenario_dir.join("operations.ndjson");
     let operation_artifact = scenario_artifact_path(definition.name, "operations.ndjson");
 
+    fs::create_dir_all(&context.scenario_dir)?;
     let result = run_scenario_body(events_path, &operation_log, run_id, scenario, context);
     let cleanup_result = run_hook(
         events_path,
@@ -860,9 +861,6 @@ fn record_event(
         hook: hook.to_string(),
         phase: phase.to_string(),
     };
-    if let Some(parent) = events_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -966,7 +964,7 @@ fn collect_existing_artifacts(
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
             collect_existing_artifacts(sandbox, &path, artifacts, seen)?;
-        } else if file_type.is_file() {
+        } else if file_type.is_file() || file_type.is_symlink() {
             let relative = normalize_relative_path(&path, sandbox);
             add_artifact(
                 artifacts,
@@ -1245,6 +1243,39 @@ mod tests {
                 "artifacts/scenarios/a/logs.txt",
                 "artifacts/scenarios/b/logs.txt"
             ]
+        );
+    }
+
+    #[test]
+    fn record_event_requires_existing_parent_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing_parent_event = temp.path().join("missing").join("events.ndjson");
+
+        let err = record_event(&missing_parent_event, "run-1", None, "run", "started")
+            .expect_err("event writer should not create missing parent directories");
+
+        assert!(matches!(err, RunnerError::Io(_)));
+        assert!(!missing_parent_event.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn report_artifact_discovery_includes_symlink_entries() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let artifact_dir = sandbox.join("artifacts/scenarios/smoke");
+        std::fs::create_dir_all(&artifact_dir).unwrap();
+        std::fs::write(artifact_dir.join("target.txt"), "target").unwrap();
+        symlink("target.txt", artifact_dir.join("linked-target.txt")).unwrap();
+
+        let artifacts = collect_report_artifacts(&sandbox, &[]).unwrap();
+
+        assert!(
+            artifacts
+                .iter()
+                .any(|artifact| artifact.path == "artifacts/scenarios/smoke/linked-target.txt")
         );
     }
 

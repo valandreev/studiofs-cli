@@ -310,6 +310,7 @@ impl DockerComposeStack {
             ],
             "postgres-schema.sql",
             "postgres-schema.stderr.log",
+            "postgres-schema.status.json",
         )? {
             collected.push("postgres metadata dump".to_string());
         }
@@ -326,6 +327,7 @@ impl DockerComposeStack {
             ],
             "rustfs-object-listing.txt",
             "rustfs-object-listing.stderr.log",
+            "rustfs-object-listing.status.json",
         )? {
             collected.push("rustfs object listing".to_string());
         }
@@ -354,6 +356,7 @@ impl DockerComposeStack {
         args: &[&str],
         stdout_file: &str,
         stderr_file: &str,
+        status_file: &str,
     ) -> Result<bool, InfraError> {
         let mut command = self.compose_command();
         command
@@ -361,17 +364,18 @@ impl DockerComposeStack {
             .extend(args.iter().map(|arg| (*arg).to_string()));
         let output = executor.run(&command)?;
         let artifact_dir = self.docker_artifact_dir();
+        let collected = output.status == 0;
+        fs::write(artifact_dir.join(stdout_file), &output.stdout)?;
         fs::write(artifact_dir.join(stderr_file), &output.stderr)?;
-        if output.status == 0 {
-            fs::write(artifact_dir.join(stdout_file), output.stdout)?;
-            Ok(true)
-        } else {
-            fs::write(
-                artifact_dir.join(stdout_file),
-                format!("{action} skipped: exit status {}\n", output.status),
-            )?;
-            Ok(false)
-        }
+        fs::write(
+            artifact_dir.join(status_file),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "action": action,
+                "status": output.status,
+                "collected": collected,
+            }))?,
+        )?;
+        Ok(collected)
     }
 
     fn compose_command(&self) -> CommandSpec {

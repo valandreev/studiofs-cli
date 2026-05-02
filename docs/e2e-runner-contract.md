@@ -163,8 +163,15 @@ diagnostics before teardown:
 | `artifacts/docker/compose.stderr.log` | stderr from Docker Compose log collection. |
 | `artifacts/docker/postgres-schema.sql` | Optional PostgreSQL schema dump from the running `postgres` service. |
 | `artifacts/docker/postgres-schema.stderr.log` | stderr from optional PostgreSQL dump collection. |
+| `artifacts/docker/postgres-schema.status.json` | Exit status and collected/skipped marker for optional PostgreSQL dump collection. |
 | `artifacts/docker/rustfs-object-listing.txt` | Optional RustFS `/data` object listing from the running `rustfs` service. |
 | `artifacts/docker/rustfs-object-listing.stderr.log` | stderr from optional RustFS listing collection. |
+| `artifacts/docker/rustfs-object-listing.status.json` | Exit status and collected/skipped marker for optional RustFS listing collection. |
+
+Optional diagnostic stdout artifacts are written even when their command exits
+non-zero; the status JSON records whether the artifact was complete. Artifact
+discovery includes regular files and symlink entries under `artifacts/`, but it
+does not recurse through symlinked directories.
 
 ## Multi-Client Process Controller
 
