@@ -15,27 +15,32 @@ const DEFAULT_RUSTFS_PORT: u16 = 29_000;
 const DEFAULT_RUSTFS_CONSOLE_PORT: u16 = 29_001;
 const DEFAULT_TOXIPROXY_API_PORT: u16 = 28_474;
 
+pub const POSTGRES_SERVICE_NAME: &str = "postgres";
+const RUSTFS_SERVICE_NAME: &str = "rustfs";
+const RUSTFS_CONSOLE_SERVICE_NAME: &str = "rustfs-console";
+const TOXIPROXY_API_SERVICE_NAME: &str = "toxiproxy-api";
+
 const SERVICE_PORTS: &[ServicePortSpec] = &[
     ServicePortSpec {
-        service: "postgres",
+        service: POSTGRES_SERVICE_NAME,
         default_host_port: DEFAULT_POSTGRES_PORT,
         container_port: 5432,
         env_var: "STUDIOFS_E2E_POSTGRES_PORT",
     },
     ServicePortSpec {
-        service: "rustfs",
+        service: RUSTFS_SERVICE_NAME,
         default_host_port: DEFAULT_RUSTFS_PORT,
         container_port: 9000,
         env_var: "STUDIOFS_E2E_RUSTFS_PORT",
     },
     ServicePortSpec {
-        service: "rustfs-console",
+        service: RUSTFS_CONSOLE_SERVICE_NAME,
         default_host_port: DEFAULT_RUSTFS_CONSOLE_PORT,
         container_port: 9001,
         env_var: "STUDIOFS_E2E_RUSTFS_CONSOLE_PORT",
     },
     ServicePortSpec {
-        service: "toxiproxy-api",
+        service: TOXIPROXY_API_SERVICE_NAME,
         default_host_port: DEFAULT_TOXIPROXY_API_PORT,
         container_port: 8474,
         env_var: "STUDIOFS_E2E_TOXIPROXY_API_PORT",
@@ -251,23 +256,39 @@ impl DockerComposeStack {
     }
 
     pub fn start(&self, executor: &dyn CommandExecutor) -> Result<(), InfraError> {
-        self.run_success(executor, "docker compose up --wait", self.up_command())?;
+        run_success(executor, "docker compose up --wait", self.up_command())?;
         Ok(())
     }
 
     pub fn stop(&self, executor: &dyn CommandExecutor) -> Result<(), InfraError> {
         let mut command = self.compose_command();
         command.args.push("stop".to_string());
-        self.run_success(executor, "docker compose stop", command)?;
+        run_success(executor, "docker compose stop", command)?;
         Ok(())
     }
 
     pub fn restart(&self, executor: &dyn CommandExecutor) -> Result<(), InfraError> {
         let mut command = self.compose_command();
         command.args.push("restart".to_string());
-        self.run_success(executor, "docker compose restart", command)?;
+        run_success(executor, "docker compose restart", command)?;
         self.start(executor)?;
         Ok(())
+    }
+
+    pub fn stop_service(
+        &self,
+        service: &str,
+        executor: &dyn CommandExecutor,
+    ) -> Result<(), InfraError> {
+        self.service_control().stop_service(service, executor)
+    }
+
+    pub fn start_service(
+        &self,
+        service: &str,
+        executor: &dyn CommandExecutor,
+    ) -> Result<(), InfraError> {
+        self.service_control().start_service(service, executor)
     }
 
     pub fn collect_logs(&self, executor: &dyn CommandExecutor) -> Result<PathBuf, InfraError> {
@@ -278,7 +299,7 @@ impl DockerComposeStack {
             "--no-color".to_string(),
             "--timestamps".to_string(),
         ]);
-        let output = self.run_success(executor, "docker compose logs", command)?;
+        let output = run_success(executor, "docker compose logs", command)?;
         let log_path = self.docker_artifact_dir().join("compose.log");
         fs::write(&log_path, output.stdout)?;
         fs::write(
@@ -300,7 +321,7 @@ impl DockerComposeStack {
             &[
                 "exec",
                 "-T",
-                "postgres",
+                POSTGRES_SERVICE_NAME,
                 "pg_dump",
                 "--username",
                 "studiofs",
@@ -320,7 +341,7 @@ impl DockerComposeStack {
             &[
                 "exec",
                 "-T",
-                "rustfs",
+                RUSTFS_SERVICE_NAME,
                 "sh",
                 "-c",
                 "find /data -mindepth 1 -maxdepth 8 -print | sort",
@@ -341,7 +362,7 @@ impl DockerComposeStack {
             "--volumes".to_string(),
             "--remove-orphans".to_string(),
         ]);
-        self.run_success(
+        run_success(
             executor,
             "docker compose down --volumes --remove-orphans",
             command,
@@ -379,18 +400,8 @@ impl DockerComposeStack {
     }
 
     fn compose_command(&self) -> CommandSpec {
-        CommandSpec {
-            program: "docker".to_string(),
-            args: vec![
-                "compose".to_string(),
-                "--project-name".to_string(),
-                self.project_name.clone(),
-                "--file".to_string(),
-                self.compose_file.display().to_string(),
-            ],
-            env: self.compose_environment(),
-            cwd: self.compose_file.parent().map(Path::to_path_buf),
-        }
+        self.service_control()
+            .compose_command(self.compose_environment())
     }
 
     fn compose_environment(&self) -> Vec<(String, String)> {
@@ -428,30 +439,108 @@ impl DockerComposeStack {
         }
     }
 
-    fn run_success(
-        &self,
-        executor: &dyn CommandExecutor,
-        action: &str,
-        command: CommandSpec,
-    ) -> Result<CommandOutput, InfraError> {
-        let output = executor.run(&command)?;
-        if output.status == 0 {
-            Ok(output)
-        } else {
-            Err(InfraError::CommandFailed {
-                action: action.to_string(),
-                status: output.status,
-                stderr: output.stderr,
-            })
-        }
-    }
-
     fn docker_artifact_dir(&self) -> PathBuf {
         self.sandbox.join("artifacts/docker")
     }
 
     fn artifact_compose_file(&self) -> PathBuf {
         self.docker_artifact_dir().join("compose.e2e.yml")
+    }
+
+    fn service_control(&self) -> ComposeServiceControl {
+        ComposeServiceControl {
+            project_name: self.project_name.clone(),
+            compose_file: self.compose_file.clone(),
+            wait_timeout_secs: self.wait_timeout_secs,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComposeServiceControl {
+    pub project_name: String,
+    pub compose_file: PathBuf,
+    pub wait_timeout_secs: u64,
+}
+
+impl ComposeServiceControl {
+    pub fn for_project(project_name: String) -> Result<Self, InfraError> {
+        let compose_file = default_compose_file();
+        if !compose_file.exists() {
+            return Err(InfraError::MissingComposeFile(compose_file));
+        }
+        Ok(Self {
+            project_name,
+            compose_file: compose_file.canonicalize()?,
+            wait_timeout_secs: DEFAULT_WAIT_TIMEOUT_SECS,
+        })
+    }
+
+    pub fn stop_service(
+        &self,
+        service: &str,
+        executor: &dyn CommandExecutor,
+    ) -> Result<(), InfraError> {
+        let mut command = self.compose_command(Vec::new());
+        command
+            .args
+            .extend(["stop".to_string(), service.to_string()]);
+        run_success(executor, &format!("docker compose stop {service}"), command)?;
+        Ok(())
+    }
+
+    pub fn start_service(
+        &self,
+        service: &str,
+        executor: &dyn CommandExecutor,
+    ) -> Result<(), InfraError> {
+        let mut command = self.compose_command(Vec::new());
+        command.args.extend([
+            "up".to_string(),
+            "--detach".to_string(),
+            "--wait".to_string(),
+            "--wait-timeout".to_string(),
+            self.wait_timeout_secs.to_string(),
+            service.to_string(),
+        ]);
+        run_success(
+            executor,
+            &format!("docker compose up --wait {service}"),
+            command,
+        )?;
+        Ok(())
+    }
+
+    fn compose_command(&self, env: Vec<(String, String)>) -> CommandSpec {
+        CommandSpec {
+            program: "docker".to_string(),
+            args: vec![
+                "compose".to_string(),
+                "--project-name".to_string(),
+                self.project_name.clone(),
+                "--file".to_string(),
+                self.compose_file.display().to_string(),
+            ],
+            env,
+            cwd: self.compose_file.parent().map(Path::to_path_buf),
+        }
+    }
+}
+
+fn run_success(
+    executor: &dyn CommandExecutor,
+    action: &str,
+    command: CommandSpec,
+) -> Result<CommandOutput, InfraError> {
+    let output = executor.run(&command)?;
+    if output.status == 0 {
+        Ok(output)
+    } else {
+        Err(InfraError::CommandFailed {
+            action: action.to_string(),
+            status: output.status,
+            stderr: output.stderr,
+        })
     }
 }
 

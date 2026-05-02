@@ -118,6 +118,8 @@ fn compose_stack_lifecycle_collects_logs_and_tears_down_volumes() {
     stack.prepare_artifacts().unwrap();
     stack.start(&executor).unwrap();
     stack.restart(&executor).unwrap();
+    stack.stop_service("postgres", &executor).unwrap();
+    stack.start_service("postgres", &executor).unwrap();
     let log_path = stack.collect_logs(&executor).unwrap();
     let diagnostics = stack.collect_optional_diagnostics(&executor).unwrap();
     stack.stop(&executor).unwrap();
@@ -161,6 +163,14 @@ fn compose_stack_lifecycle_collects_logs_and_tears_down_volumes() {
             .iter()
             .any(|call| call.args.contains(&"restart".to_string()))
     );
+    assert!(calls.iter().any(|call| {
+        call.args.contains(&"stop".to_string()) && call.args.contains(&"postgres".to_string())
+    }));
+    assert!(calls.iter().any(|call| {
+        call.args.contains(&"up".to_string())
+            && call.args.contains(&"--wait".to_string())
+            && call.args.contains(&"postgres".to_string())
+    }));
     assert!(
         calls
             .iter()
