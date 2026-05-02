@@ -233,6 +233,9 @@ validator result in `rustfs-outage-recovery-summary.json`.
 `outage_duration_ms` covers the RustFS stopped window through the accepted
 local write/read boundary; the peer visibility probe runs after that boundary
 so peer I/O latency does not inflate the outage-duration metric.
+Mounted E2E clients set `STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS=250`
+so peers that already cached the healthy payload refresh metadata inside the
+scenario convergence window after RustFS/S3 recovers.
 
 `mounted-client-crash-restart-recovery` uses at least two mounted clients with
 separate `STUDIOFS_CLIENT_ROOT` values. It writes accepted data through
