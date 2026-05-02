@@ -1295,57 +1295,10 @@ impl UploadPolicyPort for VfsUploadPolicyPort {
     }
 
     async fn finalize_completed_upload_epoch(&self, ino: Ino, content_epoch: u64) {
-        if self.vfs.shutdown_requested() {
+        if self.vfs.shutdown_requested() || self.vfs.inode_has_pending_uploads(ino) {
             return;
         }
-        let vfs = self.vfs.clone();
-        tokio::spawn(async move {
-            finalize_completed_upload_epoch(vfs, ino, content_epoch).await;
-        });
-    }
-}
-
-async fn finalize_completed_upload_epoch(vfs: Arc<StudioVfs>, ino: Ino, content_epoch: u64) {
-    if vfs.shutdown_requested() {
-        return;
-    }
-    match super::super::commit::CommitCoordinator::finalize_inode_epoch(&vfs, ino, content_epoch)
-        .await
-    {
-        Ok(super::super::commit::EpochFinalizeStatus::Published) => {
-            vfs.state.file_session.note_background_transition(
-                ino,
-                FileSessionOperation::Finalize,
-                "published",
-            );
-        }
-        Ok(super::super::commit::EpochFinalizeStatus::Skipped) => {
-            vfs.state.file_session.note_background_transition(
-                ino,
-                FileSessionOperation::Finalize,
-                "skipped",
-            );
-        }
-        Ok(super::super::commit::EpochFinalizeStatus::Deferred) => {
-            vfs.state.file_session.note_background_transition(
-                ino,
-                FileSessionOperation::Finalize,
-                "deferred",
-            );
-            vfs.queue_epoch_finalization(ino, content_epoch);
-        }
-        Err(error) => {
-            if vfs.shutdown_requested() {
-                return;
-            }
-            warn!(
-                ino,
-                content_epoch,
-                error = %error,
-                "inline epoch finalization after upload failed, will retry"
-            );
-            vfs.queue_epoch_finalization(ino, content_epoch);
-        }
+        self.vfs.queue_epoch_finalization(ino, content_epoch);
     }
 }
 
