@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 
 use chrono::{SecondsFormat, Utc};
@@ -138,6 +138,12 @@ pub enum RunnerError {
     UnsafeRunId(String),
     #[error("unsafe cleanup root: {0}")]
     UnsafeCleanupRoot(String),
+    #[error("E2E artifact path is outside the run sandbox")]
+    ArtifactPathOutsideSandbox { path: PathBuf, sandbox: PathBuf },
+    #[error("E2E artifact path contains a non-UTF-8 component")]
+    NonUtf8ArtifactPath { path: PathBuf },
+    #[error("E2E artifact path must be relative and must not contain parent components")]
+    UnsafeArtifactPath { path: PathBuf },
     #[error("runner I/O failed: {0}")]
     Io(#[from] std::io::Error),
     #[error("runner JSON failed: {0}")]
@@ -879,12 +885,14 @@ fn collect_report_artifacts(
     for artifact in required_artifacts(scenarios) {
         add_artifact(&mut artifacts, &mut seen, artifact);
     }
+    let required_count = artifacts.len();
     collect_existing_artifacts(
         sandbox,
         &sandbox.join("artifacts"),
         &mut artifacts,
         &mut seen,
     )?;
+    artifacts[required_count..].sort_by(|left, right| left.path.cmp(&right.path));
     Ok(artifacts)
 }
 
@@ -957,15 +965,14 @@ fn collect_existing_artifacts(
     if !dir.exists() {
         return Ok(());
     }
-    let mut entries = fs::read_dir(dir)?.collect::<Result<Vec<_>, _>>()?;
-    entries.sort_by_key(|entry| entry.path());
-    for entry in entries {
+    for entry_result in fs::read_dir(dir)? {
+        let entry = entry_result?;
         let path = entry.path();
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
             collect_existing_artifacts(sandbox, &path, artifacts, seen)?;
         } else if file_type.is_file() || file_type.is_symlink() {
-            let relative = normalize_relative_path(&path, sandbox);
+            let relative = normalize_relative_path(&path, sandbox)?;
             add_artifact(
                 artifacts,
                 seen,
@@ -1003,13 +1010,38 @@ fn scenario_artifact_path(scenario: &str, artifact: &str) -> String {
     format!("artifacts/scenarios/{scenario}/{artifact}")
 }
 
-fn normalize_relative_path(path: &Path, root: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .components()
-        .map(|component| component.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/")
+fn normalize_relative_path(path: &Path, root: &Path) -> Result<String, RunnerError> {
+    let relative =
+        path.strip_prefix(root)
+            .map_err(|_| RunnerError::ArtifactPathOutsideSandbox {
+                path: path.to_path_buf(),
+                sandbox: root.to_path_buf(),
+            })?;
+    let mut components = Vec::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(value) => {
+                let value = value
+                    .to_str()
+                    .ok_or_else(|| RunnerError::NonUtf8ArtifactPath {
+                        path: path.to_path_buf(),
+                    })?;
+                components.push(value.to_string());
+            }
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(RunnerError::UnsafeArtifactPath {
+                    path: relative.to_path_buf(),
+                });
+            }
+        }
+    }
+    if components.is_empty() {
+        return Err(RunnerError::UnsafeArtifactPath {
+            path: relative.to_path_buf(),
+        });
+    }
+    Ok(components.join("/"))
 }
 
 fn write_log_files(sandbox: &Path) -> Result<(), RunnerError> {
@@ -1244,6 +1276,47 @@ mod tests {
                 "artifacts/scenarios/b/logs.txt"
             ]
         );
+    }
+
+    #[test]
+    fn normalize_relative_path_rejects_paths_outside_sandbox() {
+        let temp = tempfile::tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let outside = temp.path().join("outside.log");
+
+        let err = normalize_relative_path(&outside, &sandbox).unwrap_err();
+
+        assert!(matches!(
+            err,
+            RunnerError::ArtifactPathOutsideSandbox { .. }
+        ));
+    }
+
+    #[test]
+    fn normalize_relative_path_rejects_parent_components() {
+        let temp = tempfile::tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let traversal = sandbox.join("artifacts").join("..").join("outside.log");
+
+        let err = normalize_relative_path(&traversal, &sandbox).unwrap_err();
+
+        assert!(matches!(err, RunnerError::UnsafeArtifactPath { .. }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normalize_relative_path_rejects_non_utf8_components() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let invalid = OsString::from_vec(b"invalid-\xFF.log".to_vec());
+        let artifact = sandbox.join("artifacts").join(invalid);
+
+        let err = normalize_relative_path(&artifact, &sandbox).unwrap_err();
+
+        assert!(matches!(err, RunnerError::NonUtf8ArtifactPath { .. }));
     }
 
     #[test]
