@@ -19,7 +19,7 @@ An open-source, self-hosted virtual filesystem optimized for VFX and post-produc
 - **Built for performance with Rust**
   Engineered from the ground up in Rust to guarantee memory safety, zero-overhead performance, and rock-solid stability under the heaviest multi-gigabyte editing workloads.
 
-Unlike proprietary SaaS alternatives, StudioFS is **100% open-source and self-hosted**, giving you absolute control over your storage and infrastructure.
+Unlike proprietary SaaS alternatives, StudioFS is **100% open-source and self-hosted**, giving you absolute control over your storage and infrastructure. No telemetry included.
 
 
 ### ⚠️ Caution
@@ -57,6 +57,7 @@ Key points:
 - Local metadata lives in `redb`; PostgreSQL is used for bootstrap, checkpoints, and ordered delta replication.
 - Writes become readable locally before remote upload/metadata publish fully completes.
 - Multi-client mounts converge through PostgreSQL sync.
+- Internals are highly inspired by JuiceFS Community Edition project.
 
 ## Features
 
