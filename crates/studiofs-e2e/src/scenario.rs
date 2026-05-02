@@ -622,7 +622,6 @@ fn perform_outage_operations(
     context: &ScenarioContext,
     clients: &[ClientSpec],
 ) -> Result<usize, ScenarioError> {
-    fs::create_dir_all(&context.scenario_dir)?;
     let mut log = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -1193,6 +1192,7 @@ mod tests {
             scenario_dir,
             client_controller_config: None,
         };
+        std::fs::create_dir_all(&context.scenario_dir).unwrap();
 
         let err = perform_outage_operations(&context, &clients).unwrap_err();
 
@@ -1207,6 +1207,23 @@ mod tests {
             std::fs::read_to_string(context.scenario_dir.join("outage-operations.ndjson")).unwrap();
         assert!(log.contains("\"accepted\":true"));
         assert!(log.contains("\"accepted\":false"));
+    }
+
+    #[test]
+    fn outage_operations_require_existing_scenario_dir() {
+        let temp = tempdir().unwrap();
+        let context = ScenarioContext {
+            run_id: "run-1".to_string(),
+            seed: 325,
+            sandbox: temp.path().join("run-1"),
+            scenario_dir: temp.path().join("missing-scenario"),
+            client_controller_config: None,
+        };
+
+        let err = perform_outage_operations(&context, &[]).unwrap_err();
+
+        assert!(matches!(err, ScenarioError::Io(_)));
+        assert!(!context.scenario_dir.exists());
     }
 
     fn _test_config(root: &Path) -> ClientControllerConfig {
