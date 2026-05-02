@@ -7,7 +7,9 @@ use std::time::Duration;
 use studiofs_e2e::client::{
     ClientCommand, ClientCommandOutput, ClientControllerConfig, ClientControllerError,
     ClientLifecycleState, ClientProcess, ClientProcessExecutor, MultiClientController, S3Config,
+    VolumeBootstrapOptions,
 };
+use studiofs_e2e::infra::ServicePort;
 use tempfile::tempdir;
 
 #[test]
@@ -80,6 +82,119 @@ fn controller_bootstraps_mounts_restarts_and_kills_isolated_clients() {
             .all(|call| call.stderr_log.ends_with("studiofs.stderr.log"))
     );
     assert_eq!(killed.get(), 3);
+}
+
+#[test]
+fn bootstrap_workflow_initializes_one_volume_and_discovers_isolated_clients() {
+    let temp = tempdir().unwrap();
+    let executor = RecordingExecutor {
+        create_local_metadata_db: true,
+        fail_if_local_metadata_dir_preexists: true,
+        ..RecordingExecutor::new()
+    };
+    let calls = Rc::clone(&executor.calls);
+    let config = test_config(temp.path());
+    let mut controller = MultiClientController::new(config, executor);
+
+    let summary = controller
+        .bootstrap_volume(VolumeBootstrapOptions {
+            client_names: vec![
+                "client-a".to_string(),
+                "client-b".to_string(),
+                "client-c".to_string(),
+            ],
+            clean_existing_local_metadata: false,
+        })
+        .unwrap();
+
+    assert_eq!(summary.volume_name, "projectfs");
+    assert_eq!(summary.init_client, "client-a");
+    assert_eq!(summary.discovered_clients, ["client-b", "client-c"]);
+    assert_eq!(summary.clients.len(), 3);
+    assert!(summary.clients.iter().all(|client| {
+        client.local_metadata_db.exists()
+            && client.local_metadata_db.ends_with("projectfs/projectfs.db")
+    }));
+    assert_ne!(
+        summary.clients[0].local_metadata_db,
+        summary.clients[1].local_metadata_db
+    );
+    assert_ne!(
+        summary.clients[1].local_metadata_db,
+        summary.clients[2].local_metadata_db
+    );
+
+    let calls = calls.borrow();
+    assert_eq!(calls[0].action, "init");
+    assert_eq!(calls[1].action, "discover");
+    assert_eq!(calls[2].action, "discover");
+    assert_eq!(calls[0].args[0], "init");
+    assert_eq!(calls[1].args[0], "discover");
+    assert_eq!(calls[2].args[0], "discover");
+}
+
+#[test]
+fn bootstrap_workflow_can_clean_stale_local_metadata_before_cli_commands() {
+    let temp = tempdir().unwrap();
+    let stale_db = temp
+        .path()
+        .join("run-1")
+        .join("artifacts")
+        .join("clients")
+        .join("client-a")
+        .join("client-root")
+        .join("meta")
+        .join("projectfs")
+        .join("projectfs.db");
+    std::fs::create_dir_all(stale_db.parent().unwrap()).unwrap();
+    std::fs::write(&stale_db, "stale").unwrap();
+    let executor = RecordingExecutor {
+        create_local_metadata_db: true,
+        fail_if_local_metadata_dir_preexists: true,
+        ..RecordingExecutor::new()
+    };
+    let config = test_config(temp.path());
+    let mut controller = MultiClientController::new(config, executor);
+
+    let summary = controller
+        .bootstrap_volume(VolumeBootstrapOptions {
+            client_names: vec!["client-a".to_string()],
+            clean_existing_local_metadata: true,
+        })
+        .unwrap();
+
+    assert_eq!(summary.clients.len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(&summary.clients[0].local_metadata_db).unwrap(),
+        "init"
+    );
+}
+
+#[test]
+fn compose_service_config_derives_unique_volume_and_docker_endpoints() {
+    let temp = tempdir().unwrap();
+    let config = ClientControllerConfig::from_compose_services(
+        Path::new("studiofs-test-bin").to_path_buf(),
+        temp.path().join("run-1"),
+        "Run_1.20260502",
+        321,
+        &[
+            service_port("postgres", 35432),
+            service_port("rustfs", 39000),
+            service_port("rustfs-console", 39001),
+        ],
+    )
+    .unwrap();
+
+    assert_eq!(config.volume_name, "sfs-e2e-run-1-20260502-321");
+    assert_eq!(
+        config.meta_dsn,
+        "postgres://studiofs:studiofs@127.0.0.1:35432"
+    );
+    assert_eq!(config.s3.endpoint, "http://127.0.0.1:39000");
+    assert_eq!(config.s3.bucket, "studiofs-e2e-run-1-20260502");
+    assert_eq!(config.s3.access_key, "rustfsadmin");
+    assert_eq!(config.s3.secret_key, "rustfsadmin");
 }
 
 #[test]
@@ -275,6 +390,8 @@ struct RecordingExecutor {
     run_status: Cell<i32>,
     run_stdout: String,
     run_stderr: String,
+    create_local_metadata_db: bool,
+    fail_if_local_metadata_dir_preexists: bool,
 }
 
 impl RecordingExecutor {
@@ -290,13 +407,34 @@ impl RecordingExecutor {
             run_status: Cell::new(0),
             run_stdout: String::new(),
             run_stderr: String::new(),
+            create_local_metadata_db: false,
+            fail_if_local_metadata_dir_preexists: false,
         }
     }
 }
 
 impl ClientProcessExecutor for RecordingExecutor {
     fn run(&self, command: &ClientCommand) -> io::Result<ClientCommandOutput> {
+        let volume_name = command
+            .args
+            .get(1)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing volume name"))?;
+        let local_metadata_dir = command.client_root.join("meta").join(volume_name);
+        if self.fail_if_local_metadata_dir_preexists && local_metadata_dir.exists() {
+            return Err(io::Error::other(format!(
+                "{} local metadata dir existed before command: {}",
+                command.client,
+                local_metadata_dir.display()
+            )));
+        }
         self.calls.borrow_mut().push(command.clone());
+        if self.create_local_metadata_db {
+            std::fs::create_dir_all(&local_metadata_dir)?;
+            std::fs::write(
+                local_metadata_dir.join(format!("{volume_name}.db")),
+                &command.action,
+            )?;
+        }
         Ok(ClientCommandOutput {
             status: self.run_status.get(),
             stdout: self.run_stdout.clone(),
@@ -366,6 +504,16 @@ fn test_config(root: &Path) -> ClientControllerConfig {
         mount_exit_timeout: Duration::from_secs(15),
         poll_interval: Duration::from_millis(20),
         mount_points: Vec::new(),
+    }
+}
+
+fn service_port(service: &str, host_port: u16) -> ServicePort {
+    ServicePort {
+        service: service.to_string(),
+        host: "127.0.0.1".to_string(),
+        host_port,
+        container_port: 0,
+        env_var: format!("TEST_{}", service.to_ascii_uppercase()),
     }
 }
 

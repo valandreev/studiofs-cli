@@ -5,9 +5,12 @@ use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+use std::{collections::HashSet, ffi::OsString};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use crate::infra::ServicePort;
 
 pub const DEFAULT_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c", "client-d"];
 #[cfg(windows)]
@@ -25,6 +28,40 @@ pub struct ClientControllerConfig {
     pub mount_exit_timeout: Duration,
     pub poll_interval: Duration,
     pub mount_points: Vec<PathBuf>,
+}
+
+impl ClientControllerConfig {
+    pub fn from_compose_services(
+        studiofs_bin: PathBuf,
+        sandbox: PathBuf,
+        run_id: &str,
+        seed: u64,
+        ports: &[ServicePort],
+    ) -> Result<Self, ClientControllerError> {
+        let postgres = service_port(ports, "postgres")?;
+        let rustfs = service_port(ports, "rustfs")?;
+        let sanitized_run_id = sanitize_dns_label(run_id);
+        Ok(Self {
+            studiofs_bin,
+            sandbox,
+            volume_name: format!("sfs-e2e-{sanitized_run_id}-{seed}"),
+            meta_dsn: format!(
+                "postgres://studiofs:studiofs@{}:{}",
+                postgres.host, postgres.host_port
+            ),
+            s3: S3Config {
+                endpoint: format!("http://{}:{}", rustfs.host, rustfs.host_port),
+                bucket: format!("studiofs-e2e-{sanitized_run_id}"),
+                access_key: "rustfsadmin".to_string(),
+                secret_key: "rustfsadmin".to_string(),
+                region: "us-east-1".to_string(),
+            },
+            mount_ready_timeout: Duration::from_secs(30),
+            mount_exit_timeout: Duration::from_secs(15),
+            poll_interval: Duration::from_millis(100),
+            mount_points: Vec::new(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +121,27 @@ pub struct ClientCommandOutput {
     pub status: i32,
     pub stdout: String,
     pub stderr: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VolumeBootstrapOptions {
+    pub client_names: Vec<String>,
+    pub clean_existing_local_metadata: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientBootstrapRecord {
+    pub name: String,
+    pub local_metadata_db: PathBuf,
+    pub state: ClientLifecycleState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VolumeBootstrapSummary {
+    pub volume_name: String,
+    pub init_client: String,
+    pub discovered_clients: Vec<String>,
+    pub clients: Vec<ClientBootstrapRecord>,
 }
 
 pub trait ClientProcess {
@@ -174,6 +232,8 @@ pub enum ClientControllerError {
     UnknownClient(String),
     #[error("E2E client index {index} is out of range for {len} clients")]
     ClientIndexOutOfRange { index: usize, len: usize },
+    #[error("Docker compose service port is missing for {0}")]
+    MissingServicePort(String),
     #[error(
         "client command {action} for {client} failed with exit status {status}: stderr: {stderr}; stdout: {stdout}"
     )]
@@ -184,6 +244,10 @@ pub enum ClientControllerError {
         stdout: String,
         stderr: String,
     },
+    #[error("E2E client {client} did not create local metadata DB: {path}")]
+    MissingLocalMetadataDb { client: String, path: PathBuf },
+    #[error("E2E local metadata DB path is shared by multiple clients: {0}")]
+    DuplicateLocalMetadataDb(PathBuf),
     #[error("client controller I/O failed: {0}")]
     Io(#[from] io::Error),
 }
@@ -265,6 +329,45 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         Ok(())
     }
 
+    pub fn bootstrap_volume(
+        &mut self,
+        options: VolumeBootstrapOptions,
+    ) -> Result<VolumeBootstrapSummary, ClientControllerError> {
+        self.create_clients(options.client_names)?;
+        if options.clean_existing_local_metadata {
+            self.clean_local_metadata_dirs()?;
+        }
+        self.init_first_client()?;
+        self.discover_additional_clients()?;
+        self.verify_local_metadata_dbs()?;
+
+        let clients = self
+            .clients
+            .iter()
+            .map(|runtime| ClientBootstrapRecord {
+                name: runtime.spec.name.clone(),
+                local_metadata_db: runtime.spec.local_metadata_db.clone(),
+                state: runtime.spec.state,
+            })
+            .collect::<Vec<_>>();
+        let init_client = clients
+            .first()
+            .map(|client| client.name.clone())
+            .ok_or(ClientControllerError::NoClients)?;
+        let discovered_clients = clients
+            .iter()
+            .skip(1)
+            .map(|client| client.name.clone())
+            .collect();
+
+        Ok(VolumeBootstrapSummary {
+            volume_name: self.config.volume_name.clone(),
+            init_client,
+            discovered_clients,
+            clients,
+        })
+    }
+
     pub fn mount_all(&mut self) -> Result<(), ClientControllerError> {
         for index in 0..self.clients.len() {
             self.mount_index(index)?;
@@ -319,6 +422,36 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         Ok(())
     }
 
+    fn clean_local_metadata_dirs(&self) -> Result<(), ClientControllerError> {
+        for runtime in &self.clients {
+            let path = &runtime.spec.local_metadata_dir;
+            if path.exists() {
+                fs::remove_dir_all(path)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_local_metadata_dbs(&self) -> Result<(), ClientControllerError> {
+        let mut seen = HashSet::<OsString>::new();
+        for runtime in &self.clients {
+            let path = &runtime.spec.local_metadata_db;
+            if !path.exists() {
+                return Err(ClientControllerError::MissingLocalMetadataDb {
+                    client: runtime.spec.name.clone(),
+                    path: path.clone(),
+                });
+            }
+            let unique_path = path.canonicalize()?.into_os_string();
+            if !seen.insert(unique_path) {
+                return Err(ClientControllerError::DuplicateLocalMetadataDb(
+                    path.clone(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn unmount_index(&mut self, index: usize) -> Result<(), ClientControllerError> {
         let command = self.unmount_command(index)?;
         let output = self.executor.run(&command)?;
@@ -361,7 +494,6 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
             mount_point,
         );
         fs::create_dir_all(&spec.client_root)?;
-        fs::create_dir_all(&spec.local_metadata_dir)?;
         fs::create_dir_all(&spec.cache_dir)?;
         fs::create_dir_all(&spec.mount_metadata_dir)?;
         write_mount_metadata(&spec)?;
@@ -652,6 +784,45 @@ fn validate_client_name(name: &str) -> Result<(), ClientControllerError> {
         Ok(())
     } else {
         Err(ClientControllerError::UnsafeClientName(name.to_string()))
+    }
+}
+
+fn service_port<'a>(
+    ports: &'a [ServicePort],
+    service: &str,
+) -> Result<&'a ServicePort, ClientControllerError> {
+    ports
+        .iter()
+        .find(|port| port.service == service)
+        .ok_or_else(|| ClientControllerError::MissingServicePort(service.to_string()))
+}
+
+fn sanitize_dns_label(value: &str) -> String {
+    let mut sanitized = String::new();
+    let mut last_was_dash = false;
+    for ch in value.chars() {
+        let next = if ch.is_ascii_alphanumeric() {
+            ch.to_ascii_lowercase()
+        } else {
+            '-'
+        };
+        if next == '-' {
+            if !last_was_dash && !sanitized.is_empty() {
+                sanitized.push(next);
+            }
+            last_was_dash = true;
+        } else {
+            sanitized.push(next);
+            last_was_dash = false;
+        }
+    }
+    while sanitized.ends_with('-') {
+        sanitized.pop();
+    }
+    if sanitized.is_empty() {
+        "run".to_string()
+    } else {
+        sanitized
     }
 }
 

@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::client::{DEFAULT_CLIENT_NAMES, client_cache_dir, client_mount_point, client_root_dir};
+use crate::client::{
+    ClientControllerConfig, ClientControllerError, DEFAULT_CLIENT_NAMES, client_cache_dir,
+    client_mount_point, client_root_dir,
+};
 use crate::infra::{
     CommandExecutor, ComposeConfig, DockerComposeStack, InfraCheck, InfraError, InfraMode,
     SystemCommandExecutor,
@@ -140,6 +143,8 @@ pub enum RunnerError {
     Json(#[from] serde_json::Error),
     #[error("scenario hook failed: {0}")]
     Scenario(#[from] scenario::ScenarioError),
+    #[error("runner client controller failed: {0}")]
+    Client(#[from] ClientControllerError),
     #[error("runner infra failed: {0}")]
     Infra(#[from] InfraError),
 }
@@ -279,6 +284,18 @@ pub fn run_with_executor(
                 .join("artifacts")
                 .join("scenarios")
                 .join(definition.name),
+            client_controller_config: match (infra_mode, request.studiofs_bin.as_ref()) {
+                (InfraMode::Compose, Some(studiofs_bin)) => {
+                    Some(ClientControllerConfig::from_compose_services(
+                        studiofs_bin.clone(),
+                        sandbox.clone(),
+                        &run_id,
+                        request.seed,
+                        &allocated_ports,
+                    )?)
+                }
+                _ => None,
+            },
         };
 
         let lifecycle =
@@ -1062,6 +1079,7 @@ mod tests {
             seed: 1,
             sandbox: temp.path().to_path_buf(),
             scenario_dir: temp.path().join("scenario"),
+            client_controller_config: None,
         };
         let scenario = FailingValidateScenario::new();
 
