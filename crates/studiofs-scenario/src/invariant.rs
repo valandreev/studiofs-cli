@@ -50,6 +50,8 @@ pub struct LogicalEntry {
     pub checksum_sha256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symlink_target: Option<String>,
 }
 
 impl LogicalEntry {
@@ -61,6 +63,7 @@ impl LogicalEntry {
             object: None,
             checksum_sha256: None,
             size: None,
+            symlink_target: None,
         }
     }
 
@@ -78,14 +81,17 @@ impl LogicalEntry {
             object,
             checksum_sha256,
             size,
+            symlink_target: None,
         }
     }
 
     fn convergence_key(&self) -> EntryConvergenceKey<'_> {
         EntryConvergenceKey {
             kind: self.kind,
+            logical_id: self.logical_id.as_deref(),
             checksum_sha256: self.checksum_sha256.as_deref(),
             size: self.size,
+            symlink_target: self.symlink_target.as_deref(),
         }
     }
 }
@@ -260,9 +266,7 @@ fn validate_namespace(snapshot: &LogicalSnapshot, violations: &mut Vec<Invariant
                     None,
                 ));
             }
-            if let Some(parent) = parent_path(&entry.path)
-                && !directory_paths.contains(parent)
-            {
+            if parent_path(&entry.path).is_some_and(|parent| !directory_paths.contains(parent)) {
                 violations.push(violation(
                     "valid_directory_tree_structure",
                     "entry parent directory is missing",
@@ -298,12 +302,14 @@ fn validate_namespace(snapshot: &LogicalSnapshot, violations: &mut Vec<Invariant
 }
 
 fn validate_durable_writes(snapshot: &LogicalSnapshot, violations: &mut Vec<InvariantViolation>) {
+    let clients = snapshot
+        .clients
+        .iter()
+        .map(|client| (client.client.as_str(), entries_by_path(client)))
+        .collect::<BTreeMap<_, _>>();
+
     for expected in &snapshot.durable_writes {
-        let Some(client) = snapshot
-            .clients
-            .iter()
-            .find(|client| client.client == expected.client)
-        else {
+        let Some(entries) = clients.get(expected.client.as_str()) else {
             violations.push(violation(
                 "no_lost_locally_durable_writes",
                 "durable write client is missing",
@@ -314,11 +320,7 @@ fn validate_durable_writes(snapshot: &LogicalSnapshot, violations: &mut Vec<Inva
             ));
             continue;
         };
-        let Some(entry) = client
-            .entries
-            .iter()
-            .find(|entry| entry.path == expected.path)
-        else {
+        let Some(entry) = entries.get(expected.path.as_str()) else {
             violations.push(violation(
                 "no_lost_locally_durable_writes",
                 "durable write path is missing",
@@ -430,6 +432,8 @@ fn violation(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EntryConvergenceKey<'a> {
     kind: LogicalEntryKind,
+    logical_id: Option<&'a str>,
     checksum_sha256: Option<&'a str>,
     size: Option<u64>,
+    symlink_target: Option<&'a str>,
 }

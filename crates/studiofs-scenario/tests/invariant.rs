@@ -84,6 +84,100 @@ fn allows_explicit_hard_link_model_to_share_an_inode_across_paths() {
 }
 
 #[test]
+fn convergence_detects_logical_id_divergence_for_simulation_snapshots() {
+    let snapshot = LogicalSnapshot {
+        schema_version: 1,
+        clients: vec![
+            ClientLogicalSnapshot {
+                client: "client-a".to_string(),
+                entries: vec![LogicalEntry::file(
+                    "same.txt",
+                    "inode-a",
+                    None,
+                    Some("checksum-a".to_string()),
+                    Some(5),
+                )],
+            },
+            ClientLogicalSnapshot {
+                client: "client-b".to_string(),
+                entries: vec![LogicalEntry::file(
+                    "same.txt",
+                    "inode-b",
+                    None,
+                    Some("checksum-a".to_string()),
+                    Some(5),
+                )],
+            },
+        ],
+        expected_absent_paths: Vec::new(),
+        durable_writes: Vec::new(),
+        objects: Vec::new(),
+        allow_hard_links: false,
+        replay_idempotent: None,
+    };
+
+    let report = validate_logical_invariants(&snapshot);
+
+    assert!(!report.passed);
+    assert!(
+        report
+            .violations
+            .iter()
+            .any(|violation| violation.invariant == "eventual_convergence"
+                && violation.path.as_deref() == Some("same.txt"))
+    );
+}
+
+#[test]
+fn convergence_detects_symlink_target_divergence() {
+    let snapshot = LogicalSnapshot {
+        schema_version: 1,
+        clients: vec![
+            ClientLogicalSnapshot {
+                client: "client-a".to_string(),
+                entries: vec![LogicalEntry {
+                    path: "link".to_string(),
+                    kind: LogicalEntryKind::Symlink,
+                    logical_id: None,
+                    object: None,
+                    checksum_sha256: None,
+                    size: None,
+                    symlink_target: Some("target-a".to_string()),
+                }],
+            },
+            ClientLogicalSnapshot {
+                client: "client-b".to_string(),
+                entries: vec![LogicalEntry {
+                    path: "link".to_string(),
+                    kind: LogicalEntryKind::Symlink,
+                    logical_id: None,
+                    object: None,
+                    checksum_sha256: None,
+                    size: None,
+                    symlink_target: Some("target-b".to_string()),
+                }],
+            },
+        ],
+        expected_absent_paths: Vec::new(),
+        durable_writes: Vec::new(),
+        objects: Vec::new(),
+        allow_hard_links: false,
+        replay_idempotent: None,
+    };
+
+    let report = validate_logical_invariants(&snapshot);
+
+    assert!(!report.passed);
+    assert!(
+        report
+            .violations
+            .iter()
+            .any(|violation| violation.invariant == "eventual_convergence"
+                && violation.path.as_deref() == Some("link"))
+    );
+}
+
+#[test]
 fn logical_snapshot_serializes_stable_schema_for_simulation_artifacts() {
     let snapshot = LogicalSnapshot {
         schema_version: 1,
@@ -96,6 +190,7 @@ fn logical_snapshot_serializes_stable_schema_for_simulation_artifacts() {
                 object: Some(ObjectRef::local("pending-object")),
                 checksum_sha256: Some("checksum-a".to_string()),
                 size: Some(5),
+                symlink_target: None,
             }],
         }],
         expected_absent_paths: Vec::new(),

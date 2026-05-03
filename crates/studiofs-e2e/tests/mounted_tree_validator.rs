@@ -309,6 +309,7 @@ fn mounted_snapshots_map_to_shared_logical_validator_contract() {
     assert_eq!(logical.clients[0].entries[0].path, "dir/file.txt");
     assert_eq!(logical.clients[0].entries[0].logical_id.as_deref(), None);
     assert_eq!(logical.clients[0].entries[0].object, None);
+    assert_eq!(logical.clients[0].entries[0].symlink_target, None);
     assert!(
         report
             .violations
