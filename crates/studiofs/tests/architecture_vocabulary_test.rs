@@ -532,6 +532,65 @@ fn e2e_runner_contract_covers_required_sfs341_surfaces() {
 }
 
 #[test]
+fn deterministic_simulation_architecture_covers_required_sfs330_surfaces() {
+    let doc = read_workspace_file("docs/deterministic-simulation-architecture.md");
+    let required_terms = [
+        "# Deterministic Simulation Architecture",
+        "## Scope And Non-Goals",
+        "core distributed state-machine behavior",
+        "FUSE",
+        "WinFSP",
+        "OS page cache",
+        "performance",
+        "## Simulation Boundaries",
+        "core logic",
+        "metadata replication",
+        "object upload",
+        "cache/replay",
+        "real OS mount",
+        "## Required Abstractions",
+        "virtual time",
+        "deterministic scheduler",
+        "simulated metadata bus",
+        "simulated object store",
+        "logical clients",
+        "invariant validation",
+        "## Test-Layer Relationship",
+        "Contract/Core",
+        "Real E2E",
+        "Multi-client",
+        "## Phase 1/2 Reuse",
+        "operation model",
+        "invariants",
+        "artifacts",
+        "## Counterexample Capture And Replay",
+        "seed",
+        "trace",
+        "operation log",
+        "replay",
+        "## Initial Module Plan",
+        "SFS-331",
+        "SFS-332",
+        "SFS-333",
+        "SFS-334",
+        "SFS-335",
+        "SFS-336",
+    ];
+
+    let missing: Vec<_> = required_terms
+        .iter()
+        .copied()
+        .filter(|term| !doc.contains(term))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "SFS-330 deterministic simulation architecture is missing required surfaces:\n{}",
+        missing.join("\n")
+    );
+}
+
+#[test]
 fn cli_and_regression_surfaces_drop_buffered_first_wording() {
     let files = [
         "crates/studiofs/src/cli/test_cache/reporting/human.rs",
