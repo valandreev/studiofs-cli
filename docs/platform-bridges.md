@@ -42,7 +42,7 @@ Path walks are centralized in VFS `NamespaceResolver`:
 | Sector size | `4096` bytes by default. Override: `STUDIOFS_WINFSP_SECTOR_SIZE` |
 | Allocation unit size | `1048576` bytes by default. Override: `STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE` |
 | Max component length | 255 |
-| File info timeout | `1000 ms` by default. Override: `STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS` (`-1`/`max` supported) |
+| File info timeout | WinFSP cache-manager mode (`-1`/`max`) by default. Override: `STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS` |
 | Dir info timeout | `1000 ms` by default. Override: `STUDIOFS_WINFSP_DIR_INFO_TIMEOUT_MS` (`-1`/`max` supported) |
 | Volume info timeout | `1000 ms` by default. Override: `STUDIOFS_WINFSP_VOLUME_INFO_TIMEOUT_MS` (`-1`/`max` supported) |
 | Allow open in kernel mode | Enabled by default. Override: `STUDIOFS_WINFSP_ALLOW_OPEN_IN_KERNEL_MODE` |
@@ -57,9 +57,10 @@ Path walks are centralized in VFS `NamespaceResolver`:
 `STUDIOFS_WINFSP_SECTOR_SIZE` and `STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE` are the primary WinFSP bridge throughput geometry controls for local payload I/O.
 StudioFS disables WinFSP `FlushAndPurgeOnCleanup` by default to preserve the
 read cache between close callbacks. Write-capable file handles opt out of the
-WinFSP/Windows file cache at `Create`/`Open` time, while read-only handles stay
-eligible for OS read caching with a bounded file-info timeout so remote metadata
-invalidations do not require remounting to become visible.
+WinFSP/Windows file cache at `Create`/`Open` time, while read-only handles keep
+the WinFSP cache-manager / fast-I/O path by default. Use a bounded
+`STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS` value only for targeted multi-client
+invalidation experiments.
 
 Windows mount-point handling:
 - StudioFS requests Mount Manager drive syntax (`\\.\X:`) internally for drive-letter mounts.
@@ -115,9 +116,9 @@ WinFSP callback barrier semantics:
 - `cleanup` with delete finalizes `unlink()` / `rmdir()` in the cleanup callback itself.
 - WinFSP `FlushAndPurgeOnCleanup` is disabled at the driver layer by default,
   while write-capable handles set `Create.Opened.DisableCache` so writes bypass
-  the OS file cache. Read-only file caching is time-bounded by
-  `STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS` so remote metadata invalidations can
-  surface without remounting.
+  the OS file cache. Read-only file caching keeps WinFSP cache-manager behavior
+  unless `STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS` is explicitly bounded for an
+  invalidation-focused run.
 - Non-delete `cleanup` callback handling in StudioFS is observational only; for real file handles it records that the callback happened, but any remaining writer state is deferred to a later explicit `flush` or the last-handle `close` / `release_fh()` path.
 - `fh == 0` contexts, such as directories, do not have a `release_fh()` fallback; they stay observational unless an explicit `flush` callback makes local state visible.
 - `close` is the release-path hook for WinFSP. It drains remaining local writer

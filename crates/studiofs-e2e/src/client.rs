@@ -829,6 +829,10 @@ fn client_env(client: &ClientSpec) -> Vec<(String, String)> {
             "STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS".to_string(),
             "250".to_string(),
         ),
+        (
+            "STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS".to_string(),
+            "1000".to_string(),
+        ),
     ]
 }
 
@@ -1215,6 +1219,22 @@ mod tests {
         ));
         assert!(message.contains("client-a"));
         assert!(message.contains(&path.display().to_string()));
+    }
+
+    #[test]
+    fn client_env_bounds_winfsp_file_info_timeout_for_invalidation_runs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let client = client_spec_for(
+            temp.path(),
+            "projectfs",
+            "client-a",
+            temp.path().join("mount"),
+        );
+        let env = client_env(&client);
+
+        assert!(env.iter().any(|(key, value)| {
+            key == "STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS" && value == "1000"
+        }));
     }
 
     #[test]
