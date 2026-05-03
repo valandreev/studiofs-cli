@@ -1,5 +1,7 @@
 //! Virtual-time deterministic scheduler for simulation tests.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,6 +66,7 @@ pub struct SchedulerTraceRecord {
     pub description: Option<String>,
     pub interleaving_choice: usize,
     pub ready_event_count: usize,
+    pub ready_event_ids: Vec<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,7 +82,7 @@ pub struct SimulationScheduler {
     current_tick: u64,
     next_event_id: u64,
     next_step: u64,
-    pending: Vec<QueuedEvent>,
+    pending: BTreeMap<u64, Vec<QueuedEvent>>,
     trace: Vec<SchedulerTraceRecord>,
 }
 
@@ -91,7 +94,7 @@ impl SimulationScheduler {
             current_tick: 0,
             next_event_id: 0,
             next_step: 0,
-            pending: Vec::new(),
+            pending: BTreeMap::new(),
             trace: Vec::new(),
         }
     }
@@ -101,7 +104,7 @@ impl SimulationScheduler {
     }
 
     pub fn pending_len(&self) -> usize {
-        self.pending.len()
+        self.pending.values().map(Vec::len).sum()
     }
 
     pub fn schedule_now(&mut self, event: ScheduledEvent) -> u64 {
@@ -115,26 +118,32 @@ impl SimulationScheduler {
     pub fn schedule_at(&mut self, tick: u64, event: ScheduledEvent) -> u64 {
         self.next_event_id += 1;
         let event_id = self.next_event_id;
-        self.pending.push(QueuedEvent {
-            event_id,
-            tick,
-            event,
-        });
+        self.pending
+            .entry(tick)
+            .or_default()
+            .push(QueuedEvent { event_id, event });
         event_id
     }
 
     pub fn step(&mut self) -> Option<SelectedEvent> {
-        let (ready_indexes, tick) = self.ready_indexes()?;
+        let tick = self.next_ready_tick()?;
         self.current_tick = tick;
-        let choice = self.rng.choose(ready_indexes.len());
-        let pending_index = ready_indexes[choice];
-        let queued = self.pending.remove(pending_index);
+        let ready_events = self.pending.get_mut(&tick)?;
+        let ready_event_ids = ready_events
+            .iter()
+            .map(|event| event.event_id)
+            .collect::<Vec<_>>();
+        let choice = self.rng.choose(ready_events.len());
+        let queued = ready_events.remove(choice);
+        if ready_events.is_empty() {
+            self.pending.remove(&tick);
+        }
         let selected = SelectedEvent {
             event_id: queued.event_id,
-            scheduled_tick: queued.tick,
+            scheduled_tick: tick,
             event: queued.event,
         };
-        self.record(&selected, choice, ready_indexes.len());
+        self.record(&selected, choice, ready_event_ids);
         Some(selected)
     }
 
@@ -162,19 +171,13 @@ impl SimulationScheduler {
         std::mem::take(&mut self.trace)
     }
 
-    fn ready_indexes(&self) -> Option<(Vec<usize>, u64)> {
-        let tick = self.pending.iter().map(|event| event.tick).min()?;
-        let ready_indexes = self
-            .pending
-            .iter()
-            .enumerate()
-            .filter_map(|(index, event)| (event.tick == tick).then_some(index))
-            .collect::<Vec<_>>();
-        Some((ready_indexes, tick))
+    fn next_ready_tick(&self) -> Option<u64> {
+        self.pending.first_key_value().map(|(tick, _)| *tick)
     }
 
-    fn record(&mut self, selected: &SelectedEvent, choice: usize, ready_event_count: usize) {
+    fn record(&mut self, selected: &SelectedEvent, choice: usize, ready_event_ids: Vec<u64>) {
         self.next_step += 1;
+        let ready_event_count = ready_event_ids.len();
         self.trace.push(SchedulerTraceRecord {
             step: self.next_step,
             seed: self.seed,
@@ -185,6 +188,7 @@ impl SimulationScheduler {
             description: selected.event.description.clone(),
             interleaving_choice: choice,
             ready_event_count,
+            ready_event_ids,
         });
     }
 }
@@ -192,7 +196,6 @@ impl SimulationScheduler {
 #[derive(Debug)]
 struct QueuedEvent {
     event_id: u64,
-    tick: u64,
     event: ScheduledEvent,
 }
 
@@ -203,16 +206,23 @@ struct DeterministicRng {
 
 impl DeterministicRng {
     fn new(seed: u64) -> Self {
-        Self { state: seed }
+        Self {
+            state: seed.wrapping_add(0x853c_49e6_748f_ea9b),
+        }
     }
 
     fn choose(&mut self, len: usize) -> usize {
         debug_assert!(len > 0);
-        let choice = (self.state as usize) % len;
-        self.state = self
-            .state
+        (self.next_u32() as usize) % len
+    }
+
+    fn next_u32(&mut self) -> u32 {
+        let old_state = self.state;
+        self.state = old_state
             .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1);
-        choice
+            .wrapping_add(1_442_695_040_888_963_407);
+        let xorshifted = (((old_state >> 18) ^ old_state) >> 27) as u32;
+        let rotate = (old_state >> 59) as u32;
+        xorshifted.rotate_right(rotate)
     }
 }

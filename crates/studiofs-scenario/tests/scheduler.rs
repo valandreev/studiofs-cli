@@ -27,6 +27,31 @@ fn fixed_seed_replays_the_same_interleaving_and_trace() {
 }
 
 #[test]
+fn trace_records_all_ready_competitors_for_each_choice() {
+    let mut scheduler = SimulationScheduler::new(5);
+    let first = scheduler.schedule_now(client_event("a", SchedulerEventType::ClientOperation));
+    let second = scheduler.schedule_now(client_event("b", SchedulerEventType::MetadataDelivery));
+    let third = scheduler.schedule_after(1, client_event("c", SchedulerEventType::PublishAttempt));
+
+    scheduler.step().unwrap();
+    scheduler.step().unwrap();
+
+    assert_eq!(scheduler.trace()[0].ready_event_ids, vec![first, second]);
+    let remaining_same_tick = if scheduler.trace()[0].event_id == first {
+        second
+    } else {
+        first
+    };
+    assert_eq!(
+        scheduler.trace()[1].ready_event_ids,
+        vec![remaining_same_tick]
+    );
+
+    scheduler.step().unwrap();
+    assert_eq!(scheduler.trace()[2].ready_event_ids, vec![third]);
+}
+
+#[test]
 fn scheduler_advances_virtual_ticks_without_wall_clock_sleep() {
     let mut scheduler = SimulationScheduler::new(7);
     scheduler.schedule_at(
