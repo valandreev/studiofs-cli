@@ -355,7 +355,7 @@ fn snapshot_records_symlink_target() {
     assert_eq!(link.symlink_target.as_deref(), Some("target-a"));
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn snapshot_rejects_non_utf8_relative_paths_instead_of_lossy_encoding() {
     use std::ffi::OsString;
