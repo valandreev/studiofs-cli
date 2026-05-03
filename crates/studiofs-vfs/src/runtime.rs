@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use studiofs_meta::engine::{
-    DeferredDeleteRecord, MetadataAuthorityStatus, MetadataReplicationBacklog, PendingCreateRecord,
-    UndoLogKind, UndoLogRecord,
+    DeferredDeleteRecord, MetadataAuthorityStatus, MetadataInvalidationDiagnostics,
+    MetadataReplicationBacklog, PendingCreateRecord, UndoLogKind, UndoLogRecord,
 };
 use studiofs_meta::{
     AccessLevel, ChunkId, DirEntry, DirEntryValue, FormatInfo, Ino, InodeAttr,
@@ -408,7 +408,14 @@ impl<M: ?Sized + MetaReplication> MetaReplication for RuntimeMetaHandle<M> {
     forward_method!(fn check_consistency(&self) -> MetaResult<()>);
     forward_method!(fn flush_metadata(&self) -> MetaResult<()>);
     forward_method!(fn sync_metadata(&self) -> MetaResult<()>);
+    forward_method!(fn sync_metadata_for_invalidation_poll(&self) -> MetaResult<()>);
     forward_method!(fn invalidation_sender_id(&self) -> Option<String>);
+    forward_method!(
+        fn metadata_invalidation_notifier(&self) -> Option<Arc<tokio::sync::Notify>>
+    );
+    forward_method!(
+        fn metadata_invalidation_diagnostics(&self) -> MetadataInvalidationDiagnostics
+    );
     forward_method!(fn request_eager_flush(&self));
     forward_method!(fn metadata_version_token(&self) -> Option<String>);
     forward_method!(fn namespace_version_token(&self) -> Option<String>);

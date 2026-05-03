@@ -1,4 +1,5 @@
 use futures::StreamExt;
+use std::sync::Arc;
 use tokio::time::MissedTickBehavior;
 
 use super::*;
@@ -365,8 +366,17 @@ impl StudioVfs {
         removed
     }
 
+    async fn wait_for_metadata_invalidation_notify(notifier: Option<&Arc<tokio::sync::Notify>>) {
+        if let Some(notifier) = notifier {
+            notifier.notified().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    }
+
     pub(super) async fn background_metadata_invalidation(self: Arc<Self>, interval: Duration) {
         let meta = self.sync_meta();
+        let metadata_notifier = meta.metadata_invalidation_notifier();
         let mut last_namespace_token = meta.namespace_version_token();
         let mut last_metadata_token = meta.metadata_version_token();
         let mut last_snapshot: HashSet<Ino> = HashSet::new();
@@ -387,6 +397,7 @@ impl StudioVfs {
         loop {
             tokio::select! {
                 _ = self.state.shutdown.shutdown_notify.notified() => break,
+                _ = Self::wait_for_metadata_invalidation_notify(metadata_notifier.as_ref()) => {},
                 _ = tokio::time::sleep(interval) => {}
             }
             if self.shutdown_requested() {
@@ -396,7 +407,7 @@ impl StudioVfs {
             let sync = run_meta(meta.clone(), move |engine: Arc<dyn VfsMeta>| {
                 let before_namespace = engine.namespace_version_token();
                 let before_metadata = engine.metadata_version_token();
-                engine.sync_metadata()?;
+                engine.sync_metadata_for_invalidation_poll()?;
                 let after_namespace = engine.namespace_version_token();
                 let after_metadata = engine.metadata_version_token();
                 Ok((

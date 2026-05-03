@@ -507,6 +507,17 @@ Metadata cache observability is split between runtime log events and the mounted
 write-path observability snapshot used by `studiofs status --verbose` and cache
 test reports.
 
+PostgreSQL metadata invalidation uses push-plus-poll behavior:
+
+- `LISTEN/NOTIFY` on `studiofs_meta_vol_<volume_id>` wakes peers promptly after
+  remote-visible event-log batches commit.
+- `STUDIOFS_PG_SYNC_POLL_SECS` remains the fallback discovery interval when a
+  notification is missed or the listener reconnects.
+- `STUDIOFS_PG_CONNECT_TIMEOUT_MS` and `STUDIOFS_PG_COMMAND_TIMEOUT_MS` bound
+  metadata listener reconnect and sync attempts.
+- Lock lease notifications stay on `studiofs_lock_vol_<volume_id>` and are not
+  part of general namespace/attr/payload invalidation.
+
 The existing `upload pipeline` / `upload pipeline counters` log events include:
 
 - dentry cache, full-path shortcut cache, and attr read cache metrics: hits/misses/evictions, occupancy, protected-tier (hotset) occupancy, and hot-hit contribution
