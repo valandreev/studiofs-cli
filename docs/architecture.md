@@ -35,6 +35,13 @@ studiofs (CLI)
   └── studiofs-e2e        real mounted E2E runner
 ```
 
+Future deterministic simulation work is scoped in
+[deterministic-simulation-architecture.md](./deterministic-simulation-architecture.md).
+That layer is planned as a seed-reproducible logical multi-client test surface
+for metadata replication, object upload, publication, cache/replay, and
+invariant validation. It does not replace Contract/Core checks or real mounted
+E2E validation.
+
 ## Metadata Architecture
 
 `PgMetaEngine` keeps a local metadata view and a replication path:
