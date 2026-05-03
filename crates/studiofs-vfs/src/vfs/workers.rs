@@ -17,6 +17,106 @@ enum MetadataInvalidationWakeReason {
     FallbackPoll,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct UploadTroubleCounters {
+    pub(super) uploads_ok: u64,
+    pub(super) uploads_err: u64,
+    pub(super) retries: u64,
+    pub(super) exhausted: u64,
+    pub(super) timeouts: u64,
+    pub(super) temporary_errors: u64,
+    pub(super) status_5xx_errors: u64,
+    pub(super) network_errors: u64,
+    pub(super) bytes_uploaded: u64,
+}
+
+impl UploadTroubleCounters {
+    fn from_metrics(metrics: &crate::upload::UploadMetrics) -> Self {
+        Self {
+            uploads_ok: metrics.uploads_ok.load(Ordering::Relaxed),
+            uploads_err: metrics.uploads_err.load(Ordering::Relaxed),
+            retries: metrics.retries.load(Ordering::Relaxed),
+            exhausted: metrics.exhausted.load(Ordering::Relaxed),
+            timeouts: metrics.timeout_err.load(Ordering::Relaxed),
+            temporary_errors: metrics.temporary_err.load(Ordering::Relaxed),
+            status_5xx_errors: metrics.status_5xx_err.load(Ordering::Relaxed),
+            network_errors: metrics.network_err.load(Ordering::Relaxed),
+            bytes_uploaded: metrics.bytes_uploaded.load(Ordering::Relaxed),
+        }
+    }
+
+    fn delta_since(self, previous: Self) -> Self {
+        Self {
+            uploads_ok: self.uploads_ok.saturating_sub(previous.uploads_ok),
+            uploads_err: self.uploads_err.saturating_sub(previous.uploads_err),
+            retries: self.retries.saturating_sub(previous.retries),
+            exhausted: self.exhausted.saturating_sub(previous.exhausted),
+            timeouts: self.timeouts.saturating_sub(previous.timeouts),
+            temporary_errors: self
+                .temporary_errors
+                .saturating_sub(previous.temporary_errors),
+            status_5xx_errors: self
+                .status_5xx_errors
+                .saturating_sub(previous.status_5xx_errors),
+            network_errors: self.network_errors.saturating_sub(previous.network_errors),
+            bytes_uploaded: self.bytes_uploaded.saturating_sub(previous.bytes_uploaded),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum UploadTroubleSignal {
+    None,
+    Warn,
+    Recovered,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct UploadTroubleState {
+    previous: UploadTroubleCounters,
+    active: bool,
+}
+
+impl UploadTroubleState {
+    pub(super) fn observe(
+        &mut self,
+        current: UploadTroubleCounters,
+        pending_uploads: usize,
+        active_uploads: usize,
+        pending_retry_count: u64,
+    ) -> UploadTroubleSignal {
+        let delta = current.delta_since(self.previous);
+        self.previous = current;
+
+        if upload_trouble_delta_indicates_remote_problem(delta) {
+            self.active = true;
+        }
+
+        let has_backlog = pending_uploads != 0 || active_uploads != 0 || pending_retry_count != 0;
+        if self.active && has_backlog {
+            UploadTroubleSignal::Warn
+        } else if self.active {
+            self.active = false;
+            UploadTroubleSignal::Recovered
+        } else {
+            UploadTroubleSignal::None
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_active(&self) -> bool {
+        self.active
+    }
+}
+
+fn upload_trouble_delta_indicates_remote_problem(delta: UploadTroubleCounters) -> bool {
+    delta.timeouts != 0
+        || delta.network_errors != 0
+        || delta.status_5xx_errors != 0
+        || delta.exhausted != 0
+        || (delta.uploads_err != 0 && delta.uploads_ok == 0)
+}
+
 fn should_run_invalidation_poll_sync(
     wake_reason: MetadataInvalidationWakeReason,
     last_namespace_token: &Option<String>,
@@ -511,6 +611,7 @@ impl StudioVfs {
         let mut upload_pipeline_summary_was_active = false;
         let mut ticks_since_last_log = 0u64;
         let mut zero_log_counter = 0u8;
+        let mut s3_upload_problem_active = UploadTroubleState::default();
         const ZERO_LOG_TARGET: u8 = 3;
 
         loop {
@@ -586,8 +687,20 @@ impl StudioVfs {
 
             if should_log {
                 ticks_since_last_log = 0;
-                let pending_uploads =
+                let pending_retry_count = pending_uploads
+                    .iter()
+                    .filter(|op| op.retry_count != 0)
+                    .count() as u64;
+                let pending_uploads_human =
                     Self::format_upload_pipeline_pending_uploads(pending_upload_bytes);
+                let upload_trouble_counters =
+                    UploadTroubleCounters::from_metrics(&self.upload_scheduler.metrics);
+                let upload_trouble_signal = s3_upload_problem_active.observe(
+                    upload_trouble_counters,
+                    pending,
+                    active_uploads,
+                    pending_retry_count,
+                );
                 let became_idle = !is_active && upload_pipeline_summary_was_active;
                 if let Some((event_kind, event_title)) =
                     Self::upload_pipeline_runtime_event(activity_started, became_idle, is_active)
@@ -599,7 +712,7 @@ impl StudioVfs {
                         serde_json::json!({
                             "pending_uploads": pending,
                             "pending_upload_bytes": pending_upload_bytes,
-                            "pending_uploads_human": pending_uploads,
+                            "pending_uploads_human": pending_uploads_human,
                             "active_uploads": active_uploads,
                             "pending_metadata_ops": pending_metadata_ops,
                             "inflight_metadata_ops": metadata_backlog.inflight_ops,
@@ -635,11 +748,31 @@ impl StudioVfs {
                 );
                 // #endregion debug log
                 info!(
-                    pending_uploads = %pending_uploads,
+                    pending_uploads = %pending_uploads_human,
                     active_uploads,
                     pending_metadata_ops,
                     "upload pipeline"
                 );
+                match upload_trouble_signal {
+                    UploadTroubleSignal::Warn => {
+                        warn!(
+                            pending_uploads = pending,
+                            pending_uploads_human = %pending_uploads_human,
+                            active_uploads,
+                            timeouts = upload_trouble_counters.timeouts,
+                            network_errors = upload_trouble_counters.network_errors,
+                            retries = upload_trouble_counters.retries,
+                            exhausted = upload_trouble_counters.exhausted,
+                            oldest_pending_upload_age_ms = max_ms,
+                            last_put_bytes_uploaded = upload_trouble_counters.bytes_uploaded,
+                            "S3 upload pipeline appears stuck; uploads are retrying"
+                        );
+                    }
+                    UploadTroubleSignal::Recovered => {
+                        info!("S3 upload pipeline recovered");
+                    }
+                    UploadTroubleSignal::None => {}
+                }
             }
 
             upload_pipeline_summary_was_active = is_active;

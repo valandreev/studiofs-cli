@@ -78,9 +78,9 @@ inode toward root; no match defaults to `rw`.
 | `meta_path` | — | Path to redb database |
 | `cache_dir` | — | Root for the local cache backend and runtime state |
 | `cache_size` | 100 GiB | Local cache size budget |
-| `block_size` | 16 MiB | Chunk size (cloud transfer currently uses 4x4 MiB fragments) |
+| `block_size` | 4 MiB | Logical object/block size for cloud transfer |
 | `max_concurrent_uploads` | 4 | Upload worker concurrency |
-| `readahead_width` | 18 | Base prefetch depth |
+| `readahead_width` | 64 | Base prefetch depth |
 | `max_dirty_bytes` | 300 MiB | JuiceFS-sized writer/cache dirty-byte limit before backpressure |
 | `upload_stats_interval_secs` | 1 | Upload control-loop tick interval |
 | `upload_fg_read_latency_target_ms` | 35 | Foreground-read P90 target for upload throttling |

@@ -2,7 +2,9 @@
 
 use opendal::layers::{ConcurrentLimitLayer, RetryLayer, TimeoutLayer};
 use opendal::{Buffer, Operator, services::S3};
+use std::collections::HashSet;
 use std::fmt;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use studiofs_meta::FormatInfo;
 use thiserror::Error;
@@ -100,6 +102,32 @@ fn is_ip_endpoint(endpoint: &str) -> bool {
     false
 }
 
+static PATH_STYLE_LOGGED_ENDPOINTS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn should_log_path_style_endpoint(seen: &mut HashSet<String>, endpoint: &str) -> bool {
+    seen.insert(endpoint.to_string())
+}
+
+fn log_path_style_endpoint_once(endpoint: &str) {
+    let seen = PATH_STYLE_LOGGED_ENDPOINTS.get_or_init(|| Mutex::new(HashSet::new()));
+    match seen.lock() {
+        Ok(mut guard) => {
+            if should_log_path_style_endpoint(&mut guard, endpoint) {
+                info!(
+                    endpoint,
+                    "using path-style addressing for IP-based S3 endpoint"
+                );
+            }
+        }
+        Err(_) => {
+            debug!(
+                endpoint,
+                "skipping path-style addressing log because endpoint log-once state is poisoned"
+            );
+        }
+    }
+}
+
 impl DataStore {
     /// Create a new DataStore with the default I/O profile.
     pub fn new(config: &DataStoreConfig) -> DataResult<Self> {
@@ -119,7 +147,7 @@ impl DataStore {
         // For IP-based endpoints, ensure we use path-style (default in OpenDAL).
         // Virtual-host style (bucket.host) doesn't work with IP addresses.
         if is_ip_endpoint(&config.endpoint) {
-            info!("using path-style addressing for IP-based S3 endpoint");
+            log_path_style_endpoint_once(&config.endpoint);
         }
 
         if !config.region.is_empty() {
@@ -367,5 +395,23 @@ mod tests {
         assert!(!is_ip_endpoint("http://minio.local:9000"));
         assert!(!is_ip_endpoint("https://s3.amazonaws.com"));
         assert!(!is_ip_endpoint("minio.local:9000"));
+    }
+
+    #[test]
+    fn path_style_endpoint_log_once_helper_is_per_endpoint() {
+        let mut seen = std::collections::HashSet::new();
+
+        assert!(should_log_path_style_endpoint(
+            &mut seen,
+            "http://192.168.1.50:9000"
+        ));
+        assert!(!should_log_path_style_endpoint(
+            &mut seen,
+            "http://192.168.1.50:9000"
+        ));
+        assert!(should_log_path_style_endpoint(
+            &mut seen,
+            "http://192.168.1.51:9000"
+        ));
     }
 }

@@ -660,6 +660,76 @@ fn upload_pipeline_runtime_events_only_emit_active_samples_and_transitions() {
 }
 
 #[test]
+fn s3_upload_problem_detector_timeout_delta_enters_warning_state() {
+    let mut state = super::workers::UploadTroubleState::default();
+    let counters = super::workers::UploadTroubleCounters {
+        uploads_err: 1,
+        timeouts: 1,
+        ..Default::default()
+    };
+
+    assert_eq!(
+        state.observe(counters, 2, 0, 0),
+        super::workers::UploadTroubleSignal::Warn
+    );
+    assert!(state.is_active());
+}
+
+#[test]
+fn s3_upload_problem_detector_repeated_pending_ticks_keep_warning_state() {
+    let mut state = super::workers::UploadTroubleState::default();
+    let counters = super::workers::UploadTroubleCounters {
+        uploads_err: 1,
+        network_errors: 1,
+        retries: 1,
+        ..Default::default()
+    };
+
+    assert_eq!(
+        state.observe(counters, 1, 1, 1),
+        super::workers::UploadTroubleSignal::Warn
+    );
+    assert_eq!(
+        state.observe(counters, 1, 0, 1),
+        super::workers::UploadTroubleSignal::Warn
+    );
+    assert!(state.is_active());
+}
+
+#[test]
+fn s3_upload_problem_detector_drain_emits_one_recovery_event() {
+    let mut state = super::workers::UploadTroubleState::default();
+    let failed = super::workers::UploadTroubleCounters {
+        uploads_err: 1,
+        status_5xx_errors: 1,
+        retries: 1,
+        ..Default::default()
+    };
+    assert_eq!(
+        state.observe(failed, 1, 1, 0),
+        super::workers::UploadTroubleSignal::Warn
+    );
+
+    let recovered = super::workers::UploadTroubleCounters {
+        uploads_ok: 1,
+        uploads_err: 1,
+        status_5xx_errors: 1,
+        retries: 1,
+        bytes_uploaded: 4096,
+        ..Default::default()
+    };
+    assert_eq!(
+        state.observe(recovered, 0, 0, 0),
+        super::workers::UploadTroubleSignal::Recovered
+    );
+    assert_eq!(
+        state.observe(recovered, 0, 0, 0),
+        super::workers::UploadTroubleSignal::None
+    );
+    assert!(!state.is_active());
+}
+
+#[test]
 fn startup_replay_keeps_metadata_live_extent_when_pending_upload_has_same_epoch() {
     let tmp = TempDir::new().expect("tempdir");
     let (_rt, vfs, meta) = make_test_vfs(&tmp, "startup-replay-same-epoch");
@@ -2933,18 +3003,18 @@ fn write_admission_governor_does_not_throttle_when_drain_keeps_up() {
 
 #[test]
 fn default_readahead_tracks_the_juicefs_sized_buffer_budget() {
-    let buffer_blocks = derive_buffer_blocks_default(DEFAULT_READ_BUFFER_MB, 16 * 1024 * 1024);
+    let buffer_blocks = derive_buffer_blocks_default(DEFAULT_READ_BUFFER_MB, 4 * 1024 * 1024);
     let readahead_max_width = derive_readahead_max_width(
         DEFAULT_READ_BUFFER_MB,
-        16 * 1024 * 1024,
+        4 * 1024 * 1024,
         DEFAULT_READAHEAD_WIDTH,
     );
     let fetch_aimd = build_fetch_aimd_config(readahead_max_width, &VfsConfig::default());
 
-    assert_eq!(buffer_blocks, 18);
-    assert_eq!(readahead_max_width, DEFAULT_READAHEAD_WIDTH);
-    assert_eq!(fetch_aimd.max_window, 18.0);
-    assert_eq!(fetch_aimd.initial_window, 4.5);
+    assert_eq!(buffer_blocks, 75);
+    assert_eq!(readahead_max_width, 75);
+    assert_eq!(fetch_aimd.max_window, 75.0);
+    assert_eq!(fetch_aimd.initial_window, 18.75);
 }
 
 #[test]

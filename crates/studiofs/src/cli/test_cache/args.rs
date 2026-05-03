@@ -44,7 +44,7 @@ impl From<TestCacheArgs> for TestCacheRunRequest {
             l1_limit: args.l1_limit,
             profile: args.profile,
             json_output: args.json_output,
-            full_file_reads: false,
+            full_file_reads: args.full_file_reads,
         }
     }
 }
@@ -123,6 +123,10 @@ pub(crate) struct TestCacheArgs {
     #[arg(long)]
     json_output: Option<PathBuf>,
 
+    /// Read each generated file fully instead of sampling one read-size chunk.
+    #[arg(long)]
+    full_file_reads: bool,
+
     /// Enable on-demand profiling for this benchmark run.
     #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "pyroscope")]
     profile: Option<TestCacheProfileMode>,
@@ -170,6 +174,7 @@ mod tests {
                 access_pattern,
                 l1_limit,
                 json_output,
+                full_file_reads,
                 profile,
                 during_upload_min_pending,
                 during_upload_timeout_ms,
@@ -190,6 +195,7 @@ mod tests {
                 assert_eq!(during_upload_timeout_ms, 10_000);
                 assert!(l1_limit.is_none());
                 assert!(json_output.is_none());
+                assert!(!full_file_reads);
                 assert!(profile.is_none());
             }
             other => panic!("expected TestCache, got {other:?}"),
@@ -224,6 +230,7 @@ mod tests {
             "4GB",
             "--json-output",
             "reports/cache-run.json",
+            "--full-file-reads",
             "--profile=pyroscope",
         ])
         .unwrap();
@@ -246,6 +253,7 @@ mod tests {
                 during_upload_timeout_ms,
                 l1_limit,
                 json_output,
+                full_file_reads,
                 profile,
             }) => {
                 assert_eq!(path, PathBuf::from("Z:\\bench"));
@@ -267,6 +275,7 @@ mod tests {
                     json_output.unwrap(),
                     PathBuf::from("reports/cache-run.json")
                 );
+                assert!(full_file_reads);
                 assert!(matches!(profile, Some(TestCacheProfileMode::Pyroscope)));
             }
             other => panic!("expected TestCache, got {other:?}"),

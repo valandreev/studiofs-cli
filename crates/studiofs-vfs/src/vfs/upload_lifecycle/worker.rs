@@ -333,7 +333,7 @@ where
                 retry_op.not_before_unix_ms = now_unix_millis()
                     .saturating_add(delay.as_millis().clamp(0, u64::MAX as u128) as u64);
                 self.shutdown.record_requeue();
-                warn!(
+                debug!(
                     object_id = retry_op.object_id,
                     ino = retry_op.ino,
                     retry_count = retry_op.retry_count,

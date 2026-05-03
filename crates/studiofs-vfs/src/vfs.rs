@@ -637,9 +637,9 @@ const DEFAULT_JANITOR_LEASE_TTL: Duration = Duration::from_secs(45 * 60);
 // - buffer-size: 300M
 const DEFAULT_READ_BUFFER_MB: u64 = 300;
 // Block-level derived defaults (used as fallback if conversion is unavailable).
-const DEFAULT_PREFETCH_CONCURRENCY: usize = 8;
-const DEFAULT_READAHEAD_WIDTH: u32 = 18;
-const DEFAULT_READAHEAD_MIN_PREFETCH: u32 = 1;
+const DEFAULT_PREFETCH_CONCURRENCY: usize = 16;
+const DEFAULT_READAHEAD_WIDTH: u32 = 64;
+const DEFAULT_READAHEAD_MIN_PREFETCH: u32 = 16;
 const DEFAULT_READAHEAD_SEQ_STEP: u8 = 4;
 const DEFAULT_READAHEAD_RANDOM_PENALTY: u8 = 2;
 const DEFAULT_PREFETCH_FOREGROUND_RESERVE: usize = 16;

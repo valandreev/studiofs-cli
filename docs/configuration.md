@@ -432,8 +432,8 @@ Operator stance:
 | `--cache-dir` | `<meta-dir>/cache` | Local data-cache root |
 | `--cache-size` | `100GB` | Local data-cache budget |
 | `--read-buffer` | `300MB` | Foreground read-buffer budget |
-| `--readahead` | `18` | Sequential readahead width in blocks |
-| `--prefetch` | `8` | Background prefetch batch concurrency budget |
+| `--readahead` | `64` | Sequential readahead width in 4 MiB blocks |
+| `--prefetch` | `16` | Background prefetch batch concurrency budget |
 | `--principal` / `STUDIOFS_PRINCIPAL` | `*` | Principal used for ACL checks |
 | `STUDIOFS_CLIENT_ROOT` | `~/.studiofs` | Local per-client metadata, mount records, logs, investigations, and default cache root |
 

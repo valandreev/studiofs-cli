@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use studiofs_data::store::{DataError, DataStore};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, warn};
+use tracing::{debug, error};
 
 /// Lock-free counters for upload observability.
 pub struct UploadMetrics {
@@ -189,7 +189,7 @@ impl UploadScheduler {
                             .saturating_mul(2u32.saturating_pow(attempt))
                             .min(self.retry_max_delay);
                         self.metrics.retries.fetch_add(1, Ordering::Relaxed);
-                        warn!(
+                        debug!(
                             attempt = attempt + 1,
                             max = self.max_attempts,
                             key,
@@ -202,7 +202,7 @@ impl UploadScheduler {
                             return Err(UploadError::Cancelled);
                         }
                     } else if retryable {
-                        error!(
+                        debug!(
                             attempts = self.max_attempts,
                             key,
                             req_ms,
@@ -241,7 +241,7 @@ impl UploadScheduler {
                             .saturating_mul(2u32.saturating_pow(attempt))
                             .min(self.retry_max_delay);
                         self.metrics.retries.fetch_add(1, Ordering::Relaxed);
-                        warn!(
+                        debug!(
                             attempt = attempt + 1,
                             max = self.max_attempts,
                             key,
@@ -253,7 +253,7 @@ impl UploadScheduler {
                             return Err(UploadError::Cancelled);
                         }
                     } else {
-                        error!(
+                        debug!(
                             attempts = self.max_attempts,
                             key,
                             total_ms = overall_start.elapsed().as_millis() as u64,
