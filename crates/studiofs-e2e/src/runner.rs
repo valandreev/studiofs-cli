@@ -9,6 +9,9 @@ use std::time::Instant;
 use chrono::{SecondsFormat, Utc};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
+use studiofs_scenario::{
+    OperationLogError, OperationLogWriter, OperationOutcome, ScenarioOperation,
+};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -156,6 +159,8 @@ pub enum RunnerError {
     Client(#[from] ClientControllerError),
     #[error("runner infra failed: {0}")]
     Infra(#[from] InfraError),
+    #[error("runner operation log failed: {0}")]
+    OperationLog(#[from] OperationLogError),
 }
 
 #[derive(Debug)]
@@ -858,12 +863,31 @@ fn run_hook<T>(
     f: impl FnOnce() -> Result<T, scenario::ScenarioError>,
 ) -> Result<T, RunnerError> {
     record_event(events_path, run_id, Some(scenario), hook, "started")?;
-    record_event(operation_log, run_id, Some(scenario), hook, "started")?;
+    record_operation_checkpoint(operation_log, scenario, hook, "started")?;
     let result = f();
     let phase = if result.is_ok() { "finished" } else { "failed" };
     record_event(events_path, run_id, Some(scenario), hook, phase)?;
-    record_event(operation_log, run_id, Some(scenario), hook, phase)?;
+    record_operation_checkpoint(operation_log, scenario, hook, phase)?;
     Ok(result?)
+}
+
+fn record_operation_checkpoint(
+    operation_log: &Path,
+    scenario: &str,
+    hook: &str,
+    phase: &str,
+) -> Result<(), RunnerError> {
+    let mut writer = OperationLogWriter::open_append(operation_log)?;
+    let record = writer
+        .record(
+            scenario,
+            ScenarioOperation::SchedulerCheckpoint {
+                name: format!("{hook}.{phase}"),
+            },
+        )
+        .with_outcome(OperationOutcome::Observed);
+    writer.append_record(&record)?;
+    Ok(())
 }
 
 fn record_event(

@@ -32,6 +32,7 @@ studiofs (CLI)
   ├── studiofs-vfs        filesystem core
   ├── studiofs-fuse       Linux/macOS bridge
   ├── studiofs-winfsp     Windows bridge
+  ├── studiofs-scenario   shared E2E/simulation operation log schema
   └── studiofs-e2e        real mounted E2E runner
 ```
 

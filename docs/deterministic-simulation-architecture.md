@@ -67,7 +67,7 @@ instead of one monolithic simulator.
 
 | Abstraction | Responsibility | Follow-up |
 |---|---|---|
-| operation model | Serializable logical operations shared by Real E2E and simulation: create, mkdir, write, append, truncate, rename, unlink, rmdir, read, stat, readdir, flush, fsync, close/release, crash, restart, outage, recovery, wait, and barrier | SFS-331 |
+| operation model | `studiofs-scenario` serializable logical operations shared by Real E2E and simulation: create, mkdir, write, append, truncate, rename, unlink, rmdir, read, stat, readdir, flush, fsync, close/release, crash, restart, outage, recovery, wait, and barrier | SFS-331 |
 | logical state snapshot | A stable view of paths, inodes or logical node IDs, file versions, payload references, pending uploads, pending publications, and client-local visibility | SFS-332 |
 | invariant validation | Product-specific checks for convergence, no lost durable writes, no unexpected resurrection, valid tree structure, canonical path ownership, object reachability, and idempotent replay | SFS-332 |
 | simulated metadata bus | Scheduler-driven metadata replication with ordered delivery, outage, reconnect, delayed delivery, duplicate delivery, and traceable batch/version behavior | SFS-333 |
@@ -103,8 +103,10 @@ unrelated language.
 
 Reusable inputs:
 
-- Real E2E `operations.ndjson` records should become the reference operation
-  log shape or be mechanically translatable into the shared operation model.
+- Real E2E `operations.ndjson` records use `studiofs-scenario`
+  `ScenarioOperationRecord` lines with `schema_version = 1`, monotonic
+  per-file `sequence`, typed operation variants, typed outcomes, and explicit
+  simulation support markers.
 - Scenario identifiers, client IDs, deterministic order markers, operation
   result fields, and error fields should stay portable where the simulated
   operation is meaningful without a mount.
@@ -131,9 +133,10 @@ Reusable artifacts:
 - failure diagnostics that identify scenario, seed, client, operation index,
   invariant, and relevant path/object IDs.
 
-Unsupported mounted-only operations must remain explicit. For example, a future
-operation model can contain a platform probe operation for Real E2E while marking
-it as unsupported by deterministic simulation.
+Unsupported mounted-only operations must remain explicit. Operation records keep
+`simulation_support.status = "unsupported"` plus a reason when the simulator
+must skip or reject the record, such as platform probe operations or mounted
+callback boundaries that have no logical simulation equivalent.
 
 ## Counterexample Capture And Replay
 
@@ -168,7 +171,8 @@ runner.
 
 The design intentionally sequences implementation in small slices:
 
-1. SFS-331 extracts the shared operation model and stable operation log schema.
+1. SFS-331 extracts the shared operation model and stable operation log schema
+   into `crates/studiofs-scenario`.
 2. SFS-332 extracts logical snapshots and invariant validation.
 3. SFS-333 adds the simulated metadata bus.
 4. SFS-334 adds the simulated object store and upload model.
@@ -179,9 +183,11 @@ The design intentionally sequences implementation in small slices:
 Candidate crate layout:
 
 ```text
+crates/studiofs-scenario/
+  src/lib.rs        shared operation records and NDJSON helpers
+
 crates/studiofs-sim/
   src/
-    operation.rs
     snapshot.rs
     invariant.rs
     scheduler.rs
