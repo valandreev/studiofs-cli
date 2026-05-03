@@ -2508,14 +2508,14 @@ fn test_crash_recovery_replays_local_committed_block_before_metadata_flush() {
 
             let blocks = wait_until_payload_slices(&vfs, ino, Duration::from_secs(45))
                 .expect("expected committed payload slices for baseline payload");
-            baseline_object_id = blocks[0].1.object_id;
+            let uploaded_baseline_object_id = blocks[0].1.object_id;
 
             let ds = DataStore::new(&data_config).unwrap();
             assert!(
                 wait_until_object_exists(
                     &ds,
                     &format_info.data_prefix,
-                    baseline_object_id,
+                    uploaded_baseline_object_id,
                     Duration::from_secs(60),
                 )
                 .await,
@@ -2560,9 +2560,15 @@ fn test_crash_recovery_replays_local_committed_block_before_metadata_flush() {
                 1,
                 "baseline file should have one committed payload slice"
             );
+            baseline_object_id = before[0].1.object_id;
+            let baseline_read = vfs
+                .read(ino, 0, baseline_payload.len() as u32)
+                .await
+                .unwrap();
             assert_eq!(
-                before[0].1.object_id, baseline_object_id,
-                "baseline committed payload slice must remain visible before overwrite"
+                baseline_read.as_ref(),
+                baseline_payload.as_slice(),
+                "baseline committed payload bytes must remain visible before overwrite"
             );
 
             vfs.write(ino, 0, &replacement_payload).await.unwrap();
