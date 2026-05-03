@@ -221,15 +221,15 @@ accepted-operation count, recovery time, and the final validator result.
 with `docker compose up --wait`, so it includes the PostgreSQL healthcheck
 readiness gate as well as mounted tree convergence time.
 
-`rustfs-outage-multi-client-recovery` uses the same three-client mounted
-bootstrap, writes and converges an initial file while RustFS/S3 is healthy,
-stops only the RustFS compose service, writes a new complete version through
-`client-a`, verifies that `client-a` can read the accepted local version, and
-checks that a peer client does not observe that new checksum before RustFS/S3
-is restored. After `docker compose up --wait rustfs`, the scenario waits for
-mounted tree convergence and records the local read checksum, any peer-visible
-pre-recovery checksum, the final checksum, upload recovery time, and final
-validator result in `rustfs-outage-recovery-summary.json`.
+`rustfs-outage-multi-client-recovery` uses a four-client mounted bootstrap,
+writes and converges an initial file while RustFS/S3 is healthy, stops only the
+RustFS compose service, writes a new complete version through `client-a`,
+verifies that `client-a` can read the accepted local version, and checks that
+every peer client does not observe that new checksum before RustFS/S3 is
+restored. After `docker compose up --wait rustfs`, the scenario waits for
+mounted tree convergence and records the local read checksum, per-peer
+pre-recovery visibility checksums, per-client final checksums, upload recovery
+time, and final validator result in `rustfs-outage-recovery-summary.json`.
 `outage_duration_ms` covers the RustFS stopped window through the accepted
 local write/read boundary; the peer visibility probe runs after that boundary
 so peer I/O latency does not inflate the outage-duration metric.
