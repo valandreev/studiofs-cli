@@ -40,6 +40,10 @@ pub enum UploadOutcome {
         upload_id: u64,
         object_id: String,
     },
+    AlreadyCompleted {
+        upload_id: u64,
+        object_id: String,
+    },
     Failed {
         upload_id: u64,
         object_id: String,
@@ -191,6 +195,12 @@ impl SimulatedObjectStore {
 
     pub fn complete_upload(&mut self, upload_id: u64) -> Option<UploadOutcome> {
         let state = self.uploads.get(&upload_id)?.clone();
+        if state.terminal {
+            return Some(UploadOutcome::AlreadyCompleted {
+                upload_id,
+                object_id: state.ticket.object_id,
+            });
+        }
         if !self.is_available() {
             let outcome = UploadOutcome::Blocked {
                 upload_id,
@@ -250,6 +260,9 @@ impl SimulatedObjectStore {
     ) -> Option<UploadOutcome> {
         let error = error.into();
         let state = self.uploads.get_mut(&upload_id)?;
+        if state.terminal {
+            return None;
+        }
         state.retry_at_tick = retry_at_tick;
         state.terminal = false;
         let ticket = state.ticket.clone();
@@ -403,6 +416,11 @@ impl SimulatedObjectStore {
             ids.extend(payloads.keys().cloned());
         }
         ids.extend(self.remote_objects.keys().cloned());
+        ids.extend(
+            self.uploads
+                .values()
+                .map(|state| state.ticket.object_id.clone()),
+        );
         ids.extend(self.published.iter().cloned());
         ids.extend(self.deleted.iter().cloned());
         ids

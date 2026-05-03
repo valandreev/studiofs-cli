@@ -33,6 +33,51 @@ fn upload_completion_makes_object_remote_without_publishing_metadata() {
 }
 
 #[test]
+fn completed_upload_is_terminal_and_idempotent() {
+    let mut store = SimulatedObjectStore::new();
+    store.stage_local_payload("writer", "object-a", "checksum-a", 12);
+    let ticket = store.schedule_upload("writer", "object-a").unwrap();
+
+    assert_eq!(
+        store.complete_upload(ticket.upload_id),
+        Some(UploadOutcome::Completed {
+            upload_id: ticket.upload_id,
+            object_id: "object-a".to_string()
+        })
+    );
+    assert_eq!(
+        store.complete_upload(ticket.upload_id),
+        Some(UploadOutcome::AlreadyCompleted {
+            upload_id: ticket.upload_id,
+            object_id: "object-a".to_string()
+        })
+    );
+}
+
+#[test]
+fn completed_upload_cannot_be_marked_failed() {
+    let mut store = SimulatedObjectStore::new();
+    store.stage_local_payload("writer", "object-a", "checksum-a", 12);
+    let ticket = store.schedule_upload("writer", "object-a").unwrap();
+
+    assert!(matches!(
+        store.complete_upload(ticket.upload_id),
+        Some(UploadOutcome::Completed { .. })
+    ));
+    assert_eq!(
+        store.fail_upload(ticket.upload_id, "late failure", Some(10)),
+        None
+    );
+    assert_eq!(
+        store.complete_upload(ticket.upload_id),
+        Some(UploadOutcome::AlreadyCompleted {
+            upload_id: ticket.upload_id,
+            object_id: "object-a".to_string()
+        })
+    );
+}
+
+#[test]
 fn outage_blocks_upload_completion_and_remote_reads_until_recovery() {
     let mut store = SimulatedObjectStore::new();
     store.stage_local_payload("writer", "object-a", "checksum-a", 12);
@@ -84,6 +129,23 @@ fn upload_with_missing_local_payload_is_blocked_not_ambiguous() {
             .iter()
             .any(|record| record.kind == ObjectStoreTraceKind::UploadBlocked
                 && record.fault == Some(ObjectStoreFault::LocalPayloadMissing))
+    );
+}
+
+#[test]
+fn lifecycle_includes_pending_upload_after_local_payload_is_removed() {
+    let mut store = SimulatedObjectStore::new();
+    store.stage_local_payload("writer", "object-a", "checksum-a", 12);
+    store.schedule_upload("writer", "object-a").unwrap();
+    store.remove_local_payload("writer", "object-a");
+
+    assert_eq!(
+        store.object_lifecycle(),
+        vec![ObjectLifecycle {
+            object_id: "object-a".to_string(),
+            present_remote: false,
+            protected: true,
+        }]
     );
 }
 
