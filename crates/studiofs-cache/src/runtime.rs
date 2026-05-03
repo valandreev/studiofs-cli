@@ -58,6 +58,7 @@ const ACCESS_TOUCH_RETRY_BASE_BACKOFF_MS: u64 = 10;
 const ACCESS_TOUCH_RETRY_MAX_EXPONENT: u8 = 8;
 const DIRTY_ORPHAN_PRUNE_MIN_INTERVAL: Duration = Duration::from_secs(30);
 const LOW_SPACE_UPLOAD_DRAIN_WAIT: Duration = Duration::from_millis(25);
+const LOW_SPACE_UPLOAD_DRAIN_IDLE_RETRIES: usize = 4;
 const LOW_SPACE_UPLOAD_DRAIN_PROGRESS_RETRIES: usize = 4;
 
 /// Backend kind available on the runtime path.
@@ -487,6 +488,7 @@ impl LocalPayloadBackendRuntime {
         mut current_after_evict: u64,
     ) -> Result<u64, LocalPayloadBackendError> {
         let mut progress_waits = 0;
+        let mut idle_waits = 0;
         loop {
             if !self
                 .budget_governor
@@ -507,11 +509,13 @@ impl LocalPayloadBackendRuntime {
 
             let observed_epoch = *self.storage_state_epoch.lock();
             debug!(
+                idle_waits,
                 progress_waits,
                 current_bytes = current_after_evict,
                 target_bytes,
                 payload_len,
                 dirty_object_count,
+                idle_wait_limit = LOW_SPACE_UPLOAD_DRAIN_IDLE_RETRIES,
                 progress_wait_limit = LOW_SPACE_UPLOAD_DRAIN_PROGRESS_RETRIES,
                 wait_ms = LOW_SPACE_UPLOAD_DRAIN_WAIT.as_millis(),
                 "local payload runtime low-space put waiting for pending upload drain progress"
@@ -525,6 +529,10 @@ impl LocalPayloadBackendRuntime {
                 {
                     break;
                 }
+                idle_waits += 1;
+                if idle_waits < LOW_SPACE_UPLOAD_DRAIN_IDLE_RETRIES {
+                    continue;
+                }
                 let exhausted_total = self
                     .low_space_exhausted_waits
                     .fetch_add(1, Ordering::Relaxed)
@@ -534,12 +542,14 @@ impl LocalPayloadBackendRuntime {
                     target_bytes,
                     payload_len,
                     dirty_object_count,
+                    idle_waits,
                     exhausted_total,
                     "local payload runtime low-space put retry exhausted without upload drain progress"
                 );
                 break;
             }
 
+            idle_waits = 0;
             progress_waits += 1;
             let progress_total = self
                 .low_space_progress_waits
