@@ -213,7 +213,19 @@ impl DeterministicRng {
 
     fn choose(&mut self, len: usize) -> usize {
         debug_assert!(len > 0);
-        (self.next_u32() as usize) % len
+        loop {
+            if let Some(choice) = Self::choice_from_u32(self.next_u32(), len) {
+                return choice;
+            }
+        }
+    }
+
+    fn choice_from_u32(value: u32, len: usize) -> Option<usize> {
+        let len = u64::try_from(len).expect("ready event count must fit in u64");
+        let sample_space = u64::from(u32::MAX) + 1;
+        let limit = sample_space - (sample_space % len);
+        let value = u64::from(value);
+        (value < limit).then_some((value % len) as usize)
     }
 
     fn next_u32(&mut self) -> u32 {
@@ -224,5 +236,17 @@ impl DeterministicRng {
         let xorshifted = (((old_state >> 18) ^ old_state) >> 27) as u32;
         let rotate = (old_state >> 59) as u32;
         xorshifted.rotate_right(rotate)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DeterministicRng;
+
+    #[test]
+    fn choice_rejects_values_outside_the_even_selection_window() {
+        assert_eq!(DeterministicRng::choice_from_u32(5, 10), Some(5));
+        assert_eq!(DeterministicRng::choice_from_u32(u32::MAX - 4, 10), None);
+        assert_eq!(DeterministicRng::choice_from_u32(u32::MAX, 10), None);
     }
 }
