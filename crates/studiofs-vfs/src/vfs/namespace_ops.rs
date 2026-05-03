@@ -1,10 +1,10 @@
 use super::{
-    ATTR_CACHE_TTL, AccessLevel, Arc, ChunkId, DEFAULT_CHUNK_SIZE, DirEntry, FileSessionOperation,
-    FileType, Ino, InodeAttr, InodeIncarnationState, Instant, LocalSyncPolicy, MetaError,
-    NamespacePathStyle, PendingIncarnation, ResolvedSliceSource, SetattrArgs, SliceId, SliceOrder,
-    SliceRange, SliceRecord, StudioVfs, UnlinkTarget, VfsError, VfsMeta, VfsResult, VfsState,
-    VfsUploadState, block_index_from_offset, chunk_id_from_offset, chunk_start_offset, debug, info,
-    offset_within_block, validate_name, warn,
+    ATTR_CACHE_TTL, AccessLevel, Arc, ChunkId, DEFAULT_CHUNK_SIZE, DirAccessEntry, DirEntry,
+    FileSessionOperation, FileType, Ino, InodeAttr, InodeIncarnationState, Instant,
+    LocalSyncPolicy, MetaError, NamespacePathStyle, PendingIncarnation, ResolvedSliceSource,
+    SetattrArgs, SliceId, SliceOrder, SliceRange, SliceRecord, StudioVfs, UnlinkTarget, VfsError,
+    VfsMeta, VfsResult, VfsState, VfsUploadState, block_index_from_offset, chunk_id_from_offset,
+    chunk_start_offset, debug, info, offset_within_block, validate_name, warn,
 };
 use studiofs_meta::schema::PayloadRefState;
 
@@ -799,13 +799,13 @@ impl StudioVfs {
             self.effective_access_level_cache_insert(entry_ino, level);
         }
 
-        let file_children: Vec<Ino> = entries
+        let file_children: Vec<DirAccessEntry<'_>> = entries
             .iter()
             .filter(|e| e.kind == FileType::RegularFile)
-            .map(|e| e.ino)
+            .map(|e| DirAccessEntry::new(e.ino, &e.name))
             .collect();
         if !file_children.is_empty() {
-            self.dir_prefetch.on_readdir(ino, file_children);
+            self.dir_prefetch.on_readdir_entries(ino, file_children);
         }
         self.schedule_readdir_attr_hydration(&entries);
 

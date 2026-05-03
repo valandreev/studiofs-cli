@@ -116,7 +116,7 @@ use crate::landing_zone::LandingZone;
 #[cfg(test)]
 use crate::landing_zone::RecoveredLandingSegment;
 use crate::qos::{QosController, TransitMemoryBudget};
-use crate::readahead::{DirAccessTracker, ReadAheadTracker, ReadStreamKey};
+use crate::readahead::{DirAccessEntry, DirAccessTracker, ReadAheadTracker, ReadStreamKey};
 
 use crate::runtime::{
     LocalCacheIoTiming, MetaExecutor, VfsMeta, cache_io_execution_model, into_vfs_meta,

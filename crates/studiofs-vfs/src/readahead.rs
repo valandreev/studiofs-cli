@@ -18,7 +18,7 @@
 //! concurrent calls to `record_read()` never schedule duplicate work.
 
 use dashmap::DashMap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -691,15 +691,140 @@ mod tests {
 struct DirPrefetchState {
     /// All regular-file child inodes from readdir.
     children: Vec<Ino>,
-    /// Map from child ino back to its parent dir ino (for reverse lookup).
     /// How many children we've seen accessed (open/read).
     seen: usize,
+    /// Which children have been observed through a real foreground access.
+    accessed: HashSet<Ino>,
     /// Which children have already been scheduled for prefetch.
     prefetched: HashSet<Ino>,
+    /// Contiguous frame-sequence runs in numeric order.
+    sequences: Vec<Vec<Ino>>,
+    /// child ino -> position inside `sequences`.
+    sequence_positions: HashMap<Ino, FrameSequencePosition>,
     /// Stable generation stamp for the current readdir child set.
     readdir_touch: u64,
     /// Monotonic access stamp used for bounded LRU-style eviction.
     last_touch: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirAccessEntry<'a> {
+    /// Inode for a regular-file directory child.
+    pub ino: Ino,
+    /// Raw directory entry name as returned by metadata.
+    pub name: &'a [u8],
+}
+
+impl<'a> DirAccessEntry<'a> {
+    /// Create a tracked directory child entry from an inode and raw name bytes.
+    pub fn new(ino: Ino, name: &'a [u8]) -> Self {
+        Self { ino, name }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FrameSequenceKey {
+    prefix: Vec<u8>,
+    width: usize,
+    suffix: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FrameSequenceMember {
+    number: u64,
+    ino: Ino,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FrameSequencePosition {
+    sequence_idx: usize,
+    member_idx: usize,
+}
+
+#[derive(Debug, Default)]
+struct FrameSequenceIndex {
+    sequences: Vec<Vec<Ino>>,
+    positions: HashMap<Ino, FrameSequencePosition>,
+}
+
+fn parse_frame_sequence_member(entry: &DirAccessEntry<'_>) -> Option<(FrameSequenceKey, u64)> {
+    let name = entry.name;
+    let stem_end = name.iter().rposition(|b| *b == b'.').unwrap_or(name.len());
+    if stem_end == 0 {
+        return None;
+    }
+
+    let mut digit_start = stem_end;
+    while digit_start > 0 && name[digit_start - 1].is_ascii_digit() {
+        digit_start -= 1;
+    }
+    if digit_start == stem_end {
+        return None;
+    }
+
+    let mut number = 0u64;
+    for digit in &name[digit_start..stem_end] {
+        number = number
+            .checked_mul(10)?
+            .checked_add(u64::from(digit - b'0'))?;
+    }
+
+    Some((
+        FrameSequenceKey {
+            prefix: name[..digit_start].to_vec(),
+            width: stem_end - digit_start,
+            suffix: name[stem_end..].to_vec(),
+        },
+        number,
+    ))
+}
+
+fn build_sequence_index(entries: &[DirAccessEntry<'_>]) -> FrameSequenceIndex {
+    let mut groups: HashMap<FrameSequenceKey, Vec<FrameSequenceMember>> = HashMap::new();
+    for entry in entries {
+        if let Some((key, number)) = parse_frame_sequence_member(entry) {
+            groups.entry(key).or_default().push(FrameSequenceMember {
+                number,
+                ino: entry.ino,
+            });
+        }
+    }
+
+    let mut index = FrameSequenceIndex::default();
+    for members in groups.values_mut() {
+        if members.len() < 2 {
+            continue;
+        }
+        members.sort_unstable_by_key(|member| (member.number, member.ino));
+        let mut run_start = 0;
+        for run_end in 1..=members.len() {
+            let run_continues = run_end < members.len()
+                && members[run_end - 1].number.checked_add(1) == Some(members[run_end].number);
+            if run_continues {
+                continue;
+            }
+
+            if run_end - run_start >= 2 {
+                let sequence_idx = index.sequences.len();
+                let sequence: Vec<Ino> = members[run_start..run_end]
+                    .iter()
+                    .map(|member| member.ino)
+                    .collect();
+                for (member_idx, &ino) in sequence.iter().enumerate() {
+                    index.positions.insert(
+                        ino,
+                        FrameSequencePosition {
+                            sequence_idx,
+                            member_idx,
+                        },
+                    );
+                }
+                index.sequences.push(sequence);
+            }
+            run_start = run_end;
+        }
+    }
+    index
 }
 
 /// Tracks directory-level access patterns.
@@ -782,18 +907,32 @@ impl DirAccessTracker {
     /// `children` should contain the inodes of regular-file children only
     /// (exclude directories and symlinks — those have no file payload).
     pub fn on_readdir(&self, dir_ino: Ino, children: Vec<Ino>) {
+        let entries = children
+            .into_iter()
+            .map(|ino| DirAccessEntry { ino, name: &[] })
+            .collect();
+        self.on_readdir_entries(dir_ino, entries);
+    }
+
+    /// Called after `readdir(dir_ino)` completes with child names available.
+    pub fn on_readdir_entries(&self, dir_ino: Ino, entries: Vec<DirAccessEntry<'_>>) {
         let touch = self.next_touch();
         if let Some((_, prev)) = self.dirs.remove(&dir_ino) {
             for child in &prev.children {
                 self.child_to_dir.remove(child);
             }
         }
+        let children: Vec<Ino> = entries.iter().map(|entry| entry.ino).collect();
+        let sequence_index = build_sequence_index(&entries);
         self.dirs.insert(
             dir_ino,
             DirPrefetchState {
                 children: children.clone(),
                 seen: 0,
+                accessed: HashSet::new(),
                 prefetched: HashSet::new(),
+                sequences: sequence_index.sequences,
+                sequence_positions: sequence_index.positions,
                 readdir_touch: touch,
                 last_touch: touch,
             },
@@ -811,6 +950,15 @@ impl DirAccessTracker {
     /// Returns an empty vec if the threshold hasn't been met yet, or if the
     /// child's parent directory isn't tracked.
     pub fn on_child_read(&self, child_ino: Ino) -> Vec<Ino> {
+        self.on_child_read_limited(child_ino, usize::MAX)
+    }
+
+    /// Called when a child inode is read, with an upper bound on returned inodes.
+    pub fn on_child_read_limited(&self, child_ino: Ino, limit: usize) -> Vec<Ino> {
+        if limit == 0 {
+            return Vec::new();
+        }
+
         let (dir_ino, mapping_touch) = match self.child_to_dir.get(&child_ino) {
             Some(v) => *v,
             None => return Vec::new(),
@@ -833,13 +981,33 @@ impl DirAccessTracker {
         }
         state.last_touch = touch;
 
-        // Already counted this child? Skip.
-        if state.prefetched.contains(&child_ino) {
+        // Already counted this foreground access? Skip.
+        if !state.accessed.insert(child_ino) {
             return Vec::new();
         }
 
+        if let Some(position) = state.sequence_positions.get(&child_ino).copied() {
+            let Some(sequence) = state.sequences.get(position.sequence_idx) else {
+                return Vec::new();
+            };
+            let Some(successors) = sequence.get(position.member_idx.saturating_add(1)..) else {
+                return Vec::new();
+            };
+            // `accessed` contains prior foreground reads from this immutable
+            // readdir snapshot; avoid warming files the caller already touched.
+            let to_prefetch: Vec<Ino> = successors
+                .iter()
+                .copied()
+                .filter(|ino| !state.accessed.contains(ino) && !state.prefetched.contains(ino))
+                .take(limit)
+                .collect();
+            for &ino in &to_prefetch {
+                state.prefetched.insert(ino);
+            }
+            return to_prefetch;
+        }
+
         state.seen += 1;
-        state.prefetched.insert(child_ino);
 
         // Not enough children read yet — don't prefetch.
         if state.seen < self.threshold {
@@ -847,11 +1015,14 @@ impl DirAccessTracker {
         }
 
         // Threshold met: return all un-prefetched children.
+        // `children` is the original readdir snapshot, so accessed children
+        // remain present here even after foreground reads.
         let to_prefetch: Vec<Ino> = state
             .children
             .iter()
-            .filter(|ino| !state.prefetched.contains(ino))
+            .filter(|ino| !state.accessed.contains(ino) && !state.prefetched.contains(ino))
             .copied()
+            .take(limit)
             .collect();
 
         // Mark them all as prefetched.
@@ -984,6 +1155,204 @@ mod dir_prefetch_tests {
         assert!(
             tracker.child_to_dir.get(&10).is_some(),
             "fresh mapping must survive stale compare-and-remove"
+        );
+    }
+
+    #[test]
+    fn test_frame_sequence_prefetches_next_numeric_siblings_first() {
+        let tracker = DirAccessTracker::new_with_capacity(2, 8);
+        tracker.on_readdir_entries(
+            100,
+            vec![
+                DirAccessEntry::new(10, b"plate_0100.exr"),
+                DirAccessEntry::new(11, b"plate_0101.exr"),
+                DirAccessEntry::new(12, b"plate_0102.exr"),
+                DirAccessEntry::new(99, b"notes.txt"),
+            ],
+        );
+
+        let p = tracker.on_child_read_limited(10, 2);
+
+        assert_eq!(
+            p,
+            vec![11, 12],
+            "first frame read should prefer the tight numeric sequence window"
+        );
+    }
+
+    #[test]
+    fn test_frame_sequence_index_stores_long_runs_linearly() {
+        let names: Vec<String> = (0..128)
+            .map(|frame| format!("plate_{frame:04}.exr"))
+            .collect();
+        let entries: Vec<DirAccessEntry<'_>> = names
+            .iter()
+            .enumerate()
+            .map(|(frame, name)| DirAccessEntry::new(10_000 + frame as Ino, name.as_bytes()))
+            .collect();
+
+        let index = build_sequence_index(&entries);
+        let stored_successor_slots: usize =
+            index.sequences.iter().map(|sequence| sequence.len()).sum();
+
+        assert!(
+            stored_successor_slots <= entries.len(),
+            "sequence index should store each frame at most once"
+        );
+    }
+
+    #[test]
+    fn test_frame_sequence_requires_adjacent_frame_numbers() {
+        let tracker = DirAccessTracker::new_with_capacity(2, 8);
+        tracker.on_readdir_entries(
+            100,
+            vec![
+                DirAccessEntry::new(10, b"plate_0100.exr"),
+                DirAccessEntry::new(11, b"plate_0200.exr"),
+                DirAccessEntry::new(12, b"plate_0201.exr"),
+            ],
+        );
+
+        let first_gap = tracker.on_child_read_limited(10, 2);
+        let second_run = tracker.on_child_read_limited(11, 2);
+
+        assert!(
+            first_gap.is_empty(),
+            "a distant same-shape filename should not be treated as the next frame"
+        );
+        assert_eq!(
+            second_run,
+            vec![12],
+            "adjacent frame numbers should still form a sequence"
+        );
+    }
+
+    #[test]
+    fn test_frame_sequence_rolls_window_forward_from_prefetched_member() {
+        let tracker = DirAccessTracker::new_with_capacity(2, 8);
+        tracker.on_readdir_entries(
+            100,
+            vec![
+                DirAccessEntry::new(10, b"plate_0100.exr"),
+                DirAccessEntry::new(11, b"plate_0101.exr"),
+                DirAccessEntry::new(12, b"plate_0102.exr"),
+                DirAccessEntry::new(13, b"plate_0103.exr"),
+                DirAccessEntry::new(14, b"plate_0104.exr"),
+            ],
+        );
+
+        let first = tracker.on_child_read_limited(10, 2);
+        let second = tracker.on_child_read_limited(11, 2);
+        let third = tracker.on_child_read_limited(12, 2);
+
+        assert_eq!(first, vec![11, 12]);
+        assert_eq!(
+            second,
+            vec![13, 14],
+            "reading a frame that was already prefetched should keep the bounded window warm"
+        );
+        assert!(
+            third.is_empty(),
+            "no duplicate prefetch should be scheduled for already warm frames"
+        );
+    }
+
+    #[test]
+    fn test_frame_sequence_keeps_width_and_suffix_separate() {
+        let tracker = DirAccessTracker::new_with_capacity(2, 8);
+        tracker.on_readdir_entries(
+            100,
+            vec![
+                DirAccessEntry::new(10, b"plate_0001.exr"),
+                DirAccessEntry::new(11, b"plate_0002.exr"),
+                DirAccessEntry::new(12, b"plate_0003.jpg"),
+                DirAccessEntry::new(13, b"plate_003.exr"),
+                DirAccessEntry::new(14, b"plate_0004.exr"),
+            ],
+        );
+
+        let p = tracker.on_child_read_limited(10, 4);
+
+        assert_eq!(
+            p,
+            vec![11],
+            "sequence matching should require the same numeric width and suffix"
+        );
+    }
+
+    #[test]
+    fn test_frame_sequence_allows_empty_prefix_digit_only_names() {
+        let tracker = DirAccessTracker::new_with_capacity(2, 8);
+        tracker.on_readdir_entries(
+            100,
+            vec![
+                DirAccessEntry::new(10, b"0001.exr"),
+                DirAccessEntry::new(11, b"0002.exr"),
+                DirAccessEntry::new(12, b"0003.exr"),
+            ],
+        );
+
+        let p = tracker.on_child_read_limited(10, 2);
+
+        assert_eq!(
+            p,
+            vec![11, 12],
+            "digit-only frame names should be treated as a valid sequence"
+        );
+    }
+
+    #[test]
+    fn test_frame_sequence_readdir_refresh_replaces_stale_successors() {
+        let tracker = DirAccessTracker::new_with_capacity(2, 8);
+        tracker.on_readdir_entries(
+            100,
+            vec![
+                DirAccessEntry::new(10, b"plate_0100.exr"),
+                DirAccessEntry::new(11, b"plate_0101.exr"),
+            ],
+        );
+        tracker.on_readdir_entries(
+            100,
+            vec![
+                DirAccessEntry::new(10, b"plate_0100.exr"),
+                DirAccessEntry::new(12, b"plate_0101.exr"),
+            ],
+        );
+
+        let p = tracker.on_child_read_limited(10, 2);
+
+        assert_eq!(
+            p,
+            vec![12],
+            "fresh readdir sequence state should replace stale inode successors"
+        );
+        assert!(
+            tracker.on_child_read_limited(11, 2).is_empty(),
+            "stale child mapping should be removed during refresh"
+        );
+    }
+
+    #[test]
+    fn test_frame_sequence_read_does_not_arm_generic_sibling_prefetch() {
+        let tracker = DirAccessTracker::new_with_capacity(2, 8);
+        tracker.on_readdir_entries(
+            100,
+            vec![
+                DirAccessEntry::new(10, b"plate_0100.exr"),
+                DirAccessEntry::new(11, b"plate_0101.exr"),
+                DirAccessEntry::new(12, b"plate_0102.exr"),
+                DirAccessEntry::new(90, b"notes.txt"),
+                DirAccessEntry::new(91, b"readme.txt"),
+            ],
+        );
+
+        let sequence = tracker.on_child_read_limited(10, 1);
+        let unrelated = tracker.on_child_read_limited(90, 4);
+
+        assert_eq!(sequence, vec![11]);
+        assert!(
+            unrelated.is_empty(),
+            "one sequence read plus one unrelated read should not trigger broad sibling prefetch"
         );
     }
 }
