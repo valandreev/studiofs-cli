@@ -129,3 +129,67 @@ fn delayed_delivery_waits_for_scheduler_release() {
         Some(DeliveryOutcome::Applied { version: 1, .. })
     ));
 }
+
+#[test]
+fn delayed_head_blocks_later_batches_for_strict_version_ordering() {
+    let mut bus = MetadataBus::new();
+    bus.connect_client("writer");
+    bus.connect_client("reader");
+
+    let first = bus.enqueue_local(batch("writer", "first.txt"));
+    let second = bus.enqueue_local(batch("writer", "second.txt"));
+    bus.delay_for("reader", first.batch_id);
+
+    assert_eq!(bus.deliver_next("reader"), None);
+    assert_eq!(
+        bus.pending_for("reader")
+            .iter()
+            .map(|batch| batch.version)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+
+    bus.release_delay("reader", first.batch_id);
+
+    assert_eq!(
+        bus.deliver_next("reader"),
+        Some(DeliveryOutcome::Applied {
+            batch_id: first.batch_id,
+            version: 1,
+            source_client: "writer".to_string()
+        })
+    );
+    assert_eq!(
+        bus.deliver_next("reader"),
+        Some(DeliveryOutcome::Applied {
+            batch_id: second.batch_id,
+            version: 2,
+            source_client: "writer".to_string()
+        })
+    );
+}
+
+#[test]
+fn trace_can_be_drained_between_long_simulation_windows() {
+    let mut bus = MetadataBus::new();
+    bus.connect_client("writer");
+    bus.connect_client("reader");
+    bus.enqueue_local(batch("writer", "traced.txt"));
+
+    let drained = bus.drain_trace();
+
+    assert!(
+        drained
+            .iter()
+            .any(|record| record.kind == MetadataTraceKind::Enqueued)
+    );
+    assert!(bus.trace().is_empty());
+
+    bus.deliver_next("reader");
+
+    assert!(
+        bus.trace()
+            .iter()
+            .any(|record| record.kind == MetadataTraceKind::Delivered)
+    );
+}

@@ -122,28 +122,26 @@ impl MetadataBus {
         let client = client.into();
         self.client_queues.entry(client.clone()).or_default();
         self.connected_clients.insert(client.clone());
-        self.record(MetadataTraceRecord {
-            step: 0,
-            kind: MetadataTraceKind::ClientConnected,
-            batch_id: None,
-            version: None,
-            source_client: None,
-            target_client: Some(client),
-            fault: None,
-        });
+        self.record(trace_record(
+            MetadataTraceKind::ClientConnected,
+            None,
+            None,
+            None,
+            Some(client),
+            None,
+        ));
     }
 
     pub fn disconnect_client(&mut self, client: &str) {
         self.connected_clients.remove(client);
-        self.record(MetadataTraceRecord {
-            step: 0,
-            kind: MetadataTraceKind::ClientDisconnected,
-            batch_id: None,
-            version: None,
-            source_client: None,
-            target_client: Some(client.to_string()),
-            fault: None,
-        });
+        self.record(trace_record(
+            MetadataTraceKind::ClientDisconnected,
+            None,
+            None,
+            None,
+            Some(client.to_string()),
+            None,
+        ));
     }
 
     pub fn reconnect_client(&mut self, client: impl Into<String>) {
@@ -155,19 +153,18 @@ impl MetadataBus {
             return;
         }
         self.metadata_outage = outage;
-        self.record(MetadataTraceRecord {
-            step: 0,
-            kind: if outage {
+        self.record(trace_record(
+            if outage {
                 MetadataTraceKind::MetadataOutageStarted
             } else {
                 MetadataTraceKind::MetadataOutageEnded
             },
-            batch_id: None,
-            version: None,
-            source_client: None,
-            target_client: None,
-            fault: None,
-        });
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
     }
 
     pub fn enqueue_local(&mut self, mut batch: MetadataBatch) -> MetadataBatch {
@@ -194,7 +191,6 @@ impl MetadataBus {
             .get(client)
             .into_iter()
             .flat_map(|queue| queue.iter())
-            .filter(|batch_id| !self.is_delayed(client, **batch_id))
             .filter_map(|batch_id| self.batches.get(batch_id).cloned())
             .collect()
     }
@@ -294,12 +290,13 @@ impl MetadataBus {
         &self.trace
     }
 
+    pub fn drain_trace(&mut self) -> Vec<MetadataTraceRecord> {
+        std::mem::take(&mut self.trace)
+    }
+
     fn next_ready_batch_id(&self, client: &str) -> Option<u64> {
-        self.client_queues
-            .get(client)?
-            .iter()
-            .copied()
-            .find(|batch_id| !self.is_delayed(client, *batch_id))
+        let batch_id = *self.client_queues.get(client)?.front()?;
+        (!self.is_delayed(client, batch_id)).then_some(batch_id)
     }
 
     fn is_delayed(&self, client: &str, batch_id: u64) -> bool {
@@ -309,15 +306,14 @@ impl MetadataBus {
     }
 
     fn blocked(&mut self, client: &str, fault: DeliveryFault) -> DeliveryOutcome {
-        self.record(MetadataTraceRecord {
-            step: 0,
-            kind: MetadataTraceKind::DeliveryBlocked,
-            batch_id: None,
-            version: None,
-            source_client: None,
-            target_client: Some(client.to_string()),
-            fault: Some(fault),
-        });
+        self.record(trace_record(
+            MetadataTraceKind::DeliveryBlocked,
+            None,
+            None,
+            None,
+            Some(client.to_string()),
+            Some(fault),
+        ));
         DeliveryOutcome::Blocked { reason: fault }
     }
 
@@ -333,13 +329,31 @@ fn batch_trace(
     kind: MetadataTraceKind,
     target_client: Option<&str>,
 ) -> MetadataTraceRecord {
+    trace_record(
+        kind,
+        Some(batch.batch_id),
+        Some(batch.version),
+        Some(batch.source_client.clone()),
+        target_client.map(str::to_string),
+        None,
+    )
+}
+
+fn trace_record(
+    kind: MetadataTraceKind,
+    batch_id: Option<u64>,
+    version: Option<u64>,
+    source_client: Option<String>,
+    target_client: Option<String>,
+    fault: Option<DeliveryFault>,
+) -> MetadataTraceRecord {
     MetadataTraceRecord {
         step: 0,
         kind,
-        batch_id: Some(batch.batch_id),
-        version: Some(batch.version),
-        source_client: Some(batch.source_client.clone()),
-        target_client: target_client.map(str::to_string),
-        fault: None,
+        batch_id,
+        version,
+        source_client,
+        target_client,
+        fault,
     }
 }

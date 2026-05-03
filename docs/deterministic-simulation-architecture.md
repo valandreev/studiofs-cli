@@ -214,12 +214,18 @@ The boundaries matter more than the initial package name.
 The initial SFS-333 slice starts in `studiofs-scenario::metadata_bus` so later
 simulation runtime code can reuse the same serializable batch, event, and trace
 types without depending on real PostgreSQL. The bus is intentionally passive:
+logical clients should be connected before scenario events are enqueued, and
 enqueueing a local metadata batch only records the ordered batch and queues it
-for foreign clients. Tests or a future deterministic scheduler must call
-`deliver_next` to apply one ready batch to a target client. Metadata outages,
-client disconnects, delayed batches, released delays, and duplicate deliveries
-are explicit state transitions and trace records, which keeps counterexample
-replay independent of wall-clock timing or background polling.
+for already-known foreign clients. Tests or a future deterministic scheduler
+must call `deliver_next` to apply the head ready batch to a target client. A
+delayed head batch blocks later batches for that client so simulated delivery
+preserves strict version order. Metadata outages, client disconnects, delayed
+batches, released delays, and duplicate deliveries are explicit state
+transitions and trace records, which keeps counterexample replay independent of
+wall-clock timing or background polling. Long-running searches can periodically
+call `drain_trace` after exporting records; pruning applied batches requires a
+future runtime retention contract that knows every simulated client's replay
+horizon.
 
 ## MVP Scenario Set
 
