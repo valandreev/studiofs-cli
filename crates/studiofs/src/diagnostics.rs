@@ -7157,7 +7157,7 @@ mod tests {
         let service = test_session_service(&source, &lease_manager, Some(&store), Some(&profiling));
 
         let lease = service
-            .acquire_controller("tester".to_string(), Some(250))
+            .acquire_controller("tester".to_string(), Some(5_000))
             .expect("acquire controller");
         let case = service
             .create_case(
