@@ -11,6 +11,10 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
+use studiofs_scenario::{
+    OperationLogError, OperationLogWriter, OperationOutcome, ScenarioOperation as SharedOperation,
+    ScenarioOperationRecord as SharedOperationRecord,
+};
 use thiserror::Error;
 
 use crate::client::{
@@ -62,6 +66,8 @@ const COLLISION_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(60);
 const COLLISION_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const COLLISION_OLD_COMMITTED_PAYLOAD: &[u8] = b"old committed payload\n";
 const COLLISION_NEW_COMMITTED_PAYLOAD: &[u8] = b"new committed payload\n";
+const COLLISION_APPEND_PAYLOAD: &[u8] = b"appended payload\n";
+const COLLISION_CHILD_PAYLOAD: &[u8] = b"child\n";
 const OVERWRITE_READ_ATTEMPTS: u32 = 8;
 
 #[cfg(test)]
@@ -109,6 +115,8 @@ pub enum ScenarioError {
     MountedTree(#[from] MountedTreeError),
     #[error("scenario infrastructure failed: {0}")]
     Infra(#[from] InfraError),
+    #[error("scenario operation log failed: {0}")]
+    OperationLog(#[from] OperationLogError),
     #[error("PostgreSQL outage scenario requires compose infrastructure")]
     MissingComposeInfrastructure,
     #[error("missing E2E run manifest: {path}")]
@@ -587,6 +595,26 @@ fn write_bootstrap_summary(
     Ok(())
 }
 
+fn operation_log_path(context: &ScenarioContext) -> PathBuf {
+    context.scenario_dir.join("operations.ndjson")
+}
+
+fn shared_operation_record(
+    writer: &OperationLogWriter,
+    scenario: &str,
+    operation: SharedOperation,
+) -> SharedOperationRecord {
+    writer.record(scenario, operation)
+}
+
+fn append_shared_record(
+    writer: &mut OperationLogWriter,
+    record: &SharedOperationRecord,
+) -> Result<(), ScenarioError> {
+    writer.append_record(record)?;
+    Ok(())
+}
+
 trait MountedSmokeDriver {
     fn bootstrap_volume(
         &mut self,
@@ -770,15 +798,6 @@ impl<E: CommandExecutor> PostgresOutageDriver for RealPostgresOutageDriver<E> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct OutageOperationRecord {
-    client: String,
-    path: String,
-    bytes: usize,
-    accepted: bool,
-    error: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PostgresOutageRecoverySummary {
     bootstrap: VolumeBootstrapSummary,
     outage_duration_ms: u128,
@@ -837,6 +856,7 @@ fn run_postgres_outage_body(
 
     let outage_started = Instant::now();
     driver.stop_postgres()?;
+    append_postgres_runtime_operation(context, SharedOperation::PostgresOutage)?;
     let accepted_operations = perform_outage_operations(context, &clients[1..3])?;
     let outage_duration_ms = outage_started.elapsed().as_millis();
 
@@ -844,6 +864,7 @@ fn run_postgres_outage_body(
     // PostgreSQL healthcheck readiness before mounted convergence polling.
     let recovery_started = Instant::now();
     driver.start_postgres()?;
+    append_postgres_runtime_operation(context, SharedOperation::PostgresRecovery)?;
     let mounts = clients
         .iter()
         .take(POSTGRES_OUTAGE_CLIENT_NAMES.len())
@@ -877,14 +898,19 @@ fn perform_outage_operations(
     context: &ScenarioContext,
     clients: &[ClientSpec],
 ) -> Result<usize, ScenarioError> {
-    let mut log = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(context.scenario_dir.join("outage-operations.ndjson"))?;
-    let mut operations_log = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(context.scenario_dir.join("operations.ndjson"))?;
+    if !context.scenario_dir.exists() {
+        return Err(ScenarioError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "missing scenario directory: {}",
+                context.scenario_dir.display()
+            ),
+        )));
+    }
+    let outage_log = context.scenario_dir.join("outage-operations.ndjson");
+    let operations_log = operation_log_path(context);
+    let mut outage_writer = OperationLogWriter::open_append(&outage_log)?;
+    let mut operations_writer = OperationLogWriter::open_append(&operations_log)?;
     let mut accepted = 0;
     for (index, client) in clients.iter().enumerate() {
         let relative = format!("outage-local-write-{}.txt", index + 1);
@@ -898,17 +924,27 @@ fn perform_outage_operations(
         if operation_accepted {
             accepted += 1;
         }
-        let record = OutageOperationRecord {
-            client: client.name.clone(),
-            path: relative,
-            bytes: payload.len(),
-            accepted: operation_accepted,
-            error,
+        let outcome = match error {
+            Some(error) => OperationOutcome::Rejected { error },
+            None => OperationOutcome::Accepted,
         };
-        serde_json::to_writer(&mut log, &record)?;
-        log.write_all(b"\n")?;
-        serde_json::to_writer(&mut operations_log, &record)?;
-        operations_log.write_all(b"\n")?;
+        let operation = SharedOperation::Write {
+            path: relative.clone(),
+            offset: Some(0),
+            bytes: u64::try_from(payload.len()).unwrap_or(u64::MAX),
+            checksum_sha256: None,
+        };
+        for writer in [&mut outage_writer, &mut operations_writer] {
+            let record = shared_operation_record(
+                writer,
+                POSTGRES_OUTAGE_MULTI_CLIENT_RECOVERY,
+                operation.clone(),
+            )
+            .with_client(&client.name)
+            .with_outcome(outcome.clone())
+            .with_metadata("phase", "postgres_outage");
+            append_shared_record(writer, &record)?;
+        }
     }
     let rejected = clients.len() - accepted;
     if rejected > 0 {
@@ -918,6 +954,26 @@ fn perform_outage_operations(
         });
     }
     Ok(accepted)
+}
+
+fn append_postgres_runtime_operation(
+    context: &ScenarioContext,
+    operation: SharedOperation,
+) -> Result<(), ScenarioError> {
+    let outage_log = context.scenario_dir.join("outage-operations.ndjson");
+    let operations_log = operation_log_path(context);
+    let mut outage_writer = OperationLogWriter::open_append(&outage_log)?;
+    let mut operations_writer = OperationLogWriter::open_append(&operations_log)?;
+    for writer in [&mut outage_writer, &mut operations_writer] {
+        let record = shared_operation_record(
+            writer,
+            POSTGRES_OUTAGE_MULTI_CLIENT_RECOVERY,
+            operation.clone(),
+        )
+        .with_outcome(OperationOutcome::Observed);
+        append_shared_record(writer, &record)?;
+    }
+    Ok(())
 }
 
 trait RustfsOutageDriver {
@@ -1188,25 +1244,56 @@ fn write_rustfs_outage_operation(
     context: &ScenarioContext,
     summary: &RustfsOutageRecoverySummary,
 ) -> Result<(), ScenarioError> {
-    let record = json!({
-        "scenario": RUSTFS_OUTAGE_MULTI_CLIENT_RECOVERY,
-        "client": RUSTFS_OUTAGE_CLIENT_NAMES[0],
-        "path": summary.outage_file,
-        "bytes": RUSTFS_OUTAGE_RECOVERED_PAYLOAD.len(),
-        "accepted": true,
-        "local_read_checksum_sha256": summary.local_read_checksum_sha256,
-        "peer_visible_during_outage": summary.peer_visible_during_outage,
-        "peer_visibility_during_outage": summary.peer_visibility_during_outage,
-        "final_checksum_sha256": summary.final_checksum_sha256,
-        "final_client_checksums": summary.final_client_checksums,
-    });
-    for artifact in ["rustfs-outage-operations.ndjson", "operations.ndjson"] {
-        let mut log = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(context.scenario_dir.join(artifact))?;
-        serde_json::to_writer(&mut log, &record)?;
-        log.write_all(b"\n")?;
+    let outage_log = context.scenario_dir.join("rustfs-outage-operations.ndjson");
+    let operations_log = operation_log_path(context);
+    let mut outage_writer = OperationLogWriter::open_append(&outage_log)?;
+    let mut operations_writer = OperationLogWriter::open_append(&operations_log)?;
+    for writer in [&mut outage_writer, &mut operations_writer] {
+        for (operation, client, outcome) in [
+            (
+                SharedOperation::ObjectStoreOutage,
+                None,
+                OperationOutcome::Observed,
+            ),
+            (
+                SharedOperation::Write {
+                    path: summary.outage_file.clone(),
+                    offset: Some(0),
+                    bytes: u64::try_from(RUSTFS_OUTAGE_RECOVERED_PAYLOAD.len()).unwrap_or(u64::MAX),
+                    checksum_sha256: Some(summary.local_read_checksum_sha256.clone()),
+                },
+                Some(RUSTFS_OUTAGE_CLIENT_NAMES[0]),
+                OperationOutcome::Accepted,
+            ),
+            (
+                SharedOperation::Read {
+                    path: summary.outage_file.clone(),
+                    bytes: Some(
+                        u64::try_from(RUSTFS_OUTAGE_RECOVERED_PAYLOAD.len()).unwrap_or(u64::MAX),
+                    ),
+                    checksum_sha256: Some(summary.local_read_checksum_sha256.clone()),
+                },
+                Some(RUSTFS_OUTAGE_CLIENT_NAMES[0]),
+                OperationOutcome::Observed,
+            ),
+            (
+                SharedOperation::ObjectStoreRecovery,
+                None,
+                OperationOutcome::Observed,
+            ),
+        ] {
+            let mut record =
+                shared_operation_record(writer, RUSTFS_OUTAGE_MULTI_CLIENT_RECOVERY, operation)
+                    .with_outcome(outcome)
+                    .with_metadata(
+                        "final_checksum_sha256",
+                        summary.final_checksum_sha256.clone(),
+                    );
+            if let Some(client) = client {
+                record = record.with_client(client);
+            }
+            append_shared_record(writer, &record)?;
+        }
     }
     Ok(())
 }
@@ -1433,23 +1520,34 @@ fn write_crash_restart_operation(
     context: &ScenarioContext,
     summary: &CrashRestartModeSummary,
 ) -> Result<(), ScenarioError> {
-    let record = json!({
-        "scenario": MOUNTED_CLIENT_CRASH_RESTART_RECOVERY,
-        "mode": summary.mode,
-        "client": summary.restarted_client,
-        "path": summary.relative_path,
-        "bytes": summary.bytes,
-        "accepted": true,
-        "local_read_checksum_sha256": summary.local_read_checksum_sha256,
-        "peer_visible_before_convergence": summary.peer_visible_before_convergence,
-        "final_checksum_sha256": summary.final_checksum_sha256,
-    });
-    let mut log = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(context.scenario_dir.join("operations.ndjson"))?;
-    serde_json::to_writer(&mut log, &record)?;
-    log.write_all(b"\n")?;
+    let path = operation_log_path(context);
+    let mut writer = OperationLogWriter::open_append(&path)?;
+    let bytes = u64::try_from(summary.bytes).unwrap_or(u64::MAX);
+    let mode = crash_restart_mode_log_name(summary.mode);
+    for operation in [
+        SharedOperation::Write {
+            path: summary.relative_path.clone(),
+            offset: Some(0),
+            bytes,
+            checksum_sha256: Some(summary.local_read_checksum_sha256.clone()),
+        },
+        SharedOperation::Fsync {
+            path: summary.relative_path.clone(),
+        },
+        SharedOperation::ClientCrash,
+        SharedOperation::ClientRestart,
+    ] {
+        let record =
+            shared_operation_record(&writer, MOUNTED_CLIENT_CRASH_RESTART_RECOVERY, operation)
+                .with_client(&summary.restarted_client)
+                .with_outcome(OperationOutcome::Accepted)
+                .with_metadata("mode", mode)
+                .with_metadata(
+                    "final_checksum_sha256",
+                    summary.final_checksum_sha256.clone(),
+                );
+        append_shared_record(&mut writer, &record)?;
+    }
     Ok(())
 }
 
@@ -1645,6 +1743,7 @@ struct NamespaceCollisionOperation {
     client: String,
     operation: String,
     path: String,
+    shared_operation: SharedOperation,
     result: String,
     timestamp_ms: u64,
     error: Option<String>,
@@ -1657,6 +1756,7 @@ struct NamespaceCollisionTask {
     client: ClientSpec,
     operation: &'static str,
     path: &'static str,
+    shared_operation: SharedOperation,
     action: NamespaceCollisionAction,
 }
 
@@ -1666,6 +1766,7 @@ impl NamespaceCollisionTask {
         client: ClientSpec,
         operation: &'static str,
         path: &'static str,
+        shared_operation: SharedOperation,
         action: impl FnOnce(&ClientSpec) -> io::Result<()> + Send + 'static,
     ) -> Self {
         Self {
@@ -1673,6 +1774,7 @@ impl NamespaceCollisionTask {
             client,
             operation,
             path,
+            shared_operation,
             action: Box::new(action),
         }
     }
@@ -1771,7 +1873,7 @@ fn write_namespace_collision_plan_artifacts(
     fs::create_dir_all(&context.scenario_dir)?;
     let started = Instant::now();
     let operations = planned_namespace_collision_operations(kind, started);
-    write_namespace_collision_operations(context, &operations)?;
+    write_namespace_collision_operations(context, kind, &operations)?;
     let summary = NamespaceCollisionSummary {
         scenario: kind.name().to_string(),
         bootstrap: None,
@@ -1825,6 +1927,10 @@ fn perform_namespace_collision_operations(
                     clients[0].clone(),
                     "rename",
                     "shared/file.txt -> shared/renamed-a.txt",
+                    SharedOperation::Rename {
+                        from: "shared/file.txt".to_string(),
+                        to: "shared/renamed-a.txt".to_string(),
+                    },
                     |client| {
                         fs::rename(
                             client.mount_point.join("shared/file.txt"),
@@ -1837,6 +1943,10 @@ fn perform_namespace_collision_operations(
                     clients[1].clone(),
                     "rename",
                     "shared/file.txt -> shared/renamed-b.txt",
+                    SharedOperation::Rename {
+                        from: "shared/file.txt".to_string(),
+                        to: "shared/renamed-b.txt".to_string(),
+                    },
                     |client| {
                         fs::rename(
                             client.mount_point.join("shared/file.txt"),
@@ -1854,6 +1964,10 @@ fn perform_namespace_collision_operations(
                     clients[0].clone(),
                     "rename",
                     "shared/file.txt -> shared/renamed.txt",
+                    SharedOperation::Rename {
+                        from: "shared/file.txt".to_string(),
+                        to: "shared/renamed.txt".to_string(),
+                    },
                     |client| {
                         fs::rename(
                             client.mount_point.join("shared/file.txt"),
@@ -1866,6 +1980,9 @@ fn perform_namespace_collision_operations(
                     clients[1].clone(),
                     "unlink",
                     "shared/file.txt",
+                    SharedOperation::Unlink {
+                        path: "shared/file.txt".to_string(),
+                    },
                     |client| fs::remove_file(client.mount_point.join("shared/file.txt")),
                 ),
             ],
@@ -1878,6 +1995,9 @@ fn perform_namespace_collision_operations(
                     clients[0].clone(),
                     "unlink",
                     "shared/data.txt",
+                    SharedOperation::Unlink {
+                        path: "shared/data.txt".to_string(),
+                    },
                     |client| fs::remove_file(client.mount_point.join("shared/data.txt")),
                 ),
                 NamespaceCollisionTask::new(
@@ -1885,12 +2005,17 @@ fn perform_namespace_collision_operations(
                     clients[1].clone(),
                     "append",
                     "shared/data.txt",
+                    SharedOperation::Append {
+                        path: "shared/data.txt".to_string(),
+                        bytes: u64::try_from(COLLISION_APPEND_PAYLOAD.len()).unwrap_or(u64::MAX),
+                        checksum_sha256: None,
+                    },
                     |client| {
                         let mut file = OpenOptions::new()
                             .create(true)
                             .append(true)
                             .open(client.mount_point.join("shared/data.txt"))?;
-                        file.write_all(b"appended payload\n")
+                        file.write_all(COLLISION_APPEND_PAYLOAD)
                     },
                 ),
             ],
@@ -1903,6 +2028,11 @@ fn perform_namespace_collision_operations(
                     clients[1].clone(),
                     "read_loop",
                     "shared/data.txt",
+                    SharedOperation::Read {
+                        path: "shared/data.txt".to_string(),
+                        bytes: None,
+                        checksum_sha256: None,
+                    },
                     |client| repeated_committed_read(client, "shared/data.txt"),
                 ),
                 NamespaceCollisionTask::new(
@@ -1910,6 +2040,13 @@ fn perform_namespace_collision_operations(
                     clients[0].clone(),
                     "overwrite",
                     "shared/data.txt",
+                    SharedOperation::Write {
+                        path: "shared/data.txt".to_string(),
+                        offset: Some(0),
+                        bytes: u64::try_from(COLLISION_NEW_COMMITTED_PAYLOAD.len())
+                            .unwrap_or(u64::MAX),
+                        checksum_sha256: None,
+                    },
                     |client| {
                         fs::write(
                             client.mount_point.join("shared/data.txt"),
@@ -1922,6 +2059,11 @@ fn perform_namespace_collision_operations(
                     clients[2].clone(),
                     "read_loop",
                     "shared/data.txt",
+                    SharedOperation::Read {
+                        path: "shared/data.txt".to_string(),
+                        bytes: None,
+                        checksum_sha256: None,
+                    },
                     |client| repeated_committed_read(client, "shared/data.txt"),
                 ),
             ],
@@ -1934,6 +2076,9 @@ fn perform_namespace_collision_operations(
                     clients[0].clone(),
                     "mkdir",
                     "race/subdir",
+                    SharedOperation::CreateDirectory {
+                        path: "race/subdir".to_string(),
+                    },
                     |client| fs::create_dir_all(client.mount_point.join("race/subdir")),
                 ),
                 NamespaceCollisionTask::new(
@@ -1941,24 +2086,53 @@ fn perform_namespace_collision_operations(
                     clients[1].clone(),
                     "create",
                     "race/child.txt",
-                    |client| fs::write(client.mount_point.join("race/child.txt"), b"child\n"),
+                    SharedOperation::CreateFile {
+                        path: "race/child.txt".to_string(),
+                        bytes: Some(
+                            u64::try_from(COLLISION_CHILD_PAYLOAD.len()).unwrap_or(u64::MAX),
+                        ),
+                    },
+                    |client| {
+                        fs::write(
+                            client.mount_point.join("race/child.txt"),
+                            COLLISION_CHILD_PAYLOAD,
+                        )
+                    },
                 ),
-                NamespaceCollisionTask::new(3, clients[2].clone(), "rmdir", "race", |client| {
-                    fs::remove_dir(client.mount_point.join("race"))
-                }),
+                NamespaceCollisionTask::new(
+                    3,
+                    clients[2].clone(),
+                    "rmdir",
+                    "race",
+                    SharedOperation::Rmdir {
+                        path: "race".to_string(),
+                    },
+                    |client| fs::remove_dir(client.mount_point.join("race")),
+                ),
             ],
         ),
         NamespaceCollisionKind::ReaddirStatDuringMutation => run_concurrent_namespace_operations(
             started,
             vec![
-                NamespaceCollisionTask::new(1, clients[1].clone(), "readdir", "scan", |client| {
-                    fs::read_dir(client.mount_point.join("scan")).map(|_| ())
-                }),
+                NamespaceCollisionTask::new(
+                    1,
+                    clients[1].clone(),
+                    "readdir",
+                    "scan",
+                    SharedOperation::Readdir {
+                        path: "scan".to_string(),
+                    },
+                    |client| fs::read_dir(client.mount_point.join("scan")).map(|_| ()),
+                ),
                 NamespaceCollisionTask::new(
                     2,
                     clients[0].clone(),
                     "rename",
                     "scan/a.txt -> scan/c.txt",
+                    SharedOperation::Rename {
+                        from: "scan/a.txt".to_string(),
+                        to: "scan/c.txt".to_string(),
+                    },
                     |client| {
                         fs::rename(
                             client.mount_point.join("scan/a.txt"),
@@ -1971,12 +2145,15 @@ fn perform_namespace_collision_operations(
                     clients[2].clone(),
                     "stat",
                     "scan/b.txt",
+                    SharedOperation::Stat {
+                        path: "scan/b.txt".to_string(),
+                    },
                     |client| fs::metadata(client.mount_point.join("scan/b.txt")).map(|_| ()),
                 ),
             ],
         ),
     };
-    write_namespace_collision_operations(context, &operations)?;
+    write_namespace_collision_operations(context, kind, &operations)?;
     Ok(operations)
 }
 
@@ -1996,6 +2173,7 @@ fn run_concurrent_namespace_operations(
                 &task.client,
                 task.operation,
                 task.path,
+                task.shared_operation,
                 || (task.action)(&task.client),
             )
         }));
@@ -2037,11 +2215,19 @@ fn planned_namespace_collision_operations(
                 "client-a",
                 "rename",
                 "shared/file.txt -> shared/renamed-a.txt",
+                SharedOperation::Rename {
+                    from: "shared/file.txt".to_string(),
+                    to: "shared/renamed-a.txt".to_string(),
+                },
             ),
             (
                 "client-b",
                 "rename",
                 "shared/file.txt -> shared/renamed-b.txt",
+                SharedOperation::Rename {
+                    from: "shared/file.txt".to_string(),
+                    to: "shared/renamed-b.txt".to_string(),
+                },
             ),
         ],
         NamespaceCollisionKind::RenameVsUnlink => vec![
@@ -2049,37 +2235,137 @@ fn planned_namespace_collision_operations(
                 "client-a",
                 "rename",
                 "shared/file.txt -> shared/renamed.txt",
+                SharedOperation::Rename {
+                    from: "shared/file.txt".to_string(),
+                    to: "shared/renamed.txt".to_string(),
+                },
             ),
-            ("client-b", "unlink", "shared/file.txt"),
+            (
+                "client-b",
+                "unlink",
+                "shared/file.txt",
+                SharedOperation::Unlink {
+                    path: "shared/file.txt".to_string(),
+                },
+            ),
         ],
         NamespaceCollisionKind::UnlinkVsAppend => vec![
-            ("client-a", "unlink", "shared/data.txt"),
-            ("client-b", "append", "shared/data.txt"),
+            (
+                "client-a",
+                "unlink",
+                "shared/data.txt",
+                SharedOperation::Unlink {
+                    path: "shared/data.txt".to_string(),
+                },
+            ),
+            (
+                "client-b",
+                "append",
+                "shared/data.txt",
+                SharedOperation::Append {
+                    path: "shared/data.txt".to_string(),
+                    bytes: u64::try_from(COLLISION_APPEND_PAYLOAD.len()).unwrap_or(u64::MAX),
+                    checksum_sha256: None,
+                },
+            ),
         ],
         NamespaceCollisionKind::OverwriteVsRead => vec![
-            ("client-b", "read_loop", "shared/data.txt"),
-            ("client-a", "overwrite", "shared/data.txt"),
-            ("client-c", "read_loop", "shared/data.txt"),
+            (
+                "client-b",
+                "read_loop",
+                "shared/data.txt",
+                SharedOperation::Read {
+                    path: "shared/data.txt".to_string(),
+                    bytes: None,
+                    checksum_sha256: None,
+                },
+            ),
+            (
+                "client-a",
+                "overwrite",
+                "shared/data.txt",
+                SharedOperation::Write {
+                    path: "shared/data.txt".to_string(),
+                    offset: Some(0),
+                    bytes: u64::try_from(COLLISION_NEW_COMMITTED_PAYLOAD.len()).unwrap_or(u64::MAX),
+                    checksum_sha256: None,
+                },
+            ),
+            (
+                "client-c",
+                "read_loop",
+                "shared/data.txt",
+                SharedOperation::Read {
+                    path: "shared/data.txt".to_string(),
+                    bytes: None,
+                    checksum_sha256: None,
+                },
+            ),
         ],
         NamespaceCollisionKind::MkdirRmdirVsCreate => vec![
-            ("client-a", "mkdir", "race/subdir"),
-            ("client-b", "create", "race/child.txt"),
-            ("client-c", "rmdir", "race"),
+            (
+                "client-a",
+                "mkdir",
+                "race/subdir",
+                SharedOperation::CreateDirectory {
+                    path: "race/subdir".to_string(),
+                },
+            ),
+            (
+                "client-b",
+                "create",
+                "race/child.txt",
+                SharedOperation::CreateFile {
+                    path: "race/child.txt".to_string(),
+                    bytes: Some(u64::try_from(COLLISION_CHILD_PAYLOAD.len()).unwrap_or(u64::MAX)),
+                },
+            ),
+            (
+                "client-c",
+                "rmdir",
+                "race",
+                SharedOperation::Rmdir {
+                    path: "race".to_string(),
+                },
+            ),
         ],
         NamespaceCollisionKind::ReaddirStatDuringMutation => vec![
-            ("client-b", "readdir", "scan"),
-            ("client-a", "rename", "scan/a.txt -> scan/c.txt"),
-            ("client-c", "stat", "scan/b.txt"),
+            (
+                "client-b",
+                "readdir",
+                "scan",
+                SharedOperation::Readdir {
+                    path: "scan".to_string(),
+                },
+            ),
+            (
+                "client-a",
+                "rename",
+                "scan/a.txt -> scan/c.txt",
+                SharedOperation::Rename {
+                    from: "scan/a.txt".to_string(),
+                    to: "scan/c.txt".to_string(),
+                },
+            ),
+            (
+                "client-c",
+                "stat",
+                "scan/b.txt",
+                SharedOperation::Stat {
+                    path: "scan/b.txt".to_string(),
+                },
+            ),
         ],
     };
     spec.into_iter()
         .enumerate()
         .map(
-            |(index, (client, operation, path))| NamespaceCollisionOperation {
+            |(index, (client, operation, path, shared_operation))| NamespaceCollisionOperation {
                 order: index + 1,
                 client: client.to_string(),
                 operation: operation.to_string(),
                 path: path.to_string(),
+                shared_operation,
                 result: "planned".to_string(),
                 timestamp_ms: elapsed_millis_u64(started),
                 error: None,
@@ -2094,6 +2380,7 @@ fn record_fs_operation(
     client: &ClientSpec,
     operation: &str,
     path: &str,
+    shared_operation: SharedOperation,
     f: impl FnOnce() -> std::io::Result<()>,
 ) -> NamespaceCollisionOperation {
     match f() {
@@ -2102,6 +2389,7 @@ fn record_fs_operation(
             client: client.name.clone(),
             operation: operation.to_string(),
             path: path.to_string(),
+            shared_operation,
             result: "accepted".to_string(),
             timestamp_ms: elapsed_millis_u64(started),
             error: None,
@@ -2111,6 +2399,7 @@ fn record_fs_operation(
             client: client.name.clone(),
             operation: operation.to_string(),
             path: path.to_string(),
+            shared_operation,
             result: "rejected".to_string(),
             timestamp_ms: elapsed_millis_u64(started),
             error: Some(error.to_string()),
@@ -2168,19 +2457,46 @@ fn finish_namespace_collision(
 
 fn write_namespace_collision_operations(
     context: &ScenarioContext,
+    kind: NamespaceCollisionKind,
     operations: &[NamespaceCollisionOperation],
 ) -> Result<(), ScenarioError> {
-    let mut log = fs::OpenOptions::new()
-        .create(true)
-        .append(false)
-        .truncate(true)
-        .write(true)
-        .open(context.scenario_dir.join("operations.ndjson"))?;
+    let path = operation_log_path(context);
+    let mut writer = OperationLogWriter::open_append(&path)?;
     for operation in operations {
-        serde_json::to_writer(&mut log, operation)?;
-        log.write_all(b"\n")?;
+        let record = namespace_collision_shared_operation(&writer, kind, operation);
+        append_shared_record(&mut writer, &record)?;
     }
     Ok(())
+}
+
+fn namespace_collision_shared_operation(
+    writer: &OperationLogWriter,
+    kind: NamespaceCollisionKind,
+    operation: &NamespaceCollisionOperation,
+) -> SharedOperationRecord {
+    let mut record =
+        shared_operation_record(writer, kind.name(), operation.shared_operation.clone())
+            .with_client(&operation.client)
+            .with_timestamp_ms(operation.timestamp_ms)
+            .with_outcome(namespace_collision_outcome(operation));
+    if operation.error.is_some() {
+        record = record.with_metadata("result", &operation.result);
+    }
+    record
+}
+
+fn namespace_collision_outcome(operation: &NamespaceCollisionOperation) -> OperationOutcome {
+    match operation.result.as_str() {
+        "planned" => OperationOutcome::Planned,
+        "accepted" => OperationOutcome::Accepted,
+        "rejected" => OperationOutcome::Rejected {
+            error: operation
+                .error
+                .clone()
+                .unwrap_or_else(|| "operation rejected".to_string()),
+        },
+        _ => OperationOutcome::Observed,
+    }
 }
 
 fn write_namespace_collision_summary(
@@ -2211,6 +2527,13 @@ fn crash_restart_mode_slug(mode: CrashRestartMode) -> &'static str {
     match mode {
         CrashRestartMode::AfterLocalDurabilityBoundary => "after-local-durability-boundary",
         CrashRestartMode::BeforeRemotePublicationCompletes => "before-remote-publication-completes",
+    }
+}
+
+fn crash_restart_mode_log_name(mode: CrashRestartMode) -> &'static str {
+    match mode {
+        CrashRestartMode::AfterLocalDurabilityBoundary => "after_local_durability_boundary",
+        CrashRestartMode::BeforeRemotePublicationCompletes => "before_remote_publication_completes",
     }
 }
 
@@ -2307,6 +2630,7 @@ mod tests {
 
     use super::*;
     use crate::client::{ClientLifecycleState, ClientSpec, S3Config, client_spec_for};
+    use studiofs_scenario::read_operation_log;
 
     #[test]
     fn mounted_smoke_writes_file_converges_three_mounts_and_unmounts() {
@@ -3007,10 +3331,17 @@ mod tests {
                 "unmount_all"
             ]
         );
-        let operations_log =
-            std::fs::read_to_string(context.scenario_dir.join("operations.ndjson")).unwrap();
-        assert!(operations_log.contains("\"operation\":\"rename\""));
-        assert!(operations_log.contains("\"operation\":\"unlink\""));
+        let operations =
+            read_operation_log(context.scenario_dir.join("operations.ndjson")).unwrap();
+        assert!(operations.iter().any(|record| matches!(
+            &record.operation,
+            SharedOperation::Rename { from, to }
+                if from == "shared/file.txt" && to == "shared/renamed.txt"
+        )));
+        assert!(operations.iter().any(|record| matches!(
+            &record.operation,
+            SharedOperation::Unlink { path } if path == "shared/file.txt"
+        )));
         assert!(
             context
                 .scenario_dir
@@ -3321,10 +3652,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(summary_json["modes"].as_array().unwrap().len(), 2);
-        let operations_log =
-            std::fs::read_to_string(context.scenario_dir.join("operations.ndjson")).unwrap();
-        assert!(operations_log.contains("after_local_durability_boundary"));
-        assert!(operations_log.contains("before_remote_publication_completes"));
+        let operations =
+            read_operation_log(context.scenario_dir.join("operations.ndjson")).unwrap();
+        assert!(operations.iter().any(|record| {
+            record
+                .metadata
+                .get("mode")
+                .is_some_and(|mode| mode == "after_local_durability_boundary")
+        }));
+        assert!(operations.iter().any(|record| {
+            record
+                .metadata
+                .get("mode")
+                .is_some_and(|mode| mode == "before_remote_publication_completes")
+        }));
     }
 
     #[test]
@@ -3478,13 +3819,23 @@ mod tests {
             .collect::<Vec<_>>();
         thread::spawn(move || {
             let files = [
-                CRASH_RESTART_LOCAL_DURABLE_FILE_NAME,
-                CRASH_RESTART_BEFORE_PUBLICATION_FILE_NAME,
+                (
+                    CRASH_RESTART_LOCAL_DURABLE_FILE_NAME,
+                    b"accepted local durable payload before abrupt crash\n".len(),
+                ),
+                (
+                    CRASH_RESTART_BEFORE_PUBLICATION_FILE_NAME,
+                    b"accepted local payload killed before remote publication completes\n".len(),
+                ),
             ];
-            for file in files {
+            for (file, expected_len) in files {
                 let source = source_mount.join(file);
-                for _ in 0..100 {
+                for _ in 0..500 {
                     if let Ok(payload) = std::fs::read(&source) {
+                        if payload.len() != expected_len {
+                            thread::sleep(Duration::from_millis(5));
+                            continue;
+                        }
                         thread::sleep(Duration::from_millis(50));
                         for peer in &peer_mounts {
                             std::fs::write(peer.join(file), &payload).unwrap();
@@ -3587,9 +3938,13 @@ mod tests {
                 .join("outage-operations.ndjson")
                 .exists()
         );
-        let operations_log =
-            std::fs::read_to_string(context.scenario_dir.join("operations.ndjson")).unwrap();
-        assert!(operations_log.contains("\"accepted\":true"));
+        let operations =
+            read_operation_log(context.scenario_dir.join("operations.ndjson")).unwrap();
+        assert!(
+            operations
+                .iter()
+                .any(|record| matches!(&record.outcome, OperationOutcome::Accepted))
+        );
     }
 
     #[test]
@@ -3853,9 +4208,15 @@ mod tests {
             }
         ));
         let log =
-            std::fs::read_to_string(context.scenario_dir.join("outage-operations.ndjson")).unwrap();
-        assert!(log.contains("\"accepted\":true"));
-        assert!(log.contains("\"accepted\":false"));
+            read_operation_log(context.scenario_dir.join("outage-operations.ndjson")).unwrap();
+        assert!(
+            log.iter()
+                .any(|record| matches!(&record.outcome, OperationOutcome::Accepted))
+        );
+        assert!(
+            log.iter()
+                .any(|record| matches!(&record.outcome, OperationOutcome::Rejected { .. }))
+        );
     }
 
     #[test]

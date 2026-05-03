@@ -9,6 +9,9 @@ use std::time::Instant;
 use chrono::{SecondsFormat, Utc};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
+use studiofs_scenario::{
+    OperationLogError, OperationLogWriter, OperationOutcome, ScenarioOperation,
+};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -156,6 +159,8 @@ pub enum RunnerError {
     Client(#[from] ClientControllerError),
     #[error("runner infra failed: {0}")]
     Infra(#[from] InfraError),
+    #[error("runner operation log failed: {0}")]
+    OperationLog(#[from] OperationLogError),
 }
 
 #[derive(Debug)]
@@ -746,10 +751,17 @@ fn run_scenario_lifecycle(
     let operation_artifact = scenario_artifact_path(definition.name, "operations.ndjson");
 
     fs::create_dir_all(&context.scenario_dir)?;
-    let result = run_scenario_body(events_path, &operation_log, run_id, scenario, context);
+    let mut operation_writer = OperationLogWriter::open_append(&operation_log)?;
+    let result = run_scenario_body(
+        events_path,
+        &mut operation_writer,
+        run_id,
+        scenario,
+        context,
+    );
     let cleanup_result = run_hook(
         events_path,
-        &operation_log,
+        &mut operation_writer,
         run_id,
         definition.name,
         "cleanup",
@@ -817,7 +829,7 @@ fn run_scenario_lifecycle(
 
 fn run_scenario_body(
     events_path: &Path,
-    operation_log: &Path,
+    operation_writer: &mut OperationLogWriter,
     run_id: &str,
     scenario: &dyn scenario::Scenario,
     context: &ScenarioContext,
@@ -825,7 +837,7 @@ fn run_scenario_body(
     let definition = scenario.definition();
     run_hook(
         events_path,
-        operation_log,
+        operation_writer,
         run_id,
         definition.name,
         "setup",
@@ -833,7 +845,7 @@ fn run_scenario_body(
     )?;
     run_hook(
         events_path,
-        operation_log,
+        operation_writer,
         run_id,
         definition.name,
         "run",
@@ -841,7 +853,7 @@ fn run_scenario_body(
     )?;
     run_hook(
         events_path,
-        operation_log,
+        operation_writer,
         run_id,
         definition.name,
         "validate",
@@ -851,19 +863,38 @@ fn run_scenario_body(
 
 fn run_hook<T>(
     events_path: &Path,
-    operation_log: &Path,
+    operation_writer: &mut OperationLogWriter,
     run_id: &str,
     scenario: &str,
     hook: &str,
     f: impl FnOnce() -> Result<T, scenario::ScenarioError>,
 ) -> Result<T, RunnerError> {
     record_event(events_path, run_id, Some(scenario), hook, "started")?;
-    record_event(operation_log, run_id, Some(scenario), hook, "started")?;
+    record_operation_checkpoint(operation_writer, scenario, hook, "started")?;
     let result = f();
     let phase = if result.is_ok() { "finished" } else { "failed" };
     record_event(events_path, run_id, Some(scenario), hook, phase)?;
-    record_event(operation_log, run_id, Some(scenario), hook, phase)?;
+    record_operation_checkpoint(operation_writer, scenario, hook, phase)?;
     Ok(result?)
+}
+
+fn record_operation_checkpoint(
+    writer: &mut OperationLogWriter,
+    scenario: &str,
+    hook: &str,
+    phase: &str,
+) -> Result<(), RunnerError> {
+    writer.refresh_next_sequence()?;
+    let record = writer
+        .record(
+            scenario,
+            ScenarioOperation::SchedulerCheckpoint {
+                name: format!("{hook}.{phase}"),
+            },
+        )
+        .with_outcome(OperationOutcome::Observed);
+    writer.append_record(&record)?;
+    Ok(())
 }
 
 fn record_event(

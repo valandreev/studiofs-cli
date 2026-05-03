@@ -9,6 +9,7 @@ use studiofs_e2e::runner::{
     CleanRequest, PlatformSelection, RetentionPolicy, RunRequest, RunStatus, RunnerError,
     ScenarioStatus,
 };
+use studiofs_scenario::{ScenarioOperation, read_operation_log};
 use tempfile::tempdir;
 
 #[test]
@@ -127,14 +128,22 @@ fn namespace_collision_scenario_disabled_run_writes_reproducible_artifacts() {
             .ends_with("operations.ndjson")
     );
 
-    let operations = fs::read_to_string(
+    let operations = read_operation_log(
         sandbox.join("artifacts/scenarios/collision-rename-vs-unlink/operations.ndjson"),
     )
     .unwrap();
-    assert!(operations.contains("\"client\""));
-    assert!(operations.contains("\"operation\""));
-    assert!(operations.contains("\"order\""));
-    assert!(operations.contains("\"result\""));
+    assert!(operations.iter().any(|record| record.client.is_some()));
+    assert!(operations.iter().any(|record| record.sequence > 0));
+    assert!(
+        operations
+            .iter()
+            .any(|record| matches!(&record.operation, ScenarioOperation::Rename { .. }))
+    );
+    assert!(
+        operations
+            .iter()
+            .any(|record| matches!(&record.operation, ScenarioOperation::Unlink { .. }))
+    );
 }
 
 #[test]

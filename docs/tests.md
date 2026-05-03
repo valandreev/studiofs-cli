@@ -163,7 +163,7 @@ private backend inspection. The mounted namespace collision scenarios use three
 isolated clients and barrier-start conflicting operations covering
 rename/rename, rename/unlink, unlink/append, overwrite/read, mkdir/rmdir/create,
 and readdir/stat while mutations are in flight. The overwrite/read scenario
-records repeated read loops during the overwrite. Each collision run writes `operations.ndjson`,
+records repeated read loops during the overwrite. Each collision run writes shared-schema `operations.ndjson`,
 `namespace-collision-summary.json`, and `validation.json`.
 
 Hosted Linux real mounted E2E is available as a manual RWX workflow:

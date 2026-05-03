@@ -17,6 +17,7 @@ sha2 = "0.10"
 thiserror.workspace = true
 uuid.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+studiofs-scenario.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

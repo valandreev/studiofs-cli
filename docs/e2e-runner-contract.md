@@ -152,6 +152,20 @@ The following artifact names are required and stable:
 | `artifacts/scenarios/<scenario-name>/` | Scenario-specific inputs, probes, `operations.ndjson`, and validation output. |
 | `artifacts/clients/<client>/` | Client root, mount metadata, mount stdout/stderr logs, structured tracing logs when emitted, and post-run status snapshots. |
 
+`operations.ndjson` uses the shared `studiofs-scenario` operation schema. Each
+line is one `ScenarioOperationRecord` with `schema_version = 1`, scenario name,
+monotonic per-file `sequence`, optional client, logical operation, outcome,
+simulation support marker, and string metadata. The log is append-only within a
+scenario run. Runner hook boundaries are recorded as `scheduler_checkpoint`
+operations so the deterministic simulator can ignore or replay them without
+knowing about the real mounted runner internals.
+
+Simulation-replayable operations keep `simulation_support.status = "supported"`.
+Mounted-only or platform-specific boundaries must stay in the log only when
+they are explicitly marked as unsupported with a reason. Parsing or replaying an
+operation log must not require Docker, PostgreSQL, RustFS, real mount points, or
+platform bridge crates.
+
 The final report lists all required top-level artifacts and recursively
 discovers files under `artifacts/` before writing `report.json`. This makes
 client logs, Docker logs, mounted tree snapshots, validator diffs, and
@@ -213,8 +227,9 @@ mounted clients, starts PostgreSQL again with compose health waiting, and then
 uses the mounted tree validator for final convergence. Temporary peer
 invisibility while PostgreSQL is stopped is not a failure; only local write
 failures and post-recovery convergence failure fail the scenario. The scenario
-writes accepted outage operations to `operations.ndjson` and
-`outage-operations.ndjson`, and writes
+writes PostgreSQL outage/recovery events and local write operations to
+`operations.ndjson` and `outage-operations.ndjson` using the shared operation
+schema, and writes
 `postgres-outage-recovery-summary.json` with outage duration,
 accepted-operation count, recovery time, and the final validator result.
 `recovery_time_ms` starts before the PostgreSQL compose service is brought back
@@ -267,8 +282,10 @@ against one shared remote volume. Each scenario establishes a bounded initial
 tree, starts conflicting operations from multiple clients through a shared
 barrier, writes every attempted operation to `operations.ndjson`, waits for
 mounted tree convergence, and writes `namespace-collision-summary.json` plus
-`validation.json`. Operation records include client, operation, path, result,
-error, timestamp, and deterministic order marker. The suite currently includes:
+`validation.json`. Operation log records use the shared schema; sequence replaces
+the old ad hoc deterministic order marker, outcome replaces the old string
+result field, and operation variants carry paths such as rename source/target,
+unlink path, read path, or create path. The suite currently includes:
 
 - `collision-rename-vs-rename`
 - `collision-rename-vs-unlink`
