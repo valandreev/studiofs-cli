@@ -1,6 +1,6 @@
 //! Mounted filesystem tree snapshots and convergence validation.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{self, Read as _};
@@ -9,6 +9,10 @@ use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+use studiofs_scenario::invariant::{
+    ClientLogicalSnapshot, LogicalEntry, LogicalEntryKind, LogicalSnapshot,
+    validate_logical_invariants,
+};
 use thiserror::Error;
 
 const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
@@ -208,48 +212,51 @@ pub fn validate_namespace_invariants(
     snapshot: &MountedTreeSnapshot,
     expected_absent_paths: &[&str],
 ) -> Vec<NamespaceInvariantViolation> {
-    let mut violations = Vec::new();
-    let mut seen = BTreeSet::new();
-    let directory_paths = snapshot
-        .entries
-        .iter()
-        .filter(|entry| entry.entry_type == TreeEntryKind::Directory)
-        .map(|entry| entry.path.as_str())
-        .collect::<BTreeSet<_>>();
-    let expected_absent = expected_absent_paths
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>();
+    let logical = mounted_snapshots_to_logical_snapshot(
+        std::slice::from_ref(snapshot),
+        expected_absent_paths,
+    );
+    validate_logical_invariants(&logical)
+        .violations
+        .into_iter()
+        .filter_map(|violation| {
+            let message = match violation.invariant.as_str() {
+                "canonical_path_ownership" => "duplicate canonical path",
+                "no_unexpected_resurrection" => "unexpected resurrection",
+                "valid_directory_tree_structure" => "missing parent directory",
+                _ => return None,
+            };
+            Some(NamespaceInvariantViolation {
+                client: violation.client.unwrap_or_else(|| snapshot.client.clone()),
+                path: violation.path.unwrap_or_default(),
+                message: message.to_string(),
+            })
+        })
+        .collect()
+}
 
-    for entry in &snapshot.entries {
-        if !seen.insert(entry.path.as_str()) {
-            violations.push(NamespaceInvariantViolation {
+pub fn mounted_snapshots_to_logical_snapshot(
+    snapshots: &[MountedTreeSnapshot],
+    expected_absent_paths: &[&str],
+) -> LogicalSnapshot {
+    let mut logical = LogicalSnapshot::new(
+        snapshots
+            .iter()
+            .map(|snapshot| ClientLogicalSnapshot {
                 client: snapshot.client.clone(),
-                path: entry.path.clone(),
-                message: "duplicate canonical path".to_string(),
-            });
-        }
-
-        if expected_absent.contains(entry.path.as_str()) {
-            violations.push(NamespaceInvariantViolation {
-                client: snapshot.client.clone(),
-                path: entry.path.clone(),
-                message: "unexpected resurrection".to_string(),
-            });
-        }
-
-        if let Some(parent) = parent_path(&entry.path) {
-            if !directory_paths.contains(parent) {
-                violations.push(NamespaceInvariantViolation {
-                    client: snapshot.client.clone(),
-                    path: entry.path.clone(),
-                    message: "missing parent directory".to_string(),
-                });
-            }
-        }
-    }
-
-    violations
+                entries: snapshot
+                    .entries
+                    .iter()
+                    .map(mounted_entry_to_logical_entry)
+                    .collect(),
+            })
+            .collect(),
+    );
+    logical.expected_absent_paths = expected_absent_paths
+        .iter()
+        .map(|path| (*path).to_string())
+        .collect();
+    logical
 }
 
 pub fn write_divergence_artifacts(
@@ -410,10 +417,6 @@ fn entries_by_path(snapshot: &MountedTreeSnapshot) -> BTreeMap<&str, &TreeEntry>
         .collect()
 }
 
-fn parent_path(path: &str) -> Option<&str> {
-    path.rsplit_once('/').map(|(parent, _)| parent)
-}
-
 fn compare_entry(
     reference_client: &str,
     client: &str,
@@ -469,6 +472,23 @@ fn compare_entry(
             expected: expected.symlink_target.clone(),
             actual: actual.symlink_target.clone(),
         });
+    }
+}
+
+fn mounted_entry_to_logical_entry(entry: &TreeEntry) -> LogicalEntry {
+    LogicalEntry {
+        path: entry.path.clone(),
+        kind: match entry.entry_type {
+            TreeEntryKind::Directory => LogicalEntryKind::Directory,
+            TreeEntryKind::File => LogicalEntryKind::File,
+            TreeEntryKind::Symlink => LogicalEntryKind::Symlink,
+            TreeEntryKind::Other => LogicalEntryKind::Other,
+        },
+        logical_id: None,
+        object: None,
+        checksum_sha256: entry.checksum_sha256.clone(),
+        size: entry.size,
+        symlink_target: entry.symlink_target.clone(),
     }
 }
 

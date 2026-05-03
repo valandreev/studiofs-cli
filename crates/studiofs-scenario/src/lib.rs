@@ -1,5 +1,7 @@
 //! Shared logical scenario operation model for E2E artifacts and simulation.
 
+pub mod invariant;
+
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead as _, BufReader, Read as _, Seek as _, SeekFrom};

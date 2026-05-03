@@ -334,6 +334,16 @@ could hide collisions. The validator hashes every regular file on each
 successful poll, so mounted convergence scenarios should keep trees bounded
 until a separate checksum cache/invalidation contract exists.
 
+The mounted validator can translate mounted snapshots into
+`studiofs-scenario::invariant::LogicalSnapshot` for shared logical invariant
+checks where the public mounted surface has enough information. The translation
+intentionally carries only relative path, entry type, regular-file size, and
+regular-file checksum, plus symlink target when present. It does not infer inode
+IDs, object lifecycle state, durable-write expectations, hard-link
+relationships, or replay outcomes from a mounted tree. Scenarios that need
+those invariants must provide the missing logical facts explicitly or keep using
+scenario-specific validation.
+
 Retention behavior:
 
 - `always` keeps the full sandbox after cleanup.
