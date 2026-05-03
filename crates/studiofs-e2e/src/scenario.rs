@@ -858,7 +858,7 @@ fn run_postgres_outage_body(
     driver.stop_postgres()?;
     append_postgres_runtime_operation(context, SharedOperation::PostgresOutage)?;
     let accepted_operations = perform_outage_operations(context, &clients[1..3])?;
-    let outage_duration_ms = outage_started.elapsed().as_millis();
+    let outage_duration_ms = elapsed_millis_nonzero(outage_started);
 
     // `start_postgres` uses `docker compose up --wait`, so this includes
     // PostgreSQL healthcheck readiness before mounted convergence polling.
@@ -876,7 +876,7 @@ fn run_postgres_outage_body(
         convergence_timeout,
         poll_interval,
     )?;
-    let recovery_time_ms = recovery_started.elapsed().as_millis();
+    let recovery_time_ms = elapsed_millis_nonzero(recovery_started);
 
     let summary = PostgresOutageRecoverySummary {
         bootstrap,
@@ -1146,7 +1146,7 @@ fn run_rustfs_outage_body(
     driver.stop_rustfs()?;
     fs::write(&source_file, RUSTFS_OUTAGE_RECOVERED_PAYLOAD)?;
     let local_read_checksum_sha256 = bytes_sha256(&fs::read(&source_file)?);
-    let outage_duration_ms = outage_started.elapsed().as_millis();
+    let outage_duration_ms = elapsed_millis_nonzero(outage_started);
     let mut peer_visibility_during_outage = Vec::new();
     for peer in clients
         .iter()
@@ -1172,7 +1172,7 @@ fn run_rustfs_outage_body(
         convergence_timeout,
         poll_interval,
     )?;
-    let upload_recovery_time_ms = recovery_started.elapsed().as_millis();
+    let upload_recovery_time_ms = elapsed_millis_nonzero(recovery_started);
     let mut final_client_checksums = Vec::new();
     for client in clients.iter().take(RUSTFS_OUTAGE_CLIENT_NAMES.len()) {
         let checksum = bytes_sha256(&fs::read(client.mount_point.join(relative_path))?);
@@ -1468,7 +1468,7 @@ fn run_crash_restart_mode(
         ))));
     }
     let local_read_checksum_sha256 = bytes_sha256(&local_read_payload);
-    let restart_elapsed_ms = restart_started.elapsed().as_millis();
+    let restart_elapsed_ms = elapsed_millis_nonzero(restart_started);
 
     let convergence_started = Instant::now();
     let peer_visible_before_convergence =
@@ -1490,7 +1490,7 @@ fn run_crash_restart_mode(
         convergence_timeout,
         poll_interval,
     )?;
-    let convergence_elapsed_ms = convergence_started.elapsed().as_millis();
+    let convergence_elapsed_ms = elapsed_millis_nonzero(convergence_started);
     let final_payload = fs::read(clients[1].mount_point.join(relative_path))?;
     if final_payload != payload {
         return Err(ScenarioError::Io(std::io::Error::other(format!(
@@ -2408,7 +2408,17 @@ fn record_fs_operation(
 }
 
 fn elapsed_millis_u64(started: Instant) -> u64 {
-    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    u64::try_from(elapsed_millis_nonzero(started)).unwrap_or(u64::MAX)
+}
+
+fn elapsed_millis_nonzero(started: Instant) -> u128 {
+    let elapsed = started.elapsed();
+    let elapsed_ms = elapsed.as_millis();
+    if elapsed_ms == 0 && !elapsed.is_zero() {
+        1
+    } else {
+        elapsed_ms
+    }
 }
 
 fn finish_namespace_collision(
