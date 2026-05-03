@@ -238,6 +238,20 @@ the shared invariant schema so active local payloads, pending uploads, and
 deleted remote objects can be checked without simulating S3, OpenDAL, sockets,
 or wall-clock timing.
 
+The initial SFS-335 slice adds `studiofs-scenario::scheduler` as the virtual
+time driver for those passive services. Tests enqueue `ScheduledEvent` values at
+explicit ticks with typed event categories for client operations, metadata
+delivery, upload completion, publish attempts, crash/restart, modeled faults,
+and checkpoints. `SimulationScheduler` selects among same-tick ready events
+from a seed-controlled deterministic generator, advances only by virtual ticks,
+and exposes both step-by-step execution and `run_until_idle` / `run_until`
+modes. The `run_until` mode stops at the first invariant failure and leaves
+later events pending for counterexample capture. Scheduler trace records include
+the seed, step, virtual tick, event ID, client ID, event type, ready-event count,
+and selected interleaving index. Simulation tests must keep retries, outages,
+upload completion, publication, and crash/restart timing on this scheduler
+surface rather than using wall-clock sleeps or Tokio timing.
+
 ## MVP Scenario Set
 
 The first runtime should prove the layer with small scenarios:

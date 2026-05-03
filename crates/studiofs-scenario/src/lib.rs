@@ -3,6 +3,7 @@
 pub mod invariant;
 pub mod metadata_bus;
 pub mod object_store;
+pub mod scheduler;
 
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
