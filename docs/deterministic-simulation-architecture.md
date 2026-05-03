@@ -68,8 +68,8 @@ instead of one monolithic simulator.
 | Abstraction | Responsibility | Follow-up |
 |---|---|---|
 | operation model | `studiofs-scenario` serializable logical operations shared by Real E2E and simulation: create, mkdir, write, append, truncate, rename, unlink, rmdir, read, stat, readdir, flush, fsync, close/release, crash, restart, outage, recovery, wait, and barrier | SFS-331 |
-| logical state snapshot | A stable view of paths, inodes or logical node IDs, file versions, payload references, pending uploads, pending publications, and client-local visibility | SFS-332 |
-| invariant validation | Product-specific checks for convergence, no lost durable writes, no unexpected resurrection, valid tree structure, canonical path ownership, object reachability, and idempotent replay | SFS-332 |
+| logical state snapshot | `studiofs-scenario::invariant::LogicalSnapshot` schema version 1: clients, entries, logical IDs when known, file size/checksum, object references, expected-absent paths, durable write expectations, object lifecycle facts, hard-link mode, and optional replay-idempotence result | SFS-332 |
+| invariant validation | `studiofs-scenario::invariant::validate_logical_invariants` checks convergence, no lost durable writes, no unexpected resurrection, valid tree structure, canonical path ownership, object reachability, and idempotent replay over logical snapshots | SFS-332 |
 | simulated metadata bus | Scheduler-driven metadata replication with ordered delivery, outage, reconnect, delayed delivery, duplicate delivery, and traceable batch/version behavior | SFS-333 |
 | simulated object store | Scheduler-driven object presence, local-only payloads, delayed upload completion, failed uploads, retries, outage/recovery, remote read failure, and reachability export | SFS-334 |
 | virtual time | Logical ticks and deadlines that replace wall-clock sleeps and make outage, retry, upload, and publication timing reproducible | SFS-335 |
@@ -132,6 +132,15 @@ Reusable artifacts:
   snapshots when possible;
 - failure diagnostics that identify scenario, seed, client, operation index,
   invariant, and relevant path/object IDs.
+
+The shared invariant core lives in `studiofs-scenario` so Contract/Core tests,
+the deterministic simulator, and real E2E support crates can depend on the same
+JSON-compatible data model without requiring mounted filesystems. Mounted tree
+snapshots map only the portable public fields into logical entries: relative
+path, entry type, regular-file size, and regular-file checksum. Mounted
+snapshots do not provide stable logical IDs, object lifecycle protection, local
+durability expectations, or replay results, so those fields remain absent unless
+a scenario supplies them explicitly.
 
 Unsupported mounted-only operations must remain explicit. Operation records keep
 `simulation_support.status = "unsupported"` plus a reason when the simulator

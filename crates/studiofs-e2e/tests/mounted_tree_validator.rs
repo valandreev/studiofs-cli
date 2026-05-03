@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use studiofs_e2e::mounted_tree::{
     ClientMount, MountedTreeError, MountedTreeSnapshot, TreeEntry, TreeEntryKind,
-    compare_snapshots, snapshot_client_tree, validate_namespace_invariants, wait_for_convergence,
-    write_divergence_artifacts,
+    compare_snapshots, mounted_snapshots_to_logical_snapshot, snapshot_client_tree,
+    validate_namespace_invariants, wait_for_convergence, write_divergence_artifacts,
 };
 use tempfile::tempdir;
 
@@ -270,6 +270,69 @@ fn comparison_detects_symlink_target_divergence() {
     );
 }
 
+#[test]
+fn mounted_snapshots_map_to_shared_logical_validator_contract() {
+    let snapshots = vec![
+        MountedTreeSnapshot {
+            schema_version: 1,
+            client: "client-a".to_string(),
+            mount_point: "/mnt/client-a".to_string(),
+            entries: vec![TreeEntry {
+                path: "dir/file.txt".to_string(),
+                entry_type: TreeEntryKind::File,
+                size: Some(5),
+                modified_unix_ms: Some(123),
+                checksum_sha256: Some("checksum-a".to_string()),
+                symlink_target: None,
+            }],
+        },
+        MountedTreeSnapshot {
+            schema_version: 1,
+            client: "client-b".to_string(),
+            mount_point: "/mnt/client-b".to_string(),
+            entries: vec![TreeEntry {
+                path: "dir/file.txt".to_string(),
+                entry_type: TreeEntryKind::File,
+                size: Some(7),
+                modified_unix_ms: Some(456),
+                checksum_sha256: Some("checksum-b".to_string()),
+                symlink_target: None,
+            }],
+        },
+    ];
+
+    let logical = mounted_snapshots_to_logical_snapshot(&snapshots, &[]);
+    let report = studiofs_scenario::invariant::validate_logical_invariants(&logical);
+
+    assert!(!report.passed);
+    assert_eq!(logical.clients[0].client, "client-a");
+    assert_eq!(logical.clients[0].entries[0].path, "dir/file.txt");
+    assert_eq!(logical.clients[0].entries[0].logical_id.as_deref(), None);
+    assert_eq!(logical.clients[0].entries[0].object, None);
+    assert!(
+        report
+            .violations
+            .iter()
+            .any(|violation| violation.invariant == "eventual_convergence"
+                && violation.path.as_deref() == Some("dir/file.txt"))
+    );
+}
+
+#[test]
+fn mounted_logical_mapping_does_not_require_object_lifecycle_facts() {
+    let snapshots = vec![
+        mounted_file_snapshot("client-a", "shared.txt", 4, "checksum-a"),
+        mounted_file_snapshot("client-b", "shared.txt", 4, "checksum-a"),
+    ];
+
+    let logical = mounted_snapshots_to_logical_snapshot(&snapshots, &[]);
+    let report = studiofs_scenario::invariant::validate_logical_invariants(&logical);
+
+    assert!(report.passed, "{:?}", report.violations);
+    assert!(logical.objects.is_empty());
+    assert!(logical.clients[0].entries[0].object.is_none());
+}
+
 #[cfg(unix)]
 #[test]
 fn snapshot_records_symlink_target() {
@@ -323,6 +386,27 @@ fn symlink_snapshot(client: &str, target: &str) -> MountedTreeSnapshot {
             modified_unix_ms: None,
             checksum_sha256: None,
             symlink_target: Some(target.to_string()),
+        }],
+    }
+}
+
+fn mounted_file_snapshot(
+    client: &str,
+    path: &str,
+    size: u64,
+    checksum_sha256: &str,
+) -> MountedTreeSnapshot {
+    MountedTreeSnapshot {
+        schema_version: 1,
+        client: client.to_string(),
+        mount_point: format!("/mnt/{client}"),
+        entries: vec![TreeEntry {
+            path: path.to_string(),
+            entry_type: TreeEntryKind::File,
+            size: Some(size),
+            modified_unix_ms: None,
+            checksum_sha256: Some(checksum_sha256.to_string()),
+            symlink_target: None,
         }],
     }
 }
