@@ -14,7 +14,7 @@ pub use context::{StudioFsContext, WinfspKernelInvalidator};
 use thiserror::Error;
 use windows::Win32::System::LibraryLoader::LoadLibraryW;
 
-const DEFAULT_FILE_INFO_TIMEOUT_MS: u32 = u32::MAX;
+const DEFAULT_FILE_INFO_TIMEOUT_MS: u32 = 1000;
 const DEFAULT_DIR_INFO_TIMEOUT_MS: u32 = 1000;
 const DEFAULT_VOLUME_INFO_TIMEOUT_MS: u32 = 1000;
 const DEFAULT_SECTOR_SIZE: u16 = 4096;
@@ -396,8 +396,9 @@ fn apply_volume_params(
     volume_params.file_info_timeout(options.file_info_timeout_ms);
     volume_params.dir_info_timeout(options.dir_info_timeout_ms);
     volume_params.volume_info_timeout(options.volume_info_timeout_ms);
-    // Match JuiceFS `KeepFileCache`: preserve WinFSP file cache on cleanup.
-    // Write-capable handles opt out of the OS file cache at Create/Open time.
+    // Keep WinFSP file caching bounded so remote metadata invalidations can
+    // become visible to read-only handles. Write-capable handles still opt out
+    // of the OS file cache at Create/Open time.
     volume_params.flush_and_purge_on_cleanup(options.flush_and_purge_on_cleanup);
     Ok(())
 }
@@ -710,7 +711,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_mount_options_defaults_to_winfsp_cache_manager_file_info_timeout() {
+    fn parse_mount_options_defaults_to_bounded_file_info_timeout() {
         let _guard = ENV_LOCK.lock().expect("env lock");
         // SAFETY: Tests are single-threaded via `_guard` and temporarily mutate
         // process environment variables for deterministic parsing behavior.
@@ -719,7 +720,7 @@ mod tests {
         }
 
         let opts = parse_mount_options("StudioFS").expect("options");
-        assert_eq!(opts.file_info_timeout_ms, u32::MAX);
+        assert_eq!(opts.file_info_timeout_ms, DEFAULT_FILE_INFO_TIMEOUT_MS);
     }
 
     #[test]

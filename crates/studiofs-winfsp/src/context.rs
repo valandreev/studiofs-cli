@@ -1716,7 +1716,7 @@ impl AsyncFileSystemContext for StudioFsContext {
     }
 }
 
-// ─── WinFSP Notify (Kernel Cache Invalidation) ──────────────────────────────
+// ─── WinFSP Notify (Metadata Change Signals) ────────────────────────────────
 
 /// Windows FILE_NOTIFY_CHANGE_* / FILE_ACTION_* constants.
 const FILE_NOTIFY_CHANGE_FILE_NAME: u32 = 0x0000_0001;
@@ -1760,7 +1760,7 @@ fn ino_to_windows_path(vfs: &StudioVfs, ino: Ino) -> Option<String> {
         .path_for_inode(ino)
 }
 
-/// Bridges VFS kernel cache invalidation to WinFSP's
+/// Bridges VFS metadata invalidation to WinFSP's
 /// `FspFileSystemNotify` mechanism.
 ///
 /// Metadata refreshes push inode numbers into a shared queue.

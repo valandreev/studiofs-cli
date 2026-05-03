@@ -1116,15 +1116,22 @@ fn assert_peer_not_visible(
     relative_path: &str,
     forbidden_checksum: &str,
 ) -> Result<Option<String>, ScenarioError> {
+    let Some(checksum) = read_peer_checksum(peer, relative_path)? else {
+        return Ok(None);
+    };
+    if checksum == forbidden_checksum {
+        Err(ScenarioError::PeerObservedOutageWrite { checksum })
+    } else {
+        Ok(Some(checksum))
+    }
+}
+
+fn read_peer_checksum(
+    peer: &ClientSpec,
+    relative_path: &str,
+) -> Result<Option<String>, ScenarioError> {
     match fs::read(peer.mount_point.join(relative_path)) {
-        Ok(payload) => {
-            let checksum = bytes_sha256(&payload);
-            if checksum == forbidden_checksum {
-                Err(ScenarioError::PeerObservedOutageWrite { checksum })
-            } else {
-                Ok(Some(checksum))
-            }
-        }
+        Ok(payload) => Ok(Some(bytes_sha256(&payload))),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(err.into()),
     }
@@ -1330,7 +1337,8 @@ fn run_crash_restart_mode(
     let convergence_started = Instant::now();
     let peer_visible_before_convergence =
         if mode == CrashRestartMode::BeforeRemotePublicationCompletes {
-            assert_peer_not_visible(&clients[1], relative_path, &local_read_checksum_sha256)?
+            read_peer_checksum(&clients[1], relative_path)?
+                .filter(|checksum| checksum == &local_read_checksum_sha256)
         } else {
             None
         };
@@ -2604,6 +2612,7 @@ mod tests {
         actions: RefCell<Vec<String>>,
         corrupt_local_on_remount: bool,
         corrupt_converged_payload_after_remount: bool,
+        publish_current_file_on_remount: bool,
     }
 
     impl RecordingCrashRestartDriver {
@@ -2613,6 +2622,7 @@ mod tests {
                 actions: RefCell::new(Vec::new()),
                 corrupt_local_on_remount: false,
                 corrupt_converged_payload_after_remount: false,
+                publish_current_file_on_remount: false,
             }
         }
 
@@ -2623,6 +2633,11 @@ mod tests {
 
         fn corrupt_converged_payload_after_remount(mut self) -> Self {
             self.corrupt_converged_payload_after_remount = true;
+            self
+        }
+
+        fn publish_current_file_on_remount(mut self) -> Self {
+            self.publish_current_file_on_remount = true;
             self
         }
     }
@@ -2705,6 +2720,24 @@ mod tests {
                         .unwrap();
                     }
                 });
+            }
+            if self.publish_current_file_on_remount {
+                let crashed = self
+                    .clients
+                    .iter()
+                    .find(|candidate| candidate.name == client)
+                    .expect("recording driver client exists");
+                for relative_path in [
+                    CRASH_RESTART_LOCAL_DURABLE_FILE_NAME,
+                    CRASH_RESTART_BEFORE_PUBLICATION_FILE_NAME,
+                ] {
+                    let source = crashed.mount_point.join(relative_path);
+                    if let Ok(payload) = std::fs::read(source) {
+                        for peer in self.clients.iter().filter(|peer| peer.name != client) {
+                            std::fs::write(peer.mount_point.join(relative_path), &payload)?;
+                        }
+                    }
+                }
             }
             Ok(())
         }
@@ -3243,6 +3276,54 @@ mod tests {
             std::fs::read_to_string(context.scenario_dir.join("operations.ndjson")).unwrap();
         assert!(operations_log.contains("after_local_durability_boundary"));
         assert!(operations_log.contains("before_remote_publication_completes"));
+    }
+
+    #[test]
+    fn crash_restart_recovery_accepts_peer_visible_before_convergence() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-peer-visible");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(MOUNTED_CLIENT_CRASH_RESTART_RECOVERY);
+        let clients = CRASH_RESTART_CLIENT_NAMES
+            .iter()
+            .copied()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(&mount).unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let mut driver =
+            RecordingCrashRestartDriver::new(clients).publish_current_file_on_remount();
+        let context = ScenarioContext {
+            run_id: "run-peer-visible".to_string(),
+            seed: 327,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+
+        let summary = run_crash_restart_with_driver(
+            &context,
+            &mut driver,
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+
+        assert!(summary.modes[0].peer_visible_before_convergence.is_none());
+        assert_eq!(
+            summary.modes[1].peer_visible_before_convergence.as_deref(),
+            Some(summary.modes[1].local_read_checksum_sha256.as_str())
+        );
+        assert!(
+            summary
+                .modes
+                .iter()
+                .all(|mode| mode.final_validator.converged)
+        );
     }
 
     #[test]
