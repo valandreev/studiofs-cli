@@ -518,6 +518,12 @@ PostgreSQL metadata invalidation uses push-plus-poll behavior:
 - Lock lease notifications stay on `studiofs_lock_vol_<volume_id>` and are not
   part of general namespace/attr/payload invalidation.
 
+On PostgreSQL notify wakeups, the metadata listener syncs from the event log
+before waking the VFS invalidation worker. If local namespace or metadata
+version tokens already advanced, the worker skips the fallback poll's remote
+event-log query and only performs cache invalidation work. Timer-driven fallback
+polls still always query PostgreSQL to cover missed notifications.
+
 The existing `upload pipeline` / `upload pipeline counters` log events include:
 
 - dentry cache, full-path shortcut cache, and attr read cache metrics: hits/misses/evictions, occupancy, protected-tier (hotset) occupancy, and hot-hit contribution

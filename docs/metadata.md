@@ -266,6 +266,17 @@ PostgreSQL-backed clients use a push-plus-poll invalidation model:
 - periodic `STUDIOFS_PG_SYNC_POLL_SECS` polling remains enabled as the fallback
   for missed notifications, network stalls, process pauses, and listener restarts
 
+The metadata listener performs the event-log pull before waking the VFS
+invalidation worker. On a notify-driven wake, the worker first compares local
+namespace and metadata version tokens with the last tokens it processed. If the
+listener already advanced either token, the worker skips the fallback poll's
+remote event-log query and proceeds directly to cache invalidation from the
+local metadata view. Periodic fallback polls still always run a remote sync, so
+lost notifications cannot be hidden by unrelated local token changes. If a
+notify wake arrives without a token change, the worker may still issue an empty
+event-log query; that is the conservative path that preserves the hint-only
+contract for future backends.
+
 The metadata channel is separate from the file-lock lease notification channel
 (`studiofs_lock_vol_<volume_id>`). Lock NOTIFY updates known lock state only;
 metadata NOTIFY wakes namespace, attr, payload publication, ACL, snapshot, and
