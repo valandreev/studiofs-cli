@@ -2,6 +2,7 @@
 
 pub mod invariant;
 pub mod metadata_bus;
+pub mod object_store;
 
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
