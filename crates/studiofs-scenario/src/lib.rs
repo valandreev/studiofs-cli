@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead as _, BufReader};
+use std::io::{BufRead as _, BufReader, Read as _, Seek as _, SeekFrom};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -201,11 +201,7 @@ pub fn write_operation_log(
     path: impl AsRef<Path>,
     records: &[ScenarioOperationRecord],
 ) -> Result<(), OperationLogError> {
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(path)?;
+    let mut file = open_truncate(path.as_ref())?;
     for record in records {
         write_operation_record(&mut file, record)?;
     }
@@ -216,7 +212,7 @@ pub fn append_operation_record(
     path: impl AsRef<Path>,
     record: &ScenarioOperationRecord,
 ) -> Result<(), OperationLogError> {
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    let mut file = open_append(path.as_ref())?;
     write_operation_record(&mut file, record)
 }
 
@@ -229,7 +225,7 @@ impl OperationLogWriter {
     pub fn open_append(path: impl AsRef<Path>) -> Result<Self, OperationLogError> {
         let path = path.as_ref();
         let next_sequence = next_operation_sequence(path)?;
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let file = open_append(path)?;
         Ok(Self {
             file,
             next_sequence,
@@ -252,15 +248,70 @@ impl OperationLogWriter {
         self.next_sequence = record.sequence.saturating_add(1).max(self.next_sequence);
         Ok(())
     }
+
+    pub fn refresh_next_sequence(&mut self) -> Result<(), OperationLogError> {
+        self.next_sequence = next_operation_sequence_from_file(&mut self.file)?;
+        Ok(())
+    }
 }
 
 pub fn next_operation_sequence(path: impl AsRef<Path>) -> Result<u64, OperationLogError> {
-    match read_operation_log(path) {
-        Ok(records) => Ok(records
-            .last()
-            .map_or(1, |record| record.sequence.saturating_add(1))),
-        Err(OperationLogError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(1),
-        Err(error) => Err(error),
+    let path = path.as_ref();
+    match open_read(path) {
+        Ok(mut file) => next_operation_sequence_from_file(&mut file),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(1),
+        Err(error) => Err(OperationLogError::Io(error)),
+    }
+}
+
+fn next_operation_sequence_from_file(file: &mut fs::File) -> Result<u64, OperationLogError> {
+    let Some(line) = last_non_empty_line(file)? else {
+        return Ok(1);
+    };
+    let record: ScenarioOperationRecord = serde_json::from_str(&line)
+        .map_err(|source| OperationLogError::JsonLine { line: 0, source })?;
+    if record.schema_version != SCENARIO_OPERATION_SCHEMA_VERSION {
+        return Err(OperationLogError::UnsupportedSchemaVersion {
+            line: 0,
+            version: record.schema_version,
+        });
+    }
+    Ok(record.sequence.saturating_add(1))
+}
+
+fn last_non_empty_line(file: &mut fs::File) -> Result<Option<String>, OperationLogError> {
+    const CHUNK_SIZE: u64 = 8192;
+
+    let mut position = file.seek(SeekFrom::End(0))?;
+    let mut line = Vec::new();
+    let mut seen_non_whitespace = false;
+    while position > 0 {
+        let chunk_len = position.min(CHUNK_SIZE);
+        position -= chunk_len;
+        file.seek(SeekFrom::Start(position))?;
+        let mut chunk = vec![0; chunk_len as usize];
+        file.read_exact(&mut chunk)?;
+
+        for byte in chunk.into_iter().rev() {
+            if !seen_non_whitespace {
+                if byte.is_ascii_whitespace() {
+                    continue;
+                }
+                seen_non_whitespace = true;
+            }
+            if byte == b'\n' {
+                line.reverse();
+                return Ok(Some(String::from_utf8_lossy(&line).into_owned()));
+            }
+            line.push(byte);
+        }
+    }
+
+    if seen_non_whitespace {
+        line.reverse();
+        Ok(Some(String::from_utf8_lossy(&line).into_owned()))
+    } else {
+        Ok(None)
     }
 }
 
@@ -276,9 +327,8 @@ pub fn write_operation_record(
 pub fn read_operation_log(
     path: impl AsRef<Path>,
 ) -> Result<Vec<ScenarioOperationRecord>, OperationLogError> {
-    let file = fs::File::open(path)?;
-    let reader = BufReader::new(file);
-    read_operation_log_from_reader(reader)
+    let file = open_read(path.as_ref())?;
+    read_operation_log_from_reader(file)
 }
 
 pub fn read_operation_log_from_reader(
@@ -315,3 +365,38 @@ pub fn simulation_supported_records(
         .iter()
         .filter(|record| record.is_simulation_supported())
 }
+
+fn open_read(path: &Path) -> std::io::Result<fs::File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    allow_parallel_log_access(&mut options);
+    options.open(path)
+}
+
+fn open_append(path: &Path) -> std::io::Result<fs::File> {
+    let mut options = OpenOptions::new();
+    options.create(true).append(true).read(true);
+    allow_parallel_log_access(&mut options);
+    options.open(path)
+}
+
+fn open_truncate(path: &Path) -> std::io::Result<fs::File> {
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    allow_parallel_log_access(&mut options);
+    options.open(path)
+}
+
+#[cfg(windows)]
+fn allow_parallel_log_access(options: &mut OpenOptions) {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+
+    options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+}
+
+#[cfg(not(windows))]
+fn allow_parallel_log_access(_options: &mut OpenOptions) {}

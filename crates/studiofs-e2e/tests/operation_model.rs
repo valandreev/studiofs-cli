@@ -178,6 +178,49 @@ fn operation_log_writer_allocates_sequence_without_rescanning_each_append() {
 }
 
 #[test]
+fn operation_log_writer_refreshes_sequence_after_external_append() {
+    let temp = tempdir().unwrap();
+    let log_path = temp.path().join("operations.ndjson");
+    let mut runner_writer = OperationLogWriter::open_append(&log_path).unwrap();
+    let setup_started = runner_writer.record(
+        "runner-scenario",
+        ScenarioOperation::SchedulerCheckpoint {
+            name: "setup.started".to_string(),
+        },
+    );
+    runner_writer.append_record(&setup_started).unwrap();
+
+    let mut scenario_writer = OperationLogWriter::open_append(&log_path).unwrap();
+    let scenario_record = scenario_writer.record(
+        "runner-scenario",
+        ScenarioOperation::Write {
+            path: "shared/file.txt".to_string(),
+            offset: Some(0),
+            bytes: 12,
+            checksum_sha256: None,
+        },
+    );
+    scenario_writer.append_record(&scenario_record).unwrap();
+
+    runner_writer.refresh_next_sequence().unwrap();
+    let setup_finished = runner_writer.record(
+        "runner-scenario",
+        ScenarioOperation::SchedulerCheckpoint {
+            name: "setup.finished".to_string(),
+        },
+    );
+    assert_eq!(setup_finished.sequence, 3);
+    runner_writer.append_record(&setup_finished).unwrap();
+
+    let records = read_operation_log(&log_path).unwrap();
+    let sequences = records
+        .iter()
+        .map(|record| record.sequence)
+        .collect::<Vec<_>>();
+    assert_eq!(sequences, [1, 2, 3]);
+}
+
+#[test]
 fn e2e_runner_operations_log_uses_shared_operation_records() {
     let temp = tempdir().unwrap();
     let request = RunRequest {
