@@ -184,7 +184,10 @@ impl<'a> PrefetchBatchBuilder<'a> {
                 "debug target prefetch plan"
             );
         }
-        let siblings = self.vfs.dir_prefetch.on_child_read(self.ino);
+        let siblings = self
+            .vfs
+            .dir_prefetch
+            .on_child_read_limited(self.ino, self.vfs.dir_prefetch_max_batch);
         (to_prefetch, siblings)
     }
 
@@ -659,5 +662,33 @@ mod tests {
             planned[0].block_indices.len() >= policy.readahead_min_prefetch as usize,
             "legacy reserve/cycle caps should not suppress sequential prefetch"
         );
+    }
+
+    #[test]
+    fn plan_prefetch_batches_from_hint_yields_frame_sequence_batch_after_readdir() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "prefetch-frame-sequence-batch");
+
+        let first = vfs
+            .create(ROOT_INO, b"plate_0100.exr", 1000, 1000, 0o644)
+            .expect("create first frame");
+        let second = vfs
+            .create(ROOT_INO, b"plate_0101.exr", 1000, 1000, 0o644)
+            .expect("create second frame");
+        let _notes = vfs
+            .create(ROOT_INO, b"notes.txt", 1000, 1000, 0o644)
+            .expect("create unrelated file");
+        let _ = vfs.readdir(ROOT_INO).expect("readdir root");
+
+        let stream_id = 456;
+        let policy = AccessPolicy::from_class(AccessClass::SequentialMediaRead, vfs.access_tracker);
+        let planned = vfs.plan_prefetch_batches_from_hint(first.ino, stream_id, 0, 0, policy);
+
+        assert_eq!(planned.len(), 1);
+        assert_eq!(
+            planned[0].ino, second.ino,
+            "frame sequence reads should schedule the next frame through the existing batch path"
+        );
+        assert_eq!(planned[0].block_indices, vec![0]);
     }
 }
