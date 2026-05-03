@@ -79,6 +79,22 @@ fn scheduler_advances_virtual_ticks_without_wall_clock_sleep() {
 }
 
 #[test]
+#[should_panic(expected = "cannot schedule in the past")]
+fn schedule_at_rejects_events_in_the_virtual_past() {
+    let mut scheduler = SimulationScheduler::new(7);
+    scheduler.schedule_at(
+        2,
+        client_event("reader", SchedulerEventType::MetadataDelivery),
+    );
+    scheduler.step().unwrap();
+
+    scheduler.schedule_at(
+        1,
+        client_event("writer", SchedulerEventType::UploadCompletion),
+    );
+}
+
+#[test]
 fn run_until_idle_executes_all_ready_events() {
     let mut scheduler = SimulationScheduler::new(99);
     scheduler.schedule_now(client_event("a", SchedulerEventType::ClientOperation));

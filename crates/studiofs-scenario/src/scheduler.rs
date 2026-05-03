@@ -116,6 +116,7 @@ impl SimulationScheduler {
     }
 
     pub fn schedule_at(&mut self, tick: u64, event: ScheduledEvent) -> u64 {
+        debug_assert!(tick >= self.current_tick, "cannot schedule in the past");
         self.next_event_id += 1;
         let event_id = self.next_event_id;
         self.pending
@@ -134,7 +135,7 @@ impl SimulationScheduler {
             .map(|event| event.event_id)
             .collect::<Vec<_>>();
         let choice = self.rng.choose(ready_events.len());
-        let queued = ready_events.remove(choice);
+        let queued = ready_events.swap_remove(choice);
         if ready_events.is_empty() {
             self.pending.remove(&tick);
         }
