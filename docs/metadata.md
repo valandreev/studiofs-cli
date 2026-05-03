@@ -252,6 +252,40 @@ Operational note:
 This avoids replaying a client's own changes and avoids clobbering local staged
 writes with foreign state, while still advancing the remote-visible base view.
 
+### Metadata invalidation wakeups
+
+PostgreSQL-backed clients use a push-plus-poll invalidation model:
+
+- every remote-visible event-log batch emits a volume-scoped PostgreSQL
+  `NOTIFY` on `studiofs_meta_vol_<volume_id>` after the transaction commits
+- peer metadata listeners treat the notification payload as a wakeup hint only
+- the listener wakes `sync_metadata()` and the VFS metadata invalidation worker;
+  the event log and version tokens remain the source of truth
+- listener startup/reconnect forces an immediate metadata sync before waiting
+  for the next notification, so changes missed while offline can still converge
+- periodic `STUDIOFS_PG_SYNC_POLL_SECS` polling remains enabled as the fallback
+  for missed notifications, network stalls, process pauses, and listener restarts
+
+The metadata listener performs the event-log pull before waking the VFS
+invalidation worker. On a notify-driven wake, the worker first compares local
+namespace and metadata version tokens with the last tokens it processed. If the
+listener already advanced either token, the worker skips the fallback poll's
+remote event-log query and proceeds directly to cache invalidation from the
+local metadata view. Periodic fallback polls still always run a remote sync, so
+lost notifications cannot be hidden by unrelated local token changes. If a
+notify wake arrives without a token change, the worker may still issue an empty
+event-log query; that is the conservative path that preserves the hint-only
+contract for future backends.
+
+The metadata channel is separate from the file-lock lease notification channel
+(`studiofs_lock_vol_<volume_id>`). Lock NOTIFY updates known lock state only;
+metadata NOTIFY wakes namespace, attr, payload publication, ACL, snapshot, and
+delete/cleanup replication through the ordinary event-log replay path.
+
+Available metadata invalidation diagnostics are best-effort counters:
+notifications received, listener reconnects, fallback polls that discovered
+remote changes, sync errors, and the last successful metadata sync timestamp.
+
 ## ACL Roles (Local-First)
 
 StudioFS supports per-inode ACL rules for principals with three access levels:
@@ -324,6 +358,8 @@ such as:
 - `STUDIOFS_PG_FLUSH_OPS_THRESHOLD`
 - `STUDIOFS_PG_FLUSH_IDLE_MS`
 - `STUDIOFS_PG_SYNC_POLL_SECS`
+- `STUDIOFS_PG_CONNECT_TIMEOUT_MS`
+- `STUDIOFS_PG_COMMAND_TIMEOUT_MS`
 
 ## Schema
 

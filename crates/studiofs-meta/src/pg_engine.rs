@@ -1,8 +1,8 @@
 use crate::engine::{
     DeferredDeleteRecord, MetaAcl, MetaEngineCore, MetaError, MetaFormat, MetaFsOps, MetaGc,
     MetaInodes, MetaNamespace, MetaPayloadObjects, MetaRecovery, MetaReplication, MetaResult,
-    MetaSnapshots, MetaSymlink, MetaXattr, MetadataAuthorityStatus, PendingCreateRecord,
-    UndoLogKind, UndoLogRecord,
+    MetaSnapshots, MetaSymlink, MetaXattr, MetadataAuthorityStatus,
+    MetadataInvalidationDiagnostics, PendingCreateRecord, UndoLogKind, UndoLogRecord,
 };
 use crate::events::MetaEvent;
 use crate::redb_engine::{RedbMetaEngine, RedbSnapshot};
@@ -85,9 +85,19 @@ pub struct PgMetaEngine {
     poll_wakeup: Arc<(Mutex<bool>, Condvar)>,
     /// Cancels the lock-notify listener async future immediately, even mid-await.
     lock_notify_cancel: CancellationToken,
+    /// Wakes VFS metadata invalidation after PG metadata NOTIFY syncs local state.
+    metadata_invalidation_notify: Arc<tokio::sync::Notify>,
+    /// Cancels the metadata-notify listener async future immediately.
+    metadata_notify_cancel: CancellationToken,
+    metadata_notify_received: AtomicU64,
+    metadata_notify_reconnects: AtomicU64,
+    metadata_fallback_poll_discoveries: AtomicU64,
+    metadata_sync_errors: AtomicU64,
+    metadata_last_successful_sync_unix_ms: AtomicI64,
     /// Handle to the background poll thread, used by `prepare_for_close()`
     /// to join the thread so `Database::drop()` runs before process exit.
     poll_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+    metadata_notify_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
     lock_notify_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
     lock_renew_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
@@ -141,6 +151,13 @@ struct OverlayConflictSets {
 struct RecentFlush {
     batch_version: i64,
     overlay: OverlayConflictSets,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MetadataSyncSource {
+    Manual,
+    Notify,
+    FallbackPoll,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -248,6 +265,9 @@ impl PgMetaEngine {
     "#;
     const LOCK_NOTIFY_IDLE_POLL_INTERVAL_MS: u64 = 250;
     const LOCK_NOTIFY_SAFETY_REFRESH_INTERVAL_MS: u64 = 30_000;
+    const METADATA_NOTIFY_IDLE_POLL_INTERVAL_MS: u64 = 250;
+    const METADATA_NOTIFY_RECONNECT_MIN_DELAY_MS: u64 = 250;
+    const METADATA_NOTIFY_RECONNECT_MAX_DELAY_MS: u64 = 5_000;
 
     fn env_duration_ms(key: &str, default_ms: u64) -> Duration {
         Duration::from_millis(
@@ -1248,6 +1268,10 @@ impl PgMetaEngine {
         format!("studiofs_lock_vol_{volume_id}")
     }
 
+    fn metadata_notify_channel(volume_id: i64) -> String {
+        format!("studiofs_meta_vol_{volume_id}")
+    }
+
     fn encode_file_lock_notify_payload(ino: Ino, generation: u64) -> String {
         format!("{ino}:{generation}")
     }
@@ -1467,6 +1491,212 @@ impl PgMetaEngine {
     fn ensure_lock_workers_started(&self) -> MetaResult<()> {
         self.ensure_lock_notify_listener_started()?;
         self.ensure_lock_renew_worker_started()
+    }
+
+    fn ensure_metadata_notify_listener_started(&self) -> MetaResult<()> {
+        if self
+            .metadata_notify_handle
+            .lock()
+            .map(|guard| guard.is_some())
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+
+        let engine = self.self_weak.get().cloned().ok_or_else(|| {
+            MetaError::Storage("pg metadata notify bootstrap missing self weak ref".to_string())
+        })?;
+
+        let mut notify_guard = self.metadata_notify_handle.lock().map_err(|_| {
+            MetaError::Storage("pg metadata notify handle state poisoned".to_string())
+        })?;
+        if notify_guard.is_none() {
+            *notify_guard = Some(Self::start_metadata_notify_listener(
+                engine,
+                self.poll_shutdown.clone(),
+                self.metadata_notify_cancel.clone(),
+            )?);
+        }
+
+        Ok(())
+    }
+
+    fn start_metadata_notify_listener(
+        engine: Weak<Self>,
+        shutdown: Arc<AtomicBool>,
+        cancel: CancellationToken,
+    ) -> MetaResult<std::thread::JoinHandle<()>> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| MetaError::Storage(format!("failed to build tokio runtime: {e}")))?;
+        std::thread::Builder::new()
+            .name("pg-meta-notify".into())
+            .spawn(move || {
+                let mut attempted_listen = false;
+                let mut reconnect_delay =
+                    Duration::from_millis(Self::METADATA_NOTIFY_RECONNECT_MIN_DELAY_MS);
+                while !shutdown.load(Ordering::Acquire) {
+                    let (postgres_url, volume_id, connect_timeout) = match engine.upgrade() {
+                        Some(engine_arc) => (
+                            engine_arc.postgres_url.clone(),
+                            engine_arc.volume_id,
+                            engine_arc.connect_timeout,
+                        ),
+                        None => break,
+                    };
+
+                    if attempted_listen
+                        && let Some(engine_arc) = engine.upgrade()
+                    {
+                        engine_arc
+                            .metadata_notify_reconnects
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    attempted_listen = true;
+
+                    let channel = Self::metadata_notify_channel(volume_id);
+                    let weak_engine = engine.clone();
+                    let shutdown_for_task = shutdown.clone();
+                    let cancel_for_task = cancel.clone();
+                    let connect_result = {
+                        let fut = async move {
+                            let connect_result = tokio::select! {
+                                biased;
+                                _ = cancel_for_task.cancelled() => return Ok(()),
+                                r = tokio::time::timeout(
+                                    connect_timeout,
+                                    tokio_postgres::connect(&postgres_url, tokio_postgres::NoTls),
+                                ) => r,
+                            };
+                            let (client, mut connection) = connect_result
+                                .map_err(|_| {
+                                    Self::pg_timeout_error(
+                                        "metadata notify connect",
+                                        connect_timeout,
+                                    )
+                                })?
+                                .map_err(|e| {
+                                    MetaError::Storage(format!(
+                                        "postgres metadata notify connect failed: {}",
+                                        Self::format_pg_error(e)
+                                    ))
+                                })?;
+
+                            let listen_cmd = format!("LISTEN {channel}");
+                            let listen = client.batch_execute(&listen_cmd);
+                            tokio::pin!(listen);
+                            loop {
+                                let message = tokio::time::timeout(
+                                    Duration::from_millis(
+                                        Self::METADATA_NOTIFY_IDLE_POLL_INTERVAL_MS,
+                                    ),
+                                    std::future::poll_fn(|cx| connection.poll_message(cx)),
+                                );
+                                tokio::select! {
+                                    biased;
+                                    _ = cancel_for_task.cancelled() => return Ok(()),
+                                    r = &mut listen => {
+                                        r.map_err(|e| MetaError::Storage(format!(
+                                            "postgres LISTEN {channel} failed: {}",
+                                            Self::format_pg_error(e)
+                                        )))?;
+                                        break;
+                                    }
+                                    msg = message => {
+                                        match msg {
+                                            Ok(Some(Ok(tokio_postgres::AsyncMessage::Notice(_)))) => {}
+                                            Ok(Some(Ok(_))) => {}
+                                            Ok(Some(Err(err))) => {
+                                                return Err(MetaError::Storage(format!(
+                                                    "postgres metadata notify LISTEN poll failed: {}",
+                                                    Self::format_pg_error(err)
+                                                )));
+                                            }
+                                            Ok(None) => return Ok(()),
+                                            Err(_) => {}
+                                        }
+                                    }
+                                }
+                            }
+                            {
+                                let Some(engine_arc) = weak_engine.upgrade() else {
+                                    return Ok(());
+                                };
+                                let changed = engine_arc
+                                    .sync_metadata_with_source(MetadataSyncSource::Notify)?;
+                                if changed {
+                                    engine_arc.metadata_invalidation_notify.notify_one();
+                                }
+                            }
+
+                            while !shutdown_for_task.load(Ordering::Acquire) {
+                                let message = tokio::select! {
+                                    biased;
+                                    _ = cancel_for_task.cancelled() => break,
+                                    msg = tokio::time::timeout(
+                                        Duration::from_millis(Self::METADATA_NOTIFY_IDLE_POLL_INTERVAL_MS),
+                                        std::future::poll_fn(|cx| connection.poll_message(cx)),
+                                    ) => msg,
+                                };
+                                match message {
+                                    Ok(Some(Ok(tokio_postgres::AsyncMessage::Notification(notification)))) => {
+                                        if notification.channel() != channel {
+                                            continue;
+                                        }
+                                        let Some(engine_arc) = weak_engine.upgrade() else {
+                                            return Ok(());
+                                        };
+                                        engine_arc
+                                            .metadata_notify_received
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        let changed = engine_arc
+                                            .sync_metadata_with_source(MetadataSyncSource::Notify)?;
+                                        if changed {
+                                            engine_arc.metadata_invalidation_notify.notify_one();
+                                        }
+                                    }
+                                    Ok(Some(Ok(tokio_postgres::AsyncMessage::Notice(_)))) => {}
+                                    Ok(Some(Ok(_))) => {}
+                                    Ok(Some(Err(err))) => {
+                                        return Err(MetaError::Storage(format!(
+                                            "postgres metadata notify poll failed: {}",
+                                            Self::format_pg_error(err)
+                                        )));
+                                    }
+                                    Ok(None) => return Ok(()),
+                                    Err(_) => {
+                                        if weak_engine.upgrade().is_none() {
+                                            return Ok(());
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(())
+                        };
+
+                        rt.block_on(fut)
+                    };
+
+                    if shutdown.load(Ordering::Acquire) || cancel.is_cancelled() {
+                        break;
+                    }
+                    if connect_result.is_err() {
+                        std::thread::sleep(reconnect_delay);
+                        reconnect_delay = reconnect_delay
+                            .saturating_mul(2)
+                            .min(Duration::from_millis(
+                                Self::METADATA_NOTIFY_RECONNECT_MAX_DELAY_MS,
+                            ));
+                    } else {
+                        reconnect_delay =
+                            Duration::from_millis(Self::METADATA_NOTIFY_RECONNECT_MIN_DELAY_MS);
+                    }
+                }
+            })
+            .map_err(|e| {
+                MetaError::Storage(format!("failed to spawn pg-meta-notify thread: {e}"))
+            })
     }
 
     fn start_lock_notify_listener(
@@ -1980,7 +2210,15 @@ impl PgMetaEngine {
             poll_shutdown: poll_shutdown.clone(),
             poll_wakeup: poll_wakeup.clone(),
             lock_notify_cancel: CancellationToken::new(),
+            metadata_invalidation_notify: Arc::new(tokio::sync::Notify::new()),
+            metadata_notify_cancel: CancellationToken::new(),
+            metadata_notify_received: AtomicU64::new(0),
+            metadata_notify_reconnects: AtomicU64::new(0),
+            metadata_fallback_poll_discoveries: AtomicU64::new(0),
+            metadata_sync_errors: AtomicU64::new(0),
+            metadata_last_successful_sync_unix_ms: AtomicI64::new(0),
             poll_handle: Mutex::new(None),
+            metadata_notify_handle: Mutex::new(None),
             lock_notify_handle: Mutex::new(None),
             lock_renew_handle: Mutex::new(None),
         });
@@ -1995,6 +2233,7 @@ impl PgMetaEngine {
         let _ = engine.restore_pending_state_from_local_log();
         let _ = engine.prime_local_id_ranges(client_slot);
         if options.background_poll {
+            engine.ensure_metadata_notify_listener_started()?;
             let handle = Self::start_background_poll(
                 Arc::downgrade(&engine),
                 engine.poll_interval,
@@ -2090,7 +2329,7 @@ impl PgMetaEngine {
                         break;
                     };
                     let _ = engine.flush_due_pending();
-                    let _ = engine.sync_metadata();
+                    let _ = engine.sync_metadata_with_source(MetadataSyncSource::FallbackPoll);
                 }
             })
             .map_err(|error| {
@@ -2884,7 +3123,7 @@ impl PgMetaEngine {
                         }
                     }
 
-                    let channel = format!("studiofs_vol_{volume_id}");
+                    let channel = Self::metadata_notify_channel(volume_id);
                     let _ = tx
                         .execute(
                             "SELECT pg_notify($1, $2)",
@@ -2943,41 +3182,40 @@ impl PgMetaEngine {
         })
     }
 
-    fn pull_foreign_events_locked(&self, recent_flush: Option<&RecentFlush>) -> MetaResult<bool> {
-        let postgres_url = self.postgres_url.clone();
-        let volume_id = self.volume_id;
-        let client_id = self.client_id.clone();
-        let last_seq = self.local_version.load(Ordering::SeqCst);
-        let connect_timeout = self.connect_timeout;
-        let command_timeout = self.command_timeout;
-
-        let rows = self.run_async(async move {
-            Self::with_postgres_client_timeout(
-                postgres_url,
-                connect_timeout,
-                command_timeout,
-                "pull foreign events",
-                move |client| async move {
-                    let rows = client
-                        .query(
-                            r#"
-                            SELECT batch_version, seq_id, event_payload, client_id
-                            FROM event_log
-                            WHERE vol=$1 AND batch_version > $2
-                            ORDER BY batch_version ASC, seq_id ASC
-                            "#,
-                            &[&volume_id, &last_seq],
-                        )
-                        .await
-                        .map_err(|e| {
-                            MetaError::Storage(format!("postgres event_log select failed: {e}"))
-                        })?;
-                    Ok::<_, MetaError>(rows)
-                },
+    async fn query_foreign_event_rows<C>(
+        client: &C,
+        volume_id: i64,
+        last_seq: i64,
+    ) -> MetaResult<Vec<tokio_postgres::Row>>
+    where
+        C: tokio_postgres::GenericClient + Sync,
+    {
+        client
+            .query(
+                r#"
+                SELECT batch_version, seq_id, event_payload, client_id
+                FROM event_log
+                WHERE vol=$1 AND batch_version > $2
+                ORDER BY batch_version ASC, seq_id ASC
+                "#,
+                &[&volume_id, &last_seq],
             )
             .await
-        })?;
+            .map_err(|e| {
+                MetaError::Storage(format!(
+                    "postgres event_log select failed: {}",
+                    Self::format_pg_error(e)
+                ))
+            })
+    }
 
+    fn apply_foreign_event_rows_locked(
+        &self,
+        rows: Vec<tokio_postgres::Row>,
+        recent_flush: Option<&RecentFlush>,
+        last_seq: i64,
+        client_id: &str,
+    ) -> MetaResult<bool> {
         if rows.is_empty() {
             return Ok(false);
         }
@@ -2989,7 +3227,7 @@ impl PgMetaEngine {
         let mut idx = 0;
         while idx < rows.len() {
             let (batch_version, next_idx, batch_events, is_self_batch) =
-                Self::decode_foreign_batch(&rows, idx, client_id.as_str())?;
+                Self::decode_foreign_batch(&rows, idx, client_id)?;
             idx = next_idx;
 
             if is_self_batch {
@@ -3018,6 +3256,58 @@ impl PgMetaEngine {
             self.persist_namespace_version(max_namespace_version)?;
         }
         Ok(applied_any)
+    }
+
+    fn record_metadata_sync_result(&self, source: MetadataSyncSource, result: &MetaResult<bool>) {
+        match result {
+            Ok(changed) => {
+                self.metadata_last_successful_sync_unix_ms
+                    .store(Self::now_millis(), Ordering::Relaxed);
+                if source == MetadataSyncSource::FallbackPoll && *changed {
+                    self.metadata_fallback_poll_discoveries
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            Err(_) => {
+                self.metadata_sync_errors.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn sync_metadata_with_source(&self, source: MetadataSyncSource) -> MetaResult<bool> {
+        let result = (|| {
+            let _guard = self
+                .replication_lock
+                .lock()
+                .map_err(|_| MetaError::Storage("pg replication lock poisoned".to_string()))?;
+            self.pull_foreign_events_locked(None)
+        })();
+        self.record_metadata_sync_result(source, &result);
+        result
+    }
+
+    fn pull_foreign_events_locked(&self, recent_flush: Option<&RecentFlush>) -> MetaResult<bool> {
+        let postgres_url = self.postgres_url.clone();
+        let volume_id = self.volume_id;
+        let client_id = self.client_id.clone();
+        let last_seq = self.local_version.load(Ordering::SeqCst);
+        let connect_timeout = self.connect_timeout;
+        let command_timeout = self.command_timeout;
+
+        let rows = self.run_async(async move {
+            Self::with_postgres_client_timeout(
+                postgres_url,
+                connect_timeout,
+                command_timeout,
+                "pull foreign events",
+                move |client| async move {
+                    Self::query_foreign_event_rows(&client, volume_id, last_seq).await
+                },
+            )
+            .await
+        })?;
+
+        self.apply_foreign_event_rows_locked(rows, recent_flush, last_seq, client_id.as_str())
     }
 
     fn clear_pending_state(state: &mut PendingReplicationState) {
@@ -4213,16 +4503,37 @@ impl MetaReplication for PgMetaEngine {
     }
 
     fn sync_metadata(&self) -> MetaResult<()> {
-        let _guard = self
-            .replication_lock
-            .lock()
-            .map_err(|_| MetaError::Storage("pg replication lock poisoned".to_string()))?;
-        let _ = self.pull_foreign_events_locked(None)?;
+        let _ = self.sync_metadata_with_source(MetadataSyncSource::Manual)?;
+        Ok(())
+    }
+
+    fn sync_metadata_for_invalidation_poll(&self) -> MetaResult<()> {
+        let _ = self.sync_metadata_with_source(MetadataSyncSource::FallbackPoll)?;
         Ok(())
     }
 
     fn invalidation_sender_id(&self) -> Option<String> {
         Some(self.client_id.clone())
+    }
+
+    fn metadata_invalidation_notifier(&self) -> Option<Arc<tokio::sync::Notify>> {
+        Some(Arc::clone(&self.metadata_invalidation_notify))
+    }
+
+    fn metadata_invalidation_diagnostics(&self) -> MetadataInvalidationDiagnostics {
+        let last_successful_sync_unix_ms = self
+            .metadata_last_successful_sync_unix_ms
+            .load(Ordering::Relaxed);
+        MetadataInvalidationDiagnostics {
+            notifications_received: self.metadata_notify_received.load(Ordering::Relaxed),
+            listener_reconnects: self.metadata_notify_reconnects.load(Ordering::Relaxed),
+            fallback_poll_discoveries: self
+                .metadata_fallback_poll_discoveries
+                .load(Ordering::Relaxed),
+            sync_errors: self.metadata_sync_errors.load(Ordering::Relaxed),
+            last_successful_sync_unix_ms: (last_successful_sync_unix_ms > 0)
+                .then_some(last_successful_sync_unix_ms),
+        }
     }
 
     fn metadata_version_token(&self) -> Option<String> {
@@ -4314,6 +4625,7 @@ impl MetaReplication for PgMetaEngine {
         // awaits (e.g. `refresh_known_file_lock_lease_with_client`) are
         // interrupted immediately rather than waiting up to command_timeout.
         self.lock_notify_cancel.cancel();
+        self.metadata_notify_cancel.cancel();
         self.poll_shutdown.store(true, Ordering::Release);
         self.signal_poll_wakeup();
         let join_timeout = Self::default_prepare_for_close_join_timeout();
@@ -4321,6 +4633,11 @@ impl MetaReplication for PgMetaEngine {
             && let Some(handle) = guard.take()
         {
             Self::join_background_thread_with_timeout(handle, join_timeout, "poll");
+        }
+        if let Ok(mut guard) = self.metadata_notify_handle.lock()
+            && let Some(handle) = guard.take()
+        {
+            Self::join_background_thread_with_timeout(handle, join_timeout, "metadata-notify");
         }
         if let Ok(mut guard) = self.lock_notify_handle.lock()
             && let Some(handle) = guard.take()
@@ -4580,6 +4897,28 @@ mod tests {
             Ok::<(), MetaError>(())
         })
         .expect("drop file_lock_leases");
+    }
+
+    fn send_pg_notify(dsn: &str, channel: &str, payload: &str) {
+        run_async(async move {
+            let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+                .await
+                .map_err(|e| {
+                    MetaError::Storage(format!("postgres connect failed: {}", pg_err(e)))
+                })?;
+            let conn_task = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            client
+                .execute("SELECT pg_notify($1, $2)", &[&channel, &payload])
+                .await
+                .map_err(|e| {
+                    MetaError::Storage(format!("postgres pg_notify failed: {}", pg_err(e)))
+                })?;
+            conn_task.abort();
+            Ok::<(), MetaError>(())
+        })
+        .expect("send pg notify");
     }
 
     static FILE_LOCK_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
@@ -4943,7 +5282,15 @@ mod tests {
             poll_shutdown: Arc::new(AtomicBool::new(false)),
             poll_wakeup: Arc::new((Mutex::new(false), Condvar::new())),
             lock_notify_cancel: CancellationToken::new(),
+            metadata_invalidation_notify: Arc::new(tokio::sync::Notify::new()),
+            metadata_notify_cancel: CancellationToken::new(),
+            metadata_notify_received: AtomicU64::new(0),
+            metadata_notify_reconnects: AtomicU64::new(0),
+            metadata_fallback_poll_discoveries: AtomicU64::new(0),
+            metadata_sync_errors: AtomicU64::new(0),
+            metadata_last_successful_sync_unix_ms: AtomicI64::new(0),
             poll_handle: Mutex::new(None),
+            metadata_notify_handle: Mutex::new(None),
             lock_notify_handle: Mutex::new(None),
             lock_renew_handle: Mutex::new(None),
         };
@@ -7290,6 +7637,19 @@ mod tests {
     }
 
     #[test]
+    fn metadata_notify_channel_is_distinct_from_lock_notify_channel() {
+        assert_eq!(
+            PgMetaEngine::metadata_notify_channel(7),
+            "studiofs_meta_vol_7"
+        );
+        assert_ne!(
+            PgMetaEngine::metadata_notify_channel(7),
+            PgMetaEngine::lock_notify_channel(7),
+            "metadata invalidation and lock lease wakeups must stay on separate PG channels"
+        );
+    }
+
+    #[test]
     #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
     fn test_pg_flush_advances_checkpoint_version() {
         let Some(dsn) = pg_dsn() else {
@@ -7461,6 +7821,172 @@ mod tests {
         let entry = b.lookup(ROOT_INO, b"shared").expect("lookup on b");
         assert!(entry.ino > 0);
         assert_eq!(entry.kind, FileType::Directory);
+    }
+
+    #[test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+    fn test_pg_metadata_notify_listener_wakes_remote_sync_without_poll() {
+        let Some(dsn) = pg_dsn() else {
+            return;
+        };
+
+        let _poll_guard = set_test_env("STUDIOFS_PG_SYNC_POLL_SECS", "3600");
+
+        let dir_a = tempdir().expect("tempdir a");
+        let dir_b = tempdir().expect("tempdir b");
+        let db_a = dir_a.path().join("meta-a.redb");
+        let db_b = dir_b.path().join("meta-b.redb");
+        let volume = PgTestVolume::new(&dsn, "pg-metadata-notify-sync");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
+
+        let a = PgMetaEngine::open(&db_a).expect("open a");
+        let b = PgMetaEngine::open(&db_b).expect("open b");
+
+        let channel = PgMetaEngine::metadata_notify_channel(volume.volume_id);
+        let readiness_received = wait_until(Duration::from_secs(10), || {
+            if b.metadata_invalidation_diagnostics().notifications_received > 0 {
+                true
+            } else {
+                send_pg_notify(&dsn, &channel, "ready");
+                false
+            }
+        });
+        let readiness_diagnostics = b.metadata_invalidation_diagnostics();
+        let (readiness_listener_started, readiness_listener_finished) = b
+            .metadata_notify_handle
+            .lock()
+            .expect("metadata notify handle")
+            .as_ref()
+            .map(|handle| (true, handle.is_finished()))
+            .unwrap_or((false, false));
+        assert!(
+            readiness_received,
+            "metadata notify listener should receive a readiness notification before the metadata assertion; diagnostics={readiness_diagnostics:?}; listener_started={readiness_listener_started}; listener_finished={readiness_listener_finished}"
+        );
+
+        a.create_dir(ROOT_INO, b"notify-sync", 0, 0, 0o755)
+            .expect("create dir on a");
+        a.flush_metadata().expect("flush a");
+
+        let visible = wait_until(Duration::from_secs(10), || {
+            b.lookup(ROOT_INO, b"notify-sync").is_ok()
+        });
+        let diagnostics = b.metadata_invalidation_diagnostics();
+        let (listener_started, listener_finished) = b
+            .metadata_notify_handle
+            .lock()
+            .expect("metadata notify handle")
+            .as_ref()
+            .map(|handle| (true, handle.is_finished()))
+            .unwrap_or((false, false));
+        assert!(
+            visible,
+            "metadata NOTIFY should wake the remote peer without waiting for the long fallback poll; diagnostics={diagnostics:?}; listener_started={listener_started}; listener_finished={listener_finished}"
+        );
+        assert!(
+            diagnostics.notifications_received > 0,
+            "peer should count the metadata notification that woke sync"
+        );
+        assert!(
+            diagnostics.last_successful_sync_unix_ms.is_some(),
+            "peer should record the successful NOTIFY-driven metadata sync"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+    fn test_pg_metadata_notify_listener_start_syncs_missed_change() {
+        let Some(dsn) = pg_dsn() else {
+            return;
+        };
+
+        let _poll_guard = set_test_env("STUDIOFS_PG_SYNC_POLL_SECS", "3600");
+
+        let dir_a = tempdir().expect("tempdir a");
+        let dir_b = tempdir().expect("tempdir b");
+        let db_a = dir_a.path().join("meta-a.redb");
+        let db_b = dir_b.path().join("meta-b.redb");
+        let volume = PgTestVolume::new(&dsn, "pg-metadata-notify-missed");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
+
+        let a = PgMetaEngine::open(&db_a).expect("open a");
+        let b = PgMetaEngine::open_with_options(
+            &db_b,
+            PgOpenOptions {
+                background_poll: false,
+            },
+        )
+        .expect("open b without listener");
+
+        a.create_dir(ROOT_INO, b"missed-notify", 0, 0, 0o755)
+            .expect("create dir on a");
+        a.flush_metadata().expect("flush a");
+        assert!(
+            b.lookup(ROOT_INO, b"missed-notify").is_err(),
+            "peer with listener disabled should not see the change before a sync"
+        );
+
+        b.ensure_metadata_notify_listener_started()
+            .expect("start metadata notify listener");
+
+        assert!(
+            wait_until(Duration::from_secs(10), || b
+                .lookup(ROOT_INO, b"missed-notify")
+                .is_ok()),
+            "listener startup should force an immediate sync for missed notifications"
+        );
+        assert!(
+            b.metadata_invalidation_diagnostics()
+                .last_successful_sync_unix_ms
+                .is_some(),
+            "forced reconnect/start sync should update metadata sync diagnostics"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+    fn test_pg_metadata_notify_listener_releases_engine_after_drop() {
+        let Some(dsn) = pg_dsn() else {
+            return;
+        };
+
+        let _poll_guard = set_test_env("STUDIOFS_PG_SYNC_POLL_SECS", "3600");
+
+        let dir = tempdir().expect("tempdir");
+        let db = dir.path().join("meta.redb");
+        let volume = PgTestVolume::new(&dsn, "pg-metadata-notify-drop");
+        let info = volume.format_info();
+        seed_local(&db, &info);
+
+        let engine = PgMetaEngine::open(&db).expect("open engine");
+        let channel = PgMetaEngine::metadata_notify_channel(volume.volume_id);
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                if engine
+                    .metadata_invalidation_diagnostics()
+                    .notifications_received
+                    > 0
+                {
+                    true
+                } else {
+                    send_pg_notify(&dsn, &channel, "ready");
+                    false
+                }
+            }),
+            "metadata notify listener should receive a readiness notification"
+        );
+
+        let weak = Arc::downgrade(&engine);
+        drop(engine);
+
+        assert!(
+            wait_until(Duration::from_secs(3), || weak.upgrade().is_none()),
+            "metadata notify listener must not keep PgMetaEngine alive after the last external Arc drops"
+        );
     }
 
     #[test]

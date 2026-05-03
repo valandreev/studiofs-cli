@@ -1,4 +1,5 @@
 use futures::StreamExt;
+use std::sync::Arc;
 use tokio::time::MissedTickBehavior;
 
 use super::*;
@@ -8,6 +9,28 @@ use crate::{JanitorMeta, VfsMeta};
 struct MetadataTraversalSnapshot {
     inodes: HashSet<Ino>,
     payloads: HashMap<Ino, Vec<u64>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MetadataInvalidationWakeReason {
+    BackendNotify,
+    FallbackPoll,
+}
+
+fn should_run_invalidation_poll_sync(
+    wake_reason: MetadataInvalidationWakeReason,
+    last_namespace_token: &Option<String>,
+    last_metadata_token: &Option<String>,
+    current_namespace_token: &Option<String>,
+    current_metadata_token: &Option<String>,
+) -> bool {
+    match wake_reason {
+        MetadataInvalidationWakeReason::BackendNotify => {
+            last_namespace_token == current_namespace_token
+                && last_metadata_token == current_metadata_token
+        }
+        MetadataInvalidationWakeReason::FallbackPoll => true,
+    }
 }
 
 impl StudioVfs {
@@ -365,8 +388,17 @@ impl StudioVfs {
         removed
     }
 
+    async fn wait_for_metadata_invalidation_notify(notifier: Option<&Arc<tokio::sync::Notify>>) {
+        if let Some(notifier) = notifier {
+            notifier.notified().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    }
+
     pub(super) async fn background_metadata_invalidation(self: Arc<Self>, interval: Duration) {
         let meta = self.sync_meta();
+        let metadata_notifier = meta.metadata_invalidation_notifier();
         let mut last_namespace_token = meta.namespace_version_token();
         let mut last_metadata_token = meta.metadata_version_token();
         let mut last_snapshot: HashSet<Ino> = HashSet::new();
@@ -385,18 +417,31 @@ impl StudioVfs {
         }
 
         loop {
-            tokio::select! {
+            let wake_reason = tokio::select! {
                 _ = self.state.shutdown.shutdown_notify.notified() => break,
-                _ = tokio::time::sleep(interval) => {}
-            }
+                _ = Self::wait_for_metadata_invalidation_notify(metadata_notifier.as_ref()) => {
+                    MetadataInvalidationWakeReason::BackendNotify
+                },
+                _ = tokio::time::sleep(interval) => MetadataInvalidationWakeReason::FallbackPoll,
+            };
             if self.shutdown_requested() {
                 break;
             }
             let meta = self.meta.clone();
+            let previous_namespace_token = last_namespace_token.clone();
+            let previous_metadata_token = last_metadata_token.clone();
             let sync = run_meta(meta.clone(), move |engine: Arc<dyn VfsMeta>| {
                 let before_namespace = engine.namespace_version_token();
                 let before_metadata = engine.metadata_version_token();
-                engine.sync_metadata()?;
+                if should_run_invalidation_poll_sync(
+                    wake_reason,
+                    &previous_namespace_token,
+                    &previous_metadata_token,
+                    &before_namespace,
+                    &before_metadata,
+                ) {
+                    engine.sync_metadata_for_invalidation_poll()?;
+                }
                 let after_namespace = engine.namespace_version_token();
                 let after_metadata = engine.metadata_version_token();
                 Ok((
@@ -1214,5 +1259,47 @@ impl StudioVfs {
                 warn!(cycle, error = %e, "janitor cycle failed to release PG lock");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn token(value: &str) -> Option<String> {
+        Some(value.to_string())
+    }
+
+    #[test]
+    fn notify_wake_skips_poll_sync_when_backend_already_advanced_tokens() {
+        assert!(!should_run_invalidation_poll_sync(
+            MetadataInvalidationWakeReason::BackendNotify,
+            &token("1"),
+            &token("1"),
+            &token("2"),
+            &token("1"),
+        ));
+    }
+
+    #[test]
+    fn notify_wake_still_syncs_when_tokens_did_not_advance() {
+        assert!(should_run_invalidation_poll_sync(
+            MetadataInvalidationWakeReason::BackendNotify,
+            &token("1"),
+            &token("1"),
+            &token("1"),
+            &token("1"),
+        ));
+    }
+
+    #[test]
+    fn fallback_poll_syncs_even_when_local_tokens_changed() {
+        assert!(should_run_invalidation_poll_sync(
+            MetadataInvalidationWakeReason::FallbackPoll,
+            &token("1"),
+            &token("1"),
+            &token("2"),
+            &token("1"),
+        ));
     }
 }

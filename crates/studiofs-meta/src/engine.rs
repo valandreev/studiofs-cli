@@ -5,6 +5,7 @@
 
 use crate::types::*;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 // =============================================================================
 // Errors
@@ -144,6 +145,21 @@ pub struct MetadataReplicationBacklog {
     pub pending_ops: u32,
     /// Number of operations currently being flushed in the background.
     pub inflight_ops: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Best-effort counters for push-plus-poll metadata invalidation.
+pub struct MetadataInvalidationDiagnostics {
+    /// Number of PostgreSQL metadata NOTIFY messages received by this client.
+    pub notifications_received: u64,
+    /// Number of metadata listener reconnect attempts after the first listen.
+    pub listener_reconnects: u64,
+    /// Number of periodic fallback polls that discovered remote metadata.
+    pub fallback_poll_discoveries: u64,
+    /// Number of metadata sync attempts that returned an error.
+    pub sync_errors: u64,
+    /// Unix timestamp in milliseconds for the last successful metadata sync.
+    pub last_successful_sync_unix_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -751,8 +767,23 @@ pub trait MetaReplication: Send + Sync {
     /// Force metadata synchronization from remote source (if applicable).
     fn sync_metadata(&self) -> MetaResult<()>;
 
+    /// Force metadata synchronization from the periodic invalidation fallback poll.
+    fn sync_metadata_for_invalidation_poll(&self) -> MetaResult<()> {
+        self.sync_metadata()
+    }
+
     /// Stable identifier used for invalidation self-echo suppression.
     fn invalidation_sender_id(&self) -> Option<String>;
+
+    /// Optional wakeup primitive for push-driven metadata invalidation.
+    fn metadata_invalidation_notifier(&self) -> Option<Arc<tokio::sync::Notify>> {
+        None
+    }
+
+    /// Best-effort diagnostics for push-plus-poll metadata invalidation.
+    fn metadata_invalidation_diagnostics(&self) -> MetadataInvalidationDiagnostics {
+        MetadataInvalidationDiagnostics::default()
+    }
 
     /// Request a near-immediate flush of pending metadata mutations.
     fn request_eager_flush(&self);
