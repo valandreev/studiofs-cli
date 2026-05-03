@@ -221,11 +221,12 @@ must call `deliver_next` to apply the head ready batch to a target client. A
 delayed head batch blocks later batches for that client so simulated delivery
 preserves strict version order. Metadata outages, client disconnects, delayed
 batches, released delays, and duplicate deliveries are explicit state
-transitions and trace records, which keeps counterexample replay independent of
-wall-clock timing or background polling. Long-running searches can periodically
-call `drain_trace` after exporting records; pruning applied batches requires a
-future runtime retention contract that knows every simulated client's replay
-horizon.
+transitions and trace records. Delay, release, and duplicate-injection helpers
+reject unknown batch IDs instead of mutating scheduler state. This keeps
+counterexample replay independent of wall-clock timing or background polling.
+Long-running searches can periodically call `drain_trace` after exporting
+records; pruning applied batches requires a future runtime retention contract
+that knows every simulated client's replay horizon.
 
 ## MVP Scenario Set
 

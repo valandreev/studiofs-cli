@@ -193,3 +193,33 @@ fn trace_can_be_drained_between_long_simulation_windows() {
             .any(|record| record.kind == MetadataTraceKind::Delivered)
     );
 }
+
+#[test]
+fn unknown_batch_ids_are_rejected_without_mutating_delivery_state() {
+    let mut bus = MetadataBus::new();
+    bus.connect_client("writer");
+    bus.connect_client("reader");
+    let publication = bus.enqueue_local(batch("writer", "known.txt"));
+    bus.drain_trace();
+
+    assert!(!bus.delay_for("reader", 999));
+    assert!(!bus.release_delay("reader", 999));
+    assert!(!bus.inject_duplicate("reader", 999));
+    assert!(bus.trace().is_empty());
+    assert_eq!(
+        bus.pending_for("reader")
+            .iter()
+            .map(|batch| batch.batch_id)
+            .collect::<Vec<_>>(),
+        vec![publication.batch_id]
+    );
+
+    assert_eq!(
+        bus.deliver_next("reader"),
+        Some(DeliveryOutcome::Applied {
+            batch_id: publication.batch_id,
+            version: 1,
+            source_client: "writer".to_string()
+        })
+    );
+}

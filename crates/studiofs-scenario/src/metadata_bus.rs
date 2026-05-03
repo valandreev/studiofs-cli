@@ -241,7 +241,10 @@ impl MetadataBus {
         })
     }
 
-    pub fn delay_for(&mut self, client: &str, batch_id: u64) {
+    pub fn delay_for(&mut self, client: &str, batch_id: u64) -> bool {
+        if !self.batches.contains_key(&batch_id) {
+            return false;
+        }
         self.delayed
             .entry(client.to_string())
             .or_default()
@@ -253,9 +256,13 @@ impl MetadataBus {
                 Some(client),
             ));
         }
+        true
     }
 
-    pub fn release_delay(&mut self, client: &str, batch_id: u64) {
+    pub fn release_delay(&mut self, client: &str, batch_id: u64) -> bool {
+        if !self.batches.contains_key(&batch_id) {
+            return false;
+        }
         if let Some(delayed) = self.delayed.get_mut(client) {
             delayed.remove(&batch_id);
         }
@@ -266,13 +273,18 @@ impl MetadataBus {
                 Some(client),
             ));
         }
+        true
     }
 
-    pub fn inject_duplicate(&mut self, client: &str, batch_id: u64) {
+    pub fn inject_duplicate(&mut self, client: &str, batch_id: u64) -> bool {
+        if !self.batches.contains_key(&batch_id) {
+            return false;
+        }
         self.client_queues
             .entry(client.to_string())
             .or_default()
             .push_back(batch_id);
+        true
     }
 
     pub fn applied_versions(&self, client: &str) -> Vec<u64> {
