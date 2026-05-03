@@ -173,12 +173,9 @@ impl MetadataBus {
         batch.batch_id = self.next_batch_id;
         batch.version = self.next_version;
 
-        for client in self.client_queues.keys().cloned().collect::<Vec<_>>() {
-            if client != batch.source_client {
-                self.client_queues
-                    .entry(client)
-                    .or_default()
-                    .push_back(batch.batch_id);
+        for (client, queue) in &mut self.client_queues {
+            if client != &batch.source_client {
+                queue.push_back(batch.batch_id);
             }
         }
         self.batches.insert(batch.batch_id, batch.clone());
@@ -204,9 +201,8 @@ impl MetadataBus {
         }
 
         let batch_id = self.next_ready_batch_id(client)?;
-        let queue = self.client_queues.entry(client.to_string()).or_default();
-        if let Some(position) = queue.iter().position(|candidate| *candidate == batch_id) {
-            queue.remove(position);
+        if let Some(queue) = self.client_queues.get_mut(client) {
+            queue.pop_front();
         }
 
         let batch = self.batches.get(&batch_id).cloned()?;
