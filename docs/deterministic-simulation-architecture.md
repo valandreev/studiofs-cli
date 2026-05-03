@@ -228,6 +228,16 @@ Long-running searches can periodically call `drain_trace` after exporting
 records; pruning applied batches requires a future runtime retention contract
 that knows every simulated client's replay horizon.
 
+The initial SFS-334 slice adds `studiofs-scenario::object_store` as the matching
+passive payload service. Tests stage local-only payload facts per client, create
+upload tickets, and explicitly drive upload completion, injected failures,
+retry ticks, object-store outage/recovery, and remote reads. A completed upload
+only creates remote object availability; it does not mark the object as
+metadata-published or peer-visible. The module exports object lifecycle facts in
+the shared invariant schema so active local payloads, pending uploads, and
+deleted remote objects can be checked without simulating S3, OpenDAL, sockets,
+or wall-clock timing.
+
 ## MVP Scenario Set
 
 The first runtime should prove the layer with small scenarios:
