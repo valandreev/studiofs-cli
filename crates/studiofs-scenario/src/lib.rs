@@ -1,6 +1,7 @@
 //! Shared logical scenario operation model for E2E artifacts and simulation.
 
 pub mod invariant;
+pub mod metadata_bus;
 
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};

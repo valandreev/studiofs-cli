@@ -70,7 +70,7 @@ instead of one monolithic simulator.
 | operation model | `studiofs-scenario` serializable logical operations shared by Real E2E and simulation: create, mkdir, write, append, truncate, rename, unlink, rmdir, read, stat, readdir, flush, fsync, close/release, crash, restart, outage, recovery, wait, and barrier | SFS-331 |
 | logical state snapshot | `studiofs-scenario::invariant::LogicalSnapshot` schema version 1: clients, entries, logical IDs when known, file size/checksum, symlink targets, object references, expected-absent paths, durable write expectations, object lifecycle facts, hard-link mode, and optional replay-idempotence result | SFS-332 |
 | invariant validation | `studiofs-scenario::invariant::validate_logical_invariants` checks convergence, no lost durable writes, no unexpected resurrection, valid tree structure, canonical path ownership, object reachability, and idempotent replay over logical snapshots | SFS-332 |
-| simulated metadata bus | Scheduler-driven metadata replication with ordered delivery, outage, reconnect, delayed delivery, duplicate delivery, and traceable batch/version behavior | SFS-333 |
+| simulated metadata bus | `studiofs-scenario::metadata_bus::MetadataBus` models local enqueue, ordered batch/version delivery, outage, reconnect, delayed delivery, duplicate delivery, idempotent apply, and traceable scheduler-controlled delivery points | SFS-333 |
 | simulated object store | Scheduler-driven object presence, local-only payloads, delayed upload completion, failed uploads, retries, outage/recovery, remote read failure, and reachability export | SFS-334 |
 | virtual time | Logical ticks and deadlines that replace wall-clock sleeps and make outage, retry, upload, and publication timing reproducible | SFS-335 |
 | deterministic scheduler | Seeded event selection, run-until-idle, step-by-step execution, invariant stop points, and trace emission for each selected interleaving | SFS-335 |
@@ -210,6 +210,23 @@ crates/studiofs-sim/
 If creating a new crate is too much for the first implementation slice, the same
 module boundaries can start under a test-support crate or an internal module.
 The boundaries matter more than the initial package name.
+
+The initial SFS-333 slice starts in `studiofs-scenario::metadata_bus` so later
+simulation runtime code can reuse the same serializable batch, event, and trace
+types without depending on real PostgreSQL. The bus is intentionally passive:
+logical clients should be connected before scenario events are enqueued, and
+enqueueing a local metadata batch only records the ordered batch and queues it
+for already-known foreign clients. Tests or a future deterministic scheduler
+must call `deliver_next` to apply the head ready batch to a target client. A
+delayed head batch blocks later batches for that client so simulated delivery
+preserves strict version order. Metadata outages, client disconnects, delayed
+batches, released delays, and duplicate deliveries are explicit state
+transitions and trace records. Delay, release, and duplicate-injection helpers
+reject unknown batch IDs instead of mutating scheduler state. This keeps
+counterexample replay independent of wall-clock timing or background polling.
+Long-running searches can periodically call `drain_trace` after exporting
+records; pruning applied batches requires a future runtime retention contract
+that knows every simulated client's replay horizon.
 
 ## MVP Scenario Set
 
