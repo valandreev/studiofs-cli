@@ -993,6 +993,8 @@ impl DirAccessTracker {
             let Some(successors) = sequence.get(position.member_idx.saturating_add(1)..) else {
                 return Vec::new();
             };
+            // `accessed` contains prior foreground reads from this immutable
+            // readdir snapshot; avoid warming files the caller already touched.
             let to_prefetch: Vec<Ino> = successors
                 .iter()
                 .copied()
@@ -1013,6 +1015,8 @@ impl DirAccessTracker {
         }
 
         // Threshold met: return all un-prefetched children.
+        // `children` is the original readdir snapshot, so accessed children
+        // remain present here even after foreground reads.
         let to_prefetch: Vec<Ino> = state
             .children
             .iter()
