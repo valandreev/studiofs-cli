@@ -1,6 +1,7 @@
 use studiofs_scenario::seed_corpus::{
-    SimulationCorpusKind, SimulationCorpusOptions, SimulationScenarioGroup, corpus_plan,
-    read_simulation_counterexample, replay_simulation_counterexample, run_simulation_corpus,
+    SIMULATION_COUNTEREXAMPLE_SCHEMA_VERSION, SimulationCorpusError, SimulationCorpusKind,
+    SimulationCorpusOptions, SimulationScenarioGroup, corpus_plan, read_simulation_counterexample,
+    replay_simulation_counterexample, run_simulation_corpus,
 };
 
 #[test]
@@ -132,6 +133,10 @@ fn namespace_corpus_counterexample_replays_exactly_from_artifact_path() {
 
     let artifact =
         read_simulation_counterexample(artifact_path).expect("counterexample artifact can be read");
+    assert_eq!(
+        artifact.schema_version,
+        SIMULATION_COUNTEREXAMPLE_SCHEMA_VERSION
+    );
     assert_eq!(artifact.group, SimulationScenarioGroup::NamespaceCollisions);
     assert_eq!(
         artifact.sub_group.as_deref(),
@@ -151,6 +156,38 @@ fn namespace_corpus_counterexample_replays_exactly_from_artifact_path() {
     assert_eq!(replay.group, SimulationScenarioGroup::NamespaceCollisions);
     assert_eq!(replay.seed, 13);
     assert_eq!(replay.violated_invariant, "injected_counterexample");
+}
+
+#[test]
+fn legacy_v1_simulation_counterexample_artifact_is_rejected_by_schema_before_full_parse() {
+    let artifact_root = unique_temp_dir("sfs359-v1-artifact-rejection");
+    std::fs::create_dir_all(&artifact_root).expect("create artifact root");
+    let artifact_path = artifact_root.join("legacy-v1.json");
+    std::fs::write(
+        &artifact_path,
+        serde_json::json!({
+            "schema_version": 1,
+            "scenario": "sfs340-simulation-corpus",
+            "corpus": "fast",
+            "group": "namespace_collisions",
+            "seed": 13,
+            "failure": {
+                "violated_invariant": "injected_counterexample",
+                "message": "legacy seed-only artifact"
+            },
+            "replay_command": "cargo run -p studiofs-scenario --bin studiofs-scenario -- run-corpus --corpus fast --scenario-group namespace-collisions --seed 13"
+        })
+        .to_string(),
+    )
+    .expect("write legacy artifact");
+
+    let error =
+        read_simulation_counterexample(&artifact_path).expect_err("legacy v1 is unsupported");
+
+    assert!(matches!(
+        error,
+        SimulationCorpusError::UnsupportedSchemaVersion(1)
+    ));
 }
 
 #[test]

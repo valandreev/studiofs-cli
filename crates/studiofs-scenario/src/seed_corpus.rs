@@ -21,7 +21,7 @@ use crate::object_store::{
 use crate::scheduler::{SchedulerEventType, SchedulerTraceRecord};
 use crate::{OperationOutcome, ScenarioOperation, ScenarioOperationRecord};
 
-pub const SIMULATION_COUNTEREXAMPLE_SCHEMA_VERSION: u32 = 1;
+pub const SIMULATION_COUNTEREXAMPLE_SCHEMA_VERSION: u32 = 2;
 const FAST_SEEDS: &[u64] = &[1, 2, 3];
 const DEEP_SEEDS: &[u64] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
 const CORPUS_SCENARIO: &str = "sfs340-simulation-corpus";
@@ -622,13 +622,18 @@ pub fn read_simulation_counterexample(
 ) -> Result<SimulationCounterexampleArtifact, SimulationCorpusError> {
     let file = fs::File::open(path)?;
     let reader = BufReader::new(file);
-    let artifact: SimulationCounterexampleArtifact = serde_json::from_reader(reader)?;
-    if artifact.schema_version != SIMULATION_COUNTEREXAMPLE_SCHEMA_VERSION {
+    let artifact_json: Value = serde_json::from_reader(reader)?;
+    let schema_version = artifact_json
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .and_then(|version| u32::try_from(version).ok())
+        .ok_or(SimulationCorpusError::UnsupportedSchemaVersion(0))?;
+    if schema_version != SIMULATION_COUNTEREXAMPLE_SCHEMA_VERSION {
         return Err(SimulationCorpusError::UnsupportedSchemaVersion(
-            artifact.schema_version,
+            schema_version,
         ));
     }
-    Ok(artifact)
+    serde_json::from_value(artifact_json).map_err(SimulationCorpusError::Json)
 }
 
 pub fn replay_simulation_counterexample(
