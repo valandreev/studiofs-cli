@@ -275,13 +275,14 @@ counts, scheduler-selected event traces, and replayable failure records. Each
 family schedules competing logical operations through `SimulationScheduler` and
 mutates simulated client state only when the scheduler selects that operation.
 The first suite covers rename/rename, rename/unlink, unlink/append, overwrite
-while a stale reader keeps the previous committed view, and mkdir/rmdir racing
-with create inside the same directory. Stable checkpoints run after the modeled
-conflict-resolution phase so the shared invariant validator checks convergence,
-canonical path ownership, tree structure, resurrection, durable writes, and
-object reachability. Additional modeled families are reserved for metadata
-delivery racing with local mutation and publish racing with foreign apply as the
-simulator's conflict-apply rules become richer.
+while a stale reader keeps the previous committed view, mkdir/rmdir racing with
+create inside the same directory, metadata delivery racing with a local
+namespace mutation, and publish racing with foreign apply. Stable checkpoints
+run after the modeled conflict-resolution phase so the shared invariant
+validator checks convergence, canonical path ownership, tree structure,
+resurrection, durable writes, and object reachability. If a foreign apply is
+selected before the corresponding publish creates a metadata batch, the rejected
+apply is still recorded as part of the replayable interleaving trace.
 
 ## MVP Scenario Set
 

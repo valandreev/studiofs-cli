@@ -68,8 +68,59 @@ fn scheduler_selects_real_conflicting_operations_in_both_orders() {
     assert!(
         traces
             .iter()
-            .all(|trace| trace.iter().any(|kind| *kind == "scheduler_selected"))
+            .all(|trace| trace.contains(&"scheduler_selected"))
     );
+}
+
+#[test]
+fn metadata_and_publish_families_are_scheduler_driven_races() {
+    let report = run_collision_suite(CollisionSuiteConfig {
+        scenario: "sfs337-metadata-publish-races".to_string(),
+        seeds: (1..=8).collect(),
+        families: vec![
+            CollisionFamily::MetadataDeliveryVsLocalMutation,
+            CollisionFamily::PublishVsForeignApply,
+        ],
+    });
+
+    assert!(report.passed, "{:#?}", report.failures);
+    let traces = report
+        .family_reports
+        .iter()
+        .flat_map(|family| &family.seed_reports)
+        .map(|seed| {
+            seed.trace
+                .iter()
+                .map(|record| record.kind.as_str())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    assert!(
+        traces
+            .iter()
+            .all(|trace| trace.contains(&"scheduler_selected"))
+    );
+    assert!(traces.iter().any(|trace| ordered_pair(
+        trace,
+        "alpha_publish_metadata",
+        "beta_local_rename"
+    )));
+    assert!(traces.iter().any(|trace| ordered_pair(
+        trace,
+        "beta_local_rename",
+        "alpha_publish_metadata"
+    )));
+    assert!(traces.iter().any(|trace| ordered_pair(
+        trace,
+        "alpha_publish_v2",
+        "beta_foreign_apply"
+    )));
+    assert!(traces.iter().any(|trace| ordered_pair(
+        trace,
+        "beta_foreign_apply_rejected",
+        "alpha_publish_v2"
+    )));
 }
 
 #[test]

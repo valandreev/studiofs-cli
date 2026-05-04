@@ -206,12 +206,28 @@ impl FamilyHarness {
         });
     }
 
+    fn record_result(
+        &mut self,
+        accepted: bool,
+        accepted_kind: &str,
+        rejected_kind: &str,
+        client: &str,
+        path: &str,
+    ) {
+        let kind = if accepted {
+            accepted_kind
+        } else {
+            rejected_kind
+        };
+        self.push(kind, Some(client), Some(path));
+    }
+
     fn run_race(
         &mut self,
         first: PlannedCollisionOp,
         second: PlannedCollisionOp,
     ) -> Vec<PlannedCollisionOp> {
-        let operations = if self.seed % 2 == 0 {
+        let operations = if self.seed.is_multiple_of(2) {
             [second, first]
         } else {
             [first, second]
@@ -247,109 +263,179 @@ impl FamilyHarness {
     fn apply_planned(&mut self, operation: PlannedCollisionOp) {
         match operation {
             PlannedCollisionOp::AlphaRenameToAlphaWin => {
-                if self
+                let accepted = self
                     .runtime
                     .rename("alpha", "shared.txt", "alpha_win.txt")
-                    .is_ok()
-                {
-                    self.push("alpha_rename", Some("alpha"), Some("alpha_win.txt"));
-                } else {
-                    self.push("alpha_rename_rejected", Some("alpha"), Some("shared.txt"));
-                }
+                    .is_ok();
+                self.record_result(
+                    accepted,
+                    "alpha_rename",
+                    "alpha_rename_rejected",
+                    "alpha",
+                    if accepted {
+                        "alpha_win.txt"
+                    } else {
+                        "shared.txt"
+                    },
+                );
             }
             PlannedCollisionOp::BetaRenameToBetaWin => {
-                if self
+                let accepted = self
                     .runtime
                     .rename("beta", "shared.txt", "beta_win.txt")
-                    .is_ok()
-                {
-                    self.push("beta_rename", Some("beta"), Some("beta_win.txt"));
-                } else {
-                    self.push("beta_rename_rejected", Some("beta"), Some("shared.txt"));
-                }
+                    .is_ok();
+                self.record_result(
+                    accepted,
+                    "beta_rename",
+                    "beta_rename_rejected",
+                    "beta",
+                    if accepted {
+                        "beta_win.txt"
+                    } else {
+                        "shared.txt"
+                    },
+                );
             }
             PlannedCollisionOp::AlphaRenameToKept => {
-                if self
+                let accepted = self
                     .runtime
                     .rename("alpha", "shared.txt", "kept.txt")
-                    .is_ok()
-                {
-                    self.push("alpha_rename", Some("alpha"), Some("kept.txt"));
-                } else {
-                    self.push("alpha_rename_rejected", Some("alpha"), Some("shared.txt"));
-                }
+                    .is_ok();
+                self.record_result(
+                    accepted,
+                    "alpha_rename",
+                    "alpha_rename_rejected",
+                    "alpha",
+                    if accepted { "kept.txt" } else { "shared.txt" },
+                );
             }
             PlannedCollisionOp::AlphaUnlink => {
-                if self.runtime.unlink("alpha", "shared.txt").is_ok() {
-                    self.push("alpha_unlink", Some("alpha"), Some("shared.txt"));
-                } else {
-                    self.push("alpha_unlink_rejected", Some("alpha"), Some("shared.txt"));
-                }
+                let accepted = self.runtime.unlink("alpha", "shared.txt").is_ok();
+                self.record_result(
+                    accepted,
+                    "alpha_unlink",
+                    "alpha_unlink_rejected",
+                    "alpha",
+                    "shared.txt",
+                );
             }
             PlannedCollisionOp::BetaUnlink => {
-                if self.runtime.unlink("beta", "shared.txt").is_ok() {
-                    self.push("beta_unlink", Some("beta"), Some("shared.txt"));
-                } else {
-                    self.push("beta_unlink_rejected", Some("beta"), Some("shared.txt"));
-                }
+                let accepted = self.runtime.unlink("beta", "shared.txt").is_ok();
+                self.record_result(
+                    accepted,
+                    "beta_unlink",
+                    "beta_unlink_rejected",
+                    "beta",
+                    "shared.txt",
+                );
             }
             PlannedCollisionOp::BetaAppend => {
-                if self
+                let accepted = self
                     .runtime
                     .append_file("beta", "shared.txt", 1, "checksum-appended")
-                    .is_ok()
-                {
-                    self.push("beta_append", Some("beta"), Some("shared.txt"));
-                } else {
-                    self.push("beta_append_rejected", Some("beta"), Some("shared.txt"));
-                }
+                    .is_ok();
+                self.record_result(
+                    accepted,
+                    "beta_append",
+                    "beta_append_rejected",
+                    "beta",
+                    "shared.txt",
+                );
             }
             PlannedCollisionOp::AlphaOverwrite => {
-                if self
+                let accepted = self
                     .runtime
                     .write_file("alpha", "versioned.txt", 4, "checksum-v2")
-                    .is_ok()
-                {
-                    self.push("alpha_overwrite", Some("alpha"), Some("versioned.txt"));
-                } else {
-                    self.push(
-                        "alpha_overwrite_rejected",
-                        Some("alpha"),
-                        Some("versioned.txt"),
-                    );
-                }
+                    .is_ok();
+                self.record_result(
+                    accepted,
+                    "alpha_overwrite",
+                    "alpha_overwrite_rejected",
+                    "alpha",
+                    "versioned.txt",
+                );
             }
             PlannedCollisionOp::BetaStaleRead => {
-                if self.runtime.read_file("beta", "versioned.txt").is_ok() {
-                    self.push("beta_stale_read", Some("beta"), Some("versioned.txt"));
-                } else {
-                    self.push(
-                        "beta_stale_read_rejected",
-                        Some("beta"),
-                        Some("versioned.txt"),
-                    );
-                }
+                let accepted = self.runtime.read_file("beta", "versioned.txt").is_ok();
+                self.record_result(
+                    accepted,
+                    "beta_stale_read",
+                    "beta_stale_read_rejected",
+                    "beta",
+                    "versioned.txt",
+                );
             }
             PlannedCollisionOp::AlphaRmdir => {
-                if self.runtime.rmdir("alpha", "dir").is_ok() {
-                    self.push("alpha_rmdir", Some("alpha"), Some("dir"));
-                } else {
-                    self.push("alpha_rmdir_rejected", Some("alpha"), Some("dir"));
-                }
+                let accepted = self.runtime.rmdir("alpha", "dir").is_ok();
+                self.record_result(
+                    accepted,
+                    "alpha_rmdir",
+                    "alpha_rmdir_rejected",
+                    "alpha",
+                    "dir",
+                );
             }
             PlannedCollisionOp::BetaCreateInside => {
-                if self.runtime.create_file("beta", "dir/child.txt").is_ok() {
+                let accepted = self.runtime.create_file("beta", "dir/child.txt").is_ok();
+                if accepted {
                     self.runtime
                         .write_file("beta", "dir/child.txt", 1, "checksum-child")
                         .unwrap();
-                    self.push("beta_create_inside", Some("beta"), Some("dir/child.txt"));
-                } else {
-                    self.push(
-                        "beta_create_inside_rejected",
-                        Some("beta"),
-                        Some("dir/child.txt"),
-                    );
                 }
+                self.record_result(
+                    accepted,
+                    "beta_create_inside",
+                    "beta_create_inside_rejected",
+                    "beta",
+                    "dir/child.txt",
+                );
+            }
+            PlannedCollisionOp::AlphaPublishMetadata => {
+                let accepted = self.runtime.deliver_next_metadata("beta").is_ok();
+                self.record_result(
+                    accepted,
+                    "alpha_publish_metadata",
+                    "alpha_publish_metadata_rejected",
+                    "alpha",
+                    "remote.txt",
+                );
+            }
+            PlannedCollisionOp::BetaLocalRename => {
+                let accepted = self
+                    .runtime
+                    .rename("beta", "remote.txt", "local_remote.txt")
+                    .is_ok();
+                self.record_result(
+                    accepted,
+                    "beta_local_rename",
+                    "beta_local_rename_rejected",
+                    "beta",
+                    if accepted {
+                        "local_remote.txt"
+                    } else {
+                        "remote.txt"
+                    },
+                );
+            }
+            PlannedCollisionOp::AlphaPublishV2 => {
+                let accepted = self.runtime.publish_file("alpha", "published.txt").is_ok();
+                self.record_result(
+                    accepted,
+                    "alpha_publish_v2",
+                    "alpha_publish_v2_rejected",
+                    "alpha",
+                    "published.txt",
+                );
+            }
+            PlannedCollisionOp::BetaForeignApply => {
+                let accepted = self.runtime.deliver_next_metadata("beta").is_ok();
+                self.record_result(
+                    accepted,
+                    "beta_foreign_apply",
+                    "beta_foreign_apply_rejected",
+                    "beta",
+                    "published.txt",
+                );
             }
         }
     }
@@ -367,6 +453,10 @@ enum PlannedCollisionOp {
     BetaStaleRead,
     AlphaRmdir,
     BetaCreateInside,
+    AlphaPublishMetadata,
+    BetaLocalRename,
+    AlphaPublishV2,
+    BetaForeignApply,
 }
 
 impl PlannedCollisionOp {
@@ -376,12 +466,16 @@ impl PlannedCollisionOp {
             | Self::AlphaRenameToKept
             | Self::AlphaUnlink
             | Self::AlphaOverwrite
-            | Self::AlphaRmdir => "alpha",
+            | Self::AlphaRmdir
+            | Self::AlphaPublishMetadata
+            | Self::AlphaPublishV2 => "alpha",
             Self::BetaRenameToBetaWin
             | Self::BetaUnlink
             | Self::BetaAppend
             | Self::BetaStaleRead
-            | Self::BetaCreateInside => "beta",
+            | Self::BetaCreateInside
+            | Self::BetaLocalRename
+            | Self::BetaForeignApply => "beta",
         }
     }
 
@@ -397,6 +491,10 @@ impl PlannedCollisionOp {
             Self::BetaStaleRead => "beta_stale_read",
             Self::AlphaRmdir => "alpha_rmdir",
             Self::BetaCreateInside => "beta_create_inside",
+            Self::AlphaPublishMetadata => "alpha_publish_metadata",
+            Self::BetaLocalRename => "beta_local_rename",
+            Self::AlphaPublishV2 => "alpha_publish_v2",
+            Self::BetaForeignApply => "beta_foreign_apply",
         }
     }
 
@@ -412,6 +510,10 @@ impl PlannedCollisionOp {
             "beta_stale_read" => Self::BetaStaleRead,
             "alpha_rmdir" => Self::AlphaRmdir,
             "beta_create_inside" => Self::BetaCreateInside,
+            "alpha_publish_metadata" => Self::AlphaPublishMetadata,
+            "beta_local_rename" => Self::BetaLocalRename,
+            "alpha_publish_v2" => Self::AlphaPublishV2,
+            "beta_foreign_apply" => Self::BetaForeignApply,
             _ => panic!("unknown planned collision operation {kind}"),
         }
     }
@@ -567,21 +669,41 @@ fn mkdir_rmdir_vs_create(h: &mut FamilyHarness) {
 fn metadata_delivery_vs_local_mutation(h: &mut FamilyHarness) {
     h.runtime.create_file("alpha", "remote.txt").unwrap();
     h.runtime
-        .write_file("alpha", "remote.txt", 2, "checksum-remote")
+        .write_file("alpha", "remote.txt", 2, "checksum-remote-v1")
         .unwrap();
     h.publish_to_peer("remote.txt");
     h.checkpoint("base").unwrap();
     h.runtime
-        .rename("alpha", "remote.txt", "settled.txt")
+        .write_file("alpha", "remote.txt", 3, "checksum-remote-v2")
         .unwrap();
-    h.runtime
-        .rename("beta", "remote.txt", "settled.txt")
-        .unwrap();
-    h.push(
-        "metadata_delivery_raced_local_mutation",
-        None,
-        Some("settled.txt"),
+    let upload = h.runtime.schedule_upload("alpha", "remote.txt").unwrap();
+    h.runtime.complete_upload(upload.upload_id).unwrap();
+    h.runtime.publish_file("alpha", "remote.txt").unwrap();
+
+    let selected = h.run_race(
+        PlannedCollisionOp::AlphaPublishMetadata,
+        PlannedCollisionOp::BetaLocalRename,
     );
+    if selected.contains(&PlannedCollisionOp::BetaLocalRename) {
+        h.runtime
+            .rename("alpha", "remote.txt", "local_remote.txt")
+            .ok();
+        h.runtime.unlink("beta", "remote.txt").ok();
+        h.runtime
+            .write_file("beta", "local_remote.txt", 3, "checksum-remote-v2")
+            .ok();
+        h.push(
+            "metadata_delivery_raced_local_mutation",
+            None,
+            Some("local_remote.txt"),
+        );
+    } else {
+        h.push(
+            "metadata_delivery_raced_local_mutation",
+            None,
+            Some("remote.txt"),
+        );
+    }
 }
 
 fn publish_vs_foreign_apply(h: &mut FamilyHarness) {
@@ -594,9 +716,13 @@ fn publish_vs_foreign_apply(h: &mut FamilyHarness) {
     h.runtime
         .write_file("alpha", "published.txt", 3, "checksum-v2")
         .unwrap();
-    h.runtime
-        .write_file("beta", "published.txt", 3, "checksum-v2")
-        .unwrap();
+    let upload = h.runtime.schedule_upload("alpha", "published.txt").unwrap();
+    h.runtime.complete_upload(upload.upload_id).unwrap();
+    h.run_race(
+        PlannedCollisionOp::AlphaPublishV2,
+        PlannedCollisionOp::BetaForeignApply,
+    );
+    h.runtime.deliver_next_metadata("beta").ok();
     h.push("publish_raced_foreign_apply", None, Some("published.txt"));
 }
 
