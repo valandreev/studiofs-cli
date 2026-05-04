@@ -192,6 +192,10 @@ impl MetadataBus {
             .collect()
     }
 
+    pub fn batch(&self, batch_id: u64) -> Option<MetadataBatch> {
+        self.batches.get(&batch_id).cloned()
+    }
+
     pub fn deliver_next(&mut self, client: &str) -> Option<DeliveryOutcome> {
         if self.metadata_outage {
             return Some(self.blocked(client, DeliveryFault::MetadataOutage));

@@ -253,6 +253,20 @@ selected interleaving index. Simulation tests must keep retries, outages, upload
 completion, publication, and crash/restart timing on this scheduler surface
 rather than using wall-clock sleeps or Tokio timing.
 
+The initial SFS-336 slice adds `studiofs-scenario::client::SimulatedRuntime` as
+the logical multi-client runtime over those passive services. The runtime owns
+isolated per-client namespace state and exposes the first core operation subset:
+`mkdir`, `create_file`, `write_file`, `append_file`, `truncate_file`, `rename`,
+`unlink`, `rmdir`, `read_file`, `stat`, `readdir`, `flush`, upload scheduling,
+metadata publication, foreign metadata delivery, metadata outage/recovery, and
+client restart markers. Upload completion still only makes an object remotely
+available; peer-visible reads require an explicit metadata publish and delivery
+step. Runtime snapshots export `LogicalSnapshot` values with durable write
+expectations and object lifecycle facts for the shared invariant validator.
+Client trace records include the logical client for each client-owned operation
+so failing simulation artifacts can identify the actor without real mount,
+PostgreSQL, RustFS, redb, Docker, or wall-clock dependencies.
+
 ## MVP Scenario Set
 
 The first runtime should prove the layer with small scenarios:
