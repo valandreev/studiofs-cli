@@ -781,8 +781,9 @@ impl SimulatedRuntime {
         let paths = self
             .client(client)?
             .durable_entries
-            .keys()
-            .filter(|path| *path == from || path.starts_with(&from_prefix))
+            .range(from.to_string()..)
+            .map(|(path, _)| path)
+            .take_while(|path| *path == from || path.starts_with(&from_prefix))
             .cloned()
             .collect::<Vec<_>>();
         let client_state = self.client_mut(client)?;

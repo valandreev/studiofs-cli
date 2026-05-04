@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::client::{PublishedFileVersion, SimulatedRuntime};
+use crate::client::SimulatedRuntime;
 use crate::invariant::{InvariantViolation, validate_logical_invariants};
 use crate::scheduler::{ScheduledEvent, SchedulerEventType, SimulationScheduler};
 
@@ -492,6 +492,10 @@ fn repeated_restart_replay_loops(h: &mut CrashHarness) {
 fn stale_pending_upload_events_race_newer_epochs(h: &mut CrashHarness) {
     h.write_durable("checksum-v1", 14);
     let stale_upload = h.schedule_upload();
+    let stale = h
+        .runtime
+        .published_file_version("writer", "replay.txt")
+        .unwrap();
     h.runtime
         .write_file("writer", "replay.txt", 15, "checksum-v2")
         .unwrap();
@@ -500,13 +504,6 @@ fn stale_pending_upload_events_race_newer_epochs(h: &mut CrashHarness) {
     h.record_checkpoint("stale-upload-and-newer-epoch-pending");
     h.restart_writer();
     h.complete_upload(stale_upload);
-    let stale = PublishedFileVersion {
-        logical_id: "inode-1".to_string(),
-        object_id: "writer:replay.txt:checksum-v1".to_string(),
-        checksum_sha256: "checksum-v1".to_string(),
-        size: 14,
-        epoch: 1,
-    };
     if h.runtime
         .publish_file_version("writer", "replay.txt", stale)
         .is_err()
