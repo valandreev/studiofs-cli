@@ -133,6 +133,8 @@ impl SimulatedRuntime {
     }
 
     pub fn rename(&mut self, client: &str, from: &str, to: &str) -> Result<(), ClientRuntimeError> {
+        validate_mutation_path(client, from)?;
+        validate_mutation_path(client, to)?;
         self.ensure_parent_dirs(client, to)?;
         if self.client(client)?.entries.contains_key(to) {
             return Err(ClientRuntimeError::PathExists {
@@ -140,17 +142,36 @@ impl SimulatedRuntime {
                 path: to.to_string(),
             });
         }
-        let entry = self
-            .client_mut(client)?
-            .entries
-            .remove(from)
-            .ok_or_else(|| ClientRuntimeError::PathNotFound {
-                client: client.to_string(),
-                path: from.to_string(),
-            })?;
-        self.client_mut(client)?
-            .entries
-            .insert(to.to_string(), entry);
+        let client_state = self.client_mut(client)?;
+        let entry =
+            client_state
+                .entries
+                .remove(from)
+                .ok_or_else(|| ClientRuntimeError::PathNotFound {
+                    client: client.to_string(),
+                    path: from.to_string(),
+                })?;
+        let is_directory = entry.kind == LocalEntryKind::Directory;
+        client_state.entries.insert(to.to_string(), entry);
+
+        if is_directory {
+            let from_prefix = format!("{from}/");
+            let to_prefix = format!("{to}/");
+            let child_paths = client_state
+                .entries
+                .keys()
+                .filter(|path| path.starts_with(&from_prefix))
+                .cloned()
+                .collect::<Vec<_>>();
+            for old_path in child_paths {
+                if let Some(child) = client_state.entries.remove(&old_path) {
+                    let suffix = &old_path[from_prefix.len()..];
+                    client_state
+                        .entries
+                        .insert(format!("{to_prefix}{suffix}"), child);
+                }
+            }
+        }
         self.record(client, "rename", Some(to));
         self.schedule_client_event(client, "rename");
         Ok(())
@@ -177,6 +198,7 @@ impl SimulatedRuntime {
     }
 
     pub fn rmdir(&mut self, client: &str, path: &str) -> Result<(), ClientRuntimeError> {
+        validate_mutation_path(client, path)?;
         let entry = self.entry(client, path)?;
         if entry.kind != LocalEntryKind::Directory {
             return Err(ClientRuntimeError::NotDirectory {
@@ -683,6 +705,8 @@ pub enum ClientRuntimeError {
     PathNotFound { client: String, path: String },
     #[error("path {path} already exists for simulated client {client}")]
     PathExists { client: String, path: String },
+    #[error("path {path} is invalid for simulated client {client}")]
+    InvalidPath { client: String, path: String },
     #[error("path {path} for simulated client {client} is not a file")]
     NotFile { client: String, path: String },
     #[error("path {path} for simulated client {client} is not a directory")]
@@ -815,4 +839,18 @@ fn field<'a>(event: &'a MetadataEvent, name: &str) -> Result<&'a str, ClientRunt
             field: name.to_string(),
         }
     })
+}
+
+fn validate_mutation_path(client: &str, path: &str) -> Result<(), ClientRuntimeError> {
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.contains('\\')
+        || path.split('/').any(|component| component == "..")
+    {
+        return Err(ClientRuntimeError::InvalidPath {
+            client: client.to_string(),
+            path: path.to_string(),
+        });
+    }
+    Ok(())
 }

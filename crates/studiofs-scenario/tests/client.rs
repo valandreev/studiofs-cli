@@ -208,3 +208,36 @@ fn file_cannot_be_used_as_a_parent_directory() {
 
     assert!(runtime.create_file("client-a", "file/child.txt").is_err());
 }
+
+#[test]
+fn directory_rename_moves_descendants_and_rejects_root_or_traversal_paths() {
+    let mut runtime = SimulatedRuntime::new(29);
+    runtime.add_client("client-a");
+
+    runtime.mkdir("client-a", "dir").unwrap();
+    runtime.create_file("client-a", "dir/file.txt").unwrap();
+    runtime.rename("client-a", "dir", "newdir").unwrap();
+
+    assert!(runtime.stat("client-a", "dir/file.txt").is_err());
+    assert!(runtime.stat("client-a", "newdir/file.txt").is_ok());
+    assert_eq!(
+        runtime.readdir("client-a", "newdir").unwrap(),
+        vec!["file.txt"]
+    );
+
+    assert!(runtime.rename("client-a", "", "root").is_err());
+    assert!(runtime.rename("client-a", "newdir", "../escape").is_err());
+    assert!(runtime.rename("client-a", "newdir", "/absolute").is_err());
+    assert!(runtime.rename("client-a", "newdir", "bad\\path").is_err());
+}
+
+#[test]
+fn rmdir_rejects_root_and_traversal_paths() {
+    let mut runtime = SimulatedRuntime::new(31);
+    runtime.add_client("client-a");
+
+    assert!(runtime.rmdir("client-a", "").is_err());
+    assert!(runtime.rmdir("client-a", "../escape").is_err());
+    assert!(runtime.rmdir("client-a", "/absolute").is_err());
+    assert!(runtime.rmdir("client-a", "bad\\path").is_err());
+}
