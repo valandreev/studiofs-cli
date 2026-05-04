@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::client::SimulatedRuntime;
 use crate::invariant::{InvariantViolation, validate_logical_invariants};
-use crate::scheduler::{ScheduledEvent, SchedulerEventType, SimulationScheduler};
+use crate::scheduler::{
+    ScheduledEvent, SchedulerEventType, SimulationScheduler, simulation_stream_seed,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CollisionSuiteConfig {
@@ -129,7 +131,10 @@ impl FamilyHarness {
             family,
             seed,
             runtime,
-            scheduler: SimulationScheduler::new(seed),
+            scheduler: SimulationScheduler::new_with_stream_seed(
+                seed,
+                family_scheduler_seed(seed, family),
+            ),
             trace: Vec::new(),
             invariant_checkpoints: 0,
         }
@@ -238,12 +243,7 @@ impl FamilyHarness {
         first: PlannedCollisionOp,
         second: PlannedCollisionOp,
     ) -> Vec<PlannedCollisionOp> {
-        let operations = if self.seed.is_multiple_of(2) {
-            [second, first]
-        } else {
-            [first, second]
-        };
-        for operation in operations {
+        for operation in [first, second] {
             self.scheduler.schedule_now(
                 ScheduledEvent::new(SchedulerEventType::ClientOperation)
                     .with_client(operation.client())
@@ -450,6 +450,20 @@ impl FamilyHarness {
             }
         }
     }
+}
+
+fn family_scheduler_seed(seed: u64, family: CollisionFamily) -> u64 {
+    let family_index: u64 = match family {
+        CollisionFamily::RenameVsRename => 1,
+        CollisionFamily::RenameVsUnlink => 2,
+        CollisionFamily::UnlinkVsAppend => 3,
+        CollisionFamily::OverwriteWhileStaleReader => 4,
+        CollisionFamily::MkdirRmdirVsCreate => 5,
+        CollisionFamily::MetadataDeliveryVsLocalMutation => 6,
+        CollisionFamily::PublishVsForeignApply => 7,
+        CollisionFamily::InjectedInvariantFailure => 8,
+    };
+    simulation_stream_seed(seed, family_index)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

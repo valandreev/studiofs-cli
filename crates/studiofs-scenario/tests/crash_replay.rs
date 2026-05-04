@@ -1,3 +1,6 @@
+mod common;
+
+use common::seed_order_signatures;
 use studiofs_scenario::ScenarioOperation;
 use studiofs_scenario::crash_replay::{
     CrashReplayArtifactError, CrashReplayFamily, CrashReplaySuiteConfig,
@@ -62,6 +65,47 @@ fn stale_pending_upload_or_publish_events_never_override_newer_epochs() {
             .iter()
             .any(|record| record.kind == "peer_observed_newer_epoch")
     }));
+}
+
+#[test]
+fn deep_crash_replay_seeds_cover_more_than_parity_order_signatures() {
+    let report = run_crash_replay_suite(CrashReplaySuiteConfig {
+        scenario: "sfs358-crash-replay-seed-coverage".to_string(),
+        seeds: (1..=16).collect(),
+        families: vec![
+            CrashReplayFamily::CrashAfterDurabilityBeforeUploadCompletion,
+            CrashReplayFamily::CrashAfterUploadBeforeMetadataPublication,
+            CrashReplayFamily::CrashDuringPublishAttempt,
+            CrashReplayFamily::CrashDuringForeignApply,
+            CrashReplayFamily::RestartWithPendingLocalUploadState,
+            CrashReplayFamily::RepeatedRestartReplayLoops,
+            CrashReplayFamily::StalePendingUploadEventsRaceNewerEpochs,
+        ],
+    });
+
+    assert!(report.passed, "{:#?}", report.failures);
+    let signatures = seed_order_signatures(
+        &report
+            .family_reports
+            .iter()
+            .flat_map(|family| &family.seed_reports)
+            .map(|seed| {
+                (
+                    seed.seed,
+                    seed.trace
+                        .iter()
+                        .filter(|record| record.kind == "scheduler_selected")
+                        .filter_map(|record| record.path.clone())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>(),
+    );
+
+    assert!(
+        signatures.len() > 2,
+        "deep crash/restart seeds collapsed to parity-only signatures: {signatures:#?}"
+    );
 }
 
 #[test]
