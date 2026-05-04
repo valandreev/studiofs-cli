@@ -7,6 +7,7 @@ pub mod invariant;
 pub mod metadata_bus;
 pub mod object_store;
 pub mod scheduler;
+pub mod seed_corpus;
 
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};

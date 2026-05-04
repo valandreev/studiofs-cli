@@ -27,6 +27,7 @@ workflows are manual-only while Windows work is primarily validated locally.
 | Local-first VFS fast checks | Auto (explicit Ubuntu step; covered by Rocky workspace run) | — | — |
 | `studiofs-fuse` Linux unit tests | Auto (Ubuntu + Rocky) | — | — |
 | `studiofs-fuse` Linux mount-smoke compile check | Auto (Rocky) | — | — |
+| Deterministic simulation seed corpus | Manual RWX via `.rwx/simulation.yml` | — | — |
 | `studiofs-fuse` macOS unit + non-mount integration tests | — | Manual GitHub Action | — |
 | `studiofs-winfsp` unit tests | — | — | Manual GitHub Action |
 
@@ -78,6 +79,7 @@ Manual GitHub Actions  →  macOS
 |-----|--------|-------------|
 | **Linux** | RWX `ubuntu:24.04` + `rockylinux:9` | Manual only |
 | **Real mounted E2E** | RWX `ubuntu:24.04` with Docker + `/dev/fuse` | Manual only |
+| **Deterministic simulation** | RWX `ubuntu:24.04` without Docker or mounted filesystems | Manual only |
 | **macOS** | `macos-latest` | Manual only |
 | **Windows** | `windows-latest` | Manual only |
 

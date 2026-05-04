@@ -88,6 +88,9 @@ RWX workflow definitions live in `.rwx/`:
 - `.rwx/ci.yml` — Ubuntu quality gates and Ubuntu Linux tests.
 - `.rwx/rocky.yml` — Rocky Linux tests.
 - `.rwx/e2e.yml` — manual-only hosted Linux real mounted E2E smoke.
+- `.rwx/simulation.yml` — deterministic simulation seed corpus, with fast and
+  deep targets that do not require Docker, mounted filesystems, or external
+  services.
 
 When diagnosing RWX failures locally, keep the RWX CLI binary under
 `.rwx/bin/`. That directory is ignored by Git and is only a local tool cache;
@@ -120,6 +123,18 @@ builds `studiofs`, runs `studiofs-e2e` with Docker Compose infrastructure from
 `e2e-run` artifact. The run output prints the scenario name, run ID, report
 path, failed invariant when the runner reports one, and the artifact path to
 inspect.
+
+Run the deterministic simulation corpus through RWX:
+
+```powershell
+rwx run .rwx/simulation.yml --target simulation-fast --wait --open
+rwx run .rwx/simulation.yml --target simulation-deep --wait --open
+```
+
+The simulation workflow runs `studiofs-scenario` only. It is suitable for cheap
+seed-reproducible logical correctness checks and uploads
+`target/simulation-counterexamples/` when a failing seed produces replay
+artifacts.
 
 ## Tests
 

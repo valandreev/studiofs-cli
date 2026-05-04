@@ -190,6 +190,30 @@ cargo test -p studiofs-e2e scenario::tests::crash_restart_recovery_runs_both_mod
 cargo test -p studiofs-e2e --test client_controller force_kill_then_remount_reuses_same_client_root_without_graceful_umount -- --exact --nocapture
 cargo test -p studiofs-scenario --test collision -- --nocapture
 cargo test -p studiofs-scenario --test crash_replay -- --nocapture
+cargo test -p studiofs-scenario --test seed_corpus -- --nocapture
+```
+
+### Deterministic simulation corpus
+
+The deterministic simulation corpus lives in `studiofs-scenario` and is wired
+to RWX through `.rwx/simulation.yml`. It is pure Rust logical simulation: it
+does not require Docker, PostgreSQL, RustFS, FUSE, WinFSP, mounted filesystems,
+self-hosted runners, or wall-clock sleeps.
+
+Local commands:
+
+```powershell
+cargo run -p studiofs-scenario --bin studiofs-scenario -- run-corpus --corpus fast --artifact-root target\simulation-counterexamples\fast
+cargo run -p studiofs-scenario --bin studiofs-scenario -- run-corpus --corpus deep --artifact-root target\simulation-counterexamples\deep
+cargo run -p studiofs-scenario --bin studiofs-scenario -- run-corpus --corpus fast --scenario-group namespace-collisions --artifact-root target\simulation-counterexamples\namespace-collisions
+cargo run -p studiofs-scenario --bin studiofs-scenario -- run-corpus --corpus fast --scenario-group crash-restart-replay --seed 13 --artifact-root target\simulation-counterexamples\seed-13
+```
+
+RWX commands:
+
+```powershell
+rwx run .rwx/simulation.yml --target simulation-fast --wait --open
+rwx run .rwx/simulation.yml --target simulation-deep --wait --open
 ```
 
 ## Platform-Gated Unit Tests

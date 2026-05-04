@@ -319,6 +319,21 @@ durable namespace replay state immediately, while file payload bytes still
 require the modeled local durability boundary. Directory logical IDs are stable
 through rename/restart and are not derived from the current path.
 
+The initial SFS-340 slice adds `studiofs-scenario::seed_corpus` as the
+RWX-facing corpus orchestrator. The fast corpus uses stable seeds `1, 2, 3`;
+the deep corpus uses stable seeds `1..=16`. Both run the named scenario groups
+in deterministic order: namespace collisions, crash/restart replay, metadata
+outage, and object-store outage. The corpus CLI supports running one seed, one
+scenario group, the fast corpus, or the deep corpus:
+`cargo run -p studiofs-scenario --bin studiofs-scenario -- run-corpus --corpus fast`.
+Failures report the scenario group, seed, violated invariant, message, and
+counterexample artifact path when the underlying suite can write one. The RWX
+workflow lives in `.rwx/simulation.yml` with `simulation-fast` and
+`simulation-deep` targets and uploads `target/simulation-counterexamples/`.
+It intentionally does not use Docker, PostgreSQL, RustFS, FUSE, WinFSP,
+self-hosted runners, GitHub Actions triggers, schedules, or label-gated PR
+runs.
+
 ## MVP Scenario Set
 
 The first runtime should prove the layer with small scenarios:
