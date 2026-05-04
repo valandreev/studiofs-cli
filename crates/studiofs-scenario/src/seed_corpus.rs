@@ -168,13 +168,14 @@ pub fn run_simulation_corpus(
     for group in groups {
         let mut outcome = run_group(group, &seeds, &options)?;
         if let Some(artifact_root) = &options.artifact_root {
-            for failure in &mut outcome.failures {
+            for (failure_index, failure) in outcome.failures.iter_mut().enumerate() {
                 if failure.counterexample_artifact_path.is_none() {
                     let artifact_path = simulation_counterexample_artifact_path(
                         artifact_root,
                         options.kind,
                         failure.group,
                         failure.seed,
+                        failure_index,
                     );
                     write_simulation_counterexample(&artifact_path, options.kind, failure)?;
                     failure.counterexample_artifact_path =
@@ -510,11 +511,12 @@ fn simulation_counterexample_artifact_path(
     kind: SimulationCorpusKind,
     group: SimulationScenarioGroup,
     seed: u64,
+    failure_index: usize,
 ) -> PathBuf {
     artifact_root
         .join(corpus_arg(kind))
         .join(group_arg(group))
-        .join(format!("seed-{seed}.json"))
+        .join(format!("seed-{seed}-failure-{failure_index}.json"))
 }
 
 fn path_utf8(path: &Path) -> Result<&str, SimulationCorpusError> {
@@ -575,4 +577,32 @@ pub fn group_arg(group: SimulationScenarioGroup) -> &'static str {
 struct GroupOutcome {
     seed_reports: Vec<SimulationSeedReport>,
     failures: Vec<SimulationCorpusFailure>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn synthetic_artifact_paths_are_unique_for_multiple_failures_with_the_same_seed() {
+        let root = PathBuf::from("target/synthetic-artifacts");
+        let first = simulation_counterexample_artifact_path(
+            &root,
+            SimulationCorpusKind::Fast,
+            SimulationScenarioGroup::NamespaceCollisions,
+            13,
+            0,
+        );
+        let second = simulation_counterexample_artifact_path(
+            &root,
+            SimulationCorpusKind::Fast,
+            SimulationScenarioGroup::NamespaceCollisions,
+            13,
+            1,
+        );
+
+        assert_ne!(first, second);
+        assert!(first.ends_with("fast/namespace-collisions/seed-13-failure-0.json"));
+        assert!(second.ends_with("fast/namespace-collisions/seed-13-failure-1.json"));
+    }
 }
