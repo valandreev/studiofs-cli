@@ -186,9 +186,12 @@ initial production-backed VFS Contract/Core replay adapter for portable
 `ScenarioOperationRecord` logs. The first adapter applies namespace and local
 file-content operations through `studiofs_vfs::contract_harness::ContractVfsFixture`,
 runs production metadata/VFS invariants, and reports unsupported records as
-skipped rather than silently treating them as covered. Mounted replay remains
-the next required integration step before deterministic simulation can be
-considered a full StudioFS product correctness gate.
+skipped rather than silently treating them as covered. The next adapter lives in
+`studiofs_e2e::mounted_replay`; it replays the same records against real mount
+points, honors `record.client`, dispatches client crash/restart and PostgreSQL
+or RustFS outage/recovery events through E2E driver hooks, and routes
+`MountedOnly` records to an explicit real-mount hook instead of filtering them
+out as simulation-unsupported.
 
 ## Phase 1/2 Reuse
 

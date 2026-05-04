@@ -233,6 +233,15 @@ real VFS fixture and reports checkpoints, mounted-only operations, crash/restart
 markers, and infrastructure outages as skipped records. Skipped records are not
 coverage; use mounted E2E replay for those.
 
+Mounted replay lives in `studiofs_e2e::mounted_replay`. It executes the same
+`ScenarioOperationRecord` log against real mounted client paths, selecting the
+target mount from `record.client` or the first client when no client is attached.
+It applies mount-observable file operations, dispatches `client_crash` and
+`client_restart` to the E2E client controller, dispatches PostgreSQL and RustFS
+outage/recovery operations through compose service hooks, and executes
+`mounted_only` records through an explicit driver hook for platform-specific
+real-mount probes.
+
 Local commands:
 
 ```powershell

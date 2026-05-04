@@ -622,6 +622,13 @@ trait MountedSmokeDriver {
     ) -> Result<VolumeBootstrapSummary, ClientControllerError>;
     fn mount_all(&mut self) -> Result<(), ClientControllerError>;
     fn clients(&self) -> Vec<ClientSpec>;
+    fn after_smoke_write(
+        &mut self,
+        _clients: &[ClientSpec],
+        _relative_path: &str,
+    ) -> Result<(), ClientControllerError> {
+        Ok(())
+    }
     fn unmount_all(&mut self) -> Result<(), ClientControllerError>;
 }
 
@@ -703,6 +710,7 @@ fn run_mounted_smoke_body(
 
     let smoke_file = clients[0].mount_point.join(SMOKE_FILE_NAME);
     fs::write(&smoke_file, SMOKE_FILE_PAYLOAD)?;
+    driver.after_smoke_write(&clients, SMOKE_FILE_NAME)?;
     let mounts = clients
         .iter()
         .take(SMOKE_CLIENT_NAMES.len())
@@ -1478,9 +1486,6 @@ fn run_crash_restart_mode(
     let local_read_checksum_sha256 = bytes_sha256(&local_read_payload);
     let restart_elapsed_ms = elapsed_millis_nonzero(restart_started);
 
-    driver.before_convergence_validation(mode, relative_path, clients)?;
-
-    let convergence_started = Instant::now();
     let peer_visible_before_convergence =
         if mode == CrashRestartMode::BeforeRemotePublicationCompletes {
             read_peer_checksum(&clients[1], relative_path)?
@@ -1488,6 +1493,9 @@ fn run_crash_restart_mode(
         } else {
             None
         };
+    driver.before_convergence_validation(mode, relative_path, clients)?;
+
+    let convergence_started = Instant::now();
     let mounts = clients
         .iter()
         .map(|client| ClientMount::new(client.name.clone(), client.mount_point.clone()))
@@ -2670,25 +2678,6 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let mut driver = RecordingSmokeDriver::new(clients);
-        let source_mount = temp.path().join("mounts").join(SMOKE_CLIENT_NAMES[0]);
-        let replica_mounts = SMOKE_CLIENT_NAMES
-            .iter()
-            .copied()
-            .skip(1)
-            .map(|name| temp.path().join("mounts").join(name))
-            .collect::<Vec<_>>();
-        thread::spawn(move || {
-            let source = source_mount.join("studiofs-e2e-smoke.txt");
-            for _ in 0..100 {
-                if let Ok(payload) = std::fs::read(&source) {
-                    for replica in &replica_mounts {
-                        std::fs::write(replica.join("studiofs-e2e-smoke.txt"), &payload).unwrap();
-                    }
-                    return;
-                }
-                thread::sleep(Duration::from_millis(5));
-            }
-        });
         let context = ScenarioContext {
             run_id: "run-1".to_string(),
             seed: 324,
@@ -2793,6 +2782,21 @@ mod tests {
 
         fn clients(&self) -> Vec<ClientSpec> {
             self.clients.clone()
+        }
+
+        fn after_smoke_write(
+            &mut self,
+            clients: &[ClientSpec],
+            relative_path: &str,
+        ) -> Result<(), ClientControllerError> {
+            let Some(source_client) = clients.first() else {
+                return Ok(());
+            };
+            let payload = std::fs::read(source_client.mount_point.join(relative_path))?;
+            for replica in clients.iter().skip(1) {
+                std::fs::write(replica.mount_point.join(relative_path), &payload)?;
+            }
+            Ok(())
         }
 
         fn unmount_all(&mut self) -> Result<(), ClientControllerError> {
@@ -3006,6 +3010,7 @@ mod tests {
         corrupt_local_on_remount: bool,
         corrupt_converged_payload_after_remount: bool,
         publish_current_file_on_remount: bool,
+        publish_current_file_before_convergence: bool,
     }
 
     impl RecordingCrashRestartDriver {
@@ -3016,6 +3021,7 @@ mod tests {
                 corrupt_local_on_remount: false,
                 corrupt_converged_payload_after_remount: false,
                 publish_current_file_on_remount: false,
+                publish_current_file_before_convergence: false,
             }
         }
 
@@ -3031,6 +3037,11 @@ mod tests {
 
         fn publish_current_file_on_remount(mut self) -> Self {
             self.publish_current_file_on_remount = true;
+            self
+        }
+
+        fn publish_current_file_before_convergence(mut self) -> Self {
+            self.publish_current_file_before_convergence = true;
             self
         }
     }
@@ -3137,6 +3148,15 @@ mod tests {
                         client.mount_point.join(relative_path),
                         b"wrong converged payload after restart\n",
                     )?;
+                }
+            }
+            if self.publish_current_file_before_convergence {
+                let Some(source_client) = clients.first() else {
+                    return Ok(());
+                };
+                let payload = std::fs::read(source_client.mount_point.join(relative_path))?;
+                for peer in clients.iter().skip(1) {
+                    std::fs::write(peer.mount_point.join(relative_path), &payload)?;
                 }
             }
             Ok(())
@@ -3596,33 +3616,9 @@ mod tests {
                 client_spec_for(&sandbox, "projectfs", name, mount)
             })
             .collect::<Vec<_>>();
-        let source_mount = temp
-            .path()
-            .join("mounts")
-            .join(CRASH_RESTART_CLIENT_NAMES[0]);
-        let peer_mount = temp
-            .path()
-            .join("mounts")
-            .join(CRASH_RESTART_CLIENT_NAMES[1]);
-        thread::spawn(move || {
-            let files = [
-                CRASH_RESTART_LOCAL_DURABLE_FILE_NAME,
-                CRASH_RESTART_BEFORE_PUBLICATION_FILE_NAME,
-            ];
-            for file in files {
-                let source = source_mount.join(file);
-                for _ in 0..100 {
-                    if let Ok(payload) = std::fs::read(&source) {
-                        thread::sleep(Duration::from_millis(50));
-                        std::fs::write(peer_mount.join(file), &payload).unwrap();
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(5));
-                }
-            }
-        });
         let original_client_root = clients[0].client_root.clone();
-        let mut driver = RecordingCrashRestartDriver::new(clients);
+        let mut driver =
+            RecordingCrashRestartDriver::new(clients).publish_current_file_before_convergence();
         let context = ScenarioContext {
             run_id: "run-1".to_string(),
             seed: 327,
@@ -3840,41 +3836,8 @@ mod tests {
                 client_spec_for(&sandbox, "projectfs", name, mount)
             })
             .collect::<Vec<_>>();
-        let source_mount = temp.path().join("mounts").join("client-a");
-        let peer_mounts = ["client-b", "client-c"]
-            .into_iter()
-            .map(|name| temp.path().join("mounts").join(name))
-            .collect::<Vec<_>>();
-        thread::spawn(move || {
-            let files = [
-                (
-                    CRASH_RESTART_LOCAL_DURABLE_FILE_NAME,
-                    b"accepted local durable payload before abrupt crash\n".len(),
-                ),
-                (
-                    CRASH_RESTART_BEFORE_PUBLICATION_FILE_NAME,
-                    b"accepted local payload killed before remote publication completes\n".len(),
-                ),
-            ];
-            for (file, expected_len) in files {
-                let source = source_mount.join(file);
-                for _ in 0..500 {
-                    if let Ok(payload) = std::fs::read(&source) {
-                        if payload.len() != expected_len {
-                            thread::sleep(Duration::from_millis(5));
-                            continue;
-                        }
-                        thread::sleep(Duration::from_millis(50));
-                        for peer in &peer_mounts {
-                            std::fs::write(peer.join(file), &payload).unwrap();
-                        }
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(5));
-                }
-            }
-        });
-        let mut driver = RecordingCrashRestartDriver::new(clients);
+        let mut driver =
+            RecordingCrashRestartDriver::new(clients).publish_current_file_before_convergence();
         let context = ScenarioContext {
             run_id: "run-1".to_string(),
             seed: 327,
