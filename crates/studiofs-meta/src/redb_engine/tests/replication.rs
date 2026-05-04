@@ -109,6 +109,125 @@ fn test_replica_apply_keeps_symlink_and_xattr_in_base_only() {
     );
 }
 
+fn replica_rename_event(name: &[u8], new_name: &[u8], entry: DirEntryValue) -> crate::events::MetaEvent {
+    crate::events::MetaEvent::RenameEntry {
+        parent: ROOT_INO,
+        name: name.to_vec(),
+        new_parent: ROOT_INO,
+        new_name: new_name.to_vec(),
+        entry,
+        displaced_set_attr: Box::new(None),
+        displaced_remove_attr_ino: None,
+        moved_dir_attr: Box::new(None),
+        old_parent_attr: Box::new(None),
+        new_parent_attr: Box::new(None),
+    }
+}
+
+#[test]
+fn test_replica_base_rename_relocates_inode_when_source_was_already_moved() {
+    let engine = temp_engine();
+    let entry = DirEntryValue {
+        ino: 901,
+        kind: FileType::RegularFile,
+    };
+
+    engine
+        .apply_replica_events_to_base(&[
+            crate::events::MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: b"source.txt".to_vec(),
+                entry: entry.clone(),
+            },
+            replica_rename_event(b"source.txt", b"moved-by-a.txt", entry.clone()),
+            replica_rename_event(b"source.txt", b"moved-by-b.txt", entry.clone()),
+        ])
+        .unwrap();
+
+    assert!(engine.lookup(ROOT_INO, b"source.txt").is_err());
+    assert!(engine.lookup(ROOT_INO, b"moved-by-a.txt").is_err());
+    assert_eq!(
+        engine.lookup(ROOT_INO, b"moved-by-b.txt").unwrap().ino,
+        entry.ino
+    );
+}
+
+#[test]
+fn test_replica_serving_rename_relocates_inode_when_source_was_already_moved() {
+    let engine = temp_engine();
+    let entry = DirEntryValue {
+        ino: 902,
+        kind: FileType::RegularFile,
+    };
+
+    engine
+        .apply_replica_serving_state(&[
+            crate::events::MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: b"source.txt".to_vec(),
+                entry: entry.clone(),
+            },
+            replica_rename_event(b"source.txt", b"moved-by-a.txt", entry.clone()),
+            replica_rename_event(b"source.txt", b"moved-by-b.txt", entry.clone()),
+        ])
+        .unwrap();
+
+    assert!(engine.lookup(ROOT_INO, b"source.txt").is_err());
+    assert!(engine.lookup(ROOT_INO, b"moved-by-a.txt").is_err());
+    assert_eq!(
+        engine.lookup(ROOT_INO, b"moved-by-b.txt").unwrap().ino,
+        entry.ino
+    );
+}
+
+#[test]
+fn test_reconcile_serving_rename_removes_prior_loser_for_same_inode() {
+    let engine = temp_engine();
+    let entry = DirEntryValue {
+        ino: 903,
+        kind: FileType::RegularFile,
+    };
+
+    engine
+        .apply_replica_events_to_base(&[
+            crate::events::MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: b"source.txt".to_vec(),
+                entry: entry.clone(),
+            },
+            replica_rename_event(b"source.txt", b"moved-by-a.txt", entry.clone()),
+            replica_rename_event(b"source.txt", b"moved-by-b.txt", entry.clone()),
+        ])
+        .unwrap();
+    engine
+        .apply_replica_serving_state(&[
+            crate::events::MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: b"source.txt".to_vec(),
+                entry: entry.clone(),
+            },
+            replica_rename_event(b"source.txt", b"moved-by-a.txt", entry.clone()),
+        ])
+        .unwrap();
+
+    engine
+        .reconcile_serving_rename_from_base(
+            ROOT_INO,
+            b"source.txt",
+            ROOT_INO,
+            b"moved-by-b.txt",
+            &entry,
+        )
+        .unwrap();
+
+    assert!(engine.lookup(ROOT_INO, b"source.txt").is_err());
+    assert!(engine.lookup(ROOT_INO, b"moved-by-a.txt").is_err());
+    assert_eq!(
+        engine.lookup(ROOT_INO, b"moved-by-b.txt").unwrap().ino,
+        entry.ino
+    );
+}
+
 #[test]
 fn test_replica_aux_block_events_accept_fragmented_base_graph() {
     let engine = temp_engine();

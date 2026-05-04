@@ -9684,17 +9684,95 @@ mod tests {
         let r2 = t2.join().expect("thread b");
         let ok_count = [r1.is_ok(), r2.is_ok()].into_iter().filter(|v| *v).count();
         assert!(ok_count >= 1, "at least one rename should apply");
+        let rename_batches = run_async({
+            let dsn = volume.dsn.clone();
+            let volume_id = volume.volume_id;
+            async move {
+                let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                    .await
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                let conn_task = tokio::spawn(async move {
+                    let _ = connection.await;
+                });
+                let rows = client
+                    .query(
+                        "SELECT batch_version, event_payload \
+                         FROM event_log \
+                         WHERE vol = $1 AND event_type = 'rename_entry' \
+                         ORDER BY batch_version ASC",
+                        &[&volume_id],
+                    )
+                    .await
+                    .map_err(|e| MetaError::Storage(format!("query rename batches failed: {e}")))?;
+                conn_task.abort();
+
+                let mut rename_batches = Vec::new();
+                for row in rows {
+                    let batch_version: i64 = row.get(0);
+                    let payload: Vec<u8> = row.get(1);
+                    let event: MetaEvent = postcard::from_bytes(&payload).map_err(|e| {
+                        MetaError::Serialization(format!("postgres rename decode failed: {e}"))
+                    })?;
+                    if let MetaEvent::RenameEntry { new_name, .. } = event {
+                        rename_batches.push((batch_version, new_name));
+                    }
+                }
+                Ok::<_, MetaError>(rename_batches)
+            }
+        })
+        .expect("query rename batches");
+        assert_eq!(
+            rename_batches.len(),
+            ok_count,
+            "each accepted rename must have one PG batch"
+        );
+        let expected_winner = rename_batches
+            .iter()
+            .max_by_key(|(batch_version, _)| *batch_version)
+            .map(|(_, name)| name.clone())
+            .expect("at least one rename batch");
+
         assert!(wait_until(Duration::from_secs(12), || {
             let _ = a.sync_metadata();
-            a.lookup(ROOT_INO, b"source.txt").is_err()
+            let _ = b.sync_metadata();
+            let a_source_gone = a.lookup(ROOT_INO, b"source.txt").is_err();
+            let b_source_gone = b.lookup(ROOT_INO, b"source.txt").is_err();
+            let a_winner = [b"moved_by_a.txt".as_slice(), b"moved_by_b.txt".as_slice()]
+                .into_iter()
+                .filter(|name| a.lookup(ROOT_INO, name).is_ok())
+                .map(Vec::from)
+                .collect::<Vec<_>>();
+            let b_winner = [b"moved_by_a.txt".as_slice(), b"moved_by_b.txt".as_slice()]
+                .into_iter()
+                .filter(|name| b.lookup(ROOT_INO, name).is_ok())
+                .map(Vec::from)
+                .collect::<Vec<_>>();
+            a_source_gone
+                && b_source_gone
+                && a_winner.len() == 1
+                && b_winner.len() == 1
+                && a_winner == b_winner
         }));
-        let a_exists = a.lookup(ROOT_INO, b"moved_by_a.txt").is_ok();
-        let b_exists = a.lookup(ROOT_INO, b"moved_by_b.txt").is_ok();
-        assert_ne!(a_exists, b_exists, "only one destination name should exist");
         assert!(
             a.lookup(ROOT_INO, b"source.txt").is_err(),
             "source must be gone"
         );
+        assert!(
+            b.lookup(ROOT_INO, b"source.txt").is_err(),
+            "source must be gone on peer"
+        );
+        let a_winner = [b"moved_by_a.txt".as_slice(), b"moved_by_b.txt".as_slice()]
+            .into_iter()
+            .filter(|name| a.lookup(ROOT_INO, name).is_ok())
+            .map(Vec::from)
+            .collect::<Vec<_>>();
+        let b_winner = [b"moved_by_a.txt".as_slice(), b"moved_by_b.txt".as_slice()]
+            .into_iter()
+            .filter(|name| b.lookup(ROOT_INO, name).is_ok())
+            .map(Vec::from)
+            .collect::<Vec<_>>();
+        assert_eq!(a_winner, vec![expected_winner.clone()]);
+        assert_eq!(b_winner, vec![expected_winner]);
     }
 
     #[test]
