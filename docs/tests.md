@@ -204,6 +204,26 @@ crash/restart, metadata-outage, and object-store-outage groups; identical trace
 counts across every deep seed usually mean the scenario has collapsed into a
 single-path check.
 
+Use this layer as the search front end, not as the final product verdict. The
+current corpus exercises the deterministic model itself. A counterexample only
+becomes a StudioFS product bug after it is replayed into a production-backed
+layer:
+
+1. Model search: run the `studiofs-scenario` corpus to find a failing
+   interleaving and save the counterexample artifact.
+2. Contract/Core replay: replay the portable `ScenarioOperationRecord` log into
+   non-mounted production fixtures and validate the exported logical snapshot.
+3. Mounted replay: when the operation is mount-observable, translate the same
+   log into `studiofs-e2e` and validate mounted tree convergence plus scenario
+   artifacts.
+4. Regression promotion: keep the smallest reproducing layer as a focused test,
+   and keep the original counterexample artifact replayable.
+
+If a failing seed reproduces only in the model, fix the model, invariant, or
+scenario definition first. If it reproduces in Contract/Core, treat it as a
+production core bug. If Contract/Core passes but mounted replay fails, treat it
+as a bridge, process lifecycle, or integration bug.
+
 Local commands:
 
 ```powershell
@@ -211,6 +231,18 @@ cargo run -p studiofs-scenario --bin studiofs-scenario -- run-corpus --corpus fa
 cargo run -p studiofs-scenario --bin studiofs-scenario -- run-corpus --corpus deep --artifact-root target\simulation-counterexamples\deep
 cargo run -p studiofs-scenario --bin studiofs-scenario -- run-corpus --corpus fast --scenario-group namespace-collisions --artifact-root target\simulation-counterexamples\namespace-collisions
 cargo run -p studiofs-scenario --bin studiofs-scenario -- run-corpus --corpus fast --scenario-group crash-restart-replay --seed 13 --artifact-root target\simulation-counterexamples\seed-13
+```
+
+Exploratory local seed sweep:
+
+```powershell
+$groups = @('namespace-collisions','crash-restart-replay','metadata-outage','object-store-outage')
+foreach ($group in $groups) {
+  foreach ($seed in 1..256) {
+    cargo run -q -p studiofs-scenario --bin studiofs-scenario -- run-corpus --corpus deep --scenario-group $group --seed $seed --artifact-root "target\simulation-counterexamples\explore-$group-$seed"
+    if ($LASTEXITCODE -ne 0) { throw "simulation failed for group=$group seed=$seed" }
+  }
+}
 ```
 
 Replay a saved counterexample by passing the artifact path to

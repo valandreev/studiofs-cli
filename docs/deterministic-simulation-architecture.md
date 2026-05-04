@@ -95,6 +95,97 @@ expressed over logical state. It should reuse Real E2E operation artifacts where
 the operations are portable. It should not weaken either layer by making them
 depend on simulator internals.
 
+## Product-Finding Strategy
+
+The deterministic simulator is useful only if it becomes a bug-finding front
+end for the production filesystem, not a separate toy implementation that only
+tests itself. The deep testing strategy therefore has two jobs:
+
+1. search more interleavings than Real E2E can afford;
+2. project every interesting interleaving back onto production code through a
+   shared operation log and invariant oracle.
+
+The simulator remains the fast search engine, but production components must be
+plugged into the same workload in progressively heavier layers:
+
+| Stage | Driver | System under test | Oracle | Expected bug class |
+|---|---|---|---|---|
+| model search | `studiofs-scenario` logical clients | simulation model only | shared logical invariants | scenario/model gaps, invariant bugs, missing fault cases |
+| contract replay | `ScenarioOperationRecord` replay into Contract/Core fixtures | `studiofs-meta`, `studiofs-cache`, and `studiofs-vfs` non-mounted fixtures | same logical snapshot and durable-write invariants | publication, replay, object reachability, epoch, and namespace bugs in production core logic |
+| mounted replay | same operation log translated into `studiofs-e2e` mounted clients | `studiofs-cli` through real clients, PostgreSQL, RustFS, and mounted trees | mounted tree convergence plus shared operation/invariant summaries | bridge/runtime/integration bugs missed by pure core tests |
+| counterexample promotion | saved failing artifact | smallest layer that reproduces the failure | exact artifact replay plus focused regression test | permanent regression coverage for found product bugs |
+
+This creates a one-way validation ladder. A failure first found in model search
+should be minimized and replayed against Contract/Core. If it still reproduces,
+the bug belongs to production core logic and should get a focused production
+regression. If Contract/Core passes but mounted replay fails, the bug belongs to
+the runner, bridge, process lifecycle, or integration boundary. If only the
+model fails, the simulator or invariant needs correction before the result can
+be treated as a StudioFS product defect.
+
+### Deep Search Axes
+
+Deep eventual-consistency testing should deliberately vary the axes that create
+real StudioFS risk:
+
+- publication ordering: upload completion before/after metadata publication,
+  repeated publish attempts, stale epoch publication, and foreign apply racing
+  with local mutation;
+- local durability: write accepted before flush, flush/fsync/release boundary,
+  crash before upload, crash after upload, and restart while pending work is
+  queued;
+- namespace collisions: rename/rename, rename/unlink, unlink/write,
+  mkdir/rmdir/create, parent rename while child changes, and stale readdir/stat
+  observations;
+- metadata replication: delayed head-of-line batch, duplicate delivery,
+  disconnect/reconnect, outage flapping, and delivery after local divergent
+  state exists;
+- object lifecycle: local-only payload, pending upload, failed upload retry,
+  object-store outage, deleted-but-protected object, and metadata pointing at a
+  missing remote object;
+- replay idempotence: repeated restart loops, stale pending events after newer
+  epochs, and replay after partial cleanup.
+
+Each axis should be represented in the model search and then be mapped either
+to a Contract/Core replay command or a documented mounted-only E2E scenario.
+When an axis cannot be mapped to production yet, the corpus output should label
+that gap instead of implying product coverage.
+
+### Differential Replay Contract
+
+The shared operation log is the handoff between search and product validation.
+A deep run that finds a counterexample must preserve:
+
+- scenario group, seed, scheduler trace, and selected event order;
+- operation log in `ScenarioOperationRecord` format;
+- fault schedule: metadata outage/recovery, object-store outage/recovery,
+  upload completion/failure, duplicate delivery, and crash/restart points;
+- expected logical invariants and stable-point checkpoints;
+- unsupported operation markers when the operation is simulation-only or
+  mounted-only.
+
+Contract/Core replay should consume the operation log without Docker or mounts
+and export a logical snapshot that can be checked by
+`validate_logical_invariants`. Mounted replay should consume the same portable
+operations through `studiofs-e2e`, then export mounted tree snapshots and
+operation summaries. Exact replay from an artifact remains stronger than
+`run-corpus --seed`: replay must read the saved artifact and fail if the trace,
+operation log, invariant, or relevant snapshot drifts.
+
+### Execution Policy
+
+Use three execution depths:
+
+- fast corpus: small fixed seed set for quick PR-oriented signal;
+- deep corpus: stable documented seed set for normal manual/RWX exploration;
+- exploratory corpus: larger local or RWX seed windows used to find new bugs,
+  with the seed range and scenario group captured in the run notes.
+
+The current implementation supports model search directly. Product-backed
+Contract/Core replay and mounted replay are the next required integration steps
+before deterministic simulation can be considered a full StudioFS product
+correctness gate.
+
 ## Phase 1/2 Reuse
 
 Phase 1/2 Real E2E work already established runner artifacts and mounted
