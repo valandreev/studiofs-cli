@@ -30,6 +30,14 @@ pub(super) const DENTRIES_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition
 pub(super) const BASE_DENTRIES_TABLE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("base_dentries");
 
+/// Derived serving namespace index: (ino, parent_ino, name) -> marker.
+pub(super) const DENTRY_BY_INODE_TABLE: TableDefinition<&[u8], u8> =
+    TableDefinition::new("dentry_by_inode");
+
+/// Derived remote-visible base namespace index: (ino, parent_ino, name) -> marker.
+pub(super) const BASE_DENTRY_BY_INODE_TABLE: TableDefinition<&[u8], u8> =
+    TableDefinition::new("base_dentry_by_inode");
+
 /// Local tombstones hiding remote-visible base dentries.
 pub(super) const DENTRY_TOMBSTONES_TABLE: TableDefinition<&[u8], u8> =
     TableDefinition::new("dentry_tombstones");
@@ -144,6 +152,14 @@ pub(super) fn encode_dentry_key(parent: Ino, name: &[u8]) -> Vec<u8> {
     key
 }
 
+pub(super) fn encode_dentry_by_inode_key(ino: Ino, parent: Ino, name: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(16 + name.len());
+    key.extend_from_slice(&ino.to_le_bytes());
+    key.extend_from_slice(&parent.to_le_bytes());
+    key.extend_from_slice(name);
+    key
+}
+
 fn invalid_redb_key_len(key_kind: &str, expected: &str, actual: usize) -> MetaError {
     MetaError::Storage(format!(
         "invalid redb {key_kind} key length: expected {expected}, got {actual}"
@@ -168,9 +184,27 @@ pub(super) fn decode_dentry_key(key: &[u8]) -> MetaResult<(Ino, &[u8])> {
     Ok((parent, name))
 }
 
+pub(super) fn decode_dentry_by_inode_key(key: &[u8]) -> MetaResult<(Ino, Ino, &[u8])> {
+    if key.len() < 16 {
+        return Err(invalid_redb_key_len(
+            "dentry-by-inode",
+            "at least 16 bytes",
+            key.len(),
+        ));
+    }
+    let ino = decode_inode_prefix(key, "dentry-by-inode")?;
+    let parent = decode_inode_prefix(&key[8..], "dentry-by-inode parent")?;
+    Ok((ino, parent, &key[16..]))
+}
+
 /// The prefix for scanning all dentries of a parent inode.
 pub(super) fn dentry_prefix(parent: Ino) -> [u8; 8] {
     parent.to_le_bytes()
+}
+
+/// The prefix for scanning all dentries pointing at an inode.
+pub(super) fn dentry_by_inode_prefix(ino: Ino) -> [u8; 8] {
+    ino.to_le_bytes()
 }
 
 /// Encode a regular-file chunk key: ino (8 bytes LE) + chunk_id (8 bytes LE).

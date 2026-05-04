@@ -229,6 +229,89 @@ fn test_reconcile_serving_rename_removes_prior_loser_for_same_inode() {
 }
 
 #[test]
+fn test_replica_base_inode_dentry_index_tracks_hardlink_ambiguity() {
+    let engine = temp_engine();
+    let entry = DirEntryValue {
+        ino: 904,
+        kind: FileType::RegularFile,
+    };
+
+    engine
+        .apply_replica_events_to_base(&[
+            crate::events::MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: b"source-a.txt".to_vec(),
+                entry: entry.clone(),
+            },
+            crate::events::MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: b"source-b.txt".to_vec(),
+                entry: entry.clone(),
+            },
+            replica_rename_event(b"missing-source.txt", b"winner.txt", entry.clone()),
+        ])
+        .unwrap();
+
+    assert_eq!(
+        engine
+            .base_dentry_keys_for_inode_for_test(entry.ino)
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(engine.lookup(ROOT_INO, b"source-a.txt").unwrap().ino, entry.ino);
+    assert_eq!(engine.lookup(ROOT_INO, b"source-b.txt").unwrap().ino, entry.ino);
+    assert!(
+        engine.lookup(ROOT_INO, b"winner.txt").is_err(),
+        "ambiguous hardlink relocation must not delete an arbitrary link"
+    );
+}
+
+#[test]
+fn test_serving_inode_dentry_index_tracks_add_link_rename_and_unlink() {
+    let engine = temp_engine();
+    let file = engine
+        .create_file(ROOT_INO, b"source.txt", 1000, 1000, 0o644)
+        .unwrap();
+
+    assert_eq!(
+        engine
+            .serving_dentry_keys_for_inode_for_test(file.ino)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    engine.link(file.ino, ROOT_INO, b"linked.txt").unwrap();
+    assert_eq!(
+        engine
+            .serving_dentry_keys_for_inode_for_test(file.ino)
+            .unwrap()
+            .len(),
+        2
+    );
+
+    engine
+        .rename(ROOT_INO, b"source.txt", ROOT_INO, b"renamed.txt")
+        .unwrap();
+    let keys = engine
+        .serving_dentry_keys_for_inode_for_test(file.ino)
+        .unwrap();
+    assert_eq!(keys.len(), 2);
+    assert!(keys.contains(&encode_dentry_key(ROOT_INO, b"renamed.txt")));
+    assert!(keys.contains(&encode_dentry_key(ROOT_INO, b"linked.txt")));
+    assert!(!keys.contains(&encode_dentry_key(ROOT_INO, b"source.txt")));
+
+    engine.unlink(ROOT_INO, b"linked.txt").unwrap();
+    assert_eq!(
+        engine
+            .serving_dentry_keys_for_inode_for_test(file.ino)
+            .unwrap(),
+        vec![encode_dentry_key(ROOT_INO, b"renamed.txt")]
+    );
+}
+
+#[test]
 fn test_replica_aux_block_events_accept_fragmented_base_graph() {
     let engine = temp_engine();
     let file = engine

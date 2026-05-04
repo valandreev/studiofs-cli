@@ -1,29 +1,49 @@
 use super::*;
 
+struct RenameDentryContext<'a> {
+    source_parent: Ino,
+    source_name: &'a [u8],
+    destination_parent: Ino,
+    destination_name: &'a [u8],
+}
+
 impl RedbMetaEngine {
     fn unique_dentry_key_for_entry_in_write_table(
         txn: &redb::WriteTransaction,
         table_def: redb::TableDefinition<&'static [u8], &'static [u8]>,
+        index_def: redb::TableDefinition<&'static [u8], u8>,
         entry: &DirEntryValue,
+        context: RenameDentryContext<'_>,
     ) -> MetaResult<Option<Vec<u8>>> {
         let table = txn
             .open_table(table_def)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let mut matched_key = None;
-        for row in table
-            .iter()
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-        {
-            let (key, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+        let mut matched_keys = Vec::new();
+        for key in Self::dentry_keys_for_inode_in_write_index(txn, index_def, entry.ino)? {
+            let Some(value) = table
+                .get(key.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            else {
+                continue;
+            };
             let current: DirEntryValue = decode(value.value())?;
             if current.ino == entry.ino && current.kind == entry.kind {
-                if matched_key.is_some() {
-                    return Ok(None);
-                }
-                matched_key = Some(key.value().to_vec());
+                matched_keys.push(key);
             }
         }
-        Ok(matched_key)
+        if matched_keys.len() > 1 {
+            tracing::warn!(
+                ino = entry.ino,
+                source_parent = context.source_parent,
+                source_name = %String::from_utf8_lossy(context.source_name),
+                destination_parent = context.destination_parent,
+                destination_name = %String::from_utf8_lossy(context.destination_name),
+                candidate_count = matched_keys.len(),
+                "skipping rename conflict relocation for inode with multiple dentries"
+            );
+            return Ok(None);
+        }
+        Ok(matched_keys.pop())
     }
 
     /// Export a snapshot projected to the remote-visible published namespace.
@@ -603,21 +623,10 @@ impl RedbMetaEngine {
                     name,
                     entry,
                 } => {
-                    let key = encode_dentry_key(*parent, name);
-                    let data = encode(entry)?;
-                    let mut table = txn
-                        .open_table(BASE_DENTRIES_TABLE)
-                        .map_err(|e| MetaError::Storage(e.to_string()))?;
-                    table
-                        .insert(key.as_slice(), data.as_slice())
-                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    Self::set_base_dentry_in_txn(&txn, *parent, name, entry)?;
                 }
                 crate::events::MetaEvent::RemoveEntry { parent, name } => {
-                    let key = encode_dentry_key(*parent, name);
-                    let mut table = txn
-                        .open_table(BASE_DENTRIES_TABLE)
-                        .map_err(|e| MetaError::Storage(e.to_string()))?;
-                    let _ = table.remove(key.as_slice());
+                    Self::remove_base_dentry_in_txn(&txn, *parent, name)?;
                 }
                 crate::events::MetaEvent::RenameEntry {
                     parent,
@@ -632,7 +641,6 @@ impl RedbMetaEngine {
                     new_parent_attr,
                 } => {
                     let src_key = encode_dentry_key(*parent, name);
-                    let dst_key = encode_dentry_key(*new_parent, new_name);
 
                     let src_matches = {
                         let dentries = txn
@@ -652,23 +660,24 @@ impl RedbMetaEngine {
                         Self::unique_dentry_key_for_entry_in_write_table(
                             &txn,
                             BASE_DENTRIES_TABLE,
+                            BASE_DENTRY_BY_INODE_TABLE,
                             entry,
+                            RenameDentryContext {
+                                source_parent: *parent,
+                                source_name: name,
+                                destination_parent: *new_parent,
+                                destination_name: new_name,
+                            },
                         )?
                     };
                     let Some(current_key) = current_key else {
                         continue;
                     };
 
-                    let mut dentries = txn
-                        .open_table(BASE_DENTRIES_TABLE)
-                        .map_err(|e| MetaError::Storage(e.to_string()))?;
-                    let _ = dentries.remove(current_key.as_slice());
-                    let _ = dentries.remove(dst_key.as_slice());
-                    let data = encode(entry)?;
-                    dentries
-                        .insert(dst_key.as_slice(), data.as_slice())
-                        .map_err(|e| MetaError::Storage(e.to_string()))?;
-                    drop(dentries);
+                    let (current_parent, current_name) = decode_dentry_key(&current_key)?;
+                    Self::remove_base_dentry_in_txn(&txn, current_parent, current_name)?;
+                    Self::remove_base_dentry_in_txn(&txn, *new_parent, new_name)?;
+                    Self::set_base_dentry_in_txn(&txn, *new_parent, new_name, entry)?;
 
                     let mut inodes = txn
                         .open_table(BASE_INODES_TABLE)
@@ -877,7 +886,14 @@ impl RedbMetaEngine {
                         Self::unique_dentry_key_for_entry_in_write_table(
                             &txn,
                             DENTRIES_TABLE,
+                            DENTRY_BY_INODE_TABLE,
                             entry,
+                            RenameDentryContext {
+                                source_parent: *parent,
+                                source_name: name,
+                                destination_parent: *new_parent,
+                                destination_name: new_name,
+                            },
                         )?
                     };
                     let Some(current_key) = current_key else {
@@ -993,8 +1009,18 @@ impl RedbMetaEngine {
             Self::lookup_in_write_table(&txn, BASE_DENTRIES_TABLE, new_parent, new_name)?
                 .map(|value| value.ino == entry.ino && value.kind == entry.kind)
                 .unwrap_or(false);
-        let current_key =
-            Self::unique_dentry_key_for_entry_in_write_table(&txn, DENTRIES_TABLE, entry)?;
+        let current_key = Self::unique_dentry_key_for_entry_in_write_table(
+            &txn,
+            DENTRIES_TABLE,
+            DENTRY_BY_INODE_TABLE,
+            entry,
+            RenameDentryContext {
+                source_parent: parent,
+                source_name: name,
+                destination_parent: new_parent,
+                destination_name: new_name,
+            },
+        )?;
 
         if let Some(current_key) = current_key.as_ref() {
             let (current_parent, current_name) = decode_dentry_key(current_key)?;

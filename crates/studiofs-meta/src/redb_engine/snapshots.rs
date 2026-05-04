@@ -309,32 +309,50 @@ impl RedbMetaEngine {
             Self::clear_table_in_txn(&txn, INODE_TOMBSTONES_TABLE)?;
         }
         {
+            Self::clear_table_in_txn(&txn, DENTRY_BY_INODE_TABLE)?;
             let mut table = txn
                 .open_table(DENTRIES_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
             table
                 .retain(|_, _| false)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
+            drop(table);
             for (k, v) in &snapshot.dentries {
-                table
-                    .insert(k.as_slice(), v.as_slice())
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                let (parent, name) = decode_dentry_key(k)?;
+                let entry: DirEntryValue = decode(v)?;
+                Self::set_dentry_in_table_with_index_in_txn(
+                    &txn,
+                    DENTRIES_TABLE,
+                    DENTRY_BY_INODE_TABLE,
+                    parent,
+                    name,
+                    &entry,
+                )?;
             }
         }
         {
             Self::clear_table_in_txn(&txn, DENTRY_TOMBSTONES_TABLE)?;
         }
         {
+            Self::clear_table_in_txn(&txn, BASE_DENTRY_BY_INODE_TABLE)?;
             let mut table = txn
                 .open_table(BASE_DENTRIES_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
             table
                 .retain(|_, _| false)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
+            drop(table);
             for (k, v) in &snapshot.dentries {
-                table
-                    .insert(k.as_slice(), v.as_slice())
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                let (parent, name) = decode_dentry_key(k)?;
+                let entry: DirEntryValue = decode(v)?;
+                Self::set_dentry_in_table_with_index_in_txn(
+                    &txn,
+                    BASE_DENTRIES_TABLE,
+                    BASE_DENTRY_BY_INODE_TABLE,
+                    parent,
+                    name,
+                    &entry,
+                )?;
             }
         }
         {
