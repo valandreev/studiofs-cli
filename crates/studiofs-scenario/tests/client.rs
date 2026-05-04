@@ -154,6 +154,47 @@ fn restart_replays_only_durable_local_state() {
 }
 
 #[test]
+fn stale_foreign_publish_for_same_logical_file_does_not_override_newer_epoch() {
+    let mut runtime = SimulatedRuntime::new(37);
+    runtime.add_client("writer");
+    runtime.add_client("reader");
+
+    runtime.create_file("writer", "file.txt").unwrap();
+    runtime
+        .write_file("writer", "file.txt", 4, "checksum-v1")
+        .unwrap();
+    runtime.flush("writer", "file.txt").unwrap();
+    let stale_publish = runtime
+        .published_file_version("writer", "file.txt")
+        .unwrap();
+
+    runtime
+        .write_file("writer", "file.txt", 7, "checksum-v2")
+        .unwrap();
+    runtime.flush("writer", "file.txt").unwrap();
+    let newer_upload = runtime.schedule_upload("writer", "file.txt").unwrap();
+    runtime.complete_upload(newer_upload.upload_id).unwrap();
+    runtime.publish_file("writer", "file.txt").unwrap();
+    runtime.deliver_next_metadata("reader").unwrap();
+    assert_eq!(
+        runtime
+            .read_file("reader", "file.txt")
+            .unwrap()
+            .checksum_sha256,
+        "checksum-v2"
+    );
+
+    runtime
+        .enqueue_published_file_version("writer", "file.txt", stale_publish)
+        .unwrap();
+    runtime.deliver_next_metadata("reader").unwrap();
+
+    let file = runtime.read_file("reader", "file.txt").unwrap();
+    assert_eq!(file.size, 7);
+    assert_eq!(file.checksum_sha256, "checksum-v2");
+}
+
+#[test]
 fn recreated_file_gets_a_new_logical_id_after_rename() {
     let mut runtime = SimulatedRuntime::new(17);
     runtime.add_client("client-a");
@@ -240,4 +281,53 @@ fn rmdir_rejects_root_and_traversal_paths() {
     assert!(runtime.rmdir("client-a", "../escape").is_err());
     assert!(runtime.rmdir("client-a", "/absolute").is_err());
     assert!(runtime.rmdir("client-a", "bad\\path").is_err());
+}
+
+#[test]
+fn namespace_mutations_are_replayed_after_restart() {
+    let mut runtime = SimulatedRuntime::new(41);
+    runtime.add_client("client-a");
+
+    runtime.mkdir("client-a", "dir").unwrap();
+    runtime.restart_client("client-a").unwrap();
+    assert!(runtime.stat("client-a", "dir").is_ok());
+
+    runtime.create_file("client-a", "dir/file.txt").unwrap();
+    runtime
+        .write_file("client-a", "dir/file.txt", 4, "checksum-v1")
+        .unwrap();
+    runtime.flush("client-a", "dir/file.txt").unwrap();
+    runtime.unlink("client-a", "dir/file.txt").unwrap();
+    runtime.restart_client("client-a").unwrap();
+    assert!(runtime.stat("client-a", "dir/file.txt").is_err());
+
+    runtime.rmdir("client-a", "dir").unwrap();
+    runtime.restart_client("client-a").unwrap();
+    assert!(runtime.stat("client-a", "dir").is_err());
+}
+
+#[test]
+fn directory_rename_preserves_logical_id_after_restart() {
+    let mut runtime = SimulatedRuntime::new(43);
+    runtime.add_client("client-a");
+
+    runtime.mkdir("client-a", "dir").unwrap();
+    let before = directory_logical_id(&runtime, "dir");
+
+    runtime.rename("client-a", "dir", "renamed").unwrap();
+    runtime.restart_client("client-a").unwrap();
+
+    let after = directory_logical_id(&runtime, "renamed");
+    assert_eq!(before, after);
+}
+
+fn directory_logical_id(runtime: &SimulatedRuntime, path: &str) -> String {
+    runtime
+        .logical_snapshot()
+        .clients
+        .iter()
+        .flat_map(|client| &client.entries)
+        .find(|entry| entry.path == path)
+        .and_then(|entry| entry.logical_id.clone())
+        .expect("directory logical id exists")
 }

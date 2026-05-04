@@ -189,6 +189,7 @@ cargo test -p studiofs-e2e namespace_collision_records_operations_and_validates_
 cargo test -p studiofs-e2e scenario::tests::crash_restart_recovery_runs_both_modes_reuses_client_root_and_converges -- --exact --nocapture
 cargo test -p studiofs-e2e --test client_controller force_kill_then_remount_reuses_same_client_root_without_graceful_umount -- --exact --nocapture
 cargo test -p studiofs-scenario --test collision -- --nocapture
+cargo test -p studiofs-scenario --test crash_replay -- --nocapture
 ```
 
 ## Platform-Gated Unit Tests

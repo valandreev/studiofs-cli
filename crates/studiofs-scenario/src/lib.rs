@@ -2,6 +2,7 @@
 
 pub mod client;
 pub mod collision;
+pub mod crash_replay;
 pub mod invariant;
 pub mod metadata_bus;
 pub mod object_store;
