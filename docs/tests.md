@@ -99,7 +99,9 @@ cargo test -p studiofs-vfs --test vfs_test file_session_flush_ordering_is_determ
 
 ### Smoke test descriptions
 
-The `mount_sanity` integration tests in each bridge crate contain two tiers:
+The `mount_sanity` integration tests share two lifecycle smoke tiers as the
+common bridge baseline, with bridge- or platform-specific additions where
+needed:
 
 | Test | Backend | Verifies |
 |------|---------|----------|
