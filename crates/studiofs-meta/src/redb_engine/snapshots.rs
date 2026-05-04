@@ -316,18 +316,19 @@ impl RedbMetaEngine {
             table
                 .retain(|_, _| false)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
-            drop(table);
+            let mut index = txn
+                .open_table(DENTRY_BY_INODE_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
             for (k, v) in &snapshot.dentries {
                 let (parent, name) = decode_dentry_key(k)?;
                 let entry: DirEntryValue = decode(v)?;
-                Self::set_dentry_in_table_with_index_in_txn(
-                    &txn,
-                    DENTRIES_TABLE,
-                    DENTRY_BY_INODE_TABLE,
-                    parent,
-                    name,
-                    &entry,
-                )?;
+                table
+                    .insert(k.as_slice(), v.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                let index_key = encode_dentry_by_inode_key(entry.ino, parent, name);
+                index
+                    .insert(index_key.as_slice(), 1)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
             }
         }
         {
@@ -341,18 +342,19 @@ impl RedbMetaEngine {
             table
                 .retain(|_, _| false)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
-            drop(table);
+            let mut index = txn
+                .open_table(BASE_DENTRY_BY_INODE_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
             for (k, v) in &snapshot.dentries {
                 let (parent, name) = decode_dentry_key(k)?;
                 let entry: DirEntryValue = decode(v)?;
-                Self::set_dentry_in_table_with_index_in_txn(
-                    &txn,
-                    BASE_DENTRIES_TABLE,
-                    BASE_DENTRY_BY_INODE_TABLE,
-                    parent,
-                    name,
-                    &entry,
-                )?;
+                table
+                    .insert(k.as_slice(), v.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                let index_key = encode_dentry_by_inode_key(entry.ino, parent, name);
+                index
+                    .insert(index_key.as_slice(), 1)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
             }
         }
         {

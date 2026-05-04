@@ -1151,16 +1151,14 @@ impl RedbMetaEngine {
         entry: &DirEntryValue,
     ) -> MetaResult<()> {
         let key = encode_dentry_key(parent, name);
-        let old_entry = {
-            let table = txn
-                .open_table(table_def)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            table
-                .get(key.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-                .map(|value| decode::<DirEntryValue>(value.value()))
-                .transpose()?
-        };
+        let mut table = txn
+            .open_table(table_def)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let old_entry = table
+            .get(key.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .map(|value| decode::<DirEntryValue>(value.value()))
+            .transpose()?;
         if let Some(old_entry) = old_entry {
             Self::remove_dentry_from_inode_index_in_txn(
                 txn,
@@ -1172,9 +1170,6 @@ impl RedbMetaEngine {
         }
 
         let data = encode(entry)?;
-        let mut table = txn
-            .open_table(table_def)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
         table
             .insert(key.as_slice(), data.as_slice())
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -1191,20 +1186,14 @@ impl RedbMetaEngine {
         name: &[u8],
     ) -> MetaResult<()> {
         let key = encode_dentry_key(parent, name);
-        let old_entry = {
-            let table = txn
-                .open_table(table_def)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            table
-                .get(key.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-                .map(|value| decode::<DirEntryValue>(value.value()))
-                .transpose()?
-        };
-
         let mut table = txn
             .open_table(table_def)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let old_entry = table
+            .get(key.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .map(|value| decode::<DirEntryValue>(value.value()))
+            .transpose()?;
         let _ = table.remove(key.as_slice());
         drop(table);
 
