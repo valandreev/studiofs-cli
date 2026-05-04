@@ -207,7 +207,7 @@ kill, and restart/remount. Scenarios must use this controller rather than
 sharing one local metadata DB or falling back to direct VFS calls.
 Crash-style remounts do not run `studiofs umount` for the killed client. On
 Linux, before spawning the replacement mount process, the controller attempts a
-lazy stale-mount cleanup for leftover FUSE mountpoints with `fusermount3 -u -z`,
+lazy stale-mount cleanup for leftover FUSE mount points with `fusermount3 -u -z`,
 `fusermount -u -z`, or `umount -l`. Other platforms keep the existing remount
 path unless a platform-specific stale-mount cleanup is added.
 
@@ -306,7 +306,7 @@ overwrites the committed file version.
 
 Mounted scenarios validate client-visible invariants through the
 `studiofs-e2e::mounted_tree` validator. The validator snapshots public
-mountpoints only; it must not inspect private VFS, metadata, cache, PostgreSQL,
+mount points only; it must not inspect private VFS, metadata, cache, PostgreSQL,
 or object-store state to decide whether a scenario passed.
 
 The portable equality contract is intentionally narrow:
@@ -501,7 +501,7 @@ Required checks:
   `docker compose up --detach --wait` with a project-scoped name and records the
   copied compose file plus logs under `artifacts/docker/`.
 - Mount support:
-  - Linux requires a usable `/dev/fuse`, mountpoint creation rights, and the
+  - Linux requires a usable `/dev/fuse`, mount point creation rights, and the
     FUSE backend expected by `studiofs-fuse`.
   - Windows requires WinFSP installed, `winfsp-x64.dll` loadable by the
     product CLI, a free drive letter, and either elevation or a configured

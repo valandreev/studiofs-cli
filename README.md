@@ -109,7 +109,7 @@ studiofs mount myvolume Y:
 | `init` | Create a new volume and register it in PostgreSQL |
 | `discover` | Bootstrap a new client from an existing PostgreSQL-backed volume |
 | `mount` | Mount a volume as a local filesystem |
-| `umount` | Unmount an active mountpoint |
+| `umount` | Unmount an active mount point |
 | `status` | Show local/runtime volume status |
 | `janitor` | Scan and clean orphaned remote objects |
 | `fsck` | Scan/repair metadata inconsistencies (dangling entries, orphans, undo state) |
