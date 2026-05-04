@@ -82,6 +82,14 @@ pub struct CollisionTraceRecord {
     pub client: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checksum_sha256: Option<String>,
 }
 
 pub fn run_collision_suite(config: CollisionSuiteConfig) -> CollisionSuiteReport {
@@ -228,15 +236,24 @@ impl FamilyHarness {
     }
 
     fn push(&mut self, kind: &str, client: Option<&str>, path: Option<&str>) {
-        self.trace.push(CollisionTraceRecord {
+        self.push_record(CollisionTraceRecord {
             step: self.trace.len() as u64 + 1,
             kind: kind.to_string(),
             client: client.map(str::to_string),
             path: path.map(str::to_string),
+            source_path: None,
+            target_path: None,
+            bytes: None,
+            checksum_sha256: None,
         });
     }
 
-    fn record_result(
+    fn push_record(&mut self, mut record: CollisionTraceRecord) {
+        record.step = self.trace.len() as u64 + 1;
+        self.trace.push(record);
+    }
+
+    fn record_path_result(
         &mut self,
         accepted: bool,
         accepted_kind: &str,
@@ -250,6 +267,56 @@ impl FamilyHarness {
             rejected_kind
         };
         self.push(kind, Some(client), Some(path));
+    }
+
+    fn record_rename_result(
+        &mut self,
+        accepted: bool,
+        accepted_kind: &str,
+        rejected_kind: &str,
+        client: &str,
+        source_path: &str,
+        target_path: &str,
+    ) {
+        let kind = if accepted {
+            accepted_kind
+        } else {
+            rejected_kind
+        };
+        self.push_record(CollisionTraceRecord {
+            step: 0,
+            kind: kind.to_string(),
+            client: Some(client.to_string()),
+            path: Some(if accepted { target_path } else { source_path }.to_string()),
+            source_path: Some(source_path.to_string()),
+            target_path: Some(target_path.to_string()),
+            bytes: None,
+            checksum_sha256: None,
+        });
+    }
+
+    fn record_append_result(
+        &mut self,
+        accepted: bool,
+        client: &str,
+        path: &str,
+        bytes: u64,
+        checksum_sha256: &str,
+    ) {
+        self.push_record(CollisionTraceRecord {
+            step: 0,
+            kind: if accepted {
+                "beta_append".to_string()
+            } else {
+                "beta_append_rejected".to_string()
+            },
+            client: Some(client.to_string()),
+            path: Some(path.to_string()),
+            source_path: None,
+            target_path: None,
+            bytes: Some(bytes),
+            checksum_sha256: Some(checksum_sha256.to_string()),
+        });
     }
 
     fn run_race(
@@ -292,16 +359,13 @@ impl FamilyHarness {
                     .runtime
                     .rename("alpha", "shared.txt", "alpha_win.txt")
                     .is_ok();
-                self.record_result(
+                self.record_rename_result(
                     accepted,
                     "alpha_rename",
                     "alpha_rename_rejected",
                     "alpha",
-                    if accepted {
-                        "alpha_win.txt"
-                    } else {
-                        "shared.txt"
-                    },
+                    "shared.txt",
+                    "alpha_win.txt",
                 );
             }
             PlannedCollisionOp::BetaRenameToBetaWin => {
@@ -309,16 +373,13 @@ impl FamilyHarness {
                     .runtime
                     .rename("beta", "shared.txt", "beta_win.txt")
                     .is_ok();
-                self.record_result(
+                self.record_rename_result(
                     accepted,
                     "beta_rename",
                     "beta_rename_rejected",
                     "beta",
-                    if accepted {
-                        "beta_win.txt"
-                    } else {
-                        "shared.txt"
-                    },
+                    "shared.txt",
+                    "beta_win.txt",
                 );
             }
             PlannedCollisionOp::AlphaRenameToKept => {
@@ -326,17 +387,18 @@ impl FamilyHarness {
                     .runtime
                     .rename("alpha", "shared.txt", "kept.txt")
                     .is_ok();
-                self.record_result(
+                self.record_rename_result(
                     accepted,
                     "alpha_rename",
                     "alpha_rename_rejected",
                     "alpha",
-                    if accepted { "kept.txt" } else { "shared.txt" },
+                    "shared.txt",
+                    "kept.txt",
                 );
             }
             PlannedCollisionOp::AlphaUnlink => {
                 let accepted = self.runtime.unlink("alpha", "shared.txt").is_ok();
-                self.record_result(
+                self.record_path_result(
                     accepted,
                     "alpha_unlink",
                     "alpha_unlink_rejected",
@@ -346,7 +408,7 @@ impl FamilyHarness {
             }
             PlannedCollisionOp::BetaUnlink => {
                 let accepted = self.runtime.unlink("beta", "shared.txt").is_ok();
-                self.record_result(
+                self.record_path_result(
                     accepted,
                     "beta_unlink",
                     "beta_unlink_rejected",
@@ -355,16 +417,18 @@ impl FamilyHarness {
                 );
             }
             PlannedCollisionOp::BetaAppend => {
+                const APPEND_BYTES: u64 = 1;
+                const APPEND_CHECKSUM: &str = "checksum-appended";
                 let accepted = self
                     .runtime
-                    .append_file("beta", "shared.txt", 1, "checksum-appended")
+                    .append_file("beta", "shared.txt", APPEND_BYTES, APPEND_CHECKSUM)
                     .is_ok();
-                self.record_result(
+                self.record_append_result(
                     accepted,
-                    "beta_append",
-                    "beta_append_rejected",
                     "beta",
                     "shared.txt",
+                    APPEND_BYTES,
+                    APPEND_CHECKSUM,
                 );
             }
             PlannedCollisionOp::AlphaOverwrite => {
@@ -372,7 +436,7 @@ impl FamilyHarness {
                     .runtime
                     .write_file("alpha", "versioned.txt", 4, "checksum-v2")
                     .is_ok();
-                self.record_result(
+                self.record_path_result(
                     accepted,
                     "alpha_overwrite",
                     "alpha_overwrite_rejected",
@@ -382,7 +446,7 @@ impl FamilyHarness {
             }
             PlannedCollisionOp::BetaStaleRead => {
                 let accepted = self.runtime.read_file("beta", "versioned.txt").is_ok();
-                self.record_result(
+                self.record_path_result(
                     accepted,
                     "beta_stale_read",
                     "beta_stale_read_rejected",
@@ -392,7 +456,7 @@ impl FamilyHarness {
             }
             PlannedCollisionOp::AlphaRmdir => {
                 let accepted = self.runtime.rmdir("alpha", "dir").is_ok();
-                self.record_result(
+                self.record_path_result(
                     accepted,
                     "alpha_rmdir",
                     "alpha_rmdir_rejected",
@@ -407,7 +471,7 @@ impl FamilyHarness {
                         .write_file("beta", "dir/child.txt", 1, "checksum-child")
                         .unwrap();
                 }
-                self.record_result(
+                self.record_path_result(
                     accepted,
                     "beta_create_inside",
                     "beta_create_inside_rejected",
@@ -417,7 +481,7 @@ impl FamilyHarness {
             }
             PlannedCollisionOp::AlphaPublishMetadata => {
                 let accepted = self.runtime.deliver_next_metadata("beta").is_ok();
-                self.record_result(
+                self.record_path_result(
                     accepted,
                     "alpha_publish_metadata",
                     "alpha_publish_metadata_rejected",
@@ -430,21 +494,18 @@ impl FamilyHarness {
                     .runtime
                     .rename("beta", "remote.txt", "local_remote.txt")
                     .is_ok();
-                self.record_result(
+                self.record_rename_result(
                     accepted,
                     "beta_local_rename",
                     "beta_local_rename_rejected",
                     "beta",
-                    if accepted {
-                        "local_remote.txt"
-                    } else {
-                        "remote.txt"
-                    },
+                    "remote.txt",
+                    "local_remote.txt",
                 );
             }
             PlannedCollisionOp::AlphaPublishV2 => {
                 let accepted = self.runtime.publish_file("alpha", "published.txt").is_ok();
-                self.record_result(
+                self.record_path_result(
                     accepted,
                     "alpha_publish_v2",
                     "alpha_publish_v2_rejected",
@@ -454,7 +515,7 @@ impl FamilyHarness {
             }
             PlannedCollisionOp::BetaForeignApply => {
                 let accepted = self.runtime.deliver_next_metadata("beta").is_ok();
-                self.record_result(
+                self.record_path_result(
                     accepted,
                     "beta_foreign_apply",
                     "beta_foreign_apply_rejected",
@@ -496,17 +557,30 @@ fn operation_from_trace(record: &CollisionTraceRecord) -> ScenarioOperation {
         "create_dir" => ScenarioOperation::CreateDirectory {
             path: trace_path(record),
         },
-        "rename_accepted" | "rename_rejected" => ScenarioOperation::Rename {
-            from: trace_path(record),
-            to: trace_path(record),
+        "alpha_rename"
+        | "alpha_rename_rejected"
+        | "beta_rename"
+        | "beta_rename_rejected"
+        | "beta_local_rename"
+        | "beta_local_rename_rejected" => ScenarioOperation::Rename {
+            from: record
+                .source_path
+                .clone()
+                .unwrap_or_else(|| trace_path(record)),
+            to: record
+                .target_path
+                .clone()
+                .unwrap_or_else(|| trace_path(record)),
         },
-        "unlink_accepted" | "unlink_rejected" => ScenarioOperation::Unlink {
+        "alpha_unlink" | "alpha_unlink_rejected" | "beta_unlink" | "beta_unlink_rejected" => {
+            ScenarioOperation::Unlink {
+                path: trace_path(record),
+            }
+        }
+        "beta_append" | "beta_append_rejected" => ScenarioOperation::Append {
             path: trace_path(record),
-        },
-        "append_accepted" | "append_rejected" => ScenarioOperation::Append {
-            path: trace_path(record),
-            bytes: 0,
-            checksum_sha256: None,
+            bytes: record.bytes.unwrap_or_default(),
+            checksum_sha256: record.checksum_sha256.clone(),
         },
         "publish_to_peer" | "published_to_peer" => ScenarioOperation::Fsync {
             path: trace_path(record),
@@ -828,5 +902,106 @@ fn injected_invariant_failure(h: &mut FamilyHarness) {
         kind: "counterexample_replay_ready".to_string(),
         client: None,
         path: Some("only-alpha.txt".to_string()),
+        source_path: None,
+        target_path: None,
+        bytes: None,
+        checksum_sha256: None,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn operation_from_trace_maps_actual_collision_trace_kinds() {
+        assert_eq!(
+            operation_from_trace(&trace_record_with_paths(
+                "alpha_rename",
+                "alpha",
+                "alpha_win.txt",
+                "shared.txt",
+                "alpha_win.txt",
+            )),
+            ScenarioOperation::Rename {
+                from: "shared.txt".to_string(),
+                to: "alpha_win.txt".to_string(),
+            }
+        );
+        assert_eq!(
+            operation_from_trace(&trace_record("beta_unlink_rejected", "beta", "shared.txt")),
+            ScenarioOperation::Unlink {
+                path: "shared.txt".to_string(),
+            }
+        );
+        assert_eq!(
+            operation_from_trace(&append_trace_record(
+                "beta_append",
+                "beta",
+                "shared.txt",
+                1,
+                "checksum-appended",
+            )),
+            ScenarioOperation::Append {
+                path: "shared.txt".to_string(),
+                bytes: 1,
+                checksum_sha256: Some("checksum-appended".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn operation_from_trace_keeps_scheduler_events_as_checkpoints() {
+        assert_eq!(
+            operation_from_trace(&trace_record(
+                "scheduler_selected",
+                "alpha",
+                "alpha_rename_to_alpha_win",
+            )),
+            ScenarioOperation::SchedulerCheckpoint {
+                name: "scheduler_selected".to_string(),
+            }
+        );
+    }
+
+    fn trace_record(kind: &str, client: &str, path: &str) -> CollisionTraceRecord {
+        CollisionTraceRecord {
+            step: 1,
+            kind: kind.to_string(),
+            client: Some(client.to_string()),
+            path: Some(path.to_string()),
+            source_path: None,
+            target_path: None,
+            bytes: None,
+            checksum_sha256: None,
+        }
+    }
+
+    fn trace_record_with_paths(
+        kind: &str,
+        client: &str,
+        path: &str,
+        source_path: &str,
+        target_path: &str,
+    ) -> CollisionTraceRecord {
+        CollisionTraceRecord {
+            source_path: Some(source_path.to_string()),
+            target_path: Some(target_path.to_string()),
+            ..trace_record(kind, client, path)
+        }
+    }
+
+    fn append_trace_record(
+        kind: &str,
+        client: &str,
+        path: &str,
+        bytes: u64,
+        checksum_sha256: &str,
+    ) -> CollisionTraceRecord {
+        CollisionTraceRecord {
+            bytes: Some(bytes),
+            checksum_sha256: Some(checksum_sha256.to_string()),
+            ..trace_record(kind, client, path)
+        }
+    }
 }

@@ -649,10 +649,10 @@ pub fn replay_simulation_counterexample(
             failure.group == artifact.group
                 && failure.seed == artifact.seed
                 && failure.violated_invariant == artifact.failure.violated_invariant
-                && failure
-                    .replay_evidence
-                    .as_ref()
-                    .is_none_or(|evidence| evidence.sub_group == artifact.sub_group)
+                && match failure.replay_evidence.as_ref() {
+                    Some(evidence) => evidence.sub_group == artifact.sub_group,
+                    None => true,
+                }
         })
         .ok_or_else(|| {
             SimulationCorpusError::ReplayMismatch(
