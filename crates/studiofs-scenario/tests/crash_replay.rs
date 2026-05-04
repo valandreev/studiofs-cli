@@ -1,7 +1,7 @@
 use studiofs_scenario::ScenarioOperation;
 use studiofs_scenario::crash_replay::{
-    CrashReplayFamily, CrashReplaySuiteConfig, read_crash_replay_counterexample,
-    replay_crash_replay_counterexample, run_crash_replay_suite,
+    CrashReplayArtifactError, CrashReplayFamily, CrashReplaySuiteConfig,
+    read_crash_replay_counterexample, replay_crash_replay_counterexample, run_crash_replay_suite,
     run_crash_replay_suite_with_artifacts,
 };
 
@@ -120,6 +120,7 @@ fn crash_replay_failure_writes_replayable_counterexample_artifact() {
     );
     assert!(!artifact.scheduler_trace.is_empty());
     assert!(!artifact.operation_log.is_empty());
+    assert!(artifact.replay_command.contains("\""));
     assert!(artifact.operation_log.iter().any(|record| {
         matches!(
             &record.operation,
@@ -167,6 +168,33 @@ fn counterexample_artifact_path_uses_unknown_for_empty_sanitized_scenarios() {
         .as_ref()
         .expect("failure records its counterexample artifact path");
     assert!(artifact_path.replace('\\', "/").contains("/unknown/"));
+}
+
+#[test]
+fn artifact_write_failures_are_collected_across_all_failing_seeds() {
+    let artifact_root_file = unique_temp_dir("sfs339-artifact-root-file");
+    std::fs::write(&artifact_root_file, b"not a directory").expect("create artifact root file");
+
+    let error = run_crash_replay_suite_with_artifacts(
+        CrashReplaySuiteConfig {
+            scenario: "sfs339-write-failure-collection".to_string(),
+            seeds: vec![13, 14],
+            families: vec![CrashReplayFamily::InjectedInvariantFailure],
+        },
+        &artifact_root_file,
+    )
+    .expect_err("artifact writes fail after all failing seeds are attempted");
+
+    match error {
+        CrashReplayArtifactError::ArtifactWriteFailures { errors } => {
+            assert_eq!(errors.len(), 2);
+            assert_eq!(
+                errors.iter().map(|error| error.seed).collect::<Vec<_>>(),
+                vec![13, 14]
+            );
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
 }
 
 #[test]

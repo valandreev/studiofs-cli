@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::BufWriter;
+use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -135,8 +135,23 @@ pub enum CrashReplayArtifactError {
     Json(#[from] serde_json::Error),
     #[error("unsupported counterexample artifact schema version {0}")]
     UnsupportedSchemaVersion(u32),
+    #[error("counterexample artifact path is not valid UTF-8: {path:?}")]
+    InvalidArtifactPath { path: PathBuf },
+    #[error("counterexample artifact writes failed: {errors:?}")]
+    ArtifactWriteFailures {
+        errors: Vec<CrashReplayArtifactWriteFailure>,
+    },
     #[error("counterexample replay did not reproduce: {0}")]
     ReplayMismatch(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrashReplayArtifactWriteFailure {
+    pub scenario: String,
+    pub family: CrashReplayFamily,
+    pub seed: u64,
+    pub path: PathBuf,
+    pub error: String,
 }
 
 pub fn run_crash_replay_suite(config: CrashReplaySuiteConfig) -> CrashReplaySuiteReport {
@@ -173,6 +188,7 @@ pub fn run_crash_replay_suite_with_artifacts(
     let artifact_root = artifact_root.as_ref();
     let mut family_reports = Vec::new();
     let mut failures = Vec::new();
+    let mut artifact_write_errors = Vec::new();
 
     for family in config.families {
         let mut seed_reports = Vec::new();
@@ -181,11 +197,24 @@ pub fn run_crash_replay_suite_with_artifacts(
             if run.failure.is_some() {
                 let artifact_path =
                     counterexample_artifact_path(artifact_root, &config.scenario, family, *seed);
-                let artifact = run.counterexample_artifact(&artifact_path);
-                write_crash_replay_counterexample(&artifact_path, &artifact)?;
-                if let Some(failure) = &mut run.failure {
-                    failure.counterexample_artifact_path =
-                        Some(artifact_path.to_string_lossy().into_owned());
+                match run
+                    .counterexample_artifact(&artifact_path)
+                    .and_then(|artifact| {
+                        write_crash_replay_counterexample(&artifact_path, &artifact)
+                    }) {
+                    Ok(()) => {
+                        if let Some(failure) = &mut run.failure {
+                            failure.counterexample_artifact_path =
+                                Some(artifact_path_utf8(&artifact_path)?.to_string());
+                        }
+                    }
+                    Err(error) => artifact_write_errors.push(CrashReplayArtifactWriteFailure {
+                        scenario: config.scenario.clone(),
+                        family,
+                        seed: *seed,
+                        path: artifact_path,
+                        error: error.to_string(),
+                    }),
                 }
             }
             if let Some(failure) = run.failure {
@@ -196,6 +225,12 @@ pub fn run_crash_replay_suite_with_artifacts(
         family_reports.push(CrashReplayFamilyReport {
             family,
             seed_reports,
+        });
+    }
+
+    if !artifact_write_errors.is_empty() {
+        return Err(CrashReplayArtifactError::ArtifactWriteFailures {
+            errors: artifact_write_errors,
         });
     }
 
@@ -224,7 +259,8 @@ pub fn read_crash_replay_counterexample(
     path: impl AsRef<Path>,
 ) -> Result<CrashReplayCounterexampleArtifact, CrashReplayArtifactError> {
     let file = fs::File::open(path)?;
-    let artifact: CrashReplayCounterexampleArtifact = serde_json::from_reader(file)?;
+    let reader = BufReader::new(file);
+    let artifact: CrashReplayCounterexampleArtifact = serde_json::from_reader(reader)?;
     if artifact.schema_version != CRASH_REPLAY_COUNTEREXAMPLE_SCHEMA_VERSION {
         return Err(CrashReplayArtifactError::UnsupportedSchemaVersion(
             artifact.schema_version,
@@ -285,12 +321,15 @@ struct FamilyRun {
 }
 
 impl FamilyRun {
-    fn counterexample_artifact(&self, artifact_path: &Path) -> CrashReplayCounterexampleArtifact {
+    fn counterexample_artifact(
+        &self,
+        artifact_path: &Path,
+    ) -> Result<CrashReplayCounterexampleArtifact, CrashReplayArtifactError> {
         let failure = self
             .failure
             .as_ref()
             .expect("counterexample artifact requires a failure");
-        CrashReplayCounterexampleArtifact {
+        Ok(CrashReplayCounterexampleArtifact {
             schema_version: CRASH_REPLAY_COUNTEREXAMPLE_SCHEMA_VERSION,
             scenario: failure.scenario.clone(),
             family: failure.family,
@@ -317,11 +356,18 @@ impl FamilyRun {
             },
             final_snapshot: Some(self.final_snapshot.clone()),
             replay_command: format!(
-                "cargo run -p studiofs-scenario --bin studiofs-scenario -- replay-counterexample {}",
-                artifact_path.to_string_lossy()
+                "cargo run -p studiofs-scenario --bin studiofs-scenario -- replay-counterexample \"{}\"",
+                artifact_path_utf8(artifact_path)?
             ),
-        }
+        })
     }
+}
+
+fn artifact_path_utf8(path: &Path) -> Result<&str, CrashReplayArtifactError> {
+    path.to_str()
+        .ok_or_else(|| CrashReplayArtifactError::InvalidArtifactPath {
+            path: path.to_path_buf(),
+        })
 }
 
 struct CrashHarness {
