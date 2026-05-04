@@ -224,6 +224,15 @@ scenario definition first. If it reproduces in Contract/Core, treat it as a
 production core bug. If Contract/Core passes but mounted replay fails, treat it
 as a bridge, process lifecycle, or integration bug.
 
+The first production-backed adapter lives on
+`studiofs_vfs::contract_harness::ContractVfsFixture::replay_operation_records`.
+It applies portable namespace and local file-content operations
+(`create_file`, `create_directory`, `write`, `append`, `truncate`, `rename`,
+`unlink`, `rmdir`, `read`, `stat`, `readdir`, `flush`, and `fsync`) through the
+real VFS fixture and reports checkpoints, mounted-only operations, crash/restart
+markers, and infrastructure outages as skipped records. Skipped records are not
+coverage; use mounted E2E replay for those.
+
 Local commands:
 
 ```powershell

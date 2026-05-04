@@ -8,6 +8,7 @@ license.workspace = true
 studiofs-meta.workspace = true
 studiofs-data.workspace = true
 studiofs-cache.workspace = true
+studiofs-scenario.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 bytes.workspace = true

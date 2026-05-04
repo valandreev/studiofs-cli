@@ -181,10 +181,14 @@ Use three execution depths:
 - exploratory corpus: larger local or RWX seed windows used to find new bugs,
   with the seed range and scenario group captured in the run notes.
 
-The current implementation supports model search directly. Product-backed
-Contract/Core replay and mounted replay are the next required integration steps
-before deterministic simulation can be considered a full StudioFS product
-correctness gate.
+The current implementation supports model search directly and includes an
+initial production-backed VFS Contract/Core replay adapter for portable
+`ScenarioOperationRecord` logs. The first adapter applies namespace and local
+file-content operations through `studiofs_vfs::contract_harness::ContractVfsFixture`,
+runs production metadata/VFS invariants, and reports unsupported records as
+skipped rather than silently treating them as covered. Mounted replay remains
+the next required integration step before deterministic simulation can be
+considered a full StudioFS product correctness gate.
 
 ## Phase 1/2 Reuse
 

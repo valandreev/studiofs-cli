@@ -14,6 +14,9 @@ use studiofs_meta::schema::{
 use studiofs_meta::{
     FileLockLease, HardLockKind, MetaEngine, MetaFormat, MetaFsOps, RedbMetaEngine,
 };
+use studiofs_scenario::{
+    OperationOutcome, ScenarioOperation, ScenarioOperationRecord, SimulationSupport,
+};
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
 
@@ -239,6 +242,127 @@ fn contract_vfs_harness_drop_inside_tokio_runtime_does_not_panic() {
         result.is_ok(),
         "dropping a contract VFS fixture inside an existing Tokio runtime should not panic"
     );
+}
+
+#[test]
+fn contract_vfs_replays_shared_scenario_operation_records() {
+    let mut fixture =
+        ContractVfsFixture::new("vfs-contract-scenario-replay").expect("create fixture");
+    let records = vec![
+        ScenarioOperationRecord::new(
+            "contract-replay",
+            1,
+            ScenarioOperation::CreateDirectory {
+                path: "dir".to_string(),
+            },
+        ),
+        ScenarioOperationRecord::new(
+            "contract-replay",
+            2,
+            ScenarioOperation::CreateFile {
+                path: "dir/file.txt".to_string(),
+                bytes: Some(3),
+            },
+        ),
+        ScenarioOperationRecord::new(
+            "contract-replay",
+            3,
+            ScenarioOperation::Write {
+                path: "dir/file.txt".to_string(),
+                offset: Some(1),
+                bytes: 2,
+                checksum_sha256: None,
+            },
+        ),
+        ScenarioOperationRecord::new(
+            "contract-replay",
+            4,
+            ScenarioOperation::Fsync {
+                path: "dir/file.txt".to_string(),
+            },
+        ),
+        ScenarioOperationRecord::new(
+            "contract-replay",
+            5,
+            ScenarioOperation::Rename {
+                from: "dir/file.txt".to_string(),
+                to: "dir/final.txt".to_string(),
+            },
+        ),
+        ScenarioOperationRecord::new(
+            "contract-replay",
+            6,
+            ScenarioOperation::Stat {
+                path: "dir/final.txt".to_string(),
+            },
+        ),
+        ScenarioOperationRecord::new(
+            "contract-replay",
+            7,
+            ScenarioOperation::Read {
+                path: "dir/final.txt".to_string(),
+                bytes: Some(3),
+                checksum_sha256: None,
+            },
+        ),
+        ScenarioOperationRecord::new(
+            "contract-replay",
+            8,
+            ScenarioOperation::Readdir {
+                path: "dir".to_string(),
+            },
+        ),
+        ScenarioOperationRecord::new(
+            "contract-replay",
+            9,
+            ScenarioOperation::Unlink {
+                path: "dir/final.txt".to_string(),
+            },
+        ),
+        ScenarioOperationRecord::new(
+            "contract-replay",
+            10,
+            ScenarioOperation::Rmdir {
+                path: "dir".to_string(),
+            },
+        ),
+        ScenarioOperationRecord::new(
+            "contract-replay",
+            11,
+            ScenarioOperation::SchedulerCheckpoint {
+                name: "after-delete".to_string(),
+            },
+        )
+        .with_outcome(OperationOutcome::Observed),
+        ScenarioOperationRecord::new(
+            "contract-replay",
+            12,
+            ScenarioOperation::MountedOnly {
+                name: "platform-probe".to_string(),
+                reason: "requires a mounted filesystem".to_string(),
+            },
+        )
+        .with_simulation_support(SimulationSupport::Unsupported {
+            reason: "requires a mounted filesystem".to_string(),
+        }),
+    ];
+
+    let report = fixture
+        .replay_operation_records(&records)
+        .expect("replay shared operation records");
+
+    assert_eq!(report.applied.len(), 10, "{report:#?}");
+    assert_eq!(report.skipped.len(), 2, "{report:#?}");
+    assert!(
+        report
+            .skipped
+            .iter()
+            .any(|record| record.sequence == 11 && record.reason.contains("checkpoint")),
+        "{report:#?}"
+    );
+    fixture
+        .assert_invariants("after shared scenario operation replay")
+        .expect("contract replay invariants");
 }
 
 trait FileGraphMetaFixture {

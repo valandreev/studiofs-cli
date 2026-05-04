@@ -1307,6 +1307,14 @@ trait CrashRestartDriver {
     fn clients(&self) -> Vec<ClientSpec>;
     fn force_kill(&mut self, client: &str) -> Result<(), ScenarioError>;
     fn remount(&mut self, client: &str) -> Result<(), ScenarioError>;
+    fn before_convergence_validation(
+        &mut self,
+        _mode: CrashRestartMode,
+        _relative_path: &str,
+        _clients: &[ClientSpec],
+    ) -> Result<(), ScenarioError> {
+        Ok(())
+    }
     fn unmount_all(&mut self) -> Result<(), ScenarioError>;
 }
 
@@ -1469,6 +1477,8 @@ fn run_crash_restart_mode(
     }
     let local_read_checksum_sha256 = bytes_sha256(&local_read_payload);
     let restart_elapsed_ms = elapsed_millis_nonzero(restart_started);
+
+    driver.before_convergence_validation(mode, relative_path, clients)?;
 
     let convergence_started = Instant::now();
     let peer_visible_before_convergence =
@@ -3090,19 +3100,9 @@ mod tests {
                 )?;
             }
             if self.corrupt_converged_payload_after_remount {
-                let clients = self.clients.clone();
-                thread::spawn(move || {
-                    thread::sleep(Duration::from_millis(20));
-                    for client in clients {
-                        std::fs::write(
-                            client
-                                .mount_point
-                                .join(CRASH_RESTART_LOCAL_DURABLE_FILE_NAME),
-                            b"wrong converged payload after restart\n",
-                        )
-                        .unwrap();
-                    }
-                });
+                self.actions
+                    .borrow_mut()
+                    .push("defer_corrupt_converged_payload".to_string());
             }
             if self.publish_current_file_on_remount {
                 let crashed = self
@@ -3120,6 +3120,23 @@ mod tests {
                             std::fs::write(peer.mount_point.join(relative_path), &payload)?;
                         }
                     }
+                }
+            }
+            Ok(())
+        }
+
+        fn before_convergence_validation(
+            &mut self,
+            _mode: CrashRestartMode,
+            relative_path: &str,
+            clients: &[ClientSpec],
+        ) -> Result<(), ScenarioError> {
+            if self.corrupt_converged_payload_after_remount {
+                for client in clients {
+                    std::fs::write(
+                        client.mount_point.join(relative_path),
+                        b"wrong converged payload after restart\n",
+                    )?;
                 }
             }
             Ok(())
@@ -3800,7 +3817,8 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("peer data does not match written payload")
+                .contains("peer data does not match written payload"),
+            "{err}"
         );
     }
 
