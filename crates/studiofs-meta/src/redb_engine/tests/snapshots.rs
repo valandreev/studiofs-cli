@@ -82,6 +82,47 @@ fn test_snapshot_payload_codec_roundtrips_and_reads_json() {
 }
 
 #[test]
+fn test_import_snapshot_rebuilds_inode_dentry_indexes() {
+    let source = temp_engine();
+    let file = source
+        .create_file(ROOT_INO, b"snapshot-source.txt", 1000, 1000, 0o644)
+        .unwrap();
+    source
+        .link(file.ino, ROOT_INO, b"snapshot-link.txt")
+        .unwrap();
+
+    let snapshot = source.export_snapshot().unwrap();
+    let imported = temp_engine();
+    imported.import_snapshot(&snapshot).unwrap();
+
+    let expected_keys = vec![
+        encode_dentry_key(ROOT_INO, b"snapshot-link.txt"),
+        encode_dentry_key(ROOT_INO, b"snapshot-source.txt"),
+    ];
+    assert_eq!(
+        imported
+            .serving_dentry_keys_for_inode_for_test(file.ino)
+            .unwrap(),
+        expected_keys
+    );
+    assert_eq!(
+        imported.base_dentry_keys_for_inode_for_test(file.ino).unwrap(),
+        expected_keys
+    );
+    assert_eq!(
+        imported
+            .lookup(ROOT_INO, b"snapshot-source.txt")
+            .unwrap()
+            .ino,
+        file.ino
+    );
+    assert_eq!(
+        imported.lookup(ROOT_INO, b"snapshot-link.txt").unwrap().ino,
+        file.ino
+    );
+}
+
+#[test]
 fn test_referenced_object_ids_include_committed_blocks() {
     let engine = temp_engine();
 
