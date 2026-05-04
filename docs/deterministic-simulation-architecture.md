@@ -267,6 +267,23 @@ Client trace records include the logical client for each client-owned operation
 so failing simulation artifacts can identify the actor without real mount,
 PostgreSQL, RustFS, redb, Docker, or wall-clock dependencies.
 
+The initial SFS-337 slice adds `studiofs-scenario::collision` as the first
+seeded collision-suite surface. `run_collision_suite` accepts a scenario name,
+an explicit seed list, and one or more `CollisionFamily` values, then returns a
+JSON-compatible report with per-family/per-seed results, invariant checkpoint
+counts, scheduler-selected event traces, and replayable failure records. Each
+family schedules competing logical operations through `SimulationScheduler` and
+mutates simulated client state only when the scheduler selects that operation.
+The first suite covers rename/rename, rename/unlink, unlink/append, overwrite
+while a stale reader keeps the previous committed view, mkdir/rmdir racing with
+create inside the same directory, metadata delivery racing with a local
+namespace mutation, and publish racing with foreign apply. Stable checkpoints
+run after the modeled conflict-resolution phase so the shared invariant
+validator checks convergence, canonical path ownership, tree structure,
+resurrection, durable writes, and object reachability. If a foreign apply is
+selected before the corresponding publish creates a metadata batch, the rejected
+apply is still recorded as part of the replayable interleaving trace.
+
 ## MVP Scenario Set
 
 The first runtime should prove the layer with small scenarios:
@@ -282,6 +299,9 @@ The first runtime should prove the layer with small scenarios:
    converges;
 6. rename/unlink collision converges without duplicate canonical paths or
    unexpected resurrection.
+7. seeded namespace/file-version collision suite runs the required collision
+   families across multiple seeds and records replayable counterexample traces
+   when an invariant fails.
 
 These scenarios should stay byte-light. File payloads can be represented by
 stable content IDs and checksums unless a specific invariant needs actual bytes.

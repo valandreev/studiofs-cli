@@ -1,6 +1,7 @@
 //! Shared logical scenario operation model for E2E artifacts and simulation.
 
 pub mod client;
+pub mod collision;
 pub mod invariant;
 pub mod metadata_bus;
 pub mod object_store;
