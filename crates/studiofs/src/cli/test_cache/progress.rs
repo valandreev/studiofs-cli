@@ -70,9 +70,11 @@ impl ProgressBar {
         }
     }
 
-    pub(super) fn finish(mut self) {
+    pub(super) fn finish_with_status(mut self, success: bool) {
         if let Some(inner) = &self.inner {
-            inner.completed.store(inner.total, Ordering::Relaxed);
+            if success {
+                inner.completed.store(inner.total, Ordering::Relaxed);
+            }
             inner.done.store(true, Ordering::Release);
         }
         if let Some(handle) = self.handle.take() {
@@ -102,4 +104,51 @@ fn render(inner: &ProgressInner) {
         elapsed
     );
     let _ = io::stderr().flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    impl ProgressBar {
+        fn for_test(total: usize) -> Self {
+            Self {
+                inner: Some(Arc::new(ProgressInner {
+                    label: "test".to_string(),
+                    total,
+                    completed: AtomicUsize::new(0),
+                    done: AtomicBool::new(false),
+                    started: Instant::now(),
+                })),
+                handle: None,
+            }
+        }
+    }
+
+    #[test]
+    fn finish_with_status_preserves_partial_progress_on_failure() {
+        let progress = ProgressBar::for_test(3);
+        let counter = progress.counter();
+        let inner = progress
+            .inner
+            .clone()
+            .expect("test progress has inner state");
+        counter.inc();
+
+        progress.finish_with_status(false);
+        assert_eq!(inner.completed.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn finish_with_status_marks_complete_on_success() {
+        let succeeded = ProgressBar::for_test(3);
+        let succeeded_counter = succeeded.counter();
+        succeeded_counter.inc();
+        let succeeded_inner = succeeded
+            .inner
+            .clone()
+            .expect("test progress has inner state");
+        succeeded.finish_with_status(true);
+        assert_eq!(succeeded_inner.completed.load(Ordering::Relaxed), 3);
+    }
 }
