@@ -1,5 +1,8 @@
+use studiofs_scenario::ScenarioOperation;
 use studiofs_scenario::crash_replay::{
-    CrashReplayFamily, CrashReplaySuiteConfig, run_crash_replay_suite,
+    CrashReplayFamily, CrashReplaySuiteConfig, read_crash_replay_counterexample,
+    replay_crash_replay_counterexample, run_crash_replay_suite,
+    run_crash_replay_suite_with_artifacts,
 };
 
 #[test]
@@ -85,6 +88,88 @@ fn crash_replay_failures_include_replayable_counterexample_trace() {
 }
 
 #[test]
+fn crash_replay_failure_writes_replayable_counterexample_artifact() {
+    let artifact_dir = unique_temp_dir("sfs339-counterexample-artifacts");
+    std::fs::create_dir_all(&artifact_dir).expect("create artifact dir");
+
+    let report = run_crash_replay_suite_with_artifacts(
+        CrashReplaySuiteConfig {
+            scenario: "sfs339-counterexample-artifact".to_string(),
+            seeds: vec![13],
+            families: vec![CrashReplayFamily::InjectedInvariantFailure],
+        },
+        &artifact_dir,
+    )
+    .expect("counterexample artifacts are written");
+
+    assert!(!report.passed);
+    let failure = report.failures.first().expect("failure is reported");
+    let artifact_path = failure
+        .counterexample_artifact_path
+        .as_ref()
+        .expect("failure records its counterexample artifact path");
+
+    let artifact = read_crash_replay_counterexample(artifact_path)
+        .expect("counterexample artifact can be read");
+    assert_eq!(artifact.scenario, "sfs339-counterexample-artifact");
+    assert_eq!(artifact.seed, 13);
+    assert_eq!(artifact.family, CrashReplayFamily::InjectedInvariantFailure);
+    assert_eq!(
+        artifact.failure.violated_invariant,
+        "injected_counterexample"
+    );
+    assert!(!artifact.scheduler_trace.is_empty());
+    assert!(!artifact.operation_log.is_empty());
+    assert!(artifact.operation_log.iter().any(|record| {
+        matches!(
+            &record.operation,
+            ScenarioOperation::CreateFile { path, .. } if path == "replay.txt"
+        )
+    }));
+    assert!(artifact.operation_log.iter().any(|record| {
+        matches!(
+            &record.operation,
+            ScenarioOperation::Write {
+                path,
+                bytes: 1,
+                checksum_sha256: Some(checksum_sha256),
+                ..
+            } if path == "replay.txt" && checksum_sha256 == "checksum-counterexample"
+        )
+    }));
+    assert!(artifact.final_snapshot.is_some());
+    assert!(artifact.replay_command.contains("replay-counterexample"));
+
+    let replay =
+        replay_crash_replay_counterexample(artifact_path).expect("counterexample artifact replays");
+    assert!(replay.reproduced, "{replay:#?}");
+    assert_eq!(replay.violated_invariant, "injected_counterexample");
+}
+
+#[test]
+fn counterexample_artifact_path_uses_unknown_for_empty_sanitized_scenarios() {
+    let artifact_dir = unique_temp_dir("sfs339-empty-scenario-artifact");
+    std::fs::create_dir_all(&artifact_dir).expect("create artifact dir");
+
+    let report = run_crash_replay_suite_with_artifacts(
+        CrashReplaySuiteConfig {
+            scenario: "///".to_string(),
+            seeds: vec![13],
+            families: vec![CrashReplayFamily::InjectedInvariantFailure],
+        },
+        &artifact_dir,
+    )
+    .expect("counterexample artifacts are written");
+
+    let failure = report.failures.first().expect("failure is reported");
+    let artifact_path = failure
+        .counterexample_artifact_path
+        .as_ref()
+        .expect("failure records its counterexample artifact path");
+    assert!(artifact_path.replace('\\', "/").contains("/unknown/"));
+}
+
+#[test]
 fn replay_idempotence_does_not_treat_memory_only_dirty_loss_as_failure() {
     let report = run_crash_replay_suite(CrashReplaySuiteConfig {
         scenario: "sfs338-memory-only-dirty-loss".to_string(),
@@ -100,4 +185,15 @@ fn replay_idempotence_does_not_treat_memory_only_dirty_loss_as_failure() {
             .iter()
             .any(|record| record.kind == "dirty_bytes_lost_after_crash")
     );
+}
+
+fn unique_temp_dir(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "{name}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after unix epoch")
+            .as_nanos()
+    ))
 }
