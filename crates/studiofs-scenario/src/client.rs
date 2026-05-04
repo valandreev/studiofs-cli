@@ -46,6 +46,7 @@ impl SimulatedRuntime {
     }
 
     pub fn create_file(&mut self, client: &str, path: &str) -> Result<(), ClientRuntimeError> {
+        validate_mutation_path(client, path)?;
         self.ensure_client(client)?;
         self.ensure_parent_dirs(client, path)?;
         if self.client(client)?.entries.contains_key(path) {
@@ -65,6 +66,7 @@ impl SimulatedRuntime {
     }
 
     pub fn mkdir(&mut self, client: &str, path: &str) -> Result<(), ClientRuntimeError> {
+        validate_mutation_path(client, path)?;
         self.ensure_client(client)?;
         self.ensure_parent_dirs(client, path)?;
         if self.client(client)?.entries.contains_key(path) {
@@ -142,6 +144,14 @@ impl SimulatedRuntime {
     pub fn rename(&mut self, client: &str, from: &str, to: &str) -> Result<(), ClientRuntimeError> {
         validate_mutation_path(client, from)?;
         validate_mutation_path(client, to)?;
+        let source_entry = self.entry(client, from)?;
+        let is_directory = source_entry.kind == LocalEntryKind::Directory;
+        if is_directory && to.starts_with(&format!("{from}/")) {
+            return Err(ClientRuntimeError::InvalidPath {
+                client: client.to_string(),
+                path: to.to_string(),
+            });
+        }
         self.ensure_parent_dirs(client, to)?;
         if self.client(client)?.entries.contains_key(to) {
             return Err(ClientRuntimeError::PathExists {
@@ -158,7 +168,6 @@ impl SimulatedRuntime {
                     client: client.to_string(),
                     path: from.to_string(),
                 })?;
-        let is_directory = entry.kind == LocalEntryKind::Directory;
         client_state.entries.insert(to.to_string(), entry);
 
         if is_directory {
@@ -180,6 +189,7 @@ impl SimulatedRuntime {
             }
         }
         self.rename_durable_entries(client, from, to)?;
+        self.rename_durable_write_expectations(client, from, to)?;
         self.record(client, "rename", Some(to));
         self.schedule_client_event(client, "rename");
         Ok(())
@@ -796,6 +806,38 @@ impl SimulatedRuntime {
                     format!("{to_prefix}{suffix}")
                 };
                 client_state.durable_entries.insert(new_path, entry);
+            }
+        }
+        Ok(())
+    }
+
+    fn rename_durable_write_expectations(
+        &mut self,
+        client: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<(), ClientRuntimeError> {
+        let from_prefix = format!("{from}/");
+        let to_prefix = format!("{to}/");
+        let paths = self
+            .client(client)?
+            .durable_writes
+            .range(from.to_string()..)
+            .map(|(path, _)| path)
+            .take_while(|path| *path == from || path.starts_with(&from_prefix))
+            .cloned()
+            .collect::<Vec<_>>();
+        let client_state = self.client_mut(client)?;
+        for old_path in paths {
+            if let Some(mut expectation) = client_state.durable_writes.remove(&old_path) {
+                let new_path = if old_path == from {
+                    to.to_string()
+                } else {
+                    let suffix = &old_path[from_prefix.len()..];
+                    format!("{to_prefix}{suffix}")
+                };
+                expectation.path = new_path.clone();
+                client_state.durable_writes.insert(new_path, expectation);
             }
         }
         Ok(())

@@ -284,6 +284,45 @@ fn rmdir_rejects_root_and_traversal_paths() {
 }
 
 #[test]
+fn create_and_mkdir_reject_root_absolute_traversal_and_windows_paths() {
+    let mut runtime = SimulatedRuntime::new(33);
+    runtime.add_client("client-a");
+
+    for invalid_path in ["", "../escape", "/absolute", "bad\\path"] {
+        assert!(runtime.create_file("client-a", invalid_path).is_err());
+        assert!(runtime.mkdir("client-a", invalid_path).is_err());
+    }
+}
+
+#[test]
+fn directory_rename_rejects_self_descendant_target() {
+    let mut runtime = SimulatedRuntime::new(35);
+    runtime.add_client("client-a");
+
+    runtime.mkdir("client-a", "dir").unwrap();
+    runtime.create_file("client-a", "dir/file.txt").unwrap();
+
+    assert!(runtime.rename("client-a", "dir", "dir/subdir").is_err());
+    assert!(runtime.stat("client-a", "dir/file.txt").is_ok());
+}
+
+#[test]
+fn durable_write_expectations_follow_renamed_paths() {
+    let mut runtime = SimulatedRuntime::new(39);
+    runtime.add_client("client-a");
+
+    runtime.create_file("client-a", "old.txt").unwrap();
+    runtime
+        .write_file("client-a", "old.txt", 5, "checksum-v1")
+        .unwrap();
+    runtime.flush("client-a", "old.txt").unwrap();
+    runtime.rename("client-a", "old.txt", "new.txt").unwrap();
+
+    let report = validate_logical_invariants(&runtime.logical_snapshot());
+    assert!(report.passed, "{:#?}", report.violations);
+}
+
+#[test]
 fn namespace_mutations_are_replayed_after_restart() {
     let mut runtime = SimulatedRuntime::new(41);
     runtime.add_client("client-a");
