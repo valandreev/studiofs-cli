@@ -1,6 +1,8 @@
 //! Deterministic simulation seed corpus used by RWX simulation targets.
 
-use std::path::PathBuf;
+use std::fs;
+use std::io::{BufWriter, Write as _};
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -14,6 +16,7 @@ use crate::crash_replay::{
 use crate::invariant::validate_logical_invariants;
 use crate::object_store::{ObjectStoreFault, SimulatedObjectStore, UploadOutcome};
 
+pub const SIMULATION_COUNTEREXAMPLE_SCHEMA_VERSION: u32 = 1;
 const FAST_SEEDS: &[u64] = &[1, 2, 3];
 const DEEP_SEEDS: &[u64] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
 const CORPUS_SCENARIO: &str = "sfs340-simulation-corpus";
@@ -90,6 +93,23 @@ pub struct SimulationCorpusFailure {
     pub counterexample_artifact_path: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SimulationCounterexampleArtifact {
+    pub schema_version: u32,
+    pub scenario: String,
+    pub corpus: SimulationCorpusKind,
+    pub group: SimulationScenarioGroup,
+    pub seed: u64,
+    pub failure: SimulationCounterexampleFailure,
+    pub replay_command: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SimulationCounterexampleFailure {
+    pub violated_invariant: String,
+    pub message: String,
+}
+
 #[derive(Debug, Error)]
 pub enum SimulationCorpusError {
     #[error("simulation client runtime failed: {0}")]
@@ -100,6 +120,12 @@ pub enum SimulationCorpusError {
     UploadOutcome(UploadOutcome),
     #[error("counterexample artifact failed: {0}")]
     Artifact(#[from] CrashReplayArtifactError),
+    #[error("simulation counterexample artifact I/O failed: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("simulation counterexample artifact JSON failed: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("simulation counterexample artifact path is not valid UTF-8: {path:?}")]
+    InvalidArtifactPath { path: PathBuf },
 }
 
 pub fn corpus_plan(kind: SimulationCorpusKind) -> SimulationCorpusPlan {
@@ -140,7 +166,22 @@ pub fn run_simulation_corpus(
     let mut total_runs = 0;
 
     for group in groups {
-        let outcome = run_group(group, &seeds, &options)?;
+        let mut outcome = run_group(group, &seeds, &options)?;
+        if let Some(artifact_root) = &options.artifact_root {
+            for failure in &mut outcome.failures {
+                if failure.counterexample_artifact_path.is_none() {
+                    let artifact_path = simulation_counterexample_artifact_path(
+                        artifact_root,
+                        options.kind,
+                        failure.group,
+                        failure.seed,
+                    );
+                    write_simulation_counterexample(&artifact_path, options.kind, failure)?;
+                    failure.counterexample_artifact_path =
+                        Some(path_utf8(&artifact_path)?.to_string());
+                }
+            }
+        }
         total_runs += outcome.seed_reports.len();
         failures.extend(outcome.failures);
         group_reports.push(SimulationGroupReport {
@@ -165,18 +206,20 @@ fn run_group(
     options: &SimulationCorpusOptions,
 ) -> Result<GroupOutcome, SimulationCorpusError> {
     match group {
-        SimulationScenarioGroup::NamespaceCollisions => Ok(run_namespace_collisions(seeds)),
+        SimulationScenarioGroup::NamespaceCollisions => {
+            Ok(run_namespace_collisions(seeds, options))
+        }
         SimulationScenarioGroup::CrashRestartReplay => run_crash_restart(seeds, options),
-        SimulationScenarioGroup::MetadataOutage => run_metadata_outage(seeds),
-        SimulationScenarioGroup::ObjectStoreOutage => run_object_store_outage(seeds),
+        SimulationScenarioGroup::MetadataOutage => run_metadata_outage(seeds, options),
+        SimulationScenarioGroup::ObjectStoreOutage => run_object_store_outage(seeds, options),
     }
 }
 
-fn run_namespace_collisions(seeds: &[u64]) -> GroupOutcome {
-    let report = run_collision_suite(CollisionSuiteConfig {
-        scenario: CORPUS_SCENARIO.to_string(),
-        seeds: seeds.to_vec(),
-        families: vec![
+fn run_namespace_collisions(seeds: &[u64], options: &SimulationCorpusOptions) -> GroupOutcome {
+    let families = if options.inject_failure {
+        vec![CollisionFamily::InjectedInvariantFailure]
+    } else {
+        vec![
             CollisionFamily::RenameVsRename,
             CollisionFamily::RenameVsUnlink,
             CollisionFamily::UnlinkVsAppend,
@@ -184,32 +227,24 @@ fn run_namespace_collisions(seeds: &[u64]) -> GroupOutcome {
             CollisionFamily::MkdirRmdirVsCreate,
             CollisionFamily::MetadataDeliveryVsLocalMutation,
             CollisionFamily::PublishVsForeignApply,
-        ],
+        ]
+    };
+    let report = run_collision_suite(CollisionSuiteConfig {
+        scenario: CORPUS_SCENARIO.to_string(),
+        seeds: seeds.to_vec(),
+        families,
     });
 
-    let seed_reports = seeds
-        .iter()
-        .map(|seed| {
-            let family_reports = report
-                .family_reports
-                .iter()
-                .flat_map(|family| &family.seed_reports)
-                .filter(|seed_report| seed_report.seed == *seed)
-                .collect::<Vec<_>>();
-            SimulationSeedReport {
-                seed: *seed,
-                passed: family_reports.iter().all(|seed| seed.passed),
-                invariant_checkpoints: family_reports
-                    .iter()
-                    .map(|seed| seed.invariant_checkpoints)
-                    .sum(),
-                trace_records: family_reports.iter().map(|seed| seed.trace.len()).sum(),
-            }
-        })
-        .collect();
-
     GroupOutcome {
-        seed_reports,
+        seed_reports: aggregate_seed_reports(
+            seeds,
+            &report.family_reports,
+            |family| &family.seed_reports,
+            |seed| seed.seed,
+            |seed| seed.passed,
+            |seed| seed.invariant_checkpoints,
+            |seed| seed.trace.len(),
+        ),
         failures: report
             .failures
             .into_iter()
@@ -252,29 +287,16 @@ fn run_crash_restart(
         run_crash_replay_suite(config)
     };
 
-    let seed_reports = seeds
-        .iter()
-        .map(|seed| {
-            let family_reports = report
-                .family_reports
-                .iter()
-                .flat_map(|family| &family.seed_reports)
-                .filter(|seed_report| seed_report.seed == *seed)
-                .collect::<Vec<_>>();
-            SimulationSeedReport {
-                seed: *seed,
-                passed: family_reports.iter().all(|seed| seed.passed),
-                invariant_checkpoints: family_reports
-                    .iter()
-                    .map(|seed| seed.invariant_checkpoints)
-                    .sum(),
-                trace_records: family_reports.iter().map(|seed| seed.trace.len()).sum(),
-            }
-        })
-        .collect();
-
     Ok(GroupOutcome {
-        seed_reports,
+        seed_reports: aggregate_seed_reports(
+            seeds,
+            &report.family_reports,
+            |family| &family.seed_reports,
+            |seed| seed.seed,
+            |seed| seed.passed,
+            |seed| seed.invariant_checkpoints,
+            |seed| seed.trace.len(),
+        ),
         failures: report
             .failures
             .into_iter()
@@ -289,7 +311,10 @@ fn run_crash_restart(
     })
 }
 
-fn run_metadata_outage(seeds: &[u64]) -> Result<GroupOutcome, SimulationCorpusError> {
+fn run_metadata_outage(
+    seeds: &[u64],
+    options: &SimulationCorpusOptions,
+) -> Result<GroupOutcome, SimulationCorpusError> {
     let mut seed_reports = Vec::new();
     let mut failures = Vec::new();
     for seed in seeds {
@@ -331,9 +356,18 @@ fn run_metadata_outage(seeds: &[u64]) -> Result<GroupOutcome, SimulationCorpusEr
                 counterexample_artifact_path: None,
             });
         }
+        if options.inject_failure {
+            failures.push(SimulationCorpusFailure {
+                group: SimulationScenarioGroup::MetadataOutage,
+                seed: *seed,
+                violated_invariant: "injected_counterexample".to_string(),
+                message: "injected metadata outage failure for corpus artifact testing".to_string(),
+                counterexample_artifact_path: None,
+            });
+        }
         seed_reports.push(SimulationSeedReport {
             seed: *seed,
-            passed,
+            passed: passed && !options.inject_failure,
             invariant_checkpoints: 1,
             trace_records: runtime.trace().len(),
         });
@@ -344,7 +378,10 @@ fn run_metadata_outage(seeds: &[u64]) -> Result<GroupOutcome, SimulationCorpusEr
     })
 }
 
-fn run_object_store_outage(seeds: &[u64]) -> Result<GroupOutcome, SimulationCorpusError> {
+fn run_object_store_outage(
+    seeds: &[u64],
+    options: &SimulationCorpusOptions,
+) -> Result<GroupOutcome, SimulationCorpusError> {
     let mut seed_reports = Vec::new();
     let mut failures = Vec::new();
     for seed in seeds {
@@ -380,9 +417,19 @@ fn run_object_store_outage(seeds: &[u64]) -> Result<GroupOutcome, SimulationCorp
                 counterexample_artifact_path: None,
             });
         }
+        if options.inject_failure {
+            failures.push(SimulationCorpusFailure {
+                group: SimulationScenarioGroup::ObjectStoreOutage,
+                seed: *seed,
+                violated_invariant: "injected_counterexample".to_string(),
+                message: "injected object-store outage failure for corpus artifact testing"
+                    .to_string(),
+                counterexample_artifact_path: None,
+            });
+        }
         seed_reports.push(SimulationSeedReport {
             seed: *seed,
-            passed,
+            passed: passed && !options.inject_failure,
             invariant_checkpoints: 1,
             trace_records: store.trace().len(),
         });
@@ -391,6 +438,90 @@ fn run_object_store_outage(seeds: &[u64]) -> Result<GroupOutcome, SimulationCorp
         seed_reports,
         failures,
     })
+}
+
+fn aggregate_seed_reports<FamilyReport, SeedReport>(
+    seeds: &[u64],
+    family_reports: &[FamilyReport],
+    seed_reports: impl Fn(&FamilyReport) -> &[SeedReport],
+    seed_value: impl Fn(&SeedReport) -> u64,
+    seed_passed: impl Fn(&SeedReport) -> bool,
+    invariant_checkpoints: impl Fn(&SeedReport) -> usize,
+    trace_records: impl Fn(&SeedReport) -> usize,
+) -> Vec<SimulationSeedReport> {
+    seeds
+        .iter()
+        .map(|seed| {
+            let reports = family_reports
+                .iter()
+                .flat_map(&seed_reports)
+                .filter(|seed_report| seed_value(seed_report) == *seed)
+                .collect::<Vec<_>>();
+            SimulationSeedReport {
+                seed: *seed,
+                passed: reports.iter().all(|seed_report| seed_passed(seed_report)),
+                invariant_checkpoints: reports
+                    .iter()
+                    .map(|seed_report| invariant_checkpoints(seed_report))
+                    .sum(),
+                trace_records: reports
+                    .iter()
+                    .map(|seed_report| trace_records(seed_report))
+                    .sum(),
+            }
+        })
+        .collect()
+}
+
+fn write_simulation_counterexample(
+    path: &Path,
+    kind: SimulationCorpusKind,
+    failure: &SimulationCorpusFailure,
+) -> Result<(), SimulationCorpusError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let artifact = SimulationCounterexampleArtifact {
+        schema_version: SIMULATION_COUNTEREXAMPLE_SCHEMA_VERSION,
+        scenario: CORPUS_SCENARIO.to_string(),
+        corpus: kind,
+        group: failure.group,
+        seed: failure.seed,
+        failure: SimulationCounterexampleFailure {
+            violated_invariant: failure.violated_invariant.clone(),
+            message: failure.message.clone(),
+        },
+        replay_command: format!(
+            "cargo run -p studiofs-scenario --bin studiofs-scenario -- run-corpus --corpus {} --scenario-group {} --seed {}",
+            corpus_arg(kind),
+            group_arg(failure.group),
+            failure.seed
+        ),
+    };
+    let file = fs::File::create(path)?;
+    let mut writer = BufWriter::new(file);
+    serde_json::to_writer_pretty(&mut writer, &artifact)?;
+    writer.flush()?;
+    Ok(())
+}
+
+fn simulation_counterexample_artifact_path(
+    artifact_root: &Path,
+    kind: SimulationCorpusKind,
+    group: SimulationScenarioGroup,
+    seed: u64,
+) -> PathBuf {
+    artifact_root
+        .join(corpus_arg(kind))
+        .join(group_arg(group))
+        .join(format!("seed-{seed}.json"))
+}
+
+fn path_utf8(path: &Path) -> Result<&str, SimulationCorpusError> {
+    path.to_str()
+        .ok_or_else(|| SimulationCorpusError::InvalidArtifactPath {
+            path: path.to_path_buf(),
+        })
 }
 
 fn first_violation_or(

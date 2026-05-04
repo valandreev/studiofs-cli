@@ -45,7 +45,7 @@ tasks:
     outputs:
       artifacts:
         - key: simulation-counterexamples-fast
-          path: target/simulation-counterexamples
+          path: target/simulation-counterexamples/fast
 
   - key: simulation-deep
     use: [code, rust, cargo-fetch]
@@ -61,4 +61,4 @@ tasks:
     outputs:
       artifacts:
         - key: simulation-counterexamples-deep
-          path: target/simulation-counterexamples
+          path: target/simulation-counterexamples/deep

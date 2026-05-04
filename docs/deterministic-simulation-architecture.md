@@ -330,6 +330,9 @@ Failures report the scenario group, seed, violated invariant, message, and
 counterexample artifact path when the underlying suite can write one. The RWX
 workflow lives in `.rwx/simulation.yml` with `simulation-fast` and
 `simulation-deep` targets and uploads `target/simulation-counterexamples/`.
+When a group-specific suite does not have its own replay artifact format yet,
+the corpus layer writes a schema-versioned JSON artifact with the corpus,
+scenario group, seed, violated invariant, message, and stable replay command.
 It intentionally does not use Docker, PostgreSQL, RustFS, FUSE, WinFSP,
 self-hosted runners, GitHub Actions triggers, schedules, or label-gated PR
 runs.

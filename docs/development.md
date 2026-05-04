@@ -133,8 +133,10 @@ rwx run .rwx/simulation.yml --target simulation-deep --wait --open
 
 The simulation workflow runs `studiofs-scenario` only. It is suitable for cheap
 seed-reproducible logical correctness checks and uploads
-`target/simulation-counterexamples/` when a failing seed produces replay
-artifacts.
+`simulation-counterexamples-fast` or `simulation-counterexamples-deep` when a
+failing seed produces replay artifacts. Match the `artifact_path=` line in the
+run output to the uploaded artifact tree, then use the artifact's
+`replay_command` locally.
 
 ## Tests
 

@@ -216,6 +216,12 @@ rwx run .rwx/simulation.yml --target simulation-fast --wait --open
 rwx run .rwx/simulation.yml --target simulation-deep --wait --open
 ```
 
+On failure, the RWX run uploads the matching counterexample artifact folder:
+`simulation-counterexamples-fast` for `simulation-fast` and
+`simulation-counterexamples-deep` for `simulation-deep`. The CLI output prints
+`artifact_path=<path>` for each failing seed; open the uploaded artifact with
+that relative path and replay it with the artifact's `replay_command`.
+
 ## Platform-Gated Unit Tests
 
 `studiofs-fuse` and `studiofs-winfsp` contain unit tests that are only

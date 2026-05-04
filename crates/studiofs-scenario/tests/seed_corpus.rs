@@ -78,6 +78,41 @@ fn corpus_failures_include_group_seed_invariant_and_artifact_path() {
 }
 
 #[test]
+fn all_corpus_group_failures_write_counterexample_artifacts() {
+    for group in [
+        SimulationScenarioGroup::NamespaceCollisions,
+        SimulationScenarioGroup::CrashRestartReplay,
+        SimulationScenarioGroup::MetadataOutage,
+        SimulationScenarioGroup::ObjectStoreOutage,
+    ] {
+        let artifact_root = unique_temp_dir(&format!("sfs340-{group:?}-counterexamples"));
+        std::fs::create_dir_all(&artifact_root).expect("create artifact root");
+
+        let report = run_simulation_corpus(SimulationCorpusOptions {
+            kind: SimulationCorpusKind::Fast,
+            group: Some(group),
+            seed: Some(13),
+            artifact_root: Some(artifact_root),
+            inject_failure: true,
+        })
+        .expect("corpus writes failure artifacts");
+
+        assert!(!report.passed, "{group:?} should report injected failure");
+        let failure = report.failures.first().expect("failure is reported");
+        assert_eq!(failure.group, group);
+        assert_eq!(failure.seed, 13);
+        let artifact_path = failure
+            .counterexample_artifact_path
+            .as_ref()
+            .expect("failure records an artifact path");
+        assert!(
+            std::path::Path::new(artifact_path).exists(),
+            "artifact path exists for {group:?}: {artifact_path}"
+        );
+    }
+}
+
+#[test]
 fn cli_runs_one_seed_and_reports_group_seed_and_artifact_root() {
     let artifact_root = unique_temp_dir("sfs340-cli-artifacts");
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_studiofs-scenario"))
