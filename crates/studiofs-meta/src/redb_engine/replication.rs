@@ -1,6 +1,31 @@
 use super::*;
 
 impl RedbMetaEngine {
+    fn unique_dentry_key_for_entry_in_write_table(
+        txn: &redb::WriteTransaction,
+        table_def: redb::TableDefinition<&'static [u8], &'static [u8]>,
+        entry: &DirEntryValue,
+    ) -> MetaResult<Option<Vec<u8>>> {
+        let table = txn
+            .open_table(table_def)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let mut matched_key = None;
+        for row in table
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (key, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let current: DirEntryValue = decode(value.value())?;
+            if current.ino == entry.ino && current.kind == entry.kind {
+                if matched_key.is_some() {
+                    return Ok(None);
+                }
+                matched_key = Some(key.value().to_vec());
+            }
+        }
+        Ok(matched_key)
+    }
+
     /// Export a snapshot projected to the remote-visible published namespace.
     pub fn export_remote_snapshot(&self) -> MetaResult<RedbSnapshot> {
         let mut snapshot = self.export_snapshot()?;
@@ -609,20 +634,35 @@ impl RedbMetaEngine {
                     let src_key = encode_dentry_key(*parent, name);
                     let dst_key = encode_dentry_key(*new_parent, new_name);
 
+                    let src_matches = {
+                        let dentries = txn
+                            .open_table(BASE_DENTRIES_TABLE)
+                            .map_err(|e| MetaError::Storage(e.to_string()))?;
+                        dentries
+                            .get(src_key.as_slice())
+                            .map_err(|e| MetaError::Storage(e.to_string()))?
+                            .map(|value| decode::<DirEntryValue>(value.value()))
+                            .transpose()?
+                            .map(|current| current.ino == entry.ino && current.kind == entry.kind)
+                            .unwrap_or(false)
+                    };
+                    let current_key = if src_matches {
+                        Some(src_key.clone())
+                    } else {
+                        Self::unique_dentry_key_for_entry_in_write_table(
+                            &txn,
+                            BASE_DENTRIES_TABLE,
+                            entry,
+                        )?
+                    };
+                    let Some(current_key) = current_key else {
+                        continue;
+                    };
+
                     let mut dentries = txn
                         .open_table(BASE_DENTRIES_TABLE)
                         .map_err(|e| MetaError::Storage(e.to_string()))?;
-                    let src_matches = dentries
-                        .get(src_key.as_slice())
-                        .map_err(|e| MetaError::Storage(e.to_string()))?
-                        .map(|value| decode::<DirEntryValue>(value.value()))
-                        .transpose()?
-                        .map(|current| current.ino == entry.ino && current.kind == entry.kind)
-                        .unwrap_or(false);
-                    if !src_matches {
-                        continue;
-                    }
-                    let _ = dentries.remove(src_key.as_slice());
+                    let _ = dentries.remove(current_key.as_slice());
                     let _ = dentries.remove(dst_key.as_slice());
                     let data = encode(entry)?;
                     dentries
@@ -831,11 +871,21 @@ impl RedbMetaEngine {
                         .transpose()?
                         .map(|current| current.ino == entry.ino && current.kind == entry.kind)
                         .unwrap_or(false);
-                    if !src_matches {
+                    let current_key = if src_matches {
+                        Some(src_key)
+                    } else {
+                        Self::unique_dentry_key_for_entry_in_write_table(
+                            &txn,
+                            DENTRIES_TABLE,
+                            entry,
+                        )?
+                    };
+                    let Some(current_key) = current_key else {
                         continue;
-                    }
+                    };
+                    let (current_parent, current_name) = decode_dentry_key(&current_key)?;
 
-                    Self::remove_dentry_mirror_in_txn(&txn, *parent, name)?;
+                    Self::remove_dentry_mirror_in_txn(&txn, current_parent, current_name)?;
                     Self::remove_dentry_mirror_in_txn(&txn, *new_parent, new_name)?;
                     Self::set_dentry_mirror_in_txn(&txn, *new_parent, new_name, entry)?;
 
@@ -943,6 +993,13 @@ impl RedbMetaEngine {
             Self::lookup_in_write_table(&txn, BASE_DENTRIES_TABLE, new_parent, new_name)?
                 .map(|value| value.ino == entry.ino && value.kind == entry.kind)
                 .unwrap_or(false);
+        let current_key =
+            Self::unique_dentry_key_for_entry_in_write_table(&txn, DENTRIES_TABLE, entry)?;
+
+        if let Some(current_key) = current_key.as_ref() {
+            let (current_parent, current_name) = decode_dentry_key(current_key)?;
+            Self::remove_dentry_mirror_in_txn(&txn, current_parent, current_name)?;
+        }
 
         if dst_in_base {
             Self::remove_dentry_mirror_in_txn(&txn, parent, name)?;
