@@ -57,7 +57,7 @@ impl SimulatedRuntime {
         let logical_id = self.next_file_logical_id();
         self.client_mut(client)?.entries.insert(
             path.to_string(),
-            LocalEntry::file(logical_id, None, None, Some(ObjectRef::local(""))),
+            LocalEntry::file(logical_id, None, None, Some(ObjectRef::local("")), 0),
         );
         self.record(client, "create_file", Some(path));
         self.schedule_client_event(client, "create_file");
@@ -77,6 +77,7 @@ impl SimulatedRuntime {
         self.client_mut(client)?
             .entries
             .insert(path.to_string(), LocalEntry::directory(logical_id));
+        self.persist_current_entry(client, path)?;
         self.record(client, "mkdir", Some(path));
         self.schedule_client_event(client, "mkdir");
         Ok(())
@@ -91,10 +92,16 @@ impl SimulatedRuntime {
     ) -> Result<(), ClientRuntimeError> {
         let checksum_sha256 = checksum_sha256.into();
         let object_id = self.object_id(client, path, &checksum_sha256);
+        let next_epoch = self
+            .entry(client, path)?
+            .epoch
+            .checked_add(1)
+            .expect("simulated file epoch overflowed");
         let entry = self.entry_mut(client, path)?;
         entry.size = Some(size);
         entry.checksum_sha256 = Some(checksum_sha256.clone());
         entry.object = Some(ObjectRef::local(object_id.clone()));
+        entry.epoch = next_epoch;
         self.object_store
             .stage_local_payload(client, object_id, checksum_sha256, size);
         self.record(client, "write_file", Some(path));
@@ -172,6 +179,7 @@ impl SimulatedRuntime {
                 }
             }
         }
+        self.rename_durable_entries(client, from, to)?;
         self.record(client, "rename", Some(to));
         self.schedule_client_event(client, "rename");
         Ok(())
@@ -192,6 +200,7 @@ impl SimulatedRuntime {
             }
         }
         self.client_mut(client)?.entries.remove(path);
+        self.client_mut(client)?.durable_entries.remove(path);
         self.record(client, "unlink", Some(path));
         self.schedule_client_event(client, "unlink");
         Ok(())
@@ -213,6 +222,7 @@ impl SimulatedRuntime {
             });
         }
         self.client_mut(client)?.entries.remove(path);
+        self.client_mut(client)?.durable_entries.remove(path);
         self.record(client, "rmdir", Some(path));
         self.schedule_client_event(client, "rmdir");
         Ok(())
@@ -359,17 +369,84 @@ impl SimulatedRuntime {
         let object_id = object.object_id.clone();
         let checksum_sha256 = entry.checksum_sha256.clone().unwrap_or_default();
         let size = entry.size.unwrap_or_default();
+        let epoch = entry.epoch;
 
-        self.object_store.mark_published(&object_id);
+        self.publish_file_version(
+            client,
+            path,
+            PublishedFileVersion {
+                logical_id,
+                object_id,
+                checksum_sha256,
+                size,
+                epoch,
+            },
+        )
+    }
+
+    pub fn published_file_version(
+        &self,
+        client: &str,
+        path: &str,
+    ) -> Result<PublishedFileVersion, ClientRuntimeError> {
+        let entry = self.entry(client, path)?;
+        let object = entry
+            .object
+            .as_ref()
+            .ok_or_else(|| ClientRuntimeError::MissingObjectRef {
+                client: client.to_string(),
+                path: path.to_string(),
+            })?;
+        Ok(PublishedFileVersion {
+            logical_id: entry.logical_id.clone(),
+            object_id: object.object_id.clone(),
+            checksum_sha256: entry.checksum_sha256.clone().unwrap_or_default(),
+            size: entry.size.unwrap_or_default(),
+            epoch: entry.epoch,
+        })
+    }
+
+    pub fn publish_file_version(
+        &mut self,
+        client: &str,
+        path: &str,
+        version: PublishedFileVersion,
+    ) -> Result<(), ClientRuntimeError> {
+        let current = self.entry(client, path)?;
+        if current.epoch != version.epoch {
+            return Err(ClientRuntimeError::StalePublish {
+                client: client.to_string(),
+                path: path.to_string(),
+                attempted_epoch: version.epoch,
+                current_epoch: current.epoch,
+            });
+        }
+        if !self.object_store.has_remote_object(&version.object_id) {
+            return Err(ClientRuntimeError::ObjectNotUploaded {
+                object_id: version.object_id,
+            });
+        }
+
+        self.object_store.mark_published(&version.object_id);
+        self.enqueue_published_file_version(client, path, version)
+    }
+
+    pub fn enqueue_published_file_version(
+        &mut self,
+        client: &str,
+        path: &str,
+        version: PublishedFileVersion,
+    ) -> Result<(), ClientRuntimeError> {
         let batch = MetadataBatch::new(
             client,
             vec![
                 MetadataEvent::new("file_published")
                     .with_field("path", path)
-                    .with_field("logical_id", logical_id)
-                    .with_field("object_id", object_id)
-                    .with_field("checksum_sha256", checksum_sha256)
-                    .with_field("size", size.to_string()),
+                    .with_field("logical_id", version.logical_id)
+                    .with_field("object_id", version.object_id)
+                    .with_field("checksum_sha256", version.checksum_sha256)
+                    .with_field("size", version.size.to_string())
+                    .with_field("epoch", version.epoch.to_string()),
             ],
         );
         self.metadata_bus.enqueue_local(batch);
@@ -483,6 +560,26 @@ impl SimulatedRuntime {
                         field: "size".to_string(),
                     }
                 })?;
+                let epoch = optional_field(event, "epoch")
+                    .map(|epoch| {
+                        epoch
+                            .parse()
+                            .map_err(|_| ClientRuntimeError::InvalidMetadataField {
+                                field: "epoch".to_string(),
+                            })
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+                let is_stale_same_logical_file = self
+                    .client(client)?
+                    .entries
+                    .get(path)
+                    .is_some_and(|current| {
+                        current.logical_id == logical_id && current.epoch > epoch
+                    });
+                if is_stale_same_logical_file {
+                    continue;
+                }
                 self.ensure_parent_dirs(client, path)?;
                 self.client_mut(client)?.entries.insert(
                     path.to_string(),
@@ -491,6 +588,7 @@ impl SimulatedRuntime {
                         Some(size),
                         Some(checksum_sha256.to_string()),
                         Some(ObjectRef::remote(object_id)),
+                        epoch,
                     ),
                 );
             }
@@ -660,6 +758,48 @@ impl SimulatedRuntime {
         );
     }
 
+    fn persist_current_entry(
+        &mut self,
+        client: &str,
+        path: &str,
+    ) -> Result<(), ClientRuntimeError> {
+        let entry = self.entry(client, path)?.clone();
+        self.client_mut(client)?
+            .durable_entries
+            .insert(path.to_string(), entry);
+        Ok(())
+    }
+
+    fn rename_durable_entries(
+        &mut self,
+        client: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<(), ClientRuntimeError> {
+        let from_prefix = format!("{from}/");
+        let to_prefix = format!("{to}/");
+        let paths = self
+            .client(client)?
+            .durable_entries
+            .keys()
+            .filter(|path| *path == from || path.starts_with(&from_prefix))
+            .cloned()
+            .collect::<Vec<_>>();
+        let client_state = self.client_mut(client)?;
+        for old_path in paths {
+            if let Some(entry) = client_state.durable_entries.remove(&old_path) {
+                let new_path = if old_path == from {
+                    to.to_string()
+                } else {
+                    let suffix = &old_path[from_prefix.len()..];
+                    format!("{to_prefix}{suffix}")
+                };
+                client_state.durable_entries.insert(new_path, entry);
+            }
+        }
+        Ok(())
+    }
+
     fn record(&mut self, client: impl Into<String>, kind: impl Into<String>, path: Option<&str>) {
         self.trace.push(ClientTraceRecord {
             step: self.trace.len() as u64 + 1,
@@ -685,6 +825,15 @@ pub struct SimulatedStat {
     pub checksum_sha256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublishedFileVersion {
+    pub logical_id: String,
+    pub object_id: String,
+    pub checksum_sha256: String,
+    pub size: u64,
+    pub epoch: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -717,6 +866,15 @@ pub enum ClientRuntimeError {
     MissingObjectRef { client: String, path: String },
     #[error("object {object_id} has not been uploaded")]
     ObjectNotUploaded { object_id: String },
+    #[error(
+        "stale publish for simulated client {client} path {path}: attempted epoch {attempted_epoch}, current epoch {current_epoch}"
+    )]
+    StalePublish {
+        client: String,
+        path: String,
+        attempted_epoch: u64,
+        current_epoch: u64,
+    },
     #[error("unknown upload {upload_id}")]
     UnknownUpload { upload_id: u64 },
     #[error("no pending metadata for simulated client {client}")]
@@ -781,6 +939,7 @@ struct LocalEntry {
     object: Option<ObjectRef>,
     checksum_sha256: Option<String>,
     size: Option<u64>,
+    epoch: u64,
 }
 
 impl LocalEntry {
@@ -791,6 +950,7 @@ impl LocalEntry {
             object: None,
             checksum_sha256: None,
             size: None,
+            epoch: 0,
         }
     }
 
@@ -799,6 +959,7 @@ impl LocalEntry {
         size: Option<u64>,
         checksum_sha256: Option<String>,
         object: Option<ObjectRef>,
+        epoch: u64,
     ) -> Self {
         Self {
             kind: LocalEntryKind::File,
@@ -806,6 +967,7 @@ impl LocalEntry {
             object,
             checksum_sha256,
             size,
+            epoch,
         }
     }
 
@@ -839,6 +1001,10 @@ fn field<'a>(event: &'a MetadataEvent, name: &str) -> Result<&'a str, ClientRunt
             field: name.to_string(),
         }
     })
+}
+
+fn optional_field<'a>(event: &'a MetadataEvent, name: &str) -> Option<&'a str> {
+    event.fields.get(name).map(String::as_str)
 }
 
 fn validate_mutation_path(client: &str, path: &str) -> Result<(), ClientRuntimeError> {

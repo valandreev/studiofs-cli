@@ -284,6 +284,21 @@ resurrection, durable writes, and object reachability. If a foreign apply is
 selected before the corresponding publish creates a metadata batch, the rejected
 apply is still recorded as part of the replayable interleaving trace.
 
+The initial SFS-338 slice adds `studiofs-scenario::crash_replay` as the
+crash/restart replay suite over the same deterministic runtime. The suite runs
+explicit seed lists across crash-after-durability, crash-after-upload,
+crash-during-publish, crash-during-foreign-apply, pending-local-upload restart,
+repeated restart/replay, and stale pending-upload/publish families. Each run
+records replay checkpoints, scheduler-selected crash/publish/apply races where
+ordering matters, a replay-idempotence result, peer convergence status, and
+replayable failure traces. A stale publish carries the expected logical epoch
+and is rejected when a newer local epoch already exists, so old pending upload
+or publish events cannot roll a peer back to older durable content. Namespace
+mutations such as `mkdir`, `rename`, `unlink`, and `rmdir` update the simulated
+durable namespace replay state immediately, while file payload bytes still
+require the modeled local durability boundary. Directory logical IDs are stable
+through rename/restart and are not derived from the current path.
+
 ## MVP Scenario Set
 
 The first runtime should prove the layer with small scenarios:
@@ -302,6 +317,11 @@ The first runtime should prove the layer with small scenarios:
 7. seeded namespace/file-version collision suite runs the required collision
    families across multiple seeds and records replayable counterexample traces
    when an invariant fails.
+8. seeded crash/restart replay suite runs the required replay families across
+   multiple seeds, distinguishes memory-only state from locally durable state,
+   keeps replay idempotent, and rejects stale upload/publish events for older
+   epochs. Namespace creations, removals, and directory renames remain durable
+   across restart without making unflushed file bytes durable.
 
 These scenarios should stay byte-light. File payloads can be represented by
 stable content IDs and checksums unless a specific invariant needs actual bytes.
