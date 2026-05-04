@@ -3,10 +3,12 @@
 use serde::{Deserialize, Serialize};
 
 use crate::client::SimulatedRuntime;
-use crate::invariant::{InvariantViolation, validate_logical_invariants};
+use crate::invariant::{InvariantViolation, LogicalSnapshot, validate_logical_invariants};
 use crate::scheduler::{
-    ScheduledEvent, SchedulerEventType, SimulationScheduler, simulation_stream_seed,
+    ScheduledEvent, SchedulerEventType, SchedulerTraceRecord, SimulationScheduler,
+    simulation_stream_seed,
 };
+use crate::{OperationOutcome, ScenarioOperation, ScenarioOperationRecord};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CollisionSuiteConfig {
@@ -67,6 +69,9 @@ pub struct CollisionFailure {
     pub violated_invariant: String,
     pub message: String,
     pub trace: Vec<CollisionTraceRecord>,
+    pub scheduler_trace: Vec<SchedulerTraceRecord>,
+    pub operation_log: Vec<ScenarioOperationRecord>,
+    pub final_snapshot: LogicalSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,6 +146,9 @@ impl FamilyHarness {
     }
 
     fn finish(mut self) -> FamilyRun {
+        let final_snapshot = self.runtime.logical_snapshot();
+        let scheduler_trace = self.scheduler.trace().to_vec();
+        let operation_log = operation_log_from_trace(&self.scenario, &self.trace);
         let failure = if self.family == CollisionFamily::InjectedInvariantFailure {
             Some(CollisionFailure {
                 scenario: self.scenario.clone(),
@@ -149,9 +157,12 @@ impl FamilyHarness {
                 violated_invariant: "injected_counterexample".to_string(),
                 message: "injected invariant failure for counterexample trace testing".to_string(),
                 trace: self.trace.clone(),
+                scheduler_trace: scheduler_trace.clone(),
+                operation_log: operation_log.clone(),
+                final_snapshot: final_snapshot.clone(),
             })
         } else {
-            self.checkpoint("final").err()
+            self.checkpoint("final").err().map(|failure| *failure)
         };
         let passed = failure.is_none();
         FamilyRun {
@@ -165,7 +176,7 @@ impl FamilyHarness {
         }
     }
 
-    fn checkpoint(&mut self, name: &str) -> Result<(), CollisionFailure> {
+    fn checkpoint(&mut self, name: &str) -> Result<(), Box<CollisionFailure>> {
         self.push("invariant_checkpoint", None, Some(name));
         self.invariant_checkpoints += 1;
         let snapshot = self.runtime.logical_snapshot();
@@ -190,14 +201,17 @@ impl FamilyHarness {
             violation.client.as_deref(),
             violation.path.as_deref(),
         );
-        Err(CollisionFailure {
+        Err(Box::new(CollisionFailure {
             scenario: self.scenario.clone(),
             family: self.family,
             seed: self.seed,
             violated_invariant: violation.invariant,
             message: violation.message,
             trace: self.trace.clone(),
-        })
+            scheduler_trace: self.scheduler.trace().to_vec(),
+            operation_log: operation_log_from_trace(&self.scenario, &self.trace),
+            final_snapshot: snapshot,
+        }))
     }
 
     fn publish_to_peer(&mut self, path: &str) {
@@ -450,6 +464,61 @@ impl FamilyHarness {
             }
         }
     }
+}
+
+fn operation_log_from_trace(
+    scenario: &str,
+    trace: &[CollisionTraceRecord],
+) -> Vec<ScenarioOperationRecord> {
+    trace
+        .iter()
+        .map(|record| {
+            let mut operation =
+                ScenarioOperationRecord::new(scenario, record.step, operation_from_trace(record))
+                    .with_outcome(OperationOutcome::Observed);
+            if let Some(client) = &record.client {
+                operation = operation.with_client(client.clone());
+            }
+            if let Some(path) = &record.path {
+                operation = operation.with_metadata("path", path.clone());
+            }
+            operation
+        })
+        .collect()
+}
+
+fn operation_from_trace(record: &CollisionTraceRecord) -> ScenarioOperation {
+    match record.kind.as_str() {
+        "create_file" => ScenarioOperation::CreateFile {
+            path: trace_path(record),
+            bytes: None,
+        },
+        "create_dir" => ScenarioOperation::CreateDirectory {
+            path: trace_path(record),
+        },
+        "rename_accepted" | "rename_rejected" => ScenarioOperation::Rename {
+            from: trace_path(record),
+            to: trace_path(record),
+        },
+        "unlink_accepted" | "unlink_rejected" => ScenarioOperation::Unlink {
+            path: trace_path(record),
+        },
+        "append_accepted" | "append_rejected" => ScenarioOperation::Append {
+            path: trace_path(record),
+            bytes: 0,
+            checksum_sha256: None,
+        },
+        "publish_to_peer" | "published_to_peer" => ScenarioOperation::Fsync {
+            path: trace_path(record),
+        },
+        _ => ScenarioOperation::SchedulerCheckpoint {
+            name: record.kind.clone(),
+        },
+    }
+}
+
+fn trace_path(record: &CollisionTraceRecord) -> String {
+    record.path.clone().unwrap_or_default()
 }
 
 fn family_scheduler_seed(seed: u64, family: CollisionFamily) -> u64 {
