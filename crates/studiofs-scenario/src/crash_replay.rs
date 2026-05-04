@@ -12,6 +12,7 @@ use crate::client::SimulatedRuntime;
 use crate::invariant::{InvariantViolation, LogicalSnapshot, validate_logical_invariants};
 use crate::scheduler::{
     ScheduledEvent, SchedulerEventType, SchedulerTraceRecord, SimulationScheduler,
+    simulation_stream_seed,
 };
 use crate::{ScenarioOperation, ScenarioOperationRecord};
 
@@ -381,7 +382,6 @@ struct CrashHarness {
     invariant_checkpoints: usize,
     replay_idempotent: bool,
     peer_converged: bool,
-    race_count: u64,
 }
 
 impl CrashHarness {
@@ -394,12 +394,14 @@ impl CrashHarness {
             family,
             seed,
             runtime,
-            scheduler: SimulationScheduler::new(seed),
+            scheduler: SimulationScheduler::new_with_stream_seed(
+                seed,
+                family_scheduler_seed(seed, family),
+            ),
             trace: Vec::new(),
             invariant_checkpoints: 0,
             replay_idempotent: true,
             peer_converged: false,
-            race_count: 0,
         }
     }
 
@@ -552,16 +554,7 @@ impl CrashHarness {
     }
 
     fn run_race(&mut self, first: PlannedCrashOp, second: PlannedCrashOp) -> Vec<PlannedCrashOp> {
-        self.race_count += 1;
-        let race_seed = self
-            .seed
-            .wrapping_add(self.race_count.wrapping_mul(0x9e37_79b9_7f4a_7c15));
-        let operations = if race_seed.is_multiple_of(2) {
-            [second, first]
-        } else {
-            [first, second]
-        };
-        for operation in operations {
+        for operation in [first, second] {
             self.scheduler.schedule_now(
                 ScheduledEvent::new(operation.event_type())
                     .with_client(operation.client())
@@ -607,6 +600,21 @@ impl CrashHarness {
             metadata: metadata.into_iter().collect(),
         });
     }
+}
+
+fn family_scheduler_seed(seed: u64, family: CrashReplayFamily) -> u64 {
+    let family_index: u64 = match family {
+        CrashReplayFamily::CrashAfterDurabilityBeforeUploadCompletion => 1,
+        CrashReplayFamily::CrashAfterUploadBeforeMetadataPublication => 2,
+        CrashReplayFamily::CrashDuringPublishAttempt => 3,
+        CrashReplayFamily::CrashDuringForeignApply => 4,
+        CrashReplayFamily::RestartWithPendingLocalUploadState => 5,
+        CrashReplayFamily::RepeatedRestartReplayLoops => 6,
+        CrashReplayFamily::StalePendingUploadEventsRaceNewerEpochs => 7,
+        CrashReplayFamily::MemoryOnlyDirtyCrash => 8,
+        CrashReplayFamily::InjectedInvariantFailure => 9,
+    };
+    simulation_stream_seed(seed, family_index)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -4,6 +4,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+const SEED_MIX_GOLDEN_RATIO: u64 = 0x9e37_79b9_7f4a_7c15;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScheduledEvent {
     pub event_type: SchedulerEventType,
@@ -88,9 +90,13 @@ pub struct SimulationScheduler {
 
 impl SimulationScheduler {
     pub fn new(seed: u64) -> Self {
+        Self::new_with_stream_seed(seed, seed)
+    }
+
+    pub fn new_with_stream_seed(seed: u64, stream_seed: u64) -> Self {
         Self {
             seed,
-            rng: DeterministicRng::new(seed),
+            rng: DeterministicRng::new(stream_seed),
             current_tick: 0,
             next_event_id: 0,
             next_step: 0,
@@ -194,6 +200,10 @@ impl SimulationScheduler {
     }
 }
 
+pub fn simulation_stream_seed(seed: u64, stream_index: u64) -> u64 {
+    seed ^ stream_index.wrapping_mul(SEED_MIX_GOLDEN_RATIO)
+}
+
 #[derive(Debug)]
 struct QueuedEvent {
     event_id: u64,
@@ -208,7 +218,7 @@ struct DeterministicRng {
 impl DeterministicRng {
     fn new(seed: u64) -> Self {
         Self {
-            state: seed.wrapping_add(0x853c_49e6_748f_ea9b),
+            state: mix_seed(seed),
         }
     }
 
@@ -238,6 +248,13 @@ impl DeterministicRng {
         let rotate = (old_state >> 59) as u32;
         xorshifted.rotate_right(rotate)
     }
+}
+
+fn mix_seed(mut value: u64) -> u64 {
+    value = value.wrapping_add(SEED_MIX_GOLDEN_RATIO);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
 }
 
 #[cfg(test)]

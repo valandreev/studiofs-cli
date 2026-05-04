@@ -1,3 +1,6 @@
+mod common;
+
+use common::seed_order_signatures;
 use studiofs_scenario::collision::{CollisionFamily, CollisionSuiteConfig, run_collision_suite};
 
 #[test]
@@ -69,6 +72,47 @@ fn scheduler_selects_real_conflicting_operations_in_both_orders() {
         traces
             .iter()
             .all(|trace| trace.contains(&"scheduler_selected"))
+    );
+}
+
+#[test]
+fn deep_collision_seeds_cover_more_than_parity_order_signatures() {
+    let report = run_collision_suite(CollisionSuiteConfig {
+        scenario: "sfs358-collision-seed-coverage".to_string(),
+        seeds: (1..=16).collect(),
+        families: vec![
+            CollisionFamily::RenameVsRename,
+            CollisionFamily::RenameVsUnlink,
+            CollisionFamily::UnlinkVsAppend,
+            CollisionFamily::OverwriteWhileStaleReader,
+            CollisionFamily::MkdirRmdirVsCreate,
+            CollisionFamily::MetadataDeliveryVsLocalMutation,
+            CollisionFamily::PublishVsForeignApply,
+        ],
+    });
+
+    assert!(report.passed, "{:#?}", report.failures);
+    let signatures = seed_order_signatures(
+        &report
+            .family_reports
+            .iter()
+            .flat_map(|family| &family.seed_reports)
+            .map(|seed| {
+                (
+                    seed.seed,
+                    seed.trace
+                        .iter()
+                        .filter(|record| record.kind == "scheduler_selected")
+                        .filter_map(|record| record.path.clone())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>(),
+    );
+
+    assert!(
+        signatures.len() > 2,
+        "deep collision seeds collapsed to parity-only signatures: {signatures:#?}"
     );
 }
 
