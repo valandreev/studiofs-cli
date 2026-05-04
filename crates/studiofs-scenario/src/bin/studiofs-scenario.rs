@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::path::PathBuf;
 
 use studiofs_scenario::crash_replay::replay_crash_replay_counterexample;
@@ -10,9 +11,9 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    let mut args = std::env::args().skip(1);
-    match args.next().as_deref() {
-        Some("replay-counterexample") => {
+    let mut args = std::env::args_os().skip(1);
+    match args.next() {
+        Some(command) if command == OsStr::new("replay-counterexample") => {
             let path = args
                 .next()
                 .map(PathBuf::from)

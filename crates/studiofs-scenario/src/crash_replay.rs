@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Write as _};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -250,8 +250,9 @@ pub fn write_crash_replay_counterexample(
         fs::create_dir_all(parent)?;
     }
     let file = fs::File::create(path)?;
-    let writer = BufWriter::new(file);
-    serde_json::to_writer_pretty(writer, artifact)?;
+    let mut writer = BufWriter::new(file);
+    serde_json::to_writer_pretty(&mut writer, artifact)?;
+    writer.flush()?;
     Ok(())
 }
 
