@@ -389,6 +389,11 @@ fn run_metadata_outage(
         runtime.complete_upload(upload.upload_id)?;
         runtime.publish_file("writer", "metadata-outage.txt")?;
         let blocked = runtime.deliver_next_metadata("reader").is_err();
+        for _ in 0..metadata_recovery_flaps(*seed) {
+            runtime.set_metadata_available(true);
+            runtime.set_metadata_available(false);
+            let _ = runtime.deliver_next_metadata("reader");
+        }
         runtime.set_metadata_available(true);
         runtime.deliver_next_metadata("reader")?;
 
@@ -473,6 +478,9 @@ fn run_object_store_outage(
                 ..
             })
         );
+        for _ in 0..object_store_unavailable_read_probes(*seed) {
+            let _ = store.read_remote(&object_id);
+        }
         store.set_available(true);
         let completed = matches!(
             store.complete_upload(upload.upload_id),
@@ -880,6 +888,16 @@ fn first_violation_or(
         })
 }
 
+fn metadata_recovery_flaps(seed: u64) -> usize {
+    (seed % OUTAGE_SEED_VARIANTS) as usize
+}
+
+fn object_store_unavailable_read_probes(seed: u64) -> usize {
+    (seed % OUTAGE_SEED_VARIANTS) as usize
+}
+
+const OUTAGE_SEED_VARIANTS: u64 = 8;
+
 fn seeds_for(kind: SimulationCorpusKind) -> &'static [u64] {
     match kind {
         SimulationCorpusKind::Fast => FAST_SEEDS,
@@ -955,5 +973,13 @@ mod tests {
         assert_ne!(first, second);
         assert!(first.ends_with("fast/namespace-collisions/seed-13-failure-0.json"));
         assert!(second.ends_with("fast/namespace-collisions/seed-13-failure-1.json"));
+    }
+
+    #[test]
+    fn outage_seed_variants_are_bounded() {
+        assert_eq!(metadata_recovery_flaps(1), 1);
+        assert_eq!(metadata_recovery_flaps(8), 0);
+        assert_eq!(object_store_unavailable_read_probes(3), 3);
+        assert_eq!(object_store_unavailable_read_probes(16), 0);
     }
 }

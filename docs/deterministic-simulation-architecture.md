@@ -352,6 +352,10 @@ in deterministic order: namespace collisions, crash/restart replay, metadata
 outage, and object-store outage. The corpus CLI supports running one seed, one
 scenario group, the fast corpus, or the deep corpus:
 `cargo run -p studiofs-scenario --bin studiofs-scenario -- run-corpus --corpus fast`.
+Metadata and object-store outage groups keep the core success condition stable
+while varying recovery flaps and unavailable-read probes from the seed, so deep
+corpus output makes seed-controlled fault timing visible instead of repeating a
+single trace shape.
 Failures report the scenario group, seed, violated invariant, message, and
 counterexample artifact path when the underlying suite can write one. The RWX
 workflow lives in `.rwx/simulation.yml` with `simulation-fast` and

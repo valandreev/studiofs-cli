@@ -199,6 +199,10 @@ The deterministic simulation corpus lives in `studiofs-scenario` and is wired
 to RWX through `.rwx/simulation.yml`. It is pure Rust logical simulation: it
 does not require Docker, PostgreSQL, RustFS, FUSE, WinFSP, mounted filesystems,
 self-hosted runners, or wall-clock sleeps.
+Deep corpus seeds should change the observable trace shape for collision,
+crash/restart, metadata-outage, and object-store-outage groups; identical trace
+counts across every deep seed usually mean the scenario has collapsed into a
+single-path check.
 
 Local commands:
 

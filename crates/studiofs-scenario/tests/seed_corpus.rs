@@ -52,6 +52,54 @@ fn corpus_runner_filters_one_group_and_one_seed() {
 }
 
 #[test]
+fn deep_metadata_outage_corpus_uses_seed_controlled_paths() {
+    let report = run_simulation_corpus(SimulationCorpusOptions {
+        kind: SimulationCorpusKind::Deep,
+        group: Some(SimulationScenarioGroup::MetadataOutage),
+        seed: None,
+        artifact_root: None,
+        inject_failure: false,
+    })
+    .expect("metadata outage corpus runs");
+
+    assert!(report.passed, "{:#?}", report.failures);
+    let seed_reports = &report.group_reports[0].seed_reports;
+    let distinct_trace_shapes = seed_reports
+        .iter()
+        .map(|seed| seed.trace_records)
+        .collect::<std::collections::BTreeSet<_>>();
+
+    assert!(
+        distinct_trace_shapes.len() >= 8,
+        "metadata outage deep seeds have too little path diversity: {seed_reports:#?}"
+    );
+}
+
+#[test]
+fn deep_object_store_outage_corpus_uses_seed_controlled_paths() {
+    let report = run_simulation_corpus(SimulationCorpusOptions {
+        kind: SimulationCorpusKind::Deep,
+        group: Some(SimulationScenarioGroup::ObjectStoreOutage),
+        seed: None,
+        artifact_root: None,
+        inject_failure: false,
+    })
+    .expect("object-store outage corpus runs");
+
+    assert!(report.passed, "{:#?}", report.failures);
+    let seed_reports = &report.group_reports[0].seed_reports;
+    let distinct_trace_shapes = seed_reports
+        .iter()
+        .map(|seed| seed.trace_records)
+        .collect::<std::collections::BTreeSet<_>>();
+
+    assert!(
+        distinct_trace_shapes.len() >= 8,
+        "object-store outage deep seeds have too little path diversity: {seed_reports:#?}"
+    );
+}
+
+#[test]
 fn corpus_failures_include_group_seed_invariant_and_artifact_path() {
     let artifact_root = unique_temp_dir("sfs340-corpus-counterexamples");
     std::fs::create_dir_all(&artifact_root).expect("create artifact root");
