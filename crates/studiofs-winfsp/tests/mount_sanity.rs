@@ -84,6 +84,39 @@ const FILE_FLAG_WRITE_THROUGH: u32 = 0x8000_0000;
 const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
 const AJA_CACHE_OFF_OPEN_OPTIONS_FLAGS: u32 = FILE_FLAG_WRITE_THROUGH | FILE_FLAG_NO_BUFFERING;
 const AJA_CACHE_OFF_ALIGNMENT_BYTES: usize = 4096;
+const PLATFORM_BRIDGE_MOUNT_TESTS_ENV: &str = "STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS";
+
+fn platform_bridge_mount_tests_skip_message(test_name: &str, actual: Option<&str>) -> String {
+    let actual = actual.unwrap_or("<unset>");
+    format!(
+        "studiofs_smoke_skip test={test_name:?} reason=\"env gate disabled\" env={PLATFORM_BRIDGE_MOUNT_TESTS_ENV:?} expected=\"1\" actual={actual:?}"
+    )
+}
+
+fn platform_bridge_mount_tests_enabled(test_name: &str) -> bool {
+    let actual = std::env::var(PLATFORM_BRIDGE_MOUNT_TESTS_ENV).ok();
+    if actual.as_deref() == Some("1") {
+        true
+    } else {
+        eprintln!(
+            "{}",
+            platform_bridge_mount_tests_skip_message(test_name, actual.as_deref())
+        );
+        false
+    }
+}
+
+#[test]
+fn platform_bridge_mount_tests_skip_message_names_env_gate() {
+    let message = platform_bridge_mount_tests_skip_message("smoke_case", None);
+
+    assert!(message.contains("studiofs_smoke_skip"));
+    assert!(message.contains("test=\"smoke_case\""));
+    assert!(message.contains("reason=\"env gate disabled\""));
+    assert!(message.contains("env=\"STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS\""));
+    assert!(message.contains("expected=\"1\""));
+    assert!(message.contains("actual=\"<unset>\""));
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AjaCacheValidationMode {
@@ -760,7 +793,7 @@ fn wait_for_upload_ready(vfs: &StudioVfs, ino: u64, label: &str, timeout: Durati
 #[test]
 #[ignore = "requires WinFSP runtime + STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
 fn winfsp_mount_unmount_smoke() {
-    if std::env::var("STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS").as_deref() != Ok("1") {
+    if !platform_bridge_mount_tests_enabled("winfsp_mount_unmount_smoke") {
         return;
     }
     let mount_point = match std::env::var("STUDIOFS_WINFSP_TEST_MOUNT_POINT") {
@@ -788,7 +821,7 @@ fn winfsp_mount_unmount_smoke() {
 #[test]
 #[ignore = "requires WinFSP runtime + STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
 fn winfsp_mount_write_read_unmount_smoke() {
-    if std::env::var("STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS").as_deref() != Ok("1") {
+    if !platform_bridge_mount_tests_enabled("winfsp_mount_write_read_unmount_smoke") {
         return;
     }
     let mount_point = match std::env::var("STUDIOFS_WINFSP_TEST_MOUNT_POINT") {
@@ -834,7 +867,9 @@ fn winfsp_mount_write_read_unmount_smoke() {
 #[test]
 #[ignore = "requires WinFSP runtime + STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
 fn winfsp_mount_regular_file_attributes_do_not_materialize_directories() {
-    if std::env::var("STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS").as_deref() != Ok("1") {
+    if !platform_bridge_mount_tests_enabled(
+        "winfsp_mount_regular_file_attributes_do_not_materialize_directories",
+    ) {
         return;
     }
     let mount_point = match std::env::var("STUDIOFS_WINFSP_TEST_MOUNT_POINT") {
@@ -981,7 +1016,9 @@ fn validate_aja_sequential_throughput_rejects_slow_rate() {
 #[test]
 #[ignore = "requires WinFSP runtime + STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
 fn winfsp_mount_callback_flush_and_cleanup_observability_smoke() {
-    if std::env::var("STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS").as_deref() != Ok("1") {
+    if !platform_bridge_mount_tests_enabled(
+        "winfsp_mount_callback_flush_and_cleanup_observability_smoke",
+    ) {
         return;
     }
     let mount_point = match std::env::var("STUDIOFS_WINFSP_TEST_MOUNT_POINT") {
@@ -1108,7 +1145,9 @@ fn winfsp_mount_aja_style_sequential_writer_validation_smoke() {
     use std::io::Write;
     use std::os::windows::fs::OpenOptionsExt;
 
-    if std::env::var("STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS").as_deref() != Ok("1") {
+    if !platform_bridge_mount_tests_enabled(
+        "winfsp_mount_aja_style_sequential_writer_validation_smoke",
+    ) {
         return;
     }
     let mount_point = match std::env::var("STUDIOFS_WINFSP_TEST_MOUNT_POINT") {
@@ -1258,7 +1297,8 @@ fn winfsp_mount_aja_style_sequential_writer_validation_smoke() {
 #[test]
 #[ignore = "requires WinFSP runtime + STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
 fn winfsp_mount_reopen_read_after_upload_finalize_smoke() {
-    if std::env::var("STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS").as_deref() != Ok("1") {
+    if !platform_bridge_mount_tests_enabled("winfsp_mount_reopen_read_after_upload_finalize_smoke")
+    {
         return;
     }
     if !require_online_upload_backend("winfsp_mount_reopen_read_after_upload_finalize_smoke") {
@@ -1310,7 +1350,7 @@ fn winfsp_mount_reopen_read_after_upload_finalize_smoke() {
 #[test]
 #[ignore = "requires WinFSP runtime + STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
 fn winfsp_mount_copy_read_after_upload_finalize_smoke() {
-    if std::env::var("STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS").as_deref() != Ok("1") {
+    if !platform_bridge_mount_tests_enabled("winfsp_mount_copy_read_after_upload_finalize_smoke") {
         return;
     }
     if !require_online_upload_backend("winfsp_mount_copy_read_after_upload_finalize_smoke") {
@@ -1371,7 +1411,9 @@ fn winfsp_mount_copy_read_after_upload_finalize_smoke() {
 #[test]
 #[ignore = "requires WinFSP runtime + STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
 fn winfsp_mount_set_len_chunked_write_read_after_upload_finalize_smoke() {
-    if std::env::var("STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS").as_deref() != Ok("1") {
+    if !platform_bridge_mount_tests_enabled(
+        "winfsp_mount_set_len_chunked_write_read_after_upload_finalize_smoke",
+    ) {
         return;
     }
     if !require_online_upload_backend(
@@ -1458,7 +1500,9 @@ fn winfsp_mount_set_len_chunked_write_read_after_upload_finalize_smoke() {
 #[test]
 #[ignore = "requires WinFSP runtime + STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
 fn winfsp_mount_same_handle_read_after_upload_finalize_smoke() {
-    if std::env::var("STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS").as_deref() != Ok("1") {
+    if !platform_bridge_mount_tests_enabled(
+        "winfsp_mount_same_handle_read_after_upload_finalize_smoke",
+    ) {
         return;
     }
     if !require_online_upload_backend("winfsp_mount_same_handle_read_after_upload_finalize_smoke") {
@@ -1532,7 +1576,9 @@ fn winfsp_mount_same_handle_read_after_upload_finalize_smoke() {
 #[test]
 #[ignore = "requires WinFSP runtime + STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
 fn winfsp_mount_reader_open_during_upload_stays_readable_after_finalize_smoke() {
-    if std::env::var("STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS").as_deref() != Ok("1") {
+    if !platform_bridge_mount_tests_enabled(
+        "winfsp_mount_reader_open_during_upload_stays_readable_after_finalize_smoke",
+    ) {
         return;
     }
     if !require_online_upload_backend(
@@ -1633,7 +1679,9 @@ fn winfsp_mount_reader_open_during_upload_stays_readable_after_finalize_smoke() 
 #[test]
 #[ignore = "requires WinFSP runtime + STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
 fn winfsp_mount_mmap_reader_during_upload_stays_readable_after_finalize_smoke() {
-    if std::env::var("STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS").as_deref() != Ok("1") {
+    if !platform_bridge_mount_tests_enabled(
+        "winfsp_mount_mmap_reader_during_upload_stays_readable_after_finalize_smoke",
+    ) {
         return;
     }
     if !require_online_upload_backend(
@@ -1760,7 +1808,7 @@ fn winfsp_mount_write_wall_and_gate_contention_smoke() {
     use std::io::Write;
     use std::os::windows::fs::OpenOptionsExt;
 
-    if std::env::var("STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS").as_deref() != Ok("1") {
+    if !platform_bridge_mount_tests_enabled("winfsp_mount_write_wall_and_gate_contention_smoke") {
         return;
     }
     let mount_point = match std::env::var("STUDIOFS_WINFSP_TEST_MOUNT_POINT") {
