@@ -234,15 +234,15 @@ impl<'a> NamespaceCreateTxn<'a> {
     }
 
     pub(super) fn insert_dentry(&self, dentry_key: &[u8], entry: &DirEntryValue) -> MetaResult<()> {
-        let mut dentries = self
-            .txn
-            .open_table(DENTRIES_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let entry_val = encode(entry)?;
-        dentries
-            .insert(dentry_key, entry_val.as_slice())
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(())
+        let (parent, name) = decode_dentry_key(dentry_key)?;
+        RedbMetaEngine::set_dentry_in_table_with_index_in_txn(
+            self.txn,
+            DENTRIES_TABLE,
+            DENTRY_BY_INODE_TABLE,
+            parent,
+            name,
+            entry,
+        )
     }
 
     pub(super) fn clear_dentry_tombstone(&self, dentry_key: &[u8]) -> MetaResult<()> {
