@@ -163,5 +163,5 @@ fn corpus_label(kind: SimulationCorpusKind) -> &'static str {
 }
 
 fn group_label(group: SimulationScenarioGroup) -> String {
-    group_arg(group).replace('-', "_")
+    group_arg(group).to_string()
 }

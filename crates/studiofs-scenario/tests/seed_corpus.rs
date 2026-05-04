@@ -138,7 +138,7 @@ fn cli_runs_one_seed_and_reports_group_seed_and_artifact_root() {
     );
     let stdout = String::from_utf8(output.stdout).expect("stdout is utf-8");
     assert!(stdout.contains("scenario=sfs340-simulation-corpus"));
-    assert!(stdout.contains("group=metadata_outage seed=2 status=passed"));
+    assert!(stdout.contains("group=metadata-outage seed=2 status=passed"));
     assert!(stdout.contains("artifact_root="));
 }
 
