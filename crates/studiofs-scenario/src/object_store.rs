@@ -193,6 +193,12 @@ impl SimulatedObjectStore {
         Ok(ticket)
     }
 
+    pub fn upload_ticket(&self, upload_id: u64) -> Option<UploadTicket> {
+        self.uploads
+            .get(&upload_id)
+            .map(|state| state.ticket.clone())
+    }
+
     pub fn complete_upload(&mut self, upload_id: u64) -> Option<UploadOutcome> {
         let state = self.uploads.get(&upload_id)?.clone();
         if state.terminal {
