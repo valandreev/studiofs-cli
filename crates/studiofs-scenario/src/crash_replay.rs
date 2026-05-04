@@ -1,10 +1,21 @@
 //! Deterministic crash/restart and replay simulation suite.
 
+use std::collections::BTreeMap;
+use std::fs;
+use std::io::{BufReader, BufWriter, Write as _};
+use std::path::{Path, PathBuf};
+
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 use crate::client::SimulatedRuntime;
-use crate::invariant::{InvariantViolation, validate_logical_invariants};
-use crate::scheduler::{ScheduledEvent, SchedulerEventType, SimulationScheduler};
+use crate::invariant::{InvariantViolation, LogicalSnapshot, validate_logical_invariants};
+use crate::scheduler::{
+    ScheduledEvent, SchedulerEventType, SchedulerTraceRecord, SimulationScheduler,
+};
+use crate::{ScenarioOperation, ScenarioOperationRecord};
+
+pub const CRASH_REPLAY_COUNTEREXAMPLE_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CrashReplaySuiteConfig {
@@ -68,6 +79,8 @@ pub struct CrashReplayFailure {
     pub violated_invariant: String,
     pub message: String,
     pub trace: Vec<CrashReplayTraceRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub counterexample_artifact_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,6 +91,67 @@ pub struct CrashReplayTraceRecord {
     pub client: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CrashReplayCounterexampleArtifact {
+    pub schema_version: u32,
+    pub scenario: String,
+    pub family: CrashReplayFamily,
+    pub seed: u64,
+    pub scheduler_trace: Vec<SchedulerTraceRecord>,
+    pub operation_log: Vec<ScenarioOperationRecord>,
+    pub client_trace: Vec<CrashReplayTraceRecord>,
+    pub failure: CrashReplayFailureDetails,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub final_snapshot: Option<LogicalSnapshot>,
+    pub replay_command: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CrashReplayFailureDetails {
+    pub violated_invariant: String,
+    pub message: String,
+    pub diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CrashReplayReplayReport {
+    pub reproduced: bool,
+    pub scenario: String,
+    pub family: CrashReplayFamily,
+    pub seed: u64,
+    pub violated_invariant: String,
+    pub message: String,
+}
+
+#[derive(Debug, Error)]
+pub enum CrashReplayArtifactError {
+    #[error("counterexample artifact I/O failed: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("counterexample artifact JSON failed: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("unsupported counterexample artifact schema version {0}")]
+    UnsupportedSchemaVersion(u32),
+    #[error("counterexample artifact path is not valid UTF-8: {path:?}")]
+    InvalidArtifactPath { path: PathBuf },
+    #[error("counterexample artifact writes failed: {errors:?}")]
+    ArtifactWriteFailures {
+        errors: Vec<CrashReplayArtifactWriteFailure>,
+    },
+    #[error("counterexample replay did not reproduce: {0}")]
+    ReplayMismatch(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrashReplayArtifactWriteFailure {
+    pub scenario: String,
+    pub family: CrashReplayFamily,
+    pub seed: u64,
+    pub path: PathBuf,
+    pub error: String,
 }
 
 pub fn run_crash_replay_suite(config: CrashReplaySuiteConfig) -> CrashReplaySuiteReport {
@@ -107,9 +181,194 @@ pub fn run_crash_replay_suite(config: CrashReplaySuiteConfig) -> CrashReplaySuit
     }
 }
 
+pub fn run_crash_replay_suite_with_artifacts(
+    config: CrashReplaySuiteConfig,
+    artifact_root: impl AsRef<Path>,
+) -> Result<CrashReplaySuiteReport, CrashReplayArtifactError> {
+    let artifact_root = artifact_root.as_ref();
+    let mut family_reports = Vec::new();
+    let mut failures = Vec::new();
+    let mut artifact_write_errors = Vec::new();
+
+    for family in config.families {
+        let mut seed_reports = Vec::new();
+        for seed in &config.seeds {
+            let mut run = run_family(&config.scenario, family, *seed);
+            if run.failure.is_some() {
+                let artifact_path =
+                    counterexample_artifact_path(artifact_root, &config.scenario, family, *seed);
+                match run
+                    .counterexample_artifact(&artifact_path)
+                    .and_then(|artifact| {
+                        write_crash_replay_counterexample(&artifact_path, &artifact)
+                    }) {
+                    Ok(()) => {
+                        if let Some(failure) = &mut run.failure {
+                            failure.counterexample_artifact_path =
+                                Some(artifact_path_utf8(&artifact_path)?.to_string());
+                        }
+                    }
+                    Err(error) => artifact_write_errors.push(CrashReplayArtifactWriteFailure {
+                        scenario: config.scenario.clone(),
+                        family,
+                        seed: *seed,
+                        path: artifact_path,
+                        error: error.to_string(),
+                    }),
+                }
+            }
+            if let Some(failure) = run.failure {
+                failures.push(failure);
+            }
+            seed_reports.push(run.report);
+        }
+        family_reports.push(CrashReplayFamilyReport {
+            family,
+            seed_reports,
+        });
+    }
+
+    if !artifact_write_errors.is_empty() {
+        return Err(CrashReplayArtifactError::ArtifactWriteFailures {
+            errors: artifact_write_errors,
+        });
+    }
+
+    Ok(CrashReplaySuiteReport {
+        scenario: config.scenario,
+        passed: failures.is_empty(),
+        family_reports,
+        failures,
+    })
+}
+
+pub fn write_crash_replay_counterexample(
+    path: impl AsRef<Path>,
+    artifact: &CrashReplayCounterexampleArtifact,
+) -> Result<(), CrashReplayArtifactError> {
+    if let Some(parent) = path.as_ref().parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file = fs::File::create(path)?;
+    let mut writer = BufWriter::new(file);
+    serde_json::to_writer_pretty(&mut writer, artifact)?;
+    writer.flush()?;
+    Ok(())
+}
+
+pub fn read_crash_replay_counterexample(
+    path: impl AsRef<Path>,
+) -> Result<CrashReplayCounterexampleArtifact, CrashReplayArtifactError> {
+    let file = fs::File::open(path)?;
+    let reader = BufReader::new(file);
+    let artifact: CrashReplayCounterexampleArtifact = serde_json::from_reader(reader)?;
+    if artifact.schema_version != CRASH_REPLAY_COUNTEREXAMPLE_SCHEMA_VERSION {
+        return Err(CrashReplayArtifactError::UnsupportedSchemaVersion(
+            artifact.schema_version,
+        ));
+    }
+    Ok(artifact)
+}
+
+pub fn replay_crash_replay_counterexample(
+    path: impl AsRef<Path>,
+) -> Result<CrashReplayReplayReport, CrashReplayArtifactError> {
+    let artifact = read_crash_replay_counterexample(path)?;
+    let run = run_family(&artifact.scenario, artifact.family, artifact.seed);
+    let Some(failure) = run.failure else {
+        return Err(CrashReplayArtifactError::ReplayMismatch(
+            "saved counterexample passed during replay".to_string(),
+        ));
+    };
+    let expected_trace = artifact.client_trace;
+    if failure.violated_invariant != artifact.failure.violated_invariant {
+        return Err(CrashReplayArtifactError::ReplayMismatch(format!(
+            "expected invariant {}, got {}",
+            artifact.failure.violated_invariant, failure.violated_invariant
+        )));
+    }
+    if run.scheduler_trace != artifact.scheduler_trace {
+        return Err(CrashReplayArtifactError::ReplayMismatch(
+            "scheduler trace differed from artifact".to_string(),
+        ));
+    }
+    if run.operation_log != artifact.operation_log {
+        return Err(CrashReplayArtifactError::ReplayMismatch(
+            "operation log differed from artifact".to_string(),
+        ));
+    }
+    if failure.trace != expected_trace {
+        return Err(CrashReplayArtifactError::ReplayMismatch(
+            "client trace differed from artifact".to_string(),
+        ));
+    }
+
+    Ok(CrashReplayReplayReport {
+        reproduced: true,
+        scenario: artifact.scenario,
+        family: artifact.family,
+        seed: artifact.seed,
+        violated_invariant: failure.violated_invariant,
+        message: failure.message,
+    })
+}
+
 struct FamilyRun {
     report: CrashReplaySeedReport,
     failure: Option<CrashReplayFailure>,
+    scheduler_trace: Vec<SchedulerTraceRecord>,
+    operation_log: Vec<ScenarioOperationRecord>,
+    final_snapshot: LogicalSnapshot,
+}
+
+impl FamilyRun {
+    fn counterexample_artifact(
+        &self,
+        artifact_path: &Path,
+    ) -> Result<CrashReplayCounterexampleArtifact, CrashReplayArtifactError> {
+        let failure = self
+            .failure
+            .as_ref()
+            .expect("counterexample artifact requires a failure");
+        Ok(CrashReplayCounterexampleArtifact {
+            schema_version: CRASH_REPLAY_COUNTEREXAMPLE_SCHEMA_VERSION,
+            scenario: failure.scenario.clone(),
+            family: failure.family,
+            seed: failure.seed,
+            scheduler_trace: self.scheduler_trace.clone(),
+            operation_log: self.operation_log.clone(),
+            client_trace: failure.trace.clone(),
+            failure: CrashReplayFailureDetails {
+                violated_invariant: failure.violated_invariant.clone(),
+                message: failure.message.clone(),
+                diagnostics: failure
+                    .trace
+                    .iter()
+                    .filter(|record| record.kind == "invariant_failed")
+                    .map(|record| {
+                        format!(
+                            "step={} client={} path={}",
+                            record.step,
+                            record.client.as_deref().unwrap_or("<none>"),
+                            record.path.as_deref().unwrap_or("<none>")
+                        )
+                    })
+                    .collect(),
+            },
+            final_snapshot: Some(self.final_snapshot.clone()),
+            replay_command: format!(
+                "cargo run -p studiofs-scenario --bin studiofs-scenario -- replay-counterexample \"{}\"",
+                artifact_path_utf8(artifact_path)?
+            ),
+        })
+    }
+}
+
+fn artifact_path_utf8(path: &Path) -> Result<&str, CrashReplayArtifactError> {
+    path.to_str()
+        .ok_or_else(|| CrashReplayArtifactError::InvalidArtifactPath {
+            path: path.to_path_buf(),
+        })
 }
 
 struct CrashHarness {
@@ -153,11 +412,15 @@ impl CrashHarness {
                 violated_invariant: "injected_counterexample".to_string(),
                 message: "injected invariant failure for counterexample trace testing".to_string(),
                 trace: self.trace.clone(),
+                counterexample_artifact_path: None,
             })
         } else {
-            self.checkpoint("final").err()
+            self.checkpoint("final").err().map(|failure| *failure)
         };
         let passed = failure.is_none();
+        let final_snapshot = self.runtime.logical_snapshot();
+        let operation_log = operation_log_from_trace(&self.scenario, &self.trace);
+        let scheduler_trace = self.scheduler.trace().to_vec();
         FamilyRun {
             report: CrashReplaySeedReport {
                 seed: self.seed,
@@ -168,14 +431,27 @@ impl CrashHarness {
                 trace: self.trace,
             },
             failure,
+            scheduler_trace,
+            operation_log,
+            final_snapshot,
         }
     }
 
     fn write_durable(&mut self, checksum: &str, size: u64) {
         self.runtime.create_file("writer", "replay.txt").ok();
+        self.push("create_file", Some("writer"), Some("replay.txt"));
         self.runtime
             .write_file("writer", "replay.txt", size, checksum)
             .unwrap();
+        self.push_with_metadata(
+            "write_file",
+            Some("writer"),
+            Some("replay.txt"),
+            [
+                ("bytes".to_string(), size.to_string()),
+                ("checksum_sha256".to_string(), checksum.to_string()),
+            ],
+        );
         self.runtime.flush("writer", "replay.txt").unwrap();
         self.push(
             "local_durability_boundary",
@@ -233,7 +509,7 @@ impl CrashHarness {
         self.push("client_restarted", Some("reader"), None);
     }
 
-    fn checkpoint(&mut self, name: &str) -> Result<(), CrashReplayFailure> {
+    fn checkpoint(&mut self, name: &str) -> Result<(), Box<CrashReplayFailure>> {
         self.push("invariant_checkpoint", None, Some(name));
         self.invariant_checkpoints += 1;
         let mut snapshot = self.runtime.logical_snapshot();
@@ -259,14 +535,15 @@ impl CrashHarness {
             violation.client.as_deref(),
             violation.path.as_deref(),
         );
-        Err(CrashReplayFailure {
+        Err(Box::new(CrashReplayFailure {
             scenario: self.scenario.clone(),
             family: self.family,
             seed: self.seed,
             violated_invariant: violation.invariant,
             message: violation.message,
             trace: self.trace.clone(),
-        })
+            counterexample_artifact_path: None,
+        }))
     }
 
     fn record_checkpoint(&mut self, name: &str) {
@@ -312,11 +589,22 @@ impl CrashHarness {
     }
 
     fn push(&mut self, kind: &str, client: Option<&str>, path: Option<&str>) {
+        self.push_with_metadata(kind, client, path, []);
+    }
+
+    fn push_with_metadata(
+        &mut self,
+        kind: &str,
+        client: Option<&str>,
+        path: Option<&str>,
+        metadata: impl IntoIterator<Item = (String, String)>,
+    ) {
         self.trace.push(CrashReplayTraceRecord {
             step: self.trace.len() as u64 + 1,
             kind: kind.to_string(),
             client: client.map(str::to_string),
             path: path.map(str::to_string),
+            metadata: metadata.into_iter().collect(),
         });
     }
 }
@@ -548,7 +836,103 @@ fn memory_only_dirty_crash(h: &mut CrashHarness) {
 
 fn injected_invariant_failure(h: &mut CrashHarness) {
     h.write_durable("checksum-counterexample", 1);
+    let _ = h.run_race(PlannedCrashOp::Publish, PlannedCrashOp::RestartWriter);
     h.replay_idempotent = false;
     h.push("invariant_failed", None, Some("replay.txt"));
     h.push("counterexample_replay_ready", None, Some("replay.txt"));
+}
+
+fn operation_log_from_trace(
+    scenario: &str,
+    trace: &[CrashReplayTraceRecord],
+) -> Vec<ScenarioOperationRecord> {
+    trace
+        .iter()
+        .map(|record| {
+            let mut operation =
+                ScenarioOperationRecord::new(scenario, record.step, operation_from_trace(record))
+                    .with_outcome(crate::OperationOutcome::Observed);
+            if let Some(client) = &record.client {
+                operation = operation.with_client(client.clone());
+            }
+            if let Some(path) = &record.path {
+                operation = operation.with_metadata("path", path.clone());
+            }
+            for (key, value) in &record.metadata {
+                operation = operation.with_metadata(key.clone(), value.clone());
+            }
+            operation
+        })
+        .collect()
+}
+
+fn operation_from_trace(record: &CrashReplayTraceRecord) -> ScenarioOperation {
+    match record.kind.as_str() {
+        "create_file" => ScenarioOperation::CreateFile {
+            path: trace_path(record),
+            bytes: None,
+        },
+        "write_file" => ScenarioOperation::Write {
+            path: trace_path(record),
+            offset: None,
+            bytes: record
+                .metadata
+                .get("bytes")
+                .and_then(|bytes| bytes.parse().ok())
+                .unwrap_or_default(),
+            checksum_sha256: record.metadata.get("checksum_sha256").cloned(),
+        },
+        "local_durability_boundary" => ScenarioOperation::Flush {
+            path: record.path.clone(),
+        },
+        "client_restarted" => ScenarioOperation::ClientRestart,
+        "upload_completed" => ScenarioOperation::ObjectStoreRecovery,
+        "metadata_published" | "publish_attempted" | "publish_replayed" => {
+            ScenarioOperation::Fsync {
+                path: trace_path(record),
+            }
+        }
+        "foreign_apply_completed" | "foreign_apply_attempted" | "foreign_apply_replayed" => {
+            ScenarioOperation::Wait {
+                checkpoint: record.kind.clone(),
+            }
+        }
+        _ => ScenarioOperation::SchedulerCheckpoint {
+            name: record.kind.clone(),
+        },
+    }
+}
+
+fn trace_path(record: &CrashReplayTraceRecord) -> String {
+    record.path.clone().unwrap_or_default()
+}
+
+fn counterexample_artifact_path(
+    artifact_root: &Path,
+    scenario: &str,
+    family: CrashReplayFamily,
+    seed: u64,
+) -> PathBuf {
+    artifact_root
+        .join(sanitize_path_component(scenario))
+        .join(format!("{family:?}-seed-{seed}.json").to_ascii_lowercase())
+}
+
+fn sanitize_path_component(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let sanitized = sanitized.trim_matches('-');
+    if sanitized.is_empty() {
+        "unknown".to_string()
+    } else {
+        sanitized.to_string()
+    }
 }

@@ -176,6 +176,26 @@ or NDJSON. This keeps them compatible with existing E2E report upload and makes
 future CI/RWX collection straightforward without depending on the real E2E
 runner.
 
+The initial SFS-339 artifact format is a single JSON document written by
+`studiofs_scenario::crash_replay::run_crash_replay_suite_with_artifacts` under
+`<artifact-root>/<scenario>/<family>-seed-<seed>.json`. Schema version 1
+contains:
+
+- `scenario`, `family`, and `seed`;
+- `scheduler_trace`, using the deterministic scheduler trace schema;
+- `operation_log`, using the shared `ScenarioOperationRecord` schema;
+- `client_trace`, using crash/restart replay trace records;
+- `failure.violated_invariant`, `failure.message`, and diagnostic strings;
+- `final_snapshot`, when the simulated runtime can export one;
+- `replay_command`, currently
+  `cargo run -p studiofs-scenario --bin studiofs-scenario -- replay-counterexample <artifact>`.
+
+Replay is local and deterministic: `replay-counterexample` reads the artifact,
+reruns the same scenario family and seed, and fails if the violated invariant,
+scheduler trace, operation log, or client trace differs from the saved
+counterexample. It does not start Docker, PostgreSQL, RustFS, mounted
+filesystems, Tokio timing, or wall-clock sleeps.
+
 ## Initial Module Plan
 
 The design intentionally sequences implementation in small slices:
