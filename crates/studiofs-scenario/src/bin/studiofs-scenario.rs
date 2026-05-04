@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use studiofs_scenario::crash_replay::replay_crash_replay_counterexample;
 use studiofs_scenario::seed_corpus::{
     SimulationCorpusKind, SimulationCorpusOptions, SimulationScenarioGroup, group_arg,
-    run_simulation_corpus,
+    replay_simulation_counterexample, run_simulation_corpus,
 };
 
 fn main() {
@@ -25,12 +25,29 @@ fn run() -> Result<(), String> {
             if args.next().is_some() {
                 return Err("unexpected extra arguments".to_string());
             }
-            let report = replay_crash_replay_counterexample(&path)
-                .map_err(|error| format!("counterexample replay failed: {error}"))?;
-            println!(
-                "reproduced {} seed {} invariant {}: {}",
-                report.scenario, report.seed, report.violated_invariant, report.message
-            );
+            match replay_simulation_counterexample(&path) {
+                Ok(report) => {
+                    println!(
+                        "reproduced {} group {} seed {} invariant {}: {}",
+                        report.scenario,
+                        group_label(report.group),
+                        report.seed,
+                        report.violated_invariant,
+                        report.message
+                    );
+                }
+                Err(simulation_error) => {
+                    let report = replay_crash_replay_counterexample(&path).map_err(|crash_error| {
+                        format!(
+                            "counterexample replay failed: simulation artifact error: {simulation_error}; crash/restart artifact error: {crash_error}"
+                        )
+                    })?;
+                    println!(
+                        "reproduced {} seed {} invariant {}: {}",
+                        report.scenario, report.seed, report.violated_invariant, report.message
+                    );
+                }
+            }
             Ok(())
         }
         Some(command) if command == OsStr::new("run-corpus") => run_corpus(args.collect()),

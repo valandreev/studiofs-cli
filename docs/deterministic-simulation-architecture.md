@@ -196,6 +196,32 @@ scheduler trace, operation log, or client trace differs from the saved
 counterexample. It does not start Docker, PostgreSQL, RustFS, mounted
 filesystems, Tokio timing, or wall-clock sleeps.
 
+The SFS-359 corpus artifact format extends that replay contract to non-crash
+simulation corpus failures. Generic corpus counterexamples are single JSON
+documents under `<artifact-root>/<corpus>/<scenario-group>/seed-<seed>-failure-<n>.json`.
+Schema version 1 contains:
+
+- `scenario`, `corpus`, `group`, optional `sub_group`, and `seed`;
+- `scheduler_trace`, using the deterministic scheduler trace schema or a stable
+  checkpoint trace for deterministic groups without randomized scheduling;
+- `operation_log`, using the shared `ScenarioOperationRecord` schema when the
+  group can map its trace to operations;
+- `event_trace`, using the group-specific logical event records;
+- `failure.violated_invariant` and `failure.message`;
+- `final_snapshot`, when the simulated runtime can export one; object-store
+  outage artifacts use the object lifecycle snapshot exported by the simulated
+  object store;
+- `replay_command`, always
+  `cargo run -p studiofs-scenario --bin studiofs-scenario -- replay-counterexample <artifact>`.
+
+For generic corpus artifacts, replay reruns the saved corpus, group, and seed
+from the artifact path and fails if the violated invariant, message, scheduler
+trace, operation log, event trace, or final snapshot differs. Running a seed with
+`run-corpus --seed <n>` is only a fresh corpus run; it is not exact
+counterexample replay unless it reads the saved artifact. Replay mismatch errors
+include the first differing index for trace and log vectors, or the saved and
+replayed lengths when one side has extra records.
+
 ## Initial Module Plan
 
 The design intentionally sequences implementation in small slices:
@@ -332,7 +358,11 @@ workflow lives in `.rwx/simulation.yml` with `simulation-fast` and
 `simulation-deep` targets and uploads `target/simulation-counterexamples/`.
 When a group-specific suite does not have its own replay artifact format yet,
 the corpus layer writes a schema-versioned JSON artifact with the corpus,
-scenario group, seed, violated invariant, message, and stable replay command.
+scenario group, optional scenario-family subgroup, seed, scheduler trace,
+operation log, event trace, violated invariant, message, relevant final
+snapshot, and stable replay command. The
+stable replay command reads the artifact path through `replay-counterexample`;
+`run-corpus --seed` remains a seed rerun and does not force saved event choices.
 It intentionally does not use Docker, PostgreSQL, RustFS, FUSE, WinFSP,
 self-hosted runners, GitHub Actions triggers, schedules, or label-gated PR
 runs.

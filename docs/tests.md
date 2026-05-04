@@ -209,6 +209,13 @@ cargo run -p studiofs-scenario --bin studiofs-scenario -- run-corpus --corpus fa
 cargo run -p studiofs-scenario --bin studiofs-scenario -- run-corpus --corpus fast --scenario-group crash-restart-replay --seed 13 --artifact-root target\simulation-counterexamples\seed-13
 ```
 
+Replay a saved counterexample by passing the artifact path to
+`replay-counterexample`; do not use `run-corpus --seed` for exact replay:
+
+```powershell
+cargo run -p studiofs-scenario --bin studiofs-scenario -- replay-counterexample target\simulation-counterexamples\fast\namespace-collisions\seed-13-failure-0.json
+```
+
 RWX commands:
 
 ```powershell
@@ -220,7 +227,11 @@ On failure, the RWX run uploads the matching counterexample artifact folder:
 `simulation-counterexamples-fast` for `simulation-fast` and
 `simulation-counterexamples-deep` for `simulation-deep`. The CLI output prints
 `artifact_path=<path>` for each failing seed; open the uploaded artifact with
-that relative path and replay it with the artifact's `replay_command`.
+that relative path and replay it with the artifact's `replay_command`. Replay
+is local and fails if the saved scheduler trace, operation log, event trace,
+violated invariant, or relevant snapshot no longer matches the rerun. Mismatch
+errors include the first differing vector index or a saved/replayed length
+difference to make artifact drift diagnosable.
 
 ## Platform-Gated Unit Tests
 
