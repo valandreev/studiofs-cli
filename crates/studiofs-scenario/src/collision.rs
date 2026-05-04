@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::client::SimulatedRuntime;
-use crate::invariant::validate_logical_invariants;
+use crate::invariant::{InvariantViolation, validate_logical_invariants};
 use crate::scheduler::{ScheduledEvent, SchedulerEventType, SimulationScheduler};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,7 +168,18 @@ impl FamilyHarness {
         if report.passed {
             return Ok(());
         }
-        let violation = report.violations[0].clone();
+        let violation = report
+            .violations
+            .first()
+            .cloned()
+            .unwrap_or_else(|| InvariantViolation {
+                invariant: "unknown".to_string(),
+                message: "invariant validation failed but no violations were reported".to_string(),
+                client: None,
+                path: None,
+                logical_id: None,
+                object_id: None,
+            });
         self.push(
             "invariant_failed",
             violation.client.as_deref(),
