@@ -23,6 +23,30 @@ impl RedbMetaEngine {
         Self::lookup_in_opened_dentry_table(&table, parent, name)
     }
 
+    pub(crate) fn mark_local_regular_file_ready_preserving_overlay(
+        &self,
+        ino: Ino,
+    ) -> MetaResult<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let Some(mut attr) = Self::get_attr_from_write_table(&txn, INODES_TABLE, ino)? else {
+            txn.commit()
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            return Ok(());
+        };
+        if attr.kind == FileType::RegularFile && attr.upload_state == UploadState::Updating {
+            attr.upload_state = UploadState::Ready;
+            attr.committed_size = attr.size;
+            attr.committed_content_epoch = attr.content_epoch;
+            Self::set_inode_overlay_in_txn(&txn, &attr)?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
     pub(crate) fn remove_dentry_mirrors_for_inode_in_txn(
         txn: &redb::WriteTransaction,
         ino: Ino,

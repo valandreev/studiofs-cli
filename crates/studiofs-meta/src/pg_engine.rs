@@ -2465,7 +2465,7 @@ impl PgMetaEngine {
         let conflict = match event {
             MetaEvent::RemoveAttr { ino } => {
                 if removed_inodes.contains(ino) {
-                    return Ok(false);
+                    return Ok(overlay.block_inodes.contains(ino));
                 }
                 overlay.block_inodes.contains(ino)
                     || overlay.attr_inodes.contains(ino)
@@ -2569,6 +2569,27 @@ impl PgMetaEngine {
         removed
     }
 
+    fn preserved_dentry_keys_for_batch(
+        &self,
+        batch_events: &[MetaEvent],
+        overlay: &OverlayConflictSets,
+    ) -> MetaResult<HashSet<Vec<u8>>> {
+        let mut preserved = HashSet::new();
+        for event in batch_events {
+            if let MetaEvent::RemoveEntry { parent, name } = event
+                && let Ok(Some(entry)) = self
+                    .local
+                    .lookup(*parent, name)
+                    .map(Some)
+                    .or_else(|_| self.local.lookup_base_dentry(*parent, name))
+                && overlay.block_inodes.contains(&entry.ino)
+            {
+                preserved.insert(Self::dentry_key(*parent, name));
+            }
+        }
+        Ok(preserved)
+    }
+
     fn overlay_conflicts_for_events(events: &[MetaEvent]) -> OverlayConflictSets {
         let mut overlay = OverlayConflictSets::default();
         for event in events {
@@ -2668,20 +2689,32 @@ impl PgMetaEngine {
     }
 
     fn local_overlay_conflicts(&self) -> MetaResult<OverlayConflictSets> {
+        let mut overlay = OverlayConflictSets {
+            block_inodes: self.local.local_overlay_inodes()?,
+            attr_inodes: self.local.local_overlay_attr_inodes()?,
+            dentry_keys: self.local.local_overlay_dentries()?,
+            symlink_inodes: self.local.local_overlay_symlink_inodes()?,
+            xattr_inodes: self.local.local_overlay_xattr_inodes()?,
+            xattr_keys: self.local.local_overlay_xattr_keys()?,
+            acl_keys: self.local.local_overlay_acl_keys()?,
+        };
         let start = self.flushed_event_seq.load(Ordering::SeqCst);
         let end = self.local.get_counter("nextEventSeq")?;
         if end <= start {
-            return Ok(OverlayConflictSets::default());
+            return Ok(overlay);
         }
 
         let events = self.local.read_events_range(start, end)?;
-        Ok(Self::overlay_conflicts_for_events(&events))
+        overlay =
+            Self::merge_overlay_conflicts(&overlay, &Self::overlay_conflicts_for_events(&events));
+        Ok(overlay)
     }
 
     fn serving_event_conflicts_with_overlay(
         event: &MetaEvent,
         overlay: &OverlayConflictSets,
         removed_inodes: &HashSet<Ino>,
+        preserved_dentry_keys: &HashSet<Vec<u8>>,
     ) -> bool {
         match event {
             MetaEvent::SetAttr { attr } => {
@@ -2689,7 +2722,7 @@ impl PgMetaEngine {
             }
             MetaEvent::RemoveAttr { ino } => {
                 if removed_inodes.contains(ino) {
-                    return false;
+                    return overlay.block_inodes.contains(ino);
                 }
                 overlay.block_inodes.contains(ino)
                     || overlay.attr_inodes.contains(ino)
@@ -2697,6 +2730,9 @@ impl PgMetaEngine {
                     || overlay.xattr_inodes.contains(ino)
             }
             MetaEvent::AddEntry { parent, name, .. } | MetaEvent::RemoveEntry { parent, name } => {
+                if preserved_dentry_keys.contains(&Self::dentry_key(*parent, name)) {
+                    return true;
+                }
                 overlay
                     .dentry_keys
                     .contains(&Self::dentry_key(*parent, name))
@@ -2803,11 +2839,28 @@ impl PgMetaEngine {
         overlay: &OverlayConflictSets,
     ) -> MetaResult<bool> {
         let removed_inodes = self.removed_inodes_for_batch(batch_events);
+        let preserved_dentry_keys = self.preserved_dentry_keys_for_batch(batch_events, overlay)?;
+        let preserve_local_payload_inodes = batch_events
+            .iter()
+            .filter_map(|event| match event {
+                MetaEvent::RemoveAttr { ino }
+                    if removed_inodes.contains(ino) && overlay.block_inodes.contains(ino) =>
+                {
+                    Some(*ino)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         self.local.apply_replica_events_to_base(batch_events)?;
         let serving_events: Vec<MetaEvent> = batch_events
             .iter()
             .filter(|event| {
-                !Self::serving_event_conflicts_with_overlay(event, overlay, &removed_inodes)
+                !Self::serving_event_conflicts_with_overlay(
+                    event,
+                    overlay,
+                    &removed_inodes,
+                    &preserved_dentry_keys,
+                )
             })
             .cloned()
             .collect();
@@ -2823,10 +2876,18 @@ impl PgMetaEngine {
         }
 
         if aux_events.is_empty() {
+            for ino in preserve_local_payload_inodes {
+                self.local
+                    .mark_local_regular_file_ready_preserving_overlay(ino)?;
+            }
             return Ok(false);
         }
 
         self.local.apply_replica_aux_state(&aux_events)?;
+        for ino in preserve_local_payload_inodes {
+            self.local
+                .mark_local_regular_file_ready_preserving_overlay(ino)?;
+        }
         Ok(true)
     }
 
