@@ -258,8 +258,11 @@ fn run_with_executor_and_mount_lock_dir(
     write_log_files(&sandbox)?;
 
     let mut default_mount_lock = None;
-    let mount_lock_failure = if requires_default_windows_mount_lock(infra_mode, &selected_platform)
-    {
+    let mount_lock_failure = if requires_default_windows_mount_lock(
+        infra_mode,
+        &selected_platform,
+        scenarios.iter().map(|scenario| scenario.definition),
+    ) {
         match acquire_default_mount_lock(mount_lock_dir, &run_id) {
             Ok(lock) => {
                 default_mount_lock = Some(lock);
@@ -668,11 +671,24 @@ impl Drop for DefaultMountLock {
     }
 }
 
-fn requires_default_windows_mount_lock(infra: InfraMode, selected_platform: &str) -> bool {
-    infra == InfraMode::Compose && selected_platform == "windows-winfsp"
+fn requires_default_windows_mount_lock(
+    infra: InfraMode,
+    selected_platform: &str,
+    scenarios: impl IntoIterator<Item = scenario::ScenarioDefinition>,
+) -> bool {
+    infra == InfraMode::Compose
+        && selected_platform == "windows-winfsp"
+        && scenarios
+            .into_iter()
+            .any(|scenario| scenario.requires_mount)
 }
 
 fn default_mount_lock_dir() -> PathBuf {
+    #[cfg(windows)]
+    if let Some(program_data) = std::env::var_os("ProgramData") {
+        return PathBuf::from(program_data).join("StudioFS").join("e2e");
+    }
+
     std::env::temp_dir().join("studiofs-e2e")
 }
 
@@ -690,14 +706,27 @@ fn acquire_default_mount_lock(
         "created_at": timestamp(),
     });
     let payload = serde_json::to_vec_pretty(&holder).map_err(std::io::Error::other)?;
-    match OpenOptions::new().write(true).create_new(true).open(&path) {
-        Ok(mut file) => {
-            file.write_all(&payload)?;
-            file.sync_all()?;
-            Ok(DefaultMountLock { path })
+    acquire_default_mount_lock_with_writer(&path, run_id, &payload, write_lock_payload)
+}
+
+fn acquire_default_mount_lock_with_writer(
+    path: &Path,
+    run_id: &str,
+    payload: &[u8],
+    write_payload: impl FnOnce(fs::File, &[u8]) -> std::io::Result<()>,
+) -> Result<DefaultMountLock, std::io::Error> {
+    match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(file) => {
+            if let Err(err) = write_payload(file, payload) {
+                let _ = fs::remove_file(path);
+                return Err(err);
+            }
+            Ok(DefaultMountLock {
+                path: path.to_path_buf(),
+            })
         }
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-            let holder = fs::read_to_string(&path).unwrap_or_else(|read_err| {
+            let holder = fs::read_to_string(path).unwrap_or_else(|read_err| {
                 format!("<failed to read existing lock holder: {read_err}>")
             });
             Err(std::io::Error::new(
@@ -710,6 +739,11 @@ fn acquire_default_mount_lock(
         }
         Err(err) => Err(err),
     }
+}
+
+fn write_lock_payload(mut file: fs::File, payload: &[u8]) -> std::io::Result<()> {
+    file.write_all(payload)?;
+    file.sync_all()
 }
 
 pub fn clean(request: CleanRequest) -> Result<CleanOutcome, RunnerError> {
@@ -1361,6 +1395,7 @@ mod tests {
                 name: "failing-validate",
                 description: "test scenario",
                 requires_studiofs_bin: false,
+                requires_mount: false,
             }
         }
 
@@ -1759,6 +1794,32 @@ mod tests {
     }
 
     #[test]
+    fn default_mount_lock_removes_file_after_payload_write_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let lock_path = temp
+            .path()
+            .join("locks")
+            .join("default-windows-mount-points.lock");
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+
+        let err = acquire_default_mount_lock_with_writer(
+            &lock_path,
+            "failed-run",
+            b"holder",
+            |file, _payload| {
+                drop(file);
+                Err(std::io::Error::other("injected write failure"))
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("injected write failure"));
+        assert!(!lock_path.exists());
+        let lock = acquire_default_mount_lock(lock_path.parent().unwrap(), "next-run").unwrap();
+        drop(lock);
+    }
+
+    #[test]
     fn windows_compose_run_fails_preflight_when_default_mount_lock_is_held() {
         let temp = tempfile::tempdir().unwrap();
         let lock_dir = temp.path().join("locks");
@@ -1769,9 +1830,9 @@ mod tests {
             RunRequest {
                 root: temp.path().join("e2e-runs"),
                 run_id: Some("second-run".to_string()),
-                scenarios: vec![scenario::TEST_PASSING.to_string()],
+                scenarios: vec![scenario::BASIC_MULTI_CLIENT_SMOKE.to_string()],
                 seed: 364,
-                studiofs_bin: None,
+                studiofs_bin: Some(temp.path().join("studiofs.exe")),
                 platform: PlatformSelection::WindowsWinfsp,
                 retention: RetentionPolicy::Always,
                 report: None,
@@ -1796,6 +1857,42 @@ mod tests {
         assert_eq!(check["status"], "preflight_failed");
         assert!(check["detail"].as_str().unwrap().contains("first-run"));
         assert!(check["detail"].as_str().unwrap().contains("second-run"));
+    }
+
+    #[test]
+    fn windows_compose_run_without_mounted_scenarios_does_not_take_default_mount_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let lock_dir = temp.path().join("locks");
+        let _held = acquire_default_mount_lock(&lock_dir, "mounted-run").unwrap();
+        let executor = RecordingExecutor::default();
+
+        let outcome = run_with_executor_and_mount_lock_dir(
+            RunRequest {
+                root: temp.path().join("e2e-runs"),
+                run_id: Some("non-mounted-run".to_string()),
+                scenarios: vec![scenario::TEST_PASSING.to_string()],
+                seed: 364,
+                studiofs_bin: None,
+                platform: PlatformSelection::WindowsWinfsp,
+                retention: RetentionPolicy::Always,
+                report: None,
+                port_range: Some("33320-33330".to_string()),
+                timeout: None,
+                infra: InfraMode::Compose,
+            },
+            &executor,
+            &lock_dir,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.status, RunStatus::Passed);
+        assert!(
+            executor
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call.args.contains(&"up".to_string()))
+        );
     }
 
     #[derive(Default)]

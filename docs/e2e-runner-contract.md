@@ -548,10 +548,12 @@ Required checks:
   match a prior runner manifest that explicitly authorizes cleanup. Unknown
   mounted paths are a `preflight_failed` result, not an implicit force-unmount.
 - default Windows mounted-run lock: until per-run drive-letter allocation is
-  implemented, Windows WinFSP runs using compose infrastructure acquire a
-  machine-level lock before Docker or clients start. A second default mounted
-  run fails preflight with the lock path, current run ID, and recorded holder
-  diagnostics instead of reusing `Z:\`, `Y:\`, or other default drive letters.
+  implemented, Windows WinFSP runs using compose infrastructure and at least one
+  mounted scenario acquire a machine-level lock before Docker or clients start.
+  The lock is stored under the machine-wide StudioFS E2E state directory on
+  Windows. A second default mounted run fails preflight with the lock path,
+  current run ID, and recorded holder diagnostics instead of reusing `Z:\`,
+  `Y:\`, or other default drive letters.
 - Filesystem safety: sandbox and explicit client roots canonicalize
   successfully, are not drive roots, home roots, repository roots, or temp roots,
   and do not cross symlinks or junctions in a way that would make cleanup

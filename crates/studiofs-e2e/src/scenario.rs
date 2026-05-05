@@ -94,6 +94,7 @@ pub struct ScenarioDefinition {
     pub name: &'static str,
     pub description: &'static str,
     pub requires_studiofs_bin: bool,
+    pub requires_mount: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -259,6 +260,7 @@ impl Scenario for BasicMultiClientSmoke {
             name: BASIC_MULTI_CLIENT_SMOKE,
             description: "mounted multi-client smoke scenario",
             requires_studiofs_bin: true,
+            requires_mount: true,
         }
     }
 
@@ -366,6 +368,7 @@ impl Scenario for PostgresOutageMultiClientRecovery {
             name: POSTGRES_OUTAGE_MULTI_CLIENT_RECOVERY,
             description: "mounted multi-client PostgreSQL outage recovery scenario",
             requires_studiofs_bin: true,
+            requires_mount: true,
         }
     }
 
@@ -444,6 +447,7 @@ impl Scenario for RustfsOutageMultiClientRecovery {
             name: RUSTFS_OUTAGE_MULTI_CLIENT_RECOVERY,
             description: "mounted multi-client RustFS/S3 outage recovery scenario",
             requires_studiofs_bin: true,
+            requires_mount: true,
         }
     }
 
@@ -525,6 +529,7 @@ impl Scenario for MountedClientCrashRestartRecovery {
             name: MOUNTED_CLIENT_CRASH_RESTART_RECOVERY,
             description: "mounted multi-client crash/restart recovery scenario",
             requires_studiofs_bin: true,
+            requires_mount: true,
         }
     }
 
@@ -1614,6 +1619,7 @@ impl Scenario for MountedChaosConvergence {
             name: MOUNTED_CHAOS_CONVERGENCE,
             description: "seeded mounted multi-client chaos convergence scenario",
             requires_studiofs_bin: true,
+            requires_mount: true,
         }
     }
 
@@ -2696,6 +2702,7 @@ impl Scenario for MountedFaultChaosConvergence {
             name: MOUNTED_FAULT_CHAOS_CONVERGENCE,
             description: "seeded mounted fault chaos convergence scenario",
             requires_studiofs_bin: true,
+            requires_mount: true,
         }
     }
 
@@ -3764,6 +3771,7 @@ impl Scenario for NamespaceCollisionScenario {
             name: self.kind.name(),
             description: self.kind.description(),
             requires_studiofs_bin: true,
+            requires_mount: true,
         }
     }
 
@@ -4703,6 +4711,7 @@ impl Scenario for TestFailingScenario {
             },
             description: "test-only failing scenario",
             requires_studiofs_bin: false,
+            requires_mount: false,
         }
     }
 
@@ -4741,6 +4750,7 @@ impl Scenario for TestPassingScenario {
             name: TEST_PASSING,
             description: "test-only passing scenario",
             requires_studiofs_bin: false,
+            requires_mount: false,
         }
     }
 
