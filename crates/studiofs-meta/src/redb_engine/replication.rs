@@ -8,6 +8,33 @@ struct RenameDentryContext<'a> {
 }
 
 impl RedbMetaEngine {
+    pub(crate) fn lookup_base_dentry(
+        &self,
+        parent: Ino,
+        name: &[u8],
+    ) -> MetaResult<Option<DirEntryValue>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let table = txn
+            .open_table(BASE_DENTRIES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Self::lookup_in_opened_dentry_table(&table, parent, name)
+    }
+
+    pub(crate) fn remove_dentry_mirrors_for_inode_in_txn(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+    ) -> MetaResult<()> {
+        let keys = Self::dentry_keys_for_inode_in_write_index(txn, DENTRY_BY_INODE_TABLE, ino)?;
+        for key in keys {
+            let (parent, name) = decode_dentry_key(&key)?;
+            Self::remove_dentry_mirror_in_txn(txn, parent, name)?;
+        }
+        Ok(())
+    }
+
     fn unique_dentry_key_for_entry_in_write_table(
         txn: &redb::WriteTransaction,
         table_def: redb::TableDefinition<&'static [u8], &'static [u8]>,
@@ -811,6 +838,7 @@ impl RedbMetaEngine {
                     Self::set_inode_mirror_in_txn(&txn, attr)?;
                 }
                 crate::events::MetaEvent::RemoveAttr { ino } => {
+                    Self::remove_dentry_mirrors_for_inode_in_txn(&txn, *ino)?;
                     Self::remove_inode_mirror_in_txn(&txn, *ino)?;
                     Self::remove_symlink_mirror_in_txn(&txn, *ino)?;
 
@@ -896,13 +924,17 @@ impl RedbMetaEngine {
                             },
                         )?
                     };
-                    let Some(current_key) = current_key else {
-                        continue;
-                    };
-                    let (current_parent, current_name) = decode_dentry_key(&current_key)?;
-
-                    Self::remove_dentry_mirror_in_txn(&txn, current_parent, current_name)?;
+                    if let Some(current_key) = current_key {
+                        let (current_parent, current_name) = decode_dentry_key(&current_key)?;
+                        Self::remove_dentry_mirror_in_txn(&txn, current_parent, current_name)?;
+                    }
                     Self::remove_dentry_mirror_in_txn(&txn, *new_parent, new_name)?;
+                    if Self::get_attr_from_write_table(&txn, INODES_TABLE, entry.ino)?.is_none()
+                        && let Some(attr) =
+                            Self::get_attr_from_write_table(&txn, BASE_INODES_TABLE, entry.ino)?
+                    {
+                        Self::set_inode_mirror_in_txn(&txn, &attr)?;
+                    }
                     Self::set_dentry_mirror_in_txn(&txn, *new_parent, new_name, entry)?;
 
                     if let Some(attr) = displaced_set_attr.as_ref() {

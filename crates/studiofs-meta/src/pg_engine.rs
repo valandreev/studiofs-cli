@@ -2557,7 +2557,11 @@ impl PgMetaEngine {
         let mut removed = HashSet::new();
         for event in batch_events {
             if let MetaEvent::RemoveEntry { parent, name } = event
-                && let Ok(entry) = self.local.lookup(*parent, name)
+                && let Ok(Some(entry)) = self
+                    .local
+                    .lookup(*parent, name)
+                    .map(Some)
+                    .or_else(|_| self.local.lookup_base_dentry(*parent, name))
             {
                 removed.insert(entry.ino);
             }
@@ -5202,6 +5206,80 @@ mod tests {
         );
     }
 
+    #[test]
+    fn foreign_unlink_after_local_rename_removes_destination_alias() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+        let file = create_published_small_file(&pg, ROOT_INO, b"race.txt", 77_101);
+        publish_local_events_to_base(&pg);
+
+        pg.rename(ROOT_INO, b"race.txt", ROOT_INO, b"race-renamed.txt")
+            .expect("local rename");
+        let overlay = pg.local_overlay_conflicts().expect("overlay conflicts");
+
+        let foreign_unlink = vec![
+            MetaEvent::RemoveEntry {
+                parent: ROOT_INO,
+                name: b"race.txt".to_vec(),
+            },
+            MetaEvent::RemoveAttr { ino: file.ino },
+        ];
+        pg.apply_foreign_batch(&foreign_unlink, &overlay)
+            .expect("apply foreign unlink");
+
+        assert!(
+            pg.lookup(ROOT_INO, b"race.txt").is_err(),
+            "source path must stay absent"
+        );
+        assert!(
+            pg.lookup(ROOT_INO, b"race-renamed.txt").is_err(),
+            "later authoritative unlink must remove the losing local rename destination"
+        );
+        assert!(
+            pg.get_attr(file.ino).is_err(),
+            "later authoritative unlink must remove the inode mirror"
+        );
+    }
+
+    #[test]
+    fn foreign_rename_after_local_unlink_restores_destination_alias() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+        let file = create_published_small_file(&pg, ROOT_INO, b"race.txt", 77_102);
+        publish_local_events_to_base(&pg);
+
+        pg.unlink(ROOT_INO, b"race.txt").expect("local unlink");
+        let overlay = pg.local_overlay_conflicts().expect("overlay conflicts");
+
+        let foreign_rename = vec![MetaEvent::RenameEntry {
+            parent: ROOT_INO,
+            name: b"race.txt".to_vec(),
+            new_parent: ROOT_INO,
+            new_name: b"race-renamed.txt".to_vec(),
+            entry: DirEntryValue {
+                ino: file.ino,
+                kind: FileType::RegularFile,
+            },
+            displaced_set_attr: Box::new(None),
+            displaced_remove_attr_ino: None,
+            moved_dir_attr: Box::new(None),
+            old_parent_attr: Box::new(None),
+            new_parent_attr: Box::new(None),
+        }];
+        pg.apply_foreign_batch(&foreign_rename, &overlay)
+            .expect("apply foreign rename");
+
+        assert!(
+            pg.lookup(ROOT_INO, b"race.txt").is_err(),
+            "source path must stay absent"
+        );
+        assert_eq!(
+            pg.lookup(ROOT_INO, b"race-renamed.txt")
+                .expect("renamed destination")
+                .ino,
+            file.ino,
+            "later authoritative rename must win over the local unlink overlay"
+        );
+    }
+
     fn set_file_state(engine: &PgMetaEngine, ino: Ino, size: u64, content_epoch: u64) {
         let mut attr = engine.get_attr(ino).expect("get file attr");
         attr.size = size;
@@ -5232,6 +5310,22 @@ mod tests {
             "small file publish must succeed"
         );
         file
+    }
+
+    fn publish_local_events_to_base(engine: &PgMetaEngine) {
+        let start = engine.flushed_event_seq.load(Ordering::SeqCst);
+        let end = engine.local.get_counter("nextEventSeq").expect("event end");
+        let events = engine
+            .local
+            .read_events_range(start, end)
+            .expect("read local events");
+        let remote_events = PgMetaEngine::project_remote_events(&events);
+        engine
+            .apply_visible_self_batch(&remote_events)
+            .expect("apply visible self batch");
+        engine
+            .persist_flushed_event_seq(end)
+            .expect("persist flushed event seq");
     }
 
     fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
