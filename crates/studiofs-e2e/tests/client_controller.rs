@@ -248,6 +248,28 @@ fn init_does_not_retry_non_transient_bucket_failures() {
 }
 
 #[test]
+fn init_does_not_retry_connection_refused_endpoint_failures() {
+    let temp = tempdir().unwrap();
+    let executor = RecordingExecutor {
+        permanent_init_failure: Some(
+            "bucket 'studiofs-e2e' not accessible and could not be created: connection refused"
+                .to_string(),
+        ),
+        ..RecordingExecutor::new()
+    };
+    let calls = Rc::clone(&executor.calls);
+    let mut controller = MultiClientController::new(test_config(temp.path()), executor);
+
+    controller.create_clients(["client-a"]).unwrap();
+    let err = controller.init_first_client().unwrap_err();
+
+    assert!(err.to_string().contains("connection refused"));
+    let calls = calls.borrow();
+    let init_calls = calls.iter().filter(|call| call.action == "init").count();
+    assert_eq!(init_calls, 1);
+}
+
+#[test]
 fn compose_service_config_derives_unique_volume_and_docker_endpoints() {
     let temp = tempdir().unwrap();
     let config = ClientControllerConfig::from_compose_services(

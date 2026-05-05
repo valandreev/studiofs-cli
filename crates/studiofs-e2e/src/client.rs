@@ -763,7 +763,6 @@ fn is_transient_object_store_init_failure(output: &ClientCommandOutput) -> bool 
             &[
                 "http request failed",
                 "error sending request",
-                "connection refused",
                 "connection reset",
                 "connection closed",
                 "timed out",
