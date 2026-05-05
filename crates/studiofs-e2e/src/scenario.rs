@@ -4041,6 +4041,15 @@ fn run_mounted_lww_reconnect_body(
         std::slice::from_ref(&write_a),
     )?;
     operations.push(write_a);
+    driver.after_phase(MountedLwwReconnectPhase::OnlineWriters, &online_clients)?;
+    wait_for_convergence(
+        &client_mounts(&online_clients),
+        context
+            .scenario_dir
+            .join("online-writers-order-1-validation"),
+        convergence_timeout,
+        poll_interval,
+    )?;
     let write_b = lww_reconnect_write(context.seed, started, 2, online_writer_b)?;
     write_mounted_lww_reconnect_operations(
         context,
@@ -7163,6 +7172,194 @@ mod tests {
         assert!(!report.matched);
         assert_eq!(report.clients.len(), 3);
         assert!(report.clients.iter().all(|client| !client.matched));
+    }
+
+    #[test]
+    fn mounted_lww_reconnect_waits_for_online_order_one_before_order_two() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(MOUNTED_LWW_RECONNECT_CHAOS_CONVERGENCE);
+        let clients = LWW_RECONNECT_CLIENT_NAMES
+            .iter()
+            .copied()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(&mount).unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let mut driver = RecordingLwwReconnectDriver::new(clients);
+        let context = ScenarioContext {
+            run_id: "run-1".to_string(),
+            seed: 360,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+
+        let summary = run_mounted_lww_reconnect_with_driver(
+            &context,
+            &mut driver,
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+
+        assert_eq!(summary.expected_winner.client, "client-c");
+        assert_eq!(
+            driver.online_writer_barriers.into_inner(),
+            vec![
+                Some(bytes_sha256(&lww_reconnect_payload(360, "client-a", 1))),
+                Some(bytes_sha256(&lww_reconnect_payload(360, "client-b", 2))),
+            ],
+            "the online-writer phase must wait for order 1 to become visible before order 2 is issued"
+        );
+    }
+
+    struct RecordingLwwReconnectDriver {
+        clients: Vec<ClientSpec>,
+        mounted_clients: RefCell<Vec<String>>,
+        online_writer_barriers: RefCell<Vec<Option<String>>>,
+    }
+
+    impl RecordingLwwReconnectDriver {
+        fn new(clients: Vec<ClientSpec>) -> Self {
+            Self {
+                clients,
+                mounted_clients: RefCell::new(Vec::new()),
+                online_writer_barriers: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn sync_lww_payload_from_latest_writer(&self, clients: &[ClientSpec]) {
+            let source = clients
+                .iter()
+                .filter_map(|client| {
+                    let path = client.mount_point.join(LWW_RECONNECT_ORACLE_PATH);
+                    let payload = std::fs::read(&path).ok()?;
+                    Some((test_lww_oracle_order(&payload), path))
+                })
+                .max_by_key(|(oracle_order, _)| *oracle_order);
+            let Some((_, source_path)) = source else {
+                return;
+            };
+            let payload = std::fs::read(source_path).unwrap();
+            for client in clients {
+                let target = client.mount_point.join(LWW_RECONNECT_ORACLE_PATH);
+                std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+                std::fs::write(target, &payload).unwrap();
+            }
+        }
+
+        fn sync_tree_from_first_client(&self, clients: &[ClientSpec]) {
+            let Some(source) = clients.first() else {
+                return;
+            };
+            for replica in clients.iter().skip(1) {
+                copy_test_tree(&source.mount_point, &replica.mount_point);
+            }
+        }
+    }
+
+    impl MountedLwwReconnectDriver for RecordingLwwReconnectDriver {
+        fn bootstrap_volume(
+            &mut self,
+            options: VolumeBootstrapOptions,
+        ) -> Result<VolumeBootstrapSummary, ScenarioError> {
+            Ok(VolumeBootstrapSummary {
+                volume_name: "projectfs".to_string(),
+                init_client: options.client_names[0].clone(),
+                discovered_clients: options.client_names[1..].to_vec(),
+                clients: self
+                    .clients
+                    .iter()
+                    .map(|client| crate::client::ClientBootstrapRecord {
+                        name: client.name.clone(),
+                        local_metadata_db: client.local_metadata_db.clone(),
+                        state: ClientLifecycleState::Discovered,
+                    })
+                    .collect(),
+            })
+        }
+
+        fn mount_client(&mut self, client: &str) -> Result<(), ScenarioError> {
+            let mut mounted = self.mounted_clients.borrow_mut();
+            if !mounted.iter().any(|name| name == client) {
+                mounted.push(client.to_string());
+            }
+            Ok(())
+        }
+
+        fn clients(&self) -> Vec<ClientSpec> {
+            self.clients.clone()
+        }
+
+        fn force_kill(&mut self, client: &str) -> Result<(), ScenarioError> {
+            self.mounted_clients
+                .borrow_mut()
+                .retain(|name| name != client);
+            Ok(())
+        }
+
+        fn remount(&mut self, client: &str) -> Result<(), ScenarioError> {
+            self.mount_client(client)
+        }
+
+        fn after_phase(
+            &mut self,
+            phase: MountedLwwReconnectPhase,
+            clients: &[ClientSpec],
+        ) -> Result<(), ScenarioError> {
+            if matches!(
+                phase,
+                MountedLwwReconnectPhase::HealthyWarmup
+                    | MountedLwwReconnectPhase::ColdObserverBootstrap
+            ) {
+                self.sync_tree_from_first_client(clients);
+            } else {
+                self.sync_lww_payload_from_latest_writer(clients);
+            }
+            if phase == MountedLwwReconnectPhase::OnlineWriters {
+                let checksum = clients.first().and_then(|client| {
+                    std::fs::read(client.mount_point.join(LWW_RECONNECT_ORACLE_PATH))
+                        .ok()
+                        .map(|payload| bytes_sha256(&payload))
+                });
+                self.online_writer_barriers.borrow_mut().push(checksum);
+            }
+            Ok(())
+        }
+
+        fn unmount_all(&mut self) -> Result<(), ScenarioError> {
+            self.mounted_clients.borrow_mut().clear();
+            Ok(())
+        }
+    }
+
+    fn copy_test_tree(source: &Path, target: &Path) {
+        std::fs::create_dir_all(target).unwrap();
+        for entry in std::fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let source_path = entry.path();
+            let target_path = target.join(entry.file_name());
+            if source_path.is_dir() {
+                copy_test_tree(&source_path, &target_path);
+            } else {
+                std::fs::create_dir_all(target_path.parent().unwrap()).unwrap();
+                std::fs::copy(source_path, target_path).unwrap();
+            }
+        }
+    }
+
+    fn test_lww_oracle_order(payload: &[u8]) -> u32 {
+        std::str::from_utf8(payload)
+            .ok()
+            .and_then(|text| text.split("oracle_order=").nth(1))
+            .and_then(|suffix| suffix.trim().parse().ok())
+            .unwrap_or(0)
     }
 
     #[test]
