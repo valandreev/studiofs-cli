@@ -143,6 +143,7 @@ cargo run -p studiofs-e2e -- run mounted-client-crash-restart-recovery --studiof
 cargo run -p studiofs-e2e -- run collision-rename-vs-unlink --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run mounted-chaos-convergence --seed 360 --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run mounted-fault-chaos-convergence --seed 360 --studiofs-bin target\debug\studiofs.exe
+cargo run -p studiofs-e2e -- run mounted-lww-reconnect-chaos-convergence --seed 360 --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- clean
 ```
 
@@ -163,7 +164,17 @@ convergence for both `after_local_durability_boundary` and
 `before_remote_publication_completes` modes. On Linux, crash-style remount
 attempts lazy stale FUSE mount cleanup before starting the replacement process;
 publication readiness is validated through mounted-tree convergence rather than
-private backend inspection. The mounted namespace collision scenarios use three
+private backend inspection.
+
+Use `--infra external-env` for production-like runs against already-running
+PostgreSQL and RustFS/S3. The runner reads `STUDIOFS_TEST_PG_DSN`,
+`STUDIOFS_S3_ENDPOINT`, `STUDIOFS_S3_BUCKET`, `STUDIOFS_S3_ACCESS_KEY`, and
+`STUDIOFS_S3_SECRET_KEY` from the process environment or workspace `.env`, then
+uses a unique StudioFS volume name per run. This mode does not start, stop, or
+clean external services, so scenarios whose purpose is to stop infrastructure
+services still require `--infra compose`.
+
+The mounted namespace collision scenarios use three
 isolated clients and barrier-start conflicting operations covering
 rename/rename, rename/unlink, unlink/append, overwrite/read, mkdir/rmdir/create,
 and readdir/stat while mutations are in flight. The overwrite/read scenario
@@ -179,7 +190,12 @@ scenario is the next product fault-chaos layer: it mixes a mounted conflict
 burst with PostgreSQL outage, client force-kill/remount, RustFS/S3 outage, and a
 late cold observer client with a fresh local root/cache. It validates final
 mounted tree convergence across warm clients, the restarted client, and the cold
-observer.
+observer. The `mounted-lww-reconnect-chaos-convergence` scenario adds an
+oracle-backed LWW layer: it forces a stale writer offline, lets online peers
+publish ordered writes, remounts the stale writer so it writes last, crash/restarts
+that writer before final convergence, then mounts a cold observer. It fails when
+clients converge to the same tree but `lww-chaos/winner.txt` does not match the
+expected last-writer checksum.
 
 Hosted Linux real mounted E2E is available as a manual RWX workflow:
 
@@ -202,6 +218,8 @@ cargo test -p studiofs-e2e --test compose_infra
 cargo test -p studiofs-e2e --test mounted_tree_validator
 cargo test -p studiofs-e2e scenario::tests::mounted_chaos_records_seeded_operations_and_validates_convergence -- --exact --nocapture
 cargo test -p studiofs-e2e --test runner_contract mounted_fault_chaos_disabled_run_writes_reproducible_artifacts -- --exact --nocapture
+cargo test -p studiofs-e2e --test runner_contract mounted_lww_reconnect_chaos_disabled_run_writes_reproducible_artifacts -- --exact --nocapture
+cargo test -p studiofs-e2e scenario::tests::lww_reconnect_oracle_detects_converged_wrong_winner -- --exact --nocapture
 cargo test -p studiofs-e2e namespace_collision_records_operations_and_validates_three_client_convergence -- --exact --nocapture
 cargo test -p studiofs-e2e scenario::tests::crash_restart_recovery_runs_both_modes_reuses_client_root_and_converges -- --exact --nocapture
 cargo test -p studiofs-e2e --test client_controller force_kill_then_remount_reuses_same_client_root_without_graceful_umount -- --exact --nocapture

@@ -135,7 +135,9 @@ pub struct RunOutcome {
 pub enum RunnerError {
     #[error("unknown E2E scenario: {0}")]
     UnknownScenario(String),
-    #[error("E2E scenario {scenario} requires --studiofs-bin when --infra compose is used")]
+    #[error(
+        "E2E scenario {scenario} requires --studiofs-bin when real mounted infrastructure is used"
+    )]
     MissingStudiofsBin { scenario: String },
     #[error("run ID must not be empty")]
     EmptyRunId,
@@ -207,7 +209,9 @@ fn run_with_executor_and_mount_lock_dir(
         request.scenarios
     };
     let scenarios = resolve_scenarios(&scenario_names)?;
-    if request.infra == InfraMode::Compose && request.studiofs_bin.is_none() {
+    if matches!(request.infra, InfraMode::Compose | InfraMode::ExternalEnv)
+        && request.studiofs_bin.is_none()
+    {
         if let Some(definition) = scenarios
             .iter()
             .map(|resolved| resolved.definition)
@@ -228,6 +232,19 @@ fn run_with_executor_and_mount_lock_dir(
             &sandbox,
             request.port_range.clone(),
         ))?),
+        InfraMode::ExternalEnv => None,
+    };
+    let external_client_config = if let (InfraMode::ExternalEnv, Some(studiofs_bin)) =
+        (infra_mode, request.studiofs_bin.as_ref())
+    {
+        Some(ClientControllerConfig::from_external_env(
+            studiofs_bin.clone(),
+            sandbox.clone(),
+            &run_id,
+            request.seed,
+        )?)
+    } else {
+        None
     };
     let compose_project = compose_stack
         .as_ref()
@@ -278,6 +295,7 @@ fn run_with_executor_and_mount_lock_dir(
     } else {
         prepare_preflight(
             &sandbox,
+            infra_mode,
             compose_stack.as_ref(),
             executor,
             default_mount_lock.as_ref(),
@@ -352,6 +370,7 @@ fn run_with_executor_and_mount_lock_dir(
                         &allocated_ports,
                     )?)
                 }
+                (InfraMode::ExternalEnv, _) => external_client_config.clone(),
                 _ => None,
             },
         };
@@ -522,6 +541,7 @@ struct PreparedPreflight {
 
 fn prepare_preflight(
     sandbox: &Path,
+    infra: InfraMode,
     compose_stack: Option<&DockerComposeStack>,
     executor: &dyn CommandExecutor,
     default_mount_lock: Option<&DefaultMountLock>,
@@ -537,7 +557,14 @@ fn prepare_preflight(
                 checks: vec![PreflightCheckReport {
                     name: "runner-skeleton".to_string(),
                     status: RunStatus::Passed,
-                    detail: "external infrastructure disabled for this run".to_string(),
+                    detail: match infra {
+                        InfraMode::Disabled => "external infrastructure disabled for this run",
+                        InfraMode::ExternalEnv => {
+                            "using caller-provided PostgreSQL and S3/RustFS settings from environment or .env"
+                        }
+                        InfraMode::Compose => "compose infrastructure was not started",
+                    }
+                    .to_string(),
                 }],
             },
             compose_start_attempted: false,
@@ -690,7 +717,7 @@ fn requires_default_windows_mount_lock(
     selected_platform: &str,
     scenarios: impl IntoIterator<Item = scenario::ScenarioDefinition>,
 ) -> bool {
-    infra == InfraMode::Compose
+    infra != InfraMode::Disabled
         && selected_platform == "windows-winfsp"
         && scenarios
             .into_iter()

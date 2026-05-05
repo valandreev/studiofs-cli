@@ -432,3 +432,71 @@ fn test_replica_aux_block_events_accept_fragmented_base_graph() {
         "empty base replay should leave no object-backed slices"
     );
 }
+
+#[test]
+fn test_replica_publish_updates_serving_overlay_for_lww_overwrite() {
+    let engine = temp_engine();
+    let file = engine
+        .create_file(ROOT_INO, b"replica-lww-overwrite.bin", 1000, 1000, 0o644)
+        .unwrap();
+
+    let old_payload = PayloadRef::new_full(81, DEFAULT_BLOCK_SIZE);
+    let old_slices = RedbMetaEngine::chunk_slices_for_block(
+        0,
+        DEFAULT_BLOCK_SIZE,
+        Some(&old_payload),
+        PayloadRefState::Published,
+    )
+    .unwrap();
+    let mut old_chunk = RegularFileChunkState::default();
+    for slice in old_slices[0].1.clone() {
+        old_chunk.insert_slice(slice);
+    }
+    set_regular_file_chunk_rows(
+        &engine,
+        file.ino,
+        &[(ChunkId(0), old_chunk.clone())],
+        &[(ChunkId(0), old_chunk)],
+    );
+
+    let new_payload = PayloadRef::new_full(82, DEFAULT_BLOCK_SIZE);
+    let new_slices = RedbMetaEngine::chunk_slices_for_block(
+        0,
+        DEFAULT_BLOCK_SIZE,
+        Some(&new_payload),
+        PayloadRefState::Published,
+    )
+    .unwrap();
+    let publish = crate::events::MetaEvent::PublishRegularFileBaseSlices {
+        ino: file.ino,
+        chunk_slices: new_slices,
+    };
+
+    engine
+        .apply_replica_events_to_base(std::slice::from_ref(&publish))
+        .unwrap();
+    engine
+        .apply_replica_serving_state(std::slice::from_ref(&publish))
+        .unwrap();
+    engine
+        .apply_replica_aux_state(std::slice::from_ref(&publish))
+        .unwrap();
+
+    let spans = engine
+        .lookup_regular_file_slices(file.ino, 0, u64::from(DEFAULT_BLOCK_SIZE))
+        .unwrap();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(
+        spans[0]
+            .payload
+            .as_ref()
+            .expect("published replacement payload")
+            .object_id,
+        new_payload.object_id,
+        "foreign publish should replace stale serving overlay bytes"
+    );
+    assert!(
+        engine.local_overlay_inodes().unwrap().is_empty(),
+        "serving overlay should match the imported published base after applying the remote winner"
+    );
+}

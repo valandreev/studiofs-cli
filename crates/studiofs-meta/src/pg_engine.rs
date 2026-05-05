@@ -5411,6 +5411,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn later_foreign_publish_replaces_flushed_local_payload() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+        let file = create_published_small_file(&pg, ROOT_INO, b"lww-payload.txt", 77_201);
+        publish_local_events_to_base(&pg);
+
+        publish_file_payload(&pg, file.ino, 0, 64, 2, 77_202);
+        publish_local_events_to_base(&pg);
+        assert_eq!(
+            visible_object_id(&pg, file.ino),
+            77_202,
+            "test setup should expose the locally flushed payload"
+        );
+        assert!(
+            pg.local_overlay_conflicts()
+                .expect("local overlay after local flush")
+                .block_inodes
+                .is_empty(),
+            "flushed local publish must not continue to block later PG winners"
+        );
+
+        let foreign_publish = published_payload_events(file.ino, 3, 64, 77_203);
+        pg.apply_foreign_batch(&foreign_publish, &OverlayConflictSets::default())
+            .expect("apply later foreign publish");
+
+        assert_eq!(
+            visible_object_id(&pg, file.ino),
+            77_203,
+            "later PG winner must replace a previously flushed local payload"
+        );
+    }
+
     fn set_file_state(engine: &PgMetaEngine, ino: Ino, size: u64, content_epoch: u64) {
         let mut attr = engine.get_attr(ino).expect("get file attr");
         attr.size = size;
@@ -5441,6 +5473,70 @@ mod tests {
             "small file publish must succeed"
         );
         file
+    }
+
+    fn publish_file_payload(
+        engine: &PgMetaEngine,
+        ino: Ino,
+        block_index: u32,
+        size: u64,
+        content_epoch: u64,
+        object_id: u64,
+    ) {
+        set_file_state(engine, ino, size, content_epoch);
+        engine
+            .stage_payload_slice(
+                ino,
+                block_index,
+                &PayloadRef::new_partial(object_id, size as u32),
+            )
+            .expect("stage replacement payload");
+        mark_overlay_objects_uploaded(engine, ino, content_epoch, &[object_id]);
+        assert!(
+            engine
+                .publish_regular_file_overlay_to_base_if_matches(ino, content_epoch)
+                .expect("publish replacement payload"),
+            "replacement payload publish must succeed"
+        );
+    }
+
+    fn published_payload_events(
+        ino: Ino,
+        content_epoch: u64,
+        size: u64,
+        object_id: u64,
+    ) -> Vec<MetaEvent> {
+        let mut attr = InodeAttr::new_file(ino, ROOT_INO, 0, 0, 0o644);
+        attr.size = size;
+        attr.committed_size = size;
+        attr.content_epoch = content_epoch;
+        attr.committed_content_epoch = content_epoch;
+        attr.upload_state = UploadState::Ready;
+        attr.mtime = InodeAttr::now_nanos();
+        attr.ctime = attr.mtime;
+        let chunk_slices = vec![(
+            ChunkId(0),
+            vec![SliceRecord {
+                slice_id: SliceId(0),
+                order: SliceOrder(0),
+                range: SliceRange::new(0, size as u32).expect("valid foreign slice range"),
+                payload: Some(PayloadRef::new_partial(object_id, size as u32)),
+                payload_state: PayloadRefState::Published,
+            }],
+        )];
+        vec![
+            MetaEvent::SetAttr { attr },
+            MetaEvent::PublishRegularFileBaseSlices { ino, chunk_slices },
+        ]
+    }
+
+    fn visible_object_id(engine: &PgMetaEngine, ino: Ino) -> u64 {
+        engine
+            .lookup_regular_file_slices(ino, 0, 64)
+            .expect("lookup visible file slices")
+            .into_iter()
+            .find_map(|span| span.payload.map(|payload| payload.object_id))
+            .expect("visible object id")
     }
 
     fn publish_local_events_to_base(engine: &PgMetaEngine) {

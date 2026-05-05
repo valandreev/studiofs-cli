@@ -18,8 +18,9 @@ use studiofs_scenario::{
 use thiserror::Error;
 
 use crate::client::{
-    ClientControllerConfig, ClientControllerError, ClientSpec, MultiClientController,
-    SystemClientProcessExecutor, VolumeBootstrapOptions, VolumeBootstrapSummary,
+    ClientControllerConfig, ClientControllerError, ClientLifecycleState, ClientSpec,
+    MultiClientController, SystemClientProcessExecutor, VolumeBootstrapOptions,
+    VolumeBootstrapSummary,
 };
 use crate::infra::{
     CommandExecutor, ComposeServiceControl, InfraError, POSTGRES_SERVICE_NAME, RUSTFS_SERVICE_NAME,
@@ -43,11 +44,17 @@ pub const COLLISION_MKDIR_RMDIR_VS_CREATE: &str = "collision-mkdir-rmdir-vs-crea
 pub const COLLISION_READDIR_STAT_DURING_MUTATION: &str = "collision-readdir-stat-during-mutation";
 pub const MOUNTED_CHAOS_CONVERGENCE: &str = "mounted-chaos-convergence";
 pub const MOUNTED_FAULT_CHAOS_CONVERGENCE: &str = "mounted-fault-chaos-convergence";
+pub const MOUNTED_LWW_RECONNECT_CHAOS_CONVERGENCE: &str = "mounted-lww-reconnect-chaos-convergence";
 const SMOKE_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
 const COLLISION_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
 const CHAOS_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
 const FAULT_CHAOS_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c", "client-d"];
 const FAULT_CHAOS_WARM_CLIENTS: usize = 3;
+const LWW_RECONNECT_CLIENT_NAMES: &[&str] =
+    &["client-a", "client-b", "client-c", "client-d", "client-e"];
+const LWW_RECONNECT_WARM_CLIENTS: usize = 4;
+const LWW_RECONNECT_STALE_WRITER_INDEX: usize = 2;
+const LWW_RECONNECT_COLD_OBSERVER_INDEX: usize = 4;
 const POSTGRES_OUTAGE_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
 const RUSTFS_OUTAGE_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c", "client-d"];
 const CRASH_RESTART_CLIENT_NAMES: &[&str] = &["client-a", "client-b"];
@@ -81,6 +88,9 @@ const CHAOS_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const FAULT_CHAOS_CONFLICT_ROUNDS: usize = 6;
 const FAULT_CHAOS_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(120);
 const FAULT_CHAOS_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const LWW_RECONNECT_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(120);
+const LWW_RECONNECT_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const LWW_RECONNECT_ORACLE_PATH: &str = "lww-chaos/winner.txt";
 
 #[cfg(test)]
 pub(crate) const TEST_FAILING_VALIDATE: &str = "__test-failing-validate";
@@ -152,12 +162,20 @@ pub enum ScenarioError {
     InsufficientChaosClients { expected: usize, actual: usize },
     #[error("mounted fault chaos scenario requires at least {expected} clients, got {actual}")]
     InsufficientFaultChaosClients { expected: usize, actual: usize },
+    #[error(
+        "mounted LWW reconnect chaos scenario requires at least {expected} clients, got {actual}"
+    )]
+    InsufficientLwwReconnectClients { expected: usize, actual: usize },
     #[error("namespace collision scenario failed: {primary}; unmount also failed: {cleanup}")]
     NamespaceCollisionUnmountAfterFailure { primary: String, cleanup: String },
     #[error("mounted chaos scenario failed: {primary}; unmount also failed: {cleanup}")]
     MountedChaosUnmountAfterFailure { primary: String, cleanup: String },
     #[error("mounted fault chaos scenario failed: {primary}; unmount also failed: {cleanup}")]
     MountedFaultChaosUnmountAfterFailure { primary: String, cleanup: String },
+    #[error(
+        "mounted LWW reconnect chaos scenario failed: {primary}; unmount also failed: {cleanup}"
+    )]
+    MountedLwwReconnectUnmountAfterFailure { primary: String, cleanup: String },
     #[error("namespace collision validation failed: {violations:?}")]
     NamespaceInvariantViolations {
         violations: Vec<NamespaceInvariantViolation>,
@@ -169,6 +187,18 @@ pub enum ScenarioError {
     #[error("mounted fault chaos validation failed: {violations:?}")]
     MountedFaultChaosInvariantViolations {
         violations: Vec<NamespaceInvariantViolation>,
+    },
+    #[error("mounted LWW reconnect chaos validation failed: {violations:?}")]
+    MountedLwwReconnectInvariantViolations {
+        violations: Vec<NamespaceInvariantViolation>,
+    },
+    #[error(
+        "mounted LWW reconnect oracle mismatch on {path}: expected {expected_checksum_sha256}, mismatches: {mismatches:?}"
+    )]
+    MountedLwwReconnectOracleMismatch {
+        path: String,
+        expected_checksum_sha256: String,
+        mismatches: Vec<LwwOracleClientResult>,
     },
     #[cfg(test)]
     #[error("namespace collision recording replication failed: {errors:?}")]
@@ -198,6 +228,7 @@ pub fn available_scenarios() -> Vec<ScenarioDefinition> {
             .definition(),
         MountedChaosConvergence.definition(),
         MountedFaultChaosConvergence.definition(),
+        MountedLwwReconnectChaosConvergence.definition(),
     ]
 }
 
@@ -236,6 +267,9 @@ pub(crate) fn resolve_scenario(name: &str) -> Option<Box<dyn Scenario>> {
         }
         MOUNTED_FAULT_CHAOS_CONVERGENCE | "fault-chaos" | "chaos-faults" => {
             Some(Box::new(MountedFaultChaosConvergence))
+        }
+        MOUNTED_LWW_RECONNECT_CHAOS_CONVERGENCE | "lww-chaos" | "reconnect-lww" => {
+            Some(Box::new(MountedLwwReconnectChaosConvergence))
         }
         #[cfg(test)]
         TEST_FAILING_VALIDATE => Some(Box::new(TestFailingScenario {
@@ -3691,6 +3725,1023 @@ fn fault_payload(seed: u64, label: &str) -> Vec<u8> {
     format!("studiofs fault chaos seed={seed} label={label}\n").into_bytes()
 }
 
+#[derive(Debug, Clone, Copy)]
+struct MountedLwwReconnectChaosConvergence;
+
+impl Scenario for MountedLwwReconnectChaosConvergence {
+    fn definition(&self) -> ScenarioDefinition {
+        ScenarioDefinition {
+            name: MOUNTED_LWW_RECONNECT_CHAOS_CONVERGENCE,
+            description: "mounted LWW reconnect chaos scenario with stale writer and cold observer",
+            requires_studiofs_bin: true,
+            requires_mount: true,
+        }
+    }
+
+    fn setup(&self, context: &ScenarioContext) -> Result<(), ScenarioError> {
+        fs::create_dir_all(&context.scenario_dir)?;
+        Ok(())
+    }
+
+    fn run(&self, context: &ScenarioContext) -> Result<(), ScenarioError> {
+        if let Some(config) = &context.client_controller_config {
+            let mut driver = RealMountedLwwReconnectDriver(MultiClientController::new(
+                config.clone(),
+                SystemClientProcessExecutor,
+            ));
+            run_mounted_lww_reconnect_with_driver(
+                context,
+                &mut driver,
+                LWW_RECONNECT_CONVERGENCE_TIMEOUT,
+                LWW_RECONNECT_CONVERGENCE_POLL_INTERVAL,
+            )?;
+        } else {
+            write_mounted_lww_reconnect_plan_artifacts(context)?;
+        }
+        Ok(())
+    }
+
+    fn validate(&self, context: &ScenarioContext) -> Result<Vec<String>, ScenarioError> {
+        let summary_path = context
+            .scenario_dir
+            .join("mounted-lww-reconnect-chaos-summary.json");
+        if !summary_path.exists() {
+            return Err(ScenarioError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("missing summary artifact: {}", summary_path.display()),
+            )));
+        }
+        let summary: MountedLwwReconnectSummary =
+            serde_json::from_slice(&fs::read(&summary_path)?)?;
+        let validation = json!({
+            "scenario": MOUNTED_LWW_RECONNECT_CHAOS_CONVERGENCE,
+            "run_id": context.run_id,
+            "seed": context.seed,
+            "status": if summary.final_validator.converged
+                && summary.namespace_violations.is_empty()
+                && summary.oracle.matched { "passed" } else { "failed" },
+            "warm_clients": summary.warm_clients,
+            "stale_writer": summary.stale_writer,
+            "cold_observer": summary.cold_observer,
+            "accepted_operations": summary.accepted_operations,
+            "rejected_operations": summary.rejected_operations,
+            "offline_elapsed_ms": summary.offline_elapsed_ms,
+            "restart_elapsed_ms": summary.restart_elapsed_ms,
+            "final_convergence_elapsed_ms": summary.final_convergence_elapsed_ms,
+            "expected_winner": summary.expected_winner,
+            "oracle": summary.oracle,
+            "final_validator": summary.final_validator,
+            "namespace_violations": summary.namespace_violations,
+            "operation_log": summary.operation_log,
+        });
+        fs::write(
+            context.scenario_dir.join("validation.json"),
+            serde_json::to_vec_pretty(&validation)?,
+        )?;
+        Ok(vec![
+            format!(
+                "artifacts/scenarios/{MOUNTED_LWW_RECONNECT_CHAOS_CONVERGENCE}/mounted-lww-reconnect-chaos-summary.json"
+            ),
+            format!(
+                "artifacts/scenarios/{MOUNTED_LWW_RECONNECT_CHAOS_CONVERGENCE}/validation.json"
+            ),
+            format!(
+                "artifacts/scenarios/{MOUNTED_LWW_RECONNECT_CHAOS_CONVERGENCE}/lww-oracle.json"
+            ),
+        ])
+    }
+
+    fn cleanup(&self, _context: &ScenarioContext) -> Result<(), ScenarioError> {
+        Ok(())
+    }
+}
+
+trait MountedLwwReconnectDriver {
+    fn bootstrap_volume(
+        &mut self,
+        options: VolumeBootstrapOptions,
+    ) -> Result<VolumeBootstrapSummary, ScenarioError>;
+    fn mount_client(&mut self, client: &str) -> Result<(), ScenarioError>;
+    fn clients(&self) -> Vec<ClientSpec>;
+    fn force_kill(&mut self, client: &str) -> Result<(), ScenarioError>;
+    fn remount(&mut self, client: &str) -> Result<(), ScenarioError>;
+    fn after_phase(
+        &mut self,
+        _phase: MountedLwwReconnectPhase,
+        _clients: &[ClientSpec],
+    ) -> Result<(), ScenarioError> {
+        Ok(())
+    }
+    fn unmount_all(&mut self) -> Result<(), ScenarioError>;
+}
+
+struct RealMountedLwwReconnectDriver(MultiClientController<SystemClientProcessExecutor>);
+
+impl MountedLwwReconnectDriver for RealMountedLwwReconnectDriver {
+    fn bootstrap_volume(
+        &mut self,
+        options: VolumeBootstrapOptions,
+    ) -> Result<VolumeBootstrapSummary, ScenarioError> {
+        Ok(self.0.bootstrap_volume(options)?)
+    }
+
+    fn mount_client(&mut self, client: &str) -> Result<(), ScenarioError> {
+        Ok(self.0.mount(client)?)
+    }
+
+    fn clients(&self) -> Vec<ClientSpec> {
+        self.0.clients().into_iter().cloned().collect()
+    }
+
+    fn force_kill(&mut self, client: &str) -> Result<(), ScenarioError> {
+        Ok(self.0.force_kill(client)?)
+    }
+
+    fn remount(&mut self, client: &str) -> Result<(), ScenarioError> {
+        Ok(self.0.remount(client)?)
+    }
+
+    fn unmount_all(&mut self) -> Result<(), ScenarioError> {
+        Ok(self.0.unmount_all()?)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum MountedLwwReconnectPhase {
+    HealthyWarmup,
+    StaleWriterOffline,
+    OnlineWriters,
+    StaleWriterReturn,
+    ReplayCrashRestart,
+    ColdObserverBootstrap,
+    OracleValidation,
+}
+
+impl MountedLwwReconnectPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::HealthyWarmup => "healthy_warmup",
+            Self::StaleWriterOffline => "stale_writer_offline",
+            Self::OnlineWriters => "online_writers",
+            Self::StaleWriterReturn => "stale_writer_return",
+            Self::ReplayCrashRestart => "replay_crash_restart",
+            Self::ColdObserverBootstrap => "cold_observer_bootstrap",
+            Self::OracleValidation => "oracle_validation",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct MountedLwwReconnectSummary {
+    scenario: String,
+    seed: u64,
+    bootstrap: Option<VolumeBootstrapSummary>,
+    warm_clients: Vec<String>,
+    stale_writer: String,
+    cold_observer: String,
+    operations: Vec<MountedChaosOperation>,
+    accepted_operations: usize,
+    rejected_operations: usize,
+    offline_elapsed_ms: u128,
+    restart_elapsed_ms: u128,
+    final_convergence_elapsed_ms: u128,
+    operation_log: String,
+    expected_winner: LwwExpectedWinner,
+    oracle: LwwOracleReport,
+    final_validator: TreeComparison,
+    namespace_violations: Vec<NamespaceInvariantViolation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct LwwExpectedWinner {
+    client: String,
+    path: String,
+    checksum_sha256: String,
+    bytes: u64,
+    oracle_order: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct LwwOracleReport {
+    path: String,
+    expected_client: String,
+    expected_checksum_sha256: String,
+    expected_oracle_order: u32,
+    matched: bool,
+    clients: Vec<LwwOracleClientResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LwwOracleClientResult {
+    client: String,
+    checksum_sha256: Option<String>,
+    matched: bool,
+    error: Option<String>,
+}
+
+fn run_mounted_lww_reconnect_with_driver(
+    context: &ScenarioContext,
+    driver: &mut dyn MountedLwwReconnectDriver,
+    convergence_timeout: Duration,
+    poll_interval: Duration,
+) -> Result<MountedLwwReconnectSummary, ScenarioError> {
+    let result =
+        run_mounted_lww_reconnect_body(context, driver, convergence_timeout, poll_interval);
+    let unmount_result = driver.unmount_all();
+    match (result, unmount_result) {
+        (Ok(summary), Ok(())) => Ok(summary),
+        (Err(primary), Err(cleanup)) => {
+            Err(ScenarioError::MountedLwwReconnectUnmountAfterFailure {
+                primary: primary.to_string(),
+                cleanup: cleanup.to_string(),
+            })
+        }
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+fn run_mounted_lww_reconnect_body(
+    context: &ScenarioContext,
+    driver: &mut dyn MountedLwwReconnectDriver,
+    convergence_timeout: Duration,
+    poll_interval: Duration,
+) -> Result<MountedLwwReconnectSummary, ScenarioError> {
+    let bootstrap = driver.bootstrap_volume(VolumeBootstrapOptions {
+        client_names: LWW_RECONNECT_CLIENT_NAMES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect(),
+        clean_existing_local_metadata: true,
+    })?;
+    write_bootstrap_summary(context, &bootstrap)?;
+    for name in LWW_RECONNECT_CLIENT_NAMES
+        .iter()
+        .take(LWW_RECONNECT_WARM_CLIENTS)
+    {
+        driver.mount_client(name)?;
+    }
+
+    let all_clients = driver.clients();
+    if all_clients.len() < LWW_RECONNECT_CLIENT_NAMES.len() {
+        return Err(ScenarioError::InsufficientLwwReconnectClients {
+            expected: LWW_RECONNECT_CLIENT_NAMES.len(),
+            actual: all_clients.len(),
+        });
+    }
+    let warm_clients = all_clients
+        .iter()
+        .take(LWW_RECONNECT_WARM_CLIENTS)
+        .cloned()
+        .collect::<Vec<_>>();
+    let stale_writer = warm_clients[LWW_RECONNECT_STALE_WRITER_INDEX].clone();
+    let cold_observer = all_clients[LWW_RECONNECT_COLD_OBSERVER_INDEX].clone();
+
+    establish_lww_reconnect_initial_tree(context.seed, &warm_clients[0])?;
+    driver.after_phase(MountedLwwReconnectPhase::HealthyWarmup, &warm_clients)?;
+    wait_for_convergence(
+        &client_mounts(&warm_clients),
+        context.scenario_dir.join("warmup-validation"),
+        convergence_timeout,
+        poll_interval,
+    )?;
+
+    let started = Instant::now();
+    let offline_started = Instant::now();
+    driver.force_kill(&stale_writer.name)?;
+    let mut operations = vec![lww_reconnect_client_operation(
+        started,
+        MountedLwwReconnectPhase::StaleWriterOffline,
+        1,
+        &stale_writer,
+        "stale_writer_offline",
+        &stale_writer.name,
+        SharedOperation::ClientCrash,
+        None,
+    )];
+    write_mounted_lww_reconnect_operations(
+        context,
+        MountedLwwReconnectPhase::StaleWriterOffline,
+        &operations,
+    )?;
+    driver.after_phase(MountedLwwReconnectPhase::StaleWriterOffline, &warm_clients)?;
+
+    let online_clients = warm_clients
+        .iter()
+        .filter(|client| client.name != stale_writer.name)
+        .cloned()
+        .collect::<Vec<_>>();
+    let online_writer_a = &online_clients[0];
+    let online_writer_b = &online_clients[1];
+    let write_a = lww_reconnect_write(context.seed, started, 1, online_writer_a)?;
+    write_mounted_lww_reconnect_operations(
+        context,
+        MountedLwwReconnectPhase::OnlineWriters,
+        std::slice::from_ref(&write_a),
+    )?;
+    operations.push(write_a);
+    let write_b = lww_reconnect_write(context.seed, started, 2, online_writer_b)?;
+    write_mounted_lww_reconnect_operations(
+        context,
+        MountedLwwReconnectPhase::OnlineWriters,
+        std::slice::from_ref(&write_b),
+    )?;
+    operations.push(write_b);
+    driver.after_phase(MountedLwwReconnectPhase::OnlineWriters, &online_clients)?;
+    wait_for_convergence(
+        &client_mounts(&online_clients),
+        context.scenario_dir.join("online-writers-validation"),
+        convergence_timeout,
+        poll_interval,
+    )?;
+    let offline_elapsed_ms = elapsed_millis_nonzero(offline_started);
+
+    let restart_started = Instant::now();
+    driver.remount(&stale_writer.name)?;
+    let restart_operation = lww_reconnect_client_operation(
+        started,
+        MountedLwwReconnectPhase::StaleWriterReturn,
+        1,
+        &stale_writer,
+        "stale_writer_restart",
+        &stale_writer.name,
+        SharedOperation::ClientRestart,
+        None,
+    );
+    write_mounted_lww_reconnect_operations(
+        context,
+        MountedLwwReconnectPhase::StaleWriterReturn,
+        std::slice::from_ref(&restart_operation),
+    )?;
+    operations.push(restart_operation);
+    driver.after_phase(MountedLwwReconnectPhase::StaleWriterReturn, &warm_clients)?;
+
+    let expected_winner_payload = lww_reconnect_payload(context.seed, &stale_writer.name, 3);
+    let write_c = lww_reconnect_write(context.seed, started, 3, &stale_writer)?;
+    write_mounted_lww_reconnect_operations(
+        context,
+        MountedLwwReconnectPhase::StaleWriterReturn,
+        std::slice::from_ref(&write_c),
+    )?;
+    operations.push(write_c);
+
+    driver.force_kill(&stale_writer.name)?;
+    let replay_crash = lww_reconnect_client_operation(
+        started,
+        MountedLwwReconnectPhase::ReplayCrashRestart,
+        1,
+        &stale_writer,
+        "stale_writer_replay_crash",
+        &stale_writer.name,
+        SharedOperation::ClientCrash,
+        None,
+    );
+    driver.remount(&stale_writer.name)?;
+    let replay_restart = lww_reconnect_client_operation(
+        started,
+        MountedLwwReconnectPhase::ReplayCrashRestart,
+        2,
+        &stale_writer,
+        "stale_writer_replay_restart",
+        &stale_writer.name,
+        SharedOperation::ClientRestart,
+        None,
+    );
+    let replay_operations = vec![replay_crash, replay_restart];
+    write_mounted_lww_reconnect_operations(
+        context,
+        MountedLwwReconnectPhase::ReplayCrashRestart,
+        &replay_operations,
+    )?;
+    operations.extend(replay_operations);
+    let local_read = fs::read(stale_writer.mount_point.join(LWW_RECONNECT_ORACLE_PATH))?;
+    if local_read != expected_winner_payload {
+        return Err(ScenarioError::Io(std::io::Error::other(format!(
+            "LWW reconnect replay durability failure: data read after restart does not match {}",
+            LWW_RECONNECT_ORACLE_PATH
+        ))));
+    }
+    let restart_elapsed_ms = elapsed_millis_nonzero(restart_started);
+    driver.after_phase(MountedLwwReconnectPhase::ReplayCrashRestart, &warm_clients)?;
+
+    driver.mount_client(&cold_observer.name)?;
+    let cold_mount = lww_reconnect_observed_operation(
+        started,
+        MountedLwwReconnectPhase::ColdObserverBootstrap,
+        "cold_observer_mount",
+        SharedOperation::MountedOnly {
+            name: "cold_observer_mount".to_string(),
+            reason: "mounting a late cold observer is mounted-E2E only".to_string(),
+        },
+    );
+    write_mounted_lww_reconnect_operations(
+        context,
+        MountedLwwReconnectPhase::ColdObserverBootstrap,
+        std::slice::from_ref(&cold_mount),
+    )?;
+    operations.push(cold_mount);
+
+    let mut final_clients = driver.clients();
+    final_clients.truncate(LWW_RECONNECT_CLIENT_NAMES.len());
+    driver.after_phase(
+        MountedLwwReconnectPhase::ColdObserverBootstrap,
+        &final_clients,
+    )?;
+
+    finish_mounted_lww_reconnect(
+        context,
+        Some(bootstrap),
+        final_clients,
+        stale_writer.name,
+        cold_observer.name,
+        operations,
+        LwwReconnectTimings {
+            offline_elapsed_ms,
+            restart_elapsed_ms,
+        },
+        convergence_timeout,
+        poll_interval,
+    )
+}
+
+fn establish_lww_reconnect_initial_tree(
+    seed: u64,
+    client: &ClientSpec,
+) -> Result<(), ScenarioError> {
+    let root = client.mount_point.join("lww-chaos");
+    fs::create_dir_all(&root)?;
+    fs::write(
+        root.join("winner.txt"),
+        lww_reconnect_payload(seed, "initial", 0),
+    )?;
+    fs::write(
+        root.join("observer.txt"),
+        lww_reconnect_payload(seed, "observer", 0),
+    )?;
+    Ok(())
+}
+
+fn lww_reconnect_write(
+    seed: u64,
+    started: Instant,
+    oracle_order: u32,
+    client: &ClientSpec,
+) -> Result<MountedChaosOperation, ScenarioError> {
+    let payload = lww_reconnect_payload(seed, &client.name, oracle_order);
+    write_local_durable_payload(client.mount_point.join(LWW_RECONNECT_ORACLE_PATH), &payload)?;
+    Ok(lww_reconnect_client_operation(
+        started,
+        if oracle_order == 3 {
+            MountedLwwReconnectPhase::StaleWriterReturn
+        } else {
+            MountedLwwReconnectPhase::OnlineWriters
+        },
+        oracle_order as usize,
+        client,
+        lww_write_operation_name(oracle_order),
+        LWW_RECONNECT_ORACLE_PATH,
+        SharedOperation::Write {
+            path: LWW_RECONNECT_ORACLE_PATH.to_string(),
+            offset: Some(0),
+            bytes: u64::try_from(payload.len()).unwrap_or(u64::MAX),
+            checksum_sha256: Some(bytes_sha256(&payload)),
+        },
+        None,
+    ))
+}
+
+fn lww_write_operation_name(oracle_order: u32) -> &'static str {
+    match oracle_order {
+        1 => "lww_write_order_1",
+        2 => "lww_write_order_2",
+        3 => "lww_write_order_3",
+        _ => "lww_write_order_unknown",
+    }
+}
+
+struct LwwReconnectTimings {
+    offline_elapsed_ms: u128,
+    restart_elapsed_ms: u128,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_mounted_lww_reconnect(
+    context: &ScenarioContext,
+    bootstrap: Option<VolumeBootstrapSummary>,
+    clients: Vec<ClientSpec>,
+    stale_writer: String,
+    cold_observer: String,
+    operations: Vec<MountedChaosOperation>,
+    timings: LwwReconnectTimings,
+    convergence_timeout: Duration,
+    poll_interval: Duration,
+) -> Result<MountedLwwReconnectSummary, ScenarioError> {
+    let convergence_started = Instant::now();
+    let convergence = wait_for_convergence(
+        &client_mounts(&clients),
+        context.scenario_dir.join("validation"),
+        convergence_timeout,
+        poll_interval,
+    )?;
+    let final_convergence_elapsed_ms = elapsed_millis_nonzero(convergence_started);
+    let mut namespace_violations = Vec::new();
+    for snapshot in &convergence.snapshots {
+        namespace_violations.extend(validate_namespace_invariants(snapshot, &[]));
+    }
+    if !namespace_violations.is_empty() {
+        return Err(ScenarioError::MountedLwwReconnectInvariantViolations {
+            violations: namespace_violations,
+        });
+    }
+
+    let expected_winner = lww_expected_winner(context.seed, &stale_writer);
+    let oracle = lww_oracle_report(&convergence.snapshots, &expected_winner);
+    write_lww_oracle_report(context, &oracle)?;
+    if !oracle.matched {
+        let mismatches = oracle
+            .clients
+            .iter()
+            .filter(|client| !client.matched)
+            .cloned()
+            .collect();
+        return Err(ScenarioError::MountedLwwReconnectOracleMismatch {
+            path: expected_winner.path,
+            expected_checksum_sha256: expected_winner.checksum_sha256,
+            mismatches,
+        });
+    }
+
+    let summary = mounted_lww_reconnect_summary(
+        context,
+        bootstrap,
+        clients,
+        stale_writer,
+        cold_observer,
+        operations,
+        timings,
+        final_convergence_elapsed_ms,
+        expected_winner,
+        oracle,
+        convergence.comparison,
+        namespace_violations,
+    );
+    write_mounted_lww_reconnect_summary(context, &summary)?;
+    Ok(summary)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mounted_lww_reconnect_summary(
+    context: &ScenarioContext,
+    bootstrap: Option<VolumeBootstrapSummary>,
+    clients: Vec<ClientSpec>,
+    stale_writer: String,
+    cold_observer: String,
+    operations: Vec<MountedChaosOperation>,
+    timings: LwwReconnectTimings,
+    final_convergence_elapsed_ms: u128,
+    expected_winner: LwwExpectedWinner,
+    oracle: LwwOracleReport,
+    final_validator: TreeComparison,
+    namespace_violations: Vec<NamespaceInvariantViolation>,
+) -> MountedLwwReconnectSummary {
+    let accepted_operations = operations
+        .iter()
+        .filter(|operation| operation.result == "accepted")
+        .count();
+    let rejected_operations = operations
+        .iter()
+        .filter(|operation| operation.result == "rejected")
+        .count();
+    MountedLwwReconnectSummary {
+        scenario: MOUNTED_LWW_RECONNECT_CHAOS_CONVERGENCE.to_string(),
+        seed: context.seed,
+        bootstrap,
+        warm_clients: clients
+            .iter()
+            .take(LWW_RECONNECT_WARM_CLIENTS)
+            .map(|client| client.name.clone())
+            .collect(),
+        stale_writer,
+        cold_observer,
+        operations,
+        accepted_operations,
+        rejected_operations,
+        offline_elapsed_ms: timings.offline_elapsed_ms,
+        restart_elapsed_ms: timings.restart_elapsed_ms,
+        final_convergence_elapsed_ms,
+        operation_log: format!(
+            "artifacts/scenarios/{MOUNTED_LWW_RECONNECT_CHAOS_CONVERGENCE}/operations.ndjson"
+        ),
+        expected_winner,
+        oracle,
+        final_validator,
+        namespace_violations,
+    }
+}
+
+fn write_mounted_lww_reconnect_plan_artifacts(
+    context: &ScenarioContext,
+) -> Result<MountedLwwReconnectSummary, ScenarioError> {
+    fs::create_dir_all(&context.scenario_dir)?;
+    let started = Instant::now();
+    let planned_clients = LWW_RECONNECT_CLIENT_NAMES
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            let mount = context
+                .sandbox
+                .join("planned-mounts")
+                .join(format!("client-{index}"));
+            ClientSpec {
+                name: (*name).to_string(),
+                client_root: context.sandbox.join("planned-clients").join(name),
+                local_metadata_dir: context
+                    .sandbox
+                    .join("planned-clients")
+                    .join(name)
+                    .join("meta"),
+                local_metadata_db: context
+                    .sandbox
+                    .join("planned-clients")
+                    .join(name)
+                    .join("meta")
+                    .join("projectfs.db"),
+                cache_dir: context
+                    .sandbox
+                    .join("planned-clients")
+                    .join(name)
+                    .join("cache"),
+                mount_metadata_dir: context
+                    .sandbox
+                    .join("planned-clients")
+                    .join(name)
+                    .join("mount"),
+                mount_point: mount,
+                stdout_log: context
+                    .sandbox
+                    .join("planned-clients")
+                    .join(name)
+                    .join("stdout.log"),
+                stderr_log: context
+                    .sandbox
+                    .join("planned-clients")
+                    .join(name)
+                    .join("stderr.log"),
+                tracing_log: context
+                    .sandbox
+                    .join("planned-clients")
+                    .join(name)
+                    .join("studiofs-tracing.log"),
+                process_id: None,
+                state: ClientLifecycleState::Planned,
+            }
+        })
+        .collect::<Vec<_>>();
+    let stale_writer = planned_clients[LWW_RECONNECT_STALE_WRITER_INDEX].clone();
+    let cold_observer = planned_clients[LWW_RECONNECT_COLD_OBSERVER_INDEX].clone();
+    let mut operations = vec![lww_reconnect_client_operation(
+        started,
+        MountedLwwReconnectPhase::StaleWriterOffline,
+        1,
+        &stale_writer,
+        "stale_writer_offline",
+        &stale_writer.name,
+        SharedOperation::ClientCrash,
+        None,
+    )];
+    operations.push(lww_reconnect_planned_write(
+        context.seed,
+        started,
+        1,
+        &planned_clients[0],
+    ));
+    operations.push(lww_reconnect_planned_write(
+        context.seed,
+        started,
+        2,
+        &planned_clients[1],
+    ));
+    operations.push(lww_reconnect_client_operation(
+        started,
+        MountedLwwReconnectPhase::StaleWriterReturn,
+        1,
+        &stale_writer,
+        "stale_writer_restart",
+        &stale_writer.name,
+        SharedOperation::ClientRestart,
+        None,
+    ));
+    operations.push(lww_reconnect_planned_write(
+        context.seed,
+        started,
+        3,
+        &stale_writer,
+    ));
+    operations.push(lww_reconnect_client_operation(
+        started,
+        MountedLwwReconnectPhase::ReplayCrashRestart,
+        1,
+        &stale_writer,
+        "stale_writer_replay_crash",
+        &stale_writer.name,
+        SharedOperation::ClientCrash,
+        None,
+    ));
+    operations.push(lww_reconnect_client_operation(
+        started,
+        MountedLwwReconnectPhase::ReplayCrashRestart,
+        2,
+        &stale_writer,
+        "stale_writer_replay_restart",
+        &stale_writer.name,
+        SharedOperation::ClientRestart,
+        None,
+    ));
+    operations.push(lww_reconnect_observed_operation(
+        started,
+        MountedLwwReconnectPhase::ColdObserverBootstrap,
+        "cold_observer_mount",
+        SharedOperation::MountedOnly {
+            name: "cold_observer_mount".to_string(),
+            reason: "mounting a late cold observer is mounted-E2E only".to_string(),
+        },
+    ));
+    for operation in &mut operations {
+        operation.result = "planned".to_string();
+        write_mounted_lww_reconnect_operations(
+            context,
+            lww_phase_for_operation(operation),
+            std::slice::from_ref(operation),
+        )?;
+    }
+
+    let expected_winner = lww_expected_winner(context.seed, &stale_writer.name);
+    let oracle = LwwOracleReport {
+        path: expected_winner.path.clone(),
+        expected_client: expected_winner.client.clone(),
+        expected_checksum_sha256: expected_winner.checksum_sha256.clone(),
+        expected_oracle_order: expected_winner.oracle_order,
+        matched: true,
+        clients: LWW_RECONNECT_CLIENT_NAMES
+            .iter()
+            .map(|name| LwwOracleClientResult {
+                client: (*name).to_string(),
+                checksum_sha256: Some(expected_winner.checksum_sha256.clone()),
+                matched: true,
+                error: None,
+            })
+            .collect(),
+    };
+    write_lww_oracle_report(context, &oracle)?;
+    let summary = MountedLwwReconnectSummary {
+        scenario: MOUNTED_LWW_RECONNECT_CHAOS_CONVERGENCE.to_string(),
+        seed: context.seed,
+        bootstrap: None,
+        warm_clients: LWW_RECONNECT_CLIENT_NAMES
+            .iter()
+            .take(LWW_RECONNECT_WARM_CLIENTS)
+            .map(|name| (*name).to_string())
+            .collect(),
+        stale_writer: stale_writer.name,
+        cold_observer: cold_observer.name,
+        accepted_operations: 0,
+        rejected_operations: 0,
+        operations,
+        offline_elapsed_ms: 0,
+        restart_elapsed_ms: 0,
+        final_convergence_elapsed_ms: 0,
+        operation_log: format!(
+            "artifacts/scenarios/{MOUNTED_LWW_RECONNECT_CHAOS_CONVERGENCE}/operations.ndjson"
+        ),
+        expected_winner,
+        oracle,
+        final_validator: TreeComparison {
+            converged: true,
+            reference_client: Some(LWW_RECONNECT_CLIENT_NAMES[0].to_string()),
+            compared_clients: LWW_RECONNECT_CLIENT_NAMES
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
+            differences: Vec::new(),
+        },
+        namespace_violations: Vec::new(),
+    };
+    write_mounted_lww_reconnect_summary(context, &summary)?;
+    Ok(summary)
+}
+
+fn lww_reconnect_planned_write(
+    seed: u64,
+    started: Instant,
+    oracle_order: u32,
+    client: &ClientSpec,
+) -> MountedChaosOperation {
+    let payload = lww_reconnect_payload(seed, &client.name, oracle_order);
+    lww_reconnect_client_operation(
+        started,
+        if oracle_order == 3 {
+            MountedLwwReconnectPhase::StaleWriterReturn
+        } else {
+            MountedLwwReconnectPhase::OnlineWriters
+        },
+        oracle_order as usize,
+        client,
+        lww_write_operation_name(oracle_order),
+        LWW_RECONNECT_ORACLE_PATH,
+        SharedOperation::Write {
+            path: LWW_RECONNECT_ORACLE_PATH.to_string(),
+            offset: Some(0),
+            bytes: u64::try_from(payload.len()).unwrap_or(u64::MAX),
+            checksum_sha256: Some(bytes_sha256(&payload)),
+        },
+        None,
+    )
+}
+
+fn lww_phase_for_operation(operation: &MountedChaosOperation) -> MountedLwwReconnectPhase {
+    match operation.operation.as_str() {
+        "stale_writer_offline" => MountedLwwReconnectPhase::StaleWriterOffline,
+        "stale_writer_restart" | "lww_write_order_3" => MountedLwwReconnectPhase::StaleWriterReturn,
+        "stale_writer_replay_crash" | "stale_writer_replay_restart" => {
+            MountedLwwReconnectPhase::ReplayCrashRestart
+        }
+        "cold_observer_mount" => MountedLwwReconnectPhase::ColdObserverBootstrap,
+        _ => MountedLwwReconnectPhase::OnlineWriters,
+    }
+}
+
+fn lww_reconnect_observed_operation(
+    started: Instant,
+    phase: MountedLwwReconnectPhase,
+    operation: &'static str,
+    shared_operation: SharedOperation,
+) -> MountedChaosOperation {
+    MountedChaosOperation {
+        round: phase as usize,
+        order: 0,
+        client: String::new(),
+        operation: operation.to_string(),
+        path: operation.to_string(),
+        shared_operation,
+        result: "observed".to_string(),
+        timestamp_ms: elapsed_millis_u64(started),
+        error: None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lww_reconnect_client_operation(
+    started: Instant,
+    phase: MountedLwwReconnectPhase,
+    order: usize,
+    client: &ClientSpec,
+    operation: &'static str,
+    path: &str,
+    shared_operation: SharedOperation,
+    error: Option<io::Error>,
+) -> MountedChaosOperation {
+    let error = error.map(|error| error.to_string());
+    MountedChaosOperation {
+        round: phase as usize,
+        order,
+        client: client.name.clone(),
+        operation: operation.to_string(),
+        path: path.to_string(),
+        shared_operation,
+        result: if error.is_some() {
+            "rejected".to_string()
+        } else {
+            "accepted".to_string()
+        },
+        timestamp_ms: elapsed_millis_u64(started),
+        error,
+    }
+}
+
+fn write_mounted_lww_reconnect_operations(
+    context: &ScenarioContext,
+    phase: MountedLwwReconnectPhase,
+    operations: &[MountedChaosOperation],
+) -> Result<(), ScenarioError> {
+    let path = operation_log_path(context);
+    let mut writer = OperationLogWriter::open_append(&path)?;
+    for operation in operations {
+        let mut record = shared_operation_record(
+            &writer,
+            MOUNTED_LWW_RECONNECT_CHAOS_CONVERGENCE,
+            operation.shared_operation.clone(),
+        )
+        .with_timestamp_ms(operation.timestamp_ms)
+        .with_outcome(mounted_chaos_outcome(operation))
+        .with_metadata("phase", phase.as_str())
+        .with_metadata("operation", operation.operation.clone());
+        if !operation.client.is_empty() {
+            record = record.with_client(&operation.client);
+        }
+        if let Some(order) = operation
+            .operation
+            .strip_prefix("lww_write_order_")
+            .and_then(|order| order.parse::<u32>().ok())
+        {
+            record = record.with_metadata("oracle_order", order.to_string());
+            if order == 3 {
+                record = record.with_metadata("expected_winner", "true");
+            }
+        }
+        if operation.error.is_some() {
+            record = record.with_metadata("result", &operation.result);
+        }
+        append_shared_record(&mut writer, &record)?;
+    }
+    Ok(())
+}
+
+fn lww_expected_winner(seed: u64, client: &str) -> LwwExpectedWinner {
+    let payload = lww_reconnect_payload(seed, client, 3);
+    LwwExpectedWinner {
+        client: client.to_string(),
+        path: LWW_RECONNECT_ORACLE_PATH.to_string(),
+        checksum_sha256: bytes_sha256(&payload),
+        bytes: u64::try_from(payload.len()).unwrap_or(u64::MAX),
+        oracle_order: 3,
+    }
+}
+
+fn lww_oracle_report(
+    snapshots: &[crate::mounted_tree::MountedTreeSnapshot],
+    expected: &LwwExpectedWinner,
+) -> LwwOracleReport {
+    let clients = snapshots
+        .iter()
+        .map(|snapshot| {
+            let entry = snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.path == expected.path);
+            match entry {
+                Some(entry) => {
+                    let checksum = entry.checksum_sha256.clone();
+                    let matched = checksum.as_deref() == Some(expected.checksum_sha256.as_str());
+                    LwwOracleClientResult {
+                        client: snapshot.client.clone(),
+                        checksum_sha256: checksum,
+                        matched,
+                        error: if matched {
+                            None
+                        } else {
+                            Some("checksum did not match expected LWW winner".to_string())
+                        },
+                    }
+                }
+                None => LwwOracleClientResult {
+                    client: snapshot.client.clone(),
+                    checksum_sha256: None,
+                    matched: false,
+                    error: Some("expected LWW winner path is missing".to_string()),
+                },
+            }
+        })
+        .collect::<Vec<_>>();
+    LwwOracleReport {
+        path: expected.path.clone(),
+        expected_client: expected.client.clone(),
+        expected_checksum_sha256: expected.checksum_sha256.clone(),
+        expected_oracle_order: expected.oracle_order,
+        matched: clients.iter().all(|client| client.matched),
+        clients,
+    }
+}
+
+fn write_lww_oracle_report(
+    context: &ScenarioContext,
+    oracle: &LwwOracleReport,
+) -> Result<(), ScenarioError> {
+    fs::write(
+        context.scenario_dir.join("lww-oracle.json"),
+        serde_json::to_vec_pretty(oracle)?,
+    )?;
+    Ok(())
+}
+
+fn write_mounted_lww_reconnect_summary(
+    context: &ScenarioContext,
+    summary: &MountedLwwReconnectSummary,
+) -> Result<(), ScenarioError> {
+    fs::write(
+        context
+            .scenario_dir
+            .join("mounted-lww-reconnect-chaos-summary.json"),
+        serde_json::to_vec_pretty(summary)?,
+    )?;
+    Ok(())
+}
+
+fn lww_reconnect_payload(seed: u64, client: &str, oracle_order: u32) -> Vec<u8> {
+    format!("studiofs lww reconnect seed={seed} client={client} oracle_order={oracle_order}\n")
+        .into_bytes()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum NamespaceCollisionKind {
@@ -6070,6 +7121,48 @@ mod tests {
         assert!(resolve_scenario(MOUNTED_FAULT_CHAOS_CONVERGENCE).is_some());
         assert!(resolve_scenario("fault-chaos").is_some());
         assert!(resolve_scenario("chaos-faults").is_some());
+    }
+
+    #[test]
+    fn registry_exposes_mounted_lww_reconnect_chaos_convergence_scenario() {
+        let scenarios = available_scenarios();
+
+        assert!(scenarios.iter().any(|scenario| {
+            scenario.name == MOUNTED_LWW_RECONNECT_CHAOS_CONVERGENCE
+                && scenario.requires_studiofs_bin
+                && scenario.description.contains("LWW reconnect")
+        }));
+        assert!(resolve_scenario(MOUNTED_LWW_RECONNECT_CHAOS_CONVERGENCE).is_some());
+        assert!(resolve_scenario("lww-chaos").is_some());
+        assert!(resolve_scenario("reconnect-lww").is_some());
+    }
+
+    #[test]
+    fn lww_reconnect_oracle_detects_converged_wrong_winner() {
+        let expected = lww_expected_winner(360, "client-c");
+        let wrong_checksum = bytes_sha256(&lww_reconnect_payload(360, "client-b", 2));
+        let snapshots = ["client-a", "client-b", "client-c"]
+            .iter()
+            .map(|client| crate::mounted_tree::MountedTreeSnapshot {
+                schema_version: 1,
+                client: (*client).to_string(),
+                mount_point: format!("mounts/{client}"),
+                entries: vec![crate::mounted_tree::TreeEntry {
+                    path: LWW_RECONNECT_ORACLE_PATH.to_string(),
+                    entry_type: crate::mounted_tree::TreeEntryKind::File,
+                    size: Some(expected.bytes),
+                    modified_unix_ms: None,
+                    checksum_sha256: Some(wrong_checksum.clone()),
+                    symlink_target: None,
+                }],
+            })
+            .collect::<Vec<_>>();
+
+        let report = lww_oracle_report(&snapshots, &expected);
+
+        assert!(!report.matched);
+        assert_eq!(report.clients.len(), 3);
+        assert!(report.clients.iter().all(|client| !client.matched));
     }
 
     #[test]

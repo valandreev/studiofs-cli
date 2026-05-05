@@ -25,6 +25,8 @@ fn cli_parses_required_runner_entrypoints() {
         "runner-cli-test",
         "--seed",
         "42",
+        "--infra",
+        "external-env",
     ])
     .unwrap();
     match run.command {
@@ -33,12 +35,14 @@ fn cli_parses_required_runner_entrypoints() {
             run_id,
             seed,
             platform,
+            infra,
             ..
         }) => {
             assert_eq!(scenario, Some("basic-multi-client-smoke".to_string()));
             assert_eq!(run_id, Some("runner-cli-test".to_string()));
             assert_eq!(seed, 42);
             assert_eq!(platform, PlatformSelection::Auto);
+            assert_eq!(infra, InfraMode::ExternalEnv);
         }
         other => panic!("expected run command, got {other:?}"),
     }
@@ -75,6 +79,7 @@ fn list_scenarios_exposes_namespace_collision_suite() {
         "collision-readdir-stat-during-mutation",
         "mounted-chaos-convergence",
         "mounted-fault-chaos-convergence",
+        "mounted-lww-reconnect-chaos-convergence",
     ] {
         assert!(
             names.contains(&expected),
@@ -156,6 +161,85 @@ fn mounted_fault_chaos_disabled_run_writes_reproducible_artifacts() {
             .iter()
             .any(|record| matches!(&record.operation, ScenarioOperation::MountedOnly { .. }))
     );
+}
+
+#[test]
+fn mounted_lww_reconnect_chaos_disabled_run_writes_reproducible_artifacts() {
+    let temp = tempdir().unwrap();
+    let request = RunRequest {
+        root: temp.path().join("e2e-runs"),
+        run_id: Some("lww-reconnect-contract-run".to_string()),
+        scenarios: vec!["mounted-lww-reconnect-chaos-convergence".to_string()],
+        seed: 360,
+        studiofs_bin: None,
+        platform: PlatformSelection::Auto,
+        retention: RetentionPolicy::Always,
+        report: None,
+        port_range: None,
+        timeout: None,
+        infra: InfraMode::Disabled,
+    };
+
+    let outcome = studiofs_e2e::runner::run(request).unwrap();
+
+    assert_eq!(outcome.status, RunStatus::Passed);
+    assert_eq!(
+        outcome.scenarios[0].name,
+        "mounted-lww-reconnect-chaos-convergence"
+    );
+    assert!(outcome.scenarios[0].artifacts.contains(
+        &"artifacts/scenarios/mounted-lww-reconnect-chaos-convergence/mounted-lww-reconnect-chaos-summary.json"
+            .to_string()
+    ));
+    assert!(outcome.scenarios[0].artifacts.contains(
+        &"artifacts/scenarios/mounted-lww-reconnect-chaos-convergence/validation.json".to_string()
+    ));
+
+    let sandbox = temp
+        .path()
+        .join("e2e-runs")
+        .join("lww-reconnect-contract-run");
+    let summary = read_json(sandbox.join(
+        "artifacts/scenarios/mounted-lww-reconnect-chaos-convergence/mounted-lww-reconnect-chaos-summary.json",
+    ));
+    assert_eq!(
+        summary["scenario"],
+        "mounted-lww-reconnect-chaos-convergence"
+    );
+    assert_eq!(summary["seed"], 360);
+    assert_eq!(summary["warm_clients"].as_array().unwrap().len(), 4);
+    assert_eq!(summary["stale_writer"], "client-c");
+    assert_eq!(summary["cold_observer"], "client-e");
+    assert_eq!(summary["expected_winner"]["client"], "client-c");
+    assert_eq!(summary["expected_winner"]["oracle_order"], 3);
+
+    let operations = read_operation_log(
+        sandbox
+            .join("artifacts/scenarios/mounted-lww-reconnect-chaos-convergence/operations.ndjson"),
+    )
+    .unwrap();
+    assert!(
+        operations
+            .iter()
+            .any(|record| matches!(&record.operation, ScenarioOperation::ClientCrash))
+    );
+    assert!(
+        operations
+            .iter()
+            .any(|record| matches!(&record.operation, ScenarioOperation::ClientRestart))
+    );
+    assert!(
+        operations
+            .iter()
+            .any(|record| matches!(&record.operation, ScenarioOperation::MountedOnly { .. }))
+    );
+    assert!(operations.iter().any(|record| {
+        matches!(&record.operation, ScenarioOperation::Write { .. })
+            && record
+                .metadata
+                .get("expected_winner")
+                .is_some_and(|winner| winner == "true")
+    }));
 }
 
 #[test]

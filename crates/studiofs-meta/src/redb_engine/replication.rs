@@ -1080,7 +1080,15 @@ impl RedbMetaEngine {
                         )?;
                     }
                 }
-                crate::events::MetaEvent::PublishRegularFileBaseSlices { .. } => {}
+                crate::events::MetaEvent::PublishRegularFileBaseSlices { ino, chunk_slices } => {
+                    Self::replace_regular_file_chunk_rows_from_chunk_slices_in_txn(
+                        &txn,
+                        REGULAR_FILE_OVERLAY_TABLE,
+                        *ino,
+                        chunk_slices.as_slice(),
+                        true,
+                    )?;
+                }
                 crate::events::MetaEvent::RemoveRegularFileGraph { .. }
                 | crate::events::MetaEvent::AddPendingDeletion { .. }
                 | crate::events::MetaEvent::RemovePendingDeletion { .. }

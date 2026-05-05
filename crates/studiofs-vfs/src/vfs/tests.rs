@@ -3346,6 +3346,50 @@ fn foreground_read_active_respects_idle_grace_after_last_read() {
     );
 }
 
+#[test]
+fn metadata_invalidation_drops_published_read_plan_cache_entry() {
+    let state = ReadState::new(1);
+    let ino = 42;
+    let mut attr = InodeAttr::new_file(ino, ROOT_INO, 0, 0, 0o644);
+    attr.size = 64;
+    attr.committed_size = 64;
+    attr.content_epoch = 1;
+    attr.committed_content_epoch = 1;
+    attr.upload_state = MetaUploadState::Ready;
+    let key = PublishedReadPlanCacheKey::from_attr(&attr).expect("published read-plan key");
+    let cached_span = studiofs_meta::schema::ResolvedSliceSpan {
+        chunk_id: ChunkId(0),
+        range: SliceRange::new(0, 64).expect("valid range"),
+        source: studiofs_meta::schema::ResolvedSliceSource::Overlay,
+        slice_id: Some(SliceId(0)),
+        slice_order: Some(SliceOrder(0)),
+        payload: Some(PayloadRef::new_partial(91_001, 64)),
+    };
+
+    state.published_read_plan_cache_put(
+        ino,
+        key,
+        0,
+        64,
+        Arc::from(vec![cached_span].into_boxed_slice()),
+    );
+    assert!(
+        state
+            .published_read_plan_cache_get(ino, key, 0, 64)
+            .is_some(),
+        "test setup should cache the original read plan"
+    );
+
+    state.published_read_plan_cache_remove([ino]);
+
+    assert!(
+        state
+            .published_read_plan_cache_get(ino, key, 0, 64)
+            .is_none(),
+        "metadata payload changes must force read-plan re-resolution even when attrs keep the same cache key"
+    );
+}
+
 #[tokio::test]
 async fn foreground_idle_notify_fires_when_last_read_finishes() {
     let state = ReadState::new(1);
