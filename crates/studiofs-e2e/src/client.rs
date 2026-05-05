@@ -552,6 +552,11 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
     }
 
     fn unmount_index(&mut self, index: usize) -> Result<(), ClientControllerError> {
+        if self.clients[index].spec.state != ClientLifecycleState::Mounted
+            && self.clients[index].process.is_none()
+        {
+            return Ok(());
+        }
         let command = self.unmount_command(index)?;
         let output = self.executor.run(&command)?;
         ensure_success(&command, output)?;

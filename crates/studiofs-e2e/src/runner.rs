@@ -184,6 +184,14 @@ pub fn run_with_executor(
     request: RunRequest,
     executor: &dyn CommandExecutor,
 ) -> Result<RunOutcome, RunnerError> {
+    run_with_executor_and_mount_lock_dir(request, executor, &default_mount_lock_dir())
+}
+
+fn run_with_executor_and_mount_lock_dir(
+    request: RunRequest,
+    executor: &dyn CommandExecutor,
+    mount_lock_dir: &Path,
+) -> Result<RunOutcome, RunnerError> {
     let started_instant = Instant::now();
     let started_at = timestamp();
     let root = absolutize(&request.root)?;
@@ -249,7 +257,29 @@ pub fn run_with_executor(
     write_runner_marker(&sandbox, &run_id)?;
     write_log_files(&sandbox)?;
 
-    let prepared_preflight = prepare_preflight(&sandbox, compose_stack.as_ref(), executor)?;
+    let mut default_mount_lock = None;
+    let mount_lock_failure = if requires_default_windows_mount_lock(infra_mode, &selected_platform)
+    {
+        match acquire_default_mount_lock(mount_lock_dir, &run_id) {
+            Ok(lock) => {
+                default_mount_lock = Some(lock);
+                None
+            }
+            Err(err) => Some(err.to_string()),
+        }
+    } else {
+        None
+    };
+    let prepared_preflight = if let Some(detail) = mount_lock_failure {
+        prepare_failed_mount_lock_preflight(&sandbox, compose_stack.as_ref(), detail)?
+    } else {
+        prepare_preflight(
+            &sandbox,
+            compose_stack.as_ref(),
+            executor,
+            default_mount_lock.as_ref(),
+        )?
+    };
     let preflight = prepared_preflight.report;
     let mut compose_cleanup_guard = ComposeCleanupGuard::new(
         if prepared_preflight.compose_start_attempted {
@@ -491,6 +521,7 @@ fn prepare_preflight(
     sandbox: &Path,
     compose_stack: Option<&DockerComposeStack>,
     executor: &dyn CommandExecutor,
+    default_mount_lock: Option<&DefaultMountLock>,
 ) -> Result<PreparedPreflight, RunnerError> {
     let Some(stack) = compose_stack else {
         write_pretty_json(
@@ -511,11 +542,20 @@ fn prepare_preflight(
     };
 
     stack.prepare_artifacts()?;
-    let mut checks: Vec<_> = stack
-        .preflight(executor)
-        .into_iter()
-        .map(preflight_check_report)
-        .collect();
+    let mut checks: Vec<_> = Vec::new();
+    if let Some(lock) = default_mount_lock {
+        checks.push(PreflightCheckReport {
+            name: "default Windows mounted E2E run lock".to_string(),
+            status: RunStatus::Passed,
+            detail: format!("held at {}", lock.path.display()),
+        });
+    }
+    checks.extend(
+        stack
+            .preflight(executor)
+            .into_iter()
+            .map(preflight_check_report),
+    );
     if checks.iter().any(|check| check.status != RunStatus::Passed) {
         return Ok(PreparedPreflight {
             report: PreflightReport {
@@ -557,6 +597,32 @@ fn prepare_preflight(
     })
 }
 
+fn prepare_failed_mount_lock_preflight(
+    sandbox: &Path,
+    compose_stack: Option<&DockerComposeStack>,
+    detail: String,
+) -> Result<PreparedPreflight, RunnerError> {
+    if let Some(stack) = compose_stack {
+        stack.prepare_artifacts()?;
+    } else {
+        write_pretty_json(
+            &sandbox.join("ports.json"),
+            &serde_json::json!({ "ports": [] }),
+        )?;
+    }
+    Ok(PreparedPreflight {
+        report: PreflightReport {
+            status: RunStatus::PreflightFailed,
+            checks: vec![PreflightCheckReport {
+                name: "default Windows mounted E2E run lock".to_string(),
+                status: RunStatus::PreflightFailed,
+                detail,
+            }],
+        },
+        compose_start_attempted: false,
+    })
+}
+
 fn preflight_check_report(check: InfraCheck) -> PreflightCheckReport {
     PreflightCheckReport {
         name: check.name,
@@ -588,6 +654,61 @@ fn collect_compose_cleanup(
             cleanup_actions.push("docker compose down --volumes --remove-orphans".to_string());
         }
         Err(err) => cleanup_errors.push(format!("docker compose down: {err}")),
+    }
+}
+
+#[derive(Debug)]
+struct DefaultMountLock {
+    path: PathBuf,
+}
+
+impl Drop for DefaultMountLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn requires_default_windows_mount_lock(infra: InfraMode, selected_platform: &str) -> bool {
+    infra == InfraMode::Compose && selected_platform == "windows-winfsp"
+}
+
+fn default_mount_lock_dir() -> PathBuf {
+    std::env::temp_dir().join("studiofs-e2e")
+}
+
+fn acquire_default_mount_lock(
+    lock_dir: &Path,
+    run_id: &str,
+) -> Result<DefaultMountLock, std::io::Error> {
+    fs::create_dir_all(lock_dir)?;
+    let path = lock_dir.join("default-windows-mount-points.lock");
+    let holder = serde_json::json!({
+        "runner": RUNNER_CRATE,
+        "scope": "default-windows-mount-points",
+        "run_id": run_id,
+        "pid": std::process::id(),
+        "created_at": timestamp(),
+    });
+    let payload = serde_json::to_vec_pretty(&holder).map_err(std::io::Error::other)?;
+    match OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(mut file) => {
+            file.write_all(&payload)?;
+            file.sync_all()?;
+            Ok(DefaultMountLock { path })
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            let holder = fs::read_to_string(&path).unwrap_or_else(|read_err| {
+                format!("<failed to read existing lock holder: {read_err}>")
+            });
+            Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "default Windows mounted E2E run lock is already held at {}; current run {run_id} cannot safely reuse default drive-letter mount points; holder: {holder}",
+                    path.display()
+                ),
+            ))
+        }
+        Err(err) => Err(err),
     }
 }
 
@@ -1501,7 +1622,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let executor = RecordingExecutor::default();
 
-        let outcome = run_with_executor(
+        let outcome = run_with_executor_and_mount_lock_dir(
             RunRequest {
                 root: temp.path().join("e2e-runs"),
                 run_id: Some("compose-runner-run".to_string()),
@@ -1516,6 +1637,7 @@ mod tests {
                 infra: InfraMode::Compose,
             },
             &executor,
+            &temp.path().join("mount-locks"),
         )
         .unwrap();
 
@@ -1583,7 +1705,7 @@ mod tests {
             ..RecordingExecutor::default()
         };
 
-        let err = run_with_executor(
+        let err = run_with_executor_and_mount_lock_dir(
             RunRequest {
                 root,
                 run_id: Some(run_id.to_string()),
@@ -1598,6 +1720,7 @@ mod tests {
                 infra: InfraMode::Compose,
             },
             &executor,
+            &temp.path().join("mount-locks"),
         )
         .unwrap_err();
 
@@ -1614,6 +1737,65 @@ mod tests {
                 .any(|call| call.args.contains(&"down".to_string())),
             "compose stack should be torn down after post-start runner errors"
         );
+    }
+
+    #[test]
+    fn default_mount_lock_reports_existing_holder_before_parallel_windows_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let lock_dir = temp.path().join("locks");
+
+        let first = acquire_default_mount_lock(&lock_dir, "first-run").unwrap();
+        let err = acquire_default_mount_lock(&lock_dir, "second-run").unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("default Windows mounted E2E run lock is already held"));
+        assert!(message.contains("first-run"));
+        assert!(message.contains("second-run"));
+        assert!(message.contains(&lock_dir.display().to_string()));
+
+        drop(first);
+        let second = acquire_default_mount_lock(&lock_dir, "second-run").unwrap();
+        drop(second);
+    }
+
+    #[test]
+    fn windows_compose_run_fails_preflight_when_default_mount_lock_is_held() {
+        let temp = tempfile::tempdir().unwrap();
+        let lock_dir = temp.path().join("locks");
+        let _held = acquire_default_mount_lock(&lock_dir, "first-run").unwrap();
+        let executor = RecordingExecutor::default();
+
+        let outcome = run_with_executor_and_mount_lock_dir(
+            RunRequest {
+                root: temp.path().join("e2e-runs"),
+                run_id: Some("second-run".to_string()),
+                scenarios: vec![scenario::TEST_PASSING.to_string()],
+                seed: 364,
+                studiofs_bin: None,
+                platform: PlatformSelection::WindowsWinfsp,
+                retention: RetentionPolicy::Always,
+                report: None,
+                port_range: Some("33300-33310".to_string()),
+                timeout: None,
+                infra: InfraMode::Compose,
+            },
+            &executor,
+            &lock_dir,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.status, RunStatus::PreflightFailed);
+        assert_eq!(outcome.exit_code, 2);
+        assert!(executor.calls.borrow().is_empty());
+
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(outcome.report_path).unwrap()).unwrap();
+        assert_eq!(report["preflight"]["status"], "preflight_failed");
+        let check = &report["preflight"]["checks"][0];
+        assert_eq!(check["name"], "default Windows mounted E2E run lock");
+        assert_eq!(check["status"], "preflight_failed");
+        assert!(check["detail"].as_str().unwrap().contains("first-run"));
+        assert!(check["detail"].as_str().unwrap().contains("second-run"));
     }
 
     #[derive(Default)]
