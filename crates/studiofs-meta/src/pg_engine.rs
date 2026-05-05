@@ -5503,6 +5503,20 @@ mod tests {
             pg.lookup(ROOT_INO, b"append-race.txt").is_err(),
             "winning foreign unlink must not leave a private dentry on the appending peer"
         );
+        let local_attr = pg
+            .get_attr(file.ino)
+            .expect("local append inode remains available by handle/inode");
+        assert_eq!(
+            local_attr.upload_state,
+            UploadState::Ready,
+            "accepted local payload should be sealed even though the namespace entry lost"
+        );
+        assert_eq!(
+            lookup_first_object_id(&pg, file.ino)
+                .expect("get local payload after foreign unlink")
+                .expect("local accepted payload remains attached to the orphaned inode"),
+            77_302
+        );
 
         publish_local_events_to_base(&pg);
         assert!(
@@ -9228,6 +9242,20 @@ mod tests {
             a.lookup(ROOT_INO, b"uploading.bin").is_err()
                 && b.lookup(ROOT_INO, b"uploading.bin").is_err()
         }));
+        let local_attr = a
+            .get_attr(file.ino)
+            .expect("get local attr after peer unlink");
+        assert_eq!(
+            local_attr.upload_state,
+            UploadState::Ready,
+            "peer unlink should seal the accepted local payload while removing the namespace entry"
+        );
+        assert_eq!(
+            lookup_first_object_id(&a, file.ino)
+                .expect("get local payload after peer unlink")
+                .expect("writer keeps local accepted payload by inode after peer unlink"),
+            777
+        );
 
         drop(a);
         let reopened = reopen_pg_engine_with_retry(&db_a);
