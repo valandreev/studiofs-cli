@@ -27,19 +27,56 @@ pub(crate) fn redact_secret(value: &str) -> &str {
 
 fn redact_keyword_postgres_dsn(dsn: &str) -> String {
     let mut redacted = Vec::new();
-    for part in dsn.split_whitespace() {
+    for part in split_keyword_dsn_parts(dsn) {
         let Some((key, _)) = part.split_once('=') else {
-            redacted.push(part.to_string());
+            redacted.push(part);
             continue;
         };
 
         if matches!(key.to_ascii_lowercase().as_str(), "password" | "user") {
             redacted.push(format!("{key}={REDACTED}"));
         } else {
-            redacted.push(part.to_string());
+            redacted.push(part);
         }
     }
     redacted.join(" ")
+}
+
+fn split_keyword_dsn_parts(dsn: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut in_single_quote = false;
+    let mut escaped = false;
+
+    for ch in dsn.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        if in_single_quote && ch == '\\' {
+            current.push(ch);
+            escaped = true;
+            continue;
+        }
+        if ch == '\'' {
+            in_single_quote = !in_single_quote;
+            current.push(ch);
+            continue;
+        }
+        if ch.is_whitespace() && !in_single_quote {
+            if !current.is_empty() {
+                parts.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        current.push(ch);
+    }
+
+    if !current.is_empty() {
+        parts.push(current);
+    }
+    parts
 }
 
 #[cfg(test)]
@@ -69,6 +106,30 @@ mod tests {
             redacted,
             "host=db.example.test port=5432 user=<redacted> password=<redacted> dbname=studiofs"
         );
+    }
+
+    #[test]
+    fn redacts_keyword_postgres_values_without_splitting_quoted_spaces() {
+        let redacted = redact_postgres_dsn(
+            "host=db.example.test user='lab user' password='lab password' dbname='my db'",
+        );
+
+        assert_eq!(
+            redacted,
+            "host=db.example.test user=<redacted> password=<redacted> dbname='my db'"
+        );
+        assert!(!redacted.contains("lab user"));
+        assert!(!redacted.contains("lab password"));
+    }
+
+    #[test]
+    fn redacts_empty_and_partial_keyword_postgres_dsn_without_panicking() {
+        assert_eq!(redact_postgres_dsn(""), "");
+        assert_eq!(
+            redact_postgres_dsn("host=db.example.test"),
+            "host=db.example.test"
+        );
+        assert_eq!(redact_postgres_dsn("password="), "password=<redacted>");
     }
 
     #[test]
