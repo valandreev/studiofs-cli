@@ -41,8 +41,10 @@ pub const COLLISION_UNLINK_VS_APPEND: &str = "collision-unlink-vs-append";
 pub const COLLISION_OVERWRITE_VS_READ: &str = "collision-overwrite-vs-read";
 pub const COLLISION_MKDIR_RMDIR_VS_CREATE: &str = "collision-mkdir-rmdir-vs-create";
 pub const COLLISION_READDIR_STAT_DURING_MUTATION: &str = "collision-readdir-stat-during-mutation";
+pub const MOUNTED_CHAOS_CONVERGENCE: &str = "mounted-chaos-convergence";
 const SMOKE_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
 const COLLISION_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
+const CHAOS_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
 const POSTGRES_OUTAGE_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
 const RUSTFS_OUTAGE_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c", "client-d"];
 const CRASH_RESTART_CLIENT_NAMES: &[&str] = &["client-a", "client-b"];
@@ -69,6 +71,10 @@ const COLLISION_NEW_COMMITTED_PAYLOAD: &[u8] = b"new committed payload\n";
 const COLLISION_APPEND_PAYLOAD: &[u8] = b"appended payload\n";
 const COLLISION_CHILD_PAYLOAD: &[u8] = b"child\n";
 const OVERWRITE_READ_ATTEMPTS: u32 = 8;
+const CHAOS_ROUNDS: usize = 12;
+const CHAOS_READ_ATTEMPTS: u32 = 4;
+const CHAOS_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(90);
+const CHAOS_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 #[cfg(test)]
 pub(crate) const TEST_FAILING_VALIDATE: &str = "__test-failing-validate";
@@ -135,10 +141,18 @@ pub enum ScenarioError {
     InsufficientCrashRestartClients { expected: usize, actual: usize },
     #[error("namespace collision scenario requires at least {expected} clients, got {actual}")]
     InsufficientCollisionClients { expected: usize, actual: usize },
+    #[error("mounted chaos scenario requires at least {expected} clients, got {actual}")]
+    InsufficientChaosClients { expected: usize, actual: usize },
     #[error("namespace collision scenario failed: {primary}; unmount also failed: {cleanup}")]
     NamespaceCollisionUnmountAfterFailure { primary: String, cleanup: String },
+    #[error("mounted chaos scenario failed: {primary}; unmount also failed: {cleanup}")]
+    MountedChaosUnmountAfterFailure { primary: String, cleanup: String },
     #[error("namespace collision validation failed: {violations:?}")]
     NamespaceInvariantViolations {
+        violations: Vec<NamespaceInvariantViolation>,
+    },
+    #[error("mounted chaos validation failed: {violations:?}")]
+    MountedChaosInvariantViolations {
         violations: Vec<NamespaceInvariantViolation>,
     },
     #[cfg(test)]
@@ -167,6 +181,7 @@ pub fn available_scenarios() -> Vec<ScenarioDefinition> {
         NamespaceCollisionScenario::new(NamespaceCollisionKind::MkdirRmdirVsCreate).definition(),
         NamespaceCollisionScenario::new(NamespaceCollisionKind::ReaddirStatDuringMutation)
             .definition(),
+        MountedChaosConvergence.definition(),
     ]
 }
 
@@ -200,6 +215,9 @@ pub(crate) fn resolve_scenario(name: &str) -> Option<Box<dyn Scenario>> {
         COLLISION_READDIR_STAT_DURING_MUTATION | "readdir-stat-during-mutation" => Some(Box::new(
             NamespaceCollisionScenario::new(NamespaceCollisionKind::ReaddirStatDuringMutation),
         )),
+        MOUNTED_CHAOS_CONVERGENCE | "mounted-chaos" | "chaos" => {
+            Some(Box::new(MountedChaosConvergence))
+        }
         #[cfg(test)]
         TEST_FAILING_VALIDATE => Some(Box::new(TestFailingScenario {
             cleanup_fails: false,
@@ -1567,6 +1585,1088 @@ fn write_crash_restart_operation(
         append_shared_record(&mut writer, &record)?;
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MountedChaosConvergence;
+
+impl Scenario for MountedChaosConvergence {
+    fn definition(&self) -> ScenarioDefinition {
+        ScenarioDefinition {
+            name: MOUNTED_CHAOS_CONVERGENCE,
+            description: "seeded mounted multi-client chaos convergence scenario",
+            requires_studiofs_bin: true,
+        }
+    }
+
+    fn setup(&self, context: &ScenarioContext) -> Result<(), ScenarioError> {
+        fs::create_dir_all(&context.scenario_dir)?;
+        Ok(())
+    }
+
+    fn run(&self, context: &ScenarioContext) -> Result<(), ScenarioError> {
+        if let Some(config) = &context.client_controller_config {
+            let mut driver = RealMountedChaosDriver(MultiClientController::new(
+                config.clone(),
+                SystemClientProcessExecutor,
+            ));
+            run_mounted_chaos_with_driver(
+                context,
+                &mut driver,
+                CHAOS_CONVERGENCE_TIMEOUT,
+                CHAOS_CONVERGENCE_POLL_INTERVAL,
+            )?;
+        } else {
+            write_mounted_chaos_plan_artifacts(context)?;
+        }
+        Ok(())
+    }
+
+    fn validate(&self, context: &ScenarioContext) -> Result<Vec<String>, ScenarioError> {
+        let summary_path = context.scenario_dir.join("mounted-chaos-summary.json");
+        if !summary_path.exists() {
+            return Err(ScenarioError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("missing summary artifact: {}", summary_path.display()),
+            )));
+        }
+        let summary: MountedChaosSummary = serde_json::from_slice(&fs::read(&summary_path)?)?;
+        let validation = json!({
+            "scenario": MOUNTED_CHAOS_CONVERGENCE,
+            "run_id": context.run_id,
+            "seed": context.seed,
+            "status": if summary.final_validator.converged
+                && summary.namespace_violations.is_empty() { "passed" } else { "failed" },
+            "rounds": summary.rounds,
+            "accepted_operations": summary.accepted_operations,
+            "rejected_operations": summary.rejected_operations,
+            "final_validator": summary.final_validator,
+            "namespace_violations": summary.namespace_violations,
+            "operation_log": summary.operation_log,
+        });
+        fs::write(
+            context.scenario_dir.join("validation.json"),
+            serde_json::to_vec_pretty(&validation)?,
+        )?;
+        Ok(vec![
+            format!("artifacts/scenarios/{MOUNTED_CHAOS_CONVERGENCE}/mounted-chaos-summary.json"),
+            format!("artifacts/scenarios/{MOUNTED_CHAOS_CONVERGENCE}/validation.json"),
+        ])
+    }
+
+    fn cleanup(&self, _context: &ScenarioContext) -> Result<(), ScenarioError> {
+        Ok(())
+    }
+}
+
+trait MountedChaosDriver {
+    fn bootstrap_volume(
+        &mut self,
+        options: VolumeBootstrapOptions,
+    ) -> Result<VolumeBootstrapSummary, ScenarioError>;
+    fn mount_all(&mut self) -> Result<(), ScenarioError>;
+    fn clients(&self) -> Vec<ClientSpec>;
+    fn after_initial_tree(&mut self, _clients: &[ClientSpec]) -> Result<(), ScenarioError> {
+        Ok(())
+    }
+    fn after_round(&mut self, _round: usize, _clients: &[ClientSpec]) -> Result<(), ScenarioError> {
+        Ok(())
+    }
+    fn unmount_all(&mut self) -> Result<(), ScenarioError>;
+}
+
+struct RealMountedChaosDriver(MultiClientController<SystemClientProcessExecutor>);
+
+impl MountedChaosDriver for RealMountedChaosDriver {
+    fn bootstrap_volume(
+        &mut self,
+        options: VolumeBootstrapOptions,
+    ) -> Result<VolumeBootstrapSummary, ScenarioError> {
+        Ok(self.0.bootstrap_volume(options)?)
+    }
+
+    fn mount_all(&mut self) -> Result<(), ScenarioError> {
+        Ok(self.0.mount_all()?)
+    }
+
+    fn clients(&self) -> Vec<ClientSpec> {
+        self.0.clients().into_iter().cloned().collect()
+    }
+
+    fn unmount_all(&mut self) -> Result<(), ScenarioError> {
+        Ok(self.0.unmount_all()?)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct MountedChaosOperation {
+    round: usize,
+    order: usize,
+    client: String,
+    operation: String,
+    path: String,
+    shared_operation: SharedOperation,
+    result: String,
+    timestamp_ms: u64,
+    error: Option<String>,
+}
+
+type MountedChaosAction = Box<dyn FnOnce(&ClientSpec) -> io::Result<()> + Send + 'static>;
+
+struct MountedChaosTask {
+    round: usize,
+    order: usize,
+    client: ClientSpec,
+    operation: &'static str,
+    path: String,
+    shared_operation: SharedOperation,
+    action: MountedChaosAction,
+}
+
+impl MountedChaosTask {
+    fn new(
+        round: usize,
+        order: usize,
+        client: ClientSpec,
+        operation: &'static str,
+        path: impl Into<String>,
+        shared_operation: SharedOperation,
+        action: impl FnOnce(&ClientSpec) -> io::Result<()> + Send + 'static,
+    ) -> Self {
+        Self {
+            round,
+            order,
+            client,
+            operation,
+            path: path.into(),
+            shared_operation,
+            action: Box::new(action),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct MountedChaosSummary {
+    scenario: String,
+    seed: u64,
+    bootstrap: Option<VolumeBootstrapSummary>,
+    clients: usize,
+    rounds: usize,
+    operations: Vec<MountedChaosOperation>,
+    accepted_operations: usize,
+    rejected_operations: usize,
+    operation_log: String,
+    final_validator: TreeComparison,
+    namespace_violations: Vec<NamespaceInvariantViolation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChaosFamily {
+    RenameVsRename,
+    RenameVsUnlink,
+    UnlinkVsAppend,
+    OverwriteVsRead,
+    MkdirRmdirVsCreate,
+    ReaddirStatDuringMutation,
+}
+
+impl ChaosFamily {
+    fn for_round(seed: u64, round: usize) -> Self {
+        match (round + seed as usize) % 6 {
+            0 => Self::RenameVsRename,
+            1 => Self::RenameVsUnlink,
+            2 => Self::UnlinkVsAppend,
+            3 => Self::OverwriteVsRead,
+            4 => Self::MkdirRmdirVsCreate,
+            _ => Self::ReaddirStatDuringMutation,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ChaosRng {
+    state: u64,
+}
+
+impl ChaosRng {
+    fn new(seed: u64) -> Self {
+        let state = seed ^ 0x9e37_79b9_7f4a_7c15;
+        Self {
+            state: if state == 0 {
+                0xa5a5_5a5a_d3c1_b2a0
+            } else {
+                state
+            },
+        }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.state = x;
+        x
+    }
+
+    fn next_usize(&mut self, upper: usize) -> usize {
+        if upper == 0 {
+            0
+        } else {
+            (self.next_u64() as usize) % upper
+        }
+    }
+}
+
+fn run_mounted_chaos_with_driver(
+    context: &ScenarioContext,
+    driver: &mut dyn MountedChaosDriver,
+    convergence_timeout: Duration,
+    poll_interval: Duration,
+) -> Result<MountedChaosSummary, ScenarioError> {
+    let result = run_mounted_chaos_body(context, driver, convergence_timeout, poll_interval);
+    let unmount_result = driver.unmount_all();
+    match (result, unmount_result) {
+        (Ok(summary), Ok(())) => Ok(summary),
+        (Err(primary), Err(cleanup)) => Err(ScenarioError::MountedChaosUnmountAfterFailure {
+            primary: primary.to_string(),
+            cleanup: cleanup.to_string(),
+        }),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+fn run_mounted_chaos_body(
+    context: &ScenarioContext,
+    driver: &mut dyn MountedChaosDriver,
+    convergence_timeout: Duration,
+    poll_interval: Duration,
+) -> Result<MountedChaosSummary, ScenarioError> {
+    let bootstrap = driver.bootstrap_volume(VolumeBootstrapOptions {
+        client_names: CHAOS_CLIENT_NAMES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect(),
+        clean_existing_local_metadata: true,
+    })?;
+    write_bootstrap_summary(context, &bootstrap)?;
+    driver.mount_all()?;
+    let clients = driver.clients();
+    if clients.len() < CHAOS_CLIENT_NAMES.len() {
+        return Err(ScenarioError::InsufficientChaosClients {
+            expected: CHAOS_CLIENT_NAMES.len(),
+            actual: clients.len(),
+        });
+    }
+    let clients = clients
+        .into_iter()
+        .take(CHAOS_CLIENT_NAMES.len())
+        .collect::<Vec<_>>();
+
+    establish_mounted_chaos_initial_tree(context.seed, &clients[0])?;
+    driver.after_initial_tree(&clients)?;
+    let mounts = client_mounts(&clients);
+    wait_for_convergence(
+        &mounts,
+        context.scenario_dir.join("initial-validation"),
+        convergence_timeout,
+        poll_interval,
+    )?;
+
+    let started = Instant::now();
+    let mut operations = Vec::new();
+    for round in 0..CHAOS_ROUNDS {
+        let mut round_operations =
+            perform_mounted_chaos_round(context.seed, started, round, &clients);
+        write_mounted_chaos_operations(context, &round_operations)?;
+        operations.append(&mut round_operations);
+        driver.after_round(round, &clients)?;
+    }
+
+    finish_mounted_chaos(
+        context,
+        Some(bootstrap),
+        clients,
+        operations,
+        convergence_timeout,
+        poll_interval,
+    )
+}
+
+fn establish_mounted_chaos_initial_tree(
+    seed: u64,
+    client: &ClientSpec,
+) -> Result<(), ScenarioError> {
+    let root = client.mount_point.join("chaos");
+    fs::create_dir_all(&root)?;
+    for round in 0..CHAOS_ROUNDS {
+        fs::write(
+            root.join(format!("race-{round:02}.txt")),
+            chaos_payload(seed, round, "race-initial"),
+        )?;
+        fs::write(
+            root.join(format!("data-{round:02}.txt")),
+            chaos_payload(seed, round, "data-initial"),
+        )?;
+        fs::create_dir_all(root.join(format!("tree-{round:02}")))?;
+        let scan_dir = root.join(format!("scan-{round:02}"));
+        fs::create_dir_all(&scan_dir)?;
+        fs::write(scan_dir.join("a.txt"), chaos_payload(seed, round, "scan-a"))?;
+        fs::write(scan_dir.join("b.txt"), chaos_payload(seed, round, "scan-b"))?;
+    }
+    Ok(())
+}
+
+fn perform_mounted_chaos_round(
+    seed: u64,
+    started: Instant,
+    round: usize,
+    clients: &[ClientSpec],
+) -> Vec<MountedChaosOperation> {
+    let shuffled = shuffled_clients(seed, round, clients);
+    let tasks = mounted_chaos_tasks(seed, round, &shuffled);
+    run_concurrent_mounted_chaos_operations(started, tasks)
+}
+
+fn shuffled_clients(seed: u64, round: usize, clients: &[ClientSpec]) -> Vec<ClientSpec> {
+    let round_mix = (round as u64 + 1).wrapping_mul(0x517c_c1b7_2722_0a95);
+    let mut rng = ChaosRng::new(seed ^ round_mix);
+    let mut shuffled = clients.to_vec();
+    for index in (1..shuffled.len()).rev() {
+        let swap = rng.next_usize(index + 1);
+        shuffled.swap(index, swap);
+    }
+    shuffled
+}
+
+fn mounted_chaos_tasks(seed: u64, round: usize, clients: &[ClientSpec]) -> Vec<MountedChaosTask> {
+    let c0 = clients[0].clone();
+    let c1 = clients[1].clone();
+    let c2 = clients[2].clone();
+    match ChaosFamily::for_round(seed, round) {
+        ChaosFamily::RenameVsRename => {
+            let source = format!("chaos/race-{round:02}.txt");
+            let dest_a = format!("chaos/race-{round:02}-{}.txt", c0.name);
+            let dest_b = format!("chaos/race-{round:02}-{}.txt", c1.name);
+            vec![
+                rename_task(round, 1, c0, source.clone(), dest_a),
+                rename_task(round, 2, c1, source.clone(), dest_b),
+                stat_task(round, 3, c2, source),
+            ]
+        }
+        ChaosFamily::RenameVsUnlink => {
+            let source = format!("chaos/race-{round:02}.txt");
+            let dest = format!("chaos/race-{round:02}-renamed.txt");
+            vec![
+                rename_task(round, 1, c0, source.clone(), dest),
+                unlink_task(round, 2, c1, source.clone()),
+                stat_task(round, 3, c2, source),
+            ]
+        }
+        ChaosFamily::UnlinkVsAppend => {
+            let path = format!("chaos/data-{round:02}.txt");
+            vec![
+                unlink_task(round, 1, c0, path.clone()),
+                append_task(seed, round, 2, c1, path.clone()),
+                read_task(round, 3, c2, path),
+            ]
+        }
+        ChaosFamily::OverwriteVsRead => {
+            let path = format!("chaos/data-{round:02}.txt");
+            vec![
+                read_loop_task(round, 1, c0, path.clone()),
+                write_task(seed, round, 2, c1, path.clone()),
+                read_loop_task(round, 3, c2, path),
+            ]
+        }
+        ChaosFamily::MkdirRmdirVsCreate => {
+            let dir = format!("chaos/tree-{round:02}");
+            let subdir = format!("{dir}/subdir");
+            let child = format!("{dir}/child.txt");
+            vec![
+                mkdir_task(round, 1, c0, subdir),
+                create_file_task(seed, round, 2, c1, child),
+                rmdir_task(round, 3, c2, dir),
+            ]
+        }
+        ChaosFamily::ReaddirStatDuringMutation => {
+            let dir = format!("chaos/scan-{round:02}");
+            let source = format!("{dir}/a.txt");
+            let dest = format!("{dir}/c.txt");
+            let stat = format!("{dir}/b.txt");
+            vec![
+                readdir_task(round, 1, c0, dir),
+                rename_task(round, 2, c1, source, dest),
+                stat_task(round, 3, c2, stat),
+            ]
+        }
+    }
+}
+
+fn rename_task(
+    round: usize,
+    order: usize,
+    client: ClientSpec,
+    from: String,
+    to: String,
+) -> MountedChaosTask {
+    let path = format!("{from} -> {to}");
+    let from_for_action = from.clone();
+    let to_for_action = to.clone();
+    MountedChaosTask::new(
+        round,
+        order,
+        client,
+        "rename",
+        path,
+        SharedOperation::Rename { from, to },
+        move |client| {
+            fs::rename(
+                client.mount_point.join(&from_for_action),
+                client.mount_point.join(&to_for_action),
+            )
+        },
+    )
+}
+
+fn unlink_task(round: usize, order: usize, client: ClientSpec, path: String) -> MountedChaosTask {
+    let path_for_action = path.clone();
+    MountedChaosTask::new(
+        round,
+        order,
+        client,
+        "unlink",
+        path.clone(),
+        SharedOperation::Unlink { path },
+        move |client| fs::remove_file(client.mount_point.join(path_for_action)),
+    )
+}
+
+fn append_task(
+    seed: u64,
+    round: usize,
+    order: usize,
+    client: ClientSpec,
+    path: String,
+) -> MountedChaosTask {
+    let payload = chaos_payload(seed, round, "append");
+    let bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+    let path_for_action = path.clone();
+    MountedChaosTask::new(
+        round,
+        order,
+        client,
+        "append",
+        path.clone(),
+        SharedOperation::Append {
+            path,
+            bytes,
+            checksum_sha256: Some(bytes_sha256(&payload)),
+        },
+        move |client| {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(client.mount_point.join(path_for_action))?;
+            file.write_all(&payload)
+        },
+    )
+}
+
+fn write_task(
+    seed: u64,
+    round: usize,
+    order: usize,
+    client: ClientSpec,
+    path: String,
+) -> MountedChaosTask {
+    let payload = chaos_payload(seed, round, "overwrite");
+    let bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+    let path_for_action = path.clone();
+    MountedChaosTask::new(
+        round,
+        order,
+        client,
+        "write",
+        path.clone(),
+        SharedOperation::Write {
+            path,
+            offset: Some(0),
+            bytes,
+            checksum_sha256: Some(bytes_sha256(&payload)),
+        },
+        move |client| fs::write(client.mount_point.join(path_for_action), payload),
+    )
+}
+
+fn create_file_task(
+    seed: u64,
+    round: usize,
+    order: usize,
+    client: ClientSpec,
+    path: String,
+) -> MountedChaosTask {
+    let payload = chaos_payload(seed, round, "create");
+    let bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+    let path_for_action = path.clone();
+    MountedChaosTask::new(
+        round,
+        order,
+        client,
+        "create",
+        path.clone(),
+        SharedOperation::CreateFile {
+            path,
+            bytes: Some(bytes),
+        },
+        move |client| fs::write(client.mount_point.join(path_for_action), payload),
+    )
+}
+
+fn mkdir_task(round: usize, order: usize, client: ClientSpec, path: String) -> MountedChaosTask {
+    let path_for_action = path.clone();
+    MountedChaosTask::new(
+        round,
+        order,
+        client,
+        "mkdir",
+        path.clone(),
+        SharedOperation::CreateDirectory { path },
+        move |client| fs::create_dir_all(client.mount_point.join(path_for_action)),
+    )
+}
+
+fn rmdir_task(round: usize, order: usize, client: ClientSpec, path: String) -> MountedChaosTask {
+    let path_for_action = path.clone();
+    MountedChaosTask::new(
+        round,
+        order,
+        client,
+        "rmdir",
+        path.clone(),
+        SharedOperation::Rmdir { path },
+        move |client| fs::remove_dir(client.mount_point.join(path_for_action)),
+    )
+}
+
+fn read_task(round: usize, order: usize, client: ClientSpec, path: String) -> MountedChaosTask {
+    let path_for_action = path.clone();
+    MountedChaosTask::new(
+        round,
+        order,
+        client,
+        "read",
+        path.clone(),
+        SharedOperation::Read {
+            path,
+            bytes: None,
+            checksum_sha256: None,
+        },
+        move |client| fs::read(client.mount_point.join(path_for_action)).map(|_| ()),
+    )
+}
+
+fn read_loop_task(
+    round: usize,
+    order: usize,
+    client: ClientSpec,
+    path: String,
+) -> MountedChaosTask {
+    let path_for_action = path.clone();
+    MountedChaosTask::new(
+        round,
+        order,
+        client,
+        "read_loop",
+        path.clone(),
+        SharedOperation::Read {
+            path,
+            bytes: None,
+            checksum_sha256: None,
+        },
+        move |client| repeated_chaos_read(client, &path_for_action),
+    )
+}
+
+fn stat_task(round: usize, order: usize, client: ClientSpec, path: String) -> MountedChaosTask {
+    let path_for_action = path.clone();
+    MountedChaosTask::new(
+        round,
+        order,
+        client,
+        "stat",
+        path.clone(),
+        SharedOperation::Stat { path },
+        move |client| fs::metadata(client.mount_point.join(path_for_action)).map(|_| ()),
+    )
+}
+
+fn readdir_task(round: usize, order: usize, client: ClientSpec, path: String) -> MountedChaosTask {
+    let path_for_action = path.clone();
+    MountedChaosTask::new(
+        round,
+        order,
+        client,
+        "readdir",
+        path.clone(),
+        SharedOperation::Readdir { path },
+        move |client| fs::read_dir(client.mount_point.join(path_for_action)).map(|_| ()),
+    )
+}
+
+fn run_concurrent_mounted_chaos_operations(
+    started: Instant,
+    tasks: Vec<MountedChaosTask>,
+) -> Vec<MountedChaosOperation> {
+    let barrier = Arc::new(Barrier::new(tasks.len()));
+    let mut handles = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        let barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            record_chaos_fs_operation(started, task)
+        }));
+    }
+
+    let mut operations = handles
+        .into_iter()
+        .map(|handle| {
+            handle
+                .join()
+                .expect("mounted chaos worker thread should not panic")
+        })
+        .collect::<Vec<_>>();
+    operations.sort_by_key(|operation| (operation.round, operation.order));
+    operations
+}
+
+fn record_chaos_fs_operation(started: Instant, task: MountedChaosTask) -> MountedChaosOperation {
+    match (task.action)(&task.client) {
+        Ok(()) => MountedChaosOperation {
+            round: task.round,
+            order: task.order,
+            client: task.client.name,
+            operation: task.operation.to_string(),
+            path: task.path,
+            shared_operation: task.shared_operation,
+            result: "accepted".to_string(),
+            timestamp_ms: elapsed_millis_u64(started),
+            error: None,
+        },
+        Err(error) => MountedChaosOperation {
+            round: task.round,
+            order: task.order,
+            client: task.client.name,
+            operation: task.operation.to_string(),
+            path: task.path,
+            shared_operation: task.shared_operation,
+            result: "rejected".to_string(),
+            timestamp_ms: elapsed_millis_u64(started),
+            error: Some(error.to_string()),
+        },
+    }
+}
+
+fn repeated_chaos_read(client: &ClientSpec, relative_path: &str) -> io::Result<()> {
+    for _ in 0..CHAOS_READ_ATTEMPTS {
+        fs::read(client.mount_point.join(relative_path))?;
+        thread::sleep(Duration::from_millis(5));
+    }
+    Ok(())
+}
+
+fn write_mounted_chaos_plan_artifacts(
+    context: &ScenarioContext,
+) -> Result<MountedChaosSummary, ScenarioError> {
+    fs::create_dir_all(&context.scenario_dir)?;
+    let started = Instant::now();
+    let mut operations = Vec::new();
+    for round in 0..CHAOS_ROUNDS {
+        let mut round_operations = planned_mounted_chaos_round(context.seed, started, round);
+        write_mounted_chaos_operations(context, &round_operations)?;
+        operations.append(&mut round_operations);
+    }
+    let summary = mounted_chaos_summary(
+        context,
+        None,
+        CHAOS_CLIENT_NAMES.len(),
+        operations,
+        TreeComparison {
+            converged: true,
+            reference_client: Some(CHAOS_CLIENT_NAMES[0].to_string()),
+            compared_clients: CHAOS_CLIENT_NAMES
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
+            differences: Vec::new(),
+        },
+        Vec::new(),
+    );
+    write_mounted_chaos_summary(context, &summary)?;
+    Ok(summary)
+}
+
+fn planned_mounted_chaos_round(
+    seed: u64,
+    started: Instant,
+    round: usize,
+) -> Vec<MountedChaosOperation> {
+    let clients = shuffled_client_names(seed, round);
+    let spec = planned_mounted_chaos_spec(seed, round, &clients);
+    spec.into_iter()
+        .enumerate()
+        .map(
+            |(index, (client, operation, path, shared_operation))| MountedChaosOperation {
+                round,
+                order: index + 1,
+                client,
+                operation: operation.to_string(),
+                path,
+                shared_operation,
+                result: "planned".to_string(),
+                timestamp_ms: elapsed_millis_u64(started),
+                error: None,
+            },
+        )
+        .collect()
+}
+
+fn shuffled_client_names(seed: u64, round: usize) -> Vec<String> {
+    let mut names = CHAOS_CLIENT_NAMES
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect::<Vec<_>>();
+    let round_mix = (round as u64 + 1).wrapping_mul(0x517c_c1b7_2722_0a95);
+    let mut rng = ChaosRng::new(seed ^ round_mix);
+    for index in (1..names.len()).rev() {
+        let swap = rng.next_usize(index + 1);
+        names.swap(index, swap);
+    }
+    names
+}
+
+fn planned_mounted_chaos_spec(
+    seed: u64,
+    round: usize,
+    clients: &[String],
+) -> Vec<(String, &'static str, String, SharedOperation)> {
+    match ChaosFamily::for_round(seed, round) {
+        ChaosFamily::RenameVsRename => {
+            let source = format!("chaos/race-{round:02}.txt");
+            let dest_a = format!("chaos/race-{round:02}-{}.txt", clients[0]);
+            let dest_b = format!("chaos/race-{round:02}-{}.txt", clients[1]);
+            vec![
+                (
+                    clients[0].clone(),
+                    "rename",
+                    format!("{source} -> {dest_a}"),
+                    SharedOperation::Rename {
+                        from: source.clone(),
+                        to: dest_a,
+                    },
+                ),
+                (
+                    clients[1].clone(),
+                    "rename",
+                    format!("{source} -> {dest_b}"),
+                    SharedOperation::Rename {
+                        from: source.clone(),
+                        to: dest_b,
+                    },
+                ),
+                (
+                    clients[2].clone(),
+                    "stat",
+                    source.clone(),
+                    SharedOperation::Stat { path: source },
+                ),
+            ]
+        }
+        ChaosFamily::RenameVsUnlink => {
+            let source = format!("chaos/race-{round:02}.txt");
+            let dest = format!("chaos/race-{round:02}-renamed.txt");
+            vec![
+                (
+                    clients[0].clone(),
+                    "rename",
+                    format!("{source} -> {dest}"),
+                    SharedOperation::Rename {
+                        from: source.clone(),
+                        to: dest,
+                    },
+                ),
+                (
+                    clients[1].clone(),
+                    "unlink",
+                    source.clone(),
+                    SharedOperation::Unlink {
+                        path: source.clone(),
+                    },
+                ),
+                (
+                    clients[2].clone(),
+                    "stat",
+                    source.clone(),
+                    SharedOperation::Stat { path: source },
+                ),
+            ]
+        }
+        ChaosFamily::UnlinkVsAppend => {
+            let path = format!("chaos/data-{round:02}.txt");
+            let append_payload = chaos_payload(seed, round, "append");
+            vec![
+                (
+                    clients[0].clone(),
+                    "unlink",
+                    path.clone(),
+                    SharedOperation::Unlink { path: path.clone() },
+                ),
+                (
+                    clients[1].clone(),
+                    "append",
+                    path.clone(),
+                    SharedOperation::Append {
+                        path: path.clone(),
+                        bytes: u64::try_from(append_payload.len()).unwrap_or(u64::MAX),
+                        checksum_sha256: Some(bytes_sha256(&append_payload)),
+                    },
+                ),
+                (
+                    clients[2].clone(),
+                    "read",
+                    path.clone(),
+                    SharedOperation::Read {
+                        path,
+                        bytes: None,
+                        checksum_sha256: None,
+                    },
+                ),
+            ]
+        }
+        ChaosFamily::OverwriteVsRead => {
+            let path = format!("chaos/data-{round:02}.txt");
+            let overwrite_payload = chaos_payload(seed, round, "overwrite");
+            vec![
+                (
+                    clients[0].clone(),
+                    "read_loop",
+                    path.clone(),
+                    SharedOperation::Read {
+                        path: path.clone(),
+                        bytes: None,
+                        checksum_sha256: None,
+                    },
+                ),
+                (
+                    clients[1].clone(),
+                    "write",
+                    path.clone(),
+                    SharedOperation::Write {
+                        path: path.clone(),
+                        offset: Some(0),
+                        bytes: u64::try_from(overwrite_payload.len()).unwrap_or(u64::MAX),
+                        checksum_sha256: Some(bytes_sha256(&overwrite_payload)),
+                    },
+                ),
+                (
+                    clients[2].clone(),
+                    "read_loop",
+                    path.clone(),
+                    SharedOperation::Read {
+                        path,
+                        bytes: None,
+                        checksum_sha256: None,
+                    },
+                ),
+            ]
+        }
+        ChaosFamily::MkdirRmdirVsCreate => {
+            let dir = format!("chaos/tree-{round:02}");
+            let subdir = format!("{dir}/subdir");
+            let child = format!("{dir}/child.txt");
+            let payload = chaos_payload(seed, round, "create");
+            vec![
+                (
+                    clients[0].clone(),
+                    "mkdir",
+                    subdir.clone(),
+                    SharedOperation::CreateDirectory { path: subdir },
+                ),
+                (
+                    clients[1].clone(),
+                    "create",
+                    child.clone(),
+                    SharedOperation::CreateFile {
+                        path: child,
+                        bytes: Some(u64::try_from(payload.len()).unwrap_or(u64::MAX)),
+                    },
+                ),
+                (
+                    clients[2].clone(),
+                    "rmdir",
+                    dir.clone(),
+                    SharedOperation::Rmdir { path: dir },
+                ),
+            ]
+        }
+        ChaosFamily::ReaddirStatDuringMutation => {
+            let dir = format!("chaos/scan-{round:02}");
+            let source = format!("{dir}/a.txt");
+            let dest = format!("{dir}/c.txt");
+            let stat = format!("{dir}/b.txt");
+            vec![
+                (
+                    clients[0].clone(),
+                    "readdir",
+                    dir.clone(),
+                    SharedOperation::Readdir { path: dir },
+                ),
+                (
+                    clients[1].clone(),
+                    "rename",
+                    format!("{source} -> {dest}"),
+                    SharedOperation::Rename {
+                        from: source,
+                        to: dest,
+                    },
+                ),
+                (
+                    clients[2].clone(),
+                    "stat",
+                    stat.clone(),
+                    SharedOperation::Stat { path: stat },
+                ),
+            ]
+        }
+    }
+}
+
+fn finish_mounted_chaos(
+    context: &ScenarioContext,
+    bootstrap: Option<VolumeBootstrapSummary>,
+    clients: Vec<ClientSpec>,
+    operations: Vec<MountedChaosOperation>,
+    convergence_timeout: Duration,
+    poll_interval: Duration,
+) -> Result<MountedChaosSummary, ScenarioError> {
+    let convergence = wait_for_convergence(
+        &client_mounts(&clients),
+        context.scenario_dir.join("validation"),
+        convergence_timeout,
+        poll_interval,
+    )?;
+    let mut namespace_violations = Vec::new();
+    for snapshot in &convergence.snapshots {
+        namespace_violations.extend(validate_namespace_invariants(snapshot, &[]));
+    }
+    if !namespace_violations.is_empty() {
+        return Err(ScenarioError::MountedChaosInvariantViolations {
+            violations: namespace_violations,
+        });
+    }
+    let summary = mounted_chaos_summary(
+        context,
+        bootstrap,
+        clients.len(),
+        operations,
+        convergence.comparison,
+        namespace_violations,
+    );
+    write_mounted_chaos_summary(context, &summary)?;
+    Ok(summary)
+}
+
+fn mounted_chaos_summary(
+    context: &ScenarioContext,
+    bootstrap: Option<VolumeBootstrapSummary>,
+    clients: usize,
+    operations: Vec<MountedChaosOperation>,
+    final_validator: TreeComparison,
+    namespace_violations: Vec<NamespaceInvariantViolation>,
+) -> MountedChaosSummary {
+    let accepted_operations = operations
+        .iter()
+        .filter(|operation| operation.result == "accepted")
+        .count();
+    let rejected_operations = operations
+        .iter()
+        .filter(|operation| operation.result == "rejected")
+        .count();
+    MountedChaosSummary {
+        scenario: MOUNTED_CHAOS_CONVERGENCE.to_string(),
+        seed: context.seed,
+        bootstrap,
+        clients,
+        rounds: CHAOS_ROUNDS,
+        operations,
+        accepted_operations,
+        rejected_operations,
+        operation_log: format!("artifacts/scenarios/{MOUNTED_CHAOS_CONVERGENCE}/operations.ndjson"),
+        final_validator,
+        namespace_violations,
+    }
+}
+
+fn client_mounts(clients: &[ClientSpec]) -> Vec<ClientMount> {
+    clients
+        .iter()
+        .map(|client| ClientMount::new(client.name.clone(), client.mount_point.clone()))
+        .collect()
+}
+
+fn write_mounted_chaos_operations(
+    context: &ScenarioContext,
+    operations: &[MountedChaosOperation],
+) -> Result<(), ScenarioError> {
+    let path = operation_log_path(context);
+    let mut writer = OperationLogWriter::open_append(&path)?;
+    for operation in operations {
+        let mut record = shared_operation_record(
+            &writer,
+            MOUNTED_CHAOS_CONVERGENCE,
+            operation.shared_operation.clone(),
+        )
+        .with_client(&operation.client)
+        .with_timestamp_ms(operation.timestamp_ms)
+        .with_outcome(mounted_chaos_outcome(operation))
+        .with_metadata("round", operation.round.to_string())
+        .with_metadata("operation", operation.operation.clone());
+        if operation.error.is_some() {
+            record = record.with_metadata("result", &operation.result);
+        }
+        append_shared_record(&mut writer, &record)?;
+    }
+    Ok(())
+}
+
+fn mounted_chaos_outcome(operation: &MountedChaosOperation) -> OperationOutcome {
+    match operation.result.as_str() {
+        "planned" => OperationOutcome::Planned,
+        "accepted" => OperationOutcome::Accepted,
+        "rejected" => OperationOutcome::Rejected {
+            error: operation
+                .error
+                .clone()
+                .unwrap_or_else(|| "operation rejected".to_string()),
+        },
+        _ => OperationOutcome::Observed,
+    }
+}
+
+fn write_mounted_chaos_summary(
+    context: &ScenarioContext,
+    summary: &MountedChaosSummary,
+) -> Result<(), ScenarioError> {
+    fs::write(
+        context.scenario_dir.join("mounted-chaos-summary.json"),
+        serde_json::to_vec_pretty(summary)?,
+    )?;
+    Ok(())
+}
+
+fn chaos_payload(seed: u64, round: usize, label: &str) -> Vec<u8> {
+    format!("studiofs chaos seed={seed} round={round} label={label}\n").into_bytes()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -3264,6 +4364,104 @@ mod tests {
         }
     }
 
+    struct RecordingMountedChaosDriver {
+        clients: Vec<ClientSpec>,
+        actions: RefCell<Vec<String>>,
+        unmount_error: Option<&'static str>,
+    }
+
+    impl RecordingMountedChaosDriver {
+        fn new(clients: Vec<ClientSpec>) -> Self {
+            Self {
+                clients,
+                actions: RefCell::new(Vec::new()),
+                unmount_error: None,
+            }
+        }
+
+        fn with_unmount_error(mut self, error: &'static str) -> Self {
+            self.unmount_error = Some(error);
+            self
+        }
+
+        fn replicate_from_first_client(&self) -> Result<(), ScenarioError> {
+            let source = &self.clients[0].mount_point;
+            for client in self.clients.iter().skip(1) {
+                replace_dir_contents(source, &client.mount_point)?;
+            }
+            Ok(())
+        }
+    }
+
+    impl MountedChaosDriver for RecordingMountedChaosDriver {
+        fn bootstrap_volume(
+            &mut self,
+            options: VolumeBootstrapOptions,
+        ) -> Result<VolumeBootstrapSummary, ScenarioError> {
+            self.actions.borrow_mut().push("bootstrap".to_string());
+            assert_eq!(
+                options.client_names,
+                CHAOS_CLIENT_NAMES
+                    .iter()
+                    .copied()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            );
+            Ok(VolumeBootstrapSummary {
+                volume_name: "projectfs".to_string(),
+                init_client: CHAOS_CLIENT_NAMES[0].to_string(),
+                discovered_clients: CHAOS_CLIENT_NAMES[1..]
+                    .iter()
+                    .map(|name| (*name).to_string())
+                    .collect(),
+                clients: self
+                    .clients
+                    .iter()
+                    .map(|client| crate::client::ClientBootstrapRecord {
+                        name: client.name.clone(),
+                        local_metadata_db: client.local_metadata_db.clone(),
+                        state: ClientLifecycleState::Discovered,
+                    })
+                    .collect(),
+            })
+        }
+
+        fn mount_all(&mut self) -> Result<(), ScenarioError> {
+            self.actions.borrow_mut().push("mount_all".to_string());
+            Ok(())
+        }
+
+        fn clients(&self) -> Vec<ClientSpec> {
+            self.clients.clone()
+        }
+
+        fn after_initial_tree(&mut self, _clients: &[ClientSpec]) -> Result<(), ScenarioError> {
+            self.actions
+                .borrow_mut()
+                .push("replicate_initial".to_string());
+            self.replicate_from_first_client()
+        }
+
+        fn after_round(
+            &mut self,
+            round: usize,
+            _clients: &[ClientSpec],
+        ) -> Result<(), ScenarioError> {
+            self.actions
+                .borrow_mut()
+                .push(format!("replicate_round_{round}"));
+            self.replicate_from_first_client()
+        }
+
+        fn unmount_all(&mut self) -> Result<(), ScenarioError> {
+            self.actions.borrow_mut().push("unmount_all".to_string());
+            if let Some(error) = self.unmount_error {
+                return Err(ScenarioError::Io(std::io::Error::other(error)));
+            }
+            Ok(())
+        }
+    }
+
     fn replace_dir_contents(source: &Path, destination: &Path) -> Result<(), ScenarioError> {
         if destination.exists() {
             for entry in std::fs::read_dir(destination)? {
@@ -3395,6 +4593,112 @@ mod tests {
                 .join("namespace-collision-summary.json")
                 .exists()
         );
+    }
+
+    #[test]
+    fn mounted_chaos_records_seeded_operations_and_validates_convergence() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-chaos");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(MOUNTED_CHAOS_CONVERGENCE);
+        let clients = CHAOS_CLIENT_NAMES
+            .iter()
+            .copied()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(&mount).unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let mut driver = RecordingMountedChaosDriver::new(clients);
+        let context = ScenarioContext {
+            run_id: "run-chaos".to_string(),
+            seed: 360,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+
+        let summary = run_mounted_chaos_with_driver(
+            &context,
+            &mut driver,
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+
+        assert_eq!(summary.scenario, MOUNTED_CHAOS_CONVERGENCE);
+        assert_eq!(summary.seed, 360);
+        assert_eq!(summary.rounds, CHAOS_ROUNDS);
+        assert_eq!(
+            summary.operations.len(),
+            CHAOS_ROUNDS * CHAOS_CLIENT_NAMES.len()
+        );
+        assert!(summary.accepted_operations > 0);
+        assert!(summary.final_validator.converged);
+        assert!(summary.namespace_violations.is_empty());
+        assert_eq!(
+            driver.actions.borrow().first().map(String::as_str),
+            Some("bootstrap")
+        );
+        assert!(
+            context
+                .scenario_dir
+                .join("mounted-chaos-summary.json")
+                .exists()
+        );
+
+        let operations =
+            read_operation_log(context.scenario_dir.join("operations.ndjson")).unwrap();
+        assert_eq!(operations.len(), CHAOS_ROUNDS * CHAOS_CLIENT_NAMES.len());
+        assert!(
+            operations
+                .iter()
+                .any(|record| matches!(&record.operation, SharedOperation::Rename { .. }))
+        );
+        assert!(operations.iter().any(|record| {
+            record
+                .metadata
+                .get("round")
+                .is_some_and(|round| round == "0")
+        }));
+    }
+
+    #[test]
+    fn mounted_chaos_preserves_primary_error_when_unmount_also_fails() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-chaos");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(MOUNTED_CHAOS_CONVERGENCE);
+        let mut driver =
+            RecordingMountedChaosDriver::new(Vec::new()).with_unmount_error("umount failed");
+        let context = ScenarioContext {
+            run_id: "run-chaos".to_string(),
+            seed: 360,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+
+        let err = run_mounted_chaos_with_driver(
+            &context,
+            &mut driver,
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+        )
+        .unwrap_err();
+
+        let message = err.to_string();
+        assert!(matches!(
+            err,
+            ScenarioError::MountedChaosUnmountAfterFailure { .. }
+        ));
+        assert!(message.contains("requires at least 3 clients"));
+        assert!(message.contains("umount failed"));
     }
 
     #[test]
@@ -3597,6 +4901,20 @@ mod tests {
         assert!(resolve_scenario(MOUNTED_CLIENT_CRASH_RESTART_RECOVERY).is_some());
         assert!(resolve_scenario("client-crash-restart").is_some());
         assert!(resolve_scenario("crash-restart").is_some());
+    }
+
+    #[test]
+    fn registry_exposes_mounted_chaos_convergence_scenario() {
+        let scenarios = available_scenarios();
+
+        assert!(scenarios.iter().any(|scenario| {
+            scenario.name == MOUNTED_CHAOS_CONVERGENCE
+                && scenario.requires_studiofs_bin
+                && scenario.description.contains("chaos")
+        }));
+        assert!(resolve_scenario(MOUNTED_CHAOS_CONVERGENCE).is_some());
+        assert!(resolve_scenario("mounted-chaos").is_some());
+        assert!(resolve_scenario("chaos").is_some());
     }
 
     #[test]

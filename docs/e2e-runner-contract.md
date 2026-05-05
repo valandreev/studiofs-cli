@@ -57,7 +57,7 @@ Required initial run flags and environment:
 | Flag | Contract |
 |---|---|
 | `basic-multi-client-smoke` | Positional shorthand for the mounted three-client happy-path smoke scenario. |
-| `--scenario <name>` | Repeatable. Accepted values include `basic-multi-client-smoke` (`smoke`), `postgres-outage-multi-client-recovery` (`postgres-outage`), `rustfs-outage-multi-client-recovery` (`rustfs-outage`, `s3-outage`), `mounted-client-crash-restart-recovery` (`client-crash-restart`, `crash-restart`), and the mounted namespace collision scenarios `collision-rename-vs-rename`, `collision-rename-vs-unlink`, `collision-unlink-vs-append`, `collision-overwrite-vs-read`, `collision-mkdir-rmdir-vs-create`, and `collision-readdir-stat-during-mutation`. |
+| `--scenario <name>` | Repeatable. Accepted values include `basic-multi-client-smoke` (`smoke`), `postgres-outage-multi-client-recovery` (`postgres-outage`), `rustfs-outage-multi-client-recovery` (`rustfs-outage`, `s3-outage`), `mounted-client-crash-restart-recovery` (`client-crash-restart`, `crash-restart`), `mounted-chaos-convergence` (`mounted-chaos`, `chaos`), and the mounted namespace collision scenarios `collision-rename-vs-rename`, `collision-rename-vs-unlink`, `collision-unlink-vs-append`, `collision-overwrite-vs-read`, `collision-mkdir-rmdir-vs-create`, and `collision-readdir-stat-during-mutation`. |
 | `--studiofs-bin <path>` | Path to the product CLI under test. Real mounted scenarios require it when `--infra compose` is used. The runner may build it only when an explicit build flag is added. |
 | `--root <path>` | Parent run directory. Defaults to `target/e2e-runs`. |
 | `--run-id <id>` | Optional stable run ID. If omitted, use an ISO-like UTC timestamp plus short random suffix. Explicit IDs must be safe single directory names: no separators, drive prefixes, traversal segments, leading dots, or other shell/path metacharacters. |
@@ -301,6 +301,16 @@ converge on the same public tree and rejects duplicate canonical paths, missing
 parent directories, unexpected resurrection, and checksum mismatch. The
 overwrite/read scenario records repeated read loops while another client
 overwrites the committed file version.
+
+`mounted-chaos-convergence` is the seeded product chaos scenario. It uses the
+first three default clients, creates a bounded hot working set, then executes
+multiple concurrent rounds chosen from the same conflict families as the
+focused collision suite: rename/rename, rename/unlink, unlink/append,
+overwrite/read, mkdir/rmdir/create, and readdir/stat during mutation. The
+scenario records each accepted, rejected, or planned operation in
+`operations.ndjson`, writes `mounted-chaos-summary.json` and `validation.json`,
+and uses only mounted tree convergence plus namespace invariants as the pass
+condition. A failure should be reproducible with the same `--seed`.
 
 ## Mounted Tree Convergence Validation
 
