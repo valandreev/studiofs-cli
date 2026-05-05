@@ -1905,6 +1905,9 @@ mod tests {
                 "  Maintenance:  cleanup every 30m (grace 15m, max deletes 500)".to_string(),
             ]
         );
+        let joined = lines.join("\n");
+        assert!(!joined.contains("access-key"));
+        assert!(!joined.contains("secret-key"));
     }
 
     #[test]

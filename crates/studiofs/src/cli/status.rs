@@ -2,6 +2,7 @@
 
 use crate::cli::WRITE_PATH_OBSERVABILITY_FILE;
 use crate::cli::cache_layout::describe_cache_layout_state;
+use crate::cli::redaction::redact_postgres_dsn;
 use crate::cli::utils::format_bytes;
 use clap::Args;
 use std::path::{Path, PathBuf};
@@ -408,7 +409,7 @@ pub fn run(
 
     if let Some(pg) = &format_info.metadata.postgres {
         println!("\n  Meta backend: Postgres");
-        println!("  Postgres URL:  {}", pg.url);
+        println!("  Meta:          {}", redact_postgres_dsn(&pg.url));
         println!("  Postgres vol:  {}", pg.volume_id);
         println!("  Postgres size: {}", format_bytes(remote_size));
     } else {
