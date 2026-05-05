@@ -31,6 +31,7 @@ pub struct ClientControllerConfig {
     pub volume_name: String,
     pub meta_dsn: String,
     pub s3: S3Config,
+    pub init_retry_timeout: Duration,
     pub mount_ready_timeout: Duration,
     pub mount_exit_timeout: Duration,
     pub poll_interval: Duration,
@@ -73,6 +74,7 @@ impl ClientControllerConfig {
                 secret_key: "rustfsadmin".to_string(),
                 region: "us-east-1".to_string(),
             },
+            init_retry_timeout: Duration::from_secs(30),
             mount_ready_timeout: Duration::from_secs(30),
             mount_exit_timeout: Duration::from_secs(15),
             poll_interval: Duration::from_millis(100),
@@ -348,8 +350,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
             return Err(ClientControllerError::NoClients);
         }
         let command = self.init_command(0)?;
-        let output = self.executor.run(&command)?;
-        ensure_success(&command, output)?;
+        self.run_init_with_transient_retry(&command)?;
         self.clients[0].spec.state = ClientLifecycleState::Initialized;
         Ok(())
     }
@@ -510,6 +511,23 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
             }
         }
         Ok(())
+    }
+
+    fn run_init_with_transient_retry(
+        &self,
+        command: &ClientCommand,
+    ) -> Result<(), ClientControllerError> {
+        let deadline = Instant::now() + self.config.init_retry_timeout;
+        loop {
+            let output = self.executor.run(command)?;
+            if output.status == 0 {
+                return Ok(());
+            }
+            if !is_transient_object_store_init_failure(&output) || Instant::now() >= deadline {
+                return ensure_success(command, output);
+            }
+            std::thread::sleep(nonzero_poll_interval(self.config.poll_interval));
+        }
     }
 
     fn verify_local_metadata_dbs(&self) -> Result<(), ClientControllerError> {
@@ -736,6 +754,46 @@ fn ensure_success(
             stderr: diagnostic_excerpt(&output.stderr),
         })
     }
+}
+
+fn is_transient_object_store_init_failure(output: &ClientCommandOutput) -> bool {
+    diagnostics_contain_all(output, &["bucket", "could not be created"])
+        && diagnostics_contain_any(
+            output,
+            &[
+                "http request failed",
+                "error sending request",
+                "connection refused",
+                "connection reset",
+                "connection closed",
+                "timed out",
+                "temporarily unavailable",
+            ],
+        )
+}
+
+fn diagnostics_contain_all(output: &ClientCommandOutput, needles: &[&str]) -> bool {
+    needles
+        .iter()
+        .all(|needle| diagnostic_contains(output, needle))
+}
+
+fn diagnostics_contain_any(output: &ClientCommandOutput, needles: &[&str]) -> bool {
+    needles
+        .iter()
+        .any(|needle| diagnostic_contains(output, needle))
+}
+
+fn diagnostic_contains(output: &ClientCommandOutput, needle: &str) -> bool {
+    contains_ascii_case_insensitive(&output.stdout, needle)
+        || contains_ascii_case_insensitive(&output.stderr, needle)
+}
+
+fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
 }
 
 pub fn client_artifact_dir(sandbox: &Path, client: &str) -> PathBuf {
