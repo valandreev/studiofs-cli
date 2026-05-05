@@ -6785,6 +6785,7 @@ mod tests {
                 secret_key: "studiofs123".to_string(),
                 region: "us-east-1".to_string(),
             },
+            init_retry_timeout: Duration::from_secs(1),
             mount_ready_timeout: Duration::from_secs(1),
             mount_exit_timeout: Duration::from_secs(1),
             poll_interval: Duration::from_millis(10),

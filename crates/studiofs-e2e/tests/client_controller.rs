@@ -205,6 +205,71 @@ fn bootstrap_workflow_reports_local_metadata_cleanup_failures_with_client_path()
 }
 
 #[test]
+fn init_retries_transient_rustfs_bucket_create_failures() {
+    let temp = tempdir().unwrap();
+    let executor = RecordingExecutor {
+        transient_init_failures_before_success: Cell::new(2),
+        ..RecordingExecutor::new()
+    };
+    let calls = Rc::clone(&executor.calls);
+    let mut controller = MultiClientController::new(test_config(temp.path()), executor);
+
+    controller.create_clients(["client-a"]).unwrap();
+    controller.init_first_client().unwrap();
+
+    let calls = calls.borrow();
+    let init_calls = calls
+        .iter()
+        .filter(|call| call.action == "init")
+        .collect::<Vec<_>>();
+    assert_eq!(init_calls.len(), 3);
+}
+
+#[test]
+fn init_does_not_retry_non_transient_bucket_failures() {
+    let temp = tempdir().unwrap();
+    let executor = RecordingExecutor {
+        permanent_init_failure: Some(
+            "bucket 'studiofs-e2e' not accessible and could not be created: AccessDenied"
+                .to_string(),
+        ),
+        ..RecordingExecutor::new()
+    };
+    let calls = Rc::clone(&executor.calls);
+    let mut controller = MultiClientController::new(test_config(temp.path()), executor);
+
+    controller.create_clients(["client-a"]).unwrap();
+    let err = controller.init_first_client().unwrap_err();
+
+    assert!(err.to_string().contains("AccessDenied"));
+    let calls = calls.borrow();
+    let init_calls = calls.iter().filter(|call| call.action == "init").count();
+    assert_eq!(init_calls, 1);
+}
+
+#[test]
+fn init_does_not_retry_connection_refused_endpoint_failures() {
+    let temp = tempdir().unwrap();
+    let executor = RecordingExecutor {
+        permanent_init_failure: Some(
+            "bucket 'studiofs-e2e' not accessible and could not be created: connection refused"
+                .to_string(),
+        ),
+        ..RecordingExecutor::new()
+    };
+    let calls = Rc::clone(&executor.calls);
+    let mut controller = MultiClientController::new(test_config(temp.path()), executor);
+
+    controller.create_clients(["client-a"]).unwrap();
+    let err = controller.init_first_client().unwrap_err();
+
+    assert!(err.to_string().contains("connection refused"));
+    let calls = calls.borrow();
+    let init_calls = calls.iter().filter(|call| call.action == "init").count();
+    assert_eq!(init_calls, 1);
+}
+
+#[test]
 fn compose_service_config_derives_unique_volume_and_docker_endpoints() {
     let temp = tempdir().unwrap();
     let config = ClientControllerConfig::from_compose_services(
@@ -558,6 +623,8 @@ struct RecordingExecutor {
     run_status: Cell<i32>,
     run_stdout: String,
     run_stderr: String,
+    transient_init_failures_before_success: Cell<usize>,
+    permanent_init_failure: Option<String>,
     create_local_metadata_db: bool,
     fail_if_local_metadata_dir_preexists: bool,
     kill_error_after: Cell<Option<usize>>,
@@ -579,6 +646,8 @@ impl RecordingExecutor {
             run_status: Cell::new(0),
             run_stdout: String::new(),
             run_stderr: String::new(),
+            transient_init_failures_before_success: Cell::new(0),
+            permanent_init_failure: None,
             create_local_metadata_db: false,
             fail_if_local_metadata_dir_preexists: false,
             kill_error_after: Cell::new(None),
@@ -601,6 +670,25 @@ impl ClientProcessExecutor for RecordingExecutor {
             )));
         }
         self.calls.borrow_mut().push(command.clone());
+        if command.action == "init" {
+            if let Some(stderr) = &self.permanent_init_failure {
+                return Ok(ClientCommandOutput {
+                    status: 1,
+                    stdout: "Checking storage backends...\n".to_string(),
+                    stderr: stderr.clone(),
+                });
+            }
+            let remaining = self.transient_init_failures_before_success.get();
+            if remaining > 0 {
+                self.transient_init_failures_before_success
+                    .set(remaining - 1);
+                return Ok(ClientCommandOutput {
+                    status: 1,
+                    stdout: "Checking data bucket 'studiofs-e2e'... not found\n".to_string(),
+                    stderr: "bucket 'studiofs-e2e' not accessible and could not be created: HTTP request failed".to_string(),
+                });
+            }
+        }
         if self.create_local_metadata_db {
             std::fs::create_dir_all(&local_metadata_dir)?;
             std::fs::write(
@@ -694,6 +782,7 @@ fn test_config(root: &Path) -> ClientControllerConfig {
             secret_key: "studiofs123".to_string(),
             region: "us-east-1".to_string(),
         },
+        init_retry_timeout: Duration::from_millis(200),
         mount_ready_timeout: Duration::from_millis(1),
         mount_exit_timeout: Duration::from_secs(15),
         poll_interval: Duration::from_millis(20),

@@ -206,6 +206,11 @@ same volume for additional clients with `studiofs discover`, spawns foreground
 mount readiness, and supports graceful `studiofs umount`, forced child-process
 kill, and restart/remount. Scenarios must use this controller rather than
 sharing one local metadata DB or falling back to direct VFS calls.
+When the compose RustFS endpoint is still settling after Docker reports the
+service healthy, the first `studiofs init` may retry narrowly-classified
+object-store transport failures during bucket creation. The retry window is
+bounded and must not hide credential, permission, bucket naming, or endpoint
+configuration errors.
 Crash-style remounts do not run `studiofs umount` for the killed client. On
 Linux, before spawning the replacement mount process, the controller attempts a
 lazy stale-mount cleanup for leftover FUSE mount points with `fusermount3 -u -z`,
