@@ -5322,6 +5322,54 @@ mod tests {
     }
 
     #[test]
+    fn foreign_rename_after_local_unlink_restores_symlink_and_xattr_mirrors() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+        let symlink = pg
+            .create_symlink(ROOT_INO, b"race-link", b"/remote-target", 0, 0)
+            .expect("create symlink");
+        pg.set_xattr(symlink.ino, b"user.color", b"blue", 0)
+            .expect("set xattr");
+        publish_local_events_to_base(&pg);
+
+        pg.unlink(ROOT_INO, b"race-link").expect("local unlink");
+
+        let foreign_rename = vec![MetaEvent::RenameEntry {
+            parent: ROOT_INO,
+            name: b"race-link".to_vec(),
+            new_parent: ROOT_INO,
+            new_name: b"race-link-renamed".to_vec(),
+            entry: DirEntryValue {
+                ino: symlink.ino,
+                kind: FileType::Symlink,
+            },
+            displaced_set_attr: Box::new(None),
+            displaced_remove_attr_ino: None,
+            moved_dir_attr: Box::new(None),
+            old_parent_attr: Box::new(None),
+            new_parent_attr: Box::new(None),
+        }];
+        pg.apply_foreign_batch(&foreign_rename, &OverlayConflictSets::default())
+            .expect("apply foreign rename");
+
+        assert_eq!(
+            pg.lookup(ROOT_INO, b"race-link-renamed")
+                .expect("renamed symlink")
+                .ino,
+            symlink.ino
+        );
+        assert_eq!(
+            pg.get_symlink_target(symlink.ino)
+                .expect("restored symlink target"),
+            b"/remote-target"
+        );
+        assert_eq!(
+            pg.get_xattr(symlink.ino, b"user.color")
+                .expect("restored xattr"),
+            Some(b"blue".to_vec())
+        );
+    }
+
+    #[test]
     fn older_foreign_rename_does_not_resurrect_after_self_unlink_flush() {
         let (_dir, pg) = temp_pg_engine_for_unit();
         let file = create_published_small_file(&pg, ROOT_INO, b"race.txt", 77_103);
