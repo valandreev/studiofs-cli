@@ -790,6 +790,9 @@ fn diagnostic_contains(output: &ClientCommandOutput, needle: &str) -> bool {
 }
 
 fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
     haystack
         .as_bytes()
         .windows(needle.len())
@@ -1332,6 +1335,11 @@ mod tests {
 88 42 0:77 / /var/mint-workspace/mount-\xff rw,nosuid,nodev - fuse.studiofs studiofs rw\n";
 
         assert!(mountinfo_contains_mount_point(mountinfo, &path));
+    }
+
+    #[test]
+    fn ascii_case_insensitive_contains_matches_empty_needle() {
+        assert!(contains_ascii_case_insensitive("bucket create failed", ""));
     }
 
     #[cfg(not(unix))]
