@@ -2570,29 +2570,6 @@ impl PgMetaEngine {
         removed
     }
 
-    fn preserved_dentry_keys_for_batch(
-        &self,
-        batch_events: &[MetaEvent],
-        overlay: &OverlayConflictSets,
-    ) -> MetaResult<HashSet<Vec<u8>>> {
-        let mut preserved = HashSet::new();
-        for event in batch_events {
-            if let MetaEvent::RemoveEntry { parent, name } = event {
-                let entry = self
-                    .local
-                    .lookup(*parent, name)
-                    .map(Some)
-                    .or_else(|_| self.local.lookup_base_dentry(*parent, name));
-                if let Ok(Some(entry)) = entry {
-                    if overlay.block_inodes.contains(&entry.ino) {
-                        preserved.insert(Self::dentry_key(*parent, name));
-                    }
-                }
-            }
-        }
-        Ok(preserved)
-    }
-
     fn overlay_conflicts_for_events(events: &[MetaEvent]) -> OverlayConflictSets {
         let mut overlay = OverlayConflictSets::default();
         for event in events {
@@ -2717,7 +2694,6 @@ impl PgMetaEngine {
         event: &MetaEvent,
         overlay: &OverlayConflictSets,
         removed_inodes: &HashSet<Ino>,
-        preserved_dentry_keys: &HashSet<Vec<u8>>,
     ) -> bool {
         match event {
             MetaEvent::SetAttr { attr } => {
@@ -2733,9 +2709,6 @@ impl PgMetaEngine {
                     || overlay.xattr_inodes.contains(ino)
             }
             MetaEvent::AddEntry { parent, name, .. } | MetaEvent::RemoveEntry { parent, name } => {
-                if preserved_dentry_keys.contains(&Self::dentry_key(*parent, name)) {
-                    return true;
-                }
                 overlay
                     .dentry_keys
                     .contains(&Self::dentry_key(*parent, name))
@@ -2842,7 +2815,6 @@ impl PgMetaEngine {
         overlay: &OverlayConflictSets,
     ) -> MetaResult<bool> {
         let removed_inodes = self.removed_inodes_for_batch(batch_events);
-        let preserved_dentry_keys = self.preserved_dentry_keys_for_batch(batch_events, overlay)?;
         let preserve_local_payload_inodes = batch_events
             .iter()
             .filter_map(|event| match event {
@@ -2858,12 +2830,7 @@ impl PgMetaEngine {
         let serving_events: Vec<MetaEvent> = batch_events
             .iter()
             .filter(|event| {
-                !Self::serving_event_conflicts_with_overlay(
-                    event,
-                    overlay,
-                    &removed_inodes,
-                    &preserved_dentry_keys,
-                )
+                !Self::serving_event_conflicts_with_overlay(event, overlay, &removed_inodes)
             })
             .cloned()
             .collect();
@@ -5504,6 +5471,57 @@ mod tests {
             visible_object_id(&pg, file.ino),
             77_203,
             "later PG winner must replace a previously flushed local payload"
+        );
+    }
+
+    #[test]
+    fn foreign_unlink_during_local_append_does_not_leave_private_dentry() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+        let file = create_published_small_file(&pg, ROOT_INO, b"append-race.txt", 77_301);
+        publish_local_events_to_base(&pg);
+
+        publish_file_payload(&pg, file.ino, 0, 81, 2, 77_302);
+        let append_overlay = pg
+            .local_overlay_conflicts()
+            .expect("local append overlay conflicts");
+        assert!(
+            append_overlay.block_inodes.contains(&file.ino),
+            "test setup must model an unflushed local append/update"
+        );
+
+        let foreign_unlink = vec![
+            MetaEvent::RemoveEntry {
+                parent: ROOT_INO,
+                name: b"append-race.txt".to_vec(),
+            },
+            MetaEvent::RemoveAttr { ino: file.ino },
+        ];
+        pg.apply_foreign_batch(&foreign_unlink, &append_overlay)
+            .expect("apply foreign unlink");
+
+        assert!(
+            pg.lookup(ROOT_INO, b"append-race.txt").is_err(),
+            "winning foreign unlink must not leave a private dentry on the appending peer"
+        );
+        let local_attr = pg
+            .get_attr(file.ino)
+            .expect("local append inode remains available by handle/inode");
+        assert_eq!(
+            local_attr.upload_state,
+            UploadState::Ready,
+            "accepted local payload should be sealed even though the namespace entry lost"
+        );
+        assert_eq!(
+            lookup_first_object_id(&pg, file.ino)
+                .expect("get local payload after foreign unlink")
+                .expect("local accepted payload remains attached to the orphaned inode"),
+            77_302
+        );
+
+        publish_local_events_to_base(&pg);
+        assert!(
+            pg.lookup(ROOT_INO, b"append-race.txt").is_err(),
+            "flushing the already-accepted append must not resurrect a dentry that was not published"
         );
     }
 
@@ -9221,29 +9239,30 @@ mod tests {
         assert!(wait_until(Duration::from_secs(12), || {
             let _ = a.sync_metadata();
             let _ = b.sync_metadata();
-            a.lookup(ROOT_INO, b"uploading.bin").is_ok()
+            a.lookup(ROOT_INO, b"uploading.bin").is_err()
                 && b.lookup(ROOT_INO, b"uploading.bin").is_err()
         }));
         let local_attr = a
             .get_attr(file.ino)
             .expect("get local attr after peer unlink");
-        assert_eq!(local_attr.upload_state, UploadState::Ready);
+        assert_eq!(
+            local_attr.upload_state,
+            UploadState::Ready,
+            "peer unlink should seal the accepted local payload while removing the namespace entry"
+        );
         assert_eq!(
             lookup_first_object_id(&a, file.ino)
                 .expect("get local payload after peer unlink")
-                .expect("writer keeps local pending payload after peer unlink"),
+                .expect("writer keeps local accepted payload by inode after peer unlink"),
             777
         );
 
         drop(a);
         let reopened = reopen_pg_engine_with_retry(&db_a);
         reopened.sync_metadata().expect("sync reopened a");
-        assert!(reopened.lookup(ROOT_INO, b"uploading.bin").is_ok());
-        assert_eq!(
-            lookup_first_object_id(&reopened, file.ino)
-                .expect("get reopened local payload")
-                .expect("reopened local payload"),
-            777
+        assert!(
+            reopened.lookup(ROOT_INO, b"uploading.bin").is_err(),
+            "reopen must not resurrect a private dentry after the peer unlink wins"
         );
     }
 
