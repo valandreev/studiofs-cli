@@ -184,6 +184,14 @@ pub fn run_with_executor(
     request: RunRequest,
     executor: &dyn CommandExecutor,
 ) -> Result<RunOutcome, RunnerError> {
+    run_with_executor_and_mount_lock_dir(request, executor, &default_mount_lock_dir())
+}
+
+fn run_with_executor_and_mount_lock_dir(
+    request: RunRequest,
+    executor: &dyn CommandExecutor,
+    mount_lock_dir: &Path,
+) -> Result<RunOutcome, RunnerError> {
     let started_instant = Instant::now();
     let started_at = timestamp();
     let root = absolutize(&request.root)?;
@@ -249,7 +257,32 @@ pub fn run_with_executor(
     write_runner_marker(&sandbox, &run_id)?;
     write_log_files(&sandbox)?;
 
-    let prepared_preflight = prepare_preflight(&sandbox, compose_stack.as_ref(), executor)?;
+    let mut default_mount_lock = None;
+    let mount_lock_failure = if requires_default_windows_mount_lock(
+        infra_mode,
+        &selected_platform,
+        scenarios.iter().map(|scenario| scenario.definition),
+    ) {
+        match acquire_default_mount_lock(mount_lock_dir, &run_id) {
+            Ok(lock) => {
+                default_mount_lock = Some(lock);
+                None
+            }
+            Err(err) => Some(err.to_string()),
+        }
+    } else {
+        None
+    };
+    let prepared_preflight = if let Some(detail) = mount_lock_failure {
+        prepare_failed_mount_lock_preflight(&sandbox, compose_stack.as_ref(), detail)?
+    } else {
+        prepare_preflight(
+            &sandbox,
+            compose_stack.as_ref(),
+            executor,
+            default_mount_lock.as_ref(),
+        )?
+    };
     let preflight = prepared_preflight.report;
     let mut compose_cleanup_guard = ComposeCleanupGuard::new(
         if prepared_preflight.compose_start_attempted {
@@ -491,6 +524,7 @@ fn prepare_preflight(
     sandbox: &Path,
     compose_stack: Option<&DockerComposeStack>,
     executor: &dyn CommandExecutor,
+    default_mount_lock: Option<&DefaultMountLock>,
 ) -> Result<PreparedPreflight, RunnerError> {
     let Some(stack) = compose_stack else {
         write_pretty_json(
@@ -511,11 +545,20 @@ fn prepare_preflight(
     };
 
     stack.prepare_artifacts()?;
-    let mut checks: Vec<_> = stack
-        .preflight(executor)
-        .into_iter()
-        .map(preflight_check_report)
-        .collect();
+    let mut checks: Vec<_> = Vec::new();
+    if let Some(lock) = default_mount_lock {
+        checks.push(PreflightCheckReport {
+            name: "default Windows mounted E2E run lock".to_string(),
+            status: RunStatus::Passed,
+            detail: format!("held at {}", lock.path.display()),
+        });
+    }
+    checks.extend(
+        stack
+            .preflight(executor)
+            .into_iter()
+            .map(preflight_check_report),
+    );
     if checks.iter().any(|check| check.status != RunStatus::Passed) {
         return Ok(PreparedPreflight {
             report: PreflightReport {
@@ -557,6 +600,32 @@ fn prepare_preflight(
     })
 }
 
+fn prepare_failed_mount_lock_preflight(
+    sandbox: &Path,
+    compose_stack: Option<&DockerComposeStack>,
+    detail: String,
+) -> Result<PreparedPreflight, RunnerError> {
+    if let Some(stack) = compose_stack {
+        stack.prepare_artifacts()?;
+    } else {
+        write_pretty_json(
+            &sandbox.join("ports.json"),
+            &serde_json::json!({ "ports": [] }),
+        )?;
+    }
+    Ok(PreparedPreflight {
+        report: PreflightReport {
+            status: RunStatus::PreflightFailed,
+            checks: vec![PreflightCheckReport {
+                name: "default Windows mounted E2E run lock".to_string(),
+                status: RunStatus::PreflightFailed,
+                detail,
+            }],
+        },
+        compose_start_attempted: false,
+    })
+}
+
 fn preflight_check_report(check: InfraCheck) -> PreflightCheckReport {
     PreflightCheckReport {
         name: check.name,
@@ -589,6 +658,207 @@ fn collect_compose_cleanup(
         }
         Err(err) => cleanup_errors.push(format!("docker compose down: {err}")),
     }
+}
+
+#[derive(Debug)]
+struct DefaultMountLock {
+    path: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct DefaultMountLockHolder {
+    runner: String,
+    scope: String,
+    pid: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessStatus {
+    Running,
+    NotRunning,
+    Unknown,
+}
+
+impl Drop for DefaultMountLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn requires_default_windows_mount_lock(
+    infra: InfraMode,
+    selected_platform: &str,
+    scenarios: impl IntoIterator<Item = scenario::ScenarioDefinition>,
+) -> bool {
+    infra == InfraMode::Compose
+        && selected_platform == "windows-winfsp"
+        && scenarios
+            .into_iter()
+            .any(|scenario| scenario.requires_mount)
+}
+
+fn default_mount_lock_dir() -> PathBuf {
+    #[cfg(windows)]
+    if let Some(program_data) = std::env::var_os("ProgramData") {
+        return PathBuf::from(program_data).join("StudioFS").join("e2e");
+    }
+
+    std::env::temp_dir().join("studiofs-e2e")
+}
+
+fn acquire_default_mount_lock(
+    lock_dir: &Path,
+    run_id: &str,
+) -> Result<DefaultMountLock, std::io::Error> {
+    acquire_default_mount_lock_with_process_checker(lock_dir, run_id, process_is_running)
+}
+
+fn acquire_default_mount_lock_with_process_checker(
+    lock_dir: &Path,
+    run_id: &str,
+    process_checker: impl Fn(u32) -> ProcessStatus + Copy,
+) -> Result<DefaultMountLock, std::io::Error> {
+    fs::create_dir_all(lock_dir)?;
+    let path = lock_dir.join("default-windows-mount-points.lock");
+    let holder = serde_json::json!({
+        "runner": RUNNER_CRATE,
+        "scope": "default-windows-mount-points",
+        "run_id": run_id,
+        "pid": std::process::id(),
+        "created_at": timestamp(),
+    });
+    let payload = serde_json::to_vec_pretty(&holder).map_err(std::io::Error::other)?;
+    acquire_default_mount_lock_with_writer(&path, run_id, &payload, write_lock_payload).or_else(
+        |err| {
+            if err.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(err);
+            }
+            if reclaim_stale_default_mount_lock(&path, process_checker)? {
+                return acquire_default_mount_lock_with_writer(
+                    &path,
+                    run_id,
+                    &payload,
+                    write_lock_payload,
+                );
+            }
+            Err(err)
+        },
+    )
+}
+
+fn acquire_default_mount_lock_with_writer(
+    path: &Path,
+    run_id: &str,
+    payload: &[u8],
+    write_payload: impl FnOnce(fs::File, &[u8]) -> std::io::Result<()>,
+) -> Result<DefaultMountLock, std::io::Error> {
+    match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(file) => {
+            if let Err(err) = write_payload(file, payload) {
+                let _ = fs::remove_file(path);
+                return Err(err);
+            }
+            Ok(DefaultMountLock {
+                path: path.to_path_buf(),
+            })
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            let holder = default_mount_lock_holder_diagnostic(path);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "default Windows mounted E2E run lock is already held at {}; current run {run_id} cannot safely reuse default drive-letter mount points; holder: {holder}",
+                    path.display()
+                ),
+            ))
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn reclaim_stale_default_mount_lock(
+    path: &Path,
+    process_checker: impl Fn(u32) -> ProcessStatus,
+) -> std::io::Result<bool> {
+    let Some(holder) = read_default_mount_lock_holder(path)? else {
+        return Ok(false);
+    };
+    if holder.runner != RUNNER_CRATE || holder.scope != "default-windows-mount-points" {
+        return Ok(false);
+    }
+    match process_checker(holder.pid) {
+        ProcessStatus::NotRunning => {}
+        ProcessStatus::Running | ProcessStatus::Unknown => return Ok(false),
+    }
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(err) => Err(err),
+    }
+}
+
+fn read_default_mount_lock_holder(path: &Path) -> std::io::Result<Option<DefaultMountLockHolder>> {
+    let holder = fs::read_to_string(path)?;
+    if holder.trim().is_empty() {
+        return Ok(None);
+    }
+    serde_json::from_str(&holder)
+        .map(Some)
+        .map_err(std::io::Error::other)
+}
+
+fn default_mount_lock_holder_diagnostic(path: &Path) -> String {
+    match fs::read_to_string(path) {
+        Ok(holder) if holder.trim().is_empty() => "<empty lock holder file>".to_string(),
+        Ok(holder) => holder,
+        Err(read_err) => format!("<failed to read existing lock holder: {read_err}>"),
+    }
+}
+
+fn process_is_running(pid: u32) -> ProcessStatus {
+    if pid == std::process::id() {
+        return ProcessStatus::Running;
+    }
+    platform_process_status(pid)
+}
+
+#[cfg(windows)]
+fn platform_process_status(pid: u32) -> ProcessStatus {
+    type Handle = *mut std::ffi::c_void;
+
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const ERROR_INVALID_PARAMETER: u32 = 87;
+
+    unsafe extern "system" {
+        fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> Handle;
+        fn CloseHandle(hObject: Handle) -> i32;
+        fn GetLastError() -> u32;
+    }
+
+    // SAFETY: OpenProcess only observes whether the PID can be opened.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        // SAFETY: GetLastError reads the calling thread's last OS error.
+        return match unsafe { GetLastError() } {
+            ERROR_INVALID_PARAMETER => ProcessStatus::NotRunning,
+            _ => ProcessStatus::Unknown,
+        };
+    }
+    // SAFETY: handle was returned by OpenProcess and must be closed once.
+    unsafe {
+        CloseHandle(handle);
+    }
+    ProcessStatus::Running
+}
+
+#[cfg(not(windows))]
+fn platform_process_status(_pid: u32) -> ProcessStatus {
+    ProcessStatus::Unknown
+}
+
+fn write_lock_payload(mut file: fs::File, payload: &[u8]) -> std::io::Result<()> {
+    file.write_all(payload)?;
+    file.sync_all()
 }
 
 pub fn clean(request: CleanRequest) -> Result<CleanOutcome, RunnerError> {
@@ -1240,6 +1510,7 @@ mod tests {
                 name: "failing-validate",
                 description: "test scenario",
                 requires_studiofs_bin: false,
+                requires_mount: false,
             }
         }
 
@@ -1501,7 +1772,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let executor = RecordingExecutor::default();
 
-        let outcome = run_with_executor(
+        let outcome = run_with_executor_and_mount_lock_dir(
             RunRequest {
                 root: temp.path().join("e2e-runs"),
                 run_id: Some("compose-runner-run".to_string()),
@@ -1516,6 +1787,7 @@ mod tests {
                 infra: InfraMode::Compose,
             },
             &executor,
+            &temp.path().join("mount-locks"),
         )
         .unwrap();
 
@@ -1583,7 +1855,7 @@ mod tests {
             ..RecordingExecutor::default()
         };
 
-        let err = run_with_executor(
+        let err = run_with_executor_and_mount_lock_dir(
             RunRequest {
                 root,
                 run_id: Some(run_id.to_string()),
@@ -1598,6 +1870,7 @@ mod tests {
                 infra: InfraMode::Compose,
             },
             &executor,
+            &temp.path().join("mount-locks"),
         )
         .unwrap_err();
 
@@ -1613,6 +1886,199 @@ mod tests {
                 .iter()
                 .any(|call| call.args.contains(&"down".to_string())),
             "compose stack should be torn down after post-start runner errors"
+        );
+    }
+
+    #[test]
+    fn default_mount_lock_reports_existing_holder_before_parallel_windows_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let lock_dir = temp.path().join("locks");
+
+        let first = acquire_default_mount_lock(&lock_dir, "first-run").unwrap();
+        let err = acquire_default_mount_lock(&lock_dir, "second-run").unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("default Windows mounted E2E run lock is already held"));
+        assert!(message.contains("first-run"));
+        assert!(message.contains("second-run"));
+        assert!(message.contains(&lock_dir.display().to_string()));
+
+        drop(first);
+        let second = acquire_default_mount_lock(&lock_dir, "second-run").unwrap();
+        drop(second);
+    }
+
+    #[test]
+    fn default_mount_lock_removes_file_after_payload_write_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let lock_path = temp
+            .path()
+            .join("locks")
+            .join("default-windows-mount-points.lock");
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+
+        let err = acquire_default_mount_lock_with_writer(
+            &lock_path,
+            "failed-run",
+            b"holder",
+            |file, _payload| {
+                drop(file);
+                Err(std::io::Error::other("injected write failure"))
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("injected write failure"));
+        assert!(!lock_path.exists());
+        let lock = acquire_default_mount_lock(lock_path.parent().unwrap(), "next-run").unwrap();
+        drop(lock);
+    }
+
+    #[test]
+    fn default_mount_lock_reclaims_stale_holder_when_pid_is_not_running() {
+        let temp = tempfile::tempdir().unwrap();
+        let lock_dir = temp.path().join("locks");
+        std::fs::create_dir_all(&lock_dir).unwrap();
+        let lock_path = lock_dir.join("default-windows-mount-points.lock");
+        std::fs::write(
+            &lock_path,
+            serde_json::json!({
+                "runner": RUNNER_CRATE,
+                "scope": "default-windows-mount-points",
+                "run_id": "stale-run",
+                "pid": 4_294_967_294u32,
+                "created_at": timestamp(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let lock = acquire_default_mount_lock_with_process_checker(&lock_dir, "new-run", |_| {
+            ProcessStatus::NotRunning
+        })
+        .unwrap();
+
+        let holder = std::fs::read_to_string(&lock_path).unwrap();
+        assert!(holder.contains("new-run"));
+        assert!(!holder.contains("stale-run"));
+        drop(lock);
+    }
+
+    #[test]
+    fn default_mount_lock_keeps_holder_when_pid_status_is_unknown() {
+        let temp = tempfile::tempdir().unwrap();
+        let lock_dir = temp.path().join("locks");
+        std::fs::create_dir_all(&lock_dir).unwrap();
+        let lock_path = lock_dir.join("default-windows-mount-points.lock");
+        std::fs::write(
+            &lock_path,
+            serde_json::json!({
+                "runner": RUNNER_CRATE,
+                "scope": "default-windows-mount-points",
+                "run_id": "inaccessible-run",
+                "pid": 42u32,
+                "created_at": timestamp(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let err = acquire_default_mount_lock_with_process_checker(&lock_dir, "blocked-run", |_| {
+            ProcessStatus::Unknown
+        })
+        .unwrap_err();
+
+        let holder = std::fs::read_to_string(&lock_path).unwrap();
+        assert!(err.to_string().contains("inaccessible-run"));
+        assert!(holder.contains("inaccessible-run"));
+        assert!(!holder.contains("blocked-run"));
+    }
+
+    #[test]
+    fn default_mount_lock_reports_empty_holder_file_explicitly() {
+        let temp = tempfile::tempdir().unwrap();
+        let lock_dir = temp.path().join("locks");
+        std::fs::create_dir_all(&lock_dir).unwrap();
+        std::fs::write(lock_dir.join("default-windows-mount-points.lock"), "").unwrap();
+
+        let err = acquire_default_mount_lock(&lock_dir, "blocked-run").unwrap_err();
+
+        assert!(err.to_string().contains("<empty lock holder file>"));
+    }
+
+    #[test]
+    fn windows_compose_run_fails_preflight_when_default_mount_lock_is_held() {
+        let temp = tempfile::tempdir().unwrap();
+        let lock_dir = temp.path().join("locks");
+        let _held = acquire_default_mount_lock(&lock_dir, "first-run").unwrap();
+        let executor = RecordingExecutor::default();
+
+        let outcome = run_with_executor_and_mount_lock_dir(
+            RunRequest {
+                root: temp.path().join("e2e-runs"),
+                run_id: Some("second-run".to_string()),
+                scenarios: vec![scenario::BASIC_MULTI_CLIENT_SMOKE.to_string()],
+                seed: 364,
+                studiofs_bin: Some(temp.path().join("studiofs.exe")),
+                platform: PlatformSelection::WindowsWinfsp,
+                retention: RetentionPolicy::Always,
+                report: None,
+                port_range: Some("33300-33310".to_string()),
+                timeout: None,
+                infra: InfraMode::Compose,
+            },
+            &executor,
+            &lock_dir,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.status, RunStatus::PreflightFailed);
+        assert_eq!(outcome.exit_code, 2);
+        assert!(executor.calls.borrow().is_empty());
+
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(outcome.report_path).unwrap()).unwrap();
+        assert_eq!(report["preflight"]["status"], "preflight_failed");
+        let check = &report["preflight"]["checks"][0];
+        assert_eq!(check["name"], "default Windows mounted E2E run lock");
+        assert_eq!(check["status"], "preflight_failed");
+        assert!(check["detail"].as_str().unwrap().contains("first-run"));
+        assert!(check["detail"].as_str().unwrap().contains("second-run"));
+    }
+
+    #[test]
+    fn windows_compose_run_without_mounted_scenarios_does_not_take_default_mount_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let lock_dir = temp.path().join("locks");
+        let _held = acquire_default_mount_lock(&lock_dir, "mounted-run").unwrap();
+        let executor = RecordingExecutor::default();
+
+        let outcome = run_with_executor_and_mount_lock_dir(
+            RunRequest {
+                root: temp.path().join("e2e-runs"),
+                run_id: Some("non-mounted-run".to_string()),
+                scenarios: vec![scenario::TEST_PASSING.to_string()],
+                seed: 364,
+                studiofs_bin: None,
+                platform: PlatformSelection::WindowsWinfsp,
+                retention: RetentionPolicy::Always,
+                report: None,
+                port_range: Some("33320-33330".to_string()),
+                timeout: None,
+                infra: InfraMode::Compose,
+            },
+            &executor,
+            &lock_dir,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.status, RunStatus::Passed);
+        assert!(
+            executor
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call.args.contains(&"up".to_string()))
         );
     }
 

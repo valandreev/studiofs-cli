@@ -205,6 +205,25 @@ fn bootstrap_workflow_reports_local_metadata_cleanup_failures_with_client_path()
 }
 
 #[test]
+fn unmount_all_skips_clients_that_never_reached_mounted_state() {
+    let temp = tempdir().unwrap();
+    let executor = RecordingExecutor::new();
+    let calls = Rc::clone(&executor.calls);
+    let mut controller = MultiClientController::new(test_config(temp.path()), executor);
+
+    controller.create_clients(["client-a", "client-b"]).unwrap();
+    controller.unmount_all().unwrap();
+
+    assert!(calls.borrow().is_empty());
+    assert!(
+        controller
+            .clients()
+            .iter()
+            .all(|client| client.state == ClientLifecycleState::Planned)
+    );
+}
+
+#[test]
 fn init_retries_transient_rustfs_bucket_create_failures() {
     let temp = tempdir().unwrap();
     let executor = RecordingExecutor {

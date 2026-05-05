@@ -547,6 +547,13 @@ Required checks:
 - stale mounts: requested mount points or drive letters must be unused, or must
   match a prior runner manifest that explicitly authorizes cleanup. Unknown
   mounted paths are a `preflight_failed` result, not an implicit force-unmount.
+- default Windows mounted-run lock: until per-run drive-letter allocation is
+  implemented, Windows WinFSP runs using compose infrastructure and at least one
+  mounted scenario acquire a machine-level lock before Docker or clients start.
+  The lock is stored under the machine-wide StudioFS E2E state directory on
+  Windows. A second default mounted run fails preflight with the lock path,
+  current run ID, and recorded holder diagnostics instead of reusing `Z:\`,
+  `Y:\`, or other default drive letters.
 - Filesystem safety: sandbox and explicit client roots canonicalize
   successfully, are not drive roots, home roots, repository roots, or temp roots,
   and do not cross symlinks or junctions in a way that would make cleanup
@@ -578,7 +585,8 @@ Rules:
   during cleanup.
 - Kill only child process IDs recorded in the manifest or discovered as direct
   descendants of those PIDs.
-- Unmount before deleting mount directories or explicit client roots.
+- Unmount only clients that reached the mounted state or still have a tracked
+  mount process, then delete mount directories or explicit client roots.
 - If unmount fails, retain the affected path and record the failure in
   `cleanup.json`.
 - Docker cleanup must target run-labeled containers, networks, and volumes
