@@ -142,6 +142,7 @@ cargo run -p studiofs-e2e -- run rustfs-outage-multi-client-recovery --studiofs-
 cargo run -p studiofs-e2e -- run mounted-client-crash-restart-recovery --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run collision-rename-vs-unlink --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run mounted-chaos-convergence --seed 360 --studiofs-bin target\debug\studiofs.exe
+cargo run -p studiofs-e2e -- run mounted-fault-chaos-convergence --seed 360 --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- clean
 ```
 
@@ -173,7 +174,12 @@ seeded product chaos layer: it composes rename/rename, rename/unlink,
 unlink/append, overwrite/read, mkdir/rmdir/create, and readdir/stat mutation
 families across multiple rounds against three real mounted clients, records the
 same `ScenarioOperationRecord` log, and validates final mounted tree
-convergence and namespace invariants.
+convergence and namespace invariants. The `mounted-fault-chaos-convergence`
+scenario is the next product fault-chaos layer: it mixes a mounted conflict
+burst with PostgreSQL outage, client force-kill/remount, RustFS/S3 outage, and a
+late cold observer client with a fresh local root/cache. It validates final
+mounted tree convergence across warm clients, the restarted client, and the cold
+observer.
 
 Hosted Linux real mounted E2E is available as a manual RWX workflow:
 
@@ -195,6 +201,7 @@ cargo test -p studiofs-e2e --test runner_contract
 cargo test -p studiofs-e2e --test compose_infra
 cargo test -p studiofs-e2e --test mounted_tree_validator
 cargo test -p studiofs-e2e scenario::tests::mounted_chaos_records_seeded_operations_and_validates_convergence -- --exact --nocapture
+cargo test -p studiofs-e2e --test runner_contract mounted_fault_chaos_disabled_run_writes_reproducible_artifacts -- --exact --nocapture
 cargo test -p studiofs-e2e namespace_collision_records_operations_and_validates_three_client_convergence -- --exact --nocapture
 cargo test -p studiofs-e2e scenario::tests::crash_restart_recovery_runs_both_modes_reuses_client_root_and_converges -- --exact --nocapture
 cargo test -p studiofs-e2e --test client_controller force_kill_then_remount_reuses_same_client_root_without_graceful_umount -- --exact --nocapture

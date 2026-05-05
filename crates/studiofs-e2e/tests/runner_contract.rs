@@ -74,12 +74,88 @@ fn list_scenarios_exposes_namespace_collision_suite() {
         "collision-mkdir-rmdir-vs-create",
         "collision-readdir-stat-during-mutation",
         "mounted-chaos-convergence",
+        "mounted-fault-chaos-convergence",
     ] {
         assert!(
             names.contains(&expected),
             "expected namespace collision scenario {expected}"
         );
     }
+}
+
+#[test]
+fn mounted_fault_chaos_disabled_run_writes_reproducible_artifacts() {
+    let temp = tempdir().unwrap();
+    let request = RunRequest {
+        root: temp.path().join("e2e-runs"),
+        run_id: Some("fault-chaos-contract-run".to_string()),
+        scenarios: vec!["mounted-fault-chaos-convergence".to_string()],
+        seed: 360,
+        studiofs_bin: None,
+        platform: PlatformSelection::Auto,
+        retention: RetentionPolicy::Always,
+        report: None,
+        port_range: None,
+        timeout: None,
+        infra: InfraMode::Disabled,
+    };
+
+    let outcome = studiofs_e2e::runner::run(request).unwrap();
+
+    assert_eq!(outcome.status, RunStatus::Passed);
+    assert_eq!(outcome.scenarios[0].name, "mounted-fault-chaos-convergence");
+    assert!(
+        outcome.scenarios[0].artifacts.contains(
+            &"artifacts/scenarios/mounted-fault-chaos-convergence/mounted-fault-chaos-summary.json"
+                .to_string()
+        )
+    );
+    assert!(outcome.scenarios[0].artifacts.contains(
+        &"artifacts/scenarios/mounted-fault-chaos-convergence/validation.json".to_string()
+    ));
+
+    let sandbox = temp
+        .path()
+        .join("e2e-runs")
+        .join("fault-chaos-contract-run");
+    let summary = read_json(sandbox.join(
+        "artifacts/scenarios/mounted-fault-chaos-convergence/mounted-fault-chaos-summary.json",
+    ));
+    assert_eq!(summary["scenario"], "mounted-fault-chaos-convergence");
+    assert_eq!(summary["seed"], 360);
+    assert_eq!(summary["warm_clients"].as_array().unwrap().len(), 3);
+    assert_eq!(summary["cold_observer"], "client-d");
+    assert!(
+        summary["operation_log"]
+            .as_str()
+            .unwrap()
+            .ends_with("operations.ndjson")
+    );
+
+    let operations = read_operation_log(
+        sandbox.join("artifacts/scenarios/mounted-fault-chaos-convergence/operations.ndjson"),
+    )
+    .unwrap();
+    assert!(
+        operations
+            .iter()
+            .any(|record| matches!(&record.operation, ScenarioOperation::PostgresOutage))
+    );
+    assert!(
+        operations
+            .iter()
+            .any(|record| matches!(&record.operation, ScenarioOperation::ClientCrash))
+    );
+    assert!(
+        operations
+            .iter()
+            .any(|record| matches!(&record.operation, ScenarioOperation::ObjectStoreOutage))
+    );
+    assert!(
+        operations
+            .iter()
+            .any(|record| matches!(&record.operation, ScenarioOperation::MountedOnly { .. }))
+    );
 }
 
 #[test]

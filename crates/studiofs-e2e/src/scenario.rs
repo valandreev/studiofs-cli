@@ -42,9 +42,12 @@ pub const COLLISION_OVERWRITE_VS_READ: &str = "collision-overwrite-vs-read";
 pub const COLLISION_MKDIR_RMDIR_VS_CREATE: &str = "collision-mkdir-rmdir-vs-create";
 pub const COLLISION_READDIR_STAT_DURING_MUTATION: &str = "collision-readdir-stat-during-mutation";
 pub const MOUNTED_CHAOS_CONVERGENCE: &str = "mounted-chaos-convergence";
+pub const MOUNTED_FAULT_CHAOS_CONVERGENCE: &str = "mounted-fault-chaos-convergence";
 const SMOKE_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
 const COLLISION_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
 const CHAOS_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
+const FAULT_CHAOS_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c", "client-d"];
+const FAULT_CHAOS_WARM_CLIENTS: usize = 3;
 const POSTGRES_OUTAGE_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
 const RUSTFS_OUTAGE_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c", "client-d"];
 const CRASH_RESTART_CLIENT_NAMES: &[&str] = &["client-a", "client-b"];
@@ -75,6 +78,9 @@ const CHAOS_ROUNDS: usize = 12;
 const CHAOS_READ_ATTEMPTS: u32 = 4;
 const CHAOS_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(90);
 const CHAOS_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const FAULT_CHAOS_CONFLICT_ROUNDS: usize = 6;
+const FAULT_CHAOS_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(120);
+const FAULT_CHAOS_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 #[cfg(test)]
 pub(crate) const TEST_FAILING_VALIDATE: &str = "__test-failing-validate";
@@ -143,16 +149,24 @@ pub enum ScenarioError {
     InsufficientCollisionClients { expected: usize, actual: usize },
     #[error("mounted chaos scenario requires at least {expected} clients, got {actual}")]
     InsufficientChaosClients { expected: usize, actual: usize },
+    #[error("mounted fault chaos scenario requires at least {expected} clients, got {actual}")]
+    InsufficientFaultChaosClients { expected: usize, actual: usize },
     #[error("namespace collision scenario failed: {primary}; unmount also failed: {cleanup}")]
     NamespaceCollisionUnmountAfterFailure { primary: String, cleanup: String },
     #[error("mounted chaos scenario failed: {primary}; unmount also failed: {cleanup}")]
     MountedChaosUnmountAfterFailure { primary: String, cleanup: String },
+    #[error("mounted fault chaos scenario failed: {primary}; unmount also failed: {cleanup}")]
+    MountedFaultChaosUnmountAfterFailure { primary: String, cleanup: String },
     #[error("namespace collision validation failed: {violations:?}")]
     NamespaceInvariantViolations {
         violations: Vec<NamespaceInvariantViolation>,
     },
     #[error("mounted chaos validation failed: {violations:?}")]
     MountedChaosInvariantViolations {
+        violations: Vec<NamespaceInvariantViolation>,
+    },
+    #[error("mounted fault chaos validation failed: {violations:?}")]
+    MountedFaultChaosInvariantViolations {
         violations: Vec<NamespaceInvariantViolation>,
     },
     #[cfg(test)]
@@ -182,6 +196,7 @@ pub fn available_scenarios() -> Vec<ScenarioDefinition> {
         NamespaceCollisionScenario::new(NamespaceCollisionKind::ReaddirStatDuringMutation)
             .definition(),
         MountedChaosConvergence.definition(),
+        MountedFaultChaosConvergence.definition(),
     ]
 }
 
@@ -217,6 +232,9 @@ pub(crate) fn resolve_scenario(name: &str) -> Option<Box<dyn Scenario>> {
         )),
         MOUNTED_CHAOS_CONVERGENCE | "mounted-chaos" | "chaos" => {
             Some(Box::new(MountedChaosConvergence))
+        }
+        MOUNTED_FAULT_CHAOS_CONVERGENCE | "fault-chaos" | "chaos-faults" => {
+            Some(Box::new(MountedFaultChaosConvergence))
         }
         #[cfg(test)]
         TEST_FAILING_VALIDATE => Some(Box::new(TestFailingScenario {
@@ -2669,6 +2687,1001 @@ fn chaos_payload(seed: u64, round: usize, label: &str) -> Vec<u8> {
     format!("studiofs chaos seed={seed} round={round} label={label}\n").into_bytes()
 }
 
+#[derive(Debug, Clone, Copy)]
+struct MountedFaultChaosConvergence;
+
+impl Scenario for MountedFaultChaosConvergence {
+    fn definition(&self) -> ScenarioDefinition {
+        ScenarioDefinition {
+            name: MOUNTED_FAULT_CHAOS_CONVERGENCE,
+            description: "seeded mounted fault chaos convergence scenario",
+            requires_studiofs_bin: true,
+        }
+    }
+
+    fn setup(&self, context: &ScenarioContext) -> Result<(), ScenarioError> {
+        fs::create_dir_all(&context.scenario_dir)?;
+        Ok(())
+    }
+
+    fn run(&self, context: &ScenarioContext) -> Result<(), ScenarioError> {
+        if let Some(config) = &context.client_controller_config {
+            let compose_control = compose_control_from_manifest(context)?;
+            let mut driver = RealMountedFaultChaosDriver {
+                controller: MultiClientController::new(config.clone(), SystemClientProcessExecutor),
+                compose_control,
+                executor: SystemCommandExecutor,
+            };
+            run_mounted_fault_chaos_with_driver(
+                context,
+                &mut driver,
+                FAULT_CHAOS_CONVERGENCE_TIMEOUT,
+                FAULT_CHAOS_CONVERGENCE_POLL_INTERVAL,
+            )?;
+        } else {
+            write_mounted_fault_chaos_plan_artifacts(context)?;
+        }
+        Ok(())
+    }
+
+    fn validate(&self, context: &ScenarioContext) -> Result<Vec<String>, ScenarioError> {
+        let summary_path = context
+            .scenario_dir
+            .join("mounted-fault-chaos-summary.json");
+        if !summary_path.exists() {
+            return Err(ScenarioError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("missing summary artifact: {}", summary_path.display()),
+            )));
+        }
+        let summary: MountedFaultChaosSummary = serde_json::from_slice(&fs::read(&summary_path)?)?;
+        let validation = json!({
+            "scenario": MOUNTED_FAULT_CHAOS_CONVERGENCE,
+            "run_id": context.run_id,
+            "seed": context.seed,
+            "status": if summary.final_validator.converged
+                && summary.namespace_violations.is_empty() { "passed" } else { "failed" },
+            "warm_clients": summary.warm_clients,
+            "cold_observer": summary.cold_observer,
+            "restarted_client": summary.restarted_client,
+            "accepted_operations": summary.accepted_operations,
+            "rejected_operations": summary.rejected_operations,
+            "skipped_operations": summary.skipped_operations,
+            "postgres_outage_duration_ms": summary.postgres_outage_duration_ms,
+            "rustfs_outage_duration_ms": summary.rustfs_outage_duration_ms,
+            "restart_elapsed_ms": summary.restart_elapsed_ms,
+            "final_convergence_elapsed_ms": summary.final_convergence_elapsed_ms,
+            "final_validator": summary.final_validator,
+            "namespace_violations": summary.namespace_violations,
+            "final_payload_checksums": summary.final_payload_checksums,
+            "operation_log": summary.operation_log,
+        });
+        fs::write(
+            context.scenario_dir.join("validation.json"),
+            serde_json::to_vec_pretty(&validation)?,
+        )?;
+        Ok(vec![
+            format!(
+                "artifacts/scenarios/{MOUNTED_FAULT_CHAOS_CONVERGENCE}/mounted-fault-chaos-summary.json"
+            ),
+            format!("artifacts/scenarios/{MOUNTED_FAULT_CHAOS_CONVERGENCE}/validation.json"),
+        ])
+    }
+
+    fn cleanup(&self, _context: &ScenarioContext) -> Result<(), ScenarioError> {
+        Ok(())
+    }
+}
+
+trait MountedFaultChaosDriver {
+    fn bootstrap_volume(
+        &mut self,
+        options: VolumeBootstrapOptions,
+    ) -> Result<VolumeBootstrapSummary, ScenarioError>;
+    fn mount_client(&mut self, client: &str) -> Result<(), ScenarioError>;
+    fn clients(&self) -> Vec<ClientSpec>;
+    fn stop_postgres(&mut self) -> Result<(), ScenarioError>;
+    fn start_postgres(&mut self) -> Result<(), ScenarioError>;
+    fn stop_rustfs(&mut self) -> Result<(), ScenarioError>;
+    fn start_rustfs(&mut self) -> Result<(), ScenarioError>;
+    fn force_kill(&mut self, client: &str) -> Result<(), ScenarioError>;
+    fn remount(&mut self, client: &str) -> Result<(), ScenarioError>;
+    fn after_phase(
+        &mut self,
+        _phase: MountedFaultChaosPhase,
+        _clients: &[ClientSpec],
+    ) -> Result<(), ScenarioError> {
+        Ok(())
+    }
+    fn unmount_all(&mut self) -> Result<(), ScenarioError>;
+}
+
+struct RealMountedFaultChaosDriver<E> {
+    controller: MultiClientController<SystemClientProcessExecutor>,
+    compose_control: ComposeServiceControl,
+    executor: E,
+}
+
+impl<E: CommandExecutor> MountedFaultChaosDriver for RealMountedFaultChaosDriver<E> {
+    fn bootstrap_volume(
+        &mut self,
+        options: VolumeBootstrapOptions,
+    ) -> Result<VolumeBootstrapSummary, ScenarioError> {
+        Ok(self.controller.bootstrap_volume(options)?)
+    }
+
+    fn mount_client(&mut self, client: &str) -> Result<(), ScenarioError> {
+        Ok(self.controller.mount(client)?)
+    }
+
+    fn clients(&self) -> Vec<ClientSpec> {
+        self.controller.clients().into_iter().cloned().collect()
+    }
+
+    fn stop_postgres(&mut self) -> Result<(), ScenarioError> {
+        Ok(self
+            .compose_control
+            .stop_service(POSTGRES_SERVICE_NAME, &self.executor)?)
+    }
+
+    fn start_postgres(&mut self) -> Result<(), ScenarioError> {
+        Ok(self
+            .compose_control
+            .start_service(POSTGRES_SERVICE_NAME, &self.executor)?)
+    }
+
+    fn stop_rustfs(&mut self) -> Result<(), ScenarioError> {
+        Ok(self
+            .compose_control
+            .stop_service(RUSTFS_SERVICE_NAME, &self.executor)?)
+    }
+
+    fn start_rustfs(&mut self) -> Result<(), ScenarioError> {
+        Ok(self
+            .compose_control
+            .start_service(RUSTFS_SERVICE_NAME, &self.executor)?)
+    }
+
+    fn force_kill(&mut self, client: &str) -> Result<(), ScenarioError> {
+        Ok(self.controller.force_kill(client)?)
+    }
+
+    fn remount(&mut self, client: &str) -> Result<(), ScenarioError> {
+        Ok(self.controller.remount(client)?)
+    }
+
+    fn unmount_all(&mut self) -> Result<(), ScenarioError> {
+        Ok(self.controller.unmount_all()?)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum MountedFaultChaosPhase {
+    HealthyWarmup,
+    HealthyConflictBurst,
+    PostgresOutage,
+    CrashRestart,
+    RustfsOutage,
+    ColdObserverBootstrap,
+}
+
+impl MountedFaultChaosPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::HealthyWarmup => "healthy_warmup",
+            Self::HealthyConflictBurst => "healthy_conflict_burst",
+            Self::PostgresOutage => "postgres_outage",
+            Self::CrashRestart => "crash_restart",
+            Self::RustfsOutage => "rustfs_outage",
+            Self::ColdObserverBootstrap => "cold_observer_bootstrap",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct MountedFaultChaosSummary {
+    scenario: String,
+    seed: u64,
+    bootstrap: Option<VolumeBootstrapSummary>,
+    warm_clients: Vec<String>,
+    cold_observer: String,
+    restarted_client: String,
+    operations: Vec<MountedChaosOperation>,
+    accepted_operations: usize,
+    rejected_operations: usize,
+    skipped_operations: usize,
+    postgres_outage_duration_ms: u128,
+    rustfs_outage_duration_ms: u128,
+    restart_elapsed_ms: u128,
+    final_convergence_elapsed_ms: u128,
+    operation_log: String,
+    final_validator: TreeComparison,
+    namespace_violations: Vec<NamespaceInvariantViolation>,
+    final_payload_checksums: Vec<ClientPayloadChecksum>,
+}
+
+fn run_mounted_fault_chaos_with_driver(
+    context: &ScenarioContext,
+    driver: &mut dyn MountedFaultChaosDriver,
+    convergence_timeout: Duration,
+    poll_interval: Duration,
+) -> Result<MountedFaultChaosSummary, ScenarioError> {
+    let result = run_mounted_fault_chaos_body(context, driver, convergence_timeout, poll_interval);
+    let unmount_result = driver.unmount_all();
+    match (result, unmount_result) {
+        (Ok(summary), Ok(())) => Ok(summary),
+        (Err(primary), Err(cleanup)) => Err(ScenarioError::MountedFaultChaosUnmountAfterFailure {
+            primary: primary.to_string(),
+            cleanup: cleanup.to_string(),
+        }),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+fn run_mounted_fault_chaos_body(
+    context: &ScenarioContext,
+    driver: &mut dyn MountedFaultChaosDriver,
+    convergence_timeout: Duration,
+    poll_interval: Duration,
+) -> Result<MountedFaultChaosSummary, ScenarioError> {
+    let bootstrap = driver.bootstrap_volume(VolumeBootstrapOptions {
+        client_names: FAULT_CHAOS_CLIENT_NAMES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect(),
+        clean_existing_local_metadata: true,
+    })?;
+    write_bootstrap_summary(context, &bootstrap)?;
+    for name in FAULT_CHAOS_CLIENT_NAMES
+        .iter()
+        .take(FAULT_CHAOS_WARM_CLIENTS)
+    {
+        driver.mount_client(name)?;
+    }
+    let all_clients = driver.clients();
+    if all_clients.len() < FAULT_CHAOS_CLIENT_NAMES.len() {
+        return Err(ScenarioError::InsufficientFaultChaosClients {
+            expected: FAULT_CHAOS_CLIENT_NAMES.len(),
+            actual: all_clients.len(),
+        });
+    }
+    let warm_clients = all_clients
+        .iter()
+        .take(FAULT_CHAOS_WARM_CLIENTS)
+        .cloned()
+        .collect::<Vec<_>>();
+    let cold_observer = all_clients[FAULT_CHAOS_WARM_CLIENTS].clone();
+
+    establish_mounted_chaos_initial_tree(context.seed, &warm_clients[0])?;
+    establish_fault_chaos_initial_tree(context.seed, &warm_clients[0])?;
+    driver.after_phase(MountedFaultChaosPhase::HealthyWarmup, &warm_clients)?;
+    wait_for_convergence(
+        &client_mounts(&warm_clients),
+        context.scenario_dir.join("warmup-validation"),
+        convergence_timeout,
+        poll_interval,
+    )?;
+
+    let started = Instant::now();
+    let mut operations = Vec::new();
+    for round in 0..FAULT_CHAOS_CONFLICT_ROUNDS {
+        let mut round_operations =
+            perform_mounted_chaos_round(context.seed, started, round, &warm_clients);
+        for operation in &mut round_operations {
+            operation.path = format!("healthy_conflict_burst:{}", operation.path);
+        }
+        write_mounted_fault_chaos_operations(
+            context,
+            MountedFaultChaosPhase::HealthyConflictBurst,
+            &round_operations,
+        )?;
+        operations.append(&mut round_operations);
+    }
+    driver.after_phase(MountedFaultChaosPhase::HealthyConflictBurst, &warm_clients)?;
+
+    let postgres_outage_duration_ms =
+        run_fault_chaos_postgres_phase(context, driver, started, &warm_clients, &mut operations)?;
+    driver.after_phase(MountedFaultChaosPhase::PostgresOutage, &warm_clients)?;
+
+    let killed_index = (context.seed as usize) % warm_clients.len();
+    let restarted_client = warm_clients[killed_index].name.clone();
+    let restart_elapsed_ms = run_fault_chaos_crash_phase(
+        context,
+        driver,
+        started,
+        &warm_clients,
+        &restarted_client,
+        &mut operations,
+    )?;
+    driver.after_phase(MountedFaultChaosPhase::CrashRestart, &warm_clients)?;
+
+    let rustfs_outage_duration_ms =
+        run_fault_chaos_rustfs_phase(context, driver, started, &warm_clients, &mut operations)?;
+    driver.after_phase(MountedFaultChaosPhase::RustfsOutage, &warm_clients)?;
+
+    driver.mount_client(&cold_observer.name)?;
+    let mut final_clients = driver.clients();
+    final_clients.truncate(FAULT_CHAOS_CLIENT_NAMES.len());
+    driver.after_phase(
+        MountedFaultChaosPhase::ColdObserverBootstrap,
+        &final_clients,
+    )?;
+
+    finish_mounted_fault_chaos(
+        context,
+        Some(bootstrap),
+        final_clients,
+        cold_observer.name,
+        restarted_client,
+        operations,
+        MountedFaultChaosTimings {
+            postgres_outage_duration_ms,
+            rustfs_outage_duration_ms,
+            restart_elapsed_ms,
+        },
+        convergence_timeout,
+        poll_interval,
+    )
+}
+
+fn establish_fault_chaos_initial_tree(seed: u64, client: &ClientSpec) -> Result<(), ScenarioError> {
+    let root = client.mount_point.join("fault-chaos");
+    fs::create_dir_all(&root)?;
+    fs::write(
+        root.join("postgres-outage-local.txt"),
+        fault_payload(seed, "postgres-initial"),
+    )?;
+    fs::write(
+        root.join("crash-restart.txt"),
+        fault_payload(seed, "crash-initial"),
+    )?;
+    fs::write(
+        root.join("peer-while-crashed.txt"),
+        fault_payload(seed, "peer-initial"),
+    )?;
+    fs::write(
+        root.join("rustfs-outage-payload.bin"),
+        fault_payload(seed, "rustfs-initial"),
+    )?;
+    Ok(())
+}
+
+fn run_fault_chaos_postgres_phase(
+    context: &ScenarioContext,
+    driver: &mut dyn MountedFaultChaosDriver,
+    started: Instant,
+    clients: &[ClientSpec],
+    operations: &mut Vec<MountedChaosOperation>,
+) -> Result<u128, ScenarioError> {
+    let outage_started = Instant::now();
+    driver.stop_postgres()?;
+    let outage_record = fault_chaos_observed_operation(
+        started,
+        MountedFaultChaosPhase::PostgresOutage,
+        "postgres_outage",
+        SharedOperation::PostgresOutage,
+    );
+    write_mounted_fault_chaos_operations(
+        context,
+        MountedFaultChaosPhase::PostgresOutage,
+        std::slice::from_ref(&outage_record),
+    )?;
+    operations.push(outage_record);
+
+    let path = "fault-chaos/postgres-outage-local.txt";
+    let payload = fault_payload(context.seed, "postgres-outage-local-write");
+    let write_result = fs::write(clients[1].mount_point.join(path), &payload);
+    let write_operation = fault_chaos_client_operation(
+        started,
+        MountedFaultChaosPhase::PostgresOutage,
+        2,
+        &clients[1],
+        "write",
+        path,
+        SharedOperation::Write {
+            path: path.to_string(),
+            offset: Some(0),
+            bytes: u64::try_from(payload.len()).unwrap_or(u64::MAX),
+            checksum_sha256: Some(bytes_sha256(&payload)),
+        },
+        write_result.err(),
+    );
+    write_mounted_fault_chaos_operations(
+        context,
+        MountedFaultChaosPhase::PostgresOutage,
+        std::slice::from_ref(&write_operation),
+    )?;
+    if write_operation.result != "accepted" {
+        return Err(ScenarioError::RejectedOutageOperations {
+            rejected: 1,
+            total: 1,
+        });
+    }
+    operations.push(write_operation);
+
+    let local_read = fs::read(clients[1].mount_point.join(path))?;
+    let read_operation = fault_chaos_client_operation(
+        started,
+        MountedFaultChaosPhase::PostgresOutage,
+        3,
+        &clients[1],
+        "read",
+        path,
+        SharedOperation::Read {
+            path: path.to_string(),
+            bytes: Some(u64::try_from(local_read.len()).unwrap_or(u64::MAX)),
+            checksum_sha256: Some(bytes_sha256(&local_read)),
+        },
+        None,
+    );
+    write_mounted_fault_chaos_operations(
+        context,
+        MountedFaultChaosPhase::PostgresOutage,
+        std::slice::from_ref(&read_operation),
+    )?;
+    operations.push(read_operation);
+    let outage_duration_ms = elapsed_millis_nonzero(outage_started);
+
+    driver.start_postgres()?;
+    let recovery_record = fault_chaos_observed_operation(
+        started,
+        MountedFaultChaosPhase::PostgresOutage,
+        "postgres_recovery",
+        SharedOperation::PostgresRecovery,
+    );
+    write_mounted_fault_chaos_operations(
+        context,
+        MountedFaultChaosPhase::PostgresOutage,
+        std::slice::from_ref(&recovery_record),
+    )?;
+    operations.push(recovery_record);
+    Ok(outage_duration_ms)
+}
+
+fn run_fault_chaos_crash_phase(
+    context: &ScenarioContext,
+    driver: &mut dyn MountedFaultChaosDriver,
+    started: Instant,
+    clients: &[ClientSpec],
+    restarted_client: &str,
+    operations: &mut Vec<MountedChaosOperation>,
+) -> Result<u128, ScenarioError> {
+    let crashed = clients
+        .iter()
+        .find(|client| client.name == restarted_client)
+        .ok_or_else(|| {
+            ScenarioError::Io(std::io::Error::other(format!(
+                "missing selected restart client {restarted_client}"
+            )))
+        })?;
+    let path = "fault-chaos/crash-restart.txt";
+    let payload = fault_payload(context.seed, "crash-before-publication");
+    write_local_durable_payload(crashed.mount_point.join(path), &payload)?;
+    let write_operation = fault_chaos_client_operation(
+        started,
+        MountedFaultChaosPhase::CrashRestart,
+        1,
+        crashed,
+        "write",
+        path,
+        SharedOperation::Write {
+            path: path.to_string(),
+            offset: Some(0),
+            bytes: u64::try_from(payload.len()).unwrap_or(u64::MAX),
+            checksum_sha256: Some(bytes_sha256(&payload)),
+        },
+        None,
+    );
+    let fsync_operation = fault_chaos_client_operation(
+        started,
+        MountedFaultChaosPhase::CrashRestart,
+        2,
+        crashed,
+        "fsync",
+        path,
+        SharedOperation::Fsync {
+            path: path.to_string(),
+        },
+        None,
+    );
+    let restart_started = Instant::now();
+    driver.force_kill(restarted_client)?;
+    let crash_operation = fault_chaos_client_operation(
+        started,
+        MountedFaultChaosPhase::CrashRestart,
+        3,
+        crashed,
+        "client_crash",
+        restarted_client,
+        SharedOperation::ClientCrash,
+        None,
+    );
+    let peer = clients
+        .iter()
+        .find(|client| client.name != restarted_client)
+        .unwrap_or(&clients[0]);
+    let peer_path = "fault-chaos/peer-while-crashed.txt";
+    let peer_payload = fault_payload(context.seed, "peer-while-crashed");
+    let peer_write_result = fs::write(peer.mount_point.join(peer_path), &peer_payload);
+    let peer_operation = fault_chaos_client_operation(
+        started,
+        MountedFaultChaosPhase::CrashRestart,
+        4,
+        peer,
+        "peer_write_while_crashed",
+        peer_path,
+        SharedOperation::Write {
+            path: peer_path.to_string(),
+            offset: Some(0),
+            bytes: u64::try_from(peer_payload.len()).unwrap_or(u64::MAX),
+            checksum_sha256: Some(bytes_sha256(&peer_payload)),
+        },
+        peer_write_result.err(),
+    );
+    driver.remount(restarted_client)?;
+    let restart_operation = fault_chaos_client_operation(
+        started,
+        MountedFaultChaosPhase::CrashRestart,
+        5,
+        crashed,
+        "client_restart",
+        restarted_client,
+        SharedOperation::ClientRestart,
+        None,
+    );
+    let local_read = fs::read(crashed.mount_point.join(path))?;
+    if local_read != payload {
+        return Err(ScenarioError::Io(std::io::Error::other(format!(
+            "fault chaos restart durability failure: data read after restart does not match {path}"
+        ))));
+    }
+    let restart_elapsed_ms = elapsed_millis_nonzero(restart_started);
+    let phase_operations = vec![
+        write_operation,
+        fsync_operation,
+        crash_operation,
+        peer_operation,
+        restart_operation,
+    ];
+    write_mounted_fault_chaos_operations(
+        context,
+        MountedFaultChaosPhase::CrashRestart,
+        &phase_operations,
+    )?;
+    operations.extend(phase_operations);
+    Ok(restart_elapsed_ms)
+}
+
+fn run_fault_chaos_rustfs_phase(
+    context: &ScenarioContext,
+    driver: &mut dyn MountedFaultChaosDriver,
+    started: Instant,
+    clients: &[ClientSpec],
+    operations: &mut Vec<MountedChaosOperation>,
+) -> Result<u128, ScenarioError> {
+    let outage_started = Instant::now();
+    driver.stop_rustfs()?;
+    let outage_record = fault_chaos_observed_operation(
+        started,
+        MountedFaultChaosPhase::RustfsOutage,
+        "object_store_outage",
+        SharedOperation::ObjectStoreOutage,
+    );
+    let path = "fault-chaos/rustfs-outage-payload.bin";
+    let payload = fault_payload(context.seed, "rustfs-outage-payload-pressure").repeat(8);
+    let write_result = fs::write(clients[2].mount_point.join(path), &payload);
+    let write_operation = fault_chaos_client_operation(
+        started,
+        MountedFaultChaosPhase::RustfsOutage,
+        2,
+        &clients[2],
+        "write",
+        path,
+        SharedOperation::Write {
+            path: path.to_string(),
+            offset: Some(0),
+            bytes: u64::try_from(payload.len()).unwrap_or(u64::MAX),
+            checksum_sha256: Some(bytes_sha256(&payload)),
+        },
+        write_result.err(),
+    );
+    if write_operation.result != "accepted" {
+        write_mounted_fault_chaos_operations(
+            context,
+            MountedFaultChaosPhase::RustfsOutage,
+            &[outage_record.clone(), write_operation.clone()],
+        )?;
+        operations.extend([outage_record, write_operation]);
+        return Err(ScenarioError::RejectedOutageOperations {
+            rejected: 1,
+            total: 1,
+        });
+    }
+    let local_read = fs::read(clients[2].mount_point.join(path))?;
+    let read_operation = fault_chaos_client_operation(
+        started,
+        MountedFaultChaosPhase::RustfsOutage,
+        3,
+        &clients[2],
+        "read",
+        path,
+        SharedOperation::Read {
+            path: path.to_string(),
+            bytes: Some(u64::try_from(local_read.len()).unwrap_or(u64::MAX)),
+            checksum_sha256: Some(bytes_sha256(&local_read)),
+        },
+        None,
+    );
+    let outage_duration_ms = elapsed_millis_nonzero(outage_started);
+    driver.start_rustfs()?;
+    let recovery_record = fault_chaos_observed_operation(
+        started,
+        MountedFaultChaosPhase::RustfsOutage,
+        "object_store_recovery",
+        SharedOperation::ObjectStoreRecovery,
+    );
+    let phase_operations = vec![
+        outage_record,
+        write_operation,
+        read_operation,
+        recovery_record,
+    ];
+    write_mounted_fault_chaos_operations(
+        context,
+        MountedFaultChaosPhase::RustfsOutage,
+        &phase_operations,
+    )?;
+    operations.extend(phase_operations);
+    Ok(outage_duration_ms)
+}
+
+struct MountedFaultChaosTimings {
+    postgres_outage_duration_ms: u128,
+    rustfs_outage_duration_ms: u128,
+    restart_elapsed_ms: u128,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_mounted_fault_chaos(
+    context: &ScenarioContext,
+    bootstrap: Option<VolumeBootstrapSummary>,
+    clients: Vec<ClientSpec>,
+    cold_observer: String,
+    restarted_client: String,
+    operations: Vec<MountedChaosOperation>,
+    timings: MountedFaultChaosTimings,
+    convergence_timeout: Duration,
+    poll_interval: Duration,
+) -> Result<MountedFaultChaosSummary, ScenarioError> {
+    let convergence_started = Instant::now();
+    let convergence = wait_for_convergence(
+        &client_mounts(&clients),
+        context.scenario_dir.join("validation"),
+        convergence_timeout,
+        poll_interval,
+    )?;
+    let final_convergence_elapsed_ms = elapsed_millis_nonzero(convergence_started);
+    let mut namespace_violations = Vec::new();
+    for snapshot in &convergence.snapshots {
+        namespace_violations.extend(validate_namespace_invariants(snapshot, &[]));
+    }
+    if !namespace_violations.is_empty() {
+        return Err(ScenarioError::MountedFaultChaosInvariantViolations {
+            violations: namespace_violations,
+        });
+    }
+    let final_payload_checksums =
+        collect_fault_chaos_final_checksums(&clients, "fault-chaos/rustfs-outage-payload.bin")?;
+    let summary = mounted_fault_chaos_summary(
+        context,
+        bootstrap,
+        clients,
+        cold_observer,
+        restarted_client,
+        operations,
+        timings,
+        final_convergence_elapsed_ms,
+        convergence.comparison,
+        namespace_violations,
+        final_payload_checksums,
+    );
+    write_mounted_fault_chaos_summary(context, &summary)?;
+    Ok(summary)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mounted_fault_chaos_summary(
+    context: &ScenarioContext,
+    bootstrap: Option<VolumeBootstrapSummary>,
+    clients: Vec<ClientSpec>,
+    cold_observer: String,
+    restarted_client: String,
+    operations: Vec<MountedChaosOperation>,
+    timings: MountedFaultChaosTimings,
+    final_convergence_elapsed_ms: u128,
+    final_validator: TreeComparison,
+    namespace_violations: Vec<NamespaceInvariantViolation>,
+    final_payload_checksums: Vec<ClientPayloadChecksum>,
+) -> MountedFaultChaosSummary {
+    let accepted_operations = operations
+        .iter()
+        .filter(|operation| operation.result == "accepted")
+        .count();
+    let rejected_operations = operations
+        .iter()
+        .filter(|operation| operation.result == "rejected")
+        .count();
+    let skipped_operations = operations
+        .iter()
+        .filter(|operation| operation.result == "skipped")
+        .count();
+    MountedFaultChaosSummary {
+        scenario: MOUNTED_FAULT_CHAOS_CONVERGENCE.to_string(),
+        seed: context.seed,
+        bootstrap,
+        warm_clients: clients
+            .iter()
+            .take(FAULT_CHAOS_WARM_CLIENTS)
+            .map(|client| client.name.clone())
+            .collect(),
+        cold_observer,
+        restarted_client,
+        operations,
+        accepted_operations,
+        rejected_operations,
+        skipped_operations,
+        postgres_outage_duration_ms: timings.postgres_outage_duration_ms,
+        rustfs_outage_duration_ms: timings.rustfs_outage_duration_ms,
+        restart_elapsed_ms: timings.restart_elapsed_ms,
+        final_convergence_elapsed_ms,
+        operation_log: format!(
+            "artifacts/scenarios/{MOUNTED_FAULT_CHAOS_CONVERGENCE}/operations.ndjson"
+        ),
+        final_validator,
+        namespace_violations,
+        final_payload_checksums,
+    }
+}
+
+fn write_mounted_fault_chaos_plan_artifacts(
+    context: &ScenarioContext,
+) -> Result<MountedFaultChaosSummary, ScenarioError> {
+    fs::create_dir_all(&context.scenario_dir)?;
+    let started = Instant::now();
+    let mut operations = Vec::new();
+    for round in 0..FAULT_CHAOS_CONFLICT_ROUNDS {
+        let mut round_operations = planned_mounted_chaos_round(context.seed, started, round);
+        write_mounted_fault_chaos_operations(
+            context,
+            MountedFaultChaosPhase::HealthyConflictBurst,
+            &round_operations,
+        )?;
+        operations.append(&mut round_operations);
+    }
+    let planned_records = [
+        (
+            MountedFaultChaosPhase::PostgresOutage,
+            fault_chaos_observed_operation(
+                started,
+                MountedFaultChaosPhase::PostgresOutage,
+                "postgres_outage",
+                SharedOperation::PostgresOutage,
+            ),
+        ),
+        (
+            MountedFaultChaosPhase::PostgresOutage,
+            fault_chaos_observed_operation(
+                started,
+                MountedFaultChaosPhase::PostgresOutage,
+                "postgres_recovery",
+                SharedOperation::PostgresRecovery,
+            ),
+        ),
+        (
+            MountedFaultChaosPhase::CrashRestart,
+            fault_chaos_observed_operation(
+                started,
+                MountedFaultChaosPhase::CrashRestart,
+                "client_crash",
+                SharedOperation::ClientCrash,
+            ),
+        ),
+        (
+            MountedFaultChaosPhase::CrashRestart,
+            fault_chaos_observed_operation(
+                started,
+                MountedFaultChaosPhase::CrashRestart,
+                "client_restart",
+                SharedOperation::ClientRestart,
+            ),
+        ),
+        (
+            MountedFaultChaosPhase::RustfsOutage,
+            fault_chaos_observed_operation(
+                started,
+                MountedFaultChaosPhase::RustfsOutage,
+                "object_store_outage",
+                SharedOperation::ObjectStoreOutage,
+            ),
+        ),
+        (
+            MountedFaultChaosPhase::RustfsOutage,
+            fault_chaos_observed_operation(
+                started,
+                MountedFaultChaosPhase::RustfsOutage,
+                "object_store_recovery",
+                SharedOperation::ObjectStoreRecovery,
+            ),
+        ),
+        (
+            MountedFaultChaosPhase::ColdObserverBootstrap,
+            fault_chaos_observed_operation(
+                started,
+                MountedFaultChaosPhase::ColdObserverBootstrap,
+                "cold_observer_mount",
+                SharedOperation::MountedOnly {
+                    name: "cold_observer_mount".to_string(),
+                    reason: "mounting a late cold observer is mounted-E2E only".to_string(),
+                },
+            ),
+        ),
+    ];
+    for (phase, mut record) in planned_records {
+        record.result = "planned".to_string();
+        write_mounted_fault_chaos_operations(context, phase, std::slice::from_ref(&record))?;
+        operations.push(record);
+    }
+    let summary = MountedFaultChaosSummary {
+        scenario: MOUNTED_FAULT_CHAOS_CONVERGENCE.to_string(),
+        seed: context.seed,
+        bootstrap: None,
+        warm_clients: FAULT_CHAOS_CLIENT_NAMES
+            .iter()
+            .take(FAULT_CHAOS_WARM_CLIENTS)
+            .map(|name| (*name).to_string())
+            .collect(),
+        cold_observer: FAULT_CHAOS_CLIENT_NAMES[FAULT_CHAOS_WARM_CLIENTS].to_string(),
+        restarted_client: FAULT_CHAOS_CLIENT_NAMES
+            [(context.seed as usize) % FAULT_CHAOS_WARM_CLIENTS]
+            .to_string(),
+        accepted_operations: 0,
+        rejected_operations: 0,
+        skipped_operations: 0,
+        operations,
+        postgres_outage_duration_ms: 0,
+        rustfs_outage_duration_ms: 0,
+        restart_elapsed_ms: 0,
+        final_convergence_elapsed_ms: 0,
+        operation_log: format!(
+            "artifacts/scenarios/{MOUNTED_FAULT_CHAOS_CONVERGENCE}/operations.ndjson"
+        ),
+        final_validator: TreeComparison {
+            converged: true,
+            reference_client: Some(FAULT_CHAOS_CLIENT_NAMES[0].to_string()),
+            compared_clients: FAULT_CHAOS_CLIENT_NAMES
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
+            differences: Vec::new(),
+        },
+        namespace_violations: Vec::new(),
+        final_payload_checksums: Vec::new(),
+    };
+    write_mounted_fault_chaos_summary(context, &summary)?;
+    Ok(summary)
+}
+
+fn fault_chaos_observed_operation(
+    started: Instant,
+    phase: MountedFaultChaosPhase,
+    operation: &'static str,
+    shared_operation: SharedOperation,
+) -> MountedChaosOperation {
+    MountedChaosOperation {
+        round: phase as usize,
+        order: 0,
+        client: String::new(),
+        operation: operation.to_string(),
+        path: operation.to_string(),
+        shared_operation,
+        result: "observed".to_string(),
+        timestamp_ms: elapsed_millis_u64(started),
+        error: None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fault_chaos_client_operation(
+    started: Instant,
+    phase: MountedFaultChaosPhase,
+    order: usize,
+    client: &ClientSpec,
+    operation: &'static str,
+    path: &str,
+    shared_operation: SharedOperation,
+    error: Option<io::Error>,
+) -> MountedChaosOperation {
+    let error = error.map(|error| error.to_string());
+    MountedChaosOperation {
+        round: phase as usize,
+        order,
+        client: client.name.clone(),
+        operation: operation.to_string(),
+        path: path.to_string(),
+        shared_operation,
+        result: if error.is_some() {
+            "rejected".to_string()
+        } else {
+            "accepted".to_string()
+        },
+        timestamp_ms: elapsed_millis_u64(started),
+        error,
+    }
+}
+
+fn write_mounted_fault_chaos_operations(
+    context: &ScenarioContext,
+    phase: MountedFaultChaosPhase,
+    operations: &[MountedChaosOperation],
+) -> Result<(), ScenarioError> {
+    let path = operation_log_path(context);
+    let mut writer = OperationLogWriter::open_append(&path)?;
+    for operation in operations {
+        let mut record = shared_operation_record(
+            &writer,
+            MOUNTED_FAULT_CHAOS_CONVERGENCE,
+            operation.shared_operation.clone(),
+        )
+        .with_timestamp_ms(operation.timestamp_ms)
+        .with_outcome(mounted_chaos_outcome(operation))
+        .with_metadata("phase", phase.as_str())
+        .with_metadata("operation", operation.operation.clone());
+        if !operation.client.is_empty() {
+            record = record.with_client(&operation.client);
+        }
+        if operation.error.is_some() {
+            record = record.with_metadata("result", &operation.result);
+        }
+        append_shared_record(&mut writer, &record)?;
+    }
+    Ok(())
+}
+
+fn collect_fault_chaos_final_checksums(
+    clients: &[ClientSpec],
+    relative_path: &str,
+) -> Result<Vec<ClientPayloadChecksum>, ScenarioError> {
+    clients
+        .iter()
+        .map(|client| {
+            let checksum = bytes_sha256(&fs::read(client.mount_point.join(relative_path))?);
+            Ok(ClientPayloadChecksum {
+                client: client.name.clone(),
+                checksum_sha256: checksum,
+            })
+        })
+        .collect()
+}
+
+fn write_mounted_fault_chaos_summary(
+    context: &ScenarioContext,
+    summary: &MountedFaultChaosSummary,
+) -> Result<(), ScenarioError> {
+    fs::write(
+        context
+            .scenario_dir
+            .join("mounted-fault-chaos-summary.json"),
+        serde_json::to_vec_pretty(summary)?,
+    )?;
+    Ok(())
+}
+
+fn fault_payload(seed: u64, label: &str) -> Vec<u8> {
+    format!("studiofs fault chaos seed={seed} label={label}\n").into_bytes()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum NamespaceCollisionKind {
@@ -4915,6 +5928,20 @@ mod tests {
         assert!(resolve_scenario(MOUNTED_CHAOS_CONVERGENCE).is_some());
         assert!(resolve_scenario("mounted-chaos").is_some());
         assert!(resolve_scenario("chaos").is_some());
+    }
+
+    #[test]
+    fn registry_exposes_mounted_fault_chaos_convergence_scenario() {
+        let scenarios = available_scenarios();
+
+        assert!(scenarios.iter().any(|scenario| {
+            scenario.name == MOUNTED_FAULT_CHAOS_CONVERGENCE
+                && scenario.requires_studiofs_bin
+                && scenario.description.contains("fault chaos")
+        }));
+        assert!(resolve_scenario(MOUNTED_FAULT_CHAOS_CONVERGENCE).is_some());
+        assert!(resolve_scenario("fault-chaos").is_some());
+        assert!(resolve_scenario("chaos-faults").is_some());
     }
 
     #[test]
