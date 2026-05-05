@@ -588,6 +588,9 @@ impl StudioVfs {
             let mut to_invalidate = last_snapshot.clone();
             to_invalidate.extend(current_snapshot.inodes.iter().copied());
             self.invalidate_attr_read_cache(to_invalidate.iter().copied());
+            self.state
+                .read
+                .published_read_plan_cache_remove(to_invalidate.iter().copied());
             self.invalidate_kernel_inodes(to_invalidate.iter().copied());
             if namespace_changed {
                 self.bump_namespace_epoch();

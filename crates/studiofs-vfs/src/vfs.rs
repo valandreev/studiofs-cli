@@ -1664,6 +1664,16 @@ impl ReadState {
         );
     }
 
+    fn published_read_plan_cache_remove<I>(&self, inodes: I)
+    where
+        I: IntoIterator<Item = Ino>,
+    {
+        let mut cache = self.published_read_plan_cache.lock();
+        for ino in inodes {
+            cache.remove(&ino);
+        }
+    }
+
     fn fallback_access_state(&self, ino: Ino, is_write: bool) -> Arc<Mutex<HandleAccessState>> {
         let states = if is_write {
             &self.write_access_fallback

@@ -392,15 +392,22 @@ impl<'a> NamespaceDeleteTxn<'a> {
         RedbMetaEngine::remove_dentry_overlay_in_txn(self.txn, spec.parent, spec.name)?;
 
         attr.nlink = attr.nlink.saturating_sub(1);
+        let has_published_base = attr.kind == FileType::RegularFile
+            && RedbMetaEngine::has_regular_file_chunk_rows_in_write_txn(
+                self.txn,
+                REGULAR_FILE_BASE_TABLE,
+                entry.ino,
+            )?;
+        let attr_dirty =
+            attr.content_epoch != attr.committed_content_epoch || attr.size != attr.committed_size;
+        let graph_dirty = attr.kind == FileType::RegularFile
+            && RedbMetaEngine::regular_file_overlay_differs_from_base_in_write_txn(
+                self.txn, entry.ino,
+            )?;
         let deleted_before_publish = if attr.nlink == 0
             && attr.kind == FileType::RegularFile
-            && (attr.content_epoch != attr.committed_content_epoch
-                || attr.size != attr.committed_size
-                || RedbMetaEngine::has_regular_file_chunk_rows_in_write_txn(
-                    self.txn,
-                    REGULAR_FILE_OVERLAY_TABLE,
-                    entry.ino,
-                )?) {
+            && (graph_dirty || (attr_dirty && !has_published_base))
+        {
             let uploaded_overlay_object_ids =
                 self.uploaded_overlay_object_ids_in_write_txn(entry.ino)?;
             if !uploaded_overlay_object_ids.is_empty() {

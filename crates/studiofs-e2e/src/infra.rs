@@ -60,6 +60,7 @@ struct ServicePortSpec {
 pub enum InfraMode {
     Disabled,
     Compose,
+    ExternalEnv,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

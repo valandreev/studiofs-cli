@@ -36,6 +36,7 @@ cargo run -p studiofs-e2e -- run rustfs-outage-multi-client-recovery --studiofs-
 cargo run -p studiofs-e2e -- run mounted-client-crash-restart-recovery --studiofs-bin <path-to-studiofs>
 cargo run -p studiofs-e2e -- run collision-rename-vs-unlink --studiofs-bin <path-to-studiofs>
 cargo run -p studiofs-e2e -- run mounted-fault-chaos-convergence --studiofs-bin <path-to-studiofs>
+cargo run -p studiofs-e2e -- run mounted-lww-reconnect-chaos-convergence --studiofs-bin <path-to-studiofs>
 cargo run -p studiofs-e2e -- clean
 ```
 
@@ -58,16 +59,22 @@ Required initial run flags and environment:
 | Flag | Contract |
 |---|---|
 | `basic-multi-client-smoke` | Positional shorthand for the mounted three-client happy-path smoke scenario. |
-| `--scenario <name>` | Repeatable. Accepted values include `basic-multi-client-smoke` (`smoke`), `postgres-outage-multi-client-recovery` (`postgres-outage`), `rustfs-outage-multi-client-recovery` (`rustfs-outage`, `s3-outage`), `mounted-client-crash-restart-recovery` (`client-crash-restart`, `crash-restart`), `mounted-chaos-convergence` (`mounted-chaos`, `chaos`), `mounted-fault-chaos-convergence` (`fault-chaos`, `chaos-faults`), and the mounted namespace collision scenarios `collision-rename-vs-rename`, `collision-rename-vs-unlink`, `collision-unlink-vs-append`, `collision-overwrite-vs-read`, `collision-mkdir-rmdir-vs-create`, and `collision-readdir-stat-during-mutation`. |
-| `--studiofs-bin <path>` | Path to the product CLI under test. Real mounted scenarios require it when `--infra compose` is used. The runner may build it only when an explicit build flag is added. |
+| `--scenario <name>` | Repeatable. Accepted values include `basic-multi-client-smoke` (`smoke`), `postgres-outage-multi-client-recovery` (`postgres-outage`), `rustfs-outage-multi-client-recovery` (`rustfs-outage`, `s3-outage`), `mounted-client-crash-restart-recovery` (`client-crash-restart`, `crash-restart`), `mounted-chaos-convergence` (`mounted-chaos`, `chaos`), `mounted-fault-chaos-convergence` (`fault-chaos`, `chaos-faults`), `mounted-lww-reconnect-chaos-convergence` (`lww-chaos`, `reconnect-lww`), and the mounted namespace collision scenarios `collision-rename-vs-rename`, `collision-rename-vs-unlink`, `collision-unlink-vs-append`, `collision-overwrite-vs-read`, `collision-mkdir-rmdir-vs-create`, and `collision-readdir-stat-during-mutation`. |
+| `--studiofs-bin <path>` | Path to the product CLI under test. Real mounted scenarios require it when `--infra compose` or `--infra external-env` is used. The runner may build it only when an explicit build flag is added. |
 | `--root <path>` | Parent run directory. Defaults to `target/e2e-runs`. |
 | `--run-id <id>` | Optional stable run ID. If omitted, use an ISO-like UTC timestamp plus short random suffix. Explicit IDs must be safe single directory names: no separators, drive prefixes, traversal segments, leading dots, or other shell/path metacharacters. |
 | `--platform auto|linux-fuse|macos-fuse|windows-winfsp` | Mount backend selection. `auto` resolves from host OS and installed driver checks. |
-| `--infra compose|disabled` | External infrastructure mode. `compose` starts `docker/compose.e2e.yml`, waits for healthy required services, collects Docker logs, and tears the stack down. `disabled` is reserved for runner self-tests and skeleton-only validation. |
+| `--infra compose|external-env|disabled` | External infrastructure mode. `compose` starts `docker/compose.e2e.yml`, waits for healthy required services, collects Docker logs, and tears the stack down. `external-env` uses caller-provided PostgreSQL and S3/RustFS settings from process environment or `.env` and never starts, stops, or cleans those services. `disabled` is reserved for runner self-tests and skeleton-only validation. |
 | `--retain always|on-failure|never` | Sandbox retention policy. Default is `on-failure`. |
 | `--report <path>` | Optional copy target for the final `report.json`. The canonical report remains in the run sandbox while the sandbox is retained. |
 | `--port-range <start-end>` | Optional deterministic host port pool for Docker services. The compose runner allocates PostgreSQL, RustFS S3, RustFS console, and Toxiproxy API ports in that order. |
 | `STUDIOFS_E2E_COMPOSE_FILE` | Optional environment override for the compose file path. Defaults to `docker/compose.e2e.yml` discovered from the current directory or executable location. |
+| `STUDIOFS_E2E_EXTERNAL_PG_DSN` / `STUDIOFS_TEST_PG_DSN` | PostgreSQL DSN for `--infra external-env`. The E2E-specific variable wins when both are set. |
+| `STUDIOFS_E2E_EXTERNAL_S3_ENDPOINT` / `STUDIOFS_TEST_ONLINE_S3_ENDPOINT` / `STUDIOFS_S3_ENDPOINT` | S3/RustFS endpoint for `--infra external-env`. |
+| `STUDIOFS_E2E_EXTERNAL_S3_BUCKET` / `STUDIOFS_TEST_ONLINE_S3_BUCKET` / `STUDIOFS_S3_BUCKET` | S3/RustFS bucket for `--infra external-env`. The runner uses a unique StudioFS volume name per run inside this bucket. |
+| `STUDIOFS_E2E_EXTERNAL_S3_ACCESS_KEY` / `STUDIOFS_TEST_ONLINE_S3_ACCESS_KEY` / `STUDIOFS_S3_ACCESS_KEY` | S3/RustFS access key for `--infra external-env`. |
+| `STUDIOFS_E2E_EXTERNAL_S3_SECRET_KEY` / `STUDIOFS_TEST_ONLINE_S3_SECRET_KEY` / `STUDIOFS_S3_SECRET_KEY` | S3/RustFS secret key for `--infra external-env`. |
+| `STUDIOFS_E2E_EXTERNAL_S3_REGION` / `STUDIOFS_TEST_ONLINE_S3_REGION` / `STUDIOFS_S3_REGION` | Optional S3/RustFS region for `--infra external-env`; defaults to `us-east-1`. |
 | `--timeout <duration>` | Whole-run timeout; per-hook timeouts are derived from it unless overridden later. |
 
 The initial runner implements `list`, `run`, and `clean`. Future subcommands
@@ -329,6 +336,20 @@ four clients, including the restarted client and the cold observer. The
 scenario writes `operations.ndjson`, `mounted-fault-chaos-summary.json`, and
 `validation.json`; outage/crash/restart/cold-observer boundaries are recorded
 with the shared `ScenarioOperationRecord` schema.
+
+`mounted-lww-reconnect-chaos-convergence` is the oracle-backed LWW reconnect
+scenario. It uses five clients against one shared remote volume. Four clients
+start warm; `client-c` is force-killed as a stale writer, `client-a` and
+`client-b` publish ordered writes to the same path while `client-c` is offline,
+then `client-c` remounts, writes the third ordered version, is crash/restarted
+before final convergence, and `client-e` mounts late as a cold observer. Final
+validation still requires mounted tree convergence across all five clients, but
+it also validates `lww-chaos/winner.txt` against an explicit LWW oracle derived
+from the planned operation order. This catches failures where every mounted
+client converges to the same tree but the winner is not the last expected
+writer. The scenario writes `operations.ndjson`,
+`mounted-lww-reconnect-chaos-summary.json`, `lww-oracle.json`, and
+`validation.json`.
 
 ## Mounted Tree Convergence Validation
 

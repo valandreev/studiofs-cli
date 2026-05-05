@@ -4641,6 +4641,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "dotenvy",
  "serde",
  "serde_json",
  "sha2",

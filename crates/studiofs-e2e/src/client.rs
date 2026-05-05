@@ -81,6 +81,83 @@ impl ClientControllerConfig {
             mount_points: Vec::new(),
         })
     }
+
+    pub fn from_external_env(
+        studiofs_bin: PathBuf,
+        sandbox: PathBuf,
+        run_id: &str,
+        seed: u64,
+    ) -> Result<Self, ClientControllerError> {
+        let sanitized_run_id = sanitize_dns_label(run_id);
+        let volume_stem = prefixed_dns_name(
+            E2E_VOLUME_PREFIX,
+            &format!("{sanitized_run_id}-{seed}"),
+            S3_BUCKET_NAME_MAX_CHARS,
+        );
+        let external_env = ExternalEnvValues::load();
+        let meta_dsn = external_env
+            .value(&["STUDIOFS_E2E_EXTERNAL_PG_DSN", "STUDIOFS_TEST_PG_DSN"])
+            .ok_or_else(|| ClientControllerError::MissingExternalEnv {
+                names: "STUDIOFS_E2E_EXTERNAL_PG_DSN or STUDIOFS_TEST_PG_DSN".to_string(),
+            })?;
+        let endpoint = external_env.value(&[
+            "STUDIOFS_E2E_EXTERNAL_S3_ENDPOINT",
+            "STUDIOFS_TEST_ONLINE_S3_ENDPOINT",
+            "STUDIOFS_S3_ENDPOINT",
+        ])
+        .ok_or_else(|| ClientControllerError::MissingExternalEnv {
+            names: "STUDIOFS_E2E_EXTERNAL_S3_ENDPOINT, STUDIOFS_TEST_ONLINE_S3_ENDPOINT, or STUDIOFS_S3_ENDPOINT".to_string(),
+        })?;
+        let bucket = external_env.value(&[
+            "STUDIOFS_E2E_EXTERNAL_S3_BUCKET",
+            "STUDIOFS_TEST_ONLINE_S3_BUCKET",
+            "STUDIOFS_S3_BUCKET",
+        ])
+        .ok_or_else(|| ClientControllerError::MissingExternalEnv {
+            names: "STUDIOFS_E2E_EXTERNAL_S3_BUCKET, STUDIOFS_TEST_ONLINE_S3_BUCKET, or STUDIOFS_S3_BUCKET".to_string(),
+        })?;
+        let access_key = external_env.value(&[
+            "STUDIOFS_E2E_EXTERNAL_S3_ACCESS_KEY",
+            "STUDIOFS_TEST_ONLINE_S3_ACCESS_KEY",
+            "STUDIOFS_S3_ACCESS_KEY",
+        ])
+        .ok_or_else(|| ClientControllerError::MissingExternalEnv {
+            names: "STUDIOFS_E2E_EXTERNAL_S3_ACCESS_KEY, STUDIOFS_TEST_ONLINE_S3_ACCESS_KEY, or STUDIOFS_S3_ACCESS_KEY".to_string(),
+        })?;
+        let secret_key = external_env.value(&[
+            "STUDIOFS_E2E_EXTERNAL_S3_SECRET_KEY",
+            "STUDIOFS_TEST_ONLINE_S3_SECRET_KEY",
+            "STUDIOFS_S3_SECRET_KEY",
+        ])
+        .ok_or_else(|| ClientControllerError::MissingExternalEnv {
+            names: "STUDIOFS_E2E_EXTERNAL_S3_SECRET_KEY, STUDIOFS_TEST_ONLINE_S3_SECRET_KEY, or STUDIOFS_S3_SECRET_KEY".to_string(),
+        })?;
+        let region = external_env
+            .value(&[
+                "STUDIOFS_E2E_EXTERNAL_S3_REGION",
+                "STUDIOFS_TEST_ONLINE_S3_REGION",
+                "STUDIOFS_S3_REGION",
+            ])
+            .unwrap_or_else(|| "us-east-1".to_string());
+        Ok(Self {
+            studiofs_bin,
+            sandbox,
+            volume_name: volume_stem,
+            meta_dsn,
+            s3: S3Config {
+                endpoint,
+                bucket,
+                access_key,
+                secret_key,
+                region,
+            },
+            init_retry_timeout: Duration::from_secs(30),
+            mount_ready_timeout: Duration::from_secs(30),
+            mount_exit_timeout: Duration::from_secs(15),
+            poll_interval: Duration::from_millis(100),
+            mount_points: Vec::new(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -262,6 +339,8 @@ pub enum ClientControllerError {
     MountPointAlreadyActive { client: String, path: PathBuf },
     #[error("Docker compose service port is missing for {0}")]
     MissingServicePort(String),
+    #[error("external E2E infrastructure env is missing: {names}")]
+    MissingExternalEnv { names: String },
     #[error(
         "client command {action} for {client} failed with exit status {status}: stderr: {stderr}; stdout: {stdout}"
     )]
@@ -952,6 +1031,63 @@ fn service_port<'a>(
         .ok_or_else(|| ClientControllerError::MissingServicePort(service.to_string()))
 }
 
+struct ExternalEnvValues {
+    dotenv_values: Vec<Vec<(String, String)>>,
+}
+
+impl ExternalEnvValues {
+    fn load() -> Self {
+        Self::load_from_paths(candidate_dotenv_paths())
+    }
+
+    fn load_from_paths(paths: Vec<PathBuf>) -> Self {
+        let dotenv_values = paths
+            .into_iter()
+            .filter_map(|dotenv_path| {
+                let iter = dotenvy::from_path_iter(&dotenv_path).ok()?;
+                Some(iter.filter_map(Result::ok).collect::<Vec<_>>())
+            })
+            .collect();
+        Self { dotenv_values }
+    }
+
+    fn value(&self, names: &[&str]) -> Option<String> {
+        for name in names {
+            if let Ok(value) = std::env::var(name) {
+                if !value.trim().is_empty() {
+                    return Some(value);
+                }
+            }
+        }
+        for values in &self.dotenv_values {
+            for name in names {
+                if let Some((_, value)) = values
+                    .iter()
+                    .find(|(key, value)| key == name && !value.trim().is_empty())
+                {
+                    return Some(value.clone());
+                }
+            }
+        }
+        None
+    }
+}
+
+fn candidate_dotenv_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        for ancestor in cwd.ancestors() {
+            paths.push(ancestor.join(".env"));
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        for ancestor in exe.ancestors() {
+            paths.push(ancestor.join(".env"));
+        }
+    }
+    paths
+}
+
 fn sanitize_dns_label(value: &str) -> String {
     let mut sanitized = String::new();
     let mut last_was_dash = false;
@@ -1305,6 +1441,37 @@ mod tests {
         assert!(env.iter().any(|(key, value)| {
             key == "STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS" && value == "1000"
         }));
+    }
+
+    #[test]
+    fn external_env_values_parse_dotenv_paths_once_and_preserve_lookup_order() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first = temp.path().join("first.env");
+        let second = temp.path().join("second.env");
+        std::fs::write(
+            &first,
+            "STUDIOFS_TEST_ONLINE_S3_ENDPOINT=http://first\nSTUDIOFS_S3_REGION=\n",
+        )
+        .expect("write first env");
+        std::fs::write(
+            &second,
+            "STUDIOFS_TEST_ONLINE_S3_ENDPOINT=http://second\nSTUDIOFS_S3_REGION=eu-test-1\n",
+        )
+        .expect("write second env");
+
+        let values = ExternalEnvValues::load_from_paths(vec![first, second]);
+
+        assert_eq!(
+            values.value(&[
+                "STUDIOFS_E2E_EXTERNAL_S3_ENDPOINT",
+                "STUDIOFS_TEST_ONLINE_S3_ENDPOINT",
+            ]),
+            Some("http://first".to_string())
+        );
+        assert_eq!(
+            values.value(&["STUDIOFS_S3_REGION"]),
+            Some("eu-test-1".to_string())
+        );
     }
 
     #[test]

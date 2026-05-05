@@ -2465,7 +2465,7 @@ impl PgMetaEngine {
         let conflict = match event {
             MetaEvent::RemoveAttr { ino } => {
                 if removed_inodes.contains(ino) {
-                    return Ok(false);
+                    return Ok(overlay.block_inodes.contains(ino));
                 }
                 overlay.block_inodes.contains(ino)
                     || overlay.attr_inodes.contains(ino)
@@ -2556,17 +2556,41 @@ impl PgMetaEngine {
     fn removed_inodes_for_batch(&self, batch_events: &[MetaEvent]) -> HashSet<Ino> {
         let mut removed = HashSet::new();
         for event in batch_events {
-            if let MetaEvent::RemoveEntry { parent, name } = event
-                && let Ok(Some(entry)) = self
+            if let MetaEvent::RemoveEntry { parent, name } = event {
+                let entry = self
                     .local
                     .lookup(*parent, name)
                     .map(Some)
-                    .or_else(|_| self.local.lookup_base_dentry(*parent, name))
-            {
-                removed.insert(entry.ino);
+                    .or_else(|_| self.local.lookup_base_dentry(*parent, name));
+                if let Ok(Some(entry)) = entry {
+                    removed.insert(entry.ino);
+                }
             }
         }
         removed
+    }
+
+    fn preserved_dentry_keys_for_batch(
+        &self,
+        batch_events: &[MetaEvent],
+        overlay: &OverlayConflictSets,
+    ) -> MetaResult<HashSet<Vec<u8>>> {
+        let mut preserved = HashSet::new();
+        for event in batch_events {
+            if let MetaEvent::RemoveEntry { parent, name } = event {
+                let entry = self
+                    .local
+                    .lookup(*parent, name)
+                    .map(Some)
+                    .or_else(|_| self.local.lookup_base_dentry(*parent, name));
+                if let Ok(Some(entry)) = entry {
+                    if overlay.block_inodes.contains(&entry.ino) {
+                        preserved.insert(Self::dentry_key(*parent, name));
+                    }
+                }
+            }
+        }
+        Ok(preserved)
     }
 
     fn overlay_conflicts_for_events(events: &[MetaEvent]) -> OverlayConflictSets {
@@ -2668,20 +2692,32 @@ impl PgMetaEngine {
     }
 
     fn local_overlay_conflicts(&self) -> MetaResult<OverlayConflictSets> {
+        let mut overlay = OverlayConflictSets {
+            block_inodes: self.local.local_overlay_inodes()?,
+            attr_inodes: self.local.local_overlay_attr_inodes()?,
+            dentry_keys: self.local.local_overlay_dentries()?,
+            symlink_inodes: self.local.local_overlay_symlink_inodes()?,
+            xattr_inodes: self.local.local_overlay_xattr_inodes()?,
+            xattr_keys: self.local.local_overlay_xattr_keys()?,
+            acl_keys: self.local.local_overlay_acl_keys()?,
+        };
         let start = self.flushed_event_seq.load(Ordering::SeqCst);
         let end = self.local.get_counter("nextEventSeq")?;
         if end <= start {
-            return Ok(OverlayConflictSets::default());
+            return Ok(overlay);
         }
 
         let events = self.local.read_events_range(start, end)?;
-        Ok(Self::overlay_conflicts_for_events(&events))
+        overlay =
+            Self::merge_overlay_conflicts(&overlay, &Self::overlay_conflicts_for_events(&events));
+        Ok(overlay)
     }
 
     fn serving_event_conflicts_with_overlay(
         event: &MetaEvent,
         overlay: &OverlayConflictSets,
         removed_inodes: &HashSet<Ino>,
+        preserved_dentry_keys: &HashSet<Vec<u8>>,
     ) -> bool {
         match event {
             MetaEvent::SetAttr { attr } => {
@@ -2689,7 +2725,7 @@ impl PgMetaEngine {
             }
             MetaEvent::RemoveAttr { ino } => {
                 if removed_inodes.contains(ino) {
-                    return false;
+                    return overlay.block_inodes.contains(ino);
                 }
                 overlay.block_inodes.contains(ino)
                     || overlay.attr_inodes.contains(ino)
@@ -2697,6 +2733,9 @@ impl PgMetaEngine {
                     || overlay.xattr_inodes.contains(ino)
             }
             MetaEvent::AddEntry { parent, name, .. } | MetaEvent::RemoveEntry { parent, name } => {
+                if preserved_dentry_keys.contains(&Self::dentry_key(*parent, name)) {
+                    return true;
+                }
                 overlay
                     .dentry_keys
                     .contains(&Self::dentry_key(*parent, name))
@@ -2803,11 +2842,28 @@ impl PgMetaEngine {
         overlay: &OverlayConflictSets,
     ) -> MetaResult<bool> {
         let removed_inodes = self.removed_inodes_for_batch(batch_events);
+        let preserved_dentry_keys = self.preserved_dentry_keys_for_batch(batch_events, overlay)?;
+        let preserve_local_payload_inodes = batch_events
+            .iter()
+            .filter_map(|event| match event {
+                MetaEvent::RemoveAttr { ino }
+                    if removed_inodes.contains(ino) && overlay.block_inodes.contains(ino) =>
+                {
+                    Some(*ino)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         self.local.apply_replica_events_to_base(batch_events)?;
         let serving_events: Vec<MetaEvent> = batch_events
             .iter()
             .filter(|event| {
-                !Self::serving_event_conflicts_with_overlay(event, overlay, &removed_inodes)
+                !Self::serving_event_conflicts_with_overlay(
+                    event,
+                    overlay,
+                    &removed_inodes,
+                    &preserved_dentry_keys,
+                )
             })
             .cloned()
             .collect();
@@ -2823,10 +2879,18 @@ impl PgMetaEngine {
         }
 
         if aux_events.is_empty() {
+            for ino in preserve_local_payload_inodes {
+                self.local
+                    .mark_local_regular_file_ready_preserving_overlay(ino)?;
+            }
             return Ok(false);
         }
 
         self.local.apply_replica_aux_state(&aux_events)?;
+        for ino in preserve_local_payload_inodes {
+            self.local
+                .mark_local_regular_file_ready_preserving_overlay(ino)?;
+        }
         Ok(true)
     }
 
@@ -5411,6 +5475,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn later_foreign_publish_replaces_flushed_local_payload() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+        let file = create_published_small_file(&pg, ROOT_INO, b"lww-payload.txt", 77_201);
+        publish_local_events_to_base(&pg);
+
+        publish_file_payload(&pg, file.ino, 0, 64, 2, 77_202);
+        publish_local_events_to_base(&pg);
+        assert_eq!(
+            visible_object_id(&pg, file.ino),
+            77_202,
+            "test setup should expose the locally flushed payload"
+        );
+        assert!(
+            pg.local_overlay_conflicts()
+                .expect("local overlay after local flush")
+                .block_inodes
+                .is_empty(),
+            "flushed local publish must not continue to block later PG winners"
+        );
+
+        let foreign_publish = published_payload_events(file.ino, 3, 64, 77_203);
+        pg.apply_foreign_batch(&foreign_publish, &OverlayConflictSets::default())
+            .expect("apply later foreign publish");
+
+        assert_eq!(
+            visible_object_id(&pg, file.ino),
+            77_203,
+            "later PG winner must replace a previously flushed local payload"
+        );
+    }
+
     fn set_file_state(engine: &PgMetaEngine, ino: Ino, size: u64, content_epoch: u64) {
         let mut attr = engine.get_attr(ino).expect("get file attr");
         attr.size = size;
@@ -5441,6 +5537,70 @@ mod tests {
             "small file publish must succeed"
         );
         file
+    }
+
+    fn publish_file_payload(
+        engine: &PgMetaEngine,
+        ino: Ino,
+        block_index: u32,
+        size: u64,
+        content_epoch: u64,
+        object_id: u64,
+    ) {
+        set_file_state(engine, ino, size, content_epoch);
+        engine
+            .stage_payload_slice(
+                ino,
+                block_index,
+                &PayloadRef::new_partial(object_id, size as u32),
+            )
+            .expect("stage replacement payload");
+        mark_overlay_objects_uploaded(engine, ino, content_epoch, &[object_id]);
+        assert!(
+            engine
+                .publish_regular_file_overlay_to_base_if_matches(ino, content_epoch)
+                .expect("publish replacement payload"),
+            "replacement payload publish must succeed"
+        );
+    }
+
+    fn published_payload_events(
+        ino: Ino,
+        content_epoch: u64,
+        size: u64,
+        object_id: u64,
+    ) -> Vec<MetaEvent> {
+        let mut attr = InodeAttr::new_file(ino, ROOT_INO, 0, 0, 0o644);
+        attr.size = size;
+        attr.committed_size = size;
+        attr.content_epoch = content_epoch;
+        attr.committed_content_epoch = content_epoch;
+        attr.upload_state = UploadState::Ready;
+        attr.mtime = InodeAttr::now_nanos();
+        attr.ctime = attr.mtime;
+        let chunk_slices = vec![(
+            ChunkId(0),
+            vec![SliceRecord {
+                slice_id: SliceId(0),
+                order: SliceOrder(0),
+                range: SliceRange::new(0, size as u32).expect("valid foreign slice range"),
+                payload: Some(PayloadRef::new_partial(object_id, size as u32)),
+                payload_state: PayloadRefState::Published,
+            }],
+        )];
+        vec![
+            MetaEvent::SetAttr { attr },
+            MetaEvent::PublishRegularFileBaseSlices { ino, chunk_slices },
+        ]
+    }
+
+    fn visible_object_id(engine: &PgMetaEngine, ino: Ino) -> u64 {
+        engine
+            .lookup_regular_file_slices(ino, 0, 64)
+            .expect("lookup visible file slices")
+            .into_iter()
+            .find_map(|span| span.payload.map(|payload| payload.object_id))
+            .expect("visible object id")
     }
 
     fn publish_local_events_to_base(engine: &PgMetaEngine) {
