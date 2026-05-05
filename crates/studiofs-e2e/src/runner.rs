@@ -672,6 +672,13 @@ struct DefaultMountLockHolder {
     pid: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessStatus {
+    Running,
+    NotRunning,
+    Unknown,
+}
+
 impl Drop for DefaultMountLock {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
@@ -709,7 +716,7 @@ fn acquire_default_mount_lock(
 fn acquire_default_mount_lock_with_process_checker(
     lock_dir: &Path,
     run_id: &str,
-    process_checker: impl Fn(u32) -> bool + Copy,
+    process_checker: impl Fn(u32) -> ProcessStatus + Copy,
 ) -> Result<DefaultMountLock, std::io::Error> {
     fs::create_dir_all(lock_dir)?;
     let path = lock_dir.join("default-windows-mount-points.lock");
@@ -771,7 +778,7 @@ fn acquire_default_mount_lock_with_writer(
 
 fn reclaim_stale_default_mount_lock(
     path: &Path,
-    process_checker: impl Fn(u32) -> bool,
+    process_checker: impl Fn(u32) -> ProcessStatus,
 ) -> std::io::Result<bool> {
     let Some(holder) = read_default_mount_lock_holder(path)? else {
         return Ok(false);
@@ -779,8 +786,9 @@ fn reclaim_stale_default_mount_lock(
     if holder.runner != RUNNER_CRATE || holder.scope != "default-windows-mount-points" {
         return Ok(false);
     }
-    if process_checker(holder.pid) {
-        return Ok(false);
+    match process_checker(holder.pid) {
+        ProcessStatus::NotRunning => {}
+        ProcessStatus::Running | ProcessStatus::Unknown => return Ok(false),
     }
     match fs::remove_file(path) {
         Ok(()) => Ok(true),
@@ -807,40 +815,45 @@ fn default_mount_lock_holder_diagnostic(path: &Path) -> String {
     }
 }
 
-fn process_is_running(pid: u32) -> bool {
+fn process_is_running(pid: u32) -> ProcessStatus {
     if pid == std::process::id() {
-        return true;
+        return ProcessStatus::Running;
     }
-    platform_process_is_running(pid)
+    platform_process_status(pid)
 }
 
 #[cfg(windows)]
-fn platform_process_is_running(pid: u32) -> bool {
+fn platform_process_status(pid: u32) -> ProcessStatus {
     type Handle = *mut std::ffi::c_void;
 
     const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const ERROR_INVALID_PARAMETER: u32 = 87;
 
     unsafe extern "system" {
         fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> Handle;
         fn CloseHandle(hObject: Handle) -> i32;
+        fn GetLastError() -> u32;
     }
 
-    // SAFETY: OpenProcess only observes whether the PID can be opened. A null
-    // handle means the process is not accessible/running for this check.
+    // SAFETY: OpenProcess only observes whether the PID can be opened.
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     if handle.is_null() {
-        return false;
+        // SAFETY: GetLastError reads the calling thread's last OS error.
+        return match unsafe { GetLastError() } {
+            ERROR_INVALID_PARAMETER => ProcessStatus::NotRunning,
+            _ => ProcessStatus::Unknown,
+        };
     }
     // SAFETY: handle was returned by OpenProcess and must be closed once.
     unsafe {
         CloseHandle(handle);
     }
-    true
+    ProcessStatus::Running
 }
 
 #[cfg(not(windows))]
-fn platform_process_is_running(_pid: u32) -> bool {
-    true
+fn platform_process_status(_pid: u32) -> ProcessStatus {
+    ProcessStatus::Unknown
 }
 
 fn write_lock_payload(mut file: fs::File, payload: &[u8]) -> std::io::Result<()> {
@@ -1940,13 +1953,45 @@ mod tests {
         )
         .unwrap();
 
-        let lock = acquire_default_mount_lock_with_process_checker(&lock_dir, "new-run", |_| false)
-            .unwrap();
+        let lock = acquire_default_mount_lock_with_process_checker(&lock_dir, "new-run", |_| {
+            ProcessStatus::NotRunning
+        })
+        .unwrap();
 
         let holder = std::fs::read_to_string(&lock_path).unwrap();
         assert!(holder.contains("new-run"));
         assert!(!holder.contains("stale-run"));
         drop(lock);
+    }
+
+    #[test]
+    fn default_mount_lock_keeps_holder_when_pid_status_is_unknown() {
+        let temp = tempfile::tempdir().unwrap();
+        let lock_dir = temp.path().join("locks");
+        std::fs::create_dir_all(&lock_dir).unwrap();
+        let lock_path = lock_dir.join("default-windows-mount-points.lock");
+        std::fs::write(
+            &lock_path,
+            serde_json::json!({
+                "runner": RUNNER_CRATE,
+                "scope": "default-windows-mount-points",
+                "run_id": "inaccessible-run",
+                "pid": 42u32,
+                "created_at": timestamp(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let err = acquire_default_mount_lock_with_process_checker(&lock_dir, "blocked-run", |_| {
+            ProcessStatus::Unknown
+        })
+        .unwrap_err();
+
+        let holder = std::fs::read_to_string(&lock_path).unwrap();
+        assert!(err.to_string().contains("inaccessible-run"));
+        assert!(holder.contains("inaccessible-run"));
+        assert!(!holder.contains("blocked-run"));
     }
 
     #[test]
