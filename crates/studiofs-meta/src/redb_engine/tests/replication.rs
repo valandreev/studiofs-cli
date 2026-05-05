@@ -53,6 +53,45 @@ fn test_replica_apply_keeps_namespace_in_base_only() {
 }
 
 #[test]
+fn test_replica_base_remove_attr_clears_dangling_dentries_for_inode() {
+    let engine = temp_engine();
+    let ino = 557;
+    let attr = InodeAttr::new_file(ino, ROOT_INO, 1000, 1000, 0o644);
+
+    engine
+        .apply_replica_events_to_base(&[
+            crate::events::MetaEvent::SetAttr { attr },
+            crate::events::MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: b"dangling.txt".to_vec(),
+                entry: DirEntryValue {
+                    ino,
+                    kind: FileType::RegularFile,
+                },
+            },
+        ])
+        .unwrap();
+    assert!(
+        engine
+            .lookup_base_dentry(ROOT_INO, b"dangling.txt")
+            .unwrap()
+            .is_some()
+    );
+
+    engine
+        .apply_replica_events_to_base(&[crate::events::MetaEvent::RemoveAttr { ino }])
+        .unwrap();
+
+    assert!(
+        engine
+            .lookup_base_dentry(ROOT_INO, b"dangling.txt")
+            .unwrap()
+            .is_none(),
+        "RemoveAttr should not leave stale base dentries for the removed inode"
+    );
+}
+
+#[test]
 fn test_replica_apply_keeps_symlink_and_xattr_in_base_only() {
     let engine = temp_engine();
 

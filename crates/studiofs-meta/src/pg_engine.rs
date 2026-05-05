@@ -2557,7 +2557,11 @@ impl PgMetaEngine {
         let mut removed = HashSet::new();
         for event in batch_events {
             if let MetaEvent::RemoveEntry { parent, name } = event
-                && let Ok(entry) = self.local.lookup(*parent, name)
+                && let Ok(Some(entry)) = self
+                    .local
+                    .lookup(*parent, name)
+                    .map(Some)
+                    .or_else(|_| self.local.lookup_base_dentry(*parent, name))
             {
                 removed.insert(entry.ino);
             }
@@ -2697,7 +2701,49 @@ impl PgMetaEngine {
                     .dentry_keys
                     .contains(&Self::dentry_key(*parent, name))
             }
-            MetaEvent::RenameEntry { .. } => false,
+            MetaEvent::RenameEntry {
+                parent,
+                name,
+                new_parent,
+                new_name,
+                entry,
+                displaced_set_attr,
+                displaced_remove_attr_ino,
+                moved_dir_attr,
+                old_parent_attr,
+                new_parent_attr,
+            } => {
+                overlay
+                    .dentry_keys
+                    .contains(&Self::dentry_key(*parent, name))
+                    || overlay
+                        .dentry_keys
+                        .contains(&Self::dentry_key(*new_parent, new_name))
+                    || overlay.attr_inodes.contains(&entry.ino)
+                    || displaced_set_attr
+                        .as_ref()
+                        .as_ref()
+                        .map(|attr| overlay.attr_inodes.contains(&attr.ino))
+                        .unwrap_or(false)
+                    || displaced_remove_attr_ino
+                        .map(|ino| overlay.attr_inodes.contains(&ino))
+                        .unwrap_or(false)
+                    || moved_dir_attr
+                        .as_ref()
+                        .as_ref()
+                        .map(|attr| overlay.attr_inodes.contains(&attr.ino))
+                        .unwrap_or(false)
+                    || old_parent_attr
+                        .as_ref()
+                        .as_ref()
+                        .map(|attr| overlay.attr_inodes.contains(&attr.ino))
+                        .unwrap_or(false)
+                    || new_parent_attr
+                        .as_ref()
+                        .as_ref()
+                        .map(|attr| overlay.attr_inodes.contains(&attr.ino))
+                        .unwrap_or(false)
+            }
             MetaEvent::SetSymlinkTarget { ino, .. } => {
                 overlay.block_inodes.contains(ino)
                     || overlay.attr_inodes.contains(ino)
@@ -5202,6 +5248,169 @@ mod tests {
         );
     }
 
+    #[test]
+    fn foreign_unlink_after_local_rename_removes_destination_alias() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+        let file = create_published_small_file(&pg, ROOT_INO, b"race.txt", 77_101);
+        publish_local_events_to_base(&pg);
+
+        pg.rename(ROOT_INO, b"race.txt", ROOT_INO, b"race-renamed.txt")
+            .expect("local rename");
+        let overlay = pg.local_overlay_conflicts().expect("overlay conflicts");
+
+        let foreign_unlink = vec![
+            MetaEvent::RemoveEntry {
+                parent: ROOT_INO,
+                name: b"race.txt".to_vec(),
+            },
+            MetaEvent::RemoveAttr { ino: file.ino },
+        ];
+        pg.apply_foreign_batch(&foreign_unlink, &overlay)
+            .expect("apply foreign unlink");
+
+        assert!(
+            pg.lookup(ROOT_INO, b"race.txt").is_err(),
+            "source path must stay absent"
+        );
+        assert!(
+            pg.lookup(ROOT_INO, b"race-renamed.txt").is_err(),
+            "later authoritative unlink must remove the losing local rename destination"
+        );
+        assert!(
+            pg.get_attr(file.ino).is_err(),
+            "later authoritative unlink must remove the inode mirror"
+        );
+    }
+
+    #[test]
+    fn foreign_rename_after_local_unlink_restores_destination_alias() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+        let file = create_published_small_file(&pg, ROOT_INO, b"race.txt", 77_102);
+        publish_local_events_to_base(&pg);
+
+        pg.unlink(ROOT_INO, b"race.txt").expect("local unlink");
+
+        let foreign_rename = vec![MetaEvent::RenameEntry {
+            parent: ROOT_INO,
+            name: b"race.txt".to_vec(),
+            new_parent: ROOT_INO,
+            new_name: b"race-renamed.txt".to_vec(),
+            entry: DirEntryValue {
+                ino: file.ino,
+                kind: FileType::RegularFile,
+            },
+            displaced_set_attr: Box::new(None),
+            displaced_remove_attr_ino: None,
+            moved_dir_attr: Box::new(None),
+            old_parent_attr: Box::new(None),
+            new_parent_attr: Box::new(None),
+        }];
+        pg.apply_foreign_batch(&foreign_rename, &OverlayConflictSets::default())
+            .expect("apply foreign rename");
+
+        assert!(
+            pg.lookup(ROOT_INO, b"race.txt").is_err(),
+            "source path must stay absent"
+        );
+        assert_eq!(
+            pg.lookup(ROOT_INO, b"race-renamed.txt")
+                .expect("renamed destination")
+                .ino,
+            file.ino,
+            "later authoritative rename must win over the local unlink overlay"
+        );
+    }
+
+    #[test]
+    fn foreign_rename_after_local_unlink_restores_symlink_and_xattr_mirrors() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+        let symlink = pg
+            .create_symlink(ROOT_INO, b"race-link", b"/remote-target", 0, 0)
+            .expect("create symlink");
+        pg.set_xattr(symlink.ino, b"user.color", b"blue", 0)
+            .expect("set xattr");
+        publish_local_events_to_base(&pg);
+
+        pg.unlink(ROOT_INO, b"race-link").expect("local unlink");
+
+        let foreign_rename = vec![MetaEvent::RenameEntry {
+            parent: ROOT_INO,
+            name: b"race-link".to_vec(),
+            new_parent: ROOT_INO,
+            new_name: b"race-link-renamed".to_vec(),
+            entry: DirEntryValue {
+                ino: symlink.ino,
+                kind: FileType::Symlink,
+            },
+            displaced_set_attr: Box::new(None),
+            displaced_remove_attr_ino: None,
+            moved_dir_attr: Box::new(None),
+            old_parent_attr: Box::new(None),
+            new_parent_attr: Box::new(None),
+        }];
+        pg.apply_foreign_batch(&foreign_rename, &OverlayConflictSets::default())
+            .expect("apply foreign rename");
+
+        assert_eq!(
+            pg.lookup(ROOT_INO, b"race-link-renamed")
+                .expect("renamed symlink")
+                .ino,
+            symlink.ino
+        );
+        assert_eq!(
+            pg.get_symlink_target(symlink.ino)
+                .expect("restored symlink target"),
+            b"/remote-target"
+        );
+        assert_eq!(
+            pg.get_xattr(symlink.ino, b"user.color")
+                .expect("restored xattr"),
+            Some(b"blue".to_vec())
+        );
+    }
+
+    #[test]
+    fn older_foreign_rename_does_not_resurrect_after_self_unlink_flush() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+        let file = create_published_small_file(&pg, ROOT_INO, b"race.txt", 77_103);
+        publish_local_events_to_base(&pg);
+
+        pg.unlink(ROOT_INO, b"race.txt").expect("local unlink");
+        let recent_unlink_overlay = pg.local_overlay_conflicts().expect("overlay conflicts");
+        publish_local_events_to_base(&pg);
+
+        let older_foreign_rename = vec![MetaEvent::RenameEntry {
+            parent: ROOT_INO,
+            name: b"race.txt".to_vec(),
+            new_parent: ROOT_INO,
+            new_name: b"race-renamed.txt".to_vec(),
+            entry: DirEntryValue {
+                ino: file.ino,
+                kind: FileType::RegularFile,
+            },
+            displaced_set_attr: Box::new(None),
+            displaced_remove_attr_ino: None,
+            moved_dir_attr: Box::new(None),
+            old_parent_attr: Box::new(None),
+            new_parent_attr: Box::new(None),
+        }];
+        pg.apply_foreign_batch(&older_foreign_rename, &recent_unlink_overlay)
+            .expect("apply older foreign rename");
+
+        assert!(
+            pg.lookup(ROOT_INO, b"race.txt").is_err(),
+            "source path must stay absent"
+        );
+        assert!(
+            pg.lookup(ROOT_INO, b"race-renamed.txt").is_err(),
+            "older rename must not resurrect a file after the local unlink won in PG order"
+        );
+        assert!(
+            pg.get_attr(file.ino).is_err(),
+            "winner unlink must keep the inode mirror removed"
+        );
+    }
+
     fn set_file_state(engine: &PgMetaEngine, ino: Ino, size: u64, content_epoch: u64) {
         let mut attr = engine.get_attr(ino).expect("get file attr");
         attr.size = size;
@@ -5232,6 +5441,22 @@ mod tests {
             "small file publish must succeed"
         );
         file
+    }
+
+    fn publish_local_events_to_base(engine: &PgMetaEngine) {
+        let start = engine.flushed_event_seq.load(Ordering::SeqCst);
+        let end = engine.local.get_counter("nextEventSeq").expect("event end");
+        let events = engine
+            .local
+            .read_events_range(start, end)
+            .expect("read local events");
+        let remote_events = PgMetaEngine::project_remote_events(&events);
+        engine
+            .apply_visible_self_batch(&remote_events)
+            .expect("apply visible self batch");
+        engine
+            .persist_flushed_event_seq(end)
+            .expect("persist flushed event seq");
     }
 
     fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
