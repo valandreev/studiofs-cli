@@ -665,6 +665,13 @@ struct DefaultMountLock {
     path: PathBuf,
 }
 
+#[derive(Debug, Deserialize)]
+struct DefaultMountLockHolder {
+    runner: String,
+    scope: String,
+    pid: u32,
+}
+
 impl Drop for DefaultMountLock {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
@@ -696,6 +703,14 @@ fn acquire_default_mount_lock(
     lock_dir: &Path,
     run_id: &str,
 ) -> Result<DefaultMountLock, std::io::Error> {
+    acquire_default_mount_lock_with_process_checker(lock_dir, run_id, process_is_running)
+}
+
+fn acquire_default_mount_lock_with_process_checker(
+    lock_dir: &Path,
+    run_id: &str,
+    process_checker: impl Fn(u32) -> bool + Copy,
+) -> Result<DefaultMountLock, std::io::Error> {
     fs::create_dir_all(lock_dir)?;
     let path = lock_dir.join("default-windows-mount-points.lock");
     let holder = serde_json::json!({
@@ -706,7 +721,22 @@ fn acquire_default_mount_lock(
         "created_at": timestamp(),
     });
     let payload = serde_json::to_vec_pretty(&holder).map_err(std::io::Error::other)?;
-    acquire_default_mount_lock_with_writer(&path, run_id, &payload, write_lock_payload)
+    acquire_default_mount_lock_with_writer(&path, run_id, &payload, write_lock_payload).or_else(
+        |err| {
+            if err.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(err);
+            }
+            if reclaim_stale_default_mount_lock(&path, process_checker)? {
+                return acquire_default_mount_lock_with_writer(
+                    &path,
+                    run_id,
+                    &payload,
+                    write_lock_payload,
+                );
+            }
+            Err(err)
+        },
+    )
 }
 
 fn acquire_default_mount_lock_with_writer(
@@ -726,9 +756,7 @@ fn acquire_default_mount_lock_with_writer(
             })
         }
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-            let holder = fs::read_to_string(path).unwrap_or_else(|read_err| {
-                format!("<failed to read existing lock holder: {read_err}>")
-            });
+            let holder = default_mount_lock_holder_diagnostic(path);
             Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
                 format!(
@@ -739,6 +767,80 @@ fn acquire_default_mount_lock_with_writer(
         }
         Err(err) => Err(err),
     }
+}
+
+fn reclaim_stale_default_mount_lock(
+    path: &Path,
+    process_checker: impl Fn(u32) -> bool,
+) -> std::io::Result<bool> {
+    let Some(holder) = read_default_mount_lock_holder(path)? else {
+        return Ok(false);
+    };
+    if holder.runner != RUNNER_CRATE || holder.scope != "default-windows-mount-points" {
+        return Ok(false);
+    }
+    if process_checker(holder.pid) {
+        return Ok(false);
+    }
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(err) => Err(err),
+    }
+}
+
+fn read_default_mount_lock_holder(path: &Path) -> std::io::Result<Option<DefaultMountLockHolder>> {
+    let holder = fs::read_to_string(path)?;
+    if holder.trim().is_empty() {
+        return Ok(None);
+    }
+    serde_json::from_str(&holder)
+        .map(Some)
+        .map_err(std::io::Error::other)
+}
+
+fn default_mount_lock_holder_diagnostic(path: &Path) -> String {
+    match fs::read_to_string(path) {
+        Ok(holder) if holder.trim().is_empty() => "<empty lock holder file>".to_string(),
+        Ok(holder) => holder,
+        Err(read_err) => format!("<failed to read existing lock holder: {read_err}>"),
+    }
+}
+
+fn process_is_running(pid: u32) -> bool {
+    if pid == std::process::id() {
+        return true;
+    }
+    platform_process_is_running(pid)
+}
+
+#[cfg(windows)]
+fn platform_process_is_running(pid: u32) -> bool {
+    type Handle = *mut std::ffi::c_void;
+
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+
+    unsafe extern "system" {
+        fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> Handle;
+        fn CloseHandle(hObject: Handle) -> i32;
+    }
+
+    // SAFETY: OpenProcess only observes whether the PID can be opened. A null
+    // handle means the process is not accessible/running for this check.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return false;
+    }
+    // SAFETY: handle was returned by OpenProcess and must be closed once.
+    unsafe {
+        CloseHandle(handle);
+    }
+    true
+}
+
+#[cfg(not(windows))]
+fn platform_process_is_running(_pid: u32) -> bool {
+    true
 }
 
 fn write_lock_payload(mut file: fs::File, payload: &[u8]) -> std::io::Result<()> {
@@ -1817,6 +1919,46 @@ mod tests {
         assert!(!lock_path.exists());
         let lock = acquire_default_mount_lock(lock_path.parent().unwrap(), "next-run").unwrap();
         drop(lock);
+    }
+
+    #[test]
+    fn default_mount_lock_reclaims_stale_holder_when_pid_is_not_running() {
+        let temp = tempfile::tempdir().unwrap();
+        let lock_dir = temp.path().join("locks");
+        std::fs::create_dir_all(&lock_dir).unwrap();
+        let lock_path = lock_dir.join("default-windows-mount-points.lock");
+        std::fs::write(
+            &lock_path,
+            serde_json::json!({
+                "runner": RUNNER_CRATE,
+                "scope": "default-windows-mount-points",
+                "run_id": "stale-run",
+                "pid": 4_294_967_294u32,
+                "created_at": timestamp(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let lock = acquire_default_mount_lock_with_process_checker(&lock_dir, "new-run", |_| false)
+            .unwrap();
+
+        let holder = std::fs::read_to_string(&lock_path).unwrap();
+        assert!(holder.contains("new-run"));
+        assert!(!holder.contains("stale-run"));
+        drop(lock);
+    }
+
+    #[test]
+    fn default_mount_lock_reports_empty_holder_file_explicitly() {
+        let temp = tempfile::tempdir().unwrap();
+        let lock_dir = temp.path().join("locks");
+        std::fs::create_dir_all(&lock_dir).unwrap();
+        std::fs::write(lock_dir.join("default-windows-mount-points.lock"), "").unwrap();
+
+        let err = acquire_default_mount_lock(&lock_dir, "blocked-run").unwrap_err();
+
+        assert!(err.to_string().contains("<empty lock holder file>"));
     }
 
     #[test]
