@@ -3094,6 +3094,7 @@ fn run_fault_chaos_postgres_phase(
         std::slice::from_ref(&write_operation),
     )?;
     if write_operation.result != "accepted" {
+        driver.start_postgres()?;
         return Err(ScenarioError::RejectedOutageOperations {
             rejected: 1,
             total: 1,
@@ -3294,6 +3295,7 @@ fn run_fault_chaos_rustfs_phase(
             &[outage_record.clone(), write_operation.clone()],
         )?;
         operations.extend([outage_record, write_operation]);
+        driver.start_rustfs()?;
         return Err(ScenarioError::RejectedOutageOperations {
             rejected: 1,
             total: 1,
@@ -5281,6 +5283,122 @@ mod tests {
         }
     }
 
+    struct RecordingMountedFaultChaosDriver {
+        clients: Vec<ClientSpec>,
+        actions: RefCell<Vec<&'static str>>,
+    }
+
+    impl RecordingMountedFaultChaosDriver {
+        fn new(clients: Vec<ClientSpec>) -> Self {
+            Self {
+                clients,
+                actions: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl MountedFaultChaosDriver for RecordingMountedFaultChaosDriver {
+        fn bootstrap_volume(
+            &mut self,
+            options: VolumeBootstrapOptions,
+        ) -> Result<VolumeBootstrapSummary, ScenarioError> {
+            self.actions.borrow_mut().push("bootstrap");
+            assert_eq!(
+                options.client_names,
+                FAULT_CHAOS_CLIENT_NAMES
+                    .iter()
+                    .copied()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            );
+            Ok(VolumeBootstrapSummary {
+                volume_name: "projectfs".to_string(),
+                init_client: FAULT_CHAOS_CLIENT_NAMES[0].to_string(),
+                discovered_clients: FAULT_CHAOS_CLIENT_NAMES[1..]
+                    .iter()
+                    .map(|name| (*name).to_string())
+                    .collect(),
+                clients: self
+                    .clients
+                    .iter()
+                    .map(|client| crate::client::ClientBootstrapRecord {
+                        name: client.name.clone(),
+                        local_metadata_db: client.local_metadata_db.clone(),
+                        state: ClientLifecycleState::Discovered,
+                    })
+                    .collect(),
+            })
+        }
+
+        fn mount_client(&mut self, _client: &str) -> Result<(), ScenarioError> {
+            self.actions.borrow_mut().push("mount_client");
+            Ok(())
+        }
+
+        fn clients(&self) -> Vec<ClientSpec> {
+            self.clients.clone()
+        }
+
+        fn stop_postgres(&mut self) -> Result<(), ScenarioError> {
+            self.actions.borrow_mut().push("stop_postgres");
+            Ok(())
+        }
+
+        fn start_postgres(&mut self) -> Result<(), ScenarioError> {
+            self.actions.borrow_mut().push("start_postgres");
+            Ok(())
+        }
+
+        fn stop_rustfs(&mut self) -> Result<(), ScenarioError> {
+            self.actions.borrow_mut().push("stop_rustfs");
+            Ok(())
+        }
+
+        fn start_rustfs(&mut self) -> Result<(), ScenarioError> {
+            self.actions.borrow_mut().push("start_rustfs");
+            Ok(())
+        }
+
+        fn force_kill(&mut self, _client: &str) -> Result<(), ScenarioError> {
+            self.actions.borrow_mut().push("force_kill");
+            Ok(())
+        }
+
+        fn remount(&mut self, _client: &str) -> Result<(), ScenarioError> {
+            self.actions.borrow_mut().push("remount");
+            Ok(())
+        }
+
+        fn unmount_all(&mut self) -> Result<(), ScenarioError> {
+            self.actions.borrow_mut().push("unmount_all");
+            Ok(())
+        }
+    }
+
+    fn fault_chaos_clients(
+        sandbox: &Path,
+        temp_root: &Path,
+        bad_postgres_write_index: Option<usize>,
+        bad_rustfs_write_index: Option<usize>,
+    ) -> Vec<ClientSpec> {
+        FAULT_CHAOS_CLIENT_NAMES
+            .iter()
+            .take(FAULT_CHAOS_WARM_CLIENTS)
+            .enumerate()
+            .map(|(index, name)| {
+                let mount = temp_root.join("mounts").join(name);
+                if Some(index) == bad_postgres_write_index || Some(index) == bad_rustfs_write_index
+                {
+                    std::fs::create_dir_all(mount.parent().unwrap()).unwrap();
+                    std::fs::write(&mount, b"not a directory").unwrap();
+                } else {
+                    std::fs::create_dir_all(mount.join("fault-chaos")).unwrap();
+                }
+                client_spec_for(sandbox, "projectfs", name, mount)
+            })
+            .collect()
+    }
+
     struct RecordingNamespaceCollisionDriver {
         clients: Vec<ClientSpec>,
         actions: RefCell<Vec<&'static str>>,
@@ -6552,6 +6670,88 @@ mod tests {
         assert!(
             log.iter()
                 .any(|record| matches!(&record.outcome, OperationOutcome::Rejected { .. }))
+        );
+    }
+
+    #[test]
+    fn mounted_fault_chaos_restarts_postgres_before_rejected_outage_failure() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-fault-chaos");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(MOUNTED_FAULT_CHAOS_CONVERGENCE);
+        let clients = fault_chaos_clients(&sandbox, temp.path(), Some(1), None);
+        let mut driver = RecordingMountedFaultChaosDriver::new(clients.clone());
+        let context = ScenarioContext {
+            run_id: "run-fault-chaos".to_string(),
+            seed: 362,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+        std::fs::create_dir_all(&context.scenario_dir).unwrap();
+
+        let err = run_fault_chaos_postgres_phase(
+            &context,
+            &mut driver,
+            Instant::now(),
+            &clients,
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ScenarioError::RejectedOutageOperations {
+                rejected: 1,
+                total: 1
+            }
+        ));
+        assert_eq!(
+            driver.actions.borrow().as_slice(),
+            ["stop_postgres", "start_postgres"]
+        );
+    }
+
+    #[test]
+    fn mounted_fault_chaos_restarts_rustfs_before_rejected_outage_failure() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-fault-chaos");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(MOUNTED_FAULT_CHAOS_CONVERGENCE);
+        let clients = fault_chaos_clients(&sandbox, temp.path(), None, Some(2));
+        let mut driver = RecordingMountedFaultChaosDriver::new(clients.clone());
+        let context = ScenarioContext {
+            run_id: "run-fault-chaos".to_string(),
+            seed: 362,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+        std::fs::create_dir_all(&context.scenario_dir).unwrap();
+
+        let err = run_fault_chaos_rustfs_phase(
+            &context,
+            &mut driver,
+            Instant::now(),
+            &clients,
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ScenarioError::RejectedOutageOperations {
+                rejected: 1,
+                total: 1
+            }
+        ));
+        assert_eq!(
+            driver.actions.borrow().as_slice(),
+            ["stop_rustfs", "start_rustfs"]
         );
     }
 
