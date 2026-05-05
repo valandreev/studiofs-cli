@@ -3201,7 +3201,7 @@ fn run_fault_chaos_crash_phase(
     let peer = clients
         .iter()
         .find(|client| client.name != restarted_client)
-        .unwrap_or(&clients[0]);
+        .expect("at least one peer client must be available");
     let peer_path = "fault-chaos/peer-while-crashed.txt";
     let peer_payload = fault_payload(context.seed, "peer-while-crashed");
     let peer_write_result = fs::write(peer.mount_point.join(peer_path), &peer_payload);
