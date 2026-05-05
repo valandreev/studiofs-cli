@@ -2556,14 +2556,15 @@ impl PgMetaEngine {
     fn removed_inodes_for_batch(&self, batch_events: &[MetaEvent]) -> HashSet<Ino> {
         let mut removed = HashSet::new();
         for event in batch_events {
-            if let MetaEvent::RemoveEntry { parent, name } = event
-                && let Ok(Some(entry)) = self
+            if let MetaEvent::RemoveEntry { parent, name } = event {
+                let entry = self
                     .local
                     .lookup(*parent, name)
                     .map(Some)
-                    .or_else(|_| self.local.lookup_base_dentry(*parent, name))
-            {
-                removed.insert(entry.ino);
+                    .or_else(|_| self.local.lookup_base_dentry(*parent, name));
+                if let Ok(Some(entry)) = entry {
+                    removed.insert(entry.ino);
+                }
             }
         }
         removed
@@ -2576,15 +2577,17 @@ impl PgMetaEngine {
     ) -> MetaResult<HashSet<Vec<u8>>> {
         let mut preserved = HashSet::new();
         for event in batch_events {
-            if let MetaEvent::RemoveEntry { parent, name } = event
-                && let Ok(Some(entry)) = self
+            if let MetaEvent::RemoveEntry { parent, name } = event {
+                let entry = self
                     .local
                     .lookup(*parent, name)
                     .map(Some)
-                    .or_else(|_| self.local.lookup_base_dentry(*parent, name))
-                && overlay.block_inodes.contains(&entry.ino)
-            {
-                preserved.insert(Self::dentry_key(*parent, name));
+                    .or_else(|_| self.local.lookup_base_dentry(*parent, name));
+                if let Ok(Some(entry)) = entry {
+                    if overlay.block_inodes.contains(&entry.ino) {
+                        preserved.insert(Self::dentry_key(*parent, name));
+                    }
+                }
             }
         }
         Ok(preserved)
