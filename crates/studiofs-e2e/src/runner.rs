@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead as _, BufReader, Write as _};
+use std::io::{BufRead as _, BufReader, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread;
@@ -13,7 +13,6 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use studiofs_scenario::{
     OperationLogError, OperationLogWriter, OperationOutcome, ScenarioOperation,
-    ScenarioOperationRecord,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -2046,25 +2045,78 @@ fn write_hook_progress_line(
         writer,
         "[studiofs-e2e][{}] run={} scenario={}/{} scenario_name={} hook={} phase={} elapsed={}s last_event={}",
         timestamp(),
-        snapshot.run_id,
+        format_progress_value(snapshot.run_id),
         snapshot.scenario_index,
         snapshot.scenario_total,
-        snapshot.scenario_name,
-        snapshot.hook,
-        snapshot.phase,
+        format_progress_value(snapshot.scenario_name),
+        format_progress_value(snapshot.hook),
+        format_progress_value(snapshot.phase),
         snapshot.elapsed.as_secs(),
-        snapshot.last_event
+        format_progress_value(snapshot.last_event)
     )?;
     if let Some(sandbox) = snapshot.sandbox {
-        write!(writer, " sandbox={}", sandbox.display())?;
+        write!(
+            writer,
+            " sandbox={}",
+            format_progress_value(&sandbox.display().to_string())
+        )?;
     }
     writeln!(writer)?;
     writer.flush()
 }
 
 fn latest_operation_event(path: &Path) -> Option<String> {
-    let contents = fs::read_to_string(path).ok()?;
-    contents.lines().rev().find_map(operation_event_from_line)
+    read_last_nonempty_line(path)
+        .ok()
+        .flatten()
+        .and_then(|line| operation_event_from_line(&line))
+}
+
+fn read_last_nonempty_line(path: &Path) -> std::io::Result<Option<String>> {
+    const TAIL_CHUNK_SIZE: u64 = 8192;
+
+    let mut file = fs::File::open(path)?;
+    let mut position = file.metadata()?.len();
+    let mut tail = Vec::new();
+
+    while position > 0 {
+        let read_len = TAIL_CHUNK_SIZE.min(position);
+        position -= read_len;
+        file.seek(SeekFrom::Start(position))?;
+        let mut chunk = vec![0; usize::try_from(read_len).unwrap_or(usize::MAX)];
+        file.read_exact(&mut chunk)?;
+        chunk.extend_from_slice(&tail);
+        tail = chunk;
+
+        if let Some(line) = last_complete_nonempty_line(&tail, position == 0) {
+            return Ok(Some(line));
+        }
+    }
+
+    Ok(None)
+}
+
+fn last_complete_nonempty_line(bytes: &[u8], at_file_start: bool) -> Option<String> {
+    let end = bytes
+        .iter()
+        .rposition(|byte| !matches!(byte, b'\n' | b'\r' | b' ' | b'\t'))?
+        + 1;
+    let trimmed = &bytes[..end];
+    let start = trimmed
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    if start == 0 && !at_file_start {
+        return None;
+    }
+    let line = String::from_utf8_lossy(&trimmed[start..])
+        .trim_end_matches('\r')
+        .to_string();
+    if line.trim().is_empty() {
+        None
+    } else {
+        Some(line)
+    }
 }
 
 fn operation_event_from_line(line: &str) -> Option<String> {
@@ -2072,9 +2124,21 @@ fn operation_event_from_line(line: &str) -> Option<String> {
     if line.is_empty() {
         return None;
     }
-    let record = serde_json::from_str::<ScenarioOperationRecord>(line).ok()?;
-    let operation = serde_json::to_value(&record.operation).ok()?;
-    let operation_type = operation.get("type")?.as_str()?;
+    #[derive(Deserialize)]
+    struct ProgressOperationRecord {
+        sequence: u64,
+        client: Option<String>,
+        operation: OperationTag,
+    }
+
+    #[derive(Deserialize)]
+    struct OperationTag {
+        #[serde(rename = "type")]
+        operation_type: String,
+    }
+
+    let record = serde_json::from_str::<ProgressOperationRecord>(line).ok()?;
+    let operation_type = record.operation.operation_type;
     let mut event = format!("seq={},op={operation_type}", record.sequence);
     if let Some(client) = record.client {
         event.push_str(",client=");
@@ -2436,9 +2500,21 @@ fn e2e_progress_fields(fields: &[(&str, String)]) {
         }
         line.push_str(key);
         line.push('=');
-        line.push_str(value);
+        line.push_str(&format_progress_value(value));
     }
     e2e_progress(&line);
+}
+
+fn format_progress_value(value: &str) -> String {
+    if value.is_empty()
+        || value
+            .chars()
+            .any(|ch| ch.is_whitespace() || matches!(ch, '"' | '\\'))
+    {
+        serde_json::to_string(value).unwrap_or_else(|_| "\"<invalid>\"".to_string())
+    } else {
+        value.to_string()
+    }
 }
 
 fn timestamp() -> String {
@@ -2673,6 +2749,56 @@ mod tests {
         let event = latest_operation_event(&log).unwrap();
 
         assert_eq!(event, "seq=1,op=write,client=client-a");
+    }
+
+    #[test]
+    fn heartbeat_last_event_reads_only_last_nonempty_operation_line() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = temp.path().join("operations.ndjson");
+        let mut writer = OperationLogWriter::open_append(&log).unwrap();
+        for sequence in 0..600 {
+            let record = writer.record(
+                "slow-scenario",
+                ScenarioOperation::CreateDirectory {
+                    path: format!("dir-{sequence}"),
+                },
+            );
+            writer.append_record(&record).unwrap();
+        }
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log)
+            .unwrap()
+            .write_all(b"\n\n")
+            .unwrap();
+
+        let event = latest_operation_event(&log).unwrap();
+
+        assert_eq!(event, "seq=600,op=create_directory");
+    }
+
+    #[test]
+    fn progress_values_with_spaces_are_quoted() {
+        let mut output = Vec::new();
+        let progress = HookProgressSnapshot {
+            run_id: "run with spaces",
+            scenario_name: "slow scenario",
+            scenario_index: 1,
+            scenario_total: 1,
+            hook: "run",
+            phase: "heartbeat",
+            elapsed: Duration::from_secs(30),
+            last_event: "seq=2,op=write",
+            sandbox: Some(Path::new("target/e2e runs/run 1")),
+        };
+
+        write_hook_progress_line(&mut output, &progress).unwrap();
+
+        let line = String::from_utf8(output).unwrap();
+        assert!(line.contains("run=\"run with spaces\""));
+        assert!(line.contains("scenario_name=\"slow scenario\""));
+        assert!(line.contains("last_event=seq=2,op=write"));
+        assert!(line.contains("sandbox=\"target/e2e runs/run 1\""));
     }
 
     #[cfg(unix)]

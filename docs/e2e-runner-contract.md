@@ -166,7 +166,8 @@ Use `run`, `scenario_name`, `hook`, `elapsed`, and `last_event` from the latest
 heartbeat to identify the active hook without waiting for post-mortem artifact
 inspection. `last_event` is sampled from the scenario operation log when a
 scenario has written operations, and falls back to the current hook boundary
-when no later operation is available.
+when no later operation is available. Values containing whitespace are emitted
+as JSON strings so paths remain unambiguous for log parsers.
 
 ## Artifact Layout And Retention
 
