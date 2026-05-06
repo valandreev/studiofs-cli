@@ -22,8 +22,8 @@ use crate::client::{
     client_mount_point, client_root_dir,
 };
 use crate::infra::{
-    CommandExecutor, CommandSpec, ComposeConfig, DockerComposeStack, InfraCheck, InfraError,
-    InfraMode, SystemCommandExecutor,
+    CommandExecutor, CommandSpec, ComposeConfig, ComposeServiceControl, DockerComposeStack,
+    InfraCheck, InfraError, InfraMode, SystemCommandExecutor,
 };
 use crate::report::{
     ArtifactReport, CleanupReport, EventRecord, HostReport, PreflightCheckReport, PreflightReport,
@@ -515,6 +515,7 @@ fn run_with_executor_and_mount_lock_dir(
         ]);
         prepare_preflight(
             &sandbox,
+            &root,
             infra_mode,
             compose_stack.as_mut(),
             executor,
@@ -854,6 +855,7 @@ struct PreparedPreflight {
 
 fn prepare_preflight(
     sandbox: &Path,
+    root: &Path,
     infra: InfraMode,
     compose_stack: Option<&mut DockerComposeStack>,
     executor: &dyn CommandExecutor,
@@ -891,6 +893,13 @@ fn prepare_preflight(
             name: "default Windows mounted E2E run lock".to_string(),
             status: RunStatus::Passed,
             detail: format!("held at {}", lock.path.display()),
+        });
+    }
+    if let Some(detail) = stale_infra_preflight_detail(root, sandbox)? {
+        checks.push(PreflightCheckReport {
+            name: "stale runner-owned E2E infrastructure".to_string(),
+            status: RunStatus::PreflightFailed,
+            detail,
         });
     }
     checks.extend(
@@ -1263,8 +1272,15 @@ fn write_lock_payload(mut file: fs::File, payload: &[u8]) -> std::io::Result<()>
     file.sync_all()
 }
 
-/// Function $name.
+/// Removes runner-owned E2E sandboxes and recovers their recorded infrastructure.
 pub fn clean(request: CleanRequest) -> Result<CleanOutcome, RunnerError> {
+    clean_with_executor(request, &SystemCommandExecutor)
+}
+
+fn clean_with_executor(
+    request: CleanRequest,
+    executor: &dyn CommandExecutor,
+) -> Result<CleanOutcome, RunnerError> {
     if !request.root.exists() {
         return Ok(CleanOutcome {
             removed: Vec::new(),
@@ -1286,7 +1302,7 @@ pub fn clean(request: CleanRequest) -> Result<CleanOutcome, RunnerError> {
             }
         };
         let path = entry.path();
-        match clean_entry(entry, &root) {
+        match clean_entry(entry, &root, executor) {
             Ok(Some(name)) => removed.push(name),
             Ok(None) => {}
             Err(err) => skipped.push(CleanSkipped {
@@ -1303,14 +1319,18 @@ pub fn clean(request: CleanRequest) -> Result<CleanOutcome, RunnerError> {
     Ok(CleanOutcome { removed, skipped })
 }
 
-fn clean_entry(entry: fs::DirEntry, root: &Path) -> Result<Option<PathBuf>, RunnerError> {
+fn clean_entry(
+    entry: fs::DirEntry,
+    root: &Path,
+    executor: &dyn CommandExecutor,
+) -> Result<Option<PathBuf>, RunnerError> {
     if !entry.file_type()?.is_dir() {
         return Ok(None);
     }
     let path = entry.path();
-    if !is_runner_owned_sandbox(&path)? {
+    let Some(manifest) = read_runner_owned_manifest(&path)? else {
         return Ok(None);
-    }
+    };
     let canonical = path.canonicalize()?;
     if !canonical.starts_with(root) {
         return Err(RunnerError::UnsafeCleanupRoot(format!(
@@ -1319,6 +1339,7 @@ fn clean_entry(entry: fs::DirEntry, root: &Path) -> Result<Option<PathBuf>, Runn
             root.display()
         )));
     }
+    recover_stale_infra(&manifest, executor)?;
     let name = entry.file_name();
     fs::remove_dir_all(&path)?;
     Ok(Some(PathBuf::from(name)))
@@ -2405,48 +2426,149 @@ fn write_runner_marker(sandbox: &Path, run_id: &str) -> Result<(), RunnerError> 
     )
 }
 
-fn is_runner_owned_sandbox(path: &Path) -> Result<bool, RunnerError> {
+fn read_runner_owned_manifest(path: &Path) -> Result<Option<RunManifest>, RunnerError> {
     let manifest = path.join("run.json");
     let marker = path.join(RUNNER_MARKER_FILE);
     if !manifest.exists() || !marker.exists() {
-        return Ok(false);
+        return Ok(None);
     }
-    let value: serde_json::Value = serde_json::from_slice(&fs::read(manifest)?)?;
+    let manifest_value: serde_json::Value = serde_json::from_slice(&fs::read(&manifest)?)?;
     let marker_value: serde_json::Value = serde_json::from_slice(&fs::read(marker)?)?;
-    if value["runner_crate"] != RUNNER_CRATE || marker_value["runner_crate"] != RUNNER_CRATE {
-        return Ok(false);
+    if marker_value["runner_crate"] != RUNNER_CRATE {
+        return Ok(None);
     }
-    let Some(run_id) = value["run_id"].as_str() else {
-        return Ok(false);
+    if manifest_value["runner_crate"] != RUNNER_CRATE {
+        return Err(RunnerError::UnsafeCleanupRoot(format!(
+            "cannot prove runner ownership for {}: run.json runner_crate is not {RUNNER_CRATE}",
+            path.display()
+        )));
+    }
+    let Some(run_id) = manifest_value["run_id"].as_str() else {
+        return Err(RunnerError::UnsafeCleanupRoot(format!(
+            "cannot prove runner ownership for {}: run.json is missing run_id",
+            path.display()
+        )));
     };
     if marker_value["run_id"] != run_id {
-        return Ok(false);
+        return Err(RunnerError::UnsafeCleanupRoot(format!(
+            "cannot prove runner ownership for {}: marker run_id does not match run.json",
+            path.display()
+        )));
     }
     if path.file_name().and_then(|name| name.to_str()) != Some(run_id) {
-        return Ok(false);
+        return Err(RunnerError::UnsafeCleanupRoot(format!(
+            "cannot prove runner ownership for {}: directory name does not match run_id {run_id}",
+            path.display()
+        )));
     }
-    let Some(manifest_sandbox) = value["sandbox"].as_str() else {
-        return Ok(false);
+    let Some(manifest_sandbox) = manifest_value["sandbox"].as_str() else {
+        return Err(RunnerError::UnsafeCleanupRoot(format!(
+            "cannot prove runner ownership for {}: run.json is missing sandbox",
+            path.display()
+        )));
     };
     if !Path::new(manifest_sandbox).exists()
         || Path::new(manifest_sandbox).canonicalize()? != path.canonicalize()?
     {
-        return Ok(false);
+        return Err(RunnerError::UnsafeCleanupRoot(format!(
+            "cannot prove runner ownership for {}: manifest sandbox does not match candidate",
+            path.display()
+        )));
     }
-    for required in [
-        RUNNER_MARKER_FILE,
-        "run.json",
-        "report.json",
-        "events.ndjson",
-        "preflight.json",
-        "cleanup.json",
-        "artifacts",
-    ] {
+    for required in [RUNNER_MARKER_FILE, "run.json", "artifacts"] {
         if !path.join(required).exists() {
-            return Ok(false);
+            return Err(RunnerError::UnsafeCleanupRoot(format!(
+                "cannot prove runner ownership for {}: missing required sandbox path {required}",
+                path.display()
+            )));
         }
     }
-    Ok(true)
+    let manifest = serde_json::from_value(manifest_value)?;
+    Ok(Some(manifest))
+}
+
+fn recover_stale_infra(
+    manifest: &RunManifest,
+    executor: &dyn CommandExecutor,
+) -> Result<(), RunnerError> {
+    if manifest.infra != InfraMode::Compose {
+        return Ok(());
+    }
+    let Some(project_name) = manifest.compose_project.as_deref() else {
+        return Err(RunnerError::UnsafeCleanupRoot(format!(
+            "cannot prove runner ownership for compose infrastructure in run {}: missing compose_project",
+            manifest.run_id
+        )));
+    };
+    let control = ComposeServiceControl::for_project(project_name.to_string())?;
+    control.teardown(executor)?;
+    Ok(())
+}
+
+fn stale_infra_preflight_detail(
+    root: &Path,
+    current_sandbox: &Path,
+) -> Result<Option<String>, RunnerError> {
+    if !root.exists() {
+        return Ok(None);
+    }
+    let root = canonicalize_cleanup_root(root)?;
+    let current_sandbox = current_sandbox.canonicalize().ok();
+    let mut stale = Vec::new();
+    for entry_result in fs::read_dir(&root)? {
+        let entry = entry_result?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let path = entry.path();
+        if current_sandbox.as_ref().is_some_and(|current| {
+            path.canonicalize()
+                .is_ok_and(|candidate| candidate == *current)
+        }) {
+            continue;
+        }
+        if cleanup_report_passed(&path)? {
+            continue;
+        }
+        let manifest = match read_runner_owned_manifest(&path) {
+            Ok(Some(manifest)) => manifest,
+            Ok(None) => continue,
+            Err(err) => {
+                stale.push(format!(
+                    "{} (ambiguous: {err})",
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("<non-utf8>")
+                ));
+                continue;
+            }
+        };
+        if manifest.infra == InfraMode::Compose {
+            let project = manifest
+                .compose_project
+                .as_deref()
+                .unwrap_or("<missing-project>");
+            stale.push(format!("{} ({project})", manifest.run_id));
+        }
+    }
+    if stale.is_empty() {
+        return Ok(None);
+    }
+    stale.sort();
+    Ok(Some(format!(
+        "found stale runner-owned compose infrastructure: {}; run `studiofs-e2e clean --root {}` before starting a full E2E sweep",
+        stale.join(", "),
+        root.display()
+    )))
+}
+
+fn cleanup_report_passed(path: &Path) -> Result<bool, RunnerError> {
+    let cleanup_path = path.join("cleanup.json");
+    if !cleanup_path.exists() {
+        return Ok(false);
+    }
+    let cleanup: CleanupReport = read_json_file(&cleanup_path)?;
+    Ok(cleanup.status == RunStatus::Passed)
 }
 
 fn canonicalize_cleanup_root(root: &Path) -> Result<PathBuf, RunnerError> {
@@ -3104,6 +3226,235 @@ mod tests {
                 .iter()
                 .any(|call| call.args.contains(&"down".to_string())),
             "compose stack should be torn down after post-start runner errors"
+        );
+    }
+
+    #[test]
+    fn clean_recovers_manifest_owned_compose_infra_before_removing_sandbox() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("e2e-runs");
+        let sandbox = root.join("interrupted-compose-run");
+        fs::create_dir_all(sandbox.join("artifacts")).unwrap();
+        write_pretty_json(
+            &sandbox.join(RUNNER_MARKER_FILE),
+            &serde_json::json!({
+                "runner_crate": RUNNER_CRATE,
+                "run_id": "interrupted-compose-run",
+            }),
+        )
+        .unwrap();
+        write_pretty_json(
+            &sandbox.join("run.json"),
+            &build_manifest(ManifestInput {
+                run_id: "interrupted-compose-run",
+                seed: 373,
+                sandbox: &sandbox,
+                scenarios: &[scenario::TEST_PASSING.to_string()],
+                retention: RetentionPolicy::Always,
+                selected_platform: "windows-winfsp",
+                infra: InfraMode::Compose,
+                compose_project: Some("studiofs-e2e-interrupted-compose-run"),
+                allocated_ports: Vec::new(),
+                studiofs_bin: None,
+                port_range: None,
+                timeout: None,
+                created_at: &timestamp(),
+            }),
+        )
+        .unwrap();
+
+        let ambiguous = root.join("ambiguous-compose-run");
+        fs::create_dir_all(ambiguous.join("artifacts")).unwrap();
+        write_pretty_json(
+            &ambiguous.join(RUNNER_MARKER_FILE),
+            &serde_json::json!({
+                "runner_crate": RUNNER_CRATE,
+                "run_id": "ambiguous-compose-run",
+            }),
+        )
+        .unwrap();
+        fs::write(
+            ambiguous.join("run.json"),
+            r#"{"runner_crate":"studiofs-e2e","run_id":"ambiguous-compose-run","infra":"compose","compose_project":"studiofs-e2e-ambiguous-compose-run"}"#,
+        )
+        .unwrap();
+
+        let executor = RecordingExecutor::default();
+        let outcome = clean_with_executor(CleanRequest { root }, &executor).unwrap();
+
+        assert_eq!(
+            outcome.removed,
+            vec![PathBuf::from("interrupted-compose-run")]
+        );
+        assert_eq!(outcome.skipped.len(), 1);
+        assert!(outcome.skipped[0].path.ends_with("ambiguous-compose-run"));
+        assert!(
+            outcome.skipped[0]
+                .error
+                .contains("cannot prove runner ownership")
+        );
+        assert!(!sandbox.exists());
+        assert!(ambiguous.exists());
+        let calls = executor.calls.borrow();
+        let down_call = calls
+            .iter()
+            .find(|call| call.args.contains(&"down".to_string()))
+            .expect("compose recovery should tear down manifest-owned project");
+        assert!(down_call.args.windows(2).any(|args| args
+            == [
+                "--project-name".to_string(),
+                "studiofs-e2e-interrupted-compose-run".to_string()
+            ]));
+        assert!(down_call.args.contains(&"--volumes".to_string()));
+        assert!(down_call.args.contains(&"--remove-orphans".to_string()));
+    }
+
+    #[test]
+    fn compose_preflight_reports_stale_owned_infra_before_starting_new_stack() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("e2e-runs");
+        let stale = root.join("stale-compose-run");
+        fs::create_dir_all(stale.join("artifacts")).unwrap();
+        write_pretty_json(
+            &stale.join(RUNNER_MARKER_FILE),
+            &serde_json::json!({
+                "runner_crate": RUNNER_CRATE,
+                "run_id": "stale-compose-run",
+            }),
+        )
+        .unwrap();
+        write_pretty_json(
+            &stale.join("run.json"),
+            &build_manifest(ManifestInput {
+                run_id: "stale-compose-run",
+                seed: 373,
+                sandbox: &stale,
+                scenarios: &[scenario::TEST_PASSING.to_string()],
+                retention: RetentionPolicy::Always,
+                selected_platform: "windows-winfsp",
+                infra: InfraMode::Compose,
+                compose_project: Some("studiofs-e2e-stale-compose-run"),
+                allocated_ports: Vec::new(),
+                studiofs_bin: None,
+                port_range: None,
+                timeout: None,
+                created_at: &timestamp(),
+            }),
+        )
+        .unwrap();
+        let executor = RecordingExecutor::default();
+
+        let outcome = run_with_executor_and_mount_lock_dir(
+            RunRequest {
+                root: root.clone(),
+                run_id: Some("next-compose-run".to_string()),
+                scenarios: vec![scenario::TEST_PASSING.to_string()],
+                seed: 373,
+                studiofs_bin: None,
+                platform: PlatformSelection::Auto,
+                retention: RetentionPolicy::Always,
+                report: None,
+                port_range: Some("33400-33410".to_string()),
+                timeout: None,
+                infra: InfraMode::Compose,
+            },
+            &executor,
+            &temp.path().join("mount-locks"),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.status, RunStatus::PreflightFailed);
+        let report = read_json_file::<RunReport>(&outcome.report_path).unwrap();
+        let stale_check = report
+            .preflight
+            .checks
+            .iter()
+            .find(|check| check.name == "stale runner-owned E2E infrastructure")
+            .expect("preflight should include stale infra diagnostic");
+        assert_eq!(stale_check.status, RunStatus::PreflightFailed);
+        assert!(stale_check.detail.contains("stale-compose-run"));
+        assert!(stale_check.detail.contains("studiofs-e2e clean --root"));
+        assert!(
+            !executor
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call.args.contains(&"up".to_string())),
+            "preflight must not start a new compose stack when stale owned infra is known"
+        );
+    }
+
+    #[test]
+    fn compose_preflight_ignores_retained_runs_that_completed_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("e2e-runs");
+        let retained = root.join("retained-compose-run");
+        fs::create_dir_all(retained.join("artifacts")).unwrap();
+        write_pretty_json(
+            &retained.join(RUNNER_MARKER_FILE),
+            &serde_json::json!({
+                "runner_crate": RUNNER_CRATE,
+                "run_id": "retained-compose-run",
+            }),
+        )
+        .unwrap();
+        write_pretty_json(
+            &retained.join("run.json"),
+            &build_manifest(ManifestInput {
+                run_id: "retained-compose-run",
+                seed: 373,
+                sandbox: &retained,
+                scenarios: &[scenario::TEST_PASSING.to_string()],
+                retention: RetentionPolicy::Always,
+                selected_platform: "windows-winfsp",
+                infra: InfraMode::Compose,
+                compose_project: Some("studiofs-e2e-retained-compose-run"),
+                allocated_ports: Vec::new(),
+                studiofs_bin: None,
+                port_range: None,
+                timeout: None,
+                created_at: &timestamp(),
+            }),
+        )
+        .unwrap();
+        write_pretty_json(
+            &retained.join("cleanup.json"),
+            &CleanupReport {
+                status: RunStatus::Passed,
+                actions: vec!["docker compose down --volumes --remove-orphans".to_string()],
+                errors: Vec::new(),
+            },
+        )
+        .unwrap();
+        let executor = RecordingExecutor::default();
+
+        let outcome = run_with_executor_and_mount_lock_dir(
+            RunRequest {
+                root: root.clone(),
+                run_id: Some("next-compose-run".to_string()),
+                scenarios: vec![scenario::TEST_PASSING.to_string()],
+                seed: 373,
+                studiofs_bin: None,
+                platform: PlatformSelection::Auto,
+                retention: RetentionPolicy::Always,
+                report: None,
+                port_range: Some("33420-33430".to_string()),
+                timeout: None,
+                infra: InfraMode::Compose,
+            },
+            &executor,
+            &temp.path().join("mount-locks"),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.status, RunStatus::Passed);
+        assert!(
+            executor
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call.args.contains(&"up".to_string())),
+            "completed retained runs must not block a new compose stack"
         );
     }
 

@@ -227,6 +227,17 @@ non-zero; the status JSON records whether the artifact was complete. Artifact
 discovery includes regular files and symlink entries under `artifacts/`, but it
 does not recurse through symlinked directories.
 
+If a run is interrupted before normal cleanup, `studiofs-e2e clean` must recover
+stale compose infrastructure before removing the sandbox. Recovery is allowed
+only when both `.studiofs-e2e-runner.json` and `run.json` prove the candidate is
+runner-owned, `run.json` records `infra: "compose"` and a `compose_project`, and
+the sandbox path in the manifest canonicalizes back to the candidate directory.
+The recovery command is the same bounded compose teardown used by normal
+cleanup: `docker compose down --volumes --remove-orphans` for the recorded
+project. Ambiguous candidates are retained and reported as skipped. A retained
+sandbox with `cleanup.json` status `passed` is treated as having completed the
+cleanup lifecycle and must not block later compose preflight.
+
 ## Multi-Client Process Controller
 
 Mounted multi-client scenarios use the `studiofs-e2e::client` controller to
@@ -626,6 +637,11 @@ Required checks:
   must fail preflight when a selected port is already bound. This check is early
   conflict detection; Docker's bind during `compose up` remains the final
   authority because host ports can change state after preflight.
+- stale runner-owned infrastructure: compose preflight scans the run root for
+  prior runner-owned compose manifests that do not have a passed `cleanup.json`
+  before starting Docker. If stale or ambiguous candidates are present,
+  preflight fails with a diagnostic that names the affected run IDs and points
+  to `studiofs-e2e clean --root <run-root>`.
 - stale mounts: requested mount points or drive letters must be unused, or must
   match a prior runner manifest that explicitly authorizes cleanup. Unknown
   mounted paths are a `preflight_failed` result, not an implicit force-unmount.
@@ -671,10 +687,14 @@ Rules:
   mount process, then delete mount directories or explicit client roots.
 - If unmount fails, retain the affected path and record the failure in
   `cleanup.json`.
-- Docker cleanup must target run-labeled containers, networks, and volumes
-  only. Labels must include the run ID. Compose teardown uses
+- Docker cleanup must target runner-owned compose projects recorded in
+  `run.json`. The recorded project name is required for interrupted-run
+  recovery, and compose teardown uses
   `docker compose down --volumes --remove-orphans` so PostgreSQL and RustFS
-  named volumes do not persist after cleanup.
+  named volumes do not persist after cleanup. Unknown or ambiguous Docker
+  resources must be retained and reported instead of removed. The current
+  cleanup command intentionally has no force mode; unproven resources require
+  manual operator action.
 
 When cleanup cannot prove ownership, it must retain the resource and mark the
 run `cleanup_failed`.
