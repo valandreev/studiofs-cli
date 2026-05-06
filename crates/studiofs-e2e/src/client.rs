@@ -838,7 +838,6 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
                         "unmount timeout fallback",
                         &kill_error,
                     );
-                    return Err(kill_error);
                 }
                 return Err(error);
             }

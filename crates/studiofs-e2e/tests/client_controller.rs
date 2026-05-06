@@ -557,7 +557,7 @@ fn unmount_force_kills_mount_process_when_graceful_exit_times_out() {
 
     assert!(
         err.to_string()
-            .contains("mount process did not exit after force termination")
+            .contains("mount process did not exit after graceful unmount")
     );
     assert_eq!(
         killed.get(),
@@ -681,7 +681,7 @@ fn unmount_timeout_fallback_uses_process_tree_termination() {
 
     assert!(
         err.to_string()
-            .contains("mount process did not exit after force termination")
+            .contains("mount process did not exit after graceful unmount")
     );
     assert_eq!(process_tree_kills.get(), 1);
     assert_eq!(controller.clients()[0].state, ClientLifecycleState::Killed);
