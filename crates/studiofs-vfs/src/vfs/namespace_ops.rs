@@ -1087,7 +1087,11 @@ impl StudioVfs {
     }
 
     pub fn unlink(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
-        Self::run_sync_future(self.unlink_inner(parent, name))
+        Self::run_sync_future(self.unlink_async(parent, name))
+    }
+
+    pub async fn unlink_async(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
+        self.unlink_inner(parent, name).await
     }
 
     async fn unlink_inner(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
@@ -1124,6 +1128,14 @@ impl StudioVfs {
     }
 
     pub fn rmdir(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
+        self.rmdir_inner(parent, name)
+    }
+
+    pub async fn rmdir_async(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
+        self.rmdir_inner(parent, name)
+    }
+
+    fn rmdir_inner(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
         let namespace_mutations = self.namespace_mutations();
         self.enforce_access(parent, AccessLevel::ReadWrite)?;
         if self.unlink_ignored_subtree(parent, name) || self.ignored_dir_attr(parent).is_some() {
@@ -1151,7 +1163,17 @@ impl StudioVfs {
         new_parent: Ino,
         new_name: &[u8],
     ) -> VfsResult<()> {
-        Self::run_sync_future(self.rename_inner(parent, name, new_parent, new_name))
+        Self::run_sync_future(self.rename_async(parent, name, new_parent, new_name))
+    }
+
+    pub async fn rename_async(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        new_parent: Ino,
+        new_name: &[u8],
+    ) -> VfsResult<()> {
+        self.rename_inner(parent, name, new_parent, new_name).await
     }
 
     async fn rename_inner(
