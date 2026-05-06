@@ -372,6 +372,18 @@ fn mounted_open_handle_disabled_run_writes_reproducible_artifacts() {
             .as_bool()
             .unwrap()
     );
+    for case in ["open_unlink", "open_rename"] {
+        assert_eq!(summary[case]["bytes_read_from_open_handle"], 55);
+        assert_eq!(summary[case]["expected_bytes_from_open_handle"], 55);
+        assert_eq!(
+            summary[case]["read_checksum_sha256"],
+            "ea17e2a469e88c4fa5f5e73e9744e67a9270174229b8c727df229fd5724bd3ed"
+        );
+        assert_eq!(
+            summary[case]["expected_checksum_sha256"],
+            "ea17e2a469e88c4fa5f5e73e9744e67a9270174229b8c727df229fd5724bd3ed"
+        );
+    }
 
     let operations = read_operation_log(
         sandbox.join("artifacts/scenarios/mounted-open-handle-convergence/operations.ndjson"),

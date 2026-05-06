@@ -5506,15 +5506,22 @@ struct OpenHandleCaseSummary {
     original_path: String,
     renamed_path: Option<String>,
     bytes_read_from_open_handle: u64,
+    expected_bytes_from_open_handle: u64,
+    read_checksum_sha256: String,
+    expected_checksum_sha256: String,
     deleted_path_absent: bool,
     old_path_absent: bool,
     renamed_path_visible: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Public validation check emitted when mounted open-handle convergence fails.
 pub struct OpenHandleCheck {
+    /// Stable check identifier.
     name: String,
+    /// Whether the check passed.
     passed: bool,
+    /// Human-readable diagnostic detail for reports and errors.
     detail: String,
 }
 
@@ -5767,6 +5774,7 @@ fn execute_open_unlink_case(
         },
     );
     let deleted_path_absent = !observer_client.mount_point.join(OPEN_UNLINK_PATH).exists();
+    let read_checksum_sha256 = bytes_sha256(&payload);
     Ok(OpenHandleCaseSummary {
         name: "open_unlink".to_string(),
         handle_client: handle_client.name.clone(),
@@ -5775,6 +5783,9 @@ fn execute_open_unlink_case(
         original_path: OPEN_UNLINK_PATH.to_string(),
         renamed_path: None,
         bytes_read_from_open_handle: u64::try_from(payload.len()).unwrap_or(u64::MAX),
+        expected_bytes_from_open_handle: expected_open_handle_payload_bytes(),
+        read_checksum_sha256,
+        expected_checksum_sha256: expected_open_handle_payload_checksum(),
         deleted_path_absent,
         old_path_absent: deleted_path_absent,
         renamed_path_visible: false,
@@ -5882,6 +5893,7 @@ fn execute_open_rename_case(
     );
     let old_path_absent = !observer_client.mount_point.join(OPEN_RENAME_PATH).exists();
     let renamed_path_visible = observer_client.mount_point.join(OPEN_RENAME_DEST).exists();
+    let read_checksum_sha256 = bytes_sha256(&payload);
     Ok(OpenHandleCaseSummary {
         name: "open_rename".to_string(),
         handle_client: handle_client.name.clone(),
@@ -5890,6 +5902,9 @@ fn execute_open_rename_case(
         original_path: OPEN_RENAME_PATH.to_string(),
         renamed_path: Some(OPEN_RENAME_DEST.to_string()),
         bytes_read_from_open_handle: u64::try_from(payload.len()).unwrap_or(u64::MAX),
+        expected_bytes_from_open_handle: expected_open_handle_payload_bytes(),
+        read_checksum_sha256,
+        expected_checksum_sha256: expected_open_handle_payload_checksum(),
         deleted_path_absent: false,
         old_path_absent,
         renamed_path_visible,
@@ -5991,10 +6006,26 @@ fn planned_open_handle_case(
             OPEN_HANDLE_INITIAL_PAYLOAD.len() + OPEN_HANDLE_APPEND_PAYLOAD.len(),
         )
         .unwrap_or(u64::MAX),
+        expected_bytes_from_open_handle: expected_open_handle_payload_bytes(),
+        read_checksum_sha256: expected_open_handle_payload_checksum(),
+        expected_checksum_sha256: expected_open_handle_payload_checksum(),
         deleted_path_absent,
         old_path_absent,
         renamed_path_visible,
     }
+}
+
+fn expected_open_handle_payload_bytes() -> u64 {
+    u64::try_from(OPEN_HANDLE_INITIAL_PAYLOAD.len() + OPEN_HANDLE_APPEND_PAYLOAD.len())
+        .unwrap_or(u64::MAX)
+}
+
+fn expected_open_handle_payload_checksum() -> String {
+    let mut payload =
+        Vec::with_capacity(OPEN_HANDLE_INITIAL_PAYLOAD.len() + OPEN_HANDLE_APPEND_PAYLOAD.len());
+    payload.extend_from_slice(OPEN_HANDLE_INITIAL_PAYLOAD);
+    payload.extend_from_slice(OPEN_HANDLE_APPEND_PAYLOAD);
+    bytes_sha256(&payload)
 }
 
 fn planned_open_handle_operations(started: Instant) -> Vec<OpenHandleOperation> {
@@ -6157,9 +6188,22 @@ fn open_handle_checks(
             detail: OPEN_UNLINK_PATH.to_string(),
         },
         OpenHandleCheck {
-            name: "unlink_handle_remained_readable".to_string(),
-            passed: open_unlink.bytes_read_from_open_handle > 0,
-            detail: format!("{} bytes read", open_unlink.bytes_read_from_open_handle),
+            name: "unlink_handle_read_expected_bytes".to_string(),
+            passed: open_unlink.bytes_read_from_open_handle
+                == open_unlink.expected_bytes_from_open_handle,
+            detail: format!(
+                "{} bytes read, expected {}",
+                open_unlink.bytes_read_from_open_handle,
+                open_unlink.expected_bytes_from_open_handle
+            ),
+        },
+        OpenHandleCheck {
+            name: "unlink_handle_checksum_matches".to_string(),
+            passed: open_unlink.read_checksum_sha256 == open_unlink.expected_checksum_sha256,
+            detail: format!(
+                "read {}, expected {}",
+                open_unlink.read_checksum_sha256, open_unlink.expected_checksum_sha256
+            ),
         },
         OpenHandleCheck {
             name: "rename_old_path_absent_after_release".to_string(),
@@ -6172,9 +6216,22 @@ fn open_handle_checks(
             detail: OPEN_RENAME_DEST.to_string(),
         },
         OpenHandleCheck {
-            name: "rename_handle_remained_readable".to_string(),
-            passed: open_rename.bytes_read_from_open_handle > 0,
-            detail: format!("{} bytes read", open_rename.bytes_read_from_open_handle),
+            name: "rename_handle_read_expected_bytes".to_string(),
+            passed: open_rename.bytes_read_from_open_handle
+                == open_rename.expected_bytes_from_open_handle,
+            detail: format!(
+                "{} bytes read, expected {}",
+                open_rename.bytes_read_from_open_handle,
+                open_rename.expected_bytes_from_open_handle
+            ),
+        },
+        OpenHandleCheck {
+            name: "rename_handle_checksum_matches".to_string(),
+            passed: open_rename.read_checksum_sha256 == open_rename.expected_checksum_sha256,
+            detail: format!(
+                "read {}, expected {}",
+                open_rename.read_checksum_sha256, open_rename.expected_checksum_sha256
+            ),
         },
     ]
 }
