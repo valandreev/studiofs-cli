@@ -141,9 +141,9 @@ cargo run -p studiofs-e2e -- run basic-multi-client-smoke --studiofs-bin target\
 cargo run -p studiofs-e2e -- run rustfs-outage-multi-client-recovery --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run mounted-client-crash-restart-recovery --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run collision-rename-vs-unlink --studiofs-bin target\debug\studiofs.exe
-cargo run -p studiofs-e2e -- run mounted-chaos-convergence --seed 360 --studiofs-bin target\debug\studiofs.exe
-cargo run -p studiofs-e2e -- run mounted-fault-chaos-convergence --seed 360 --studiofs-bin target\debug\studiofs.exe
-cargo run -p studiofs-e2e -- run mounted-lww-reconnect-chaos-convergence --seed 360 --studiofs-bin target\debug\studiofs.exe
+cargo run -p studiofs-e2e -- run mounted-chaos-convergence --seed 360 --timeout 20m --studiofs-bin target\debug\studiofs.exe
+cargo run -p studiofs-e2e -- run mounted-fault-chaos-convergence --seed 360 --timeout 30m --studiofs-bin target\debug\studiofs.exe
+cargo run -p studiofs-e2e -- run mounted-lww-reconnect-chaos-convergence --seed 360 --timeout 30m --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- clean
 ```
 
@@ -180,8 +180,8 @@ For Windows WinFSP external-infra debugging, prefer one mounted scenario per
 command rather than a long PowerShell loop. If a mounted filesystem syscall
 hangs below the runner, a one-scenario command limits the number of live mount
 processes that can be left behind and leaves a smaller artifact set to inspect.
-When a sweep is needed, run it from an outer watchdog that can terminate the
-`studiofs-e2e` process tree and then inspect the newest
+When a sweep is needed, pass an explicit `--timeout` so the runner can write a
+best-effort timeout report and cleanup summary. Then inspect the newest
 `target/e2e-runs/<run-id>/events.ndjson` and per-client logs before starting the
 next scenario.
 

@@ -35,8 +35,8 @@ cargo run -p studiofs-e2e -- run postgres-outage-multi-client-recovery --studiof
 cargo run -p studiofs-e2e -- run rustfs-outage-multi-client-recovery --studiofs-bin <path-to-studiofs>
 cargo run -p studiofs-e2e -- run mounted-client-crash-restart-recovery --studiofs-bin <path-to-studiofs>
 cargo run -p studiofs-e2e -- run collision-rename-vs-unlink --studiofs-bin <path-to-studiofs>
-cargo run -p studiofs-e2e -- run mounted-fault-chaos-convergence --studiofs-bin <path-to-studiofs>
-cargo run -p studiofs-e2e -- run mounted-lww-reconnect-chaos-convergence --studiofs-bin <path-to-studiofs>
+cargo run -p studiofs-e2e -- run mounted-fault-chaos-convergence --seed 360 --timeout 30m --studiofs-bin <path-to-studiofs>
+cargo run -p studiofs-e2e -- run mounted-lww-reconnect-chaos-convergence --seed 360 --timeout 30m --studiofs-bin <path-to-studiofs>
 cargo run -p studiofs-e2e -- clean
 ```
 
@@ -75,7 +75,7 @@ Required initial run flags and environment:
 | `STUDIOFS_E2E_EXTERNAL_S3_ACCESS_KEY` / `STUDIOFS_TEST_ONLINE_S3_ACCESS_KEY` / `STUDIOFS_S3_ACCESS_KEY` | S3/RustFS access key for `--infra external-env`. |
 | `STUDIOFS_E2E_EXTERNAL_S3_SECRET_KEY` / `STUDIOFS_TEST_ONLINE_S3_SECRET_KEY` / `STUDIOFS_S3_SECRET_KEY` | S3/RustFS secret key for `--infra external-env`. |
 | `STUDIOFS_E2E_EXTERNAL_S3_REGION` / `STUDIOFS_TEST_ONLINE_S3_REGION` / `STUDIOFS_S3_REGION` | Optional S3/RustFS region for `--infra external-env`; defaults to `us-east-1`. |
-| `--timeout <duration>` | Reserved manifest field for a future whole-run watchdog. Current mounted safety relies on scenario-local operation/convergence timeouts and cleanup fallbacks. |
+| `--timeout <duration>` | Enforced whole-run watchdog. Supported units are `ms`, `s`, `m`, and `h`, for example `500ms`, `30s`, `10m`, or `1h`. When the deadline is exceeded, the runner marks the active scenario `timed_out`, records the active hook when known, writes best-effort `report.json`, `events.ndjson`, and `cleanup.json`, and attempts runner-level cleanup. Same-process hooks cannot be safely killed; child-process scenario isolation is the boundary for hard cancellation of blocked hook code. |
 
 The initial runner implements `list`, `run`, and `clean`. Future subcommands
 may add dedicated `preflight` or artifact commands, but those must reuse the

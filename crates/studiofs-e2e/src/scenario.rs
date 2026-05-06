@@ -102,6 +102,8 @@ pub(crate) const TEST_FAILING_VALIDATE: &str = "__test-failing-validate";
 pub(crate) const TEST_FAILING_VALIDATE_AND_CLEANUP: &str = "__test-failing-validate-and-cleanup";
 #[cfg(test)]
 pub(crate) const TEST_PASSING: &str = "__test-passing";
+#[cfg(test)]
+pub(crate) const TEST_HANGING_RUN: &str = "__test-hanging-run";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScenarioDefinition {
@@ -221,7 +223,7 @@ pub enum ScenarioError {
     ReplicationFailure { errors: Vec<String> },
 }
 
-pub trait Scenario {
+pub trait Scenario: Send {
     fn definition(&self) -> ScenarioDefinition;
     fn setup(&self, context: &ScenarioContext) -> Result<(), ScenarioError>;
     fn run(&self, context: &ScenarioContext) -> Result<(), ScenarioError>;
@@ -297,6 +299,8 @@ pub(crate) fn resolve_scenario(name: &str) -> Option<Box<dyn Scenario>> {
         })),
         #[cfg(test)]
         TEST_PASSING => Some(Box::new(TestPassingScenario)),
+        #[cfg(test)]
+        TEST_HANGING_RUN => Some(Box::new(TestHangingRunScenario)),
         _ => None,
     }
 }
@@ -6240,6 +6244,40 @@ impl Scenario for TestPassingScenario {
     }
 
     fn run(&self, _context: &ScenarioContext) -> Result<(), ScenarioError> {
+        Ok(())
+    }
+
+    fn validate(&self, _context: &ScenarioContext) -> Result<Vec<String>, ScenarioError> {
+        Ok(Vec::new())
+    }
+
+    fn cleanup(&self, _context: &ScenarioContext) -> Result<(), ScenarioError> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+struct TestHangingRunScenario;
+
+#[cfg(test)]
+impl Scenario for TestHangingRunScenario {
+    fn definition(&self) -> ScenarioDefinition {
+        ScenarioDefinition {
+            name: TEST_HANGING_RUN,
+            description: "test-only hanging run scenario",
+            requires_studiofs_bin: false,
+            requires_mount: false,
+        }
+    }
+
+    fn setup(&self, context: &ScenarioContext) -> Result<(), ScenarioError> {
+        fs::create_dir_all(&context.scenario_dir)?;
+        Ok(())
+    }
+
+    fn run(&self, _context: &ScenarioContext) -> Result<(), ScenarioError> {
+        thread::sleep(Duration::from_millis(500));
         Ok(())
     }
 
