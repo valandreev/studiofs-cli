@@ -280,6 +280,7 @@ pub trait ClientProcess {
     fn id(&self) -> u32;
     fn try_wait(&mut self) -> io::Result<Option<i32>>;
     fn kill(&mut self) -> io::Result<()>;
+    /// Force-terminate this runner-owned process and, on Windows, its child process tree.
     fn kill_process_tree(&mut self, context: &str) -> io::Result<()> {
         let _ = context;
         self.kill()
@@ -433,25 +434,34 @@ fn join_output_reader(reader: thread::JoinHandle<io::Result<Vec<u8>>>) -> io::Re
 
 fn force_kill_child_process_tree(child: &mut Child, context: &str) -> io::Result<()> {
     let pid = child.id();
-    let primary_result = child.kill();
     #[cfg(windows)]
     {
         let pid_arg = pid.to_string();
-        let fallback_result = Command::new("taskkill")
+        let tree_result = Command::new("taskkill")
             .args(["/PID", &pid_arg, "/T", "/F"])
             .output();
-        match (primary_result, fallback_result) {
-            (Ok(()), Ok(output)) if output.status.success() => Ok(()),
-            (primary, Ok(output)) => Err(io::Error::other(format!(
-                "failed to terminate process tree for {context} pid {pid}: primary kill: {}; taskkill exit: {}; stdout: {}; stderr: {}",
-                format_kill_result(&primary),
+        let primary_result = child.kill();
+        match (tree_result, primary_result) {
+            (Ok(output), _) if output.status.success() || output.status.code() == Some(128) => {
+                Ok(())
+            }
+            (Ok(output), Ok(())) => Err(io::Error::other(format!(
+                "failed to terminate process tree for {context} pid {pid}: taskkill exit: {}; stdout: {}; stderr: {}; primary kill: ok",
                 output.status.code().unwrap_or(-1),
                 String::from_utf8_lossy(&output.stdout).trim(),
                 String::from_utf8_lossy(&output.stderr).trim()
             ))),
-            (primary, Err(fallback)) => Err(io::Error::other(format!(
-                "failed to terminate process tree for {context} pid {pid}: primary kill: {}; taskkill failed: {fallback}",
-                format_kill_result(&primary)
+            (Ok(output), Err(primary)) => Err(io::Error::other(format!(
+                "failed to terminate process tree for {context} pid {pid}: taskkill exit: {}; stdout: {}; stderr: {}; primary kill: {primary}",
+                output.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&output.stdout).trim(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))),
+            (Err(tree), Ok(())) => Err(io::Error::other(format!(
+                "failed to terminate process tree for {context} pid {pid}: taskkill failed: {tree}; primary kill: ok"
+            ))),
+            (Err(tree), Err(primary)) => Err(io::Error::other(format!(
+                "failed to terminate process tree for {context} pid {pid}: taskkill failed: {tree}; primary kill: {primary}"
             ))),
         }
     }
@@ -459,15 +469,7 @@ fn force_kill_child_process_tree(child: &mut Child, context: &str) -> io::Result
     {
         let _ = context;
         let _ = pid;
-        primary_result
-    }
-}
-
-#[cfg(windows)]
-fn format_kill_result(result: &io::Result<()>) -> String {
-    match result {
-        Ok(()) => "ok".to_string(),
-        Err(error) => error.to_string(),
+        child.kill()
     }
 }
 
@@ -659,7 +661,12 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
     pub fn force_kill(&mut self, client: &str) -> Result<(), ClientControllerError> {
         let index = self.client_index(client)?;
         if let Some(process) = self.clients[index].process.as_mut() {
-            process.kill_process_tree("force_kill")?;
+            force_kill_process_and_wait(
+                process.as_mut(),
+                "force_kill",
+                self.config.mount_exit_timeout,
+                self.config.poll_interval,
+            )?;
         }
         self.clients[index].process = None;
         self.clients[index].spec.process_id = None;
@@ -685,7 +692,12 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         let mut kill_error = None;
         for index in 0..self.clients.len() {
             if let Some(process) = self.clients[index].process.as_mut() {
-                if let Err(err) = process.kill_process_tree("force_kill_all") {
+                if let Err(err) = force_kill_process_and_wait(
+                    process.as_mut(),
+                    "force_kill_all",
+                    self.config.mount_exit_timeout,
+                    self.config.poll_interval,
+                ) {
                     kill_error.get_or_insert(err);
                 }
             }
@@ -694,7 +706,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
             self.clients[index].spec.state = ClientLifecycleState::Killed;
         }
         if let Some(err) = kill_error {
-            Err(err.into())
+            Err(err)
         } else {
             Ok(())
         }
@@ -711,7 +723,12 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         let mut process = self.executor.spawn(&command)?;
         let process_id = process.id();
         if let Err(err) = self.wait_until_mount_ready(&command, process.as_mut()) {
-            if let Err(kill_error) = process.kill_process_tree("mount readiness failure") {
+            if let Err(kill_error) = force_kill_process_and_wait(
+                process.as_mut(),
+                "mount readiness failure",
+                self.config.mount_exit_timeout,
+                self.config.poll_interval,
+            ) {
                 debug_log_kill_error(&command.client, "mount readiness failure", &kill_error);
             }
             self.clients[index].spec.state =
@@ -806,7 +823,12 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
                 self.config.mount_exit_timeout,
                 self.config.poll_interval,
             ) {
-                let kill_result = process.kill_process_tree("unmount timeout fallback");
+                let kill_result = force_kill_process_and_wait(
+                    process.as_mut(),
+                    "unmount timeout fallback",
+                    self.config.mount_exit_timeout,
+                    self.config.poll_interval,
+                );
                 self.clients[index].process = None;
                 self.clients[index].spec.process_id = None;
                 self.clients[index].spec.state = ClientLifecycleState::Killed;
@@ -816,6 +838,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
                         "unmount timeout fallback",
                         &kill_error,
                     );
+                    return Err(kill_error);
                 }
                 return Err(error);
             }
@@ -844,7 +867,12 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
 
     fn kill_mount_process_after_failed_unmount(&mut self, index: usize, context: &str) {
         if let Some(process) = self.clients[index].process.as_mut() {
-            if let Err(kill_error) = process.kill_process_tree(context) {
+            if let Err(kill_error) = force_kill_process_and_wait(
+                process.as_mut(),
+                context,
+                self.config.mount_exit_timeout,
+                self.config.poll_interval,
+            ) {
                 debug_log_kill_error(&self.clients[index].spec.name, context, &kill_error);
             }
             self.clients[index].process = None;
@@ -1149,6 +1177,27 @@ fn wait_for_process_exit(
     }
 }
 
+fn force_kill_process_and_wait(
+    process: &mut dyn ClientProcess,
+    context: &str,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> Result<(), ClientControllerError> {
+    process.kill_process_tree(context)?;
+    wait_for_process_exit(process, timeout, poll_interval).map_err(|error| match error {
+        ClientControllerError::Io(source) if source.kind() == io::ErrorKind::TimedOut => {
+            ClientControllerError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "mount process did not exit after force termination within {} ms during {context}",
+                    timeout.as_millis()
+                ),
+            ))
+        }
+        other => other,
+    })
+}
+
 fn client_env(client: &ClientSpec) -> Vec<(String, String)> {
     vec![
         (
@@ -1407,12 +1456,12 @@ fn diagnostic_excerpt(value: &str) -> String {
 }
 
 #[cfg(debug_assertions)]
-fn debug_log_kill_error(client: &str, context: &str, error: &io::Error) {
+fn debug_log_kill_error(client: &str, context: &str, error: &dyn fmt::Display) {
     eprintln!("studiofs-e2e: failed to kill client {client} during {context}: {error}");
 }
 
 #[cfg(not(debug_assertions))]
-fn debug_log_kill_error(_client: &str, _context: &str, _error: &io::Error) {}
+fn debug_log_kill_error(_client: &str, _context: &str, _error: &dyn fmt::Display) {}
 
 #[cfg(unix)]
 fn mount_point_is_active(path: &Path) -> io::Result<bool> {
