@@ -177,9 +177,25 @@ fn unmount_windows(mount_point: &str, pid: u32) -> Result<()> {
         unsafe { CloseHandle(process) };
     } else {
         let error = std::io::Error::last_os_error();
-        anyhow::bail!("failed to open mount process {pid} for shutdown: {error}");
+        windows_open_process_failure_after_signal(
+            pid,
+            super::utils::is_process_running(pid),
+            error,
+        )?;
     }
 
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_open_process_failure_after_signal(
+    pid: u32,
+    still_running: bool,
+    error: std::io::Error,
+) -> Result<()> {
+    if still_running {
+        anyhow::bail!("failed to open mount process {pid} for shutdown: {error}");
+    }
     Ok(())
 }
 
@@ -353,5 +369,34 @@ mod tests {
         assert!(result.is_err());
         let message = result.unwrap_err().to_string();
         assert!(message.contains("mount process did not exit after force termination"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_umount_treats_open_process_race_after_signal_as_success() {
+        let result = windows_open_process_failure_after_signal(
+            123,
+            false,
+            std::io::Error::from_raw_os_error(87),
+        );
+
+        assert!(
+            result.is_ok(),
+            "process exit after shutdown signal should be a successful unmount"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_umount_reports_open_process_failure_when_process_still_runs() {
+        let result = windows_open_process_failure_after_signal(
+            123,
+            true,
+            std::io::Error::from_raw_os_error(5),
+        );
+
+        assert!(result.is_err());
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("failed to open mount process 123 for shutdown"));
     }
 }
