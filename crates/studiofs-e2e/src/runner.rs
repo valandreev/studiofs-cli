@@ -617,6 +617,21 @@ fn prepare_preflight(
             });
         }
     }
+    checks.extend(
+        stack
+            .post_start_preflight(executor)
+            .into_iter()
+            .map(preflight_check_report),
+    );
+    if checks.iter().any(|check| check.status != RunStatus::Passed) {
+        return Ok(PreparedPreflight {
+            report: PreflightReport {
+                status: RunStatus::PreflightFailed,
+                checks,
+            },
+            compose_start_attempted: true,
+        });
+    }
 
     Ok(PreparedPreflight {
         report: PreflightReport {

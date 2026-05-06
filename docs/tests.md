@@ -150,11 +150,13 @@ cargo run -p studiofs-e2e -- clean
 `run` uses Docker Compose infrastructure by default. The stack is defined in
 `docker/compose.e2e.yml` and includes PostgreSQL 18, RustFS, and a Toxiproxy
 placeholder. Use `--port-range <start-end>` to allocate deterministic
-project-scoped ports for concurrent local runs, or `--infra disabled` only for
-runner self-tests that must not touch Docker. The basic mounted smoke scenario
-uses three isolated StudioFS clients, mounts each client separately, writes a
-small file through the first mount, and validates convergence through the public
-mounted trees. The RustFS/S3 outage scenario stops only the RustFS compose
+project-scoped ports for concurrent local runs, or when a default host port is
+occupied or Docker reports it healthy but host-side StudioFS clients cannot
+reach it. Use `--infra disabled` only for runner self-tests that must not touch
+Docker. The basic mounted smoke scenario uses three isolated StudioFS clients,
+mounts each client separately, writes a small file through the first mount, and
+validates convergence through the public mounted trees. The RustFS/S3 outage
+scenario stops only the RustFS compose
 service, keeps accepted writes locally readable, verifies a peer does not see
 the new outage checksum before recovery, and reports upload recovery time plus
 final checksum convergence. The mounted client crash/restart scenario kills and

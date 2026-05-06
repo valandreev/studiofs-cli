@@ -117,6 +117,7 @@ fn compose_stack_lifecycle_collects_logs_and_tears_down_volumes() {
 
     stack.prepare_artifacts().unwrap();
     stack.start(&executor).unwrap();
+    let post_start_checks = stack.post_start_preflight(&executor);
     stack.restart(&executor).unwrap();
     stack.stop_service("postgres", &executor).unwrap();
     stack.start_service("postgres", &executor).unwrap();
@@ -128,6 +129,12 @@ fn compose_stack_lifecycle_collects_logs_and_tears_down_volumes() {
     assert_eq!(
         std::fs::read_to_string(log_path).unwrap(),
         "postgres ready\nrustfs ready\n"
+    );
+    assert_eq!(post_start_checks.len(), 2);
+    assert!(
+        post_start_checks
+            .iter()
+            .all(|check| check.passed && check.name.starts_with("host health "))
     );
     assert_eq!(
         diagnostics,

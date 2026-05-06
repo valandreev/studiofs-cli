@@ -261,6 +261,19 @@ impl DockerComposeStack {
         Ok(())
     }
 
+    pub fn post_start_preflight(&self, executor: &dyn CommandExecutor) -> Vec<InfraCheck> {
+        self.ports
+            .iter()
+            .filter(|port| {
+                matches!(
+                    port.service.as_str(),
+                    RUSTFS_SERVICE_NAME | RUSTFS_CONSOLE_SERVICE_NAME
+                )
+            })
+            .map(|port| host_health_check(port, executor))
+            .collect()
+    }
+
     pub fn stop(&self, executor: &dyn CommandExecutor) -> Result<(), InfraError> {
         let mut command = self.compose_command();
         command.args.push("stop".to_string());
@@ -566,6 +579,40 @@ fn port_check(port: &ServicePort) -> InfraCheck {
         }
         Err(err) => InfraCheck {
             name: format!("port {} {}", port.service, port.host_port),
+            passed: false,
+            detail: err.to_string(),
+        },
+    }
+}
+
+fn host_health_check(port: &ServicePort, executor: &dyn CommandExecutor) -> InfraCheck {
+    let url = format!("http://{}:{}/health", port.host, port.host_port);
+    let command = CommandSpec {
+        program: "curl".to_string(),
+        args: vec![
+            "--fail".to_string(),
+            "--silent".to_string(),
+            "--show-error".to_string(),
+            "--max-time".to_string(),
+            "10".to_string(),
+            url.clone(),
+        ],
+        env: Vec::new(),
+        cwd: None,
+    };
+    match executor.run(&command) {
+        Ok(output) if output.status == 0 => InfraCheck {
+            name: format!("host health {} {}", port.service, port.host_port),
+            passed: true,
+            detail: format!("{url} returned success"),
+        },
+        Ok(output) => InfraCheck {
+            name: format!("host health {} {}", port.service, port.host_port),
+            passed: false,
+            detail: command_failure_detail(output.status, &output.stderr),
+        },
+        Err(err) => InfraCheck {
+            name: format!("host health {} {}", port.service, port.host_port),
             passed: false,
             detail: err.to_string(),
         },

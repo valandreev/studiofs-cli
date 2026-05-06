@@ -11,6 +11,7 @@ use studiofs_e2e::client::{
 };
 use studiofs_e2e::infra::ServicePort;
 use tempfile::tempdir;
+use uuid::Uuid;
 
 #[test]
 fn controller_bootstraps_mounts_restarts_and_kills_isolated_clients() {
@@ -289,7 +290,7 @@ fn init_does_not_retry_connection_refused_endpoint_failures() {
 }
 
 #[test]
-fn compose_service_config_derives_unique_volume_and_docker_endpoints() {
+fn compose_service_config_derives_uuid_volume_and_docker_endpoints() {
     let temp = tempdir().unwrap();
     let config = ClientControllerConfig::from_compose_services(
         Path::new("studiofs-test-bin").to_path_buf(),
@@ -304,7 +305,7 @@ fn compose_service_config_derives_unique_volume_and_docker_endpoints() {
     )
     .unwrap();
 
-    assert_eq!(config.volume_name, "sfs-e2e-run-1-20260502-321");
+    Uuid::parse_str(&config.volume_name).expect("volume name should be a UUID");
     assert_eq!(
         config.meta_dsn,
         "postgres://studiofs:studiofs@127.0.0.1:35432"
@@ -313,6 +314,38 @@ fn compose_service_config_derives_unique_volume_and_docker_endpoints() {
     assert_eq!(config.s3.bucket, "studiofs-e2e-run-1-20260502");
     assert_eq!(config.s3.access_key, "rustfsadmin");
     assert_eq!(config.s3.secret_key, "rustfsadmin");
+}
+
+#[test]
+fn compose_service_config_generates_unique_volume_names_per_scenario_config() {
+    let temp = tempdir().unwrap();
+    let first = ClientControllerConfig::from_compose_services(
+        Path::new("studiofs-test-bin").to_path_buf(),
+        temp.path().join("run-1"),
+        "Run_1.20260502",
+        321,
+        &[
+            service_port("postgres", 35432),
+            service_port("rustfs", 39000),
+            service_port("rustfs-console", 39001),
+        ],
+    )
+    .unwrap();
+    let second = ClientControllerConfig::from_compose_services(
+        Path::new("studiofs-test-bin").to_path_buf(),
+        temp.path().join("run-1"),
+        "Run_1.20260502",
+        321,
+        &[
+            service_port("postgres", 35432),
+            service_port("rustfs", 39000),
+            service_port("rustfs-console", 39001),
+        ],
+    )
+    .unwrap();
+
+    assert_ne!(first.volume_name, second.volume_name);
+    assert_eq!(first.s3.bucket, second.s3.bucket);
 }
 
 #[test]

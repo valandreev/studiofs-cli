@@ -11,6 +11,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use uuid::Uuid;
 
 use crate::infra::ServicePort;
 
@@ -22,7 +23,6 @@ const DEFAULT_WINDOWS_MOUNT_LETTERS: &[char] = &[
 const MAX_COMMAND_OUTPUT_CHARS: usize = 4096;
 const S3_BUCKET_NAME_MAX_CHARS: usize = 63;
 const E2E_BUCKET_PREFIX: &str = "studiofs-e2e-";
-const E2E_VOLUME_PREFIX: &str = "sfs-e2e-";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientControllerConfig {
@@ -43,7 +43,7 @@ impl ClientControllerConfig {
         studiofs_bin: PathBuf,
         sandbox: PathBuf,
         run_id: &str,
-        seed: u64,
+        _seed: u64,
         ports: &[ServicePort],
     ) -> Result<Self, ClientControllerError> {
         let postgres = service_port(ports, "postgres")?;
@@ -54,15 +54,10 @@ impl ClientControllerConfig {
             &sanitized_run_id,
             S3_BUCKET_NAME_MAX_CHARS,
         );
-        let volume_stem = prefixed_dns_name(
-            E2E_VOLUME_PREFIX,
-            &format!("{sanitized_run_id}-{seed}"),
-            S3_BUCKET_NAME_MAX_CHARS,
-        );
         Ok(Self {
             studiofs_bin,
             sandbox,
-            volume_name: volume_stem,
+            volume_name: unique_e2e_volume_name(),
             meta_dsn: format!(
                 "postgres://studiofs:studiofs@{}:{}",
                 postgres.host, postgres.host_port
@@ -85,15 +80,9 @@ impl ClientControllerConfig {
     pub fn from_external_env(
         studiofs_bin: PathBuf,
         sandbox: PathBuf,
-        run_id: &str,
-        seed: u64,
+        _run_id: &str,
+        _seed: u64,
     ) -> Result<Self, ClientControllerError> {
-        let sanitized_run_id = sanitize_dns_label(run_id);
-        let volume_stem = prefixed_dns_name(
-            E2E_VOLUME_PREFIX,
-            &format!("{sanitized_run_id}-{seed}"),
-            S3_BUCKET_NAME_MAX_CHARS,
-        );
         let external_env = ExternalEnvValues::load();
         let meta_dsn = external_env
             .value(&["STUDIOFS_E2E_EXTERNAL_PG_DSN", "STUDIOFS_TEST_PG_DSN"])
@@ -142,7 +131,7 @@ impl ClientControllerConfig {
         Ok(Self {
             studiofs_bin,
             sandbox,
-            volume_name: volume_stem,
+            volume_name: unique_e2e_volume_name(),
             meta_dsn,
             s3: S3Config {
                 endpoint,
@@ -158,6 +147,10 @@ impl ClientControllerConfig {
             mount_points: Vec::new(),
         })
     }
+}
+
+fn unique_e2e_volume_name() -> String {
+    Uuid::new_v4().to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -67,11 +67,11 @@ Required initial run flags and environment:
 | `--infra compose|external-env|disabled` | External infrastructure mode. `compose` starts `docker/compose.e2e.yml`, waits for healthy required services, collects Docker logs, and tears the stack down. `external-env` uses caller-provided PostgreSQL and S3/RustFS settings from process environment or `.env` and never starts, stops, or cleans those services. `disabled` is reserved for runner self-tests and skeleton-only validation. |
 | `--retain always|on-failure|never` | Sandbox retention policy. Default is `on-failure`. |
 | `--report <path>` | Optional copy target for the final `report.json`. The canonical report remains in the run sandbox while the sandbox is retained. |
-| `--port-range <start-end>` | Optional deterministic host port pool for Docker services. The compose runner allocates PostgreSQL, RustFS S3, RustFS console, and Toxiproxy API ports in that order. |
+| `--port-range <start-end>` | Optional deterministic host port pool for Docker services. The compose runner allocates PostgreSQL, RustFS S3, RustFS console, and Toxiproxy API ports in that order. Use this when a default host port is occupied or Docker reports it healthy but host-side clients cannot reach it. |
 | `STUDIOFS_E2E_COMPOSE_FILE` | Optional environment override for the compose file path. Defaults to `docker/compose.e2e.yml` discovered from the current directory or executable location. |
 | `STUDIOFS_E2E_EXTERNAL_PG_DSN` / `STUDIOFS_TEST_PG_DSN` | PostgreSQL DSN for `--infra external-env`. The E2E-specific variable wins when both are set. |
 | `STUDIOFS_E2E_EXTERNAL_S3_ENDPOINT` / `STUDIOFS_TEST_ONLINE_S3_ENDPOINT` / `STUDIOFS_S3_ENDPOINT` | S3/RustFS endpoint for `--infra external-env`. |
-| `STUDIOFS_E2E_EXTERNAL_S3_BUCKET` / `STUDIOFS_TEST_ONLINE_S3_BUCKET` / `STUDIOFS_S3_BUCKET` | S3/RustFS bucket for `--infra external-env`. The runner uses a unique StudioFS volume name per run inside this bucket. |
+| `STUDIOFS_E2E_EXTERNAL_S3_BUCKET` / `STUDIOFS_TEST_ONLINE_S3_BUCKET` / `STUDIOFS_S3_BUCKET` | S3/RustFS bucket for `--infra external-env`. The runner uses a UUID StudioFS volume name for each scenario bootstrap inside this bucket. |
 | `STUDIOFS_E2E_EXTERNAL_S3_ACCESS_KEY` / `STUDIOFS_TEST_ONLINE_S3_ACCESS_KEY` / `STUDIOFS_S3_ACCESS_KEY` | S3/RustFS access key for `--infra external-env`. |
 | `STUDIOFS_E2E_EXTERNAL_S3_SECRET_KEY` / `STUDIOFS_TEST_ONLINE_S3_SECRET_KEY` / `STUDIOFS_S3_SECRET_KEY` | S3/RustFS secret key for `--infra external-env`. |
 | `STUDIOFS_E2E_EXTERNAL_S3_REGION` / `STUDIOFS_TEST_ONLINE_S3_REGION` / `STUDIOFS_S3_REGION` | Optional S3/RustFS region for `--infra external-env`; defaults to `us-east-1`. |
@@ -218,6 +218,10 @@ service healthy, the first `studiofs init` may retry narrowly-classified
 object-store transport failures during bucket creation. The retry window is
 bounded and must not hide credential, permission, bucket naming, or endpoint
 configuration errors.
+Each real E2E bootstrap uses a UUID as the StudioFS volume name. This keeps
+multi-scenario runs from colliding with a volume created by an earlier scenario
+in the same PostgreSQL metadata database, while preserving the readable
+run-scoped bucket name for Docker/RustFS diagnostics.
 Crash-style remounts do not run `studiofs umount` for the killed client. On
 Linux, before spawning the replacement mount process, the controller attempts a
 lazy stale-mount cleanup for leftover FUSE mount points with `fusermount3 -u -z`,
@@ -562,8 +566,9 @@ Required checks:
 - Compose stack: `docker/compose.e2e.yml` defines PostgreSQL 18, RustFS, and a
   Toxiproxy placeholder using version-pinned service images for reproducible
   runs. Published ports bind to `127.0.0.1` only. The runner invokes
-  `docker compose up --detach --wait` with a project-scoped name and records the
-  copied compose file plus logs under `artifacts/docker/`.
+  `docker compose up --detach --wait` with a project-scoped name, verifies the
+  host-mapped RustFS health endpoints, and records the copied compose file plus
+  logs under `artifacts/docker/`.
 - Mount support:
   - Linux requires a usable `/dev/fuse`, mount point creation rights, and the
     FUSE backend expected by `studiofs-fuse`.
