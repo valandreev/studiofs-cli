@@ -4,6 +4,7 @@ use std::fs;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use clap::ValueEnum;
@@ -103,6 +104,7 @@ pub struct CommandSpec {
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
     pub cwd: Option<PathBuf>,
+    pub timeout: Option<Duration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,7 +135,27 @@ impl CommandExecutor for SystemCommandExecutor {
         if let Some(cwd) = &command.cwd {
             process.current_dir(cwd);
         }
-        let output = process.output()?;
+        let mut child = process.spawn()?;
+        let output = if let Some(timeout) = command.timeout {
+            let started = Instant::now();
+            loop {
+                if child.try_wait()?.is_some() {
+                    break child.wait_with_output()?;
+                }
+                if started.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let output = child.wait_with_output()?;
+                    return Ok(CommandOutput {
+                        status: -1,
+                        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                        stderr: format!("command timed out after {}ms", timeout.as_millis()),
+                    });
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        } else {
+            child.wait_with_output()?
+        };
         Ok(CommandOutput {
             status: output.status.code().unwrap_or(-1),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -255,6 +277,7 @@ impl DockerComposeStack {
                 ],
                 env: Vec::new(),
                 cwd: None,
+                timeout: None,
             },
         ));
         checks.push(self.command_check(
@@ -265,6 +288,7 @@ impl DockerComposeStack {
                 args: vec!["compose".to_string(), "version".to_string()],
                 env: Vec::new(),
                 cwd: None,
+                timeout: None,
             },
         ));
         checks.extend(self.ports.iter().map(port_check));
@@ -335,6 +359,7 @@ impl DockerComposeStack {
             "--no-color".to_string(),
             "--timestamps".to_string(),
         ]);
+        command.timeout = Some(Duration::from_secs(120));
         let output = run_success(executor, "docker compose logs", command)?;
         let log_path = self.docker_artifact_dir().join("compose.log");
         fs::write(&log_path, output.stdout)?;
@@ -398,6 +423,7 @@ impl DockerComposeStack {
             "--volumes".to_string(),
             "--remove-orphans".to_string(),
         ]);
+        command.timeout = Some(Duration::from_secs(120));
         run_success(
             executor,
             "docker compose down --volumes --remove-orphans",
@@ -419,6 +445,7 @@ impl DockerComposeStack {
         command
             .args
             .extend(args.iter().map(|arg| (*arg).to_string()));
+        command.timeout = Some(Duration::from_secs(120));
         let output = executor.run(&command)?;
         let artifact_dir = self.docker_artifact_dir();
         let collected = output.status == 0;
@@ -568,6 +595,7 @@ impl ComposeServiceControl {
             ],
             env: self.env.clone(),
             cwd: self.compose_file.parent().map(Path::to_path_buf),
+            timeout: None,
         }
     }
 }
@@ -627,6 +655,7 @@ fn host_health_check(port: &ServicePort, executor: &dyn CommandExecutor) -> Infr
             ],
             env: Vec::new(),
             cwd: None,
+            timeout: Some(Duration::from_secs(HOST_HEALTH_ATTEMPT_TIMEOUT_SECS)),
         };
         match executor.run(&command) {
             Ok(output) if output.status == 0 => {

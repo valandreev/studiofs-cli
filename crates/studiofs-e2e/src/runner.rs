@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
-use std::io::Write as _;
+use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
@@ -1321,10 +1321,15 @@ fn parse_run_timeout(value: &str) -> Result<Duration, RunnerError> {
 }
 
 fn active_scenario_hook(events_path: &Path, scenario: &str) -> Option<String> {
-    let content = fs::read_to_string(events_path).ok()?;
+    let file = fs::File::open(events_path).ok()?;
+    let reader = BufReader::new(file);
     let mut active = BTreeSet::new();
-    for line in content.lines().filter(|line| !line.trim().is_empty()) {
-        let Ok(event) = serde_json::from_str::<EventRecord>(line) else {
+    for line in reader
+        .lines()
+        .map_while(Result::ok)
+        .filter(|line| !line.trim().is_empty())
+    {
+        let Ok(event) = serde_json::from_str::<EventRecord>(&line) else {
             continue;
         };
         if event.scenario.as_deref() != Some(scenario) {
@@ -2250,6 +2255,8 @@ mod tests {
             .unwrap();
         assert!(up_index < logs_index);
         assert!(logs_index < down_index);
+        assert_eq!(calls[logs_index].timeout, Some(Duration::from_secs(120)));
+        assert_eq!(calls[down_index].timeout, Some(Duration::from_secs(120)));
     }
 
     #[test]
