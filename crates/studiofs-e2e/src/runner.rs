@@ -1377,6 +1377,8 @@ fn run_scenario_child_with_timeout(
         .join(definition.name);
     fs::create_dir_all(&scenario_dir)?;
     let report_path = scenario_report_path(&scenario_dir);
+    let child_stdout = scenario_dir.join("child.stdout.log");
+    let child_stderr = scenario_dir.join("child.stderr.log");
     let timeout = deadline.and_then(RunDeadline::remaining);
     let mut args = vec![
         "__run-one".to_string(),
@@ -1388,12 +1390,7 @@ fn run_scenario_child_with_timeout(
         "--seed".to_string(),
         request.seed.to_string(),
         "--infra".to_string(),
-        match request.infra {
-            InfraMode::Disabled => "disabled",
-            InfraMode::Compose => "compose",
-            InfraMode::ExternalEnv => "external-env",
-        }
-        .to_string(),
+        request.infra.cli_value().to_string(),
     ];
     if let Some(studiofs_bin) = &request.studiofs_bin {
         args.push("--studiofs-bin".to_string());
@@ -1405,6 +1402,8 @@ fn run_scenario_child_with_timeout(
         env: Vec::new(),
         cwd: None,
         timeout,
+        stdout_path: Some(child_stdout.clone()),
+        stderr_path: Some(child_stderr.clone()),
     })?;
 
     if output.status == -1 {
@@ -1450,10 +1449,10 @@ fn run_scenario_child_with_timeout(
             duration_ms: duration_millis(started_instant),
             artifacts: vec![scenario_artifact_path(definition.name, "operations.ndjson")],
             error: Some(format!(
-                "scenario child exited with status {}; stderr: {}; stdout: {}",
+                "scenario child terminated abnormally with status {}; stderr: {}; stdout: {}",
                 output.status,
-                output.stderr.trim(),
-                output.stdout.trim()
+                read_text_snippet(&child_stderr)?.trim(),
+                read_text_snippet(&child_stdout)?.trim()
             )),
         }
     };
@@ -1939,6 +1938,16 @@ fn write_pretty_json<T: Serialize>(path: &Path, value: &T) -> Result<(), RunnerE
 
 fn read_json_file<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, RunnerError> {
     Ok(serde_json::from_slice(&fs::read(path)?)?)
+}
+
+fn read_text_snippet(path: &Path) -> Result<String, RunnerError> {
+    const MAX_SNIPPET_BYTES: usize = 8192;
+    if !path.exists() {
+        return Ok(String::new());
+    }
+    let bytes = fs::read(path)?;
+    let start = bytes.len().saturating_sub(MAX_SNIPPET_BYTES);
+    Ok(String::from_utf8_lossy(&bytes[start..]).into_owned())
 }
 
 fn scenario_report_path(scenario_dir: &Path) -> PathBuf {
@@ -2766,6 +2775,15 @@ mod tests {
             call.timeout
                 .is_some_and(|timeout| timeout <= Duration::from_secs(30))
         }));
+        assert!(child_runs.iter().all(|call| {
+            call.stdout_path
+                .as_ref()
+                .is_some_and(|path| path.ends_with("child.stdout.log"))
+                && call
+                    .stderr_path
+                    .as_ref()
+                    .is_some_and(|path| path.ends_with("child.stderr.log"))
+        }));
     }
 
     #[test]
@@ -2812,11 +2830,52 @@ mod tests {
         assert_eq!(child_runs, 1);
     }
 
+    #[test]
+    fn abnormal_supervised_child_without_report_is_marked_failed() {
+        let temp = tempfile::tempdir().unwrap();
+        let executor = RecordingExecutor::default();
+        executor.fail_next_run_one_without_report.set(true);
+
+        let outcome = run_with_executor_and_mount_lock_dir(
+            RunRequest {
+                root: temp.path().join("e2e-runs"),
+                run_id: Some("supervised-abnormal-run".to_string()),
+                scenarios: vec![
+                    scenario::TEST_FAILING_VALIDATE.to_string(),
+                    scenario::TEST_PASSING.to_string(),
+                ],
+                seed: 371,
+                studiofs_bin: None,
+                platform: PlatformSelection::Auto,
+                retention: RetentionPolicy::Always,
+                report: None,
+                port_range: None,
+                timeout: Some("30s".to_string()),
+                infra: InfraMode::Disabled,
+            },
+            &executor,
+            &temp.path().join("locks"),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.status, RunStatus::Failed);
+        assert_eq!(outcome.scenarios.len(), 2);
+        let report = read_json_file::<RunReport>(&outcome.report_path).unwrap();
+        assert_eq!(report.scenarios[0].status, ScenarioStatus::Failed);
+        assert!(
+            report.scenarios[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("terminated abnormally"))
+        );
+    }
+
     #[derive(Default)]
     struct RecordingExecutor {
         calls: RefCell<Vec<crate::infra::CommandSpec>>,
         poison_events_path_after_up: RefCell<Option<PathBuf>>,
         timeout_next_run_one: Cell<bool>,
+        fail_next_run_one_without_report: Cell<bool>,
     }
 
     impl CommandExecutor for RecordingExecutor {
@@ -2828,6 +2887,13 @@ mod tests {
                         status: -1,
                         stdout: String::new(),
                         stderr: "command timed out after 30000ms".to_string(),
+                    });
+                }
+                if self.fail_next_run_one_without_report.replace(false) {
+                    return Ok(CommandOutput {
+                        status: 101,
+                        stdout: String::new(),
+                        stderr: String::new(),
                     });
                 }
                 let scenario_name = command

@@ -102,6 +102,8 @@ target/e2e-runs/<run-id>/
     scenarios/
       <scenario-name>/
         scenario-report.json
+        child.stdout.log
+        child.stderr.log
         operations.ndjson
     clients/
       client-a/
