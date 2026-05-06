@@ -3,8 +3,10 @@
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{self, Write as _};
-use std::path::PathBuf;
-use std::sync::{Arc, Barrier, mpsc};
+use std::path::{Path, PathBuf};
+#[cfg(not(test))]
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -86,6 +88,7 @@ const CHAOS_READ_ATTEMPTS: u32 = 4;
 const CHAOS_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(90);
 const CHAOS_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const CHAOS_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+const CHAOS_HELPER_START_TIMEOUT: Duration = Duration::from_secs(60);
 const FAULT_CHAOS_CONFLICT_ROUNDS: usize = 6;
 const FAULT_CHAOS_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(120);
 const FAULT_CHAOS_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -137,6 +140,8 @@ pub enum ScenarioError {
     CrashRestartUnmountAfterFailure { primary: String, cleanup: String },
     #[error("mounted tree validation failed: {0}")]
     MountedTree(#[from] MountedTreeError),
+    #[error("mounted chaos helper failed: {0}")]
+    MountedChaosHelper(String),
     #[error("scenario infrastructure failed: {0}")]
     Infra(#[from] InfraError),
     #[error("scenario operation log failed: {0}")]
@@ -1778,13 +1783,57 @@ struct MountedChaosOperation {
     error: Option<String>,
 }
 
-type MountedChaosAction = Box<dyn FnOnce(&ClientSpec) -> io::Result<()> + Send + 'static>;
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+enum MountedChaosAction {
+    Rename {
+        from: String,
+        to: String,
+    },
+    Unlink {
+        path: String,
+    },
+    Append {
+        path: String,
+        payload: Vec<u8>,
+    },
+    Write {
+        path: String,
+        payload: Vec<u8>,
+    },
+    CreateFile {
+        path: String,
+        payload: Vec<u8>,
+    },
+    Mkdir {
+        path: String,
+    },
+    Rmdir {
+        path: String,
+    },
+    Read {
+        path: String,
+    },
+    ReadLoop {
+        path: String,
+    },
+    Stat {
+        path: String,
+    },
+    Readdir {
+        path: String,
+    },
+    #[cfg(test)]
+    Sleep {
+        millis: u64,
+    },
+}
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct MountedChaosTask {
     round: usize,
     order: usize,
     client: ClientSpec,
-    operation: &'static str,
+    operation: String,
     path: String,
     shared_operation: SharedOperation,
     action: MountedChaosAction,
@@ -1795,19 +1844,19 @@ impl MountedChaosTask {
         round: usize,
         order: usize,
         client: ClientSpec,
-        operation: &'static str,
+        operation: impl Into<String>,
         path: impl Into<String>,
         shared_operation: SharedOperation,
-        action: impl FnOnce(&ClientSpec) -> io::Result<()> + Send + 'static,
+        action: MountedChaosAction,
     ) -> Self {
         Self {
             round,
             order,
             client,
-            operation,
+            operation: operation.into(),
             path: path.into(),
             shared_operation,
-            action: Box::new(action),
+            action,
         }
     }
 }
@@ -2084,34 +2133,29 @@ fn rename_task(
     to: String,
 ) -> MountedChaosTask {
     let path = format!("{from} -> {to}");
-    let from_for_action = from.clone();
-    let to_for_action = to.clone();
     MountedChaosTask::new(
         round,
         order,
         client,
         "rename",
         path,
-        SharedOperation::Rename { from, to },
-        move |client| {
-            fs::rename(
-                client.mount_point.join(&from_for_action),
-                client.mount_point.join(&to_for_action),
-            )
+        SharedOperation::Rename {
+            from: from.clone(),
+            to: to.clone(),
         },
+        MountedChaosAction::Rename { from, to },
     )
 }
 
 fn unlink_task(round: usize, order: usize, client: ClientSpec, path: String) -> MountedChaosTask {
-    let path_for_action = path.clone();
     MountedChaosTask::new(
         round,
         order,
         client,
         "unlink",
         path.clone(),
-        SharedOperation::Unlink { path },
-        move |client| fs::remove_file(client.mount_point.join(path_for_action)),
+        SharedOperation::Unlink { path: path.clone() },
+        MountedChaosAction::Unlink { path },
     )
 }
 
@@ -2124,7 +2168,6 @@ fn append_task(
 ) -> MountedChaosTask {
     let payload = chaos_payload(seed, round, "append");
     let bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
-    let path_for_action = path.clone();
     MountedChaosTask::new(
         round,
         order,
@@ -2132,17 +2175,11 @@ fn append_task(
         "append",
         path.clone(),
         SharedOperation::Append {
-            path,
+            path: path.clone(),
             bytes,
             checksum_sha256: Some(bytes_sha256(&payload)),
         },
-        move |client| {
-            let mut file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(client.mount_point.join(path_for_action))?;
-            file.write_all(&payload)
-        },
+        MountedChaosAction::Append { path, payload },
     )
 }
 
@@ -2155,7 +2192,6 @@ fn write_task(
 ) -> MountedChaosTask {
     let payload = chaos_payload(seed, round, "overwrite");
     let bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
-    let path_for_action = path.clone();
     MountedChaosTask::new(
         round,
         order,
@@ -2163,12 +2199,12 @@ fn write_task(
         "write",
         path.clone(),
         SharedOperation::Write {
-            path,
+            path: path.clone(),
             offset: Some(0),
             bytes,
             checksum_sha256: Some(bytes_sha256(&payload)),
         },
-        move |client| fs::write(client.mount_point.join(path_for_action), payload),
+        MountedChaosAction::Write { path, payload },
     )
 }
 
@@ -2181,7 +2217,6 @@ fn create_file_task(
 ) -> MountedChaosTask {
     let payload = chaos_payload(seed, round, "create");
     let bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
-    let path_for_action = path.clone();
     MountedChaosTask::new(
         round,
         order,
@@ -2189,41 +2224,38 @@ fn create_file_task(
         "create",
         path.clone(),
         SharedOperation::CreateFile {
-            path,
+            path: path.clone(),
             bytes: Some(bytes),
         },
-        move |client| fs::write(client.mount_point.join(path_for_action), payload),
+        MountedChaosAction::CreateFile { path, payload },
     )
 }
 
 fn mkdir_task(round: usize, order: usize, client: ClientSpec, path: String) -> MountedChaosTask {
-    let path_for_action = path.clone();
     MountedChaosTask::new(
         round,
         order,
         client,
         "mkdir",
         path.clone(),
-        SharedOperation::CreateDirectory { path },
-        move |client| fs::create_dir_all(client.mount_point.join(path_for_action)),
+        SharedOperation::CreateDirectory { path: path.clone() },
+        MountedChaosAction::Mkdir { path },
     )
 }
 
 fn rmdir_task(round: usize, order: usize, client: ClientSpec, path: String) -> MountedChaosTask {
-    let path_for_action = path.clone();
     MountedChaosTask::new(
         round,
         order,
         client,
         "rmdir",
         path.clone(),
-        SharedOperation::Rmdir { path },
-        move |client| fs::remove_dir(client.mount_point.join(path_for_action)),
+        SharedOperation::Rmdir { path: path.clone() },
+        MountedChaosAction::Rmdir { path },
     )
 }
 
 fn read_task(round: usize, order: usize, client: ClientSpec, path: String) -> MountedChaosTask {
-    let path_for_action = path.clone();
     MountedChaosTask::new(
         round,
         order,
@@ -2231,11 +2263,11 @@ fn read_task(round: usize, order: usize, client: ClientSpec, path: String) -> Mo
         "read",
         path.clone(),
         SharedOperation::Read {
-            path,
+            path: path.clone(),
             bytes: None,
             checksum_sha256: None,
         },
-        move |client| fs::read(client.mount_point.join(path_for_action)).map(|_| ()),
+        MountedChaosAction::Read { path },
     )
 }
 
@@ -2245,7 +2277,6 @@ fn read_loop_task(
     client: ClientSpec,
     path: String,
 ) -> MountedChaosTask {
-    let path_for_action = path.clone();
     MountedChaosTask::new(
         round,
         order,
@@ -2253,37 +2284,35 @@ fn read_loop_task(
         "read_loop",
         path.clone(),
         SharedOperation::Read {
-            path,
+            path: path.clone(),
             bytes: None,
             checksum_sha256: None,
         },
-        move |client| repeated_chaos_read(client, &path_for_action),
+        MountedChaosAction::ReadLoop { path },
     )
 }
 
 fn stat_task(round: usize, order: usize, client: ClientSpec, path: String) -> MountedChaosTask {
-    let path_for_action = path.clone();
     MountedChaosTask::new(
         round,
         order,
         client,
         "stat",
         path.clone(),
-        SharedOperation::Stat { path },
-        move |client| fs::metadata(client.mount_point.join(path_for_action)).map(|_| ()),
+        SharedOperation::Stat { path: path.clone() },
+        MountedChaosAction::Stat { path },
     )
 }
 
 fn readdir_task(round: usize, order: usize, client: ClientSpec, path: String) -> MountedChaosTask {
-    let path_for_action = path.clone();
     MountedChaosTask::new(
         round,
         order,
         client,
         "readdir",
         path.clone(),
-        SharedOperation::Readdir { path },
-        move |client| fs::read_dir(client.mount_point.join(path_for_action)).map(|_| ()),
+        SharedOperation::Readdir { path: path.clone() },
+        MountedChaosAction::Readdir { path },
     )
 }
 
@@ -2291,89 +2320,302 @@ fn run_concurrent_mounted_chaos_operations(
     started: Instant,
     tasks: Vec<MountedChaosTask>,
 ) -> Result<Vec<MountedChaosOperation>, ScenarioError> {
-    run_concurrent_mounted_chaos_operations_with_timeout(started, tasks, CHAOS_OPERATION_TIMEOUT)
+    #[cfg(test)]
+    {
+        let launcher = InProcessMountedChaosProcessLauncher;
+        run_concurrent_mounted_chaos_operations_with_launcher(
+            started,
+            tasks,
+            CHAOS_OPERATION_TIMEOUT,
+            &launcher,
+        )
+    }
+    #[cfg(not(test))]
+    {
+        let launcher = SystemMountedChaosProcessLauncher::new()?;
+        run_concurrent_mounted_chaos_operations_with_launcher(
+            started,
+            tasks,
+            CHAOS_OPERATION_TIMEOUT,
+            &launcher,
+        )
+    }
 }
 
-fn run_concurrent_mounted_chaos_operations_with_timeout(
+fn run_concurrent_mounted_chaos_operations_with_launcher(
     started: Instant,
     tasks: Vec<MountedChaosTask>,
     timeout: Duration,
+    launcher: &dyn MountedChaosProcessLauncher,
 ) -> Result<Vec<MountedChaosOperation>, ScenarioError> {
     let round = tasks.first().map(|task| task.round).unwrap_or_default();
-    let pending = tasks
+    let work_dir = std::env::temp_dir().join(format!(
+        "studiofs-e2e-chaos-{}-{}",
+        std::process::id(),
+        started.elapsed().as_nanos()
+    ));
+    fs::create_dir_all(&work_dir)?;
+    let start_file = work_dir.join("start");
+    let mut processes = tasks
         .iter()
-        .map(mounted_chaos_task_label)
-        .collect::<Vec<_>>();
-    let barrier = Arc::new(Barrier::new(tasks.len()));
-    let (tx, rx) = mpsc::channel();
-    for task in tasks {
-        let barrier = Arc::clone(&barrier);
-        let tx = tx.clone();
-        thread::spawn(move || {
-            barrier.wait();
-            let _ = tx.send(record_chaos_fs_operation(started, task));
-        });
-    }
-    drop(tx);
+        .map(|task| {
+            let label = mounted_chaos_task_label(task);
+            launcher
+                .launch(task, &start_file, &work_dir)
+                .map(|process| LaunchedMountedChaosProcess {
+                    label,
+                    process,
+                    done: false,
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    fs::write(&start_file, b"start")?;
 
     let deadline = Instant::now() + timeout;
-    let mut operations = Vec::with_capacity(pending.len());
-    while operations.len() < pending.len() {
-        let now = Instant::now();
-        if now >= deadline {
-            let completed = operations
-                .iter()
-                .map(|operation: &MountedChaosOperation| mounted_chaos_operation_label(operation))
-                .collect::<std::collections::HashSet<_>>();
-            let pending = pending
-                .into_iter()
-                .filter(|operation| !completed.contains(operation))
-                .collect();
+    let mut operations = Vec::with_capacity(processes.len());
+    while operations.len() < processes.len() {
+        for process in processes.iter_mut().filter(|process| !process.done) {
+            if let Some(operation) = process.process.try_collect(started)? {
+                process.done = true;
+                operations.push(operation);
+            }
+        }
+        if operations.len() == processes.len() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let pending = kill_pending_mounted_chaos_processes(&mut processes);
             return Err(ScenarioError::MountedChaosOperationTimeout {
                 round,
                 timeout_ms: timeout.as_millis(),
                 pending,
             });
         }
-        match rx.recv_timeout(deadline.saturating_duration_since(now)) {
-            Ok(operation) => operations.push(operation),
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                let completed = operations
-                    .iter()
-                    .map(|operation: &MountedChaosOperation| {
-                        mounted_chaos_operation_label(operation)
-                    })
-                    .collect::<std::collections::HashSet<_>>();
-                let pending = pending
-                    .into_iter()
-                    .filter(|operation| !completed.contains(operation))
-                    .collect();
-                return Err(ScenarioError::MountedChaosOperationTimeout {
-                    round,
-                    timeout_ms: timeout.as_millis(),
-                    pending,
-                });
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        }
+        thread::sleep(Duration::from_millis(5));
     }
+    let _ = fs::remove_dir_all(&work_dir);
     operations.sort_by_key(|operation| (operation.round, operation.order));
     Ok(operations)
+}
+
+struct LaunchedMountedChaosProcess {
+    label: String,
+    process: Box<dyn MountedChaosProcess>,
+    done: bool,
+}
+
+fn kill_pending_mounted_chaos_processes(
+    processes: &mut [LaunchedMountedChaosProcess],
+) -> Vec<String> {
+    let mut pending = Vec::new();
+    for process in processes.iter_mut().filter(|process| !process.done) {
+        pending.push(process.label.clone());
+        if let Err(error) = process.process.kill() {
+            pending.push(format!("{} (kill failed: {error})", process.label));
+        }
+    }
+    pending
+}
+
+trait MountedChaosProcessLauncher {
+    fn launch(
+        &self,
+        task: &MountedChaosTask,
+        start_file: &Path,
+        work_dir: &Path,
+    ) -> Result<Box<dyn MountedChaosProcess>, ScenarioError>;
+}
+
+trait MountedChaosProcess {
+    fn try_collect(
+        &mut self,
+        started: Instant,
+    ) -> Result<Option<MountedChaosOperation>, ScenarioError>;
+    fn kill(&mut self) -> io::Result<()>;
+}
+
+#[cfg(not(test))]
+struct SystemMountedChaosProcessLauncher {
+    helper_bin: PathBuf,
+}
+
+#[cfg(not(test))]
+impl SystemMountedChaosProcessLauncher {
+    fn new() -> Result<Self, ScenarioError> {
+        Ok(Self {
+            helper_bin: std::env::current_exe()?,
+        })
+    }
+}
+
+#[cfg(not(test))]
+impl MountedChaosProcessLauncher for SystemMountedChaosProcessLauncher {
+    fn launch(
+        &self,
+        task: &MountedChaosTask,
+        start_file: &Path,
+        work_dir: &Path,
+    ) -> Result<Box<dyn MountedChaosProcess>, ScenarioError> {
+        let task_path = work_dir.join(format!(
+            "task-{}-{}-{}.json",
+            task.round, task.order, task.client.name
+        ));
+        let stdout_path = work_dir.join(format!(
+            "task-{}-{}-{}.stdout.json",
+            task.round, task.order, task.client.name
+        ));
+        let stderr_path = work_dir.join(format!(
+            "task-{}-{}-{}.stderr.log",
+            task.round, task.order, task.client.name
+        ));
+        fs::write(&task_path, serde_json::to_vec(task)?)?;
+        let stdout = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&stdout_path)?;
+        let stderr = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&stderr_path)?;
+        let child = Command::new(&self.helper_bin)
+            .arg("__mounted-chaos-op")
+            .arg("--task")
+            .arg(&task_path)
+            .arg("--start-file")
+            .arg(start_file)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr))
+            .spawn()?;
+        Ok(Box::new(SystemMountedChaosProcess {
+            child,
+            task: task.clone(),
+            stdout_path,
+            stderr_path,
+        }))
+    }
+}
+
+#[cfg(not(test))]
+struct SystemMountedChaosProcess {
+    child: Child,
+    task: MountedChaosTask,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+}
+
+#[cfg(not(test))]
+impl MountedChaosProcess for SystemMountedChaosProcess {
+    fn try_collect(
+        &mut self,
+        started: Instant,
+    ) -> Result<Option<MountedChaosOperation>, ScenarioError> {
+        let Some(status) = self.child.try_wait()? else {
+            return Ok(None);
+        };
+        let stdout = fs::read_to_string(&self.stdout_path).unwrap_or_default();
+        let stderr = fs::read_to_string(&self.stderr_path).unwrap_or_default();
+        let parsed = stdout
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .and_then(|line| serde_json::from_str::<MountedChaosOperation>(line).ok());
+        let mut operation = parsed.unwrap_or_else(|| MountedChaosOperation {
+            round: self.task.round,
+            order: self.task.order,
+            client: self.task.client.name.clone(),
+            operation: self.task.operation.clone(),
+            path: self.task.path.clone(),
+            shared_operation: self.task.shared_operation.clone(),
+            result: "error".to_string(),
+            timestamp_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            error: Some(format!(
+                "mounted chaos helper exited without a valid operation record: status={status}, stderr={}",
+                stderr.trim()
+            )),
+        });
+        operation.timestamp_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        Ok(Some(operation))
+    }
+
+    fn kill(&mut self) -> io::Result<()> {
+        self.child.kill()
+    }
+}
+
+#[cfg(test)]
+struct InProcessMountedChaosProcessLauncher;
+
+#[cfg(test)]
+impl MountedChaosProcessLauncher for InProcessMountedChaosProcessLauncher {
+    fn launch(
+        &self,
+        task: &MountedChaosTask,
+        _start_file: &Path,
+        _work_dir: &Path,
+    ) -> Result<Box<dyn MountedChaosProcess>, ScenarioError> {
+        Ok(Box::new(InProcessMountedChaosProcess {
+            task: Some(task.clone()),
+            result: None,
+        }))
+    }
+}
+
+#[cfg(test)]
+struct InProcessMountedChaosProcess {
+    task: Option<MountedChaosTask>,
+    result: Option<MountedChaosOperation>,
+}
+
+#[cfg(test)]
+impl MountedChaosProcess for InProcessMountedChaosProcess {
+    fn try_collect(
+        &mut self,
+        started: Instant,
+    ) -> Result<Option<MountedChaosOperation>, ScenarioError> {
+        if self.result.is_none() {
+            let task = self
+                .task
+                .take()
+                .expect("task must be present before collect");
+            self.result = Some(record_chaos_fs_operation(started, task));
+        }
+        Ok(self.result.take())
+    }
+
+    fn kill(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+pub(crate) fn run_mounted_chaos_operation_helper(
+    task_path: &Path,
+    start_file: &Path,
+) -> Result<(), ScenarioError> {
+    let task: MountedChaosTask = serde_json::from_slice(&fs::read(task_path)?)?;
+    let deadline = Instant::now() + CHAOS_HELPER_START_TIMEOUT;
+    while !start_file.exists() {
+        if Instant::now() >= deadline {
+            return Err(ScenarioError::MountedChaosHelper(format!(
+                "timed out waiting for chaos helper start file {}",
+                start_file.display()
+            )));
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    let operation = record_chaos_fs_operation(Instant::now(), task);
+    println!("{}", serde_json::to_string(&operation)?);
+    Ok(())
 }
 
 fn mounted_chaos_task_label(task: &MountedChaosTask) -> String {
     format!("{} {} {}", task.client.name, task.operation, task.path)
 }
 
-fn mounted_chaos_operation_label(operation: &MountedChaosOperation) -> String {
-    format!(
-        "{} {} {}",
-        operation.client, operation.operation, operation.path
-    )
-}
-
 fn record_chaos_fs_operation(started: Instant, task: MountedChaosTask) -> MountedChaosOperation {
-    match (task.action)(&task.client) {
+    match execute_mounted_chaos_action(&task.client, &task.action) {
         Ok(()) => MountedChaosOperation {
             round: task.round,
             order: task.order,
@@ -2396,6 +2638,44 @@ fn record_chaos_fs_operation(started: Instant, task: MountedChaosTask) -> Mounte
             timestamp_ms: elapsed_millis_u64(started),
             error: Some(error.to_string()),
         },
+    }
+}
+
+fn execute_mounted_chaos_action(
+    client: &ClientSpec,
+    action: &MountedChaosAction,
+) -> io::Result<()> {
+    match action {
+        MountedChaosAction::Rename { from, to } => {
+            fs::rename(client.mount_point.join(from), client.mount_point.join(to))
+        }
+        MountedChaosAction::Unlink { path } => fs::remove_file(client.mount_point.join(path)),
+        MountedChaosAction::Append { path, payload } => {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(client.mount_point.join(path))?;
+            file.write_all(payload)
+        }
+        MountedChaosAction::Write { path, payload }
+        | MountedChaosAction::CreateFile { path, payload } => {
+            fs::write(client.mount_point.join(path), payload)
+        }
+        MountedChaosAction::Mkdir { path } => fs::create_dir_all(client.mount_point.join(path)),
+        MountedChaosAction::Rmdir { path } => fs::remove_dir(client.mount_point.join(path)),
+        MountedChaosAction::Read { path } => fs::read(client.mount_point.join(path)).map(|_| ()),
+        MountedChaosAction::ReadLoop { path } => repeated_chaos_read(client, path),
+        MountedChaosAction::Stat { path } => {
+            fs::metadata(client.mount_point.join(path)).map(|_| ())
+        }
+        MountedChaosAction::Readdir { path } => {
+            fs::read_dir(client.mount_point.join(path)).map(|_| ())
+        }
+        #[cfg(test)]
+        MountedChaosAction::Sleep { millis } => {
+            thread::sleep(Duration::from_millis(*millis));
+            Ok(())
+        }
     }
 }
 
@@ -7073,17 +7353,16 @@ mod tests {
                 name: "mounted-only-hang".to_string(),
                 reason: "test hang".to_string(),
             },
-            |_client| {
-                thread::sleep(Duration::from_millis(250));
-                Ok(())
-            },
+            MountedChaosAction::Sleep { millis: 250 },
         );
+        let launcher = RecordingMountedChaosProcessLauncher::pending();
         let started = Instant::now();
 
-        let err = run_concurrent_mounted_chaos_operations_with_timeout(
+        let err = run_concurrent_mounted_chaos_operations_with_launcher(
             started,
             vec![task],
             Duration::from_millis(20),
+            &launcher,
         )
         .unwrap_err();
 
@@ -7093,6 +7372,92 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_millis(200),
             "timeout must not wait for the hung worker to finish"
+        );
+    }
+
+    struct RecordingMountedChaosProcessLauncher {
+        killed: std::rc::Rc<RefCell<Vec<String>>>,
+    }
+
+    impl RecordingMountedChaosProcessLauncher {
+        fn pending() -> Self {
+            Self {
+                killed: std::rc::Rc::new(RefCell::new(Vec::new())),
+            }
+        }
+
+        fn killed_processes(&self) -> Vec<String> {
+            self.killed.borrow().clone()
+        }
+    }
+
+    impl MountedChaosProcessLauncher for RecordingMountedChaosProcessLauncher {
+        fn launch(
+            &self,
+            task: &MountedChaosTask,
+            _start_file: &Path,
+            _work_dir: &Path,
+        ) -> Result<Box<dyn MountedChaosProcess>, ScenarioError> {
+            Ok(Box::new(RecordingMountedChaosProcess {
+                label: mounted_chaos_task_label(task),
+                killed: std::rc::Rc::clone(&self.killed),
+            }))
+        }
+    }
+
+    struct RecordingMountedChaosProcess {
+        label: String,
+        killed: std::rc::Rc<RefCell<Vec<String>>>,
+    }
+
+    impl MountedChaosProcess for RecordingMountedChaosProcess {
+        fn try_collect(
+            &mut self,
+            _started: Instant,
+        ) -> Result<Option<MountedChaosOperation>, ScenarioError> {
+            Ok(None)
+        }
+
+        fn kill(&mut self) -> io::Result<()> {
+            self.killed.borrow_mut().push(self.label.clone());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn mounted_chaos_timeout_kills_isolated_operation_process() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-chaos-isolation-timeout");
+        let mount = temp.path().join("mounts").join("client-a");
+        std::fs::create_dir_all(&mount).unwrap();
+        let client = client_spec_for(&sandbox, "projectfs", "client-a", mount);
+        let task = MountedChaosTask::new(
+            9,
+            1,
+            client,
+            "stat",
+            "chaos/blocked.txt",
+            SharedOperation::Stat {
+                path: "chaos/blocked.txt".to_string(),
+            },
+            MountedChaosAction::Stat {
+                path: "chaos/blocked.txt".to_string(),
+            },
+        );
+        let launcher = RecordingMountedChaosProcessLauncher::pending();
+
+        let err = run_concurrent_mounted_chaos_operations_with_launcher(
+            Instant::now(),
+            vec![task],
+            Duration::from_millis(20),
+            &launcher,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("mounted chaos round 9 timed out"));
+        assert_eq!(
+            launcher.killed_processes(),
+            vec!["client-a stat chaos/blocked.txt".to_string()]
         );
     }
 

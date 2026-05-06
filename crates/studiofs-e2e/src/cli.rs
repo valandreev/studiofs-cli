@@ -26,6 +26,9 @@ pub enum Commands {
     Run(RunArgs),
     /// Remove runner-owned sandboxes from the run root.
     Clean(CleanArgs),
+    /// Internal helper for one mounted chaos filesystem operation.
+    #[command(name = "__mounted-chaos-op", hide = true)]
+    MountedChaosOp(MountedChaosOpArgs),
 }
 
 #[derive(Args, Debug)]
@@ -85,6 +88,17 @@ pub struct CleanArgs {
     pub root: PathBuf,
 }
 
+#[derive(Args, Debug)]
+pub struct MountedChaosOpArgs {
+    /// Serialized mounted chaos task JSON.
+    #[arg(long)]
+    pub task: PathBuf,
+
+    /// File created by the parent runner to release concurrent helpers.
+    #[arg(long)]
+    pub start_file: PathBuf,
+}
+
 impl RunArgs {
     pub fn scenario_names(&self) -> Vec<String> {
         let mut names = Vec::new();
@@ -142,6 +156,10 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             for skipped in outcome.skipped {
                 eprintln!("skipped {}: {}", skipped.path.display(), skipped.error);
             }
+            Ok(0)
+        }
+        Commands::MountedChaosOp(args) => {
+            scenario::run_mounted_chaos_operation_helper(&args.task, &args.start_file)?;
             Ok(0)
         }
     }

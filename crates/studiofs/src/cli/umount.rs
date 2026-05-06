@@ -11,6 +11,17 @@ type RemovePidFn = fn(&str) -> Result<()>;
 type IsRunningFn = fn(u32) -> bool;
 type IsMountActiveFn = fn(&str) -> Result<bool>;
 
+#[cfg(windows)]
+const SYNCHRONIZE: u32 = 0x00100000;
+#[cfg(windows)]
+const PROCESS_TERMINATE: u32 = 0x0001;
+#[cfg(windows)]
+const WAIT_OBJECT_0: u32 = 0x00000000;
+#[cfg(windows)]
+const WAIT_TIMEOUT: u32 = 0x00000102;
+#[cfg(windows)]
+const FORCE_TERMINATE_WAIT_MS: u32 = 5_000;
+
 #[derive(Debug, Args)]
 #[command(about = "Unmount a previously mounted filesystem volume")]
 #[command(after_help = "\
@@ -106,9 +117,6 @@ fn unmount_windows(mount_point: &str, pid: u32) -> Result<()> {
     }
 
     const EVENT_MODIFY_STATE: u32 = 0x0002;
-    const SYNCHRONIZE: u32 = 0x00100000;
-    const PROCESS_TERMINATE: u32 = 0x0001;
-    const WAIT_TIMEOUT: u32 = 0x00000102;
 
     // 1. Signal the named event for graceful shutdown
     let event_name = super::utils::shutdown_event_name(mount_point);
@@ -140,15 +148,54 @@ fn unmount_windows(mount_point: &str, pid: u32) -> Result<()> {
         if wait_result == WAIT_TIMEOUT {
             tracing::warn!("mount process did not exit within 15 s — force-killing");
             // SAFETY: `process` is valid and still live until we close it after this block.
-            unsafe {
-                TerminateProcess(process, 1);
+            let terminated = unsafe { TerminateProcess(process, 1) };
+            if terminated == 0 {
+                let error = std::io::Error::last_os_error();
+                // SAFETY: `process` was returned by `OpenProcess`; closing it is the required
+                // cleanup action before returning the OS error.
+                unsafe { CloseHandle(process) };
+                anyhow::bail!("failed to force-kill mount process {pid}: {error}");
             }
+            // SAFETY: `process` is still valid after `TerminateProcess`; wait until Windows
+            // actually signals process exit so `umount` cannot report a false success.
+            let after_terminate = unsafe { WaitForSingleObject(process, FORCE_TERMINATE_WAIT_MS) };
+            let result = windows_process_exit_after_terminate(after_terminate);
+            // SAFETY: `process` was returned by `OpenProcess`; closing it is the required cleanup
+            // action after waiting.
+            unsafe { CloseHandle(process) };
+            result?;
+            return Ok(());
+        }
+        if wait_result != WAIT_OBJECT_0 {
+            let error = std::io::Error::last_os_error();
+            // SAFETY: `process` was returned by `OpenProcess`; closing it is the required cleanup
+            // action before returning the wait failure.
+            unsafe { CloseHandle(process) };
+            anyhow::bail!("failed while waiting for mount process {pid} to exit: {error}");
         }
         // SAFETY: `process` was returned by `OpenProcess`; closing it is the required cleanup action.
         unsafe { CloseHandle(process) };
+    } else {
+        let error = std::io::Error::last_os_error();
+        anyhow::bail!("failed to open mount process {pid} for shutdown: {error}");
     }
 
     Ok(())
+}
+
+#[cfg(windows)]
+fn windows_process_exit_after_terminate(wait_result: u32) -> Result<()> {
+    if wait_result == WAIT_OBJECT_0 {
+        Ok(())
+    } else if wait_result == WAIT_TIMEOUT {
+        anyhow::bail!(
+            "mount process did not exit after force termination within {} ms",
+            FORCE_TERMINATE_WAIT_MS
+        );
+    } else {
+        let error = std::io::Error::last_os_error();
+        anyhow::bail!("failed while waiting after force termination: {error}");
+    }
 }
 
 // ─── Unix ────────────────────────────────────────────────────────────────────
@@ -296,5 +343,15 @@ mod tests {
         let state = pid_state().lock().unwrap();
         assert!(state.removed, "PID file should have been removed");
         assert!(state.value.is_none(), "PID state should be cleared");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_umount_reports_process_that_survives_force_termination() {
+        let result = windows_process_exit_after_terminate(WAIT_TIMEOUT);
+
+        assert!(result.is_err());
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("mount process did not exit after force termination"));
     }
 }

@@ -321,20 +321,24 @@ multiple concurrent rounds chosen from the same conflict families as the
 focused collision suite: rename/rename, rename/unlink, unlink/append,
 overwrite/read, mkdir/rmdir/create, and readdir/stat during mutation. The
 scenario records each round's planned and started operations in
-`operations.ndjson` before launching mounted worker threads, then records
-accepted or rejected outcomes after workers return. This preserves the intended
-operation set even when a platform filesystem call hangs before the worker can
-report a result. A mounted-chaos worker round has a bounded timeout; on timeout
-the scenario reports the pending operation labels and still enters mounted
-cleanup. The scenario writes `mounted-chaos-summary.json` and `validation.json`,
-and uses only mounted tree convergence plus namespace invariants as the pass
-condition. A failure should be reproducible with the same `--seed`.
+`operations.ndjson` before launching mounted operation helpers, then records
+accepted or rejected outcomes after helpers return. Each mounted filesystem
+operation runs in a short-lived helper process rather than an in-runner thread,
+so a blocked platform syscall cannot keep the runner's main process from
+writing the failure report. A mounted-chaos round has a bounded timeout; on
+timeout the scenario force-terminates pending helper processes, reports their
+operation labels, and still enters mounted cleanup. The scenario writes
+`mounted-chaos-summary.json` and `validation.json`, and uses only mounted tree
+convergence plus namespace invariants as the pass condition. A failure should
+be reproducible with the same `--seed`.
 
 Mounted cleanup must not rely only on graceful unmount. If `studiofs umount`
 returns but the mounted process does not exit within the configured process-exit
 timeout, the client controller force-kills the mount process, clears the
 recorded PID, marks the client as killed, and returns the unmount timeout as the
 cleanup error.
+On Windows, `studiofs umount` itself must not report success after requesting
+forced termination unless the mount process is actually signaled as exited.
 
 `mounted-fault-chaos-convergence` is the deeper product fault-chaos scenario.
 It uses four clients against one shared remote volume. The first three clients

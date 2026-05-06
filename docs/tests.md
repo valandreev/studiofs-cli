@@ -195,9 +195,11 @@ unlink/append, overwrite/read, mkdir/rmdir/create, and readdir/stat mutation
 families across multiple rounds against three real mounted clients, records the
 same `ScenarioOperationRecord` log, and validates final mounted tree
 convergence and namespace invariants. Each mounted-chaos round records planned
-and started operations before launching worker threads, then records accepted or
-rejected results after the workers return. If a worker does not return within
-the round timeout, the scenario fails and still attempts mounted cleanup. The
+and started operations before launching short-lived operation helper processes,
+then records accepted or rejected results after the helpers return. If a helper
+does not return within the round timeout, the scenario force-terminates pending
+helpers, fails with their operation labels, and still attempts mounted cleanup.
+The
 `mounted-fault-chaos-convergence`
 scenario is the next product fault-chaos layer: it mixes a mounted conflict
 burst with PostgreSQL outage, client force-kill/remount, RustFS/S3 outage, and a
