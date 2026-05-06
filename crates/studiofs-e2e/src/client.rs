@@ -280,6 +280,10 @@ pub trait ClientProcess {
     fn id(&self) -> u32;
     fn try_wait(&mut self) -> io::Result<Option<i32>>;
     fn kill(&mut self) -> io::Result<()>;
+    fn kill_process_tree(&mut self, context: &str) -> io::Result<()> {
+        let _ = context;
+        self.kill()
+    }
 }
 
 pub trait ClientProcessExecutor {
@@ -335,7 +339,7 @@ impl ClientProcessExecutor for SystemClientProcessExecutor {
             }
             if Instant::now() >= deadline {
                 timed_out = true;
-                let _ = child.kill();
+                let _ = force_kill_child_process_tree(&mut child, &command.action);
                 break;
             }
             std::thread::sleep(COMMAND_RUN_POLL_INTERVAL);
@@ -415,12 +419,56 @@ impl ClientProcess for SystemClientProcess {
     fn kill(&mut self) -> io::Result<()> {
         self.child.kill()
     }
+
+    fn kill_process_tree(&mut self, context: &str) -> io::Result<()> {
+        force_kill_child_process_tree(&mut self.child, context)
+    }
 }
 
 fn join_output_reader(reader: thread::JoinHandle<io::Result<Vec<u8>>>) -> io::Result<Vec<u8>> {
     reader
         .join()
         .map_err(|_| io::Error::other("client command output reader panicked"))?
+}
+
+fn force_kill_child_process_tree(child: &mut Child, context: &str) -> io::Result<()> {
+    let pid = child.id();
+    let primary_result = child.kill();
+    #[cfg(windows)]
+    {
+        let pid_arg = pid.to_string();
+        let fallback_result = Command::new("taskkill")
+            .args(["/PID", &pid_arg, "/T", "/F"])
+            .output();
+        match (primary_result, fallback_result) {
+            (Ok(()), Ok(output)) if output.status.success() => Ok(()),
+            (primary, Ok(output)) => Err(io::Error::other(format!(
+                "failed to terminate process tree for {context} pid {pid}: primary kill: {}; taskkill exit: {}; stdout: {}; stderr: {}",
+                format_kill_result(&primary),
+                output.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&output.stdout).trim(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))),
+            (primary, Err(fallback)) => Err(io::Error::other(format!(
+                "failed to terminate process tree for {context} pid {pid}: primary kill: {}; taskkill failed: {fallback}",
+                format_kill_result(&primary)
+            ))),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = context;
+        let _ = pid;
+        primary_result
+    }
+}
+
+#[cfg(windows)]
+fn format_kill_result(result: &io::Result<()>) -> String {
+    match result {
+        Ok(()) => "ok".to_string(),
+        Err(error) => error.to_string(),
+    }
 }
 
 #[derive(Debug, Error)]
@@ -611,7 +659,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
     pub fn force_kill(&mut self, client: &str) -> Result<(), ClientControllerError> {
         let index = self.client_index(client)?;
         if let Some(process) = self.clients[index].process.as_mut() {
-            process.kill()?;
+            process.kill_process_tree("force_kill")?;
         }
         self.clients[index].process = None;
         self.clients[index].spec.process_id = None;
@@ -637,7 +685,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         let mut kill_error = None;
         for index in 0..self.clients.len() {
             if let Some(process) = self.clients[index].process.as_mut() {
-                if let Err(err) = process.kill() {
+                if let Err(err) = process.kill_process_tree("force_kill_all") {
                     kill_error.get_or_insert(err);
                 }
             }
@@ -663,7 +711,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         let mut process = self.executor.spawn(&command)?;
         let process_id = process.id();
         if let Err(err) = self.wait_until_mount_ready(&command, process.as_mut()) {
-            if let Err(kill_error) = process.kill() {
+            if let Err(kill_error) = process.kill_process_tree("mount readiness failure") {
                 debug_log_kill_error(&command.client, "mount readiness failure", &kill_error);
             }
             self.clients[index].spec.state =
@@ -758,7 +806,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
                 self.config.mount_exit_timeout,
                 self.config.poll_interval,
             ) {
-                let kill_result = process.kill();
+                let kill_result = process.kill_process_tree("unmount timeout fallback");
                 self.clients[index].process = None;
                 self.clients[index].spec.process_id = None;
                 self.clients[index].spec.state = ClientLifecycleState::Killed;
@@ -796,7 +844,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
 
     fn kill_mount_process_after_failed_unmount(&mut self, index: usize, context: &str) {
         if let Some(process) = self.clients[index].process.as_mut() {
-            if let Err(kill_error) = process.kill() {
+            if let Err(kill_error) = process.kill_process_tree(context) {
                 debug_log_kill_error(&self.clients[index].spec.name, context, &kill_error);
             }
             self.clients[index].process = None;
