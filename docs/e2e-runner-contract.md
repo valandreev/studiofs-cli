@@ -153,10 +153,10 @@ runner prints the run ID and sandbox path before preflight so operators can
 inspect `events.ndjson`, child logs, and scenario artifacts while the run is
 still active.
 
-Progress is emitted for run start, preflight start and result, scenario start
-and result, hook start and result, and cleanup start and result. While a hook is
-active, the runner emits a heartbeat every 30 seconds. Heartbeats are plain log
-lines, not terminal-control updates:
+Progress is emitted as stable key-value lines for run start, preflight start
+and result, scenario start and result, hook start and result, and cleanup start
+and result. While a hook is active, the runner emits a heartbeat every 30
+seconds. Heartbeats are plain log lines, not terminal-control updates:
 
 ```text
 [studiofs-e2e][2026-05-06T17:30:00.000Z] run=20260506T173000Z-a1b2c3 scenario=1/1 scenario_name=mounted-fault-chaos-convergence hook=run phase=heartbeat elapsed=90s last_event=run.started sandbox=E:\dev\studiofs-cli\target\e2e-runs\20260506T173000Z-a1b2c3
@@ -164,7 +164,9 @@ lines, not terminal-control updates:
 
 Use `run`, `scenario_name`, `hook`, `elapsed`, and `last_event` from the latest
 heartbeat to identify the active hook without waiting for post-mortem artifact
-inspection.
+inspection. `last_event` is sampled from the scenario operation log when a
+scenario has written operations, and falls back to the current hook boundary
+when no later operation is available.
 
 ## Artifact Layout And Retention
 
