@@ -2516,18 +2516,38 @@ fn stale_infra_preflight_detail(
     let current_sandbox = current_sandbox.canonicalize().ok();
     let mut stale = Vec::new();
     for entry_result in fs::read_dir(&root)? {
-        let entry = entry_result?;
-        if !entry.file_type()?.is_dir() {
+        let entry = match entry_result {
+            Ok(entry) => entry,
+            Err(err) => {
+                stale.push(format!("<entry-error: {err}>"));
+                continue;
+            }
+        };
+        let path = entry.path();
+        let is_dir = match entry.file_type() {
+            Ok(file_type) => file_type.is_dir(),
+            Err(err) => {
+                stale.push(format!("{} (ambiguous: {err})", path.display()));
+                continue;
+            }
+        };
+        if !is_dir {
             continue;
         }
-        let path = entry.path();
         if current_sandbox.as_ref().is_some_and(|current| {
             path.canonicalize()
                 .is_ok_and(|candidate| candidate == *current)
         }) {
             continue;
         }
-        if cleanup_report_passed(&path)? {
+        let cleanup_passed = match cleanup_report_passed(&path) {
+            Ok(passed) => passed,
+            Err(err) => {
+                stale.push(format!("{} (report-error: {err})", path.display()));
+                false
+            }
+        };
+        if cleanup_passed {
             continue;
         }
         let manifest = match read_runner_owned_manifest(&path) {
@@ -3456,6 +3476,104 @@ mod tests {
                 .any(|call| call.args.contains(&"up".to_string())),
             "completed retained runs must not block a new compose stack"
         );
+    }
+
+    #[test]
+    fn compose_preflight_reports_malformed_cleanup_json_and_continues_scanning() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("e2e-runs");
+        let malformed = root.join("malformed-cleanup-run");
+        fs::create_dir_all(malformed.join("artifacts")).unwrap();
+        write_pretty_json(
+            &malformed.join(RUNNER_MARKER_FILE),
+            &serde_json::json!({
+                "runner_crate": RUNNER_CRATE,
+                "run_id": "malformed-cleanup-run",
+            }),
+        )
+        .unwrap();
+        write_pretty_json(
+            &malformed.join("run.json"),
+            &build_manifest(ManifestInput {
+                run_id: "malformed-cleanup-run",
+                seed: 373,
+                sandbox: &malformed,
+                scenarios: &[scenario::TEST_PASSING.to_string()],
+                retention: RetentionPolicy::Always,
+                selected_platform: "windows-winfsp",
+                infra: InfraMode::Compose,
+                compose_project: Some("studiofs-e2e-malformed-cleanup-run"),
+                allocated_ports: Vec::new(),
+                studiofs_bin: None,
+                port_range: None,
+                timeout: None,
+                created_at: &timestamp(),
+            }),
+        )
+        .unwrap();
+        fs::write(malformed.join("cleanup.json"), "{").unwrap();
+
+        let stale = root.join("stale-compose-run");
+        fs::create_dir_all(stale.join("artifacts")).unwrap();
+        write_pretty_json(
+            &stale.join(RUNNER_MARKER_FILE),
+            &serde_json::json!({
+                "runner_crate": RUNNER_CRATE,
+                "run_id": "stale-compose-run",
+            }),
+        )
+        .unwrap();
+        write_pretty_json(
+            &stale.join("run.json"),
+            &build_manifest(ManifestInput {
+                run_id: "stale-compose-run",
+                seed: 373,
+                sandbox: &stale,
+                scenarios: &[scenario::TEST_PASSING.to_string()],
+                retention: RetentionPolicy::Always,
+                selected_platform: "windows-winfsp",
+                infra: InfraMode::Compose,
+                compose_project: Some("studiofs-e2e-stale-compose-run"),
+                allocated_ports: Vec::new(),
+                studiofs_bin: None,
+                port_range: None,
+                timeout: None,
+                created_at: &timestamp(),
+            }),
+        )
+        .unwrap();
+        let executor = RecordingExecutor::default();
+
+        let outcome = run_with_executor_and_mount_lock_dir(
+            RunRequest {
+                root: root.clone(),
+                run_id: Some("next-compose-run".to_string()),
+                scenarios: vec![scenario::TEST_PASSING.to_string()],
+                seed: 373,
+                studiofs_bin: None,
+                platform: PlatformSelection::Auto,
+                retention: RetentionPolicy::Always,
+                report: None,
+                port_range: Some("33440-33450".to_string()),
+                timeout: None,
+                infra: InfraMode::Compose,
+            },
+            &executor,
+            &temp.path().join("mount-locks"),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.status, RunStatus::PreflightFailed);
+        let report = read_json_file::<RunReport>(&outcome.report_path).unwrap();
+        let stale_check = report
+            .preflight
+            .checks
+            .iter()
+            .find(|check| check.name == "stale runner-owned E2E infrastructure")
+            .expect("preflight should include stale infra diagnostic");
+        assert!(stale_check.detail.contains("malformed-cleanup-run"));
+        assert!(stale_check.detail.contains("report-error"));
+        assert!(stale_check.detail.contains("stale-compose-run"));
     }
 
     #[test]
