@@ -147,12 +147,32 @@ returns and writes the final expected version. A cold observer joins at the end.
 The test does not only check that clients converge. It also checks that they
 converge to the right winner.
 
+### 9. Mounted Open-Handle Convergence
+
+This scenario keeps real operating-system file handles open while another
+mounted client changes the namespace underneath them. One case unlinks the path
+while the handle owner keeps reading and writing through the open handle. The
+other case renames the path while the handle owner appends, flushes, fsyncs,
+reads back, and releases the same open handle.
+
+The pass condition has two sides. The open handle must keep behaving like a
+real local file handle until release, but the mounted namespace must still
+converge to the public winner. Deleted paths must not come back after
+flush/fsync/release, the old rename source must stay absent, and the renamed
+destination must remain visible to every mounted client.
+
+The focused regression and the real Windows/WinFSP mounted scenario now pass.
+The final validation shows all three clients converge,
+`open-handles/unlink-target.txt` stayed absent, `open-handles/rename-target.txt`
+stayed absent, `open-handles/renamed-target.txt` stayed visible, and both open
+handles read back the expected payload and checksum.
+
 ## What A Passing Full Sweep Means
 
 A passing full mounted E2E sweep means the current implementation survived all
 implemented real-mount scenarios in one run: basic sharing, service outages,
 client crash/restart, focused namespace collisions, seeded mounted chaos,
-fault chaos, and LWW reconnect chaos.
+fault chaos, LWW reconnect chaos, and open-handle namespace convergence.
 
 It does not mean the filesystem is perfect. It means the current safety net is
 working and gives us a strong baseline before we add deeper scenarios.
@@ -173,10 +193,10 @@ should become a smaller focused regression before we move on.
 ## What Comes Next
 
 The next planned testing levels go deeper into filesystem semantics that are
-easy to get wrong: open files while paths are renamed or deleted, crashes at
-publication boundaries, hot directory churn, sparse-file truncate/write races,
-long-history cold observers, metadata invalidation dropouts, symlink/attribute
-convergence, and adversarial runner cleanup.
+easy to get wrong: crashes at publication boundaries, hot directory churn,
+sparse-file truncate/write races, long-history cold observers, metadata
+invalidation dropouts, symlink/attribute convergence, and adversarial runner
+cleanup.
 
 The workflow is intentionally staged. We add one level, run it, fix the bugs it
 finds, rerun the existing sweep to make sure nothing regressed, and only then

@@ -2781,6 +2781,21 @@ impl PgMetaEngine {
         }
     }
 
+    fn rename_dentry_conflicts_with_overlay(
+        parent: Ino,
+        name: &[u8],
+        new_parent: Ino,
+        new_name: &[u8],
+        overlay: &OverlayConflictSets,
+    ) -> bool {
+        overlay
+            .dentry_keys
+            .contains(&Self::dentry_key(parent, name))
+            || overlay
+                .dentry_keys
+                .contains(&Self::dentry_key(new_parent, new_name))
+    }
+
     fn decode_foreign_batch(
         rows: &[tokio_postgres::Row],
         start_idx: usize,
@@ -2835,6 +2850,38 @@ impl PgMetaEngine {
             .cloned()
             .collect();
         self.local.apply_replica_serving_state(&serving_events)?;
+        for event in batch_events {
+            let MetaEvent::RenameEntry {
+                parent,
+                name,
+                new_parent,
+                new_name,
+                entry,
+                ..
+            } = event
+            else {
+                continue;
+            };
+            if !Self::serving_event_conflicts_with_overlay(event, overlay, &removed_inodes) {
+                continue;
+            }
+            if Self::rename_dentry_conflicts_with_overlay(
+                *parent,
+                name,
+                *new_parent,
+                new_name,
+                overlay,
+            ) {
+                continue;
+            }
+            self.local.reconcile_serving_rename_from_base(
+                *parent,
+                name,
+                *new_parent,
+                new_name,
+                entry,
+            )?;
+        }
         let mut aux_events = Vec::new();
         for event in batch_events {
             if !Self::event_has_aux_apply_effect(event) {
@@ -5276,6 +5323,60 @@ mod tests {
             pg.flushed_event_seq.load(Ordering::SeqCst),
             end,
             "self-batch ack must advance over the raw local events that produced the projected batch"
+        );
+    }
+
+    #[test]
+    fn foreign_rename_reconciles_serving_dentry_despite_local_attr_overlay() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+        let file = pg
+            .create_file(ROOT_INO, b"rename-source.txt", 0, 0, 0o644)
+            .expect("create file");
+        set_file_state(&pg, file.ino, 28, 1);
+        publish_local_events_to_base(&pg);
+
+        let mut local_attr = pg.get_attr(file.ino).expect("get attr");
+        local_attr.size = 55;
+        pg.set_attr(&local_attr).expect("set local attr overlay");
+        let overlay = pg.local_overlay_conflicts().expect("local overlay");
+        let rename = MetaEvent::RenameEntry {
+            parent: ROOT_INO,
+            name: b"rename-source.txt".to_vec(),
+            new_parent: ROOT_INO,
+            new_name: b"renamed-target.txt".to_vec(),
+            entry: DirEntryValue {
+                ino: file.ino,
+                kind: FileType::RegularFile,
+            },
+            displaced_set_attr: Box::new(None),
+            displaced_remove_attr_ino: None,
+            moved_dir_attr: Box::new(None),
+            old_parent_attr: Box::new(None),
+            new_parent_attr: Box::new(None),
+        };
+
+        assert!(
+            PgMetaEngine::serving_event_conflicts_with_overlay(
+                &rename,
+                &overlay,
+                &HashSet::new()
+            ),
+            "local attr overlay should conflict with the full rename event"
+        );
+        pg.apply_foreign_batch(std::slice::from_ref(&rename), &overlay)
+            .expect("apply foreign rename");
+
+        assert!(pg.lookup(ROOT_INO, b"rename-source.txt").is_err());
+        assert_eq!(
+            pg.lookup(ROOT_INO, b"renamed-target.txt")
+                .expect("lookup renamed target")
+                .ino,
+            file.ino
+        );
+        assert_eq!(
+            pg.get_attr(file.ino).expect("local attr survives").size,
+            55,
+            "serving dentry reconciliation must preserve the local attr overlay"
         );
     }
 
