@@ -208,6 +208,12 @@ fn run_with_executor_and_mount_lock_dir(
     } else {
         request.scenarios
     };
+    e2e_progress(&format!(
+        "run {run_id} starting: {} scenario(s), seed={}, infra={:?}",
+        scenario_names.len(),
+        request.seed,
+        request.infra
+    ));
     let scenarios = resolve_scenarios(&scenario_names)?;
     if matches!(request.infra, InfraMode::Compose | InfraMode::ExternalEnv)
         && request.studiofs_bin.is_none()
@@ -291,8 +297,10 @@ fn run_with_executor_and_mount_lock_dir(
         None
     };
     let prepared_preflight = if let Some(detail) = mount_lock_failure {
+        e2e_progress(&format!("run {run_id} preflight: mount lock failed"));
         prepare_failed_mount_lock_preflight(&sandbox, compose_stack.as_ref(), detail)?
     } else {
+        e2e_progress(&format!("run {run_id} preflight: starting"));
         prepare_preflight(
             &sandbox,
             infra_mode,
@@ -302,6 +310,7 @@ fn run_with_executor_and_mount_lock_dir(
         )?
     };
     let preflight = prepared_preflight.report;
+    e2e_progress(&format!("run {run_id} preflight: {:?}", preflight.status));
     allocated_ports = compose_stack
         .as_ref()
         .map(|stack| stack.ports().to_vec())
@@ -370,8 +379,15 @@ fn run_with_executor_and_mount_lock_dir(
     let mut scenario_reports = Vec::new();
     let mut scenario_outcomes = Vec::new();
     let mut cleanup_errors = Vec::new();
-    for resolved in scenarios {
+    let total_scenarios = scenarios.len();
+    for (index, resolved) in scenarios.into_iter().enumerate() {
         let definition = resolved.definition;
+        e2e_progress(&format!(
+            "run {run_id} scenario {}/{} {}: starting",
+            index + 1,
+            total_scenarios,
+            definition.name
+        ));
         let context = ScenarioContext {
             run_id: run_id.clone(),
             seed: request.seed,
@@ -401,6 +417,13 @@ fn run_with_executor_and_mount_lock_dir(
 
         let lifecycle =
             run_scenario_lifecycle(&events_path, &run_id, resolved.scenario.as_ref(), &context)?;
+        e2e_progress(&format!(
+            "run {run_id} scenario {}/{} {}: {:?}",
+            index + 1,
+            total_scenarios,
+            definition.name,
+            lifecycle.outcome.status
+        ));
         if let Some(cleanup_error) = &lifecycle.cleanup_error {
             cleanup_errors.push(format!("{}: {cleanup_error}", lifecycle.outcome.name));
         }
@@ -410,6 +433,7 @@ fn run_with_executor_and_mount_lock_dir(
 
     record_event(&events_path, &run_id, None, "run", "finished")?;
     let mut cleanup_actions = Vec::new();
+    e2e_progress(&format!("run {run_id} cleanup: starting"));
     compose_cleanup_guard.collect_into(&mut cleanup_actions, &mut cleanup_errors);
 
     let cleanup = CleanupReport {
@@ -1254,8 +1278,14 @@ fn run_hook<T>(
 ) -> Result<T, RunnerError> {
     record_event(events_path, run_id, Some(scenario), hook, "started")?;
     record_operation_checkpoint(operation_writer, scenario, hook, "started")?;
+    e2e_progress(&format!(
+        "run {run_id} scenario {scenario} hook {hook}: starting"
+    ));
     let result = f();
     let phase = if result.is_ok() { "finished" } else { "failed" };
+    e2e_progress(&format!(
+        "run {run_id} scenario {scenario} hook {hook}: {phase}"
+    ));
     record_event(events_path, run_id, Some(scenario), hook, phase)?;
     record_operation_checkpoint(operation_writer, scenario, hook, phase)?;
     Ok(result?)
@@ -1577,6 +1607,11 @@ fn absolutize(path: &Path) -> Result<PathBuf, RunnerError> {
 fn generated_run_id() -> String {
     let suffix = Uuid::new_v4().simple().to_string();
     format!("{}-{}", Utc::now().format("%Y%m%dT%H%M%SZ"), &suffix[..6])
+}
+
+fn e2e_progress(message: &str) {
+    println!("[studiofs-e2e][{}] {message}", timestamp());
+    let _ = std::io::stdout().flush();
 }
 
 fn timestamp() -> String {
