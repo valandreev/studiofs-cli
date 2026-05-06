@@ -742,6 +742,22 @@ fn system_executor_times_out_foreground_commands_and_preserves_partial_logs() {
     assert!(stderr.contains("partial stderr"));
 }
 
+#[test]
+fn system_executor_drains_large_output_while_waiting_for_foreground_command() {
+    let temp = tempdir().unwrap();
+    let command = noisy_client_command_for_mount_point(temp.path().join("mount"));
+    std::fs::create_dir_all(&command.client_root).unwrap();
+
+    let output = studiofs_e2e::client::SystemClientProcessExecutor
+        .run(&command, Duration::from_secs(5))
+        .unwrap();
+
+    assert_eq!(output.status, 0);
+    assert!(output.stdout.len() > 128 * 1024);
+    let stdout = std::fs::read_to_string(&command.stdout_log).unwrap();
+    assert!(stdout.len() > 128 * 1024);
+}
+
 #[derive(Clone)]
 struct RecordingExecutor {
     calls: Rc<RefCell<Vec<ClientCommand>>>,
@@ -990,6 +1006,18 @@ fn sleepy_client_command_for_mount_point(mount_point: std::path::PathBuf) -> Cli
         "-NoProfile".to_string(),
         "-Command".to_string(),
         "Write-Output 'partial stdout'; [Console]::Error.WriteLine('partial stderr'); Start-Sleep -Seconds 5".to_string(),
+    ];
+    command
+}
+
+fn noisy_client_command_for_mount_point(mount_point: std::path::PathBuf) -> ClientCommand {
+    let mut command = client_command_for_mount_point(mount_point);
+    command.action = "noisy".to_string();
+    command.program = powershell_program().to_string();
+    command.args = vec![
+        "-NoProfile".to_string(),
+        "-Command".to_string(),
+        "[Console]::Out.Write(('x' * 131072)); [Console]::Out.Write(('y' * 1024))".to_string(),
     ];
     command
 }

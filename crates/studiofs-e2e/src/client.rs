@@ -2,9 +2,10 @@
 
 use std::fmt;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write as _};
+use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::thread;
 use std::time::{Duration, Instant};
 use std::{
     collections::HashSet, collections::hash_map::DefaultHasher, ffi::OsString, hash::Hasher,
@@ -308,36 +309,58 @@ impl ClientProcessExecutor for SystemClientProcessExecutor {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("failed to capture client command stdout"))?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| io::Error::other("failed to capture client command stderr"))?;
+        let stdout_reader = thread::spawn(move || {
+            let mut output = Vec::new();
+            stdout.read_to_end(&mut output)?;
+            Ok::<_, io::Error>(output)
+        });
+        let stderr_reader = thread::spawn(move || {
+            let mut output = Vec::new();
+            stderr.read_to_end(&mut output)?;
+            Ok::<_, io::Error>(output)
+        });
         let deadline = Instant::now() + timeout;
+        let mut timed_out = false;
         loop {
             if child.try_wait()?.is_some() {
                 break;
             }
             if Instant::now() >= deadline {
+                timed_out = true;
                 let _ = child.kill();
-                let output = child.wait_with_output()?;
-                append_log(&command.stdout_log, &output.stdout)?;
-                append_log(&command.stderr_log, &output.stderr)?;
-                return Err(ClientControllerError::CommandTimedOut(Box::new(
-                    ClientCommandTimeoutError {
-                        client: command.client.clone(),
-                        action: command.action.clone(),
-                        timeout,
-                        program: command.program.clone(),
-                        stdout_log: command.stdout_log.clone(),
-                        stderr_log: command.stderr_log.clone(),
-                    },
-                )));
+                break;
             }
             std::thread::sleep(COMMAND_RUN_POLL_INTERVAL);
         }
-        let output = child.wait_with_output()?;
-        append_log(&command.stdout_log, &output.stdout)?;
-        append_log(&command.stderr_log, &output.stderr)?;
+        let status = child.wait()?;
+        let stdout = join_output_reader(stdout_reader)?;
+        let stderr = join_output_reader(stderr_reader)?;
+        append_log(&command.stdout_log, &stdout)?;
+        append_log(&command.stderr_log, &stderr)?;
+        if timed_out {
+            return Err(ClientControllerError::CommandTimedOut(Box::new(
+                ClientCommandTimeoutError {
+                    client: command.client.clone(),
+                    action: command.action.clone(),
+                    timeout,
+                    program: command.program.clone(),
+                    stdout_log: command.stdout_log.clone(),
+                    stderr_log: command.stderr_log.clone(),
+                },
+            )));
+        }
         Ok(ClientCommandOutput {
-            status: output.status.code().unwrap_or(-1),
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            status: status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
         })
     }
 
@@ -392,6 +415,12 @@ impl ClientProcess for SystemClientProcess {
     fn kill(&mut self) -> io::Result<()> {
         self.child.kill()
     }
+}
+
+fn join_output_reader(reader: thread::JoinHandle<io::Result<Vec<u8>>>) -> io::Result<Vec<u8>> {
+    reader
+        .join()
+        .map_err(|_| io::Error::other("client command output reader panicked"))?
 }
 
 #[derive(Debug, Error)]
