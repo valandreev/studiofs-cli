@@ -1,9 +1,11 @@
 //! Multi-client process controller for mounted E2E scenarios.
 
+use std::fmt;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write as _};
+use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::thread;
 use std::time::{Duration, Instant};
 use std::{
     collections::HashSet, collections::hash_map::DefaultHasher, ffi::OsString, hash::Hasher,
@@ -23,6 +25,7 @@ const DEFAULT_WINDOWS_MOUNT_LETTERS: &[char] = &[
 const MAX_COMMAND_OUTPUT_CHARS: usize = 4096;
 const S3_BUCKET_NAME_MAX_CHARS: usize = 63;
 const E2E_BUCKET_PREFIX: &str = "studiofs-e2e-";
+const COMMAND_RUN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientControllerConfig {
@@ -34,8 +37,26 @@ pub struct ClientControllerConfig {
     pub init_retry_timeout: Duration,
     pub mount_ready_timeout: Duration,
     pub mount_exit_timeout: Duration,
+    pub command_timeouts: ClientCommandTimeouts,
     pub poll_interval: Duration,
     pub mount_points: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientCommandTimeouts {
+    pub init: Duration,
+    pub discover: Duration,
+    pub umount: Duration,
+}
+
+impl Default for ClientCommandTimeouts {
+    fn default() -> Self {
+        Self {
+            init: Duration::from_secs(60),
+            discover: Duration::from_secs(60),
+            umount: Duration::from_secs(60),
+        }
+    }
 }
 
 impl ClientControllerConfig {
@@ -72,6 +93,7 @@ impl ClientControllerConfig {
             init_retry_timeout: Duration::from_secs(30),
             mount_ready_timeout: Duration::from_secs(30),
             mount_exit_timeout: Duration::from_secs(15),
+            command_timeouts: ClientCommandTimeouts::default(),
             poll_interval: Duration::from_millis(100),
             mount_points: Vec::new(),
         })
@@ -143,6 +165,7 @@ impl ClientControllerConfig {
             init_retry_timeout: Duration::from_secs(30),
             mount_ready_timeout: Duration::from_secs(30),
             mount_exit_timeout: Duration::from_secs(15),
+            command_timeouts: ClientCommandTimeouts::default(),
             poll_interval: Duration::from_millis(100),
             mount_points: Vec::new(),
         })
@@ -213,6 +236,26 @@ pub struct ClientCommandOutput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientCommandTimeoutError {
+    pub client: String,
+    pub action: String,
+    pub timeout: Duration,
+    pub program: String,
+    pub stdout_log: PathBuf,
+    pub stderr_log: PathBuf,
+}
+
+impl fmt::Display for ClientCommandTimeoutError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} for {} timed out after {:?}: program: {}; stdout log: {:?}; stderr log: {:?}",
+            self.action, self.client, self.timeout, self.program, self.stdout_log, self.stderr_log
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VolumeBootstrapOptions {
     pub client_names: Vec<String>,
     pub clean_existing_local_metadata: bool,
@@ -240,7 +283,11 @@ pub trait ClientProcess {
 }
 
 pub trait ClientProcessExecutor {
-    fn run(&self, command: &ClientCommand) -> io::Result<ClientCommandOutput>;
+    fn run(
+        &self,
+        command: &ClientCommand,
+        timeout: Duration,
+    ) -> Result<ClientCommandOutput, ClientControllerError>;
     fn spawn(&self, command: &ClientCommand) -> io::Result<Box<dyn ClientProcess>>;
     fn is_mount_ready(&self, command: &ClientCommand) -> io::Result<bool>;
     fn cleanup_stale_mount_before_remount(&self, _command: &ClientCommand) -> io::Result<()> {
@@ -252,14 +299,68 @@ pub trait ClientProcessExecutor {
 pub struct SystemClientProcessExecutor;
 
 impl ClientProcessExecutor for SystemClientProcessExecutor {
-    fn run(&self, command: &ClientCommand) -> io::Result<ClientCommandOutput> {
-        let output = base_command(command).output()?;
-        append_log(&command.stdout_log, &output.stdout)?;
-        append_log(&command.stderr_log, &output.stderr)?;
+    fn run(
+        &self,
+        command: &ClientCommand,
+        timeout: Duration,
+    ) -> Result<ClientCommandOutput, ClientControllerError> {
+        let mut child = base_command(command)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("failed to capture client command stdout"))?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| io::Error::other("failed to capture client command stderr"))?;
+        let stdout_reader = thread::spawn(move || {
+            let mut output = Vec::new();
+            stdout.read_to_end(&mut output)?;
+            Ok::<_, io::Error>(output)
+        });
+        let stderr_reader = thread::spawn(move || {
+            let mut output = Vec::new();
+            stderr.read_to_end(&mut output)?;
+            Ok::<_, io::Error>(output)
+        });
+        let deadline = Instant::now() + timeout;
+        let mut timed_out = false;
+        loop {
+            if child.try_wait()?.is_some() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                timed_out = true;
+                let _ = child.kill();
+                break;
+            }
+            std::thread::sleep(COMMAND_RUN_POLL_INTERVAL);
+        }
+        let status = child.wait()?;
+        let stdout = join_output_reader(stdout_reader)?;
+        let stderr = join_output_reader(stderr_reader)?;
+        append_log(&command.stdout_log, &stdout)?;
+        append_log(&command.stderr_log, &stderr)?;
+        if timed_out {
+            return Err(ClientControllerError::CommandTimedOut(Box::new(
+                ClientCommandTimeoutError {
+                    client: command.client.clone(),
+                    action: command.action.clone(),
+                    timeout,
+                    program: command.program.clone(),
+                    stdout_log: command.stdout_log.clone(),
+                    stderr_log: command.stderr_log.clone(),
+                },
+            )));
+        }
         Ok(ClientCommandOutput {
-            status: output.status.code().unwrap_or(-1),
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            status: status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
         })
     }
 
@@ -316,6 +417,12 @@ impl ClientProcess for SystemClientProcess {
     }
 }
 
+fn join_output_reader(reader: thread::JoinHandle<io::Result<Vec<u8>>>) -> io::Result<Vec<u8>> {
+    reader
+        .join()
+        .map_err(|_| io::Error::other("client command output reader panicked"))?
+}
+
 #[derive(Debug, Error)]
 pub enum ClientControllerError {
     #[error("no E2E clients have been created")]
@@ -344,6 +451,8 @@ pub enum ClientControllerError {
         stdout: String,
         stderr: String,
     },
+    #[error("client command {0}")]
+    CommandTimedOut(Box<ClientCommandTimeoutError>),
     #[error("E2E client {client} did not create local metadata DB: {path}")]
     MissingLocalMetadataDb { client: String, path: PathBuf },
     #[error("E2E local metadata DB path is shared by multiple clients: {0}")]
@@ -433,7 +542,9 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         }
         for index in 1..self.clients.len() {
             let command = self.discover_command(index)?;
-            let output = self.executor.run(&command)?;
+            let output = self
+                .executor
+                .run(&command, self.command_timeout(&command))?;
             ensure_success(&command, output)?;
             self.clients[index].spec.state = ClientLifecycleState::Discovered;
         }
@@ -591,7 +702,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
     ) -> Result<(), ClientControllerError> {
         let deadline = Instant::now() + self.config.init_retry_timeout;
         loop {
-            let output = self.executor.run(command)?;
+            let output = self.executor.run(command, self.command_timeout(command))?;
             if output.status == 0 {
                 return Ok(());
             }
@@ -630,7 +741,16 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
             return Ok(());
         }
         let command = self.unmount_command(index)?;
-        let output = self.executor.run(&command)?;
+        let output = match self.executor.run(&command, self.command_timeout(&command)) {
+            Ok(output) => output,
+            Err(error) => {
+                self.kill_mount_process_after_failed_unmount(
+                    index,
+                    "unmount command timeout fallback",
+                );
+                return Err(error);
+            }
+        };
         ensure_success(&command, output)?;
         if let Some(process) = self.clients[index].process.as_mut() {
             if let Err(error) = wait_for_process_exit(
@@ -663,6 +783,26 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
             .iter()
             .position(|runtime| runtime.spec.name == client)
             .ok_or_else(|| ClientControllerError::UnknownClient(client.to_string()))
+    }
+
+    fn command_timeout(&self, command: &ClientCommand) -> Duration {
+        match command.action.as_str() {
+            "init" => self.config.command_timeouts.init,
+            "discover" => self.config.command_timeouts.discover,
+            "umount" => self.config.command_timeouts.umount,
+            _ => self.config.command_timeouts.discover,
+        }
+    }
+
+    fn kill_mount_process_after_failed_unmount(&mut self, index: usize, context: &str) {
+        if let Some(process) = self.clients[index].process.as_mut() {
+            if let Err(kill_error) = process.kill() {
+                debug_log_kill_error(&self.clients[index].spec.name, context, &kill_error);
+            }
+            self.clients[index].process = None;
+            self.clients[index].spec.process_id = None;
+            self.clients[index].spec.state = ClientLifecycleState::Killed;
+        }
     }
 
     fn create_client_spec(

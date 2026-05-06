@@ -8784,6 +8784,7 @@ mod tests {
             init_retry_timeout: Duration::from_secs(1),
             mount_ready_timeout: Duration::from_secs(1),
             mount_exit_timeout: Duration::from_secs(1),
+            command_timeouts: Default::default(),
             poll_interval: Duration::from_millis(10),
             mount_points: Vec::new(),
         }
