@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 //! StudioFS Cache Layer.
 //!
 //! `cached_store` provides the unified local cache + staged-writeback runtime

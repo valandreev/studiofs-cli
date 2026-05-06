@@ -1,4 +1,5 @@
 #![cfg(unix)]
+#![allow(missing_docs)]
 
 //! StudioFS FUSE backend for Linux and macOS using `fuser`.
 //!

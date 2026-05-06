@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 //! Real mounted E2E runner skeleton for StudioFS.
 
 pub mod cli;

@@ -1,4 +1,5 @@
 #![cfg(windows)]
+#![allow(missing_docs)]
 //! StudioFS WinFSP backend for Windows.
 //!
 //! Implements `winfsp::filesystem::FileSystemContext` to expose the VFS
