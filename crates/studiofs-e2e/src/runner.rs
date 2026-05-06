@@ -167,6 +167,8 @@ pub enum RunnerError {
     NonUtf8ArtifactPath { path: PathBuf },
     #[error("E2E artifact path must be relative and must not contain parent components")]
     UnsafeArtifactPath { path: PathBuf },
+    #[error("scenario child exited successfully without report: {path}")]
+    MissingScenarioReport { path: PathBuf },
     #[error("runner I/O failed: {0}")]
     Io(#[from] std::io::Error),
     #[error("runner JSON failed: {0}")]
@@ -1379,7 +1381,35 @@ fn run_scenario_child_with_timeout(
     let report_path = scenario_report_path(&scenario_dir);
     let child_stdout = scenario_dir.join("child.stdout.log");
     let child_stderr = scenario_dir.join("child.stderr.log");
-    let timeout = deadline.and_then(RunDeadline::remaining);
+    let timeout = if let Some(deadline) = deadline {
+        match deadline.remaining() {
+            Some(remaining) => Some(remaining),
+            None => {
+                let active_hook = active_scenario_hook(events_path, definition.name)
+                    .unwrap_or_else(|| "not_started".to_string());
+                let error = format!(
+                    "whole-run timeout already elapsed before starting scenario child {}; active hook {active_hook}; cleanup attempted",
+                    definition.name
+                );
+                let _ = record_event(
+                    events_path,
+                    run_id,
+                    Some(definition.name),
+                    &active_hook,
+                    "timed_out",
+                );
+                return Ok(timed_out_lifecycle(
+                    definition.name,
+                    request.seed,
+                    started_at,
+                    started_instant,
+                    error,
+                ));
+            }
+        }
+    } else {
+        None
+    };
     let mut args = vec![
         "__run-one".to_string(),
         definition.name.to_string(),
@@ -1432,13 +1462,7 @@ fn run_scenario_child_with_timeout(
     let report = if report_path.exists() {
         read_json_file::<ScenarioReport>(&report_path)?
     } else if output.status == 0 {
-        return Err(RunnerError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!(
-                "scenario child exited successfully without report: {}",
-                report_path.display()
-            ),
-        )));
+        return Err(RunnerError::MissingScenarioReport { path: report_path });
     } else {
         ScenarioReport {
             name: definition.name.to_string(),
@@ -2831,6 +2855,78 @@ mod tests {
     }
 
     #[test]
+    fn elapsed_deadline_times_out_before_spawning_supervised_child() {
+        let temp = tempfile::tempdir().unwrap();
+        let executor = RecordingExecutor::default();
+        let run_id = "elapsed-deadline-run";
+        let root = temp.path().join("e2e-runs");
+        let sandbox = root.join(run_id);
+        fs::create_dir_all(&sandbox).unwrap();
+        write_pretty_json(
+            &sandbox.join("run.json"),
+            &build_manifest(ManifestInput {
+                run_id,
+                seed: 371,
+                sandbox: &sandbox,
+                scenarios: &[scenario::TEST_HANGING_RUN.to_string()],
+                retention: RetentionPolicy::Always,
+                selected_platform: "windows-winfsp",
+                infra: InfraMode::Disabled,
+                compose_project: None,
+                allocated_ports: Vec::new(),
+                studiofs_bin: None,
+                port_range: None,
+                timeout: Some("1ms"),
+                created_at: &timestamp(),
+            }),
+        )
+        .unwrap();
+        let definition = scenario::resolve_scenario(scenario::TEST_HANGING_RUN)
+            .unwrap()
+            .definition();
+        let request = RunRequest {
+            root,
+            run_id: Some(run_id.to_string()),
+            scenarios: vec![scenario::TEST_HANGING_RUN.to_string()],
+            seed: 371,
+            studiofs_bin: None,
+            platform: PlatformSelection::Auto,
+            retention: RetentionPolicy::Always,
+            report: None,
+            port_range: None,
+            timeout: Some("1ms".to_string()),
+            infra: InfraMode::Disabled,
+        };
+        let deadline = RunDeadline::new(
+            Duration::from_millis(1),
+            Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("test instant before now"),
+        );
+
+        let lifecycle = run_scenario_child_with_timeout(
+            &sandbox,
+            &sandbox.join("events.ndjson"),
+            run_id,
+            definition,
+            &executor,
+            &request,
+            Some(deadline),
+        )
+        .unwrap();
+
+        assert_eq!(lifecycle.outcome.status, ScenarioStatus::TimedOut);
+        assert!(executor.calls.borrow().is_empty());
+        assert!(
+            lifecycle
+                .report
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("already elapsed"))
+        );
+    }
+
+    #[test]
     fn abnormal_supervised_child_without_report_is_marked_failed() {
         let temp = tempfile::tempdir().unwrap();
         let executor = RecordingExecutor::default();
@@ -2870,12 +2966,76 @@ mod tests {
         );
     }
 
+    #[test]
+    fn successful_supervised_child_without_report_returns_structured_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let executor = RecordingExecutor::default();
+        executor.skip_next_run_one_report.set(true);
+        let run_id = "missing-report-run";
+        let root = temp.path().join("e2e-runs");
+        let sandbox = root.join(run_id);
+        fs::create_dir_all(&sandbox).unwrap();
+        write_pretty_json(
+            &sandbox.join("run.json"),
+            &build_manifest(ManifestInput {
+                run_id,
+                seed: 371,
+                sandbox: &sandbox,
+                scenarios: &[scenario::TEST_PASSING.to_string()],
+                retention: RetentionPolicy::Always,
+                selected_platform: "windows-winfsp",
+                infra: InfraMode::Disabled,
+                compose_project: None,
+                allocated_ports: Vec::new(),
+                studiofs_bin: None,
+                port_range: None,
+                timeout: Some("30s"),
+                created_at: &timestamp(),
+            }),
+        )
+        .unwrap();
+        let definition = scenario::resolve_scenario(scenario::TEST_PASSING)
+            .unwrap()
+            .definition();
+        let request = RunRequest {
+            root,
+            run_id: Some(run_id.to_string()),
+            scenarios: vec![scenario::TEST_PASSING.to_string()],
+            seed: 371,
+            studiofs_bin: None,
+            platform: PlatformSelection::Auto,
+            retention: RetentionPolicy::Always,
+            report: None,
+            port_range: None,
+            timeout: Some("30s".to_string()),
+            infra: InfraMode::Disabled,
+        };
+
+        let err = run_scenario_child_with_timeout(
+            &sandbox,
+            &sandbox.join("events.ndjson"),
+            run_id,
+            definition,
+            &executor,
+            &request,
+            Some(RunDeadline::new(Duration::from_secs(30), Instant::now())),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            RunnerError::MissingScenarioReport { path }
+                if path.ends_with("scenario-report.json")
+        ));
+    }
+
     #[derive(Default)]
     struct RecordingExecutor {
         calls: RefCell<Vec<crate::infra::CommandSpec>>,
         poison_events_path_after_up: RefCell<Option<PathBuf>>,
         timeout_next_run_one: Cell<bool>,
         fail_next_run_one_without_report: Cell<bool>,
+        skip_next_run_one_report: Cell<bool>,
     }
 
     impl CommandExecutor for RecordingExecutor {
@@ -2892,6 +3052,13 @@ mod tests {
                 if self.fail_next_run_one_without_report.replace(false) {
                     return Ok(CommandOutput {
                         status: 101,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    });
+                }
+                if self.skip_next_run_one_report.replace(false) {
+                    return Ok(CommandOutput {
+                        status: 0,
                         stdout: String::new(),
                         stderr: String::new(),
                     });
