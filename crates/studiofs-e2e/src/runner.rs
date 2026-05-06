@@ -2,9 +2,11 @@
 
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
-use std::io::Write as _;
+use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Component, Path, PathBuf};
-use std::time::Instant;
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use chrono::{SecondsFormat, Utc};
 use clap::ValueEnum;
@@ -143,6 +145,10 @@ pub enum RunnerError {
     EmptyRunId,
     #[error("run ID must be a safe single directory name: {0}")]
     UnsafeRunId(String),
+    #[error(
+        "invalid E2E --timeout value {value:?}: expected <number>ms, <number>s, <number>m, or <number>h"
+    )]
+    InvalidTimeout { value: String },
     #[error("unsafe cleanup root: {0}")]
     UnsafeCleanupRoot(String),
     #[error("E2E artifact path is outside the run sandbox")]
@@ -177,6 +183,26 @@ struct ResolvedScenario {
     scenario: Box<dyn scenario::Scenario>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RunDeadline {
+    timeout: Duration,
+    started: Instant,
+}
+
+impl RunDeadline {
+    fn new(timeout: Duration, started: Instant) -> Self {
+        Self { timeout, started }
+    }
+
+    fn elapsed(self) -> Duration {
+        self.started.elapsed()
+    }
+
+    fn remaining(self) -> Option<Duration> {
+        self.timeout.checked_sub(self.elapsed())
+    }
+}
+
 pub fn run(request: RunRequest) -> Result<RunOutcome, RunnerError> {
     let executor = SystemCommandExecutor;
     run_with_executor(request, &executor)
@@ -196,6 +222,12 @@ fn run_with_executor_and_mount_lock_dir(
 ) -> Result<RunOutcome, RunnerError> {
     let started_instant = Instant::now();
     let started_at = timestamp();
+    let run_deadline = request
+        .timeout
+        .as_deref()
+        .map(parse_run_timeout)
+        .transpose()?
+        .map(|timeout| RunDeadline::new(timeout, started_instant));
     let root = absolutize(&request.root)?;
     let run_id = match request.run_id {
         Some(run_id) if run_id.trim().is_empty() => return Err(RunnerError::EmptyRunId),
@@ -415,8 +447,13 @@ fn run_with_executor_and_mount_lock_dir(
             },
         };
 
-        let lifecycle =
-            run_scenario_lifecycle(&events_path, &run_id, resolved.scenario.as_ref(), &context)?;
+        let lifecycle = run_scenario_lifecycle_with_timeout(
+            &events_path,
+            &run_id,
+            resolved,
+            context,
+            run_deadline,
+        )?;
         e2e_progress(&format!(
             "run {run_id} scenario {}/{} {}: {:?}",
             index + 1,
@@ -429,9 +466,21 @@ fn run_with_executor_and_mount_lock_dir(
         }
         scenario_reports.push(lifecycle.report);
         scenario_outcomes.push(lifecycle.outcome);
+        if scenario_outcomes
+            .last()
+            .is_some_and(|scenario| scenario.status == ScenarioStatus::TimedOut)
+        {
+            record_event(&events_path, &run_id, None, "run", "timed_out")?;
+            break;
+        }
     }
 
-    record_event(&events_path, &run_id, None, "run", "finished")?;
+    if !scenario_outcomes
+        .iter()
+        .any(|scenario| scenario.status == ScenarioStatus::TimedOut)
+    {
+        record_event(&events_path, &run_id, None, "run", "finished")?;
+    }
     let mut cleanup_actions = Vec::new();
     e2e_progress(&format!("run {run_id} cleanup: starting"));
     compose_cleanup_guard.collect_into(&mut cleanup_actions, &mut cleanup_errors);
@@ -450,8 +499,13 @@ fn run_with_executor_and_mount_lock_dir(
     let scenario_failed = scenario_outcomes
         .iter()
         .any(|scenario| scenario.status != ScenarioStatus::Passed);
+    let run_timed_out = scenario_outcomes
+        .iter()
+        .any(|scenario| scenario.status == ScenarioStatus::TimedOut);
     let cleanup_failed = cleanup.status == RunStatus::CleanupFailed;
-    let status = if scenario_failed {
+    let status = if run_timed_out {
+        RunStatus::TimedOut
+    } else if scenario_failed {
         RunStatus::Failed
     } else if cleanup_failed {
         RunStatus::CleanupFailed
@@ -1143,6 +1197,155 @@ fn build_manifest(input: ManifestInput<'_>) -> RunManifest {
         cleanup_allowlist,
         created_at: input.created_at.to_string(),
     }
+}
+
+fn run_scenario_lifecycle_with_timeout(
+    events_path: &Path,
+    run_id: &str,
+    resolved: ResolvedScenario,
+    context: ScenarioContext,
+    deadline: Option<RunDeadline>,
+) -> Result<ScenarioLifecycleOutcome, RunnerError> {
+    let Some(deadline) = deadline else {
+        return run_scenario_lifecycle(events_path, run_id, resolved.scenario.as_ref(), &context);
+    };
+    let definition = resolved.definition;
+    let seed = context.seed;
+    let started_at = timestamp();
+    let started_instant = Instant::now();
+    let remaining = deadline.remaining().unwrap_or_default();
+    let (tx, rx) = mpsc::channel();
+    let events_path = events_path.to_path_buf();
+    let run_id = run_id.to_string();
+    let worker_events_path = events_path.clone();
+    let worker_run_id = run_id.clone();
+
+    thread::spawn(move || {
+        let result = run_scenario_lifecycle(
+            &worker_events_path,
+            &worker_run_id,
+            resolved.scenario.as_ref(),
+            &context,
+        );
+        let _ = tx.send(result);
+    });
+
+    match rx.recv_timeout(remaining) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            let active_hook = active_scenario_hook(&events_path, definition.name)
+                .unwrap_or_else(|| "unknown".to_string());
+            let elapsed_ms = deadline.elapsed().as_millis();
+            let timeout_ms = deadline.timeout.as_millis();
+            let error = format!(
+                "whole-run timeout exceeded after {elapsed_ms}ms (limit {timeout_ms}ms); active scenario {}; active hook {active_hook}; cleanup attempted",
+                definition.name
+            );
+            e2e_progress(&format!(
+                "run {run_id} scenario {} timed out in hook {active_hook}",
+                definition.name
+            ));
+            let _ = record_event(
+                &events_path,
+                &run_id,
+                Some(definition.name),
+                &active_hook,
+                "timed_out",
+            );
+            let operation_artifact = scenario_artifact_path(definition.name, "operations.ndjson");
+            Ok(ScenarioLifecycleOutcome {
+                report: ScenarioReport {
+                    name: definition.name.to_string(),
+                    seed,
+                    status: ScenarioStatus::TimedOut,
+                    started_at,
+                    finished_at: timestamp(),
+                    duration_ms: duration_millis(started_instant),
+                    artifacts: vec![operation_artifact.clone()],
+                    error: Some(error),
+                },
+                outcome: ScenarioOutcome {
+                    name: definition.name.to_string(),
+                    status: ScenarioStatus::TimedOut,
+                    artifacts: vec![operation_artifact],
+                },
+                cleanup_error: None,
+            })
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(RunnerError::Io(std::io::Error::other(
+            "scenario watchdog worker exited without a result",
+        ))),
+    }
+}
+
+fn parse_run_timeout(value: &str) -> Result<Duration, RunnerError> {
+    let trimmed = value.trim();
+    let (digits, unit) = trimmed
+        .find(|ch: char| !ch.is_ascii_digit())
+        .map(|index| trimmed.split_at(index))
+        .unwrap_or((trimmed, "s"));
+    if digits.is_empty() || unit.is_empty() || !digits.chars().all(|ch| ch.is_ascii_digit()) {
+        return Err(RunnerError::InvalidTimeout {
+            value: value.to_string(),
+        });
+    }
+    let amount = digits
+        .parse::<u64>()
+        .map_err(|_| RunnerError::InvalidTimeout {
+            value: value.to_string(),
+        })?;
+    if amount == 0 {
+        return Err(RunnerError::InvalidTimeout {
+            value: value.to_string(),
+        });
+    }
+    match unit {
+        "ms" => Ok(Duration::from_millis(amount)),
+        "s" => Ok(Duration::from_secs(amount)),
+        "m" => amount
+            .checked_mul(60)
+            .map(Duration::from_secs)
+            .ok_or_else(|| RunnerError::InvalidTimeout {
+                value: value.to_string(),
+            }),
+        "h" => amount
+            .checked_mul(60 * 60)
+            .map(Duration::from_secs)
+            .ok_or_else(|| RunnerError::InvalidTimeout {
+                value: value.to_string(),
+            }),
+        _ => Err(RunnerError::InvalidTimeout {
+            value: value.to_string(),
+        }),
+    }
+}
+
+fn active_scenario_hook(events_path: &Path, scenario: &str) -> Option<String> {
+    let file = fs::File::open(events_path).ok()?;
+    let reader = BufReader::new(file);
+    let mut active = BTreeSet::new();
+    for line in reader
+        .lines()
+        .map_while(Result::ok)
+        .filter(|line| !line.trim().is_empty())
+    {
+        let Ok(event) = serde_json::from_str::<EventRecord>(&line) else {
+            continue;
+        };
+        if event.scenario.as_deref() != Some(scenario) {
+            continue;
+        }
+        match event.phase.as_str() {
+            "started" => {
+                active.insert(event.hook);
+            }
+            "finished" | "failed" | "timed_out" => {
+                active.remove(&event.hook);
+            }
+            _ => {}
+        }
+    }
+    active.into_iter().next_back()
 }
 
 fn run_scenario_lifecycle(
@@ -1852,6 +2055,68 @@ mod tests {
     }
 
     #[test]
+    fn run_timeout_marks_active_scenario_timed_out_and_writes_artifacts() {
+        let temp = tempfile::tempdir().unwrap();
+        let outcome = run(RunRequest {
+            root: temp.path().join("e2e-runs"),
+            run_id: Some("timed-out-run".to_string()),
+            scenarios: vec![scenario::TEST_HANGING_RUN.to_string()],
+            seed: 370,
+            studiofs_bin: None,
+            platform: PlatformSelection::Auto,
+            retention: RetentionPolicy::Always,
+            report: None,
+            port_range: None,
+            timeout: Some("150ms".to_string()),
+            infra: InfraMode::Disabled,
+        })
+        .unwrap();
+
+        assert_eq!(outcome.status, RunStatus::TimedOut);
+        assert_eq!(outcome.exit_code, 1);
+        assert_eq!(outcome.scenarios[0].status, ScenarioStatus::TimedOut);
+        assert!(outcome.sandbox.join("events.ndjson").exists());
+        assert!(outcome.sandbox.join("cleanup.json").exists());
+        assert!(outcome.report_path.exists());
+
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(outcome.report_path).unwrap()).unwrap();
+        assert_eq!(report["status"], "timed_out");
+        assert_eq!(report["scenarios"][0]["status"], "timed_out");
+        let error = report["scenarios"][0]["error"].as_str().unwrap();
+        assert!(error.contains("whole-run timeout exceeded"));
+        assert!(error.contains("active scenario __test-hanging-run"));
+        assert!(error.contains("active hook "));
+    }
+
+    #[test]
+    fn parse_run_timeout_supports_documented_units() {
+        assert_eq!(
+            parse_run_timeout("500ms").unwrap(),
+            Duration::from_millis(500)
+        );
+        assert_eq!(parse_run_timeout("30s").unwrap(), Duration::from_secs(30));
+        assert_eq!(parse_run_timeout("10m").unwrap(), Duration::from_secs(600));
+        assert_eq!(parse_run_timeout("1h").unwrap(), Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn parse_run_timeout_rejects_unknown_or_zero_values() {
+        assert!(matches!(
+            parse_run_timeout("0s"),
+            Err(RunnerError::InvalidTimeout { .. })
+        ));
+        assert!(matches!(
+            parse_run_timeout("1d"),
+            Err(RunnerError::InvalidTimeout { .. })
+        ));
+        assert!(matches!(
+            parse_run_timeout("soon"),
+            Err(RunnerError::InvalidTimeout { .. })
+        ));
+    }
+
+    #[test]
     fn run_preserves_primary_scenario_error_when_cleanup_also_fails() {
         let temp = tempfile::tempdir().unwrap();
         let outcome = run(RunRequest {
@@ -1990,6 +2255,8 @@ mod tests {
             .unwrap();
         assert!(up_index < logs_index);
         assert!(logs_index < down_index);
+        assert_eq!(calls[logs_index].timeout, Some(Duration::from_secs(120)));
+        assert_eq!(calls[down_index].timeout, Some(Duration::from_secs(120)));
     }
 
     #[test]

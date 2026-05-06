@@ -72,7 +72,7 @@ pub struct RunArgs {
     #[arg(long)]
     pub port_range: Option<String>,
 
-    /// Optional whole-run timeout string reserved for future hook enforcement.
+    /// Optional whole-run timeout, for example 500ms, 30s, 10m, or 1h.
     #[arg(long)]
     pub timeout: Option<String>,
 
