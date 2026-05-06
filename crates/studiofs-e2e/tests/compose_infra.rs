@@ -130,7 +130,7 @@ fn compose_stack_lifecycle_collects_logs_and_tears_down_volumes() {
         std::fs::read_to_string(log_path).unwrap(),
         "postgres ready\nrustfs ready\n"
     );
-    assert_eq!(post_start_checks.len(), 2);
+    assert_eq!(post_start_checks.len(), 1);
     assert!(
         post_start_checks
             .iter()
@@ -253,6 +253,26 @@ fn optional_diagnostics_preserve_stdout_when_command_fails() {
 }
 
 #[test]
+fn post_start_preflight_retries_transient_host_rustfs_health_timeout() {
+    let temp = tempdir().unwrap();
+    let stack = DockerComposeStack::new(ComposeConfig {
+        run_id: "compose-transient-host-health".to_string(),
+        sandbox: temp.path().join("compose-transient-host-health"),
+        compose_file: repo_root().join("docker/compose.e2e.yml"),
+        port_range: Some("32300-32310".to_string()),
+        wait_timeout_secs: 120,
+    })
+    .unwrap();
+    let executor = TransientRustfsHealthExecutor::default();
+
+    let checks = stack.post_start_preflight(&executor);
+
+    assert_eq!(checks.len(), 1);
+    assert!(checks.iter().all(|check| check.passed));
+    assert_eq!(*executor.rustfs_health_attempts.borrow(), 2);
+}
+
+#[test]
 fn compose_stack_rejects_port_ranges_smaller_than_required_service_ports() {
     let temp = tempdir().unwrap();
     let err = DockerComposeStack::new(ComposeConfig {
@@ -289,6 +309,34 @@ fn compose_stack_accepts_whitespace_around_port_range_bounds() {
 
     assert_eq!(stack.ports()[0].host_port, 32100);
     assert_eq!(stack.ports()[3].host_port, 32103);
+}
+
+#[test]
+fn compose_stack_can_advance_to_highest_port_block_inside_range() {
+    let temp = tempdir().unwrap();
+    let mut stack = DockerComposeStack::new(ComposeConfig {
+        run_id: "compose-next-port-block".to_string(),
+        sandbox: temp.path().join("compose-next-port-block"),
+        compose_file: repo_root().join("docker/compose.e2e.yml"),
+        port_range: Some("32400-32410".to_string()),
+        wait_timeout_secs: 120,
+    })
+    .unwrap();
+
+    assert!(stack.advance_port_block().unwrap());
+    assert_eq!(
+        stack
+            .ports()
+            .iter()
+            .map(|port| (port.service.as_str(), port.host_port))
+            .collect::<Vec<_>>(),
+        vec![
+            ("postgres", 32407),
+            ("rustfs", 32408),
+            ("rustfs-console", 32409),
+            ("toxiproxy-api", 32410),
+        ]
+    );
 }
 
 #[derive(Default)]
@@ -331,6 +379,38 @@ impl CommandExecutor for FailingDiagnosticsExecutor {
         Ok(CommandOutput {
             status: 0,
             stdout: "/data/studiofs-e2e/object\n".to_string(),
+            stderr: String::new(),
+        })
+    }
+}
+
+#[derive(Default)]
+struct TransientRustfsHealthExecutor {
+    rustfs_health_attempts: RefCell<usize>,
+}
+
+impl CommandExecutor for TransientRustfsHealthExecutor {
+    fn run(&self, command: &studiofs_e2e::infra::CommandSpec) -> std::io::Result<CommandOutput> {
+        if command.program == "curl"
+            && command
+                .args
+                .iter()
+                .any(|arg| arg == "http://127.0.0.1:32301/health")
+        {
+            let mut attempts = self.rustfs_health_attempts.borrow_mut();
+            *attempts += 1;
+            if *attempts == 1 {
+                return Ok(CommandOutput {
+                    status: 28,
+                    stdout: String::new(),
+                    stderr: "curl: (28) Operation timed out after 2000 milliseconds with 0 bytes received\n"
+                        .to_string(),
+                });
+            }
+        }
+        Ok(CommandOutput {
+            status: 0,
+            stdout: String::new(),
             stderr: String::new(),
         })
     }

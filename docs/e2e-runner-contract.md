@@ -567,8 +567,11 @@ Required checks:
   Toxiproxy placeholder using version-pinned service images for reproducible
   runs. Published ports bind to `127.0.0.1` only. The runner invokes
   `docker compose up --detach --wait` with a project-scoped name, verifies the
-  host-mapped RustFS health endpoints, and records the copied compose file plus
-  logs under `artifacts/docker/`.
+  host-mapped RustFS S3 health endpoint with bounded retries, and records the
+  copied compose file plus logs under `artifacts/docker/`. If Docker reports the
+  stack healthy but the host-mapped S3 endpoint remains unreachable and the
+  caller supplied spare ports in `--port-range`, the runner may recreate the
+  stack on a higher port block within that range before scenarios start.
 - Mount support:
   - Linux requires a usable `/dev/fuse`, mount point creation rights, and the
     FUSE backend expected by `studiofs-fuse`.

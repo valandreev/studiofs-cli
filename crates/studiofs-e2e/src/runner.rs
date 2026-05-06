@@ -225,7 +225,7 @@ fn run_with_executor_and_mount_lock_dir(
     let sandbox = root.join(&run_id);
     let selected_platform = request.platform.resolved().to_string();
     let infra_mode = request.infra;
-    let compose_stack = match infra_mode {
+    let mut compose_stack = match infra_mode {
         InfraMode::Disabled => None,
         InfraMode::Compose => Some(DockerComposeStack::new(ComposeConfig::for_run(
             &run_id,
@@ -249,7 +249,7 @@ fn run_with_executor_and_mount_lock_dir(
     let compose_project = compose_stack
         .as_ref()
         .map(|stack| stack.project_name().to_string());
-    let allocated_ports = compose_stack
+    let mut allocated_ports = compose_stack
         .as_ref()
         .map(|stack| stack.ports().to_vec())
         .unwrap_or_default();
@@ -296,12 +296,32 @@ fn run_with_executor_and_mount_lock_dir(
         prepare_preflight(
             &sandbox,
             infra_mode,
-            compose_stack.as_ref(),
+            compose_stack.as_mut(),
             executor,
             default_mount_lock.as_ref(),
         )?
     };
     let preflight = prepared_preflight.report;
+    allocated_ports = compose_stack
+        .as_ref()
+        .map(|stack| stack.ports().to_vec())
+        .unwrap_or_default();
+    let manifest = build_manifest(ManifestInput {
+        run_id: &run_id,
+        seed: request.seed,
+        sandbox: &sandbox,
+        scenarios: &scenario_names,
+        retention: request.retention,
+        selected_platform: &selected_platform,
+        infra: infra_mode,
+        compose_project: compose_project.as_deref(),
+        allocated_ports: allocated_ports.clone(),
+        studiofs_bin: request.studiofs_bin.as_deref(),
+        port_range: request.port_range.as_deref(),
+        timeout: request.timeout.as_deref(),
+        created_at: &started_at,
+    });
+    write_pretty_json(&sandbox.join("run.json"), &manifest)?;
     let mut compose_cleanup_guard = ComposeCleanupGuard::new(
         if prepared_preflight.compose_start_attempted {
             compose_stack.as_ref()
@@ -362,6 +382,10 @@ fn run_with_executor_and_mount_lock_dir(
                 .join(definition.name),
             client_controller_config: match (infra_mode, request.studiofs_bin.as_ref()) {
                 (InfraMode::Compose, Some(studiofs_bin)) => {
+                    let allocated_ports = compose_stack
+                        .as_ref()
+                        .map(|stack| stack.ports().to_vec())
+                        .unwrap_or_default();
                     Some(ClientControllerConfig::from_compose_services(
                         studiofs_bin.clone(),
                         sandbox.clone(),
@@ -542,7 +566,7 @@ struct PreparedPreflight {
 fn prepare_preflight(
     sandbox: &Path,
     infra: InfraMode,
-    compose_stack: Option<&DockerComposeStack>,
+    compose_stack: Option<&mut DockerComposeStack>,
     executor: &dyn CommandExecutor,
     default_mount_lock: Option<&DefaultMountLock>,
 ) -> Result<PreparedPreflight, RunnerError> {
@@ -617,12 +641,59 @@ fn prepare_preflight(
             });
         }
     }
-    checks.extend(
-        stack
-            .post_start_preflight(executor)
-            .into_iter()
-            .map(preflight_check_report),
-    );
+    let post_start_checks = stack.post_start_preflight(executor);
+    if post_start_checks.iter().all(|check| check.passed) {
+        checks.extend(post_start_checks.into_iter().map(preflight_check_report));
+    } else {
+        let failed_details = post_start_checks
+            .iter()
+            .filter(|check| !check.passed)
+            .map(|check| format!("{}: {}", check.name, check.detail))
+            .collect::<Vec<_>>()
+            .join("; ");
+        match stack.teardown(executor).and_then(|()| {
+            let advanced_ports = stack.advance_port_block()?;
+            stack.prepare_artifacts()?;
+            stack.start(executor)?;
+            Ok(advanced_ports)
+        }) {
+            Ok(advanced_ports) => checks.push(PreflightCheckReport {
+                name: "docker compose recreate after failed host health".to_string(),
+                status: RunStatus::Passed,
+                detail: if advanced_ports {
+                    format!(
+                        "recreated stack on higher port block after host readiness failure: {failed_details}"
+                    )
+                } else {
+                    format!(
+                        "recreated stack after host readiness failure: {failed_details}"
+                    )
+                },
+            }),
+            Err(err) => {
+                checks.push(PreflightCheckReport {
+                    name: "docker compose recreate after failed host health".to_string(),
+                    status: RunStatus::PreflightFailed,
+                    detail: format!(
+                        "failed to recreate stack after host readiness failure ({failed_details}): {err}"
+                    ),
+                });
+                return Ok(PreparedPreflight {
+                    report: PreflightReport {
+                        status: RunStatus::PreflightFailed,
+                        checks,
+                    },
+                    compose_start_attempted: true,
+                });
+            }
+        }
+        checks.extend(
+            stack
+                .post_start_preflight(executor)
+                .into_iter()
+                .map(preflight_check_report),
+        );
+    }
     if checks.iter().any(|check| check.status != RunStatus::Passed) {
         return Ok(PreparedPreflight {
             report: PreflightReport {

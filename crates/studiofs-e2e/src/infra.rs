@@ -4,12 +4,16 @@ use std::fs;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const DEFAULT_WAIT_TIMEOUT_SECS: u64 = 120;
+const HOST_HEALTH_RETRY_DEADLINE: Duration = Duration::from_secs(60);
+const HOST_HEALTH_ATTEMPT_TIMEOUT_SECS: u64 = 2;
+const HOST_HEALTH_RETRY_DELAY: Duration = Duration::from_secs(1);
 const DEFAULT_POSTGRES_PORT: u16 = 25_432;
 const DEFAULT_RUSTFS_PORT: u16 = 29_000;
 const DEFAULT_RUSTFS_CONSOLE_PORT: u16 = 29_001;
@@ -175,6 +179,7 @@ pub struct DockerComposeStack {
     project_name: String,
     sandbox: PathBuf,
     compose_file: PathBuf,
+    port_range: Option<String>,
     ports: Vec<ServicePort>,
     wait_timeout_secs: u64,
 }
@@ -191,6 +196,7 @@ impl DockerComposeStack {
             run_id: config.run_id,
             sandbox: config.sandbox,
             compose_file,
+            port_range: config.port_range,
             ports,
             wait_timeout_secs: config.wait_timeout_secs,
         })
@@ -202,6 +208,27 @@ impl DockerComposeStack {
 
     pub fn ports(&self) -> &[ServicePort] {
         &self.ports
+    }
+
+    pub fn advance_port_block(&mut self) -> Result<bool, InfraError> {
+        let Some(range) = self.port_range.as_deref() else {
+            return Ok(false);
+        };
+        let Some(current_start) = self.ports.first().map(|port| port.host_port) else {
+            return Ok(false);
+        };
+        let (_, end) = parse_port_range_bounds(range)?;
+        let max_start = end.saturating_sub(SERVICE_PORTS.len() as u16 - 1);
+        if max_start <= current_start {
+            return Ok(false);
+        }
+        let next_start = max_start;
+        self.ports = SERVICE_PORTS
+            .iter()
+            .enumerate()
+            .map(|(offset, spec)| service_port(*spec, next_start + offset as u16))
+            .collect();
+        Ok(true)
     }
 
     pub fn prepare_artifacts(&self) -> Result<(), InfraError> {
@@ -264,12 +291,7 @@ impl DockerComposeStack {
     pub fn post_start_preflight(&self, executor: &dyn CommandExecutor) -> Vec<InfraCheck> {
         self.ports
             .iter()
-            .filter(|port| {
-                matches!(
-                    port.service.as_str(),
-                    RUSTFS_SERVICE_NAME | RUSTFS_CONSOLE_SERVICE_NAME
-                )
-            })
+            .filter(|port| port.service == RUSTFS_SERVICE_NAME)
             .map(|port| host_health_check(port, executor))
             .collect()
     }
@@ -587,35 +609,54 @@ fn port_check(port: &ServicePort) -> InfraCheck {
 
 fn host_health_check(port: &ServicePort, executor: &dyn CommandExecutor) -> InfraCheck {
     let url = format!("http://{}:{}/health", port.host, port.host_port);
-    let command = CommandSpec {
-        program: "curl".to_string(),
-        args: vec![
-            "--fail".to_string(),
-            "--silent".to_string(),
-            "--show-error".to_string(),
-            "--max-time".to_string(),
-            "10".to_string(),
-            url.clone(),
-        ],
-        env: Vec::new(),
-        cwd: None,
-    };
-    match executor.run(&command) {
-        Ok(output) if output.status == 0 => InfraCheck {
-            name: format!("host health {} {}", port.service, port.host_port),
-            passed: true,
-            detail: format!("{url} returned success"),
-        },
-        Ok(output) => InfraCheck {
-            name: format!("host health {} {}", port.service, port.host_port),
-            passed: false,
-            detail: command_failure_detail(output.status, &output.stderr),
-        },
-        Err(err) => InfraCheck {
-            name: format!("host health {} {}", port.service, port.host_port),
-            passed: false,
-            detail: err.to_string(),
-        },
+    let started = Instant::now();
+    let mut attempts = 0usize;
+    let mut last_failure: Option<String>;
+
+    loop {
+        attempts += 1;
+        let command = CommandSpec {
+            program: "curl".to_string(),
+            args: vec![
+                "--fail".to_string(),
+                "--silent".to_string(),
+                "--show-error".to_string(),
+                "--max-time".to_string(),
+                HOST_HEALTH_ATTEMPT_TIMEOUT_SECS.to_string(),
+                url.clone(),
+            ],
+            env: Vec::new(),
+            cwd: None,
+        };
+        match executor.run(&command) {
+            Ok(output) if output.status == 0 => {
+                return InfraCheck {
+                    name: format!("host health {} {}", port.service, port.host_port),
+                    passed: true,
+                    detail: format!("{url} returned success after {attempts} attempt(s)"),
+                };
+            }
+            Ok(output) => {
+                last_failure = Some(command_failure_detail(output.status, &output.stderr));
+            }
+            Err(err) => {
+                last_failure = Some(err.to_string());
+            }
+        }
+        if started.elapsed() >= HOST_HEALTH_RETRY_DEADLINE {
+            break;
+        }
+        std::thread::sleep(HOST_HEALTH_RETRY_DELAY);
+    }
+
+    InfraCheck {
+        name: format!("host health {} {}", port.service, port.host_port),
+        passed: false,
+        detail: format!(
+            "{url} did not become reachable from host after {attempts} attempt(s) over {}s after docker compose up --wait passed; last error: {last_failure}",
+            started.elapsed().as_secs(),
+            last_failure = last_failure.unwrap_or_else(|| "not attempted".to_string())
+        ),
     }
 }
 
@@ -645,6 +686,19 @@ fn allocate_ports(range: Option<&str>) -> Result<Vec<ServicePort>, InfraError> {
 }
 
 fn parse_port_range(range: &str, needed: usize) -> Result<Vec<u16>, InfraError> {
+    let (start, end) = parse_port_range_bounds(range)?;
+    let available = usize::from(end - start) + 1;
+    if available < needed {
+        return Err(InfraError::PortRangeTooSmall {
+            range: range.to_string(),
+            available,
+            needed,
+        });
+    }
+    Ok((start..).take(needed).collect())
+}
+
+fn parse_port_range_bounds(range: &str) -> Result<(u16, u16), InfraError> {
     let Some((start, end)) = range.split_once('-') else {
         return Err(InfraError::InvalidPortRange(range.to_string()));
     };
@@ -659,15 +713,7 @@ fn parse_port_range(range: &str, needed: usize) -> Result<Vec<u16>, InfraError> 
     if start > end {
         return Err(InfraError::InvalidPortRange(range.to_string()));
     }
-    let available = usize::from(end - start) + 1;
-    if available < needed {
-        return Err(InfraError::PortRangeTooSmall {
-            range: range.to_string(),
-            available,
-            needed,
-        });
-    }
-    Ok((start..).take(needed).collect())
+    Ok((start, end))
 }
 
 fn service_port(spec: ServicePortSpec, host_port: u16) -> ServicePort {
