@@ -1,4 +1,4 @@
-#![allow(missing_docs)]
+//! Crate documentation for lint completion.
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};

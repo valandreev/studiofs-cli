@@ -230,6 +230,7 @@ impl StudioVfs {
         }))
     }
 
+    /// Function $name.
     pub fn set_acl_rule(
         &self,
         ino: Ino,
@@ -243,6 +244,7 @@ impl StudioVfs {
         Ok(())
     }
 
+    /// Function $name.
     pub fn remove_acl_rule(&self, ino: Ino, principal: &str) -> VfsResult<()> {
         let meta = self.sync_meta();
         meta.remove_acl_rule(ino, principal)?;

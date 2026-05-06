@@ -1,5 +1,4 @@
 #![forbid(unsafe_code)]
-#![allow(missing_docs)]
 //! StudioFS Data Layer
 //!
 //! Handles reading/writing StudioFS payload objects to S3-compatible storage via OpenDAL.

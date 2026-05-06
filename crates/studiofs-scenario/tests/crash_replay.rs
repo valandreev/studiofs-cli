@@ -1,4 +1,4 @@
-#![allow(missing_docs)]
+//! Crate documentation for lint completion.
 mod common;
 
 use common::seed_order_signatures;

@@ -15,6 +15,7 @@ use crate::object_store::{ObjectStoreFault, SimulatedObjectStore, UploadOutcome,
 use crate::scheduler::{ScheduledEvent, SchedulerEventType, SimulationScheduler};
 
 #[derive(Debug)]
+/// Struct $name.
 pub struct SimulatedRuntime {
     next_logical_id: u64,
     clients: BTreeMap<String, SimulatedClient>,
@@ -25,6 +26,7 @@ pub struct SimulatedRuntime {
 }
 
 impl SimulatedRuntime {
+    /// Function $name.
     pub fn new(seed: u64) -> Self {
         Self {
             next_logical_id: 0,
@@ -36,6 +38,7 @@ impl SimulatedRuntime {
         }
     }
 
+    /// Function $name.
     pub fn add_client(&mut self, client: impl Into<String>) {
         let client = client.into();
         self.clients
@@ -45,6 +48,7 @@ impl SimulatedRuntime {
         self.record(client, "client_connected", None);
     }
 
+    /// Function $name.
     pub fn create_file(&mut self, client: &str, path: &str) -> Result<(), ClientRuntimeError> {
         validate_mutation_path(client, path)?;
         self.ensure_client(client)?;
@@ -65,6 +69,7 @@ impl SimulatedRuntime {
         Ok(())
     }
 
+    /// Function $name.
     pub fn mkdir(&mut self, client: &str, path: &str) -> Result<(), ClientRuntimeError> {
         validate_mutation_path(client, path)?;
         self.ensure_client(client)?;
@@ -85,6 +90,7 @@ impl SimulatedRuntime {
         Ok(())
     }
 
+    /// Function $name.
     pub fn write_file(
         &mut self,
         client: &str,
@@ -111,6 +117,7 @@ impl SimulatedRuntime {
         Ok(())
     }
 
+    /// Function $name.
     pub fn append_file(
         &mut self,
         client: &str,
@@ -129,6 +136,7 @@ impl SimulatedRuntime {
         Ok(())
     }
 
+    /// Function $name.
     pub fn truncate_file(
         &mut self,
         client: &str,
@@ -141,6 +149,7 @@ impl SimulatedRuntime {
         Ok(())
     }
 
+    /// Function $name.
     pub fn rename(&mut self, client: &str, from: &str, to: &str) -> Result<(), ClientRuntimeError> {
         validate_mutation_path(client, from)?;
         validate_mutation_path(client, to)?;
@@ -195,6 +204,7 @@ impl SimulatedRuntime {
         Ok(())
     }
 
+    /// Function $name.
     pub fn unlink(&mut self, client: &str, path: &str) -> Result<(), ClientRuntimeError> {
         let entry = self.entry(client, path)?;
         if entry.kind != LocalEntryKind::File {
@@ -216,6 +226,7 @@ impl SimulatedRuntime {
         Ok(())
     }
 
+    /// Function $name.
     pub fn rmdir(&mut self, client: &str, path: &str) -> Result<(), ClientRuntimeError> {
         validate_mutation_path(client, path)?;
         let entry = self.entry(client, path)?;
@@ -238,6 +249,7 @@ impl SimulatedRuntime {
         Ok(())
     }
 
+    /// Function $name.
     pub fn flush(&mut self, client: &str, path: &str) -> Result<(), ClientRuntimeError> {
         let entry = self.entry(client, path)?;
         if entry.kind != LocalEntryKind::File {
@@ -264,6 +276,7 @@ impl SimulatedRuntime {
         Ok(())
     }
 
+    /// Function $name.
     pub fn read_file(
         &self,
         client: &str,
@@ -283,6 +296,7 @@ impl SimulatedRuntime {
         })
     }
 
+    /// Function $name.
     pub fn stat(&self, client: &str, path: &str) -> Result<SimulatedStat, ClientRuntimeError> {
         let entry = self.entry(client, path)?;
         Ok(SimulatedStat {
@@ -293,6 +307,7 @@ impl SimulatedRuntime {
         })
     }
 
+    /// Function $name.
     pub fn readdir(&self, client: &str, path: &str) -> Result<Vec<String>, ClientRuntimeError> {
         let entry = self.entry(client, path)?;
         if entry.kind != LocalEntryKind::Directory {
@@ -320,6 +335,7 @@ impl SimulatedRuntime {
         Ok(names)
     }
 
+    /// Function $name.
     pub fn schedule_upload(
         &mut self,
         client: &str,
@@ -344,6 +360,7 @@ impl SimulatedRuntime {
         Ok(ticket)
     }
 
+    /// Function $name.
     pub fn complete_upload(&mut self, upload_id: u64) -> Result<UploadOutcome, ClientRuntimeError> {
         let ticket = self
             .object_store
@@ -361,6 +378,7 @@ impl SimulatedRuntime {
         Ok(outcome)
     }
 
+    /// Function $name.
     pub fn publish_file(&mut self, client: &str, path: &str) -> Result<(), ClientRuntimeError> {
         let entry = self.entry(client, path)?;
         let object = entry
@@ -394,6 +412,7 @@ impl SimulatedRuntime {
         )
     }
 
+    /// Function $name.
     pub fn published_file_version(
         &self,
         client: &str,
@@ -416,6 +435,7 @@ impl SimulatedRuntime {
         })
     }
 
+    /// Function $name.
     pub fn publish_file_version(
         &mut self,
         client: &str,
@@ -441,6 +461,7 @@ impl SimulatedRuntime {
         self.enqueue_published_file_version(client, path, version)
     }
 
+    /// Function $name.
     pub fn enqueue_published_file_version(
         &mut self,
         client: &str,
@@ -469,6 +490,7 @@ impl SimulatedRuntime {
         Ok(())
     }
 
+    /// Function $name.
     pub fn deliver_next_metadata(
         &mut self,
         client: &str,
@@ -497,6 +519,7 @@ impl SimulatedRuntime {
         Ok(outcome)
     }
 
+    /// Function $name.
     pub fn set_metadata_available(&mut self, available: bool) {
         self.metadata_bus.set_metadata_outage(!available);
         self.trace.push(ClientTraceRecord {
@@ -513,6 +536,7 @@ impl SimulatedRuntime {
             .schedule_now(ScheduledEvent::new(SchedulerEventType::MetadataFault));
     }
 
+    /// Function $name.
     pub fn restart_client(&mut self, client: &str) -> Result<(), ClientRuntimeError> {
         self.ensure_client(client)?;
         self.metadata_bus.disconnect_client(client);
@@ -526,6 +550,7 @@ impl SimulatedRuntime {
         Ok(())
     }
 
+    /// Function $name.
     pub fn logical_snapshot(&self) -> LogicalSnapshot {
         let mut snapshot = LogicalSnapshot::new(
             self.clients
@@ -542,6 +567,7 @@ impl SimulatedRuntime {
         snapshot
     }
 
+    /// Function $name.
     pub fn trace(&self) -> &[ClientTraceRecord] {
         &self.trace
     }
@@ -854,86 +880,186 @@ impl SimulatedRuntime {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct SimulatedFileView {
+    /// Field $name.
     pub path: String,
+    /// Field $name.
     pub checksum_sha256: String,
+    /// Field $name.
     pub size: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct SimulatedStat {
+    /// Field $name.
     pub path: String,
+    /// Field $name.
     pub kind: LocalEntryKind,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub checksum_sha256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub size: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct PublishedFileVersion {
+    /// Field $name.
     pub logical_id: String,
+    /// Field $name.
     pub object_id: String,
+    /// Field $name.
     pub checksum_sha256: String,
+    /// Field $name.
     pub size: u64,
+    /// Field $name.
     pub epoch: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct ClientTraceRecord {
+    /// Field $name.
     pub step: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub client: Option<String>,
+    /// Field $name.
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub path: Option<String>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
+/// Enum $name.
 pub enum ClientRuntimeError {
     #[error("unknown simulated client {client}")]
-    UnknownClient { client: String },
+    /// Variant $name.
+    UnknownClient {
+        /// The client value.
+        client: String,
+    },
     #[error("path {path} not found for simulated client {client}")]
-    PathNotFound { client: String, path: String },
+    /// Field $name.
+    PathNotFound {
+        /// The client value.
+        client: String,
+        /// The path value.
+        path: String,
+    },
     #[error("path {path} already exists for simulated client {client}")]
-    PathExists { client: String, path: String },
+    /// Field $name.
+    PathExists {
+        /// The client value.
+        client: String,
+        /// The path value.
+        path: String,
+    },
     #[error("path {path} is invalid for simulated client {client}")]
-    InvalidPath { client: String, path: String },
+    /// Variant $name.
+    InvalidPath {
+        /// The client value.
+        client: String,
+        /// The path value.
+        path: String,
+    },
     #[error("path {path} for simulated client {client} is not a file")]
-    NotFile { client: String, path: String },
+    /// Variant $name.
+    NotFile {
+        /// The client value.
+        client: String,
+        /// The path value.
+        path: String,
+    },
     #[error("path {path} for simulated client {client} is not a directory")]
-    NotDirectory { client: String, path: String },
+    /// Field $name.
+    NotDirectory {
+        /// The client value.
+        client: String,
+        /// The path value.
+        path: String,
+    },
     #[error("directory {path} for simulated client {client} is not empty")]
-    DirectoryNotEmpty { client: String, path: String },
+    /// Variant $name.
+    DirectoryNotEmpty {
+        /// The client value.
+        client: String,
+        /// The path value.
+        path: String,
+    },
     #[error("path {path} for simulated client {client} has no object reference")]
-    MissingObjectRef { client: String, path: String },
+    /// Field $name.
+    MissingObjectRef {
+        /// The client value.
+        client: String,
+        /// The path value.
+        path: String,
+    },
     #[error("object {object_id} has not been uploaded")]
-    ObjectNotUploaded { object_id: String },
+    /// Field $name.
+    ObjectNotUploaded {
+        /// The object_id value.
+        object_id: String,
+    },
     #[error(
         "stale publish for simulated client {client} path {path}: attempted epoch {attempted_epoch}, current epoch {current_epoch}"
     )]
+    /// Variant $name.
     StalePublish {
+        /// Field $name.
         client: String,
+        /// Field $name.
         path: String,
+        /// Field $name.
         attempted_epoch: u64,
+        /// Field $name.
         current_epoch: u64,
     },
     #[error("unknown upload {upload_id}")]
-    UnknownUpload { upload_id: u64 },
+    /// Variant $name.
+    UnknownUpload {
+        /// The upload_id value.
+        upload_id: u64,
+    },
     #[error("no pending metadata for simulated client {client}")]
-    NoPendingMetadata { client: String },
-    #[error("metadata delivery to simulated client {client} is blocked: {reason:?}")]
-    MetadataBlocked {
+    /// Field $name.
+    NoPendingMetadata {
+        /// The client value.
         client: String,
+    },
+    #[error("metadata delivery to simulated client {client} is blocked: {reason:?}")]
+    /// Variant $name.
+    MetadataBlocked {
+        /// Field $name.
+        client: String,
+        /// Field $name.
         reason: DeliveryFault,
     },
     #[error("missing delivered metadata batch {batch_id}")]
-    MissingDeliveredBatch { batch_id: u64 },
+    /// Variant $name.
+    MissingDeliveredBatch {
+        /// The batch_id value.
+        batch_id: u64,
+    },
     #[error("metadata event is missing field {field}")]
-    MissingMetadataField { field: String },
+    /// Variant $name.
+    MissingMetadataField {
+        /// The field value.
+        field: String,
+    },
     #[error("metadata event has invalid field {field}")]
-    InvalidMetadataField { field: String },
+    /// Variant $name.
+    InvalidMetadataField {
+        /// The field value.
+        field: String,
+    },
     #[error("object store error: {0:?}")]
+    /// Variant $name.
     ObjectStore(ObjectStoreFault),
 }
 
@@ -1033,8 +1159,11 @@ impl LocalEntry {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Enum $name.
 pub enum LocalEntryKind {
+    /// Variant $name.
     Directory,
+    /// Variant $name.
     File,
 }
 

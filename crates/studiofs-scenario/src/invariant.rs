@@ -4,21 +4,31 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+/// Constant $name.
 pub const LOGICAL_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct LogicalSnapshot {
+    /// Field $name.
     pub schema_version: u32,
+    /// Field $name.
     pub clients: Vec<ClientLogicalSnapshot>,
+    /// Field $name.
     pub expected_absent_paths: Vec<String>,
+    /// Field $name.
     pub durable_writes: Vec<DurableWriteExpectation>,
+    /// Field $name.
     pub objects: Vec<ObjectLifecycle>,
+    /// Field $name.
     pub allow_hard_links: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub replay_idempotent: Option<bool>,
 }
 
 impl LogicalSnapshot {
+    /// Function $name.
     pub fn new(clients: Vec<ClientLogicalSnapshot>) -> Self {
         Self {
             schema_version: LOGICAL_SNAPSHOT_SCHEMA_VERSION,
@@ -33,28 +43,40 @@ impl LogicalSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct ClientLogicalSnapshot {
+    /// Field $name.
     pub client: String,
+    /// Field $name.
     pub entries: Vec<LogicalEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct LogicalEntry {
+    /// Field $name.
     pub path: String,
+    /// Field $name.
     pub kind: LogicalEntryKind,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub logical_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub object: Option<ObjectRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub checksum_sha256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub size: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub symlink_target: Option<String>,
 }
 
 impl LogicalEntry {
+    /// Function $name.
     pub fn directory(path: impl Into<String>, logical_id: impl Into<String>) -> Self {
         Self {
             path: path.into(),
@@ -67,6 +89,7 @@ impl LogicalEntry {
         }
     }
 
+    /// Function $name.
     pub fn file(
         path: impl Into<String>,
         logical_id: impl Into<String>,
@@ -98,20 +121,29 @@ impl LogicalEntry {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Enum $name.
 pub enum LogicalEntryKind {
+    /// Variant $name.
     Directory,
+    /// Variant $name.
     File,
+    /// Variant $name.
     Symlink,
+    /// Variant $name.
     Other,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct ObjectRef {
+    /// Field $name.
     pub object_id: String,
+    /// Field $name.
     pub location: ObjectLocation,
 }
 
 impl ObjectRef {
+    /// Function $name.
     pub fn local(object_id: impl Into<String>) -> Self {
         Self {
             object_id: object_id.into(),
@@ -119,6 +151,7 @@ impl ObjectRef {
         }
     }
 
+    /// Function $name.
     pub fn remote(object_id: impl Into<String>) -> Self {
         Self {
             object_id: object_id.into(),
@@ -129,48 +162,71 @@ impl ObjectRef {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Enum $name.
 pub enum ObjectLocation {
+    /// Variant $name.
     Local,
+    /// Variant $name.
     Remote,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct ObjectLifecycle {
+    /// Field $name.
     pub object_id: String,
+    /// Field $name.
     pub present_remote: bool,
+    /// Field $name.
     pub protected: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct DurableWriteExpectation {
+    /// Field $name.
     pub client: String,
+    /// Field $name.
     pub path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub checksum_sha256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub size: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct InvariantReport {
+    /// Field $name.
     pub passed: bool,
+    /// Field $name.
     pub violations: Vec<InvariantViolation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct InvariantViolation {
+    /// Field $name.
     pub invariant: String,
+    /// Field $name.
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub client: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub logical_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub object_id: Option<String>,
 }
 
+/// Function $name.
 pub fn validate_logical_invariants(snapshot: &LogicalSnapshot) -> InvariantReport {
     let mut violations = Vec::new();
     validate_convergence(snapshot, &mut violations);

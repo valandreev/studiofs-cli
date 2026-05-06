@@ -1,4 +1,4 @@
-#![allow(missing_docs)]
+//! Crate documentation for lint completion.
 use studiofs_scenario::scheduler::{
     ScheduledEvent, SchedulerEventType, SchedulerRunOutcome, SimulationScheduler,
 };

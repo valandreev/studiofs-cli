@@ -15,12 +15,15 @@ use crate::scenario;
 #[command(name = "studiofs-e2e")]
 #[command(version)]
 #[command(about = "Run StudioFS real mounted E2E scenarios")]
+/// Struct $name.
 pub struct Cli {
     #[command(subcommand)]
+    /// Field $name.
     pub command: Commands,
 }
 
 #[derive(Subcommand, Debug)]
+/// Enum $name.
 pub enum Commands {
     /// List available E2E scenarios.
     List,
@@ -37,6 +40,7 @@ pub enum Commands {
 }
 
 #[derive(Args, Debug)]
+/// Struct $name.
 pub struct RunArgs {
     /// Scenario name, for example basic-multi-client-smoke.
     pub scenario: Option<String>,
@@ -87,6 +91,7 @@ pub struct RunArgs {
 }
 
 #[derive(Args, Debug)]
+/// Struct $name.
 pub struct CleanArgs {
     /// Parent directory containing per-run sandboxes.
     #[arg(long, default_value = "target/e2e-runs")]
@@ -94,6 +99,7 @@ pub struct CleanArgs {
 }
 
 #[derive(Args, Debug)]
+/// Struct $name.
 pub struct MountedChaosOpArgs {
     /// Serialized mounted chaos task JSON.
     #[arg(long)]
@@ -105,6 +111,7 @@ pub struct MountedChaosOpArgs {
 }
 
 #[derive(Args, Debug)]
+/// Struct $name.
 pub struct RunOneArgs {
     /// Scenario name to execute in this child process.
     pub scenario: String,
@@ -131,6 +138,7 @@ pub struct RunOneArgs {
 }
 
 impl RunArgs {
+    /// Function $name.
     pub fn scenario_names(&self) -> Vec<String> {
         let mut names = Vec::new();
         if let Some(scenario) = &self.scenario {
@@ -143,6 +151,7 @@ impl RunArgs {
         names
     }
 
+    /// Function $name.
     pub fn into_request(self) -> RunRequest {
         let scenarios = self.scenario_names();
         RunRequest {
@@ -161,6 +170,7 @@ impl RunArgs {
     }
 }
 
+/// Function $name.
 pub fn dispatch(cli: Cli) -> Result<i32> {
     match cli.command {
         Commands::List => {

@@ -1,4 +1,4 @@
-#![allow(missing_docs)]
+//! Crate documentation for lint completion.
 use studiofs_scenario::seed_corpus::{
     SIMULATION_COUNTEREXAMPLE_SCHEMA_VERSION, SimulationCorpusError, SimulationCorpusKind,
     SimulationCorpusOptions, SimulationScenarioGroup, corpus_plan, read_simulation_counterexample,

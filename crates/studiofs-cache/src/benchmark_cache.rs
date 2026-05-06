@@ -14,18 +14,23 @@ use std::time::{Duration, Instant};
 
 use crate::metrics::{CachePipelineMetrics, CachePipelineMetricsSnapshot};
 
+/// Type alias $name.
 pub type ObjectId = u64;
 
 /// Default in-memory benchmark cache size: 2 GiB.
 pub const DEFAULT_MEMORY_CACHE_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
+/// Struct $name.
 pub struct BenchmarkCacheConfig {
+    /// Field $name.
     pub memory_cache_size: u64,
+    /// Field $name.
     pub cache_dir: PathBuf,
 }
 
 impl BenchmarkCacheConfig {
+    /// Function $name.
     pub fn new(cache_dir: impl Into<PathBuf>, memory_cache_size: u64) -> Self {
         Self {
             memory_cache_size,
@@ -35,19 +40,27 @@ impl BenchmarkCacheConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Enum $name.
 pub enum CacheReadLevel {
+    /// Variant $name.
     L1,
+    /// Variant $name.
     Miss,
 }
 
 #[derive(Debug, Clone)]
+/// Struct $name.
 pub struct CacheReadTrace {
+    /// Field $name.
     pub level: CacheReadLevel,
+    /// Field $name.
     pub l1_lookup_latency: Duration,
 }
 
 #[derive(Debug, Clone, Default)]
+/// Struct $name.
 pub struct BenchmarkCacheStats {
+    /// Field $name.
     pub l1_bytes: u64,
 }
 
@@ -121,6 +134,7 @@ impl L1State {
     }
 }
 
+/// Struct $name.
 pub struct BenchmarkCache {
     config: BenchmarkCacheConfig,
     l1: Mutex<L1State>,
@@ -129,6 +143,7 @@ pub struct BenchmarkCache {
 }
 
 impl BenchmarkCache {
+    /// Function $name.
     pub fn open(config: BenchmarkCacheConfig) -> io::Result<Arc<Self>> {
         Ok(Arc::new(Self {
             l1: Mutex::new(L1State::default()),
@@ -138,10 +153,12 @@ impl BenchmarkCache {
         }))
     }
 
+    /// Function $name.
     pub async fn get(&self, object_id: ObjectId) -> Option<Bytes> {
         self.get_with_trace(object_id).await.0
     }
 
+    /// Function $name.
     pub async fn get_with_trace(&self, object_id: ObjectId) -> (Option<Bytes>, CacheReadTrace) {
         let started = Instant::now();
         let l1_hit = self.l1.lock().get_cloned(object_id);
@@ -164,46 +181,56 @@ impl BenchmarkCache {
         }
     }
 
+    /// Function $name.
     pub async fn put(&self, object_id: ObjectId, data: Bytes) -> io::Result<()> {
         self.stage_l1(object_id, data);
         Ok(())
     }
 
+    /// Function $name.
     pub async fn remove(&self, object_id: ObjectId) {
         self.remove_sync(object_id);
     }
 
+    /// Function $name.
     pub fn remove_sync(&self, object_id: ObjectId) {
         let _ = self.l1.lock().remove(object_id);
     }
 
+    /// Function $name.
     pub fn contains(&self, object_id: ObjectId) -> bool {
         self.l1.lock().contains(object_id)
     }
 
+    /// Function $name.
     pub fn stage_l1(&self, object_id: ObjectId, data: Bytes) {
         let max_bytes = self.l1_max_bytes.load(Ordering::Acquire).max(1);
         self.l1.lock().insert(object_id, data, max_bytes);
     }
 
+    /// Function $name.
     pub fn stats(&self) -> BenchmarkCacheStats {
         BenchmarkCacheStats {
             l1_bytes: self.l1_bytes(),
         }
     }
 
+    /// Function $name.
     pub fn l1_bytes(&self) -> u64 {
         self.l1.lock().total_bytes.get()
     }
 
+    /// Function $name.
     pub fn memory_cache_size(&self) -> u64 {
         self.l1_max_bytes.load(Ordering::Acquire)
     }
 
+    /// Function $name.
     pub fn cache_dir(&self) -> &Path {
         &self.config.cache_dir
     }
 
+    /// Function $name.
     pub fn cache_pipeline_metrics(&self) -> CachePipelineMetricsSnapshot {
         self.metrics.snapshot(0)
     }

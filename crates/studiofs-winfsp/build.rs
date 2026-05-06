@@ -1,4 +1,4 @@
-#![allow(missing_docs)]
+//! Crate documentation for lint completion.
 fn main() {
     // Required for winfsp delayed loading.
     #[cfg(windows)]

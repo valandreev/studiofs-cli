@@ -260,6 +260,7 @@ impl StudioVfs {
             .await
     }
 
+    /// Function $name.
     pub async fn write_with_local_sync_policy(
         &self,
         ino: Ino,
@@ -338,6 +339,7 @@ impl StudioVfs {
             .await
     }
 
+    /// Function $name.
     pub async fn flush(&self, ino: Ino) -> VfsResult<()> {
         self.flush_with_outcome(ino).await.map(|_| ())
     }

@@ -20,7 +20,9 @@ const DEFAULT_RUSTFS_PORT: u16 = 29_000;
 const DEFAULT_RUSTFS_CONSOLE_PORT: u16 = 29_001;
 const DEFAULT_TOXIPROXY_API_PORT: u16 = 28_474;
 
+/// Constant $name.
 pub const POSTGRES_SERVICE_NAME: &str = "postgres";
+/// Constant $name.
 pub const RUSTFS_SERVICE_NAME: &str = "rustfs";
 const RUSTFS_CONSOLE_SERVICE_NAME: &str = "rustfs-console";
 const TOXIPROXY_API_SERVICE_NAME: &str = "toxiproxy-api";
@@ -62,13 +64,18 @@ struct ServicePortSpec {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+/// Enum $name.
 pub enum InfraMode {
+    /// Variant $name.
     Disabled,
+    /// Variant $name.
     Compose,
+    /// Variant $name.
     ExternalEnv,
 }
 
 impl InfraMode {
+    /// Function $name.
     pub fn cli_value(self) -> &'static str {
         match self {
             Self::Disabled => "disabled",
@@ -79,15 +86,22 @@ impl InfraMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Struct $name.
 pub struct ComposeConfig {
+    /// Field $name.
     pub run_id: String,
+    /// Field $name.
     pub sandbox: PathBuf,
+    /// Field $name.
     pub compose_file: PathBuf,
+    /// Field $name.
     pub port_range: Option<String>,
+    /// Field $name.
     pub wait_timeout_secs: u64,
 }
 
 impl ComposeConfig {
+    /// Function $name.
     pub fn for_run(run_id: &str, sandbox: &Path, port_range: Option<String>) -> Self {
         Self {
             run_id: run_id.to_string(),
@@ -100,37 +114,58 @@ impl ComposeConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct ServicePort {
+    /// Field $name.
     pub service: String,
+    /// Field $name.
     pub host: String,
+    /// Field $name.
     pub host_port: u16,
+    /// Field $name.
     pub container_port: u16,
+    /// Field $name.
     pub env_var: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Struct $name.
 pub struct CommandSpec {
+    /// Field $name.
     pub program: String,
+    /// Field $name.
     pub args: Vec<String>,
+    /// Field $name.
     pub env: Vec<(String, String)>,
+    /// Field $name.
     pub cwd: Option<PathBuf>,
+    /// Field $name.
     pub timeout: Option<Duration>,
+    /// Field $name.
     pub stdout_path: Option<PathBuf>,
+    /// Field $name.
     pub stderr_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Struct $name.
 pub struct CommandOutput {
+    /// Field $name.
     pub status: i32,
+    /// Field $name.
     pub stdout: String,
+    /// Field $name.
     pub stderr: String,
 }
 
+/// Trait $name.
 pub trait CommandExecutor {
+    /// Function $name.
     fn run(&self, command: &CommandSpec) -> std::io::Result<CommandOutput>;
 }
 
 #[derive(Debug, Clone, Copy, Default)]
+/// Struct $name.
 pub struct SystemCommandExecutor;
 
 impl CommandExecutor for SystemCommandExecutor {
@@ -244,37 +279,55 @@ fn command_spec(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Struct $name.
 pub struct InfraCheck {
+    /// Field $name.
     pub name: String,
+    /// Field $name.
     pub passed: bool,
+    /// Field $name.
     pub detail: String,
 }
 
 #[derive(Debug, Error)]
+/// Enum $name.
 pub enum InfraError {
     #[error("compose file does not exist: {0}")]
+    /// Variant $name.
     MissingComposeFile(PathBuf),
     #[error("invalid port range: {0}")]
+    /// Variant $name.
     InvalidPortRange(String),
     #[error("port range {range} has {available} ports, but {needed} are required")]
+    /// Variant $name.
     PortRangeTooSmall {
+        /// Field $name.
         range: String,
+        /// Field $name.
         available: usize,
+        /// Field $name.
         needed: usize,
     },
     #[error("{action} failed with exit status {status}: {stderr}")]
+    /// Variant $name.
     CommandFailed {
+        /// Field $name.
         action: String,
+        /// Field $name.
         status: i32,
+        /// Field $name.
         stderr: String,
     },
     #[error("infra I/O failed: {0}")]
+    /// Variant $name.
     Io(#[from] std::io::Error),
     #[error("infra JSON failed: {0}")]
+    /// Variant $name.
     Json(#[from] serde_json::Error),
 }
 
 #[derive(Debug, Clone)]
+/// Struct $name.
 pub struct DockerComposeStack {
     run_id: String,
     project_name: String,
@@ -286,6 +339,7 @@ pub struct DockerComposeStack {
 }
 
 impl DockerComposeStack {
+    /// Function $name.
     pub fn new(config: ComposeConfig) -> Result<Self, InfraError> {
         if !config.compose_file.exists() {
             return Err(InfraError::MissingComposeFile(config.compose_file));
@@ -303,14 +357,17 @@ impl DockerComposeStack {
         })
     }
 
+    /// Function $name.
     pub fn project_name(&self) -> &str {
         &self.project_name
     }
 
+    /// Function $name.
     pub fn ports(&self) -> &[ServicePort] {
         &self.ports
     }
 
+    /// Function $name.
     pub fn advance_port_block(&mut self) -> Result<bool, InfraError> {
         let Some(range) = self.port_range.as_deref() else {
             return Ok(false);
@@ -332,6 +389,7 @@ impl DockerComposeStack {
         Ok(true)
     }
 
+    /// Function $name.
     pub fn prepare_artifacts(&self) -> Result<(), InfraError> {
         fs::create_dir_all(self.docker_artifact_dir())?;
         fs::copy(&self.compose_file, self.artifact_compose_file())?;
@@ -342,6 +400,7 @@ impl DockerComposeStack {
         Ok(())
     }
 
+    /// Function $name.
     pub fn preflight(&self, executor: &dyn CommandExecutor) -> Vec<InfraCheck> {
         let mut checks = Vec::new();
         checks.push(self.command_check(
@@ -374,6 +433,7 @@ impl DockerComposeStack {
         checks
     }
 
+    /// Function $name.
     pub fn up_command(&self) -> CommandSpec {
         let mut command = self.compose_command();
         command.args.extend([
@@ -386,11 +446,13 @@ impl DockerComposeStack {
         command
     }
 
+    /// Function $name.
     pub fn start(&self, executor: &dyn CommandExecutor) -> Result<(), InfraError> {
         run_success(executor, "docker compose up --wait", self.up_command())?;
         Ok(())
     }
 
+    /// Function $name.
     pub fn post_start_preflight(&self, executor: &dyn CommandExecutor) -> Vec<InfraCheck> {
         self.ports
             .iter()
@@ -399,6 +461,7 @@ impl DockerComposeStack {
             .collect()
     }
 
+    /// Function $name.
     pub fn stop(&self, executor: &dyn CommandExecutor) -> Result<(), InfraError> {
         let mut command = self.compose_command();
         command.args.push("stop".to_string());
@@ -406,6 +469,7 @@ impl DockerComposeStack {
         Ok(())
     }
 
+    /// Function $name.
     pub fn restart(&self, executor: &dyn CommandExecutor) -> Result<(), InfraError> {
         let mut command = self.compose_command();
         command.args.push("restart".to_string());
@@ -414,6 +478,7 @@ impl DockerComposeStack {
         Ok(())
     }
 
+    /// Function $name.
     pub fn stop_service(
         &self,
         service: &str,
@@ -422,6 +487,7 @@ impl DockerComposeStack {
         self.service_control().stop_service(service, executor)
     }
 
+    /// Function $name.
     pub fn start_service(
         &self,
         service: &str,
@@ -430,6 +496,7 @@ impl DockerComposeStack {
         self.service_control().start_service(service, executor)
     }
 
+    /// Function $name.
     pub fn collect_logs(&self, executor: &dyn CommandExecutor) -> Result<PathBuf, InfraError> {
         fs::create_dir_all(self.docker_artifact_dir())?;
         let mut command = self.compose_command();
@@ -449,6 +516,7 @@ impl DockerComposeStack {
         Ok(log_path)
     }
 
+    /// Function $name.
     pub fn collect_optional_diagnostics(
         &self,
         executor: &dyn CommandExecutor,
@@ -495,6 +563,7 @@ impl DockerComposeStack {
         Ok(collected)
     }
 
+    /// Function $name.
     pub fn teardown(&self, executor: &dyn CommandExecutor) -> Result<(), InfraError> {
         let mut command = self.compose_command();
         command.args.extend([
@@ -599,18 +668,24 @@ impl DockerComposeStack {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Struct $name.
 pub struct ComposeServiceControl {
+    /// Field $name.
     pub project_name: String,
+    /// Field $name.
     pub compose_file: PathBuf,
+    /// Field $name.
     pub wait_timeout_secs: u64,
     env: Vec<(String, String)>,
 }
 
 impl ComposeServiceControl {
+    /// Function $name.
     pub fn for_project(project_name: String) -> Result<Self, InfraError> {
         Self::for_project_with_environment(project_name, Vec::new())
     }
 
+    /// Function $name.
     pub fn for_project_with_environment(
         project_name: String,
         env: Vec<(String, String)>,
@@ -627,6 +702,7 @@ impl ComposeServiceControl {
         })
     }
 
+    /// Function $name.
     pub fn stop_service(
         &self,
         service: &str,
@@ -640,6 +716,7 @@ impl ComposeServiceControl {
         Ok(())
     }
 
+    /// Function $name.
     pub fn start_service(
         &self,
         service: &str,

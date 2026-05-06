@@ -1,4 +1,4 @@
-#![allow(missing_docs)]
+//! Crate documentation for lint completion.
 use studiofs_scenario::invariant::{
     ClientLogicalSnapshot, DurableWriteExpectation, LogicalEntry, LogicalEntryKind,
     LogicalSnapshot, ObjectLifecycle, ObjectRef, validate_logical_invariants,

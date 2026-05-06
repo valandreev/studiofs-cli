@@ -16,65 +16,86 @@ use crate::infra::{
 use crate::scenario::ScenarioError;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct MountedReplayReport {
+    /// Field $name.
     pub applied: Vec<MountedReplayAppliedRecord>,
+    /// Field $name.
     pub skipped: Vec<MountedReplaySkippedRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct MountedReplayAppliedRecord {
+    /// Field $name.
     pub sequence: u64,
+    /// Field $name.
     pub client: Option<String>,
+    /// Field $name.
     pub operation: String,
+    /// Field $name.
     pub path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct MountedReplaySkippedRecord {
+    /// Field $name.
     pub sequence: u64,
+    /// Field $name.
     pub operation: String,
+    /// Field $name.
     pub reason: String,
 }
 
+/// Trait $name.
 pub trait MountedReplayDriver {
+    /// Function $name.
     fn clients(&self) -> Vec<ClientSpec>;
 
+    /// Function $name.
     fn crash_client(&mut self, client: &str) -> Result<(), ScenarioError> {
         Err(ScenarioError::Io(std::io::Error::other(format!(
             "mounted replay driver does not support client crash for {client}"
         ))))
     }
 
+    /// Function $name.
     fn restart_client(&mut self, client: &str) -> Result<(), ScenarioError> {
         Err(ScenarioError::Io(std::io::Error::other(format!(
             "mounted replay driver does not support client restart for {client}"
         ))))
     }
 
+    /// Function $name.
     fn postgres_outage(&mut self) -> Result<(), ScenarioError> {
         Err(ScenarioError::Io(std::io::Error::other(
             "mounted replay driver does not support PostgreSQL outage",
         )))
     }
 
+    /// Function $name.
     fn postgres_recovery(&mut self) -> Result<(), ScenarioError> {
         Err(ScenarioError::Io(std::io::Error::other(
             "mounted replay driver does not support PostgreSQL recovery",
         )))
     }
 
+    /// Function $name.
     fn object_store_outage(&mut self) -> Result<(), ScenarioError> {
         Err(ScenarioError::Io(std::io::Error::other(
             "mounted replay driver does not support object-store outage",
         )))
     }
 
+    /// Function $name.
     fn object_store_recovery(&mut self) -> Result<(), ScenarioError> {
         Err(ScenarioError::Io(std::io::Error::other(
             "mounted replay driver does not support object-store recovery",
         )))
     }
 
+    /// Function $name.
     fn mounted_only(
         &mut self,
         name: &str,
@@ -87,13 +108,18 @@ pub trait MountedReplayDriver {
     }
 }
 
+/// Struct $name.
 pub struct MountedReplayControllerDriver<'a, E, C> {
+    /// Field $name.
     pub controller: &'a mut MultiClientController<E>,
+    /// Field $name.
     pub compose_control: Option<&'a mut ComposeServiceControl>,
+    /// Field $name.
     pub infra_executor: Option<&'a C>,
 }
 
 impl<'a, E, C> MountedReplayControllerDriver<'a, E, C> {
+    /// Function $name.
     pub fn new(
         controller: &'a mut MultiClientController<E>,
         compose_control: Option<&'a mut ComposeServiceControl>,
@@ -179,9 +205,11 @@ where
     }
 }
 
+/// Type alias $name.
 pub type SystemMountedReplayControllerDriver<'a, C> =
     MountedReplayControllerDriver<'a, SystemClientProcessExecutor, C>;
 
+/// Function $name.
 pub fn replay_operation_records(
     driver: &mut dyn MountedReplayDriver,
     records: &[ScenarioOperationRecord],

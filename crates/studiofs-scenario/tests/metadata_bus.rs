@@ -1,4 +1,4 @@
-#![allow(missing_docs)]
+//! Crate documentation for lint completion.
 use studiofs_scenario::metadata_bus::{
     DeliveryFault, DeliveryOutcome, MetadataBatch, MetadataBus, MetadataEvent, MetadataTraceKind,
 };

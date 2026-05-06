@@ -18,7 +18,9 @@ use tokio_util::sync::CancellationToken;
 
 use super::{VfsError, VfsResult};
 
+/// Trait $name.
 pub trait VfsCommitMeta: Send + Sync {
+    /// Function $name.
     fn flush_regular_file_overlay_slices_with_attr(
         &self,
         ino: Ino,
@@ -46,6 +48,7 @@ where
     }
 }
 
+/// Trait $name.
 pub trait VfsMeta:
     Send
     + Sync
@@ -85,15 +88,19 @@ impl<T> VfsMeta for T where
 {
 }
 
+/// Trait $name.
 pub trait ReadPathMeta: Send + Sync + MetaInodes + MetaPayloadObjects {}
 impl<T> ReadPathMeta for T where T: ?Sized + Send + Sync + MetaInodes + MetaPayloadObjects {}
 
+/// Trait $name.
 pub trait AclMeta: Send + Sync + MetaInodes + MetaAcl {}
 impl<T> AclMeta for T where T: ?Sized + Send + Sync + MetaInodes + MetaAcl {}
 
+/// Trait $name.
 pub trait UploadMeta: Send + Sync + MetaInodes + MetaPayloadObjects + MetaGc {}
 impl<T> UploadMeta for T where T: ?Sized + Send + Sync + MetaInodes + MetaPayloadObjects + MetaGc {}
 
+/// Trait $name.
 pub trait JanitorMeta:
     Send
     + Sync

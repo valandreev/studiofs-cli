@@ -16,38 +16,59 @@ use crate::scheduler::{
 };
 use crate::{ScenarioOperation, ScenarioOperationRecord};
 
+/// Constant $name.
 pub const CRASH_REPLAY_COUNTEREXAMPLE_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct CrashReplaySuiteConfig {
+    /// Field $name.
     pub scenario: String,
+    /// Field $name.
     pub seeds: Vec<u64>,
+    /// Field $name.
     pub families: Vec<CrashReplayFamily>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Enum $name.
 pub enum CrashReplayFamily {
+    /// Variant $name.
     CrashAfterDurabilityBeforeUploadCompletion,
+    /// Variant $name.
     CrashAfterUploadBeforeMetadataPublication,
+    /// Variant $name.
     CrashDuringPublishAttempt,
+    /// Variant $name.
     CrashDuringForeignApply,
+    /// Variant $name.
     RestartWithPendingLocalUploadState,
+    /// Variant $name.
     RepeatedRestartReplayLoops,
+    /// Variant $name.
     StalePendingUploadEventsRaceNewerEpochs,
+    /// Variant $name.
     MemoryOnlyDirtyCrash,
+    /// Variant $name.
     InjectedInvariantFailure,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct CrashReplaySuiteReport {
+    /// Field $name.
     pub scenario: String,
+    /// Field $name.
     pub passed: bool,
+    /// Field $name.
     pub family_reports: Vec<CrashReplayFamilyReport>,
+    /// Field $name.
     pub failures: Vec<CrashReplayFailure>,
 }
 
 impl CrashReplaySuiteReport {
+    /// Function $name.
     pub fn total_runs(&self) -> usize {
         self.family_reports
             .iter()
@@ -57,104 +78,168 @@ impl CrashReplaySuiteReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct CrashReplayFamilyReport {
+    /// Field $name.
     pub family: CrashReplayFamily,
+    /// Field $name.
     pub seed_reports: Vec<CrashReplaySeedReport>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct CrashReplaySeedReport {
+    /// Field $name.
     pub seed: u64,
+    /// Field $name.
     pub passed: bool,
+    /// Field $name.
     pub invariant_checkpoints: usize,
+    /// Field $name.
     pub replay_idempotent: bool,
+    /// Field $name.
     pub peer_converged: bool,
+    /// Field $name.
     pub trace: Vec<CrashReplayTraceRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct CrashReplayFailure {
+    /// Field $name.
     pub scenario: String,
+    /// Field $name.
     pub family: CrashReplayFamily,
+    /// Field $name.
     pub seed: u64,
+    /// Field $name.
     pub violated_invariant: String,
+    /// Field $name.
     pub message: String,
+    /// Field $name.
     pub trace: Vec<CrashReplayTraceRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub counterexample_artifact_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct CrashReplayTraceRecord {
+    /// Field $name.
     pub step: u64,
+    /// Field $name.
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub client: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub path: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    /// Field $name.
     pub metadata: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct CrashReplayCounterexampleArtifact {
+    /// Field $name.
     pub schema_version: u32,
+    /// Field $name.
     pub scenario: String,
+    /// Field $name.
     pub family: CrashReplayFamily,
+    /// Field $name.
     pub seed: u64,
+    /// Field $name.
     pub scheduler_trace: Vec<SchedulerTraceRecord>,
+    /// Field $name.
     pub operation_log: Vec<ScenarioOperationRecord>,
+    /// Field $name.
     pub client_trace: Vec<CrashReplayTraceRecord>,
+    /// Field $name.
     pub failure: CrashReplayFailureDetails,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub final_snapshot: Option<LogicalSnapshot>,
+    /// Field $name.
     pub replay_command: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct CrashReplayFailureDetails {
+    /// Field $name.
     pub violated_invariant: String,
+    /// Field $name.
     pub message: String,
+    /// Field $name.
     pub diagnostics: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct CrashReplayReplayReport {
+    /// Field $name.
     pub reproduced: bool,
+    /// Field $name.
     pub scenario: String,
+    /// Field $name.
     pub family: CrashReplayFamily,
+    /// Field $name.
     pub seed: u64,
+    /// Field $name.
     pub violated_invariant: String,
+    /// Field $name.
     pub message: String,
 }
 
 #[derive(Debug, Error)]
+/// Enum $name.
 pub enum CrashReplayArtifactError {
     #[error("counterexample artifact I/O failed: {0}")]
+    /// Variant $name.
     Io(#[from] std::io::Error),
     #[error("counterexample artifact JSON failed: {0}")]
+    /// Variant $name.
     Json(#[from] serde_json::Error),
     #[error("unsupported counterexample artifact schema version {0}")]
+    /// Variant $name.
     UnsupportedSchemaVersion(u32),
     #[error("counterexample artifact path is not valid UTF-8: {path:?}")]
-    InvalidArtifactPath { path: PathBuf },
+    /// Variant $name.
+    InvalidArtifactPath {
+        /// The path value.
+        path: PathBuf,
+    },
     #[error("counterexample artifact writes failed: {errors:?}")]
+    /// Variant $name.
     ArtifactWriteFailures {
+        /// Field $name.
         errors: Vec<CrashReplayArtifactWriteFailure>,
     },
     #[error("counterexample replay did not reproduce: {0}")]
+    /// Variant $name.
     ReplayMismatch(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Struct $name.
 pub struct CrashReplayArtifactWriteFailure {
+    /// Field $name.
     pub scenario: String,
+    /// Field $name.
     pub family: CrashReplayFamily,
+    /// Field $name.
     pub seed: u64,
+    /// Field $name.
     pub path: PathBuf,
+    /// Field $name.
     pub error: String,
 }
 
+/// Function $name.
 pub fn run_crash_replay_suite(config: CrashReplaySuiteConfig) -> CrashReplaySuiteReport {
     let mut family_reports = Vec::new();
     let mut failures = Vec::new();
@@ -182,6 +267,7 @@ pub fn run_crash_replay_suite(config: CrashReplaySuiteConfig) -> CrashReplaySuit
     }
 }
 
+/// Function $name.
 pub fn run_crash_replay_suite_with_artifacts(
     config: CrashReplaySuiteConfig,
     artifact_root: impl AsRef<Path>,
@@ -243,6 +329,7 @@ pub fn run_crash_replay_suite_with_artifacts(
     })
 }
 
+/// Function $name.
 pub fn write_crash_replay_counterexample(
     path: impl AsRef<Path>,
     artifact: &CrashReplayCounterexampleArtifact,
@@ -257,6 +344,7 @@ pub fn write_crash_replay_counterexample(
     Ok(())
 }
 
+/// Function $name.
 pub fn read_crash_replay_counterexample(
     path: impl AsRef<Path>,
 ) -> Result<CrashReplayCounterexampleArtifact, CrashReplayArtifactError> {
@@ -271,6 +359,7 @@ pub fn read_crash_replay_counterexample(
     Ok(artifact)
 }
 
+/// Function $name.
 pub fn replay_crash_replay_counterexample(
     path: impl AsRef<Path>,
 ) -> Result<CrashReplayReplayReport, CrashReplayArtifactError> {

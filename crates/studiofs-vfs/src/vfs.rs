@@ -168,6 +168,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+/// Constant $name.
 pub const VFS_RUNTIME_EVENT_CAPACITY: usize = 128;
 const ZEROIO_DIAGNOSTIC_DRILLDOWN_LIMIT: usize = 32;
 const ZEROIO_HEALTH_SIGNAL_LIMIT: usize = 16;
@@ -510,52 +511,71 @@ fn sustained_write_effective_buffer_bytes(
 // =============================================================================
 
 #[derive(Debug, Error)]
+/// Enum $name.
 pub enum VfsError {
     #[error("metadata error: {0}")]
+    /// Variant $name.
     Meta(#[from] studiofs_meta::MetaError),
 
     #[error("data error: {0}")]
+    /// Variant $name.
     Data(#[from] studiofs_data::store::DataError),
 
     #[error("I/O error: {0}")]
+    /// Variant $name.
     Io(#[from] std::io::Error),
 
     #[error("task join error: {0}")]
+    /// Variant $name.
     Join(#[from] tokio::task::JoinError),
 
     #[error("object error: {0}")]
+    /// Variant $name.
     Object(#[from] studiofs_data::object::ObjectError),
 
     #[error("block not found: inode {0}, block {1}")]
+    /// Variant $name.
     BlockNotFound(Ino, u32),
 
     #[error("lock conflict (EAGAIN)")]
+    /// Variant $name.
     WouldBlock,
 
     #[error("remote content is still uploading (EAGAIN)")]
+    /// Variant $name.
     RemoteContentPending,
 
     #[error("invalid filename: {0}")]
+    /// Variant $name.
     InvalidName(String),
 
     #[error("qos permit failure at {stage} for object {object_id} (0x{object_id:016x}): {message}")]
+    /// Variant $name.
     QosFailure {
+        /// Field $name.
         stage: Cow<'static, str>,
+        /// Field $name.
         object_id: u64,
+        /// Field $name.
         message: String,
     },
 
     #[error("fetch error: {0}")]
+    /// Variant $name.
     Fetch(#[from] crate::fetch::FetchError),
 
     #[error("cache backend detection failed for root '{cache_root}': {source}")]
+    /// Variant $name.
     LocalPayloadRuntimeDetection {
+        /// Field $name.
         cache_root: String,
         #[source]
+        /// Field $name.
         source: std::io::Error,
     },
 
     #[error("{0}")]
+    /// Variant $name.
     Other(String),
 }
 
@@ -566,6 +586,7 @@ enum WinfspBarrierType {
     Close,
 }
 
+/// Type alias $name.
 pub type VfsResult<T> = Result<T, VfsError>;
 
 // =============================================================================
@@ -611,6 +632,7 @@ fn is_probable_trash_component(name: &[u8]) -> bool {
     matches!(name, b".Trash" | b".Trashes") || name.starts_with(b".Trash-")
 }
 
+/// Function $name.
 pub fn is_hidden_non_macos_root_metadata_name(name: &[u8]) -> bool {
     name == b".Trashes"
 }
@@ -3629,6 +3651,7 @@ impl StudioVfs {
         }
     }
 
+    /// Function $name.
     pub fn cache_state_snapshot(&self) -> VfsCacheStateSnapshot {
         let dentry = self.dentry_cache_metrics();
         let path_shortcut = self.path_shortcut_cache_metrics();
@@ -3654,6 +3677,7 @@ impl StudioVfs {
         }
     }
 
+    /// Function $name.
     pub fn synchronization_state_snapshot(&self) -> VfsSynchronizationStateSnapshot {
         let metadata_backlog = self.sync_meta().replication_backlog();
         VfsSynchronizationStateSnapshot {
@@ -3884,6 +3908,7 @@ impl StudioVfs {
         }
     }
 
+    /// Function $name.
     pub fn zeroio_runtime_snapshot(&self) -> VfsZeroIoRuntimeSnapshot {
         let generated_unix_ms = now_unix_millis();
         let storage_stats = self.local_payload_backend.storage_stats();
@@ -4345,6 +4370,7 @@ impl StudioVfs {
         snapshot
     }
 
+    /// Function $name.
     pub fn recent_runtime_events(&self, limit: usize) -> Vec<VfsRuntimeEvent> {
         let events = self.state.metrics.runtime_events.lock();
         let keep = limit.min(events.len());
@@ -4355,6 +4381,7 @@ impl StudioVfs {
             .collect()
     }
 
+    /// Function $name.
     pub fn reset_diagnostics_observability(&self) {
         self.state.metrics.reset_diagnostics_observability();
         self.state.write_admission_governor.lock().reset_stats();
@@ -4366,6 +4393,7 @@ impl StudioVfs {
         self.cached_store.reset_diagnostics_metrics();
     }
 
+    /// Function $name.
     pub fn record_runtime_event(
         &self,
         subsystem: &str,
@@ -5339,6 +5367,7 @@ impl StudioVfs {
         self.collect_regular_file_object_ids_for_recovery(ino, size)
     }
 
+    /// Function $name.
     pub async fn inode_incarnation_state(&self, ino: Ino) -> VfsResult<InodeIncarnationState> {
         let attr = self.getattr_async(ino).await?;
         Ok(self.refresh_inode_incarnation_state_from_attr(ino, &attr))
@@ -5374,6 +5403,7 @@ impl StudioVfs {
         false
     }
 
+    /// Function $name.
     pub fn live_extent_records_for_inode(&self, ino: Ino) -> Vec<(u32, u64, u64)> {
         let mut out: Vec<_> = self
             .state
@@ -5390,6 +5420,7 @@ impl StudioVfs {
         out
     }
 
+    /// Function $name.
     pub fn pending_uploads_for_inode(&self, ino: Ino) -> Vec<(u64, u64, u64)> {
         let mut out: Vec<_> = self
             .pending_uploads_snapshot()
@@ -5401,6 +5432,7 @@ impl StudioVfs {
         out
     }
 
+    /// Function $name.
     pub fn read_cached_block(&self, object_id: u64) -> Option<Bytes> {
         let (cached, timing) = run_local_cache_io(|| self.local_payload_backend.get(object_id));
         self.record_local_cache_io_timing(timing);
@@ -5742,6 +5774,7 @@ impl StudioVfs {
         self.cached_store.remove_hot_upload_batch(object_ids);
     }
 
+    /// Function $name.
     pub fn upload_stats(&self) -> VfsUploadStats {
         let pending_uploads = self.pending_uploads_snapshot();
         let now_ms = now_unix_millis();
@@ -5813,10 +5846,12 @@ impl StudioVfs {
         }
     }
 
+    /// Function $name.
     pub fn file_session_stats(&self) -> VfsFileSessionStats {
         self.state.file_session.stats()
     }
 
+    /// Function $name.
     pub fn foreground_read_protection_stats(&self) -> VfsForegroundReadProtectionStats {
         let (p90_latency_ns, speedometer_samples, window_bytes, window_coverage_ms) = self
             .state
@@ -6794,6 +6829,7 @@ impl StudioVfs {
         *self.metadata_authority_override.lock() = status;
     }
 
+    /// Function $name.
     pub fn note_winfsp_write_callback(&self) {
         self.state
             .metrics
@@ -6801,6 +6837,7 @@ impl StudioVfs {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Function $name.
     pub fn record_winfsp_write_callback_observability(
         &self,
         write_bytes: usize,
@@ -6925,6 +6962,7 @@ impl StudioVfs {
         );
     }
 
+    /// Function $name.
     pub fn note_winfsp_overwrite_callback(&self) {
         self.state
             .metrics
@@ -6932,6 +6970,7 @@ impl StudioVfs {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Function $name.
     pub fn note_winfsp_cleanup_callback(&self) {
         self.state
             .metrics
@@ -6939,6 +6978,7 @@ impl StudioVfs {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Function $name.
     pub fn note_winfsp_flush_callback(&self) {
         self.state
             .metrics
@@ -6946,6 +6986,7 @@ impl StudioVfs {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Function $name.
     pub fn note_winfsp_close_callback(&self) {
         self.state
             .metrics
@@ -6953,6 +6994,7 @@ impl StudioVfs {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Function $name.
     pub fn note_winfsp_cleanup_flush_fh_callback(&self) {
         self.state
             .metrics
@@ -6984,14 +7026,17 @@ impl StudioVfs {
         }
     }
 
+    /// Function $name.
     pub fn note_winfsp_cleanup_barrier_outcome(&self, flushed: bool) {
         self.note_winfsp_barrier_outcome(WinfspBarrierType::Cleanup, flushed);
     }
 
+    /// Function $name.
     pub fn note_winfsp_flush_barrier_outcome(&self, flushed: bool) {
         self.note_winfsp_barrier_outcome(WinfspBarrierType::Flush, flushed);
     }
 
+    /// Function $name.
     pub fn note_winfsp_close_barrier_outcome(&self, flushed: bool) {
         self.note_winfsp_barrier_outcome(WinfspBarrierType::Close, flushed);
     }
@@ -7004,6 +7049,7 @@ impl StudioVfs {
             || self.state.writer_stack.has_dirty_writers(ino)
     }
 
+    /// Function $name.
     pub fn write_path_observability_snapshot(&self) -> VfsWritePathObservabilitySnapshot {
         let elapsed = self.write_path_started_at.elapsed();
         macro_rules! load_metric {

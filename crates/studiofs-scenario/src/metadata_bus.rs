@@ -5,12 +5,16 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct MetadataEvent {
+    /// Field $name.
     pub kind: String,
+    /// Field $name.
     pub fields: BTreeMap<String, String>,
 }
 
 impl MetadataEvent {
+    /// Function $name.
     pub fn new(kind: impl Into<String>) -> Self {
         Self {
             kind: kind.into(),
@@ -18,6 +22,7 @@ impl MetadataEvent {
         }
     }
 
+    /// Function $name.
     pub fn with_field(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.fields.insert(key.into(), value.into());
         self
@@ -25,14 +30,20 @@ impl MetadataEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct MetadataBatch {
+    /// Field $name.
     pub batch_id: u64,
+    /// Field $name.
     pub version: u64,
+    /// Field $name.
     pub source_client: String,
+    /// Field $name.
     pub events: Vec<MetadataEvent>,
 }
 
 impl MetadataBatch {
+    /// Function $name.
     pub fn new(source_client: impl Into<String>, events: Vec<MetadataEvent>) -> Self {
         Self {
             batch_id: 0,
@@ -44,61 +55,95 @@ impl MetadataBatch {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Enum $name.
 pub enum DeliveryOutcome {
+    /// Variant $name.
     Applied {
+        /// Field $name.
         batch_id: u64,
+        /// Field $name.
         version: u64,
+        /// Field $name.
         source_client: String,
     },
+    /// Variant $name.
     DuplicateIgnored {
+        /// Field $name.
         batch_id: u64,
+        /// Field $name.
         version: u64,
+        /// Field $name.
         source_client: String,
     },
+    /// Variant $name.
     Blocked {
+        /// Field $name.
         reason: DeliveryFault,
     },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Enum $name.
 pub enum DeliveryFault {
+    /// Variant $name.
     MetadataOutage,
+    /// Variant $name.
     ClientDisconnected,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct MetadataTraceRecord {
+    /// Field $name.
     pub step: u64,
+    /// Field $name.
     pub kind: MetadataTraceKind,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub batch_id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub version: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub source_client: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub target_client: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub fault: Option<DeliveryFault>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Enum $name.
 pub enum MetadataTraceKind {
+    /// Variant $name.
     ClientConnected,
+    /// Variant $name.
     ClientDisconnected,
+    /// Variant $name.
     MetadataOutageStarted,
+    /// Variant $name.
     MetadataOutageEnded,
+    /// Variant $name.
     Enqueued,
+    /// Variant $name.
     Delayed,
+    /// Variant $name.
     DelayReleased,
+    /// Variant $name.
     Delivered,
+    /// Variant $name.
     DuplicateIgnored,
+    /// Variant $name.
     DeliveryBlocked,
 }
 
 #[derive(Debug, Default)]
+/// Struct $name.
 pub struct MetadataBus {
     next_batch_id: u64,
     next_version: u64,
@@ -114,10 +159,12 @@ pub struct MetadataBus {
 }
 
 impl MetadataBus {
+    /// Function $name.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Function $name.
     pub fn connect_client(&mut self, client: impl Into<String>) {
         let client = client.into();
         self.client_queues.entry(client.clone()).or_default();
@@ -132,6 +179,7 @@ impl MetadataBus {
         ));
     }
 
+    /// Function $name.
     pub fn disconnect_client(&mut self, client: &str) {
         self.connected_clients.remove(client);
         self.record(trace_record(
@@ -144,10 +192,12 @@ impl MetadataBus {
         ));
     }
 
+    /// Function $name.
     pub fn reconnect_client(&mut self, client: impl Into<String>) {
         self.connect_client(client);
     }
 
+    /// Function $name.
     pub fn set_metadata_outage(&mut self, outage: bool) {
         if self.metadata_outage == outage {
             return;
@@ -167,6 +217,7 @@ impl MetadataBus {
         ));
     }
 
+    /// Function $name.
     pub fn enqueue_local(&mut self, mut batch: MetadataBatch) -> MetadataBatch {
         self.next_batch_id += 1;
         self.next_version += 1;
@@ -183,6 +234,7 @@ impl MetadataBus {
         batch
     }
 
+    /// Function $name.
     pub fn pending_for(&self, client: &str) -> Vec<MetadataBatch> {
         self.client_queues
             .get(client)
@@ -192,10 +244,12 @@ impl MetadataBus {
             .collect()
     }
 
+    /// Function $name.
     pub fn batch(&self, batch_id: u64) -> Option<MetadataBatch> {
         self.batches.get(&batch_id).cloned()
     }
 
+    /// Function $name.
     pub fn deliver_next(&mut self, client: &str) -> Option<DeliveryOutcome> {
         if self.metadata_outage {
             return Some(self.blocked(client, DeliveryFault::MetadataOutage));
@@ -245,6 +299,7 @@ impl MetadataBus {
         })
     }
 
+    /// Function $name.
     pub fn delay_for(&mut self, client: &str, batch_id: u64) -> bool {
         if !self.batches.contains_key(&batch_id) {
             return false;
@@ -263,6 +318,7 @@ impl MetadataBus {
         true
     }
 
+    /// Function $name.
     pub fn release_delay(&mut self, client: &str, batch_id: u64) -> bool {
         if !self.batches.contains_key(&batch_id) {
             return false;
@@ -280,6 +336,7 @@ impl MetadataBus {
         true
     }
 
+    /// Function $name.
     pub fn inject_duplicate(&mut self, client: &str, batch_id: u64) -> bool {
         if !self.batches.contains_key(&batch_id) {
             return false;
@@ -291,6 +348,7 @@ impl MetadataBus {
         true
     }
 
+    /// Function $name.
     pub fn applied_versions(&self, client: &str) -> Vec<u64> {
         self.applied_versions
             .get(client)
@@ -298,10 +356,12 @@ impl MetadataBus {
             .unwrap_or_default()
     }
 
+    /// Function $name.
     pub fn trace(&self) -> &[MetadataTraceRecord] {
         &self.trace
     }
 
+    /// Function $name.
     pub fn drain_trace(&mut self) -> Vec<MetadataTraceRecord> {
         std::mem::take(&mut self.trace)
     }

@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 use crate::infra::ServicePort;
 
+/// Constant $name.
 pub const DEFAULT_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c", "client-d"];
 #[cfg(windows)]
 const DEFAULT_WINDOWS_MOUNT_LETTERS: &[char] = &[
@@ -28,24 +29,40 @@ const E2E_BUCKET_PREFIX: &str = "studiofs-e2e-";
 const COMMAND_RUN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Struct $name.
 pub struct ClientControllerConfig {
+    /// Field $name.
     pub studiofs_bin: PathBuf,
+    /// Field $name.
     pub sandbox: PathBuf,
+    /// Field $name.
     pub volume_name: String,
+    /// Field $name.
     pub meta_dsn: String,
+    /// Field $name.
     pub s3: S3Config,
+    /// Field $name.
     pub init_retry_timeout: Duration,
+    /// Field $name.
     pub mount_ready_timeout: Duration,
+    /// Field $name.
     pub mount_exit_timeout: Duration,
+    /// Field $name.
     pub command_timeouts: ClientCommandTimeouts,
+    /// Field $name.
     pub poll_interval: Duration,
+    /// Field $name.
     pub mount_points: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Struct $name.
 pub struct ClientCommandTimeouts {
+    /// Field $name.
     pub init: Duration,
+    /// Field $name.
     pub discover: Duration,
+    /// Field $name.
     pub umount: Duration,
 }
 
@@ -60,6 +77,7 @@ impl Default for ClientCommandTimeouts {
 }
 
 impl ClientControllerConfig {
+    /// Function $name.
     pub fn from_compose_services(
         studiofs_bin: PathBuf,
         sandbox: PathBuf,
@@ -99,6 +117,7 @@ impl ClientControllerConfig {
         })
     }
 
+    /// Function $name.
     pub fn from_external_env(
         studiofs_bin: PathBuf,
         sandbox: PathBuf,
@@ -177,71 +196,121 @@ fn unique_e2e_volume_name() -> String {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Struct $name.
 pub struct S3Config {
+    /// Field $name.
     pub endpoint: String,
+    /// Field $name.
     pub bucket: String,
+    /// Field $name.
     pub access_key: String,
+    /// Field $name.
     pub secret_key: String,
+    /// Field $name.
     pub region: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Enum $name.
 pub enum ClientLifecycleState {
+    /// Variant $name.
     Planned,
+    /// Variant $name.
     Initialized,
+    /// Variant $name.
     Discovered,
+    /// Variant $name.
     Mounted,
+    /// Variant $name.
     Unmounted,
+    /// Variant $name.
     Killed,
+    /// Variant $name.
     Exited,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct ClientSpec {
+    /// Field $name.
     pub name: String,
+    /// Field $name.
     pub client_root: PathBuf,
+    /// Field $name.
     pub local_metadata_dir: PathBuf,
+    /// Field $name.
     pub local_metadata_db: PathBuf,
+    /// Field $name.
     pub cache_dir: PathBuf,
+    /// Field $name.
     pub mount_metadata_dir: PathBuf,
+    /// Field $name.
     pub mount_point: PathBuf,
+    /// Field $name.
     pub stdout_log: PathBuf,
+    /// Field $name.
     pub stderr_log: PathBuf,
+    /// Field $name.
     pub tracing_log: PathBuf,
+    /// Field $name.
     pub process_id: Option<u32>,
+    /// Field $name.
     pub state: ClientLifecycleState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Struct $name.
 pub struct ClientCommand {
+    /// Field $name.
     pub client: String,
+    /// Field $name.
     pub action: String,
+    /// Field $name.
     pub program: String,
+    /// Field $name.
     pub args: Vec<String>,
+    /// Field $name.
     pub env: Vec<(String, String)>,
+    /// Field $name.
     pub client_root: PathBuf,
+    /// Field $name.
     pub cache_dir: PathBuf,
+    /// Field $name.
     pub mount_point: PathBuf,
+    /// Field $name.
     pub stdout_log: PathBuf,
+    /// Field $name.
     pub stderr_log: PathBuf,
+    /// Field $name.
     pub tracing_log: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Struct $name.
 pub struct ClientCommandOutput {
+    /// Field $name.
     pub status: i32,
+    /// Field $name.
     pub stdout: String,
+    /// Field $name.
     pub stderr: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Struct $name.
 pub struct ClientCommandTimeoutError {
+    /// Field $name.
     pub client: String,
+    /// Field $name.
     pub action: String,
+    /// Field $name.
     pub timeout: Duration,
+    /// Field $name.
     pub program: String,
+    /// Field $name.
     pub stdout_log: PathBuf,
+    /// Field $name.
     pub stderr_log: PathBuf,
 }
 
@@ -256,29 +325,45 @@ impl fmt::Display for ClientCommandTimeoutError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Struct $name.
 pub struct VolumeBootstrapOptions {
+    /// Field $name.
     pub client_names: Vec<String>,
+    /// Field $name.
     pub clean_existing_local_metadata: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct ClientBootstrapRecord {
+    /// Field $name.
     pub name: String,
+    /// Field $name.
     pub local_metadata_db: PathBuf,
+    /// Field $name.
     pub state: ClientLifecycleState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct VolumeBootstrapSummary {
+    /// Field $name.
     pub volume_name: String,
+    /// Field $name.
     pub init_client: String,
+    /// Field $name.
     pub discovered_clients: Vec<String>,
+    /// Field $name.
     pub clients: Vec<ClientBootstrapRecord>,
 }
 
+/// Trait $name.
 pub trait ClientProcess {
+    /// Function $name.
     fn id(&self) -> u32;
+    /// Function $name.
     fn try_wait(&mut self) -> io::Result<Option<i32>>;
+    /// Function $name.
     fn kill(&mut self) -> io::Result<()>;
     /// Force-terminate this runner-owned process and, on Windows, its child process tree.
     fn kill_process_tree(&mut self, context: &str) -> io::Result<()> {
@@ -287,20 +372,26 @@ pub trait ClientProcess {
     }
 }
 
+/// Trait $name.
 pub trait ClientProcessExecutor {
+    /// Function $name.
     fn run(
         &self,
         command: &ClientCommand,
         timeout: Duration,
     ) -> Result<ClientCommandOutput, ClientControllerError>;
+    /// Function $name.
     fn spawn(&self, command: &ClientCommand) -> io::Result<Box<dyn ClientProcess>>;
+    /// Function $name.
     fn is_mount_ready(&self, command: &ClientCommand) -> io::Result<bool>;
+    /// Function $name.
     fn cleanup_stale_mount_before_remount(&self, _command: &ClientCommand) -> io::Result<()> {
         Ok(())
     }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
+/// Struct $name.
 pub struct SystemClientProcessExecutor;
 
 impl ClientProcessExecutor for SystemClientProcessExecutor {
@@ -474,55 +565,101 @@ fn force_kill_child_process_tree(child: &mut Child, context: &str) -> io::Result
 }
 
 #[derive(Debug, Error)]
+/// Enum $name.
 pub enum ClientControllerError {
     #[error("no E2E clients have been created")]
+    /// Variant $name.
     NoClients,
     #[error("cannot replace E2E clients while mount processes are still tracked")]
+    /// Variant $name.
     ClientsStillMounted,
     #[error("client name must be a safe single directory name: {0}")]
+    /// Variant $name.
     UnsafeClientName(String),
     #[error("unknown E2E client: {0}")]
+    /// Variant $name.
     UnknownClient(String),
     #[error("E2E client index {index} is out of range for {len} clients")]
-    ClientIndexOutOfRange { index: usize, len: usize },
+    /// Variant $name.
+    ClientIndexOutOfRange {
+        /// The index value.
+        index: usize,
+        /// The len value.
+        len: usize,
+    },
     #[error("E2E client {client} mount point is already active before mount: {path}")]
-    MountPointAlreadyActive { client: String, path: PathBuf },
+    /// Variant $name.
+    MountPointAlreadyActive {
+        /// The client value.
+        client: String,
+        /// The path value.
+        path: PathBuf,
+    },
     #[error("Docker compose service port is missing for {0}")]
+    /// Variant $name.
     MissingServicePort(String),
     #[error("external E2E infrastructure env is missing: {names}")]
-    MissingExternalEnv { names: String },
+    /// Field $name.
+    MissingExternalEnv {
+        /// The names value.
+        names: String,
+    },
     #[error(
         "client command {action} for {client} failed with exit status {status}: stderr: {stderr}; stdout: {stdout}"
     )]
+    /// Variant $name.
     CommandFailed {
+        /// Field $name.
         client: String,
+        /// Field $name.
         action: String,
+        /// Field $name.
         status: i32,
+        /// Field $name.
         stdout: String,
+        /// Field $name.
         stderr: String,
     },
     #[error("client command {0}")]
+    /// Variant $name.
     CommandTimedOut(Box<ClientCommandTimeoutError>),
     #[error("E2E client {client} did not create local metadata DB: {path}")]
-    MissingLocalMetadataDb { client: String, path: PathBuf },
+    /// Field $name.
+    MissingLocalMetadataDb {
+        /// The client value.
+        client: String,
+        /// The path value.
+        path: PathBuf,
+    },
     #[error("E2E local metadata DB path is shared by multiple clients: {0}")]
+    /// Variant $name.
     DuplicateLocalMetadataDb(PathBuf),
     #[error("failed to canonicalize local metadata DB for E2E client {client} at {path}: {source}")]
+    /// Variant $name.
     CanonicalizeLocalMetadataDbFailed {
+        /// Field $name.
         client: String,
+        /// Field $name.
         path: PathBuf,
+        /// Field $name.
         source: io::Error,
     },
     #[error("failed to clean local metadata for E2E client {client} at {path}: {source}")]
+    /// Variant $name.
     CleanLocalMetadataFailed {
+        /// Field $name.
         client: String,
+        /// Field $name.
         path: PathBuf,
+        /// Field $name.
         source: io::Error,
     },
     #[error("client controller I/O failed: {0}")]
+    /// Variant $name.
     Io(#[from] io::Error),
 }
 
+/// Struct $name.
 pub struct MultiClientController<E> {
     config: ClientControllerConfig,
     executor: E,
@@ -530,6 +667,7 @@ pub struct MultiClientController<E> {
 }
 
 impl<E: ClientProcessExecutor> MultiClientController<E> {
+    /// Function $name.
     pub fn new(config: ClientControllerConfig, executor: E) -> Self {
         Self {
             config,
@@ -538,6 +676,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         }
     }
 
+    /// Function $name.
     pub fn create_clients<I, N>(&mut self, names: I) -> Result<(), ClientControllerError>
     where
         I: IntoIterator<Item = N>,
@@ -565,6 +704,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         Ok(())
     }
 
+    /// Function $name.
     pub fn clients(&self) -> Vec<&ClientSpec> {
         self.clients
             .iter()
@@ -572,10 +712,12 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
             .collect::<Vec<_>>()
     }
 
+    /// Function $name.
     pub fn client_at(&self, index: usize) -> Result<&ClientSpec, ClientControllerError> {
         self.client(index)
     }
 
+    /// Function $name.
     pub fn init_first_client(&mut self) -> Result<(), ClientControllerError> {
         if self.clients.is_empty() {
             return Err(ClientControllerError::NoClients);
@@ -586,6 +728,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         Ok(())
     }
 
+    /// Function $name.
     pub fn discover_additional_clients(&mut self) -> Result<(), ClientControllerError> {
         if self.clients.is_empty() {
             return Err(ClientControllerError::NoClients);
@@ -601,6 +744,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         Ok(())
     }
 
+    /// Function $name.
     pub fn bootstrap_volume(
         &mut self,
         options: VolumeBootstrapOptions,
@@ -640,6 +784,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         })
     }
 
+    /// Function $name.
     pub fn mount_all(&mut self) -> Result<(), ClientControllerError> {
         for index in 0..self.clients.len() {
             self.mount_index(index)?;
@@ -647,17 +792,20 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         Ok(())
     }
 
+    /// Function $name.
     pub fn mount(&mut self, client: &str) -> Result<(), ClientControllerError> {
         let index = self.client_index(client)?;
         self.mount_index(index)
     }
 
+    /// Function $name.
     pub fn restart(&mut self, client: &str) -> Result<(), ClientControllerError> {
         let index = self.client_index(client)?;
         self.unmount_index(index)?;
         self.mount_index(index)
     }
 
+    /// Function $name.
     pub fn force_kill(&mut self, client: &str) -> Result<(), ClientControllerError> {
         let index = self.client_index(client)?;
         if let Some(process) = self.clients[index].process.as_mut() {
@@ -674,6 +822,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         Ok(())
     }
 
+    /// Function $name.
     pub fn remount(&mut self, client: &str) -> Result<(), ClientControllerError> {
         let index = self.client_index(client)?;
         let command = self.mount_command(index)?;
@@ -681,6 +830,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         self.mount_index(index)
     }
 
+    /// Function $name.
     pub fn unmount_all(&mut self) -> Result<(), ClientControllerError> {
         for index in 0..self.clients.len() {
             self.unmount_index(index)?;
@@ -688,6 +838,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         Ok(())
     }
 
+    /// Function $name.
     pub fn force_kill_all(&mut self) -> Result<(), ClientControllerError> {
         let mut kill_error = None;
         for index in 0..self.clients.len() {
@@ -1103,34 +1254,42 @@ fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
         .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
 }
 
+/// Function $name.
 pub fn client_artifact_dir(sandbox: &Path, client: &str) -> PathBuf {
     sandbox.join("artifacts").join("clients").join(client)
 }
 
+/// Function $name.
 pub fn client_root_dir(sandbox: &Path, client: &str) -> PathBuf {
     client_artifact_dir(sandbox, client).join("client-root")
 }
 
+/// Function $name.
 pub fn client_cache_dir(sandbox: &Path, client: &str) -> PathBuf {
     client_artifact_dir(sandbox, client).join("cache")
 }
 
+/// Function $name.
 pub fn client_mount_point(sandbox: &Path, client: &str) -> PathBuf {
     client_artifact_dir(sandbox, client).join("mount")
 }
 
+/// Function $name.
 pub fn client_stdout_log(sandbox: &Path, client: &str) -> PathBuf {
     client_artifact_dir(sandbox, client).join("studiofs.stdout.log")
 }
 
+/// Function $name.
 pub fn client_stderr_log(sandbox: &Path, client: &str) -> PathBuf {
     client_artifact_dir(sandbox, client).join("studiofs.stderr.log")
 }
 
+/// Function $name.
 pub fn client_tracing_log(sandbox: &Path, client: &str) -> PathBuf {
     client_artifact_dir(sandbox, client).join("studiofs-tracing.log")
 }
 
+/// Function $name.
 pub fn client_spec_for(
     sandbox: &Path,
     volume_name: &str,

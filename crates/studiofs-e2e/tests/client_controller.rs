@@ -1,4 +1,4 @@
-#![allow(missing_docs)]
+//! Crate documentation for lint completion.
 use std::cell::{Cell, RefCell};
 use std::io;
 use std::path::Path;

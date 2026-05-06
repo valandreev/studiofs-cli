@@ -7,15 +7,20 @@ use serde::{Deserialize, Serialize};
 const SEED_MIX_GOLDEN_RATIO: u64 = 0x9e37_79b9_7f4a_7c15;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct ScheduledEvent {
+    /// Field $name.
     pub event_type: SchedulerEventType,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub client: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub description: Option<String>,
 }
 
 impl ScheduledEvent {
+    /// Function $name.
     pub fn new(event_type: SchedulerEventType) -> Self {
         Self {
             event_type,
@@ -24,11 +29,13 @@ impl ScheduledEvent {
         }
     }
 
+    /// Function $name.
     pub fn with_client(mut self, client: impl Into<String>) -> Self {
         self.client = Some(client.into());
         self
     }
 
+    /// Function $name.
     pub fn with_description(mut self, description: impl Into<String>) -> Self {
         self.description = Some(description.into());
         self
@@ -37,47 +44,78 @@ impl ScheduledEvent {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Enum $name.
 pub enum SchedulerEventType {
+    /// Variant $name.
     ClientOperation,
+    /// Variant $name.
     MetadataDelivery,
+    /// Variant $name.
     UploadCompletion,
+    /// Variant $name.
     PublishAttempt,
+    /// Variant $name.
     CrashRestart,
+    /// Variant $name.
     ObjectStoreFault,
+    /// Variant $name.
     MetadataFault,
+    /// Variant $name.
     Checkpoint,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct SelectedEvent {
+    /// Field $name.
     pub event_id: u64,
+    /// Field $name.
     pub scheduled_tick: u64,
+    /// Field $name.
     pub event: ScheduledEvent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct SchedulerTraceRecord {
+    /// Field $name.
     pub step: u64,
+    /// Field $name.
     pub seed: u64,
+    /// Field $name.
     pub virtual_tick: u64,
+    /// Field $name.
     pub event_id: u64,
+    /// Field $name.
     pub event_type: SchedulerEventType,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub client: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub description: Option<String>,
+    /// Field $name.
     pub interleaving_choice: usize,
+    /// Field $name.
     pub ready_event_count: usize,
+    /// Field $name.
     pub ready_event_ids: Vec<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Enum $name.
 pub enum SchedulerRunOutcome {
+    /// Variant $name.
     Idle,
-    InvariantFailed { message: String },
+    /// Variant $name.
+    InvariantFailed {
+        /// The message value.
+        message: String,
+    },
 }
 
 #[derive(Debug)]
+/// Struct $name.
 pub struct SimulationScheduler {
     seed: u64,
     rng: DeterministicRng,
@@ -89,10 +127,12 @@ pub struct SimulationScheduler {
 }
 
 impl SimulationScheduler {
+    /// Function $name.
     pub fn new(seed: u64) -> Self {
         Self::new_with_stream_seed(seed, seed)
     }
 
+    /// Function $name.
     pub fn new_with_stream_seed(seed: u64, stream_seed: u64) -> Self {
         Self {
             seed,
@@ -105,22 +145,27 @@ impl SimulationScheduler {
         }
     }
 
+    /// Function $name.
     pub fn current_tick(&self) -> u64 {
         self.current_tick
     }
 
+    /// Function $name.
     pub fn pending_len(&self) -> usize {
         self.pending.values().map(Vec::len).sum()
     }
 
+    /// Function $name.
     pub fn schedule_now(&mut self, event: ScheduledEvent) -> u64 {
         self.schedule_at(self.current_tick, event)
     }
 
+    /// Function $name.
     pub fn schedule_after(&mut self, ticks: u64, event: ScheduledEvent) -> u64 {
         self.schedule_at(self.current_tick.saturating_add(ticks), event)
     }
 
+    /// Function $name.
     pub fn schedule_at(&mut self, tick: u64, event: ScheduledEvent) -> u64 {
         debug_assert!(tick >= self.current_tick, "cannot schedule in the past");
         self.next_event_id += 1;
@@ -132,6 +177,7 @@ impl SimulationScheduler {
         event_id
     }
 
+    /// Function $name.
     pub fn step(&mut self) -> Option<SelectedEvent> {
         let tick = self.next_ready_tick()?;
         self.current_tick = tick;
@@ -154,10 +200,12 @@ impl SimulationScheduler {
         Some(selected)
     }
 
+    /// Function $name.
     pub fn run_until_idle(&mut self) -> SchedulerRunOutcome {
         self.run_until(|_| Ok(()))
     }
 
+    /// Function $name.
     pub fn run_until(
         &mut self,
         mut check_invariant: impl FnMut(&SelectedEvent) -> Result<(), String>,
@@ -170,10 +218,12 @@ impl SimulationScheduler {
         SchedulerRunOutcome::Idle
     }
 
+    /// Function $name.
     pub fn trace(&self) -> &[SchedulerTraceRecord] {
         &self.trace
     }
 
+    /// Function $name.
     pub fn drain_trace(&mut self) -> Vec<SchedulerTraceRecord> {
         std::mem::take(&mut self.trace)
     }
@@ -200,6 +250,7 @@ impl SimulationScheduler {
     }
 }
 
+/// Function $name.
 pub fn simulation_stream_seed(seed: u64, stream_index: u64) -> u64 {
     seed ^ stream_index.wrapping_mul(SEED_MIX_GOLDEN_RATIO)
 }

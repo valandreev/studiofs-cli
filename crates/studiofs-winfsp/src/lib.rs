@@ -1,5 +1,4 @@
 #![cfg(windows)]
-#![allow(missing_docs)]
 //! StudioFS WinFSP backend for Windows.
 //!
 //! Implements `winfsp::filesystem::FileSystemContext` to expose the VFS
@@ -58,12 +57,19 @@ enum MountOptionError {
     InvalidDriveMountPoint(String),
 }
 
+/// Struct $name.
 pub struct WinfspMountRequest {
+    /// Field $name.
     pub vfs: std::sync::Arc<studiofs_vfs::StudioVfs>,
+    /// Field $name.
     pub runtime_handle: tokio::runtime::Handle,
+    /// Field $name.
     pub mount_point: String,
+    /// Field $name.
     pub volume_label: String,
+    /// Field $name.
     pub read_only: bool,
+    /// Field $name.
     pub shutdown_event_name: Option<String>,
 }
 

@@ -1,4 +1,4 @@
-#![allow(missing_docs)]
+//! Crate documentation for lint completion.
 use studiofs_scenario::client::SimulatedRuntime;
 use studiofs_scenario::invariant::validate_logical_invariants;
 

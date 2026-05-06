@@ -37,18 +37,27 @@ const RUNNER_MARKER_FILE: &str = ".studiofs-e2e-runner.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+/// Enum $name.
 pub enum RetentionPolicy {
+    /// Variant $name.
     Always,
+    /// Variant $name.
     OnFailure,
+    /// Variant $name.
     Never,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+/// Enum $name.
 pub enum PlatformSelection {
+    /// Variant $name.
     Auto,
+    /// Variant $name.
     LinuxFuse,
+    /// Variant $name.
     MacosFuse,
+    /// Variant $name.
     WindowsWinfsp,
 }
 
@@ -65,121 +74,209 @@ impl PlatformSelection {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Enum $name.
 pub enum RunStatus {
+    /// Variant $name.
     Passed,
+    /// Variant $name.
     Failed,
+    /// Variant $name.
     Skipped,
+    /// Variant $name.
     PreflightFailed,
+    /// Variant $name.
     CleanupFailed,
+    /// Variant $name.
     TimedOut,
+    /// Variant $name.
     Interrupted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Enum $name.
 pub enum ScenarioStatus {
+    /// Variant $name.
     Passed,
+    /// Variant $name.
     Failed,
+    /// Variant $name.
     Skipped,
+    /// Variant $name.
     TimedOut,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Struct $name.
 pub struct RunRequest {
+    /// Field $name.
     pub root: PathBuf,
+    /// Field $name.
     pub run_id: Option<String>,
+    /// Field $name.
     pub scenarios: Vec<String>,
+    /// Field $name.
     pub seed: u64,
+    /// Field $name.
     pub studiofs_bin: Option<PathBuf>,
+    /// Field $name.
     pub platform: PlatformSelection,
+    /// Field $name.
     pub retention: RetentionPolicy,
+    /// Field $name.
     pub report: Option<PathBuf>,
+    /// Field $name.
     pub port_range: Option<String>,
+    /// Field $name.
     pub timeout: Option<String>,
+    /// Field $name.
     pub infra: InfraMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Struct $name.
 pub struct CleanRequest {
+    /// Field $name.
     pub root: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Struct $name.
 pub struct RunOneRequest {
+    /// Field $name.
     pub root: PathBuf,
+    /// Field $name.
     pub run_id: String,
+    /// Field $name.
     pub scenario: String,
+    /// Field $name.
     pub seed: u64,
+    /// Field $name.
     pub studiofs_bin: Option<PathBuf>,
+    /// Field $name.
     pub infra: InfraMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Struct $name.
 pub struct CleanOutcome {
+    /// Field $name.
     pub removed: Vec<PathBuf>,
+    /// Field $name.
     pub skipped: Vec<CleanSkipped>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Struct $name.
 pub struct CleanSkipped {
+    /// Field $name.
     pub path: PathBuf,
+    /// Field $name.
     pub error: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Struct $name.
 pub struct ScenarioOutcome {
+    /// Field $name.
     pub name: String,
+    /// Field $name.
     pub status: ScenarioStatus,
+    /// Field $name.
     pub artifacts: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Struct $name.
 pub struct RunOutcome {
+    /// Field $name.
     pub run_id: String,
+    /// Field $name.
     pub status: RunStatus,
+    /// Field $name.
     pub exit_code: i32,
+    /// Field $name.
     pub sandbox: PathBuf,
+    /// Field $name.
     pub report_path: PathBuf,
+    /// Field $name.
     pub scenarios: Vec<ScenarioOutcome>,
 }
 
 #[derive(Debug, Error)]
+/// Enum $name.
 pub enum RunnerError {
     #[error("unknown E2E scenario: {0}")]
+    /// Variant $name.
     UnknownScenario(String),
     #[error(
         "E2E scenario {scenario} requires --studiofs-bin when real mounted infrastructure is used"
     )]
-    MissingStudiofsBin { scenario: String },
+    /// Field $name.
+    MissingStudiofsBin {
+        /// The scenario value.
+        scenario: String,
+    },
     #[error("run ID must not be empty")]
+    /// Variant $name.
     EmptyRunId,
     #[error("run ID must be a safe single directory name: {0}")]
+    /// Variant $name.
     UnsafeRunId(String),
     #[error(
         "invalid E2E --timeout value {value:?}: expected <number>ms, <number>s, <number>m, or <number>h"
     )]
-    InvalidTimeout { value: String },
+    /// Variant $name.
+    InvalidTimeout {
+        /// The value value.
+        value: String,
+    },
     #[error("unsafe cleanup root: {0}")]
+    /// Variant $name.
     UnsafeCleanupRoot(String),
     #[error("E2E artifact path is outside the run sandbox")]
-    ArtifactPathOutsideSandbox { path: PathBuf, sandbox: PathBuf },
+    /// Field $name.
+    ArtifactPathOutsideSandbox {
+        /// The path value.
+        path: PathBuf,
+        /// The sandbox value.
+        sandbox: PathBuf,
+    },
     #[error("E2E artifact path contains a non-UTF-8 component")]
-    NonUtf8ArtifactPath { path: PathBuf },
+    /// Variant $name.
+    NonUtf8ArtifactPath {
+        /// The path value.
+        path: PathBuf,
+    },
     #[error("E2E artifact path must be relative and must not contain parent components")]
-    UnsafeArtifactPath { path: PathBuf },
+    /// Field $name.
+    UnsafeArtifactPath {
+        /// The path value.
+        path: PathBuf,
+    },
     #[error("scenario child exited successfully without report: {path}")]
-    MissingScenarioReport { path: PathBuf },
+    /// Variant $name.
+    MissingScenarioReport {
+        /// The path value.
+        path: PathBuf,
+    },
     #[error("runner I/O failed: {0}")]
+    /// Variant $name.
     Io(#[from] std::io::Error),
     #[error("runner JSON failed: {0}")]
+    /// Variant $name.
     Json(#[from] serde_json::Error),
     #[error("scenario hook failed: {0}")]
+    /// Variant $name.
     Scenario(#[from] scenario::ScenarioError),
     #[error("runner client controller failed: {0}")]
+    /// Variant $name.
     Client(#[from] ClientControllerError),
     #[error("runner infra failed: {0}")]
+    /// Variant $name.
     Infra(#[from] InfraError),
     #[error("runner operation log failed: {0}")]
+    /// Variant $name.
     OperationLog(#[from] OperationLogError),
 }
 
@@ -215,11 +312,13 @@ impl RunDeadline {
     }
 }
 
+/// Function $name.
 pub fn run(request: RunRequest) -> Result<RunOutcome, RunnerError> {
     let executor = SystemCommandExecutor;
     run_with_executor(request, &executor)
 }
 
+/// Function $name.
 pub fn run_with_executor(
     request: RunRequest,
     executor: &dyn CommandExecutor,
@@ -227,6 +326,7 @@ pub fn run_with_executor(
     run_with_executor_and_mount_lock_dir(request, executor, &default_mount_lock_dir())
 }
 
+/// Function $name.
 pub fn run_one(request: RunOneRequest) -> Result<i32, RunnerError> {
     let root = absolutize(&request.root)?;
     validate_run_id(&request.run_id)?;
@@ -1127,6 +1227,7 @@ fn write_lock_payload(mut file: fs::File, payload: &[u8]) -> std::io::Result<()>
     file.sync_all()
 }
 
+/// Function $name.
 pub fn clean(request: CleanRequest) -> Result<CleanOutcome, RunnerError> {
     if !request.root.exists() {
         return Ok(CleanOutcome {

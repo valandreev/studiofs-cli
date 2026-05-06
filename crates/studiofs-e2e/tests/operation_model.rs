@@ -1,4 +1,4 @@
-#![allow(missing_docs)]
+//! Crate documentation for lint completion.
 use std::fs;
 
 use studiofs_e2e::infra::InfraMode;

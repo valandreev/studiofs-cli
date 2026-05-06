@@ -1,4 +1,4 @@
-#![allow(missing_docs)]
+//! Crate documentation for lint completion.
 #![cfg(unix)]
 
 use std::sync::{Arc, OnceLock};

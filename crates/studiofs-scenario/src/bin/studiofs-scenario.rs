@@ -1,4 +1,4 @@
-#![allow(missing_docs)]
+//! Crate documentation for lint completion.
 use std::ffi::OsStr;
 use std::path::PathBuf;
 

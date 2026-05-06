@@ -11,34 +11,53 @@ use crate::scheduler::{
 use crate::{OperationOutcome, ScenarioOperation, ScenarioOperationRecord};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct CollisionSuiteConfig {
+    /// Field $name.
     pub scenario: String,
+    /// Field $name.
     pub seeds: Vec<u64>,
+    /// Field $name.
     pub families: Vec<CollisionFamily>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Enum $name.
 pub enum CollisionFamily {
+    /// Variant $name.
     RenameVsRename,
+    /// Variant $name.
     RenameVsUnlink,
+    /// Variant $name.
     UnlinkVsAppend,
+    /// Variant $name.
     OverwriteWhileStaleReader,
+    /// Variant $name.
     MkdirRmdirVsCreate,
+    /// Variant $name.
     MetadataDeliveryVsLocalMutation,
+    /// Variant $name.
     PublishVsForeignApply,
+    /// Variant $name.
     InjectedInvariantFailure,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct CollisionSuiteReport {
+    /// Field $name.
     pub scenario: String,
+    /// Field $name.
     pub passed: bool,
+    /// Field $name.
     pub family_reports: Vec<CollisionFamilyReport>,
+    /// Field $name.
     pub failures: Vec<CollisionFailure>,
 }
 
 impl CollisionSuiteReport {
+    /// Function $name.
     pub fn total_runs(&self) -> usize {
         self.family_reports
             .iter()
@@ -48,50 +67,78 @@ impl CollisionSuiteReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct CollisionFamilyReport {
+    /// Field $name.
     pub family: CollisionFamily,
+    /// Field $name.
     pub seed_reports: Vec<CollisionSeedReport>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct CollisionSeedReport {
+    /// Field $name.
     pub seed: u64,
+    /// Field $name.
     pub passed: bool,
+    /// Field $name.
     pub invariant_checkpoints: usize,
+    /// Field $name.
     pub trace: Vec<CollisionTraceRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct CollisionFailure {
+    /// Field $name.
     pub scenario: String,
+    /// Field $name.
     pub family: CollisionFamily,
+    /// Field $name.
     pub seed: u64,
+    /// Field $name.
     pub violated_invariant: String,
+    /// Field $name.
     pub message: String,
+    /// Field $name.
     pub trace: Vec<CollisionTraceRecord>,
+    /// Field $name.
     pub scheduler_trace: Vec<SchedulerTraceRecord>,
+    /// Field $name.
     pub operation_log: Vec<ScenarioOperationRecord>,
+    /// Field $name.
     pub final_snapshot: LogicalSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct CollisionTraceRecord {
+    /// Field $name.
     pub step: u64,
+    /// Field $name.
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub client: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub source_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub target_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub checksum_sha256: Option<String>,
 }
 
+/// Function $name.
 pub fn run_collision_suite(config: CollisionSuiteConfig) -> CollisionSuiteReport {
     let mut family_reports = Vec::new();
     let mut failures = Vec::new();

@@ -1357,6 +1357,7 @@ impl StudioVfs {
         }
     }
 
+    /// Function $name.
     pub fn getattr(&self, ino: Ino) -> VfsResult<InodeAttr> {
         let attr = self.getattr_unchecked(ino)?;
         self.enforce_access(ino, AccessLevel::ReadOnly)?;

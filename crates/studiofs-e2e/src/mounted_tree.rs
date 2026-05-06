@@ -19,12 +19,16 @@ const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 const READ_BUFFER_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Struct $name.
 pub struct ClientMount {
+    /// Field $name.
     pub client: String,
+    /// Field $name.
     pub mount_point: PathBuf,
 }
 
 impl ClientMount {
+    /// Function $name.
     pub fn new(client: impl Into<String>, mount_point: impl Into<PathBuf>) -> Self {
         Self {
             client: client.into(),
@@ -34,102 +38,165 @@ impl ClientMount {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct MountedTreeSnapshot {
+    /// Field $name.
     pub schema_version: u32,
+    /// Field $name.
     pub client: String,
+    /// Field $name.
     pub mount_point: String,
+    /// Field $name.
     pub entries: Vec<TreeEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct TreeEntry {
+    /// Field $name.
     pub path: String,
+    /// Field $name.
     pub entry_type: TreeEntryKind,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub size: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub modified_unix_ms: Option<u128>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub checksum_sha256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub symlink_target: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Enum $name.
 pub enum TreeEntryKind {
+    /// Variant $name.
     Directory,
+    /// Variant $name.
     File,
+    /// Variant $name.
     Symlink,
+    /// Variant $name.
     Other,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct TreeComparison {
+    /// Field $name.
     pub converged: bool,
+    /// Field $name.
     pub reference_client: Option<String>,
+    /// Field $name.
     pub compared_clients: Vec<String>,
+    /// Field $name.
     pub differences: Vec<TreeDifference>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct TreeDifference {
+    /// Field $name.
     pub client: String,
+    /// Field $name.
     pub reference_client: Option<String>,
+    /// Field $name.
     pub path: String,
+    /// Field $name.
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub expected: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub actual: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct NamespaceInvariantViolation {
+    /// Field $name.
     pub client: String,
+    /// Field $name.
     pub path: String,
+    /// Field $name.
     pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Struct $name.
 pub struct ConvergenceOutcome {
+    /// Field $name.
     pub attempts: usize,
+    /// Field $name.
     pub elapsed_ms: u128,
+    /// Field $name.
     pub snapshots: Vec<MountedTreeSnapshot>,
+    /// Field $name.
     pub comparison: TreeComparison,
 }
 
 #[derive(Debug, Error)]
+/// Enum $name.
 pub enum MountedTreeError {
     #[error("mounted tree I/O failed at {path}: {source}")]
-    Io { path: PathBuf, source: io::Error },
-    #[error("mounted tree JSON failed at {path}: {source}")]
-    Json {
+    /// Variant $name.
+    Io {
+        /// The path value.
         path: PathBuf,
+        /// The source value.
+        source: io::Error,
+    },
+    #[error("mounted tree JSON failed at {path}: {source}")]
+    /// Variant $name.
+    Json {
+        /// Field $name.
+        path: PathBuf,
+        /// Field $name.
         source: serde_json::Error,
     },
     #[error(
         "mounted filesystem trees did not converge after {attempts} attempts in {elapsed_ms}ms; artifacts written to {artifact_dir}"
     )]
+    /// Variant $name.
     ConvergenceTimedOut {
+        /// Field $name.
         attempts: usize,
+        /// Field $name.
         elapsed_ms: u128,
+        /// Field $name.
         artifact_dir: PathBuf,
+        /// Field $name.
         comparison: Box<TreeComparison>,
     },
     #[error(
         "mounted filesystem trees could not be snapshotted after {attempts} attempts in {elapsed_ms}ms; last error: {source}"
     )]
+    /// Variant $name.
     SnapshotUnavailableTimedOut {
+        /// Field $name.
         attempts: usize,
+        /// Field $name.
         elapsed_ms: u128,
+        /// Field $name.
         artifact_dir: PathBuf,
+        /// Field $name.
         source: Box<MountedTreeError>,
     },
     #[error("mounted tree path is not valid UTF-8: {path}")]
-    NonUtf8Path { path: PathBuf },
+    /// Variant $name.
+    NonUtf8Path {
+        /// The path value.
+        path: PathBuf,
+    },
 }
 
+/// Function $name.
 pub fn snapshot_client_tree(
     client: impl Into<String>,
     mount_point: impl AsRef<Path>,
@@ -148,6 +215,7 @@ pub fn snapshot_client_tree(
     })
 }
 
+/// Function $name.
 pub fn compare_snapshots(snapshots: &[MountedTreeSnapshot]) -> TreeComparison {
     let compared_clients = snapshots
         .iter()
@@ -208,6 +276,7 @@ pub fn compare_snapshots(snapshots: &[MountedTreeSnapshot]) -> TreeComparison {
     }
 }
 
+/// Function $name.
 pub fn validate_namespace_invariants(
     snapshot: &MountedTreeSnapshot,
     expected_absent_paths: &[&str],
@@ -235,6 +304,7 @@ pub fn validate_namespace_invariants(
         .collect()
 }
 
+/// Function $name.
 pub fn mounted_snapshots_to_logical_snapshot(
     snapshots: &[MountedTreeSnapshot],
     expected_absent_paths: &[&str],
@@ -259,6 +329,7 @@ pub fn mounted_snapshots_to_logical_snapshot(
     logical
 }
 
+/// Function $name.
 pub fn write_divergence_artifacts(
     artifact_dir: impl AsRef<Path>,
     snapshots: &[MountedTreeSnapshot],
@@ -279,6 +350,7 @@ pub fn write_divergence_artifacts(
     Ok(artifacts)
 }
 
+/// Function $name.
 pub fn wait_for_convergence(
     mounts: &[ClientMount],
     artifact_dir: impl AsRef<Path>,

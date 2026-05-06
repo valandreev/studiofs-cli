@@ -25,16 +25,24 @@ use std::time::Instant;
 use studiofs_meta::types::Ino;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Struct $name.
 pub struct ReadStreamKey {
+    /// Field $name.
     pub ino: Ino,
+    /// Field $name.
     pub stream_id: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
+/// Struct $name.
 pub struct ReadAheadPolicy {
+    /// Field $name.
     pub base_width: u32,
+    /// Field $name.
     pub max_width: u32,
+    /// Field $name.
     pub min_prefetch_on_seq: u32,
+    /// Field $name.
     pub prefetch_enabled: bool,
 }
 
@@ -213,6 +221,7 @@ impl ReadAheadTracker {
         )
     }
 
+    /// Function $name.
     pub fn record_read_for_stream(
         &self,
         key: ReadStreamKey,
@@ -264,6 +273,7 @@ impl ReadAheadTracker {
         !found_stream
     }
 
+    /// Function $name.
     pub fn stream_prefetch_relevant(&self, key: ReadStreamKey, block: u32) -> bool {
         let Some(state) = self.states.get(&key) else {
             return true;
@@ -271,6 +281,7 @@ impl ReadAheadTracker {
         Self::state_considers_block_relevant(&state, self.width.max(1), block)
     }
 
+    /// Function $name.
     pub fn evict_stream(&self, key: ReadStreamKey) {
         self.states.remove(&key);
     }
@@ -708,6 +719,7 @@ struct DirPrefetchState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Struct $name.
 pub struct DirAccessEntry<'a> {
     /// Inode for a regular-file directory child.
     pub ino: Ino,

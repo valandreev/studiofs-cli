@@ -6,111 +6,186 @@ use crate::infra::{InfraMode, ServicePort};
 use crate::runner::{RetentionPolicy, RunStatus, ScenarioStatus};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Struct $name.
 pub struct RunManifest {
+    /// Field $name.
     pub schema_version: u32,
+    /// Field $name.
     pub runner_crate: String,
+    /// Field $name.
     pub run_id: String,
+    /// Field $name.
     pub seed: u64,
+    /// Field $name.
     pub sandbox: String,
+    /// Field $name.
     pub scenarios: Vec<String>,
+    /// Field $name.
     pub retention: RetentionPolicy,
+    /// Field $name.
     pub selected_platform: String,
+    /// Field $name.
     pub infra: InfraMode,
+    /// Field $name.
     pub compose_project: Option<String>,
+    /// Field $name.
     pub allocated_ports: Vec<ServicePort>,
+    /// Field $name.
     pub studiofs_bin: Option<String>,
+    /// Field $name.
     pub port_range: Option<String>,
+    /// Field $name.
     pub timeout: Option<String>,
+    /// Field $name.
     pub explicit_client_roots: Vec<String>,
+    /// Field $name.
     pub cleanup_allowlist: Vec<String>,
+    /// Field $name.
     pub created_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Struct $name.
 pub struct RunReport {
+    /// Field $name.
     pub schema_version: u32,
+    /// Field $name.
     pub run_id: String,
+    /// Field $name.
     pub seed: u64,
+    /// Field $name.
     pub status: RunStatus,
+    /// Field $name.
     pub exit_code: i32,
+    /// Field $name.
     pub started_at: String,
+    /// Field $name.
     pub finished_at: String,
+    /// Field $name.
     pub duration_ms: u64,
+    /// Field $name.
     pub runner: RunnerReport,
+    /// Field $name.
     pub host: HostReport,
+    /// Field $name.
     pub sandbox: SandboxReport,
+    /// Field $name.
     pub preflight: PreflightReport,
+    /// Field $name.
     pub scenarios: Vec<ScenarioReport>,
+    /// Field $name.
     pub artifacts: Vec<ArtifactReport>,
+    /// Field $name.
     pub cleanup: CleanupReport,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Struct $name.
 pub struct RunnerReport {
     #[serde(rename = "crate")]
+    /// Field $name.
     pub crate_name: String,
+    /// Field $name.
     pub version: String,
+    /// Field $name.
     pub git_sha: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Struct $name.
 pub struct HostReport {
+    /// Field $name.
     pub os: String,
+    /// Field $name.
     pub arch: String,
+    /// Field $name.
     pub platform: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Struct $name.
 pub struct SandboxReport {
+    /// Field $name.
     pub root: String,
+    /// Field $name.
     pub retention: RetentionPolicy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Struct $name.
 pub struct PreflightReport {
+    /// Field $name.
     pub status: RunStatus,
+    /// Field $name.
     pub checks: Vec<PreflightCheckReport>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Struct $name.
 pub struct PreflightCheckReport {
+    /// Field $name.
     pub name: String,
+    /// Field $name.
     pub status: RunStatus,
+    /// Field $name.
     pub detail: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Struct $name.
 pub struct ScenarioReport {
+    /// Field $name.
     pub name: String,
+    /// Field $name.
     pub seed: u64,
+    /// Field $name.
     pub status: ScenarioStatus,
+    /// Field $name.
     pub started_at: String,
+    /// Field $name.
     pub finished_at: String,
+    /// Field $name.
     pub duration_ms: u64,
+    /// Field $name.
     pub artifacts: Vec<String>,
+    /// Field $name.
     pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Struct $name.
 pub struct ArtifactReport {
+    /// Field $name.
     pub name: String,
+    /// Field $name.
     pub path: String,
+    /// Field $name.
     pub required: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Struct $name.
 pub struct CleanupReport {
+    /// Field $name.
     pub status: RunStatus,
+    /// Field $name.
     pub actions: Vec<String>,
+    /// Field $name.
     pub errors: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Struct $name.
 pub struct EventRecord {
+    /// Field $name.
     pub timestamp: String,
+    /// Field $name.
     pub run_id: String,
+    /// Field $name.
     pub scenario: Option<String>,
+    /// Field $name.
     pub hook: String,
+    /// Field $name.
     pub phase: String,
 }
 

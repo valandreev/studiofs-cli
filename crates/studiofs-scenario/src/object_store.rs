@@ -7,13 +7,18 @@ use serde::{Deserialize, Serialize};
 use crate::invariant::ObjectLifecycle;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct SimulatedObject {
+    /// Field $name.
     pub object_id: String,
+    /// Field $name.
     pub checksum_sha256: String,
+    /// Field $name.
     pub size: u64,
 }
 
 impl SimulatedObject {
+    /// Function $name.
     pub fn new(
         object_id: impl Into<String>,
         checksum_sha256: impl Into<String>,
@@ -28,77 +33,122 @@ impl SimulatedObject {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct UploadTicket {
+    /// Field $name.
     pub upload_id: u64,
+    /// Field $name.
     pub client: String,
+    /// Field $name.
     pub object_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Enum $name.
 pub enum UploadOutcome {
+    /// Variant $name.
     Completed {
+        /// Field $name.
         upload_id: u64,
+        /// Field $name.
         object_id: String,
     },
+    /// Variant $name.
     AlreadyCompleted {
+        /// Field $name.
         upload_id: u64,
+        /// Field $name.
         object_id: String,
     },
+    /// Variant $name.
     Failed {
+        /// Field $name.
         upload_id: u64,
+        /// Field $name.
         object_id: String,
+        /// Field $name.
         error: String,
         #[serde(skip_serializing_if = "Option::is_none")]
+        /// Field $name.
         retry_at_tick: Option<u64>,
     },
+    /// Variant $name.
     Blocked {
+        /// Field $name.
         upload_id: u64,
+        /// Field $name.
         object_id: String,
+        /// Field $name.
         reason: ObjectStoreFault,
     },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Enum $name.
 pub enum ObjectStoreFault {
+    /// Variant $name.
     ObjectStoreOutage,
+    /// Variant $name.
     ObjectNotFound,
+    /// Variant $name.
     LocalPayloadMissing,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct ObjectStoreTraceRecord {
+    /// Field $name.
     pub step: u64,
+    /// Field $name.
     pub kind: ObjectStoreTraceKind,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub client: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub object_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub upload_id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub fault: Option<ObjectStoreFault>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub retry_at_tick: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Enum $name.
 pub enum ObjectStoreTraceKind {
+    /// Variant $name.
     LocalPayloadStaged,
+    /// Variant $name.
     UploadScheduled,
+    /// Variant $name.
     UploadCompleted,
+    /// Variant $name.
     UploadFailed,
+    /// Variant $name.
     UploadBlocked,
+    /// Variant $name.
     ObjectStoreOutageStarted,
+    /// Variant $name.
     ObjectStoreOutageEnded,
+    /// Variant $name.
     RemoteRead,
+    /// Variant $name.
     RemoteReadFailed,
+    /// Variant $name.
     MetadataPublished,
+    /// Variant $name.
     ObjectDeleted,
 }
 
 #[derive(Debug, Default)]
+/// Struct $name.
 pub struct SimulatedObjectStore {
     available: bool,
     next_upload_id: u64,
@@ -112,6 +162,7 @@ pub struct SimulatedObjectStore {
 }
 
 impl SimulatedObjectStore {
+    /// Function $name.
     pub fn new() -> Self {
         Self {
             available: true,
@@ -119,6 +170,7 @@ impl SimulatedObjectStore {
         }
     }
 
+    /// Function $name.
     pub fn stage_local_payload(
         &mut self,
         client: impl Into<String>,
@@ -143,12 +195,14 @@ impl SimulatedObjectStore {
         ));
     }
 
+    /// Function $name.
     pub fn has_local_payload(&self, client: &str, object_id: &str) -> bool {
         self.local_payloads
             .get(client)
             .is_some_and(|payloads| payloads.contains_key(object_id))
     }
 
+    /// Function $name.
     pub fn remove_local_payload(&mut self, client: &str, object_id: &str) -> bool {
         self.local_payloads
             .get_mut(client)
@@ -156,10 +210,12 @@ impl SimulatedObjectStore {
             .is_some()
     }
 
+    /// Function $name.
     pub fn has_remote_object(&self, object_id: &str) -> bool {
         self.remote_objects.contains_key(object_id)
     }
 
+    /// Function $name.
     pub fn schedule_upload(
         &mut self,
         client: impl Into<String>,
@@ -193,12 +249,14 @@ impl SimulatedObjectStore {
         Ok(ticket)
     }
 
+    /// Function $name.
     pub fn upload_ticket(&self, upload_id: u64) -> Option<UploadTicket> {
         self.uploads
             .get(&upload_id)
             .map(|state| state.ticket.clone())
     }
 
+    /// Function $name.
     pub fn complete_upload(&mut self, upload_id: u64) -> Option<UploadOutcome> {
         let state = self.uploads.get(&upload_id)?.clone();
         if state.terminal {
@@ -258,6 +316,7 @@ impl SimulatedObjectStore {
         })
     }
 
+    /// Function $name.
     pub fn fail_upload(
         &mut self,
         upload_id: u64,
@@ -286,6 +345,7 @@ impl SimulatedObjectStore {
         })
     }
 
+    /// Function $name.
     pub fn ready_retries(&self, tick: u64) -> Vec<u64> {
         self.uploads
             .iter()
@@ -296,6 +356,7 @@ impl SimulatedObjectStore {
             .collect()
     }
 
+    /// Function $name.
     pub fn set_available(&mut self, available: bool) {
         if self.available == available {
             return;
@@ -315,10 +376,12 @@ impl SimulatedObjectStore {
         ));
     }
 
+    /// Function $name.
     pub fn is_available(&self) -> bool {
         self.available
     }
 
+    /// Function $name.
     pub fn read_remote(&mut self, object_id: &str) -> Result<SimulatedObject, ObjectStoreFault> {
         if !self.is_available() {
             self.record(trace_record(
@@ -353,6 +416,7 @@ impl SimulatedObjectStore {
         Ok(object)
     }
 
+    /// Function $name.
     pub fn mark_published(&mut self, object_id: &str) {
         self.published.insert(object_id.to_string());
         self.record(trace_record(
@@ -365,10 +429,12 @@ impl SimulatedObjectStore {
         ));
     }
 
+    /// Function $name.
     pub fn is_published(&self, object_id: &str) -> bool {
         self.published.contains(object_id)
     }
 
+    /// Function $name.
     pub fn mark_deleted(&mut self, object_id: &str) {
         self.deleted.insert(object_id.to_string());
         self.published.remove(object_id);
@@ -382,6 +448,7 @@ impl SimulatedObjectStore {
         ));
     }
 
+    /// Function $name.
     pub fn object_lifecycle(&self) -> Vec<ObjectLifecycle> {
         let local_payload_ids = self
             .local_payloads
@@ -408,10 +475,12 @@ impl SimulatedObjectStore {
             .collect()
     }
 
+    /// Function $name.
     pub fn trace(&self) -> &[ObjectStoreTraceRecord] {
         &self.trace
     }
 
+    /// Function $name.
     pub fn drain_trace(&mut self) -> Vec<ObjectStoreTraceRecord> {
         std::mem::take(&mut self.trace)
     }

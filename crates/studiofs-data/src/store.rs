@@ -11,24 +11,34 @@ use thiserror::Error;
 use tracing::{debug, info};
 
 #[derive(Debug, Error)]
+/// Enum $name.
 pub enum DataError {
     #[error("storage error: {0}")]
+    /// Variant $name.
     Storage(String),
 
     #[error("opendal error: {0}")]
+    /// Variant $name.
     OpenDal(#[from] opendal::Error),
 }
 
+/// Type alias $name.
 pub type DataResult<T> = Result<T, DataError>;
 
 /// Configuration for the data store.
 #[derive(Clone)]
 pub struct DataStoreConfig {
+    /// Field $name.
     pub endpoint: String,
+    /// Field $name.
     pub bucket: String,
+    /// Field $name.
     pub access_key: String,
+    /// Field $name.
     pub secret_key: String,
+    /// Field $name.
     pub region: String,
+    /// Field $name.
     pub volume_name: String,
 }
 

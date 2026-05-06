@@ -613,6 +613,7 @@ impl StudioVfs {
         result
     }
 
+    /// Function $name.
     pub fn release_fh_with_deferred_last_handle_barrier(
         self: &Arc<Self>,
         fh: u64,
@@ -648,6 +649,7 @@ impl StudioVfs {
         }
     }
 
+    /// Function $name.
     pub async fn flush_winfsp_writeback_with_outcome(
         self: &Arc<Self>,
         ino: Ino,
@@ -860,6 +862,7 @@ impl StudioVfs {
         result
     }
 
+    /// Function $name.
     pub async fn flush_fh(&self, fh: u64) -> VfsResult<()> {
         self.flush_fh_with_outcome(fh).await.map(|_| ())
     }
@@ -948,6 +951,7 @@ impl StudioVfs {
             .await
     }
 
+    /// Function $name.
     pub async fn write_fh_with_local_sync_policy(
         &self,
         fh: u64,

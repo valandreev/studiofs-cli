@@ -1,4 +1,3 @@
-#![allow(missing_docs)]
 //! Scenario registry and lifecycle hooks for mounted E2E runs.
 
 use std::fs;
@@ -35,18 +34,31 @@ use crate::mounted_tree::{
 };
 use crate::report::RunManifest;
 
+/// Constant $name.
 pub const BASIC_MULTI_CLIENT_SMOKE: &str = "basic-multi-client-smoke";
+/// Constant $name.
 pub const POSTGRES_OUTAGE_MULTI_CLIENT_RECOVERY: &str = "postgres-outage-multi-client-recovery";
+/// Constant $name.
 pub const RUSTFS_OUTAGE_MULTI_CLIENT_RECOVERY: &str = "rustfs-outage-multi-client-recovery";
+/// Constant $name.
 pub const MOUNTED_CLIENT_CRASH_RESTART_RECOVERY: &str = "mounted-client-crash-restart-recovery";
+/// Constant $name.
 pub const COLLISION_RENAME_VS_RENAME: &str = "collision-rename-vs-rename";
+/// Constant $name.
 pub const COLLISION_RENAME_VS_UNLINK: &str = "collision-rename-vs-unlink";
+/// Constant $name.
 pub const COLLISION_UNLINK_VS_APPEND: &str = "collision-unlink-vs-append";
+/// Constant $name.
 pub const COLLISION_OVERWRITE_VS_READ: &str = "collision-overwrite-vs-read";
+/// Constant $name.
 pub const COLLISION_MKDIR_RMDIR_VS_CREATE: &str = "collision-mkdir-rmdir-vs-create";
+/// Constant $name.
 pub const COLLISION_READDIR_STAT_DURING_MUTATION: &str = "collision-readdir-stat-during-mutation";
+/// Constant $name.
 pub const MOUNTED_CHAOS_CONVERGENCE: &str = "mounted-chaos-convergence";
+/// Constant $name.
 pub const MOUNTED_FAULT_CHAOS_CONVERGENCE: &str = "mounted-fault-chaos-convergence";
+/// Constant $name.
 pub const MOUNTED_LWW_RECONNECT_CHAOS_CONVERGENCE: &str = "mounted-lww-reconnect-chaos-convergence";
 const SMOKE_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
 const COLLISION_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
@@ -107,131 +119,286 @@ pub(crate) const TEST_PASSING: &str = "__test-passing";
 pub(crate) const TEST_HANGING_RUN: &str = "__test-hanging-run";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Struct $name.
 pub struct ScenarioDefinition {
+    /// Field $name.
     pub name: &'static str,
+    /// Field $name.
     pub description: &'static str,
+    /// Field $name.
     pub requires_studiofs_bin: bool,
+    /// Field $name.
     pub requires_mount: bool,
 }
 
 #[derive(Debug, Clone)]
+/// Struct $name.
 pub struct ScenarioContext {
+    /// Field $name.
     pub run_id: String,
+    /// Field $name.
     pub seed: u64,
+    /// Field $name.
     pub sandbox: PathBuf,
+    /// Field $name.
     pub scenario_dir: PathBuf,
+    /// Field $name.
     pub client_controller_config: Option<ClientControllerConfig>,
 }
 
 #[derive(Debug, Error)]
+/// Enum $name.
 pub enum ScenarioError {
     #[error("scenario I/O failed: {0}")]
+    /// Variant $name.
     Io(#[from] std::io::Error),
     #[error("scenario JSON failed: {0}")]
+    /// Variant $name.
     Json(#[from] serde_json::Error),
     #[error("scenario client controller failed: {0}")]
+    /// Variant $name.
     Client(#[from] ClientControllerError),
     #[error("mounted smoke scenario failed: {primary}; unmount also failed: {cleanup}")]
-    MountedSmokeUnmountAfterFailure { primary: String, cleanup: String },
+    /// Variant $name.
+    MountedSmokeUnmountAfterFailure {
+        /// The primary value.
+        primary: String,
+        /// The cleanup value.
+        cleanup: String,
+    },
     #[error("PostgreSQL outage scenario failed: {primary}; unmount also failed: {cleanup}")]
-    PostgresOutageUnmountAfterFailure { primary: String, cleanup: String },
+    /// Field $name.
+    PostgresOutageUnmountAfterFailure {
+        /// The primary value.
+        primary: String,
+        /// The cleanup value.
+        cleanup: String,
+    },
     #[error("RustFS/S3 outage scenario failed: {primary}; unmount also failed: {cleanup}")]
-    RustfsOutageUnmountAfterFailure { primary: String, cleanup: String },
+    /// Field $name.
+    RustfsOutageUnmountAfterFailure {
+        /// The primary value.
+        primary: String,
+        /// The cleanup value.
+        cleanup: String,
+    },
     #[error(
         "mounted client crash/restart scenario failed: {primary}; unmount also failed: {cleanup}"
     )]
-    CrashRestartUnmountAfterFailure { primary: String, cleanup: String },
+    /// Field $name.
+    CrashRestartUnmountAfterFailure {
+        /// The primary value.
+        primary: String,
+        /// The cleanup value.
+        cleanup: String,
+    },
     #[error("mounted tree validation failed: {0}")]
+    /// Variant $name.
     MountedTree(#[from] MountedTreeError),
     #[error("mounted chaos helper failed: {0}")]
+    /// Variant $name.
     MountedChaosHelper(String),
     #[error("scenario infrastructure failed: {0}")]
+    /// Variant $name.
     Infra(#[from] InfraError),
     #[error("scenario operation log failed: {0}")]
+    /// Variant $name.
     OperationLog(#[from] OperationLogError),
     #[error("PostgreSQL outage scenario requires compose infrastructure")]
+    /// Variant $name.
     MissingComposeInfrastructure,
     #[error("missing E2E run manifest: {path}")]
-    MissingRunManifest { path: PathBuf },
+    /// Field $name.
+    MissingRunManifest {
+        /// The path value.
+        path: PathBuf,
+    },
     #[error("PostgreSQL outage operations rejected {rejected} of {total} expected local writes")]
-    RejectedOutageOperations { rejected: usize, total: usize },
+    /// Field $name.
+    RejectedOutageOperations {
+        /// The rejected value.
+        rejected: usize,
+        /// The total value.
+        total: usize,
+    },
     #[error("peer client observed the RustFS/S3 outage write before recovery: {checksum}")]
-    PeerObservedOutageWrite { checksum: String },
+    /// Field $name.
+    PeerObservedOutageWrite {
+        /// The checksum value.
+        checksum: String,
+    },
     #[error("mounted smoke scenario requires at least {expected} clients, got {actual}")]
-    InsufficientMountedClients { expected: usize, actual: usize },
+    /// Variant $name.
+    InsufficientMountedClients {
+        /// The expected value.
+        expected: usize,
+        /// The actual value.
+        actual: usize,
+    },
     #[error("PostgreSQL outage scenario requires at least {expected} clients, got {actual}")]
-    InsufficientOutageClients { expected: usize, actual: usize },
+    /// Variant $name.
+    InsufficientOutageClients {
+        /// The expected value.
+        expected: usize,
+        /// The actual value.
+        actual: usize,
+    },
     #[error(
         "mounted client crash/restart scenario requires at least {expected} clients, got {actual}"
     )]
-    InsufficientCrashRestartClients { expected: usize, actual: usize },
+    /// Field $name.
+    InsufficientCrashRestartClients {
+        /// The expected value.
+        expected: usize,
+        /// The actual value.
+        actual: usize,
+    },
     #[error("namespace collision scenario requires at least {expected} clients, got {actual}")]
-    InsufficientCollisionClients { expected: usize, actual: usize },
+    /// Field $name.
+    InsufficientCollisionClients {
+        /// The expected value.
+        expected: usize,
+        /// The actual value.
+        actual: usize,
+    },
     #[error("mounted chaos scenario requires at least {expected} clients, got {actual}")]
-    InsufficientChaosClients { expected: usize, actual: usize },
+    /// Field $name.
+    InsufficientChaosClients {
+        /// The expected value.
+        expected: usize,
+        /// The actual value.
+        actual: usize,
+    },
     #[error("mounted fault chaos scenario requires at least {expected} clients, got {actual}")]
-    InsufficientFaultChaosClients { expected: usize, actual: usize },
+    /// Field $name.
+    InsufficientFaultChaosClients {
+        /// The expected value.
+        expected: usize,
+        /// The actual value.
+        actual: usize,
+    },
     #[error(
         "mounted LWW reconnect chaos scenario requires at least {expected} clients, got {actual}"
     )]
-    InsufficientLwwReconnectClients { expected: usize, actual: usize },
+    /// Field $name.
+    InsufficientLwwReconnectClients {
+        /// The expected value.
+        expected: usize,
+        /// The actual value.
+        actual: usize,
+    },
     #[error("namespace collision scenario failed: {primary}; unmount also failed: {cleanup}")]
-    NamespaceCollisionUnmountAfterFailure { primary: String, cleanup: String },
+    /// Field $name.
+    NamespaceCollisionUnmountAfterFailure {
+        /// The primary value.
+        primary: String,
+        /// The cleanup value.
+        cleanup: String,
+    },
     #[error("mounted chaos scenario failed: {primary}; unmount also failed: {cleanup}")]
-    MountedChaosUnmountAfterFailure { primary: String, cleanup: String },
+    /// Variant $name.
+    MountedChaosUnmountAfterFailure {
+        /// The primary value.
+        primary: String,
+        /// The cleanup value.
+        cleanup: String,
+    },
     #[error("mounted fault chaos scenario failed: {primary}; unmount also failed: {cleanup}")]
-    MountedFaultChaosUnmountAfterFailure { primary: String, cleanup: String },
+    /// Field $name.
+    MountedFaultChaosUnmountAfterFailure {
+        /// The primary value.
+        primary: String,
+        /// The cleanup value.
+        cleanup: String,
+    },
     #[error(
         "mounted LWW reconnect chaos scenario failed: {primary}; unmount also failed: {cleanup}"
     )]
-    MountedLwwReconnectUnmountAfterFailure { primary: String, cleanup: String },
+    /// Field $name.
+    MountedLwwReconnectUnmountAfterFailure {
+        /// The primary value.
+        primary: String,
+        /// The cleanup value.
+        cleanup: String,
+    },
     #[error("namespace collision validation failed: {violations:?}")]
+    /// Variant $name.
     NamespaceInvariantViolations {
+        /// Field $name.
         violations: Vec<NamespaceInvariantViolation>,
     },
     #[error("mounted chaos validation failed: {violations:?}")]
+    /// Variant $name.
     MountedChaosInvariantViolations {
+        /// Field $name.
         violations: Vec<NamespaceInvariantViolation>,
     },
     #[error(
         "mounted chaos round {round} timed out after {timeout_ms}ms; pending operations: {pending:?}"
     )]
+    /// Variant $name.
     MountedChaosOperationTimeout {
+        /// Field $name.
         round: usize,
+        /// Field $name.
         timeout_ms: u128,
+        /// Field $name.
         pending: Vec<String>,
     },
     #[error("mounted chaos helper launch failures: {errors:?}")]
-    MountedChaosLaunchFailures { errors: Vec<String> },
+    /// Variant $name.
+    MountedChaosLaunchFailures {
+        /// The errors value.
+        errors: Vec<String>,
+    },
     #[error("mounted fault chaos validation failed: {violations:?}")]
+    /// Variant $name.
     MountedFaultChaosInvariantViolations {
+        /// Field $name.
         violations: Vec<NamespaceInvariantViolation>,
     },
     #[error("mounted LWW reconnect chaos validation failed: {violations:?}")]
+    /// Variant $name.
     MountedLwwReconnectInvariantViolations {
+        /// Field $name.
         violations: Vec<NamespaceInvariantViolation>,
     },
     #[error(
         "mounted LWW reconnect oracle mismatch on {path}: expected {expected_checksum_sha256}, mismatches: {mismatches:?}"
     )]
+    /// Variant $name.
     MountedLwwReconnectOracleMismatch {
+        /// Field $name.
         path: String,
+        /// Field $name.
         expected_checksum_sha256: String,
+        /// Field $name.
         mismatches: Vec<LwwOracleClientResult>,
     },
     #[cfg(test)]
     #[error("namespace collision recording replication failed: {errors:?}")]
-    ReplicationFailure { errors: Vec<String> },
+    /// Variant $name.
+    ReplicationFailure {
+        /// The errors value.
+        errors: Vec<String>,
+    },
 }
 
+/// Trait $name.
 pub trait Scenario: Send {
+    /// Function $name.
     fn definition(&self) -> ScenarioDefinition;
+    /// Function $name.
     fn setup(&self, context: &ScenarioContext) -> Result<(), ScenarioError>;
+    /// Function $name.
     fn run(&self, context: &ScenarioContext) -> Result<(), ScenarioError>;
+    /// Function $name.
     fn validate(&self, context: &ScenarioContext) -> Result<Vec<String>, ScenarioError>;
+    /// Function $name.
     fn cleanup(&self, context: &ScenarioContext) -> Result<(), ScenarioError>;
 }
 
+/// Function $name.
 pub fn available_scenarios() -> Vec<ScenarioDefinition> {
     vec![
         BasicMultiClientSmoke.definition(),
@@ -4358,6 +4525,7 @@ struct LwwOracleReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct LwwOracleClientResult {
     client: String,
     checksum_sha256: Option<String>,

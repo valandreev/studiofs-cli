@@ -21,6 +21,7 @@ use crate::object_store::{
 use crate::scheduler::{SchedulerEventType, SchedulerTraceRecord};
 use crate::{OperationOutcome, ScenarioOperation, ScenarioOperationRecord};
 
+/// Constant $name.
 pub const SIMULATION_COUNTEREXAMPLE_SCHEMA_VERSION: u32 = 2;
 const FAST_SEEDS: &[u64] = &[1, 2, 3];
 const DEEP_SEEDS: &[u64] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
@@ -28,144 +29,231 @@ const CORPUS_SCENARIO: &str = "sfs340-simulation-corpus";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Enum $name.
 pub enum SimulationCorpusKind {
+    /// Variant $name.
     Fast,
+    /// Variant $name.
     Deep,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Enum $name.
 pub enum SimulationScenarioGroup {
+    /// Variant $name.
     NamespaceCollisions,
+    /// Variant $name.
     CrashRestartReplay,
+    /// Variant $name.
     MetadataOutage,
+    /// Variant $name.
     ObjectStoreOutage,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct SimulationCorpusPlan {
+    /// Field $name.
     pub kind: SimulationCorpusKind,
+    /// Field $name.
     pub seeds: Vec<u64>,
+    /// Field $name.
     pub groups: Vec<SimulationGroupPlan>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct SimulationGroupPlan {
+    /// Field $name.
     pub group: SimulationScenarioGroup,
+    /// Field $name.
     pub replay_command: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Struct $name.
 pub struct SimulationCorpusOptions {
+    /// Field $name.
     pub kind: SimulationCorpusKind,
+    /// Field $name.
     pub group: Option<SimulationScenarioGroup>,
+    /// Field $name.
     pub seed: Option<u64>,
+    /// Field $name.
     pub artifact_root: Option<PathBuf>,
+    /// Field $name.
     pub inject_failure: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct SimulationCorpusReport {
+    /// Field $name.
     pub scenario: String,
+    /// Field $name.
     pub kind: SimulationCorpusKind,
+    /// Field $name.
     pub passed: bool,
+    /// Field $name.
     pub total_runs: usize,
+    /// Field $name.
     pub group_reports: Vec<SimulationGroupReport>,
+    /// Field $name.
     pub failures: Vec<SimulationCorpusFailure>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct SimulationGroupReport {
+    /// Field $name.
     pub group: SimulationScenarioGroup,
+    /// Field $name.
     pub seed_reports: Vec<SimulationSeedReport>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct SimulationSeedReport {
+    /// Field $name.
     pub seed: u64,
+    /// Field $name.
     pub passed: bool,
+    /// Field $name.
     pub invariant_checkpoints: usize,
+    /// Field $name.
     pub trace_records: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct SimulationCorpusFailure {
+    /// Field $name.
     pub group: SimulationScenarioGroup,
+    /// Field $name.
     pub seed: u64,
+    /// Field $name.
     pub violated_invariant: String,
+    /// Field $name.
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub counterexample_artifact_path: Option<String>,
     #[serde(skip)]
+    /// Field $name.
     pub replay_evidence: Option<SimulationCounterexampleEvidence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct SimulationCounterexampleArtifact {
+    /// Field $name.
     pub schema_version: u32,
+    /// Field $name.
     pub scenario: String,
+    /// Field $name.
     pub corpus: SimulationCorpusKind,
+    /// Field $name.
     pub group: SimulationScenarioGroup,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub sub_group: Option<String>,
+    /// Field $name.
     pub seed: u64,
+    /// Field $name.
     pub scheduler_trace: Vec<SchedulerTraceRecord>,
+    /// Field $name.
     pub operation_log: Vec<ScenarioOperationRecord>,
+    /// Field $name.
     pub event_trace: Vec<Value>,
+    /// Field $name.
     pub failure: SimulationCounterexampleFailure,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
     pub final_snapshot: Option<Value>,
+    /// Field $name.
     pub replay_command: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct SimulationCounterexampleFailure {
+    /// Field $name.
     pub violated_invariant: String,
+    /// Field $name.
     pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Struct $name.
 pub struct SimulationCounterexampleEvidence {
+    /// Field $name.
     pub sub_group: Option<String>,
+    /// Field $name.
     pub scheduler_trace: Vec<SchedulerTraceRecord>,
+    /// Field $name.
     pub operation_log: Vec<ScenarioOperationRecord>,
+    /// Field $name.
     pub event_trace: Vec<Value>,
+    /// Field $name.
     pub final_snapshot: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
 pub struct SimulationCounterexampleReplayReport {
+    /// Field $name.
     pub reproduced: bool,
+    /// Field $name.
     pub scenario: String,
+    /// Field $name.
     pub corpus: SimulationCorpusKind,
+    /// Field $name.
     pub group: SimulationScenarioGroup,
+    /// Field $name.
     pub seed: u64,
+    /// Field $name.
     pub violated_invariant: String,
+    /// Field $name.
     pub message: String,
 }
 
 #[derive(Debug, Error)]
+/// Enum $name.
 pub enum SimulationCorpusError {
     #[error("simulation client runtime failed: {0}")]
+    /// Variant $name.
     Client(#[from] ClientRuntimeError),
     #[error("object-store simulation failed: {0:?}")]
+    /// Variant $name.
     ObjectStore(ObjectStoreFault),
     #[error("unexpected upload outcome: {0:?}")]
+    /// Variant $name.
     UploadOutcome(UploadOutcome),
     #[error("counterexample artifact failed: {0}")]
+    /// Variant $name.
     Artifact(#[from] CrashReplayArtifactError),
     #[error("simulation counterexample artifact I/O failed: {0}")]
+    /// Variant $name.
     Io(#[from] std::io::Error),
     #[error("simulation counterexample artifact JSON failed: {0}")]
+    /// Variant $name.
     Json(#[from] serde_json::Error),
     #[error("unsupported simulation counterexample artifact schema version {0}")]
+    /// Variant $name.
     UnsupportedSchemaVersion(u32),
     #[error("simulation counterexample replay did not reproduce: {0}")]
+    /// Variant $name.
     ReplayMismatch(String),
     #[error("simulation counterexample artifact path is not valid UTF-8: {path:?}")]
-    InvalidArtifactPath { path: PathBuf },
+    /// Variant $name.
+    InvalidArtifactPath {
+        /// The path value.
+        path: PathBuf,
+    },
 }
 
+/// Function $name.
 pub fn corpus_plan(kind: SimulationCorpusKind) -> SimulationCorpusPlan {
     let seeds = seeds_for(kind).to_vec();
     let groups = ordered_groups()
@@ -187,6 +275,7 @@ pub fn corpus_plan(kind: SimulationCorpusKind) -> SimulationCorpusPlan {
     }
 }
 
+/// Function $name.
 pub fn run_simulation_corpus(
     options: SimulationCorpusOptions,
 ) -> Result<SimulationCorpusReport, SimulationCorpusError> {
@@ -625,6 +714,7 @@ fn write_simulation_counterexample(
     Ok(())
 }
 
+/// Function $name.
 pub fn read_simulation_counterexample(
     path: impl AsRef<Path>,
 ) -> Result<SimulationCounterexampleArtifact, SimulationCorpusError> {
@@ -644,6 +734,7 @@ pub fn read_simulation_counterexample(
     serde_json::from_value(artifact_json).map_err(SimulationCorpusError::Json)
 }
 
+/// Function $name.
 pub fn replay_simulation_counterexample(
     path: impl AsRef<Path>,
 ) -> Result<SimulationCounterexampleReplayReport, SimulationCorpusError> {
@@ -914,6 +1005,7 @@ fn ordered_groups() -> &'static [SimulationScenarioGroup] {
     ]
 }
 
+/// Function $name.
 pub fn corpus_arg(kind: SimulationCorpusKind) -> &'static str {
     match kind {
         SimulationCorpusKind::Fast => "fast",
@@ -921,6 +1013,7 @@ pub fn corpus_arg(kind: SimulationCorpusKind) -> &'static str {
     }
 }
 
+/// Function $name.
 pub fn group_arg(group: SimulationScenarioGroup) -> &'static str {
     match group {
         SimulationScenarioGroup::NamespaceCollisions => "namespace-collisions",

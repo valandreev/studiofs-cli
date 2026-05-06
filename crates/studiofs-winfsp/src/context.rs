@@ -758,6 +758,7 @@ pub struct StudioFsContext {
 }
 
 impl StudioFsContext {
+    /// Function $name.
     pub fn new(
         vfs: Arc<StudioVfs>,
         rt: Handle,
@@ -779,6 +780,7 @@ impl StudioFsContext {
     }
 
     #[cfg(test)]
+    /// Function $name.
     pub fn new_for_tests(
         vfs: Arc<StudioVfs>,
         rt: Arc<tokio::runtime::Runtime>,
@@ -1803,6 +1805,7 @@ pub struct WinfspKernelInvalidator {
 }
 
 impl WinfspKernelInvalidator {
+    /// Function $name.
     pub fn new(queue: Arc<Mutex<Vec<Ino>>>) -> Self {
         Self { queue }
     }

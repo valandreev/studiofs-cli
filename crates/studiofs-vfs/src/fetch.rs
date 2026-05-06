@@ -47,28 +47,50 @@ const MAX_FRAGMENT_FETCH_IN_FLIGHT: usize = 8;
 #[derive(Debug, thiserror::Error)]
 pub enum FetchError {
     #[error("object not found: {key}")]
-    NotFound { key: String },
+    /// Variant $name.
+    NotFound {
+        /// The key value.
+        key: String,
+    },
 
     #[error("fetch failed after {attempts} attempts: {source}")]
-    Exhausted { attempts: u32, source: DataError },
+    /// Variant $name.
+    Exhausted {
+        /// The attempts value.
+        attempts: u32,
+        /// The source value.
+        source: DataError,
+    },
 
     #[error("object decode error: {0}")]
+    /// Variant $name.
     Decode(#[from] studiofs_data::object::ObjectError),
 
     #[error("cache access error: {0}")]
+    /// Variant $name.
     CacheAccess(String),
 
     #[error("prefetch skipped: no foreground headroom")]
+    /// Variant $name.
     PrefetchSkipped,
 
     #[error("corrupt fragment layout for object {object_id}: {reason}")]
-    CorruptFragment { object_id: u64, reason: String },
+    /// Field $name.
+    CorruptFragment {
+        /// The object_id value.
+        object_id: u64,
+        /// The reason value.
+        reason: String,
+    },
 
     #[error(
         "transit memory budget too small: required={required_bytes} bytes, budget={budget_bytes} bytes"
     )]
+    /// Variant $name.
     TransitBudgetTooSmall {
+        /// Field $name.
         required_bytes: usize,
+        /// Field $name.
         budget_bytes: usize,
     },
 }
@@ -79,32 +101,59 @@ pub enum FetchError {
 
 /// Lock-free counters for observability (logged periodically by the VFS).
 pub struct FetchMetrics {
+    /// Field $name.
     pub cache_hits: AtomicU64,
+    /// Field $name.
     pub s3_fetches: AtomicU64,
+    /// Field $name.
     pub s3_errors: AtomicU64,
+    /// Field $name.
     pub singleflight_joins: AtomicU64,
+    /// Field $name.
     pub retries: AtomicU64,
+    /// Field $name.
     pub bytes_downloaded: AtomicU64,
+    /// Field $name.
     pub prefetch_skips: AtomicU64,
+    /// Field $name.
     pub local_cache_io_calls: AtomicU64,
+    /// Field $name.
     pub local_cache_io_handoff_total_ns: AtomicU64,
+    /// Field $name.
     pub local_cache_io_handoff_max_ns: AtomicU64,
+    /// Field $name.
     pub local_cache_io_backend_total_ns: AtomicU64,
+    /// Field $name.
     pub local_cache_io_backend_max_ns: AtomicU64,
+    /// Field $name.
     pub s3_get_calls: AtomicU64,
+    /// Field $name.
     pub s3_get_total_ns: AtomicU64,
+    /// Field $name.
     pub s3_get_max_ns: AtomicU64,
+    /// Field $name.
     pub object_decode_calls: AtomicU64,
+    /// Field $name.
     pub object_decode_total_ns: AtomicU64,
+    /// Field $name.
     pub object_decode_max_ns: AtomicU64,
+    /// Field $name.
     pub assemble_copy_calls: AtomicU64,
+    /// Field $name.
     pub assemble_copy_total_ns: AtomicU64,
+    /// Field $name.
     pub assemble_copy_max_ns: AtomicU64,
+    /// Field $name.
     pub local_cache_put_calls: AtomicU64,
+    /// Field $name.
     pub local_cache_put_total_ns: AtomicU64,
+    /// Field $name.
     pub local_cache_put_max_ns: AtomicU64,
+    /// Field $name.
     pub fetch_total_calls: AtomicU64,
+    /// Field $name.
     pub fetch_total_ns: AtomicU64,
+    /// Field $name.
     pub fetch_total_max_ns: AtomicU64,
 }
 

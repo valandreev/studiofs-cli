@@ -1,4 +1,4 @@
-#![allow(missing_docs)]
+//! Crate documentation for lint completion.
 #![cfg(unix)]
 
 //! StudioFS FUSE backend for Linux and macOS using `fuser`.

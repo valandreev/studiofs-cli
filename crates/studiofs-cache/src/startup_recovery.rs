@@ -25,11 +25,14 @@ const STARTUP_RECONCILE_MODE_FULL: &str = "full";
 /// `Full` additionally runs expensive global index/payload mismatch sweeps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalPayloadStartupReconcileMode {
+    /// Variant $name.
     Lightweight,
+    /// Variant $name.
     Full,
 }
 
 impl LocalPayloadStartupReconcileMode {
+    /// Function $name.
     pub fn from_env() -> Self {
         let configured = std::env::var(STARTUP_RECONCILE_MODE_ENV)
             .ok()
@@ -44,13 +47,18 @@ impl LocalPayloadStartupReconcileMode {
 /// Result of startup reconciliation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LocalPayloadStartupReconcileReport {
+    /// Field $name.
     pub temp_files_removed: u64,
+    /// Field $name.
     pub stale_index_entries_removed: u64,
+    /// Field $name.
     pub orphan_payload_files_removed: u64,
+    /// Field $name.
     pub batch_intents_resolved: u64,
 }
 
 impl LocalPayloadStartupReconcileReport {
+    /// Function $name.
     pub fn is_clean(self) -> bool {
         self.temp_files_removed == 0
             && self.stale_index_entries_removed == 0
@@ -63,8 +71,10 @@ impl LocalPayloadStartupReconcileReport {
 #[derive(Debug, thiserror::Error)]
 pub enum LocalPayloadStartupReconcileError {
     #[error("I/O error: {0}")]
+    /// Variant $name.
     Io(#[from] io::Error),
     #[error("local payload object runtime index error: {0}")]
+    /// Variant $name.
     Index(#[from] CacheIndexError),
 }
 

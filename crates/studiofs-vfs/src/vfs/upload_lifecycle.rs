@@ -119,6 +119,7 @@ impl StudioVfs {
         tokens.remove(&ino);
     }
 
+    /// Function $name.
     pub fn is_shutting_down(&self) -> bool {
         self.shutdown_requested()
             || self.uploader_shutdown_requested()
