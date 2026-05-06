@@ -75,7 +75,7 @@ Required initial run flags and environment:
 | `STUDIOFS_E2E_EXTERNAL_S3_ACCESS_KEY` / `STUDIOFS_TEST_ONLINE_S3_ACCESS_KEY` / `STUDIOFS_S3_ACCESS_KEY` | S3/RustFS access key for `--infra external-env`. |
 | `STUDIOFS_E2E_EXTERNAL_S3_SECRET_KEY` / `STUDIOFS_TEST_ONLINE_S3_SECRET_KEY` / `STUDIOFS_S3_SECRET_KEY` | S3/RustFS secret key for `--infra external-env`. |
 | `STUDIOFS_E2E_EXTERNAL_S3_REGION` / `STUDIOFS_TEST_ONLINE_S3_REGION` / `STUDIOFS_S3_REGION` | Optional S3/RustFS region for `--infra external-env`; defaults to `us-east-1`. |
-| `--timeout <duration>` | Whole-run timeout; per-hook timeouts are derived from it unless overridden later. |
+| `--timeout <duration>` | Reserved manifest field for a future whole-run watchdog. Current mounted safety relies on scenario-local operation/convergence timeouts and cleanup fallbacks. |
 
 The initial runner implements `list`, `run`, and `clean`. Future subcommands
 may add dedicated `preflight` or artifact commands, but those must reuse the
@@ -320,10 +320,21 @@ first three default clients, creates a bounded hot working set, then executes
 multiple concurrent rounds chosen from the same conflict families as the
 focused collision suite: rename/rename, rename/unlink, unlink/append,
 overwrite/read, mkdir/rmdir/create, and readdir/stat during mutation. The
-scenario records each accepted, rejected, or planned operation in
-`operations.ndjson`, writes `mounted-chaos-summary.json` and `validation.json`,
+scenario records each round's planned and started operations in
+`operations.ndjson` before launching mounted worker threads, then records
+accepted or rejected outcomes after workers return. This preserves the intended
+operation set even when a platform filesystem call hangs before the worker can
+report a result. A mounted-chaos worker round has a bounded timeout; on timeout
+the scenario reports the pending operation labels and still enters mounted
+cleanup. The scenario writes `mounted-chaos-summary.json` and `validation.json`,
 and uses only mounted tree convergence plus namespace invariants as the pass
 condition. A failure should be reproducible with the same `--seed`.
+
+Mounted cleanup must not rely only on graceful unmount. If `studiofs umount`
+returns but the mounted process does not exit within the configured process-exit
+timeout, the client controller force-kills the mount process, clears the
+recorded PID, marks the client as killed, and returns the unmount timeout as the
+cleanup error.
 
 `mounted-fault-chaos-convergence` is the deeper product fault-chaos scenario.
 It uses four clients against one shared remote volume. The first three clients

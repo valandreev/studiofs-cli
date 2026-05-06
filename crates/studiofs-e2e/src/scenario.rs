@@ -4,7 +4,7 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::io::{self, Write as _};
 use std::path::PathBuf;
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -85,6 +85,7 @@ const CHAOS_ROUNDS: usize = 12;
 const CHAOS_READ_ATTEMPTS: u32 = 4;
 const CHAOS_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(90);
 const CHAOS_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const CHAOS_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const FAULT_CHAOS_CONFLICT_ROUNDS: usize = 6;
 const FAULT_CHAOS_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(120);
 const FAULT_CHAOS_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -183,6 +184,14 @@ pub enum ScenarioError {
     #[error("mounted chaos validation failed: {violations:?}")]
     MountedChaosInvariantViolations {
         violations: Vec<NamespaceInvariantViolation>,
+    },
+    #[error(
+        "mounted chaos round {round} timed out after {timeout_ms}ms; pending operations: {pending:?}"
+    )]
+    MountedChaosOperationTimeout {
+        round: usize,
+        timeout_ms: u128,
+        pending: Vec<String>,
     },
     #[error("mounted fault chaos validation failed: {violations:?}")]
     MountedFaultChaosInvariantViolations {
@@ -1935,8 +1944,13 @@ fn run_mounted_chaos_body(
     let started = Instant::now();
     let mut operations = Vec::new();
     for round in 0..CHAOS_ROUNDS {
-        let mut round_operations =
-            perform_mounted_chaos_round(context.seed, started, round, &clients);
+        let shuffled = shuffled_clients(context.seed, round, &clients);
+        let tasks = mounted_chaos_tasks(context.seed, round, &shuffled);
+        let planned_operations = planned_mounted_chaos_operations_from_tasks(started, &tasks);
+        write_mounted_chaos_operations(context, &planned_operations)?;
+        let started_operations = started_mounted_chaos_operations_from_tasks(started, &tasks);
+        write_mounted_chaos_operations(context, &started_operations)?;
+        let mut round_operations = run_concurrent_mounted_chaos_operations(started, tasks)?;
         write_mounted_chaos_operations(context, &round_operations)?;
         operations.append(&mut round_operations);
         driver.after_round(round, &clients)?;
@@ -1981,7 +1995,7 @@ fn perform_mounted_chaos_round(
     started: Instant,
     round: usize,
     clients: &[ClientSpec],
-) -> Vec<MountedChaosOperation> {
+) -> Result<Vec<MountedChaosOperation>, ScenarioError> {
     let shuffled = shuffled_clients(seed, round, clients);
     let tasks = mounted_chaos_tasks(seed, round, &shuffled);
     run_concurrent_mounted_chaos_operations(started, tasks)
@@ -2276,27 +2290,86 @@ fn readdir_task(round: usize, order: usize, client: ClientSpec, path: String) ->
 fn run_concurrent_mounted_chaos_operations(
     started: Instant,
     tasks: Vec<MountedChaosTask>,
-) -> Vec<MountedChaosOperation> {
+) -> Result<Vec<MountedChaosOperation>, ScenarioError> {
+    run_concurrent_mounted_chaos_operations_with_timeout(started, tasks, CHAOS_OPERATION_TIMEOUT)
+}
+
+fn run_concurrent_mounted_chaos_operations_with_timeout(
+    started: Instant,
+    tasks: Vec<MountedChaosTask>,
+    timeout: Duration,
+) -> Result<Vec<MountedChaosOperation>, ScenarioError> {
+    let round = tasks.first().map(|task| task.round).unwrap_or_default();
+    let pending = tasks
+        .iter()
+        .map(mounted_chaos_task_label)
+        .collect::<Vec<_>>();
     let barrier = Arc::new(Barrier::new(tasks.len()));
-    let mut handles = Vec::with_capacity(tasks.len());
+    let (tx, rx) = mpsc::channel();
     for task in tasks {
         let barrier = Arc::clone(&barrier);
-        handles.push(thread::spawn(move || {
+        let tx = tx.clone();
+        thread::spawn(move || {
             barrier.wait();
-            record_chaos_fs_operation(started, task)
-        }));
+            let _ = tx.send(record_chaos_fs_operation(started, task));
+        });
     }
+    drop(tx);
 
-    let mut operations = handles
-        .into_iter()
-        .map(|handle| {
-            handle
-                .join()
-                .expect("mounted chaos worker thread should not panic")
-        })
-        .collect::<Vec<_>>();
+    let deadline = Instant::now() + timeout;
+    let mut operations = Vec::with_capacity(pending.len());
+    while operations.len() < pending.len() {
+        let now = Instant::now();
+        if now >= deadline {
+            let completed = operations
+                .iter()
+                .map(|operation: &MountedChaosOperation| mounted_chaos_operation_label(operation))
+                .collect::<std::collections::HashSet<_>>();
+            let pending = pending
+                .into_iter()
+                .filter(|operation| !completed.contains(operation))
+                .collect();
+            return Err(ScenarioError::MountedChaosOperationTimeout {
+                round,
+                timeout_ms: timeout.as_millis(),
+                pending,
+            });
+        }
+        match rx.recv_timeout(deadline.saturating_duration_since(now)) {
+            Ok(operation) => operations.push(operation),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let completed = operations
+                    .iter()
+                    .map(|operation: &MountedChaosOperation| {
+                        mounted_chaos_operation_label(operation)
+                    })
+                    .collect::<std::collections::HashSet<_>>();
+                let pending = pending
+                    .into_iter()
+                    .filter(|operation| !completed.contains(operation))
+                    .collect();
+                return Err(ScenarioError::MountedChaosOperationTimeout {
+                    round,
+                    timeout_ms: timeout.as_millis(),
+                    pending,
+                });
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
     operations.sort_by_key(|operation| (operation.round, operation.order));
-    operations
+    Ok(operations)
+}
+
+fn mounted_chaos_task_label(task: &MountedChaosTask) -> String {
+    format!("{} {} {}", task.client.name, task.operation, task.path)
+}
+
+fn mounted_chaos_operation_label(operation: &MountedChaosOperation) -> String {
+    format!(
+        "{} {} {}",
+        operation.client, operation.operation, operation.path
+    )
 }
 
 fn record_chaos_fs_operation(started: Instant, task: MountedChaosTask) -> MountedChaosOperation {
@@ -2388,6 +2461,45 @@ fn planned_mounted_chaos_round(
             },
         )
         .collect()
+}
+
+fn planned_mounted_chaos_operations_from_tasks(
+    started: Instant,
+    tasks: &[MountedChaosTask],
+) -> Vec<MountedChaosOperation> {
+    tasks
+        .iter()
+        .map(|task| mounted_chaos_operation_from_task(started, task, "planned", None))
+        .collect()
+}
+
+fn started_mounted_chaos_operations_from_tasks(
+    started: Instant,
+    tasks: &[MountedChaosTask],
+) -> Vec<MountedChaosOperation> {
+    tasks
+        .iter()
+        .map(|task| mounted_chaos_operation_from_task(started, task, "started", None))
+        .collect()
+}
+
+fn mounted_chaos_operation_from_task(
+    started: Instant,
+    task: &MountedChaosTask,
+    result: &str,
+    error: Option<String>,
+) -> MountedChaosOperation {
+    MountedChaosOperation {
+        round: task.round,
+        order: task.order,
+        client: task.client.name.clone(),
+        operation: task.operation.to_string(),
+        path: task.path.clone(),
+        shared_operation: task.shared_operation.clone(),
+        result: result.to_string(),
+        timestamp_ms: elapsed_millis_u64(started),
+        error,
+    }
 }
 
 fn shuffled_client_names(seed: u64, round: usize) -> Vec<String> {
@@ -2689,9 +2801,10 @@ fn write_mounted_chaos_operations(
         .with_timestamp_ms(operation.timestamp_ms)
         .with_outcome(mounted_chaos_outcome(operation))
         .with_metadata("round", operation.round.to_string())
-        .with_metadata("operation", operation.operation.clone());
-        if operation.error.is_some() {
-            record = record.with_metadata("result", &operation.result);
+        .with_metadata("operation", operation.operation.clone())
+        .with_metadata("result", &operation.result);
+        if let Some(error) = &operation.error {
+            record = record.with_metadata("error", error);
         }
         append_shared_record(&mut writer, &record)?;
     }
@@ -2708,6 +2821,7 @@ fn mounted_chaos_outcome(operation: &MountedChaosOperation) -> OperationOutcome 
                 .clone()
                 .unwrap_or_else(|| "operation rejected".to_string()),
         },
+        "started" => OperationOutcome::Observed,
         _ => OperationOutcome::Observed,
     }
 }
@@ -3009,7 +3123,7 @@ fn run_mounted_fault_chaos_body(
     let mut operations = Vec::new();
     for round in 0..FAULT_CHAOS_CONFLICT_ROUNDS {
         let mut round_operations =
-            perform_mounted_chaos_round(context.seed, started, round, &warm_clients);
+            perform_mounted_chaos_round(context.seed, started, round, &warm_clients)?;
         for operation in &mut round_operations {
             operation.path = format!("healthy_conflict_burst:{}", operation.path);
         }
@@ -6853,7 +6967,13 @@ mod tests {
 
         let operations =
             read_operation_log(context.scenario_dir.join("operations.ndjson")).unwrap();
-        assert_eq!(operations.len(), CHAOS_ROUNDS * CHAOS_CLIENT_NAMES.len());
+        assert_eq!(
+            operations
+                .iter()
+                .filter(|record| matches!(record.outcome, OperationOutcome::Accepted))
+                .count(),
+            CHAOS_ROUNDS * CHAOS_CLIENT_NAMES.len()
+        );
         assert!(
             operations
                 .iter()
@@ -6865,6 +6985,115 @@ mod tests {
                 .get("round")
                 .is_some_and(|round| round == "0")
         }));
+    }
+
+    #[test]
+    fn mounted_chaos_records_planned_and_started_operations_before_round_finishes() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-chaos-started");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(MOUNTED_CHAOS_CONVERGENCE);
+        let clients = CHAOS_CLIENT_NAMES
+            .iter()
+            .copied()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(&mount).unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let mut driver = RecordingMountedChaosDriver::new(clients);
+        let context = ScenarioContext {
+            run_id: "run-chaos-started".to_string(),
+            seed: 360,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+
+        run_mounted_chaos_with_driver(
+            &context,
+            &mut driver,
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+
+        let operations =
+            read_operation_log(context.scenario_dir.join("operations.ndjson")).unwrap();
+        let round_zero = operations
+            .iter()
+            .filter(|record| {
+                record
+                    .metadata
+                    .get("round")
+                    .is_some_and(|round| round == "0")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            round_zero
+                .iter()
+                .any(|record| matches!(record.outcome, OperationOutcome::Planned)),
+            "round must be recorded as planned before any mounted worker can hang"
+        );
+        assert!(
+            round_zero.iter().any(|record| {
+                matches!(record.outcome, OperationOutcome::Observed)
+                    && record
+                        .metadata
+                        .get("result")
+                        .is_some_and(|result| result == "started")
+            }),
+            "round must be recorded as started before waiting for mounted workers"
+        );
+        assert!(
+            round_zero
+                .iter()
+                .any(|record| matches!(record.outcome, OperationOutcome::Accepted)),
+            "successful round must still record accepted results"
+        );
+    }
+
+    #[test]
+    fn mounted_chaos_round_times_out_instead_of_joining_forever() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-chaos-timeout");
+        let mount = temp.path().join("mounts").join("client-a");
+        std::fs::create_dir_all(&mount).unwrap();
+        let client = client_spec_for(&sandbox, "projectfs", "client-a", mount);
+        let task = MountedChaosTask::new(
+            7,
+            1,
+            client,
+            "mounted-only-hang",
+            "chaos/hang.txt",
+            SharedOperation::MountedOnly {
+                name: "mounted-only-hang".to_string(),
+                reason: "test hang".to_string(),
+            },
+            |_client| {
+                thread::sleep(Duration::from_millis(250));
+                Ok(())
+            },
+        );
+        let started = Instant::now();
+
+        let err = run_concurrent_mounted_chaos_operations_with_timeout(
+            started,
+            vec![task],
+            Duration::from_millis(20),
+        )
+        .unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("mounted chaos round 7 timed out"));
+        assert!(message.contains("client-a mounted-only-hang chaos/hang.txt"));
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "timeout must not wait for the hung worker to finish"
+        );
     }
 
     #[test]
