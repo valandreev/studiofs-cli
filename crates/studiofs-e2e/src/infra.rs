@@ -15,6 +15,7 @@ const DEFAULT_WAIT_TIMEOUT_SECS: u64 = 120;
 const HOST_HEALTH_RETRY_DEADLINE: Duration = Duration::from_secs(60);
 const HOST_HEALTH_ATTEMPT_TIMEOUT_SECS: u64 = 2;
 const HOST_HEALTH_RETRY_DELAY: Duration = Duration::from_secs(1);
+const COMPOSE_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_POSTGRES_PORT: u16 = 25_432;
 const DEFAULT_RUSTFS_PORT: u16 = 29_000;
 const DEFAULT_RUSTFS_CONSOLE_PORT: u16 = 29_001;
@@ -563,7 +564,7 @@ impl DockerComposeStack {
         Ok(collected)
     }
 
-    /// Function $name.
+    /// Tears down a previously recorded Docker Compose project.
     pub fn teardown(&self, executor: &dyn CommandExecutor) -> Result<(), InfraError> {
         let mut command = self.compose_command();
         command.args.extend([
@@ -571,7 +572,7 @@ impl DockerComposeStack {
             "--volumes".to_string(),
             "--remove-orphans".to_string(),
         ]);
-        command.timeout = Some(Duration::from_secs(120));
+        command.timeout = Some(COMPOSE_TEARDOWN_TIMEOUT);
         run_success(
             executor,
             "docker compose down --volumes --remove-orphans",
@@ -734,6 +735,23 @@ impl ComposeServiceControl {
         run_success(
             executor,
             &format!("docker compose up --wait {service}"),
+            command,
+        )?;
+        Ok(())
+    }
+
+    /// Tears down the Docker Compose project and removes runner-owned volumes.
+    pub fn teardown(&self, executor: &dyn CommandExecutor) -> Result<(), InfraError> {
+        let mut command = self.compose_command();
+        command.args.extend([
+            "down".to_string(),
+            "--volumes".to_string(),
+            "--remove-orphans".to_string(),
+        ]);
+        command.timeout = Some(COMPOSE_TEARDOWN_TIMEOUT);
+        run_success(
+            executor,
+            "docker compose down --volumes --remove-orphans",
             command,
         )?;
         Ok(())
