@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 fn main() {
     // Required for winfsp delayed loading.
     #[cfg(windows)]

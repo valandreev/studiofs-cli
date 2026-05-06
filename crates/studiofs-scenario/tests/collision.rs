@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 mod common;
 
 use common::seed_order_signatures;

@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 use std::cell::{Cell, RefCell};
 use std::io;
 use std::path::Path;

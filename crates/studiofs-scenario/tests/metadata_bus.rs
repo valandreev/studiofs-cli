@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 use studiofs_scenario::metadata_bus::{
     DeliveryFault, DeliveryOutcome, MetadataBatch, MetadataBus, MetadataEvent, MetadataTraceKind,
 };
