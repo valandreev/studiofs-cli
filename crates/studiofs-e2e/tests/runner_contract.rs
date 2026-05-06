@@ -97,6 +97,7 @@ fn list_scenarios_exposes_namespace_collision_suite() {
         "mounted-chaos-convergence",
         "mounted-fault-chaos-convergence",
         "mounted-lww-reconnect-chaos-convergence",
+        "mounted-open-handle-convergence",
     ] {
         assert!(
             names.contains(&expected),
@@ -318,6 +319,96 @@ fn mounted_chaos_disabled_run_writes_reproducible_artifacts() {
         &record.operation,
         ScenarioOperation::Append { .. } | ScenarioOperation::Write { .. }
     )));
+}
+
+#[test]
+fn mounted_open_handle_disabled_run_writes_reproducible_artifacts() {
+    let temp = tempdir().unwrap();
+    let request = RunRequest {
+        root: temp.path().join("e2e-runs"),
+        run_id: Some("open-handle-contract-run".to_string()),
+        scenarios: vec!["mounted-open-handle-convergence".to_string()],
+        seed: 374,
+        studiofs_bin: None,
+        platform: PlatformSelection::Auto,
+        retention: RetentionPolicy::Always,
+        report: None,
+        port_range: None,
+        timeout: None,
+        infra: InfraMode::Disabled,
+    };
+
+    let outcome = studiofs_e2e::runner::run(request).unwrap();
+
+    assert_eq!(outcome.status, RunStatus::Passed);
+    assert_eq!(outcome.scenarios[0].name, "mounted-open-handle-convergence");
+    assert!(
+        outcome.scenarios[0].artifacts.contains(
+            &"artifacts/scenarios/mounted-open-handle-convergence/mounted-open-handle-summary.json"
+                .to_string()
+        )
+    );
+    assert!(outcome.scenarios[0].artifacts.contains(
+        &"artifacts/scenarios/mounted-open-handle-convergence/validation.json".to_string()
+    ));
+
+    let sandbox = temp
+        .path()
+        .join("e2e-runs")
+        .join("open-handle-contract-run");
+    let summary = read_json(sandbox.join(
+        "artifacts/scenarios/mounted-open-handle-convergence/mounted-open-handle-summary.json",
+    ));
+    assert_eq!(summary["scenario"], "mounted-open-handle-convergence");
+    assert_eq!(summary["clients"], 3);
+    assert!(
+        summary["open_unlink"]["deleted_path_absent"]
+            .as_bool()
+            .unwrap()
+    );
+    assert!(summary["open_rename"]["old_path_absent"].as_bool().unwrap());
+    assert!(
+        summary["open_rename"]["renamed_path_visible"]
+            .as_bool()
+            .unwrap()
+    );
+
+    let operations = read_operation_log(
+        sandbox.join("artifacts/scenarios/mounted-open-handle-convergence/operations.ndjson"),
+    )
+    .unwrap();
+    assert!(operations.iter().any(|record| record.client.is_some()));
+    assert!(operations.iter().any(|record| {
+        matches!(
+            &record.operation,
+            ScenarioOperation::MountedOnly { name, .. } if name == "open_handle"
+        )
+    }));
+    assert!(
+        operations
+            .iter()
+            .any(|record| matches!(&record.operation, ScenarioOperation::Unlink { .. }))
+    );
+    assert!(
+        operations
+            .iter()
+            .any(|record| matches!(&record.operation, ScenarioOperation::Rename { .. }))
+    );
+    assert!(
+        operations
+            .iter()
+            .any(|record| matches!(&record.operation, ScenarioOperation::Flush { .. }))
+    );
+    assert!(
+        operations
+            .iter()
+            .any(|record| matches!(&record.operation, ScenarioOperation::Fsync { .. }))
+    );
+    assert!(
+        operations
+            .iter()
+            .any(|record| matches!(&record.operation, ScenarioOperation::Release { .. }))
+    );
 }
 
 #[test]

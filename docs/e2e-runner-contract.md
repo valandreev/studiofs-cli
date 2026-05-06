@@ -35,6 +35,7 @@ cargo run -p studiofs-e2e -- run postgres-outage-multi-client-recovery --studiof
 cargo run -p studiofs-e2e -- run rustfs-outage-multi-client-recovery --studiofs-bin <path-to-studiofs>
 cargo run -p studiofs-e2e -- run mounted-client-crash-restart-recovery --studiofs-bin <path-to-studiofs>
 cargo run -p studiofs-e2e -- run collision-rename-vs-unlink --studiofs-bin <path-to-studiofs>
+cargo run -p studiofs-e2e -- run mounted-open-handle-convergence --studiofs-bin <path-to-studiofs>
 cargo run -p studiofs-e2e -- run mounted-fault-chaos-convergence --seed 360 --timeout 30m --studiofs-bin <path-to-studiofs>
 cargo run -p studiofs-e2e -- run mounted-lww-reconnect-chaos-convergence --seed 360 --timeout 30m --studiofs-bin <path-to-studiofs>
 cargo run -p studiofs-e2e -- clean
@@ -59,7 +60,7 @@ Required initial run flags and environment:
 | Flag | Contract |
 |---|---|
 | `basic-multi-client-smoke` | Positional shorthand for the mounted three-client happy-path smoke scenario. |
-| `--scenario <name>` | Repeatable. Accepted values include `basic-multi-client-smoke` (`smoke`), `postgres-outage-multi-client-recovery` (`postgres-outage`), `rustfs-outage-multi-client-recovery` (`rustfs-outage`, `s3-outage`), `mounted-client-crash-restart-recovery` (`client-crash-restart`, `crash-restart`), `mounted-chaos-convergence` (`mounted-chaos`, `chaos`), `mounted-fault-chaos-convergence` (`fault-chaos`, `chaos-faults`), `mounted-lww-reconnect-chaos-convergence` (`lww-chaos`, `reconnect-lww`), and the mounted namespace collision scenarios `collision-rename-vs-rename`, `collision-rename-vs-unlink`, `collision-unlink-vs-append`, `collision-overwrite-vs-read`, `collision-mkdir-rmdir-vs-create`, and `collision-readdir-stat-during-mutation`. |
+| `--scenario <name>` | Repeatable. Accepted values include `basic-multi-client-smoke` (`smoke`), `postgres-outage-multi-client-recovery` (`postgres-outage`), `rustfs-outage-multi-client-recovery` (`rustfs-outage`, `s3-outage`), `mounted-client-crash-restart-recovery` (`client-crash-restart`, `crash-restart`), `mounted-open-handle-convergence` (`open-handle`, `open-unlink-rename`), `mounted-chaos-convergence` (`mounted-chaos`, `chaos`), `mounted-fault-chaos-convergence` (`fault-chaos`, `chaos-faults`), `mounted-lww-reconnect-chaos-convergence` (`lww-chaos`, `reconnect-lww`), and the mounted namespace collision scenarios `collision-rename-vs-rename`, `collision-rename-vs-unlink`, `collision-unlink-vs-append`, `collision-overwrite-vs-read`, `collision-mkdir-rmdir-vs-create`, and `collision-readdir-stat-during-mutation`. |
 | `--studiofs-bin <path>` | Path to the product CLI under test. Real mounted scenarios require it when `--infra compose` or `--infra external-env` is used. The runner may build it only when an explicit build flag is added. |
 | `--root <path>` | Parent run directory. Defaults to `target/e2e-runs`. |
 | `--run-id <id>` | Optional stable run ID. If omitted, use an ISO-like UTC timestamp plus short random suffix. Explicit IDs must be safe single directory names: no separators, drive prefixes, traversal segments, leading dots, or other shell/path metacharacters. |
@@ -340,6 +341,20 @@ public mounted-tree convergence loop; the scenario must not inspect private S3,
 PostgreSQL, VFS, cache, or redb state to decide success. It must not delete
 local metadata, rerun `discover`, or share one local metadata database between
 clients during recovery.
+
+`mounted-open-handle-convergence` uses three mounted clients against one shared
+remote volume. `client-a` opens a file handle and keeps it live while
+`client-b` unlinks that path; the open handle then appends, flushes, fsyncs,
+reads back through the handle, and releases. A second case keeps another handle
+open while `client-b` renames the namespace entry, then repeats append, flush,
+fsync, read, and release through the still-open handle. `client-c` is the
+observer for namespace convergence. The pass condition is purely public
+mounted behavior: all clients converge to the same final tree, the unlinked
+path does not resurrect after flush/fsync/release, the old rename source stays
+absent, and the rename destination is visible. The scenario writes
+`operations.ndjson`, `mounted-open-handle-summary.json`, and `validation.json`;
+open-handle lifecycle records use `mounted_only` operations because the
+simulation layer does not model OS file descriptor state.
 
 Mounted namespace collision scenarios use the first three default clients
 against one shared remote volume. Each scenario establishes a bounded initial

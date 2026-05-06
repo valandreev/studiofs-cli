@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::{self, Write as _};
+use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 #[cfg(not(test))]
 use std::process::{Child, Command, Stdio};
@@ -60,6 +60,8 @@ pub const MOUNTED_CHAOS_CONVERGENCE: &str = "mounted-chaos-convergence";
 pub const MOUNTED_FAULT_CHAOS_CONVERGENCE: &str = "mounted-fault-chaos-convergence";
 /// Constant $name.
 pub const MOUNTED_LWW_RECONNECT_CHAOS_CONVERGENCE: &str = "mounted-lww-reconnect-chaos-convergence";
+/// Constant $name.
+pub const MOUNTED_OPEN_HANDLE_CONVERGENCE: &str = "mounted-open-handle-convergence";
 const SMOKE_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
 const COLLISION_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
 const CHAOS_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
@@ -108,6 +110,14 @@ const FAULT_CHAOS_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(25
 const LWW_RECONNECT_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(120);
 const LWW_RECONNECT_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const LWW_RECONNECT_ORACLE_PATH: &str = "lww-chaos/winner.txt";
+const OPEN_HANDLE_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
+const OPEN_HANDLE_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(60);
+const OPEN_HANDLE_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const OPEN_UNLINK_PATH: &str = "open-handles/unlink-target.txt";
+const OPEN_RENAME_PATH: &str = "open-handles/rename-target.txt";
+const OPEN_RENAME_DEST: &str = "open-handles/renamed-target.txt";
+const OPEN_HANDLE_INITIAL_PAYLOAD: &[u8] = b"open handle initial payload\n";
+const OPEN_HANDLE_APPEND_PAYLOAD: &[u8] = b"open handle append payload\n";
 
 #[cfg(test)]
 pub(crate) const TEST_FAILING_VALIDATE: &str = "__test-failing-validate";
@@ -321,6 +331,28 @@ pub enum ScenarioError {
         /// The cleanup value.
         cleanup: String,
     },
+    #[error("mounted open-handle scenario failed: {primary}; unmount also failed: {cleanup}")]
+    /// Field $name.
+    MountedOpenHandleUnmountAfterFailure {
+        /// The primary value.
+        primary: String,
+        /// The cleanup value.
+        cleanup: String,
+    },
+    #[error("mounted open-handle scenario requires at least {expected} clients, got {actual}")]
+    /// Field $name.
+    InsufficientOpenHandleClients {
+        /// The expected value.
+        expected: usize,
+        /// The actual value.
+        actual: usize,
+    },
+    #[error("mounted open-handle validation failed: {checks:?}")]
+    /// Field $name.
+    MountedOpenHandleValidation {
+        /// The checks value.
+        checks: Vec<OpenHandleCheck>,
+    },
     #[error("namespace collision validation failed: {violations:?}")]
     /// Variant $name.
     NamespaceInvariantViolations {
@@ -415,6 +447,7 @@ pub fn available_scenarios() -> Vec<ScenarioDefinition> {
         MountedChaosConvergence.definition(),
         MountedFaultChaosConvergence.definition(),
         MountedLwwReconnectChaosConvergence.definition(),
+        MountedOpenHandleConvergence.definition(),
     ]
 }
 
@@ -456,6 +489,9 @@ pub(crate) fn resolve_scenario(name: &str) -> Option<Box<dyn Scenario>> {
         }
         MOUNTED_LWW_RECONNECT_CHAOS_CONVERGENCE | "lww-chaos" | "reconnect-lww" => {
             Some(Box::new(MountedLwwReconnectChaosConvergence))
+        }
+        MOUNTED_OPEN_HANDLE_CONVERGENCE | "open-handle" | "open-unlink-rename" => {
+            Some(Box::new(MountedOpenHandleConvergence))
         }
         #[cfg(test)]
         TEST_FAILING_VALIDATE => Some(Box::new(TestFailingScenario {
@@ -5342,6 +5378,853 @@ fn write_mounted_lww_reconnect_summary(
 fn lww_reconnect_payload(seed: u64, client: &str, oracle_order: u32) -> Vec<u8> {
     format!("studiofs lww reconnect seed={seed} client={client} oracle_order={oracle_order}\n")
         .into_bytes()
+}
+
+struct MountedOpenHandleConvergence;
+
+impl Scenario for MountedOpenHandleConvergence {
+    fn definition(&self) -> ScenarioDefinition {
+        ScenarioDefinition {
+            name: MOUNTED_OPEN_HANDLE_CONVERGENCE,
+            description: "mounted open-handle convergence: unlink and rename while handles stay open",
+            requires_studiofs_bin: true,
+            requires_mount: true,
+        }
+    }
+
+    fn setup(&self, context: &ScenarioContext) -> Result<(), ScenarioError> {
+        fs::create_dir_all(&context.scenario_dir)?;
+        Ok(())
+    }
+
+    fn run(&self, context: &ScenarioContext) -> Result<(), ScenarioError> {
+        if let Some(config) = &context.client_controller_config {
+            let mut driver = RealOpenHandleDriver(MultiClientController::new(
+                config.clone(),
+                SystemClientProcessExecutor,
+            ));
+            run_open_handle_with_driver(
+                context,
+                &mut driver,
+                OPEN_HANDLE_CONVERGENCE_TIMEOUT,
+                OPEN_HANDLE_CONVERGENCE_POLL_INTERVAL,
+            )?;
+        } else {
+            write_open_handle_plan_artifacts(context)?;
+        }
+        Ok(())
+    }
+
+    fn validate(&self, context: &ScenarioContext) -> Result<Vec<String>, ScenarioError> {
+        let summary_path = context
+            .scenario_dir
+            .join("mounted-open-handle-summary.json");
+        if !summary_path.exists() {
+            return Err(ScenarioError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("missing summary artifact: {}", summary_path.display()),
+            )));
+        }
+        let summary: OpenHandleSummary = serde_json::from_slice(&fs::read(&summary_path)?)?;
+        let validation = json!({
+            "scenario": MOUNTED_OPEN_HANDLE_CONVERGENCE,
+            "run_id": context.run_id,
+            "seed": context.seed,
+            "status": if summary.final_validator.converged && summary.checks.iter().all(|check| check.passed) {
+                "passed"
+            } else {
+                "failed"
+            },
+            "open_unlink": summary.open_unlink,
+            "open_rename": summary.open_rename,
+            "checks": summary.checks,
+            "final_validator": summary.final_validator,
+            "operation_log": summary.operation_log,
+        });
+        fs::write(
+            context.scenario_dir.join("validation.json"),
+            serde_json::to_vec_pretty(&validation)?,
+        )?;
+        Ok(vec![
+            format!(
+                "artifacts/scenarios/{MOUNTED_OPEN_HANDLE_CONVERGENCE}/mounted-open-handle-summary.json"
+            ),
+            format!("artifacts/scenarios/{MOUNTED_OPEN_HANDLE_CONVERGENCE}/validation.json"),
+        ])
+    }
+
+    fn cleanup(&self, _context: &ScenarioContext) -> Result<(), ScenarioError> {
+        Ok(())
+    }
+}
+
+trait OpenHandleDriver {
+    fn bootstrap_volume(
+        &mut self,
+        options: VolumeBootstrapOptions,
+    ) -> Result<VolumeBootstrapSummary, ScenarioError>;
+    fn mount_all(&mut self) -> Result<(), ScenarioError>;
+    fn clients(&self) -> Vec<ClientSpec>;
+    fn after_initial_write(&mut self, _clients: &[ClientSpec]) -> Result<(), ScenarioError> {
+        Ok(())
+    }
+    fn after_namespace_mutation(&mut self, _clients: &[ClientSpec]) -> Result<(), ScenarioError> {
+        Ok(())
+    }
+    fn unmount_all(&mut self) -> Result<(), ScenarioError>;
+}
+
+struct RealOpenHandleDriver(MultiClientController<SystemClientProcessExecutor>);
+
+impl OpenHandleDriver for RealOpenHandleDriver {
+    fn bootstrap_volume(
+        &mut self,
+        options: VolumeBootstrapOptions,
+    ) -> Result<VolumeBootstrapSummary, ScenarioError> {
+        Ok(self.0.bootstrap_volume(options)?)
+    }
+
+    fn mount_all(&mut self) -> Result<(), ScenarioError> {
+        Ok(self.0.mount_all()?)
+    }
+
+    fn clients(&self) -> Vec<ClientSpec> {
+        self.0.clients().into_iter().cloned().collect()
+    }
+
+    fn unmount_all(&mut self) -> Result<(), ScenarioError> {
+        Ok(self.0.unmount_all()?)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct OpenHandleCaseSummary {
+    name: String,
+    handle_client: String,
+    mutator_client: String,
+    observer_client: String,
+    original_path: String,
+    renamed_path: Option<String>,
+    bytes_read_from_open_handle: u64,
+    deleted_path_absent: bool,
+    old_path_absent: bool,
+    renamed_path_visible: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenHandleCheck {
+    name: String,
+    passed: bool,
+    detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct OpenHandleOperation {
+    order: usize,
+    client: String,
+    operation: String,
+    path: String,
+    shared_operation: SharedOperation,
+    result: String,
+    timestamp_ms: u64,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct OpenHandleSummary {
+    scenario: String,
+    bootstrap: Option<VolumeBootstrapSummary>,
+    clients: usize,
+    open_unlink: OpenHandleCaseSummary,
+    open_rename: OpenHandleCaseSummary,
+    operations: Vec<OpenHandleOperation>,
+    operation_log: String,
+    final_validator: TreeComparison,
+    checks: Vec<OpenHandleCheck>,
+}
+
+fn run_open_handle_with_driver(
+    context: &ScenarioContext,
+    driver: &mut dyn OpenHandleDriver,
+    convergence_timeout: Duration,
+    poll_interval: Duration,
+) -> Result<OpenHandleSummary, ScenarioError> {
+    let result = run_open_handle_body(context, driver, convergence_timeout, poll_interval);
+    let unmount_result = driver.unmount_all();
+    match (result, unmount_result) {
+        (Ok(summary), Ok(())) => Ok(summary),
+        (Err(primary), Err(cleanup)) => Err(ScenarioError::MountedOpenHandleUnmountAfterFailure {
+            primary: primary.to_string(),
+            cleanup: cleanup.to_string(),
+        }),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+fn run_open_handle_body(
+    context: &ScenarioContext,
+    driver: &mut dyn OpenHandleDriver,
+    convergence_timeout: Duration,
+    poll_interval: Duration,
+) -> Result<OpenHandleSummary, ScenarioError> {
+    let bootstrap = driver.bootstrap_volume(VolumeBootstrapOptions {
+        client_names: OPEN_HANDLE_CLIENT_NAMES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect(),
+        clean_existing_local_metadata: true,
+    })?;
+    write_bootstrap_summary(context, &bootstrap)?;
+    driver.mount_all()?;
+    let clients = driver.clients();
+    if clients.len() < OPEN_HANDLE_CLIENT_NAMES.len() {
+        return Err(ScenarioError::InsufficientOpenHandleClients {
+            expected: OPEN_HANDLE_CLIENT_NAMES.len(),
+            actual: clients.len(),
+        });
+    }
+    let clients = clients
+        .into_iter()
+        .take(OPEN_HANDLE_CLIENT_NAMES.len())
+        .collect::<Vec<_>>();
+
+    establish_open_handle_initial_tree(&clients[0])?;
+    driver.after_initial_write(&clients)?;
+    wait_for_convergence(
+        &client_mounts(&clients),
+        context.scenario_dir.join("initial-validation"),
+        convergence_timeout,
+        poll_interval,
+    )?;
+
+    let started = Instant::now();
+    let mut operations = Vec::new();
+    let open_unlink = execute_open_unlink_case(started, &clients, &mut operations)?;
+    driver.after_namespace_mutation(&clients)?;
+    let open_rename = execute_open_rename_case(started, &clients, &mut operations)?;
+    driver.after_namespace_mutation(&clients)?;
+    write_open_handle_operations(context, &operations)?;
+    finish_open_handle(OpenHandleFinishInput {
+        context,
+        bootstrap: Some(bootstrap),
+        clients,
+        open_unlink,
+        open_rename,
+        operations,
+        convergence_timeout,
+        poll_interval,
+    })
+}
+
+fn write_open_handle_plan_artifacts(
+    context: &ScenarioContext,
+) -> Result<OpenHandleSummary, ScenarioError> {
+    fs::create_dir_all(&context.scenario_dir)?;
+    let started = Instant::now();
+    let operations = planned_open_handle_operations(started);
+    write_open_handle_operations(context, &operations)?;
+    let open_unlink =
+        planned_open_handle_case("open_unlink", OPEN_UNLINK_PATH, None, true, true, false);
+    let open_rename = planned_open_handle_case(
+        "open_rename",
+        OPEN_RENAME_PATH,
+        Some(OPEN_RENAME_DEST),
+        false,
+        true,
+        true,
+    );
+    let checks = open_handle_checks(&open_unlink, &open_rename, true);
+    let summary = OpenHandleSummary {
+        scenario: MOUNTED_OPEN_HANDLE_CONVERGENCE.to_string(),
+        bootstrap: None,
+        clients: OPEN_HANDLE_CLIENT_NAMES.len(),
+        open_unlink,
+        open_rename,
+        operations,
+        operation_log: format!(
+            "artifacts/scenarios/{MOUNTED_OPEN_HANDLE_CONVERGENCE}/operations.ndjson"
+        ),
+        final_validator: TreeComparison {
+            converged: true,
+            reference_client: Some(OPEN_HANDLE_CLIENT_NAMES[0].to_string()),
+            compared_clients: OPEN_HANDLE_CLIENT_NAMES
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
+            differences: Vec::new(),
+        },
+        checks,
+    };
+    write_open_handle_summary(context, &summary)?;
+    Ok(summary)
+}
+
+fn establish_open_handle_initial_tree(client: &ClientSpec) -> Result<(), ScenarioError> {
+    for relative_path in [OPEN_UNLINK_PATH, OPEN_RENAME_PATH] {
+        let path = client.mount_point.join(relative_path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, OPEN_HANDLE_INITIAL_PAYLOAD)?;
+    }
+    Ok(())
+}
+
+fn execute_open_unlink_case(
+    started: Instant,
+    clients: &[ClientSpec],
+    operations: &mut Vec<OpenHandleOperation>,
+) -> Result<OpenHandleCaseSummary, ScenarioError> {
+    let handle_client = &clients[0];
+    let mutator_client = &clients[1];
+    let observer_client = &clients[2];
+    let mut file = OpenOptions::new()
+        .read(true)
+        .append(true)
+        .open(handle_client.mount_point.join(OPEN_UNLINK_PATH))?;
+    push_open_handle_operation(
+        started,
+        operations,
+        handle_client,
+        "open_handle",
+        OPEN_UNLINK_PATH,
+        SharedOperation::MountedOnly {
+            name: "open_handle".to_string(),
+            reason: "open file handle state is mounted-product behavior".to_string(),
+        },
+    );
+    file.write_all(OPEN_HANDLE_APPEND_PAYLOAD)?;
+    push_open_handle_operation(
+        started,
+        operations,
+        handle_client,
+        "append_open_handle",
+        OPEN_UNLINK_PATH,
+        SharedOperation::Append {
+            path: OPEN_UNLINK_PATH.to_string(),
+            bytes: u64::try_from(OPEN_HANDLE_APPEND_PAYLOAD.len()).unwrap_or(u64::MAX),
+            checksum_sha256: None,
+        },
+    );
+    fs::remove_file(mutator_client.mount_point.join(OPEN_UNLINK_PATH))?;
+    push_open_handle_operation(
+        started,
+        operations,
+        mutator_client,
+        "unlink",
+        OPEN_UNLINK_PATH,
+        SharedOperation::Unlink {
+            path: OPEN_UNLINK_PATH.to_string(),
+        },
+    );
+    file.flush()?;
+    push_open_handle_operation(
+        started,
+        operations,
+        handle_client,
+        "flush",
+        OPEN_UNLINK_PATH,
+        SharedOperation::Flush {
+            path: Some(OPEN_UNLINK_PATH.to_string()),
+        },
+    );
+    file.sync_all()?;
+    push_open_handle_operation(
+        started,
+        operations,
+        handle_client,
+        "fsync",
+        OPEN_UNLINK_PATH,
+        SharedOperation::Fsync {
+            path: OPEN_UNLINK_PATH.to_string(),
+        },
+    );
+    file.seek(SeekFrom::Start(0))?;
+    let mut payload = Vec::new();
+    file.read_to_end(&mut payload)?;
+    push_open_handle_operation(
+        started,
+        operations,
+        handle_client,
+        "read_open_handle",
+        OPEN_UNLINK_PATH,
+        SharedOperation::Read {
+            path: OPEN_UNLINK_PATH.to_string(),
+            bytes: Some(u64::try_from(payload.len()).unwrap_or(u64::MAX)),
+            checksum_sha256: Some(bytes_sha256(&payload)),
+        },
+    );
+    drop(file);
+    push_open_handle_operation(
+        started,
+        operations,
+        handle_client,
+        "release",
+        OPEN_UNLINK_PATH,
+        SharedOperation::Release {
+            path: Some(OPEN_UNLINK_PATH.to_string()),
+        },
+    );
+    let deleted_path_absent = !observer_client.mount_point.join(OPEN_UNLINK_PATH).exists();
+    Ok(OpenHandleCaseSummary {
+        name: "open_unlink".to_string(),
+        handle_client: handle_client.name.clone(),
+        mutator_client: mutator_client.name.clone(),
+        observer_client: observer_client.name.clone(),
+        original_path: OPEN_UNLINK_PATH.to_string(),
+        renamed_path: None,
+        bytes_read_from_open_handle: u64::try_from(payload.len()).unwrap_or(u64::MAX),
+        deleted_path_absent,
+        old_path_absent: deleted_path_absent,
+        renamed_path_visible: false,
+    })
+}
+
+fn execute_open_rename_case(
+    started: Instant,
+    clients: &[ClientSpec],
+    operations: &mut Vec<OpenHandleOperation>,
+) -> Result<OpenHandleCaseSummary, ScenarioError> {
+    let handle_client = &clients[0];
+    let mutator_client = &clients[1];
+    let observer_client = &clients[2];
+    let mut file = OpenOptions::new()
+        .read(true)
+        .append(true)
+        .open(handle_client.mount_point.join(OPEN_RENAME_PATH))?;
+    push_open_handle_operation(
+        started,
+        operations,
+        handle_client,
+        "open_handle",
+        OPEN_RENAME_PATH,
+        SharedOperation::MountedOnly {
+            name: "open_handle".to_string(),
+            reason: "open file handle state is mounted-product behavior".to_string(),
+        },
+    );
+    fs::rename(
+        mutator_client.mount_point.join(OPEN_RENAME_PATH),
+        mutator_client.mount_point.join(OPEN_RENAME_DEST),
+    )?;
+    push_open_handle_operation(
+        started,
+        operations,
+        mutator_client,
+        "rename",
+        &format!("{OPEN_RENAME_PATH} -> {OPEN_RENAME_DEST}"),
+        SharedOperation::Rename {
+            from: OPEN_RENAME_PATH.to_string(),
+            to: OPEN_RENAME_DEST.to_string(),
+        },
+    );
+    file.write_all(OPEN_HANDLE_APPEND_PAYLOAD)?;
+    push_open_handle_operation(
+        started,
+        operations,
+        handle_client,
+        "append_open_handle",
+        OPEN_RENAME_PATH,
+        SharedOperation::Append {
+            path: OPEN_RENAME_PATH.to_string(),
+            bytes: u64::try_from(OPEN_HANDLE_APPEND_PAYLOAD.len()).unwrap_or(u64::MAX),
+            checksum_sha256: None,
+        },
+    );
+    file.flush()?;
+    push_open_handle_operation(
+        started,
+        operations,
+        handle_client,
+        "flush",
+        OPEN_RENAME_PATH,
+        SharedOperation::Flush {
+            path: Some(OPEN_RENAME_PATH.to_string()),
+        },
+    );
+    file.sync_all()?;
+    push_open_handle_operation(
+        started,
+        operations,
+        handle_client,
+        "fsync",
+        OPEN_RENAME_PATH,
+        SharedOperation::Fsync {
+            path: OPEN_RENAME_PATH.to_string(),
+        },
+    );
+    file.seek(SeekFrom::Start(0))?;
+    let mut payload = Vec::new();
+    file.read_to_end(&mut payload)?;
+    push_open_handle_operation(
+        started,
+        operations,
+        handle_client,
+        "read_open_handle",
+        OPEN_RENAME_PATH,
+        SharedOperation::Read {
+            path: OPEN_RENAME_PATH.to_string(),
+            bytes: Some(u64::try_from(payload.len()).unwrap_or(u64::MAX)),
+            checksum_sha256: Some(bytes_sha256(&payload)),
+        },
+    );
+    drop(file);
+    push_open_handle_operation(
+        started,
+        operations,
+        handle_client,
+        "release",
+        OPEN_RENAME_PATH,
+        SharedOperation::Release {
+            path: Some(OPEN_RENAME_PATH.to_string()),
+        },
+    );
+    let old_path_absent = !observer_client.mount_point.join(OPEN_RENAME_PATH).exists();
+    let renamed_path_visible = observer_client.mount_point.join(OPEN_RENAME_DEST).exists();
+    Ok(OpenHandleCaseSummary {
+        name: "open_rename".to_string(),
+        handle_client: handle_client.name.clone(),
+        mutator_client: mutator_client.name.clone(),
+        observer_client: observer_client.name.clone(),
+        original_path: OPEN_RENAME_PATH.to_string(),
+        renamed_path: Some(OPEN_RENAME_DEST.to_string()),
+        bytes_read_from_open_handle: u64::try_from(payload.len()).unwrap_or(u64::MAX),
+        deleted_path_absent: false,
+        old_path_absent,
+        renamed_path_visible,
+    })
+}
+
+struct OpenHandleFinishInput<'a> {
+    context: &'a ScenarioContext,
+    bootstrap: Option<VolumeBootstrapSummary>,
+    clients: Vec<ClientSpec>,
+    open_unlink: OpenHandleCaseSummary,
+    open_rename: OpenHandleCaseSummary,
+    operations: Vec<OpenHandleOperation>,
+    convergence_timeout: Duration,
+    poll_interval: Duration,
+}
+
+fn finish_open_handle(
+    input: OpenHandleFinishInput<'_>,
+) -> Result<OpenHandleSummary, ScenarioError> {
+    let OpenHandleFinishInput {
+        context,
+        bootstrap,
+        clients,
+        mut open_unlink,
+        mut open_rename,
+        operations,
+        convergence_timeout,
+        poll_interval,
+    } = input;
+    let convergence = wait_for_convergence(
+        &client_mounts(&clients),
+        context.scenario_dir.join("validation"),
+        convergence_timeout,
+        poll_interval,
+    )?;
+    open_unlink.deleted_path_absent =
+        snapshots_path_absent(&convergence.snapshots, OPEN_UNLINK_PATH);
+    open_unlink.old_path_absent = open_unlink.deleted_path_absent;
+    open_rename.old_path_absent = snapshots_path_absent(&convergence.snapshots, OPEN_RENAME_PATH);
+    open_rename.renamed_path_visible =
+        snapshots_path_visible(&convergence.snapshots, OPEN_RENAME_DEST);
+    let checks = open_handle_checks(&open_unlink, &open_rename, convergence.comparison.converged);
+    if checks.iter().any(|check| !check.passed) {
+        return Err(ScenarioError::MountedOpenHandleValidation { checks });
+    }
+    let summary = OpenHandleSummary {
+        scenario: MOUNTED_OPEN_HANDLE_CONVERGENCE.to_string(),
+        bootstrap,
+        clients: clients.len(),
+        open_unlink,
+        open_rename,
+        operations,
+        operation_log: format!(
+            "artifacts/scenarios/{MOUNTED_OPEN_HANDLE_CONVERGENCE}/operations.ndjson"
+        ),
+        final_validator: convergence.comparison,
+        checks,
+    };
+    write_open_handle_summary(context, &summary)?;
+    Ok(summary)
+}
+
+fn snapshots_path_absent(
+    snapshots: &[crate::mounted_tree::MountedTreeSnapshot],
+    path: &str,
+) -> bool {
+    snapshots
+        .iter()
+        .all(|snapshot| snapshot.entries.iter().all(|entry| entry.path != path))
+}
+
+fn snapshots_path_visible(
+    snapshots: &[crate::mounted_tree::MountedTreeSnapshot],
+    path: &str,
+) -> bool {
+    !snapshots.is_empty()
+        && snapshots
+            .iter()
+            .all(|snapshot| snapshot.entries.iter().any(|entry| entry.path == path))
+}
+
+fn planned_open_handle_case(
+    name: &str,
+    original_path: &str,
+    renamed_path: Option<&str>,
+    deleted_path_absent: bool,
+    old_path_absent: bool,
+    renamed_path_visible: bool,
+) -> OpenHandleCaseSummary {
+    OpenHandleCaseSummary {
+        name: name.to_string(),
+        handle_client: "client-a".to_string(),
+        mutator_client: "client-b".to_string(),
+        observer_client: "client-c".to_string(),
+        original_path: original_path.to_string(),
+        renamed_path: renamed_path.map(str::to_string),
+        bytes_read_from_open_handle: u64::try_from(
+            OPEN_HANDLE_INITIAL_PAYLOAD.len() + OPEN_HANDLE_APPEND_PAYLOAD.len(),
+        )
+        .unwrap_or(u64::MAX),
+        deleted_path_absent,
+        old_path_absent,
+        renamed_path_visible,
+    }
+}
+
+fn planned_open_handle_operations(started: Instant) -> Vec<OpenHandleOperation> {
+    [
+        (
+            "client-a",
+            "open_handle",
+            OPEN_UNLINK_PATH,
+            SharedOperation::MountedOnly {
+                name: "open_handle".to_string(),
+                reason: "open file handle state is mounted-product behavior".to_string(),
+            },
+        ),
+        (
+            "client-a",
+            "append_open_handle",
+            OPEN_UNLINK_PATH,
+            SharedOperation::Append {
+                path: OPEN_UNLINK_PATH.to_string(),
+                bytes: u64::try_from(OPEN_HANDLE_APPEND_PAYLOAD.len()).unwrap_or(u64::MAX),
+                checksum_sha256: None,
+            },
+        ),
+        (
+            "client-b",
+            "unlink",
+            OPEN_UNLINK_PATH,
+            SharedOperation::Unlink {
+                path: OPEN_UNLINK_PATH.to_string(),
+            },
+        ),
+        (
+            "client-a",
+            "flush",
+            OPEN_UNLINK_PATH,
+            SharedOperation::Flush {
+                path: Some(OPEN_UNLINK_PATH.to_string()),
+            },
+        ),
+        (
+            "client-a",
+            "fsync",
+            OPEN_UNLINK_PATH,
+            SharedOperation::Fsync {
+                path: OPEN_UNLINK_PATH.to_string(),
+            },
+        ),
+        (
+            "client-a",
+            "release",
+            OPEN_UNLINK_PATH,
+            SharedOperation::Release {
+                path: Some(OPEN_UNLINK_PATH.to_string()),
+            },
+        ),
+        (
+            "client-a",
+            "open_handle",
+            OPEN_RENAME_PATH,
+            SharedOperation::MountedOnly {
+                name: "open_handle".to_string(),
+                reason: "open file handle state is mounted-product behavior".to_string(),
+            },
+        ),
+        (
+            "client-b",
+            "rename",
+            OPEN_RENAME_PATH,
+            SharedOperation::Rename {
+                from: OPEN_RENAME_PATH.to_string(),
+                to: OPEN_RENAME_DEST.to_string(),
+            },
+        ),
+        (
+            "client-a",
+            "append_open_handle",
+            OPEN_RENAME_PATH,
+            SharedOperation::Append {
+                path: OPEN_RENAME_PATH.to_string(),
+                bytes: u64::try_from(OPEN_HANDLE_APPEND_PAYLOAD.len()).unwrap_or(u64::MAX),
+                checksum_sha256: None,
+            },
+        ),
+        (
+            "client-a",
+            "flush",
+            OPEN_RENAME_PATH,
+            SharedOperation::Flush {
+                path: Some(OPEN_RENAME_PATH.to_string()),
+            },
+        ),
+        (
+            "client-a",
+            "fsync",
+            OPEN_RENAME_PATH,
+            SharedOperation::Fsync {
+                path: OPEN_RENAME_PATH.to_string(),
+            },
+        ),
+        (
+            "client-a",
+            "release",
+            OPEN_RENAME_PATH,
+            SharedOperation::Release {
+                path: Some(OPEN_RENAME_PATH.to_string()),
+            },
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(
+        |(index, (client, operation, path, shared_operation))| OpenHandleOperation {
+            order: index + 1,
+            client: client.to_string(),
+            operation: operation.to_string(),
+            path: path.to_string(),
+            shared_operation,
+            result: "planned".to_string(),
+            timestamp_ms: elapsed_millis_u64(started),
+            error: None,
+        },
+    )
+    .collect()
+}
+
+fn push_open_handle_operation(
+    started: Instant,
+    operations: &mut Vec<OpenHandleOperation>,
+    client: &ClientSpec,
+    operation: &str,
+    path: &str,
+    shared_operation: SharedOperation,
+) {
+    operations.push(OpenHandleOperation {
+        order: operations.len() + 1,
+        client: client.name.clone(),
+        operation: operation.to_string(),
+        path: path.to_string(),
+        shared_operation,
+        result: "accepted".to_string(),
+        timestamp_ms: elapsed_millis_u64(started),
+        error: None,
+    });
+}
+
+fn open_handle_checks(
+    open_unlink: &OpenHandleCaseSummary,
+    open_rename: &OpenHandleCaseSummary,
+    converged: bool,
+) -> Vec<OpenHandleCheck> {
+    vec![
+        OpenHandleCheck {
+            name: "final_namespace_converged".to_string(),
+            passed: converged,
+            detail: "all mounted clients have the same final namespace".to_string(),
+        },
+        OpenHandleCheck {
+            name: "unlink_deleted_path_absent_after_release".to_string(),
+            passed: open_unlink.deleted_path_absent,
+            detail: OPEN_UNLINK_PATH.to_string(),
+        },
+        OpenHandleCheck {
+            name: "unlink_handle_remained_readable".to_string(),
+            passed: open_unlink.bytes_read_from_open_handle > 0,
+            detail: format!("{} bytes read", open_unlink.bytes_read_from_open_handle),
+        },
+        OpenHandleCheck {
+            name: "rename_old_path_absent_after_release".to_string(),
+            passed: open_rename.old_path_absent,
+            detail: OPEN_RENAME_PATH.to_string(),
+        },
+        OpenHandleCheck {
+            name: "rename_destination_visible_after_release".to_string(),
+            passed: open_rename.renamed_path_visible,
+            detail: OPEN_RENAME_DEST.to_string(),
+        },
+        OpenHandleCheck {
+            name: "rename_handle_remained_readable".to_string(),
+            passed: open_rename.bytes_read_from_open_handle > 0,
+            detail: format!("{} bytes read", open_rename.bytes_read_from_open_handle),
+        },
+    ]
+}
+
+fn write_open_handle_operations(
+    context: &ScenarioContext,
+    operations: &[OpenHandleOperation],
+) -> Result<(), ScenarioError> {
+    let path = operation_log_path(context);
+    let mut writer = OperationLogWriter::open_append(&path)?;
+    for operation in operations {
+        let record = shared_operation_record(
+            &writer,
+            MOUNTED_OPEN_HANDLE_CONVERGENCE,
+            operation.shared_operation.clone(),
+        )
+        .with_client(&operation.client)
+        .with_timestamp_ms(operation.timestamp_ms)
+        .with_outcome(open_handle_outcome(operation))
+        .with_metadata("operation", operation.operation.clone());
+        append_shared_record(&mut writer, &record)?;
+    }
+    Ok(())
+}
+
+fn open_handle_outcome(operation: &OpenHandleOperation) -> OperationOutcome {
+    match operation.result.as_str() {
+        "planned" => OperationOutcome::Planned,
+        "accepted" => OperationOutcome::Accepted,
+        "rejected" => OperationOutcome::Rejected {
+            error: operation
+                .error
+                .clone()
+                .unwrap_or_else(|| "operation rejected".to_string()),
+        },
+        _ => OperationOutcome::Observed,
+    }
+}
+
+fn write_open_handle_summary(
+    context: &ScenarioContext,
+    summary: &OpenHandleSummary,
+) -> Result<(), ScenarioError> {
+    fs::write(
+        context
+            .scenario_dir
+            .join("mounted-open-handle-summary.json"),
+        serde_json::to_vec_pretty(summary)?,
+    )?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
