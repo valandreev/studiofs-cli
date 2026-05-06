@@ -213,6 +213,14 @@ same volume for additional clients with `studiofs discover`, spawns foreground
 mount readiness, and supports graceful `studiofs umount`, forced child-process
 kill, and restart/remount. Scenarios must use this controller rather than
 sharing one local metadata DB or falling back to direct VFS calls.
+Runner-owned foreground CLI commands must be bounded. The controller applies
+per-command timeouts to `studiofs init`, `studiofs discover`, and
+`studiofs umount`, appends captured stdout/stderr to the per-client logs even
+when a command times out, kills the timed-out command process, and reports the
+client name, command action, timeout, executable path, and stdout/stderr log
+paths. If `studiofs umount` itself times out, the controller must still continue
+to the tracked mount-process fallback so cleanup can force-kill the foreground
+mount process and return control to scenario reporting.
 When the compose RustFS endpoint is still settling after Docker reports the
 service healthy, the first `studiofs init` may retry narrowly-classified
 object-store transport failures during bucket creation. The retry window is
@@ -340,7 +348,9 @@ Mounted cleanup must not rely only on graceful unmount. If `studiofs umount`
 returns but the mounted process does not exit within the configured process-exit
 timeout, the client controller force-kills the mount process, clears the
 recorded PID, marks the client as killed, and returns the unmount timeout as the
-cleanup error.
+cleanup error. If the `studiofs umount` command process itself times out, the
+same mount-process force-kill fallback is required and the cleanup error must
+identify the timed-out command and its captured log paths.
 On Windows, `studiofs umount` itself must not report success after requesting
 forced termination unless the mount process is actually signaled as exited.
 

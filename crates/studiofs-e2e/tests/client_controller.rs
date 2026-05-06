@@ -5,9 +5,9 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use studiofs_e2e::client::{
-    ClientCommand, ClientCommandOutput, ClientControllerConfig, ClientControllerError,
-    ClientLifecycleState, ClientProcess, ClientProcessExecutor, MultiClientController, S3Config,
-    VolumeBootstrapOptions,
+    ClientCommand, ClientCommandOutput, ClientCommandTimeouts, ClientControllerConfig,
+    ClientControllerError, ClientLifecycleState, ClientProcess, ClientProcessExecutor,
+    MultiClientController, S3Config, VolumeBootstrapOptions,
 };
 use studiofs_e2e::infra::ServicePort;
 use tempfile::tempdir;
@@ -565,6 +565,39 @@ fn unmount_force_kills_mount_process_when_graceful_exit_times_out() {
 }
 
 #[test]
+fn unmount_force_kills_mount_process_when_umount_command_times_out() {
+    let temp = tempdir().unwrap();
+    let executor = RecordingExecutor {
+        run_timeout_action: Some("umount".to_string()),
+        ..RecordingExecutor::new()
+    };
+    let killed = Rc::clone(&executor.killed);
+    let mut config = test_config(temp.path());
+    config.command_timeouts.umount = Duration::from_millis(20);
+    let mut controller = MultiClientController::new(config, executor);
+    controller.create_clients(["client-a"]).unwrap();
+    controller.init_first_client().unwrap();
+    controller.mount_all().unwrap();
+
+    let err = controller.unmount_all().unwrap_err();
+
+    assert!(matches!(
+        err,
+        ClientControllerError::CommandTimedOut(details)
+            if details.client == "client-a"
+                && details.action == "umount"
+                && details.timeout == Duration::from_millis(20)
+    ));
+    assert_eq!(
+        killed.get(),
+        1,
+        "timed out umount command must still force-kill the tracked mount process"
+    );
+    assert_eq!(controller.clients()[0].state, ClientLifecycleState::Killed);
+    assert!(controller.clients()[0].process_id.is_none());
+}
+
+#[test]
 fn force_kill_then_remount_reuses_same_client_root_without_graceful_umount() {
     let temp = tempdir().unwrap();
     let executor = RecordingExecutor::new();
@@ -688,6 +721,27 @@ fn command_failure_truncates_large_stdout_and_stderr() {
     assert!(message.contains("truncated"));
 }
 
+#[test]
+fn system_executor_times_out_foreground_commands_and_preserves_partial_logs() {
+    let temp = tempdir().unwrap();
+    let command = sleepy_client_command_for_mount_point(temp.path().join("mount"));
+    std::fs::create_dir_all(&command.client_root).unwrap();
+
+    let err = studiofs_e2e::client::SystemClientProcessExecutor
+        .run(&command, Duration::from_millis(300))
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        ClientControllerError::CommandTimedOut(details)
+            if details.action == "sleepy" && details.timeout == Duration::from_millis(300)
+    ));
+    let stdout = std::fs::read_to_string(&command.stdout_log).unwrap();
+    let stderr = std::fs::read_to_string(&command.stderr_log).unwrap();
+    assert!(stdout.contains("partial stdout"));
+    assert!(stderr.contains("partial stderr"));
+}
+
 #[derive(Clone)]
 struct RecordingExecutor {
     calls: Rc<RefCell<Vec<ClientCommand>>>,
@@ -703,6 +757,7 @@ struct RecordingExecutor {
     run_status: Cell<i32>,
     run_stdout: String,
     run_stderr: String,
+    run_timeout_action: Option<String>,
     transient_init_failures_before_success: Cell<usize>,
     permanent_init_failure: Option<String>,
     create_local_metadata_db: bool,
@@ -727,6 +782,7 @@ impl RecordingExecutor {
             run_status: Cell::new(0),
             run_stdout: String::new(),
             run_stderr: String::new(),
+            run_timeout_action: None,
             transient_init_failures_before_success: Cell::new(0),
             permanent_init_failure: None,
             create_local_metadata_db: false,
@@ -738,7 +794,11 @@ impl RecordingExecutor {
 }
 
 impl ClientProcessExecutor for RecordingExecutor {
-    fn run(&self, command: &ClientCommand) -> io::Result<ClientCommandOutput> {
+    fn run(
+        &self,
+        command: &ClientCommand,
+        timeout: Duration,
+    ) -> Result<ClientCommandOutput, ClientControllerError> {
         let volume_name = command
             .args
             .get(1)
@@ -749,9 +809,22 @@ impl ClientProcessExecutor for RecordingExecutor {
                 "{} local metadata dir existed before command: {}",
                 command.client,
                 local_metadata_dir.display()
-            )));
+            ))
+            .into());
         }
         self.calls.borrow_mut().push(command.clone());
+        if self.run_timeout_action.as_deref() == Some(command.action.as_str()) {
+            return Err(ClientControllerError::CommandTimedOut(Box::new(
+                studiofs_e2e::client::ClientCommandTimeoutError {
+                    client: command.client.clone(),
+                    action: command.action.clone(),
+                    timeout,
+                    program: command.program.clone(),
+                    stdout_log: command.stdout_log.clone(),
+                    stderr_log: command.stderr_log.clone(),
+                },
+            )));
+        }
         if command.action == "init" {
             if let Some(stderr) = &self.permanent_init_failure {
                 return Ok(ClientCommandOutput {
@@ -872,6 +945,11 @@ fn test_config(root: &Path) -> ClientControllerConfig {
         init_retry_timeout: Duration::from_millis(200),
         mount_ready_timeout: Duration::from_millis(1),
         mount_exit_timeout: Duration::from_secs(15),
+        command_timeouts: ClientCommandTimeouts {
+            init: Duration::from_millis(200),
+            discover: Duration::from_millis(200),
+            umount: Duration::from_millis(200),
+        },
         poll_interval: Duration::from_millis(20),
         mount_points: Vec::new(),
     }
@@ -888,6 +966,7 @@ fn service_port(service: &str, host_port: u16) -> ServicePort {
 }
 
 fn client_command_for_mount_point(mount_point: std::path::PathBuf) -> ClientCommand {
+    let artifact_dir = mount_point.join("artifacts");
     ClientCommand {
         client: "client-a".to_string(),
         action: "mount".to_string(),
@@ -897,8 +976,24 @@ fn client_command_for_mount_point(mount_point: std::path::PathBuf) -> ClientComm
         client_root: mount_point.join("client-root"),
         cache_dir: mount_point.join("cache"),
         mount_point,
-        stdout_log: Path::new("stdout.log").to_path_buf(),
-        stderr_log: Path::new("stderr.log").to_path_buf(),
-        tracing_log: Path::new("tracing.log").to_path_buf(),
+        stdout_log: artifact_dir.join("stdout.log"),
+        stderr_log: artifact_dir.join("stderr.log"),
+        tracing_log: artifact_dir.join("tracing.log"),
     }
+}
+
+fn sleepy_client_command_for_mount_point(mount_point: std::path::PathBuf) -> ClientCommand {
+    let mut command = client_command_for_mount_point(mount_point);
+    command.action = "sleepy".to_string();
+    command.program = powershell_program().to_string();
+    command.args = vec![
+        "-NoProfile".to_string(),
+        "-Command".to_string(),
+        "Write-Output 'partial stdout'; [Console]::Error.WriteLine('partial stderr'); Start-Sleep -Seconds 5".to_string(),
+    ];
+    command
+}
+
+fn powershell_program() -> &'static str {
+    if cfg!(windows) { "powershell" } else { "pwsh" }
 }
