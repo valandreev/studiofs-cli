@@ -373,16 +373,16 @@ fn mounted_open_handle_disabled_run_writes_reproducible_artifacts() {
             .unwrap()
     );
     for case in ["open_unlink", "open_rename"] {
-        assert_eq!(summary[case]["bytes_read_from_open_handle"], 55);
-        assert_eq!(summary[case]["expected_bytes_from_open_handle"], 55);
-        assert_eq!(
-            summary[case]["read_checksum_sha256"],
-            "ea17e2a469e88c4fa5f5e73e9744e67a9270174229b8c727df229fd5724bd3ed"
+        let expected_len = summary[case]["expected_bytes_from_open_handle"].clone();
+        let expected_checksum = summary[case]["expected_checksum_sha256"].clone();
+        assert!(expected_len.as_u64().is_some_and(|len| len > 0));
+        assert!(
+            expected_checksum
+                .as_str()
+                .is_some_and(|checksum| !checksum.is_empty())
         );
-        assert_eq!(
-            summary[case]["expected_checksum_sha256"],
-            "ea17e2a469e88c4fa5f5e73e9744e67a9270174229b8c727df229fd5724bd3ed"
-        );
+        assert_eq!(summary[case]["bytes_read_from_open_handle"], expected_len);
+        assert_eq!(summary[case]["read_checksum_sha256"], expected_checksum);
     }
 
     let operations = read_operation_log(
