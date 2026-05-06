@@ -141,6 +141,7 @@ cargo run -p studiofs-e2e -- run basic-multi-client-smoke --studiofs-bin target\
 cargo run -p studiofs-e2e -- run rustfs-outage-multi-client-recovery --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run mounted-client-crash-restart-recovery --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run collision-rename-vs-unlink --studiofs-bin target\debug\studiofs.exe
+cargo run -p studiofs-e2e -- run mounted-open-handle-convergence --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run mounted-chaos-convergence --seed 360 --timeout 20m --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run mounted-fault-chaos-convergence --seed 360 --timeout 30m --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run mounted-lww-reconnect-chaos-convergence --seed 360 --timeout 30m --studiofs-bin target\debug\studiofs.exe
@@ -201,6 +202,13 @@ and started operations before launching short-lived operation helper processes,
 then records accepted or rejected results after the helpers return. If a helper
 does not return within the round timeout, the scenario force-terminates pending
 helpers, fails with their operation labels, and still attempts mounted cleanup.
+The `mounted-open-handle-convergence` scenario keeps file handles open while
+another mounted client unlinks or renames the same namespace entry, then
+validates that flush/fsync/release do not resurrect deleted paths and that the
+renamed destination remains visible after convergence. It records the mounted
+open-handle lifecycle in `operations.ndjson`, writes
+`mounted-open-handle-summary.json`, and uses only public mounted-tree
+validation.
 The
 `mounted-fault-chaos-convergence`
 scenario is the next product fault-chaos layer: it mixes a mounted conflict
