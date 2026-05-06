@@ -198,6 +198,8 @@ pub enum ScenarioError {
         timeout_ms: u128,
         pending: Vec<String>,
     },
+    #[error("mounted chaos helper launch failures: {errors:?}")]
+    MountedChaosLaunchFailures { errors: Vec<String> },
     #[error("mounted fault chaos validation failed: {violations:?}")]
     MountedFaultChaosInvariantViolations {
         violations: Vec<NamespaceInvariantViolation>,
@@ -2356,46 +2358,70 @@ fn run_concurrent_mounted_chaos_operations_with_launcher(
     ));
     fs::create_dir_all(&work_dir)?;
     let start_file = work_dir.join("start");
-    let mut processes = tasks
-        .iter()
-        .map(|task| {
+    let result = (|| {
+        let mut processes = Vec::with_capacity(tasks.len());
+        let mut launch_errors = Vec::new();
+        for task in &tasks {
             let label = mounted_chaos_task_label(task);
-            launcher
-                .launch(task, &start_file, &work_dir)
-                .map(|process| LaunchedMountedChaosProcess {
-                    label,
+            match launcher.launch(task, &start_file, &work_dir) {
+                Ok(process) => processes.push(LaunchedMountedChaosProcess {
+                    label: label.clone(),
                     process,
                     done: false,
-                })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    fs::write(&start_file, b"start")?;
-
-    let deadline = Instant::now() + timeout;
-    let mut operations = Vec::with_capacity(processes.len());
-    while operations.len() < processes.len() {
-        for process in processes.iter_mut().filter(|process| !process.done) {
-            if let Some(operation) = process.process.try_collect(started)? {
-                process.done = true;
-                operations.push(operation);
+                }),
+                Err(error) => launch_errors.push(format!("{label}: {error}")),
             }
         }
-        if operations.len() == processes.len() {
-            break;
-        }
-        if Instant::now() >= deadline {
+        if !launch_errors.is_empty() {
             let pending = kill_pending_mounted_chaos_processes(&mut processes);
-            return Err(ScenarioError::MountedChaosOperationTimeout {
-                round,
-                timeout_ms: timeout.as_millis(),
-                pending,
+            if !pending.is_empty() {
+                launch_errors.push(format!(
+                    "launched helpers killed after launch failure: {pending:?}"
+                ));
+            }
+            return Err(ScenarioError::MountedChaosLaunchFailures {
+                errors: launch_errors,
             });
         }
-        thread::sleep(Duration::from_millis(5));
+        fs::write(&start_file, b"start")?;
+
+        let deadline = Instant::now() + timeout;
+        let mut operations = Vec::with_capacity(processes.len());
+        while operations.len() < processes.len() {
+            for process in processes.iter_mut().filter(|process| !process.done) {
+                if let Some(operation) = process.process.try_collect(started)? {
+                    process.done = true;
+                    operations.push(operation);
+                }
+            }
+            if operations.len() == processes.len() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                let pending = kill_pending_mounted_chaos_processes(&mut processes);
+                return Err(ScenarioError::MountedChaosOperationTimeout {
+                    round,
+                    timeout_ms: timeout.as_millis(),
+                    pending,
+                });
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        operations.sort_by_key(|operation| (operation.round, operation.order));
+        Ok(operations)
+    })();
+    match (result, fs::remove_dir_all(&work_dir)) {
+        (Ok(operations), Ok(())) => Ok(operations),
+        (Ok(_), Err(cleanup)) => Err(cleanup.into()),
+        (Err(primary), Ok(())) => Err(primary),
+        (Err(primary), Err(cleanup)) => {
+            eprintln!(
+                "mounted chaos helper work dir cleanup failed after primary error: {}; cleanup: {}",
+                primary, cleanup
+            );
+            Err(primary)
+        }
     }
-    let _ = fs::remove_dir_all(&work_dir);
-    operations.sort_by_key(|operation| (operation.round, operation.order));
-    Ok(operations)
 }
 
 struct LaunchedMountedChaosProcess {
@@ -7373,21 +7399,41 @@ mod tests {
             started.elapsed() < Duration::from_millis(200),
             "timeout must not wait for the hung worker to finish"
         );
+        assert!(
+            launcher.work_dirs().iter().all(|path| !path.exists()),
+            "timeout cleanup must remove the helper work directory"
+        );
     }
 
     struct RecordingMountedChaosProcessLauncher {
         killed: std::rc::Rc<RefCell<Vec<String>>>,
+        work_dirs: std::rc::Rc<RefCell<Vec<PathBuf>>>,
+        fail_launch_orders: Vec<usize>,
     }
 
     impl RecordingMountedChaosProcessLauncher {
         fn pending() -> Self {
             Self {
                 killed: std::rc::Rc::new(RefCell::new(Vec::new())),
+                work_dirs: std::rc::Rc::new(RefCell::new(Vec::new())),
+                fail_launch_orders: Vec::new(),
+            }
+        }
+
+        fn failing_launches(fail_launch_orders: Vec<usize>) -> Self {
+            Self {
+                killed: std::rc::Rc::new(RefCell::new(Vec::new())),
+                work_dirs: std::rc::Rc::new(RefCell::new(Vec::new())),
+                fail_launch_orders,
             }
         }
 
         fn killed_processes(&self) -> Vec<String> {
             self.killed.borrow().clone()
+        }
+
+        fn work_dirs(&self) -> Vec<PathBuf> {
+            self.work_dirs.borrow().clone()
         }
     }
 
@@ -7396,8 +7442,15 @@ mod tests {
             &self,
             task: &MountedChaosTask,
             _start_file: &Path,
-            _work_dir: &Path,
+            work_dir: &Path,
         ) -> Result<Box<dyn MountedChaosProcess>, ScenarioError> {
+            self.work_dirs.borrow_mut().push(work_dir.to_path_buf());
+            if self.fail_launch_orders.contains(&task.order) {
+                return Err(ScenarioError::MountedChaosHelper(format!(
+                    "launch failed for order {}",
+                    task.order
+                )));
+            }
             Ok(Box::new(RecordingMountedChaosProcess {
                 label: mounted_chaos_task_label(task),
                 killed: std::rc::Rc::clone(&self.killed),
@@ -7458,6 +7511,55 @@ mod tests {
         assert_eq!(
             launcher.killed_processes(),
             vec!["client-a stat chaos/blocked.txt".to_string()]
+        );
+        assert!(
+            launcher.work_dirs().iter().all(|path| !path.exists()),
+            "timeout cleanup must remove the helper work directory"
+        );
+    }
+
+    #[test]
+    fn mounted_chaos_launch_failures_collect_all_errors_and_cleanup_started_helpers() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-chaos-launch-failure");
+        let mount = temp.path().join("mounts").join("client-a");
+        std::fs::create_dir_all(&mount).unwrap();
+        let client = client_spec_for(&sandbox, "projectfs", "client-a", mount);
+        let tasks = (1..=3)
+            .map(|order| {
+                let path = format!("chaos/task-{order}.txt");
+                MountedChaosTask::new(
+                    11,
+                    order,
+                    client.clone(),
+                    "stat",
+                    path.clone(),
+                    SharedOperation::Stat { path: path.clone() },
+                    MountedChaosAction::Stat { path },
+                )
+            })
+            .collect::<Vec<_>>();
+        let launcher = RecordingMountedChaosProcessLauncher::failing_launches(vec![2, 3]);
+
+        let err = run_concurrent_mounted_chaos_operations_with_launcher(
+            Instant::now(),
+            tasks,
+            Duration::from_millis(20),
+            &launcher,
+        )
+        .unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("mounted chaos helper launch failures"));
+        assert!(message.contains("client-a stat chaos/task-2.txt"));
+        assert!(message.contains("client-a stat chaos/task-3.txt"));
+        assert_eq!(
+            launcher.killed_processes(),
+            vec!["client-a stat chaos/task-1.txt".to_string()]
+        );
+        assert!(
+            launcher.work_dirs().iter().all(|path| !path.exists()),
+            "launch failure cleanup must remove the helper work directory"
         );
     }
 
