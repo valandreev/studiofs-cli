@@ -5,6 +5,8 @@ mod handle_drain;
 
 use std::ffi::c_void;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use futures::FutureExt;
@@ -41,6 +43,8 @@ const FILE_DIRECTORY_FILE_OPTION: u32 = 0x0000_0001;
 const FILE_READ_DATA_ACCESS: FILE_ACCESS_RIGHTS = 0x0001;
 const FILE_WRITE_DATA_ACCESS: FILE_ACCESS_RIGHTS = 0x0002;
 const FILE_APPEND_DATA_ACCESS: FILE_ACCESS_RIGHTS = 0x0004;
+const FILE_DELETE_CHILD_ACCESS: FILE_ACCESS_RIGHTS = 0x0040;
+const DELETE_ACCESS: FILE_ACCESS_RIGHTS = 0x0001_0000;
 #[cfg(test)]
 const FILE_GENERIC_READ_ACCESS: FILE_ACCESS_RIGHTS = 0x0012_0089;
 #[cfg(test)]
@@ -229,12 +233,19 @@ fn write_local_sync_policy_from_create_options(create_options: u32) -> LocalSync
     LocalSyncPolicy::Opportunistic
 }
 
-fn should_disable_winfsp_file_cache(is_dir: bool, open_flags: OpenFlags) -> bool {
-    !is_dir && (open_flags.contains(OpenFlags::WRONLY) || open_flags.contains(OpenFlags::RDWR))
+fn access_can_mutate_namespace(granted_access: FILE_ACCESS_RIGHTS) -> bool {
+    (granted_access & (DELETE_ACCESS | FILE_DELETE_CHILD_ACCESS)) != 0
 }
 
-fn should_disable_winfsp_file_cache_for_handle(handle: &StudioFileHandle) -> bool {
-    should_disable_winfsp_file_cache(handle.is_dir, handle.open_flags)
+fn should_disable_winfsp_file_cache(
+    is_dir: bool,
+    open_flags: OpenFlags,
+    granted_access: FILE_ACCESS_RIGHTS,
+) -> bool {
+    !is_dir
+        && (open_flags.contains(OpenFlags::WRONLY)
+            || open_flags.contains(OpenFlags::RDWR)
+            || access_can_mutate_namespace(granted_access))
 }
 
 fn set_current_winfsp_open_disable_cache(disable_cache: bool) {
@@ -742,6 +753,8 @@ pub struct StudioFsContext {
     callback_barrier_state: CallbackBarrierState,
     #[cfg(test)]
     _test_runtime: Option<Arc<tokio::runtime::Runtime>>,
+    #[cfg(test)]
+    spawn_wait_calls: AtomicU64,
 }
 
 impl StudioFsContext {
@@ -760,6 +773,8 @@ impl StudioFsContext {
             callback_barrier_state: CallbackBarrierState::new(),
             #[cfg(test)]
             _test_runtime: None,
+            #[cfg(test)]
+            spawn_wait_calls: AtomicU64::new(0),
         })
     }
 
@@ -779,7 +794,13 @@ impl StudioFsContext {
             invalidation_queue,
             callback_barrier_state: CallbackBarrierState::new(),
             _test_runtime: Some(rt),
+            spawn_wait_calls: AtomicU64::new(0),
         }
+    }
+
+    #[cfg(test)]
+    fn spawn_wait_call_count(&self) -> u64 {
+        self.spawn_wait_calls.load(Ordering::SeqCst)
     }
 
     #[cfg(test)]
@@ -998,6 +1019,20 @@ impl StudioFsContext {
         })
     }
 
+    fn execute_rename_callback_plan(&self, plan: RenameCallbackPlan) -> winfsp::Result<()> {
+        let vfs = self.vfs.clone();
+        self.spawn_wait(async move {
+            vfs.rename_async(
+                plan.old_parent,
+                &plan.old_name,
+                plan.new_parent,
+                &plan.new_name,
+            )
+            .await
+        })
+        .map_err(vfs_to_winfsp_err)
+    }
+
     /// Copy the cached security descriptor into the provided buffer.
     /// Returns the full SD length (even if the buffer was smaller).
     fn copy_sd_to_buffer(&self, buf: Option<&mut [c_void]>) -> u64 {
@@ -1031,6 +1066,8 @@ impl StudioFsContext {
         F: std::future::Future<Output = T> + Send + 'static,
         T: SpawnWaitFallback + Send + 'static,
     {
+        #[cfg(test)]
+        self.spawn_wait_calls.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = std::sync::mpsc::sync_channel::<std::thread::Result<T>>(1);
         self.rt.spawn(async move {
             let result = std::panic::AssertUnwindSafe(f).catch_unwind().await;
@@ -1106,7 +1143,8 @@ impl FileSystemContext for StudioFsContext {
         let write_local_sync_policy = write_local_sync_policy_from_create_options(create_options);
         Self::write_open_file_info(file_info, &attr);
         let handle = self.open_file_handle_for_attr(&attr, open_flags, write_local_sync_policy)?;
-        let disable_os_cache = should_disable_winfsp_file_cache_for_handle(&handle);
+        let disable_os_cache =
+            should_disable_winfsp_file_cache(handle.is_dir, handle.open_flags, granted_access);
         set_current_winfsp_open_disable_cache(disable_os_cache);
 
         debug!(
@@ -1149,7 +1187,8 @@ impl FileSystemContext for StudioFsContext {
             extra_buffer_is_reparse_point,
         )?;
         let handle = self.execute_create_callback_plan(plan, file_info)?;
-        let disable_os_cache = should_disable_winfsp_file_cache_for_handle(&handle);
+        let disable_os_cache =
+            should_disable_winfsp_file_cache(handle.is_dir, handle.open_flags, granted_access);
         set_current_winfsp_open_disable_cache(disable_os_cache);
 
         debug!(
@@ -1551,14 +1590,7 @@ impl FileSystemContext for StudioFsContext {
         }
         let plan = self.resolve_rename_callback_plan(file_name, new_file_name)?;
 
-        self.vfs
-            .rename(
-                plan.old_parent,
-                &plan.old_name,
-                plan.new_parent,
-                &plan.new_name,
-            )
-            .map_err(vfs_to_winfsp_err)?;
+        self.execute_rename_callback_plan(plan)?;
 
         debug!(
             "rename {:?} -> {:?}",
@@ -1823,13 +1855,13 @@ impl NotifyingFileSystemContext<Vec<Ino>> for StudioFsContext {
 mod tests {
     use super::is_benign_cleanup_delete_error;
     use super::{
-        CreateCallbackKind, FILE_ACTION_MODIFIED, FILE_APPEND_DATA_ACCESS,
-        FILE_DIRECTORY_FILE_OPTION, FILE_GENERIC_READ_ACCESS, FILE_GENERIC_WRITE_ACCESS,
-        FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
-        FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE, FILE_READ_ATTRIBUTES_ACCESS,
-        FILE_READ_DATA_ACCESS, FILE_WRITE_ATTRIBUTES_ACCESS, FILE_WRITE_DATA_ACCESS,
-        FileSizeCallbackAction, READ_CONTROL_ACCESS, STATUS_ACCESS_DENIED, STATUS_DATA_ERROR,
-        STATUS_EA_TOO_LARGE, STATUS_INVALID_PARAMETER, STATUS_IO_TIMEOUT,
+        CreateCallbackKind, DELETE_ACCESS, FILE_ACTION_MODIFIED, FILE_APPEND_DATA_ACCESS,
+        FILE_DELETE_CHILD_ACCESS, FILE_DIRECTORY_FILE_OPTION, FILE_GENERIC_READ_ACCESS,
+        FILE_GENERIC_WRITE_ACCESS, FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_DIR_NAME,
+        FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE,
+        FILE_READ_ATTRIBUTES_ACCESS, FILE_READ_DATA_ACCESS, FILE_WRITE_ATTRIBUTES_ACCESS,
+        FILE_WRITE_DATA_ACCESS, FileSizeCallbackAction, READ_CONTROL_ACCESS, STATUS_ACCESS_DENIED,
+        STATUS_DATA_ERROR, STATUS_EA_TOO_LARGE, STATUS_INVALID_PARAMETER, STATUS_IO_TIMEOUT,
         STATUS_OBJECT_NAME_NOT_FOUND, SYNCHRONIZE_ACCESS, StudioFileHandle, StudioFsContext,
         WinfspKernelInvalidator, attr_to_file_info, build_basic_info_setattr_args,
         build_notify_info, encode_symlink_reparse, hidden_non_macos_root_path_component,
@@ -1842,6 +1874,7 @@ mod tests {
     use std::collections::BTreeSet;
     use std::sync::Arc;
     use std::sync::Barrier;
+    use std::sync::mpsc;
     use studiofs_data::store::DataStoreConfig;
     use studiofs_meta::{
         CURRENT_FORMAT_VERSION, DirEntryValue, FileType, FormatInfo, Ino, InodeAttr, MetaFormat,
@@ -2006,16 +2039,56 @@ mod tests {
         let flags = open_flags_from_access(read_metadata_access, 0);
 
         assert_eq!(flags.bits(), OpenFlags::RDONLY.bits());
-        assert!(!should_disable_winfsp_file_cache(false, flags));
+        assert!(!should_disable_winfsp_file_cache(
+            false,
+            flags,
+            read_metadata_access
+        ));
     }
 
     #[test]
     fn write_capable_file_handles_disable_winfsp_file_cache() {
-        assert!(!should_disable_winfsp_file_cache(false, OpenFlags::RDONLY));
-        assert!(should_disable_winfsp_file_cache(false, OpenFlags::WRONLY));
-        assert!(should_disable_winfsp_file_cache(false, OpenFlags::RDWR));
-        assert!(!should_disable_winfsp_file_cache(true, OpenFlags::WRONLY));
-        assert!(!should_disable_winfsp_file_cache(true, OpenFlags::RDWR));
+        assert!(!should_disable_winfsp_file_cache(
+            false,
+            OpenFlags::RDONLY,
+            FILE_READ_DATA_ACCESS
+        ));
+        assert!(should_disable_winfsp_file_cache(
+            false,
+            OpenFlags::WRONLY,
+            FILE_WRITE_DATA_ACCESS
+        ));
+        assert!(should_disable_winfsp_file_cache(
+            false,
+            OpenFlags::RDWR,
+            FILE_READ_DATA_ACCESS | FILE_WRITE_DATA_ACCESS
+        ));
+        assert!(!should_disable_winfsp_file_cache(
+            true,
+            OpenFlags::WRONLY,
+            FILE_WRITE_DATA_ACCESS
+        ));
+        assert!(!should_disable_winfsp_file_cache(
+            true,
+            OpenFlags::RDWR,
+            FILE_READ_DATA_ACCESS | FILE_WRITE_DATA_ACCESS
+        ));
+    }
+
+    #[test]
+    fn namespace_mutation_file_handles_disable_winfsp_file_cache() {
+        let delete_only = open_flags_from_access(DELETE_ACCESS, 0);
+        assert_eq!(delete_only.bits(), OpenFlags::RDONLY.bits());
+        assert!(should_disable_winfsp_file_cache(
+            false,
+            delete_only,
+            DELETE_ACCESS
+        ));
+        assert!(!should_disable_winfsp_file_cache(
+            true,
+            delete_only,
+            DELETE_ACCESS | FILE_DELETE_CHILD_ACCESS
+        ));
     }
 
     #[test]
@@ -2197,6 +2270,124 @@ mod tests {
         let dir_delete = VfsError::Meta(MetaError::NotADirectory(42));
         assert!(is_benign_cleanup_delete_error(&dir_delete, true));
         assert!(!is_benign_cleanup_delete_error(&dir_delete, false));
+    }
+
+    #[test]
+    fn rename_callback_enters_context_runtime_for_namespace_mutation() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("rename_runtime_boundary");
+        let attr = vfs
+            .create(ROOT_INO, b"race.txt", 0, 0, 0o644)
+            .expect("create file");
+        let handle = StudioFileHandle::new(attr.ino, false, 0, OpenFlags::RDWR);
+        let old_name = U16CString::from_str(r"\race.txt").expect("old path");
+        let new_name = U16CString::from_str(r"\race-renamed.txt").expect("new path");
+
+        let spawn_wait_calls_before = ctx.spawn_wait_call_count();
+        <StudioFsContext as FileSystemContext>::rename(
+            &ctx,
+            &handle,
+            old_name.as_ucstr(),
+            new_name.as_ucstr(),
+            false,
+        )
+        .expect("rename callback");
+
+        assert!(
+            ctx.spawn_wait_call_count() > spawn_wait_calls_before,
+            "WinFSP rename callback must execute namespace mutation on the context runtime"
+        );
+        assert!(vfs.lookup(ROOT_INO, b"race.txt").is_err());
+        assert!(vfs.lookup(ROOT_INO, b"race-renamed.txt").is_ok());
+    }
+
+    #[test]
+    fn cleanup_delete_file_enters_context_runtime_for_namespace_mutation() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("cleanup_delete_runtime_boundary");
+        let attr = vfs
+            .create(ROOT_INO, b"delete-me.txt", 0, 0, 0o644)
+            .expect("create file");
+        let handle = StudioFileHandle::new(attr.ino, false, 0, OpenFlags::RDWR);
+        let file_name = U16CString::from_str(r"\delete-me.txt").expect("delete path");
+
+        let spawn_wait_calls_before = ctx.spawn_wait_call_count();
+        <StudioFsContext as FileSystemContext>::cleanup(
+            &ctx,
+            &handle,
+            Some(file_name.as_ucstr()),
+            0x01,
+        );
+
+        assert!(
+            ctx.spawn_wait_call_count() > spawn_wait_calls_before,
+            "WinFSP cleanup-delete callback must execute file unlink on the context runtime"
+        );
+        assert!(vfs.lookup(ROOT_INO, b"delete-me.txt").is_err());
+    }
+
+    #[test]
+    fn concurrent_rename_and_cleanup_delete_on_same_file_finish() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("rename_delete_runtime_race");
+        let attr = vfs
+            .create(ROOT_INO, b"race.txt", 0, 0, 0o644)
+            .expect("create file");
+        let ctx = Arc::new(ctx);
+        let start = Arc::new(Barrier::new(3));
+        let (tx, rx) = mpsc::channel();
+
+        let rename_thread = {
+            let ctx = ctx.clone();
+            let start = start.clone();
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let handle = StudioFileHandle::new(attr.ino, false, 0, OpenFlags::RDWR);
+                let old_name = U16CString::from_str(r"\race.txt").expect("old path");
+                let new_name = U16CString::from_str(r"\race-renamed.txt").expect("new path");
+                start.wait();
+                let result = <StudioFsContext as FileSystemContext>::rename(
+                    &ctx,
+                    &handle,
+                    old_name.as_ucstr(),
+                    new_name.as_ucstr(),
+                    false,
+                )
+                .map_err(|error| format!("{error:?}"));
+                tx.send(("rename", result)).expect("send rename result");
+            })
+        };
+
+        let delete_thread = {
+            let ctx = ctx.clone();
+            let start = start.clone();
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let handle = StudioFileHandle::new(attr.ino, false, 0, OpenFlags::RDWR);
+                let file_name = U16CString::from_str(r"\race.txt").expect("delete path");
+                start.wait();
+                <StudioFsContext as FileSystemContext>::cleanup(
+                    &ctx,
+                    &handle,
+                    Some(file_name.as_ucstr()),
+                    0x01,
+                );
+                tx.send(("cleanup", Ok(()))).expect("send cleanup result");
+            })
+        };
+
+        start.wait();
+        drop(tx);
+        for _ in 0..2 {
+            let (_operation, _result) = rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("rename/delete callback should not hang");
+        }
+        rename_thread.join().expect("rename thread");
+        delete_thread.join().expect("delete thread");
+
+        assert!(vfs.lookup(ROOT_INO, b"race.txt").is_err());
+        assert!(
+            ctx.spawn_wait_call_count() >= 2,
+            "both namespace-mutating callbacks should cross the context runtime boundary"
+        );
     }
 
     #[test]

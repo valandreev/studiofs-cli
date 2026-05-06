@@ -640,11 +640,24 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         let output = self.executor.run(&command)?;
         ensure_success(&command, output)?;
         if let Some(process) = self.clients[index].process.as_mut() {
-            wait_for_process_exit(
+            if let Err(error) = wait_for_process_exit(
                 process.as_mut(),
                 self.config.mount_exit_timeout,
                 self.config.poll_interval,
-            )?;
+            ) {
+                let kill_result = process.kill();
+                self.clients[index].process = None;
+                self.clients[index].spec.process_id = None;
+                self.clients[index].spec.state = ClientLifecycleState::Killed;
+                if let Err(kill_error) = kill_result {
+                    debug_log_kill_error(
+                        &self.clients[index].spec.name,
+                        "unmount timeout fallback",
+                        &kill_error,
+                    );
+                }
+                return Err(error);
+            }
         }
         self.clients[index].process = None;
         self.clients[index].spec.process_id = None;

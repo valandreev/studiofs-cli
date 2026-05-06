@@ -434,12 +434,17 @@ impl FlushGatePort for WinfspFlushGatePort<'_> {
 
 impl DeleteCleanupPort for WinfspDeleteCleanupPort<'_> {
     fn cleanup_delete(&self, request: HandleDrainDeleteRequest) {
-        let healed_orphans = if request.is_dir {
-            match self.context.heal_directory_orphans_for_delete(request.ino) {
+        let request_ino = request.ino;
+        let parent_ino = request.parent_ino;
+        let is_dir = request.is_dir;
+        let name = request.name;
+
+        let healed_orphans = if is_dir {
+            match self.context.heal_directory_orphans_for_delete(request_ino) {
                 Ok(count) => count,
                 Err(error) => {
                     warn!(
-                        ino = request.ino,
+                        ino = request_ino,
                         error = ?error,
                         "failed to heal orphan children before directory cleanup delete"
                     );
@@ -450,20 +455,24 @@ impl DeleteCleanupPort for WinfspDeleteCleanupPort<'_> {
             0
         };
 
-        let result = if request.is_dir {
-            self.context.vfs.rmdir(request.parent_ino, &request.name)
+        let result = if is_dir {
+            let vfs = self.context.vfs.clone();
+            self.context
+                .spawn_wait(async move { vfs.rmdir_async(parent_ino, &name).await })
         } else {
-            self.context.vfs.unlink(request.parent_ino, &request.name)
+            let vfs = self.context.vfs.clone();
+            self.context
+                .spawn_wait(async move { vfs.unlink_async(parent_ino, &name).await })
         };
 
         match result {
             Ok(()) => {
-                debug!(ino = request.ino, healed_orphans, "cleanup delete");
+                debug!(ino = request_ino, healed_orphans, "cleanup delete");
             }
-            Err(error) if is_benign_cleanup_delete_error(&error, request.is_dir) => {
+            Err(error) if is_benign_cleanup_delete_error(&error, is_dir) => {
                 debug!(
-                    ino = request.ino,
-                    is_dir = request.is_dir,
+                    ino = request_ino,
+                    is_dir,
                     healed_orphans,
                     error = ?error,
                     "cleanup delete skipped stale race"

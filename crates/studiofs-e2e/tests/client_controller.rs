@@ -504,6 +504,34 @@ fn unmount_waits_for_mount_process_to_exit() {
 }
 
 #[test]
+fn unmount_force_kills_mount_process_when_graceful_exit_times_out() {
+    let temp = tempdir().unwrap();
+    let executor = RecordingExecutor {
+        process_never_exits: true,
+        ..RecordingExecutor::new()
+    };
+    let killed = Rc::clone(&executor.killed);
+    let mut config = test_config(temp.path());
+    config.mount_exit_timeout = Duration::from_millis(20);
+    config.poll_interval = Duration::from_millis(1);
+    let mut controller = MultiClientController::new(config, executor);
+    controller.create_clients(["client-a"]).unwrap();
+    controller.init_first_client().unwrap();
+    controller.mount_all().unwrap();
+
+    let err = controller.unmount_all().unwrap_err();
+
+    assert!(err.to_string().contains("mount process did not exit"));
+    assert_eq!(
+        killed.get(),
+        1,
+        "timed out graceful unmount must force-kill the mount process"
+    );
+    assert_eq!(controller.clients()[0].state, ClientLifecycleState::Killed);
+    assert!(controller.clients()[0].process_id.is_none());
+}
+
+#[test]
 fn force_kill_then_remount_reuses_same_client_root_without_graceful_umount() {
     let temp = tempdir().unwrap();
     let executor = RecordingExecutor::new();
@@ -647,6 +675,7 @@ struct RecordingExecutor {
     create_local_metadata_db: bool,
     fail_if_local_metadata_dir_preexists: bool,
     kill_error_after: Cell<Option<usize>>,
+    process_never_exits: bool,
 }
 
 impl RecordingExecutor {
@@ -670,6 +699,7 @@ impl RecordingExecutor {
             create_local_metadata_db: false,
             fail_if_local_metadata_dir_preexists: false,
             kill_error_after: Cell::new(None),
+            process_never_exits: false,
         }
     }
 }
@@ -736,6 +766,7 @@ impl ClientProcessExecutor for RecordingExecutor {
             wait_calls: Rc::clone(&self.process_wait_calls),
             try_wait_calls: Cell::new(0),
             exit_status: self.process_exit_status.get(),
+            never_exits: self.process_never_exits,
         }))
     }
 
@@ -764,6 +795,7 @@ struct RecordingProcess {
     wait_calls: Rc<Cell<usize>>,
     try_wait_calls: Cell<usize>,
     exit_status: i32,
+    never_exits: bool,
 }
 
 impl ClientProcess for RecordingProcess {
@@ -775,6 +807,9 @@ impl ClientProcess for RecordingProcess {
         self.wait_calls.set(self.wait_calls.get() + 1);
         let calls = self.try_wait_calls.get() + 1;
         self.try_wait_calls.set(calls);
+        if self.never_exits {
+            return Ok(None);
+        }
         Ok((calls > 1).then_some(self.exit_status))
     }
 

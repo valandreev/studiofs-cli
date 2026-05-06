@@ -174,6 +174,15 @@ uses a unique StudioFS volume name per run. This mode does not start, stop, or
 clean external services, so scenarios whose purpose is to stop infrastructure
 services still require `--infra compose`.
 
+For Windows WinFSP external-infra debugging, prefer one mounted scenario per
+command rather than a long PowerShell loop. If a mounted filesystem syscall
+hangs below the runner, a one-scenario command limits the number of live mount
+processes that can be left behind and leaves a smaller artifact set to inspect.
+When a sweep is needed, run it from an outer watchdog that can terminate the
+`studiofs-e2e` process tree and then inspect the newest
+`target/e2e-runs/<run-id>/events.ndjson` and per-client logs before starting the
+next scenario.
+
 The mounted namespace collision scenarios use three
 isolated clients and barrier-start conflicting operations covering
 rename/rename, rename/unlink, unlink/append, overwrite/read, mkdir/rmdir/create,
@@ -185,7 +194,13 @@ seeded product chaos layer: it composes rename/rename, rename/unlink,
 unlink/append, overwrite/read, mkdir/rmdir/create, and readdir/stat mutation
 families across multiple rounds against three real mounted clients, records the
 same `ScenarioOperationRecord` log, and validates final mounted tree
-convergence and namespace invariants. The `mounted-fault-chaos-convergence`
+convergence and namespace invariants. Each mounted-chaos round records planned
+and started operations before launching short-lived operation helper processes,
+then records accepted or rejected results after the helpers return. If a helper
+does not return within the round timeout, the scenario force-terminates pending
+helpers, fails with their operation labels, and still attempts mounted cleanup.
+The
+`mounted-fault-chaos-convergence`
 scenario is the next product fault-chaos layer: it mixes a mounted conflict
 burst with PostgreSQL outage, client force-kill/remount, RustFS/S3 outage, and a
 late cold observer client with a fresh local root/cache. It validates final
