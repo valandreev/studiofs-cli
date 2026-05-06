@@ -2,9 +2,9 @@
 
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead as _, BufReader, Write as _};
+use std::io::{BufRead as _, BufReader, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Component, Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -34,6 +34,7 @@ use crate::scenario::{self, ScenarioContext};
 const SCHEMA_VERSION: u32 = 1;
 const RUNNER_CRATE: &str = "studiofs-e2e";
 const RUNNER_MARKER_FILE: &str = ".studiofs-e2e-runner.json";
+const HOOK_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -369,6 +370,8 @@ pub fn run_one(request: RunOneRequest) -> Result<i32, RunnerError> {
         &request.run_id,
         resolved.scenario.as_ref(),
         &context,
+        1,
+        1,
     )?;
     write_scenario_report(&context.scenario_dir, &lifecycle.report)?;
     Ok(if lifecycle.outcome.status == ScenarioStatus::Passed {
@@ -403,12 +406,13 @@ fn run_with_executor_and_mount_lock_dir(
     } else {
         request.scenarios.clone()
     };
-    e2e_progress(&format!(
-        "run {run_id} starting: {} scenario(s), seed={}, infra={:?}",
-        scenario_names.len(),
-        request.seed,
-        request.infra
-    ));
+    e2e_progress_fields(&[
+        ("run", run_id.clone()),
+        ("phase", "starting".to_string()),
+        ("scenarios", scenario_names.len().to_string()),
+        ("seed", request.seed.to_string()),
+        ("infra", format!("{:?}", request.infra)),
+    ]);
     let scenarios = resolve_scenarios(&scenario_names)?;
     if matches!(request.infra, InfraMode::Compose | InfraMode::ExternalEnv)
         && request.studiofs_bin.is_none()
@@ -424,6 +428,11 @@ fn run_with_executor_and_mount_lock_dir(
         }
     }
     let sandbox = root.join(&run_id);
+    e2e_progress_fields(&[
+        ("run", run_id.clone()),
+        ("phase", "sandbox".to_string()),
+        ("sandbox", sandbox.display().to_string()),
+    ]);
     let selected_platform = request.platform.resolved().to_string();
     let infra_mode = request.infra;
     let mut compose_stack = match infra_mode {
@@ -492,10 +501,18 @@ fn run_with_executor_and_mount_lock_dir(
         None
     };
     let prepared_preflight = if let Some(detail) = mount_lock_failure {
-        e2e_progress(&format!("run {run_id} preflight: mount lock failed"));
+        e2e_progress_fields(&[
+            ("run", run_id.clone()),
+            ("stage", "preflight".to_string()),
+            ("phase", "mount_lock_failed".to_string()),
+        ]);
         prepare_failed_mount_lock_preflight(&sandbox, compose_stack.as_ref(), detail)?
     } else {
-        e2e_progress(&format!("run {run_id} preflight: starting"));
+        e2e_progress_fields(&[
+            ("run", run_id.clone()),
+            ("stage", "preflight".to_string()),
+            ("phase", "starting".to_string()),
+        ]);
         prepare_preflight(
             &sandbox,
             infra_mode,
@@ -505,7 +522,11 @@ fn run_with_executor_and_mount_lock_dir(
         )?
     };
     let preflight = prepared_preflight.report;
-    e2e_progress(&format!("run {run_id} preflight: {:?}", preflight.status));
+    e2e_progress_fields(&[
+        ("run", run_id.clone()),
+        ("stage", "preflight".to_string()),
+        ("status", format!("{:?}", preflight.status)),
+    ]);
     allocated_ports = compose_stack
         .as_ref()
         .map(|stack| stack.ports().to_vec())
@@ -549,6 +570,11 @@ fn run_with_executor_and_mount_lock_dir(
             errors: cleanup_errors,
         };
         write_pretty_json(&sandbox.join("cleanup.json"), &cleanup)?;
+        e2e_progress_fields(&[
+            ("run", run_id.clone()),
+            ("stage", "cleanup".to_string()),
+            ("status", format!("{:?}", cleanup.status)),
+        ]);
         return finish_run(FinishRunInput {
             run_id,
             seed: request.seed,
@@ -577,12 +603,12 @@ fn run_with_executor_and_mount_lock_dir(
     let total_scenarios = scenarios.len();
     for (index, resolved) in scenarios.into_iter().enumerate() {
         let definition = resolved.definition;
-        e2e_progress(&format!(
-            "run {run_id} scenario {}/{} {}: starting",
-            index + 1,
-            total_scenarios,
-            definition.name
-        ));
+        e2e_progress_fields(&[
+            ("run", run_id.clone()),
+            ("scenario", format!("{}/{}", index + 1, total_scenarios)),
+            ("scenario_name", definition.name.to_string()),
+            ("phase", "starting".to_string()),
+        ]);
         let lifecycle = if total_scenarios > 1 {
             run_scenario_child_with_timeout(
                 &sandbox,
@@ -627,15 +653,16 @@ fn run_with_executor_and_mount_lock_dir(
                 resolved,
                 context,
                 run_deadline,
+                index + 1,
+                total_scenarios,
             )?
         };
-        e2e_progress(&format!(
-            "run {run_id} scenario {}/{} {}: {:?}",
-            index + 1,
-            total_scenarios,
-            definition.name,
-            lifecycle.outcome.status
-        ));
+        e2e_progress_fields(&[
+            ("run", run_id.clone()),
+            ("scenario", format!("{}/{}", index + 1, total_scenarios)),
+            ("scenario_name", definition.name.to_string()),
+            ("status", format!("{:?}", lifecycle.outcome.status)),
+        ]);
         if let Some(cleanup_error) = &lifecycle.cleanup_error {
             cleanup_errors.push(format!("{}: {cleanup_error}", lifecycle.outcome.name));
         }
@@ -657,7 +684,11 @@ fn run_with_executor_and_mount_lock_dir(
         record_event(&events_path, &run_id, None, "run", "finished")?;
     }
     let mut cleanup_actions = Vec::new();
-    e2e_progress(&format!("run {run_id} cleanup: starting"));
+    e2e_progress_fields(&[
+        ("run", run_id.clone()),
+        ("stage", "cleanup".to_string()),
+        ("phase", "starting".to_string()),
+    ]);
     compose_cleanup_guard.collect_into(&mut cleanup_actions, &mut cleanup_errors);
 
     let cleanup = CleanupReport {
@@ -670,6 +701,11 @@ fn run_with_executor_and_mount_lock_dir(
         errors: cleanup_errors,
     };
     write_pretty_json(&sandbox.join("cleanup.json"), &cleanup)?;
+    e2e_progress_fields(&[
+        ("run", run_id.clone()),
+        ("stage", "cleanup".to_string()),
+        ("status", format!("{:?}", cleanup.status)),
+    ]);
 
     let scenario_failed = scenario_outcomes
         .iter()
@@ -1390,9 +1426,18 @@ fn run_scenario_lifecycle_with_timeout(
     resolved: ResolvedScenario,
     context: ScenarioContext,
     deadline: Option<RunDeadline>,
+    scenario_index: usize,
+    scenario_total: usize,
 ) -> Result<ScenarioLifecycleOutcome, RunnerError> {
     let Some(deadline) = deadline else {
-        return run_scenario_lifecycle(events_path, run_id, resolved.scenario.as_ref(), &context);
+        return run_scenario_lifecycle(
+            events_path,
+            run_id,
+            resolved.scenario.as_ref(),
+            &context,
+            scenario_index,
+            scenario_total,
+        );
     };
     let definition = resolved.definition;
     let seed = context.seed;
@@ -1411,6 +1456,8 @@ fn run_scenario_lifecycle_with_timeout(
             &worker_run_id,
             resolved.scenario.as_ref(),
             &context,
+            scenario_index,
+            scenario_total,
         );
         let _ = tx.send(result);
     });
@@ -1426,10 +1473,12 @@ fn run_scenario_lifecycle_with_timeout(
                 "whole-run timeout exceeded after {elapsed_ms}ms (limit {timeout_ms}ms); active scenario {}; active hook {active_hook}; cleanup attempted",
                 definition.name
             );
-            e2e_progress(&format!(
-                "run {run_id} scenario {} timed out in hook {active_hook}",
-                definition.name
-            ));
+            e2e_progress_fields(&[
+                ("run", run_id.clone()),
+                ("scenario_name", definition.name.to_string()),
+                ("hook", active_hook.clone()),
+                ("status", "timed_out".to_string()),
+            ]);
             let _ = record_event(
                 &events_path,
                 &run_id,
@@ -1696,6 +1745,8 @@ fn run_scenario_lifecycle(
     run_id: &str,
     scenario: &dyn scenario::Scenario,
     context: &ScenarioContext,
+    scenario_index: usize,
+    scenario_total: usize,
 ) -> Result<ScenarioLifecycleOutcome, RunnerError> {
     let definition = scenario.definition();
     let started_at = timestamp();
@@ -1711,13 +1762,23 @@ fn run_scenario_lifecycle(
         run_id,
         scenario,
         context,
+        ScenarioProgressContext {
+            operation_log: &operation_log,
+            scenario_index,
+            scenario_total,
+        },
     );
     let cleanup_result = run_hook(
         events_path,
         &mut operation_writer,
         run_id,
-        definition.name,
-        "cleanup",
+        HookContext {
+            scenario: definition.name,
+            hook: "cleanup",
+            scenario_index,
+            scenario_total,
+            operation_log: &operation_log,
+        },
         || scenario.cleanup(context),
     );
 
@@ -1786,55 +1847,304 @@ fn run_scenario_body(
     run_id: &str,
     scenario: &dyn scenario::Scenario,
     context: &ScenarioContext,
+    progress: ScenarioProgressContext<'_>,
 ) -> Result<Vec<String>, RunnerError> {
     let definition = scenario.definition();
     run_hook(
         events_path,
         operation_writer,
         run_id,
-        definition.name,
-        "setup",
+        HookContext {
+            scenario: definition.name,
+            hook: "setup",
+            scenario_index: progress.scenario_index,
+            scenario_total: progress.scenario_total,
+            operation_log: progress.operation_log,
+        },
         || scenario.setup(context),
     )?;
     run_hook(
         events_path,
         operation_writer,
         run_id,
-        definition.name,
-        "run",
+        HookContext {
+            scenario: definition.name,
+            hook: "run",
+            scenario_index: progress.scenario_index,
+            scenario_total: progress.scenario_total,
+            operation_log: progress.operation_log,
+        },
         || scenario.run(context),
     )?;
     run_hook(
         events_path,
         operation_writer,
         run_id,
-        definition.name,
-        "validate",
+        HookContext {
+            scenario: definition.name,
+            hook: "validate",
+            scenario_index: progress.scenario_index,
+            scenario_total: progress.scenario_total,
+            operation_log: progress.operation_log,
+        },
         || scenario.validate(context),
     )
+}
+
+#[derive(Clone, Copy)]
+struct ScenarioProgressContext<'a> {
+    scenario_index: usize,
+    scenario_total: usize,
+    operation_log: &'a Path,
+}
+
+#[derive(Clone, Copy)]
+struct HookContext<'a> {
+    scenario: &'a str,
+    hook: &'a str,
+    scenario_index: usize,
+    scenario_total: usize,
+    operation_log: &'a Path,
 }
 
 fn run_hook<T>(
     events_path: &Path,
     operation_writer: &mut OperationLogWriter,
     run_id: &str,
-    scenario: &str,
-    hook: &str,
+    hook_context: HookContext<'_>,
     f: impl FnOnce() -> Result<T, scenario::ScenarioError>,
 ) -> Result<T, RunnerError> {
+    let scenario = hook_context.scenario;
+    let hook = hook_context.hook;
     record_event(events_path, run_id, Some(scenario), hook, "started")?;
     record_operation_checkpoint(operation_writer, scenario, hook, "started")?;
-    e2e_progress(&format!(
-        "run {run_id} scenario {scenario} hook {hook}: starting"
-    ));
+    let started = Instant::now();
+    let started_event = format!("{hook}.started");
+    let start_snapshot = HookProgressSnapshot {
+        run_id,
+        scenario_name: scenario,
+        scenario_index: hook_context.scenario_index,
+        scenario_total: hook_context.scenario_total,
+        hook,
+        phase: "started",
+        elapsed: Duration::ZERO,
+        last_event: &started_event,
+        sandbox: events_path.parent(),
+    };
+    let mut stdout = std::io::stdout().lock();
+    write_hook_progress_line(&mut stdout, &start_snapshot)?;
+    let _heartbeat = HookHeartbeat::start(HookHeartbeatInput {
+        run_id: run_id.to_string(),
+        scenario_name: scenario.to_string(),
+        scenario_index: hook_context.scenario_index,
+        scenario_total: hook_context.scenario_total,
+        hook: hook.to_string(),
+        sandbox: events_path.parent().map(Path::to_path_buf),
+        operation_log: hook_context.operation_log.to_path_buf(),
+        interval: HOOK_HEARTBEAT_INTERVAL,
+    });
     let result = f();
     let phase = if result.is_ok() { "finished" } else { "failed" };
-    e2e_progress(&format!(
-        "run {run_id} scenario {scenario} hook {hook}: {phase}"
-    ));
+    let last_event = latest_operation_event(hook_context.operation_log)
+        .unwrap_or_else(|| format!("{hook}.{phase}"));
+    let finish_snapshot = HookProgressSnapshot {
+        run_id,
+        scenario_name: scenario,
+        scenario_index: hook_context.scenario_index,
+        scenario_total: hook_context.scenario_total,
+        hook,
+        phase,
+        elapsed: started.elapsed(),
+        last_event: &last_event,
+        sandbox: events_path.parent(),
+    };
+    let mut stdout = std::io::stdout().lock();
+    write_hook_progress_line(&mut stdout, &finish_snapshot)?;
     record_event(events_path, run_id, Some(scenario), hook, phase)?;
     record_operation_checkpoint(operation_writer, scenario, hook, phase)?;
     Ok(result?)
+}
+
+struct HookHeartbeatInput {
+    run_id: String,
+    scenario_name: String,
+    scenario_index: usize,
+    scenario_total: usize,
+    hook: String,
+    sandbox: Option<PathBuf>,
+    operation_log: PathBuf,
+    interval: Duration,
+}
+
+struct HookHeartbeat {
+    stop: Sender<()>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl HookHeartbeat {
+    fn start(input: HookHeartbeatInput) -> Self {
+        let started = Instant::now();
+        let (stop, rx) = mpsc::channel();
+        let handle = thread::Builder::new()
+            .name("e2e-heartbeat".to_string())
+            .spawn(move || {
+                loop {
+                    match rx.recv_timeout(input.interval) {
+                        Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                        Err(RecvTimeoutError::Timeout) => {
+                            let last_event = latest_operation_event(&input.operation_log)
+                                .unwrap_or_else(|| format!("{}.started", input.hook));
+                            let snapshot = HookProgressSnapshot {
+                                run_id: &input.run_id,
+                                scenario_name: &input.scenario_name,
+                                scenario_index: input.scenario_index,
+                                scenario_total: input.scenario_total,
+                                hook: &input.hook,
+                                phase: "heartbeat",
+                                elapsed: started.elapsed(),
+                                last_event: &last_event,
+                                sandbox: input.sandbox.as_deref(),
+                            };
+                            let mut stdout = std::io::stdout().lock();
+                            let _ = write_hook_progress_line(&mut stdout, &snapshot);
+                        }
+                    }
+                }
+            })
+            .ok();
+        Self { stop, handle }
+    }
+}
+
+impl Drop for HookHeartbeat {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+struct HookProgressSnapshot<'a> {
+    run_id: &'a str,
+    scenario_name: &'a str,
+    scenario_index: usize,
+    scenario_total: usize,
+    hook: &'a str,
+    phase: &'a str,
+    elapsed: Duration,
+    last_event: &'a str,
+    sandbox: Option<&'a Path>,
+}
+
+fn write_hook_progress_line(
+    mut writer: impl std::io::Write,
+    snapshot: &HookProgressSnapshot<'_>,
+) -> std::io::Result<()> {
+    write!(
+        writer,
+        "[studiofs-e2e][{}] run={} scenario={}/{} scenario_name={} hook={} phase={} elapsed={}s last_event={}",
+        timestamp(),
+        format_progress_value(snapshot.run_id),
+        snapshot.scenario_index,
+        snapshot.scenario_total,
+        format_progress_value(snapshot.scenario_name),
+        format_progress_value(snapshot.hook),
+        format_progress_value(snapshot.phase),
+        snapshot.elapsed.as_secs(),
+        format_progress_value(snapshot.last_event)
+    )?;
+    if let Some(sandbox) = snapshot.sandbox {
+        write!(
+            writer,
+            " sandbox={}",
+            format_progress_value(&sandbox.display().to_string())
+        )?;
+    }
+    writeln!(writer)?;
+    writer.flush()
+}
+
+fn latest_operation_event(path: &Path) -> Option<String> {
+    read_last_nonempty_line(path)
+        .ok()
+        .flatten()
+        .and_then(|line| operation_event_from_line(&line))
+}
+
+fn read_last_nonempty_line(path: &Path) -> std::io::Result<Option<String>> {
+    const TAIL_CHUNK_SIZE: u64 = 8192;
+
+    let mut file = fs::File::open(path)?;
+    let mut position = file.metadata()?.len();
+    let mut tail = Vec::new();
+
+    while position > 0 {
+        let read_len = TAIL_CHUNK_SIZE.min(position);
+        position -= read_len;
+        file.seek(SeekFrom::Start(position))?;
+        let mut chunk = vec![0; usize::try_from(read_len).unwrap_or(usize::MAX)];
+        file.read_exact(&mut chunk)?;
+        chunk.extend_from_slice(&tail);
+        tail = chunk;
+
+        if let Some(line) = last_complete_nonempty_line(&tail, position == 0) {
+            return Ok(Some(line));
+        }
+    }
+
+    Ok(None)
+}
+
+fn last_complete_nonempty_line(bytes: &[u8], at_file_start: bool) -> Option<String> {
+    let end = bytes
+        .iter()
+        .rposition(|byte| !matches!(byte, b'\n' | b'\r' | b' ' | b'\t'))?
+        + 1;
+    let trimmed = &bytes[..end];
+    let start = trimmed
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    if start == 0 && !at_file_start {
+        return None;
+    }
+    let line = String::from_utf8_lossy(&trimmed[start..])
+        .trim_end_matches('\r')
+        .to_string();
+    if line.trim().is_empty() {
+        None
+    } else {
+        Some(line)
+    }
+}
+
+fn operation_event_from_line(line: &str) -> Option<String> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    #[derive(Deserialize)]
+    struct ProgressOperationRecord {
+        sequence: u64,
+        client: Option<String>,
+        operation: OperationTag,
+    }
+
+    #[derive(Deserialize)]
+    struct OperationTag {
+        #[serde(rename = "type")]
+        operation_type: String,
+    }
+
+    let record = serde_json::from_str::<ProgressOperationRecord>(line).ok()?;
+    let operation_type = record.operation.operation_type;
+    let mut event = format!("seq={},op={operation_type}", record.sequence);
+    if let Some(client) = record.client {
+        event.push_str(",client=");
+        event.push_str(&client);
+    }
+    Some(event)
 }
 
 fn record_operation_checkpoint(
@@ -2182,6 +2492,31 @@ fn e2e_progress(message: &str) {
     let _ = std::io::stdout().flush();
 }
 
+fn e2e_progress_fields(fields: &[(&str, String)]) {
+    let mut line = String::new();
+    for (index, (key, value)) in fields.iter().enumerate() {
+        if index > 0 {
+            line.push(' ');
+        }
+        line.push_str(key);
+        line.push('=');
+        line.push_str(&format_progress_value(value));
+    }
+    e2e_progress(&line);
+}
+
+fn format_progress_value(value: &str) -> String {
+    if value.is_empty()
+        || value
+            .chars()
+            .any(|ch| ch.is_whitespace() || matches!(ch, '"' | '\\'))
+    {
+        serde_json::to_string(value).unwrap_or_else(|_| "\"<invalid>\"".to_string())
+    } else {
+        value.to_string()
+    }
+}
+
 fn timestamp() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
@@ -2270,7 +2605,8 @@ mod tests {
         };
         let scenario = FailingValidateScenario::new();
 
-        let outcome = run_scenario_lifecycle(&events_path, "run-1", &scenario, &context).unwrap();
+        let outcome =
+            run_scenario_lifecycle(&events_path, "run-1", &scenario, &context, 1, 1).unwrap();
 
         assert_eq!(outcome.outcome.status, ScenarioStatus::Failed);
         assert!(outcome.report.error.unwrap().contains("validation failed"));
@@ -2361,6 +2697,108 @@ mod tests {
 
         assert!(matches!(err, RunnerError::Io(_)));
         assert!(!missing_parent_event.exists());
+    }
+
+    #[test]
+    fn hook_progress_heartbeat_reports_active_hook_context() {
+        let mut output = Vec::new();
+        let progress = HookProgressSnapshot {
+            run_id: "run-1",
+            scenario_name: "slow-scenario",
+            scenario_index: 13,
+            scenario_total: 13,
+            hook: "run",
+            phase: "heartbeat",
+            elapsed: Duration::from_secs(90),
+            last_event: "run.started",
+            sandbox: Some(Path::new("target/e2e-runs/run-1")),
+        };
+
+        write_hook_progress_line(&mut output, &progress).unwrap();
+
+        let line = String::from_utf8(output).unwrap();
+        assert!(line.contains("run=run-1"));
+        assert!(line.contains("scenario=13/13"));
+        assert!(line.contains("scenario_name=slow-scenario"));
+        assert!(line.contains("hook=run"));
+        assert!(line.contains("phase=heartbeat"));
+        assert!(line.contains("elapsed=90s"));
+        assert!(line.contains("last_event=run.started"));
+        assert!(line.contains("sandbox=target/e2e-runs/run-1"));
+        assert!(line.ends_with('\n'));
+    }
+
+    #[test]
+    fn heartbeat_last_event_uses_latest_operation_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = temp.path().join("operations.ndjson");
+        let mut writer = OperationLogWriter::open_append(&log).unwrap();
+        let record = writer
+            .record(
+                "slow-scenario",
+                ScenarioOperation::Write {
+                    path: "file.bin".to_string(),
+                    offset: Some(0),
+                    bytes: 42,
+                    checksum_sha256: None,
+                },
+            )
+            .with_client("client-a");
+        writer.append_record(&record).unwrap();
+
+        let event = latest_operation_event(&log).unwrap();
+
+        assert_eq!(event, "seq=1,op=write,client=client-a");
+    }
+
+    #[test]
+    fn heartbeat_last_event_reads_only_last_nonempty_operation_line() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = temp.path().join("operations.ndjson");
+        let mut writer = OperationLogWriter::open_append(&log).unwrap();
+        for sequence in 0..600 {
+            let record = writer.record(
+                "slow-scenario",
+                ScenarioOperation::CreateDirectory {
+                    path: format!("dir-{sequence}"),
+                },
+            );
+            writer.append_record(&record).unwrap();
+        }
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log)
+            .unwrap()
+            .write_all(b"\n\n")
+            .unwrap();
+
+        let event = latest_operation_event(&log).unwrap();
+
+        assert_eq!(event, "seq=600,op=create_directory");
+    }
+
+    #[test]
+    fn progress_values_with_spaces_are_quoted() {
+        let mut output = Vec::new();
+        let progress = HookProgressSnapshot {
+            run_id: "run with spaces",
+            scenario_name: "slow scenario",
+            scenario_index: 1,
+            scenario_total: 1,
+            hook: "run",
+            phase: "heartbeat",
+            elapsed: Duration::from_secs(30),
+            last_event: "seq=2,op=write",
+            sandbox: Some(Path::new("target/e2e runs/run 1")),
+        };
+
+        write_hook_progress_line(&mut output, &progress).unwrap();
+
+        let line = String::from_utf8(output).unwrap();
+        assert!(line.contains("run=\"run with spaces\""));
+        assert!(line.contains("scenario_name=\"slow scenario\""));
+        assert!(line.contains("last_event=seq=2,op=write"));
+        assert!(line.contains("sandbox=\"target/e2e runs/run 1\""));
     }
 
     #[cfg(unix)]
