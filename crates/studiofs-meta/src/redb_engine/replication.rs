@@ -1126,6 +1126,91 @@ impl RedbMetaEngine {
         Ok(())
     }
 
+    fn reconcile_serving_rename_from_base_in_txn(
+        txn: &redb::WriteTransaction,
+        parent: Ino,
+        name: &[u8],
+        new_parent: Ino,
+        new_name: &[u8],
+        entry: &DirEntryValue,
+    ) -> MetaResult<()> {
+        let src_in_base = Self::lookup_in_write_table(txn, BASE_DENTRIES_TABLE, parent, name)?
+            .map(|value| value.ino == entry.ino && value.kind == entry.kind)
+            .unwrap_or(false);
+        let dst_in_base =
+            Self::lookup_in_write_table(txn, BASE_DENTRIES_TABLE, new_parent, new_name)?
+                .map(|value| value.ino == entry.ino && value.kind == entry.kind)
+                .unwrap_or(false);
+        let current_key = Self::unique_dentry_key_for_entry_in_write_table(
+            txn,
+            DENTRIES_TABLE,
+            DENTRY_BY_INODE_TABLE,
+            entry,
+            RenameDentryContext {
+                source_parent: parent,
+                source_name: name,
+                destination_parent: new_parent,
+                destination_name: new_name,
+            },
+        )?;
+
+        if let Some(current_key) = current_key.as_ref() {
+            let (current_parent, current_name) = decode_dentry_key(current_key)?;
+            Self::remove_dentry_mirror_in_txn(txn, current_parent, current_name)?;
+        }
+
+        if dst_in_base {
+            Self::remove_dentry_mirror_in_txn(txn, parent, name)?;
+            Self::remove_dentry_mirror_in_txn(txn, new_parent, new_name)?;
+            Self::set_dentry_mirror_in_txn(txn, new_parent, new_name, entry)?;
+        } else if src_in_base {
+            Self::remove_dentry_mirror_in_txn(txn, new_parent, new_name)?;
+            Self::set_dentry_mirror_in_txn(txn, parent, name, entry)?;
+        } else {
+            Self::remove_dentry_mirror_in_txn(txn, parent, name)?;
+            Self::remove_dentry_mirror_in_txn(txn, new_parent, new_name)?;
+        }
+
+        Ok(())
+    }
+
+    /// Reconcile renames in the serving overlay using the authoritative base namespace.
+    pub fn reconcile_serving_renames_from_base<'a>(
+        &self,
+        events: impl IntoIterator<Item = &'a crate::events::MetaEvent>,
+    ) -> MetaResult<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        for event in events {
+            let crate::events::MetaEvent::RenameEntry {
+                parent,
+                name,
+                new_parent,
+                new_name,
+                entry,
+                ..
+            } = event
+            else {
+                continue;
+            };
+            Self::reconcile_serving_rename_from_base_in_txn(
+                &txn,
+                *parent,
+                name,
+                *new_parent,
+                new_name,
+                entry,
+            )?;
+        }
+
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
     /// Reconcile a rename in the serving overlay using the authoritative base namespace.
     pub fn reconcile_serving_rename_from_base(
         &self,
@@ -1140,42 +1225,9 @@ impl RedbMetaEngine {
             .begin_write()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
 
-        let src_in_base = Self::lookup_in_write_table(&txn, BASE_DENTRIES_TABLE, parent, name)?
-            .map(|value| value.ino == entry.ino && value.kind == entry.kind)
-            .unwrap_or(false);
-        let dst_in_base =
-            Self::lookup_in_write_table(&txn, BASE_DENTRIES_TABLE, new_parent, new_name)?
-                .map(|value| value.ino == entry.ino && value.kind == entry.kind)
-                .unwrap_or(false);
-        let current_key = Self::unique_dentry_key_for_entry_in_write_table(
-            &txn,
-            DENTRIES_TABLE,
-            DENTRY_BY_INODE_TABLE,
-            entry,
-            RenameDentryContext {
-                source_parent: parent,
-                source_name: name,
-                destination_parent: new_parent,
-                destination_name: new_name,
-            },
+        Self::reconcile_serving_rename_from_base_in_txn(
+            &txn, parent, name, new_parent, new_name, entry,
         )?;
-
-        if let Some(current_key) = current_key.as_ref() {
-            let (current_parent, current_name) = decode_dentry_key(current_key)?;
-            Self::remove_dentry_mirror_in_txn(&txn, current_parent, current_name)?;
-        }
-
-        if dst_in_base {
-            Self::remove_dentry_mirror_in_txn(&txn, parent, name)?;
-            Self::remove_dentry_mirror_in_txn(&txn, new_parent, new_name)?;
-            Self::set_dentry_mirror_in_txn(&txn, new_parent, new_name, entry)?;
-        } else if src_in_base {
-            Self::remove_dentry_mirror_in_txn(&txn, new_parent, new_name)?;
-            Self::set_dentry_mirror_in_txn(&txn, parent, name, entry)?;
-        } else {
-            Self::remove_dentry_mirror_in_txn(&txn, parent, name)?;
-            Self::remove_dentry_mirror_in_txn(&txn, new_parent, new_name)?;
-        }
 
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;

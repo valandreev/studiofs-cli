@@ -2842,55 +2842,41 @@ impl PgMetaEngine {
             })
             .collect::<Vec<_>>();
         self.local.apply_replica_events_to_base(batch_events)?;
-        let serving_events: Vec<MetaEvent> = batch_events
-            .iter()
-            .filter(|event| {
-                !Self::serving_event_conflicts_with_overlay(event, overlay, &removed_inodes)
-            })
-            .cloned()
-            .collect();
-        self.local.apply_replica_serving_state(&serving_events)?;
+        let mut serving_events = Vec::new();
+        let mut serving_rename_reconciles = Vec::new();
+        let mut aux_events = Vec::new();
         for event in batch_events {
-            let MetaEvent::RenameEntry {
+            let serving_conflicts =
+                Self::serving_event_conflicts_with_overlay(event, overlay, &removed_inodes);
+            if !serving_conflicts {
+                serving_events.push(event.clone());
+            } else if let MetaEvent::RenameEntry {
                 parent,
                 name,
                 new_parent,
                 new_name,
-                entry,
                 ..
             } = event
-            else {
-                continue;
-            };
-            if !Self::serving_event_conflicts_with_overlay(event, overlay, &removed_inodes) {
-                continue;
+                && !Self::rename_dentry_conflicts_with_overlay(
+                    *parent,
+                    name,
+                    *new_parent,
+                    new_name,
+                    overlay,
+                )
+            {
+                serving_rename_reconciles.push(event);
             }
-            if Self::rename_dentry_conflicts_with_overlay(
-                *parent,
-                name,
-                *new_parent,
-                new_name,
-                overlay,
-            ) {
-                continue;
-            }
-            self.local.reconcile_serving_rename_from_base(
-                *parent,
-                name,
-                *new_parent,
-                new_name,
-                entry,
-            )?;
-        }
-        let mut aux_events = Vec::new();
-        for event in batch_events {
-            if !Self::event_has_aux_apply_effect(event) {
-                continue;
-            }
-            if !self.aux_event_conflicts_with_overlay(event, overlay, &removed_inodes)? {
+
+            if Self::event_has_aux_apply_effect(event)
+                && !self.aux_event_conflicts_with_overlay(event, overlay, &removed_inodes)?
+            {
                 aux_events.push(event.clone());
             }
         }
+        self.local.apply_replica_serving_state(&serving_events)?;
+        self.local
+            .reconcile_serving_renames_from_base(serving_rename_reconciles)?;
 
         if aux_events.is_empty() {
             for ino in preserve_local_payload_inodes {
@@ -5356,11 +5342,7 @@ mod tests {
         };
 
         assert!(
-            PgMetaEngine::serving_event_conflicts_with_overlay(
-                &rename,
-                &overlay,
-                &HashSet::new()
-            ),
+            PgMetaEngine::serving_event_conflicts_with_overlay(&rename, &overlay, &HashSet::new()),
             "local attr overlay should conflict with the full rename event"
         );
         pg.apply_foreign_batch(std::slice::from_ref(&rename), &overlay)
