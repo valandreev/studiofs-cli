@@ -6,7 +6,9 @@ use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 
 use crate::infra::InfraMode;
-use crate::runner::{self, CleanRequest, PlatformSelection, RetentionPolicy, RunRequest};
+use crate::runner::{
+    self, CleanRequest, PlatformSelection, RetentionPolicy, RunOneRequest, RunRequest,
+};
 use crate::scenario;
 
 #[derive(Parser, Debug)]
@@ -29,6 +31,9 @@ pub enum Commands {
     /// Internal helper for one mounted chaos filesystem operation.
     #[command(name = "__mounted-chaos-op", hide = true)]
     MountedChaosOp(MountedChaosOpArgs),
+    /// Internal supervised single-scenario runner.
+    #[command(name = "__run-one", hide = true)]
+    RunOne(RunOneArgs),
 }
 
 #[derive(Args, Debug)]
@@ -99,6 +104,32 @@ pub struct MountedChaosOpArgs {
     pub start_file: PathBuf,
 }
 
+#[derive(Args, Debug)]
+pub struct RunOneArgs {
+    /// Scenario name to execute in this child process.
+    pub scenario: String,
+
+    /// Parent directory for per-run sandboxes.
+    #[arg(long)]
+    pub root: PathBuf,
+
+    /// Existing run ID owned by the parent supervisor.
+    #[arg(long)]
+    pub run_id: String,
+
+    /// Deterministic seed recorded in the scenario report.
+    #[arg(long)]
+    pub seed: u64,
+
+    /// Path to the StudioFS product binary under test.
+    #[arg(long)]
+    pub studiofs_bin: Option<PathBuf>,
+
+    /// External infrastructure mode for the run.
+    #[arg(long, value_enum)]
+    pub infra: InfraMode,
+}
+
 impl RunArgs {
     pub fn scenario_names(&self) -> Vec<String> {
         let mut names = Vec::new();
@@ -162,5 +193,13 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             scenario::run_mounted_chaos_operation_helper(&args.task, &args.start_file)?;
             Ok(0)
         }
+        Commands::RunOne(args) => Ok(runner::run_one(RunOneRequest {
+            root: args.root,
+            run_id: args.run_id,
+            scenario: args.scenario,
+            seed: args.seed,
+            studiofs_bin: args.studiofs_bin,
+            infra: args.infra,
+        })?),
     }
 }

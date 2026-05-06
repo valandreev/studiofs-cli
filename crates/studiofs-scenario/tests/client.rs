@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 use studiofs_scenario::client::SimulatedRuntime;
 use studiofs_scenario::invariant::validate_logical_invariants;
 

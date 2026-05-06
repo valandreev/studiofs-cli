@@ -75,11 +75,11 @@ Required initial run flags and environment:
 | `STUDIOFS_E2E_EXTERNAL_S3_ACCESS_KEY` / `STUDIOFS_TEST_ONLINE_S3_ACCESS_KEY` / `STUDIOFS_S3_ACCESS_KEY` | S3/RustFS access key for `--infra external-env`. |
 | `STUDIOFS_E2E_EXTERNAL_S3_SECRET_KEY` / `STUDIOFS_TEST_ONLINE_S3_SECRET_KEY` / `STUDIOFS_S3_SECRET_KEY` | S3/RustFS secret key for `--infra external-env`. |
 | `STUDIOFS_E2E_EXTERNAL_S3_REGION` / `STUDIOFS_TEST_ONLINE_S3_REGION` / `STUDIOFS_S3_REGION` | Optional S3/RustFS region for `--infra external-env`; defaults to `us-east-1`. |
-| `--timeout <duration>` | Enforced whole-run watchdog. Supported units are `ms`, `s`, `m`, and `h`, for example `500ms`, `30s`, `10m`, or `1h`. When the deadline is exceeded, the runner marks the active scenario `timed_out`, records the active hook when known, writes best-effort `report.json`, `events.ndjson`, and `cleanup.json`, and attempts runner-level cleanup. Same-process hooks cannot be safely killed; child-process scenario isolation is the boundary for hard cancellation of blocked hook code. |
+| `--timeout <duration>` | Enforced whole-run watchdog. Supported units are `ms`, `s`, `m`, and `h`, for example `500ms`, `30s`, `10m`, or `1h`. When a multi-scenario run is selected, the parent runner executes each scenario in a supervised child process and passes the remaining deadline as the child command timeout. If that timeout expires, the parent kills the child, marks the active scenario `timed_out`, records the active hook when known, writes best-effort `report.json`, `events.ndjson`, and `cleanup.json`, and does not start later scenarios. Single-scenario runs still use the direct lifecycle path for focused local debugging. |
 
-The initial runner implements `list`, `run`, and `clean`. Future subcommands
-may add dedicated `preflight` or artifact commands, but those must reuse the
-same report schema and cleanup safety checks.
+The public runner implements `list`, `run`, and `clean`. Hidden helper
+subcommands such as `__run-one` are parent-owned implementation details; they
+must reuse the same report schema, sandbox layout, and cleanup safety checks.
 
 ## Sandbox Layout
 
@@ -101,6 +101,10 @@ target/e2e-runs/<run-id>/
     commands/
     scenarios/
       <scenario-name>/
+        scenario-report.json
+        child.stdout.log
+        child.stderr.log
+        operations.ndjson
     clients/
       client-a/
         client-root/

@@ -1,4 +1,5 @@
 #![cfg(windows)]
+#![allow(missing_docs)]
 
 use std::net::ToSocketAddrs;
 use std::sync::{Arc, OnceLock};

@@ -22,8 +22,8 @@ use crate::client::{
     client_mount_point, client_root_dir,
 };
 use crate::infra::{
-    CommandExecutor, ComposeConfig, DockerComposeStack, InfraCheck, InfraError, InfraMode,
-    SystemCommandExecutor,
+    CommandExecutor, CommandSpec, ComposeConfig, DockerComposeStack, InfraCheck, InfraError,
+    InfraMode, SystemCommandExecutor,
 };
 use crate::report::{
     ArtifactReport, CleanupReport, EventRecord, HostReport, PreflightCheckReport, PreflightReport,
@@ -105,6 +105,16 @@ pub struct CleanRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunOneRequest {
+    pub root: PathBuf,
+    pub run_id: String,
+    pub scenario: String,
+    pub seed: u64,
+    pub studiofs_bin: Option<PathBuf>,
+    pub infra: InfraMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CleanOutcome {
     pub removed: Vec<PathBuf>,
     pub skipped: Vec<CleanSkipped>,
@@ -157,6 +167,8 @@ pub enum RunnerError {
     NonUtf8ArtifactPath { path: PathBuf },
     #[error("E2E artifact path must be relative and must not contain parent components")]
     UnsafeArtifactPath { path: PathBuf },
+    #[error("scenario child exited successfully without report: {path}")]
+    MissingScenarioReport { path: PathBuf },
     #[error("runner I/O failed: {0}")]
     Io(#[from] std::io::Error),
     #[error("runner JSON failed: {0}")]
@@ -215,6 +227,57 @@ pub fn run_with_executor(
     run_with_executor_and_mount_lock_dir(request, executor, &default_mount_lock_dir())
 }
 
+pub fn run_one(request: RunOneRequest) -> Result<i32, RunnerError> {
+    let root = absolutize(&request.root)?;
+    validate_run_id(&request.run_id)?;
+    let sandbox = root.join(&request.run_id);
+    let manifest: RunManifest = read_json_file(&sandbox.join("run.json"))?;
+    let resolved = resolve_scenario(&request.scenario)?;
+    let events_path = sandbox.join("events.ndjson");
+    let context = ScenarioContext {
+        run_id: request.run_id.clone(),
+        seed: request.seed,
+        sandbox: sandbox.clone(),
+        scenario_dir: sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(resolved.definition.name),
+        client_controller_config: match (request.infra, request.studiofs_bin.as_ref()) {
+            (InfraMode::Compose, Some(studiofs_bin)) => {
+                Some(ClientControllerConfig::from_compose_services(
+                    studiofs_bin.clone(),
+                    sandbox.clone(),
+                    &request.run_id,
+                    request.seed,
+                    &manifest.allocated_ports,
+                )?)
+            }
+            (InfraMode::ExternalEnv, Some(studiofs_bin)) => {
+                Some(ClientControllerConfig::from_external_env(
+                    studiofs_bin.clone(),
+                    sandbox.clone(),
+                    &request.run_id,
+                    request.seed,
+                )?)
+            }
+            _ => None,
+        },
+    };
+
+    let lifecycle = run_scenario_lifecycle(
+        &events_path,
+        &request.run_id,
+        resolved.scenario.as_ref(),
+        &context,
+    )?;
+    write_scenario_report(&context.scenario_dir, &lifecycle.report)?;
+    Ok(if lifecycle.outcome.status == ScenarioStatus::Passed {
+        0
+    } else {
+        1
+    })
+}
+
 fn run_with_executor_and_mount_lock_dir(
     request: RunRequest,
     executor: &dyn CommandExecutor,
@@ -229,16 +292,16 @@ fn run_with_executor_and_mount_lock_dir(
         .transpose()?
         .map(|timeout| RunDeadline::new(timeout, started_instant));
     let root = absolutize(&request.root)?;
-    let run_id = match request.run_id {
+    let run_id = match &request.run_id {
         Some(run_id) if run_id.trim().is_empty() => return Err(RunnerError::EmptyRunId),
-        Some(run_id) => run_id,
+        Some(run_id) => run_id.clone(),
         None => generated_run_id(),
     };
     validate_run_id(&run_id)?;
     let scenario_names = if request.scenarios.is_empty() {
         vec![scenario::BASIC_MULTI_CLIENT_SMOKE.to_string()]
     } else {
-        request.scenarios
+        request.scenarios.clone()
     };
     e2e_progress(&format!(
         "run {run_id} starting: {} scenario(s), seed={}, infra={:?}",
@@ -420,40 +483,52 @@ fn run_with_executor_and_mount_lock_dir(
             total_scenarios,
             definition.name
         ));
-        let context = ScenarioContext {
-            run_id: run_id.clone(),
-            seed: request.seed,
-            sandbox: sandbox.clone(),
-            scenario_dir: sandbox
-                .join("artifacts")
-                .join("scenarios")
-                .join(definition.name),
-            client_controller_config: match (infra_mode, request.studiofs_bin.as_ref()) {
-                (InfraMode::Compose, Some(studiofs_bin)) => {
-                    let allocated_ports = compose_stack
-                        .as_ref()
-                        .map(|stack| stack.ports().to_vec())
-                        .unwrap_or_default();
-                    Some(ClientControllerConfig::from_compose_services(
-                        studiofs_bin.clone(),
-                        sandbox.clone(),
-                        &run_id,
-                        request.seed,
-                        &allocated_ports,
-                    )?)
-                }
-                (InfraMode::ExternalEnv, _) => external_client_config.clone(),
-                _ => None,
-            },
-        };
+        let lifecycle = if total_scenarios > 1 {
+            run_scenario_child_with_timeout(
+                &sandbox,
+                &events_path,
+                &run_id,
+                definition,
+                executor,
+                &request,
+                run_deadline,
+            )?
+        } else {
+            let context = ScenarioContext {
+                run_id: run_id.clone(),
+                seed: request.seed,
+                sandbox: sandbox.clone(),
+                scenario_dir: sandbox
+                    .join("artifacts")
+                    .join("scenarios")
+                    .join(definition.name),
+                client_controller_config: match (infra_mode, request.studiofs_bin.as_ref()) {
+                    (InfraMode::Compose, Some(studiofs_bin)) => {
+                        let allocated_ports = compose_stack
+                            .as_ref()
+                            .map(|stack| stack.ports().to_vec())
+                            .unwrap_or_default();
+                        Some(ClientControllerConfig::from_compose_services(
+                            studiofs_bin.clone(),
+                            sandbox.clone(),
+                            &run_id,
+                            request.seed,
+                            &allocated_ports,
+                        )?)
+                    }
+                    (InfraMode::ExternalEnv, _) => external_client_config.clone(),
+                    _ => None,
+                },
+            };
 
-        let lifecycle = run_scenario_lifecycle_with_timeout(
-            &events_path,
-            &run_id,
-            resolved,
-            context,
-            run_deadline,
-        )?;
+            run_scenario_lifecycle_with_timeout(
+                &events_path,
+                &run_id,
+                resolved,
+                context,
+                run_deadline,
+            )?
+        };
         e2e_progress(&format!(
             "run {run_id} scenario {}/{} {}: {:?}",
             index + 1,
@@ -1126,6 +1201,15 @@ fn resolve_scenarios(names: &[String]) -> Result<Vec<ResolvedScenario>, RunnerEr
         .collect()
 }
 
+fn resolve_scenario(name: &str) -> Result<ResolvedScenario, RunnerError> {
+    let scenario = scenario::resolve_scenario(name)
+        .ok_or_else(|| RunnerError::UnknownScenario(name.to_string()))?;
+    Ok(ResolvedScenario {
+        definition: scenario.definition(),
+        scenario,
+    })
+}
+
 fn create_sandbox_layout(
     sandbox: &Path,
     scenarios: &[ResolvedScenario],
@@ -1275,6 +1359,164 @@ fn run_scenario_lifecycle_with_timeout(
         Err(mpsc::RecvTimeoutError::Disconnected) => Err(RunnerError::Io(std::io::Error::other(
             "scenario watchdog worker exited without a result",
         ))),
+    }
+}
+
+fn run_scenario_child_with_timeout(
+    sandbox: &Path,
+    events_path: &Path,
+    run_id: &str,
+    definition: scenario::ScenarioDefinition,
+    executor: &dyn CommandExecutor,
+    request: &RunRequest,
+    deadline: Option<RunDeadline>,
+) -> Result<ScenarioLifecycleOutcome, RunnerError> {
+    let started_at = timestamp();
+    let started_instant = Instant::now();
+    let scenario_dir = sandbox
+        .join("artifacts")
+        .join("scenarios")
+        .join(definition.name);
+    fs::create_dir_all(&scenario_dir)?;
+    let report_path = scenario_report_path(&scenario_dir);
+    let child_stdout = scenario_dir.join("child.stdout.log");
+    let child_stderr = scenario_dir.join("child.stderr.log");
+    let timeout = if let Some(deadline) = deadline {
+        match deadline.remaining() {
+            Some(remaining) => Some(remaining),
+            None => {
+                let active_hook = active_scenario_hook(events_path, definition.name)
+                    .unwrap_or_else(|| "not_started".to_string());
+                let error = format!(
+                    "whole-run timeout already elapsed before starting scenario child {}; active hook {active_hook}; cleanup attempted",
+                    definition.name
+                );
+                let _ = record_event(
+                    events_path,
+                    run_id,
+                    Some(definition.name),
+                    &active_hook,
+                    "timed_out",
+                );
+                return Ok(timed_out_lifecycle(
+                    definition.name,
+                    request.seed,
+                    started_at,
+                    started_instant,
+                    error,
+                ));
+            }
+        }
+    } else {
+        None
+    };
+    let mut args = vec![
+        "__run-one".to_string(),
+        definition.name.to_string(),
+        "--root".to_string(),
+        request.root.display().to_string(),
+        "--run-id".to_string(),
+        run_id.to_string(),
+        "--seed".to_string(),
+        request.seed.to_string(),
+        "--infra".to_string(),
+        request.infra.cli_value().to_string(),
+    ];
+    if let Some(studiofs_bin) = &request.studiofs_bin {
+        args.push("--studiofs-bin".to_string());
+        args.push(studiofs_bin.display().to_string());
+    }
+    let output = executor.run(&CommandSpec {
+        program: std::env::current_exe()?.display().to_string(),
+        args,
+        env: Vec::new(),
+        cwd: None,
+        timeout,
+        stdout_path: Some(child_stdout.clone()),
+        stderr_path: Some(child_stderr.clone()),
+    })?;
+
+    if output.status == -1 {
+        let active_hook = active_scenario_hook(events_path, definition.name)
+            .unwrap_or_else(|| "unknown".to_string());
+        let error = format!(
+            "scenario child timed out after {}ms; active hook {active_hook}; cleanup attempted",
+            timeout.unwrap_or_default().as_millis()
+        );
+        let _ = record_event(
+            events_path,
+            run_id,
+            Some(definition.name),
+            &active_hook,
+            "timed_out",
+        );
+        return Ok(timed_out_lifecycle(
+            definition.name,
+            request.seed,
+            started_at,
+            started_instant,
+            error,
+        ));
+    }
+
+    let report = if report_path.exists() {
+        read_json_file::<ScenarioReport>(&report_path)?
+    } else if output.status == 0 {
+        return Err(RunnerError::MissingScenarioReport { path: report_path });
+    } else {
+        ScenarioReport {
+            name: definition.name.to_string(),
+            seed: request.seed,
+            status: ScenarioStatus::Failed,
+            started_at,
+            finished_at: timestamp(),
+            duration_ms: duration_millis(started_instant),
+            artifacts: vec![scenario_artifact_path(definition.name, "operations.ndjson")],
+            error: Some(format!(
+                "scenario child terminated abnormally with status {}; stderr: {}; stdout: {}",
+                output.status,
+                read_text_snippet(&child_stderr)?.trim(),
+                read_text_snippet(&child_stdout)?.trim()
+            )),
+        }
+    };
+    let outcome = ScenarioOutcome {
+        name: report.name.clone(),
+        status: report.status,
+        artifacts: report.artifacts.clone(),
+    };
+    Ok(ScenarioLifecycleOutcome {
+        report,
+        outcome,
+        cleanup_error: None,
+    })
+}
+
+fn timed_out_lifecycle(
+    scenario_name: &str,
+    seed: u64,
+    started_at: String,
+    started_instant: Instant,
+    error: String,
+) -> ScenarioLifecycleOutcome {
+    let operation_artifact = scenario_artifact_path(scenario_name, "operations.ndjson");
+    ScenarioLifecycleOutcome {
+        report: ScenarioReport {
+            name: scenario_name.to_string(),
+            seed,
+            status: ScenarioStatus::TimedOut,
+            started_at,
+            finished_at: timestamp(),
+            duration_ms: duration_millis(started_instant),
+            artifacts: vec![operation_artifact.clone()],
+            error: Some(error),
+        },
+        outcome: ScenarioOutcome {
+            name: scenario_name.to_string(),
+            status: ScenarioStatus::TimedOut,
+            artifacts: vec![operation_artifact],
+        },
+        cleanup_error: None,
     }
 }
 
@@ -1716,6 +1958,28 @@ fn write_pretty_json<T: Serialize>(path: &Path, value: &T) -> Result<(), RunnerE
     }
     fs::write(path, serde_json::to_vec_pretty(value)?)?;
     Ok(())
+}
+
+fn read_json_file<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, RunnerError> {
+    Ok(serde_json::from_slice(&fs::read(path)?)?)
+}
+
+fn read_text_snippet(path: &Path) -> Result<String, RunnerError> {
+    const MAX_SNIPPET_BYTES: usize = 8192;
+    if !path.exists() {
+        return Ok(String::new());
+    }
+    let bytes = fs::read(path)?;
+    let start = bytes.len().saturating_sub(MAX_SNIPPET_BYTES);
+    Ok(String::from_utf8_lossy(&bytes[start..]).into_owned())
+}
+
+fn scenario_report_path(scenario_dir: &Path) -> PathBuf {
+    scenario_dir.join("scenario-report.json")
+}
+
+fn write_scenario_report(scenario_dir: &Path, report: &ScenarioReport) -> Result<(), RunnerError> {
+    write_pretty_json(&scenario_report_path(scenario_dir), report)
 }
 
 fn write_runner_marker(sandbox: &Path, run_id: &str) -> Result<(), RunnerError> {
@@ -2497,15 +2761,341 @@ mod tests {
         );
     }
 
+    #[test]
+    fn multi_scenario_run_supervises_each_scenario_in_child_process() {
+        let temp = tempfile::tempdir().unwrap();
+        let executor = RecordingExecutor::default();
+
+        let outcome = run_with_executor_and_mount_lock_dir(
+            RunRequest {
+                root: temp.path().join("e2e-runs"),
+                run_id: Some("supervised-run".to_string()),
+                scenarios: vec![
+                    scenario::TEST_PASSING.to_string(),
+                    scenario::TEST_PASSING.to_string(),
+                ],
+                seed: 371,
+                studiofs_bin: None,
+                platform: PlatformSelection::Auto,
+                retention: RetentionPolicy::Always,
+                report: None,
+                port_range: None,
+                timeout: Some("30s".to_string()),
+                infra: InfraMode::Disabled,
+            },
+            &executor,
+            &temp.path().join("locks"),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.status, RunStatus::Passed);
+        let calls = executor.calls.borrow();
+        let child_runs = calls
+            .iter()
+            .filter(|call| call.args.iter().any(|arg| arg == "__run-one"))
+            .collect::<Vec<_>>();
+        assert_eq!(child_runs.len(), 2);
+        assert!(child_runs.iter().all(|call| {
+            call.timeout
+                .is_some_and(|timeout| timeout <= Duration::from_secs(30))
+        }));
+        assert!(child_runs.iter().all(|call| {
+            call.stdout_path
+                .as_ref()
+                .is_some_and(|path| path.ends_with("child.stdout.log"))
+                && call
+                    .stderr_path
+                    .as_ref()
+                    .is_some_and(|path| path.ends_with("child.stderr.log"))
+        }));
+    }
+
+    #[test]
+    fn timed_out_supervised_child_marks_run_timed_out_and_skips_later_scenarios() {
+        let temp = tempfile::tempdir().unwrap();
+        let executor = RecordingExecutor::default();
+        executor.timeout_next_run_one.set(true);
+
+        let outcome = run_with_executor_and_mount_lock_dir(
+            RunRequest {
+                root: temp.path().join("e2e-runs"),
+                run_id: Some("supervised-timeout-run".to_string()),
+                scenarios: vec![
+                    scenario::TEST_HANGING_RUN.to_string(),
+                    scenario::TEST_PASSING.to_string(),
+                ],
+                seed: 371,
+                studiofs_bin: None,
+                platform: PlatformSelection::Auto,
+                retention: RetentionPolicy::Always,
+                report: None,
+                port_range: None,
+                timeout: Some("30s".to_string()),
+                infra: InfraMode::Disabled,
+            },
+            &executor,
+            &temp.path().join("locks"),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.status, RunStatus::TimedOut);
+        assert_eq!(outcome.exit_code, 1);
+        assert_eq!(outcome.scenarios.len(), 1);
+        assert_eq!(outcome.scenarios[0].status, ScenarioStatus::TimedOut);
+        let report = read_json_file::<RunReport>(&outcome.report_path).unwrap();
+        assert_eq!(report.status, RunStatus::TimedOut);
+        assert_eq!(report.scenarios[0].status, ScenarioStatus::TimedOut);
+        let child_runs = executor
+            .calls
+            .borrow()
+            .iter()
+            .filter(|call| call.args.iter().any(|arg| arg == "__run-one"))
+            .count();
+        assert_eq!(child_runs, 1);
+    }
+
+    #[test]
+    fn elapsed_deadline_times_out_before_spawning_supervised_child() {
+        let temp = tempfile::tempdir().unwrap();
+        let executor = RecordingExecutor::default();
+        let run_id = "elapsed-deadline-run";
+        let root = temp.path().join("e2e-runs");
+        let sandbox = root.join(run_id);
+        fs::create_dir_all(&sandbox).unwrap();
+        write_pretty_json(
+            &sandbox.join("run.json"),
+            &build_manifest(ManifestInput {
+                run_id,
+                seed: 371,
+                sandbox: &sandbox,
+                scenarios: &[scenario::TEST_HANGING_RUN.to_string()],
+                retention: RetentionPolicy::Always,
+                selected_platform: "windows-winfsp",
+                infra: InfraMode::Disabled,
+                compose_project: None,
+                allocated_ports: Vec::new(),
+                studiofs_bin: None,
+                port_range: None,
+                timeout: Some("1ms"),
+                created_at: &timestamp(),
+            }),
+        )
+        .unwrap();
+        let definition = scenario::resolve_scenario(scenario::TEST_HANGING_RUN)
+            .unwrap()
+            .definition();
+        let request = RunRequest {
+            root,
+            run_id: Some(run_id.to_string()),
+            scenarios: vec![scenario::TEST_HANGING_RUN.to_string()],
+            seed: 371,
+            studiofs_bin: None,
+            platform: PlatformSelection::Auto,
+            retention: RetentionPolicy::Always,
+            report: None,
+            port_range: None,
+            timeout: Some("1ms".to_string()),
+            infra: InfraMode::Disabled,
+        };
+        let deadline = RunDeadline::new(
+            Duration::from_millis(1),
+            Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("test instant before now"),
+        );
+
+        let lifecycle = run_scenario_child_with_timeout(
+            &sandbox,
+            &sandbox.join("events.ndjson"),
+            run_id,
+            definition,
+            &executor,
+            &request,
+            Some(deadline),
+        )
+        .unwrap();
+
+        assert_eq!(lifecycle.outcome.status, ScenarioStatus::TimedOut);
+        assert!(executor.calls.borrow().is_empty());
+        assert!(
+            lifecycle
+                .report
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("already elapsed"))
+        );
+    }
+
+    #[test]
+    fn abnormal_supervised_child_without_report_is_marked_failed() {
+        let temp = tempfile::tempdir().unwrap();
+        let executor = RecordingExecutor::default();
+        executor.fail_next_run_one_without_report.set(true);
+
+        let outcome = run_with_executor_and_mount_lock_dir(
+            RunRequest {
+                root: temp.path().join("e2e-runs"),
+                run_id: Some("supervised-abnormal-run".to_string()),
+                scenarios: vec![
+                    scenario::TEST_FAILING_VALIDATE.to_string(),
+                    scenario::TEST_PASSING.to_string(),
+                ],
+                seed: 371,
+                studiofs_bin: None,
+                platform: PlatformSelection::Auto,
+                retention: RetentionPolicy::Always,
+                report: None,
+                port_range: None,
+                timeout: Some("30s".to_string()),
+                infra: InfraMode::Disabled,
+            },
+            &executor,
+            &temp.path().join("locks"),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.status, RunStatus::Failed);
+        assert_eq!(outcome.scenarios.len(), 2);
+        let report = read_json_file::<RunReport>(&outcome.report_path).unwrap();
+        assert_eq!(report.scenarios[0].status, ScenarioStatus::Failed);
+        assert!(
+            report.scenarios[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("terminated abnormally"))
+        );
+    }
+
+    #[test]
+    fn successful_supervised_child_without_report_returns_structured_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let executor = RecordingExecutor::default();
+        executor.skip_next_run_one_report.set(true);
+        let run_id = "missing-report-run";
+        let root = temp.path().join("e2e-runs");
+        let sandbox = root.join(run_id);
+        fs::create_dir_all(&sandbox).unwrap();
+        write_pretty_json(
+            &sandbox.join("run.json"),
+            &build_manifest(ManifestInput {
+                run_id,
+                seed: 371,
+                sandbox: &sandbox,
+                scenarios: &[scenario::TEST_PASSING.to_string()],
+                retention: RetentionPolicy::Always,
+                selected_platform: "windows-winfsp",
+                infra: InfraMode::Disabled,
+                compose_project: None,
+                allocated_ports: Vec::new(),
+                studiofs_bin: None,
+                port_range: None,
+                timeout: Some("30s"),
+                created_at: &timestamp(),
+            }),
+        )
+        .unwrap();
+        let definition = scenario::resolve_scenario(scenario::TEST_PASSING)
+            .unwrap()
+            .definition();
+        let request = RunRequest {
+            root,
+            run_id: Some(run_id.to_string()),
+            scenarios: vec![scenario::TEST_PASSING.to_string()],
+            seed: 371,
+            studiofs_bin: None,
+            platform: PlatformSelection::Auto,
+            retention: RetentionPolicy::Always,
+            report: None,
+            port_range: None,
+            timeout: Some("30s".to_string()),
+            infra: InfraMode::Disabled,
+        };
+
+        let err = run_scenario_child_with_timeout(
+            &sandbox,
+            &sandbox.join("events.ndjson"),
+            run_id,
+            definition,
+            &executor,
+            &request,
+            Some(RunDeadline::new(Duration::from_secs(30), Instant::now())),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            RunnerError::MissingScenarioReport { path }
+                if path.ends_with("scenario-report.json")
+        ));
+    }
+
     #[derive(Default)]
     struct RecordingExecutor {
         calls: RefCell<Vec<crate::infra::CommandSpec>>,
         poison_events_path_after_up: RefCell<Option<PathBuf>>,
+        timeout_next_run_one: Cell<bool>,
+        fail_next_run_one_without_report: Cell<bool>,
+        skip_next_run_one_report: Cell<bool>,
     }
 
     impl CommandExecutor for RecordingExecutor {
         fn run(&self, command: &crate::infra::CommandSpec) -> std::io::Result<CommandOutput> {
             self.calls.borrow_mut().push(command.clone());
+            if command.args.iter().any(|arg| arg == "__run-one") {
+                if self.timeout_next_run_one.replace(false) {
+                    return Ok(CommandOutput {
+                        status: -1,
+                        stdout: String::new(),
+                        stderr: "command timed out after 30000ms".to_string(),
+                    });
+                }
+                if self.fail_next_run_one_without_report.replace(false) {
+                    return Ok(CommandOutput {
+                        status: 101,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    });
+                }
+                if self.skip_next_run_one_report.replace(false) {
+                    return Ok(CommandOutput {
+                        status: 0,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    });
+                }
+                let scenario_name = command
+                    .args
+                    .iter()
+                    .position(|arg| arg == "__run-one")
+                    .and_then(|index| command.args.get(index + 1))
+                    .expect("run-one scenario argument")
+                    .clone();
+                let root = command_arg_value(command, "--root");
+                let run_id = command_arg_value(command, "--run-id");
+                let seed = command_arg_value(command, "--seed").parse::<u64>().unwrap();
+                let scenario_dir = PathBuf::from(root)
+                    .join(&run_id)
+                    .join("artifacts")
+                    .join("scenarios")
+                    .join(&scenario_name);
+                std::fs::create_dir_all(&scenario_dir)?;
+                write_scenario_report(
+                    &scenario_dir,
+                    &ScenarioReport {
+                        name: scenario_name,
+                        seed,
+                        status: ScenarioStatus::Passed,
+                        started_at: timestamp(),
+                        finished_at: timestamp(),
+                        duration_ms: 0,
+                        artifacts: vec![
+                            "artifacts/scenarios/__test-passing/operations.ndjson".to_string(),
+                        ],
+                        error: None,
+                    },
+                )
+                .map_err(std::io::Error::other)?;
+            }
             if command.args.contains(&"up".to_string()) {
                 if let Some(events_path) = self.poison_events_path_after_up.borrow_mut().take() {
                     std::fs::create_dir_all(events_path)?;
@@ -2522,5 +3112,15 @@ mod tests {
                 stderr: String::new(),
             })
         }
+    }
+
+    fn command_arg_value(command: &crate::infra::CommandSpec, flag: &str) -> String {
+        command
+            .args
+            .iter()
+            .position(|arg| arg == flag)
+            .and_then(|index| command.args.get(index + 1))
+            .unwrap_or_else(|| panic!("missing {flag}"))
+            .clone()
     }
 }

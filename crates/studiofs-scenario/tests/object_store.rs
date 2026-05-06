@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 use studiofs_scenario::invariant::ObjectLifecycle;
 use studiofs_scenario::object_store::{
     ObjectStoreFault, ObjectStoreTraceKind, SimulatedObjectStore, UploadOutcome,

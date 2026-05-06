@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -49,6 +50,22 @@ fn cli_parses_required_runner_entrypoints() {
 
     let clean = Cli::try_parse_from(["studiofs-e2e", "clean"]).unwrap();
     assert!(matches!(clean.command, Commands::Clean(CleanArgs { .. })));
+
+    let run_one = Cli::try_parse_from([
+        "studiofs-e2e",
+        "__run-one",
+        "basic-multi-client-smoke",
+        "--root",
+        "target/e2e-runs",
+        "--run-id",
+        "runner-cli-test",
+        "--seed",
+        "42",
+        "--infra",
+        "external-env",
+    ])
+    .unwrap();
+    assert!(matches!(run_one.command, Commands::RunOne(_)));
 }
 
 #[test]

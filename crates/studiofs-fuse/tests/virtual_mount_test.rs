@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 #![cfg(unix)]
 
 use std::sync::{Arc, OnceLock};

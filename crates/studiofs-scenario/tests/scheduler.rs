@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 use studiofs_scenario::scheduler::{
     ScheduledEvent, SchedulerEventType, SchedulerRunOutcome, SimulationScheduler,
 };

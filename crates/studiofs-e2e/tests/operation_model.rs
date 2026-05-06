@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 use std::fs;
 
 use studiofs_e2e::infra::InfraMode;

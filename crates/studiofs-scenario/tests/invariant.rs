@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 use studiofs_scenario::invariant::{
     ClientLogicalSnapshot, DurableWriteExpectation, LogicalEntry, LogicalEntryKind,
     LogicalSnapshot, ObjectLifecycle, ObjectRef, validate_logical_invariants,

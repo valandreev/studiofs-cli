@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 //! Scenario registry and lifecycle hooks for mounted E2E runs.
 
 use std::fs;

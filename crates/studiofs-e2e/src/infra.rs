@@ -68,6 +68,16 @@ pub enum InfraMode {
     ExternalEnv,
 }
 
+impl InfraMode {
+    pub fn cli_value(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Compose => "compose",
+            Self::ExternalEnv => "external-env",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComposeConfig {
     pub run_id: String,
@@ -105,6 +115,8 @@ pub struct CommandSpec {
     pub env: Vec<(String, String)>,
     pub cwd: Option<PathBuf>,
     pub timeout: Option<Duration>,
+    pub stdout_path: Option<PathBuf>,
+    pub stderr_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,7 +147,35 @@ impl CommandExecutor for SystemCommandExecutor {
         if let Some(cwd) = &command.cwd {
             process.current_dir(cwd);
         }
+        let capture_output = command.stdout_path.is_none() && command.stderr_path.is_none();
+        if let Some(stdout_path) = &command.stdout_path {
+            if let Some(parent) = stdout_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            process.stdout(Stdio::from(fs::File::create(stdout_path)?));
+        }
+        if let Some(stderr_path) = &command.stderr_path {
+            if let Some(parent) = stderr_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            process.stderr(Stdio::from(fs::File::create(stderr_path)?));
+        }
         let mut child = process.spawn()?;
+        if !capture_output {
+            let status = wait_for_child(&mut child, command.timeout)?;
+            return Ok(CommandOutput {
+                status,
+                stdout: String::new(),
+                stderr: if status == -1 {
+                    command
+                        .timeout
+                        .map(|timeout| format!("command timed out after {}ms", timeout.as_millis()))
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                },
+            });
+        }
         let output = if let Some(timeout) = command.timeout {
             let started = Instant::now();
             loop {
@@ -161,6 +201,45 @@ impl CommandExecutor for SystemCommandExecutor {
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         })
+    }
+}
+
+fn wait_for_child(
+    child: &mut std::process::Child,
+    timeout: Option<Duration>,
+) -> std::io::Result<i32> {
+    if let Some(timeout) = timeout {
+        let started = Instant::now();
+        loop {
+            if let Some(status) = child.try_wait()? {
+                return Ok(status.code().unwrap_or(-1));
+            }
+            if started.elapsed() >= timeout {
+                let _ = child.kill();
+                let _ = child.wait()?;
+                return Ok(-1);
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+    Ok(child.wait()?.code().unwrap_or(-1))
+}
+
+fn command_spec(
+    program: impl Into<String>,
+    args: Vec<String>,
+    env: Vec<(String, String)>,
+    cwd: Option<PathBuf>,
+    timeout: Option<Duration>,
+) -> CommandSpec {
+    CommandSpec {
+        program: program.into(),
+        args,
+        env,
+        cwd,
+        timeout,
+        stdout_path: None,
+        stderr_path: None,
     }
 }
 
@@ -268,28 +347,28 @@ impl DockerComposeStack {
         checks.push(self.command_check(
             "docker version",
             executor,
-            CommandSpec {
-                program: "docker".to_string(),
-                args: vec![
+            command_spec(
+                "docker",
+                vec![
                     "version".to_string(),
                     "--format".to_string(),
                     "{{.Server.Version}}".to_string(),
                 ],
-                env: Vec::new(),
-                cwd: None,
-                timeout: None,
-            },
+                Vec::new(),
+                None,
+                None,
+            ),
         ));
         checks.push(self.command_check(
             "docker compose version",
             executor,
-            CommandSpec {
-                program: "docker".to_string(),
-                args: vec!["compose".to_string(), "version".to_string()],
-                env: Vec::new(),
-                cwd: None,
-                timeout: None,
-            },
+            command_spec(
+                "docker",
+                vec!["compose".to_string(), "version".to_string()],
+                Vec::new(),
+                None,
+                None,
+            ),
         ));
         checks.extend(self.ports.iter().map(port_check));
         checks
@@ -584,19 +663,19 @@ impl ComposeServiceControl {
     }
 
     fn compose_command(&self) -> CommandSpec {
-        CommandSpec {
-            program: "docker".to_string(),
-            args: vec![
+        command_spec(
+            "docker",
+            vec![
                 "compose".to_string(),
                 "--project-name".to_string(),
                 self.project_name.clone(),
                 "--file".to_string(),
                 self.compose_file.display().to_string(),
             ],
-            env: self.env.clone(),
-            cwd: self.compose_file.parent().map(Path::to_path_buf),
-            timeout: None,
-        }
+            self.env.clone(),
+            self.compose_file.parent().map(Path::to_path_buf),
+            None,
+        )
     }
 }
 
@@ -643,9 +722,9 @@ fn host_health_check(port: &ServicePort, executor: &dyn CommandExecutor) -> Infr
 
     loop {
         attempts += 1;
-        let command = CommandSpec {
-            program: "curl".to_string(),
-            args: vec![
+        let command = command_spec(
+            "curl",
+            vec![
                 "--fail".to_string(),
                 "--silent".to_string(),
                 "--show-error".to_string(),
@@ -653,10 +732,10 @@ fn host_health_check(port: &ServicePort, executor: &dyn CommandExecutor) -> Infr
                 HOST_HEALTH_ATTEMPT_TIMEOUT_SECS.to_string(),
                 url.clone(),
             ],
-            env: Vec::new(),
-            cwd: None,
-            timeout: Some(Duration::from_secs(HOST_HEALTH_ATTEMPT_TIMEOUT_SECS)),
-        };
+            Vec::new(),
+            None,
+            Some(Duration::from_secs(HOST_HEALTH_ATTEMPT_TIMEOUT_SECS)),
+        );
         match executor.run(&command) {
             Ok(output) if output.status == 0 => {
                 return InfraCheck {

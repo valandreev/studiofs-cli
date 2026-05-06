@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![allow(missing_docs)]
 //! StudioFS VFS Layer
 //!
 //! Platform-agnostic virtual filesystem operations. Bridges metadata, data, and cache layers.
