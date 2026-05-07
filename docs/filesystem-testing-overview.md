@@ -167,12 +167,43 @@ The final validation shows all three clients converge,
 stayed absent, `open-handles/renamed-target.txt` stayed visible, and both open
 handles read back the expected payload and checksum.
 
+### 10. Mounted Publication-Boundary Crash Matrix
+
+This scenario targets the boundary between local durability and public
+publication. A mounted writer creates a file, crosses one explicit boundary,
+then the scenario kills or gracefully shuts down that writer and remounts it
+with the same client root.
+
+The matrix covers four boundaries:
+
+- flush
+- fsync
+- release/close
+- graceful shutdown drain
+
+For each boundary, the restarted writer must read back the exact payload from
+its recovered local state. Peers are checked at the scenario's publication gate,
+then the runner waits for normal mounted-tree convergence across all clients.
+
+This level is important because local-first filesystems have two different
+promises that are easy to mix up. First, data accepted by the writer must become
+locally durable at the right boundary and survive process death. Second, peers
+must converge through the public publication path rather than by sharing private
+writer state.
+
+The scenario writes `operations.ndjson`,
+`publication-boundary-summary.json`, and `validation.json`. The successful
+Windows/WinFSP run covered all four boundaries, remounted `client-a` with the
+same client root each time, matched local and final checksums, and converged
+`client-a`, `client-b`, and `client-c` with no mounted-tree differences.
+
 ## What A Passing Full Sweep Means
 
 A passing full mounted E2E sweep means the current implementation survived all
 implemented real-mount scenarios in one run: basic sharing, service outages,
 client crash/restart, focused namespace collisions, seeded mounted chaos,
-fault chaos, LWW reconnect chaos, and open-handle namespace convergence.
+fault chaos, LWW reconnect chaos, open-handle namespace convergence, and
+publication-boundary crash recovery.
 
 It does not mean the filesystem is perfect. It means the current safety net is
 working and gives us a strong baseline before we add deeper scenarios.
@@ -193,10 +224,9 @@ should become a smaller focused regression before we move on.
 ## What Comes Next
 
 The next planned testing levels go deeper into filesystem semantics that are
-easy to get wrong: crashes at publication boundaries, hot directory churn,
-sparse-file truncate/write races, long-history cold observers, metadata
-invalidation dropouts, symlink/attribute convergence, and adversarial runner
-cleanup.
+easy to get wrong: hot directory churn, sparse-file truncate/write races,
+long-history cold observers, metadata invalidation dropouts, symlink/attribute
+convergence, and adversarial runner cleanup.
 
 The workflow is intentionally staged. We add one level, run it, fix the bugs it
 finds, rerun the existing sweep to make sure nothing regressed, and only then
