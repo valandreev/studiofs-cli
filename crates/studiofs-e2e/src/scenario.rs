@@ -2852,10 +2852,15 @@ fn write_mounted_chaos_initial_file(path: PathBuf, payload: &[u8]) -> Result<(),
     )?;
     if readback != payload {
         return Err(ScenarioError::Io(std::io::Error::other(format!(
-            "mounted chaos initial write readback mismatch for {}: expected {} bytes, read {} bytes",
+            "mounted chaos initial write readback mismatch for {}: expected {} bytes, read {} bytes{}",
             path.display(),
             payload.len(),
-            readback.len()
+            readback.len(),
+            if readback.is_empty() {
+                "; no payload became readable before timeout"
+            } else {
+                ""
+            }
         ))));
     }
     Ok(())
@@ -4950,7 +4955,6 @@ fn run_mounted_fault_chaos_body(
 
 fn establish_fault_chaos_initial_tree(seed: u64, client: &ClientSpec) -> Result<(), ScenarioError> {
     let root = client.mount_point.join("fault-chaos");
-    fs::create_dir_all(&root)?;
     write_mounted_chaos_initial_file(
         root.join("postgres-outage-local.txt"),
         &fault_payload(seed, "postgres-initial"),
