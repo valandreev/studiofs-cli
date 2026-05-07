@@ -560,6 +560,7 @@ fn run_with_executor_and_mount_lock_dir(
         write_pretty_json(&sandbox.join("preflight.json"), &preflight)?;
         let mut cleanup_actions = Vec::new();
         let mut cleanup_errors = Vec::new();
+        drop(default_mount_lock.take());
         compose_cleanup_guard.collect_into(&mut cleanup_actions, &mut cleanup_errors);
         let cleanup = CleanupReport {
             status: if cleanup_errors.is_empty() {
@@ -711,6 +712,7 @@ fn run_with_executor_and_mount_lock_dir(
         })?;
     }
     let mut cleanup_actions = Vec::new();
+    drop(default_mount_lock.take());
     e2e_progress_fields(&[
         ("run", run_id.clone()),
         ("stage", "cleanup".to_string()),
@@ -3249,6 +3251,53 @@ mod tests {
     }
 
     #[test]
+    fn windows_mount_lock_is_released_before_compose_cleanup_after_mounted_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("e2e-runs");
+        let lock_dir = temp.path().join("mount-locks");
+        let lock_path = lock_dir.join("default-windows-mount-points.lock");
+        let run_id = "mounted-failed-run";
+        let report_path = root.join(run_id).join("report.json");
+        let executor = RecordingExecutor::default();
+        executor.fail_next_run_one_without_report.set(true);
+        executor
+            .require_report_before_compose_cleanup
+            .replace(Some(report_path.clone()));
+        executor
+            .require_missing_lock_before_compose_cleanup
+            .replace(Some(lock_path.clone()));
+
+        let outcome = run_with_executor_and_mount_lock_dir(
+            RunRequest {
+                root,
+                run_id: Some(run_id.to_string()),
+                scenarios: vec![
+                    scenario::BASIC_MULTI_CLIENT_SMOKE.to_string(),
+                    scenario::TEST_PASSING.to_string(),
+                ],
+                seed: 384,
+                studiofs_bin: Some(temp.path().join("studiofs.exe")),
+                platform: PlatformSelection::WindowsWinfsp,
+                retention: RetentionPolicy::Always,
+                report: None,
+                port_range: Some("33340-33350".to_string()),
+                timeout: Some("30s".to_string()),
+                infra: InfraMode::Compose,
+            },
+            &executor,
+            &lock_dir,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.status, RunStatus::Failed);
+        assert!(report_path.exists());
+        assert!(!lock_path.exists());
+        let report: RunReport = read_json_file(&report_path).unwrap();
+        assert_eq!(report.scenarios[0].status, ScenarioStatus::Failed);
+        assert_eq!(report.cleanup.status, RunStatus::Passed);
+    }
+
+    #[test]
     fn compose_basic_smoke_requires_product_binary() {
         let temp = tempfile::tempdir().unwrap();
         let executor = RecordingExecutor::default();
@@ -4324,6 +4373,7 @@ mod tests {
         calls: RefCell<Vec<crate::infra::CommandSpec>>,
         poison_events_path_after_up: RefCell<Option<PathBuf>>,
         require_report_before_compose_cleanup: RefCell<Option<PathBuf>>,
+        require_missing_lock_before_compose_cleanup: RefCell<Option<PathBuf>>,
         timeout_next_run_one: Cell<bool>,
         fail_next_run_one_without_report: Cell<bool>,
         skip_next_run_one_report: Cell<bool>,
@@ -4398,6 +4448,16 @@ mod tests {
                     assert!(
                         report_path.exists(),
                         "report.json must exist before compose cleanup starts"
+                    );
+                }
+                if let Some(lock_path) = self
+                    .require_missing_lock_before_compose_cleanup
+                    .borrow()
+                    .as_ref()
+                {
+                    assert!(
+                        !lock_path.exists(),
+                        "default mount lock must be released before compose cleanup starts"
                     );
                 }
             }
