@@ -480,7 +480,10 @@ impl ClientProcessExecutor for SystemClientProcessExecutor {
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr))
             .spawn()?;
-        Ok(Box::new(SystemClientProcess { child }))
+        Ok(Box::new(SystemClientProcess {
+            child,
+            force_kill_confirmed_exit: false,
+        }))
     }
 
     fn is_mount_ready(&self, command: &ClientCommand) -> io::Result<bool> {
@@ -494,6 +497,7 @@ impl ClientProcessExecutor for SystemClientProcessExecutor {
 
 struct SystemClientProcess {
     child: Child,
+    force_kill_confirmed_exit: bool,
 }
 
 impl ClientProcess for SystemClientProcess {
@@ -502,10 +506,11 @@ impl ClientProcess for SystemClientProcess {
     }
 
     fn try_wait(&mut self) -> io::Result<Option<i32>> {
-        Ok(self
+        let status = self
             .child
             .try_wait()?
-            .map(|status| status.code().unwrap_or(-1)))
+            .map(|status| status.code().unwrap_or(-1));
+        Ok(status.or_else(|| self.force_kill_confirmed_exit.then_some(-1)))
     }
 
     fn kill(&mut self) -> io::Result<()> {
@@ -513,7 +518,8 @@ impl ClientProcess for SystemClientProcess {
     }
 
     fn kill_process_tree(&mut self, context: &str) -> io::Result<()> {
-        force_kill_child_process_tree(&mut self.child, context)
+        self.force_kill_confirmed_exit = force_kill_child_process_tree(&mut self.child, context)?;
+        Ok(())
     }
 }
 
@@ -523,7 +529,7 @@ fn join_output_reader(reader: thread::JoinHandle<io::Result<Vec<u8>>>) -> io::Re
         .map_err(|_| io::Error::other("client command output reader panicked"))?
 }
 
-fn force_kill_child_process_tree(child: &mut Child, context: &str) -> io::Result<()> {
+fn force_kill_child_process_tree(child: &mut Child, context: &str) -> io::Result<bool> {
     let pid = child.id();
     #[cfg(windows)]
     {
@@ -533,9 +539,8 @@ fn force_kill_child_process_tree(child: &mut Child, context: &str) -> io::Result
             .output();
         let primary_result = child.kill();
         match (tree_result, primary_result) {
-            (Ok(output), _) if output.status.success() || output.status.code() == Some(128) => {
-                Ok(())
-            }
+            (Ok(output), _) if windows_taskkill_status_is_success(output.status.code()) => Ok(true),
+            (Ok(_), Ok(())) if !windows_pid_is_running(pid) => Ok(true),
             (Ok(output), Ok(())) => Err(io::Error::other(format!(
                 "failed to terminate process tree for {context} pid {pid}: taskkill exit: {}; stdout: {}; stderr: {}; primary kill: ok",
                 output.status.code().unwrap_or(-1),
@@ -560,7 +565,49 @@ fn force_kill_child_process_tree(child: &mut Child, context: &str) -> io::Result
     {
         let _ = context;
         let _ = pid;
-        child.kill()
+        child.kill()?;
+        Ok(false)
+    }
+}
+
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn windows_taskkill_status_is_success(status_code: Option<i32>) -> bool {
+    status_code == Some(0) || status_code == Some(128)
+}
+
+#[cfg(windows)]
+pub(crate) fn windows_pid_is_running(pid: u32) -> bool {
+    unsafe extern "system" {
+        fn OpenProcess(
+            dwDesiredAccess: u32,
+            bInheritHandle: i32,
+            dwProcessId: u32,
+        ) -> *mut core::ffi::c_void;
+        fn WaitForSingleObject(hHandle: *mut core::ffi::c_void, dwMilliseconds: u32) -> u32;
+        fn CloseHandle(hObject: *mut core::ffi::c_void) -> i32;
+    }
+
+    const SYNCHRONIZE: u32 = 0x00100000;
+    const WAIT_OBJECT_0: u32 = 0x00000000;
+    const WAIT_TIMEOUT: u32 = 0x00000102;
+
+    // SAFETY: `OpenProcess` returns a nullable handle for the PID; null means
+    // there is no waitable process object available for this PID.
+    let handle = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
+    if handle.is_null() {
+        return false;
+    }
+
+    // SAFETY: `handle` is a valid process handle with SYNCHRONIZE access.
+    let wait_result = unsafe { WaitForSingleObject(handle, 0) };
+    // SAFETY: `handle` is non-null and must be closed to release OS resources.
+    unsafe { CloseHandle(handle) };
+
+    match wait_result {
+        WAIT_TIMEOUT => true,
+        WAIT_OBJECT_0 => false,
+        _ => true,
     }
 }
 
