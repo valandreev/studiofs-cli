@@ -1043,11 +1043,36 @@ impl RedbMetaEngine {
                         )?
                     };
                     let Some(current_key) = current_key else {
-                        if displaced_remove_attr_ino.is_some() {
+                        let dst_in_base = Self::lookup_in_write_table(
+                            &txn,
+                            BASE_DENTRIES_TABLE,
+                            *new_parent,
+                            new_name,
+                        )?
+                        .map(|value| value.ino == entry.ino && value.kind == entry.kind)
+                        .unwrap_or(false);
+                        if dst_in_base {
+                            Self::remove_dentry_mirror_in_txn(&txn, *parent, name)?;
                             Self::remove_dentry_mirror_in_txn(&txn, *new_parent, new_name)?;
-                        }
-                        if let Some(ino) = displaced_remove_attr_ino {
-                            Self::remove_inode_mirror_in_txn(&txn, *ino)?;
+                            if Self::get_attr_from_write_table(&txn, INODES_TABLE, entry.ino)?
+                                .is_none()
+                                && let Some(attr) = Self::get_attr_from_write_table(
+                                    &txn,
+                                    BASE_INODES_TABLE,
+                                    entry.ino,
+                                )?
+                            {
+                                Self::set_inode_mirror_in_txn(&txn, &attr)?;
+                                Self::restore_mirror_aux_from_base_in_txn(&txn, entry.ino)?;
+                            }
+                            Self::set_dentry_mirror_in_txn(&txn, *new_parent, new_name, entry)?;
+                        } else {
+                            if displaced_remove_attr_ino.is_some() {
+                                Self::remove_dentry_mirror_in_txn(&txn, *new_parent, new_name)?;
+                            }
+                            if let Some(ino) = displaced_remove_attr_ino {
+                                Self::remove_inode_mirror_in_txn(&txn, *ino)?;
+                            }
                         }
                         continue;
                     };

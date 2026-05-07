@@ -2854,11 +2854,7 @@ impl PgMetaEngine {
             {
                 serving_displaced_dentry_cleanup_inodes.push(*ino);
             }
-            let serving_conflicts =
-                Self::serving_event_conflicts_with_overlay(event, overlay, &removed_inodes);
-            if !serving_conflicts {
-                serving_events.push(event.clone());
-            } else if let MetaEvent::RenameEntry {
+            if let MetaEvent::RenameEntry {
                 parent,
                 name,
                 new_parent,
@@ -2874,6 +2870,11 @@ impl PgMetaEngine {
                 )
             {
                 serving_rename_reconciles.push(event);
+            }
+            let serving_conflicts =
+                Self::serving_event_conflicts_with_overlay(event, overlay, &removed_inodes);
+            if !serving_conflicts {
+                serving_events.push(event.clone());
             } else if let MetaEvent::RemoveAttr { ino } = event {
                 serving_displaced_dentry_cleanup_inodes.push(*ino);
             }
