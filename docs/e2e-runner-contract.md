@@ -61,7 +61,7 @@ Required initial run flags and environment:
 | Flag | Contract |
 |---|---|
 | `basic-multi-client-smoke` | Positional shorthand for the mounted three-client happy-path smoke scenario. |
-| `--scenario <name>` | Repeatable. Accepted values include `basic-multi-client-smoke` (`smoke`), `postgres-outage-multi-client-recovery` (`postgres-outage`), `rustfs-outage-multi-client-recovery` (`rustfs-outage`, `s3-outage`), `mounted-client-crash-restart-recovery` (`client-crash-restart`, `crash-restart`), `mounted-publication-boundary-crash-matrix` (`publication-boundary-crash`, `publication-boundary`), `mounted-open-handle-convergence` (`open-handle`, `open-unlink-rename`), `mounted-chaos-convergence` (`mounted-chaos`, `chaos`), `mounted-fault-chaos-convergence` (`fault-chaos`, `chaos-faults`), `mounted-lww-reconnect-chaos-convergence` (`lww-chaos`, `reconnect-lww`), and the mounted namespace collision scenarios `collision-rename-vs-rename`, `collision-rename-vs-unlink`, `collision-unlink-vs-append`, `collision-overwrite-vs-read`, `collision-mkdir-rmdir-vs-create`, and `collision-readdir-stat-during-mutation`. |
+| `--scenario <name>` | Repeatable. Accepted values include `basic-multi-client-smoke` (`smoke`), `postgres-outage-multi-client-recovery` (`postgres-outage`), `rustfs-outage-multi-client-recovery` (`rustfs-outage`, `s3-outage`), `mounted-client-crash-restart-recovery` (`client-crash-restart`, `crash-restart`), `mounted-publication-boundary-crash-matrix` (`publication-boundary-crash`, `publication-boundary`), `mounted-open-handle-convergence` (`open-handle`, `open-unlink-rename`), `mounted-chaos-convergence` (`mounted-chaos`, `chaos`), `mounted-hotspot-churn-convergence` (`hotspot-churn`, `hot-dir-churn`), `mounted-fault-chaos-convergence` (`fault-chaos`, `chaos-faults`), `mounted-lww-reconnect-chaos-convergence` (`lww-chaos`, `reconnect-lww`), and the mounted namespace collision scenarios `collision-rename-vs-rename`, `collision-rename-vs-unlink`, `collision-unlink-vs-append`, `collision-overwrite-vs-read`, `collision-mkdir-rmdir-vs-create`, and `collision-readdir-stat-during-mutation`. |
 | `--studiofs-bin <path>` | Path to the product CLI under test. Real mounted scenarios require it when `--infra compose` or `--infra external-env` is used. The runner may build it only when an explicit build flag is added. |
 | `--root <path>` | Parent run directory. Defaults to `target/e2e-runs`. |
 | `--run-id <id>` | Optional stable run ID. If omitted, use an ISO-like UTC timestamp plus short random suffix. Explicit IDs must be safe single directory names: no separators, drive prefixes, traversal segments, leading dots, or other shell/path metacharacters. |
@@ -410,6 +410,18 @@ operation labels, and still enters mounted cleanup. The scenario writes
 `mounted-chaos-summary.json` and `validation.json`, and uses only mounted tree
 convergence plus namespace invariants as the pass condition. A failure should
 be reproducible with the same `--seed`.
+
+`mounted-hotspot-churn-convergence` focuses the mounted product chaos layer on
+one bounded hot directory. It uses the first three default mounted clients: two
+clients repeatedly create, unlink, rename, overwrite, and append files with the
+same `slot-*` prefix inside `hotspot/`, while the third client concurrently
+performs readdir, stat, and open/read probes against the same directory. The
+scenario records planned, started, accepted, rejected, and probe operations in
+`operations.ndjson`, writes `mounted-hotspot-churn-summary.json` and
+`validation.json`, and validates only the final mounted tree plus namespace
+invariants. Temporary divergence during the churn window is allowed; duplicate
+canonical paths, missing parents, resurrected children, and checksum mismatches
+are final validation failures.
 
 Mounted cleanup must not rely only on graceful unmount. If `studiofs umount`
 returns but the mounted process does not exit within the configured process-exit

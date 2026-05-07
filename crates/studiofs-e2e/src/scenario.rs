@@ -60,6 +60,8 @@ pub const COLLISION_READDIR_STAT_DURING_MUTATION: &str = "collision-readdir-stat
 /// Constant $name.
 pub const MOUNTED_CHAOS_CONVERGENCE: &str = "mounted-chaos-convergence";
 /// Constant $name.
+pub const MOUNTED_HOTSPOT_CHURN_CONVERGENCE: &str = "mounted-hotspot-churn-convergence";
+/// Constant $name.
 pub const MOUNTED_FAULT_CHAOS_CONVERGENCE: &str = "mounted-fault-chaos-convergence";
 /// Constant $name.
 pub const MOUNTED_LWW_RECONNECT_CHAOS_CONVERGENCE: &str = "mounted-lww-reconnect-chaos-convergence";
@@ -106,6 +108,10 @@ const COLLISION_CHILD_PAYLOAD: &[u8] = b"child\n";
 const OVERWRITE_READ_ATTEMPTS: u32 = 8;
 const CHAOS_ROUNDS: usize = 12;
 const CHAOS_READ_ATTEMPTS: u32 = 4;
+const HOTSPOT_CHURN_ROUNDS: usize = 10;
+const HOTSPOT_WORKING_SET: usize = 6;
+const HOTSPOT_PROBE_ATTEMPTS: u32 = 4;
+const HOTSPOT_PROBE_INTERVAL: Duration = Duration::from_millis(5);
 const CHAOS_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(90);
 const CHAOS_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const CHAOS_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -345,6 +351,14 @@ pub enum ScenarioError {
         /// The cleanup value.
         cleanup: String,
     },
+    #[error("mounted hot-spot churn scenario failed: {primary}; unmount also failed: {cleanup}")]
+    /// Field $name.
+    MountedHotspotChurnUnmountAfterFailure {
+        /// The primary value.
+        primary: String,
+        /// The cleanup value.
+        cleanup: String,
+    },
     #[error("mounted fault chaos scenario failed: {primary}; unmount also failed: {cleanup}")]
     /// Field $name.
     MountedFaultChaosUnmountAfterFailure {
@@ -394,6 +408,12 @@ pub enum ScenarioError {
     #[error("mounted chaos validation failed: {violations:?}")]
     /// Variant $name.
     MountedChaosInvariantViolations {
+        /// Field $name.
+        violations: Vec<NamespaceInvariantViolation>,
+    },
+    #[error("mounted hot-spot churn validation failed: {violations:?}")]
+    /// Variant $name.
+    MountedHotspotChurnInvariantViolations {
         /// Field $name.
         violations: Vec<NamespaceInvariantViolation>,
     },
@@ -478,6 +498,7 @@ pub fn available_scenarios() -> Vec<ScenarioDefinition> {
         NamespaceCollisionScenario::new(NamespaceCollisionKind::ReaddirStatDuringMutation)
             .definition(),
         MountedChaosConvergence.definition(),
+        MountedHotspotChurnConvergence.definition(),
         MountedFaultChaosConvergence.definition(),
         MountedLwwReconnectChaosConvergence.definition(),
         MountedOpenHandleConvergence.definition(),
@@ -519,6 +540,9 @@ pub(crate) fn resolve_scenario(name: &str) -> Option<Box<dyn Scenario>> {
         )),
         MOUNTED_CHAOS_CONVERGENCE | "mounted-chaos" | "chaos" => {
             Some(Box::new(MountedChaosConvergence))
+        }
+        MOUNTED_HOTSPOT_CHURN_CONVERGENCE | "hotspot-churn" | "hot-dir-churn" => {
+            Some(Box::new(MountedHotspotChurnConvergence))
         }
         MOUNTED_FAULT_CHAOS_CONVERGENCE | "fault-chaos" | "chaos-faults" => {
             Some(Box::new(MountedFaultChaosConvergence))
@@ -2573,6 +2597,11 @@ enum MountedChaosAction {
     ReadLoop {
         path: String,
     },
+    ProbeLoop {
+        dir: String,
+        stat_path: String,
+        read_path: String,
+    },
     Stat {
         path: String,
     },
@@ -3446,6 +3475,11 @@ fn execute_mounted_chaos_action(
         MountedChaosAction::Rmdir { path } => fs::remove_dir(client.mount_point.join(path)),
         MountedChaosAction::Read { path } => fs::read(client.mount_point.join(path)).map(|_| ()),
         MountedChaosAction::ReadLoop { path } => repeated_chaos_read(client, path),
+        MountedChaosAction::ProbeLoop {
+            dir,
+            stat_path,
+            read_path,
+        } => repeated_hotspot_probe(client, dir, stat_path, read_path),
         MountedChaosAction::Stat { path } => {
             fs::metadata(client.mount_point.join(path)).map(|_| ())
         }
@@ -3466,6 +3500,46 @@ fn repeated_chaos_read(client: &ClientSpec, relative_path: &str) -> io::Result<(
         thread::sleep(Duration::from_millis(5));
     }
     Ok(())
+}
+
+fn repeated_hotspot_probe(
+    client: &ClientSpec,
+    dir: &str,
+    stat_path: &str,
+    read_path: &str,
+) -> io::Result<()> {
+    for _ in 0..HOTSPOT_PROBE_ATTEMPTS {
+        let mut entries_seen = 0;
+        for entry in fs::read_dir(client.mount_point.join(dir))? {
+            entry?;
+            entries_seen += 1;
+        }
+        if entries_seen == 0 {
+            return Err(io::Error::other(format!(
+                "hotspot probe observed empty directory listing for {dir}"
+            )));
+        }
+        fs::metadata(client.mount_point.join(stat_path))?;
+        let payload = fs::read(client.mount_point.join(read_path))?;
+        validate_hotspot_payload(read_path, &payload)?;
+        thread::sleep(HOTSPOT_PROBE_INTERVAL);
+    }
+    Ok(())
+}
+
+fn validate_hotspot_payload(relative_path: &str, payload: &[u8]) -> io::Result<()> {
+    let text = std::str::from_utf8(payload).map_err(|error| {
+        io::Error::other(format!(
+            "hotspot probe read non-UTF-8 payload from {relative_path}: {error}"
+        ))
+    })?;
+    if text.starts_with("studiofs hotspot seed=") || text.starts_with("studiofs chaos seed=") {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "hotspot probe read unexpected payload from {relative_path}"
+        )))
+    }
 }
 
 fn write_mounted_chaos_plan_artifacts(
@@ -3900,6 +3974,484 @@ fn write_mounted_chaos_summary(
 
 fn chaos_payload(seed: u64, round: usize, label: &str) -> Vec<u8> {
     format!("studiofs chaos seed={seed} round={round} label={label}\n").into_bytes()
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MountedHotspotChurnConvergence;
+
+impl Scenario for MountedHotspotChurnConvergence {
+    fn definition(&self) -> ScenarioDefinition {
+        ScenarioDefinition {
+            name: MOUNTED_HOTSPOT_CHURN_CONVERGENCE,
+            description: "mounted hot-spot directory churn convergence scenario",
+            requires_studiofs_bin: true,
+            requires_mount: true,
+        }
+    }
+
+    fn setup(&self, context: &ScenarioContext) -> Result<(), ScenarioError> {
+        fs::create_dir_all(&context.scenario_dir)?;
+        Ok(())
+    }
+
+    fn run(&self, context: &ScenarioContext) -> Result<(), ScenarioError> {
+        if let Some(config) = &context.client_controller_config {
+            let mut driver = RealMountedChaosDriver(MultiClientController::new(
+                config.clone(),
+                SystemClientProcessExecutor,
+            ));
+            run_mounted_hotspot_churn_with_driver(
+                context,
+                &mut driver,
+                CHAOS_CONVERGENCE_TIMEOUT,
+                CHAOS_CONVERGENCE_POLL_INTERVAL,
+            )?;
+        } else {
+            write_mounted_hotspot_churn_plan_artifacts(context)?;
+        }
+        Ok(())
+    }
+
+    fn validate(&self, context: &ScenarioContext) -> Result<Vec<String>, ScenarioError> {
+        let summary_path = context
+            .scenario_dir
+            .join("mounted-hotspot-churn-summary.json");
+        if !summary_path.exists() {
+            return Err(ScenarioError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("missing summary artifact: {}", summary_path.display()),
+            )));
+        }
+        let summary: MountedHotspotChurnSummary =
+            serde_json::from_slice(&fs::read(&summary_path)?)?;
+        let validation = json!({
+            "scenario": MOUNTED_HOTSPOT_CHURN_CONVERGENCE,
+            "run_id": context.run_id,
+            "seed": context.seed,
+            "status": if summary.final_validator.converged
+                && summary.namespace_violations.is_empty() { "passed" } else { "failed" },
+            "rounds": summary.rounds,
+            "working_set": summary.working_set,
+            "accepted_operations": summary.accepted_operations,
+            "rejected_operations": summary.rejected_operations,
+            "probe_operations": summary.probe_operations,
+            "final_validator": summary.final_validator,
+            "namespace_violations": summary.namespace_violations,
+            "operation_log": summary.operation_log,
+        });
+        fs::write(
+            context.scenario_dir.join("validation.json"),
+            serde_json::to_vec_pretty(&validation)?,
+        )?;
+        Ok(vec![
+            format!(
+                "artifacts/scenarios/{MOUNTED_HOTSPOT_CHURN_CONVERGENCE}/mounted-hotspot-churn-summary.json"
+            ),
+            format!("artifacts/scenarios/{MOUNTED_HOTSPOT_CHURN_CONVERGENCE}/validation.json"),
+        ])
+    }
+
+    fn cleanup(&self, _context: &ScenarioContext) -> Result<(), ScenarioError> {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct MountedHotspotChurnSummary {
+    scenario: String,
+    seed: u64,
+    bootstrap: Option<VolumeBootstrapSummary>,
+    clients: usize,
+    rounds: usize,
+    working_set: usize,
+    observer_client: String,
+    operations: Vec<MountedChaosOperation>,
+    accepted_operations: usize,
+    rejected_operations: usize,
+    probe_operations: usize,
+    operation_log: String,
+    final_validator: TreeComparison,
+    namespace_violations: Vec<NamespaceInvariantViolation>,
+}
+
+fn run_mounted_hotspot_churn_with_driver(
+    context: &ScenarioContext,
+    driver: &mut dyn MountedChaosDriver,
+    convergence_timeout: Duration,
+    poll_interval: Duration,
+) -> Result<MountedHotspotChurnSummary, ScenarioError> {
+    let result =
+        run_mounted_hotspot_churn_body(context, driver, convergence_timeout, poll_interval);
+    let unmount_result = driver.unmount_all();
+    match (result, unmount_result) {
+        (Ok(summary), Ok(())) => Ok(summary),
+        (Err(primary), Err(cleanup)) => {
+            Err(ScenarioError::MountedHotspotChurnUnmountAfterFailure {
+                primary: primary.to_string(),
+                cleanup: cleanup.to_string(),
+            })
+        }
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+fn run_mounted_hotspot_churn_body(
+    context: &ScenarioContext,
+    driver: &mut dyn MountedChaosDriver,
+    convergence_timeout: Duration,
+    poll_interval: Duration,
+) -> Result<MountedHotspotChurnSummary, ScenarioError> {
+    let bootstrap = driver.bootstrap_volume(VolumeBootstrapOptions {
+        client_names: CHAOS_CLIENT_NAMES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect(),
+        clean_existing_local_metadata: true,
+    })?;
+    write_bootstrap_summary(context, &bootstrap)?;
+    driver.mount_all()?;
+    let clients = driver.clients();
+    if clients.len() < CHAOS_CLIENT_NAMES.len() {
+        return Err(ScenarioError::InsufficientChaosClients {
+            expected: CHAOS_CLIENT_NAMES.len(),
+            actual: clients.len(),
+        });
+    }
+    let clients = clients
+        .into_iter()
+        .take(CHAOS_CLIENT_NAMES.len())
+        .collect::<Vec<_>>();
+
+    establish_hotspot_initial_tree(context.seed, &clients[0])?;
+    driver.after_initial_tree(&clients)?;
+    wait_for_convergence(
+        &client_mounts(&clients),
+        context.scenario_dir.join("initial-validation"),
+        convergence_timeout,
+        poll_interval,
+    )?;
+
+    let started = Instant::now();
+    let mut operations = Vec::new();
+    for round in 0..HOTSPOT_CHURN_ROUNDS {
+        let tasks = hotspot_churn_tasks(context.seed, round, &clients);
+        let planned = planned_mounted_chaos_operations_from_tasks(started, &tasks);
+        write_mounted_hotspot_churn_operations(context, &planned)?;
+        let started_operations = started_mounted_chaos_operations_from_tasks(started, &tasks);
+        write_mounted_hotspot_churn_operations(context, &started_operations)?;
+        let mut round_operations = run_concurrent_mounted_chaos_operations(started, tasks)?;
+        write_mounted_hotspot_churn_operations(context, &round_operations)?;
+        operations.append(&mut round_operations);
+        driver.after_round(round, &clients)?;
+    }
+
+    finish_mounted_hotspot_churn(
+        context,
+        Some(bootstrap),
+        clients,
+        operations,
+        convergence_timeout,
+        poll_interval,
+    )
+}
+
+fn establish_hotspot_initial_tree(seed: u64, client: &ClientSpec) -> Result<(), ScenarioError> {
+    let root = client.mount_point.join("hotspot");
+    fs::create_dir_all(&root)?;
+    for slot in 0..HOTSPOT_WORKING_SET {
+        fs::write(
+            root.join(format!("slot-{slot:02}.txt")),
+            hotspot_payload(seed, 0, slot, "initial"),
+        )?;
+    }
+    Ok(())
+}
+
+fn hotspot_churn_tasks(seed: u64, round: usize, clients: &[ClientSpec]) -> Vec<MountedChaosTask> {
+    assert!(
+        clients.len() >= CHAOS_CLIENT_NAMES.len(),
+        "hotspot churn requires at least {} clients",
+        CHAOS_CLIENT_NAMES.len()
+    );
+    let writer_a = clients[round % 2].clone();
+    let writer_b = clients[(round + 1) % 2].clone();
+    let observer = clients[2].clone();
+    let slot = round % HOTSPOT_WORKING_SET;
+    let next_slot = (round + 1) % HOTSPOT_WORKING_SET;
+    let path = hotspot_slot_path(slot);
+    let next_path = hotspot_slot_path(next_slot);
+    match round % 5 {
+        0 => vec![
+            write_task(seed, round, 1, writer_a, path.clone()),
+            create_file_task(seed, round, 2, writer_b, next_path.clone()),
+            readdir_task(round, 3, observer.clone(), "hotspot".to_string()),
+            stat_task(round, 4, observer.clone(), next_path.clone()),
+            read_task(round, 5, observer, path),
+        ],
+        1 => {
+            let renamed = format!("hotspot/slot-{slot:02}-renamed.txt");
+            vec![
+                rename_task(round, 1, writer_a, path.clone(), renamed),
+                create_file_task(seed, round, 2, writer_b, path.clone()),
+                readdir_task(round, 3, observer.clone(), "hotspot".to_string()),
+                stat_task(round, 4, observer.clone(), path.clone()),
+                read_task(round, 5, observer, path),
+            ]
+        }
+        2 => vec![
+            unlink_task(round, 1, writer_a, path.clone()),
+            create_file_task(seed, round, 2, writer_b, path.clone()),
+            readdir_task(round, 3, observer.clone(), "hotspot".to_string()),
+            stat_task(round, 4, observer.clone(), next_path.clone()),
+            read_task(round, 5, observer, next_path),
+        ],
+        3 => vec![
+            append_task(seed, round, 1, writer_a, path.clone()),
+            write_task(seed, round, 2, writer_b, next_path.clone()),
+            readdir_task(round, 3, observer.clone(), "hotspot".to_string()),
+            stat_task(round, 4, observer.clone(), path.clone()),
+            read_task(round, 5, observer, path),
+        ],
+        _ => vec![
+            create_file_task(seed, round, 1, writer_a, path.clone()),
+            rename_task(round, 2, writer_b, next_path.clone(), path.clone()),
+            MountedChaosTask::new(
+                round,
+                3,
+                observer.clone(),
+                "probe_loop",
+                "hotspot",
+                SharedOperation::Readdir {
+                    path: "hotspot".to_string(),
+                },
+                MountedChaosAction::ProbeLoop {
+                    dir: "hotspot".to_string(),
+                    stat_path: path.clone(),
+                    read_path: path,
+                },
+            ),
+            stat_task(round, 4, observer.clone(), next_path.clone()),
+            read_task(round, 5, observer, next_path),
+        ],
+    }
+}
+
+fn hotspot_slot_path(slot: usize) -> String {
+    format!("hotspot/slot-{slot:02}.txt")
+}
+
+fn finish_mounted_hotspot_churn(
+    context: &ScenarioContext,
+    bootstrap: Option<VolumeBootstrapSummary>,
+    clients: Vec<ClientSpec>,
+    operations: Vec<MountedChaosOperation>,
+    convergence_timeout: Duration,
+    poll_interval: Duration,
+) -> Result<MountedHotspotChurnSummary, ScenarioError> {
+    let convergence = wait_for_convergence(
+        &client_mounts(&clients),
+        context.scenario_dir.join("validation"),
+        convergence_timeout,
+        poll_interval,
+    )?;
+    let namespace_violations = validate_hotspot_churn_namespace(&convergence.snapshots)?;
+    let summary = mounted_hotspot_churn_summary(
+        context,
+        bootstrap,
+        clients.len(),
+        clients[2].name.clone(),
+        operations,
+        convergence.comparison,
+        namespace_violations,
+    );
+    write_mounted_hotspot_churn_summary(context, &summary)?;
+    Ok(summary)
+}
+
+fn validate_hotspot_churn_namespace(
+    snapshots: &[crate::mounted_tree::MountedTreeSnapshot],
+) -> Result<Vec<NamespaceInvariantViolation>, ScenarioError> {
+    let mut namespace_violations = Vec::new();
+    for snapshot in snapshots {
+        namespace_violations.extend(validate_namespace_invariants(snapshot, &[]));
+    }
+    if namespace_violations.is_empty() {
+        Ok(namespace_violations)
+    } else {
+        Err(ScenarioError::MountedHotspotChurnInvariantViolations {
+            violations: namespace_violations,
+        })
+    }
+}
+
+fn mounted_hotspot_churn_summary(
+    context: &ScenarioContext,
+    bootstrap: Option<VolumeBootstrapSummary>,
+    clients: usize,
+    observer_client: String,
+    operations: Vec<MountedChaosOperation>,
+    final_validator: TreeComparison,
+    namespace_violations: Vec<NamespaceInvariantViolation>,
+) -> MountedHotspotChurnSummary {
+    let accepted_operations = operations
+        .iter()
+        .filter(|operation| operation.result == "accepted")
+        .count();
+    let rejected_operations = operations
+        .iter()
+        .filter(|operation| operation.result == "rejected")
+        .count();
+    let probe_operations = operations
+        .iter()
+        .filter(|operation| hotspot_operation_role(operation) == "observer")
+        .count();
+    MountedHotspotChurnSummary {
+        scenario: MOUNTED_HOTSPOT_CHURN_CONVERGENCE.to_string(),
+        seed: context.seed,
+        bootstrap,
+        clients,
+        rounds: HOTSPOT_CHURN_ROUNDS,
+        working_set: HOTSPOT_WORKING_SET,
+        observer_client,
+        operations,
+        accepted_operations,
+        rejected_operations,
+        probe_operations,
+        operation_log: format!(
+            "artifacts/scenarios/{MOUNTED_HOTSPOT_CHURN_CONVERGENCE}/operations.ndjson"
+        ),
+        final_validator,
+        namespace_violations,
+    }
+}
+
+fn write_mounted_hotspot_churn_plan_artifacts(
+    context: &ScenarioContext,
+) -> Result<MountedHotspotChurnSummary, ScenarioError> {
+    fs::create_dir_all(&context.scenario_dir)?;
+    let started = Instant::now();
+    let planned_clients = CHAOS_CLIENT_NAMES
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            client_spec_for_plan(
+                &context.sandbox,
+                name,
+                context
+                    .sandbox
+                    .join("planned-mounts")
+                    .join(format!("client-{index}")),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut operations = Vec::new();
+    for round in 0..HOTSPOT_CHURN_ROUNDS {
+        let tasks = hotspot_churn_tasks(context.seed, round, &planned_clients);
+        let mut planned = planned_mounted_chaos_operations_from_tasks(started, &tasks);
+        write_mounted_hotspot_churn_operations(context, &planned)?;
+        operations.append(&mut planned);
+    }
+    let summary = mounted_hotspot_churn_summary(
+        context,
+        None,
+        CHAOS_CLIENT_NAMES.len(),
+        CHAOS_CLIENT_NAMES[2].to_string(),
+        operations,
+        TreeComparison {
+            converged: true,
+            reference_client: Some(CHAOS_CLIENT_NAMES[0].to_string()),
+            compared_clients: CHAOS_CLIENT_NAMES
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
+            differences: Vec::new(),
+        },
+        Vec::new(),
+    );
+    write_mounted_hotspot_churn_summary(context, &summary)?;
+    Ok(summary)
+}
+
+fn client_spec_for_plan(sandbox: &Path, name: &str, mount_point: PathBuf) -> ClientSpec {
+    ClientSpec {
+        name: name.to_string(),
+        client_root: sandbox.join("planned-clients").join(name),
+        local_metadata_dir: sandbox.join("planned-clients").join(name).join("meta"),
+        local_metadata_db: sandbox
+            .join("planned-clients")
+            .join(name)
+            .join("meta")
+            .join("projectfs.db"),
+        cache_dir: sandbox.join("planned-clients").join(name).join("cache"),
+        mount_metadata_dir: sandbox.join("planned-clients").join(name).join("mount"),
+        mount_point,
+        stdout_log: sandbox
+            .join("planned-clients")
+            .join(name)
+            .join("stdout.log"),
+        stderr_log: sandbox
+            .join("planned-clients")
+            .join(name)
+            .join("stderr.log"),
+        tracing_log: sandbox
+            .join("planned-clients")
+            .join(name)
+            .join("studiofs-tracing.log"),
+        process_id: None,
+        state: ClientLifecycleState::Planned,
+    }
+}
+
+fn write_mounted_hotspot_churn_operations(
+    context: &ScenarioContext,
+    operations: &[MountedChaosOperation],
+) -> Result<(), ScenarioError> {
+    let path = operation_log_path(context);
+    let mut writer = OperationLogWriter::open_append(&path)?;
+    for operation in operations {
+        let mut record = shared_operation_record(
+            &writer,
+            MOUNTED_HOTSPOT_CHURN_CONVERGENCE,
+            operation.shared_operation.clone(),
+        )
+        .with_client(&operation.client)
+        .with_timestamp_ms(operation.timestamp_ms)
+        .with_outcome(mounted_chaos_outcome(operation))
+        .with_metadata("round", operation.round.to_string())
+        .with_metadata("operation", operation.operation.clone())
+        .with_metadata("result", &operation.result)
+        .with_metadata("role", hotspot_operation_role(operation));
+        if let Some(error) = &operation.error {
+            record = record.with_metadata("error", error);
+        }
+        append_shared_record(&mut writer, &record)?;
+    }
+    Ok(())
+}
+
+fn hotspot_operation_role(operation: &MountedChaosOperation) -> &'static str {
+    match operation.operation.as_str() {
+        "readdir" | "stat" | "read" | "probe_loop" | "read_loop" => "observer",
+        _ => "mutator",
+    }
+}
+
+fn write_mounted_hotspot_churn_summary(
+    context: &ScenarioContext,
+    summary: &MountedHotspotChurnSummary,
+) -> Result<(), ScenarioError> {
+    fs::write(
+        context
+            .scenario_dir
+            .join("mounted-hotspot-churn-summary.json"),
+        serde_json::to_vec_pretty(summary)?,
+    )?;
+    Ok(())
+}
+
+fn hotspot_payload(seed: u64, round: usize, slot: usize, label: &str) -> Vec<u8> {
+    format!("studiofs hotspot seed={seed} round={round} slot={slot} label={label}\n").into_bytes()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -9664,6 +10216,212 @@ mod tests {
         assert!(resolve_scenario(MOUNTED_CHAOS_CONVERGENCE).is_some());
         assert!(resolve_scenario("mounted-chaos").is_some());
         assert!(resolve_scenario("chaos").is_some());
+    }
+
+    #[test]
+    fn registry_exposes_mounted_hotspot_churn_scenario() {
+        let scenarios = available_scenarios();
+
+        assert!(scenarios.iter().any(|scenario| {
+            scenario.name == MOUNTED_HOTSPOT_CHURN_CONVERGENCE
+                && scenario.requires_studiofs_bin
+                && scenario.requires_mount
+                && scenario.description.contains("hot-spot")
+        }));
+        assert!(resolve_scenario(MOUNTED_HOTSPOT_CHURN_CONVERGENCE).is_some());
+        assert!(resolve_scenario("hotspot-churn").is_some());
+        assert!(resolve_scenario("hot-dir-churn").is_some());
+    }
+
+    #[test]
+    fn mounted_hotspot_churn_plan_records_bounded_mutations_and_observer_probes() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-hotspot-plan");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(MOUNTED_HOTSPOT_CHURN_CONVERGENCE);
+        let context = ScenarioContext {
+            run_id: "run-hotspot-plan".to_string(),
+            seed: 376,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+
+        write_mounted_hotspot_churn_plan_artifacts(&context).unwrap();
+        MountedHotspotChurnConvergence
+            .validate(&context)
+            .expect("plan artifacts should validate without a real mount");
+
+        let operations =
+            read_operation_log(context.scenario_dir.join("operations.ndjson")).unwrap();
+        assert!(operations.iter().any(|record| matches!(
+            &record.operation,
+            SharedOperation::CreateFile { path, .. } if path.starts_with("hotspot/")
+        )));
+        assert!(operations.iter().any(|record| matches!(
+            &record.operation,
+            SharedOperation::Unlink { path } if path.starts_with("hotspot/")
+        )));
+        assert!(operations.iter().any(|record| matches!(
+            &record.operation,
+            SharedOperation::Rename { from, to }
+                if from.starts_with("hotspot/") && to.starts_with("hotspot/")
+        )));
+        assert!(operations.iter().any(|record| matches!(
+            &record.operation,
+            SharedOperation::Write { path, .. } if path.starts_with("hotspot/")
+        )));
+        assert!(operations.iter().any(|record| matches!(
+            &record.operation,
+            SharedOperation::Readdir { path } if path == "hotspot"
+        )));
+        assert!(operations.iter().any(|record| matches!(
+            &record.operation,
+            SharedOperation::Stat { path } if path.starts_with("hotspot/")
+        )));
+        assert!(operations.iter().any(|record| matches!(
+            &record.operation,
+            SharedOperation::Read { path, .. } if path.starts_with("hotspot/")
+        )));
+        assert!(operations.iter().any(|record| {
+            record
+                .metadata
+                .get("role")
+                .is_some_and(|role| role == "observer")
+        }));
+        assert!(
+            operations.iter().all(|record| match &record.operation {
+                SharedOperation::CreateFile { path, .. }
+                | SharedOperation::Unlink { path }
+                | SharedOperation::Write { path, .. }
+                | SharedOperation::Read { path, .. }
+                | SharedOperation::Stat { path }
+                | SharedOperation::Readdir { path } =>
+                    path == "hotspot"
+                        || path
+                            .strip_prefix("hotspot/")
+                            .and_then(|rest| rest.split('/').next())
+                            .is_some_and(|name| name.starts_with("slot-")),
+                SharedOperation::Rename { from, to } => [from, to].iter().all(|path| {
+                    path.strip_prefix("hotspot/")
+                        .and_then(|rest| rest.split('/').next())
+                        .is_some_and(|name| name.starts_with("slot-"))
+                }),
+                _ => true,
+            }),
+            "hotspot churn must stay inside the bounded working set"
+        );
+        assert!(
+            context
+                .scenario_dir
+                .join("mounted-hotspot-churn-summary.json")
+                .exists()
+        );
+        assert!(context.scenario_dir.join("validation.json").exists());
+    }
+
+    #[test]
+    fn hotspot_probe_rejects_empty_listing_and_unexpected_payload() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-hotspot-probe");
+        let mount = temp.path().join("mounts").join("client-c");
+        let hotspot = mount.join("hotspot");
+        std::fs::create_dir_all(&hotspot).unwrap();
+        let client = client_spec_for(&sandbox, "projectfs", "client-c", mount.clone());
+
+        let empty_err = repeated_hotspot_probe(
+            &client,
+            "hotspot",
+            "hotspot/slot-00.txt",
+            "hotspot/slot-00.txt",
+        )
+        .unwrap_err();
+        assert!(empty_err.to_string().contains("empty directory listing"));
+
+        std::fs::write(hotspot.join("slot-00.txt"), b"corrupt payload").unwrap();
+        let payload_err = repeated_hotspot_probe(
+            &client,
+            "hotspot",
+            "hotspot/slot-00.txt",
+            "hotspot/slot-00.txt",
+        )
+        .unwrap_err();
+        assert!(payload_err.to_string().contains("unexpected payload"));
+
+        std::fs::write(
+            hotspot.join("slot-00.txt"),
+            hotspot_payload(376, 0, 0, "initial"),
+        )
+        .unwrap();
+        repeated_hotspot_probe(
+            &client,
+            "hotspot",
+            "hotspot/slot-00.txt",
+            "hotspot/slot-00.txt",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn mounted_hotspot_churn_preserves_primary_error_when_unmount_also_fails() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-hotspot-unmount");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(MOUNTED_HOTSPOT_CHURN_CONVERGENCE);
+        let mut driver =
+            RecordingMountedChaosDriver::new(Vec::new()).with_unmount_error("umount failed");
+        let context = ScenarioContext {
+            run_id: "run-hotspot-unmount".to_string(),
+            seed: 376,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+
+        let err = run_mounted_hotspot_churn_with_driver(
+            &context,
+            &mut driver,
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+        )
+        .unwrap_err();
+
+        let message = err.to_string();
+        assert!(matches!(
+            err,
+            ScenarioError::MountedHotspotChurnUnmountAfterFailure { .. }
+        ));
+        assert!(message.contains("requires at least 3 clients"));
+        assert!(message.contains("umount failed"));
+    }
+
+    #[test]
+    fn mounted_hotspot_churn_reports_specific_namespace_invariant_error() {
+        let snapshots = vec![crate::mounted_tree::MountedTreeSnapshot {
+            schema_version: 1,
+            client: "client-a".to_string(),
+            mount_point: "mounts/client-a".to_string(),
+            entries: vec![crate::mounted_tree::TreeEntry {
+                path: "hotspot/slot-00.txt".to_string(),
+                entry_type: crate::mounted_tree::TreeEntryKind::File,
+                size: Some(12),
+                modified_unix_ms: None,
+                checksum_sha256: Some(bytes_sha256(b"payload")),
+                symlink_target: None,
+            }],
+        }];
+
+        let err = validate_hotspot_churn_namespace(&snapshots).unwrap_err();
+
+        assert!(matches!(
+            err,
+            ScenarioError::MountedHotspotChurnInvariantViolations { .. }
+        ));
+        assert!(err.to_string().contains("missing parent directory"));
     }
 
     #[test]

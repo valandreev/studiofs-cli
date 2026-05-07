@@ -203,6 +203,13 @@ and started operations before launching short-lived operation helper processes,
 then records accepted or rejected results after the helpers return. If a helper
 does not return within the round timeout, the scenario force-terminates pending
 helpers, fails with their operation labels, and still attempts mounted cleanup.
+The `mounted-hotspot-churn-convergence` scenario narrows that product chaos
+surface to one bounded `hotspot/` directory. Two mounted clients mutate the same
+small `slot-*` working set with create, delete, rename, overwrite, append, and
+same-prefix path churn while a third mounted observer repeatedly performs
+readdir/stat/open probes. It records `operations.ndjson`,
+`mounted-hotspot-churn-summary.json`, and `validation.json`; only final mounted
+tree divergence or namespace/probe contract failures should fail the run.
 The `mounted-open-handle-convergence` scenario keeps file handles open while
 another mounted client unlinks or renames the same namespace entry, then
 validates that flush/fsync/release do not resurrect deleted paths and that the
