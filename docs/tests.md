@@ -217,6 +217,10 @@ opens the explicit public convergence gate by refreshing observer peers,
 records peer checksums at that gate, then waits for mounted-tree convergence.
 It records shared-schema `operations.ndjson`, `publication-boundary-summary.json`,
 and `validation.json`.
+Early peer visibility is allowed in this scenario once the writer data is
+locally durable and the product has completed its normal background publication;
+the gate exists to make the observer refresh explicit instead of relying on a
+timing window.
 The
 `mounted-fault-chaos-convergence`
 scenario is the next product fault-chaos layer: it mixes a mounted conflict

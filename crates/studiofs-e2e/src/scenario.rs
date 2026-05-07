@@ -289,16 +289,6 @@ pub enum ScenarioError {
         /// The actual value.
         actual: usize,
     },
-    #[error(
-        "peer client {client} observed publication boundary payload before convergence: {checksum}"
-    )]
-    /// A peer observed a boundary payload before the public convergence gate.
-    PeerObservedPrematurePublication {
-        /// The client value.
-        client: String,
-        /// The checksum value.
-        checksum: String,
-    },
     #[error("namespace collision scenario requires at least {expected} clients, got {actual}")]
     /// Field $name.
     InsufficientCollisionClients {
