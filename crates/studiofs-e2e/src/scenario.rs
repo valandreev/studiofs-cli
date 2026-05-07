@@ -116,7 +116,9 @@ const CHAOS_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(90);
 const CHAOS_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const CHAOS_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const CHAOS_HELPER_START_TIMEOUT: Duration = Duration::from_secs(60);
-#[cfg(not(test))]
+const MOUNTED_WRITE_READBACK_TIMEOUT: Duration = Duration::from_secs(5);
+const MOUNTED_WRITE_READBACK_POLL_INTERVAL: Duration = Duration::from_millis(25);
+#[cfg(all(not(test), not(windows)))]
 const CHAOS_HELPER_KILL_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const FAULT_CHAOS_CONFLICT_ROUNDS: usize = 6;
 const FAULT_CHAOS_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -2837,14 +2839,17 @@ fn write_mounted_chaos_initial_file(path: PathBuf, payload: &[u8]) -> Result<(),
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&path)?;
+    let mut options = mounted_write_barrier_open_options();
+    let mut file = options.create_new(true).open(&path)?;
     file.write_all(payload)?;
-    file.flush()?;
+    file.sync_all()?;
     drop(file);
-    let readback = fs::read(&path)?;
+    let readback = wait_for_mounted_payload_readback(
+        &path,
+        payload,
+        MOUNTED_WRITE_READBACK_TIMEOUT,
+        MOUNTED_WRITE_READBACK_POLL_INTERVAL,
+    )?;
     if readback != payload {
         return Err(ScenarioError::Io(std::io::Error::other(format!(
             "mounted chaos initial write readback mismatch for {}: expected {} bytes, read {} bytes",
@@ -2854,6 +2859,28 @@ fn write_mounted_chaos_initial_file(path: PathBuf, payload: &[u8]) -> Result<(),
         ))));
     }
     Ok(())
+}
+
+fn wait_for_mounted_payload_readback(
+    path: &Path,
+    payload: &[u8],
+    timeout: Duration,
+    poll_interval: Duration,
+) -> Result<Vec<u8>, ScenarioError> {
+    let deadline = Instant::now() + timeout;
+    let mut last_readback = Vec::new();
+    loop {
+        match fs::read(path) {
+            Ok(readback) if readback == payload => return Ok(readback),
+            Ok(readback) => last_readback = readback,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        if Instant::now() >= deadline {
+            return Ok(last_readback);
+        }
+        thread::sleep(std::cmp::max(poll_interval, Duration::from_millis(1)));
+    }
 }
 
 fn perform_mounted_chaos_round(
@@ -3405,60 +3432,61 @@ impl MountedChaosProcess for SystemMountedChaosProcess {
                 .args(["/PID", &pid, "/T", "/F"])
                 .output();
             let primary_result = self.child.kill();
-            match (tree_result, primary_result) {
-                (Ok(output), _) if output.status.success() || output.status.code() == Some(128) => {
+            return match (tree_result, primary_result) {
+                (Ok(output), primary_result)
+                    if crate::client::windows_taskkill_status_is_success(
+                        output.status.code(),
+                        &String::from_utf8_lossy(&output.stderr),
+                        primary_result.is_ok(),
+                    ) =>
+                {
+                    Ok(())
                 }
-                (Ok(output), Ok(())) => {
-                    return Err(io::Error::other(format!(
-                        "failed to terminate mounted chaos helper {}: taskkill exit {}; stdout: {}; stderr: {}; primary kill: ok",
-                        self.task.operation,
-                        output.status.code().unwrap_or(-1),
-                        String::from_utf8_lossy(&output.stdout).trim(),
-                        String::from_utf8_lossy(&output.stderr).trim()
-                    )));
-                }
-                (Ok(output), Err(primary)) => {
-                    return Err(io::Error::other(format!(
-                        "failed to terminate mounted chaos helper {}: taskkill exit {}; stdout: {}; stderr: {}; primary kill: {primary}",
-                        self.task.operation,
-                        output.status.code().unwrap_or(-1),
-                        String::from_utf8_lossy(&output.stdout).trim(),
-                        String::from_utf8_lossy(&output.stderr).trim()
-                    )));
-                }
-                (Err(tree), Ok(())) => {
-                    return Err(io::Error::other(format!(
-                        "failed to terminate mounted chaos helper {}: taskkill failed: {tree}; primary kill: ok",
-                        self.task.operation
-                    )));
-                }
-                (Err(tree), Err(primary)) => {
-                    return Err(io::Error::other(format!(
-                        "failed to terminate mounted chaos helper {}: taskkill failed: {tree}; primary kill: {primary}",
-                        self.task.operation
-                    )));
-                }
-            }
+                (Ok(output), Ok(())) => Err(io::Error::other(format!(
+                    "failed to terminate mounted chaos helper {}: taskkill exit {}; stdout: {}; stderr: {}; primary kill: ok",
+                    self.task.operation,
+                    output.status.code().unwrap_or(-1),
+                    String::from_utf8_lossy(&output.stdout).trim(),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ))),
+                (Ok(output), Err(primary)) => Err(io::Error::other(format!(
+                    "failed to terminate mounted chaos helper {}: taskkill exit {}; stdout: {}; stderr: {}; primary kill: {primary}",
+                    self.task.operation,
+                    output.status.code().unwrap_or(-1),
+                    String::from_utf8_lossy(&output.stdout).trim(),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ))),
+                (Err(tree), Ok(())) => Err(io::Error::other(format!(
+                    "failed to terminate mounted chaos helper {}: taskkill failed: {tree}; primary kill: ok",
+                    self.task.operation
+                ))),
+                (Err(tree), Err(primary)) => Err(io::Error::other(format!(
+                    "failed to terminate mounted chaos helper {}: taskkill failed: {tree}; primary kill: {primary}",
+                    self.task.operation
+                ))),
+            };
         }
 
         #[cfg(not(windows))]
-        self.child.kill()?;
+        {
+            self.child.kill()?;
 
-        let deadline = Instant::now() + CHAOS_HELPER_KILL_WAIT_TIMEOUT;
-        while self.child.try_wait()?.is_none() {
-            if Instant::now() >= deadline {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!(
-                        "mounted chaos helper {} did not exit after force termination within {} ms",
-                        self.task.operation,
-                        CHAOS_HELPER_KILL_WAIT_TIMEOUT.as_millis()
-                    ),
-                ));
+            let deadline = Instant::now() + CHAOS_HELPER_KILL_WAIT_TIMEOUT;
+            while self.child.try_wait()?.is_none() {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "mounted chaos helper {} did not exit after force termination within {} ms",
+                            self.task.operation,
+                            CHAOS_HELPER_KILL_WAIT_TIMEOUT.as_millis()
+                        ),
+                    ));
+                }
+                thread::sleep(Duration::from_millis(5));
             }
-            thread::sleep(Duration::from_millis(5));
+            Ok(())
         }
-        Ok(())
     }
 }
 
@@ -3603,13 +3631,23 @@ fn execute_mounted_chaos_action(
 }
 
 fn write_payload_with_publication_barrier(path: &Path, payload: &[u8]) -> io::Result<()> {
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(path)?;
+    let mut options = mounted_write_barrier_open_options();
+    let mut file = options.create(true).truncate(true).open(path)?;
     file.write_all(payload)?;
     file.sync_all()
+}
+
+fn mounted_write_barrier_open_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options.write(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_FLAG_WRITE_THROUGH: u32 = 0x8000_0000;
+        options.custom_flags(FILE_FLAG_WRITE_THROUGH);
+    }
+    options
 }
 
 fn repeated_chaos_read(client: &ClientSpec, relative_path: &str) -> io::Result<()> {
@@ -9809,6 +9847,33 @@ mod tests {
         write_mounted_chaos_initial_file(file_path.clone(), &payload).unwrap();
 
         assert_eq!(std::fs::read(file_path).unwrap(), payload);
+    }
+
+    #[test]
+    fn mounted_chaos_initial_readback_waits_for_delayed_visibility() {
+        let temp = tempdir().unwrap();
+        let file_path = temp.path().join("chaos").join("delayed.txt");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(&file_path, b"").unwrap();
+        let payload = chaos_payload(376, 7, "delayed-readback");
+        let writer_path = file_path.clone();
+        let writer_payload = payload.clone();
+
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(40));
+            std::fs::write(writer_path, writer_payload).unwrap();
+        });
+
+        let readback = wait_for_mounted_payload_readback(
+            &file_path,
+            &payload,
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+        )
+        .unwrap();
+        writer.join().unwrap();
+
+        assert_eq!(readback, payload);
     }
 
     #[test]

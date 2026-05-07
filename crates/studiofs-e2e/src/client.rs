@@ -480,7 +480,10 @@ impl ClientProcessExecutor for SystemClientProcessExecutor {
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr))
             .spawn()?;
-        Ok(Box::new(SystemClientProcess { child }))
+        Ok(Box::new(SystemClientProcess {
+            child,
+            force_kill_confirmed_exit: false,
+        }))
     }
 
     fn is_mount_ready(&self, command: &ClientCommand) -> io::Result<bool> {
@@ -494,6 +497,7 @@ impl ClientProcessExecutor for SystemClientProcessExecutor {
 
 struct SystemClientProcess {
     child: Child,
+    force_kill_confirmed_exit: bool,
 }
 
 impl ClientProcess for SystemClientProcess {
@@ -502,10 +506,11 @@ impl ClientProcess for SystemClientProcess {
     }
 
     fn try_wait(&mut self) -> io::Result<Option<i32>> {
-        Ok(self
+        let status = self
             .child
             .try_wait()?
-            .map(|status| status.code().unwrap_or(-1)))
+            .map(|status| status.code().unwrap_or(-1));
+        Ok(status.or_else(|| self.force_kill_confirmed_exit.then_some(-1)))
     }
 
     fn kill(&mut self) -> io::Result<()> {
@@ -513,7 +518,8 @@ impl ClientProcess for SystemClientProcess {
     }
 
     fn kill_process_tree(&mut self, context: &str) -> io::Result<()> {
-        force_kill_child_process_tree(&mut self.child, context)
+        self.force_kill_confirmed_exit = force_kill_child_process_tree(&mut self.child, context)?;
+        Ok(())
     }
 }
 
@@ -523,7 +529,7 @@ fn join_output_reader(reader: thread::JoinHandle<io::Result<Vec<u8>>>) -> io::Re
         .map_err(|_| io::Error::other("client command output reader panicked"))?
 }
 
-fn force_kill_child_process_tree(child: &mut Child, context: &str) -> io::Result<()> {
+fn force_kill_child_process_tree(child: &mut Child, context: &str) -> io::Result<bool> {
     let pid = child.id();
     #[cfg(windows)]
     {
@@ -540,7 +546,7 @@ fn force_kill_child_process_tree(child: &mut Child, context: &str) -> io::Result
                     primary_result.is_ok(),
                 ) =>
             {
-                Ok(())
+                Ok(true)
             }
             (Ok(output), Ok(())) => Err(io::Error::other(format!(
                 "failed to terminate process tree for {context} pid {pid}: taskkill exit: {}; stdout: {}; stderr: {}; primary kill: ok",
@@ -566,7 +572,8 @@ fn force_kill_child_process_tree(child: &mut Child, context: &str) -> io::Result
     {
         let _ = context;
         let _ = pid;
-        child.kill()
+        child.kill()?;
+        Ok(false)
     }
 }
 

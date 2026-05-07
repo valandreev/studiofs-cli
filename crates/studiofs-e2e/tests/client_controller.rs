@@ -689,6 +689,30 @@ fn force_kill_uses_process_tree_termination_for_tracked_mount_process() {
 }
 
 #[test]
+fn force_kill_accepts_confirmed_tree_termination_when_process_handle_stays_stale() {
+    let temp = tempdir().unwrap();
+    let executor = RecordingExecutor {
+        process_never_exits: true,
+        process_tree_kill_confirmed_exit: true,
+        ..RecordingExecutor::new()
+    };
+    let process_tree_kills = Rc::clone(&executor.process_tree_kills);
+    let mut config = test_config(temp.path());
+    config.mount_exit_timeout = Duration::from_millis(20);
+    config.poll_interval = Duration::from_millis(1);
+    let mut controller = MultiClientController::new(config, executor);
+    controller.create_clients(["client-a"]).unwrap();
+    controller.init_first_client().unwrap();
+    controller.mount_all().unwrap();
+
+    controller.force_kill("client-a").unwrap();
+
+    assert_eq!(process_tree_kills.get(), 1);
+    assert_eq!(controller.clients()[0].state, ClientLifecycleState::Killed);
+    assert!(controller.clients()[0].process_id.is_none());
+}
+
+#[test]
 fn unmount_timeout_fallback_uses_process_tree_termination() {
     let temp = tempdir().unwrap();
     let executor = RecordingExecutor {
@@ -875,6 +899,7 @@ struct RecordingExecutor {
     process_never_exits: bool,
     process_tree_kills: Rc<Cell<usize>>,
     process_tree_kill_never_exits: bool,
+    process_tree_kill_confirmed_exit: bool,
 }
 
 impl RecordingExecutor {
@@ -903,6 +928,7 @@ impl RecordingExecutor {
             process_never_exits: false,
             process_tree_kills: Rc::new(Cell::new(0)),
             process_tree_kill_never_exits: false,
+            process_tree_kill_confirmed_exit: false,
         }
     }
 }
@@ -998,6 +1024,7 @@ impl ClientProcessExecutor for RecordingExecutor {
             never_exits: self.process_never_exits,
             process_tree_kills: Rc::clone(&self.process_tree_kills),
             process_tree_kill_never_exits: self.process_tree_kill_never_exits,
+            process_tree_kill_confirmed_exit: self.process_tree_kill_confirmed_exit,
             killed_once: Cell::new(false),
         }))
     }
@@ -1030,6 +1057,7 @@ struct RecordingProcess {
     never_exits: bool,
     process_tree_kills: Rc<Cell<usize>>,
     process_tree_kill_never_exits: bool,
+    process_tree_kill_confirmed_exit: bool,
     killed_once: Cell<bool>,
 }
 
@@ -1042,6 +1070,9 @@ impl ClientProcess for RecordingProcess {
         self.wait_calls.set(self.wait_calls.get() + 1);
         let calls = self.try_wait_calls.get() + 1;
         self.try_wait_calls.set(calls);
+        if self.process_tree_kill_confirmed_exit && self.killed_once.get() {
+            return Ok(Some(self.exit_status));
+        }
         if self.never_exits && (!self.killed_once.get() || self.process_tree_kill_never_exits) {
             return Ok(None);
         }

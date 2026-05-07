@@ -159,7 +159,11 @@ fn unmount_windows(mount_point: &str, pid: u32) -> Result<()> {
             // SAFETY: `process` is still valid after `TerminateProcess`; wait until Windows
             // actually signals process exit so `umount` cannot report a false success.
             let after_terminate = unsafe { WaitForSingleObject(process, FORCE_TERMINATE_WAIT_MS) };
-            let result = windows_process_exit_after_terminate(after_terminate);
+            let result = windows_process_exit_after_terminate(
+                pid,
+                after_terminate,
+                super::utils::is_process_running(pid),
+            );
             // SAFETY: `process` was returned by `OpenProcess`; closing it is the required cleanup
             // action after waiting.
             unsafe { CloseHandle(process) };
@@ -200,12 +204,18 @@ fn windows_open_process_failure_after_signal(
 }
 
 #[cfg(windows)]
-fn windows_process_exit_after_terminate(wait_result: u32) -> Result<()> {
+fn windows_process_exit_after_terminate(
+    pid: u32,
+    wait_result: u32,
+    still_running: bool,
+) -> Result<()> {
     if wait_result == WAIT_OBJECT_0 {
+        Ok(())
+    } else if wait_result == WAIT_TIMEOUT && !still_running {
         Ok(())
     } else if wait_result == WAIT_TIMEOUT {
         anyhow::bail!(
-            "mount process did not exit after force termination within {} ms",
+            "mount process {pid} did not exit after force termination within {} ms",
             FORCE_TERMINATE_WAIT_MS
         );
     } else {
@@ -364,11 +374,22 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_umount_reports_process_that_survives_force_termination() {
-        let result = windows_process_exit_after_terminate(WAIT_TIMEOUT);
+        let result = windows_process_exit_after_terminate(123, WAIT_TIMEOUT, true);
 
         assert!(result.is_err());
         let message = result.unwrap_err().to_string();
-        assert!(message.contains("mount process did not exit after force termination"));
+        assert!(message.contains("did not exit after force termination"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_umount_treats_force_terminated_process_report_race_as_success() {
+        let result = windows_process_exit_after_terminate(123, WAIT_TIMEOUT, false);
+
+        assert!(
+            result.is_ok(),
+            "post-terminate wait timeout is successful once the PID is no longer running"
+        );
     }
 
     #[cfg(windows)]
