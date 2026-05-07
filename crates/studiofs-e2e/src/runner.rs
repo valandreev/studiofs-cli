@@ -684,12 +684,7 @@ fn run_with_executor_and_mount_lock_dir(
     {
         record_event(&events_path, &run_id, None, "run", "finished")?;
     }
-    let scenario_failed = scenario_outcomes
-        .iter()
-        .any(|scenario| scenario.status != ScenarioStatus::Passed);
-    let run_timed_out = scenario_outcomes
-        .iter()
-        .any(|scenario| scenario.status == ScenarioStatus::TimedOut);
+    let (run_timed_out, scenario_failed) = scenario_outcome_flags(&scenario_outcomes);
     if scenario_failed {
         let interim_cleanup = CleanupReport {
             status: RunStatus::Interrupted,
@@ -697,7 +692,7 @@ fn run_with_executor_and_mount_lock_dir(
             errors: Vec::new(),
         };
         let (interim_status, interim_exit_code) =
-            run_status_and_exit_code(scenario_failed, run_timed_out, false);
+            run_status_and_exit_code(run_timed_out, scenario_failed, false);
         finish_run(FinishRunInput {
             run_id: run_id.clone(),
             seed: request.seed,
@@ -741,7 +736,7 @@ fn run_with_executor_and_mount_lock_dir(
 
     let cleanup_failed = cleanup.status == RunStatus::CleanupFailed;
     let (status, exit_code) =
-        run_status_and_exit_code(scenario_failed, run_timed_out, cleanup_failed);
+        run_status_and_exit_code(run_timed_out, scenario_failed, cleanup_failed);
     finish_run(FinishRunInput {
         run_id,
         seed: request.seed,
@@ -797,8 +792,8 @@ impl Drop for ComposeCleanupGuard<'_> {
 }
 
 fn run_status_and_exit_code(
-    scenario_failed: bool,
     run_timed_out: bool,
+    scenario_failed: bool,
     cleanup_failed: bool,
 ) -> (RunStatus, i32) {
     match (run_timed_out, scenario_failed, cleanup_failed) {
@@ -807,6 +802,18 @@ fn run_status_and_exit_code(
         (_, _, true) => (RunStatus::CleanupFailed, 4),
         _ => (RunStatus::Passed, 0),
     }
+}
+
+fn scenario_outcome_flags(scenario_outcomes: &[ScenarioOutcome]) -> (bool, bool) {
+    scenario_outcomes.iter().fold(
+        (false, false),
+        |(run_timed_out, scenario_failed), scenario| {
+            (
+                run_timed_out || scenario.status == ScenarioStatus::TimedOut,
+                scenario_failed || scenario.status != ScenarioStatus::Passed,
+            )
+        },
+    )
 }
 
 struct FinishRunInput {
