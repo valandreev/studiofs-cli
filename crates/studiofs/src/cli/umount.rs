@@ -209,18 +209,19 @@ fn windows_process_exit_after_terminate(
     wait_result: u32,
     still_running: bool,
 ) -> Result<()> {
-    if wait_result == WAIT_OBJECT_0 {
-        Ok(())
-    } else if wait_result == WAIT_TIMEOUT && !still_running {
-        Ok(())
-    } else if wait_result == WAIT_TIMEOUT {
-        anyhow::bail!(
-            "mount process {pid} did not exit after force termination within {} ms",
-            FORCE_TERMINATE_WAIT_MS
-        );
-    } else {
-        let error = std::io::Error::last_os_error();
-        anyhow::bail!("failed while waiting after force termination: {error}");
+    match wait_result {
+        WAIT_OBJECT_0 => Ok(()),
+        WAIT_TIMEOUT if !still_running => Ok(()),
+        WAIT_TIMEOUT => {
+            anyhow::bail!(
+                "mount process {pid} did not exit after force termination within {} ms",
+                FORCE_TERMINATE_WAIT_MS
+            );
+        }
+        _ => {
+            let error = std::io::Error::last_os_error();
+            anyhow::bail!("failed while waiting after force termination: {error}");
+        }
     }
 }
 

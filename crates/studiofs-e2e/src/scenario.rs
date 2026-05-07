@@ -2852,10 +2852,15 @@ fn write_mounted_chaos_initial_file(path: PathBuf, payload: &[u8]) -> Result<(),
     )?;
     if readback != payload {
         return Err(ScenarioError::Io(std::io::Error::other(format!(
-            "mounted chaos initial write readback mismatch for {}: expected {} bytes, read {} bytes",
+            "mounted chaos initial write readback mismatch for {}: expected {} bytes, read {} bytes{}",
             path.display(),
             payload.len(),
-            readback.len()
+            readback.len(),
+            if readback.is_empty() {
+                "; no payload became readable before timeout"
+            } else {
+                ""
+            }
         ))));
     }
     Ok(())
@@ -3433,7 +3438,7 @@ impl MountedChaosProcess for SystemMountedChaosProcess {
                 .args(["/PID", &pid_arg, "/T", "/F"])
                 .output();
             let primary_result = self.child.kill();
-            return match (tree_result, primary_result) {
+            match (tree_result, primary_result) {
                 (Ok(output), _)
                     if crate::client::windows_taskkill_status_is_success(output.status.code()) =>
                 {
@@ -3462,7 +3467,7 @@ impl MountedChaosProcess for SystemMountedChaosProcess {
                     "failed to terminate mounted chaos helper {}: taskkill failed: {tree}; primary kill: {primary}",
                     self.task.operation
                 ))),
-            };
+            }
         }
 
         #[cfg(not(windows))]
@@ -4950,22 +4955,21 @@ fn run_mounted_fault_chaos_body(
 
 fn establish_fault_chaos_initial_tree(seed: u64, client: &ClientSpec) -> Result<(), ScenarioError> {
     let root = client.mount_point.join("fault-chaos");
-    fs::create_dir_all(&root)?;
-    fs::write(
+    write_mounted_chaos_initial_file(
         root.join("postgres-outage-local.txt"),
-        fault_payload(seed, "postgres-initial"),
+        &fault_payload(seed, "postgres-initial"),
     )?;
-    fs::write(
+    write_mounted_chaos_initial_file(
         root.join("crash-restart.txt"),
-        fault_payload(seed, "crash-initial"),
+        &fault_payload(seed, "crash-initial"),
     )?;
-    fs::write(
+    write_mounted_chaos_initial_file(
         root.join("peer-while-crashed.txt"),
-        fault_payload(seed, "peer-initial"),
+        &fault_payload(seed, "peer-initial"),
     )?;
-    fs::write(
+    write_mounted_chaos_initial_file(
         root.join("rustfs-outage-payload.bin"),
-        fault_payload(seed, "rustfs-initial"),
+        &fault_payload(seed, "rustfs-initial"),
     )?;
     Ok(())
 }
@@ -9430,6 +9434,24 @@ mod tests {
                 client_spec_for(sandbox, "projectfs", name, mount)
             })
             .collect()
+    }
+
+    #[test]
+    fn fault_chaos_initial_tree_rejects_stale_zero_byte_warmup_file() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-fault-chaos");
+        let mount = temp.path().join("mounts").join("client-a");
+        let stale_file = mount.join("fault-chaos").join("postgres-outage-local.txt");
+        std::fs::create_dir_all(stale_file.parent().unwrap()).unwrap();
+        std::fs::write(&stale_file, []).unwrap();
+        let client = client_spec_for(&sandbox, "projectfs", "client-a", mount);
+
+        let err = establish_fault_chaos_initial_tree(376, &client).unwrap_err();
+
+        assert!(
+            matches!(&err, ScenarioError::Io(error) if error.kind() == io::ErrorKind::AlreadyExists),
+            "expected stale warmup file to be rejected before convergence validation, got {err:?}"
+        );
     }
 
     struct RecordingNamespaceCollisionDriver {
