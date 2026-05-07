@@ -43,6 +43,9 @@ pub const RUSTFS_OUTAGE_MULTI_CLIENT_RECOVERY: &str = "rustfs-outage-multi-clien
 /// Constant $name.
 pub const MOUNTED_CLIENT_CRASH_RESTART_RECOVERY: &str = "mounted-client-crash-restart-recovery";
 /// Constant $name.
+pub const MOUNTED_PUBLICATION_BOUNDARY_CRASH_MATRIX: &str =
+    "mounted-publication-boundary-crash-matrix";
+/// Constant $name.
 pub const COLLISION_RENAME_VS_RENAME: &str = "collision-rename-vs-rename";
 /// Constant $name.
 pub const COLLISION_RENAME_VS_UNLINK: &str = "collision-rename-vs-unlink";
@@ -91,6 +94,9 @@ const CRASH_RESTART_BEFORE_PUBLICATION_FILE_NAME: &str =
     "studiofs-e2e-crash-before-remote-publication.txt";
 const CRASH_RESTART_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(60);
 const CRASH_RESTART_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const PUBLICATION_BOUNDARY_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
+const PUBLICATION_BOUNDARY_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(60);
+const PUBLICATION_BOUNDARY_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const COLLISION_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(60);
 const COLLISION_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const COLLISION_OLD_COMMITTED_PAYLOAD: &[u8] = b"old committed payload\n";
@@ -202,6 +208,16 @@ pub enum ScenarioError {
         /// The cleanup value.
         cleanup: String,
     },
+    #[error(
+        "mounted publication boundary crash matrix failed: {primary}; unmount also failed: {cleanup}"
+    )]
+    /// Field $name.
+    PublicationBoundaryUnmountAfterFailure {
+        /// The primary value.
+        primary: String,
+        /// The cleanup value.
+        cleanup: String,
+    },
     #[error("mounted tree validation failed: {0}")]
     /// Variant $name.
     MountedTree(#[from] MountedTreeError),
@@ -262,6 +278,26 @@ pub enum ScenarioError {
         expected: usize,
         /// The actual value.
         actual: usize,
+    },
+    #[error(
+        "mounted publication boundary crash matrix requires at least {expected} clients, got {actual}"
+    )]
+    /// Field $name.
+    InsufficientPublicationBoundaryClients {
+        /// The expected value.
+        expected: usize,
+        /// The actual value.
+        actual: usize,
+    },
+    #[error(
+        "peer client {client} observed publication boundary payload before convergence: {checksum}"
+    )]
+    /// Field $name.
+    PeerObservedPrematurePublication {
+        /// The client value.
+        client: String,
+        /// The checksum value.
+        checksum: String,
     },
     #[error("namespace collision scenario requires at least {expected} clients, got {actual}")]
     /// Field $name.
@@ -437,6 +473,7 @@ pub fn available_scenarios() -> Vec<ScenarioDefinition> {
         PostgresOutageMultiClientRecovery.definition(),
         RustfsOutageMultiClientRecovery.definition(),
         MountedClientCrashRestartRecovery.definition(),
+        MountedPublicationBoundaryCrashMatrix.definition(),
         NamespaceCollisionScenario::new(NamespaceCollisionKind::RenameVsRename).definition(),
         NamespaceCollisionScenario::new(NamespaceCollisionKind::RenameVsUnlink).definition(),
         NamespaceCollisionScenario::new(NamespaceCollisionKind::UnlinkVsAppend).definition(),
@@ -463,6 +500,9 @@ pub(crate) fn resolve_scenario(name: &str) -> Option<Box<dyn Scenario>> {
         MOUNTED_CLIENT_CRASH_RESTART_RECOVERY | "client-crash-restart" | "crash-restart" => {
             Some(Box::new(MountedClientCrashRestartRecovery))
         }
+        MOUNTED_PUBLICATION_BOUNDARY_CRASH_MATRIX
+        | "publication-boundary-crash"
+        | "publication-boundary" => Some(Box::new(MountedPublicationBoundaryCrashMatrix)),
         COLLISION_RENAME_VS_RENAME | "rename-vs-rename" => Some(Box::new(
             NamespaceCollisionScenario::new(NamespaceCollisionKind::RenameVsRename),
         )),
@@ -848,6 +888,90 @@ impl Scenario for MountedClientCrashRestartRecovery {
                 "artifacts/scenarios/{MOUNTED_CLIENT_CRASH_RESTART_RECOVERY}/crash-restart-recovery-summary.json"
             ),
             format!("artifacts/scenarios/{MOUNTED_CLIENT_CRASH_RESTART_RECOVERY}/validation.json"),
+        ])
+    }
+
+    fn cleanup(&self, _context: &ScenarioContext) -> Result<(), ScenarioError> {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MountedPublicationBoundaryCrashMatrix;
+
+impl Scenario for MountedPublicationBoundaryCrashMatrix {
+    fn definition(&self) -> ScenarioDefinition {
+        ScenarioDefinition {
+            name: MOUNTED_PUBLICATION_BOUNDARY_CRASH_MATRIX,
+            description: "mounted publication boundary crash matrix scenario",
+            requires_studiofs_bin: true,
+            requires_mount: true,
+        }
+    }
+
+    fn setup(&self, context: &ScenarioContext) -> Result<(), ScenarioError> {
+        fs::create_dir_all(&context.scenario_dir)?;
+        Ok(())
+    }
+
+    fn run(&self, context: &ScenarioContext) -> Result<(), ScenarioError> {
+        let Some(config) = &context.client_controller_config else {
+            return Err(ScenarioError::MissingComposeInfrastructure);
+        };
+        let mut driver = RealPublicationBoundaryDriver(MultiClientController::new(
+            config.clone(),
+            SystemClientProcessExecutor,
+        ));
+        run_publication_boundary_crash_matrix_with_driver(
+            context,
+            &mut driver,
+            PUBLICATION_BOUNDARY_CONVERGENCE_TIMEOUT,
+            PUBLICATION_BOUNDARY_CONVERGENCE_POLL_INTERVAL,
+        )?;
+        Ok(())
+    }
+
+    fn validate(&self, context: &ScenarioContext) -> Result<Vec<String>, ScenarioError> {
+        let summary_path = context
+            .scenario_dir
+            .join("publication-boundary-summary.json");
+        if !summary_path.exists() {
+            return Err(ScenarioError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("missing summary artifact: {}", summary_path.display()),
+            )));
+        }
+        let summary: PublicationBoundaryCrashMatrixSummary =
+            serde_json::from_slice(&fs::read(&summary_path)?)?;
+        let validation = json!({
+            "scenario": MOUNTED_PUBLICATION_BOUNDARY_CRASH_MATRIX,
+            "run_id": context.run_id,
+            "seed": context.seed,
+            "status": if summary
+                .boundaries
+                .iter()
+                .all(|boundary| boundary.final_validator.converged)
+            {
+                "passed"
+            } else {
+                "failed"
+            },
+            "boundaries": summary.boundaries,
+        });
+        fs::write(
+            context.scenario_dir.join("validation.json"),
+            serde_json::to_vec_pretty(&validation)?,
+        )?;
+        Ok(vec![
+            format!(
+                "artifacts/scenarios/{MOUNTED_PUBLICATION_BOUNDARY_CRASH_MATRIX}/operations.ndjson"
+            ),
+            format!(
+                "artifacts/scenarios/{MOUNTED_PUBLICATION_BOUNDARY_CRASH_MATRIX}/publication-boundary-summary.json"
+            ),
+            format!(
+                "artifacts/scenarios/{MOUNTED_PUBLICATION_BOUNDARY_CRASH_MATRIX}/validation.json"
+            ),
         ])
     }
 
@@ -1866,6 +1990,421 @@ fn write_crash_restart_operation(
         append_shared_record(&mut writer, &record)?;
     }
     Ok(())
+}
+
+trait PublicationBoundaryDriver {
+    fn bootstrap_volume(
+        &mut self,
+        options: VolumeBootstrapOptions,
+    ) -> Result<VolumeBootstrapSummary, ScenarioError>;
+    fn mount_all(&mut self) -> Result<(), ScenarioError>;
+    fn clients(&self) -> Vec<ClientSpec>;
+    fn force_kill(&mut self, client: &str) -> Result<(), ScenarioError>;
+    fn remount(&mut self, client: &str) -> Result<(), ScenarioError>;
+    fn restart(&mut self, client: &str) -> Result<(), ScenarioError>;
+    fn publish_for_convergence(
+        &mut self,
+        _boundary: PublicationBoundary,
+        _clients: &[ClientSpec],
+        _relative_path: &str,
+    ) -> Result<(), ScenarioError> {
+        Ok(())
+    }
+    fn unmount_all(&mut self) -> Result<(), ScenarioError>;
+}
+
+struct RealPublicationBoundaryDriver(MultiClientController<SystemClientProcessExecutor>);
+
+impl PublicationBoundaryDriver for RealPublicationBoundaryDriver {
+    fn bootstrap_volume(
+        &mut self,
+        options: VolumeBootstrapOptions,
+    ) -> Result<VolumeBootstrapSummary, ScenarioError> {
+        Ok(self.0.bootstrap_volume(options)?)
+    }
+
+    fn mount_all(&mut self) -> Result<(), ScenarioError> {
+        Ok(self.0.mount_all()?)
+    }
+
+    fn clients(&self) -> Vec<ClientSpec> {
+        self.0.clients().into_iter().cloned().collect()
+    }
+
+    fn force_kill(&mut self, client: &str) -> Result<(), ScenarioError> {
+        Ok(self.0.force_kill(client)?)
+    }
+
+    fn remount(&mut self, client: &str) -> Result<(), ScenarioError> {
+        Ok(self.0.remount(client)?)
+    }
+
+    fn restart(&mut self, client: &str) -> Result<(), ScenarioError> {
+        Ok(self.0.restart(client)?)
+    }
+
+    fn unmount_all(&mut self) -> Result<(), ScenarioError> {
+        Ok(self.0.unmount_all()?)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PublicationBoundary {
+    Flush,
+    Fsync,
+    ReleaseClose,
+    ShutdownDrain,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PublicationBoundaryPeerVisibility {
+    client: String,
+    visible_checksum_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PublicationBoundarySummary {
+    boundary: PublicationBoundary,
+    restarted_client: String,
+    restart_client_root: String,
+    relative_path: String,
+    bytes: usize,
+    local_read_checksum_sha256: String,
+    peer_visibility_before_publication: Vec<PublicationBoundaryPeerVisibility>,
+    final_checksum_sha256: String,
+    restart_elapsed_ms: u128,
+    convergence_elapsed_ms: u128,
+    final_validator: TreeComparison,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PublicationBoundaryCrashMatrixSummary {
+    scenario: String,
+    bootstrap: VolumeBootstrapSummary,
+    boundaries: Vec<PublicationBoundarySummary>,
+}
+
+fn run_publication_boundary_crash_matrix_with_driver(
+    context: &ScenarioContext,
+    driver: &mut dyn PublicationBoundaryDriver,
+    convergence_timeout: Duration,
+    poll_interval: Duration,
+) -> Result<PublicationBoundaryCrashMatrixSummary, ScenarioError> {
+    let result = run_publication_boundary_crash_matrix_body(
+        context,
+        driver,
+        convergence_timeout,
+        poll_interval,
+    );
+    let unmount_result = driver.unmount_all();
+    match (result, unmount_result) {
+        (Ok(summary), Ok(())) => Ok(summary),
+        (Err(primary), Err(cleanup)) => {
+            Err(ScenarioError::PublicationBoundaryUnmountAfterFailure {
+                primary: primary.to_string(),
+                cleanup: cleanup.to_string(),
+            })
+        }
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+fn run_publication_boundary_crash_matrix_body(
+    context: &ScenarioContext,
+    driver: &mut dyn PublicationBoundaryDriver,
+    convergence_timeout: Duration,
+    poll_interval: Duration,
+) -> Result<PublicationBoundaryCrashMatrixSummary, ScenarioError> {
+    let bootstrap = driver.bootstrap_volume(VolumeBootstrapOptions {
+        client_names: PUBLICATION_BOUNDARY_CLIENT_NAMES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect(),
+        clean_existing_local_metadata: true,
+    })?;
+    write_bootstrap_summary(context, &bootstrap)?;
+
+    driver.mount_all()?;
+    let clients = driver.clients();
+    if clients.len() < PUBLICATION_BOUNDARY_CLIENT_NAMES.len() {
+        return Err(ScenarioError::InsufficientPublicationBoundaryClients {
+            expected: PUBLICATION_BOUNDARY_CLIENT_NAMES.len(),
+            actual: clients.len(),
+        });
+    }
+
+    let mut boundaries = Vec::new();
+    for boundary in [
+        PublicationBoundary::Flush,
+        PublicationBoundary::Fsync,
+        PublicationBoundary::ReleaseClose,
+        PublicationBoundary::ShutdownDrain,
+    ] {
+        boundaries.push(run_publication_boundary(
+            context,
+            driver,
+            &clients,
+            boundary,
+            convergence_timeout,
+            poll_interval,
+        )?);
+    }
+
+    let summary = PublicationBoundaryCrashMatrixSummary {
+        scenario: MOUNTED_PUBLICATION_BOUNDARY_CRASH_MATRIX.to_string(),
+        bootstrap,
+        boundaries,
+    };
+    fs::write(
+        context
+            .scenario_dir
+            .join("publication-boundary-summary.json"),
+        serde_json::to_vec_pretty(&summary)?,
+    )?;
+    Ok(summary)
+}
+
+fn run_publication_boundary(
+    context: &ScenarioContext,
+    driver: &mut dyn PublicationBoundaryDriver,
+    clients: &[ClientSpec],
+    boundary: PublicationBoundary,
+    convergence_timeout: Duration,
+    poll_interval: Duration,
+) -> Result<PublicationBoundarySummary, ScenarioError> {
+    let writer = &clients[0];
+    let relative_path = publication_boundary_file_name(boundary);
+    let payload = publication_boundary_payload(context, boundary);
+    apply_publication_boundary(writer, relative_path, &payload, boundary)?;
+
+    let restart_started = Instant::now();
+    if boundary == PublicationBoundary::ShutdownDrain {
+        driver.restart(&writer.name)?;
+    }
+    driver.force_kill(&writer.name)?;
+    driver.remount(&writer.name)?;
+    let local_read_payload = fs::read(writer.mount_point.join(relative_path))?;
+    if local_read_payload != payload {
+        return Err(ScenarioError::Io(std::io::Error::other(format!(
+            "publication boundary durability failure: data read after restart does not match written payload for {relative_path}"
+        ))));
+    }
+    let local_read_checksum_sha256 = bytes_sha256(&local_read_payload);
+    let restart_elapsed_ms = elapsed_millis_nonzero(restart_started);
+
+    let peer_visibility_before_publication =
+        publication_boundary_peer_visibility(&clients[1..], relative_path)?;
+    for visibility in &peer_visibility_before_publication {
+        if visibility
+            .visible_checksum_sha256
+            .as_ref()
+            .is_some_and(|checksum| checksum == &local_read_checksum_sha256)
+        {
+            return Err(ScenarioError::PeerObservedPrematurePublication {
+                client: visibility.client.clone(),
+                checksum: local_read_checksum_sha256,
+            });
+        }
+    }
+
+    driver.publish_for_convergence(boundary, clients, relative_path)?;
+    let convergence_started = Instant::now();
+    let mounts = clients
+        .iter()
+        .map(|client| ClientMount::new(client.name.clone(), client.mount_point.clone()))
+        .collect::<Vec<_>>();
+    let convergence = wait_for_convergence(
+        &mounts,
+        context.scenario_dir.join(format!(
+            "validation-{}",
+            publication_boundary_slug(boundary)
+        )),
+        convergence_timeout,
+        poll_interval,
+    )?;
+    let convergence_elapsed_ms = elapsed_millis_nonzero(convergence_started);
+    let final_payload = fs::read(clients[1].mount_point.join(relative_path))?;
+    if final_payload != payload {
+        return Err(ScenarioError::Io(std::io::Error::other(format!(
+            "publication boundary convergence failure: peer data does not match written payload for {relative_path}"
+        ))));
+    }
+    let final_checksum_sha256 = bytes_sha256(&final_payload);
+
+    let summary = PublicationBoundarySummary {
+        boundary,
+        restarted_client: writer.name.clone(),
+        restart_client_root: writer.client_root.display().to_string(),
+        relative_path: relative_path.to_string(),
+        bytes: payload.len(),
+        local_read_checksum_sha256,
+        peer_visibility_before_publication,
+        final_checksum_sha256,
+        restart_elapsed_ms,
+        convergence_elapsed_ms,
+        final_validator: convergence.comparison,
+    };
+    write_publication_boundary_operations(context, &summary)?;
+    Ok(summary)
+}
+
+fn apply_publication_boundary(
+    client: &ClientSpec,
+    relative_path: &str,
+    payload: &[u8],
+    boundary: PublicationBoundary,
+) -> Result<(), ScenarioError> {
+    let path = client.mount_point.join(relative_path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(&path)?;
+    file.write_all(payload)?;
+    match boundary {
+        PublicationBoundary::Flush => file.flush()?,
+        PublicationBoundary::Fsync => file.sync_all()?,
+        PublicationBoundary::ReleaseClose => {
+            file.flush()?;
+            drop(file);
+        }
+        PublicationBoundary::ShutdownDrain => file.sync_all()?,
+    }
+    Ok(())
+}
+
+fn publication_boundary_peer_visibility(
+    peers: &[ClientSpec],
+    relative_path: &str,
+) -> Result<Vec<PublicationBoundaryPeerVisibility>, ScenarioError> {
+    peers
+        .iter()
+        .map(|peer| {
+            read_peer_checksum(peer, relative_path).map(|visible_checksum_sha256| {
+                PublicationBoundaryPeerVisibility {
+                    client: peer.name.clone(),
+                    visible_checksum_sha256,
+                }
+            })
+        })
+        .collect()
+}
+
+fn write_publication_boundary_operations(
+    context: &ScenarioContext,
+    summary: &PublicationBoundarySummary,
+) -> Result<(), ScenarioError> {
+    let path = operation_log_path(context);
+    let mut writer = OperationLogWriter::open_append(&path)?;
+    let bytes = u64::try_from(summary.bytes).unwrap_or(u64::MAX);
+    let boundary = publication_boundary_log_name(summary.boundary);
+    let mut operations = vec![SharedOperation::Write {
+        path: summary.relative_path.clone(),
+        offset: Some(0),
+        bytes,
+        checksum_sha256: Some(summary.local_read_checksum_sha256.clone()),
+    }];
+    operations.extend(publication_boundary_operations(
+        summary.boundary,
+        &summary.relative_path,
+    ));
+    operations.push(SharedOperation::SchedulerCheckpoint {
+        name: "publication_boundary_checkpoint".to_string(),
+    });
+    if summary.boundary == PublicationBoundary::ShutdownDrain {
+        operations.push(SharedOperation::MountedOnly {
+            name: "graceful_shutdown_drain".to_string(),
+            reason: "real mounted graceful shutdown boundary".to_string(),
+        });
+    }
+    operations.extend([SharedOperation::ClientCrash, SharedOperation::ClientRestart]);
+
+    for operation in operations {
+        let record = shared_operation_record(
+            &writer,
+            MOUNTED_PUBLICATION_BOUNDARY_CRASH_MATRIX,
+            operation,
+        )
+        .with_client(&summary.restarted_client)
+        .with_outcome(OperationOutcome::Accepted)
+        .with_metadata("boundary", boundary)
+        .with_metadata(
+            "final_checksum_sha256",
+            summary.final_checksum_sha256.clone(),
+        );
+        append_shared_record(&mut writer, &record)?;
+    }
+    Ok(())
+}
+
+fn publication_boundary_operations(
+    boundary: PublicationBoundary,
+    path: &str,
+) -> Vec<SharedOperation> {
+    match boundary {
+        PublicationBoundary::Flush => vec![SharedOperation::Flush {
+            path: Some(path.to_string()),
+        }],
+        PublicationBoundary::Fsync => vec![SharedOperation::Fsync {
+            path: path.to_string(),
+        }],
+        PublicationBoundary::ReleaseClose => vec![
+            SharedOperation::Close {
+                path: Some(path.to_string()),
+            },
+            SharedOperation::Release {
+                path: Some(path.to_string()),
+            },
+        ],
+        PublicationBoundary::ShutdownDrain => vec![SharedOperation::Release {
+            path: Some(path.to_string()),
+        }],
+    }
+}
+
+fn publication_boundary_file_name(boundary: PublicationBoundary) -> &'static str {
+    match boundary {
+        PublicationBoundary::Flush => "publication-boundary/flush.txt",
+        PublicationBoundary::Fsync => "publication-boundary/fsync.txt",
+        PublicationBoundary::ReleaseClose => "publication-boundary/release-close.txt",
+        PublicationBoundary::ShutdownDrain => "publication-boundary/shutdown-drain.txt",
+    }
+}
+
+fn publication_boundary_payload(
+    context: &ScenarioContext,
+    boundary: PublicationBoundary,
+) -> Vec<u8> {
+    format!(
+        "publication boundary {} payload for run {}\n",
+        publication_boundary_log_name(boundary),
+        context.run_id
+    )
+    .into_bytes()
+}
+
+fn publication_boundary_slug(boundary: PublicationBoundary) -> &'static str {
+    match boundary {
+        PublicationBoundary::Flush => "flush",
+        PublicationBoundary::Fsync => "fsync",
+        PublicationBoundary::ReleaseClose => "release-close",
+        PublicationBoundary::ShutdownDrain => "shutdown-drain",
+    }
+}
+
+fn publication_boundary_log_name(boundary: PublicationBoundary) -> &'static str {
+    match boundary {
+        PublicationBoundary::Flush => "flush",
+        PublicationBoundary::Fsync => "fsync",
+        PublicationBoundary::ReleaseClose => "release_close",
+        PublicationBoundary::ShutdownDrain => "shutdown_drain",
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -7913,6 +8452,106 @@ mod tests {
         }
     }
 
+    struct RecordingPublicationBoundaryDriver {
+        clients: Vec<ClientSpec>,
+        actions: RefCell<Vec<String>>,
+    }
+
+    impl RecordingPublicationBoundaryDriver {
+        fn new(clients: Vec<ClientSpec>) -> Self {
+            Self {
+                clients,
+                actions: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn replicate_from_writer(&self) -> Result<(), ScenarioError> {
+            let source = &self.clients[0].mount_point;
+            for client in self.clients.iter().skip(1) {
+                copy_dir_contents(source, &client.mount_point)?;
+            }
+            Ok(())
+        }
+    }
+
+    impl PublicationBoundaryDriver for RecordingPublicationBoundaryDriver {
+        fn bootstrap_volume(
+            &mut self,
+            options: VolumeBootstrapOptions,
+        ) -> Result<VolumeBootstrapSummary, ScenarioError> {
+            self.actions.borrow_mut().push("bootstrap".to_string());
+            assert_eq!(
+                options.client_names,
+                PUBLICATION_BOUNDARY_CLIENT_NAMES
+                    .iter()
+                    .copied()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            );
+            Ok(VolumeBootstrapSummary {
+                volume_name: "projectfs".to_string(),
+                init_client: PUBLICATION_BOUNDARY_CLIENT_NAMES[0].to_string(),
+                discovered_clients: PUBLICATION_BOUNDARY_CLIENT_NAMES[1..]
+                    .iter()
+                    .map(|name| (*name).to_string())
+                    .collect(),
+                clients: self
+                    .clients
+                    .iter()
+                    .map(|client| crate::client::ClientBootstrapRecord {
+                        name: client.name.clone(),
+                        local_metadata_db: client.local_metadata_db.clone(),
+                        state: ClientLifecycleState::Discovered,
+                    })
+                    .collect(),
+            })
+        }
+
+        fn mount_all(&mut self) -> Result<(), ScenarioError> {
+            self.actions.borrow_mut().push("mount_all".to_string());
+            Ok(())
+        }
+
+        fn clients(&self) -> Vec<ClientSpec> {
+            self.clients.clone()
+        }
+
+        fn force_kill(&mut self, client: &str) -> Result<(), ScenarioError> {
+            self.actions
+                .borrow_mut()
+                .push(format!("force_kill_{client}"));
+            Ok(())
+        }
+
+        fn remount(&mut self, client: &str) -> Result<(), ScenarioError> {
+            self.actions.borrow_mut().push(format!("remount_{client}"));
+            Ok(())
+        }
+
+        fn restart(&mut self, client: &str) -> Result<(), ScenarioError> {
+            self.actions.borrow_mut().push(format!("restart_{client}"));
+            Ok(())
+        }
+
+        fn publish_for_convergence(
+            &mut self,
+            boundary: PublicationBoundary,
+            _clients: &[ClientSpec],
+            _relative_path: &str,
+        ) -> Result<(), ScenarioError> {
+            self.actions.borrow_mut().push(format!(
+                "publish_{}",
+                publication_boundary_log_name(boundary)
+            ));
+            self.replicate_from_writer()
+        }
+
+        fn unmount_all(&mut self) -> Result<(), ScenarioError> {
+            self.actions.borrow_mut().push("unmount_all".to_string());
+            Ok(())
+        }
+    }
+
     struct RecordingMountedFaultChaosDriver {
         clients: Vec<ClientSpec>,
         actions: RefCell<Vec<&'static str>>,
@@ -8941,6 +9580,21 @@ mod tests {
     }
 
     #[test]
+    fn registry_exposes_mounted_publication_boundary_crash_matrix_scenario() {
+        let scenarios = available_scenarios();
+
+        assert!(scenarios.iter().any(|scenario| {
+            scenario.name == "mounted-publication-boundary-crash-matrix"
+                && scenario.requires_studiofs_bin
+                && scenario.requires_mount
+                && scenario.description.contains("publication boundary")
+        }));
+        assert!(resolve_scenario("mounted-publication-boundary-crash-matrix").is_some());
+        assert!(resolve_scenario("publication-boundary-crash").is_some());
+        assert!(resolve_scenario("publication-boundary").is_some());
+    }
+
+    #[test]
     fn registry_exposes_mounted_chaos_convergence_scenario() {
         let scenarios = available_scenarios();
 
@@ -9459,6 +10113,136 @@ mod tests {
                     .iter()
                     .map(|name| (*name).to_string())
                     .collect::<Vec<_>>()
+        }));
+    }
+
+    #[test]
+    fn publication_boundary_crash_matrix_covers_boundaries_and_blocks_premature_peer_visibility() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-publication-boundary");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(MOUNTED_PUBLICATION_BOUNDARY_CRASH_MATRIX);
+        let clients = PUBLICATION_BOUNDARY_CLIENT_NAMES
+            .iter()
+            .copied()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(&mount).unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let original_client_root = clients[0].client_root.clone();
+        let mut driver = RecordingPublicationBoundaryDriver::new(clients);
+        let context = ScenarioContext {
+            run_id: "run-publication-boundary".to_string(),
+            seed: 375,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+
+        let summary = run_publication_boundary_crash_matrix_with_driver(
+            &context,
+            &mut driver,
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+
+        assert_eq!(summary.scenario, MOUNTED_PUBLICATION_BOUNDARY_CRASH_MATRIX);
+        assert_eq!(summary.boundaries.len(), 4);
+        assert_eq!(
+            summary
+                .boundaries
+                .iter()
+                .map(|boundary| boundary.boundary)
+                .collect::<Vec<_>>(),
+            vec![
+                PublicationBoundary::Flush,
+                PublicationBoundary::Fsync,
+                PublicationBoundary::ReleaseClose,
+                PublicationBoundary::ShutdownDrain,
+            ]
+        );
+        assert!(summary.boundaries.iter().all(|boundary| {
+            boundary.restart_client_root == original_client_root.display().to_string()
+                && boundary.local_read_checksum_sha256 == boundary.final_checksum_sha256
+                && boundary
+                    .peer_visibility_before_publication
+                    .iter()
+                    .all(|visibility| visibility.visible_checksum_sha256.is_none())
+                && boundary.final_validator.converged
+        }));
+        assert_eq!(
+            driver.actions.borrow().as_slice(),
+            [
+                "bootstrap",
+                "mount_all",
+                "force_kill_client-a",
+                "remount_client-a",
+                "publish_flush",
+                "force_kill_client-a",
+                "remount_client-a",
+                "publish_fsync",
+                "force_kill_client-a",
+                "remount_client-a",
+                "publish_release_close",
+                "restart_client-a",
+                "force_kill_client-a",
+                "remount_client-a",
+                "publish_shutdown_drain",
+                "unmount_all",
+            ]
+        );
+
+        assert!(
+            context
+                .scenario_dir
+                .join("publication-boundary-summary.json")
+                .exists()
+        );
+        let operations =
+            read_operation_log(context.scenario_dir.join("operations.ndjson")).unwrap();
+        for boundary in ["flush", "fsync", "release_close", "shutdown_drain"] {
+            assert!(operations.iter().any(|record| {
+                record
+                    .metadata
+                    .get("boundary")
+                    .is_some_and(|value| value == boundary)
+                    && matches!(
+                        record.operation,
+                        SharedOperation::ClientCrash | SharedOperation::ClientRestart
+                    )
+            }));
+        }
+        assert!(
+            operations
+                .iter()
+                .any(|record| matches!(record.operation, SharedOperation::Flush { .. }))
+        );
+        assert!(
+            operations
+                .iter()
+                .any(|record| matches!(record.operation, SharedOperation::Fsync { .. }))
+        );
+        assert!(
+            operations
+                .iter()
+                .any(|record| matches!(record.operation, SharedOperation::Release { .. }))
+        );
+        assert!(
+            operations
+                .iter()
+                .any(|record| matches!(record.operation, SharedOperation::Close { .. }))
+        );
+        assert!(operations.iter().any(|record| {
+            matches!(
+                &record.operation,
+                SharedOperation::SchedulerCheckpoint { name }
+                    if name == "publication_boundary_checkpoint"
+            )
         }));
     }
 
