@@ -801,23 +801,12 @@ fn run_status_and_exit_code(
     run_timed_out: bool,
     cleanup_failed: bool,
 ) -> (RunStatus, i32) {
-    let status = if run_timed_out {
-        RunStatus::TimedOut
-    } else if scenario_failed {
-        RunStatus::Failed
-    } else if cleanup_failed {
-        RunStatus::CleanupFailed
-    } else {
-        RunStatus::Passed
-    };
-    let exit_code = if scenario_failed {
-        1
-    } else if cleanup_failed {
-        4
-    } else {
-        0
-    };
-    (status, exit_code)
+    match (run_timed_out, scenario_failed, cleanup_failed) {
+        (true, _, _) => (RunStatus::TimedOut, 1),
+        (_, true, _) => (RunStatus::Failed, 1),
+        (_, _, true) => (RunStatus::CleanupFailed, 4),
+        _ => (RunStatus::Passed, 0),
+    }
 }
 
 struct FinishRunInput {
@@ -3173,6 +3162,14 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("validation failed")
+        );
+        assert_eq!(report["cleanup"]["status"], "passed");
+        assert!(
+            report["cleanup"]["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|action| action.as_str() == Some("docker compose logs"))
         );
     }
 
