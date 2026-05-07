@@ -3175,9 +3175,21 @@ fn run_concurrent_mounted_chaos_operations_with_launcher(
         let mut operations = Vec::with_capacity(processes.len());
         while operations.len() < processes.len() {
             for process in processes.iter_mut().filter(|process| !process.done) {
-                if let Some(operation) = process.process.try_collect(started)? {
-                    process.done = true;
-                    operations.push(operation);
+                match process.process.try_collect(started) {
+                    Ok(Some(operation)) => {
+                        process.done = true;
+                        operations.push(operation);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        let pending = kill_pending_mounted_chaos_processes(&mut processes);
+                        if pending.is_empty() {
+                            return Err(error);
+                        }
+                        return Err(ScenarioError::MountedChaosHelper(format!(
+                            "{error}; pending helpers killed after collect failure: {pending:?}"
+                        )));
+                    }
                 }
             }
             if operations.len() == processes.len() {
@@ -9875,6 +9887,7 @@ mod tests {
         killed: std::rc::Rc<RefCell<Vec<String>>>,
         work_dirs: std::rc::Rc<RefCell<Vec<PathBuf>>>,
         fail_launch_orders: Vec<usize>,
+        fail_collect_orders: Vec<usize>,
     }
 
     impl RecordingMountedChaosProcessLauncher {
@@ -9883,6 +9896,7 @@ mod tests {
                 killed: std::rc::Rc::new(RefCell::new(Vec::new())),
                 work_dirs: std::rc::Rc::new(RefCell::new(Vec::new())),
                 fail_launch_orders: Vec::new(),
+                fail_collect_orders: Vec::new(),
             }
         }
 
@@ -9891,6 +9905,16 @@ mod tests {
                 killed: std::rc::Rc::new(RefCell::new(Vec::new())),
                 work_dirs: std::rc::Rc::new(RefCell::new(Vec::new())),
                 fail_launch_orders,
+                fail_collect_orders: Vec::new(),
+            }
+        }
+
+        fn failing_collects(fail_collect_orders: Vec<usize>) -> Self {
+            Self {
+                killed: std::rc::Rc::new(RefCell::new(Vec::new())),
+                work_dirs: std::rc::Rc::new(RefCell::new(Vec::new())),
+                fail_launch_orders: Vec::new(),
+                fail_collect_orders,
             }
         }
 
@@ -9919,6 +9943,7 @@ mod tests {
             }
             Ok(Box::new(RecordingMountedChaosProcess {
                 label: mounted_chaos_task_label(task),
+                fail_collect: self.fail_collect_orders.contains(&task.order),
                 killed: std::rc::Rc::clone(&self.killed),
             }))
         }
@@ -9926,6 +9951,7 @@ mod tests {
 
     struct RecordingMountedChaosProcess {
         label: String,
+        fail_collect: bool,
         killed: std::rc::Rc<RefCell<Vec<String>>>,
     }
 
@@ -9934,6 +9960,12 @@ mod tests {
             &mut self,
             _started: Instant,
         ) -> Result<Option<MountedChaosOperation>, ScenarioError> {
+            if self.fail_collect {
+                return Err(ScenarioError::MountedChaosHelper(format!(
+                    "{} collect failed",
+                    self.label
+                )));
+            }
             Ok(None)
         }
 
@@ -9941,6 +9973,54 @@ mod tests {
             self.killed.borrow_mut().push(self.label.clone());
             Ok(())
         }
+    }
+
+    #[test]
+    fn mounted_chaos_collect_failure_kills_pending_operation_processes() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-chaos-collect-failure");
+        let mount = temp.path().join("mounts").join("client-a");
+        std::fs::create_dir_all(&mount).unwrap();
+        let client = client_spec_for(&sandbox, "projectfs", "client-a", mount);
+        let tasks = (1..=3)
+            .map(|order| {
+                let path = format!("chaos/task-{order}.txt");
+                MountedChaosTask::new(
+                    12,
+                    order,
+                    client.clone(),
+                    "stat",
+                    path.clone(),
+                    SharedOperation::Stat { path: path.clone() },
+                    MountedChaosAction::Stat { path },
+                )
+            })
+            .collect::<Vec<_>>();
+        let launcher = RecordingMountedChaosProcessLauncher::failing_collects(vec![2]);
+
+        let err = run_concurrent_mounted_chaos_operations_with_launcher(
+            Instant::now(),
+            tasks,
+            Duration::from_millis(20),
+            &launcher,
+        )
+        .unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("client-a stat chaos/task-2.txt collect failed"));
+        assert!(message.contains("pending helpers killed after collect failure"));
+        assert_eq!(
+            launcher.killed_processes(),
+            vec![
+                "client-a stat chaos/task-1.txt".to_string(),
+                "client-a stat chaos/task-2.txt".to_string(),
+                "client-a stat chaos/task-3.txt".to_string(),
+            ]
+        );
+        assert!(
+            launcher.work_dirs().iter().all(|path| !path.exists()),
+            "collect failure cleanup must remove the helper work directory"
+        );
     }
 
     #[test]
