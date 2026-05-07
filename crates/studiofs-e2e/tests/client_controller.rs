@@ -716,6 +716,16 @@ fn unmount_timeout_fallback_uses_process_tree_termination() {
     assert!(controller.clients()[0].process_id.is_none());
 }
 
+#[cfg(windows)]
+#[test]
+fn taskkill_no_running_instance_is_success_when_primary_kill_succeeded() {
+    assert!(studiofs_e2e::client::windows_taskkill_status_is_success(
+        Some(255),
+        "ERROR: The process with PID 28232 (child process of PID 12436) could not be terminated.\r\nReason: There is no running instance of the task.",
+        true,
+    ));
+}
+
 #[test]
 fn force_kill_all_attempts_every_client_and_clears_state_after_kill_error() {
     let temp = tempdir().unwrap();

@@ -2810,19 +2810,48 @@ fn establish_mounted_chaos_initial_tree(
     let root = client.mount_point.join("chaos");
     fs::create_dir_all(&root)?;
     for round in 0..CHAOS_ROUNDS {
-        fs::write(
+        write_mounted_chaos_initial_file(
             root.join(format!("race-{round:02}.txt")),
-            chaos_payload(seed, round, "race-initial"),
+            &chaos_payload(seed, round, "race-initial"),
         )?;
-        fs::write(
+        write_mounted_chaos_initial_file(
             root.join(format!("data-{round:02}.txt")),
-            chaos_payload(seed, round, "data-initial"),
+            &chaos_payload(seed, round, "data-initial"),
         )?;
         fs::create_dir_all(root.join(format!("tree-{round:02}")))?;
         let scan_dir = root.join(format!("scan-{round:02}"));
         fs::create_dir_all(&scan_dir)?;
-        fs::write(scan_dir.join("a.txt"), chaos_payload(seed, round, "scan-a"))?;
-        fs::write(scan_dir.join("b.txt"), chaos_payload(seed, round, "scan-b"))?;
+        write_mounted_chaos_initial_file(
+            scan_dir.join("a.txt"),
+            &chaos_payload(seed, round, "scan-a"),
+        )?;
+        write_mounted_chaos_initial_file(
+            scan_dir.join("b.txt"),
+            &chaos_payload(seed, round, "scan-b"),
+        )?;
+    }
+    Ok(())
+}
+
+fn write_mounted_chaos_initial_file(path: PathBuf, payload: &[u8]) -> Result<(), ScenarioError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&path)?;
+    file.write_all(payload)?;
+    file.flush()?;
+    drop(file);
+    let readback = fs::read(&path)?;
+    if readback != payload {
+        return Err(ScenarioError::Io(std::io::Error::other(format!(
+            "mounted chaos initial write readback mismatch for {}: expected {} bytes, read {} bytes",
+            path.display(),
+            payload.len(),
+            readback.len()
+        ))));
     }
     Ok(())
 }
@@ -9769,6 +9798,17 @@ mod tests {
                 .get("round")
                 .is_some_and(|round| round == "0")
         }));
+    }
+
+    #[test]
+    fn mounted_chaos_initial_files_are_written_through_durable_boundary() {
+        let temp = tempdir().unwrap();
+        let file_path = temp.path().join("chaos").join("data-01.txt");
+        let payload = chaos_payload(376, 1, "data-initial");
+
+        write_mounted_chaos_initial_file(file_path.clone(), &payload).unwrap();
+
+        assert_eq!(std::fs::read(file_path).unwrap(), payload);
     }
 
     #[test]

@@ -533,7 +533,13 @@ fn force_kill_child_process_tree(child: &mut Child, context: &str) -> io::Result
             .output();
         let primary_result = child.kill();
         match (tree_result, primary_result) {
-            (Ok(output), _) if output.status.success() || output.status.code() == Some(128) => {
+            (Ok(output), primary_result)
+                if windows_taskkill_status_is_success(
+                    output.status.code(),
+                    &String::from_utf8_lossy(&output.stderr),
+                    primary_result.is_ok(),
+                ) =>
+            {
                 Ok(())
             }
             (Ok(output), Ok(())) => Err(io::Error::other(format!(
@@ -562,6 +568,18 @@ fn force_kill_child_process_tree(child: &mut Child, context: &str) -> io::Result
         let _ = pid;
         child.kill()
     }
+}
+
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn windows_taskkill_status_is_success(
+    status_code: Option<i32>,
+    stderr: &str,
+    primary_kill_succeeded: bool,
+) -> bool {
+    status_code == Some(0)
+        || status_code == Some(128)
+        || (primary_kill_succeeded && stderr.contains("There is no running instance of the task"))
 }
 
 #[derive(Debug, Error)]
