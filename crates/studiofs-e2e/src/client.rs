@@ -805,6 +805,12 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         self.mount_index(index)
     }
 
+    /// Gracefully unmounts one mounted client by name without remounting it.
+    pub fn unmount(&mut self, client: &str) -> Result<(), ClientControllerError> {
+        let index = self.client_index(client)?;
+        self.unmount_index(index)
+    }
+
     /// Function $name.
     pub fn force_kill(&mut self, client: &str) -> Result<(), ClientControllerError> {
         let index = self.client_index(client)?;

@@ -38,6 +38,7 @@ cargo run -p studiofs-e2e -- run collision-rename-vs-unlink --studiofs-bin <path
 cargo run -p studiofs-e2e -- run mounted-open-handle-convergence --studiofs-bin <path-to-studiofs>
 cargo run -p studiofs-e2e -- run mounted-fault-chaos-convergence --seed 360 --timeout 30m --studiofs-bin <path-to-studiofs>
 cargo run -p studiofs-e2e -- run mounted-lww-reconnect-chaos-convergence --seed 360 --timeout 30m --studiofs-bin <path-to-studiofs>
+cargo run -p studiofs-e2e -- run mounted-publication-boundary-crash-matrix --studiofs-bin <path-to-studiofs>
 cargo run -p studiofs-e2e -- clean
 ```
 
@@ -60,7 +61,7 @@ Required initial run flags and environment:
 | Flag | Contract |
 |---|---|
 | `basic-multi-client-smoke` | Positional shorthand for the mounted three-client happy-path smoke scenario. |
-| `--scenario <name>` | Repeatable. Accepted values include `basic-multi-client-smoke` (`smoke`), `postgres-outage-multi-client-recovery` (`postgres-outage`), `rustfs-outage-multi-client-recovery` (`rustfs-outage`, `s3-outage`), `mounted-client-crash-restart-recovery` (`client-crash-restart`, `crash-restart`), `mounted-open-handle-convergence` (`open-handle`, `open-unlink-rename`), `mounted-chaos-convergence` (`mounted-chaos`, `chaos`), `mounted-fault-chaos-convergence` (`fault-chaos`, `chaos-faults`), `mounted-lww-reconnect-chaos-convergence` (`lww-chaos`, `reconnect-lww`), and the mounted namespace collision scenarios `collision-rename-vs-rename`, `collision-rename-vs-unlink`, `collision-unlink-vs-append`, `collision-overwrite-vs-read`, `collision-mkdir-rmdir-vs-create`, and `collision-readdir-stat-during-mutation`. |
+| `--scenario <name>` | Repeatable. Accepted values include `basic-multi-client-smoke` (`smoke`), `postgres-outage-multi-client-recovery` (`postgres-outage`), `rustfs-outage-multi-client-recovery` (`rustfs-outage`, `s3-outage`), `mounted-client-crash-restart-recovery` (`client-crash-restart`, `crash-restart`), `mounted-publication-boundary-crash-matrix` (`publication-boundary-crash`, `publication-boundary`), `mounted-open-handle-convergence` (`open-handle`, `open-unlink-rename`), `mounted-chaos-convergence` (`mounted-chaos`, `chaos`), `mounted-fault-chaos-convergence` (`fault-chaos`, `chaos-faults`), `mounted-lww-reconnect-chaos-convergence` (`lww-chaos`, `reconnect-lww`), and the mounted namespace collision scenarios `collision-rename-vs-rename`, `collision-rename-vs-unlink`, `collision-unlink-vs-append`, `collision-overwrite-vs-read`, `collision-mkdir-rmdir-vs-create`, and `collision-readdir-stat-during-mutation`. |
 | `--studiofs-bin <path>` | Path to the product CLI under test. Real mounted scenarios require it when `--infra compose` or `--infra external-env` is used. The runner may build it only when an explicit build flag is added. |
 | `--root <path>` | Parent run directory. Defaults to `target/e2e-runs`. |
 | `--run-id <id>` | Optional stable run ID. If omitted, use an ISO-like UTC timestamp plus short random suffix. Explicit IDs must be safe single directory names: no separators, drive prefixes, traversal segments, leading dots, or other shell/path metacharacters. |
@@ -355,6 +356,18 @@ absent, and the rename destination is visible. The scenario writes
 `operations.ndjson`, `mounted-open-handle-summary.json`, and `validation.json`;
 open-handle lifecycle records use `mounted_only` operations because the
 simulation layer does not model OS file descriptor state.
+
+`mounted-publication-boundary-crash-matrix` uses three mounted clients against
+one shared remote volume. `client-a` writes payloads and is force-killed then
+remounted at four local-first publication boundaries: flush, fsync,
+release/close, and graceful shutdown drain. Each case reuses the same client
+root, verifies the payload is locally durable after remount, probes peer
+mounted trees before the scenario-defined public convergence gate, and then
+waits for final mounted-tree convergence across all clients. The scenario
+writes `operations.ndjson`, `publication-boundary-summary.json`, and
+`validation.json`; boundary checkpoints and crash/restart operations use the
+shared `ScenarioOperationRecord` schema, while the shutdown-drain marker is
+explicitly recorded as mounted-only.
 
 Mounted namespace collision scenarios use the first three default clients
 against one shared remote volume. Each scenario establishes a bounded initial

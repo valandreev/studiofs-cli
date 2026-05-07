@@ -145,6 +145,7 @@ cargo run -p studiofs-e2e -- run mounted-open-handle-convergence --studiofs-bin 
 cargo run -p studiofs-e2e -- run mounted-chaos-convergence --seed 360 --timeout 20m --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run mounted-fault-chaos-convergence --seed 360 --timeout 30m --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run mounted-lww-reconnect-chaos-convergence --seed 360 --timeout 30m --studiofs-bin target\debug\studiofs.exe
+cargo run -p studiofs-e2e -- run mounted-publication-boundary-crash-matrix --timeout 30m --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- clean
 ```
 
@@ -209,6 +210,13 @@ renamed destination remains visible after convergence. It records the mounted
 open-handle lifecycle in `operations.ndjson`, writes
 `mounted-open-handle-summary.json`, and uses only public mounted-tree
 validation.
+The `mounted-publication-boundary-crash-matrix` scenario force-kills and
+remounts a writer at flush, fsync, release/close, and graceful shutdown-drain
+publication boundaries. It validates same-root local durability after remount,
+checks that peers do not observe the boundary payload before the explicit
+public convergence gate, then waits for mounted-tree convergence. It records
+shared-schema `operations.ndjson`, `publication-boundary-summary.json`, and
+`validation.json`.
 The
 `mounted-fault-chaos-convergence`
 scenario is the next product fault-chaos layer: it mixes a mounted conflict
@@ -245,6 +253,7 @@ cargo test -p studiofs-e2e scenario::tests::mounted_chaos_records_seeded_operati
 cargo test -p studiofs-e2e --test runner_contract mounted_fault_chaos_disabled_run_writes_reproducible_artifacts -- --exact --nocapture
 cargo test -p studiofs-e2e --test runner_contract mounted_lww_reconnect_chaos_disabled_run_writes_reproducible_artifacts -- --exact --nocapture
 cargo test -p studiofs-e2e scenario::tests::lww_reconnect_oracle_detects_converged_wrong_winner -- --exact --nocapture
+cargo test -p studiofs-e2e scenario::tests::publication_boundary_crash_matrix_covers_boundaries_and_blocks_premature_peer_visibility -- --exact --nocapture
 cargo test -p studiofs-e2e namespace_collision_records_operations_and_validates_three_client_convergence -- --exact --nocapture
 cargo test -p studiofs-e2e scenario::tests::crash_restart_recovery_runs_both_modes_reuses_client_root_and_converges -- --exact --nocapture
 cargo test -p studiofs-e2e --test client_controller force_kill_then_remount_reuses_same_client_root_without_graceful_umount -- --exact --nocapture
