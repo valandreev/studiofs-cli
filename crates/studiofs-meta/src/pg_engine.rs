@@ -2874,13 +2874,8 @@ impl PgMetaEngine {
                 )
             {
                 serving_rename_reconciles.push(event);
-            } else {
-                match event {
-                    MetaEvent::RemoveAttr { ino } => {
-                        serving_displaced_dentry_cleanup_inodes.push(*ino);
-                    }
-                    _ => {}
-                }
+            } else if let MetaEvent::RemoveAttr { ino } = event {
+                serving_displaced_dentry_cleanup_inodes.push(*ino);
             }
 
             if Self::event_has_aux_apply_effect(event)
@@ -2937,13 +2932,8 @@ impl PgMetaEngine {
                     &removed_inodes,
                 ) {
                     serving_events.push(event.clone());
-                } else {
-                    match event {
-                        MetaEvent::RemoveAttr { ino } => {
-                            serving_displaced_dentry_cleanup_inodes.push(*ino);
-                        }
-                        _ => {}
-                    }
+                } else if let MetaEvent::RemoveAttr { ino } = event {
+                    serving_displaced_dentry_cleanup_inodes.push(*ino);
                 }
             }
             if !serving_events.is_empty() {
