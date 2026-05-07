@@ -1071,6 +1071,7 @@ impl RedbMetaEngine {
                                 Self::remove_dentry_mirror_in_txn(&txn, *new_parent, new_name)?;
                             }
                             if let Some(ino) = displaced_remove_attr_ino {
+                                Self::remove_dentry_mirrors_for_inode_in_txn(&txn, *ino)?;
                                 Self::remove_inode_mirror_in_txn(&txn, *ino)?;
                             }
                         }

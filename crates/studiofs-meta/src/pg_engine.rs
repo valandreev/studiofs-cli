@@ -2456,6 +2456,28 @@ impl PgMetaEngine {
         })
     }
 
+    fn self_batch_event_fully_ackable(event: &MetaEvent) -> bool {
+        match event {
+            MetaEvent::SetAttr { attr } if attr.kind == FileType::RegularFile => {
+                attr.size == attr.committed_size
+            }
+            _ => true,
+        }
+    }
+
+    fn projected_events_match(left: &[MetaEvent], right: &[MetaEvent]) -> MetaResult<bool> {
+        if left.len() != right.len() {
+            return Ok(false);
+        }
+
+        for (local, remote) in left.iter().zip(right.iter()) {
+            if Self::encode_postcard(local)? != Self::encode_postcard(remote)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     fn aux_event_conflicts_with_overlay(
         &self,
         event: &MetaEvent,
@@ -2991,10 +3013,16 @@ impl PgMetaEngine {
         let local_events = self.local.read_events_range(start, end)?;
         let mut projected_prefix = Vec::with_capacity(batch_events.len());
         let mut consumed_events = 0usize;
+        let mut ackable_events = 0usize;
+        let mut prefix_ackable = true;
         for event in &local_events {
             consumed_events = consumed_events.saturating_add(1);
             let projected = Self::project_remote_events(std::slice::from_ref(event));
             projected_prefix.extend(projected);
+            prefix_ackable &= Self::self_batch_event_fully_ackable(event);
+            if prefix_ackable {
+                ackable_events = consumed_events;
+            }
             if projected_prefix.len() >= batch_events.len() {
                 break;
             }
@@ -3003,19 +3031,12 @@ impl PgMetaEngine {
             return Ok(None);
         }
 
-        let matches_prefix =
-            projected_prefix
-                .iter()
-                .zip(batch_events.iter())
-                .all(|(local, remote)| {
-                    Self::encode_postcard(local).ok() == Self::encode_postcard(remote).ok()
-                });
-        if !matches_prefix {
+        if !Self::projected_events_match(&projected_prefix, batch_events)? {
             return Ok(None);
         }
 
         Ok(Some(Self::overlay_conflicts_for_events(
-            &local_events[consumed_events..],
+            &local_events[ackable_events..],
         )))
     }
 
@@ -3036,10 +3057,16 @@ impl PgMetaEngine {
         let local_events = self.local.read_events_range(start, end)?;
         let mut projected_prefix = Vec::with_capacity(batch_events.len());
         let mut consumed_events = 0usize;
+        let mut ackable_events = 0usize;
+        let mut prefix_ackable = true;
         for event in &local_events {
             consumed_events = consumed_events.saturating_add(1);
             let projected = Self::project_remote_events(std::slice::from_ref(event));
             projected_prefix.extend(projected);
+            prefix_ackable &= Self::self_batch_event_fully_ackable(event);
+            if prefix_ackable {
+                ackable_events = consumed_events;
+            }
             if projected_prefix.len() >= batch_events.len() {
                 break;
             }
@@ -3048,15 +3075,8 @@ impl PgMetaEngine {
             return Ok(());
         }
 
-        let matches_prefix =
-            projected_prefix
-                .iter()
-                .zip(batch_events.iter())
-                .all(|(local, remote)| {
-                    Self::encode_postcard(local).ok() == Self::encode_postcard(remote).ok()
-                });
-        if matches_prefix {
-            let next_seq = start.max(1).saturating_add(consumed_events as u64);
+        if Self::projected_events_match(&projected_prefix, batch_events)? {
+            let next_seq = start.max(1).saturating_add(ackable_events as u64);
             self.persist_flushed_event_seq(next_seq)?;
         }
         Ok(())
@@ -3705,7 +3725,7 @@ impl PgMetaEngine {
         // newer batch_version while still missing earlier foreign batches.
         // `pull_foreign_events_locked()` must remain able to read the full gap.
         self.apply_visible_self_batch(&remote_events)?;
-        self.persist_flushed_event_seq(batch.event_end)?;
+        self.acknowledge_local_prefix_from_self_batch(&remote_events)?;
         Ok(Some(RecentFlush {
             batch_version,
             overlay: Self::overlay_conflicts_for_events(&remote_events),
