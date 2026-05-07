@@ -218,6 +218,12 @@ pub enum ScenarioError {
         /// The cleanup value.
         cleanup: String,
     },
+    #[error("publication boundary peer refresh failed: {errors}")]
+    /// One or more observer peers failed to refresh at the publication gate.
+    PublicationBoundaryPeerRefreshFailed {
+        /// The collected refresh errors.
+        errors: String,
+    },
     #[error("mounted tree validation failed: {0}")]
     /// Variant $name.
     MountedTree(#[from] MountedTreeError),
@@ -288,16 +294,6 @@ pub enum ScenarioError {
         expected: usize,
         /// The actual value.
         actual: usize,
-    },
-    #[error(
-        "peer client {client} observed publication boundary payload before convergence: {checksum}"
-    )]
-    /// A peer observed a boundary payload before the public convergence gate.
-    PeerObservedPrematurePublication {
-        /// The client value.
-        client: String,
-        /// The checksum value.
-        checksum: String,
     },
     #[error("namespace collision scenario requires at least {expected} clients, got {actual}")]
     /// Field $name.
@@ -2043,6 +2039,27 @@ impl PublicationBoundaryDriver for RealPublicationBoundaryDriver {
         Ok(self.0.remount(client)?)
     }
 
+    fn publish_for_convergence(
+        &mut self,
+        _boundary: PublicationBoundary,
+        clients: &[ClientSpec],
+        _relative_path: &str,
+    ) -> Result<(), ScenarioError> {
+        let mut errors = Vec::new();
+        for peer in clients.iter().skip(1) {
+            if let Err(error) = self.0.restart(&peer.name) {
+                errors.push(format!("{}: {error}", peer.name));
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(ScenarioError::PublicationBoundaryPeerRefreshFailed {
+                errors: errors.join("; "),
+            })
+        }
+    }
+
     fn unmount_all(&mut self) -> Result<(), ScenarioError> {
         Ok(self.0.unmount_all()?)
     }
@@ -2071,7 +2088,7 @@ struct PublicationBoundarySummary {
     relative_path: String,
     bytes: usize,
     local_read_checksum_sha256: String,
-    peer_visibility_before_publication: Vec<PublicationBoundaryPeerVisibility>,
+    peer_visibility_at_publication_gate: Vec<PublicationBoundaryPeerVisibility>,
     final_checksum_sha256: String,
     restart_elapsed_ms: u128,
     convergence_elapsed_ms: u128,
@@ -2186,17 +2203,6 @@ fn run_publication_boundary(
         driver.force_kill(&writer.name)?;
     }
 
-    let peer_visibility_before_publication =
-        publication_boundary_peer_visibility(&clients[1..], relative_path)?;
-    for visibility in &peer_visibility_before_publication {
-        if let Some(checksum) = &visibility.visible_checksum_sha256 {
-            return Err(ScenarioError::PeerObservedPrematurePublication {
-                client: visibility.client.clone(),
-                checksum: checksum.clone(),
-            });
-        }
-    }
-
     driver.remount(&writer.name)?;
     let local_read_payload = fs::read(writer.mount_point.join(relative_path))?;
     if local_read_payload != payload {
@@ -2208,6 +2214,8 @@ fn run_publication_boundary(
     let restart_elapsed_ms = elapsed_millis_nonzero(restart_started);
 
     driver.publish_for_convergence(boundary, clients, relative_path)?;
+    let peer_visibility_at_publication_gate =
+        publication_boundary_peer_visibility(&clients[1..], relative_path)?;
     let convergence_started = Instant::now();
     let mounts = clients
         .iter()
@@ -2238,7 +2246,7 @@ fn run_publication_boundary(
         relative_path: relative_path.to_string(),
         bytes: payload.len(),
         local_read_checksum_sha256,
-        peer_visibility_before_publication,
+        peer_visibility_at_publication_gate,
         final_checksum_sha256,
         restart_elapsed_ms,
         convergence_elapsed_ms,
@@ -8456,6 +8464,7 @@ mod tests {
         clients: Vec<ClientSpec>,
         actions: RefCell<Vec<String>>,
         leak_premature_peer_file: bool,
+        refresh_failure_client: Option<String>,
     }
 
     impl RecordingPublicationBoundaryDriver {
@@ -8464,11 +8473,17 @@ mod tests {
                 clients,
                 actions: RefCell::new(Vec::new()),
                 leak_premature_peer_file: false,
+                refresh_failure_client: None,
             }
         }
 
         fn leak_premature_peer_file(mut self) -> Self {
             self.leak_premature_peer_file = true;
+            self
+        }
+
+        fn fail_refresh_for(mut self, client: &str) -> Self {
+            self.refresh_failure_client = Some(client.to_string());
             self
         }
 
@@ -8547,13 +8562,27 @@ mod tests {
         fn publish_for_convergence(
             &mut self,
             boundary: PublicationBoundary,
-            _clients: &[ClientSpec],
+            clients: &[ClientSpec],
             _relative_path: &str,
         ) -> Result<(), ScenarioError> {
             self.actions.borrow_mut().push(format!(
                 "publish_{}",
                 publication_boundary_log_name(boundary)
             ));
+            let mut errors = Vec::new();
+            for peer in clients.iter().skip(1) {
+                self.actions
+                    .borrow_mut()
+                    .push(format!("refresh_{}_for_convergence", peer.name));
+                if self.refresh_failure_client.as_deref() == Some(peer.name.as_str()) {
+                    errors.push(format!("refresh failed for {}", peer.name));
+                }
+            }
+            if !errors.is_empty() {
+                return Err(ScenarioError::PublicationBoundaryPeerRefreshFailed {
+                    errors: errors.join("; "),
+                });
+            }
             self.replicate_from_writer()
         }
 
@@ -10199,9 +10228,9 @@ mod tests {
             boundary.restart_client_root == original_client_root.display().to_string()
                 && boundary.local_read_checksum_sha256 == boundary.final_checksum_sha256
                 && boundary
-                    .peer_visibility_before_publication
+                    .peer_visibility_at_publication_gate
                     .iter()
-                    .all(|visibility| visibility.visible_checksum_sha256.is_none())
+                    .all(|visibility| visibility.visible_checksum_sha256.is_some())
                 && boundary.final_validator.converged
         }));
         assert_eq!(
@@ -10212,15 +10241,23 @@ mod tests {
                 "force_kill_client-a",
                 "remount_client-a",
                 "publish_flush",
+                "refresh_client-b_for_convergence",
+                "refresh_client-c_for_convergence",
                 "force_kill_client-a",
                 "remount_client-a",
                 "publish_fsync",
+                "refresh_client-b_for_convergence",
+                "refresh_client-c_for_convergence",
                 "force_kill_client-a",
                 "remount_client-a",
                 "publish_release_close",
+                "refresh_client-b_for_convergence",
+                "refresh_client-c_for_convergence",
                 "graceful_shutdown_client-a",
                 "remount_client-a",
                 "publish_shutdown_drain",
+                "refresh_client-b_for_convergence",
+                "refresh_client-c_for_convergence",
                 "unmount_all",
             ]
         );
@@ -10282,9 +10319,57 @@ mod tests {
     }
 
     #[test]
-    fn publication_boundary_crash_matrix_rejects_any_peer_file_before_publication_gate() {
+    fn publication_boundary_crash_matrix_records_peer_visibility_at_publication_gate() {
         let temp = tempdir().unwrap();
         let sandbox = temp.path().join("run-publication-boundary-leak");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(MOUNTED_PUBLICATION_BOUNDARY_CRASH_MATRIX);
+        let clients = PUBLICATION_BOUNDARY_CLIENT_NAMES
+            .iter()
+            .copied()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(&mount).unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let mut driver = RecordingPublicationBoundaryDriver::new(clients);
+        let context = ScenarioContext {
+            run_id: "run-publication-boundary-leak".to_string(),
+            seed: 375,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+
+        let summary = run_publication_boundary_crash_matrix_with_driver(
+            &context,
+            &mut driver,
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+
+        let flush = summary
+            .boundaries
+            .iter()
+            .find(|boundary| boundary.boundary == PublicationBoundary::Flush)
+            .unwrap();
+        assert!(
+            flush
+                .peer_visibility_at_publication_gate
+                .iter()
+                .all(|visibility| visibility.visible_checksum_sha256
+                    == Some(flush.final_checksum_sha256.clone()))
+        );
+    }
+
+    #[test]
+    fn publication_boundary_crash_matrix_allows_product_publication_before_scenario_gate() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-publication-boundary-product-visible");
         let scenario_dir = sandbox
             .join("artifacts")
             .join("scenarios")
@@ -10301,8 +10386,52 @@ mod tests {
         let mut driver =
             RecordingPublicationBoundaryDriver::new(clients).leak_premature_peer_file();
         let context = ScenarioContext {
-            run_id: "run-publication-boundary-leak".to_string(),
-            seed: 375,
+            run_id: "run-publication-boundary-product-visible".to_string(),
+            seed: 382,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+
+        let summary = run_publication_boundary_crash_matrix_with_driver(
+            &context,
+            &mut driver,
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+
+        assert_eq!(summary.boundaries.len(), 4);
+        assert!(summary.boundaries.iter().all(|boundary| {
+            boundary
+                .peer_visibility_at_publication_gate
+                .iter()
+                .all(|visibility| visibility.visible_checksum_sha256.is_some())
+        }));
+    }
+
+    #[test]
+    fn publication_boundary_refresh_attempts_all_peers_before_reporting_failure() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-publication-boundary-refresh-failure");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(MOUNTED_PUBLICATION_BOUNDARY_CRASH_MATRIX);
+        let clients = PUBLICATION_BOUNDARY_CLIENT_NAMES
+            .iter()
+            .copied()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(&mount).unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let mut driver =
+            RecordingPublicationBoundaryDriver::new(clients).fail_refresh_for("client-b");
+        let context = ScenarioContext {
+            run_id: "run-publication-boundary-refresh-failure".to_string(),
+            seed: 382,
             sandbox,
             scenario_dir,
             client_controller_config: None,
@@ -10317,8 +10446,16 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            matches!(err, ScenarioError::PeerObservedPrematurePublication { .. }),
+            err.to_string().contains("refresh failed for client-b"),
             "{err}"
+        );
+        assert!(
+            driver
+                .actions
+                .borrow()
+                .contains(&"refresh_client-c_for_convergence".to_string()),
+            "{:?}",
+            driver.actions.borrow()
         );
     }
 

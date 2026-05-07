@@ -361,13 +361,13 @@ simulation layer does not model OS file descriptor state.
 one shared remote volume. `client-a` writes payloads and is force-killed then
 remounted at four local-first publication boundaries: flush, fsync,
 release/close, and graceful shutdown drain. Each case reuses the same client
-root, verifies the payload is locally durable after remount, probes peer
-mounted trees before the scenario-defined public convergence gate, and then
-waits for final mounted-tree convergence across all clients. The scenario
-writes `operations.ndjson`, `publication-boundary-summary.json`, and
-`validation.json`; boundary checkpoints and crash/restart operations use the
-shared `ScenarioOperationRecord` schema, while the shutdown-drain marker is
-explicitly recorded as mounted-only.
+root, verifies the payload is locally durable after remount, opens the
+scenario-defined public convergence gate by refreshing observer peers, records
+peer mounted-tree checksums at that gate, and then waits for final mounted-tree
+convergence across all clients. The scenario writes `operations.ndjson`,
+`publication-boundary-summary.json`, and `validation.json`; boundary checkpoints
+and crash/restart operations use the shared `ScenarioOperationRecord` schema,
+while the shutdown-drain marker is explicitly recorded as mounted-only.
 
 Mounted namespace collision scenarios use the first three default clients
 against one shared remote volume. Each scenario establishes a bounded initial

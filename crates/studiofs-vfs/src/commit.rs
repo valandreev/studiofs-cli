@@ -133,6 +133,7 @@ impl CommitCoordinator {
             return Ok(EpochFinalizeStatus::Deferred);
         }
 
+        let publication_advances_visible_size = attr.committed_size < attr.size;
         vfs.remove_live_extents_for_inode_epoch(ino, content_epoch);
 
         // Clear any stale dirty_attr that was snapshotted before this epoch was
@@ -173,7 +174,7 @@ impl CommitCoordinator {
         // `getattr` can expose pending attrs from dirty_attrs without populating
         // attr_read_cache. A newer dirty attr must be preserved, but its presence
         // still means the kernel may hold stale attrs for the epoch just published.
-        if was_dirty_visible || removed_cached_attr {
+        if was_dirty_visible || removed_cached_attr || publication_advances_visible_size {
             vfs.invalidate_kernel_inodes([ino]);
         }
 

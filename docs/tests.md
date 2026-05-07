@@ -213,10 +213,14 @@ validation.
 The `mounted-publication-boundary-crash-matrix` scenario force-kills and
 remounts a writer at flush, fsync, release/close, and graceful shutdown-drain
 publication boundaries. It validates same-root local durability after remount,
-checks that peers do not observe the boundary payload before the explicit
-public convergence gate, then waits for mounted-tree convergence. It records
-shared-schema `operations.ndjson`, `publication-boundary-summary.json`, and
-`validation.json`.
+opens the explicit public convergence gate by refreshing observer peers,
+records peer checksums at that gate, then waits for mounted-tree convergence.
+It records shared-schema `operations.ndjson`, `publication-boundary-summary.json`,
+and `validation.json`.
+Early peer visibility is allowed in this scenario once the writer data is
+locally durable and the product has completed its normal background publication;
+the gate exists to make the observer refresh explicit instead of relying on a
+timing window.
 The
 `mounted-fault-chaos-convergence`
 scenario is the next product fault-chaos layer: it mixes a mounted conflict
