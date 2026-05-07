@@ -973,7 +973,10 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
                 return Err(error);
             }
         };
-        ensure_success(&command, output)?;
+        if let Err(error) = ensure_success(&command, output) {
+            self.kill_mount_process_after_failed_unmount(index, "failed unmount command fallback");
+            return Err(error);
+        }
         if let Some(process) = self.clients[index].process.as_mut() {
             if let Err(error) = wait_for_process_exit(
                 process.as_mut(),

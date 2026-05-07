@@ -116,6 +116,8 @@ const CHAOS_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(90);
 const CHAOS_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const CHAOS_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const CHAOS_HELPER_START_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(not(test))]
+const CHAOS_HELPER_KILL_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const FAULT_CHAOS_CONFLICT_ROUNDS: usize = 6;
 const FAULT_CHAOS_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(120);
 const FAULT_CHAOS_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -3351,7 +3353,71 @@ impl MountedChaosProcess for SystemMountedChaosProcess {
     }
 
     fn kill(&mut self) -> io::Result<()> {
-        self.child.kill()
+        if self.child.try_wait()?.is_some() {
+            return Ok(());
+        }
+
+        #[cfg(windows)]
+        {
+            let pid = self.child.id().to_string();
+            let tree_result = Command::new("taskkill")
+                .args(["/PID", &pid, "/T", "/F"])
+                .output();
+            let primary_result = self.child.kill();
+            match (tree_result, primary_result) {
+                (Ok(output), _) if output.status.success() || output.status.code() == Some(128) => {
+                }
+                (Ok(output), Ok(())) => {
+                    return Err(io::Error::other(format!(
+                        "failed to terminate mounted chaos helper {}: taskkill exit {}; stdout: {}; stderr: {}; primary kill: ok",
+                        self.task.operation,
+                        output.status.code().unwrap_or(-1),
+                        String::from_utf8_lossy(&output.stdout).trim(),
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    )));
+                }
+                (Ok(output), Err(primary)) => {
+                    return Err(io::Error::other(format!(
+                        "failed to terminate mounted chaos helper {}: taskkill exit {}; stdout: {}; stderr: {}; primary kill: {primary}",
+                        self.task.operation,
+                        output.status.code().unwrap_or(-1),
+                        String::from_utf8_lossy(&output.stdout).trim(),
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    )));
+                }
+                (Err(tree), Ok(())) => {
+                    return Err(io::Error::other(format!(
+                        "failed to terminate mounted chaos helper {}: taskkill failed: {tree}; primary kill: ok",
+                        self.task.operation
+                    )));
+                }
+                (Err(tree), Err(primary)) => {
+                    return Err(io::Error::other(format!(
+                        "failed to terminate mounted chaos helper {}: taskkill failed: {tree}; primary kill: {primary}",
+                        self.task.operation
+                    )));
+                }
+            }
+        }
+
+        #[cfg(not(windows))]
+        self.child.kill()?;
+
+        let deadline = Instant::now() + CHAOS_HELPER_KILL_WAIT_TIMEOUT;
+        while self.child.try_wait()?.is_none() {
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "mounted chaos helper {} did not exit after force termination within {} ms",
+                        self.task.operation,
+                        CHAOS_HELPER_KILL_WAIT_TIMEOUT.as_millis()
+                    ),
+                ));
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        Ok(())
     }
 }
 
@@ -3465,11 +3531,12 @@ fn execute_mounted_chaos_action(
                 .create(true)
                 .append(true)
                 .open(client.mount_point.join(path))?;
-            file.write_all(payload)
+            file.write_all(payload)?;
+            file.sync_all()
         }
         MountedChaosAction::Write { path, payload }
         | MountedChaosAction::CreateFile { path, payload } => {
-            fs::write(client.mount_point.join(path), payload)
+            write_payload_with_publication_barrier(&client.mount_point.join(path), payload)
         }
         MountedChaosAction::Mkdir { path } => fs::create_dir_all(client.mount_point.join(path)),
         MountedChaosAction::Rmdir { path } => fs::remove_dir(client.mount_point.join(path)),
@@ -3492,6 +3559,16 @@ fn execute_mounted_chaos_action(
             Ok(())
         }
     }
+}
+
+fn write_payload_with_publication_barrier(path: &Path, payload: &[u8]) -> io::Result<()> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)?;
+    file.write_all(payload)?;
+    file.sync_all()
 }
 
 fn repeated_chaos_read(client: &ClientSpec, relative_path: &str) -> io::Result<()> {
@@ -10362,6 +10439,48 @@ mod tests {
             "hotspot/slot-00.txt",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn mounted_hotspot_write_actions_preserve_payload_semantics() {
+        let temp = tempdir().unwrap();
+        let mount = temp.path().join("mount");
+        std::fs::create_dir_all(mount.join("hotspot")).unwrap();
+        let client = client_spec_for_plan(temp.path(), "client-a", mount.clone());
+
+        execute_mounted_chaos_action(
+            &client,
+            &MountedChaosAction::CreateFile {
+                path: "hotspot/slot-00.txt".to_string(),
+                payload: b"first".to_vec(),
+            },
+        )
+        .unwrap();
+        execute_mounted_chaos_action(
+            &client,
+            &MountedChaosAction::Append {
+                path: "hotspot/slot-00.txt".to_string(),
+                payload: b"-second".to_vec(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(mount.join("hotspot/slot-00.txt")).unwrap(),
+            b"first-second"
+        );
+
+        execute_mounted_chaos_action(
+            &client,
+            &MountedChaosAction::Write {
+                path: "hotspot/slot-00.txt".to_string(),
+                payload: b"replacement".to_vec(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(mount.join("hotspot/slot-00.txt")).unwrap(),
+            b"replacement"
+        );
     }
 
     #[test]

@@ -2844,8 +2844,16 @@ impl PgMetaEngine {
         self.local.apply_replica_events_to_base(batch_events)?;
         let mut serving_events = Vec::new();
         let mut serving_rename_reconciles = Vec::new();
+        let mut serving_displaced_dentry_cleanup_inodes = Vec::new();
         let mut aux_events = Vec::new();
         for event in batch_events {
+            if let MetaEvent::RenameEntry {
+                displaced_remove_attr_ino: Some(ino),
+                ..
+            } = event
+            {
+                serving_displaced_dentry_cleanup_inodes.push(*ino);
+            }
             let serving_conflicts =
                 Self::serving_event_conflicts_with_overlay(event, overlay, &removed_inodes);
             if !serving_conflicts {
@@ -2866,6 +2874,13 @@ impl PgMetaEngine {
                 )
             {
                 serving_rename_reconciles.push(event);
+            } else {
+                match event {
+                    MetaEvent::RemoveAttr { ino } => {
+                        serving_displaced_dentry_cleanup_inodes.push(*ino);
+                    }
+                    _ => {}
+                }
             }
 
             if Self::event_has_aux_apply_effect(event)
@@ -2877,6 +2892,9 @@ impl PgMetaEngine {
         self.local.apply_replica_serving_state(&serving_events)?;
         self.local
             .reconcile_serving_renames_from_base(serving_rename_reconciles)?;
+        for ino in serving_displaced_dentry_cleanup_inodes {
+            self.local.remove_serving_dentries_for_inode(ino)?;
+        }
 
         if aux_events.is_empty() {
             for ino in preserve_local_payload_inodes {
@@ -2900,6 +2918,43 @@ impl PgMetaEngine {
         }
 
         self.local.apply_replica_events_to_base(batch_events)?;
+        let mut applied_any = false;
+        if let Some(tail_overlay) = self.local_tail_overlay_after_self_batch(batch_events)? {
+            let removed_inodes = self.removed_inodes_for_batch(batch_events);
+            let mut serving_events = Vec::new();
+            let mut serving_displaced_dentry_cleanup_inodes = Vec::new();
+            for event in batch_events {
+                if let MetaEvent::RenameEntry {
+                    displaced_remove_attr_ino: Some(ino),
+                    ..
+                } = event
+                {
+                    serving_displaced_dentry_cleanup_inodes.push(*ino);
+                }
+                if !Self::serving_event_conflicts_with_overlay(
+                    event,
+                    &tail_overlay,
+                    &removed_inodes,
+                ) {
+                    serving_events.push(event.clone());
+                } else {
+                    match event {
+                        MetaEvent::RemoveAttr { ino } => {
+                            serving_displaced_dentry_cleanup_inodes.push(*ino);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if !serving_events.is_empty() {
+                self.local.apply_replica_serving_state(&serving_events)?;
+                applied_any = true;
+            }
+            for ino in serving_displaced_dentry_cleanup_inodes {
+                self.local.remove_serving_dentries_for_inode(ino)?;
+                applied_any = true;
+            }
+        }
         for event in batch_events {
             if let MetaEvent::RenameEntry {
                 parent,
@@ -2925,11 +2980,52 @@ impl PgMetaEngine {
             .cloned()
             .collect();
         if aux_events.is_empty() {
-            return Ok(false);
+            return Ok(applied_any);
         }
 
         self.local.apply_replica_aux_state(&aux_events)?;
         Ok(true)
+    }
+
+    fn local_tail_overlay_after_self_batch(
+        &self,
+        batch_events: &[MetaEvent],
+    ) -> MetaResult<Option<OverlayConflictSets>> {
+        let start = self.flushed_event_seq.load(Ordering::SeqCst);
+        let end = self.local.get_counter("nextEventSeq")?;
+        if end <= start {
+            return Ok(Some(OverlayConflictSets::default()));
+        }
+
+        let local_events = self.local.read_events_range(start, end)?;
+        let mut projected_prefix = Vec::with_capacity(batch_events.len());
+        let mut consumed_events = 0usize;
+        for event in &local_events {
+            consumed_events = consumed_events.saturating_add(1);
+            let projected = Self::project_remote_events(std::slice::from_ref(event));
+            projected_prefix.extend(projected);
+            if projected_prefix.len() >= batch_events.len() {
+                break;
+            }
+        }
+        if projected_prefix.len() != batch_events.len() {
+            return Ok(None);
+        }
+
+        let matches_prefix =
+            projected_prefix
+                .iter()
+                .zip(batch_events.iter())
+                .all(|(local, remote)| {
+                    Self::encode_postcard(local).ok() == Self::encode_postcard(remote).ok()
+                });
+        if !matches_prefix {
+            return Ok(None);
+        }
+
+        Ok(Some(Self::overlay_conflicts_for_events(
+            &local_events[consumed_events..],
+        )))
     }
 
     fn acknowledge_local_prefix_from_self_batch(
@@ -5558,6 +5654,45 @@ mod tests {
     }
 
     #[test]
+    fn replayed_self_batch_restores_serving_payload_after_older_foreign_batch() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+        let file = create_published_small_file(&pg, ROOT_INO, b"self-replay.txt", 77_211);
+        publish_local_events_to_base(&pg);
+
+        let start = pg.flushed_event_seq.load(Ordering::SeqCst);
+        publish_file_payload(&pg, file.ino, 0, 64, 2, 77_212);
+        let end = pg.local.get_counter("nextEventSeq").expect("event end");
+        let local_events = pg
+            .local
+            .read_events_range(start, end)
+            .expect("read local self batch");
+        let self_batch = PgMetaEngine::project_remote_events(&local_events);
+        pg.apply_visible_self_batch(&self_batch)
+            .expect("apply visible self batch");
+        pg.persist_flushed_event_seq(end)
+            .expect("persist flushed seq");
+        assert_eq!(visible_object_id(&pg, file.ino), 77_212);
+
+        let older_foreign_publish = published_payload_events(file.ino, 2, 64, 77_213);
+        pg.apply_foreign_batch(&older_foreign_publish, &OverlayConflictSets::default())
+            .expect("apply older foreign batch");
+        assert_eq!(
+            visible_object_id(&pg, file.ino),
+            77_213,
+            "setup must reproduce an older foreign batch overwriting serving state"
+        );
+
+        pg.flushed_event_seq.store(start, Ordering::SeqCst);
+        pg.apply_visible_self_batch(&self_batch)
+            .expect("replay visible self batch");
+        assert_eq!(
+            visible_object_id(&pg, file.ino),
+            77_212,
+            "later self batch replay must restore the serving graph that wins in PG order"
+        );
+    }
+
+    #[test]
     fn foreign_unlink_during_local_append_does_not_leave_private_dentry() {
         let (_dir, pg) = temp_pg_engine_for_unit();
         let file = create_published_small_file(&pg, ROOT_INO, b"append-race.txt", 77_301);
@@ -5605,6 +5740,176 @@ mod tests {
         assert!(
             pg.lookup(ROOT_INO, b"append-race.txt").is_err(),
             "flushing the already-accepted append must not resurrect a dentry that was not published"
+        );
+    }
+
+    #[test]
+    fn foreign_rename_displacement_drops_private_dentry_despite_source_conflict() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+        let source = create_published_small_file(&pg, ROOT_INO, b"source.txt", 77_401);
+        let displaced = create_published_small_file(&pg, ROOT_INO, b"dest.txt", 77_402);
+        let local = create_published_small_file(&pg, ROOT_INO, b"local.txt", 77_403);
+        publish_local_events_to_base(&pg);
+
+        publish_file_payload(&pg, displaced.ino, 0, 64, 2, 77_404);
+        pg.rename(ROOT_INO, b"local.txt", ROOT_INO, b"source.txt")
+            .expect("local dentry conflict at foreign source");
+        let overlay = pg
+            .local_overlay_conflicts()
+            .expect("overlay with source dentry and displaced payload");
+        assert!(
+            overlay
+                .dentry_keys
+                .contains(&PgMetaEngine::dentry_key(ROOT_INO, b"source.txt")),
+            "test setup must block full foreign rename serving apply"
+        );
+        assert!(
+            overlay.block_inodes.contains(&displaced.ino),
+            "test setup must preserve displaced inode payload by inode"
+        );
+
+        let foreign_rename = vec![MetaEvent::RenameEntry {
+            parent: ROOT_INO,
+            name: b"source.txt".to_vec(),
+            new_parent: ROOT_INO,
+            new_name: b"dest.txt".to_vec(),
+            entry: DirEntryValue {
+                ino: source.ino,
+                kind: FileType::RegularFile,
+            },
+            displaced_set_attr: Box::new(None),
+            displaced_remove_attr_ino: Some(displaced.ino),
+            moved_dir_attr: Box::new(None),
+            old_parent_attr: Box::new(None),
+            new_parent_attr: Box::new(None),
+        }];
+        pg.apply_foreign_batch(&foreign_rename, &overlay)
+            .expect("apply foreign rename displacement");
+
+        assert!(
+            pg.lookup(ROOT_INO, b"dest.txt").is_err(),
+            "foreign displacement must remove the losing private dentry"
+        );
+        assert_eq!(
+            pg.lookup(ROOT_INO, b"source.txt")
+                .expect("local source conflict remains")
+                .ino,
+            local.ino
+        );
+        assert_eq!(
+            lookup_first_object_id(&pg, displaced.ino)
+                .expect("read displaced inode payload")
+                .expect("payload remains available by inode"),
+            77_404
+        );
+    }
+
+    #[test]
+    fn foreign_rename_without_source_dentry_does_not_resurrect_destination() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+        let source = create_published_small_file(&pg, ROOT_INO, b"missing-source.txt", 77_501);
+        publish_local_events_to_base(&pg);
+
+        let mut source_attr = pg.get_attr(source.ino).expect("source attr");
+        pg.unlink(ROOT_INO, b"missing-source.txt")
+            .expect("remove source dentry");
+        publish_local_events_to_base(&pg);
+        source_attr.ctime = InodeAttr::now_nanos();
+        source_attr.mtime = source_attr.ctime;
+
+        let foreign_rename = vec![
+            MetaEvent::SetAttr { attr: source_attr },
+            MetaEvent::RenameEntry {
+                parent: ROOT_INO,
+                name: b"missing-source.txt".to_vec(),
+                new_parent: ROOT_INO,
+                new_name: b"resurrected.txt".to_vec(),
+                entry: DirEntryValue {
+                    ino: source.ino,
+                    kind: FileType::RegularFile,
+                },
+                displaced_set_attr: Box::new(None),
+                displaced_remove_attr_ino: None,
+                moved_dir_attr: Box::new(None),
+                old_parent_attr: Box::new(None),
+                new_parent_attr: Box::new(None),
+            },
+        ];
+        pg.apply_foreign_batch(&foreign_rename, &OverlayConflictSets::default())
+            .expect("apply rename without source dentry");
+
+        assert!(
+            pg.lookup(ROOT_INO, b"resurrected.txt").is_err(),
+            "serving apply must match base apply and skip renames whose source inode has no dentry"
+        );
+    }
+
+    #[test]
+    fn foreign_rename_without_source_still_cleans_displaced_destination() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+        let source = create_published_small_file(&pg, ROOT_INO, b"missing-source.txt", 77_511);
+        let displaced = create_published_small_file(&pg, ROOT_INO, b"dest.txt", 77_512);
+        publish_local_events_to_base(&pg);
+
+        pg.unlink(ROOT_INO, b"missing-source.txt")
+            .expect("remove source dentry");
+        publish_local_events_to_base(&pg);
+
+        let foreign_rename = vec![MetaEvent::RenameEntry {
+            parent: ROOT_INO,
+            name: b"missing-source.txt".to_vec(),
+            new_parent: ROOT_INO,
+            new_name: b"dest.txt".to_vec(),
+            entry: DirEntryValue {
+                ino: source.ino,
+                kind: FileType::RegularFile,
+            },
+            displaced_set_attr: Box::new(None),
+            displaced_remove_attr_ino: Some(displaced.ino),
+            moved_dir_attr: Box::new(None),
+            old_parent_attr: Box::new(None),
+            new_parent_attr: Box::new(None),
+        }];
+        pg.apply_foreign_batch(&foreign_rename, &OverlayConflictSets::default())
+            .expect("apply rename without source dentry");
+
+        assert!(
+            pg.lookup(ROOT_INO, b"dest.txt").is_err(),
+            "displaced destination must be removed even when the incoming rename source is stale"
+        );
+        assert!(
+            pg.lookup(ROOT_INO, b"missing-source.txt").is_err(),
+            "stale rename source must not reappear"
+        );
+    }
+
+    #[test]
+    fn conflicted_foreign_remove_attr_drops_private_dentry_and_preserves_payload() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+        let file = create_published_small_file(&pg, ROOT_INO, b"remove-attr-race.txt", 77_601);
+        publish_local_events_to_base(&pg);
+
+        publish_file_payload(&pg, file.ino, 0, 64, 2, 77_602);
+        let overlay = pg
+            .local_overlay_conflicts()
+            .expect("local payload overlay conflicts");
+        assert!(
+            overlay.block_inodes.contains(&file.ino),
+            "test setup must preserve the local payload by inode"
+        );
+
+        pg.apply_foreign_batch(&[MetaEvent::RemoveAttr { ino: file.ino }], &overlay)
+            .expect("apply conflicted foreign remove attr");
+
+        assert!(
+            pg.lookup(ROOT_INO, b"remove-attr-race.txt").is_err(),
+            "winning remote inode removal must remove namespace dentries even when local payload survives"
+        );
+        assert_eq!(
+            lookup_first_object_id(&pg, file.ino)
+                .expect("read preserved payload")
+                .expect("local payload remains attached to orphaned inode"),
+            77_602
         );
     }
 

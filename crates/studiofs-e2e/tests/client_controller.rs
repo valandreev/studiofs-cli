@@ -603,6 +603,33 @@ fn unmount_force_kills_mount_process_when_umount_command_times_out() {
 }
 
 #[test]
+fn unmount_force_kills_mount_process_when_umount_command_fails() {
+    let temp = tempdir().unwrap();
+    let executor = RecordingExecutor {
+        run_status_action: Some("umount".to_string()),
+        run_status: Cell::new(1),
+        run_stderr: "mount process did not exit after force termination".to_string(),
+        ..RecordingExecutor::new()
+    };
+    let killed = Rc::clone(&executor.killed);
+    let mut controller = MultiClientController::new(test_config(temp.path()), executor);
+    controller.create_clients(["client-a"]).unwrap();
+    controller.init_first_client().unwrap();
+    controller.mount_all().unwrap();
+
+    let err = controller.unmount_all().unwrap_err();
+
+    assert!(err.to_string().contains("umount"));
+    assert_eq!(
+        killed.get(),
+        1,
+        "failed umount command must still force-kill the tracked mount process"
+    );
+    assert_eq!(controller.clients()[0].state, ClientLifecycleState::Killed);
+    assert!(controller.clients()[0].process_id.is_none());
+}
+
+#[test]
 fn force_kill_then_remount_reuses_same_client_root_without_graceful_umount() {
     let temp = tempdir().unwrap();
     let executor = RecordingExecutor::new();
@@ -829,6 +856,7 @@ struct RecordingExecutor {
     run_stdout: String,
     run_stderr: String,
     run_timeout_action: Option<String>,
+    run_status_action: Option<String>,
     transient_init_failures_before_success: Cell<usize>,
     permanent_init_failure: Option<String>,
     create_local_metadata_db: bool,
@@ -856,6 +884,7 @@ impl RecordingExecutor {
             run_stdout: String::new(),
             run_stderr: String::new(),
             run_timeout_action: None,
+            run_status_action: None,
             transient_init_failures_before_success: Cell::new(0),
             permanent_init_failure: None,
             create_local_metadata_db: false,
@@ -919,6 +948,15 @@ impl ClientProcessExecutor for RecordingExecutor {
                 });
             }
         }
+        let status = if self
+            .run_status_action
+            .as_deref()
+            .is_none_or(|action| action == command.action)
+        {
+            self.run_status.get()
+        } else {
+            0
+        };
         if self.create_local_metadata_db {
             std::fs::create_dir_all(&local_metadata_dir)?;
             std::fs::write(
@@ -927,7 +965,7 @@ impl ClientProcessExecutor for RecordingExecutor {
             )?;
         }
         Ok(ClientCommandOutput {
-            status: self.run_status.get(),
+            status,
             stdout: self.run_stdout.clone(),
             stderr: self.run_stderr.clone(),
         })

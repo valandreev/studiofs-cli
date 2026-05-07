@@ -94,6 +94,17 @@ impl RedbMetaEngine {
         Ok(())
     }
 
+    pub(crate) fn remove_serving_dentries_for_inode(&self, ino: Ino) -> MetaResult<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Self::remove_dentry_mirrors_for_inode_in_txn(&txn, ino)?;
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
     fn restore_mirror_aux_from_base_in_txn(
         txn: &redb::WriteTransaction,
         ino: Ino,
@@ -795,6 +806,15 @@ impl RedbMetaEngine {
                         )?
                     };
                     let Some(current_key) = current_key else {
+                        if displaced_remove_attr_ino.is_some() {
+                            Self::remove_base_dentry_in_txn(&txn, *new_parent, new_name)?;
+                        }
+                        if let Some(ino) = displaced_remove_attr_ino {
+                            let mut inodes = txn
+                                .open_table(BASE_INODES_TABLE)
+                                .map_err(|e| MetaError::Storage(e.to_string()))?;
+                            let _ = inodes.remove(*ino);
+                        }
                         continue;
                     };
 
@@ -813,6 +833,7 @@ impl RedbMetaEngine {
                             .map_err(|e| MetaError::Storage(e.to_string()))?;
                     }
                     if let Some(ino) = displaced_remove_attr_ino {
+                        Self::remove_base_dentries_for_inode_in_txn(&txn, *ino)?;
                         let _ = inodes.remove(*ino);
                     }
                     if let Some(attr) = moved_dir_attr.as_ref() {
@@ -1021,10 +1042,17 @@ impl RedbMetaEngine {
                             },
                         )?
                     };
-                    if let Some(current_key) = current_key {
-                        let (current_parent, current_name) = decode_dentry_key(&current_key)?;
-                        Self::remove_dentry_mirror_in_txn(&txn, current_parent, current_name)?;
-                    }
+                    let Some(current_key) = current_key else {
+                        if displaced_remove_attr_ino.is_some() {
+                            Self::remove_dentry_mirror_in_txn(&txn, *new_parent, new_name)?;
+                        }
+                        if let Some(ino) = displaced_remove_attr_ino {
+                            Self::remove_inode_mirror_in_txn(&txn, *ino)?;
+                        }
+                        continue;
+                    };
+                    let (current_parent, current_name) = decode_dentry_key(&current_key)?;
+                    Self::remove_dentry_mirror_in_txn(&txn, current_parent, current_name)?;
                     Self::remove_dentry_mirror_in_txn(&txn, *new_parent, new_name)?;
                     if Self::get_attr_from_write_table(&txn, INODES_TABLE, entry.ino)?.is_none()
                         && let Some(attr) =
@@ -1039,6 +1067,7 @@ impl RedbMetaEngine {
                         Self::set_inode_mirror_in_txn(&txn, attr)?;
                     }
                     if let Some(ino) = displaced_remove_attr_ino {
+                        Self::remove_dentry_mirrors_for_inode_in_txn(&txn, *ino)?;
                         Self::remove_inode_mirror_in_txn(&txn, *ino)?;
                     }
                     if let Some(attr) = moved_dir_attr.as_ref() {
