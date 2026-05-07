@@ -2000,8 +2000,8 @@ trait PublicationBoundaryDriver {
     fn mount_all(&mut self) -> Result<(), ScenarioError>;
     fn clients(&self) -> Vec<ClientSpec>;
     fn force_kill(&mut self, client: &str) -> Result<(), ScenarioError>;
+    fn graceful_shutdown(&mut self, client: &str) -> Result<(), ScenarioError>;
     fn remount(&mut self, client: &str) -> Result<(), ScenarioError>;
-    fn restart(&mut self, client: &str) -> Result<(), ScenarioError>;
     fn publish_for_convergence(
         &mut self,
         _boundary: PublicationBoundary,
@@ -2035,12 +2035,12 @@ impl PublicationBoundaryDriver for RealPublicationBoundaryDriver {
         Ok(self.0.force_kill(client)?)
     }
 
-    fn remount(&mut self, client: &str) -> Result<(), ScenarioError> {
-        Ok(self.0.remount(client)?)
+    fn graceful_shutdown(&mut self, client: &str) -> Result<(), ScenarioError> {
+        Ok(self.0.unmount(client)?)
     }
 
-    fn restart(&mut self, client: &str) -> Result<(), ScenarioError> {
-        Ok(self.0.restart(client)?)
+    fn remount(&mut self, client: &str) -> Result<(), ScenarioError> {
+        Ok(self.0.remount(client)?)
     }
 
     fn unmount_all(&mut self) -> Result<(), ScenarioError> {
@@ -2181,9 +2181,22 @@ fn run_publication_boundary(
 
     let restart_started = Instant::now();
     if boundary == PublicationBoundary::ShutdownDrain {
-        driver.restart(&writer.name)?;
+        driver.graceful_shutdown(&writer.name)?;
+    } else {
+        driver.force_kill(&writer.name)?;
     }
-    driver.force_kill(&writer.name)?;
+
+    let peer_visibility_before_publication =
+        publication_boundary_peer_visibility(&clients[1..], relative_path)?;
+    for visibility in &peer_visibility_before_publication {
+        if let Some(checksum) = &visibility.visible_checksum_sha256 {
+            return Err(ScenarioError::PeerObservedPrematurePublication {
+                client: visibility.client.clone(),
+                checksum: checksum.clone(),
+            });
+        }
+    }
+
     driver.remount(&writer.name)?;
     let local_read_payload = fs::read(writer.mount_point.join(relative_path))?;
     if local_read_payload != payload {
@@ -2193,21 +2206,6 @@ fn run_publication_boundary(
     }
     let local_read_checksum_sha256 = bytes_sha256(&local_read_payload);
     let restart_elapsed_ms = elapsed_millis_nonzero(restart_started);
-
-    let peer_visibility_before_publication =
-        publication_boundary_peer_visibility(&clients[1..], relative_path)?;
-    for visibility in &peer_visibility_before_publication {
-        if visibility
-            .visible_checksum_sha256
-            .as_ref()
-            .is_some_and(|checksum| checksum == &local_read_checksum_sha256)
-        {
-            return Err(ScenarioError::PeerObservedPrematurePublication {
-                client: visibility.client.clone(),
-                checksum: local_read_checksum_sha256,
-            });
-        }
-    }
 
     driver.publish_for_convergence(boundary, clients, relative_path)?;
     let convergence_started = Instant::now();
@@ -2322,8 +2320,10 @@ fn write_publication_boundary_operations(
             name: "graceful_shutdown_drain".to_string(),
             reason: "real mounted graceful shutdown boundary".to_string(),
         });
+        operations.push(SharedOperation::ClientRestart);
+    } else {
+        operations.extend([SharedOperation::ClientCrash, SharedOperation::ClientRestart]);
     }
-    operations.extend([SharedOperation::ClientCrash, SharedOperation::ClientRestart]);
 
     for operation in operations {
         let record = shared_operation_record(
@@ -8455,6 +8455,7 @@ mod tests {
     struct RecordingPublicationBoundaryDriver {
         clients: Vec<ClientSpec>,
         actions: RefCell<Vec<String>>,
+        leak_premature_peer_file: bool,
     }
 
     impl RecordingPublicationBoundaryDriver {
@@ -8462,7 +8463,13 @@ mod tests {
             Self {
                 clients,
                 actions: RefCell::new(Vec::new()),
+                leak_premature_peer_file: false,
             }
+        }
+
+        fn leak_premature_peer_file(mut self) -> Self {
+            self.leak_premature_peer_file = true;
+            self
         }
 
         fn replicate_from_writer(&self) -> Result<(), ScenarioError> {
@@ -8520,16 +8527,20 @@ mod tests {
             self.actions
                 .borrow_mut()
                 .push(format!("force_kill_{client}"));
+            self.maybe_leak_premature_peer_file()?;
+            Ok(())
+        }
+
+        fn graceful_shutdown(&mut self, client: &str) -> Result<(), ScenarioError> {
+            self.actions
+                .borrow_mut()
+                .push(format!("graceful_shutdown_{client}"));
+            self.maybe_leak_premature_peer_file()?;
             Ok(())
         }
 
         fn remount(&mut self, client: &str) -> Result<(), ScenarioError> {
             self.actions.borrow_mut().push(format!("remount_{client}"));
-            Ok(())
-        }
-
-        fn restart(&mut self, client: &str) -> Result<(), ScenarioError> {
-            self.actions.borrow_mut().push(format!("restart_{client}"));
             Ok(())
         }
 
@@ -8548,6 +8559,24 @@ mod tests {
 
         fn unmount_all(&mut self) -> Result<(), ScenarioError> {
             self.actions.borrow_mut().push("unmount_all".to_string());
+            Ok(())
+        }
+    }
+
+    impl RecordingPublicationBoundaryDriver {
+        fn maybe_leak_premature_peer_file(&self) -> Result<(), ScenarioError> {
+            if !self.leak_premature_peer_file {
+                return Ok(());
+            }
+            for peer in self.clients.iter().skip(1) {
+                let path = peer
+                    .mount_point
+                    .join(publication_boundary_file_name(PublicationBoundary::Flush));
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(path, b"partial premature payload\n")?;
+            }
             Ok(())
         }
     }
@@ -10189,8 +10218,7 @@ mod tests {
                 "force_kill_client-a",
                 "remount_client-a",
                 "publish_release_close",
-                "restart_client-a",
-                "force_kill_client-a",
+                "graceful_shutdown_client-a",
                 "remount_client-a",
                 "publish_shutdown_drain",
                 "unmount_all",
@@ -10244,6 +10272,54 @@ mod tests {
                     if name == "publication_boundary_checkpoint"
             )
         }));
+        assert!(!operations.iter().any(|record| {
+            matches!(record.operation, SharedOperation::ClientCrash)
+                && record
+                    .metadata
+                    .get("boundary")
+                    .is_some_and(|value| value == "shutdown_drain")
+        }));
+    }
+
+    #[test]
+    fn publication_boundary_crash_matrix_rejects_any_peer_file_before_publication_gate() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-publication-boundary-leak");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(MOUNTED_PUBLICATION_BOUNDARY_CRASH_MATRIX);
+        let clients = PUBLICATION_BOUNDARY_CLIENT_NAMES
+            .iter()
+            .copied()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(&mount).unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let mut driver =
+            RecordingPublicationBoundaryDriver::new(clients).leak_premature_peer_file();
+        let context = ScenarioContext {
+            run_id: "run-publication-boundary-leak".to_string(),
+            seed: 375,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+
+        let err = run_publication_boundary_crash_matrix_with_driver(
+            &context,
+            &mut driver,
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, ScenarioError::PeerObservedPrematurePublication { .. }),
+            "{err}"
+        );
     }
 
     #[test]

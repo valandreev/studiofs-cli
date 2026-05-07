@@ -806,6 +806,12 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
     }
 
     /// Function $name.
+    pub fn unmount(&mut self, client: &str) -> Result<(), ClientControllerError> {
+        let index = self.client_index(client)?;
+        self.unmount_index(index)
+    }
+
+    /// Function $name.
     pub fn force_kill(&mut self, client: &str) -> Result<(), ClientControllerError> {
         let index = self.client_index(client)?;
         if let Some(process) = self.clients[index].process.as_mut() {
