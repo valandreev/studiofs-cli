@@ -684,6 +684,32 @@ fn run_with_executor_and_mount_lock_dir(
     {
         record_event(&events_path, &run_id, None, "run", "finished")?;
     }
+    let (run_timed_out, scenario_failed) = scenario_outcome_flags(&scenario_outcomes);
+    if scenario_failed {
+        let interim_cleanup = CleanupReport {
+            status: RunStatus::Interrupted,
+            actions: vec!["cleanup pending".to_string()],
+            errors: Vec::new(),
+        };
+        let (interim_status, interim_exit_code) =
+            run_status_and_exit_code(run_timed_out, scenario_failed, false);
+        finish_run(FinishRunInput {
+            run_id: run_id.clone(),
+            seed: request.seed,
+            status: interim_status,
+            exit_code: interim_exit_code,
+            started_at: started_at.clone(),
+            duration_ms: duration_millis(started_instant),
+            selected_platform: selected_platform.clone(),
+            sandbox: sandbox.clone(),
+            retention: request.retention,
+            report_copy: request.report.clone(),
+            preflight: preflight.clone(),
+            scenario_reports: scenario_reports.clone(),
+            scenario_outcomes: scenario_outcomes.clone(),
+            cleanup: interim_cleanup,
+        })?;
+    }
     let mut cleanup_actions = Vec::new();
     e2e_progress_fields(&[
         ("run", run_id.clone()),
@@ -708,29 +734,9 @@ fn run_with_executor_and_mount_lock_dir(
         ("status", format!("{:?}", cleanup.status)),
     ]);
 
-    let scenario_failed = scenario_outcomes
-        .iter()
-        .any(|scenario| scenario.status != ScenarioStatus::Passed);
-    let run_timed_out = scenario_outcomes
-        .iter()
-        .any(|scenario| scenario.status == ScenarioStatus::TimedOut);
     let cleanup_failed = cleanup.status == RunStatus::CleanupFailed;
-    let status = if run_timed_out {
-        RunStatus::TimedOut
-    } else if scenario_failed {
-        RunStatus::Failed
-    } else if cleanup_failed {
-        RunStatus::CleanupFailed
-    } else {
-        RunStatus::Passed
-    };
-    let exit_code = if scenario_failed {
-        1
-    } else if cleanup_failed {
-        4
-    } else {
-        0
-    };
+    let (status, exit_code) =
+        run_status_and_exit_code(run_timed_out, scenario_failed, cleanup_failed);
     finish_run(FinishRunInput {
         run_id,
         seed: request.seed,
@@ -783,6 +789,31 @@ impl Drop for ComposeCleanupGuard<'_> {
             );
         }
     }
+}
+
+fn run_status_and_exit_code(
+    run_timed_out: bool,
+    scenario_failed: bool,
+    cleanup_failed: bool,
+) -> (RunStatus, i32) {
+    match (run_timed_out, scenario_failed, cleanup_failed) {
+        (true, _, _) => (RunStatus::TimedOut, 1),
+        (_, true, _) => (RunStatus::Failed, 1),
+        (_, _, true) => (RunStatus::CleanupFailed, 4),
+        _ => (RunStatus::Passed, 0),
+    }
+}
+
+fn scenario_outcome_flags(scenario_outcomes: &[ScenarioOutcome]) -> (bool, bool) {
+    scenario_outcomes.iter().fold(
+        (false, false),
+        |(run_timed_out, scenario_failed), scenario| {
+            (
+                run_timed_out || scenario.status == ScenarioStatus::TimedOut,
+                scenario_failed || scenario.status != ScenarioStatus::Passed,
+            )
+        },
+    )
 }
 
 struct FinishRunInput {
@@ -3099,6 +3130,57 @@ mod tests {
     }
 
     #[test]
+    fn compose_failure_run_writes_report_before_compose_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("e2e-runs");
+        let run_id = "compose-failed-run";
+        let report_path = root.join(run_id).join("report.json");
+        let executor = RecordingExecutor::default();
+        executor
+            .require_report_before_compose_cleanup
+            .replace(Some(report_path.clone()));
+
+        let outcome = run_with_executor(
+            RunRequest {
+                root,
+                run_id: Some(run_id.to_string()),
+                scenarios: vec![scenario::TEST_FAILING_VALIDATE.to_string()],
+                seed: 383,
+                studiofs_bin: None,
+                platform: PlatformSelection::Auto,
+                retention: RetentionPolicy::Always,
+                report: None,
+                port_range: None,
+                timeout: None,
+                infra: InfraMode::Compose,
+            },
+            &executor,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.status, RunStatus::Failed);
+        assert_eq!(outcome.exit_code, 1);
+        assert!(report_path.exists());
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
+        assert_eq!(report["status"], "failed");
+        assert!(
+            report["scenarios"][0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("validation failed")
+        );
+        assert_eq!(report["cleanup"]["status"], "passed");
+        assert!(
+            report["cleanup"]["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|action| action.as_str() == Some("docker compose logs"))
+        );
+    }
+
+    #[test]
     fn compose_basic_smoke_requires_product_binary() {
         let temp = tempfile::tempdir().unwrap();
         let executor = RecordingExecutor::default();
@@ -4041,6 +4123,7 @@ mod tests {
     struct RecordingExecutor {
         calls: RefCell<Vec<crate::infra::CommandSpec>>,
         poison_events_path_after_up: RefCell<Option<PathBuf>>,
+        require_report_before_compose_cleanup: RefCell<Option<PathBuf>>,
         timeout_next_run_one: Cell<bool>,
         fail_next_run_one_without_report: Cell<bool>,
         skip_next_run_one_report: Cell<bool>,
@@ -4103,6 +4186,20 @@ mod tests {
                     },
                 )
                 .map_err(std::io::Error::other)?;
+            }
+            if command
+                .args
+                .iter()
+                .any(|arg| arg == "logs" || arg == "down")
+            {
+                if let Some(report_path) =
+                    self.require_report_before_compose_cleanup.borrow().as_ref()
+                {
+                    assert!(
+                        report_path.exists(),
+                        "report.json must exist before compose cleanup starts"
+                    );
+                }
             }
             if command.args.contains(&"up".to_string()) {
                 if let Some(events_path) = self.poison_events_path_after_up.borrow_mut().take() {
