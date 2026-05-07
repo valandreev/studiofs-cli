@@ -742,12 +742,14 @@ fn unmount_timeout_fallback_uses_process_tree_termination() {
 
 #[cfg(windows)]
 #[test]
-fn taskkill_no_running_instance_is_success_when_primary_kill_succeeded() {
+fn taskkill_not_found_status_is_success_without_parsing_stderr() {
     assert!(studiofs_e2e::client::windows_taskkill_status_is_success(
-        Some(255),
-        "ERROR: The process with PID 28232 (child process of PID 12436) could not be terminated.\r\nReason: There is no running instance of the task.",
-        true,
+        Some(128),
     ));
+    assert!(
+        !studiofs_e2e::client::windows_taskkill_status_is_success(Some(255)),
+        "non-standard taskkill failures must be resolved through PID liveness, not localized stderr"
+    );
 }
 
 #[test]

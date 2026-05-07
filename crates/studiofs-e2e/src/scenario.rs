@@ -3427,21 +3427,19 @@ impl MountedChaosProcess for SystemMountedChaosProcess {
 
         #[cfg(windows)]
         {
-            let pid = self.child.id().to_string();
+            let pid = self.child.id();
+            let pid_arg = pid.to_string();
             let tree_result = Command::new("taskkill")
-                .args(["/PID", &pid, "/T", "/F"])
+                .args(["/PID", &pid_arg, "/T", "/F"])
                 .output();
             let primary_result = self.child.kill();
             return match (tree_result, primary_result) {
-                (Ok(output), primary_result)
-                    if crate::client::windows_taskkill_status_is_success(
-                        output.status.code(),
-                        &String::from_utf8_lossy(&output.stderr),
-                        primary_result.is_ok(),
-                    ) =>
+                (Ok(output), _)
+                    if crate::client::windows_taskkill_status_is_success(output.status.code()) =>
                 {
                     Ok(())
                 }
+                (Ok(_), Ok(())) if !crate::client::windows_pid_is_running(pid) => Ok(()),
                 (Ok(output), Ok(())) => Err(io::Error::other(format!(
                     "failed to terminate mounted chaos helper {}: taskkill exit {}; stdout: {}; stderr: {}; primary kill: ok",
                     self.task.operation,
