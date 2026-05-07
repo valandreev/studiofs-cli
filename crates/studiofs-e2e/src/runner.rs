@@ -1305,22 +1305,43 @@ fn write_lock_payload(mut file: fs::File, payload: &[u8]) -> std::io::Result<()>
 
 /// Removes runner-owned E2E sandboxes and recovers their recorded infrastructure.
 pub fn clean(request: CleanRequest) -> Result<CleanOutcome, RunnerError> {
-    clean_with_executor(request, &SystemCommandExecutor)
+    clean_with_executor_and_mount_lock_dir(
+        request,
+        &SystemCommandExecutor,
+        &default_mount_lock_dir(),
+        process_is_running,
+    )
 }
 
+#[cfg(test)]
 fn clean_with_executor(
     request: CleanRequest,
     executor: &dyn CommandExecutor,
 ) -> Result<CleanOutcome, RunnerError> {
+    clean_with_executor_and_mount_lock_dir(
+        request,
+        executor,
+        &default_mount_lock_dir(),
+        process_is_running,
+    )
+}
+
+fn clean_with_executor_and_mount_lock_dir(
+    request: CleanRequest,
+    executor: &dyn CommandExecutor,
+    mount_lock_dir: &Path,
+    process_checker: impl Fn(u32) -> ProcessStatus + Copy,
+) -> Result<CleanOutcome, RunnerError> {
+    let mut skipped = Vec::new();
+    clean_default_mount_lock(mount_lock_dir, process_checker, &mut skipped);
     if !request.root.exists() {
         return Ok(CleanOutcome {
             removed: Vec::new(),
-            skipped: Vec::new(),
+            skipped,
         });
     }
     let root = canonicalize_cleanup_root(&request.root)?;
     let mut removed = Vec::new();
-    let mut skipped = Vec::new();
     for entry_result in fs::read_dir(&root)? {
         let entry = match entry_result {
             Ok(entry) => entry,
@@ -1348,6 +1369,23 @@ fn clean_with_executor(
     removed.sort();
     skipped.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(CleanOutcome { removed, skipped })
+}
+
+fn clean_default_mount_lock(
+    mount_lock_dir: &Path,
+    process_checker: impl Fn(u32) -> ProcessStatus + Copy,
+    skipped: &mut Vec<CleanSkipped>,
+) {
+    let path = mount_lock_dir.join("default-windows-mount-points.lock");
+    if !path.exists() {
+        return;
+    }
+    if let Err(err) = reclaim_stale_default_mount_lock(&path, process_checker) {
+        skipped.push(CleanSkipped {
+            path,
+            error: format!("default Windows mounted E2E run lock cleanup failed: {err}"),
+        });
+    }
 }
 
 fn clean_entry(
@@ -3731,6 +3769,39 @@ mod tests {
         assert!(holder.contains("new-run"));
         assert!(!holder.contains("stale-run"));
         drop(lock);
+    }
+
+    #[test]
+    fn clean_reclaims_stale_default_mount_lock_when_holder_pid_is_not_running() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("e2e-runs");
+        let lock_dir = temp.path().join("locks");
+        std::fs::create_dir_all(&lock_dir).unwrap();
+        let lock_path = lock_dir.join("default-windows-mount-points.lock");
+        std::fs::write(
+            &lock_path,
+            serde_json::json!({
+                "runner": RUNNER_CRATE,
+                "scope": "default-windows-mount-points",
+                "run_id": "stale-run",
+                "pid": 4_294_967_294u32,
+                "created_at": timestamp(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let outcome = clean_with_executor_and_mount_lock_dir(
+            CleanRequest { root },
+            &RecordingExecutor::default(),
+            &lock_dir,
+            |_| ProcessStatus::NotRunning,
+        )
+        .unwrap();
+
+        assert!(outcome.removed.is_empty());
+        assert!(outcome.skipped.is_empty());
+        assert!(!lock_path.exists());
     }
 
     #[test]
