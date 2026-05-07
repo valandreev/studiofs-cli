@@ -810,13 +810,13 @@ fn system_executor_times_out_foreground_commands_and_preserves_partial_logs() {
     std::fs::create_dir_all(&command.client_root).unwrap();
 
     let err = studiofs_e2e::client::SystemClientProcessExecutor
-        .run(&command, Duration::from_millis(300))
+        .run(&command, Duration::from_secs(2))
         .unwrap_err();
 
     assert!(matches!(
         err,
         ClientControllerError::CommandTimedOut(details)
-            if details.action == "sleepy" && details.timeout == Duration::from_millis(300)
+            if details.action == "sleepy" && details.timeout == Duration::from_secs(2)
     ));
     let stdout = std::fs::read_to_string(&command.stdout_log).unwrap();
     let stderr = std::fs::read_to_string(&command.stderr_log).unwrap();
@@ -1115,7 +1115,7 @@ fn sleepy_client_command_for_mount_point(mount_point: std::path::PathBuf) -> Cli
     command.args = vec![
         "-NoProfile".to_string(),
         "-Command".to_string(),
-        "Write-Output 'partial stdout'; [Console]::Error.WriteLine('partial stderr'); Start-Sleep -Seconds 5".to_string(),
+        "[Console]::Out.WriteLine('partial stdout'); [Console]::Out.Flush(); [Console]::Error.WriteLine('partial stderr'); [Console]::Error.Flush(); Start-Sleep -Seconds 5".to_string(),
     ];
     command
 }
