@@ -1111,7 +1111,7 @@ struct DefaultMountLock {
 struct DefaultMountLockHolder {
     runner: String,
     scope: String,
-    run_id: String,
+    run_id: Option<String>,
     pid: u32,
 }
 
@@ -1226,6 +1226,14 @@ fn reclaim_stale_default_mount_lock(
     let Some(holder) = read_default_mount_lock_holder(path)? else {
         return Ok(false);
     };
+    reclaim_stale_default_mount_lock_for_holder(path, &holder, process_checker)
+}
+
+fn reclaim_stale_default_mount_lock_for_holder(
+    path: &Path,
+    holder: &DefaultMountLockHolder,
+    process_checker: impl Fn(u32) -> ProcessStatus,
+) -> std::io::Result<bool> {
     if holder.runner != RUNNER_CRATE || holder.scope != "default-windows-mount-points" {
         return Ok(false);
     }
@@ -1400,10 +1408,12 @@ fn reclaim_stale_default_mount_lock_after_clean(
     let Some(holder) = read_default_mount_lock_holder(path)? else {
         return Ok(false);
     };
-    if root.is_some_and(|root| root.join(&holder.run_id).exists()) {
-        return Ok(false);
+    if let Some(run_id) = &holder.run_id {
+        if validate_run_id(run_id).is_err() || root.is_some_and(|root| root.join(run_id).exists()) {
+            return Ok(false);
+        }
     }
-    reclaim_stale_default_mount_lock(path, process_checker)
+    reclaim_stale_default_mount_lock_for_holder(path, &holder, process_checker)
 }
 
 fn clean_entry(
@@ -3825,6 +3835,38 @@ mod tests {
     }
 
     #[test]
+    fn clean_reclaims_legacy_default_mount_lock_without_run_id_when_holder_pid_is_not_running() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("e2e-runs");
+        let lock_dir = temp.path().join("locks");
+        std::fs::create_dir_all(&lock_dir).unwrap();
+        let lock_path = lock_dir.join("default-windows-mount-points.lock");
+        std::fs::write(
+            &lock_path,
+            serde_json::json!({
+                "runner": RUNNER_CRATE,
+                "scope": "default-windows-mount-points",
+                "pid": DEFINITELY_DEAD_TEST_PID,
+                "created_at": timestamp(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let outcome = clean_with_executor_and_mount_lock_dir(
+            CleanRequest { root },
+            &RecordingExecutor::default(),
+            &lock_dir,
+            |_| ProcessStatus::NotRunning,
+        )
+        .unwrap();
+
+        assert!(outcome.removed.is_empty());
+        assert!(outcome.skipped.is_empty());
+        assert!(!lock_path.exists());
+    }
+
+    #[test]
     fn clean_keeps_dead_pid_default_mount_lock_when_recorded_run_still_exists() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("e2e-runs");
@@ -3838,6 +3880,39 @@ mod tests {
                 "runner": RUNNER_CRATE,
                 "scope": "default-windows-mount-points",
                 "run_id": "active-run",
+                "pid": DEFINITELY_DEAD_TEST_PID,
+                "created_at": timestamp(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let outcome = clean_with_executor_and_mount_lock_dir(
+            CleanRequest { root },
+            &RecordingExecutor::default(),
+            &lock_dir,
+            |_| ProcessStatus::NotRunning,
+        )
+        .unwrap();
+
+        assert!(outcome.removed.is_empty());
+        assert!(outcome.skipped.is_empty());
+        assert!(lock_path.exists());
+    }
+
+    #[test]
+    fn clean_keeps_dead_pid_default_mount_lock_when_recorded_run_id_is_unsafe() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("e2e-runs");
+        let lock_dir = temp.path().join("locks");
+        std::fs::create_dir_all(&lock_dir).unwrap();
+        let lock_path = lock_dir.join("default-windows-mount-points.lock");
+        std::fs::write(
+            &lock_path,
+            serde_json::json!({
+                "runner": RUNNER_CRATE,
+                "scope": "default-windows-mount-points",
+                "run_id": "../outside-run",
                 "pid": DEFINITELY_DEAD_TEST_PID,
                 "created_at": timestamp(),
             })
