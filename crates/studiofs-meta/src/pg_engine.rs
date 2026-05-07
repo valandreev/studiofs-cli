@@ -2456,10 +2456,13 @@ impl PgMetaEngine {
         })
     }
 
-    fn self_batch_event_fully_ackable(event: &MetaEvent) -> bool {
+    fn self_batch_event_fully_ackable(
+        event: &MetaEvent,
+        retained_block_overlay: &HashSet<Ino>,
+    ) -> bool {
         match event {
             MetaEvent::SetAttr { attr } if attr.kind == FileType::RegularFile => {
-                attr.size == attr.committed_size
+                attr.size == attr.committed_size || !retained_block_overlay.contains(&attr.ino)
             }
             _ => true,
         }
@@ -3011,6 +3014,7 @@ impl PgMetaEngine {
         }
 
         let local_events = self.local.read_events_range(start, end)?;
+        let retained_block_overlay = self.local.local_overlay_inodes()?;
         let mut projected_prefix = Vec::with_capacity(batch_events.len());
         let mut consumed_events = 0usize;
         let mut ackable_events = 0usize;
@@ -3019,7 +3023,7 @@ impl PgMetaEngine {
             consumed_events = consumed_events.saturating_add(1);
             let projected = Self::project_remote_events(std::slice::from_ref(event));
             projected_prefix.extend(projected);
-            prefix_ackable &= Self::self_batch_event_fully_ackable(event);
+            prefix_ackable &= Self::self_batch_event_fully_ackable(event, &retained_block_overlay);
             if prefix_ackable {
                 ackable_events = consumed_events;
             }
@@ -3055,6 +3059,7 @@ impl PgMetaEngine {
         }
 
         let local_events = self.local.read_events_range(start, end)?;
+        let retained_block_overlay = self.local.local_overlay_inodes()?;
         let mut projected_prefix = Vec::with_capacity(batch_events.len());
         let mut consumed_events = 0usize;
         let mut ackable_events = 0usize;
@@ -3063,7 +3068,7 @@ impl PgMetaEngine {
             consumed_events = consumed_events.saturating_add(1);
             let projected = Self::project_remote_events(std::slice::from_ref(event));
             projected_prefix.extend(projected);
-            prefix_ackable &= Self::self_batch_event_fully_ackable(event);
+            prefix_ackable &= Self::self_batch_event_fully_ackable(event, &retained_block_overlay);
             if prefix_ackable {
                 ackable_events = consumed_events;
             }
