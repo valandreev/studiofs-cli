@@ -1111,6 +1111,7 @@ struct DefaultMountLock {
 struct DefaultMountLockHolder {
     runner: String,
     scope: String,
+    run_id: Option<String>,
     pid: u32,
 }
 
@@ -1225,6 +1226,14 @@ fn reclaim_stale_default_mount_lock(
     let Some(holder) = read_default_mount_lock_holder(path)? else {
         return Ok(false);
     };
+    reclaim_stale_default_mount_lock_for_holder(path, &holder, process_checker)
+}
+
+fn reclaim_stale_default_mount_lock_for_holder(
+    path: &Path,
+    holder: &DefaultMountLockHolder,
+    process_checker: impl Fn(u32) -> ProcessStatus,
+) -> std::io::Result<bool> {
     if holder.runner != RUNNER_CRATE || holder.scope != "default-windows-mount-points" {
         return Ok(false);
     }
@@ -1305,17 +1314,39 @@ fn write_lock_payload(mut file: fs::File, payload: &[u8]) -> std::io::Result<()>
 
 /// Removes runner-owned E2E sandboxes and recovers their recorded infrastructure.
 pub fn clean(request: CleanRequest) -> Result<CleanOutcome, RunnerError> {
-    clean_with_executor(request, &SystemCommandExecutor)
+    clean_with_executor_and_mount_lock_dir(
+        request,
+        &SystemCommandExecutor,
+        &default_mount_lock_dir(),
+        process_is_running,
+    )
 }
 
+#[cfg(test)]
 fn clean_with_executor(
     request: CleanRequest,
     executor: &dyn CommandExecutor,
 ) -> Result<CleanOutcome, RunnerError> {
+    clean_with_executor_and_mount_lock_dir(
+        request,
+        executor,
+        &default_mount_lock_dir(),
+        process_is_running,
+    )
+}
+
+fn clean_with_executor_and_mount_lock_dir(
+    request: CleanRequest,
+    executor: &dyn CommandExecutor,
+    mount_lock_dir: &Path,
+    process_checker: impl Fn(u32) -> ProcessStatus + Copy,
+) -> Result<CleanOutcome, RunnerError> {
     if !request.root.exists() {
+        let mut skipped = Vec::new();
+        clean_default_mount_lock(mount_lock_dir, None, process_checker, &mut skipped);
         return Ok(CleanOutcome {
             removed: Vec::new(),
-            skipped: Vec::new(),
+            skipped,
         });
     }
     let root = canonicalize_cleanup_root(&request.root)?;
@@ -1345,9 +1376,44 @@ fn clean_with_executor(
             }),
         }
     }
+    clean_default_mount_lock(mount_lock_dir, Some(&root), process_checker, &mut skipped);
     removed.sort();
     skipped.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(CleanOutcome { removed, skipped })
+}
+
+fn clean_default_mount_lock(
+    mount_lock_dir: &Path,
+    root: Option<&Path>,
+    process_checker: impl Fn(u32) -> ProcessStatus + Copy,
+    skipped: &mut Vec<CleanSkipped>,
+) {
+    let path = mount_lock_dir.join("default-windows-mount-points.lock");
+    if !path.exists() {
+        return;
+    }
+    if let Err(err) = reclaim_stale_default_mount_lock_after_clean(&path, root, process_checker) {
+        skipped.push(CleanSkipped {
+            path,
+            error: format!("default Windows mounted E2E run lock cleanup failed: {err}"),
+        });
+    }
+}
+
+fn reclaim_stale_default_mount_lock_after_clean(
+    path: &Path,
+    root: Option<&Path>,
+    process_checker: impl Fn(u32) -> ProcessStatus,
+) -> std::io::Result<bool> {
+    let Some(holder) = read_default_mount_lock_holder(path)? else {
+        return Ok(false);
+    };
+    if let Some(run_id) = &holder.run_id {
+        if validate_run_id(run_id).is_err() || root.is_some_and(|root| root.join(run_id).exists()) {
+            return Ok(false);
+        }
+    }
+    reclaim_stale_default_mount_lock_for_holder(path, &holder, process_checker)
 }
 
 fn clean_entry(
@@ -2713,6 +2779,8 @@ mod tests {
     use crate::infra::{CommandExecutor, CommandOutput, InfraMode};
     use std::cell::{Cell, RefCell};
 
+    const DEFINITELY_DEAD_TEST_PID: u32 = 4_294_967_294;
+
     #[derive(Debug)]
     struct FailingValidateScenario {
         calls: RefCell<Vec<&'static str>>,
@@ -3715,7 +3783,7 @@ mod tests {
                 "runner": RUNNER_CRATE,
                 "scope": "default-windows-mount-points",
                 "run_id": "stale-run",
-                "pid": 4_294_967_294u32,
+                "pid": DEFINITELY_DEAD_TEST_PID,
                 "created_at": timestamp(),
             })
             .to_string(),
@@ -3731,6 +3799,138 @@ mod tests {
         assert!(holder.contains("new-run"));
         assert!(!holder.contains("stale-run"));
         drop(lock);
+    }
+
+    #[test]
+    fn clean_reclaims_stale_default_mount_lock_when_holder_pid_is_not_running() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("e2e-runs");
+        let lock_dir = temp.path().join("locks");
+        std::fs::create_dir_all(&lock_dir).unwrap();
+        let lock_path = lock_dir.join("default-windows-mount-points.lock");
+        std::fs::write(
+            &lock_path,
+            serde_json::json!({
+                "runner": RUNNER_CRATE,
+                "scope": "default-windows-mount-points",
+                "run_id": "stale-run",
+                "pid": DEFINITELY_DEAD_TEST_PID,
+                "created_at": timestamp(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let outcome = clean_with_executor_and_mount_lock_dir(
+            CleanRequest { root },
+            &RecordingExecutor::default(),
+            &lock_dir,
+            |_| ProcessStatus::NotRunning,
+        )
+        .unwrap();
+
+        assert!(outcome.removed.is_empty());
+        assert!(outcome.skipped.is_empty());
+        assert!(!lock_path.exists());
+    }
+
+    #[test]
+    fn clean_reclaims_legacy_default_mount_lock_without_run_id_when_holder_pid_is_not_running() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("e2e-runs");
+        let lock_dir = temp.path().join("locks");
+        std::fs::create_dir_all(&lock_dir).unwrap();
+        let lock_path = lock_dir.join("default-windows-mount-points.lock");
+        std::fs::write(
+            &lock_path,
+            serde_json::json!({
+                "runner": RUNNER_CRATE,
+                "scope": "default-windows-mount-points",
+                "pid": DEFINITELY_DEAD_TEST_PID,
+                "created_at": timestamp(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let outcome = clean_with_executor_and_mount_lock_dir(
+            CleanRequest { root },
+            &RecordingExecutor::default(),
+            &lock_dir,
+            |_| ProcessStatus::NotRunning,
+        )
+        .unwrap();
+
+        assert!(outcome.removed.is_empty());
+        assert!(outcome.skipped.is_empty());
+        assert!(!lock_path.exists());
+    }
+
+    #[test]
+    fn clean_keeps_dead_pid_default_mount_lock_when_recorded_run_still_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("e2e-runs");
+        std::fs::create_dir_all(root.join("active-run")).unwrap();
+        let lock_dir = temp.path().join("locks");
+        std::fs::create_dir_all(&lock_dir).unwrap();
+        let lock_path = lock_dir.join("default-windows-mount-points.lock");
+        std::fs::write(
+            &lock_path,
+            serde_json::json!({
+                "runner": RUNNER_CRATE,
+                "scope": "default-windows-mount-points",
+                "run_id": "active-run",
+                "pid": DEFINITELY_DEAD_TEST_PID,
+                "created_at": timestamp(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let outcome = clean_with_executor_and_mount_lock_dir(
+            CleanRequest { root },
+            &RecordingExecutor::default(),
+            &lock_dir,
+            |_| ProcessStatus::NotRunning,
+        )
+        .unwrap();
+
+        assert!(outcome.removed.is_empty());
+        assert!(outcome.skipped.is_empty());
+        assert!(lock_path.exists());
+    }
+
+    #[test]
+    fn clean_keeps_dead_pid_default_mount_lock_when_recorded_run_id_is_unsafe() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("e2e-runs");
+        let lock_dir = temp.path().join("locks");
+        std::fs::create_dir_all(&lock_dir).unwrap();
+        let lock_path = lock_dir.join("default-windows-mount-points.lock");
+        std::fs::write(
+            &lock_path,
+            serde_json::json!({
+                "runner": RUNNER_CRATE,
+                "scope": "default-windows-mount-points",
+                "run_id": "../outside-run",
+                "pid": DEFINITELY_DEAD_TEST_PID,
+                "created_at": timestamp(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let outcome = clean_with_executor_and_mount_lock_dir(
+            CleanRequest { root },
+            &RecordingExecutor::default(),
+            &lock_dir,
+            |_| ProcessStatus::NotRunning,
+        )
+        .unwrap();
+
+        assert!(outcome.removed.is_empty());
+        assert!(outcome.skipped.is_empty());
+        assert!(lock_path.exists());
     }
 
     #[test]
