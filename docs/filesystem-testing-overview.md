@@ -197,13 +197,31 @@ Windows/WinFSP run covered all four boundaries, remounted `client-a` with the
 same client root each time, matched local and final checksums, and converged
 `client-a`, `client-b`, and `client-c` with no mounted-tree differences.
 
+### 11. Mounted Hot-Spot Directory Churn
+
+This scenario focuses product chaos on one busy mounted directory. Two mounted
+writer clients repeatedly mutate the same bounded `hotspot/` working set with
+creates, writes, renames, and unlinks. A third mounted observer concurrently
+probes that same directory with readdir, stat, and read operations.
+
+The test intentionally allows temporary divergence while the churn window is
+active. The pass condition is about the final filesystem contract: every
+mounted client must converge to the same valid tree, the hot directory must not
+end with duplicate logical slots, and observer reads must only see valid
+StudioFS hotspot payloads rather than empty or corrupted results.
+
+The scenario writes `operations.ndjson`,
+`mounted-hotspot-churn-summary.json`, and `validation.json`. This gives us a
+bounded timeline of every planned and accepted mutation, plus a compact summary
+of the final namespace and observer activity.
+
 ## What A Passing Full Sweep Means
 
 A passing full mounted E2E sweep means the current implementation survived all
 implemented real-mount scenarios in one run: basic sharing, service outages,
 client crash/restart, focused namespace collisions, seeded mounted chaos,
 fault chaos, LWW reconnect chaos, open-handle namespace convergence, and
-publication-boundary crash recovery.
+publication-boundary crash recovery, and mounted hot-spot directory churn.
 
 It does not mean the filesystem is perfect. It means the current safety net is
 working and gives us a strong baseline before we add deeper scenarios.
@@ -224,9 +242,9 @@ should become a smaller focused regression before we move on.
 ## What Comes Next
 
 The next planned testing levels go deeper into filesystem semantics that are
-easy to get wrong: hot directory churn, sparse-file truncate/write races,
-long-history cold observers, metadata invalidation dropouts, symlink/attribute
-convergence, and adversarial runner cleanup.
+easy to get wrong: sparse-file truncate/write races, long-history cold
+observers, metadata invalidation dropouts, symlink/attribute convergence, and
+adversarial runner cleanup.
 
 The workflow is intentionally staged. We add one level, run it, fix the bugs it
 finds, rerun the existing sweep to make sure nothing regressed, and only then
