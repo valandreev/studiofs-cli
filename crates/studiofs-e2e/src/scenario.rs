@@ -218,6 +218,12 @@ pub enum ScenarioError {
         /// The cleanup value.
         cleanup: String,
     },
+    #[error("publication boundary peer refresh failed: {errors}")]
+    /// One or more observer peers failed to refresh at the publication gate.
+    PublicationBoundaryPeerRefreshFailed {
+        /// The collected refresh errors.
+        errors: String,
+    },
     #[error("mounted tree validation failed: {0}")]
     /// Variant $name.
     MountedTree(#[from] MountedTreeError),
@@ -2039,10 +2045,19 @@ impl PublicationBoundaryDriver for RealPublicationBoundaryDriver {
         clients: &[ClientSpec],
         _relative_path: &str,
     ) -> Result<(), ScenarioError> {
+        let mut errors = Vec::new();
         for peer in clients.iter().skip(1) {
-            self.0.restart(&peer.name)?;
+            if let Err(error) = self.0.restart(&peer.name) {
+                errors.push(format!("{}: {error}", peer.name));
+            }
         }
-        Ok(())
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(ScenarioError::PublicationBoundaryPeerRefreshFailed {
+                errors: errors.join("; "),
+            })
+        }
     }
 
     fn unmount_all(&mut self) -> Result<(), ScenarioError> {
@@ -8449,6 +8464,7 @@ mod tests {
         clients: Vec<ClientSpec>,
         actions: RefCell<Vec<String>>,
         leak_premature_peer_file: bool,
+        refresh_failure_client: Option<String>,
     }
 
     impl RecordingPublicationBoundaryDriver {
@@ -8457,11 +8473,17 @@ mod tests {
                 clients,
                 actions: RefCell::new(Vec::new()),
                 leak_premature_peer_file: false,
+                refresh_failure_client: None,
             }
         }
 
         fn leak_premature_peer_file(mut self) -> Self {
             self.leak_premature_peer_file = true;
+            self
+        }
+
+        fn fail_refresh_for(mut self, client: &str) -> Self {
+            self.refresh_failure_client = Some(client.to_string());
             self
         }
 
@@ -8547,10 +8569,19 @@ mod tests {
                 "publish_{}",
                 publication_boundary_log_name(boundary)
             ));
+            let mut errors = Vec::new();
             for peer in clients.iter().skip(1) {
                 self.actions
                     .borrow_mut()
                     .push(format!("refresh_{}_for_convergence", peer.name));
+                if self.refresh_failure_client.as_deref() == Some(peer.name.as_str()) {
+                    errors.push(format!("refresh failed for {}", peer.name));
+                }
+            }
+            if !errors.is_empty() {
+                return Err(ScenarioError::PublicationBoundaryPeerRefreshFailed {
+                    errors: errors.join("; "),
+                });
             }
             self.replicate_from_writer()
         }
@@ -10377,6 +10408,55 @@ mod tests {
                 .iter()
                 .all(|visibility| visibility.visible_checksum_sha256.is_some())
         }));
+    }
+
+    #[test]
+    fn publication_boundary_refresh_attempts_all_peers_before_reporting_failure() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-publication-boundary-refresh-failure");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(MOUNTED_PUBLICATION_BOUNDARY_CRASH_MATRIX);
+        let clients = PUBLICATION_BOUNDARY_CLIENT_NAMES
+            .iter()
+            .copied()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(&mount).unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let mut driver =
+            RecordingPublicationBoundaryDriver::new(clients).fail_refresh_for("client-b");
+        let context = ScenarioContext {
+            run_id: "run-publication-boundary-refresh-failure".to_string(),
+            seed: 382,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+
+        let err = run_publication_boundary_crash_matrix_with_driver(
+            &context,
+            &mut driver,
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("refresh failed for client-b"),
+            "{err}"
+        );
+        assert!(
+            driver
+                .actions
+                .borrow()
+                .contains(&"refresh_client-c_for_convergence".to_string()),
+            "{:?}",
+            driver.actions.borrow()
+        );
     }
 
     #[test]
