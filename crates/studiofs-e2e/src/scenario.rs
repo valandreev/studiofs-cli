@@ -211,7 +211,7 @@ pub enum ScenarioError {
     #[error(
         "mounted publication boundary crash matrix failed: {primary}; unmount also failed: {cleanup}"
     )]
-    /// Field $name.
+    /// A publication-boundary run failed and cleanup also failed.
     PublicationBoundaryUnmountAfterFailure {
         /// The primary value.
         primary: String,
@@ -282,7 +282,7 @@ pub enum ScenarioError {
     #[error(
         "mounted publication boundary crash matrix requires at least {expected} clients, got {actual}"
     )]
-    /// Field $name.
+    /// The publication-boundary matrix did not have enough mounted clients.
     InsufficientPublicationBoundaryClients {
         /// The expected value.
         expected: usize,
@@ -292,7 +292,7 @@ pub enum ScenarioError {
     #[error(
         "peer client {client} observed publication boundary payload before convergence: {checksum}"
     )]
-    /// Field $name.
+    /// A peer observed a boundary payload before the public convergence gate.
     PeerObservedPrematurePublication {
         /// The client value.
         client: String,
@@ -2362,8 +2362,8 @@ fn publication_boundary_operations(
                 path: Some(path.to_string()),
             },
         ],
-        PublicationBoundary::ShutdownDrain => vec![SharedOperation::Release {
-            path: Some(path.to_string()),
+        PublicationBoundary::ShutdownDrain => vec![SharedOperation::Fsync {
+            path: path.to_string(),
         }],
     }
 }
@@ -10320,6 +10320,40 @@ mod tests {
             matches!(err, ScenarioError::PeerObservedPrematurePublication { .. }),
             "{err}"
         );
+    }
+
+    #[test]
+    fn publication_boundary_operations_map_boundaries_to_specific_shared_operations() {
+        assert!(matches!(
+            publication_boundary_operations(PublicationBoundary::Flush, "boundary/file.txt")
+                .as_slice(),
+            [SharedOperation::Flush { path }] if path.as_deref() == Some("boundary/file.txt")
+        ));
+        assert!(matches!(
+            publication_boundary_operations(PublicationBoundary::Fsync, "boundary/file.txt")
+                .as_slice(),
+            [SharedOperation::Fsync { path }] if path == "boundary/file.txt"
+        ));
+        assert!(matches!(
+            publication_boundary_operations(
+                PublicationBoundary::ReleaseClose,
+                "boundary/file.txt"
+            )
+            .as_slice(),
+            [
+                SharedOperation::Close { path: close_path },
+                SharedOperation::Release { path: release_path },
+            ] if close_path.as_deref() == Some("boundary/file.txt")
+                && release_path.as_deref() == Some("boundary/file.txt")
+        ));
+        assert!(matches!(
+            publication_boundary_operations(
+                PublicationBoundary::ShutdownDrain,
+                "boundary/file.txt"
+            )
+            .as_slice(),
+            [SharedOperation::Fsync { path }] if path == "boundary/file.txt"
+        ));
     }
 
     #[test]
