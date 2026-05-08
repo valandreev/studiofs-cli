@@ -4751,8 +4751,32 @@ impl StudioVfs {
     }
 
     async fn wait_for_pending_uploads_idle(&self, timeout: Duration) -> bool {
-        self.cached_store.wait_for_uploads_idle(timeout).await
-            && self.upload_scheduler.in_flight() == 0
+        let deadline = Instant::now() + timeout;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return self.cached_store.pending_upload_count() == 0
+                    && self.upload_scheduler.in_flight() == 0;
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            if !self.cached_store.wait_for_uploads_idle(remaining).await {
+                return self.cached_store.pending_upload_count() == 0
+                    && self.upload_scheduler.in_flight() == 0;
+            }
+            if self.cached_store.pending_upload_count() == 0
+                && self.upload_scheduler.in_flight() == 0
+            {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            tokio::time::sleep(
+                Duration::from_millis(50).min(deadline.saturating_duration_since(now)),
+            )
+            .await;
+        }
     }
 
     fn derive_committed_incarnation_from_attr(
