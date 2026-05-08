@@ -32,6 +32,7 @@ fn cli_parses_required_runner_entrypoints() {
     .unwrap();
     match run.command {
         Commands::Run(RunArgs {
+            all,
             scenario,
             run_id,
             seed,
@@ -39,6 +40,7 @@ fn cli_parses_required_runner_entrypoints() {
             infra,
             ..
         }) => {
+            assert!(!all);
             assert_eq!(scenario, Some("basic-multi-client-smoke".to_string()));
             assert_eq!(run_id, Some("runner-cli-test".to_string()));
             assert_eq!(seed, 42);
@@ -66,6 +68,23 @@ fn cli_parses_required_runner_entrypoints() {
     ])
     .unwrap();
     assert!(matches!(run_one.command, Commands::RunOne(_)));
+}
+
+#[test]
+fn cli_all_expands_to_every_registered_scenario() {
+    let cli = Cli::try_parse_from(["studiofs-e2e", "run", "--all"]).unwrap();
+    let Commands::Run(args) = cli.command else {
+        panic!("expected run command");
+    };
+
+    let expected = studiofs_e2e::scenario::available_scenarios()
+        .into_iter()
+        .map(|scenario| scenario.name.to_string())
+        .collect::<Vec<_>>();
+
+    assert!(args.all);
+    assert_eq!(args.scenario_names(), expected);
+    assert!(expected.len() > 1);
 }
 
 #[test]

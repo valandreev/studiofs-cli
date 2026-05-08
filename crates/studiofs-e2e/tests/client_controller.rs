@@ -538,6 +538,43 @@ fn unmount_waits_for_mount_process_to_exit() {
 }
 
 #[test]
+fn unmount_all_continues_after_client_unmount_error() {
+    let temp = tempdir().unwrap();
+    let executor = RecordingExecutor {
+        run_status_action: Some("umount".to_string()),
+        run_status: Cell::new(1),
+        run_stderr: "umount failed".to_string(),
+        ..RecordingExecutor::new()
+    };
+    let calls = Rc::clone(&executor.calls);
+    let killed = Rc::clone(&executor.killed);
+    let mut controller = MultiClientController::new(test_config(temp.path()), executor);
+    controller.create_clients(["client-a", "client-b"]).unwrap();
+    controller.init_first_client().unwrap();
+    controller.discover_additional_clients().unwrap();
+    controller.mount_all().unwrap();
+
+    let err = controller.unmount_all().unwrap_err();
+
+    assert!(err.to_string().contains("umount"));
+    assert_eq!(
+        calls
+            .borrow()
+            .iter()
+            .filter(|call| call.action == "umount")
+            .count(),
+        2
+    );
+    assert_eq!(killed.get(), 2);
+    assert!(
+        controller
+            .clients()
+            .iter()
+            .all(|client| client.state == ClientLifecycleState::Killed)
+    );
+}
+
+#[test]
 fn unmount_force_kills_mount_process_when_graceful_exit_times_out() {
     let temp = tempdir().unwrap();
     let executor = RecordingExecutor {

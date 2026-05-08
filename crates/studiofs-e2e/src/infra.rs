@@ -3,7 +3,7 @@
 use std::fs;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -16,6 +16,7 @@ const HOST_HEALTH_RETRY_DEADLINE: Duration = Duration::from_secs(60);
 const HOST_HEALTH_ATTEMPT_TIMEOUT_SECS: u64 = 2;
 const HOST_HEALTH_RETRY_DELAY: Duration = Duration::from_secs(1);
 const COMPOSE_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(120);
+const TIMED_OUT_COMMAND_EXIT_WAIT: Duration = Duration::from_secs(5);
 const DEFAULT_POSTGRES_PORT: u16 = 25_432;
 const DEFAULT_RUSTFS_PORT: u16 = 29_000;
 const DEFAULT_RUSTFS_CONSOLE_PORT: u16 = 29_001;
@@ -219,12 +220,20 @@ impl CommandExecutor for SystemCommandExecutor {
                     break child.wait_with_output()?;
                 }
                 if started.elapsed() >= timeout {
-                    let _ = child.kill();
+                    terminate_child_on_timeout(&mut child);
+                    let exited = wait_after_timeout_termination(&mut child)?;
+                    if !exited {
+                        return Ok(CommandOutput {
+                            status: -1,
+                            stdout: String::new(),
+                            stderr: timed_out_command_message(timeout, false),
+                        });
+                    }
                     let output = child.wait_with_output()?;
                     return Ok(CommandOutput {
                         status: -1,
                         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                        stderr: format!("command timed out after {}ms", timeout.as_millis()),
+                        stderr: timed_out_command_message(timeout, true),
                     });
                 }
                 thread::sleep(Duration::from_millis(50));
@@ -251,7 +260,11 @@ fn wait_for_child(
                 return Ok(status.code().unwrap_or(-1));
             }
             if started.elapsed() >= timeout {
-                let _ = child.kill();
+                terminate_child_on_timeout(child);
+                let exited = wait_after_timeout_termination(child)?;
+                if !exited {
+                    return Ok(-1);
+                }
                 let _ = child.wait()?;
                 return Ok(-1);
             }
@@ -259,6 +272,45 @@ fn wait_for_child(
         }
     }
     Ok(child.wait()?.code().unwrap_or(-1))
+}
+
+fn terminate_child_on_timeout(child: &mut Child) {
+    terminate_process_tree(child.id());
+    let _ = child.kill();
+}
+
+#[cfg(windows)]
+fn terminate_process_tree(pid: u32) {
+    let _ = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(not(windows))]
+fn terminate_process_tree(_pid: u32) {}
+
+fn wait_after_timeout_termination(child: &mut Child) -> std::io::Result<bool> {
+    let started = Instant::now();
+    loop {
+        if child.try_wait()?.is_some() {
+            return Ok(true);
+        }
+        if started.elapsed() >= TIMED_OUT_COMMAND_EXIT_WAIT {
+            return Ok(false);
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn timed_out_command_message(timeout: Duration, exited: bool) -> String {
+    let mut message = format!("command timed out after {}ms", timeout.as_millis());
+    if !exited {
+        message.push_str("; process tree did not exit after termination request");
+    }
+    message
 }
 
 fn command_spec(

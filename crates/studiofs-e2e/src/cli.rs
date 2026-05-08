@@ -42,6 +42,10 @@ pub enum Commands {
 #[derive(Args, Debug)]
 /// Struct $name.
 pub struct RunArgs {
+    /// Run every registered E2E scenario in one supervised run.
+    #[arg(long)]
+    pub all: bool,
+
     /// Scenario name, for example basic-multi-client-smoke.
     pub scenario: Option<String>,
 
@@ -140,6 +144,13 @@ pub struct RunOneArgs {
 impl RunArgs {
     /// Function $name.
     pub fn scenario_names(&self) -> Vec<String> {
+        if self.all {
+            return scenario::available_scenarios()
+                .into_iter()
+                .map(|scenario| scenario.name.to_string())
+                .collect();
+        }
+
         let mut names = Vec::new();
         if let Some(scenario) = &self.scenario {
             names.push(scenario.clone());

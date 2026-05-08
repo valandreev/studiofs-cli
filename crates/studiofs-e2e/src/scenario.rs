@@ -1583,7 +1583,7 @@ fn run_rustfs_outage_body(
 
     let relative_path = RUSTFS_OUTAGE_FILE_NAME;
     let source_file = clients[0].mount_point.join(relative_path);
-    fs::write(&source_file, RUSTFS_OUTAGE_INITIAL_PAYLOAD)?;
+    write_mounted_file(&source_file, RUSTFS_OUTAGE_INITIAL_PAYLOAD)?;
     driver.after_initial_write(&clients, relative_path)?;
     let initial_mounts = clients
         .iter()
@@ -1599,7 +1599,7 @@ fn run_rustfs_outage_body(
 
     let outage_started = Instant::now();
     driver.stop_rustfs()?;
-    fs::write(&source_file, RUSTFS_OUTAGE_RECOVERED_PAYLOAD)?;
+    write_mounted_file(&source_file, RUSTFS_OUTAGE_RECOVERED_PAYLOAD)?;
     let local_read_checksum_sha256 = bytes_sha256(&fs::read(&source_file)?);
     let outage_duration_ms = elapsed_millis_nonzero(outage_started);
     let mut peer_visibility_during_outage = Vec::new();
@@ -1682,6 +1682,21 @@ fn assert_peer_not_visible(
     } else {
         Ok(Some(checksum))
     }
+}
+
+fn write_mounted_file(path: &Path, payload: &[u8]) -> Result<(), ScenarioError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)?;
+    file.write_all(payload)?;
+    file.flush()?;
+    file.sync_all()?;
+    Ok(())
 }
 
 fn read_peer_checksum(
@@ -6864,9 +6879,9 @@ fn run_open_handle_body(
 
     let started = Instant::now();
     let mut operations = Vec::new();
-    let open_unlink = execute_open_unlink_case(started, &clients, &mut operations)?;
+    let open_unlink = execute_open_unlink_case(context, started, &clients, &mut operations)?;
     driver.after_namespace_mutation(&clients)?;
-    let open_rename = execute_open_rename_case(started, &clients, &mut operations)?;
+    let open_rename = execute_open_rename_case(context, started, &clients, &mut operations)?;
     driver.after_namespace_mutation(&clients)?;
     write_open_handle_operations(context, &operations)?;
     finish_open_handle(OpenHandleFinishInput {
@@ -6936,6 +6951,7 @@ fn establish_open_handle_initial_tree(client: &ClientSpec) -> Result<(), Scenari
 }
 
 fn execute_open_unlink_case(
+    context: &ScenarioContext,
     started: Instant,
     clients: &[ClientSpec],
     operations: &mut Vec<OpenHandleOperation>,
@@ -6943,10 +6959,24 @@ fn execute_open_unlink_case(
     let handle_client = &clients[0];
     let mutator_client = &clients[1];
     let observer_client = &clients[2];
+    record_open_handle_checkpoint(
+        context,
+        started,
+        Some(handle_client),
+        "open_unlink.open.started",
+        Some(OPEN_UNLINK_PATH),
+    )?;
     let mut file = OpenOptions::new()
         .read(true)
         .append(true)
         .open(handle_client.mount_point.join(OPEN_UNLINK_PATH))?;
+    record_open_handle_checkpoint(
+        context,
+        started,
+        Some(handle_client),
+        "open_unlink.open.finished",
+        Some(OPEN_UNLINK_PATH),
+    )?;
     push_open_handle_operation(
         started,
         operations,
@@ -6958,6 +6988,13 @@ fn execute_open_unlink_case(
             reason: "open file handle state is mounted-product behavior".to_string(),
         },
     );
+    record_open_handle_checkpoint(
+        context,
+        started,
+        Some(handle_client),
+        "open_unlink.append.started",
+        Some(OPEN_UNLINK_PATH),
+    )?;
     append_to_open_handle(
         started,
         operations,
@@ -6965,7 +7002,28 @@ fn execute_open_unlink_case(
         OPEN_UNLINK_PATH,
         &mut file,
     )?;
+    record_open_handle_checkpoint(
+        context,
+        started,
+        Some(handle_client),
+        "open_unlink.append.finished",
+        Some(OPEN_UNLINK_PATH),
+    )?;
+    record_open_handle_checkpoint(
+        context,
+        started,
+        Some(mutator_client),
+        "open_unlink.unlink.started",
+        Some(OPEN_UNLINK_PATH),
+    )?;
     fs::remove_file(mutator_client.mount_point.join(OPEN_UNLINK_PATH))?;
+    record_open_handle_checkpoint(
+        context,
+        started,
+        Some(mutator_client),
+        "open_unlink.unlink.finished",
+        Some(OPEN_UNLINK_PATH),
+    )?;
     push_open_handle_operation(
         started,
         operations,
@@ -6976,6 +7034,13 @@ fn execute_open_unlink_case(
             path: OPEN_UNLINK_PATH.to_string(),
         },
     );
+    record_open_handle_checkpoint(
+        context,
+        started,
+        Some(handle_client),
+        "open_unlink.flush_sync_read.started",
+        Some(OPEN_UNLINK_PATH),
+    )?;
     let readback = flush_sync_read_open_handle(
         started,
         operations,
@@ -6983,7 +7048,28 @@ fn execute_open_unlink_case(
         OPEN_UNLINK_PATH,
         &mut file,
     )?;
+    record_open_handle_checkpoint(
+        context,
+        started,
+        Some(handle_client),
+        "open_unlink.flush_sync_read.finished",
+        Some(OPEN_UNLINK_PATH),
+    )?;
+    record_open_handle_checkpoint(
+        context,
+        started,
+        Some(handle_client),
+        "open_unlink.release.started",
+        Some(OPEN_UNLINK_PATH),
+    )?;
     drop(file);
+    record_open_handle_checkpoint(
+        context,
+        started,
+        Some(handle_client),
+        "open_unlink.release.finished",
+        Some(OPEN_UNLINK_PATH),
+    )?;
     push_open_handle_operation(
         started,
         operations,
@@ -7013,6 +7099,7 @@ fn execute_open_unlink_case(
 }
 
 fn execute_open_rename_case(
+    context: &ScenarioContext,
     started: Instant,
     clients: &[ClientSpec],
     operations: &mut Vec<OpenHandleOperation>,
@@ -7020,10 +7107,24 @@ fn execute_open_rename_case(
     let handle_client = &clients[0];
     let mutator_client = &clients[1];
     let observer_client = &clients[2];
+    record_open_handle_checkpoint(
+        context,
+        started,
+        Some(handle_client),
+        "open_rename.open.started",
+        Some(OPEN_RENAME_PATH),
+    )?;
     let mut file = OpenOptions::new()
         .read(true)
         .append(true)
         .open(handle_client.mount_point.join(OPEN_RENAME_PATH))?;
+    record_open_handle_checkpoint(
+        context,
+        started,
+        Some(handle_client),
+        "open_rename.open.finished",
+        Some(OPEN_RENAME_PATH),
+    )?;
     push_open_handle_operation(
         started,
         operations,
@@ -7035,9 +7136,23 @@ fn execute_open_rename_case(
             reason: "open file handle state is mounted-product behavior".to_string(),
         },
     );
+    record_open_handle_checkpoint(
+        context,
+        started,
+        Some(mutator_client),
+        "open_rename.rename.started",
+        Some(OPEN_RENAME_PATH),
+    )?;
     fs::rename(
         mutator_client.mount_point.join(OPEN_RENAME_PATH),
         mutator_client.mount_point.join(OPEN_RENAME_DEST),
+    )?;
+    record_open_handle_checkpoint(
+        context,
+        started,
+        Some(mutator_client),
+        "open_rename.rename.finished",
+        Some(OPEN_RENAME_DEST),
     )?;
     push_open_handle_operation(
         started,
@@ -7050,12 +7165,33 @@ fn execute_open_rename_case(
             to: OPEN_RENAME_DEST.to_string(),
         },
     );
+    record_open_handle_checkpoint(
+        context,
+        started,
+        Some(handle_client),
+        "open_rename.append.started",
+        Some(OPEN_RENAME_PATH),
+    )?;
     append_to_open_handle(
         started,
         operations,
         handle_client,
         OPEN_RENAME_PATH,
         &mut file,
+    )?;
+    record_open_handle_checkpoint(
+        context,
+        started,
+        Some(handle_client),
+        "open_rename.append.finished",
+        Some(OPEN_RENAME_PATH),
+    )?;
+    record_open_handle_checkpoint(
+        context,
+        started,
+        Some(handle_client),
+        "open_rename.flush_sync_read.started",
+        Some(OPEN_RENAME_PATH),
     )?;
     let readback = flush_sync_read_open_handle(
         started,
@@ -7064,7 +7200,28 @@ fn execute_open_rename_case(
         OPEN_RENAME_PATH,
         &mut file,
     )?;
+    record_open_handle_checkpoint(
+        context,
+        started,
+        Some(handle_client),
+        "open_rename.flush_sync_read.finished",
+        Some(OPEN_RENAME_PATH),
+    )?;
+    record_open_handle_checkpoint(
+        context,
+        started,
+        Some(handle_client),
+        "open_rename.release.started",
+        Some(OPEN_RENAME_PATH),
+    )?;
     drop(file);
+    record_open_handle_checkpoint(
+        context,
+        started,
+        Some(handle_client),
+        "open_rename.release.finished",
+        Some(OPEN_RENAME_PATH),
+    )?;
     push_open_handle_operation(
         started,
         operations,
@@ -7505,6 +7662,34 @@ fn write_open_handle_operations(
         append_shared_record(&mut writer, &record)?;
     }
     Ok(())
+}
+
+fn record_open_handle_checkpoint(
+    context: &ScenarioContext,
+    started: Instant,
+    client: Option<&ClientSpec>,
+    name: &str,
+    path: Option<&str>,
+) -> Result<(), ScenarioError> {
+    let path_on_disk = operation_log_path(context);
+    let mut writer = OperationLogWriter::open_append(&path_on_disk)?;
+    let mut record = shared_operation_record(
+        &writer,
+        MOUNTED_OPEN_HANDLE_CONVERGENCE,
+        SharedOperation::SchedulerCheckpoint {
+            name: name.to_string(),
+        },
+    )
+    .with_timestamp_ms(elapsed_millis_u64(started))
+    .with_outcome(OperationOutcome::Observed)
+    .with_metadata("checkpoint", name.to_string());
+    if let Some(client) = client {
+        record = record.with_client(&client.name);
+    }
+    if let Some(path) = path {
+        record = record.with_metadata("path", path.to_string());
+    }
+    append_shared_record(&mut writer, &record)
 }
 
 fn open_handle_outcome(operation: &OpenHandleOperation) -> OperationOutcome {

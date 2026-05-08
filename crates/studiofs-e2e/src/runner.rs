@@ -335,50 +335,66 @@ pub fn run_one(request: RunOneRequest) -> Result<i32, RunnerError> {
     let manifest: RunManifest = read_json_file(&sandbox.join("run.json"))?;
     let resolved = resolve_scenario(&request.scenario)?;
     let events_path = sandbox.join("events.ndjson");
+    let scenario_dir = scenario_artifact_dir(&sandbox, resolved.definition.name);
+    let client_controller_config =
+        run_one_client_controller_config(&request, &manifest, &sandbox, resolved.definition.name)?;
     let context = ScenarioContext {
         run_id: request.run_id.clone(),
         seed: request.seed,
         sandbox: sandbox.clone(),
-        scenario_dir: sandbox
-            .join("artifacts")
-            .join("scenarios")
-            .join(resolved.definition.name),
-        client_controller_config: match (request.infra, request.studiofs_bin.as_ref()) {
-            (InfraMode::Compose, Some(studiofs_bin)) => {
-                Some(ClientControllerConfig::from_compose_services(
-                    studiofs_bin.clone(),
-                    sandbox.clone(),
-                    &request.run_id,
-                    request.seed,
-                    &manifest.allocated_ports,
-                )?)
-            }
-            (InfraMode::ExternalEnv, Some(studiofs_bin)) => {
-                Some(ClientControllerConfig::from_external_env(
-                    studiofs_bin.clone(),
-                    sandbox.clone(),
-                    &request.run_id,
-                    request.seed,
-                )?)
-            }
-            _ => None,
-        },
+        scenario_dir,
+        client_controller_config,
     };
 
-    let lifecycle = run_scenario_lifecycle(
+    let lifecycle_result = run_scenario_lifecycle(
         &events_path,
         &request.run_id,
         resolved.scenario.as_ref(),
         &context,
         1,
         1,
-    )?;
+    );
+    let lifecycle = lifecycle_result.unwrap_or_else(|error| {
+        failed_lifecycle(
+            resolved.definition.name,
+            request.seed,
+            format!("scenario lifecycle failed before report was written: {error}"),
+        )
+    });
     write_scenario_report(&context.scenario_dir, &lifecycle.report)?;
     Ok(if lifecycle.outcome.status == ScenarioStatus::Passed {
         0
     } else {
         1
     })
+}
+
+fn run_one_client_controller_config(
+    request: &RunOneRequest,
+    manifest: &RunManifest,
+    sandbox: &Path,
+    scenario_name: &str,
+) -> Result<Option<ClientControllerConfig>, RunnerError> {
+    let Some(studiofs_bin) = request.studiofs_bin.as_ref() else {
+        return Ok(None);
+    };
+    let client_sandbox = scenario_client_runtime_sandbox(sandbox, scenario_name);
+    match request.infra {
+        InfraMode::Compose => Ok(Some(ClientControllerConfig::from_compose_services(
+            studiofs_bin.clone(),
+            client_sandbox,
+            &request.run_id,
+            request.seed,
+            &manifest.allocated_ports,
+        )?)),
+        InfraMode::ExternalEnv => Ok(Some(ClientControllerConfig::from_external_env(
+            studiofs_bin.clone(),
+            client_sandbox,
+            &request.run_id,
+            request.seed,
+        )?)),
+        InfraMode::Disabled => Ok(None),
+    }
 }
 
 fn run_with_executor_and_mount_lock_dir(
@@ -611,7 +627,7 @@ fn run_with_executor_and_mount_lock_dir(
             ("scenario_name", definition.name.to_string()),
             ("phase", "starting".to_string()),
         ]);
-        let lifecycle = if total_scenarios > 1 {
+        let lifecycle_result = if total_scenarios > 1 {
             run_scenario_child_with_timeout(
                 &sandbox,
                 &events_path,
@@ -620,7 +636,7 @@ fn run_with_executor_and_mount_lock_dir(
                 executor,
                 &request,
                 run_deadline,
-            )?
+            )
         } else {
             let context = ScenarioContext {
                 run_id: run_id.clone(),
@@ -657,8 +673,15 @@ fn run_with_executor_and_mount_lock_dir(
                 run_deadline,
                 index + 1,
                 total_scenarios,
-            )?
+            )
         };
+        let lifecycle = lifecycle_result.unwrap_or_else(|error| {
+            failed_lifecycle(
+                definition.name,
+                request.seed,
+                format!("scenario supervisor failed before report was written: {error}"),
+            )
+        });
         e2e_progress_fields(&[
             ("run", run_id.clone()),
             ("scenario", format!("{}/{}", index + 1, total_scenarios)),
@@ -836,6 +859,7 @@ struct FinishRunInput {
 }
 
 fn finish_run(input: FinishRunInput) -> Result<RunOutcome, RunnerError> {
+    let artifacts = collect_report_artifacts_best_effort(&input.sandbox, &input.scenario_outcomes)?;
     let report = RunReport {
         schema_version: SCHEMA_VERSION,
         run_id: input.run_id.clone(),
@@ -861,7 +885,7 @@ fn finish_run(input: FinishRunInput) -> Result<RunOutcome, RunnerError> {
         },
         preflight: input.preflight,
         scenarios: input.scenario_reports,
-        artifacts: collect_report_artifacts(&input.sandbox, &input.scenario_outcomes)?,
+        artifacts,
         cleanup: input.cleanup,
     };
 
@@ -1486,11 +1510,7 @@ fn create_sandbox_layout(
         fs::write(crate::client::client_tracing_log(sandbox, client), "")?;
     }
     for scenario in scenarios {
-        fs::create_dir_all(
-            sandbox
-                .join("artifacts/scenarios")
-                .join(scenario.definition.name),
-        )?;
+        fs::create_dir_all(scenario_artifact_dir(sandbox, scenario.definition.name))?;
     }
     Ok(())
 }
@@ -1790,6 +1810,29 @@ fn timed_out_lifecycle(
     }
 }
 
+fn failed_lifecycle(scenario_name: &str, seed: u64, error: String) -> ScenarioLifecycleOutcome {
+    let operation_artifact = scenario_artifact_path(scenario_name, "operations.ndjson");
+    let now = timestamp();
+    ScenarioLifecycleOutcome {
+        report: ScenarioReport {
+            name: scenario_name.to_string(),
+            seed,
+            status: ScenarioStatus::Failed,
+            started_at: now.clone(),
+            finished_at: now,
+            duration_ms: 0,
+            artifacts: vec![operation_artifact.clone()],
+            error: Some(error),
+        },
+        outcome: ScenarioOutcome {
+            name: scenario_name.to_string(),
+            status: ScenarioStatus::Failed,
+            artifacts: vec![operation_artifact],
+        },
+        cleanup_error: None,
+    }
+}
+
 fn parse_run_timeout(value: &str) -> Result<Duration, RunnerError> {
     let trimmed = value.trim();
     let (digits, unit) = trimmed
@@ -2034,6 +2077,24 @@ fn run_hook<T>(
     hook_context: HookContext<'_>,
     f: impl FnOnce() -> Result<T, scenario::ScenarioError>,
 ) -> Result<T, RunnerError> {
+    run_hook_with_heartbeat_interval(
+        events_path,
+        operation_writer,
+        run_id,
+        hook_context,
+        HOOK_HEARTBEAT_INTERVAL,
+        f,
+    )
+}
+
+fn run_hook_with_heartbeat_interval<T>(
+    events_path: &Path,
+    operation_writer: &mut OperationLogWriter,
+    run_id: &str,
+    hook_context: HookContext<'_>,
+    heartbeat_interval: Duration,
+    f: impl FnOnce() -> Result<T, scenario::ScenarioError>,
+) -> Result<T, RunnerError> {
     let scenario = hook_context.scenario;
     let hook = hook_context.hook;
     record_event(events_path, run_id, Some(scenario), hook, "started")?;
@@ -2051,8 +2112,7 @@ fn run_hook<T>(
         last_event: &started_event,
         sandbox: events_path.parent(),
     };
-    let mut stdout = std::io::stdout().lock();
-    write_hook_progress_line(&mut stdout, &start_snapshot)?;
+    write_hook_progress_snapshot(&start_snapshot)?;
     let _heartbeat = HookHeartbeat::start(HookHeartbeatInput {
         run_id: run_id.to_string(),
         scenario_name: scenario.to_string(),
@@ -2061,7 +2121,7 @@ fn run_hook<T>(
         hook: hook.to_string(),
         sandbox: events_path.parent().map(Path::to_path_buf),
         operation_log: hook_context.operation_log.to_path_buf(),
-        interval: HOOK_HEARTBEAT_INTERVAL,
+        interval: heartbeat_interval,
     });
     let result = f();
     let phase = if result.is_ok() { "finished" } else { "failed" };
@@ -2078,8 +2138,7 @@ fn run_hook<T>(
         last_event: &last_event,
         sandbox: events_path.parent(),
     };
-    let mut stdout = std::io::stdout().lock();
-    write_hook_progress_line(&mut stdout, &finish_snapshot)?;
+    write_hook_progress_snapshot(&finish_snapshot)?;
     record_event(events_path, run_id, Some(scenario), hook, phase)?;
     record_operation_checkpoint(operation_writer, scenario, hook, phase)?;
     Ok(result?)
@@ -2183,6 +2242,11 @@ fn write_hook_progress_line(
     }
     writeln!(writer)?;
     writer.flush()
+}
+
+fn write_hook_progress_snapshot(snapshot: &HookProgressSnapshot<'_>) -> std::io::Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    write_hook_progress_line(&mut stdout, snapshot)
 }
 
 fn latest_operation_event(path: &Path) -> Option<String> {
@@ -2329,6 +2393,29 @@ fn collect_report_artifacts(
     Ok(artifacts)
 }
 
+fn collect_report_artifacts_best_effort(
+    sandbox: &Path,
+    scenarios: &[ScenarioOutcome],
+) -> Result<Vec<ArtifactReport>, RunnerError> {
+    match collect_report_artifacts(sandbox, scenarios) {
+        Ok(artifacts) => Ok(artifacts),
+        Err(error) => {
+            let diagnostic = format!("artifact collection failed: {error}\n");
+            let diagnostic_path = sandbox.join("artifact-collection-error.txt");
+            let diagnostic_written = fs::write(&diagnostic_path, diagnostic).is_ok();
+            let mut artifacts = required_artifacts(scenarios);
+            if diagnostic_written {
+                artifacts.push(ArtifactReport {
+                    name: "artifact-collection-error.txt".to_string(),
+                    path: "artifact-collection-error.txt".to_string(),
+                    required: false,
+                });
+            }
+            Ok(artifacts)
+        }
+    }
+}
+
 fn required_artifacts(scenarios: &[ScenarioOutcome]) -> Vec<ArtifactReport> {
     let mut artifacts = vec![
         ArtifactReport {
@@ -2441,6 +2528,14 @@ fn artifact_name(path: &str) -> String {
 
 fn scenario_artifact_path(scenario: &str, artifact: &str) -> String {
     format!("artifacts/scenarios/{scenario}/{artifact}")
+}
+
+fn scenario_artifact_dir(sandbox: &Path, scenario: &str) -> PathBuf {
+    sandbox.join("artifacts").join("scenarios").join(scenario)
+}
+
+fn scenario_client_runtime_sandbox(sandbox: &Path, scenario: &str) -> PathBuf {
+    scenario_artifact_dir(sandbox, scenario).join("client-runtime")
 }
 
 fn normalize_relative_path(path: &Path, root: &Path) -> Result<String, RunnerError> {
@@ -2778,7 +2873,7 @@ fn host_platform() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::infra::{CommandExecutor, CommandOutput, InfraMode};
+    use crate::infra::{CommandExecutor, CommandOutput, InfraMode, ServicePort};
     use std::cell::{Cell, RefCell};
 
     const DEFINITELY_DEAD_TEST_PID: u32 = 4_294_967_294;
@@ -2887,6 +2982,66 @@ mod tests {
                 "artifacts/scenarios/b/logs.txt"
             ]
         );
+    }
+
+    #[test]
+    fn run_one_compose_config_uses_scenario_scoped_client_sandbox() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("e2e-runs");
+        let run_id = "shared-infra-run";
+        let sandbox = root.join(run_id);
+        let scenario_name = scenario::BASIC_MULTI_CLIENT_SMOKE;
+        let manifest = build_manifest(ManifestInput {
+            run_id,
+            seed: 360,
+            sandbox: &sandbox,
+            scenarios: &[scenario_name.to_string()],
+            retention: RetentionPolicy::Always,
+            selected_platform: "windows-winfsp",
+            infra: InfraMode::Compose,
+            compose_project: Some("studiofs-e2e-shared-infra-run"),
+            allocated_ports: vec![
+                ServicePort {
+                    service: "postgres".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    host_port: 25432,
+                    container_port: 5432,
+                    env_var: "STUDIOFS_E2E_POSTGRES_PORT".to_string(),
+                },
+                ServicePort {
+                    service: "rustfs".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    host_port: 29000,
+                    container_port: 9000,
+                    env_var: "STUDIOFS_E2E_RUSTFS_PORT".to_string(),
+                },
+            ],
+            studiofs_bin: Some(Path::new("target/debug/studiofs.exe")),
+            port_range: Some("29000-29100"),
+            timeout: Some("30m"),
+            created_at: "2026-05-08T00:00:00Z",
+        });
+        let request = RunOneRequest {
+            root,
+            run_id: run_id.to_string(),
+            scenario: scenario_name.to_string(),
+            seed: 360,
+            studiofs_bin: Some(PathBuf::from("target/debug/studiofs.exe")),
+            infra: InfraMode::Compose,
+        };
+
+        let config = run_one_client_controller_config(&request, &manifest, &sandbox, scenario_name)
+            .unwrap()
+            .expect("compose config");
+
+        assert_eq!(
+            config.sandbox,
+            scenario_client_runtime_sandbox(&sandbox, scenario_name)
+        );
+        assert_ne!(config.sandbox, sandbox);
+        assert!(config.sandbox.ends_with(Path::new(
+            "artifacts/scenarios/basic-multi-client-smoke/client-runtime"
+        )));
     }
 
     #[test]
@@ -3042,6 +3197,47 @@ mod tests {
         assert!(line.contains("scenario_name=\"slow scenario\""));
         assert!(line.contains("last_event=seq=2,op=write"));
         assert!(line.contains("sandbox=\"target/e2e runs/run 1\""));
+    }
+
+    #[test]
+    fn hook_heartbeat_does_not_deadlock_after_slow_hook() {
+        let temp = tempfile::tempdir().unwrap();
+        let events_path = temp.path().join("events.ndjson");
+        let operation_log = temp.path().join("operations.ndjson");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_events_path = events_path.clone();
+        let worker_operation_log = operation_log.clone();
+
+        std::thread::spawn(move || {
+            let mut operation_writer =
+                OperationLogWriter::open_append(&worker_operation_log).unwrap();
+            let result = run_hook_with_heartbeat_interval(
+                &worker_events_path,
+                &mut operation_writer,
+                "heartbeat-run",
+                HookContext {
+                    scenario: "__test-heartbeat",
+                    hook: "run",
+                    scenario_index: 1,
+                    scenario_total: 1,
+                    operation_log: &worker_operation_log,
+                },
+                Duration::from_millis(10),
+                || {
+                    std::thread::sleep(Duration::from_millis(60));
+                    Ok(())
+                },
+            );
+            tx.send(result.map(|_| ())).unwrap();
+        });
+
+        let result = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("hook heartbeat should not deadlock after a slow hook");
+        assert!(result.is_ok(), "{result:?}");
+        let events = std::fs::read_to_string(events_path).unwrap();
+        assert!(events.contains("\"phase\":\"started\""));
+        assert!(events.contains("\"phase\":\"finished\""));
     }
 
     #[cfg(unix)]
@@ -3294,6 +3490,51 @@ mod tests {
         assert!(!lock_path.exists());
         let report: RunReport = read_json_file(&report_path).unwrap();
         assert_eq!(report.scenarios[0].status, ScenarioStatus::Failed);
+        assert_eq!(report.cleanup.status, RunStatus::Passed);
+    }
+
+    #[test]
+    fn run_writes_report_and_cleans_up_when_child_supervisor_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("e2e-runs");
+        let run_id = "child-supervisor-error";
+        let report_path = root.join(run_id).join("report.json");
+        let executor = RecordingExecutor::default();
+        executor.io_error_next_run_one.set(true);
+
+        let outcome = run_with_executor_and_mount_lock_dir(
+            RunRequest {
+                root,
+                run_id: Some(run_id.to_string()),
+                scenarios: vec![
+                    scenario::TEST_PASSING.to_string(),
+                    scenario::TEST_PASSING.to_string(),
+                ],
+                seed: 385,
+                studiofs_bin: None,
+                platform: PlatformSelection::Auto,
+                retention: RetentionPolicy::Always,
+                report: None,
+                port_range: Some("33360-33370".to_string()),
+                timeout: Some("30s".to_string()),
+                infra: InfraMode::Compose,
+            },
+            &executor,
+            &temp.path().join("mount-locks"),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.status, RunStatus::Failed);
+        assert!(report_path.exists());
+        let report: RunReport = read_json_file(&report_path).unwrap();
+        assert_eq!(report.scenarios[0].status, ScenarioStatus::Failed);
+        assert!(
+            report.scenarios[0]
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("scenario supervisor failed before report was written")
+        );
         assert_eq!(report.cleanup.status, RunStatus::Passed);
     }
 
@@ -4375,6 +4616,7 @@ mod tests {
         require_report_before_compose_cleanup: RefCell<Option<PathBuf>>,
         require_missing_lock_before_compose_cleanup: RefCell<Option<PathBuf>>,
         timeout_next_run_one: Cell<bool>,
+        io_error_next_run_one: Cell<bool>,
         fail_next_run_one_without_report: Cell<bool>,
         skip_next_run_one_report: Cell<bool>,
     }
@@ -4383,6 +4625,9 @@ mod tests {
         fn run(&self, command: &crate::infra::CommandSpec) -> std::io::Result<CommandOutput> {
             self.calls.borrow_mut().push(command.clone());
             if command.args.iter().any(|arg| arg == "__run-one") {
+                if self.io_error_next_run_one.replace(false) {
+                    return Err(std::io::Error::other("run-one spawn failed"));
+                }
                 if self.timeout_next_run_one.replace(false) {
                     return Ok(CommandOutput {
                         status: -1,

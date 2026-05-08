@@ -885,10 +885,17 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
 
     /// Function $name.
     pub fn unmount_all(&mut self) -> Result<(), ClientControllerError> {
+        let mut unmount_error = None;
         for index in 0..self.clients.len() {
-            self.unmount_index(index)?;
+            if let Err(err) = self.unmount_index(index) {
+                unmount_error.get_or_insert(err);
+            }
         }
-        Ok(())
+        if let Some(err) = unmount_error {
+            Err(err)
+        } else {
+            Ok(())
+        }
     }
 
     /// Function $name.

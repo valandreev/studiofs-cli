@@ -137,6 +137,7 @@ Initial runner commands:
 ```powershell
 cargo run -p studiofs-e2e -- list
 cargo build -p studiofs
+cargo run -p studiofs-e2e -- run --all --seed 360 --timeout 4h --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run basic-multi-client-smoke --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run rustfs-outage-multi-client-recovery --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run mounted-client-crash-restart-recovery --studiofs-bin target\debug\studiofs.exe
@@ -178,14 +179,16 @@ uses a unique StudioFS volume name per run. This mode does not start, stop, or
 clean external services, so scenarios whose purpose is to stop infrastructure
 services still require `--infra compose`.
 
-For Windows WinFSP external-infra debugging, prefer one mounted scenario per
-command rather than a long PowerShell loop. If a mounted filesystem syscall
-hangs below the runner, a one-scenario command limits the number of live mount
-processes that can be left behind and leaves a smaller artifact set to inspect.
-When a sweep is needed, pass an explicit `--timeout` so the runner can write a
-best-effort timeout report and cleanup summary. Then inspect the newest
-`target/e2e-runs/<run-id>/events.ndjson` and per-client logs before starting the
-next scenario.
+For Windows WinFSP compose sweeps, prefer `run --all` over an external
+PowerShell loop. The runner starts PostgreSQL, RustFS, and Toxiproxy once for
+the whole run, then executes each scenario in a supervised child with a fresh
+StudioFS volume and scenario-scoped client roots/cache/logs under
+`artifacts/scenarios/<scenario>/client-runtime/`. If a mounted filesystem
+syscall hangs below the runner, the whole-run `--timeout` lets the runner write
+a best-effort timeout report and cleanup summary without repeatedly recreating
+Docker infrastructure. For narrow debugging, keep using one mounted scenario
+per command, then inspect the newest `target/e2e-runs/<run-id>/events.ndjson`
+and per-client logs before starting the next scenario.
 
 The mounted namespace collision scenarios use three
 isolated clients and barrier-start conflicting operations covering
