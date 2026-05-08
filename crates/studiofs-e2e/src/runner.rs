@@ -635,17 +635,17 @@ fn run_with_executor_and_mount_lock_dir(
             ("phase", "starting".to_string()),
         ]);
         let lifecycle_result = if total_scenarios > 1 {
-            run_scenario_child_with_timeout(
-                &sandbox,
-                &events_path,
-                &run_id,
+            run_scenario_child_with_timeout(ScenarioChildRun {
+                sandbox: &sandbox,
+                events_path: &events_path,
+                run_id: &run_id,
                 definition,
-                index + 1,
-                total_scenarios,
+                scenario_index: index + 1,
+                scenario_total: total_scenarios,
                 executor,
-                &request,
-                run_deadline,
-            )
+                request: &request,
+                deadline: run_deadline,
+            })
         } else {
             let context = ScenarioContext {
                 run_id: run_id.clone(),
@@ -1753,17 +1753,32 @@ fn run_scenario_lifecycle_with_timeout(
     }
 }
 
-fn run_scenario_child_with_timeout(
-    sandbox: &Path,
-    events_path: &Path,
-    run_id: &str,
+struct ScenarioChildRun<'a> {
+    sandbox: &'a Path,
+    events_path: &'a Path,
+    run_id: &'a str,
     definition: scenario::ScenarioDefinition,
     scenario_index: usize,
     scenario_total: usize,
-    executor: &dyn CommandExecutor,
-    request: &RunRequest,
+    executor: &'a dyn CommandExecutor,
+    request: &'a RunRequest,
     deadline: Option<RunDeadline>,
+}
+
+fn run_scenario_child_with_timeout(
+    child: ScenarioChildRun<'_>,
 ) -> Result<ScenarioLifecycleOutcome, RunnerError> {
+    let ScenarioChildRun {
+        sandbox,
+        events_path,
+        run_id,
+        definition,
+        scenario_index,
+        scenario_total,
+        executor,
+        request,
+        deadline,
+    } = child;
     let started_at = timestamp();
     let started_instant = Instant::now();
     let scenario_dir = sandbox
@@ -4622,17 +4637,18 @@ mod tests {
                 .expect("test instant before now"),
         );
 
-        let lifecycle = run_scenario_child_with_timeout(
-            &sandbox,
-            &sandbox.join("events.ndjson"),
+        let events_path = sandbox.join("events.ndjson");
+        let lifecycle = run_scenario_child_with_timeout(ScenarioChildRun {
+            sandbox: &sandbox,
+            events_path: &events_path,
             run_id,
             definition,
-            1,
-            1,
-            &executor,
-            &request,
-            Some(deadline),
-        )
+            scenario_index: 1,
+            scenario_total: 1,
+            executor: &executor,
+            request: &request,
+            deadline: Some(deadline),
+        })
         .unwrap();
 
         assert_eq!(lifecycle.outcome.status, ScenarioStatus::TimedOut);
@@ -4731,17 +4747,18 @@ mod tests {
             infra: InfraMode::Disabled,
         };
 
-        let err = run_scenario_child_with_timeout(
-            &sandbox,
-            &sandbox.join("events.ndjson"),
+        let events_path = sandbox.join("events.ndjson");
+        let err = run_scenario_child_with_timeout(ScenarioChildRun {
+            sandbox: &sandbox,
+            events_path: &events_path,
             run_id,
             definition,
-            1,
-            1,
-            &executor,
-            &request,
-            Some(RunDeadline::new(Duration::from_secs(30), Instant::now())),
-        )
+            scenario_index: 1,
+            scenario_total: 1,
+            executor: &executor,
+            request: &request,
+            deadline: Some(RunDeadline::new(Duration::from_secs(30), Instant::now())),
+        })
         .unwrap_err();
 
         assert!(matches!(
