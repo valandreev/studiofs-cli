@@ -23,6 +23,9 @@ const DEFAULT_MAX_DISPATCHER_THREADS: u32 = 16;
 const DEFAULT_ALLOW_OPEN_IN_KERNEL_MODE: bool = true;
 const DEFAULT_FLUSH_AND_PURGE_ON_CLEANUP: bool = false;
 const DEFAULT_PERSISTENT_ACLS: bool = false;
+// Temporary SFS-388 mitigation: coarse guarding serializes WinFSP callbacks and
+// can reduce multi-threaded throughput, but avoids rename preflight hangs until
+// the notification/rename lock interaction has a narrower fix.
 const DEFAULT_COARSE_OPERATION_GUARD: bool = true;
 const DEFAULT_KERNEL_NOTIFICATIONS: bool = false;
 const DEFAULT_SECTORS_PER_ALLOCATION_UNIT: u16 =

@@ -1614,9 +1614,14 @@ impl FileSystemContext for StudioFsContext {
     fn cleanup(&self, context: &Self::FileContext, file_name: Option<&U16CStr>, flags: u32) {
         let trace_callback = callback_trace_enabled();
         let path = trace_callback.then(|| file_name.map(U16CStr::to_string_lossy));
-        if let Some(path) = path.as_ref() {
+        if trace_callback {
+            let path = match &path {
+                Some(Some(path)) => path.as_ref(),
+                Some(None) => "<none>",
+                None => "<trace-disabled>",
+            };
             info!(
-                path = path.as_deref().unwrap_or("<none>"),
+                path,
                 ino = context.ino,
                 fh = context.fh,
                 flags,
@@ -1631,9 +1636,14 @@ impl FileSystemContext for StudioFsContext {
         // deferred until an explicit `flush` or the mandatory last-handle
         // `close`/`release_fh` fallback drain.
         self.handle_drain().cleanup(context, file_name, flags);
-        if let Some(path) = path.as_ref() {
+        if trace_callback {
+            let path = match &path {
+                Some(Some(path)) => path.as_ref(),
+                Some(None) => "<none>",
+                None => "<trace-disabled>",
+            };
             info!(
-                path = path.as_deref().unwrap_or("<none>"),
+                path,
                 ino = context.ino,
                 fh = context.fh,
                 flags,
