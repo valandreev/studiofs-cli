@@ -633,6 +633,8 @@ fn run_with_executor_and_mount_lock_dir(
                 &events_path,
                 &run_id,
                 definition,
+                index + 1,
+                total_scenarios,
                 executor,
                 &request,
                 run_deadline,
@@ -1144,6 +1146,13 @@ struct DefaultMountLockHolder {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProcessStatus {
     Running,
+    #[cfg_attr(
+        not(windows),
+        expect(
+            dead_code,
+            reason = "Windows PID probes are the only production source"
+        )
+    )]
     NotRunning,
     Unknown,
 }
@@ -1657,6 +1666,8 @@ fn run_scenario_child_with_timeout(
     events_path: &Path,
     run_id: &str,
     definition: scenario::ScenarioDefinition,
+    scenario_index: usize,
+    scenario_total: usize,
     executor: &dyn CommandExecutor,
     request: &RunRequest,
     deadline: Option<RunDeadline>,
@@ -1669,6 +1680,7 @@ fn run_scenario_child_with_timeout(
         .join(definition.name);
     fs::create_dir_all(&scenario_dir)?;
     let report_path = scenario_report_path(&scenario_dir);
+    let operation_log = scenario_dir.join("operations.ndjson");
     let child_stdout = scenario_dir.join("child.stdout.log");
     let child_stderr = scenario_dir.join("child.stderr.log");
     let timeout = if let Some(deadline) = deadline {
@@ -1716,7 +1728,7 @@ fn run_scenario_child_with_timeout(
         args.push("--studiofs-bin".to_string());
         args.push(studiofs_bin.display().to_string());
     }
-    let output = executor.run(&CommandSpec {
+    let command = CommandSpec {
         program: std::env::current_exe()?.display().to_string(),
         args,
         env: Vec::new(),
@@ -1724,7 +1736,26 @@ fn run_scenario_child_with_timeout(
         timeout,
         stdout_path: Some(child_stdout.clone()),
         stderr_path: Some(child_stderr.clone()),
-    })?;
+    };
+    let mut heartbeat = || {
+        let active_hook = active_scenario_hook(events_path, definition.name)
+            .unwrap_or_else(|| "not_started".to_string());
+        let last_event = latest_operation_event(&operation_log)
+            .unwrap_or_else(|| format!("{active_hook}.started"));
+        let snapshot = HookProgressSnapshot {
+            run_id,
+            scenario_name: definition.name,
+            scenario_index,
+            scenario_total,
+            hook: &active_hook,
+            phase: "heartbeat",
+            elapsed: started_instant.elapsed(),
+            last_event: &last_event,
+            sandbox: Some(sandbox),
+        };
+        let _ = write_hook_progress_snapshot(&snapshot);
+    };
+    let output = executor.run_with_heartbeat(&command, HOOK_HEARTBEAT_INTERVAL, &mut heartbeat)?;
 
     if output.status == -1 {
         let active_hook = active_scenario_hook(events_path, definition.name)
@@ -4388,6 +4419,7 @@ mod tests {
                     .as_ref()
                     .is_some_and(|path| path.ends_with("child.stderr.log"))
         }));
+        assert_eq!(executor.run_with_heartbeat_calls.get(), 2);
     }
 
     #[test]
@@ -4489,6 +4521,8 @@ mod tests {
             &sandbox.join("events.ndjson"),
             run_id,
             definition,
+            1,
+            1,
             &executor,
             &request,
             Some(deadline),
@@ -4596,6 +4630,8 @@ mod tests {
             &sandbox.join("events.ndjson"),
             run_id,
             definition,
+            1,
+            1,
             &executor,
             &request,
             Some(RunDeadline::new(Duration::from_secs(30), Instant::now())),
@@ -4612,6 +4648,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingExecutor {
         calls: RefCell<Vec<crate::infra::CommandSpec>>,
+        run_with_heartbeat_calls: Cell<usize>,
         poison_events_path_after_up: RefCell<Option<PathBuf>>,
         require_report_before_compose_cleanup: RefCell<Option<PathBuf>>,
         require_missing_lock_before_compose_cleanup: RefCell<Option<PathBuf>>,
@@ -4622,6 +4659,21 @@ mod tests {
     }
 
     impl CommandExecutor for RecordingExecutor {
+        fn run_with_heartbeat(
+            &self,
+            command: &crate::infra::CommandSpec,
+            heartbeat_interval: Duration,
+            heartbeat: &mut dyn FnMut(),
+        ) -> std::io::Result<CommandOutput> {
+            let _ = heartbeat_interval;
+            let _ = heartbeat;
+            if command.args.iter().any(|arg| arg == "__run-one") {
+                self.run_with_heartbeat_calls
+                    .set(self.run_with_heartbeat_calls.get() + 1);
+            }
+            self.run(command)
+        }
+
         fn run(&self, command: &crate::infra::CommandSpec) -> std::io::Result<CommandOutput> {
             self.calls.borrow_mut().push(command.clone());
             if command.args.iter().any(|arg| arg == "__run-one") {

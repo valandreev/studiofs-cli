@@ -164,6 +164,18 @@ pub struct CommandOutput {
 pub trait CommandExecutor {
     /// Function $name.
     fn run(&self, command: &CommandSpec) -> std::io::Result<CommandOutput>;
+
+    /// Runs a command while periodically invoking a caller-provided heartbeat.
+    fn run_with_heartbeat(
+        &self,
+        command: &CommandSpec,
+        heartbeat_interval: Duration,
+        heartbeat: &mut dyn FnMut(),
+    ) -> std::io::Result<CommandOutput> {
+        let _ = heartbeat_interval;
+        let _ = heartbeat;
+        self.run(command)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -172,6 +184,28 @@ pub struct SystemCommandExecutor;
 
 impl CommandExecutor for SystemCommandExecutor {
     fn run(&self, command: &CommandSpec) -> std::io::Result<CommandOutput> {
+        self.run_inner(command, None)
+    }
+
+    fn run_with_heartbeat(
+        &self,
+        command: &CommandSpec,
+        heartbeat_interval: Duration,
+        heartbeat: &mut dyn FnMut(),
+    ) -> std::io::Result<CommandOutput> {
+        self.run_inner(
+            command,
+            Some(CommandHeartbeat::new(heartbeat_interval, heartbeat)),
+        )
+    }
+}
+
+impl SystemCommandExecutor {
+    fn run_inner(
+        &self,
+        command: &CommandSpec,
+        mut heartbeat: Option<CommandHeartbeat<'_>>,
+    ) -> std::io::Result<CommandOutput> {
         let mut process = Command::new(&command.program);
         process.args(&command.args);
         process.envs(
@@ -199,7 +233,7 @@ impl CommandExecutor for SystemCommandExecutor {
         }
         let mut child = process.spawn()?;
         if !capture_output {
-            let status = wait_for_child(&mut child, command.timeout)?;
+            let status = wait_for_child(&mut child, command.timeout, heartbeat.as_mut())?;
             return Ok(CommandOutput {
                 status,
                 stdout: String::new(),
@@ -236,6 +270,9 @@ impl CommandExecutor for SystemCommandExecutor {
                         stderr: timed_out_command_message(timeout, true),
                     });
                 }
+                if let Some(heartbeat) = &mut heartbeat {
+                    heartbeat.maybe_emit();
+                }
                 thread::sleep(Duration::from_millis(50));
             }
         } else {
@@ -249,16 +286,44 @@ impl CommandExecutor for SystemCommandExecutor {
     }
 }
 
+struct CommandHeartbeat<'a> {
+    interval: Duration,
+    last_emit: Instant,
+    emit: &'a mut dyn FnMut(),
+}
+
+impl<'a> CommandHeartbeat<'a> {
+    fn new(interval: Duration, emit: &'a mut dyn FnMut()) -> Self {
+        Self {
+            interval,
+            last_emit: Instant::now(),
+            emit,
+        }
+    }
+
+    fn maybe_emit(&mut self) {
+        if self.last_emit.elapsed() >= self.interval {
+            (self.emit)();
+            self.last_emit = Instant::now();
+        }
+    }
+}
+
 fn wait_for_child(
     child: &mut std::process::Child,
     timeout: Option<Duration>,
+    mut heartbeat: Option<&mut CommandHeartbeat<'_>>,
 ) -> std::io::Result<i32> {
-    if let Some(timeout) = timeout {
-        let started = Instant::now();
-        loop {
-            if let Some(status) = child.try_wait()? {
-                return Ok(status.code().unwrap_or(-1));
-            }
+    if timeout.is_none() && heartbeat.is_none() {
+        return Ok(child.wait()?.code().unwrap_or(-1));
+    }
+
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status.code().unwrap_or(-1));
+        }
+        if let Some(timeout) = timeout {
             if started.elapsed() >= timeout {
                 terminate_child_on_timeout(child);
                 let exited = wait_after_timeout_termination(child)?;
@@ -268,10 +333,12 @@ fn wait_for_child(
                 let _ = child.wait()?;
                 return Ok(-1);
             }
-            thread::sleep(Duration::from_millis(50));
         }
+        if let Some(heartbeat) = &mut heartbeat {
+            heartbeat.maybe_emit();
+        }
+        thread::sleep(Duration::from_millis(50));
     }
-    Ok(child.wait()?.code().unwrap_or(-1))
 }
 
 fn terminate_child_on_timeout(child: &mut Child) {
@@ -1015,4 +1082,58 @@ fn default_compose_file() -> PathBuf {
         }
     }
     PathBuf::from(COMPOSE_FILE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redirected_command_emits_heartbeats_while_waiting() {
+        let temp = tempfile::tempdir().unwrap();
+        let (program, args) = slow_command();
+        let command = CommandSpec {
+            program,
+            args,
+            env: Vec::new(),
+            cwd: None,
+            timeout: Some(Duration::from_secs(5)),
+            stdout_path: Some(temp.path().join("stdout.log")),
+            stderr_path: Some(temp.path().join("stderr.log")),
+        };
+        let executor = SystemCommandExecutor;
+        let mut heartbeat_count = 0;
+
+        let output = executor
+            .run_with_heartbeat(&command, Duration::from_millis(20), &mut || {
+                heartbeat_count += 1;
+            })
+            .unwrap();
+
+        assert_eq!(output.status, 0);
+        assert!(
+            heartbeat_count > 0,
+            "redirected command should emit progress while the parent waits"
+        );
+    }
+
+    #[cfg(windows)]
+    fn slow_command() -> (String, Vec<String>) {
+        (
+            "powershell".to_string(),
+            vec![
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                "Start-Sleep -Milliseconds 250".to_string(),
+            ],
+        )
+    }
+
+    #[cfg(not(windows))]
+    fn slow_command() -> (String, Vec<String>) {
+        (
+            "sh".to_string(),
+            vec!["-c".to_string(), "sleep 1".to_string()],
+        )
+    }
 }

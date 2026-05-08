@@ -101,29 +101,32 @@ tasks:
         - key: e2e-preflight
           path: target/e2e-runs
 
-  - key: e2e-smoke
+  - key: e2e-linux-full
     use: [linux-e2e-packages, e2e-preflight, build-studiofs]
     docker: true
+    timeout: 120m
     run: |
       set -euo pipefail
 
       case "${RWX_RUN_ID:-}" in
         ""|*[!A-Za-z0-9_-]*)
-          echo "e2e smoke failed: RWX_RUN_ID must use only ASCII letters, digits, underscores, or hyphens"
+          echo "e2e full failed: RWX_RUN_ID must use only ASCII letters, digits, underscores, or hyphens"
           exit 2
           ;;
       esac
 
-      RUN_ID="rwx-${RWX_RUN_ID}"
+      RUN_ID="rwx-full-${RWX_RUN_ID}"
       RUN_ROOT="target/e2e-runs"
       ARTIFACT_DIR="${RUN_ROOT}/${RUN_ID}"
 
-      echo "Starting StudioFS real E2E smoke"
+      echo "Starting StudioFS full Linux/FUSE E2E sweep"
       echo "run_id=${RUN_ID}"
       echo "artifact_path=${ARTIFACT_DIR}"
 
       set +e
-      cargo run -p studiofs-e2e -- run basic-multi-client-smoke \
+      cargo run -p studiofs-e2e -- run --all \
+        --seed 360 \
+        --timeout 90m \
         --studiofs-bin target/debug/studiofs \
         --root "${RUN_ROOT}" \
         --run-id "${RUN_ID}" \

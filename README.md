@@ -202,11 +202,11 @@ Focused Local-First regression:
 cargo test -p studiofs-vfs --test vfs_test foreground_read_baseline_during_and_post_upload_are_comparable -- --ignored --nocapture --test-threads=1
 ```
 
-Real mounted E2E runner skeleton:
+Real mounted E2E runner:
 
 ```bash
 cargo run -p studiofs-e2e -- list
-cargo run -p studiofs-e2e -- run basic-multi-client-smoke
+cargo run -p studiofs-e2e -- run --all --seed 360 --timeout 90m --studiofs-bin target/debug/studiofs
 cargo run -p studiofs-e2e -- clean
 ```
 
@@ -215,7 +215,8 @@ contains PostgreSQL 18, RustFS, and a Toxiproxy placeholder, waits for healthy
 required services, writes Docker logs under `artifacts/docker/`, and tears down
 containers, networks, and volumes during cleanup. Use `--port-range <start-end>`
 to choose deterministic host ports, or `--infra disabled` for runner self-tests
-that must not start Docker.
+that must not start Docker. Hosted Linux/FUSE product-level sweeps run manually
+through RWX with `rwx run .rwx/e2e.yml --target e2e-linux-full --wait --open`.
 
 Local development and infra-backed tests use RustFS as the default
 S3-compatible backend together with PostgreSQL.

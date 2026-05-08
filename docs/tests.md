@@ -247,15 +247,18 @@ expected last-writer checksum.
 Hosted Linux real mounted E2E is available as a manual RWX workflow:
 
 ```powershell
-rwx run .rwx/e2e.yml --target e2e-smoke --wait --open
+rwx run .rwx/e2e.yml --target e2e-linux-full --wait --open
 ```
 
-The first RWX target runs `basic-multi-client-smoke` only. It requires RWX
-Docker support, `/dev/fuse`, `fusermount3`, and readable FUSE configuration on
-the hosted Linux task. It does not add a GitHub Actions workflow, PR trigger, or
-schedule. RWX uploads `target/e2e-runs/<run-id>/` as the `e2e-run` artifact so
+The RWX target runs the full registered `studiofs-e2e run --all` Linux/FUSE
+sweep with seed `360`, one Docker Compose stack, and a fresh StudioFS volume
+plus scenario-scoped client runtime for each scenario. It requires RWX Docker
+support, `/dev/fuse`, `fusermount3`, and readable FUSE configuration on the
+hosted Linux task. It does not add a GitHub Actions workflow, PR trigger, or
+schedule. RWX uploads `target/e2e-runs` as the `e2e-run` artifact so
 `report.json`, `preflight.json`, Docker diagnostics, scenario artifacts, and
-client logs remain available on failure.
+client logs remain available after the run. The RWX task timeout is `120m`,
+which is intentionally longer than the runner `--timeout 90m` watchdog.
 
 Focused runner skeleton check:
 

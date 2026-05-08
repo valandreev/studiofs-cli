@@ -8,6 +8,45 @@ The runner is not part of the default fast test suite. It is an explicit,
 operator-started workflow for tests that need Docker, PostgreSQL, S3-compatible
 object storage, and a real FUSE, macFUSE, or WinFSP mount.
 
+## RWX Linux/FUSE Hosted Sweep
+
+RWX is the primary hosted environment for product-level real mounted E2E
+coverage while the shared filesystem behavior is still being expanded. The
+manual workflow at `.rwx/e2e.yml` runs the `e2e-linux-full` target on
+Ubuntu with Docker support and `/dev/fuse`, builds the `studiofs` binary, and
+executes:
+
+```text
+studiofs-e2e run --all \
+  --seed 360 \
+  --timeout 90m \
+  --studiofs-bin target/debug/studiofs \
+  --root target/e2e-runs \
+  --run-id rwx-full-<RWX_RUN_ID> \
+  --platform linux-fuse \
+  --infra compose \
+  --retain always
+```
+
+This target is the first completion bar for the shared FS logic: every
+registered scenario must pass on RWX Linux/FUSE before the same scenario set is
+treated as ready for Windows/WinFSP-specific hang and shutdown work. New
+implemented scenarios should join the registry and then become part of the RWX
+full sweep through `--all`; planned-but-unimplemented scenario families should
+not be represented by passing placeholders.
+
+The RWX run owns exactly one sandbox rooted at
+`target/e2e-runs/rwx-full-<RWX_RUN_ID>`. The run ID must contain only ASCII
+letters, digits, underscores, and hyphens before it is used in any artifact
+path. RWX uploads `target/e2e-runs` as the `e2e-run` artifact so the canonical
+run report, Docker diagnostics, per-scenario operation logs, mounted-tree
+snapshots, and per-client logs stay available after both passes and failures.
+The RWX task timeout is `120m`, while the runner watchdog is `90m`; the task
+timeout must remain higher so the runner can write its own report and cleanup
+artifacts if the mounted sweep stalls. During bring-up the workflow retains
+sandboxes on success as well as failure; that can be tightened after the full
+sweep is stable.
+
 ## Runner Boundaries And CLI
 
 The runner belongs in a dedicated workspace crate named `studiofs-e2e`, with a
@@ -140,6 +179,13 @@ target/e2e-runs/<run-id>/
         studiofs-tracing.log
 ```
 
+For RWX, `<run-id>` is `rwx-full-<RWX_RUN_ID>` and the whole
+`target/e2e-runs` tree is uploaded as the hosted artifact. The runner still
+owns the nested sandbox and report schema; RWX only provides the Linux/FUSE
+host, Docker daemon, and artifact uploader. A full RWX sweep must start compose
+once for the run, then give each scenario a fresh StudioFS volume and
+scenario-scoped client runtime under `artifacts/scenarios/<scenario-name>/`.
+
 On Windows, `artifacts/clients/<client>/mount/` is a metadata directory for the
 drive-letter mount. It must contain the chosen mount point in a small text or
 JSON artifact, because `Z:` is not a directory inside the sandbox.
@@ -160,7 +206,10 @@ still active.
 Progress is emitted as stable key-value lines for run start, preflight start
 and result, scenario start and result, hook start and result, and cleanup start
 and result. While a hook is active, the runner emits a heartbeat every 30
-seconds. Heartbeats are plain log lines, not terminal-control updates:
+seconds. Multi-scenario `run --all` executions redirect each child scenario's
+stdout and stderr to `child.stdout.log` and `child.stderr.log`; the parent
+supervisor still prints heartbeat lines to visible stdout while it waits for
+the child. Heartbeats are plain log lines, not terminal-control updates:
 
 ```text
 [studiofs-e2e][2026-05-06T17:30:00.000Z] run=20260506T173000Z-a1b2c3 scenario=1/1 scenario_name=mounted-fault-chaos-convergence hook=run phase=heartbeat elapsed=90s last_event=run.started sandbox=E:\dev\studiofs-cli\target\e2e-runs\20260506T173000Z-a1b2c3
