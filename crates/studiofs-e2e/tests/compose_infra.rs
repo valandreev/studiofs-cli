@@ -1,6 +1,7 @@
 //! Crate documentation for lint completion.
 use std::cell::RefCell;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use studiofs_e2e::infra::{
     CommandExecutor, CommandOutput, ComposeConfig, DockerComposeStack, InfraError,
@@ -271,6 +272,33 @@ fn post_start_preflight_retries_transient_host_rustfs_health_timeout() {
     assert_eq!(checks.len(), 1);
     assert!(checks.iter().all(|check| check.passed));
     assert_eq!(*executor.rustfs_health_attempts.borrow(), 2);
+}
+
+#[test]
+fn post_start_preflight_heartbeat_reports_retry_progress() {
+    let temp = tempdir().unwrap();
+    let stack = DockerComposeStack::new(ComposeConfig {
+        run_id: "compose-host-health-progress".to_string(),
+        sandbox: temp.path().join("compose-host-health-progress"),
+        compose_file: repo_root().join("docker/compose.e2e.yml"),
+        port_range: Some("32300-32310".to_string()),
+        wait_timeout_secs: 120,
+    })
+    .unwrap();
+    let executor = TransientRustfsHealthExecutor::default();
+    let mut heartbeats = Vec::new();
+
+    let checks = stack.post_start_preflight_with_heartbeat(
+        &executor,
+        Duration::ZERO,
+        &mut |port, attempts, _elapsed| {
+            heartbeats.push((port.service.clone(), attempts));
+        },
+    );
+
+    assert_eq!(checks.len(), 1);
+    assert!(checks.iter().all(|check| check.passed));
+    assert_eq!(heartbeats, vec![("rustfs".to_string(), 1)]);
 }
 
 #[test]

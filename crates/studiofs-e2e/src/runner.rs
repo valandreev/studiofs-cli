@@ -34,7 +34,7 @@ use crate::scenario::{self, ScenarioContext};
 const SCHEMA_VERSION: u32 = 1;
 const RUNNER_CRATE: &str = "studiofs-e2e";
 const RUNNER_MARKER_FILE: &str = ".studiofs-e2e-runner.json";
-const HOOK_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+const HOOK_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -530,6 +530,7 @@ fn run_with_executor_and_mount_lock_dir(
             ("phase", "starting".to_string()),
         ]);
         prepare_preflight(
+            &run_id,
             &sandbox,
             &root,
             infra_mode,
@@ -565,6 +566,7 @@ fn run_with_executor_and_mount_lock_dir(
     });
     write_pretty_json(&sandbox.join("run.json"), &manifest)?;
     let mut compose_cleanup_guard = ComposeCleanupGuard::new(
+        &run_id,
         if prepared_preflight.compose_start_attempted {
             compose_stack.as_ref()
         } else {
@@ -577,6 +579,11 @@ fn run_with_executor_and_mount_lock_dir(
         let mut cleanup_actions = Vec::new();
         let mut cleanup_errors = Vec::new();
         drop(default_mount_lock.take());
+        e2e_progress_fields(&[
+            ("run", run_id.clone()),
+            ("stage", "cleanup".to_string()),
+            ("phase", "starting".to_string()),
+        ]);
         compose_cleanup_guard.collect_into(&mut cleanup_actions, &mut cleanup_errors);
         let cleanup = CleanupReport {
             status: if cleanup_errors.is_empty() {
@@ -783,13 +790,22 @@ fn run_with_executor_and_mount_lock_dir(
 }
 
 struct ComposeCleanupGuard<'a> {
+    run_id: String,
     stack: Option<&'a DockerComposeStack>,
     executor: &'a dyn CommandExecutor,
 }
 
 impl<'a> ComposeCleanupGuard<'a> {
-    fn new(stack: Option<&'a DockerComposeStack>, executor: &'a dyn CommandExecutor) -> Self {
-        Self { stack, executor }
+    fn new(
+        run_id: &str,
+        stack: Option<&'a DockerComposeStack>,
+        executor: &'a dyn CommandExecutor,
+    ) -> Self {
+        Self {
+            run_id: run_id.to_string(),
+            stack,
+            executor,
+        }
     }
 
     fn collect_into(
@@ -798,7 +814,13 @@ impl<'a> ComposeCleanupGuard<'a> {
         cleanup_errors: &mut Vec<String>,
     ) {
         if let Some(stack) = self.stack.take() {
-            collect_compose_cleanup(stack, self.executor, cleanup_actions, cleanup_errors);
+            collect_compose_cleanup(
+                &self.run_id,
+                stack,
+                self.executor,
+                cleanup_actions,
+                cleanup_errors,
+            );
         }
     }
 }
@@ -809,6 +831,7 @@ impl Drop for ComposeCleanupGuard<'_> {
             let mut cleanup_actions = Vec::new();
             let mut cleanup_errors = Vec::new();
             collect_compose_cleanup(
+                &self.run_id,
                 stack,
                 self.executor,
                 &mut cleanup_actions,
@@ -913,6 +936,7 @@ struct PreparedPreflight {
 }
 
 fn prepare_preflight(
+    run_id: &str,
     sandbox: &Path,
     root: &Path,
     infra: InfraMode,
@@ -977,13 +1001,18 @@ fn prepare_preflight(
         });
     }
 
+    e2e_stage_step_progress(run_id, "preflight", "docker_compose_up", "started");
     match stack.start(executor) {
-        Ok(()) => checks.push(PreflightCheckReport {
-            name: "docker compose up --wait".to_string(),
-            status: RunStatus::Passed,
-            detail: "required services are running or healthy".to_string(),
-        }),
+        Ok(()) => {
+            e2e_stage_step_progress(run_id, "preflight", "docker_compose_up", "Passed");
+            checks.push(PreflightCheckReport {
+                name: "docker compose up --wait".to_string(),
+                status: RunStatus::Passed,
+                detail: "required services are running or healthy".to_string(),
+            });
+        }
         Err(err) => {
+            e2e_stage_step_progress(run_id, "preflight", "docker_compose_up", "Failed");
             checks.push(PreflightCheckReport {
                 name: "docker compose up --wait".to_string(),
                 status: RunStatus::PreflightFailed,
@@ -998,36 +1027,43 @@ fn prepare_preflight(
             });
         }
     }
-    let post_start_checks = stack.post_start_preflight(executor);
+    e2e_stage_step_progress(run_id, "preflight", "host_health", "started");
+    let post_start_checks =
+        post_start_preflight_with_progress(stack, executor, run_id, "host_health");
     if post_start_checks.iter().all(|check| check.passed) {
+        e2e_stage_step_progress(run_id, "preflight", "host_health", "Passed");
         checks.extend(post_start_checks.into_iter().map(preflight_check_report));
     } else {
+        e2e_stage_step_progress(run_id, "preflight", "host_health", "Failed");
         let failed_details = post_start_checks
             .iter()
             .filter(|check| !check.passed)
             .map(|check| format!("{}: {}", check.name, check.detail))
             .collect::<Vec<_>>()
             .join("; ");
+        e2e_stage_step_progress(run_id, "preflight", "docker_compose_recreate", "started");
         match stack.teardown(executor).and_then(|()| {
             let advanced_ports = stack.advance_port_block()?;
             stack.prepare_artifacts()?;
             stack.start(executor)?;
             Ok(advanced_ports)
         }) {
-            Ok(advanced_ports) => checks.push(PreflightCheckReport {
-                name: "docker compose recreate after failed host health".to_string(),
-                status: RunStatus::Passed,
-                detail: if advanced_ports {
-                    format!(
-                        "recreated stack on higher port block after host readiness failure: {failed_details}"
-                    )
-                } else {
-                    format!(
-                        "recreated stack after host readiness failure: {failed_details}"
-                    )
-                },
-            }),
+            Ok(advanced_ports) => {
+                e2e_stage_step_progress(run_id, "preflight", "docker_compose_recreate", "Passed");
+                checks.push(PreflightCheckReport {
+                    name: "docker compose recreate after failed host health".to_string(),
+                    status: RunStatus::Passed,
+                    detail: if advanced_ports {
+                        format!(
+                            "recreated stack on higher port block after host readiness failure: {failed_details}"
+                        )
+                    } else {
+                        format!("recreated stack after host readiness failure: {failed_details}")
+                    },
+                });
+            }
             Err(err) => {
+                e2e_stage_step_progress(run_id, "preflight", "docker_compose_recreate", "Failed");
                 checks.push(PreflightCheckReport {
                     name: "docker compose recreate after failed host health".to_string(),
                     status: RunStatus::PreflightFailed,
@@ -1044,11 +1080,27 @@ fn prepare_preflight(
                 });
             }
         }
+        e2e_stage_step_progress(run_id, "preflight", "host_health_after_recreate", "started");
         checks.extend(
-            stack
-                .post_start_preflight(executor)
-                .into_iter()
-                .map(preflight_check_report),
+            post_start_preflight_with_progress(
+                stack,
+                executor,
+                run_id,
+                "host_health_after_recreate",
+            )
+            .into_iter()
+            .map(preflight_check_report),
+        );
+        let post_recreate_status = if checks.iter().all(|check| check.status == RunStatus::Passed) {
+            "Passed"
+        } else {
+            "Failed"
+        };
+        e2e_stage_step_progress(
+            run_id,
+            "preflight",
+            "host_health_after_recreate",
+            post_recreate_status,
         );
     }
     if checks.iter().any(|check| check.status != RunStatus::Passed) {
@@ -1068,6 +1120,26 @@ fn prepare_preflight(
         },
         compose_start_attempted: true,
     })
+}
+
+fn post_start_preflight_with_progress(
+    stack: &DockerComposeStack,
+    executor: &dyn CommandExecutor,
+    run_id: &str,
+    step: &str,
+) -> Vec<InfraCheck> {
+    let mut heartbeat = |port: &crate::infra::ServicePort, attempts: usize, elapsed: Duration| {
+        e2e_progress_fields(&[
+            ("run", run_id.to_string()),
+            ("stage", "preflight".to_string()),
+            ("step", step.to_string()),
+            ("phase", "running".to_string()),
+            ("service", port.service.clone()),
+            ("elapsed", format!("{}s", elapsed.as_secs())),
+            ("attempts", attempts.to_string()),
+        ]);
+    };
+    stack.post_start_preflight_with_heartbeat(executor, HOOK_HEARTBEAT_INTERVAL, &mut heartbeat)
 }
 
 fn prepare_failed_mount_lock_preflight(
@@ -1109,24 +1181,44 @@ fn preflight_check_report(check: InfraCheck) -> PreflightCheckReport {
 }
 
 fn collect_compose_cleanup(
+    run_id: &str,
     stack: &DockerComposeStack,
     executor: &dyn CommandExecutor,
     cleanup_actions: &mut Vec<String>,
     cleanup_errors: &mut Vec<String>,
 ) {
+    e2e_stage_step_progress(run_id, "cleanup", "docker_compose_logs", "started");
     match stack.collect_logs(executor) {
-        Ok(_) => cleanup_actions.push("docker compose logs".to_string()),
-        Err(err) => cleanup_errors.push(format!("docker compose logs: {err}")),
+        Ok(_) => {
+            e2e_stage_step_progress(run_id, "cleanup", "docker_compose_logs", "Passed");
+            cleanup_actions.push("docker compose logs".to_string());
+        }
+        Err(err) => {
+            e2e_stage_step_progress(run_id, "cleanup", "docker_compose_logs", "Failed");
+            cleanup_errors.push(format!("docker compose logs: {err}"));
+        }
     }
+    e2e_stage_step_progress(run_id, "cleanup", "docker_diagnostics", "started");
     match stack.collect_optional_diagnostics(executor) {
-        Ok(actions) => cleanup_actions.extend(actions),
-        Err(err) => cleanup_actions.push(format!("optional docker diagnostics skipped: {err}")),
+        Ok(actions) => {
+            e2e_stage_step_progress(run_id, "cleanup", "docker_diagnostics", "Passed");
+            cleanup_actions.extend(actions);
+        }
+        Err(err) => {
+            e2e_stage_step_progress(run_id, "cleanup", "docker_diagnostics", "Failed");
+            cleanup_actions.push(format!("optional docker diagnostics skipped: {err}"));
+        }
     }
+    e2e_stage_step_progress(run_id, "cleanup", "docker_compose_down", "started");
     match stack.teardown(executor) {
         Ok(()) => {
+            e2e_stage_step_progress(run_id, "cleanup", "docker_compose_down", "Passed");
             cleanup_actions.push("docker compose down --volumes --remove-orphans".to_string());
         }
-        Err(err) => cleanup_errors.push(format!("docker compose down: {err}")),
+        Err(err) => {
+            e2e_stage_step_progress(run_id, "cleanup", "docker_compose_down", "Failed");
+            cleanup_errors.push(format!("docker compose down: {err}"));
+        }
     }
 }
 
@@ -1748,10 +1840,10 @@ fn run_scenario_child_with_timeout(
             scenario_index,
             scenario_total,
             hook: &active_hook,
-            phase: "heartbeat",
+            phase: "running",
             elapsed: started_instant.elapsed(),
             last_event: &last_event,
-            sandbox: Some(sandbox),
+            sandbox: None,
         };
         let _ = write_hook_progress_snapshot(&snapshot);
     };
@@ -2141,7 +2233,7 @@ fn run_hook_with_heartbeat_interval<T>(
         phase: "started",
         elapsed: Duration::ZERO,
         last_event: &started_event,
-        sandbox: events_path.parent(),
+        sandbox: None,
     };
     write_hook_progress_snapshot(&start_snapshot)?;
     let _heartbeat = HookHeartbeat::start(HookHeartbeatInput {
@@ -2150,7 +2242,7 @@ fn run_hook_with_heartbeat_interval<T>(
         scenario_index: hook_context.scenario_index,
         scenario_total: hook_context.scenario_total,
         hook: hook.to_string(),
-        sandbox: events_path.parent().map(Path::to_path_buf),
+        sandbox: None,
         operation_log: hook_context.operation_log.to_path_buf(),
         interval: heartbeat_interval,
     });
@@ -2167,7 +2259,7 @@ fn run_hook_with_heartbeat_interval<T>(
         phase,
         elapsed: started.elapsed(),
         last_event: &last_event,
-        sandbox: events_path.parent(),
+        sandbox: None,
     };
     write_hook_progress_snapshot(&finish_snapshot)?;
     record_event(events_path, run_id, Some(scenario), hook, phase)?;
@@ -2210,7 +2302,7 @@ impl HookHeartbeat {
                                 scenario_index: input.scenario_index,
                                 scenario_total: input.scenario_total,
                                 hook: &input.hook,
-                                phase: "heartbeat",
+                                phase: "running",
                                 elapsed: started.elapsed(),
                                 last_event: &last_event,
                                 sandbox: input.sandbox.as_deref(),
@@ -2872,6 +2964,20 @@ fn e2e_progress_fields(fields: &[(&str, String)]) {
     e2e_progress(&line);
 }
 
+fn e2e_stage_step_progress(run_id: &str, stage: &str, step: &str, state: &str) {
+    let state_key = if matches!(state, "started" | "running") {
+        "phase"
+    } else {
+        "status"
+    };
+    e2e_progress_fields(&[
+        ("run", run_id.to_string()),
+        ("stage", stage.to_string()),
+        ("step", step.to_string()),
+        (state_key, state.to_string()),
+    ]);
+}
+
 fn format_progress_value(value: &str) -> String {
     if value.is_empty()
         || value
@@ -3137,7 +3243,7 @@ mod tests {
             scenario_index: 13,
             scenario_total: 13,
             hook: "run",
-            phase: "heartbeat",
+            phase: "running",
             elapsed: Duration::from_secs(90),
             last_event: "run.started",
             sandbox: Some(Path::new("target/e2e-runs/run-1")),
@@ -3150,7 +3256,7 @@ mod tests {
         assert!(line.contains("scenario=13/13"));
         assert!(line.contains("scenario_name=slow-scenario"));
         assert!(line.contains("hook=run"));
-        assert!(line.contains("phase=heartbeat"));
+        assert!(line.contains("phase=running"));
         assert!(line.contains("elapsed=90s"));
         assert!(line.contains("last_event=run.started"));
         assert!(line.contains("sandbox=target/e2e-runs/run-1"));
@@ -3215,7 +3321,7 @@ mod tests {
             scenario_index: 1,
             scenario_total: 1,
             hook: "run",
-            phase: "heartbeat",
+            phase: "running",
             elapsed: Duration::from_secs(30),
             last_event: "seq=2,op=write",
             sandbox: Some(Path::new("target/e2e runs/run 1")),

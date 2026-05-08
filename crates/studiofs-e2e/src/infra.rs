@@ -219,17 +219,26 @@ impl SystemCommandExecutor {
             process.current_dir(cwd);
         }
         let capture_output = command.stdout_path.is_none() && command.stderr_path.is_none();
-        if let Some(stdout_path) = &command.stdout_path {
-            if let Some(parent) = stdout_path.parent() {
-                fs::create_dir_all(parent)?;
+        if capture_output {
+            process.stdout(Stdio::piped());
+            process.stderr(Stdio::piped());
+        } else {
+            if let Some(stdout_path) = &command.stdout_path {
+                if let Some(parent) = stdout_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                process.stdout(Stdio::from(fs::File::create(stdout_path)?));
+            } else {
+                process.stdout(Stdio::null());
             }
-            process.stdout(Stdio::from(fs::File::create(stdout_path)?));
-        }
-        if let Some(stderr_path) = &command.stderr_path {
-            if let Some(parent) = stderr_path.parent() {
-                fs::create_dir_all(parent)?;
+            if let Some(stderr_path) = &command.stderr_path {
+                if let Some(parent) = stderr_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                process.stderr(Stdio::from(fs::File::create(stderr_path)?));
+            } else {
+                process.stderr(Stdio::null());
             }
-            process.stderr(Stdio::from(fs::File::create(stderr_path)?));
         }
         let mut child = process.spawn()?;
         if !capture_output {
@@ -574,10 +583,24 @@ impl DockerComposeStack {
 
     /// Function $name.
     pub fn post_start_preflight(&self, executor: &dyn CommandExecutor) -> Vec<InfraCheck> {
+        self.post_start_preflight_with_heartbeat(
+            executor,
+            Duration::from_secs(0),
+            &mut |_port, _attempts, _elapsed| {},
+        )
+    }
+
+    /// Function $name.
+    pub fn post_start_preflight_with_heartbeat(
+        &self,
+        executor: &dyn CommandExecutor,
+        heartbeat_interval: Duration,
+        heartbeat: &mut dyn FnMut(&ServicePort, usize, Duration),
+    ) -> Vec<InfraCheck> {
         self.ports
             .iter()
             .filter(|port| port.service == RUSTFS_SERVICE_NAME)
-            .map(|port| host_health_check(port, executor))
+            .map(|port| host_health_check(port, executor, heartbeat_interval, heartbeat))
             .collect()
     }
 
@@ -619,6 +642,8 @@ impl DockerComposeStack {
     /// Function $name.
     pub fn collect_logs(&self, executor: &dyn CommandExecutor) -> Result<PathBuf, InfraError> {
         fs::create_dir_all(self.docker_artifact_dir())?;
+        let log_path = self.docker_artifact_dir().join("compose.log");
+        let stderr_path = self.docker_artifact_dir().join("compose.stderr.log");
         let mut command = self.compose_command();
         command.args.extend([
             "logs".to_string(),
@@ -626,13 +651,11 @@ impl DockerComposeStack {
             "--timestamps".to_string(),
         ]);
         command.timeout = Some(Duration::from_secs(120));
+        command.stdout_path = Some(log_path.clone());
+        command.stderr_path = Some(stderr_path.clone());
         let output = run_success(executor, "docker compose logs", command)?;
-        let log_path = self.docker_artifact_dir().join("compose.log");
-        fs::write(&log_path, output.stdout)?;
-        fs::write(
-            self.docker_artifact_dir().join("compose.stderr.log"),
-            output.stderr,
-        )?;
+        write_command_output_fallback(&log_path, &output.stdout)?;
+        write_command_output_fallback(&stderr_path, &output.stderr)?;
         Ok(log_path)
     }
 
@@ -714,11 +737,15 @@ impl DockerComposeStack {
             .args
             .extend(args.iter().map(|arg| (*arg).to_string()));
         command.timeout = Some(Duration::from_secs(120));
-        let output = executor.run(&command)?;
         let artifact_dir = self.docker_artifact_dir();
+        let stdout_path = artifact_dir.join(stdout_file);
+        let stderr_path = artifact_dir.join(stderr_file);
+        command.stdout_path = Some(stdout_path.clone());
+        command.stderr_path = Some(stderr_path.clone());
+        let output = executor.run(&command)?;
         let collected = output.status == 0;
-        fs::write(artifact_dir.join(stdout_file), &output.stdout)?;
-        fs::write(artifact_dir.join(stderr_file), &output.stderr)?;
+        write_command_output_fallback(&stdout_path, &output.stdout)?;
+        write_command_output_fallback(&stderr_path, &output.stderr)?;
         fs::write(
             artifact_dir.join(status_file),
             serde_json::to_vec_pretty(&serde_json::json!({
@@ -785,6 +812,13 @@ impl DockerComposeStack {
             env: self.compose_environment(),
         }
     }
+}
+
+fn write_command_output_fallback(path: &Path, output: &str) -> std::io::Result<()> {
+    if !path.exists() {
+        fs::write(path, output)?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -928,9 +962,15 @@ fn port_check(port: &ServicePort) -> InfraCheck {
     }
 }
 
-fn host_health_check(port: &ServicePort, executor: &dyn CommandExecutor) -> InfraCheck {
+fn host_health_check(
+    port: &ServicePort,
+    executor: &dyn CommandExecutor,
+    heartbeat_interval: Duration,
+    heartbeat: &mut dyn FnMut(&ServicePort, usize, Duration),
+) -> InfraCheck {
     let url = format!("http://{}:{}/health", port.host, port.host_port);
     let started = Instant::now();
+    let mut last_heartbeat = Instant::now();
     let mut attempts = 0usize;
     let mut last_failure: Option<String>;
 
@@ -967,6 +1007,10 @@ fn host_health_check(port: &ServicePort, executor: &dyn CommandExecutor) -> Infr
         }
         if started.elapsed() >= HOST_HEALTH_RETRY_DEADLINE {
             break;
+        }
+        if last_heartbeat.elapsed() >= heartbeat_interval {
+            heartbeat(port, attempts, started.elapsed());
+            last_heartbeat = Instant::now();
         }
         std::thread::sleep(HOST_HEALTH_RETRY_DELAY);
     }
