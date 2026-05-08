@@ -7067,6 +7067,53 @@ fn writer_stack_dirty_attrs_keep_nanos_timestamps() {
 }
 
 #[test]
+fn flush_fh_skips_stale_dirty_attr_that_would_shrink_current_size() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "flush-fh-stale-dirty-attr-size");
+    let attr = vfs
+        .create(1, b"flush-fh-stale-dirty-attr-size.txt", 0, 0, 0o644)
+        .expect("create test file");
+    let ino = attr.ino;
+    let fh = vfs
+        .open_file(ino, OpenFlags::RDWR, false)
+        .expect("open writable handle");
+
+    let mut current = meta.get_attr(ino).expect("load durable attr");
+    current.size = 1024 * 1024;
+    current.committed_size = current.size;
+    current.committed_content_epoch = current.content_epoch;
+    current.upload_state = MetaUploadState::Ready;
+    meta.set_attr(&current).expect("persist durable attr");
+
+    let mut stale = current.clone();
+    stale.size = 0;
+    stale.committed_size = 0;
+    stale.upload_state = MetaUploadState::Uploading;
+    vfs.state.namespace.dirty_attrs.lock().insert(ino, stale);
+
+    rt.block_on(async {
+        let _outcome = vfs
+            .flush_fh_with_outcome(fh)
+            .await
+            .expect("flush_fh with stale dirty attr");
+    });
+
+    let after = meta.get_attr(ino).expect("reload durable attr");
+    assert_eq!(
+        after.size, current.size,
+        "flush_fh must not shrink durable size using a stale dirty attr"
+    );
+    assert!(
+        !vfs.state.namespace.dirty_attrs.lock().contains_key(&ino),
+        "stale dirty attr should be discarded after it is rejected"
+    );
+
+    rt.block_on(async {
+        vfs.release_fh(fh).await.expect("release handle");
+    });
+}
+
+#[test]
 fn release_fh_enforces_strict_local_durability_on_last_handle() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "release-fh-fast-local-sync");
@@ -7450,6 +7497,80 @@ fn deferred_materialization_reschedules_write_that_arrives_while_inflight_finish
         .expect("finishing materializer should reschedule dirty writer-stack state");
 
         vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn winfsp_style_overwrite_then_deferred_write_persists_visible_size() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "winfsp-overwrite-deferred-size");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"winfsp-overwrite-deferred-size.bin", 0, 0, 0o644)
+            .expect("create");
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).expect("open");
+        let payload = vec![0xE5; vfs.block_size as usize / 2];
+
+        vfs.setattr_with_handle(Some(fh), ino, SetattrArgs::size_only(0))
+            .expect("WinFSP overwrite logical-size reset");
+        vfs.write_fh_with_deferred_materialize(
+            fh,
+            ino,
+            0,
+            &payload,
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .expect("deferred write");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if vfs.state.writer_stack.dirty_bytes_for_inode(ino) == 0
+                    && !vfs.pending_uploads_for_inode(ino).is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("background materialization should publish local metadata");
+
+        let visible_attr = vfs.getattr(ino).expect("visible attr");
+        assert_eq!(visible_attr.size, payload.len() as u64);
+        let durable_attr = meta.get_attr(ino).expect("durable attr");
+        assert_eq!(
+            durable_attr.size,
+            payload.len() as u64,
+            "remount must not collapse a deferred WinFSP write back to the overwrite size"
+        );
+
+        let (content_epoch, _object_ids) = mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+        for pending in vfs.pending_uploads_snapshot() {
+            if pending.ino == ino && pending.content_epoch == content_epoch {
+                vfs.cached_store().complete_upload(&pending);
+            }
+        }
+        assert!(
+            vfs.pending_uploads_for_inode(ino).is_empty(),
+            "setup should simulate completed local uploads"
+        );
+        publish_current_file_graph(&meta, ino, content_epoch, &[]);
+        let published_attr = meta.get_attr(ino).expect("published attr");
+        assert_eq!(
+            published_attr.size,
+            payload.len() as u64,
+            "upload finalization must preserve the visible file size"
+        );
+        assert_eq!(
+            published_attr.committed_size,
+            payload.len() as u64,
+            "published base graph should cover the complete file"
+        );
+
+        vfs.release_fh(fh).await.expect("release");
     });
 }
 

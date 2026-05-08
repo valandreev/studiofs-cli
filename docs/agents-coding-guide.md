@@ -109,8 +109,10 @@ Higher priority (lower tier number) must be acquired first:
 - WinFSP `cleanup`:
   - WinFSP `FlushAndPurgeOnCleanup` is disabled by default; write-capable
     handles use `Create.Opened.DisableCache` so writes bypass the OS file cache.
-    Read-only handle caching is bounded by `STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS`
-    so remote metadata invalidations can become visible without remounting.
+    FileInfo caching defaults to WinFSP's cache-manager mode
+    (`STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS=max`) while kernel notifications are
+    opt-in, so read-only handles can keep the OS read cache hot across repeated
+    passes. Use small bounded values only for targeted stale-attribute diagnostics.
   - delete + `FspCleanupDelete` finalizes deletion.
   - non-delete StudioFS cleanup callback handling is observational; it should
     not be the ownership point for dirty local persistence.

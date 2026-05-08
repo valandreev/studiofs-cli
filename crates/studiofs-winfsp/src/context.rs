@@ -4,9 +4,9 @@
 mod handle_drain;
 
 use std::ffi::c_void;
-use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use futures::FutureExt;
@@ -19,7 +19,7 @@ use studiofs_vfs::{
     StudioVfs, classify_vfs_error, is_hidden_non_macos_root_metadata_name, normalize_attr_times,
 };
 use tokio::runtime::Handle;
-use tracing::{debug, error, trace, warn};
+use tracing::{Level, debug, error, info, trace, warn};
 use windows::Win32::Foundation::NTSTATUS;
 use windows::Win32::Security::{
     Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -235,6 +235,20 @@ fn write_local_sync_policy_from_create_options(create_options: u32) -> LocalSync
 
 fn access_can_mutate_namespace(granted_access: FILE_ACCESS_RIGHTS) -> bool {
     (granted_access & (DELETE_ACCESS | FILE_DELETE_CHILD_ACCESS)) != 0
+}
+
+fn callback_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("STUDIOFS_WINFSP_CALLBACK_TRACE")
+            .map(|value| {
+                matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    })
 }
 
 fn should_disable_winfsp_file_cache(
@@ -1104,22 +1118,59 @@ impl FileSystemContext for StudioFsContext {
         security_descriptor: Option<&mut [c_void]>,
         resolve_reparse_points: impl FnOnce(&U16CStr) -> Option<FileSecurity>,
     ) -> winfsp::Result<FileSecurity> {
-        if maybe_hide_non_macos_root_path(&self.vfs, file_name)? {
-            return Err(winfsp::FspError::from(STATUS_OBJECT_NAME_NOT_FOUND));
-        }
-        if let Some(security) = resolve_reparse_points(file_name) {
-            return Ok(security);
+        let trace_callback = callback_trace_enabled();
+        let security_buffer_len = security_descriptor.as_ref().map(|buf| buf.len());
+        let callback_started = trace_callback.then(Instant::now);
+        let trace_path = trace_callback.then(|| file_name.to_string_lossy());
+        if let Some(path) = trace_path.as_ref() {
+            info!(
+                path = %path,
+                security_buffer_len,
+                "get_security_by_name callback start"
+            );
         }
 
-        let attr = resolve_path(&self.vfs, file_name)?;
-        let file_attributes = compute_file_attributes(&attr);
-        let sd_len = self.copy_sd_to_buffer(security_descriptor);
+        let result = (|| {
+            if maybe_hide_non_macos_root_path(&self.vfs, file_name)? {
+                return Err(winfsp::FspError::from(STATUS_OBJECT_NAME_NOT_FOUND));
+            }
+            if let Some(security) = resolve_reparse_points(file_name) {
+                return Ok(security);
+            }
 
-        Ok(FileSecurity {
-            reparse: attr.kind == FileType::Symlink,
-            sz_security_descriptor: sd_len,
-            attributes: file_attributes,
-        })
+            let attr = resolve_path(&self.vfs, file_name)?;
+            let file_attributes = compute_file_attributes(&attr);
+            let sd_len = self.copy_sd_to_buffer(security_descriptor);
+
+            Ok(FileSecurity {
+                reparse: attr.kind == FileType::Symlink,
+                sz_security_descriptor: sd_len,
+                attributes: file_attributes,
+            })
+        })();
+
+        if let (Some(path), Some(callback_started)) = (trace_path.as_ref(), callback_started) {
+            match &result {
+                Ok(security) => info!(
+                    path = %path,
+                    elapsed_ms = callback_started.elapsed().as_millis() as u64,
+                    security_buffer_len,
+                    security_descriptor_len = security.sz_security_descriptor,
+                    file_attributes = security.attributes,
+                    reparse = security.reparse,
+                    "get_security_by_name callback complete"
+                ),
+                Err(error) => warn!(
+                    path = %path,
+                    elapsed_ms = callback_started.elapsed().as_millis() as u64,
+                    security_buffer_len,
+                    error = ?error,
+                    "get_security_by_name callback failed"
+                ),
+            }
+        }
+
+        result
     }
 
     fn get_security(
@@ -1127,7 +1178,17 @@ impl FileSystemContext for StudioFsContext {
         _context: &Self::FileContext,
         security_descriptor: Option<&mut [c_void]>,
     ) -> winfsp::Result<u64> {
-        Ok(self.copy_sd_to_buffer(security_descriptor))
+        let trace_callback = callback_trace_enabled();
+        let security_buffer_len = security_descriptor.as_ref().map(|buf| buf.len());
+        let descriptor_len = self.copy_sd_to_buffer(security_descriptor);
+        if trace_callback {
+            info!(
+                security_buffer_len,
+                security_descriptor_len = descriptor_len,
+                "get_security callback complete"
+            );
+        }
+        Ok(descriptor_len)
     }
 
     fn open(
@@ -1137,32 +1198,94 @@ impl FileSystemContext for StudioFsContext {
         granted_access: FILE_ACCESS_RIGHTS,
         file_info: &mut OpenFileInfo,
     ) -> winfsp::Result<Self::FileContext> {
-        if maybe_hide_non_macos_root_path(&self.vfs, file_name)? {
-            return Err(winfsp::FspError::from(STATUS_OBJECT_NAME_NOT_FOUND));
+        let trace_callback = callback_trace_enabled();
+        let callback_started = trace_callback.then(Instant::now);
+        let trace_path = trace_callback.then(|| file_name.to_string_lossy());
+        if let Some(path) = trace_path.as_ref() {
+            info!(
+                path = %path,
+                create_options,
+                granted_access = ?granted_access,
+                "namespace open callback start"
+            );
         }
-        let attr = resolve_path(&self.vfs, file_name)?;
-        let open_flags = open_flags_from_access(granted_access, create_options);
-        let write_local_sync_policy = write_local_sync_policy_from_create_options(create_options);
-        Self::write_open_file_info(file_info, &attr);
-        let handle = self.open_file_handle_for_attr(&attr, open_flags, write_local_sync_policy)?;
-        let disable_os_cache =
-            should_disable_winfsp_file_cache(handle.is_dir, handle.open_flags, granted_access);
-        set_current_winfsp_open_disable_cache(disable_os_cache);
 
-        debug!(
-            ino = attr.ino,
-            fh = handle.fh,
-            is_dir = handle.is_dir,
-            open_flags = open_flags.bits(),
-            disable_os_cache,
-            "open"
-        );
-        Ok(handle)
+        let result = (|| {
+            if maybe_hide_non_macos_root_path(&self.vfs, file_name)? {
+                return Err(winfsp::FspError::from(STATUS_OBJECT_NAME_NOT_FOUND));
+            }
+            let attr = resolve_path(&self.vfs, file_name)?;
+            let open_flags = open_flags_from_access(granted_access, create_options);
+            let write_local_sync_policy =
+                write_local_sync_policy_from_create_options(create_options);
+            Self::write_open_file_info(file_info, &attr);
+            let handle =
+                self.open_file_handle_for_attr(&attr, open_flags, write_local_sync_policy)?;
+            let disable_os_cache =
+                should_disable_winfsp_file_cache(handle.is_dir, handle.open_flags, granted_access);
+            set_current_winfsp_open_disable_cache(disable_os_cache);
+
+            if let Some(path) = trace_path.as_ref() {
+                info!(
+                    path = %path,
+                    ino = attr.ino,
+                    fh = handle.fh,
+                    is_dir = handle.is_dir,
+                    create_options,
+                    granted_access = ?granted_access,
+                    open_flags = open_flags.bits(),
+                    disable_os_cache,
+                    "open cache policy"
+                );
+            }
+
+            debug!(
+                ino = attr.ino,
+                fh = handle.fh,
+                is_dir = handle.is_dir,
+                open_flags = open_flags.bits(),
+                disable_os_cache,
+                "open"
+            );
+            Ok(handle)
+        })();
+
+        if let (Some(path), Some(callback_started)) = (trace_path.as_ref(), callback_started) {
+            match &result {
+                Ok(handle) => info!(
+                    path = %path,
+                    ino = handle.ino,
+                    fh = handle.fh,
+                    is_dir = handle.is_dir,
+                    elapsed_ms = callback_started.elapsed().as_millis() as u64,
+                    "namespace open callback complete"
+                ),
+                Err(error) => warn!(
+                    path = %path,
+                    elapsed_ms = callback_started.elapsed().as_millis() as u64,
+                    error = ?error,
+                    "namespace open callback failed"
+                ),
+            }
+        }
+
+        result
     }
 
     fn close(&self, context: Self::FileContext) {
+        let trace_callback = callback_trace_enabled();
+        if trace_callback {
+            info!(ino = context.ino, fh = context.fh, "close callback start");
+        }
         debug!(ino = context.ino, fh = context.fh, "close");
         self.run_close_callback(context.ino, context.fh);
+        if trace_callback {
+            info!(
+                ino = context.ino,
+                fh = context.fh,
+                "close callback complete"
+            );
+        }
         drop(context);
     }
 
@@ -1178,6 +1301,17 @@ impl FileSystemContext for StudioFsContext {
         extra_buffer_is_reparse_point: bool,
         file_info: &mut OpenFileInfo,
     ) -> winfsp::Result<Self::FileContext> {
+        let trace_callback = callback_trace_enabled();
+        let trace_path = trace_callback.then(|| file_name.to_string_lossy());
+        if let Some(path) = trace_path.as_ref() {
+            info!(
+                path = %path,
+                create_options,
+                granted_access = ?granted_access,
+                "create callback start"
+            );
+        }
+
         if maybe_hide_non_macos_root_path(&self.vfs, file_name)? {
             return Err(winfsp::FspError::from(STATUS_OBJECT_NAME_NOT_FOUND));
         }
@@ -1192,6 +1326,20 @@ impl FileSystemContext for StudioFsContext {
         let disable_os_cache =
             should_disable_winfsp_file_cache(handle.is_dir, handle.open_flags, granted_access);
         set_current_winfsp_open_disable_cache(disable_os_cache);
+
+        if let Some(path) = trace_path.as_ref() {
+            info!(
+                path = %path,
+                ino = handle.ino,
+                fh = handle.fh,
+                is_dir = handle.is_dir,
+                create_options,
+                granted_access = ?granted_access,
+                open_flags = handle.open_flags.bits(),
+                disable_os_cache,
+                "create cache policy"
+            );
+        }
 
         debug!(
             ino = handle.ino,
@@ -1443,26 +1591,81 @@ impl FileSystemContext for StudioFsContext {
     fn set_delete(
         &self,
         context: &Self::FileContext,
-        _file_name: &U16CStr,
+        file_name: &U16CStr,
         delete_file: bool,
     ) -> winfsp::Result<()> {
-        if delete_file && context.is_dir {
-            let healed_orphans = self.heal_directory_orphans_for_delete(context.ino)?;
-            let entries = self.vfs.readdir(context.ino).map_err(vfs_to_winfsp_err)?;
-            debug!(
+        let trace_callback = callback_trace_enabled();
+        let callback_started = trace_callback.then(Instant::now);
+        let trace_path = trace_callback.then(|| file_name.to_string_lossy());
+        if let Some(path) = trace_path.as_ref() {
+            info!(
+                path = %path,
                 ino = context.ino,
-                healed_orphans,
-                remaining_entries = entries.len(),
-                "directory delete precheck"
+                fh = context.fh,
+                delete_file,
+                "set_delete callback start"
             );
-            if !entries.is_empty() {
-                return Err(winfsp::FspError::from(STATUS_DIRECTORY_NOT_EMPTY));
+        }
+
+        let result = (|| {
+            if delete_file && context.is_dir {
+                let healed_orphans = self.heal_directory_orphans_for_delete(context.ino)?;
+                let entries = self.vfs.readdir(context.ino).map_err(vfs_to_winfsp_err)?;
+                debug!(
+                    ino = context.ino,
+                    healed_orphans,
+                    remaining_entries = entries.len(),
+                    "directory delete precheck"
+                );
+                if !entries.is_empty() {
+                    return Err(winfsp::FspError::from(STATUS_DIRECTORY_NOT_EMPTY));
+                }
+            }
+            Ok(())
+        })();
+
+        if let (Some(path), Some(callback_started)) = (trace_path.as_ref(), callback_started) {
+            match &result {
+                Ok(()) => info!(
+                    path = %path,
+                    ino = context.ino,
+                    fh = context.fh,
+                    delete_file,
+                    elapsed_ms = callback_started.elapsed().as_millis() as u64,
+                    "set_delete callback complete"
+                ),
+                Err(error) => warn!(
+                    path = %path,
+                    ino = context.ino,
+                    fh = context.fh,
+                    delete_file,
+                    elapsed_ms = callback_started.elapsed().as_millis() as u64,
+                    error = ?error,
+                    "set_delete callback failed"
+                ),
             }
         }
-        Ok(())
+
+        result
     }
 
     fn cleanup(&self, context: &Self::FileContext, file_name: Option<&U16CStr>, flags: u32) {
+        let trace_callback = callback_trace_enabled();
+        let path = trace_callback.then(|| file_name.map(U16CStr::to_string_lossy));
+        if trace_callback {
+            let path = match &path {
+                Some(Some(path)) => path.as_ref(),
+                Some(None) => "<none>",
+                None => "<trace-disabled>",
+            };
+            info!(
+                path,
+                ino = context.ino,
+                fh = context.fh,
+                flags,
+                "cleanup callback start"
+            );
+        }
         // Current dirty-handle ordering is:
         //   write/overwrite -> optional flush -> cleanup(non-delete) -> close -> release_fh
         //
@@ -1471,6 +1674,20 @@ impl FileSystemContext for StudioFsContext {
         // deferred until an explicit `flush` or the mandatory last-handle
         // `close`/`release_fh` fallback drain.
         self.handle_drain().cleanup(context, file_name, flags);
+        if trace_callback {
+            let path = match &path {
+                Some(Some(path)) => path.as_ref(),
+                Some(None) => "<none>",
+                None => "<trace-disabled>",
+            };
+            info!(
+                path,
+                ino = context.ino,
+                fh = context.fh,
+                flags,
+                "cleanup callback complete"
+            );
+        }
     }
 
     fn overwrite(
@@ -1585,6 +1802,13 @@ impl FileSystemContext for StudioFsContext {
         new_file_name: &U16CStr,
         _replace_if_exists: bool,
     ) -> winfsp::Result<()> {
+        let trace_callback = callback_trace_enabled();
+        let callback_started = trace_callback.then(Instant::now);
+        let trace_paths =
+            trace_callback.then(|| (file_name.to_string_lossy(), new_file_name.to_string_lossy()));
+        if let Some((old_path, new_path)) = trace_paths.as_ref() {
+            info!(old_path = %old_path, new_path = %new_path, "rename callback start");
+        }
         if maybe_hide_non_macos_root_path(&self.vfs, file_name)?
             || maybe_hide_non_macos_root_path(&self.vfs, new_file_name)?
         {
@@ -1592,13 +1816,35 @@ impl FileSystemContext for StudioFsContext {
         }
         let plan = self.resolve_rename_callback_plan(file_name, new_file_name)?;
 
-        self.execute_rename_callback_plan(plan)?;
+        let result = self.execute_rename_callback_plan(plan);
+        if let (Some((old_path, new_path)), Some(callback_started)) =
+            (trace_paths.as_ref(), callback_started)
+        {
+            match &result {
+                Ok(()) => info!(
+                    old_path = %old_path,
+                    new_path = %new_path,
+                    elapsed_ms = callback_started.elapsed().as_millis() as u64,
+                    "rename callback complete"
+                ),
+                Err(error) => warn!(
+                    old_path = %old_path,
+                    new_path = %new_path,
+                    elapsed_ms = callback_started.elapsed().as_millis() as u64,
+                    error = ?error,
+                    "rename callback failed"
+                ),
+            }
+        }
+        result?;
 
-        debug!(
-            "rename {:?} -> {:?}",
-            file_name.to_string_lossy(),
-            new_file_name.to_string_lossy()
-        );
+        if tracing::enabled!(Level::DEBUG) {
+            debug!(
+                "rename {:?} -> {:?}",
+                file_name.to_string_lossy(),
+                new_file_name.to_string_lossy()
+            );
+        }
         Ok(())
     }
 
@@ -3004,6 +3250,19 @@ mod tests {
         assert!(
             flush_barrier_calls(&vfs) == flush_calls_before,
             "last-handle close must not run the local barrier before returning to WinFSP"
+        );
+        assert!(
+            {
+                let vfs = ctx.vfs.clone();
+                let read = ctx
+                    .spawn_wait(async move {
+                        vfs.read(attr.ino, 0, b"buffered-cleanup-close".len() as u32)
+                            .await
+                    })
+                    .expect("read immediately after WinFSP close");
+                read.as_ref() == b"buffered-cleanup-close"
+            },
+            "read immediately after deferred WinFSP close must still see buffered bytes"
         );
         assert!(
             vfs.inode_has_local_dirty_state(attr.ino),
