@@ -1198,8 +1198,7 @@ impl FileSystemContext for StudioFsContext {
         granted_access: FILE_ACCESS_RIGHTS,
         file_info: &mut OpenFileInfo,
     ) -> winfsp::Result<Self::FileContext> {
-        let trace_callback =
-            callback_trace_enabled() && access_can_mutate_namespace(granted_access);
+        let trace_callback = callback_trace_enabled();
         let callback_started = trace_callback.then(Instant::now);
         let trace_path = trace_callback.then(|| file_name.to_string_lossy());
         if let Some(path) = trace_path.as_ref() {
@@ -1225,6 +1224,20 @@ impl FileSystemContext for StudioFsContext {
             let disable_os_cache =
                 should_disable_winfsp_file_cache(handle.is_dir, handle.open_flags, granted_access);
             set_current_winfsp_open_disable_cache(disable_os_cache);
+
+            if let Some(path) = trace_path.as_ref() {
+                info!(
+                    path = %path,
+                    ino = attr.ino,
+                    fh = handle.fh,
+                    is_dir = handle.is_dir,
+                    create_options,
+                    granted_access = ?granted_access,
+                    open_flags = open_flags.bits(),
+                    disable_os_cache,
+                    "open cache policy"
+                );
+            }
 
             debug!(
                 ino = attr.ino,
@@ -1288,6 +1301,17 @@ impl FileSystemContext for StudioFsContext {
         extra_buffer_is_reparse_point: bool,
         file_info: &mut OpenFileInfo,
     ) -> winfsp::Result<Self::FileContext> {
+        let trace_callback = callback_trace_enabled();
+        let trace_path = trace_callback.then(|| file_name.to_string_lossy());
+        if let Some(path) = trace_path.as_ref() {
+            info!(
+                path = %path,
+                create_options,
+                granted_access = ?granted_access,
+                "create callback start"
+            );
+        }
+
         if maybe_hide_non_macos_root_path(&self.vfs, file_name)? {
             return Err(winfsp::FspError::from(STATUS_OBJECT_NAME_NOT_FOUND));
         }
@@ -1302,6 +1326,20 @@ impl FileSystemContext for StudioFsContext {
         let disable_os_cache =
             should_disable_winfsp_file_cache(handle.is_dir, handle.open_flags, granted_access);
         set_current_winfsp_open_disable_cache(disable_os_cache);
+
+        if let Some(path) = trace_path.as_ref() {
+            info!(
+                path = %path,
+                ino = handle.ino,
+                fh = handle.fh,
+                is_dir = handle.is_dir,
+                create_options,
+                granted_access = ?granted_access,
+                open_flags = handle.open_flags.bits(),
+                disable_os_cache,
+                "create cache policy"
+            );
+        }
 
         debug!(
             ino = handle.ino,

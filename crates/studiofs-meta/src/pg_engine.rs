@@ -2404,12 +2404,45 @@ impl PgMetaEngine {
     }
 
     fn project_remote_events(events: &[MetaEvent]) -> Vec<MetaEvent> {
+        let mut hidden_regular_inodes = HashSet::new();
+        let mut published_regular_inodes = HashSet::new();
+        for event in events {
+            match event {
+                MetaEvent::SetAttr { attr }
+                    if attr.kind == FileType::RegularFile
+                        && attr.committed_size == 0
+                        && attr.committed_content_epoch == 0
+                        && attr.size > 0 =>
+                {
+                    hidden_regular_inodes.insert(attr.ino);
+                }
+                MetaEvent::SetAttr { attr }
+                    if attr.kind == FileType::RegularFile
+                        && attr.upload_state == UploadState::Ready
+                        && (attr.committed_size > 0 || attr.committed_content_epoch > 0) =>
+                {
+                    published_regular_inodes.insert(attr.ino);
+                }
+                MetaEvent::PublishRegularFileBaseSlices { ino, .. } => {
+                    published_regular_inodes.insert(*ino);
+                }
+                _ => {}
+            }
+        }
+        hidden_regular_inodes.retain(|ino| !published_regular_inodes.contains(ino));
+
         let mut out = Vec::with_capacity(events.len());
         for event in events {
             match event {
                 MetaEvent::SetRegularFileOverlaySlices { .. }
                 | MetaEvent::RemoveRegularFileGraph { .. } => {}
+                MetaEvent::AddEntry { entry, .. }
+                    if entry.kind == FileType::RegularFile
+                        && hidden_regular_inodes.contains(&entry.ino) => {}
                 MetaEvent::AddPendingDeletion { .. } | MetaEvent::RemovePendingDeletion { .. } => {}
+                MetaEvent::SetAttr { attr }
+                    if attr.kind == FileType::RegularFile
+                        && hidden_regular_inodes.contains(&attr.ino) => {}
                 MetaEvent::CreateSnapshot { snapshot } => {
                     let mut synced = snapshot.clone();
                     synced.state = SnapshotState::Synced;
@@ -2432,6 +2465,16 @@ impl PgMetaEngine {
     }
 
     fn remote_events_need_eager_flush(events: &[MetaEvent]) -> bool {
+        let regular_create_inodes: HashSet<Ino> = events
+            .iter()
+            .filter_map(|event| match event {
+                MetaEvent::AddEntry { entry, .. } if entry.kind == FileType::RegularFile => {
+                    Some(entry.ino)
+                }
+                _ => None,
+            })
+            .collect();
+
         events.iter().any(|event| match event {
             MetaEvent::SetRegularFileOverlaySlices { .. }
             | MetaEvent::RemoveRegularFileGraph { .. }
@@ -2439,15 +2482,17 @@ impl PgMetaEngine {
             | MetaEvent::RemovePendingDeletion { .. } => false,
             MetaEvent::SetAttr { attr } if attr.kind == FileType::RegularFile => {
                 attr.upload_state == UploadState::Ready
+                    && ((attr.committed_size > 0 || attr.committed_content_epoch > 0)
+                        || !regular_create_inodes.contains(&attr.ino))
             }
             MetaEvent::SetAttr { .. }
             | MetaEvent::RemoveAttr { .. }
-            | MetaEvent::AddEntry { .. }
             | MetaEvent::RemoveEntry { .. }
             | MetaEvent::RenameEntry { .. }
             | MetaEvent::PublishRegularFileBaseSlices { .. }
             | MetaEvent::CreateSnapshot { .. }
             | MetaEvent::UpdateSnapshotState { .. } => true,
+            MetaEvent::AddEntry { entry, .. } => entry.kind != FileType::RegularFile,
             MetaEvent::SetSymlinkTarget { .. }
             | MetaEvent::SetXattr { .. }
             | MetaEvent::RemoveXattr { .. }
@@ -5378,6 +5423,151 @@ mod tests {
     }
 
     #[test]
+    fn project_remote_events_hides_unpublished_regular_file_attrs() {
+        let mut attr = InodeAttr::new_file(42, ROOT_INO, 0, 0, 0o644);
+        attr.size = 8 * 1024 * 1024;
+        attr.committed_size = 0;
+        attr.content_epoch = 1;
+        attr.committed_content_epoch = 0;
+        attr.upload_state = UploadState::Uploading;
+        let events = vec![
+            MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: b"uploading.bin".to_vec(),
+                entry: DirEntryValue {
+                    ino: attr.ino,
+                    kind: FileType::RegularFile,
+                },
+            },
+            MetaEvent::SetAttr { attr },
+        ];
+
+        let projected = PgMetaEngine::project_remote_events(&events);
+        assert!(
+            projected.is_empty(),
+            "unpublished regular files must not appear remotely as zero-size files"
+        );
+    }
+
+    #[test]
+    fn project_remote_events_hides_create_then_unpublished_regular_file_attrs() {
+        let initial_attr = InodeAttr::new_file(42, ROOT_INO, 0, 0, 0o644);
+        let mut uploading_attr = initial_attr.clone();
+        uploading_attr.size = 8 * 1024 * 1024;
+        uploading_attr.committed_size = 0;
+        uploading_attr.content_epoch = 1;
+        uploading_attr.committed_content_epoch = 0;
+        uploading_attr.upload_state = UploadState::Uploading;
+        let events = vec![
+            MetaEvent::SetAttr { attr: initial_attr },
+            MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: b"uploading.bin".to_vec(),
+                entry: DirEntryValue {
+                    ino: uploading_attr.ino,
+                    kind: FileType::RegularFile,
+                },
+            },
+            MetaEvent::SetAttr {
+                attr: uploading_attr,
+            },
+        ];
+
+        let projected = PgMetaEngine::project_remote_events(&events);
+        assert!(
+            projected.is_empty(),
+            "create followed by unpublished upload state must not publish zero-size metadata"
+        );
+    }
+
+    #[test]
+    fn apply_empty_self_projection_keeps_unpublished_local_overlay_size() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+        let file = pg
+            .create_file(ROOT_INO, b"draft.bin", 0, 0, 0o644)
+            .expect("create file");
+        set_file_state(&pg, file.ino, 4096, 1);
+        pg.stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(501, 4096))
+            .expect("stage local payload");
+
+        let start = pg.flushed_event_seq.load(Ordering::SeqCst);
+        let end = pg.local.get_counter("nextEventSeq").expect("event end");
+        let events = pg.local.read_events_range(start, end).expect("events");
+        let projected = PgMetaEngine::project_remote_events(&events);
+        assert!(
+            projected.is_empty(),
+            "unpublished local draft must have no remote projection"
+        );
+        pg.persist_flushed_event_seq(end)
+            .expect("ack empty projection");
+
+        let attr = pg.get_attr(file.ino).expect("draft attr");
+        assert_eq!(attr.size, 4096);
+        assert_eq!(attr.committed_size, 0);
+        assert_eq!(attr.upload_state, UploadState::Uploading);
+    }
+
+    #[test]
+    fn apply_empty_self_projection_keeps_size_only_unpublished_local_overlay() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+        let file = pg
+            .create_file(ROOT_INO, b"draft.bin", 0, 0, 0o644)
+            .expect("create file");
+        let mut attr = pg.get_attr(file.ino).expect("get attr");
+        attr.size = 4096;
+        pg.set_attr(&attr).expect("set size-only attr");
+        pg.stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(501, 4096))
+            .expect("stage local payload");
+
+        let start = pg.flushed_event_seq.load(Ordering::SeqCst);
+        let end = pg.local.get_counter("nextEventSeq").expect("event end");
+        let events = pg.local.read_events_range(start, end).expect("events");
+        let projected = PgMetaEngine::project_remote_events(&events);
+        assert!(
+            projected.is_empty(),
+            "size-only unpublished local draft must have no remote projection"
+        );
+        pg.persist_flushed_event_seq(end)
+            .expect("ack empty projection");
+
+        let attr = pg.get_attr(file.ino).expect("draft attr");
+        assert_eq!(attr.size, 4096);
+        assert_eq!(attr.committed_size, 0);
+    }
+
+    #[test]
+    fn project_remote_events_keeps_published_regular_file_attrs() {
+        let mut attr = InodeAttr::new_file(42, ROOT_INO, 0, 0, 0o644);
+        attr.size = 8 * 1024 * 1024;
+        attr.committed_size = attr.size;
+        attr.content_epoch = 1;
+        attr.committed_content_epoch = 1;
+        attr.upload_state = UploadState::Ready;
+        let events = vec![
+            MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: b"published.bin".to_vec(),
+                entry: DirEntryValue {
+                    ino: attr.ino,
+                    kind: FileType::RegularFile,
+                },
+            },
+            MetaEvent::SetAttr { attr },
+        ];
+
+        let projected = PgMetaEngine::project_remote_events(&events);
+        assert_eq!(projected.len(), 2);
+        assert!(matches!(
+            projected.first(),
+            Some(MetaEvent::AddEntry { entry, .. }) if entry.ino == 42
+        ));
+        assert!(matches!(
+            projected.get(1),
+            Some(MetaEvent::SetAttr { attr }) if attr.size == 8 * 1024 * 1024
+        ));
+    }
+
+    #[test]
     fn self_batch_acknowledges_projected_prefix_with_filtered_overlay_events() {
         let (_dir, pg) = temp_pg_engine_for_unit();
         let file = pg
@@ -5427,10 +5617,7 @@ mod tests {
     #[test]
     fn foreign_rename_reconciles_serving_dentry_despite_local_attr_overlay() {
         let (_dir, pg) = temp_pg_engine_for_unit();
-        let file = pg
-            .create_file(ROOT_INO, b"rename-source.txt", 0, 0, 0o644)
-            .expect("create file");
-        set_file_state(&pg, file.ino, 28, 1);
+        let file = create_published_small_file(&pg, ROOT_INO, b"rename-source.txt", 77_099);
         publish_local_events_to_base(&pg);
 
         let mut local_attr = pg.get_attr(file.ino).expect("get attr");
@@ -7924,8 +8111,8 @@ mod tests {
 
         assert_eq!(
             pg.replication_backlog().pending_ops,
-            1,
-            "uploading attrs remain remote-visible metadata"
+            0,
+            "uploading-only attrs must not publish remote-visible zero-size metadata"
         );
         assert!(
             !*wakeup_lock.lock().expect("poll wakeup lock"),

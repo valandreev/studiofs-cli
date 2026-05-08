@@ -7067,6 +7067,53 @@ fn writer_stack_dirty_attrs_keep_nanos_timestamps() {
 }
 
 #[test]
+fn flush_fh_skips_stale_dirty_attr_that_would_shrink_current_size() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "flush-fh-stale-dirty-attr-size");
+    let attr = vfs
+        .create(1, b"flush-fh-stale-dirty-attr-size.txt", 0, 0, 0o644)
+        .expect("create test file");
+    let ino = attr.ino;
+    let fh = vfs
+        .open_file(ino, OpenFlags::RDWR, false)
+        .expect("open writable handle");
+
+    let mut current = meta.get_attr(ino).expect("load durable attr");
+    current.size = 1024 * 1024;
+    current.committed_size = current.size;
+    current.committed_content_epoch = current.content_epoch;
+    current.upload_state = MetaUploadState::Ready;
+    meta.set_attr(&current).expect("persist durable attr");
+
+    let mut stale = current.clone();
+    stale.size = 0;
+    stale.committed_size = 0;
+    stale.upload_state = MetaUploadState::Uploading;
+    vfs.state.namespace.dirty_attrs.lock().insert(ino, stale);
+
+    rt.block_on(async {
+        let _outcome = vfs
+            .flush_fh_with_outcome(fh)
+            .await
+            .expect("flush_fh with stale dirty attr");
+    });
+
+    let after = meta.get_attr(ino).expect("reload durable attr");
+    assert_eq!(
+        after.size, current.size,
+        "flush_fh must not shrink durable size using a stale dirty attr"
+    );
+    assert!(
+        !vfs.state.namespace.dirty_attrs.lock().contains_key(&ino),
+        "stale dirty attr should be discarded after it is rejected"
+    );
+
+    rt.block_on(async {
+        vfs.release_fh(fh).await.expect("release handle");
+    });
+}
+
+#[test]
 fn release_fh_enforces_strict_local_durability_on_last_handle() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "release-fh-fast-local-sync");

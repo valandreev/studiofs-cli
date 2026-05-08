@@ -743,13 +743,26 @@ impl StudioVfs {
             self.fail_inline_dirty_attr_persist_for_test()?;
             let meta = self.meta.clone();
             let attr_to_persist = attr.clone();
-            run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
-                engine.set_attr(&attr_to_persist)
+            let persisted = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+                if let Ok(current) = engine.get_attr(attr_to_persist.ino)
+                    && current.kind == FileType::RegularFile
+                    && attr_to_persist.kind == FileType::RegularFile
+                    && current.content_epoch >= attr_to_persist.content_epoch
+                    && current.size > attr_to_persist.size
+                {
+                    return Ok(false);
+                }
+                engine.set_attr(&attr_to_persist)?;
+                Ok(true)
             })
             .await?;
-            self.clear_matching_dirty_attr_if_committed(ino, &attr);
+            if persisted {
+                self.clear_matching_dirty_attr_if_committed(ino, &attr);
+            } else {
+                self.state.namespace.dirty_attrs.lock().remove(&ino);
+            }
             self.state.namespace.attr_read_cache.lock().remove(ino);
-            true
+            persisted
         } else {
             false
         };

@@ -42,7 +42,7 @@ Path walks are centralized in VFS `NamespaceResolver`:
 | Sector size | `4096` bytes by default. Override: `STUDIOFS_WINFSP_SECTOR_SIZE` |
 | Allocation unit size | `1048576` bytes by default. Override: `STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE` |
 | Max component length | 255 |
-| File info timeout | `0 ms` by default while kernel notifications are opt-in. Override: `STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS` (`-1`/`max` supported for targeted cache-manager experiments) |
+| File info timeout | WinFSP cache-manager default (`max`) for hot repeated reads. Override: `STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS` (`0` or small bounded values only for stale-attribute diagnostics) |
 | Dir info timeout | `1000 ms` by default. Override: `STUDIOFS_WINFSP_DIR_INFO_TIMEOUT_MS` (`-1`/`max` supported) |
 | Volume info timeout | `1000 ms` by default. Override: `STUDIOFS_WINFSP_VOLUME_INFO_TIMEOUT_MS` (`-1`/`max` supported) |
 | Allow open in kernel mode | Enabled by default. Override: `STUDIOFS_WINFSP_ALLOW_OPEN_IN_KERNEL_MODE` |
@@ -59,8 +59,8 @@ StudioFS disables WinFSP `FlushAndPurgeOnCleanup` by default to preserve the
 read cache between close callbacks. Write-capable file handles opt out of the
 WinFSP/Windows file cache at `Create`/`Open` time, while read-only handles keep
 the WinFSP cache-manager / fast-I/O path by default. Use a bounded
-`STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS` value only for targeted multi-client
-invalidation experiments.
+`STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS=0` value only for targeted stale-attribute
+diagnostics.
 
 Windows mount-point handling:
 - StudioFS requests Mount Manager drive syntax (`\\.\X:`) internally for drive-letter mounts.
@@ -116,9 +116,9 @@ WinFSP callback barrier semantics:
 - `cleanup` with delete finalizes `unlink()` / `rmdir()` in the cleanup callback itself.
 - WinFSP `FlushAndPurgeOnCleanup` is disabled at the driver layer by default,
   while write-capable handles set `Create.Opened.DisableCache` so writes bypass
-  the OS file cache. FileInfo caching is disabled by default while WinFSP
-  kernel notifications are opt-in; use `STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS`
-  only for targeted cache-manager throughput experiments.
+  the OS file cache. FileInfo caching uses WinFSP's cache-manager default while
+  kernel notifications are opt-in; use `STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS=0`
+  only for targeted stale-attribute diagnostics.
 - Non-delete `cleanup` callback handling in StudioFS is observational only; for real file handles it records that the callback happened, but any remaining writer state is deferred to a later explicit `flush` or the last-handle `close` / `release_fh()` path.
 - `fh == 0` contexts, such as directories, do not have a `release_fh()` fallback; they stay observational unless an explicit `flush` callback makes local state visible.
 - `close` is the release-path hook for WinFSP. It drains remaining local writer

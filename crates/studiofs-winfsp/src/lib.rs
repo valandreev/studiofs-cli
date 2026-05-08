@@ -14,7 +14,7 @@ pub use context::{StudioFsContext, WinfspKernelInvalidator};
 use thiserror::Error;
 use windows::Win32::System::LibraryLoader::LoadLibraryW;
 
-const DEFAULT_FILE_INFO_TIMEOUT_MS: u32 = 0;
+const DEFAULT_FILE_INFO_TIMEOUT_MS: u32 = u32::MAX;
 const DEFAULT_DIR_INFO_TIMEOUT_MS: u32 = 1000;
 const DEFAULT_VOLUME_INFO_TIMEOUT_MS: u32 = 1000;
 const DEFAULT_SECTOR_SIZE: u16 = 4096;
@@ -425,11 +425,11 @@ fn apply_volume_params(
     volume_params.file_info_timeout(options.file_info_timeout_ms);
     volume_params.dir_info_timeout(options.dir_info_timeout_ms);
     volume_params.volume_info_timeout(options.volume_info_timeout_ms);
-    // Keep file attributes uncached by default while WinFSP kernel notifications
-    // stay opt-in for SFS-388. An infinite FileInfo timeout without notify can
-    // leave Windows holding stale EOF/size after writeback or upload publish.
-    // Operators can still opt into a bounded or `max` timeout for targeted
-    // cache-manager throughput experiments.
+    // Keep WinFSP's cache-manager / fast-I/O path enabled by default. A zero or
+    // short FileInfo timeout prevents AJA-style repeated reads from reusing the
+    // OS cache across measurement passes. SFS-388 still keeps kernel
+    // notifications opt-in and serializes callbacks; the stale-size bug is
+    // handled at the metadata projection and local dirty-attr barriers.
     volume_params.flush_and_purge_on_cleanup(options.flush_and_purge_on_cleanup);
     Ok(())
 }
@@ -504,7 +504,7 @@ pub fn mount_and_serve(request: WinfspMountRequest) -> std::io::Result<()> {
     } else {
         "fine"
     };
-    tracing::info!(
+    tracing::debug!(
         mount_point = %mount_point,
         volume_label = %options.volume_label,
         file_info_timeout_ms = options.file_info_timeout_ms,
@@ -778,7 +778,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_mount_options_disables_file_info_cache_by_default_without_kernel_notify() {
+    fn parse_mount_options_defaults_to_winfsp_cache_manager_file_info_timeout() {
         let _guard = ENV_LOCK.lock().expect("env lock");
         // SAFETY: Tests are single-threaded via `_guard` and temporarily mutate
         // process environment variables for deterministic parsing behavior.
@@ -789,8 +789,9 @@ mod tests {
 
         let opts = parse_mount_options("StudioFS").expect("options");
         assert_eq!(
-            opts.file_info_timeout_ms, 0,
-            "FileInfo must not be cached indefinitely while kernel notifications are disabled"
+            opts.file_info_timeout_ms,
+            u32::MAX,
+            "FileInfo must keep WinFSP cache-manager reads hot by default"
         );
     }
 
