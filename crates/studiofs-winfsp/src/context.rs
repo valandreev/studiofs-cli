@@ -1119,10 +1119,10 @@ impl FileSystemContext for StudioFsContext {
         resolve_reparse_points: impl FnOnce(&U16CStr) -> Option<FileSecurity>,
     ) -> winfsp::Result<FileSecurity> {
         let trace_callback = callback_trace_enabled();
-        let path = file_name.to_string_lossy();
         let security_buffer_len = security_descriptor.as_ref().map(|buf| buf.len());
-        let callback_started = Instant::now();
-        if trace_callback {
+        let callback_started = trace_callback.then(Instant::now);
+        let trace_path = trace_callback.then(|| file_name.to_string_lossy());
+        if let Some(path) = trace_path.as_ref() {
             info!(
                 path = %path,
                 security_buffer_len,
@@ -1149,7 +1149,7 @@ impl FileSystemContext for StudioFsContext {
             })
         })();
 
-        if trace_callback {
+        if let (Some(path), Some(callback_started)) = (trace_path.as_ref(), callback_started) {
             match &result {
                 Ok(security) => info!(
                     path = %path,
@@ -1200,9 +1200,9 @@ impl FileSystemContext for StudioFsContext {
     ) -> winfsp::Result<Self::FileContext> {
         let trace_callback =
             callback_trace_enabled() && access_can_mutate_namespace(granted_access);
-        let path = file_name.to_string_lossy();
-        let callback_started = Instant::now();
-        if trace_callback {
+        let callback_started = trace_callback.then(Instant::now);
+        let trace_path = trace_callback.then(|| file_name.to_string_lossy());
+        if let Some(path) = trace_path.as_ref() {
             info!(
                 path = %path,
                 create_options,
@@ -1237,7 +1237,7 @@ impl FileSystemContext for StudioFsContext {
             Ok(handle)
         })();
 
-        if trace_callback {
+        if let (Some(path), Some(callback_started)) = (trace_path.as_ref(), callback_started) {
             match &result {
                 Ok(handle) => info!(
                     path = %path,
@@ -1557,9 +1557,9 @@ impl FileSystemContext for StudioFsContext {
         delete_file: bool,
     ) -> winfsp::Result<()> {
         let trace_callback = callback_trace_enabled();
-        let path = file_name.to_string_lossy();
-        let callback_started = Instant::now();
-        if trace_callback {
+        let callback_started = trace_callback.then(Instant::now);
+        let trace_path = trace_callback.then(|| file_name.to_string_lossy());
+        if let Some(path) = trace_path.as_ref() {
             info!(
                 path = %path,
                 ino = context.ino,
@@ -1586,7 +1586,7 @@ impl FileSystemContext for StudioFsContext {
             Ok(())
         })();
 
-        if trace_callback {
+        if let (Some(path), Some(callback_started)) = (trace_path.as_ref(), callback_started) {
             match &result {
                 Ok(()) => info!(
                     path = %path,
@@ -1613,8 +1613,8 @@ impl FileSystemContext for StudioFsContext {
 
     fn cleanup(&self, context: &Self::FileContext, file_name: Option<&U16CStr>, flags: u32) {
         let trace_callback = callback_trace_enabled();
-        let path = file_name.map(U16CStr::to_string_lossy);
-        if trace_callback {
+        let path = trace_callback.then(|| file_name.map(U16CStr::to_string_lossy));
+        if let Some(path) = path.as_ref() {
             info!(
                 path = path.as_deref().unwrap_or("<none>"),
                 ino = context.ino,
@@ -1631,7 +1631,7 @@ impl FileSystemContext for StudioFsContext {
         // deferred until an explicit `flush` or the mandatory last-handle
         // `close`/`release_fh` fallback drain.
         self.handle_drain().cleanup(context, file_name, flags);
-        if trace_callback {
+        if let Some(path) = path.as_ref() {
             info!(
                 path = path.as_deref().unwrap_or("<none>"),
                 ino = context.ino,
@@ -1754,10 +1754,13 @@ impl FileSystemContext for StudioFsContext {
         new_file_name: &U16CStr,
         _replace_if_exists: bool,
     ) -> winfsp::Result<()> {
-        let callback_started = Instant::now();
-        let old_path = file_name.to_string_lossy();
-        let new_path = new_file_name.to_string_lossy();
-        info!(old_path = %old_path, new_path = %new_path, "rename callback start");
+        let trace_callback = callback_trace_enabled();
+        let callback_started = trace_callback.then(Instant::now);
+        let trace_paths =
+            trace_callback.then(|| (file_name.to_string_lossy(), new_file_name.to_string_lossy()));
+        if let Some((old_path, new_path)) = trace_paths.as_ref() {
+            info!(old_path = %old_path, new_path = %new_path, "rename callback start");
+        }
         if maybe_hide_non_macos_root_path(&self.vfs, file_name)?
             || maybe_hide_non_macos_root_path(&self.vfs, new_file_name)?
         {
@@ -1766,20 +1769,24 @@ impl FileSystemContext for StudioFsContext {
         let plan = self.resolve_rename_callback_plan(file_name, new_file_name)?;
 
         let result = self.execute_rename_callback_plan(plan);
-        match &result {
-            Ok(()) => info!(
-                old_path = %old_path,
-                new_path = %new_path,
-                elapsed_ms = callback_started.elapsed().as_millis() as u64,
-                "rename callback complete"
-            ),
-            Err(error) => warn!(
-                old_path = %old_path,
-                new_path = %new_path,
-                elapsed_ms = callback_started.elapsed().as_millis() as u64,
-                error = ?error,
-                "rename callback failed"
-            ),
+        if let (Some((old_path, new_path)), Some(callback_started)) =
+            (trace_paths.as_ref(), callback_started)
+        {
+            match &result {
+                Ok(()) => info!(
+                    old_path = %old_path,
+                    new_path = %new_path,
+                    elapsed_ms = callback_started.elapsed().as_millis() as u64,
+                    "rename callback complete"
+                ),
+                Err(error) => warn!(
+                    old_path = %old_path,
+                    new_path = %new_path,
+                    elapsed_ms = callback_started.elapsed().as_millis() as u64,
+                    error = ?error,
+                    "rename callback failed"
+                ),
+            }
         }
         result?;
 
