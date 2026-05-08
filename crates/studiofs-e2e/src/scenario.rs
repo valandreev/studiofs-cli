@@ -8073,10 +8073,7 @@ fn establish_collision_initial_tree(
     }
     for (relative_path, payload) in kind.initial_paths() {
         let path = client.mount_point.join(relative_path);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(path, payload)?;
+        write_mounted_chaos_initial_file(path, payload)?;
     }
     Ok(())
 }
@@ -9636,6 +9633,25 @@ mod tests {
         assert!(
             matches!(&err, ScenarioError::Io(error) if error.kind() == io::ErrorKind::AlreadyExists),
             "expected stale warmup file to be rejected before convergence validation, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn namespace_collision_initial_tree_rejects_stale_initial_file() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-collision");
+        let mount = temp.path().join("mounts").join("client-a");
+        let stale_file = mount.join("shared").join("data.txt");
+        std::fs::create_dir_all(stale_file.parent().unwrap()).unwrap();
+        std::fs::write(&stale_file, []).unwrap();
+        let client = client_spec_for(&sandbox, "projectfs", "client-a", mount);
+
+        let err = establish_collision_initial_tree(NamespaceCollisionKind::UnlinkVsAppend, &client)
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, ScenarioError::Io(error) if error.kind() == io::ErrorKind::AlreadyExists),
+            "expected stale collision initial file to be rejected before convergence validation, got {err:?}"
         );
     }
 

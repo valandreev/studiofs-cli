@@ -602,6 +602,38 @@ pub struct VfsPortableAllocatorStats {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 /// Struct $name.
+pub struct VfsMetadataInvalidationStats {
+    #[serde(default)]
+    /// Number of PostgreSQL metadata NOTIFY messages received by this client.
+    pub notifications_received: u64,
+    #[serde(default)]
+    /// Number of metadata listener reconnect attempts after the first listen.
+    pub listener_reconnects: u64,
+    #[serde(default)]
+    /// Number of fallback polls that discovered remote metadata changes.
+    pub fallback_poll_discoveries: u64,
+    #[serde(default)]
+    /// Number of metadata invalidation sync attempts that failed.
+    pub sync_errors: u64,
+    #[serde(default)]
+    /// Unix timestamp in milliseconds for the last successful metadata sync.
+    pub last_successful_sync_unix_ms: Option<i64>,
+    #[serde(default)]
+    /// Local namespace version token observed by this mounted client.
+    pub namespace_version_token: Option<String>,
+    #[serde(default)]
+    /// Local metadata version token observed by this mounted client.
+    pub metadata_version_token: Option<String>,
+    #[serde(default)]
+    /// Metadata operations queued for remote flush.
+    pub pending_metadata_ops: u32,
+    #[serde(default)]
+    /// Metadata operations currently being flushed.
+    pub inflight_metadata_ops: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// Struct $name.
 pub struct VfsWritePathObservabilitySnapshot {
     #[serde(default)]
     /// Field $name.
@@ -664,6 +696,9 @@ pub struct VfsWritePathObservabilitySnapshot {
     #[serde(default)]
     /// Field $name.
     pub metadata_commit_cadence: VfsWritePathCadenceStats,
+    #[serde(default)]
+    /// Metadata invalidation listener and fallback-poll diagnostics.
+    pub metadata_invalidation: VfsMetadataInvalidationStats,
     #[serde(default)]
     /// Field $name.
     pub eager_flush: VfsWritePathEagerFlushStats,

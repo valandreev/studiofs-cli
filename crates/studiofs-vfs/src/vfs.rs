@@ -64,14 +64,15 @@ pub use locking::LockKind;
 pub use metrics::{
     StatFs, VfsAttrReadCacheSnapshot, VfsCacheStateSnapshot, VfsFetchStats,
     VfsForegroundReadProtectionStats, VfsIngressLane, VfsIngressPressure, VfsIngressStats,
-    VfsLatencyHistogramSnapshot, VfsNamespaceCacheSnapshot, VfsPortableAllocatorStats,
-    VfsRuntimeEvent, VfsSynchronizationStateSnapshot, VfsTransitMemorySnapshot, VfsUploadStats,
-    VfsWritePathBackpressureStats, VfsWritePathBurstStats, VfsWritePathCadenceStats,
-    VfsWritePathDirtyPressureStats, VfsWritePathDrainLagStats, VfsWritePathEagerFlushStats,
-    VfsWritePathLandingZoneStats, VfsWritePathLatencyQuantilesMs,
-    VfsWritePathLatencyQuantilesSaturated, VfsWritePathLocalCacheIoStats,
-    VfsWritePathObservabilitySnapshot, VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats,
-    VfsWritePathTuningStats, VfsWritePathVfsWriteStats, VfsWritePathWinfspCallbackStats,
+    VfsLatencyHistogramSnapshot, VfsMetadataInvalidationStats, VfsNamespaceCacheSnapshot,
+    VfsPortableAllocatorStats, VfsRuntimeEvent, VfsSynchronizationStateSnapshot,
+    VfsTransitMemorySnapshot, VfsUploadStats, VfsWritePathBackpressureStats,
+    VfsWritePathBurstStats, VfsWritePathCadenceStats, VfsWritePathDirtyPressureStats,
+    VfsWritePathDrainLagStats, VfsWritePathEagerFlushStats, VfsWritePathLandingZoneStats,
+    VfsWritePathLatencyQuantilesMs, VfsWritePathLatencyQuantilesSaturated,
+    VfsWritePathLocalCacheIoStats, VfsWritePathObservabilitySnapshot,
+    VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats, VfsWritePathTuningStats,
+    VfsWritePathVfsWriteStats, VfsWritePathWinfspCallbackStats,
     VfsWritePathWinfspForegroundFlushStats, VfsWritePathWinfspWritePathStats,
     VfsZeroIoCacheBytesSnapshot, VfsZeroIoDrilldownEntry, VfsZeroIoHealthSignal,
     VfsZeroIoRuntimeSnapshot, VfsZeroIoShutdownSnapshot, VfsZeroIoStartupReplaySnapshot,
@@ -7255,6 +7256,11 @@ impl StudioVfs {
         let writer_stack_dirty_bytes = self.state.writer_stack.total_dirty_bytes();
         let total_dirty_bytes = pending_local_dirty_bytes.saturating_add(writer_stack_dirty_bytes);
         let upload_stats = self.upload_stats();
+        let meta = self.sync_meta();
+        let metadata_invalidation_diagnostics = meta.metadata_invalidation_diagnostics();
+        let metadata_replication_backlog = meta.replication_backlog();
+        let metadata_version_token = meta.metadata_version_token();
+        let namespace_version_token = meta.namespace_version_token();
         let fetch_metrics = &self.fetch_scheduler.metrics;
         let fetch_cache_hits = fetch_metrics.cache_hits.load(Ordering::Relaxed);
         let fetch_s3_fetches = fetch_metrics.s3_fetches.load(Ordering::Relaxed);
@@ -7832,6 +7838,19 @@ impl StudioVfs {
                 metadata_commit_interval_histogram,
                 elapsed,
             ),
+            metadata_invalidation: VfsMetadataInvalidationStats {
+                notifications_received: metadata_invalidation_diagnostics.notifications_received,
+                listener_reconnects: metadata_invalidation_diagnostics.listener_reconnects,
+                fallback_poll_discoveries: metadata_invalidation_diagnostics
+                    .fallback_poll_discoveries,
+                sync_errors: metadata_invalidation_diagnostics.sync_errors,
+                last_successful_sync_unix_ms: metadata_invalidation_diagnostics
+                    .last_successful_sync_unix_ms,
+                namespace_version_token,
+                metadata_version_token,
+                pending_metadata_ops: metadata_replication_backlog.pending_ops,
+                inflight_metadata_ops: metadata_replication_backlog.inflight_ops,
+            },
             eager_flush: VfsWritePathEagerFlushStats {
                 checks: eager_flush_checks,
                 triggered: eager_flush_triggered,

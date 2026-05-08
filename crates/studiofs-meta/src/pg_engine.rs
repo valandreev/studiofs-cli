@@ -31,6 +31,20 @@ const LOCAL_PG_INODE_PREFETCHED_WINDOW_NEXT_COUNTER: &str = "pgInodePrefetchedWi
 const LOCAL_PG_INODE_PREFETCHED_WINDOW_END_COUNTER: &str = "pgInodePrefetchedWindowEnd";
 const PG_NEXT_CLIENT_SLOT_COUNTER: &str = "next_client_slot";
 const PG_NEXT_INODE_COUNTER: &str = "next_inode";
+const PG_LOCAL_ONLY_SNAPSHOT_COUNTERS: &[&str] = &[
+    counters::NEXT_INODE,
+    counters::NEXT_OBJECT_ID,
+    LOCAL_PG_CLIENT_SLOT_COUNTER,
+    LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER,
+    LEGACY_LOCAL_PG_INODE_ACTIVE_RANGE_START_COUNTER,
+    LEGACY_LOCAL_PG_INODE_ACTIVE_RANGE_END_COUNTER,
+    LEGACY_LOCAL_PG_INODE_RESERVED_RANGE_END_COUNTER,
+    LOCAL_PG_INODE_CURRENT_WINDOW_START_COUNTER,
+    LOCAL_PG_INODE_CURRENT_WINDOW_END_COUNTER,
+    LOCAL_PG_INODE_PREFETCHED_WINDOW_START_COUNTER,
+    LOCAL_PG_INODE_PREFETCHED_WINDOW_NEXT_COUNTER,
+    LOCAL_PG_INODE_PREFETCHED_WINDOW_END_COUNTER,
+];
 const DEFAULT_PG_FLUSH_INTERVAL_SECS: u64 = 60;
 const DEFAULT_PG_FLUSH_OPS_THRESHOLD: u32 = 500;
 const PG_EVENT_INSERT_CHUNK_SIZE: usize = 512;
@@ -612,6 +626,35 @@ impl PgMetaEngine {
     fn persist_inode_allocator_state(&self, state: InodeAllocatorState) -> MetaResult<()> {
         self.local
             .write_counters(|counters| Self::persist_inode_allocator_state_locked(counters, state))
+    }
+
+    fn strip_pg_local_snapshot_counters(snapshot: &mut RedbSnapshot) {
+        snapshot
+            .counters
+            .retain(|(name, _)| !PG_LOCAL_ONLY_SNAPSHOT_COUNTERS.contains(&name.as_str()));
+    }
+
+    fn pg_local_snapshot_counter_values(&self) -> MetaResult<Vec<(&'static str, u64)>> {
+        PG_LOCAL_ONLY_SNAPSHOT_COUNTERS
+            .iter()
+            .map(|name| self.local.get_counter(name).map(|value| (*name, value)))
+            .collect()
+    }
+
+    fn import_remote_snapshot_preserving_pg_local_counters(
+        &self,
+        snapshot: &RedbSnapshot,
+    ) -> MetaResult<()> {
+        let preserved = self.pg_local_snapshot_counter_values()?;
+        let mut snapshot = snapshot.clone();
+        Self::strip_pg_local_snapshot_counters(&mut snapshot);
+        self.local.import_remote_snapshot(&snapshot)?;
+        self.local.write_counters(|counters| {
+            for (name, value) in preserved {
+                counters.set(name, value)?;
+            }
+            Ok(())
+        })
     }
 
     fn update_inode_headroom_flag(&self, state: InodeAllocatorState) {
@@ -3190,7 +3233,7 @@ impl PgMetaEngine {
         let bytes: Vec<u8> = row.get(1);
 
         let snapshot = Self::decode_snapshot(&bytes)?;
-        self.local.import_remote_snapshot(&snapshot)?;
+        self.import_remote_snapshot_preserving_pg_local_counters(&snapshot)?;
         self.persist_local_version(version)?;
         Ok(true)
     }
@@ -3409,7 +3452,8 @@ impl PgMetaEngine {
     fn write_checkpoint_locked(&self) -> MetaResult<()> {
         let postgres_url = self.postgres_url.clone();
         let volume_id = self.volume_id;
-        let snapshot = self.local.export_remote_snapshot()?;
+        let mut snapshot = self.local.export_remote_snapshot()?;
+        Self::strip_pg_local_snapshot_counters(&mut snapshot);
         let payload = serde_json::to_vec(&snapshot)
             .map_err(|e| MetaError::Serialization(format!("snapshot encode failed: {e}")))?;
         let version = self.local_version.load(Ordering::SeqCst);
@@ -6302,6 +6346,135 @@ mod tests {
         engine.update_inode_headroom_flag(inode_state);
 
         (dir, engine)
+    }
+
+    fn set_snapshot_counter(snapshot: &mut RedbSnapshot, name: &str, value: u64) {
+        if let Some((_, existing)) = snapshot
+            .counters
+            .iter_mut()
+            .find(|(candidate, _)| candidate == name)
+        {
+            *existing = value;
+        } else {
+            snapshot.counters.push((name.to_string(), value));
+        }
+    }
+
+    fn snapshot_counter(snapshot: &RedbSnapshot, name: &str) -> Option<u64> {
+        snapshot
+            .counters
+            .iter()
+            .find_map(|(candidate, value)| (candidate == name).then_some(*value))
+    }
+
+    #[test]
+    fn pg_remote_snapshot_strips_local_inode_allocator_counters() {
+        let mut snapshot = RedbSnapshot::default();
+        set_snapshot_counter(&mut snapshot, counters::NEXT_INODE, 101);
+        set_snapshot_counter(&mut snapshot, counters::NEXT_OBJECT_ID, 102);
+        set_snapshot_counter(&mut snapshot, LOCAL_PG_CLIENT_SLOT_COUNTER, 103);
+        set_snapshot_counter(&mut snapshot, LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER, 104);
+        set_snapshot_counter(
+            &mut snapshot,
+            LOCAL_PG_INODE_CURRENT_WINDOW_START_COUNTER,
+            105,
+        );
+        set_snapshot_counter(
+            &mut snapshot,
+            LOCAL_PG_INODE_CURRENT_WINDOW_END_COUNTER,
+            106,
+        );
+        set_snapshot_counter(
+            &mut snapshot,
+            LOCAL_PG_INODE_PREFETCHED_WINDOW_START_COUNTER,
+            107,
+        );
+        set_snapshot_counter(
+            &mut snapshot,
+            LOCAL_PG_INODE_PREFETCHED_WINDOW_NEXT_COUNTER,
+            108,
+        );
+        set_snapshot_counter(
+            &mut snapshot,
+            LOCAL_PG_INODE_PREFETCHED_WINDOW_END_COUNTER,
+            109,
+        );
+        set_snapshot_counter(&mut snapshot, counters::TOTAL_INODES, 2);
+        set_snapshot_counter(&mut snapshot, LOCAL_PG_VERSION_COUNTER, 55);
+        set_snapshot_counter(&mut snapshot, LOCAL_PG_NAMESPACE_VERSION_COUNTER, 44);
+
+        PgMetaEngine::strip_pg_local_snapshot_counters(&mut snapshot);
+
+        for name in PG_LOCAL_ONLY_SNAPSHOT_COUNTERS {
+            assert_eq!(
+                snapshot_counter(&snapshot, name),
+                None,
+                "remote PG snapshots must not carry local-only counter {name}"
+            );
+        }
+        assert_eq!(snapshot_counter(&snapshot, counters::TOTAL_INODES), Some(2));
+        assert_eq!(
+            snapshot_counter(&snapshot, LOCAL_PG_VERSION_COUNTER),
+            Some(55)
+        );
+        assert_eq!(
+            snapshot_counter(&snapshot, LOCAL_PG_NAMESPACE_VERSION_COUNTER),
+            Some(44)
+        );
+    }
+
+    #[test]
+    fn pg_snapshot_import_preserves_local_inode_allocator_counters() {
+        let (_dir, engine) = temp_pg_engine_for_unit();
+        let preserved_next_inode = engine
+            .local
+            .get_counter(counters::NEXT_INODE)
+            .expect("local next inode");
+        let preserved_client_slot = engine
+            .local
+            .get_counter(LOCAL_PG_CLIENT_SLOT_COUNTER)
+            .expect("local client slot");
+        let preserved_window_end = engine
+            .local
+            .get_counter(LOCAL_PG_INODE_CURRENT_WINDOW_END_COUNTER)
+            .expect("local window end");
+
+        let mut snapshot = engine.local.export_remote_snapshot().expect("snapshot");
+        set_snapshot_counter(&mut snapshot, counters::NEXT_INODE, 900_001);
+        set_snapshot_counter(&mut snapshot, LOCAL_PG_CLIENT_SLOT_COUNTER, 99);
+        set_snapshot_counter(
+            &mut snapshot,
+            LOCAL_PG_INODE_CURRENT_WINDOW_END_COUNTER,
+            900_250,
+        );
+        set_snapshot_counter(&mut snapshot, counters::TOTAL_INODES, 17);
+
+        engine
+            .import_remote_snapshot_preserving_pg_local_counters(&snapshot)
+            .expect("import snapshot");
+
+        assert_eq!(
+            engine.local.get_counter(counters::NEXT_INODE).unwrap(),
+            preserved_next_inode
+        );
+        assert_eq!(
+            engine
+                .local
+                .get_counter(LOCAL_PG_CLIENT_SLOT_COUNTER)
+                .unwrap(),
+            preserved_client_slot
+        );
+        assert_eq!(
+            engine
+                .local
+                .get_counter(LOCAL_PG_INODE_CURRENT_WINDOW_END_COUNTER)
+                .unwrap(),
+            preserved_window_end
+        );
+        assert_eq!(
+            engine.local.get_counter(counters::TOTAL_INODES).unwrap(),
+            17
+        );
     }
 
     #[test]
