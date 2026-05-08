@@ -3212,6 +3212,19 @@ mod tests {
             "last-handle close must not run the local barrier before returning to WinFSP"
         );
         assert!(
+            {
+                let vfs = ctx.vfs.clone();
+                let read = ctx
+                    .spawn_wait(async move {
+                        vfs.read(attr.ino, 0, b"buffered-cleanup-close".len() as u32)
+                            .await
+                    })
+                    .expect("read immediately after WinFSP close");
+                read.as_ref() == b"buffered-cleanup-close"
+            },
+            "read immediately after deferred WinFSP close must still see buffered bytes"
+        );
+        assert!(
             vfs.inode_has_local_dirty_state(attr.ino),
             "last-handle close should leave dirty state to the deferred drain after returning"
         );
