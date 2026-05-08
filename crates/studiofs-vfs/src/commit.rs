@@ -3,6 +3,7 @@ use studiofs_meta::InodeLifecycleState;
 
 pub(super) struct CommitCoordinator;
 
+#[derive(Debug)]
 pub(super) enum EpochFinalizeStatus {
     Published,
     Deferred,

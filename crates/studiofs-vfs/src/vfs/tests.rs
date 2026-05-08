@@ -7454,6 +7454,80 @@ fn deferred_materialization_reschedules_write_that_arrives_while_inflight_finish
 }
 
 #[test]
+fn winfsp_style_overwrite_then_deferred_write_persists_visible_size() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "winfsp-overwrite-deferred-size");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"winfsp-overwrite-deferred-size.bin", 0, 0, 0o644)
+            .expect("create");
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).expect("open");
+        let payload = vec![0xE5; vfs.block_size as usize / 2];
+
+        vfs.setattr_with_handle(Some(fh), ino, SetattrArgs::size_only(0))
+            .expect("WinFSP overwrite logical-size reset");
+        vfs.write_fh_with_deferred_materialize(
+            fh,
+            ino,
+            0,
+            &payload,
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .expect("deferred write");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if vfs.state.writer_stack.dirty_bytes_for_inode(ino) == 0
+                    && !vfs.pending_uploads_for_inode(ino).is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("background materialization should publish local metadata");
+
+        let visible_attr = vfs.getattr(ino).expect("visible attr");
+        assert_eq!(visible_attr.size, payload.len() as u64);
+        let durable_attr = meta.get_attr(ino).expect("durable attr");
+        assert_eq!(
+            durable_attr.size,
+            payload.len() as u64,
+            "remount must not collapse a deferred WinFSP write back to the overwrite size"
+        );
+
+        let (content_epoch, _object_ids) = mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+        for pending in vfs.pending_uploads_snapshot() {
+            if pending.ino == ino && pending.content_epoch == content_epoch {
+                vfs.cached_store().complete_upload(&pending);
+            }
+        }
+        assert!(
+            vfs.pending_uploads_for_inode(ino).is_empty(),
+            "setup should simulate completed local uploads"
+        );
+        publish_current_file_graph(&meta, ino, content_epoch, &[]);
+        let published_attr = meta.get_attr(ino).expect("published attr");
+        assert_eq!(
+            published_attr.size,
+            payload.len() as u64,
+            "upload finalization must preserve the visible file size"
+        );
+        assert_eq!(
+            published_attr.committed_size,
+            payload.len() as u64,
+            "published base graph should cover the complete file"
+        );
+
+        vfs.release_fh(fh).await.expect("release");
+    });
+}
+
+#[test]
 fn strict_deferred_write_waits_for_inflight_materialization() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-301-strict-waits-inflight");
