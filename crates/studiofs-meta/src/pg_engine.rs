@@ -3066,8 +3066,7 @@ impl PgMetaEngine {
         let mut prefix_ackable = true;
         for event in &local_events {
             consumed_events = consumed_events.saturating_add(1);
-            let projected = Self::project_remote_events(std::slice::from_ref(event));
-            projected_prefix.extend(projected);
+            projected_prefix = Self::project_remote_events(&local_events[..consumed_events]);
             prefix_ackable &= Self::self_batch_event_fully_ackable(event, &retained_block_overlay);
             if prefix_ackable {
                 ackable_events = consumed_events;
@@ -3111,8 +3110,7 @@ impl PgMetaEngine {
         let mut prefix_ackable = true;
         for event in &local_events {
             consumed_events = consumed_events.saturating_add(1);
-            let projected = Self::project_remote_events(std::slice::from_ref(event));
-            projected_prefix.extend(projected);
+            projected_prefix = Self::project_remote_events(&local_events[..consumed_events]);
             prefix_ackable &= Self::self_batch_event_fully_ackable(event, &retained_block_overlay);
             if prefix_ackable {
                 ackable_events = consumed_events;

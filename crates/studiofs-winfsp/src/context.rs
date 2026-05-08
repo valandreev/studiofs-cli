@@ -19,7 +19,7 @@ use studiofs_vfs::{
     StudioVfs, classify_vfs_error, is_hidden_non_macos_root_metadata_name, normalize_attr_times,
 };
 use tokio::runtime::Handle;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{Level, debug, error, info, trace, warn};
 use windows::Win32::Foundation::NTSTATUS;
 use windows::Win32::Security::{
     Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -1838,11 +1838,13 @@ impl FileSystemContext for StudioFsContext {
         }
         result?;
 
-        debug!(
-            "rename {:?} -> {:?}",
-            file_name.to_string_lossy(),
-            new_file_name.to_string_lossy()
-        );
+        if tracing::enabled!(Level::DEBUG) {
+            debug!(
+                "rename {:?} -> {:?}",
+                file_name.to_string_lossy(),
+                new_file_name.to_string_lossy()
+            );
+        }
         Ok(())
     }
 

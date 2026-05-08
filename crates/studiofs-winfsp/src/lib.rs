@@ -27,6 +27,9 @@ const DEFAULT_PERSISTENT_ACLS: bool = false;
 // can reduce multi-threaded throughput, but avoids rename preflight hangs until
 // the notification/rename lock interaction has a narrower fix.
 const DEFAULT_COARSE_OPERATION_GUARD: bool = true;
+// Temporary SFS-388 mitigation: WinFSP kernel notifications stay opt-in because
+// the notification timer can interact with rename preflight before our callback
+// is posted. Re-enable by default only after that path has a narrower fix.
 const DEFAULT_KERNEL_NOTIFICATIONS: bool = false;
 const DEFAULT_SECTORS_PER_ALLOCATION_UNIT: u16 =
     (DEFAULT_ALLOCATION_UNIT_SIZE / DEFAULT_SECTOR_SIZE as u32) as u16;
