@@ -6,11 +6,12 @@ use std::io::{BufRead as _, BufReader, Read as _, Seek as _, SeekFrom, Write as 
 use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{SecondsFormat, Utc};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use studiofs_scenario::{
     OperationLogError, OperationLogWriter, OperationOutcome, ScenarioOperation,
 };
@@ -27,7 +28,7 @@ use crate::infra::{
 };
 use crate::report::{
     ArtifactReport, CleanupReport, EventRecord, HostReport, PreflightCheckReport, PreflightReport,
-    RunManifest, RunReport, RunnerReport, SandboxReport, ScenarioReport,
+    RunManifest, RunReport, RunnerReport, SandboxReport, ScenarioReport, StudiofsBinaryReport,
 };
 use crate::scenario::{self, ScenarioContext};
 
@@ -443,6 +444,8 @@ fn run_with_executor_and_mount_lock_dir(
             });
         }
     }
+    let (studiofs_bin_fingerprint, studiofs_bin_check) =
+        studiofs_bin_preflight_check(request.studiofs_bin.as_deref());
     let sandbox = root.join(&run_id);
     e2e_progress_fields(&[
         ("run", run_id.clone()),
@@ -492,6 +495,7 @@ fn run_with_executor_and_mount_lock_dir(
         compose_project: compose_project.as_deref(),
         allocated_ports: allocated_ports.clone(),
         studiofs_bin: request.studiofs_bin.as_deref(),
+        studiofs_bin_fingerprint: studiofs_bin_fingerprint.clone(),
         port_range: request.port_range.as_deref(),
         timeout: request.timeout.as_deref(),
         created_at: &started_at,
@@ -522,7 +526,13 @@ fn run_with_executor_and_mount_lock_dir(
             ("stage", "preflight".to_string()),
             ("phase", "mount_lock_failed".to_string()),
         ]);
-        prepare_failed_mount_lock_preflight(&sandbox, compose_stack.as_ref(), detail)?
+        prepare_failed_mount_lock_preflight(
+            &run_id,
+            &sandbox,
+            compose_stack.as_ref(),
+            studiofs_bin_check.clone(),
+            detail,
+        )?
     } else {
         e2e_progress_fields(&[
             ("run", run_id.clone()),
@@ -537,6 +547,7 @@ fn run_with_executor_and_mount_lock_dir(
             compose_stack.as_mut(),
             executor,
             default_mount_lock.as_ref(),
+            studiofs_bin_check.clone(),
         )?
     };
     let preflight = prepared_preflight.report;
@@ -560,6 +571,7 @@ fn run_with_executor_and_mount_lock_dir(
         compose_project: compose_project.as_deref(),
         allocated_ports: allocated_ports.clone(),
         studiofs_bin: request.studiofs_bin.as_deref(),
+        studiofs_bin_fingerprint: studiofs_bin_fingerprint.clone(),
         port_range: request.port_range.as_deref(),
         timeout: request.timeout.as_deref(),
         created_at: &started_at,
@@ -615,6 +627,7 @@ fn run_with_executor_and_mount_lock_dir(
             scenario_reports: Vec::new(),
             scenario_outcomes: Vec::new(),
             cleanup,
+            studiofs_bin_fingerprint,
         });
     }
     write_pretty_json(&sandbox.join("preflight.json"), &preflight)?;
@@ -741,6 +754,7 @@ fn run_with_executor_and_mount_lock_dir(
             scenario_reports: scenario_reports.clone(),
             scenario_outcomes: scenario_outcomes.clone(),
             cleanup: interim_cleanup,
+            studiofs_bin_fingerprint: studiofs_bin_fingerprint.clone(),
         })?;
     }
     let mut cleanup_actions = Vec::new();
@@ -786,6 +800,7 @@ fn run_with_executor_and_mount_lock_dir(
         scenario_reports,
         scenario_outcomes,
         cleanup,
+        studiofs_bin_fingerprint,
     })
 }
 
@@ -881,6 +896,7 @@ struct FinishRunInput {
     scenario_reports: Vec<ScenarioReport>,
     scenario_outcomes: Vec<ScenarioOutcome>,
     cleanup: CleanupReport,
+    studiofs_bin_fingerprint: Option<StudiofsBinaryReport>,
 }
 
 fn finish_run(input: FinishRunInput) -> Result<RunOutcome, RunnerError> {
@@ -899,6 +915,7 @@ fn finish_run(input: FinishRunInput) -> Result<RunOutcome, RunnerError> {
             version: env!("CARGO_PKG_VERSION").to_string(),
             git_sha: option_env!("GITHUB_SHA").unwrap_or("unknown").to_string(),
         },
+        studiofs_bin: input.studiofs_bin_fingerprint,
         host: HostReport {
             os: std::env::consts::OS.to_string(),
             arch: std::env::consts::ARCH.to_string(),
@@ -935,6 +952,89 @@ struct PreparedPreflight {
     compose_start_attempted: bool,
 }
 
+fn studiofs_bin_preflight_check(
+    studiofs_bin: Option<&Path>,
+) -> (Option<StudiofsBinaryReport>, Option<PreflightCheckReport>) {
+    let Some(path) = studiofs_bin else {
+        return (None, None);
+    };
+    match studiofs_bin_fingerprint(path) {
+        Ok(fingerprint) => {
+            let detail = studiofs_bin_fingerprint_detail(&fingerprint);
+            (
+                Some(fingerprint),
+                Some(PreflightCheckReport {
+                    name: "studiofs binary fingerprint".to_string(),
+                    status: RunStatus::Passed,
+                    detail,
+                }),
+            )
+        }
+        Err(error) => (
+            None,
+            Some(PreflightCheckReport {
+                name: "studiofs binary fingerprint".to_string(),
+                status: RunStatus::PreflightFailed,
+                detail: format!("path={} error={error}", path.display()),
+            }),
+        ),
+    }
+}
+
+fn studiofs_bin_fingerprint(path: &Path) -> Result<StudiofsBinaryReport, RunnerError> {
+    let canonical_path = path.canonicalize()?;
+    let metadata = fs::metadata(&canonical_path)?;
+    let modified_unix_ms = system_time_unix_ms(metadata.modified()?);
+    let mut file = fs::File::open(&canonical_path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let sha256 = hex_lower(&hasher.finalize());
+    Ok(StudiofsBinaryReport {
+        path: path.display().to_string(),
+        canonical_path: canonical_path.display().to_string(),
+        size_bytes: metadata.len(),
+        modified_unix_ms,
+        sha256,
+    })
+}
+
+fn studiofs_bin_fingerprint_detail(fingerprint: &StudiofsBinaryReport) -> String {
+    format!(
+        "path={} canonical_path={} size_bytes={} modified_unix_ms={} sha256={}",
+        fingerprint.path,
+        fingerprint.canonical_path,
+        fingerprint.size_bytes,
+        fingerprint.modified_unix_ms,
+        fingerprint.sha256
+    )
+}
+
+fn system_time_unix_ms(time: SystemTime) -> u64 {
+    u64::try_from(
+        time.duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
 fn prepare_preflight(
     run_id: &str,
     sandbox: &Path,
@@ -943,34 +1043,45 @@ fn prepare_preflight(
     compose_stack: Option<&mut DockerComposeStack>,
     executor: &dyn CommandExecutor,
     default_mount_lock: Option<&DefaultMountLock>,
+    studiofs_bin_check: Option<PreflightCheckReport>,
 ) -> Result<PreparedPreflight, RunnerError> {
     let Some(stack) = compose_stack else {
+        let mut checks = Vec::new();
+        if let Some(check) = studiofs_bin_check {
+            push_preflight_step_check(&mut checks, run_id, "studiofs_bin_fingerprint", check);
+        }
+        checks.push(PreflightCheckReport {
+            name: "runner-skeleton".to_string(),
+            status: RunStatus::Passed,
+            detail: match infra {
+                InfraMode::Disabled => "external infrastructure disabled for this run",
+                InfraMode::ExternalEnv => {
+                    "using caller-provided PostgreSQL and S3/RustFS settings from environment or .env"
+                }
+                InfraMode::Compose => "compose infrastructure was not started",
+            }
+            .to_string(),
+        });
+        let status = if checks.iter().any(|check| check.status != RunStatus::Passed) {
+            RunStatus::PreflightFailed
+        } else {
+            RunStatus::Passed
+        };
         write_pretty_json(
             &sandbox.join("ports.json"),
             &serde_json::json!({ "ports": [] }),
         )?;
         return Ok(PreparedPreflight {
-            report: PreflightReport {
-                status: RunStatus::Passed,
-                checks: vec![PreflightCheckReport {
-                    name: "runner-skeleton".to_string(),
-                    status: RunStatus::Passed,
-                    detail: match infra {
-                        InfraMode::Disabled => "external infrastructure disabled for this run",
-                        InfraMode::ExternalEnv => {
-                            "using caller-provided PostgreSQL and S3/RustFS settings from environment or .env"
-                        }
-                        InfraMode::Compose => "compose infrastructure was not started",
-                    }
-                    .to_string(),
-                }],
-            },
+            report: PreflightReport { status, checks },
             compose_start_attempted: false,
         });
     };
 
     stack.prepare_artifacts()?;
     let mut checks: Vec<_> = Vec::new();
+    if let Some(check) = studiofs_bin_check {
+        push_preflight_step_check(&mut checks, run_id, "studiofs_bin_fingerprint", check);
+    }
     if let Some(lock) = default_mount_lock {
         checks.push(PreflightCheckReport {
             name: "default Windows mounted E2E run lock".to_string(),
@@ -1143,8 +1254,10 @@ fn post_start_preflight_with_progress(
 }
 
 fn prepare_failed_mount_lock_preflight(
+    run_id: &str,
     sandbox: &Path,
     compose_stack: Option<&DockerComposeStack>,
+    studiofs_bin_check: Option<PreflightCheckReport>,
     detail: String,
 ) -> Result<PreparedPreflight, RunnerError> {
     if let Some(stack) = compose_stack {
@@ -1155,17 +1268,45 @@ fn prepare_failed_mount_lock_preflight(
             &serde_json::json!({ "ports": [] }),
         )?;
     }
+    let mut checks = Vec::new();
+    if let Some(check) = studiofs_bin_check {
+        push_preflight_step_check(&mut checks, run_id, "studiofs_bin_fingerprint", check);
+    }
+    checks.push(PreflightCheckReport {
+        name: "default Windows mounted E2E run lock".to_string(),
+        status: RunStatus::PreflightFailed,
+        detail,
+    });
     Ok(PreparedPreflight {
         report: PreflightReport {
             status: RunStatus::PreflightFailed,
-            checks: vec![PreflightCheckReport {
-                name: "default Windows mounted E2E run lock".to_string(),
-                status: RunStatus::PreflightFailed,
-                detail,
-            }],
+            checks,
         },
         compose_start_attempted: false,
     })
+}
+
+fn push_preflight_step_check(
+    checks: &mut Vec<PreflightCheckReport>,
+    run_id: &str,
+    step: &str,
+    check: PreflightCheckReport,
+) {
+    e2e_stage_step_progress(
+        run_id,
+        "preflight",
+        step,
+        preflight_step_status(check.status),
+    );
+    checks.push(check);
+}
+
+fn preflight_step_status(status: RunStatus) -> &'static str {
+    if status == RunStatus::Passed {
+        "Passed"
+    } else {
+        "Failed"
+    }
 }
 
 fn preflight_check_report(check: InfraCheck) -> PreflightCheckReport {
@@ -1627,6 +1768,7 @@ struct ManifestInput<'a> {
     compose_project: Option<&'a str>,
     allocated_ports: Vec<crate::infra::ServicePort>,
     studiofs_bin: Option<&'a Path>,
+    studiofs_bin_fingerprint: Option<StudiofsBinaryReport>,
     port_range: Option<&'a str>,
     timeout: Option<&'a str>,
     created_at: &'a str,
@@ -1653,6 +1795,7 @@ fn build_manifest(input: ManifestInput<'_>) -> RunManifest {
         compose_project: input.compose_project.map(str::to_string),
         allocated_ports: input.allocated_ports,
         studiofs_bin: input.studiofs_bin.map(|path| path.display().to_string()),
+        studiofs_bin_fingerprint: input.studiofs_bin_fingerprint,
         port_range: input.port_range.map(str::to_string),
         timeout: input.timeout.map(str::to_string),
         explicit_client_roots,
@@ -3137,6 +3280,104 @@ mod tests {
     }
 
     #[test]
+    fn studiofs_bin_preflight_reports_fingerprint() {
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("studiofs.exe");
+        fs::write(&bin, b"studiofs-test-binary").unwrap();
+
+        let (fingerprint, check) = studiofs_bin_preflight_check(Some(&bin));
+
+        let fingerprint = fingerprint.expect("fingerprint should be recorded");
+        assert_eq!(fingerprint.path, bin.display().to_string());
+        assert_eq!(fingerprint.size_bytes, 20);
+        assert_eq!(
+            fingerprint.sha256,
+            "babf491ea85eb483aacbae06a67e8e3c8cd8fc7da470eca166701d2964276205"
+        );
+        assert!(Path::new(&fingerprint.canonical_path).is_absolute());
+        let check = check.expect("preflight check should be recorded");
+        assert_eq!(check.name, "studiofs binary fingerprint");
+        assert_eq!(check.status, RunStatus::Passed);
+        assert!(check.detail.contains("size_bytes=20"));
+        assert!(check.detail.contains(&fingerprint.sha256));
+    }
+
+    #[test]
+    fn studiofs_bin_preflight_fails_when_binary_is_unreadable() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing-studiofs.exe");
+
+        let (fingerprint, check) = studiofs_bin_preflight_check(Some(&missing));
+
+        assert!(fingerprint.is_none());
+        let check = check.expect("preflight check should be recorded");
+        assert_eq!(check.name, "studiofs binary fingerprint");
+        assert_eq!(check.status, RunStatus::PreflightFailed);
+        assert!(check.detail.contains("missing-studiofs.exe"));
+    }
+
+    #[test]
+    fn run_records_studiofs_bin_fingerprint_in_artifacts() {
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("studiofs.exe");
+        fs::write(&bin, b"studiofs-test-binary").unwrap();
+        let executor = RecordingExecutor::default();
+
+        let outcome = run_with_executor_and_mount_lock_dir(
+            RunRequest {
+                root: temp.path().join("e2e-runs"),
+                run_id: Some("fingerprint-run".to_string()),
+                scenarios: vec![scenario::TEST_PASSING.to_string()],
+                seed: 373,
+                studiofs_bin: Some(bin.clone()),
+                platform: PlatformSelection::Auto,
+                retention: RetentionPolicy::Always,
+                report: None,
+                port_range: None,
+                timeout: Some("30s".to_string()),
+                infra: InfraMode::Disabled,
+            },
+            &executor,
+            &temp.path().join("mount-locks"),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.status, RunStatus::Passed);
+        let manifest = read_json_file::<RunManifest>(&outcome.sandbox.join("run.json")).unwrap();
+        let manifest_fingerprint = manifest
+            .studiofs_bin_fingerprint
+            .expect("manifest should record fingerprint");
+        assert_eq!(manifest_fingerprint.path, bin.display().to_string());
+        assert_eq!(
+            manifest_fingerprint.sha256,
+            "babf491ea85eb483aacbae06a67e8e3c8cd8fc7da470eca166701d2964276205"
+        );
+
+        let preflight =
+            read_json_file::<PreflightReport>(&outcome.sandbox.join("preflight.json")).unwrap();
+        let fingerprint_check = preflight
+            .checks
+            .iter()
+            .find(|check| check.name == "studiofs binary fingerprint")
+            .expect("preflight should include fingerprint check");
+        assert_eq!(fingerprint_check.status, RunStatus::Passed);
+        assert!(
+            fingerprint_check
+                .detail
+                .contains(&manifest_fingerprint.sha256)
+        );
+
+        let report = read_json_file::<RunReport>(&outcome.report_path).unwrap();
+        assert_eq!(
+            report
+                .studiofs_bin
+                .expect("report should record fingerprint")
+                .sha256,
+            manifest_fingerprint.sha256
+        );
+    }
+
+    #[test]
     fn run_one_compose_config_uses_scenario_scoped_client_sandbox() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("e2e-runs");
@@ -3169,6 +3410,7 @@ mod tests {
                 },
             ],
             studiofs_bin: Some(Path::new("target/debug/studiofs.exe")),
+            studiofs_bin_fingerprint: None,
             port_range: Some("29000-29100"),
             timeout: Some("30m"),
             created_at: "2026-05-08T00:00:00Z",
@@ -3868,6 +4110,7 @@ mod tests {
                 compose_project: Some("studiofs-e2e-interrupted-compose-run"),
                 allocated_ports: Vec::new(),
                 studiofs_bin: None,
+                studiofs_bin_fingerprint: None,
                 port_range: None,
                 timeout: None,
                 created_at: &timestamp(),
@@ -3948,6 +4191,7 @@ mod tests {
                 compose_project: Some("studiofs-e2e-stale-compose-run"),
                 allocated_ports: Vec::new(),
                 studiofs_bin: None,
+                studiofs_bin_fingerprint: None,
                 port_range: None,
                 timeout: None,
                 created_at: &timestamp(),
@@ -4023,6 +4267,7 @@ mod tests {
                 compose_project: Some("studiofs-e2e-retained-compose-run"),
                 allocated_ports: Vec::new(),
                 studiofs_bin: None,
+                studiofs_bin_fingerprint: None,
                 port_range: None,
                 timeout: None,
                 created_at: &timestamp(),
@@ -4097,6 +4342,7 @@ mod tests {
                 compose_project: Some("studiofs-e2e-malformed-cleanup-run"),
                 allocated_ports: Vec::new(),
                 studiofs_bin: None,
+                studiofs_bin_fingerprint: None,
                 port_range: None,
                 timeout: None,
                 created_at: &timestamp(),
@@ -4128,6 +4374,7 @@ mod tests {
                 compose_project: Some("studiofs-e2e-stale-compose-run"),
                 allocated_ports: Vec::new(),
                 studiofs_bin: None,
+                studiofs_bin_fingerprint: None,
                 port_range: None,
                 timeout: None,
                 created_at: &timestamp(),
@@ -4608,6 +4855,7 @@ mod tests {
                 compose_project: None,
                 allocated_ports: Vec::new(),
                 studiofs_bin: None,
+                studiofs_bin_fingerprint: None,
                 port_range: None,
                 timeout: Some("1ms"),
                 created_at: &timestamp(),
@@ -4724,6 +4972,7 @@ mod tests {
                 compose_project: None,
                 allocated_ports: Vec::new(),
                 studiofs_bin: None,
+                studiofs_bin_fingerprint: None,
                 port_range: None,
                 timeout: Some("30s"),
                 created_at: &timestamp(),

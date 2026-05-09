@@ -32,6 +32,9 @@ pub struct RunManifest {
     pub allocated_ports: Vec<ServicePort>,
     /// Field $name.
     pub studiofs_bin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
+    pub studiofs_bin_fingerprint: Option<StudiofsBinaryReport>,
     /// Field $name.
     pub port_range: Option<String>,
     /// Field $name.
@@ -65,6 +68,9 @@ pub struct RunReport {
     pub duration_ms: u64,
     /// Field $name.
     pub runner: RunnerReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
+    pub studiofs_bin: Option<StudiofsBinaryReport>,
     /// Field $name.
     pub host: HostReport,
     /// Field $name.
@@ -89,6 +95,21 @@ pub struct RunnerReport {
     pub version: String,
     /// Field $name.
     pub git_sha: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Product binary fingerprint recorded for reproducible E2E diagnostics.
+pub struct StudiofsBinaryReport {
+    /// Original path passed through `--studiofs-bin`.
+    pub path: String,
+    /// Canonical path resolved by the runner.
+    pub canonical_path: String,
+    /// File size in bytes.
+    pub size_bytes: u64,
+    /// Last modification time in Unix milliseconds.
+    pub modified_unix_ms: u64,
+    /// SHA-256 digest of the executable bytes.
+    pub sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -220,6 +241,7 @@ mod tests {
                 version: "0.1.0".to_string(),
                 git_sha: "unknown".to_string(),
             },
+            studiofs_bin: None,
             host: HostReport {
                 os: "windows".to_string(),
                 arch: "x86_64".to_string(),

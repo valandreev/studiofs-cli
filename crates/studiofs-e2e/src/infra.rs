@@ -668,7 +668,7 @@ impl DockerComposeStack {
         let mut collected = Vec::new();
         if self.collect_optional_command(
             executor,
-            "postgres metadata dump",
+            "postgres metadata schema dump",
             &[
                 "exec",
                 "-T",
@@ -684,7 +684,42 @@ impl DockerComposeStack {
             "postgres-schema.stderr.log",
             "postgres-schema.status.json",
         )? {
-            collected.push("postgres metadata dump".to_string());
+            collected.push("postgres metadata schema dump".to_string());
+        }
+        if self.collect_optional_command(
+            executor,
+            "postgres metadata data dump",
+            &[
+                "exec",
+                "-T",
+                POSTGRES_SERVICE_NAME,
+                "pg_dump",
+                "--username",
+                "studiofs",
+                "--dbname",
+                "studiofs",
+                "--data-only",
+                "--inserts",
+                "--table",
+                "public.volumes",
+                "--table",
+                "public.event_log",
+                "--table",
+                "public.metadata_state",
+                "--table",
+                "public.counters",
+                "--table",
+                "public.snapshots",
+                "--table",
+                "public.file_lock_leases",
+                "--table",
+                "public.acl_rules",
+            ],
+            "postgres-data.sql",
+            "postgres-data.stderr.log",
+            "postgres-data.status.json",
+        )? {
+            collected.push("postgres metadata data dump".to_string());
         }
         if self.collect_optional_command(
             executor,

@@ -141,7 +141,8 @@ fn compose_stack_lifecycle_collects_logs_and_tears_down_volumes() {
     assert_eq!(
         diagnostics,
         vec![
-            "postgres metadata dump".to_string(),
+            "postgres metadata schema dump".to_string(),
+            "postgres metadata data dump".to_string(),
             "rustfs object listing".to_string()
         ]
     );
@@ -153,6 +154,15 @@ fn compose_stack_lifecycle_collects_logs_and_tears_down_volumes() {
         )
         .unwrap(),
         "postgres schema\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(
+            temp.path()
+                .join("compose-lifecycle")
+                .join("artifacts/docker/postgres-data.sql")
+        )
+        .unwrap(),
+        "postgres data\n"
     );
     assert_eq!(
         std::fs::read_to_string(
@@ -249,7 +259,14 @@ fn optional_diagnostics_preserve_stdout_when_command_fails() {
         &std::fs::read(artifact_dir.join("postgres-schema.status.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(status["action"], "postgres metadata dump");
+    assert_eq!(status["action"], "postgres metadata schema dump");
+    assert_eq!(status["status"], 17);
+    assert_eq!(status["collected"], false);
+    let status: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(artifact_dir.join("postgres-data.status.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(status["action"], "postgres metadata data dump");
     assert_eq!(status["status"], 17);
     assert_eq!(status["collected"], false);
 }
@@ -376,8 +393,14 @@ struct RecordingExecutor {
 impl CommandExecutor for RecordingExecutor {
     fn run(&self, command: &studiofs_e2e::infra::CommandSpec) -> std::io::Result<CommandOutput> {
         self.calls.borrow_mut().push(command.clone());
-        let stdout = if command.args.contains(&"pg_dump".to_string()) {
+        let stdout = if command.args.contains(&"pg_dump".to_string())
+            && command.args.contains(&"--schema-only".to_string())
+        {
             "postgres schema\n"
+        } else if command.args.contains(&"pg_dump".to_string())
+            && command.args.contains(&"--data-only".to_string())
+        {
+            "postgres data\n"
         } else if command
             .args
             .contains(&"find /data -mindepth 1 -maxdepth 8 -print | sort".to_string())
