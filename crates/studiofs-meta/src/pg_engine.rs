@@ -2562,6 +2562,23 @@ impl PgMetaEngine {
         })
     }
 
+    fn batch_updates_remote_namespace_visibility(events: &[MetaEvent]) -> bool {
+        events.iter().any(|event| {
+            event.is_namespace_mutation()
+                || matches!(
+                    event,
+                    MetaEvent::PublishRegularFileBaseSlices { .. }
+                        | MetaEvent::RemoveRegularFileGraph { .. }
+                )
+                || matches!(
+                    event,
+                    MetaEvent::SetAttr { attr }
+                        if attr.kind == FileType::RegularFile
+                            && (attr.committed_size > 0 || attr.committed_content_epoch > 0)
+                )
+        })
+    }
+
     fn self_batch_event_fully_ackable(
         event: &MetaEvent,
         retained_block_overlay: &HashSet<Ino>,
@@ -3712,7 +3729,7 @@ impl PgMetaEngine {
                     overlay.clone()
                 };
                 applied_any |= self.apply_foreign_batch(&batch_events, &effective_overlay)?;
-                if batch_events.iter().any(MetaEvent::is_namespace_mutation) {
+                if Self::batch_updates_remote_namespace_visibility(&batch_events) {
                     max_namespace_version = max_namespace_version.max(batch_version);
                 }
             }
@@ -4009,6 +4026,16 @@ impl PgMetaEngine {
                 self.restore_pending_batch(batch);
                 Err(err)
             }
+        }
+    }
+
+    fn merge_recent_flush(acc: &mut Option<RecentFlush>, flush: RecentFlush) {
+        match acc {
+            Some(current) => {
+                current.batch_version = current.batch_version.max(flush.batch_version);
+                current.overlay = Self::merge_overlay_conflicts(&current.overlay, &flush.overlay);
+            }
+            None => *acc = Some(flush),
         }
     }
 
@@ -4960,11 +4987,12 @@ impl MetaReplication for PgMetaEngine {
             .replication_lock
             .lock()
             .map_err(|_| MetaError::Storage("pg replication lock poisoned".to_string()))?;
-        let recent_flush = if let Some(batch) = self.claim_pending_batch(true) {
-            self.flush_pending_claimed_batch_with_restore(batch)?
-        } else {
-            None
-        };
+        let mut recent_flush = None;
+        while let Some(batch) = self.claim_pending_batch(true) {
+            if let Some(flush) = self.flush_pending_claimed_batch_with_restore(batch)? {
+                Self::merge_recent_flush(&mut recent_flush, flush);
+            }
+        }
         let _ = self.pull_foreign_events_locked(recent_flush.as_ref())?;
         self.write_checkpoint_locked()?;
         Ok(())
@@ -6787,6 +6815,16 @@ mod tests {
             MetaEvent::SetAttr { attr },
             MetaEvent::PublishRegularFileBaseSlices { ino, chunk_slices },
         ]
+    }
+
+    #[test]
+    fn regular_publish_batch_updates_remote_namespace_visibility_token() {
+        let events = published_payload_events(42, 1, 64, 77_701);
+
+        assert!(
+            PgMetaEngine::batch_updates_remote_namespace_visibility(&events),
+            "publishing the first visible payload can make an existing regular-file dentry appear"
+        );
     }
 
     fn visible_object_id(engine: &PgMetaEngine, ino: Ino) -> u64 {

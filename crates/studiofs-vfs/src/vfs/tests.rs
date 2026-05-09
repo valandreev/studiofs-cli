@@ -6869,6 +6869,94 @@ fn flush_fh_default_config_enforces_strict_local_durability() {
 }
 
 #[test]
+fn winfsp_flush_callback_enforces_strict_local_durability() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = VfsConfig::default();
+    let (rt, vfs, _meta) =
+        make_test_vfs_with_config(&tmp, "winfsp-flush-callback-durable-local-sync", cfg);
+    let attr = vfs
+        .create(
+            1,
+            b"winfsp-flush-callback-durable-local-sync.txt",
+            0,
+            0,
+            0o644,
+        )
+        .expect("create test file");
+    let ino = attr.ino;
+    let fh = vfs
+        .open_file(ino, OpenFlags::RDWR, false)
+        .expect("open writable handle");
+
+    let mut dirty_attr = vfs.getattr(ino).expect("load attr");
+    dirty_attr.size = 4096;
+    dirty_attr.touch_mtime();
+    dirty_attr.touch_ctime();
+    vfs.state
+        .namespace
+        .dirty_attrs
+        .lock()
+        .insert(ino, dirty_attr.clone());
+
+    rt.block_on(async {
+        let mut group = vfs.state.local_dirty.local_sync_group.lock().await;
+        group.pending_bytes = 4096;
+        group.last_sync_at = Instant::now();
+    });
+
+    let calls_before = vfs
+        .state
+        .metrics
+        .payload_store_sync_data_calls
+        .load(Ordering::Relaxed);
+    let synced_before = vfs
+        .state
+        .metrics
+        .payload_store_sync_data_synced_bytes
+        .load(Ordering::Relaxed);
+
+    rt.block_on(async {
+        vfs.flush_winfsp_writeback_with_outcome(ino, fh)
+            .await
+            .expect("WinFSP flush callback barrier");
+    });
+
+    let calls_after = vfs
+        .state
+        .metrics
+        .payload_store_sync_data_calls
+        .load(Ordering::Relaxed);
+    let synced_after = vfs
+        .state
+        .metrics
+        .payload_store_sync_data_synced_bytes
+        .load(Ordering::Relaxed);
+    assert!(
+        calls_after > calls_before,
+        "WinFSP flush callback must force sync_data when dirty unpublished state remains"
+    );
+    assert!(
+        synced_after >= synced_before + 4096,
+        "WinFSP flush callback should account for pending local durable sync bytes"
+    );
+    rt.block_on(async {
+        let group = vfs.state.local_dirty.local_sync_group.lock().await;
+        assert_eq!(
+            group.pending_bytes, 0,
+            "WinFSP flush callback should drain pending local sync bytes"
+        );
+    });
+    assert!(
+        !vfs.state.namespace.dirty_attrs.lock().contains_key(&ino),
+        "WinFSP flush callback should commit dirty local attr state"
+    );
+
+    rt.block_on(async {
+        vfs.release_fh(fh).await.expect("release handle");
+    });
+}
+
+#[test]
 fn flush_fh_materializes_opportunistic_writer_stack_state_into_overlay_slices() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (rt, vfs, meta) = make_test_vfs(&tmp, "sfs-245-flush-writer-stack");

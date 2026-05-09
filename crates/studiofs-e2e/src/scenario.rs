@@ -1,7 +1,6 @@
 //! Scenario registry and lifecycle hooks for mounted E2E runs.
 
-use std::fs;
-use std::fs::OpenOptions;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 #[cfg(not(test))]
@@ -1933,9 +1932,13 @@ fn run_crash_restart_mode(
     poll_interval: Duration,
 ) -> Result<CrashRestartModeSummary, ScenarioError> {
     let crashed = &clients[0];
-    write_local_durable_payload(crashed.mount_point.join(relative_path), payload)?;
+    let durable_payload_handle = write_local_durable_payload_and_keep_handle(
+        crashed.mount_point.join(relative_path),
+        payload,
+    )?;
     let restart_started = Instant::now();
     driver.force_kill(&crashed.name)?;
+    drop(durable_payload_handle);
     driver.remount(&crashed.name)?;
     let local_read_payload = fs::read(crashed.mount_point.join(relative_path))?;
     if local_read_payload != payload {
@@ -2232,7 +2235,8 @@ fn run_publication_boundary(
     let writer = &clients[0];
     let relative_path = publication_boundary_file_name(boundary);
     let payload = publication_boundary_payload(context, boundary);
-    apply_publication_boundary(writer, relative_path, &payload, boundary)?;
+    let publication_boundary_handle =
+        apply_publication_boundary(writer, relative_path, &payload, boundary)?;
     if boundary == PublicationBoundary::ReleaseClose {
         wait_for_publication_boundary_release_close_drain(
             context,
@@ -2248,6 +2252,7 @@ fn run_publication_boundary(
     } else {
         driver.force_kill(&writer.name)?;
     }
+    drop(publication_boundary_handle);
 
     driver.remount(&writer.name)?;
     let local_read_payload = wait_for_mounted_payload_readback(
@@ -2309,7 +2314,7 @@ fn apply_publication_boundary(
     relative_path: &str,
     payload: &[u8],
     boundary: PublicationBoundary,
-) -> Result<(), ScenarioError> {
+) -> Result<Option<File>, ScenarioError> {
     let path = client.mount_point.join(relative_path);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -2322,15 +2327,24 @@ fn apply_publication_boundary(
         .open(&path)?;
     file.write_all(payload)?;
     match boundary {
-        PublicationBoundary::Flush => file.sync_data()?,
-        PublicationBoundary::Fsync => file.sync_all()?,
+        PublicationBoundary::Flush => {
+            file.sync_data()?;
+            Ok(Some(file))
+        }
+        PublicationBoundary::Fsync => {
+            file.sync_all()?;
+            Ok(Some(file))
+        }
         PublicationBoundary::ReleaseClose => {
             file.flush()?;
             drop(file);
+            Ok(None)
         }
-        PublicationBoundary::ShutdownDrain => file.sync_all()?,
+        PublicationBoundary::ShutdownDrain => {
+            file.sync_all()?;
+            Ok(None)
+        }
     }
-    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2339,6 +2353,7 @@ struct PublicationBoundaryDrainSnapshot {
     pending_persisted_slice_bytes: u64,
     writer_stack_dirty_bytes: u64,
     total_dirty_bytes: u64,
+    local_sync_unsynced_bytes: u64,
 }
 
 impl PublicationBoundaryDrainSnapshot {
@@ -2360,6 +2375,10 @@ impl PublicationBoundaryDrainSnapshot {
                 value,
                 "/runtime_snapshot/write_path/dirty_pressure/total_dirty_bytes",
             )?,
+            local_sync_unsynced_bytes: required_json_u64(
+                value,
+                "/runtime_snapshot/write_path/drain_lag/local_sync_unsynced_bytes",
+            )?,
         })
     }
 
@@ -2368,6 +2387,7 @@ impl PublicationBoundaryDrainSnapshot {
             && self.pending_persisted_slice_bytes == 0
             && self.writer_stack_dirty_bytes == 0
             && self.total_dirty_bytes == 0
+            && self.local_sync_unsynced_bytes == 0
     }
 }
 
@@ -8875,6 +8895,14 @@ fn write_namespace_collision_summary(
 }
 
 fn write_local_durable_payload(path: PathBuf, payload: &[u8]) -> Result<(), ScenarioError> {
+    drop(write_local_durable_payload_and_keep_handle(path, payload)?);
+    Ok(())
+}
+
+fn write_local_durable_payload_and_keep_handle(
+    path: PathBuf,
+    payload: &[u8],
+) -> Result<File, ScenarioError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -8882,7 +8910,6 @@ fn write_local_durable_payload(path: PathBuf, payload: &[u8]) -> Result<(), Scen
     let mut file = options.create(true).truncate(true).open(&path)?;
     file.write_all(payload)?;
     file.sync_all()?;
-    drop(file);
     let readback = wait_for_mounted_payload_readback(
         &path,
         payload,
@@ -8902,7 +8929,7 @@ fn write_local_durable_payload(path: PathBuf, payload: &[u8]) -> Result<(), Scen
             }
         ))));
     }
-    Ok(())
+    Ok(file)
 }
 
 fn crash_restart_mode_slug(mode: CrashRestartMode) -> &'static str {
@@ -9404,6 +9431,8 @@ mod tests {
         corrupt_converged_payload_after_remount: bool,
         publish_current_file_on_remount: bool,
         publish_current_file_before_convergence: bool,
+        #[cfg(windows)]
+        require_open_payload_handle_during_kill: Option<String>,
     }
 
     impl RecordingCrashRestartDriver {
@@ -9415,6 +9444,8 @@ mod tests {
                 corrupt_converged_payload_after_remount: false,
                 publish_current_file_on_remount: false,
                 publish_current_file_before_convergence: false,
+                #[cfg(windows)]
+                require_open_payload_handle_during_kill: None,
             }
         }
 
@@ -9436,6 +9467,43 @@ mod tests {
         fn publish_current_file_before_convergence(mut self) -> Self {
             self.publish_current_file_before_convergence = true;
             self
+        }
+
+        #[cfg(windows)]
+        fn require_open_payload_handle_during_kill(mut self, relative_path: &str) -> Self {
+            self.require_open_payload_handle_during_kill = Some(relative_path.to_string());
+            self
+        }
+
+        #[cfg(windows)]
+        fn assert_payload_handle_is_open_during_kill(&self) -> Result<(), ScenarioError> {
+            let Some(relative_path) = self.require_open_payload_handle_during_kill.as_deref()
+            else {
+                return Ok(());
+            };
+            let path = self.clients[0].mount_point.join(relative_path);
+            use std::os::windows::fs::OpenOptionsExt as _;
+            match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .share_mode(0)
+                .open(&path)
+            {
+                Ok(_) => Err(ScenarioError::Io(std::io::Error::other(format!(
+                    "crash-restart test handle for {} was already closed before force_kill",
+                    path.display()
+                )))),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::PermissionDenied
+                        || error.raw_os_error() == Some(32) =>
+                {
+                    Ok(())
+                }
+                Err(error) => Err(ScenarioError::Io(std::io::Error::other(format!(
+                    "crash-restart handle check for {} failed with unexpected error: {error}",
+                    path.display()
+                )))),
+            }
         }
     }
 
@@ -9485,6 +9553,8 @@ mod tests {
             self.actions
                 .borrow_mut()
                 .push(format!("force_kill_{client}"));
+            #[cfg(windows)]
+            self.assert_payload_handle_is_open_during_kill()?;
             Ok(())
         }
 
@@ -9566,6 +9636,8 @@ mod tests {
         actions: RefCell<Vec<String>>,
         leak_premature_peer_file: bool,
         refresh_failure_client: Option<String>,
+        #[cfg(windows)]
+        require_open_boundary_handle_during_kill: Option<PublicationBoundary>,
     }
 
     impl RecordingPublicationBoundaryDriver {
@@ -9575,6 +9647,8 @@ mod tests {
                 actions: RefCell::new(Vec::new()),
                 leak_premature_peer_file: false,
                 refresh_failure_client: None,
+                #[cfg(windows)]
+                require_open_boundary_handle_during_kill: None,
             }
         }
 
@@ -9585,6 +9659,15 @@ mod tests {
 
         fn fail_refresh_for(mut self, client: &str) -> Self {
             self.refresh_failure_client = Some(client.to_string());
+            self
+        }
+
+        #[cfg(windows)]
+        fn require_open_boundary_handle_during_kill(
+            mut self,
+            boundary: PublicationBoundary,
+        ) -> Self {
+            self.require_open_boundary_handle_during_kill = Some(boundary);
             self
         }
 
@@ -9643,6 +9726,8 @@ mod tests {
             self.actions
                 .borrow_mut()
                 .push(format!("force_kill_{client}"));
+            #[cfg(windows)]
+            self.assert_boundary_handle_is_open_during_kill()?;
             self.maybe_leak_premature_peer_file()?;
             Ok(())
         }
@@ -9694,6 +9779,38 @@ mod tests {
     }
 
     impl RecordingPublicationBoundaryDriver {
+        #[cfg(windows)]
+        fn assert_boundary_handle_is_open_during_kill(&self) -> Result<(), ScenarioError> {
+            let Some(boundary) = self.require_open_boundary_handle_during_kill else {
+                return Ok(());
+            };
+            let path = self.clients[0]
+                .mount_point
+                .join(publication_boundary_file_name(boundary));
+            use std::os::windows::fs::OpenOptionsExt as _;
+            match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .share_mode(0)
+                .open(&path)
+            {
+                Ok(_) => Err(ScenarioError::Io(std::io::Error::other(format!(
+                    "publication boundary test handle for {} was already closed before force_kill",
+                    path.display()
+                )))),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::PermissionDenied
+                        || error.raw_os_error() == Some(32) =>
+                {
+                    Ok(())
+                }
+                Err(error) => Err(ScenarioError::Io(std::io::Error::other(format!(
+                    "publication boundary handle check for {} failed with unexpected error: {error}",
+                    path.display()
+                )))),
+            }
+        }
+
         fn maybe_leak_premature_peer_file(&self) -> Result<(), ScenarioError> {
             if !self.leak_premature_peer_file {
                 return Ok(());
@@ -11494,6 +11611,49 @@ mod tests {
         }));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn crash_restart_keeps_durable_payload_handle_open_until_crash() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-crash-restart-handle-lifetime");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(MOUNTED_CLIENT_CRASH_RESTART_RECOVERY);
+        std::fs::create_dir_all(&scenario_dir).unwrap();
+        let clients = CRASH_RESTART_CLIENT_NAMES
+            .iter()
+            .copied()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(&mount).unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let mut driver = RecordingCrashRestartDriver::new(clients.clone())
+            .publish_current_file_before_convergence()
+            .require_open_payload_handle_during_kill(CRASH_RESTART_BEFORE_PUBLICATION_FILE_NAME);
+        let context = ScenarioContext {
+            run_id: "run-crash-restart-handle-lifetime".to_string(),
+            seed: 327,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+
+        run_crash_restart_mode(
+            &context,
+            &mut driver,
+            &clients,
+            CrashRestartMode::BeforeRemotePublicationCompletes,
+            CRASH_RESTART_BEFORE_PUBLICATION_FILE_NAME,
+            b"accepted local payload killed before remote publication completes\n",
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn crash_restart_recovery_accepts_peer_visible_before_convergence() {
         let temp = tempdir().unwrap();
@@ -11902,6 +12062,46 @@ mod tests {
         }));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn publication_boundary_flush_keeps_handle_open_until_crash() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-publication-boundary-handle-lifetime");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(MOUNTED_PUBLICATION_BOUNDARY_CRASH_MATRIX);
+        std::fs::create_dir_all(&scenario_dir).unwrap();
+        let clients = PUBLICATION_BOUNDARY_CLIENT_NAMES
+            .iter()
+            .copied()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(&mount).unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let mut driver = RecordingPublicationBoundaryDriver::new(clients.clone())
+            .require_open_boundary_handle_during_kill(PublicationBoundary::Flush);
+        let context = ScenarioContext {
+            run_id: "run-publication-boundary-handle-lifetime".to_string(),
+            seed: 375,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+
+        run_publication_boundary(
+            &context,
+            &mut driver,
+            &clients,
+            PublicationBoundary::Flush,
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn publication_boundary_refresh_attempts_all_peers_before_reporting_failure() {
         let temp = tempdir().unwrap();
@@ -12039,6 +12239,43 @@ mod tests {
     }
 
     #[test]
+    fn publication_boundary_release_close_waits_for_pending_local_sync_bytes() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp
+            .path()
+            .join("run-publication-boundary-local-sync-drain");
+        let client = client_spec_for(
+            &sandbox,
+            "projectfs",
+            "client-a",
+            temp.path().join("mounts").join("client-a"),
+        );
+        let config = test_client_controller_config(&sandbox);
+        let executor = FakeDrainExecutor {
+            outputs: RefCell::new(vec![
+                publication_boundary_drain_output_with_local_sync(0, 32),
+                publication_boundary_drain_output_with_local_sync(0, 0),
+            ]),
+            commands: RefCell::new(Vec::new()),
+        };
+
+        wait_for_publication_boundary_local_drain(
+            &executor,
+            &config,
+            &client,
+            Duration::from_secs(1),
+            Duration::from_millis(1),
+        )
+        .unwrap();
+
+        assert_eq!(
+            executor.commands.borrow().len(),
+            2,
+            "release-close drain must wait for payload-store local sync bytes, not only dirty pressure"
+        );
+    }
+
+    #[test]
     fn publication_boundary_drain_snapshot_requires_dirty_pressure_fields() {
         let err = PublicationBoundaryDrainSnapshot::from_diagnostics_json(&json!({
             "runtime_snapshot": {
@@ -12055,6 +12292,13 @@ mod tests {
     }
 
     fn publication_boundary_drain_output(total_dirty_bytes: u64) -> CommandOutput {
+        publication_boundary_drain_output_with_local_sync(total_dirty_bytes, 0)
+    }
+
+    fn publication_boundary_drain_output_with_local_sync(
+        total_dirty_bytes: u64,
+        local_sync_unsynced_bytes: u64,
+    ) -> CommandOutput {
         CommandOutput {
             status: 0,
             stdout: json!({
@@ -12065,6 +12309,9 @@ mod tests {
                             "pending_persisted_slice_bytes": total_dirty_bytes,
                             "writer_stack_dirty_bytes": total_dirty_bytes,
                             "total_dirty_bytes": total_dirty_bytes
+                        },
+                        "drain_lag": {
+                            "local_sync_unsynced_bytes": local_sync_unsynced_bytes
                         }
                     }
                 }

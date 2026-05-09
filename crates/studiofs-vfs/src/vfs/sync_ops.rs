@@ -670,7 +670,7 @@ impl StudioVfs {
             let outcome = self
                 .local_sync_barrier_with_outcome(
                     target_ino,
-                    LocalSyncPolicy::Opportunistic,
+                    self.local_sync_policy_for_barrier(target_ino),
                     StickyErrorPolicy::Ignore,
                     DirtyAttrPersistPolicy::PersistIfPresent,
                 )
