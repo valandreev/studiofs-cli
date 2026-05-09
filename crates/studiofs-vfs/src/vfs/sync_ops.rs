@@ -655,6 +655,25 @@ impl StudioVfs {
         ino: Ino,
         fh: u64,
     ) -> VfsResult<ExplicitFlushOutcome> {
+        self.flush_winfsp_writeback_with_policy(ino, fh, None).await
+    }
+
+    /// Drains WinFSP buffered writeback without forcing payload backend sync data.
+    pub async fn flush_winfsp_buffered_writeback_with_outcome(
+        self: &Arc<Self>,
+        ino: Ino,
+        fh: u64,
+    ) -> VfsResult<ExplicitFlushOutcome> {
+        self.flush_winfsp_writeback_with_policy(ino, fh, Some(LocalSyncPolicy::Opportunistic))
+            .await
+    }
+
+    async fn flush_winfsp_writeback_with_policy(
+        self: &Arc<Self>,
+        ino: Ino,
+        fh: u64,
+        local_sync_policy: Option<LocalSyncPolicy>,
+    ) -> VfsResult<ExplicitFlushOutcome> {
         let target_ino = if fh != 0 {
             self.handle_table.get(fh).map(|open_file| open_file.ino)
         } else {
@@ -670,7 +689,8 @@ impl StudioVfs {
             let outcome = self
                 .local_sync_barrier_with_outcome(
                     target_ino,
-                    self.local_sync_policy_for_barrier(target_ino),
+                    local_sync_policy
+                        .unwrap_or_else(|| self.local_sync_policy_for_barrier(target_ino)),
                     StickyErrorPolicy::Ignore,
                     DirtyAttrPersistPolicy::PersistIfPresent,
                 )

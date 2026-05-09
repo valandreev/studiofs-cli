@@ -64,9 +64,14 @@ impl ClientMount {
     }
 
     /// Function $name.
-    pub fn with_remote_metadata_probe(mut self, meta_dsn: impl Into<String>) -> Self {
+    pub fn with_remote_metadata_probe(
+        mut self,
+        meta_dsn: impl Into<String>,
+        volume_name: impl Into<String>,
+    ) -> Self {
         self.remote_metadata_probe = Some(RemoteMetadataProbe {
             meta_dsn: meta_dsn.into(),
+            volume_name: volume_name.into(),
             timeout: REMOTE_METADATA_TIMEOUT,
         });
         self
@@ -89,6 +94,8 @@ pub struct ClientDiagnosticsProbe {
 pub struct RemoteMetadataProbe {
     /// Field $name.
     pub meta_dsn: String,
+    /// Field $name.
+    pub volume_name: String,
     /// Field $name.
     pub timeout: Duration,
 }
@@ -173,6 +180,8 @@ pub struct TreeMetadataDiagnostics {
 pub struct RemoteMetadataDiagnostics {
     /// Field $name.
     pub status: String,
+    /// Field $name.
+    pub volume_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     /// Field $name.
     pub max_batch_version: Option<i64>,
@@ -753,6 +762,7 @@ fn query_remote_metadata(probe: &RemoteMetadataProbe) -> RemoteMetadataDiagnosti
     match query_remote_metadata_inner(probe) {
         Ok((max_batch_version, max_seq_id, event_count)) => RemoteMetadataDiagnostics {
             status: "collected".to_string(),
+            volume_name: probe.volume_name.clone(),
             max_batch_version: Some(max_batch_version),
             max_seq_id: Some(max_seq_id),
             event_count: Some(event_count),
@@ -760,6 +770,7 @@ fn query_remote_metadata(probe: &RemoteMetadataProbe) -> RemoteMetadataDiagnosti
         },
         Err(error) => RemoteMetadataDiagnostics {
             status: "failed".to_string(),
+            volume_name: probe.volume_name.clone(),
             max_batch_version: None,
             max_seq_id: None,
             event_count: None,
@@ -785,12 +796,7 @@ fn query_remote_metadata_inner(probe: &RemoteMetadataProbe) -> Result<(i64, i64,
         let connection_task = tokio::spawn(connection);
         let row = tokio::time::timeout(
             probe.timeout,
-            client.query_one(
-                "SELECT COALESCE(MAX(batch_version), 0)::BIGINT, \
-                 COALESCE(MAX(seq_id), 0)::BIGINT, COUNT(*)::BIGINT \
-                 FROM public.event_log",
-                &[],
-            ),
+            client.query_one(remote_metadata_query_sql(), &[&probe.volume_name]),
         )
         .await
         .map_err(|_| "remote metadata query timed out".to_string())?
@@ -799,6 +805,14 @@ fn query_remote_metadata_inner(probe: &RemoteMetadataProbe) -> Result<(i64, i64,
         let _ = tokio::time::timeout(Duration::from_secs(1), connection_task).await;
         Ok((row.get(0), row.get(1), row.get(2)))
     })
+}
+
+fn remote_metadata_query_sql() -> &'static str {
+    "SELECT COALESCE(MAX(event_log.batch_version), 0)::BIGINT, \
+     COALESCE(MAX(event_log.seq_id), 0)::BIGINT, COUNT(*)::BIGINT \
+     FROM public.event_log \
+     JOIN public.volumes ON volumes.vol = event_log.vol \
+     WHERE volumes.name = $1"
 }
 
 fn value_to_string(value: &Value) -> Option<String> {
@@ -1189,6 +1203,7 @@ mod tests {
             generated_unix_ms: 1,
             expected_remote: Some(RemoteMetadataDiagnostics {
                 status: "collected".to_string(),
+                volume_name: "scenario-volume".to_string(),
                 max_batch_version: Some(99),
                 max_seq_id: Some(100),
                 event_count: Some(7),
@@ -1207,7 +1222,27 @@ mod tests {
 
         let diff = fs::read_to_string(temp.path().join("diff.json")).unwrap();
         assert!(diff.contains("\"metadata_diagnostics\""));
+        assert!(diff.contains("\"volume_name\": \"scenario-volume\""));
         assert!(diff.contains("\"max_batch_version\": 99"));
         assert!(temp.path().join("metadata-diagnostics.json").exists());
+    }
+
+    #[test]
+    fn remote_metadata_probe_query_is_scoped_to_volume_name() {
+        let mount = ClientMount::new("client-a", "/mnt/client-a").with_remote_metadata_probe(
+            "postgres://studiofs@127.0.0.1/studiofs",
+            "scenario-volume",
+        );
+        let probe = mount.remote_metadata_probe.as_ref().unwrap();
+
+        assert_eq!(probe.volume_name, "scenario-volume");
+        assert!(
+            remote_metadata_query_sql().contains("JOIN public.volumes"),
+            "remote diagnostics must join volumes to avoid cross-scenario event counts"
+        );
+        assert!(
+            remote_metadata_query_sql().contains("WHERE volumes.name = $1"),
+            "remote diagnostics must filter by the current scenario volume"
+        );
     }
 }

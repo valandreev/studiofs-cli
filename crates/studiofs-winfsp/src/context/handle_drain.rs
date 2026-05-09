@@ -363,7 +363,7 @@ impl LocalSyncBarrierPort for WinfspLocalSyncBarrierPort<'_> {
     ) -> studiofs_vfs::VfsResult<ExplicitFlushOutcome> {
         let vfs = self.context.vfs.clone();
         self.context.spawn_wait(async move {
-            vfs.flush_winfsp_writeback_with_outcome(request.ino, request.fh)
+            vfs.flush_winfsp_buffered_writeback_with_outcome(request.ino, request.fh)
                 .await
         })
     }
