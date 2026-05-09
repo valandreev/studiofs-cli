@@ -344,11 +344,14 @@ mounted clients, starts PostgreSQL again with compose health waiting, and then
 uses the mounted tree validator for final convergence. Temporary peer
 invisibility while PostgreSQL is stopped is not a failure; only local write
 failures and post-recovery convergence failure fail the scenario. The scenario
-writes PostgreSQL outage/recovery events and local write operations to
-`operations.ndjson` and `outage-operations.ndjson` using the shared operation
-schema, and writes
-`postgres-outage-recovery-summary.json` with outage duration,
-accepted-operation count, recovery time, and the final validator result.
+publishes and converges the healthy initial file before stopping PostgreSQL,
+recording that gate under `healthy-validation/` and
+`initial_publication_gate`. It writes PostgreSQL outage/recovery events and
+local write operations to `operations.ndjson` and `outage-operations.ndjson`
+using the shared operation schema, and writes
+`postgres-outage-recovery-summary.json` with the initial publication gate,
+outage duration, accepted-operation count, recovery time, and the final
+validator result.
 `recovery_time_ms` starts before the PostgreSQL compose service is brought back
 with `docker compose up --wait`, so it includes the PostgreSQL healthcheck
 readiness gate as well as mounted tree convergence time.
