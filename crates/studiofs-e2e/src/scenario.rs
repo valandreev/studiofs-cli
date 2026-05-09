@@ -11,7 +11,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use studiofs_scenario::{
     OperationLogError, OperationLogWriter, OperationOutcome, ScenarioOperation as SharedOperation,
@@ -25,8 +25,8 @@ use crate::client::{
     VolumeBootstrapSummary,
 };
 use crate::infra::{
-    CommandExecutor, ComposeServiceControl, InfraError, POSTGRES_SERVICE_NAME, RUSTFS_SERVICE_NAME,
-    SystemCommandExecutor,
+    CommandExecutor, CommandSpec, ComposeServiceControl, InfraError, POSTGRES_SERVICE_NAME,
+    RUSTFS_SERVICE_NAME, SystemCommandExecutor,
 };
 use crate::mounted_tree::{
     ClientMount, ConvergenceOutcome, MountedTreeError, NamespaceInvariantViolation, TreeComparison,
@@ -99,6 +99,9 @@ const CRASH_RESTART_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(
 const PUBLICATION_BOUNDARY_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
 const PUBLICATION_BOUNDARY_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(60);
 const PUBLICATION_BOUNDARY_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const PUBLICATION_BOUNDARY_RELEASE_CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+const PUBLICATION_BOUNDARY_RELEASE_CLOSE_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const PUBLICATION_BOUNDARY_DIAGNOSTICS_TIMEOUT: Duration = Duration::from_secs(5);
 const COLLISION_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(60);
 const COLLISION_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const COLLISION_OLD_COMMITTED_PAYLOAD: &[u8] = b"old committed payload\n";
@@ -2223,6 +2226,14 @@ fn run_publication_boundary(
     let relative_path = publication_boundary_file_name(boundary);
     let payload = publication_boundary_payload(context, boundary);
     apply_publication_boundary(writer, relative_path, &payload, boundary)?;
+    if boundary == PublicationBoundary::ReleaseClose {
+        wait_for_publication_boundary_release_close_drain(
+            context,
+            writer,
+            relative_path,
+            &payload,
+        )?;
+    }
 
     let restart_started = Instant::now();
     if boundary == PublicationBoundary::ShutdownDrain {
@@ -2232,7 +2243,12 @@ fn run_publication_boundary(
     }
 
     driver.remount(&writer.name)?;
-    let local_read_payload = fs::read(writer.mount_point.join(relative_path))?;
+    let local_read_payload = wait_for_mounted_payload_readback(
+        &writer.mount_point.join(relative_path),
+        &payload,
+        MOUNTED_WRITE_READBACK_TIMEOUT,
+        MOUNTED_WRITE_READBACK_POLL_INTERVAL,
+    )?;
     if local_read_payload != payload {
         return Err(ScenarioError::Io(std::io::Error::other(format!(
             "publication boundary durability failure: data read after restart does not match written payload for {relative_path}"
@@ -2299,7 +2315,7 @@ fn apply_publication_boundary(
         .open(&path)?;
     file.write_all(payload)?;
     match boundary {
-        PublicationBoundary::Flush => file.flush()?,
+        PublicationBoundary::Flush => file.sync_data()?,
         PublicationBoundary::Fsync => file.sync_all()?,
         PublicationBoundary::ReleaseClose => {
             file.flush()?;
@@ -2308,6 +2324,146 @@ fn apply_publication_boundary(
         PublicationBoundary::ShutdownDrain => file.sync_all()?,
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PublicationBoundaryDrainSnapshot {
+    pending_local_dirty_bytes: u64,
+    pending_persisted_slice_bytes: u64,
+    writer_stack_dirty_bytes: u64,
+    total_dirty_bytes: u64,
+}
+
+impl PublicationBoundaryDrainSnapshot {
+    fn from_diagnostics_json(value: &Value) -> Result<Self, ScenarioError> {
+        Ok(Self {
+            pending_local_dirty_bytes: required_json_u64(
+                value,
+                "/runtime_snapshot/write_path/dirty_pressure/pending_local_dirty_bytes",
+            )?,
+            pending_persisted_slice_bytes: required_json_u64(
+                value,
+                "/runtime_snapshot/write_path/dirty_pressure/pending_persisted_slice_bytes",
+            )?,
+            writer_stack_dirty_bytes: required_json_u64(
+                value,
+                "/runtime_snapshot/write_path/dirty_pressure/writer_stack_dirty_bytes",
+            )?,
+            total_dirty_bytes: required_json_u64(
+                value,
+                "/runtime_snapshot/write_path/dirty_pressure/total_dirty_bytes",
+            )?,
+        })
+    }
+
+    fn is_locally_drained(&self) -> bool {
+        self.pending_local_dirty_bytes == 0
+            && self.pending_persisted_slice_bytes == 0
+            && self.writer_stack_dirty_bytes == 0
+            && self.total_dirty_bytes == 0
+    }
+}
+
+fn wait_for_publication_boundary_release_close_drain(
+    context: &ScenarioContext,
+    client: &ClientSpec,
+    relative_path: &str,
+    payload: &[u8],
+) -> Result<(), ScenarioError> {
+    let path = client.mount_point.join(relative_path);
+    let readback = wait_for_mounted_payload_readback(
+        &path,
+        payload,
+        MOUNTED_WRITE_READBACK_TIMEOUT,
+        MOUNTED_WRITE_READBACK_POLL_INTERVAL,
+    )?;
+    if readback != payload {
+        return Err(ScenarioError::Io(std::io::Error::other(format!(
+            "publication boundary release-close readback did not match written payload for {relative_path}"
+        ))));
+    }
+
+    let Some(config) = &context.client_controller_config else {
+        return Ok(());
+    };
+    let executor = SystemCommandExecutor;
+    wait_for_publication_boundary_local_drain(
+        &executor,
+        config,
+        client,
+        PUBLICATION_BOUNDARY_RELEASE_CLOSE_DRAIN_TIMEOUT,
+        PUBLICATION_BOUNDARY_RELEASE_CLOSE_DRAIN_POLL_INTERVAL,
+    )
+}
+
+fn wait_for_publication_boundary_local_drain(
+    executor: &dyn CommandExecutor,
+    config: &ClientControllerConfig,
+    client: &ClientSpec,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> Result<(), ScenarioError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let snapshot = publication_boundary_drain_snapshot(executor, config, client)?;
+        if snapshot.is_locally_drained() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(ScenarioError::Io(std::io::Error::other(format!(
+                "publication boundary release-close local drain did not settle before crash for {}: last_snapshot={:?}",
+                client.name, snapshot
+            ))));
+        }
+        thread::sleep(std::cmp::max(poll_interval, Duration::from_millis(1)));
+    }
+}
+
+fn publication_boundary_drain_snapshot(
+    executor: &dyn CommandExecutor,
+    config: &ClientControllerConfig,
+    client: &ClientSpec,
+) -> Result<PublicationBoundaryDrainSnapshot, ScenarioError> {
+    let command = CommandSpec {
+        program: config.studiofs_bin.to_string_lossy().into_owned(),
+        args: vec![
+            "internal".to_string(),
+            "diagnostics-attach".to_string(),
+            client.mount_point.to_string_lossy().into_owned(),
+            "--recent-events-limit".to_string(),
+            "1".to_string(),
+        ],
+        env: vec![(
+            "STUDIOFS_CLIENT_ROOT".to_string(),
+            client.client_root.to_string_lossy().into_owned(),
+        )],
+        cwd: None,
+        timeout: Some(PUBLICATION_BOUNDARY_DIAGNOSTICS_TIMEOUT),
+        stdout_path: None,
+        stderr_path: None,
+    };
+    let output = executor.run(&command)?;
+    if output.status != 0 {
+        return Err(ScenarioError::Io(std::io::Error::other(format!(
+            "publication boundary diagnostics attach failed for {} with status {}: {}",
+            client.name,
+            output.status,
+            output.stderr.trim()
+        ))));
+    }
+    let value = serde_json::from_str::<Value>(&output.stdout)?;
+    PublicationBoundaryDrainSnapshot::from_diagnostics_json(&value)
+}
+
+fn required_json_u64(value: &Value, pointer: &str) -> Result<u64, ScenarioError> {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            ScenarioError::Io(std::io::Error::other(format!(
+                "publication boundary diagnostics missing numeric field {pointer}"
+            )))
+        })
 }
 
 fn publication_boundary_peer_visibility(
@@ -8883,7 +9039,10 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::client::{ClientLifecycleState, ClientSpec, S3Config, client_spec_for};
+    use crate::client::{
+        ClientCommandTimeouts, ClientLifecycleState, ClientSpec, S3Config, client_spec_for,
+    };
+    use crate::infra::CommandOutput;
     use studiofs_scenario::read_operation_log;
 
     #[test]
@@ -11816,6 +11975,117 @@ mod tests {
             .as_slice(),
             [SharedOperation::Fsync { path }] if path == "boundary/file.txt"
         ));
+    }
+
+    struct FakeDrainExecutor {
+        outputs: RefCell<Vec<CommandOutput>>,
+        commands: RefCell<Vec<CommandSpec>>,
+    }
+
+    impl CommandExecutor for FakeDrainExecutor {
+        fn run(&self, command: &CommandSpec) -> std::io::Result<CommandOutput> {
+            self.commands.borrow_mut().push(command.clone());
+            Ok(self.outputs.borrow_mut().remove(0))
+        }
+    }
+
+    #[test]
+    fn publication_boundary_release_close_waits_for_observed_local_drain() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-publication-boundary-drain");
+        let client = client_spec_for(
+            &sandbox,
+            "projectfs",
+            "client-a",
+            temp.path().join("mounts").join("client-a"),
+        );
+        let config = test_client_controller_config(&sandbox);
+        let executor = FakeDrainExecutor {
+            outputs: RefCell::new(vec![
+                publication_boundary_drain_output(32),
+                publication_boundary_drain_output(0),
+            ]),
+            commands: RefCell::new(Vec::new()),
+        };
+
+        wait_for_publication_boundary_local_drain(
+            &executor,
+            &config,
+            &client,
+            Duration::from_secs(1),
+            Duration::from_millis(1),
+        )
+        .unwrap();
+
+        let commands = executor.commands.borrow();
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0].args[0], "internal");
+        assert_eq!(commands[0].args[1], "diagnostics-attach");
+        assert_eq!(
+            commands[0].env,
+            vec![(
+                "STUDIOFS_CLIENT_ROOT".to_string(),
+                client.client_root.to_string_lossy().into_owned()
+            )]
+        );
+    }
+
+    #[test]
+    fn publication_boundary_drain_snapshot_requires_dirty_pressure_fields() {
+        let err = PublicationBoundaryDrainSnapshot::from_diagnostics_json(&json!({
+            "runtime_snapshot": {
+                "write_path": {}
+            }
+        }))
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("/runtime_snapshot/write_path/dirty_pressure"),
+            "{err}"
+        );
+    }
+
+    fn publication_boundary_drain_output(total_dirty_bytes: u64) -> CommandOutput {
+        CommandOutput {
+            status: 0,
+            stdout: json!({
+                "runtime_snapshot": {
+                    "write_path": {
+                        "dirty_pressure": {
+                            "pending_local_dirty_bytes": total_dirty_bytes,
+                            "pending_persisted_slice_bytes": total_dirty_bytes,
+                            "writer_stack_dirty_bytes": total_dirty_bytes,
+                            "total_dirty_bytes": total_dirty_bytes
+                        }
+                    }
+                }
+            })
+            .to_string(),
+            stderr: String::new(),
+        }
+    }
+
+    fn test_client_controller_config(sandbox: &Path) -> ClientControllerConfig {
+        ClientControllerConfig {
+            studiofs_bin: PathBuf::from("studiofs"),
+            sandbox: sandbox.to_path_buf(),
+            volume_name: "test-volume".to_string(),
+            meta_dsn: "postgres://studiofs:studiofs@127.0.0.1:5432".to_string(),
+            s3: S3Config {
+                endpoint: "http://127.0.0.1:9000".to_string(),
+                bucket: "studiofs-e2e-test".to_string(),
+                access_key: "rustfsadmin".to_string(),
+                secret_key: "rustfsadmin".to_string(),
+                region: "us-east-1".to_string(),
+            },
+            init_retry_timeout: Duration::from_secs(1),
+            mount_ready_timeout: Duration::from_secs(1),
+            mount_exit_timeout: Duration::from_secs(1),
+            command_timeouts: ClientCommandTimeouts::default(),
+            poll_interval: Duration::from_millis(1),
+            mount_points: Vec::new(),
+        }
     }
 
     #[test]
