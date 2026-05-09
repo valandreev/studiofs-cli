@@ -541,16 +541,16 @@ fn run_with_executor_and_mount_lock_dir(
             ("stage", "preflight".to_string()),
             ("phase", "starting".to_string()),
         ]);
-        prepare_preflight(
-            &run_id,
-            &sandbox,
-            &root,
-            infra_mode,
-            compose_stack.as_mut(),
+        prepare_preflight(PreparePreflightInput {
+            run_id: &run_id,
+            sandbox: &sandbox,
+            root: &root,
+            infra: infra_mode,
+            compose_stack: compose_stack.as_mut(),
             executor,
-            default_mount_lock.as_ref(),
-            studiofs_bin_check.clone(),
-        )?
+            default_mount_lock: default_mount_lock.as_ref(),
+            studiofs_bin_check: studiofs_bin_check.clone(),
+        })?
     };
     let preflight = prepared_preflight.report;
     e2e_progress_fields(&[
@@ -1034,16 +1034,29 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
-fn prepare_preflight(
-    run_id: &str,
-    sandbox: &Path,
-    root: &Path,
+struct PreparePreflightInput<'a> {
+    run_id: &'a str,
+    sandbox: &'a Path,
+    root: &'a Path,
     infra: InfraMode,
-    compose_stack: Option<&mut DockerComposeStack>,
-    executor: &dyn CommandExecutor,
-    default_mount_lock: Option<&DefaultMountLock>,
+    compose_stack: Option<&'a mut DockerComposeStack>,
+    executor: &'a dyn CommandExecutor,
+    default_mount_lock: Option<&'a DefaultMountLock>,
     studiofs_bin_check: Option<PreflightCheckReport>,
-) -> Result<PreparedPreflight, RunnerError> {
+}
+
+fn prepare_preflight(input: PreparePreflightInput<'_>) -> Result<PreparedPreflight, RunnerError> {
+    let PreparePreflightInput {
+        run_id,
+        sandbox,
+        root,
+        infra,
+        compose_stack,
+        executor,
+        default_mount_lock,
+        studiofs_bin_check,
+    } = input;
+
     let Some(stack) = compose_stack else {
         let mut checks = Vec::new();
         if let Some(check) = studiofs_bin_check {

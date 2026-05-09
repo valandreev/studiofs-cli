@@ -782,7 +782,7 @@ fn query_remote_metadata_inner(probe: &RemoteMetadataProbe) -> Result<(i64, i64,
         .map_err(|_| "remote metadata query timed out while connecting".to_string())?
         .map_err(|error| error.to_string())?;
         let (client, connection) = connected;
-        let connection_task = tokio::spawn(async move { connection.await });
+        let connection_task = tokio::spawn(connection);
         let row = tokio::time::timeout(
             probe.timeout,
             client.query_one(
