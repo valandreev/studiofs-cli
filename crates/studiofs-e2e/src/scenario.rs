@@ -736,10 +736,17 @@ impl Scenario for PostgresOutageMultiClientRecovery {
             "scenario": POSTGRES_OUTAGE_MULTI_CLIENT_RECOVERY,
             "run_id": context.run_id,
             "seed": context.seed,
-            "status": if summary.final_validator.converged { "passed" } else { "failed" },
+            "status": if summary.initial_publication_gate.converged
+                && summary.final_validator.converged
+            {
+                "passed"
+            } else {
+                "failed"
+            },
             "outage_duration_ms": summary.outage_duration_ms,
             "recovery_time_ms": summary.recovery_time_ms,
             "operations_accepted_during_outage": summary.operations_accepted_during_outage,
+            "initial_publication_gate": summary.initial_publication_gate,
             "final_validator": summary.final_validator,
         });
         fs::write(
@@ -1206,6 +1213,13 @@ trait PostgresOutageDriver {
     ) -> Result<VolumeBootstrapSummary, ScenarioError>;
     fn mount_all(&mut self) -> Result<(), ScenarioError>;
     fn clients(&self) -> Vec<ClientSpec>;
+    fn after_initial_write(
+        &mut self,
+        _clients: &[ClientSpec],
+        _relative_path: &str,
+    ) -> Result<(), ScenarioError> {
+        Ok(())
+    }
     fn stop_postgres(&mut self) -> Result<(), ScenarioError>;
     fn start_postgres(&mut self) -> Result<(), ScenarioError>;
     fn unmount_all(&mut self) -> Result<(), ScenarioError>;
@@ -1253,6 +1267,7 @@ impl<E: CommandExecutor> PostgresOutageDriver for RealPostgresOutageDriver<E> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PostgresOutageRecoverySummary {
     bootstrap: VolumeBootstrapSummary,
+    initial_publication_gate: TreeComparison,
     outage_duration_ms: u128,
     operations_accepted_during_outage: usize,
     recovery_time_ms: u128,
@@ -1302,9 +1317,17 @@ fn run_postgres_outage_body(
         });
     }
 
-    fs::write(
-        clients[0].mount_point.join(OUTAGE_INITIAL_FILE_NAME),
+    write_mounted_file(
+        &clients[0].mount_point.join(OUTAGE_INITIAL_FILE_NAME),
         b"initial healthy PostgreSQL write\n",
+    )?;
+    driver.after_initial_write(&clients, OUTAGE_INITIAL_FILE_NAME)?;
+    let mounts = client_mounts(context, &clients[..POSTGRES_OUTAGE_CLIENT_NAMES.len()]);
+    let initial_publication_gate = wait_for_convergence(
+        &mounts,
+        context.scenario_dir.join("healthy-validation"),
+        convergence_timeout,
+        poll_interval,
     )?;
 
     let outage_started = Instant::now();
@@ -1318,7 +1341,6 @@ fn run_postgres_outage_body(
     let recovery_started = Instant::now();
     driver.start_postgres()?;
     append_postgres_runtime_operation(context, SharedOperation::PostgresRecovery)?;
-    let mounts = client_mounts(context, &clients[..POSTGRES_OUTAGE_CLIENT_NAMES.len()]);
     let convergence = wait_for_convergence(
         &mounts,
         context.scenario_dir.join("validation"),
@@ -1329,6 +1351,7 @@ fn run_postgres_outage_body(
 
     let summary = PostgresOutageRecoverySummary {
         bootstrap,
+        initial_publication_gate: initial_publication_gate.comparison,
         outage_duration_ms,
         operations_accepted_during_outage: accepted_operations,
         recovery_time_ms,
@@ -9288,6 +9311,19 @@ mod tests {
             self.clients.clone()
         }
 
+        fn after_initial_write(
+            &mut self,
+            clients: &[ClientSpec],
+            relative_path: &str,
+        ) -> Result<(), ScenarioError> {
+            self.actions.borrow_mut().push("after_initial_write");
+            let payload = std::fs::read(clients[0].mount_point.join(relative_path))?;
+            for replica in clients.iter().skip(1) {
+                std::fs::write(replica.mount_point.join(relative_path), &payload)?;
+            }
+            Ok(())
+        }
+
         fn stop_postgres(&mut self) -> Result<(), ScenarioError> {
             self.actions.borrow_mut().push("stop_postgres");
             Ok(())
@@ -12409,6 +12445,7 @@ mod tests {
 
         assert_eq!(summary.bootstrap.init_client, "client-a");
         assert_eq!(summary.operations_accepted_during_outage, 2);
+        assert!(summary.initial_publication_gate.converged);
         assert!(summary.outage_duration_ms > 0);
         assert!(summary.recovery_time_ms > 0);
         assert!(summary.final_validator.converged);
@@ -12417,6 +12454,7 @@ mod tests {
             [
                 "bootstrap",
                 "mount_all",
+                "after_initial_write",
                 "stop_postgres",
                 "start_postgres",
                 "unmount_all"
@@ -12432,6 +12470,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        assert_eq!(summary_json["initial_publication_gate"]["converged"], true);
         assert_eq!(summary_json["operations_accepted_during_outage"], 2);
         assert!(
             context
