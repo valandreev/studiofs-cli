@@ -1679,14 +1679,21 @@ fn write_mounted_file(path: &Path, payload: &[u8]) -> Result<(), ScenarioError> 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(path)?;
-    file.write_all(payload)?;
-    file.flush()?;
-    file.sync_all()?;
+    write_payload_with_publication_barrier(path, payload)?;
+    let readback = wait_for_mounted_payload_readback(
+        path,
+        payload,
+        MOUNTED_WRITE_READBACK_TIMEOUT,
+        MOUNTED_WRITE_READBACK_POLL_INTERVAL,
+    )?;
+    if readback != payload {
+        return Err(ScenarioError::Io(std::io::Error::other(format!(
+            "mounted write readback mismatch for {}: expected {} bytes, read {} bytes",
+            path.display(),
+            payload.len(),
+            readback.len()
+        ))));
+    }
     Ok(())
 }
 
@@ -3752,7 +3759,8 @@ fn execute_mounted_chaos_action(
         }
         MountedChaosAction::Unlink { path } => fs::remove_file(client.mount_point.join(path)),
         MountedChaosAction::Append { path, payload } => {
-            let mut file = OpenOptions::new()
+            let mut options = mounted_write_barrier_open_options();
+            let mut file = options
                 .create(true)
                 .append(true)
                 .open(client.mount_point.join(path))?;
@@ -4480,9 +4488,9 @@ fn establish_hotspot_initial_tree(seed: u64, client: &ClientSpec) -> Result<(), 
     let root = client.mount_point.join("hotspot");
     fs::create_dir_all(&root)?;
     for slot in 0..HOTSPOT_WORKING_SET {
-        fs::write(
-            root.join(format!("slot-{slot:02}.txt")),
-            hotspot_payload(seed, 0, slot, "initial"),
+        write_mounted_file(
+            &root.join(format!("slot-{slot:02}.txt")),
+            &hotspot_payload(seed, 0, slot, "initial"),
         )?;
     }
     Ok(())

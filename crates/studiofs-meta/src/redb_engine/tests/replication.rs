@@ -268,6 +268,65 @@ fn test_reconcile_serving_rename_removes_prior_loser_for_same_inode() {
 }
 
 #[test]
+fn test_reconcile_serving_rename_prunes_ambiguous_non_base_aliases() {
+    let engine = temp_engine();
+    let entry = DirEntryValue {
+        ino: 905,
+        kind: FileType::RegularFile,
+    };
+
+    engine
+        .apply_replica_events_to_base(&[crate::events::MetaEvent::AddEntry {
+            parent: ROOT_INO,
+            name: b"slot-03.txt".to_vec(),
+            entry: entry.clone(),
+        }])
+        .unwrap();
+    engine
+        .apply_replica_serving_state(&[
+            crate::events::MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: b"slot-03.txt".to_vec(),
+                entry: entry.clone(),
+            },
+            crate::events::MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: b"slot-04.txt".to_vec(),
+                entry: entry.clone(),
+            },
+            crate::events::MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: b"slot-05.txt".to_vec(),
+                entry: entry.clone(),
+            },
+        ])
+        .unwrap();
+
+    engine
+        .reconcile_serving_rename_from_base(
+            ROOT_INO,
+            b"slot-04.txt",
+            ROOT_INO,
+            b"slot-03.txt",
+            &entry,
+        )
+        .unwrap();
+
+    assert_eq!(
+        engine.lookup(ROOT_INO, b"slot-03.txt").unwrap().ino,
+        entry.ino
+    );
+    assert!(engine.lookup(ROOT_INO, b"slot-04.txt").is_err());
+    assert!(engine.lookup(ROOT_INO, b"slot-05.txt").is_err());
+    assert_eq!(
+        engine
+            .serving_dentry_keys_for_inode_for_test(entry.ino)
+            .unwrap(),
+        vec![encode_dentry_key(ROOT_INO, b"slot-03.txt")]
+    );
+}
+
+#[test]
 fn test_replica_base_inode_dentry_index_tracks_hardlink_ambiguity() {
     let engine = temp_engine();
     let entry = DirEntryValue {

@@ -149,6 +149,29 @@ impl RedbMetaEngine {
         entry: &DirEntryValue,
         context: RenameDentryContext<'_>,
     ) -> MetaResult<Option<Vec<u8>>> {
+        let mut matched_keys =
+            Self::matching_dentry_keys_for_entry_in_write_table(txn, table_def, index_def, entry)?;
+        if matched_keys.len() > 1 {
+            tracing::warn!(
+                ino = entry.ino,
+                source_parent = context.source_parent,
+                source_name = %String::from_utf8_lossy(context.source_name),
+                destination_parent = context.destination_parent,
+                destination_name = %String::from_utf8_lossy(context.destination_name),
+                candidate_count = matched_keys.len(),
+                "skipping rename conflict relocation for inode with multiple dentries"
+            );
+            return Ok(None);
+        }
+        Ok(matched_keys.pop())
+    }
+
+    fn matching_dentry_keys_for_entry_in_write_table(
+        txn: &redb::WriteTransaction,
+        table_def: redb::TableDefinition<&'static [u8], &'static [u8]>,
+        index_def: redb::TableDefinition<&'static [u8], u8>,
+        entry: &DirEntryValue,
+    ) -> MetaResult<Vec<Vec<u8>>> {
         let table = txn
             .open_table(table_def)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -165,19 +188,36 @@ impl RedbMetaEngine {
                 matched_keys.push(key);
             }
         }
-        if matched_keys.len() > 1 {
-            tracing::warn!(
-                ino = entry.ino,
-                source_parent = context.source_parent,
-                source_name = %String::from_utf8_lossy(context.source_name),
-                destination_parent = context.destination_parent,
-                destination_name = %String::from_utf8_lossy(context.destination_name),
-                candidate_count = matched_keys.len(),
-                "skipping rename conflict relocation for inode with multiple dentries"
-            );
-            return Ok(None);
+        Ok(matched_keys)
+    }
+
+    fn sync_serving_dentry_aliases_to_base_for_entry_in_txn(
+        txn: &redb::WriteTransaction,
+        entry: &DirEntryValue,
+        serving_keys: &[Vec<u8>],
+    ) -> MetaResult<()> {
+        let base_keys = Self::matching_dentry_keys_for_entry_in_write_table(
+            txn,
+            BASE_DENTRIES_TABLE,
+            BASE_DENTRY_BY_INODE_TABLE,
+            entry,
+        )?;
+        let base_key_set: HashSet<Vec<u8>> = base_keys.iter().cloned().collect();
+
+        for key in serving_keys {
+            if base_key_set.contains(key) {
+                continue;
+            }
+            let (parent, name) = decode_dentry_key(key)?;
+            Self::remove_dentry_mirror_in_txn(txn, parent, name)?;
         }
-        Ok(matched_keys.pop())
+
+        for key in base_keys {
+            let (parent, name) = decode_dentry_key(&key)?;
+            Self::set_dentry_mirror_in_txn(txn, parent, name, entry)?;
+        }
+
+        Ok(())
     }
 
     /// Export a snapshot projected to the remote-visible published namespace.
@@ -1196,18 +1236,17 @@ impl RedbMetaEngine {
             Self::lookup_in_write_table(txn, BASE_DENTRIES_TABLE, new_parent, new_name)?
                 .map(|value| value.ino == entry.ino && value.kind == entry.kind)
                 .unwrap_or(false);
-        let current_key = Self::unique_dentry_key_for_entry_in_write_table(
+        let mut serving_keys = Self::matching_dentry_keys_for_entry_in_write_table(
             txn,
             DENTRIES_TABLE,
             DENTRY_BY_INODE_TABLE,
             entry,
-            RenameDentryContext {
-                source_parent: parent,
-                source_name: name,
-                destination_parent: new_parent,
-                destination_name: new_name,
-            },
         )?;
+        if serving_keys.len() > 1 {
+            Self::sync_serving_dentry_aliases_to_base_for_entry_in_txn(txn, entry, &serving_keys)?;
+            return Ok(());
+        }
+        let current_key = serving_keys.pop();
 
         if let Some(current_key) = current_key.as_ref() {
             let (current_parent, current_name) = decode_dentry_key(current_key)?;
