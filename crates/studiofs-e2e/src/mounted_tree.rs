@@ -175,6 +175,18 @@ pub struct TreeMetadataDiagnostics {
     pub clients: Vec<ClientMetadataDiagnostics>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+/// Mounted-client quiescence classification captured on convergence timeout.
+pub enum ClientQuiescence {
+    /// The client still has known metadata or upload work in progress.
+    Busy,
+    /// All known metadata and upload work counters are zero.
+    Quiescent,
+    /// The diagnostic probe did not expose enough counters to classify state.
+    Unknown,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 /// Struct $name.
 pub struct RemoteMetadataDiagnostics {
@@ -240,6 +252,19 @@ pub struct ClientMetadataDiagnostics {
     #[serde(skip_serializing_if = "Option::is_none")]
     /// Field $name.
     pub last_successful_sync_unix_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Upload payloads waiting to be stored by this client.
+    pub pending_uploads: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Total bytes represented by pending upload payloads.
+    pub pending_upload_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Upload payloads currently being transferred by this client.
+    pub active_uploads: Option<u64>,
+    /// Busy, quiescent, or unknown classification for timeout diagnostics.
+    pub quiescence: ClientQuiescence,
+    /// Counters or probe failures explaining the quiescence classification.
+    pub quiescence_reasons: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     /// Field $name.
     pub error: Option<String>,
@@ -694,6 +719,40 @@ fn collect_client_metadata_diagnostics(
             let metadata = stdout_json.as_ref().and_then(|value| {
                 value.pointer("/runtime_snapshot/write_path/metadata_invalidation")
             });
+            let upload = stdout_json
+                .as_ref()
+                .and_then(|value| value.pointer("/runtime_snapshot/upload"));
+            let write_path = stdout_json
+                .as_ref()
+                .and_then(|value| value.pointer("/runtime_snapshot/write_path"));
+            let pending_metadata_ops = metadata
+                .and_then(|value| value.get("pending_metadata_ops"))
+                .and_then(Value::as_u64);
+            let inflight_metadata_ops = metadata
+                .and_then(|value| value.get("inflight_metadata_ops"))
+                .and_then(Value::as_u64);
+            let pending_uploads = upload
+                .and_then(|value| value.get("pending_uploads"))
+                .and_then(Value::as_u64)
+                .or_else(|| {
+                    write_path
+                        .and_then(|value| value.get("pending_uploads"))
+                        .and_then(Value::as_u64)
+                });
+            let pending_upload_bytes = upload
+                .and_then(|value| value.get("pending_upload_bytes"))
+                .and_then(Value::as_u64);
+            let active_uploads = upload
+                .and_then(|value| value.get("active_uploads"))
+                .and_then(Value::as_u64);
+            let (quiescence, quiescence_reasons) = classify_client_quiescence(
+                output.status,
+                pending_metadata_ops,
+                inflight_metadata_ops,
+                pending_uploads,
+                pending_upload_bytes,
+                active_uploads,
+            );
             Some(ClientMetadataDiagnostics {
                 client: mount.client.clone(),
                 mount_point,
@@ -713,12 +772,8 @@ fn collect_client_metadata_diagnostics(
                 flushed_event_seq: metadata
                     .and_then(|value| value.get("flushed_event_seq"))
                     .and_then(Value::as_u64),
-                pending_metadata_ops: metadata
-                    .and_then(|value| value.get("pending_metadata_ops"))
-                    .and_then(Value::as_u64),
-                inflight_metadata_ops: metadata
-                    .and_then(|value| value.get("inflight_metadata_ops"))
-                    .and_then(Value::as_u64),
+                pending_metadata_ops,
+                inflight_metadata_ops,
                 notifications_received: metadata
                     .and_then(|value| value.get("notifications_received"))
                     .and_then(Value::as_u64),
@@ -734,6 +789,11 @@ fn collect_client_metadata_diagnostics(
                 last_successful_sync_unix_ms: metadata
                     .and_then(|value| value.get("last_successful_sync_unix_ms"))
                     .and_then(Value::as_i64),
+                pending_uploads,
+                pending_upload_bytes,
+                active_uploads,
+                quiescence,
+                quiescence_reasons,
                 error: (output.status != 0).then_some(truncate_diagnostic_error(&output.stderr)),
             })
         }
@@ -753,8 +813,67 @@ fn collect_client_metadata_diagnostics(
             fallback_poll_discoveries: None,
             sync_errors: None,
             last_successful_sync_unix_ms: None,
+            pending_uploads: None,
+            pending_upload_bytes: None,
+            active_uploads: None,
+            quiescence: ClientQuiescence::Unknown,
+            quiescence_reasons: vec!["diagnostics command could not be started".to_string()],
             error: Some(error.to_string()),
         }),
+    }
+}
+
+fn classify_client_quiescence(
+    exit_code: i32,
+    pending_metadata_ops: Option<u64>,
+    inflight_metadata_ops: Option<u64>,
+    pending_uploads: Option<u64>,
+    pending_upload_bytes: Option<u64>,
+    active_uploads: Option<u64>,
+) -> (ClientQuiescence, Vec<String>) {
+    if exit_code != 0 {
+        return (
+            ClientQuiescence::Unknown,
+            vec!["diagnostics command failed".to_string()],
+        );
+    }
+
+    let mut reasons = Vec::new();
+    push_positive_reason(&mut reasons, "pending_metadata_ops", pending_metadata_ops);
+    push_positive_reason(&mut reasons, "inflight_metadata_ops", inflight_metadata_ops);
+    push_positive_reason(&mut reasons, "pending_uploads", pending_uploads);
+    push_positive_reason(&mut reasons, "pending_upload_bytes", pending_upload_bytes);
+    push_positive_reason(&mut reasons, "active_uploads", active_uploads);
+    if !reasons.is_empty() {
+        return (ClientQuiescence::Busy, reasons);
+    }
+
+    if [
+        pending_metadata_ops,
+        inflight_metadata_ops,
+        pending_uploads,
+        pending_upload_bytes,
+        active_uploads,
+    ]
+    .iter()
+    .any(Option::is_none)
+    {
+        return (
+            ClientQuiescence::Unknown,
+            vec!["diagnostics missing one or more quiescence counters".to_string()],
+        );
+    }
+
+    (
+        ClientQuiescence::Quiescent,
+        vec!["no pending metadata or upload work".to_string()],
+    )
+}
+
+fn push_positive_reason(reasons: &mut Vec<String>, field: &str, value: Option<u64>) {
+    match value {
+        Some(value) if value > 0 => reasons.push(format!("{field}={value}")),
+        _ => {}
     }
 }
 
@@ -1149,6 +1268,11 @@ mod tests {
                                 "sync_errors": 6,
                                 "last_successful_sync_unix_ms": 123456
                             }
+                        },
+                        "upload": {
+                            "pending_uploads": 3,
+                            "pending_upload_bytes": 4096,
+                            "active_uploads": 1
                         }
                     }
                 })
@@ -1180,7 +1304,118 @@ mod tests {
         assert_eq!(diagnostics.fallback_poll_discoveries, Some(5));
         assert_eq!(diagnostics.sync_errors, Some(6));
         assert_eq!(diagnostics.last_successful_sync_unix_ms, Some(123456));
+        assert_eq!(diagnostics.pending_uploads, Some(3));
+        assert_eq!(diagnostics.pending_upload_bytes, Some(4096));
+        assert_eq!(diagnostics.active_uploads, Some(1));
+        assert_eq!(diagnostics.quiescence, ClientQuiescence::Busy);
+        assert!(
+            diagnostics
+                .quiescence_reasons
+                .contains(&"pending_metadata_ops=2".to_string())
+        );
+        assert!(
+            diagnostics
+                .quiescence_reasons
+                .contains(&"inflight_metadata_ops=1".to_string())
+        );
+        assert!(
+            diagnostics
+                .quiescence_reasons
+                .contains(&"pending_uploads=3".to_string())
+        );
+        assert!(
+            diagnostics
+                .quiescence_reasons
+                .contains(&"pending_upload_bytes=4096".to_string())
+        );
+        assert!(
+            diagnostics
+                .quiescence_reasons
+                .contains(&"active_uploads=1".to_string())
+        );
         assert!(temp.path().join("metadata-client-1.json").exists());
+    }
+
+    #[test]
+    fn client_metadata_diagnostics_marks_zero_backlog_as_quiescent() {
+        let temp = tempfile::tempdir().unwrap();
+        let executor = FakeDiagnosticsExecutor {
+            output: CommandOutput {
+                status: 0,
+                stdout: serde_json::json!({
+                    "runtime_snapshot": {
+                        "write_path": {
+                            "metadata_invalidation": {
+                                "metadata_version_token": "42",
+                                "namespace_version_token": "42",
+                                "flushed_event_seq": 17,
+                                "pending_metadata_ops": 0,
+                                "inflight_metadata_ops": 0,
+                                "fallback_poll_discoveries": 0,
+                                "sync_errors": 0,
+                                "last_successful_sync_unix_ms": 123456
+                            }
+                        },
+                        "upload": {
+                            "pending_uploads": 0,
+                            "pending_upload_bytes": 0,
+                            "active_uploads": 0
+                        }
+                    }
+                })
+                .to_string(),
+                stderr: String::new(),
+            },
+        };
+        let mount = ClientMount::new("client-a", temp.path().join("mount"))
+            .with_diagnostics_probe("studiofs", temp.path().join("client-a"));
+
+        let diagnostics =
+            collect_client_metadata_diagnostics(&executor, temp.path(), 0, &mount).unwrap();
+
+        assert_eq!(diagnostics.quiescence, ClientQuiescence::Quiescent);
+        assert_eq!(
+            diagnostics.quiescence_reasons,
+            ["no pending metadata or upload work"]
+        );
+    }
+
+    #[test]
+    fn client_metadata_diagnostics_treats_orphaned_upload_bytes_as_busy() {
+        let temp = tempfile::tempdir().unwrap();
+        let executor = FakeDiagnosticsExecutor {
+            output: CommandOutput {
+                status: 0,
+                stdout: serde_json::json!({
+                    "runtime_snapshot": {
+                        "write_path": {
+                            "metadata_invalidation": {
+                                "pending_metadata_ops": 0,
+                                "inflight_metadata_ops": 0
+                            }
+                        },
+                        "upload": {
+                            "pending_uploads": 0,
+                            "pending_upload_bytes": 4096,
+                            "active_uploads": 0
+                        }
+                    }
+                })
+                .to_string(),
+                stderr: String::new(),
+            },
+        };
+        let mount = ClientMount::new("client-a", temp.path().join("mount"))
+            .with_diagnostics_probe("studiofs", temp.path().join("client-a"));
+
+        let diagnostics =
+            collect_client_metadata_diagnostics(&executor, temp.path(), 0, &mount).unwrap();
+
+        assert_eq!(diagnostics.quiescence, ClientQuiescence::Busy);
+        assert_eq!(
+            diagnostics.quiescence_reasons,
+            ["pending_upload_bytes=4096"]
+        );
     }
 
     #[test]
@@ -1209,7 +1444,29 @@ mod tests {
                 event_count: Some(7),
                 error: None,
             }),
-            clients: Vec::new(),
+            clients: vec![ClientMetadataDiagnostics {
+                client: "client-a".to_string(),
+                mount_point: "/mnt/client-a".to_string(),
+                artifact: "metadata-client-1.json".to_string(),
+                status: "collected".to_string(),
+                exit_code: Some(0),
+                local_version: Some("42".to_string()),
+                namespace_version: Some("41".to_string()),
+                flushed_event_seq: Some(17),
+                pending_metadata_ops: Some(2),
+                inflight_metadata_ops: Some(0),
+                notifications_received: Some(3),
+                listener_reconnects: Some(0),
+                fallback_poll_discoveries: Some(5),
+                sync_errors: Some(0),
+                last_successful_sync_unix_ms: Some(123456),
+                pending_uploads: Some(0),
+                pending_upload_bytes: Some(0),
+                active_uploads: Some(0),
+                quiescence: ClientQuiescence::Busy,
+                quiescence_reasons: vec!["pending_metadata_ops=2".to_string()],
+                error: None,
+            }],
         };
 
         write_divergence_artifacts_with_diagnostics(
@@ -1224,6 +1481,8 @@ mod tests {
         assert!(diff.contains("\"metadata_diagnostics\""));
         assert!(diff.contains("\"volume_name\": \"scenario-volume\""));
         assert!(diff.contains("\"max_batch_version\": 99"));
+        assert!(diff.contains("\"quiescence\": \"busy\""));
+        assert!(diff.contains("\"pending_metadata_ops=2\""));
         assert!(temp.path().join("metadata-diagnostics.json").exists());
     }
 
