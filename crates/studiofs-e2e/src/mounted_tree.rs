@@ -94,7 +94,7 @@ pub struct ClientDiagnosticsProbe {
 pub struct RemoteMetadataProbe {
     /// Field $name.
     pub meta_dsn: String,
-    /// Field $name.
+    /// Current scenario volume name used to scope remote metadata diagnostics.
     pub volume_name: String,
     /// Field $name.
     pub timeout: Duration,
@@ -180,7 +180,7 @@ pub struct TreeMetadataDiagnostics {
 pub struct RemoteMetadataDiagnostics {
     /// Field $name.
     pub status: String,
-    /// Field $name.
+    /// Volume name used by the remote metadata diagnostic query.
     pub volume_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     /// Field $name.
