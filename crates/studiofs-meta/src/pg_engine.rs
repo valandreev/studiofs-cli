@@ -2590,15 +2590,18 @@ impl PgMetaEngine {
                     || !retained_block_overlay.contains(&entry.ino)
             }
             MetaEvent::SetAttr { attr } if attr.kind == FileType::RegularFile => {
-                !retained_block_overlay.contains(&attr.ino)
-                    && (fully_published_regular_inodes.contains(&attr.ino)
-                        || (attr.upload_state == UploadState::Ready
-                            && attr.size == attr.committed_size
-                            && attr.content_epoch == attr.committed_content_epoch))
+                fully_published_regular_inodes.contains(&attr.ino)
+                    || (!retained_block_overlay.contains(&attr.ino)
+                        && attr.upload_state == UploadState::Ready
+                        && attr.size == attr.committed_size
+                        && attr.content_epoch == attr.committed_content_epoch)
             }
             MetaEvent::SetRegularFileOverlaySlices { ino, .. }
             | MetaEvent::PublishRegularFileBaseSlices { ino, .. }
-            | MetaEvent::RemoveRegularFileGraph { ino } => !retained_block_overlay.contains(ino),
+            | MetaEvent::RemoveRegularFileGraph { ino } => {
+                fully_published_regular_inodes.contains(ino)
+                    || !retained_block_overlay.contains(ino)
+            }
             _ => true,
         }
     }
@@ -2622,13 +2625,9 @@ impl PgMetaEngine {
     fn fully_published_regular_inodes_for_self_batch(
         &self,
         local_events: &[MetaEvent],
-        retained_block_overlay: &HashSet<Ino>,
     ) -> MetaResult<HashSet<Ino>> {
         let mut published = HashSet::new();
         for ino in Self::touched_regular_inodes(local_events) {
-            if retained_block_overlay.contains(&ino) {
-                continue;
-            }
             let Ok(attr) = self.local.get_attr(ino) else {
                 continue;
             };
@@ -3191,6 +3190,24 @@ impl PgMetaEngine {
         Ok(true)
     }
 
+    fn apply_remote_self_batch(
+        &self,
+        batch_version: i64,
+        batch_events: &[MetaEvent],
+    ) -> MetaResult<(bool, OverlayConflictSets)> {
+        let applied = self.apply_visible_self_batch(batch_events)?;
+        self.acknowledge_local_prefix_from_self_batch(batch_events)?;
+        if Self::batch_updates_remote_namespace_visibility(batch_events) {
+            self.persist_namespace_version(
+                self.namespace_version
+                    .load(Ordering::SeqCst)
+                    .max(batch_version),
+            )?;
+        }
+        let overlay = self.overlay_after_visible_self_batch(batch_events)?;
+        Ok((applied, overlay))
+    }
+
     fn local_tail_overlay_after_self_batch(
         &self,
         batch_events: &[MetaEvent],
@@ -3203,10 +3220,8 @@ impl PgMetaEngine {
 
         let local_events = self.local.read_events_range(start, end)?;
         let retained_block_overlay = self.local.local_overlay_inodes()?;
-        let fully_published_regular_inodes = self.fully_published_regular_inodes_for_self_batch(
-            &local_events,
-            &retained_block_overlay,
-        )?;
+        let fully_published_regular_inodes =
+            self.fully_published_regular_inodes_for_self_batch(&local_events)?;
         let mut projected_prefix = Vec::with_capacity(batch_events.len());
         let mut consumed_events = 0usize;
         let mut ackable_events = 0usize;
@@ -3251,10 +3266,8 @@ impl PgMetaEngine {
 
         let local_events = self.local.read_events_range(start, end)?;
         let retained_block_overlay = self.local.local_overlay_inodes()?;
-        let fully_published_regular_inodes = self.fully_published_regular_inodes_for_self_batch(
-            &local_events,
-            &retained_block_overlay,
-        )?;
+        let fully_published_regular_inodes =
+            self.fully_published_regular_inodes_for_self_batch(&local_events)?;
         let mut projected_prefix = Vec::with_capacity(batch_events.len());
         let mut consumed_events = 0usize;
         for _ in &local_events {
@@ -3313,10 +3326,8 @@ impl PgMetaEngine {
 
         let local_events = self.local.read_events_range(start, end)?;
         let retained_block_overlay = self.local.local_overlay_inodes()?;
-        let fully_published_regular_inodes = self.fully_published_regular_inodes_for_self_batch(
-            &local_events,
-            &retained_block_overlay,
-        )?;
+        let fully_published_regular_inodes =
+            self.fully_published_regular_inodes_for_self_batch(&local_events)?;
         let mut projected_prefix = Vec::with_capacity(batch_events.len());
         let mut consumed_events = 0usize;
         let mut ackable_events = 0usize;
@@ -3715,9 +3726,12 @@ impl PgMetaEngine {
             idx = next_idx;
 
             if is_self_batch {
-                applied_any |= self.apply_visible_self_batch(&batch_events)?;
-                self.acknowledge_local_prefix_from_self_batch(&batch_events)?;
-                next_overlay_override = Some(self.overlay_after_visible_self_batch(&batch_events)?);
+                let (self_applied, overlay_after_self) =
+                    self.apply_remote_self_batch(batch_version, &batch_events)?;
+                applied_any |= self_applied;
+                max_namespace_version =
+                    max_namespace_version.max(self.namespace_version.load(Ordering::SeqCst));
+                next_overlay_override = Some(overlay_after_self);
             } else {
                 let effective_overlay = if let Some(recent_flush) = recent_flush {
                     if batch_version < recent_flush.batch_version {
@@ -6510,6 +6524,76 @@ mod tests {
     }
 
     #[test]
+    fn remote_self_batch_clears_ready_overlay_retained_by_older_foreign_conflict() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+        let file = create_published_small_file(&pg, ROOT_INO, b"ready-retained.txt", 77_221);
+        publish_local_events_to_base(&pg);
+
+        let start = pg.flushed_event_seq.load(Ordering::SeqCst);
+        publish_file_payload(&pg, file.ino, 0, 64, 2, 77_222);
+        let end = pg.local.get_counter("nextEventSeq").expect("event end");
+        let local_events = pg
+            .local
+            .read_events_range(start, end)
+            .expect("read local self batch");
+        let self_batch = PgMetaEngine::project_remote_events(&local_events);
+        pg.apply_visible_self_batch(&self_batch)
+            .expect("materialize local ready payload in serving overlay");
+        let overlay = pg
+            .local_overlay_conflicts()
+            .expect("local ready overlay conflicts");
+        assert!(
+            overlay.block_inodes.contains(&file.ino),
+            "unacknowledged publish events should protect the local ready payload"
+        );
+
+        let older_foreign_publish = published_payload_events(file.ino, 3, 64, 77_223);
+        pg.apply_foreign_batch(&older_foreign_publish, &overlay)
+            .expect("apply older foreign batch");
+        assert_eq!(
+            visible_object_id(&pg, file.ino),
+            77_222,
+            "the older foreign batch should not replace the local ready payload yet"
+        );
+        assert!(
+            pg.local_overlay_conflicts()
+                .expect("retained overlay after foreign")
+                .block_inodes
+                .contains(&file.ino),
+            "the retained overlay reproduces the convergence blocker"
+        );
+
+        pg.apply_remote_self_batch(12, &self_batch)
+            .expect("apply remote self batch");
+        assert_eq!(
+            visible_object_id(&pg, file.ino),
+            77_222,
+            "the remote self batch should keep the winning local payload visible"
+        );
+        assert_eq!(
+            pg.flushed_event_seq.load(Ordering::SeqCst),
+            end,
+            "the ready self batch should become ackable even after a retained overlay"
+        );
+        assert!(
+            pg.local_overlay_conflicts()
+                .expect("overlay after self ack")
+                .block_inodes
+                .is_empty(),
+            "ready self ack must clear the retained block overlay so later PG winners can apply"
+        );
+
+        let later_foreign_publish = published_payload_events(file.ino, 4, 64, 77_224);
+        pg.apply_foreign_batch(&later_foreign_publish, &OverlayConflictSets::default())
+            .expect("apply later foreign batch");
+        assert_eq!(
+            visible_object_id(&pg, file.ino),
+            77_224,
+            "a later PG winner must not be masked by the old retained overlay"
+        );
+    }
+
+    #[test]
     fn foreign_unlink_during_local_append_does_not_leave_private_dentry() {
         let (_dir, pg) = temp_pg_engine_for_unit();
         let file = create_published_small_file(&pg, ROOT_INO, b"append-race.txt", 77_301);
@@ -6824,6 +6908,37 @@ mod tests {
         assert!(
             PgMetaEngine::batch_updates_remote_namespace_visibility(&events),
             "publishing the first visible payload can make an existing regular-file dentry appear"
+        );
+    }
+
+    #[test]
+    fn remote_self_batch_updates_namespace_visibility_token() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+        let start = pg.flushed_event_seq.load(Ordering::SeqCst);
+        create_published_small_file(&pg, ROOT_INO, b"self-visible-file.bin", 77_702);
+        let end = pg.local.get_counter("nextEventSeq").expect("event end");
+        let events = pg
+            .local
+            .read_events_range(start, end)
+            .expect("read visible self events");
+        let remote_events = PgMetaEngine::project_remote_events(&events);
+        assert!(
+            PgMetaEngine::batch_updates_remote_namespace_visibility(&remote_events),
+            "test setup must produce a remotely visible namespace batch"
+        );
+
+        pg.apply_remote_self_batch(42, &remote_events)
+            .expect("apply remote self batch");
+
+        assert_eq!(
+            pg.namespace_version.load(Ordering::SeqCst),
+            42,
+            "self batches must advance the namespace token so mounted clients invalidate their own remote-visible view"
+        );
+        assert_eq!(
+            pg.flushed_event_seq.load(Ordering::SeqCst),
+            end,
+            "applying the remote self batch should still acknowledge the matching local prefix"
         );
     }
 

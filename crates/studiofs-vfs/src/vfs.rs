@@ -2897,6 +2897,7 @@ struct StartupReplayCoordinator<'a> {
     quarantined_inodes: HashSet<Ino>,
     quarantined_object_ids: HashSet<u64>,
     replay_ops: Vec<(u64, u64, u64, u64)>,
+    uploaded_overlay_progress: Vec<(Ino, u64, u64)>,
     live_extents: HashMap<(Ino, u32), ExtentRecordId>,
     pending_epoch_finalizations: Vec<(Ino, u64)>,
     seen_replay_inodes: HashSet<Ino>,
@@ -2945,6 +2946,7 @@ impl<'a> StartupReplayCoordinator<'a> {
             quarantined_inodes: HashSet::new(),
             quarantined_object_ids: HashSet::new(),
             replay_ops: Vec::new(),
+            uploaded_overlay_progress: Vec::new(),
             live_extents: HashMap::new(),
             pending_epoch_finalizations: Vec::new(),
             seen_replay_inodes: HashSet::new(),
@@ -2999,6 +3001,13 @@ impl<'a> StartupReplayCoordinator<'a> {
         }
 
         if needs_finalization {
+            for graph_object in &graph_objects {
+                self.record_uploaded_overlay_progress_if_local(
+                    ino,
+                    graph_object,
+                    attr.content_epoch,
+                );
+            }
             self.record_epoch_finalization(ino, attr.content_epoch, graph_objects.as_slice());
         }
     }
@@ -3125,6 +3134,23 @@ impl<'a> StartupReplayCoordinator<'a> {
             content_epoch,
         );
         self.restored_live_extents = self.restored_live_extents.saturating_add(1);
+    }
+
+    fn record_uploaded_overlay_progress_if_local(
+        &mut self,
+        ino: Ino,
+        graph_object: &StartupGraphObject,
+        content_epoch: u64,
+    ) {
+        if self
+            .vfs
+            .local_payload_backend
+            .lifecycle_state(graph_object.object_id)
+            == LocalPayloadLifecycleState::Uploaded
+        {
+            self.uploaded_overlay_progress
+                .push((ino, content_epoch, graph_object.object_id));
+        }
     }
 
     fn record_epoch_finalization(
@@ -3383,10 +3409,49 @@ impl<'a> StartupReplayCoordinator<'a> {
         );
     }
 
+    fn restore_uploaded_overlay_progress(&mut self) {
+        if self.uploaded_overlay_progress.is_empty() {
+            return;
+        }
+
+        let candidates: BTreeSet<_> = self.uploaded_overlay_progress.iter().copied().collect();
+        let mut restored = 0u64;
+        for (ino, content_epoch, object_id) in candidates {
+            match self
+                .vfs
+                .sync_meta()
+                .mark_regular_file_overlay_object_uploaded_if_matches(ino, content_epoch, object_id)
+            {
+                Ok(true) => {
+                    restored = restored.saturating_add(1);
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    self.replay_failures = self.replay_failures.saturating_add(1);
+                    warn!(
+                        ino,
+                        content_epoch,
+                        object_id,
+                        error = %error,
+                        "failed to restore uploaded overlay progress from local payload backend"
+                    );
+                }
+            }
+        }
+
+        if restored > 0 {
+            info!(
+                restored_uploaded_overlay_objects = restored,
+                "recovered uploaded overlay progress from local payload backend"
+            );
+        }
+    }
+
     fn finish(mut self) {
         self.mark_pending_uploads_without_attrs_stale();
         self.discard_quarantined_dirty_objects();
         self.merge_pending_live_extents();
+        self.restore_uploaded_overlay_progress();
         let replayed_blocks = self.restored_live_extents as u64;
         let replayed_object_ids: Vec<_> = self
             .replay_ops
@@ -4428,6 +4493,29 @@ impl StudioVfs {
         attrs: &[InodeAttr],
     ) {
         StartupReplayCoordinator::new(self, pending_uploads).run(attrs);
+    }
+
+    fn recover_missing_dirty_uploads_from_local_backend(&self) {
+        if self.cached_store.pending_upload_count() != 0 || self.upload_scheduler.in_flight() != 0 {
+            return;
+        }
+
+        let pending_uploads = self.pending_uploads_snapshot();
+        if !pending_uploads.is_empty() {
+            return;
+        }
+
+        let attrs = match self.sync_meta().list_inode_attrs() {
+            Ok(attrs) => attrs,
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "failed to enumerate inode attrs for runtime dirty upload recovery"
+                );
+                return;
+            }
+        };
+        self.replay_dirty_uploads_from_local_backend(pending_uploads.as_slice(), attrs.as_slice());
     }
 
     fn ensure_can_start(&self) -> VfsResult<()> {

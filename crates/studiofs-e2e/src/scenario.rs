@@ -3817,6 +3817,7 @@ fn execute_mounted_chaos_action(
 fn write_payload_with_publication_barrier(path: &Path, payload: &[u8]) -> io::Result<()> {
     let mut options = mounted_write_barrier_open_options();
     let mut file = options.create(true).truncate(true).open(path)?;
+    file.set_len(0)?;
     file.write_all(payload)?;
     file.sync_all()
 }

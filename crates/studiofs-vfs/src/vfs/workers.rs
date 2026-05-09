@@ -715,6 +715,9 @@ impl StudioVfs {
             let local_backend_dirty_count = self.local_payload_backend.dirty_object_count();
             let transit_memory = self.transit_memory_budget.snapshot();
             let file_sessions = self.file_session_stats();
+            if pending == 0 && active_uploads == 0 {
+                self.recover_missing_dirty_uploads_from_local_backend();
+            }
 
             if should_log {
                 ticks_since_last_log = 0;

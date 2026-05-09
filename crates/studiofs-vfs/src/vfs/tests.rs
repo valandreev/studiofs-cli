@@ -1043,7 +1043,7 @@ fn startup_replay_rebuilds_runtime_pending_upload_index_from_persisted_state() {
         vfs.cached_store().snapshot_pending_uploads().is_empty(),
         "test setup requires the runtime queue to start empty"
     );
-    vfs.replay_dirty_uploads_from_local_backend(&[], &[attr.clone()]);
+    vfs.recover_missing_dirty_uploads_from_local_backend();
 
     let runtime_pending = vfs.cached_store().snapshot_pending_uploads();
     assert_eq!(runtime_pending.len(), 1);
@@ -1056,6 +1056,147 @@ fn startup_replay_rebuilds_runtime_pending_upload_index_from_persisted_state() {
     assert!(
         vfs.cached_store().has_staged_upload(object_id),
         "startup replay should restore upload links so recovered uploads do not depend on cold rereads"
+    );
+}
+
+#[test]
+fn runtime_recovery_rebuilds_missing_dirty_upload_queue() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "runtime-replay-runtime-uploads");
+
+    let created = vfs
+        .create(1, b"runtime-replay.bin", 0, 0, 0o644)
+        .expect("create test file");
+    let ino = created.ino;
+    let object_id = 7_012;
+    let payload = vec![0xDB; 4096];
+
+    vfs.local_payload_backend()
+        .put(object_id, &payload, false)
+        .expect("persist local payload");
+    vfs.local_payload_backend()
+        .sync_data()
+        .expect("sync local payload");
+
+    let mut attr = meta.get_attr(ino).expect("load test attr");
+    attr.size = payload.len() as u64;
+    attr.committed_size = 0;
+    attr.content_epoch = 9;
+    attr.committed_content_epoch = 8;
+    attr.upload_state = MetaUploadState::Uploading;
+    meta.set_attr(&attr).expect("persist staged attr");
+    meta.stage_payload_slice(
+        ino,
+        0,
+        &PayloadRef::new_partial(object_id, payload.len() as u32),
+    )
+    .expect("persist current payload slice");
+
+    assert!(
+        vfs.cached_store().snapshot_pending_uploads().is_empty(),
+        "test setup requires the runtime queue to start empty"
+    );
+
+    vfs.replay_dirty_uploads_from_local_backend(&[], &[attr.clone()]);
+
+    let runtime_pending = vfs.cached_store().snapshot_pending_uploads();
+    assert_eq!(runtime_pending.len(), 1);
+    assert_eq!(runtime_pending[0].ino, ino);
+    assert_eq!(runtime_pending[0].object_id, object_id);
+}
+
+#[test]
+fn runtime_recovery_restores_uploaded_overlay_progress_without_reupload() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "runtime-replay-uploaded-overlay");
+
+    let created = vfs
+        .create(1, b"runtime-uploaded-overlay.bin", 0, 0, 0o644)
+        .expect("create test file");
+    let ino = created.ino;
+    let object_id = 7_013;
+    let payload = vec![0xDC; 4096];
+
+    vfs.local_payload_backend()
+        .put(object_id, &payload, false)
+        .expect("persist local payload");
+    vfs.local_payload_backend().mark_uploaded(object_id);
+    vfs.local_payload_backend()
+        .sync_data()
+        .expect("sync local payload");
+
+    let mut attr = meta.get_attr(ino).expect("load test attr");
+    attr.size = payload.len() as u64;
+    attr.committed_size = 0;
+    attr.content_epoch = 9;
+    attr.committed_content_epoch = 8;
+    attr.upload_state = MetaUploadState::Uploading;
+    meta.set_attr(&attr).expect("persist staged attr");
+    meta.stage_payload_slice(
+        ino,
+        0,
+        &PayloadRef::new_partial(object_id, payload.len() as u32),
+    )
+    .expect("persist local-only payload slice");
+
+    assert_eq!(
+        vfs.local_payload_backend().dirty_object_count(),
+        0,
+        "regression setup must not rely on dirty-object replay"
+    );
+    assert_eq!(
+        vfs.local_payload_backend().lifecycle_state(object_id),
+        LocalPayloadLifecycleState::Uploaded,
+        "regression setup should model an object uploaded before metadata progress was restored"
+    );
+    assert!(
+        meta.has_regular_file_overlay_object_if_matches(ino, attr.content_epoch, object_id)
+            .expect("query overlay object"),
+        "regression setup should keep the object in the local overlay graph"
+    );
+    assert!(
+        vfs.cached_store().snapshot_pending_uploads().is_empty(),
+        "test setup requires the runtime upload queue to start empty"
+    );
+    assert_eq!(
+        vfs.cached_store().pending_upload_count(),
+        0,
+        "pending upload count should agree with the empty runtime queue"
+    );
+    assert_eq!(
+        vfs.upload_scheduler.in_flight(),
+        0,
+        "upload scheduler should be idle before recovery"
+    );
+    assert_eq!(
+        meta.get_inode_lifecycle(ino)
+            .expect("load lifecycle before recovery")
+            .expect("lifecycle should exist before recovery")
+            .state,
+        InodeLifecycleState::LocalOnly,
+        "metadata should still consider the uploaded object local-only before recovery"
+    );
+
+    vfs.recover_missing_dirty_uploads_from_local_backend();
+
+    assert!(
+        vfs.cached_store().snapshot_pending_uploads().is_empty(),
+        "uploaded local payload should advance metadata progress without reuploading"
+    );
+    assert_eq!(
+        meta.get_inode_lifecycle(ino)
+            .expect("load lifecycle after recovery")
+            .expect("lifecycle should exist after recovery")
+            .state,
+        InodeLifecycleState::PublishReady
+    );
+    assert!(
+        vfs.state
+            .upload
+            .pending_epoch_finalizations
+            .lock()
+            .contains(&(ino, attr.content_epoch)),
+        "uploaded overlay recovery should queue publication of the restored epoch"
     );
 }
 
