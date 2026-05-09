@@ -3863,6 +3863,8 @@ mod tests {
         executor
             .require_missing_lock_before_compose_cleanup
             .replace(Some(lock_path.clone()));
+        let studiofs_bin = temp.path().join("studiofs.exe");
+        fs::write(&studiofs_bin, b"test studiofs binary").unwrap();
 
         let outcome = run_with_executor_and_mount_lock_dir(
             RunRequest {
@@ -3873,7 +3875,7 @@ mod tests {
                     scenario::TEST_PASSING.to_string(),
                 ],
                 seed: 384,
-                studiofs_bin: Some(temp.path().join("studiofs.exe")),
+                studiofs_bin: Some(studiofs_bin),
                 platform: PlatformSelection::WindowsWinfsp,
                 retention: RetentionPolicy::Always,
                 report: None,
@@ -5145,6 +5147,9 @@ mod tests {
             }
             if command.args.contains(&"up".to_string()) {
                 if let Some(events_path) = self.poison_events_path_after_up.borrow_mut().take() {
+                    if events_path.is_file() {
+                        std::fs::remove_file(&events_path)?;
+                    }
                     std::fs::create_dir_all(events_path)?;
                 }
             }

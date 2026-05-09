@@ -6465,7 +6465,7 @@ mod tests {
             .expect("pending upload overlay conflicts");
         assert!(
             overlay.block_inodes.contains(&file.ino),
-            "test setup must retain a local block overlay while upload is in flight"
+            "test setup must retain a local payload overlay while upload is in flight"
         );
 
         let older_publish = published_payload_events(file.ino, 1, 64, 77_204);
@@ -7386,6 +7386,8 @@ mod tests {
             .local
             .get_counter("nextEventSeq")
             .expect("read baseline seq");
+        pg.persist_flushed_event_seq(baseline)
+            .expect("mark setup events flushed");
         {
             let mut state = pg.pending_state.lock().expect("pending_state");
             *state = PendingReplicationState::default();

@@ -4262,7 +4262,10 @@ fn client_mounts(context: &ScenarioContext, clients: &[ClientSpec]) -> Vec<Clien
             if let Some(config) = &context.client_controller_config {
                 mount = mount
                     .with_diagnostics_probe(config.studiofs_bin.clone(), client.client_root.clone())
-                    .with_remote_metadata_probe(config.meta_dsn.clone());
+                    .with_remote_metadata_probe(
+                        config.meta_dsn.clone(),
+                        config.volume_name.clone(),
+                    );
             }
             mount
         })
@@ -12320,6 +12323,32 @@ mod tests {
             .to_string(),
             stderr: String::new(),
         }
+    }
+
+    #[test]
+    fn client_mounts_scope_remote_metadata_probe_to_configured_volume() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let config = test_client_controller_config(&sandbox);
+        let context = ScenarioContext {
+            run_id: "run-1".to_string(),
+            seed: 389,
+            sandbox: sandbox.clone(),
+            scenario_dir: sandbox.join("artifacts").join("scenarios").join("unit"),
+            client_controller_config: Some(config.clone()),
+        };
+        let clients = vec![client_spec_for(
+            &sandbox,
+            &config.volume_name,
+            "client-a",
+            temp.path().join("mount-a"),
+        )];
+
+        let mounts = client_mounts(&context, &clients);
+
+        let probe = mounts[0].remote_metadata_probe.as_ref().unwrap();
+        assert_eq!(probe.meta_dsn, config.meta_dsn);
+        assert_eq!(probe.volume_name, config.volume_name);
     }
 
     fn test_client_controller_config(sandbox: &Path) -> ClientControllerConfig {
