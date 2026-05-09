@@ -871,10 +871,9 @@ fn classify_client_quiescence(
 }
 
 fn push_positive_reason(reasons: &mut Vec<String>, field: &str, value: Option<u64>) {
-    if let Some(value) = value
-        && value > 0
-    {
-        reasons.push(format!("{field}={value}"));
+    match value {
+        Some(value) if value > 0 => reasons.push(format!("{field}={value}")),
+        _ => {}
     }
 }
 
