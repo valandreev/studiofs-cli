@@ -160,6 +160,8 @@ pub struct MetadataInvalidationDiagnostics {
     pub sync_errors: u64,
     /// Unix timestamp in milliseconds for the last successful metadata sync.
     pub last_successful_sync_unix_ms: Option<i64>,
+    /// Last local metadata event sequence durably flushed to remote.
+    pub flushed_event_seq: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

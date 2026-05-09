@@ -2567,6 +2567,9 @@ impl PgMetaEngine {
         retained_block_overlay: &HashSet<Ino>,
     ) -> bool {
         match event {
+            MetaEvent::AddEntry { entry, .. } if entry.kind == FileType::RegularFile => {
+                !retained_block_overlay.contains(&entry.ino)
+            }
             MetaEvent::SetAttr { attr } if attr.kind == FileType::RegularFile => {
                 attr.size == attr.committed_size || !retained_block_overlay.contains(&attr.ino)
             }
@@ -3149,6 +3152,43 @@ impl PgMetaEngine {
         )))
     }
 
+    fn local_unackable_overlay_after_self_batch(
+        &self,
+        batch_events: &[MetaEvent],
+    ) -> MetaResult<Option<OverlayConflictSets>> {
+        let start = self.flushed_event_seq.load(Ordering::SeqCst);
+        let end = self.local.get_counter("nextEventSeq")?;
+        if end <= start {
+            return Ok(Some(OverlayConflictSets::default()));
+        }
+
+        let local_events = self.local.read_events_range(start, end)?;
+        let retained_block_overlay = self.local.local_overlay_inodes()?;
+        let mut projected_prefix = Vec::with_capacity(batch_events.len());
+        let mut consumed_events = 0usize;
+        for _ in &local_events {
+            consumed_events = consumed_events.saturating_add(1);
+            projected_prefix = Self::project_remote_events(&local_events[..consumed_events]);
+            if projected_prefix.len() >= batch_events.len() {
+                break;
+            }
+        }
+        if projected_prefix.len() != batch_events.len() {
+            return Ok(None);
+        }
+
+        if !Self::projected_events_match(&projected_prefix, batch_events)? {
+            return Ok(None);
+        }
+
+        let unackable_events = local_events[..consumed_events]
+            .iter()
+            .filter(|event| !Self::self_batch_event_fully_ackable(event, &retained_block_overlay))
+            .cloned()
+            .collect::<Vec<_>>();
+        Ok(Some(Self::overlay_conflicts_for_events(&unackable_events)))
+    }
+
     fn acknowledge_local_prefix_from_self_batch(
         &self,
         batch_events: &[MetaEvent],
@@ -3553,6 +3593,7 @@ impl PgMetaEngine {
         let mut max_namespace_version = self.namespace_version.load(Ordering::SeqCst);
         let mut idx = 0;
         while idx < rows.len() {
+            let mut next_overlay_override = None;
             let (batch_version, next_idx, batch_events, is_self_batch) =
                 Self::decode_foreign_batch(&rows, idx, client_id)?;
             idx = next_idx;
@@ -3560,6 +3601,8 @@ impl PgMetaEngine {
             if is_self_batch {
                 applied_any |= self.apply_visible_self_batch(&batch_events)?;
                 self.acknowledge_local_prefix_from_self_batch(&batch_events)?;
+                next_overlay_override =
+                    self.local_unackable_overlay_after_self_batch(&batch_events)?;
             } else {
                 let effective_overlay = if let Some(recent_flush) = recent_flush {
                     if batch_version < recent_flush.batch_version {
@@ -3576,7 +3619,7 @@ impl PgMetaEngine {
                 }
             }
             max_version = batch_version;
-            overlay = self.local_overlay_conflicts()?;
+            overlay = next_overlay_override.unwrap_or(self.local_overlay_conflicts()?);
         }
         self.persist_local_version(max_version)?;
         if max_namespace_version > self.namespace_version.load(Ordering::SeqCst) {
@@ -4865,6 +4908,7 @@ impl MetaReplication for PgMetaEngine {
             sync_errors: self.metadata_sync_errors.load(Ordering::Relaxed),
             last_successful_sync_unix_ms: (last_successful_sync_unix_ms > 0)
                 .then_some(last_successful_sync_unix_ms),
+            flushed_event_seq: Some(self.flushed_event_seq.load(Ordering::SeqCst)),
         }
     }
 
@@ -5738,6 +5782,68 @@ mod tests {
                     if entry.kind == FileType::RegularFile && entry.ino == file.ino
             )),
             "remote projection must include the original regular-file dentry"
+        );
+    }
+
+    #[test]
+    fn self_ack_does_not_skip_hidden_regular_create_before_visible_tail() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+        let start = pg.flushed_event_seq.load(Ordering::SeqCst);
+        let hidden = pg
+            .create_file(ROOT_INO, b"hidden-before-visible.bin", 0, 0, 0o644)
+            .expect("create hidden file");
+        set_file_state(&pg, hidden.ino, 4096, 1);
+        let hidden_payload = PayloadRef::new_partial(77_778, 4096);
+        pg.stage_payload_slice(hidden.ino, 0, &hidden_payload)
+            .expect("stage hidden payload");
+        let visible = pg
+            .create_file(ROOT_INO, b"visible-tail.bin", 0, 0, 0o644)
+            .expect("create visible tail file");
+
+        let end = pg.local.get_counter("nextEventSeq").expect("event end");
+        let events = pg
+            .local
+            .read_events_range(start, end)
+            .expect("read mixed local events");
+        let projected = PgMetaEngine::project_remote_events(&events);
+        assert!(
+            !projected.iter().any(|event| matches!(
+                event,
+                MetaEvent::AddEntry { entry, .. } if entry.ino == hidden.ino
+            )),
+            "hidden regular-file dentry must not be published yet"
+        );
+        assert!(
+            projected.iter().any(|event| matches!(
+                event,
+                MetaEvent::AddEntry { entry, .. } if entry.ino == visible.ino
+            )),
+            "later visible events keep the batch non-empty"
+        );
+
+        pg.acknowledge_local_prefix_from_self_batch(&projected)
+            .expect("ack visible self batch");
+        mark_overlay_objects_uploaded(&pg, hidden.ino, 1, &[hidden_payload.object_id]);
+        assert!(
+            pg.publish_regular_file_overlay_to_base_if_matches(hidden.ino, 1)
+                .expect("publish hidden payload"),
+            "hidden file publish must succeed"
+        );
+
+        let batch = pg
+            .claim_pending_batch(true)
+            .expect("claim later publish batch");
+        let events = pg
+            .local
+            .read_events_range(batch.event_start, batch.event_end)
+            .expect("read later publish events");
+        let projected = PgMetaEngine::project_remote_events(&events);
+        assert!(
+            projected.iter().any(|event| matches!(
+                event,
+                MetaEvent::AddEntry { entry, .. } if entry.ino == hidden.ino
+            )),
+            "later publish must still include the hidden file dentry"
         );
     }
 

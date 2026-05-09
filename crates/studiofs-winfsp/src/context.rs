@@ -2008,7 +2008,7 @@ const FILE_ACTION_MODIFIED: u32 = 0x0000_0003;
 
 fn notify_filter_for_kind(kind: FileType) -> u32 {
     if kind == FileType::Directory {
-        FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_ATTRIBUTES
+        FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_ATTRIBUTES
     } else {
         FILE_NOTIFY_CHANGE_FILE_NAME
             | FILE_NOTIFY_CHANGE_SIZE
@@ -3980,7 +3980,9 @@ mod tests {
     fn notify_filter_matches_inode_kind() {
         assert_eq!(
             notify_filter_for_kind(studiofs_meta::FileType::Directory),
-            FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_ATTRIBUTES
+            FILE_NOTIFY_CHANGE_FILE_NAME
+                | FILE_NOTIFY_CHANGE_DIR_NAME
+                | FILE_NOTIFY_CHANGE_ATTRIBUTES
         );
         assert_eq!(
             notify_filter_for_kind(studiofs_meta::FileType::RegularFile),

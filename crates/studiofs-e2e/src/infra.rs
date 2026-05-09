@@ -13,7 +13,8 @@ use thiserror::Error;
 
 const DEFAULT_WAIT_TIMEOUT_SECS: u64 = 120;
 const HOST_HEALTH_RETRY_DEADLINE: Duration = Duration::from_secs(60);
-const HOST_HEALTH_ATTEMPT_TIMEOUT_SECS: u64 = 2;
+const HOST_HEALTH_ATTEMPT_TIMEOUT_SECS: u64 = 5;
+const HOST_HEALTH_COMMAND_TIMEOUT_PADDING_SECS: u64 = 1;
 const HOST_HEALTH_RETRY_DELAY: Duration = Duration::from_secs(1);
 const COMPOSE_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(120);
 const TIMED_OUT_COMMAND_EXIT_WAIT: Duration = Duration::from_secs(5);
@@ -462,7 +463,6 @@ pub struct DockerComposeStack {
     project_name: String,
     sandbox: PathBuf,
     compose_file: PathBuf,
-    port_range: Option<String>,
     ports: Vec<ServicePort>,
     wait_timeout_secs: u64,
 }
@@ -480,7 +480,6 @@ impl DockerComposeStack {
             run_id: config.run_id,
             sandbox: config.sandbox,
             compose_file,
-            port_range: config.port_range,
             ports,
             wait_timeout_secs: config.wait_timeout_secs,
         })
@@ -494,28 +493,6 @@ impl DockerComposeStack {
     /// Function $name.
     pub fn ports(&self) -> &[ServicePort] {
         &self.ports
-    }
-
-    /// Function $name.
-    pub fn advance_port_block(&mut self) -> Result<bool, InfraError> {
-        let Some(range) = self.port_range.as_deref() else {
-            return Ok(false);
-        };
-        let Some(current_start) = self.ports.first().map(|port| port.host_port) else {
-            return Ok(false);
-        };
-        let (_, end) = parse_port_range_bounds(range)?;
-        let max_start = end.saturating_sub(SERVICE_PORTS.len() as u16 - 1);
-        if max_start <= current_start {
-            return Ok(false);
-        }
-        let next_start = max_start;
-        self.ports = SERVICE_PORTS
-            .iter()
-            .enumerate()
-            .map(|(offset, spec)| service_port(*spec, next_start + offset as u16))
-            .collect();
-        Ok(true)
     }
 
     /// Function $name.
@@ -1023,7 +1000,9 @@ fn host_health_check(
             ],
             Vec::new(),
             None,
-            Some(Duration::from_secs(HOST_HEALTH_ATTEMPT_TIMEOUT_SECS)),
+            Some(Duration::from_secs(
+                HOST_HEALTH_ATTEMPT_TIMEOUT_SECS + HOST_HEALTH_COMMAND_TIMEOUT_PADDING_SECS,
+            )),
         );
         match executor.run(&command) {
             Ok(output) if output.status == 0 => {

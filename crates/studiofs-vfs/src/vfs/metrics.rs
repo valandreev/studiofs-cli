@@ -619,6 +619,9 @@ pub struct VfsMetadataInvalidationStats {
     /// Unix timestamp in milliseconds for the last successful metadata sync.
     pub last_successful_sync_unix_ms: Option<i64>,
     #[serde(default)]
+    /// Last local metadata event sequence durably flushed to remote.
+    pub flushed_event_seq: Option<u64>,
+    #[serde(default)]
     /// Local namespace version token observed by this mounted client.
     pub namespace_version_token: Option<String>,
     #[serde(default)]

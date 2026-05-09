@@ -7846,6 +7846,7 @@ impl StudioVfs {
                 sync_errors: metadata_invalidation_diagnostics.sync_errors,
                 last_successful_sync_unix_ms: metadata_invalidation_diagnostics
                     .last_successful_sync_unix_ms,
+                flushed_event_seq: metadata_invalidation_diagnostics.flushed_event_seq,
                 namespace_version_token,
                 metadata_version_token,
                 pending_metadata_ops: metadata_replication_backlog.pending_ops,

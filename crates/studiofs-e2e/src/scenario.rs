@@ -1158,11 +1158,7 @@ fn run_mounted_smoke_body(
     let smoke_file = clients[0].mount_point.join(SMOKE_FILE_NAME);
     fs::write(&smoke_file, SMOKE_FILE_PAYLOAD)?;
     driver.after_smoke_write(&clients, SMOKE_FILE_NAME)?;
-    let mounts = clients
-        .iter()
-        .take(SMOKE_CLIENT_NAMES.len())
-        .map(|client| ClientMount::new(client.name.clone(), client.mount_point.clone()))
-        .collect::<Vec<_>>();
+    let mounts = client_mounts(context, &clients[..SMOKE_CLIENT_NAMES.len()]);
     let convergence = wait_for_convergence(
         &mounts,
         context.scenario_dir.join("validation"),
@@ -1320,11 +1316,7 @@ fn run_postgres_outage_body(
     let recovery_started = Instant::now();
     driver.start_postgres()?;
     append_postgres_runtime_operation(context, SharedOperation::PostgresRecovery)?;
-    let mounts = clients
-        .iter()
-        .take(POSTGRES_OUTAGE_CLIENT_NAMES.len())
-        .map(|client| ClientMount::new(client.name.clone(), client.mount_point.clone()))
-        .collect::<Vec<_>>();
+    let mounts = client_mounts(context, &clients[..POSTGRES_OUTAGE_CLIENT_NAMES.len()]);
     let convergence = wait_for_convergence(
         &mounts,
         context.scenario_dir.join("validation"),
@@ -1585,11 +1577,7 @@ fn run_rustfs_outage_body(
     let source_file = clients[0].mount_point.join(relative_path);
     write_mounted_file(&source_file, RUSTFS_OUTAGE_INITIAL_PAYLOAD)?;
     driver.after_initial_write(&clients, relative_path)?;
-    let initial_mounts = clients
-        .iter()
-        .take(RUSTFS_OUTAGE_CLIENT_NAMES.len())
-        .map(|client| ClientMount::new(client.name.clone(), client.mount_point.clone()))
-        .collect::<Vec<_>>();
+    let initial_mounts = client_mounts(context, &clients[..RUSTFS_OUTAGE_CLIENT_NAMES.len()]);
     wait_for_convergence(
         &initial_mounts,
         context.scenario_dir.join("healthy-validation"),
@@ -1958,10 +1946,7 @@ fn run_crash_restart_mode(
     driver.before_convergence_validation(mode, relative_path, clients)?;
 
     let convergence_started = Instant::now();
-    let mounts = clients
-        .iter()
-        .map(|client| ClientMount::new(client.name.clone(), client.mount_point.clone()))
-        .collect::<Vec<_>>();
+    let mounts = client_mounts(context, clients);
     let convergence = wait_for_convergence(
         &mounts,
         context
@@ -2260,10 +2245,7 @@ fn run_publication_boundary(
     let peer_visibility_at_publication_gate =
         publication_boundary_peer_visibility(&clients[1..], relative_path)?;
     let convergence_started = Instant::now();
-    let mounts = clients
-        .iter()
-        .map(|client| ClientMount::new(client.name.clone(), client.mount_point.clone()))
-        .collect::<Vec<_>>();
+    let mounts = client_mounts(context, clients);
     let convergence = wait_for_convergence(
         &mounts,
         context.scenario_dir.join(format!(
@@ -2787,7 +2769,7 @@ fn run_mounted_chaos_body(
 
     establish_mounted_chaos_initial_tree(context.seed, &clients[0])?;
     driver.after_initial_tree(&clients)?;
-    let mounts = client_mounts(&clients);
+    let mounts = client_mounts(context, &clients);
     wait_for_convergence(
         &mounts,
         context.scenario_dir.join("initial-validation"),
@@ -4030,7 +4012,7 @@ fn finish_mounted_chaos(
     poll_interval: Duration,
 ) -> Result<MountedChaosSummary, ScenarioError> {
     let convergence = wait_for_convergence(
-        &client_mounts(&clients),
+        &client_mounts(context, &clients),
         context.scenario_dir.join("validation"),
         convergence_timeout,
         poll_interval,
@@ -4087,10 +4069,18 @@ fn mounted_chaos_summary(
     }
 }
 
-fn client_mounts(clients: &[ClientSpec]) -> Vec<ClientMount> {
+fn client_mounts(context: &ScenarioContext, clients: &[ClientSpec]) -> Vec<ClientMount> {
     clients
         .iter()
-        .map(|client| ClientMount::new(client.name.clone(), client.mount_point.clone()))
+        .map(|client| {
+            let mut mount = ClientMount::new(client.name.clone(), client.mount_point.clone());
+            if let Some(config) = &context.client_controller_config {
+                mount = mount
+                    .with_diagnostics_probe(config.studiofs_bin.clone(), client.client_root.clone())
+                    .with_remote_metadata_probe(config.meta_dsn.clone());
+            }
+            mount
+        })
         .collect()
 }
 
@@ -4300,7 +4290,7 @@ fn run_mounted_hotspot_churn_body(
     establish_hotspot_initial_tree(context.seed, &clients[0])?;
     driver.after_initial_tree(&clients)?;
     wait_for_convergence(
-        &client_mounts(&clients),
+        &client_mounts(context, &clients),
         context.scenario_dir.join("initial-validation"),
         convergence_timeout,
         poll_interval,
@@ -4424,7 +4414,7 @@ fn finish_mounted_hotspot_churn(
     poll_interval: Duration,
 ) -> Result<MountedHotspotChurnSummary, ScenarioError> {
     let convergence = wait_for_convergence(
-        &client_mounts(&clients),
+        &client_mounts(context, &clients),
         context.scenario_dir.join("validation"),
         convergence_timeout,
         poll_interval,
@@ -4900,7 +4890,7 @@ fn run_mounted_fault_chaos_body(
     establish_fault_chaos_initial_tree(context.seed, &warm_clients[0])?;
     driver.after_phase(MountedFaultChaosPhase::HealthyWarmup, &warm_clients)?;
     wait_for_convergence(
-        &client_mounts(&warm_clients),
+        &client_mounts(context, &warm_clients),
         context.scenario_dir.join("warmup-validation"),
         convergence_timeout,
         poll_interval,
@@ -5300,7 +5290,7 @@ fn finish_mounted_fault_chaos(
 ) -> Result<MountedFaultChaosSummary, ScenarioError> {
     let convergence_started = Instant::now();
     let convergence = wait_for_convergence(
-        &client_mounts(&clients),
+        &client_mounts(context, &clients),
         context.scenario_dir.join("validation"),
         convergence_timeout,
         poll_interval,
@@ -5902,7 +5892,7 @@ fn run_mounted_lww_reconnect_body(
     establish_lww_reconnect_initial_tree(context.seed, &warm_clients[0])?;
     driver.after_phase(MountedLwwReconnectPhase::HealthyWarmup, &warm_clients)?;
     wait_for_convergence(
-        &client_mounts(&warm_clients),
+        &client_mounts(context, &warm_clients),
         context.scenario_dir.join("warmup-validation"),
         convergence_timeout,
         poll_interval,
@@ -5944,7 +5934,7 @@ fn run_mounted_lww_reconnect_body(
     operations.push(write_a);
     driver.after_phase(MountedLwwReconnectPhase::OnlineWriters, &online_clients)?;
     wait_for_convergence(
-        &client_mounts(&online_clients),
+        &client_mounts(context, &online_clients),
         context
             .scenario_dir
             .join("online-writers-order-1-validation"),
@@ -5960,7 +5950,7 @@ fn run_mounted_lww_reconnect_body(
     operations.push(write_b);
     driver.after_phase(MountedLwwReconnectPhase::OnlineWriters, &online_clients)?;
     wait_for_convergence(
-        &client_mounts(&online_clients),
+        &client_mounts(context, &online_clients),
         context.scenario_dir.join("online-writers-validation"),
         convergence_timeout,
         poll_interval,
@@ -6149,7 +6139,7 @@ fn finish_mounted_lww_reconnect(
 ) -> Result<MountedLwwReconnectSummary, ScenarioError> {
     let convergence_started = Instant::now();
     let convergence = wait_for_convergence(
-        &client_mounts(&clients),
+        &client_mounts(context, &clients),
         context.scenario_dir.join("validation"),
         convergence_timeout,
         poll_interval,
@@ -6871,7 +6861,7 @@ fn run_open_handle_body(
     establish_open_handle_initial_tree(&clients[0])?;
     driver.after_initial_write(&clients)?;
     wait_for_convergence(
-        &client_mounts(&clients),
+        &client_mounts(context, &clients),
         context.scenario_dir.join("initial-validation"),
         convergence_timeout,
         poll_interval,
@@ -6881,6 +6871,14 @@ fn run_open_handle_body(
     let mut operations = Vec::new();
     let open_unlink = execute_open_unlink_case(context, started, &clients, &mut operations)?;
     driver.after_namespace_mutation(&clients)?;
+    wait_for_open_handle_phase_convergence(
+        context,
+        started,
+        &clients,
+        "open_unlink",
+        convergence_timeout,
+        poll_interval,
+    )?;
     let open_rename = execute_open_rename_case(context, started, &clients, &mut operations)?;
     driver.after_namespace_mutation(&clients)?;
     write_open_handle_operations(context, &operations)?;
@@ -6939,13 +6937,43 @@ fn write_open_handle_plan_artifacts(
     Ok(summary)
 }
 
+fn wait_for_open_handle_phase_convergence(
+    context: &ScenarioContext,
+    started: Instant,
+    clients: &[ClientSpec],
+    phase: &str,
+    convergence_timeout: Duration,
+    poll_interval: Duration,
+) -> Result<ConvergenceOutcome, ScenarioError> {
+    record_open_handle_checkpoint(
+        context,
+        started,
+        None,
+        &format!("{phase}.convergence.started"),
+        None,
+    )?;
+    let convergence = wait_for_convergence(
+        &client_mounts(context, clients),
+        context.scenario_dir.join(format!("{phase}-validation")),
+        convergence_timeout,
+        poll_interval,
+    )?;
+    record_open_handle_checkpoint(
+        context,
+        started,
+        None,
+        &format!("{phase}.convergence.finished"),
+        None,
+    )?;
+    Ok(convergence)
+}
+
 fn establish_open_handle_initial_tree(client: &ClientSpec) -> Result<(), ScenarioError> {
     for relative_path in [OPEN_UNLINK_PATH, OPEN_RENAME_PATH] {
-        let path = client.mount_point.join(relative_path);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(path, OPEN_HANDLE_INITIAL_PAYLOAD)?;
+        write_mounted_chaos_initial_file(
+            client.mount_point.join(relative_path),
+            OPEN_HANDLE_INITIAL_PAYLOAD,
+        )?;
     }
     Ok(())
 }
@@ -7276,7 +7304,7 @@ fn finish_open_handle(
         poll_interval,
     } = input;
     let convergence = wait_for_convergence(
-        &client_mounts(&clients),
+        &client_mounts(context, &clients),
         context.scenario_dir.join("validation"),
         convergence_timeout,
         poll_interval,
@@ -8011,10 +8039,7 @@ fn run_namespace_collision_body(
 
     establish_collision_initial_tree(kind, &clients[0])?;
     driver.after_conflicting_operations(kind, &clients)?;
-    let initial_mounts = clients
-        .iter()
-        .map(|client| ClientMount::new(client.name.clone(), client.mount_point.clone()))
-        .collect::<Vec<_>>();
+    let initial_mounts = client_mounts(context, &clients);
     wait_for_convergence(
         &initial_mounts,
         context.scenario_dir.join("initial-validation"),
@@ -8596,10 +8621,7 @@ fn finish_namespace_collision(
     convergence_timeout: Duration,
     poll_interval: Duration,
 ) -> Result<NamespaceCollisionSummary, ScenarioError> {
-    let mounts = clients
-        .iter()
-        .map(|client| ClientMount::new(client.name.clone(), client.mount_point.clone()))
-        .collect::<Vec<_>>();
+    let mounts = client_mounts(context, &clients);
     let convergence = wait_for_convergence(
         &mounts,
         context.scenario_dir.join("validation"),
@@ -8689,13 +8711,33 @@ fn write_namespace_collision_summary(
 }
 
 fn write_local_durable_payload(path: PathBuf, payload: &[u8]) -> Result<(), ScenarioError> {
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(path)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut options = mounted_write_barrier_open_options();
+    let mut file = options.create(true).truncate(true).open(&path)?;
     file.write_all(payload)?;
     file.sync_all()?;
+    drop(file);
+    let readback = wait_for_mounted_payload_readback(
+        &path,
+        payload,
+        MOUNTED_WRITE_READBACK_TIMEOUT,
+        MOUNTED_WRITE_READBACK_POLL_INTERVAL,
+    )?;
+    if readback != payload {
+        return Err(ScenarioError::Io(std::io::Error::other(format!(
+            "local durable write readback mismatch for {}: expected {} bytes, read {} bytes{}",
+            path.display(),
+            payload.len(),
+            readback.len(),
+            if readback.is_empty() {
+                "; no payload became readable before timeout"
+            } else {
+                ""
+            }
+        ))));
+    }
     Ok(())
 }
 

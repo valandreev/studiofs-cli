@@ -503,6 +503,8 @@ fn run_with_executor_and_mount_lock_dir(
     write_pretty_json(&sandbox.join("run.json"), &manifest)?;
     write_runner_marker(&sandbox, &run_id)?;
     write_log_files(&sandbox)?;
+    let events_path = sandbox.join("events.ndjson");
+    record_event(&events_path, &run_id, None, "run", "started")?;
 
     let mut default_mount_lock = None;
     let mount_lock_failure = if requires_default_windows_mount_lock(
@@ -631,9 +633,6 @@ fn run_with_executor_and_mount_lock_dir(
         });
     }
     write_pretty_json(&sandbox.join("preflight.json"), &preflight)?;
-
-    let events_path = sandbox.join("events.ndjson");
-    record_event(&events_path, &run_id, None, "run", "started")?;
 
     let mut scenario_reports = Vec::new();
     let mut scenario_outcomes = Vec::new();
@@ -1154,23 +1153,18 @@ fn prepare_preflight(
             .join("; ");
         e2e_stage_step_progress(run_id, "preflight", "docker_compose_recreate", "started");
         match stack.teardown(executor).and_then(|()| {
-            let advanced_ports = stack.advance_port_block()?;
             stack.prepare_artifacts()?;
             stack.start(executor)?;
-            Ok(advanced_ports)
+            Ok(())
         }) {
-            Ok(advanced_ports) => {
+            Ok(()) => {
                 e2e_stage_step_progress(run_id, "preflight", "docker_compose_recreate", "Passed");
                 checks.push(PreflightCheckReport {
                     name: "docker compose recreate after failed host health".to_string(),
                     status: RunStatus::Passed,
-                    detail: if advanced_ports {
-                        format!(
-                            "recreated stack on higher port block after host readiness failure: {failed_details}"
-                        )
-                    } else {
-                        format!("recreated stack after host readiness failure: {failed_details}")
-                    },
+                    detail: format!(
+                        "recreated stack on the same host ports after host readiness failure: {failed_details}"
+                    ),
                 });
             }
             Err(err) => {
@@ -4697,11 +4691,17 @@ mod tests {
         let report: serde_json::Value =
             serde_json::from_slice(&std::fs::read(outcome.report_path).unwrap()).unwrap();
         assert_eq!(report["preflight"]["status"], "preflight_failed");
-        let check = &report["preflight"]["checks"][0];
+        let check = report["preflight"]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["name"] == "default Windows mounted E2E run lock")
+            .expect("mount lock preflight check");
         assert_eq!(check["name"], "default Windows mounted E2E run lock");
         assert_eq!(check["status"], "preflight_failed");
         assert!(check["detail"].as_str().unwrap().contains("first-run"));
         assert!(check["detail"].as_str().unwrap().contains("second-run"));
+        assert!(outcome.sandbox.join("events.ndjson").exists());
     }
 
     #[test]

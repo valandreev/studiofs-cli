@@ -5616,6 +5616,32 @@ fn metadata_payload_diff_detects_removed_objects_for_retained_inode() {
 }
 
 #[test]
+fn remote_namespace_invalidation_drops_parent_dentries_and_generations() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "remote-namespace-parent-invalidation");
+
+    vfs.dentry_cache_insert_negative(ROOT_INO, b"remote-file.txt");
+    assert!(
+        vfs.dentry_cache_lookup(ROOT_INO, b"remote-file.txt")
+            .is_some(),
+        "test should start with a cached negative dentry"
+    );
+    let before_generation = vfs.directory_generation(ROOT_INO);
+
+    vfs.invalidate_remote_namespace_caches([ROOT_INO]);
+
+    assert_eq!(
+        vfs.dentry_cache_lookup(ROOT_INO, b"remote-file.txt"),
+        None,
+        "remote namespace refresh must drop parent dentry cache entries"
+    );
+    assert!(
+        vfs.directory_generation(ROOT_INO) > before_generation,
+        "remote namespace refresh must bump the parent generation used by path caches"
+    );
+}
+
+#[test]
 fn test_rename_over_existing_target_discards_pending_local_state() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "rename-displaced-cleanup");

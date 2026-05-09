@@ -229,6 +229,13 @@ fn compose_stack_lifecycle_collects_logs_and_tears_down_volumes() {
                 .args
                 .contains(&"find /data -mindepth 1 -maxdepth 8 -print | sort".to_string())
     }));
+    let curl_call = calls
+        .iter()
+        .find(|call| call.program == "curl")
+        .expect("host health curl call");
+    assert!(curl_call.args.contains(&"--max-time".to_string()));
+    assert!(curl_call.args.contains(&"5".to_string()));
+    assert_eq!(curl_call.timeout, Some(Duration::from_secs(6)));
 }
 
 #[test]
@@ -357,34 +364,6 @@ fn compose_stack_accepts_whitespace_around_port_range_bounds() {
     assert_eq!(stack.ports()[3].host_port, 32103);
 }
 
-#[test]
-fn compose_stack_can_advance_to_highest_port_block_inside_range() {
-    let temp = tempdir().unwrap();
-    let mut stack = DockerComposeStack::new(ComposeConfig {
-        run_id: "compose-next-port-block".to_string(),
-        sandbox: temp.path().join("compose-next-port-block"),
-        compose_file: repo_root().join("docker/compose.e2e.yml"),
-        port_range: Some("32400-32410".to_string()),
-        wait_timeout_secs: 120,
-    })
-    .unwrap();
-
-    assert!(stack.advance_port_block().unwrap());
-    assert_eq!(
-        stack
-            .ports()
-            .iter()
-            .map(|port| (port.service.as_str(), port.host_port))
-            .collect::<Vec<_>>(),
-        vec![
-            ("postgres", 32407),
-            ("rustfs", 32408),
-            ("rustfs-console", 32409),
-            ("toxiproxy-api", 32410),
-        ]
-    );
-}
-
 #[derive(Default)]
 struct RecordingExecutor {
     calls: RefCell<Vec<studiofs_e2e::infra::CommandSpec>>,
@@ -455,7 +434,7 @@ impl CommandExecutor for TransientRustfsHealthExecutor {
                 return Ok(CommandOutput {
                     status: 28,
                     stdout: String::new(),
-                    stderr: "curl: (28) Operation timed out after 2000 milliseconds with 0 bytes received\n"
+                    stderr: "curl: (28) Operation timed out after 5000 milliseconds with 0 bytes received\n"
                         .to_string(),
                 });
             }
