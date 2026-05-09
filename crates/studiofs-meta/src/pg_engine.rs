@@ -2447,32 +2447,7 @@ impl PgMetaEngine {
     }
 
     fn project_remote_events(events: &[MetaEvent]) -> Vec<MetaEvent> {
-        let mut hidden_regular_inodes = HashSet::new();
-        let mut published_regular_inodes = HashSet::new();
-        for event in events {
-            match event {
-                MetaEvent::SetAttr { attr }
-                    if attr.kind == FileType::RegularFile
-                        && attr.committed_size == 0
-                        && attr.committed_content_epoch == 0
-                        && attr.size > 0 =>
-                {
-                    hidden_regular_inodes.insert(attr.ino);
-                }
-                MetaEvent::SetAttr { attr }
-                    if attr.kind == FileType::RegularFile
-                        && attr.upload_state == UploadState::Ready
-                        && (attr.committed_size > 0 || attr.committed_content_epoch > 0) =>
-                {
-                    published_regular_inodes.insert(attr.ino);
-                }
-                MetaEvent::PublishRegularFileBaseSlices { ino, .. } => {
-                    published_regular_inodes.insert(*ino);
-                }
-                _ => {}
-            }
-        }
-        hidden_regular_inodes.retain(|ino| !published_regular_inodes.contains(ino));
+        let hidden_regular_inodes = Self::hidden_unpublished_regular_inodes(events);
 
         let mut out = Vec::with_capacity(events.len());
         for event in events {
@@ -2500,6 +2475,49 @@ impl PgMetaEngine {
             }
         }
         out
+    }
+
+    fn hidden_unpublished_regular_inodes(events: &[MetaEvent]) -> HashSet<Ino> {
+        let mut hidden_regular_inodes = HashSet::new();
+        let mut published_regular_inodes = HashSet::new();
+        for event in events {
+            match event {
+                MetaEvent::SetAttr { attr }
+                    if attr.kind == FileType::RegularFile
+                        && attr.committed_size == 0
+                        && attr.committed_content_epoch == 0
+                        && attr.size > 0 =>
+                {
+                    hidden_regular_inodes.insert(attr.ino);
+                }
+                MetaEvent::SetAttr { attr }
+                    if attr.kind == FileType::RegularFile
+                        && attr.upload_state == UploadState::Ready
+                        && (attr.committed_size > 0 || attr.committed_content_epoch > 0) =>
+                {
+                    published_regular_inodes.insert(attr.ino);
+                }
+                MetaEvent::PublishRegularFileBaseSlices { ino, .. } => {
+                    published_regular_inodes.insert(*ino);
+                }
+                _ => {}
+            }
+        }
+        hidden_regular_inodes.retain(|ino| !published_regular_inodes.contains(ino));
+        hidden_regular_inodes
+    }
+
+    fn has_deferred_regular_create(events: &[MetaEvent]) -> bool {
+        let hidden_regular_inodes = Self::hidden_unpublished_regular_inodes(events);
+        !hidden_regular_inodes.is_empty()
+            && events.iter().any(|event| {
+                matches!(
+                    event,
+                    MetaEvent::AddEntry { entry, .. }
+                        if entry.kind == FileType::RegularFile
+                            && hidden_regular_inodes.contains(&entry.ino)
+                )
+            })
     }
 
     fn remote_visible_event_count(events: &[MetaEvent]) -> u32 {
@@ -3675,37 +3693,42 @@ impl PgMetaEngine {
         if after_seq <= before_seq {
             return Ok(false);
         }
-        let events = self.local.read_events_range(before_seq, after_seq)?;
-        let remote_events = Self::project_remote_events(&events);
-        let remote_visible_ops = u32::try_from(remote_events.len()).unwrap_or(u32::MAX);
-        let needs_eager_flush = Self::remote_events_need_eager_flush(&remote_events);
         let now = Instant::now();
         let mut state = self
             .pending_state
             .lock()
             .map_err(|_| MetaError::Storage("pg pending state lock poisoned".to_string()))?;
+        let event_start = state
+            .event_start
+            .unwrap_or_else(|| before_seq.min(self.flushed_event_seq.load(Ordering::SeqCst)));
+        let event_end = state.event_end.max(after_seq);
+        let events = self.local.read_events_range(event_start, event_end)?;
+        let remote_events = Self::project_remote_events(&events);
+        let remote_visible_ops = u32::try_from(remote_events.len()).unwrap_or(u32::MAX);
+        let has_deferred_regular_create = Self::has_deferred_regular_create(&events);
+        let needs_eager_flush = Self::remote_events_need_eager_flush(&remote_events);
         if remote_visible_ops == 0 {
-            if state.ops == 0 {
-                Self::clear_pending_state(&mut state);
-                drop(state);
-                self.persist_flushed_event_seq(after_seq)?;
-            } else {
-                if state.event_start.is_none() {
-                    state.event_start = Some(before_seq);
-                }
-                state.event_end = state.event_end.max(after_seq);
+            if has_deferred_regular_create {
+                state.ops = 0;
+                state.force_flush = false;
+                state.event_start = Some(event_start);
+                state.event_end = event_end;
+                state.started_at = None;
+                state.last_mutation_at = Some(now);
+                return Ok(false);
             }
+            Self::clear_pending_state(&mut state);
+            drop(state);
+            self.persist_flushed_event_seq(event_end)?;
             return Ok(false);
         }
         if state.ops == 0 {
             state.started_at = Some(now);
         }
-        state.ops = state.ops.saturating_add(remote_visible_ops);
+        state.ops = remote_visible_ops;
         state.last_mutation_at = Some(now);
-        if state.event_start.is_none() {
-            state.event_start = Some(before_seq);
-        }
-        state.event_end = state.event_end.max(after_seq);
+        state.event_start = Some(event_start);
+        state.event_end = event_end;
         if needs_eager_flush || state.ops >= self.flush_ops_threshold {
             state.force_flush = true;
         }
@@ -5653,6 +5676,68 @@ mod tests {
             pg.flushed_event_seq.load(Ordering::SeqCst),
             end,
             "self-batch ack must advance over the raw local events that produced the projected batch"
+        );
+    }
+
+    #[test]
+    fn pg_pending_keeps_hidden_regular_create_until_publish_projection() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+        let start = pg.flushed_event_seq.load(Ordering::SeqCst);
+        let file = pg
+            .create_file(ROOT_INO, b"write-through-race.bin", 0, 0, 0o644)
+            .expect("create file");
+        set_file_state(&pg, file.ino, 4096, 1);
+        let hidden_end = pg.local.get_counter("nextEventSeq").expect("hidden end");
+        let hidden_events = pg
+            .local
+            .read_events_range(start, hidden_end)
+            .expect("hidden events");
+        assert!(
+            PgMetaEngine::project_remote_events(&hidden_events).is_empty(),
+            "create followed by unpublished content must stay hidden remotely"
+        );
+
+        assert!(
+            pg.claim_pending_batch(true).is_none(),
+            "hidden regular create must not be claimable as a remote batch yet"
+        );
+        assert_eq!(
+            pg.flushed_event_seq.load(Ordering::SeqCst),
+            start,
+            "hidden regular create must remain unacked so later publish can include its AddEntry"
+        );
+
+        let payload = PayloadRef::new_partial(77_777, 4096);
+        pg.stage_payload_slice(file.ino, 0, &payload)
+            .expect("stage payload");
+        assert!(
+            pg.mark_regular_file_overlay_object_uploaded_if_matches(file.ino, 1, payload.object_id)
+                .expect("mark uploaded"),
+            "payload marker must update overlay state"
+        );
+        assert!(
+            pg.publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
+                .expect("publish payload"),
+            "payload publish must succeed"
+        );
+
+        let batch = pg.claim_pending_batch(true).expect("claim publish batch");
+        assert_eq!(
+            batch.event_start, start,
+            "publish batch must replay the hidden create prefix"
+        );
+        let events = pg
+            .local
+            .read_events_range(batch.event_start, batch.event_end)
+            .expect("publish range events");
+        let projected = PgMetaEngine::project_remote_events(&events);
+        assert!(
+            projected.iter().any(|event| matches!(
+                event,
+                MetaEvent::AddEntry { entry, .. }
+                    if entry.kind == FileType::RegularFile && entry.ino == file.ino
+            )),
+            "remote projection must include the original regular-file dentry"
         );
     }
 
