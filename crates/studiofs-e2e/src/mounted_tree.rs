@@ -175,6 +175,18 @@ pub struct TreeMetadataDiagnostics {
     pub clients: Vec<ClientMetadataDiagnostics>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+/// Mounted-client quiescence classification captured on convergence timeout.
+pub enum ClientQuiescence {
+    /// The client still has known metadata or upload work in progress.
+    Busy,
+    /// All known metadata and upload work counters are zero.
+    Quiescent,
+    /// The diagnostic probe did not expose enough counters to classify state.
+    Unknown,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 /// Struct $name.
 pub struct RemoteMetadataDiagnostics {
@@ -250,7 +262,7 @@ pub struct ClientMetadataDiagnostics {
     /// Upload payloads currently being transferred by this client.
     pub active_uploads: Option<u64>,
     /// Busy, quiescent, or unknown classification for timeout diagnostics.
-    pub quiescence: String,
+    pub quiescence: ClientQuiescence,
     /// Counters or probe failures explaining the quiescence classification.
     pub quiescence_reasons: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -738,6 +750,7 @@ fn collect_client_metadata_diagnostics(
                 pending_metadata_ops,
                 inflight_metadata_ops,
                 pending_uploads,
+                pending_upload_bytes,
                 active_uploads,
             );
             Some(ClientMetadataDiagnostics {
@@ -803,7 +816,7 @@ fn collect_client_metadata_diagnostics(
             pending_uploads: None,
             pending_upload_bytes: None,
             active_uploads: None,
-            quiescence: "unknown".to_string(),
+            quiescence: ClientQuiescence::Unknown,
             quiescence_reasons: vec!["diagnostics command could not be started".to_string()],
             error: Some(error.to_string()),
         }),
@@ -815,11 +828,12 @@ fn classify_client_quiescence(
     pending_metadata_ops: Option<u64>,
     inflight_metadata_ops: Option<u64>,
     pending_uploads: Option<u64>,
+    pending_upload_bytes: Option<u64>,
     active_uploads: Option<u64>,
-) -> (String, Vec<String>) {
+) -> (ClientQuiescence, Vec<String>) {
     if exit_code != 0 {
         return (
-            "unknown".to_string(),
+            ClientQuiescence::Unknown,
             vec!["diagnostics command failed".to_string()],
         );
     }
@@ -828,28 +842,30 @@ fn classify_client_quiescence(
     push_positive_reason(&mut reasons, "pending_metadata_ops", pending_metadata_ops);
     push_positive_reason(&mut reasons, "inflight_metadata_ops", inflight_metadata_ops);
     push_positive_reason(&mut reasons, "pending_uploads", pending_uploads);
+    push_positive_reason(&mut reasons, "pending_upload_bytes", pending_upload_bytes);
     push_positive_reason(&mut reasons, "active_uploads", active_uploads);
     if !reasons.is_empty() {
-        return ("busy".to_string(), reasons);
+        return (ClientQuiescence::Busy, reasons);
     }
 
     if [
         pending_metadata_ops,
         inflight_metadata_ops,
         pending_uploads,
+        pending_upload_bytes,
         active_uploads,
     ]
     .iter()
     .any(Option::is_none)
     {
         return (
-            "unknown".to_string(),
+            ClientQuiescence::Unknown,
             vec!["diagnostics missing one or more quiescence counters".to_string()],
         );
     }
 
     (
-        "quiescent".to_string(),
+        ClientQuiescence::Quiescent,
         vec!["no pending metadata or upload work".to_string()],
     )
 }
@@ -1292,7 +1308,7 @@ mod tests {
         assert_eq!(diagnostics.pending_uploads, Some(3));
         assert_eq!(diagnostics.pending_upload_bytes, Some(4096));
         assert_eq!(diagnostics.active_uploads, Some(1));
-        assert_eq!(diagnostics.quiescence, "busy");
+        assert_eq!(diagnostics.quiescence, ClientQuiescence::Busy);
         assert!(
             diagnostics
                 .quiescence_reasons
@@ -1307,6 +1323,11 @@ mod tests {
             diagnostics
                 .quiescence_reasons
                 .contains(&"pending_uploads=3".to_string())
+        );
+        assert!(
+            diagnostics
+                .quiescence_reasons
+                .contains(&"pending_upload_bytes=4096".to_string())
         );
         assert!(
             diagnostics
@@ -1353,10 +1374,48 @@ mod tests {
         let diagnostics =
             collect_client_metadata_diagnostics(&executor, temp.path(), 0, &mount).unwrap();
 
-        assert_eq!(diagnostics.quiescence, "quiescent");
+        assert_eq!(diagnostics.quiescence, ClientQuiescence::Quiescent);
         assert_eq!(
             diagnostics.quiescence_reasons,
             ["no pending metadata or upload work"]
+        );
+    }
+
+    #[test]
+    fn client_metadata_diagnostics_treats_orphaned_upload_bytes_as_busy() {
+        let temp = tempfile::tempdir().unwrap();
+        let executor = FakeDiagnosticsExecutor {
+            output: CommandOutput {
+                status: 0,
+                stdout: serde_json::json!({
+                    "runtime_snapshot": {
+                        "write_path": {
+                            "metadata_invalidation": {
+                                "pending_metadata_ops": 0,
+                                "inflight_metadata_ops": 0
+                            }
+                        },
+                        "upload": {
+                            "pending_uploads": 0,
+                            "pending_upload_bytes": 4096,
+                            "active_uploads": 0
+                        }
+                    }
+                })
+                .to_string(),
+                stderr: String::new(),
+            },
+        };
+        let mount = ClientMount::new("client-a", temp.path().join("mount"))
+            .with_diagnostics_probe("studiofs", temp.path().join("client-a"));
+
+        let diagnostics =
+            collect_client_metadata_diagnostics(&executor, temp.path(), 0, &mount).unwrap();
+
+        assert_eq!(diagnostics.quiescence, ClientQuiescence::Busy);
+        assert_eq!(
+            diagnostics.quiescence_reasons,
+            ["pending_upload_bytes=4096"]
         );
     }
 
@@ -1405,7 +1464,7 @@ mod tests {
                 pending_uploads: Some(0),
                 pending_upload_bytes: Some(0),
                 active_uploads: Some(0),
-                quiescence: "busy".to_string(),
+                quiescence: ClientQuiescence::Busy,
                 quiescence_reasons: vec!["pending_metadata_ops=2".to_string()],
                 error: None,
             }],
