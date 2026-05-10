@@ -96,7 +96,8 @@ const SMOKE_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const OUTAGE_INITIAL_FILE_NAME: &str = "studiofs-e2e-outage-initial.txt";
 const OUTAGE_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(60);
 const OUTAGE_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
-const RUSTFS_OUTAGE_FILE_NAME: &str = "studiofs-e2e-rustfs-outage.txt";
+const RUSTFS_OUTAGE_GATE_FILE_NAME: &str = "studiofs-e2e-rustfs-outage-gate.txt";
+const RUSTFS_OUTAGE_FILE_NAME: &str = "studiofs-e2e-rustfs-outage-recovered.txt";
 const CRASH_RESTART_LOCAL_DURABLE_FILE_NAME: &str = "studiofs-e2e-crash-after-local-durability.txt";
 const CRASH_RESTART_BEFORE_PUBLICATION_FILE_NAME: &str =
     "studiofs-e2e-crash-before-remote-publication.txt";
@@ -1611,11 +1612,11 @@ fn run_rustfs_outage_body(
         });
     }
 
-    let relative_path = rustfs_outage_relative_path(context);
-    let source_file = clients[0].mount_point.join(&relative_path);
+    let gate_relative_path = rustfs_outage_gate_relative_path(context);
+    let gate_file = clients[0].mount_point.join(&gate_relative_path);
     let initial_payload = rustfs_outage_initial_payload(context);
-    write_mounted_file(&source_file, &initial_payload)?;
-    driver.after_initial_write(&clients, &relative_path)?;
+    write_mounted_file(&gate_file, &initial_payload)?;
+    driver.after_initial_write(&clients, &gate_relative_path)?;
     let initial_mounts = client_mounts(context, &clients[..RUSTFS_OUTAGE_CLIENT_NAMES.len()]);
     wait_for_convergence(
         &initial_mounts,
@@ -1626,6 +1627,8 @@ fn run_rustfs_outage_body(
 
     let outage_started = Instant::now();
     driver.stop_rustfs()?;
+    let relative_path = rustfs_outage_relative_path(context);
+    let source_file = clients[0].mount_point.join(&relative_path);
     let recovered_payload = rustfs_outage_recovered_payload(context);
     write_mounted_file(&source_file, &recovered_payload)?;
     let local_read_checksum_sha256 = bytes_sha256(&fs::read(&source_file)?);
@@ -1699,6 +1702,10 @@ fn run_rustfs_outage_body(
 
 fn rustfs_outage_relative_path(context: &ScenarioContext) -> String {
     run_unique_path(context, "rustfs-outage", RUSTFS_OUTAGE_FILE_NAME)
+}
+
+fn rustfs_outage_gate_relative_path(context: &ScenarioContext) -> String {
+    run_unique_path(context, "rustfs-outage", RUSTFS_OUTAGE_GATE_FILE_NAME)
 }
 
 fn rustfs_outage_initial_payload(context: &ScenarioContext) -> Vec<u8> {
@@ -9750,9 +9757,6 @@ mod tests {
             relative_path: &str,
         ) -> Result<(), ScenarioError> {
             self.actions.borrow_mut().push("after_initial_write");
-            self.outage_path
-                .borrow_mut()
-                .replace(relative_path.to_string());
             let payload = std::fs::read(clients[0].mount_point.join(relative_path))?;
             for client in clients.iter().skip(1) {
                 let target = client.mount_point.join(relative_path);
@@ -9776,6 +9780,9 @@ mod tests {
             forbidden_checksum: &str,
         ) -> Result<Option<String>, ScenarioError> {
             self.actions.borrow_mut().push("assert_peer_not_visible");
+            self.outage_path
+                .borrow_mut()
+                .replace(relative_path.to_string());
             if !self.peer_probe_delay.is_zero() {
                 thread::sleep(self.peer_probe_delay);
             }
@@ -12991,21 +12998,20 @@ mod tests {
         assert_eq!(summary.bootstrap.init_client, "client-a");
         assert_eq!(
             summary.outage_file,
-            "rustfs-outage/run-1/studiofs-e2e-rustfs-outage.txt"
+            "rustfs-outage/run-1/studiofs-e2e-rustfs-outage-recovered.txt"
         );
         assert_eq!(
             summary.local_read_checksum_sha256,
             summary.final_checksum_sha256
         );
-        let initial_checksum = bytes_sha256(&rustfs_outage_initial_payload(&context));
         assert_eq!(summary.peer_visibility_during_outage.len(), 3);
-        assert!(summary.peer_visibility_during_outage.iter().all(|probe| {
-            probe.visible_checksum_sha256.as_deref() == Some(initial_checksum.as_str())
-        }));
-        assert_eq!(
-            summary.peer_visible_during_outage.as_deref(),
-            Some(initial_checksum.as_str())
+        assert!(
+            summary
+                .peer_visibility_during_outage
+                .iter()
+                .all(|probe| { probe.visible_checksum_sha256.is_none() })
         );
+        assert_eq!(summary.peer_visible_during_outage, None);
         assert_eq!(summary.final_client_checksums.len(), 4);
         assert!(
             summary
