@@ -288,13 +288,15 @@ fn namespace_collision_operation_log_uses_shared_logical_operations() {
     assert!(records.iter().all(|record| {
         record.scenario == "collision-rename-vs-unlink" && record.is_simulation_supported()
     }));
+    let shared_file = "collision/shared-collision-run/shared/file.txt";
+    let renamed = "collision/shared-collision-run/shared/renamed.txt";
     assert!(records.iter().any(|record| matches!(
         &record.operation,
         ScenarioOperation::Rename { from, to }
-            if from == "shared/file.txt" && to == "shared/renamed.txt"
+            if from == shared_file && to == renamed
     )));
     assert!(records.iter().any(|record| matches!(
         &record.operation,
-        ScenarioOperation::Unlink { path } if path == "shared/file.txt"
+        ScenarioOperation::Unlink { path } if path == shared_file
     )));
 }
