@@ -21,7 +21,7 @@ const DEFAULT_SECTOR_SIZE: u16 = 4096;
 const DEFAULT_ALLOCATION_UNIT_SIZE: u32 = 1024 * 1024;
 const DEFAULT_MAX_DISPATCHER_THREADS: u32 = 16;
 const DEFAULT_ALLOW_OPEN_IN_KERNEL_MODE: bool = true;
-const DEFAULT_FLUSH_AND_PURGE_ON_CLEANUP: bool = false;
+const DEFAULT_FLUSH_AND_PURGE_ON_CLEANUP: bool = true;
 const DEFAULT_PERSISTENT_ACLS: bool = false;
 // Temporary SFS-388 mitigation: coarse guarding serializes WinFSP callbacks and
 // can reduce multi-threaded throughput, but avoids rename preflight hangs until
@@ -433,6 +433,10 @@ fn apply_volume_params(
     // OS cache across measurement passes. SFS-388 still keeps kernel
     // notifications opt-in and serializes callbacks; the stale-size bug is
     // handled at the metadata projection and local dirty-attr barriers.
+    //
+    // Cleanup must flush/purge cached data by default so a last-handle close is
+    // a real StudioFS release boundary, matching WinFSP's FUSE FlushOnCleanup
+    // intent for cached writes.
     volume_params.flush_and_purge_on_cleanup(options.flush_and_purge_on_cleanup);
     Ok(())
 }
@@ -791,6 +795,10 @@ mod tests {
         assert_eq!(
             opts.flush_and_purge_on_cleanup,
             DEFAULT_FLUSH_AND_PURGE_ON_CLEANUP
+        );
+        assert!(
+            opts.flush_and_purge_on_cleanup,
+            "cleanup flush/purge must be enabled by default so cached writes reach close/release durability"
         );
         assert_eq!(opts.persistent_acls, DEFAULT_PERSISTENT_ACLS);
         assert_eq!(opts.coarse_operation_guard, DEFAULT_COARSE_OPERATION_GUARD);
