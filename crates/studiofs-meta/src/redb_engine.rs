@@ -43,20 +43,6 @@ impl CounterWriteTransaction<'_> {
 }
 
 impl RedbMetaEngine {
-    /// Opens a metadata write transaction with redb crash-safety enabled.
-    ///
-    /// StudioFS treats redb metadata as the local recovery source of truth, so
-    /// every local metadata mutation must survive unclean shutdowns once it has
-    /// been accepted by a VFS durability boundary.
-    pub(crate) fn begin_crash_safe_write(&self) -> MetaResult<WriteTransaction> {
-        let mut txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        txn.set_two_phase_commit(true);
-        Ok(txn)
-    }
-
     /// Open or create a metadata database at the given path.
     pub fn open(path: impl AsRef<Path>) -> MetaResult<Self> {
         if let Some(parent) = path.as_ref().parent() {
@@ -80,8 +66,6 @@ impl RedbMetaEngine {
             let _ = txn.open_table(INODE_TOMBSTONES_TABLE);
             let _ = txn.open_table(DENTRIES_TABLE);
             let _ = txn.open_table(BASE_DENTRIES_TABLE);
-            let _ = txn.open_table(DENTRY_BY_INODE_TABLE);
-            let _ = txn.open_table(BASE_DENTRY_BY_INODE_TABLE);
             let _ = txn.open_table(DENTRY_TOMBSTONES_TABLE);
             let _ = txn.open_table(REGULAR_FILE_OVERLAY_TABLE);
             let _ = txn.open_table(REGULAR_FILE_BASE_TABLE);

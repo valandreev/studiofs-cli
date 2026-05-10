@@ -31,16 +31,12 @@ fn update_peak(peak: &AtomicUsize, value: usize) {
 }
 
 #[derive(Debug, Clone)]
-/// Struct $name.
 pub struct LatencyHistogramSnapshot {
-    /// Field $name.
     pub bucket_upper_bounds_ns: Vec<u64>,
-    /// Field $name.
     pub bucket_counts: Vec<u64>,
 }
 
 #[derive(Debug)]
-/// Struct $name.
 pub struct LatencyHistogram {
     buckets: [AtomicU64; LATENCY_BUCKET_COUNT],
 }
@@ -54,7 +50,6 @@ impl Default for LatencyHistogram {
 }
 
 impl LatencyHistogram {
-    /// Function $name.
     pub fn observe_ns(&self, elapsed_ns: u64) {
         let idx = LATENCY_BUCKET_UPPER_NS
             .iter()
@@ -63,13 +58,11 @@ impl LatencyHistogram {
         self.buckets[idx].fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Function $name.
     pub fn observe_duration(&self, elapsed: Duration) {
         let ns = saturating_u64_from_u128(elapsed.as_nanos());
         self.observe_ns(ns);
     }
 
-    /// Function $name.
     pub fn snapshot(&self) -> LatencyHistogramSnapshot {
         LatencyHistogramSnapshot {
             bucket_upper_bounds_ns: LATENCY_BUCKET_UPPER_NS.to_vec(),
@@ -81,7 +74,6 @@ impl LatencyHistogram {
         }
     }
 
-    /// Function $name.
     pub fn reset(&self) {
         for bucket in &self.buckets {
             bucket.store(0, Ordering::Relaxed);
@@ -90,24 +82,16 @@ impl LatencyHistogram {
 }
 
 #[derive(Debug, Clone)]
-/// Struct $name.
 pub struct MaterializeBatchStatsSnapshot {
-    /// Field $name.
     pub batches: u64,
-    /// Field $name.
     pub payloads: u64,
-    /// Field $name.
     pub bytes: u64,
-    /// Field $name.
     pub inflight_batches: usize,
-    /// Field $name.
     pub inflight_batches_peak: usize,
-    /// Field $name.
     pub duration_histogram: LatencyHistogramSnapshot,
 }
 
 #[derive(Debug, Default)]
-/// Struct $name.
 pub struct MaterializeBatchStats {
     batches: AtomicU64,
     payloads: AtomicU64,
@@ -118,7 +102,6 @@ pub struct MaterializeBatchStats {
 }
 
 impl MaterializeBatchStats {
-    /// Function $name.
     pub fn record_batch(&self, payloads: u64, bytes: u64, elapsed: Duration) {
         self.batches.fetch_add(1, Ordering::Relaxed);
         self.payloads.fetch_add(payloads, Ordering::Relaxed);
@@ -126,13 +109,11 @@ impl MaterializeBatchStats {
         self.duration_histogram.observe_duration(elapsed);
     }
 
-    /// Function $name.
     pub fn enter_inflight(&self) {
         let inflight = self.inflight_batches.fetch_add(1, Ordering::Relaxed) + 1;
         update_peak(&self.inflight_batches_peak, inflight);
     }
 
-    /// Function $name.
     pub fn leave_inflight(&self) {
         let _ = self
             .inflight_batches
@@ -141,7 +122,6 @@ impl MaterializeBatchStats {
             });
     }
 
-    /// Function $name.
     pub fn snapshot(&self) -> MaterializeBatchStatsSnapshot {
         MaterializeBatchStatsSnapshot {
             batches: self.batches.load(Ordering::Relaxed),
@@ -153,7 +133,6 @@ impl MaterializeBatchStats {
         }
     }
 
-    /// Function $name.
     pub fn reset(&self) {
         self.batches.store(0, Ordering::Relaxed);
         self.payloads.store(0, Ordering::Relaxed);
@@ -165,26 +144,17 @@ impl MaterializeBatchStats {
 }
 
 #[derive(Debug, Clone)]
-/// Struct $name.
 pub struct UploadQueueStatsSnapshot {
-    /// Field $name.
     pub pending_depth: usize,
-    /// Field $name.
     pub pending_depth_peak: usize,
-    /// Field $name.
     pub submitted: u64,
-    /// Field $name.
     pub completed: u64,
-    /// Field $name.
     pub completed_bytes: u64,
-    /// Field $name.
     pub requeued: u64,
-    /// Field $name.
     pub canceled: u64,
 }
 
 #[derive(Debug, Default)]
-/// Struct $name.
 pub struct UploadQueueStats {
     pending_depth_peak: AtomicUsize,
     submitted: AtomicU64,
@@ -195,29 +165,24 @@ pub struct UploadQueueStats {
 }
 
 impl UploadQueueStats {
-    /// Function $name.
     pub fn record_submit(&self, pending_depth: usize) {
         self.submitted.fetch_add(1, Ordering::Relaxed);
         update_peak(&self.pending_depth_peak, pending_depth);
     }
 
-    /// Function $name.
     pub fn record_complete(&self, bytes: u64) {
         self.completed.fetch_add(1, Ordering::Relaxed);
         self.completed_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    /// Function $name.
     pub fn record_requeue(&self) {
         self.requeued.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Function $name.
     pub fn record_cancel(&self) {
         self.canceled.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Function $name.
     pub fn snapshot(&self, pending_depth: usize) -> UploadQueueStatsSnapshot {
         UploadQueueStatsSnapshot {
             pending_depth,
@@ -230,7 +195,6 @@ impl UploadQueueStats {
         }
     }
 
-    /// Function $name.
     pub fn reset(&self) {
         self.pending_depth_peak.store(0, Ordering::Relaxed);
         self.submitted.store(0, Ordering::Relaxed);
@@ -242,52 +206,33 @@ impl UploadQueueStats {
 }
 
 #[derive(Debug, Clone)]
-/// Struct $name.
 pub struct BlockingTaskStatsSnapshot {
-    /// Field $name.
     pub active: usize,
-    /// Field $name.
     pub active_peak: usize,
-    /// Field $name.
     pub submitted: u64,
-    /// Field $name.
     pub started: u64,
-    /// Field $name.
     pub completed: u64,
-    /// Field $name.
     pub queue_wait_total: Duration,
-    /// Field $name.
     pub queue_wait_max: Duration,
-    /// Field $name.
     pub queue_wait_histogram: LatencyHistogramSnapshot,
-    /// Field $name.
     pub execution_total: Duration,
-    /// Field $name.
     pub execution_max: Duration,
-    /// Field $name.
     pub execution_histogram: LatencyHistogramSnapshot,
 }
 
 #[derive(Debug, Clone)]
-/// Struct $name.
 pub struct BlockingTaskKindStatsSnapshot {
-    /// Field $name.
     pub task_kind: String,
-    /// Field $name.
     pub stats: BlockingTaskStatsSnapshot,
 }
 
 #[derive(Debug, Clone)]
-/// Struct $name.
 pub struct BlockingTaskMetricsSnapshot {
-    /// Field $name.
     pub total: BlockingTaskStatsSnapshot,
-    /// Field $name.
     pub by_kind: Vec<BlockingTaskKindStatsSnapshot>,
 }
 
 #[derive(Debug, Default)]
-/// Struct $name.
 pub struct BlockingTaskStats {
     active: AtomicUsize,
     active_peak: AtomicUsize,
@@ -303,19 +248,16 @@ pub struct BlockingTaskStats {
 }
 
 #[must_use = "guard tracks active task count and execution time for metrics accuracy"]
-/// Struct $name.
 pub struct BlockingTaskExecutionGuard<'a> {
     stats: &'a BlockingTaskStats,
     started_at: Instant,
 }
 
 impl BlockingTaskStats {
-    /// Function $name.
     pub fn record_submit(&self) {
         self.submitted.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Function $name.
     pub fn record_start(&self, queue_wait: Duration) -> BlockingTaskExecutionGuard<'_> {
         let wait_ns = saturating_u64_from_u128(queue_wait.as_nanos());
         self.started.fetch_add(1, Ordering::Relaxed);
@@ -333,7 +275,6 @@ impl BlockingTaskStats {
         }
     }
 
-    /// Function $name.
     pub fn snapshot(&self) -> BlockingTaskStatsSnapshot {
         BlockingTaskStatsSnapshot {
             active: self.active.load(Ordering::Relaxed),
@@ -388,27 +329,19 @@ impl Drop for BlockingTaskExecutionGuard<'_> {
 }
 
 #[derive(Debug, Clone)]
-/// Struct $name.
 pub struct CachePipelineMetricsSnapshot {
-    /// Field $name.
     pub materialize_batches: MaterializeBatchStatsSnapshot,
-    /// Field $name.
     pub upload_queue: UploadQueueStatsSnapshot,
-    /// Field $name.
     pub blocking_tasks: BlockingTaskMetricsSnapshot,
 }
 
 #[derive(Debug, Default)]
-/// Struct $name.
 pub struct CachePipelineMetrics {
-    /// Field $name.
     pub materialize_batches: MaterializeBatchStats,
-    /// Field $name.
     pub upload_queue: UploadQueueStats,
 }
 
 impl CachePipelineMetrics {
-    /// Function $name.
     pub fn snapshot(&self, pending_uploads: usize) -> CachePipelineMetricsSnapshot {
         CachePipelineMetricsSnapshot {
             materialize_batches: self.materialize_batches.snapshot(),
@@ -417,7 +350,6 @@ impl CachePipelineMetrics {
         }
     }
 
-    /// Function $name.
     pub fn reset(&self) {
         self.materialize_batches.reset();
         self.upload_queue.reset();

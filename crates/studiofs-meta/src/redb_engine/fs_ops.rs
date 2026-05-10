@@ -234,15 +234,15 @@ impl<'a> NamespaceCreateTxn<'a> {
     }
 
     pub(super) fn insert_dentry(&self, dentry_key: &[u8], entry: &DirEntryValue) -> MetaResult<()> {
-        let (parent, name) = decode_dentry_key(dentry_key)?;
-        RedbMetaEngine::set_dentry_in_table_with_index_in_txn(
-            self.txn,
-            DENTRIES_TABLE,
-            DENTRY_BY_INODE_TABLE,
-            parent,
-            name,
-            entry,
-        )
+        let mut dentries = self
+            .txn
+            .open_table(DENTRIES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let entry_val = encode(entry)?;
+        dentries
+            .insert(dentry_key, entry_val.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
     }
 
     pub(super) fn clear_dentry_tombstone(&self, dentry_key: &[u8]) -> MetaResult<()> {
@@ -392,22 +392,15 @@ impl<'a> NamespaceDeleteTxn<'a> {
         RedbMetaEngine::remove_dentry_overlay_in_txn(self.txn, spec.parent, spec.name)?;
 
         attr.nlink = attr.nlink.saturating_sub(1);
-        let has_published_base = attr.kind == FileType::RegularFile
-            && RedbMetaEngine::has_regular_file_chunk_rows_in_write_txn(
-                self.txn,
-                REGULAR_FILE_BASE_TABLE,
-                entry.ino,
-            )?;
-        let attr_dirty =
-            attr.content_epoch != attr.committed_content_epoch || attr.size != attr.committed_size;
-        let graph_dirty = attr.kind == FileType::RegularFile
-            && RedbMetaEngine::regular_file_overlay_differs_from_base_in_write_txn(
-                self.txn, entry.ino,
-            )?;
         let deleted_before_publish = if attr.nlink == 0
             && attr.kind == FileType::RegularFile
-            && (graph_dirty || (attr_dirty && !has_published_base))
-        {
+            && (attr.content_epoch != attr.committed_content_epoch
+                || attr.size != attr.committed_size
+                || RedbMetaEngine::has_regular_file_chunk_rows_in_write_txn(
+                    self.txn,
+                    REGULAR_FILE_OVERLAY_TABLE,
+                    entry.ino,
+                )?) {
             let uploaded_overlay_object_ids =
                 self.uploaded_overlay_object_ids_in_write_txn(entry.ino)?;
             if !uploaded_overlay_object_ids.is_empty() {
@@ -694,7 +687,10 @@ impl RedbMetaEngine {
         self.add_pending_create(&intent)?;
 
         let create_result = (|| -> MetaResult<InodeAttr> {
-            let txn = self.begin_crash_safe_write()?;
+            let txn = self
+                .db
+                .begin_write()
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
             let result_attr = NamespaceCreateTxn::new(&txn).execute(&spec)?;
             txn.commit()
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -759,7 +755,10 @@ impl RedbMetaEngine {
         &self,
         spec: NamespaceDeleteSpec<'_>,
     ) -> MetaResult<NamespaceDeleteResult> {
-        let txn = self.begin_crash_safe_write()?;
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
         let result = NamespaceDeleteTxn::new(&txn).execute(&spec)?;
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -777,7 +776,10 @@ impl MetaFsOps for RedbMetaEngine {
         new_parent: Ino,
         new_name: &[u8],
     ) -> MetaResult<RenameAtomicResult> {
-        let txn = self.begin_crash_safe_write()?;
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
         let src_entry = Self::lookup_merged_in_write_txn(&txn, parent, name)?.ok_or_else(|| {
             MetaError::EntryNotFound {
                 parent,
@@ -919,7 +921,10 @@ impl MetaFsOps for RedbMetaEngine {
             });
         }
 
-        let txn = self.begin_crash_safe_write()?;
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
         let result;
         let parent_attr_event: Option<InodeAttr>;
         {

@@ -57,7 +57,6 @@ pub enum LockTier {
 }
 
 impl LockTier {
-    /// Function $name.
     pub const fn level(self) -> u8 {
         match self {
             LockTier::Shutdown => 1,
@@ -73,7 +72,6 @@ impl LockTier {
         }
     }
 
-    /// Function $name.
     pub fn name(&self) -> &'static str {
         match self {
             LockTier::Shutdown => "Shutdown",

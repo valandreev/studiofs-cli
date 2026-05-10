@@ -1,4 +1,3 @@
-//! Crate documentation for lint completion.
 use clap::Parser as _;
 
 fn main() -> anyhow::Result<()> {

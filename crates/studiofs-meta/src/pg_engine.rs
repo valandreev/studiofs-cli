@@ -31,20 +31,6 @@ const LOCAL_PG_INODE_PREFETCHED_WINDOW_NEXT_COUNTER: &str = "pgInodePrefetchedWi
 const LOCAL_PG_INODE_PREFETCHED_WINDOW_END_COUNTER: &str = "pgInodePrefetchedWindowEnd";
 const PG_NEXT_CLIENT_SLOT_COUNTER: &str = "next_client_slot";
 const PG_NEXT_INODE_COUNTER: &str = "next_inode";
-const PG_LOCAL_ONLY_SNAPSHOT_COUNTERS: &[&str] = &[
-    counters::NEXT_INODE,
-    counters::NEXT_OBJECT_ID,
-    LOCAL_PG_CLIENT_SLOT_COUNTER,
-    LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER,
-    LEGACY_LOCAL_PG_INODE_ACTIVE_RANGE_START_COUNTER,
-    LEGACY_LOCAL_PG_INODE_ACTIVE_RANGE_END_COUNTER,
-    LEGACY_LOCAL_PG_INODE_RESERVED_RANGE_END_COUNTER,
-    LOCAL_PG_INODE_CURRENT_WINDOW_START_COUNTER,
-    LOCAL_PG_INODE_CURRENT_WINDOW_END_COUNTER,
-    LOCAL_PG_INODE_PREFETCHED_WINDOW_START_COUNTER,
-    LOCAL_PG_INODE_PREFETCHED_WINDOW_NEXT_COUNTER,
-    LOCAL_PG_INODE_PREFETCHED_WINDOW_END_COUNTER,
-];
 const DEFAULT_PG_FLUSH_INTERVAL_SECS: u64 = 60;
 const DEFAULT_PG_FLUSH_OPS_THRESHOLD: u32 = 500;
 const PG_EVENT_INSERT_CHUNK_SIZE: usize = 512;
@@ -626,35 +612,6 @@ impl PgMetaEngine {
     fn persist_inode_allocator_state(&self, state: InodeAllocatorState) -> MetaResult<()> {
         self.local
             .write_counters(|counters| Self::persist_inode_allocator_state_locked(counters, state))
-    }
-
-    fn strip_pg_local_snapshot_counters(snapshot: &mut RedbSnapshot) {
-        snapshot
-            .counters
-            .retain(|(name, _)| !PG_LOCAL_ONLY_SNAPSHOT_COUNTERS.contains(&name.as_str()));
-    }
-
-    fn pg_local_snapshot_counter_values(&self) -> MetaResult<Vec<(&'static str, u64)>> {
-        PG_LOCAL_ONLY_SNAPSHOT_COUNTERS
-            .iter()
-            .map(|name| self.local.get_counter(name).map(|value| (*name, value)))
-            .collect()
-    }
-
-    fn import_remote_snapshot_preserving_pg_local_counters(
-        &self,
-        snapshot: &RedbSnapshot,
-    ) -> MetaResult<()> {
-        let preserved = self.pg_local_snapshot_counter_values()?;
-        let mut snapshot = snapshot.clone();
-        Self::strip_pg_local_snapshot_counters(&mut snapshot);
-        self.local.import_remote_snapshot(&snapshot)?;
-        self.local.write_counters(|counters| {
-            for (name, value) in preserved {
-                counters.set(name, value)?;
-            }
-            Ok(())
-        })
     }
 
     fn update_inode_headroom_flag(&self, state: InodeAllocatorState) {
@@ -2447,20 +2404,12 @@ impl PgMetaEngine {
     }
 
     fn project_remote_events(events: &[MetaEvent]) -> Vec<MetaEvent> {
-        let hidden_regular_inodes = Self::hidden_unpublished_regular_inodes(events);
-
         let mut out = Vec::with_capacity(events.len());
         for event in events {
             match event {
                 MetaEvent::SetRegularFileOverlaySlices { .. }
                 | MetaEvent::RemoveRegularFileGraph { .. } => {}
-                MetaEvent::AddEntry { entry, .. }
-                    if entry.kind == FileType::RegularFile
-                        && hidden_regular_inodes.contains(&entry.ino) => {}
                 MetaEvent::AddPendingDeletion { .. } | MetaEvent::RemovePendingDeletion { .. } => {}
-                MetaEvent::SetAttr { attr }
-                    if attr.kind == FileType::RegularFile
-                        && hidden_regular_inodes.contains(&attr.ino) => {}
                 MetaEvent::CreateSnapshot { snapshot } => {
                     let mut synced = snapshot.clone();
                     synced.state = SnapshotState::Synced;
@@ -2477,65 +2426,12 @@ impl PgMetaEngine {
         out
     }
 
-    fn hidden_unpublished_regular_inodes(events: &[MetaEvent]) -> HashSet<Ino> {
-        let mut hidden_regular_inodes = HashSet::new();
-        let mut published_regular_inodes = HashSet::new();
-        for event in events {
-            match event {
-                MetaEvent::SetAttr { attr }
-                    if attr.kind == FileType::RegularFile
-                        && attr.committed_size == 0
-                        && attr.committed_content_epoch == 0
-                        && attr.size > 0 =>
-                {
-                    hidden_regular_inodes.insert(attr.ino);
-                }
-                MetaEvent::SetAttr { attr }
-                    if attr.kind == FileType::RegularFile
-                        && attr.upload_state == UploadState::Ready
-                        && (attr.committed_size > 0 || attr.committed_content_epoch > 0) =>
-                {
-                    published_regular_inodes.insert(attr.ino);
-                }
-                MetaEvent::PublishRegularFileBaseSlices { ino, .. } => {
-                    published_regular_inodes.insert(*ino);
-                }
-                _ => {}
-            }
-        }
-        hidden_regular_inodes.retain(|ino| !published_regular_inodes.contains(ino));
-        hidden_regular_inodes
-    }
-
-    fn has_deferred_regular_create(events: &[MetaEvent]) -> bool {
-        let hidden_regular_inodes = Self::hidden_unpublished_regular_inodes(events);
-        !hidden_regular_inodes.is_empty()
-            && events.iter().any(|event| {
-                matches!(
-                    event,
-                    MetaEvent::AddEntry { entry, .. }
-                        if entry.kind == FileType::RegularFile
-                            && hidden_regular_inodes.contains(&entry.ino)
-                )
-            })
-    }
-
     fn remote_visible_event_count(events: &[MetaEvent]) -> u32 {
         let count = Self::project_remote_events(events).len();
         u32::try_from(count).unwrap_or(u32::MAX)
     }
 
     fn remote_events_need_eager_flush(events: &[MetaEvent]) -> bool {
-        let regular_create_inodes: HashSet<Ino> = events
-            .iter()
-            .filter_map(|event| match event {
-                MetaEvent::AddEntry { entry, .. } if entry.kind == FileType::RegularFile => {
-                    Some(entry.ino)
-                }
-                _ => None,
-            })
-            .collect();
-
         events.iter().any(|event| match event {
             MetaEvent::SetRegularFileOverlaySlices { .. }
             | MetaEvent::RemoveRegularFileGraph { .. }
@@ -2543,116 +2439,21 @@ impl PgMetaEngine {
             | MetaEvent::RemovePendingDeletion { .. } => false,
             MetaEvent::SetAttr { attr } if attr.kind == FileType::RegularFile => {
                 attr.upload_state == UploadState::Ready
-                    && ((attr.committed_size > 0 || attr.committed_content_epoch > 0)
-                        || !regular_create_inodes.contains(&attr.ino))
             }
             MetaEvent::SetAttr { .. }
             | MetaEvent::RemoveAttr { .. }
+            | MetaEvent::AddEntry { .. }
             | MetaEvent::RemoveEntry { .. }
             | MetaEvent::RenameEntry { .. }
             | MetaEvent::PublishRegularFileBaseSlices { .. }
             | MetaEvent::CreateSnapshot { .. }
             | MetaEvent::UpdateSnapshotState { .. } => true,
-            MetaEvent::AddEntry { entry, .. } => entry.kind != FileType::RegularFile,
             MetaEvent::SetSymlinkTarget { .. }
             | MetaEvent::SetXattr { .. }
             | MetaEvent::RemoveXattr { .. }
             | MetaEvent::SetAclRule { .. }
             | MetaEvent::RemoveAclRule { .. } => false,
         })
-    }
-
-    fn batch_updates_remote_namespace_visibility(events: &[MetaEvent]) -> bool {
-        events.iter().any(|event| {
-            event.is_namespace_mutation()
-                || matches!(
-                    event,
-                    MetaEvent::PublishRegularFileBaseSlices { .. }
-                        | MetaEvent::RemoveRegularFileGraph { .. }
-                )
-                || matches!(
-                    event,
-                    MetaEvent::SetAttr { attr }
-                        if attr.kind == FileType::RegularFile
-                            && (attr.committed_size > 0 || attr.committed_content_epoch > 0)
-                )
-        })
-    }
-
-    fn self_batch_event_fully_ackable(
-        event: &MetaEvent,
-        retained_block_overlay: &HashSet<Ino>,
-        fully_published_regular_inodes: &HashSet<Ino>,
-    ) -> bool {
-        match event {
-            MetaEvent::AddEntry { entry, .. } if entry.kind == FileType::RegularFile => {
-                fully_published_regular_inodes.contains(&entry.ino)
-                    || !retained_block_overlay.contains(&entry.ino)
-            }
-            MetaEvent::SetAttr { attr } if attr.kind == FileType::RegularFile => {
-                fully_published_regular_inodes.contains(&attr.ino)
-                    || (!retained_block_overlay.contains(&attr.ino)
-                        && attr.upload_state == UploadState::Ready
-                        && attr.size == attr.committed_size
-                        && attr.content_epoch == attr.committed_content_epoch)
-            }
-            MetaEvent::SetRegularFileOverlaySlices { ino, .. }
-            | MetaEvent::PublishRegularFileBaseSlices { ino, .. }
-            | MetaEvent::RemoveRegularFileGraph { ino } => {
-                fully_published_regular_inodes.contains(ino)
-                    || !retained_block_overlay.contains(ino)
-            }
-            _ => true,
-        }
-    }
-
-    fn touched_regular_inodes(events: &[MetaEvent]) -> HashSet<Ino> {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                MetaEvent::AddEntry { entry, .. } if entry.kind == FileType::RegularFile => {
-                    Some(entry.ino)
-                }
-                MetaEvent::SetAttr { attr } if attr.kind == FileType::RegularFile => Some(attr.ino),
-                MetaEvent::SetRegularFileOverlaySlices { ino, .. }
-                | MetaEvent::PublishRegularFileBaseSlices { ino, .. }
-                | MetaEvent::RemoveRegularFileGraph { ino } => Some(*ino),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn fully_published_regular_inodes_for_self_batch(
-        &self,
-        local_events: &[MetaEvent],
-    ) -> MetaResult<HashSet<Ino>> {
-        let mut published = HashSet::new();
-        for ino in Self::touched_regular_inodes(local_events) {
-            let Ok(attr) = self.local.get_attr(ino) else {
-                continue;
-            };
-            if attr.kind == FileType::RegularFile
-                && attr.upload_state == UploadState::Ready
-                && attr.size == attr.committed_size
-                && attr.content_epoch == attr.committed_content_epoch
-            {
-                published.insert(ino);
-            }
-        }
-        Ok(published)
-    }
-
-    fn projected_events_match(left: &[MetaEvent], right: &[MetaEvent]) -> MetaResult<bool> {
-        if left.len() != right.len() {
-            return Ok(false);
-        }
-
-        for (local, remote) in left.iter().zip(right.iter()) {
-            if Self::encode_postcard(local)? != Self::encode_postcard(remote)? {
-                return Ok(false);
-            }
-        }
-        Ok(true)
     }
 
     fn aux_event_conflicts_with_overlay(
@@ -2664,7 +2465,7 @@ impl PgMetaEngine {
         let conflict = match event {
             MetaEvent::RemoveAttr { ino } => {
                 if removed_inodes.contains(ino) {
-                    return Ok(overlay.block_inodes.contains(ino));
+                    return Ok(false);
                 }
                 overlay.block_inodes.contains(ino)
                     || overlay.attr_inodes.contains(ino)
@@ -2755,15 +2556,10 @@ impl PgMetaEngine {
     fn removed_inodes_for_batch(&self, batch_events: &[MetaEvent]) -> HashSet<Ino> {
         let mut removed = HashSet::new();
         for event in batch_events {
-            if let MetaEvent::RemoveEntry { parent, name } = event {
-                let entry = self
-                    .local
-                    .lookup(*parent, name)
-                    .map(Some)
-                    .or_else(|_| self.local.lookup_base_dentry(*parent, name));
-                if let Ok(Some(entry)) = entry {
-                    removed.insert(entry.ino);
-                }
+            if let MetaEvent::RemoveEntry { parent, name } = event
+                && let Ok(entry) = self.local.lookup(*parent, name)
+            {
+                removed.insert(entry.ino);
             }
         }
         removed
@@ -2868,25 +2664,14 @@ impl PgMetaEngine {
     }
 
     fn local_overlay_conflicts(&self) -> MetaResult<OverlayConflictSets> {
-        let mut overlay = OverlayConflictSets {
-            block_inodes: self.local.local_overlay_inodes()?,
-            attr_inodes: self.local.local_overlay_attr_inodes()?,
-            dentry_keys: self.local.local_overlay_dentries()?,
-            symlink_inodes: self.local.local_overlay_symlink_inodes()?,
-            xattr_inodes: self.local.local_overlay_xattr_inodes()?,
-            xattr_keys: self.local.local_overlay_xattr_keys()?,
-            acl_keys: self.local.local_overlay_acl_keys()?,
-        };
         let start = self.flushed_event_seq.load(Ordering::SeqCst);
         let end = self.local.get_counter("nextEventSeq")?;
         if end <= start {
-            return Ok(overlay);
+            return Ok(OverlayConflictSets::default());
         }
 
         let events = self.local.read_events_range(start, end)?;
-        overlay =
-            Self::merge_overlay_conflicts(&overlay, &Self::overlay_conflicts_for_events(&events));
-        Ok(overlay)
+        Ok(Self::overlay_conflicts_for_events(&events))
     }
 
     fn serving_event_conflicts_with_overlay(
@@ -2900,7 +2685,7 @@ impl PgMetaEngine {
             }
             MetaEvent::RemoveAttr { ino } => {
                 if removed_inodes.contains(ino) {
-                    return overlay.block_inodes.contains(ino);
+                    return false;
                 }
                 overlay.block_inodes.contains(ino)
                     || overlay.attr_inodes.contains(ino)
@@ -2912,49 +2697,7 @@ impl PgMetaEngine {
                     .dentry_keys
                     .contains(&Self::dentry_key(*parent, name))
             }
-            MetaEvent::RenameEntry {
-                parent,
-                name,
-                new_parent,
-                new_name,
-                entry,
-                displaced_set_attr,
-                displaced_remove_attr_ino,
-                moved_dir_attr,
-                old_parent_attr,
-                new_parent_attr,
-            } => {
-                overlay
-                    .dentry_keys
-                    .contains(&Self::dentry_key(*parent, name))
-                    || overlay
-                        .dentry_keys
-                        .contains(&Self::dentry_key(*new_parent, new_name))
-                    || overlay.attr_inodes.contains(&entry.ino)
-                    || displaced_set_attr
-                        .as_ref()
-                        .as_ref()
-                        .map(|attr| overlay.attr_inodes.contains(&attr.ino))
-                        .unwrap_or(false)
-                    || displaced_remove_attr_ino
-                        .map(|ino| overlay.attr_inodes.contains(&ino))
-                        .unwrap_or(false)
-                    || moved_dir_attr
-                        .as_ref()
-                        .as_ref()
-                        .map(|attr| overlay.attr_inodes.contains(&attr.ino))
-                        .unwrap_or(false)
-                    || old_parent_attr
-                        .as_ref()
-                        .as_ref()
-                        .map(|attr| overlay.attr_inodes.contains(&attr.ino))
-                        .unwrap_or(false)
-                    || new_parent_attr
-                        .as_ref()
-                        .as_ref()
-                        .map(|attr| overlay.attr_inodes.contains(&attr.ino))
-                        .unwrap_or(false)
-            }
+            MetaEvent::RenameEntry { .. } => false,
             MetaEvent::SetSymlinkTarget { ino, .. } => {
                 overlay.block_inodes.contains(ino)
                     || overlay.attr_inodes.contains(ino)
@@ -2970,29 +2713,14 @@ impl PgMetaEngine {
                 overlay.attr_inodes.contains(ino)
                     || overlay.acl_keys.contains(&Self::acl_key(*ino, principal))
             }
-            MetaEvent::SetRegularFileOverlaySlices { ino, .. }
-            | MetaEvent::PublishRegularFileBaseSlices { ino, .. }
-            | MetaEvent::RemoveRegularFileGraph { ino } => overlay.block_inodes.contains(ino),
-            MetaEvent::AddPendingDeletion { .. }
+            MetaEvent::SetRegularFileOverlaySlices { .. }
+            | MetaEvent::PublishRegularFileBaseSlices { .. }
+            | MetaEvent::RemoveRegularFileGraph { .. }
+            | MetaEvent::AddPendingDeletion { .. }
             | MetaEvent::RemovePendingDeletion { .. }
             | MetaEvent::CreateSnapshot { .. }
             | MetaEvent::UpdateSnapshotState { .. } => false,
         }
-    }
-
-    fn rename_dentry_conflicts_with_overlay(
-        parent: Ino,
-        name: &[u8],
-        new_parent: Ino,
-        new_name: &[u8],
-        overlay: &OverlayConflictSets,
-    ) -> bool {
-        overlay
-            .dentry_keys
-            .contains(&Self::dentry_key(parent, name))
-            || overlay
-                .dentry_keys
-                .contains(&Self::dentry_key(new_parent, new_name))
     }
 
     fn decode_foreign_batch(
@@ -3029,81 +2757,30 @@ impl PgMetaEngine {
         overlay: &OverlayConflictSets,
     ) -> MetaResult<bool> {
         let removed_inodes = self.removed_inodes_for_batch(batch_events);
-        let preserve_local_payload_inodes = batch_events
-            .iter()
-            .filter_map(|event| match event {
-                MetaEvent::RemoveAttr { ino }
-                    if removed_inodes.contains(ino) && overlay.block_inodes.contains(ino) =>
-                {
-                    Some(*ino)
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
         self.local.apply_replica_events_to_base(batch_events)?;
-        let mut serving_events = Vec::new();
-        let mut serving_rename_reconciles = Vec::new();
-        let mut serving_displaced_dentry_cleanup_inodes = Vec::new();
+        let serving_events: Vec<MetaEvent> = batch_events
+            .iter()
+            .filter(|event| {
+                !Self::serving_event_conflicts_with_overlay(event, overlay, &removed_inodes)
+            })
+            .cloned()
+            .collect();
+        self.local.apply_replica_serving_state(&serving_events)?;
         let mut aux_events = Vec::new();
         for event in batch_events {
-            if let MetaEvent::RenameEntry {
-                displaced_remove_attr_ino: Some(ino),
-                ..
-            } = event
-            {
-                serving_displaced_dentry_cleanup_inodes.push(*ino);
+            if !Self::event_has_aux_apply_effect(event) {
+                continue;
             }
-            if let MetaEvent::RenameEntry {
-                parent,
-                name,
-                new_parent,
-                new_name,
-                ..
-            } = event
-                && !Self::rename_dentry_conflicts_with_overlay(
-                    *parent,
-                    name,
-                    *new_parent,
-                    new_name,
-                    overlay,
-                )
-            {
-                serving_rename_reconciles.push(event);
-            }
-            let serving_conflicts =
-                Self::serving_event_conflicts_with_overlay(event, overlay, &removed_inodes);
-            if !serving_conflicts {
-                serving_events.push(event.clone());
-            } else if let MetaEvent::RemoveAttr { ino } = event {
-                serving_displaced_dentry_cleanup_inodes.push(*ino);
-            }
-
-            if Self::event_has_aux_apply_effect(event)
-                && !self.aux_event_conflicts_with_overlay(event, overlay, &removed_inodes)?
-            {
+            if !self.aux_event_conflicts_with_overlay(event, overlay, &removed_inodes)? {
                 aux_events.push(event.clone());
             }
         }
-        self.local.apply_replica_serving_state(&serving_events)?;
-        self.local
-            .reconcile_serving_renames_from_base(serving_rename_reconciles)?;
-        for ino in serving_displaced_dentry_cleanup_inodes {
-            self.local.remove_serving_dentries_for_inode(ino)?;
-        }
 
         if aux_events.is_empty() {
-            for ino in preserve_local_payload_inodes {
-                self.local
-                    .mark_local_regular_file_ready_preserving_overlay(ino)?;
-            }
             return Ok(false);
         }
 
         self.local.apply_replica_aux_state(&aux_events)?;
-        for ino in preserve_local_payload_inodes {
-            self.local
-                .mark_local_regular_file_ready_preserving_overlay(ino)?;
-        }
         Ok(true)
     }
 
@@ -3112,52 +2789,7 @@ impl PgMetaEngine {
             return Ok(false);
         }
 
-        let tail_overlay = self.local_tail_overlay_after_self_batch(batch_events)?;
-        let retained_block_overlay = self.local.local_overlay_inodes()?;
         self.local.apply_replica_events_to_base(batch_events)?;
-        let mut applied_any = false;
-        if let Some(tail_overlay) = tail_overlay {
-            let removed_inodes = self.removed_inodes_for_batch(batch_events);
-            let mut serving_events = Vec::new();
-            let mut serving_displaced_dentry_cleanup_inodes = Vec::new();
-            for event in batch_events {
-                if let MetaEvent::RenameEntry {
-                    displaced_remove_attr_ino: Some(ino),
-                    ..
-                } = event
-                {
-                    serving_displaced_dentry_cleanup_inodes.push(*ino);
-                }
-                let serving_conflicts = Self::serving_event_conflicts_with_overlay(
-                    event,
-                    &tail_overlay,
-                    &removed_inodes,
-                );
-                let self_graph_event_ackable = matches!(
-                    event,
-                    MetaEvent::SetRegularFileOverlaySlices { .. }
-                        | MetaEvent::PublishRegularFileBaseSlices { .. }
-                        | MetaEvent::RemoveRegularFileGraph { .. }
-                ) && Self::self_batch_event_fully_ackable(
-                    event,
-                    &retained_block_overlay,
-                    &HashSet::new(),
-                );
-                if !serving_conflicts || self_graph_event_ackable {
-                    serving_events.push(event.clone());
-                } else if let MetaEvent::RemoveAttr { ino } = event {
-                    serving_displaced_dentry_cleanup_inodes.push(*ino);
-                }
-            }
-            if !serving_events.is_empty() {
-                self.local.apply_replica_serving_state(&serving_events)?;
-                applied_any = true;
-            }
-            for ino in serving_displaced_dentry_cleanup_inodes {
-                self.local.remove_serving_dentries_for_inode(ino)?;
-                applied_any = true;
-            }
-        }
         for event in batch_events {
             if let MetaEvent::RenameEntry {
                 parent,
@@ -3183,131 +2815,11 @@ impl PgMetaEngine {
             .cloned()
             .collect();
         if aux_events.is_empty() {
-            return Ok(applied_any);
+            return Ok(false);
         }
 
         self.local.apply_replica_aux_state(&aux_events)?;
         Ok(true)
-    }
-
-    fn apply_remote_self_batch(
-        &self,
-        batch_version: i64,
-        batch_events: &[MetaEvent],
-    ) -> MetaResult<(bool, OverlayConflictSets)> {
-        let applied = self.apply_visible_self_batch(batch_events)?;
-        self.acknowledge_local_prefix_from_self_batch(batch_events)?;
-        if Self::batch_updates_remote_namespace_visibility(batch_events) {
-            self.persist_namespace_version(
-                self.namespace_version
-                    .load(Ordering::SeqCst)
-                    .max(batch_version),
-            )?;
-        }
-        let overlay = self.overlay_after_visible_self_batch(batch_events)?;
-        Ok((applied, overlay))
-    }
-
-    fn local_tail_overlay_after_self_batch(
-        &self,
-        batch_events: &[MetaEvent],
-    ) -> MetaResult<Option<OverlayConflictSets>> {
-        let start = self.flushed_event_seq.load(Ordering::SeqCst);
-        let end = self.local.get_counter("nextEventSeq")?;
-        if end <= start {
-            return Ok(Some(OverlayConflictSets::default()));
-        }
-
-        let local_events = self.local.read_events_range(start, end)?;
-        let retained_block_overlay = self.local.local_overlay_inodes()?;
-        let fully_published_regular_inodes =
-            self.fully_published_regular_inodes_for_self_batch(&local_events)?;
-        let mut projected_prefix = Vec::with_capacity(batch_events.len());
-        let mut consumed_events = 0usize;
-        let mut ackable_events = 0usize;
-        let mut prefix_ackable = true;
-        for event in &local_events {
-            consumed_events = consumed_events.saturating_add(1);
-            projected_prefix = Self::project_remote_events(&local_events[..consumed_events]);
-            prefix_ackable &= Self::self_batch_event_fully_ackable(
-                event,
-                &retained_block_overlay,
-                &fully_published_regular_inodes,
-            );
-            if prefix_ackable {
-                ackable_events = consumed_events;
-            }
-            if projected_prefix.len() >= batch_events.len() {
-                break;
-            }
-        }
-        if projected_prefix.len() != batch_events.len() {
-            return Ok(None);
-        }
-
-        if !Self::projected_events_match(&projected_prefix, batch_events)? {
-            return Ok(None);
-        }
-
-        Ok(Some(Self::overlay_conflicts_for_events(
-            &local_events[ackable_events..],
-        )))
-    }
-
-    fn local_unackable_overlay_after_self_batch(
-        &self,
-        batch_events: &[MetaEvent],
-    ) -> MetaResult<Option<OverlayConflictSets>> {
-        let start = self.flushed_event_seq.load(Ordering::SeqCst);
-        let end = self.local.get_counter("nextEventSeq")?;
-        if end <= start {
-            return Ok(Some(OverlayConflictSets::default()));
-        }
-
-        let local_events = self.local.read_events_range(start, end)?;
-        let retained_block_overlay = self.local.local_overlay_inodes()?;
-        let fully_published_regular_inodes =
-            self.fully_published_regular_inodes_for_self_batch(&local_events)?;
-        let mut projected_prefix = Vec::with_capacity(batch_events.len());
-        let mut consumed_events = 0usize;
-        for _ in &local_events {
-            consumed_events = consumed_events.saturating_add(1);
-            projected_prefix = Self::project_remote_events(&local_events[..consumed_events]);
-            if projected_prefix.len() >= batch_events.len() {
-                break;
-            }
-        }
-        if projected_prefix.len() != batch_events.len() {
-            return Ok(None);
-        }
-
-        if !Self::projected_events_match(&projected_prefix, batch_events)? {
-            return Ok(None);
-        }
-
-        let unackable_events = local_events[..consumed_events]
-            .iter()
-            .filter(|event| {
-                !Self::self_batch_event_fully_ackable(
-                    event,
-                    &retained_block_overlay,
-                    &fully_published_regular_inodes,
-                )
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        Ok(Some(Self::overlay_conflicts_for_events(&unackable_events)))
-    }
-
-    fn overlay_after_visible_self_batch(
-        &self,
-        batch_events: &[MetaEvent],
-    ) -> MetaResult<OverlayConflictSets> {
-        let current = self.local_overlay_conflicts()?;
-        match self.local_unackable_overlay_after_self_batch(batch_events)? {
-            Some(unackable) => Ok(Self::merge_overlay_conflicts(&current, &unackable)),
-            None => Ok(current),
-        }
     }
 
     fn acknowledge_local_prefix_from_self_batch(
@@ -3325,24 +2837,12 @@ impl PgMetaEngine {
         }
 
         let local_events = self.local.read_events_range(start, end)?;
-        let retained_block_overlay = self.local.local_overlay_inodes()?;
-        let fully_published_regular_inodes =
-            self.fully_published_regular_inodes_for_self_batch(&local_events)?;
         let mut projected_prefix = Vec::with_capacity(batch_events.len());
         let mut consumed_events = 0usize;
-        let mut ackable_events = 0usize;
-        let mut prefix_ackable = true;
         for event in &local_events {
             consumed_events = consumed_events.saturating_add(1);
-            projected_prefix = Self::project_remote_events(&local_events[..consumed_events]);
-            prefix_ackable &= Self::self_batch_event_fully_ackable(
-                event,
-                &retained_block_overlay,
-                &fully_published_regular_inodes,
-            );
-            if prefix_ackable {
-                ackable_events = consumed_events;
-            }
+            let projected = Self::project_remote_events(std::slice::from_ref(event));
+            projected_prefix.extend(projected);
             if projected_prefix.len() >= batch_events.len() {
                 break;
             }
@@ -3351,8 +2851,15 @@ impl PgMetaEngine {
             return Ok(());
         }
 
-        if Self::projected_events_match(&projected_prefix, batch_events)? {
-            let next_seq = start.max(1).saturating_add(ackable_events as u64);
+        let matches_prefix =
+            projected_prefix
+                .iter()
+                .zip(batch_events.iter())
+                .all(|(local, remote)| {
+                    Self::encode_postcard(local).ok() == Self::encode_postcard(remote).ok()
+                });
+        if matches_prefix {
+            let next_seq = start.max(1).saturating_add(consumed_events as u64);
             self.persist_flushed_event_seq(next_seq)?;
         }
         Ok(())
@@ -3418,7 +2925,7 @@ impl PgMetaEngine {
         let bytes: Vec<u8> = row.get(1);
 
         let snapshot = Self::decode_snapshot(&bytes)?;
-        self.import_remote_snapshot_preserving_pg_local_counters(&snapshot)?;
+        self.local.import_remote_snapshot(&snapshot)?;
         self.persist_local_version(version)?;
         Ok(true)
     }
@@ -3637,8 +3144,7 @@ impl PgMetaEngine {
     fn write_checkpoint_locked(&self) -> MetaResult<()> {
         let postgres_url = self.postgres_url.clone();
         let volume_id = self.volume_id;
-        let mut snapshot = self.local.export_remote_snapshot()?;
-        Self::strip_pg_local_snapshot_counters(&mut snapshot);
+        let snapshot = self.local.export_remote_snapshot()?;
         let payload = serde_json::to_vec(&snapshot)
             .map_err(|e| MetaError::Serialization(format!("snapshot encode failed: {e}")))?;
         let version = self.local_version.load(Ordering::SeqCst);
@@ -3720,18 +3226,13 @@ impl PgMetaEngine {
         let mut max_namespace_version = self.namespace_version.load(Ordering::SeqCst);
         let mut idx = 0;
         while idx < rows.len() {
-            let mut next_overlay_override = None;
             let (batch_version, next_idx, batch_events, is_self_batch) =
                 Self::decode_foreign_batch(&rows, idx, client_id)?;
             idx = next_idx;
 
             if is_self_batch {
-                let (self_applied, overlay_after_self) =
-                    self.apply_remote_self_batch(batch_version, &batch_events)?;
-                applied_any |= self_applied;
-                max_namespace_version =
-                    max_namespace_version.max(self.namespace_version.load(Ordering::SeqCst));
-                next_overlay_override = Some(overlay_after_self);
+                applied_any |= self.apply_visible_self_batch(&batch_events)?;
+                self.acknowledge_local_prefix_from_self_batch(&batch_events)?;
             } else {
                 let effective_overlay = if let Some(recent_flush) = recent_flush {
                     if batch_version < recent_flush.batch_version {
@@ -3743,12 +3244,12 @@ impl PgMetaEngine {
                     overlay.clone()
                 };
                 applied_any |= self.apply_foreign_batch(&batch_events, &effective_overlay)?;
-                if Self::batch_updates_remote_namespace_visibility(&batch_events) {
+                if batch_events.iter().any(MetaEvent::is_namespace_mutation) {
                     max_namespace_version = max_namespace_version.max(batch_version);
                 }
             }
             max_version = batch_version;
-            overlay = next_overlay_override.unwrap_or(self.local_overlay_conflicts()?);
+            overlay = self.local_overlay_conflicts()?;
         }
         self.persist_local_version(max_version)?;
         if max_namespace_version > self.namespace_version.load(Ordering::SeqCst) {
@@ -3865,42 +3366,37 @@ impl PgMetaEngine {
         if after_seq <= before_seq {
             return Ok(false);
         }
+        let events = self.local.read_events_range(before_seq, after_seq)?;
+        let remote_events = Self::project_remote_events(&events);
+        let remote_visible_ops = u32::try_from(remote_events.len()).unwrap_or(u32::MAX);
+        let needs_eager_flush = Self::remote_events_need_eager_flush(&remote_events);
         let now = Instant::now();
         let mut state = self
             .pending_state
             .lock()
             .map_err(|_| MetaError::Storage("pg pending state lock poisoned".to_string()))?;
-        let event_start = state
-            .event_start
-            .unwrap_or_else(|| before_seq.min(self.flushed_event_seq.load(Ordering::SeqCst)));
-        let event_end = state.event_end.max(after_seq);
-        let events = self.local.read_events_range(event_start, event_end)?;
-        let remote_events = Self::project_remote_events(&events);
-        let remote_visible_ops = u32::try_from(remote_events.len()).unwrap_or(u32::MAX);
-        let has_deferred_regular_create = Self::has_deferred_regular_create(&events);
-        let needs_eager_flush = Self::remote_events_need_eager_flush(&remote_events);
         if remote_visible_ops == 0 {
-            if has_deferred_regular_create {
-                state.ops = 0;
-                state.force_flush = false;
-                state.event_start = Some(event_start);
-                state.event_end = event_end;
-                state.started_at = None;
-                state.last_mutation_at = Some(now);
-                return Ok(false);
+            if state.ops == 0 {
+                Self::clear_pending_state(&mut state);
+                drop(state);
+                self.persist_flushed_event_seq(after_seq)?;
+            } else {
+                if state.event_start.is_none() {
+                    state.event_start = Some(before_seq);
+                }
+                state.event_end = state.event_end.max(after_seq);
             }
-            Self::clear_pending_state(&mut state);
-            drop(state);
-            self.persist_flushed_event_seq(event_end)?;
             return Ok(false);
         }
         if state.ops == 0 {
             state.started_at = Some(now);
         }
-        state.ops = remote_visible_ops;
+        state.ops = state.ops.saturating_add(remote_visible_ops);
         state.last_mutation_at = Some(now);
-        state.event_start = Some(event_start);
-        state.event_end = event_end;
+        if state.event_start.is_none() {
+            state.event_start = Some(before_seq);
+        }
+        state.event_end = state.event_end.max(after_seq);
         if needs_eager_flush || state.ops >= self.flush_ops_threshold {
             state.force_flush = true;
         }
@@ -4012,7 +3508,7 @@ impl PgMetaEngine {
         // newer batch_version while still missing earlier foreign batches.
         // `pull_foreign_events_locked()` must remain able to read the full gap.
         self.apply_visible_self_batch(&remote_events)?;
-        self.acknowledge_local_prefix_from_self_batch(&remote_events)?;
+        self.persist_flushed_event_seq(batch.event_end)?;
         Ok(Some(RecentFlush {
             batch_version,
             overlay: Self::overlay_conflicts_for_events(&remote_events),
@@ -4040,16 +3536,6 @@ impl PgMetaEngine {
                 self.restore_pending_batch(batch);
                 Err(err)
             }
-        }
-    }
-
-    fn merge_recent_flush(acc: &mut Option<RecentFlush>, flush: RecentFlush) {
-        match acc {
-            Some(current) => {
-                current.batch_version = current.batch_version.max(flush.batch_version);
-                current.overlay = Self::merge_overlay_conflicts(&current.overlay, &flush.overlay);
-            }
-            None => *acc = Some(flush),
         }
     }
 
@@ -5001,19 +4487,14 @@ impl MetaReplication for PgMetaEngine {
             .replication_lock
             .lock()
             .map_err(|_| MetaError::Storage("pg replication lock poisoned".to_string()))?;
-        let mut recent_flush = None;
-        while let Some(batch) = self.claim_pending_batch(true) {
-            if let Some(flush) = self.flush_pending_claimed_batch_with_restore(batch)? {
-                Self::merge_recent_flush(&mut recent_flush, flush);
-            }
-        }
+        let recent_flush = if let Some(batch) = self.claim_pending_batch(true) {
+            self.flush_pending_claimed_batch_with_restore(batch)?
+        } else {
+            None
+        };
         let _ = self.pull_foreign_events_locked(recent_flush.as_ref())?;
         self.write_checkpoint_locked()?;
         Ok(())
-    }
-
-    fn flush_local_metadata(&self) -> MetaResult<()> {
-        self.local.flush_local_metadata()
     }
 
     fn request_eager_flush(&self) {
@@ -5052,7 +4533,6 @@ impl MetaReplication for PgMetaEngine {
             sync_errors: self.metadata_sync_errors.load(Ordering::Relaxed),
             last_successful_sync_unix_ms: (last_successful_sync_unix_ms > 0)
                 .then_some(last_successful_sync_unix_ms),
-            flushed_event_seq: Some(self.flushed_event_seq.load(Ordering::SeqCst)),
         }
     }
 
@@ -5676,151 +5156,6 @@ mod tests {
     }
 
     #[test]
-    fn project_remote_events_hides_unpublished_regular_file_attrs() {
-        let mut attr = InodeAttr::new_file(42, ROOT_INO, 0, 0, 0o644);
-        attr.size = 8 * 1024 * 1024;
-        attr.committed_size = 0;
-        attr.content_epoch = 1;
-        attr.committed_content_epoch = 0;
-        attr.upload_state = UploadState::Uploading;
-        let events = vec![
-            MetaEvent::AddEntry {
-                parent: ROOT_INO,
-                name: b"uploading.bin".to_vec(),
-                entry: DirEntryValue {
-                    ino: attr.ino,
-                    kind: FileType::RegularFile,
-                },
-            },
-            MetaEvent::SetAttr { attr },
-        ];
-
-        let projected = PgMetaEngine::project_remote_events(&events);
-        assert!(
-            projected.is_empty(),
-            "unpublished regular files must not appear remotely as zero-size files"
-        );
-    }
-
-    #[test]
-    fn project_remote_events_hides_create_then_unpublished_regular_file_attrs() {
-        let initial_attr = InodeAttr::new_file(42, ROOT_INO, 0, 0, 0o644);
-        let mut uploading_attr = initial_attr.clone();
-        uploading_attr.size = 8 * 1024 * 1024;
-        uploading_attr.committed_size = 0;
-        uploading_attr.content_epoch = 1;
-        uploading_attr.committed_content_epoch = 0;
-        uploading_attr.upload_state = UploadState::Uploading;
-        let events = vec![
-            MetaEvent::SetAttr { attr: initial_attr },
-            MetaEvent::AddEntry {
-                parent: ROOT_INO,
-                name: b"uploading.bin".to_vec(),
-                entry: DirEntryValue {
-                    ino: uploading_attr.ino,
-                    kind: FileType::RegularFile,
-                },
-            },
-            MetaEvent::SetAttr {
-                attr: uploading_attr,
-            },
-        ];
-
-        let projected = PgMetaEngine::project_remote_events(&events);
-        assert!(
-            projected.is_empty(),
-            "create followed by unpublished upload state must not publish zero-size metadata"
-        );
-    }
-
-    #[test]
-    fn apply_empty_self_projection_keeps_unpublished_local_overlay_size() {
-        let (_dir, pg) = temp_pg_engine_for_unit();
-        let file = pg
-            .create_file(ROOT_INO, b"draft.bin", 0, 0, 0o644)
-            .expect("create file");
-        set_file_state(&pg, file.ino, 4096, 1);
-        pg.stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(501, 4096))
-            .expect("stage local payload");
-
-        let start = pg.flushed_event_seq.load(Ordering::SeqCst);
-        let end = pg.local.get_counter("nextEventSeq").expect("event end");
-        let events = pg.local.read_events_range(start, end).expect("events");
-        let projected = PgMetaEngine::project_remote_events(&events);
-        assert!(
-            projected.is_empty(),
-            "unpublished local draft must have no remote projection"
-        );
-        pg.persist_flushed_event_seq(end)
-            .expect("ack empty projection");
-
-        let attr = pg.get_attr(file.ino).expect("draft attr");
-        assert_eq!(attr.size, 4096);
-        assert_eq!(attr.committed_size, 0);
-        assert_eq!(attr.upload_state, UploadState::Uploading);
-    }
-
-    #[test]
-    fn apply_empty_self_projection_keeps_size_only_unpublished_local_overlay() {
-        let (_dir, pg) = temp_pg_engine_for_unit();
-        let file = pg
-            .create_file(ROOT_INO, b"draft.bin", 0, 0, 0o644)
-            .expect("create file");
-        let mut attr = pg.get_attr(file.ino).expect("get attr");
-        attr.size = 4096;
-        pg.set_attr(&attr).expect("set size-only attr");
-        pg.stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(501, 4096))
-            .expect("stage local payload");
-
-        let start = pg.flushed_event_seq.load(Ordering::SeqCst);
-        let end = pg.local.get_counter("nextEventSeq").expect("event end");
-        let events = pg.local.read_events_range(start, end).expect("events");
-        let projected = PgMetaEngine::project_remote_events(&events);
-        assert!(
-            projected.is_empty(),
-            "size-only unpublished local draft must have no remote projection"
-        );
-        pg.persist_flushed_event_seq(end)
-            .expect("ack empty projection");
-
-        let attr = pg.get_attr(file.ino).expect("draft attr");
-        assert_eq!(attr.size, 4096);
-        assert_eq!(attr.committed_size, 0);
-    }
-
-    #[test]
-    fn project_remote_events_keeps_published_regular_file_attrs() {
-        let mut attr = InodeAttr::new_file(42, ROOT_INO, 0, 0, 0o644);
-        attr.size = 8 * 1024 * 1024;
-        attr.committed_size = attr.size;
-        attr.content_epoch = 1;
-        attr.committed_content_epoch = 1;
-        attr.upload_state = UploadState::Ready;
-        let events = vec![
-            MetaEvent::AddEntry {
-                parent: ROOT_INO,
-                name: b"published.bin".to_vec(),
-                entry: DirEntryValue {
-                    ino: attr.ino,
-                    kind: FileType::RegularFile,
-                },
-            },
-            MetaEvent::SetAttr { attr },
-        ];
-
-        let projected = PgMetaEngine::project_remote_events(&events);
-        assert_eq!(projected.len(), 2);
-        assert!(matches!(
-            projected.first(),
-            Some(MetaEvent::AddEntry { entry, .. }) if entry.ino == 42
-        ));
-        assert!(matches!(
-            projected.get(1),
-            Some(MetaEvent::SetAttr { attr }) if attr.size == 8 * 1024 * 1024
-        ));
-    }
-
-    #[test]
     fn self_batch_acknowledges_projected_prefix_with_filtered_overlay_events() {
         let (_dir, pg) = temp_pg_engine_for_unit();
         let file = pg
@@ -5867,957 +5202,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn self_batch_acknowledges_transient_unpublished_events_after_publish() {
-        let (_dir, pg) = temp_pg_engine_for_unit();
-
-        let start = pg.flushed_event_seq.load(Ordering::SeqCst);
-        create_published_small_file(&pg, ROOT_INO, b"published-self-create.bin", 77_410);
-        let end = pg.local.get_counter("nextEventSeq").expect("event end");
-        let events = pg
-            .local
-            .read_events_range(start, end)
-            .expect("read local create/publish events");
-        let projected = PgMetaEngine::project_remote_events(&events);
-        assert!(
-            events.len() > projected.len(),
-            "raw local create history should include filtered local-only graph events"
-        );
-
-        pg.acknowledge_local_prefix_from_self_batch(&projected)
-            .expect("ack projected self create/publish batch");
-
-        assert_eq!(
-            pg.flushed_event_seq.load(Ordering::SeqCst),
-            end,
-            "self-batch ack must advance over transient unpublished events once the inode is fully published"
-        );
-    }
-
-    #[test]
-    fn self_batch_projection_keeps_pending_update_overlay_serving() {
-        let (_dir, pg) = temp_pg_engine_for_unit();
-        let file = create_published_small_file(&pg, ROOT_INO, b"pending-self-update.bin", 77_404);
-        publish_local_events_to_base(&pg);
-
-        let start = pg.flushed_event_seq.load(Ordering::SeqCst);
-        set_file_state(&pg, file.ino, 75, 2);
-        let pending_payload = PayloadRef::new_partial(77_405, 75);
-        pg.stage_payload_slice(file.ino, 0, &pending_payload)
-            .expect("stage pending update");
-        let end = pg.local.get_counter("nextEventSeq").expect("event end");
-        let events = pg
-            .local
-            .read_events_range(start, end)
-            .expect("read local pending update events");
-        let projected = PgMetaEngine::project_remote_events(&events);
-        assert!(projected.iter().any(|event| matches!(
-            event,
-            MetaEvent::SetAttr { attr }
-                if attr.ino == file.ino && attr.size == 64 && attr.content_epoch == 2
-        )));
-
-        pg.apply_visible_self_batch(&projected)
-            .expect("apply visible self projection");
-
-        let attr = pg.get_attr(file.ino).expect("pending update attr");
-        assert_eq!(attr.size, 75);
-        assert_eq!(attr.committed_size, 64);
-        assert_eq!(
-            visible_object_id(&pg, file.ino),
-            pending_payload.object_id,
-            "self projected remote view must not replace the local pending overlay in serving state"
-        );
-        assert!(
-            pg.has_regular_file_overlay_object_if_matches(file.ino, 2, pending_payload.object_id)
-                .expect("pending overlay object lookup"),
-            "upload worker must still be able to finalize the pending overlay object"
-        );
-    }
-
-    #[test]
-    fn self_batch_projection_keeps_unpublished_attr_update_serving() {
-        let (_dir, pg) = temp_pg_engine_for_unit();
-        let file =
-            create_published_small_file(&pg, ROOT_INO, b"pending-attr-self-update.bin", 77_407);
-        publish_local_events_to_base(&pg);
-
-        let start = pg.flushed_event_seq.load(Ordering::SeqCst);
-        let mut attr = pg.get_attr(file.ino).expect("published file attr");
-        attr.size = 75;
-        attr.content_epoch = 2;
-        attr.upload_state = UploadState::Updating;
-        attr.mtime = InodeAttr::now_nanos();
-        attr.ctime = attr.mtime;
-        pg.set_attr(&attr).expect("set pending attr update");
-        assert!(
-            !pg.local
-                .local_overlay_inodes()
-                .expect("local overlay inodes")
-                .contains(&file.ino),
-            "test setup must model the pre-upload window where attr changed before graph overlay exists"
-        );
-
-        let end = pg.local.get_counter("nextEventSeq").expect("event end");
-        let events = pg
-            .local
-            .read_events_range(start, end)
-            .expect("read local pending attr update events");
-        let projected = PgMetaEngine::project_remote_events(&events);
-        assert!(projected.iter().any(|event| matches!(
-            event,
-            MetaEvent::SetAttr { attr }
-                if attr.ino == file.ino
-                    && attr.size == 64
-                    && attr.committed_size == 64
-                    && attr.content_epoch == 2
-                    && attr.committed_content_epoch == 1
-        )));
-
-        pg.apply_visible_self_batch(&projected)
-            .expect("apply visible self projection");
-
-        let attr = pg.get_attr(file.ino).expect("pending attr update attr");
-        assert_eq!(
-            attr.size, 75,
-            "self projected remote view must not shrink the local pre-upload attr"
-        );
-        assert_eq!(attr.committed_size, 64);
-        assert_eq!(attr.content_epoch, 2);
-        assert_eq!(attr.committed_content_epoch, 1);
-        assert_eq!(attr.upload_state, UploadState::Updating);
-    }
-
-    #[test]
-    fn self_batch_overlay_keeps_current_block_conflict_after_attr_prefix() {
-        let (_dir, pg) = temp_pg_engine_for_unit();
-        let file =
-            create_published_small_file(&pg, ROOT_INO, b"pending-overlay-self-update.bin", 77_408);
-        publish_local_events_to_base(&pg);
-
-        let start = pg.flushed_event_seq.load(Ordering::SeqCst);
-        let mut attr = pg.get_attr(file.ino).expect("published file attr");
-        attr.size = 75;
-        attr.content_epoch = 2;
-        attr.upload_state = UploadState::Updating;
-        attr.mtime = InodeAttr::now_nanos();
-        attr.ctime = attr.mtime;
-        pg.set_attr(&attr).expect("set pending attr update");
-        let pending_payload = PayloadRef::new_partial(77_409, 75);
-        pg.stage_payload_slice(file.ino, 0, &pending_payload)
-            .expect("stage pending overlay");
-        assert!(
-            pg.local
-                .local_overlay_inodes()
-                .expect("local overlay inodes")
-                .contains(&file.ino),
-            "test setup must have a current block overlay that follows the projected attr prefix"
-        );
-
-        let end = pg.local.get_counter("nextEventSeq").expect("event end");
-        let events = pg
-            .local
-            .read_events_range(start, end)
-            .expect("read local pending update events");
-        assert!(matches!(
-            events.first(),
-            Some(MetaEvent::SetAttr { attr })
-                if attr.ino == file.ino && attr.size == 75 && attr.content_epoch == 2
-        ));
-        let projected_attr_prefix = PgMetaEngine::project_remote_events(&events[..1]);
-
-        pg.apply_visible_self_batch(&projected_attr_prefix)
-            .expect("apply visible self attr prefix");
-        pg.acknowledge_local_prefix_from_self_batch(&projected_attr_prefix)
-            .expect("ack visible self attr prefix");
-        let overlay = pg
-            .overlay_after_visible_self_batch(&projected_attr_prefix)
-            .expect("overlay after visible self prefix");
-
-        assert!(
-            overlay.attr_inodes.contains(&file.ino),
-            "unackable projected attr must still protect serving attrs"
-        );
-        assert!(
-            overlay.block_inodes.contains(&file.ino),
-            "current pending graph overlay must remain protected for following rows in the same pull"
-        );
-    }
-
-    #[test]
-    fn self_batch_keeps_graph_mutations_unackable_while_overlay_is_retained() {
-        let retained = HashSet::from([42]);
-        let chunk_slices = vec![(
-            ChunkId(0),
-            vec![SliceRecord {
-                slice_id: SliceId(0),
-                order: SliceOrder(0),
-                range: SliceRange::new(0, 64).expect("valid range"),
-                payload: Some(PayloadRef::new_partial(77_406, 64)),
-                payload_state: PayloadRefState::Published,
-            }],
-        )];
-
-        assert!(!PgMetaEngine::self_batch_event_fully_ackable(
-            &MetaEvent::SetRegularFileOverlaySlices {
-                ino: 42,
-                chunk_slices: chunk_slices.clone(),
-            },
-            &retained,
-            &HashSet::new(),
-        ));
-        assert!(!PgMetaEngine::self_batch_event_fully_ackable(
-            &MetaEvent::PublishRegularFileBaseSlices {
-                ino: 42,
-                chunk_slices,
-            },
-            &retained,
-            &HashSet::new(),
-        ));
-        assert!(!PgMetaEngine::self_batch_event_fully_ackable(
-            &MetaEvent::RemoveRegularFileGraph { ino: 42 },
-            &retained,
-            &HashSet::new(),
-        ));
-    }
-
-    #[test]
-    fn pg_pending_keeps_hidden_regular_create_until_publish_projection() {
-        let (_dir, pg) = temp_pg_engine_for_unit();
-        let start = pg.flushed_event_seq.load(Ordering::SeqCst);
-        let file = pg
-            .create_file(ROOT_INO, b"write-through-race.bin", 0, 0, 0o644)
-            .expect("create file");
-        set_file_state(&pg, file.ino, 4096, 1);
-        let hidden_end = pg.local.get_counter("nextEventSeq").expect("hidden end");
-        let hidden_events = pg
-            .local
-            .read_events_range(start, hidden_end)
-            .expect("hidden events");
-        assert!(
-            PgMetaEngine::project_remote_events(&hidden_events).is_empty(),
-            "create followed by unpublished content must stay hidden remotely"
-        );
-
-        assert!(
-            pg.claim_pending_batch(true).is_none(),
-            "hidden regular create must not be claimable as a remote batch yet"
-        );
-        assert_eq!(
-            pg.flushed_event_seq.load(Ordering::SeqCst),
-            start,
-            "hidden regular create must remain unacked so later publish can include its AddEntry"
-        );
-
-        let payload = PayloadRef::new_partial(77_777, 4096);
-        pg.stage_payload_slice(file.ino, 0, &payload)
-            .expect("stage payload");
-        assert!(
-            pg.mark_regular_file_overlay_object_uploaded_if_matches(file.ino, 1, payload.object_id)
-                .expect("mark uploaded"),
-            "payload marker must update overlay state"
-        );
-        assert!(
-            pg.publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
-                .expect("publish payload"),
-            "payload publish must succeed"
-        );
-
-        let batch = pg.claim_pending_batch(true).expect("claim publish batch");
-        assert_eq!(
-            batch.event_start, start,
-            "publish batch must replay the hidden create prefix"
-        );
-        let events = pg
-            .local
-            .read_events_range(batch.event_start, batch.event_end)
-            .expect("publish range events");
-        let projected = PgMetaEngine::project_remote_events(&events);
-        assert!(
-            projected.iter().any(|event| matches!(
-                event,
-                MetaEvent::AddEntry { entry, .. }
-                    if entry.kind == FileType::RegularFile && entry.ino == file.ino
-            )),
-            "remote projection must include the original regular-file dentry"
-        );
-    }
-
-    #[test]
-    fn self_ack_does_not_skip_hidden_regular_create_before_visible_tail() {
-        let (_dir, pg) = temp_pg_engine_for_unit();
-        let start = pg.flushed_event_seq.load(Ordering::SeqCst);
-        let hidden = pg
-            .create_file(ROOT_INO, b"hidden-before-visible.bin", 0, 0, 0o644)
-            .expect("create hidden file");
-        set_file_state(&pg, hidden.ino, 4096, 1);
-        let hidden_payload = PayloadRef::new_partial(77_778, 4096);
-        pg.stage_payload_slice(hidden.ino, 0, &hidden_payload)
-            .expect("stage hidden payload");
-        let visible = pg
-            .create_file(ROOT_INO, b"visible-tail.bin", 0, 0, 0o644)
-            .expect("create visible tail file");
-
-        let end = pg.local.get_counter("nextEventSeq").expect("event end");
-        let events = pg
-            .local
-            .read_events_range(start, end)
-            .expect("read mixed local events");
-        let projected = PgMetaEngine::project_remote_events(&events);
-        assert!(
-            !projected.iter().any(|event| matches!(
-                event,
-                MetaEvent::AddEntry { entry, .. } if entry.ino == hidden.ino
-            )),
-            "hidden regular-file dentry must not be published yet"
-        );
-        assert!(
-            projected.iter().any(|event| matches!(
-                event,
-                MetaEvent::AddEntry { entry, .. } if entry.ino == visible.ino
-            )),
-            "later visible events keep the batch non-empty"
-        );
-
-        pg.acknowledge_local_prefix_from_self_batch(&projected)
-            .expect("ack visible self batch");
-        mark_overlay_objects_uploaded(&pg, hidden.ino, 1, &[hidden_payload.object_id]);
-        assert!(
-            pg.publish_regular_file_overlay_to_base_if_matches(hidden.ino, 1)
-                .expect("publish hidden payload"),
-            "hidden file publish must succeed"
-        );
-
-        let batch = pg
-            .claim_pending_batch(true)
-            .expect("claim later publish batch");
-        let events = pg
-            .local
-            .read_events_range(batch.event_start, batch.event_end)
-            .expect("read later publish events");
-        let projected = PgMetaEngine::project_remote_events(&events);
-        assert!(
-            projected.iter().any(|event| matches!(
-                event,
-                MetaEvent::AddEntry { entry, .. } if entry.ino == hidden.ino
-            )),
-            "later publish must still include the hidden file dentry"
-        );
-    }
-
-    #[test]
-    fn foreign_rename_reconciles_serving_dentry_despite_local_attr_overlay() {
-        let (_dir, pg) = temp_pg_engine_for_unit();
-        let file = create_published_small_file(&pg, ROOT_INO, b"rename-source.txt", 77_099);
-        publish_local_events_to_base(&pg);
-
-        let mut local_attr = pg.get_attr(file.ino).expect("get attr");
-        local_attr.size = 55;
-        pg.set_attr(&local_attr).expect("set local attr overlay");
-        let overlay = pg.local_overlay_conflicts().expect("local overlay");
-        let rename = MetaEvent::RenameEntry {
-            parent: ROOT_INO,
-            name: b"rename-source.txt".to_vec(),
-            new_parent: ROOT_INO,
-            new_name: b"renamed-target.txt".to_vec(),
-            entry: DirEntryValue {
-                ino: file.ino,
-                kind: FileType::RegularFile,
-            },
-            displaced_set_attr: Box::new(None),
-            displaced_remove_attr_ino: None,
-            moved_dir_attr: Box::new(None),
-            old_parent_attr: Box::new(None),
-            new_parent_attr: Box::new(None),
-        };
-
-        assert!(
-            PgMetaEngine::serving_event_conflicts_with_overlay(&rename, &overlay, &HashSet::new()),
-            "local attr overlay should conflict with the full rename event"
-        );
-        pg.apply_foreign_batch(std::slice::from_ref(&rename), &overlay)
-            .expect("apply foreign rename");
-
-        assert!(pg.lookup(ROOT_INO, b"rename-source.txt").is_err());
-        assert_eq!(
-            pg.lookup(ROOT_INO, b"renamed-target.txt")
-                .expect("lookup renamed target")
-                .ino,
-            file.ino
-        );
-        assert_eq!(
-            pg.get_attr(file.ino).expect("local attr survives").size,
-            55,
-            "serving dentry reconciliation must preserve the local attr overlay"
-        );
-    }
-
-    #[test]
-    fn foreign_unlink_after_local_rename_removes_destination_alias() {
-        let (_dir, pg) = temp_pg_engine_for_unit();
-        let file = create_published_small_file(&pg, ROOT_INO, b"race.txt", 77_101);
-        publish_local_events_to_base(&pg);
-
-        pg.rename(ROOT_INO, b"race.txt", ROOT_INO, b"race-renamed.txt")
-            .expect("local rename");
-        let overlay = pg.local_overlay_conflicts().expect("overlay conflicts");
-
-        let foreign_unlink = vec![
-            MetaEvent::RemoveEntry {
-                parent: ROOT_INO,
-                name: b"race.txt".to_vec(),
-            },
-            MetaEvent::RemoveAttr { ino: file.ino },
-        ];
-        pg.apply_foreign_batch(&foreign_unlink, &overlay)
-            .expect("apply foreign unlink");
-
-        assert!(
-            pg.lookup(ROOT_INO, b"race.txt").is_err(),
-            "source path must stay absent"
-        );
-        assert!(
-            pg.lookup(ROOT_INO, b"race-renamed.txt").is_err(),
-            "later authoritative unlink must remove the losing local rename destination"
-        );
-        assert!(
-            pg.get_attr(file.ino).is_err(),
-            "later authoritative unlink must remove the inode mirror"
-        );
-    }
-
-    #[test]
-    fn foreign_rename_after_local_unlink_restores_destination_alias() {
-        let (_dir, pg) = temp_pg_engine_for_unit();
-        let file = create_published_small_file(&pg, ROOT_INO, b"race.txt", 77_102);
-        publish_local_events_to_base(&pg);
-
-        pg.unlink(ROOT_INO, b"race.txt").expect("local unlink");
-
-        let foreign_rename = vec![MetaEvent::RenameEntry {
-            parent: ROOT_INO,
-            name: b"race.txt".to_vec(),
-            new_parent: ROOT_INO,
-            new_name: b"race-renamed.txt".to_vec(),
-            entry: DirEntryValue {
-                ino: file.ino,
-                kind: FileType::RegularFile,
-            },
-            displaced_set_attr: Box::new(None),
-            displaced_remove_attr_ino: None,
-            moved_dir_attr: Box::new(None),
-            old_parent_attr: Box::new(None),
-            new_parent_attr: Box::new(None),
-        }];
-        pg.apply_foreign_batch(&foreign_rename, &OverlayConflictSets::default())
-            .expect("apply foreign rename");
-
-        assert!(
-            pg.lookup(ROOT_INO, b"race.txt").is_err(),
-            "source path must stay absent"
-        );
-        assert_eq!(
-            pg.lookup(ROOT_INO, b"race-renamed.txt")
-                .expect("renamed destination")
-                .ino,
-            file.ino,
-            "later authoritative rename must win over the local unlink overlay"
-        );
-    }
-
-    #[test]
-    fn foreign_rename_after_local_unlink_restores_symlink_and_xattr_mirrors() {
-        let (_dir, pg) = temp_pg_engine_for_unit();
-        let symlink = pg
-            .create_symlink(ROOT_INO, b"race-link", b"/remote-target", 0, 0)
-            .expect("create symlink");
-        pg.set_xattr(symlink.ino, b"user.color", b"blue", 0)
-            .expect("set xattr");
-        publish_local_events_to_base(&pg);
-
-        pg.unlink(ROOT_INO, b"race-link").expect("local unlink");
-
-        let foreign_rename = vec![MetaEvent::RenameEntry {
-            parent: ROOT_INO,
-            name: b"race-link".to_vec(),
-            new_parent: ROOT_INO,
-            new_name: b"race-link-renamed".to_vec(),
-            entry: DirEntryValue {
-                ino: symlink.ino,
-                kind: FileType::Symlink,
-            },
-            displaced_set_attr: Box::new(None),
-            displaced_remove_attr_ino: None,
-            moved_dir_attr: Box::new(None),
-            old_parent_attr: Box::new(None),
-            new_parent_attr: Box::new(None),
-        }];
-        pg.apply_foreign_batch(&foreign_rename, &OverlayConflictSets::default())
-            .expect("apply foreign rename");
-
-        assert_eq!(
-            pg.lookup(ROOT_INO, b"race-link-renamed")
-                .expect("renamed symlink")
-                .ino,
-            symlink.ino
-        );
-        assert_eq!(
-            pg.get_symlink_target(symlink.ino)
-                .expect("restored symlink target"),
-            b"/remote-target"
-        );
-        assert_eq!(
-            pg.get_xattr(symlink.ino, b"user.color")
-                .expect("restored xattr"),
-            Some(b"blue".to_vec())
-        );
-    }
-
-    #[test]
-    fn older_foreign_rename_does_not_resurrect_after_self_unlink_flush() {
-        let (_dir, pg) = temp_pg_engine_for_unit();
-        let file = create_published_small_file(&pg, ROOT_INO, b"race.txt", 77_103);
-        publish_local_events_to_base(&pg);
-
-        pg.unlink(ROOT_INO, b"race.txt").expect("local unlink");
-        let recent_unlink_overlay = pg.local_overlay_conflicts().expect("overlay conflicts");
-        publish_local_events_to_base(&pg);
-
-        let older_foreign_rename = vec![MetaEvent::RenameEntry {
-            parent: ROOT_INO,
-            name: b"race.txt".to_vec(),
-            new_parent: ROOT_INO,
-            new_name: b"race-renamed.txt".to_vec(),
-            entry: DirEntryValue {
-                ino: file.ino,
-                kind: FileType::RegularFile,
-            },
-            displaced_set_attr: Box::new(None),
-            displaced_remove_attr_ino: None,
-            moved_dir_attr: Box::new(None),
-            old_parent_attr: Box::new(None),
-            new_parent_attr: Box::new(None),
-        }];
-        pg.apply_foreign_batch(&older_foreign_rename, &recent_unlink_overlay)
-            .expect("apply older foreign rename");
-
-        assert!(
-            pg.lookup(ROOT_INO, b"race.txt").is_err(),
-            "source path must stay absent"
-        );
-        assert!(
-            pg.lookup(ROOT_INO, b"race-renamed.txt").is_err(),
-            "older rename must not resurrect a file after the local unlink won in PG order"
-        );
-        assert!(
-            pg.get_attr(file.ino).is_err(),
-            "winner unlink must keep the inode mirror removed"
-        );
-    }
-
-    #[test]
-    fn later_foreign_publish_replaces_flushed_local_payload() {
-        let (_dir, pg) = temp_pg_engine_for_unit();
-        let file = create_published_small_file(&pg, ROOT_INO, b"lww-payload.txt", 77_201);
-        publish_local_events_to_base(&pg);
-
-        publish_file_payload(&pg, file.ino, 0, 64, 2, 77_202);
-        publish_local_events_to_base(&pg);
-        assert_eq!(
-            visible_object_id(&pg, file.ino),
-            77_202,
-            "test setup should expose the locally flushed payload"
-        );
-        assert!(
-            pg.local_overlay_conflicts()
-                .expect("local overlay after local flush")
-                .block_inodes
-                .is_empty(),
-            "flushed local publish must not continue to block later PG winners"
-        );
-
-        let foreign_publish = published_payload_events(file.ino, 3, 64, 77_203);
-        pg.apply_foreign_batch(&foreign_publish, &OverlayConflictSets::default())
-            .expect("apply later foreign publish");
-
-        assert_eq!(
-            visible_object_id(&pg, file.ino),
-            77_203,
-            "later PG winner must replace a previously flushed local payload"
-        );
-    }
-
-    #[test]
-    fn conflicted_foreign_publish_keeps_pending_overlay_upload_current() {
-        let (_dir, pg) = temp_pg_engine_for_unit();
-        let file = create_published_small_file(&pg, ROOT_INO, b"pending-publish-race.txt", 77_204);
-        publish_local_events_to_base(&pg);
-
-        let mut attr = pg.get_attr(file.ino).expect("published file attr");
-        attr.size = 75;
-        attr.content_epoch = 2;
-        attr.upload_state = UploadState::Updating;
-        attr.mtime = InodeAttr::now_nanos();
-        attr.ctime = attr.mtime;
-        pg.set_attr(&attr).expect("set pending update attr");
-        let pending_payload = PayloadRef::new_partial(77_205, 75);
-        pg.stage_payload_slice(file.ino, 0, &pending_payload)
-            .expect("stage pending upload overlay");
-
-        let overlay = pg
-            .local_overlay_conflicts()
-            .expect("pending upload overlay conflicts");
-        assert!(
-            overlay.block_inodes.contains(&file.ino),
-            "test setup must retain a local payload overlay while upload is in flight"
-        );
-
-        let older_publish = published_payload_events(file.ino, 1, 64, 77_204);
-        pg.apply_foreign_batch(&older_publish, &overlay)
-            .expect("apply older publish while local upload is pending");
-
-        assert_eq!(
-            visible_object_id(&pg, file.ino),
-            pending_payload.object_id,
-            "older publish must not replace the serving overlay for an in-flight local upload"
-        );
-        assert!(
-            pg.has_regular_file_overlay_object_if_matches(file.ino, 2, pending_payload.object_id)
-                .expect("pending overlay object lookup"),
-            "upload worker post-PUT check must still see the pending overlay object"
-        );
-    }
-
-    #[test]
-    fn replayed_self_batch_restores_serving_payload_after_older_foreign_batch() {
-        let (_dir, pg) = temp_pg_engine_for_unit();
-        let file = create_published_small_file(&pg, ROOT_INO, b"self-replay.txt", 77_211);
-        publish_local_events_to_base(&pg);
-
-        let start = pg.flushed_event_seq.load(Ordering::SeqCst);
-        publish_file_payload(&pg, file.ino, 0, 64, 2, 77_212);
-        let end = pg.local.get_counter("nextEventSeq").expect("event end");
-        let local_events = pg
-            .local
-            .read_events_range(start, end)
-            .expect("read local self batch");
-        let self_batch = PgMetaEngine::project_remote_events(&local_events);
-        pg.apply_visible_self_batch(&self_batch)
-            .expect("apply visible self batch");
-        pg.persist_flushed_event_seq(end)
-            .expect("persist flushed seq");
-        assert_eq!(visible_object_id(&pg, file.ino), 77_212);
-
-        let older_foreign_publish = published_payload_events(file.ino, 2, 64, 77_213);
-        pg.apply_foreign_batch(&older_foreign_publish, &OverlayConflictSets::default())
-            .expect("apply older foreign batch");
-        assert_eq!(
-            visible_object_id(&pg, file.ino),
-            77_213,
-            "setup must reproduce an older foreign batch overwriting serving state"
-        );
-
-        pg.flushed_event_seq.store(start, Ordering::SeqCst);
-        pg.apply_visible_self_batch(&self_batch)
-            .expect("replay visible self batch");
-        assert_eq!(
-            visible_object_id(&pg, file.ino),
-            77_212,
-            "later self batch replay must restore the serving graph that wins in PG order"
-        );
-    }
-
-    #[test]
-    fn remote_self_batch_clears_ready_overlay_retained_by_older_foreign_conflict() {
-        let (_dir, pg) = temp_pg_engine_for_unit();
-        let file = create_published_small_file(&pg, ROOT_INO, b"ready-retained.txt", 77_221);
-        publish_local_events_to_base(&pg);
-
-        let start = pg.flushed_event_seq.load(Ordering::SeqCst);
-        publish_file_payload(&pg, file.ino, 0, 64, 2, 77_222);
-        let end = pg.local.get_counter("nextEventSeq").expect("event end");
-        let local_events = pg
-            .local
-            .read_events_range(start, end)
-            .expect("read local self batch");
-        let self_batch = PgMetaEngine::project_remote_events(&local_events);
-        pg.apply_visible_self_batch(&self_batch)
-            .expect("materialize local ready payload in serving overlay");
-        let overlay = pg
-            .local_overlay_conflicts()
-            .expect("local ready overlay conflicts");
-        assert!(
-            overlay.block_inodes.contains(&file.ino),
-            "unacknowledged publish events should protect the local ready payload"
-        );
-
-        let older_foreign_publish = published_payload_events(file.ino, 3, 64, 77_223);
-        pg.apply_foreign_batch(&older_foreign_publish, &overlay)
-            .expect("apply older foreign batch");
-        assert_eq!(
-            visible_object_id(&pg, file.ino),
-            77_222,
-            "the older foreign batch should not replace the local ready payload yet"
-        );
-        assert!(
-            pg.local_overlay_conflicts()
-                .expect("retained overlay after foreign")
-                .block_inodes
-                .contains(&file.ino),
-            "the retained overlay reproduces the convergence blocker"
-        );
-
-        pg.apply_remote_self_batch(12, &self_batch)
-            .expect("apply remote self batch");
-        assert_eq!(
-            visible_object_id(&pg, file.ino),
-            77_222,
-            "the remote self batch should keep the winning local payload visible"
-        );
-        assert_eq!(
-            pg.flushed_event_seq.load(Ordering::SeqCst),
-            end,
-            "the ready self batch should become ackable even after a retained overlay"
-        );
-        assert!(
-            pg.local_overlay_conflicts()
-                .expect("overlay after self ack")
-                .block_inodes
-                .is_empty(),
-            "ready self ack must clear the retained block overlay so later PG winners can apply"
-        );
-
-        let later_foreign_publish = published_payload_events(file.ino, 4, 64, 77_224);
-        pg.apply_foreign_batch(&later_foreign_publish, &OverlayConflictSets::default())
-            .expect("apply later foreign batch");
-        assert_eq!(
-            visible_object_id(&pg, file.ino),
-            77_224,
-            "a later PG winner must not be masked by the old retained overlay"
-        );
-    }
-
-    #[test]
-    fn foreign_unlink_during_local_append_does_not_leave_private_dentry() {
-        let (_dir, pg) = temp_pg_engine_for_unit();
-        let file = create_published_small_file(&pg, ROOT_INO, b"append-race.txt", 77_301);
-        publish_local_events_to_base(&pg);
-
-        publish_file_payload(&pg, file.ino, 0, 81, 2, 77_302);
-        let append_overlay = pg
-            .local_overlay_conflicts()
-            .expect("local append overlay conflicts");
-        assert!(
-            append_overlay.block_inodes.contains(&file.ino),
-            "test setup must model an unflushed local append/update"
-        );
-
-        let foreign_unlink = vec![
-            MetaEvent::RemoveEntry {
-                parent: ROOT_INO,
-                name: b"append-race.txt".to_vec(),
-            },
-            MetaEvent::RemoveAttr { ino: file.ino },
-        ];
-        pg.apply_foreign_batch(&foreign_unlink, &append_overlay)
-            .expect("apply foreign unlink");
-
-        assert!(
-            pg.lookup(ROOT_INO, b"append-race.txt").is_err(),
-            "winning foreign unlink must not leave a private dentry on the appending peer"
-        );
-        let local_attr = pg
-            .get_attr(file.ino)
-            .expect("local append inode remains available by handle/inode");
-        assert_eq!(
-            local_attr.upload_state,
-            UploadState::Ready,
-            "accepted local payload should be sealed even though the namespace entry lost"
-        );
-        assert_eq!(
-            lookup_first_object_id(&pg, file.ino)
-                .expect("get local payload after foreign unlink")
-                .expect("local accepted payload remains attached to the orphaned inode"),
-            77_302
-        );
-
-        publish_local_events_to_base(&pg);
-        assert!(
-            pg.lookup(ROOT_INO, b"append-race.txt").is_err(),
-            "flushing the already-accepted append must not resurrect a dentry that was not published"
-        );
-    }
-
-    #[test]
-    fn foreign_rename_displacement_drops_private_dentry_despite_source_conflict() {
-        let (_dir, pg) = temp_pg_engine_for_unit();
-        let source = create_published_small_file(&pg, ROOT_INO, b"source.txt", 77_401);
-        let displaced = create_published_small_file(&pg, ROOT_INO, b"dest.txt", 77_402);
-        let local = create_published_small_file(&pg, ROOT_INO, b"local.txt", 77_403);
-        publish_local_events_to_base(&pg);
-
-        publish_file_payload(&pg, displaced.ino, 0, 64, 2, 77_404);
-        pg.rename(ROOT_INO, b"local.txt", ROOT_INO, b"source.txt")
-            .expect("local dentry conflict at foreign source");
-        let overlay = pg
-            .local_overlay_conflicts()
-            .expect("overlay with source dentry and displaced payload");
-        assert!(
-            overlay
-                .dentry_keys
-                .contains(&PgMetaEngine::dentry_key(ROOT_INO, b"source.txt")),
-            "test setup must block full foreign rename serving apply"
-        );
-        assert!(
-            overlay.block_inodes.contains(&displaced.ino),
-            "test setup must preserve displaced inode payload by inode"
-        );
-
-        let foreign_rename = vec![MetaEvent::RenameEntry {
-            parent: ROOT_INO,
-            name: b"source.txt".to_vec(),
-            new_parent: ROOT_INO,
-            new_name: b"dest.txt".to_vec(),
-            entry: DirEntryValue {
-                ino: source.ino,
-                kind: FileType::RegularFile,
-            },
-            displaced_set_attr: Box::new(None),
-            displaced_remove_attr_ino: Some(displaced.ino),
-            moved_dir_attr: Box::new(None),
-            old_parent_attr: Box::new(None),
-            new_parent_attr: Box::new(None),
-        }];
-        pg.apply_foreign_batch(&foreign_rename, &overlay)
-            .expect("apply foreign rename displacement");
-
-        assert!(
-            pg.lookup(ROOT_INO, b"dest.txt").is_err(),
-            "foreign displacement must remove the losing private dentry"
-        );
-        assert_eq!(
-            pg.lookup(ROOT_INO, b"source.txt")
-                .expect("local source conflict remains")
-                .ino,
-            local.ino
-        );
-        assert_eq!(
-            lookup_first_object_id(&pg, displaced.ino)
-                .expect("read displaced inode payload")
-                .expect("payload remains available by inode"),
-            77_404
-        );
-    }
-
-    #[test]
-    fn foreign_rename_without_source_dentry_does_not_resurrect_destination() {
-        let (_dir, pg) = temp_pg_engine_for_unit();
-        let source = create_published_small_file(&pg, ROOT_INO, b"missing-source.txt", 77_501);
-        publish_local_events_to_base(&pg);
-
-        let mut source_attr = pg.get_attr(source.ino).expect("source attr");
-        pg.unlink(ROOT_INO, b"missing-source.txt")
-            .expect("remove source dentry");
-        publish_local_events_to_base(&pg);
-        source_attr.ctime = InodeAttr::now_nanos();
-        source_attr.mtime = source_attr.ctime;
-
-        let foreign_rename = vec![
-            MetaEvent::SetAttr { attr: source_attr },
-            MetaEvent::RenameEntry {
-                parent: ROOT_INO,
-                name: b"missing-source.txt".to_vec(),
-                new_parent: ROOT_INO,
-                new_name: b"resurrected.txt".to_vec(),
-                entry: DirEntryValue {
-                    ino: source.ino,
-                    kind: FileType::RegularFile,
-                },
-                displaced_set_attr: Box::new(None),
-                displaced_remove_attr_ino: None,
-                moved_dir_attr: Box::new(None),
-                old_parent_attr: Box::new(None),
-                new_parent_attr: Box::new(None),
-            },
-        ];
-        pg.apply_foreign_batch(&foreign_rename, &OverlayConflictSets::default())
-            .expect("apply rename without source dentry");
-
-        assert!(
-            pg.lookup(ROOT_INO, b"resurrected.txt").is_err(),
-            "serving apply must match base apply and skip renames whose source inode has no dentry"
-        );
-    }
-
-    #[test]
-    fn foreign_rename_without_source_still_cleans_displaced_destination() {
-        let (_dir, pg) = temp_pg_engine_for_unit();
-        let source = create_published_small_file(&pg, ROOT_INO, b"missing-source.txt", 77_511);
-        let displaced = create_published_small_file(&pg, ROOT_INO, b"dest.txt", 77_512);
-        publish_local_events_to_base(&pg);
-
-        pg.unlink(ROOT_INO, b"missing-source.txt")
-            .expect("remove source dentry");
-        publish_local_events_to_base(&pg);
-
-        let foreign_rename = vec![MetaEvent::RenameEntry {
-            parent: ROOT_INO,
-            name: b"missing-source.txt".to_vec(),
-            new_parent: ROOT_INO,
-            new_name: b"dest.txt".to_vec(),
-            entry: DirEntryValue {
-                ino: source.ino,
-                kind: FileType::RegularFile,
-            },
-            displaced_set_attr: Box::new(None),
-            displaced_remove_attr_ino: Some(displaced.ino),
-            moved_dir_attr: Box::new(None),
-            old_parent_attr: Box::new(None),
-            new_parent_attr: Box::new(None),
-        }];
-        pg.apply_foreign_batch(&foreign_rename, &OverlayConflictSets::default())
-            .expect("apply rename without source dentry");
-
-        assert!(
-            pg.lookup(ROOT_INO, b"dest.txt").is_err(),
-            "displaced destination must be removed even when the incoming rename source is stale"
-        );
-        assert!(
-            pg.lookup(ROOT_INO, b"missing-source.txt").is_err(),
-            "stale rename source must not reappear"
-        );
-    }
-
-    #[test]
-    fn conflicted_foreign_remove_attr_drops_private_dentry_and_preserves_payload() {
-        let (_dir, pg) = temp_pg_engine_for_unit();
-        let file = create_published_small_file(&pg, ROOT_INO, b"remove-attr-race.txt", 77_601);
-        publish_local_events_to_base(&pg);
-
-        publish_file_payload(&pg, file.ino, 0, 64, 2, 77_602);
-        let overlay = pg
-            .local_overlay_conflicts()
-            .expect("local payload overlay conflicts");
-        assert!(
-            overlay.block_inodes.contains(&file.ino),
-            "test setup must preserve the local payload by inode"
-        );
-
-        pg.apply_foreign_batch(&[MetaEvent::RemoveAttr { ino: file.ino }], &overlay)
-            .expect("apply conflicted foreign remove attr");
-
-        assert!(
-            pg.lookup(ROOT_INO, b"remove-attr-race.txt").is_err(),
-            "winning remote inode removal must remove namespace dentries even when local payload survives"
-        );
-        assert_eq!(
-            lookup_first_object_id(&pg, file.ino)
-                .expect("read preserved payload")
-                .expect("local payload remains attached to orphaned inode"),
-            77_602
-        );
-    }
-
     fn set_file_state(engine: &PgMetaEngine, ino: Ino, size: u64, content_epoch: u64) {
         let mut attr = engine.get_attr(ino).expect("get file attr");
         attr.size = size;
@@ -6848,127 +5232,6 @@ mod tests {
             "small file publish must succeed"
         );
         file
-    }
-
-    fn publish_file_payload(
-        engine: &PgMetaEngine,
-        ino: Ino,
-        block_index: u32,
-        size: u64,
-        content_epoch: u64,
-        object_id: u64,
-    ) {
-        set_file_state(engine, ino, size, content_epoch);
-        engine
-            .stage_payload_slice(
-                ino,
-                block_index,
-                &PayloadRef::new_partial(object_id, size as u32),
-            )
-            .expect("stage replacement payload");
-        mark_overlay_objects_uploaded(engine, ino, content_epoch, &[object_id]);
-        assert!(
-            engine
-                .publish_regular_file_overlay_to_base_if_matches(ino, content_epoch)
-                .expect("publish replacement payload"),
-            "replacement payload publish must succeed"
-        );
-    }
-
-    fn published_payload_events(
-        ino: Ino,
-        content_epoch: u64,
-        size: u64,
-        object_id: u64,
-    ) -> Vec<MetaEvent> {
-        let mut attr = InodeAttr::new_file(ino, ROOT_INO, 0, 0, 0o644);
-        attr.size = size;
-        attr.committed_size = size;
-        attr.content_epoch = content_epoch;
-        attr.committed_content_epoch = content_epoch;
-        attr.upload_state = UploadState::Ready;
-        attr.mtime = InodeAttr::now_nanos();
-        attr.ctime = attr.mtime;
-        let chunk_slices = vec![(
-            ChunkId(0),
-            vec![SliceRecord {
-                slice_id: SliceId(0),
-                order: SliceOrder(0),
-                range: SliceRange::new(0, size as u32).expect("valid foreign slice range"),
-                payload: Some(PayloadRef::new_partial(object_id, size as u32)),
-                payload_state: PayloadRefState::Published,
-            }],
-        )];
-        vec![
-            MetaEvent::SetAttr { attr },
-            MetaEvent::PublishRegularFileBaseSlices { ino, chunk_slices },
-        ]
-    }
-
-    #[test]
-    fn regular_publish_batch_updates_remote_namespace_visibility_token() {
-        let events = published_payload_events(42, 1, 64, 77_701);
-
-        assert!(
-            PgMetaEngine::batch_updates_remote_namespace_visibility(&events),
-            "publishing the first visible payload can make an existing regular-file dentry appear"
-        );
-    }
-
-    #[test]
-    fn remote_self_batch_updates_namespace_visibility_token() {
-        let (_dir, pg) = temp_pg_engine_for_unit();
-        let start = pg.flushed_event_seq.load(Ordering::SeqCst);
-        create_published_small_file(&pg, ROOT_INO, b"self-visible-file.bin", 77_702);
-        let end = pg.local.get_counter("nextEventSeq").expect("event end");
-        let events = pg
-            .local
-            .read_events_range(start, end)
-            .expect("read visible self events");
-        let remote_events = PgMetaEngine::project_remote_events(&events);
-        assert!(
-            PgMetaEngine::batch_updates_remote_namespace_visibility(&remote_events),
-            "test setup must produce a remotely visible namespace batch"
-        );
-
-        pg.apply_remote_self_batch(42, &remote_events)
-            .expect("apply remote self batch");
-
-        assert_eq!(
-            pg.namespace_version.load(Ordering::SeqCst),
-            42,
-            "self batches must advance the namespace token so mounted clients invalidate their own remote-visible view"
-        );
-        assert_eq!(
-            pg.flushed_event_seq.load(Ordering::SeqCst),
-            end,
-            "applying the remote self batch should still acknowledge the matching local prefix"
-        );
-    }
-
-    fn visible_object_id(engine: &PgMetaEngine, ino: Ino) -> u64 {
-        engine
-            .lookup_regular_file_slices(ino, 0, 64)
-            .expect("lookup visible file slices")
-            .into_iter()
-            .find_map(|span| span.payload.map(|payload| payload.object_id))
-            .expect("visible object id")
-    }
-
-    fn publish_local_events_to_base(engine: &PgMetaEngine) {
-        let start = engine.flushed_event_seq.load(Ordering::SeqCst);
-        let end = engine.local.get_counter("nextEventSeq").expect("event end");
-        let events = engine
-            .local
-            .read_events_range(start, end)
-            .expect("read local events");
-        let remote_events = PgMetaEngine::project_remote_events(&events);
-        engine
-            .apply_visible_self_batch(&remote_events)
-            .expect("apply visible self batch");
-        engine
-            .persist_flushed_event_seq(end)
-            .expect("persist flushed event seq");
     }
 
     fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
@@ -7047,135 +5310,6 @@ mod tests {
         engine.update_inode_headroom_flag(inode_state);
 
         (dir, engine)
-    }
-
-    fn set_snapshot_counter(snapshot: &mut RedbSnapshot, name: &str, value: u64) {
-        if let Some((_, existing)) = snapshot
-            .counters
-            .iter_mut()
-            .find(|(candidate, _)| candidate == name)
-        {
-            *existing = value;
-        } else {
-            snapshot.counters.push((name.to_string(), value));
-        }
-    }
-
-    fn snapshot_counter(snapshot: &RedbSnapshot, name: &str) -> Option<u64> {
-        snapshot
-            .counters
-            .iter()
-            .find_map(|(candidate, value)| (candidate == name).then_some(*value))
-    }
-
-    #[test]
-    fn pg_remote_snapshot_strips_local_inode_allocator_counters() {
-        let mut snapshot = RedbSnapshot::default();
-        set_snapshot_counter(&mut snapshot, counters::NEXT_INODE, 101);
-        set_snapshot_counter(&mut snapshot, counters::NEXT_OBJECT_ID, 102);
-        set_snapshot_counter(&mut snapshot, LOCAL_PG_CLIENT_SLOT_COUNTER, 103);
-        set_snapshot_counter(&mut snapshot, LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER, 104);
-        set_snapshot_counter(
-            &mut snapshot,
-            LOCAL_PG_INODE_CURRENT_WINDOW_START_COUNTER,
-            105,
-        );
-        set_snapshot_counter(
-            &mut snapshot,
-            LOCAL_PG_INODE_CURRENT_WINDOW_END_COUNTER,
-            106,
-        );
-        set_snapshot_counter(
-            &mut snapshot,
-            LOCAL_PG_INODE_PREFETCHED_WINDOW_START_COUNTER,
-            107,
-        );
-        set_snapshot_counter(
-            &mut snapshot,
-            LOCAL_PG_INODE_PREFETCHED_WINDOW_NEXT_COUNTER,
-            108,
-        );
-        set_snapshot_counter(
-            &mut snapshot,
-            LOCAL_PG_INODE_PREFETCHED_WINDOW_END_COUNTER,
-            109,
-        );
-        set_snapshot_counter(&mut snapshot, counters::TOTAL_INODES, 2);
-        set_snapshot_counter(&mut snapshot, LOCAL_PG_VERSION_COUNTER, 55);
-        set_snapshot_counter(&mut snapshot, LOCAL_PG_NAMESPACE_VERSION_COUNTER, 44);
-
-        PgMetaEngine::strip_pg_local_snapshot_counters(&mut snapshot);
-
-        for name in PG_LOCAL_ONLY_SNAPSHOT_COUNTERS {
-            assert_eq!(
-                snapshot_counter(&snapshot, name),
-                None,
-                "remote PG snapshots must not carry local-only counter {name}"
-            );
-        }
-        assert_eq!(snapshot_counter(&snapshot, counters::TOTAL_INODES), Some(2));
-        assert_eq!(
-            snapshot_counter(&snapshot, LOCAL_PG_VERSION_COUNTER),
-            Some(55)
-        );
-        assert_eq!(
-            snapshot_counter(&snapshot, LOCAL_PG_NAMESPACE_VERSION_COUNTER),
-            Some(44)
-        );
-    }
-
-    #[test]
-    fn pg_snapshot_import_preserves_local_inode_allocator_counters() {
-        let (_dir, engine) = temp_pg_engine_for_unit();
-        let preserved_next_inode = engine
-            .local
-            .get_counter(counters::NEXT_INODE)
-            .expect("local next inode");
-        let preserved_client_slot = engine
-            .local
-            .get_counter(LOCAL_PG_CLIENT_SLOT_COUNTER)
-            .expect("local client slot");
-        let preserved_window_end = engine
-            .local
-            .get_counter(LOCAL_PG_INODE_CURRENT_WINDOW_END_COUNTER)
-            .expect("local window end");
-
-        let mut snapshot = engine.local.export_remote_snapshot().expect("snapshot");
-        set_snapshot_counter(&mut snapshot, counters::NEXT_INODE, 900_001);
-        set_snapshot_counter(&mut snapshot, LOCAL_PG_CLIENT_SLOT_COUNTER, 99);
-        set_snapshot_counter(
-            &mut snapshot,
-            LOCAL_PG_INODE_CURRENT_WINDOW_END_COUNTER,
-            900_250,
-        );
-        set_snapshot_counter(&mut snapshot, counters::TOTAL_INODES, 17);
-
-        engine
-            .import_remote_snapshot_preserving_pg_local_counters(&snapshot)
-            .expect("import snapshot");
-
-        assert_eq!(
-            engine.local.get_counter(counters::NEXT_INODE).unwrap(),
-            preserved_next_inode
-        );
-        assert_eq!(
-            engine
-                .local
-                .get_counter(LOCAL_PG_CLIENT_SLOT_COUNTER)
-                .unwrap(),
-            preserved_client_slot
-        );
-        assert_eq!(
-            engine
-                .local
-                .get_counter(LOCAL_PG_INODE_CURRENT_WINDOW_END_COUNTER)
-                .unwrap(),
-            preserved_window_end
-        );
-        assert_eq!(
-            engine.local.get_counter(counters::TOTAL_INODES).unwrap(),
-            17
-        );
     }
 
     #[test]
@@ -7390,8 +5524,6 @@ mod tests {
             .local
             .get_counter("nextEventSeq")
             .expect("read baseline seq");
-        pg.persist_flushed_event_seq(baseline)
-            .expect("mark setup events flushed");
         {
             let mut state = pg.pending_state.lock().expect("pending_state");
             *state = PendingReplicationState::default();
@@ -8985,8 +7117,8 @@ mod tests {
 
         assert_eq!(
             pg.replication_backlog().pending_ops,
-            0,
-            "uploading-only attrs must not publish remote-visible zero-size metadata"
+            1,
+            "uploading attrs remain remote-visible metadata"
         );
         assert!(
             !*wakeup_lock.lock().expect("poll wakeup lock"),
@@ -10704,30 +8836,29 @@ mod tests {
         assert!(wait_until(Duration::from_secs(12), || {
             let _ = a.sync_metadata();
             let _ = b.sync_metadata();
-            a.lookup(ROOT_INO, b"uploading.bin").is_err()
+            a.lookup(ROOT_INO, b"uploading.bin").is_ok()
                 && b.lookup(ROOT_INO, b"uploading.bin").is_err()
         }));
         let local_attr = a
             .get_attr(file.ino)
             .expect("get local attr after peer unlink");
-        assert_eq!(
-            local_attr.upload_state,
-            UploadState::Ready,
-            "peer unlink should seal the accepted local payload while removing the namespace entry"
-        );
+        assert_eq!(local_attr.upload_state, UploadState::Ready);
         assert_eq!(
             lookup_first_object_id(&a, file.ino)
                 .expect("get local payload after peer unlink")
-                .expect("writer keeps local accepted payload by inode after peer unlink"),
+                .expect("writer keeps local pending payload after peer unlink"),
             777
         );
 
         drop(a);
         let reopened = reopen_pg_engine_with_retry(&db_a);
         reopened.sync_metadata().expect("sync reopened a");
-        assert!(
-            reopened.lookup(ROOT_INO, b"uploading.bin").is_err(),
-            "reopen must not resurrect a private dentry after the peer unlink wins"
+        assert!(reopened.lookup(ROOT_INO, b"uploading.bin").is_ok());
+        assert_eq!(
+            lookup_first_object_id(&reopened, file.ino)
+                .expect("get reopened local payload")
+                .expect("reopened local payload"),
+            777
         );
     }
 
@@ -11553,95 +9684,17 @@ mod tests {
         let r2 = t2.join().expect("thread b");
         let ok_count = [r1.is_ok(), r2.is_ok()].into_iter().filter(|v| *v).count();
         assert!(ok_count >= 1, "at least one rename should apply");
-        let rename_batches = run_async({
-            let dsn = volume.dsn.clone();
-            let volume_id = volume.volume_id;
-            async move {
-                let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
-                    .await
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
-                let conn_task = tokio::spawn(async move {
-                    let _ = connection.await;
-                });
-                let rows = client
-                    .query(
-                        "SELECT batch_version, event_payload \
-                         FROM event_log \
-                         WHERE vol = $1 AND event_type = 'rename_entry' \
-                         ORDER BY batch_version ASC",
-                        &[&volume_id],
-                    )
-                    .await
-                    .map_err(|e| MetaError::Storage(format!("query rename batches failed: {e}")))?;
-                conn_task.abort();
-
-                let mut rename_batches = Vec::new();
-                for row in rows {
-                    let batch_version: i64 = row.get(0);
-                    let payload: Vec<u8> = row.get(1);
-                    let event: MetaEvent = postcard::from_bytes(&payload).map_err(|e| {
-                        MetaError::Serialization(format!("postgres rename decode failed: {e}"))
-                    })?;
-                    if let MetaEvent::RenameEntry { new_name, .. } = event {
-                        rename_batches.push((batch_version, new_name));
-                    }
-                }
-                Ok::<_, MetaError>(rename_batches)
-            }
-        })
-        .expect("query rename batches");
-        assert_eq!(
-            rename_batches.len(),
-            ok_count,
-            "each accepted rename must have one PG batch"
-        );
-        let expected_winner = rename_batches
-            .iter()
-            .max_by_key(|(batch_version, _)| *batch_version)
-            .map(|(_, name)| name.clone())
-            .expect("at least one rename batch");
-
         assert!(wait_until(Duration::from_secs(12), || {
             let _ = a.sync_metadata();
-            let _ = b.sync_metadata();
-            let a_source_gone = a.lookup(ROOT_INO, b"source.txt").is_err();
-            let b_source_gone = b.lookup(ROOT_INO, b"source.txt").is_err();
-            let a_winner = [b"moved_by_a.txt".as_slice(), b"moved_by_b.txt".as_slice()]
-                .into_iter()
-                .filter(|name| a.lookup(ROOT_INO, name).is_ok())
-                .map(Vec::from)
-                .collect::<Vec<_>>();
-            let b_winner = [b"moved_by_a.txt".as_slice(), b"moved_by_b.txt".as_slice()]
-                .into_iter()
-                .filter(|name| b.lookup(ROOT_INO, name).is_ok())
-                .map(Vec::from)
-                .collect::<Vec<_>>();
-            a_source_gone
-                && b_source_gone
-                && a_winner.len() == 1
-                && b_winner.len() == 1
-                && a_winner == b_winner
+            a.lookup(ROOT_INO, b"source.txt").is_err()
         }));
+        let a_exists = a.lookup(ROOT_INO, b"moved_by_a.txt").is_ok();
+        let b_exists = a.lookup(ROOT_INO, b"moved_by_b.txt").is_ok();
+        assert_ne!(a_exists, b_exists, "only one destination name should exist");
         assert!(
             a.lookup(ROOT_INO, b"source.txt").is_err(),
             "source must be gone"
         );
-        assert!(
-            b.lookup(ROOT_INO, b"source.txt").is_err(),
-            "source must be gone on peer"
-        );
-        let a_winner = [b"moved_by_a.txt".as_slice(), b"moved_by_b.txt".as_slice()]
-            .into_iter()
-            .filter(|name| a.lookup(ROOT_INO, name).is_ok())
-            .map(Vec::from)
-            .collect::<Vec<_>>();
-        let b_winner = [b"moved_by_a.txt".as_slice(), b"moved_by_b.txt".as_slice()]
-            .into_iter()
-            .filter(|name| b.lookup(ROOT_INO, name).is_ok())
-            .map(Vec::from)
-            .collect::<Vec<_>>();
-        assert_eq!(a_winner, vec![expected_winner.clone()]);
-        assert_eq!(b_winner, vec![expected_winner]);
     }
 
     #[test]

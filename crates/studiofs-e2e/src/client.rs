@@ -1,11 +1,9 @@
 //! Multi-client process controller for mounted E2E scenarios.
 
-use std::fmt;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Read as _, Write as _};
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::thread;
 use std::time::{Duration, Instant};
 use std::{
     collections::HashSet, collections::hash_map::DefaultHasher, ffi::OsString, hash::Hasher,
@@ -13,11 +11,9 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use uuid::Uuid;
 
 use crate::infra::ServicePort;
 
-/// Constant $name.
 pub const DEFAULT_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c", "client-d"];
 #[cfg(windows)]
 const DEFAULT_WINDOWS_MOUNT_LETTERS: &[char] = &[
@@ -26,63 +22,27 @@ const DEFAULT_WINDOWS_MOUNT_LETTERS: &[char] = &[
 const MAX_COMMAND_OUTPUT_CHARS: usize = 4096;
 const S3_BUCKET_NAME_MAX_CHARS: usize = 63;
 const E2E_BUCKET_PREFIX: &str = "studiofs-e2e-";
-const COMMAND_RUN_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const E2E_VOLUME_PREFIX: &str = "sfs-e2e-";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/// Struct $name.
 pub struct ClientControllerConfig {
-    /// Field $name.
     pub studiofs_bin: PathBuf,
-    /// Field $name.
     pub sandbox: PathBuf,
-    /// Field $name.
     pub volume_name: String,
-    /// Field $name.
     pub meta_dsn: String,
-    /// Field $name.
     pub s3: S3Config,
-    /// Field $name.
-    pub init_retry_timeout: Duration,
-    /// Field $name.
     pub mount_ready_timeout: Duration,
-    /// Field $name.
     pub mount_exit_timeout: Duration,
-    /// Field $name.
-    pub command_timeouts: ClientCommandTimeouts,
-    /// Field $name.
     pub poll_interval: Duration,
-    /// Field $name.
     pub mount_points: Vec<PathBuf>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// Struct $name.
-pub struct ClientCommandTimeouts {
-    /// Field $name.
-    pub init: Duration,
-    /// Field $name.
-    pub discover: Duration,
-    /// Field $name.
-    pub umount: Duration,
-}
-
-impl Default for ClientCommandTimeouts {
-    fn default() -> Self {
-        Self {
-            init: Duration::from_secs(60),
-            discover: Duration::from_secs(60),
-            umount: Duration::from_secs(60),
-        }
-    }
-}
-
 impl ClientControllerConfig {
-    /// Function $name.
     pub fn from_compose_services(
         studiofs_bin: PathBuf,
         sandbox: PathBuf,
         run_id: &str,
-        _seed: u64,
+        seed: u64,
         ports: &[ServicePort],
     ) -> Result<Self, ClientControllerError> {
         let postgres = service_port(ports, "postgres")?;
@@ -93,10 +53,15 @@ impl ClientControllerConfig {
             &sanitized_run_id,
             S3_BUCKET_NAME_MAX_CHARS,
         );
+        let volume_stem = prefixed_dns_name(
+            E2E_VOLUME_PREFIX,
+            &format!("{sanitized_run_id}-{seed}"),
+            S3_BUCKET_NAME_MAX_CHARS,
+        );
         Ok(Self {
             studiofs_bin,
             sandbox,
-            volume_name: unique_e2e_volume_name(),
+            volume_name: volume_stem,
             meta_dsn: format!(
                 "postgres://studiofs:studiofs@{}:{}",
                 postgres.host, postgres.host_port
@@ -108,355 +73,121 @@ impl ClientControllerConfig {
                 secret_key: "rustfsadmin".to_string(),
                 region: "us-east-1".to_string(),
             },
-            init_retry_timeout: Duration::from_secs(30),
             mount_ready_timeout: Duration::from_secs(30),
             mount_exit_timeout: Duration::from_secs(15),
-            command_timeouts: ClientCommandTimeouts::default(),
             poll_interval: Duration::from_millis(100),
             mount_points: Vec::new(),
         })
     }
-
-    /// Function $name.
-    pub fn from_external_env(
-        studiofs_bin: PathBuf,
-        sandbox: PathBuf,
-        _run_id: &str,
-        _seed: u64,
-    ) -> Result<Self, ClientControllerError> {
-        let external_env = ExternalEnvValues::load();
-        let meta_dsn = external_env
-            .value(&["STUDIOFS_E2E_EXTERNAL_PG_DSN", "STUDIOFS_TEST_PG_DSN"])
-            .ok_or_else(|| ClientControllerError::MissingExternalEnv {
-                names: "STUDIOFS_E2E_EXTERNAL_PG_DSN or STUDIOFS_TEST_PG_DSN".to_string(),
-            })?;
-        let endpoint = external_env.value(&[
-            "STUDIOFS_E2E_EXTERNAL_S3_ENDPOINT",
-            "STUDIOFS_TEST_ONLINE_S3_ENDPOINT",
-            "STUDIOFS_S3_ENDPOINT",
-        ])
-        .ok_or_else(|| ClientControllerError::MissingExternalEnv {
-            names: "STUDIOFS_E2E_EXTERNAL_S3_ENDPOINT, STUDIOFS_TEST_ONLINE_S3_ENDPOINT, or STUDIOFS_S3_ENDPOINT".to_string(),
-        })?;
-        let bucket = external_env.value(&[
-            "STUDIOFS_E2E_EXTERNAL_S3_BUCKET",
-            "STUDIOFS_TEST_ONLINE_S3_BUCKET",
-            "STUDIOFS_S3_BUCKET",
-        ])
-        .ok_or_else(|| ClientControllerError::MissingExternalEnv {
-            names: "STUDIOFS_E2E_EXTERNAL_S3_BUCKET, STUDIOFS_TEST_ONLINE_S3_BUCKET, or STUDIOFS_S3_BUCKET".to_string(),
-        })?;
-        let access_key = external_env.value(&[
-            "STUDIOFS_E2E_EXTERNAL_S3_ACCESS_KEY",
-            "STUDIOFS_TEST_ONLINE_S3_ACCESS_KEY",
-            "STUDIOFS_S3_ACCESS_KEY",
-        ])
-        .ok_or_else(|| ClientControllerError::MissingExternalEnv {
-            names: "STUDIOFS_E2E_EXTERNAL_S3_ACCESS_KEY, STUDIOFS_TEST_ONLINE_S3_ACCESS_KEY, or STUDIOFS_S3_ACCESS_KEY".to_string(),
-        })?;
-        let secret_key = external_env.value(&[
-            "STUDIOFS_E2E_EXTERNAL_S3_SECRET_KEY",
-            "STUDIOFS_TEST_ONLINE_S3_SECRET_KEY",
-            "STUDIOFS_S3_SECRET_KEY",
-        ])
-        .ok_or_else(|| ClientControllerError::MissingExternalEnv {
-            names: "STUDIOFS_E2E_EXTERNAL_S3_SECRET_KEY, STUDIOFS_TEST_ONLINE_S3_SECRET_KEY, or STUDIOFS_S3_SECRET_KEY".to_string(),
-        })?;
-        let region = external_env
-            .value(&[
-                "STUDIOFS_E2E_EXTERNAL_S3_REGION",
-                "STUDIOFS_TEST_ONLINE_S3_REGION",
-                "STUDIOFS_S3_REGION",
-            ])
-            .unwrap_or_else(|| "us-east-1".to_string());
-        Ok(Self {
-            studiofs_bin,
-            sandbox,
-            volume_name: unique_e2e_volume_name(),
-            meta_dsn,
-            s3: S3Config {
-                endpoint,
-                bucket,
-                access_key,
-                secret_key,
-                region,
-            },
-            init_retry_timeout: Duration::from_secs(30),
-            mount_ready_timeout: Duration::from_secs(30),
-            mount_exit_timeout: Duration::from_secs(15),
-            command_timeouts: ClientCommandTimeouts::default(),
-            poll_interval: Duration::from_millis(100),
-            mount_points: Vec::new(),
-        })
-    }
-}
-
-fn unique_e2e_volume_name() -> String {
-    Uuid::new_v4().to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/// Struct $name.
 pub struct S3Config {
-    /// Field $name.
     pub endpoint: String,
-    /// Field $name.
     pub bucket: String,
-    /// Field $name.
     pub access_key: String,
-    /// Field $name.
     pub secret_key: String,
-    /// Field $name.
     pub region: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-/// Enum $name.
 pub enum ClientLifecycleState {
-    /// Variant $name.
     Planned,
-    /// Variant $name.
     Initialized,
-    /// Variant $name.
     Discovered,
-    /// Variant $name.
     Mounted,
-    /// Variant $name.
     Unmounted,
-    /// Variant $name.
     Killed,
-    /// Variant $name.
     Exited,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-/// Struct $name.
 pub struct ClientSpec {
-    /// Field $name.
     pub name: String,
-    /// Field $name.
     pub client_root: PathBuf,
-    /// Field $name.
     pub local_metadata_dir: PathBuf,
-    /// Field $name.
     pub local_metadata_db: PathBuf,
-    /// Field $name.
     pub cache_dir: PathBuf,
-    /// Field $name.
     pub mount_metadata_dir: PathBuf,
-    /// Field $name.
     pub mount_point: PathBuf,
-    /// Field $name.
     pub stdout_log: PathBuf,
-    /// Field $name.
     pub stderr_log: PathBuf,
-    /// Field $name.
     pub tracing_log: PathBuf,
-    /// Field $name.
     pub process_id: Option<u32>,
-    /// Field $name.
     pub state: ClientLifecycleState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/// Struct $name.
 pub struct ClientCommand {
-    /// Field $name.
     pub client: String,
-    /// Field $name.
     pub action: String,
-    /// Field $name.
     pub program: String,
-    /// Field $name.
     pub args: Vec<String>,
-    /// Field $name.
     pub env: Vec<(String, String)>,
-    /// Field $name.
     pub client_root: PathBuf,
-    /// Field $name.
     pub cache_dir: PathBuf,
-    /// Field $name.
     pub mount_point: PathBuf,
-    /// Field $name.
     pub stdout_log: PathBuf,
-    /// Field $name.
     pub stderr_log: PathBuf,
-    /// Field $name.
     pub tracing_log: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/// Struct $name.
 pub struct ClientCommandOutput {
-    /// Field $name.
     pub status: i32,
-    /// Field $name.
     pub stdout: String,
-    /// Field $name.
     pub stderr: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/// Struct $name.
-pub struct ClientCommandTimeoutError {
-    /// Field $name.
-    pub client: String,
-    /// Field $name.
-    pub action: String,
-    /// Field $name.
-    pub timeout: Duration,
-    /// Field $name.
-    pub program: String,
-    /// Field $name.
-    pub stdout_log: PathBuf,
-    /// Field $name.
-    pub stderr_log: PathBuf,
-}
-
-impl fmt::Display for ClientCommandTimeoutError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "{} for {} timed out after {:?}: program: {}; stdout log: {:?}; stderr log: {:?}",
-            self.action, self.client, self.timeout, self.program, self.stdout_log, self.stderr_log
-        )
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-/// Struct $name.
 pub struct VolumeBootstrapOptions {
-    /// Field $name.
     pub client_names: Vec<String>,
-    /// Field $name.
     pub clean_existing_local_metadata: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-/// Struct $name.
 pub struct ClientBootstrapRecord {
-    /// Field $name.
     pub name: String,
-    /// Field $name.
     pub local_metadata_db: PathBuf,
-    /// Field $name.
     pub state: ClientLifecycleState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-/// Struct $name.
 pub struct VolumeBootstrapSummary {
-    /// Field $name.
     pub volume_name: String,
-    /// Field $name.
     pub init_client: String,
-    /// Field $name.
     pub discovered_clients: Vec<String>,
-    /// Field $name.
     pub clients: Vec<ClientBootstrapRecord>,
 }
 
-/// Trait $name.
 pub trait ClientProcess {
-    /// Function $name.
     fn id(&self) -> u32;
-    /// Function $name.
     fn try_wait(&mut self) -> io::Result<Option<i32>>;
-    /// Function $name.
     fn kill(&mut self) -> io::Result<()>;
-    /// Force-terminate this runner-owned process and, on Windows, its child process tree.
-    fn kill_process_tree(&mut self, context: &str) -> io::Result<()> {
-        let _ = context;
-        self.kill()
-    }
 }
 
-/// Trait $name.
 pub trait ClientProcessExecutor {
-    /// Function $name.
-    fn run(
-        &self,
-        command: &ClientCommand,
-        timeout: Duration,
-    ) -> Result<ClientCommandOutput, ClientControllerError>;
-    /// Function $name.
+    fn run(&self, command: &ClientCommand) -> io::Result<ClientCommandOutput>;
     fn spawn(&self, command: &ClientCommand) -> io::Result<Box<dyn ClientProcess>>;
-    /// Function $name.
     fn is_mount_ready(&self, command: &ClientCommand) -> io::Result<bool>;
-    /// Function $name.
     fn cleanup_stale_mount_before_remount(&self, _command: &ClientCommand) -> io::Result<()> {
         Ok(())
     }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-/// Struct $name.
 pub struct SystemClientProcessExecutor;
 
 impl ClientProcessExecutor for SystemClientProcessExecutor {
-    fn run(
-        &self,
-        command: &ClientCommand,
-        timeout: Duration,
-    ) -> Result<ClientCommandOutput, ClientControllerError> {
-        let mut child = base_command(command)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        let mut stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| io::Error::other("failed to capture client command stdout"))?;
-        let mut stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| io::Error::other("failed to capture client command stderr"))?;
-        let stdout_reader = thread::spawn(move || {
-            let mut output = Vec::new();
-            stdout.read_to_end(&mut output)?;
-            Ok::<_, io::Error>(output)
-        });
-        let stderr_reader = thread::spawn(move || {
-            let mut output = Vec::new();
-            stderr.read_to_end(&mut output)?;
-            Ok::<_, io::Error>(output)
-        });
-        let deadline = Instant::now() + timeout;
-        let mut timed_out = false;
-        loop {
-            if child.try_wait()?.is_some() {
-                break;
-            }
-            if Instant::now() >= deadline {
-                timed_out = true;
-                let _ = force_kill_child_process_tree(&mut child, &command.action);
-                break;
-            }
-            std::thread::sleep(COMMAND_RUN_POLL_INTERVAL);
-        }
-        let status = child.wait()?;
-        let stdout = join_output_reader(stdout_reader)?;
-        let stderr = join_output_reader(stderr_reader)?;
-        append_log(&command.stdout_log, &stdout)?;
-        append_log(&command.stderr_log, &stderr)?;
-        if timed_out {
-            return Err(ClientControllerError::CommandTimedOut(Box::new(
-                ClientCommandTimeoutError {
-                    client: command.client.clone(),
-                    action: command.action.clone(),
-                    timeout,
-                    program: command.program.clone(),
-                    stdout_log: command.stdout_log.clone(),
-                    stderr_log: command.stderr_log.clone(),
-                },
-            )));
-        }
+    fn run(&self, command: &ClientCommand) -> io::Result<ClientCommandOutput> {
+        let output = base_command(command).output()?;
+        append_log(&command.stdout_log, &output.stdout)?;
+        append_log(&command.stderr_log, &output.stderr)?;
         Ok(ClientCommandOutput {
-            status: status.code().unwrap_or(-1),
-            stdout: String::from_utf8_lossy(&stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&stderr).into_owned(),
+            status: output.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         })
     }
 
@@ -480,10 +211,7 @@ impl ClientProcessExecutor for SystemClientProcessExecutor {
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr))
             .spawn()?;
-        Ok(Box::new(SystemClientProcess {
-            child,
-            force_kill_confirmed_exit: false,
-        }))
+        Ok(Box::new(SystemClientProcess { child }))
     }
 
     fn is_mount_ready(&self, command: &ClientCommand) -> io::Result<bool> {
@@ -497,7 +225,6 @@ impl ClientProcessExecutor for SystemClientProcessExecutor {
 
 struct SystemClientProcess {
     child: Child,
-    force_kill_confirmed_exit: bool,
 }
 
 impl ClientProcess for SystemClientProcess {
@@ -506,207 +233,63 @@ impl ClientProcess for SystemClientProcess {
     }
 
     fn try_wait(&mut self) -> io::Result<Option<i32>> {
-        let status = self
+        Ok(self
             .child
             .try_wait()?
-            .map(|status| status.code().unwrap_or(-1));
-        Ok(status.or_else(|| self.force_kill_confirmed_exit.then_some(-1)))
+            .map(|status| status.code().unwrap_or(-1)))
     }
 
     fn kill(&mut self) -> io::Result<()> {
         self.child.kill()
     }
-
-    fn kill_process_tree(&mut self, context: &str) -> io::Result<()> {
-        self.force_kill_confirmed_exit = force_kill_child_process_tree(&mut self.child, context)?;
-        Ok(())
-    }
-}
-
-fn join_output_reader(reader: thread::JoinHandle<io::Result<Vec<u8>>>) -> io::Result<Vec<u8>> {
-    reader
-        .join()
-        .map_err(|_| io::Error::other("client command output reader panicked"))?
-}
-
-fn force_kill_child_process_tree(child: &mut Child, context: &str) -> io::Result<bool> {
-    let pid = child.id();
-    #[cfg(windows)]
-    {
-        let pid_arg = pid.to_string();
-        let tree_result = Command::new("taskkill")
-            .args(["/PID", &pid_arg, "/T", "/F"])
-            .output();
-        let primary_result = child.kill();
-        match (tree_result, primary_result) {
-            (Ok(output), _) if windows_taskkill_status_is_success(output.status.code()) => Ok(true),
-            (Ok(_), Ok(())) if !windows_pid_is_running(pid) => Ok(true),
-            (Ok(output), Ok(())) => Err(io::Error::other(format!(
-                "failed to terminate process tree for {context} pid {pid}: taskkill exit: {}; stdout: {}; stderr: {}; primary kill: ok",
-                output.status.code().unwrap_or(-1),
-                String::from_utf8_lossy(&output.stdout).trim(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            ))),
-            (Ok(output), Err(primary)) => Err(io::Error::other(format!(
-                "failed to terminate process tree for {context} pid {pid}: taskkill exit: {}; stdout: {}; stderr: {}; primary kill: {primary}",
-                output.status.code().unwrap_or(-1),
-                String::from_utf8_lossy(&output.stdout).trim(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            ))),
-            (Err(tree), Ok(())) => Err(io::Error::other(format!(
-                "failed to terminate process tree for {context} pid {pid}: taskkill failed: {tree}; primary kill: ok"
-            ))),
-            (Err(tree), Err(primary)) => Err(io::Error::other(format!(
-                "failed to terminate process tree for {context} pid {pid}: taskkill failed: {tree}; primary kill: {primary}"
-            ))),
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = context;
-        let _ = pid;
-        child.kill()?;
-        Ok(false)
-    }
-}
-
-#[cfg(windows)]
-#[doc(hidden)]
-pub fn windows_taskkill_status_is_success(status_code: Option<i32>) -> bool {
-    status_code == Some(0) || status_code == Some(128)
-}
-
-#[cfg(windows)]
-pub(crate) fn windows_pid_is_running(pid: u32) -> bool {
-    unsafe extern "system" {
-        fn OpenProcess(
-            dwDesiredAccess: u32,
-            bInheritHandle: i32,
-            dwProcessId: u32,
-        ) -> *mut core::ffi::c_void;
-        fn WaitForSingleObject(hHandle: *mut core::ffi::c_void, dwMilliseconds: u32) -> u32;
-        fn CloseHandle(hObject: *mut core::ffi::c_void) -> i32;
-    }
-
-    const SYNCHRONIZE: u32 = 0x00100000;
-    const WAIT_OBJECT_0: u32 = 0x00000000;
-    const WAIT_TIMEOUT: u32 = 0x00000102;
-
-    // SAFETY: `OpenProcess` returns a nullable handle for the PID; null means
-    // there is no waitable process object available for this PID.
-    let handle = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
-    if handle.is_null() {
-        return false;
-    }
-
-    // SAFETY: `handle` is a valid process handle with SYNCHRONIZE access.
-    let wait_result = unsafe { WaitForSingleObject(handle, 0) };
-    // SAFETY: `handle` is non-null and must be closed to release OS resources.
-    unsafe { CloseHandle(handle) };
-
-    match wait_result {
-        WAIT_TIMEOUT => true,
-        WAIT_OBJECT_0 => false,
-        _ => true,
-    }
 }
 
 #[derive(Debug, Error)]
-/// Enum $name.
 pub enum ClientControllerError {
     #[error("no E2E clients have been created")]
-    /// Variant $name.
     NoClients,
     #[error("cannot replace E2E clients while mount processes are still tracked")]
-    /// Variant $name.
     ClientsStillMounted,
     #[error("client name must be a safe single directory name: {0}")]
-    /// Variant $name.
     UnsafeClientName(String),
     #[error("unknown E2E client: {0}")]
-    /// Variant $name.
     UnknownClient(String),
     #[error("E2E client index {index} is out of range for {len} clients")]
-    /// Variant $name.
-    ClientIndexOutOfRange {
-        /// The index value.
-        index: usize,
-        /// The len value.
-        len: usize,
-    },
+    ClientIndexOutOfRange { index: usize, len: usize },
     #[error("E2E client {client} mount point is already active before mount: {path}")]
-    /// Variant $name.
-    MountPointAlreadyActive {
-        /// The client value.
-        client: String,
-        /// The path value.
-        path: PathBuf,
-    },
+    MountPointAlreadyActive { client: String, path: PathBuf },
     #[error("Docker compose service port is missing for {0}")]
-    /// Variant $name.
     MissingServicePort(String),
-    #[error("external E2E infrastructure env is missing: {names}")]
-    /// Field $name.
-    MissingExternalEnv {
-        /// The names value.
-        names: String,
-    },
     #[error(
         "client command {action} for {client} failed with exit status {status}: stderr: {stderr}; stdout: {stdout}"
     )]
-    /// Variant $name.
     CommandFailed {
-        /// Field $name.
         client: String,
-        /// Field $name.
         action: String,
-        /// Field $name.
         status: i32,
-        /// Field $name.
         stdout: String,
-        /// Field $name.
         stderr: String,
     },
-    #[error("client command {0}")]
-    /// Variant $name.
-    CommandTimedOut(Box<ClientCommandTimeoutError>),
     #[error("E2E client {client} did not create local metadata DB: {path}")]
-    /// Field $name.
-    MissingLocalMetadataDb {
-        /// The client value.
-        client: String,
-        /// The path value.
-        path: PathBuf,
-    },
+    MissingLocalMetadataDb { client: String, path: PathBuf },
     #[error("E2E local metadata DB path is shared by multiple clients: {0}")]
-    /// Variant $name.
     DuplicateLocalMetadataDb(PathBuf),
     #[error("failed to canonicalize local metadata DB for E2E client {client} at {path}: {source}")]
-    /// Variant $name.
     CanonicalizeLocalMetadataDbFailed {
-        /// Field $name.
         client: String,
-        /// Field $name.
         path: PathBuf,
-        /// Field $name.
         source: io::Error,
     },
     #[error("failed to clean local metadata for E2E client {client} at {path}: {source}")]
-    /// Variant $name.
     CleanLocalMetadataFailed {
-        /// Field $name.
         client: String,
-        /// Field $name.
         path: PathBuf,
-        /// Field $name.
         source: io::Error,
     },
     #[error("client controller I/O failed: {0}")]
-    /// Variant $name.
     Io(#[from] io::Error),
 }
 
-/// Struct $name.
 pub struct MultiClientController<E> {
     config: ClientControllerConfig,
     executor: E,
@@ -714,7 +297,6 @@ pub struct MultiClientController<E> {
 }
 
 impl<E: ClientProcessExecutor> MultiClientController<E> {
-    /// Function $name.
     pub fn new(config: ClientControllerConfig, executor: E) -> Self {
         Self {
             config,
@@ -723,7 +305,6 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         }
     }
 
-    /// Function $name.
     pub fn create_clients<I, N>(&mut self, names: I) -> Result<(), ClientControllerError>
     where
         I: IntoIterator<Item = N>,
@@ -751,7 +332,6 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         Ok(())
     }
 
-    /// Function $name.
     pub fn clients(&self) -> Vec<&ClientSpec> {
         self.clients
             .iter()
@@ -759,39 +339,34 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
             .collect::<Vec<_>>()
     }
 
-    /// Function $name.
     pub fn client_at(&self, index: usize) -> Result<&ClientSpec, ClientControllerError> {
         self.client(index)
     }
 
-    /// Function $name.
     pub fn init_first_client(&mut self) -> Result<(), ClientControllerError> {
         if self.clients.is_empty() {
             return Err(ClientControllerError::NoClients);
         }
         let command = self.init_command(0)?;
-        self.run_init_with_transient_retry(&command)?;
+        let output = self.executor.run(&command)?;
+        ensure_success(&command, output)?;
         self.clients[0].spec.state = ClientLifecycleState::Initialized;
         Ok(())
     }
 
-    /// Function $name.
     pub fn discover_additional_clients(&mut self) -> Result<(), ClientControllerError> {
         if self.clients.is_empty() {
             return Err(ClientControllerError::NoClients);
         }
         for index in 1..self.clients.len() {
             let command = self.discover_command(index)?;
-            let output = self
-                .executor
-                .run(&command, self.command_timeout(&command))?;
+            let output = self.executor.run(&command)?;
             ensure_success(&command, output)?;
             self.clients[index].spec.state = ClientLifecycleState::Discovered;
         }
         Ok(())
     }
 
-    /// Function $name.
     pub fn bootstrap_volume(
         &mut self,
         options: VolumeBootstrapOptions,
@@ -831,7 +406,6 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         })
     }
 
-    /// Function $name.
     pub fn mount_all(&mut self) -> Result<(), ClientControllerError> {
         for index in 0..self.clients.len() {
             self.mount_index(index)?;
@@ -839,35 +413,16 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         Ok(())
     }
 
-    /// Function $name.
-    pub fn mount(&mut self, client: &str) -> Result<(), ClientControllerError> {
-        let index = self.client_index(client)?;
-        self.mount_index(index)
-    }
-
-    /// Function $name.
     pub fn restart(&mut self, client: &str) -> Result<(), ClientControllerError> {
         let index = self.client_index(client)?;
         self.unmount_index(index)?;
         self.mount_index(index)
     }
 
-    /// Gracefully unmounts one mounted client by name without remounting it.
-    pub fn unmount(&mut self, client: &str) -> Result<(), ClientControllerError> {
-        let index = self.client_index(client)?;
-        self.unmount_index(index)
-    }
-
-    /// Function $name.
     pub fn force_kill(&mut self, client: &str) -> Result<(), ClientControllerError> {
         let index = self.client_index(client)?;
         if let Some(process) = self.clients[index].process.as_mut() {
-            force_kill_process_and_wait(
-                process.as_mut(),
-                "force_kill",
-                self.config.mount_exit_timeout,
-                self.config.poll_interval,
-            )?;
+            process.kill()?;
         }
         self.clients[index].process = None;
         self.clients[index].spec.process_id = None;
@@ -875,7 +430,6 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         Ok(())
     }
 
-    /// Function $name.
     pub fn remount(&mut self, client: &str) -> Result<(), ClientControllerError> {
         let index = self.client_index(client)?;
         let command = self.mount_command(index)?;
@@ -883,32 +437,18 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         self.mount_index(index)
     }
 
-    /// Function $name.
     pub fn unmount_all(&mut self) -> Result<(), ClientControllerError> {
-        let mut unmount_error = None;
         for index in 0..self.clients.len() {
-            if let Err(err) = self.unmount_index(index) {
-                unmount_error.get_or_insert(err);
-            }
+            self.unmount_index(index)?;
         }
-        if let Some(err) = unmount_error {
-            Err(err)
-        } else {
-            Ok(())
-        }
+        Ok(())
     }
 
-    /// Function $name.
     pub fn force_kill_all(&mut self) -> Result<(), ClientControllerError> {
         let mut kill_error = None;
         for index in 0..self.clients.len() {
             if let Some(process) = self.clients[index].process.as_mut() {
-                if let Err(err) = force_kill_process_and_wait(
-                    process.as_mut(),
-                    "force_kill_all",
-                    self.config.mount_exit_timeout,
-                    self.config.poll_interval,
-                ) {
+                if let Err(err) = process.kill() {
                     kill_error.get_or_insert(err);
                 }
             }
@@ -917,7 +457,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
             self.clients[index].spec.state = ClientLifecycleState::Killed;
         }
         if let Some(err) = kill_error {
-            Err(err)
+            Err(err.into())
         } else {
             Ok(())
         }
@@ -934,12 +474,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         let mut process = self.executor.spawn(&command)?;
         let process_id = process.id();
         if let Err(err) = self.wait_until_mount_ready(&command, process.as_mut()) {
-            if let Err(kill_error) = force_kill_process_and_wait(
-                process.as_mut(),
-                "mount readiness failure",
-                self.config.mount_exit_timeout,
-                self.config.poll_interval,
-            ) {
+            if let Err(kill_error) = process.kill() {
                 debug_log_kill_error(&command.client, "mount readiness failure", &kill_error);
             }
             self.clients[index].spec.state =
@@ -972,23 +507,6 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         Ok(())
     }
 
-    fn run_init_with_transient_retry(
-        &self,
-        command: &ClientCommand,
-    ) -> Result<(), ClientControllerError> {
-        let deadline = Instant::now() + self.config.init_retry_timeout;
-        loop {
-            let output = self.executor.run(command, self.command_timeout(command))?;
-            if output.status == 0 {
-                return Ok(());
-            }
-            if !is_transient_object_store_init_failure(&output) || Instant::now() >= deadline {
-                return ensure_success(command, output);
-            }
-            std::thread::sleep(nonzero_poll_interval(self.config.poll_interval));
-        }
-    }
-
     fn verify_local_metadata_dbs(&self) -> Result<(), ClientControllerError> {
         let mut seen = HashSet::<OsString>::new();
         for runtime in &self.clients {
@@ -1011,50 +529,15 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
     }
 
     fn unmount_index(&mut self, index: usize) -> Result<(), ClientControllerError> {
-        if self.clients[index].spec.state != ClientLifecycleState::Mounted
-            && self.clients[index].process.is_none()
-        {
-            return Ok(());
-        }
         let command = self.unmount_command(index)?;
-        let output = match self.executor.run(&command, self.command_timeout(&command)) {
-            Ok(output) => output,
-            Err(error) => {
-                self.kill_mount_process_after_failed_unmount(
-                    index,
-                    "unmount command timeout fallback",
-                );
-                return Err(error);
-            }
-        };
-        if let Err(error) = ensure_success(&command, output) {
-            self.kill_mount_process_after_failed_unmount(index, "failed unmount command fallback");
-            return Err(error);
-        }
+        let output = self.executor.run(&command)?;
+        ensure_success(&command, output)?;
         if let Some(process) = self.clients[index].process.as_mut() {
-            if let Err(error) = wait_for_process_exit(
+            wait_for_process_exit(
                 process.as_mut(),
                 self.config.mount_exit_timeout,
                 self.config.poll_interval,
-            ) {
-                let kill_result = force_kill_process_and_wait(
-                    process.as_mut(),
-                    "unmount timeout fallback",
-                    self.config.mount_exit_timeout,
-                    self.config.poll_interval,
-                );
-                self.clients[index].process = None;
-                self.clients[index].spec.process_id = None;
-                self.clients[index].spec.state = ClientLifecycleState::Killed;
-                if let Err(kill_error) = kill_result {
-                    debug_log_kill_error(
-                        &self.clients[index].spec.name,
-                        "unmount timeout fallback",
-                        &kill_error,
-                    );
-                }
-                return Err(error);
-            }
+            )?;
         }
         self.clients[index].process = None;
         self.clients[index].spec.process_id = None;
@@ -1067,31 +550,6 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
             .iter()
             .position(|runtime| runtime.spec.name == client)
             .ok_or_else(|| ClientControllerError::UnknownClient(client.to_string()))
-    }
-
-    fn command_timeout(&self, command: &ClientCommand) -> Duration {
-        match command.action.as_str() {
-            "init" => self.config.command_timeouts.init,
-            "discover" => self.config.command_timeouts.discover,
-            "umount" => self.config.command_timeouts.umount,
-            _ => self.config.command_timeouts.discover,
-        }
-    }
-
-    fn kill_mount_process_after_failed_unmount(&mut self, index: usize, context: &str) {
-        if let Some(process) = self.clients[index].process.as_mut() {
-            if let Err(kill_error) = force_kill_process_and_wait(
-                process.as_mut(),
-                context,
-                self.config.mount_exit_timeout,
-                self.config.poll_interval,
-            ) {
-                debug_log_kill_error(&self.clients[index].spec.name, context, &kill_error);
-            }
-            self.clients[index].process = None;
-            self.clients[index].spec.process_id = None;
-            self.clients[index].spec.state = ClientLifecycleState::Killed;
-        }
     }
 
     fn create_client_spec(
@@ -1275,84 +733,34 @@ fn ensure_success(
     }
 }
 
-fn is_transient_object_store_init_failure(output: &ClientCommandOutput) -> bool {
-    diagnostics_contain_all(output, &["bucket", "could not be created"])
-        && diagnostics_contain_any(
-            output,
-            &[
-                "http request failed",
-                "error sending request",
-                "connection reset",
-                "connection closed",
-                "timed out",
-                "temporarily unavailable",
-            ],
-        )
-}
-
-fn diagnostics_contain_all(output: &ClientCommandOutput, needles: &[&str]) -> bool {
-    needles
-        .iter()
-        .all(|needle| diagnostic_contains(output, needle))
-}
-
-fn diagnostics_contain_any(output: &ClientCommandOutput, needles: &[&str]) -> bool {
-    needles
-        .iter()
-        .any(|needle| diagnostic_contains(output, needle))
-}
-
-fn diagnostic_contains(output: &ClientCommandOutput, needle: &str) -> bool {
-    contains_ascii_case_insensitive(&output.stdout, needle)
-        || contains_ascii_case_insensitive(&output.stderr, needle)
-}
-
-fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
-    if needle.is_empty() {
-        return true;
-    }
-    haystack
-        .as_bytes()
-        .windows(needle.len())
-        .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
-}
-
-/// Function $name.
 pub fn client_artifact_dir(sandbox: &Path, client: &str) -> PathBuf {
     sandbox.join("artifacts").join("clients").join(client)
 }
 
-/// Function $name.
 pub fn client_root_dir(sandbox: &Path, client: &str) -> PathBuf {
     client_artifact_dir(sandbox, client).join("client-root")
 }
 
-/// Function $name.
 pub fn client_cache_dir(sandbox: &Path, client: &str) -> PathBuf {
     client_artifact_dir(sandbox, client).join("cache")
 }
 
-/// Function $name.
 pub fn client_mount_point(sandbox: &Path, client: &str) -> PathBuf {
     client_artifact_dir(sandbox, client).join("mount")
 }
 
-/// Function $name.
 pub fn client_stdout_log(sandbox: &Path, client: &str) -> PathBuf {
     client_artifact_dir(sandbox, client).join("studiofs.stdout.log")
 }
 
-/// Function $name.
 pub fn client_stderr_log(sandbox: &Path, client: &str) -> PathBuf {
     client_artifact_dir(sandbox, client).join("studiofs.stderr.log")
 }
 
-/// Function $name.
 pub fn client_tracing_log(sandbox: &Path, client: &str) -> PathBuf {
     client_artifact_dir(sandbox, client).join("studiofs-tracing.log")
 }
 
-/// Function $name.
 pub fn client_spec_for(
     sandbox: &Path,
     volume_name: &str,
@@ -1396,27 +804,6 @@ fn wait_for_process_exit(
         }
         std::thread::sleep(nonzero_poll_interval(poll_interval));
     }
-}
-
-fn force_kill_process_and_wait(
-    process: &mut dyn ClientProcess,
-    context: &str,
-    timeout: Duration,
-    poll_interval: Duration,
-) -> Result<(), ClientControllerError> {
-    process.kill_process_tree(context)?;
-    wait_for_process_exit(process, timeout, poll_interval).map_err(|error| match error {
-        ClientControllerError::Io(source) if source.kind() == io::ErrorKind::TimedOut => {
-            ClientControllerError::Io(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!(
-                    "mount process did not exit after force termination within {} ms during {context}",
-                    timeout.as_millis()
-                ),
-            ))
-        }
-        other => other,
-    })
 }
 
 fn client_env(client: &ClientSpec) -> Vec<(String, String)> {
@@ -1493,63 +880,6 @@ fn service_port<'a>(
         .iter()
         .find(|port| port.service == service)
         .ok_or_else(|| ClientControllerError::MissingServicePort(service.to_string()))
-}
-
-struct ExternalEnvValues {
-    dotenv_values: Vec<Vec<(String, String)>>,
-}
-
-impl ExternalEnvValues {
-    fn load() -> Self {
-        Self::load_from_paths(candidate_dotenv_paths())
-    }
-
-    fn load_from_paths(paths: Vec<PathBuf>) -> Self {
-        let dotenv_values = paths
-            .into_iter()
-            .filter_map(|dotenv_path| {
-                let iter = dotenvy::from_path_iter(&dotenv_path).ok()?;
-                Some(iter.filter_map(Result::ok).collect::<Vec<_>>())
-            })
-            .collect();
-        Self { dotenv_values }
-    }
-
-    fn value(&self, names: &[&str]) -> Option<String> {
-        for name in names {
-            if let Ok(value) = std::env::var(name) {
-                if !value.trim().is_empty() {
-                    return Some(value);
-                }
-            }
-        }
-        for values in &self.dotenv_values {
-            for name in names {
-                if let Some((_, value)) = values
-                    .iter()
-                    .find(|(key, value)| key == name && !value.trim().is_empty())
-                {
-                    return Some(value.clone());
-                }
-            }
-        }
-        None
-    }
-}
-
-fn candidate_dotenv_paths() -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    if let Ok(cwd) = std::env::current_dir() {
-        for ancestor in cwd.ancestors() {
-            paths.push(ancestor.join(".env"));
-        }
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        for ancestor in exe.ancestors() {
-            paths.push(ancestor.join(".env"));
-        }
-    }
-    paths
 }
 
 fn sanitize_dns_label(value: &str) -> String {
@@ -1677,12 +1007,12 @@ fn diagnostic_excerpt(value: &str) -> String {
 }
 
 #[cfg(debug_assertions)]
-fn debug_log_kill_error(client: &str, context: &str, error: &dyn fmt::Display) {
+fn debug_log_kill_error(client: &str, context: &str, error: &io::Error) {
     eprintln!("studiofs-e2e: failed to kill client {client} during {context}: {error}");
 }
 
 #[cfg(not(debug_assertions))]
-fn debug_log_kill_error(_client: &str, _context: &str, _error: &dyn fmt::Display) {}
+fn debug_log_kill_error(_client: &str, _context: &str, _error: &io::Error) {}
 
 #[cfg(unix)]
 fn mount_point_is_active(path: &Path) -> io::Result<bool> {
@@ -1908,37 +1238,6 @@ mod tests {
     }
 
     #[test]
-    fn external_env_values_parse_dotenv_paths_once_and_preserve_lookup_order() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let first = temp.path().join("first.env");
-        let second = temp.path().join("second.env");
-        std::fs::write(
-            &first,
-            "STUDIOFS_TEST_ONLINE_S3_ENDPOINT=http://first\nSTUDIOFS_S3_REGION=\n",
-        )
-        .expect("write first env");
-        std::fs::write(
-            &second,
-            "STUDIOFS_TEST_ONLINE_S3_ENDPOINT=http://second\nSTUDIOFS_S3_REGION=eu-test-1\n",
-        )
-        .expect("write second env");
-
-        let values = ExternalEnvValues::load_from_paths(vec![first, second]);
-
-        assert_eq!(
-            values.value(&[
-                "STUDIOFS_E2E_EXTERNAL_S3_ENDPOINT",
-                "STUDIOFS_TEST_ONLINE_S3_ENDPOINT",
-            ]),
-            Some("http://first".to_string())
-        );
-        assert_eq!(
-            values.value(&["STUDIOFS_S3_REGION"]),
-            Some("eu-test-1".to_string())
-        );
-    }
-
-    #[test]
     fn linux_mountinfo_fallback_matches_escaped_mount_point() {
         let path = Path::new("/var/mint-workspace/target/e2e-runs/run with space/mount");
         let mountinfo = "\
@@ -1970,11 +1269,6 @@ mod tests {
 88 42 0:77 / /var/mint-workspace/mount-\xff rw,nosuid,nodev - fuse.studiofs studiofs rw\n";
 
         assert!(mountinfo_contains_mount_point(mountinfo, &path));
-    }
-
-    #[test]
-    fn ascii_case_insensitive_contains_matches_empty_needle() {
-        assert!(contains_ascii_case_insensitive("bucket create failed", ""));
     }
 
     #[cfg(not(unix))]

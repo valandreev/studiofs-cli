@@ -2,7 +2,10 @@ use super::*;
 
 impl RedbMetaEngine {
     fn add_pending_create_intent(&self, intent: &PendingCreateRecord) -> MetaResult<()> {
-        let txn = self.begin_crash_safe_write()?;
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
         {
             let mut table = txn
                 .open_table(PENDING_CREATES_TABLE)
@@ -28,7 +31,10 @@ impl RedbMetaEngine {
     }
 
     fn remove_pending_create_intent(&self, ino: Ino) -> MetaResult<()> {
-        let txn = self.begin_crash_safe_write()?;
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
         {
             let mut table = txn
                 .open_table(PENDING_CREATES_TABLE)
@@ -69,7 +75,10 @@ impl RedbMetaEngine {
             return Ok(Vec::new());
         }
 
-        let txn = self.begin_crash_safe_write()?;
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
         let mut healed = 0u64;
         let mut touched_parents: HashSet<Ino> = HashSet::new();
         for intent in intents {
@@ -109,7 +118,10 @@ impl RedbMetaEngine {
     }
 
     pub(super) fn cleanup_stale_undo_logs(&self) -> MetaResult<()> {
-        let txn = self.begin_crash_safe_write()?;
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
 
         let undo_entries: Vec<(u64, UndoLogRecord)> = {
             let undo = txn
@@ -178,7 +190,10 @@ impl RedbMetaEngine {
 
 impl MetaRecovery for RedbMetaEngine {
     fn add_deferred_delete(&self, record: &DeferredDeleteRecord) -> MetaResult<()> {
-        let txn = self.begin_crash_safe_write()?;
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
         {
             let mut table = txn
                 .open_table(DEFERRED_DELETES_TABLE)
@@ -194,7 +209,10 @@ impl MetaRecovery for RedbMetaEngine {
     }
 
     fn remove_deferred_delete(&self, ino: Ino) -> MetaResult<()> {
-        let txn = self.begin_crash_safe_write()?;
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
         {
             let mut table = txn
                 .open_table(DEFERRED_DELETES_TABLE)
@@ -309,7 +327,10 @@ impl MetaRecovery for RedbMetaEngine {
     }
 
     fn append_undo_log(&self, record: &UndoLogRecord) -> MetaResult<()> {
-        let txn = self.begin_crash_safe_write()?;
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
         {
             Self::append_undo_log_in_txn(&txn, record)?;
         }
@@ -319,7 +340,10 @@ impl MetaRecovery for RedbMetaEngine {
     }
 
     fn remove_undo_logs_for(&self, kind: UndoLogKind, ino: Ino) -> MetaResult<()> {
-        let txn = self.begin_crash_safe_write()?;
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
         {
             Self::remove_undo_logs_for_in_txn(&txn, kind, ino)?;
         }

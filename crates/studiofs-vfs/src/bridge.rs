@@ -5,54 +5,32 @@ use studiofs_meta::{InodeAttr, MetaError};
 use crate::{VfsError, fetch::FetchError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// Enum $name.
 pub enum BridgeVfsErrorKind {
-    /// Variant $name.
     NotFound,
-    /// Variant $name.
     AlreadyExists,
-    /// Variant $name.
     NotDirectory,
-    /// Variant $name.
     IsDirectory,
-    /// Variant $name.
     DirectoryNotEmpty,
-    /// Variant $name.
     UnrecognizedVolume,
-    /// Variant $name.
     XattrValueTooLarge,
-    /// Variant $name.
     InvalidInput,
-    /// Variant $name.
     PermissionDenied,
-    /// Variant $name.
     Retryable,
-    /// Variant $name.
     TimedOut,
-    /// Variant $name.
     InsufficientResources,
-    /// Variant $name.
     DataCorruption,
-    /// Variant $name.
     CriticalRuntimeFailure,
-    /// Variant $name.
     GenericFailure,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// Struct $name.
 pub struct BridgeAttrTimes {
-    /// Field $name.
     pub atime_unix_nanos: u64,
-    /// Field $name.
     pub mtime_unix_nanos: u64,
-    /// Field $name.
     pub ctime_unix_nanos: u64,
-    /// Field $name.
     pub creation_time_unix_nanos: u64,
 }
 
-/// Function $name.
 pub fn classify_vfs_error(error: &VfsError) -> BridgeVfsErrorKind {
     match error {
         VfsError::Meta(meta_error) => classify_meta_error(meta_error),
@@ -66,7 +44,6 @@ pub fn classify_vfs_error(error: &VfsError) -> BridgeVfsErrorKind {
     }
 }
 
-/// Function $name.
 pub fn normalize_attr_times(attr: &InodeAttr) -> BridgeAttrTimes {
     BridgeAttrTimes {
         atime_unix_nanos: clamp_unix_nanos(attr.atime),

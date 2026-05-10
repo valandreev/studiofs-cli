@@ -99,9 +99,7 @@ cargo test -p studiofs-vfs --test vfs_test file_session_flush_ordering_is_determ
 
 ### Smoke test descriptions
 
-The `mount_sanity` integration tests share two lifecycle smoke tiers as the
-common bridge baseline, with bridge- or platform-specific additions where
-needed:
+The `mount_sanity` integration tests in each bridge crate contain two tiers:
 
 | Test | Backend | Verifies |
 |------|---------|----------|
@@ -137,156 +135,49 @@ Initial runner commands:
 ```powershell
 cargo run -p studiofs-e2e -- list
 cargo build -p studiofs
-cargo run -p studiofs-e2e -- run --scenario 1-8 --seed 360 --timeout 90m --port-range 29700-29800 --studiofs-bin target\debug\studiofs.exe
-cargo run -p studiofs-e2e -- run --all --seed 360 --timeout 4h --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run basic-multi-client-smoke --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run rustfs-outage-multi-client-recovery --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run mounted-client-crash-restart-recovery --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run collision-rename-vs-unlink --studiofs-bin target\debug\studiofs.exe
-cargo run -p studiofs-e2e -- run mounted-open-handle-convergence --studiofs-bin target\debug\studiofs.exe
-cargo run -p studiofs-e2e -- run mounted-chaos-convergence --seed 360 --timeout 20m --studiofs-bin target\debug\studiofs.exe
-cargo run -p studiofs-e2e -- run mounted-fault-chaos-convergence --seed 360 --timeout 30m --studiofs-bin target\debug\studiofs.exe
-cargo run -p studiofs-e2e -- run mounted-lww-reconnect-chaos-convergence --seed 360 --timeout 30m --studiofs-bin target\debug\studiofs.exe
-cargo run -p studiofs-e2e -- run mounted-publication-boundary-crash-matrix --timeout 30m --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- clean
 ```
 
 `run` uses Docker Compose infrastructure by default. The stack is defined in
 `docker/compose.e2e.yml` and includes PostgreSQL 18, RustFS, and a Toxiproxy
 placeholder. Use `--port-range <start-end>` to allocate deterministic
-project-scoped ports for concurrent local runs, or when a default host port is
-occupied or Docker reports it healthy but host-side StudioFS clients cannot
-reach it. Use `--infra disabled` only for runner self-tests that must not touch
-Docker. The basic mounted smoke scenario uses three isolated StudioFS clients,
-mounts each client separately, writes a small file through the first mount, and
-validates convergence through the public mounted trees. The RustFS/S3 outage
-scenario stops only the RustFS compose
+project-scoped ports for concurrent local runs, or `--infra disabled` only for
+runner self-tests that must not touch Docker. The basic mounted smoke scenario
+uses three isolated StudioFS clients, mounts each client separately, writes a
+small file through the first mount, and validates convergence through the public
+mounted trees. The RustFS/S3 outage scenario stops only the RustFS compose
 service, keeps accepted writes locally readable, verifies a peer does not see
 the new outage checksum before recovery, and reports upload recovery time plus
-final checksum convergence. The mounted client crash/restart scenario uses
-three mounted clients, kills and remounts one mounted client with the same
-`STUDIOFS_CLIENT_ROOT`, verifies locally durable data remains readable after
-restart for both
-`after_local_durability_boundary` and `before_remote_publication_completes`
-modes, then waits for normal S3/PG publication and mounted-tree convergence on
-observer clients. On Linux, crash-style remount attempts lazy stale FUSE mount
-cleanup before starting the replacement process.
-
-### First-eight mounted baseline gate
-
-Before debugging later chaos layers, stabilize the first eight mounted
-scenarios as one focused gate:
-
-1. `basic-multi-client-smoke`
-2. `postgres-outage-multi-client-recovery`
-3. `rustfs-outage-multi-client-recovery`
-4. `mounted-client-crash-restart-recovery`
-5. `mounted-publication-boundary-crash-matrix`
-6. `collision-rename-vs-rename`
-7. `collision-rename-vs-unlink`
-8. `collision-unlink-vs-append`
-
-Windows/WinFSP baseline command:
-
-```powershell
-cargo build -p studiofs
-cargo run -p studiofs-e2e -- run --scenario 1-8 --seed 360 --timeout 90m --port-range 29700-29800 --studiofs-bin target\debug\studiofs.exe
-```
-
-The `run` command accepts one-based registry selectors for focused slices:
-`--scenario 1-8` runs the first eight registered scenarios, and comma lists such
-as `--scenario 1,2,5-8` can mix individual indices, ranges, canonical scenario
-names, and aliases. `--first-eight-mounted` is the stable shortcut for the same
-baseline gate. The `list` command prints the registry order used by these
-selectors.
-
-Use `--infra external-env` for production-like runs against already-running
-PostgreSQL and RustFS/S3. The runner reads `STUDIOFS_TEST_PG_DSN`,
-`STUDIOFS_S3_ENDPOINT`, `STUDIOFS_S3_BUCKET`, `STUDIOFS_S3_ACCESS_KEY`, and
-`STUDIOFS_S3_SECRET_KEY` from the process environment or workspace `.env`, then
-uses a unique StudioFS volume name per run. This mode does not start, stop, or
-clean external services, so scenarios whose purpose is to stop infrastructure
-services still require `--infra compose`.
-
-For Windows WinFSP compose sweeps, prefer `run --all` over an external
-PowerShell loop. The runner starts PostgreSQL, RustFS, and Toxiproxy once for
-the whole run, then executes each scenario in a supervised child with a fresh
-StudioFS volume and scenario-scoped client roots/cache/logs under
-`artifacts/scenarios/<scenario>/client-runtime/`. If a mounted filesystem
-syscall hangs below the runner, the whole-run `--timeout` lets the runner write
-a best-effort timeout report and cleanup summary without repeatedly recreating
-Docker infrastructure. For narrow debugging, keep using one mounted scenario
-per command, then inspect the newest `target/e2e-runs/<run-id>/events.ndjson`
-and per-client logs before starting the next scenario.
-
-The mounted namespace collision scenarios use three
+final checksum convergence. The mounted client crash/restart scenario kills and
+remounts one mounted client with the same `STUDIOFS_CLIENT_ROOT`, verifies
+locally durable data remains readable after restart, and validates peer
+convergence for both `after_local_durability_boundary` and
+`before_remote_publication_completes` modes. On Linux, crash-style remount
+attempts lazy stale FUSE mount cleanup before starting the replacement process;
+publication readiness is validated through mounted-tree convergence rather than
+private backend inspection. The mounted namespace collision scenarios use three
 isolated clients and barrier-start conflicting operations covering
 rename/rename, rename/unlink, unlink/append, overwrite/read, mkdir/rmdir/create,
 and readdir/stat while mutations are in flight. The overwrite/read scenario
-records repeated read loops during the overwrite. Each collision run writes
-shared-schema `operations.ndjson`, `namespace-collision-summary.json`, and
-`validation.json`. The `mounted-chaos-convergence` scenario is the deeper
-seeded product chaos layer: it composes rename/rename, rename/unlink,
-unlink/append, overwrite/read, mkdir/rmdir/create, and readdir/stat mutation
-families across multiple rounds against three real mounted clients, records the
-same `ScenarioOperationRecord` log, and validates final mounted tree
-convergence and namespace invariants. Each mounted-chaos round records planned
-and started operations before launching short-lived operation helper processes,
-then records accepted or rejected results after the helpers return. If a helper
-does not return within the round timeout, the scenario force-terminates pending
-helpers, fails with their operation labels, and still attempts mounted cleanup.
-The `mounted-hotspot-churn-convergence` scenario narrows that product chaos
-surface to one bounded `hotspot/` directory. Two mounted clients mutate the same
-small `slot-*` working set with create, delete, rename, overwrite, append, and
-same-prefix path churn while a third mounted observer repeatedly performs
-readdir/stat/open probes. It records `operations.ndjson`,
-`mounted-hotspot-churn-summary.json`, and `validation.json`; only final mounted
-tree divergence or namespace/probe contract failures should fail the run.
-The `mounted-open-handle-convergence` scenario keeps file handles open while
-another mounted client unlinks or renames the same namespace entry, then
-validates that flush/fsync/release do not resurrect deleted paths and that the
-renamed destination remains visible after convergence. It records the mounted
-open-handle lifecycle in `operations.ndjson`, writes
-`mounted-open-handle-summary.json`, and uses only public mounted-tree
-validation.
-The `mounted-publication-boundary-crash-matrix` scenario force-kills and
-remounts a writer at flush, fsync, release/close, and graceful shutdown-drain
-publication boundaries. It attempts same-root local recovery after remount. If
-the writer cannot recover the file, that loss is allowed for the crash-boundary
-contract. If the writer reads any payload, that recovered checksum becomes the
-oracle and the scenario waits for observers to converge to it through normal
-S3/PG publication, even when the recovered payload differs from the original
-payload.
-It records shared-schema `operations.ndjson`, `publication-boundary-summary.json`,
-and `validation.json`.
-The
-`mounted-fault-chaos-convergence`
-scenario is the next product fault-chaos layer: it mixes a mounted conflict
-burst with PostgreSQL outage, client force-kill/remount, RustFS/S3 outage, and a
-late cold observer client with a fresh local root/cache. It validates final
-mounted tree convergence across warm clients, the restarted client, and the cold
-observer. The `mounted-lww-reconnect-chaos-convergence` scenario adds an
-oracle-backed LWW layer: it forces a stale writer offline, lets online peers
-publish ordered writes, remounts the stale writer so it writes last, crash/restarts
-that writer before final convergence, then mounts a cold observer. It fails when
-clients converge to the same tree but `lww-chaos/winner.txt` does not match the
-expected last-writer checksum.
+records repeated read loops during the overwrite. Each collision run writes `operations.ndjson`,
+`namespace-collision-summary.json`, and `validation.json`.
 
 Hosted Linux real mounted E2E is available as a manual RWX workflow:
 
 ```powershell
-rwx run .rwx/e2e.yml --target e2e-linux-full --wait --open
+rwx run .rwx/e2e.yml --target e2e-smoke --wait --open
 ```
 
-The RWX target runs the full registered `studiofs-e2e run --all` Linux/FUSE
-sweep with seed `360`, one Docker Compose stack, and a fresh StudioFS volume
-plus scenario-scoped client runtime for each scenario. It requires RWX Docker
-support, `/dev/fuse`, `fusermount3`, and readable FUSE configuration on the
-hosted Linux task. It does not add a GitHub Actions workflow, PR trigger, or
-schedule. RWX uploads `target/e2e-runs` as the `e2e-run` artifact so
+The first RWX target runs `basic-multi-client-smoke` only. It requires RWX
+Docker support, `/dev/fuse`, `fusermount3`, and readable FUSE configuration on
+the hosted Linux task. It does not add a GitHub Actions workflow, PR trigger, or
+schedule. RWX uploads `target/e2e-runs/<run-id>/` as the `e2e-run` artifact so
 `report.json`, `preflight.json`, Docker diagnostics, scenario artifacts, and
-client logs remain available after the run. The RWX task timeout is `120m`,
-which is intentionally longer than the runner `--timeout 90m` watchdog.
+client logs remain available on failure.
 
 Focused runner skeleton check:
 
@@ -294,112 +185,10 @@ Focused runner skeleton check:
 cargo test -p studiofs-e2e --test runner_contract
 cargo test -p studiofs-e2e --test compose_infra
 cargo test -p studiofs-e2e --test mounted_tree_validator
-cargo test -p studiofs-e2e scenario::tests::mounted_chaos_records_seeded_operations_and_validates_convergence -- --exact --nocapture
-cargo test -p studiofs-e2e --test runner_contract mounted_fault_chaos_disabled_run_writes_reproducible_artifacts -- --exact --nocapture
-cargo test -p studiofs-e2e --test runner_contract mounted_lww_reconnect_chaos_disabled_run_writes_reproducible_artifacts -- --exact --nocapture
-cargo test -p studiofs-e2e scenario::tests::lww_reconnect_oracle_detects_converged_wrong_winner -- --exact --nocapture
-cargo test -p studiofs-e2e scenario::tests::publication_boundary_crash_matrix_covers_boundaries_and_blocks_premature_peer_visibility -- --exact --nocapture
 cargo test -p studiofs-e2e namespace_collision_records_operations_and_validates_three_client_convergence -- --exact --nocapture
 cargo test -p studiofs-e2e scenario::tests::crash_restart_recovery_runs_both_modes_reuses_client_root_and_converges -- --exact --nocapture
 cargo test -p studiofs-e2e --test client_controller force_kill_then_remount_reuses_same_client_root_without_graceful_umount -- --exact --nocapture
-cargo test -p studiofs-scenario --test collision -- --nocapture
-cargo test -p studiofs-scenario --test crash_replay -- --nocapture
-cargo test -p studiofs-scenario --test seed_corpus -- --nocapture
 ```
-
-### Deterministic simulation corpus
-
-The deterministic simulation corpus lives in `studiofs-scenario` and is wired
-to RWX through `.rwx/simulation.yml`. It is pure Rust logical simulation: it
-does not require Docker, PostgreSQL, RustFS, FUSE, WinFSP, mounted filesystems,
-self-hosted runners, or wall-clock sleeps.
-Deep corpus seeds should change the observable trace shape for collision,
-crash/restart, metadata-outage, and object-store-outage groups; identical trace
-counts across every deep seed usually mean the scenario has collapsed into a
-single-path check.
-
-Use this layer as the search front end, not as the final product verdict. The
-current corpus exercises the deterministic model itself. A counterexample only
-becomes a StudioFS product bug after it is replayed into a production-backed
-layer:
-
-1. Model search: run the `studiofs-scenario` corpus to find a failing
-   interleaving and save the counterexample artifact.
-2. Contract/Core replay: replay the portable `ScenarioOperationRecord` log into
-   non-mounted production fixtures and validate the exported logical snapshot.
-3. Mounted replay: when the operation is mount-observable, translate the same
-   log into `studiofs-e2e` and validate mounted tree convergence plus scenario
-   artifacts.
-4. Regression promotion: keep the smallest reproducing layer as a focused test,
-   and keep the original counterexample artifact replayable.
-
-If a failing seed reproduces only in the model, fix the model, invariant, or
-scenario definition first. If it reproduces in Contract/Core, treat it as a
-production core bug. If Contract/Core passes but mounted replay fails, treat it
-as a bridge, process lifecycle, or integration bug.
-
-The first production-backed adapter lives on
-`studiofs_vfs::contract_harness::ContractVfsFixture::replay_operation_records`.
-It applies portable namespace and local file-content operations
-(`create_file`, `create_directory`, `write`, `append`, `truncate`, `rename`,
-`unlink`, `rmdir`, `read`, `stat`, `readdir`, `flush`, and `fsync`) through the
-real VFS fixture and reports checkpoints, mounted-only operations, crash/restart
-markers, and infrastructure outages as skipped records. Skipped records are not
-coverage; use mounted E2E replay for those.
-
-Mounted replay lives in `studiofs_e2e::mounted_replay`. It executes the same
-`ScenarioOperationRecord` log against real mounted client paths, selecting the
-target mount from `record.client` or the first client when no client is attached.
-It applies mount-observable file operations, dispatches `client_crash` and
-`client_restart` to the E2E client controller, dispatches PostgreSQL and RustFS
-outage/recovery operations through compose service hooks, and executes
-`mounted_only` records through an explicit driver hook for platform-specific
-real-mount probes.
-
-Local commands:
-
-```powershell
-cargo run -p studiofs-scenario --bin studiofs-scenario -- run-corpus --corpus fast --artifact-root target\simulation-counterexamples\fast
-cargo run -p studiofs-scenario --bin studiofs-scenario -- run-corpus --corpus deep --artifact-root target\simulation-counterexamples\deep
-cargo run -p studiofs-scenario --bin studiofs-scenario -- run-corpus --corpus fast --scenario-group namespace-collisions --artifact-root target\simulation-counterexamples\namespace-collisions
-cargo run -p studiofs-scenario --bin studiofs-scenario -- run-corpus --corpus fast --scenario-group crash-restart-replay --seed 13 --artifact-root target\simulation-counterexamples\seed-13
-```
-
-Exploratory local seed sweep:
-
-```powershell
-$groups = @('namespace-collisions','crash-restart-replay','metadata-outage','object-store-outage')
-foreach ($group in $groups) {
-  foreach ($seed in 1..256) {
-    cargo run -q -p studiofs-scenario --bin studiofs-scenario -- run-corpus --corpus deep --scenario-group $group --seed $seed --artifact-root "target\simulation-counterexamples\explore-$group-$seed"
-    if ($LASTEXITCODE -ne 0) { throw "simulation failed for group=$group seed=$seed" }
-  }
-}
-```
-
-Replay a saved counterexample by passing the artifact path to
-`replay-counterexample`; do not use `run-corpus --seed` for exact replay:
-
-```powershell
-cargo run -p studiofs-scenario --bin studiofs-scenario -- replay-counterexample target\simulation-counterexamples\fast\namespace-collisions\seed-13-failure-0.json
-```
-
-RWX commands:
-
-```powershell
-rwx run .rwx/simulation.yml --target simulation-fast --wait --open
-rwx run .rwx/simulation.yml --target simulation-deep --wait --open
-```
-
-On failure, the RWX run uploads the matching counterexample artifact folder:
-`simulation-counterexamples-fast` for `simulation-fast` and
-`simulation-counterexamples-deep` for `simulation-deep`. The CLI output prints
-`artifact_path=<path>` for each failing seed; open the uploaded artifact with
-that relative path and replay it with the artifact's `replay_command`. Replay
-is local and fails if the saved scheduler trace, operation log, event trace,
-violated invariant, or relevant snapshot no longer matches the rerun. Mismatch
-errors include the first differing vector index or a saved/replayed length
-difference to make artifact drift diagnosable.
 
 ## Platform-Gated Unit Tests
 

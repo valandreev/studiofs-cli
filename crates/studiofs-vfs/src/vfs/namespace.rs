@@ -1,20 +1,14 @@
 use super::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-/// Enum $name.
 pub enum NamespacePathStyle {
-    /// Variant $name.
     Posix,
-    /// Variant $name.
     Windows,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/// Struct $name.
 pub struct NamespaceParent {
-    /// Field $name.
     pub parent: Ino,
-    /// Field $name.
     pub name: Vec<u8>,
 }
 
@@ -544,7 +538,6 @@ impl PathShortcutCache {
     }
 }
 
-/// Struct $name.
 pub struct NamespaceResolver<'a> {
     vfs: &'a StudioVfs,
     style: NamespacePathStyle,
@@ -663,18 +656,15 @@ impl<'a> NamespaceResolver<'a> {
         do_resolve()
     }
 
-    /// Function $name.
     pub fn lookup_component(&self, parent: Ino, name: &[u8]) -> VfsResult<InodeAttr> {
         self.vfs.lookup_component_impl(parent, name)
     }
 
-    /// Function $name.
     pub fn resolve_path(&self, path: &str) -> VfsResult<InodeAttr> {
         let components = self.path_components(path);
         self.resolve_components_cached(&components)
     }
 
-    /// Function $name.
     pub fn resolve_parent(&self, path: &str) -> VfsResult<NamespaceParent> {
         let components = self.path_components(path);
         if components.is_empty() {
@@ -694,7 +684,6 @@ impl<'a> NamespaceResolver<'a> {
         })
     }
 
-    /// Function $name.
     pub fn path_for_inode(&self, ino: Ino) -> Option<String> {
         if ino == ROOT_INO {
             return Some(match self.style {
@@ -819,9 +808,7 @@ impl<'a> NamespaceMutationOps<'a> {
     }
 }
 
-/// Trait $name.
 pub trait KernelInvalidator: Send + Sync {
-    /// Function $name.
     fn inval_inode(&self, ino: u64);
 }
 
@@ -1031,7 +1018,6 @@ impl StudioVfs {
         self.state.namespace.path_shortcut_cache.lock().metrics()
     }
 
-    /// Function $name.
     pub fn namespace_resolver(&self, style: NamespacePathStyle) -> NamespaceResolver<'_> {
         NamespaceResolver::new(self, style)
     }
@@ -1040,12 +1026,10 @@ impl StudioVfs {
         NamespaceMutationOps::new(self)
     }
 
-    /// Function $name.
     pub fn set_kernel_invalidator(&self, inv: Arc<dyn KernelInvalidator>) {
         *self.kernel_invalidator.write() = Some(inv);
     }
 
-    /// Function $name.
     pub fn clear_kernel_invalidator(&self) {
         *self.kernel_invalidator.write() = None;
     }

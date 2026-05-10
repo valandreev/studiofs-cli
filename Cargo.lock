@@ -4641,15 +4641,11 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
- "dotenvy",
  "serde",
  "serde_json",
  "sha2",
- "studiofs-scenario",
  "tempfile",
  "thiserror 2.0.18",
- "tokio",
- "tokio-postgres",
  "uuid",
 ]
 
@@ -4691,15 +4687,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "studiofs-scenario"
-version = "0.1.1"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "studiofs-vfs"
 version = "0.1.1"
 dependencies = [
@@ -4718,7 +4705,6 @@ dependencies = [
  "studiofs-cache",
  "studiofs-data",
  "studiofs-meta",
- "studiofs-scenario",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

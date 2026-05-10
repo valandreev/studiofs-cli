@@ -4,7 +4,10 @@ impl MetaAcl for RedbMetaEngine {
     fn set_acl_rule(&self, ino: Ino, principal: &str, access_level: AccessLevel) -> MetaResult<()> {
         let _ = self.get_attr(ino)?;
         let key = encode_acl_rule_key(ino, principal);
-        let txn = self.begin_crash_safe_write()?;
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
         {
             let mut rules = txn
                 .open_table(ACL_RULES_TABLE)
@@ -32,7 +35,10 @@ impl MetaAcl for RedbMetaEngine {
 
     fn remove_acl_rule(&self, ino: Ino, principal: &str) -> MetaResult<()> {
         let key = encode_acl_rule_key(ino, principal);
-        let txn = self.begin_crash_safe_write()?;
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
         {
             let mut rules = txn
                 .open_table(ACL_RULES_TABLE)

@@ -1,7 +1,5 @@
-//! Crate documentation for lint completion.
 use std::cell::RefCell;
 use std::path::PathBuf;
-use std::time::Duration;
 
 use studiofs_e2e::infra::{
     CommandExecutor, CommandOutput, ComposeConfig, DockerComposeStack, InfraError,
@@ -119,7 +117,6 @@ fn compose_stack_lifecycle_collects_logs_and_tears_down_volumes() {
 
     stack.prepare_artifacts().unwrap();
     stack.start(&executor).unwrap();
-    let post_start_checks = stack.post_start_preflight(&executor);
     stack.restart(&executor).unwrap();
     stack.stop_service("postgres", &executor).unwrap();
     stack.start_service("postgres", &executor).unwrap();
@@ -132,17 +129,10 @@ fn compose_stack_lifecycle_collects_logs_and_tears_down_volumes() {
         std::fs::read_to_string(log_path).unwrap(),
         "postgres ready\nrustfs ready\n"
     );
-    assert_eq!(post_start_checks.len(), 1);
-    assert!(
-        post_start_checks
-            .iter()
-            .all(|check| check.passed && check.name.starts_with("host health "))
-    );
     assert_eq!(
         diagnostics,
         vec![
-            "postgres metadata schema dump".to_string(),
-            "postgres metadata data dump".to_string(),
+            "postgres metadata dump".to_string(),
             "rustfs object listing".to_string()
         ]
     );
@@ -154,15 +144,6 @@ fn compose_stack_lifecycle_collects_logs_and_tears_down_volumes() {
         )
         .unwrap(),
         "postgres schema\n"
-    );
-    assert_eq!(
-        std::fs::read_to_string(
-            temp.path()
-                .join("compose-lifecycle")
-                .join("artifacts/docker/postgres-data.sql")
-        )
-        .unwrap(),
-        "postgres data\n"
     );
     assert_eq!(
         std::fs::read_to_string(
@@ -229,13 +210,6 @@ fn compose_stack_lifecycle_collects_logs_and_tears_down_volumes() {
                 .args
                 .contains(&"find /data -mindepth 1 -maxdepth 8 -print | sort".to_string())
     }));
-    let curl_call = calls
-        .iter()
-        .find(|call| call.program == "curl")
-        .expect("host health curl call");
-    assert!(curl_call.args.contains(&"--max-time".to_string()));
-    assert!(curl_call.args.contains(&"5".to_string()));
-    assert_eq!(curl_call.timeout, Some(Duration::from_secs(6)));
 }
 
 #[test]
@@ -266,63 +240,9 @@ fn optional_diagnostics_preserve_stdout_when_command_fails() {
         &std::fs::read(artifact_dir.join("postgres-schema.status.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(status["action"], "postgres metadata schema dump");
+    assert_eq!(status["action"], "postgres metadata dump");
     assert_eq!(status["status"], 17);
     assert_eq!(status["collected"], false);
-    let status: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(artifact_dir.join("postgres-data.status.json")).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(status["action"], "postgres metadata data dump");
-    assert_eq!(status["status"], 17);
-    assert_eq!(status["collected"], false);
-}
-
-#[test]
-fn post_start_preflight_retries_transient_host_rustfs_health_timeout() {
-    let temp = tempdir().unwrap();
-    let stack = DockerComposeStack::new(ComposeConfig {
-        run_id: "compose-transient-host-health".to_string(),
-        sandbox: temp.path().join("compose-transient-host-health"),
-        compose_file: repo_root().join("docker/compose.e2e.yml"),
-        port_range: Some("32300-32310".to_string()),
-        wait_timeout_secs: 120,
-    })
-    .unwrap();
-    let executor = TransientRustfsHealthExecutor::default();
-
-    let checks = stack.post_start_preflight(&executor);
-
-    assert_eq!(checks.len(), 1);
-    assert!(checks.iter().all(|check| check.passed));
-    assert_eq!(*executor.rustfs_health_attempts.borrow(), 2);
-}
-
-#[test]
-fn post_start_preflight_heartbeat_reports_retry_progress() {
-    let temp = tempdir().unwrap();
-    let stack = DockerComposeStack::new(ComposeConfig {
-        run_id: "compose-host-health-progress".to_string(),
-        sandbox: temp.path().join("compose-host-health-progress"),
-        compose_file: repo_root().join("docker/compose.e2e.yml"),
-        port_range: Some("32300-32310".to_string()),
-        wait_timeout_secs: 120,
-    })
-    .unwrap();
-    let executor = TransientRustfsHealthExecutor::default();
-    let mut heartbeats = Vec::new();
-
-    let checks = stack.post_start_preflight_with_heartbeat(
-        &executor,
-        Duration::ZERO,
-        &mut |port, attempts, _elapsed| {
-            heartbeats.push((port.service.clone(), attempts));
-        },
-    );
-
-    assert_eq!(checks.len(), 1);
-    assert!(checks.iter().all(|check| check.passed));
-    assert_eq!(heartbeats, vec![("rustfs".to_string(), 1)]);
 }
 
 #[test]
@@ -372,14 +292,8 @@ struct RecordingExecutor {
 impl CommandExecutor for RecordingExecutor {
     fn run(&self, command: &studiofs_e2e::infra::CommandSpec) -> std::io::Result<CommandOutput> {
         self.calls.borrow_mut().push(command.clone());
-        let stdout = if command.args.contains(&"pg_dump".to_string())
-            && command.args.contains(&"--schema-only".to_string())
-        {
+        let stdout = if command.args.contains(&"pg_dump".to_string()) {
             "postgres schema\n"
-        } else if command.args.contains(&"pg_dump".to_string())
-            && command.args.contains(&"--data-only".to_string())
-        {
-            "postgres data\n"
         } else if command
             .args
             .contains(&"find /data -mindepth 1 -maxdepth 8 -print | sort".to_string())
@@ -410,38 +324,6 @@ impl CommandExecutor for FailingDiagnosticsExecutor {
         Ok(CommandOutput {
             status: 0,
             stdout: "/data/studiofs-e2e/object\n".to_string(),
-            stderr: String::new(),
-        })
-    }
-}
-
-#[derive(Default)]
-struct TransientRustfsHealthExecutor {
-    rustfs_health_attempts: RefCell<usize>,
-}
-
-impl CommandExecutor for TransientRustfsHealthExecutor {
-    fn run(&self, command: &studiofs_e2e::infra::CommandSpec) -> std::io::Result<CommandOutput> {
-        if command.program == "curl"
-            && command
-                .args
-                .iter()
-                .any(|arg| arg == "http://127.0.0.1:32301/health")
-        {
-            let mut attempts = self.rustfs_health_attempts.borrow_mut();
-            *attempts += 1;
-            if *attempts == 1 {
-                return Ok(CommandOutput {
-                    status: 28,
-                    stdout: String::new(),
-                    stderr: "curl: (28) Operation timed out after 5000 milliseconds with 0 bytes received\n"
-                        .to_string(),
-                });
-            }
-        }
-        Ok(CommandOutput {
-            status: 0,
-            stdout: String::new(),
             stderr: String::new(),
         })
     }

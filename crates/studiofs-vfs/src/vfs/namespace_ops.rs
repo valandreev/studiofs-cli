@@ -29,12 +29,10 @@ fn setattr_args_are_size_only(args: &SetattrArgs) -> bool {
 }
 
 impl StudioVfs {
-    /// Function $name.
     pub fn setattr(&self, ino: Ino, args: SetattrArgs) -> VfsResult<InodeAttr> {
         self.setattr_with_handle(None, ino, args)
     }
 
-    /// Function $name.
     pub fn setattr_with_handle(
         &self,
         fh: Option<u64>,
@@ -688,7 +686,6 @@ impl StudioVfs {
         self.dentry_cache_insert_negative(parent, name);
     }
 
-    /// Function $name.
     pub fn heal_dangling_entry_if_inode_missing(
         &self,
         parent: Ino,
@@ -766,13 +763,11 @@ impl StudioVfs {
         }
     }
 
-    /// Function $name.
     pub fn lookup(&self, parent: Ino, name: &[u8]) -> VfsResult<InodeAttr> {
         self.namespace_resolver(NamespacePathStyle::Posix)
             .lookup_component(parent, name)
     }
 
-    /// Function $name.
     pub fn readdir(&self, ino: Ino) -> VfsResult<Vec<DirEntry>> {
         let parent_effective = self.effective_access_level(ino)?;
         if parent_effective == AccessLevel::NoAccess {
@@ -962,7 +957,6 @@ impl StudioVfs {
         Ok(Some(attr))
     }
 
-    /// Function $name.
     pub fn link(&self, ino: Ino, new_parent: Ino, new_name: &[u8]) -> VfsResult<InodeAttr> {
         let namespace_mutations = self.namespace_mutations();
         self.enforce_access(ino, AccessLevel::ReadOnly)?;
@@ -999,7 +993,6 @@ impl StudioVfs {
         Ok(attr)
     }
 
-    /// Function $name.
     pub fn create(
         &self,
         parent: Ino,
@@ -1037,7 +1030,6 @@ impl StudioVfs {
         Ok(attr)
     }
 
-    /// Function $name.
     pub fn mkdir(
         &self,
         parent: Ino,
@@ -1062,7 +1054,6 @@ impl StudioVfs {
         Ok(attr)
     }
 
-    /// Function $name.
     pub fn symlink(
         &self,
         parent: Ino,
@@ -1087,7 +1078,6 @@ impl StudioVfs {
         Ok(attr)
     }
 
-    /// Function $name.
     pub fn readlink(&self, ino: Ino) -> VfsResult<Vec<u8>> {
         self.enforce_access(ino, AccessLevel::ReadOnly)?;
         if matches!(self.ignored_entry_attr(ino), Some(attr) if attr.kind == FileType::Symlink) {
@@ -1096,14 +1086,8 @@ impl StudioVfs {
         Ok(self.sync_meta().get_symlink_target(ino)?)
     }
 
-    /// Function $name.
     pub fn unlink(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
-        Self::run_sync_future(self.unlink_async(parent, name))
-    }
-
-    /// Function $name.
-    pub async fn unlink_async(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
-        self.unlink_inner(parent, name).await
+        Self::run_sync_future(self.unlink_inner(parent, name))
     }
 
     async fn unlink_inner(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
@@ -1139,17 +1123,7 @@ impl StudioVfs {
         Ok(())
     }
 
-    /// Function $name.
     pub fn rmdir(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
-        self.rmdir_inner(parent, name)
-    }
-
-    /// Function $name.
-    pub async fn rmdir_async(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
-        self.rmdir_inner(parent, name)
-    }
-
-    fn rmdir_inner(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
         let namespace_mutations = self.namespace_mutations();
         self.enforce_access(parent, AccessLevel::ReadWrite)?;
         if self.unlink_ignored_subtree(parent, name) || self.ignored_dir_attr(parent).is_some() {
@@ -1170,7 +1144,6 @@ impl StudioVfs {
         Ok(())
     }
 
-    /// Function $name.
     pub fn rename(
         &self,
         parent: Ino,
@@ -1178,18 +1151,7 @@ impl StudioVfs {
         new_parent: Ino,
         new_name: &[u8],
     ) -> VfsResult<()> {
-        Self::run_sync_future(self.rename_async(parent, name, new_parent, new_name))
-    }
-
-    /// Function $name.
-    pub async fn rename_async(
-        &self,
-        parent: Ino,
-        name: &[u8],
-        new_parent: Ino,
-        new_name: &[u8],
-    ) -> VfsResult<()> {
-        self.rename_inner(parent, name, new_parent, new_name).await
+        Self::run_sync_future(self.rename_inner(parent, name, new_parent, new_name))
     }
 
     async fn rename_inner(

@@ -2086,7 +2086,7 @@ impl StudioVfs {
         }
     }
 
-    pub(super) fn shutdown_dirty_inodes_by_priority(&self) -> Vec<Ino> {
+    fn shutdown_dirty_inodes_by_priority(&self) -> Vec<Ino> {
         let mut ordered = Vec::new();
         let mut seen = BTreeSet::new();
         Self::append_unique_dirty_inodes(

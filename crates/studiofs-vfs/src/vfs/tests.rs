@@ -14,9 +14,6 @@ use studiofs_meta::schema::{
 use studiofs_meta::{
     FileLockLease, HardLockKind, MetaEngine, MetaFormat, MetaFsOps, RedbMetaEngine,
 };
-use studiofs_scenario::{
-    OperationOutcome, ScenarioOperation, ScenarioOperationRecord, SimulationSupport,
-};
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
 
@@ -242,127 +239,6 @@ fn contract_vfs_harness_drop_inside_tokio_runtime_does_not_panic() {
         result.is_ok(),
         "dropping a contract VFS fixture inside an existing Tokio runtime should not panic"
     );
-}
-
-#[test]
-fn contract_vfs_replays_shared_scenario_operation_records() {
-    let mut fixture =
-        ContractVfsFixture::new("vfs-contract-scenario-replay").expect("create fixture");
-    let records = vec![
-        ScenarioOperationRecord::new(
-            "contract-replay",
-            1,
-            ScenarioOperation::CreateDirectory {
-                path: "dir".to_string(),
-            },
-        ),
-        ScenarioOperationRecord::new(
-            "contract-replay",
-            2,
-            ScenarioOperation::CreateFile {
-                path: "dir/file.txt".to_string(),
-                bytes: Some(3),
-            },
-        ),
-        ScenarioOperationRecord::new(
-            "contract-replay",
-            3,
-            ScenarioOperation::Write {
-                path: "dir/file.txt".to_string(),
-                offset: Some(1),
-                bytes: 2,
-                checksum_sha256: None,
-            },
-        ),
-        ScenarioOperationRecord::new(
-            "contract-replay",
-            4,
-            ScenarioOperation::Fsync {
-                path: "dir/file.txt".to_string(),
-            },
-        ),
-        ScenarioOperationRecord::new(
-            "contract-replay",
-            5,
-            ScenarioOperation::Rename {
-                from: "dir/file.txt".to_string(),
-                to: "dir/final.txt".to_string(),
-            },
-        ),
-        ScenarioOperationRecord::new(
-            "contract-replay",
-            6,
-            ScenarioOperation::Stat {
-                path: "dir/final.txt".to_string(),
-            },
-        ),
-        ScenarioOperationRecord::new(
-            "contract-replay",
-            7,
-            ScenarioOperation::Read {
-                path: "dir/final.txt".to_string(),
-                bytes: Some(3),
-                checksum_sha256: None,
-            },
-        ),
-        ScenarioOperationRecord::new(
-            "contract-replay",
-            8,
-            ScenarioOperation::Readdir {
-                path: "dir".to_string(),
-            },
-        ),
-        ScenarioOperationRecord::new(
-            "contract-replay",
-            9,
-            ScenarioOperation::Unlink {
-                path: "dir/final.txt".to_string(),
-            },
-        ),
-        ScenarioOperationRecord::new(
-            "contract-replay",
-            10,
-            ScenarioOperation::Rmdir {
-                path: "dir".to_string(),
-            },
-        ),
-        ScenarioOperationRecord::new(
-            "contract-replay",
-            11,
-            ScenarioOperation::SchedulerCheckpoint {
-                name: "after-delete".to_string(),
-            },
-        )
-        .with_outcome(OperationOutcome::Observed),
-        ScenarioOperationRecord::new(
-            "contract-replay",
-            12,
-            ScenarioOperation::MountedOnly {
-                name: "platform-probe".to_string(),
-                reason: "requires a mounted filesystem".to_string(),
-            },
-        )
-        .with_simulation_support(SimulationSupport::Unsupported {
-            reason: "requires a mounted filesystem".to_string(),
-        }),
-    ];
-
-    let report = fixture
-        .replay_operation_records(&records)
-        .expect("replay shared operation records");
-
-    assert_eq!(report.applied.len(), 10, "{report:#?}");
-    assert_eq!(report.skipped.len(), 2, "{report:#?}");
-    assert!(
-        report
-            .skipped
-            .iter()
-            .any(|record| record.sequence == 11 && record.reason.contains("checkpoint")),
-        "{report:#?}"
-    );
-    fixture
-        .assert_invariants("after shared scenario operation replay")
-        .expect("contract replay invariants");
 }
 
 trait FileGraphMetaFixture {
@@ -1043,7 +919,7 @@ fn startup_replay_rebuilds_runtime_pending_upload_index_from_persisted_state() {
         vfs.cached_store().snapshot_pending_uploads().is_empty(),
         "test setup requires the runtime queue to start empty"
     );
-    vfs.recover_missing_dirty_uploads_from_local_backend();
+    vfs.replay_dirty_uploads_from_local_backend(&[], &[attr.clone()]);
 
     let runtime_pending = vfs.cached_store().snapshot_pending_uploads();
     assert_eq!(runtime_pending.len(), 1);
@@ -1056,147 +932,6 @@ fn startup_replay_rebuilds_runtime_pending_upload_index_from_persisted_state() {
     assert!(
         vfs.cached_store().has_staged_upload(object_id),
         "startup replay should restore upload links so recovered uploads do not depend on cold rereads"
-    );
-}
-
-#[test]
-fn runtime_recovery_rebuilds_missing_dirty_upload_queue() {
-    let tmp = TempDir::new().expect("tempdir");
-    let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "runtime-replay-runtime-uploads");
-
-    let created = vfs
-        .create(1, b"runtime-replay.bin", 0, 0, 0o644)
-        .expect("create test file");
-    let ino = created.ino;
-    let object_id = 7_012;
-    let payload = vec![0xDB; 4096];
-
-    vfs.local_payload_backend()
-        .put(object_id, &payload, false)
-        .expect("persist local payload");
-    vfs.local_payload_backend()
-        .sync_data()
-        .expect("sync local payload");
-
-    let mut attr = meta.get_attr(ino).expect("load test attr");
-    attr.size = payload.len() as u64;
-    attr.committed_size = 0;
-    attr.content_epoch = 9;
-    attr.committed_content_epoch = 8;
-    attr.upload_state = MetaUploadState::Uploading;
-    meta.set_attr(&attr).expect("persist staged attr");
-    meta.stage_payload_slice(
-        ino,
-        0,
-        &PayloadRef::new_partial(object_id, payload.len() as u32),
-    )
-    .expect("persist current payload slice");
-
-    assert!(
-        vfs.cached_store().snapshot_pending_uploads().is_empty(),
-        "test setup requires the runtime queue to start empty"
-    );
-
-    vfs.replay_dirty_uploads_from_local_backend(&[], &[attr.clone()]);
-
-    let runtime_pending = vfs.cached_store().snapshot_pending_uploads();
-    assert_eq!(runtime_pending.len(), 1);
-    assert_eq!(runtime_pending[0].ino, ino);
-    assert_eq!(runtime_pending[0].object_id, object_id);
-}
-
-#[test]
-fn runtime_recovery_restores_uploaded_overlay_progress_without_reupload() {
-    let tmp = TempDir::new().expect("tempdir");
-    let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "runtime-replay-uploaded-overlay");
-
-    let created = vfs
-        .create(1, b"runtime-uploaded-overlay.bin", 0, 0, 0o644)
-        .expect("create test file");
-    let ino = created.ino;
-    let object_id = 7_013;
-    let payload = vec![0xDC; 4096];
-
-    vfs.local_payload_backend()
-        .put(object_id, &payload, false)
-        .expect("persist local payload");
-    vfs.local_payload_backend().mark_uploaded(object_id);
-    vfs.local_payload_backend()
-        .sync_data()
-        .expect("sync local payload");
-
-    let mut attr = meta.get_attr(ino).expect("load test attr");
-    attr.size = payload.len() as u64;
-    attr.committed_size = 0;
-    attr.content_epoch = 9;
-    attr.committed_content_epoch = 8;
-    attr.upload_state = MetaUploadState::Uploading;
-    meta.set_attr(&attr).expect("persist staged attr");
-    meta.stage_payload_slice(
-        ino,
-        0,
-        &PayloadRef::new_partial(object_id, payload.len() as u32),
-    )
-    .expect("persist local-only payload slice");
-
-    assert_eq!(
-        vfs.local_payload_backend().dirty_object_count(),
-        0,
-        "regression setup must not rely on dirty-object replay"
-    );
-    assert_eq!(
-        vfs.local_payload_backend().lifecycle_state(object_id),
-        LocalPayloadLifecycleState::Uploaded,
-        "regression setup should model an object uploaded before metadata progress was restored"
-    );
-    assert!(
-        meta.has_regular_file_overlay_object_if_matches(ino, attr.content_epoch, object_id)
-            .expect("query overlay object"),
-        "regression setup should keep the object in the local overlay graph"
-    );
-    assert!(
-        vfs.cached_store().snapshot_pending_uploads().is_empty(),
-        "test setup requires the runtime upload queue to start empty"
-    );
-    assert_eq!(
-        vfs.cached_store().pending_upload_count(),
-        0,
-        "pending upload count should agree with the empty runtime queue"
-    );
-    assert_eq!(
-        vfs.upload_scheduler.in_flight(),
-        0,
-        "upload scheduler should be idle before recovery"
-    );
-    assert_eq!(
-        meta.get_inode_lifecycle(ino)
-            .expect("load lifecycle before recovery")
-            .expect("lifecycle should exist before recovery")
-            .state,
-        InodeLifecycleState::LocalOnly,
-        "metadata should still consider the uploaded object local-only before recovery"
-    );
-
-    vfs.recover_missing_dirty_uploads_from_local_backend();
-
-    assert!(
-        vfs.cached_store().snapshot_pending_uploads().is_empty(),
-        "uploaded local payload should advance metadata progress without reuploading"
-    );
-    assert_eq!(
-        meta.get_inode_lifecycle(ino)
-            .expect("load lifecycle after recovery")
-            .expect("lifecycle should exist after recovery")
-            .state,
-        InodeLifecycleState::PublishReady
-    );
-    assert!(
-        vfs.state
-            .upload
-            .pending_epoch_finalizations
-            .lock()
-            .contains(&(ino, attr.content_epoch)),
-        "uploaded overlay recovery should queue publication of the restored epoch"
     );
 }
 
@@ -3487,50 +3222,6 @@ fn foreground_read_active_respects_idle_grace_after_last_read() {
     );
 }
 
-#[test]
-fn metadata_invalidation_drops_published_read_plan_cache_entry() {
-    let state = ReadState::new(1);
-    let ino = 42;
-    let mut attr = InodeAttr::new_file(ino, ROOT_INO, 0, 0, 0o644);
-    attr.size = 64;
-    attr.committed_size = 64;
-    attr.content_epoch = 1;
-    attr.committed_content_epoch = 1;
-    attr.upload_state = MetaUploadState::Ready;
-    let key = PublishedReadPlanCacheKey::from_attr(&attr).expect("published read-plan key");
-    let cached_span = studiofs_meta::schema::ResolvedSliceSpan {
-        chunk_id: ChunkId(0),
-        range: SliceRange::new(0, 64).expect("valid range"),
-        source: studiofs_meta::schema::ResolvedSliceSource::Overlay,
-        slice_id: Some(SliceId(0)),
-        slice_order: Some(SliceOrder(0)),
-        payload: Some(PayloadRef::new_partial(91_001, 64)),
-    };
-
-    state.published_read_plan_cache_put(
-        ino,
-        key,
-        0,
-        64,
-        Arc::from(vec![cached_span].into_boxed_slice()),
-    );
-    assert!(
-        state
-            .published_read_plan_cache_get(ino, key, 0, 64)
-            .is_some(),
-        "test setup should cache the original read plan"
-    );
-
-    state.published_read_plan_cache_remove([ino]);
-
-    assert!(
-        state
-            .published_read_plan_cache_get(ino, key, 0, 64)
-            .is_none(),
-        "metadata payload changes must force read-plan re-resolution even when attrs keep the same cache key"
-    );
-}
-
 #[tokio::test]
 async fn foreground_idle_notify_fires_when_last_read_finishes() {
     let state = ReadState::new(1);
@@ -5757,32 +5448,6 @@ fn metadata_payload_diff_detects_removed_objects_for_retained_inode() {
 }
 
 #[test]
-fn remote_namespace_invalidation_drops_parent_dentries_and_generations() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "remote-namespace-parent-invalidation");
-
-    vfs.dentry_cache_insert_negative(ROOT_INO, b"remote-file.txt");
-    assert!(
-        vfs.dentry_cache_lookup(ROOT_INO, b"remote-file.txt")
-            .is_some(),
-        "test should start with a cached negative dentry"
-    );
-    let before_generation = vfs.directory_generation(ROOT_INO);
-
-    vfs.invalidate_remote_namespace_caches([ROOT_INO]);
-
-    assert_eq!(
-        vfs.dentry_cache_lookup(ROOT_INO, b"remote-file.txt"),
-        None,
-        "remote namespace refresh must drop parent dentry cache entries"
-    );
-    assert!(
-        vfs.directory_generation(ROOT_INO) > before_generation,
-        "remote namespace refresh must bump the parent generation used by path caches"
-    );
-}
-
-#[test]
 fn test_rename_over_existing_target_discards_pending_local_state() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "rename-displaced-cleanup");
@@ -7010,94 +6675,6 @@ fn flush_fh_default_config_enforces_strict_local_durability() {
 }
 
 #[test]
-fn winfsp_flush_callback_enforces_strict_local_durability() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let cfg = VfsConfig::default();
-    let (rt, vfs, _meta) =
-        make_test_vfs_with_config(&tmp, "winfsp-flush-callback-durable-local-sync", cfg);
-    let attr = vfs
-        .create(
-            1,
-            b"winfsp-flush-callback-durable-local-sync.txt",
-            0,
-            0,
-            0o644,
-        )
-        .expect("create test file");
-    let ino = attr.ino;
-    let fh = vfs
-        .open_file(ino, OpenFlags::RDWR, false)
-        .expect("open writable handle");
-
-    let mut dirty_attr = vfs.getattr(ino).expect("load attr");
-    dirty_attr.size = 4096;
-    dirty_attr.touch_mtime();
-    dirty_attr.touch_ctime();
-    vfs.state
-        .namespace
-        .dirty_attrs
-        .lock()
-        .insert(ino, dirty_attr.clone());
-
-    rt.block_on(async {
-        let mut group = vfs.state.local_dirty.local_sync_group.lock().await;
-        group.pending_bytes = 4096;
-        group.last_sync_at = Instant::now();
-    });
-
-    let calls_before = vfs
-        .state
-        .metrics
-        .payload_store_sync_data_calls
-        .load(Ordering::Relaxed);
-    let synced_before = vfs
-        .state
-        .metrics
-        .payload_store_sync_data_synced_bytes
-        .load(Ordering::Relaxed);
-
-    rt.block_on(async {
-        vfs.flush_winfsp_writeback_with_outcome(ino, fh)
-            .await
-            .expect("WinFSP flush callback barrier");
-    });
-
-    let calls_after = vfs
-        .state
-        .metrics
-        .payload_store_sync_data_calls
-        .load(Ordering::Relaxed);
-    let synced_after = vfs
-        .state
-        .metrics
-        .payload_store_sync_data_synced_bytes
-        .load(Ordering::Relaxed);
-    assert!(
-        calls_after > calls_before,
-        "WinFSP flush callback must force sync_data when dirty unpublished state remains"
-    );
-    assert!(
-        synced_after >= synced_before + 4096,
-        "WinFSP flush callback should account for pending local durable sync bytes"
-    );
-    rt.block_on(async {
-        let group = vfs.state.local_dirty.local_sync_group.lock().await;
-        assert_eq!(
-            group.pending_bytes, 0,
-            "WinFSP flush callback should drain pending local sync bytes"
-        );
-    });
-    assert!(
-        !vfs.state.namespace.dirty_attrs.lock().contains_key(&ino),
-        "WinFSP flush callback should commit dirty local attr state"
-    );
-
-    rt.block_on(async {
-        vfs.release_fh(fh).await.expect("release handle");
-    });
-}
-
-#[test]
 fn flush_fh_materializes_opportunistic_writer_stack_state_into_overlay_slices() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (rt, vfs, meta) = make_test_vfs(&tmp, "sfs-245-flush-writer-stack");
@@ -7318,53 +6895,6 @@ fn writer_stack_dirty_attrs_keep_nanos_timestamps() {
         );
 
         vfs.release_fh(fh).await.unwrap();
-    });
-}
-
-#[test]
-fn flush_fh_skips_stale_dirty_attr_that_would_shrink_current_size() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let (rt, vfs, meta) = make_test_vfs(&tmp, "flush-fh-stale-dirty-attr-size");
-    let attr = vfs
-        .create(1, b"flush-fh-stale-dirty-attr-size.txt", 0, 0, 0o644)
-        .expect("create test file");
-    let ino = attr.ino;
-    let fh = vfs
-        .open_file(ino, OpenFlags::RDWR, false)
-        .expect("open writable handle");
-
-    let mut current = meta.get_attr(ino).expect("load durable attr");
-    current.size = 1024 * 1024;
-    current.committed_size = current.size;
-    current.committed_content_epoch = current.content_epoch;
-    current.upload_state = MetaUploadState::Ready;
-    meta.set_attr(&current).expect("persist durable attr");
-
-    let mut stale = current.clone();
-    stale.size = 0;
-    stale.committed_size = 0;
-    stale.upload_state = MetaUploadState::Uploading;
-    vfs.state.namespace.dirty_attrs.lock().insert(ino, stale);
-
-    rt.block_on(async {
-        let _outcome = vfs
-            .flush_fh_with_outcome(fh)
-            .await
-            .expect("flush_fh with stale dirty attr");
-    });
-
-    let after = meta.get_attr(ino).expect("reload durable attr");
-    assert_eq!(
-        after.size, current.size,
-        "flush_fh must not shrink durable size using a stale dirty attr"
-    );
-    assert!(
-        !vfs.state.namespace.dirty_attrs.lock().contains_key(&ino),
-        "stale dirty attr should be discarded after it is rejected"
-    );
-
-    rt.block_on(async {
-        vfs.release_fh(fh).await.expect("release handle");
     });
 }
 
@@ -7752,80 +7282,6 @@ fn deferred_materialization_reschedules_write_that_arrives_while_inflight_finish
         .expect("finishing materializer should reschedule dirty writer-stack state");
 
         vfs.release_fh(fh).await.unwrap();
-    });
-}
-
-#[test]
-fn winfsp_style_overwrite_then_deferred_write_persists_visible_size() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let (rt, vfs, meta) = make_test_vfs(&tmp, "winfsp-overwrite-deferred-size");
-    let _guard = rt.enter();
-    rt.block_on(async {
-        let attr = vfs
-            .create(1, b"winfsp-overwrite-deferred-size.bin", 0, 0, 0o644)
-            .expect("create");
-        let ino = attr.ino;
-        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).expect("open");
-        let payload = vec![0xE5; vfs.block_size as usize / 2];
-
-        vfs.setattr_with_handle(Some(fh), ino, SetattrArgs::size_only(0))
-            .expect("WinFSP overwrite logical-size reset");
-        vfs.write_fh_with_deferred_materialize(
-            fh,
-            ino,
-            0,
-            &payload,
-            LocalSyncPolicy::Opportunistic,
-        )
-        .await
-        .expect("deferred write");
-
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if vfs.state.writer_stack.dirty_bytes_for_inode(ino) == 0
-                    && !vfs.pending_uploads_for_inode(ino).is_empty()
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("background materialization should publish local metadata");
-
-        let visible_attr = vfs.getattr(ino).expect("visible attr");
-        assert_eq!(visible_attr.size, payload.len() as u64);
-        let durable_attr = meta.get_attr(ino).expect("durable attr");
-        assert_eq!(
-            durable_attr.size,
-            payload.len() as u64,
-            "remount must not collapse a deferred WinFSP write back to the overwrite size"
-        );
-
-        let (content_epoch, _object_ids) = mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
-        for pending in vfs.pending_uploads_snapshot() {
-            if pending.ino == ino && pending.content_epoch == content_epoch {
-                vfs.cached_store().complete_upload(&pending);
-            }
-        }
-        assert!(
-            vfs.pending_uploads_for_inode(ino).is_empty(),
-            "setup should simulate completed local uploads"
-        );
-        publish_current_file_graph(&meta, ino, content_epoch, &[]);
-        let published_attr = meta.get_attr(ino).expect("published attr");
-        assert_eq!(
-            published_attr.size,
-            payload.len() as u64,
-            "upload finalization must preserve the visible file size"
-        );
-        assert_eq!(
-            published_attr.committed_size,
-            payload.len() as u64,
-            "published base graph should cover the complete file"
-        );
-
-        vfs.release_fh(fh).await.expect("release");
     });
 }
 

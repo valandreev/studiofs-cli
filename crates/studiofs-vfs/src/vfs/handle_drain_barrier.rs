@@ -2,22 +2,15 @@ use super::{ExplicitFlushOutcome, ReleaseFhOutcome, VfsError, VfsResult};
 use studiofs_meta::types::Ino;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// Struct $name.
 pub struct HandleDrainRequest {
-    /// Field $name.
     pub ino: Ino,
-    /// Field $name.
     pub fh: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/// Struct $name.
 pub struct HandleDrainDeleteRequest {
-    /// Field $name.
     pub ino: Ino,
-    /// Field $name.
     pub parent_ino: Ino,
-    /// Field $name.
     pub name: Vec<u8>,
     /// The bridge passes the callback's delete intent explicitly so the delete
     /// adapter can choose `unlink` vs `rmdir` without reloading inode state
@@ -25,68 +18,45 @@ pub struct HandleDrainDeleteRequest {
     pub is_dir: bool,
 }
 
-/// Trait $name.
 pub trait LocalSyncBarrierPort {
-    /// Function $name.
     fn inode_has_local_dirty_state(&self, ino: Ino) -> bool;
 
-    /// Function $name.
     fn explicit_flush(&self, request: HandleDrainRequest) -> VfsResult<ExplicitFlushOutcome>;
 }
 
-/// Trait $name.
 pub trait HandleReleasePort {
-    /// Function $name.
     fn release_handle(&self, request: HandleDrainRequest) -> VfsResult<ReleaseFhOutcome>;
 }
 
-/// Trait $name.
 pub trait DeferredCleanupHintPort {
-    /// Function $name.
     fn set_deferred_cleanup_hint(&self, ino: Ino);
 
-    /// Function $name.
     fn clear_deferred_cleanup_hint(&self, ino: Ino);
 
-    /// Function $name.
     fn take_deferred_cleanup_hint(&self, ino: Ino) -> bool;
 
-    /// Function $name.
     fn has_deferred_cleanup_hint(&self, ino: Ino) -> bool;
 }
 
-/// Trait $name.
 pub trait FlushGatePort {
-    /// Function $name.
     fn with_flush_gate<T, F>(&self, ino: Ino, op: F) -> VfsResult<T>
     where
         F: FnOnce() -> VfsResult<T>;
 }
 
-/// Trait $name.
 pub trait DeleteCleanupPort {
-    /// Function $name.
     fn cleanup_delete(&self, request: HandleDrainDeleteRequest);
 }
 
-/// Trait $name.
 pub trait BarrierObservabilityPort {
-    /// Function $name.
     fn note_cleanup_callback(&self);
 
-    /// Function $name.
     fn note_flush_callback(&self);
 
-    /// Function $name.
-    fn note_cleanup_barrier_outcome(&self, flushed_local_dirty_state: bool);
-
-    /// Function $name.
     fn note_flush_barrier_outcome(&self, flushed_local_dirty_state: bool);
 
-    /// Function $name.
     fn note_close_callback(&self);
 
-    /// Function $name.
     fn note_release_success(
         &self,
         request: HandleDrainRequest,
@@ -94,7 +64,6 @@ pub trait BarrierObservabilityPort {
         outcome: ReleaseFhOutcome,
     );
 
-    /// Function $name.
     fn note_release_error(
         &self,
         request: HandleDrainRequest,
@@ -103,7 +72,6 @@ pub trait BarrierObservabilityPort {
     );
 }
 
-/// Struct $name.
 pub struct HandleDrainBarrier<
     LocalSync,
     HandleRelease,
@@ -137,7 +105,6 @@ where
     DeleteCleanup: DeleteCleanupPort,
     Observability: BarrierObservabilityPort,
 {
-    /// Function $name.
     pub fn new(
         local_sync: LocalSync,
         handle_release: HandleRelease,
@@ -156,7 +123,6 @@ where
         }
     }
 
-    /// Function $name.
     pub fn on_flush(&self, request: HandleDrainRequest) -> VfsResult<()> {
         self.observability.note_flush_callback();
         let flushed = self.flush_gate.with_flush_gate(request.ino, || {
@@ -172,30 +138,14 @@ where
         Ok(())
     }
 
-    /// Function $name.
     pub fn on_cleanup_non_delete(&self, request: HandleDrainRequest) {
         self.observability.note_cleanup_callback();
-        if request.fh == 0 {
+        if request.fh != 0 && self.local_sync.inode_has_local_dirty_state(request.ino) {
             self.deferred_cleanup_hints
-                .clear_deferred_cleanup_hint(request.ino);
-            return;
+                .set_deferred_cleanup_hint(request.ino);
         }
-        let flushed = self
-            .flush_gate
-            .with_flush_gate(request.ino, || {
-                if !self.local_sync.inode_has_local_dirty_state(request.ino) {
-                    return Ok(false);
-                }
-                let outcome = self.local_sync.explicit_flush(request)?;
-                Ok(outcome.flushed_local_dirty_state)
-            })
-            .unwrap_or(false);
-        self.observability.note_cleanup_barrier_outcome(flushed);
-        self.deferred_cleanup_hints
-            .clear_deferred_cleanup_hint(request.ino);
     }
 
-    /// Function $name.
     pub fn on_close(&self, request: HandleDrainRequest) {
         self.observability.note_close_callback();
         if request.fh == 0 {
@@ -207,12 +157,10 @@ where
         let _ = self.try_release(request);
     }
 
-    /// Function $name.
     pub fn on_release(&self, request: HandleDrainRequest) -> VfsResult<()> {
         self.try_release(request)
     }
 
-    /// Function $name.
     pub fn on_cleanup_delete(&self, request: HandleDrainDeleteRequest) {
         self.observability.note_cleanup_callback();
         self.delete_cleanup.cleanup_delete(request);
@@ -294,7 +242,6 @@ mod tests {
         cleanup_callbacks: AtomicUsize,
         flush_callbacks: AtomicUsize,
         close_callbacks: AtomicUsize,
-        cleanup_barrier_outcomes: Mutex<Vec<bool>>,
         flush_barrier_outcomes: Mutex<Vec<bool>>,
         release_successes: Mutex<Vec<(HandleDrainRequest, bool, ReleaseFhOutcome)>>,
         release_errors: Mutex<Vec<(HandleDrainRequest, bool, String)>>,
@@ -397,12 +344,6 @@ mod tests {
             self.flush_callbacks.fetch_add(1, Ordering::Relaxed);
         }
 
-        fn note_cleanup_barrier_outcome(&self, flushed_local_dirty_state: bool) {
-            self.cleanup_barrier_outcomes
-                .lock()
-                .push(flushed_local_dirty_state);
-        }
-
         fn note_flush_barrier_outcome(&self, flushed_local_dirty_state: bool) {
             self.flush_barrier_outcomes
                 .lock()
@@ -478,7 +419,7 @@ mod tests {
     }
 
     #[test]
-    fn non_delete_cleanup_flushes_dirty_handles() {
+    fn non_delete_cleanup_defers_only_for_dirty_handles() {
         let ports = Arc::new(FakePorts::default());
         ports.mark_dirty(13);
         let barrier = barrier(ports.clone());
@@ -486,16 +427,9 @@ mod tests {
         barrier.on_cleanup_non_delete(HandleDrainRequest { ino: 13, fh: 3 });
         barrier.on_cleanup_non_delete(HandleDrainRequest { ino: 14, fh: 0 });
 
-        assert!(!ports.inode_has_local_dirty_state(13));
-        assert!(!ports.has_deferred_cleanup_hint(13));
+        assert!(ports.has_deferred_cleanup_hint(13));
         assert!(!ports.has_deferred_cleanup_hint(14));
         assert_eq!(ports.cleanup_callbacks.load(Ordering::Relaxed), 2);
-        assert_eq!(
-            ports.flush_calls.lock().as_slice(),
-            &[HandleDrainRequest { ino: 13, fh: 3 }]
-        );
-        assert_eq!(ports.cleanup_barrier_outcomes.lock().as_slice(), &[true]);
-        assert!(ports.flush_barrier_outcomes.lock().is_empty());
     }
 
     #[test]
@@ -554,7 +488,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_cleanup_callbacks_flush_once_then_clean_skip() {
+    fn repeated_cleanup_callbacks_do_not_add_barriers() {
         let ports = Arc::new(FakePorts::default());
         ports.mark_dirty(18);
         let barrier = barrier(ports.clone());
@@ -563,11 +497,6 @@ mod tests {
         barrier.on_cleanup_non_delete(HandleDrainRequest { ino: 18, fh: 2 });
 
         assert_eq!(ports.cleanup_callbacks.load(Ordering::Relaxed), 2);
-        assert_eq!(ports.flush_calls.lock().len(), 1);
-        assert_eq!(
-            ports.cleanup_barrier_outcomes.lock().as_slice(),
-            &[true, false]
-        );
         assert!(ports.flush_barrier_outcomes.lock().is_empty());
     }
 

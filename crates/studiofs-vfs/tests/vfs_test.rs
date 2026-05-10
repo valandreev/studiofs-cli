@@ -9710,53 +9710,6 @@ fn make_local_zeroio_test_vfs(
     (meta, data_config, vfs)
 }
 
-fn seed_local_committed_file(
-    meta: &Arc<RedbMetaEngine>,
-    vfs: &Arc<StudioVfs>,
-    format_info: &FormatInfo,
-    name: &[u8],
-    payload: &[u8],
-) -> (u64, Vec<(u32, PayloadRef)>) {
-    let attr = meta.create_file(1, name, 0, 0, 0o644).unwrap();
-    let ino = attr.ino;
-    let mut file_attr = meta.get_attr(ino).unwrap();
-    file_attr.size = payload.len() as u64;
-    meta.set_attr(&file_attr).unwrap();
-
-    let block_size = format_info.block_size as usize;
-    let block_count = payload.len().div_ceil(block_size);
-    let object_ids = meta.next_object_ids(block_count as u32).unwrap();
-
-    for (block_index, chunk) in payload.chunks(block_size).enumerate() {
-        let object_id = object_ids[block_index];
-        vfs.local_payload_backend()
-            .put(object_id, chunk, false)
-            .unwrap();
-        vfs.local_payload_backend().mark_uploaded(object_id);
-
-        let block_ref = if chunk.len() == block_size {
-            PayloadRef::new_full(object_id, chunk.len() as u32)
-        } else {
-            PayloadRef::new_partial(object_id, chunk.len() as u32)
-        };
-        meta.stage_payload_slice(ino, block_index as u32, &block_ref)
-            .unwrap();
-        assert!(
-            meta.publish_uploaded_slice_object(
-                ino,
-                block_index as u32,
-                file_attr.content_epoch,
-                &block_ref
-            )
-            .unwrap(),
-            "seeded local committed payload slice should satisfy metadata preconditions"
-        );
-    }
-    vfs.local_payload_backend().sync_data().unwrap();
-
-    (ino, meta.lookup_payload_slices(ino).unwrap())
-}
-
 #[test]
 fn write_returns_after_small_new_file_is_locally_readable_until_flush() {
     let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
@@ -9837,8 +9790,10 @@ fn write_returns_after_small_new_file_is_locally_readable_until_flush() {
 #[test]
 fn overwrite_of_published_file_is_locally_readable_without_flush() {
     let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
+    let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
     unsafe {
         std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "60000");
     }
 
     let tmp = tempfile::tempdir().unwrap();
@@ -9869,13 +9824,12 @@ fn overwrite_of_published_file_is_locally_readable_without_flush() {
         vfs.start()
             .expect("failed to start StudioVfs background workers");
 
-        let (ino, _) = seed_local_committed_file(
-            &meta,
-            &vfs,
-            &format_info,
-            b"zeroio-overwrite.bin",
-            &baseline_payload,
-        );
+        let attr = vfs.create(1, b"zeroio-overwrite.bin", 0, 0, 0o644).unwrap();
+        let ino = attr.ino;
+        vfs.write(ino, 0, &baseline_payload).await.unwrap();
+        vfs.flush(ino).await.unwrap();
+        wait_until_payload_slices(&vfs, ino, Duration::from_secs(15))
+            .expect("baseline file must commit before overwrite test");
 
         let published_before = meta.get_attr(ino).unwrap();
         let published_epoch = published_before.committed_content_epoch;
@@ -9916,8 +9870,10 @@ fn overwrite_of_published_file_is_locally_readable_without_flush() {
 #[test]
 fn truncate_of_published_file_keeps_committed_size_and_pending_incarnation() {
     let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
+    let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
     unsafe {
         std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "60000");
     }
 
     let tmp = tempfile::tempdir().unwrap();
@@ -9948,13 +9904,14 @@ fn truncate_of_published_file_keeps_committed_size_and_pending_incarnation() {
         vfs.start()
             .expect("failed to start StudioVfs background workers");
 
-        let (ino, _) = seed_local_committed_file(
-            &meta,
-            &vfs,
-            &format_info,
-            b"zeroio-published-truncate.bin",
-            &baseline_payload,
-        );
+        let attr = vfs
+            .create(1, b"zeroio-published-truncate.bin", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        vfs.write(ino, 0, &baseline_payload).await.unwrap();
+        vfs.flush(ino).await.unwrap();
+        wait_until_payload_slices(&vfs, ino, Duration::from_secs(15))
+            .expect("baseline file must commit before truncate test");
 
         let published_before = meta.get_attr(ino).unwrap();
         let published_epoch = published_before.committed_content_epoch;

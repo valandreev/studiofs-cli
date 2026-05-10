@@ -17,8 +17,6 @@ use studiofs_meta::{
 use tracing::info;
 use uuid::Uuid;
 
-use super::redaction::redact_postgres_dsn;
-
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 #[cfg(unix)]
@@ -574,7 +572,7 @@ fn run(request: InitRunRequest) -> anyhow::Result<()> {
     println!("  Data bucket:   {}", object_store.bucket);
     if let Some(pg) = &format_info.metadata.postgres {
         println!("  Metadata backend: Postgres");
-        println!("  Meta: {}", redact_postgres_dsn(&pg.url));
+        println!("  Postgres: {}", pg.url);
         println!("  Volume ID: {}", pg.volume_id);
     }
     println!("  Metadata:   {:?}", db_path);

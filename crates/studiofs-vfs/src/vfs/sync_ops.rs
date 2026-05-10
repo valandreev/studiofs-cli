@@ -613,7 +613,6 @@ impl StudioVfs {
         result
     }
 
-    /// Function $name.
     pub fn release_fh_with_deferred_last_handle_barrier(
         self: &Arc<Self>,
         fh: u64,
@@ -649,52 +648,10 @@ impl StudioVfs {
         }
     }
 
-    /// Function $name.
     pub async fn flush_winfsp_writeback_with_outcome(
         self: &Arc<Self>,
         ino: Ino,
         fh: u64,
-    ) -> VfsResult<ExplicitFlushOutcome> {
-        self.flush_winfsp_writeback_with_policy(ino, fh, None).await
-    }
-
-    /// Drains WinFSP buffered writeback without forcing payload backend sync data.
-    pub async fn flush_winfsp_buffered_writeback_with_outcome(
-        self: &Arc<Self>,
-        ino: Ino,
-        fh: u64,
-    ) -> VfsResult<ExplicitFlushOutcome> {
-        self.flush_winfsp_writeback_with_policy(ino, fh, Some(LocalSyncPolicy::Opportunistic))
-            .await
-    }
-
-    /// Flushes every dirty inode for WinFSP volume-level flush callbacks.
-    pub async fn flush_winfsp_volume_writeback_with_outcome(
-        self: &Arc<Self>,
-    ) -> VfsResult<ExplicitFlushOutcome> {
-        self.note_winfsp_flush_callback();
-        let dirty_inodes = self.shutdown_dirty_inodes_by_priority();
-        let mut flushed_local_dirty_state = false;
-
-        for ino in dirty_inodes {
-            if !self.inode_has_local_dirty_state(ino) {
-                continue;
-            }
-            let outcome = self.flush_winfsp_writeback_with_outcome(ino, 0).await?;
-            flushed_local_dirty_state |= outcome.flushed_local_dirty_state;
-        }
-
-        self.note_winfsp_flush_barrier_outcome(flushed_local_dirty_state);
-        Ok(ExplicitFlushOutcome {
-            flushed_local_dirty_state,
-        })
-    }
-
-    async fn flush_winfsp_writeback_with_policy(
-        self: &Arc<Self>,
-        ino: Ino,
-        fh: u64,
-        local_sync_policy: Option<LocalSyncPolicy>,
     ) -> VfsResult<ExplicitFlushOutcome> {
         let target_ino = if fh != 0 {
             self.handle_table.get(fh).map(|open_file| open_file.ino)
@@ -711,8 +668,7 @@ impl StudioVfs {
             let outcome = self
                 .local_sync_barrier_with_outcome(
                     target_ino,
-                    local_sync_policy
-                        .unwrap_or_else(|| self.local_sync_policy_for_barrier(target_ino)),
+                    LocalSyncPolicy::Opportunistic,
                     StickyErrorPolicy::Ignore,
                     DirtyAttrPersistPolicy::PersistIfPresent,
                 )
@@ -785,40 +741,16 @@ impl StudioVfs {
             self.fail_inline_dirty_attr_persist_for_test()?;
             let meta = self.meta.clone();
             let attr_to_persist = attr.clone();
-            let persisted = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
-                if let Ok(current) = engine.get_attr(attr_to_persist.ino)
-                    && current.kind == FileType::RegularFile
-                    && attr_to_persist.kind == FileType::RegularFile
-                    && current.content_epoch >= attr_to_persist.content_epoch
-                    && current.size > attr_to_persist.size
-                {
-                    return Ok(false);
-                }
-                engine.set_attr(&attr_to_persist)?;
-                Ok(true)
+            run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+                engine.set_attr(&attr_to_persist)
             })
             .await?;
-            if persisted {
-                self.clear_matching_dirty_attr_if_committed(ino, &attr);
-            } else {
-                self.state.namespace.dirty_attrs.lock().remove(&ino);
-            }
+            self.clear_matching_dirty_attr_if_committed(ino, &attr);
             self.state.namespace.attr_read_cache.lock().remove(ino);
-            persisted
+            true
         } else {
             false
         };
-
-        // The metadata mutations above already use crash-safe redb transactions,
-        // but the mounted crash/remount boundary can immediately kill the
-        // process after this barrier. Force a local metadata checkpoint so redb
-        // recovery does not reopen a namespace/base-slice state that lags the
-        // payload object we just made durable.
-        if flushed_file_data || persisted_dirty_attrs {
-            self.sync_meta()
-                .flush_local_metadata()
-                .map_err(VfsError::Meta)?;
-        }
 
         if matches!(sticky_error_policy, StickyErrorPolicy::Report) {
             self.ensure_no_upload_sticky_error(ino)?;
@@ -845,9 +777,8 @@ impl StudioVfs {
     }
 
     fn local_sync_policy_for_barrier(&self, ino: Ino) -> LocalSyncPolicy {
-        let has_pending_local_state = self.inode_has_local_dirty_state(ino)
-            || self.state.writer_stack.has_dirty_writers(ino)
-            || self.total_pending_persisted_local_dirty_slice_bytes() > 0;
+        let has_pending_local_state =
+            self.inode_has_local_dirty_state(ino) || self.state.writer_stack.has_dirty_writers(ino);
         if has_pending_local_state {
             LocalSyncPolicy::Strict
         } else {
@@ -929,7 +860,6 @@ impl StudioVfs {
         result
     }
 
-    /// Function $name.
     pub async fn flush_fh(&self, fh: u64) -> VfsResult<()> {
         self.flush_fh_with_outcome(fh).await.map(|_| ())
     }
@@ -1018,7 +948,6 @@ impl StudioVfs {
             .await
     }
 
-    /// Function $name.
     pub async fn write_fh_with_local_sync_policy(
         &self,
         fh: u64,
@@ -1115,9 +1044,6 @@ impl StudioVfs {
             }
             if local_sync_policy.requires_write_path_durability() {
                 self.flush_local_dirty_state(ino, local_sync_policy).await?;
-                self.sync_meta()
-                    .flush_local_metadata()
-                    .map_err(VfsError::Meta)?;
             }
             Ok(written)
         }
@@ -1249,20 +1175,25 @@ impl StudioVfs {
                 // Durability-required: await writer-stack materialization inline.
                 self.wait_for_deferred_materialization_inflight(ino).await;
                 let materialize_strict_started = Instant::now();
-                let materialize_result = self.materialize_writer_stack_for_limits(ino).await;
+                let materialized_bytes = match self.materialize_writer_stack_for_limits(ino).await {
+                    Ok(materialized_bytes) => materialized_bytes,
+                    Err(e) => {
+                        drop(session);
+                        self.state.file_session.gc_if_idle(ino);
+                        return Err(e);
+                    }
+                };
                 self.record_vfs_write_materialize_strict(materialize_strict_started.elapsed());
-                if let Err(e) = materialize_result {
+
+                if let Err(e) = self.flush_local_dirty_state(ino, local_sync_policy).await {
                     drop(session);
                     self.state.file_session.gc_if_idle(ino);
                     return Err(e);
                 }
-
                 if let Err(e) = self
-                    .local_sync_barrier_with_outcome(
-                        ino,
+                    .maybe_payload_store_sync_data_async(
+                        materialized_bytes as u64,
                         local_sync_policy,
-                        StickyErrorPolicy::Ignore,
-                        DirtyAttrPersistPolicy::PersistIfPresent,
                     )
                     .await
                 {

@@ -8,7 +8,6 @@ use crate::{JanitorMeta, VfsMeta};
 
 struct MetadataTraversalSnapshot {
     inodes: HashSet<Ino>,
-    directories: HashSet<Ino>,
     payloads: HashMap<Ino, Vec<u64>>,
 }
 
@@ -341,7 +340,6 @@ impl StudioVfs {
         engine: &M,
     ) -> MetaResult<MetadataTraversalSnapshot> {
         let mut seen = HashSet::from([ROOT_INO]);
-        let mut directories = HashSet::new();
         let mut stack = vec![ROOT_INO];
         let mut payloads = HashMap::new();
 
@@ -353,7 +351,6 @@ impl StudioVfs {
             };
             match attr.kind {
                 FileType::Directory => {
-                    directories.insert(ino);
                     let entries = match engine.readdir(ino) {
                         Ok(entries) => entries,
                         Err(MetaError::InodeNotFound(_)) => continue,
@@ -383,7 +380,6 @@ impl StudioVfs {
 
         Ok(MetadataTraversalSnapshot {
             inodes: seen,
-            directories,
             payloads,
         })
     }
@@ -492,25 +488,6 @@ impl StudioVfs {
         removed
     }
 
-    pub(super) fn invalidate_remote_namespace_caches(
-        &self,
-        parents: impl IntoIterator<Item = Ino>,
-    ) {
-        let mut seen = HashSet::new();
-        let mut unique_parents = Vec::new();
-        for parent in parents {
-            if seen.insert(parent) {
-                self.dentry_cache_invalidate_parent(parent);
-                unique_parents.push(parent);
-            }
-        }
-        if unique_parents.is_empty() {
-            self.bump_namespace_epoch();
-        } else {
-            self.bump_namespace_for_parents(unique_parents);
-        }
-    }
-
     async fn wait_for_metadata_invalidation_notify(notifier: Option<&Arc<tokio::sync::Notify>>) {
         if let Some(notifier) = notifier {
             notifier.notified().await;
@@ -525,7 +502,6 @@ impl StudioVfs {
         let mut last_namespace_token = meta.namespace_version_token();
         let mut last_metadata_token = meta.metadata_version_token();
         let mut last_snapshot: HashSet<Ino> = HashSet::new();
-        let mut last_directory_snapshot: HashSet<Ino> = HashSet::new();
         let mut last_payload_snapshot = HashMap::<Ino, Vec<u64>>::new();
 
         if last_namespace_token.is_some() || last_metadata_token.is_some() {
@@ -536,7 +512,6 @@ impl StudioVfs {
             .await
             {
                 last_snapshot = snapshot.inodes;
-                last_directory_snapshot = snapshot.directories;
                 last_payload_snapshot = snapshot.payloads;
             }
         }
@@ -613,19 +588,13 @@ impl StudioVfs {
             let mut to_invalidate = last_snapshot.clone();
             to_invalidate.extend(current_snapshot.inodes.iter().copied());
             self.invalidate_attr_read_cache(to_invalidate.iter().copied());
-            self.state
-                .read
-                .published_read_plan_cache_remove(to_invalidate.iter().copied());
             self.invalidate_kernel_inodes(to_invalidate.iter().copied());
             if namespace_changed {
-                let mut namespace_dirs = last_directory_snapshot.clone();
-                namespace_dirs.extend(current_snapshot.directories.iter().copied());
-                self.invalidate_remote_namespace_caches(namespace_dirs);
+                self.bump_namespace_epoch();
             }
             if namespace_changed || metadata_changed {
                 self.bump_acl_namespace_epoch();
             }
-            last_directory_snapshot = current_snapshot.directories;
             last_snapshot = current_snapshot.inodes;
             last_payload_snapshot = current_snapshot.payloads;
         }
@@ -715,9 +684,6 @@ impl StudioVfs {
             let local_backend_dirty_count = self.local_payload_backend.dirty_object_count();
             let transit_memory = self.transit_memory_budget.snapshot();
             let file_sessions = self.file_session_stats();
-            if pending == 0 && active_uploads == 0 {
-                self.recover_missing_dirty_uploads_from_local_backend();
-            }
 
             if should_log {
                 ticks_since_last_log = 0;

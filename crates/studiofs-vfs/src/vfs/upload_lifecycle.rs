@@ -19,10 +19,6 @@ fn shutdown_recoverable_on_restart(
     dirty_after == 0 && local_payload_sync_ok && metadata_flush_outcome == "success"
 }
 
-fn should_wait_for_upload_drain(pending_uploads: usize, active_uploads: usize) -> bool {
-    pending_uploads > 0 || active_uploads > 0
-}
-
 impl StudioVfs {
     pub(super) fn track_background_task(&self, handle: JoinHandle<()>) {
         self.state.shutdown.background_tasks.lock().push(handle);
@@ -123,7 +119,6 @@ impl StudioVfs {
         tokens.remove(&ino);
     }
 
-    /// Function $name.
     pub fn is_shutting_down(&self) -> bool {
         self.shutdown_requested()
             || self.uploader_shutdown_requested()
@@ -273,10 +268,6 @@ impl StudioVfs {
 
     /// Best-effort graceful shutdown: drain pending local state, persist the
     /// cached-store upload journal, cancel uploader tasks, then persist upload state.
-    ///
-    /// Shutdown is a Local First boundary. It must make accepted local state
-    /// recoverable after remount, but it must not force remote metadata
-    /// publication into the foreground unmount path.
     pub async fn shutdown(&self, upload_drain_timeout: Duration) {
         if self
             .state
@@ -332,20 +323,16 @@ impl StudioVfs {
         // Phase 2: attempt graceful upload drain (bounded by user timeout),
         // then cancel uploader work so network-blocked requests are aborted.
         let pending = self.pending_uploads_snapshot().len();
-        let active_uploads = self.upload_scheduler.in_flight();
-        let should_drain = should_wait_for_upload_drain(pending, active_uploads);
-        let mut drained = !should_drain;
-        if should_drain {
+        let mut drained = pending == 0;
+        if pending > 0 {
             if upload_drain_timeout.is_zero() {
                 info!(
                     pending,
-                    active_uploads,
                     "VFS shutdown: skipping upload drain and cancelling uploader immediately"
                 );
             } else {
                 info!(
                     pending,
-                    active_uploads,
                     timeout_ms = upload_drain_timeout.as_millis() as u64,
                     "VFS shutdown: waiting for uploads to drain before forced cancellation"
                 );
@@ -370,27 +357,27 @@ impl StudioVfs {
         }
         self.join_uploader_task(background_join_timeout).await;
 
-        // Phase 4: persist local metadata + cache checkpoint.
+        // Phase 4: persist metadata + cache checkpoint.
         info!(
             elapsed_ms = t0.elapsed().as_millis() as u64,
-            "VFS shutdown: persisting local metadata checkpoint"
+            "VFS shutdown: persisting metadata"
         );
         let meta = self.sync_meta();
         let metadata_flush_timeout = self.shutdown_metadata_flush_timeout;
         let metadata_flush_outcome = match super::run_sync_with_timeout(
             metadata_flush_timeout,
-            move || meta.flush_local_metadata().map_err(VfsError::Meta),
+            move || meta.flush_metadata().map_err(VfsError::Meta),
         ) {
             Ok(Some(())) => "success",
             Ok(None) => {
                 warn!(
                     timeout_ms = metadata_flush_timeout.as_millis() as u64,
-                    "VFS shutdown: local metadata checkpoint timed out, leaving recovery to existing checkpoint"
+                    "VFS shutdown: metadata flush timed out, leaving remote sync for next session"
                 );
                 "timeout"
             }
             Err(e) => {
-                warn!("VFS shutdown: local metadata checkpoint failed: {}", e);
+                warn!("VFS shutdown: metadata flush failed: {}", e);
                 "failed"
             }
         };
@@ -444,7 +431,7 @@ impl StudioVfs {
 
 #[cfg(test)]
 mod tests {
-    use super::{should_wait_for_upload_drain, shutdown_recoverable_on_restart};
+    use super::shutdown_recoverable_on_restart;
 
     #[test]
     fn shutdown_recoverability_requires_metadata_flush_success() {
@@ -453,13 +440,5 @@ mod tests {
         assert!(!shutdown_recoverable_on_restart(0, false, "success"));
         assert!(!shutdown_recoverable_on_restart(0, true, "timeout"));
         assert!(!shutdown_recoverable_on_restart(0, true, "failed"));
-    }
-
-    #[test]
-    fn shutdown_drain_waits_for_active_uploads_even_when_pending_queue_is_empty() {
-        assert!(!should_wait_for_upload_drain(0, 0));
-        assert!(should_wait_for_upload_drain(1, 0));
-        assert!(should_wait_for_upload_drain(0, 1));
-        assert!(should_wait_for_upload_drain(2, 3));
     }
 }

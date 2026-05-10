@@ -209,7 +209,6 @@ impl UploadQueue {
         self.pending_state.lock().by_object.contains_key(&object_id)
     }
 
-    /// Function $name.
     pub fn shutdown(&self) {
         self.shutdown_requested.store(true, Ordering::Release);
         self.shutdown_notify.notify_waiters();

@@ -74,7 +74,39 @@ impl<'a> WinfspHandleDrainFacade<'a> {
     }
 
     pub(super) fn close(&self, ino: Ino, fh: u64) {
-        self.barrier().on_close(HandleDrainRequest { ino, fh });
+        self.context.vfs.note_winfsp_close_callback();
+        if fh == 0 {
+            self.context
+                .callback_barrier_state
+                .clear_deferred_cleanup_hint(ino);
+            return;
+        }
+
+        let outcome = self
+            .context
+            .vfs
+            .release_fh_with_deferred_last_handle_barrier(fh, &self.context.rt);
+        if outcome.closed_last_handle {
+            let hint_was_taken = self
+                .context
+                .callback_barrier_state
+                .take_deferred_cleanup_hint(ino);
+            self.context
+                .vfs
+                .note_winfsp_close_barrier_outcome(outcome.flushed_local_dirty_state);
+            if hint_was_taken && outcome.flushed_local_dirty_state {
+                debug!(
+                    ino,
+                    fh, "close scheduled deferred cleanup barrier on the last handle"
+                );
+            } else if hint_was_taken {
+                trace!(
+                    ino,
+                    fh,
+                    "close observed deferred cleanup hint but no last-handle barrier was needed"
+                );
+            }
+        }
     }
 
     pub(super) fn cleanup_non_delete(&self, ino: Ino, fh: u64) -> studiofs_vfs::VfsResult<()> {
@@ -402,17 +434,12 @@ impl FlushGatePort for WinfspFlushGatePort<'_> {
 
 impl DeleteCleanupPort for WinfspDeleteCleanupPort<'_> {
     fn cleanup_delete(&self, request: HandleDrainDeleteRequest) {
-        let request_ino = request.ino;
-        let parent_ino = request.parent_ino;
-        let is_dir = request.is_dir;
-        let name = request.name;
-
-        let healed_orphans = if is_dir {
-            match self.context.heal_directory_orphans_for_delete(request_ino) {
+        let healed_orphans = if request.is_dir {
+            match self.context.heal_directory_orphans_for_delete(request.ino) {
                 Ok(count) => count,
                 Err(error) => {
                     warn!(
-                        ino = request_ino,
+                        ino = request.ino,
                         error = ?error,
                         "failed to heal orphan children before directory cleanup delete"
                     );
@@ -423,24 +450,20 @@ impl DeleteCleanupPort for WinfspDeleteCleanupPort<'_> {
             0
         };
 
-        let result = if is_dir {
-            let vfs = self.context.vfs.clone();
-            self.context
-                .spawn_wait(async move { vfs.rmdir_async(parent_ino, &name).await })
+        let result = if request.is_dir {
+            self.context.vfs.rmdir(request.parent_ino, &request.name)
         } else {
-            let vfs = self.context.vfs.clone();
-            self.context
-                .spawn_wait(async move { vfs.unlink_async(parent_ino, &name).await })
+            self.context.vfs.unlink(request.parent_ino, &request.name)
         };
 
         match result {
             Ok(()) => {
-                debug!(ino = request_ino, healed_orphans, "cleanup delete");
+                debug!(ino = request.ino, healed_orphans, "cleanup delete");
             }
-            Err(error) if is_benign_cleanup_delete_error(&error, is_dir) => {
+            Err(error) if is_benign_cleanup_delete_error(&error, request.is_dir) => {
                 debug!(
-                    ino = request_ino,
-                    is_dir,
+                    ino = request.ino,
+                    is_dir = request.is_dir,
                     healed_orphans,
                     error = ?error,
                     "cleanup delete skipped stale race"
@@ -460,12 +483,6 @@ impl BarrierObservabilityPort for WinfspBarrierObservabilityPort<'_> {
 
     fn note_flush_callback(&self) {
         self.context.vfs.note_winfsp_flush_callback();
-    }
-
-    fn note_cleanup_barrier_outcome(&self, flushed_local_dirty_state: bool) {
-        self.context
-            .vfs
-            .note_winfsp_cleanup_barrier_outcome(flushed_local_dirty_state);
     }
 
     fn note_flush_barrier_outcome(&self, flushed_local_dirty_state: bool) {
@@ -574,16 +591,15 @@ mod tests {
         );
         assert_eq!(
             barriers_after_cleanup.cleanup, barriers_before.cleanup,
-            "clean non-delete cleanup should not own a foreground barrier"
+            "non-delete cleanup should no longer own a foreground barrier"
         );
         assert_eq!(
-            barriers_after_cleanup.cleanup_skipped_clean,
-            barriers_before.cleanup_skipped_clean + 1,
-            "clean cleanup should be attributed as a clean-skip barrier"
+            barriers_after_cleanup.cleanup_skipped_clean, barriers_before.cleanup_skipped_clean,
+            "dirty cleanup should not be attributed as a clean-skip barrier either"
         );
         assert_eq!(
             flush_calls_after_cleanup, flush_calls_before,
-            "clean cleanup should not flush local dirty state before close"
+            "cleanup should not flush local dirty state before close"
         );
 
         facade.close(attr.ino, fh);
@@ -615,7 +631,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_cleanup_callbacks_coalesce_foreground_flushes() {
+    fn concurrent_cleanup_callbacks_do_not_add_foreground_flushes() {
         let (_tmp, vfs, ctx, _queue) = make_test_context("cleanup_defer_concurrent");
         let attr = vfs
             .create(ROOT_INO, b"coalesce.txt", 0, 0, 0o644)
@@ -665,19 +681,16 @@ mod tests {
             "all concurrent cleanup callbacks should still be observable"
         );
         assert_eq!(
-            barriers_after_cleanup.cleanup,
-            barriers_before.cleanup + 1,
-            "concurrent dirty cleanup callbacks should coalesce to one foreground barrier"
+            barriers_after_cleanup.cleanup, barriers_before.cleanup,
+            "cleanup callbacks should not add foreground barriers"
         );
         assert_eq!(
-            barriers_after_cleanup.cleanup_skipped_clean,
-            barriers_before.cleanup_skipped_clean + 3,
-            "cleanup callbacks after the coalesced drain should be clean skips"
+            barriers_after_cleanup.cleanup_skipped_clean, barriers_before.cleanup_skipped_clean,
+            "cleanup callbacks should not add clean-skip barrier attribution"
         );
         assert_eq!(
-            flush_calls_after_cleanup,
-            flush_calls_before + 1,
-            "cleanup callbacks should trigger only one foreground flush"
+            flush_calls_after_cleanup, flush_calls_before,
+            "cleanup callbacks should not trigger foreground flush work"
         );
 
         ctx.spawn_wait({
@@ -729,12 +742,7 @@ mod tests {
         );
         assert_eq!(
             barriers_after_cleanup.cleanup, barriers_before.cleanup,
-            "clean cleanup should not claim a foreground barrier before the explicit flush"
-        );
-        assert_eq!(
-            barriers_after_cleanup.cleanup_skipped_clean,
-            barriers_before.cleanup_skipped_clean + 1,
-            "clean cleanup should be attributed as a clean skip"
+            "cleanup should not claim a foreground barrier before the explicit flush"
         );
 
         facade.flush(attr.ino, fh).expect("explicit flush callback");

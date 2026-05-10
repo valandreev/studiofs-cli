@@ -4,27 +4,22 @@ use std::io;
 use tracing::warn;
 
 #[derive(Debug, thiserror::Error)]
-/// Enum $name.
 pub enum UploadStageStoreError {
     #[error("I/O error: {0}")]
-    /// Variant $name.
     Io(#[from] io::Error),
 }
 
 #[derive(Debug, Clone)]
-/// Struct $name.
 pub struct UploadStageStore {
     layout: LocalPayloadLayout,
 }
 
 impl UploadStageStore {
-    /// Function $name.
     pub fn open(layout: LocalPayloadLayout) -> Result<Self, UploadStageStoreError> {
         fs::create_dir_all(&layout.upload_stage_objects_dir)?;
         Ok(Self { layout })
     }
 
-    /// Function $name.
     pub fn get(&self, object_id: u64) -> Option<bytes::Bytes> {
         let path = self.layout.upload_stage_object_path(object_id);
         match fs::read(&path) {
@@ -42,7 +37,6 @@ impl UploadStageStore {
         }
     }
 
-    /// Function $name.
     pub fn contains(&self, object_id: u64) -> bool {
         self.layout
             .upload_stage_object_path(object_id)
@@ -50,7 +44,6 @@ impl UploadStageStore {
             .unwrap_or(false)
     }
 
-    /// Function $name.
     pub fn link_payload(&self, object_id: u64) -> Result<(), UploadStageStoreError> {
         let payload_path = self.layout.payload_object_path(object_id);
         let stage_path = self.layout.upload_stage_object_path(object_id);
@@ -81,7 +74,6 @@ impl UploadStageStore {
         }
     }
 
-    /// Function $name.
     pub fn link_payload_batch(&self, object_ids: &[u64]) -> Result<(), UploadStageStoreError> {
         for &object_id in object_ids {
             self.link_payload(object_id)?;
@@ -89,7 +81,6 @@ impl UploadStageStore {
         Ok(())
     }
 
-    /// Function $name.
     pub fn remove(&self, object_id: u64) {
         let path = self.layout.upload_stage_object_path(object_id);
         if let Err(error) = fs::remove_file(&path)
@@ -104,7 +95,6 @@ impl UploadStageStore {
         }
     }
 
-    /// Function $name.
     pub fn remove_batch(&self, object_ids: &[u64]) {
         for &object_id in object_ids {
             self.remove(object_id);

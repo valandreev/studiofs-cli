@@ -32,23 +32,14 @@ pub const LOCAL_PAYLOAD_REDB_INDEX_FILE: &str = "cache.redb";
 /// Fully resolved local payload object runtime paths for a cache root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalPayloadLayout {
-    /// Field $name.
     pub cache_root: PathBuf,
-    /// Field $name.
     pub runtime_root: PathBuf,
-    /// Field $name.
     pub tmp_dir: PathBuf,
-    /// Field $name.
     pub payload_root: PathBuf,
-    /// Field $name.
     pub payload_objects_dir: PathBuf,
-    /// Field $name.
     pub upload_stage_root: PathBuf,
-    /// Field $name.
     pub upload_stage_objects_dir: PathBuf,
-    /// Field $name.
     pub index_dir: PathBuf,
-    /// Field $name.
     pub redb_index_path: PathBuf,
 }
 

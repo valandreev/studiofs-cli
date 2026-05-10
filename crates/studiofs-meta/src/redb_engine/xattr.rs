@@ -11,7 +11,10 @@ impl MetaXattr for RedbMetaEngine {
 
     fn set_xattr(&self, ino: Ino, name: &[u8], value: &[u8], flags: u32) -> MetaResult<()> {
         let current = self.get_xattr(ino, name)?;
-        let txn = self.begin_crash_safe_write()?;
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
         {
             if flags & XATTR_CREATE_FLAG != 0 && current.is_some() {
                 return Err(MetaError::EntryExists {
@@ -50,7 +53,10 @@ impl MetaXattr for RedbMetaEngine {
                 name: String::from_utf8_lossy(name).to_string(),
             });
         }
-        let txn = self.begin_crash_safe_write()?;
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
         {
             Self::remove_xattr_overlay_in_txn(&txn, ino, name)?;
 

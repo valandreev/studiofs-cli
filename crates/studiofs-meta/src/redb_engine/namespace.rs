@@ -160,7 +160,10 @@ impl MetaNamespace for RedbMetaEngine {
             });
         }
 
-        let txn = self.begin_crash_safe_write()?;
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
         {
             Self::set_dentry_overlay_in_txn(&txn, parent, name, entry)?;
 
@@ -180,7 +183,10 @@ impl MetaNamespace for RedbMetaEngine {
 
     fn remove_entry(&self, parent: Ino, name: &[u8]) -> MetaResult<DirEntryValue> {
         let entry_val = self.lookup(parent, name)?;
-        let txn = self.begin_crash_safe_write()?;
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
         {
             Self::remove_dentry_overlay_in_txn(&txn, parent, name)?;
 

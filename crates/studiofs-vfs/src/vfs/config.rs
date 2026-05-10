@@ -52,23 +52,17 @@ pub(super) const CACHE_RUNTIME_LARGE_BUDGET_BYTES: u64 = 512 * 1024 * 1024 * 102
 pub(super) const CACHE_RUNTIME_HUGE_BUDGET_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// Enum $name.
 pub enum LocalSyncPolicy {
-    /// Variant $name.
     Opportunistic,
-    /// Variant $name.
     Strict,
-    /// Variant $name.
     WriteThrough,
 }
 
 impl LocalSyncPolicy {
-    /// Function $name.
     pub const fn is_opportunistic(self) -> bool {
         matches!(self, Self::Opportunistic)
     }
 
-    /// Function $name.
     pub const fn requires_write_path_durability(self) -> bool {
         matches!(self, Self::Strict | Self::WriteThrough)
     }
@@ -87,18 +81,13 @@ pub(super) enum DirtyAttrPersistPolicy {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-/// Struct $name.
 pub struct ReleaseFhOutcome {
-    /// Field $name.
     pub closed_last_handle: bool,
-    /// Field $name.
     pub flushed_local_dirty_state: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-/// Struct $name.
 pub struct ExplicitFlushOutcome {
-    /// Field $name.
     pub flushed_local_dirty_state: bool,
 }
 
@@ -335,158 +324,83 @@ pub struct VfsConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct VfsConfigRaw {
-    /// Field $name.
     pub janitor_interval_secs: Option<u64>,
-    /// Field $name.
     pub janitor_skip_newer_secs: Option<u64>,
-    /// Field $name.
     pub janitor_max_deletes: Option<u64>,
-    /// Field $name.
     pub janitor_lease_ttl_secs: Option<u64>,
-    /// Field $name.
     pub metadata_invalidation_sync_interval_ms: Option<u64>,
-    /// Field $name.
     pub read_buffer_mb: Option<u64>,
-    /// Field $name.
     pub prefetch_concurrency: Option<usize>,
-    /// Field $name.
     pub readahead_width: Option<u32>,
-    /// Field $name.
     pub readahead_min_prefetch: Option<u32>,
-    /// Field $name.
     pub readahead_seq_step: Option<u8>,
-    /// Field $name.
     pub readahead_random_penalty: Option<u8>,
-    /// Field $name.
     pub dir_prefetch_max_batch: Option<usize>,
-    /// Field $name.
     pub readdir_attr_batch_chunk: Option<usize>,
-    /// Field $name.
     pub readdir_attr_batch_max_inodes: Option<usize>,
-    /// Field $name.
     pub prefetch_foreground_reserve: Option<usize>,
-    /// Field $name.
     pub prefetch_max_per_cycle: Option<usize>,
-    /// Field $name.
     pub prefetch_pause_on_neterr_ms: Option<u64>,
-    /// Field $name.
     pub lock_ttl_secs: Option<u64>,
-    /// Field $name.
     pub lock_retry_base_ms: Option<u64>,
-    /// Field $name.
     pub lock_retry_max_ms: Option<u64>,
-    /// Field $name.
     pub max_dirty_bytes: Option<usize>,
-    /// Field $name.
     pub write_eager_flush_batch_bytes: Option<usize>,
-    /// Field $name.
     pub max_xattr_bytes: Option<usize>,
-    /// Field $name.
     pub dentry_cache_capacity: Option<usize>,
-    /// Field $name.
     pub dentry_cache_bytes: Option<usize>,
-    /// Field $name.
     pub path_shortcut_cache_capacity: Option<usize>,
-    /// Field $name.
     pub path_shortcut_cache_bytes: Option<usize>,
-    /// Field $name.
     pub attr_read_cache_capacity: Option<usize>,
-    /// Field $name.
     pub attr_read_cache_bytes: Option<usize>,
-    /// Field $name.
     pub effective_acl_cache_capacity: Option<usize>,
-    /// Field $name.
     pub principal: Option<String>,
-    /// Field $name.
     pub fetch_initial_window: Option<f64>,
-    /// Field $name.
     pub fetch_min_window: Option<f64>,
-    /// Field $name.
     pub fetch_max_window: Option<f64>,
-    /// Field $name.
     pub fetch_increase_step: Option<f64>,
-    /// Field $name.
     pub fetch_decrease_factor: Option<f64>,
-    /// Field $name.
     pub fetch_decrease_cooldown_secs: Option<u64>,
-    /// Field $name.
     pub upload_initial_window: Option<f64>,
-    /// Field $name.
     pub upload_min_window: Option<f64>,
-    /// Field $name.
     pub upload_max_window: Option<f64>,
-    /// Field $name.
     pub upload_increase_step: Option<f64>,
-    /// Field $name.
     pub upload_decrease_factor: Option<f64>,
-    /// Field $name.
     pub upload_decrease_cooldown_secs: Option<u64>,
-    /// Field $name.
     pub upload_delay_ms: Option<u64>,
-    /// Field $name.
     pub upload_requeue_base_ms: Option<u64>,
-    /// Field $name.
     pub upload_requeue_max_ms: Option<u64>,
-    /// Field $name.
     pub upload_stats_interval_secs: Option<u64>,
-    /// Field $name.
     pub slab_flush_interval_ms: Option<u64>,
-    /// Field $name.
     pub upload_cache_io_slots: Option<usize>,
-    /// Field $name.
     pub transit_memory_budget_bytes: Option<usize>,
-    /// Field $name.
     pub upload_user_idle_grace_ms: Option<u64>,
-    /// Field $name.
     pub upload_fg_read_latency_target_ms: Option<u64>,
-    /// Field $name.
     pub upload_fg_read_latency_window_ms: Option<u64>,
-    /// Field $name.
     pub upload_fg_read_latency_sticky_windows: Option<u64>,
-    /// Field $name.
     pub upload_worker_count: Option<usize>,
-    /// Field $name.
     pub upload_max_attempts: Option<u32>,
-    /// Field $name.
     pub upload_request_timeout_secs: Option<u64>,
-    /// Field $name.
     pub upload_retry_base_ms: Option<u64>,
-    /// Field $name.
     pub upload_retry_max_ms: Option<u64>,
-    /// Field $name.
     pub fetch_max_attempts: Option<u32>,
-    /// Field $name.
     pub prefetch_fetch_max_attempts: Option<u32>,
-    /// Field $name.
     pub fetch_request_timeout_secs: Option<u64>,
-    /// Field $name.
     pub fetch_retry_base_ms: Option<u64>,
-    /// Field $name.
     pub fetch_retry_max_ms: Option<u64>,
-    /// Field $name.
     pub fetch_prefetch_reserve: Option<usize>,
-    /// Field $name.
     pub fetch_prefetch_acquire_wait_ms: Option<u64>,
-    /// Field $name.
     pub max_drain_batch: Option<usize>,
-    /// Field $name.
     pub publish_visibility_timeout_secs: Option<u64>,
-    /// Field $name.
     pub shutdown_metadata_flush_timeout_secs: Option<u64>,
-    /// Field $name.
     pub qos_accept_slots: Option<usize>,
-    /// Field $name.
     pub qos_materialize_slots: Option<usize>,
-    /// Field $name.
     pub qos_commit_slots: Option<usize>,
-    /// Field $name.
     pub qos_fetch_slots: Option<usize>,
-    /// Field $name.
     pub foreground_read_speedometer_shards: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
-/// Struct $name.
 pub struct VfsConfigValidated {
     config: VfsConfig,
     cache_runtime_overrides: CacheRuntimeTuningOverrides,
@@ -501,7 +415,6 @@ pub(super) struct CacheRuntimeTuningOverrides {
 }
 
 impl VfsConfigValidated {
-    /// Function $name.
     pub fn into_inner(self) -> VfsConfig {
         self.config
     }
@@ -635,7 +548,6 @@ impl VfsConfigRaw {
         (cfg, overrides)
     }
 
-    /// Function $name.
     pub fn validate(self) -> VfsResult<VfsConfigValidated> {
         let (cfg, overrides) = self.resolve_defaults();
         normalize_vfs_config(cfg, overrides)

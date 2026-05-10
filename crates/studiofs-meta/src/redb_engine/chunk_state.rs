@@ -153,27 +153,6 @@ impl RedbMetaEngine {
         signature
     }
 
-    pub(super) fn regular_file_overlay_differs_from_base_in_write_txn(
-        txn: &redb::WriteTransaction,
-        ino: Ino,
-    ) -> MetaResult<bool> {
-        let overlay_chunks = Self::regular_file_chunk_states_for_inode_in_write_txn(
-            txn,
-            REGULAR_FILE_OVERLAY_TABLE,
-            ino,
-        )?;
-        if overlay_chunks.is_empty() {
-            return Ok(false);
-        }
-        let base_chunks = Self::regular_file_chunk_states_for_inode_in_write_txn(
-            txn,
-            REGULAR_FILE_BASE_TABLE,
-            ino,
-        )?;
-        Ok(Self::regular_file_graph_signature(&overlay_chunks)
-            != Self::regular_file_graph_signature(&base_chunks))
-    }
-
     pub(super) fn regular_file_chunk_state_from_slices(
         chunk_slices: &[crate::schema::SliceRecord],
     ) -> MetaResult<RegularFileChunkState> {

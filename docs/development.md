@@ -87,10 +87,7 @@ RWX workflow definitions live in `.rwx/`:
 
 - `.rwx/ci.yml` — Ubuntu quality gates and Ubuntu Linux tests.
 - `.rwx/rocky.yml` — Rocky Linux tests.
-- `.rwx/e2e.yml` — manual-only hosted Linux full real mounted E2E sweep.
-- `.rwx/simulation.yml` — deterministic simulation seed corpus, with fast and
-  deep targets that do not require Docker, mounted filesystems, or external
-  services.
+- `.rwx/e2e.yml` — manual-only hosted Linux real mounted E2E smoke.
 
 When diagnosing RWX failures locally, keep the RWX CLI binary under
 `.rwx/bin/`. That directory is ignored by Git and is only a local tool cache;
@@ -111,34 +108,18 @@ Downloaded logs belong under `.rwx/downloads/`; that directory has its own
 the matching RWX CLI release binary from the official RWX GitHub release before
 running `rwx logs`.
 
-Run the hosted full real mounted E2E sweep manually through RWX:
+Run the hosted real mounted E2E smoke manually through RWX:
 
 ```powershell
-rwx run .rwx/e2e.yml --target e2e-linux-full --wait --open
+rwx run .rwx/e2e.yml --target e2e-smoke --wait --open
 ```
 
 The workflow is Linux-only and uses RWX Docker support plus `/dev/fuse`. It
 builds `studiofs`, runs `studiofs-e2e` with Docker Compose infrastructure from
-`docker/compose.e2e.yml`, executes `run --all` with seed `360`, and uploads
-`target/e2e-runs` as the `e2e-run` artifact. The run output prints the scenario
-name, run ID, report path, failed invariant when the runner reports one, and
-the artifact path to inspect. The RWX task timeout is longer than the runner
-watchdog so `studiofs-e2e` can still write cleanup and report artifacts on a
-stall.
-
-Run the deterministic simulation corpus through RWX:
-
-```powershell
-rwx run .rwx/simulation.yml --target simulation-fast --wait --open
-rwx run .rwx/simulation.yml --target simulation-deep --wait --open
-```
-
-The simulation workflow runs `studiofs-scenario` only. It is suitable for cheap
-seed-reproducible logical correctness checks and uploads
-`simulation-counterexamples-fast` or `simulation-counterexamples-deep` when a
-failing seed produces replay artifacts. Match the `artifact_path=` line in the
-run output to the uploaded artifact tree, then use the artifact's
-`replay_command` locally.
+`docker/compose.e2e.yml`, and uploads `target/e2e-runs/<run-id>/` as the
+`e2e-run` artifact. The run output prints the scenario name, run ID, report
+path, failed invariant when the runner reports one, and the artifact path to
+inspect.
 
 ## Tests
 

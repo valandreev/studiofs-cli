@@ -3,29 +3,19 @@
 use std::fs;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::process::{Command, Stdio};
 
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const DEFAULT_WAIT_TIMEOUT_SECS: u64 = 120;
-const HOST_HEALTH_RETRY_DEADLINE: Duration = Duration::from_secs(60);
-const HOST_HEALTH_ATTEMPT_TIMEOUT_SECS: u64 = 5;
-const HOST_HEALTH_COMMAND_TIMEOUT_PADDING_SECS: u64 = 1;
-const HOST_HEALTH_RETRY_DELAY: Duration = Duration::from_secs(1);
-const COMPOSE_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(120);
-const TIMED_OUT_COMMAND_EXIT_WAIT: Duration = Duration::from_secs(5);
 const DEFAULT_POSTGRES_PORT: u16 = 25_432;
 const DEFAULT_RUSTFS_PORT: u16 = 29_000;
 const DEFAULT_RUSTFS_CONSOLE_PORT: u16 = 29_001;
 const DEFAULT_TOXIPROXY_API_PORT: u16 = 28_474;
 
-/// Constant $name.
 pub const POSTGRES_SERVICE_NAME: &str = "postgres";
-/// Constant $name.
 pub const RUSTFS_SERVICE_NAME: &str = "rustfs";
 const RUSTFS_CONSOLE_SERVICE_NAME: &str = "rustfs-console";
 const TOXIPROXY_API_SERVICE_NAME: &str = "toxiproxy-api";
@@ -67,44 +57,21 @@ struct ServicePortSpec {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-/// Enum $name.
 pub enum InfraMode {
-    /// Variant $name.
     Disabled,
-    /// Variant $name.
     Compose,
-    /// Variant $name.
-    ExternalEnv,
-}
-
-impl InfraMode {
-    /// Function $name.
-    pub fn cli_value(self) -> &'static str {
-        match self {
-            Self::Disabled => "disabled",
-            Self::Compose => "compose",
-            Self::ExternalEnv => "external-env",
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/// Struct $name.
 pub struct ComposeConfig {
-    /// Field $name.
     pub run_id: String,
-    /// Field $name.
     pub sandbox: PathBuf,
-    /// Field $name.
     pub compose_file: PathBuf,
-    /// Field $name.
     pub port_range: Option<String>,
-    /// Field $name.
     pub wait_timeout_secs: u64,
 }
 
 impl ComposeConfig {
-    /// Function $name.
     pub fn for_run(run_id: &str, sandbox: &Path, port_range: Option<String>) -> Self {
         Self {
             run_id: run_id.to_string(),
@@ -117,96 +84,38 @@ impl ComposeConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-/// Struct $name.
 pub struct ServicePort {
-    /// Field $name.
     pub service: String,
-    /// Field $name.
     pub host: String,
-    /// Field $name.
     pub host_port: u16,
-    /// Field $name.
     pub container_port: u16,
-    /// Field $name.
     pub env_var: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/// Struct $name.
 pub struct CommandSpec {
-    /// Field $name.
     pub program: String,
-    /// Field $name.
     pub args: Vec<String>,
-    /// Field $name.
     pub env: Vec<(String, String)>,
-    /// Field $name.
     pub cwd: Option<PathBuf>,
-    /// Field $name.
-    pub timeout: Option<Duration>,
-    /// Field $name.
-    pub stdout_path: Option<PathBuf>,
-    /// Field $name.
-    pub stderr_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/// Struct $name.
 pub struct CommandOutput {
-    /// Field $name.
     pub status: i32,
-    /// Field $name.
     pub stdout: String,
-    /// Field $name.
     pub stderr: String,
 }
 
-/// Trait $name.
 pub trait CommandExecutor {
-    /// Function $name.
     fn run(&self, command: &CommandSpec) -> std::io::Result<CommandOutput>;
-
-    /// Runs a command while periodically invoking a caller-provided heartbeat.
-    fn run_with_heartbeat(
-        &self,
-        command: &CommandSpec,
-        heartbeat_interval: Duration,
-        heartbeat: &mut dyn FnMut(),
-    ) -> std::io::Result<CommandOutput> {
-        let _ = heartbeat_interval;
-        let _ = heartbeat;
-        self.run(command)
-    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-/// Struct $name.
 pub struct SystemCommandExecutor;
 
 impl CommandExecutor for SystemCommandExecutor {
     fn run(&self, command: &CommandSpec) -> std::io::Result<CommandOutput> {
-        self.run_inner(command, None)
-    }
-
-    fn run_with_heartbeat(
-        &self,
-        command: &CommandSpec,
-        heartbeat_interval: Duration,
-        heartbeat: &mut dyn FnMut(),
-    ) -> std::io::Result<CommandOutput> {
-        self.run_inner(
-            command,
-            Some(CommandHeartbeat::new(heartbeat_interval, heartbeat)),
-        )
-    }
-}
-
-impl SystemCommandExecutor {
-    fn run_inner(
-        &self,
-        command: &CommandSpec,
-        mut heartbeat: Option<CommandHeartbeat<'_>>,
-    ) -> std::io::Result<CommandOutput> {
         let mut process = Command::new(&command.program);
         process.args(&command.args);
         process.envs(
@@ -219,75 +128,7 @@ impl SystemCommandExecutor {
         if let Some(cwd) = &command.cwd {
             process.current_dir(cwd);
         }
-        let capture_output = command.stdout_path.is_none() && command.stderr_path.is_none();
-        if capture_output {
-            process.stdout(Stdio::piped());
-            process.stderr(Stdio::piped());
-        } else {
-            if let Some(stdout_path) = &command.stdout_path {
-                if let Some(parent) = stdout_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                process.stdout(Stdio::from(fs::File::create(stdout_path)?));
-            } else {
-                process.stdout(Stdio::null());
-            }
-            if let Some(stderr_path) = &command.stderr_path {
-                if let Some(parent) = stderr_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                process.stderr(Stdio::from(fs::File::create(stderr_path)?));
-            } else {
-                process.stderr(Stdio::null());
-            }
-        }
-        let mut child = process.spawn()?;
-        if !capture_output {
-            let status = wait_for_child(&mut child, command.timeout, heartbeat.as_mut())?;
-            return Ok(CommandOutput {
-                status,
-                stdout: String::new(),
-                stderr: if status == -1 {
-                    command
-                        .timeout
-                        .map(|timeout| format!("command timed out after {}ms", timeout.as_millis()))
-                        .unwrap_or_default()
-                } else {
-                    String::new()
-                },
-            });
-        }
-        let output = if let Some(timeout) = command.timeout {
-            let started = Instant::now();
-            loop {
-                if child.try_wait()?.is_some() {
-                    break child.wait_with_output()?;
-                }
-                if started.elapsed() >= timeout {
-                    terminate_child_on_timeout(&mut child);
-                    let exited = wait_after_timeout_termination(&mut child)?;
-                    if !exited {
-                        return Ok(CommandOutput {
-                            status: -1,
-                            stdout: String::new(),
-                            stderr: timed_out_command_message(timeout, false),
-                        });
-                    }
-                    let output = child.wait_with_output()?;
-                    return Ok(CommandOutput {
-                        status: -1,
-                        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                        stderr: timed_out_command_message(timeout, true),
-                    });
-                }
-                if let Some(heartbeat) = &mut heartbeat {
-                    heartbeat.maybe_emit();
-                }
-                thread::sleep(Duration::from_millis(50));
-            }
-        } else {
-            child.wait_with_output()?
-        };
+        let output = process.output()?;
         Ok(CommandOutput {
             status: output.status.code().unwrap_or(-1),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -296,168 +137,38 @@ impl SystemCommandExecutor {
     }
 }
 
-struct CommandHeartbeat<'a> {
-    interval: Duration,
-    last_emit: Instant,
-    emit: &'a mut dyn FnMut(),
-}
-
-impl<'a> CommandHeartbeat<'a> {
-    fn new(interval: Duration, emit: &'a mut dyn FnMut()) -> Self {
-        Self {
-            interval,
-            last_emit: Instant::now(),
-            emit,
-        }
-    }
-
-    fn maybe_emit(&mut self) {
-        if self.last_emit.elapsed() >= self.interval {
-            (self.emit)();
-            self.last_emit = Instant::now();
-        }
-    }
-}
-
-fn wait_for_child(
-    child: &mut std::process::Child,
-    timeout: Option<Duration>,
-    mut heartbeat: Option<&mut CommandHeartbeat<'_>>,
-) -> std::io::Result<i32> {
-    if timeout.is_none() && heartbeat.is_none() {
-        return Ok(child.wait()?.code().unwrap_or(-1));
-    }
-
-    let started = Instant::now();
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(status.code().unwrap_or(-1));
-        }
-        if let Some(timeout) = timeout {
-            if started.elapsed() >= timeout {
-                terminate_child_on_timeout(child);
-                let exited = wait_after_timeout_termination(child)?;
-                if !exited {
-                    return Ok(-1);
-                }
-                let _ = child.wait()?;
-                return Ok(-1);
-            }
-        }
-        if let Some(heartbeat) = &mut heartbeat {
-            heartbeat.maybe_emit();
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-}
-
-fn terminate_child_on_timeout(child: &mut Child) {
-    terminate_process_tree(child.id());
-    let _ = child.kill();
-}
-
-#[cfg(windows)]
-fn terminate_process_tree(pid: u32) {
-    let _ = Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/T", "/F"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-}
-
-#[cfg(not(windows))]
-fn terminate_process_tree(_pid: u32) {}
-
-fn wait_after_timeout_termination(child: &mut Child) -> std::io::Result<bool> {
-    let started = Instant::now();
-    loop {
-        if child.try_wait()?.is_some() {
-            return Ok(true);
-        }
-        if started.elapsed() >= TIMED_OUT_COMMAND_EXIT_WAIT {
-            return Ok(false);
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-}
-
-fn timed_out_command_message(timeout: Duration, exited: bool) -> String {
-    let mut message = format!("command timed out after {}ms", timeout.as_millis());
-    if !exited {
-        message.push_str("; process tree did not exit after termination request");
-    }
-    message
-}
-
-fn command_spec(
-    program: impl Into<String>,
-    args: Vec<String>,
-    env: Vec<(String, String)>,
-    cwd: Option<PathBuf>,
-    timeout: Option<Duration>,
-) -> CommandSpec {
-    CommandSpec {
-        program: program.into(),
-        args,
-        env,
-        cwd,
-        timeout,
-        stdout_path: None,
-        stderr_path: None,
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
-/// Struct $name.
 pub struct InfraCheck {
-    /// Field $name.
     pub name: String,
-    /// Field $name.
     pub passed: bool,
-    /// Field $name.
     pub detail: String,
 }
 
 #[derive(Debug, Error)]
-/// Enum $name.
 pub enum InfraError {
     #[error("compose file does not exist: {0}")]
-    /// Variant $name.
     MissingComposeFile(PathBuf),
     #[error("invalid port range: {0}")]
-    /// Variant $name.
     InvalidPortRange(String),
     #[error("port range {range} has {available} ports, but {needed} are required")]
-    /// Variant $name.
     PortRangeTooSmall {
-        /// Field $name.
         range: String,
-        /// Field $name.
         available: usize,
-        /// Field $name.
         needed: usize,
     },
     #[error("{action} failed with exit status {status}: {stderr}")]
-    /// Variant $name.
     CommandFailed {
-        /// Field $name.
         action: String,
-        /// Field $name.
         status: i32,
-        /// Field $name.
         stderr: String,
     },
     #[error("infra I/O failed: {0}")]
-    /// Variant $name.
     Io(#[from] std::io::Error),
     #[error("infra JSON failed: {0}")]
-    /// Variant $name.
     Json(#[from] serde_json::Error),
 }
 
 #[derive(Debug, Clone)]
-/// Struct $name.
 pub struct DockerComposeStack {
     run_id: String,
     project_name: String,
@@ -468,7 +179,6 @@ pub struct DockerComposeStack {
 }
 
 impl DockerComposeStack {
-    /// Function $name.
     pub fn new(config: ComposeConfig) -> Result<Self, InfraError> {
         if !config.compose_file.exists() {
             return Err(InfraError::MissingComposeFile(config.compose_file));
@@ -485,17 +195,14 @@ impl DockerComposeStack {
         })
     }
 
-    /// Function $name.
     pub fn project_name(&self) -> &str {
         &self.project_name
     }
 
-    /// Function $name.
     pub fn ports(&self) -> &[ServicePort] {
         &self.ports
     }
 
-    /// Function $name.
     pub fn prepare_artifacts(&self) -> Result<(), InfraError> {
         fs::create_dir_all(self.docker_artifact_dir())?;
         fs::copy(&self.compose_file, self.artifact_compose_file())?;
@@ -506,40 +213,36 @@ impl DockerComposeStack {
         Ok(())
     }
 
-    /// Function $name.
     pub fn preflight(&self, executor: &dyn CommandExecutor) -> Vec<InfraCheck> {
         let mut checks = Vec::new();
         checks.push(self.command_check(
             "docker version",
             executor,
-            command_spec(
-                "docker",
-                vec![
+            CommandSpec {
+                program: "docker".to_string(),
+                args: vec![
                     "version".to_string(),
                     "--format".to_string(),
                     "{{.Server.Version}}".to_string(),
                 ],
-                Vec::new(),
-                None,
-                None,
-            ),
+                env: Vec::new(),
+                cwd: None,
+            },
         ));
         checks.push(self.command_check(
             "docker compose version",
             executor,
-            command_spec(
-                "docker",
-                vec!["compose".to_string(), "version".to_string()],
-                Vec::new(),
-                None,
-                None,
-            ),
+            CommandSpec {
+                program: "docker".to_string(),
+                args: vec!["compose".to_string(), "version".to_string()],
+                env: Vec::new(),
+                cwd: None,
+            },
         ));
         checks.extend(self.ports.iter().map(port_check));
         checks
     }
 
-    /// Function $name.
     pub fn up_command(&self) -> CommandSpec {
         let mut command = self.compose_command();
         command.args.extend([
@@ -552,36 +255,11 @@ impl DockerComposeStack {
         command
     }
 
-    /// Function $name.
     pub fn start(&self, executor: &dyn CommandExecutor) -> Result<(), InfraError> {
         run_success(executor, "docker compose up --wait", self.up_command())?;
         Ok(())
     }
 
-    /// Function $name.
-    pub fn post_start_preflight(&self, executor: &dyn CommandExecutor) -> Vec<InfraCheck> {
-        self.post_start_preflight_with_heartbeat(
-            executor,
-            Duration::from_secs(0),
-            &mut |_port, _attempts, _elapsed| {},
-        )
-    }
-
-    /// Function $name.
-    pub fn post_start_preflight_with_heartbeat(
-        &self,
-        executor: &dyn CommandExecutor,
-        heartbeat_interval: Duration,
-        heartbeat: &mut dyn FnMut(&ServicePort, usize, Duration),
-    ) -> Vec<InfraCheck> {
-        self.ports
-            .iter()
-            .filter(|port| port.service == RUSTFS_SERVICE_NAME)
-            .map(|port| host_health_check(port, executor, heartbeat_interval, heartbeat))
-            .collect()
-    }
-
-    /// Function $name.
     pub fn stop(&self, executor: &dyn CommandExecutor) -> Result<(), InfraError> {
         let mut command = self.compose_command();
         command.args.push("stop".to_string());
@@ -589,7 +267,6 @@ impl DockerComposeStack {
         Ok(())
     }
 
-    /// Function $name.
     pub fn restart(&self, executor: &dyn CommandExecutor) -> Result<(), InfraError> {
         let mut command = self.compose_command();
         command.args.push("restart".to_string());
@@ -598,7 +275,6 @@ impl DockerComposeStack {
         Ok(())
     }
 
-    /// Function $name.
     pub fn stop_service(
         &self,
         service: &str,
@@ -607,7 +283,6 @@ impl DockerComposeStack {
         self.service_control().stop_service(service, executor)
     }
 
-    /// Function $name.
     pub fn start_service(
         &self,
         service: &str,
@@ -616,27 +291,24 @@ impl DockerComposeStack {
         self.service_control().start_service(service, executor)
     }
 
-    /// Function $name.
     pub fn collect_logs(&self, executor: &dyn CommandExecutor) -> Result<PathBuf, InfraError> {
         fs::create_dir_all(self.docker_artifact_dir())?;
-        let log_path = self.docker_artifact_dir().join("compose.log");
-        let stderr_path = self.docker_artifact_dir().join("compose.stderr.log");
         let mut command = self.compose_command();
         command.args.extend([
             "logs".to_string(),
             "--no-color".to_string(),
             "--timestamps".to_string(),
         ]);
-        command.timeout = Some(Duration::from_secs(120));
-        command.stdout_path = Some(log_path.clone());
-        command.stderr_path = Some(stderr_path.clone());
         let output = run_success(executor, "docker compose logs", command)?;
-        write_command_output_fallback(&log_path, &output.stdout)?;
-        write_command_output_fallback(&stderr_path, &output.stderr)?;
+        let log_path = self.docker_artifact_dir().join("compose.log");
+        fs::write(&log_path, output.stdout)?;
+        fs::write(
+            self.docker_artifact_dir().join("compose.stderr.log"),
+            output.stderr,
+        )?;
         Ok(log_path)
     }
 
-    /// Function $name.
     pub fn collect_optional_diagnostics(
         &self,
         executor: &dyn CommandExecutor,
@@ -645,7 +317,7 @@ impl DockerComposeStack {
         let mut collected = Vec::new();
         if self.collect_optional_command(
             executor,
-            "postgres metadata schema dump",
+            "postgres metadata dump",
             &[
                 "exec",
                 "-T",
@@ -661,42 +333,7 @@ impl DockerComposeStack {
             "postgres-schema.stderr.log",
             "postgres-schema.status.json",
         )? {
-            collected.push("postgres metadata schema dump".to_string());
-        }
-        if self.collect_optional_command(
-            executor,
-            "postgres metadata data dump",
-            &[
-                "exec",
-                "-T",
-                POSTGRES_SERVICE_NAME,
-                "pg_dump",
-                "--username",
-                "studiofs",
-                "--dbname",
-                "studiofs",
-                "--data-only",
-                "--inserts",
-                "--table",
-                "public.volumes",
-                "--table",
-                "public.event_log",
-                "--table",
-                "public.metadata_state",
-                "--table",
-                "public.counters",
-                "--table",
-                "public.snapshots",
-                "--table",
-                "public.file_lock_leases",
-                "--table",
-                "public.acl_rules",
-            ],
-            "postgres-data.sql",
-            "postgres-data.stderr.log",
-            "postgres-data.status.json",
-        )? {
-            collected.push("postgres metadata data dump".to_string());
+            collected.push("postgres metadata dump".to_string());
         }
         if self.collect_optional_command(
             executor,
@@ -718,7 +355,6 @@ impl DockerComposeStack {
         Ok(collected)
     }
 
-    /// Tears down a previously recorded Docker Compose project.
     pub fn teardown(&self, executor: &dyn CommandExecutor) -> Result<(), InfraError> {
         let mut command = self.compose_command();
         command.args.extend([
@@ -726,7 +362,6 @@ impl DockerComposeStack {
             "--volumes".to_string(),
             "--remove-orphans".to_string(),
         ]);
-        command.timeout = Some(COMPOSE_TEARDOWN_TIMEOUT);
         run_success(
             executor,
             "docker compose down --volumes --remove-orphans",
@@ -748,16 +383,11 @@ impl DockerComposeStack {
         command
             .args
             .extend(args.iter().map(|arg| (*arg).to_string()));
-        command.timeout = Some(Duration::from_secs(120));
-        let artifact_dir = self.docker_artifact_dir();
-        let stdout_path = artifact_dir.join(stdout_file);
-        let stderr_path = artifact_dir.join(stderr_file);
-        command.stdout_path = Some(stdout_path.clone());
-        command.stderr_path = Some(stderr_path.clone());
         let output = executor.run(&command)?;
+        let artifact_dir = self.docker_artifact_dir();
         let collected = output.status == 0;
-        write_command_output_fallback(&stdout_path, &output.stdout)?;
-        write_command_output_fallback(&stderr_path, &output.stderr)?;
+        fs::write(artifact_dir.join(stdout_file), &output.stdout)?;
+        fs::write(artifact_dir.join(stderr_file), &output.stderr)?;
         fs::write(
             artifact_dir.join(status_file),
             serde_json::to_vec_pretty(&serde_json::json!({
@@ -826,32 +456,19 @@ impl DockerComposeStack {
     }
 }
 
-fn write_command_output_fallback(path: &Path, output: &str) -> std::io::Result<()> {
-    if !path.exists() {
-        fs::write(path, output)?;
-    }
-    Ok(())
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
-/// Struct $name.
 pub struct ComposeServiceControl {
-    /// Field $name.
     pub project_name: String,
-    /// Field $name.
     pub compose_file: PathBuf,
-    /// Field $name.
     pub wait_timeout_secs: u64,
     env: Vec<(String, String)>,
 }
 
 impl ComposeServiceControl {
-    /// Function $name.
     pub fn for_project(project_name: String) -> Result<Self, InfraError> {
         Self::for_project_with_environment(project_name, Vec::new())
     }
 
-    /// Function $name.
     pub fn for_project_with_environment(
         project_name: String,
         env: Vec<(String, String)>,
@@ -868,7 +485,6 @@ impl ComposeServiceControl {
         })
     }
 
-    /// Function $name.
     pub fn stop_service(
         &self,
         service: &str,
@@ -882,7 +498,6 @@ impl ComposeServiceControl {
         Ok(())
     }
 
-    /// Function $name.
     pub fn start_service(
         &self,
         service: &str,
@@ -905,37 +520,19 @@ impl ComposeServiceControl {
         Ok(())
     }
 
-    /// Tears down the Docker Compose project and removes runner-owned volumes.
-    pub fn teardown(&self, executor: &dyn CommandExecutor) -> Result<(), InfraError> {
-        let mut command = self.compose_command();
-        command.args.extend([
-            "down".to_string(),
-            "--volumes".to_string(),
-            "--remove-orphans".to_string(),
-        ]);
-        command.timeout = Some(COMPOSE_TEARDOWN_TIMEOUT);
-        run_success(
-            executor,
-            "docker compose down --volumes --remove-orphans",
-            command,
-        )?;
-        Ok(())
-    }
-
     fn compose_command(&self) -> CommandSpec {
-        command_spec(
-            "docker",
-            vec![
+        CommandSpec {
+            program: "docker".to_string(),
+            args: vec![
                 "compose".to_string(),
                 "--project-name".to_string(),
                 self.project_name.clone(),
                 "--file".to_string(),
                 self.compose_file.display().to_string(),
             ],
-            self.env.clone(),
-            self.compose_file.parent().map(Path::to_path_buf),
-            None,
-        )
+            env: self.env.clone(),
+            cwd: self.compose_file.parent().map(Path::to_path_buf),
+        }
     }
 }
 
@@ -974,72 +571,6 @@ fn port_check(port: &ServicePort) -> InfraCheck {
     }
 }
 
-fn host_health_check(
-    port: &ServicePort,
-    executor: &dyn CommandExecutor,
-    heartbeat_interval: Duration,
-    heartbeat: &mut dyn FnMut(&ServicePort, usize, Duration),
-) -> InfraCheck {
-    let url = format!("http://{}:{}/health", port.host, port.host_port);
-    let started = Instant::now();
-    let mut last_heartbeat = Instant::now();
-    let mut attempts = 0usize;
-    let mut last_failure: Option<String>;
-
-    loop {
-        attempts += 1;
-        let command = command_spec(
-            "curl",
-            vec![
-                "--fail".to_string(),
-                "--silent".to_string(),
-                "--show-error".to_string(),
-                "--max-time".to_string(),
-                HOST_HEALTH_ATTEMPT_TIMEOUT_SECS.to_string(),
-                url.clone(),
-            ],
-            Vec::new(),
-            None,
-            Some(Duration::from_secs(
-                HOST_HEALTH_ATTEMPT_TIMEOUT_SECS + HOST_HEALTH_COMMAND_TIMEOUT_PADDING_SECS,
-            )),
-        );
-        match executor.run(&command) {
-            Ok(output) if output.status == 0 => {
-                return InfraCheck {
-                    name: format!("host health {} {}", port.service, port.host_port),
-                    passed: true,
-                    detail: format!("{url} returned success after {attempts} attempt(s)"),
-                };
-            }
-            Ok(output) => {
-                last_failure = Some(command_failure_detail(output.status, &output.stderr));
-            }
-            Err(err) => {
-                last_failure = Some(err.to_string());
-            }
-        }
-        if started.elapsed() >= HOST_HEALTH_RETRY_DEADLINE {
-            break;
-        }
-        if last_heartbeat.elapsed() >= heartbeat_interval {
-            heartbeat(port, attempts, started.elapsed());
-            last_heartbeat = Instant::now();
-        }
-        std::thread::sleep(HOST_HEALTH_RETRY_DELAY);
-    }
-
-    InfraCheck {
-        name: format!("host health {} {}", port.service, port.host_port),
-        passed: false,
-        detail: format!(
-            "{url} did not become reachable from host after {attempts} attempt(s) over {}s after docker compose up --wait passed; last error: {last_failure}",
-            started.elapsed().as_secs(),
-            last_failure = last_failure.unwrap_or_else(|| "not attempted".to_string())
-        ),
-    }
-}
-
 fn command_failure_detail(status: i32, stderr: &str) -> String {
     let stderr = stderr.trim();
     if stderr.is_empty() {
@@ -1066,19 +597,6 @@ fn allocate_ports(range: Option<&str>) -> Result<Vec<ServicePort>, InfraError> {
 }
 
 fn parse_port_range(range: &str, needed: usize) -> Result<Vec<u16>, InfraError> {
-    let (start, end) = parse_port_range_bounds(range)?;
-    let available = usize::from(end - start) + 1;
-    if available < needed {
-        return Err(InfraError::PortRangeTooSmall {
-            range: range.to_string(),
-            available,
-            needed,
-        });
-    }
-    Ok((start..).take(needed).collect())
-}
-
-fn parse_port_range_bounds(range: &str) -> Result<(u16, u16), InfraError> {
     let Some((start, end)) = range.split_once('-') else {
         return Err(InfraError::InvalidPortRange(range.to_string()));
     };
@@ -1093,7 +611,15 @@ fn parse_port_range_bounds(range: &str) -> Result<(u16, u16), InfraError> {
     if start > end {
         return Err(InfraError::InvalidPortRange(range.to_string()));
     }
-    Ok((start, end))
+    let available = usize::from(end - start) + 1;
+    if available < needed {
+        return Err(InfraError::PortRangeTooSmall {
+            range: range.to_string(),
+            available,
+            needed,
+        });
+    }
+    Ok((start..).take(needed).collect())
 }
 
 fn service_port(spec: ServicePortSpec, host_port: u16) -> ServicePort {
@@ -1140,58 +666,4 @@ fn default_compose_file() -> PathBuf {
         }
     }
     PathBuf::from(COMPOSE_FILE)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn redirected_command_emits_heartbeats_while_waiting() {
-        let temp = tempfile::tempdir().unwrap();
-        let (program, args) = slow_command();
-        let command = CommandSpec {
-            program,
-            args,
-            env: Vec::new(),
-            cwd: None,
-            timeout: Some(Duration::from_secs(5)),
-            stdout_path: Some(temp.path().join("stdout.log")),
-            stderr_path: Some(temp.path().join("stderr.log")),
-        };
-        let executor = SystemCommandExecutor;
-        let mut heartbeat_count = 0;
-
-        let output = executor
-            .run_with_heartbeat(&command, Duration::from_millis(20), &mut || {
-                heartbeat_count += 1;
-            })
-            .unwrap();
-
-        assert_eq!(output.status, 0);
-        assert!(
-            heartbeat_count > 0,
-            "redirected command should emit progress while the parent waits"
-        );
-    }
-
-    #[cfg(windows)]
-    fn slow_command() -> (String, Vec<String>) {
-        (
-            "powershell".to_string(),
-            vec![
-                "-NoProfile".to_string(),
-                "-Command".to_string(),
-                "Start-Sleep -Milliseconds 250".to_string(),
-            ],
-        )
-    }
-
-    #[cfg(not(windows))]
-    fn slow_command() -> (String, Vec<String>) {
-        (
-            "sh".to_string(),
-            vec!["-c".to_string(), "sleep 1".to_string()],
-        )
-    }
 }

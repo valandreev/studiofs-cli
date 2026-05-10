@@ -1,31 +1,21 @@
-//! StudioFS VFS layer.
-//! Platform-agnostic virtual filesystem operations bridging metadata, data, and cache.
+#![forbid(unsafe_code)]
+//! StudioFS VFS Layer
+//!
+//! Platform-agnostic virtual filesystem operations. Bridges metadata, data, and cache layers.
 
-/// Module with VFS access primitives and metadata visibility controls.
 pub mod access;
-/// Module with AIMD request-shaping helpers.
 pub mod aimd;
-/// Module $name.
 pub mod bridge;
-/// Module with integration test harness abstractions for contracts.
 pub mod contract_harness;
-/// Module implementing fetch scheduling.
 pub mod fetch;
-/// Module $name.
 pub mod incarnation;
 mod landing_zone;
-/// Module with lock ordering helpers and diagnostics.
 pub mod lock_order;
-/// Module $name.
 pub mod qos;
-/// Module for read-ahead and related access optimization.
 pub mod readahead;
 mod runtime;
-/// Module with upload scheduler internals.
 pub mod upload;
-/// Module for shared helper functions.
 pub mod utils;
-/// Module containing the public VFS implementation.
 pub mod vfs;
 
 pub use aimd::{AimdConfig, AimdController};
@@ -51,8 +41,8 @@ pub use vfs::{
     VFS_RUNTIME_EVENT_CAPACITY, VfsAttrReadCacheSnapshot, VfsCacheStateSnapshot, VfsConfig,
     VfsConfigRaw, VfsConfigValidated, VfsError, VfsFetchStats, VfsForegroundReadProtectionStats,
     VfsIngressLane, VfsIngressPressure, VfsIngressStats, VfsLatencyHistogramSnapshot,
-    VfsMetadataInvalidationStats, VfsNamespaceCacheSnapshot, VfsPortableAllocatorStats, VfsResult,
-    VfsRuntimeEvent, VfsSynchronizationStateSnapshot, VfsTransitMemorySnapshot, VfsUploadStats,
+    VfsNamespaceCacheSnapshot, VfsPortableAllocatorStats, VfsResult, VfsRuntimeEvent,
+    VfsSynchronizationStateSnapshot, VfsTransitMemorySnapshot, VfsUploadStats,
     VfsWritePathBackpressureStats, VfsWritePathBurstStats, VfsWritePathDirtyPressureStats,
     VfsWritePathDrainLagStats, VfsWritePathEagerFlushStats, VfsWritePathLandingZoneStats,
     VfsWritePathLatencyQuantilesMs, VfsWritePathLatencyQuantilesSaturated,

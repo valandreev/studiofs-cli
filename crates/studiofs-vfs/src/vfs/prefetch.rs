@@ -684,20 +684,11 @@ mod tests {
         let policy = AccessPolicy::from_class(AccessClass::SequentialMediaRead, vfs.access_tracker);
         let planned = vfs.plan_prefetch_batches_from_hint(first.ino, stream_id, 0, 0, policy);
 
-        assert_eq!(planned.len(), 2);
+        assert_eq!(planned.len(), 1);
         assert_eq!(
-            planned[0].ino, first.ino,
-            "cold first-block reads should prefetch ahead in the current file"
-        );
-        assert_eq!(planned[0].block_indices.first(), Some(&1));
-        assert!(
-            planned[0].block_indices.len() >= policy.readahead_min_prefetch as usize,
-            "cold-start prefetch should use at least the configured minimum depth"
-        );
-        assert_eq!(
-            planned[1].ino, second.ino,
+            planned[0].ino, second.ino,
             "frame sequence reads should schedule the next frame through the existing batch path"
         );
-        assert_eq!(planned[1].block_indices, vec![0]);
+        assert_eq!(planned[0].block_indices, vec![0]);
     }
 }

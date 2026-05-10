@@ -305,28 +305,17 @@ pub fn is_process_running(pid: u32) -> bool {
                 bInheritHandle: i32,
                 dwProcessId: u32,
             ) -> *mut core::ffi::c_void;
-            fn WaitForSingleObject(hHandle: *mut core::ffi::c_void, dwMilliseconds: u32) -> u32;
             fn CloseHandle(hObject: *mut core::ffi::c_void) -> i32;
         }
         const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
-        const SYNCHRONIZE: u32 = 0x00100000;
-        const WAIT_OBJECT_0: u32 = 0x00000000;
-        const WAIT_TIMEOUT: u32 = 0x00000102;
         // SAFETY: `OpenProcess` returns a nullable handle for the PID; null means process unavailable.
-        let handle =
-            unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid) };
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
         if handle.is_null() {
             false
         } else {
-            // SAFETY: `handle` is a valid process handle with SYNCHRONIZE access.
-            let wait_result = unsafe { WaitForSingleObject(handle, 0) };
             // SAFETY: `handle` is non-null and must be closed to release OS resources.
             unsafe { CloseHandle(handle) };
-            match wait_result {
-                WAIT_TIMEOUT => true,
-                WAIT_OBJECT_0 => false,
-                _ => true,
-            }
+            true
         }
     }
 

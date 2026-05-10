@@ -244,7 +244,10 @@ impl RedbMetaEngine {
         snapshot: &RedbSnapshot,
         enable_remote_namespace_filter: bool,
     ) -> MetaResult<()> {
-        let txn = self.begin_crash_safe_write()?;
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
 
         Self::clear_table_in_txn(&txn, PENDING_REGULAR_FILE_COMPACTION_TABLE)?;
         Self::clear_table_in_txn(&txn, INODE_LIFECYCLE_TABLE)?;
@@ -306,25 +309,15 @@ impl RedbMetaEngine {
             Self::clear_table_in_txn(&txn, INODE_TOMBSTONES_TABLE)?;
         }
         {
-            Self::clear_table_in_txn(&txn, DENTRY_BY_INODE_TABLE)?;
             let mut table = txn
                 .open_table(DENTRIES_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
             table
                 .retain(|_, _| false)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let mut index = txn
-                .open_table(DENTRY_BY_INODE_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
             for (k, v) in &snapshot.dentries {
-                let (parent, name) = decode_dentry_key(k)?;
-                let entry: DirEntryValue = decode(v)?;
                 table
                     .insert(k.as_slice(), v.as_slice())
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
-                let index_key = encode_dentry_by_inode_key(entry.ino, parent, name);
-                index
-                    .insert(index_key.as_slice(), 1)
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
             }
         }
@@ -332,25 +325,15 @@ impl RedbMetaEngine {
             Self::clear_table_in_txn(&txn, DENTRY_TOMBSTONES_TABLE)?;
         }
         {
-            Self::clear_table_in_txn(&txn, BASE_DENTRY_BY_INODE_TABLE)?;
             let mut table = txn
                 .open_table(BASE_DENTRIES_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
             table
                 .retain(|_, _| false)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let mut index = txn
-                .open_table(BASE_DENTRY_BY_INODE_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
             for (k, v) in &snapshot.dentries {
-                let (parent, name) = decode_dentry_key(k)?;
-                let entry: DirEntryValue = decode(v)?;
                 table
                     .insert(k.as_slice(), v.as_slice())
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
-                let index_key = encode_dentry_by_inode_key(entry.ino, parent, name);
-                index
-                    .insert(index_key.as_slice(), 1)
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
             }
         }
@@ -538,7 +521,10 @@ impl MetaSnapshots for RedbMetaEngine {
         };
 
         let bytes = encode(&snapshot)?;
-        let txn = self.begin_crash_safe_write()?;
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
         {
             let mut table = txn
                 .open_table(SNAPSHOTS_TABLE)

@@ -42,71 +42,6 @@ The simulator should deliberately stay smaller than the product. If a behavior
 needs a real mount, Docker, PostgreSQL, RustFS, FUSE, WinFSP, or platform I/O to
 be meaningful, it belongs in Real E2E or bridge tests rather than in this layer.
 
-## Simulation V2 Mounted-Baseline Recalibration
-
-The mounted baseline findings from Levels 1-11 change how deeper levels should
-be promoted. The simulator remains a logical model, but the next scenario
-family must be shaped by the mounted evidence before real WinFSP/FUSE work is
-added:
-
-- write handles keep OS cache disabled for stability, so OS cache behavior must
-  stay outside simulation instead of becoming a model assumption;
-- first-read behavior depends on StudioFS prefetch and payload visibility, so
-  simulation should model explicit read-range probes and object availability
-  rather than platform cache timing;
-- real mounted scenarios must start from fresh volumes and client roots, so
-  simulation should distinguish warm clients, cold observers, and imported
-  shared state instead of reusing hidden local state;
-- deeper mounted levels should not be designed first in Real E2E when their
-  core behavior can be searched deterministically.
-
-The v2 simulation-first promotion rule is: every new deep real mounted E2E
-level needs a deterministic simulation slice first, unless the behavior is
-platform-only bridge behavior. The simulation slice must define the portable
-operation vocabulary, invariant, counterexample artifact, focused validation
-command, and promotion path before the corresponding mounted issue is
-implemented. The mounted issue then proves the same public contract through
-real clients, PostgreSQL, RustFS, FUSE or WinFSP, process lifecycle, and runner
-artifacts.
-
-Platform-only behavior stays out of simulation. This includes OS cache
-behavior, WinFSP callback hangs, FUSE or WinFSP file descriptor quirks, drive
-letter cleanup, actual kernel notification delivery, and process-kill behavior
-that only exists through a mounted bridge. Simulation may record those as
-unsupported markers or capability gates, but the pass/fail authority remains
-Real E2E or bridge tests.
-
-The shared operation vocabulary should be extended only where the behavior is
-portable without a real mount:
-
-- sparse writes, truncate shrink/extend, tail writes, holes, deterministic
-  read-range probes, and byte-range diagnostics;
-- cold observer join points, fresh local state, bounded mutation history,
-  tombstone replay, and stale object-reference checks;
-- lossy invalidation hints, delayed hints, fallback sync, and authoritative
-  metadata catch-up;
-- symlink target state and supported metadata attribute state behind explicit
-  capability gates;
-- partial helper launch, hung helper timeout, cleanup sequencing, cleanup error
-  recording, and primary-error preservation for the infra-disabled runner
-  model.
-
-The v2 issue-ready checklist is:
-
-| Simulation slice | Promotes to real mounted level | Required gate before promotion |
-|---|---|---|
-| SFS-396 sparse file truncate/write/read-range chaos | SFS-377 Level 12 sparse-file E2E | Model sparse writes, shrink/extend truncates, holes, tail writes, read-range probes, byte-range diagnostics, and replayable counterexamples. |
-| SFS-397 cold-observer long-history convergence | SFS-378 Level 13 cold-observer E2E | Model warm history, fresh cold observer state, tombstone/base replay, stale object references, duplicate canonical paths, and checksum/range convergence. |
-| SFS-398 invalidation dropout and fallback sync | SFS-379 Level 14 invalidation-dropout E2E | Model invalidation hints as lossy wakeups, fallback sync as the source-of-truth recovery path, bounded stale windows, and final convergence. |
-| SFS-399 symlink and metadata-attribute convergence | SFS-380 Level 15 symlink/attribute E2E | Model symlink target and metadata attribute state with explicit platform capabilities, plus races against rename, unlink, writes, and metadata delivery. |
-| SFS-400 adversarial runner cleanup and partial failure | SFS-381 Level 16 adversarial cleanup E2E | Model partial helper launch, hung helper timeout, best-effort report writing, cleanup sequencing, restricted cleanup targets, cleanup error recording, and primary-error preservation. |
-
-Each checklist item should remain independently implementable. A later mounted
-level should stay blocked until its deterministic slice is green and has a
-focused replay path. If the simulation slice exposes that an operation is
-platform-only, the promotion issue should carry an explicit unsupported marker
-or platform gate instead of forcing the simulator to fake the bridge.
-
 ## Simulation Boundaries
 
 The simulator models StudioFS as logical clients connected to deterministic
@@ -132,15 +67,14 @@ instead of one monolithic simulator.
 
 | Abstraction | Responsibility | Follow-up |
 |---|---|---|
-| operation model | `studiofs-scenario` serializable logical operations shared by Real E2E and simulation: create, mkdir, write, append, truncate, rename, unlink, rmdir, read, stat, readdir, flush, fsync, close/release, crash, restart, outage, recovery, wait, and barrier | SFS-331 |
-| logical state snapshot | `studiofs-scenario::invariant::LogicalSnapshot` schema version 1: clients, entries, logical IDs when known, file size/checksum, symlink targets, object references, expected-absent paths, durable write expectations, object lifecycle facts, hard-link mode, and optional replay-idempotence result | SFS-332 |
-| invariant validation | `studiofs-scenario::invariant::validate_logical_invariants` checks convergence, no lost durable writes, no unexpected resurrection, valid tree structure, canonical path ownership, object reachability, and idempotent replay over logical snapshots | SFS-332 |
-| simulated metadata bus | `studiofs-scenario::metadata_bus::MetadataBus` models local enqueue, ordered batch/version delivery, outage, reconnect, delayed delivery, duplicate delivery, idempotent apply, and traceable scheduler-controlled delivery points | SFS-333 |
+| operation model | Serializable logical operations shared by Real E2E and simulation: create, mkdir, write, append, truncate, rename, unlink, rmdir, read, stat, readdir, flush, fsync, close/release, crash, restart, outage, recovery, wait, and barrier | SFS-331 |
+| logical state snapshot | A stable view of paths, inodes or logical node IDs, file versions, payload references, pending uploads, pending publications, and client-local visibility | SFS-332 |
+| invariant validation | Product-specific checks for convergence, no lost durable writes, no unexpected resurrection, valid tree structure, canonical path ownership, object reachability, and idempotent replay | SFS-332 |
+| simulated metadata bus | Scheduler-driven metadata replication with ordered delivery, outage, reconnect, delayed delivery, duplicate delivery, and traceable batch/version behavior | SFS-333 |
 | simulated object store | Scheduler-driven object presence, local-only payloads, delayed upload completion, failed uploads, retries, outage/recovery, remote read failure, and reachability export | SFS-334 |
 | virtual time | Logical ticks and deadlines that replace wall-clock sleeps and make outage, retry, upload, and publication timing reproducible | SFS-335 |
 | deterministic scheduler | Seeded event selection, run-until-idle, step-by-step execution, invariant stop points, and trace emission for each selected interleaving | SFS-335 |
 | logical clients | Per-client local state and operation execution against the metadata bus, object store, scheduler, operation model, and invariant validator | SFS-336 |
-| infra-disabled runner model | Partial helper launch, hung helper timeout, best-effort report writing, cleanup sequencing, restricted cleanup targets, cleanup error recording, and primary-error preservation without Docker, FUSE, WinFSP, or real mounts | SFS-400 |
 
 Each abstraction should own one deterministic input/output contract. Shared data
 formats should use append-only JSON-compatible schemas so failing simulation
@@ -161,104 +95,6 @@ expressed over logical state. It should reuse Real E2E operation artifacts where
 the operations are portable. It should not weaken either layer by making them
 depend on simulator internals.
 
-## Product-Finding Strategy
-
-The deterministic simulator is useful only if it becomes a bug-finding front
-end for the production filesystem, not a separate toy implementation that only
-tests itself. The deep testing strategy therefore has two jobs:
-
-1. search more interleavings than Real E2E can afford;
-2. project every interesting interleaving back onto production code through a
-   shared operation log and invariant oracle.
-
-The simulator remains the fast search engine, but production components must be
-plugged into the same workload in progressively heavier layers:
-
-| Stage | Driver | System under test | Oracle | Expected bug class |
-|---|---|---|---|---|
-| model search | `studiofs-scenario` logical clients | simulation model only | shared logical invariants | scenario/model gaps, invariant bugs, missing fault cases |
-| contract replay | `ScenarioOperationRecord` replay into Contract/Core fixtures | `studiofs-meta`, `studiofs-cache`, and `studiofs-vfs` non-mounted fixtures | same logical snapshot and durable-write invariants | publication, replay, object reachability, epoch, and namespace bugs in production core logic |
-| mounted replay | same operation log translated into `studiofs-e2e` mounted clients | `studiofs-cli` through real clients, PostgreSQL, RustFS, and mounted trees | mounted tree convergence plus shared operation/invariant summaries | bridge/runtime/integration bugs missed by pure core tests |
-| counterexample promotion | saved failing artifact | smallest layer that reproduces the failure | exact artifact replay plus focused regression test | permanent regression coverage for found product bugs |
-
-This creates a one-way validation ladder. A failure first found in model search
-should be minimized and replayed against Contract/Core. If it still reproduces,
-the bug belongs to production core logic and should get a focused production
-regression. If Contract/Core passes but mounted replay fails, the bug belongs to
-the runner, bridge, process lifecycle, or integration boundary. If only the
-model fails, the simulator or invariant needs correction before the result can
-be treated as a StudioFS product defect.
-
-### Deep Search Axes
-
-Deep eventual-consistency testing should deliberately vary the axes that create
-real StudioFS risk:
-
-- publication ordering: upload completion before/after metadata publication,
-  repeated publish attempts, stale epoch publication, and foreign apply racing
-  with local mutation;
-- local durability: write accepted before flush, flush/fsync/release boundary,
-  crash before upload, crash after upload, and restart while pending work is
-  queued;
-- namespace collisions: rename/rename, rename/unlink, unlink/write,
-  mkdir/rmdir/create, parent rename while child changes, and stale readdir/stat
-  observations;
-- metadata replication: delayed head-of-line batch, duplicate delivery,
-  disconnect/reconnect, outage flapping, and delivery after local divergent
-  state exists;
-- object lifecycle: local-only payload, pending upload, failed upload retry,
-  object-store outage, deleted-but-protected object, and metadata pointing at a
-  missing remote object;
-- replay idempotence: repeated restart loops, stale pending events after newer
-  epochs, and replay after partial cleanup.
-
-Each axis should be represented in the model search and then be mapped either
-to a Contract/Core replay command or a documented mounted-only E2E scenario.
-When an axis cannot be mapped to production yet, the corpus output should label
-that gap instead of implying product coverage.
-
-### Differential Replay Contract
-
-The shared operation log is the handoff between search and product validation.
-A deep run that finds a counterexample must preserve:
-
-- scenario group, seed, scheduler trace, and selected event order;
-- operation log in `ScenarioOperationRecord` format;
-- fault schedule: metadata outage/recovery, object-store outage/recovery,
-  upload completion/failure, duplicate delivery, and crash/restart points;
-- expected logical invariants and stable-point checkpoints;
-- unsupported operation markers when the operation is simulation-only or
-  mounted-only.
-
-Contract/Core replay should consume the operation log without Docker or mounts
-and export a logical snapshot that can be checked by
-`validate_logical_invariants`. Mounted replay should consume the same portable
-operations through `studiofs-e2e`, then export mounted tree snapshots and
-operation summaries. Exact replay from an artifact remains stronger than
-`run-corpus --seed`: replay must read the saved artifact and fail if the trace,
-operation log, invariant, or relevant snapshot drifts.
-
-### Execution Policy
-
-Use three execution depths:
-
-- fast corpus: small fixed seed set for quick PR-oriented signal;
-- deep corpus: stable documented seed set for normal manual/RWX exploration;
-- exploratory corpus: larger local or RWX seed windows used to find new bugs,
-  with the seed range and scenario group captured in the run notes.
-
-The current implementation supports model search directly and includes an
-initial production-backed VFS Contract/Core replay adapter for portable
-`ScenarioOperationRecord` logs. The first adapter applies namespace and local
-file-content operations through `studiofs_vfs::contract_harness::ContractVfsFixture`,
-runs production metadata/VFS invariants, and reports unsupported records as
-skipped rather than silently treating them as covered. The next adapter lives in
-`studiofs_e2e::mounted_replay`; it replays the same records against real mount
-points, honors `record.client`, dispatches client crash/restart and PostgreSQL
-or RustFS outage/recovery events through E2E driver hooks, and routes
-`MountedOnly` records to an explicit real-mount hook instead of filtering them
-out as simulation-unsupported.
-
 ## Phase 1/2 Reuse
 
 Phase 1/2 Real E2E work already established runner artifacts and mounted
@@ -267,10 +103,8 @@ unrelated language.
 
 Reusable inputs:
 
-- Real E2E `operations.ndjson` records use `studiofs-scenario`
-  `ScenarioOperationRecord` lines with `schema_version = 1`, monotonic
-  per-file `sequence`, typed operation variants, typed outcomes, and explicit
-  simulation support markers.
+- Real E2E `operations.ndjson` records should become the reference operation
+  log shape or be mechanically translatable into the shared operation model.
 - Scenario identifiers, client IDs, deterministic order markers, operation
   result fields, and error fields should stay portable where the simulated
   operation is meaningful without a mount.
@@ -297,19 +131,9 @@ Reusable artifacts:
 - failure diagnostics that identify scenario, seed, client, operation index,
   invariant, and relevant path/object IDs.
 
-The shared invariant core lives in `studiofs-scenario` so Contract/Core tests,
-the deterministic simulator, and real E2E support crates can depend on the same
-JSON-compatible data model without requiring mounted filesystems. Mounted tree
-snapshots map only the portable public fields into logical entries: relative
-path, entry type, regular-file size, regular-file checksum, and symlink target
-when present. Mounted snapshots do not provide stable logical IDs, object
-lifecycle protection, local durability expectations, or replay results, so
-those fields remain absent unless a scenario supplies them explicitly.
-
-Unsupported mounted-only operations must remain explicit. Operation records keep
-`simulation_support.status = "unsupported"` plus a reason when the simulator
-must skip or reject the record, such as platform probe operations or mounted
-callback boundaries that have no logical simulation equivalent.
+Unsupported mounted-only operations must remain explicit. For example, a future
+operation model can contain a platform probe operation for Real E2E while marking
+it as unsupported by deterministic simulation.
 
 ## Counterexample Capture And Replay
 
@@ -340,58 +164,11 @@ or NDJSON. This keeps them compatible with existing E2E report upload and makes
 future CI/RWX collection straightforward without depending on the real E2E
 runner.
 
-The initial SFS-339 artifact format is a single JSON document written by
-`studiofs_scenario::crash_replay::run_crash_replay_suite_with_artifacts` under
-`<artifact-root>/<scenario>/<family>-seed-<seed>.json`. Schema version 1
-contains:
-
-- `scenario`, `family`, and `seed`;
-- `scheduler_trace`, using the deterministic scheduler trace schema;
-- `operation_log`, using the shared `ScenarioOperationRecord` schema;
-- `client_trace`, using crash/restart replay trace records;
-- `failure.violated_invariant`, `failure.message`, and diagnostic strings;
-- `final_snapshot`, when the simulated runtime can export one;
-- `replay_command`, currently
-  `cargo run -p studiofs-scenario --bin studiofs-scenario -- replay-counterexample <artifact>`.
-
-Replay is local and deterministic: `replay-counterexample` reads the artifact,
-reruns the same scenario family and seed, and fails if the violated invariant,
-scheduler trace, operation log, or client trace differs from the saved
-counterexample. It does not start Docker, PostgreSQL, RustFS, mounted
-filesystems, Tokio timing, or wall-clock sleeps.
-
-The SFS-359 corpus artifact format extends that replay contract to non-crash
-simulation corpus failures. Generic corpus counterexamples are single JSON
-documents under `<artifact-root>/<corpus>/<scenario-group>/seed-<seed>-failure-<n>.json`.
-Schema version 1 contains:
-
-- `scenario`, `corpus`, `group`, optional `sub_group`, and `seed`;
-- `scheduler_trace`, using the deterministic scheduler trace schema or a stable
-  checkpoint trace for deterministic groups without randomized scheduling;
-- `operation_log`, using the shared `ScenarioOperationRecord` schema when the
-  group can map its trace to operations;
-- `event_trace`, using the group-specific logical event records;
-- `failure.violated_invariant` and `failure.message`;
-- `final_snapshot`, when the simulated runtime can export one; object-store
-  outage artifacts use the object lifecycle snapshot exported by the simulated
-  object store;
-- `replay_command`, always
-  `cargo run -p studiofs-scenario --bin studiofs-scenario -- replay-counterexample <artifact>`.
-
-For generic corpus artifacts, replay reruns the saved corpus, group, and seed
-from the artifact path and fails if the violated invariant, message, scheduler
-trace, operation log, event trace, or final snapshot differs. Running a seed with
-`run-corpus --seed <n>` is only a fresh corpus run; it is not exact
-counterexample replay unless it reads the saved artifact. Replay mismatch errors
-include the first differing index for trace and log vectors, or the saved and
-replayed lengths when one side has extra records.
-
 ## Initial Module Plan
 
 The design intentionally sequences implementation in small slices:
 
-1. SFS-331 extracts the shared operation model and stable operation log schema
-   into `crates/studiofs-scenario`.
+1. SFS-331 extracts the shared operation model and stable operation log schema.
 2. SFS-332 extracts logical snapshots and invariant validation.
 3. SFS-333 adds the simulated metadata bus.
 4. SFS-334 adds the simulated object store and upload model.
@@ -402,11 +179,9 @@ The design intentionally sequences implementation in small slices:
 Candidate crate layout:
 
 ```text
-crates/studiofs-scenario/
-  src/lib.rs        shared operation records and NDJSON helpers
-
 crates/studiofs-sim/
   src/
+    operation.rs
     snapshot.rs
     invariant.rs
     scheduler.rs
@@ -420,120 +195,6 @@ crates/studiofs-sim/
 If creating a new crate is too much for the first implementation slice, the same
 module boundaries can start under a test-support crate or an internal module.
 The boundaries matter more than the initial package name.
-
-The initial SFS-333 slice starts in `studiofs-scenario::metadata_bus` so later
-simulation runtime code can reuse the same serializable batch, event, and trace
-types without depending on real PostgreSQL. The bus is intentionally passive:
-logical clients should be connected before scenario events are enqueued, and
-enqueueing a local metadata batch only records the ordered batch and queues it
-for already-known foreign clients. Tests or a future deterministic scheduler
-must call `deliver_next` to apply the head ready batch to a target client. A
-delayed head batch blocks later batches for that client so simulated delivery
-preserves strict version order. Metadata outages, client disconnects, delayed
-batches, released delays, and duplicate deliveries are explicit state
-transitions and trace records. Delay, release, and duplicate-injection helpers
-reject unknown batch IDs instead of mutating scheduler state. This keeps
-counterexample replay independent of wall-clock timing or background polling.
-Long-running searches can periodically call `drain_trace` after exporting
-records; pruning applied batches requires a future runtime retention contract
-that knows every simulated client's replay horizon.
-
-The initial SFS-334 slice adds `studiofs-scenario::object_store` as the matching
-passive payload service. Tests stage local-only payload facts per client, create
-upload tickets, and explicitly drive upload completion, injected failures,
-retry ticks, object-store outage/recovery, and remote reads. A completed upload
-only creates remote object availability; it does not mark the object as
-metadata-published or peer-visible. The module exports object lifecycle facts in
-the shared invariant schema so active local payloads, pending uploads, and
-deleted remote objects can be checked without simulating S3, OpenDAL, sockets,
-or wall-clock timing.
-
-The initial SFS-335 slice adds `studiofs-scenario::scheduler` as the virtual
-time driver for those passive services. Tests enqueue `ScheduledEvent` values at
-explicit ticks with typed event categories for client operations, metadata
-delivery, upload completion, publish attempts, crash/restart, modeled faults,
-and checkpoints. `SimulationScheduler` keeps pending work grouped by virtual
-tick, selects among same-tick ready events from a seed-controlled deterministic
-generator, advances only by virtual ticks, and exposes both step-by-step
-execution and `run_until_idle` / `run_until` modes. The `run_until` mode stops
-at the first invariant failure and leaves later events pending for
-counterexample capture. Scheduler trace records include the seed, step, virtual
-tick, event ID, client ID, event type, ready-event count, ready-event IDs, and
-selected interleaving index. Simulation tests must keep retries, outages, upload
-completion, publication, and crash/restart timing on this scheduler surface
-rather than using wall-clock sleeps or Tokio timing.
-
-The initial SFS-336 slice adds `studiofs-scenario::client::SimulatedRuntime` as
-the logical multi-client runtime over those passive services. The runtime owns
-isolated per-client namespace state and exposes the first core operation subset:
-`mkdir`, `create_file`, `write_file`, `append_file`, `truncate_file`, `rename`,
-`unlink`, `rmdir`, `read_file`, `stat`, `readdir`, `flush`, upload scheduling,
-metadata publication, foreign metadata delivery, metadata outage/recovery, and
-client restart markers. Upload completion still only makes an object remotely
-available; peer-visible reads require an explicit metadata publish and delivery
-step. Runtime snapshots export `LogicalSnapshot` values with durable write
-expectations and object lifecycle facts for the shared invariant validator.
-Client trace records include the logical client for each client-owned operation
-so failing simulation artifacts can identify the actor without real mount,
-PostgreSQL, RustFS, redb, Docker, or wall-clock dependencies.
-
-The initial SFS-337 slice adds `studiofs-scenario::collision` as the first
-seeded collision-suite surface. `run_collision_suite` accepts a scenario name,
-an explicit seed list, and one or more `CollisionFamily` values, then returns a
-JSON-compatible report with per-family/per-seed results, invariant checkpoint
-counts, scheduler-selected event traces, and replayable failure records. Each
-family schedules competing logical operations through `SimulationScheduler` and
-mutates simulated client state only when the scheduler selects that operation.
-The first suite covers rename/rename, rename/unlink, unlink/append, overwrite
-while a stale reader keeps the previous committed view, mkdir/rmdir racing with
-create inside the same directory, metadata delivery racing with a local
-namespace mutation, and publish racing with foreign apply. Stable checkpoints
-run after the modeled conflict-resolution phase so the shared invariant
-validator checks convergence, canonical path ownership, tree structure,
-resurrection, durable writes, and object reachability. If a foreign apply is
-selected before the corresponding publish creates a metadata batch, the rejected
-apply is still recorded as part of the replayable interleaving trace.
-
-The initial SFS-338 slice adds `studiofs-scenario::crash_replay` as the
-crash/restart replay suite over the same deterministic runtime. The suite runs
-explicit seed lists across crash-after-durability, crash-after-upload,
-crash-during-publish, crash-during-foreign-apply, pending-local-upload restart,
-repeated restart/replay, and stale pending-upload/publish families. Each run
-records replay checkpoints, scheduler-selected crash/publish/apply races where
-ordering matters, a replay-idempotence result, peer convergence status, and
-replayable failure traces. A stale publish carries the expected logical epoch
-and is rejected when a newer local epoch already exists, so old pending upload
-or publish events cannot roll a peer back to older durable content. Namespace
-mutations such as `mkdir`, `rename`, `unlink`, and `rmdir` update the simulated
-durable namespace replay state immediately, while file payload bytes still
-require the modeled local durability boundary. Directory logical IDs are stable
-through rename/restart and are not derived from the current path.
-
-The initial SFS-340 slice adds `studiofs-scenario::seed_corpus` as the
-RWX-facing corpus orchestrator. The fast corpus uses stable seeds `1, 2, 3`;
-the deep corpus uses stable seeds `1..=16`. Both run the named scenario groups
-in deterministic order: namespace collisions, crash/restart replay, metadata
-outage, and object-store outage. The corpus CLI supports running one seed, one
-scenario group, the fast corpus, or the deep corpus:
-`cargo run -p studiofs-scenario --bin studiofs-scenario -- run-corpus --corpus fast`.
-Metadata and object-store outage groups keep the core success condition stable
-while varying recovery flaps and unavailable-read probes from the seed, so deep
-corpus output makes seed-controlled fault timing visible instead of repeating a
-single trace shape.
-Failures report the scenario group, seed, violated invariant, message, and
-counterexample artifact path when the underlying suite can write one. The RWX
-workflow lives in `.rwx/simulation.yml` with `simulation-fast` and
-`simulation-deep` targets and uploads `target/simulation-counterexamples/`.
-When a group-specific suite does not have its own replay artifact format yet,
-the corpus layer writes a schema-versioned JSON artifact with the corpus,
-scenario group, optional scenario-family subgroup, seed, scheduler trace,
-operation log, event trace, violated invariant, message, relevant final
-snapshot, and stable replay command. The
-stable replay command reads the artifact path through `replay-counterexample`;
-`run-corpus --seed` remains a seed rerun and does not force saved event choices.
-It intentionally does not use Docker, PostgreSQL, RustFS, FUSE, WinFSP,
-self-hosted runners, GitHub Actions triggers, schedules, or label-gated PR
-runs.
 
 ## MVP Scenario Set
 
@@ -550,14 +211,6 @@ The first runtime should prove the layer with small scenarios:
    converges;
 6. rename/unlink collision converges without duplicate canonical paths or
    unexpected resurrection.
-7. seeded namespace/file-version collision suite runs the required collision
-   families across multiple seeds and records replayable counterexample traces
-   when an invariant fails.
-8. seeded crash/restart replay suite runs the required replay families across
-   multiple seeds, distinguishes memory-only state from locally durable state,
-   keeps replay idempotent, and rejects stale upload/publish events for older
-   epochs. Namespace creations, removals, and directory renames remain durable
-   across restart without making unflushed file bytes durable.
 
 These scenarios should stay byte-light. File payloads can be represented by
 stable content IDs and checksums unless a specific invariant needs actual bytes.
