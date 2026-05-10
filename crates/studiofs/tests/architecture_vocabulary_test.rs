@@ -592,6 +592,58 @@ fn deterministic_simulation_architecture_covers_required_sfs330_surfaces() {
 }
 
 #[test]
+fn deterministic_simulation_architecture_covers_required_sfs395_v2_surfaces() {
+    let doc = read_workspace_file("docs/deterministic-simulation-architecture.md");
+    let required_terms = [
+        "## Simulation V2 Mounted-Baseline Recalibration",
+        "mounted baseline findings",
+        "write handles keep OS cache disabled",
+        "StudioFS prefetch",
+        "fresh volumes and client roots",
+        "simulation-first promotion rule",
+        "SFS-396",
+        "SFS-397",
+        "SFS-398",
+        "SFS-399",
+        "SFS-400",
+        "SFS-377",
+        "SFS-378",
+        "SFS-379",
+        "SFS-380",
+        "SFS-381",
+        "sparse writes",
+        "read-range probes",
+        "byte-range diagnostics",
+        "cold observer",
+        "invalidation hints",
+        "fallback sync",
+        "symlink target",
+        "metadata attribute",
+        "infra-disabled runner model",
+        "partial helper launch",
+        "hung helper timeout",
+        "cleanup sequencing",
+        "cleanup error recording",
+        "primary-error preservation",
+        "OS cache behavior",
+        "WinFSP callback hangs",
+        "kernel notification delivery",
+    ];
+
+    let missing: Vec<_> = required_terms
+        .iter()
+        .copied()
+        .filter(|term| !doc.contains(term))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "SFS-395 deterministic simulation v2 architecture is missing required surfaces:\n{}",
+        missing.join("\n")
+    );
+}
+
+#[test]
 fn cli_and_regression_surfaces_drop_buffered_first_wording() {
     let files = [
         "crates/studiofs/src/cli/test_cache/reporting/human.rs",

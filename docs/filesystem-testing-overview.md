@@ -246,6 +246,8 @@ easy to get wrong: sparse-file truncate/write races, long-history cold
 observers, metadata invalidation dropouts, symlink/attribute convergence, and
 adversarial runner cleanup.
 
-The workflow is intentionally staged. We add one level, run it, fix the bugs it
-finds, rerun the existing sweep to make sure nothing regressed, and only then
-move to the next level.
+The workflow is intentionally staged. For these deeper levels, we first model
+the portable behavior in deterministic simulation, then promote the same
+contract to real mounted E2E unless the behavior is platform-only. After that
+we add one mounted level, run it, fix the bugs it finds, rerun the existing
+sweep to make sure nothing regressed, and only then move to the next level.

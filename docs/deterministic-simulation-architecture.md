@@ -42,6 +42,71 @@ The simulator should deliberately stay smaller than the product. If a behavior
 needs a real mount, Docker, PostgreSQL, RustFS, FUSE, WinFSP, or platform I/O to
 be meaningful, it belongs in Real E2E or bridge tests rather than in this layer.
 
+## Simulation V2 Mounted-Baseline Recalibration
+
+The mounted baseline findings from Levels 1-11 change how deeper levels should
+be promoted. The simulator remains a logical model, but the next scenario
+family must be shaped by the mounted evidence before real WinFSP/FUSE work is
+added:
+
+- write handles keep OS cache disabled for stability, so OS cache behavior must
+  stay outside simulation instead of becoming a model assumption;
+- first-read behavior depends on StudioFS prefetch and payload visibility, so
+  simulation should model explicit read-range probes and object availability
+  rather than platform cache timing;
+- real mounted scenarios must start from fresh volumes and client roots, so
+  simulation should distinguish warm clients, cold observers, and imported
+  shared state instead of reusing hidden local state;
+- deeper mounted levels should not be designed first in Real E2E when their
+  core behavior can be searched deterministically.
+
+The v2 simulation-first promotion rule is: every new deep real mounted E2E
+level needs a deterministic simulation slice first, unless the behavior is
+platform-only bridge behavior. The simulation slice must define the portable
+operation vocabulary, invariant, counterexample artifact, focused validation
+command, and promotion path before the corresponding mounted issue is
+implemented. The mounted issue then proves the same public contract through
+real clients, PostgreSQL, RustFS, FUSE or WinFSP, process lifecycle, and runner
+artifacts.
+
+Platform-only behavior stays out of simulation. This includes OS cache
+behavior, WinFSP callback hangs, FUSE or WinFSP file descriptor quirks, drive
+letter cleanup, actual kernel notification delivery, and process-kill behavior
+that only exists through a mounted bridge. Simulation may record those as
+unsupported markers or capability gates, but the pass/fail authority remains
+Real E2E or bridge tests.
+
+The shared operation vocabulary should be extended only where the behavior is
+portable without a real mount:
+
+- sparse writes, truncate shrink/extend, tail writes, holes, deterministic
+  read-range probes, and byte-range diagnostics;
+- cold observer join points, fresh local state, bounded mutation history,
+  tombstone replay, and stale object-reference checks;
+- lossy invalidation hints, delayed hints, fallback sync, and authoritative
+  metadata catch-up;
+- symlink target state and supported metadata attribute state behind explicit
+  capability gates;
+- partial helper launch, hung helper timeout, cleanup sequencing, cleanup error
+  recording, and primary-error preservation for the infra-disabled runner
+  model.
+
+The v2 issue-ready checklist is:
+
+| Simulation slice | Promotes to real mounted level | Required gate before promotion |
+|---|---|---|
+| SFS-396 sparse file truncate/write/read-range chaos | SFS-377 Level 12 sparse-file E2E | Model sparse writes, shrink/extend truncates, holes, tail writes, read-range probes, byte-range diagnostics, and replayable counterexamples. |
+| SFS-397 cold-observer long-history convergence | SFS-378 Level 13 cold-observer E2E | Model warm history, fresh cold observer state, tombstone/base replay, stale object references, duplicate canonical paths, and checksum/range convergence. |
+| SFS-398 invalidation dropout and fallback sync | SFS-379 Level 14 invalidation-dropout E2E | Model invalidation hints as lossy wakeups, fallback sync as the source-of-truth recovery path, bounded stale windows, and final convergence. |
+| SFS-399 symlink and metadata-attribute convergence | SFS-380 Level 15 symlink/attribute E2E | Model symlink target and metadata attribute state with explicit platform capabilities, plus races against rename, unlink, writes, and metadata delivery. |
+| SFS-400 adversarial runner cleanup and partial failure | SFS-381 Level 16 adversarial cleanup E2E | Model partial helper launch, hung helper timeout, best-effort report writing, cleanup sequencing, restricted cleanup targets, cleanup error recording, and primary-error preservation. |
+
+Each checklist item should remain independently implementable. A later mounted
+level should stay blocked until its deterministic slice is green and has a
+focused replay path. If the simulation slice exposes that an operation is
+platform-only, the promotion issue should carry an explicit unsupported marker
+or platform gate instead of forcing the simulator to fake the bridge.
+
 ## Simulation Boundaries
 
 The simulator models StudioFS as logical clients connected to deterministic
@@ -75,6 +140,7 @@ instead of one monolithic simulator.
 | virtual time | Logical ticks and deadlines that replace wall-clock sleeps and make outage, retry, upload, and publication timing reproducible | SFS-335 |
 | deterministic scheduler | Seeded event selection, run-until-idle, step-by-step execution, invariant stop points, and trace emission for each selected interleaving | SFS-335 |
 | logical clients | Per-client local state and operation execution against the metadata bus, object store, scheduler, operation model, and invariant validator | SFS-336 |
+| infra-disabled runner model | Partial helper launch, hung helper timeout, best-effort report writing, cleanup sequencing, restricted cleanup targets, cleanup error recording, and primary-error preservation without Docker, FUSE, WinFSP, or real mounts | SFS-400 |
 
 Each abstraction should own one deterministic input/output contract. Shared data
 formats should use append-only JSON-compatible schemas so failing simulation
