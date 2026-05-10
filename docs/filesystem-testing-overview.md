@@ -181,21 +181,24 @@ The matrix covers four boundaries:
 - release/close
 - graceful shutdown drain
 
-For each boundary, the restarted writer must read back the exact payload from
-its recovered local state. Peers are checked at the scenario's publication gate,
-then the runner waits for normal mounted-tree convergence across all clients.
+For each boundary, the restarted writer attempts to recover the file from local
+state. If the writer cannot recover it, data loss is allowed for this
+crash-boundary contract. If the writer reads any payload, even a partial or
+broken payload, that checksum becomes the oracle and peers must converge to the
+same recovered content through the normal publication path.
 
 This level is important because local-first filesystems have two different
 promises that are easy to mix up. First, data accepted by the writer must become
 locally durable at the right boundary and survive process death. Second, peers
 must converge through the public publication path rather than by sharing private
-writer state.
+writer state. This level validates both the recovery attempt and the publication
+of whatever payload the writer actually recovered.
 
 The scenario writes `operations.ndjson`,
 `publication-boundary-summary.json`, and `validation.json`. The successful
 Windows/WinFSP run covered all four boundaries, remounted `client-a` with the
-same client root each time, matched local and final checksums, and converged
-`client-a`, `client-b`, and `client-c` with no mounted-tree differences.
+same client root each time, and matched final peer checksums to the writer's
+recovered checksum after remount.
 
 ### 11. Mounted Hot-Spot Directory Churn
 

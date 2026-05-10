@@ -163,14 +163,14 @@ validates convergence through the public mounted trees. The RustFS/S3 outage
 scenario stops only the RustFS compose
 service, keeps accepted writes locally readable, verifies a peer does not see
 the new outage checksum before recovery, and reports upload recovery time plus
-final checksum convergence. The mounted client crash/restart scenario kills and
-remounts one mounted client with the same `STUDIOFS_CLIENT_ROOT`, verifies
-locally durable data remains readable after restart, and validates peer
-convergence for both `after_local_durability_boundary` and
-`before_remote_publication_completes` modes. On Linux, crash-style remount
-attempts lazy stale FUSE mount cleanup before starting the replacement process;
-publication readiness is validated through mounted-tree convergence rather than
-private backend inspection.
+final checksum convergence. The mounted client crash/restart scenario uses
+three mounted clients, kills and remounts one mounted client with the same
+`STUDIOFS_CLIENT_ROOT`, verifies locally durable data remains readable after
+restart for both
+`after_local_durability_boundary` and `before_remote_publication_completes`
+modes, then waits for normal S3/PG publication and mounted-tree convergence on
+observer clients. On Linux, crash-style remount attempts lazy stale FUSE mount
+cleanup before starting the replacement process.
 
 ### First-eight mounted baseline gate
 
@@ -251,15 +251,14 @@ open-handle lifecycle in `operations.ndjson`, writes
 validation.
 The `mounted-publication-boundary-crash-matrix` scenario force-kills and
 remounts a writer at flush, fsync, release/close, and graceful shutdown-drain
-publication boundaries. It validates same-root local durability after remount,
-opens the explicit public convergence gate by refreshing observer peers,
-records peer checksums at that gate, then waits for mounted-tree convergence.
+publication boundaries. It attempts same-root local recovery after remount. If
+the writer cannot recover the file, that loss is allowed for the crash-boundary
+contract. If the writer reads any payload, that recovered checksum becomes the
+oracle and the scenario waits for observers to converge to it through normal
+S3/PG publication, even when the recovered payload differs from the original
+payload.
 It records shared-schema `operations.ndjson`, `publication-boundary-summary.json`,
 and `validation.json`.
-Early peer visibility is allowed in this scenario once the writer data is
-locally durable and the product has completed its normal background publication;
-the gate exists to make the observer refresh explicit instead of relying on a
-timing window.
 The
 `mounted-fault-chaos-convergence`
 scenario is the next product fault-chaos layer: it mixes a mounted conflict

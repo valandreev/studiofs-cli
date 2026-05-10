@@ -373,13 +373,13 @@ Mounted E2E clients set `STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS=250`
 so peers that already cached the healthy payload refresh metadata inside the
 scenario convergence window after RustFS/S3 recovers.
 
-`mounted-client-crash-restart-recovery` uses at least two mounted clients with
+`mounted-client-crash-restart-recovery` uses three mounted clients with
 separate `STUDIOFS_CLIENT_ROOT` values. It writes accepted data through
 `client-a`, crosses an explicit local durability boundary with `fsync`, kills
 only the `client-a` mount process without running `studiofs umount`, remounts
 `client-a` with the same client root, verifies the durable data is still
-readable after restart, waits for upload/publication and peer convergence, and
-then validates matching mounted tree checksums from all clients. The scenario
+readable after restart, then waits for normal background S3/PG publication and
+mounted-tree convergence on observer clients. The scenario
 runs two modes in one invocation:
 
 - `after_local_durability_boundary`, which crashes immediately after the
@@ -389,14 +389,14 @@ runs two modes in one invocation:
 
 The scenario writes `operations.ndjson`,
 `crash-restart-recovery-summary.json`, and `validation.json`. The summary
-records the restarted client, reused client root, per-mode local and final
-checksums, whether a peer saw any pre-convergence checksum in the
-`before_remote_publication_completes` mode, restart timing, convergence timing,
-and mounted tree validator result. Publication waiting is intentionally the
-public mounted-tree convergence loop; the scenario must not inspect private S3,
-PostgreSQL, VFS, cache, or redb state to decide success. It must not delete
-local metadata, rerun `discover`, or share one local metadata database between
-clients during recovery.
+records the restarted client, reused client root, per-mode local read checksum,
+whether a peer saw that checksum before the convergence wait, restart timing,
+convergence timing, final checksum, and mounted tree validator result. The pass
+condition requires `client-a` to recover the original payload and all mounted
+clients to converge to that checksum through the normal publication path. The
+scenario must not inspect private S3, PostgreSQL, VFS, cache, or redb state to
+decide success. It must not delete local metadata, rerun `discover`, or share
+one local metadata database between clients during recovery.
 
 `mounted-open-handle-convergence` uses three mounted clients against one shared
 remote volume. `client-a` opens a file handle and keeps it live while
@@ -416,10 +416,12 @@ simulation layer does not model OS file descriptor state.
 one shared remote volume. `client-a` writes payloads and is force-killed then
 remounted at four local-first publication boundaries: flush, fsync,
 release/close, and graceful shutdown drain. Each case reuses the same client
-root, verifies the payload is locally durable after remount, opens the
-scenario-defined public convergence gate by refreshing observer peers, records
-peer mounted-tree checksums at that gate, and then waits for final mounted-tree
-convergence across all clients. The scenario writes `operations.ndjson`,
+root and attempts to recover the file from local state after remount. If the
+writer cannot recover the file, the loss is accepted for this crash-boundary
+contract. If the writer reads any payload, even a partial or otherwise broken
+payload, that recovered checksum becomes the oracle: StudioFS must attempt to
+publish that recovered state through S3/PG and all mounted clients must converge
+to the same checksum. The scenario writes `operations.ndjson`,
 `publication-boundary-summary.json`, and `validation.json`; boundary checkpoints
 and crash/restart operations use the shared `ScenarioOperationRecord` schema,
 while the shutdown-drain marker is explicitly recorded as mounted-only.

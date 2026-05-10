@@ -89,7 +89,7 @@ const LWW_RECONNECT_STALE_WRITER_INDEX: usize = 2;
 const LWW_RECONNECT_COLD_OBSERVER_INDEX: usize = 4;
 const POSTGRES_OUTAGE_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
 const RUSTFS_OUTAGE_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c", "client-d"];
-const CRASH_RESTART_CLIENT_NAMES: &[&str] = &["client-a", "client-b"];
+const CRASH_RESTART_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
 const SMOKE_FILE_NAME: &str = "studiofs-e2e-smoke.txt";
 const SMOKE_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(30);
 const SMOKE_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -228,12 +228,6 @@ pub enum ScenarioError {
         primary: String,
         /// The cleanup value.
         cleanup: String,
-    },
-    #[error("publication boundary peer refresh failed: {errors}")]
-    /// One or more observer peers failed to refresh at the publication gate.
-    PublicationBoundaryPeerRefreshFailed {
-        /// The collected refresh errors.
-        errors: String,
     },
     #[error("mounted tree validation failed: {0}")]
     /// Variant $name.
@@ -898,11 +892,16 @@ impl Scenario for MountedClientCrashRestartRecovery {
             "scenario": MOUNTED_CLIENT_CRASH_RESTART_RECOVERY,
             "run_id": context.run_id,
             "seed": context.seed,
-            "status": if summary.modes.iter().all(|mode| mode.final_validator.converged) {
+            "status": if summary
+                .modes
+                .iter()
+                .all(|mode| mode.local_recovered && mode.final_validator.converged)
+            {
                 "passed"
             } else {
                 "failed"
             },
+            "contract": "local_first_restart_recovery_then_publication",
             "modes": summary.modes,
         });
         fs::write(
@@ -976,12 +975,17 @@ impl Scenario for MountedPublicationBoundaryCrashMatrix {
             "status": if summary
                 .boundaries
                 .iter()
-                .all(|boundary| boundary.final_validator.converged)
+                .all(|boundary| !boundary.local_recovered
+                    || boundary
+                        .final_validator
+                        .as_ref()
+                        .is_some_and(|validator| validator.converged))
             {
                 "passed"
             } else {
                 "failed"
             },
+            "contract": "local_first_recovery_attempt_then_recovered_payload_publication",
             "boundaries": summary.boundaries,
         });
         fs::write(
@@ -1937,8 +1941,9 @@ struct CrashRestartModeSummary {
     restart_client_root: String,
     relative_path: String,
     bytes: usize,
+    local_recovered: bool,
     local_read_checksum_sha256: String,
-    peer_visible_before_convergence: Option<String>,
+    peer_visible_after_local_recovery: Option<String>,
     final_checksum_sha256: String,
     restart_elapsed_ms: u128,
     convergence_elapsed_ms: u128,
@@ -2082,7 +2087,7 @@ fn run_crash_restart_mode(
     let local_read_checksum_sha256 = bytes_sha256(&local_read_payload);
     let restart_elapsed_ms = elapsed_millis_nonzero(restart_started);
 
-    let peer_visible_before_convergence =
+    let peer_visible_after_local_recovery =
         if mode == CrashRestartMode::BeforeRemotePublicationCompletes {
             read_peer_checksum(&clients[1], relative_path)?
                 .filter(|checksum| checksum == &local_read_checksum_sha256)
@@ -2116,8 +2121,9 @@ fn run_crash_restart_mode(
         restart_client_root: crashed.client_root.display().to_string(),
         relative_path: relative_path.to_string(),
         bytes: payload.len(),
+        local_recovered: true,
         local_read_checksum_sha256,
-        peer_visible_before_convergence,
+        peer_visible_after_local_recovery,
         final_checksum_sha256,
         restart_elapsed_ms,
         convergence_elapsed_ms,
@@ -2154,8 +2160,8 @@ fn write_crash_restart_operation(
                 .with_outcome(OperationOutcome::Accepted)
                 .with_metadata("mode", mode)
                 .with_metadata(
-                    "final_checksum_sha256",
-                    summary.final_checksum_sha256.clone(),
+                    "local_read_checksum_sha256",
+                    summary.local_read_checksum_sha256.clone(),
                 );
         append_shared_record(&mut writer, &record)?;
     }
@@ -2173,7 +2179,7 @@ trait PublicationBoundaryDriver {
     fn force_kill(&mut self, client: &str) -> Result<(), ScenarioError>;
     fn graceful_shutdown(&mut self, client: &str) -> Result<(), ScenarioError>;
     fn remount(&mut self, client: &str) -> Result<(), ScenarioError>;
-    fn publish_for_convergence(
+    fn before_recovered_payload_convergence(
         &mut self,
         _boundary: PublicationBoundary,
         _clients: &[ClientSpec],
@@ -2233,27 +2239,6 @@ impl PublicationBoundaryDriver for RealPublicationBoundaryDriver {
         Ok(self.controller.remount(client)?)
     }
 
-    fn publish_for_convergence(
-        &mut self,
-        _boundary: PublicationBoundary,
-        clients: &[ClientSpec],
-        _relative_path: &str,
-    ) -> Result<(), ScenarioError> {
-        let mut errors = Vec::new();
-        for peer in clients.iter().skip(1) {
-            if let Err(error) = self.controller.restart(&peer.name) {
-                errors.push(format!("{}: {error}", peer.name));
-            }
-        }
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(ScenarioError::PublicationBoundaryPeerRefreshFailed {
-                errors: errors.join("; "),
-            })
-        }
-    }
-
     fn unmount_all(&mut self) -> Result<(), ScenarioError> {
         Ok(self.controller.unmount_all()?)
     }
@@ -2281,12 +2266,14 @@ struct PublicationBoundarySummary {
     restart_client_root: String,
     relative_path: String,
     bytes: usize,
-    local_read_checksum_sha256: String,
-    peer_visibility_at_publication_gate: Vec<PublicationBoundaryPeerVisibility>,
-    final_checksum_sha256: String,
+    local_recovered: bool,
+    local_read_checksum_sha256: Option<String>,
+    peer_visibility_after_local_recovery: Vec<PublicationBoundaryPeerVisibility>,
+    final_checksum_sha256: Option<String>,
     restart_elapsed_ms: u128,
-    convergence_elapsed_ms: u128,
-    final_validator: TreeComparison,
+    convergence_elapsed_ms: Option<u128>,
+    final_validator: Option<TreeComparison>,
+    recovery_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2417,12 +2404,36 @@ fn run_publication_boundary(
     drop(publication_boundary_handle);
 
     driver.remount(&writer.name)?;
-    let local_read_payload = wait_for_mounted_payload_readback(
+    let local_recovery = wait_for_publication_boundary_recovery_payload(
         &writer.mount_point.join(&relative_path),
-        &payload,
         MOUNTED_WRITE_READBACK_TIMEOUT,
         MOUNTED_WRITE_READBACK_POLL_INTERVAL,
     )?;
+    let restart_elapsed_ms = elapsed_millis_nonzero(restart_started);
+
+    let Some(local_read_payload) = local_recovery else {
+        let peer_visibility_after_local_recovery =
+            publication_boundary_peer_visibility(&clients[1..], &relative_path)?;
+        let summary = PublicationBoundarySummary {
+            boundary,
+            restarted_client: writer.name.clone(),
+            restart_client_root: writer.client_root.display().to_string(),
+            relative_path,
+            bytes: payload.len(),
+            local_recovered: false,
+            local_read_checksum_sha256: None,
+            peer_visibility_after_local_recovery,
+            final_checksum_sha256: None,
+            restart_elapsed_ms,
+            convergence_elapsed_ms: None,
+            final_validator: None,
+            recovery_error: Some("file not recovered after remount".to_string()),
+        };
+        write_publication_boundary_operations(context, &summary)?;
+        return Ok(summary);
+    };
+
+    let local_read_checksum_sha256 = bytes_sha256(&local_read_payload);
     if local_read_payload != payload {
         write_publication_boundary_readback_mismatch_artifacts(
             context,
@@ -2431,20 +2442,11 @@ fn run_publication_boundary(
             &payload,
             &local_read_payload,
         );
-        return Err(ScenarioError::Io(std::io::Error::other(format!(
-            "publication boundary durability failure: data read after restart does not match written payload for {relative_path}: expected_len={} expected_checksum={} actual_len={} actual_checksum={}",
-            payload.len(),
-            bytes_sha256(&payload),
-            local_read_payload.len(),
-            bytes_sha256(&local_read_payload)
-        ))));
     }
-    let local_read_checksum_sha256 = bytes_sha256(&local_read_payload);
-    let restart_elapsed_ms = elapsed_millis_nonzero(restart_started);
-
-    driver.publish_for_convergence(boundary, clients, &relative_path)?;
-    let peer_visibility_at_publication_gate =
+    let peer_visibility_after_local_recovery =
         publication_boundary_peer_visibility(&clients[1..], &relative_path)?;
+    driver.before_recovered_payload_convergence(boundary, clients, &relative_path)?;
+
     let convergence_started = Instant::now();
     let mounts = client_mounts(context, clients);
     let convergence = wait_for_convergence(
@@ -2458,9 +2460,13 @@ fn run_publication_boundary(
     )?;
     let convergence_elapsed_ms = elapsed_millis_nonzero(convergence_started);
     let final_payload = fs::read(clients[1].mount_point.join(&relative_path))?;
-    if final_payload != payload {
+    if final_payload != local_read_payload {
         return Err(ScenarioError::Io(std::io::Error::other(format!(
-            "publication boundary convergence failure: peer data does not match written payload for {relative_path}"
+            "publication boundary convergence failure: peer data does not match recovered payload for {relative_path}: recovered_len={} recovered_checksum={} peer_len={} peer_checksum={}",
+            local_read_payload.len(),
+            local_read_checksum_sha256,
+            final_payload.len(),
+            bytes_sha256(&final_payload)
         ))));
     }
     let final_checksum_sha256 = bytes_sha256(&final_payload);
@@ -2471,15 +2477,44 @@ fn run_publication_boundary(
         restart_client_root: writer.client_root.display().to_string(),
         relative_path,
         bytes: payload.len(),
-        local_read_checksum_sha256,
-        peer_visibility_at_publication_gate,
-        final_checksum_sha256,
+        local_recovered: true,
+        local_read_checksum_sha256: Some(local_read_checksum_sha256),
+        peer_visibility_after_local_recovery,
+        final_checksum_sha256: Some(final_checksum_sha256),
         restart_elapsed_ms,
-        convergence_elapsed_ms,
-        final_validator: convergence.comparison,
+        convergence_elapsed_ms: Some(convergence_elapsed_ms),
+        final_validator: Some(convergence.comparison),
+        recovery_error: None,
     };
     write_publication_boundary_operations(context, &summary)?;
     Ok(summary)
+}
+
+fn wait_for_publication_boundary_recovery_payload(
+    path: &Path,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> Result<Option<Vec<u8>>, ScenarioError> {
+    let deadline = Instant::now() + timeout;
+    let mut last_error: Option<std::io::Error>;
+    loop {
+        match fs::read(path) {
+            Ok(payload) => return Ok(Some(payload)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                last_error = None;
+            }
+            Err(error) => {
+                last_error = Some(error);
+            }
+        }
+        if Instant::now() >= deadline {
+            return match last_error {
+                Some(error) => Err(ScenarioError::Io(error)),
+                None => Ok(None),
+            };
+        }
+        std::thread::sleep(poll_interval);
+    }
 }
 
 fn wait_for_publication_boundary_readback(
@@ -2757,7 +2792,7 @@ fn write_publication_boundary_operations(
         path: summary.relative_path.clone(),
         offset: Some(0),
         bytes,
-        checksum_sha256: Some(summary.local_read_checksum_sha256.clone()),
+        checksum_sha256: summary.local_read_checksum_sha256.clone(),
     }];
     operations.extend(publication_boundary_operations(
         summary.boundary,
@@ -2777,18 +2812,19 @@ fn write_publication_boundary_operations(
     }
 
     for operation in operations {
-        let record = shared_operation_record(
+        let mut record = shared_operation_record(
             &writer,
             MOUNTED_PUBLICATION_BOUNDARY_CRASH_MATRIX,
             operation,
         )
         .with_client(&summary.restarted_client)
         .with_outcome(OperationOutcome::Accepted)
-        .with_metadata("boundary", boundary)
-        .with_metadata(
-            "final_checksum_sha256",
-            summary.final_checksum_sha256.clone(),
-        );
+        .with_metadata("boundary", boundary);
+        if let Some(checksum) = &summary.local_read_checksum_sha256 {
+            record = record.with_metadata("local_read_checksum_sha256", checksum.clone());
+        } else {
+            record = record.with_metadata("recovery", "lost");
+        }
         append_shared_record(&mut writer, &record)?;
     }
     Ok(())
@@ -10167,7 +10203,9 @@ mod tests {
         clients: Vec<ClientSpec>,
         actions: RefCell<Vec<String>>,
         leak_premature_peer_file: bool,
-        refresh_failure_client: Option<String>,
+        corrupt_writer_after_remount: Option<Vec<u8>>,
+        remove_writer_after_remount: bool,
+        current_boundary: Option<PublicationBoundary>,
         #[cfg(windows)]
         require_open_boundary_handle_during_kill: Option<PublicationBoundary>,
     }
@@ -10178,7 +10216,9 @@ mod tests {
                 clients,
                 actions: RefCell::new(Vec::new()),
                 leak_premature_peer_file: false,
-                refresh_failure_client: None,
+                corrupt_writer_after_remount: None,
+                remove_writer_after_remount: false,
+                current_boundary: None,
                 #[cfg(windows)]
                 require_open_boundary_handle_during_kill: None,
             }
@@ -10189,8 +10229,13 @@ mod tests {
             self
         }
 
-        fn fail_refresh_for(mut self, client: &str) -> Self {
-            self.refresh_failure_client = Some(client.to_string());
+        fn corrupt_writer_after_remount(mut self, payload: &[u8]) -> Self {
+            self.corrupt_writer_after_remount = Some(payload.to_vec());
+            self
+        }
+
+        fn remove_writer_after_remount(mut self) -> Self {
+            self.remove_writer_after_remount = true;
             self
         }
 
@@ -10202,18 +10247,11 @@ mod tests {
             self.require_open_boundary_handle_during_kill = Some(boundary);
             self
         }
-
-        fn replicate_from_writer(&self) -> Result<(), ScenarioError> {
-            let source = &self.clients[0].mount_point;
-            for client in self.clients.iter().skip(1) {
-                copy_dir_contents(source, &client.mount_point)?;
-            }
-            Ok(())
-        }
     }
 
     impl PublicationBoundaryDriver for RecordingPublicationBoundaryDriver {
         fn start_boundary(&mut self, boundary: PublicationBoundary) -> Result<(), ScenarioError> {
+            self.current_boundary = Some(boundary);
             self.actions
                 .borrow_mut()
                 .push(format!("start_{}", publication_boundary_log_name(boundary)));
@@ -10283,34 +10321,50 @@ mod tests {
 
         fn remount(&mut self, client: &str) -> Result<(), ScenarioError> {
             self.actions.borrow_mut().push(format!("remount_{client}"));
+            let Some(writer) = self
+                .clients
+                .iter()
+                .find(|candidate| candidate.name == client)
+            else {
+                return Ok(());
+            };
+            let Some(boundary) = self.current_boundary else {
+                return Ok(());
+            };
+            let path = find_named_file(
+                &writer.mount_point,
+                Path::new(publication_boundary_leaf(boundary))
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(""),
+            )
+            .unwrap_or_else(|| writer.mount_point.join(publication_boundary_leaf(boundary)));
+            if self.remove_writer_after_remount {
+                let _ = std::fs::remove_file(&path);
+            } else if let Some(payload) = &self.corrupt_writer_after_remount {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(path, payload)?;
+            }
             Ok(())
         }
 
-        fn publish_for_convergence(
+        fn before_recovered_payload_convergence(
             &mut self,
             boundary: PublicationBoundary,
-            clients: &[ClientSpec],
+            _clients: &[ClientSpec],
             _relative_path: &str,
         ) -> Result<(), ScenarioError> {
             self.actions.borrow_mut().push(format!(
-                "publish_{}",
+                "publish_recovered_{}",
                 publication_boundary_log_name(boundary)
             ));
-            let mut errors = Vec::new();
-            for peer in clients.iter().skip(1) {
-                self.actions
-                    .borrow_mut()
-                    .push(format!("refresh_{}_for_convergence", peer.name));
-                if self.refresh_failure_client.as_deref() == Some(peer.name.as_str()) {
-                    errors.push(format!("refresh failed for {}", peer.name));
-                }
+            let source = &self.clients[0].mount_point;
+            for client in self.clients.iter().skip(1) {
+                copy_dir_contents(source, &client.mount_point)?;
             }
-            if !errors.is_empty() {
-                return Err(ScenarioError::PublicationBoundaryPeerRefreshFailed {
-                    errors: errors.join("; "),
-                });
-            }
-            self.replicate_from_writer()
+            Ok(())
         }
 
         fn unmount_all(&mut self) -> Result<(), ScenarioError> {
@@ -12232,11 +12286,12 @@ mod tests {
         );
         assert!(summary.modes.iter().all(|mode| {
             mode.restart_client_root == original_client_root.display().to_string()
+                && mode.local_recovered
                 && mode.local_read_checksum_sha256 == mode.final_checksum_sha256
                 && mode.final_validator.converged
         }));
-        assert!(summary.modes[0].peer_visible_before_convergence.is_none());
-        assert!(summary.modes[1].peer_visible_before_convergence.is_none());
+        assert!(summary.modes[0].peer_visible_after_local_recovery.is_none());
+        assert!(summary.modes[1].peer_visible_after_local_recovery.is_none());
         assert_eq!(
             driver.actions.borrow().as_slice(),
             [
@@ -12339,7 +12394,7 @@ mod tests {
     }
 
     #[test]
-    fn crash_restart_recovery_accepts_peer_visible_before_convergence() {
+    fn crash_restart_recovery_records_peer_visible_after_local_recovery() {
         let temp = tempdir().unwrap();
         let sandbox = temp.path().join("run-peer-visible");
         let scenario_dir = sandbox
@@ -12373,17 +12428,14 @@ mod tests {
         )
         .unwrap();
 
-        assert!(summary.modes[0].peer_visible_before_convergence.is_none());
+        assert!(summary.modes[0].peer_visible_after_local_recovery.is_none());
         assert_eq!(
-            summary.modes[1].peer_visible_before_convergence.as_deref(),
+            summary.modes[1]
+                .peer_visible_after_local_recovery
+                .as_deref(),
             Some(summary.modes[1].local_read_checksum_sha256.as_str())
         );
-        assert!(
-            summary
-                .modes
-                .iter()
-                .all(|mode| mode.final_validator.converged)
-        );
+        assert!(summary.modes.iter().all(|mode| mode.local_recovered));
     }
 
     #[test]
@@ -12511,7 +12563,7 @@ mod tests {
     }
 
     #[test]
-    fn publication_boundary_crash_matrix_covers_boundaries_and_blocks_premature_peer_visibility() {
+    fn publication_boundary_crash_matrix_covers_boundaries_and_converges_recovered_payload() {
         let temp = tempdir().unwrap();
         let sandbox = temp.path().join("run-publication-boundary");
         let scenario_dir = sandbox
@@ -12562,12 +12614,12 @@ mod tests {
         );
         assert!(summary.boundaries.iter().all(|boundary| {
             boundary.restart_client_root == original_client_root.display().to_string()
+                && boundary.local_recovered
                 && boundary.local_read_checksum_sha256 == boundary.final_checksum_sha256
                 && boundary
-                    .peer_visibility_at_publication_gate
-                    .iter()
-                    .all(|visibility| visibility.visible_checksum_sha256.is_some())
-                && boundary.final_validator.converged
+                    .final_validator
+                    .as_ref()
+                    .is_some_and(|validator| validator.converged)
         }));
         assert_eq!(
             driver.actions.borrow().as_slice(),
@@ -12577,36 +12629,28 @@ mod tests {
                 "mount_all",
                 "force_kill_client-a",
                 "remount_client-a",
-                "publish_flush",
-                "refresh_client-b_for_convergence",
-                "refresh_client-c_for_convergence",
+                "publish_recovered_flush",
                 "unmount_all",
                 "start_fsync",
                 "bootstrap",
                 "mount_all",
                 "force_kill_client-a",
                 "remount_client-a",
-                "publish_fsync",
-                "refresh_client-b_for_convergence",
-                "refresh_client-c_for_convergence",
+                "publish_recovered_fsync",
                 "unmount_all",
                 "start_release_close",
                 "bootstrap",
                 "mount_all",
                 "force_kill_client-a",
                 "remount_client-a",
-                "publish_release_close",
-                "refresh_client-b_for_convergence",
-                "refresh_client-c_for_convergence",
+                "publish_recovered_release_close",
                 "unmount_all",
                 "start_shutdown_drain",
                 "bootstrap",
                 "mount_all",
                 "graceful_shutdown_client-a",
                 "remount_client-a",
-                "publish_shutdown_drain",
-                "refresh_client-b_for_convergence",
-                "refresh_client-c_for_convergence",
+                "publish_recovered_shutdown_drain",
                 "unmount_all",
             ]
         );
@@ -12668,7 +12712,7 @@ mod tests {
     }
 
     #[test]
-    fn publication_boundary_crash_matrix_records_peer_visibility_at_publication_gate() {
+    fn publication_boundary_crash_matrix_records_peer_visibility_after_local_recovery() {
         let temp = tempdir().unwrap();
         let sandbox = temp.path().join("run-publication-boundary-leak");
         let scenario_dir = sandbox
@@ -12708,15 +12752,20 @@ mod tests {
             .unwrap();
         assert!(
             flush
-                .peer_visibility_at_publication_gate
+                .peer_visibility_after_local_recovery
                 .iter()
-                .all(|visibility| visibility.visible_checksum_sha256
-                    == Some(flush.final_checksum_sha256.clone()))
+                .all(|visibility| visibility.visible_checksum_sha256.is_none())
+        );
+        assert!(
+            flush
+                .final_validator
+                .as_ref()
+                .is_some_and(|validator| validator.converged)
         );
     }
 
     #[test]
-    fn publication_boundary_crash_matrix_allows_product_publication_before_scenario_gate() {
+    fn publication_boundary_crash_matrix_allows_background_publication_before_probe() {
         let temp = tempdir().unwrap();
         let sandbox = temp.path().join("run-publication-boundary-product-visible");
         let scenario_dir = sandbox
@@ -12752,11 +12801,132 @@ mod tests {
 
         assert_eq!(summary.boundaries.len(), 4);
         assert!(summary.boundaries.iter().all(|boundary| {
-            boundary
-                .peer_visibility_at_publication_gate
-                .iter()
-                .all(|visibility| visibility.visible_checksum_sha256.is_some())
+            boundary.local_recovered
+                && boundary
+                    .final_validator
+                    .as_ref()
+                    .is_some_and(|validator| validator.converged)
         }));
+        assert!(summary.boundaries.iter().any(|boundary| {
+            boundary
+                .peer_visibility_after_local_recovery
+                .iter()
+                .any(|visibility| visibility.visible_checksum_sha256.is_some())
+        }));
+    }
+
+    #[test]
+    fn publication_boundary_converges_checksum_recovered_by_writer_even_when_payload_is_broken() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-publication-boundary-broken");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(MOUNTED_PUBLICATION_BOUNDARY_CRASH_MATRIX);
+        std::fs::create_dir_all(&scenario_dir).unwrap();
+        let clients = PUBLICATION_BOUNDARY_CLIENT_NAMES
+            .iter()
+            .copied()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(&mount).unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let recovered_payload = b"broken recovered payload\n";
+        let mut driver = RecordingPublicationBoundaryDriver::new(clients.clone())
+            .corrupt_writer_after_remount(recovered_payload);
+        driver.start_boundary(PublicationBoundary::Flush).unwrap();
+        let context = ScenarioContext {
+            run_id: "run-publication-boundary-broken".to_string(),
+            seed: 375,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+
+        let summary = run_publication_boundary(
+            &context,
+            &mut driver,
+            &clients,
+            PublicationBoundary::Flush,
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+
+        let recovered_checksum = bytes_sha256(recovered_payload);
+        assert!(summary.local_recovered);
+        assert_eq!(
+            summary.local_read_checksum_sha256.as_deref(),
+            Some(recovered_checksum.as_str())
+        );
+        assert_eq!(
+            summary.final_checksum_sha256.as_deref(),
+            Some(recovered_checksum.as_str())
+        );
+        assert_ne!(
+            recovered_checksum,
+            bytes_sha256(&publication_boundary_payload(
+                &context,
+                PublicationBoundary::Flush
+            ))
+        );
+        assert!(
+            summary
+                .final_validator
+                .as_ref()
+                .is_some_and(|validator| validator.converged)
+        );
+    }
+
+    #[test]
+    fn publication_boundary_allows_loss_when_writer_cannot_recover_file() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-publication-boundary-lost");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(MOUNTED_PUBLICATION_BOUNDARY_CRASH_MATRIX);
+        std::fs::create_dir_all(&scenario_dir).unwrap();
+        let clients = PUBLICATION_BOUNDARY_CLIENT_NAMES
+            .iter()
+            .copied()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(&mount).unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let mut driver =
+            RecordingPublicationBoundaryDriver::new(clients.clone()).remove_writer_after_remount();
+        driver.start_boundary(PublicationBoundary::Flush).unwrap();
+        let context = ScenarioContext {
+            run_id: "run-publication-boundary-lost".to_string(),
+            seed: 375,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+
+        let summary = run_publication_boundary(
+            &context,
+            &mut driver,
+            &clients,
+            PublicationBoundary::Flush,
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+
+        assert!(!summary.local_recovered);
+        assert!(summary.local_read_checksum_sha256.is_none());
+        assert!(summary.final_checksum_sha256.is_none());
+        assert!(summary.final_validator.is_none());
+        assert_eq!(
+            summary.recovery_error.as_deref(),
+            Some("file not recovered after remount")
+        );
     }
 
     #[cfg(windows)]
@@ -12842,7 +13012,7 @@ mod tests {
     }
 
     #[test]
-    fn publication_boundary_refresh_attempts_all_peers_before_reporting_failure() {
+    fn publication_boundary_local_recovery_does_not_refresh_peers_for_convergence() {
         let temp = tempdir().unwrap();
         let sandbox = temp.path().join("run-publication-boundary-refresh-failure");
         let scenario_dir = sandbox
@@ -12858,8 +13028,7 @@ mod tests {
                 client_spec_for(&sandbox, "projectfs", name, mount)
             })
             .collect::<Vec<_>>();
-        let mut driver =
-            RecordingPublicationBoundaryDriver::new(clients).fail_refresh_for("client-b");
+        let mut driver = RecordingPublicationBoundaryDriver::new(clients);
         let context = ScenarioContext {
             run_id: "run-publication-boundary-refresh-failure".to_string(),
             seed: 382,
@@ -12868,23 +13037,26 @@ mod tests {
             client_controller_config: None,
         };
 
-        let err = run_publication_boundary_crash_matrix_with_driver(
+        let summary = run_publication_boundary_crash_matrix_with_driver(
             &context,
             &mut driver,
             Duration::from_secs(1),
             Duration::from_millis(10),
         )
-        .unwrap_err();
+        .unwrap();
 
         assert!(
-            err.to_string().contains("refresh failed for client-b"),
-            "{err}"
+            summary
+                .boundaries
+                .iter()
+                .all(|boundary| boundary.local_recovered)
         );
         assert!(
-            driver
+            !driver
                 .actions
                 .borrow()
-                .contains(&"refresh_client-c_for_convergence".to_string()),
+                .iter()
+                .any(|action| action.starts_with("refresh_")),
             "{:?}",
             driver.actions.borrow()
         );

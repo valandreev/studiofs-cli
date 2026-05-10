@@ -273,6 +273,10 @@ impl StudioVfs {
 
     /// Best-effort graceful shutdown: drain pending local state, persist the
     /// cached-store upload journal, cancel uploader tasks, then persist upload state.
+    ///
+    /// Shutdown is a Local First boundary. It must make accepted local state
+    /// recoverable after remount, but it must not force remote metadata
+    /// publication into the foreground unmount path.
     pub async fn shutdown(&self, upload_drain_timeout: Duration) {
         if self
             .state
@@ -366,27 +370,27 @@ impl StudioVfs {
         }
         self.join_uploader_task(background_join_timeout).await;
 
-        // Phase 4: persist metadata + cache checkpoint.
+        // Phase 4: persist local metadata + cache checkpoint.
         info!(
             elapsed_ms = t0.elapsed().as_millis() as u64,
-            "VFS shutdown: persisting metadata"
+            "VFS shutdown: persisting local metadata checkpoint"
         );
         let meta = self.sync_meta();
         let metadata_flush_timeout = self.shutdown_metadata_flush_timeout;
         let metadata_flush_outcome = match super::run_sync_with_timeout(
             metadata_flush_timeout,
-            move || meta.flush_metadata().map_err(VfsError::Meta),
+            move || meta.flush_local_metadata().map_err(VfsError::Meta),
         ) {
             Ok(Some(())) => "success",
             Ok(None) => {
                 warn!(
                     timeout_ms = metadata_flush_timeout.as_millis() as u64,
-                    "VFS shutdown: metadata flush timed out, leaving remote sync for next session"
+                    "VFS shutdown: local metadata checkpoint timed out, leaving recovery to existing checkpoint"
                 );
                 "timeout"
             }
             Err(e) => {
-                warn!("VFS shutdown: metadata flush failed: {}", e);
+                warn!("VFS shutdown: local metadata checkpoint failed: {}", e);
                 "failed"
             }
         };

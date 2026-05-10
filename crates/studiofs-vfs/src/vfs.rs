@@ -3309,10 +3309,11 @@ impl<'a> StartupReplayCoordinator<'a> {
         self.orphan_dirty_payloads_removed = self
             .orphan_dirty_payloads_removed
             .saturating_add(orphan_count);
+        let sample_object_ids: Vec<u64> = self.dirty_set.iter().copied().take(8).collect();
         for object_id in &self.dirty_set {
-            warn!(
+            debug!(
                 object_id,
-                "removing orphan dirty payload object without metadata reference"
+                "removing orphan dirty payload object without metadata reference during startup cleanup"
             );
             self.vfs.local_payload_backend.remove(*object_id);
             self.vfs
@@ -3329,6 +3330,7 @@ impl<'a> StartupReplayCoordinator<'a> {
             .fetch_add(orphan_count, Ordering::Relaxed);
         info!(
             orphan_dirty_payloads = self.dirty_set.len(),
+            sample_object_ids = ?sample_object_ids,
             "startup cleanup removed orphan dirty local backend entries"
         );
     }

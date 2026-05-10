@@ -2,7 +2,9 @@ use super::{DeletedInodeCleanup, Ino, MetaError, StudioVfs, VfsMeta, VfsResult};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-use crate::runtime::run_meta;
+use crate::runtime::{run_local_cache_io_blocking, run_meta};
+
+const FOREGROUND_DELETED_PAYLOAD_EVICTION_LIMIT: usize = 2_000;
 
 pub(super) struct RegularFileGraphUsage {
     pub(super) object_ids: Vec<u64>,
@@ -243,6 +245,13 @@ impl StudioVfs {
         }
 
         self.upload_hot_remove_batch(object_ids);
+        if object_ids.len() > FOREGROUND_DELETED_PAYLOAD_EVICTION_LIMIT {
+            self.queue_deleted_payload_cache_removal(ino, object_ids.to_vec(), forced_pinned);
+            self.readahead.evict(ino);
+            self.clear_access_tracking(ino);
+            return;
+        }
+
         if let Err(error) = self.upload_stage_remove_batch_async(object_ids).await {
             warn!(
                 ino,
@@ -271,6 +280,51 @@ impl StudioVfs {
         // Invalidate readahead state for this inode.
         self.readahead.evict(ino);
         self.clear_access_tracking(ino);
+    }
+
+    fn queue_deleted_payload_cache_removal(
+        &self,
+        ino: Ino,
+        object_ids: Vec<u64>,
+        forced_pinned: usize,
+    ) {
+        if object_ids.is_empty() {
+            return;
+        }
+        let cached_store = self.cached_store.clone();
+        let payload_store = self.local_payload_backend.clone();
+        let removed_blocks = object_ids.len();
+        let sample_object_ids: Vec<u64> = object_ids.iter().copied().take(8).collect();
+        info!(
+            ino,
+            removed_blocks,
+            forced_pinned,
+            sample_object_ids = ?sample_object_ids,
+            "evict_inode: queued deleted payload cache removal in background"
+        );
+        let handle = tokio::spawn(async move {
+            let result = run_local_cache_io_blocking(move || {
+                cached_store.remove_staged_upload_batch(&object_ids);
+                payload_store.remove_batch(&object_ids);
+                Ok(())
+            })
+            .await;
+            match result {
+                Ok(((), _timing)) => debug!(
+                    ino,
+                    removed_blocks,
+                    forced_pinned,
+                    "evict_inode: background deleted payload cache removal complete"
+                ),
+                Err(error) => warn!(
+                    ino,
+                    removed_blocks,
+                    error = %error,
+                    "evict_inode: background deleted payload cache removal failed"
+                ),
+            }
+        });
+        self.track_background_task(handle);
     }
 
     pub(super) async fn evict_payload_objects_from_caches(&self, ino: Ino, object_ids: &[u64]) {
