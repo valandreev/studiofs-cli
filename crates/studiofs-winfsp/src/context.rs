@@ -898,6 +898,15 @@ impl StudioFsContext {
         self.handle_drain().flush(ino, fh)
     }
 
+    fn run_volume_flush_callback(&self) -> studiofs_vfs::VfsResult<()> {
+        let vfs = self.vfs.clone();
+        self.spawn_wait(async move {
+            vfs.flush_winfsp_volume_writeback_with_outcome()
+                .await
+                .map(|_| ())
+        })
+    }
+
     fn run_close_callback(&self, ino: Ino, fh: u64) {
         self.handle_drain().close(ino, fh);
     }
@@ -1861,7 +1870,9 @@ impl FileSystemContext for StudioFsContext {
             *file_info = attr_to_file_info(&attr);
             debug!(ino = ctx.ino, "flush");
         } else {
-            self.vfs.note_winfsp_flush_callback();
+            self.run_volume_flush_callback()
+                .map_err(vfs_to_winfsp_err)?;
+            debug!("volume flush");
         }
         Ok(())
     }
@@ -3131,6 +3142,54 @@ mod tests {
             read_back.as_ref(),
             payload,
             "explicit flush should leave the file immediately readable through a fresh read"
+        );
+
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.release_fh(fh).await }
+        })
+        .expect("release_fh");
+    }
+
+    #[test]
+    fn volume_flush_callback_drains_buffered_write_without_file_context() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("write_callback_volume_flush");
+        let attr = vfs
+            .create(ROOT_INO, b"buffered-write-volume-flush.txt", 0, 0, 0o644)
+            .expect("create");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open_file");
+        let handle = StudioFileHandle::new(attr.ino, false, fh, OpenFlags::RDWR);
+        let mut file_info = winfsp::filesystem::FileInfo::default();
+        let payload = b"volume flush publication boundary payload";
+        let sync_calls_before = sync_data_calls(&vfs);
+
+        <StudioFsContext as FileSystemContext>::write(
+            &ctx,
+            &handle,
+            payload,
+            0,
+            false,
+            false,
+            &mut file_info,
+        )
+        .expect("write callback");
+        assert!(
+            vfs.inode_has_local_dirty_state(attr.ino),
+            "buffered WinFSP writes should be dirty before the volume flush"
+        );
+
+        <StudioFsContext as FileSystemContext>::flush(&ctx, None, &mut file_info)
+            .expect("volume flush callback");
+
+        assert!(
+            sync_data_calls(&vfs) > sync_calls_before,
+            "WinFSP volume flush should cross the local payload sync boundary"
+        );
+        assert!(
+            !vfs.inode_has_local_dirty_state(attr.ino),
+            "WinFSP volume flush should drain every dirty inode before returning"
         );
 
         ctx.spawn_wait({

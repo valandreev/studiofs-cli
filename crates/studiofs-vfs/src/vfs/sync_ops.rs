@@ -668,6 +668,28 @@ impl StudioVfs {
             .await
     }
 
+    /// Flushes every dirty inode for WinFSP volume-level flush callbacks.
+    pub async fn flush_winfsp_volume_writeback_with_outcome(
+        self: &Arc<Self>,
+    ) -> VfsResult<ExplicitFlushOutcome> {
+        self.note_winfsp_flush_callback();
+        let dirty_inodes = self.shutdown_dirty_inodes_by_priority();
+        let mut flushed_local_dirty_state = false;
+
+        for ino in dirty_inodes {
+            if !self.inode_has_local_dirty_state(ino) {
+                continue;
+            }
+            let outcome = self.flush_winfsp_writeback_with_outcome(ino, 0).await?;
+            flushed_local_dirty_state |= outcome.flushed_local_dirty_state;
+        }
+
+        self.note_winfsp_flush_barrier_outcome(flushed_local_dirty_state);
+        Ok(ExplicitFlushOutcome {
+            flushed_local_dirty_state,
+        })
+    }
+
     async fn flush_winfsp_writeback_with_policy(
         self: &Arc<Self>,
         ino: Ino,
