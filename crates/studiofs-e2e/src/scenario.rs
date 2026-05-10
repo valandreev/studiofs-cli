@@ -2358,6 +2358,8 @@ fn run_publication_boundary(
             &relative_path,
             &payload,
         )?;
+    } else {
+        wait_for_publication_boundary_readback(writer, &relative_path, &payload, boundary)?;
     }
 
     let restart_started = Instant::now();
@@ -2376,6 +2378,13 @@ fn run_publication_boundary(
         MOUNTED_WRITE_READBACK_POLL_INTERVAL,
     )?;
     if local_read_payload != payload {
+        write_publication_boundary_readback_mismatch_artifacts(
+            context,
+            boundary,
+            &relative_path,
+            &payload,
+            &local_read_payload,
+        );
         return Err(ScenarioError::Io(std::io::Error::other(format!(
             "publication boundary durability failure: data read after restart does not match written payload for {relative_path}: expected_len={} expected_checksum={} actual_len={} actual_checksum={}",
             payload.len(),
@@ -2425,6 +2434,68 @@ fn run_publication_boundary(
     };
     write_publication_boundary_operations(context, &summary)?;
     Ok(summary)
+}
+
+fn wait_for_publication_boundary_readback(
+    client: &ClientSpec,
+    relative_path: &str,
+    payload: &[u8],
+    boundary: PublicationBoundary,
+) -> Result<(), ScenarioError> {
+    let path = client.mount_point.join(relative_path);
+    let readback = wait_for_mounted_payload_readback(
+        &path,
+        payload,
+        MOUNTED_WRITE_READBACK_TIMEOUT,
+        MOUNTED_WRITE_READBACK_POLL_INTERVAL,
+    )?;
+    if readback != payload {
+        return Err(ScenarioError::Io(std::io::Error::other(format!(
+            "publication boundary {} readback did not match written payload for {relative_path}: expected_len={} expected_checksum={} actual_len={} actual_checksum={}",
+            publication_boundary_log_name(boundary),
+            payload.len(),
+            bytes_sha256(payload),
+            readback.len(),
+            bytes_sha256(&readback)
+        ))));
+    }
+    Ok(())
+}
+
+fn write_publication_boundary_readback_mismatch_artifacts(
+    context: &ScenarioContext,
+    boundary: PublicationBoundary,
+    relative_path: &str,
+    expected_payload: &[u8],
+    actual_payload: &[u8],
+) {
+    let slug = publication_boundary_slug(boundary);
+    let _ = fs::create_dir_all(&context.scenario_dir);
+    let expected_path = context
+        .scenario_dir
+        .join(format!("publication-boundary-{slug}-expected.bin"));
+    let actual_path = context
+        .scenario_dir
+        .join(format!("publication-boundary-{slug}-actual.bin"));
+    let diagnostic_path = context.scenario_dir.join(format!(
+        "publication-boundary-{slug}-readback-mismatch.json"
+    ));
+    let _ = fs::write(&expected_path, expected_payload);
+    let _ = fs::write(&actual_path, actual_payload);
+    let diagnostic = json!({
+        "boundary": boundary,
+        "relative_path": relative_path,
+        "expected_len": expected_payload.len(),
+        "expected_checksum_sha256": bytes_sha256(expected_payload),
+        "actual_len": actual_payload.len(),
+        "actual_checksum_sha256": bytes_sha256(actual_payload),
+        "expected_artifact": expected_path.display().to_string(),
+        "actual_artifact": actual_path.display().to_string(),
+    });
+    let _ = fs::write(
+        diagnostic_path,
+        serde_json::to_vec_pretty(&diagnostic).unwrap_or_default(),
+    );
 }
 
 fn apply_publication_boundary(
