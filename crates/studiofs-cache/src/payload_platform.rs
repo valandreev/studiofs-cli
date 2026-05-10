@@ -10,14 +10,12 @@ const WINDOWS_UNBUFFERED_WRITE_ALIGNMENT: usize = 4096;
 const WINDOWS_VOLUME_PATH_BUFFER_U16: usize = 32_768;
 
 #[derive(Debug, Default)]
-/// Struct $name.
 pub struct UnbufferedWriteBuffer {
     #[cfg(any(windows, test))]
     backing: Vec<u8>,
 }
 
 impl UnbufferedWriteBuffer {
-    /// Function $name.
     pub fn new() -> Self {
         Self::default()
     }

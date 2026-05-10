@@ -8,7 +8,6 @@ use tokio_util::sync::CancellationToken;
 use crate::vfs::VfsConfig;
 
 #[derive(Debug)]
-/// Struct $name.
 pub struct QosController {
     accept_slots: Arc<Semaphore>,
     materialize_slots: Arc<Semaphore>,
@@ -17,7 +16,6 @@ pub struct QosController {
 }
 
 impl QosController {
-    /// Function $name.
     pub fn from_config(config: &VfsConfig) -> Self {
         Self {
             accept_slots: Arc::new(Semaphore::new(config.qos_accept_slots.max(1))),
@@ -27,80 +25,61 @@ impl QosController {
         }
     }
 
-    /// Function $name.
     pub async fn acquire_accept(&self) -> Result<OwnedSemaphorePermit, tokio::sync::AcquireError> {
         self.accept_slots.clone().acquire_owned().await
     }
 
-    /// Function $name.
     pub fn try_acquire_accept(&self) -> Option<OwnedSemaphorePermit> {
         self.accept_slots.clone().try_acquire_owned().ok()
     }
 
-    /// Function $name.
     pub async fn acquire_materialize(
         &self,
     ) -> Result<OwnedSemaphorePermit, tokio::sync::AcquireError> {
         self.materialize_slots.clone().acquire_owned().await
     }
 
-    /// Function $name.
     pub async fn acquire_commit(&self) -> Result<OwnedSemaphorePermit, tokio::sync::AcquireError> {
         self.commit_slots.clone().acquire_owned().await
     }
 
-    /// Function $name.
     pub async fn acquire_fetch(&self) -> Result<OwnedSemaphorePermit, tokio::sync::AcquireError> {
         self.fetch_slots.clone().acquire_owned().await
     }
 
-    /// Function $name.
     pub fn accept_available(&self) -> usize {
         self.accept_slots.available_permits()
     }
 
-    /// Function $name.
     pub fn materialize_available(&self) -> usize {
         self.materialize_slots.available_permits()
     }
 
-    /// Function $name.
     pub fn commit_available(&self) -> usize {
         self.commit_slots.available_permits()
     }
 
-    /// Function $name.
     pub fn fetch_available(&self) -> usize {
         self.fetch_slots.available_permits()
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// Enum $name.
 pub enum TransitPriority {
-    /// Variant $name.
     Foreground,
-    /// Variant $name.
     Background,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// Struct $name.
 pub struct TransitMemorySnapshot {
-    /// Field $name.
     pub budget_bytes: usize,
-    /// Field $name.
     pub used_bytes: usize,
-    /// Field $name.
     pub available_bytes: usize,
-    /// Field $name.
     pub waiting_foreground: usize,
-    /// Field $name.
     pub waiting_background: usize,
 }
 
 #[derive(Debug)]
-/// Struct $name.
 pub struct TransitMemoryBudget {
     budget_bytes: AtomicUsize,
     state: Mutex<TransitMemoryBudgetState>,
@@ -116,14 +95,12 @@ struct TransitMemoryBudgetState {
 
 #[derive(Debug)]
 #[must_use = "guard must be held to maintain transit memory budget reservation"]
-/// Struct $name.
 pub struct TransitMemoryGuard {
     budget: Arc<TransitMemoryBudget>,
     bytes: usize,
 }
 
 impl TransitMemoryBudget {
-    /// Function $name.
     pub fn new(budget_bytes: usize) -> Arc<Self> {
         Arc::new(Self {
             budget_bytes: AtomicUsize::new(budget_bytes.max(1)),
@@ -132,7 +109,6 @@ impl TransitMemoryBudget {
         })
     }
 
-    /// Function $name.
     pub fn budget_bytes(&self) -> usize {
         self.budget_bytes.load(Ordering::Acquire)
     }
@@ -148,7 +124,6 @@ impl TransitMemoryBudget {
         self.notify.notify_waiters();
     }
 
-    /// Function $name.
     pub fn snapshot(&self) -> TransitMemorySnapshot {
         let budget = self.budget_bytes();
         let state = self.state.lock();
@@ -161,17 +136,14 @@ impl TransitMemoryBudget {
         }
     }
 
-    /// Function $name.
     pub async fn acquire_foreground(self: &Arc<Self>, bytes: usize) -> TransitMemoryGuard {
         self.acquire(TransitPriority::Foreground, bytes).await
     }
 
-    /// Function $name.
     pub async fn acquire_background(self: &Arc<Self>, bytes: usize) -> TransitMemoryGuard {
         self.acquire(TransitPriority::Background, bytes).await
     }
 
-    /// Function $name.
     pub async fn acquire_background_cancelable(
         self: &Arc<Self>,
         bytes: usize,

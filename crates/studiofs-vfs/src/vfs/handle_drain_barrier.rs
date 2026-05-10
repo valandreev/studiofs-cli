@@ -2,22 +2,15 @@ use super::{ExplicitFlushOutcome, ReleaseFhOutcome, VfsError, VfsResult};
 use studiofs_meta::types::Ino;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// Struct $name.
 pub struct HandleDrainRequest {
-    /// Field $name.
     pub ino: Ino,
-    /// Field $name.
     pub fh: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/// Struct $name.
 pub struct HandleDrainDeleteRequest {
-    /// Field $name.
     pub ino: Ino,
-    /// Field $name.
     pub parent_ino: Ino,
-    /// Field $name.
     pub name: Vec<u8>,
     /// The bridge passes the callback's delete intent explicitly so the delete
     /// adapter can choose `unlink` vs `rmdir` without reloading inode state
@@ -25,65 +18,45 @@ pub struct HandleDrainDeleteRequest {
     pub is_dir: bool,
 }
 
-/// Trait $name.
 pub trait LocalSyncBarrierPort {
-    /// Function $name.
     fn inode_has_local_dirty_state(&self, ino: Ino) -> bool;
 
-    /// Function $name.
     fn explicit_flush(&self, request: HandleDrainRequest) -> VfsResult<ExplicitFlushOutcome>;
 }
 
-/// Trait $name.
 pub trait HandleReleasePort {
-    /// Function $name.
     fn release_handle(&self, request: HandleDrainRequest) -> VfsResult<ReleaseFhOutcome>;
 }
 
-/// Trait $name.
 pub trait DeferredCleanupHintPort {
-    /// Function $name.
     fn set_deferred_cleanup_hint(&self, ino: Ino);
 
-    /// Function $name.
     fn clear_deferred_cleanup_hint(&self, ino: Ino);
 
-    /// Function $name.
     fn take_deferred_cleanup_hint(&self, ino: Ino) -> bool;
 
-    /// Function $name.
     fn has_deferred_cleanup_hint(&self, ino: Ino) -> bool;
 }
 
-/// Trait $name.
 pub trait FlushGatePort {
-    /// Function $name.
     fn with_flush_gate<T, F>(&self, ino: Ino, op: F) -> VfsResult<T>
     where
         F: FnOnce() -> VfsResult<T>;
 }
 
-/// Trait $name.
 pub trait DeleteCleanupPort {
-    /// Function $name.
     fn cleanup_delete(&self, request: HandleDrainDeleteRequest);
 }
 
-/// Trait $name.
 pub trait BarrierObservabilityPort {
-    /// Function $name.
     fn note_cleanup_callback(&self);
 
-    /// Function $name.
     fn note_flush_callback(&self);
 
-    /// Function $name.
     fn note_flush_barrier_outcome(&self, flushed_local_dirty_state: bool);
 
-    /// Function $name.
     fn note_close_callback(&self);
 
-    /// Function $name.
     fn note_release_success(
         &self,
         request: HandleDrainRequest,
@@ -91,7 +64,6 @@ pub trait BarrierObservabilityPort {
         outcome: ReleaseFhOutcome,
     );
 
-    /// Function $name.
     fn note_release_error(
         &self,
         request: HandleDrainRequest,
@@ -100,7 +72,6 @@ pub trait BarrierObservabilityPort {
     );
 }
 
-/// Struct $name.
 pub struct HandleDrainBarrier<
     LocalSync,
     HandleRelease,
@@ -134,7 +105,6 @@ where
     DeleteCleanup: DeleteCleanupPort,
     Observability: BarrierObservabilityPort,
 {
-    /// Function $name.
     pub fn new(
         local_sync: LocalSync,
         handle_release: HandleRelease,
@@ -153,7 +123,6 @@ where
         }
     }
 
-    /// Function $name.
     pub fn on_flush(&self, request: HandleDrainRequest) -> VfsResult<()> {
         self.observability.note_flush_callback();
         let flushed = self.flush_gate.with_flush_gate(request.ino, || {
@@ -169,7 +138,6 @@ where
         Ok(())
     }
 
-    /// Function $name.
     pub fn on_cleanup_non_delete(&self, request: HandleDrainRequest) {
         self.observability.note_cleanup_callback();
         if request.fh != 0 && self.local_sync.inode_has_local_dirty_state(request.ino) {
@@ -178,7 +146,6 @@ where
         }
     }
 
-    /// Function $name.
     pub fn on_close(&self, request: HandleDrainRequest) {
         self.observability.note_close_callback();
         if request.fh == 0 {
@@ -190,12 +157,10 @@ where
         let _ = self.try_release(request);
     }
 
-    /// Function $name.
     pub fn on_release(&self, request: HandleDrainRequest) -> VfsResult<()> {
         self.try_release(request)
     }
 
-    /// Function $name.
     pub fn on_cleanup_delete(&self, request: HandleDrainDeleteRequest) {
         self.observability.note_cleanup_callback();
         self.delete_cleanup.cleanup_delete(request);

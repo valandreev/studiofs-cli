@@ -22,15 +22,6 @@ const DEFAULT_ALLOCATION_UNIT_SIZE: u32 = 1024 * 1024;
 const DEFAULT_MAX_DISPATCHER_THREADS: u32 = 16;
 const DEFAULT_ALLOW_OPEN_IN_KERNEL_MODE: bool = true;
 const DEFAULT_FLUSH_AND_PURGE_ON_CLEANUP: bool = false;
-const DEFAULT_PERSISTENT_ACLS: bool = false;
-// Temporary SFS-388 mitigation: coarse guarding serializes WinFSP callbacks and
-// can reduce multi-threaded throughput, but avoids rename preflight hangs until
-// the notification/rename lock interaction has a narrower fix.
-const DEFAULT_COARSE_OPERATION_GUARD: bool = true;
-// Temporary SFS-388 mitigation: WinFSP kernel notifications stay opt-in because
-// the notification timer can interact with rename preflight before our callback
-// is posted. Re-enable by default only after that path has a narrower fix.
-const DEFAULT_KERNEL_NOTIFICATIONS: bool = false;
 const DEFAULT_SECTORS_PER_ALLOCATION_UNIT: u16 =
     (DEFAULT_ALLOCATION_UNIT_SIZE / DEFAULT_SECTOR_SIZE as u32) as u16;
 static WINFSP_RUNTIME_DLL_LOAD: OnceLock<Result<(), String>> = OnceLock::new();
@@ -54,9 +45,6 @@ struct WinfspMountOptions {
     dispatcher_threads: u32,
     allow_open_in_kernel_mode: bool,
     flush_and_purge_on_cleanup: bool,
-    persistent_acls: bool,
-    coarse_operation_guard: bool,
-    kernel_notifications: bool,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -69,19 +57,12 @@ enum MountOptionError {
     InvalidDriveMountPoint(String),
 }
 
-/// Struct $name.
 pub struct WinfspMountRequest {
-    /// Field $name.
     pub vfs: std::sync::Arc<studiofs_vfs::StudioVfs>,
-    /// Field $name.
     pub runtime_handle: tokio::runtime::Handle,
-    /// Field $name.
     pub mount_point: String,
-    /// Field $name.
     pub volume_label: String,
-    /// Field $name.
     pub read_only: bool,
-    /// Field $name.
     pub shutdown_event_name: Option<String>,
 }
 
@@ -222,16 +203,6 @@ fn parse_mount_options(volume_label: &str) -> Result<WinfspMountOptions, MountOp
         "STUDIOFS_WINFSP_FLUSH_AND_PURGE_ON_CLEANUP",
         DEFAULT_FLUSH_AND_PURGE_ON_CLEANUP,
     );
-    let persistent_acls =
-        parse_bool_env("STUDIOFS_WINFSP_PERSISTENT_ACLS", DEFAULT_PERSISTENT_ACLS);
-    let coarse_operation_guard = parse_bool_env(
-        "STUDIOFS_WINFSP_COARSE_OPERATION_GUARD",
-        DEFAULT_COARSE_OPERATION_GUARD,
-    );
-    let kernel_notifications = parse_bool_env(
-        "STUDIOFS_WINFSP_KERNEL_NOTIFICATIONS",
-        DEFAULT_KERNEL_NOTIFICATIONS,
-    );
 
     Ok(WinfspMountOptions {
         volume_label: trimmed.to_string(),
@@ -243,9 +214,6 @@ fn parse_mount_options(volume_label: &str) -> Result<WinfspMountOptions, MountOp
         dispatcher_threads,
         allow_open_in_kernel_mode,
         flush_and_purge_on_cleanup,
-        persistent_acls,
-        coarse_operation_guard,
-        kernel_notifications,
     })
 }
 
@@ -428,11 +396,10 @@ fn apply_volume_params(
     volume_params.file_info_timeout(options.file_info_timeout_ms);
     volume_params.dir_info_timeout(options.dir_info_timeout_ms);
     volume_params.volume_info_timeout(options.volume_info_timeout_ms);
-    // Keep WinFSP's cache-manager / fast-I/O path enabled by default. A zero or
-    // short FileInfo timeout prevents AJA-style repeated reads from reusing the
-    // OS cache across measurement passes. SFS-388 still keeps kernel
-    // notifications opt-in and serializes callbacks; the stale-size bug is
-    // handled at the metadata projection and local dirty-attr barriers.
+    // Keep WinFSP's cache-manager / fast-I/O path enabled by default. Tests or
+    // targeted multi-client invalidation runs can bound this with
+    // STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS.
+    // Write-capable handles still opt out of the OS file cache at Create/Open time.
     volume_params.flush_and_purge_on_cleanup(options.flush_and_purge_on_cleanup);
     Ok(())
 }
@@ -488,7 +455,7 @@ fn invalid_input_io_error(err: MountOptionError) -> std::io::Error {
 /// external process (`studiofs umount`) can signal a graceful shutdown.
 pub fn mount_and_serve(request: WinfspMountRequest) -> std::io::Result<()> {
     use studiofs_meta::Ino;
-    use winfsp::host::{FileSystemHost, FileSystemParams, OperationGuardStrategy, VolumeParams};
+    use winfsp::host::{FileSystemHost, FileSystemParams, VolumeParams};
 
     ensure_winfsp_runtime_loaded()?;
 
@@ -502,35 +469,11 @@ pub fn mount_and_serve(request: WinfspMountRequest) -> std::io::Result<()> {
     } = request;
 
     let options = parse_mount_options(&volume_label).map_err(invalid_input_io_error)?;
-    let operation_guard_strategy = if options.coarse_operation_guard {
-        "coarse"
-    } else {
-        "fine"
-    };
-    tracing::debug!(
-        mount_point = %mount_point,
-        volume_label = %options.volume_label,
-        file_info_timeout_ms = options.file_info_timeout_ms,
-        dir_info_timeout_ms = options.dir_info_timeout_ms,
-        volume_info_timeout_ms = options.volume_info_timeout_ms,
-        sector_size = options.sector_size,
-        sectors_per_allocation_unit = options.sectors_per_allocation_unit,
-        dispatcher_threads = options.dispatcher_threads,
-        allow_open_in_kernel_mode = options.allow_open_in_kernel_mode,
-        flush_and_purge_on_cleanup = options.flush_and_purge_on_cleanup,
-        persistent_acls = options.persistent_acls,
-        operation_guard_strategy,
-        kernel_notifications = options.kernel_notifications,
-        "WinFSP mount options"
-    );
-
     let mut volume_params = VolumeParams::new();
     volume_params.case_sensitive_search(true);
     volume_params.case_preserved_names(true);
     volume_params.unicode_on_disk(true);
-    // StudioFS currently exposes a synthetic default security descriptor on
-    // Windows, but does not persist or enforce per-file ACLs.
-    volume_params.persistent_acls(options.persistent_acls);
+    volume_params.persistent_acls(true);
     volume_params.reparse_points(true);
     volume_params.named_streams(false);
     volume_params.read_only_volume(read_only);
@@ -555,24 +498,19 @@ pub fn mount_and_serve(request: WinfspMountRequest) -> std::io::Result<()> {
     )
     .map_err(|err| std::io::Error::other(format!("failed to initialize WinFSP context: {err}")))?;
 
-    // Keep WinFSP kernel notifications opt-in until the notification timer can
-    // never hold FspFileSystemNotifyBegin across rename preflight.
-    let mut filesystem_params = FileSystemParams::default_params(volume_params);
-    if options.coarse_operation_guard {
-        // Diagnostic/mitigation knob for SFS-388: rename preflight can stall
-        // before WinFSP posts our Rename callback. Coarse guarding serializes
-        // callbacks and helps isolate operation-guard interactions.
-        filesystem_params.guard_strategy = OperationGuardStrategy::Coarse;
-    }
-    let mut host = if options.kernel_notifications {
-        FileSystemHost::new_with_timer_async::<Vec<Ino>, 250>(filesystem_params, context).map_err(
-            |err| std::io::Error::other(format!("failed to initialize WinFSP host: {err}")),
-        )?
-    } else {
-        FileSystemHost::new_with_options_async(filesystem_params, context).map_err(|err| {
-            std::io::Error::other(format!("failed to initialize WinFSP host: {err}"))
-        })?
-    };
+    // Use `new_with_timer_async` so read/write/readdir can return
+    // STATUS_PENDING and complete from the Tokio runtime without parking
+    // WinFSP dispatcher threads behind local cache I/O. The timer still
+    // periodically calls
+    // our `NotifyingFileSystemContext` impl, which sends `FspFileSystemNotify`
+    // for metadata-driven invalidations. The const generic (250) is the
+    // timer interval in milliseconds — short enough for snappy Explorer
+    // refreshes, long enough to batch rapid sequences.
+    let mut host = FileSystemHost::new_with_timer_async::<Vec<Ino>, 250>(
+        FileSystemParams::default_params(volume_params),
+        context,
+    )
+    .map_err(|err| std::io::Error::other(format!("failed to initialize WinFSP host: {err}")))?;
     let mount_manager_path =
         mount_manager_mount_point(&mount_point).map_err(invalid_input_io_error)?;
     host.mount(&mount_manager_path).map_err(|err| {
@@ -718,12 +656,11 @@ mod tests {
 
     use super::{
         DEFAULT_ALLOCATION_UNIT_SIZE, DEFAULT_ALLOW_OPEN_IN_KERNEL_MODE,
-        DEFAULT_COARSE_OPERATION_GUARD, DEFAULT_DIR_INFO_TIMEOUT_MS, DEFAULT_FILE_INFO_TIMEOUT_MS,
-        DEFAULT_FLUSH_AND_PURGE_ON_CLEANUP, DEFAULT_KERNEL_NOTIFICATIONS, DEFAULT_PERSISTENT_ACLS,
-        DEFAULT_SECTOR_SIZE, DEFAULT_SECTORS_PER_ALLOCATION_UNIT, DEFAULT_VOLUME_INFO_TIMEOUT_MS,
-        MountOptionError, canonical_drive_mount_point, default_dispatcher_threads,
-        is_drive_root_mount_point, mount_manager_mount_point, parse_mount_options,
-        winfsp_dll_stem_for_arch,
+        DEFAULT_DIR_INFO_TIMEOUT_MS, DEFAULT_FILE_INFO_TIMEOUT_MS,
+        DEFAULT_FLUSH_AND_PURGE_ON_CLEANUP, DEFAULT_SECTOR_SIZE,
+        DEFAULT_SECTORS_PER_ALLOCATION_UNIT, DEFAULT_VOLUME_INFO_TIMEOUT_MS, MountOptionError,
+        canonical_drive_mount_point, default_dispatcher_threads, is_drive_root_mount_point,
+        mount_manager_mount_point, parse_mount_options, winfsp_dll_stem_for_arch,
     };
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -752,9 +689,6 @@ mod tests {
             std::env::remove_var("STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE");
             std::env::remove_var("STUDIOFS_WINFSP_ALLOW_OPEN_IN_KERNEL_MODE");
             std::env::remove_var("STUDIOFS_WINFSP_FLUSH_AND_PURGE_ON_CLEANUP");
-            std::env::remove_var("STUDIOFS_WINFSP_PERSISTENT_ACLS");
-            std::env::remove_var("STUDIOFS_WINFSP_COARSE_OPERATION_GUARD");
-            std::env::remove_var("STUDIOFS_WINFSP_KERNEL_NOTIFICATIONS");
         }
         let opts = parse_mount_options("  StudioFS  ").expect("options");
         assert_eq!(opts.volume_label, "StudioFS");
@@ -775,9 +709,6 @@ mod tests {
             opts.flush_and_purge_on_cleanup,
             DEFAULT_FLUSH_AND_PURGE_ON_CLEANUP
         );
-        assert_eq!(opts.persistent_acls, DEFAULT_PERSISTENT_ACLS);
-        assert_eq!(opts.coarse_operation_guard, DEFAULT_COARSE_OPERATION_GUARD);
-        assert_eq!(opts.kernel_notifications, DEFAULT_KERNEL_NOTIFICATIONS);
     }
 
     #[test]
@@ -787,31 +718,10 @@ mod tests {
         // process environment variables for deterministic parsing behavior.
         unsafe {
             std::env::remove_var("STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS");
-            std::env::remove_var("STUDIOFS_WINFSP_KERNEL_NOTIFICATIONS");
         }
 
         let opts = parse_mount_options("StudioFS").expect("options");
-        assert_eq!(
-            opts.file_info_timeout_ms,
-            u32::MAX,
-            "FileInfo must keep WinFSP cache-manager reads hot by default"
-        );
-    }
-
-    #[test]
-    fn parse_mount_options_disables_kernel_notifications_by_default() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
-        // SAFETY: Tests are single-threaded via `_guard` and temporarily mutate
-        // process environment variables for deterministic parsing behavior.
-        unsafe {
-            std::env::remove_var("STUDIOFS_WINFSP_KERNEL_NOTIFICATIONS");
-        }
-
-        let opts = parse_mount_options("StudioFS").expect("options");
-        assert!(
-            !opts.kernel_notifications,
-            "WinFSP kernel notifications must be opt-in until rename preflight blocking is safe"
-        );
+        assert_eq!(opts.file_info_timeout_ms, u32::MAX);
     }
 
     #[test]
@@ -899,72 +809,6 @@ mod tests {
         // variables that were written earlier in the test.
         unsafe {
             std::env::remove_var("STUDIOFS_WINFSP_FLUSH_AND_PURGE_ON_CLEANUP");
-        }
-    }
-
-    #[test]
-    fn parse_mount_options_allows_persistent_acls_override() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
-        // SAFETY: Tests are single-threaded via `_guard` and temporarily mutate
-        // process environment variables for deterministic parsing behavior.
-        unsafe {
-            std::env::set_var("STUDIOFS_WINFSP_PERSISTENT_ACLS", "1");
-        }
-
-        let opts = parse_mount_options("StudioFS").expect("options");
-        assert!(
-            opts.persistent_acls,
-            "WinFSP persistent ACL override should be honored"
-        );
-
-        // SAFETY: Tests are single-threaded via `_guard` and restore environment
-        // variables that were written earlier in the test.
-        unsafe {
-            std::env::remove_var("STUDIOFS_WINFSP_PERSISTENT_ACLS");
-        }
-    }
-
-    #[test]
-    fn parse_mount_options_allows_coarse_operation_guard_override() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
-        // SAFETY: Tests are single-threaded via `_guard` and temporarily mutate
-        // process environment variables for deterministic parsing behavior.
-        unsafe {
-            std::env::set_var("STUDIOFS_WINFSP_COARSE_OPERATION_GUARD", "0");
-        }
-
-        let opts = parse_mount_options("StudioFS").expect("options");
-        assert!(
-            !opts.coarse_operation_guard,
-            "WinFSP coarse operation guard override should be honored"
-        );
-
-        // SAFETY: Tests are single-threaded via `_guard` and restore environment
-        // variables that were written earlier in the test.
-        unsafe {
-            std::env::remove_var("STUDIOFS_WINFSP_COARSE_OPERATION_GUARD");
-        }
-    }
-
-    #[test]
-    fn parse_mount_options_allows_kernel_notifications_override() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
-        // SAFETY: Tests are single-threaded via `_guard` and temporarily mutate
-        // process environment variables for deterministic parsing behavior.
-        unsafe {
-            std::env::set_var("STUDIOFS_WINFSP_KERNEL_NOTIFICATIONS", "1");
-        }
-
-        let opts = parse_mount_options("StudioFS").expect("options");
-        assert!(
-            opts.kernel_notifications,
-            "WinFSP kernel notification override should be honored"
-        );
-
-        // SAFETY: Tests are single-threaded via `_guard` and restore environment
-        // variables that were written earlier in the test.
-        unsafe {
-            std::env::remove_var("STUDIOFS_WINFSP_KERNEL_NOTIFICATIONS");
         }
     }
 

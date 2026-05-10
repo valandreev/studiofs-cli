@@ -46,41 +46,26 @@ pub enum LocalPayloadUploadState {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-/// Struct $name.
 pub struct LocalPayloadStorageStats {
-    /// Field $name.
     pub current_bytes: u64,
-    /// Field $name.
     pub dirty_bytes: u64,
-    /// Field $name.
     pub evictable_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// Struct $name.
 pub struct LocalPayloadObjectStats {
-    /// Field $name.
     pub payload_len: u64,
-    /// Field $name.
     pub lifecycle: LocalPayloadLifecycleState,
-    /// Field $name.
     pub origin: LocalPayloadOrigin,
-    /// Field $name.
     pub upload_state: LocalPayloadUploadState,
-    /// Field $name.
     pub last_access_unix_millis: u64,
-    /// Field $name.
     pub evictable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/// Struct $name.
 pub struct LocalPayloadPut {
-    /// Field $name.
     pub object_id: u64,
-    /// Field $name.
     pub data: Bytes,
-    /// Field $name.
     pub evictable: bool,
 }
 
@@ -88,107 +73,72 @@ pub struct LocalPayloadPut {
 #[derive(Debug, thiserror::Error)]
 pub enum LocalPayloadBackendError {
     #[error("I/O error: {0}")]
-    /// Variant $name.
     Io(#[from] std::io::Error),
     #[error("local backend full: need {needed} bytes, free {free} bytes")]
-    /// Field $name.
-    CapacityExhausted {
-        /// The needed value.
-        needed: u64,
-        /// The free value.
-        free: u64,
-    },
+    CapacityExhausted { needed: u64, free: u64 },
     #[error("local backend operation failed: {0}")]
-    /// Variant $name.
     Other(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
 /// Minimal local payload API required by read/write/upload paths.
 pub trait LocalPayloadBackend: Send + Sync {
-    /// Function $name.
     fn as_any(&self) -> &dyn Any;
-    /// Function $name.
     fn get(&self, object_id: u64) -> Option<Bytes>;
-    /// Function $name.
     fn read_into(&self, object_id: u64, data_offset: usize, out: &mut [u8]) -> Option<usize>;
-    /// Function $name.
     fn get_for_upload(&self, object_id: u64) -> Option<Bytes>;
-    /// Function $name.
     fn contains(&self, object_id: u64) -> bool;
-    /// Function $name.
     fn advise_will_need(&self, object_id: u64);
 
-    /// Function $name.
     fn put(
         &self,
         object_id: u64,
         data: &[u8],
         evictable: bool,
     ) -> Result<(), LocalPayloadBackendError>;
-    /// Function $name.
     fn put_owned(&self, put: LocalPayloadPut) -> Result<(), LocalPayloadBackendError> {
         self.put(put.object_id, put.data.as_ref(), put.evictable)
     }
-    /// Function $name.
     fn put_batch(&self, entries: &[LocalPayloadPut]) -> Result<(), LocalPayloadBackendError> {
         for entry in entries {
             self.put_owned(entry.clone())?;
         }
         Ok(())
     }
-    /// Function $name.
     fn sync_data(&self) -> Result<(), LocalPayloadBackendError>;
-    /// Function $name.
     fn run_pressure_maintenance(&self) -> Result<(), LocalPayloadBackendError>;
 
-    /// Function $name.
     fn mark_uploading(&self, object_id: u64);
-    /// Function $name.
     fn mark_upload_failed(&self, object_id: u64);
-    /// Function $name.
     fn mark_uploaded(&self, object_id: u64);
-    /// Function $name.
     fn pin(&self, object_id: u64);
-    /// Function $name.
     fn unpin(&self, object_id: u64);
-    /// Function $name.
     fn pin_batch(&self, object_ids: &[u64]) {
         for &object_id in object_ids {
             self.pin(object_id);
         }
     }
-    /// Function $name.
     fn unpin_batch(&self, object_ids: &[u64]) {
         for &object_id in object_ids {
             self.unpin(object_id);
         }
     }
 
-    /// Function $name.
     fn remove(&self, object_id: u64);
-    /// Function $name.
     fn remove_batch(&self, object_ids: &[u64]);
 
-    /// Function $name.
     fn dirty_object_ids(&self) -> Vec<u64>;
-    /// Function $name.
     fn dirty_object_count(&self) -> usize {
         self.dirty_object_ids().len()
     }
-    /// Function $name.
     fn lifecycle_state(&self, object_id: u64) -> LocalPayloadLifecycleState;
-    /// Function $name.
     fn is_evictable(&self, object_id: u64) -> bool;
-    /// Function $name.
     fn storage_stats(&self) -> LocalPayloadStorageStats {
         LocalPayloadStorageStats::default()
     }
-    /// Function $name.
     fn object_stats(&self, object_id: u64) -> Option<LocalPayloadObjectStats> {
         let _ = object_id;
         None
     }
-    /// Function $name.
     fn object_ids(&self) -> Vec<u64> {
         Vec::new()
     }

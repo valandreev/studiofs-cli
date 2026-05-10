@@ -64,25 +64,15 @@ const LEGACY_ENTRY_OFFSET_PAYLOAD_KEY_LEN: usize = 28;
 const LEGACY_ENTRY_HEADER_LEN: usize = 32;
 
 #[derive(Debug, thiserror::Error)]
-/// Enum $name.
 pub enum CacheIndexError {
     #[error("I/O error: {0}")]
-    /// Variant $name.
     Io(#[from] std::io::Error),
     #[error("index storage error: {0}")]
-    /// Variant $name.
     Storage(#[source] RedbError),
     #[error("index corruption: {0}")]
-    /// Variant $name.
     Corruption(String),
     #[error("unsupported cache index format: expected {expected}, found {found}")]
-    /// Field $name.
-    UnsupportedFormat {
-        /// The expected value.
-        expected: u64,
-        /// The found value.
-        found: u64,
-    },
+    UnsupportedFormat { expected: u64, found: u64 },
 }
 
 impl CacheIndexError {
@@ -92,103 +82,63 @@ impl CacheIndexError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-/// Struct $name.
 pub struct CacheIndexStats {
-    /// Field $name.
     pub current_bytes: u64,
-    /// Field $name.
     pub dirty_bytes: u64,
-    /// Field $name.
     pub evictable_bytes: u64,
 }
 
 #[derive(Clone, PartialEq, Eq)]
-/// Struct $name.
 pub struct CacheIndexEntry {
-    /// Field $name.
     pub object_id: u64,
-    /// Field $name.
     pub payload_key: Vec<u8>,
-    /// Field $name.
     pub payload_len: u64,
-    /// Field $name.
     pub lifecycle: LocalPayloadLifecycleState,
-    /// Field $name.
     pub origin: LocalPayloadOrigin,
-    /// Field $name.
     pub upload_state: LocalPayloadUploadState,
-    /// Field $name.
     pub last_access_unix_millis: u64,
-    /// Field $name.
     pub evictable: bool,
-    /// Field $name.
     pub dirty_order: Option<u64>,
-    /// Field $name.
     pub access_order: u64,
 }
 
 #[derive(Clone, PartialEq, Eq)]
-/// Struct $name.
 pub struct CacheIndexUpsert {
-    /// Field $name.
     pub object_id: u64,
-    /// Field $name.
     pub payload_key: Vec<u8>,
-    /// Field $name.
     pub payload_len: u64,
-    /// Field $name.
     pub lifecycle: LocalPayloadLifecycleState,
-    /// Field $name.
     pub origin: LocalPayloadOrigin,
-    /// Field $name.
     pub upload_state: LocalPayloadUploadState,
-    /// Field $name.
     pub evictable: bool,
 }
 
 #[derive(Clone, PartialEq, Eq)]
-/// Struct $name.
 pub struct DirtyReplayEntry {
-    /// Field $name.
     pub object_id: u64,
-    /// Field $name.
     pub payload_key: Vec<u8>,
-    /// Field $name.
     pub payload_len: u64,
-    /// Field $name.
     pub lifecycle: LocalPayloadLifecycleState,
-    /// Field $name.
     pub origin: LocalPayloadOrigin,
-    /// Field $name.
     pub upload_state: LocalPayloadUploadState,
-    /// Field $name.
     pub dirty_order: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/// Struct $name.
 pub struct EvictionCandidateEntry {
-    /// Field $name.
     pub object_id: u64,
-    /// Field $name.
     pub payload_len: u64,
-    /// Field $name.
     pub access_order: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-/// Struct $name.
 pub struct EvictionCandidatePage {
-    /// Field $name.
     pub entries: Vec<EvictionCandidateEntry>,
-    /// Field $name.
     pub scanned_rows: u64,
-    /// Field $name.
     pub skipped_non_evictable: u64,
 }
 
 #[derive(Debug)]
-/// Struct $name.
 pub struct CacheIndex {
     db_path: PathBuf,
     db: Arc<Database>,
@@ -213,7 +163,6 @@ fn normalize_upsert(mut update: CacheIndexUpsert) -> CacheIndexUpsert {
 }
 
 impl CacheIndex {
-    /// Function $name.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, CacheIndexError> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
@@ -234,12 +183,10 @@ impl CacheIndex {
         Ok(index)
     }
 
-    /// Function $name.
     pub fn db_path(&self) -> &Path {
         &self.db_path
     }
 
-    /// Function $name.
     pub fn stats(&self) -> Result<CacheIndexStats, CacheIndexError> {
         let txn = self.db.begin_read().map_err(storage_error)?;
         let counters = txn.open_table(COUNTERS_TABLE).map_err(storage_error)?;
@@ -250,7 +197,6 @@ impl CacheIndex {
         })
     }
 
-    /// Function $name.
     pub fn dirty_object_count(&self) -> Result<usize, CacheIndexError> {
         let txn = self.db.begin_read().map_err(storage_error)?;
         let dirty_order = txn.open_table(DIRTY_ORDER_TABLE).map_err(storage_error)?;
@@ -259,7 +205,6 @@ impl CacheIndex {
         })
     }
 
-    /// Function $name.
     pub fn get_entry(&self, object_id: u64) -> Result<Option<CacheIndexEntry>, CacheIndexError> {
         let txn = self.db.begin_read().map_err(storage_error)?;
         let payloads = txn
@@ -269,7 +214,6 @@ impl CacheIndex {
             .map(|entry| entry.into_public(object_id)))
     }
 
-    /// Function $name.
     pub fn upsert(&self, mut update: CacheIndexUpsert) -> Result<(), CacheIndexError> {
         update = normalize_upsert(update);
 
@@ -313,7 +257,6 @@ impl CacheIndex {
         Ok(())
     }
 
-    /// Function $name.
     pub fn upsert_many(&self, updates: &[CacheIndexUpsert]) -> Result<(), CacheIndexError> {
         if updates.is_empty() {
             return Ok(());
@@ -362,7 +305,6 @@ impl CacheIndex {
         Ok(())
     }
 
-    /// Function $name.
     pub fn touch_access(&self, object_id: u64) -> Result<(), CacheIndexError> {
         self.touch_access_batch(&[object_id])
     }
@@ -425,7 +367,6 @@ impl CacheIndex {
         Ok(due.len())
     }
 
-    /// Function $name.
     pub fn touch_access_if_stale(
         &self,
         object_id: u64,
@@ -472,7 +413,6 @@ impl CacheIndex {
         Ok(())
     }
 
-    /// Function $name.
     pub fn mark_uploading(&self, object_id: u64) -> Result<(), CacheIndexError> {
         let txn = self.db.begin_write().map_err(storage_error)?;
         {
@@ -513,7 +453,6 @@ impl CacheIndex {
         Ok(())
     }
 
-    /// Function $name.
     pub fn mark_upload_failed(&self, object_id: u64) -> Result<(), CacheIndexError> {
         let txn = self.db.begin_write().map_err(storage_error)?;
         {
@@ -552,7 +491,6 @@ impl CacheIndex {
         Ok(())
     }
 
-    /// Function $name.
     pub fn mark_uploaded(&self, object_id: u64) -> Result<(), CacheIndexError> {
         let txn = self.db.begin_write().map_err(storage_error)?;
         {
@@ -587,7 +525,6 @@ impl CacheIndex {
         Ok(())
     }
 
-    /// Function $name.
     pub fn remove(&self, object_id: u64) -> Result<(), CacheIndexError> {
         let txn = self.db.begin_write().map_err(storage_error)?;
         {
@@ -659,7 +596,6 @@ impl CacheIndex {
         Ok(())
     }
 
-    /// Function $name.
     pub fn dirty_uploading_entries(&self) -> Result<Vec<DirtyReplayEntry>, CacheIndexError> {
         let mut cursor = None;
         let mut out = Vec::new();
@@ -739,7 +675,6 @@ impl CacheIndex {
         Ok(ordered)
     }
 
-    /// Function $name.
     pub fn access_order_object_ids(&self) -> Result<Vec<u64>, CacheIndexError> {
         let mut cursor = None;
         let mut out = Vec::new();
@@ -793,7 +728,6 @@ impl CacheIndex {
         Ok(ordered)
     }
 
-    /// Function $name.
     pub fn access_order_object_ids_page(
         &self,
         start_after: Option<u64>,

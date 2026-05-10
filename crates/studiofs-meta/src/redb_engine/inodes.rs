@@ -411,20 +411,16 @@ impl RedbMetaEngine {
         chunk_states: impl Iterator<Item = &'a RegularFileChunkState>,
     ) -> Option<InodeLifecycleState> {
         let mut saw_local_only = false;
-        let mut saw_publish_ready_change = false;
+        let mut saw_uploaded = false;
         for chunk_state in chunk_states {
             for slice in chunk_state.slices.values() {
-                if slice.payload.is_none() {
-                    saw_publish_ready_change = true;
-                    continue;
-                }
                 match slice.payload_state {
                     PayloadRefState::Uploading => return Some(InodeLifecycleState::Uploading),
                     PayloadRefState::LocalOnly | PayloadRefState::Recovering => {
                         saw_local_only = true;
                     }
                     PayloadRefState::Uploaded => {
-                        saw_publish_ready_change = true;
+                        saw_uploaded = true;
                     }
                     PayloadRefState::Published => {}
                 }
@@ -432,7 +428,7 @@ impl RedbMetaEngine {
         }
         if saw_local_only {
             Some(InodeLifecycleState::LocalOnly)
-        } else if saw_publish_ready_change {
+        } else if saw_uploaded {
             Some(InodeLifecycleState::PublishReady)
         } else {
             None

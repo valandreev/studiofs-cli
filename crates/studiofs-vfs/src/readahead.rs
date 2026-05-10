@@ -25,24 +25,16 @@ use std::time::Instant;
 use studiofs_meta::types::Ino;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-/// Struct $name.
 pub struct ReadStreamKey {
-    /// Field $name.
     pub ino: Ino,
-    /// Field $name.
     pub stream_id: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
-/// Struct $name.
 pub struct ReadAheadPolicy {
-    /// Field $name.
     pub base_width: u32,
-    /// Field $name.
     pub max_width: u32,
-    /// Field $name.
     pub min_prefetch_on_seq: u32,
-    /// Field $name.
     pub prefetch_enabled: bool,
 }
 
@@ -143,7 +135,6 @@ impl ReadAheadTracker {
         let is_sequential =
             state.last_block != u32::MAX && first_block == state.last_block.saturating_add(1);
 
-        let was_cold = state.last_block == u32::MAX;
         let was_ready = state.sequential_ready;
         if is_sequential {
             state.sequential_ready = true;
@@ -167,11 +158,7 @@ impl ReadAheadTracker {
             return Vec::new();
         }
 
-        let cold_start_from_beginning = was_cold && first_block == 0 && last_block >= first_block;
-        if !(cold_start_from_beginning
-            || is_sequential
-            || (is_same_block && (was_ready || sequential_ready)))
-        {
+        if !(is_sequential || (is_same_block && (was_ready || sequential_ready))) {
             return Vec::new();
         }
         (1..=current_width)
@@ -226,7 +213,6 @@ impl ReadAheadTracker {
         )
     }
 
-    /// Function $name.
     pub fn record_read_for_stream(
         &self,
         key: ReadStreamKey,
@@ -278,7 +264,6 @@ impl ReadAheadTracker {
         !found_stream
     }
 
-    /// Function $name.
     pub fn stream_prefetch_relevant(&self, key: ReadStreamKey, block: u32) -> bool {
         let Some(state) = self.states.get(&key) else {
             return true;
@@ -286,7 +271,6 @@ impl ReadAheadTracker {
         Self::state_considers_block_relevant(&state, self.width.max(1), block)
     }
 
-    /// Function $name.
     pub fn evict_stream(&self, key: ReadStreamKey) {
         self.states.remove(&key);
     }
@@ -343,21 +327,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_first_read_from_start_prefetches_ahead() {
+    fn test_no_prefetch_on_first_read() {
         let tracker = ReadAheadTracker::new(8);
         let blocks = tracker.record_read(1, 0, 0);
-        assert_eq!(
-            blocks,
-            vec![1, 2, 3, 4, 5, 6, 7, 8],
-            "first read from the beginning should start cold sequential prefetch"
+        assert!(
+            blocks.is_empty(),
+            "first read of a brand-new inode should not trigger prefetch"
         );
-    }
-
-    #[test]
-    fn test_no_prefetch_on_first_seeked_read() {
-        let tracker = ReadAheadTracker::new(8);
-        let blocks = tracker.record_read(1, 42, 42);
-        assert!(blocks.is_empty(), "seeked first reads should stay cold");
     }
 
     #[test]
@@ -365,9 +341,9 @@ mod tests {
         let tracker = ReadAheadTracker::new_with_bounds(8, 64, 1);
         let mut t = 1_000_000u64;
 
-        // First read: block 0 starts the cold sequential prefetch window.
+        // First read: block 0 establishes baseline state only.
         let p = tracker.record_read_at_micros(1, 0, 0, t);
-        assert_eq!(p.len(), 8);
+        assert!(p.is_empty());
 
         // Second read: block 1 opens the fixed sequential window.
         t = t.saturating_add(500_000);
@@ -613,25 +589,20 @@ mod tests {
             tracker.record_read(1, i, i);
         }
 
-        // Inode 2 should start fresh and get its own cold-start window.
+        // Inode 2 should start fresh
         let p = tracker.record_read(2, 0, 0);
-        assert_eq!(p[0], 1, "separate inodes track state independently");
-        assert_eq!(p.len(), 8);
+        assert!(p.is_empty(), "separate inodes track state independently");
     }
 
     #[test]
     fn test_aggressive_min_prefetch_window() {
         let tracker = ReadAheadTracker::new_with_tuning(64, 16);
 
-        // Initial read from the beginning opens the cold-start window.
+        // Initial read establishes baseline (no prefetch yet).
         let p0 = tracker.record_read(1, 0, 0);
-        assert!(
-            p0.len() >= 16,
-            "aggressive tuning should affect the cold-start window"
-        );
-        assert_eq!(p0[0], 1);
+        assert!(p0.is_empty());
 
-        // First sequential boundary should keep the larger window.
+        // First sequential boundary should immediately open a larger window.
         let p1 = tracker.record_read(1, 1, 1);
         assert!(
             p1.len() >= 16,
@@ -737,7 +708,6 @@ struct DirPrefetchState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/// Struct $name.
 pub struct DirAccessEntry<'a> {
     /// Inode for a regular-file directory child.
     pub ino: Ino,

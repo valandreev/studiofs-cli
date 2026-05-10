@@ -58,18 +58,15 @@ const ACCESS_TOUCH_RETRY_BASE_BACKOFF_MS: u64 = 10;
 const ACCESS_TOUCH_RETRY_MAX_EXPONENT: u8 = 8;
 const DIRTY_ORPHAN_PRUNE_MIN_INTERVAL: Duration = Duration::from_secs(30);
 const LOW_SPACE_UPLOAD_DRAIN_WAIT: Duration = Duration::from_millis(25);
-const LOW_SPACE_UPLOAD_DRAIN_IDLE_RETRIES: usize = 4;
 const LOW_SPACE_UPLOAD_DRAIN_PROGRESS_RETRIES: usize = 4;
 
 /// Backend kind available on the runtime path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalPayloadBackendKind {
-    /// Variant $name.
     Current,
 }
 
 impl LocalPayloadBackendKind {
-    /// Function $name.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Current => "local-payload-runtime",
@@ -86,22 +83,15 @@ impl fmt::Display for LocalPayloadBackendKind {
 /// Detection snapshot for a per-volume cache root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalPayloadRuntimeDetection {
-    /// Field $name.
     pub layout: LocalPayloadLayout,
-    /// Field $name.
     pub index_exists: bool,
-    /// Field $name.
     pub payload_objects_dir_exists: bool,
-    /// Field $name.
     pub upload_objects_dir_exists: bool,
-    /// Field $name.
     pub tmp_dir_exists: bool,
-    /// Field $name.
     pub index_dir_exists: bool,
 }
 
 impl LocalPayloadRuntimeDetection {
-    /// Function $name.
     pub fn has_runtime_layout(&self) -> bool {
         self.index_exists
             || self.payload_objects_dir_exists
@@ -110,12 +100,10 @@ impl LocalPayloadRuntimeDetection {
             || self.index_dir_exists
     }
 
-    /// Function $name.
     pub const fn has_complete_runtime_layout(&self) -> bool {
         !self.needs_runtime_provisioning()
     }
 
-    /// Function $name.
     pub const fn needs_runtime_provisioning(&self) -> bool {
         !self.payload_objects_dir_exists
             || !self.upload_objects_dir_exists
@@ -123,7 +111,6 @@ impl LocalPayloadRuntimeDetection {
             || !self.index_dir_exists
     }
 
-    /// Function $name.
     pub fn runtime_backend(&self) -> Option<LocalPayloadBackendKind> {
         if !self.has_complete_runtime_layout() {
             None
@@ -154,9 +141,7 @@ pub fn detect_cache_backends(cache_root: &Path) -> io::Result<LocalPayloadRuntim
 /// Configuration for opening the current local payload object backend.
 #[derive(Debug, Clone)]
 pub struct LocalPayloadBackendConfig {
-    /// Field $name.
     pub cache_root: PathBuf,
-    /// Field $name.
     pub volume_uuid: [u8; 16],
 }
 
@@ -182,7 +167,6 @@ pub enum LocalPayloadWriteMode {
 }
 
 impl LocalPayloadWriteMode {
-    /// Function $name.
     pub const fn default_for_mount_path() -> Self {
         if cfg!(windows) {
             Self::UnbufferedFast
@@ -196,45 +180,30 @@ impl LocalPayloadWriteMode {
 #[derive(Debug, thiserror::Error)]
 pub enum LocalPayloadBackendOpenError {
     #[error("I/O error: {0}")]
-    /// Variant $name.
     Io(#[from] io::Error),
     #[error("local payload object runtime layout under '{cache_root}' is incomplete")]
-    /// Variant $name.
-    IncompleteRuntimeLayout {
-        /// The cache_root value.
-        cache_root: PathBuf,
-    },
+    IncompleteRuntimeLayout { cache_root: PathBuf },
     #[error("failed to open local payload index at '{path}': {source}")]
-    /// Variant $name.
     OpenCacheIndex {
-        /// Field $name.
         path: PathBuf,
         #[source]
-        /// Field $name.
         source: CacheIndexError,
     },
     #[error("failed to open local payload payload store at '{cache_root}': {source}")]
-    /// Variant $name.
     OpenPayloadStore {
-        /// Field $name.
         cache_root: PathBuf,
         #[source]
-        /// Field $name.
         source: FilePayloadStoreError,
     },
     #[error("failed to reconcile local payload startup state under '{cache_root}': {source}")]
-    /// Variant $name.
     StartupReconcile {
-        /// Field $name.
         cache_root: PathBuf,
         #[source]
-        /// Field $name.
         source: LocalPayloadStartupReconcileError,
     },
 }
 
 impl LocalPayloadBackendOpenError {
-    /// Function $name.
     pub fn is_transient_open_lock_conflict(&self) -> bool {
         match self {
             Self::OpenCacheIndex { source, .. } => source.is_database_lock_conflict(),
@@ -282,12 +251,10 @@ impl Drop for LocalPayloadBackendRuntime {
 }
 
 impl LocalPayloadBackendRuntime {
-    /// Function $name.
     pub fn open(config: LocalPayloadBackendConfig) -> Result<Self, LocalPayloadBackendOpenError> {
         Self::open_with_budget_and_sync_mode(config, None, LocalPayloadSyncMode::Durable)
     }
 
-    /// Function $name.
     pub fn open_with_budget(
         config: LocalPayloadBackendConfig,
         cache_budget_bytes: Option<u64>,
@@ -299,7 +266,6 @@ impl LocalPayloadBackendRuntime {
         )
     }
 
-    /// Function $name.
     pub fn open_with_budget_and_sync_mode(
         config: LocalPayloadBackendConfig,
         cache_budget_bytes: Option<u64>,
@@ -313,7 +279,6 @@ impl LocalPayloadBackendRuntime {
         )
     }
 
-    /// Function $name.
     pub fn open_with_budget_sync_and_write_mode(
         config: LocalPayloadBackendConfig,
         cache_budget_bytes: Option<u64>,
@@ -321,22 +286,10 @@ impl LocalPayloadBackendRuntime {
         payload_write_mode: LocalPayloadWriteMode,
     ) -> Result<Self, LocalPayloadBackendOpenError> {
         let layout = LocalPayloadLayout::from_cache_root(&config.cache_root);
-        if !layout
-            .payload_objects_dir
-            .try_exists()
-            .map_err(LocalPayloadBackendOpenError::Io)?
-            || !layout
-                .upload_stage_objects_dir
-                .try_exists()
-                .map_err(LocalPayloadBackendOpenError::Io)?
-            || !layout
-                .tmp_dir
-                .try_exists()
-                .map_err(LocalPayloadBackendOpenError::Io)?
-            || !layout
-                .index_dir
-                .try_exists()
-                .map_err(LocalPayloadBackendOpenError::Io)?
+        if !layout.payload_objects_dir.try_exists()?
+            || !layout.upload_stage_objects_dir.try_exists()?
+            || !layout.tmp_dir.try_exists()?
+            || !layout.index_dir.try_exists()?
         {
             return Err(LocalPayloadBackendOpenError::IncompleteRuntimeLayout {
                 cache_root: layout.runtime_root.clone(),
@@ -534,7 +487,6 @@ impl LocalPayloadBackendRuntime {
         mut current_after_evict: u64,
     ) -> Result<u64, LocalPayloadBackendError> {
         let mut progress_waits = 0;
-        let mut idle_waits = 0;
         loop {
             if !self
                 .budget_governor
@@ -555,13 +507,11 @@ impl LocalPayloadBackendRuntime {
 
             let observed_epoch = *self.storage_state_epoch.lock();
             debug!(
-                idle_waits,
                 progress_waits,
                 current_bytes = current_after_evict,
                 target_bytes,
                 payload_len,
                 dirty_object_count,
-                idle_wait_limit = LOW_SPACE_UPLOAD_DRAIN_IDLE_RETRIES,
                 progress_wait_limit = LOW_SPACE_UPLOAD_DRAIN_PROGRESS_RETRIES,
                 wait_ms = LOW_SPACE_UPLOAD_DRAIN_WAIT.as_millis(),
                 "local payload runtime low-space put waiting for pending upload drain progress"
@@ -575,10 +525,6 @@ impl LocalPayloadBackendRuntime {
                 {
                     break;
                 }
-                idle_waits += 1;
-                if idle_waits < LOW_SPACE_UPLOAD_DRAIN_IDLE_RETRIES {
-                    continue;
-                }
                 let exhausted_total = self
                     .low_space_exhausted_waits
                     .fetch_add(1, Ordering::Relaxed)
@@ -588,14 +534,12 @@ impl LocalPayloadBackendRuntime {
                     target_bytes,
                     payload_len,
                     dirty_object_count,
-                    idle_waits,
                     exhausted_total,
                     "local payload runtime low-space put retry exhausted without upload drain progress"
                 );
                 break;
             }
 
-            idle_waits = 0;
             progress_waits += 1;
             let progress_total = self
                 .low_space_progress_waits

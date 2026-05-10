@@ -41,36 +41,22 @@ const _: [(); DEFAULT_BLOCK_SIZE as usize] = [(); CLOUD_FRAGMENT_SIZE * CLOUD_FR
 // =============================================================================
 
 #[derive(Debug, Error)]
-/// Enum $name.
 pub enum ObjectError {
     #[error("invalid magic bytes")]
-    /// Variant $name.
     InvalidMagic,
     #[error("unsupported version: {0}")]
-    /// Variant $name.
     UnsupportedVersion(u16),
     #[error("IO error: {0}")]
-    /// Variant $name.
     Io(#[from] io::Error),
     #[error("legacy compressed object is not supported in this build")]
-    /// Variant $name.
     LegacyCompressionUnsupported,
     #[error("checksum mismatch: expected {expected:016x}, got {computed:016x}")]
-    /// Field $name.
-    ChecksumMismatch {
-        /// The expected value.
-        expected: u64,
-        /// The computed value.
-        computed: u64,
-    },
+    ChecksumMismatch { expected: u64, computed: u64 },
     #[error("object too large: {0} bytes")]
-    /// Variant $name.
     ObjectTooLarge(u64),
     #[error("invalid object ID: {0}")]
-    /// Variant $name.
     InvalidObjectId(String),
     #[error("invalid cloud fragment layout: {0}")]
-    /// Variant $name.
     InvalidFragmentLayout(String),
 }
 

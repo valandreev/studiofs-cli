@@ -8,45 +8,6 @@ The runner is not part of the default fast test suite. It is an explicit,
 operator-started workflow for tests that need Docker, PostgreSQL, S3-compatible
 object storage, and a real FUSE, macFUSE, or WinFSP mount.
 
-## RWX Linux/FUSE Hosted Sweep
-
-RWX is the primary hosted environment for product-level real mounted E2E
-coverage while the shared filesystem behavior is still being expanded. The
-manual workflow at `.rwx/e2e.yml` runs the `e2e-linux-full` target on
-Ubuntu with Docker support and `/dev/fuse`, builds the `studiofs` binary, and
-executes:
-
-```text
-studiofs-e2e run --all \
-  --seed 360 \
-  --timeout 90m \
-  --studiofs-bin target/debug/studiofs \
-  --root target/e2e-runs \
-  --run-id rwx-full-<RWX_RUN_ID> \
-  --platform linux-fuse \
-  --infra compose \
-  --retain always
-```
-
-This target is the first completion bar for the shared FS logic: every
-registered scenario must pass on RWX Linux/FUSE before the same scenario set is
-treated as ready for Windows/WinFSP-specific hang and shutdown work. New
-implemented scenarios should join the registry and then become part of the RWX
-full sweep through `--all`; planned-but-unimplemented scenario families should
-not be represented by passing placeholders.
-
-The RWX run owns exactly one sandbox rooted at
-`target/e2e-runs/rwx-full-<RWX_RUN_ID>`. The run ID must contain only ASCII
-letters, digits, underscores, and hyphens before it is used in any artifact
-path. RWX uploads `target/e2e-runs` as the `e2e-run` artifact so the canonical
-run report, Docker diagnostics, per-scenario operation logs, mounted-tree
-snapshots, and per-client logs stay available after both passes and failures.
-The RWX task timeout is `120m`, while the runner watchdog is `90m`; the task
-timeout must remain higher so the runner can write its own report and cleanup
-artifacts if the mounted sweep stalls. During bring-up the workflow retains
-sandboxes on success as well as failure; that can be tightened after the full
-sweep is stable.
-
 ## Runner Boundaries And CLI
 
 The runner belongs in a dedicated workspace crate named `studiofs-e2e`, with a
@@ -69,16 +30,11 @@ Initial operator commands:
 
 ```text
 cargo run -p studiofs-e2e -- list
-cargo run -p studiofs-e2e -- run --all --seed 360 --timeout 4h --studiofs-bin <path-to-studiofs>
 cargo run -p studiofs-e2e -- run basic-multi-client-smoke
 cargo run -p studiofs-e2e -- run postgres-outage-multi-client-recovery --studiofs-bin <path-to-studiofs>
 cargo run -p studiofs-e2e -- run rustfs-outage-multi-client-recovery --studiofs-bin <path-to-studiofs>
 cargo run -p studiofs-e2e -- run mounted-client-crash-restart-recovery --studiofs-bin <path-to-studiofs>
 cargo run -p studiofs-e2e -- run collision-rename-vs-unlink --studiofs-bin <path-to-studiofs>
-cargo run -p studiofs-e2e -- run mounted-open-handle-convergence --studiofs-bin <path-to-studiofs>
-cargo run -p studiofs-e2e -- run mounted-fault-chaos-convergence --seed 360 --timeout 30m --studiofs-bin <path-to-studiofs>
-cargo run -p studiofs-e2e -- run mounted-lww-reconnect-chaos-convergence --seed 360 --timeout 30m --studiofs-bin <path-to-studiofs>
-cargo run -p studiofs-e2e -- run mounted-publication-boundary-crash-matrix --studiofs-bin <path-to-studiofs>
 cargo run -p studiofs-e2e -- clean
 ```
 
@@ -101,29 +57,21 @@ Required initial run flags and environment:
 | Flag | Contract |
 |---|---|
 | `basic-multi-client-smoke` | Positional shorthand for the mounted three-client happy-path smoke scenario. |
-| `--all` | Run every registered scenario in one supervised sweep. Compose infrastructure is started once for the run; each scenario child gets a fresh StudioFS volume and scenario-scoped client roots/cache/logs. |
-| `--first-eight-mounted` | Run the first eight mounted baseline scenarios. This conflicts with `--all` and explicit `--scenario` selectors. |
-| `--scenario <selector>` | Repeatable. Selectors may be scenario names, aliases, one-based registry indices, ranges such as `1-8`, or comma lists such as `smoke,3,6-8`. Accepted names include `basic-multi-client-smoke` (`smoke`), `postgres-outage-multi-client-recovery` (`postgres-outage`), `rustfs-outage-multi-client-recovery` (`rustfs-outage`, `s3-outage`), `mounted-client-crash-restart-recovery` (`client-crash-restart`, `crash-restart`), `mounted-publication-boundary-crash-matrix` (`publication-boundary-crash`, `publication-boundary`), `mounted-open-handle-convergence` (`open-handle`, `open-unlink-rename`), `mounted-chaos-convergence` (`mounted-chaos`, `chaos`), `mounted-hotspot-churn-convergence` (`hotspot-churn`, `hot-dir-churn`), `mounted-fault-chaos-convergence` (`fault-chaos`, `chaos-faults`), `mounted-lww-reconnect-chaos-convergence` (`lww-chaos`, `reconnect-lww`), and the mounted namespace collision scenarios `collision-rename-vs-rename`, `collision-rename-vs-unlink`, `collision-unlink-vs-append`, `collision-overwrite-vs-read`, `collision-mkdir-rmdir-vs-create`, and `collision-readdir-stat-during-mutation`. |
-| `--studiofs-bin <path>` | Path to the product CLI under test. Real mounted scenarios require it when `--infra compose` or `--infra external-env` is used. The runner may build it only when an explicit build flag is added. |
+| `--scenario <name>` | Repeatable. Accepted values include `basic-multi-client-smoke` (`smoke`), `postgres-outage-multi-client-recovery` (`postgres-outage`), `rustfs-outage-multi-client-recovery` (`rustfs-outage`, `s3-outage`), `mounted-client-crash-restart-recovery` (`client-crash-restart`, `crash-restart`), and the mounted namespace collision scenarios `collision-rename-vs-rename`, `collision-rename-vs-unlink`, `collision-unlink-vs-append`, `collision-overwrite-vs-read`, `collision-mkdir-rmdir-vs-create`, and `collision-readdir-stat-during-mutation`. |
+| `--studiofs-bin <path>` | Path to the product CLI under test. Real mounted scenarios require it when `--infra compose` is used. The runner may build it only when an explicit build flag is added. |
 | `--root <path>` | Parent run directory. Defaults to `target/e2e-runs`. |
 | `--run-id <id>` | Optional stable run ID. If omitted, use an ISO-like UTC timestamp plus short random suffix. Explicit IDs must be safe single directory names: no separators, drive prefixes, traversal segments, leading dots, or other shell/path metacharacters. |
 | `--platform auto|linux-fuse|macos-fuse|windows-winfsp` | Mount backend selection. `auto` resolves from host OS and installed driver checks. |
-| `--infra compose|external-env|disabled` | External infrastructure mode. `compose` starts `docker/compose.e2e.yml`, waits for healthy required services, collects Docker logs, and tears the stack down. `external-env` uses caller-provided PostgreSQL and S3/RustFS settings from process environment or `.env` and never starts, stops, or cleans those services. `disabled` is reserved for runner self-tests and skeleton-only validation. |
+| `--infra compose|disabled` | External infrastructure mode. `compose` starts `docker/compose.e2e.yml`, waits for healthy required services, collects Docker logs, and tears the stack down. `disabled` is reserved for runner self-tests and skeleton-only validation. |
 | `--retain always|on-failure|never` | Sandbox retention policy. Default is `on-failure`. |
 | `--report <path>` | Optional copy target for the final `report.json`. The canonical report remains in the run sandbox while the sandbox is retained. |
-| `--port-range <start-end>` | Optional deterministic host port pool for Docker services. The compose runner allocates PostgreSQL, RustFS S3, RustFS console, and Toxiproxy API ports in that order. Use this when a default host port is occupied or Docker reports it healthy but host-side clients cannot reach it. |
+| `--port-range <start-end>` | Optional deterministic host port pool for Docker services. The compose runner allocates PostgreSQL, RustFS S3, RustFS console, and Toxiproxy API ports in that order. |
 | `STUDIOFS_E2E_COMPOSE_FILE` | Optional environment override for the compose file path. Defaults to `docker/compose.e2e.yml` discovered from the current directory or executable location. |
-| `STUDIOFS_E2E_EXTERNAL_PG_DSN` / `STUDIOFS_TEST_PG_DSN` | PostgreSQL DSN for `--infra external-env`. The E2E-specific variable wins when both are set. |
-| `STUDIOFS_E2E_EXTERNAL_S3_ENDPOINT` / `STUDIOFS_TEST_ONLINE_S3_ENDPOINT` / `STUDIOFS_S3_ENDPOINT` | S3/RustFS endpoint for `--infra external-env`. |
-| `STUDIOFS_E2E_EXTERNAL_S3_BUCKET` / `STUDIOFS_TEST_ONLINE_S3_BUCKET` / `STUDIOFS_S3_BUCKET` | S3/RustFS bucket for `--infra external-env`. The runner uses a UUID StudioFS volume name for each scenario bootstrap inside this bucket. |
-| `STUDIOFS_E2E_EXTERNAL_S3_ACCESS_KEY` / `STUDIOFS_TEST_ONLINE_S3_ACCESS_KEY` / `STUDIOFS_S3_ACCESS_KEY` | S3/RustFS access key for `--infra external-env`. |
-| `STUDIOFS_E2E_EXTERNAL_S3_SECRET_KEY` / `STUDIOFS_TEST_ONLINE_S3_SECRET_KEY` / `STUDIOFS_S3_SECRET_KEY` | S3/RustFS secret key for `--infra external-env`. |
-| `STUDIOFS_E2E_EXTERNAL_S3_REGION` / `STUDIOFS_TEST_ONLINE_S3_REGION` / `STUDIOFS_S3_REGION` | Optional S3/RustFS region for `--infra external-env`; defaults to `us-east-1`. |
-| `--timeout <duration>` | Enforced whole-run watchdog. Supported units are `ms`, `s`, `m`, and `h`, for example `500ms`, `30s`, `10m`, or `1h`. When a multi-scenario run is selected, the parent runner executes each scenario in a supervised child process and passes the remaining deadline as the child command timeout. If that timeout expires, the parent kills the child, marks the active scenario `timed_out`, records the active hook when known, writes best-effort `report.json`, `events.ndjson`, and `cleanup.json`, and does not start later scenarios. Single-scenario runs still use the direct lifecycle path for focused local debugging. |
+| `--timeout <duration>` | Whole-run timeout; per-hook timeouts are derived from it unless overridden later. |
 
-The public runner implements `list`, `run`, and `clean`. Hidden helper
-subcommands such as `__run-one` are parent-owned implementation details; they
-must reuse the same report schema, sandbox layout, and cleanup safety checks.
+The initial runner implements `list`, `run`, and `clean`. Future subcommands
+may add dedicated `preflight` or artifact commands, but those must reuse the
+same report schema and cleanup safety checks.
 
 ## Sandbox Layout
 
@@ -145,10 +93,6 @@ target/e2e-runs/<run-id>/
     commands/
     scenarios/
       <scenario-name>/
-        scenario-report.json
-        child.stdout.log
-        child.stderr.log
-        operations.ndjson
     clients/
       client-a/
         client-root/
@@ -180,13 +124,6 @@ target/e2e-runs/<run-id>/
         studiofs-tracing.log
 ```
 
-For RWX, `<run-id>` is `rwx-full-<RWX_RUN_ID>` and the whole
-`target/e2e-runs` tree is uploaded as the hosted artifact. The runner still
-owns the nested sandbox and report schema; RWX only provides the Linux/FUSE
-host, Docker daemon, and artifact uploader. A full RWX sweep must start compose
-once for the run, then give each scenario a fresh StudioFS volume and
-scenario-scoped client runtime under `artifacts/scenarios/<scenario-name>/`.
-
 On Windows, `artifacts/clients/<client>/mount/` is a metadata directory for the
 drive-letter mount. It must contain the chosen mount point in a small text or
 JSON artifact, because `Z:` is not a directory inside the sandbox.
@@ -195,33 +132,6 @@ JSON artifact, because `Z:` is not a directory inside the sandbox.
 include the run ID, absolute sandbox path, requested scenarios, retention
 policy, selected platform, explicit client roots, allocated ports, child
 process IDs once known, and cleanup allowlist.
-
-## Interactive Progress
-
-Real E2E runs print stable line-oriented progress to stdout and flush after
-each line so PowerShell and CI logs show the active operation immediately. The
-runner prints the run ID and sandbox path before preflight so operators can
-inspect `events.ndjson`, child logs, and scenario artifacts while the run is
-still active.
-
-Progress is emitted as stable key-value lines for run start, preflight start
-and result, scenario start and result, hook start and result, and cleanup start
-and result. While a hook is active, the runner emits a heartbeat every 30
-seconds. Multi-scenario `run --all` executions redirect each child scenario's
-stdout and stderr to `child.stdout.log` and `child.stderr.log`; the parent
-supervisor still prints heartbeat lines to visible stdout while it waits for
-the child. Heartbeats are plain log lines, not terminal-control updates:
-
-```text
-[studiofs-e2e][2026-05-06T17:30:00.000Z] run=20260506T173000Z-a1b2c3 scenario=1/1 scenario_name=mounted-fault-chaos-convergence hook=run phase=heartbeat elapsed=90s last_event=run.started sandbox=E:\dev\studiofs-cli\target\e2e-runs\20260506T173000Z-a1b2c3
-```
-
-Use `run`, `scenario_name`, `hook`, `elapsed`, and `last_event` from the latest
-heartbeat to identify the active hook without waiting for post-mortem artifact
-inspection. `last_event` is sampled from the scenario operation log when a
-scenario has written operations, and falls back to the current hook boundary
-when no later operation is available. Values containing whitespace are emitted
-as JSON strings so paths remain unambiguous for log parsers.
 
 ## Artifact Layout And Retention
 
@@ -241,20 +151,6 @@ The following artifact names are required and stable:
 | `artifacts/commands/` | Per-command stdout/stderr/status records for child commands. |
 | `artifacts/scenarios/<scenario-name>/` | Scenario-specific inputs, probes, `operations.ndjson`, and validation output. |
 | `artifacts/clients/<client>/` | Client root, mount metadata, mount stdout/stderr logs, structured tracing logs when emitted, and post-run status snapshots. |
-
-`operations.ndjson` uses the shared `studiofs-scenario` operation schema. Each
-line is one `ScenarioOperationRecord` with `schema_version = 1`, scenario name,
-monotonic per-file `sequence`, optional client, logical operation, outcome,
-simulation support marker, and string metadata. The log is append-only within a
-scenario run. Runner hook boundaries are recorded as `scheduler_checkpoint`
-operations so the deterministic simulator can ignore or replay them without
-knowing about the real mounted runner internals.
-
-Simulation-replayable operations keep `simulation_support.status = "supported"`.
-Mounted-only or platform-specific boundaries must stay in the log only when
-they are explicitly marked as unsupported with a reason. Parsing or replaying an
-operation log must not require Docker, PostgreSQL, RustFS, real mount points, or
-platform bridge crates.
 
 The final report lists all required top-level artifacts and recursively
 discovers files under `artifacts/` before writing `report.json`. This makes
@@ -281,17 +177,6 @@ non-zero; the status JSON records whether the artifact was complete. Artifact
 discovery includes regular files and symlink entries under `artifacts/`, but it
 does not recurse through symlinked directories.
 
-If a run is interrupted before normal cleanup, `studiofs-e2e clean` must recover
-stale compose infrastructure before removing the sandbox. Recovery is allowed
-only when both `.studiofs-e2e-runner.json` and `run.json` prove the candidate is
-runner-owned, `run.json` records `infra: "compose"` and a `compose_project`, and
-the sandbox path in the manifest canonicalizes back to the candidate directory.
-The recovery command is the same bounded compose teardown used by normal
-cleanup: `docker compose down --volumes --remove-orphans` for the recorded
-project. Ambiguous candidates are retained and reported as skipped. A retained
-sandbox with `cleanup.json` status `passed` is treated as having completed the
-cleanup lifecycle and must not block later compose preflight.
-
 ## Multi-Client Process Controller
 
 Mounted multi-client scenarios use the `studiofs-e2e::client` controller to
@@ -306,26 +191,9 @@ same volume for additional clients with `studiofs discover`, spawns foreground
 mount readiness, and supports graceful `studiofs umount`, forced child-process
 kill, and restart/remount. Scenarios must use this controller rather than
 sharing one local metadata DB or falling back to direct VFS calls.
-Runner-owned foreground CLI commands must be bounded. The controller applies
-per-command timeouts to `studiofs init`, `studiofs discover`, and
-`studiofs umount`, appends captured stdout/stderr to the per-client logs even
-when a command times out, kills the timed-out command process, and reports the
-client name, command action, timeout, executable path, and stdout/stderr log
-paths. If `studiofs umount` itself times out, the controller must still continue
-to the tracked mount-process fallback so cleanup can force-kill the foreground
-mount process and return control to scenario reporting.
-When the compose RustFS endpoint is still settling after Docker reports the
-service healthy, the first `studiofs init` may retry narrowly-classified
-object-store transport failures during bucket creation. The retry window is
-bounded and must not hide credential, permission, bucket naming, or endpoint
-configuration errors.
-Each real E2E bootstrap uses a UUID as the StudioFS volume name. This keeps
-multi-scenario runs from colliding with a volume created by an earlier scenario
-in the same PostgreSQL metadata database, while preserving the readable
-run-scoped bucket name for Docker/RustFS diagnostics.
 Crash-style remounts do not run `studiofs umount` for the killed client. On
 Linux, before spawning the replacement mount process, the controller attempts a
-lazy stale-mount cleanup for leftover FUSE mount points with `fusermount3 -u -z`,
+lazy stale-mount cleanup for leftover FUSE mountpoints with `fusermount3 -u -z`,
 `fusermount -u -z`, or `umount -l`. Other platforms keep the existing remount
 path unless a platform-specific stale-mount cleanup is added.
 
@@ -345,14 +213,10 @@ mounted clients, starts PostgreSQL again with compose health waiting, and then
 uses the mounted tree validator for final convergence. Temporary peer
 invisibility while PostgreSQL is stopped is not a failure; only local write
 failures and post-recovery convergence failure fail the scenario. The scenario
-publishes and converges the healthy initial file before stopping PostgreSQL,
-recording that gate under `healthy-validation/` and
-`initial_publication_gate`. It writes PostgreSQL outage/recovery events and
-local write operations to `operations.ndjson` and `outage-operations.ndjson`
-using the shared operation schema, and writes
-`postgres-outage-recovery-summary.json` with the initial publication gate,
-outage duration, accepted-operation count, recovery time, and the final
-validator result.
+writes accepted outage operations to `operations.ndjson` and
+`outage-operations.ndjson`, and writes
+`postgres-outage-recovery-summary.json` with outage duration,
+accepted-operation count, recovery time, and the final validator result.
 `recovery_time_ms` starts before the PostgreSQL compose service is brought back
 with `docker compose up --wait`, so it includes the PostgreSQL healthcheck
 readiness gate as well as mounted tree convergence time.
@@ -398,41 +262,13 @@ PostgreSQL, VFS, cache, or redb state to decide success. It must not delete
 local metadata, rerun `discover`, or share one local metadata database between
 clients during recovery.
 
-`mounted-open-handle-convergence` uses three mounted clients against one shared
-remote volume. `client-a` opens a file handle and keeps it live while
-`client-b` unlinks that path; the open handle then appends, flushes, fsyncs,
-reads back through the handle, and releases. A second case keeps another handle
-open while `client-b` renames the namespace entry, then repeats append, flush,
-fsync, read, and release through the still-open handle. `client-c` is the
-observer for namespace convergence. The pass condition is purely public
-mounted behavior: all clients converge to the same final tree, the unlinked
-path does not resurrect after flush/fsync/release, the old rename source stays
-absent, and the rename destination is visible. The scenario writes
-`operations.ndjson`, `mounted-open-handle-summary.json`, and `validation.json`;
-open-handle lifecycle records use `mounted_only` operations because the
-simulation layer does not model OS file descriptor state.
-
-`mounted-publication-boundary-crash-matrix` uses three mounted clients against
-one shared remote volume. `client-a` writes payloads and is force-killed then
-remounted at four local-first publication boundaries: flush, fsync,
-release/close, and graceful shutdown drain. Each case reuses the same client
-root, verifies the payload is locally durable after remount, opens the
-scenario-defined public convergence gate by refreshing observer peers, records
-peer mounted-tree checksums at that gate, and then waits for final mounted-tree
-convergence across all clients. The scenario writes `operations.ndjson`,
-`publication-boundary-summary.json`, and `validation.json`; boundary checkpoints
-and crash/restart operations use the shared `ScenarioOperationRecord` schema,
-while the shutdown-drain marker is explicitly recorded as mounted-only.
-
 Mounted namespace collision scenarios use the first three default clients
 against one shared remote volume. Each scenario establishes a bounded initial
 tree, starts conflicting operations from multiple clients through a shared
 barrier, writes every attempted operation to `operations.ndjson`, waits for
 mounted tree convergence, and writes `namespace-collision-summary.json` plus
-`validation.json`. Operation log records use the shared schema; sequence replaces
-the old ad hoc deterministic order marker, outcome replaces the old string
-result field, and operation variants carry paths such as rename source/target,
-unlink path, read path, or create path. The suite currently includes:
+`validation.json`. Operation records include client, operation, path, result,
+error, timestamp, and deterministic order marker. The suite currently includes:
 
 - `collision-rename-vs-rename`
 - `collision-rename-vs-unlink`
@@ -449,76 +285,11 @@ parent directories, unexpected resurrection, and checksum mismatch. The
 overwrite/read scenario records repeated read loops while another client
 overwrites the committed file version.
 
-`mounted-chaos-convergence` is the seeded product chaos scenario. It uses the
-first three default clients, creates a bounded hot working set, then executes
-multiple concurrent rounds chosen from the same conflict families as the
-focused collision suite: rename/rename, rename/unlink, unlink/append,
-overwrite/read, mkdir/rmdir/create, and readdir/stat during mutation. The
-scenario records each round's planned and started operations in
-`operations.ndjson` before launching mounted operation helpers, then records
-accepted or rejected outcomes after helpers return. Each mounted filesystem
-operation runs in a short-lived helper process rather than an in-runner thread,
-so a blocked platform syscall cannot keep the runner's main process from
-writing the failure report. A mounted-chaos round has a bounded timeout; on
-timeout the scenario force-terminates pending helper processes, reports their
-operation labels, and still enters mounted cleanup. The scenario writes
-`mounted-chaos-summary.json` and `validation.json`, and uses only mounted tree
-convergence plus namespace invariants as the pass condition. A failure should
-be reproducible with the same `--seed`.
-
-`mounted-hotspot-churn-convergence` focuses the mounted product chaos layer on
-one bounded hot directory. It uses the first three default mounted clients: two
-clients repeatedly create, unlink, rename, overwrite, and append files with the
-same `slot-*` prefix inside `hotspot/`, while the third client concurrently
-performs readdir, stat, and open/read probes against the same directory. The
-scenario records planned, started, accepted, rejected, and probe operations in
-`operations.ndjson`, writes `mounted-hotspot-churn-summary.json` and
-`validation.json`, and validates only the final mounted tree plus namespace
-invariants. Temporary divergence during the churn window is allowed; duplicate
-canonical paths, missing parents, resurrected children, and checksum mismatches
-are final validation failures.
-
-Mounted cleanup must not rely only on graceful unmount. If `studiofs umount`
-returns but the mounted process does not exit within the configured process-exit
-timeout, the client controller force-kills the mount process, clears the
-recorded PID, marks the client as killed, and returns the unmount timeout as the
-cleanup error. If the `studiofs umount` command process itself times out, the
-same mount-process force-kill fallback is required and the cleanup error must
-identify the timed-out command and its captured log paths.
-On Windows, `studiofs umount` itself must not report success after requesting
-forced termination unless the mount process is actually signaled as exited.
-
-`mounted-fault-chaos-convergence` is the deeper product fault-chaos scenario.
-It uses four clients against one shared remote volume. The first three clients
-mount as warm mutating clients, run a seeded conflict burst, accept local work
-during a PostgreSQL outage, force-kill and remount one seeded client after a
-local durability boundary, accept payload-bearing work during a RustFS/S3
-outage, and finally mount the fourth client as a cold observer with a fresh
-local root/cache. Final validation requires mounted tree convergence across all
-four clients, including the restarted client and the cold observer. The
-scenario writes `operations.ndjson`, `mounted-fault-chaos-summary.json`, and
-`validation.json`; outage/crash/restart/cold-observer boundaries are recorded
-with the shared `ScenarioOperationRecord` schema.
-
-`mounted-lww-reconnect-chaos-convergence` is the oracle-backed LWW reconnect
-scenario. It uses five clients against one shared remote volume. Four clients
-start warm; `client-c` is force-killed as a stale writer, `client-a` and
-`client-b` publish ordered writes to the same path while `client-c` is offline,
-then `client-c` remounts, writes the third ordered version, is crash/restarted
-before final convergence, and `client-e` mounts late as a cold observer. Final
-validation still requires mounted tree convergence across all five clients, but
-it also validates `lww-chaos/winner.txt` against an explicit LWW oracle derived
-from the planned operation order. This catches failures where every mounted
-client converges to the same tree but the winner is not the last expected
-writer. The scenario writes `operations.ndjson`,
-`mounted-lww-reconnect-chaos-summary.json`, `lww-oracle.json`, and
-`validation.json`.
-
 ## Mounted Tree Convergence Validation
 
 Mounted scenarios validate client-visible invariants through the
 `studiofs-e2e::mounted_tree` validator. The validator snapshots public
-mount points only; it must not inspect private VFS, metadata, cache, PostgreSQL,
+mountpoints only; it must not inspect private VFS, metadata, cache, PostgreSQL,
 or object-store state to decide whether a scenario passed.
 
 The portable equality contract is intentionally narrow:
@@ -545,16 +316,6 @@ JSON; non-UTF-8 paths fail validation instead of using lossy replacement that
 could hide collisions. The validator hashes every regular file on each
 successful poll, so mounted convergence scenarios should keep trees bounded
 until a separate checksum cache/invalidation contract exists.
-
-The mounted validator can translate mounted snapshots into
-`studiofs-scenario::invariant::LogicalSnapshot` for shared logical invariant
-checks where the public mounted surface has enough information. The translation
-intentionally carries only relative path, entry type, regular-file size, and
-regular-file checksum, plus symlink target when present. It does not infer inode
-IDs, object lifecycle state, durable-write expectations, hard-link
-relationships, or replay outcomes from a mounted tree. Scenarios that need
-those invariants must provide the missing logical facts explicitly or keep using
-scenario-specific validation.
 
 Retention behavior:
 
@@ -710,14 +471,10 @@ Required checks:
 - Compose stack: `docker/compose.e2e.yml` defines PostgreSQL 18, RustFS, and a
   Toxiproxy placeholder using version-pinned service images for reproducible
   runs. Published ports bind to `127.0.0.1` only. The runner invokes
-  `docker compose up --detach --wait` with a project-scoped name, verifies the
-  host-mapped RustFS S3 health endpoint with bounded retries, and records the
-  copied compose file plus logs under `artifacts/docker/`. If Docker reports the
-  stack healthy but the host-mapped S3 endpoint remains unreachable and the
-  caller supplied spare ports in `--port-range`, the runner may recreate the
-  stack on a higher port block within that range before scenarios start.
+  `docker compose up --detach --wait` with a project-scoped name and records the
+  copied compose file plus logs under `artifacts/docker/`.
 - Mount support:
-  - Linux requires a usable `/dev/fuse`, mount point creation rights, and the
+  - Linux requires a usable `/dev/fuse`, mountpoint creation rights, and the
     FUSE backend expected by `studiofs-fuse`.
   - Windows requires WinFSP installed, `winfsp-x64.dll` loadable by the
     product CLI, a free drive letter, and either elevation or a configured
@@ -732,21 +489,9 @@ Required checks:
   must fail preflight when a selected port is already bound. This check is early
   conflict detection; Docker's bind during `compose up` remains the final
   authority because host ports can change state after preflight.
-- stale runner-owned infrastructure: compose preflight scans the run root for
-  prior runner-owned compose manifests that do not have a passed `cleanup.json`
-  before starting Docker. If stale or ambiguous candidates are present,
-  preflight fails with a diagnostic that names the affected run IDs and points
-  to `studiofs-e2e clean --root <run-root>`.
 - stale mounts: requested mount points or drive letters must be unused, or must
   match a prior runner manifest that explicitly authorizes cleanup. Unknown
   mounted paths are a `preflight_failed` result, not an implicit force-unmount.
-- default Windows mounted-run lock: until per-run drive-letter allocation is
-  implemented, Windows WinFSP runs using compose infrastructure and at least one
-  mounted scenario acquire a machine-level lock before Docker or clients start.
-  The lock is stored under the machine-wide StudioFS E2E state directory on
-  Windows. A second default mounted run fails preflight with the lock path,
-  current run ID, and recorded holder diagnostics instead of reusing `Z:\`,
-  `Y:\`, or other default drive letters.
 - Filesystem safety: sandbox and explicit client roots canonicalize
   successfully, are not drive roots, home roots, repository roots, or temp roots,
   and do not cross symlinks or junctions in a way that would make cleanup
@@ -778,18 +523,13 @@ Rules:
   during cleanup.
 - Kill only child process IDs recorded in the manifest or discovered as direct
   descendants of those PIDs.
-- Unmount only clients that reached the mounted state or still have a tracked
-  mount process, then delete mount directories or explicit client roots.
+- Unmount before deleting mount directories or explicit client roots.
 - If unmount fails, retain the affected path and record the failure in
   `cleanup.json`.
-- Docker cleanup must target runner-owned compose projects recorded in
-  `run.json`. The recorded project name is required for interrupted-run
-  recovery, and compose teardown uses
+- Docker cleanup must target run-labeled containers, networks, and volumes
+  only. Labels must include the run ID. Compose teardown uses
   `docker compose down --volumes --remove-orphans` so PostgreSQL and RustFS
-  named volumes do not persist after cleanup. Unknown or ambiguous Docker
-  resources must be retained and reported instead of removed. The current
-  cleanup command intentionally has no force mode; unproven resources require
-  manual operator action.
+  named volumes do not persist after cleanup.
 
 When cleanup cannot prove ownership, it must retain the resource and mark the
 run `cleanup_failed`.

@@ -64,15 +64,14 @@ pub use locking::LockKind;
 pub use metrics::{
     StatFs, VfsAttrReadCacheSnapshot, VfsCacheStateSnapshot, VfsFetchStats,
     VfsForegroundReadProtectionStats, VfsIngressLane, VfsIngressPressure, VfsIngressStats,
-    VfsLatencyHistogramSnapshot, VfsMetadataInvalidationStats, VfsNamespaceCacheSnapshot,
-    VfsPortableAllocatorStats, VfsRuntimeEvent, VfsSynchronizationStateSnapshot,
-    VfsTransitMemorySnapshot, VfsUploadStats, VfsWritePathBackpressureStats,
-    VfsWritePathBurstStats, VfsWritePathCadenceStats, VfsWritePathDirtyPressureStats,
-    VfsWritePathDrainLagStats, VfsWritePathEagerFlushStats, VfsWritePathLandingZoneStats,
-    VfsWritePathLatencyQuantilesMs, VfsWritePathLatencyQuantilesSaturated,
-    VfsWritePathLocalCacheIoStats, VfsWritePathObservabilitySnapshot,
-    VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats, VfsWritePathTuningStats,
-    VfsWritePathVfsWriteStats, VfsWritePathWinfspCallbackStats,
+    VfsLatencyHistogramSnapshot, VfsNamespaceCacheSnapshot, VfsPortableAllocatorStats,
+    VfsRuntimeEvent, VfsSynchronizationStateSnapshot, VfsTransitMemorySnapshot, VfsUploadStats,
+    VfsWritePathBackpressureStats, VfsWritePathBurstStats, VfsWritePathCadenceStats,
+    VfsWritePathDirtyPressureStats, VfsWritePathDrainLagStats, VfsWritePathEagerFlushStats,
+    VfsWritePathLandingZoneStats, VfsWritePathLatencyQuantilesMs,
+    VfsWritePathLatencyQuantilesSaturated, VfsWritePathLocalCacheIoStats,
+    VfsWritePathObservabilitySnapshot, VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats,
+    VfsWritePathTuningStats, VfsWritePathVfsWriteStats, VfsWritePathWinfspCallbackStats,
     VfsWritePathWinfspForegroundFlushStats, VfsWritePathWinfspWritePathStats,
     VfsZeroIoCacheBytesSnapshot, VfsZeroIoDrilldownEntry, VfsZeroIoHealthSignal,
     VfsZeroIoRuntimeSnapshot, VfsZeroIoShutdownSnapshot, VfsZeroIoStartupReplaySnapshot,
@@ -169,7 +168,6 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-/// Constant $name.
 pub const VFS_RUNTIME_EVENT_CAPACITY: usize = 128;
 const ZEROIO_DIAGNOSTIC_DRILLDOWN_LIMIT: usize = 32;
 const ZEROIO_HEALTH_SIGNAL_LIMIT: usize = 16;
@@ -512,71 +510,52 @@ fn sustained_write_effective_buffer_bytes(
 // =============================================================================
 
 #[derive(Debug, Error)]
-/// Enum $name.
 pub enum VfsError {
     #[error("metadata error: {0}")]
-    /// Variant $name.
     Meta(#[from] studiofs_meta::MetaError),
 
     #[error("data error: {0}")]
-    /// Variant $name.
     Data(#[from] studiofs_data::store::DataError),
 
     #[error("I/O error: {0}")]
-    /// Variant $name.
     Io(#[from] std::io::Error),
 
     #[error("task join error: {0}")]
-    /// Variant $name.
     Join(#[from] tokio::task::JoinError),
 
     #[error("object error: {0}")]
-    /// Variant $name.
     Object(#[from] studiofs_data::object::ObjectError),
 
     #[error("block not found: inode {0}, block {1}")]
-    /// Variant $name.
     BlockNotFound(Ino, u32),
 
     #[error("lock conflict (EAGAIN)")]
-    /// Variant $name.
     WouldBlock,
 
     #[error("remote content is still uploading (EAGAIN)")]
-    /// Variant $name.
     RemoteContentPending,
 
     #[error("invalid filename: {0}")]
-    /// Variant $name.
     InvalidName(String),
 
     #[error("qos permit failure at {stage} for object {object_id} (0x{object_id:016x}): {message}")]
-    /// Variant $name.
     QosFailure {
-        /// Field $name.
         stage: Cow<'static, str>,
-        /// Field $name.
         object_id: u64,
-        /// Field $name.
         message: String,
     },
 
     #[error("fetch error: {0}")]
-    /// Variant $name.
     Fetch(#[from] crate::fetch::FetchError),
 
     #[error("cache backend detection failed for root '{cache_root}': {source}")]
-    /// Variant $name.
     LocalPayloadRuntimeDetection {
-        /// Field $name.
         cache_root: String,
         #[source]
-        /// Field $name.
         source: std::io::Error,
     },
 
     #[error("{0}")]
-    /// Variant $name.
     Other(String),
 }
 
@@ -587,7 +566,6 @@ enum WinfspBarrierType {
     Close,
 }
 
-/// Type alias $name.
 pub type VfsResult<T> = Result<T, VfsError>;
 
 // =============================================================================
@@ -633,7 +611,6 @@ fn is_probable_trash_component(name: &[u8]) -> bool {
     matches!(name, b".Trash" | b".Trashes") || name.starts_with(b".Trash-")
 }
 
-/// Function $name.
 pub fn is_hidden_non_macos_root_metadata_name(name: &[u8]) -> bool {
     name == b".Trashes"
 }
@@ -1685,16 +1662,6 @@ impl ReadState {
                 resolved_slices,
             },
         );
-    }
-
-    fn published_read_plan_cache_remove<I>(&self, inodes: I)
-    where
-        I: IntoIterator<Item = Ino>,
-    {
-        let mut cache = self.published_read_plan_cache.lock();
-        for ino in inodes {
-            cache.remove(&ino);
-        }
     }
 
     fn fallback_access_state(&self, ino: Ino, is_write: bool) -> Arc<Mutex<HandleAccessState>> {
@@ -2897,7 +2864,6 @@ struct StartupReplayCoordinator<'a> {
     quarantined_inodes: HashSet<Ino>,
     quarantined_object_ids: HashSet<u64>,
     replay_ops: Vec<(u64, u64, u64, u64)>,
-    uploaded_overlay_progress: Vec<(Ino, u64, u64)>,
     live_extents: HashMap<(Ino, u32), ExtentRecordId>,
     pending_epoch_finalizations: Vec<(Ino, u64)>,
     seen_replay_inodes: HashSet<Ino>,
@@ -2946,7 +2912,6 @@ impl<'a> StartupReplayCoordinator<'a> {
             quarantined_inodes: HashSet::new(),
             quarantined_object_ids: HashSet::new(),
             replay_ops: Vec::new(),
-            uploaded_overlay_progress: Vec::new(),
             live_extents: HashMap::new(),
             pending_epoch_finalizations: Vec::new(),
             seen_replay_inodes: HashSet::new(),
@@ -3001,13 +2966,6 @@ impl<'a> StartupReplayCoordinator<'a> {
         }
 
         if needs_finalization {
-            for graph_object in &graph_objects {
-                self.record_uploaded_overlay_progress_if_local(
-                    ino,
-                    graph_object,
-                    attr.content_epoch,
-                );
-            }
             self.record_epoch_finalization(ino, attr.content_epoch, graph_objects.as_slice());
         }
     }
@@ -3134,23 +3092,6 @@ impl<'a> StartupReplayCoordinator<'a> {
             content_epoch,
         );
         self.restored_live_extents = self.restored_live_extents.saturating_add(1);
-    }
-
-    fn record_uploaded_overlay_progress_if_local(
-        &mut self,
-        ino: Ino,
-        graph_object: &StartupGraphObject,
-        content_epoch: u64,
-    ) {
-        if self
-            .vfs
-            .local_payload_backend
-            .lifecycle_state(graph_object.object_id)
-            == LocalPayloadLifecycleState::Uploaded
-        {
-            self.uploaded_overlay_progress
-                .push((ino, content_epoch, graph_object.object_id));
-        }
     }
 
     fn record_epoch_finalization(
@@ -3409,49 +3350,10 @@ impl<'a> StartupReplayCoordinator<'a> {
         );
     }
 
-    fn restore_uploaded_overlay_progress(&mut self) {
-        if self.uploaded_overlay_progress.is_empty() {
-            return;
-        }
-
-        let candidates: BTreeSet<_> = self.uploaded_overlay_progress.iter().copied().collect();
-        let mut restored = 0u64;
-        for (ino, content_epoch, object_id) in candidates {
-            match self
-                .vfs
-                .sync_meta()
-                .mark_regular_file_overlay_object_uploaded_if_matches(ino, content_epoch, object_id)
-            {
-                Ok(true) => {
-                    restored = restored.saturating_add(1);
-                }
-                Ok(false) => {}
-                Err(error) => {
-                    self.replay_failures = self.replay_failures.saturating_add(1);
-                    warn!(
-                        ino,
-                        content_epoch,
-                        object_id,
-                        error = %error,
-                        "failed to restore uploaded overlay progress from local payload backend"
-                    );
-                }
-            }
-        }
-
-        if restored > 0 {
-            info!(
-                restored_uploaded_overlay_objects = restored,
-                "recovered uploaded overlay progress from local payload backend"
-            );
-        }
-    }
-
     fn finish(mut self) {
         self.mark_pending_uploads_without_attrs_stale();
         self.discard_quarantined_dirty_objects();
         self.merge_pending_live_extents();
-        self.restore_uploaded_overlay_progress();
         let replayed_blocks = self.restored_live_extents as u64;
         let replayed_object_ids: Vec<_> = self
             .replay_ops
@@ -3717,7 +3619,6 @@ impl StudioVfs {
         }
     }
 
-    /// Function $name.
     pub fn cache_state_snapshot(&self) -> VfsCacheStateSnapshot {
         let dentry = self.dentry_cache_metrics();
         let path_shortcut = self.path_shortcut_cache_metrics();
@@ -3743,7 +3644,6 @@ impl StudioVfs {
         }
     }
 
-    /// Function $name.
     pub fn synchronization_state_snapshot(&self) -> VfsSynchronizationStateSnapshot {
         let metadata_backlog = self.sync_meta().replication_backlog();
         VfsSynchronizationStateSnapshot {
@@ -3974,7 +3874,6 @@ impl StudioVfs {
         }
     }
 
-    /// Function $name.
     pub fn zeroio_runtime_snapshot(&self) -> VfsZeroIoRuntimeSnapshot {
         let generated_unix_ms = now_unix_millis();
         let storage_stats = self.local_payload_backend.storage_stats();
@@ -4436,7 +4335,6 @@ impl StudioVfs {
         snapshot
     }
 
-    /// Function $name.
     pub fn recent_runtime_events(&self, limit: usize) -> Vec<VfsRuntimeEvent> {
         let events = self.state.metrics.runtime_events.lock();
         let keep = limit.min(events.len());
@@ -4447,7 +4345,6 @@ impl StudioVfs {
             .collect()
     }
 
-    /// Function $name.
     pub fn reset_diagnostics_observability(&self) {
         self.state.metrics.reset_diagnostics_observability();
         self.state.write_admission_governor.lock().reset_stats();
@@ -4459,7 +4356,6 @@ impl StudioVfs {
         self.cached_store.reset_diagnostics_metrics();
     }
 
-    /// Function $name.
     pub fn record_runtime_event(
         &self,
         subsystem: &str,
@@ -4493,29 +4389,6 @@ impl StudioVfs {
         attrs: &[InodeAttr],
     ) {
         StartupReplayCoordinator::new(self, pending_uploads).run(attrs);
-    }
-
-    fn recover_missing_dirty_uploads_from_local_backend(&self) {
-        if self.cached_store.pending_upload_count() != 0 || self.upload_scheduler.in_flight() != 0 {
-            return;
-        }
-
-        let pending_uploads = self.pending_uploads_snapshot();
-        if !pending_uploads.is_empty() {
-            return;
-        }
-
-        let attrs = match self.sync_meta().list_inode_attrs() {
-            Ok(attrs) => attrs,
-            Err(error) => {
-                warn!(
-                    error = %error,
-                    "failed to enumerate inode attrs for runtime dirty upload recovery"
-                );
-                return;
-            }
-        };
-        self.replay_dirty_uploads_from_local_backend(pending_uploads.as_slice(), attrs.as_slice());
     }
 
     fn ensure_can_start(&self) -> VfsResult<()> {
@@ -4840,32 +4713,8 @@ impl StudioVfs {
     }
 
     async fn wait_for_pending_uploads_idle(&self, timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let now = Instant::now();
-            if now >= deadline {
-                return self.cached_store.pending_upload_count() == 0
-                    && self.upload_scheduler.in_flight() == 0;
-            }
-            let remaining = deadline.saturating_duration_since(now);
-            if !self.cached_store.wait_for_uploads_idle(remaining).await {
-                return self.cached_store.pending_upload_count() == 0
-                    && self.upload_scheduler.in_flight() == 0;
-            }
-            if self.cached_store.pending_upload_count() == 0
-                && self.upload_scheduler.in_flight() == 0
-            {
-                return true;
-            }
-            let now = Instant::now();
-            if now >= deadline {
-                return false;
-            }
-            tokio::time::sleep(
-                Duration::from_millis(50).min(deadline.saturating_duration_since(now)),
-            )
-            .await;
-        }
+        self.cached_store.wait_for_uploads_idle(timeout).await
+            && self.upload_scheduler.in_flight() == 0
     }
 
     fn derive_committed_incarnation_from_attr(
@@ -5480,7 +5329,6 @@ impl StudioVfs {
         self.collect_regular_file_object_ids_for_recovery(ino, size)
     }
 
-    /// Function $name.
     pub async fn inode_incarnation_state(&self, ino: Ino) -> VfsResult<InodeIncarnationState> {
         let attr = self.getattr_async(ino).await?;
         Ok(self.refresh_inode_incarnation_state_from_attr(ino, &attr))
@@ -5516,7 +5364,6 @@ impl StudioVfs {
         false
     }
 
-    /// Function $name.
     pub fn live_extent_records_for_inode(&self, ino: Ino) -> Vec<(u32, u64, u64)> {
         let mut out: Vec<_> = self
             .state
@@ -5533,7 +5380,6 @@ impl StudioVfs {
         out
     }
 
-    /// Function $name.
     pub fn pending_uploads_for_inode(&self, ino: Ino) -> Vec<(u64, u64, u64)> {
         let mut out: Vec<_> = self
             .pending_uploads_snapshot()
@@ -5545,7 +5391,6 @@ impl StudioVfs {
         out
     }
 
-    /// Function $name.
     pub fn read_cached_block(&self, object_id: u64) -> Option<Bytes> {
         let (cached, timing) = run_local_cache_io(|| self.local_payload_backend.get(object_id));
         self.record_local_cache_io_timing(timing);
@@ -5887,7 +5732,6 @@ impl StudioVfs {
         self.cached_store.remove_hot_upload_batch(object_ids);
     }
 
-    /// Function $name.
     pub fn upload_stats(&self) -> VfsUploadStats {
         let pending_uploads = self.pending_uploads_snapshot();
         let now_ms = now_unix_millis();
@@ -5959,12 +5803,10 @@ impl StudioVfs {
         }
     }
 
-    /// Function $name.
     pub fn file_session_stats(&self) -> VfsFileSessionStats {
         self.state.file_session.stats()
     }
 
-    /// Function $name.
     pub fn foreground_read_protection_stats(&self) -> VfsForegroundReadProtectionStats {
         let (p90_latency_ns, speedometer_samples, window_bytes, window_coverage_ms) = self
             .state
@@ -6942,7 +6784,6 @@ impl StudioVfs {
         *self.metadata_authority_override.lock() = status;
     }
 
-    /// Function $name.
     pub fn note_winfsp_write_callback(&self) {
         self.state
             .metrics
@@ -6950,7 +6791,6 @@ impl StudioVfs {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Function $name.
     pub fn record_winfsp_write_callback_observability(
         &self,
         write_bytes: usize,
@@ -7075,7 +6915,6 @@ impl StudioVfs {
         );
     }
 
-    /// Function $name.
     pub fn note_winfsp_overwrite_callback(&self) {
         self.state
             .metrics
@@ -7083,7 +6922,6 @@ impl StudioVfs {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Function $name.
     pub fn note_winfsp_cleanup_callback(&self) {
         self.state
             .metrics
@@ -7091,7 +6929,6 @@ impl StudioVfs {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Function $name.
     pub fn note_winfsp_flush_callback(&self) {
         self.state
             .metrics
@@ -7099,7 +6936,6 @@ impl StudioVfs {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Function $name.
     pub fn note_winfsp_close_callback(&self) {
         self.state
             .metrics
@@ -7107,7 +6943,6 @@ impl StudioVfs {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Function $name.
     pub fn note_winfsp_cleanup_flush_fh_callback(&self) {
         self.state
             .metrics
@@ -7139,17 +6974,14 @@ impl StudioVfs {
         }
     }
 
-    /// Function $name.
     pub fn note_winfsp_cleanup_barrier_outcome(&self, flushed: bool) {
         self.note_winfsp_barrier_outcome(WinfspBarrierType::Cleanup, flushed);
     }
 
-    /// Function $name.
     pub fn note_winfsp_flush_barrier_outcome(&self, flushed: bool) {
         self.note_winfsp_barrier_outcome(WinfspBarrierType::Flush, flushed);
     }
 
-    /// Function $name.
     pub fn note_winfsp_close_barrier_outcome(&self, flushed: bool) {
         self.note_winfsp_barrier_outcome(WinfspBarrierType::Close, flushed);
     }
@@ -7162,7 +6994,6 @@ impl StudioVfs {
             || self.state.writer_stack.has_dirty_writers(ino)
     }
 
-    /// Function $name.
     pub fn write_path_observability_snapshot(&self) -> VfsWritePathObservabilitySnapshot {
         let elapsed = self.write_path_started_at.elapsed();
         macro_rules! load_metric {
@@ -7344,11 +7175,6 @@ impl StudioVfs {
         let writer_stack_dirty_bytes = self.state.writer_stack.total_dirty_bytes();
         let total_dirty_bytes = pending_local_dirty_bytes.saturating_add(writer_stack_dirty_bytes);
         let upload_stats = self.upload_stats();
-        let meta = self.sync_meta();
-        let metadata_invalidation_diagnostics = meta.metadata_invalidation_diagnostics();
-        let metadata_replication_backlog = meta.replication_backlog();
-        let metadata_version_token = meta.metadata_version_token();
-        let namespace_version_token = meta.namespace_version_token();
         let fetch_metrics = &self.fetch_scheduler.metrics;
         let fetch_cache_hits = fetch_metrics.cache_hits.load(Ordering::Relaxed);
         let fetch_s3_fetches = fetch_metrics.s3_fetches.load(Ordering::Relaxed);
@@ -7926,20 +7752,6 @@ impl StudioVfs {
                 metadata_commit_interval_histogram,
                 elapsed,
             ),
-            metadata_invalidation: VfsMetadataInvalidationStats {
-                notifications_received: metadata_invalidation_diagnostics.notifications_received,
-                listener_reconnects: metadata_invalidation_diagnostics.listener_reconnects,
-                fallback_poll_discoveries: metadata_invalidation_diagnostics
-                    .fallback_poll_discoveries,
-                sync_errors: metadata_invalidation_diagnostics.sync_errors,
-                last_successful_sync_unix_ms: metadata_invalidation_diagnostics
-                    .last_successful_sync_unix_ms,
-                flushed_event_seq: metadata_invalidation_diagnostics.flushed_event_seq,
-                namespace_version_token,
-                metadata_version_token,
-                pending_metadata_ops: metadata_replication_backlog.pending_ops,
-                inflight_metadata_ops: metadata_replication_backlog.inflight_ops,
-            },
             eager_flush: VfsWritePathEagerFlushStats {
                 checks: eager_flush_checks,
                 triggered: eager_flush_triggered,

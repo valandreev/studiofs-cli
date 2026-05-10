@@ -1,4 +1,3 @@
-//! Crate documentation for lint completion.
 use std::cell::{Cell, RefCell};
 use std::io;
 use std::path::Path;
@@ -6,13 +5,12 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use studiofs_e2e::client::{
-    ClientCommand, ClientCommandOutput, ClientCommandTimeouts, ClientControllerConfig,
-    ClientControllerError, ClientLifecycleState, ClientProcess, ClientProcessExecutor,
-    MultiClientController, S3Config, VolumeBootstrapOptions,
+    ClientCommand, ClientCommandOutput, ClientControllerConfig, ClientControllerError,
+    ClientLifecycleState, ClientProcess, ClientProcessExecutor, MultiClientController, S3Config,
+    VolumeBootstrapOptions,
 };
 use studiofs_e2e::infra::ServicePort;
 use tempfile::tempdir;
-use uuid::Uuid;
 
 #[test]
 fn controller_bootstraps_mounts_restarts_and_kills_isolated_clients() {
@@ -207,91 +205,7 @@ fn bootstrap_workflow_reports_local_metadata_cleanup_failures_with_client_path()
 }
 
 #[test]
-fn unmount_all_skips_clients_that_never_reached_mounted_state() {
-    let temp = tempdir().unwrap();
-    let executor = RecordingExecutor::new();
-    let calls = Rc::clone(&executor.calls);
-    let mut controller = MultiClientController::new(test_config(temp.path()), executor);
-
-    controller.create_clients(["client-a", "client-b"]).unwrap();
-    controller.unmount_all().unwrap();
-
-    assert!(calls.borrow().is_empty());
-    assert!(
-        controller
-            .clients()
-            .iter()
-            .all(|client| client.state == ClientLifecycleState::Planned)
-    );
-}
-
-#[test]
-fn init_retries_transient_rustfs_bucket_create_failures() {
-    let temp = tempdir().unwrap();
-    let executor = RecordingExecutor {
-        transient_init_failures_before_success: Cell::new(2),
-        ..RecordingExecutor::new()
-    };
-    let calls = Rc::clone(&executor.calls);
-    let mut controller = MultiClientController::new(test_config(temp.path()), executor);
-
-    controller.create_clients(["client-a"]).unwrap();
-    controller.init_first_client().unwrap();
-
-    let calls = calls.borrow();
-    let init_calls = calls
-        .iter()
-        .filter(|call| call.action == "init")
-        .collect::<Vec<_>>();
-    assert_eq!(init_calls.len(), 3);
-}
-
-#[test]
-fn init_does_not_retry_non_transient_bucket_failures() {
-    let temp = tempdir().unwrap();
-    let executor = RecordingExecutor {
-        permanent_init_failure: Some(
-            "bucket 'studiofs-e2e' not accessible and could not be created: AccessDenied"
-                .to_string(),
-        ),
-        ..RecordingExecutor::new()
-    };
-    let calls = Rc::clone(&executor.calls);
-    let mut controller = MultiClientController::new(test_config(temp.path()), executor);
-
-    controller.create_clients(["client-a"]).unwrap();
-    let err = controller.init_first_client().unwrap_err();
-
-    assert!(err.to_string().contains("AccessDenied"));
-    let calls = calls.borrow();
-    let init_calls = calls.iter().filter(|call| call.action == "init").count();
-    assert_eq!(init_calls, 1);
-}
-
-#[test]
-fn init_does_not_retry_connection_refused_endpoint_failures() {
-    let temp = tempdir().unwrap();
-    let executor = RecordingExecutor {
-        permanent_init_failure: Some(
-            "bucket 'studiofs-e2e' not accessible and could not be created: connection refused"
-                .to_string(),
-        ),
-        ..RecordingExecutor::new()
-    };
-    let calls = Rc::clone(&executor.calls);
-    let mut controller = MultiClientController::new(test_config(temp.path()), executor);
-
-    controller.create_clients(["client-a"]).unwrap();
-    let err = controller.init_first_client().unwrap_err();
-
-    assert!(err.to_string().contains("connection refused"));
-    let calls = calls.borrow();
-    let init_calls = calls.iter().filter(|call| call.action == "init").count();
-    assert_eq!(init_calls, 1);
-}
-
-#[test]
-fn compose_service_config_derives_uuid_volume_and_docker_endpoints() {
+fn compose_service_config_derives_unique_volume_and_docker_endpoints() {
     let temp = tempdir().unwrap();
     let config = ClientControllerConfig::from_compose_services(
         Path::new("studiofs-test-bin").to_path_buf(),
@@ -306,7 +220,7 @@ fn compose_service_config_derives_uuid_volume_and_docker_endpoints() {
     )
     .unwrap();
 
-    Uuid::parse_str(&config.volume_name).expect("volume name should be a UUID");
+    assert_eq!(config.volume_name, "sfs-e2e-run-1-20260502-321");
     assert_eq!(
         config.meta_dsn,
         "postgres://studiofs:studiofs@127.0.0.1:35432"
@@ -315,38 +229,6 @@ fn compose_service_config_derives_uuid_volume_and_docker_endpoints() {
     assert_eq!(config.s3.bucket, "studiofs-e2e-run-1-20260502");
     assert_eq!(config.s3.access_key, "rustfsadmin");
     assert_eq!(config.s3.secret_key, "rustfsadmin");
-}
-
-#[test]
-fn compose_service_config_generates_unique_volume_names_per_scenario_config() {
-    let temp = tempdir().unwrap();
-    let first = ClientControllerConfig::from_compose_services(
-        Path::new("studiofs-test-bin").to_path_buf(),
-        temp.path().join("run-1"),
-        "Run_1.20260502",
-        321,
-        &[
-            service_port("postgres", 35432),
-            service_port("rustfs", 39000),
-            service_port("rustfs-console", 39001),
-        ],
-    )
-    .unwrap();
-    let second = ClientControllerConfig::from_compose_services(
-        Path::new("studiofs-test-bin").to_path_buf(),
-        temp.path().join("run-1"),
-        "Run_1.20260502",
-        321,
-        &[
-            service_port("postgres", 35432),
-            service_port("rustfs", 39000),
-            service_port("rustfs-console", 39001),
-        ],
-    )
-    .unwrap();
-
-    assert_ne!(first.volume_name, second.volume_name);
-    assert_eq!(first.s3.bucket, second.s3.bucket);
 }
 
 #[test]
@@ -538,135 +420,6 @@ fn unmount_waits_for_mount_process_to_exit() {
 }
 
 #[test]
-fn unmount_all_continues_after_client_unmount_error() {
-    let temp = tempdir().unwrap();
-    let executor = RecordingExecutor {
-        run_status_action: Some("umount".to_string()),
-        run_status: Cell::new(1),
-        run_stderr: "umount failed".to_string(),
-        ..RecordingExecutor::new()
-    };
-    let calls = Rc::clone(&executor.calls);
-    let killed = Rc::clone(&executor.killed);
-    let mut controller = MultiClientController::new(test_config(temp.path()), executor);
-    controller.create_clients(["client-a", "client-b"]).unwrap();
-    controller.init_first_client().unwrap();
-    controller.discover_additional_clients().unwrap();
-    controller.mount_all().unwrap();
-
-    let err = controller.unmount_all().unwrap_err();
-
-    assert!(err.to_string().contains("umount"));
-    assert_eq!(
-        calls
-            .borrow()
-            .iter()
-            .filter(|call| call.action == "umount")
-            .count(),
-        2
-    );
-    assert_eq!(killed.get(), 2);
-    assert!(
-        controller
-            .clients()
-            .iter()
-            .all(|client| client.state == ClientLifecycleState::Killed)
-    );
-}
-
-#[test]
-fn unmount_force_kills_mount_process_when_graceful_exit_times_out() {
-    let temp = tempdir().unwrap();
-    let executor = RecordingExecutor {
-        process_never_exits: true,
-        process_tree_kill_never_exits: true,
-        ..RecordingExecutor::new()
-    };
-    let killed = Rc::clone(&executor.killed);
-    let mut config = test_config(temp.path());
-    config.mount_exit_timeout = Duration::from_millis(20);
-    config.poll_interval = Duration::from_millis(1);
-    let mut controller = MultiClientController::new(config, executor);
-    controller.create_clients(["client-a"]).unwrap();
-    controller.init_first_client().unwrap();
-    controller.mount_all().unwrap();
-
-    let err = controller.unmount_all().unwrap_err();
-
-    assert!(
-        err.to_string()
-            .contains("mount process did not exit after graceful unmount")
-    );
-    assert_eq!(
-        killed.get(),
-        1,
-        "timed out graceful unmount must force-kill the mount process"
-    );
-    assert_eq!(controller.clients()[0].state, ClientLifecycleState::Killed);
-    assert!(controller.clients()[0].process_id.is_none());
-}
-
-#[test]
-fn unmount_force_kills_mount_process_when_umount_command_times_out() {
-    let temp = tempdir().unwrap();
-    let executor = RecordingExecutor {
-        run_timeout_action: Some("umount".to_string()),
-        ..RecordingExecutor::new()
-    };
-    let killed = Rc::clone(&executor.killed);
-    let mut config = test_config(temp.path());
-    config.command_timeouts.umount = Duration::from_millis(20);
-    let mut controller = MultiClientController::new(config, executor);
-    controller.create_clients(["client-a"]).unwrap();
-    controller.init_first_client().unwrap();
-    controller.mount_all().unwrap();
-
-    let err = controller.unmount_all().unwrap_err();
-
-    assert!(matches!(
-        err,
-        ClientControllerError::CommandTimedOut(details)
-            if details.client == "client-a"
-                && details.action == "umount"
-                && details.timeout == Duration::from_millis(20)
-    ));
-    assert_eq!(
-        killed.get(),
-        1,
-        "timed out umount command must still force-kill the tracked mount process"
-    );
-    assert_eq!(controller.clients()[0].state, ClientLifecycleState::Killed);
-    assert!(controller.clients()[0].process_id.is_none());
-}
-
-#[test]
-fn unmount_force_kills_mount_process_when_umount_command_fails() {
-    let temp = tempdir().unwrap();
-    let executor = RecordingExecutor {
-        run_status_action: Some("umount".to_string()),
-        run_status: Cell::new(1),
-        run_stderr: "mount process did not exit after force termination".to_string(),
-        ..RecordingExecutor::new()
-    };
-    let killed = Rc::clone(&executor.killed);
-    let mut controller = MultiClientController::new(test_config(temp.path()), executor);
-    controller.create_clients(["client-a"]).unwrap();
-    controller.init_first_client().unwrap();
-    controller.mount_all().unwrap();
-
-    let err = controller.unmount_all().unwrap_err();
-
-    assert!(err.to_string().contains("umount"));
-    assert_eq!(
-        killed.get(),
-        1,
-        "failed umount command must still force-kill the tracked mount process"
-    );
-    assert_eq!(controller.clients()[0].state, ClientLifecycleState::Killed);
-    assert!(controller.clients()[0].process_id.is_none());
-}
-
-#[test]
 fn force_kill_then_remount_reuses_same_client_root_without_graceful_umount() {
     let temp = tempdir().unwrap();
     let executor = RecordingExecutor::new();
@@ -700,92 +453,6 @@ fn force_kill_then_remount_reuses_same_client_root_without_graceful_umount() {
             .iter()
             .any(|call| call.client == "client-a" && call.action == "umount"),
         "abrupt crash recovery must not model a clean unmount"
-    );
-}
-
-#[test]
-fn force_kill_uses_process_tree_termination_for_tracked_mount_process() {
-    let temp = tempdir().unwrap();
-    let executor = RecordingExecutor::new();
-    let process_tree_kills = Rc::clone(&executor.process_tree_kills);
-    let process_wait_calls = Rc::clone(&executor.process_wait_calls);
-    let mut controller = MultiClientController::new(test_config(temp.path()), executor);
-    controller.create_clients(["client-a"]).unwrap();
-    controller.init_first_client().unwrap();
-    controller.mount_all().unwrap();
-
-    controller.force_kill("client-a").unwrap();
-
-    assert_eq!(process_tree_kills.get(), 1);
-    assert!(
-        process_wait_calls.get() >= 1,
-        "force kill must wait for process exit after signaling"
-    );
-    assert_eq!(controller.clients()[0].state, ClientLifecycleState::Killed);
-    assert!(controller.clients()[0].process_id.is_none());
-}
-
-#[test]
-fn force_kill_accepts_confirmed_tree_termination_when_process_handle_stays_stale() {
-    let temp = tempdir().unwrap();
-    let executor = RecordingExecutor {
-        process_never_exits: true,
-        process_tree_kill_confirmed_exit: true,
-        ..RecordingExecutor::new()
-    };
-    let process_tree_kills = Rc::clone(&executor.process_tree_kills);
-    let mut config = test_config(temp.path());
-    config.mount_exit_timeout = Duration::from_millis(20);
-    config.poll_interval = Duration::from_millis(1);
-    let mut controller = MultiClientController::new(config, executor);
-    controller.create_clients(["client-a"]).unwrap();
-    controller.init_first_client().unwrap();
-    controller.mount_all().unwrap();
-
-    controller.force_kill("client-a").unwrap();
-
-    assert_eq!(process_tree_kills.get(), 1);
-    assert_eq!(controller.clients()[0].state, ClientLifecycleState::Killed);
-    assert!(controller.clients()[0].process_id.is_none());
-}
-
-#[test]
-fn unmount_timeout_fallback_uses_process_tree_termination() {
-    let temp = tempdir().unwrap();
-    let executor = RecordingExecutor {
-        process_never_exits: true,
-        process_tree_kill_never_exits: true,
-        ..RecordingExecutor::new()
-    };
-    let process_tree_kills = Rc::clone(&executor.process_tree_kills);
-    let mut config = test_config(temp.path());
-    config.mount_exit_timeout = Duration::from_millis(20);
-    config.poll_interval = Duration::from_millis(1);
-    let mut controller = MultiClientController::new(config, executor);
-    controller.create_clients(["client-a"]).unwrap();
-    controller.init_first_client().unwrap();
-    controller.mount_all().unwrap();
-
-    let err = controller.unmount_all().unwrap_err();
-
-    assert!(
-        err.to_string()
-            .contains("mount process did not exit after graceful unmount")
-    );
-    assert_eq!(process_tree_kills.get(), 1);
-    assert_eq!(controller.clients()[0].state, ClientLifecycleState::Killed);
-    assert!(controller.clients()[0].process_id.is_none());
-}
-
-#[cfg(windows)]
-#[test]
-fn taskkill_not_found_status_is_success_without_parsing_stderr() {
-    assert!(studiofs_e2e::client::windows_taskkill_status_is_success(
-        Some(128),
-    ));
-    assert!(
-        !studiofs_e2e::client::windows_taskkill_status_is_success(Some(255)),
-        "non-standard taskkill failures must be resolved through PID liveness, not localized stderr"
     );
 }
 
@@ -876,43 +543,6 @@ fn command_failure_truncates_large_stdout_and_stderr() {
     assert!(message.contains("truncated"));
 }
 
-#[test]
-fn system_executor_times_out_foreground_commands_and_preserves_partial_logs() {
-    let temp = tempdir().unwrap();
-    let command = sleepy_client_command_for_mount_point(temp.path().join("mount"));
-    std::fs::create_dir_all(&command.client_root).unwrap();
-
-    let err = studiofs_e2e::client::SystemClientProcessExecutor
-        .run(&command, Duration::from_secs(2))
-        .unwrap_err();
-
-    assert!(matches!(
-        err,
-        ClientControllerError::CommandTimedOut(details)
-            if details.action == "sleepy" && details.timeout == Duration::from_secs(2)
-    ));
-    let stdout = std::fs::read_to_string(&command.stdout_log).unwrap();
-    let stderr = std::fs::read_to_string(&command.stderr_log).unwrap();
-    assert!(stdout.contains("partial stdout"));
-    assert!(stderr.contains("partial stderr"));
-}
-
-#[test]
-fn system_executor_drains_large_output_while_waiting_for_foreground_command() {
-    let temp = tempdir().unwrap();
-    let command = noisy_client_command_for_mount_point(temp.path().join("mount"));
-    std::fs::create_dir_all(&command.client_root).unwrap();
-
-    let output = studiofs_e2e::client::SystemClientProcessExecutor
-        .run(&command, Duration::from_secs(5))
-        .unwrap();
-
-    assert_eq!(output.status, 0);
-    assert!(output.stdout.len() > 128 * 1024);
-    let stdout = std::fs::read_to_string(&command.stdout_log).unwrap();
-    assert!(stdout.len() > 128 * 1024);
-}
-
 #[derive(Clone)]
 struct RecordingExecutor {
     calls: Rc<RefCell<Vec<ClientCommand>>>,
@@ -928,17 +558,9 @@ struct RecordingExecutor {
     run_status: Cell<i32>,
     run_stdout: String,
     run_stderr: String,
-    run_timeout_action: Option<String>,
-    run_status_action: Option<String>,
-    transient_init_failures_before_success: Cell<usize>,
-    permanent_init_failure: Option<String>,
     create_local_metadata_db: bool,
     fail_if_local_metadata_dir_preexists: bool,
     kill_error_after: Cell<Option<usize>>,
-    process_never_exits: bool,
-    process_tree_kills: Rc<Cell<usize>>,
-    process_tree_kill_never_exits: bool,
-    process_tree_kill_confirmed_exit: bool,
 }
 
 impl RecordingExecutor {
@@ -957,27 +579,15 @@ impl RecordingExecutor {
             run_status: Cell::new(0),
             run_stdout: String::new(),
             run_stderr: String::new(),
-            run_timeout_action: None,
-            run_status_action: None,
-            transient_init_failures_before_success: Cell::new(0),
-            permanent_init_failure: None,
             create_local_metadata_db: false,
             fail_if_local_metadata_dir_preexists: false,
             kill_error_after: Cell::new(None),
-            process_never_exits: false,
-            process_tree_kills: Rc::new(Cell::new(0)),
-            process_tree_kill_never_exits: false,
-            process_tree_kill_confirmed_exit: false,
         }
     }
 }
 
 impl ClientProcessExecutor for RecordingExecutor {
-    fn run(
-        &self,
-        command: &ClientCommand,
-        timeout: Duration,
-    ) -> Result<ClientCommandOutput, ClientControllerError> {
+    fn run(&self, command: &ClientCommand) -> io::Result<ClientCommandOutput> {
         let volume_name = command
             .args
             .get(1)
@@ -988,50 +598,9 @@ impl ClientProcessExecutor for RecordingExecutor {
                 "{} local metadata dir existed before command: {}",
                 command.client,
                 local_metadata_dir.display()
-            ))
-            .into());
-        }
-        self.calls.borrow_mut().push(command.clone());
-        if self.run_timeout_action.as_deref() == Some(command.action.as_str()) {
-            return Err(ClientControllerError::CommandTimedOut(Box::new(
-                studiofs_e2e::client::ClientCommandTimeoutError {
-                    client: command.client.clone(),
-                    action: command.action.clone(),
-                    timeout,
-                    program: command.program.clone(),
-                    stdout_log: command.stdout_log.clone(),
-                    stderr_log: command.stderr_log.clone(),
-                },
             )));
         }
-        if command.action == "init" {
-            if let Some(stderr) = &self.permanent_init_failure {
-                return Ok(ClientCommandOutput {
-                    status: 1,
-                    stdout: "Checking storage backends...\n".to_string(),
-                    stderr: stderr.clone(),
-                });
-            }
-            let remaining = self.transient_init_failures_before_success.get();
-            if remaining > 0 {
-                self.transient_init_failures_before_success
-                    .set(remaining - 1);
-                return Ok(ClientCommandOutput {
-                    status: 1,
-                    stdout: "Checking data bucket 'studiofs-e2e'... not found\n".to_string(),
-                    stderr: "bucket 'studiofs-e2e' not accessible and could not be created: HTTP request failed".to_string(),
-                });
-            }
-        }
-        let status = if self
-            .run_status_action
-            .as_deref()
-            .is_none_or(|action| action == command.action)
-        {
-            self.run_status.get()
-        } else {
-            0
-        };
+        self.calls.borrow_mut().push(command.clone());
         if self.create_local_metadata_db {
             std::fs::create_dir_all(&local_metadata_dir)?;
             std::fs::write(
@@ -1040,7 +609,7 @@ impl ClientProcessExecutor for RecordingExecutor {
             )?;
         }
         Ok(ClientCommandOutput {
-            status,
+            status: self.run_status.get(),
             stdout: self.run_stdout.clone(),
             stderr: self.run_stderr.clone(),
         })
@@ -1060,11 +629,6 @@ impl ClientProcessExecutor for RecordingExecutor {
             wait_calls: Rc::clone(&self.process_wait_calls),
             try_wait_calls: Cell::new(0),
             exit_status: self.process_exit_status.get(),
-            never_exits: self.process_never_exits,
-            process_tree_kills: Rc::clone(&self.process_tree_kills),
-            process_tree_kill_never_exits: self.process_tree_kill_never_exits,
-            process_tree_kill_confirmed_exit: self.process_tree_kill_confirmed_exit,
-            killed_once: Cell::new(false),
         }))
     }
 
@@ -1093,11 +657,6 @@ struct RecordingProcess {
     wait_calls: Rc<Cell<usize>>,
     try_wait_calls: Cell<usize>,
     exit_status: i32,
-    never_exits: bool,
-    process_tree_kills: Rc<Cell<usize>>,
-    process_tree_kill_never_exits: bool,
-    process_tree_kill_confirmed_exit: bool,
-    killed_once: Cell<bool>,
 }
 
 impl ClientProcess for RecordingProcess {
@@ -1109,12 +668,6 @@ impl ClientProcess for RecordingProcess {
         self.wait_calls.set(self.wait_calls.get() + 1);
         let calls = self.try_wait_calls.get() + 1;
         self.try_wait_calls.set(calls);
-        if self.process_tree_kill_confirmed_exit && self.killed_once.get() {
-            return Ok(Some(self.exit_status));
-        }
-        if self.never_exits && (!self.killed_once.get() || self.process_tree_kill_never_exits) {
-            return Ok(None);
-        }
         Ok((calls > 1).then_some(self.exit_status))
     }
 
@@ -1124,14 +677,7 @@ impl ClientProcess for RecordingProcess {
         if self.kill_error_after.get() == Some(next) {
             return Err(io::Error::other("injected kill failure"));
         }
-        self.killed_once.set(true);
         Ok(())
-    }
-
-    fn kill_process_tree(&mut self, _context: &str) -> io::Result<()> {
-        self.process_tree_kills
-            .set(self.process_tree_kills.get() + 1);
-        self.kill()
     }
 }
 
@@ -1148,14 +694,8 @@ fn test_config(root: &Path) -> ClientControllerConfig {
             secret_key: "studiofs123".to_string(),
             region: "us-east-1".to_string(),
         },
-        init_retry_timeout: Duration::from_millis(200),
         mount_ready_timeout: Duration::from_millis(1),
         mount_exit_timeout: Duration::from_secs(15),
-        command_timeouts: ClientCommandTimeouts {
-            init: Duration::from_millis(200),
-            discover: Duration::from_millis(200),
-            umount: Duration::from_millis(200),
-        },
         poll_interval: Duration::from_millis(20),
         mount_points: Vec::new(),
     }
@@ -1172,7 +712,6 @@ fn service_port(service: &str, host_port: u16) -> ServicePort {
 }
 
 fn client_command_for_mount_point(mount_point: std::path::PathBuf) -> ClientCommand {
-    let artifact_dir = mount_point.join("artifacts");
     ClientCommand {
         client: "client-a".to_string(),
         action: "mount".to_string(),
@@ -1182,36 +721,8 @@ fn client_command_for_mount_point(mount_point: std::path::PathBuf) -> ClientComm
         client_root: mount_point.join("client-root"),
         cache_dir: mount_point.join("cache"),
         mount_point,
-        stdout_log: artifact_dir.join("stdout.log"),
-        stderr_log: artifact_dir.join("stderr.log"),
-        tracing_log: artifact_dir.join("tracing.log"),
+        stdout_log: Path::new("stdout.log").to_path_buf(),
+        stderr_log: Path::new("stderr.log").to_path_buf(),
+        tracing_log: Path::new("tracing.log").to_path_buf(),
     }
-}
-
-fn sleepy_client_command_for_mount_point(mount_point: std::path::PathBuf) -> ClientCommand {
-    let mut command = client_command_for_mount_point(mount_point);
-    command.action = "sleepy".to_string();
-    command.program = powershell_program().to_string();
-    command.args = vec![
-        "-NoProfile".to_string(),
-        "-Command".to_string(),
-        "[Console]::Out.WriteLine('partial stdout'); [Console]::Out.Flush(); [Console]::Error.WriteLine('partial stderr'); [Console]::Error.Flush(); Start-Sleep -Seconds 5".to_string(),
-    ];
-    command
-}
-
-fn noisy_client_command_for_mount_point(mount_point: std::path::PathBuf) -> ClientCommand {
-    let mut command = client_command_for_mount_point(mount_point);
-    command.action = "noisy".to_string();
-    command.program = powershell_program().to_string();
-    command.args = vec![
-        "-NoProfile".to_string(),
-        "-Command".to_string(),
-        "[Console]::Out.Write(('x' * 131072)); [Console]::Out.Write(('y' * 1024))".to_string(),
-    ];
-    command
-}
-
-fn powershell_program() -> &'static str {
-    if cfg!(windows) { "powershell" } else { "pwsh" }
 }

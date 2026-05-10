@@ -1,4 +1,3 @@
-//! Crate documentation for lint completion.
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -10,7 +9,6 @@ use studiofs_e2e::runner::{
     CleanRequest, PlatformSelection, RetentionPolicy, RunRequest, RunStatus, RunnerError,
     ScenarioStatus,
 };
-use studiofs_scenario::{ScenarioOperation, read_operation_log};
 use tempfile::tempdir;
 
 #[test]
@@ -26,128 +24,26 @@ fn cli_parses_required_runner_entrypoints() {
         "runner-cli-test",
         "--seed",
         "42",
-        "--infra",
-        "external-env",
     ])
     .unwrap();
     match run.command {
         Commands::Run(RunArgs {
-            all,
             scenario,
             run_id,
             seed,
             platform,
-            infra,
             ..
         }) => {
-            assert!(!all);
             assert_eq!(scenario, Some("basic-multi-client-smoke".to_string()));
             assert_eq!(run_id, Some("runner-cli-test".to_string()));
             assert_eq!(seed, 42);
             assert_eq!(platform, PlatformSelection::Auto);
-            assert_eq!(infra, InfraMode::ExternalEnv);
         }
         other => panic!("expected run command, got {other:?}"),
     }
 
     let clean = Cli::try_parse_from(["studiofs-e2e", "clean"]).unwrap();
     assert!(matches!(clean.command, Commands::Clean(CleanArgs { .. })));
-
-    let run_one = Cli::try_parse_from([
-        "studiofs-e2e",
-        "__run-one",
-        "basic-multi-client-smoke",
-        "--root",
-        "target/e2e-runs",
-        "--run-id",
-        "runner-cli-test",
-        "--seed",
-        "42",
-        "--infra",
-        "external-env",
-    ])
-    .unwrap();
-    assert!(matches!(run_one.command, Commands::RunOne(_)));
-}
-
-#[test]
-fn cli_all_expands_to_every_registered_scenario() {
-    let cli = Cli::try_parse_from(["studiofs-e2e", "run", "--all"]).unwrap();
-    let Commands::Run(args) = cli.command else {
-        panic!("expected run command");
-    };
-
-    let expected = studiofs_e2e::scenario::available_scenarios()
-        .into_iter()
-        .map(|scenario| scenario.name.to_string())
-        .collect::<Vec<_>>();
-
-    assert!(args.all);
-    assert_eq!(args.scenario_names(), expected);
-    assert!(expected.len() > 1);
-}
-
-#[test]
-fn cli_first_eight_mounted_expands_to_baseline() {
-    let cli = Cli::try_parse_from(["studiofs-e2e", "run", "--first-eight-mounted"]).unwrap();
-    let Commands::Run(args) = cli.command else {
-        panic!("expected run command");
-    };
-
-    assert_eq!(
-        args.scenario_names(),
-        [
-            "basic-multi-client-smoke",
-            "postgres-outage-multi-client-recovery",
-            "rustfs-outage-multi-client-recovery",
-            "mounted-client-crash-restart-recovery",
-            "mounted-publication-boundary-crash-matrix",
-            "collision-rename-vs-rename",
-            "collision-rename-vs-unlink",
-            "collision-unlink-vs-append",
-        ]
-    );
-}
-
-#[test]
-fn cli_scenario_range_expands_by_registered_order() {
-    let cli = Cli::try_parse_from(["studiofs-e2e", "run", "--scenario", "1-8"]).unwrap();
-    let Commands::Run(args) = cli.command else {
-        panic!("expected run command");
-    };
-
-    assert_eq!(
-        args.scenario_names(),
-        [
-            "basic-multi-client-smoke",
-            "postgres-outage-multi-client-recovery",
-            "rustfs-outage-multi-client-recovery",
-            "mounted-client-crash-restart-recovery",
-            "mounted-publication-boundary-crash-matrix",
-            "collision-rename-vs-rename",
-            "collision-rename-vs-unlink",
-            "collision-unlink-vs-append",
-        ]
-    );
-}
-
-#[test]
-fn cli_scenario_comma_list_accepts_names_indices_and_ranges() {
-    let cli = Cli::try_parse_from(["studiofs-e2e", "run", "--scenario", "smoke,3,6-8"]).unwrap();
-    let Commands::Run(args) = cli.command else {
-        panic!("expected run command");
-    };
-
-    assert_eq!(
-        args.scenario_names(),
-        [
-            "smoke",
-            "rustfs-outage-multi-client-recovery",
-            "collision-rename-vs-rename",
-            "collision-rename-vs-unlink",
-            "collision-unlink-vs-append",
-        ]
-    );
 }
 
 #[test]
@@ -176,333 +72,12 @@ fn list_scenarios_exposes_namespace_collision_suite() {
         "collision-overwrite-vs-read",
         "collision-mkdir-rmdir-vs-create",
         "collision-readdir-stat-during-mutation",
-        "mounted-chaos-convergence",
-        "mounted-fault-chaos-convergence",
-        "mounted-lww-reconnect-chaos-convergence",
-        "mounted-open-handle-convergence",
     ] {
         assert!(
             names.contains(&expected),
             "expected namespace collision scenario {expected}"
         );
     }
-}
-
-#[test]
-fn mounted_fault_chaos_disabled_run_writes_reproducible_artifacts() {
-    let temp = tempdir().unwrap();
-    let request = RunRequest {
-        root: temp.path().join("e2e-runs"),
-        run_id: Some("fault-chaos-contract-run".to_string()),
-        scenarios: vec!["mounted-fault-chaos-convergence".to_string()],
-        seed: 360,
-        studiofs_bin: None,
-        platform: PlatformSelection::Auto,
-        retention: RetentionPolicy::Always,
-        report: None,
-        port_range: None,
-        timeout: None,
-        infra: InfraMode::Disabled,
-    };
-
-    let outcome = studiofs_e2e::runner::run(request).unwrap();
-
-    assert_eq!(outcome.status, RunStatus::Passed);
-    assert_eq!(outcome.scenarios[0].name, "mounted-fault-chaos-convergence");
-    assert!(
-        outcome.scenarios[0].artifacts.contains(
-            &"artifacts/scenarios/mounted-fault-chaos-convergence/mounted-fault-chaos-summary.json"
-                .to_string()
-        )
-    );
-    assert!(outcome.scenarios[0].artifacts.contains(
-        &"artifacts/scenarios/mounted-fault-chaos-convergence/validation.json".to_string()
-    ));
-
-    let sandbox = temp
-        .path()
-        .join("e2e-runs")
-        .join("fault-chaos-contract-run");
-    let summary = read_json(sandbox.join(
-        "artifacts/scenarios/mounted-fault-chaos-convergence/mounted-fault-chaos-summary.json",
-    ));
-    assert_eq!(summary["scenario"], "mounted-fault-chaos-convergence");
-    assert_eq!(summary["seed"], 360);
-    assert_eq!(summary["warm_clients"].as_array().unwrap().len(), 3);
-    assert_eq!(summary["cold_observer"], "client-d");
-    assert!(
-        summary["operation_log"]
-            .as_str()
-            .unwrap()
-            .ends_with("operations.ndjson")
-    );
-
-    let operations = read_operation_log(
-        sandbox.join("artifacts/scenarios/mounted-fault-chaos-convergence/operations.ndjson"),
-    )
-    .unwrap();
-    assert!(
-        operations
-            .iter()
-            .any(|record| matches!(&record.operation, ScenarioOperation::PostgresOutage))
-    );
-    assert!(
-        operations
-            .iter()
-            .any(|record| matches!(&record.operation, ScenarioOperation::ClientCrash))
-    );
-    assert!(
-        operations
-            .iter()
-            .any(|record| matches!(&record.operation, ScenarioOperation::ObjectStoreOutage))
-    );
-    assert!(
-        operations
-            .iter()
-            .any(|record| matches!(&record.operation, ScenarioOperation::MountedOnly { .. }))
-    );
-}
-
-#[test]
-fn mounted_lww_reconnect_chaos_disabled_run_writes_reproducible_artifacts() {
-    let temp = tempdir().unwrap();
-    let request = RunRequest {
-        root: temp.path().join("e2e-runs"),
-        run_id: Some("lww-reconnect-contract-run".to_string()),
-        scenarios: vec!["mounted-lww-reconnect-chaos-convergence".to_string()],
-        seed: 360,
-        studiofs_bin: None,
-        platform: PlatformSelection::Auto,
-        retention: RetentionPolicy::Always,
-        report: None,
-        port_range: None,
-        timeout: None,
-        infra: InfraMode::Disabled,
-    };
-
-    let outcome = studiofs_e2e::runner::run(request).unwrap();
-
-    assert_eq!(outcome.status, RunStatus::Passed);
-    assert_eq!(
-        outcome.scenarios[0].name,
-        "mounted-lww-reconnect-chaos-convergence"
-    );
-    assert!(outcome.scenarios[0].artifacts.contains(
-        &"artifacts/scenarios/mounted-lww-reconnect-chaos-convergence/mounted-lww-reconnect-chaos-summary.json"
-            .to_string()
-    ));
-    assert!(outcome.scenarios[0].artifacts.contains(
-        &"artifacts/scenarios/mounted-lww-reconnect-chaos-convergence/validation.json".to_string()
-    ));
-
-    let sandbox = temp
-        .path()
-        .join("e2e-runs")
-        .join("lww-reconnect-contract-run");
-    let summary = read_json(sandbox.join(
-        "artifacts/scenarios/mounted-lww-reconnect-chaos-convergence/mounted-lww-reconnect-chaos-summary.json",
-    ));
-    assert_eq!(
-        summary["scenario"],
-        "mounted-lww-reconnect-chaos-convergence"
-    );
-    assert_eq!(summary["seed"], 360);
-    assert_eq!(summary["warm_clients"].as_array().unwrap().len(), 4);
-    assert_eq!(summary["stale_writer"], "client-c");
-    assert_eq!(summary["cold_observer"], "client-e");
-    assert_eq!(summary["expected_winner"]["client"], "client-c");
-    assert_eq!(summary["expected_winner"]["oracle_order"], 3);
-
-    let operations = read_operation_log(
-        sandbox
-            .join("artifacts/scenarios/mounted-lww-reconnect-chaos-convergence/operations.ndjson"),
-    )
-    .unwrap();
-    assert!(
-        operations
-            .iter()
-            .any(|record| matches!(&record.operation, ScenarioOperation::ClientCrash))
-    );
-    assert!(
-        operations
-            .iter()
-            .any(|record| matches!(&record.operation, ScenarioOperation::ClientRestart))
-    );
-    assert!(
-        operations
-            .iter()
-            .any(|record| matches!(&record.operation, ScenarioOperation::MountedOnly { .. }))
-    );
-    assert!(operations.iter().any(|record| {
-        matches!(&record.operation, ScenarioOperation::Write { .. })
-            && record
-                .metadata
-                .get("expected_winner")
-                .is_some_and(|winner| winner == "true")
-    }));
-}
-
-#[test]
-fn mounted_chaos_disabled_run_writes_reproducible_artifacts() {
-    let temp = tempdir().unwrap();
-    let request = RunRequest {
-        root: temp.path().join("e2e-runs"),
-        run_id: Some("chaos-contract-run".to_string()),
-        scenarios: vec!["mounted-chaos-convergence".to_string()],
-        seed: 360,
-        studiofs_bin: None,
-        platform: PlatformSelection::Auto,
-        retention: RetentionPolicy::Always,
-        report: None,
-        port_range: None,
-        timeout: None,
-        infra: InfraMode::Disabled,
-    };
-
-    let outcome = studiofs_e2e::runner::run(request).unwrap();
-
-    assert_eq!(outcome.status, RunStatus::Passed);
-    assert_eq!(outcome.scenarios[0].name, "mounted-chaos-convergence");
-    assert!(outcome.scenarios[0].artifacts.contains(
-        &"artifacts/scenarios/mounted-chaos-convergence/mounted-chaos-summary.json".to_string()
-    ));
-    assert!(
-        outcome.scenarios[0]
-            .artifacts
-            .contains(&"artifacts/scenarios/mounted-chaos-convergence/validation.json".to_string())
-    );
-
-    let sandbox = temp.path().join("e2e-runs").join("chaos-contract-run");
-    let summary = read_json(
-        sandbox.join("artifacts/scenarios/mounted-chaos-convergence/mounted-chaos-summary.json"),
-    );
-    assert_eq!(summary["scenario"], "mounted-chaos-convergence");
-    assert_eq!(summary["seed"], 360);
-    assert_eq!(summary["rounds"], 12);
-    assert!(
-        summary["operation_log"]
-            .as_str()
-            .unwrap()
-            .ends_with("operations.ndjson")
-    );
-
-    let operations = read_operation_log(
-        sandbox.join("artifacts/scenarios/mounted-chaos-convergence/operations.ndjson"),
-    )
-    .unwrap();
-    assert!(operations.iter().any(|record| record.client.is_some()));
-    assert!(operations.iter().any(|record| record.sequence > 0));
-    assert!(
-        operations
-            .iter()
-            .any(|record| matches!(&record.operation, ScenarioOperation::Rename { .. }))
-    );
-    assert!(operations.iter().any(|record| matches!(
-        &record.operation,
-        ScenarioOperation::Append { .. } | ScenarioOperation::Write { .. }
-    )));
-}
-
-#[test]
-fn mounted_open_handle_disabled_run_writes_reproducible_artifacts() {
-    let temp = tempdir().unwrap();
-    let request = RunRequest {
-        root: temp.path().join("e2e-runs"),
-        run_id: Some("open-handle-contract-run".to_string()),
-        scenarios: vec!["mounted-open-handle-convergence".to_string()],
-        seed: 374,
-        studiofs_bin: None,
-        platform: PlatformSelection::Auto,
-        retention: RetentionPolicy::Always,
-        report: None,
-        port_range: None,
-        timeout: None,
-        infra: InfraMode::Disabled,
-    };
-
-    let outcome = studiofs_e2e::runner::run(request).unwrap();
-
-    assert_eq!(outcome.status, RunStatus::Passed);
-    assert_eq!(outcome.scenarios[0].name, "mounted-open-handle-convergence");
-    assert!(
-        outcome.scenarios[0].artifacts.contains(
-            &"artifacts/scenarios/mounted-open-handle-convergence/mounted-open-handle-summary.json"
-                .to_string()
-        )
-    );
-    assert!(outcome.scenarios[0].artifacts.contains(
-        &"artifacts/scenarios/mounted-open-handle-convergence/validation.json".to_string()
-    ));
-
-    let sandbox = temp
-        .path()
-        .join("e2e-runs")
-        .join("open-handle-contract-run");
-    let summary = read_json(sandbox.join(
-        "artifacts/scenarios/mounted-open-handle-convergence/mounted-open-handle-summary.json",
-    ));
-    assert_eq!(summary["scenario"], "mounted-open-handle-convergence");
-    assert_eq!(summary["clients"], 3);
-    assert!(
-        summary["open_unlink"]["deleted_path_absent"]
-            .as_bool()
-            .unwrap()
-    );
-    assert!(summary["open_rename"]["old_path_absent"].as_bool().unwrap());
-    assert!(
-        summary["open_rename"]["renamed_path_visible"]
-            .as_bool()
-            .unwrap()
-    );
-    for case in ["open_unlink", "open_rename"] {
-        let expected_len = summary[case]["expected_bytes_from_open_handle"].clone();
-        let expected_checksum = summary[case]["expected_checksum_sha256"].clone();
-        assert!(expected_len.as_u64().is_some_and(|len| len > 0));
-        assert!(
-            expected_checksum
-                .as_str()
-                .is_some_and(|checksum| !checksum.is_empty())
-        );
-        assert_eq!(summary[case]["bytes_read_from_open_handle"], expected_len);
-        assert_eq!(summary[case]["read_checksum_sha256"], expected_checksum);
-    }
-
-    let operations = read_operation_log(
-        sandbox.join("artifacts/scenarios/mounted-open-handle-convergence/operations.ndjson"),
-    )
-    .unwrap();
-    assert!(operations.iter().any(|record| record.client.is_some()));
-    assert!(operations.iter().any(|record| {
-        matches!(
-            &record.operation,
-            ScenarioOperation::MountedOnly { name, .. } if name == "open_handle"
-        )
-    }));
-    assert!(
-        operations
-            .iter()
-            .any(|record| matches!(&record.operation, ScenarioOperation::Unlink { .. }))
-    );
-    assert!(
-        operations
-            .iter()
-            .any(|record| matches!(&record.operation, ScenarioOperation::Rename { .. }))
-    );
-    assert!(
-        operations
-            .iter()
-            .any(|record| matches!(&record.operation, ScenarioOperation::Flush { .. }))
-    );
-    assert!(
-        operations
-            .iter()
-            .any(|record| matches!(&record.operation, ScenarioOperation::Fsync { .. }))
-    );
-    assert!(
-        operations
-            .iter()
-            .any(|record| matches!(&record.operation, ScenarioOperation::Release { .. }))
-    );
 }
 
 #[test]
@@ -552,22 +127,14 @@ fn namespace_collision_scenario_disabled_run_writes_reproducible_artifacts() {
             .ends_with("operations.ndjson")
     );
 
-    let operations = read_operation_log(
+    let operations = fs::read_to_string(
         sandbox.join("artifacts/scenarios/collision-rename-vs-unlink/operations.ndjson"),
     )
     .unwrap();
-    assert!(operations.iter().any(|record| record.client.is_some()));
-    assert!(operations.iter().any(|record| record.sequence > 0));
-    assert!(
-        operations
-            .iter()
-            .any(|record| matches!(&record.operation, ScenarioOperation::Rename { .. }))
-    );
-    assert!(
-        operations
-            .iter()
-            .any(|record| matches!(&record.operation, ScenarioOperation::Unlink { .. }))
-    );
+    assert!(operations.contains("\"client\""));
+    assert!(operations.contains("\"operation\""));
+    assert!(operations.contains("\"order\""));
+    assert!(operations.contains("\"result\""));
 }
 
 #[test]

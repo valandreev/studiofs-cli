@@ -13,11 +13,9 @@ use std::time::Duration;
 pub mod benchmark_cache;
 pub mod cached_store;
 pub mod local;
-/// Module $name.
 pub mod metrics;
 pub mod runtime;
 pub mod upload_queue;
-/// Module $name.
 pub mod upload_stage;
 
 // --- Re-exports ---
@@ -68,20 +66,15 @@ fn is_recognized_retired_runtime_root(path: &Path, metadata: &std::fs::Metadata)
 
 /// Open result for the selected local backend implementation.
 pub struct OpenedLocalPayloadBackend {
-    /// Field $name.
     pub detection: runtime::LocalPayloadRuntimeDetection,
-    /// Field $name.
     pub backend_kind: runtime::LocalPayloadBackendKind,
-    /// Field $name.
     pub backend: Arc<dyn local::LocalPayloadBackend>,
 }
 
 /// Prepared local payload object runtime state for a per-volume cache root.
 #[derive(Debug, Clone)]
 pub struct PreparedLocalPayloadRuntime {
-    /// Field $name.
     pub layout: runtime::LocalPayloadLayout,
-    /// Field $name.
     pub detection: runtime::LocalPayloadRuntimeDetection,
 }
 
@@ -89,23 +82,17 @@ pub struct PreparedLocalPayloadRuntime {
 #[derive(Debug, thiserror::Error)]
 pub enum PrepareLocalPayloadRuntimeError {
     #[error("failed to inspect cache backend contract at '{cache_root}': {source}")]
-    /// Variant $name.
     DetectCacheBackend {
-        /// Field $name.
         cache_root: String,
         #[source]
-        /// Field $name.
         source: std::io::Error,
     },
     #[error(
         "failed to provision local payload object runtime layout under '{cache_root}': {source}"
     )]
-    /// Variant $name.
     ProvisionLocalPayloadLayout {
-        /// Field $name.
         cache_root: String,
         #[source]
-        /// Field $name.
         source: std::io::Error,
     },
 }
@@ -114,32 +101,23 @@ pub enum PrepareLocalPayloadRuntimeError {
 #[derive(Debug, thiserror::Error)]
 pub enum OpenLocalPayloadBackendError {
     #[error("failed to inspect cache backend contract at '{cache_root}': {source}")]
-    /// Variant $name.
     DetectCacheBackend {
-        /// Field $name.
         cache_root: String,
         #[source]
-        /// Field $name.
         source: std::io::Error,
     },
     #[error(
         "failed to provision local payload object runtime layout under '{cache_root}': {source}"
     )]
-    /// Variant $name.
     ProvisionLocalPayloadLayout {
-        /// Field $name.
         cache_root: String,
         #[source]
-        /// Field $name.
         source: std::io::Error,
     },
     #[error("failed to open local payload object backend at '{cache_root}': {source}")]
-    /// Variant $name.
     OpenLocalPayloadBackend {
-        /// Field $name.
         cache_root: String,
         #[source]
-        /// Field $name.
         source: Box<runtime::LocalPayloadBackendOpenError>,
     },
 }

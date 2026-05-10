@@ -15,23 +15,14 @@ use crate::utils::now_unix_millis;
 // =============================================================================
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-/// Struct $name.
 pub struct VfsFileSessionStats {
-    /// Field $name.
     pub active_sessions: usize,
-    /// Field $name.
     pub open_handles: u64,
-    /// Field $name.
     pub queued_ops: u64,
-    /// Field $name.
     pub max_queue_depth: u64,
-    /// Field $name.
     pub wait_events: u64,
-    /// Field $name.
     pub wait_ms: u64,
-    /// Field $name.
     pub transitions: u64,
-    /// Field $name.
     pub wait_reasons: Vec<(String, u64)>,
 }
 
@@ -40,31 +31,23 @@ pub struct VfsFileSessionStats {
 pub struct OpenFlags(u32);
 
 impl OpenFlags {
-    /// Constant $name.
     pub const RDONLY: Self = Self(0x01);
-    /// Constant $name.
     pub const WRONLY: Self = Self(0x02);
-    /// Constant $name.
     pub const RDWR: Self = Self(0x04);
-    /// Constant $name.
     pub const APPEND: Self = Self(0x08);
 
-    /// Function $name.
     pub const fn empty() -> Self {
         Self(0)
     }
 
-    /// Function $name.
     pub const fn bits(self) -> u32 {
         self.0
     }
 
-    /// Function $name.
     pub const fn contains(self, other: Self) -> bool {
         (self.0 & other.0) == other.0
     }
 
-    /// Function $name.
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
     }
@@ -80,11 +63,8 @@ impl std::ops::BitOr for OpenFlags {
 /// Information about a single open file descriptor.
 #[derive(Clone, Debug)]
 pub struct OpenFile {
-    /// Field $name.
     pub fh: u64,
-    /// Field $name.
     pub ino: Ino,
-    /// Field $name.
     pub flags: OpenFlags,
     access_state: Arc<Mutex<HandleAccessState>>,
 }
@@ -107,7 +87,6 @@ impl OpenFile {
         self.access_state.lock().current_class()
     }
 
-    /// Function $name.
     pub fn access_class_name(&self) -> &'static str {
         self.current_access_class().as_str()
     }

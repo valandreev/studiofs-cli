@@ -24,94 +24,60 @@ use crate::runtime::LocalPayloadLayout;
 use crate::upload_queue::{PendingUpload, UploadQueue};
 use crate::upload_stage::{UploadStageStore, UploadStageStoreError};
 
-/// Type alias $name.
 pub type ObjectId = u64;
 const DEFAULT_WRITER_MAX_BUFFER_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
-/// Struct $name.
 pub struct CachedStoreConfig {
-    /// Field $name.
     pub cache_dir: PathBuf,
-    /// Field $name.
     pub upload_hot_bytes: usize,
 }
 
 #[derive(Debug, Clone)]
-/// Struct $name.
 pub struct CachedStoreWriterConfig {
-    /// Field $name.
     pub ino: u64,
-    /// Field $name.
     pub base_offset: u64,
-    /// Field $name.
     pub first_object_id: ObjectId,
-    /// Field $name.
     pub content_epoch: u64,
-    /// Field $name.
     pub block_size: usize,
-    /// Field $name.
     pub page_size: usize,
-    /// Field $name.
     pub dirty_byte_limit: Option<usize>,
-    /// Field $name.
     pub max_buffer_bytes: Option<usize>,
-    /// Field $name.
     pub submit_upload: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// Struct $name.
 pub struct WriterWriteResult {
-    /// Field $name.
     pub accepted_bytes: usize,
-    /// Field $name.
     pub dirty_bytes: usize,
-    /// Field $name.
     pub throttled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/// Struct $name.
 pub struct StagedSlice {
-    /// Field $name.
     pub ino: u64,
-    /// Field $name.
     pub offset: u64,
-    /// Field $name.
     pub object_id: ObjectId,
-    /// Field $name.
     pub len: usize,
-    /// Field $name.
     pub content_epoch: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/// Struct $name.
 pub struct DetachedStagedSlice {
-    /// Field $name.
     pub staged: StagedSlice,
-    /// Field $name.
     pub payload: Bytes,
-    /// Field $name.
     pub submit_upload: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/// Struct $name.
 pub struct CachedStoreWriterCountersSnapshot {
     /// Writer-owned bytes retained by the cached-store slice writer, including
     /// zero-filled sparse gaps that will be staged locally.
     pub dirty_bytes: u64,
-    /// Field $name.
     pub staged_bytes: u64,
-    /// Field $name.
     pub pending_upload_bytes: u64,
-    /// Field $name.
     pub staged_slices: u64,
-    /// Field $name.
     pub staging_latency_observations: u64,
-    /// Field $name.
     pub throttle_events: u64,
 }
 
@@ -179,51 +145,29 @@ fn subtract_saturating(value: &AtomicU64, amount: u64) {
 }
 
 #[derive(Debug, thiserror::Error)]
-/// Enum $name.
 pub enum CachedStoreWriterError {
     #[error("writer page size and block size must be greater than zero")]
-    /// Variant $name.
     InvalidPageGeometry,
     #[error("write offset {offset} targets bytes already frozen before {frozen_before}")]
-    /// Field $name.
-    WriteBeforeFrozen {
-        /// The offset value.
-        offset: u64,
-        /// The frozen_before value.
-        frozen_before: u64,
-    },
+    WriteBeforeFrozen { offset: u64, frozen_before: u64 },
     #[error("writer offset is too large for this platform")]
-    /// Variant $name.
     OffsetTooLarge,
     #[error("writer buffer limit exceeded: requested {requested} bytes, limit {limit} bytes")]
-    /// Field $name.
-    BufferLimitExceeded {
-        /// The requested value.
-        requested: usize,
-        /// The limit value.
-        limit: usize,
-    },
+    BufferLimitExceeded { requested: usize, limit: usize },
     #[error("local payload backend failed while staging object {object_id}: {source}")]
-    /// Variant $name.
     LocalPayload {
-        /// Field $name.
         object_id: ObjectId,
         #[source]
-        /// Field $name.
         source: crate::local::LocalPayloadBackendError,
     },
     #[error("upload stage failed while staging object {object_id}: {source}")]
-    /// Variant $name.
     UploadStage {
-        /// Field $name.
         object_id: ObjectId,
         #[source]
-        /// Field $name.
         source: UploadStageStoreError,
     },
 }
 
-/// Struct $name.
 pub struct CachedStoreWriterSlice {
     store: Arc<CachedStore>,
     config: CachedStoreWriterConfig,
@@ -235,7 +179,6 @@ pub struct CachedStoreWriterSlice {
 }
 
 impl CachedStoreConfig {
-    /// Function $name.
     pub fn new(cache_dir: impl Into<PathBuf>) -> Self {
         Self {
             cache_dir: cache_dir.into(),
@@ -243,7 +186,6 @@ impl CachedStoreConfig {
         }
     }
 
-    /// Function $name.
     pub fn with_upload_hot_bytes(mut self, upload_hot_bytes: usize) -> Self {
         self.upload_hot_bytes = upload_hot_bytes;
         self
@@ -391,7 +333,6 @@ impl UploadHotState {
     }
 }
 
-/// Struct $name.
 pub struct CachedStore {
     config: CachedStoreConfig,
     local_payload_backend: Arc<dyn LocalPayloadBackend>,
@@ -405,7 +346,6 @@ pub struct CachedStore {
 }
 
 impl CachedStore {
-    /// Function $name.
     pub fn open(
         config: CachedStoreConfig,
         local_payload_backend: Arc<dyn LocalPayloadBackend>,
@@ -430,7 +370,6 @@ impl CachedStore {
         Ok((cached_store, upload_rx))
     }
 
-    /// Function $name.
     pub fn open_writer_slice(
         self: &Arc<Self>,
         config: CachedStoreWriterConfig,
@@ -446,22 +385,18 @@ impl CachedStore {
         }
     }
 
-    /// Function $name.
     pub fn snapshot_writer_counters(&self) -> CachedStoreWriterCountersSnapshot {
         self.writer_counters.snapshot()
     }
 
-    /// Function $name.
     pub fn local_payload_backend(&self) -> &Arc<dyn LocalPayloadBackend> {
         &self.local_payload_backend
     }
 
-    /// Function $name.
     pub fn get(&self, object_id: ObjectId) -> Option<bytes::Bytes> {
         self.local_payload_backend.get(object_id)
     }
 
-    /// Function $name.
     pub fn read_into(
         &self,
         object_id: ObjectId,
@@ -472,37 +407,30 @@ impl CachedStore {
             .read_into(object_id, data_offset, out)
     }
 
-    /// Function $name.
     pub fn get_for_upload(&self, object_id: ObjectId) -> Option<bytes::Bytes> {
         self.local_payload_backend.get_for_upload(object_id)
     }
 
-    /// Function $name.
     pub fn get_staged_for_upload(&self, object_id: ObjectId) -> Option<bytes::Bytes> {
         self.upload_stage_store.get(object_id)
     }
 
-    /// Function $name.
     pub fn has_staged_upload(&self, object_id: ObjectId) -> bool {
         self.upload_stage_store.contains(object_id)
     }
 
-    /// Function $name.
     pub fn get_hot_upload(&self, object_id: ObjectId) -> Option<Bytes> {
         self.upload_hot.lock().get(object_id)
     }
 
-    /// Function $name.
     pub fn contains(&self, object_id: ObjectId) -> bool {
         self.local_payload_backend.contains(object_id)
     }
 
-    /// Function $name.
     pub fn advise_will_need(&self, object_id: ObjectId) {
         self.local_payload_backend.advise_will_need(object_id);
     }
 
-    /// Function $name.
     pub fn put(
         &self,
         object_id: ObjectId,
@@ -512,7 +440,6 @@ impl CachedStore {
         self.local_payload_backend.put(object_id, data, evictable)
     }
 
-    /// Function $name.
     pub fn put_owned(
         &self,
         put: LocalPayloadPut,
@@ -520,7 +447,6 @@ impl CachedStore {
         self.local_payload_backend.put_owned(put)
     }
 
-    /// Function $name.
     pub fn put_batch(
         &self,
         entries: &[LocalPayloadPut],
@@ -528,42 +454,34 @@ impl CachedStore {
         self.local_payload_backend.put_batch(entries)
     }
 
-    /// Function $name.
     pub fn sync_data(&self) -> Result<(), crate::local::LocalPayloadBackendError> {
         self.local_payload_backend.sync_data()
     }
 
-    /// Function $name.
     pub fn run_pressure_maintenance(&self) -> Result<(), crate::local::LocalPayloadBackendError> {
         self.local_payload_backend.run_pressure_maintenance()
     }
 
-    /// Function $name.
     pub fn mark_uploading(&self, object_id: ObjectId) {
         self.local_payload_backend.mark_uploading(object_id);
     }
 
-    /// Function $name.
     pub fn mark_upload_failed(&self, object_id: ObjectId) {
         self.local_payload_backend.mark_upload_failed(object_id);
     }
 
-    /// Function $name.
     pub fn mark_uploaded(&self, object_id: ObjectId) {
         self.local_payload_backend.mark_uploaded(object_id);
     }
 
-    /// Function $name.
     pub fn remove(&self, object_id: ObjectId) {
         self.local_payload_backend.remove(object_id);
     }
 
-    /// Function $name.
     pub fn remove_batch(&self, object_ids: &[ObjectId]) {
         self.local_payload_backend.remove_batch(object_ids);
     }
 
-    /// Function $name.
     pub fn link_upload_stage_batch(
         &self,
         object_ids: &[ObjectId],
@@ -571,7 +489,6 @@ impl CachedStore {
         self.upload_stage_store.link_payload_batch(object_ids)
     }
 
-    /// Function $name.
     pub fn cache_hot_upload_batch(&self, entries: &[LocalPayloadPut]) {
         let mut upload_hot = self.upload_hot.lock();
         for entry in entries {
@@ -579,7 +496,6 @@ impl CachedStore {
         }
     }
 
-    /// Function $name.
     pub fn persist_detached_staged_slices(
         &self,
         entries: Vec<DetachedStagedSlice>,
@@ -646,22 +562,18 @@ impl CachedStore {
         Ok(())
     }
 
-    /// Function $name.
     pub fn remove_staged_upload(&self, object_id: ObjectId) {
         self.upload_stage_store.remove(object_id);
     }
 
-    /// Function $name.
     pub fn remove_staged_upload_batch(&self, object_ids: &[ObjectId]) {
         self.upload_stage_store.remove_batch(object_ids);
     }
 
-    /// Function $name.
     pub fn remove_hot_upload(&self, object_id: ObjectId) {
         self.upload_hot.lock().remove(object_id);
     }
 
-    /// Function $name.
     pub fn remove_hot_upload_batch(&self, object_ids: &[ObjectId]) {
         let mut upload_hot = self.upload_hot.lock();
         for &object_id in object_ids {
@@ -669,42 +581,34 @@ impl CachedStore {
         }
     }
 
-    /// Function $name.
     pub fn dirty_object_ids(&self) -> Vec<ObjectId> {
         self.local_payload_backend.dirty_object_ids()
     }
 
-    /// Function $name.
     pub fn dirty_object_count(&self) -> usize {
         self.local_payload_backend.dirty_object_count()
     }
 
-    /// Function $name.
     pub fn lifecycle_state(&self, object_id: ObjectId) -> LocalPayloadLifecycleState {
         self.local_payload_backend.lifecycle_state(object_id)
     }
 
-    /// Function $name.
     pub fn is_evictable(&self, object_id: ObjectId) -> bool {
         self.local_payload_backend.is_evictable(object_id) && !self.is_pinned(object_id)
     }
 
-    /// Function $name.
     pub fn storage_stats(&self) -> LocalPayloadStorageStats {
         self.local_payload_backend.storage_stats()
     }
 
-    /// Function $name.
     pub fn object_stats(&self, object_id: ObjectId) -> Option<LocalPayloadObjectStats> {
         self.local_payload_backend.object_stats(object_id)
     }
 
-    /// Function $name.
     pub fn object_ids(&self) -> Vec<ObjectId> {
         self.local_payload_backend.object_ids()
     }
 
-    /// Function $name.
     pub fn pin(&self, object_id: ObjectId) {
         let first_pin = self.pinned.lock().insert(object_id);
         if first_pin {
@@ -712,12 +616,10 @@ impl CachedStore {
         }
     }
 
-    /// Function $name.
     pub fn is_pinned(&self, object_id: ObjectId) -> bool {
         self.pinned.lock().contains(object_id)
     }
 
-    /// Function $name.
     pub fn unpin(&self, object_id: ObjectId) {
         let last_pin = self.pinned.lock().remove(object_id);
         if last_pin {
@@ -725,7 +627,6 @@ impl CachedStore {
         }
     }
 
-    /// Function $name.
     pub fn submit_upload(&self, ino: u64, offset: u64, object_id: ObjectId, content_epoch: u64) {
         self.pin(object_id);
         self.upload_queue
@@ -735,7 +636,6 @@ impl CachedStore {
             .record_submit(self.upload_queue.pending_count());
     }
 
-    /// Function $name.
     pub fn submit_uploads_batch(&self, ops: &[(u64, u64, ObjectId, u64)]) {
         let first_pins = {
             let mut pinned = self.pinned.lock();
@@ -751,7 +651,6 @@ impl CachedStore {
         }
     }
 
-    /// Function $name.
     pub fn complete_upload(&self, op: &PendingUpload) {
         if self.upload_queue.complete(op) {
             let mut bytes = self.record_upload_terminal(op.object_id);
@@ -767,7 +666,6 @@ impl CachedStore {
         }
     }
 
-    /// Function $name.
     pub fn requeue_upload(&self, op: PendingUpload) -> bool {
         let queued = self.upload_queue.requeue(op);
         if queued {
@@ -776,7 +674,6 @@ impl CachedStore {
         queued
     }
 
-    /// Function $name.
     pub fn cancel_upload(&self, op: &PendingUpload) {
         if self.upload_queue.cancel(op) {
             self.record_upload_terminal(op.object_id);
@@ -785,47 +682,38 @@ impl CachedStore {
         }
     }
 
-    /// Function $name.
     pub fn pending_upload_count(&self) -> usize {
         self.upload_queue.pending_count()
     }
 
-    /// Function $name.
     pub async fn wait_for_uploads_idle(&self, timeout: Duration) -> bool {
         self.upload_queue.wait_for_idle(timeout).await
     }
 
-    /// Function $name.
     pub fn snapshot_pending_uploads(&self) -> Vec<PendingUpload> {
         self.upload_queue.snapshot_pending()
     }
 
-    /// Function $name.
     pub fn has_pending_uploads_for_ino(&self, ino: u64) -> bool {
         self.upload_queue.has_pending_for_ino(ino)
     }
 
-    /// Function $name.
     pub async fn flush_upload_journal(&self) {
         self.upload_queue.flush_journal().await;
     }
 
-    /// Function $name.
     pub fn cache_dir(&self) -> &Path {
         &self.config.cache_dir
     }
 
-    /// Function $name.
     pub fn cache_pipeline_metrics(&self) -> CachePipelineMetricsSnapshot {
         self.metrics.snapshot(self.upload_queue.pending_count())
     }
 
-    /// Function $name.
     pub fn reset_diagnostics_metrics(&self) {
         self.metrics.reset();
     }
 
-    /// Function $name.
     pub async fn shutdown(&self) {
         self.upload_queue.shutdown();
         self.flush_upload_journal().await;
@@ -862,7 +750,6 @@ impl CachedStore {
 }
 
 impl CachedStoreWriterSlice {
-    /// Function $name.
     pub fn write_at(
         &mut self,
         offset: u64,
@@ -909,7 +796,6 @@ impl CachedStoreWriterSlice {
         })
     }
 
-    /// Function $name.
     pub fn flush_to(
         &mut self,
         target_offset: u64,
@@ -927,7 +813,6 @@ impl CachedStoreWriterSlice {
         Ok(staged)
     }
 
-    /// Function $name.
     pub fn completed_block_count(&self) -> usize {
         if self.config.block_size == 0 {
             return 0;
@@ -935,7 +820,6 @@ impl CachedStoreWriterSlice {
         self.dirty_bytes() / self.config.block_size
     }
 
-    /// Function $name.
     pub fn flush_completed_blocks(
         &mut self,
         max_blocks: usize,
@@ -950,7 +834,6 @@ impl CachedStoreWriterSlice {
         self.flush_to(target_offset)
     }
 
-    /// Function $name.
     pub fn detach_completed_blocks(
         &mut self,
         max_blocks: usize,
@@ -965,7 +848,6 @@ impl CachedStoreWriterSlice {
         self.detach_to(target_offset)
     }
 
-    /// Function $name.
     pub fn finish(&mut self) -> Result<Vec<StagedSlice>, CachedStoreWriterError> {
         self.validate_geometry()?;
         let mut staged = Vec::new();
@@ -976,7 +858,6 @@ impl CachedStoreWriterSlice {
         Ok(staged)
     }
 
-    /// Function $name.
     pub fn detach_finish(&mut self) -> Result<Vec<DetachedStagedSlice>, CachedStoreWriterError> {
         self.validate_geometry()?;
         let mut staged = Vec::new();
@@ -987,7 +868,6 @@ impl CachedStoreWriterSlice {
         Ok(staged)
     }
 
-    /// Function $name.
     pub fn freeze_if_older_than(
         &mut self,
         max_age: Duration,
@@ -998,7 +878,6 @@ impl CachedStoreWriterSlice {
         self.finish()
     }
 
-    /// Function $name.
     pub fn read_accepted(&self, offset: u64, out: &mut [u8]) -> usize {
         if offset < self.active_start {
             return 0;
@@ -1015,7 +894,6 @@ impl CachedStoreWriterSlice {
         len
     }
 
-    /// Function $name.
     pub fn accepted_range(&self) -> Option<(u64, u64)> {
         let dirty_bytes = self.dirty_bytes();
         if dirty_bytes == 0 {
@@ -1027,12 +905,10 @@ impl CachedStoreWriterSlice {
         ))
     }
 
-    /// Function $name.
     pub fn dirty_bytes(&self) -> usize {
         self.dirty_len
     }
 
-    /// Function $name.
     pub fn set_next_object_id(&mut self, next_object_id: ObjectId) {
         self.next_object_id = next_object_id;
     }

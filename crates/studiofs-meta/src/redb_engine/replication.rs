@@ -1,225 +1,6 @@
 use super::*;
 
-struct RenameDentryContext<'a> {
-    source_parent: Ino,
-    source_name: &'a [u8],
-    destination_parent: Ino,
-    destination_name: &'a [u8],
-}
-
 impl RedbMetaEngine {
-    pub(crate) fn lookup_base_dentry(
-        &self,
-        parent: Ino,
-        name: &[u8],
-    ) -> MetaResult<Option<DirEntryValue>> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let table = txn
-            .open_table(BASE_DENTRIES_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Self::lookup_in_opened_dentry_table(&table, parent, name)
-    }
-
-    pub(crate) fn mark_local_regular_file_ready_preserving_overlay(
-        &self,
-        ino: Ino,
-    ) -> MetaResult<()> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let Some(mut attr) = Self::get_attr_from_write_table(&txn, INODES_TABLE, ino)? else {
-            txn.commit()
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            return Ok(());
-        };
-        if attr.kind == FileType::RegularFile && attr.upload_state == UploadState::Updating {
-            attr.upload_state = UploadState::Ready;
-            attr.committed_size = attr.size;
-            attr.committed_content_epoch = attr.content_epoch;
-            Self::set_inode_overlay_in_txn(&txn, &attr)?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(())
-    }
-
-    pub(crate) fn remove_dentry_mirrors_for_inode_in_txn(
-        txn: &redb::WriteTransaction,
-        ino: Ino,
-    ) -> MetaResult<()> {
-        Self::remove_dentries_for_inode_from_table_in_txn(
-            txn,
-            DENTRY_BY_INODE_TABLE,
-            DENTRIES_TABLE,
-            DENTRY_BY_INODE_TABLE,
-            ino,
-        )
-    }
-
-    fn remove_base_dentries_for_inode_in_txn(
-        txn: &redb::WriteTransaction,
-        ino: Ino,
-    ) -> MetaResult<()> {
-        Self::remove_dentries_for_inode_from_table_in_txn(
-            txn,
-            BASE_DENTRY_BY_INODE_TABLE,
-            BASE_DENTRIES_TABLE,
-            BASE_DENTRY_BY_INODE_TABLE,
-            ino,
-        )
-    }
-
-    fn remove_dentries_for_inode_from_table_in_txn(
-        txn: &redb::WriteTransaction,
-        read_index_def: redb::TableDefinition<&'static [u8], u8>,
-        table_def: redb::TableDefinition<&'static [u8], &'static [u8]>,
-        write_index_def: redb::TableDefinition<&'static [u8], u8>,
-        ino: Ino,
-    ) -> MetaResult<()> {
-        let keys = Self::dentry_keys_for_inode_in_write_index(txn, read_index_def, ino)?;
-        for key in keys {
-            let (parent, name) = decode_dentry_key(&key)?;
-            Self::remove_dentry_from_table_with_index_in_txn(
-                txn,
-                table_def,
-                write_index_def,
-                parent,
-                name,
-            )?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn remove_serving_dentries_for_inode(&self, ino: Ino) -> MetaResult<()> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Self::remove_dentry_mirrors_for_inode_in_txn(&txn, ino)?;
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(())
-    }
-
-    fn restore_mirror_aux_from_base_in_txn(
-        txn: &redb::WriteTransaction,
-        ino: Ino,
-    ) -> MetaResult<()> {
-        let base_symlink = {
-            let table = txn
-                .open_table(BASE_SYMLINKS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            table
-                .get(ino)
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-                .map(|target| target.value().to_vec())
-        };
-        if let Some(target) = base_symlink {
-            Self::set_symlink_mirror_in_txn(txn, ino, &target)?;
-        }
-
-        let base_xattr_keys = Self::keys_for_inode_in_write_table(txn, BASE_XATTRS_TABLE, ino)?;
-        for key in base_xattr_keys {
-            let value = {
-                let table = txn
-                    .open_table(BASE_XATTRS_TABLE)
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
-                table
-                    .get(key.as_slice())
-                    .map_err(|e| MetaError::Storage(e.to_string()))?
-                    .map(|value| value.value().to_vec())
-            };
-            if let Some(value) = value {
-                let name = xattr_name_from_key(&key).to_vec();
-                Self::set_xattr_mirror_in_txn(txn, ino, &name, &value)?;
-            }
-        }
-
-        Ok(())
-    }
-
-    fn unique_dentry_key_for_entry_in_write_table(
-        txn: &redb::WriteTransaction,
-        table_def: redb::TableDefinition<&'static [u8], &'static [u8]>,
-        index_def: redb::TableDefinition<&'static [u8], u8>,
-        entry: &DirEntryValue,
-        context: RenameDentryContext<'_>,
-    ) -> MetaResult<Option<Vec<u8>>> {
-        let mut matched_keys =
-            Self::matching_dentry_keys_for_entry_in_write_table(txn, table_def, index_def, entry)?;
-        if matched_keys.len() > 1 {
-            tracing::warn!(
-                ino = entry.ino,
-                source_parent = context.source_parent,
-                source_name = %String::from_utf8_lossy(context.source_name),
-                destination_parent = context.destination_parent,
-                destination_name = %String::from_utf8_lossy(context.destination_name),
-                candidate_count = matched_keys.len(),
-                "skipping rename conflict relocation for inode with multiple dentries"
-            );
-            return Ok(None);
-        }
-        Ok(matched_keys.pop())
-    }
-
-    fn matching_dentry_keys_for_entry_in_write_table(
-        txn: &redb::WriteTransaction,
-        table_def: redb::TableDefinition<&'static [u8], &'static [u8]>,
-        index_def: redb::TableDefinition<&'static [u8], u8>,
-        entry: &DirEntryValue,
-    ) -> MetaResult<Vec<Vec<u8>>> {
-        let table = txn
-            .open_table(table_def)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let mut matched_keys = Vec::new();
-        for key in Self::dentry_keys_for_inode_in_write_index(txn, index_def, entry.ino)? {
-            let Some(value) = table
-                .get(key.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-            else {
-                continue;
-            };
-            let current: DirEntryValue = decode(value.value())?;
-            if current.ino == entry.ino && current.kind == entry.kind {
-                matched_keys.push(key);
-            }
-        }
-        Ok(matched_keys)
-    }
-
-    fn sync_serving_dentry_aliases_to_base_for_entry_in_txn(
-        txn: &redb::WriteTransaction,
-        entry: &DirEntryValue,
-        serving_keys: &[Vec<u8>],
-    ) -> MetaResult<()> {
-        let base_keys = Self::matching_dentry_keys_for_entry_in_write_table(
-            txn,
-            BASE_DENTRIES_TABLE,
-            BASE_DENTRY_BY_INODE_TABLE,
-            entry,
-        )?;
-        let base_key_set: HashSet<Vec<u8>> = base_keys.iter().cloned().collect();
-
-        for key in serving_keys {
-            if base_key_set.contains(key) {
-                continue;
-            }
-            let (parent, name) = decode_dentry_key(key)?;
-            Self::remove_dentry_mirror_in_txn(txn, parent, name)?;
-        }
-
-        for key in base_keys {
-            let (parent, name) = decode_dentry_key(&key)?;
-            Self::set_dentry_mirror_in_txn(txn, parent, name, entry)?;
-        }
-
-        Ok(())
-    }
-
     /// Export a snapshot projected to the remote-visible published namespace.
     pub fn export_remote_snapshot(&self) -> MetaResult<RedbSnapshot> {
         let mut snapshot = self.export_snapshot()?;
@@ -739,7 +520,6 @@ impl RedbMetaEngine {
                         .map_err(|e| MetaError::Storage(e.to_string()))?;
                 }
                 crate::events::MetaEvent::RemoveAttr { ino } => {
-                    Self::remove_base_dentries_for_inode_in_txn(&txn, *ino)?;
                     let mut table = txn
                         .open_table(BASE_INODES_TABLE)
                         .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -798,10 +578,21 @@ impl RedbMetaEngine {
                     name,
                     entry,
                 } => {
-                    Self::set_base_dentry_in_txn(&txn, *parent, name, entry)?;
+                    let key = encode_dentry_key(*parent, name);
+                    let data = encode(entry)?;
+                    let mut table = txn
+                        .open_table(BASE_DENTRIES_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    table
+                        .insert(key.as_slice(), data.as_slice())
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
                 }
                 crate::events::MetaEvent::RemoveEntry { parent, name } => {
-                    Self::remove_base_dentry_in_txn(&txn, *parent, name)?;
+                    let key = encode_dentry_key(*parent, name);
+                    let mut table = txn
+                        .open_table(BASE_DENTRIES_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let _ = table.remove(key.as_slice());
                 }
                 crate::events::MetaEvent::RenameEntry {
                     parent,
@@ -816,52 +607,28 @@ impl RedbMetaEngine {
                     new_parent_attr,
                 } => {
                     let src_key = encode_dentry_key(*parent, name);
+                    let dst_key = encode_dentry_key(*new_parent, new_name);
 
-                    let src_matches = {
-                        let dentries = txn
-                            .open_table(BASE_DENTRIES_TABLE)
-                            .map_err(|e| MetaError::Storage(e.to_string()))?;
-                        dentries
-                            .get(src_key.as_slice())
-                            .map_err(|e| MetaError::Storage(e.to_string()))?
-                            .map(|value| decode::<DirEntryValue>(value.value()))
-                            .transpose()?
-                            .map(|current| current.ino == entry.ino && current.kind == entry.kind)
-                            .unwrap_or(false)
-                    };
-                    let current_key = if src_matches {
-                        Some(src_key.clone())
-                    } else {
-                        Self::unique_dentry_key_for_entry_in_write_table(
-                            &txn,
-                            BASE_DENTRIES_TABLE,
-                            BASE_DENTRY_BY_INODE_TABLE,
-                            entry,
-                            RenameDentryContext {
-                                source_parent: *parent,
-                                source_name: name,
-                                destination_parent: *new_parent,
-                                destination_name: new_name,
-                            },
-                        )?
-                    };
-                    let Some(current_key) = current_key else {
-                        if displaced_remove_attr_ino.is_some() {
-                            Self::remove_base_dentry_in_txn(&txn, *new_parent, new_name)?;
-                        }
-                        if let Some(ino) = displaced_remove_attr_ino {
-                            let mut inodes = txn
-                                .open_table(BASE_INODES_TABLE)
-                                .map_err(|e| MetaError::Storage(e.to_string()))?;
-                            let _ = inodes.remove(*ino);
-                        }
+                    let mut dentries = txn
+                        .open_table(BASE_DENTRIES_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let src_matches = dentries
+                        .get(src_key.as_slice())
+                        .map_err(|e| MetaError::Storage(e.to_string()))?
+                        .map(|value| decode::<DirEntryValue>(value.value()))
+                        .transpose()?
+                        .map(|current| current.ino == entry.ino && current.kind == entry.kind)
+                        .unwrap_or(false);
+                    if !src_matches {
                         continue;
-                    };
-
-                    let (current_parent, current_name) = decode_dentry_key(&current_key)?;
-                    Self::remove_base_dentry_in_txn(&txn, current_parent, current_name)?;
-                    Self::remove_base_dentry_in_txn(&txn, *new_parent, new_name)?;
-                    Self::set_base_dentry_in_txn(&txn, *new_parent, new_name, entry)?;
+                    }
+                    let _ = dentries.remove(src_key.as_slice());
+                    let _ = dentries.remove(dst_key.as_slice());
+                    let data = encode(entry)?;
+                    dentries
+                        .insert(dst_key.as_slice(), data.as_slice())
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    drop(dentries);
 
                     let mut inodes = txn
                         .open_table(BASE_INODES_TABLE)
@@ -873,7 +640,6 @@ impl RedbMetaEngine {
                             .map_err(|e| MetaError::Storage(e.to_string()))?;
                     }
                     if let Some(ino) = displaced_remove_attr_ino {
-                        Self::remove_base_dentries_for_inode_in_txn(&txn, *ino)?;
                         let _ = inodes.remove(*ino);
                     }
                     if let Some(attr) = moved_dir_attr.as_ref() {
@@ -996,7 +762,6 @@ impl RedbMetaEngine {
                     Self::set_inode_mirror_in_txn(&txn, attr)?;
                 }
                 crate::events::MetaEvent::RemoveAttr { ino } => {
-                    Self::remove_dentry_mirrors_for_inode_in_txn(&txn, *ino)?;
                     Self::remove_inode_mirror_in_txn(&txn, *ino)?;
                     Self::remove_symlink_mirror_in_txn(&txn, *ino)?;
 
@@ -1066,74 +831,18 @@ impl RedbMetaEngine {
                         .transpose()?
                         .map(|current| current.ino == entry.ino && current.kind == entry.kind)
                         .unwrap_or(false);
-                    let current_key = if src_matches {
-                        Some(src_key)
-                    } else {
-                        Self::unique_dentry_key_for_entry_in_write_table(
-                            &txn,
-                            DENTRIES_TABLE,
-                            DENTRY_BY_INODE_TABLE,
-                            entry,
-                            RenameDentryContext {
-                                source_parent: *parent,
-                                source_name: name,
-                                destination_parent: *new_parent,
-                                destination_name: new_name,
-                            },
-                        )?
-                    };
-                    let Some(current_key) = current_key else {
-                        let dst_in_base = Self::lookup_in_write_table(
-                            &txn,
-                            BASE_DENTRIES_TABLE,
-                            *new_parent,
-                            new_name,
-                        )?
-                        .map(|value| value.ino == entry.ino && value.kind == entry.kind)
-                        .unwrap_or(false);
-                        if dst_in_base {
-                            Self::remove_dentry_mirror_in_txn(&txn, *parent, name)?;
-                            Self::remove_dentry_mirror_in_txn(&txn, *new_parent, new_name)?;
-                            if Self::get_attr_from_write_table(&txn, INODES_TABLE, entry.ino)?
-                                .is_none()
-                                && let Some(attr) = Self::get_attr_from_write_table(
-                                    &txn,
-                                    BASE_INODES_TABLE,
-                                    entry.ino,
-                                )?
-                            {
-                                Self::set_inode_mirror_in_txn(&txn, &attr)?;
-                                Self::restore_mirror_aux_from_base_in_txn(&txn, entry.ino)?;
-                            }
-                            Self::set_dentry_mirror_in_txn(&txn, *new_parent, new_name, entry)?;
-                        } else {
-                            if displaced_remove_attr_ino.is_some() {
-                                Self::remove_dentry_mirror_in_txn(&txn, *new_parent, new_name)?;
-                            }
-                            if let Some(ino) = displaced_remove_attr_ino {
-                                Self::remove_dentry_mirrors_for_inode_in_txn(&txn, *ino)?;
-                                Self::remove_inode_mirror_in_txn(&txn, *ino)?;
-                            }
-                        }
+                    if !src_matches {
                         continue;
-                    };
-                    let (current_parent, current_name) = decode_dentry_key(&current_key)?;
-                    Self::remove_dentry_mirror_in_txn(&txn, current_parent, current_name)?;
-                    Self::remove_dentry_mirror_in_txn(&txn, *new_parent, new_name)?;
-                    if Self::get_attr_from_write_table(&txn, INODES_TABLE, entry.ino)?.is_none()
-                        && let Some(attr) =
-                            Self::get_attr_from_write_table(&txn, BASE_INODES_TABLE, entry.ino)?
-                    {
-                        Self::set_inode_mirror_in_txn(&txn, &attr)?;
-                        Self::restore_mirror_aux_from_base_in_txn(&txn, entry.ino)?;
                     }
+
+                    Self::remove_dentry_mirror_in_txn(&txn, *parent, name)?;
+                    Self::remove_dentry_mirror_in_txn(&txn, *new_parent, new_name)?;
                     Self::set_dentry_mirror_in_txn(&txn, *new_parent, new_name, entry)?;
 
                     if let Some(attr) = displaced_set_attr.as_ref() {
                         Self::set_inode_mirror_in_txn(&txn, attr)?;
                     }
                     if let Some(ino) = displaced_remove_attr_ino {
-                        Self::remove_dentry_mirrors_for_inode_in_txn(&txn, *ino)?;
                         Self::remove_inode_mirror_in_txn(&txn, *ino)?;
                     }
                     if let Some(attr) = moved_dir_attr.as_ref() {
@@ -1199,105 +908,13 @@ impl RedbMetaEngine {
                         )?;
                     }
                 }
-                crate::events::MetaEvent::PublishRegularFileBaseSlices { ino, chunk_slices } => {
-                    Self::replace_regular_file_chunk_rows_from_chunk_slices_in_txn(
-                        &txn,
-                        REGULAR_FILE_OVERLAY_TABLE,
-                        *ino,
-                        chunk_slices.as_slice(),
-                        true,
-                    )?;
-                }
+                crate::events::MetaEvent::PublishRegularFileBaseSlices { .. } => {}
                 crate::events::MetaEvent::RemoveRegularFileGraph { .. }
                 | crate::events::MetaEvent::AddPendingDeletion { .. }
                 | crate::events::MetaEvent::RemovePendingDeletion { .. }
                 | crate::events::MetaEvent::CreateSnapshot { .. }
                 | crate::events::MetaEvent::UpdateSnapshotState { .. } => {}
             }
-        }
-
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(())
-    }
-
-    fn reconcile_serving_rename_from_base_in_txn(
-        txn: &redb::WriteTransaction,
-        parent: Ino,
-        name: &[u8],
-        new_parent: Ino,
-        new_name: &[u8],
-        entry: &DirEntryValue,
-    ) -> MetaResult<()> {
-        let src_in_base = Self::lookup_in_write_table(txn, BASE_DENTRIES_TABLE, parent, name)?
-            .map(|value| value.ino == entry.ino && value.kind == entry.kind)
-            .unwrap_or(false);
-        let dst_in_base =
-            Self::lookup_in_write_table(txn, BASE_DENTRIES_TABLE, new_parent, new_name)?
-                .map(|value| value.ino == entry.ino && value.kind == entry.kind)
-                .unwrap_or(false);
-        let mut serving_keys = Self::matching_dentry_keys_for_entry_in_write_table(
-            txn,
-            DENTRIES_TABLE,
-            DENTRY_BY_INODE_TABLE,
-            entry,
-        )?;
-        if serving_keys.len() > 1 {
-            Self::sync_serving_dentry_aliases_to_base_for_entry_in_txn(txn, entry, &serving_keys)?;
-            return Ok(());
-        }
-        let current_key = serving_keys.pop();
-
-        if let Some(current_key) = current_key.as_ref() {
-            let (current_parent, current_name) = decode_dentry_key(current_key)?;
-            Self::remove_dentry_mirror_in_txn(txn, current_parent, current_name)?;
-        }
-
-        if dst_in_base {
-            Self::remove_dentry_mirror_in_txn(txn, parent, name)?;
-            Self::remove_dentry_mirror_in_txn(txn, new_parent, new_name)?;
-            Self::set_dentry_mirror_in_txn(txn, new_parent, new_name, entry)?;
-        } else if src_in_base {
-            Self::remove_dentry_mirror_in_txn(txn, new_parent, new_name)?;
-            Self::set_dentry_mirror_in_txn(txn, parent, name, entry)?;
-        } else {
-            Self::remove_dentry_mirror_in_txn(txn, parent, name)?;
-            Self::remove_dentry_mirror_in_txn(txn, new_parent, new_name)?;
-        }
-
-        Ok(())
-    }
-
-    /// Reconcile renames in the serving overlay using the authoritative base namespace.
-    pub fn reconcile_serving_renames_from_base<'a>(
-        &self,
-        events: impl IntoIterator<Item = &'a crate::events::MetaEvent>,
-    ) -> MetaResult<()> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-        for event in events {
-            let crate::events::MetaEvent::RenameEntry {
-                parent,
-                name,
-                new_parent,
-                new_name,
-                entry,
-                ..
-            } = event
-            else {
-                continue;
-            };
-            Self::reconcile_serving_rename_from_base_in_txn(
-                &txn,
-                *parent,
-                name,
-                *new_parent,
-                new_name,
-                entry,
-            )?;
         }
 
         txn.commit()
@@ -1319,9 +936,25 @@ impl RedbMetaEngine {
             .begin_write()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
 
-        Self::reconcile_serving_rename_from_base_in_txn(
-            &txn, parent, name, new_parent, new_name, entry,
-        )?;
+        let src_in_base = Self::lookup_in_write_table(&txn, BASE_DENTRIES_TABLE, parent, name)?
+            .map(|value| value.ino == entry.ino && value.kind == entry.kind)
+            .unwrap_or(false);
+        let dst_in_base =
+            Self::lookup_in_write_table(&txn, BASE_DENTRIES_TABLE, new_parent, new_name)?
+                .map(|value| value.ino == entry.ino && value.kind == entry.kind)
+                .unwrap_or(false);
+
+        if dst_in_base {
+            Self::remove_dentry_mirror_in_txn(&txn, parent, name)?;
+            Self::remove_dentry_mirror_in_txn(&txn, new_parent, new_name)?;
+            Self::set_dentry_mirror_in_txn(&txn, new_parent, new_name, entry)?;
+        } else if src_in_base {
+            Self::remove_dentry_mirror_in_txn(&txn, new_parent, new_name)?;
+            Self::set_dentry_mirror_in_txn(&txn, parent, name, entry)?;
+        } else {
+            Self::remove_dentry_mirror_in_txn(&txn, parent, name)?;
+            Self::remove_dentry_mirror_in_txn(&txn, new_parent, new_name)?;
+        }
 
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;

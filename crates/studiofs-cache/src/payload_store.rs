@@ -37,42 +37,29 @@ static TEMP_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
 static BATCH_INTENT_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug)]
-/// Struct $name.
 pub struct PayloadBatchEntry<'a> {
-    /// Field $name.
     pub object_id: u64,
-    /// Field $name.
     pub data: &'a [u8],
 }
 
 #[derive(Debug)]
 #[must_use = "batch payload commit intents must be completed after the index commit succeeds"]
-/// Struct $name.
 pub struct PayloadBatchCommit {
     intent_path: PathBuf,
 }
 
 impl PayloadBatchCommit {
-    /// Function $name.
     pub fn complete(self) {
         remove_batch_payload_intent(&self.intent_path);
     }
 }
 
 #[derive(Debug, thiserror::Error)]
-/// Enum $name.
 pub enum FilePayloadStoreError {
     #[error("I/O error: {0}")]
-    /// Variant $name.
     Io(#[from] io::Error),
     #[error("failed to create a unique temp payload file for object_id={object_id} in '{dir}'")]
-    /// Field $name.
-    TempFileCreateExhausted {
-        /// The object_id value.
-        object_id: u64,
-        /// The dir value.
-        dir: PathBuf,
-    },
+    TempFileCreateExhausted { object_id: u64, dir: PathBuf },
 }
 
 /// File-per-object payload store rooted under the current local payload runtime
@@ -90,12 +77,10 @@ pub struct FilePayloadStore {
 }
 
 impl FilePayloadStore {
-    /// Function $name.
     pub fn open(layout: LocalPayloadLayout) -> Result<Self, FilePayloadStoreError> {
         Self::open_with_sync_mode(layout, LocalPayloadSyncMode::Durable)
     }
 
-    /// Function $name.
     pub fn open_with_sync_mode(
         layout: LocalPayloadLayout,
         sync_mode: LocalPayloadSyncMode,
@@ -103,7 +88,6 @@ impl FilePayloadStore {
         Self::open_with_sync_and_write_mode(layout, sync_mode, LocalPayloadWriteMode::Buffered)
     }
 
-    /// Function $name.
     pub fn open_with_sync_and_write_mode(
         layout: LocalPayloadLayout,
         sync_mode: LocalPayloadSyncMode,
@@ -128,7 +112,6 @@ impl FilePayloadStore {
         })
     }
 
-    /// Function $name.
     pub fn get(&self, object_id: u64) -> Option<Bytes> {
         let path = self.layout.payload_object_path(object_id);
         let file = self.cached_read_handle(object_id, &path).ok()?;
@@ -171,7 +154,6 @@ impl FilePayloadStore {
         Some(Bytes::from(payload))
     }
 
-    /// Function $name.
     pub fn read_into(&self, object_id: u64, data_offset: usize, out: &mut [u8]) -> Option<usize> {
         if out.is_empty() {
             return Some(0);
@@ -208,7 +190,6 @@ impl FilePayloadStore {
         }
     }
 
-    /// Function $name.
     pub fn contains(&self, object_id: u64) -> bool {
         match self.payload_exists(object_id) {
             Ok(exists) => exists,
@@ -223,12 +204,10 @@ impl FilePayloadStore {
         }
     }
 
-    /// Function $name.
     pub fn payload_exists(&self, object_id: u64) -> io::Result<bool> {
         self.layout.payload_object_path(object_id).try_exists()
     }
 
-    /// Function $name.
     pub fn put(&self, object_id: u64, data: &[u8]) -> Result<(), FilePayloadStoreError> {
         let payload_path = self.layout.payload_object_path(object_id);
         let payload_dir = payload_path.parent().ok_or_else(|| {
@@ -279,7 +258,6 @@ impl FilePayloadStore {
         Ok(())
     }
 
-    /// Function $name.
     pub fn put_batch(
         &self,
         entries: &[PayloadBatchEntry<'_>],
@@ -461,7 +439,6 @@ impl FilePayloadStore {
         })
     }
 
-    /// Function $name.
     pub fn remove(&self, object_id: u64) {
         self.invalidate_cached_read_handle(object_id);
         self.pending_grouped_sync
@@ -481,14 +458,12 @@ impl FilePayloadStore {
         }
     }
 
-    /// Function $name.
     pub fn remove_batch(&self, object_ids: &[u64]) {
         for object_id in object_ids {
             self.remove(*object_id);
         }
     }
 
-    /// Function $name.
     pub fn sync_data(&self) -> Result<(), FilePayloadStoreError> {
         if matches!(self.sync_mode, LocalPayloadSyncMode::Fast) {
             let (pending_object_ids, pending_dirs) = self.take_grouped_sync_targets();

@@ -613,7 +613,6 @@ impl StudioVfs {
         result
     }
 
-    /// Function $name.
     pub fn release_fh_with_deferred_last_handle_barrier(
         self: &Arc<Self>,
         fh: u64,
@@ -649,30 +648,10 @@ impl StudioVfs {
         }
     }
 
-    /// Function $name.
     pub async fn flush_winfsp_writeback_with_outcome(
         self: &Arc<Self>,
         ino: Ino,
         fh: u64,
-    ) -> VfsResult<ExplicitFlushOutcome> {
-        self.flush_winfsp_writeback_with_policy(ino, fh, None).await
-    }
-
-    /// Drains WinFSP buffered writeback without forcing payload backend sync data.
-    pub async fn flush_winfsp_buffered_writeback_with_outcome(
-        self: &Arc<Self>,
-        ino: Ino,
-        fh: u64,
-    ) -> VfsResult<ExplicitFlushOutcome> {
-        self.flush_winfsp_writeback_with_policy(ino, fh, Some(LocalSyncPolicy::Opportunistic))
-            .await
-    }
-
-    async fn flush_winfsp_writeback_with_policy(
-        self: &Arc<Self>,
-        ino: Ino,
-        fh: u64,
-        local_sync_policy: Option<LocalSyncPolicy>,
     ) -> VfsResult<ExplicitFlushOutcome> {
         let target_ino = if fh != 0 {
             self.handle_table.get(fh).map(|open_file| open_file.ino)
@@ -689,8 +668,7 @@ impl StudioVfs {
             let outcome = self
                 .local_sync_barrier_with_outcome(
                     target_ino,
-                    local_sync_policy
-                        .unwrap_or_else(|| self.local_sync_policy_for_barrier(target_ino)),
+                    LocalSyncPolicy::Opportunistic,
                     StickyErrorPolicy::Ignore,
                     DirtyAttrPersistPolicy::PersistIfPresent,
                 )
@@ -763,26 +741,13 @@ impl StudioVfs {
             self.fail_inline_dirty_attr_persist_for_test()?;
             let meta = self.meta.clone();
             let attr_to_persist = attr.clone();
-            let persisted = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
-                if let Ok(current) = engine.get_attr(attr_to_persist.ino)
-                    && current.kind == FileType::RegularFile
-                    && attr_to_persist.kind == FileType::RegularFile
-                    && current.content_epoch >= attr_to_persist.content_epoch
-                    && current.size > attr_to_persist.size
-                {
-                    return Ok(false);
-                }
-                engine.set_attr(&attr_to_persist)?;
-                Ok(true)
+            run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+                engine.set_attr(&attr_to_persist)
             })
             .await?;
-            if persisted {
-                self.clear_matching_dirty_attr_if_committed(ino, &attr);
-            } else {
-                self.state.namespace.dirty_attrs.lock().remove(&ino);
-            }
+            self.clear_matching_dirty_attr_if_committed(ino, &attr);
             self.state.namespace.attr_read_cache.lock().remove(ino);
-            persisted
+            true
         } else {
             false
         };
@@ -895,7 +860,6 @@ impl StudioVfs {
         result
     }
 
-    /// Function $name.
     pub async fn flush_fh(&self, fh: u64) -> VfsResult<()> {
         self.flush_fh_with_outcome(fh).await.map(|_| ())
     }
@@ -984,7 +948,6 @@ impl StudioVfs {
             .await
     }
 
-    /// Function $name.
     pub async fn write_fh_with_local_sync_policy(
         &self,
         fh: u64,

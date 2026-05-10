@@ -109,7 +109,7 @@ studiofs mount myvolume Y:
 | `init` | Create a new volume and register it in PostgreSQL |
 | `discover` | Bootstrap a new client from an existing PostgreSQL-backed volume |
 | `mount` | Mount a volume as a local filesystem |
-| `umount` | Unmount an active mount point |
+| `umount` | Unmount an active mountpoint |
 | `status` | Show local/runtime volume status |
 | `janitor` | Scan and clean orphaned remote objects |
 | `fsck` | Scan/repair metadata inconsistencies (dangling entries, orphans, undo state) |
@@ -169,7 +169,7 @@ Checks:
 
 ```bash
 cargo fmt --all
-cargo clippy --workspace --all-targets -- -W missing-docs
+cargo clippy -p studiofs-meta --all-targets -- -W missing-docs
 cargo clippy --workspace --all-targets -- -D warnings
 cargo check --workspace
 ```
@@ -202,11 +202,11 @@ Focused Local-First regression:
 cargo test -p studiofs-vfs --test vfs_test foreground_read_baseline_during_and_post_upload_are_comparable -- --ignored --nocapture --test-threads=1
 ```
 
-Real mounted E2E runner:
+Real mounted E2E runner skeleton:
 
 ```bash
 cargo run -p studiofs-e2e -- list
-cargo run -p studiofs-e2e -- run --all --seed 360 --timeout 90m --studiofs-bin target/debug/studiofs
+cargo run -p studiofs-e2e -- run basic-multi-client-smoke
 cargo run -p studiofs-e2e -- clean
 ```
 
@@ -215,8 +215,7 @@ contains PostgreSQL 18, RustFS, and a Toxiproxy placeholder, waits for healthy
 required services, writes Docker logs under `artifacts/docker/`, and tears down
 containers, networks, and volumes during cleanup. Use `--port-range <start-end>`
 to choose deterministic host ports, or `--infra disabled` for runner self-tests
-that must not start Docker. Hosted Linux/FUSE product-level sweeps run manually
-through RWX with `rwx run .rwx/e2e.yml --target e2e-linux-full --wait --open`.
+that must not start Docker.
 
 Local development and infra-backed tests use RustFS as the default
 S3-compatible backend together with PostgreSQL.
@@ -258,7 +257,6 @@ Project docs live in [docs/](docs/):
 - [docs/development.md](docs/development.md) - local setup, build, and test workflow
 - [docs/contributing.md](docs/contributing.md) - verification matrix, CI ownership, platform-specific code rules
 - [docs/tests.md](docs/tests.md) - test matrix and infra expectations
-- [docs/filesystem-testing-overview.md](docs/filesystem-testing-overview.md) - friendly overview of the real filesystem testing approach
 - [docs/e2e-runner-contract.md](docs/e2e-runner-contract.md) - real mounted E2E runner contract, artifacts, reports, preflight, and cleanup rules
 - [docs/metadata.md](docs/metadata.md) - local `redb` + PostgreSQL metadata model
 - [docs/cache.md](docs/cache.md) - local cache backend, staged writeback, and upload flow

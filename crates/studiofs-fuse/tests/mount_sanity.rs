@@ -1,4 +1,3 @@
-//! Crate documentation for lint completion.
 #![cfg(unix)]
 
 use std::sync::{Arc, OnceLock};
@@ -10,8 +9,6 @@ use studiofs_meta::{
     CURRENT_FORMAT_VERSION, FormatInfo, MetaFormat, MetadataConfig, RedbMetaEngine,
 };
 use studiofs_vfs::{StudioVfs, VfsConfig};
-
-const PLATFORM_BRIDGE_MOUNT_TESTS_ENV: &str = "STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS";
 
 fn workspace_root() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -35,26 +32,6 @@ fn load_test_env() {
             let _ = dotenvy::dotenv();
         }
     });
-}
-
-fn platform_bridge_mount_tests_skip_message(test_name: &str, actual: Option<&str>) -> String {
-    let actual = actual.unwrap_or("<unset>");
-    format!(
-        "studiofs_smoke_skip test={test_name:?} reason=\"env gate disabled\" env={PLATFORM_BRIDGE_MOUNT_TESTS_ENV:?} expected=\"1\" actual={actual:?}"
-    )
-}
-
-fn platform_bridge_mount_tests_enabled(test_name: &str) -> bool {
-    let actual = std::env::var(PLATFORM_BRIDGE_MOUNT_TESTS_ENV).ok();
-    if actual.as_deref() == Some("1") {
-        true
-    } else {
-        eprintln!(
-            "{}",
-            platform_bridge_mount_tests_skip_message(test_name, actual.as_deref())
-        );
-        false
-    }
 }
 
 fn workspace_dotenv_vars() -> &'static std::collections::BTreeMap<String, String> {
@@ -152,7 +129,7 @@ fn make_test_vfs(
 #[test]
 #[ignore = "requires /dev/fuse or macFUSE and STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
 fn fuse_session_mount_and_drop_smoke() {
-    if !platform_bridge_mount_tests_enabled("fuse_session_mount_and_drop_smoke") {
+    if std::env::var("STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS").as_deref() != Ok("1") {
         return;
     }
 
@@ -224,7 +201,7 @@ fn macos_resource_fork_roundtrip_uses_native_xattr_store() {
 #[test]
 #[ignore = "requires /dev/fuse or macFUSE and STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
 fn fuse_mount_write_read_unmount_smoke() {
-    if !platform_bridge_mount_tests_enabled("fuse_mount_write_read_unmount_smoke") {
+    if std::env::var("STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS").as_deref() != Ok("1") {
         return;
     }
 
@@ -315,21 +292,4 @@ fn fuse_mount_write_read_unmount_smoke() {
     session_handle
         .join()
         .expect("FUSE session thread should exit cleanly");
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn platform_bridge_mount_tests_skip_message_names_env_gate() {
-        let message = platform_bridge_mount_tests_skip_message("smoke_case", None);
-
-        assert!(message.contains("studiofs_smoke_skip"));
-        assert!(message.contains("test=\"smoke_case\""));
-        assert!(message.contains("reason=\"env gate disabled\""));
-        assert!(message.contains("env=\"STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS\""));
-        assert!(message.contains("expected=\"1\""));
-        assert!(message.contains("actual=\"<unset>\""));
-    }
 }

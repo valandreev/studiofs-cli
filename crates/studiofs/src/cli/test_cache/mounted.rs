@@ -1430,7 +1430,7 @@ async fn run_mounted_write_phase(
             counter,
         )
         .await;
-        progress.finish_with_status(writes_by_stream.is_ok());
+        progress.finish();
         let writes_by_stream = writes_by_stream?;
         let mut merged = PhaseTelemetry::default();
         for stream in &writes_by_stream {
@@ -1448,7 +1448,7 @@ async fn run_mounted_write_phase(
             counter,
         )
         .await;
-        progress.finish_with_status(writes.is_ok());
+        progress.finish();
         Ok((writes?, Vec::new()))
     }
 }
@@ -1478,7 +1478,7 @@ async fn run_mounted_read_phase(
             counter,
         )
         .await;
-        progress.finish_with_status(reads_by_stream.is_ok());
+        progress.finish();
         let reads_by_stream = reads_by_stream?;
         let mut merged = PhaseTelemetry::default();
         for stream in &reads_by_stream {
@@ -1496,7 +1496,7 @@ async fn run_mounted_read_phase(
             counter,
         )
         .await;
-        progress.finish_with_status(reads.is_ok());
+        progress.finish();
         Ok((reads?, Vec::new()))
     }
 }

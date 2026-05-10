@@ -16,25 +16,15 @@ use tracing::{debug, error};
 
 /// Lock-free counters for upload observability.
 pub struct UploadMetrics {
-    /// Field $name.
     pub attempts: AtomicU64,
-    /// Field $name.
     pub uploads_ok: AtomicU64,
-    /// Field $name.
     pub uploads_err: AtomicU64,
-    /// Field $name.
     pub retries: AtomicU64,
-    /// Field $name.
     pub exhausted: AtomicU64,
-    /// Field $name.
     pub timeout_err: AtomicU64,
-    /// Field $name.
     pub temporary_err: AtomicU64,
-    /// Field $name.
     pub status_5xx_err: AtomicU64,
-    /// Field $name.
     pub network_err: AtomicU64,
-    /// Field $name.
     pub bytes_uploaded: AtomicU64,
 }
 
@@ -75,18 +65,10 @@ impl std::fmt::Display for UploadMetrics {
 }
 
 #[derive(Debug, thiserror::Error)]
-/// Enum $name.
 pub enum UploadError {
     #[error("upload failed after {attempts} attempts: {source}")]
-    /// Field $name.
-    Exhausted {
-        /// The attempts value.
-        attempts: u32,
-        /// The source value.
-        source: DataError,
-    },
+    Exhausted { attempts: u32, source: DataError },
     #[error("upload cancelled")]
-    /// Variant $name.
     Cancelled,
 }
 
@@ -100,12 +82,10 @@ pub struct UploadScheduler {
     retry_base_delay: Duration,
     retry_max_delay: Duration,
     adaptive_penalty_ms: AtomicU64,
-    /// Field $name.
     pub metrics: UploadMetrics,
 }
 
 impl UploadScheduler {
-    /// Function $name.
     pub fn new(data_store: Arc<DataStore>, aimd_config: AimdConfig, config: &VfsConfig) -> Self {
         let max_attempts = config.upload_max_attempts.max(1);
         let request_timeout_s = config.upload_request_timeout_secs.max(1);
@@ -140,14 +120,12 @@ impl UploadScheduler {
         }
     }
 
-    /// Function $name.
     pub fn set_adaptive_penalty(&self, delay: Duration) {
         let penalty_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
         self.adaptive_penalty_ms
             .store(penalty_ms, Ordering::Relaxed);
     }
 
-    /// Function $name.
     pub fn adaptive_penalty_ms(&self) -> u64 {
         self.adaptive_penalty_ms.load(Ordering::Relaxed)
     }
@@ -301,17 +279,14 @@ impl UploadScheduler {
         })
     }
 
-    /// Function $name.
     pub fn window(&self) -> f64 {
         self.aimd.window()
     }
 
-    /// Function $name.
     pub fn in_flight(&self) -> usize {
         self.aimd.in_flight()
     }
 
-    /// Function $name.
     pub fn max_concurrency_hint(&self) -> usize {
         self.max_concurrency_hint.max(1)
     }
