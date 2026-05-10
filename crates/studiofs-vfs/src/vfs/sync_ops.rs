@@ -809,6 +809,17 @@ impl StudioVfs {
             false
         };
 
+        // The metadata mutations above already use crash-safe redb transactions,
+        // but the mounted crash/remount boundary can immediately kill the
+        // process after this barrier. Force a local metadata checkpoint so redb
+        // recovery does not reopen a namespace/base-slice state that lags the
+        // payload object we just made durable.
+        if flushed_file_data || persisted_dirty_attrs {
+            self.sync_meta()
+                .flush_local_metadata()
+                .map_err(VfsError::Meta)?;
+        }
+
         if matches!(sticky_error_policy, StickyErrorPolicy::Report) {
             self.ensure_no_upload_sticky_error(ino)?;
         } else if let Some(msg) = self
