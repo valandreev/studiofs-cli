@@ -46,10 +46,17 @@ pub struct RunArgs {
     #[arg(long)]
     pub all: bool,
 
-    /// Scenario name, for example basic-multi-client-smoke.
+    /// Run the first eight mounted baseline scenarios.
+    #[arg(
+        long,
+        conflicts_with_all = ["all", "scenario", "scenarios"]
+    )]
+    pub first_eight_mounted: bool,
+
+    /// Scenario name, one-based index, range, or comma list.
     pub scenario: Option<String>,
 
-    /// Additional scenario name. Repeat to select multiple scenarios.
+    /// Additional scenario selector. Repeat to select multiple scenarios.
     #[arg(long = "scenario")]
     pub scenarios: Vec<String>,
 
@@ -150,12 +157,20 @@ impl RunArgs {
                 .map(|scenario| scenario.name.to_string())
                 .collect();
         }
+        if self.first_eight_mounted {
+            return scenario::FIRST_EIGHT_MOUNTED_BASELINE
+                .iter()
+                .map(|scenario| (*scenario).to_string())
+                .collect();
+        }
 
         let mut names = Vec::new();
         if let Some(scenario) = &self.scenario {
-            names.push(scenario.clone());
+            names.extend(expand_scenario_selector(scenario));
         }
-        names.extend(self.scenarios.iter().cloned());
+        for scenario in &self.scenarios {
+            names.extend(expand_scenario_selector(scenario));
+        }
         if names.is_empty() {
             names.push(scenario::BASIC_MULTI_CLIENT_SMOKE.to_string());
         }
@@ -179,6 +194,52 @@ impl RunArgs {
             infra: self.infra,
         }
     }
+}
+
+fn expand_scenario_selector(selector: &str) -> Vec<String> {
+    selector
+        .split(',')
+        .filter_map(|part| {
+            let part = part.trim();
+            (!part.is_empty()).then_some(expand_scenario_selector_part(part))
+        })
+        .flatten()
+        .collect()
+}
+
+fn expand_scenario_selector_part(part: &str) -> Vec<String> {
+    if let Ok(index) = part.parse::<usize>() {
+        return scenario_name_by_one_based_index(index)
+            .map(|name| vec![name.to_string()])
+            .unwrap_or_else(|| vec![part.to_string()]);
+    }
+
+    if let Some((start, end)) = parse_one_based_range(part) {
+        let names = (start..=end)
+            .filter_map(scenario_name_by_one_based_index)
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if !names.is_empty() {
+            return names;
+        }
+    }
+
+    vec![part.to_string()]
+}
+
+fn parse_one_based_range(part: &str) -> Option<(usize, usize)> {
+    let (start, end) = part.split_once('-')?;
+    let start = start.parse::<usize>().ok()?;
+    let end = end.parse::<usize>().ok()?;
+    (start <= end).then_some((start, end))
+}
+
+fn scenario_name_by_one_based_index(index: usize) -> Option<&'static str> {
+    index.checked_sub(1).and_then(|zero_based| {
+        scenario::available_scenarios()
+            .get(zero_based)
+            .map(|scenario| scenario.name)
+    })
 }
 
 /// Function $name.

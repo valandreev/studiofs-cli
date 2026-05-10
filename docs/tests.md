@@ -137,6 +137,7 @@ Initial runner commands:
 ```powershell
 cargo run -p studiofs-e2e -- list
 cargo build -p studiofs
+cargo run -p studiofs-e2e -- run --scenario 1-8 --seed 360 --timeout 90m --port-range 29700-29800 --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run --all --seed 360 --timeout 4h --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run basic-multi-client-smoke --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run rustfs-outage-multi-client-recovery --studiofs-bin target\debug\studiofs.exe
@@ -170,6 +171,34 @@ convergence for both `after_local_durability_boundary` and
 attempts lazy stale FUSE mount cleanup before starting the replacement process;
 publication readiness is validated through mounted-tree convergence rather than
 private backend inspection.
+
+### First-eight mounted baseline gate
+
+Before debugging later chaos layers, stabilize the first eight mounted
+scenarios as one focused gate:
+
+1. `basic-multi-client-smoke`
+2. `postgres-outage-multi-client-recovery`
+3. `rustfs-outage-multi-client-recovery`
+4. `mounted-client-crash-restart-recovery`
+5. `mounted-publication-boundary-crash-matrix`
+6. `collision-rename-vs-rename`
+7. `collision-rename-vs-unlink`
+8. `collision-unlink-vs-append`
+
+Windows/WinFSP baseline command:
+
+```powershell
+cargo build -p studiofs
+cargo run -p studiofs-e2e -- run --scenario 1-8 --seed 360 --timeout 90m --port-range 29700-29800 --studiofs-bin target\debug\studiofs.exe
+```
+
+The `run` command accepts one-based registry selectors for focused slices:
+`--scenario 1-8` runs the first eight registered scenarios, and comma lists such
+as `--scenario 1,2,5-8` can mix individual indices, ranges, canonical scenario
+names, and aliases. `--first-eight-mounted` is the stable shortcut for the same
+baseline gate. The `list` command prints the registry order used by these
+selectors.
 
 Use `--infra external-env` for production-like runs against already-running
 PostgreSQL and RustFS/S3. The runner reads `STUDIOFS_TEST_PG_DSN`,

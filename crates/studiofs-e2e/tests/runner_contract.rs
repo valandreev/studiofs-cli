@@ -88,6 +88,69 @@ fn cli_all_expands_to_every_registered_scenario() {
 }
 
 #[test]
+fn cli_first_eight_mounted_expands_to_baseline() {
+    let cli = Cli::try_parse_from(["studiofs-e2e", "run", "--first-eight-mounted"]).unwrap();
+    let Commands::Run(args) = cli.command else {
+        panic!("expected run command");
+    };
+
+    assert_eq!(
+        args.scenario_names(),
+        [
+            "basic-multi-client-smoke",
+            "postgres-outage-multi-client-recovery",
+            "rustfs-outage-multi-client-recovery",
+            "mounted-client-crash-restart-recovery",
+            "mounted-publication-boundary-crash-matrix",
+            "collision-rename-vs-rename",
+            "collision-rename-vs-unlink",
+            "collision-unlink-vs-append",
+        ]
+    );
+}
+
+#[test]
+fn cli_scenario_range_expands_by_registered_order() {
+    let cli = Cli::try_parse_from(["studiofs-e2e", "run", "--scenario", "1-8"]).unwrap();
+    let Commands::Run(args) = cli.command else {
+        panic!("expected run command");
+    };
+
+    assert_eq!(
+        args.scenario_names(),
+        [
+            "basic-multi-client-smoke",
+            "postgres-outage-multi-client-recovery",
+            "rustfs-outage-multi-client-recovery",
+            "mounted-client-crash-restart-recovery",
+            "mounted-publication-boundary-crash-matrix",
+            "collision-rename-vs-rename",
+            "collision-rename-vs-unlink",
+            "collision-unlink-vs-append",
+        ]
+    );
+}
+
+#[test]
+fn cli_scenario_comma_list_accepts_names_indices_and_ranges() {
+    let cli = Cli::try_parse_from(["studiofs-e2e", "run", "--scenario", "smoke,3,6-8"]).unwrap();
+    let Commands::Run(args) = cli.command else {
+        panic!("expected run command");
+    };
+
+    assert_eq!(
+        args.scenario_names(),
+        [
+            "smoke",
+            "rustfs-outage-multi-client-recovery",
+            "collision-rename-vs-rename",
+            "collision-rename-vs-unlink",
+            "collision-unlink-vs-append",
+        ]
+    );
+}
+
+#[test]
 fn list_scenarios_exposes_initial_basic_smoke_scenario() {
     let scenarios = studiofs_e2e::scenario::available_scenarios();
 

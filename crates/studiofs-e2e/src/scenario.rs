@@ -66,6 +66,17 @@ pub const MOUNTED_FAULT_CHAOS_CONVERGENCE: &str = "mounted-fault-chaos-convergen
 pub const MOUNTED_LWW_RECONNECT_CHAOS_CONVERGENCE: &str = "mounted-lww-reconnect-chaos-convergence";
 /// Constant $name.
 pub const MOUNTED_OPEN_HANDLE_CONVERGENCE: &str = "mounted-open-handle-convergence";
+/// First eight mounted scenarios used as the baseline gate before deeper chaos layers.
+pub const FIRST_EIGHT_MOUNTED_BASELINE: &[&str] = &[
+    BASIC_MULTI_CLIENT_SMOKE,
+    POSTGRES_OUTAGE_MULTI_CLIENT_RECOVERY,
+    RUSTFS_OUTAGE_MULTI_CLIENT_RECOVERY,
+    MOUNTED_CLIENT_CRASH_RESTART_RECOVERY,
+    MOUNTED_PUBLICATION_BOUNDARY_CRASH_MATRIX,
+    COLLISION_RENAME_VS_RENAME,
+    COLLISION_RENAME_VS_UNLINK,
+    COLLISION_UNLINK_VS_APPEND,
+];
 const SMOKE_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
 const COLLISION_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
 const CHAOS_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
