@@ -32,6 +32,14 @@ fn sparse_writes_truncate_and_read_ranges_preserve_holes() {
         vec![(0, 4).into(), (8, 4).into()],
         "read diagnostics should expose holes inside the requested range"
     );
+    assert_eq!(
+        runtime
+            .stat("writer", "sparse.bin")
+            .unwrap()
+            .checksum_sha256
+            .as_deref(),
+        Some(spanning.checksum_sha256.as_str())
+    );
 
     runtime
         .truncate_sparse_file("writer", "sparse.bin", 6)
@@ -95,6 +103,56 @@ fn sparse_ranges_converge_through_upload_publish_and_metadata_delivery() {
     assert_eq!(reader_entry.byte_ranges.len(), 4);
     assert_eq!(reader_entry.byte_ranges[0].kind, LogicalByteRangeKind::Hole);
     assert_eq!(reader_entry.byte_ranges[1].kind, LogicalByteRangeKind::Data);
+}
+
+#[test]
+fn high_offset_sparse_write_does_not_materialize_full_file_for_checksum() {
+    let mut runtime = SimulatedRuntime::new(398);
+    runtime.add_client("writer");
+
+    runtime.create_file("writer", "large-sparse.bin").unwrap();
+    runtime
+        .write_sparse_range("writer", "large-sparse.bin", 8 * 1024 * 1024 * 1024, b"x")
+        .unwrap();
+
+    let stat = runtime.stat("writer", "large-sparse.bin").unwrap();
+    assert_eq!(stat.size, Some(8 * 1024 * 1024 * 1024 + 1));
+    let tail = runtime
+        .read_file_range("writer", "large-sparse.bin", 8 * 1024 * 1024 * 1024, 1)
+        .unwrap();
+    assert_eq!(tail.bytes, b"x");
+}
+
+#[test]
+fn sparse_object_ids_use_logical_identity_after_rename() {
+    let mut runtime = SimulatedRuntime::new(399);
+    runtime.add_client("writer");
+
+    runtime.create_file("writer", "dir/sparse.bin").unwrap();
+    runtime
+        .write_sparse_range("writer", "dir/sparse.bin", 4, b"left")
+        .unwrap();
+    runtime
+        .rename("writer", "dir/sparse.bin", "dir/renamed.bin")
+        .unwrap();
+    runtime
+        .write_sparse_range("writer", "dir/renamed.bin", 12, b"right")
+        .unwrap();
+
+    let snapshot = runtime.logical_snapshot();
+    let entry = snapshot
+        .clients
+        .iter()
+        .find(|client| client.client == "writer")
+        .unwrap()
+        .entries
+        .iter()
+        .find(|entry| entry.path == "dir/renamed.bin")
+        .unwrap();
+    let object_id = &entry.object.as_ref().unwrap().object_id;
+    assert!(!object_id.contains("dir/sparse.bin"));
+    assert!(!object_id.contains("dir/renamed.bin"));
+    assert!(object_id.contains(entry.logical_id.as_deref().unwrap()));
 }
 
 #[test]

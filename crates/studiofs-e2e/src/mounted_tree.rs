@@ -1101,6 +1101,7 @@ fn mounted_entry_to_logical_entry(entry: &TreeEntry) -> LogicalEntry {
         object: None,
         checksum_sha256: entry.checksum_sha256.clone(),
         size: entry.size,
+        byte_ranges: Vec::new(),
         symlink_target: entry.symlink_target.clone(),
     }
 }

@@ -100,7 +100,8 @@ impl SimulatedRuntime {
         checksum_sha256: impl Into<String>,
     ) -> Result<(), ClientRuntimeError> {
         let checksum_sha256 = checksum_sha256.into();
-        let object_id = self.object_id(client, path, &checksum_sha256);
+        let logical_id = self.entry(client, path)?.logical_id.clone();
+        let object_id = Self::object_id(client, &logical_id, &checksum_sha256);
         let next_epoch = self
             .entry(client, path)?
             .epoch
@@ -146,7 +147,7 @@ impl SimulatedRuntime {
             payload.write(offset, bytes)?;
             let size = payload.size;
             let checksum_sha256 = payload.file_checksum();
-            let object_id = format!("{client}:{path}:{checksum_sha256}");
+            let object_id = Self::object_id(client, &entry.logical_id, &checksum_sha256);
             entry.size = Some(size);
             entry.checksum_sha256 = Some(checksum_sha256.clone());
             entry.object = Some(ObjectRef::local(object_id.clone()));
@@ -226,7 +227,7 @@ impl SimulatedRuntime {
                 .get_or_insert_with(|| SparsePayload::new(entry.size.unwrap_or_default()));
             payload.truncate(size);
             let checksum_sha256 = payload.file_checksum();
-            let object_id = format!("{client}:{path}:{checksum_sha256}");
+            let object_id = Self::object_id(client, &entry.logical_id, &checksum_sha256);
             entry.size = Some(size);
             entry.checksum_sha256 = Some(checksum_sha256.clone());
             entry.object = Some(ObjectRef::local(object_id.clone()));
@@ -407,12 +408,10 @@ impl SimulatedRuntime {
                 path: path.to_string(),
             });
         }
-        let payload = entry
-            .payload
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| SparsePayload::new(entry.size.unwrap_or_default()));
-        let mut read = payload.read(offset, bytes)?;
+        let mut read = match &entry.payload {
+            Some(payload) => payload.read(offset, bytes)?,
+            None => SparsePayload::read_empty(entry.size.unwrap_or_default(), offset, bytes)?,
+        };
         read.path = path.to_string();
         self.record_with_metadata(
             client,
@@ -923,8 +922,8 @@ impl SimulatedRuntime {
         }
     }
 
-    fn object_id(&self, client: &str, path: &str, checksum_sha256: &str) -> String {
-        format!("{client}:{path}:{checksum_sha256}")
+    fn object_id(client: &str, logical_id: &str, checksum_sha256: &str) -> String {
+        format!("{client}:{logical_id}:{checksum_sha256}")
     }
 
     fn schedule_client_event(&mut self, client: &str, description: &str) {
@@ -1094,26 +1093,35 @@ impl SparsePayload {
         let end = offset
             .checked_add(bytes.len() as u64)
             .ok_or(ClientRuntimeError::SparseRangeOverflow)?;
-        let mut rewritten = BTreeMap::new();
-        for (&extent_offset, extent_bytes) in &self.extents {
+        let mut overlapping = self.extents.split_off(&offset);
+        if let Some((&extent_offset, extent_bytes)) = self.extents.last_key_value() {
             let extent_end = extent_offset
                 .checked_add(extent_bytes.len() as u64)
                 .ok_or(ClientRuntimeError::SparseRangeOverflow)?;
-            if extent_end <= offset || extent_offset >= end {
-                rewritten.insert(extent_offset, extent_bytes.clone());
-                continue;
-            }
-            if extent_offset < offset {
+            if extent_end > offset {
+                let extent_bytes = extent_bytes.clone();
                 let keep_len = (offset - extent_offset) as usize;
-                rewritten.insert(extent_offset, extent_bytes[..keep_len].to_vec());
-            }
-            if extent_end > end {
-                let keep_start = (end - extent_offset) as usize;
-                rewritten.insert(end, extent_bytes[keep_start..].to_vec());
+                self.extents
+                    .insert(extent_offset, extent_bytes[..keep_len].to_vec());
+                if extent_end > end {
+                    let keep_start = (end - extent_offset) as usize;
+                    overlapping.insert(end, extent_bytes[keep_start..].to_vec());
+                }
             }
         }
-        rewritten.insert(offset, bytes.to_vec());
-        self.extents = rewritten;
+        let mut right = overlapping.split_off(&end);
+        for (&extent_offset, extent_bytes) in &overlapping {
+            let extent_end = extent_offset
+                .checked_add(extent_bytes.len() as u64)
+                .ok_or(ClientRuntimeError::SparseRangeOverflow)?;
+            if extent_end > end {
+                let keep_start = (end - extent_offset) as usize;
+                right.insert(end, extent_bytes[keep_start..].to_vec());
+                break;
+            }
+        }
+        self.extents.insert(offset, bytes.to_vec());
+        self.extents.append(&mut right);
         self.size = self.size.max(end);
         Ok(())
     }
@@ -1135,6 +1143,22 @@ impl SparsePayload {
     }
 
     fn read(&self, offset: u64, bytes: u64) -> Result<SimulatedReadRange, ClientRuntimeError> {
+        self.read_with_extents(offset, bytes)
+    }
+
+    fn read_empty(
+        size: u64,
+        offset: u64,
+        bytes: u64,
+    ) -> Result<SimulatedReadRange, ClientRuntimeError> {
+        Self::new(size).read_with_extents(offset, bytes)
+    }
+
+    fn read_with_extents(
+        &self,
+        offset: u64,
+        bytes: u64,
+    ) -> Result<SimulatedReadRange, ClientRuntimeError> {
         let requested_end = offset
             .checked_add(bytes)
             .ok_or(ClientRuntimeError::SparseRangeOverflow)?;
@@ -1196,9 +1220,19 @@ impl SparsePayload {
     }
 
     fn file_checksum(&self) -> String {
-        self.read(0, self.size)
-            .map(|read| read.checksum_sha256)
-            .unwrap_or_else(|_| "sparse-overflow".to_string())
+        let mut checksum = PayloadChecksum::new();
+        let mut cursor = 0;
+        for (&offset, bytes) in &self.extents {
+            if cursor < offset {
+                checksum.update_zeroes(offset - cursor);
+            }
+            checksum.update(bytes);
+            cursor = offset.saturating_add(bytes.len() as u64).min(self.size);
+        }
+        if cursor < self.size {
+            checksum.update_zeroes(self.size - cursor);
+        }
+        checksum.finish()
     }
 
     fn logical_byte_ranges(&self) -> Vec<LogicalByteRange> {
@@ -1220,7 +1254,7 @@ impl SparsePayload {
                 kind: LogicalByteRangeKind::Data,
                 checksum_sha256: Some(payload_checksum(bytes)),
             });
-            cursor = offset + len;
+            cursor = offset.saturating_add(len).min(self.size);
         }
         if cursor < self.size {
             ranges.push(LogicalByteRange {
@@ -1552,12 +1586,51 @@ fn optional_field<'a>(event: &'a MetadataEvent, name: &str) -> Option<&'a str> {
 }
 
 fn payload_checksum(bytes: &[u8]) -> String {
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
+    let mut checksum = PayloadChecksum::new();
+    checksum.update(bytes);
+    checksum.finish()
+}
+
+struct PayloadChecksum {
+    hash: u64,
+}
+
+impl PayloadChecksum {
+    const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+
+    fn new() -> Self {
+        Self {
+            hash: Self::OFFSET_BASIS,
+        }
     }
-    format!("simulated-fnv64-{hash:016x}")
+
+    fn update(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.hash ^= u64::from(*byte);
+            self.hash = self.hash.wrapping_mul(Self::PRIME);
+        }
+    }
+
+    fn update_zeroes(&mut self, len: u64) {
+        self.hash = self.hash.wrapping_mul(wrapping_pow(Self::PRIME, len));
+    }
+
+    fn finish(self) -> String {
+        format!("simulated-fnv64-{:016x}", self.hash)
+    }
+}
+
+fn wrapping_pow(mut base: u64, mut exp: u64) -> u64 {
+    let mut result = 1_u64;
+    while exp > 0 {
+        if exp & 1 == 1 {
+            result = result.wrapping_mul(base);
+        }
+        base = base.wrapping_mul(base);
+        exp >>= 1;
+    }
+    result
 }
 
 fn validate_mutation_path(client: &str, path: &str) -> Result<(), ClientRuntimeError> {
