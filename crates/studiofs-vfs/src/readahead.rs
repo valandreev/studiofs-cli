@@ -143,6 +143,7 @@ impl ReadAheadTracker {
         let is_sequential =
             state.last_block != u32::MAX && first_block == state.last_block.saturating_add(1);
 
+        let was_cold = state.last_block == u32::MAX;
         let was_ready = state.sequential_ready;
         if is_sequential {
             state.sequential_ready = true;
@@ -166,7 +167,11 @@ impl ReadAheadTracker {
             return Vec::new();
         }
 
-        if !(is_sequential || (is_same_block && (was_ready || sequential_ready))) {
+        let cold_start_from_beginning = was_cold && first_block == 0 && last_block >= first_block;
+        if !(cold_start_from_beginning
+            || is_sequential
+            || (is_same_block && (was_ready || sequential_ready)))
+        {
             return Vec::new();
         }
         (1..=current_width)
@@ -338,13 +343,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_no_prefetch_on_first_read() {
+    fn test_first_read_from_start_prefetches_ahead() {
         let tracker = ReadAheadTracker::new(8);
         let blocks = tracker.record_read(1, 0, 0);
-        assert!(
-            blocks.is_empty(),
-            "first read of a brand-new inode should not trigger prefetch"
+        assert_eq!(
+            blocks,
+            vec![1, 2, 3, 4, 5, 6, 7, 8],
+            "first read from the beginning should start cold sequential prefetch"
         );
+    }
+
+    #[test]
+    fn test_no_prefetch_on_first_seeked_read() {
+        let tracker = ReadAheadTracker::new(8);
+        let blocks = tracker.record_read(1, 42, 42);
+        assert!(blocks.is_empty(), "seeked first reads should stay cold");
     }
 
     #[test]
@@ -352,9 +365,9 @@ mod tests {
         let tracker = ReadAheadTracker::new_with_bounds(8, 64, 1);
         let mut t = 1_000_000u64;
 
-        // First read: block 0 establishes baseline state only.
+        // First read: block 0 starts the cold sequential prefetch window.
         let p = tracker.record_read_at_micros(1, 0, 0, t);
-        assert!(p.is_empty());
+        assert_eq!(p.len(), 8);
 
         // Second read: block 1 opens the fixed sequential window.
         t = t.saturating_add(500_000);
@@ -600,20 +613,25 @@ mod tests {
             tracker.record_read(1, i, i);
         }
 
-        // Inode 2 should start fresh
+        // Inode 2 should start fresh and get its own cold-start window.
         let p = tracker.record_read(2, 0, 0);
-        assert!(p.is_empty(), "separate inodes track state independently");
+        assert_eq!(p[0], 1, "separate inodes track state independently");
+        assert_eq!(p.len(), 8);
     }
 
     #[test]
     fn test_aggressive_min_prefetch_window() {
         let tracker = ReadAheadTracker::new_with_tuning(64, 16);
 
-        // Initial read establishes baseline (no prefetch yet).
+        // Initial read from the beginning opens the cold-start window.
         let p0 = tracker.record_read(1, 0, 0);
-        assert!(p0.is_empty());
+        assert!(
+            p0.len() >= 16,
+            "aggressive tuning should affect the cold-start window"
+        );
+        assert_eq!(p0[0], 1);
 
-        // First sequential boundary should immediately open a larger window.
+        // First sequential boundary should keep the larger window.
         let p1 = tracker.record_read(1, 1, 1);
         assert!(
             p1.len() >= 16,
