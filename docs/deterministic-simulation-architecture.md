@@ -79,8 +79,8 @@ Real E2E or bridge tests.
 The shared operation vocabulary should be extended only where the behavior is
 portable without a real mount:
 
-- sparse writes, truncate shrink/extend, tail writes, holes, and deterministic
-  read-range probes;
+- sparse writes, truncate shrink/extend, tail writes, holes, deterministic
+  read-range probes, and byte-range diagnostics;
 - cold observer join points, fresh local state, bounded mutation history,
   tombstone replay, and stale object-reference checks;
 - lossy invalidation hints, delayed hints, fallback sync, and authoritative
@@ -139,6 +139,7 @@ instead of one monolithic simulator.
 | virtual time | Logical ticks and deadlines that replace wall-clock sleeps and make outage, retry, upload, and publication timing reproducible | SFS-335 |
 | deterministic scheduler | Seeded event selection, run-until-idle, step-by-step execution, invariant stop points, and trace emission for each selected interleaving | SFS-335 |
 | logical clients | Per-client local state and operation execution against the metadata bus, object store, scheduler, operation model, and invariant validator | SFS-336 |
+| infra-disabled runner model | Partial helper launch, hung helper timeout, best-effort report writing, cleanup sequencing, restricted cleanup targets, cleanup error recording, and primary-error preservation without Docker, FUSE, WinFSP, or real mounts | SFS-400 |
 
 Each abstraction should own one deterministic input/output contract. Shared data
 formats should use append-only JSON-compatible schemas so failing simulation
