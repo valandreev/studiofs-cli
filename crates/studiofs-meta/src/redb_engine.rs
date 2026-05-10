@@ -43,6 +43,11 @@ impl CounterWriteTransaction<'_> {
 }
 
 impl RedbMetaEngine {
+    /// Opens a metadata write transaction with redb crash-safety enabled.
+    ///
+    /// StudioFS treats redb metadata as the local recovery source of truth, so
+    /// every local metadata mutation must survive unclean shutdowns once it has
+    /// been accepted by a VFS durability boundary.
     pub(crate) fn begin_crash_safe_write(&self) -> MetaResult<WriteTransaction> {
         let mut txn = self
             .db

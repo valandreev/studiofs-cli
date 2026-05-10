@@ -1318,8 +1318,7 @@ impl MetaReplication for RedbMetaEngine {
     }
 
     fn flush_local_metadata(&self) -> MetaResult<()> {
-        let mut txn = self.begin_crash_safe_write()?;
-        txn.set_two_phase_commit(true);
+        let txn = self.begin_crash_safe_write()?;
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(())
