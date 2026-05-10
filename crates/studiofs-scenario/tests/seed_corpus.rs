@@ -20,6 +20,7 @@ fn fast_and_deep_corpus_are_stable_named_seed_sets() {
             SimulationScenarioGroup::CrashRestartReplay,
             SimulationScenarioGroup::MetadataOutage,
             SimulationScenarioGroup::ObjectStoreOutage,
+            SimulationScenarioGroup::SparsePayloadChaos,
         ]
     );
     assert_eq!(fast.seeds, vec![1, 2, 3]);
@@ -134,6 +135,7 @@ fn all_corpus_group_failures_write_counterexample_artifacts() {
         SimulationScenarioGroup::CrashRestartReplay,
         SimulationScenarioGroup::MetadataOutage,
         SimulationScenarioGroup::ObjectStoreOutage,
+        SimulationScenarioGroup::SparsePayloadChaos,
     ] {
         let artifact_root = unique_temp_dir(&format!("sfs340-{group:?}-counterexamples"));
         std::fs::create_dir_all(&artifact_root).expect("create artifact root");
