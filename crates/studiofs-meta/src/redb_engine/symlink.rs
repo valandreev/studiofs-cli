@@ -2,10 +2,7 @@ use super::*;
 
 impl MetaSymlink for RedbMetaEngine {
     fn set_symlink_target(&self, ino: Ino, target: &[u8]) -> MetaResult<()> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_crash_safe_write()?;
         {
             Self::set_symlink_overlay_in_txn(&txn, ino, target)?;
 

@@ -27,10 +27,7 @@ impl RedbMetaEngine {
         &self,
         ino: Ino,
     ) -> MetaResult<()> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_crash_safe_write()?;
         let Some(mut attr) = Self::get_attr_from_write_table(&txn, INODES_TABLE, ino)? else {
             txn.commit()
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -95,10 +92,7 @@ impl RedbMetaEngine {
     }
 
     pub(crate) fn remove_serving_dentries_for_inode(&self, ino: Ino) -> MetaResult<()> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_crash_safe_write()?;
         Self::remove_dentry_mirrors_for_inode_in_txn(&txn, ino)?;
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -551,10 +545,7 @@ impl RedbMetaEngine {
             return Ok(());
         }
 
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_crash_safe_write()?;
 
         for event in events {
             match event {
@@ -722,10 +713,7 @@ impl RedbMetaEngine {
             return Ok(());
         }
 
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_crash_safe_write()?;
 
         for event in events {
             match event {
@@ -985,10 +973,7 @@ impl RedbMetaEngine {
             return Ok(());
         }
 
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_crash_safe_write()?;
 
         for event in events {
             match event {
@@ -1273,10 +1258,7 @@ impl RedbMetaEngine {
         &self,
         events: impl IntoIterator<Item = &'a crate::events::MetaEvent>,
     ) -> MetaResult<()> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_crash_safe_write()?;
 
         for event in events {
             let crate::events::MetaEvent::RenameEntry {
@@ -1314,10 +1296,7 @@ impl RedbMetaEngine {
         new_name: &[u8],
         entry: &DirEntryValue,
     ) -> MetaResult<()> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_crash_safe_write()?;
 
         Self::reconcile_serving_rename_from_base_in_txn(
             &txn, parent, name, new_parent, new_name, entry,
@@ -1335,6 +1314,14 @@ impl MetaReplication for RedbMetaEngine {
     }
 
     fn flush_metadata(&self) -> MetaResult<()> {
+        self.flush_local_metadata()
+    }
+
+    fn flush_local_metadata(&self) -> MetaResult<()> {
+        let mut txn = self.begin_crash_safe_write()?;
+        txn.set_two_phase_commit(true);
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(())
     }
 

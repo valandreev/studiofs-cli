@@ -766,6 +766,12 @@ pub trait MetaReplication: Send + Sync {
     /// Flush pending metadata mutations to remote store (if any).
     fn flush_metadata(&self) -> MetaResult<()>;
 
+    /// Force the local serving metadata store across its crash-recovery
+    /// durability boundary without publishing remote metadata.
+    fn flush_local_metadata(&self) -> MetaResult<()> {
+        Ok(())
+    }
+
     /// Force metadata synchronization from remote source (if applicable).
     fn sync_metadata(&self) -> MetaResult<()>;
 

@@ -104,10 +104,7 @@ impl MetaPayloadObjects for RedbMetaEngine {
     }
 
     fn remove_regular_file_graph(&self, ino: Ino) -> MetaResult<Vec<u64>> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_crash_safe_write()?;
         let removed_ids;
         {
             let mut removed_object_ids = std::collections::BTreeSet::new();
@@ -155,10 +152,7 @@ impl MetaPayloadObjects for RedbMetaEngine {
         if count == 0 {
             return Ok(Vec::new());
         }
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_crash_safe_write()?;
         let first_id;
         {
             let mut table = txn
@@ -311,10 +305,7 @@ impl MetaPayloadObjects for RedbMetaEngine {
         expected_epoch: u64,
         object_id: u64,
     ) -> MetaResult<bool> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_crash_safe_write()?;
         let changed_chunk_slices = {
             let inodes = txn
                 .open_table(INODES_TABLE)
@@ -403,10 +394,7 @@ impl MetaPayloadObjects for RedbMetaEngine {
         ino: Ino,
         expected_epoch: u64,
     ) -> MetaResult<bool> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_crash_safe_write()?;
 
         {
             let inodes = txn
@@ -511,10 +499,7 @@ impl MetaPayloadObjects for RedbMetaEngine {
         drop(txn);
 
         for batch in candidates.chunks(COMPACTION_TXN_BATCH_SIZE) {
-            let txn = self
-                .db
-                .begin_write()
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let txn = self.begin_crash_safe_write()?;
             let mut overlay_table = txn
                 .open_table(REGULAR_FILE_OVERLAY_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -620,10 +605,7 @@ impl RedbMetaEngine {
         chunk_slices: &[(ChunkId, Vec<crate::schema::SliceRecord>)],
         attr: Option<&InodeAttr>,
     ) -> MetaResult<Option<InodeAttr>> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_crash_safe_write()?;
         if let Some(attr) = attr {
             match Self::get_attr_merged_in_write_txn(&txn, ino) {
                 Ok(current) if current.content_epoch > attr.content_epoch => return Ok(None),

@@ -43,6 +43,15 @@ impl CounterWriteTransaction<'_> {
 }
 
 impl RedbMetaEngine {
+    pub(crate) fn begin_crash_safe_write(&self) -> MetaResult<WriteTransaction> {
+        let mut txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        txn.set_two_phase_commit(true);
+        Ok(txn)
+    }
+
     /// Open or create a metadata database at the given path.
     pub fn open(path: impl AsRef<Path>) -> MetaResult<Self> {
         if let Some(parent) = path.as_ref().parent() {

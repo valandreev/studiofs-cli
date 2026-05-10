@@ -482,6 +482,29 @@ fn invalid_input_io_error(err: MountOptionError) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidInput, err)
 }
 
+trait WinfspShutdownHost {
+    fn stop_for_shutdown(&mut self);
+    fn unmount_after_shutdown(&mut self);
+}
+
+impl<T: winfsp::filesystem::FileSystemContext> WinfspShutdownHost
+    for winfsp::host::FileSystemHost<T>
+{
+    fn stop_for_shutdown(&mut self) {
+        self.stop();
+    }
+
+    fn unmount_after_shutdown(&mut self) {
+        self.unmount();
+    }
+}
+
+fn stop_host_before_vfs_shutdown(host: &mut impl WinfspShutdownHost, shutdown_vfs: impl FnOnce()) {
+    host.stop_for_shutdown();
+    shutdown_vfs();
+    host.unmount_after_shutdown();
+}
+
 /// Start the WinFSP filesystem, mount, and block until unmounted.
 ///
 /// `shutdown_event_name` — if `Some`, a Win32 named event is created so that an
@@ -667,17 +690,11 @@ this usually means Administrator privileges are required, or WinFSP must be conf
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
     let upload_drain_timeout = std::time::Duration::from_secs(upload_secs);
-    // Block on the provided runtime handle so shutdown runs synchronously
-    // in the current thread before we stop/unmount the host.
-    // Run VFS shutdown synchronously on the provided runtime so background
-    // workers are drained and metadata is flushed before unmount.
-    runtime_handle.block_on(vfs.shutdown(upload_drain_timeout));
-
-    // Stop WinFSP so no new callbacks race with the shutdown drain, then
-    // unmount the volume.  Host may still hold references until unmount completes,
-    // but background threads and metadata engines have been asked to stop.
-    host.stop();
-    host.unmount();
+    // Stop WinFSP before the VFS shutdown drain so late cleanup/close callbacks
+    // cannot race after the local metadata/cache checkpoint has been flushed.
+    stop_host_before_vfs_shutdown(&mut host, || {
+        runtime_handle.block_on(vfs.shutdown(upload_drain_timeout));
+    });
 
     Ok(())
 }
@@ -721,9 +738,9 @@ mod tests {
         DEFAULT_COARSE_OPERATION_GUARD, DEFAULT_DIR_INFO_TIMEOUT_MS, DEFAULT_FILE_INFO_TIMEOUT_MS,
         DEFAULT_FLUSH_AND_PURGE_ON_CLEANUP, DEFAULT_KERNEL_NOTIFICATIONS, DEFAULT_PERSISTENT_ACLS,
         DEFAULT_SECTOR_SIZE, DEFAULT_SECTORS_PER_ALLOCATION_UNIT, DEFAULT_VOLUME_INFO_TIMEOUT_MS,
-        MountOptionError, canonical_drive_mount_point, default_dispatcher_threads,
-        is_drive_root_mount_point, mount_manager_mount_point, parse_mount_options,
-        winfsp_dll_stem_for_arch,
+        MountOptionError, WinfspShutdownHost, canonical_drive_mount_point,
+        default_dispatcher_threads, is_drive_root_mount_point, mount_manager_mount_point,
+        parse_mount_options, stop_host_before_vfs_shutdown, winfsp_dll_stem_for_arch,
     };
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -1073,5 +1090,37 @@ mod tests {
         assert_eq!(winfsp_dll_stem_for_arch("x86"), Some("winfsp-x86"));
         assert_eq!(winfsp_dll_stem_for_arch("aarch64"), Some("winfsp-a64"));
         assert_eq!(winfsp_dll_stem_for_arch("arm"), None);
+    }
+
+    struct FakeShutdownHost {
+        events: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+    }
+
+    impl WinfspShutdownHost for FakeShutdownHost {
+        fn stop_for_shutdown(&mut self) {
+            self.events.borrow_mut().push("host.stop");
+        }
+
+        fn unmount_after_shutdown(&mut self) {
+            self.events.borrow_mut().push("host.unmount");
+        }
+    }
+
+    #[test]
+    fn graceful_shutdown_stops_winfsp_host_before_vfs_shutdown() {
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut host = FakeShutdownHost {
+            events: events.clone(),
+        };
+
+        stop_host_before_vfs_shutdown(&mut host, || {
+            events.borrow_mut().push("vfs.shutdown");
+        });
+
+        assert_eq!(
+            events.borrow().as_slice(),
+            ["host.stop", "vfs.shutdown", "host.unmount"],
+            "WinFSP callbacks must be stopped before the VFS shutdown checkpoint"
+        );
     }
 }

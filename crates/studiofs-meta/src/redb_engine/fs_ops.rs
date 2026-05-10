@@ -694,10 +694,7 @@ impl RedbMetaEngine {
         self.add_pending_create(&intent)?;
 
         let create_result = (|| -> MetaResult<InodeAttr> {
-            let txn = self
-                .db
-                .begin_write()
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let txn = self.begin_crash_safe_write()?;
             let result_attr = NamespaceCreateTxn::new(&txn).execute(&spec)?;
             txn.commit()
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -762,10 +759,7 @@ impl RedbMetaEngine {
         &self,
         spec: NamespaceDeleteSpec<'_>,
     ) -> MetaResult<NamespaceDeleteResult> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_crash_safe_write()?;
         let result = NamespaceDeleteTxn::new(&txn).execute(&spec)?;
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -783,10 +777,7 @@ impl MetaFsOps for RedbMetaEngine {
         new_parent: Ino,
         new_name: &[u8],
     ) -> MetaResult<RenameAtomicResult> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_crash_safe_write()?;
         let src_entry = Self::lookup_merged_in_write_txn(&txn, parent, name)?.ok_or_else(|| {
             MetaError::EntryNotFound {
                 parent,
@@ -928,10 +919,7 @@ impl MetaFsOps for RedbMetaEngine {
             });
         }
 
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_crash_safe_write()?;
         let result;
         let parent_attr_event: Option<InodeAttr>;
         {

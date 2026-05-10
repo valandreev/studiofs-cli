@@ -6,28 +6,19 @@ impl RedbMetaEngine {
         &self,
         ino: Ino,
     ) -> MetaResult<Vec<Vec<u8>>> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_crash_safe_write()?;
         Self::dentry_keys_for_inode_in_write_index(&txn, DENTRY_BY_INODE_TABLE, ino)
     }
 
     #[cfg(test)]
     pub(super) fn base_dentry_keys_for_inode_for_test(&self, ino: Ino) -> MetaResult<Vec<Vec<u8>>> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_crash_safe_write()?;
         Self::dentry_keys_for_inode_in_write_index(&txn, BASE_DENTRY_BY_INODE_TABLE, ino)
     }
 
     /// Enable or disable filtering that hides remote-only namespace rows locally.
     pub fn set_remote_namespace_visibility_filter(&self, enabled: bool) -> MetaResult<()> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_crash_safe_write()?;
         Self::set_remote_namespace_visibility_filter_in_txn(&txn, enabled)?;
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -1460,10 +1451,7 @@ impl RedbMetaEngine {
         ino: Ino,
         phase: UndoLogPhase,
     ) -> MetaResult<()> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_crash_safe_write()?;
         {
             Self::set_undo_log_phase_for_in_txn(&txn, kind, ino, phase)?;
         }

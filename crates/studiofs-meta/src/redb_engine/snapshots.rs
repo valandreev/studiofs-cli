@@ -244,10 +244,7 @@ impl RedbMetaEngine {
         snapshot: &RedbSnapshot,
         enable_remote_namespace_filter: bool,
     ) -> MetaResult<()> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_crash_safe_write()?;
 
         Self::clear_table_in_txn(&txn, PENDING_REGULAR_FILE_COMPACTION_TABLE)?;
         Self::clear_table_in_txn(&txn, INODE_LIFECYCLE_TABLE)?;
@@ -541,10 +538,7 @@ impl MetaSnapshots for RedbMetaEngine {
         };
 
         let bytes = encode(&snapshot)?;
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_crash_safe_write()?;
         {
             let mut table = txn
                 .open_table(SNAPSHOTS_TABLE)

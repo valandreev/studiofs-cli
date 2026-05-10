@@ -2,10 +2,7 @@ use super::*;
 
 impl MetaGc for RedbMetaEngine {
     fn add_pending_deletion(&self, object_id: u64, timestamp: i64) -> MetaResult<()> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_crash_safe_write()?;
         {
             let mut table = txn
                 .open_table(PENDING_DELETIONS_TABLE)
@@ -28,10 +25,7 @@ impl MetaGc for RedbMetaEngine {
     }
 
     fn remove_pending_deletion(&self, object_id: u64) -> MetaResult<()> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_crash_safe_write()?;
         {
             let mut table = txn
                 .open_table(PENDING_DELETIONS_TABLE)

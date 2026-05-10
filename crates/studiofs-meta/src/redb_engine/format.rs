@@ -48,10 +48,7 @@ impl RedbMetaEngine {
 impl MetaFormat for RedbMetaEngine {
     fn set_format_info(&self, info: &FormatInfo) -> MetaResult<()> {
         let json = serde_json::to_vec(info).map_err(|e| MetaError::Serialization(e.to_string()))?;
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_crash_safe_write()?;
         {
             let mut table = txn
                 .open_table(SETTINGS_TABLE)

@@ -6,10 +6,7 @@ const CURRENT_INODE_LIFECYCLE_SCHEMA_VERSION: u64 = 1;
 impl RedbMetaEngine {
     /// Ensure the inode lifecycle table exists and matches the current schema version.
     pub fn ensure_inode_lifecycle_table(&self) -> MetaResult<()> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_crash_safe_write()?;
         let settings = txn
             .open_table(SETTINGS_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -80,10 +77,7 @@ impl RedbMetaEngine {
 
     /// Rebuild inode lifecycle rows from the current foreground metadata state.
     pub fn rebuild_inode_lifecycle_table(&self) -> MetaResult<()> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_crash_safe_write()?;
         Self::rebuild_inode_lifecycle_table_in_txn(&txn)?;
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -540,10 +534,7 @@ impl MetaInodes for RedbMetaEngine {
     }
 
     fn incr_counter(&self, name: &str, delta: u64) -> MetaResult<u64> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_crash_safe_write()?;
         let new_val = Self::update_counter_in_txn(&txn, name, |current| current + delta)?;
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -551,10 +542,7 @@ impl MetaInodes for RedbMetaEngine {
     }
 
     fn decr_counter(&self, name: &str, delta: u64) -> MetaResult<u64> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_crash_safe_write()?;
         let new_val =
             Self::update_counter_in_txn(&txn, name, |current| current.saturating_sub(delta))?;
         txn.commit()
@@ -563,10 +551,7 @@ impl MetaInodes for RedbMetaEngine {
     }
 
     fn set_counter(&self, name: &str, value: u64) -> MetaResult<()> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_crash_safe_write()?;
         {
             let mut table = txn
                 .open_table(COUNTERS_TABLE)
@@ -581,10 +566,7 @@ impl MetaInodes for RedbMetaEngine {
     }
 
     fn next_inode(&self) -> MetaResult<Ino> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_crash_safe_write()?;
         let ino;
         {
             let mut table = txn
@@ -651,10 +633,7 @@ impl MetaInodes for RedbMetaEngine {
     }
 
     fn set_attr(&self, attr: &InodeAttr) -> MetaResult<()> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_crash_safe_write()?;
         {
             let mut normalized = attr.clone();
             if normalized.kind == FileType::RegularFile {
@@ -684,10 +663,7 @@ impl MetaInodes for RedbMetaEngine {
     }
 
     fn remove_attr(&self, ino: Ino) -> MetaResult<()> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let txn = self.begin_crash_safe_write()?;
         {
             Self::remove_inode_overlay_in_txn(&txn, ino)?;
 

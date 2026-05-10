@@ -5012,6 +5012,10 @@ impl MetaReplication for PgMetaEngine {
         Ok(())
     }
 
+    fn flush_local_metadata(&self) -> MetaResult<()> {
+        self.local.flush_local_metadata()
+    }
+
     fn request_eager_flush(&self) {
         self.request_pending_flush();
         self.signal_poll_wakeup();

@@ -2209,17 +2209,6 @@ mod tests {
             .calls
     }
 
-    fn wait_until(timeout: std::time::Duration, mut condition: impl FnMut() -> bool) -> bool {
-        let started = std::time::Instant::now();
-        while started.elapsed() < timeout {
-            if condition() {
-                return true;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        condition()
-    }
-
     pub(super) fn winfsp_callbacks(
         vfs: &StudioVfs,
     ) -> studiofs_vfs::VfsWritePathWinfspCallbackStats {
@@ -3029,7 +3018,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_flush_callback_drains_buffered_write_without_foreground_sync_data() {
+    fn explicit_flush_callback_drains_buffered_write_through_local_sync_boundary() {
         let (_tmp, vfs, ctx, _queue) = make_test_context("write_callback_explicit_flush");
         let attr = vfs
             .create(ROOT_INO, b"buffered-write-flush.txt", 0, 0, 0o644)
@@ -3076,8 +3065,8 @@ mod tests {
             "explicit flush callback should own the WinFSP flush barrier"
         );
         assert!(
-            sync_calls_after == sync_calls_before,
-            "WinFSP writeback flush should not call fdatasync from the dispatcher"
+            sync_calls_after > sync_calls_before,
+            "WinFSP writeback flush should cross the local payload sync boundary"
         );
         assert!(
             flush_calls_after > flush_calls_before,
@@ -3086,6 +3075,62 @@ mod tests {
         assert!(
             !vfs.inode_has_local_dirty_state(attr.ino),
             "explicit flush should drain buffered local dirty state before returning"
+        );
+
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.release_fh(fh).await }
+        })
+        .expect("release_fh");
+    }
+
+    #[test]
+    fn explicit_flush_callback_crosses_local_payload_sync_boundary() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("write_callback_fsync_boundary");
+        let attr = vfs
+            .create(ROOT_INO, b"buffered-write-fsync-boundary.txt", 0, 0, 0o644)
+            .expect("create");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open_file");
+        let handle = StudioFileHandle::new(attr.ino, false, fh, OpenFlags::RDWR);
+        let mut file_info = winfsp::filesystem::FileInfo::default();
+        let payload = b"publication boundary fsync payload";
+
+        <StudioFsContext as FileSystemContext>::write(
+            &ctx,
+            &handle,
+            payload,
+            0,
+            false,
+            false,
+            &mut file_info,
+        )
+        .expect("write callback");
+        let sync_calls_before = sync_data_calls(&vfs);
+
+        ctx.run_flush_callback(attr.ino, fh)
+            .expect("explicit flush callback");
+
+        assert!(
+            sync_data_calls(&vfs) > sync_calls_before,
+            "explicit WinFSP flush must cross the local payload sync boundary before returning"
+        );
+        assert!(
+            !vfs.inode_has_local_dirty_state(attr.ino),
+            "explicit flush should drain buffered local dirty state before returning"
+        );
+
+        let read_back = ctx
+            .spawn_wait({
+                let vfs = vfs.clone();
+                async move { vfs.read(attr.ino, 0, payload.len() as u32).await }
+            })
+            .expect("read after explicit flush");
+        assert_eq!(
+            read_back.as_ref(),
+            payload,
+            "explicit flush should leave the file immediately readable through a fresh read"
         );
 
         ctx.spawn_wait({
@@ -3173,8 +3218,8 @@ mod tests {
             "explicit flush should not lose flush barrier accounting for buffered dirty state"
         );
         assert!(
-            sync_calls_after == sync_calls_before,
-            "WinFSP writeback flush should not force fdatasync after buffered writes"
+            sync_calls_after > sync_calls_before,
+            "WinFSP writeback flush should force local payload sync after buffered writes"
         );
         assert!(
             flush_calls_after > flush_calls_before,
@@ -3248,8 +3293,8 @@ mod tests {
             "last-handle close should not lose foreground close accounting for buffered dirty state"
         );
         assert!(
-            flush_barrier_calls(&vfs) == flush_calls_before,
-            "last-handle close must not run the local barrier before returning to WinFSP"
+            flush_barrier_calls(&vfs) > flush_calls_before,
+            "last-handle close must run the local barrier before returning to WinFSP"
         );
         assert!(
             {
@@ -3265,14 +3310,8 @@ mod tests {
             "read immediately after deferred WinFSP close must still see buffered bytes"
         );
         assert!(
-            vfs.inode_has_local_dirty_state(attr.ino),
-            "last-handle close should leave dirty state to the deferred drain after returning"
-        );
-        assert!(
-            wait_until(std::time::Duration::from_secs(2), || {
-                !vfs.inode_has_local_dirty_state(attr.ino)
-            }),
-            "deferred last-handle close should eventually drain buffered local dirty state"
+            !vfs.inode_has_local_dirty_state(attr.ino),
+            "last-handle close should drain buffered local dirty state before returning"
         );
         assert_eq!(
             vfs.write_path_observability_snapshot()
