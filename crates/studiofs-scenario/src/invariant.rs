@@ -70,6 +70,9 @@ pub struct LogicalEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     /// Field $name.
     pub size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Field $name.
+    pub byte_ranges: Vec<LogicalByteRange>,
     #[serde(skip_serializing_if = "Option::is_none")]
     /// Field $name.
     pub symlink_target: Option<String>,
@@ -85,6 +88,7 @@ impl LogicalEntry {
             object: None,
             checksum_sha256: None,
             size: None,
+            byte_ranges: Vec::new(),
             symlink_target: None,
         }
     }
@@ -104,6 +108,7 @@ impl LogicalEntry {
             object,
             checksum_sha256,
             size,
+            byte_ranges: Vec::new(),
             symlink_target: None,
         }
     }
@@ -114,9 +119,34 @@ impl LogicalEntry {
             logical_id: self.logical_id.as_deref(),
             checksum_sha256: self.checksum_sha256.as_deref(),
             size: self.size,
+            byte_ranges: self.byte_ranges.as_slice(),
             symlink_target: self.symlink_target.as_deref(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Struct $name.
+pub struct LogicalByteRange {
+    /// Field $name.
+    pub offset: u64,
+    /// Field $name.
+    pub len: u64,
+    /// Field $name.
+    pub kind: LogicalByteRangeKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Field $name.
+    pub checksum_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+/// Enum $name.
+pub enum LogicalByteRangeKind {
+    /// Variant $name.
+    Data,
+    /// Variant $name.
+    Hole,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -231,6 +261,7 @@ pub fn validate_logical_invariants(snapshot: &LogicalSnapshot) -> InvariantRepor
     let mut violations = Vec::new();
     validate_convergence(snapshot, &mut violations);
     validate_namespace(snapshot, &mut violations);
+    validate_sparse_byte_ranges(snapshot, &mut violations);
     validate_durable_writes(snapshot, &mut violations);
     validate_object_reachability(snapshot, &mut violations);
     validate_replay(snapshot, &mut violations);
@@ -352,6 +383,89 @@ fn validate_namespace(snapshot: &LogicalSnapshot, violations: &mut Vec<Invariant
                         None,
                     ));
                 }
+            }
+        }
+    }
+}
+
+fn validate_sparse_byte_ranges(
+    snapshot: &LogicalSnapshot,
+    violations: &mut Vec<InvariantViolation>,
+) {
+    for client in &snapshot.clients {
+        for entry in &client.entries {
+            if entry.byte_ranges.is_empty() {
+                continue;
+            }
+            if entry.kind != LogicalEntryKind::File {
+                violations.push(violation(
+                    "valid_sparse_byte_ranges",
+                    "non-file entry has byte ranges",
+                    Some(&client.client),
+                    Some(&entry.path),
+                    entry.logical_id.as_deref(),
+                    None,
+                ));
+                continue;
+            }
+            let Some(size) = entry.size else {
+                violations.push(violation(
+                    "valid_sparse_byte_ranges",
+                    "byte-ranged file is missing size",
+                    Some(&client.client),
+                    Some(&entry.path),
+                    entry.logical_id.as_deref(),
+                    None,
+                ));
+                continue;
+            };
+
+            let mut cursor = 0;
+            for range in &entry.byte_ranges {
+                let Some(end) = range.offset.checked_add(range.len) else {
+                    violations.push(violation(
+                        "valid_sparse_byte_ranges",
+                        "byte range overflows",
+                        Some(&client.client),
+                        Some(&entry.path),
+                        entry.logical_id.as_deref(),
+                        None,
+                    ));
+                    continue;
+                };
+                if range.len == 0 || range.offset != cursor || end > size {
+                    violations.push(violation(
+                        "valid_sparse_byte_ranges",
+                        "byte ranges must be contiguous and inside file size",
+                        Some(&client.client),
+                        Some(&entry.path),
+                        entry.logical_id.as_deref(),
+                        None,
+                    ));
+                    break;
+                }
+                if range.kind == LogicalByteRangeKind::Data && range.checksum_sha256.is_none() {
+                    violations.push(violation(
+                        "valid_sparse_byte_ranges",
+                        "data range is missing checksum",
+                        Some(&client.client),
+                        Some(&entry.path),
+                        entry.logical_id.as_deref(),
+                        None,
+                    ));
+                    break;
+                }
+                cursor = end;
+            }
+            if cursor != size {
+                violations.push(violation(
+                    "valid_sparse_byte_ranges",
+                    "byte ranges do not cover the file size",
+                    Some(&client.client),
+                    Some(&entry.path),
+                    entry.logical_id.as_deref(),
+                    None,
+                ));
             }
         }
     }
@@ -491,5 +605,6 @@ struct EntryConvergenceKey<'a> {
     logical_id: Option<&'a str>,
     checksum_sha256: Option<&'a str>,
     size: Option<u64>,
+    byte_ranges: &'a [LogicalByteRange],
     symlink_target: Option<&'a str>,
 }

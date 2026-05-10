@@ -49,6 +49,8 @@ pub enum SimulationScenarioGroup {
     MetadataOutage,
     /// Variant $name.
     ObjectStoreOutage,
+    /// Variant $name.
+    SparsePayloadChaos,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -338,6 +340,7 @@ fn run_group(
         SimulationScenarioGroup::CrashRestartReplay => run_crash_restart(seeds, options),
         SimulationScenarioGroup::MetadataOutage => run_metadata_outage(seeds, options),
         SimulationScenarioGroup::ObjectStoreOutage => run_object_store_outage(seeds, options),
+        SimulationScenarioGroup::SparsePayloadChaos => run_sparse_payload_chaos(seeds, options),
     }
 }
 
@@ -628,6 +631,116 @@ fn run_object_store_outage(
     })
 }
 
+fn run_sparse_payload_chaos(
+    seeds: &[u64],
+    options: &SimulationCorpusOptions,
+) -> Result<GroupOutcome, SimulationCorpusError> {
+    let mut seed_reports = Vec::new();
+    let mut failures = Vec::new();
+    for seed in seeds {
+        let mut runtime = SimulatedRuntime::new(*seed);
+        runtime.add_client("writer");
+        runtime.add_client("reader");
+        runtime.create_file("writer", "sparse.bin")?;
+
+        match seed % 4 {
+            0 => {
+                runtime.write_sparse_range("writer", "sparse.bin", 4, b"abcd")?;
+                runtime.write_sparse_range("writer", "sparse.bin", 12, b"tail")?;
+                runtime.truncate_sparse_file("writer", "sparse.bin", 18)?;
+            }
+            1 => {
+                runtime.truncate_sparse_file("writer", "sparse.bin", 16)?;
+                runtime.write_sparse_range("writer", "sparse.bin", 12, b"tail")?;
+                runtime.write_sparse_range("writer", "sparse.bin", 4, b"abcd")?;
+            }
+            2 => {
+                runtime.write_sparse_range("writer", "sparse.bin", 0, b"head")?;
+                runtime.write_sparse_range("writer", "sparse.bin", 8, b"stale-tail")?;
+                runtime.write_sparse_range("writer", "sparse.bin", 10, b"new")?;
+                runtime.truncate_sparse_file("writer", "sparse.bin", 13)?;
+            }
+            _ => {
+                runtime.write_sparse_range("writer", "sparse.bin", 6, b"middle")?;
+                runtime.truncate_sparse_file("writer", "sparse.bin", 4)?;
+                runtime.truncate_sparse_file("writer", "sparse.bin", 12)?;
+                runtime.write_sparse_range("writer", "sparse.bin", 8, b"tail")?;
+            }
+        }
+
+        for _ in 0..sparse_read_probes(*seed) {
+            let _ = runtime.read_file_range("writer", "sparse.bin", 0, 6)?;
+        }
+        runtime.flush("writer", "sparse.bin")?;
+        let upload = runtime.schedule_upload("writer", "sparse.bin")?;
+        runtime.complete_upload(upload.upload_id)?;
+        runtime.publish_file("writer", "sparse.bin")?;
+        runtime.deliver_next_metadata("reader")?;
+
+        let writer_probe = runtime.read_file_range("writer", "sparse.bin", 0, 18)?;
+        let reader_probe = runtime.read_file_range("reader", "sparse.bin", 0, 18)?;
+        let invariant_report = validate_logical_invariants(&runtime.logical_snapshot());
+        let passed = invariant_report.passed
+            && writer_probe.bytes == reader_probe.bytes
+            && writer_probe.holes == reader_probe.holes
+            && !reader_probe.holes.is_empty();
+
+        if !passed {
+            let (violated_invariant, base_message) =
+                first_violation_or(&invariant_report, "sparse_payload_range_convergence");
+            failures.push(SimulationCorpusFailure {
+                group: SimulationScenarioGroup::SparsePayloadChaos,
+                seed: *seed,
+                violated_invariant,
+                message: format!(
+                    "{base_message}; expected bytes={:?} holes={:?}, actual bytes={:?} holes={:?}",
+                    writer_probe.bytes, writer_probe.holes, reader_probe.bytes, reader_probe.holes
+                ),
+                counterexample_artifact_path: None,
+                replay_evidence: Some(SimulationCounterexampleEvidence {
+                    sub_group: Some(format!("ordering-{}", seed % 4)),
+                    scheduler_trace: synthetic_scheduler_trace(*seed, "sparse-payload-final"),
+                    operation_log: operation_log_from_client_trace(
+                        CORPUS_SCENARIO,
+                        runtime.trace(),
+                    ),
+                    event_trace: json_trace(runtime.trace())?,
+                    final_snapshot: Some(json_value(&runtime.logical_snapshot())?),
+                }),
+            });
+        }
+        if options.inject_failure {
+            failures.push(SimulationCorpusFailure {
+                group: SimulationScenarioGroup::SparsePayloadChaos,
+                seed: *seed,
+                violated_invariant: "injected_counterexample".to_string(),
+                message: "injected sparse payload failure for corpus artifact testing".to_string(),
+                counterexample_artifact_path: None,
+                replay_evidence: Some(SimulationCounterexampleEvidence {
+                    sub_group: Some(format!("ordering-{}", seed % 4)),
+                    scheduler_trace: synthetic_scheduler_trace(*seed, "sparse-payload-injected"),
+                    operation_log: operation_log_from_client_trace(
+                        CORPUS_SCENARIO,
+                        runtime.trace(),
+                    ),
+                    event_trace: json_trace(runtime.trace())?,
+                    final_snapshot: Some(json_value(&runtime.logical_snapshot())?),
+                }),
+            });
+        }
+        seed_reports.push(SimulationSeedReport {
+            seed: *seed,
+            passed: passed && !options.inject_failure,
+            invariant_checkpoints: 2 + sparse_read_probes(*seed),
+            trace_records: runtime.trace().len(),
+        });
+    }
+    Ok(GroupOutcome {
+        seed_reports,
+        failures,
+    })
+}
+
 fn aggregate_seed_reports<FamilyReport, SeedReport>(
     seeds: &[u64],
     family_reports: &[FamilyReport],
@@ -896,23 +1009,60 @@ fn operation_log_from_client_trace(
     trace
         .iter()
         .map(|record| {
-            let mut operation = ScenarioOperationRecord::new(
-                scenario,
-                record.step,
-                ScenarioOperation::SchedulerCheckpoint {
-                    name: record.kind.clone(),
-                },
-            )
-            .with_outcome(OperationOutcome::Observed);
+            let scenario_operation = client_trace_operation(record);
+            let mut operation =
+                ScenarioOperationRecord::new(scenario, record.step, scenario_operation)
+                    .with_outcome(OperationOutcome::Observed);
             if let Some(client) = &record.client {
                 operation = operation.with_client(client.clone());
             }
             if let Some(path) = &record.path {
                 operation = operation.with_metadata("path", path.clone());
             }
+            for (key, value) in &record.metadata {
+                operation = operation.with_metadata(key.clone(), value.clone());
+            }
             operation
         })
         .collect()
+}
+
+fn client_trace_operation(record: &crate::client::ClientTraceRecord) -> ScenarioOperation {
+    let path = record.path.clone().unwrap_or_default();
+    match record.kind.as_str() {
+        "write_sparse_range" => ScenarioOperation::Write {
+            path,
+            offset: record
+                .metadata
+                .get("offset")
+                .and_then(|value| value.parse().ok()),
+            bytes: record
+                .metadata
+                .get("bytes")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or_default(),
+            checksum_sha256: record.metadata.get("checksum_sha256").cloned(),
+        },
+        "truncate_sparse_file" => ScenarioOperation::Truncate {
+            path,
+            size: record
+                .metadata
+                .get("size")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or_default(),
+        },
+        "read_file_range" => ScenarioOperation::Read {
+            path,
+            bytes: record
+                .metadata
+                .get("bytes")
+                .and_then(|value| value.parse().ok()),
+            checksum_sha256: record.metadata.get("checksum_sha256").cloned(),
+        },
+        _ => ScenarioOperation::SchedulerCheckpoint {
+            name: record.kind.clone(),
+        },
+    }
 }
 
 fn operation_log_from_object_trace(
@@ -987,7 +1137,12 @@ fn object_store_unavailable_read_probes(seed: u64) -> usize {
     (seed % OUTAGE_SEED_VARIANTS) as usize
 }
 
+fn sparse_read_probes(seed: u64) -> usize {
+    (seed % SPARSE_SEED_VARIANTS) as usize
+}
+
 const OUTAGE_SEED_VARIANTS: u64 = 8;
+const SPARSE_SEED_VARIANTS: u64 = 4;
 
 fn seeds_for(kind: SimulationCorpusKind) -> &'static [u64] {
     match kind {
@@ -1002,6 +1157,7 @@ fn ordered_groups() -> &'static [SimulationScenarioGroup] {
         SimulationScenarioGroup::CrashRestartReplay,
         SimulationScenarioGroup::MetadataOutage,
         SimulationScenarioGroup::ObjectStoreOutage,
+        SimulationScenarioGroup::SparsePayloadChaos,
     ]
 }
 
@@ -1020,6 +1176,7 @@ pub fn group_arg(group: SimulationScenarioGroup) -> &'static str {
         SimulationScenarioGroup::CrashRestartReplay => "crash-restart-replay",
         SimulationScenarioGroup::MetadataOutage => "metadata-outage",
         SimulationScenarioGroup::ObjectStoreOutage => "object-store-outage",
+        SimulationScenarioGroup::SparsePayloadChaos => "sparse-payload-chaos",
     }
 }
 
