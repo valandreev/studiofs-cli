@@ -503,10 +503,37 @@ impl<T: winfsp::filesystem::FileSystemContext> WinfspShutdownHost
     }
 }
 
+struct WinfspUnmountGuard<'a, H: WinfspShutdownHost + ?Sized> {
+    host: Option<&'a mut H>,
+}
+
+impl<'a, H: WinfspShutdownHost + ?Sized> WinfspUnmountGuard<'a, H> {
+    fn new(host: &'a mut H) -> Self {
+        Self { host: Some(host) }
+    }
+
+    fn unmount_now(mut self) {
+        self.unmount_if_needed();
+    }
+
+    fn unmount_if_needed(&mut self) {
+        if let Some(host) = self.host.take() {
+            host.unmount_after_shutdown();
+        }
+    }
+}
+
+impl<H: WinfspShutdownHost + ?Sized> Drop for WinfspUnmountGuard<'_, H> {
+    fn drop(&mut self) {
+        self.unmount_if_needed();
+    }
+}
+
 fn stop_host_before_vfs_shutdown(host: &mut impl WinfspShutdownHost, shutdown_vfs: impl FnOnce()) {
     host.stop_for_shutdown();
+    let unmount_guard = WinfspUnmountGuard::new(host);
     shutdown_vfs();
-    host.unmount_after_shutdown();
+    unmount_guard.unmount_now();
 }
 
 /// Start the WinFSP filesystem, mount, and block until unmounted.
@@ -1129,6 +1156,31 @@ mod tests {
             events.borrow().as_slice(),
             ["host.stop", "vfs.shutdown", "host.unmount"],
             "WinFSP callbacks must be stopped before the VFS shutdown checkpoint"
+        );
+    }
+
+    #[test]
+    fn graceful_shutdown_unmounts_winfsp_host_when_vfs_shutdown_panics() {
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut host = FakeShutdownHost {
+            events: events.clone(),
+        };
+
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            stop_host_before_vfs_shutdown(&mut host, || {
+                events.borrow_mut().push("vfs.shutdown");
+                panic!("simulated VFS shutdown panic");
+            });
+        }));
+
+        assert!(
+            panic_result.is_err(),
+            "the original VFS shutdown panic should still propagate"
+        );
+        assert_eq!(
+            events.borrow().as_slice(),
+            ["host.stop", "vfs.shutdown", "host.unmount"],
+            "WinFSP unmount must still be attempted while unwinding"
         );
     }
 }

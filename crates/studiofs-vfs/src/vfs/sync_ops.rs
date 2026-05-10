@@ -809,12 +809,6 @@ impl StudioVfs {
             false
         };
 
-        if local_sync_policy.requires_write_path_durability() && had_local_dirty_state {
-            self.sync_meta()
-                .flush_local_metadata()
-                .map_err(VfsError::Meta)?;
-        }
-
         if matches!(sticky_error_policy, StickyErrorPolicy::Report) {
             self.ensure_no_upload_sticky_error(ino)?;
         } else if let Some(msg) = self
