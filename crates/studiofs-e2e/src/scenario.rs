@@ -91,16 +91,12 @@ const POSTGRES_OUTAGE_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-
 const RUSTFS_OUTAGE_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c", "client-d"];
 const CRASH_RESTART_CLIENT_NAMES: &[&str] = &["client-a", "client-b"];
 const SMOKE_FILE_NAME: &str = "studiofs-e2e-smoke.txt";
-const SMOKE_FILE_PAYLOAD: &[u8] = b"studiofs e2e mounted multi-client smoke\n";
 const SMOKE_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(30);
 const SMOKE_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const OUTAGE_INITIAL_FILE_NAME: &str = "studiofs-e2e-outage-initial.txt";
 const OUTAGE_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(60);
 const OUTAGE_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const RUSTFS_OUTAGE_FILE_NAME: &str = "studiofs-e2e-rustfs-outage.txt";
-const RUSTFS_OUTAGE_INITIAL_PAYLOAD: &[u8] = b"initial healthy RustFS payload\n";
-const RUSTFS_OUTAGE_RECOVERED_PAYLOAD: &[u8] =
-    b"initial healthy RustFS payload\naccepted local payload while RustFS is down\n";
 const CRASH_RESTART_LOCAL_DURABLE_FILE_NAME: &str = "studiofs-e2e-crash-after-local-durability.txt";
 const CRASH_RESTART_BEFORE_PUBLICATION_FILE_NAME: &str =
     "studiofs-e2e-crash-before-remote-publication.txt";
@@ -114,10 +110,6 @@ const PUBLICATION_BOUNDARY_RELEASE_CLOSE_DRAIN_POLL_INTERVAL: Duration = Duratio
 const PUBLICATION_BOUNDARY_DIAGNOSTICS_TIMEOUT: Duration = Duration::from_secs(5);
 const COLLISION_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(60);
 const COLLISION_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
-const COLLISION_OLD_COMMITTED_PAYLOAD: &[u8] = b"old committed payload\n";
-const COLLISION_NEW_COMMITTED_PAYLOAD: &[u8] = b"new committed payload\n";
-const COLLISION_APPEND_PAYLOAD: &[u8] = b"appended payload\n";
-const COLLISION_CHILD_PAYLOAD: &[u8] = b"child\n";
 const OVERWRITE_READ_ATTEMPTS: u32 = 8;
 const CHAOS_ROUNDS: usize = 12;
 const CHAOS_READ_ATTEMPTS: u32 = 4;
@@ -138,15 +130,10 @@ const FAULT_CHAOS_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(120);
 const FAULT_CHAOS_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const LWW_RECONNECT_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(120);
 const LWW_RECONNECT_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
-const LWW_RECONNECT_ORACLE_PATH: &str = "lww-chaos/winner.txt";
 const OPEN_HANDLE_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
 const OPEN_HANDLE_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(60);
 const OPEN_HANDLE_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const OPEN_UNLINK_PATH: &str = "open-handles/unlink-target.txt";
-const OPEN_RENAME_PATH: &str = "open-handles/rename-target.txt";
-const OPEN_RENAME_DEST: &str = "open-handles/renamed-target.txt";
-const OPEN_HANDLE_INITIAL_PAYLOAD: &[u8] = b"open handle initial payload\n";
-const OPEN_HANDLE_APPEND_PAYLOAD: &[u8] = b"open handle append payload\n";
 
 #[cfg(test)]
 pub(crate) const TEST_FAILING_VALIDATE: &str = "__test-failing-validate";
@@ -1175,9 +1162,13 @@ fn run_mounted_smoke_body(
         });
     }
 
-    let smoke_file = clients[0].mount_point.join(SMOKE_FILE_NAME);
-    fs::write(&smoke_file, SMOKE_FILE_PAYLOAD)?;
-    driver.after_smoke_write(&clients, SMOKE_FILE_NAME)?;
+    let relative_path = run_unique_path(context, "smoke", SMOKE_FILE_NAME);
+    let smoke_file = clients[0].mount_point.join(&relative_path);
+    write_mounted_file(
+        &smoke_file,
+        &run_unique_payload(context, BASIC_MULTI_CLIENT_SMOKE, "smoke"),
+    )?;
+    driver.after_smoke_write(&clients, &relative_path)?;
     let mounts = client_mounts(context, &clients[..SMOKE_CLIENT_NAMES.len()]);
     let convergence = wait_for_convergence(
         &mounts,
@@ -1328,11 +1319,12 @@ fn run_postgres_outage_body(
         });
     }
 
+    let initial_path = run_unique_path(context, "postgres-outage", OUTAGE_INITIAL_FILE_NAME);
     write_mounted_file(
-        &clients[0].mount_point.join(OUTAGE_INITIAL_FILE_NAME),
-        b"initial healthy PostgreSQL write\n",
+        &clients[0].mount_point.join(&initial_path),
+        &run_unique_payload(context, POSTGRES_OUTAGE_MULTI_CLIENT_RECOVERY, "initial"),
     )?;
-    driver.after_initial_write(&clients, OUTAGE_INITIAL_FILE_NAME)?;
+    driver.after_initial_write(&clients, &initial_path)?;
     let mounts = client_mounts(context, &clients[..POSTGRES_OUTAGE_CLIENT_NAMES.len()]);
     let initial_publication_gate = wait_for_convergence(
         &mounts,
@@ -1396,12 +1388,22 @@ fn perform_outage_operations(
     let mut operations_writer = OperationLogWriter::open_append(&operations_log)?;
     let mut accepted = 0;
     for (index, client) in clients.iter().enumerate() {
-        let relative = format!("outage-local-write-{}.txt", index + 1);
-        let payload = format!(
-            "accepted local-first outage write from {} in {}\n",
-            client.name, context.run_id
+        let relative = run_unique_path(
+            context,
+            "postgres-outage",
+            &format!("outage-local-write-{}.txt", index + 1),
         );
-        let write_result = fs::write(client.mount_point.join(&relative), payload.as_bytes());
+        let payload = format!(
+            "accepted local-first outage write from {} in {} seed={}\n",
+            client.name, context.run_id, context.seed
+        );
+        let target = client.mount_point.join(&relative);
+        let write_result = (|| -> io::Result<()> {
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&target, payload.as_bytes())
+        })();
         let error = write_result.err().map(|err| err.to_string());
         let operation_accepted = error.is_none();
         if operation_accepted {
@@ -1415,7 +1417,7 @@ fn perform_outage_operations(
             path: relative.clone(),
             offset: Some(0),
             bytes: u64::try_from(payload.len()).unwrap_or(u64::MAX),
-            checksum_sha256: None,
+            checksum_sha256: Some(bytes_sha256(payload.as_bytes())),
         };
         for writer in [&mut outage_writer, &mut operations_writer] {
             let record = shared_operation_record(
@@ -1609,10 +1611,11 @@ fn run_rustfs_outage_body(
         });
     }
 
-    let relative_path = RUSTFS_OUTAGE_FILE_NAME;
-    let source_file = clients[0].mount_point.join(relative_path);
-    write_mounted_file(&source_file, RUSTFS_OUTAGE_INITIAL_PAYLOAD)?;
-    driver.after_initial_write(&clients, relative_path)?;
+    let relative_path = rustfs_outage_relative_path(context);
+    let source_file = clients[0].mount_point.join(&relative_path);
+    let initial_payload = rustfs_outage_initial_payload(context);
+    write_mounted_file(&source_file, &initial_payload)?;
+    driver.after_initial_write(&clients, &relative_path)?;
     let initial_mounts = client_mounts(context, &clients[..RUSTFS_OUTAGE_CLIENT_NAMES.len()]);
     wait_for_convergence(
         &initial_mounts,
@@ -1623,7 +1626,8 @@ fn run_rustfs_outage_body(
 
     let outage_started = Instant::now();
     driver.stop_rustfs()?;
-    write_mounted_file(&source_file, RUSTFS_OUTAGE_RECOVERED_PAYLOAD)?;
+    let recovered_payload = rustfs_outage_recovered_payload(context);
+    write_mounted_file(&source_file, &recovered_payload)?;
     let local_read_checksum_sha256 = bytes_sha256(&fs::read(&source_file)?);
     let outage_duration_ms = elapsed_millis_nonzero(outage_started);
     let mut peer_visibility_during_outage = Vec::new();
@@ -1633,7 +1637,7 @@ fn run_rustfs_outage_body(
         .take(RUSTFS_OUTAGE_CLIENT_NAMES.len() - 1)
     {
         let visible_checksum_sha256 =
-            driver.assert_peer_not_visible(peer, relative_path, &local_read_checksum_sha256)?;
+            driver.assert_peer_not_visible(peer, &relative_path, &local_read_checksum_sha256)?;
         peer_visibility_during_outage.push(RustfsPeerVisibility {
             client: peer.name.clone(),
             visible_checksum_sha256,
@@ -1654,11 +1658,11 @@ fn run_rustfs_outage_body(
     let upload_recovery_time_ms = elapsed_millis_nonzero(recovery_started);
     let mut final_client_checksums = Vec::new();
     for client in clients.iter().take(RUSTFS_OUTAGE_CLIENT_NAMES.len()) {
-        let checksum = bytes_sha256(&fs::read(client.mount_point.join(relative_path))?);
+        let checksum = bytes_sha256(&fs::read(client.mount_point.join(&relative_path))?);
         if checksum != local_read_checksum_sha256 {
             return Err(ScenarioError::Io(std::io::Error::other(format!(
-                "recovery convergence failure: {} read checksum {} but expected {} for {relative_path}",
-                client.name, checksum, local_read_checksum_sha256
+                "recovery convergence failure: {} read checksum {} but expected {} for {}",
+                client.name, checksum, local_read_checksum_sha256, relative_path
             ))));
         }
         final_client_checksums.push(ClientPayloadChecksum {
@@ -1673,7 +1677,7 @@ fn run_rustfs_outage_body(
 
     let summary = RustfsOutageRecoverySummary {
         bootstrap,
-        outage_file: relative_path.to_string(),
+        outage_file: relative_path,
         outage_duration_ms,
         upload_recovery_time_ms,
         local_read_checksum_sha256,
@@ -1691,6 +1695,52 @@ fn run_rustfs_outage_body(
         serde_json::to_vec_pretty(&summary)?,
     )?;
     Ok(summary)
+}
+
+fn rustfs_outage_relative_path(context: &ScenarioContext) -> String {
+    run_unique_path(context, "rustfs-outage", RUSTFS_OUTAGE_FILE_NAME)
+}
+
+fn rustfs_outage_initial_payload(context: &ScenarioContext) -> Vec<u8> {
+    run_unique_payload(context, "rustfs-outage", "initial")
+}
+
+fn rustfs_outage_recovered_payload(context: &ScenarioContext) -> Vec<u8> {
+    run_unique_payload(context, "rustfs-outage", "recovered-local-write")
+}
+
+fn run_unique_path(context: &ScenarioContext, namespace: &str, leaf: &str) -> String {
+    format!(
+        "{}/{}/{}",
+        namespace,
+        scenario_path_token(&context.run_id),
+        leaf
+    )
+}
+
+fn run_unique_dir(context: &ScenarioContext, namespace: &str) -> String {
+    format!("{}/{}", namespace, scenario_path_token(&context.run_id))
+}
+
+fn run_unique_payload(context: &ScenarioContext, scenario: &str, label: &str) -> Vec<u8> {
+    format!(
+        "studiofs e2e scenario={scenario} label={label} run_id={} seed={}\n",
+        context.run_id, context.seed
+    )
+    .into_bytes()
+}
+
+fn scenario_path_token(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn assert_peer_not_visible(
@@ -1760,7 +1810,8 @@ fn write_rustfs_outage_operation(
                 SharedOperation::Write {
                     path: summary.outage_file.clone(),
                     offset: Some(0),
-                    bytes: u64::try_from(RUSTFS_OUTAGE_RECOVERED_PAYLOAD.len()).unwrap_or(u64::MAX),
+                    bytes: u64::try_from(rustfs_outage_recovered_payload(context).len())
+                        .unwrap_or(u64::MAX),
                     checksum_sha256: Some(summary.local_read_checksum_sha256.clone()),
                 },
                 Some(RUSTFS_OUTAGE_CLIENT_NAMES[0]),
@@ -1770,7 +1821,8 @@ fn write_rustfs_outage_operation(
                 SharedOperation::Read {
                     path: summary.outage_file.clone(),
                     bytes: Some(
-                        u64::try_from(RUSTFS_OUTAGE_RECOVERED_PAYLOAD.len()).unwrap_or(u64::MAX),
+                        u64::try_from(rustfs_outage_recovered_payload(context).len())
+                            .unwrap_or(u64::MAX),
                     ),
                     checksum_sha256: Some(summary.local_read_checksum_sha256.clone()),
                 },
@@ -1927,8 +1979,12 @@ fn run_crash_restart_body(
             driver,
             &clients,
             CrashRestartMode::AfterLocalDurabilityBoundary,
-            CRASH_RESTART_LOCAL_DURABLE_FILE_NAME,
-            b"accepted local durable payload before abrupt crash\n",
+            &crash_restart_relative_path(context, CrashRestartMode::AfterLocalDurabilityBoundary),
+            &run_unique_payload(
+                context,
+                MOUNTED_CLIENT_CRASH_RESTART_RECOVERY,
+                "after-local-durability-boundary",
+            ),
             convergence_timeout,
             poll_interval,
         )?,
@@ -1937,8 +1993,15 @@ fn run_crash_restart_body(
             driver,
             &clients,
             CrashRestartMode::BeforeRemotePublicationCompletes,
-            CRASH_RESTART_BEFORE_PUBLICATION_FILE_NAME,
-            b"accepted local payload killed before remote publication completes\n",
+            &crash_restart_relative_path(
+                context,
+                CrashRestartMode::BeforeRemotePublicationCompletes,
+            ),
+            &run_unique_payload(
+                context,
+                MOUNTED_CLIENT_CRASH_RESTART_RECOVERY,
+                "before-remote-publication-completes",
+            ),
             convergence_timeout,
             poll_interval,
         )?,
@@ -1952,6 +2015,16 @@ fn run_crash_restart_body(
         serde_json::to_vec_pretty(&summary)?,
     )?;
     Ok(summary)
+}
+
+fn crash_restart_relative_path(context: &ScenarioContext, mode: CrashRestartMode) -> String {
+    let file_name = match mode {
+        CrashRestartMode::AfterLocalDurabilityBoundary => CRASH_RESTART_LOCAL_DURABLE_FILE_NAME,
+        CrashRestartMode::BeforeRemotePublicationCompletes => {
+            CRASH_RESTART_BEFORE_PUBLICATION_FILE_NAME
+        }
+    };
+    run_unique_path(context, "crash-restart", file_name)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2267,15 +2340,15 @@ fn run_publication_boundary(
     poll_interval: Duration,
 ) -> Result<PublicationBoundarySummary, ScenarioError> {
     let writer = &clients[0];
-    let relative_path = publication_boundary_file_name(boundary);
+    let relative_path = publication_boundary_file_name(context, boundary);
     let payload = publication_boundary_payload(context, boundary);
     let publication_boundary_handle =
-        apply_publication_boundary(writer, relative_path, &payload, boundary)?;
+        apply_publication_boundary(writer, &relative_path, &payload, boundary)?;
     if boundary == PublicationBoundary::ReleaseClose {
         wait_for_publication_boundary_release_close_drain(
             context,
             writer,
-            relative_path,
+            &relative_path,
             &payload,
         )?;
     }
@@ -2290,7 +2363,7 @@ fn run_publication_boundary(
 
     driver.remount(&writer.name)?;
     let local_read_payload = wait_for_mounted_payload_readback(
-        &writer.mount_point.join(relative_path),
+        &writer.mount_point.join(&relative_path),
         &payload,
         MOUNTED_WRITE_READBACK_TIMEOUT,
         MOUNTED_WRITE_READBACK_POLL_INTERVAL,
@@ -2303,9 +2376,9 @@ fn run_publication_boundary(
     let local_read_checksum_sha256 = bytes_sha256(&local_read_payload);
     let restart_elapsed_ms = elapsed_millis_nonzero(restart_started);
 
-    driver.publish_for_convergence(boundary, clients, relative_path)?;
+    driver.publish_for_convergence(boundary, clients, &relative_path)?;
     let peer_visibility_at_publication_gate =
-        publication_boundary_peer_visibility(&clients[1..], relative_path)?;
+        publication_boundary_peer_visibility(&clients[1..], &relative_path)?;
     let convergence_started = Instant::now();
     let mounts = client_mounts(context, clients);
     let convergence = wait_for_convergence(
@@ -2318,7 +2391,7 @@ fn run_publication_boundary(
         poll_interval,
     )?;
     let convergence_elapsed_ms = elapsed_millis_nonzero(convergence_started);
-    let final_payload = fs::read(clients[1].mount_point.join(relative_path))?;
+    let final_payload = fs::read(clients[1].mount_point.join(&relative_path))?;
     if final_payload != payload {
         return Err(ScenarioError::Io(std::io::Error::other(format!(
             "publication boundary convergence failure: peer data does not match written payload for {relative_path}"
@@ -2330,7 +2403,7 @@ fn run_publication_boundary(
         boundary,
         restarted_client: writer.name.clone(),
         restart_client_root: writer.client_root.display().to_string(),
-        relative_path: relative_path.to_string(),
+        relative_path,
         bytes: payload.len(),
         local_read_checksum_sha256,
         peer_visibility_at_publication_gate,
@@ -2618,7 +2691,18 @@ fn publication_boundary_operations(
     }
 }
 
-fn publication_boundary_file_name(boundary: PublicationBoundary) -> &'static str {
+fn publication_boundary_file_name(
+    context: &ScenarioContext,
+    boundary: PublicationBoundary,
+) -> String {
+    run_unique_path(
+        context,
+        "publication-boundary",
+        publication_boundary_leaf(boundary),
+    )
+}
+
+fn publication_boundary_leaf(boundary: PublicationBoundary) -> &'static str {
     match boundary {
         PublicationBoundary::Flush => "publication-boundary/flush.txt",
         PublicationBoundary::Fsync => "publication-boundary/fsync.txt",
@@ -2632,9 +2716,10 @@ fn publication_boundary_payload(
     boundary: PublicationBoundary,
 ) -> Vec<u8> {
     format!(
-        "publication boundary {} payload for run {}\n",
+        "publication boundary {} payload for run {} seed={}\n",
         publication_boundary_log_name(boundary),
-        context.run_id
+        context.run_id,
+        context.seed
     )
     .into_bytes()
 }
@@ -2984,7 +3069,7 @@ fn run_mounted_chaos_body(
         .take(CHAOS_CLIENT_NAMES.len())
         .collect::<Vec<_>>();
 
-    establish_mounted_chaos_initial_tree(context.seed, &clients[0])?;
+    establish_mounted_chaos_initial_tree(context, &clients[0])?;
     driver.after_initial_tree(&clients)?;
     let mounts = client_mounts(context, &clients);
     wait_for_convergence(
@@ -2998,7 +3083,7 @@ fn run_mounted_chaos_body(
     let mut operations = Vec::new();
     for round in 0..CHAOS_ROUNDS {
         let shuffled = shuffled_clients(context.seed, round, &clients);
-        let tasks = mounted_chaos_tasks(context.seed, round, &shuffled);
+        let tasks = mounted_chaos_tasks(context, round, &shuffled);
         let planned_operations = planned_mounted_chaos_operations_from_tasks(started, &tasks);
         write_mounted_chaos_operations(context, &planned_operations)?;
         let started_operations = started_mounted_chaos_operations_from_tasks(started, &tasks);
@@ -3020,30 +3105,31 @@ fn run_mounted_chaos_body(
 }
 
 fn establish_mounted_chaos_initial_tree(
-    seed: u64,
+    context: &ScenarioContext,
     client: &ClientSpec,
 ) -> Result<(), ScenarioError> {
-    let root = client.mount_point.join("chaos");
+    let relative_root = run_unique_dir(context, "chaos");
+    let root = client.mount_point.join(&relative_root);
     fs::create_dir_all(&root)?;
     for round in 0..CHAOS_ROUNDS {
         write_mounted_chaos_initial_file(
             root.join(format!("race-{round:02}.txt")),
-            &chaos_payload(seed, round, "race-initial"),
+            &chaos_payload(context, round, "race-initial"),
         )?;
         write_mounted_chaos_initial_file(
             root.join(format!("data-{round:02}.txt")),
-            &chaos_payload(seed, round, "data-initial"),
+            &chaos_payload(context, round, "data-initial"),
         )?;
         fs::create_dir_all(root.join(format!("tree-{round:02}")))?;
         let scan_dir = root.join(format!("scan-{round:02}"));
         fs::create_dir_all(&scan_dir)?;
         write_mounted_chaos_initial_file(
             scan_dir.join("a.txt"),
-            &chaos_payload(seed, round, "scan-a"),
+            &chaos_payload(context, round, "scan-a"),
         )?;
         write_mounted_chaos_initial_file(
             scan_dir.join("b.txt"),
-            &chaos_payload(seed, round, "scan-b"),
+            &chaos_payload(context, round, "scan-b"),
         )?;
     }
     Ok(())
@@ -3103,13 +3189,13 @@ fn wait_for_mounted_payload_readback(
 }
 
 fn perform_mounted_chaos_round(
-    seed: u64,
+    context: &ScenarioContext,
     started: Instant,
     round: usize,
     clients: &[ClientSpec],
 ) -> Result<Vec<MountedChaosOperation>, ScenarioError> {
-    let shuffled = shuffled_clients(seed, round, clients);
-    let tasks = mounted_chaos_tasks(seed, round, &shuffled);
+    let shuffled = shuffled_clients(context.seed, round, clients);
+    let tasks = mounted_chaos_tasks(context, round, &shuffled);
     run_concurrent_mounted_chaos_operations(started, tasks)
 }
 
@@ -3124,15 +3210,20 @@ fn shuffled_clients(seed: u64, round: usize, clients: &[ClientSpec]) -> Vec<Clie
     shuffled
 }
 
-fn mounted_chaos_tasks(seed: u64, round: usize, clients: &[ClientSpec]) -> Vec<MountedChaosTask> {
+fn mounted_chaos_tasks(
+    context: &ScenarioContext,
+    round: usize,
+    clients: &[ClientSpec],
+) -> Vec<MountedChaosTask> {
     let c0 = clients[0].clone();
     let c1 = clients[1].clone();
     let c2 = clients[2].clone();
-    match ChaosFamily::for_round(seed, round) {
+    let root = run_unique_dir(context, "chaos");
+    match ChaosFamily::for_round(context.seed, round) {
         ChaosFamily::RenameVsRename => {
-            let source = format!("chaos/race-{round:02}.txt");
-            let dest_a = format!("chaos/race-{round:02}-{}.txt", c0.name);
-            let dest_b = format!("chaos/race-{round:02}-{}.txt", c1.name);
+            let source = format!("{root}/race-{round:02}.txt");
+            let dest_a = format!("{root}/race-{round:02}-{}.txt", c0.name);
+            let dest_b = format!("{root}/race-{round:02}-{}.txt", c1.name);
             vec![
                 rename_task(round, 1, c0, source.clone(), dest_a),
                 rename_task(round, 2, c1, source.clone(), dest_b),
@@ -3140,8 +3231,8 @@ fn mounted_chaos_tasks(seed: u64, round: usize, clients: &[ClientSpec]) -> Vec<M
             ]
         }
         ChaosFamily::RenameVsUnlink => {
-            let source = format!("chaos/race-{round:02}.txt");
-            let dest = format!("chaos/race-{round:02}-renamed.txt");
+            let source = format!("{root}/race-{round:02}.txt");
+            let dest = format!("{root}/race-{round:02}-renamed.txt");
             vec![
                 rename_task(round, 1, c0, source.clone(), dest),
                 unlink_task(round, 2, c1, source.clone()),
@@ -3149,33 +3240,33 @@ fn mounted_chaos_tasks(seed: u64, round: usize, clients: &[ClientSpec]) -> Vec<M
             ]
         }
         ChaosFamily::UnlinkVsAppend => {
-            let path = format!("chaos/data-{round:02}.txt");
+            let path = format!("{root}/data-{round:02}.txt");
             vec![
                 unlink_task(round, 1, c0, path.clone()),
-                append_task(seed, round, 2, c1, path.clone()),
+                append_task(context, round, 2, c1, path.clone()),
                 read_task(round, 3, c2, path),
             ]
         }
         ChaosFamily::OverwriteVsRead => {
-            let path = format!("chaos/data-{round:02}.txt");
+            let path = format!("{root}/data-{round:02}.txt");
             vec![
                 read_loop_task(round, 1, c0, path.clone()),
-                write_task(seed, round, 2, c1, path.clone()),
+                write_task(context, round, 2, c1, path.clone()),
                 read_loop_task(round, 3, c2, path),
             ]
         }
         ChaosFamily::MkdirRmdirVsCreate => {
-            let dir = format!("chaos/tree-{round:02}");
+            let dir = format!("{root}/tree-{round:02}");
             let subdir = format!("{dir}/subdir");
             let child = format!("{dir}/child.txt");
             vec![
                 mkdir_task(round, 1, c0, subdir),
-                create_file_task(seed, round, 2, c1, child),
+                create_file_task(context, round, 2, c1, child),
                 rmdir_task(round, 3, c2, dir),
             ]
         }
         ChaosFamily::ReaddirStatDuringMutation => {
-            let dir = format!("chaos/scan-{round:02}");
+            let dir = format!("{root}/scan-{round:02}");
             let source = format!("{dir}/a.txt");
             let dest = format!("{dir}/c.txt");
             let stat = format!("{dir}/b.txt");
@@ -3223,13 +3314,13 @@ fn unlink_task(round: usize, order: usize, client: ClientSpec, path: String) -> 
 }
 
 fn append_task(
-    seed: u64,
+    context: &ScenarioContext,
     round: usize,
     order: usize,
     client: ClientSpec,
     path: String,
 ) -> MountedChaosTask {
-    let payload = chaos_payload(seed, round, "append");
+    let payload = chaos_payload(context, round, "append");
     let bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
     MountedChaosTask::new(
         round,
@@ -3247,13 +3338,13 @@ fn append_task(
 }
 
 fn write_task(
-    seed: u64,
+    context: &ScenarioContext,
     round: usize,
     order: usize,
     client: ClientSpec,
     path: String,
 ) -> MountedChaosTask {
-    let payload = chaos_payload(seed, round, "overwrite");
+    let payload = chaos_payload(context, round, "overwrite");
     let bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
     MountedChaosTask::new(
         round,
@@ -3272,13 +3363,13 @@ fn write_task(
 }
 
 fn create_file_task(
-    seed: u64,
+    context: &ScenarioContext,
     round: usize,
     order: usize,
     client: ClientSpec,
     path: String,
 ) -> MountedChaosTask {
-    let payload = chaos_payload(seed, round, "create");
+    let payload = chaos_payload(context, round, "create");
     let bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
     MountedChaosTask::new(
         round,
@@ -3924,7 +4015,7 @@ fn write_mounted_chaos_plan_artifacts(
     let started = Instant::now();
     let mut operations = Vec::new();
     for round in 0..CHAOS_ROUNDS {
-        let mut round_operations = planned_mounted_chaos_round(context.seed, started, round);
+        let mut round_operations = planned_mounted_chaos_round(context, started, round);
         write_mounted_chaos_operations(context, &round_operations)?;
         operations.append(&mut round_operations);
     }
@@ -3949,12 +4040,12 @@ fn write_mounted_chaos_plan_artifacts(
 }
 
 fn planned_mounted_chaos_round(
-    seed: u64,
+    context: &ScenarioContext,
     started: Instant,
     round: usize,
 ) -> Vec<MountedChaosOperation> {
-    let clients = shuffled_client_names(seed, round);
-    let spec = planned_mounted_chaos_spec(seed, round, &clients);
+    let clients = shuffled_client_names(context.seed, round);
+    let spec = planned_mounted_chaos_spec(context, round, &clients);
     spec.into_iter()
         .enumerate()
         .map(
@@ -4027,15 +4118,16 @@ fn shuffled_client_names(seed: u64, round: usize) -> Vec<String> {
 }
 
 fn planned_mounted_chaos_spec(
-    seed: u64,
+    context: &ScenarioContext,
     round: usize,
     clients: &[String],
 ) -> Vec<(String, &'static str, String, SharedOperation)> {
-    match ChaosFamily::for_round(seed, round) {
+    let root = run_unique_dir(context, "chaos");
+    match ChaosFamily::for_round(context.seed, round) {
         ChaosFamily::RenameVsRename => {
-            let source = format!("chaos/race-{round:02}.txt");
-            let dest_a = format!("chaos/race-{round:02}-{}.txt", clients[0]);
-            let dest_b = format!("chaos/race-{round:02}-{}.txt", clients[1]);
+            let source = format!("{root}/race-{round:02}.txt");
+            let dest_a = format!("{root}/race-{round:02}-{}.txt", clients[0]);
+            let dest_b = format!("{root}/race-{round:02}-{}.txt", clients[1]);
             vec![
                 (
                     clients[0].clone(),
@@ -4064,8 +4156,8 @@ fn planned_mounted_chaos_spec(
             ]
         }
         ChaosFamily::RenameVsUnlink => {
-            let source = format!("chaos/race-{round:02}.txt");
-            let dest = format!("chaos/race-{round:02}-renamed.txt");
+            let source = format!("{root}/race-{round:02}.txt");
+            let dest = format!("{root}/race-{round:02}-renamed.txt");
             vec![
                 (
                     clients[0].clone(),
@@ -4093,8 +4185,8 @@ fn planned_mounted_chaos_spec(
             ]
         }
         ChaosFamily::UnlinkVsAppend => {
-            let path = format!("chaos/data-{round:02}.txt");
-            let append_payload = chaos_payload(seed, round, "append");
+            let path = format!("{root}/data-{round:02}.txt");
+            let append_payload = chaos_payload(context, round, "append");
             vec![
                 (
                     clients[0].clone(),
@@ -4125,8 +4217,8 @@ fn planned_mounted_chaos_spec(
             ]
         }
         ChaosFamily::OverwriteVsRead => {
-            let path = format!("chaos/data-{round:02}.txt");
-            let overwrite_payload = chaos_payload(seed, round, "overwrite");
+            let path = format!("{root}/data-{round:02}.txt");
+            let overwrite_payload = chaos_payload(context, round, "overwrite");
             vec![
                 (
                     clients[0].clone(),
@@ -4162,10 +4254,10 @@ fn planned_mounted_chaos_spec(
             ]
         }
         ChaosFamily::MkdirRmdirVsCreate => {
-            let dir = format!("chaos/tree-{round:02}");
+            let dir = format!("{root}/tree-{round:02}");
             let subdir = format!("{dir}/subdir");
             let child = format!("{dir}/child.txt");
-            let payload = chaos_payload(seed, round, "create");
+            let payload = chaos_payload(context, round, "create");
             vec![
                 (
                     clients[0].clone(),
@@ -4191,7 +4283,7 @@ fn planned_mounted_chaos_spec(
             ]
         }
         ChaosFamily::ReaddirStatDuringMutation => {
-            let dir = format!("chaos/scan-{round:02}");
+            let dir = format!("{root}/scan-{round:02}");
             let source = format!("{dir}/a.txt");
             let dest = format!("{dir}/c.txt");
             let stat = format!("{dir}/b.txt");
@@ -4358,8 +4450,12 @@ fn write_mounted_chaos_summary(
     Ok(())
 }
 
-fn chaos_payload(seed: u64, round: usize, label: &str) -> Vec<u8> {
-    format!("studiofs chaos seed={seed} round={round} label={label}\n").into_bytes()
+fn chaos_payload(context: &ScenarioContext, round: usize, label: &str) -> Vec<u8> {
+    format!(
+        "studiofs chaos seed={} run_id={} round={round} label={label}\n",
+        context.seed, context.run_id
+    )
+    .into_bytes()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4509,7 +4605,7 @@ fn run_mounted_hotspot_churn_body(
         .take(CHAOS_CLIENT_NAMES.len())
         .collect::<Vec<_>>();
 
-    establish_hotspot_initial_tree(context.seed, &clients[0])?;
+    establish_hotspot_initial_tree(context, &clients[0])?;
     driver.after_initial_tree(&clients)?;
     wait_for_convergence(
         &client_mounts(context, &clients),
@@ -4521,7 +4617,7 @@ fn run_mounted_hotspot_churn_body(
     let started = Instant::now();
     let mut operations = Vec::new();
     for round in 0..HOTSPOT_CHURN_ROUNDS {
-        let tasks = hotspot_churn_tasks(context.seed, round, &clients);
+        let tasks = hotspot_churn_tasks(context, round, &clients);
         let planned = planned_mounted_chaos_operations_from_tasks(started, &tasks);
         write_mounted_hotspot_churn_operations(context, &planned)?;
         let started_operations = started_mounted_chaos_operations_from_tasks(started, &tasks);
@@ -4542,19 +4638,27 @@ fn run_mounted_hotspot_churn_body(
     )
 }
 
-fn establish_hotspot_initial_tree(seed: u64, client: &ClientSpec) -> Result<(), ScenarioError> {
-    let root = client.mount_point.join("hotspot");
+fn establish_hotspot_initial_tree(
+    context: &ScenarioContext,
+    client: &ClientSpec,
+) -> Result<(), ScenarioError> {
+    let relative_root = run_unique_dir(context, "hotspot");
+    let root = client.mount_point.join(&relative_root);
     fs::create_dir_all(&root)?;
     for slot in 0..HOTSPOT_WORKING_SET {
         write_mounted_file(
             &root.join(format!("slot-{slot:02}.txt")),
-            &hotspot_payload(seed, 0, slot, "initial"),
+            &hotspot_payload(context, 0, slot, "initial"),
         )?;
     }
     Ok(())
 }
 
-fn hotspot_churn_tasks(seed: u64, round: usize, clients: &[ClientSpec]) -> Vec<MountedChaosTask> {
+fn hotspot_churn_tasks(
+    context: &ScenarioContext,
+    round: usize,
+    clients: &[ClientSpec],
+) -> Vec<MountedChaosTask> {
     assert!(
         clients.len() >= CHAOS_CLIENT_NAMES.len(),
         "hotspot churn requires at least {} clients",
@@ -4565,54 +4669,53 @@ fn hotspot_churn_tasks(seed: u64, round: usize, clients: &[ClientSpec]) -> Vec<M
     let observer = clients[2].clone();
     let slot = round % HOTSPOT_WORKING_SET;
     let next_slot = (round + 1) % HOTSPOT_WORKING_SET;
-    let path = hotspot_slot_path(slot);
-    let next_path = hotspot_slot_path(next_slot);
+    let root = run_unique_dir(context, "hotspot");
+    let path = hotspot_slot_path(&root, slot);
+    let next_path = hotspot_slot_path(&root, next_slot);
     match round % 5 {
         0 => vec![
-            write_task(seed, round, 1, writer_a, path.clone()),
-            create_file_task(seed, round, 2, writer_b, next_path.clone()),
-            readdir_task(round, 3, observer.clone(), "hotspot".to_string()),
+            write_task(context, round, 1, writer_a, path.clone()),
+            create_file_task(context, round, 2, writer_b, next_path.clone()),
+            readdir_task(round, 3, observer.clone(), root.clone()),
             stat_task(round, 4, observer.clone(), next_path.clone()),
             read_task(round, 5, observer, path),
         ],
         1 => {
-            let renamed = format!("hotspot/slot-{slot:02}-renamed.txt");
+            let renamed = format!("{root}/slot-{slot:02}-renamed.txt");
             vec![
                 rename_task(round, 1, writer_a, path.clone(), renamed),
-                create_file_task(seed, round, 2, writer_b, path.clone()),
-                readdir_task(round, 3, observer.clone(), "hotspot".to_string()),
+                create_file_task(context, round, 2, writer_b, path.clone()),
+                readdir_task(round, 3, observer.clone(), root.clone()),
                 stat_task(round, 4, observer.clone(), path.clone()),
                 read_task(round, 5, observer, path),
             ]
         }
         2 => vec![
             unlink_task(round, 1, writer_a, path.clone()),
-            create_file_task(seed, round, 2, writer_b, path.clone()),
-            readdir_task(round, 3, observer.clone(), "hotspot".to_string()),
+            create_file_task(context, round, 2, writer_b, path.clone()),
+            readdir_task(round, 3, observer.clone(), root.clone()),
             stat_task(round, 4, observer.clone(), next_path.clone()),
             read_task(round, 5, observer, next_path),
         ],
         3 => vec![
-            append_task(seed, round, 1, writer_a, path.clone()),
-            write_task(seed, round, 2, writer_b, next_path.clone()),
-            readdir_task(round, 3, observer.clone(), "hotspot".to_string()),
+            append_task(context, round, 1, writer_a, path.clone()),
+            write_task(context, round, 2, writer_b, next_path.clone()),
+            readdir_task(round, 3, observer.clone(), root.clone()),
             stat_task(round, 4, observer.clone(), path.clone()),
             read_task(round, 5, observer, path),
         ],
         _ => vec![
-            create_file_task(seed, round, 1, writer_a, path.clone()),
+            create_file_task(context, round, 1, writer_a, path.clone()),
             rename_task(round, 2, writer_b, next_path.clone(), path.clone()),
             MountedChaosTask::new(
                 round,
                 3,
                 observer.clone(),
                 "probe_loop",
-                "hotspot",
-                SharedOperation::Readdir {
-                    path: "hotspot".to_string(),
-                },
+                root.clone(),
+                SharedOperation::Readdir { path: root.clone() },
                 MountedChaosAction::ProbeLoop {
-                    dir: "hotspot".to_string(),
+                    dir: root.clone(),
                     stat_path: path.clone(),
                     read_path: path,
                 },
@@ -4623,8 +4726,8 @@ fn hotspot_churn_tasks(seed: u64, round: usize, clients: &[ClientSpec]) -> Vec<M
     }
 }
 
-fn hotspot_slot_path(slot: usize) -> String {
-    format!("hotspot/slot-{slot:02}.txt")
+fn hotspot_slot_path(root: &str, slot: usize) -> String {
+    format!("{root}/slot-{slot:02}.txt")
 }
 
 fn finish_mounted_hotspot_churn(
@@ -4733,7 +4836,7 @@ fn write_mounted_hotspot_churn_plan_artifacts(
         .collect::<Vec<_>>();
     let mut operations = Vec::new();
     for round in 0..HOTSPOT_CHURN_ROUNDS {
-        let tasks = hotspot_churn_tasks(context.seed, round, &planned_clients);
+        let tasks = hotspot_churn_tasks(context, round, &planned_clients);
         let mut planned = planned_mounted_chaos_operations_from_tasks(started, &tasks);
         write_mounted_hotspot_churn_operations(context, &planned)?;
         operations.append(&mut planned);
@@ -4836,8 +4939,12 @@ fn write_mounted_hotspot_churn_summary(
     Ok(())
 }
 
-fn hotspot_payload(seed: u64, round: usize, slot: usize, label: &str) -> Vec<u8> {
-    format!("studiofs hotspot seed={seed} round={round} slot={slot} label={label}\n").into_bytes()
+fn hotspot_payload(context: &ScenarioContext, round: usize, slot: usize, label: &str) -> Vec<u8> {
+    format!(
+        "studiofs hotspot seed={} run_id={} round={round} slot={slot} label={label}\n",
+        context.seed, context.run_id
+    )
+    .into_bytes()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -5108,8 +5215,8 @@ fn run_mounted_fault_chaos_body(
         .collect::<Vec<_>>();
     let cold_observer = all_clients[FAULT_CHAOS_WARM_CLIENTS].clone();
 
-    establish_mounted_chaos_initial_tree(context.seed, &warm_clients[0])?;
-    establish_fault_chaos_initial_tree(context.seed, &warm_clients[0])?;
+    establish_mounted_chaos_initial_tree(context, &warm_clients[0])?;
+    establish_fault_chaos_initial_tree(context, &warm_clients[0])?;
     driver.after_phase(MountedFaultChaosPhase::HealthyWarmup, &warm_clients)?;
     wait_for_convergence(
         &client_mounts(context, &warm_clients),
@@ -5122,7 +5229,7 @@ fn run_mounted_fault_chaos_body(
     let mut operations = Vec::new();
     for round in 0..FAULT_CHAOS_CONFLICT_ROUNDS {
         let mut round_operations =
-            perform_mounted_chaos_round(context.seed, started, round, &warm_clients)?;
+            perform_mounted_chaos_round(context, started, round, &warm_clients)?;
         for operation in &mut round_operations {
             operation.path = format!("healthy_conflict_burst:{}", operation.path);
         }
@@ -5180,23 +5287,28 @@ fn run_mounted_fault_chaos_body(
     )
 }
 
-fn establish_fault_chaos_initial_tree(seed: u64, client: &ClientSpec) -> Result<(), ScenarioError> {
-    let root = client.mount_point.join("fault-chaos");
+fn establish_fault_chaos_initial_tree(
+    context: &ScenarioContext,
+    client: &ClientSpec,
+) -> Result<(), ScenarioError> {
+    let root = client
+        .mount_point
+        .join(run_unique_dir(context, "fault-chaos"));
     write_mounted_chaos_initial_file(
         root.join("postgres-outage-local.txt"),
-        &fault_payload(seed, "postgres-initial"),
+        &fault_payload(context, "postgres-initial"),
     )?;
     write_mounted_chaos_initial_file(
         root.join("crash-restart.txt"),
-        &fault_payload(seed, "crash-initial"),
+        &fault_payload(context, "crash-initial"),
     )?;
     write_mounted_chaos_initial_file(
         root.join("peer-while-crashed.txt"),
-        &fault_payload(seed, "peer-initial"),
+        &fault_payload(context, "peer-initial"),
     )?;
     write_mounted_chaos_initial_file(
         root.join("rustfs-outage-payload.bin"),
-        &fault_payload(seed, "rustfs-initial"),
+        &fault_payload(context, "rustfs-initial"),
     )?;
     Ok(())
 }
@@ -5223,18 +5335,18 @@ fn run_fault_chaos_postgres_phase(
     )?;
     operations.push(outage_record);
 
-    let path = "fault-chaos/postgres-outage-local.txt";
-    let payload = fault_payload(context.seed, "postgres-outage-local-write");
-    let write_result = fs::write(clients[1].mount_point.join(path), &payload);
+    let path = run_unique_path(context, "fault-chaos", "postgres-outage-local.txt");
+    let payload = fault_payload(context, "postgres-outage-local-write");
+    let write_result = fs::write(clients[1].mount_point.join(&path), &payload);
     let write_operation = fault_chaos_client_operation(
         started,
         MountedFaultChaosPhase::PostgresOutage,
         2,
         &clients[1],
         "write",
-        path,
+        &path,
         SharedOperation::Write {
-            path: path.to_string(),
+            path: path.clone(),
             offset: Some(0),
             bytes: u64::try_from(payload.len()).unwrap_or(u64::MAX),
             checksum_sha256: Some(bytes_sha256(&payload)),
@@ -5255,16 +5367,16 @@ fn run_fault_chaos_postgres_phase(
     }
     operations.push(write_operation);
 
-    let local_read = fs::read(clients[1].mount_point.join(path))?;
+    let local_read = fs::read(clients[1].mount_point.join(&path))?;
     let read_operation = fault_chaos_client_operation(
         started,
         MountedFaultChaosPhase::PostgresOutage,
         3,
         &clients[1],
         "read",
-        path,
+        &path,
         SharedOperation::Read {
-            path: path.to_string(),
+            path: path.clone(),
             bytes: Some(u64::try_from(local_read.len()).unwrap_or(u64::MAX)),
             checksum_sha256: Some(bytes_sha256(&local_read)),
         },
@@ -5310,18 +5422,18 @@ fn run_fault_chaos_crash_phase(
                 "missing selected restart client {restarted_client}"
             )))
         })?;
-    let path = "fault-chaos/crash-restart.txt";
-    let payload = fault_payload(context.seed, "crash-before-publication");
-    write_local_durable_payload(crashed.mount_point.join(path), &payload)?;
+    let path = run_unique_path(context, "fault-chaos", "crash-restart.txt");
+    let payload = fault_payload(context, "crash-before-publication");
+    write_local_durable_payload(crashed.mount_point.join(&path), &payload)?;
     let write_operation = fault_chaos_client_operation(
         started,
         MountedFaultChaosPhase::CrashRestart,
         1,
         crashed,
         "write",
-        path,
+        &path,
         SharedOperation::Write {
-            path: path.to_string(),
+            path: path.clone(),
             offset: Some(0),
             bytes: u64::try_from(payload.len()).unwrap_or(u64::MAX),
             checksum_sha256: Some(bytes_sha256(&payload)),
@@ -5334,10 +5446,8 @@ fn run_fault_chaos_crash_phase(
         2,
         crashed,
         "fsync",
-        path,
-        SharedOperation::Fsync {
-            path: path.to_string(),
-        },
+        &path,
+        SharedOperation::Fsync { path: path.clone() },
         None,
     );
     let restart_started = Instant::now();
@@ -5356,18 +5466,18 @@ fn run_fault_chaos_crash_phase(
         .iter()
         .find(|client| client.name != restarted_client)
         .expect("at least one peer client must be available");
-    let peer_path = "fault-chaos/peer-while-crashed.txt";
-    let peer_payload = fault_payload(context.seed, "peer-while-crashed");
-    let peer_write_result = fs::write(peer.mount_point.join(peer_path), &peer_payload);
+    let peer_path = run_unique_path(context, "fault-chaos", "peer-while-crashed.txt");
+    let peer_payload = fault_payload(context, "peer-while-crashed");
+    let peer_write_result = fs::write(peer.mount_point.join(&peer_path), &peer_payload);
     let peer_operation = fault_chaos_client_operation(
         started,
         MountedFaultChaosPhase::CrashRestart,
         4,
         peer,
         "peer_write_while_crashed",
-        peer_path,
+        &peer_path,
         SharedOperation::Write {
-            path: peer_path.to_string(),
+            path: peer_path.clone(),
             offset: Some(0),
             bytes: u64::try_from(peer_payload.len()).unwrap_or(u64::MAX),
             checksum_sha256: Some(bytes_sha256(&peer_payload)),
@@ -5385,7 +5495,7 @@ fn run_fault_chaos_crash_phase(
         SharedOperation::ClientRestart,
         None,
     );
-    let local_read = fs::read(crashed.mount_point.join(path))?;
+    let local_read = fs::read(crashed.mount_point.join(&path))?;
     if local_read != payload {
         return Err(ScenarioError::Io(std::io::Error::other(format!(
             "fault chaos restart durability failure: data read after restart does not match {path}"
@@ -5423,18 +5533,18 @@ fn run_fault_chaos_rustfs_phase(
         "object_store_outage",
         SharedOperation::ObjectStoreOutage,
     );
-    let path = "fault-chaos/rustfs-outage-payload.bin";
-    let payload = fault_payload(context.seed, "rustfs-outage-payload-pressure").repeat(8);
-    let write_result = fs::write(clients[2].mount_point.join(path), &payload);
+    let path = run_unique_path(context, "fault-chaos", "rustfs-outage-payload.bin");
+    let payload = fault_payload(context, "rustfs-outage-payload-pressure").repeat(8);
+    let write_result = fs::write(clients[2].mount_point.join(&path), &payload);
     let write_operation = fault_chaos_client_operation(
         started,
         MountedFaultChaosPhase::RustfsOutage,
         2,
         &clients[2],
         "write",
-        path,
+        &path,
         SharedOperation::Write {
-            path: path.to_string(),
+            path: path.clone(),
             offset: Some(0),
             bytes: u64::try_from(payload.len()).unwrap_or(u64::MAX),
             checksum_sha256: Some(bytes_sha256(&payload)),
@@ -5454,16 +5564,16 @@ fn run_fault_chaos_rustfs_phase(
             total: 1,
         });
     }
-    let local_read = fs::read(clients[2].mount_point.join(path))?;
+    let local_read = fs::read(clients[2].mount_point.join(&path))?;
     let read_operation = fault_chaos_client_operation(
         started,
         MountedFaultChaosPhase::RustfsOutage,
         3,
         &clients[2],
         "read",
-        path,
+        &path,
         SharedOperation::Read {
-            path: path.to_string(),
+            path: path.clone(),
             bytes: Some(u64::try_from(local_read.len()).unwrap_or(u64::MAX)),
             checksum_sha256: Some(bytes_sha256(&local_read)),
         },
@@ -5527,8 +5637,10 @@ fn finish_mounted_fault_chaos(
             violations: namespace_violations,
         });
     }
-    let final_payload_checksums =
-        collect_fault_chaos_final_checksums(&clients, "fault-chaos/rustfs-outage-payload.bin")?;
+    let final_payload_checksums = collect_fault_chaos_final_checksums(
+        &clients,
+        &run_unique_path(context, "fault-chaos", "rustfs-outage-payload.bin"),
+    )?;
     let summary = mounted_fault_chaos_summary(
         context,
         bootstrap,
@@ -5607,7 +5719,7 @@ fn write_mounted_fault_chaos_plan_artifacts(
     let started = Instant::now();
     let mut operations = Vec::new();
     for round in 0..FAULT_CHAOS_CONFLICT_ROUNDS {
-        let mut round_operations = planned_mounted_chaos_round(context.seed, started, round);
+        let mut round_operations = planned_mounted_chaos_round(context, started, round);
         write_mounted_fault_chaos_operations(
             context,
             MountedFaultChaosPhase::HealthyConflictBurst,
@@ -5833,8 +5945,12 @@ fn write_mounted_fault_chaos_summary(
     Ok(())
 }
 
-fn fault_payload(seed: u64, label: &str) -> Vec<u8> {
-    format!("studiofs fault chaos seed={seed} label={label}\n").into_bytes()
+fn fault_payload(context: &ScenarioContext, label: &str) -> Vec<u8> {
+    format!(
+        "studiofs fault chaos seed={} run_id={} label={label}\n",
+        context.seed, context.run_id
+    )
+    .into_bytes()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -6111,7 +6227,7 @@ fn run_mounted_lww_reconnect_body(
     let stale_writer = warm_clients[LWW_RECONNECT_STALE_WRITER_INDEX].clone();
     let cold_observer = all_clients[LWW_RECONNECT_COLD_OBSERVER_INDEX].clone();
 
-    establish_lww_reconnect_initial_tree(context.seed, &warm_clients[0])?;
+    establish_lww_reconnect_initial_tree(context, &warm_clients[0])?;
     driver.after_phase(MountedLwwReconnectPhase::HealthyWarmup, &warm_clients)?;
     wait_for_convergence(
         &client_mounts(context, &warm_clients),
@@ -6147,7 +6263,7 @@ fn run_mounted_lww_reconnect_body(
         .collect::<Vec<_>>();
     let online_writer_a = &online_clients[0];
     let online_writer_b = &online_clients[1];
-    let write_a = lww_reconnect_write(context.seed, started, 1, online_writer_a)?;
+    let write_a = lww_reconnect_write(context, started, 1, online_writer_a)?;
     write_mounted_lww_reconnect_operations(
         context,
         MountedLwwReconnectPhase::OnlineWriters,
@@ -6163,7 +6279,7 @@ fn run_mounted_lww_reconnect_body(
         convergence_timeout,
         poll_interval,
     )?;
-    let write_b = lww_reconnect_write(context.seed, started, 2, online_writer_b)?;
+    let write_b = lww_reconnect_write(context, started, 2, online_writer_b)?;
     write_mounted_lww_reconnect_operations(
         context,
         MountedLwwReconnectPhase::OnlineWriters,
@@ -6199,8 +6315,8 @@ fn run_mounted_lww_reconnect_body(
     operations.push(restart_operation);
     driver.after_phase(MountedLwwReconnectPhase::StaleWriterReturn, &warm_clients)?;
 
-    let expected_winner_payload = lww_reconnect_payload(context.seed, &stale_writer.name, 3);
-    let write_c = lww_reconnect_write(context.seed, started, 3, &stale_writer)?;
+    let expected_winner_payload = lww_reconnect_payload(context, &stale_writer.name, 3);
+    let write_c = lww_reconnect_write(context, started, 3, &stale_writer)?;
     write_mounted_lww_reconnect_operations(
         context,
         MountedLwwReconnectPhase::StaleWriterReturn,
@@ -6237,11 +6353,12 @@ fn run_mounted_lww_reconnect_body(
         &replay_operations,
     )?;
     operations.extend(replay_operations);
-    let local_read = fs::read(stale_writer.mount_point.join(LWW_RECONNECT_ORACLE_PATH))?;
+    let oracle_path = lww_reconnect_oracle_path(context);
+    let local_read = fs::read(stale_writer.mount_point.join(&oracle_path))?;
     if local_read != expected_winner_payload {
         return Err(ScenarioError::Io(std::io::Error::other(format!(
             "LWW reconnect replay durability failure: data read after restart does not match {}",
-            LWW_RECONNECT_ORACLE_PATH
+            oracle_path
         ))));
     }
     let restart_elapsed_ms = elapsed_millis_nonzero(restart_started);
@@ -6288,30 +6405,33 @@ fn run_mounted_lww_reconnect_body(
 }
 
 fn establish_lww_reconnect_initial_tree(
-    seed: u64,
+    context: &ScenarioContext,
     client: &ClientSpec,
 ) -> Result<(), ScenarioError> {
-    let root = client.mount_point.join("lww-chaos");
+    let root = client
+        .mount_point
+        .join(run_unique_dir(context, "lww-chaos"));
     fs::create_dir_all(&root)?;
     fs::write(
         root.join("winner.txt"),
-        lww_reconnect_payload(seed, "initial", 0),
+        lww_reconnect_payload(context, "initial", 0),
     )?;
     fs::write(
         root.join("observer.txt"),
-        lww_reconnect_payload(seed, "observer", 0),
+        lww_reconnect_payload(context, "observer", 0),
     )?;
     Ok(())
 }
 
 fn lww_reconnect_write(
-    seed: u64,
+    context: &ScenarioContext,
     started: Instant,
     oracle_order: u32,
     client: &ClientSpec,
 ) -> Result<MountedChaosOperation, ScenarioError> {
-    let payload = lww_reconnect_payload(seed, &client.name, oracle_order);
-    write_local_durable_payload(client.mount_point.join(LWW_RECONNECT_ORACLE_PATH), &payload)?;
+    let payload = lww_reconnect_payload(context, &client.name, oracle_order);
+    let oracle_path = lww_reconnect_oracle_path(context);
+    write_local_durable_payload(client.mount_point.join(&oracle_path), &payload)?;
     Ok(lww_reconnect_client_operation(
         started,
         if oracle_order == 3 {
@@ -6322,9 +6442,9 @@ fn lww_reconnect_write(
         oracle_order as usize,
         client,
         lww_write_operation_name(oracle_order),
-        LWW_RECONNECT_ORACLE_PATH,
+        &oracle_path,
         SharedOperation::Write {
-            path: LWW_RECONNECT_ORACLE_PATH.to_string(),
+            path: oracle_path.clone(),
             offset: Some(0),
             bytes: u64::try_from(payload.len()).unwrap_or(u64::MAX),
             checksum_sha256: Some(bytes_sha256(&payload)),
@@ -6377,7 +6497,7 @@ fn finish_mounted_lww_reconnect(
         });
     }
 
-    let expected_winner = lww_expected_winner(context.seed, &stale_writer);
+    let expected_winner = lww_expected_winner(context, &stale_writer);
     let oracle = lww_oracle_report(&convergence.snapshots, &expected_winner);
     write_lww_oracle_report(context, &oracle)?;
     if !oracle.matched {
@@ -6533,13 +6653,13 @@ fn write_mounted_lww_reconnect_plan_artifacts(
         None,
     )];
     operations.push(lww_reconnect_planned_write(
-        context.seed,
+        context,
         started,
         1,
         &planned_clients[0],
     ));
     operations.push(lww_reconnect_planned_write(
-        context.seed,
+        context,
         started,
         2,
         &planned_clients[1],
@@ -6555,7 +6675,7 @@ fn write_mounted_lww_reconnect_plan_artifacts(
         None,
     ));
     operations.push(lww_reconnect_planned_write(
-        context.seed,
+        context,
         started,
         3,
         &stale_writer,
@@ -6598,7 +6718,7 @@ fn write_mounted_lww_reconnect_plan_artifacts(
         )?;
     }
 
-    let expected_winner = lww_expected_winner(context.seed, &stale_writer.name);
+    let expected_winner = lww_expected_winner(context, &stale_writer.name);
     let oracle = LwwOracleReport {
         path: expected_winner.path.clone(),
         expected_client: expected_winner.client.clone(),
@@ -6654,12 +6774,13 @@ fn write_mounted_lww_reconnect_plan_artifacts(
 }
 
 fn lww_reconnect_planned_write(
-    seed: u64,
+    context: &ScenarioContext,
     started: Instant,
     oracle_order: u32,
     client: &ClientSpec,
 ) -> MountedChaosOperation {
-    let payload = lww_reconnect_payload(seed, &client.name, oracle_order);
+    let payload = lww_reconnect_payload(context, &client.name, oracle_order);
+    let oracle_path = lww_reconnect_oracle_path(context);
     lww_reconnect_client_operation(
         started,
         if oracle_order == 3 {
@@ -6670,9 +6791,9 @@ fn lww_reconnect_planned_write(
         oracle_order as usize,
         client,
         lww_write_operation_name(oracle_order),
-        LWW_RECONNECT_ORACLE_PATH,
+        &oracle_path,
         SharedOperation::Write {
-            path: LWW_RECONNECT_ORACLE_PATH.to_string(),
+            path: oracle_path.clone(),
             offset: Some(0),
             bytes: u64::try_from(payload.len()).unwrap_or(u64::MAX),
             checksum_sha256: Some(bytes_sha256(&payload)),
@@ -6779,11 +6900,11 @@ fn write_mounted_lww_reconnect_operations(
     Ok(())
 }
 
-fn lww_expected_winner(seed: u64, client: &str) -> LwwExpectedWinner {
-    let payload = lww_reconnect_payload(seed, client, 3);
+fn lww_expected_winner(context: &ScenarioContext, client: &str) -> LwwExpectedWinner {
+    let payload = lww_reconnect_payload(context, client, 3);
     LwwExpectedWinner {
         client: client.to_string(),
-        path: LWW_RECONNECT_ORACLE_PATH.to_string(),
+        path: lww_reconnect_oracle_path(context),
         checksum_sha256: bytes_sha256(&payload),
         bytes: u64::try_from(payload.len()).unwrap_or(u64::MAX),
         oracle_order: 3,
@@ -6859,9 +6980,16 @@ fn write_mounted_lww_reconnect_summary(
     Ok(())
 }
 
-fn lww_reconnect_payload(seed: u64, client: &str, oracle_order: u32) -> Vec<u8> {
-    format!("studiofs lww reconnect seed={seed} client={client} oracle_order={oracle_order}\n")
-        .into_bytes()
+fn lww_reconnect_oracle_path(context: &ScenarioContext) -> String {
+    run_unique_path(context, "lww-chaos", "winner.txt")
+}
+
+fn lww_reconnect_payload(context: &ScenarioContext, client: &str, oracle_order: u32) -> Vec<u8> {
+    format!(
+        "studiofs lww reconnect seed={} run_id={} client={client} oracle_order={oracle_order}\n",
+        context.seed, context.run_id
+    )
+    .into_bytes()
 }
 
 struct MountedOpenHandleConvergence;
@@ -7080,7 +7208,7 @@ fn run_open_handle_body(
         .take(OPEN_HANDLE_CLIENT_NAMES.len())
         .collect::<Vec<_>>();
 
-    establish_open_handle_initial_tree(&clients[0])?;
+    establish_open_handle_initial_tree(context, &clients[0])?;
     driver.after_initial_write(&clients)?;
     wait_for_convergence(
         &client_mounts(context, &clients),
@@ -7121,14 +7249,25 @@ fn write_open_handle_plan_artifacts(
 ) -> Result<OpenHandleSummary, ScenarioError> {
     fs::create_dir_all(&context.scenario_dir)?;
     let started = Instant::now();
-    let operations = planned_open_handle_operations(started);
+    let operations = planned_open_handle_operations(context, started);
     write_open_handle_operations(context, &operations)?;
-    let open_unlink =
-        planned_open_handle_case("open_unlink", OPEN_UNLINK_PATH, None, true, true, false);
+    let unlink_path = open_unlink_path(context);
+    let rename_path = open_rename_path(context);
+    let rename_dest = open_rename_dest(context);
+    let open_unlink = planned_open_handle_case(
+        context,
+        "open_unlink",
+        &unlink_path,
+        None,
+        true,
+        true,
+        false,
+    );
     let open_rename = planned_open_handle_case(
+        context,
         "open_rename",
-        OPEN_RENAME_PATH,
-        Some(OPEN_RENAME_DEST),
+        &rename_path,
+        Some(&rename_dest),
         false,
         true,
         true,
@@ -7190,11 +7329,14 @@ fn wait_for_open_handle_phase_convergence(
     Ok(convergence)
 }
 
-fn establish_open_handle_initial_tree(client: &ClientSpec) -> Result<(), ScenarioError> {
-    for relative_path in [OPEN_UNLINK_PATH, OPEN_RENAME_PATH] {
+fn establish_open_handle_initial_tree(
+    context: &ScenarioContext,
+    client: &ClientSpec,
+) -> Result<(), ScenarioError> {
+    for relative_path in [open_unlink_path(context), open_rename_path(context)] {
         write_mounted_chaos_initial_file(
             client.mount_point.join(relative_path),
-            OPEN_HANDLE_INITIAL_PAYLOAD,
+            &open_handle_initial_payload(context),
         )?;
     }
     Ok(())
@@ -7209,30 +7351,31 @@ fn execute_open_unlink_case(
     let handle_client = &clients[0];
     let mutator_client = &clients[1];
     let observer_client = &clients[2];
+    let unlink_path = open_unlink_path(context);
     record_open_handle_checkpoint(
         context,
         started,
         Some(handle_client),
         "open_unlink.open.started",
-        Some(OPEN_UNLINK_PATH),
+        Some(&unlink_path),
     )?;
     let mut file = OpenOptions::new()
         .read(true)
         .append(true)
-        .open(handle_client.mount_point.join(OPEN_UNLINK_PATH))?;
+        .open(handle_client.mount_point.join(&unlink_path))?;
     record_open_handle_checkpoint(
         context,
         started,
         Some(handle_client),
         "open_unlink.open.finished",
-        Some(OPEN_UNLINK_PATH),
+        Some(&unlink_path),
     )?;
     push_open_handle_operation(
         started,
         operations,
         handle_client,
         "open_handle",
-        OPEN_UNLINK_PATH,
+        &unlink_path,
         SharedOperation::MountedOnly {
             name: "open_handle".to_string(),
             reason: "open file handle state is mounted-product behavior".to_string(),
@@ -7243,13 +7386,14 @@ fn execute_open_unlink_case(
         started,
         Some(handle_client),
         "open_unlink.append.started",
-        Some(OPEN_UNLINK_PATH),
+        Some(&unlink_path),
     )?;
     append_to_open_handle(
+        context,
         started,
         operations,
         handle_client,
-        OPEN_UNLINK_PATH,
+        &unlink_path,
         &mut file,
     )?;
     record_open_handle_checkpoint(
@@ -7264,24 +7408,24 @@ fn execute_open_unlink_case(
         started,
         Some(mutator_client),
         "open_unlink.unlink.started",
-        Some(OPEN_UNLINK_PATH),
+        Some(&unlink_path),
     )?;
-    fs::remove_file(mutator_client.mount_point.join(OPEN_UNLINK_PATH))?;
+    fs::remove_file(mutator_client.mount_point.join(&unlink_path))?;
     record_open_handle_checkpoint(
         context,
         started,
         Some(mutator_client),
         "open_unlink.unlink.finished",
-        Some(OPEN_UNLINK_PATH),
+        Some(&unlink_path),
     )?;
     push_open_handle_operation(
         started,
         operations,
         mutator_client,
         "unlink",
-        OPEN_UNLINK_PATH,
+        &unlink_path,
         SharedOperation::Unlink {
-            path: OPEN_UNLINK_PATH.to_string(),
+            path: unlink_path.clone(),
         },
     );
     record_open_handle_checkpoint(
@@ -7289,28 +7433,23 @@ fn execute_open_unlink_case(
         started,
         Some(handle_client),
         "open_unlink.flush_sync_read.started",
-        Some(OPEN_UNLINK_PATH),
+        Some(&unlink_path),
     )?;
-    let readback = flush_sync_read_open_handle(
-        started,
-        operations,
-        handle_client,
-        OPEN_UNLINK_PATH,
-        &mut file,
-    )?;
+    let readback =
+        flush_sync_read_open_handle(started, operations, handle_client, &unlink_path, &mut file)?;
     record_open_handle_checkpoint(
         context,
         started,
         Some(handle_client),
         "open_unlink.flush_sync_read.finished",
-        Some(OPEN_UNLINK_PATH),
+        Some(&unlink_path),
     )?;
     record_open_handle_checkpoint(
         context,
         started,
         Some(handle_client),
         "open_unlink.release.started",
-        Some(OPEN_UNLINK_PATH),
+        Some(&unlink_path),
     )?;
     drop(file);
     record_open_handle_checkpoint(
@@ -7318,30 +7457,30 @@ fn execute_open_unlink_case(
         started,
         Some(handle_client),
         "open_unlink.release.finished",
-        Some(OPEN_UNLINK_PATH),
+        Some(&unlink_path),
     )?;
     push_open_handle_operation(
         started,
         operations,
         handle_client,
         "release",
-        OPEN_UNLINK_PATH,
+        &unlink_path,
         SharedOperation::Release {
-            path: Some(OPEN_UNLINK_PATH.to_string()),
+            path: Some(unlink_path.clone()),
         },
     );
-    let deleted_path_absent = !observer_client.mount_point.join(OPEN_UNLINK_PATH).exists();
+    let deleted_path_absent = !observer_client.mount_point.join(&unlink_path).exists();
     Ok(OpenHandleCaseSummary {
         name: "open_unlink".to_string(),
         handle_client: handle_client.name.clone(),
         mutator_client: mutator_client.name.clone(),
         observer_client: observer_client.name.clone(),
-        original_path: OPEN_UNLINK_PATH.to_string(),
+        original_path: unlink_path,
         renamed_path: None,
         bytes_read_from_open_handle: readback.bytes,
-        expected_bytes_from_open_handle: expected_open_handle_payload_bytes(),
+        expected_bytes_from_open_handle: expected_open_handle_payload_bytes(context),
         read_checksum_sha256: readback.checksum_sha256,
-        expected_checksum_sha256: expected_open_handle_payload_checksum(),
+        expected_checksum_sha256: expected_open_handle_payload_checksum(context),
         deleted_path_absent,
         old_path_absent: deleted_path_absent,
         renamed_path_visible: false,
@@ -7357,30 +7496,32 @@ fn execute_open_rename_case(
     let handle_client = &clients[0];
     let mutator_client = &clients[1];
     let observer_client = &clients[2];
+    let rename_path = open_rename_path(context);
+    let rename_dest = open_rename_dest(context);
     record_open_handle_checkpoint(
         context,
         started,
         Some(handle_client),
         "open_rename.open.started",
-        Some(OPEN_RENAME_PATH),
+        Some(&rename_path),
     )?;
     let mut file = OpenOptions::new()
         .read(true)
         .append(true)
-        .open(handle_client.mount_point.join(OPEN_RENAME_PATH))?;
+        .open(handle_client.mount_point.join(&rename_path))?;
     record_open_handle_checkpoint(
         context,
         started,
         Some(handle_client),
         "open_rename.open.finished",
-        Some(OPEN_RENAME_PATH),
+        Some(&rename_path),
     )?;
     push_open_handle_operation(
         started,
         operations,
         handle_client,
         "open_handle",
-        OPEN_RENAME_PATH,
+        &rename_path,
         SharedOperation::MountedOnly {
             name: "open_handle".to_string(),
             reason: "open file handle state is mounted-product behavior".to_string(),
@@ -7391,28 +7532,28 @@ fn execute_open_rename_case(
         started,
         Some(mutator_client),
         "open_rename.rename.started",
-        Some(OPEN_RENAME_PATH),
+        Some(&rename_path),
     )?;
     fs::rename(
-        mutator_client.mount_point.join(OPEN_RENAME_PATH),
-        mutator_client.mount_point.join(OPEN_RENAME_DEST),
+        mutator_client.mount_point.join(&rename_path),
+        mutator_client.mount_point.join(&rename_dest),
     )?;
     record_open_handle_checkpoint(
         context,
         started,
         Some(mutator_client),
         "open_rename.rename.finished",
-        Some(OPEN_RENAME_DEST),
+        Some(&rename_dest),
     )?;
     push_open_handle_operation(
         started,
         operations,
         mutator_client,
         "rename",
-        &format!("{OPEN_RENAME_PATH} -> {OPEN_RENAME_DEST}"),
+        &format!("{rename_path} -> {rename_dest}"),
         SharedOperation::Rename {
-            from: OPEN_RENAME_PATH.to_string(),
-            to: OPEN_RENAME_DEST.to_string(),
+            from: rename_path.clone(),
+            to: rename_dest.clone(),
         },
     );
     record_open_handle_checkpoint(
@@ -7420,13 +7561,14 @@ fn execute_open_rename_case(
         started,
         Some(handle_client),
         "open_rename.append.started",
-        Some(OPEN_RENAME_PATH),
+        Some(&rename_path),
     )?;
     append_to_open_handle(
+        context,
         started,
         operations,
         handle_client,
-        OPEN_RENAME_PATH,
+        &rename_path,
         &mut file,
     )?;
     record_open_handle_checkpoint(
@@ -7434,35 +7576,30 @@ fn execute_open_rename_case(
         started,
         Some(handle_client),
         "open_rename.append.finished",
-        Some(OPEN_RENAME_PATH),
+        Some(&rename_path),
     )?;
     record_open_handle_checkpoint(
         context,
         started,
         Some(handle_client),
         "open_rename.flush_sync_read.started",
-        Some(OPEN_RENAME_PATH),
+        Some(&rename_path),
     )?;
-    let readback = flush_sync_read_open_handle(
-        started,
-        operations,
-        handle_client,
-        OPEN_RENAME_PATH,
-        &mut file,
-    )?;
+    let readback =
+        flush_sync_read_open_handle(started, operations, handle_client, &rename_path, &mut file)?;
     record_open_handle_checkpoint(
         context,
         started,
         Some(handle_client),
         "open_rename.flush_sync_read.finished",
-        Some(OPEN_RENAME_PATH),
+        Some(&rename_path),
     )?;
     record_open_handle_checkpoint(
         context,
         started,
         Some(handle_client),
         "open_rename.release.started",
-        Some(OPEN_RENAME_PATH),
+        Some(&rename_path),
     )?;
     drop(file);
     record_open_handle_checkpoint(
@@ -7470,31 +7607,31 @@ fn execute_open_rename_case(
         started,
         Some(handle_client),
         "open_rename.release.finished",
-        Some(OPEN_RENAME_PATH),
+        Some(&rename_path),
     )?;
     push_open_handle_operation(
         started,
         operations,
         handle_client,
         "release",
-        OPEN_RENAME_PATH,
+        &rename_path,
         SharedOperation::Release {
-            path: Some(OPEN_RENAME_PATH.to_string()),
+            path: Some(rename_path.clone()),
         },
     );
-    let old_path_absent = !observer_client.mount_point.join(OPEN_RENAME_PATH).exists();
-    let renamed_path_visible = observer_client.mount_point.join(OPEN_RENAME_DEST).exists();
+    let old_path_absent = !observer_client.mount_point.join(&rename_path).exists();
+    let renamed_path_visible = observer_client.mount_point.join(&rename_dest).exists();
     Ok(OpenHandleCaseSummary {
         name: "open_rename".to_string(),
         handle_client: handle_client.name.clone(),
         mutator_client: mutator_client.name.clone(),
         observer_client: observer_client.name.clone(),
-        original_path: OPEN_RENAME_PATH.to_string(),
-        renamed_path: Some(OPEN_RENAME_DEST.to_string()),
+        original_path: rename_path,
+        renamed_path: Some(rename_dest),
         bytes_read_from_open_handle: readback.bytes,
-        expected_bytes_from_open_handle: expected_open_handle_payload_bytes(),
+        expected_bytes_from_open_handle: expected_open_handle_payload_bytes(context),
         read_checksum_sha256: readback.checksum_sha256,
-        expected_checksum_sha256: expected_open_handle_payload_checksum(),
+        expected_checksum_sha256: expected_open_handle_payload_checksum(context),
         deleted_path_absent: false,
         old_path_absent,
         renamed_path_visible,
@@ -7531,12 +7668,13 @@ fn finish_open_handle(
         convergence_timeout,
         poll_interval,
     )?;
-    open_unlink.deleted_path_absent =
-        snapshots_path_absent(&convergence.snapshots, OPEN_UNLINK_PATH);
+    let unlink_path = open_unlink_path(context);
+    let rename_path = open_rename_path(context);
+    let rename_dest = open_rename_dest(context);
+    open_unlink.deleted_path_absent = snapshots_path_absent(&convergence.snapshots, &unlink_path);
     open_unlink.old_path_absent = open_unlink.deleted_path_absent;
-    open_rename.old_path_absent = snapshots_path_absent(&convergence.snapshots, OPEN_RENAME_PATH);
-    open_rename.renamed_path_visible =
-        snapshots_path_visible(&convergence.snapshots, OPEN_RENAME_DEST);
+    open_rename.old_path_absent = snapshots_path_absent(&convergence.snapshots, &rename_path);
+    open_rename.renamed_path_visible = snapshots_path_visible(&convergence.snapshots, &rename_dest);
     let checks = open_handle_checks(&open_unlink, &open_rename, convergence.comparison.converged);
     if checks.iter().any(|check| !check.passed) {
         return Err(ScenarioError::MountedOpenHandleValidation { checks });
@@ -7583,13 +7721,15 @@ struct OpenHandleReadback {
 }
 
 fn append_to_open_handle(
+    context: &ScenarioContext,
     started: Instant,
     operations: &mut Vec<OpenHandleOperation>,
     client: &ClientSpec,
     path: &str,
     file: &mut fs::File,
 ) -> Result<(), ScenarioError> {
-    file.write_all(OPEN_HANDLE_APPEND_PAYLOAD)?;
+    let append_payload = open_handle_append_payload(context);
+    file.write_all(&append_payload)?;
     push_open_handle_operation(
         started,
         operations,
@@ -7598,8 +7738,8 @@ fn append_to_open_handle(
         path,
         SharedOperation::Append {
             path: path.to_string(),
-            bytes: u64::try_from(OPEN_HANDLE_APPEND_PAYLOAD.len()).unwrap_or(u64::MAX),
-            checksum_sha256: None,
+            bytes: u64::try_from(append_payload.len()).unwrap_or(u64::MAX),
+            checksum_sha256: Some(bytes_sha256(&append_payload)),
         },
     );
     Ok(())
@@ -7657,6 +7797,7 @@ fn flush_sync_read_open_handle(
 }
 
 fn planned_open_handle_case(
+    context: &ScenarioContext,
     name: &str,
     original_path: &str,
     renamed_path: Option<&str>,
@@ -7671,38 +7812,64 @@ fn planned_open_handle_case(
         observer_client: "client-c".to_string(),
         original_path: original_path.to_string(),
         renamed_path: renamed_path.map(str::to_string),
-        bytes_read_from_open_handle: u64::try_from(
-            OPEN_HANDLE_INITIAL_PAYLOAD.len() + OPEN_HANDLE_APPEND_PAYLOAD.len(),
-        )
-        .unwrap_or(u64::MAX),
-        expected_bytes_from_open_handle: expected_open_handle_payload_bytes(),
-        read_checksum_sha256: expected_open_handle_payload_checksum(),
-        expected_checksum_sha256: expected_open_handle_payload_checksum(),
+        bytes_read_from_open_handle: u64::try_from(open_handle_expected_payload(context).len())
+            .unwrap_or(u64::MAX),
+        expected_bytes_from_open_handle: expected_open_handle_payload_bytes(context),
+        read_checksum_sha256: expected_open_handle_payload_checksum(context),
+        expected_checksum_sha256: expected_open_handle_payload_checksum(context),
         deleted_path_absent,
         old_path_absent,
         renamed_path_visible,
     }
 }
 
-fn expected_open_handle_payload_bytes() -> u64 {
-    u64::try_from(OPEN_HANDLE_INITIAL_PAYLOAD.len() + OPEN_HANDLE_APPEND_PAYLOAD.len())
-        .unwrap_or(u64::MAX)
+fn expected_open_handle_payload_bytes(context: &ScenarioContext) -> u64 {
+    u64::try_from(open_handle_expected_payload(context).len()).unwrap_or(u64::MAX)
 }
 
-fn expected_open_handle_payload_checksum() -> String {
-    let mut payload =
-        Vec::with_capacity(OPEN_HANDLE_INITIAL_PAYLOAD.len() + OPEN_HANDLE_APPEND_PAYLOAD.len());
-    payload.extend_from_slice(OPEN_HANDLE_INITIAL_PAYLOAD);
-    payload.extend_from_slice(OPEN_HANDLE_APPEND_PAYLOAD);
-    bytes_sha256(&payload)
+fn expected_open_handle_payload_checksum(context: &ScenarioContext) -> String {
+    bytes_sha256(&open_handle_expected_payload(context))
 }
 
-fn planned_open_handle_operations(started: Instant) -> Vec<OpenHandleOperation> {
+fn open_unlink_path(context: &ScenarioContext) -> String {
+    run_unique_path(context, "open-handles", "unlink-target.txt")
+}
+
+fn open_rename_path(context: &ScenarioContext) -> String {
+    run_unique_path(context, "open-handles", "rename-target.txt")
+}
+
+fn open_rename_dest(context: &ScenarioContext) -> String {
+    run_unique_path(context, "open-handles", "renamed-target.txt")
+}
+
+fn open_handle_initial_payload(context: &ScenarioContext) -> Vec<u8> {
+    run_unique_payload(context, MOUNTED_OPEN_HANDLE_CONVERGENCE, "initial")
+}
+
+fn open_handle_append_payload(context: &ScenarioContext) -> Vec<u8> {
+    run_unique_payload(context, MOUNTED_OPEN_HANDLE_CONVERGENCE, "append")
+}
+
+fn open_handle_expected_payload(context: &ScenarioContext) -> Vec<u8> {
+    let mut payload = open_handle_initial_payload(context);
+    payload.extend_from_slice(&open_handle_append_payload(context));
+    payload
+}
+
+fn planned_open_handle_operations(
+    context: &ScenarioContext,
+    started: Instant,
+) -> Vec<OpenHandleOperation> {
+    let unlink_path = open_unlink_path(context);
+    let rename_path = open_rename_path(context);
+    let rename_dest = open_rename_dest(context);
+    let append_payload = open_handle_append_payload(context);
     [
         (
             "client-a",
             "open_handle",
-            OPEN_UNLINK_PATH,
+            unlink_path.clone(),
             SharedOperation::MountedOnly {
                 name: "open_handle".to_string(),
                 reason: "open file handle state is mounted-product behavior".to_string(),
@@ -7711,49 +7878,49 @@ fn planned_open_handle_operations(started: Instant) -> Vec<OpenHandleOperation> 
         (
             "client-a",
             "append_open_handle",
-            OPEN_UNLINK_PATH,
+            unlink_path.clone(),
             SharedOperation::Append {
-                path: OPEN_UNLINK_PATH.to_string(),
-                bytes: u64::try_from(OPEN_HANDLE_APPEND_PAYLOAD.len()).unwrap_or(u64::MAX),
-                checksum_sha256: None,
+                path: unlink_path.clone(),
+                bytes: u64::try_from(append_payload.len()).unwrap_or(u64::MAX),
+                checksum_sha256: Some(bytes_sha256(&append_payload)),
             },
         ),
         (
             "client-b",
             "unlink",
-            OPEN_UNLINK_PATH,
+            unlink_path.clone(),
             SharedOperation::Unlink {
-                path: OPEN_UNLINK_PATH.to_string(),
+                path: unlink_path.clone(),
             },
         ),
         (
             "client-a",
             "flush",
-            OPEN_UNLINK_PATH,
+            unlink_path.clone(),
             SharedOperation::Flush {
-                path: Some(OPEN_UNLINK_PATH.to_string()),
+                path: Some(unlink_path.clone()),
             },
         ),
         (
             "client-a",
             "fsync",
-            OPEN_UNLINK_PATH,
+            unlink_path.clone(),
             SharedOperation::Fsync {
-                path: OPEN_UNLINK_PATH.to_string(),
+                path: unlink_path.clone(),
             },
         ),
         (
             "client-a",
             "release",
-            OPEN_UNLINK_PATH,
+            unlink_path.clone(),
             SharedOperation::Release {
-                path: Some(OPEN_UNLINK_PATH.to_string()),
+                path: Some(unlink_path.clone()),
             },
         ),
         (
             "client-a",
             "open_handle",
-            OPEN_RENAME_PATH,
+            rename_path.clone(),
             SharedOperation::MountedOnly {
                 name: "open_handle".to_string(),
                 reason: "open file handle state is mounted-product behavior".to_string(),
@@ -7762,44 +7929,44 @@ fn planned_open_handle_operations(started: Instant) -> Vec<OpenHandleOperation> 
         (
             "client-b",
             "rename",
-            OPEN_RENAME_PATH,
+            rename_path.clone(),
             SharedOperation::Rename {
-                from: OPEN_RENAME_PATH.to_string(),
-                to: OPEN_RENAME_DEST.to_string(),
+                from: rename_path.clone(),
+                to: rename_dest.clone(),
             },
         ),
         (
             "client-a",
             "append_open_handle",
-            OPEN_RENAME_PATH,
+            rename_path.clone(),
             SharedOperation::Append {
-                path: OPEN_RENAME_PATH.to_string(),
-                bytes: u64::try_from(OPEN_HANDLE_APPEND_PAYLOAD.len()).unwrap_or(u64::MAX),
-                checksum_sha256: None,
+                path: rename_path.clone(),
+                bytes: u64::try_from(append_payload.len()).unwrap_or(u64::MAX),
+                checksum_sha256: Some(bytes_sha256(&append_payload)),
             },
         ),
         (
             "client-a",
             "flush",
-            OPEN_RENAME_PATH,
+            rename_path.clone(),
             SharedOperation::Flush {
-                path: Some(OPEN_RENAME_PATH.to_string()),
+                path: Some(rename_path.clone()),
             },
         ),
         (
             "client-a",
             "fsync",
-            OPEN_RENAME_PATH,
+            rename_path.clone(),
             SharedOperation::Fsync {
-                path: OPEN_RENAME_PATH.to_string(),
+                path: rename_path.clone(),
             },
         ),
         (
             "client-a",
             "release",
-            OPEN_RENAME_PATH,
+            rename_path.clone(),
             SharedOperation::Release {
-                path: Some(OPEN_RENAME_PATH.to_string()),
+                path: Some(rename_path.clone()),
             },
         ),
     ]
@@ -7810,7 +7977,7 @@ fn planned_open_handle_operations(started: Instant) -> Vec<OpenHandleOperation> 
             order: index + 1,
             client: client.to_string(),
             operation: operation.to_string(),
-            path: path.to_string(),
+            path,
             shared_operation,
             result: "planned".to_string(),
             timestamp_ms: elapsed_millis_u64(started),
@@ -7854,17 +8021,17 @@ fn open_handle_checks(
         OpenHandleCheck {
             name: "unlink_deleted_path_absent_after_release".to_string(),
             passed: open_unlink.deleted_path_absent,
-            detail: OPEN_UNLINK_PATH.to_string(),
+            detail: open_unlink.original_path.clone(),
         },
         OpenHandleCheck {
             name: "rename_old_path_absent_after_release".to_string(),
             passed: open_rename.old_path_absent,
-            detail: OPEN_RENAME_PATH.to_string(),
+            detail: open_rename.original_path.clone(),
         },
         OpenHandleCheck {
             name: "rename_destination_visible_after_release".to_string(),
             passed: open_rename.renamed_path_visible,
-            detail: OPEN_RENAME_DEST.to_string(),
+            detail: open_rename.renamed_path.clone().unwrap_or_default(),
         },
     ];
     checks.extend(open_handle_payload_checks("unlink", open_unlink));
@@ -8005,31 +8172,55 @@ impl NamespaceCollisionKind {
         }
     }
 
-    fn initial_paths(self) -> Vec<(&'static str, &'static [u8])> {
+    fn initial_paths(self, context: &ScenarioContext) -> Vec<(String, Vec<u8>)> {
+        let root = namespace_collision_root(context);
         match self {
             Self::RenameVsRename | Self::RenameVsUnlink => {
-                vec![("shared/file.txt", b"initial namespace payload\n")]
+                vec![(
+                    format!("{root}/shared/file.txt"),
+                    run_unique_payload(context, self.name(), "initial-shared-file"),
+                )]
             }
             Self::UnlinkVsAppend | Self::OverwriteVsRead => {
-                vec![("shared/data.txt", COLLISION_OLD_COMMITTED_PAYLOAD)]
+                vec![(
+                    format!("{root}/shared/data.txt"),
+                    collision_payload(context, "old-committed"),
+                )]
             }
             Self::MkdirRmdirVsCreate => Vec::new(),
             Self::ReaddirStatDuringMutation => {
-                vec![("scan/a.txt", b"a\n"), ("scan/b.txt", b"b\n")]
+                vec![
+                    (
+                        format!("{root}/scan/a.txt"),
+                        run_unique_payload(context, self.name(), "scan-a"),
+                    ),
+                    (
+                        format!("{root}/scan/b.txt"),
+                        run_unique_payload(context, self.name(), "scan-b"),
+                    ),
+                ]
             }
         }
     }
 
-    fn expected_absent_paths(self) -> &'static [&'static str] {
+    fn expected_absent_paths(self, context: &ScenarioContext) -> Vec<String> {
+        let root = namespace_collision_root(context);
         match self {
-            Self::RenameVsRename => &["shared/file.txt"],
-            Self::RenameVsUnlink => &["shared/file.txt"],
-            Self::UnlinkVsAppend => &[],
-            Self::OverwriteVsRead => &[],
-            Self::MkdirRmdirVsCreate => &[],
-            Self::ReaddirStatDuringMutation => &["scan/a.txt"],
+            Self::RenameVsRename | Self::RenameVsUnlink => {
+                vec![format!("{root}/shared/file.txt")]
+            }
+            Self::ReaddirStatDuringMutation => vec![format!("{root}/scan/a.txt")],
+            Self::UnlinkVsAppend | Self::OverwriteVsRead | Self::MkdirRmdirVsCreate => Vec::new(),
         }
     }
+}
+
+fn namespace_collision_root(context: &ScenarioContext) -> String {
+    run_unique_dir(context, "collision")
+}
+
+fn collision_payload(context: &ScenarioContext, label: &str) -> Vec<u8> {
+    run_unique_payload(context, "namespace-collision", label)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -8174,7 +8365,7 @@ struct NamespaceCollisionTask {
     order: usize,
     client: ClientSpec,
     operation: &'static str,
-    path: &'static str,
+    path: String,
     shared_operation: SharedOperation,
     action: NamespaceCollisionAction,
 }
@@ -8184,7 +8375,7 @@ impl NamespaceCollisionTask {
         order: usize,
         client: ClientSpec,
         operation: &'static str,
-        path: &'static str,
+        path: impl Into<String>,
         shared_operation: SharedOperation,
         action: impl FnOnce(&ClientSpec) -> io::Result<()> + Send + 'static,
     ) -> Self {
@@ -8192,7 +8383,7 @@ impl NamespaceCollisionTask {
             order,
             client,
             operation,
-            path,
+            path: path.into(),
             shared_operation,
             action: Box::new(action),
         }
@@ -8259,7 +8450,7 @@ fn run_namespace_collision_body(
         .take(COLLISION_CLIENT_NAMES.len())
         .collect::<Vec<_>>();
 
-    establish_collision_initial_tree(kind, &clients[0])?;
+    establish_collision_initial_tree(context, kind, &clients[0])?;
     driver.after_conflicting_operations(kind, &clients)?;
     let initial_mounts = client_mounts(context, &clients);
     wait_for_convergence(
@@ -8288,7 +8479,7 @@ fn write_namespace_collision_plan_artifacts(
 ) -> Result<NamespaceCollisionSummary, ScenarioError> {
     fs::create_dir_all(&context.scenario_dir)?;
     let started = Instant::now();
-    let operations = planned_namespace_collision_operations(kind, started);
+    let operations = planned_namespace_collision_operations(context, kind, started);
     write_namespace_collision_operations(context, kind, &operations)?;
     let summary = NamespaceCollisionSummary {
         scenario: kind.name().to_string(),
@@ -8312,15 +8503,17 @@ fn write_namespace_collision_plan_artifacts(
 }
 
 fn establish_collision_initial_tree(
+    context: &ScenarioContext,
     kind: NamespaceCollisionKind,
     client: &ClientSpec,
 ) -> Result<(), ScenarioError> {
+    let root = namespace_collision_root(context);
     if kind == NamespaceCollisionKind::MkdirRmdirVsCreate {
-        fs::create_dir_all(client.mount_point.join("race"))?;
+        fs::create_dir_all(client.mount_point.join(format!("{root}/race")))?;
     }
-    for (relative_path, payload) in kind.initial_paths() {
+    for (relative_path, payload) in kind.initial_paths(context) {
         let path = client.mount_point.join(relative_path);
-        write_mounted_chaos_initial_file(path, payload)?;
+        write_mounted_chaos_initial_file(path, &payload)?;
     }
     Ok(())
 }
@@ -8331,6 +8524,19 @@ fn perform_namespace_collision_operations(
     clients: &[ClientSpec],
 ) -> Result<Vec<NamespaceCollisionOperation>, ScenarioError> {
     let started = Instant::now();
+    let root = namespace_collision_root(context);
+    let shared_file = format!("{root}/shared/file.txt");
+    let renamed_a = format!("{root}/shared/renamed-a.txt");
+    let renamed_b = format!("{root}/shared/renamed-b.txt");
+    let renamed = format!("{root}/shared/renamed.txt");
+    let shared_data = format!("{root}/shared/data.txt");
+    let race_dir = format!("{root}/race");
+    let race_subdir = format!("{race_dir}/subdir");
+    let race_child = format!("{race_dir}/child.txt");
+    let scan_dir = format!("{root}/scan");
+    let scan_a = format!("{scan_dir}/a.txt");
+    let scan_b = format!("{scan_dir}/b.txt");
+    let scan_c = format!("{scan_dir}/c.txt");
     let operations = match kind {
         NamespaceCollisionKind::RenameVsRename => run_concurrent_namespace_operations(
             started,
@@ -8339,32 +8545,40 @@ fn perform_namespace_collision_operations(
                     1,
                     clients[0].clone(),
                     "rename",
-                    "shared/file.txt -> shared/renamed-a.txt",
+                    format!("{shared_file} -> {renamed_a}"),
                     SharedOperation::Rename {
-                        from: "shared/file.txt".to_string(),
-                        to: "shared/renamed-a.txt".to_string(),
+                        from: shared_file.clone(),
+                        to: renamed_a.clone(),
                     },
-                    |client| {
-                        fs::rename(
-                            client.mount_point.join("shared/file.txt"),
-                            client.mount_point.join("shared/renamed-a.txt"),
-                        )
+                    {
+                        let shared_file = shared_file.clone();
+                        let renamed_a = renamed_a.clone();
+                        move |client| {
+                            fs::rename(
+                                client.mount_point.join(shared_file),
+                                client.mount_point.join(renamed_a),
+                            )
+                        }
                     },
                 ),
                 NamespaceCollisionTask::new(
                     2,
                     clients[1].clone(),
                     "rename",
-                    "shared/file.txt -> shared/renamed-b.txt",
+                    format!("{shared_file} -> {renamed_b}"),
                     SharedOperation::Rename {
-                        from: "shared/file.txt".to_string(),
-                        to: "shared/renamed-b.txt".to_string(),
+                        from: shared_file.clone(),
+                        to: renamed_b.clone(),
                     },
-                    |client| {
-                        fs::rename(
-                            client.mount_point.join("shared/file.txt"),
-                            client.mount_point.join("shared/renamed-b.txt"),
-                        )
+                    {
+                        let shared_file = shared_file.clone();
+                        let renamed_b = renamed_b.clone();
+                        move |client| {
+                            fs::rename(
+                                client.mount_point.join(shared_file),
+                                client.mount_point.join(renamed_b),
+                            )
+                        }
                     },
                 ),
             ],
@@ -8376,27 +8590,34 @@ fn perform_namespace_collision_operations(
                     1,
                     clients[0].clone(),
                     "rename",
-                    "shared/file.txt -> shared/renamed.txt",
+                    format!("{shared_file} -> {renamed}"),
                     SharedOperation::Rename {
-                        from: "shared/file.txt".to_string(),
-                        to: "shared/renamed.txt".to_string(),
+                        from: shared_file.clone(),
+                        to: renamed.clone(),
                     },
-                    |client| {
-                        fs::rename(
-                            client.mount_point.join("shared/file.txt"),
-                            client.mount_point.join("shared/renamed.txt"),
-                        )
+                    {
+                        let shared_file = shared_file.clone();
+                        let renamed = renamed.clone();
+                        move |client| {
+                            fs::rename(
+                                client.mount_point.join(shared_file),
+                                client.mount_point.join(renamed),
+                            )
+                        }
                     },
                 ),
                 NamespaceCollisionTask::new(
                     2,
                     clients[1].clone(),
                     "unlink",
-                    "shared/file.txt",
+                    shared_file.clone(),
                     SharedOperation::Unlink {
-                        path: "shared/file.txt".to_string(),
+                        path: shared_file.clone(),
                     },
-                    |client| fs::remove_file(client.mount_point.join("shared/file.txt")),
+                    {
+                        let shared_file = shared_file.clone();
+                        move |client| fs::remove_file(client.mount_point.join(shared_file))
+                    },
                 ),
             ],
         ),
@@ -8407,28 +8628,36 @@ fn perform_namespace_collision_operations(
                     1,
                     clients[0].clone(),
                     "unlink",
-                    "shared/data.txt",
+                    shared_data.clone(),
                     SharedOperation::Unlink {
-                        path: "shared/data.txt".to_string(),
+                        path: shared_data.clone(),
                     },
-                    |client| fs::remove_file(client.mount_point.join("shared/data.txt")),
+                    {
+                        let shared_data = shared_data.clone();
+                        move |client| fs::remove_file(client.mount_point.join(shared_data))
+                    },
                 ),
                 NamespaceCollisionTask::new(
                     2,
                     clients[1].clone(),
                     "append",
-                    "shared/data.txt",
+                    shared_data.clone(),
                     SharedOperation::Append {
-                        path: "shared/data.txt".to_string(),
-                        bytes: u64::try_from(COLLISION_APPEND_PAYLOAD.len()).unwrap_or(u64::MAX),
-                        checksum_sha256: None,
+                        path: shared_data.clone(),
+                        bytes: u64::try_from(collision_payload(context, "append").len())
+                            .unwrap_or(u64::MAX),
+                        checksum_sha256: Some(bytes_sha256(&collision_payload(context, "append"))),
                     },
-                    |client| {
-                        let mut file = OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(client.mount_point.join("shared/data.txt"))?;
-                        file.write_all(COLLISION_APPEND_PAYLOAD)
+                    {
+                        let shared_data = shared_data.clone();
+                        let payload = collision_payload(context, "append");
+                        move |client| {
+                            let mut file = OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(client.mount_point.join(shared_data))?;
+                            file.write_all(&payload)
+                        }
                     },
                 ),
             ],
@@ -8440,44 +8669,70 @@ fn perform_namespace_collision_operations(
                     1,
                     clients[1].clone(),
                     "read_loop",
-                    "shared/data.txt",
+                    shared_data.clone(),
                     SharedOperation::Read {
-                        path: "shared/data.txt".to_string(),
+                        path: shared_data.clone(),
                         bytes: None,
                         checksum_sha256: None,
                     },
-                    |client| repeated_committed_read(client, "shared/data.txt"),
+                    {
+                        let shared_data = shared_data.clone();
+                        let old_payload = collision_payload(context, "old-committed");
+                        let new_payload = collision_payload(context, "new-committed");
+                        move |client| {
+                            repeated_committed_read(
+                                client,
+                                &shared_data,
+                                &old_payload,
+                                &new_payload,
+                            )
+                        }
+                    },
                 ),
                 NamespaceCollisionTask::new(
                     2,
                     clients[0].clone(),
                     "overwrite",
-                    "shared/data.txt",
+                    shared_data.clone(),
                     SharedOperation::Write {
-                        path: "shared/data.txt".to_string(),
+                        path: shared_data.clone(),
                         offset: Some(0),
-                        bytes: u64::try_from(COLLISION_NEW_COMMITTED_PAYLOAD.len())
+                        bytes: u64::try_from(collision_payload(context, "new-committed").len())
                             .unwrap_or(u64::MAX),
-                        checksum_sha256: None,
+                        checksum_sha256: Some(bytes_sha256(&collision_payload(
+                            context,
+                            "new-committed",
+                        ))),
                     },
-                    |client| {
-                        fs::write(
-                            client.mount_point.join("shared/data.txt"),
-                            COLLISION_NEW_COMMITTED_PAYLOAD,
-                        )
+                    {
+                        let shared_data = shared_data.clone();
+                        let payload = collision_payload(context, "new-committed");
+                        move |client| fs::write(client.mount_point.join(shared_data), &payload)
                     },
                 ),
                 NamespaceCollisionTask::new(
                     3,
                     clients[2].clone(),
                     "read_loop",
-                    "shared/data.txt",
+                    shared_data.clone(),
                     SharedOperation::Read {
-                        path: "shared/data.txt".to_string(),
+                        path: shared_data.clone(),
                         bytes: None,
                         checksum_sha256: None,
                     },
-                    |client| repeated_committed_read(client, "shared/data.txt"),
+                    {
+                        let shared_data = shared_data.clone();
+                        let old_payload = collision_payload(context, "old-committed");
+                        let new_payload = collision_payload(context, "new-committed");
+                        move |client| {
+                            repeated_committed_read(
+                                client,
+                                &shared_data,
+                                &old_payload,
+                                &new_payload,
+                            )
+                        }
+                    },
                 ),
             ],
         ),
@@ -8488,39 +8743,45 @@ fn perform_namespace_collision_operations(
                     1,
                     clients[0].clone(),
                     "mkdir",
-                    "race/subdir",
+                    race_subdir.clone(),
                     SharedOperation::CreateDirectory {
-                        path: "race/subdir".to_string(),
+                        path: race_subdir.clone(),
                     },
-                    |client| fs::create_dir_all(client.mount_point.join("race/subdir")),
+                    {
+                        let race_subdir = race_subdir.clone();
+                        move |client| fs::create_dir_all(client.mount_point.join(race_subdir))
+                    },
                 ),
                 NamespaceCollisionTask::new(
                     2,
                     clients[1].clone(),
                     "create",
-                    "race/child.txt",
+                    race_child.clone(),
                     SharedOperation::CreateFile {
-                        path: "race/child.txt".to_string(),
+                        path: race_child.clone(),
                         bytes: Some(
-                            u64::try_from(COLLISION_CHILD_PAYLOAD.len()).unwrap_or(u64::MAX),
+                            u64::try_from(collision_payload(context, "child").len())
+                                .unwrap_or(u64::MAX),
                         ),
                     },
-                    |client| {
-                        fs::write(
-                            client.mount_point.join("race/child.txt"),
-                            COLLISION_CHILD_PAYLOAD,
-                        )
+                    {
+                        let race_child = race_child.clone();
+                        let payload = collision_payload(context, "child");
+                        move |client| fs::write(client.mount_point.join(race_child), &payload)
                     },
                 ),
                 NamespaceCollisionTask::new(
                     3,
                     clients[2].clone(),
                     "rmdir",
-                    "race",
+                    race_dir.clone(),
                     SharedOperation::Rmdir {
-                        path: "race".to_string(),
+                        path: race_dir.clone(),
                     },
-                    |client| fs::remove_dir(client.mount_point.join("race")),
+                    {
+                        let race_dir = race_dir.clone();
+                        move |client| fs::remove_dir(client.mount_point.join(race_dir))
+                    },
                 ),
             ],
         ),
@@ -8531,37 +8792,47 @@ fn perform_namespace_collision_operations(
                     1,
                     clients[1].clone(),
                     "readdir",
-                    "scan",
+                    scan_dir.clone(),
                     SharedOperation::Readdir {
-                        path: "scan".to_string(),
+                        path: scan_dir.clone(),
                     },
-                    |client| fs::read_dir(client.mount_point.join("scan")).map(|_| ()),
+                    {
+                        let scan_dir = scan_dir.clone();
+                        move |client| fs::read_dir(client.mount_point.join(scan_dir)).map(|_| ())
+                    },
                 ),
                 NamespaceCollisionTask::new(
                     2,
                     clients[0].clone(),
                     "rename",
-                    "scan/a.txt -> scan/c.txt",
+                    format!("{scan_a} -> {scan_c}"),
                     SharedOperation::Rename {
-                        from: "scan/a.txt".to_string(),
-                        to: "scan/c.txt".to_string(),
+                        from: scan_a.clone(),
+                        to: scan_c.clone(),
                     },
-                    |client| {
-                        fs::rename(
-                            client.mount_point.join("scan/a.txt"),
-                            client.mount_point.join("scan/c.txt"),
-                        )
+                    {
+                        let scan_a = scan_a.clone();
+                        let scan_c = scan_c.clone();
+                        move |client| {
+                            fs::rename(
+                                client.mount_point.join(scan_a),
+                                client.mount_point.join(scan_c),
+                            )
+                        }
                     },
                 ),
                 NamespaceCollisionTask::new(
                     3,
                     clients[2].clone(),
                     "stat",
-                    "scan/b.txt",
+                    scan_b.clone(),
                     SharedOperation::Stat {
-                        path: "scan/b.txt".to_string(),
+                        path: scan_b.clone(),
                     },
-                    |client| fs::metadata(client.mount_point.join("scan/b.txt")).map(|_| ()),
+                    {
+                        let scan_b = scan_b.clone();
+                        move |client| fs::metadata(client.mount_point.join(scan_b)).map(|_| ())
+                    },
                 ),
             ],
         ),
@@ -8585,7 +8856,7 @@ fn run_concurrent_namespace_operations(
                 task.order,
                 &task.client,
                 task.operation,
-                task.path,
+                &task.path,
                 task.shared_operation,
                 || (task.action)(&task.client),
             )
@@ -8604,11 +8875,15 @@ fn run_concurrent_namespace_operations(
     operations
 }
 
-fn repeated_committed_read(client: &ClientSpec, relative_path: &str) -> io::Result<()> {
+fn repeated_committed_read(
+    client: &ClientSpec,
+    relative_path: &str,
+    old_payload: &[u8],
+    new_payload: &[u8],
+) -> io::Result<()> {
     for _ in 0..OVERWRITE_READ_ATTEMPTS {
         let payload = fs::read(client.mount_point.join(relative_path))?;
-        if payload != COLLISION_OLD_COMMITTED_PAYLOAD && payload != COLLISION_NEW_COMMITTED_PAYLOAD
-        {
+        if payload != old_payload && payload != new_payload {
             return Err(io::Error::other(format!(
                 "read observed partial or unexpected payload for {relative_path}"
             )));
@@ -8619,27 +8894,41 @@ fn repeated_committed_read(client: &ClientSpec, relative_path: &str) -> io::Resu
 }
 
 fn planned_namespace_collision_operations(
+    context: &ScenarioContext,
     kind: NamespaceCollisionKind,
     started: Instant,
 ) -> Vec<NamespaceCollisionOperation> {
+    let root = namespace_collision_root(context);
+    let shared_file = format!("{root}/shared/file.txt");
+    let renamed_a = format!("{root}/shared/renamed-a.txt");
+    let renamed_b = format!("{root}/shared/renamed-b.txt");
+    let renamed = format!("{root}/shared/renamed.txt");
+    let shared_data = format!("{root}/shared/data.txt");
+    let race_dir = format!("{root}/race");
+    let race_subdir = format!("{race_dir}/subdir");
+    let race_child = format!("{race_dir}/child.txt");
+    let scan_dir = format!("{root}/scan");
+    let scan_a = format!("{scan_dir}/a.txt");
+    let scan_b = format!("{scan_dir}/b.txt");
+    let scan_c = format!("{scan_dir}/c.txt");
     let spec = match kind {
         NamespaceCollisionKind::RenameVsRename => vec![
             (
                 "client-a",
                 "rename",
-                "shared/file.txt -> shared/renamed-a.txt",
+                format!("{shared_file} -> {renamed_a}"),
                 SharedOperation::Rename {
-                    from: "shared/file.txt".to_string(),
-                    to: "shared/renamed-a.txt".to_string(),
+                    from: shared_file.clone(),
+                    to: renamed_a,
                 },
             ),
             (
                 "client-b",
                 "rename",
-                "shared/file.txt -> shared/renamed-b.txt",
+                format!("{shared_file} -> {renamed_b}"),
                 SharedOperation::Rename {
-                    from: "shared/file.txt".to_string(),
-                    to: "shared/renamed-b.txt".to_string(),
+                    from: shared_file.clone(),
+                    to: renamed_b,
                 },
             ),
         ],
@@ -8647,18 +8936,18 @@ fn planned_namespace_collision_operations(
             (
                 "client-a",
                 "rename",
-                "shared/file.txt -> shared/renamed.txt",
+                format!("{shared_file} -> {renamed}"),
                 SharedOperation::Rename {
-                    from: "shared/file.txt".to_string(),
-                    to: "shared/renamed.txt".to_string(),
+                    from: shared_file.clone(),
+                    to: renamed,
                 },
             ),
             (
                 "client-b",
                 "unlink",
-                "shared/file.txt",
+                shared_file.clone(),
                 SharedOperation::Unlink {
-                    path: "shared/file.txt".to_string(),
+                    path: shared_file.clone(),
                 },
             ),
         ],
@@ -8666,19 +8955,20 @@ fn planned_namespace_collision_operations(
             (
                 "client-a",
                 "unlink",
-                "shared/data.txt",
+                shared_data.clone(),
                 SharedOperation::Unlink {
-                    path: "shared/data.txt".to_string(),
+                    path: shared_data.clone(),
                 },
             ),
             (
                 "client-b",
                 "append",
-                "shared/data.txt",
+                shared_data.clone(),
                 SharedOperation::Append {
-                    path: "shared/data.txt".to_string(),
-                    bytes: u64::try_from(COLLISION_APPEND_PAYLOAD.len()).unwrap_or(u64::MAX),
-                    checksum_sha256: None,
+                    path: shared_data.clone(),
+                    bytes: u64::try_from(collision_payload(context, "append").len())
+                        .unwrap_or(u64::MAX),
+                    checksum_sha256: Some(bytes_sha256(&collision_payload(context, "append"))),
                 },
             ),
         ],
@@ -8686,9 +8976,9 @@ fn planned_namespace_collision_operations(
             (
                 "client-b",
                 "read_loop",
-                "shared/data.txt",
+                shared_data.clone(),
                 SharedOperation::Read {
-                    path: "shared/data.txt".to_string(),
+                    path: shared_data.clone(),
                     bytes: None,
                     checksum_sha256: None,
                 },
@@ -8696,20 +8986,24 @@ fn planned_namespace_collision_operations(
             (
                 "client-a",
                 "overwrite",
-                "shared/data.txt",
+                shared_data.clone(),
                 SharedOperation::Write {
-                    path: "shared/data.txt".to_string(),
+                    path: shared_data.clone(),
                     offset: Some(0),
-                    bytes: u64::try_from(COLLISION_NEW_COMMITTED_PAYLOAD.len()).unwrap_or(u64::MAX),
-                    checksum_sha256: None,
+                    bytes: u64::try_from(collision_payload(context, "new-committed").len())
+                        .unwrap_or(u64::MAX),
+                    checksum_sha256: Some(bytes_sha256(&collision_payload(
+                        context,
+                        "new-committed",
+                    ))),
                 },
             ),
             (
                 "client-c",
                 "read_loop",
-                "shared/data.txt",
+                shared_data.clone(),
                 SharedOperation::Read {
-                    path: "shared/data.txt".to_string(),
+                    path: shared_data.clone(),
                     bytes: None,
                     checksum_sha256: None,
                 },
@@ -8719,54 +9013,49 @@ fn planned_namespace_collision_operations(
             (
                 "client-a",
                 "mkdir",
-                "race/subdir",
-                SharedOperation::CreateDirectory {
-                    path: "race/subdir".to_string(),
-                },
+                race_subdir.clone(),
+                SharedOperation::CreateDirectory { path: race_subdir },
             ),
             (
                 "client-b",
                 "create",
-                "race/child.txt",
+                race_child.clone(),
                 SharedOperation::CreateFile {
-                    path: "race/child.txt".to_string(),
-                    bytes: Some(u64::try_from(COLLISION_CHILD_PAYLOAD.len()).unwrap_or(u64::MAX)),
+                    path: race_child,
+                    bytes: Some(
+                        u64::try_from(collision_payload(context, "child").len())
+                            .unwrap_or(u64::MAX),
+                    ),
                 },
             ),
             (
                 "client-c",
                 "rmdir",
-                "race",
-                SharedOperation::Rmdir {
-                    path: "race".to_string(),
-                },
+                race_dir.clone(),
+                SharedOperation::Rmdir { path: race_dir },
             ),
         ],
         NamespaceCollisionKind::ReaddirStatDuringMutation => vec![
             (
                 "client-b",
                 "readdir",
-                "scan",
-                SharedOperation::Readdir {
-                    path: "scan".to_string(),
-                },
+                scan_dir.clone(),
+                SharedOperation::Readdir { path: scan_dir },
             ),
             (
                 "client-a",
                 "rename",
-                "scan/a.txt -> scan/c.txt",
+                format!("{scan_a} -> {scan_c}"),
                 SharedOperation::Rename {
-                    from: "scan/a.txt".to_string(),
-                    to: "scan/c.txt".to_string(),
+                    from: scan_a,
+                    to: scan_c,
                 },
             ),
             (
                 "client-c",
                 "stat",
-                "scan/b.txt",
-                SharedOperation::Stat {
-                    path: "scan/b.txt".to_string(),
-                },
+                scan_b.clone(),
+                SharedOperation::Stat { path: scan_b },
             ),
         ],
     };
@@ -8851,10 +9140,15 @@ fn finish_namespace_collision(
         poll_interval,
     )?;
     let mut namespace_violations = Vec::new();
+    let expected_absent_paths = kind.expected_absent_paths(context);
+    let expected_absent_path_refs = expected_absent_paths
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
     for snapshot in &convergence.snapshots {
         namespace_violations.extend(validate_namespace_invariants(
             snapshot,
-            kind.expected_absent_paths(),
+            &expected_absent_path_refs,
         ));
     }
     if !namespace_violations.is_empty() {
@@ -9118,6 +9412,17 @@ mod tests {
     use crate::infra::CommandOutput;
     use studiofs_scenario::read_operation_log;
 
+    fn test_context(root: &Path, run_id: &str, scenario: &str, seed: u64) -> ScenarioContext {
+        let sandbox = root.join(run_id);
+        ScenarioContext {
+            run_id: run_id.to_string(),
+            seed,
+            scenario_dir: sandbox.join("artifacts").join("scenarios").join(scenario),
+            sandbox,
+            client_controller_config: None,
+        }
+    }
+
     #[test]
     fn mounted_smoke_writes_file_converges_three_mounts_and_unmounts() {
         let temp = tempdir().unwrap();
@@ -9171,9 +9476,13 @@ mod tests {
         assert!(driver.mounted.get());
         assert!(driver.unmounted.get());
 
+        let relative_path = run_unique_path(&context, "smoke", SMOKE_FILE_NAME);
         for client in driver.clients {
-            let payload = std::fs::read(client.mount_point.join("studiofs-e2e-smoke.txt")).unwrap();
-            assert_eq!(payload, b"studiofs e2e mounted multi-client smoke\n");
+            let payload = std::fs::read(client.mount_point.join(&relative_path)).unwrap();
+            assert_eq!(
+                payload,
+                run_unique_payload(&context, BASIC_MULTI_CLIENT_SMOKE, "smoke")
+            );
         }
         assert!(context.scenario_dir.join("smoke-summary.json").exists());
     }
@@ -9252,7 +9561,11 @@ mod tests {
             };
             let payload = std::fs::read(source_client.mount_point.join(relative_path))?;
             for replica in clients.iter().skip(1) {
-                std::fs::write(replica.mount_point.join(relative_path), &payload)?;
+                let target = replica.mount_point.join(relative_path);
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(target, &payload)?;
             }
             Ok(())
         }
@@ -9330,7 +9643,11 @@ mod tests {
             self.actions.borrow_mut().push("after_initial_write");
             let payload = std::fs::read(clients[0].mount_point.join(relative_path))?;
             for replica in clients.iter().skip(1) {
-                std::fs::write(replica.mount_point.join(relative_path), &payload)?;
+                let target = replica.mount_point.join(relative_path);
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(target, &payload)?;
             }
             Ok(())
         }
@@ -9344,16 +9661,13 @@ mod tests {
             self.actions.borrow_mut().push("start_postgres");
             let mut entries = Vec::new();
             for client in &self.clients {
-                for entry in std::fs::read_dir(&client.mount_point).unwrap() {
-                    let entry = entry.unwrap();
-                    if entry.file_type().unwrap().is_file() {
-                        entries.push((entry.file_name(), std::fs::read(entry.path()).unwrap()));
-                    }
-                }
+                collect_test_files(&client.mount_point, &client.mount_point, &mut entries);
             }
             for client in &self.clients {
-                for (name, payload) in &entries {
-                    std::fs::write(client.mount_point.join(name), payload).unwrap();
+                for (relative_path, payload) in &entries {
+                    let target = client.mount_point.join(relative_path);
+                    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+                    std::fs::write(target, payload).unwrap();
                 }
             }
             Ok(())
@@ -9369,6 +9683,7 @@ mod tests {
         clients: Vec<ClientSpec>,
         actions: RefCell<Vec<&'static str>>,
         peer_probe_delay: Duration,
+        outage_path: RefCell<Option<String>>,
     }
 
     impl RecordingRustfsOutageDriver {
@@ -9377,6 +9692,7 @@ mod tests {
                 clients,
                 actions: RefCell::new(Vec::new()),
                 peer_probe_delay: Duration::from_millis(0),
+                outage_path: RefCell::new(None),
             }
         }
 
@@ -9434,9 +9750,16 @@ mod tests {
             relative_path: &str,
         ) -> Result<(), ScenarioError> {
             self.actions.borrow_mut().push("after_initial_write");
+            self.outage_path
+                .borrow_mut()
+                .replace(relative_path.to_string());
             let payload = std::fs::read(clients[0].mount_point.join(relative_path))?;
             for client in clients.iter().skip(1) {
-                std::fs::write(client.mount_point.join(relative_path), &payload)?;
+                let target = client.mount_point.join(relative_path);
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(target, &payload)?;
             }
             Ok(())
         }
@@ -9461,10 +9784,19 @@ mod tests {
 
         fn start_rustfs(&mut self) -> Result<(), ScenarioError> {
             self.actions.borrow_mut().push("start_rustfs");
-            let source = self.clients[0].mount_point.join(RUSTFS_OUTAGE_FILE_NAME);
+            let outage_path = self
+                .outage_path
+                .borrow()
+                .clone()
+                .unwrap_or_else(|| RUSTFS_OUTAGE_FILE_NAME.to_string());
+            let source = self.clients[0].mount_point.join(&outage_path);
             let payload = std::fs::read(source)?;
             for client in self.clients.iter().skip(1) {
-                std::fs::write(client.mount_point.join(RUSTFS_OUTAGE_FILE_NAME), &payload)?;
+                let target = client.mount_point.join(&outage_path);
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(target, &payload)?;
             }
             Ok(())
         }
@@ -9618,9 +9950,12 @@ mod tests {
                     .find(|candidate| candidate.name == client)
                     .expect("recording driver client exists");
                 std::fs::write(
-                    client
-                        .mount_point
-                        .join(CRASH_RESTART_LOCAL_DURABLE_FILE_NAME),
+                    find_named_file(&client.mount_point, CRASH_RESTART_LOCAL_DURABLE_FILE_NAME)
+                        .unwrap_or_else(|| {
+                            client
+                                .mount_point
+                                .join(CRASH_RESTART_LOCAL_DURABLE_FILE_NAME)
+                        }),
                     b"corrupted payload after restart\n",
                 )?;
             }
@@ -9635,16 +9970,8 @@ mod tests {
                     .iter()
                     .find(|candidate| candidate.name == client)
                     .expect("recording driver client exists");
-                for relative_path in [
-                    CRASH_RESTART_LOCAL_DURABLE_FILE_NAME,
-                    CRASH_RESTART_BEFORE_PUBLICATION_FILE_NAME,
-                ] {
-                    let source = crashed.mount_point.join(relative_path);
-                    if let Ok(payload) = std::fs::read(source) {
-                        for peer in self.clients.iter().filter(|peer| peer.name != client) {
-                            std::fs::write(peer.mount_point.join(relative_path), &payload)?;
-                        }
-                    }
+                for peer in self.clients.iter().filter(|peer| peer.name != client) {
+                    copy_test_tree(&crashed.mount_point, &peer.mount_point);
                 }
             }
             Ok(())
@@ -9658,10 +9985,11 @@ mod tests {
         ) -> Result<(), ScenarioError> {
             if self.corrupt_converged_payload_after_remount {
                 for client in clients {
-                    std::fs::write(
-                        client.mount_point.join(relative_path),
-                        b"wrong converged payload after restart\n",
-                    )?;
+                    let target = client.mount_point.join(relative_path);
+                    if let Some(parent) = target.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(target, b"wrong converged payload after restart\n")?;
                 }
             }
             if self.publish_current_file_before_convergence {
@@ -9670,7 +9998,11 @@ mod tests {
                 };
                 let payload = std::fs::read(source_client.mount_point.join(relative_path))?;
                 for peer in clients.iter().skip(1) {
-                    std::fs::write(peer.mount_point.join(relative_path), &payload)?;
+                    let target = peer.mount_point.join(relative_path);
+                    if let Some(parent) = target.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(target, &payload)?;
                 }
             }
             Ok(())
@@ -9837,7 +10169,15 @@ mod tests {
             };
             let path = self.clients[0]
                 .mount_point
-                .join(publication_boundary_file_name(boundary));
+                .join(publication_boundary_leaf(boundary));
+            let path = find_named_file(
+                &self.clients[0].mount_point,
+                Path::new(publication_boundary_leaf(boundary))
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(""),
+            )
+            .unwrap_or(path);
             use std::os::windows::fs::OpenOptionsExt as _;
             match OpenOptions::new()
                 .read(true)
@@ -9866,10 +10206,16 @@ mod tests {
             if !self.leak_premature_peer_file {
                 return Ok(());
             }
+            let source_path = find_named_file(&self.clients[0].mount_point, "flush.txt");
+            let relative_path = source_path
+                .as_ref()
+                .and_then(|path| path.strip_prefix(&self.clients[0].mount_point).ok())
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| {
+                    PathBuf::from(publication_boundary_leaf(PublicationBoundary::Flush))
+                });
             for peer in self.clients.iter().skip(1) {
-                let path = peer
-                    .mount_point
-                    .join(publication_boundary_file_name(PublicationBoundary::Flush));
+                let path = peer.mount_point.join(&relative_path);
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
@@ -9999,13 +10345,25 @@ mod tests {
     fn fault_chaos_initial_tree_rejects_stale_zero_byte_warmup_file() {
         let temp = tempdir().unwrap();
         let sandbox = temp.path().join("run-fault-chaos");
+        let context = ScenarioContext {
+            run_id: "run-fault-chaos".to_string(),
+            seed: 376,
+            sandbox: sandbox.clone(),
+            scenario_dir: sandbox
+                .join("artifacts")
+                .join("scenarios")
+                .join(MOUNTED_FAULT_CHAOS_CONVERGENCE),
+            client_controller_config: None,
+        };
         let mount = temp.path().join("mounts").join("client-a");
-        let stale_file = mount.join("fault-chaos").join("postgres-outage-local.txt");
+        let stale_file = mount
+            .join(run_unique_dir(&context, "fault-chaos"))
+            .join("postgres-outage-local.txt");
         std::fs::create_dir_all(stale_file.parent().unwrap()).unwrap();
         std::fs::write(&stale_file, []).unwrap();
         let client = client_spec_for(&sandbox, "projectfs", "client-a", mount);
 
-        let err = establish_fault_chaos_initial_tree(376, &client).unwrap_err();
+        let err = establish_fault_chaos_initial_tree(&context, &client).unwrap_err();
 
         assert!(
             matches!(&err, ScenarioError::Io(error) if error.kind() == io::ErrorKind::AlreadyExists),
@@ -10017,14 +10375,31 @@ mod tests {
     fn namespace_collision_initial_tree_rejects_stale_initial_file() {
         let temp = tempdir().unwrap();
         let sandbox = temp.path().join("run-collision");
+        let context = ScenarioContext {
+            run_id: "run-collision".to_string(),
+            seed: 328,
+            sandbox: sandbox.clone(),
+            scenario_dir: sandbox
+                .join("artifacts")
+                .join("scenarios")
+                .join(COLLISION_UNLINK_VS_APPEND),
+            client_controller_config: None,
+        };
         let mount = temp.path().join("mounts").join("client-a");
-        let stale_file = mount.join("shared").join("data.txt");
+        let stale_file = mount
+            .join(namespace_collision_root(&context))
+            .join("shared")
+            .join("data.txt");
         std::fs::create_dir_all(stale_file.parent().unwrap()).unwrap();
         std::fs::write(&stale_file, []).unwrap();
         let client = client_spec_for(&sandbox, "projectfs", "client-a", mount);
 
-        let err = establish_collision_initial_tree(NamespaceCollisionKind::UnlinkVsAppend, &client)
-            .unwrap_err();
+        let err = establish_collision_initial_tree(
+            &context,
+            NamespaceCollisionKind::UnlinkVsAppend,
+            &client,
+        )
+        .unwrap_err();
 
         assert!(
             matches!(&err, ScenarioError::Io(error) if error.kind() == io::ErrorKind::AlreadyExists),
@@ -10342,14 +10717,16 @@ mod tests {
         );
         let operations =
             read_operation_log(context.scenario_dir.join("operations.ndjson")).unwrap();
+        let root = namespace_collision_root(&context);
         assert!(operations.iter().any(|record| matches!(
             &record.operation,
             SharedOperation::Rename { from, to }
-                if from == "shared/file.txt" && to == "shared/renamed.txt"
+                if from == &format!("{root}/shared/file.txt")
+                    && to == &format!("{root}/shared/renamed.txt")
         )));
         assert!(operations.iter().any(|record| matches!(
             &record.operation,
-            SharedOperation::Unlink { path } if path == "shared/file.txt"
+            SharedOperation::Unlink { path } if path == &format!("{root}/shared/file.txt")
         )));
         assert!(
             context
@@ -10440,7 +10817,13 @@ mod tests {
     fn mounted_chaos_initial_files_are_written_through_durable_boundary() {
         let temp = tempdir().unwrap();
         let file_path = temp.path().join("chaos").join("data-01.txt");
-        let payload = chaos_payload(376, 1, "data-initial");
+        let context = test_context(
+            temp.path(),
+            "run-chaos-payload",
+            MOUNTED_CHAOS_CONVERGENCE,
+            376,
+        );
+        let payload = chaos_payload(&context, 1, "data-initial");
 
         write_mounted_chaos_initial_file(file_path.clone(), &payload).unwrap();
 
@@ -10453,7 +10836,13 @@ mod tests {
         let file_path = temp.path().join("chaos").join("delayed.txt");
         std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
         std::fs::write(&file_path, b"").unwrap();
-        let payload = chaos_payload(376, 7, "delayed-readback");
+        let context = test_context(
+            temp.path(),
+            "run-chaos-readback",
+            MOUNTED_CHAOS_CONVERGENCE,
+            376,
+        );
+        let payload = chaos_payload(&context, 7, "delayed-readback");
         let writer_path = file_path.clone();
         let writer_payload = payload.clone();
 
@@ -10914,7 +11303,15 @@ mod tests {
     fn namespace_collision_operation_timestamps_are_portable_u64_values() {
         fn accepts_u64(_value: u64) {}
 
+        let temp = tempdir().unwrap();
+        let context = test_context(
+            temp.path(),
+            "run-collision-plan",
+            COLLISION_RENAME_VS_UNLINK,
+            328,
+        );
         let operations = planned_namespace_collision_operations(
+            &context,
             NamespaceCollisionKind::RenameVsUnlink,
             Instant::now(),
         );
@@ -11116,6 +11513,7 @@ mod tests {
 
         let operations =
             read_operation_log(context.scenario_dir.join("operations.ndjson")).unwrap();
+        let hotspot_root = run_unique_dir(&context, "hotspot");
         assert!(operations.iter().any(|record| matches!(
             &record.operation,
             SharedOperation::CreateFile { path, .. } if path.starts_with("hotspot/")
@@ -11135,7 +11533,7 @@ mod tests {
         )));
         assert!(operations.iter().any(|record| matches!(
             &record.operation,
-            SharedOperation::Readdir { path } if path == "hotspot"
+            SharedOperation::Readdir { path } if path == &hotspot_root
         )));
         assert!(operations.iter().any(|record| matches!(
             &record.operation,
@@ -11159,13 +11557,13 @@ mod tests {
                 | SharedOperation::Read { path, .. }
                 | SharedOperation::Stat { path }
                 | SharedOperation::Readdir { path } =>
-                    path == "hotspot"
+                    path == &hotspot_root
                         || path
-                            .strip_prefix("hotspot/")
+                            .strip_prefix(&format!("{hotspot_root}/"))
                             .and_then(|rest| rest.split('/').next())
                             .is_some_and(|name| name.starts_with("slot-")),
                 SharedOperation::Rename { from, to } => [from, to].iter().all(|path| {
-                    path.strip_prefix("hotspot/")
+                    path.strip_prefix(&format!("{hotspot_root}/"))
                         .and_then(|rest| rest.split('/').next())
                         .is_some_and(|name| name.starts_with("slot-"))
                 }),
@@ -11210,9 +11608,15 @@ mod tests {
         .unwrap_err();
         assert!(payload_err.to_string().contains("unexpected payload"));
 
+        let context = test_context(
+            temp.path(),
+            "run-hotspot-probe",
+            MOUNTED_HOTSPOT_CHURN_CONVERGENCE,
+            376,
+        );
         std::fs::write(
             hotspot.join("slot-00.txt"),
-            hotspot_payload(376, 0, 0, "initial"),
+            hotspot_payload(&context, 0, 0, "initial"),
         )
         .unwrap();
         repeated_hotspot_probe(
@@ -11356,8 +11760,15 @@ mod tests {
 
     #[test]
     fn lww_reconnect_oracle_detects_converged_wrong_winner() {
-        let expected = lww_expected_winner(360, "client-c");
-        let wrong_checksum = bytes_sha256(&lww_reconnect_payload(360, "client-b", 2));
+        let temp = tempdir().unwrap();
+        let context = test_context(
+            temp.path(),
+            "run-lww-oracle",
+            MOUNTED_LWW_RECONNECT_CHAOS_CONVERGENCE,
+            360,
+        );
+        let expected = lww_expected_winner(&context, "client-c");
+        let wrong_checksum = bytes_sha256(&lww_reconnect_payload(&context, "client-b", 2));
         let snapshots = ["client-a", "client-b", "client-c"]
             .iter()
             .map(|client| crate::mounted_tree::MountedTreeSnapshot {
@@ -11365,7 +11776,7 @@ mod tests {
                 client: (*client).to_string(),
                 mount_point: format!("mounts/{client}"),
                 entries: vec![crate::mounted_tree::TreeEntry {
-                    path: LWW_RECONNECT_ORACLE_PATH.to_string(),
+                    path: expected.path.clone(),
                     entry_type: crate::mounted_tree::TreeEntryKind::File,
                     size: Some(expected.bytes),
                     modified_unix_ms: None,
@@ -11420,8 +11831,12 @@ mod tests {
         assert_eq!(
             driver.online_writer_barriers.into_inner(),
             vec![
-                Some(bytes_sha256(&lww_reconnect_payload(360, "client-a", 1))),
-                Some(bytes_sha256(&lww_reconnect_payload(360, "client-b", 2))),
+                Some(bytes_sha256(&lww_reconnect_payload(
+                    &context, "client-a", 1
+                ))),
+                Some(bytes_sha256(&lww_reconnect_payload(
+                    &context, "client-b", 2
+                ))),
             ],
             "the online-writer phase must wait for order 1 to become visible before order 2 is issued"
         );
@@ -11446,7 +11861,7 @@ mod tests {
             let source = clients
                 .iter()
                 .filter_map(|client| {
-                    let path = client.mount_point.join(LWW_RECONNECT_ORACLE_PATH);
+                    let path = find_test_lww_oracle_path(&client.mount_point)?;
                     let payload = std::fs::read(&path).ok()?;
                     Some((test_lww_oracle_order(&payload), path))
                 })
@@ -11454,9 +11869,14 @@ mod tests {
             let Some((_, source_path)) = source else {
                 return;
             };
-            let payload = std::fs::read(source_path).unwrap();
+            let payload = std::fs::read(&source_path).unwrap();
+            let relative_source_path = clients
+                .iter()
+                .find_map(|client| source_path.strip_prefix(&client.mount_point).ok())
+                .expect("source path must live under one of the client mounts")
+                .to_path_buf();
             for client in clients {
-                let target = client.mount_point.join(LWW_RECONNECT_ORACLE_PATH);
+                let target = client.mount_point.join(&relative_source_path);
                 std::fs::create_dir_all(target.parent().unwrap()).unwrap();
                 std::fs::write(target, &payload).unwrap();
             }
@@ -11532,8 +11952,8 @@ mod tests {
             }
             if phase == MountedLwwReconnectPhase::OnlineWriters {
                 let checksum = clients.first().and_then(|client| {
-                    std::fs::read(client.mount_point.join(LWW_RECONNECT_ORACLE_PATH))
-                        .ok()
+                    find_test_lww_oracle_path(&client.mount_point)
+                        .and_then(|path| std::fs::read(path).ok())
                         .map(|payload| bytes_sha256(&payload))
                 });
                 self.online_writer_barriers.borrow_mut().push(checksum);
@@ -11562,12 +11982,48 @@ mod tests {
         }
     }
 
+    fn collect_test_files(root: &Path, current: &Path, files: &mut Vec<(PathBuf, Vec<u8>)>) {
+        let Ok(entries) = std::fs::read_dir(current) else {
+            return;
+        };
+        for entry in entries {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.is_dir() {
+                collect_test_files(root, &path, files);
+            } else {
+                let relative_path = path.strip_prefix(root).unwrap().to_path_buf();
+                files.push((relative_path, std::fs::read(path).unwrap()));
+            }
+        }
+    }
+
     fn test_lww_oracle_order(payload: &[u8]) -> u32 {
         std::str::from_utf8(payload)
             .ok()
             .and_then(|text| text.split("oracle_order=").nth(1))
             .and_then(|suffix| suffix.trim().parse().ok())
             .unwrap_or(0)
+    }
+
+    fn find_test_lww_oracle_path(mount: &Path) -> Option<PathBuf> {
+        let root = mount.join("lww-chaos");
+        find_named_file(&root, "winner.txt")
+    }
+
+    fn find_named_file(root: &Path, name: &str) -> Option<PathBuf> {
+        for entry in std::fs::read_dir(root).ok()? {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(found) = find_named_file(&path, name) {
+                    return Some(found);
+                }
+            } else if entry.file_name() == name {
+                return Some(path);
+            }
+        }
+        None
     }
 
     #[test]
@@ -12533,12 +12989,15 @@ mod tests {
         .unwrap();
 
         assert_eq!(summary.bootstrap.init_client, "client-a");
-        assert_eq!(summary.outage_file, "studiofs-e2e-rustfs-outage.txt");
+        assert_eq!(
+            summary.outage_file,
+            "rustfs-outage/run-1/studiofs-e2e-rustfs-outage.txt"
+        );
         assert_eq!(
             summary.local_read_checksum_sha256,
             summary.final_checksum_sha256
         );
-        let initial_checksum = bytes_sha256(RUSTFS_OUTAGE_INITIAL_PAYLOAD);
+        let initial_checksum = bytes_sha256(&rustfs_outage_initial_payload(&context));
         assert_eq!(summary.peer_visibility_during_outage.len(), 3);
         assert!(summary.peer_visibility_during_outage.iter().all(|probe| {
             probe.visible_checksum_sha256.as_deref() == Some(initial_checksum.as_str())
@@ -12653,6 +13112,21 @@ mod tests {
     }
 
     #[test]
+    fn rustfs_outage_uses_run_unique_path_and_payload() {
+        let first = run_recorded_rustfs_outage_for_id("run-one");
+        let second = run_recorded_rustfs_outage_for_id("run-two");
+
+        assert_ne!(first.outage_file, second.outage_file);
+        assert!(first.outage_file.contains("run-one"));
+        assert!(second.outage_file.contains("run-two"));
+        assert_ne!(
+            first.local_read_checksum_sha256,
+            second.local_read_checksum_sha256
+        );
+        assert_ne!(first.final_checksum_sha256, second.final_checksum_sha256);
+    }
+
+    #[test]
     fn rustfs_outage_duration_excludes_peer_visibility_probe_latency() {
         let temp = tempdir().unwrap();
         let sandbox = temp.path().join("run-1");
@@ -12705,6 +13179,40 @@ mod tests {
         let err = assert_peer_not_visible(&peer, RUSTFS_OUTAGE_FILE_NAME, "forbidden").unwrap_err();
 
         assert!(matches!(err, ScenarioError::Io(_)));
+    }
+
+    fn run_recorded_rustfs_outage_for_id(run_id: &str) -> RustfsOutageRecoverySummary {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join(run_id);
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(RUSTFS_OUTAGE_MULTI_CLIENT_RECOVERY);
+        let clients = RUSTFS_OUTAGE_CLIENT_NAMES
+            .iter()
+            .copied()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(&mount).unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let mut driver = RecordingRustfsOutageDriver::new(clients);
+        let context = ScenarioContext {
+            run_id: run_id.to_string(),
+            seed: 326,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+
+        run_rustfs_outage_with_driver(
+            &context,
+            &mut driver,
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+        )
+        .unwrap()
     }
 
     #[test]
