@@ -87,8 +87,9 @@ portable without a real mount:
   metadata catch-up;
 - symlink target state and supported metadata attribute state behind explicit
   capability gates;
-- partial helper launch, hung helper, cleanup attempt, cleanup error, and
-  primary-error preservation for the infra-disabled runner model.
+- partial helper launch, hung helper timeout, cleanup sequencing, cleanup error
+  recording, and primary-error preservation for the infra-disabled runner
+  model.
 
 The v2 issue-ready checklist is:
 
@@ -98,7 +99,7 @@ The v2 issue-ready checklist is:
 | SFS-397 cold-observer long-history convergence | SFS-378 Level 13 cold-observer E2E | Model warm history, fresh cold observer state, tombstone/base replay, stale object references, duplicate canonical paths, and checksum/range convergence. |
 | SFS-398 invalidation dropout and fallback sync | SFS-379 Level 14 invalidation-dropout E2E | Model invalidation hints as lossy wakeups, fallback sync as the source-of-truth recovery path, bounded stale windows, and final convergence. |
 | SFS-399 symlink and metadata-attribute convergence | SFS-380 Level 15 symlink/attribute E2E | Model symlink target and metadata attribute state with explicit platform capabilities, plus races against rename, unlink, writes, and metadata delivery. |
-| SFS-400 adversarial runner cleanup and partial failure | SFS-381 Level 16 adversarial cleanup E2E | Model partial helper launch, hung helper timeout, best-effort reporting, cleanup sequencing, restricted cleanup targets, and primary-error preservation. |
+| SFS-400 adversarial runner cleanup and partial failure | SFS-381 Level 16 adversarial cleanup E2E | Model partial helper launch, hung helper timeout, best-effort report writing, cleanup sequencing, restricted cleanup targets, cleanup error recording, and primary-error preservation. |
 
 Each checklist item should remain independently implementable. A later mounted
 level should stay blocked until its deterministic slice is green and has a
