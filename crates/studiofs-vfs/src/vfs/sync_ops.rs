@@ -845,8 +845,9 @@ impl StudioVfs {
     }
 
     fn local_sync_policy_for_barrier(&self, ino: Ino) -> LocalSyncPolicy {
-        let has_pending_local_state =
-            self.inode_has_local_dirty_state(ino) || self.state.writer_stack.has_dirty_writers(ino);
+        let has_pending_local_state = self.inode_has_local_dirty_state(ino)
+            || self.state.writer_stack.has_dirty_writers(ino)
+            || self.total_pending_persisted_local_dirty_slice_bytes() > 0;
         if has_pending_local_state {
             LocalSyncPolicy::Strict
         } else {
@@ -1114,6 +1115,9 @@ impl StudioVfs {
             }
             if local_sync_policy.requires_write_path_durability() {
                 self.flush_local_dirty_state(ino, local_sync_policy).await?;
+                self.sync_meta()
+                    .flush_local_metadata()
+                    .map_err(VfsError::Meta)?;
             }
             Ok(written)
         }
@@ -1245,25 +1249,20 @@ impl StudioVfs {
                 // Durability-required: await writer-stack materialization inline.
                 self.wait_for_deferred_materialization_inflight(ino).await;
                 let materialize_strict_started = Instant::now();
-                let materialized_bytes = match self.materialize_writer_stack_for_limits(ino).await {
-                    Ok(materialized_bytes) => materialized_bytes,
-                    Err(e) => {
-                        drop(session);
-                        self.state.file_session.gc_if_idle(ino);
-                        return Err(e);
-                    }
-                };
+                let materialize_result = self.materialize_writer_stack_for_limits(ino).await;
                 self.record_vfs_write_materialize_strict(materialize_strict_started.elapsed());
-
-                if let Err(e) = self.flush_local_dirty_state(ino, local_sync_policy).await {
+                if let Err(e) = materialize_result {
                     drop(session);
                     self.state.file_session.gc_if_idle(ino);
                     return Err(e);
                 }
+
                 if let Err(e) = self
-                    .maybe_payload_store_sync_data_async(
-                        materialized_bytes as u64,
+                    .local_sync_barrier_with_outcome(
+                        ino,
                         local_sync_policy,
+                        StickyErrorPolicy::Ignore,
+                        DirtyAttrPersistPolicy::PersistIfPresent,
                     )
                     .await
                 {

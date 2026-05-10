@@ -1678,10 +1678,9 @@ impl FileSystemContext for StudioFsContext {
         // Current dirty-handle ordering is:
         //   write/overwrite -> optional flush -> cleanup(non-delete) -> close -> release_fh
         //
-        // Non-delete `cleanup` no longer owns a foreground barrier. It is
-        // still counted for observability, but dirty local state stays
-        // deferred until an explicit `flush` or the mandatory last-handle
-        // `close`/`release_fh` fallback drain.
+        // Non-delete `cleanup` mirrors WinFSP FUSE FlushOnCleanup semantics
+        // for the native API: dirty local state is drained before cleanup
+        // returns, while clean callbacks remain observable clean skips.
         self.handle_drain().cleanup(context, file_name, flags);
         if trace_callback {
             let path = match &path {
@@ -3200,7 +3199,7 @@ mod tests {
     }
 
     #[test]
-    fn buffered_write_cleanup_stays_observational_until_explicit_flush() {
+    fn buffered_write_cleanup_flushes_before_explicit_flush() {
         let (_tmp, vfs, ctx, _queue) = make_test_context("sfs-285-buffered-cleanup-flush");
         let attr = vfs
             .create(ROOT_INO, b"sfs-285-buffered-cleanup-flush.txt", 0, 0, 0o644)
@@ -3241,22 +3240,37 @@ mod tests {
             .expect("cleanup callback");
         let after_cleanup_callbacks = winfsp_callbacks(&vfs);
         let after_cleanup_barriers = winfsp_foreground_flushes(&vfs);
+        let after_cleanup_flush_calls = flush_barrier_calls(&vfs);
+        let after_cleanup_sync_calls = sync_data_calls(&vfs);
         assert_eq!(
             after_cleanup_callbacks.cleanup,
             callbacks_before.cleanup + 1,
             "non-delete cleanup should still be observable for buffered writes"
         );
         assert_eq!(
-            after_cleanup_barriers.cleanup, barriers_before.cleanup,
-            "non-delete cleanup must not reclaim foreground barrier ownership for buffered writes"
+            after_cleanup_barriers.cleanup,
+            barriers_before.cleanup + 1,
+            "non-delete cleanup should own the foreground barrier for dirty buffered writes"
         );
         assert_eq!(
             after_cleanup_barriers.cleanup_skipped_clean, barriers_before.cleanup_skipped_clean,
-            "non-delete cleanup should not be attributed as a clean-skip barrier"
+            "dirty cleanup should not be attributed as a clean-skip barrier"
         );
         assert!(
-            ctx.has_deferred_cleanup_hint(attr.ino),
-            "cleanup should defer buffered dirty state to explicit flush or last close"
+            !ctx.has_deferred_cleanup_hint(attr.ino),
+            "cleanup should clear any deferred cleanup hint after draining dirty state"
+        );
+        assert!(
+            !vfs.inode_has_local_dirty_state(attr.ino),
+            "cleanup should drain buffered local dirty state before returning"
+        );
+        assert!(
+            after_cleanup_flush_calls > flush_calls_before,
+            "cleanup should commit buffered dirty state through the metadata barrier"
+        );
+        assert!(
+            after_cleanup_sync_calls > sync_calls_before,
+            "cleanup should force local payload sync after buffered writes"
         );
 
         ctx.run_flush_callback(attr.ino, fh)
@@ -3267,22 +3281,27 @@ mod tests {
         );
         assert!(
             !vfs.inode_has_local_dirty_state(attr.ino),
-            "explicit flush should drain buffered local dirty state before returning"
+            "cleanup should already have drained buffered local dirty state"
         );
         let after_flush_barriers = winfsp_foreground_flushes(&vfs);
         let flush_calls_after = flush_barrier_calls(&vfs);
         let sync_calls_after = sync_data_calls(&vfs);
-        assert!(
-            after_flush_barriers.flush >= barriers_before.flush,
-            "explicit flush should not lose flush barrier accounting for buffered dirty state"
+        assert_eq!(
+            after_flush_barriers.flush, barriers_before.flush,
+            "explicit flush should not own a dirty barrier after cleanup drained the inode"
         );
-        assert!(
-            sync_calls_after > sync_calls_before,
-            "WinFSP writeback flush should force local payload sync after buffered writes"
+        assert_eq!(
+            after_flush_barriers.flush_skipped_clean,
+            barriers_before.flush_skipped_clean + 1,
+            "explicit flush should be attributed as a clean skip after cleanup"
         );
-        assert!(
-            flush_calls_after > flush_calls_before,
-            "explicit flush should commit buffered dirty state through the metadata barrier"
+        assert_eq!(
+            sync_calls_after, after_cleanup_sync_calls,
+            "clean explicit flush should not add another payload sync"
+        );
+        assert_eq!(
+            flush_calls_after, after_cleanup_flush_calls,
+            "clean explicit flush should not add another metadata barrier"
         );
         assert_eq!(
             vfs.write_path_observability_snapshot()
@@ -3300,7 +3319,7 @@ mod tests {
     }
 
     #[test]
-    fn buffered_write_last_handle_close_owns_fallback_barrier_after_cleanup() {
+    fn buffered_write_cleanup_owns_barrier_before_last_handle_close() {
         let (_tmp, vfs, ctx, _queue) = make_test_context("sfs-285-buffered-cleanup-close");
         let attr = vfs
             .create(ROOT_INO, b"sfs-285-buffered-cleanup-close.txt", 0, 0, 0o644)
@@ -3337,23 +3356,36 @@ mod tests {
         ctx.run_cleanup_non_delete_callback(attr.ino, fh)
             .expect("cleanup callback");
         assert!(
-            ctx.has_deferred_cleanup_hint(attr.ino),
-            "cleanup should defer buffered dirty state to last close"
+            !ctx.has_deferred_cleanup_hint(attr.ino),
+            "cleanup should drain buffered dirty state before last close"
+        );
+        let after_cleanup_barriers = winfsp_foreground_flushes(&vfs);
+        let flush_calls_after_cleanup = flush_barrier_calls(&vfs);
+        assert_eq!(
+            after_cleanup_barriers.cleanup,
+            barriers_before.cleanup + 1,
+            "cleanup should own the foreground barrier for buffered dirty state"
+        );
+        assert!(
+            flush_calls_after_cleanup > flush_calls_before,
+            "cleanup must run the local barrier before returning to WinFSP"
         );
 
         ctx.run_close_callback(attr.ino, fh);
         let after_close_barriers = winfsp_foreground_flushes(&vfs);
         assert_eq!(
-            after_close_barriers.cleanup, barriers_before.cleanup,
-            "cleanup should remain observational before buffered-write close fallback"
+            after_close_barriers.close, barriers_before.close,
+            "last-handle close should not own a second barrier after cleanup drained the inode"
         );
-        assert!(
-            after_close_barriers.close >= barriers_before.close,
-            "last-handle close should not lose foreground close accounting for buffered dirty state"
+        assert_eq!(
+            after_close_barriers.close_skipped_clean,
+            barriers_before.close_skipped_clean + 1,
+            "last-handle close should be attributed as a clean skip after cleanup"
         );
-        assert!(
-            flush_barrier_calls(&vfs) > flush_calls_before,
-            "last-handle close must run the local barrier before returning to WinFSP"
+        assert_eq!(
+            flush_barrier_calls(&vfs),
+            flush_calls_after_cleanup,
+            "last-handle close should not drain the inode again after cleanup"
         );
         assert!(
             {
@@ -3366,7 +3398,7 @@ mod tests {
                     .expect("read immediately after WinFSP close");
                 read.as_ref() == b"buffered-cleanup-close"
             },
-            "read immediately after deferred WinFSP close must still see buffered bytes"
+            "read immediately after WinFSP close must still see cleanup-drained bytes"
         );
         assert!(
             !vfs.inode_has_local_dirty_state(attr.ino),
@@ -3850,11 +3882,12 @@ mod tests {
         );
         assert_eq!(
             after_first_barriers.cleanup, barriers_before.cleanup,
-            "cleanup callback should no longer attribute a foreground barrier"
+            "clean cleanup callback should not attribute a foreground barrier"
         );
         assert_eq!(
-            after_first_barriers.cleanup_skipped_clean, barriers_before.cleanup_skipped_clean,
-            "cleanup callback should not be recorded as a clean-skip barrier either"
+            after_first_barriers.cleanup_skipped_clean,
+            barriers_before.cleanup_skipped_clean + 1,
+            "clean cleanup callback should be recorded as a clean-skip barrier"
         );
 
         ctx.run_cleanup_non_delete_callback(attr.ino, fh)
@@ -3871,8 +3904,9 @@ mod tests {
             "repeated cleanup callbacks should not add foreground barriers"
         );
         assert_eq!(
-            after_second_barriers.cleanup_skipped_clean, after_first_barriers.cleanup_skipped_clean,
-            "repeated cleanup callbacks should not create clean-skip attribution"
+            after_second_barriers.cleanup_skipped_clean,
+            after_first_barriers.cleanup_skipped_clean + 1,
+            "repeated clean cleanup callbacks should create clean-skip attribution"
         );
 
         let flush_calls_before_close = flush_barrier_calls(&vfs);
@@ -3929,7 +3963,12 @@ mod tests {
         );
         assert_eq!(
             after_cleanup_barriers.cleanup, barriers_before.cleanup,
-            "dirty-handle lifecycle should not attribute a foreground barrier to cleanup"
+            "clean dirty-handle lifecycle should not attribute a foreground barrier to cleanup"
+        );
+        assert_eq!(
+            after_cleanup_barriers.cleanup_skipped_clean,
+            barriers_before.cleanup_skipped_clean + 1,
+            "clean dirty-handle lifecycle cleanup should be attributed as a clean skip"
         );
 
         ctx.run_close_callback(attr.ino, fh);

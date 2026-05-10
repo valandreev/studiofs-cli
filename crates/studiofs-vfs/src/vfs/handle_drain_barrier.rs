@@ -78,6 +78,9 @@ pub trait BarrierObservabilityPort {
     fn note_flush_callback(&self);
 
     /// Function $name.
+    fn note_cleanup_barrier_outcome(&self, flushed_local_dirty_state: bool);
+
+    /// Function $name.
     fn note_flush_barrier_outcome(&self, flushed_local_dirty_state: bool);
 
     /// Function $name.
@@ -172,10 +175,24 @@ where
     /// Function $name.
     pub fn on_cleanup_non_delete(&self, request: HandleDrainRequest) {
         self.observability.note_cleanup_callback();
-        if request.fh != 0 && self.local_sync.inode_has_local_dirty_state(request.ino) {
+        if request.fh == 0 {
             self.deferred_cleanup_hints
-                .set_deferred_cleanup_hint(request.ino);
+                .clear_deferred_cleanup_hint(request.ino);
+            return;
         }
+        let flushed = self
+            .flush_gate
+            .with_flush_gate(request.ino, || {
+                if !self.local_sync.inode_has_local_dirty_state(request.ino) {
+                    return Ok(false);
+                }
+                let outcome = self.local_sync.explicit_flush(request)?;
+                Ok(outcome.flushed_local_dirty_state)
+            })
+            .unwrap_or(false);
+        self.observability.note_cleanup_barrier_outcome(flushed);
+        self.deferred_cleanup_hints
+            .clear_deferred_cleanup_hint(request.ino);
     }
 
     /// Function $name.
@@ -277,6 +294,7 @@ mod tests {
         cleanup_callbacks: AtomicUsize,
         flush_callbacks: AtomicUsize,
         close_callbacks: AtomicUsize,
+        cleanup_barrier_outcomes: Mutex<Vec<bool>>,
         flush_barrier_outcomes: Mutex<Vec<bool>>,
         release_successes: Mutex<Vec<(HandleDrainRequest, bool, ReleaseFhOutcome)>>,
         release_errors: Mutex<Vec<(HandleDrainRequest, bool, String)>>,
@@ -379,6 +397,12 @@ mod tests {
             self.flush_callbacks.fetch_add(1, Ordering::Relaxed);
         }
 
+        fn note_cleanup_barrier_outcome(&self, flushed_local_dirty_state: bool) {
+            self.cleanup_barrier_outcomes
+                .lock()
+                .push(flushed_local_dirty_state);
+        }
+
         fn note_flush_barrier_outcome(&self, flushed_local_dirty_state: bool) {
             self.flush_barrier_outcomes
                 .lock()
@@ -454,7 +478,7 @@ mod tests {
     }
 
     #[test]
-    fn non_delete_cleanup_defers_only_for_dirty_handles() {
+    fn non_delete_cleanup_flushes_dirty_handles() {
         let ports = Arc::new(FakePorts::default());
         ports.mark_dirty(13);
         let barrier = barrier(ports.clone());
@@ -462,9 +486,16 @@ mod tests {
         barrier.on_cleanup_non_delete(HandleDrainRequest { ino: 13, fh: 3 });
         barrier.on_cleanup_non_delete(HandleDrainRequest { ino: 14, fh: 0 });
 
-        assert!(ports.has_deferred_cleanup_hint(13));
+        assert!(!ports.inode_has_local_dirty_state(13));
+        assert!(!ports.has_deferred_cleanup_hint(13));
         assert!(!ports.has_deferred_cleanup_hint(14));
         assert_eq!(ports.cleanup_callbacks.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            ports.flush_calls.lock().as_slice(),
+            &[HandleDrainRequest { ino: 13, fh: 3 }]
+        );
+        assert_eq!(ports.cleanup_barrier_outcomes.lock().as_slice(), &[true]);
+        assert!(ports.flush_barrier_outcomes.lock().is_empty());
     }
 
     #[test]
@@ -523,7 +554,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_cleanup_callbacks_do_not_add_barriers() {
+    fn repeated_cleanup_callbacks_flush_once_then_clean_skip() {
         let ports = Arc::new(FakePorts::default());
         ports.mark_dirty(18);
         let barrier = barrier(ports.clone());
@@ -532,6 +563,11 @@ mod tests {
         barrier.on_cleanup_non_delete(HandleDrainRequest { ino: 18, fh: 2 });
 
         assert_eq!(ports.cleanup_callbacks.load(Ordering::Relaxed), 2);
+        assert_eq!(ports.flush_calls.lock().len(), 1);
+        assert_eq!(
+            ports.cleanup_barrier_outcomes.lock().as_slice(),
+            &[true, false]
+        );
         assert!(ports.flush_barrier_outcomes.lock().is_empty());
     }
 

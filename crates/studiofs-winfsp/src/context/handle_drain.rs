@@ -462,6 +462,12 @@ impl BarrierObservabilityPort for WinfspBarrierObservabilityPort<'_> {
         self.context.vfs.note_winfsp_flush_callback();
     }
 
+    fn note_cleanup_barrier_outcome(&self, flushed_local_dirty_state: bool) {
+        self.context
+            .vfs
+            .note_winfsp_cleanup_barrier_outcome(flushed_local_dirty_state);
+    }
+
     fn note_flush_barrier_outcome(&self, flushed_local_dirty_state: bool) {
         self.context
             .vfs
@@ -568,15 +574,16 @@ mod tests {
         );
         assert_eq!(
             barriers_after_cleanup.cleanup, barriers_before.cleanup,
-            "non-delete cleanup should no longer own a foreground barrier"
+            "clean non-delete cleanup should not own a foreground barrier"
         );
         assert_eq!(
-            barriers_after_cleanup.cleanup_skipped_clean, barriers_before.cleanup_skipped_clean,
-            "dirty cleanup should not be attributed as a clean-skip barrier either"
+            barriers_after_cleanup.cleanup_skipped_clean,
+            barriers_before.cleanup_skipped_clean + 1,
+            "clean cleanup should be attributed as a clean-skip barrier"
         );
         assert_eq!(
             flush_calls_after_cleanup, flush_calls_before,
-            "cleanup should not flush local dirty state before close"
+            "clean cleanup should not flush local dirty state before close"
         );
 
         facade.close(attr.ino, fh);
@@ -608,7 +615,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_cleanup_callbacks_do_not_add_foreground_flushes() {
+    fn concurrent_cleanup_callbacks_coalesce_foreground_flushes() {
         let (_tmp, vfs, ctx, _queue) = make_test_context("cleanup_defer_concurrent");
         let attr = vfs
             .create(ROOT_INO, b"coalesce.txt", 0, 0, 0o644)
@@ -658,16 +665,19 @@ mod tests {
             "all concurrent cleanup callbacks should still be observable"
         );
         assert_eq!(
-            barriers_after_cleanup.cleanup, barriers_before.cleanup,
-            "cleanup callbacks should not add foreground barriers"
+            barriers_after_cleanup.cleanup,
+            barriers_before.cleanup + 1,
+            "concurrent dirty cleanup callbacks should coalesce to one foreground barrier"
         );
         assert_eq!(
-            barriers_after_cleanup.cleanup_skipped_clean, barriers_before.cleanup_skipped_clean,
-            "cleanup callbacks should not add clean-skip barrier attribution"
+            barriers_after_cleanup.cleanup_skipped_clean,
+            barriers_before.cleanup_skipped_clean + 3,
+            "cleanup callbacks after the coalesced drain should be clean skips"
         );
         assert_eq!(
-            flush_calls_after_cleanup, flush_calls_before,
-            "cleanup callbacks should not trigger foreground flush work"
+            flush_calls_after_cleanup,
+            flush_calls_before + 1,
+            "cleanup callbacks should trigger only one foreground flush"
         );
 
         ctx.spawn_wait({
@@ -719,7 +729,12 @@ mod tests {
         );
         assert_eq!(
             barriers_after_cleanup.cleanup, barriers_before.cleanup,
-            "cleanup should not claim a foreground barrier before the explicit flush"
+            "clean cleanup should not claim a foreground barrier before the explicit flush"
+        );
+        assert_eq!(
+            barriers_after_cleanup.cleanup_skipped_clean,
+            barriers_before.cleanup_skipped_clean + 1,
+            "clean cleanup should be attributed as a clean skip"
         );
 
         facade.flush(attr.ino, fh).expect("explicit flush callback");

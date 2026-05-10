@@ -872,10 +872,7 @@ impl Scenario for MountedClientCrashRestartRecovery {
         let Some(config) = &context.client_controller_config else {
             return Err(ScenarioError::MissingComposeInfrastructure);
         };
-        let mut driver = RealCrashRestartDriver(MultiClientController::new(
-            config.clone(),
-            SystemClientProcessExecutor,
-        ));
+        let mut driver = RealCrashRestartDriver::new(config.clone());
         run_crash_restart_with_driver(
             context,
             &mut driver,
@@ -950,10 +947,7 @@ impl Scenario for MountedPublicationBoundaryCrashMatrix {
         let Some(config) = &context.client_controller_config else {
             return Err(ScenarioError::MissingComposeInfrastructure);
         };
-        let mut driver = RealPublicationBoundaryDriver(MultiClientController::new(
-            config.clone(),
-            SystemClientProcessExecutor,
-        ));
+        let mut driver = RealPublicationBoundaryDriver::new(config.clone());
         run_publication_boundary_crash_matrix_with_driver(
             context,
             &mut driver,
@@ -1859,6 +1853,7 @@ fn write_rustfs_outage_operation(
 }
 
 trait CrashRestartDriver {
+    fn start_mode(&mut self, mode: CrashRestartMode) -> Result<(), ScenarioError>;
     fn bootstrap_volume(
         &mut self,
         options: VolumeBootstrapOptions,
@@ -1878,34 +1873,53 @@ trait CrashRestartDriver {
     fn unmount_all(&mut self) -> Result<(), ScenarioError>;
 }
 
-struct RealCrashRestartDriver(MultiClientController<SystemClientProcessExecutor>);
+struct RealCrashRestartDriver {
+    base_config: ClientControllerConfig,
+    controller: MultiClientController<SystemClientProcessExecutor>,
+}
+
+impl RealCrashRestartDriver {
+    fn new(config: ClientControllerConfig) -> Self {
+        Self {
+            controller: MultiClientController::new(config.clone(), SystemClientProcessExecutor),
+            base_config: config,
+        }
+    }
+}
 
 impl CrashRestartDriver for RealCrashRestartDriver {
+    fn start_mode(&mut self, mode: CrashRestartMode) -> Result<(), ScenarioError> {
+        let mut config = self.base_config.clone();
+        config.volume_name = crash_restart_volume_name(&config.volume_name, mode);
+        self.controller = MultiClientController::new(config, SystemClientProcessExecutor);
+        Ok(())
+    }
+
     fn bootstrap_volume(
         &mut self,
         options: VolumeBootstrapOptions,
     ) -> Result<VolumeBootstrapSummary, ScenarioError> {
-        Ok(self.0.bootstrap_volume(options)?)
+        Ok(self.controller.bootstrap_volume(options)?)
     }
 
     fn mount_all(&mut self) -> Result<(), ScenarioError> {
-        Ok(self.0.mount_all()?)
+        Ok(self.controller.mount_all()?)
     }
 
     fn clients(&self) -> Vec<ClientSpec> {
-        self.0.clients().into_iter().cloned().collect()
+        self.controller.clients().into_iter().cloned().collect()
     }
 
     fn force_kill(&mut self, client: &str) -> Result<(), ScenarioError> {
-        Ok(self.0.force_kill(client)?)
+        Ok(self.controller.force_kill(client)?)
     }
 
     fn remount(&mut self, client: &str) -> Result<(), ScenarioError> {
-        Ok(self.0.remount(client)?)
+        Ok(self.controller.remount(client)?)
     }
 
     fn unmount_all(&mut self) -> Result<(), ScenarioError> {
-        Ok(self.0.unmount_all()?)
+        Ok(self.controller.unmount_all()?)
     }
 }
 
@@ -1944,15 +1958,15 @@ fn run_crash_restart_with_driver(
     poll_interval: Duration,
 ) -> Result<CrashRestartRecoverySummary, ScenarioError> {
     let result = run_crash_restart_body(context, driver, convergence_timeout, poll_interval);
-    let unmount_result = driver.unmount_all();
-    match (result, unmount_result) {
-        (Ok(summary), Ok(())) => Ok(summary),
-        (Err(primary), Err(cleanup)) => Err(ScenarioError::CrashRestartUnmountAfterFailure {
-            primary: primary.to_string(),
-            cleanup: cleanup.to_string(),
-        }),
-        (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
+    match result {
+        Ok(summary) => Ok(summary),
+        Err(primary) => match driver.unmount_all() {
+            Ok(()) => Err(primary),
+            Err(cleanup) => Err(ScenarioError::CrashRestartUnmountAfterFailure {
+                primary: primary.to_string(),
+                cleanup: cleanup.to_string(),
+            }),
+        },
     }
 }
 
@@ -1962,59 +1976,64 @@ fn run_crash_restart_body(
     convergence_timeout: Duration,
     poll_interval: Duration,
 ) -> Result<CrashRestartRecoverySummary, ScenarioError> {
-    let bootstrap = driver.bootstrap_volume(VolumeBootstrapOptions {
-        client_names: CRASH_RESTART_CLIENT_NAMES
-            .iter()
-            .map(|name| (*name).to_string())
-            .collect(),
-        clean_existing_local_metadata: true,
-    })?;
-    write_bootstrap_summary(context, &bootstrap)?;
+    let mut bootstrap = None;
+    let mut modes = Vec::new();
+    for (mode, payload_label) in [
+        (
+            CrashRestartMode::AfterLocalDurabilityBoundary,
+            "after-local-durability-boundary",
+        ),
+        (
+            CrashRestartMode::BeforeRemotePublicationCompletes,
+            "before-remote-publication-completes",
+        ),
+    ] {
+        driver.start_mode(mode)?;
+        let mode_bootstrap = driver.bootstrap_volume(VolumeBootstrapOptions {
+            client_names: CRASH_RESTART_CLIENT_NAMES
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
+            clean_existing_local_metadata: true,
+        })?;
+        if bootstrap.is_none() {
+            write_bootstrap_summary(context, &mode_bootstrap)?;
+            bootstrap = Some(mode_bootstrap);
+        }
 
-    driver.mount_all()?;
-    let clients = driver.clients();
-    if clients.len() < CRASH_RESTART_CLIENT_NAMES.len() {
-        return Err(ScenarioError::InsufficientCrashRestartClients {
-            expected: CRASH_RESTART_CLIENT_NAMES.len(),
-            actual: clients.len(),
-        });
+        driver.mount_all()?;
+        let clients = driver.clients();
+        if clients.len() < CRASH_RESTART_CLIENT_NAMES.len() {
+            return Err(ScenarioError::InsufficientCrashRestartClients {
+                expected: CRASH_RESTART_CLIENT_NAMES.len(),
+                actual: clients.len(),
+            });
+        }
+        modes.push(run_crash_restart_mode(
+            context,
+            driver,
+            &clients,
+            mode,
+            &crash_restart_relative_path(context, mode),
+            &run_unique_payload(
+                context,
+                MOUNTED_CLIENT_CRASH_RESTART_RECOVERY,
+                payload_label,
+            ),
+            convergence_timeout,
+            poll_interval,
+        )?);
+        driver.unmount_all()?;
     }
 
-    let modes = vec![
-        run_crash_restart_mode(
-            context,
-            driver,
-            &clients,
-            CrashRestartMode::AfterLocalDurabilityBoundary,
-            &crash_restart_relative_path(context, CrashRestartMode::AfterLocalDurabilityBoundary),
-            &run_unique_payload(
-                context,
-                MOUNTED_CLIENT_CRASH_RESTART_RECOVERY,
-                "after-local-durability-boundary",
-            ),
-            convergence_timeout,
-            poll_interval,
-        )?,
-        run_crash_restart_mode(
-            context,
-            driver,
-            &clients,
-            CrashRestartMode::BeforeRemotePublicationCompletes,
-            &crash_restart_relative_path(
-                context,
-                CrashRestartMode::BeforeRemotePublicationCompletes,
-            ),
-            &run_unique_payload(
-                context,
-                MOUNTED_CLIENT_CRASH_RESTART_RECOVERY,
-                "before-remote-publication-completes",
-            ),
-            convergence_timeout,
-            poll_interval,
-        )?,
-    ];
-
-    let summary = CrashRestartRecoverySummary { bootstrap, modes };
+    let summary = CrashRestartRecoverySummary {
+        bootstrap: bootstrap.ok_or_else(|| {
+            ScenarioError::Io(std::io::Error::other(
+                "crash-restart recovery did not execute any modes",
+            ))
+        })?,
+        modes,
+    };
     fs::write(
         context
             .scenario_dir
@@ -2144,6 +2163,7 @@ fn write_crash_restart_operation(
 }
 
 trait PublicationBoundaryDriver {
+    fn start_boundary(&mut self, boundary: PublicationBoundary) -> Result<(), ScenarioError>;
     fn bootstrap_volume(
         &mut self,
         options: VolumeBootstrapOptions,
@@ -2164,34 +2184,53 @@ trait PublicationBoundaryDriver {
     fn unmount_all(&mut self) -> Result<(), ScenarioError>;
 }
 
-struct RealPublicationBoundaryDriver(MultiClientController<SystemClientProcessExecutor>);
+struct RealPublicationBoundaryDriver {
+    base_config: ClientControllerConfig,
+    controller: MultiClientController<SystemClientProcessExecutor>,
+}
+
+impl RealPublicationBoundaryDriver {
+    fn new(config: ClientControllerConfig) -> Self {
+        Self {
+            controller: MultiClientController::new(config.clone(), SystemClientProcessExecutor),
+            base_config: config,
+        }
+    }
+}
 
 impl PublicationBoundaryDriver for RealPublicationBoundaryDriver {
+    fn start_boundary(&mut self, boundary: PublicationBoundary) -> Result<(), ScenarioError> {
+        let mut config = self.base_config.clone();
+        config.volume_name = publication_boundary_volume_name(&config.volume_name, boundary);
+        self.controller = MultiClientController::new(config, SystemClientProcessExecutor);
+        Ok(())
+    }
+
     fn bootstrap_volume(
         &mut self,
         options: VolumeBootstrapOptions,
     ) -> Result<VolumeBootstrapSummary, ScenarioError> {
-        Ok(self.0.bootstrap_volume(options)?)
+        Ok(self.controller.bootstrap_volume(options)?)
     }
 
     fn mount_all(&mut self) -> Result<(), ScenarioError> {
-        Ok(self.0.mount_all()?)
+        Ok(self.controller.mount_all()?)
     }
 
     fn clients(&self) -> Vec<ClientSpec> {
-        self.0.clients().into_iter().cloned().collect()
+        self.controller.clients().into_iter().cloned().collect()
     }
 
     fn force_kill(&mut self, client: &str) -> Result<(), ScenarioError> {
-        Ok(self.0.force_kill(client)?)
+        Ok(self.controller.force_kill(client)?)
     }
 
     fn graceful_shutdown(&mut self, client: &str) -> Result<(), ScenarioError> {
-        Ok(self.0.unmount(client)?)
+        Ok(self.controller.unmount(client)?)
     }
 
     fn remount(&mut self, client: &str) -> Result<(), ScenarioError> {
-        Ok(self.0.remount(client)?)
+        Ok(self.controller.remount(client)?)
     }
 
     fn publish_for_convergence(
@@ -2202,7 +2241,7 @@ impl PublicationBoundaryDriver for RealPublicationBoundaryDriver {
     ) -> Result<(), ScenarioError> {
         let mut errors = Vec::new();
         for peer in clients.iter().skip(1) {
-            if let Err(error) = self.0.restart(&peer.name) {
+            if let Err(error) = self.controller.restart(&peer.name) {
                 errors.push(format!("{}: {error}", peer.name));
             }
         }
@@ -2216,7 +2255,7 @@ impl PublicationBoundaryDriver for RealPublicationBoundaryDriver {
     }
 
     fn unmount_all(&mut self) -> Result<(), ScenarioError> {
-        Ok(self.0.unmount_all()?)
+        Ok(self.controller.unmount_all()?)
     }
 }
 
@@ -2269,17 +2308,15 @@ fn run_publication_boundary_crash_matrix_with_driver(
         convergence_timeout,
         poll_interval,
     );
-    let unmount_result = driver.unmount_all();
-    match (result, unmount_result) {
-        (Ok(summary), Ok(())) => Ok(summary),
-        (Err(primary), Err(cleanup)) => {
-            Err(ScenarioError::PublicationBoundaryUnmountAfterFailure {
+    match result {
+        Ok(summary) => Ok(summary),
+        Err(primary) => match driver.unmount_all() {
+            Ok(()) => Err(primary),
+            Err(cleanup) => Err(ScenarioError::PublicationBoundaryUnmountAfterFailure {
                 primary: primary.to_string(),
                 cleanup: cleanup.to_string(),
-            })
-        }
-        (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
+            }),
+        },
     }
 }
 
@@ -2289,24 +2326,7 @@ fn run_publication_boundary_crash_matrix_body(
     convergence_timeout: Duration,
     poll_interval: Duration,
 ) -> Result<PublicationBoundaryCrashMatrixSummary, ScenarioError> {
-    let bootstrap = driver.bootstrap_volume(VolumeBootstrapOptions {
-        client_names: PUBLICATION_BOUNDARY_CLIENT_NAMES
-            .iter()
-            .map(|name| (*name).to_string())
-            .collect(),
-        clean_existing_local_metadata: true,
-    })?;
-    write_bootstrap_summary(context, &bootstrap)?;
-
-    driver.mount_all()?;
-    let clients = driver.clients();
-    if clients.len() < PUBLICATION_BOUNDARY_CLIENT_NAMES.len() {
-        return Err(ScenarioError::InsufficientPublicationBoundaryClients {
-            expected: PUBLICATION_BOUNDARY_CLIENT_NAMES.len(),
-            actual: clients.len(),
-        });
-    }
-
+    let mut bootstrap = None;
     let mut boundaries = Vec::new();
     for boundary in [
         PublicationBoundary::Flush,
@@ -2314,6 +2334,27 @@ fn run_publication_boundary_crash_matrix_body(
         PublicationBoundary::ReleaseClose,
         PublicationBoundary::ShutdownDrain,
     ] {
+        driver.start_boundary(boundary)?;
+        let boundary_bootstrap = driver.bootstrap_volume(VolumeBootstrapOptions {
+            client_names: PUBLICATION_BOUNDARY_CLIENT_NAMES
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
+            clean_existing_local_metadata: true,
+        })?;
+        if bootstrap.is_none() {
+            write_bootstrap_summary(context, &boundary_bootstrap)?;
+            bootstrap = Some(boundary_bootstrap);
+        }
+
+        driver.mount_all()?;
+        let clients = driver.clients();
+        if clients.len() < PUBLICATION_BOUNDARY_CLIENT_NAMES.len() {
+            return Err(ScenarioError::InsufficientPublicationBoundaryClients {
+                expected: PUBLICATION_BOUNDARY_CLIENT_NAMES.len(),
+                actual: clients.len(),
+            });
+        }
         boundaries.push(run_publication_boundary(
             context,
             driver,
@@ -2322,11 +2363,16 @@ fn run_publication_boundary_crash_matrix_body(
             convergence_timeout,
             poll_interval,
         )?);
+        driver.unmount_all()?;
     }
 
     let summary = PublicationBoundaryCrashMatrixSummary {
         scenario: MOUNTED_PUBLICATION_BOUNDARY_CRASH_MATRIX.to_string(),
-        bootstrap,
+        bootstrap: bootstrap.ok_or_else(|| {
+            ScenarioError::Io(std::io::Error::other(
+                "publication boundary matrix did not execute any boundaries",
+            ))
+        })?,
         boundaries,
     };
     fs::write(
@@ -2531,7 +2577,7 @@ fn apply_publication_boundary(
         }
         PublicationBoundary::ShutdownDrain => {
             file.sync_all()?;
-            Ok(None)
+            Ok(Some(file))
         }
     }
 }
@@ -2813,6 +2859,16 @@ fn publication_boundary_slug(boundary: PublicationBoundary) -> &'static str {
         PublicationBoundary::ReleaseClose => "release-close",
         PublicationBoundary::ShutdownDrain => "shutdown-drain",
     }
+}
+
+fn publication_boundary_volume_name(
+    base_volume_name: &str,
+    boundary: PublicationBoundary,
+) -> String {
+    format!(
+        "{base_volume_name}-{}",
+        publication_boundary_slug(boundary).replace('_', "-")
+    )
 }
 
 fn publication_boundary_log_name(boundary: PublicationBoundary) -> &'static str {
@@ -9353,6 +9409,10 @@ fn crash_restart_mode_slug(mode: CrashRestartMode) -> &'static str {
     }
 }
 
+fn crash_restart_volume_name(base_volume_name: &str, mode: CrashRestartMode) -> String {
+    format!("{base_volume_name}-{}", crash_restart_mode_slug(mode))
+}
+
 fn crash_restart_mode_log_name(mode: CrashRestartMode) -> &'static str {
     match mode {
         CrashRestartMode::AfterLocalDurabilityBoundary => "after_local_durability_boundary",
@@ -9973,6 +10033,13 @@ mod tests {
     }
 
     impl CrashRestartDriver for RecordingCrashRestartDriver {
+        fn start_mode(&mut self, mode: CrashRestartMode) -> Result<(), ScenarioError> {
+            self.actions
+                .borrow_mut()
+                .push(format!("start_{}", crash_restart_mode_log_name(mode)));
+            Ok(())
+        }
+
         fn bootstrap_volume(
             &mut self,
             options: VolumeBootstrapOptions,
@@ -10146,6 +10213,13 @@ mod tests {
     }
 
     impl PublicationBoundaryDriver for RecordingPublicationBoundaryDriver {
+        fn start_boundary(&mut self, boundary: PublicationBoundary) -> Result<(), ScenarioError> {
+            self.actions
+                .borrow_mut()
+                .push(format!("start_{}", publication_boundary_log_name(boundary)));
+            Ok(())
+        }
+
         fn bootstrap_volume(
             &mut self,
             options: VolumeBootstrapOptions,
@@ -10201,6 +10275,8 @@ mod tests {
             self.actions
                 .borrow_mut()
                 .push(format!("graceful_shutdown_{client}"));
+            #[cfg(windows)]
+            self.assert_boundary_handle_is_open_during_kill()?;
             self.maybe_leak_premature_peer_file()?;
             Ok(())
         }
@@ -12164,10 +12240,15 @@ mod tests {
         assert_eq!(
             driver.actions.borrow().as_slice(),
             [
+                "start_after_local_durability_boundary",
                 "bootstrap",
                 "mount_all",
                 "force_kill_client-a",
                 "remount_client-a",
+                "unmount_all",
+                "start_before_remote_publication_completes",
+                "bootstrap",
+                "mount_all",
                 "force_kill_client-a",
                 "remount_client-a",
                 "unmount_all",
@@ -12198,6 +12279,20 @@ mod tests {
                 .get("mode")
                 .is_some_and(|mode| mode == "before_remote_publication_completes")
         }));
+    }
+
+    #[test]
+    fn crash_restart_volume_names_are_unique_per_mode() {
+        let base = "2c28f3c5-7d67-42fb-8071-6a768aa86b7c";
+
+        assert_eq!(
+            crash_restart_volume_name(base, CrashRestartMode::AfterLocalDurabilityBoundary),
+            "2c28f3c5-7d67-42fb-8071-6a768aa86b7c-after-local-durability-boundary"
+        );
+        assert_eq!(
+            crash_restart_volume_name(base, CrashRestartMode::BeforeRemotePublicationCompletes),
+            "2c28f3c5-7d67-42fb-8071-6a768aa86b7c-before-remote-publication-completes"
+        );
     }
 
     #[cfg(windows)]
@@ -12477,6 +12572,7 @@ mod tests {
         assert_eq!(
             driver.actions.borrow().as_slice(),
             [
+                "start_flush",
                 "bootstrap",
                 "mount_all",
                 "force_kill_client-a",
@@ -12484,16 +12580,28 @@ mod tests {
                 "publish_flush",
                 "refresh_client-b_for_convergence",
                 "refresh_client-c_for_convergence",
+                "unmount_all",
+                "start_fsync",
+                "bootstrap",
+                "mount_all",
                 "force_kill_client-a",
                 "remount_client-a",
                 "publish_fsync",
                 "refresh_client-b_for_convergence",
                 "refresh_client-c_for_convergence",
+                "unmount_all",
+                "start_release_close",
+                "bootstrap",
+                "mount_all",
                 "force_kill_client-a",
                 "remount_client-a",
                 "publish_release_close",
                 "refresh_client-b_for_convergence",
                 "refresh_client-c_for_convergence",
+                "unmount_all",
+                "start_shutdown_drain",
+                "bootstrap",
+                "mount_all",
                 "graceful_shutdown_client-a",
                 "remount_client-a",
                 "publish_shutdown_drain",
@@ -12691,6 +12799,48 @@ mod tests {
         .unwrap();
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn publication_boundary_shutdown_drain_keeps_handle_open_until_graceful_shutdown() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp
+            .path()
+            .join("run-publication-boundary-shutdown-handle-lifetime");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(MOUNTED_PUBLICATION_BOUNDARY_CRASH_MATRIX);
+        std::fs::create_dir_all(&scenario_dir).unwrap();
+        let clients = PUBLICATION_BOUNDARY_CLIENT_NAMES
+            .iter()
+            .copied()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(&mount).unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let mut driver = RecordingPublicationBoundaryDriver::new(clients.clone())
+            .require_open_boundary_handle_during_kill(PublicationBoundary::ShutdownDrain);
+        let context = ScenarioContext {
+            run_id: "run-publication-boundary-shutdown-handle-lifetime".to_string(),
+            seed: 375,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+
+        run_publication_boundary(
+            &context,
+            &mut driver,
+            &clients,
+            PublicationBoundary::ShutdownDrain,
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn publication_boundary_refresh_attempts_all_peers_before_reporting_failure() {
         let temp = tempdir().unwrap();
@@ -12772,6 +12922,24 @@ mod tests {
             .as_slice(),
             [SharedOperation::Fsync { path }] if path == "boundary/file.txt"
         ));
+    }
+
+    #[test]
+    fn publication_boundary_volume_names_are_unique_per_boundary() {
+        let base = "2c28f3c5-7d67-42fb-8071-6a768aa86b7c";
+
+        assert_eq!(
+            publication_boundary_volume_name(base, PublicationBoundary::Flush),
+            "2c28f3c5-7d67-42fb-8071-6a768aa86b7c-flush"
+        );
+        assert_eq!(
+            publication_boundary_volume_name(base, PublicationBoundary::ReleaseClose),
+            "2c28f3c5-7d67-42fb-8071-6a768aa86b7c-release-close"
+        );
+        assert_eq!(
+            publication_boundary_volume_name(base, PublicationBoundary::ShutdownDrain),
+            "2c28f3c5-7d67-42fb-8071-6a768aa86b7c-shutdown-drain"
+        );
     }
 
     struct FakeDrainExecutor {
