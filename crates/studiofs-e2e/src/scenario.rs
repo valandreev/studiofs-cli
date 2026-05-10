@@ -2377,7 +2377,11 @@ fn run_publication_boundary(
     )?;
     if local_read_payload != payload {
         return Err(ScenarioError::Io(std::io::Error::other(format!(
-            "publication boundary durability failure: data read after restart does not match written payload for {relative_path}"
+            "publication boundary durability failure: data read after restart does not match written payload for {relative_path}: expected_len={} expected_checksum={} actual_len={} actual_checksum={}",
+            payload.len(),
+            bytes_sha256(&payload),
+            local_read_payload.len(),
+            bytes_sha256(&local_read_payload)
         ))));
     }
     let local_read_checksum_sha256 = bytes_sha256(&local_read_payload);
