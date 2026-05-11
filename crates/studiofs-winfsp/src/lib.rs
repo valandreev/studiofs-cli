@@ -205,6 +205,8 @@ fn parse_mount_options(volume_label: &str) -> Result<WinfspMountOptions, MountOp
         "STUDIOFS_WINFSP_FLUSH_AND_PURGE_ON_CLEANUP",
         DEFAULT_FLUSH_AND_PURGE_ON_CLEANUP,
     );
+    let persistent_acls =
+        parse_bool_env("STUDIOFS_WINFSP_PERSISTENT_ACLS", DEFAULT_PERSISTENT_ACLS);
 
     Ok(WinfspMountOptions {
         volume_label: trimmed.to_string(),
@@ -216,7 +218,7 @@ fn parse_mount_options(volume_label: &str) -> Result<WinfspMountOptions, MountOp
         dispatcher_threads,
         allow_open_in_kernel_mode,
         flush_and_purge_on_cleanup,
-        persistent_acls: DEFAULT_PERSISTENT_ACLS,
+        persistent_acls,
     })
 }
 
@@ -765,7 +767,6 @@ mod tests {
             opts.flush_and_purge_on_cleanup,
             DEFAULT_FLUSH_AND_PURGE_ON_CLEANUP
         );
-        assert_eq!(opts.persistent_acls, DEFAULT_PERSISTENT_ACLS);
     }
 
     #[test]
@@ -778,10 +779,30 @@ mod tests {
         }
 
         let opts = parse_mount_options("StudioFS").expect("options");
+        assert_eq!(opts.persistent_acls, DEFAULT_PERSISTENT_ACLS);
+        assert!(!opts.persistent_acls);
+    }
+
+    #[test]
+    fn parse_mount_options_allows_persistent_acls_override() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        // SAFETY: Tests are single-threaded via `_guard` and temporarily mutate
+        // process environment variables for deterministic parsing behavior.
+        unsafe {
+            std::env::set_var("STUDIOFS_WINFSP_PERSISTENT_ACLS", "1");
+        }
+
+        let opts = parse_mount_options("StudioFS").expect("options");
         assert!(
-            !opts.persistent_acls,
-            "StudioFS must not advertise persistent ACLs until it preserves and enforces per-file ACLs"
+            opts.persistent_acls,
+            "explicit diagnostics override should be able to advertise persistent ACLs"
         );
+
+        // SAFETY: Tests are single-threaded via `_guard` and restore environment
+        // variables that were written earlier in the test.
+        unsafe {
+            std::env::remove_var("STUDIOFS_WINFSP_PERSISTENT_ACLS");
+        }
     }
 
     #[test]
