@@ -1875,7 +1875,7 @@ mod tests {
     #[test]
     fn resolve_read_metadata_async_reuses_dirty_attr_read_plan_when_local_dirty_is_drained() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let (rt, vfs, meta) = make_test_vfs(&tmp, "read-metadata-dirty-plan-cache");
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "read-metadata-dirty-plan-cache");
         let _guard = rt.enter();
         rt.block_on(async {
             let created = vfs
