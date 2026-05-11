@@ -47,6 +47,9 @@ const SMOKE_FILE_PAYLOAD: &[u8] = b"studiofs e2e mounted multi-client smoke\n";
 const SMOKE_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(30);
 const SMOKE_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const OUTAGE_INITIAL_FILE_NAME: &str = "studiofs-e2e-outage-initial.txt";
+const POSTGRES_OUTAGE_FILE_NAME: &str = "studiofs-e2e-postgres-outage-writer.txt";
+const POSTGRES_OUTAGE_RECOVERED_PAYLOAD: &[u8] =
+    b"accepted writer-local PostgreSQL outage payload\n";
 const OUTAGE_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(60);
 const OUTAGE_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const RUSTFS_OUTAGE_FILE_NAME: &str = "studiofs-e2e-rustfs-outage.txt";
@@ -115,6 +118,16 @@ pub enum ScenarioError {
     MissingRunManifest { path: PathBuf },
     #[error("PostgreSQL outage operations rejected {rejected} of {total} expected local writes")]
     RejectedOutageOperations { rejected: usize, total: usize },
+    #[error("PostgreSQL outage writer recovery failed for {client}:{path}: {detail}")]
+    PostgresOutageWriterRecoveryFailed {
+        client: String,
+        path: String,
+        detail: String,
+    },
+    #[error("PostgreSQL outage writer publication failed for {client}: {detail}")]
+    PostgresOutageWriterPublicationFailed { client: String, detail: String },
+    #[error("PostgreSQL outage peer convergence failed after writer publication: {detail}")]
+    PostgresOutagePeerConvergenceFailed { detail: String },
     #[error("peer client observed the RustFS/S3 outage write before recovery: {checksum}")]
     PeerObservedOutageWrite { checksum: String },
     #[error("mounted smoke scenario requires at least {expected} clients, got {actual}")]
@@ -368,7 +381,12 @@ impl Scenario for PostgresOutageMultiClientRecovery {
             "status": if summary.final_validator.converged { "passed" } else { "failed" },
             "outage_duration_ms": summary.outage_duration_ms,
             "recovery_time_ms": summary.recovery_time_ms,
+            "writer_recovery_client": summary.writer_recovery_client,
+            "writer_recovery_time_ms": summary.writer_recovery_time_ms,
+            "writer_recovery_checksum_sha256": summary.writer_recovery_checksum_sha256,
+            "peer_observation_time_ms": summary.peer_observation_time_ms,
             "operations_accepted_during_outage": summary.operations_accepted_during_outage,
+            "peer_observation_validator": summary.peer_observation_validator,
             "final_validator": summary.final_validator,
         });
         fs::write(
@@ -727,6 +745,8 @@ trait PostgresOutageDriver {
     fn clients(&self) -> Vec<ClientSpec>;
     fn stop_postgres(&mut self) -> Result<(), ScenarioError>;
     fn start_postgres(&mut self) -> Result<(), ScenarioError>;
+    fn force_kill(&mut self, client: &str) -> Result<(), ScenarioError>;
+    fn remount(&mut self, client: &str) -> Result<(), ScenarioError>;
     fn unmount_all(&mut self) -> Result<(), ScenarioError>;
 }
 
@@ -764,6 +784,14 @@ impl<E: CommandExecutor> PostgresOutageDriver for RealPostgresOutageDriver<E> {
             .start_service(POSTGRES_SERVICE_NAME, &self.executor)?)
     }
 
+    fn force_kill(&mut self, client: &str) -> Result<(), ScenarioError> {
+        Ok(self.controller.force_kill(client)?)
+    }
+
+    fn remount(&mut self, client: &str) -> Result<(), ScenarioError> {
+        Ok(self.controller.remount(client)?)
+    }
+
     fn unmount_all(&mut self) -> Result<(), ScenarioError> {
         Ok(self.controller.unmount_all()?)
     }
@@ -781,8 +809,14 @@ struct OutageOperationRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PostgresOutageRecoverySummary {
     bootstrap: VolumeBootstrapSummary,
+    outage_file: String,
     outage_duration_ms: u128,
     operations_accepted_during_outage: usize,
+    writer_recovery_client: String,
+    writer_recovery_time_ms: u128,
+    writer_recovery_checksum_sha256: String,
+    peer_observation_time_ms: u128,
+    peer_observation_validator: TreeComparison,
     recovery_time_ms: u128,
     final_validator: TreeComparison,
 }
@@ -835,32 +869,79 @@ fn run_postgres_outage_body(
         b"initial healthy PostgreSQL write\n",
     )?;
 
+    let writer = &clients[0];
     let outage_started = Instant::now();
     driver.stop_postgres()?;
-    let accepted_operations = perform_outage_operations(context, &clients[1..3])?;
-    let outage_duration_ms = outage_started.elapsed().as_millis();
+    let accepted_operations = perform_postgres_writer_outage_operation(
+        context,
+        writer,
+        POSTGRES_OUTAGE_FILE_NAME,
+        POSTGRES_OUTAGE_RECOVERED_PAYLOAD,
+    )?;
+    driver.force_kill(&writer.name)?;
+    let outage_duration_ms = elapsed_millis_nonzero(outage_started);
 
     // `start_postgres` uses `docker compose up --wait`, so this includes
     // PostgreSQL healthcheck readiness before mounted convergence polling.
     let recovery_started = Instant::now();
     driver.start_postgres()?;
+    let writer_recovery_started = Instant::now();
+    driver.remount(&writer.name).map_err(|error| {
+        ScenarioError::PostgresOutageWriterPublicationFailed {
+            client: writer.name.clone(),
+            detail: error.to_string(),
+        }
+    })?;
+    let writer_payload =
+        fs::read(writer.mount_point.join(POSTGRES_OUTAGE_FILE_NAME)).map_err(|error| {
+            ScenarioError::PostgresOutageWriterRecoveryFailed {
+                client: writer.name.clone(),
+                path: POSTGRES_OUTAGE_FILE_NAME.to_string(),
+                detail: error.to_string(),
+            }
+        })?;
+    if writer_payload != POSTGRES_OUTAGE_RECOVERED_PAYLOAD {
+        return Err(ScenarioError::PostgresOutageWriterRecoveryFailed {
+            client: writer.name.clone(),
+            path: POSTGRES_OUTAGE_FILE_NAME.to_string(),
+            detail: format!(
+                "recovered payload differs: expected {} bytes, got {} bytes",
+                POSTGRES_OUTAGE_RECOVERED_PAYLOAD.len(),
+                writer_payload.len()
+            ),
+        });
+    }
+    let writer_recovery_time_ms = elapsed_millis_nonzero(writer_recovery_started);
+    let writer_recovery_checksum_sha256 = bytes_sha256(&writer_payload);
     let mounts = clients
         .iter()
         .take(POSTGRES_OUTAGE_CLIENT_NAMES.len())
         .map(|client| ClientMount::new(client.name.clone(), client.mount_point.clone()))
         .collect::<Vec<_>>();
+    let peer_observation_started = Instant::now();
     let convergence = wait_for_convergence(
         &mounts,
         context.scenario_dir.join("validation"),
         convergence_timeout,
         poll_interval,
-    )?;
-    let recovery_time_ms = recovery_started.elapsed().as_millis();
+    )
+    .map_err(|error| ScenarioError::PostgresOutagePeerConvergenceFailed {
+        detail: error.to_string(),
+    })?;
+    let peer_observation_time_ms = elapsed_millis_nonzero(peer_observation_started);
+    let recovery_time_ms = elapsed_millis_nonzero(recovery_started);
+    let peer_observation_validator = convergence.comparison.clone();
 
     let summary = PostgresOutageRecoverySummary {
         bootstrap,
+        outage_file: POSTGRES_OUTAGE_FILE_NAME.to_string(),
         outage_duration_ms,
         operations_accepted_during_outage: accepted_operations,
+        writer_recovery_client: writer.name.clone(),
+        writer_recovery_time_ms,
+        writer_recovery_checksum_sha256,
+        peer_observation_time_ms,
+        peer_observation_validator,
         recovery_time_ms,
         final_validator: convergence.comparison,
     };
@@ -873,9 +954,11 @@ fn run_postgres_outage_body(
     Ok(summary)
 }
 
-fn perform_outage_operations(
+fn perform_postgres_writer_outage_operation(
     context: &ScenarioContext,
-    clients: &[ClientSpec],
+    client: &ClientSpec,
+    relative: &str,
+    payload: &[u8],
 ) -> Result<usize, ScenarioError> {
     let mut log = fs::OpenOptions::new()
         .create(true)
@@ -885,39 +968,28 @@ fn perform_outage_operations(
         .create(true)
         .append(true)
         .open(context.scenario_dir.join("operations.ndjson"))?;
-    let mut accepted = 0;
-    for (index, client) in clients.iter().enumerate() {
-        let relative = format!("outage-local-write-{}.txt", index + 1);
-        let payload = format!(
-            "accepted local-first outage write from {} in {}\n",
-            client.name, context.run_id
-        );
-        let write_result = fs::write(client.mount_point.join(&relative), payload.as_bytes());
-        let error = write_result.err().map(|err| err.to_string());
-        let operation_accepted = error.is_none();
-        if operation_accepted {
-            accepted += 1;
-        }
-        let record = OutageOperationRecord {
-            client: client.name.clone(),
-            path: relative,
-            bytes: payload.len(),
-            accepted: operation_accepted,
-            error,
-        };
-        serde_json::to_writer(&mut log, &record)?;
-        log.write_all(b"\n")?;
-        serde_json::to_writer(&mut operations_log, &record)?;
-        operations_log.write_all(b"\n")?;
+    let write_result = fs::write(client.mount_point.join(relative), payload);
+    let error = write_result.err().map(|err| err.to_string());
+    let operation_accepted = error.is_none();
+    let record = OutageOperationRecord {
+        client: client.name.clone(),
+        path: relative.to_string(),
+        bytes: payload.len(),
+        accepted: operation_accepted,
+        error,
+    };
+    serde_json::to_writer(&mut log, &record)?;
+    log.write_all(b"\n")?;
+    serde_json::to_writer(&mut operations_log, &record)?;
+    operations_log.write_all(b"\n")?;
+    if operation_accepted {
+        Ok(1)
+    } else {
+        Err(ScenarioError::RejectedOutageOperations {
+            rejected: 1,
+            total: 1,
+        })
     }
-    let rejected = clients.len() - accepted;
-    if rejected > 0 {
-        return Err(ScenarioError::RejectedOutageOperations {
-            rejected,
-            total: clients.len(),
-        });
-    }
-    Ok(accepted)
 }
 
 trait RustfsOutageDriver {
@@ -2122,6 +2194,10 @@ fn elapsed_millis_u64(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
+fn elapsed_millis_nonzero(started: Instant) -> u128 {
+    started.elapsed().as_millis().max(1)
+}
+
 fn finish_namespace_collision(
     context: &ScenarioContext,
     kind: NamespaceCollisionKind,
@@ -2463,6 +2539,7 @@ mod tests {
     struct RecordingOutageDriver {
         clients: Vec<ClientSpec>,
         actions: RefCell<Vec<&'static str>>,
+        publish_writer_on_remount: bool,
     }
 
     impl RecordingOutageDriver {
@@ -2470,7 +2547,13 @@ mod tests {
             Self {
                 clients,
                 actions: RefCell::new(Vec::new()),
+                publish_writer_on_remount: false,
             }
+        }
+
+        fn publish_writer_on_remount(mut self) -> Self {
+            self.publish_writer_on_remount = true;
+            self
         }
     }
 
@@ -2523,18 +2606,36 @@ mod tests {
 
         fn start_postgres(&mut self) -> Result<(), ScenarioError> {
             self.actions.borrow_mut().push("start_postgres");
+            Ok(())
+        }
+
+        fn force_kill(&mut self, client: &str) -> Result<(), ScenarioError> {
+            assert_eq!(client, POSTGRES_OUTAGE_CLIENT_NAMES[0]);
+            self.actions.borrow_mut().push("force_kill_writer");
+            Ok(())
+        }
+
+        fn remount(&mut self, client: &str) -> Result<(), ScenarioError> {
+            assert_eq!(client, POSTGRES_OUTAGE_CLIENT_NAMES[0]);
+            self.actions.borrow_mut().push("remount_writer");
+            if !self.publish_writer_on_remount {
+                return Ok(());
+            }
+            let writer = self
+                .clients
+                .iter()
+                .find(|candidate| candidate.name == client)
+                .expect("recording writer client exists");
             let mut entries = Vec::new();
-            for client in &self.clients {
-                for entry in std::fs::read_dir(&client.mount_point).unwrap() {
-                    let entry = entry.unwrap();
-                    if entry.file_type().unwrap().is_file() {
-                        entries.push((entry.file_name(), std::fs::read(entry.path()).unwrap()));
-                    }
+            for entry in std::fs::read_dir(&writer.mount_point)? {
+                let entry = entry?;
+                if entry.file_type()?.is_file() {
+                    entries.push((entry.file_name(), std::fs::read(entry.path())?));
                 }
             }
             for client in &self.clients {
                 for (name, payload) in &entries {
-                    std::fs::write(client.mount_point.join(name), payload).unwrap();
+                    std::fs::write(client.mount_point.join(name), payload)?;
                 }
             }
             Ok(())
@@ -3538,7 +3639,7 @@ mod tests {
                 client_spec_for(&sandbox, "projectfs", name, mount)
             })
             .collect::<Vec<_>>();
-        let mut driver = RecordingOutageDriver::new(clients);
+        let mut driver = RecordingOutageDriver::new(clients).publish_writer_on_remount();
         let context = ScenarioContext {
             run_id: "run-1".to_string(),
             seed: 325,
@@ -3556,17 +3657,25 @@ mod tests {
         .unwrap();
 
         assert_eq!(summary.bootstrap.init_client, "client-a");
-        assert_eq!(summary.operations_accepted_during_outage, 2);
+        assert_eq!(
+            summary.outage_file,
+            "studiofs-e2e-postgres-outage-writer.txt"
+        );
+        assert_eq!(summary.writer_recovery_client, "client-a");
+        assert_eq!(summary.operations_accepted_during_outage, 1);
         assert!(summary.outage_duration_ms > 0);
-        assert!(summary.recovery_time_ms > 0);
-        assert!(summary.final_validator.converged);
+        assert!(summary.writer_recovery_time_ms > 0);
+        assert!(summary.peer_observation_time_ms > 0);
+        assert!(summary.peer_observation_validator.converged);
         assert_eq!(
             driver.actions.borrow().as_slice(),
             [
                 "bootstrap",
                 "mount_all",
                 "stop_postgres",
+                "force_kill_writer",
                 "start_postgres",
+                "remount_writer",
                 "unmount_all"
             ]
         );
@@ -3580,7 +3689,14 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert_eq!(summary_json["operations_accepted_during_outage"], 2);
+        assert_eq!(summary_json["operations_accepted_during_outage"], 1);
+        assert_eq!(summary_json["writer_recovery_client"], "client-a");
+        assert!(summary_json["writer_recovery_checksum_sha256"].is_string());
+        assert!(
+            summary_json["peer_observation_validator"]["converged"]
+                .as_bool()
+                .unwrap()
+        );
         assert!(
             context
                 .scenario_dir
@@ -3590,6 +3706,8 @@ mod tests {
         let operations_log =
             std::fs::read_to_string(context.scenario_dir.join("operations.ndjson")).unwrap();
         assert!(operations_log.contains("\"accepted\":true"));
+        assert!(operations_log.contains("\"client\":\"client-a\""));
+        assert!(!operations_log.contains("\"client\":\"client-b\""));
     }
 
     #[test]
@@ -3819,21 +3937,17 @@ mod tests {
     }
 
     #[test]
-    fn outage_operations_log_rejected_write_before_failing_expected_operation() {
+    fn outage_operations_log_rejected_writer_write_before_failing_expected_operation() {
         let temp = tempdir().unwrap();
         let sandbox = temp.path().join("run-1");
         let scenario_dir = sandbox
             .join("artifacts")
             .join("scenarios")
             .join(POSTGRES_OUTAGE_MULTI_CLIENT_RECOVERY);
-        let accepted_mount = temp.path().join("mounts").join("client-b");
-        let rejected_mount = temp.path().join("mounts").join("client-c");
-        std::fs::create_dir_all(&accepted_mount).unwrap();
+        let rejected_mount = temp.path().join("mounts").join("client-a");
+        std::fs::create_dir_all(rejected_mount.parent().unwrap()).unwrap();
         std::fs::write(&rejected_mount, "not a directory").unwrap();
-        let clients = vec![
-            client_spec_for(&sandbox, "projectfs", "client-b", accepted_mount),
-            client_spec_for(&sandbox, "projectfs", "client-c", rejected_mount),
-        ];
+        let client = client_spec_for(&sandbox, "projectfs", "client-a", rejected_mount);
         let context = ScenarioContext {
             run_id: "run-1".to_string(),
             seed: 325,
@@ -3843,19 +3957,25 @@ mod tests {
         };
         std::fs::create_dir_all(&context.scenario_dir).unwrap();
 
-        let err = perform_outage_operations(&context, &clients).unwrap_err();
+        let err = perform_postgres_writer_outage_operation(
+            &context,
+            &client,
+            POSTGRES_OUTAGE_FILE_NAME,
+            POSTGRES_OUTAGE_RECOVERED_PAYLOAD,
+        )
+        .unwrap_err();
 
         assert!(matches!(
             err,
             ScenarioError::RejectedOutageOperations {
                 rejected: 1,
-                total: 2
+                total: 1
             }
         ));
         let log =
             std::fs::read_to_string(context.scenario_dir.join("outage-operations.ndjson")).unwrap();
-        assert!(log.contains("\"accepted\":true"));
         assert!(log.contains("\"accepted\":false"));
+        assert!(log.contains("\"client\":\"client-a\""));
     }
 
     #[test]
@@ -3868,8 +3988,17 @@ mod tests {
             scenario_dir: temp.path().join("missing-scenario"),
             client_controller_config: None,
         };
+        let mount = temp.path().join("mounts").join("client-a");
+        std::fs::create_dir_all(&mount).unwrap();
+        let client = client_spec_for(&context.sandbox, "projectfs", "client-a", mount);
 
-        let err = perform_outage_operations(&context, &[]).unwrap_err();
+        let err = perform_postgres_writer_outage_operation(
+            &context,
+            &client,
+            POSTGRES_OUTAGE_FILE_NAME,
+            POSTGRES_OUTAGE_RECOVERED_PAYLOAD,
+        )
+        .unwrap_err();
 
         assert!(matches!(err, ScenarioError::Io(_)));
         assert!(!context.scenario_dir.exists());

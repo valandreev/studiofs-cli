@@ -208,18 +208,20 @@ the skeleton validation artifact.
 
 `postgres-outage-multi-client-recovery` uses the same three-client mounted
 bootstrap, writes an initial file while PostgreSQL is healthy, stops only the
-PostgreSQL compose service, performs accepted local-first writes from multiple
-mounted clients, starts PostgreSQL again with compose health waiting, and then
-uses the mounted tree validator for final convergence. Temporary peer
-invisibility while PostgreSQL is stopped is not a failure; only local write
-failures and post-recovery convergence failure fail the scenario. The scenario
-writes accepted outage operations to `operations.ndjson` and
-`outage-operations.ndjson`, and writes
-`postgres-outage-recovery-summary.json` with outage duration,
-accepted-operation count, recovery time, and the final validator result.
-`recovery_time_ms` starts before the PostgreSQL compose service is brought back
-with `docker compose up --wait`, so it includes the PostgreSQL healthcheck
-readiness gate as well as mounted tree convergence time.
+PostgreSQL compose service, accepts a writer-local outage write through
+`client-a`, force-kills that writer, starts PostgreSQL again with compose health
+waiting, remounts `client-a`, verifies the writer recovered the accepted local
+payload, and only then uses the mounted tree validator to check peer
+observation from `client-b` and `client-c`. The scenario does not require peers
+to observe the writer's outage payload before writer recovery and publication
+after PostgreSQL returns. The scenario writes the accepted writer outage
+operation to `operations.ndjson` and `outage-operations.ndjson`, and writes
+`postgres-outage-recovery-summary.json` with outage duration, accepted-operation
+count, writer recovery client/checksum/time, peer observation time, recovery
+time, and the final validator result. `recovery_time_ms` starts before the
+PostgreSQL compose service is brought back with `docker compose up --wait`, so
+it includes PostgreSQL healthcheck readiness, writer remount/recovery, and
+mounted tree convergence time.
 
 `rustfs-outage-multi-client-recovery` uses a four-client mounted bootstrap,
 writes and converges an initial file while RustFS/S3 is healthy, stops only the
