@@ -901,13 +901,17 @@ fn run_postgres_outage_body(
             }
         })?;
     if writer_payload != POSTGRES_OUTAGE_RECOVERED_PAYLOAD {
+        let expected_checksum = bytes_sha256(POSTGRES_OUTAGE_RECOVERED_PAYLOAD);
+        let recovered_checksum = bytes_sha256(&writer_payload);
         return Err(ScenarioError::PostgresOutageWriterRecoveryFailed {
             client: writer.name.clone(),
             path: POSTGRES_OUTAGE_FILE_NAME.to_string(),
             detail: format!(
-                "recovered payload differs: expected {} bytes, got {} bytes",
+                "recovered payload differs: expected {} bytes with expected checksum {}, got {} bytes with recovered checksum {}",
                 POSTGRES_OUTAGE_RECOVERED_PAYLOAD.len(),
-                writer_payload.len()
+                expected_checksum,
+                writer_payload.len(),
+                recovered_checksum
             ),
         });
     }
@@ -2540,6 +2544,7 @@ mod tests {
         clients: Vec<ClientSpec>,
         actions: RefCell<Vec<&'static str>>,
         publish_writer_on_remount: bool,
+        corrupt_writer_payload_on_remount: bool,
     }
 
     impl RecordingOutageDriver {
@@ -2548,11 +2553,17 @@ mod tests {
                 clients,
                 actions: RefCell::new(Vec::new()),
                 publish_writer_on_remount: false,
+                corrupt_writer_payload_on_remount: false,
             }
         }
 
         fn publish_writer_on_remount(mut self) -> Self {
             self.publish_writer_on_remount = true;
+            self
+        }
+
+        fn corrupt_writer_payload_on_remount(mut self) -> Self {
+            self.corrupt_writer_payload_on_remount = true;
             self
         }
     }
@@ -2626,6 +2637,12 @@ mod tests {
                 .iter()
                 .find(|candidate| candidate.name == client)
                 .expect("recording writer client exists");
+            if self.corrupt_writer_payload_on_remount {
+                std::fs::write(
+                    writer.mount_point.join(POSTGRES_OUTAGE_FILE_NAME),
+                    vec![b'x'; POSTGRES_OUTAGE_RECOVERED_PAYLOAD.len()],
+                )?;
+            }
             let mut entries = Vec::new();
             for entry in std::fs::read_dir(&writer.mount_point)? {
                 let entry = entry?;
@@ -2633,9 +2650,9 @@ mod tests {
                     entries.push((entry.file_name(), std::fs::read(entry.path())?));
                 }
             }
-            for client in &self.clients {
+            for peer in self.clients.iter().filter(|peer| peer.name != client) {
                 for (name, payload) in &entries {
-                    std::fs::write(client.mount_point.join(name), payload)?;
+                    std::fs::write(peer.mount_point.join(name), payload)?;
                 }
             }
             Ok(())
@@ -3708,6 +3725,49 @@ mod tests {
         assert!(operations_log.contains("\"accepted\":true"));
         assert!(operations_log.contains("\"client\":\"client-a\""));
         assert!(!operations_log.contains("\"client\":\"client-b\""));
+    }
+
+    #[test]
+    fn postgres_outage_writer_recovery_reports_equal_length_corruption() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(POSTGRES_OUTAGE_MULTI_CLIENT_RECOVERY);
+        let clients = POSTGRES_OUTAGE_CLIENT_NAMES
+            .iter()
+            .copied()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(&mount).unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let mut driver = RecordingOutageDriver::new(clients)
+            .publish_writer_on_remount()
+            .corrupt_writer_payload_on_remount();
+        let context = ScenarioContext {
+            run_id: "run-1".to_string(),
+            seed: 403,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+
+        let err = run_postgres_outage_with_driver(
+            &context,
+            &mut driver,
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+        )
+        .unwrap_err();
+
+        let ScenarioError::PostgresOutageWriterRecoveryFailed { detail, .. } = err else {
+            panic!("expected writer recovery error");
+        };
+        assert!(detail.contains("expected checksum"));
+        assert!(detail.contains("recovered checksum"));
     }
 
     #[test]
