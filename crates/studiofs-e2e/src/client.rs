@@ -45,17 +45,51 @@ impl ClientControllerConfig {
         seed: u64,
         ports: &[ServicePort],
     ) -> Result<Self, ClientControllerError> {
+        Self::from_compose_services_inner(studiofs_bin, sandbox, run_id, seed, None, ports)
+    }
+
+    pub fn from_compose_services_for_scenario(
+        studiofs_bin: PathBuf,
+        sandbox: PathBuf,
+        run_id: &str,
+        seed: u64,
+        scenario_name: &str,
+        ports: &[ServicePort],
+    ) -> Result<Self, ClientControllerError> {
+        Self::from_compose_services_inner(
+            studiofs_bin,
+            sandbox,
+            run_id,
+            seed,
+            Some(scenario_name),
+            ports,
+        )
+    }
+
+    fn from_compose_services_inner(
+        studiofs_bin: PathBuf,
+        sandbox: PathBuf,
+        run_id: &str,
+        seed: u64,
+        scenario_name: Option<&str>,
+        ports: &[ServicePort],
+    ) -> Result<Self, ClientControllerError> {
         let postgres = service_port(ports, "postgres")?;
         let rustfs = service_port(ports, "rustfs")?;
         let sanitized_run_id = sanitize_dns_label(run_id);
+        let volume_discriminator = scenario_name.map(sanitize_dns_label);
         let bucket = prefixed_dns_name(
             E2E_BUCKET_PREFIX,
             &sanitized_run_id,
             S3_BUCKET_NAME_MAX_CHARS,
         );
+        let volume_stem_input = match volume_discriminator {
+            Some(scenario) => format!("{sanitized_run_id}-{seed}-{scenario}"),
+            None => format!("{sanitized_run_id}-{seed}"),
+        };
         let volume_stem = prefixed_dns_name(
             E2E_VOLUME_PREFIX,
-            &format!("{sanitized_run_id}-{seed}"),
+            &volume_stem_input,
             S3_BUCKET_NAME_MAX_CHARS,
         );
         Ok(Self {
@@ -105,6 +139,7 @@ pub enum ClientLifecycleState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientSpec {
     pub name: String,
+    pub volume_name: String,
     pub client_root: PathBuf,
     pub local_metadata_dir: PathBuf,
     pub local_metadata_db: PathBuf,
@@ -146,6 +181,12 @@ pub struct VolumeBootstrapOptions {
     pub clean_existing_local_metadata: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerVolumeBootstrapOptions {
+    pub client_names: Vec<String>,
+    pub clean_existing_local_metadata: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientBootstrapRecord {
     pub name: String,
@@ -159,6 +200,12 @@ pub struct VolumeBootstrapSummary {
     pub init_client: String,
     pub discovered_clients: Vec<String>,
     pub clients: Vec<ClientBootstrapRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerVolumeBootstrapSummary {
+    pub base_volume_name: String,
+    pub volumes: Vec<VolumeBootstrapSummary>,
 }
 
 pub trait ClientProcess {
@@ -406,6 +453,90 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         })
     }
 
+    pub fn bootstrap_peer_volumes(
+        &mut self,
+        options: PeerVolumeBootstrapOptions,
+    ) -> Result<PeerVolumeBootstrapSummary, ClientControllerError> {
+        self.create_clients(options.client_names)?;
+        if options.clean_existing_local_metadata {
+            self.clean_client_metadata_roots()?;
+        }
+        if self.clients.is_empty() {
+            return Err(ClientControllerError::NoClients);
+        }
+
+        let volume_names = self.peer_volume_names();
+        let mut summaries = Vec::with_capacity(volume_names.len());
+        for (owner_index, volume_name) in volume_names.iter().enumerate() {
+            let init_command = self.init_command_for_volume(owner_index, volume_name)?;
+            let output = self.executor.run(&init_command)?;
+            ensure_success(&init_command, output)?;
+            self.clients[owner_index].spec.state = ClientLifecycleState::Initialized;
+
+            let mut discovered_clients = Vec::new();
+            for index in 0..self.clients.len() {
+                if index == owner_index {
+                    continue;
+                }
+                let discover_command = self.discover_command_for_volume(index, volume_name)?;
+                let output = self.executor.run(&discover_command)?;
+                ensure_success(&discover_command, output)?;
+                self.clients[index].spec.state = ClientLifecycleState::Discovered;
+                discovered_clients.push(self.clients[index].spec.name.clone());
+            }
+
+            let clients = self
+                .clients
+                .iter()
+                .map(|runtime| {
+                    let spec = self.spec_for_client_volume(&runtime.spec.name, volume_name);
+                    ClientBootstrapRecord {
+                        name: runtime.spec.name.clone(),
+                        local_metadata_db: spec.local_metadata_db,
+                        state: if runtime.spec.name == self.clients[owner_index].spec.name {
+                            ClientLifecycleState::Initialized
+                        } else {
+                            ClientLifecycleState::Discovered
+                        },
+                    }
+                })
+                .collect::<Vec<_>>();
+            verify_local_metadata_db_records(&clients)?;
+            summaries.push(VolumeBootstrapSummary {
+                volume_name: volume_name.clone(),
+                init_client: self.clients[owner_index].spec.name.clone(),
+                discovered_clients,
+                clients,
+            });
+        }
+
+        Ok(PeerVolumeBootstrapSummary {
+            base_volume_name: self.config.volume_name.clone(),
+            volumes: summaries,
+        })
+    }
+
+    pub fn select_volume_for_clients(
+        &mut self,
+        volume_name: &str,
+    ) -> Result<(), ClientControllerError> {
+        if self.clients.is_empty() {
+            return Err(ClientControllerError::NoClients);
+        }
+        if self.clients.iter().any(|runtime| runtime.process.is_some()) {
+            return Err(ClientControllerError::ClientsStillMounted);
+        }
+        let names = self
+            .clients
+            .iter()
+            .map(|runtime| runtime.spec.name.clone())
+            .collect::<Vec<_>>();
+        for (index, name) in names.iter().enumerate() {
+            self.clients[index].spec = self.create_client_volume_spec(index, name, volume_name)?;
+        }
+        Ok(())
+    }
+
     pub fn mount_all(&mut self) -> Result<(), ClientControllerError> {
         for index in 0..self.clients.len() {
             self.mount_index(index)?;
@@ -507,6 +638,22 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         Ok(())
     }
 
+    fn clean_client_metadata_roots(&self) -> Result<(), ClientControllerError> {
+        for runtime in &self.clients {
+            let path = runtime.spec.client_root.join("meta");
+            if path.exists() {
+                fs::remove_dir_all(&path).map_err(|source| {
+                    ClientControllerError::CleanLocalMetadataFailed {
+                        client: runtime.spec.name.clone(),
+                        path,
+                        source,
+                    }
+                })?;
+            }
+        }
+        Ok(())
+    }
+
     fn verify_local_metadata_dbs(&self) -> Result<(), ClientControllerError> {
         let mut seen = HashSet::<OsString>::new();
         for runtime in &self.clients {
@@ -526,6 +673,23 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
             }
         }
         Ok(())
+    }
+
+    fn peer_volume_names(&self) -> Vec<String> {
+        self.clients
+            .iter()
+            .map(|runtime| peer_volume_name(&self.config.volume_name, &runtime.spec.name))
+            .collect()
+    }
+
+    fn spec_for_client_volume(&self, client: &str, volume_name: &str) -> ClientSpec {
+        let mount_point = self
+            .clients
+            .iter()
+            .find(|runtime| runtime.spec.name == client)
+            .map(|runtime| runtime.spec.mount_point.clone())
+            .unwrap_or_else(|| client_mount_point(&self.config.sandbox, client));
+        client_spec_for(&self.config.sandbox, volume_name, client, mount_point)
     }
 
     fn unmount_index(&mut self, index: usize) -> Result<(), ClientControllerError> {
@@ -557,19 +721,23 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         index: usize,
         name: &str,
     ) -> Result<ClientSpec, ClientControllerError> {
+        self.create_client_volume_spec(index, name, &self.config.volume_name)
+    }
+
+    fn create_client_volume_spec(
+        &self,
+        index: usize,
+        name: &str,
+        volume_name: &str,
+    ) -> Result<ClientSpec, ClientControllerError> {
         let mount_point = self
             .config
             .mount_points
             .get(index)
             .cloned()
             .unwrap_or_else(|| default_client_mount_point(&self.config.sandbox, name, index));
-        let mount_point = product_mount_path(&self.config.volume_name, mount_point);
-        let spec = client_spec_for(
-            &self.config.sandbox,
-            &self.config.volume_name,
-            name,
-            mount_point,
-        );
+        let mount_point = product_mount_path(volume_name, mount_point);
+        let spec = client_spec_for(&self.config.sandbox, volume_name, name, mount_point);
         fs::create_dir_all(&spec.client_root)?;
         fs::create_dir_all(&spec.cache_dir)?;
         fs::create_dir_all(&spec.mount_metadata_dir)?;
@@ -581,9 +749,17 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
     }
 
     fn init_command(&self, index: usize) -> Result<ClientCommand, ClientControllerError> {
+        self.init_command_for_volume(index, &self.config.volume_name)
+    }
+
+    fn init_command_for_volume(
+        &self,
+        index: usize,
+        volume_name: &str,
+    ) -> Result<ClientCommand, ClientControllerError> {
         let args = vec![
             "init".to_string(),
-            self.config.volume_name.clone(),
+            volume_name.to_string(),
             "--endpoint".to_string(),
             self.config.s3.endpoint.clone(),
             "--bucket".to_string(),
@@ -601,9 +777,17 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
     }
 
     fn discover_command(&self, index: usize) -> Result<ClientCommand, ClientControllerError> {
+        self.discover_command_for_volume(index, &self.config.volume_name)
+    }
+
+    fn discover_command_for_volume(
+        &self,
+        index: usize,
+        volume_name: &str,
+    ) -> Result<ClientCommand, ClientControllerError> {
         let args = vec![
             "discover".to_string(),
-            self.config.volume_name.clone(),
+            volume_name.to_string(),
             "--meta".to_string(),
             self.config.meta_dsn.clone(),
         ];
@@ -614,7 +798,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         let client = self.client(index)?;
         let args = vec![
             "mount".to_string(),
-            self.config.volume_name.clone(),
+            client.volume_name.clone(),
             client.mount_point.display().to_string(),
             "--cache-dir".to_string(),
             client.cache_dir.display().to_string(),
@@ -772,6 +956,7 @@ pub fn client_spec_for(
     let mount_metadata_dir = client_mount_point(sandbox, client);
     ClientSpec {
         name: client.to_string(),
+        volume_name: volume_name.to_string(),
         local_metadata_db: local_metadata_dir.join(format!("{volume_name}.db")),
         local_metadata_dir,
         client_root,
@@ -929,6 +1114,14 @@ fn prefixed_dns_name(prefix: &str, stem: &str, max_chars: usize) -> String {
     name
 }
 
+fn peer_volume_name(base_volume_name: &str, client: &str) -> String {
+    prefixed_dns_name(
+        "",
+        &format!("{base_volume_name}-{client}"),
+        S3_BUCKET_NAME_MAX_CHARS,
+    )
+}
+
 fn canonical_local_metadata_db_path(
     client: &str,
     path: &Path,
@@ -940,6 +1133,28 @@ fn canonical_local_metadata_db_path(
             source,
         },
     )
+}
+
+fn verify_local_metadata_db_records(
+    clients: &[ClientBootstrapRecord],
+) -> Result<(), ClientControllerError> {
+    let mut seen = HashSet::<OsString>::new();
+    for client in clients {
+        let path = &client.local_metadata_db;
+        if !path.exists() {
+            return Err(ClientControllerError::MissingLocalMetadataDb {
+                client: client.name.clone(),
+                path: path.clone(),
+            });
+        }
+        let unique_path = canonical_local_metadata_db_path(&client.name, path)?.into_os_string();
+        if !seen.insert(unique_path) {
+            return Err(ClientControllerError::DuplicateLocalMetadataDb(
+                path.clone(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn write_mount_metadata(spec: &ClientSpec) -> Result<(), ClientControllerError> {

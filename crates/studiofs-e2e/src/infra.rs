@@ -166,6 +166,8 @@ pub enum InfraError {
     Io(#[from] std::io::Error),
     #[error("infra JSON failed: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("infra YAML failed: {0}")]
+    Yaml(#[from] serde_yaml::Error),
 }
 
 #[derive(Debug, Clone)]
@@ -215,6 +217,7 @@ impl DockerComposeStack {
 
     pub fn preflight(&self, executor: &dyn CommandExecutor) -> Vec<InfraCheck> {
         let mut checks = Vec::new();
+        checks.push(self.compose_contract_check());
         checks.push(self.command_check(
             "docker version",
             executor,
@@ -241,6 +244,49 @@ impl DockerComposeStack {
         ));
         checks.extend(self.ports.iter().map(port_check));
         checks
+    }
+
+    fn compose_contract_check(&self) -> InfraCheck {
+        let Ok(compose) = fs::read_to_string(&self.compose_file) else {
+            return InfraCheck {
+                name: "compose baseline contract".to_string(),
+                passed: false,
+                detail: format!("failed to read {}", self.compose_file.display()),
+            };
+        };
+        let images = match compose_images(&compose) {
+            Ok(images) => images,
+            Err(error) => {
+                return InfraCheck {
+                    name: "compose baseline contract".to_string(),
+                    passed: false,
+                    detail: format!("failed to parse compose YAML: {error}"),
+                };
+            }
+        };
+        let mut errors = Vec::new();
+        if !images.iter().any(|image| image == "postgres:18-alpine") {
+            errors.push("PostgreSQL image must stay pinned to postgres:18-alpine");
+        }
+        if !images
+            .iter()
+            .any(|image| image == "rustfs/rustfs:1.0.0-alpha.94")
+        {
+            errors.push("RustFS image must stay pinned to rustfs/rustfs:1.0.0-alpha.94");
+        }
+        if images.iter().any(|image| image == "rustfs/rustfs:latest") {
+            errors.push("RustFS latest is rejected by the Local First baseline gate");
+        }
+
+        InfraCheck {
+            name: "compose baseline contract".to_string(),
+            passed: errors.is_empty(),
+            detail: if errors.is_empty() {
+                "PostgreSQL and RustFS images match the Local First baseline".to_string()
+            } else {
+                errors.join("; ")
+            },
+        }
     }
 
     pub fn up_command(&self) -> CommandSpec {
@@ -454,6 +500,28 @@ impl DockerComposeStack {
             env: self.compose_environment(),
         }
     }
+}
+
+fn compose_images(compose: &str) -> Result<Vec<String>, serde_yaml::Error> {
+    let document: serde_yaml::Value = serde_yaml::from_str(compose)?;
+    let Some(services) = mapping_value(&document, "services") else {
+        return Ok(Vec::new());
+    };
+    let Some(services) = services.as_mapping() else {
+        return Ok(Vec::new());
+    };
+    Ok(services
+        .values()
+        .filter_map(|service| mapping_value(service, "image"))
+        .filter_map(serde_yaml::Value::as_str)
+        .map(str::to_string)
+        .collect())
+}
+
+fn mapping_value<'a>(value: &'a serde_yaml::Value, key: &str) -> Option<&'a serde_yaml::Value> {
+    value
+        .as_mapping()?
+        .get(serde_yaml::Value::String(key.to_string()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use studiofs_e2e::client::{
     ClientCommand, ClientCommandOutput, ClientControllerConfig, ClientControllerError,
-    ClientLifecycleState, ClientProcess, ClientProcessExecutor, MultiClientController, S3Config,
-    VolumeBootstrapOptions,
+    ClientLifecycleState, ClientProcess, ClientProcessExecutor, MultiClientController,
+    PeerVolumeBootstrapOptions, S3Config, VolumeBootstrapOptions,
 };
 use studiofs_e2e::infra::ServicePort;
 use tempfile::tempdir;
@@ -43,6 +43,7 @@ fn controller_bootstraps_mounts_restarts_and_kills_isolated_clients() {
             .join("projectfs")
             .join("projectfs.db")
     );
+    assert_eq!(clients[0].volume_name, "projectfs");
     assert!(clients[0].stdout_log.ends_with("studiofs.stdout.log"));
     assert!(clients[0].stderr_log.ends_with("studiofs.stderr.log"));
     assert!(clients[0].tracing_log.ends_with("studiofs-tracing.log"));
@@ -139,6 +140,116 @@ fn bootstrap_workflow_initializes_one_volume_and_discovers_isolated_clients() {
 }
 
 #[test]
+fn peer_bootstrap_initializes_each_client_volume_and_cross_discovers_neighbors() {
+    let temp = tempdir().unwrap();
+    let executor = RecordingExecutor {
+        create_local_metadata_db: true,
+        fail_if_local_metadata_dir_preexists: true,
+        ..RecordingExecutor::new()
+    };
+    let calls = Rc::clone(&executor.calls);
+    let config = test_config(temp.path());
+    let mut controller = MultiClientController::new(config, executor);
+
+    let summary = controller
+        .bootstrap_peer_volumes(PeerVolumeBootstrapOptions {
+            client_names: vec![
+                "client-a".to_string(),
+                "client-b".to_string(),
+                "client-c".to_string(),
+            ],
+            clean_existing_local_metadata: false,
+        })
+        .unwrap();
+
+    assert_eq!(summary.volumes.len(), 3);
+    assert_eq!(summary.volumes[0].init_client, "client-a");
+    assert_eq!(summary.volumes[1].init_client, "client-b");
+    assert_eq!(summary.volumes[2].init_client, "client-c");
+    assert!(summary.volumes.iter().all(|volume| {
+        volume.discovered_clients.len() == 2
+            && !volume.discovered_clients.contains(&volume.init_client)
+            && volume.clients.iter().all(|client| {
+                client.local_metadata_db.exists()
+                    && client
+                        .local_metadata_db
+                        .ends_with(format!("{}/{}.db", volume.volume_name, volume.volume_name))
+            })
+    }));
+
+    let calls = calls.borrow();
+    let init_calls = calls
+        .iter()
+        .filter(|call| call.action == "init")
+        .collect::<Vec<_>>();
+    let discover_calls = calls
+        .iter()
+        .filter(|call| call.action == "discover")
+        .collect::<Vec<_>>();
+    assert_eq!(init_calls.len(), 3);
+    assert_eq!(discover_calls.len(), 6);
+    for init in &init_calls {
+        assert_eq!(init.args[0], "init");
+        assert!(init.args[1].starts_with("projectfs-"));
+        assert!(init.args[1].contains(&init.client));
+    }
+    for discover in &discover_calls {
+        assert_eq!(discover.args[0], "discover");
+        assert_ne!(
+            discover.args[1],
+            init_calls
+                .iter()
+                .find(|init| init.client == discover.client)
+                .unwrap()
+                .args[1]
+        );
+    }
+}
+
+#[test]
+fn controller_can_select_peer_volume_for_sequential_mount_validation() {
+    let temp = tempdir().unwrap();
+    let executor = RecordingExecutor {
+        create_local_metadata_db: true,
+        fail_if_local_metadata_dir_preexists: true,
+        ..RecordingExecutor::new()
+    };
+    let calls = Rc::clone(&executor.calls);
+    let config = test_config(temp.path());
+    let mut controller = MultiClientController::new(config, executor);
+
+    let summary = controller
+        .bootstrap_peer_volumes(PeerVolumeBootstrapOptions {
+            client_names: vec![
+                "client-a".to_string(),
+                "client-b".to_string(),
+                "client-c".to_string(),
+            ],
+            clean_existing_local_metadata: false,
+        })
+        .unwrap();
+    let volume_name = summary.volumes[1].volume_name.clone();
+
+    controller.select_volume_for_clients(&volume_name).unwrap();
+    controller.mount_all().unwrap();
+
+    let clients = controller.clients();
+    assert!(clients.iter().all(|client| {
+        client.volume_name == volume_name
+            && client
+                .local_metadata_db
+                .ends_with(format!("{volume_name}/{volume_name}.db"))
+    }));
+    let calls = calls.borrow();
+    let mount_calls = calls
+        .iter()
+        .filter(|call| call.action == "mount")
+        .collect::<Vec<_>>();
+    assert_eq!(mount_calls.len(), 3);
+    assert!(mount_calls.iter().all(|call| call.args[1] == volume_name));
+}
+
+#[test]
 fn bootstrap_workflow_can_clean_stale_local_metadata_before_cli_commands() {
     let temp = tempdir().unwrap();
     let stale_db = temp
@@ -229,6 +340,29 @@ fn compose_service_config_derives_unique_volume_and_docker_endpoints() {
     assert_eq!(config.s3.bucket, "studiofs-e2e-run-1-20260502");
     assert_eq!(config.s3.access_key, "rustfsadmin");
     assert_eq!(config.s3.secret_key, "rustfsadmin");
+}
+
+#[test]
+fn compose_service_config_can_scope_volume_to_scenario() {
+    let temp = tempdir().unwrap();
+    let config = ClientControllerConfig::from_compose_services_for_scenario(
+        Path::new("studiofs-test-bin").to_path_buf(),
+        temp.path().join("run-1"),
+        "Run_1.20260502",
+        321,
+        "rustfs-outage-multi-client-recovery",
+        &[
+            service_port("postgres", 35432),
+            service_port("rustfs", 39000),
+        ],
+    )
+    .unwrap();
+
+    assert_eq!(
+        config.volume_name,
+        "sfs-e2e-run-1-20260502-321-rustfs-outage-multi-client-recovery"
+    );
+    assert_eq!(config.s3.bucket, "studiofs-e2e-run-1-20260502");
 }
 
 #[test]

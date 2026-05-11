@@ -3,7 +3,7 @@
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{self, Write as _};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -15,7 +15,8 @@ use thiserror::Error;
 
 use crate::client::{
     ClientControllerConfig, ClientControllerError, ClientSpec, MultiClientController,
-    SystemClientProcessExecutor, VolumeBootstrapOptions, VolumeBootstrapSummary,
+    PeerVolumeBootstrapOptions, PeerVolumeBootstrapSummary, SystemClientProcessExecutor,
+    VolumeBootstrapOptions, VolumeBootstrapSummary,
 };
 use crate::infra::{
     CommandExecutor, ComposeServiceControl, InfraError, POSTGRES_SERVICE_NAME, RUSTFS_SERVICE_NAME,
@@ -175,10 +176,10 @@ pub trait Scenario {
 pub fn available_scenarios() -> Vec<ScenarioDefinition> {
     vec![
         BasicMultiClientSmoke.definition(),
-        PostgresOutageMultiClientRecovery.definition(),
         RustfsOutageMultiClientRecovery.definition(),
-        MountedClientCrashRestartRecovery.definition(),
         NamespaceCollisionScenario::new(NamespaceCollisionKind::RenameVsRename).definition(),
+        PostgresOutageMultiClientRecovery.definition(),
+        MountedClientCrashRestartRecovery.definition(),
         NamespaceCollisionScenario::new(NamespaceCollisionKind::RenameVsUnlink).definition(),
         NamespaceCollisionScenario::new(NamespaceCollisionKind::UnlinkVsAppend).definition(),
         NamespaceCollisionScenario::new(NamespaceCollisionKind::OverwriteVsRead).definition(),
@@ -276,9 +277,27 @@ impl Scenario for BasicMultiClientSmoke {
     }
 
     fn validate(&self, context: &ScenarioContext) -> Result<Vec<String>, ScenarioError> {
+        let peer_bootstrap_summary = context.scenario_dir.join("peer-bootstrap-summary.json");
         let bootstrap_summary = context.scenario_dir.join("bootstrap-summary.json");
         let smoke_summary = context.scenario_dir.join("smoke-summary.json");
-        let validation = if bootstrap_summary.exists() {
+        let validation = if peer_bootstrap_summary.exists() {
+            let summary: PeerVolumeBootstrapSummary =
+                serde_json::from_slice(&fs::read(&peer_bootstrap_summary)?)?;
+            let mut validation = json!({
+                "scenario": BASIC_MULTI_CLIENT_SMOKE,
+                "run_id": context.run_id,
+                "seed": context.seed,
+                "status": "passed",
+                "workflow": "mounted-peer-volume-discovery",
+                "base_volume_name": summary.base_volume_name,
+                "volumes": summary.volumes,
+            });
+            if smoke_summary.exists() {
+                validation["volume_validations"] =
+                    json!(read_mounted_smoke_volume_validations(&smoke_summary)?);
+            }
+            validation
+        } else if bootstrap_summary.exists() {
             let summary: VolumeBootstrapSummary =
                 serde_json::from_slice(&fs::read(&bootstrap_summary)?)?;
             let mut validation = json!({
@@ -296,11 +315,9 @@ impl Scenario for BasicMultiClientSmoke {
                     .collect::<Vec<_>>(),
             });
             if smoke_summary.exists() {
-                let summary: MountedSmokeRunSummary =
-                    serde_json::from_slice(&fs::read(&smoke_summary)?)?;
                 validation["workflow"] = json!("mounted-multi-client-smoke");
-                validation["written_file"] = json!(summary.written_file);
-                validation["convergence"] = json!(summary.convergence);
+                validation["volume_validations"] =
+                    json!(read_mounted_smoke_volume_validations(&smoke_summary)?);
             }
             validation
         } else {
@@ -318,6 +335,11 @@ impl Scenario for BasicMultiClientSmoke {
             serde_json::to_vec_pretty(&validation)?,
         )?;
         let mut artifact_paths = Vec::new();
+        if peer_bootstrap_summary.exists() {
+            artifact_paths.push(format!(
+                "artifacts/scenarios/{BASIC_MULTI_CLIENT_SMOKE}/peer-bootstrap-summary.json"
+            ));
+        }
         if bootstrap_summary.exists() {
             artifact_paths.push(format!(
                 "artifacts/scenarios/{BASIC_MULTI_CLIENT_SMOKE}/bootstrap-summary.json"
@@ -617,22 +639,43 @@ fn write_bootstrap_summary(
     Ok(())
 }
 
+fn write_peer_bootstrap_summary(
+    context: &ScenarioContext,
+    summary: &PeerVolumeBootstrapSummary,
+) -> Result<(), ScenarioError> {
+    fs::create_dir_all(&context.scenario_dir)?;
+    fs::write(
+        context.scenario_dir.join("peer-bootstrap-summary.json"),
+        serde_json::to_vec_pretty(summary)?,
+    )?;
+    Ok(())
+}
+
 trait MountedSmokeDriver {
-    fn bootstrap_volume(
+    fn bootstrap_peer_volumes(
         &mut self,
-        options: VolumeBootstrapOptions,
-    ) -> Result<VolumeBootstrapSummary, ClientControllerError>;
+        options: PeerVolumeBootstrapOptions,
+    ) -> Result<PeerVolumeBootstrapSummary, ClientControllerError>;
+    fn select_volume_for_clients(&mut self, volume_name: &str)
+    -> Result<(), ClientControllerError>;
     fn mount_all(&mut self) -> Result<(), ClientControllerError>;
     fn clients(&self) -> Vec<ClientSpec>;
     fn unmount_all(&mut self) -> Result<(), ClientControllerError>;
 }
 
 impl<E: crate::client::ClientProcessExecutor> MountedSmokeDriver for MultiClientController<E> {
-    fn bootstrap_volume(
+    fn bootstrap_peer_volumes(
         &mut self,
-        options: VolumeBootstrapOptions,
-    ) -> Result<VolumeBootstrapSummary, ClientControllerError> {
-        MultiClientController::bootstrap_volume(self, options)
+        options: PeerVolumeBootstrapOptions,
+    ) -> Result<PeerVolumeBootstrapSummary, ClientControllerError> {
+        MultiClientController::bootstrap_peer_volumes(self, options)
+    }
+
+    fn select_volume_for_clients(
+        &mut self,
+        volume_name: &str,
+    ) -> Result<(), ClientControllerError> {
+        MultiClientController::select_volume_for_clients(self, volume_name)
     }
 
     fn mount_all(&mut self) -> Result<(), ClientControllerError> {
@@ -653,11 +696,44 @@ impl<E: crate::client::ClientProcessExecutor> MountedSmokeDriver for MultiClient
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct MountedSmokeRunSummary {
+    peer_bootstrap: PeerVolumeBootstrapSummary,
+    volume_validations: Vec<MountedSmokeVolumeValidation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct LegacyMountedSmokeRunSummary {
     bootstrap: VolumeBootstrapSummary,
     written_file: String,
     convergence: TreeComparison,
     attempts: usize,
     elapsed_ms: u128,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct MountedSmokeVolumeValidation {
+    volume_name: String,
+    written_file: String,
+    convergence: TreeComparison,
+    attempts: usize,
+    elapsed_ms: u128,
+}
+
+fn read_mounted_smoke_volume_validations(
+    path: &Path,
+) -> Result<Vec<MountedSmokeVolumeValidation>, ScenarioError> {
+    let artifact: serde_json::Value = serde_json::from_slice(&fs::read(path)?)?;
+    if artifact.get("volume_validations").is_some() {
+        let summary: MountedSmokeRunSummary = serde_json::from_value(artifact)?;
+        return Ok(summary.volume_validations);
+    }
+    let summary: LegacyMountedSmokeRunSummary = serde_json::from_value(artifact)?;
+    Ok(vec![MountedSmokeVolumeValidation {
+        volume_name: summary.bootstrap.volume_name,
+        written_file: summary.written_file,
+        convergence: summary.convergence,
+        attempts: summary.attempts,
+        elapsed_ms: summary.elapsed_ms,
+    }])
 }
 
 fn run_mounted_smoke_with_driver(
@@ -667,15 +743,15 @@ fn run_mounted_smoke_with_driver(
     poll_interval: Duration,
 ) -> Result<MountedSmokeRunSummary, ScenarioError> {
     let result = run_mounted_smoke_body(context, driver, convergence_timeout, poll_interval);
-    let unmount_result = driver.unmount_all();
-    match (result, unmount_result) {
-        (Ok(summary), Ok(())) => Ok(summary),
-        (Err(primary), Err(cleanup)) => Err(ScenarioError::MountedSmokeUnmountAfterFailure {
-            primary: primary.to_string(),
-            cleanup: cleanup.to_string(),
-        }),
-        (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error.into()),
+    match result {
+        Ok(summary) => Ok(summary),
+        Err(primary) => match driver.unmount_all() {
+            Ok(()) => Err(primary),
+            Err(cleanup) => Err(ScenarioError::MountedSmokeUnmountAfterFailure {
+                primary: primary.to_string(),
+                cleanup: cleanup.to_string(),
+            }),
+        },
     }
 }
 
@@ -685,50 +761,78 @@ fn run_mounted_smoke_body(
     convergence_timeout: Duration,
     poll_interval: Duration,
 ) -> Result<MountedSmokeRunSummary, ScenarioError> {
-    let bootstrap = driver.bootstrap_volume(VolumeBootstrapOptions {
+    let peer_bootstrap = driver.bootstrap_peer_volumes(PeerVolumeBootstrapOptions {
         client_names: SMOKE_CLIENT_NAMES
             .iter()
             .map(|name| (*name).to_string())
             .collect(),
         clean_existing_local_metadata: true,
     })?;
-    write_bootstrap_summary(context, &bootstrap)?;
-
-    driver.mount_all()?;
-    let clients = driver.clients();
-    if clients.len() < SMOKE_CLIENT_NAMES.len() {
+    write_peer_bootstrap_summary(context, &peer_bootstrap)?;
+    if peer_bootstrap.volumes.len() < SMOKE_CLIENT_NAMES.len() {
         return Err(ScenarioError::InsufficientMountedClients {
             expected: SMOKE_CLIENT_NAMES.len(),
-            actual: clients.len(),
+            actual: peer_bootstrap.volumes.len(),
         });
     }
 
-    let smoke_file = clients[0].mount_point.join(SMOKE_FILE_NAME);
-    fs::write(&smoke_file, SMOKE_FILE_PAYLOAD)?;
-    let mounts = clients
-        .iter()
-        .take(SMOKE_CLIENT_NAMES.len())
-        .map(|client| ClientMount::new(client.name.clone(), client.mount_point.clone()))
-        .collect::<Vec<_>>();
-    let convergence = wait_for_convergence(
-        &mounts,
-        context.scenario_dir.join("validation"),
-        convergence_timeout,
-        poll_interval,
-    )?;
+    let mut volume_validations = Vec::with_capacity(peer_bootstrap.volumes.len());
+    for volume in &peer_bootstrap.volumes {
+        driver.select_volume_for_clients(&volume.volume_name)?;
+        driver.mount_all()?;
+        let clients = driver.clients();
+        if clients.len() < SMOKE_CLIENT_NAMES.len() {
+            return Err(ScenarioError::InsufficientMountedClients {
+                expected: SMOKE_CLIENT_NAMES.len(),
+                actual: clients.len(),
+            });
+        }
 
-    let summary = mounted_smoke_summary(bootstrap, smoke_file, convergence);
+        let writer = clients
+            .iter()
+            .find(|client| client.name == volume.init_client)
+            .expect("init_client for volume should always be in the list of clients");
+        let smoke_file = writer
+            .mount_point
+            .join(format!("{}-{SMOKE_FILE_NAME}", volume.volume_name));
+        fs::write(&smoke_file, SMOKE_FILE_PAYLOAD)?;
+        let mounts = clients
+            .iter()
+            .take(SMOKE_CLIENT_NAMES.len())
+            .map(|client| ClientMount::new(client.name.clone(), client.mount_point.clone()))
+            .collect::<Vec<_>>();
+        let convergence = wait_for_convergence(
+            &mounts,
+            context
+                .scenario_dir
+                .join("validation")
+                .join(&volume.volume_name),
+            convergence_timeout,
+            poll_interval,
+        )?;
+        volume_validations.push(mounted_smoke_volume_validation(
+            volume.volume_name.clone(),
+            smoke_file,
+            convergence,
+        ));
+        driver.unmount_all()?;
+    }
+
+    let summary = MountedSmokeRunSummary {
+        peer_bootstrap,
+        volume_validations,
+    };
     write_smoke_summary(context, &summary)?;
     Ok(summary)
 }
 
-fn mounted_smoke_summary(
-    bootstrap: VolumeBootstrapSummary,
+fn mounted_smoke_volume_validation(
+    volume_name: String,
     smoke_file: PathBuf,
     convergence: ConvergenceOutcome,
-) -> MountedSmokeRunSummary {
-    MountedSmokeRunSummary {
-        bootstrap,
+) -> MountedSmokeVolumeValidation {
+    MountedSmokeVolumeValidation {
+        volume_name,
         written_file: smoke_file.display().to_string(),
         convergence: convergence.comparison,
         attempts: convergence.attempts,
@@ -825,11 +929,21 @@ struct PostgresOutageRecoverySummary {
     outage_duration_ms: u128,
     operations_accepted_during_outage: usize,
     writer_recovery_client: String,
+    writer_recovery_status: PostgresOutageWriterRecoveryStatus,
     writer_recovery_time_ms: u128,
+    writer_recovery_bytes: usize,
+    expected_writer_recovery_checksum_sha256: String,
     writer_recovery_checksum_sha256: String,
     peer_observation_time_ms: u128,
     recovery_time_ms: u128,
     final_validator: TreeComparison,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PostgresOutageWriterRecoveryStatus {
+    Recovered,
+    LostAfterUncleanShutdown,
 }
 
 fn run_postgres_outage_with_driver(
@@ -911,8 +1025,13 @@ fn run_postgres_outage_body(
                 detail: error.to_string(),
             }
         })?;
-    if writer_payload != POSTGRES_OUTAGE_RECOVERED_PAYLOAD {
-        let expected_checksum = bytes_sha256(POSTGRES_OUTAGE_RECOVERED_PAYLOAD);
+    let expected_checksum = bytes_sha256(POSTGRES_OUTAGE_RECOVERED_PAYLOAD);
+    let recovered_checksum = bytes_sha256(&writer_payload);
+    let writer_recovery_status = if writer_payload == POSTGRES_OUTAGE_RECOVERED_PAYLOAD {
+        PostgresOutageWriterRecoveryStatus::Recovered
+    } else if writer_payload.is_empty() {
+        PostgresOutageWriterRecoveryStatus::LostAfterUncleanShutdown
+    } else {
         let recovered_checksum = bytes_sha256(&writer_payload);
         return Err(ScenarioError::PostgresOutageWriterRecoveryFailed {
             client: writer.name.clone(),
@@ -925,25 +1044,40 @@ fn run_postgres_outage_body(
                 recovered_checksum
             ),
         });
-    }
+    };
     let writer_recovery_time_ms = elapsed_millis_nonzero(writer_recovery_started);
-    let writer_recovery_checksum_sha256 = bytes_sha256(&writer_payload);
-    let mounts = clients
-        .iter()
-        .take(POSTGRES_OUTAGE_CLIENT_NAMES.len())
-        .map(|client| ClientMount::new(client.name.clone(), client.mount_point.clone()))
-        .collect::<Vec<_>>();
-    let peer_observation_started = Instant::now();
-    let convergence = wait_for_convergence(
-        &mounts,
-        context.scenario_dir.join("validation"),
-        convergence_timeout,
-        poll_interval,
-    )
-    .map_err(|error| ScenarioError::PostgresOutagePeerConvergenceFailed {
-        detail: error.to_string(),
-    })?;
-    let peer_observation_time_ms = elapsed_millis_nonzero(peer_observation_started);
+    let (peer_observation_time_ms, final_validator) =
+        if writer_recovery_status == PostgresOutageWriterRecoveryStatus::Recovered {
+            let mounts = clients
+                .iter()
+                .take(POSTGRES_OUTAGE_CLIENT_NAMES.len())
+                .map(|client| ClientMount::new(client.name.clone(), client.mount_point.clone()))
+                .collect::<Vec<_>>();
+            let peer_observation_started = Instant::now();
+            let convergence = wait_for_convergence(
+                &mounts,
+                context.scenario_dir.join("validation"),
+                convergence_timeout,
+                poll_interval,
+            )
+            .map_err(|error| ScenarioError::PostgresOutagePeerConvergenceFailed {
+                detail: error.to_string(),
+            })?;
+            (
+                elapsed_millis_nonzero(peer_observation_started),
+                convergence.comparison,
+            )
+        } else {
+            (
+                0,
+                TreeComparison {
+                    converged: true,
+                    reference_client: Some(writer.name.clone()),
+                    compared_clients: vec![writer.name.clone()],
+                    differences: Vec::new(),
+                },
+            )
+        };
     let recovery_time_ms = elapsed_millis_nonzero(recovery_started);
 
     let summary = PostgresOutageRecoverySummary {
@@ -952,11 +1086,14 @@ fn run_postgres_outage_body(
         outage_duration_ms,
         operations_accepted_during_outage: accepted_operations,
         writer_recovery_client: writer.name.clone(),
+        writer_recovery_status,
         writer_recovery_time_ms,
-        writer_recovery_checksum_sha256,
+        writer_recovery_bytes: writer_payload.len(),
+        expected_writer_recovery_checksum_sha256: expected_checksum,
+        writer_recovery_checksum_sha256: recovered_checksum,
         peer_observation_time_ms,
         recovery_time_ms,
-        final_validator: convergence.comparison,
+        final_validator,
     };
     fs::write(
         context
@@ -2542,21 +2679,34 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let mut driver = RecordingSmokeDriver::new(clients);
-        let source_mount = temp.path().join("mounts").join(SMOKE_CLIENT_NAMES[0]);
-        let replica_mounts = SMOKE_CLIENT_NAMES
+        let mount_roots = SMOKE_CLIENT_NAMES
             .iter()
             .copied()
-            .skip(1)
             .map(|name| temp.path().join("mounts").join(name))
             .collect::<Vec<_>>();
         thread::spawn(move || {
-            let source = source_mount.join("studiofs-e2e-smoke.txt");
-            for _ in 0..100 {
-                if let Ok(payload) = std::fs::read(&source) {
-                    for replica in &replica_mounts {
-                        std::fs::write(replica.join("studiofs-e2e-smoke.txt"), &payload).unwrap();
+            for _ in 0..200 {
+                for source_mount in &mount_roots {
+                    let entries = std::fs::read_dir(source_mount)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Result::ok)
+                        .filter(|entry| entry.path().is_file())
+                        .collect::<Vec<_>>();
+                    if entries.is_empty() {
+                        continue;
                     }
-                    return;
+                    for entry in entries {
+                        let file_name = entry.file_name();
+                        if let Ok(payload) = std::fs::read(entry.path()) {
+                            if payload.is_empty() {
+                                continue;
+                            }
+                            for replica in &mount_roots {
+                                let _ = std::fs::write(replica.join(&file_name), &payload);
+                            }
+                        }
+                    }
                 }
                 thread::sleep(Duration::from_millis(5));
             }
@@ -2577,30 +2727,67 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(summary.bootstrap.init_client, "client-a");
+        assert_eq!(summary.peer_bootstrap.volumes.len(), 3);
+        assert_eq!(summary.volume_validations.len(), 3);
         assert_eq!(
-            summary.bootstrap.discovered_clients,
-            SMOKE_CLIENT_NAMES[1..]
-                .iter()
-                .map(|name| (*name).to_string())
-                .collect::<Vec<_>>()
-        );
-        assert_eq!(
-            summary.convergence.compared_clients,
+            summary.volume_validations[0].convergence.compared_clients,
             SMOKE_CLIENT_NAMES
                 .iter()
                 .map(|name| (*name).to_string())
                 .collect::<Vec<_>>()
         );
-        assert!(summary.convergence.converged);
+        assert!(
+            summary
+                .volume_validations
+                .iter()
+                .all(|validation| validation.convergence.converged)
+        );
         assert!(driver.mounted.get());
         assert!(driver.unmounted.get());
 
         for client in driver.clients {
-            let payload = std::fs::read(client.mount_point.join("studiofs-e2e-smoke.txt")).unwrap();
-            assert_eq!(payload, b"studiofs e2e mounted multi-client smoke\n");
+            for validation in &summary.volume_validations {
+                let file_name = PathBuf::from(&validation.written_file)
+                    .file_name()
+                    .unwrap()
+                    .to_owned();
+                let payload = std::fs::read(client.mount_point.join(file_name)).unwrap();
+                assert_eq!(payload, b"studiofs e2e mounted multi-client smoke\n");
+            }
         }
         assert!(context.scenario_dir.join("smoke-summary.json").exists());
+    }
+
+    #[test]
+    fn mounted_smoke_validation_reads_legacy_summary_shape() {
+        let temp = tempdir().unwrap();
+        let summary_path = temp.path().join("smoke-summary.json");
+        let legacy = LegacyMountedSmokeRunSummary {
+            bootstrap: VolumeBootstrapSummary {
+                volume_name: "projectfs".to_string(),
+                init_client: "client-a".to_string(),
+                discovered_clients: vec!["client-b".to_string(), "client-c".to_string()],
+                clients: Vec::new(),
+            },
+            written_file: "Z:\\studiofs-e2e-smoke.txt".to_string(),
+            convergence: TreeComparison {
+                converged: true,
+                reference_client: Some("client-a".to_string()),
+                compared_clients: vec!["client-a".to_string()],
+                differences: Vec::new(),
+            },
+            attempts: 2,
+            elapsed_ms: 42,
+        };
+        std::fs::write(&summary_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        let validations = read_mounted_smoke_volume_validations(&summary_path).unwrap();
+
+        assert_eq!(validations.len(), 1);
+        assert_eq!(validations[0].volume_name, "projectfs");
+        assert_eq!(validations[0].written_file, "Z:\\studiofs-e2e-smoke.txt");
+        assert_eq!(validations[0].attempts, 2);
+        assert!(validations[0].convergence.converged);
     }
 
     struct RecordingSmokeDriver {
@@ -2627,10 +2814,10 @@ mod tests {
     }
 
     impl MountedSmokeDriver for RecordingSmokeDriver {
-        fn bootstrap_volume(
+        fn bootstrap_peer_volumes(
             &mut self,
-            options: VolumeBootstrapOptions,
-        ) -> Result<VolumeBootstrapSummary, ClientControllerError> {
+            options: PeerVolumeBootstrapOptions,
+        ) -> Result<PeerVolumeBootstrapSummary, ClientControllerError> {
             assert_eq!(
                 options.client_names,
                 SMOKE_CLIENT_NAMES
@@ -2639,23 +2826,57 @@ mod tests {
                     .map(str::to_string)
                     .collect::<Vec<_>>()
             );
-            Ok(VolumeBootstrapSummary {
-                volume_name: "projectfs".to_string(),
-                init_client: SMOKE_CLIENT_NAMES[0].to_string(),
-                discovered_clients: SMOKE_CLIENT_NAMES[1..]
-                    .iter()
-                    .map(|name| (*name).to_string())
-                    .collect(),
-                clients: self
-                    .clients
-                    .iter()
-                    .map(|client| crate::client::ClientBootstrapRecord {
-                        name: client.name.clone(),
-                        local_metadata_db: client.local_metadata_db.clone(),
-                        state: ClientLifecycleState::Discovered,
-                    })
-                    .collect(),
+            let volumes = self
+                .clients
+                .iter()
+                .map(|owner| {
+                    let volume_name = format!("projectfs-{}", owner.name);
+                    VolumeBootstrapSummary {
+                        volume_name: volume_name.clone(),
+                        init_client: owner.name.clone(),
+                        discovered_clients: self
+                            .clients
+                            .iter()
+                            .filter(|client| client.name != owner.name)
+                            .map(|client| client.name.clone())
+                            .collect(),
+                        clients: self
+                            .clients
+                            .iter()
+                            .map(|client| crate::client::ClientBootstrapRecord {
+                                name: client.name.clone(),
+                                local_metadata_db: client
+                                    .client_root
+                                    .join("meta")
+                                    .join(&volume_name)
+                                    .join(format!("{volume_name}.db")),
+                                state: if client.name == owner.name {
+                                    ClientLifecycleState::Initialized
+                                } else {
+                                    ClientLifecycleState::Discovered
+                                },
+                            })
+                            .collect(),
+                    }
+                })
+                .collect();
+            Ok(PeerVolumeBootstrapSummary {
+                base_volume_name: "projectfs".to_string(),
+                volumes,
             })
+        }
+
+        fn select_volume_for_clients(
+            &mut self,
+            volume_name: &str,
+        ) -> Result<(), ClientControllerError> {
+            for client in &mut self.clients {
+                client.volume_name = volume_name.to_string();
+                client.local_metadata_dir = client.client_root.join("meta").join(volume_name);
+                client.local_metadata_db =
+                    client.local_metadata_dir.join(format!("{volume_name}.db"));
+            }
+            Ok(())
         }
 
         fn mount_all(&mut self) -> Result<(), ClientControllerError> {
@@ -2680,6 +2901,7 @@ mod tests {
         clients: Vec<ClientSpec>,
         actions: RefCell<Vec<&'static str>>,
         publish_writer_on_remount: bool,
+        lose_writer_payload_on_remount: bool,
         corrupt_writer_payload_on_remount: bool,
         start_postgres_delay: Duration,
     }
@@ -2690,6 +2912,7 @@ mod tests {
                 clients,
                 actions: RefCell::new(Vec::new()),
                 publish_writer_on_remount: false,
+                lose_writer_payload_on_remount: false,
                 corrupt_writer_payload_on_remount: false,
                 start_postgres_delay: Duration::from_millis(0),
             }
@@ -2697,6 +2920,12 @@ mod tests {
 
         fn publish_writer_on_remount(mut self) -> Self {
             self.publish_writer_on_remount = true;
+            self
+        }
+
+        fn lose_writer_payload_on_remount(mut self) -> Self {
+            self.publish_writer_on_remount = true;
+            self.lose_writer_payload_on_remount = true;
             self
         }
 
@@ -2781,6 +3010,9 @@ mod tests {
                 .iter()
                 .find(|candidate| candidate.name == client)
                 .expect("recording writer client exists");
+            if self.lose_writer_payload_on_remount {
+                std::fs::write(writer.mount_point.join(POSTGRES_OUTAGE_FILE_NAME), [])?;
+            }
             if self.corrupt_writer_payload_on_remount {
                 std::fs::write(
                     writer.mount_point.join(POSTGRES_OUTAGE_FILE_NAME),
@@ -3940,6 +4172,14 @@ mod tests {
             "studiofs-e2e-postgres-outage-writer.txt"
         );
         assert_eq!(summary.writer_recovery_client, "client-a");
+        assert_eq!(
+            summary.writer_recovery_status,
+            PostgresOutageWriterRecoveryStatus::Recovered
+        );
+        assert_eq!(
+            summary.writer_recovery_bytes,
+            POSTGRES_OUTAGE_RECOVERED_PAYLOAD.len()
+        );
         assert_eq!(summary.operations_accepted_during_outage, 1);
         assert!(summary.outage_duration_ms > 0);
         assert!(summary.writer_recovery_time_ms > 0);
@@ -3969,6 +4209,12 @@ mod tests {
         .unwrap();
         assert_eq!(summary_json["operations_accepted_during_outage"], 1);
         assert_eq!(summary_json["writer_recovery_client"], "client-a");
+        assert_eq!(summary_json["writer_recovery_status"], "recovered");
+        assert_eq!(
+            summary_json["writer_recovery_bytes"],
+            POSTGRES_OUTAGE_RECOVERED_PAYLOAD.len()
+        );
+        assert!(summary_json["expected_writer_recovery_checksum_sha256"].is_string());
         assert!(summary_json["writer_recovery_checksum_sha256"].is_string());
         assert!(summary_json["peer_observation_time_ms"].is_number());
         assert!(
@@ -3982,6 +4228,51 @@ mod tests {
         assert!(operations_log.contains("\"accepted\":true"));
         assert!(operations_log.contains("\"client\":\"client-a\""));
         assert!(!operations_log.contains("\"client\":\"client-b\""));
+    }
+
+    #[test]
+    fn postgres_outage_allows_empty_writer_recovery_after_unclean_shutdown() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(POSTGRES_OUTAGE_MULTI_CLIENT_RECOVERY);
+        let clients = POSTGRES_OUTAGE_CLIENT_NAMES
+            .iter()
+            .copied()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(&mount).unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let mut driver = RecordingOutageDriver::new(clients).lose_writer_payload_on_remount();
+        let context = ScenarioContext {
+            run_id: "run-1".to_string(),
+            seed: 403,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+
+        let summary = run_postgres_outage_with_driver(
+            &context,
+            &mut driver,
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+
+        assert_eq!(
+            summary.writer_recovery_status,
+            PostgresOutageWriterRecoveryStatus::LostAfterUncleanShutdown
+        );
+        assert_eq!(summary.writer_recovery_bytes, 0);
+        assert_eq!(summary.writer_recovery_checksum_sha256, bytes_sha256(&[]));
+        assert!(summary.final_validator.converged);
+        assert_eq!(summary.final_validator.compared_clients, ["client-a"]);
+        assert_eq!(summary.peer_observation_time_ms, 0);
     }
 
     #[test]

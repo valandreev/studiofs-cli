@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 
 use clap::Parser as _;
 use serde_json::Value;
-use studiofs_e2e::cli::{CleanArgs, Cli, Commands, RunArgs};
+use studiofs_e2e::baseline_gate;
+use studiofs_e2e::cli::{BaselineGateArgs, CleanArgs, Cli, Commands, RunArgs};
 use studiofs_e2e::infra::InfraMode;
 use studiofs_e2e::runner::{
     CleanRequest, PlatformSelection, RetentionPolicy, RunRequest, RunStatus, RunnerError,
@@ -44,6 +45,108 @@ fn cli_parses_required_runner_entrypoints() {
 
     let clean = Cli::try_parse_from(["studiofs-e2e", "clean"]).unwrap();
     assert!(matches!(clean.command, Commands::Clean(CleanArgs { .. })));
+}
+
+#[test]
+fn cli_parses_local_first_baseline_gate() {
+    let gate = Cli::try_parse_from([
+        "studiofs-e2e",
+        "local-first-baseline-gate",
+        "--studiofs-bin",
+        "target/debug/studiofs.exe",
+        "--run-id-prefix",
+        "sfs405-baseline",
+        "--iterations",
+        "2",
+        "--seed",
+        "405",
+        "--port-range",
+        "29700-29800",
+    ])
+    .unwrap();
+
+    match gate.command {
+        Commands::LocalFirstBaselineGate(BaselineGateArgs {
+            studiofs_bin,
+            run_id_prefix,
+            iterations,
+            seed,
+            platform,
+            port_range,
+            ..
+        }) => {
+            assert_eq!(studiofs_bin, PathBuf::from("target/debug/studiofs.exe"));
+            assert_eq!(run_id_prefix, "sfs405-baseline");
+            assert_eq!(iterations, 2);
+            assert_eq!(seed, 405);
+            assert_eq!(platform, PlatformSelection::WindowsWinfsp);
+            assert_eq!(port_range.as_deref(), Some("29700-29800"));
+        }
+        other => panic!("expected local-first-baseline-gate command, got {other:?}"),
+    }
+}
+
+#[test]
+fn run_scenario_selection_expands_numeric_ranges() {
+    let cli = Cli::try_parse_from(["studiofs-e2e", "run", "--scenario", "1-3"]).unwrap();
+    let Commands::Run(args) = cli.command else {
+        panic!("expected run command");
+    };
+
+    assert_eq!(args.scenario_names(), scenario_names_by_index(&[1, 2, 3]));
+}
+
+#[test]
+fn run_scenario_selection_expands_comma_separated_numbers() {
+    let cli = Cli::try_parse_from(["studiofs-e2e", "run", "--scenario", "2,5,10"]).unwrap();
+    let Commands::Run(args) = cli.command else {
+        panic!("expected run command");
+    };
+
+    assert_eq!(args.scenario_names(), scenario_names_by_index(&[2, 5, 10]));
+}
+
+#[test]
+fn local_first_baseline_gate_uses_scenarios_1_through_8() {
+    assert_eq!(
+        baseline_gate::SCENARIOS_1_THROUGH_8,
+        [
+            "basic-multi-client-smoke",
+            "rustfs-outage-multi-client-recovery",
+            "collision-rename-vs-rename",
+            "postgres-outage-multi-client-recovery",
+            "mounted-client-crash-restart-recovery",
+            "collision-rename-vs-unlink",
+            "collision-unlink-vs-append",
+            "collision-overwrite-vs-read",
+        ]
+    );
+}
+
+#[test]
+fn scenario_list_order_matches_local_first_baseline_numbering() {
+    let scenarios = studiofs_e2e::scenario::available_scenarios();
+    let first_eight = scenarios
+        .iter()
+        .take(8)
+        .map(|scenario| scenario.name)
+        .collect::<Vec<_>>();
+
+    assert_eq!(first_eight, baseline_gate::SCENARIOS_1_THROUGH_8);
+}
+
+#[test]
+fn e2e_compose_pins_rustfs_baseline_image() {
+    let compose_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("docker/compose.e2e.yml");
+    let compose = fs::read_to_string(compose_path).unwrap();
+
+    assert!(
+        compose.contains("image: rustfs/rustfs:1.0.0-alpha.94"),
+        "SFS-405 baseline gate must reject accidental RustFS latest usage"
+    );
+    assert!(!compose.contains("image: rustfs/rustfs:latest"));
 }
 
 #[test]
@@ -446,4 +549,12 @@ fn assert_required_sandbox_files(sandbox: &Path) {
 fn read_json(path: impl AsRef<Path>) -> Value {
     let content = fs::read_to_string(path).unwrap();
     serde_json::from_str(&content).unwrap()
+}
+
+fn scenario_names_by_index(indexes: &[usize]) -> Vec<String> {
+    let scenarios = studiofs_e2e::scenario::available_scenarios();
+    indexes
+        .iter()
+        .map(|index| scenarios[index - 1].name.to_string())
+        .collect()
 }
