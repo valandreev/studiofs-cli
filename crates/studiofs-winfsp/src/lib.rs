@@ -22,6 +22,7 @@ const DEFAULT_ALLOCATION_UNIT_SIZE: u32 = 1024 * 1024;
 const DEFAULT_MAX_DISPATCHER_THREADS: u32 = 16;
 const DEFAULT_ALLOW_OPEN_IN_KERNEL_MODE: bool = true;
 const DEFAULT_FLUSH_AND_PURGE_ON_CLEANUP: bool = false;
+const DEFAULT_PERSISTENT_ACLS: bool = false;
 const DEFAULT_SECTORS_PER_ALLOCATION_UNIT: u16 =
     (DEFAULT_ALLOCATION_UNIT_SIZE / DEFAULT_SECTOR_SIZE as u32) as u16;
 static WINFSP_RUNTIME_DLL_LOAD: OnceLock<Result<(), String>> = OnceLock::new();
@@ -45,6 +46,7 @@ struct WinfspMountOptions {
     dispatcher_threads: u32,
     allow_open_in_kernel_mode: bool,
     flush_and_purge_on_cleanup: bool,
+    persistent_acls: bool,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -203,6 +205,8 @@ fn parse_mount_options(volume_label: &str) -> Result<WinfspMountOptions, MountOp
         "STUDIOFS_WINFSP_FLUSH_AND_PURGE_ON_CLEANUP",
         DEFAULT_FLUSH_AND_PURGE_ON_CLEANUP,
     );
+    let persistent_acls =
+        parse_bool_env("STUDIOFS_WINFSP_PERSISTENT_ACLS", DEFAULT_PERSISTENT_ACLS);
 
     Ok(WinfspMountOptions {
         volume_label: trimmed.to_string(),
@@ -214,6 +218,7 @@ fn parse_mount_options(volume_label: &str) -> Result<WinfspMountOptions, MountOp
         dispatcher_threads,
         allow_open_in_kernel_mode,
         flush_and_purge_on_cleanup,
+        persistent_acls,
     })
 }
 
@@ -523,7 +528,7 @@ pub fn mount_and_serve(request: WinfspMountRequest) -> std::io::Result<()> {
     volume_params.case_sensitive_search(true);
     volume_params.case_preserved_names(true);
     volume_params.unicode_on_disk(true);
-    volume_params.persistent_acls(true);
+    volume_params.persistent_acls(options.persistent_acls);
     volume_params.reparse_points(true);
     volume_params.named_streams(false);
     volume_params.read_only_volume(read_only);
@@ -709,7 +714,7 @@ mod tests {
     use super::{
         DEFAULT_ALLOCATION_UNIT_SIZE, DEFAULT_ALLOW_OPEN_IN_KERNEL_MODE,
         DEFAULT_DIR_INFO_TIMEOUT_MS, DEFAULT_FILE_INFO_TIMEOUT_MS,
-        DEFAULT_FLUSH_AND_PURGE_ON_CLEANUP, DEFAULT_SECTOR_SIZE,
+        DEFAULT_FLUSH_AND_PURGE_ON_CLEANUP, DEFAULT_PERSISTENT_ACLS, DEFAULT_SECTOR_SIZE,
         DEFAULT_SECTORS_PER_ALLOCATION_UNIT, DEFAULT_VOLUME_INFO_TIMEOUT_MS, MountOptionError,
         WinfspShutdownHost, canonical_drive_mount_point, default_dispatcher_threads,
         is_drive_root_mount_point, mount_manager_mount_point, parse_mount_options,
@@ -762,6 +767,42 @@ mod tests {
             opts.flush_and_purge_on_cleanup,
             DEFAULT_FLUSH_AND_PURGE_ON_CLEANUP
         );
+    }
+
+    #[test]
+    fn parse_mount_options_defaults_to_non_persistent_acls() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        // SAFETY: Tests are single-threaded via `_guard` and temporarily mutate
+        // process environment variables for deterministic parsing behavior.
+        unsafe {
+            std::env::remove_var("STUDIOFS_WINFSP_PERSISTENT_ACLS");
+        }
+
+        let opts = parse_mount_options("StudioFS").expect("options");
+        assert_eq!(opts.persistent_acls, DEFAULT_PERSISTENT_ACLS);
+        assert!(!opts.persistent_acls);
+    }
+
+    #[test]
+    fn parse_mount_options_allows_persistent_acls_override() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        // SAFETY: Tests are single-threaded via `_guard` and temporarily mutate
+        // process environment variables for deterministic parsing behavior.
+        unsafe {
+            std::env::set_var("STUDIOFS_WINFSP_PERSISTENT_ACLS", "1");
+        }
+
+        let opts = parse_mount_options("StudioFS").expect("options");
+        assert!(
+            opts.persistent_acls,
+            "explicit WinFSP boolean override should be able to advertise persistent ACLs"
+        );
+
+        // SAFETY: Tests are single-threaded via `_guard` and restore environment
+        // variables that were written earlier in the test.
+        unsafe {
+            std::env::remove_var("STUDIOFS_WINFSP_PERSISTENT_ACLS");
+        }
     }
 
     #[test]
