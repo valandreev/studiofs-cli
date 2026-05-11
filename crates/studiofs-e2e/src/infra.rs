@@ -92,6 +92,12 @@ pub struct ServicePort {
     pub env_var: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComposeServiceImage {
+    pub service: String,
+    pub image: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandSpec {
     pub program: String,
@@ -205,6 +211,12 @@ impl DockerComposeStack {
         &self.ports
     }
 
+    pub fn compose_images(&self) -> Result<Vec<ComposeServiceImage>, InfraError> {
+        Ok(compose_service_images(&fs::read_to_string(
+            &self.compose_file,
+        )?)?)
+    }
+
     pub fn prepare_artifacts(&self) -> Result<(), InfraError> {
         fs::create_dir_all(self.docker_artifact_dir())?;
         fs::copy(&self.compose_file, self.artifact_compose_file())?;
@@ -254,7 +266,7 @@ impl DockerComposeStack {
                 detail: format!("failed to read {}", self.compose_file.display()),
             };
         };
-        let images = match compose_images(&compose) {
+        let images = match compose_service_images(&compose) {
             Ok(images) => images,
             Err(error) => {
                 return InfraCheck {
@@ -265,16 +277,22 @@ impl DockerComposeStack {
             }
         };
         let mut errors = Vec::new();
-        if !images.iter().any(|image| image == "postgres:18-alpine") {
+        if !images
+            .iter()
+            .any(|image| image.image == "postgres:18-alpine")
+        {
             errors.push("PostgreSQL image must stay pinned to postgres:18-alpine");
         }
         if !images
             .iter()
-            .any(|image| image == "rustfs/rustfs:1.0.0-alpha.94")
+            .any(|image| image.image == "rustfs/rustfs:1.0.0-alpha.94")
         {
             errors.push("RustFS image must stay pinned to rustfs/rustfs:1.0.0-alpha.94");
         }
-        if images.iter().any(|image| image == "rustfs/rustfs:latest") {
+        if images
+            .iter()
+            .any(|image| image.image == "rustfs/rustfs:latest")
+        {
             errors.push("RustFS latest is rejected by the Local First baseline gate");
         }
 
@@ -502,7 +520,7 @@ impl DockerComposeStack {
     }
 }
 
-fn compose_images(compose: &str) -> Result<Vec<String>, serde_yaml::Error> {
+fn compose_service_images(compose: &str) -> Result<Vec<ComposeServiceImage>, serde_yaml::Error> {
     let document: serde_yaml::Value = serde_yaml::from_str(compose)?;
     let Some(services) = mapping_value(&document, "services") else {
         return Ok(Vec::new());
@@ -510,12 +528,22 @@ fn compose_images(compose: &str) -> Result<Vec<String>, serde_yaml::Error> {
     let Some(services) = services.as_mapping() else {
         return Ok(Vec::new());
     };
-    Ok(services
-        .values()
-        .filter_map(|service| mapping_value(service, "image"))
-        .filter_map(serde_yaml::Value::as_str)
-        .map(str::to_string)
-        .collect())
+    let mut images = Vec::new();
+    for (name, service) in services {
+        let Some(service_name) = name.as_str() else {
+            continue;
+        };
+        let Some(image) = mapping_value(service, "image").and_then(serde_yaml::Value::as_str)
+        else {
+            continue;
+        };
+        images.push(ComposeServiceImage {
+            service: service_name.to_string(),
+            image: image.to_string(),
+        });
+    }
+    images.sort_by(|left, right| left.service.cmp(&right.service));
+    Ok(images)
 }
 
 fn mapping_value<'a>(value: &'a serde_yaml::Value, key: &str) -> Option<&'a serde_yaml::Value> {
