@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
+use chrono::{SecondsFormat, Utc};
 use clap::{Args, Parser, Subcommand};
 
 use crate::baseline_gate::{self, BaselineGateRequest};
@@ -232,7 +233,8 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
         Commands::Run(args) => {
             let outcome = runner::run(args.into_request())?;
             println!(
-                "run_id={} status={:?} report={}",
+                "timestamp={} run_id={} status={:?} report={}",
+                timestamp(),
                 outcome.run_id,
                 outcome.status,
                 outcome.report_path.display()
@@ -243,7 +245,8 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             let outcome = baseline_gate::run(args.into_request())?;
             for run in &outcome.runs {
                 println!(
-                    "run_id={} status={:?} report={}",
+                    "timestamp={} run_id={} status={:?} report={}",
+                    timestamp(),
                     run.run_id,
                     run.status,
                     run.report_path.display()
@@ -262,4 +265,8 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             Ok(0)
         }
     }
+}
+
+fn timestamp() -> String {
+    Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }

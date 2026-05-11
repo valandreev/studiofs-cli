@@ -245,7 +245,13 @@ pub fn run_with_executor(
     write_runner_marker(&sandbox, &run_id)?;
     write_log_files(&sandbox)?;
 
-    emit_progress(&run_id, "runner", "preflight", ProgressStatus::Started);
+    emit_progress(
+        &run_id,
+        "runner",
+        None,
+        "preflight",
+        ProgressStatus::Started,
+    );
     let prepared_preflight = prepare_preflight(
         &root,
         &sandbox,
@@ -257,6 +263,7 @@ pub fn run_with_executor(
     emit_progress(
         &run_id,
         "runner",
+        None,
         "preflight",
         if preflight.status == RunStatus::Passed {
             ProgressStatus::Passed
@@ -276,7 +283,7 @@ pub fn run_with_executor(
         write_pretty_json(&sandbox.join("preflight.json"), &preflight)?;
         let mut cleanup_actions = Vec::new();
         let mut cleanup_errors = Vec::new();
-        emit_progress(&run_id, "runner", "cleanup", ProgressStatus::Started);
+        emit_progress(&run_id, "runner", None, "cleanup", ProgressStatus::Started);
         compose_cleanup_guard.collect_into(&mut cleanup_actions, &mut cleanup_errors);
         let cleanup = CleanupReport {
             status: if cleanup_errors.is_empty() {
@@ -291,6 +298,7 @@ pub fn run_with_executor(
         emit_progress(
             &run_id,
             "runner",
+            None,
             "cleanup",
             if cleanup.status == RunStatus::Passed {
                 ProgressStatus::Passed
@@ -333,11 +341,17 @@ pub fn run_with_executor(
     let mut scenario_reports = Vec::new();
     let mut scenario_outcomes = Vec::new();
     let mut cleanup_errors = Vec::new();
-    for resolved in scenarios {
+    let scenario_total = scenarios.len();
+    for (scenario_index, resolved) in scenarios.into_iter().enumerate() {
         let definition = resolved.definition;
+        let scenario_progress = ScenarioProgress {
+            index: scenario_index + 1,
+            total: scenario_total,
+        };
         emit_progress(
             &run_id,
             definition.name,
+            Some(scenario_progress),
             "scenario",
             ProgressStatus::Started,
         );
@@ -364,14 +378,20 @@ pub fn run_with_executor(
             },
         };
 
-        let lifecycle =
-            run_scenario_lifecycle(&events_path, &run_id, resolved.scenario.as_ref(), &context)?;
+        let lifecycle = run_scenario_lifecycle(
+            &events_path,
+            &run_id,
+            resolved.scenario.as_ref(),
+            &context,
+            scenario_progress,
+        )?;
         if let Some(cleanup_error) = &lifecycle.cleanup_error {
             cleanup_errors.push(format!("{}: {cleanup_error}", lifecycle.outcome.name));
         }
         emit_progress(
             &run_id,
             definition.name,
+            Some(scenario_progress),
             "scenario",
             if lifecycle.outcome.status == ScenarioStatus::Passed {
                 ProgressStatus::Passed
@@ -385,7 +405,7 @@ pub fn run_with_executor(
 
     record_event(&events_path, &run_id, None, "run", "finished")?;
     let mut cleanup_actions = Vec::new();
-    emit_progress(&run_id, "runner", "cleanup", ProgressStatus::Started);
+    emit_progress(&run_id, "runner", None, "cleanup", ProgressStatus::Started);
     compose_cleanup_guard.collect_into(&mut cleanup_actions, &mut cleanup_errors);
 
     let cleanup = CleanupReport {
@@ -401,6 +421,7 @@ pub fn run_with_executor(
     emit_progress(
         &run_id,
         "runner",
+        None,
         "cleanup",
         if cleanup.status == RunStatus::Passed {
             ProgressStatus::Passed
@@ -1141,6 +1162,7 @@ fn run_scenario_lifecycle(
     run_id: &str,
     scenario: &dyn scenario::Scenario,
     context: &ScenarioContext,
+    progress: ScenarioProgress,
 ) -> Result<ScenarioLifecycleOutcome, RunnerError> {
     let definition = scenario.definition();
     let started_at = timestamp();
@@ -1149,12 +1171,20 @@ fn run_scenario_lifecycle(
     let operation_artifact = scenario_artifact_path(definition.name, "operations.ndjson");
 
     fs::create_dir_all(&context.scenario_dir)?;
-    let result = run_scenario_body(events_path, &operation_log, run_id, scenario, context);
+    let result = run_scenario_body(
+        events_path,
+        &operation_log,
+        run_id,
+        scenario,
+        context,
+        progress,
+    );
     let cleanup_result = run_hook(
         events_path,
         &operation_log,
         run_id,
         definition.name,
+        Some(progress),
         "cleanup",
         || scenario.cleanup(context),
     );
@@ -1224,6 +1254,7 @@ fn run_scenario_body(
     run_id: &str,
     scenario: &dyn scenario::Scenario,
     context: &ScenarioContext,
+    progress: ScenarioProgress,
 ) -> Result<Vec<String>, RunnerError> {
     let definition = scenario.definition();
     run_hook(
@@ -1231,6 +1262,7 @@ fn run_scenario_body(
         operation_log,
         run_id,
         definition.name,
+        Some(progress),
         "setup",
         || scenario.setup(context),
     )?;
@@ -1239,6 +1271,7 @@ fn run_scenario_body(
         operation_log,
         run_id,
         definition.name,
+        Some(progress),
         "run",
         || scenario.run(context),
     )?;
@@ -1247,6 +1280,7 @@ fn run_scenario_body(
         operation_log,
         run_id,
         definition.name,
+        Some(progress),
         "validate",
         || scenario.validate(context),
     )
@@ -1257,10 +1291,11 @@ fn run_hook<T>(
     operation_log: &Path,
     run_id: &str,
     scenario: &str,
+    progress: Option<ScenarioProgress>,
     hook: &str,
     f: impl FnOnce() -> Result<T, scenario::ScenarioError>,
 ) -> Result<T, RunnerError> {
-    emit_progress(run_id, scenario, hook, ProgressStatus::Started);
+    emit_progress(run_id, scenario, progress, hook, ProgressStatus::Started);
     record_event(events_path, run_id, Some(scenario), hook, "started")?;
     record_event(operation_log, run_id, Some(scenario), hook, "started")?;
     let result = f();
@@ -1270,6 +1305,7 @@ fn run_hook<T>(
     emit_progress(
         run_id,
         scenario,
+        progress,
         hook,
         if result.is_ok() {
             ProgressStatus::Passed
@@ -1297,15 +1333,43 @@ impl ProgressStatus {
     }
 }
 
-fn progress_line(run_id: &str, task: &str, phase: &str, status: ProgressStatus) -> String {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScenarioProgress {
+    index: usize,
+    total: usize,
+}
+
+fn progress_line(
+    timestamp: &str,
+    run_id: &str,
+    task: &str,
+    progress: Option<ScenarioProgress>,
+    phase: &str,
+    status: ProgressStatus,
+) -> String {
+    let progress = progress
+        .map(|progress| format!(" scenario_progress={}/{}", progress.index, progress.total))
+        .unwrap_or_default();
     format!(
-        "studiofs-e2e run_id={run_id} task={task} phase={phase} status={}",
+        "timestamp={timestamp} studiofs-e2e run_id={run_id} task={task}{progress} phase={phase} status={}",
         status.as_str()
     )
 }
 
-fn emit_progress(run_id: &str, task: &str, phase: &str, status: ProgressStatus) {
-    eprintln!("{}", progress_line(run_id, task, phase, status));
+fn emit_progress(
+    run_id: &str,
+    task: &str,
+    progress: Option<ScenarioProgress>,
+    phase: &str,
+    status: ProgressStatus,
+) {
+    let mut stderr = std::io::stderr().lock();
+    let _ = writeln!(
+        stderr,
+        "{}",
+        progress_line(&timestamp(), run_id, task, progress, phase, status)
+    );
+    let _ = stderr.flush();
 }
 
 fn record_event(
@@ -1328,6 +1392,7 @@ fn record_event(
         .open(events_path)?;
     serde_json::to_writer(&mut file, &record)?;
     file.write_all(b"\n")?;
+    file.flush()?;
     Ok(())
 }
 
@@ -1708,7 +1773,14 @@ mod tests {
         };
         let scenario = FailingValidateScenario::new();
 
-        let outcome = run_scenario_lifecycle(&events_path, "run-1", &scenario, &context).unwrap();
+        let outcome = run_scenario_lifecycle(
+            &events_path,
+            "run-1",
+            &scenario,
+            &context,
+            ScenarioProgress { index: 1, total: 1 },
+        )
+        .unwrap();
 
         assert_eq!(outcome.outcome.status, ScenarioStatus::Failed);
         assert!(outcome.report.error.unwrap().contains("validation failed"));
@@ -1723,12 +1795,29 @@ mod tests {
     fn progress_line_names_task_phase_and_status() {
         assert_eq!(
             progress_line(
+                "2026-05-11T16:40:00.000Z",
                 "run-1",
                 "collision-rename-vs-rename",
+                Some(ScenarioProgress { index: 3, total: 8 }),
                 "validate",
                 ProgressStatus::Failed
             ),
-            "studiofs-e2e run_id=run-1 task=collision-rename-vs-rename phase=validate status=failed"
+            "timestamp=2026-05-11T16:40:00.000Z studiofs-e2e run_id=run-1 task=collision-rename-vs-rename scenario_progress=3/8 phase=validate status=failed"
+        );
+    }
+
+    #[test]
+    fn progress_line_omits_scenario_progress_for_runner_tasks() {
+        assert_eq!(
+            progress_line(
+                "2026-05-11T16:40:00.000Z",
+                "run-1",
+                "runner",
+                None,
+                "preflight",
+                ProgressStatus::Started
+            ),
+            "timestamp=2026-05-11T16:40:00.000Z studiofs-e2e run_id=run-1 task=runner phase=preflight status=started"
         );
     }
 
