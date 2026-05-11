@@ -4,7 +4,9 @@ use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
-use std::time::Instant;
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use chrono::{SecondsFormat, Utc};
 use clap::ValueEnum;
@@ -30,6 +32,7 @@ use crate::scenario::{self, ScenarioContext};
 const SCHEMA_VERSION: u32 = 1;
 const RUNNER_CRATE: &str = "studiofs-e2e";
 const RUNNER_MARKER_FILE: &str = ".studiofs-e2e-runner.json";
+const PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -1298,7 +1301,9 @@ fn run_hook<T>(
     emit_progress(run_id, scenario, progress, hook, ProgressStatus::Started);
     record_event(events_path, run_id, Some(scenario), hook, "started")?;
     record_event(operation_log, run_id, Some(scenario), hook, "started")?;
+    let heartbeat = ProgressHeartbeat::start(run_id, scenario, progress, hook);
     let result = f();
+    heartbeat.stop();
     let phase = if result.is_ok() { "finished" } else { "failed" };
     record_event(events_path, run_id, Some(scenario), hook, phase)?;
     record_event(operation_log, run_id, Some(scenario), hook, phase)?;
@@ -1319,6 +1324,7 @@ fn run_hook<T>(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProgressStatus {
     Started,
+    Running,
     Passed,
     Failed,
 }
@@ -1327,6 +1333,7 @@ impl ProgressStatus {
     fn as_str(self) -> &'static str {
         match self {
             Self::Started => "started",
+            Self::Running => "running",
             Self::Passed => "passed",
             Self::Failed => "failed",
         }
@@ -1370,6 +1377,36 @@ fn emit_progress(
         progress_line(&timestamp(), run_id, task, progress, phase, status)
     );
     let _ = stderr.flush();
+}
+
+struct ProgressHeartbeat {
+    stop: mpsc::Sender<()>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl ProgressHeartbeat {
+    fn start(run_id: &str, task: &str, progress: Option<ScenarioProgress>, phase: &str) -> Self {
+        let (stop, stop_rx) = mpsc::channel();
+        let run_id = run_id.to_string();
+        let task = task.to_string();
+        let phase = phase.to_string();
+        let handle = thread::spawn(move || {
+            while stop_rx.recv_timeout(PROGRESS_HEARTBEAT_INTERVAL).is_err() {
+                emit_progress(&run_id, &task, progress, &phase, ProgressStatus::Running);
+            }
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn stop(mut self) {
+        let _ = self.stop.send(());
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 fn record_event(
@@ -1818,6 +1855,21 @@ mod tests {
                 ProgressStatus::Started
             ),
             "timestamp=2026-05-11T16:40:00.000Z studiofs-e2e run_id=run-1 task=runner phase=preflight status=started"
+        );
+    }
+
+    #[test]
+    fn progress_line_reports_running_heartbeat_status() {
+        assert_eq!(
+            progress_line(
+                "2026-05-11T16:40:10.000Z",
+                "run-1",
+                "basic-multi-client-smoke",
+                Some(ScenarioProgress { index: 1, total: 8 }),
+                "run",
+                ProgressStatus::Running
+            ),
+            "timestamp=2026-05-11T16:40:10.000Z studiofs-e2e run_id=run-1 task=basic-multi-client-smoke scenario_progress=1/8 phase=run status=running"
         );
     }
 
