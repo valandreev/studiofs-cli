@@ -4240,31 +4240,8 @@ mod tests {
                 client_spec_for(&sandbox, "projectfs", name, mount)
             })
             .collect::<Vec<_>>();
-        let source_mount = temp.path().join("mounts").join("client-a");
-        let peer_mounts = ["client-b", "client-c"]
-            .into_iter()
-            .map(|name| temp.path().join("mounts").join(name))
-            .collect::<Vec<_>>();
-        thread::spawn(move || {
-            let files = [
-                CRASH_RESTART_LOCAL_DURABLE_FILE_NAME,
-                CRASH_RESTART_BEFORE_PUBLICATION_FILE_NAME,
-            ];
-            for file in files {
-                let source = source_mount.join(file);
-                for _ in 0..100 {
-                    if let Ok(payload) = std::fs::read(&source) {
-                        thread::sleep(Duration::from_millis(50));
-                        for peer in &peer_mounts {
-                            std::fs::write(peer.join(file), &payload).unwrap();
-                        }
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(5));
-                }
-            }
-        });
-        let mut driver = RecordingCrashRestartDriver::new(clients);
+        let mut driver =
+            RecordingCrashRestartDriver::new(clients).publish_current_file_before_convergence();
         let context = ScenarioContext {
             run_id: "run-1".to_string(),
             seed: 327,
