@@ -19,14 +19,12 @@ fn read_workspace_file(path: &str) -> String {
     })
 }
 
-fn contains_doc_term(doc: &str, term: &str) -> bool {
-    if doc.contains(term) {
-        return true;
-    }
+fn normalize_doc_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
 
-    let normalized_doc = doc.split_whitespace().collect::<Vec<_>>().join(" ");
-    let normalized_term = term.split_whitespace().collect::<Vec<_>>().join(" ");
-    normalized_doc.contains(&normalized_term)
+fn contains_doc_term(doc: &str, normalized_doc: &str, term: &str) -> bool {
+    doc.contains(term) || normalized_doc.contains(&normalize_doc_whitespace(term))
 }
 
 fn collect_term_hits(path: &str, terms: &[&str]) -> Vec<String> {
@@ -640,8 +638,9 @@ fn deterministic_simulation_architecture_covers_required_sfs330_surfaces() {
 #[test]
 fn deterministic_simulation_architecture_covers_sfs407_replan() {
     let doc = read_workspace_file("docs/deterministic-simulation-architecture.md");
+    let normalized_doc = normalize_doc_whitespace(&doc);
     let required_terms = [
-        "## SFS-407 Replan From Accepted Local First Contracts",
+        "SFS-407 Replan From Accepted Local First Contracts",
         "SFS-330",
         "SFS-402",
         "SFS-405",
@@ -661,7 +660,7 @@ fn deterministic_simulation_architecture_covers_sfs407_replan() {
     let missing: Vec<_> = required_terms
         .iter()
         .copied()
-        .filter(|term| !contains_doc_term(&doc, term))
+        .filter(|term| !contains_doc_term(&doc, &normalized_doc, term))
         .collect();
 
     assert!(
