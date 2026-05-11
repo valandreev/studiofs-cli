@@ -769,6 +769,12 @@ fn run_mounted_smoke_body(
         clean_existing_local_metadata: true,
     })?;
     write_peer_bootstrap_summary(context, &peer_bootstrap)?;
+    if peer_bootstrap.volumes.len() < SMOKE_CLIENT_NAMES.len() {
+        return Err(ScenarioError::InsufficientMountedClients {
+            expected: SMOKE_CLIENT_NAMES.len(),
+            actual: peer_bootstrap.volumes.len(),
+        });
+    }
 
     let mut volume_validations = Vec::with_capacity(peer_bootstrap.volumes.len());
     for volume in &peer_bootstrap.volumes {
