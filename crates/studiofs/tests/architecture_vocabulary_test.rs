@@ -19,6 +19,16 @@ fn read_workspace_file(path: &str) -> String {
     })
 }
 
+fn contains_doc_term(doc: &str, term: &str) -> bool {
+    if doc.contains(term) {
+        return true;
+    }
+
+    let normalized_doc = doc.split_whitespace().collect::<Vec<_>>().join(" ");
+    let normalized_term = term.split_whitespace().collect::<Vec<_>>().join(" ");
+    normalized_doc.contains(&normalized_term)
+}
+
 fn collect_term_hits(path: &str, terms: &[&str]) -> Vec<String> {
     let contents = read_workspace_file(path);
     collect_term_hits_from_contents(path, &contents, terms)
@@ -643,7 +653,7 @@ fn deterministic_simulation_architecture_covers_sfs407_replan() {
         "real mounted E2E owns",
         "OS cache behavior",
         "WinFSP callback timing",
-        "kernel notification",
+        "kernel notification delivery",
         "SFS-395 through SFS-400",
         "clear product invariant",
     ];
@@ -651,7 +661,7 @@ fn deterministic_simulation_architecture_covers_sfs407_replan() {
     let missing: Vec<_> = required_terms
         .iter()
         .copied()
-        .filter(|term| !doc.contains(term))
+        .filter(|term| !contains_doc_term(&doc, term))
         .collect();
 
     assert!(
