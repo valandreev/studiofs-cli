@@ -75,9 +75,12 @@ pub struct EnvironmentReport {
     pub studiofs_bin: Option<String>,
     pub compose_project: Option<String>,
     pub compose_images: Vec<ComposeImageReport>,
+    pub compose_images_error: Option<String>,
     pub allocated_ports: Vec<ServicePort>,
     pub client_roots: Vec<String>,
     pub mount_roots: Vec<String>,
+    pub client_root_ownership: Vec<PathOwnershipReport>,
+    pub mount_root_ownership: Vec<PathOwnershipReport>,
     pub winfsp_version: Option<String>,
 }
 
@@ -85,6 +88,13 @@ pub struct EnvironmentReport {
 pub struct ComposeImageReport {
     pub service: String,
     pub image: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PathOwnershipReport {
+    pub path: String,
+    pub owner: Option<String>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -182,9 +192,12 @@ mod tests {
                 studiofs_bin: None,
                 compose_project: None,
                 compose_images: Vec::new(),
+                compose_images_error: None,
                 allocated_ports: Vec::new(),
                 client_roots: Vec::new(),
                 mount_roots: Vec::new(),
+                client_root_ownership: Vec::new(),
+                mount_root_ownership: Vec::new(),
                 winfsp_version: None,
             },
             preflight: PreflightReport {

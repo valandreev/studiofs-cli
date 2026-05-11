@@ -1,10 +1,10 @@
 //! Local First baseline gate orchestration for the accepted mounted scenario set.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context as _, Result, bail};
 
-use crate::infra::{CommandExecutor, CommandSpec, InfraMode, SystemCommandExecutor};
+use crate::infra::{CommandExecutor, InfraMode, SystemCommandExecutor};
 use crate::runner::{self, PlatformSelection, RetentionPolicy, RunOutcome, RunRequest, RunStatus};
 use crate::scenario;
 
@@ -68,8 +68,6 @@ pub fn run_with_executor(
         bail!("baseline gate iterations must be greater than zero");
     }
 
-    check_windows_process_cleanliness(request.platform, &request.root, executor)?;
-
     let mut runs = Vec::with_capacity(request.iterations);
     for index in 0..request.iterations {
         let run_id = if request.iterations == 1 {
@@ -101,85 +99,4 @@ pub fn run_with_executor(
     }
 
     Ok(BaselineGateOutcome { runs })
-}
-
-fn check_windows_process_cleanliness(
-    platform: PlatformSelection,
-    root: &Path,
-    executor: &dyn CommandExecutor,
-) -> Result<()> {
-    if platform != PlatformSelection::WindowsWinfsp {
-        return Ok(());
-    }
-
-    let output = executor.run(&windows_stale_process_command(root))?;
-
-    if output.status != 0 {
-        bail!(
-            "failed to check stale StudioFS processes before baseline gate: {}",
-            output.stderr.trim()
-        );
-    }
-    let stale_processes = output.stdout.trim();
-    if !stale_processes.is_empty() {
-        bail!(
-            "stale runner-owned StudioFS processes are still running before baseline gate:\n{}",
-            stale_processes
-        );
-    }
-    Ok(())
-}
-
-fn windows_stale_process_command(root: &Path) -> CommandSpec {
-    let root = absolute_without_requiring_exists(root);
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/check-stale-processes.ps1");
-    CommandSpec {
-        program: "powershell".to_string(),
-        args: vec![
-            "-NoProfile".to_string(),
-            "-ExecutionPolicy".to_string(),
-            "Bypass".to_string(),
-            "-File".to_string(),
-            script.display().to_string(),
-        ],
-        env: vec![
-            (
-                "STUDIOFS_E2E_BASELINE_ROOT".to_string(),
-                root.display().to_string(),
-            ),
-            (
-                "STUDIOFS_E2E_BASELINE_SELF_PID".to_string(),
-                std::process::id().to_string(),
-            ),
-        ],
-        cwd: None,
-    }
-}
-
-fn absolute_without_requiring_exists(path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        return path.to_path_buf();
-    }
-    std::env::current_dir()
-        .map(|cwd| cwd.join(path))
-        .unwrap_or_else(|_| path.to_path_buf())
-}
-
-#[cfg(test)]
-mod tests {
-    use std::path::Path;
-
-    use super::windows_stale_process_command;
-
-    #[test]
-    fn windows_process_check_uses_requested_root_instead_of_default_root() {
-        let command = windows_stale_process_command(Path::new("D:\\custom-e2e-root"));
-
-        assert!(command.env.contains(&(
-            "STUDIOFS_E2E_BASELINE_ROOT".to_string(),
-            "D:\\custom-e2e-root".to_string()
-        )));
-        assert!(command.args.iter().any(|arg| arg.ends_with(".ps1")));
-        assert!(!command.args.join(" ").contains("target\\\\e2e-runs"));
-    }
 }

@@ -325,16 +325,22 @@ fn run_creates_per_run_sandbox_manifest_report_and_validation_artifact() {
         report["environment"]["compose_images"]
             .as_array()
             .unwrap()
-            .iter()
-            .any(|image| image["service"] == "postgres" && image["image"] == "postgres:18-alpine")
+            .is_empty()
     );
-    assert!(
-        report["environment"]["compose_images"]
+    assert!(report["environment"]["compose_images_error"].is_null());
+    assert_eq!(
+        report["environment"]["client_root_ownership"]
             .as_array()
             .unwrap()
-            .iter()
-            .any(|image| image["service"] == "rustfs"
-                && image["image"] == "rustfs/rustfs:1.0.0-alpha.94")
+            .len(),
+        4
+    );
+    assert_eq!(
+        report["environment"]["mount_root_ownership"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
     );
 
     let validation =

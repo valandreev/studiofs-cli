@@ -17,13 +17,13 @@ use crate::client::{
     client_mount_point, client_root_dir,
 };
 use crate::infra::{
-    CommandExecutor, ComposeConfig, DockerComposeStack, InfraCheck, InfraError, InfraMode,
-    SystemCommandExecutor,
+    CommandExecutor, CommandSpec, ComposeConfig, DockerComposeStack, InfraCheck, InfraError,
+    InfraMode, SystemCommandExecutor,
 };
 use crate::report::{
     ArtifactReport, CleanupReport, ComposeImageReport, EnvironmentReport, EventRecord, HostReport,
-    PreflightCheckReport, PreflightReport, RunManifest, RunReport, RunnerReport, SandboxReport,
-    ScenarioReport,
+    PathOwnershipReport, PreflightCheckReport, PreflightReport, RunManifest, RunReport,
+    RunnerReport, SandboxReport, ScenarioReport,
 };
 use crate::scenario::{self, ScenarioContext};
 
@@ -245,8 +245,25 @@ pub fn run_with_executor(
     write_runner_marker(&sandbox, &run_id)?;
     write_log_files(&sandbox)?;
 
-    let prepared_preflight = prepare_preflight(&sandbox, compose_stack.as_ref(), executor)?;
+    emit_progress(&run_id, "runner", "preflight", ProgressStatus::Started);
+    let prepared_preflight = prepare_preflight(
+        &root,
+        &sandbox,
+        request.platform,
+        compose_stack.as_ref(),
+        executor,
+    )?;
     let preflight = prepared_preflight.report;
+    emit_progress(
+        &run_id,
+        "runner",
+        "preflight",
+        if preflight.status == RunStatus::Passed {
+            ProgressStatus::Passed
+        } else {
+            ProgressStatus::Failed
+        },
+    );
     let mut compose_cleanup_guard = ComposeCleanupGuard::new(
         if prepared_preflight.compose_start_attempted {
             compose_stack.as_ref()
@@ -259,6 +276,7 @@ pub fn run_with_executor(
         write_pretty_json(&sandbox.join("preflight.json"), &preflight)?;
         let mut cleanup_actions = Vec::new();
         let mut cleanup_errors = Vec::new();
+        emit_progress(&run_id, "runner", "cleanup", ProgressStatus::Started);
         compose_cleanup_guard.collect_into(&mut cleanup_actions, &mut cleanup_errors);
         let cleanup = CleanupReport {
             status: if cleanup_errors.is_empty() {
@@ -270,6 +288,16 @@ pub fn run_with_executor(
             errors: cleanup_errors,
         };
         write_pretty_json(&sandbox.join("cleanup.json"), &cleanup)?;
+        emit_progress(
+            &run_id,
+            "runner",
+            "cleanup",
+            if cleanup.status == RunStatus::Passed {
+                ProgressStatus::Passed
+            } else {
+                ProgressStatus::Failed
+            },
+        );
         return finish_run(FinishRunInput {
             run_id: run_id.clone(),
             seed: request.seed,
@@ -307,6 +335,12 @@ pub fn run_with_executor(
     let mut cleanup_errors = Vec::new();
     for resolved in scenarios {
         let definition = resolved.definition;
+        emit_progress(
+            &run_id,
+            definition.name,
+            "scenario",
+            ProgressStatus::Started,
+        );
         let context = ScenarioContext {
             run_id: run_id.clone(),
             seed: request.seed,
@@ -335,12 +369,23 @@ pub fn run_with_executor(
         if let Some(cleanup_error) = &lifecycle.cleanup_error {
             cleanup_errors.push(format!("{}: {cleanup_error}", lifecycle.outcome.name));
         }
+        emit_progress(
+            &run_id,
+            definition.name,
+            "scenario",
+            if lifecycle.outcome.status == ScenarioStatus::Passed {
+                ProgressStatus::Passed
+            } else {
+                ProgressStatus::Failed
+            },
+        );
         scenario_reports.push(lifecycle.report);
         scenario_outcomes.push(lifecycle.outcome);
     }
 
     record_event(&events_path, &run_id, None, "run", "finished")?;
     let mut cleanup_actions = Vec::new();
+    emit_progress(&run_id, "runner", "cleanup", ProgressStatus::Started);
     compose_cleanup_guard.collect_into(&mut cleanup_actions, &mut cleanup_errors);
 
     let cleanup = CleanupReport {
@@ -353,6 +398,16 @@ pub fn run_with_executor(
         errors: cleanup_errors,
     };
     write_pretty_json(&sandbox.join("cleanup.json"), &cleanup)?;
+    emit_progress(
+        &run_id,
+        "runner",
+        "cleanup",
+        if cleanup.status == RunStatus::Passed {
+            ProgressStatus::Passed
+        } else {
+            ProgressStatus::Failed
+        },
+    );
 
     let scenario_failed = scenario_outcomes
         .iter()
@@ -514,60 +569,132 @@ struct EnvironmentInput<'a> {
 }
 
 fn build_environment_report(input: EnvironmentInput<'_>) -> EnvironmentReport {
+    let compose_images_result = input
+        .compose_stack
+        .map(|stack| stack.compose_images().map_err(|err| err.to_string()));
+    let (compose_images, compose_images_error) = match compose_images_result {
+        Some(Ok(images)) => (
+            images
+                .into_iter()
+                .map(|image| ComposeImageReport {
+                    service: image.service,
+                    image: image.image,
+                })
+                .collect(),
+            None,
+        ),
+        Some(Err(error)) => (Vec::new(), Some(error)),
+        None => (Vec::new(), None),
+    };
+    let client_roots: Vec<_> = DEFAULT_CLIENT_NAMES
+        .iter()
+        .map(|client| client_root_dir(input.sandbox, client))
+        .collect();
+    let mount_roots: Vec<_> = DEFAULT_CLIENT_NAMES
+        .iter()
+        .map(|client| client_mount_point(input.sandbox, client))
+        .collect();
     EnvironmentReport {
         run_id: input.run_id.to_string(),
         scenarios: input.scenarios.to_vec(),
         seed: input.seed,
         studiofs_bin: input.studiofs_bin.map(|path| path.display().to_string()),
         compose_project: input.compose_project.map(str::to_string),
-        compose_images: input
-            .compose_stack
-            .and_then(|stack| stack.compose_images().ok())
-            .map(|images| {
-                images
-                    .into_iter()
-                    .map(|image| ComposeImageReport {
-                        service: image.service,
-                        image: image.image,
-                    })
-                    .collect()
-            })
-            .unwrap_or_else(default_compose_images),
+        compose_images,
+        compose_images_error,
         allocated_ports: input.allocated_ports,
-        client_roots: DEFAULT_CLIENT_NAMES
+        client_roots: client_roots
             .iter()
-            .map(|client| client_root_dir(input.sandbox, client).display().to_string())
+            .map(|path| path.display().to_string())
             .collect(),
-        mount_roots: DEFAULT_CLIENT_NAMES
+        mount_roots: mount_roots
             .iter()
-            .map(|client| {
-                client_mount_point(input.sandbox, client)
-                    .display()
-                    .to_string()
-            })
+            .map(|path| path.display().to_string())
             .collect(),
+        client_root_ownership: path_ownership_reports(&client_roots),
+        mount_root_ownership: path_ownership_reports(&mount_roots),
         winfsp_version: detect_winfsp_version(),
     }
 }
 
-fn default_compose_images() -> Vec<ComposeImageReport> {
-    vec![
-        ComposeImageReport {
-            service: crate::infra::POSTGRES_SERVICE_NAME.to_string(),
-            image: "postgres:18-alpine".to_string(),
-        },
-        ComposeImageReport {
-            service: crate::infra::RUSTFS_SERVICE_NAME.to_string(),
-            image: "rustfs/rustfs:1.0.0-alpha.94".to_string(),
-        },
-    ]
+fn path_ownership_reports(paths: &[PathBuf]) -> Vec<PathOwnershipReport> {
+    paths
+        .iter()
+        .map(|path| PathOwnershipReport {
+            path: path.display().to_string(),
+            owner: detect_path_owner(path),
+            error: None,
+        })
+        .collect()
 }
 
 fn detect_winfsp_version() -> Option<String> {
-    std::env::var("STUDIOFS_E2E_WINFSP_VERSION")
+    if let Some(version) = std::env::var("STUDIOFS_E2E_WINFSP_VERSION")
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+    {
+        return Some(version);
+    }
+    detect_winfsp_version_from_host()
+}
+
+#[cfg(windows)]
+fn detect_winfsp_version_from_host() -> Option<String> {
+    let output = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            "$paths = @('HKLM:\\SOFTWARE\\WinFsp', 'HKLM:\\SOFTWARE\\WOW6432Node\\WinFsp'); foreach ($path in $paths) { if (Test-Path $path) { $item = Get-ItemProperty -Path $path; foreach ($name in @('Version', 'ProductVersion')) { $value = $item.$name; if ($value) { Write-Output $value; exit 0 } } } }; exit 0",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
+}
+
+#[cfg(not(windows))]
+fn detect_winfsp_version_from_host() -> Option<String> {
+    None
+}
+
+#[cfg(windows)]
+fn detect_path_owner(path: &Path) -> Option<String> {
+    let script = format!(
+        "(Get-Acl -LiteralPath '{}').Owner",
+        path.display().to_string().replace('\'', "''")
+    );
+    let output = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &script,
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
+}
+
+#[cfg(not(windows))]
+fn detect_path_owner(_path: &Path) -> Option<String> {
+    None
 }
 
 struct PreparedPreflight {
@@ -576,34 +703,48 @@ struct PreparedPreflight {
 }
 
 fn prepare_preflight(
+    root: &Path,
     sandbox: &Path,
+    platform: PlatformSelection,
     compose_stack: Option<&DockerComposeStack>,
     executor: &dyn CommandExecutor,
 ) -> Result<PreparedPreflight, RunnerError> {
+    let mut runner_checks = runner_preflight_checks(root, platform, executor);
     let Some(stack) = compose_stack else {
         write_pretty_json(
             &sandbox.join("ports.json"),
             &serde_json::json!({ "ports": [] }),
         )?;
+        runner_checks.push(PreflightCheckReport {
+            name: "runner-skeleton".to_string(),
+            status: RunStatus::Passed,
+            detail: "external infrastructure disabled for this run".to_string(),
+        });
+        let status = if runner_checks
+            .iter()
+            .any(|check| check.status != RunStatus::Passed)
+        {
+            RunStatus::PreflightFailed
+        } else {
+            RunStatus::Passed
+        };
         return Ok(PreparedPreflight {
             report: PreflightReport {
-                status: RunStatus::Passed,
-                checks: vec![PreflightCheckReport {
-                    name: "runner-skeleton".to_string(),
-                    status: RunStatus::Passed,
-                    detail: "external infrastructure disabled for this run".to_string(),
-                }],
+                status,
+                checks: runner_checks,
             },
             compose_start_attempted: false,
         });
     };
 
     stack.prepare_artifacts()?;
-    let mut checks: Vec<_> = stack
-        .preflight(executor)
-        .into_iter()
-        .map(preflight_check_report)
-        .collect();
+    let mut checks = runner_checks;
+    checks.extend(
+        stack
+            .preflight(executor)
+            .into_iter()
+            .map(preflight_check_report),
+    );
     if checks.iter().any(|check| check.status != RunStatus::Passed) {
         return Ok(PreparedPreflight {
             report: PreflightReport {
@@ -642,6 +783,84 @@ fn prepare_preflight(
             checks,
         },
         compose_start_attempted: true,
+    })
+}
+
+fn runner_preflight_checks(
+    root: &Path,
+    platform: PlatformSelection,
+    executor: &dyn CommandExecutor,
+) -> Vec<PreflightCheckReport> {
+    let Some(command) = stale_process_cleanup_command(root, platform) else {
+        return Vec::new();
+    };
+    vec![match executor.run(&command) {
+        Ok(output) if output.status == 0 => PreflightCheckReport {
+            name: "runner-owned stale process cleanup".to_string(),
+            status: RunStatus::Passed,
+            detail: stale_process_cleanup_detail(&output.stdout),
+        },
+        Ok(output) => PreflightCheckReport {
+            name: "runner-owned stale process cleanup".to_string(),
+            status: RunStatus::PreflightFailed,
+            detail: command_failure_detail(output.status, &output.stderr),
+        },
+        Err(err) => PreflightCheckReport {
+            name: "runner-owned stale process cleanup".to_string(),
+            status: RunStatus::PreflightFailed,
+            detail: err.to_string(),
+        },
+    }]
+}
+
+fn stale_process_cleanup_detail(stdout: &str) -> String {
+    let detail = stdout.trim();
+    if detail.is_empty() {
+        "no runner-owned stale StudioFS processes found".to_string()
+    } else {
+        format!("cleaned runner-owned stale StudioFS processes:\n{detail}")
+    }
+}
+
+fn command_failure_detail(status: i32, stderr: &str) -> String {
+    let stderr = stderr.trim();
+    if stderr.is_empty() {
+        format!("exit status {status}")
+    } else {
+        format!("exit status {status}: {stderr}")
+    }
+}
+
+fn stale_process_cleanup_command(root: &Path, platform: PlatformSelection) -> Option<CommandSpec> {
+    if platform.resolved() != "windows-winfsp" {
+        return None;
+    }
+    let root = absolute_without_requiring_exists(root);
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/check-stale-processes.ps1");
+    Some(CommandSpec {
+        program: "powershell".to_string(),
+        args: vec![
+            "-NoProfile".to_string(),
+            "-ExecutionPolicy".to_string(),
+            "Bypass".to_string(),
+            "-File".to_string(),
+            script.display().to_string(),
+        ],
+        env: vec![
+            (
+                "STUDIOFS_E2E_RUNNER_ROOT".to_string(),
+                root.display().to_string(),
+            ),
+            (
+                "STUDIOFS_E2E_SELF_PID".to_string(),
+                std::process::id().to_string(),
+            ),
+            (
+                "STUDIOFS_E2E_CLEAN_STALE_PROCESSES".to_string(),
+                "1".to_string(),
+            ),
+        ],
+        cwd: None,
     })
 }
 
@@ -950,13 +1169,52 @@ fn run_hook<T>(
     hook: &str,
     f: impl FnOnce() -> Result<T, scenario::ScenarioError>,
 ) -> Result<T, RunnerError> {
+    emit_progress(run_id, scenario, hook, ProgressStatus::Started);
     record_event(events_path, run_id, Some(scenario), hook, "started")?;
     record_event(operation_log, run_id, Some(scenario), hook, "started")?;
     let result = f();
     let phase = if result.is_ok() { "finished" } else { "failed" };
     record_event(events_path, run_id, Some(scenario), hook, phase)?;
     record_event(operation_log, run_id, Some(scenario), hook, phase)?;
+    emit_progress(
+        run_id,
+        scenario,
+        hook,
+        if result.is_ok() {
+            ProgressStatus::Passed
+        } else {
+            ProgressStatus::Failed
+        },
+    );
     Ok(result?)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProgressStatus {
+    Started,
+    Passed,
+    Failed,
+}
+
+impl ProgressStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+fn progress_line(run_id: &str, task: &str, phase: &str, status: ProgressStatus) -> String {
+    format!(
+        "studiofs-e2e run_id={run_id} task={task} phase={phase} status={}",
+        status.as_str()
+    )
+}
+
+fn emit_progress(run_id: &str, task: &str, phase: &str, status: ProgressStatus) {
+    eprintln!("{}", progress_line(run_id, task, phase, status));
 }
 
 fn record_event(
@@ -1258,6 +1516,15 @@ fn absolutize(path: &Path) -> Result<PathBuf, RunnerError> {
     }
 }
 
+fn absolute_without_requiring_exists(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(path))
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+
 fn generated_run_id() -> String {
     let suffix = Uuid::new_v4().simple().to_string();
     format!("{}-{}", Utc::now().format("%Y%m%dT%H%M%SZ"), &suffix[..6])
@@ -1358,6 +1625,19 @@ mod tests {
         assert_eq!(
             scenario.calls.borrow().as_slice(),
             ["setup", "run", "validate", "cleanup"]
+        );
+    }
+
+    #[test]
+    fn progress_line_names_task_phase_and_status() {
+        assert_eq!(
+            progress_line(
+                "run-1",
+                "collision-rename-vs-rename",
+                "validate",
+                ProgressStatus::Failed
+            ),
+            "studiofs-e2e run_id=run-1 task=collision-rename-vs-rename phase=validate status=failed"
         );
     }
 
@@ -1656,6 +1936,67 @@ mod tests {
             .unwrap();
         assert!(up_index < logs_index);
         assert!(logs_index < down_index);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_runner_run_cleans_stale_runner_processes_before_preflight() {
+        let temp = tempfile::tempdir().unwrap();
+        let executor = RecordingExecutor::default();
+
+        let outcome = run_with_executor(
+            RunRequest {
+                root: temp.path().join("e2e-runs"),
+                run_id: Some("windows-stale-cleanup-run".to_string()),
+                scenarios: vec![scenario::TEST_PASSING.to_string()],
+                seed: 406,
+                studiofs_bin: None,
+                platform: PlatformSelection::Auto,
+                retention: RetentionPolicy::Always,
+                report: None,
+                port_range: None,
+                timeout: None,
+                infra: InfraMode::Disabled,
+            },
+            &executor,
+        )
+        .unwrap();
+
+        let calls = executor.calls.borrow();
+        let cleanup_call = calls
+            .iter()
+            .find(|call| {
+                call.program == "powershell"
+                    && call
+                        .args
+                        .iter()
+                        .any(|arg| arg.ends_with("check-stale-processes.ps1"))
+            })
+            .expect("windows stale cleanup command");
+        assert!(
+            cleanup_call.env.iter().any(|(key, value)| {
+                key == "STUDIOFS_E2E_CLEAN_STALE_PROCESSES" && value == "1"
+            })
+        );
+        assert!(
+            cleanup_call
+                .env
+                .iter()
+                .any(|(key, _)| key == "STUDIOFS_E2E_RUNNER_ROOT")
+        );
+
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(outcome.report_path).unwrap()).unwrap();
+        assert!(
+            report["preflight"]["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(
+                    |check| check["name"] == "runner-owned stale process cleanup"
+                        && check["status"] == "passed"
+                )
+        );
     }
 
     #[test]
