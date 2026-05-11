@@ -1376,6 +1376,18 @@ enum CrashRestartRecoveredPayload {
     UnrecoverableLoss { detail: String },
 }
 
+enum CrashRestartOutcomeDraft {
+    Recovered {
+        local_read_payload: Vec<u8>,
+        local_read_checksum_sha256: String,
+        peer_visible_before_convergence: Option<String>,
+    },
+    UnrecoverableLoss {
+        detail: String,
+        peer_visible_before_convergence: Option<String>,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct CrashRestartRecoverySummary {
     bootstrap: VolumeBootstrapSummary,
@@ -1487,7 +1499,7 @@ fn run_crash_restart_mode(
         .scenario_dir
         .join(format!("validation-{}", crash_restart_mode_slug(mode)));
 
-    let summary = match recovered_payload {
+    let outcome = match recovered_payload {
         CrashRestartRecoveredPayload::Recovered(local_read_payload) => {
             let local_read_checksum_sha256 = bytes_sha256(&local_read_payload);
             let peer_visible_before_convergence =
@@ -1497,10 +1509,38 @@ fn run_crash_restart_mode(
                 } else {
                     None
                 };
-            let convergence =
-                wait_for_convergence(&mounts, validation_dir, convergence_timeout, poll_interval)
-                    .map_err(|error| crash_restart_convergence_error(relative_path, error))?;
-            let convergence_elapsed_ms = convergence_started.elapsed().as_millis();
+
+            CrashRestartOutcomeDraft::Recovered {
+                local_read_payload,
+                local_read_checksum_sha256,
+                peer_visible_before_convergence,
+            }
+        }
+        CrashRestartRecoveredPayload::UnrecoverableLoss { detail } => {
+            let peer_visible_before_convergence =
+                if mode == CrashRestartMode::BeforeRemotePublicationCompletes {
+                    read_peer_checksum(&clients[1], relative_path)?
+                } else {
+                    None
+                };
+            CrashRestartOutcomeDraft::UnrecoverableLoss {
+                detail,
+                peer_visible_before_convergence,
+            }
+        }
+    };
+
+    let convergence =
+        wait_for_convergence(&mounts, validation_dir, convergence_timeout, poll_interval)
+            .map_err(|error| crash_restart_convergence_error(relative_path, error))?;
+    let convergence_elapsed_ms = convergence_started.elapsed().as_millis();
+
+    let summary = match outcome {
+        CrashRestartOutcomeDraft::Recovered {
+            local_read_payload,
+            local_read_checksum_sha256,
+            peer_visible_before_convergence,
+        } => {
             let final_payload = fs::read(clients[1].mount_point.join(relative_path))?;
             let final_checksum_sha256 = bytes_sha256(&final_payload);
             if final_checksum_sha256 != local_read_checksum_sha256 {
@@ -1529,17 +1569,10 @@ fn run_crash_restart_mode(
                 final_validator: convergence.comparison,
             }
         }
-        CrashRestartRecoveredPayload::UnrecoverableLoss { detail } => {
-            let peer_visible_before_convergence =
-                if mode == CrashRestartMode::BeforeRemotePublicationCompletes {
-                    read_peer_checksum(&clients[1], relative_path)?
-                } else {
-                    None
-                };
-            let convergence =
-                wait_for_convergence(&mounts, validation_dir, convergence_timeout, poll_interval)
-                    .map_err(|error| crash_restart_convergence_error(relative_path, error))?;
-            let convergence_elapsed_ms = convergence_started.elapsed().as_millis();
+        CrashRestartOutcomeDraft::UnrecoverableLoss {
+            detail,
+            peer_visible_before_convergence,
+        } => {
             if let Some(final_checksum_sha256) = read_peer_checksum(&clients[1], relative_path)? {
                 return Err(ScenarioError::CrashRestartCorruptAdvertisedFile {
                     client: clients[1].name.clone(),
