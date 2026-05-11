@@ -750,7 +750,28 @@ fn detect_path_owners(paths: &[PathBuf]) -> Vec<PathOwnershipReport> {
     })
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
+fn detect_path_owners(paths: &[PathBuf]) -> Vec<PathOwnershipReport> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    paths
+        .iter()
+        .map(|path| match fs::metadata(path) {
+            Ok(metadata) => PathOwnershipReport {
+                path: path.display().to_string(),
+                owner: Some(format!("uid:{} gid:{}", metadata.uid(), metadata.gid())),
+                error: None,
+            },
+            Err(err) => PathOwnershipReport {
+                path: path.display().to_string(),
+                owner: None,
+                error: Some(err.to_string()),
+            },
+        })
+        .collect()
+}
+
+#[cfg(not(any(windows, unix)))]
 fn detect_path_owners(paths: &[PathBuf]) -> Vec<PathOwnershipReport> {
     fallback_path_ownership_reports(paths)
 }
@@ -890,20 +911,32 @@ fn command_failure_detail(status: i32, stderr: &str) -> String {
 }
 
 fn stale_process_cleanup_command(root: &Path, platform: PlatformSelection) -> Option<CommandSpec> {
-    if platform.resolved() != "windows-winfsp" {
-        return None;
-    }
     let root = absolute_without_requiring_exists(root);
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/check-stale-processes.ps1");
+    let (program, args) = match platform.resolved() {
+        "windows-winfsp" => {
+            let script =
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/check-stale-processes.ps1");
+            (
+                "powershell".to_string(),
+                vec![
+                    "-NoProfile".to_string(),
+                    "-ExecutionPolicy".to_string(),
+                    "Bypass".to_string(),
+                    "-File".to_string(),
+                    script.display().to_string(),
+                ],
+            )
+        }
+        "linux-fuse" | "macos-fuse" => {
+            let script =
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/check-stale-processes.sh");
+            ("sh".to_string(), vec![script.display().to_string()])
+        }
+        _ => return None,
+    };
     Some(CommandSpec {
-        program: "powershell".to_string(),
-        args: vec![
-            "-NoProfile".to_string(),
-            "-ExecutionPolicy".to_string(),
-            "Bypass".to_string(),
-            "-File".to_string(),
-            script.display().to_string(),
-        ],
+        program,
+        args,
         env: vec![
             (
                 "STUDIOFS_E2E_RUNNER_ROOT".to_string(),
@@ -1996,20 +2029,53 @@ mod tests {
         assert!(logs_index < down_index);
     }
 
-    #[cfg(windows)]
     #[test]
-    fn windows_runner_run_cleans_stale_runner_processes_before_preflight() {
+    fn stale_process_cleanup_command_selects_platform_helper() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("e2e-runs");
+
+        let linux = stale_process_cleanup_command(&root, PlatformSelection::LinuxFuse).unwrap();
+        assert_eq!(linux.program, "sh");
+        assert!(
+            linux
+                .args
+                .iter()
+                .any(|arg| arg.ends_with("check-stale-processes.sh"))
+        );
+
+        let macos = stale_process_cleanup_command(&root, PlatformSelection::MacosFuse).unwrap();
+        assert_eq!(macos.program, "sh");
+        assert!(
+            macos
+                .args
+                .iter()
+                .any(|arg| arg.ends_with("check-stale-processes.sh"))
+        );
+
+        let windows =
+            stale_process_cleanup_command(&root, PlatformSelection::WindowsWinfsp).unwrap();
+        assert_eq!(windows.program, "powershell");
+        assert!(
+            windows
+                .args
+                .iter()
+                .any(|arg| arg.ends_with("check-stale-processes.ps1"))
+        );
+    }
+
+    #[test]
+    fn runner_run_cleans_stale_runner_processes_before_preflight() {
         let temp = tempfile::tempdir().unwrap();
         let executor = RecordingExecutor::default();
 
         let outcome = run_with_executor(
             RunRequest {
                 root: temp.path().join("e2e-runs"),
-                run_id: Some("windows-stale-cleanup-run".to_string()),
+                run_id: Some("stale-cleanup-run".to_string()),
                 scenarios: vec![scenario::TEST_PASSING.to_string()],
                 seed: 406,
                 studiofs_bin: None,
-                platform: PlatformSelection::Auto,
+                platform: PlatformSelection::LinuxFuse,
                 retention: RetentionPolicy::Always,
                 report: None,
                 port_range: None,
@@ -2024,13 +2090,13 @@ mod tests {
         let cleanup_call = calls
             .iter()
             .find(|call| {
-                call.program == "powershell"
+                call.program == "sh"
                     && call
                         .args
                         .iter()
-                        .any(|arg| arg.ends_with("check-stale-processes.ps1"))
+                        .any(|arg| arg.ends_with("check-stale-processes.sh"))
             })
-            .expect("windows stale cleanup command");
+            .expect("unix stale cleanup command");
         assert!(
             cleanup_call.env.iter().any(|(key, value)| {
                 key == "STUDIOFS_E2E_CLEAN_STALE_PROCESSES" && value == "1"
