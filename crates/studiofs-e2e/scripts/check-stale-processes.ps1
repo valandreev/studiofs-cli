@@ -24,6 +24,8 @@ $processFilter = "Name = 'studiofs.exe' OR Name = 'studiofs-e2e.exe'"
 Get-CimInstance Win32_Process -Filter $processFilter |
     Where-Object {
         $cmd = $_.CommandLine -as [string]
+        # Runner-owned mount commands still include the sandbox root via --cache-dir;
+        # avoid matching every user-owned "studiofs mount" process on this machine.
         $_.ProcessId -ne $selfPid -and
             ($cmd -match $rootPattern -or $cmd -match '__mounted-chaos-op')
     } |
