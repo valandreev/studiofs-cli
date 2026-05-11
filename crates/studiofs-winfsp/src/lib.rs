@@ -795,7 +795,7 @@ mod tests {
         let opts = parse_mount_options("StudioFS").expect("options");
         assert!(
             opts.persistent_acls,
-            "explicit diagnostics override should be able to advertise persistent ACLs"
+            "explicit WinFSP boolean override should be able to advertise persistent ACLs"
         );
 
         // SAFETY: Tests are single-threaded via `_guard` and restore environment
