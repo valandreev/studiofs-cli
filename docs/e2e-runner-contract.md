@@ -468,9 +468,10 @@ Required checks:
 
 - Docker: `docker version` succeeds, Docker compose is available, and the
   daemon can start required PostgreSQL and S3-compatible services.
-- Compose stack: `docker/compose.e2e.yml` defines PostgreSQL 18, RustFS, and a
-  Toxiproxy placeholder using version-pinned service images for reproducible
-  runs. Published ports bind to `127.0.0.1` only. The runner invokes
+- Compose stack: `docker/compose.e2e.yml` defines PostgreSQL 18
+  (`postgres:18-alpine`), RustFS (`rustfs/rustfs:latest`), and a Toxiproxy
+  placeholder using explicit service images. Published ports bind to
+  `127.0.0.1` only. The runner invokes
   `docker compose up --detach --wait` with a project-scoped name and records the
   copied compose file plus logs under `artifacts/docker/`.
 - Mount support:
