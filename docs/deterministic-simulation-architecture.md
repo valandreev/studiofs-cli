@@ -8,6 +8,52 @@ replacement for Contract/Core tests or real mounted E2E tests.
 The initial design covers Phase 3 planning for the Deterministic Simulation
 Testing milestone. Follow-up implementation issues are SFS-331 through SFS-336.
 
+## SFS-407 Replan From Accepted Local First Contracts
+
+SFS-407 keeps SFS-330 as the accepted deterministic simulation starting point.
+The reset is intentionally based on the accepted E2E baseline from SFS-402 and
+the corrected Local First contracts guarded by SFS-405, not on the canceled
+post-baseline Simulation v2 chain.
+
+The replan keeps only deterministic slices that still expose product
+invariants after the mounted baseline is corrected:
+
+- publication remains distinct from local durability, upload completion, and
+  peer apply;
+- writer-local recovery remains meaningful only after an explicit Local First
+  boundary has been crossed;
+- metadata replication, object availability, crash/restart replay, and
+  namespace convergence remain logical state-machine behavior;
+- product failures remain separate from harness bugs, environment drift, and
+  incorrect mounted-test expectations.
+
+Scenario 4 and Scenario 5 from the mounted baseline are the immediate
+calibration points. Scenario 4 requires PostgreSQL outage coverage to validate
+writer recovery first, then publication after PostgreSQL returns, then peer
+convergence. Scenario 5 requires crash/restart coverage to validate recovered
+writer-visible bytes after a local durability boundary, not bytes that only
+existed in volatile cache before an unclean crash.
+
+The deterministic simulation owns seeded exploration of logical state-machine
+interleavings: client-local durable state, upload readiness, publication
+eligibility, metadata delivery, duplicate or delayed events, outage/recovery,
+restart replay, and invariant checking over logical snapshots.
+
+The real mounted E2E owns platform and integration behavior: product CLI
+execution, Docker infrastructure, PostgreSQL and RustFS process behavior, FUSE
+and WinFSP mounts, mounted tree polling, cleanup, preflight, and public
+artifacts. OS cache behavior, WinFSP callback timing, and kernel notification
+delivery stay out of deterministic simulation unless a later contract reduces
+them to an abstract hint or modeled failure that is also validated by mounted
+E2E or bridge tests.
+
+SFS-395 through SFS-400 must not be resurrected unchanged. A follow-up
+simulation issue is valid only when it names a clear product invariant, states
+which accepted Local First contract it models, and explains why that invariant
+is better explored deterministically than by another focused Contract/Core or
+real mounted E2E check. Until the SFS-405 baseline gate is stable, the next
+simulation issue set should stay uncreated.
+
 ## Scope And Non-Goals
 
 In scope:

@@ -19,6 +19,14 @@ fn read_workspace_file(path: &str) -> String {
     })
 }
 
+fn normalize_doc_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn contains_doc_term(doc: &str, normalized_doc: &str, term: &str) -> bool {
+    doc.contains(term) || normalized_doc.contains(&normalize_doc_whitespace(term))
+}
+
 fn collect_term_hits(path: &str, terms: &[&str]) -> Vec<String> {
     let contents = read_workspace_file(path);
     collect_term_hits_from_contents(path, &contents, terms)
@@ -623,6 +631,41 @@ fn deterministic_simulation_architecture_covers_required_sfs330_surfaces() {
     assert!(
         missing.is_empty(),
         "SFS-330 deterministic simulation architecture is missing required surfaces:\n{}",
+        missing.join("\n")
+    );
+}
+
+#[test]
+fn deterministic_simulation_architecture_covers_sfs407_replan() {
+    let doc = read_workspace_file("docs/deterministic-simulation-architecture.md");
+    let normalized_doc = normalize_doc_whitespace(&doc);
+    let required_terms = [
+        "SFS-407 Replan From Accepted Local First Contracts",
+        "SFS-330",
+        "SFS-402",
+        "SFS-405",
+        "accepted E2E baseline",
+        "corrected Local First contracts",
+        "Scenario 4",
+        "Scenario 5",
+        "deterministic simulation owns",
+        "real mounted E2E owns",
+        "OS cache behavior",
+        "WinFSP callback timing",
+        "kernel notification delivery",
+        "SFS-395 through SFS-400",
+        "clear product invariant",
+    ];
+
+    let missing: Vec<_> = required_terms
+        .iter()
+        .copied()
+        .filter(|term| !contains_doc_term(&doc, &normalized_doc, term))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "SFS-407 deterministic simulation replan is missing required surfaces:\n{}",
         missing.join("\n")
     );
 }
