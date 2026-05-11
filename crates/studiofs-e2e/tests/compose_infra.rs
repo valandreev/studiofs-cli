@@ -42,12 +42,8 @@ fn compose_file_defines_required_services_healthchecks_and_project_ports() {
         "named volumes must be explicit so down --volumes can remove them"
     );
     assert!(
-        compose.contains("rustfs/rustfs:1.0.0-alpha.94"),
-        "RustFS image must be pinned to a versioned tag"
-    );
-    assert!(
-        !compose.contains("rustfs/rustfs:latest"),
-        "RustFS image must not use latest in reproducible E2E infra"
+        compose.contains("rustfs/rustfs:latest"),
+        "RustFS image must use latest for baseline E2E infra"
     );
 }
 

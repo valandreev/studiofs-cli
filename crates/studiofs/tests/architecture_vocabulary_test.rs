@@ -507,6 +507,7 @@ fn e2e_runner_contract_covers_required_sfs341_surfaces() {
         "/dev/fuse",
         "WinFSP",
         "macFUSE",
+        "floating RustFS tag",
         "port allocation",
         "stale mounts",
         "## Cleanup Safety",
@@ -549,6 +550,7 @@ fn local_first_e2e_baseline_audit_covers_sfs402_surfaces() {
         "rustfs/rustfs:latest",
         "Windows process cleanup",
         "zombie",
+        "landing-zone",
         "stale resource recovery",
         "Follow-up rewrites",
     ];

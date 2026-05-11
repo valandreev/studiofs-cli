@@ -38,7 +38,11 @@ Potential conflict area in the accepted real E2E set:
 
 - SFS-327 crash/restart wording must be read as recovery of data that crossed a
   documented local durability boundary. It must not require preserving bytes
-  that existed only in volatile OS cache after an unclean crash.
+  that existed only in volatile OS cache after an unclean crash. In this
+  context, volatile OS cache also covers StudioFS-side dirty writer/cached-store
+  pages that have not crossed the explicit local boundary, including
+  landing-zone acceptance or cached-store staging/metadata commit needed for the
+  scenario mode being tested.
 - SFS-325 and SFS-326 must keep temporary peer invisibility during PostgreSQL or
   RustFS/S3 outage as expected behavior until publication and convergence are
   possible.
