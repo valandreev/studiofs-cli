@@ -628,6 +628,40 @@ fn deterministic_simulation_architecture_covers_required_sfs330_surfaces() {
 }
 
 #[test]
+fn deterministic_simulation_architecture_covers_sfs407_replan() {
+    let doc = read_workspace_file("docs/deterministic-simulation-architecture.md");
+    let required_terms = [
+        "## SFS-407 Replan From Accepted Local First Contracts",
+        "SFS-330",
+        "SFS-402",
+        "SFS-405",
+        "accepted E2E baseline",
+        "corrected Local First contracts",
+        "Scenario 4",
+        "Scenario 5",
+        "deterministic simulation owns",
+        "real mounted E2E owns",
+        "OS cache behavior",
+        "WinFSP callback timing",
+        "kernel notification",
+        "SFS-395 through SFS-400",
+        "clear product invariant",
+    ];
+
+    let missing: Vec<_> = required_terms
+        .iter()
+        .copied()
+        .filter(|term| !doc.contains(term))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "SFS-407 deterministic simulation replan is missing required surfaces:\n{}",
+        missing.join("\n")
+    );
+}
+
+#[test]
 fn cli_and_regression_surfaces_drop_buffered_first_wording() {
     let files = [
         "crates/studiofs/src/cli/test_cache/reporting/human.rs",
