@@ -321,6 +321,63 @@ fn replica_base_rename_uses_pg_order_when_source_already_moved_to_prior_winner()
 }
 
 #[test]
+fn replica_serving_rename_preserves_local_hardlink_while_removing_local_loser() {
+    let engine = temp_engine();
+    let entry = DirEntryValue {
+        ino: 782,
+        kind: FileType::RegularFile,
+    };
+    let attr = InodeAttr::new_file(entry.ino, ROOT_INO, 1000, 1000, 0o644);
+
+    engine
+        .apply_replica_events_to_base(&[
+            MetaEvent::SetAttr { attr: attr.clone() },
+            MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: b"source.txt".to_vec(),
+                entry: entry.clone(),
+            },
+        ])
+        .unwrap();
+    engine
+        .apply_replica_serving_state(&[
+            MetaEvent::SetAttr { attr },
+            MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: b"source.txt".to_vec(),
+                entry: entry.clone(),
+            },
+        ])
+        .unwrap();
+
+    engine
+        .link(entry.ino, ROOT_INO, b"local-link.txt")
+        .expect("local hardlink should be accepted");
+    engine
+        .rename_atomic(ROOT_INO, b"source.txt", ROOT_INO, b"renamed-a.txt")
+        .expect("local loser rename should be accepted");
+
+    let pg_winner = replica_rename_event(
+        ROOT_INO,
+        b"source.txt",
+        ROOT_INO,
+        b"renamed-b.txt",
+        entry,
+    );
+    engine
+        .apply_replica_events_to_base(std::slice::from_ref(&pg_winner))
+        .unwrap();
+    engine
+        .apply_replica_serving_state(std::slice::from_ref(&pg_winner))
+        .unwrap();
+
+    assert!(engine.lookup(ROOT_INO, b"renamed-b.txt").is_ok());
+    assert!(engine.lookup(ROOT_INO, b"local-link.txt").is_ok());
+    assert!(engine.lookup(ROOT_INO, b"source.txt").is_err());
+    assert!(engine.lookup(ROOT_INO, b"renamed-a.txt").is_err());
+}
+
+#[test]
 fn replica_serving_rename_still_applies_when_source_matches() {
     let engine = temp_engine();
     let entry = DirEntryValue {

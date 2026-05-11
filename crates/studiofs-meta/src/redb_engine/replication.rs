@@ -956,6 +956,7 @@ impl RedbMetaEngine {
     ) -> MetaResult<()> {
         let keys =
             Self::dentry_keys_for_inode_in_write_index(txn, DENTRIES_BY_INODE_TABLE, entry.ino)?;
+        let protected = Self::pending_local_alias_dentry_keys_for_inode_in_txn(txn, entry)?;
         let current = txn
             .open_table(DENTRIES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -975,7 +976,7 @@ impl RedbMetaEngine {
             let base_matches = Self::lookup_in_opened_dentry_table(&base, parent, name)?
                 .map(|value| value.ino == entry.ino && value.kind == entry.kind)
                 .unwrap_or(false);
-            if !base_matches {
+            if !base_matches && !protected.contains(&key) {
                 stale.push((parent, name.to_vec()));
             }
         }
@@ -986,6 +987,70 @@ impl RedbMetaEngine {
             Self::remove_dentry_mirror_in_txn(txn, parent, &name)?;
         }
         Ok(())
+    }
+
+    // Pending local AddEntry aliases are local namespace state, not stale
+    // remote rename losers, so foreign rename reconciliation must preserve them.
+    fn pending_local_alias_dentry_keys_for_inode_in_txn(
+        txn: &redb::WriteTransaction,
+        entry: &DirEntryValue,
+    ) -> MetaResult<HashSet<Vec<u8>>> {
+        let counters = txn
+            .open_table(COUNTERS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let start_seq = counters
+            .get("pgLastFlushedLocalEventSeq")
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .map(|value| value.value())
+            .unwrap_or(1);
+        let end_seq = counters
+            .get("nextEventSeq")
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .map(|value| value.value())
+            .unwrap_or(1);
+        drop(counters);
+
+        let mut aliases = HashSet::new();
+        if end_seq <= start_seq {
+            return Ok(aliases);
+        }
+
+        let events = txn
+            .open_table(EVENT_LOG_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        for row in events
+            .range(start_seq..end_seq)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (_seq, bytes) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            match decode::<crate::events::MetaEvent>(bytes.value())? {
+                crate::events::MetaEvent::AddEntry {
+                    parent,
+                    name,
+                    entry: added,
+                } if added.ino == entry.ino && added.kind == entry.kind => {
+                    aliases.insert(encode_dentry_key(parent, &name));
+                }
+                crate::events::MetaEvent::RemoveEntry { parent, name } => {
+                    aliases.remove(&encode_dentry_key(parent, &name));
+                }
+                crate::events::MetaEvent::RenameEntry {
+                    parent,
+                    name,
+                    new_parent,
+                    new_name,
+                    entry: renamed,
+                    ..
+                } if renamed.ino == entry.ino && renamed.kind == entry.kind => {
+                    let old_key = encode_dentry_key(parent, &name);
+                    if aliases.remove(&old_key) {
+                        aliases.insert(encode_dentry_key(new_parent, &new_name));
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(aliases)
     }
 
     fn base_dentry_keys_for_rename_entry(
