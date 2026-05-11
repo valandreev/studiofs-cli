@@ -31,6 +31,8 @@ const READ_FD_CACHE_CAPACITY: usize = 2_048;
 const READ_FD_CACHE_CAPACITY: usize = 16;
 const READ_FD_CACHE_SHARDS: usize = 16;
 const READ_HINT_MIN_LEN: usize = 512 * 1024;
+#[cfg(windows)]
+const WINDOWS_ADVISE_WARMUP_CHUNK: usize = 256 * 1024;
 const FAST_BATCH_STAGING_MAX_CONCURRENCY: usize = 4;
 
 static TEMP_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -186,6 +188,58 @@ impl FilePayloadStore {
                     "local payload runtime payload read_into failed"
                 );
                 None
+            }
+        }
+    }
+
+    pub fn advise_will_need(&self, object_id: u64) {
+        let path = self.layout.payload_object_path(object_id);
+        let Ok(file) = self.cached_read_handle(object_id, &path) else {
+            return;
+        };
+        let Ok(metadata) = file.metadata() else {
+            return;
+        };
+        let len = metadata.len();
+        if len == 0 {
+            return;
+        }
+        if let Err(error) = platform::advise_will_need(file.as_ref(), 0, len) {
+            warn!(
+                object_id,
+                path = %path.display(),
+                error = ?error,
+                "local payload runtime payload advise_will_need failed"
+            );
+        }
+        #[cfg(windows)]
+        self.warm_windows_read_cache(object_id, file.as_ref(), &path, len);
+    }
+
+    #[cfg(windows)]
+    fn warm_windows_read_cache(&self, object_id: u64, file: &File, path: &Path, len: u64) {
+        let mut scratch = vec![0_u8; WINDOWS_ADVISE_WARMUP_CHUNK];
+        let mut offset = 0_u64;
+        while offset < len {
+            let remaining = len.saturating_sub(offset);
+            let chunk_len = usize::try_from(remaining)
+                .unwrap_or(usize::MAX)
+                .min(scratch.len());
+            match platform::pread(file, &mut scratch[..chunk_len], offset) {
+                Ok(0) => break,
+                Ok(read) => {
+                    offset = offset.saturating_add(read as u64);
+                }
+                Err(error) => {
+                    warn!(
+                        object_id,
+                        path = %path.display(),
+                        offset,
+                        error = ?error,
+                        "local payload runtime payload Windows read-cache warmup failed"
+                    );
+                    break;
+                }
             }
         }
     }

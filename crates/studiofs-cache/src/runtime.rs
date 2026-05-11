@@ -873,7 +873,13 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
         self.has_index_entry(object_id) && self.payload_store.contains(object_id)
     }
 
-    fn advise_will_need(&self, _object_id: u64) {}
+    fn advise_will_need(&self, object_id: u64) {
+        if !self.has_index_entry(object_id) {
+            return;
+        }
+        self.payload_store.advise_will_need(object_id);
+        self.touch_access_if_read(object_id, 1, "advise_will_need");
+    }
 
     fn put(
         &self,

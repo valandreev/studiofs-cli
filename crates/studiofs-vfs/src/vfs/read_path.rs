@@ -542,6 +542,13 @@ impl<'a> DataReader<'a> {
         if remote_blocks.is_empty() {
             return Ok(());
         }
+        if matches!(mode, RemoteFetchMode::BestEffortPrefetch) {
+            for object_id in remote_blocks.keys() {
+                if vfs.local_payload_backend.contains(*object_id) {
+                    vfs.local_payload_backend.advise_will_need(*object_id);
+                }
+            }
+        }
         remote_blocks.retain(|object_id, _| !vfs.local_payload_backend.contains(*object_id));
         if remote_blocks.is_empty() {
             return Ok(());
@@ -1485,6 +1492,7 @@ mod tests {
         inner: Arc<dyn LocalPayloadBackend>,
         get_calls: AtomicU64,
         read_into_calls: AtomicU64,
+        advise_will_need_calls: AtomicU64,
     }
 
     impl CountingLocalPayloadBackend {
@@ -1493,12 +1501,15 @@ mod tests {
                 inner,
                 get_calls: AtomicU64::new(0),
                 read_into_calls: AtomicU64::new(0),
+                advise_will_need_calls: AtomicU64::new(0),
             }
         }
 
         fn reset_counters(&self) {
             self.get_calls.store(0, AtomicOrdering::Relaxed);
             self.read_into_calls.store(0, AtomicOrdering::Relaxed);
+            self.advise_will_need_calls
+                .store(0, AtomicOrdering::Relaxed);
         }
 
         fn get_calls(&self) -> u64 {
@@ -1507,6 +1518,10 @@ mod tests {
 
         fn read_into_calls(&self) -> u64 {
             self.read_into_calls.load(AtomicOrdering::Relaxed)
+        }
+
+        fn advise_will_need_calls(&self) -> u64 {
+            self.advise_will_need_calls.load(AtomicOrdering::Relaxed)
         }
     }
 
@@ -1534,6 +1549,8 @@ mod tests {
         }
 
         fn advise_will_need(&self, object_id: u64) {
+            self.advise_will_need_calls
+                .fetch_add(1, AtomicOrdering::Relaxed);
             self.inner.advise_will_need(object_id);
         }
 
@@ -2742,6 +2759,79 @@ mod tests {
                 .expect("read task should join cleanly")
                 .expect("foreground read should complete");
             assert_eq!(read.as_ref(), b"BBBB");
+        });
+    }
+
+    #[test]
+    fn sequential_prefetch_warms_existing_local_payloads() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, mut vfs, meta) =
+            make_unstarted_test_vfs(&tmp, "sequential-prefetch-warms-local-payloads");
+        let inner = vfs.local_payload_backend.clone();
+        let counting_backend = Arc::new(CountingLocalPayloadBackend::new(inner));
+        Arc::get_mut(&mut vfs)
+            .expect("unstarted test VFS should be uniquely owned")
+            .local_payload_backend = counting_backend.clone();
+        let _guard = rt.enter();
+        vfs.start().expect("start vfs background workers");
+        rt.block_on(async {
+            let created = vfs
+                .create(
+                    ROOT_INO,
+                    b"sequential-prefetch-warms-local-payloads.bin",
+                    1000,
+                    1000,
+                    0o644,
+                )
+                .expect("create test file");
+            let ino = created.ino;
+            let block_size = u64::from(DEFAULT_BLOCK_SIZE);
+            let object_0 = 0x5101;
+            let object_1 = 0x5102;
+            let object_2 = 0x5103;
+
+            let mut staged_attr = meta.get_attr(ino).expect("load staged attr");
+            staged_attr.size = block_size.saturating_mul(2).saturating_add(4);
+            staged_attr.committed_size = staged_attr.size;
+            staged_attr.upload_state = MetaUploadState::Ready;
+            meta.set_attr(&staged_attr).expect("persist committed attr");
+            meta.stage_payload_slice(ino, 0, &PayloadRef::new_partial(object_0, 4))
+                .expect("stage first published payload");
+            meta.stage_payload_slice(ino, 1, &PayloadRef::new_partial(object_1, 4))
+                .expect("stage second published payload");
+            meta.stage_payload_slice(ino, 2, &PayloadRef::new_partial(object_2, 4))
+                .expect("stage third published payload");
+
+            vfs.payload_store_put_async(object_0, Bytes::from_static(b"AAAA"), false)
+                .await
+                .expect("seed first local payload");
+            vfs.payload_store_put_async(object_1, Bytes::from_static(b"BBBB"), false)
+                .await
+                .expect("seed second local payload");
+            vfs.payload_store_put_async(object_2, Bytes::from_static(b"CCCC"), false)
+                .await
+                .expect("seed third local payload");
+
+            let first_read = vfs.read(ino, 0, 4).await.expect("read first block");
+            assert_eq!(first_read.as_ref(), b"AAAA");
+            let second_read = vfs
+                .read(ino, block_size, 4)
+                .await
+                .expect("read second block");
+            assert_eq!(second_read.as_ref(), b"BBBB");
+
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    if counting_backend.advise_will_need_calls() > 0 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect(
+                "prefetch should warm already-local payloads instead of treating them as a no-op",
+            );
         });
     }
 
