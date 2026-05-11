@@ -138,12 +138,6 @@ pub enum ScenarioError {
         "mounted client crash/restart scenario requires at least {expected} clients, got {actual}"
     )]
     InsufficientCrashRestartClients { expected: usize, actual: usize },
-    #[error("mounted client crash/restart unrecoverable loss for {client}:{path}: {detail}")]
-    CrashRestartUnrecoverableLoss {
-        client: String,
-        path: String,
-        detail: String,
-    },
     #[error("mounted client crash/restart publication failed for {path}: {detail}")]
     CrashRestartPublicationFailed { path: String, detail: String },
     #[error("mounted client crash/restart peer convergence failed for {path}: {detail}")]
@@ -1359,13 +1353,14 @@ struct CrashRestartModeSummary {
     restart_client_root: String,
     relative_path: String,
     bytes: usize,
-    local_read_checksum_sha256: String,
+    local_read_checksum_sha256: Option<String>,
     peer_visible_before_convergence: Option<String>,
-    final_checksum_sha256: String,
+    final_checksum_sha256: Option<String>,
     restart_elapsed_ms: u128,
     convergence_elapsed_ms: u128,
     intended_checksum_sha256: String,
     recovery_outcome: CrashRestartRecoveryOutcome,
+    recovery_detail: Option<String>,
     final_validator: TreeComparison,
 }
 
@@ -1373,6 +1368,12 @@ struct CrashRestartModeSummary {
 #[serde(rename_all = "snake_case")]
 enum CrashRestartRecoveryOutcome {
     RecoverableWriterState,
+    UnrecoverableLoss,
+}
+
+enum CrashRestartRecoveredPayload {
+    Recovered(Vec<u8>),
+    UnrecoverableLoss { detail: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1473,58 +1474,98 @@ fn run_crash_restart_mode(
     let restart_started = Instant::now();
     driver.force_kill(&crashed.name)?;
     driver.remount(&crashed.name)?;
-    let local_read_payload = read_crash_restart_recovered_payload(crashed, relative_path)?;
+    let recovered_payload = read_crash_restart_recovered_payload(crashed, relative_path)?;
     let intended_checksum_sha256 = bytes_sha256(payload);
-    let local_read_checksum_sha256 = bytes_sha256(&local_read_payload);
     let restart_elapsed_ms = restart_started.elapsed().as_millis();
 
     let convergence_started = Instant::now();
-    let peer_visible_before_convergence =
-        if mode == CrashRestartMode::BeforeRemotePublicationCompletes {
-            read_peer_checksum(&clients[1], relative_path)?
-                .filter(|checksum| checksum == &local_read_checksum_sha256)
-        } else {
-            None
-        };
     let mounts = clients
         .iter()
         .map(|client| ClientMount::new(client.name.clone(), client.mount_point.clone()))
         .collect::<Vec<_>>();
-    let convergence = wait_for_convergence(
-        &mounts,
-        context
-            .scenario_dir
-            .join(format!("validation-{}", crash_restart_mode_slug(mode))),
-        convergence_timeout,
-        poll_interval,
-    )
-    .map_err(|error| crash_restart_convergence_error(relative_path, error))?;
-    let convergence_elapsed_ms = convergence_started.elapsed().as_millis();
-    let final_payload = fs::read(clients[1].mount_point.join(relative_path))?;
-    let final_checksum_sha256 = bytes_sha256(&final_payload);
-    if final_checksum_sha256 != local_read_checksum_sha256 {
-        return Err(ScenarioError::CrashRestartCorruptAdvertisedFile {
-            client: clients[1].name.clone(),
-            path: relative_path.to_string(),
-            expected_checksum: local_read_checksum_sha256,
-            actual_checksum: final_checksum_sha256,
-        });
-    }
+    let validation_dir = context
+        .scenario_dir
+        .join(format!("validation-{}", crash_restart_mode_slug(mode)));
 
-    let summary = CrashRestartModeSummary {
-        mode,
-        restarted_client: crashed.name.clone(),
-        restart_client_root: crashed.client_root.display().to_string(),
-        relative_path: relative_path.to_string(),
-        bytes: local_read_payload.len(),
-        local_read_checksum_sha256,
-        peer_visible_before_convergence,
-        final_checksum_sha256,
-        restart_elapsed_ms,
-        convergence_elapsed_ms,
-        intended_checksum_sha256,
-        recovery_outcome: CrashRestartRecoveryOutcome::RecoverableWriterState,
-        final_validator: convergence.comparison,
+    let summary = match recovered_payload {
+        CrashRestartRecoveredPayload::Recovered(local_read_payload) => {
+            let local_read_checksum_sha256 = bytes_sha256(&local_read_payload);
+            let peer_visible_before_convergence =
+                if mode == CrashRestartMode::BeforeRemotePublicationCompletes {
+                    read_peer_checksum(&clients[1], relative_path)?
+                        .filter(|checksum| checksum == &local_read_checksum_sha256)
+                } else {
+                    None
+                };
+            let convergence =
+                wait_for_convergence(&mounts, validation_dir, convergence_timeout, poll_interval)
+                    .map_err(|error| crash_restart_convergence_error(relative_path, error))?;
+            let convergence_elapsed_ms = convergence_started.elapsed().as_millis();
+            let final_payload = fs::read(clients[1].mount_point.join(relative_path))?;
+            let final_checksum_sha256 = bytes_sha256(&final_payload);
+            if final_checksum_sha256 != local_read_checksum_sha256 {
+                return Err(ScenarioError::CrashRestartCorruptAdvertisedFile {
+                    client: clients[1].name.clone(),
+                    path: relative_path.to_string(),
+                    expected_checksum: local_read_checksum_sha256,
+                    actual_checksum: final_checksum_sha256,
+                });
+            }
+
+            CrashRestartModeSummary {
+                mode,
+                restarted_client: crashed.name.clone(),
+                restart_client_root: crashed.client_root.display().to_string(),
+                relative_path: relative_path.to_string(),
+                bytes: local_read_payload.len(),
+                local_read_checksum_sha256: Some(local_read_checksum_sha256),
+                peer_visible_before_convergence,
+                final_checksum_sha256: Some(final_checksum_sha256),
+                restart_elapsed_ms,
+                convergence_elapsed_ms,
+                intended_checksum_sha256,
+                recovery_outcome: CrashRestartRecoveryOutcome::RecoverableWriterState,
+                recovery_detail: None,
+                final_validator: convergence.comparison,
+            }
+        }
+        CrashRestartRecoveredPayload::UnrecoverableLoss { detail } => {
+            let peer_visible_before_convergence =
+                if mode == CrashRestartMode::BeforeRemotePublicationCompletes {
+                    read_peer_checksum(&clients[1], relative_path)?
+                } else {
+                    None
+                };
+            let convergence =
+                wait_for_convergence(&mounts, validation_dir, convergence_timeout, poll_interval)
+                    .map_err(|error| crash_restart_convergence_error(relative_path, error))?;
+            let convergence_elapsed_ms = convergence_started.elapsed().as_millis();
+            if let Some(final_checksum_sha256) = read_peer_checksum(&clients[1], relative_path)? {
+                return Err(ScenarioError::CrashRestartCorruptAdvertisedFile {
+                    client: clients[1].name.clone(),
+                    path: relative_path.to_string(),
+                    expected_checksum: "unrecoverable_loss".to_string(),
+                    actual_checksum: final_checksum_sha256,
+                });
+            }
+
+            CrashRestartModeSummary {
+                mode,
+                restarted_client: crashed.name.clone(),
+                restart_client_root: crashed.client_root.display().to_string(),
+                relative_path: relative_path.to_string(),
+                bytes: 0,
+                local_read_checksum_sha256: None,
+                peer_visible_before_convergence,
+                final_checksum_sha256: None,
+                restart_elapsed_ms,
+                convergence_elapsed_ms,
+                intended_checksum_sha256,
+                recovery_outcome: CrashRestartRecoveryOutcome::UnrecoverableLoss,
+                recovery_detail: Some(detail),
+                final_validator: convergence.comparison,
+            }
+        }
     };
     write_crash_restart_operation(context, &summary)?;
     Ok(summary)
@@ -1533,19 +1574,20 @@ fn run_crash_restart_mode(
 fn read_crash_restart_recovered_payload(
     client: &ClientSpec,
     relative_path: &str,
-) -> Result<Vec<u8>, ScenarioError> {
+) -> Result<CrashRestartRecoveredPayload, ScenarioError> {
     let path = client.mount_point.join(relative_path);
-    fs::read(&path).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            ScenarioError::CrashRestartUnrecoverableLoss {
-                client: client.name.clone(),
-                path: relative_path.to_string(),
-                detail: "writer could not read recovered bytes after restart".to_string(),
-            }
-        } else {
-            ScenarioError::Io(error)
+    match fs::read(&path) {
+        Ok(payload) => Ok(CrashRestartRecoveredPayload::Recovered(payload)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(CrashRestartRecoveredPayload::UnrecoverableLoss {
+                detail: format!(
+                    "{} could not read recovered bytes for {relative_path} after restart",
+                    client.name
+                ),
+            })
         }
-    })
+        Err(error) => Err(ScenarioError::Io(error)),
+    }
 }
 
 fn crash_restart_convergence_error(relative_path: &str, error: MountedTreeError) -> ScenarioError {
@@ -1575,6 +1617,7 @@ fn write_crash_restart_operation(
         "bytes": summary.bytes,
         "accepted": true,
         "recovery_outcome": summary.recovery_outcome,
+        "recovery_detail": summary.recovery_detail,
         "intended_checksum_sha256": summary.intended_checksum_sha256,
         "local_read_checksum_sha256": summary.local_read_checksum_sha256,
         "peer_visible_before_convergence": summary.peer_visible_before_convergence,
@@ -2954,11 +2997,14 @@ mod tests {
                     .iter()
                     .find(|candidate| candidate.name == client)
                     .expect("recording driver client exists");
-                let path = client
-                    .mount_point
-                    .join(CRASH_RESTART_LOCAL_DURABLE_FILE_NAME);
-                if let Err(error) = std::fs::remove_file(&path) {
-                    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+                for relative_path in [
+                    CRASH_RESTART_LOCAL_DURABLE_FILE_NAME,
+                    CRASH_RESTART_BEFORE_PUBLICATION_FILE_NAME,
+                ] {
+                    let path = client.mount_point.join(relative_path);
+                    if let Err(error) = std::fs::remove_file(&path) {
+                        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+                    }
                 }
             }
             if self.corrupt_converged_payload_after_remount {
@@ -3571,7 +3617,7 @@ mod tests {
         assert!(summary.modes[0].peer_visible_before_convergence.is_none());
         assert_eq!(
             summary.modes[1].peer_visible_before_convergence.as_deref(),
-            Some(summary.modes[1].local_read_checksum_sha256.as_str())
+            summary.modes[1].local_read_checksum_sha256.as_deref()
         );
         assert!(
             summary
@@ -3620,9 +3666,12 @@ mod tests {
         let recovered_checksum = bytes_sha256(b"corrupted payload after restart\n");
         assert_eq!(
             summary.modes[0].local_read_checksum_sha256,
-            recovered_checksum
+            Some(recovered_checksum.clone())
         );
-        assert_eq!(summary.modes[0].final_checksum_sha256, recovered_checksum);
+        assert_eq!(
+            summary.modes[0].final_checksum_sha256,
+            Some(recovered_checksum)
+        );
         assert!(summary.modes[0].final_validator.converged);
     }
 
@@ -3692,18 +3741,20 @@ mod tests {
             client_controller_config: None,
         };
 
-        let err = run_crash_restart_with_driver(
+        let summary = run_crash_restart_with_driver(
             &context,
             &mut driver,
             Duration::from_millis(100),
             Duration::from_millis(10),
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(matches!(
-            err,
-            ScenarioError::CrashRestartUnrecoverableLoss { .. }
-        ));
+        assert!(summary.modes.iter().all(|mode| {
+            mode.recovery_outcome == CrashRestartRecoveryOutcome::UnrecoverableLoss
+                && mode.local_read_checksum_sha256.is_none()
+                && mode.final_checksum_sha256.is_none()
+                && mode.final_validator.converged
+        }));
     }
 
     #[test]
