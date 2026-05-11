@@ -3336,10 +3336,9 @@ mod tests {
                     .find(|candidate| candidate.name == client)
                     .expect("recording driver client exists");
                 let source = crashed.mount_point.join(relative_path);
-                if let Ok(payload) = std::fs::read(source) {
-                    for peer in self.clients.iter().filter(|peer| peer.name != client) {
-                        std::fs::write(peer.mount_point.join(relative_path), &payload)?;
-                    }
+                let payload = std::fs::read(source)?;
+                for peer in self.clients.iter().filter(|peer| peer.name != client) {
+                    std::fs::write(peer.mount_point.join(relative_path), &payload)?;
                 }
             }
             Ok(())
@@ -3903,6 +3902,32 @@ mod tests {
                 .iter()
                 .all(|mode| mode.final_validator.converged)
         );
+    }
+
+    #[test]
+    fn crash_restart_before_convergence_publish_reports_missing_source() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-missing-source");
+        let clients = CRASH_RESTART_CLIENT_NAMES
+            .iter()
+            .copied()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(&mount).unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let mut driver =
+            RecordingCrashRestartDriver::new(clients).publish_current_file_before_convergence();
+
+        let err = driver
+            .before_peer_convergence_wait(CRASH_RESTART_CLIENT_NAMES[0], "missing.txt")
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ScenarioError::Io(error) if error.kind() == std::io::ErrorKind::NotFound
+        ));
     }
 
     #[test]
