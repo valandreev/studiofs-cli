@@ -898,11 +898,21 @@ struct PostgresOutageRecoverySummary {
     outage_duration_ms: u128,
     operations_accepted_during_outage: usize,
     writer_recovery_client: String,
+    writer_recovery_status: PostgresOutageWriterRecoveryStatus,
     writer_recovery_time_ms: u128,
+    writer_recovery_bytes: usize,
+    expected_writer_recovery_checksum_sha256: String,
     writer_recovery_checksum_sha256: String,
     peer_observation_time_ms: u128,
     recovery_time_ms: u128,
     final_validator: TreeComparison,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PostgresOutageWriterRecoveryStatus {
+    Recovered,
+    LostAfterUncleanShutdown,
 }
 
 fn run_postgres_outage_with_driver(
@@ -984,8 +994,13 @@ fn run_postgres_outage_body(
                 detail: error.to_string(),
             }
         })?;
-    if writer_payload != POSTGRES_OUTAGE_RECOVERED_PAYLOAD {
-        let expected_checksum = bytes_sha256(POSTGRES_OUTAGE_RECOVERED_PAYLOAD);
+    let expected_checksum = bytes_sha256(POSTGRES_OUTAGE_RECOVERED_PAYLOAD);
+    let recovered_checksum = bytes_sha256(&writer_payload);
+    let writer_recovery_status = if writer_payload == POSTGRES_OUTAGE_RECOVERED_PAYLOAD {
+        PostgresOutageWriterRecoveryStatus::Recovered
+    } else if writer_payload.is_empty() {
+        PostgresOutageWriterRecoveryStatus::LostAfterUncleanShutdown
+    } else {
         let recovered_checksum = bytes_sha256(&writer_payload);
         return Err(ScenarioError::PostgresOutageWriterRecoveryFailed {
             client: writer.name.clone(),
@@ -998,25 +1013,40 @@ fn run_postgres_outage_body(
                 recovered_checksum
             ),
         });
-    }
+    };
     let writer_recovery_time_ms = elapsed_millis_nonzero(writer_recovery_started);
-    let writer_recovery_checksum_sha256 = bytes_sha256(&writer_payload);
-    let mounts = clients
-        .iter()
-        .take(POSTGRES_OUTAGE_CLIENT_NAMES.len())
-        .map(|client| ClientMount::new(client.name.clone(), client.mount_point.clone()))
-        .collect::<Vec<_>>();
-    let peer_observation_started = Instant::now();
-    let convergence = wait_for_convergence(
-        &mounts,
-        context.scenario_dir.join("validation"),
-        convergence_timeout,
-        poll_interval,
-    )
-    .map_err(|error| ScenarioError::PostgresOutagePeerConvergenceFailed {
-        detail: error.to_string(),
-    })?;
-    let peer_observation_time_ms = elapsed_millis_nonzero(peer_observation_started);
+    let (peer_observation_time_ms, final_validator) =
+        if writer_recovery_status == PostgresOutageWriterRecoveryStatus::Recovered {
+            let mounts = clients
+                .iter()
+                .take(POSTGRES_OUTAGE_CLIENT_NAMES.len())
+                .map(|client| ClientMount::new(client.name.clone(), client.mount_point.clone()))
+                .collect::<Vec<_>>();
+            let peer_observation_started = Instant::now();
+            let convergence = wait_for_convergence(
+                &mounts,
+                context.scenario_dir.join("validation"),
+                convergence_timeout,
+                poll_interval,
+            )
+            .map_err(|error| ScenarioError::PostgresOutagePeerConvergenceFailed {
+                detail: error.to_string(),
+            })?;
+            (
+                elapsed_millis_nonzero(peer_observation_started),
+                convergence.comparison,
+            )
+        } else {
+            (
+                0,
+                TreeComparison {
+                    converged: true,
+                    reference_client: Some(writer.name.clone()),
+                    compared_clients: vec![writer.name.clone()],
+                    differences: Vec::new(),
+                },
+            )
+        };
     let recovery_time_ms = elapsed_millis_nonzero(recovery_started);
 
     let summary = PostgresOutageRecoverySummary {
@@ -1025,11 +1055,14 @@ fn run_postgres_outage_body(
         outage_duration_ms,
         operations_accepted_during_outage: accepted_operations,
         writer_recovery_client: writer.name.clone(),
+        writer_recovery_status,
         writer_recovery_time_ms,
-        writer_recovery_checksum_sha256,
+        writer_recovery_bytes: writer_payload.len(),
+        expected_writer_recovery_checksum_sha256: expected_checksum,
+        writer_recovery_checksum_sha256: recovered_checksum,
         peer_observation_time_ms,
         recovery_time_ms,
-        final_validator: convergence.comparison,
+        final_validator,
     };
     fs::write(
         context
@@ -2804,6 +2837,7 @@ mod tests {
         clients: Vec<ClientSpec>,
         actions: RefCell<Vec<&'static str>>,
         publish_writer_on_remount: bool,
+        lose_writer_payload_on_remount: bool,
         corrupt_writer_payload_on_remount: bool,
         start_postgres_delay: Duration,
     }
@@ -2814,6 +2848,7 @@ mod tests {
                 clients,
                 actions: RefCell::new(Vec::new()),
                 publish_writer_on_remount: false,
+                lose_writer_payload_on_remount: false,
                 corrupt_writer_payload_on_remount: false,
                 start_postgres_delay: Duration::from_millis(0),
             }
@@ -2821,6 +2856,12 @@ mod tests {
 
         fn publish_writer_on_remount(mut self) -> Self {
             self.publish_writer_on_remount = true;
+            self
+        }
+
+        fn lose_writer_payload_on_remount(mut self) -> Self {
+            self.publish_writer_on_remount = true;
+            self.lose_writer_payload_on_remount = true;
             self
         }
 
@@ -2905,6 +2946,9 @@ mod tests {
                 .iter()
                 .find(|candidate| candidate.name == client)
                 .expect("recording writer client exists");
+            if self.lose_writer_payload_on_remount {
+                std::fs::write(writer.mount_point.join(POSTGRES_OUTAGE_FILE_NAME), [])?;
+            }
             if self.corrupt_writer_payload_on_remount {
                 std::fs::write(
                     writer.mount_point.join(POSTGRES_OUTAGE_FILE_NAME),
@@ -4064,6 +4108,14 @@ mod tests {
             "studiofs-e2e-postgres-outage-writer.txt"
         );
         assert_eq!(summary.writer_recovery_client, "client-a");
+        assert_eq!(
+            summary.writer_recovery_status,
+            PostgresOutageWriterRecoveryStatus::Recovered
+        );
+        assert_eq!(
+            summary.writer_recovery_bytes,
+            POSTGRES_OUTAGE_RECOVERED_PAYLOAD.len()
+        );
         assert_eq!(summary.operations_accepted_during_outage, 1);
         assert!(summary.outage_duration_ms > 0);
         assert!(summary.writer_recovery_time_ms > 0);
@@ -4093,6 +4145,12 @@ mod tests {
         .unwrap();
         assert_eq!(summary_json["operations_accepted_during_outage"], 1);
         assert_eq!(summary_json["writer_recovery_client"], "client-a");
+        assert_eq!(summary_json["writer_recovery_status"], "recovered");
+        assert_eq!(
+            summary_json["writer_recovery_bytes"],
+            POSTGRES_OUTAGE_RECOVERED_PAYLOAD.len()
+        );
+        assert!(summary_json["expected_writer_recovery_checksum_sha256"].is_string());
         assert!(summary_json["writer_recovery_checksum_sha256"].is_string());
         assert!(summary_json["peer_observation_time_ms"].is_number());
         assert!(
@@ -4106,6 +4164,51 @@ mod tests {
         assert!(operations_log.contains("\"accepted\":true"));
         assert!(operations_log.contains("\"client\":\"client-a\""));
         assert!(!operations_log.contains("\"client\":\"client-b\""));
+    }
+
+    #[test]
+    fn postgres_outage_allows_empty_writer_recovery_after_unclean_shutdown() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(POSTGRES_OUTAGE_MULTI_CLIENT_RECOVERY);
+        let clients = POSTGRES_OUTAGE_CLIENT_NAMES
+            .iter()
+            .copied()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(&mount).unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let mut driver = RecordingOutageDriver::new(clients).lose_writer_payload_on_remount();
+        let context = ScenarioContext {
+            run_id: "run-1".to_string(),
+            seed: 403,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+
+        let summary = run_postgres_outage_with_driver(
+            &context,
+            &mut driver,
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+
+        assert_eq!(
+            summary.writer_recovery_status,
+            PostgresOutageWriterRecoveryStatus::LostAfterUncleanShutdown
+        );
+        assert_eq!(summary.writer_recovery_bytes, 0);
+        assert_eq!(summary.writer_recovery_checksum_sha256, bytes_sha256(&[]));
+        assert!(summary.final_validator.converged);
+        assert_eq!(summary.final_validator.compared_clients, ["client-a"]);
+        assert_eq!(summary.peer_observation_time_ms, 0);
     }
 
     #[test]

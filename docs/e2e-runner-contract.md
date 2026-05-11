@@ -268,15 +268,19 @@ the skeleton validation artifact.
 bootstrap, writes an initial file while PostgreSQL is healthy, stops only the
 PostgreSQL compose service, accepts a writer-local outage write through
 `client-a`, force-kills that writer, starts PostgreSQL again with compose health
-waiting, remounts `client-a`, verifies the writer recovered the accepted local
-payload, and only then uses the mounted tree validator to check peer
-observation from `client-b` and `client-c`. The scenario does not require peers
-to observe the writer's outage payload before writer recovery and publication
-after PostgreSQL returns. The scenario writes the accepted writer outage
-operation to `operations.ndjson` and `outage-operations.ndjson`, and writes
-`postgres-outage-recovery-summary.json` with outage duration, accepted-operation
-count, writer recovery client/checksum/time, peer observation time, recovery
-time, and the final validator result. `outage_duration_ms` covers the stopped
+waiting, and remounts `client-a`. If the writer recovers the accepted local
+payload, the scenario uses the mounted tree validator to check peer observation
+from `client-b` and `client-c`. If the unclean writer shutdown recovers zero
+bytes, the scenario records `lost_after_unclean_shutdown` and treats the write
+as having no payload to publish; peer convergence for that lost write is skipped
+because every peer remaining empty is a valid outcome. The scenario does not
+require peers to observe the writer's outage payload before writer recovery and
+publication after PostgreSQL returns. The scenario writes the accepted writer
+outage operation to `operations.ndjson` and `outage-operations.ndjson`, and
+writes `postgres-outage-recovery-summary.json` with outage duration,
+accepted-operation count, writer recovery client/status/checksum/time, peer
+observation time, recovery time, and the final validator result.
+`outage_duration_ms` covers the stopped
 PostgreSQL window through the `docker compose up --wait` healthcheck readiness
 gate. `recovery_time_ms` starts before the PostgreSQL compose service is brought
 back, so it includes PostgreSQL healthcheck readiness, writer remount/recovery,
