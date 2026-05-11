@@ -1442,6 +1442,13 @@ trait CrashRestartDriver {
     fn clients(&self) -> Vec<ClientSpec>;
     fn force_kill(&mut self, client: &str) -> Result<(), ScenarioError>;
     fn remount(&mut self, client: &str) -> Result<(), ScenarioError>;
+    fn before_peer_convergence_wait(
+        &mut self,
+        _client: &str,
+        _relative_path: &str,
+    ) -> Result<(), ScenarioError> {
+        Ok(())
+    }
     fn unmount_all(&mut self) -> Result<(), ScenarioError>;
 }
 
@@ -1666,6 +1673,8 @@ fn run_crash_restart_mode(
             }
         }
     };
+
+    driver.before_peer_convergence_wait(&crashed.name, relative_path)?;
 
     let convergence =
         wait_for_convergence(&mounts, validation_dir, convergence_timeout, poll_interval)
@@ -3157,6 +3166,7 @@ mod tests {
         corrupt_converged_payload_after_remount: bool,
         remove_local_on_remount: bool,
         publish_current_file_on_remount: bool,
+        publish_current_file_before_convergence: bool,
     }
 
     impl RecordingCrashRestartDriver {
@@ -3168,6 +3178,7 @@ mod tests {
                 corrupt_converged_payload_after_remount: false,
                 remove_local_on_remount: false,
                 publish_current_file_on_remount: false,
+                publish_current_file_before_convergence: false,
             }
         }
 
@@ -3188,6 +3199,11 @@ mod tests {
 
         fn publish_current_file_on_remount(mut self) -> Self {
             self.publish_current_file_on_remount = true;
+            self
+        }
+
+        fn publish_current_file_before_convergence(mut self) -> Self {
+            self.publish_current_file_before_convergence = true;
             self
         }
     }
@@ -3302,6 +3318,27 @@ mod tests {
                         for peer in self.clients.iter().filter(|peer| peer.name != client) {
                             std::fs::write(peer.mount_point.join(relative_path), &payload)?;
                         }
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        fn before_peer_convergence_wait(
+            &mut self,
+            client: &str,
+            relative_path: &str,
+        ) -> Result<(), ScenarioError> {
+            if self.publish_current_file_before_convergence {
+                let crashed = self
+                    .clients
+                    .iter()
+                    .find(|candidate| candidate.name == client)
+                    .expect("recording driver client exists");
+                let source = crashed.mount_point.join(relative_path);
+                if let Ok(payload) = std::fs::read(source) {
+                    for peer in self.clients.iter().filter(|peer| peer.name != client) {
+                        std::fs::write(peer.mount_point.join(relative_path), &payload)?;
                     }
                 }
             }
@@ -3755,33 +3792,9 @@ mod tests {
                 client_spec_for(&sandbox, "projectfs", name, mount)
             })
             .collect::<Vec<_>>();
-        let source_mount = temp
-            .path()
-            .join("mounts")
-            .join(CRASH_RESTART_CLIENT_NAMES[0]);
-        let peer_mount = temp
-            .path()
-            .join("mounts")
-            .join(CRASH_RESTART_CLIENT_NAMES[1]);
-        thread::spawn(move || {
-            let files = [
-                CRASH_RESTART_LOCAL_DURABLE_FILE_NAME,
-                CRASH_RESTART_BEFORE_PUBLICATION_FILE_NAME,
-            ];
-            for file in files {
-                let source = source_mount.join(file);
-                for _ in 0..100 {
-                    if let Ok(payload) = std::fs::read(&source) {
-                        thread::sleep(Duration::from_millis(50));
-                        std::fs::write(peer_mount.join(file), &payload).unwrap();
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(5));
-                }
-            }
-        });
         let original_client_root = clients[0].client_root.clone();
-        let mut driver = RecordingCrashRestartDriver::new(clients);
+        let mut driver =
+            RecordingCrashRestartDriver::new(clients).publish_current_file_before_convergence();
         let context = ScenarioContext {
             run_id: "run-1".to_string(),
             seed: 327,
