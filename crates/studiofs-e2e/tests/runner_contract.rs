@@ -150,6 +150,30 @@ fn e2e_compose_pins_rustfs_baseline_image() {
 }
 
 #[test]
+fn runner_contract_documents_mounted_level_9_promotion_gate() {
+    let contract_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("docs/e2e-runner-contract.md");
+    let contract = fs::read_to_string(contract_path).unwrap();
+    let normalized = contract.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    for expected in [
+        "Mounted Levels 9+ Promotion Gate",
+        "scenarios 1-8 pass with Local First semantics",
+        "product-invariant, harness-invariant, or platform-only behavior",
+        "Local First invariant and publication boundary",
+        "deterministic simulation first",
+        "bridge, OS cache, shutdown, and kernel notification behavior",
+        "old post-baseline scenario chain",
+    ] {
+        assert!(
+            normalized.contains(expected),
+            "runner contract must document mounted level 9+ gate phrase: {expected}"
+        );
+    }
+}
+
+#[test]
 fn list_scenarios_exposes_initial_basic_smoke_scenario() {
     let scenarios = studiofs_e2e::scenario::available_scenarios();
 

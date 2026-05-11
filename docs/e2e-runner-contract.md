@@ -129,6 +129,34 @@ execution: PostgreSQL must use `postgres:18-alpine`, RustFS must use
 `rustfs/rustfs:1.0.0-alpha.94`, and accidental RustFS `latest` usage is a
 preflight failure, not a product failure.
 
+## Mounted Levels 9+ Promotion Gate
+
+Mounted levels 9+ are blocked until scenarios 1-8 pass with Local First
+semantics through the `local-first-baseline-gate`. A deeper mounted level may
+be added or trusted only after the baseline artifacts show that failures are no
+longer coming from unresolved Local First contract rewrites, runner cleanup, or
+environment drift in the accepted baseline.
+
+Every new mounted scenario issue after level 8 must state:
+
+- its Local First invariant and publication boundary;
+- whether it validates product-invariant, harness-invariant, or platform-only
+  behavior;
+- why the behavior belongs in real mounted E2E instead of a lower test layer;
+- whether deterministic simulation first gives useful signal before WinFSP,
+  FUSE, or macFUSE is involved.
+
+Use deterministic simulation first when the behavior is a logical state-machine
+or convergence invariant that can be modeled without the OS mount stack. Keep
+real mounted E2E for bridge, OS cache, shutdown, and kernel notification
+behavior, and for final public-path validation of scenarios whose lower-layer
+models have already passed.
+
+The old post-baseline scenario chain is not continued automatically. Any
+scenario that was planned beyond the accepted baseline must be reintroduced
+through this gate with its invariant class, publication boundary, and required
+lower-layer signal named explicitly.
+
 ## Sandbox Layout
 
 Every run creates exactly one canonical sandbox:

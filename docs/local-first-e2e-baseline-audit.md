@@ -131,6 +131,9 @@ needed so they state the Local First expectation directly:
   failure while the Local First baseline is being stabilized.
 - SFS-407: deterministic simulation should be replanned from accepted Local
   First contracts rather than from canceled post-baseline assumptions.
+- SFS-408: mounted levels 9+ must pass through the promotion gate in
+  `docs/e2e-runner-contract.md` before new deeper mounted scenarios are added
+  or trusted.
 
 The next implementation issues can proceed without reopening the canceled
 post-baseline plan as long as they keep product bugs, harness bugs,
