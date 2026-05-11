@@ -1212,7 +1212,10 @@ impl RedbMetaEngine {
         let dentries = txn
             .open_table(dentry_table_def)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let mut rows = Vec::new();
+        let mut index = txn
+            .open_table(index_table_def)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
         for row in dentries
             .iter()
             .map_err(|e| MetaError::Storage(e.to_string()))?
@@ -1220,12 +1223,10 @@ impl RedbMetaEngine {
             let (key, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
             let (parent, name) = decode_dentry_key(key.value())?;
             let entry: DirEntryValue = decode(value.value())?;
-            rows.push((parent, name.to_vec(), entry));
-        }
-        drop(dentries);
-
-        for (parent, name, entry) in rows {
-            Self::insert_dentry_index_in_txn(txn, index_table_def, parent, &name, &entry)?;
+            let index_key = encode_dentry_by_inode_key(entry.ino, parent, name);
+            index
+                .insert(index_key.as_slice(), 1)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
         }
         Ok(())
     }

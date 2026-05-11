@@ -956,21 +956,34 @@ impl RedbMetaEngine {
     ) -> MetaResult<()> {
         let keys =
             Self::dentry_keys_for_inode_in_write_index(txn, DENTRIES_BY_INODE_TABLE, entry.ino)?;
+        let current = txn
+            .open_table(DENTRIES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let base = txn
+            .open_table(BASE_DENTRIES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let mut stale = Vec::new();
         for key in keys {
             let (parent, name) = decode_dentry_key(&key)?;
-            let current_matches = Self::lookup_in_write_table(txn, DENTRIES_TABLE, parent, name)?
+            let current_matches = Self::lookup_in_opened_dentry_table(&current, parent, name)?
                 .map(|value| value.ino == entry.ino && value.kind == entry.kind)
                 .unwrap_or(false);
             if !current_matches {
                 continue;
             }
 
-            let base_matches = Self::lookup_in_write_table(txn, BASE_DENTRIES_TABLE, parent, name)?
+            let base_matches = Self::lookup_in_opened_dentry_table(&base, parent, name)?
                 .map(|value| value.ino == entry.ino && value.kind == entry.kind)
                 .unwrap_or(false);
             if !base_matches {
-                Self::remove_dentry_mirror_in_txn(txn, parent, name)?;
+                stale.push((parent, name.to_vec()));
             }
+        }
+        drop(base);
+        drop(current);
+
+        for (parent, name) in stale {
+            Self::remove_dentry_mirror_in_txn(txn, parent, &name)?;
         }
         Ok(())
     }
@@ -985,9 +998,12 @@ impl RedbMetaEngine {
             entry.ino,
         )?;
         let mut matching = Vec::new();
+        let base = txn
+            .open_table(BASE_DENTRIES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
         for key in keys {
             let (parent, name) = decode_dentry_key(&key)?;
-            let base_matches = Self::lookup_in_write_table(txn, BASE_DENTRIES_TABLE, parent, name)?
+            let base_matches = Self::lookup_in_opened_dentry_table(&base, parent, name)?
                 .map(|value| value.ino == entry.ino && value.kind == entry.kind)
                 .unwrap_or(false);
             if base_matches {
