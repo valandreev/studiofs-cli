@@ -594,6 +594,7 @@ fn build_environment_report(input: EnvironmentInput<'_>) -> EnvironmentReport {
         .iter()
         .map(|client| client_mount_point(input.sandbox, client))
         .collect();
+    let ownership = path_ownership_reports(&client_roots, &mount_roots);
     EnvironmentReport {
         run_id: input.run_id.to_string(),
         scenarios: input.scenarios.to_vec(),
@@ -611,18 +612,38 @@ fn build_environment_report(input: EnvironmentInput<'_>) -> EnvironmentReport {
             .iter()
             .map(|path| path.display().to_string())
             .collect(),
-        client_root_ownership: path_ownership_reports(&client_roots),
-        mount_root_ownership: path_ownership_reports(&mount_roots),
+        client_root_ownership: ownership.client_roots,
+        mount_root_ownership: ownership.mount_roots,
         winfsp_version: detect_winfsp_version(),
     }
 }
 
-fn path_ownership_reports(paths: &[PathBuf]) -> Vec<PathOwnershipReport> {
+struct EnvironmentOwnership {
+    client_roots: Vec<PathOwnershipReport>,
+    mount_roots: Vec<PathOwnershipReport>,
+}
+
+fn path_ownership_reports(
+    client_roots: &[PathBuf],
+    mount_roots: &[PathBuf],
+) -> EnvironmentOwnership {
+    let mut paths = Vec::with_capacity(client_roots.len() + mount_roots.len());
+    paths.extend(client_roots.iter().cloned());
+    paths.extend(mount_roots.iter().cloned());
+    let reports = detect_path_owners(&paths);
+    let mut reports = reports.into_iter();
+    EnvironmentOwnership {
+        client_roots: reports.by_ref().take(client_roots.len()).collect(),
+        mount_roots: reports.collect(),
+    }
+}
+
+fn fallback_path_ownership_reports(paths: &[PathBuf]) -> Vec<PathOwnershipReport> {
     paths
         .iter()
         .map(|path| PathOwnershipReport {
             path: path.display().to_string(),
-            owner: detect_path_owner(path),
+            owner: None,
             error: None,
         })
         .collect()
@@ -667,34 +688,71 @@ fn detect_winfsp_version_from_host() -> Option<String> {
 }
 
 #[cfg(windows)]
-fn detect_path_owner(path: &Path) -> Option<String> {
-    let script = format!(
-        "(Get-Acl -LiteralPath '{}').Owner",
-        path.display().to_string().replace('\'', "''")
-    );
+fn detect_path_owners(paths: &[PathBuf]) -> Vec<PathOwnershipReport> {
+    let paths_json = match serde_json::to_string(
+        &paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>(),
+    ) {
+        Ok(paths_json) => paths_json,
+        Err(err) => {
+            return paths
+                .iter()
+                .map(|path| PathOwnershipReport {
+                    path: path.display().to_string(),
+                    owner: None,
+                    error: Some(err.to_string()),
+                })
+                .collect();
+        }
+    };
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/get-path-ownership.ps1");
+    let script_arg = script.display().to_string();
     let output = std::process::Command::new("powershell")
         .args([
             "-NoProfile",
             "-ExecutionPolicy",
             "Bypass",
-            "-Command",
-            &script,
+            "-File",
+            &script_arg,
         ])
+        .env("STUDIOFS_E2E_OWNERSHIP_PATHS_JSON", paths_json)
         .output()
-        .ok()?;
+        .ok();
+    let Some(output) = output else {
+        return fallback_path_ownership_reports(paths);
+    };
     if !output.status.success() {
-        return None;
+        let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return paths
+            .iter()
+            .map(|path| PathOwnershipReport {
+                path: path.display().to_string(),
+                owner: None,
+                error: Some(if error.is_empty() {
+                    format!("path ownership probe exited with status {}", output.status)
+                } else {
+                    error.clone()
+                }),
+            })
+            .collect();
     }
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .map(str::to_string)
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|err| {
+        paths
+            .iter()
+            .map(|path| PathOwnershipReport {
+                path: path.display().to_string(),
+                owner: None,
+                error: Some(err.to_string()),
+            })
+            .collect()
+    })
 }
 
 #[cfg(not(windows))]
-fn detect_path_owner(_path: &Path) -> Option<String> {
-    None
+fn detect_path_owners(paths: &[PathBuf]) -> Vec<PathOwnershipReport> {
+    fallback_path_ownership_reports(paths)
 }
 
 struct PreparedPreflight {
