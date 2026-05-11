@@ -821,23 +821,14 @@ impl RedbMetaEngine {
                     old_parent_attr,
                     new_parent_attr,
                 } => {
-                    let src_key = encode_dentry_key(*parent, name);
-                    let src_matches = txn
-                        .open_table(DENTRIES_TABLE)
-                        .map_err(|e| MetaError::Storage(e.to_string()))?
-                        .get(src_key.as_slice())
-                        .map_err(|e| MetaError::Storage(e.to_string()))?
-                        .map(|value| decode::<DirEntryValue>(value.value()))
-                        .transpose()?
-                        .map(|current| current.ino == entry.ino && current.kind == entry.kind)
-                        .unwrap_or(false);
-                    if !src_matches {
-                        continue;
-                    }
-
-                    Self::remove_dentry_mirror_in_txn(&txn, *parent, name)?;
-                    Self::remove_dentry_mirror_in_txn(&txn, *new_parent, new_name)?;
-                    Self::set_dentry_mirror_in_txn(&txn, *new_parent, new_name, entry)?;
+                    Self::reconcile_serving_rename_from_base_in_txn(
+                        &txn,
+                        *parent,
+                        name,
+                        *new_parent,
+                        new_name,
+                        entry,
+                    )?;
 
                     if let Some(attr) = displaced_set_attr.as_ref() {
                         Self::set_inode_mirror_in_txn(&txn, attr)?;
@@ -936,29 +927,84 @@ impl RedbMetaEngine {
             .begin_write()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
 
-        let src_in_base = Self::lookup_in_write_table(&txn, BASE_DENTRIES_TABLE, parent, name)?
-            .map(|value| value.ino == entry.ino && value.kind == entry.kind)
-            .unwrap_or(false);
-        let dst_in_base =
-            Self::lookup_in_write_table(&txn, BASE_DENTRIES_TABLE, new_parent, new_name)?
-                .map(|value| value.ino == entry.ino && value.kind == entry.kind)
-                .unwrap_or(false);
-
-        if dst_in_base {
-            Self::remove_dentry_mirror_in_txn(&txn, parent, name)?;
-            Self::remove_dentry_mirror_in_txn(&txn, new_parent, new_name)?;
-            Self::set_dentry_mirror_in_txn(&txn, new_parent, new_name, entry)?;
-        } else if src_in_base {
-            Self::remove_dentry_mirror_in_txn(&txn, new_parent, new_name)?;
-            Self::set_dentry_mirror_in_txn(&txn, parent, name, entry)?;
-        } else {
-            Self::remove_dentry_mirror_in_txn(&txn, parent, name)?;
-            Self::remove_dentry_mirror_in_txn(&txn, new_parent, new_name)?;
-        }
+        Self::reconcile_serving_rename_from_base_in_txn(
+            &txn, parent, name, new_parent, new_name, entry,
+        )?;
 
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(())
+    }
+
+    fn reconcile_serving_rename_from_base_in_txn(
+        txn: &redb::WriteTransaction,
+        parent: Ino,
+        name: &[u8],
+        new_parent: Ino,
+        new_name: &[u8],
+        entry: &DirEntryValue,
+    ) -> MetaResult<()> {
+        let src_in_base = Self::lookup_in_write_table(txn, BASE_DENTRIES_TABLE, parent, name)?
+            .map(|value| value.ino == entry.ino && value.kind == entry.kind)
+            .unwrap_or(false);
+        let dst_in_base =
+            Self::lookup_in_write_table(txn, BASE_DENTRIES_TABLE, new_parent, new_name)?
+                .map(|value| value.ino == entry.ino && value.kind == entry.kind)
+                .unwrap_or(false);
+
+        let stale_keys = Self::stale_serving_dentry_keys_for_base_entry(txn, entry)?;
+        for key in stale_keys {
+            let (stale_parent, stale_name) = decode_dentry_key(&key)?;
+            Self::remove_dentry_mirror_in_txn(txn, stale_parent, stale_name)?;
+        }
+
+        if dst_in_base {
+            Self::remove_dentry_mirror_in_txn(txn, parent, name)?;
+            Self::set_dentry_mirror_in_txn(txn, new_parent, new_name, entry)?;
+        } else if src_in_base {
+            Self::remove_dentry_mirror_in_txn(txn, new_parent, new_name)?;
+            Self::set_dentry_mirror_in_txn(txn, parent, name, entry)?;
+        } else {
+            Self::remove_dentry_mirror_in_txn(txn, parent, name)?;
+            Self::remove_dentry_mirror_in_txn(txn, new_parent, new_name)?;
+        }
+
+        Ok(())
+    }
+
+    fn stale_serving_dentry_keys_for_base_entry(
+        txn: &redb::WriteTransaction,
+        entry: &DirEntryValue,
+    ) -> MetaResult<Vec<Vec<u8>>> {
+        let current = txn
+            .open_table(DENTRIES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let base = txn
+            .open_table(BASE_DENTRIES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let mut stale_keys = Vec::new();
+        for row in current
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (key, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let current_entry: DirEntryValue = decode(value.value())?;
+            if current_entry.ino != entry.ino || current_entry.kind != entry.kind {
+                continue;
+            }
+
+            let base_matches = base
+                .get(key.value())
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .map(|value| decode::<DirEntryValue>(value.value()))
+                .transpose()?
+                .map(|base_entry| base_entry.ino == entry.ino && base_entry.kind == entry.kind)
+                .unwrap_or(false);
+            if !base_matches {
+                stale_keys.push(key.value().to_vec());
+            }
+        }
+        Ok(stale_keys)
     }
 }
 
