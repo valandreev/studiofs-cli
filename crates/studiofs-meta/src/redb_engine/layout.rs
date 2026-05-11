@@ -26,9 +26,17 @@ pub(super) const INODE_TOMBSTONES_TABLE: TableDefinition<u64, u8> =
 /// Directory entries: (parent_ino, name) as bytes -> DirEntryValue (postcard)
 pub(super) const DENTRIES_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("dentries");
 
+/// Reverse index for serving dentries: (ino, parent_ino, name) -> marker.
+pub(super) const DENTRIES_BY_INODE_TABLE: TableDefinition<&[u8], u8> =
+    TableDefinition::new("dentries_by_inode");
+
 /// Remote-visible base dentries imported from checkpoint + foreign PG apply.
 pub(super) const BASE_DENTRIES_TABLE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("base_dentries");
+
+/// Reverse index for base dentries: (ino, parent_ino, name) -> marker.
+pub(super) const BASE_DENTRIES_BY_INODE_TABLE: TableDefinition<&[u8], u8> =
+    TableDefinition::new("base_dentries_by_inode");
 
 /// Local tombstones hiding remote-visible base dentries.
 pub(super) const DENTRY_TOMBSTONES_TABLE: TableDefinition<&[u8], u8> =
@@ -105,6 +113,8 @@ pub(super) const EVENT_LOG_TABLE: TableDefinition<u64, &[u8]> = TableDefinition:
 pub(super) const SNAPSHOTS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("snapshots");
 pub(super) const REMOTE_NAMESPACE_VISIBILITY_FILTER_SETTING: &str =
     "remote_namespace_visibility_filter";
+pub(super) const DENTRY_BY_INODE_INDEX_VERSION_SETTING: &str = "dentry_by_inode_index_version";
+pub(super) const CURRENT_DENTRY_BY_INODE_INDEX_VERSION: &[u8] = b"1";
 
 /// Serializable full snapshot of redb metadata state.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
@@ -144,6 +154,14 @@ pub(super) fn encode_dentry_key(parent: Ino, name: &[u8]) -> Vec<u8> {
     key
 }
 
+pub(super) fn encode_dentry_by_inode_key(ino: Ino, parent: Ino, name: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(16 + name.len());
+    key.extend_from_slice(&ino.to_le_bytes());
+    key.extend_from_slice(&parent.to_le_bytes());
+    key.extend_from_slice(name);
+    key
+}
+
 fn invalid_redb_key_len(key_kind: &str, expected: &str, actual: usize) -> MetaError {
     MetaError::Storage(format!(
         "invalid redb {key_kind} key length: expected {expected}, got {actual}"
@@ -168,9 +186,26 @@ pub(super) fn decode_dentry_key(key: &[u8]) -> MetaResult<(Ino, &[u8])> {
     Ok((parent, name))
 }
 
+pub(super) fn decode_dentry_by_inode_key(key: &[u8]) -> MetaResult<(Ino, Ino, &[u8])> {
+    let ino = decode_inode_prefix(key, "dentry-by-inode")?;
+    let parent_bytes = key
+        .get(8..16)
+        .ok_or_else(|| invalid_redb_key_len("dentry-by-inode", "at least 16 bytes", key.len()))?;
+    let mut parent = [0_u8; 8];
+    parent.copy_from_slice(parent_bytes);
+    let name = key
+        .get(16..)
+        .ok_or_else(|| invalid_redb_key_len("dentry-by-inode", "at least 16 bytes", key.len()))?;
+    Ok((ino, u64::from_le_bytes(parent), name))
+}
+
 /// The prefix for scanning all dentries of a parent inode.
 pub(super) fn dentry_prefix(parent: Ino) -> [u8; 8] {
     parent.to_le_bytes()
+}
+
+pub(super) fn dentry_by_inode_prefix(ino: Ino) -> [u8; 8] {
+    ino.to_le_bytes()
 }
 
 /// Encode a regular-file chunk key: ino (8 bytes LE) + chunk_id (8 bytes LE).

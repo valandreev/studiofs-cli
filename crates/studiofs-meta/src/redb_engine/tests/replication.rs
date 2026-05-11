@@ -256,6 +256,71 @@ fn replica_serving_rename_uses_base_winner_when_local_loser_moved_to_b() {
 }
 
 #[test]
+fn replica_base_rename_uses_pg_order_when_source_already_moved_to_prior_winner() {
+    let engine = temp_engine();
+    let entry = DirEntryValue {
+        ino: 781,
+        kind: FileType::RegularFile,
+    };
+    let attr = InodeAttr::new_file(entry.ino, ROOT_INO, 1000, 1000, 0o644);
+
+    engine
+        .apply_replica_events_to_base(&[
+            MetaEvent::SetAttr { attr: attr.clone() },
+            MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: b"source.txt".to_vec(),
+                entry: entry.clone(),
+            },
+        ])
+        .unwrap();
+    engine
+        .apply_replica_serving_state(&[
+            MetaEvent::SetAttr { attr },
+            MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: b"source.txt".to_vec(),
+                entry: entry.clone(),
+            },
+        ])
+        .unwrap();
+
+    let first_winner = replica_rename_event(
+        ROOT_INO,
+        b"source.txt",
+        ROOT_INO,
+        b"renamed-a.txt",
+        entry.clone(),
+    );
+    engine
+        .apply_replica_events_to_base(std::slice::from_ref(&first_winner))
+        .unwrap();
+    engine
+        .apply_replica_serving_state(std::slice::from_ref(&first_winner))
+        .unwrap();
+
+    let pg_later_winner = replica_rename_event(
+        ROOT_INO,
+        b"source.txt",
+        ROOT_INO,
+        b"renamed-b.txt",
+        entry,
+    );
+    engine
+        .apply_replica_events_to_base(std::slice::from_ref(&pg_later_winner))
+        .unwrap();
+    engine
+        .apply_replica_serving_state(std::slice::from_ref(&pg_later_winner))
+        .unwrap();
+
+    assert_only_visible_name(
+        &engine,
+        b"renamed-b.txt",
+        &[b"source.txt".as_slice(), b"renamed-a.txt".as_slice()],
+    );
+}
+
+#[test]
 fn replica_serving_rename_still_applies_when_source_matches() {
     let engine = temp_engine();
     let entry = DirEntryValue {

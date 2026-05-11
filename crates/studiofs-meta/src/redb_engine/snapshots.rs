@@ -321,6 +321,7 @@ impl RedbMetaEngine {
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
             }
         }
+        Self::rebuild_dentry_index_in_txn(&txn, DENTRIES_TABLE, DENTRIES_BY_INODE_TABLE)?;
         {
             Self::clear_table_in_txn(&txn, DENTRY_TOMBSTONES_TABLE)?;
         }
@@ -336,6 +337,18 @@ impl RedbMetaEngine {
                     .insert(k.as_slice(), v.as_slice())
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
             }
+        }
+        Self::rebuild_dentry_index_in_txn(&txn, BASE_DENTRIES_TABLE, BASE_DENTRIES_BY_INODE_TABLE)?;
+        {
+            let mut settings = txn
+                .open_table(SETTINGS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            settings
+                .insert(
+                    DENTRY_BY_INODE_INDEX_VERSION_SETTING,
+                    CURRENT_DENTRY_BY_INODE_INDEX_VERSION,
+                )
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
         }
         {
             Self::replace_regular_file_chunk_rows_from_snapshot_rows(
