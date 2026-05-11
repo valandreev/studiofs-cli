@@ -139,6 +139,7 @@ pub enum ClientLifecycleState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientSpec {
     pub name: String,
+    pub volume_name: String,
     pub client_root: PathBuf,
     pub local_metadata_dir: PathBuf,
     pub local_metadata_db: PathBuf,
@@ -797,11 +798,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         let client = self.client(index)?;
         let args = vec![
             "mount".to_string(),
-            client
-                .local_metadata_dir
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| self.config.volume_name.clone()),
+            client.volume_name.clone(),
             client.mount_point.display().to_string(),
             "--cache-dir".to_string(),
             client.cache_dir.display().to_string(),
@@ -959,6 +956,7 @@ pub fn client_spec_for(
     let mount_metadata_dir = client_mount_point(sandbox, client);
     ClientSpec {
         name: client.to_string(),
+        volume_name: volume_name.to_string(),
         local_metadata_db: local_metadata_dir.join(format!("{volume_name}.db")),
         local_metadata_dir,
         client_root,

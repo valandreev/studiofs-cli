@@ -3,7 +3,7 @@
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{self, Write as _};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -293,9 +293,8 @@ impl Scenario for BasicMultiClientSmoke {
                 "volumes": summary.volumes,
             });
             if smoke_summary.exists() {
-                let summary: MountedSmokeRunSummary =
-                    serde_json::from_slice(&fs::read(&smoke_summary)?)?;
-                validation["volume_validations"] = json!(summary.volume_validations);
+                validation["volume_validations"] =
+                    json!(read_mounted_smoke_volume_validations(&smoke_summary)?);
             }
             validation
         } else if bootstrap_summary.exists() {
@@ -316,10 +315,9 @@ impl Scenario for BasicMultiClientSmoke {
                     .collect::<Vec<_>>(),
             });
             if smoke_summary.exists() {
-                let summary: MountedSmokeRunSummary =
-                    serde_json::from_slice(&fs::read(&smoke_summary)?)?;
                 validation["workflow"] = json!("mounted-multi-client-smoke");
-                validation["volume_validations"] = json!(summary.volume_validations);
+                validation["volume_validations"] =
+                    json!(read_mounted_smoke_volume_validations(&smoke_summary)?);
             }
             validation
         } else {
@@ -703,12 +701,39 @@ struct MountedSmokeRunSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct LegacyMountedSmokeRunSummary {
+    bootstrap: VolumeBootstrapSummary,
+    written_file: String,
+    convergence: TreeComparison,
+    attempts: usize,
+    elapsed_ms: u128,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct MountedSmokeVolumeValidation {
     volume_name: String,
     written_file: String,
     convergence: TreeComparison,
     attempts: usize,
     elapsed_ms: u128,
+}
+
+fn read_mounted_smoke_volume_validations(
+    path: &Path,
+) -> Result<Vec<MountedSmokeVolumeValidation>, ScenarioError> {
+    let artifact: serde_json::Value = serde_json::from_slice(&fs::read(path)?)?;
+    if artifact.get("volume_validations").is_some() {
+        let summary: MountedSmokeRunSummary = serde_json::from_value(artifact)?;
+        return Ok(summary.volume_validations);
+    }
+    let summary: LegacyMountedSmokeRunSummary = serde_json::from_value(artifact)?;
+    Ok(vec![MountedSmokeVolumeValidation {
+        volume_name: summary.bootstrap.volume_name,
+        written_file: summary.written_file,
+        convergence: summary.convergence,
+        attempts: summary.attempts,
+        elapsed_ms: summary.elapsed_ms,
+    }])
 }
 
 fn run_mounted_smoke_with_driver(
@@ -760,7 +785,7 @@ fn run_mounted_smoke_body(
         let writer = clients
             .iter()
             .find(|client| client.name == volume.init_client)
-            .unwrap_or(&clients[0]);
+            .expect("init_client for volume should always be in the list of clients");
         let smoke_file = writer
             .mount_point
             .join(format!("{}-{SMOKE_FILE_NAME}", volume.volume_name));
@@ -2727,6 +2752,38 @@ mod tests {
         assert!(context.scenario_dir.join("smoke-summary.json").exists());
     }
 
+    #[test]
+    fn mounted_smoke_validation_reads_legacy_summary_shape() {
+        let temp = tempdir().unwrap();
+        let summary_path = temp.path().join("smoke-summary.json");
+        let legacy = LegacyMountedSmokeRunSummary {
+            bootstrap: VolumeBootstrapSummary {
+                volume_name: "projectfs".to_string(),
+                init_client: "client-a".to_string(),
+                discovered_clients: vec!["client-b".to_string(), "client-c".to_string()],
+                clients: Vec::new(),
+            },
+            written_file: "Z:\\studiofs-e2e-smoke.txt".to_string(),
+            convergence: TreeComparison {
+                converged: true,
+                reference_client: Some("client-a".to_string()),
+                compared_clients: vec!["client-a".to_string()],
+                differences: Vec::new(),
+            },
+            attempts: 2,
+            elapsed_ms: 42,
+        };
+        std::fs::write(&summary_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        let validations = read_mounted_smoke_volume_validations(&summary_path).unwrap();
+
+        assert_eq!(validations.len(), 1);
+        assert_eq!(validations[0].volume_name, "projectfs");
+        assert_eq!(validations[0].written_file, "Z:\\studiofs-e2e-smoke.txt");
+        assert_eq!(validations[0].attempts, 2);
+        assert!(validations[0].convergence.converged);
+    }
+
     struct RecordingSmokeDriver {
         clients: Vec<ClientSpec>,
         mounted: Cell<bool>,
@@ -2808,6 +2865,7 @@ mod tests {
             volume_name: &str,
         ) -> Result<(), ClientControllerError> {
             for client in &mut self.clients {
+                client.volume_name = volume_name.to_string();
                 client.local_metadata_dir = client.client_root.join("meta").join(volume_name);
                 client.local_metadata_db =
                     client.local_metadata_dir.join(format!("{volume_name}.db"));

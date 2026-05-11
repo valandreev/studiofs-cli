@@ -166,6 +166,8 @@ pub enum InfraError {
     Io(#[from] std::io::Error),
     #[error("infra JSON failed: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("infra YAML failed: {0}")]
+    Yaml(#[from] serde_yaml::Error),
 }
 
 #[derive(Debug, Clone)]
@@ -252,7 +254,16 @@ impl DockerComposeStack {
                 detail: format!("failed to read {}", self.compose_file.display()),
             };
         };
-        let images = compose_images(&compose);
+        let images = match compose_images(&compose) {
+            Ok(images) => images,
+            Err(error) => {
+                return InfraCheck {
+                    name: "compose baseline contract".to_string(),
+                    passed: false,
+                    detail: format!("failed to parse compose YAML: {error}"),
+                };
+            }
+        };
         let mut errors = Vec::new();
         if !images.iter().any(|image| image == "postgres:18-alpine") {
             errors.push("PostgreSQL image must stay pinned to postgres:18-alpine");
@@ -491,16 +502,26 @@ impl DockerComposeStack {
     }
 }
 
-fn compose_images(compose: &str) -> Vec<String> {
-    compose
-        .lines()
-        .filter_map(|line| {
-            let line = line.split_once('#').map_or(line, |(before, _)| before);
-            let (_, image) = line.split_once("image:")?;
-            let image = image.trim().trim_matches(['"', '\'']);
-            (!image.is_empty()).then(|| image.to_string())
-        })
-        .collect()
+fn compose_images(compose: &str) -> Result<Vec<String>, serde_yaml::Error> {
+    let document: serde_yaml::Value = serde_yaml::from_str(compose)?;
+    let Some(services) = mapping_value(&document, "services") else {
+        return Ok(Vec::new());
+    };
+    let Some(services) = services.as_mapping() else {
+        return Ok(Vec::new());
+    };
+    Ok(services
+        .values()
+        .filter_map(|service| mapping_value(service, "image"))
+        .filter_map(serde_yaml::Value::as_str)
+        .map(str::to_string)
+        .collect())
+}
+
+fn mapping_value<'a>(value: &'a serde_yaml::Value, key: &str) -> Option<&'a serde_yaml::Value> {
+    value
+        .as_mapping()?
+        .get(serde_yaml::Value::String(key.to_string()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

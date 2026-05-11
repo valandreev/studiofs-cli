@@ -43,6 +43,7 @@ fn controller_bootstraps_mounts_restarts_and_kills_isolated_clients() {
             .join("projectfs")
             .join("projectfs.db")
     );
+    assert_eq!(clients[0].volume_name, "projectfs");
     assert!(clients[0].stdout_log.ends_with("studiofs.stdout.log"));
     assert!(clients[0].stderr_log.ends_with("studiofs.stderr.log"));
     assert!(clients[0].tracing_log.ends_with("studiofs-tracing.log"));
@@ -234,9 +235,10 @@ fn controller_can_select_peer_volume_for_sequential_mount_validation() {
 
     let clients = controller.clients();
     assert!(clients.iter().all(|client| {
-        client
-            .local_metadata_db
-            .ends_with(format!("{volume_name}/{volume_name}.db"))
+        client.volume_name == volume_name
+            && client
+                .local_metadata_db
+                .ends_with(format!("{volume_name}/{volume_name}.db"))
     }));
     let calls = calls.borrow();
     let mount_calls = calls

@@ -132,22 +132,15 @@ fn check_windows_process_cleanliness(
 
 fn windows_stale_process_command(root: &Path) -> CommandSpec {
     let root = absolute_without_requiring_exists(root);
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/check-stale-processes.ps1");
     CommandSpec {
         program: "powershell".to_string(),
         args: vec![
             "-NoProfile".to_string(),
-            "-Command".to_string(),
-            "$names=@('studiofs.exe','studiofs-e2e.exe'); \
-             $selfPid=[int]$env:STUDIOFS_E2E_BASELINE_SELF_PID; \
-             $rootPattern=[regex]::Escape($env:STUDIOFS_E2E_BASELINE_ROOT); \
-             Get-CimInstance Win32_Process | \
-             Where-Object { \
-               $cmd=$_.CommandLine -as [string]; \
-               $names -contains $_.Name -and $_.ProcessId -ne $selfPid -and \
-               ($cmd -match $rootPattern -or $cmd -match '__mounted-chaos-op|\\smount\\s') \
-             } | \
-             ForEach-Object { \"$($_.ProcessId) $($_.Name) $($_.CommandLine)\" }"
-                .to_string(),
+            "-ExecutionPolicy".to_string(),
+            "Bypass".to_string(),
+            "-File".to_string(),
+            script.display().to_string(),
         ],
         env: vec![
             (
@@ -186,6 +179,7 @@ mod tests {
             "STUDIOFS_E2E_BASELINE_ROOT".to_string(),
             "D:\\custom-e2e-root".to_string()
         )));
+        assert!(command.args.iter().any(|arg| arg.ends_with(".ps1")));
         assert!(!command.args.join(" ").contains("target\\\\e2e-runs"));
     }
 }
