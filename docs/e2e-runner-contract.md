@@ -218,10 +218,11 @@ after PostgreSQL returns. The scenario writes the accepted writer outage
 operation to `operations.ndjson` and `outage-operations.ndjson`, and writes
 `postgres-outage-recovery-summary.json` with outage duration, accepted-operation
 count, writer recovery client/checksum/time, peer observation time, recovery
-time, and the final validator result. `recovery_time_ms` starts before the
-PostgreSQL compose service is brought back with `docker compose up --wait`, so
-it includes PostgreSQL healthcheck readiness, writer remount/recovery, and
-mounted tree convergence time.
+time, and the final validator result. `outage_duration_ms` covers the stopped
+PostgreSQL window through the `docker compose up --wait` healthcheck readiness
+gate. `recovery_time_ms` starts before the PostgreSQL compose service is brought
+back, so it includes PostgreSQL healthcheck readiness, writer remount/recovery,
+and mounted tree convergence time.
 
 `rustfs-outage-multi-client-recovery` uses a four-client mounted bootstrap,
 writes and converges an initial file while RustFS/S3 is healthy, stops only the

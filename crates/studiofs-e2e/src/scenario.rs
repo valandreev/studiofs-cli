@@ -124,8 +124,8 @@ pub enum ScenarioError {
         path: String,
         detail: String,
     },
-    #[error("PostgreSQL outage writer publication failed for {client}: {detail}")]
-    PostgresOutageWriterPublicationFailed { client: String, detail: String },
+    #[error("PostgreSQL outage writer remount failed for {client}: {detail}")]
+    PostgresOutageWriterRemountFailed { client: String, detail: String },
     #[error("PostgreSQL outage peer convergence failed after writer publication: {detail}")]
     PostgresOutagePeerConvergenceFailed { detail: String },
     #[error("peer client observed the RustFS/S3 outage write before recovery: {checksum}")]
@@ -386,7 +386,6 @@ impl Scenario for PostgresOutageMultiClientRecovery {
             "writer_recovery_checksum_sha256": summary.writer_recovery_checksum_sha256,
             "peer_observation_time_ms": summary.peer_observation_time_ms,
             "operations_accepted_during_outage": summary.operations_accepted_during_outage,
-            "peer_observation_validator": summary.peer_observation_validator,
             "final_validator": summary.final_validator,
         });
         fs::write(
@@ -816,7 +815,6 @@ struct PostgresOutageRecoverySummary {
     writer_recovery_time_ms: u128,
     writer_recovery_checksum_sha256: String,
     peer_observation_time_ms: u128,
-    peer_observation_validator: TreeComparison,
     recovery_time_ms: u128,
     final_validator: TreeComparison,
 }
@@ -879,15 +877,15 @@ fn run_postgres_outage_body(
         POSTGRES_OUTAGE_RECOVERED_PAYLOAD,
     )?;
     driver.force_kill(&writer.name)?;
-    let outage_duration_ms = elapsed_millis_nonzero(outage_started);
 
     // `start_postgres` uses `docker compose up --wait`, so this includes
     // PostgreSQL healthcheck readiness before mounted convergence polling.
     let recovery_started = Instant::now();
     driver.start_postgres()?;
+    let outage_duration_ms = elapsed_millis_nonzero(outage_started);
     let writer_recovery_started = Instant::now();
     driver.remount(&writer.name).map_err(|error| {
-        ScenarioError::PostgresOutageWriterPublicationFailed {
+        ScenarioError::PostgresOutageWriterRemountFailed {
             client: writer.name.clone(),
             detail: error.to_string(),
         }
@@ -934,7 +932,6 @@ fn run_postgres_outage_body(
     })?;
     let peer_observation_time_ms = elapsed_millis_nonzero(peer_observation_started);
     let recovery_time_ms = elapsed_millis_nonzero(recovery_started);
-    let peer_observation_validator = convergence.comparison.clone();
 
     let summary = PostgresOutageRecoverySummary {
         bootstrap,
@@ -945,7 +942,6 @@ fn run_postgres_outage_body(
         writer_recovery_time_ms,
         writer_recovery_checksum_sha256,
         peer_observation_time_ms,
-        peer_observation_validator,
         recovery_time_ms,
         final_validator: convergence.comparison,
     };
@@ -2545,6 +2541,7 @@ mod tests {
         actions: RefCell<Vec<&'static str>>,
         publish_writer_on_remount: bool,
         corrupt_writer_payload_on_remount: bool,
+        start_postgres_delay: Duration,
     }
 
     impl RecordingOutageDriver {
@@ -2554,6 +2551,7 @@ mod tests {
                 actions: RefCell::new(Vec::new()),
                 publish_writer_on_remount: false,
                 corrupt_writer_payload_on_remount: false,
+                start_postgres_delay: Duration::from_millis(0),
             }
         }
 
@@ -2564,6 +2562,11 @@ mod tests {
 
         fn corrupt_writer_payload_on_remount(mut self) -> Self {
             self.corrupt_writer_payload_on_remount = true;
+            self
+        }
+
+        fn with_start_postgres_delay(mut self, delay: Duration) -> Self {
+            self.start_postgres_delay = delay;
             self
         }
     }
@@ -2617,6 +2620,7 @@ mod tests {
 
         fn start_postgres(&mut self) -> Result<(), ScenarioError> {
             self.actions.borrow_mut().push("start_postgres");
+            thread::sleep(self.start_postgres_delay);
             Ok(())
         }
 
@@ -3683,7 +3687,7 @@ mod tests {
         assert!(summary.outage_duration_ms > 0);
         assert!(summary.writer_recovery_time_ms > 0);
         assert!(summary.peer_observation_time_ms > 0);
-        assert!(summary.peer_observation_validator.converged);
+        assert!(summary.final_validator.converged);
         assert_eq!(
             driver.actions.borrow().as_slice(),
             [
@@ -3709,11 +3713,7 @@ mod tests {
         assert_eq!(summary_json["operations_accepted_during_outage"], 1);
         assert_eq!(summary_json["writer_recovery_client"], "client-a");
         assert!(summary_json["writer_recovery_checksum_sha256"].is_string());
-        assert!(
-            summary_json["peer_observation_validator"]["converged"]
-                .as_bool()
-                .unwrap()
-        );
+        assert!(summary_json["peer_observation_time_ms"].is_number());
         assert!(
             context
                 .scenario_dir
@@ -3768,6 +3768,49 @@ mod tests {
         };
         assert!(detail.contains("expected checksum"));
         assert!(detail.contains("recovered checksum"));
+    }
+
+    #[test]
+    fn postgres_outage_duration_includes_postgres_restart_wait() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(POSTGRES_OUTAGE_MULTI_CLIENT_RECOVERY);
+        let clients = POSTGRES_OUTAGE_CLIENT_NAMES
+            .iter()
+            .copied()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(&mount).unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let mut driver = RecordingOutageDriver::new(clients)
+            .publish_writer_on_remount()
+            .with_start_postgres_delay(Duration::from_millis(40));
+        let context = ScenarioContext {
+            run_id: "run-1".to_string(),
+            seed: 403,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+
+        let summary = run_postgres_outage_with_driver(
+            &context,
+            &mut driver,
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+
+        assert!(
+            summary.outage_duration_ms >= 30,
+            "outage duration should include PostgreSQL restart wait, got {}ms",
+            summary.outage_duration_ms
+        );
     }
 
     #[test]
