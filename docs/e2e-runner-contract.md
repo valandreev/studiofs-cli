@@ -35,6 +35,7 @@ cargo run -p studiofs-e2e -- run postgres-outage-multi-client-recovery --studiof
 cargo run -p studiofs-e2e -- run rustfs-outage-multi-client-recovery --studiofs-bin <path-to-studiofs>
 cargo run -p studiofs-e2e -- run mounted-client-crash-restart-recovery --studiofs-bin <path-to-studiofs>
 cargo run -p studiofs-e2e -- run collision-rename-vs-unlink --studiofs-bin <path-to-studiofs>
+cargo run -p studiofs-e2e -- local-first-baseline-gate --studiofs-bin <path-to-studiofs> --run-id-prefix <prefix> --seed 405 --port-range <start-end>
 cargo run -p studiofs-e2e -- clean
 ```
 
@@ -57,7 +58,7 @@ Required initial run flags and environment:
 | Flag | Contract |
 |---|---|
 | `basic-multi-client-smoke` | Positional shorthand for the mounted three-client happy-path smoke scenario. |
-| `--scenario <name>` | Repeatable. Accepted values include `basic-multi-client-smoke` (`smoke`), `postgres-outage-multi-client-recovery` (`postgres-outage`), `rustfs-outage-multi-client-recovery` (`rustfs-outage`, `s3-outage`), `mounted-client-crash-restart-recovery` (`client-crash-restart`, `crash-restart`), and the mounted namespace collision scenarios `collision-rename-vs-rename`, `collision-rename-vs-unlink`, `collision-unlink-vs-append`, `collision-overwrite-vs-read`, `collision-mkdir-rmdir-vs-create`, and `collision-readdir-stat-during-mutation`. |
+| `--scenario <name|number|range|list>` | Repeatable. Accepted values include scenario names/aliases, one-based numbers from `studiofs-e2e list`, numeric ranges such as `1-8`, and comma lists such as `2,5,10`. Names include `basic-multi-client-smoke` (`smoke`), `postgres-outage-multi-client-recovery` (`postgres-outage`), `rustfs-outage-multi-client-recovery` (`rustfs-outage`, `s3-outage`), `mounted-client-crash-restart-recovery` (`client-crash-restart`, `crash-restart`), and the mounted namespace collision scenarios `collision-rename-vs-rename`, `collision-rename-vs-unlink`, `collision-unlink-vs-append`, `collision-overwrite-vs-read`, `collision-mkdir-rmdir-vs-create`, and `collision-readdir-stat-during-mutation`. |
 | `--studiofs-bin <path>` | Path to the product CLI under test. Real mounted scenarios require it when `--infra compose` is used. The runner may build it only when an explicit build flag is added. |
 | `--root <path>` | Parent run directory. Defaults to `target/e2e-runs`. |
 | `--run-id <id>` | Optional stable run ID. If omitted, use an ISO-like UTC timestamp plus short random suffix. Explicit IDs must be safe single directory names: no separators, drive prefixes, traversal segments, leading dots, or other shell/path metacharacters. |
@@ -72,6 +73,61 @@ Required initial run flags and environment:
 The initial runner implements `list`, `run`, and `clean`. Future subcommands
 may add dedicated `preflight` or artifact commands, but those must reuse the
 same report schema and cleanup safety checks.
+
+## Local First Baseline Gate
+
+`local-first-baseline-gate` is the explicit SFS-405 gate for rerunning the
+accepted mounted scenario 1-8 baseline after the Local First contract rewrites.
+It is operator-started, uses the same per-run sandbox/report schema as `run`,
+and does not become part of the default fast suite.
+
+Recommended Windows/WinFSP command:
+
+```powershell
+cargo build -p studiofs
+cargo run -p studiofs-e2e -- local-first-baseline-gate `
+  --studiofs-bin target\debug\studiofs.exe `
+  --run-id-prefix sfs405-baseline `
+  --iterations 3 `
+  --seed 405 `
+  --port-range 29700-29800
+```
+
+Each iteration records a stable run ID (`sfs405-baseline-01`,
+`sfs405-baseline-02`, and so on), writes the normal `report.json`,
+`preflight.json`, `cleanup.json`, mounted-tree validation artifacts, scenario
+summaries, and Docker diagnostics. Failures should be classified from those
+artifacts as product bug, harness bug, environment drift, or invalid test
+expectation before changing product semantics.
+
+The gate runs these accepted baseline scenarios in order:
+
+1. `basic-multi-client-smoke`
+2. `rustfs-outage-multi-client-recovery`
+3. `collision-rename-vs-rename`
+4. `postgres-outage-multi-client-recovery`
+5. `mounted-client-crash-restart-recovery`
+6. `collision-rename-vs-unlink`
+7. `collision-unlink-vs-append`
+8. `collision-overwrite-vs-read`
+
+The same numbering is used by `studiofs-e2e list` and by `run --scenario`, so
+`--scenario 1-8` runs this baseline set and `--scenario 2,5,10` runs only those
+numbered scenarios when they are registered.
+
+Scenario 4 follows the rewritten PostgreSQL outage contract: writer recovery
+comes first, then normal publication, then peer convergence. Scenario 5 follows
+the rewritten crash/restart contract: a readable recovered writer checksum is
+the convergence oracle, while unrecoverable local loss is reported separately
+from corrupt advertised files, publication failure, and peer convergence
+failure.
+
+For Windows/WinFSP runs, the gate checks for stale runner-owned
+`studiofs.exe` / `studiofs-e2e.exe` processes before starting the first
+iteration. Compose preflight also rejects environment drift before scenario
+execution: PostgreSQL must use `postgres:18-alpine`, RustFS must use
+`rustfs/rustfs:1.0.0-alpha.94`, and accidental RustFS `latest` usage is a
+preflight failure, not a product failure.
 
 ## Sandbox Layout
 
@@ -198,11 +254,13 @@ lazy stale-mount cleanup for leftover FUSE mountpoints with `fusermount3 -u -z`,
 path unless a platform-specific stale-mount cleanup is added.
 
 `basic-multi-client-smoke` uses the first three default clients. It initializes
-one shared remote volume from `client-a`, discovers it from `client-b` and
-`client-c`, mounts all three clients, writes `studiofs-e2e-smoke.txt` through
-`client-a`'s mount point, waits for the mounted tree validator to observe the
-same file from all three mount points, writes `bootstrap-summary.json`,
-`smoke-summary.json`, and `validation.json`, and then unmounts the clients.
+three peer remote volumes, one from each client, then discovers each peer-owned
+volume from the other two clients. To keep Windows drive-letter use bounded, it
+validates those volumes sequentially: select one volume, mount it from all three
+clients, write the smoke file through that volume's init client, wait for the
+mounted tree validator to observe convergence from all three mount points, then
+unmount and move to the next peer volume. The scenario writes
+`peer-bootstrap-summary.json`, `smoke-summary.json`, and `validation.json`.
 The `--infra disabled` path remains limited to runner self-tests and writes only
 the skeleton validation artifact.
 

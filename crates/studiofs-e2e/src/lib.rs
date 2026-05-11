@@ -1,5 +1,6 @@
 //! Real mounted E2E runner skeleton for StudioFS.
 
+pub mod baseline_gate;
 pub mod cli;
 pub mod client;
 pub mod infra;

@@ -306,11 +306,12 @@ pub fn run_with_executor(
                 .join(definition.name),
             client_controller_config: match (infra_mode, request.studiofs_bin.as_ref()) {
                 (InfraMode::Compose, Some(studiofs_bin)) => {
-                    Some(ClientControllerConfig::from_compose_services(
+                    Some(ClientControllerConfig::from_compose_services_for_scenario(
                         studiofs_bin.clone(),
                         sandbox.clone(),
                         &run_id,
                         request.seed,
+                        definition.name,
                         &allocated_ports,
                     )?)
                 }

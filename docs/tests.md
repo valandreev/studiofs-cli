@@ -136,9 +136,12 @@ Initial runner commands:
 cargo run -p studiofs-e2e -- list
 cargo build -p studiofs
 cargo run -p studiofs-e2e -- run basic-multi-client-smoke --studiofs-bin target\debug\studiofs.exe
+cargo run -p studiofs-e2e -- run --scenario 1-8 --studiofs-bin target\debug\studiofs.exe
+cargo run -p studiofs-e2e -- run --scenario 2,5,10 --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run rustfs-outage-multi-client-recovery --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run mounted-client-crash-restart-recovery --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run collision-rename-vs-unlink --studiofs-bin target\debug\studiofs.exe
+cargo run -p studiofs-e2e -- local-first-baseline-gate --studiofs-bin target\debug\studiofs.exe --run-id-prefix sfs405-baseline --iterations 3 --seed 405 --port-range 29700-29800
 cargo run -p studiofs-e2e -- clean
 ```
 

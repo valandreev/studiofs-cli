@@ -15,7 +15,8 @@ use thiserror::Error;
 
 use crate::client::{
     ClientControllerConfig, ClientControllerError, ClientSpec, MultiClientController,
-    SystemClientProcessExecutor, VolumeBootstrapOptions, VolumeBootstrapSummary,
+    PeerVolumeBootstrapOptions, PeerVolumeBootstrapSummary, SystemClientProcessExecutor,
+    VolumeBootstrapOptions, VolumeBootstrapSummary,
 };
 use crate::infra::{
     CommandExecutor, ComposeServiceControl, InfraError, POSTGRES_SERVICE_NAME, RUSTFS_SERVICE_NAME,
@@ -175,10 +176,10 @@ pub trait Scenario {
 pub fn available_scenarios() -> Vec<ScenarioDefinition> {
     vec![
         BasicMultiClientSmoke.definition(),
-        PostgresOutageMultiClientRecovery.definition(),
         RustfsOutageMultiClientRecovery.definition(),
-        MountedClientCrashRestartRecovery.definition(),
         NamespaceCollisionScenario::new(NamespaceCollisionKind::RenameVsRename).definition(),
+        PostgresOutageMultiClientRecovery.definition(),
+        MountedClientCrashRestartRecovery.definition(),
         NamespaceCollisionScenario::new(NamespaceCollisionKind::RenameVsUnlink).definition(),
         NamespaceCollisionScenario::new(NamespaceCollisionKind::UnlinkVsAppend).definition(),
         NamespaceCollisionScenario::new(NamespaceCollisionKind::OverwriteVsRead).definition(),
@@ -276,9 +277,28 @@ impl Scenario for BasicMultiClientSmoke {
     }
 
     fn validate(&self, context: &ScenarioContext) -> Result<Vec<String>, ScenarioError> {
+        let peer_bootstrap_summary = context.scenario_dir.join("peer-bootstrap-summary.json");
         let bootstrap_summary = context.scenario_dir.join("bootstrap-summary.json");
         let smoke_summary = context.scenario_dir.join("smoke-summary.json");
-        let validation = if bootstrap_summary.exists() {
+        let validation = if peer_bootstrap_summary.exists() {
+            let summary: PeerVolumeBootstrapSummary =
+                serde_json::from_slice(&fs::read(&peer_bootstrap_summary)?)?;
+            let mut validation = json!({
+                "scenario": BASIC_MULTI_CLIENT_SMOKE,
+                "run_id": context.run_id,
+                "seed": context.seed,
+                "status": "passed",
+                "workflow": "mounted-peer-volume-discovery",
+                "base_volume_name": summary.base_volume_name,
+                "volumes": summary.volumes,
+            });
+            if smoke_summary.exists() {
+                let summary: MountedSmokeRunSummary =
+                    serde_json::from_slice(&fs::read(&smoke_summary)?)?;
+                validation["volume_validations"] = json!(summary.volume_validations);
+            }
+            validation
+        } else if bootstrap_summary.exists() {
             let summary: VolumeBootstrapSummary =
                 serde_json::from_slice(&fs::read(&bootstrap_summary)?)?;
             let mut validation = json!({
@@ -299,8 +319,7 @@ impl Scenario for BasicMultiClientSmoke {
                 let summary: MountedSmokeRunSummary =
                     serde_json::from_slice(&fs::read(&smoke_summary)?)?;
                 validation["workflow"] = json!("mounted-multi-client-smoke");
-                validation["written_file"] = json!(summary.written_file);
-                validation["convergence"] = json!(summary.convergence);
+                validation["volume_validations"] = json!(summary.volume_validations);
             }
             validation
         } else {
@@ -318,6 +337,11 @@ impl Scenario for BasicMultiClientSmoke {
             serde_json::to_vec_pretty(&validation)?,
         )?;
         let mut artifact_paths = Vec::new();
+        if peer_bootstrap_summary.exists() {
+            artifact_paths.push(format!(
+                "artifacts/scenarios/{BASIC_MULTI_CLIENT_SMOKE}/peer-bootstrap-summary.json"
+            ));
+        }
         if bootstrap_summary.exists() {
             artifact_paths.push(format!(
                 "artifacts/scenarios/{BASIC_MULTI_CLIENT_SMOKE}/bootstrap-summary.json"
@@ -617,22 +641,43 @@ fn write_bootstrap_summary(
     Ok(())
 }
 
+fn write_peer_bootstrap_summary(
+    context: &ScenarioContext,
+    summary: &PeerVolumeBootstrapSummary,
+) -> Result<(), ScenarioError> {
+    fs::create_dir_all(&context.scenario_dir)?;
+    fs::write(
+        context.scenario_dir.join("peer-bootstrap-summary.json"),
+        serde_json::to_vec_pretty(summary)?,
+    )?;
+    Ok(())
+}
+
 trait MountedSmokeDriver {
-    fn bootstrap_volume(
+    fn bootstrap_peer_volumes(
         &mut self,
-        options: VolumeBootstrapOptions,
-    ) -> Result<VolumeBootstrapSummary, ClientControllerError>;
+        options: PeerVolumeBootstrapOptions,
+    ) -> Result<PeerVolumeBootstrapSummary, ClientControllerError>;
+    fn select_volume_for_clients(&mut self, volume_name: &str)
+    -> Result<(), ClientControllerError>;
     fn mount_all(&mut self) -> Result<(), ClientControllerError>;
     fn clients(&self) -> Vec<ClientSpec>;
     fn unmount_all(&mut self) -> Result<(), ClientControllerError>;
 }
 
 impl<E: crate::client::ClientProcessExecutor> MountedSmokeDriver for MultiClientController<E> {
-    fn bootstrap_volume(
+    fn bootstrap_peer_volumes(
         &mut self,
-        options: VolumeBootstrapOptions,
-    ) -> Result<VolumeBootstrapSummary, ClientControllerError> {
-        MultiClientController::bootstrap_volume(self, options)
+        options: PeerVolumeBootstrapOptions,
+    ) -> Result<PeerVolumeBootstrapSummary, ClientControllerError> {
+        MultiClientController::bootstrap_peer_volumes(self, options)
+    }
+
+    fn select_volume_for_clients(
+        &mut self,
+        volume_name: &str,
+    ) -> Result<(), ClientControllerError> {
+        MultiClientController::select_volume_for_clients(self, volume_name)
     }
 
     fn mount_all(&mut self) -> Result<(), ClientControllerError> {
@@ -653,7 +698,13 @@ impl<E: crate::client::ClientProcessExecutor> MountedSmokeDriver for MultiClient
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct MountedSmokeRunSummary {
-    bootstrap: VolumeBootstrapSummary,
+    peer_bootstrap: PeerVolumeBootstrapSummary,
+    volume_validations: Vec<MountedSmokeVolumeValidation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct MountedSmokeVolumeValidation {
+    volume_name: String,
     written_file: String,
     convergence: TreeComparison,
     attempts: usize,
@@ -667,15 +718,15 @@ fn run_mounted_smoke_with_driver(
     poll_interval: Duration,
 ) -> Result<MountedSmokeRunSummary, ScenarioError> {
     let result = run_mounted_smoke_body(context, driver, convergence_timeout, poll_interval);
-    let unmount_result = driver.unmount_all();
-    match (result, unmount_result) {
-        (Ok(summary), Ok(())) => Ok(summary),
-        (Err(primary), Err(cleanup)) => Err(ScenarioError::MountedSmokeUnmountAfterFailure {
-            primary: primary.to_string(),
-            cleanup: cleanup.to_string(),
-        }),
-        (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error.into()),
+    match result {
+        Ok(summary) => Ok(summary),
+        Err(primary) => match driver.unmount_all() {
+            Ok(()) => Err(primary),
+            Err(cleanup) => Err(ScenarioError::MountedSmokeUnmountAfterFailure {
+                primary: primary.to_string(),
+                cleanup: cleanup.to_string(),
+            }),
+        },
     }
 }
 
@@ -685,50 +736,72 @@ fn run_mounted_smoke_body(
     convergence_timeout: Duration,
     poll_interval: Duration,
 ) -> Result<MountedSmokeRunSummary, ScenarioError> {
-    let bootstrap = driver.bootstrap_volume(VolumeBootstrapOptions {
+    let peer_bootstrap = driver.bootstrap_peer_volumes(PeerVolumeBootstrapOptions {
         client_names: SMOKE_CLIENT_NAMES
             .iter()
             .map(|name| (*name).to_string())
             .collect(),
         clean_existing_local_metadata: true,
     })?;
-    write_bootstrap_summary(context, &bootstrap)?;
+    write_peer_bootstrap_summary(context, &peer_bootstrap)?;
 
-    driver.mount_all()?;
-    let clients = driver.clients();
-    if clients.len() < SMOKE_CLIENT_NAMES.len() {
-        return Err(ScenarioError::InsufficientMountedClients {
-            expected: SMOKE_CLIENT_NAMES.len(),
-            actual: clients.len(),
-        });
+    let mut volume_validations = Vec::with_capacity(peer_bootstrap.volumes.len());
+    for volume in &peer_bootstrap.volumes {
+        driver.select_volume_for_clients(&volume.volume_name)?;
+        driver.mount_all()?;
+        let clients = driver.clients();
+        if clients.len() < SMOKE_CLIENT_NAMES.len() {
+            return Err(ScenarioError::InsufficientMountedClients {
+                expected: SMOKE_CLIENT_NAMES.len(),
+                actual: clients.len(),
+            });
+        }
+
+        let writer = clients
+            .iter()
+            .find(|client| client.name == volume.init_client)
+            .unwrap_or(&clients[0]);
+        let smoke_file = writer
+            .mount_point
+            .join(format!("{}-{SMOKE_FILE_NAME}", volume.volume_name));
+        fs::write(&smoke_file, SMOKE_FILE_PAYLOAD)?;
+        let mounts = clients
+            .iter()
+            .take(SMOKE_CLIENT_NAMES.len())
+            .map(|client| ClientMount::new(client.name.clone(), client.mount_point.clone()))
+            .collect::<Vec<_>>();
+        let convergence = wait_for_convergence(
+            &mounts,
+            context
+                .scenario_dir
+                .join("validation")
+                .join(&volume.volume_name),
+            convergence_timeout,
+            poll_interval,
+        )?;
+        volume_validations.push(mounted_smoke_volume_validation(
+            volume.volume_name.clone(),
+            smoke_file,
+            convergence,
+        ));
+        driver.unmount_all()?;
     }
 
-    let smoke_file = clients[0].mount_point.join(SMOKE_FILE_NAME);
-    fs::write(&smoke_file, SMOKE_FILE_PAYLOAD)?;
-    let mounts = clients
-        .iter()
-        .take(SMOKE_CLIENT_NAMES.len())
-        .map(|client| ClientMount::new(client.name.clone(), client.mount_point.clone()))
-        .collect::<Vec<_>>();
-    let convergence = wait_for_convergence(
-        &mounts,
-        context.scenario_dir.join("validation"),
-        convergence_timeout,
-        poll_interval,
-    )?;
-
-    let summary = mounted_smoke_summary(bootstrap, smoke_file, convergence);
+    let summary = MountedSmokeRunSummary {
+        peer_bootstrap,
+        volume_validations,
+    };
     write_smoke_summary(context, &summary)?;
     Ok(summary)
 }
 
-fn mounted_smoke_summary(
-    bootstrap: VolumeBootstrapSummary,
+fn mounted_smoke_volume_validation(
+    volume_name: String,
     smoke_file: PathBuf,
     convergence: ConvergenceOutcome,
-) -> MountedSmokeRunSummary {
-    MountedSmokeRunSummary {
-        bootstrap,
+) -> MountedSmokeVolumeValidation {
+    MountedSmokeVolumeValidation {
+        volume_name,
         written_file: smoke_file.display().to_string(),
         convergence: convergence.comparison,
         attempts: convergence.attempts,
@@ -2542,21 +2615,34 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let mut driver = RecordingSmokeDriver::new(clients);
-        let source_mount = temp.path().join("mounts").join(SMOKE_CLIENT_NAMES[0]);
-        let replica_mounts = SMOKE_CLIENT_NAMES
+        let mount_roots = SMOKE_CLIENT_NAMES
             .iter()
             .copied()
-            .skip(1)
             .map(|name| temp.path().join("mounts").join(name))
             .collect::<Vec<_>>();
         thread::spawn(move || {
-            let source = source_mount.join("studiofs-e2e-smoke.txt");
-            for _ in 0..100 {
-                if let Ok(payload) = std::fs::read(&source) {
-                    for replica in &replica_mounts {
-                        std::fs::write(replica.join("studiofs-e2e-smoke.txt"), &payload).unwrap();
+            for _ in 0..200 {
+                for source_mount in &mount_roots {
+                    let entries = std::fs::read_dir(source_mount)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Result::ok)
+                        .filter(|entry| entry.path().is_file())
+                        .collect::<Vec<_>>();
+                    if entries.is_empty() {
+                        continue;
                     }
-                    return;
+                    for entry in entries {
+                        let file_name = entry.file_name();
+                        if let Ok(payload) = std::fs::read(entry.path()) {
+                            if payload.is_empty() {
+                                continue;
+                            }
+                            for replica in &mount_roots {
+                                let _ = std::fs::write(replica.join(&file_name), &payload);
+                            }
+                        }
+                    }
                 }
                 thread::sleep(Duration::from_millis(5));
             }
@@ -2577,28 +2663,33 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(summary.bootstrap.init_client, "client-a");
+        assert_eq!(summary.peer_bootstrap.volumes.len(), 3);
+        assert_eq!(summary.volume_validations.len(), 3);
         assert_eq!(
-            summary.bootstrap.discovered_clients,
-            SMOKE_CLIENT_NAMES[1..]
-                .iter()
-                .map(|name| (*name).to_string())
-                .collect::<Vec<_>>()
-        );
-        assert_eq!(
-            summary.convergence.compared_clients,
+            summary.volume_validations[0].convergence.compared_clients,
             SMOKE_CLIENT_NAMES
                 .iter()
                 .map(|name| (*name).to_string())
                 .collect::<Vec<_>>()
         );
-        assert!(summary.convergence.converged);
+        assert!(
+            summary
+                .volume_validations
+                .iter()
+                .all(|validation| validation.convergence.converged)
+        );
         assert!(driver.mounted.get());
         assert!(driver.unmounted.get());
 
         for client in driver.clients {
-            let payload = std::fs::read(client.mount_point.join("studiofs-e2e-smoke.txt")).unwrap();
-            assert_eq!(payload, b"studiofs e2e mounted multi-client smoke\n");
+            for validation in &summary.volume_validations {
+                let file_name = PathBuf::from(&validation.written_file)
+                    .file_name()
+                    .unwrap()
+                    .to_owned();
+                let payload = std::fs::read(client.mount_point.join(file_name)).unwrap();
+                assert_eq!(payload, b"studiofs e2e mounted multi-client smoke\n");
+            }
         }
         assert!(context.scenario_dir.join("smoke-summary.json").exists());
     }
@@ -2627,10 +2718,10 @@ mod tests {
     }
 
     impl MountedSmokeDriver for RecordingSmokeDriver {
-        fn bootstrap_volume(
+        fn bootstrap_peer_volumes(
             &mut self,
-            options: VolumeBootstrapOptions,
-        ) -> Result<VolumeBootstrapSummary, ClientControllerError> {
+            options: PeerVolumeBootstrapOptions,
+        ) -> Result<PeerVolumeBootstrapSummary, ClientControllerError> {
             assert_eq!(
                 options.client_names,
                 SMOKE_CLIENT_NAMES
@@ -2639,23 +2730,56 @@ mod tests {
                     .map(str::to_string)
                     .collect::<Vec<_>>()
             );
-            Ok(VolumeBootstrapSummary {
-                volume_name: "projectfs".to_string(),
-                init_client: SMOKE_CLIENT_NAMES[0].to_string(),
-                discovered_clients: SMOKE_CLIENT_NAMES[1..]
-                    .iter()
-                    .map(|name| (*name).to_string())
-                    .collect(),
-                clients: self
-                    .clients
-                    .iter()
-                    .map(|client| crate::client::ClientBootstrapRecord {
-                        name: client.name.clone(),
-                        local_metadata_db: client.local_metadata_db.clone(),
-                        state: ClientLifecycleState::Discovered,
-                    })
-                    .collect(),
+            let volumes = self
+                .clients
+                .iter()
+                .map(|owner| {
+                    let volume_name = format!("projectfs-{}", owner.name);
+                    VolumeBootstrapSummary {
+                        volume_name: volume_name.clone(),
+                        init_client: owner.name.clone(),
+                        discovered_clients: self
+                            .clients
+                            .iter()
+                            .filter(|client| client.name != owner.name)
+                            .map(|client| client.name.clone())
+                            .collect(),
+                        clients: self
+                            .clients
+                            .iter()
+                            .map(|client| crate::client::ClientBootstrapRecord {
+                                name: client.name.clone(),
+                                local_metadata_db: client
+                                    .client_root
+                                    .join("meta")
+                                    .join(&volume_name)
+                                    .join(format!("{volume_name}.db")),
+                                state: if client.name == owner.name {
+                                    ClientLifecycleState::Initialized
+                                } else {
+                                    ClientLifecycleState::Discovered
+                                },
+                            })
+                            .collect(),
+                    }
+                })
+                .collect();
+            Ok(PeerVolumeBootstrapSummary {
+                base_volume_name: "projectfs".to_string(),
+                volumes,
             })
+        }
+
+        fn select_volume_for_clients(
+            &mut self,
+            volume_name: &str,
+        ) -> Result<(), ClientControllerError> {
+            for client in &mut self.clients {
+                client.local_metadata_dir = client.client_root.join("meta").join(volume_name);
+                client.local_metadata_db =
+                    client.local_metadata_dir.join(format!("{volume_name}.db"));
+            }
+            Ok(())
         }
 
         fn mount_all(&mut self) -> Result<(), ClientControllerError> {

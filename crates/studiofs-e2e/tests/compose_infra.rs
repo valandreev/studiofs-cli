@@ -42,9 +42,65 @@ fn compose_file_defines_required_services_healthchecks_and_project_ports() {
         "named volumes must be explicit so down --volumes can remove them"
     );
     assert!(
-        compose.contains("rustfs/rustfs:latest"),
-        "RustFS image must use latest for baseline E2E infra"
+        compose.contains("rustfs/rustfs:1.0.0-alpha.94"),
+        "RustFS image must stay pinned for baseline E2E infra"
     );
+    assert!(!compose.contains("rustfs/rustfs:latest"));
+}
+
+#[test]
+fn compose_preflight_reports_baseline_image_contract() {
+    let temp = tempdir().unwrap();
+    let stack = DockerComposeStack::new(ComposeConfig {
+        run_id: "compose-baseline-contract".to_string(),
+        sandbox: temp.path().join("compose-baseline-contract"),
+        compose_file: repo_root().join("docker/compose.e2e.yml"),
+        port_range: Some("31100-31110".to_string()),
+        wait_timeout_secs: 90,
+    })
+    .unwrap();
+
+    let checks = stack.preflight(&RecordingExecutor::default());
+    let baseline = checks
+        .iter()
+        .find(|check| check.name == "compose baseline contract")
+        .expect("baseline contract check");
+
+    assert!(baseline.passed, "{baseline:?}");
+    assert!(baseline.detail.contains("Local First baseline"));
+}
+
+#[test]
+fn compose_preflight_accepts_quoted_baseline_images() {
+    let temp = tempdir().unwrap();
+    let compose_file = temp.path().join("compose.e2e.yml");
+    std::fs::write(
+        &compose_file,
+        r#"
+services:
+  postgres:
+    image: "postgres:18-alpine"
+  rustfs:
+    image: 'rustfs/rustfs:1.0.0-alpha.94'
+"#,
+    )
+    .unwrap();
+    let stack = DockerComposeStack::new(ComposeConfig {
+        run_id: "compose-quoted-images".to_string(),
+        sandbox: temp.path().join("compose-quoted-images"),
+        compose_file,
+        port_range: Some("31200-31210".to_string()),
+        wait_timeout_secs: 90,
+    })
+    .unwrap();
+
+    let checks = stack.preflight(&RecordingExecutor::default());
+    let baseline = checks
+        .iter()
+        .find(|check| check.name == "compose baseline contract")
+        .expect("baseline contract check");
+
+    assert!(baseline.passed, "{baseline:?}");
 }
 
 #[test]

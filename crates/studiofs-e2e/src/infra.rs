@@ -215,6 +215,7 @@ impl DockerComposeStack {
 
     pub fn preflight(&self, executor: &dyn CommandExecutor) -> Vec<InfraCheck> {
         let mut checks = Vec::new();
+        checks.push(self.compose_contract_check());
         checks.push(self.command_check(
             "docker version",
             executor,
@@ -241,6 +242,40 @@ impl DockerComposeStack {
         ));
         checks.extend(self.ports.iter().map(port_check));
         checks
+    }
+
+    fn compose_contract_check(&self) -> InfraCheck {
+        let Ok(compose) = fs::read_to_string(&self.compose_file) else {
+            return InfraCheck {
+                name: "compose baseline contract".to_string(),
+                passed: false,
+                detail: format!("failed to read {}", self.compose_file.display()),
+            };
+        };
+        let images = compose_images(&compose);
+        let mut errors = Vec::new();
+        if !images.iter().any(|image| image == "postgres:18-alpine") {
+            errors.push("PostgreSQL image must stay pinned to postgres:18-alpine");
+        }
+        if !images
+            .iter()
+            .any(|image| image == "rustfs/rustfs:1.0.0-alpha.94")
+        {
+            errors.push("RustFS image must stay pinned to rustfs/rustfs:1.0.0-alpha.94");
+        }
+        if images.iter().any(|image| image == "rustfs/rustfs:latest") {
+            errors.push("RustFS latest is rejected by the Local First baseline gate");
+        }
+
+        InfraCheck {
+            name: "compose baseline contract".to_string(),
+            passed: errors.is_empty(),
+            detail: if errors.is_empty() {
+                "PostgreSQL and RustFS images match the Local First baseline".to_string()
+            } else {
+                errors.join("; ")
+            },
+        }
     }
 
     pub fn up_command(&self) -> CommandSpec {
@@ -454,6 +489,18 @@ impl DockerComposeStack {
             env: self.compose_environment(),
         }
     }
+}
+
+fn compose_images(compose: &str) -> Vec<String> {
+    compose
+        .lines()
+        .filter_map(|line| {
+            let line = line.split_once('#').map_or(line, |(before, _)| before);
+            let (_, image) = line.split_once("image:")?;
+            let image = image.trim().trim_matches(['"', '\'']);
+            (!image.is_empty()).then(|| image.to_string())
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

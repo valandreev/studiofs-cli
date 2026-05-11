@@ -22,7 +22,7 @@ services:
       - postgres-data:/var/lib/postgresql
 
   rustfs:
-    image: rustfs/rustfs:latest
+    image: rustfs/rustfs:1.0.0-alpha.94
     command: ["--address", ":9000", "--console-enable", "/data"]
     environment:
       RUSTFS_ADDRESS: ":9000"
