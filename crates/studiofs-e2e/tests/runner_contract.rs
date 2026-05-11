@@ -304,6 +304,38 @@ fn run_creates_per_run_sandbox_manifest_report_and_validation_artifact() {
             .iter()
             .any(|artifact| artifact["path"] == ".studiofs-e2e-runner.json")
     );
+    assert_eq!(report["environment"]["run_id"], "runner-contract-run");
+    assert!(report["environment"]["studiofs_bin"].is_null());
+    assert!(report["environment"]["compose_project"].is_null());
+    assert_eq!(
+        report["environment"]["client_roots"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+    assert_eq!(
+        report["environment"]["mount_roots"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+    assert!(
+        report["environment"]["compose_images"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|image| image["service"] == "postgres" && image["image"] == "postgres:18-alpine")
+    );
+    assert!(
+        report["environment"]["compose_images"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|image| image["service"] == "rustfs"
+                && image["image"] == "rustfs/rustfs:1.0.0-alpha.94")
+    );
 
     let validation =
         read_json(sandbox.join("artifacts/scenarios/basic-multi-client-smoke/validation.json"));
@@ -538,6 +570,7 @@ fn assert_required_sandbox_files(sandbox: &Path) {
         "preflight.json",
         "ports.json",
         "cleanup.json",
+        "environment.json",
     ] {
         assert!(
             sandbox.join(relative).exists(),

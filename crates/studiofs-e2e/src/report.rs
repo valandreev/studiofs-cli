@@ -39,6 +39,7 @@ pub struct RunReport {
     pub runner: RunnerReport,
     pub host: HostReport,
     pub sandbox: SandboxReport,
+    pub environment: EnvironmentReport,
     pub preflight: PreflightReport,
     pub scenarios: Vec<ScenarioReport>,
     pub artifacts: Vec<ArtifactReport>,
@@ -64,6 +65,26 @@ pub struct HostReport {
 pub struct SandboxReport {
     pub root: String,
     pub retention: RetentionPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnvironmentReport {
+    pub run_id: String,
+    pub scenarios: Vec<String>,
+    pub seed: u64,
+    pub studiofs_bin: Option<String>,
+    pub compose_project: Option<String>,
+    pub compose_images: Vec<ComposeImageReport>,
+    pub allocated_ports: Vec<ServicePort>,
+    pub client_roots: Vec<String>,
+    pub mount_roots: Vec<String>,
+    pub winfsp_version: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ComposeImageReport {
+    pub service: String,
+    pub image: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,6 +174,18 @@ mod tests {
             sandbox: SandboxReport {
                 root: "target/e2e-runs/run-1".to_string(),
                 retention: RetentionPolicy::Always,
+            },
+            environment: EnvironmentReport {
+                run_id: "run-1".to_string(),
+                scenarios: vec!["basic-multi-client-smoke".to_string()],
+                seed: 1,
+                studiofs_bin: None,
+                compose_project: None,
+                compose_images: Vec::new(),
+                allocated_ports: Vec::new(),
+                client_roots: Vec::new(),
+                mount_roots: Vec::new(),
+                winfsp_version: None,
             },
             preflight: PreflightReport {
                 status: RunStatus::Passed,

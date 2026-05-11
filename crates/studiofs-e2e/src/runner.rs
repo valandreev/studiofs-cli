@@ -21,8 +21,9 @@ use crate::infra::{
     SystemCommandExecutor,
 };
 use crate::report::{
-    ArtifactReport, CleanupReport, EventRecord, HostReport, PreflightCheckReport, PreflightReport,
-    RunManifest, RunReport, RunnerReport, SandboxReport, ScenarioReport,
+    ArtifactReport, CleanupReport, ComposeImageReport, EnvironmentReport, EventRecord, HostReport,
+    PreflightCheckReport, PreflightReport, RunManifest, RunReport, RunnerReport, SandboxReport,
+    ScenarioReport,
 };
 use crate::scenario::{self, ScenarioContext};
 
@@ -270,16 +271,26 @@ pub fn run_with_executor(
         };
         write_pretty_json(&sandbox.join("cleanup.json"), &cleanup)?;
         return finish_run(FinishRunInput {
-            run_id,
+            run_id: run_id.clone(),
             seed: request.seed,
             status: RunStatus::PreflightFailed,
             exit_code: 2,
             started_at,
             duration_ms: duration_millis(started_instant),
             selected_platform,
-            sandbox,
+            sandbox: sandbox.clone(),
             retention: request.retention,
             report_copy: request.report,
+            environment: build_environment_report(EnvironmentInput {
+                run_id: &run_id,
+                scenarios: &scenario_names,
+                seed: request.seed,
+                sandbox: &sandbox,
+                studiofs_bin: request.studiofs_bin.as_deref(),
+                compose_stack: compose_stack.as_ref(),
+                compose_project: compose_project.as_deref(),
+                allocated_ports: allocated_ports.clone(),
+            }),
             preflight,
             scenario_reports: Vec::new(),
             scenario_outcomes: Vec::new(),
@@ -362,16 +373,26 @@ pub fn run_with_executor(
         0
     };
     finish_run(FinishRunInput {
-        run_id,
+        run_id: run_id.clone(),
         seed: request.seed,
         status,
         exit_code,
         started_at,
         duration_ms: duration_millis(started_instant),
         selected_platform,
-        sandbox,
+        sandbox: sandbox.clone(),
         retention: request.retention,
         report_copy: request.report,
+        environment: build_environment_report(EnvironmentInput {
+            run_id: &run_id,
+            scenarios: &scenario_names,
+            seed: request.seed,
+            sandbox: &sandbox,
+            studiofs_bin: request.studiofs_bin.as_deref(),
+            compose_stack: compose_stack.as_ref(),
+            compose_project: compose_project.as_deref(),
+            allocated_ports,
+        }),
         preflight,
         scenario_reports,
         scenario_outcomes,
@@ -426,6 +447,7 @@ struct FinishRunInput {
     sandbox: PathBuf,
     retention: RetentionPolicy,
     report_copy: Option<PathBuf>,
+    environment: EnvironmentReport,
     preflight: PreflightReport,
     scenario_reports: Vec<ScenarioReport>,
     scenario_outcomes: Vec<ScenarioOutcome>,
@@ -433,6 +455,7 @@ struct FinishRunInput {
 }
 
 fn finish_run(input: FinishRunInput) -> Result<RunOutcome, RunnerError> {
+    write_pretty_json(&input.sandbox.join("environment.json"), &input.environment)?;
     let report = RunReport {
         schema_version: SCHEMA_VERSION,
         run_id: input.run_id.clone(),
@@ -456,6 +479,7 @@ fn finish_run(input: FinishRunInput) -> Result<RunOutcome, RunnerError> {
             root: input.sandbox.display().to_string(),
             retention: input.retention,
         },
+        environment: input.environment,
         preflight: input.preflight,
         scenarios: input.scenario_reports,
         artifacts: collect_report_artifacts(&input.sandbox, &input.scenario_outcomes)?,
@@ -476,6 +500,74 @@ fn finish_run(input: FinishRunInput) -> Result<RunOutcome, RunnerError> {
         report_path,
         scenarios: input.scenario_outcomes,
     })
+}
+
+struct EnvironmentInput<'a> {
+    run_id: &'a str,
+    scenarios: &'a [String],
+    seed: u64,
+    sandbox: &'a Path,
+    studiofs_bin: Option<&'a Path>,
+    compose_stack: Option<&'a DockerComposeStack>,
+    compose_project: Option<&'a str>,
+    allocated_ports: Vec<crate::infra::ServicePort>,
+}
+
+fn build_environment_report(input: EnvironmentInput<'_>) -> EnvironmentReport {
+    EnvironmentReport {
+        run_id: input.run_id.to_string(),
+        scenarios: input.scenarios.to_vec(),
+        seed: input.seed,
+        studiofs_bin: input.studiofs_bin.map(|path| path.display().to_string()),
+        compose_project: input.compose_project.map(str::to_string),
+        compose_images: input
+            .compose_stack
+            .and_then(|stack| stack.compose_images().ok())
+            .map(|images| {
+                images
+                    .into_iter()
+                    .map(|image| ComposeImageReport {
+                        service: image.service,
+                        image: image.image,
+                    })
+                    .collect()
+            })
+            .unwrap_or_else(default_compose_images),
+        allocated_ports: input.allocated_ports,
+        client_roots: DEFAULT_CLIENT_NAMES
+            .iter()
+            .map(|client| client_root_dir(input.sandbox, client).display().to_string())
+            .collect(),
+        mount_roots: DEFAULT_CLIENT_NAMES
+            .iter()
+            .map(|client| {
+                client_mount_point(input.sandbox, client)
+                    .display()
+                    .to_string()
+            })
+            .collect(),
+        winfsp_version: detect_winfsp_version(),
+    }
+}
+
+fn default_compose_images() -> Vec<ComposeImageReport> {
+    vec![
+        ComposeImageReport {
+            service: crate::infra::POSTGRES_SERVICE_NAME.to_string(),
+            image: "postgres:18-alpine".to_string(),
+        },
+        ComposeImageReport {
+            service: crate::infra::RUSTFS_SERVICE_NAME.to_string(),
+            image: "rustfs/rustfs:1.0.0-alpha.94".to_string(),
+        },
+    ]
+}
+
+fn detect_winfsp_version() -> Option<String> {
+    std::env::var("STUDIOFS_E2E_WINFSP_VERSION")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 struct PreparedPreflight {
@@ -955,6 +1047,11 @@ fn required_artifacts(scenarios: &[ScenarioOutcome]) -> Vec<ArtifactReport> {
         ArtifactReport {
             name: "cleanup.json".to_string(),
             path: "cleanup.json".to_string(),
+            required: true,
+        },
+        ArtifactReport {
+            name: "environment.json".to_string(),
+            path: "environment.json".to_string(),
             required: true,
         },
     ];
@@ -1523,6 +1620,25 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|action| action == "docker compose down --volumes --remove-orphans")
+        );
+        assert_eq!(
+            report["environment"]["compose_project"],
+            "studiofs-e2e-compose-runner-run"
+        );
+        assert_eq!(
+            report["environment"]["allocated_ports"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4
+        );
+        assert!(
+            report["environment"]["compose_images"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|image| image["service"] == "postgres"
+                    && image["image"] == "postgres:18-alpine")
         );
 
         let calls = executor.calls.borrow();
