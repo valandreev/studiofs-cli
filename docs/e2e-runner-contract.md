@@ -244,10 +244,14 @@ scenario convergence window after RustFS/S3 recovers.
 separate `STUDIOFS_CLIENT_ROOT` values. It writes accepted data through
 `client-a`, crosses an explicit local durability boundary with `fsync`, kills
 only the `client-a` mount process without running `studiofs umount`, remounts
-`client-a` with the same client root, verifies the durable data is still
-readable after restart, waits for upload/publication and peer convergence, and
-then validates matching mounted tree checksums from all clients. The scenario
-runs two modes in one invocation:
+`client-a` with the same client root, and probes the writer-visible file after
+restart. If the writer can read recovered bytes, that recovered checksum becomes
+the convergence oracle even when it differs from the pre-crash intended
+checksum. If the writer cannot recover the file from local log/cache, the
+scenario reports unrecoverable loss instead of requiring volatile OS-cache data
+to survive an unclean crash. For recovered writer state, the scenario waits for
+upload/publication and peer convergence, and then validates matching mounted
+tree checksums from all clients. The scenario runs two modes in one invocation:
 
 - `after_local_durability_boundary`, which crashes immediately after the
   documented local durability boundary is crossed.
@@ -256,11 +260,14 @@ runs two modes in one invocation:
 
 The scenario writes `operations.ndjson`,
 `crash-restart-recovery-summary.json`, and `validation.json`. The summary
-records the restarted client, reused client root, per-mode local and final
-checksums, whether a peer saw any pre-convergence checksum in the
-`before_remote_publication_completes` mode, restart timing, convergence timing,
-and mounted tree validator result. Publication waiting is intentionally the
-public mounted-tree convergence loop; the scenario must not inspect private S3,
+records the restarted client, reused client root, per-mode intended, recovered
+local, and final checksums, whether a peer saw any pre-convergence checksum in
+the `before_remote_publication_completes` mode, restart timing, convergence
+timing, recovery outcome, and mounted tree validator result. Diagnostics must
+distinguish unrecoverable local loss, publication failure, peer convergence
+failure, and a corrupt advertised file whose final peer checksum differs from
+the writer's recovered checksum. Publication waiting is intentionally the public
+mounted-tree convergence loop; the scenario must not inspect private S3,
 PostgreSQL, VFS, cache, or redb state to decide success. It must not delete
 local metadata, rerun `discover`, or share one local metadata database between
 clients during recovery.

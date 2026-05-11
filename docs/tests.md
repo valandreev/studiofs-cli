@@ -153,14 +153,16 @@ mounted trees. The RustFS/S3 outage scenario stops only the RustFS compose
 service, keeps accepted writes locally readable, verifies a peer does not see
 the new outage checksum before recovery, and reports upload recovery time plus
 final checksum convergence. The mounted client crash/restart scenario kills and
-remounts one mounted client with the same `STUDIOFS_CLIENT_ROOT`, verifies
-locally durable data remains readable after restart, and validates peer
-convergence for both `after_local_durability_boundary` and
-`before_remote_publication_completes` modes. On Linux, crash-style remount
-attempts lazy stale FUSE mount cleanup before starting the replacement process;
-publication readiness is validated through mounted-tree convergence rather than
-private backend inspection. The mounted namespace collision scenarios use three
-isolated clients and barrier-start conflicting operations covering
+remounts one mounted client with the same `STUDIOFS_CLIENT_ROOT`; when the
+writer can read recovered bytes after restart, that recovered checksum becomes
+the peer-convergence oracle for both `after_local_durability_boundary` and
+`before_remote_publication_completes` modes. Unrecoverable local loss is
+reported separately from publication failure, peer convergence failure, and a
+corrupt advertised file. On Linux, crash-style remount attempts lazy stale FUSE
+mount cleanup before starting the replacement process; publication readiness is
+validated through mounted-tree convergence rather than private backend
+inspection. The mounted namespace collision scenarios use three isolated
+clients and barrier-start conflicting operations covering
 rename/rename, rename/unlink, unlink/append, overwrite/read, mkdir/rmdir/create,
 and readdir/stat while mutations are in flight. The overwrite/read scenario
 records repeated read loops during the overwrite. Each collision run writes `operations.ndjson`,

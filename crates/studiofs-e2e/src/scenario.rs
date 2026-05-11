@@ -138,6 +138,19 @@ pub enum ScenarioError {
         "mounted client crash/restart scenario requires at least {expected} clients, got {actual}"
     )]
     InsufficientCrashRestartClients { expected: usize, actual: usize },
+    #[error("mounted client crash/restart publication failed for {path}: {detail}")]
+    CrashRestartPublicationFailed { path: String, detail: String },
+    #[error("mounted client crash/restart peer convergence failed for {path}: {detail}")]
+    CrashRestartPeerConvergenceFailed { path: String, detail: String },
+    #[error(
+        "mounted client crash/restart corrupt advertised file for {client}:{path}: expected recovered checksum {expected_checksum}, got {actual_checksum}"
+    )]
+    CrashRestartCorruptAdvertisedFile {
+        client: String,
+        path: String,
+        expected_checksum: String,
+        actual_checksum: String,
+    },
     #[error("namespace collision scenario requires at least {expected} clients, got {actual}")]
     InsufficientCollisionClients { expected: usize, actual: usize },
     #[error("namespace collision scenario failed: {primary}; unmount also failed: {cleanup}")]
@@ -1340,12 +1353,39 @@ struct CrashRestartModeSummary {
     restart_client_root: String,
     relative_path: String,
     bytes: usize,
-    local_read_checksum_sha256: String,
+    local_read_checksum_sha256: Option<String>,
     peer_visible_before_convergence: Option<String>,
-    final_checksum_sha256: String,
+    final_checksum_sha256: Option<String>,
     restart_elapsed_ms: u128,
     convergence_elapsed_ms: u128,
+    intended_checksum_sha256: String,
+    recovery_outcome: CrashRestartRecoveryOutcome,
+    recovery_detail: Option<String>,
     final_validator: TreeComparison,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CrashRestartRecoveryOutcome {
+    RecoverableWriterState,
+    UnrecoverableLoss,
+}
+
+enum CrashRestartRecoveredPayload {
+    Recovered(Vec<u8>),
+    UnrecoverableLoss { detail: String },
+}
+
+enum CrashRestartOutcomeDraft {
+    Recovered {
+        local_read_payload: Vec<u8>,
+        local_read_checksum_sha256: String,
+        peer_visible_before_convergence: Option<String>,
+    },
+    UnrecoverableLoss {
+        detail: String,
+        peer_visible_before_convergence: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1446,59 +1486,156 @@ fn run_crash_restart_mode(
     let restart_started = Instant::now();
     driver.force_kill(&crashed.name)?;
     driver.remount(&crashed.name)?;
-    let local_read_payload = fs::read(crashed.mount_point.join(relative_path))?;
-    if local_read_payload != payload {
-        return Err(ScenarioError::Io(std::io::Error::other(format!(
-            "durability failure: data read after restart does not match written payload for {relative_path}"
-        ))));
-    }
-    let local_read_checksum_sha256 = bytes_sha256(&local_read_payload);
+    let recovered_payload = read_crash_restart_recovered_payload(crashed, relative_path)?;
+    let intended_checksum_sha256 = bytes_sha256(payload);
     let restart_elapsed_ms = restart_started.elapsed().as_millis();
 
     let convergence_started = Instant::now();
-    let peer_visible_before_convergence =
-        if mode == CrashRestartMode::BeforeRemotePublicationCompletes {
-            read_peer_checksum(&clients[1], relative_path)?
-                .filter(|checksum| checksum == &local_read_checksum_sha256)
-        } else {
-            None
-        };
     let mounts = clients
         .iter()
         .map(|client| ClientMount::new(client.name.clone(), client.mount_point.clone()))
         .collect::<Vec<_>>();
-    let convergence = wait_for_convergence(
-        &mounts,
-        context
-            .scenario_dir
-            .join(format!("validation-{}", crash_restart_mode_slug(mode))),
-        convergence_timeout,
-        poll_interval,
-    )?;
-    let convergence_elapsed_ms = convergence_started.elapsed().as_millis();
-    let final_payload = fs::read(clients[1].mount_point.join(relative_path))?;
-    if final_payload != payload {
-        return Err(ScenarioError::Io(std::io::Error::other(format!(
-            "convergence failure: peer data does not match written payload for {relative_path}"
-        ))));
-    }
-    let final_checksum_sha256 = bytes_sha256(&final_payload);
+    let validation_dir = context
+        .scenario_dir
+        .join(format!("validation-{}", crash_restart_mode_slug(mode)));
 
-    let summary = CrashRestartModeSummary {
-        mode,
-        restarted_client: crashed.name.clone(),
-        restart_client_root: crashed.client_root.display().to_string(),
-        relative_path: relative_path.to_string(),
-        bytes: payload.len(),
-        local_read_checksum_sha256,
-        peer_visible_before_convergence,
-        final_checksum_sha256,
-        restart_elapsed_ms,
-        convergence_elapsed_ms,
-        final_validator: convergence.comparison,
+    let outcome = match recovered_payload {
+        CrashRestartRecoveredPayload::Recovered(local_read_payload) => {
+            let local_read_checksum_sha256 = bytes_sha256(&local_read_payload);
+            let peer_visible_before_convergence =
+                if mode == CrashRestartMode::BeforeRemotePublicationCompletes {
+                    read_peer_checksum(&clients[1], relative_path)?
+                        .filter(|checksum| checksum == &local_read_checksum_sha256)
+                } else {
+                    None
+                };
+
+            CrashRestartOutcomeDraft::Recovered {
+                local_read_payload,
+                local_read_checksum_sha256,
+                peer_visible_before_convergence,
+            }
+        }
+        CrashRestartRecoveredPayload::UnrecoverableLoss { detail } => {
+            let peer_visible_before_convergence =
+                if mode == CrashRestartMode::BeforeRemotePublicationCompletes {
+                    read_peer_checksum(&clients[1], relative_path)?
+                } else {
+                    None
+                };
+            CrashRestartOutcomeDraft::UnrecoverableLoss {
+                detail,
+                peer_visible_before_convergence,
+            }
+        }
+    };
+
+    let convergence =
+        wait_for_convergence(&mounts, validation_dir, convergence_timeout, poll_interval)
+            .map_err(|error| crash_restart_convergence_error(relative_path, error))?;
+    let convergence_elapsed_ms = convergence_started.elapsed().as_millis();
+
+    let summary = match outcome {
+        CrashRestartOutcomeDraft::Recovered {
+            local_read_payload,
+            local_read_checksum_sha256,
+            peer_visible_before_convergence,
+        } => {
+            let final_payload = fs::read(clients[1].mount_point.join(relative_path))?;
+            let final_checksum_sha256 = bytes_sha256(&final_payload);
+            if final_checksum_sha256 != local_read_checksum_sha256 {
+                return Err(ScenarioError::CrashRestartCorruptAdvertisedFile {
+                    client: clients[1].name.clone(),
+                    path: relative_path.to_string(),
+                    expected_checksum: local_read_checksum_sha256,
+                    actual_checksum: final_checksum_sha256,
+                });
+            }
+
+            CrashRestartModeSummary {
+                mode,
+                restarted_client: crashed.name.clone(),
+                restart_client_root: crashed.client_root.display().to_string(),
+                relative_path: relative_path.to_string(),
+                bytes: local_read_payload.len(),
+                local_read_checksum_sha256: Some(local_read_checksum_sha256),
+                peer_visible_before_convergence,
+                final_checksum_sha256: Some(final_checksum_sha256),
+                restart_elapsed_ms,
+                convergence_elapsed_ms,
+                intended_checksum_sha256,
+                recovery_outcome: CrashRestartRecoveryOutcome::RecoverableWriterState,
+                recovery_detail: None,
+                final_validator: convergence.comparison,
+            }
+        }
+        CrashRestartOutcomeDraft::UnrecoverableLoss {
+            detail,
+            peer_visible_before_convergence,
+        } => {
+            if let Some(final_checksum_sha256) = read_peer_checksum(&clients[1], relative_path)? {
+                return Err(ScenarioError::CrashRestartCorruptAdvertisedFile {
+                    client: clients[1].name.clone(),
+                    path: relative_path.to_string(),
+                    expected_checksum: "unrecoverable_loss".to_string(),
+                    actual_checksum: final_checksum_sha256,
+                });
+            }
+
+            CrashRestartModeSummary {
+                mode,
+                restarted_client: crashed.name.clone(),
+                restart_client_root: crashed.client_root.display().to_string(),
+                relative_path: relative_path.to_string(),
+                bytes: 0,
+                local_read_checksum_sha256: None,
+                peer_visible_before_convergence,
+                final_checksum_sha256: None,
+                restart_elapsed_ms,
+                convergence_elapsed_ms,
+                intended_checksum_sha256,
+                recovery_outcome: CrashRestartRecoveryOutcome::UnrecoverableLoss,
+                recovery_detail: Some(detail),
+                final_validator: convergence.comparison,
+            }
+        }
     };
     write_crash_restart_operation(context, &summary)?;
     Ok(summary)
+}
+
+fn read_crash_restart_recovered_payload(
+    client: &ClientSpec,
+    relative_path: &str,
+) -> Result<CrashRestartRecoveredPayload, ScenarioError> {
+    let path = client.mount_point.join(relative_path);
+    match fs::read(&path) {
+        Ok(payload) => Ok(CrashRestartRecoveredPayload::Recovered(payload)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(CrashRestartRecoveredPayload::UnrecoverableLoss {
+                detail: format!(
+                    "{} could not read recovered bytes for {relative_path} after restart",
+                    client.name
+                ),
+            })
+        }
+        Err(error) => Err(ScenarioError::Io(error)),
+    }
+}
+
+fn crash_restart_convergence_error(relative_path: &str, error: MountedTreeError) -> ScenarioError {
+    match error {
+        MountedTreeError::ConvergenceTimedOut { .. } => {
+            ScenarioError::CrashRestartPeerConvergenceFailed {
+                path: relative_path.to_string(),
+                detail: error.to_string(),
+            }
+        }
+        error => ScenarioError::CrashRestartPublicationFailed {
+            path: relative_path.to_string(),
+            detail: error.to_string(),
+        },
+    }
 }
 
 fn write_crash_restart_operation(
@@ -1512,6 +1649,9 @@ fn write_crash_restart_operation(
         "path": summary.relative_path,
         "bytes": summary.bytes,
         "accepted": true,
+        "recovery_outcome": summary.recovery_outcome,
+        "recovery_detail": summary.recovery_detail,
+        "intended_checksum_sha256": summary.intended_checksum_sha256,
         "local_read_checksum_sha256": summary.local_read_checksum_sha256,
         "peer_visible_before_convergence": summary.peer_visible_before_convergence,
         "final_checksum_sha256": summary.final_checksum_sha256,
@@ -2783,6 +2923,7 @@ mod tests {
         actions: RefCell<Vec<String>>,
         corrupt_local_on_remount: bool,
         corrupt_converged_payload_after_remount: bool,
+        remove_local_on_remount: bool,
         publish_current_file_on_remount: bool,
     }
 
@@ -2793,6 +2934,7 @@ mod tests {
                 actions: RefCell::new(Vec::new()),
                 corrupt_local_on_remount: false,
                 corrupt_converged_payload_after_remount: false,
+                remove_local_on_remount: false,
                 publish_current_file_on_remount: false,
             }
         }
@@ -2804,6 +2946,11 @@ mod tests {
 
         fn corrupt_converged_payload_after_remount(mut self) -> Self {
             self.corrupt_converged_payload_after_remount = true;
+            self
+        }
+
+        fn remove_local_on_remount(mut self) -> Self {
+            self.remove_local_on_remount = true;
             self
         }
 
@@ -2876,6 +3023,22 @@ mod tests {
                         .join(CRASH_RESTART_LOCAL_DURABLE_FILE_NAME),
                     b"corrupted payload after restart\n",
                 )?;
+            }
+            if self.remove_local_on_remount {
+                let client = self
+                    .clients
+                    .iter()
+                    .find(|candidate| candidate.name == client)
+                    .expect("recording driver client exists");
+                for relative_path in [
+                    CRASH_RESTART_LOCAL_DURABLE_FILE_NAME,
+                    CRASH_RESTART_BEFORE_PUBLICATION_FILE_NAME,
+                ] {
+                    let path = client.mount_point.join(relative_path);
+                    if let Err(error) = std::fs::remove_file(&path) {
+                        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+                    }
+                }
             }
             if self.corrupt_converged_payload_after_remount {
                 let clients = self.clients.clone();
@@ -3487,7 +3650,7 @@ mod tests {
         assert!(summary.modes[0].peer_visible_before_convergence.is_none());
         assert_eq!(
             summary.modes[1].peer_visible_before_convergence.as_deref(),
-            Some(summary.modes[1].local_read_checksum_sha256.as_str())
+            summary.modes[1].local_read_checksum_sha256.as_deref()
         );
         assert!(
             summary
@@ -3498,7 +3661,55 @@ mod tests {
     }
 
     #[test]
-    fn crash_restart_fails_when_restart_read_differs_from_written_payload() {
+    fn crash_restart_recovery_uses_recovered_writer_checksum_as_oracle() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-recovered-writer");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(MOUNTED_CLIENT_CRASH_RESTART_RECOVERY);
+        let clients = CRASH_RESTART_CLIENT_NAMES
+            .iter()
+            .copied()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(&mount).unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let mut driver = RecordingCrashRestartDriver::new(clients)
+            .corrupt_local_on_remount()
+            .publish_current_file_on_remount();
+        let context = ScenarioContext {
+            run_id: "run-recovered-writer".to_string(),
+            seed: 404,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+
+        let summary = run_crash_restart_with_driver(
+            &context,
+            &mut driver,
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+
+        let recovered_checksum = bytes_sha256(b"corrupted payload after restart\n");
+        assert_eq!(
+            summary.modes[0].local_read_checksum_sha256,
+            Some(recovered_checksum.clone())
+        );
+        assert_eq!(
+            summary.modes[0].final_checksum_sha256,
+            Some(recovered_checksum)
+        );
+        assert!(summary.modes[0].final_validator.converged);
+    }
+
+    #[test]
+    fn crash_restart_reports_peer_convergence_failure_when_recovered_state_is_not_published() {
         let temp = tempdir().unwrap();
         let sandbox = temp.path().join("run-1");
         let scenario_dir = sandbox
@@ -3531,11 +3742,57 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(err.to_string().contains("does not match written payload"));
+        assert!(matches!(
+            err,
+            ScenarioError::CrashRestartPeerConvergenceFailed { .. }
+        ));
     }
 
     #[test]
-    fn crash_restart_fails_when_final_peer_payload_differs_from_written_payload() {
+    fn crash_restart_reports_unrecoverable_loss_when_writer_cannot_read_after_restart() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-unrecoverable");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(MOUNTED_CLIENT_CRASH_RESTART_RECOVERY);
+        let clients = CRASH_RESTART_CLIENT_NAMES
+            .iter()
+            .copied()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(&mount).unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let mut driver = RecordingCrashRestartDriver::new(clients).remove_local_on_remount();
+        let context = ScenarioContext {
+            run_id: "run-unrecoverable".to_string(),
+            seed: 404,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+
+        let summary = run_crash_restart_with_driver(
+            &context,
+            &mut driver,
+            Duration::from_millis(100),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+
+        assert!(summary.modes.iter().all(|mode| {
+            mode.recovery_outcome == CrashRestartRecoveryOutcome::UnrecoverableLoss
+                && mode.local_read_checksum_sha256.is_none()
+                && mode.final_checksum_sha256.is_none()
+                && mode.final_validator.converged
+        }));
+    }
+
+    #[test]
+    fn crash_restart_reports_corrupt_advertised_file_when_final_peer_differs_from_recovered_writer()
+    {
         let temp = tempdir().unwrap();
         let sandbox = temp.path().join("run-1");
         let scenario_dir = sandbox
@@ -3569,10 +3826,10 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(
-            err.to_string()
-                .contains("peer data does not match written payload")
-        );
+        assert!(matches!(
+            err,
+            ScenarioError::CrashRestartCorruptAdvertisedFile { .. }
+        ));
     }
 
     #[test]
