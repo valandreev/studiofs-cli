@@ -234,6 +234,22 @@ impl<'a> NamespaceCreateTxn<'a> {
     }
 
     pub(super) fn insert_dentry(&self, dentry_key: &[u8], entry: &DirEntryValue) -> MetaResult<()> {
+        let (parent, name) = decode_dentry_key(dentry_key)?;
+        RedbMetaEngine::remove_existing_dentry_index_in_txn(
+            self.txn,
+            DENTRIES_TABLE,
+            DENTRIES_BY_INODE_TABLE,
+            parent,
+            name,
+        )?;
+        RedbMetaEngine::insert_dentry_index_in_txn(
+            self.txn,
+            DENTRIES_BY_INODE_TABLE,
+            parent,
+            name,
+            entry,
+        )?;
+
         let mut dentries = self
             .txn
             .open_table(DENTRIES_TABLE)

@@ -616,6 +616,26 @@ fn force_kill_all_attempts_every_client_and_clears_state_after_kill_error() {
 }
 
 #[test]
+fn force_kill_all_waits_for_mount_processes_to_exit_after_termination() {
+    let temp = tempdir().unwrap();
+    let executor = RecordingExecutor::new();
+    let wait_calls = Rc::clone(&executor.process_wait_calls);
+    let mut controller = MultiClientController::new(test_config(temp.path()), executor);
+    controller.create_clients(["client-a", "client-b"]).unwrap();
+    controller.init_first_client().unwrap();
+    controller.discover_additional_clients().unwrap();
+    controller.mount_all().unwrap();
+    wait_calls.set(0);
+
+    controller.force_kill_all().unwrap();
+
+    assert!(
+        wait_calls.get() >= 2,
+        "force-kill cleanup must wait for every terminated mount process to exit"
+    );
+}
+
+#[test]
 fn mount_reports_process_exit_while_waiting_for_readiness() {
     let temp = tempdir().unwrap();
     let executor = RecordingExecutor {

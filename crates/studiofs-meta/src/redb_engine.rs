@@ -65,7 +65,9 @@ impl RedbMetaEngine {
             let _ = txn.open_table(INODE_LIFECYCLE_TABLE);
             let _ = txn.open_table(INODE_TOMBSTONES_TABLE);
             let _ = txn.open_table(DENTRIES_TABLE);
+            let _ = txn.open_table(DENTRIES_BY_INODE_TABLE);
             let _ = txn.open_table(BASE_DENTRIES_TABLE);
+            let _ = txn.open_table(BASE_DENTRIES_BY_INODE_TABLE);
             let _ = txn.open_table(DENTRY_TOMBSTONES_TABLE);
             let _ = txn.open_table(REGULAR_FILE_OVERLAY_TABLE);
             let _ = txn.open_table(REGULAR_FILE_BASE_TABLE);
@@ -91,6 +93,7 @@ impl RedbMetaEngine {
 
         debug!("opened metadata database at {:?}", path.as_ref());
         let engine = Self { db: Arc::new(db) };
+        engine.ensure_dentry_by_inode_indexes()?;
         let _ = engine.recover_undo_logs()?;
 
         match engine.get_format_info() {

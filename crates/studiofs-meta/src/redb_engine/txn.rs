@@ -62,6 +62,45 @@ impl RedbMetaEngine {
         attr.committed_size > 0 || attr.committed_content_epoch > 0
     }
 
+    pub(super) fn ensure_dentry_by_inode_indexes(&self) -> MetaResult<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        let current_version = {
+            let settings = txn
+                .open_table(SETTINGS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            settings
+                .get(DENTRY_BY_INODE_INDEX_VERSION_SETTING)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .map(|value| value.value().to_vec())
+        };
+
+        if current_version.as_deref() != Some(CURRENT_DENTRY_BY_INODE_INDEX_VERSION) {
+            Self::rebuild_dentry_index_in_txn(&txn, DENTRIES_TABLE, DENTRIES_BY_INODE_TABLE)?;
+            Self::rebuild_dentry_index_in_txn(
+                &txn,
+                BASE_DENTRIES_TABLE,
+                BASE_DENTRIES_BY_INODE_TABLE,
+            )?;
+            let mut settings = txn
+                .open_table(SETTINGS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            settings
+                .insert(
+                    DENTRY_BY_INODE_INDEX_VERSION_SETTING,
+                    CURRENT_DENTRY_BY_INODE_INDEX_VERSION,
+                )
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        }
+
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
     fn inode_has_local_lifecycle_from_opened_table<T>(table: &T, ino: Ino) -> MetaResult<bool>
     where
         T: ReadableTable<u64, &'static [u8]>,
@@ -824,6 +863,31 @@ impl RedbMetaEngine {
         Ok(keys)
     }
 
+    pub(super) fn dentry_keys_for_inode_in_write_index(
+        txn: &redb::WriteTransaction,
+        table_def: TableDefinition<&[u8], u8>,
+        ino: Ino,
+    ) -> MetaResult<Vec<Vec<u8>>> {
+        let prefix = dentry_by_inode_prefix(ino);
+        let table = txn
+            .open_table(table_def)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let range = table
+            .range(prefix.as_ref()..)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let mut keys = Vec::new();
+        for item in range {
+            let (k, _v) = item.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let key_bytes = k.value();
+            if !key_bytes.starts_with(&prefix) {
+                break;
+            }
+            let (_ino, parent, name) = decode_dentry_by_inode_key(key_bytes)?;
+            keys.push(encode_dentry_key(parent, name));
+        }
+        Ok(keys)
+    }
+
     pub(super) fn merged_symlink_target(
         &self,
         txn: &redb::ReadTransaction,
@@ -932,6 +996,15 @@ impl RedbMetaEngine {
         entry: &DirEntryValue,
     ) -> MetaResult<()> {
         let key = encode_dentry_key(parent, name);
+        Self::remove_existing_dentry_index_in_txn(
+            txn,
+            DENTRIES_TABLE,
+            DENTRIES_BY_INODE_TABLE,
+            parent,
+            name,
+        )?;
+        Self::insert_dentry_index_in_txn(txn, DENTRIES_BY_INODE_TABLE, parent, name, entry)?;
+
         let mut tombstones = txn
             .open_table(DENTRY_TOMBSTONES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -954,6 +1027,14 @@ impl RedbMetaEngine {
         name: &[u8],
     ) -> MetaResult<()> {
         let key = encode_dentry_key(parent, name);
+        Self::remove_existing_dentry_index_in_txn(
+            txn,
+            DENTRIES_TABLE,
+            DENTRIES_BY_INODE_TABLE,
+            parent,
+            name,
+        )?;
+
         let mut dentries = txn
             .open_table(DENTRIES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -1024,6 +1105,15 @@ impl RedbMetaEngine {
         entry: &DirEntryValue,
     ) -> MetaResult<()> {
         let key = encode_dentry_key(parent, name);
+        Self::remove_existing_dentry_index_in_txn(
+            txn,
+            DENTRIES_TABLE,
+            DENTRIES_BY_INODE_TABLE,
+            parent,
+            name,
+        )?;
+        Self::insert_dentry_index_in_txn(txn, DENTRIES_BY_INODE_TABLE, parent, name, entry)?;
+
         let mut tombstones = txn
             .open_table(DENTRY_TOMBSTONES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -1046,6 +1136,14 @@ impl RedbMetaEngine {
         name: &[u8],
     ) -> MetaResult<()> {
         let key = encode_dentry_key(parent, name);
+        Self::remove_existing_dentry_index_in_txn(
+            txn,
+            DENTRIES_TABLE,
+            DENTRIES_BY_INODE_TABLE,
+            parent,
+            name,
+        )?;
+
         let mut dentries = txn
             .open_table(DENTRIES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -1056,6 +1154,115 @@ impl RedbMetaEngine {
             .open_table(DENTRY_TOMBSTONES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         let _ = tombstones.remove(key.as_slice());
+        Ok(())
+    }
+
+    pub(super) fn set_base_dentry_in_txn(
+        txn: &redb::WriteTransaction,
+        parent: Ino,
+        name: &[u8],
+        entry: &DirEntryValue,
+    ) -> MetaResult<()> {
+        let key = encode_dentry_key(parent, name);
+        Self::remove_existing_dentry_index_in_txn(
+            txn,
+            BASE_DENTRIES_TABLE,
+            BASE_DENTRIES_BY_INODE_TABLE,
+            parent,
+            name,
+        )?;
+        Self::insert_dentry_index_in_txn(txn, BASE_DENTRIES_BY_INODE_TABLE, parent, name, entry)?;
+
+        let data = encode(entry)?;
+        let mut dentries = txn
+            .open_table(BASE_DENTRIES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        dentries
+            .insert(key.as_slice(), data.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    pub(super) fn remove_base_dentry_in_txn(
+        txn: &redb::WriteTransaction,
+        parent: Ino,
+        name: &[u8],
+    ) -> MetaResult<()> {
+        let key = encode_dentry_key(parent, name);
+        Self::remove_existing_dentry_index_in_txn(
+            txn,
+            BASE_DENTRIES_TABLE,
+            BASE_DENTRIES_BY_INODE_TABLE,
+            parent,
+            name,
+        )?;
+        let mut dentries = txn
+            .open_table(BASE_DENTRIES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let _ = dentries.remove(key.as_slice());
+        Ok(())
+    }
+
+    pub(super) fn rebuild_dentry_index_in_txn(
+        txn: &redb::WriteTransaction,
+        dentry_table_def: TableDefinition<&[u8], &[u8]>,
+        index_table_def: TableDefinition<&[u8], u8>,
+    ) -> MetaResult<()> {
+        Self::clear_table_in_txn(txn, index_table_def)?;
+        let dentries = txn
+            .open_table(dentry_table_def)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let mut index = txn
+            .open_table(index_table_def)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        for row in dentries
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (key, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let (parent, name) = decode_dentry_key(key.value())?;
+            let entry: DirEntryValue = decode(value.value())?;
+            let index_key = encode_dentry_by_inode_key(entry.ino, parent, name);
+            index
+                .insert(index_key.as_slice(), 1)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn insert_dentry_index_in_txn(
+        txn: &redb::WriteTransaction,
+        index_table_def: TableDefinition<&[u8], u8>,
+        parent: Ino,
+        name: &[u8],
+        entry: &DirEntryValue,
+    ) -> MetaResult<()> {
+        let index_key = encode_dentry_by_inode_key(entry.ino, parent, name);
+        let mut index = txn
+            .open_table(index_table_def)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        index
+            .insert(index_key.as_slice(), 1)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    pub(super) fn remove_existing_dentry_index_in_txn(
+        txn: &redb::WriteTransaction,
+        dentry_table_def: TableDefinition<&[u8], &[u8]>,
+        index_table_def: TableDefinition<&[u8], u8>,
+        parent: Ino,
+        name: &[u8],
+    ) -> MetaResult<()> {
+        let Some(entry) = Self::lookup_in_write_table(txn, dentry_table_def, parent, name)? else {
+            return Ok(());
+        };
+        let index_key = encode_dentry_by_inode_key(entry.ino, parent, name);
+        let mut index = txn
+            .open_table(index_table_def)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let _ = index.remove(index_key.as_slice());
         Ok(())
     }
 
