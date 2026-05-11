@@ -4,7 +4,7 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -64,6 +64,7 @@ const CRASH_RESTART_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(60);
 const CRASH_RESTART_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const COLLISION_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(60);
 const COLLISION_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const COLLISION_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const COLLISION_OLD_COMMITTED_PAYLOAD: &[u8] = b"old committed payload\n";
 const COLLISION_NEW_COMMITTED_PAYLOAD: &[u8] = b"new committed payload\n";
 const OVERWRITE_READ_ATTEMPTS: u32 = 8;
@@ -156,6 +157,11 @@ pub enum ScenarioError {
     InsufficientCollisionClients { expected: usize, actual: usize },
     #[error("namespace collision scenario failed: {primary}; unmount also failed: {cleanup}")]
     NamespaceCollisionUnmountAfterFailure { primary: String, cleanup: String },
+    #[error("namespace collision operations timed out after {timeout_ms} ms; pending: {pending:?}")]
+    NamespaceCollisionOperationTimeout {
+        timeout_ms: u128,
+        pending: Vec<String>,
+    },
     #[error("namespace collision validation failed: {violations:?}")]
     NamespaceInvariantViolations {
         violations: Vec<NamespaceInvariantViolation>,
@@ -1971,6 +1977,7 @@ trait NamespaceCollisionDriver {
     ) -> Result<(), ScenarioError> {
         Ok(())
     }
+    fn force_kill_all(&mut self) -> Result<(), ScenarioError>;
     fn unmount_all(&mut self) -> Result<(), ScenarioError>;
 }
 
@@ -1994,6 +2001,10 @@ impl NamespaceCollisionDriver for RealNamespaceCollisionDriver {
 
     fn unmount_all(&mut self) -> Result<(), ScenarioError> {
         Ok(self.0.unmount_all()?)
+    }
+
+    fn force_kill_all(&mut self) -> Result<(), ScenarioError> {
+        Ok(self.0.force_kill_all()?)
     }
 }
 
@@ -2108,7 +2119,19 @@ fn run_namespace_collision_body(
         convergence_timeout,
         poll_interval,
     )?;
-    let operations = perform_namespace_collision_operations(context, kind, &clients)?;
+    let operations = match perform_namespace_collision_operations(context, kind, &clients) {
+        Ok(operations) => operations,
+        Err(error @ ScenarioError::NamespaceCollisionOperationTimeout { .. }) => {
+            if let Err(cleanup) = driver.force_kill_all() {
+                return Err(ScenarioError::NamespaceCollisionUnmountAfterFailure {
+                    primary: error.to_string(),
+                    cleanup: cleanup.to_string(),
+                });
+            }
+            return Err(error);
+        }
+        Err(error) => return Err(error),
+    };
     driver.after_conflicting_operations(kind, &clients)?;
     let summary = finish_namespace_collision(
         context,
@@ -2203,6 +2226,7 @@ fn perform_namespace_collision_operations(
                     },
                 ),
             ],
+            COLLISION_OPERATION_TIMEOUT,
         ),
         NamespaceCollisionKind::RenameVsUnlink => run_concurrent_namespace_operations(
             started,
@@ -2227,6 +2251,7 @@ fn perform_namespace_collision_operations(
                     |client| fs::remove_file(client.mount_point.join("shared/file.txt")),
                 ),
             ],
+            COLLISION_OPERATION_TIMEOUT,
         ),
         NamespaceCollisionKind::UnlinkVsAppend => run_concurrent_namespace_operations(
             started,
@@ -2252,6 +2277,7 @@ fn perform_namespace_collision_operations(
                     },
                 ),
             ],
+            COLLISION_OPERATION_TIMEOUT,
         ),
         NamespaceCollisionKind::OverwriteVsRead => run_concurrent_namespace_operations(
             started,
@@ -2283,6 +2309,7 @@ fn perform_namespace_collision_operations(
                     |client| repeated_committed_read(client, "shared/data.txt"),
                 ),
             ],
+            COLLISION_OPERATION_TIMEOUT,
         ),
         NamespaceCollisionKind::MkdirRmdirVsCreate => run_concurrent_namespace_operations(
             started,
@@ -2305,6 +2332,7 @@ fn perform_namespace_collision_operations(
                     fs::remove_dir(client.mount_point.join("race"))
                 }),
             ],
+            COLLISION_OPERATION_TIMEOUT,
         ),
         NamespaceCollisionKind::ReaddirStatDuringMutation => run_concurrent_namespace_operations(
             started,
@@ -2332,8 +2360,9 @@ fn perform_namespace_collision_operations(
                     |client| fs::metadata(client.mount_point.join("scan/b.txt")).map(|_| ()),
                 ),
             ],
+            COLLISION_OPERATION_TIMEOUT,
         ),
-    };
+    }?;
     write_namespace_collision_operations(context, &operations)?;
     Ok(operations)
 }
@@ -2341,34 +2370,81 @@ fn perform_namespace_collision_operations(
 fn run_concurrent_namespace_operations(
     started: Instant,
     tasks: Vec<NamespaceCollisionTask>,
-) -> Vec<NamespaceCollisionOperation> {
+    timeout: Duration,
+) -> Result<Vec<NamespaceCollisionOperation>, ScenarioError> {
+    if tasks.is_empty() {
+        return Ok(Vec::new());
+    }
     let barrier = Arc::new(Barrier::new(tasks.len()));
+    let (tx, rx) = mpsc::channel();
+    let mut pending = tasks
+        .iter()
+        .map(|task| (task.order, namespace_collision_task_label(task)))
+        .collect::<Vec<_>>();
+    let expected_operations = pending.len();
     let mut handles = Vec::with_capacity(tasks.len());
     for task in tasks {
         let barrier = Arc::clone(&barrier);
+        let tx = tx.clone();
         handles.push(thread::spawn(move || {
             barrier.wait();
-            record_fs_operation(
+            let operation = record_fs_operation(
                 started,
                 task.order,
                 &task.client,
                 task.operation,
                 task.path,
                 || (task.action)(&task.client),
-            )
+            );
+            let _ = tx.send(operation);
         }));
     }
+    drop(tx);
 
-    let mut operations = handles
-        .into_iter()
-        .map(|handle| {
-            handle
-                .join()
-                .expect("namespace collision worker thread should not panic")
-        })
-        .collect::<Vec<_>>();
+    let deadline = Instant::now() + timeout;
+    let mut operations = Vec::with_capacity(expected_operations);
+    while operations.len() < expected_operations {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(namespace_collision_operation_timeout(timeout, pending));
+        }
+        match rx.recv_timeout(deadline.saturating_duration_since(now)) {
+            Ok(operation) => {
+                pending.retain(|(order, _)| *order != operation.order);
+                operations.push(operation);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                return Err(namespace_collision_operation_timeout(timeout, pending));
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(ScenarioError::Io(std::io::Error::other(
+                    "namespace collision worker channel closed before all operations completed",
+                )));
+            }
+        }
+    }
+
+    for handle in handles {
+        handle
+            .join()
+            .expect("namespace collision worker thread should not panic");
+    }
     operations.sort_by_key(|operation| operation.order);
-    operations
+    Ok(operations)
+}
+
+fn namespace_collision_operation_timeout(
+    timeout: Duration,
+    pending: Vec<(usize, String)>,
+) -> ScenarioError {
+    ScenarioError::NamespaceCollisionOperationTimeout {
+        timeout_ms: timeout.as_millis(),
+        pending: pending.into_iter().map(|(_, label)| label).collect(),
+    }
+}
+
+fn namespace_collision_task_label(task: &NamespaceCollisionTask) -> String {
+    format!("{} {} {}", task.client.name, task.operation, task.path)
 }
 
 fn repeated_committed_read(client: &ClientSpec, relative_path: &str) -> io::Result<()> {
@@ -3444,6 +3520,11 @@ mod tests {
             }
             Ok(())
         }
+
+        fn force_kill_all(&mut self) -> Result<(), ScenarioError> {
+            self.actions.borrow_mut().push("force_kill_all");
+            Ok(())
+        }
     }
 
     fn replace_dir_contents(source: &Path, destination: &Path) -> Result<(), ScenarioError> {
@@ -3645,6 +3726,45 @@ mod tests {
         );
 
         accepts_u64(operations[0].timestamp_ms);
+    }
+
+    #[test]
+    fn namespace_collision_operation_timeout_reports_pending_without_waiting_forever() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-collision-timeout");
+        let mount = temp.path().join("mounts").join("client-a");
+        std::fs::create_dir_all(&mount).unwrap();
+        let client = client_spec_for(&sandbox, "projectfs", "client-a", mount);
+        let started = Instant::now();
+
+        let err = run_concurrent_namespace_operations(
+            started,
+            vec![NamespaceCollisionTask::new(
+                1,
+                client,
+                "rename",
+                "shared/file.txt -> shared/renamed-a.txt",
+                |_client| {
+                    thread::sleep(Duration::from_millis(200));
+                    Ok(())
+                },
+            )],
+            Duration::from_millis(20),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ScenarioError::NamespaceCollisionOperationTimeout { .. }
+        ));
+        assert!(
+            err.to_string()
+                .contains("client-a rename shared/file.txt -> shared/renamed-a.txt")
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(150),
+            "timeout must not wait for the hung namespace worker to finish"
+        );
     }
 
     #[test]
