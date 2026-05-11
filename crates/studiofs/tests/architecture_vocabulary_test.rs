@@ -507,6 +507,7 @@ fn e2e_runner_contract_covers_required_sfs341_surfaces() {
         "/dev/fuse",
         "WinFSP",
         "macFUSE",
+        "floating RustFS tag",
         "port allocation",
         "stale mounts",
         "## Cleanup Safety",
@@ -527,6 +528,42 @@ fn e2e_runner_contract_covers_required_sfs341_surfaces() {
     assert!(
         missing.is_empty(),
         "SFS-341 E2E runner contract is missing required surfaces:\n{}",
+        missing.join("\n")
+    );
+}
+
+#[test]
+fn local_first_e2e_baseline_audit_covers_sfs402_surfaces() {
+    let doc = read_workspace_file("docs/local-first-e2e-baseline-audit.md");
+    let required_terms = [
+        "# Local First E2E Baseline Audit",
+        "f4e5e831252f265b16bba569dc7b8f274645d26e",
+        "SFS-309 through SFS-316",
+        "SFS-317 through SFS-329",
+        "Local First contract conflicts",
+        "Product bugs",
+        "Harness bugs",
+        "Environment drift",
+        "Incorrect test expectations",
+        "retained lessons",
+        "PostgreSQL 18",
+        "rustfs/rustfs:latest",
+        "Windows process cleanup",
+        "zombie",
+        "landing-zone",
+        "stale resource recovery",
+        "Follow-up rewrites",
+    ];
+
+    let missing: Vec<_> = required_terms
+        .iter()
+        .copied()
+        .filter(|term| !doc.contains(term))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "SFS-402 baseline audit is missing required surfaces:\n{}",
         missing.join("\n")
     );
 }
