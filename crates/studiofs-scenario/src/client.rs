@@ -318,8 +318,36 @@ impl SimulatedRuntime {
         }
         self.client_mut(client)?.entries.remove(path);
         self.client_mut(client)?.durable_entries.remove(path);
+        self.client_mut(client)?.durable_writes.remove(path);
         self.record(client, "unlink", Some(path));
         self.schedule_client_event(client, "unlink");
+        Ok(())
+    }
+
+    /// Unlinks a file and publishes a deletion event to the metadata bus.
+    pub fn publish_unlink(&mut self, client: &str, path: &str) -> Result<(), ClientRuntimeError> {
+        let entry = self.entry(client, path)?;
+        if entry.kind != LocalEntryKind::File {
+            return Err(ClientRuntimeError::NotFile {
+                client: client.to_string(),
+                path: path.to_string(),
+            });
+        }
+        let logical_id = entry.logical_id.clone();
+        let epoch = entry.epoch;
+        self.unlink(client, path)?;
+        let event = MetadataEvent::new("file_deleted")
+            .with_field("path", path)
+            .with_field("logical_id", logical_id)
+            .with_field("epoch", epoch.to_string());
+        self.metadata_bus
+            .enqueue_local(MetadataBatch::new(client, vec![event]));
+        self.record(client, "publish_unlink", Some(path));
+        self.scheduler.schedule_now(
+            ScheduledEvent::new(SchedulerEventType::PublishAttempt)
+                .with_client(client)
+                .with_description(path),
+        );
         Ok(())
     }
 
@@ -654,6 +682,46 @@ impl SimulatedRuntime {
         Ok(outcome)
     }
 
+    /// Delivers all currently pending metadata batches for a client.
+    pub fn deliver_all_metadata(&mut self, client: &str) -> Result<usize, ClientRuntimeError> {
+        let mut delivered = 0;
+        let pending = self.metadata_bus.pending_count_for(client);
+        for _ in 0..pending {
+            match self.deliver_next_metadata(client) {
+                Ok(_) => delivered += 1,
+                Err(ClientRuntimeError::NoPendingMetadata { .. }) => return Ok(delivered),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(delivered)
+    }
+
+    /// Imports metadata history for a client, excluding already-applied batches.
+    pub fn import_metadata_history(&mut self, client: &str) -> Result<usize, ClientRuntimeError> {
+        self.ensure_client(client)?;
+        let enqueued = self.metadata_bus.enqueue_history_for(client, false);
+        self.record_with_metadata(
+            client,
+            "metadata_history_imported",
+            None,
+            [("enqueued_batches".to_string(), enqueued.to_string())],
+        );
+        Ok(enqueued)
+    }
+
+    /// Replays metadata history for a client, including already-applied batches.
+    pub fn replay_metadata_history(&mut self, client: &str) -> Result<usize, ClientRuntimeError> {
+        self.ensure_client(client)?;
+        let enqueued = self.metadata_bus.enqueue_history_for(client, true);
+        self.record_with_metadata(
+            client,
+            "metadata_history_replayed",
+            None,
+            [("enqueued_batches".to_string(), enqueued.to_string())],
+        );
+        Ok(enqueued)
+    }
+
     /// Function $name.
     pub fn set_metadata_available(&mut self, available: bool) {
         self.metadata_bus.set_metadata_outage(!available);
@@ -767,6 +835,32 @@ impl SimulatedRuntime {
                         payload,
                     ),
                 );
+            } else if event.kind == "file_deleted" {
+                let path = field(event, "path")?;
+                let logical_id = field(event, "logical_id")?;
+                let epoch = optional_field(event, "epoch")
+                    .map(|epoch| {
+                        epoch
+                            .parse()
+                            .map_err(|_| ClientRuntimeError::InvalidMetadataField {
+                                field: "epoch".to_string(),
+                            })
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+                let remove = self
+                    .client(client)?
+                    .entries
+                    .get(path)
+                    .is_some_and(|current| {
+                        current.logical_id == logical_id && current.epoch <= epoch
+                    });
+                if remove {
+                    let client_state = self.client_mut(client)?;
+                    client_state.entries.remove(path);
+                    client_state.durable_entries.remove(path);
+                    client_state.durable_writes.remove(path);
+                }
             }
         }
         Ok(())

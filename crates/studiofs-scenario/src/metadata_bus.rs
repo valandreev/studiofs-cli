@@ -244,6 +244,11 @@ impl MetadataBus {
             .collect()
     }
 
+    /// Returns the number of queued metadata batches for a client.
+    pub fn pending_count_for(&self, client: &str) -> usize {
+        self.client_queues.get(client).map_or(0, VecDeque::len)
+    }
+
     /// Function $name.
     pub fn batch(&self, batch_id: u64) -> Option<MetadataBatch> {
         self.batches.get(&batch_id).cloned()
@@ -346,6 +351,27 @@ impl MetadataBus {
             .or_default()
             .push_back(batch_id);
         true
+    }
+
+    /// Enqueues metadata history for a client in version order.
+    pub fn enqueue_history_for(&mut self, client: &str, include_applied: bool) -> usize {
+        let applied = self.applied_batches.get(client);
+        let Some(queue) = self.client_queues.get_mut(client) else {
+            return 0;
+        };
+        let queued = queue.iter().copied().collect::<BTreeSet<_>>();
+        let mut enqueued = 0;
+        for batch_id in self.batches.keys().copied() {
+            if queued.contains(&batch_id) {
+                continue;
+            }
+            if !include_applied && applied.is_some_and(|applied| applied.contains(&batch_id)) {
+                continue;
+            }
+            queue.push_back(batch_id);
+            enqueued += 1;
+        }
+        enqueued
     }
 
     /// Function $name.

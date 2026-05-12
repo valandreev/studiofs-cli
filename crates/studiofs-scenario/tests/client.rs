@@ -355,6 +355,31 @@ fn namespace_mutations_are_replayed_after_restart() {
 }
 
 #[test]
+fn metadata_history_replay_drains_only_the_current_queue_snapshot() {
+    let mut runtime = SimulatedRuntime::new(45);
+    runtime.add_client("writer");
+    runtime.add_client("reader");
+
+    runtime.create_file("writer", "file.txt").unwrap();
+    runtime
+        .write_file("writer", "file.txt", 4, "checksum-v1")
+        .unwrap();
+    runtime.flush("writer", "file.txt").unwrap();
+    let upload = runtime.schedule_upload("writer", "file.txt").unwrap();
+    runtime.complete_upload(upload.upload_id).unwrap();
+    runtime.publish_file("writer", "file.txt").unwrap();
+
+    assert_eq!(runtime.deliver_all_metadata("reader").unwrap(), 1);
+    assert_eq!(runtime.import_metadata_history("reader").unwrap(), 0);
+    assert_eq!(runtime.replay_metadata_history("reader").unwrap(), 1);
+    assert_eq!(runtime.deliver_all_metadata("reader").unwrap(), 1);
+    assert_eq!(runtime.deliver_all_metadata("reader").unwrap(), 0);
+
+    let file = runtime.read_file("reader", "file.txt").unwrap();
+    assert_eq!(file.checksum_sha256, "checksum-v1");
+}
+
+#[test]
 fn directory_rename_preserves_logical_id_after_restart() {
     let mut runtime = SimulatedRuntime::new(43);
     runtime.add_client("client-a");

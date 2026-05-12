@@ -21,6 +21,7 @@ fn fast_and_deep_corpus_are_stable_named_seed_sets() {
             SimulationScenarioGroup::MetadataOutage,
             SimulationScenarioGroup::ObjectStoreOutage,
             SimulationScenarioGroup::SparsePayloadChaos,
+            SimulationScenarioGroup::ColdObserverLongHistory,
         ]
     );
     assert_eq!(fast.seeds, vec![1, 2, 3]);
@@ -102,6 +103,67 @@ fn deep_object_store_outage_corpus_uses_seed_controlled_paths() {
 }
 
 #[test]
+fn cold_observer_long_history_corpus_runs_seed_variants_and_replays_counterexample() {
+    let report = run_simulation_corpus(SimulationCorpusOptions {
+        kind: SimulationCorpusKind::Deep,
+        group: Some(SimulationScenarioGroup::ColdObserverLongHistory),
+        seed: None,
+        artifact_root: None,
+        inject_failure: false,
+    })
+    .expect("cold observer corpus runs");
+
+    assert!(report.passed, "{:#?}", report.failures);
+    let seed_reports = &report.group_reports[0].seed_reports;
+    assert_eq!(seed_reports.len(), 16);
+    assert!(
+        seed_reports
+            .iter()
+            .all(|seed| seed.invariant_checkpoints >= 3)
+    );
+    let distinct_trace_shapes = seed_reports
+        .iter()
+        .map(|seed| seed.trace_records)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        distinct_trace_shapes.len() >= 4,
+        "cold observer deep seeds have too little ordering diversity: {seed_reports:#?}"
+    );
+
+    let artifact_root = unique_temp_dir("sfs397-cold-observer-counterexample");
+    std::fs::create_dir_all(&artifact_root).expect("create artifact root");
+    let report = run_simulation_corpus(SimulationCorpusOptions {
+        kind: SimulationCorpusKind::Fast,
+        group: Some(SimulationScenarioGroup::ColdObserverLongHistory),
+        seed: Some(13),
+        artifact_root: Some(artifact_root),
+        inject_failure: true,
+    })
+    .expect("cold observer corpus writes failure artifact");
+    let artifact_path = report.failures[0]
+        .counterexample_artifact_path
+        .as_ref()
+        .expect("failure records an artifact path");
+
+    let artifact =
+        read_simulation_counterexample(artifact_path).expect("counterexample artifact can be read");
+    assert_eq!(
+        artifact.group,
+        SimulationScenarioGroup::ColdObserverLongHistory
+    );
+    assert!(artifact.final_snapshot.is_some());
+
+    let replay =
+        replay_simulation_counterexample(artifact_path).expect("counterexample artifact replays");
+    assert!(replay.reproduced);
+    assert_eq!(
+        replay.group,
+        SimulationScenarioGroup::ColdObserverLongHistory
+    );
+    assert_eq!(replay.violated_invariant, "injected_counterexample");
+}
+
+#[test]
 fn corpus_failures_include_group_seed_invariant_and_artifact_path() {
     let artifact_root = unique_temp_dir("sfs340-corpus-counterexamples");
     std::fs::create_dir_all(&artifact_root).expect("create artifact root");
@@ -136,6 +198,7 @@ fn all_corpus_group_failures_write_counterexample_artifacts() {
         SimulationScenarioGroup::MetadataOutage,
         SimulationScenarioGroup::ObjectStoreOutage,
         SimulationScenarioGroup::SparsePayloadChaos,
+        SimulationScenarioGroup::ColdObserverLongHistory,
     ] {
         let artifact_root = unique_temp_dir(&format!("sfs340-{group:?}-counterexamples"));
         std::fs::create_dir_all(&artifact_root).expect("create artifact root");
