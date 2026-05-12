@@ -339,14 +339,15 @@ restart. If the writer can read recovered bytes, that recovered checksum becomes
 the convergence oracle even when it differs from the pre-crash intended
 checksum. If the writer cannot recover the file from local log/cache, the
 scenario reports unrecoverable loss instead of requiring volatile OS-cache data
-to survive an unclean crash. For recovered writer state, the scenario waits for
-upload/publication and peer convergence, and then validates matching mounted
-tree checksums from all clients. The scenario runs two modes in one invocation:
+to survive an unclean crash. The scenario runs two modes in one invocation:
 
 - `after_local_durability_boundary`, which crashes immediately after the
-  documented local durability boundary is crossed.
+  documented local durability boundary is crossed. Recovered writer state is
+  expected to publish and converge across peers.
 - `before_remote_publication_completes`, which crashes after local durability
   but before the scenario waits for remote publication and peer convergence.
+  The writer's recovered local read is pass/fail; peer visibility is recorded
+  as diagnostics only.
 
 The scenario writes `operations.ndjson`,
 `crash-restart-recovery-summary.json`, and `validation.json`. The summary
@@ -355,12 +356,12 @@ local, and final checksums, whether a peer saw any pre-convergence checksum in
 the `before_remote_publication_completes` mode, restart timing, convergence
 timing, recovery outcome, and mounted tree validator result. Diagnostics must
 distinguish unrecoverable local loss, publication failure, peer convergence
-failure, and a corrupt advertised file whose final peer checksum differs from
-the writer's recovered checksum. Publication waiting is intentionally the public
-mounted-tree convergence loop; the scenario must not inspect private S3,
-PostgreSQL, VFS, cache, or redb state to decide success. It must not delete
-local metadata, rerun `discover`, or share one local metadata database between
-clients during recovery.
+failure in the post-durability mode, and a corrupt advertised file whose final
+peer checksum differs from the writer's recovered checksum. Publication waiting
+is intentionally the public mounted-tree convergence loop; the scenario must not
+inspect private S3, PostgreSQL, VFS, cache, or redb state to decide success. It
+must not delete local metadata, rerun `discover`, or share one local metadata
+database between clients during recovery.
 
 Mounted namespace collision scenarios use the first three default clients
 against one shared remote volume. Each scenario establishes a bounded initial

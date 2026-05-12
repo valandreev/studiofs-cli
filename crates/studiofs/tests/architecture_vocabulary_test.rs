@@ -671,6 +671,50 @@ fn deterministic_simulation_architecture_covers_sfs407_replan() {
 }
 
 #[test]
+fn deterministic_simulation_architecture_covers_sfs395_baseline_rebase() {
+    let doc = read_workspace_file("docs/deterministic-simulation-architecture.md");
+    let overview = read_workspace_file("docs/filesystem-testing-overview.md");
+    let combined = format!("{doc}\n{overview}");
+    let normalized_combined = normalize_doc_whitespace(&combined);
+    let required_terms = [
+        "SFS-395 Rebase On Accepted Windows E2E 1-16 Baseline",
+        "accepted mounted Windows E2E 1-16 baseline",
+        "deterministic backstop",
+        "no longer a blocker for accepting scenarios 1-16",
+        "WinFSP callback behavior",
+        "OS cache behavior",
+        "actual kernel notification delivery",
+        "real process teardown",
+        "SFS-396",
+        "sparse-file truncate/write/read-range",
+        "SFS-397",
+        "cold-observer long-history convergence",
+        "SFS-398",
+        "invalidation dropout and fallback sync",
+        "SFS-399",
+        "symlink and metadata-attribute convergence",
+        "SFS-400",
+        "adversarial runner cleanup",
+    ];
+
+    let missing: Vec<_> = required_terms
+        .iter()
+        .copied()
+        .filter(|term| !contains_doc_term(&combined, &normalized_combined, term))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "SFS-395 deterministic simulation baseline rebase is missing required surfaces:\n{}",
+        missing.join("\n")
+    );
+    assert!(
+        !doc.contains("SFS-395 through SFS-400 must not be resurrected unchanged"),
+        "SFS-395 baseline rebase should replace stale canceled-chain wording"
+    );
+}
+
+#[test]
 fn cli_and_regression_surfaces_drop_buffered_first_wording() {
     let files = [
         "crates/studiofs/src/cli/test_cache/reporting/human.rs",

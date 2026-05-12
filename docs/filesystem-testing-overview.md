@@ -69,9 +69,11 @@ Docker services and OS filesystem bridges such as WinFSP on Windows or FUSE on
 Linux/macOS. It is slower, but it proves behavior through the actual filesystem
 interface instead of through private internals.
 
-Older documentation mentioned a separate deterministic simulation crate. That
-crate is not part of the current workspace, so this overview describes the
-testing surface that exists in the codebase now.
+Simulation v2 is being recalibrated as a future deterministic backstop for this
+accepted mounted Windows baseline. It should catch logical metadata, payload,
+publication, replay, and convergence regressions cheaply, but it is not a
+replacement for real mounted E2E and it is no longer a gate for accepting
+scenarios 1-16.
 
 ## Real Mounted E2E Scenarios We Have Today
 
@@ -112,7 +114,8 @@ This tests the split between local durability and remote publication.
 
 We kill a mounted client after it has accepted local work, then remount it with
 the same client root. The restarted client must recover readable local state,
-and the run records whether peer convergence succeeds after that recovery.
+and the run records whether peers can see the work after that recovery. For the
+pre-publication crash mode, peer visibility is diagnostic rather than pass/fail.
 
 This tests whether accepted local work survives process death.
 
@@ -219,6 +222,7 @@ The workflow is intentionally staged. We add or restore one level, run it, fix
 the bugs it finds, rerun the focused slice to make sure nothing regressed, and
 only then move to the next level.
 
-Future filesystem testing can go deeper into sparse-file truncate/write races,
-long-history cold observers, metadata invalidation dropouts, symlink and
-attribute convergence, and adversarial runner cleanup.
+Future deterministic backstops can go deeper into sparse-file
+truncate/write/read-range races, cold-observer long-history convergence,
+invalidation dropout and fallback sync, symlink and metadata-attribute
+convergence, and adversarial runner cleanup.

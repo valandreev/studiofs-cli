@@ -5,8 +5,10 @@ simulator is a fast, seed-reproducible test layer for StudioFS logical clients.
 The target scope is core distributed state-machine behavior. It is not a
 replacement for Contract/Core tests or real mounted E2E tests.
 
-The initial design covers Phase 3 planning for the Deterministic Simulation
-Testing milestone. Follow-up implementation issues are SFS-331 through SFS-336.
+The initial design covered Phase 3 planning for the Deterministic Simulation
+Testing milestone. SFS-395 rebases that plan onto the accepted mounted Windows
+E2E 1-16 baseline and keeps future simulation work as regression backstops, not
+as prerequisites for accepting that baseline.
 
 ## SFS-407 Replan From Accepted Local First Contracts
 
@@ -47,12 +49,51 @@ delivery stay out of deterministic simulation unless a later contract reduces
 them to an abstract hint or modeled failure that is also validated by mounted
 E2E or bridge tests.
 
-SFS-395 through SFS-400 must not be resurrected unchanged. A follow-up
-simulation issue is valid only when it names a clear product invariant, states
-which accepted Local First contract it models, and explains why that invariant
-is better explored deterministically than by another focused Contract/Core or
-real mounted E2E check. Until the SFS-405 baseline gate is stable, the next
-simulation issue set should stay uncreated.
+SFS-395 through SFS-400 must therefore be evaluated against the accepted
+baseline before implementation. A follow-up simulation issue is valid only when
+it names a clear product invariant, states which accepted Local First contract
+or mounted baseline gap it models, and explains why that invariant is better
+explored deterministically than by another focused Contract/Core or real mounted
+E2E check.
+
+## SFS-395 Rebase On Accepted Windows E2E 1-16 Baseline
+
+The v2 simulation rule is: deterministic simulation should catch logical
+metadata, payload, publication, replay, and convergence regressions cheaply
+before they require a real mounted Windows rerun. It is a deterministic
+backstop for the accepted mounted Windows E2E 1-16 baseline and for future
+deeper filesystem scenarios. It is no longer a blocker for accepting scenarios
+1-16.
+
+The accepted mounted baseline is:
+
+- scenarios 1-5: smoke, outages, crash/restart, and the publication-boundary
+  crash matrix;
+- scenarios 6-11: focused mounted namespace collision families;
+- scenarios 12-16: seeded mounted chaos, hot-spot churn, fault chaos, LWW
+  reconnect chaos, and open-handle convergence.
+
+Simulation v2 should model logical state-machine behavior that can be explored
+with seeds, virtual time, replayable operation traces, and invariant checks.
+Keep platform-only behavior out of simulation: WinFSP callback behavior, FUSE
+callback behavior, OS cache behavior, actual kernel notification delivery, real
+process teardown, Docker service behavior, and mounted helper lifecycle remain
+E2E, bridge-test, or runner-test territory unless a later issue explicitly
+reduces them to a deterministic logical contract.
+
+Updated checklist for the next simulation slices:
+
+| Issue | Baseline gap it protects | Simulation or deterministic-test slice |
+|---|---|---|
+| SFS-396 | The accepted 1-16 baseline has no dedicated sparse-file truncate/write/read-range scenario, and final tree equality can miss hole or byte-range regressions. | Add bounded sparse-file truncate/write/read-range coverage for holes, zero-fill, chunk boundaries, stale dirty slice replacement, committed size, logical size, and range diagnostics. |
+| SFS-397 | Scenario 14 includes a cold observer, but there is no isolated long-history model for tombstones, base mirrors, stale object references, or checksum/range divergence. | Add cold-observer long-history convergence coverage with namespace, content, tombstone, object-reference, and canonical-path invariants. |
+| SFS-398 | Real E2E exercises PostgreSQL and convergence, but it does not isolate the logical rule that invalidation hints are lossy and fallback sync remains authoritative. | Add invalidation dropout and fallback sync coverage with missed or delayed hints, modeled fallback intervals, bounded stale windows, and replayable hint/drop diagnostics. |
+| SFS-399 | The accepted baseline validates regular-file trees, LWW reconnect, and open handles, but not dedicated symlink target state or supported metadata-attribute convergence. | Add symlink and metadata-attribute convergence coverage with explicit capability gates and auxiliary-state invariants. |
+| SFS-400 | The accepted baseline depends on trustworthy runner artifacts and cleanup, but adversarial partial-failure cleanup is mostly harness behavior. | Add deterministic simulation or infra-disabled runner self-tests for adversarial runner cleanup, including partial launch failure, hung helper timeout, primary-error preservation, and runner-owned cleanup boundaries. |
+
+These issues are independently implementable regression backstops. They must not
+be presented as prerequisites for the already-green mounted Windows E2E 1-16
+baseline.
 
 ## Scope And Non-Goals
 

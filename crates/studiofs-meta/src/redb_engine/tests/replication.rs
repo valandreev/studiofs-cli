@@ -146,6 +146,106 @@ fn assert_only_visible_name(engine: &RedbMetaEngine, expected: &[u8], absent: &[
 }
 
 #[test]
+fn test_replica_base_remove_attr_clears_dangling_dentries_for_inode() {
+    let engine = temp_engine();
+    let ino = 782;
+    let entry = DirEntryValue {
+        ino,
+        kind: FileType::RegularFile,
+    };
+    let attr = InodeAttr::new_file(ino, ROOT_INO, 1000, 1000, 0o644);
+
+    engine
+        .apply_replica_events_to_base(&[
+            MetaEvent::SetAttr { attr },
+            MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: b"base-only.txt".to_vec(),
+                entry,
+            },
+        ])
+        .unwrap();
+
+    let dentry_key = encode_dentry_key(ROOT_INO, b"base-only.txt");
+    let index_key = encode_dentry_by_inode_key(ino, ROOT_INO, b"base-only.txt");
+    {
+        let txn = engine.db.begin_read().unwrap();
+        let dentries = txn.open_table(BASE_DENTRIES_TABLE).unwrap();
+        let by_inode = txn.open_table(BASE_DENTRIES_BY_INODE_TABLE).unwrap();
+        assert!(dentries.get(dentry_key.as_slice()).unwrap().is_some());
+        assert!(by_inode.get(index_key.as_slice()).unwrap().is_some());
+    }
+
+    engine
+        .apply_replica_events_to_base(&[MetaEvent::RemoveAttr { ino }])
+        .unwrap();
+
+    let txn = engine.db.begin_read().unwrap();
+    let dentries = txn.open_table(BASE_DENTRIES_TABLE).unwrap();
+    let by_inode = txn.open_table(BASE_DENTRIES_BY_INODE_TABLE).unwrap();
+    assert!(dentries.get(dentry_key.as_slice()).unwrap().is_none());
+    assert!(by_inode.get(index_key.as_slice()).unwrap().is_none());
+}
+
+#[test]
+fn replica_serving_remove_attr_removes_renamed_alias() {
+    let engine = temp_engine();
+    let entry = DirEntryValue {
+        ino: 783,
+        kind: FileType::RegularFile,
+    };
+    let attr = InodeAttr::new_file(entry.ino, ROOT_INO, 1000, 1000, 0o644);
+
+    engine
+        .apply_replica_events_to_base(&[
+            MetaEvent::SetAttr { attr: attr.clone() },
+            MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: b"source.txt".to_vec(),
+                entry: entry.clone(),
+            },
+        ])
+        .unwrap();
+    engine
+        .apply_replica_serving_state(&[
+            MetaEvent::SetAttr { attr },
+            MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: b"source.txt".to_vec(),
+                entry,
+            },
+        ])
+        .unwrap();
+
+    engine
+        .rename_atomic(ROOT_INO, b"source.txt", ROOT_INO, b"renamed.txt")
+        .expect("local rename should be accepted");
+    assert!(engine.lookup(ROOT_INO, b"renamed.txt").is_ok());
+
+    engine
+        .apply_replica_events_to_base(&[
+            MetaEvent::RemoveEntry {
+                parent: ROOT_INO,
+                name: b"source.txt".to_vec(),
+            },
+            MetaEvent::RemoveAttr { ino: 783 },
+        ])
+        .unwrap();
+    engine
+        .apply_replica_serving_state(&[
+            MetaEvent::RemoveEntry {
+                parent: ROOT_INO,
+                name: b"source.txt".to_vec(),
+            },
+            MetaEvent::RemoveAttr { ino: 783 },
+        ])
+        .unwrap();
+
+    assert!(engine.lookup(ROOT_INO, b"source.txt").is_err());
+    assert!(engine.lookup(ROOT_INO, b"renamed.txt").is_err());
+}
+
+#[test]
 fn replica_serving_rename_uses_base_winner_when_local_loser_moved_to_a() {
     let engine = temp_engine();
     let entry = DirEntryValue {
