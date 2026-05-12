@@ -1765,7 +1765,7 @@ fn client_trace_operation(record: &crate::client::ClientTraceRecord) -> Scenario
             path,
             target: record.metadata.get("target").cloned().unwrap_or_default(),
         },
-        "set_symlink_target" => ScenarioOperation::CreateSymlink {
+        "set_symlink_target" => ScenarioOperation::UpdateSymlinkTarget {
             path,
             target: record.metadata.get("target").cloned().unwrap_or_default(),
         },

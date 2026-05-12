@@ -292,6 +292,10 @@ fn auxiliary_metadata_corpus_models_symlink_xattr_capability_gates_and_replays_c
         ScenarioOperation::PublishMetadataAttribute { name, .. }
             if name == "user.studiofs.label"
     )));
+    assert!(artifact.operation_log.iter().any(|record| matches!(
+        &record.operation,
+        ScenarioOperation::UpdateSymlinkTarget { target, .. } if target == "target-b.txt"
+    )));
     assert!(!artifact.operation_log.iter().any(|record| matches!(
         &record.operation,
         ScenarioOperation::SetMetadataAttribute { name, value, .. }

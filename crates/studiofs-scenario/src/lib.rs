@@ -120,6 +120,13 @@ pub enum ScenarioOperation {
         target: String,
     },
     /// Variant $name.
+    UpdateSymlinkTarget {
+        /// Field $name.
+        path: String,
+        /// Field $name.
+        target: String,
+    },
+    /// Variant $name.
     Write {
         /// Field $name.
         path: String,
