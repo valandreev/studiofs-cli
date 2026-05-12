@@ -312,15 +312,29 @@ pub fn run_with_executor(
     let events_path = sandbox.join("events.ndjson");
     if let Err(primary_error) = record_event(&events_path, &run_id, None, "run", "started") {
         let primary_error_detail = primary_error.to_string();
-        write_runner_failure_boundary(
+        let mut cleanup_errors = Vec::new();
+        if let Err(err) = write_runner_failure_boundary(
             &sandbox,
             "post-preflight",
             Some(&events_path),
             &primary_error_detail,
-        )?;
-        let cleanup =
-            run_runner_cleanup(&run_id, &sandbox, &mut compose_cleanup_guard, Vec::new())?;
-        finish_runner_early_failure(EarlyRunnerFailureInput {
+        ) {
+            cleanup_errors.push(format!("failure-boundary report: {err}"));
+        }
+        let cleanup = match run_runner_cleanup(
+            &run_id,
+            &sandbox,
+            &mut compose_cleanup_guard,
+            cleanup_errors,
+        ) {
+            Ok(cleanup) => cleanup,
+            Err(err) => CleanupReport {
+                status: RunStatus::CleanupFailed,
+                actions: Vec::new(),
+                errors: vec![format!("cleanup report failed during early failure: {err}")],
+            },
+        };
+        let _ = finish_runner_early_failure(EarlyRunnerFailureInput {
             run_id: &run_id,
             seed: request.seed,
             status: RunStatus::Failed,
@@ -338,7 +352,7 @@ pub fn run_with_executor(
             allocated_ports: allocated_ports.clone(),
             preflight,
             cleanup,
-        })?;
+        });
         return Err(primary_error);
     }
 
@@ -2559,11 +2573,65 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn post_start_cleanup_report_errors_do_not_shadow_primary_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("e2e-runs");
+        let run_id = "post-start-cleanup-report-error";
+        let sandbox = root.join(run_id);
+        let executor = RecordingExecutor {
+            poison_events_path_after_up: RefCell::new(Some(sandbox.join("events.ndjson"))),
+            poison_failure_boundary_path_after_up: RefCell::new(Some(
+                sandbox.join("artifacts/runner/failure-boundary.json"),
+            )),
+            fail_logs: Cell::new(true),
+            ..RecordingExecutor::default()
+        };
+
+        let err = run_with_executor(
+            RunRequest {
+                root,
+                run_id: Some(run_id.to_string()),
+                scenarios: vec![scenario::TEST_PASSING.to_string()],
+                seed: 400,
+                studiofs_bin: None,
+                platform: PlatformSelection::Auto,
+                retention: RetentionPolicy::Always,
+                report: None,
+                port_range: Some("33500-33510".to_string()),
+                timeout: None,
+                infra: InfraMode::Compose,
+            },
+            &executor,
+        )
+        .expect_err("primary event-log failure should be preserved");
+
+        assert!(matches!(err, RunnerError::Io(_)));
+        assert!(
+            sandbox.join("cleanup.json").exists(),
+            "cleanup/reporting errors should not abort early-failure cleanup before recording cleanup.json: {err}"
+        );
+        let cleanup: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(sandbox.join("cleanup.json"))?)?;
+        assert_eq!(cleanup["status"], "cleanup_failed");
+        assert!(
+            cleanup["errors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|error| error.as_str().unwrap().contains("docker compose logs"))
+        );
+        Ok(())
+    }
+
     #[derive(Default)]
     struct RecordingExecutor {
         calls: RefCell<Vec<crate::infra::CommandSpec>>,
         poison_events_path_after_up: RefCell<Option<PathBuf>>,
+        poison_failure_boundary_path_after_up: RefCell<Option<PathBuf>>,
         fail_up: Cell<bool>,
+        fail_logs: Cell<bool>,
     }
 
     impl CommandExecutor for RecordingExecutor {
@@ -2580,6 +2648,20 @@ mod tests {
                 if let Some(events_path) = self.poison_events_path_after_up.borrow_mut().take() {
                     std::fs::create_dir_all(events_path)?;
                 }
+                if let Some(failure_boundary_path) = self
+                    .poison_failure_boundary_path_after_up
+                    .borrow_mut()
+                    .take()
+                {
+                    std::fs::create_dir_all(failure_boundary_path)?;
+                }
+            }
+            if command.args.contains(&"logs".to_string()) && self.fail_logs.get() {
+                return Ok(CommandOutput {
+                    status: 1,
+                    stdout: String::new(),
+                    stderr: "compose logs failed".to_string(),
+                });
             }
             let stdout = if command.args.contains(&"logs".to_string()) {
                 "compose logs\n"

@@ -1,10 +1,12 @@
 //! Docker Compose infrastructure for real E2E runs.
 
 use std::fs;
+use std::io::{self, Read as _};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{ChildStderr, ChildStdout, Command, Stdio};
 use std::thread;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use clap::ValueEnum;
@@ -158,19 +160,25 @@ fn run_command_with_timeout(
     timeout: Duration,
 ) -> std::io::Result<CommandOutput> {
     let mut child = command.spawn()?;
+    let mut stdout_reader = child.stdout.take().map(spawn_stdout_reader);
+    let mut stderr_reader = child.stderr.take().map(spawn_stderr_reader);
     let started = Instant::now();
     loop {
         if child.try_wait()?.is_some() {
-            let output = child.wait_with_output()?;
+            let status = child.wait()?;
+            let stdout = collect_reader(stdout_reader.take())?;
+            let stderr = collect_reader(stderr_reader.take())?;
             return Ok(CommandOutput {
-                status: output.status.code().unwrap_or(-1),
-                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                status: status.code().unwrap_or(-1),
+                stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&stderr).into_owned(),
             });
         }
         if started.elapsed() >= timeout {
             let _ = child.kill();
-            let _ = child.wait_with_output();
+            let _ = child.wait();
+            let _ = collect_reader(stdout_reader.take());
+            let _ = collect_reader(stderr_reader.take());
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 format!("command timed out after {} ms", timeout.as_millis()),
@@ -178,6 +186,31 @@ fn run_command_with_timeout(
         }
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn spawn_stdout_reader(mut stdout: ChildStdout) -> JoinHandle<io::Result<Vec<u8>>> {
+    thread::spawn(move || {
+        let mut buffer = Vec::new();
+        stdout.read_to_end(&mut buffer)?;
+        Ok(buffer)
+    })
+}
+
+fn spawn_stderr_reader(mut stderr: ChildStderr) -> JoinHandle<io::Result<Vec<u8>>> {
+    thread::spawn(move || {
+        let mut buffer = Vec::new();
+        stderr.read_to_end(&mut buffer)?;
+        Ok(buffer)
+    })
+}
+
+fn collect_reader(reader: Option<JoinHandle<io::Result<Vec<u8>>>>) -> io::Result<Vec<u8>> {
+    let Some(reader) = reader else {
+        return Ok(Vec::new());
+    };
+    reader
+        .join()
+        .map_err(|_| io::Error::other("command output reader thread panicked"))?
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -826,6 +859,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn timeout_executor_drains_large_stdout_while_waiting() {
+        let command = large_stdout_command(Duration::from_secs(5));
+
+        let output = SystemCommandExecutor
+            .run(&command)
+            .expect("large-output command should finish before timeout");
+
+        assert_eq!(output.status, 0);
+        assert!(output.stdout.len() >= 1_000_000);
+    }
+
     #[cfg(windows)]
     fn hung_command(timeout: Duration) -> CommandSpec {
         CommandSpec {
@@ -841,11 +886,40 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    fn large_stdout_command(timeout: Duration) -> CommandSpec {
+        CommandSpec {
+            program: "powershell".to_string(),
+            args: vec![
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                "[Console]::Out.Write(('x' * 1048576))".to_string(),
+            ],
+            env: Vec::new(),
+            cwd: None,
+            timeout: Some(timeout),
+        }
+    }
+
     #[cfg(unix)]
     fn hung_command(timeout: Duration) -> CommandSpec {
         CommandSpec {
             program: "sh".to_string(),
             args: vec!["-c".to_string(), "sleep 5".to_string()],
+            env: Vec::new(),
+            cwd: None,
+            timeout: Some(timeout),
+        }
+    }
+
+    #[cfg(unix)]
+    fn large_stdout_command(timeout: Duration) -> CommandSpec {
+        CommandSpec {
+            program: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "dd if=/dev/zero bs=1024 count=1024 2>/dev/null".to_string(),
+            ],
             env: Vec::new(),
             cwd: None,
             timeout: Some(timeout),
