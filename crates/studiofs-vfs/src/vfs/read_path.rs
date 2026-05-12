@@ -1856,7 +1856,7 @@ mod tests {
     #[test]
     fn resolve_read_metadata_async_reuses_published_read_plan_cache_for_hot_window() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let (rt, vfs, meta) = make_test_vfs(&tmp, "read-metadata-plan-cache");
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "read-metadata-plan-cache");
         let _guard = rt.enter();
         rt.block_on(async {
             let created = vfs
