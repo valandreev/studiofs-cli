@@ -140,9 +140,9 @@ pub enum MetadataTraceKind {
     DuplicateIgnored,
     /// Variant $name.
     DeliveryBlocked,
-    /// Variant $name.
+    /// A queued metadata hint was dropped for a client.
     HintDropped,
-    /// Variant $name.
+    /// A client rebuilt pending metadata from authoritative history.
     FallbackSync,
 }
 
@@ -384,24 +384,30 @@ impl MetadataBus {
 
     /// Rebuilds the client queue from authoritative metadata history.
     pub fn fallback_sync_for(&mut self, client: &str) -> usize {
-        let Some(queue) = self.client_queues.get_mut(client) else {
+        let Some(existing_queue) = self.client_queues.get(client) else {
             return 0;
         };
         let applied = self.applied_batches.get(client);
-        let queued = queue.iter().copied().collect::<BTreeSet<_>>();
-        let missing = self
+        let queued = existing_queue.iter().copied().collect::<BTreeSet<_>>();
+        let mut pending_batches = self
             .batches
-            .keys()
-            .copied()
-            .filter(|batch_id| !queued.contains(batch_id))
-            .filter(|batch_id| !applied.is_some_and(|applied| applied.contains(batch_id)))
+            .values()
+            .filter(|batch| !applied.is_some_and(|applied| applied.contains(&batch.batch_id)))
+            .map(|batch| (batch.version, batch.batch_id))
+            .collect::<Vec<_>>();
+        pending_batches.sort_by_key(|&(version, batch_id)| (version, batch_id));
+
+        let missing = pending_batches
+            .iter()
+            .filter(|(_, batch_id)| !queued.contains(batch_id))
             .count();
-        *queue = self
-            .batches
-            .keys()
-            .copied()
-            .filter(|batch_id| !applied.is_some_and(|applied| applied.contains(batch_id)))
+        let rebuilt_queue = pending_batches
+            .into_iter()
+            .map(|(_, batch_id)| batch_id)
             .collect();
+        if let Some(queue) = self.client_queues.get_mut(client) {
+            *queue = rebuilt_queue;
+        }
         self.delayed.remove(client);
         self.record(trace_record(
             MetadataTraceKind::FallbackSync,

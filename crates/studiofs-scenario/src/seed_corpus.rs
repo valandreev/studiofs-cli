@@ -997,6 +997,7 @@ fn invalidation_dropout_seed(seed: u64) -> Result<InvalidationDropoutRun, Simula
         scheduler_trace: invalidation_dropout_scheduler_trace(
             seed,
             invalidation_dropout_variant(seed),
+            "reader",
             fallback_bound,
         ),
         final_snapshot,
@@ -1037,6 +1038,7 @@ fn reader_is_stale(
 fn invalidation_dropout_scheduler_trace(
     seed: u64,
     variant: &str,
+    client: &str,
     fallback_bound: usize,
 ) -> Vec<SchedulerTraceRecord> {
     (0..fallback_bound)
@@ -1046,7 +1048,7 @@ fn invalidation_dropout_scheduler_trace(
             virtual_tick: index as u64,
             event_id: (index + 1) as u64,
             event_type: SchedulerEventType::MetadataDelivery,
-            client: Some("reader".to_string()),
+            client: Some(client.to_string()),
             description: Some(format!("{variant}:fallback-window-{index}")),
             interleaving_choice: 0,
             ready_event_count: 1,
