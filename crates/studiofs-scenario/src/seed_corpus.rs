@@ -15,11 +15,14 @@ use crate::crash_replay::{
     CrashReplayArtifactError, CrashReplayFamily, CrashReplaySuiteConfig, run_crash_replay_suite,
     run_crash_replay_suite_with_artifacts,
 };
-use crate::invariant::validate_logical_invariants;
+use crate::invariant::{LogicalSnapshot, validate_logical_invariants};
 use crate::object_store::{
     ObjectStoreFault, ObjectStoreTraceRecord, SimulatedObjectStore, UploadOutcome,
 };
-use crate::scheduler::{SchedulerEventType, SchedulerTraceRecord};
+use crate::scheduler::{
+    ScheduledEvent, SchedulerEventType, SchedulerTraceRecord, SimulationScheduler,
+    simulation_stream_seed,
+};
 use crate::{OperationOutcome, ScenarioOperation, ScenarioOperationRecord};
 
 /// Constant $name.
@@ -52,6 +55,8 @@ pub enum SimulationScenarioGroup {
     ObjectStoreOutage,
     /// Variant $name.
     SparsePayloadChaos,
+    /// Variant $name.
+    ColdObserverLongHistory,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -342,6 +347,9 @@ fn run_group(
         SimulationScenarioGroup::MetadataOutage => run_metadata_outage(seeds, options),
         SimulationScenarioGroup::ObjectStoreOutage => run_object_store_outage(seeds, options),
         SimulationScenarioGroup::SparsePayloadChaos => run_sparse_payload_chaos(seeds, options),
+        SimulationScenarioGroup::ColdObserverLongHistory => {
+            run_cold_observer_long_history(seeds, options)
+        }
     }
 }
 
@@ -740,6 +748,261 @@ fn run_sparse_payload_chaos(
         seed_reports,
         failures,
     })
+}
+
+fn run_cold_observer_long_history(
+    seeds: &[u64],
+    options: &SimulationCorpusOptions,
+) -> Result<GroupOutcome, SimulationCorpusError> {
+    let mut seed_reports = Vec::new();
+    let mut failures = Vec::new();
+    for seed in seeds {
+        let mut run = cold_observer_long_history_seed(*seed)?;
+        let invariant_report = validate_logical_invariants(&run.final_snapshot);
+        let cold_a = run
+            .runtime
+            .read_file("cold", "history/a.txt")?
+            .checksum_sha256;
+        let warm_sparse = run
+            .runtime
+            .read_file_range("warm", "history/sparse.bin", 0, 24)?;
+        let cold_sparse = run
+            .runtime
+            .read_file_range("cold", "history/sparse.bin", 0, 24)?;
+        let tombstones_hold = run.runtime.stat("warm", "history/b.txt").is_err()
+            && run.runtime.stat("cold", "history/b.txt").is_err()
+            && run.runtime.stat("warm", "history/deleted.txt").is_err()
+            && run.runtime.stat("cold", "history/deleted.txt").is_err();
+        let passed = invariant_report.passed
+            && tombstones_hold
+            && cold_a == "checksum-a-v2"
+            && warm_sparse.bytes == cold_sparse.bytes
+            && warm_sparse.holes == cold_sparse.holes
+            && run.replay_idempotent;
+
+        if !passed {
+            let (violated_invariant, base_message) =
+                first_violation_or(&invariant_report, "cold_observer_long_history_convergence");
+            failures.push(SimulationCorpusFailure {
+                group: SimulationScenarioGroup::ColdObserverLongHistory,
+                seed: *seed,
+                violated_invariant,
+                message: format!(
+                    "{base_message}; tombstones_hold={tombstones_hold} cold_a={cold_a} replay_idempotent={} warm_sparse_checksum={} cold_sparse_checksum={}",
+                    run.replay_idempotent,
+                    warm_sparse.checksum_sha256,
+                    cold_sparse.checksum_sha256
+                ),
+                counterexample_artifact_path: None,
+                replay_evidence: Some(SimulationCounterexampleEvidence {
+                    sub_group: Some(cold_observer_variant(*seed).to_string()),
+                    scheduler_trace: nonempty_scheduler_trace(
+                        *seed,
+                        run.scheduler_trace.clone(),
+                        "cold-observer-long-history-final",
+                    ),
+                    operation_log: operation_log_from_client_trace(
+                        CORPUS_SCENARIO,
+                        run.runtime.trace(),
+                    ),
+                    event_trace: json_trace(run.runtime.trace())?,
+                    final_snapshot: Some(json_value(&run.final_snapshot)?),
+                }),
+            });
+        }
+        if options.inject_failure {
+            failures.push(SimulationCorpusFailure {
+                group: SimulationScenarioGroup::ColdObserverLongHistory,
+                seed: *seed,
+                violated_invariant: "injected_counterexample".to_string(),
+                message: "injected cold observer long-history failure for corpus artifact testing"
+                    .to_string(),
+                counterexample_artifact_path: None,
+                replay_evidence: Some(SimulationCounterexampleEvidence {
+                    sub_group: Some(cold_observer_variant(*seed).to_string()),
+                    scheduler_trace: nonempty_scheduler_trace(
+                        *seed,
+                        run.scheduler_trace.clone(),
+                        "cold-observer-long-history-injected",
+                    ),
+                    operation_log: operation_log_from_client_trace(
+                        CORPUS_SCENARIO,
+                        run.runtime.trace(),
+                    ),
+                    event_trace: json_trace(run.runtime.trace())?,
+                    final_snapshot: Some(json_value(&run.final_snapshot)?),
+                }),
+            });
+        }
+        seed_reports.push(SimulationSeedReport {
+            seed: *seed,
+            passed: passed && !options.inject_failure,
+            invariant_checkpoints: run.invariant_checkpoints,
+            trace_records: run.runtime.trace().len() + run.scheduler_trace.len(),
+        });
+    }
+    Ok(GroupOutcome {
+        seed_reports,
+        failures,
+    })
+}
+
+fn cold_observer_long_history_seed(seed: u64) -> Result<ColdObserverRun, SimulationCorpusError> {
+    let mut runtime = SimulatedRuntime::new(seed);
+    runtime.add_client("writer");
+    runtime.add_client("warm");
+    runtime.mkdir("writer", "history")?;
+
+    runtime.create_file("writer", "history/a.txt")?;
+    runtime.write_file("writer", "history/a.txt", 7, "checksum-a-v1")?;
+    runtime.flush("writer", "history/a.txt")?;
+    runtime.create_file("writer", "history/b.txt")?;
+    runtime.write_file("writer", "history/b.txt", 7, "checksum-b-v1")?;
+    runtime.flush("writer", "history/b.txt")?;
+    runtime.create_file("writer", "history/deleted.txt")?;
+    runtime.write_file("writer", "history/deleted.txt", 13, "checksum-deleted-v1")?;
+    runtime.flush("writer", "history/deleted.txt")?;
+    runtime.create_file("writer", "history/sparse.bin")?;
+    runtime.write_sparse_range("writer", "history/sparse.bin", 0, b"head")?;
+    runtime.write_sparse_range("writer", "history/sparse.bin", 16, b"tail")?;
+    runtime.flush("writer", "history/sparse.bin")?;
+
+    let mut scheduler =
+        SimulationScheduler::new_with_stream_seed(seed, simulation_stream_seed(seed, 397));
+    publish_paths_in_scheduler_order(
+        &mut runtime,
+        &mut scheduler,
+        &[
+            "history/a.txt",
+            "history/b.txt",
+            "history/deleted.txt",
+            "history/sparse.bin",
+        ],
+    )?;
+
+    runtime.write_file("writer", "history/a.txt", 11, "checksum-a-v2")?;
+    runtime.flush("writer", "history/a.txt")?;
+    runtime.write_sparse_range("writer", "history/sparse.bin", 8, b"middle")?;
+    runtime.truncate_sparse_file("writer", "history/sparse.bin", 22)?;
+    runtime.flush("writer", "history/sparse.bin")?;
+    publish_paths_in_scheduler_order(
+        &mut runtime,
+        &mut scheduler,
+        &["history/a.txt", "history/sparse.bin"],
+    )?;
+
+    runtime.publish_unlink("writer", "history/b.txt")?;
+    runtime.publish_unlink("writer", "history/deleted.txt")?;
+    runtime.add_client("cold");
+
+    schedule_history_delivery(&mut scheduler);
+    let mut warm_delivered = false;
+    let mut cold_imported = false;
+    while let Some(selected) = scheduler.step() {
+        match selected.event.description.as_deref() {
+            Some("warm-history-delivery") => {
+                runtime.deliver_all_metadata("warm")?;
+                warm_delivered = true;
+            }
+            Some("cold-history-import") => {
+                runtime.import_metadata_history("cold")?;
+                runtime.deliver_all_metadata("cold")?;
+                cold_imported = true;
+            }
+            _ => {}
+        }
+    }
+    if !warm_delivered {
+        runtime.deliver_all_metadata("warm")?;
+    }
+    if !cold_imported {
+        runtime.import_metadata_history("cold")?;
+        runtime.deliver_all_metadata("cold")?;
+    }
+
+    let before_replay = runtime.logical_snapshot();
+    for _ in 0..=cold_observer_variant_index(seed) {
+        runtime.replay_metadata_history("cold")?;
+        runtime.deliver_all_metadata("cold")?;
+    }
+    let after_replay = runtime.logical_snapshot();
+    let replay_idempotent = before_replay.clients == after_replay.clients;
+    let mut final_snapshot = after_replay;
+    final_snapshot.expected_absent_paths = vec![
+        "history/b.txt".to_string(),
+        "history/deleted.txt".to_string(),
+    ];
+    final_snapshot.replay_idempotent = Some(replay_idempotent);
+
+    Ok(ColdObserverRun {
+        runtime,
+        scheduler_trace: scheduler.trace().to_vec(),
+        final_snapshot,
+        replay_idempotent,
+        invariant_checkpoints: 3 + cold_observer_variant_index(seed),
+    })
+}
+
+fn publish_paths_in_scheduler_order(
+    runtime: &mut SimulatedRuntime,
+    scheduler: &mut SimulationScheduler,
+    paths: &[&str],
+) -> Result<(), SimulationCorpusError> {
+    let mut uploads = BTreeMap::new();
+    for path in paths {
+        let upload = runtime.schedule_upload("writer", path)?;
+        uploads.insert((*path).to_string(), upload.upload_id);
+        scheduler.schedule_now(
+            ScheduledEvent::new(SchedulerEventType::UploadCompletion)
+                .with_client("writer")
+                .with_description(format!("complete-upload:{path}")),
+        );
+    }
+    while let Some(selected) = scheduler.step() {
+        let Some(path) = selected
+            .event
+            .description
+            .as_deref()
+            .and_then(|description| description.strip_prefix("complete-upload:"))
+        else {
+            continue;
+        };
+        let Some(upload_id) = uploads.remove(path) else {
+            continue;
+        };
+        runtime.complete_upload(upload_id)?;
+        runtime.publish_file("writer", path)?;
+        if uploads.is_empty() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn schedule_history_delivery(scheduler: &mut SimulationScheduler) {
+    scheduler.schedule_now(
+        ScheduledEvent::new(SchedulerEventType::MetadataDelivery)
+            .with_client("warm")
+            .with_description("warm-history-delivery"),
+    );
+    scheduler.schedule_now(
+        ScheduledEvent::new(SchedulerEventType::MetadataDelivery)
+            .with_client("cold")
+            .with_description("cold-history-import"),
+    );
+}
+
+fn cold_observer_variant(seed: u64) -> &'static str {
+    match cold_observer_variant_index(seed) {
+        0 => "upload_order_a",
+        1 => "upload_order_b",
+        2 => "observer_import_before_warm_delivery",
+        _ => "warm_delivery_before_observer_import",
+    }
+}
+
+fn cold_observer_variant_index(seed: u64) -> usize {
+    (seed % COLD_OBSERVER_SEED_VARIANTS) as usize
 }
 
 fn aggregate_seed_reports<FamilyReport, SeedReport>(
@@ -1150,6 +1413,7 @@ fn sparse_read_probes(seed: u64) -> usize {
 
 const OUTAGE_SEED_VARIANTS: u64 = 8;
 const SPARSE_SEED_VARIANTS: u64 = 4;
+const COLD_OBSERVER_SEED_VARIANTS: u64 = 4;
 
 fn seeds_for(kind: SimulationCorpusKind) -> &'static [u64] {
     match kind {
@@ -1165,6 +1429,7 @@ fn ordered_groups() -> &'static [SimulationScenarioGroup] {
         SimulationScenarioGroup::MetadataOutage,
         SimulationScenarioGroup::ObjectStoreOutage,
         SimulationScenarioGroup::SparsePayloadChaos,
+        SimulationScenarioGroup::ColdObserverLongHistory,
     ]
 }
 
@@ -1184,6 +1449,7 @@ pub fn group_arg(group: SimulationScenarioGroup) -> &'static str {
         SimulationScenarioGroup::MetadataOutage => "metadata-outage",
         SimulationScenarioGroup::ObjectStoreOutage => "object-store-outage",
         SimulationScenarioGroup::SparsePayloadChaos => "sparse-payload-chaos",
+        SimulationScenarioGroup::ColdObserverLongHistory => "cold-observer-long-history",
     }
 }
 
@@ -1203,6 +1469,14 @@ fn collision_family_arg(family: CollisionFamily) -> &'static str {
 struct GroupOutcome {
     seed_reports: Vec<SimulationSeedReport>,
     failures: Vec<SimulationCorpusFailure>,
+}
+
+struct ColdObserverRun {
+    runtime: SimulatedRuntime,
+    scheduler_trace: Vec<SchedulerTraceRecord>,
+    final_snapshot: LogicalSnapshot,
+    replay_idempotent: bool,
+    invariant_checkpoints: usize,
 }
 
 #[cfg(test)]

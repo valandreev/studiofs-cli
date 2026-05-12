@@ -349,6 +349,31 @@ impl MetadataBus {
     }
 
     /// Function $name.
+    pub fn enqueue_history_for(&mut self, client: &str, include_applied: bool) -> usize {
+        let Some(queue) = self.client_queues.get_mut(client) else {
+            return 0;
+        };
+        let applied = self
+            .applied_batches
+            .get(client)
+            .cloned()
+            .unwrap_or_default();
+        let queued = queue.iter().copied().collect::<BTreeSet<_>>();
+        let mut enqueued = 0;
+        for batch_id in self.batches.keys().copied() {
+            if queued.contains(&batch_id) {
+                continue;
+            }
+            if !include_applied && applied.contains(&batch_id) {
+                continue;
+            }
+            queue.push_back(batch_id);
+            enqueued += 1;
+        }
+        enqueued
+    }
+
+    /// Function $name.
     pub fn applied_versions(&self, client: &str) -> Vec<u64> {
         self.applied_versions
             .get(client)
