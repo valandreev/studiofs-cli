@@ -135,6 +135,7 @@ impl SimulatedRuntime {
         path: &str,
         target: &str,
     ) -> Result<(), ClientRuntimeError> {
+        validate_mutation_path(client, path)?;
         if target.is_empty() {
             return Err(ClientRuntimeError::InvalidSymlinkTarget {
                 client: client.to_string(),
@@ -191,17 +192,23 @@ impl SimulatedRuntime {
         name: &str,
         value: &str,
     ) -> Result<(), ClientRuntimeError> {
+        validate_mutation_path(client, path)?;
         validate_supported_metadata_attribute(name)?;
-        let next_epoch = self
+        let next_attribute_epoch = self
             .entry(client, path)?
-            .epoch
+            .metadata_attribute_epochs
+            .get(name)
+            .copied()
+            .unwrap_or_default()
             .checked_add(1)
             .expect("simulated metadata attribute epoch overflowed");
         let entry = self.entry_mut(client, path)?;
         entry
             .metadata_attributes
             .insert(name.to_string(), value.to_string());
-        entry.epoch = next_epoch;
+        entry
+            .metadata_attribute_epochs
+            .insert(name.to_string(), next_attribute_epoch);
         self.record_with_metadata(
             client,
             "set_metadata_attribute",
@@ -209,6 +216,7 @@ impl SimulatedRuntime {
             [
                 ("name".to_string(), name.to_string()),
                 ("value".to_string(), value.to_string()),
+                ("attr_epoch".to_string(), next_attribute_epoch.to_string()),
             ],
         );
         self.schedule_client_event(client, "set_metadata_attribute");
@@ -841,12 +849,17 @@ impl SimulatedRuntime {
                 path: path.to_string(),
                 name: name.to_string(),
             })?;
+        let attr_epoch = entry
+            .metadata_attribute_epochs
+            .get(name)
+            .copied()
+            .unwrap_or_default();
         let event = MetadataEvent::new("metadata_attribute_published")
             .with_field("path", path)
             .with_field("logical_id", entry.logical_id.clone())
             .with_field("name", name)
             .with_field("value", value)
-            .with_field("epoch", entry.epoch.to_string());
+            .with_field("attr_epoch", attr_epoch.to_string());
         self.metadata_bus
             .enqueue_local(MetadataBatch::new(client, vec![event]));
         self.record_with_metadata(
@@ -1108,17 +1121,21 @@ impl SimulatedRuntime {
                     continue;
                 }
                 self.ensure_parent_dirs(client, path)?;
-                self.client_mut(client)?.entries.insert(
-                    path.to_string(),
-                    LocalEntry::file(
-                        logical_id.to_string(),
-                        Some(size),
-                        Some(checksum_sha256.to_string()),
-                        Some(ObjectRef::remote(object_id)),
-                        epoch,
-                        payload,
-                    ),
+                let auxiliary = self.auxiliary_metadata_for_logical_id(client, logical_id)?;
+                self.remove_other_paths_for_logical_id(client, logical_id, path)?;
+                let mut entry = LocalEntry::file(
+                    logical_id.to_string(),
+                    Some(size),
+                    Some(checksum_sha256.to_string()),
+                    Some(ObjectRef::remote(object_id)),
+                    epoch,
+                    payload,
                 );
+                entry.metadata_attributes = auxiliary.metadata_attributes;
+                entry.metadata_attribute_epochs = auxiliary.metadata_attribute_epochs;
+                self.client_mut(client)?
+                    .entries
+                    .insert(path.to_string(), entry);
             } else if event.kind == "symlink_published" {
                 let path = field(event, "path")?;
                 let logical_id = field(event, "logical_id")?;
@@ -1144,23 +1161,28 @@ impl SimulatedRuntime {
                     continue;
                 }
                 self.ensure_parent_dirs(client, path)?;
+                let auxiliary = self.auxiliary_metadata_for_logical_id(client, logical_id)?;
                 self.remove_other_paths_for_logical_id(client, logical_id, path)?;
-                self.client_mut(client)?.entries.insert(
-                    path.to_string(),
-                    LocalEntry::symlink(logical_id.to_string(), target.to_string(), epoch),
-                );
+                let mut entry =
+                    LocalEntry::symlink(logical_id.to_string(), target.to_string(), epoch);
+                entry.metadata_attributes = auxiliary.metadata_attributes;
+                entry.metadata_attribute_epochs = auxiliary.metadata_attribute_epochs;
+                self.client_mut(client)?
+                    .entries
+                    .insert(path.to_string(), entry);
             } else if event.kind == "metadata_attribute_published" {
                 let path = field(event, "path")?;
                 let logical_id = field(event, "logical_id")?;
                 let name = field(event, "name")?;
                 let value = field(event, "value")?;
                 validate_supported_metadata_attribute(name)?;
-                let epoch = optional_field(event, "epoch")
+                let attr_epoch = optional_field(event, "attr_epoch")
+                    .or_else(|| optional_field(event, "epoch"))
                     .map(|epoch| {
                         epoch
                             .parse()
                             .map_err(|_| ClientRuntimeError::InvalidMetadataField {
-                                field: "epoch".to_string(),
+                                field: "attr_epoch".to_string(),
                             })
                     })
                     .transpose()?
@@ -1169,13 +1191,20 @@ impl SimulatedRuntime {
                 if entry.logical_id != logical_id {
                     continue;
                 }
-                if entry.epoch > epoch {
+                let current_attr_epoch = entry
+                    .metadata_attribute_epochs
+                    .get(name)
+                    .copied()
+                    .unwrap_or_default();
+                if current_attr_epoch > attr_epoch {
                     continue;
                 }
                 entry
                     .metadata_attributes
                     .insert(name.to_string(), value.to_string());
-                entry.epoch = epoch;
+                entry
+                    .metadata_attribute_epochs
+                    .insert(name.to_string(), attr_epoch);
             } else if event.kind == "file_deleted" {
                 let path = field(event, "path")?;
                 let logical_id = field(event, "logical_id")?;
@@ -1219,6 +1248,23 @@ impl SimulatedRuntime {
                 }
             }
         }
+    }
+
+    fn auxiliary_metadata_for_logical_id(
+        &self,
+        client: &str,
+        logical_id: &str,
+    ) -> Result<AuxiliaryMetadataState, ClientRuntimeError> {
+        Ok(self
+            .client(client)?
+            .entries
+            .values()
+            .find(|entry| entry.logical_id == logical_id)
+            .map(|entry| AuxiliaryMetadataState {
+                metadata_attributes: entry.metadata_attributes.clone(),
+                metadata_attribute_epochs: entry.metadata_attribute_epochs.clone(),
+            })
+            .unwrap_or_default())
     }
 
     fn remove_other_paths_for_logical_id(
@@ -2080,6 +2126,12 @@ impl SimulatedClient {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct AuxiliaryMetadataState {
+    metadata_attributes: BTreeMap<String, String>,
+    metadata_attribute_epochs: BTreeMap<String, u64>,
+}
+
 #[derive(Debug, Clone)]
 struct LocalEntry {
     kind: LocalEntryKind,
@@ -2090,6 +2142,7 @@ struct LocalEntry {
     payload: Option<SparsePayload>,
     symlink_target: Option<String>,
     metadata_attributes: BTreeMap<String, String>,
+    metadata_attribute_epochs: BTreeMap<String, u64>,
     epoch: u64,
 }
 
@@ -2104,6 +2157,7 @@ impl LocalEntry {
             payload: None,
             symlink_target: None,
             metadata_attributes: BTreeMap::new(),
+            metadata_attribute_epochs: BTreeMap::new(),
             epoch: 0,
         }
     }
@@ -2125,6 +2179,7 @@ impl LocalEntry {
             payload,
             symlink_target: None,
             metadata_attributes: BTreeMap::new(),
+            metadata_attribute_epochs: BTreeMap::new(),
             epoch,
         }
     }
@@ -2139,6 +2194,7 @@ impl LocalEntry {
             payload: None,
             symlink_target: Some(target),
             metadata_attributes: BTreeMap::new(),
+            metadata_attribute_epochs: BTreeMap::new(),
             epoch,
         }
     }
@@ -2325,6 +2381,58 @@ mod tests {
                 .trace()
                 .iter()
                 .any(|record| record.kind == "metadata_hint_delayed")
+        );
+    }
+
+    #[test]
+    fn independent_metadata_attribute_epochs_do_not_block_older_keys() {
+        let mut runtime = SimulatedRuntime::new(55);
+        runtime.add_client("writer");
+        runtime.add_client("reader");
+        runtime.create_file("reader", "file.txt").unwrap();
+        let logical_id = runtime
+            .entry("reader", "file.txt")
+            .unwrap()
+            .logical_id
+            .clone();
+
+        let attr_a = MetadataBatch::new(
+            "writer",
+            vec![
+                MetadataEvent::new("metadata_attribute_published")
+                    .with_field("path", "file.txt")
+                    .with_field("logical_id", logical_id.clone())
+                    .with_field("name", "user.studiofs.a")
+                    .with_field("value", "a")
+                    .with_field("epoch", "1"),
+            ],
+        );
+        let attr_b = MetadataBatch::new(
+            "writer",
+            vec![
+                MetadataEvent::new("metadata_attribute_published")
+                    .with_field("path", "file.txt")
+                    .with_field("logical_id", logical_id)
+                    .with_field("name", "user.studiofs.b")
+                    .with_field("value", "b")
+                    .with_field("epoch", "2"),
+            ],
+        );
+
+        runtime.apply_batch("reader", &attr_b).unwrap();
+        runtime.apply_batch("reader", &attr_a).unwrap();
+
+        assert_eq!(
+            runtime
+                .read_metadata_attribute("reader", "file.txt", "user.studiofs.a")
+                .unwrap(),
+            Some("a".to_string())
+        );
+        assert_eq!(
+            runtime
+                .read_metadata_attribute("reader", "file.txt", "user.studiofs.b")
+                .unwrap(),
+            Some("b".to_string())
         );
     }
 }

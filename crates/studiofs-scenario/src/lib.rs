@@ -189,6 +189,13 @@ pub enum ScenarioOperation {
         value: String,
     },
     /// Variant $name.
+    PublishMetadataAttribute {
+        /// Field $name.
+        path: String,
+        /// Field $name.
+        name: String,
+    },
+    /// Variant $name.
     GetMetadataAttribute {
         /// Field $name.
         path: String,

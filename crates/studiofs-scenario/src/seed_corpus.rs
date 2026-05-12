@@ -1774,10 +1774,9 @@ fn client_trace_operation(record: &crate::client::ClientTraceRecord) -> Scenario
             name: record.metadata.get("name").cloned().unwrap_or_default(),
             value: record.metadata.get("value").cloned().unwrap_or_default(),
         },
-        "publish_metadata_attribute" => ScenarioOperation::SetMetadataAttribute {
+        "publish_metadata_attribute" => ScenarioOperation::PublishMetadataAttribute {
             path,
             name: record.metadata.get("name").cloned().unwrap_or_default(),
-            value: String::new(),
         },
         "write_sparse_range" => ScenarioOperation::Write {
             path,

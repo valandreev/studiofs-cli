@@ -1,4 +1,5 @@
 //! Crate documentation for lint completion.
+use studiofs_scenario::ScenarioOperation;
 use studiofs_scenario::seed_corpus::{
     SIMULATION_COUNTEREXAMPLE_SCHEMA_VERSION, SimulationCorpusError, SimulationCorpusKind,
     SimulationCorpusOptions, SimulationScenarioGroup, corpus_plan, read_simulation_counterexample,
@@ -286,6 +287,16 @@ fn auxiliary_metadata_corpus_models_symlink_xattr_capability_gates_and_replays_c
             .iter()
             .any(|record| !record.is_simulation_supported())
     );
+    assert!(artifact.operation_log.iter().any(|record| matches!(
+        &record.operation,
+        ScenarioOperation::PublishMetadataAttribute { name, .. }
+            if name == "user.studiofs.label"
+    )));
+    assert!(!artifact.operation_log.iter().any(|record| matches!(
+        &record.operation,
+        ScenarioOperation::SetMetadataAttribute { name, value, .. }
+            if name == "user.studiofs.label" && value.is_empty()
+    )));
     assert!(artifact.final_snapshot.is_some());
 
     let replay =

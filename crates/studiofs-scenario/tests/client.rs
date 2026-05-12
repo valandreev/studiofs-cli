@@ -1,4 +1,5 @@
 //! Crate documentation for lint completion.
+use studiofs_scenario::client::ClientRuntimeError;
 use studiofs_scenario::client::SimulatedRuntime;
 use studiofs_scenario::invariant::validate_logical_invariants;
 
@@ -463,6 +464,110 @@ fn symlink_and_metadata_attributes_converge_through_metadata_delivery() {
 
     let report = validate_logical_invariants(&runtime.logical_snapshot());
     assert!(report.passed, "{:#?}", report.violations);
+}
+
+#[test]
+fn metadata_attributes_survive_file_and_symlink_publish_updates() {
+    let mut runtime = SimulatedRuntime::new(49);
+    runtime.add_client("writer");
+    runtime.add_client("reader");
+
+    runtime.create_file("writer", "file.txt").unwrap();
+    runtime
+        .write_file("writer", "file.txt", 4, "checksum-v1")
+        .unwrap();
+    runtime.flush("writer", "file.txt").unwrap();
+    let upload = runtime.schedule_upload("writer", "file.txt").unwrap();
+    runtime.complete_upload(upload.upload_id).unwrap();
+    runtime.publish_file("writer", "file.txt").unwrap();
+    runtime
+        .set_metadata_attribute("writer", "file.txt", "user.studiofs.label", "kept")
+        .unwrap();
+    runtime
+        .publish_metadata_attribute("writer", "file.txt", "user.studiofs.label")
+        .unwrap();
+    runtime.deliver_all_metadata("reader").unwrap();
+
+    runtime
+        .write_file("writer", "file.txt", 8, "checksum-v2")
+        .unwrap();
+    let upload = runtime.schedule_upload("writer", "file.txt").unwrap();
+    runtime.complete_upload(upload.upload_id).unwrap();
+    runtime.publish_file("writer", "file.txt").unwrap();
+    runtime.deliver_all_metadata("reader").unwrap();
+
+    assert_eq!(
+        runtime
+            .read_metadata_attribute("reader", "file.txt", "user.studiofs.label")
+            .unwrap(),
+        Some("kept".to_string())
+    );
+
+    runtime
+        .create_symlink("writer", "link", "target-a.txt")
+        .unwrap();
+    runtime
+        .set_metadata_attribute("writer", "link", "user.studiofs.label", "link-attr")
+        .unwrap();
+    runtime.publish_symlink("writer", "link").unwrap();
+    runtime
+        .publish_metadata_attribute("writer", "link", "user.studiofs.label")
+        .unwrap();
+    runtime.deliver_all_metadata("reader").unwrap();
+
+    runtime
+        .set_symlink_target("writer", "link", "target-b.txt")
+        .unwrap();
+    runtime.publish_symlink("writer", "link").unwrap();
+    runtime.deliver_all_metadata("reader").unwrap();
+
+    assert_eq!(
+        runtime
+            .read_metadata_attribute("reader", "link", "user.studiofs.label")
+            .unwrap(),
+        Some("link-attr".to_string())
+    );
+}
+
+#[test]
+fn file_publish_moves_logical_id_instead_of_leaving_old_path_alias() {
+    let mut runtime = SimulatedRuntime::new(51);
+    runtime.add_client("writer");
+    runtime.add_client("reader");
+
+    runtime.create_file("writer", "old.txt").unwrap();
+    runtime
+        .write_file("writer", "old.txt", 4, "checksum-v1")
+        .unwrap();
+    runtime.flush("writer", "old.txt").unwrap();
+    let upload = runtime.schedule_upload("writer", "old.txt").unwrap();
+    runtime.complete_upload(upload.upload_id).unwrap();
+    runtime.publish_file("writer", "old.txt").unwrap();
+    runtime.deliver_all_metadata("reader").unwrap();
+
+    runtime.rename("writer", "old.txt", "new.txt").unwrap();
+    runtime.publish_file("writer", "new.txt").unwrap();
+    runtime.deliver_all_metadata("reader").unwrap();
+
+    assert!(runtime.read_file("reader", "old.txt").is_err());
+    assert!(runtime.read_file("reader", "new.txt").is_ok());
+    let report = validate_logical_invariants(&runtime.logical_snapshot());
+    assert!(report.passed, "{:#?}", report.violations);
+}
+
+#[test]
+fn auxiliary_metadata_mutations_reject_invalid_paths_before_lookup() {
+    let mut runtime = SimulatedRuntime::new(53);
+    runtime.add_client("writer");
+
+    assert!(matches!(
+        runtime.set_symlink_target("writer", "../escape", "target.txt"),
+        Err(ClientRuntimeError::InvalidPath { .. })
+    ));
+    assert!(matches!(
+        runtime.set_metadata_attribute("writer", "../escape", "user.studiofs.label", "value"),
+        Err(ClientRuntimeError::InvalidPath { .. })
+    ));
 }
 
 fn directory_logical_id(runtime: &SimulatedRuntime, path: &str) -> String {
