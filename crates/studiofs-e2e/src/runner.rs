@@ -246,6 +246,7 @@ pub fn run_with_executor(
     });
     write_pretty_json(&sandbox.join("run.json"), &manifest)?;
     write_runner_marker(&sandbox, &run_id)?;
+    write_runner_cleanup_boundary(&sandbox, &manifest)?;
     write_log_files(&sandbox)?;
 
     emit_progress(
@@ -339,7 +340,67 @@ pub fn run_with_executor(
     write_pretty_json(&sandbox.join("preflight.json"), &preflight)?;
 
     let events_path = sandbox.join("events.ndjson");
-    record_event(&events_path, &run_id, None, "run", "started")?;
+    if let Err(primary_error) = record_event(&events_path, &run_id, None, "run", "started") {
+        let primary_error_detail = primary_error.to_string();
+        write_runner_failure_boundary(
+            &sandbox,
+            "post-preflight",
+            Some(&events_path),
+            &primary_error_detail,
+        )?;
+        let mut cleanup_actions = Vec::new();
+        let mut cleanup_errors = Vec::new();
+        emit_progress(&run_id, "runner", None, "cleanup", ProgressStatus::Started);
+        compose_cleanup_guard.collect_into(&mut cleanup_actions, &mut cleanup_errors);
+        let cleanup = CleanupReport {
+            status: if cleanup_errors.is_empty() {
+                RunStatus::Passed
+            } else {
+                RunStatus::CleanupFailed
+            },
+            actions: cleanup_actions,
+            errors: cleanup_errors,
+        };
+        write_pretty_json(&sandbox.join("cleanup.json"), &cleanup)?;
+        emit_progress(
+            &run_id,
+            "runner",
+            None,
+            "cleanup",
+            if cleanup.status == RunStatus::Passed {
+                ProgressStatus::Passed
+            } else {
+                ProgressStatus::Failed
+            },
+        );
+        finish_run(FinishRunInput {
+            run_id: run_id.clone(),
+            seed: request.seed,
+            status: RunStatus::Failed,
+            exit_code: 1,
+            started_at,
+            duration_ms: duration_millis(started_instant),
+            selected_platform,
+            sandbox: sandbox.clone(),
+            retention: request.retention,
+            report_copy: request.report,
+            environment: build_environment_report(EnvironmentInput {
+                run_id: &run_id,
+                scenarios: &scenario_names,
+                seed: request.seed,
+                sandbox: &sandbox,
+                studiofs_bin: request.studiofs_bin.as_deref(),
+                compose_stack: compose_stack.as_ref(),
+                compose_project: compose_project.as_deref(),
+                allocated_ports,
+            }),
+            preflight,
+            scenario_reports: Vec::new(),
+            scenario_outcomes: Vec::new(),
+            cleanup,
+        })?;
+        return Err(primary_error);
+    }
 
     let mut scenario_reports = Vec::new();
     let mut scenario_outcomes = Vec::new();
@@ -1646,6 +1707,40 @@ fn write_runner_marker(sandbox: &Path, run_id: &str) -> Result<(), RunnerError> 
     )
 }
 
+fn write_runner_cleanup_boundary(
+    sandbox: &Path,
+    manifest: &RunManifest,
+) -> Result<(), RunnerError> {
+    write_pretty_json(
+        &sandbox.join("artifacts/runner/cleanup-boundary.json"),
+        &serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "run_id": &manifest.run_id,
+            "sandbox": &manifest.sandbox,
+            "cleanup_allowlist": &manifest.cleanup_allowlist,
+            "explicit_client_roots": &manifest.explicit_client_roots,
+            "compose_project": &manifest.compose_project,
+        }),
+    )
+}
+
+fn write_runner_failure_boundary(
+    sandbox: &Path,
+    phase: &str,
+    event_log: Option<&Path>,
+    primary_error: &str,
+) -> Result<(), RunnerError> {
+    write_pretty_json(
+        &sandbox.join("artifacts/runner/failure-boundary.json"),
+        &serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "phase": phase,
+            "event_log": event_log.map(|path| path.display().to_string()),
+            "primary_error": primary_error,
+        }),
+    )
+}
+
 fn is_runner_owned_sandbox(path: &Path) -> Result<bool, RunnerError> {
     let manifest = path.join("run.json");
     let marker = path.join(RUNNER_MARKER_FILE);
@@ -2307,16 +2402,173 @@ mod tests {
         );
     }
 
+    #[test]
+    fn compose_start_failure_records_cleanup_boundary_artifact() {
+        let temp = tempfile::tempdir().unwrap();
+        let executor = RecordingExecutor {
+            fail_up: Cell::new(true),
+            ..RecordingExecutor::default()
+        };
+
+        let outcome = run_with_executor(
+            RunRequest {
+                root: temp.path().join("e2e-runs"),
+                run_id: Some("compose-partial-launch-failure".to_string()),
+                scenarios: vec![scenario::TEST_PASSING.to_string()],
+                seed: 400,
+                studiofs_bin: None,
+                platform: PlatformSelection::Auto,
+                retention: RetentionPolicy::Always,
+                report: None,
+                port_range: Some("33300-33310".to_string()),
+                timeout: None,
+                infra: InfraMode::Compose,
+            },
+            &executor,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.status, RunStatus::PreflightFailed);
+        assert_eq!(outcome.exit_code, 2);
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&outcome.report_path).unwrap()).unwrap();
+        assert!(
+            report["artifacts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|artifact| artifact["path"] == "artifacts/runner/cleanup-boundary.json"),
+            "cleanup boundary artifact should be discoverable from report.json"
+        );
+
+        let boundary: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                outcome
+                    .sandbox
+                    .join("artifacts/runner/cleanup-boundary.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(boundary["run_id"], "compose-partial-launch-failure");
+        assert_eq!(
+            boundary["compose_project"],
+            "studiofs-e2e-compose-partial-launch-failure"
+        );
+        let allowlist = boundary["cleanup_allowlist"].as_array().unwrap();
+        assert!(allowlist.iter().all(|path| {
+            path.as_str()
+                .unwrap()
+                .starts_with(outcome.sandbox.to_str().unwrap())
+        }));
+        assert_eq!(
+            boundary["explicit_client_roots"].as_array().unwrap().len(),
+            4
+        );
+
+        let calls = executor.calls.borrow();
+        let up_index = calls
+            .iter()
+            .position(|call| call.args.contains(&"up".to_string()))
+            .unwrap();
+        let logs_index = calls
+            .iter()
+            .position(|call| call.args.contains(&"logs".to_string()))
+            .unwrap();
+        let down_index = calls
+            .iter()
+            .position(|call| call.args.contains(&"down".to_string()))
+            .unwrap();
+        assert!(up_index < logs_index);
+        assert!(logs_index < down_index);
+    }
+
+    #[test]
+    fn post_start_runner_failure_writes_best_effort_report() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("e2e-runs");
+        let run_id = "post-start-best-effort-report";
+        let sandbox = root.join(run_id);
+        let executor = RecordingExecutor {
+            poison_events_path_after_up: RefCell::new(Some(sandbox.join("events.ndjson"))),
+            ..RecordingExecutor::default()
+        };
+
+        let err = run_with_executor(
+            RunRequest {
+                root,
+                run_id: Some(run_id.to_string()),
+                scenarios: vec![scenario::TEST_PASSING.to_string()],
+                seed: 400,
+                studiofs_bin: None,
+                platform: PlatformSelection::Auto,
+                retention: RetentionPolicy::Always,
+                report: None,
+                port_range: Some("33400-33410".to_string()),
+                timeout: None,
+                infra: InfraMode::Compose,
+            },
+            &executor,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, RunnerError::Io(_)));
+        let report_path = sandbox.join("report.json");
+        assert!(
+            report_path.exists(),
+            "post-start failure must preserve report.json"
+        );
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
+        assert_eq!(report["status"], "failed");
+        assert_eq!(report["exit_code"], 1);
+        assert_eq!(report["cleanup"]["status"], "passed");
+        assert!(
+            report["cleanup"]["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|action| action == "docker compose down --volumes --remove-orphans")
+        );
+        assert!(
+            report["artifacts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|artifact| artifact["path"] == "artifacts/runner/failure-boundary.json")
+        );
+        let failure: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(sandbox.join("artifacts/runner/failure-boundary.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(failure["phase"], "post-preflight");
+        assert!(
+            failure["event_log"]
+                .as_str()
+                .unwrap()
+                .contains("events.ndjson")
+        );
+        assert!(!failure["primary_error"].as_str().unwrap().is_empty());
+    }
+
     #[derive(Default)]
     struct RecordingExecutor {
         calls: RefCell<Vec<crate::infra::CommandSpec>>,
         poison_events_path_after_up: RefCell<Option<PathBuf>>,
+        fail_up: Cell<bool>,
     }
 
     impl CommandExecutor for RecordingExecutor {
         fn run(&self, command: &crate::infra::CommandSpec) -> std::io::Result<CommandOutput> {
             self.calls.borrow_mut().push(command.clone());
             if command.args.contains(&"up".to_string()) {
+                if self.fail_up.get() {
+                    return Ok(CommandOutput {
+                        status: 1,
+                        stdout: String::new(),
+                        stderr: "compose helper launch failed".to_string(),
+                    });
+                }
                 if let Some(events_path) = self.poison_events_path_after_up.borrow_mut().take() {
                     std::fs::create_dir_all(events_path)?;
                 }
