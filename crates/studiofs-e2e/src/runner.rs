@@ -285,55 +285,25 @@ pub fn run_with_executor(
     );
     if preflight.status == RunStatus::PreflightFailed {
         write_pretty_json(&sandbox.join("preflight.json"), &preflight)?;
-        let mut cleanup_actions = Vec::new();
-        let mut cleanup_errors = Vec::new();
-        emit_progress(&run_id, "runner", None, "cleanup", ProgressStatus::Started);
-        compose_cleanup_guard.collect_into(&mut cleanup_actions, &mut cleanup_errors);
-        let cleanup = CleanupReport {
-            status: if cleanup_errors.is_empty() {
-                RunStatus::Passed
-            } else {
-                RunStatus::CleanupFailed
-            },
-            actions: cleanup_actions,
-            errors: cleanup_errors,
-        };
-        write_pretty_json(&sandbox.join("cleanup.json"), &cleanup)?;
-        emit_progress(
-            &run_id,
-            "runner",
-            None,
-            "cleanup",
-            if cleanup.status == RunStatus::Passed {
-                ProgressStatus::Passed
-            } else {
-                ProgressStatus::Failed
-            },
-        );
-        return finish_run(FinishRunInput {
-            run_id: run_id.clone(),
+        let cleanup =
+            run_runner_cleanup(&run_id, &sandbox, &mut compose_cleanup_guard, Vec::new())?;
+        return finish_runner_early_failure(EarlyRunnerFailureInput {
+            run_id: &run_id,
             seed: request.seed,
             status: RunStatus::PreflightFailed,
             exit_code: 2,
-            started_at,
+            started_at: &started_at,
             duration_ms: duration_millis(started_instant),
-            selected_platform,
-            sandbox: sandbox.clone(),
+            selected_platform: &selected_platform,
+            sandbox: &sandbox,
             retention: request.retention,
             report_copy: request.report,
-            environment: build_environment_report(EnvironmentInput {
-                run_id: &run_id,
-                scenarios: &scenario_names,
-                seed: request.seed,
-                sandbox: &sandbox,
-                studiofs_bin: request.studiofs_bin.as_deref(),
-                compose_stack: compose_stack.as_ref(),
-                compose_project: compose_project.as_deref(),
-                allocated_ports: allocated_ports.clone(),
-            }),
+            scenarios: &scenario_names,
+            studiofs_bin: request.studiofs_bin.as_deref(),
+            compose_stack: compose_stack.as_ref(),
+            compose_project: compose_project.as_deref(),
+            allocated_ports: allocated_ports.clone(),
             preflight,
-            scenario_reports: Vec::new(),
-            scenario_outcomes: Vec::new(),
             cleanup,
         });
     }
@@ -348,55 +318,25 @@ pub fn run_with_executor(
             Some(&events_path),
             &primary_error_detail,
         )?;
-        let mut cleanup_actions = Vec::new();
-        let mut cleanup_errors = Vec::new();
-        emit_progress(&run_id, "runner", None, "cleanup", ProgressStatus::Started);
-        compose_cleanup_guard.collect_into(&mut cleanup_actions, &mut cleanup_errors);
-        let cleanup = CleanupReport {
-            status: if cleanup_errors.is_empty() {
-                RunStatus::Passed
-            } else {
-                RunStatus::CleanupFailed
-            },
-            actions: cleanup_actions,
-            errors: cleanup_errors,
-        };
-        write_pretty_json(&sandbox.join("cleanup.json"), &cleanup)?;
-        emit_progress(
-            &run_id,
-            "runner",
-            None,
-            "cleanup",
-            if cleanup.status == RunStatus::Passed {
-                ProgressStatus::Passed
-            } else {
-                ProgressStatus::Failed
-            },
-        );
-        finish_run(FinishRunInput {
-            run_id: run_id.clone(),
+        let cleanup =
+            run_runner_cleanup(&run_id, &sandbox, &mut compose_cleanup_guard, Vec::new())?;
+        finish_runner_early_failure(EarlyRunnerFailureInput {
+            run_id: &run_id,
             seed: request.seed,
             status: RunStatus::Failed,
             exit_code: 1,
-            started_at,
+            started_at: &started_at,
             duration_ms: duration_millis(started_instant),
-            selected_platform,
-            sandbox: sandbox.clone(),
+            selected_platform: &selected_platform,
+            sandbox: &sandbox,
             retention: request.retention,
             report_copy: request.report,
-            environment: build_environment_report(EnvironmentInput {
-                run_id: &run_id,
-                scenarios: &scenario_names,
-                seed: request.seed,
-                sandbox: &sandbox,
-                studiofs_bin: request.studiofs_bin.as_deref(),
-                compose_stack: compose_stack.as_ref(),
-                compose_project: compose_project.as_deref(),
-                allocated_ports,
-            }),
+            scenarios: &scenario_names,
+            studiofs_bin: request.studiofs_bin.as_deref(),
+            compose_stack: compose_stack.as_ref(),
+            compose_project: compose_project.as_deref(),
+            allocated_ports: allocated_ports.clone(),
             preflight,
-            scenario_reports: Vec::new(),
-            scenario_outcomes: Vec::new(),
             cleanup,
         })?;
         return Err(primary_error);
@@ -468,31 +408,12 @@ pub fn run_with_executor(
     }
 
     record_event(&events_path, &run_id, None, "run", "finished")?;
-    let mut cleanup_actions = Vec::new();
-    emit_progress(&run_id, "runner", None, "cleanup", ProgressStatus::Started);
-    compose_cleanup_guard.collect_into(&mut cleanup_actions, &mut cleanup_errors);
-
-    let cleanup = CleanupReport {
-        status: if cleanup_errors.is_empty() {
-            RunStatus::Passed
-        } else {
-            RunStatus::CleanupFailed
-        },
-        actions: cleanup_actions,
-        errors: cleanup_errors,
-    };
-    write_pretty_json(&sandbox.join("cleanup.json"), &cleanup)?;
-    emit_progress(
+    let cleanup = run_runner_cleanup(
         &run_id,
-        "runner",
-        None,
-        "cleanup",
-        if cleanup.status == RunStatus::Passed {
-            ProgressStatus::Passed
-        } else {
-            ProgressStatus::Failed
-        },
-    );
+        &sandbox,
+        &mut compose_cleanup_guard,
+        cleanup_errors,
+    )?;
 
     let scenario_failed = scenario_outcomes
         .iter()
@@ -574,6 +495,90 @@ impl Drop for ComposeCleanupGuard<'_> {
             );
         }
     }
+}
+
+fn run_runner_cleanup(
+    run_id: &str,
+    sandbox: &Path,
+    compose_cleanup_guard: &mut ComposeCleanupGuard<'_>,
+    mut cleanup_errors: Vec<String>,
+) -> Result<CleanupReport, RunnerError> {
+    let mut cleanup_actions = Vec::new();
+    emit_progress(run_id, "runner", None, "cleanup", ProgressStatus::Started);
+    compose_cleanup_guard.collect_into(&mut cleanup_actions, &mut cleanup_errors);
+    let cleanup = CleanupReport {
+        status: if cleanup_errors.is_empty() {
+            RunStatus::Passed
+        } else {
+            RunStatus::CleanupFailed
+        },
+        actions: cleanup_actions,
+        errors: cleanup_errors,
+    };
+    write_pretty_json(&sandbox.join("cleanup.json"), &cleanup)?;
+    emit_progress(
+        run_id,
+        "runner",
+        None,
+        "cleanup",
+        if cleanup.status == RunStatus::Passed {
+            ProgressStatus::Passed
+        } else {
+            ProgressStatus::Failed
+        },
+    );
+    Ok(cleanup)
+}
+
+struct EarlyRunnerFailureInput<'a> {
+    run_id: &'a str,
+    seed: u64,
+    status: RunStatus,
+    exit_code: i32,
+    started_at: &'a str,
+    duration_ms: u64,
+    selected_platform: &'a str,
+    sandbox: &'a Path,
+    retention: RetentionPolicy,
+    report_copy: Option<PathBuf>,
+    scenarios: &'a [String],
+    studiofs_bin: Option<&'a Path>,
+    compose_stack: Option<&'a DockerComposeStack>,
+    compose_project: Option<&'a str>,
+    allocated_ports: Vec<crate::infra::ServicePort>,
+    preflight: PreflightReport,
+    cleanup: CleanupReport,
+}
+
+fn finish_runner_early_failure(
+    input: EarlyRunnerFailureInput<'_>,
+) -> Result<RunOutcome, RunnerError> {
+    finish_run(FinishRunInput {
+        run_id: input.run_id.to_string(),
+        seed: input.seed,
+        status: input.status,
+        exit_code: input.exit_code,
+        started_at: input.started_at.to_string(),
+        duration_ms: input.duration_ms,
+        selected_platform: input.selected_platform.to_string(),
+        sandbox: input.sandbox.to_path_buf(),
+        retention: input.retention,
+        report_copy: input.report_copy,
+        environment: build_environment_report(EnvironmentInput {
+            run_id: input.run_id,
+            scenarios: input.scenarios,
+            seed: input.seed,
+            sandbox: input.sandbox,
+            studiofs_bin: input.studiofs_bin,
+            compose_stack: input.compose_stack,
+            compose_project: input.compose_project,
+            allocated_ports: input.allocated_ports,
+        }),
+        preflight: input.preflight,
+        scenario_reports: Vec::new(),
+        scenario_outcomes: Vec::new(),
+        cleanup: input.cleanup,
+    })
 }
 
 struct FinishRunInput {
@@ -1037,6 +1042,7 @@ fn stale_process_cleanup_command(root: &Path, platform: PlatformSelection) -> Op
             ),
         ],
         cwd: None,
+        timeout: Some(Duration::from_secs(30)),
     })
 }
 
@@ -1715,6 +1721,9 @@ fn write_runner_cleanup_boundary(
         &sandbox.join("artifacts/runner/cleanup-boundary.json"),
         &serde_json::json!({
             "schema_version": SCHEMA_VERSION,
+            "artifact": "cleanup-boundary",
+            "source_manifest": "run.json",
+            "purpose": "runner-owned cleanup allowlist and failure-boundary context",
             "run_id": &manifest.run_id,
             "sandbox": &manifest.sandbox,
             "cleanup_allowlist": &manifest.cleanup_allowlist,
@@ -2403,8 +2412,9 @@ mod tests {
     }
 
     #[test]
-    fn compose_start_failure_records_cleanup_boundary_artifact() {
-        let temp = tempfile::tempdir().unwrap();
+    fn compose_start_failure_records_cleanup_boundary_artifact()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
         let executor = RecordingExecutor {
             fail_up: Cell::new(true),
             ..RecordingExecutor::default()
@@ -2425,13 +2435,12 @@ mod tests {
                 infra: InfraMode::Compose,
             },
             &executor,
-        )
-        .unwrap();
+        )?;
 
         assert_eq!(outcome.status, RunStatus::PreflightFailed);
         assert_eq!(outcome.exit_code, 2);
         let report: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&outcome.report_path).unwrap()).unwrap();
+            serde_json::from_slice(&std::fs::read(&outcome.report_path)?)?;
         assert!(
             report["artifacts"]
                 .as_array()
@@ -2441,16 +2450,14 @@ mod tests {
             "cleanup boundary artifact should be discoverable from report.json"
         );
 
-        let boundary: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(
-                outcome
-                    .sandbox
-                    .join("artifacts/runner/cleanup-boundary.json"),
-            )
-            .unwrap(),
-        )
-        .unwrap();
+        let boundary: serde_json::Value = serde_json::from_slice(&std::fs::read(
+            outcome
+                .sandbox
+                .join("artifacts/runner/cleanup-boundary.json"),
+        )?)?;
         assert_eq!(boundary["run_id"], "compose-partial-launch-failure");
+        assert_eq!(boundary["source_manifest"], "run.json");
+        assert!(boundary["purpose"].as_str().unwrap().contains("cleanup"));
         assert_eq!(
             boundary["compose_project"],
             "studiofs-e2e-compose-partial-launch-failure"
@@ -2481,11 +2488,13 @@ mod tests {
             .unwrap();
         assert!(up_index < logs_index);
         assert!(logs_index < down_index);
+        Ok(())
     }
 
     #[test]
-    fn post_start_runner_failure_writes_best_effort_report() {
-        let temp = tempfile::tempdir().unwrap();
+    fn post_start_runner_failure_writes_best_effort_report()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
         let root = temp.path().join("e2e-runs");
         let run_id = "post-start-best-effort-report";
         let sandbox = root.join(run_id);
@@ -2510,7 +2519,7 @@ mod tests {
             },
             &executor,
         )
-        .unwrap_err();
+        .expect_err("post-start I/O failure should be returned");
 
         assert!(matches!(err, RunnerError::Io(_)));
         let report_path = sandbox.join("report.json");
@@ -2518,8 +2527,7 @@ mod tests {
             report_path.exists(),
             "post-start failure must preserve report.json"
         );
-        let report: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&std::fs::read(report_path)?)?;
         assert_eq!(report["status"], "failed");
         assert_eq!(report["exit_code"], 1);
         assert_eq!(report["cleanup"]["status"], "passed");
@@ -2537,10 +2545,9 @@ mod tests {
                 .iter()
                 .any(|artifact| artifact["path"] == "artifacts/runner/failure-boundary.json")
         );
-        let failure: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(sandbox.join("artifacts/runner/failure-boundary.json")).unwrap(),
-        )
-        .unwrap();
+        let failure: serde_json::Value = serde_json::from_slice(&std::fs::read(
+            sandbox.join("artifacts/runner/failure-boundary.json"),
+        )?)?;
         assert_eq!(failure["phase"], "post-preflight");
         assert!(
             failure["event_log"]
@@ -2549,6 +2556,7 @@ mod tests {
                 .contains("events.ndjson")
         );
         assert!(!failure["primary_error"].as_str().unwrap().is_empty());
+        Ok(())
     }
 
     #[derive(Default)]

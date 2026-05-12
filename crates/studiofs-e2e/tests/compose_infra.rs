@@ -248,6 +248,12 @@ fn compose_stack_lifecycle_collects_logs_and_tears_down_volumes() {
     assert!(calls.iter().any(|call| {
         call.args.contains(&"down".to_string()) && call.args.contains(&"--volumes".to_string())
     }));
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.args.contains(&"down".to_string()) && call.timeout.is_some()),
+        "compose cleanup must be bounded so a hung docker compose down cannot hang the runner"
+    );
     assert!(calls.iter().any(|call| {
         call.args.contains(&"exec".to_string())
             && call.args.contains(&"-T".to_string())

@@ -4,6 +4,8 @@ use std::fs;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
@@ -14,6 +16,8 @@ const DEFAULT_POSTGRES_PORT: u16 = 25_432;
 const DEFAULT_RUSTFS_PORT: u16 = 29_000;
 const DEFAULT_RUSTFS_CONSOLE_PORT: u16 = 29_001;
 const DEFAULT_TOXIPROXY_API_PORT: u16 = 28_474;
+const COMPOSE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
+const COMPOSE_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub const POSTGRES_SERVICE_NAME: &str = "postgres";
 pub const RUSTFS_SERVICE_NAME: &str = "rustfs";
@@ -104,6 +108,7 @@ pub struct CommandSpec {
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
     pub cwd: Option<PathBuf>,
+    pub timeout: Option<Duration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,12 +139,44 @@ impl CommandExecutor for SystemCommandExecutor {
         if let Some(cwd) = &command.cwd {
             process.current_dir(cwd);
         }
+        if let Some(timeout) = command.timeout {
+            process.stdout(Stdio::piped());
+            process.stderr(Stdio::piped());
+            return run_command_with_timeout(process, timeout);
+        }
         let output = process.output()?;
         Ok(CommandOutput {
             status: output.status.code().unwrap_or(-1),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         })
+    }
+}
+
+fn run_command_with_timeout(
+    mut command: Command,
+    timeout: Duration,
+) -> std::io::Result<CommandOutput> {
+    let mut child = command.spawn()?;
+    let started = Instant::now();
+    loop {
+        if child.try_wait()?.is_some() {
+            let output = child.wait_with_output()?;
+            return Ok(CommandOutput {
+                status: output.status.code().unwrap_or(-1),
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            });
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait_with_output();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("command timed out after {} ms", timeout.as_millis()),
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -242,6 +279,7 @@ impl DockerComposeStack {
                 ],
                 env: Vec::new(),
                 cwd: None,
+                timeout: Some(COMPOSE_DIAGNOSTIC_TIMEOUT),
             },
         ));
         checks.push(self.command_check(
@@ -252,6 +290,7 @@ impl DockerComposeStack {
                 args: vec!["compose".to_string(), "version".to_string()],
                 env: Vec::new(),
                 cwd: None,
+                timeout: Some(COMPOSE_DIAGNOSTIC_TIMEOUT),
             },
         ));
         checks.extend(self.ports.iter().map(port_check));
@@ -358,6 +397,7 @@ impl DockerComposeStack {
     pub fn collect_logs(&self, executor: &dyn CommandExecutor) -> Result<PathBuf, InfraError> {
         fs::create_dir_all(self.docker_artifact_dir())?;
         let mut command = self.compose_command();
+        command.timeout = Some(COMPOSE_CLEANUP_TIMEOUT);
         command.args.extend([
             "logs".to_string(),
             "--no-color".to_string(),
@@ -421,6 +461,7 @@ impl DockerComposeStack {
 
     pub fn teardown(&self, executor: &dyn CommandExecutor) -> Result<(), InfraError> {
         let mut command = self.compose_command();
+        command.timeout = Some(COMPOSE_CLEANUP_TIMEOUT);
         command.args.extend([
             "down".to_string(),
             "--volumes".to_string(),
@@ -444,6 +485,7 @@ impl DockerComposeStack {
         status_file: &str,
     ) -> Result<bool, InfraError> {
         let mut command = self.compose_command();
+        command.timeout = Some(COMPOSE_DIAGNOSTIC_TIMEOUT);
         command
             .args
             .extend(args.iter().map(|arg| (*arg).to_string()));
@@ -628,6 +670,7 @@ impl ComposeServiceControl {
             ],
             env: self.env.clone(),
             cwd: self.compose_file.parent().map(Path::to_path_buf),
+            timeout: None,
         }
     }
 }
@@ -762,4 +805,50 @@ fn default_compose_file() -> PathBuf {
         }
     }
     PathBuf::from(COMPOSE_FILE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn system_command_executor_returns_timed_out_for_hung_command() {
+        let command = hung_command(Duration::from_millis(50));
+        let started = Instant::now();
+
+        let err = SystemCommandExecutor.run(&command).unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "timeout-aware executor should not wait for the hung command to finish"
+        );
+    }
+
+    #[cfg(windows)]
+    fn hung_command(timeout: Duration) -> CommandSpec {
+        CommandSpec {
+            program: "powershell".to_string(),
+            args: vec![
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                "Start-Sleep -Seconds 5".to_string(),
+            ],
+            env: Vec::new(),
+            cwd: None,
+            timeout: Some(timeout),
+        }
+    }
+
+    #[cfg(unix)]
+    fn hung_command(timeout: Duration) -> CommandSpec {
+        CommandSpec {
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), "sleep 5".to_string()],
+            env: Vec::new(),
+            cwd: None,
+            timeout: Some(timeout),
+        }
+    }
 }
