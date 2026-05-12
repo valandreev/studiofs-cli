@@ -91,6 +91,145 @@ impl SimulatedRuntime {
         Ok(())
     }
 
+    /// Creates a symlink in one simulated client's local logical state.
+    pub fn create_symlink(
+        &mut self,
+        client: &str,
+        path: &str,
+        target: &str,
+    ) -> Result<(), ClientRuntimeError> {
+        validate_mutation_path(client, path)?;
+        if target.is_empty() {
+            return Err(ClientRuntimeError::InvalidSymlinkTarget {
+                client: client.to_string(),
+                path: path.to_string(),
+            });
+        }
+        self.ensure_client(client)?;
+        self.ensure_parent_dirs(client, path)?;
+        if self.client(client)?.entries.contains_key(path) {
+            return Err(ClientRuntimeError::PathExists {
+                client: client.to_string(),
+                path: path.to_string(),
+            });
+        }
+        let logical_id = self.next_file_logical_id();
+        self.client_mut(client)?.entries.insert(
+            path.to_string(),
+            LocalEntry::symlink(logical_id, target.to_string(), 0),
+        );
+        self.record_with_metadata(
+            client,
+            "create_symlink",
+            Some(path),
+            [("target".to_string(), target.to_string())],
+        );
+        self.schedule_client_event(client, "create_symlink");
+        Ok(())
+    }
+
+    /// Replaces the symlink target in local logical state.
+    pub fn set_symlink_target(
+        &mut self,
+        client: &str,
+        path: &str,
+        target: &str,
+    ) -> Result<(), ClientRuntimeError> {
+        if target.is_empty() {
+            return Err(ClientRuntimeError::InvalidSymlinkTarget {
+                client: client.to_string(),
+                path: path.to_string(),
+            });
+        }
+        let next_epoch = self
+            .entry(client, path)?
+            .epoch
+            .checked_add(1)
+            .expect("simulated symlink epoch overflowed");
+        let entry = self.entry_mut(client, path)?;
+        if entry.kind != LocalEntryKind::Symlink {
+            return Err(ClientRuntimeError::NotSymlink {
+                client: client.to_string(),
+                path: path.to_string(),
+            });
+        }
+        entry.symlink_target = Some(target.to_string());
+        entry.epoch = next_epoch;
+        self.record_with_metadata(
+            client,
+            "set_symlink_target",
+            Some(path),
+            [("target".to_string(), target.to_string())],
+        );
+        self.schedule_client_event(client, "set_symlink_target");
+        Ok(())
+    }
+
+    /// Reads the current symlink target from one simulated client.
+    pub fn read_symlink(&self, client: &str, path: &str) -> Result<String, ClientRuntimeError> {
+        let entry = self.entry(client, path)?;
+        if entry.kind != LocalEntryKind::Symlink {
+            return Err(ClientRuntimeError::NotSymlink {
+                client: client.to_string(),
+                path: path.to_string(),
+            });
+        }
+        entry
+            .symlink_target
+            .clone()
+            .ok_or_else(|| ClientRuntimeError::MissingSymlinkTarget {
+                client: client.to_string(),
+                path: path.to_string(),
+            })
+    }
+
+    /// Sets a supported logical metadata attribute on an entry.
+    pub fn set_metadata_attribute(
+        &mut self,
+        client: &str,
+        path: &str,
+        name: &str,
+        value: &str,
+    ) -> Result<(), ClientRuntimeError> {
+        validate_supported_metadata_attribute(name)?;
+        let next_epoch = self
+            .entry(client, path)?
+            .epoch
+            .checked_add(1)
+            .expect("simulated metadata attribute epoch overflowed");
+        let entry = self.entry_mut(client, path)?;
+        entry
+            .metadata_attributes
+            .insert(name.to_string(), value.to_string());
+        entry.epoch = next_epoch;
+        self.record_with_metadata(
+            client,
+            "set_metadata_attribute",
+            Some(path),
+            [
+                ("name".to_string(), name.to_string()),
+                ("value".to_string(), value.to_string()),
+            ],
+        );
+        self.schedule_client_event(client, "set_metadata_attribute");
+        Ok(())
+    }
+
+    /// Reads a supported logical metadata attribute from an entry.
+    pub fn read_metadata_attribute(
+        &self,
+        client: &str,
+        path: &str,
+        name: &str,
+    ) -> Result<Option<String>, ClientRuntimeError> {
+        validate_supported_metadata_attribute(name)?;
+        Ok(self
+            .entry(client, path)?
+            .metadata_attributes
+            .get(name)
+            .cloned())
+    }
+
     /// Function $name.
     pub fn write_file(
         &mut self,
@@ -304,7 +443,7 @@ impl SimulatedRuntime {
     /// Function $name.
     pub fn unlink(&mut self, client: &str, path: &str) -> Result<(), ClientRuntimeError> {
         let entry = self.entry(client, path)?;
-        if entry.kind != LocalEntryKind::File {
+        if entry.kind == LocalEntryKind::Directory {
             return Err(ClientRuntimeError::NotFile {
                 client: client.to_string(),
                 path: path.to_string(),
@@ -327,7 +466,7 @@ impl SimulatedRuntime {
     /// Unlinks a file and publishes a deletion event to the metadata bus.
     pub fn publish_unlink(&mut self, client: &str, path: &str) -> Result<(), ClientRuntimeError> {
         let entry = self.entry(client, path)?;
-        if entry.kind != LocalEntryKind::File {
+        if entry.kind == LocalEntryKind::Directory {
             return Err(ClientRuntimeError::NotFile {
                 client: client.to_string(),
                 path: path.to_string(),
@@ -653,6 +792,77 @@ impl SimulatedRuntime {
         Ok(())
     }
 
+    /// Publishes the current symlink target to the simulated metadata bus.
+    pub fn publish_symlink(&mut self, client: &str, path: &str) -> Result<(), ClientRuntimeError> {
+        let entry = self.entry(client, path)?;
+        if entry.kind != LocalEntryKind::Symlink {
+            return Err(ClientRuntimeError::NotSymlink {
+                client: client.to_string(),
+                path: path.to_string(),
+            });
+        }
+        let target = entry.symlink_target.clone().ok_or_else(|| {
+            ClientRuntimeError::MissingSymlinkTarget {
+                client: client.to_string(),
+                path: path.to_string(),
+            }
+        })?;
+        let event = MetadataEvent::new("symlink_published")
+            .with_field("path", path)
+            .with_field("logical_id", entry.logical_id.clone())
+            .with_field("target", target)
+            .with_field("epoch", entry.epoch.to_string());
+        self.metadata_bus
+            .enqueue_local(MetadataBatch::new(client, vec![event]));
+        self.record(client, "publish_symlink", Some(path));
+        self.scheduler.schedule_now(
+            ScheduledEvent::new(SchedulerEventType::PublishAttempt)
+                .with_client(client)
+                .with_description(path),
+        );
+        Ok(())
+    }
+
+    /// Publishes one supported metadata attribute to the simulated metadata bus.
+    pub fn publish_metadata_attribute(
+        &mut self,
+        client: &str,
+        path: &str,
+        name: &str,
+    ) -> Result<(), ClientRuntimeError> {
+        validate_supported_metadata_attribute(name)?;
+        let entry = self.entry(client, path)?;
+        let value = entry
+            .metadata_attributes
+            .get(name)
+            .cloned()
+            .ok_or_else(|| ClientRuntimeError::MissingMetadataAttribute {
+                client: client.to_string(),
+                path: path.to_string(),
+                name: name.to_string(),
+            })?;
+        let event = MetadataEvent::new("metadata_attribute_published")
+            .with_field("path", path)
+            .with_field("logical_id", entry.logical_id.clone())
+            .with_field("name", name)
+            .with_field("value", value)
+            .with_field("epoch", entry.epoch.to_string());
+        self.metadata_bus
+            .enqueue_local(MetadataBatch::new(client, vec![event]));
+        self.record_with_metadata(
+            client,
+            "publish_metadata_attribute",
+            Some(path),
+            [("name".to_string(), name.to_string())],
+        );
+        self.scheduler.schedule_now(
+            ScheduledEvent::new(SchedulerEventType::PublishAttempt)
+                .with_client(client)
+                .with_description(path),
+        );
+        Ok(())
+    }
+
     /// Function $name.
     pub fn deliver_next_metadata(
         &mut self,
@@ -909,6 +1119,63 @@ impl SimulatedRuntime {
                         payload,
                     ),
                 );
+            } else if event.kind == "symlink_published" {
+                let path = field(event, "path")?;
+                let logical_id = field(event, "logical_id")?;
+                let target = field(event, "target")?;
+                let epoch = optional_field(event, "epoch")
+                    .map(|epoch| {
+                        epoch
+                            .parse()
+                            .map_err(|_| ClientRuntimeError::InvalidMetadataField {
+                                field: "epoch".to_string(),
+                            })
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+                let is_stale_same_symlink =
+                    self.client(client)?
+                        .entries
+                        .get(path)
+                        .is_some_and(|current| {
+                            current.logical_id == logical_id && current.epoch > epoch
+                        });
+                if is_stale_same_symlink {
+                    continue;
+                }
+                self.ensure_parent_dirs(client, path)?;
+                self.remove_other_paths_for_logical_id(client, logical_id, path)?;
+                self.client_mut(client)?.entries.insert(
+                    path.to_string(),
+                    LocalEntry::symlink(logical_id.to_string(), target.to_string(), epoch),
+                );
+            } else if event.kind == "metadata_attribute_published" {
+                let path = field(event, "path")?;
+                let logical_id = field(event, "logical_id")?;
+                let name = field(event, "name")?;
+                let value = field(event, "value")?;
+                validate_supported_metadata_attribute(name)?;
+                let epoch = optional_field(event, "epoch")
+                    .map(|epoch| {
+                        epoch
+                            .parse()
+                            .map_err(|_| ClientRuntimeError::InvalidMetadataField {
+                                field: "epoch".to_string(),
+                            })
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+                let entry = self.entry_mut(client, path)?;
+                if entry.logical_id != logical_id {
+                    continue;
+                }
+                if entry.epoch > epoch {
+                    continue;
+                }
+                entry
+                    .metadata_attributes
+                    .insert(name.to_string(), value.to_string());
+                entry.epoch = epoch;
             } else if event.kind == "file_deleted" {
                 let path = field(event, "path")?;
                 let logical_id = field(event, "logical_id")?;
@@ -952,6 +1219,28 @@ impl SimulatedRuntime {
                 }
             }
         }
+    }
+
+    fn remove_other_paths_for_logical_id(
+        &mut self,
+        client: &str,
+        logical_id: &str,
+        keep_path: &str,
+    ) -> Result<(), ClientRuntimeError> {
+        let paths = self
+            .client(client)?
+            .entries
+            .iter()
+            .filter(|(path, entry)| path.as_str() != keep_path && entry.logical_id == logical_id)
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        let client_state = self.client_mut(client)?;
+        for path in paths {
+            client_state.entries.remove(&path);
+            client_state.durable_entries.remove(&path);
+            client_state.durable_writes.remove(&path);
+        }
+        Ok(())
     }
 
     fn ensure_parent_dirs(&mut self, client: &str, path: &str) -> Result<(), ClientRuntimeError> {
@@ -1617,6 +1906,46 @@ pub enum ClientRuntimeError {
         /// The path value.
         path: String,
     },
+    #[error("path {path} for simulated client {client} is not a symlink")]
+    /// Variant $name.
+    NotSymlink {
+        /// The client value.
+        client: String,
+        /// The path value.
+        path: String,
+    },
+    #[error("path {path} for simulated client {client} has no symlink target")]
+    /// Variant $name.
+    MissingSymlinkTarget {
+        /// The client value.
+        client: String,
+        /// The path value.
+        path: String,
+    },
+    #[error("path {path} has an invalid symlink target for simulated client {client}")]
+    /// Variant $name.
+    InvalidSymlinkTarget {
+        /// The client value.
+        client: String,
+        /// The path value.
+        path: String,
+    },
+    #[error("metadata attribute {name} is missing on path {path} for simulated client {client}")]
+    /// Variant $name.
+    MissingMetadataAttribute {
+        /// The client value.
+        client: String,
+        /// The path value.
+        path: String,
+        /// The metadata attribute name.
+        name: String,
+    },
+    #[error("metadata attribute {name} is not supported by deterministic simulation")]
+    /// Variant $name.
+    UnsupportedMetadataAttribute {
+        /// The metadata attribute name.
+        name: String,
+    },
     #[error("directory {path} for simulated client {client} is not empty")]
     /// Variant $name.
     DirectoryNotEmpty {
@@ -1759,6 +2088,8 @@ struct LocalEntry {
     checksum_sha256: Option<String>,
     size: Option<u64>,
     payload: Option<SparsePayload>,
+    symlink_target: Option<String>,
+    metadata_attributes: BTreeMap<String, String>,
     epoch: u64,
 }
 
@@ -1771,6 +2102,8 @@ impl LocalEntry {
             checksum_sha256: None,
             size: None,
             payload: None,
+            symlink_target: None,
+            metadata_attributes: BTreeMap::new(),
             epoch: 0,
         }
     }
@@ -1790,13 +2123,33 @@ impl LocalEntry {
             checksum_sha256,
             size,
             payload,
+            symlink_target: None,
+            metadata_attributes: BTreeMap::new(),
+            epoch,
+        }
+    }
+
+    fn symlink(logical_id: String, target: String, epoch: u64) -> Self {
+        Self {
+            kind: LocalEntryKind::Symlink,
+            logical_id,
+            object: None,
+            checksum_sha256: None,
+            size: None,
+            payload: None,
+            symlink_target: Some(target),
+            metadata_attributes: BTreeMap::new(),
             epoch,
         }
     }
 
     fn logical_entry(&self, path: &str) -> LogicalEntry {
         match self.kind {
-            LocalEntryKind::Directory => LogicalEntry::directory(path, self.logical_id.clone()),
+            LocalEntryKind::Directory => {
+                let mut entry = LogicalEntry::directory(path, self.logical_id.clone());
+                entry.metadata_attributes = self.metadata_attributes.clone();
+                entry
+            }
             LocalEntryKind::File => {
                 let mut entry = LogicalEntry::file(
                     path,
@@ -1811,6 +2164,16 @@ impl LocalEntry {
                 if let Some(payload) = &self.payload {
                     entry.byte_ranges = payload.logical_byte_ranges();
                 }
+                entry.metadata_attributes = self.metadata_attributes.clone();
+                entry
+            }
+            LocalEntryKind::Symlink => {
+                let mut entry = LogicalEntry::symlink(
+                    path,
+                    self.logical_id.clone(),
+                    self.symlink_target.clone().unwrap_or_default(),
+                );
+                entry.metadata_attributes = self.metadata_attributes.clone();
                 entry
             }
         }
@@ -1825,6 +2188,8 @@ pub enum LocalEntryKind {
     Directory,
     /// Variant $name.
     File,
+    /// Variant $name.
+    Symlink,
 }
 
 fn field<'a>(event: &'a MetadataEvent, name: &str) -> Result<&'a str, ClientRuntimeError> {
@@ -1837,6 +2202,16 @@ fn field<'a>(event: &'a MetadataEvent, name: &str) -> Result<&'a str, ClientRunt
 
 fn optional_field<'a>(event: &'a MetadataEvent, name: &str) -> Option<&'a str> {
     event.fields.get(name).map(String::as_str)
+}
+
+fn validate_supported_metadata_attribute(name: &str) -> Result<(), ClientRuntimeError> {
+    if name.starts_with("user.studiofs.") || name == "com.apple.ResourceFork" {
+        Ok(())
+    } else {
+        Err(ClientRuntimeError::UnsupportedMetadataAttribute {
+            name: name.to_string(),
+        })
+    }
 }
 
 fn payload_checksum(bytes: &[u8]) -> String {

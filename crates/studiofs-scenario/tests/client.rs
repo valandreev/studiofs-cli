@@ -394,6 +394,77 @@ fn directory_rename_preserves_logical_id_after_restart() {
     assert_eq!(before, after);
 }
 
+#[test]
+fn symlink_and_metadata_attributes_converge_through_metadata_delivery() {
+    let mut runtime = SimulatedRuntime::new(47);
+    runtime.add_client("writer");
+    runtime.add_client("reader");
+
+    runtime.mkdir("writer", "aux").unwrap();
+    runtime
+        .create_symlink("writer", "aux/current", "target-a.txt")
+        .unwrap();
+    runtime
+        .set_metadata_attribute(
+            "writer",
+            "aux/current",
+            "user.studiofs.label",
+            "published-link",
+        )
+        .unwrap();
+    runtime.publish_symlink("writer", "aux/current").unwrap();
+    runtime
+        .publish_metadata_attribute("writer", "aux/current", "user.studiofs.label")
+        .unwrap();
+    runtime.deliver_all_metadata("reader").unwrap();
+
+    assert_eq!(
+        runtime.read_symlink("reader", "aux/current").unwrap(),
+        "target-a.txt"
+    );
+    assert_eq!(
+        runtime
+            .read_metadata_attribute("reader", "aux/current", "user.studiofs.label")
+            .unwrap(),
+        Some("published-link".to_string())
+    );
+
+    runtime
+        .rename("writer", "aux/current", "aux/renamed")
+        .unwrap();
+    runtime
+        .set_symlink_target("writer", "aux/renamed", "target-b.txt")
+        .unwrap();
+    runtime
+        .set_metadata_attribute(
+            "writer",
+            "aux/renamed",
+            "user.studiofs.label",
+            "renamed-link",
+        )
+        .unwrap();
+    runtime.publish_symlink("writer", "aux/renamed").unwrap();
+    runtime
+        .publish_metadata_attribute("writer", "aux/renamed", "user.studiofs.label")
+        .unwrap();
+    runtime.deliver_all_metadata("reader").unwrap();
+
+    assert!(runtime.read_symlink("reader", "aux/current").is_err());
+    assert_eq!(
+        runtime.read_symlink("reader", "aux/renamed").unwrap(),
+        "target-b.txt"
+    );
+    assert_eq!(
+        runtime
+            .read_metadata_attribute("reader", "aux/renamed", "user.studiofs.label")
+            .unwrap(),
+        Some("renamed-link".to_string())
+    );
+
+    let report = validate_logical_invariants(&runtime.logical_snapshot());
+    assert!(report.passed, "{:#?}", report.violations);
+}
+
 fn directory_logical_id(runtime: &SimulatedRuntime, path: &str) -> String {
     runtime
         .logical_snapshot()

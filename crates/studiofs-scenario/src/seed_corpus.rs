@@ -59,6 +59,8 @@ pub enum SimulationScenarioGroup {
     ColdObserverLongHistory,
     /// Variant $name.
     InvalidationDropoutFallbackSync,
+    /// Variant $name.
+    AuxiliaryMetadataConvergence,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -354,6 +356,9 @@ fn run_group(
         }
         SimulationScenarioGroup::InvalidationDropoutFallbackSync => {
             run_invalidation_dropout_fallback_sync(seeds, options)
+        }
+        SimulationScenarioGroup::AuxiliaryMetadataConvergence => {
+            run_auxiliary_metadata_convergence(seeds, options)
         }
     }
 }
@@ -931,6 +936,78 @@ fn run_invalidation_dropout_fallback_sync(
     })
 }
 
+fn run_auxiliary_metadata_convergence(
+    seeds: &[u64],
+    options: &SimulationCorpusOptions,
+) -> Result<GroupOutcome, SimulationCorpusError> {
+    let mut seed_reports = Vec::new();
+    let mut failures = Vec::new();
+    for seed in seeds {
+        let run = auxiliary_metadata_seed(*seed)?;
+        let invariant_report = validate_logical_invariants(&run.final_snapshot);
+        let passed = invariant_report.passed && run.capability_gates == 1 && run.final_check_passed;
+
+        if !passed {
+            let (violated_invariant, base_message) =
+                first_violation_or(&invariant_report, "auxiliary_metadata_convergence");
+            failures.push(SimulationCorpusFailure {
+                group: SimulationScenarioGroup::AuxiliaryMetadataConvergence,
+                seed: *seed,
+                violated_invariant,
+                message: format!(
+                    "{base_message}; variant={} final_check_passed={} capability_gates={}",
+                    auxiliary_metadata_variant(*seed),
+                    run.final_check_passed,
+                    run.capability_gates
+                ),
+                counterexample_artifact_path: None,
+                replay_evidence: Some(SimulationCounterexampleEvidence {
+                    sub_group: Some(auxiliary_metadata_variant(*seed).to_string()),
+                    scheduler_trace: nonempty_scheduler_trace(
+                        *seed,
+                        run.scheduler_trace.clone(),
+                        "auxiliary-metadata-final",
+                    ),
+                    operation_log: auxiliary_metadata_operation_log(run.runtime.trace()),
+                    event_trace: json_trace(run.runtime.trace())?,
+                    final_snapshot: Some(json_value(&run.final_snapshot)?),
+                }),
+            });
+        }
+        if options.inject_failure {
+            failures.push(SimulationCorpusFailure {
+                group: SimulationScenarioGroup::AuxiliaryMetadataConvergence,
+                seed: *seed,
+                violated_invariant: "injected_counterexample".to_string(),
+                message: "injected auxiliary metadata failure for corpus artifact testing"
+                    .to_string(),
+                counterexample_artifact_path: None,
+                replay_evidence: Some(SimulationCounterexampleEvidence {
+                    sub_group: Some(auxiliary_metadata_variant(*seed).to_string()),
+                    scheduler_trace: nonempty_scheduler_trace(
+                        *seed,
+                        run.scheduler_trace.clone(),
+                        "auxiliary-metadata-injected",
+                    ),
+                    operation_log: auxiliary_metadata_operation_log(run.runtime.trace()),
+                    event_trace: json_trace(run.runtime.trace())?,
+                    final_snapshot: Some(json_value(&run.final_snapshot)?),
+                }),
+            });
+        }
+        seed_reports.push(SimulationSeedReport {
+            seed: *seed,
+            passed: passed && !options.inject_failure,
+            invariant_checkpoints: run.invariant_checkpoints,
+            trace_records: run.runtime.trace().len() + run.scheduler_trace.len(),
+        });
+    }
+    Ok(GroupOutcome {
+        seed_reports,
+        failures,
+    })
+}
+
 fn invalidation_dropout_seed(seed: u64) -> Result<InvalidationDropoutRun, SimulationCorpusError> {
     let mut runtime = SimulatedRuntime::new(seed);
     runtime.add_client("writer");
@@ -1009,6 +1086,105 @@ fn invalidation_dropout_seed(seed: u64) -> Result<InvalidationDropoutRun, Simula
     })
 }
 
+fn auxiliary_metadata_seed(seed: u64) -> Result<AuxiliaryMetadataRun, SimulationCorpusError> {
+    let mut runtime = SimulatedRuntime::new(seed);
+    runtime.add_client("writer");
+    runtime.add_client("reader");
+    runtime.mkdir("writer", "aux")?;
+    runtime.create_file("writer", "aux/target.txt")?;
+    publish_checksum(&mut runtime, "aux/target.txt", "checksum-aux-v1", 7)?;
+    runtime.create_symlink("writer", "aux/current", "target-a.txt")?;
+    runtime.set_metadata_attribute("writer", "aux/current", "user.studiofs.label", "link-v1")?;
+    runtime.publish_symlink("writer", "aux/current")?;
+    runtime.publish_metadata_attribute("writer", "aux/current", "user.studiofs.label")?;
+
+    let variant_index = auxiliary_metadata_variant_index(seed);
+    match variant_index {
+        0 => {
+            runtime.deliver_all_metadata("reader")?;
+        }
+        1 => {
+            runtime.set_symlink_target("writer", "aux/current", "target-b.txt")?;
+            runtime.set_metadata_attribute(
+                "writer",
+                "aux/current",
+                "user.studiofs.label",
+                "link-v2",
+            )?;
+            runtime.publish_symlink("writer", "aux/current")?;
+            runtime.publish_metadata_attribute("writer", "aux/current", "user.studiofs.label")?;
+            runtime.deliver_all_metadata("reader")?;
+        }
+        2 => {
+            runtime.deliver_all_metadata("reader")?;
+            runtime.rename("writer", "aux/current", "aux/renamed")?;
+            runtime.set_symlink_target("writer", "aux/renamed", "target-b.txt")?;
+            runtime.set_metadata_attribute(
+                "writer",
+                "aux/renamed",
+                "user.studiofs.label",
+                "renamed-link",
+            )?;
+            runtime.publish_symlink("writer", "aux/renamed")?;
+            runtime.publish_metadata_attribute("writer", "aux/renamed", "user.studiofs.label")?;
+            runtime.deliver_all_metadata("reader")?;
+        }
+        _ => {
+            runtime.deliver_all_metadata("reader")?;
+            runtime.publish_unlink("writer", "aux/current")?;
+            runtime.deliver_all_metadata("reader")?;
+        }
+    }
+
+    let final_check_passed = match variant_index {
+        0 => {
+            runtime.read_symlink("reader", "aux/current")? == "target-a.txt"
+                && runtime.read_metadata_attribute(
+                    "reader",
+                    "aux/current",
+                    "user.studiofs.label",
+                )? == Some("link-v1".to_string())
+        }
+        1 => {
+            runtime.read_symlink("reader", "aux/current")? == "target-b.txt"
+                && runtime.read_metadata_attribute(
+                    "reader",
+                    "aux/current",
+                    "user.studiofs.label",
+                )? == Some("link-v2".to_string())
+        }
+        2 => {
+            runtime.read_symlink("reader", "aux/current").is_err()
+                && runtime.read_symlink("reader", "aux/renamed")? == "target-b.txt"
+                && runtime.read_metadata_attribute(
+                    "reader",
+                    "aux/renamed",
+                    "user.studiofs.label",
+                )? == Some("renamed-link".to_string())
+        }
+        _ => runtime.read_symlink("reader", "aux/current").is_err(),
+    };
+
+    let mut final_snapshot = runtime.logical_snapshot();
+    if variant_index == 3 {
+        final_snapshot.expected_absent_paths = vec!["aux/current".to_string()];
+    }
+    final_snapshot.replay_idempotent = Some(true);
+
+    Ok(AuxiliaryMetadataRun {
+        runtime,
+        scheduler_trace: auxiliary_metadata_scheduler_trace(
+            seed,
+            auxiliary_metadata_variant(seed),
+            variant_index + 1,
+        ),
+        final_snapshot,
+        final_check_passed,
+        capability_gates: 1,
+        invariant_checkpoints: 3 + variant_index,
+    })
+}
+
 fn publish_checksum(
     runtime: &mut SimulatedRuntime,
     path: &str,
@@ -1053,6 +1229,31 @@ fn invalidation_dropout_scheduler_trace(
             interleaving_choice: 0,
             ready_event_count: 1,
             ready_event_ids: vec![(index + 1) as u64],
+        })
+        .collect()
+}
+
+fn auxiliary_metadata_scheduler_trace(
+    seed: u64,
+    variant: &str,
+    steps: usize,
+) -> Vec<SchedulerTraceRecord> {
+    (0..steps)
+        .map(|index| SchedulerTraceRecord {
+            step: (index + 1) as u64,
+            seed,
+            virtual_tick: index as u64,
+            event_id: (index + 1) as u64,
+            event_type: if index % 2 == 0 {
+                SchedulerEventType::MetadataDelivery
+            } else {
+                SchedulerEventType::PublishAttempt
+            },
+            client: Some("reader".to_string()),
+            description: Some(format!("{variant}:auxiliary-state-step-{index}")),
+            interleaving_choice: index,
+            ready_event_count: steps,
+            ready_event_ids: (1..=steps as u64).collect(),
         })
         .collect()
 }
@@ -1226,6 +1427,19 @@ fn invalidation_dropout_variant(seed: u64) -> &'static str {
 
 fn invalidation_dropout_variant_index(seed: u64) -> usize {
     (seed % INVALIDATION_DROPOUT_SEED_VARIANTS) as usize
+}
+
+fn auxiliary_metadata_variant(seed: u64) -> &'static str {
+    match auxiliary_metadata_variant_index(seed) {
+        0 => "initial_symlink_attribute_delivery",
+        1 => "target_and_attribute_race_before_delivery",
+        2 => "rename_with_auxiliary_state_overlay",
+        _ => "unlink_removes_auxiliary_state",
+    }
+}
+
+fn auxiliary_metadata_variant_index(seed: u64) -> usize {
+    (seed % AUXILIARY_METADATA_SEED_VARIANTS) as usize
 }
 
 fn aggregate_seed_reports<FamilyReport, SeedReport>(
@@ -1520,9 +1734,51 @@ fn operation_log_from_client_trace(
         .collect()
 }
 
+fn auxiliary_metadata_operation_log(
+    trace: &[crate::client::ClientTraceRecord],
+) -> Vec<ScenarioOperationRecord> {
+    let mut operation_log = operation_log_from_client_trace(CORPUS_SCENARIO, trace);
+    operation_log.push(
+        ScenarioOperationRecord::new(
+            CORPUS_SCENARIO,
+            operation_log.len() as u64 + 1,
+            ScenarioOperation::SetMetadataAttribute {
+                path: "aux/current".to_string(),
+                name: "system.windows.security_descriptor".to_string(),
+                value: "<opaque>".to_string(),
+            },
+        )
+        .with_client("writer")
+        .with_outcome(OperationOutcome::Planned)
+        .with_simulation_support(crate::SimulationSupport::Unsupported {
+            reason: "platform-specific metadata attribute is outside deterministic simulation"
+                .to_string(),
+        }),
+    );
+    operation_log
+}
+
 fn client_trace_operation(record: &crate::client::ClientTraceRecord) -> ScenarioOperation {
     let path = record.path.clone().unwrap_or_default();
     match record.kind.as_str() {
+        "create_symlink" => ScenarioOperation::CreateSymlink {
+            path,
+            target: record.metadata.get("target").cloned().unwrap_or_default(),
+        },
+        "set_symlink_target" => ScenarioOperation::CreateSymlink {
+            path,
+            target: record.metadata.get("target").cloned().unwrap_or_default(),
+        },
+        "set_metadata_attribute" => ScenarioOperation::SetMetadataAttribute {
+            path,
+            name: record.metadata.get("name").cloned().unwrap_or_default(),
+            value: record.metadata.get("value").cloned().unwrap_or_default(),
+        },
+        "publish_metadata_attribute" => ScenarioOperation::SetMetadataAttribute {
+            path,
+            name: record.metadata.get("name").cloned().unwrap_or_default(),
+            value: String::new(),
+        },
         "write_sparse_range" => ScenarioOperation::Write {
             path,
             offset: record
@@ -1638,6 +1894,7 @@ const OUTAGE_SEED_VARIANTS: u64 = 8;
 const SPARSE_SEED_VARIANTS: u64 = 4;
 const COLD_OBSERVER_SEED_VARIANTS: u64 = 4;
 const INVALIDATION_DROPOUT_SEED_VARIANTS: u64 = 4;
+const AUXILIARY_METADATA_SEED_VARIANTS: u64 = 4;
 
 fn seeds_for(kind: SimulationCorpusKind) -> &'static [u64] {
     match kind {
@@ -1655,6 +1912,7 @@ fn ordered_groups() -> &'static [SimulationScenarioGroup] {
         SimulationScenarioGroup::SparsePayloadChaos,
         SimulationScenarioGroup::ColdObserverLongHistory,
         SimulationScenarioGroup::InvalidationDropoutFallbackSync,
+        SimulationScenarioGroup::AuxiliaryMetadataConvergence,
     ]
 }
 
@@ -1678,6 +1936,7 @@ pub fn group_arg(group: SimulationScenarioGroup) -> &'static str {
         SimulationScenarioGroup::InvalidationDropoutFallbackSync => {
             "invalidation-dropout-fallback-sync"
         }
+        SimulationScenarioGroup::AuxiliaryMetadataConvergence => "auxiliary-metadata-convergence",
     }
 }
 
@@ -1715,6 +1974,15 @@ struct InvalidationDropoutRun {
     fallback_bound: usize,
     fallback_syncs: usize,
     hints_disrupted: usize,
+    invariant_checkpoints: usize,
+}
+
+struct AuxiliaryMetadataRun {
+    runtime: SimulatedRuntime,
+    scheduler_trace: Vec<SchedulerTraceRecord>,
+    final_snapshot: LogicalSnapshot,
+    final_check_passed: bool,
+    capability_gates: usize,
     invariant_checkpoints: usize,
 }
 
