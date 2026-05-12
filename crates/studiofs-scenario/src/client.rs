@@ -728,11 +728,7 @@ impl SimulatedRuntime {
         client: &str,
     ) -> Result<Option<u64>, ClientRuntimeError> {
         self.ensure_client(client)?;
-        let batch_id = self
-            .metadata_bus
-            .pending_for(client)
-            .first()
-            .map(|batch| batch.batch_id);
+        let batch_id = self.metadata_bus.peek_pending_id(client);
         if let Some(batch_id) = batch_id {
             self.metadata_bus.drop_hint_for(client, batch_id);
         }
@@ -756,11 +752,7 @@ impl SimulatedRuntime {
         client: &str,
     ) -> Result<Option<u64>, ClientRuntimeError> {
         self.ensure_client(client)?;
-        let batch_id = self
-            .metadata_bus
-            .pending_for(client)
-            .first()
-            .map(|batch| batch.batch_id);
+        let batch_id = self.metadata_bus.peek_pending_id(client);
         if let Some(batch_id) = batch_id {
             self.metadata_bus.delay_for(client, batch_id);
         }

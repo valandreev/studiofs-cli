@@ -253,6 +253,13 @@ impl MetadataBus {
         self.client_queues.get(client).map_or(0, VecDeque::len)
     }
 
+    /// Returns the next queued metadata batch ID without cloning the batch.
+    pub fn peek_pending_id(&self, client: &str) -> Option<u64> {
+        self.client_queues
+            .get(client)
+            .and_then(|queue| queue.front().copied())
+    }
+
     /// Function $name.
     pub fn batch(&self, batch_id: u64) -> Option<MetadataBatch> {
         self.batches.get(&batch_id).cloned()
@@ -389,13 +396,15 @@ impl MetadataBus {
         };
         let applied = self.applied_batches.get(client);
         let queued = existing_queue.iter().copied().collect::<BTreeSet<_>>();
-        let mut pending_batches = self
+        let pending_batches = self
             .batches
             .values()
-            .filter(|batch| !applied.is_some_and(|applied| applied.contains(&batch.batch_id)))
+            .filter(|batch| {
+                batch.source_client != client
+                    && !applied.is_some_and(|applied| applied.contains(&batch.batch_id))
+            })
             .map(|batch| (batch.version, batch.batch_id))
             .collect::<Vec<_>>();
-        pending_batches.sort_by_key(|&(version, batch_id)| (version, batch_id));
 
         let missing = pending_batches
             .iter()

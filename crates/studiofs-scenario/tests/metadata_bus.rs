@@ -222,6 +222,32 @@ fn dropped_hint_is_recovered_by_fallback_sync_without_marking_batch_applied() {
 }
 
 #[test]
+fn fallback_sync_does_not_enqueue_self_authored_batches() {
+    let mut bus = MetadataBus::new();
+    bus.connect_client("writer");
+    bus.connect_client("reader");
+
+    let own = bus.enqueue_local(batch("writer", "own.txt"));
+    let foreign = bus.enqueue_local(batch("reader", "foreign.txt"));
+    assert!(bus.drop_hint_for("writer", foreign.batch_id));
+
+    assert_eq!(bus.fallback_sync_for("writer"), 1);
+    assert_eq!(
+        bus.pending_for("writer")
+            .iter()
+            .map(|batch| batch.batch_id)
+            .collect::<Vec<_>>(),
+        vec![foreign.batch_id]
+    );
+    assert!(
+        !bus.pending_for("writer")
+            .iter()
+            .any(|batch| batch.batch_id == own.batch_id),
+        "fallback sync must preserve the normal no-self-hints bus contract"
+    );
+}
+
+#[test]
 fn trace_can_be_drained_between_long_simulation_windows() {
     let mut bus = MetadataBus::new();
     bus.connect_client("writer");
