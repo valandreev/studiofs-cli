@@ -4,7 +4,11 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Barrier, mpsc};
+use std::sync::{
+    Arc, Barrier, LazyLock,
+    atomic::{AtomicUsize, Ordering},
+    mpsc,
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -82,6 +86,9 @@ const OVERWRITE_READ_ATTEMPTS: u32 = 8;
 const ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(90);
 const ADVANCED_MOUNTED_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const HOTSPOT_CHURN_OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
+const HOTSPOT_IO_MAX_ACTIVE_WORKERS: usize = 1;
+static HOTSPOT_IO_ACTIVE_WORKERS: LazyLock<Arc<AtomicUsize>> =
+    LazyLock::new(|| Arc::new(AtomicUsize::new(0)));
 const LWW_RECONNECT_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(120);
 const FAULT_CHAOS_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -3301,10 +3308,37 @@ fn run_timed_hotspot_io<T: Send + 'static>(
     pending_label: String,
     f: impl FnOnce() -> io::Result<T> + Send + 'static,
 ) -> Result<T, ScenarioError> {
+    run_timed_hotspot_io_with_worker_limit(
+        timeout,
+        pending_label,
+        f,
+        Arc::clone(&HOTSPOT_IO_ACTIVE_WORKERS),
+    )
+}
+
+fn run_timed_hotspot_io_with_worker_limit<T: Send + 'static>(
+    timeout: Duration,
+    pending_label: String,
+    f: impl FnOnce() -> io::Result<T> + Send + 'static,
+    active_workers: Arc<AtomicUsize>,
+) -> Result<T, ScenarioError> {
+    let Some(permit) = HotspotIoWorkerPermit::try_acquire(active_workers) else {
+        let pending_label = format!(
+            "hotspot worker limit reached; previous timed operation may still be blocked before {pending_label}"
+        );
+        eprintln!(
+            "studiofs-e2e: {pending_label}; refusing to spawn another mounted hotspot worker"
+        );
+        return Err(namespace_collision_operation_timeout(
+            timeout,
+            vec![(1, pending_label)],
+        ));
+    };
     let (tx, rx) = mpsc::channel();
     thread::Builder::new()
         .name("studiofs-e2e-hotspot-io".to_string())
         .spawn(move || {
+            let _permit = permit;
             let _ = tx.send(f());
         })?;
     match rx.recv_timeout(timeout) {
@@ -3324,6 +3358,36 @@ fn run_timed_hotspot_io<T: Send + 'static>(
         Err(mpsc::RecvTimeoutError::Disconnected) => Err(ScenarioError::Io(io::Error::other(
             "hotspot operation worker channel closed before completion",
         ))),
+    }
+}
+
+struct HotspotIoWorkerPermit {
+    active_workers: Arc<AtomicUsize>,
+}
+
+impl HotspotIoWorkerPermit {
+    fn try_acquire(active_workers: Arc<AtomicUsize>) -> Option<Self> {
+        let mut current = active_workers.load(Ordering::Acquire);
+        loop {
+            if current >= HOTSPOT_IO_MAX_ACTIVE_WORKERS {
+                return None;
+            }
+            match active_workers.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Self { active_workers }),
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+impl Drop for HotspotIoWorkerPermit {
+    fn drop(&mut self) {
+        self.active_workers.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -4918,13 +4982,14 @@ mod tests {
     fn hotspot_churn_operation_timeout_reports_pending_without_waiting_forever() {
         let started = Instant::now();
 
-        let err = run_timed_hotspot_io(
+        let err = run_timed_hotspot_io_with_worker_limit(
             Duration::from_millis(20),
             "client-a mkdir hotspot".to_string(),
             || {
                 thread::sleep(Duration::from_millis(200));
                 Ok(())
             },
+            Arc::new(AtomicUsize::new(0)),
         )
         .unwrap_err();
 
@@ -4937,6 +5002,59 @@ mod tests {
             started.elapsed() < Duration::from_millis(150),
             "hotspot timeout must not wait for the hung mounted operation to finish"
         );
+    }
+
+    #[test]
+    fn hotspot_churn_operation_timeout_bounds_pending_workers() {
+        let active_workers = Arc::new(AtomicUsize::new(0));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        let err = run_timed_hotspot_io_with_worker_limit(
+            Duration::from_millis(20),
+            "client-a mkdir hotspot".to_string(),
+            move || {
+                release_rx
+                    .recv()
+                    .map_err(|_| io::Error::other("hotspot worker release channel closed"))?;
+                Ok(())
+            },
+            Arc::clone(&active_workers),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ScenarioError::NamespaceCollisionOperationTimeout { .. }
+        ));
+        assert_eq!(active_workers.load(Ordering::SeqCst), 1);
+
+        let started = Instant::now();
+        let err = run_timed_hotspot_io_with_worker_limit(
+            Duration::from_secs(1),
+            "client-b append hotspot/slot-1.txt".to_string(),
+            || Ok(()),
+            Arc::clone(&active_workers),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ScenarioError::NamespaceCollisionOperationTimeout { .. }
+        ));
+        assert!(err.to_string().contains("hotspot worker limit reached"));
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "saturated hotspot worker limit must fail without spawning another worker"
+        );
+
+        release_tx.send(()).unwrap();
+        for _ in 0..50 {
+            if active_workers.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(active_workers.load(Ordering::SeqCst), 0);
     }
 
     #[test]
