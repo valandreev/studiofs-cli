@@ -716,6 +716,13 @@ trait MountedSmokeDriver {
     -> Result<(), ClientControllerError>;
     fn mount_all(&mut self) -> Result<(), ClientControllerError>;
     fn clients(&self) -> Vec<ClientSpec>;
+    fn after_smoke_file_written(
+        &mut self,
+        _volume_name: &str,
+        _smoke_file: &Path,
+    ) -> Result<(), ClientControllerError> {
+        Ok(())
+    }
     fn unmount_all(&mut self) -> Result<(), ClientControllerError>;
 }
 
@@ -852,6 +859,7 @@ fn run_mounted_smoke_body(
             .mount_point
             .join(format!("{}-{SMOKE_FILE_NAME}", volume.volume_name));
         fs::write(&smoke_file, SMOKE_FILE_PAYLOAD)?;
+        driver.after_smoke_file_written(&volume.volume_name, &smoke_file)?;
         let mounts = clients
             .iter()
             .take(SMOKE_CLIENT_NAMES.len())
@@ -3848,38 +3856,6 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let mut driver = RecordingSmokeDriver::new(clients);
-        let mount_roots = SMOKE_CLIENT_NAMES
-            .iter()
-            .copied()
-            .map(|name| temp.path().join("mounts").join(name))
-            .collect::<Vec<_>>();
-        thread::spawn(move || {
-            for _ in 0..200 {
-                for source_mount in &mount_roots {
-                    let entries = std::fs::read_dir(source_mount)
-                        .into_iter()
-                        .flatten()
-                        .filter_map(Result::ok)
-                        .filter(|entry| entry.path().is_file())
-                        .collect::<Vec<_>>();
-                    if entries.is_empty() {
-                        continue;
-                    }
-                    for entry in entries {
-                        let file_name = entry.file_name();
-                        if let Ok(payload) = std::fs::read(entry.path()) {
-                            if payload.is_empty() {
-                                continue;
-                            }
-                            for replica in &mount_roots {
-                                let _ = std::fs::write(replica.join(&file_name), &payload);
-                            }
-                        }
-                    }
-                }
-                thread::sleep(Duration::from_millis(5));
-            }
-        });
         let context = ScenarioContext {
             run_id: "run-1".to_string(),
             seed: 324,
@@ -4055,6 +4031,21 @@ mod tests {
 
         fn clients(&self) -> Vec<ClientSpec> {
             self.clients.clone()
+        }
+
+        fn after_smoke_file_written(
+            &mut self,
+            _volume_name: &str,
+            smoke_file: &Path,
+        ) -> Result<(), ClientControllerError> {
+            let file_name = smoke_file.file_name().ok_or_else(|| {
+                ClientControllerError::Io(io::Error::other("missing smoke file name"))
+            })?;
+            let payload = fs::read(smoke_file)?;
+            for client in &self.clients {
+                fs::write(client.mount_point.join(file_name), &payload)?;
+            }
+            Ok(())
         }
 
         fn unmount_all(&mut self) -> Result<(), ClientControllerError> {
