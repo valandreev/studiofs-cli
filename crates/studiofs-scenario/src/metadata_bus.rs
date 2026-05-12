@@ -260,6 +260,14 @@ impl MetadataBus {
             .and_then(|queue| queue.front().copied())
     }
 
+    #[cfg(test)]
+    pub(crate) fn inject_stale_hint_for_test(&mut self, client: &str, batch_id: u64) {
+        self.client_queues
+            .entry(client.to_string())
+            .or_default()
+            .push_back(batch_id);
+    }
+
     /// Function $name.
     pub fn batch(&self, batch_id: u64) -> Option<MetadataBatch> {
         self.batches.get(&batch_id).cloned()
