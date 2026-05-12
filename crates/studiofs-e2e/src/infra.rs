@@ -1,9 +1,13 @@
 //! Docker Compose infrastructure for real E2E runs.
 
 use std::fs;
+use std::io::{self, Read as _};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{ChildStderr, ChildStdout, Command, Stdio};
+use std::thread;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
@@ -14,6 +18,8 @@ const DEFAULT_POSTGRES_PORT: u16 = 25_432;
 const DEFAULT_RUSTFS_PORT: u16 = 29_000;
 const DEFAULT_RUSTFS_CONSOLE_PORT: u16 = 29_001;
 const DEFAULT_TOXIPROXY_API_PORT: u16 = 28_474;
+const COMPOSE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
+const COMPOSE_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub const POSTGRES_SERVICE_NAME: &str = "postgres";
 pub const RUSTFS_SERVICE_NAME: &str = "rustfs";
@@ -104,6 +110,7 @@ pub struct CommandSpec {
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
     pub cwd: Option<PathBuf>,
+    pub timeout: Option<Duration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,6 +141,11 @@ impl CommandExecutor for SystemCommandExecutor {
         if let Some(cwd) = &command.cwd {
             process.current_dir(cwd);
         }
+        if let Some(timeout) = command.timeout {
+            process.stdout(Stdio::piped());
+            process.stderr(Stdio::piped());
+            return run_command_with_timeout(process, timeout);
+        }
         let output = process.output()?;
         Ok(CommandOutput {
             status: output.status.code().unwrap_or(-1),
@@ -141,6 +153,64 @@ impl CommandExecutor for SystemCommandExecutor {
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         })
     }
+}
+
+fn run_command_with_timeout(
+    mut command: Command,
+    timeout: Duration,
+) -> std::io::Result<CommandOutput> {
+    let mut child = command.spawn()?;
+    let mut stdout_reader = child.stdout.take().map(spawn_stdout_reader);
+    let mut stderr_reader = child.stderr.take().map(spawn_stderr_reader);
+    let started = Instant::now();
+    loop {
+        if child.try_wait()?.is_some() {
+            let status = child.wait()?;
+            let stdout = collect_reader(stdout_reader.take())?;
+            let stderr = collect_reader(stderr_reader.take())?;
+            return Ok(CommandOutput {
+                status: status.code().unwrap_or(-1),
+                stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&stderr).into_owned(),
+            });
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = collect_reader(stdout_reader.take());
+            let _ = collect_reader(stderr_reader.take());
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("command timed out after {} ms", timeout.as_millis()),
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn spawn_stdout_reader(mut stdout: ChildStdout) -> JoinHandle<io::Result<Vec<u8>>> {
+    thread::spawn(move || {
+        let mut buffer = Vec::new();
+        stdout.read_to_end(&mut buffer)?;
+        Ok(buffer)
+    })
+}
+
+fn spawn_stderr_reader(mut stderr: ChildStderr) -> JoinHandle<io::Result<Vec<u8>>> {
+    thread::spawn(move || {
+        let mut buffer = Vec::new();
+        stderr.read_to_end(&mut buffer)?;
+        Ok(buffer)
+    })
+}
+
+fn collect_reader(reader: Option<JoinHandle<io::Result<Vec<u8>>>>) -> io::Result<Vec<u8>> {
+    let Some(reader) = reader else {
+        return Ok(Vec::new());
+    };
+    reader
+        .join()
+        .map_err(|_| io::Error::other("command output reader thread panicked"))?
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -242,6 +312,7 @@ impl DockerComposeStack {
                 ],
                 env: Vec::new(),
                 cwd: None,
+                timeout: Some(COMPOSE_DIAGNOSTIC_TIMEOUT),
             },
         ));
         checks.push(self.command_check(
@@ -252,6 +323,7 @@ impl DockerComposeStack {
                 args: vec!["compose".to_string(), "version".to_string()],
                 env: Vec::new(),
                 cwd: None,
+                timeout: Some(COMPOSE_DIAGNOSTIC_TIMEOUT),
             },
         ));
         checks.extend(self.ports.iter().map(port_check));
@@ -358,6 +430,7 @@ impl DockerComposeStack {
     pub fn collect_logs(&self, executor: &dyn CommandExecutor) -> Result<PathBuf, InfraError> {
         fs::create_dir_all(self.docker_artifact_dir())?;
         let mut command = self.compose_command();
+        command.timeout = Some(COMPOSE_CLEANUP_TIMEOUT);
         command.args.extend([
             "logs".to_string(),
             "--no-color".to_string(),
@@ -421,6 +494,7 @@ impl DockerComposeStack {
 
     pub fn teardown(&self, executor: &dyn CommandExecutor) -> Result<(), InfraError> {
         let mut command = self.compose_command();
+        command.timeout = Some(COMPOSE_CLEANUP_TIMEOUT);
         command.args.extend([
             "down".to_string(),
             "--volumes".to_string(),
@@ -444,6 +518,7 @@ impl DockerComposeStack {
         status_file: &str,
     ) -> Result<bool, InfraError> {
         let mut command = self.compose_command();
+        command.timeout = Some(COMPOSE_DIAGNOSTIC_TIMEOUT);
         command
             .args
             .extend(args.iter().map(|arg| (*arg).to_string()));
@@ -628,6 +703,7 @@ impl ComposeServiceControl {
             ],
             env: self.env.clone(),
             cwd: self.compose_file.parent().map(Path::to_path_buf),
+            timeout: None,
         }
     }
 }
@@ -762,4 +838,91 @@ fn default_compose_file() -> PathBuf {
         }
     }
     PathBuf::from(COMPOSE_FILE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn system_command_executor_returns_timed_out_for_hung_command() {
+        let command = hung_command(Duration::from_millis(50));
+        let started = Instant::now();
+
+        let err = SystemCommandExecutor.run(&command).unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "timeout-aware executor should not wait for the hung command to finish"
+        );
+    }
+
+    #[test]
+    fn timeout_executor_drains_large_stdout_while_waiting() {
+        let command = large_stdout_command(Duration::from_secs(5));
+
+        let output = SystemCommandExecutor
+            .run(&command)
+            .expect("large-output command should finish before timeout");
+
+        assert_eq!(output.status, 0);
+        assert!(output.stdout.len() >= 1_000_000);
+    }
+
+    #[cfg(windows)]
+    fn hung_command(timeout: Duration) -> CommandSpec {
+        CommandSpec {
+            program: "powershell".to_string(),
+            args: vec![
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                "Start-Sleep -Seconds 5".to_string(),
+            ],
+            env: Vec::new(),
+            cwd: None,
+            timeout: Some(timeout),
+        }
+    }
+
+    #[cfg(windows)]
+    fn large_stdout_command(timeout: Duration) -> CommandSpec {
+        CommandSpec {
+            program: "powershell".to_string(),
+            args: vec![
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                "[Console]::Out.Write(('x' * 1048576))".to_string(),
+            ],
+            env: Vec::new(),
+            cwd: None,
+            timeout: Some(timeout),
+        }
+    }
+
+    #[cfg(unix)]
+    fn hung_command(timeout: Duration) -> CommandSpec {
+        CommandSpec {
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), "sleep 5".to_string()],
+            env: Vec::new(),
+            cwd: None,
+            timeout: Some(timeout),
+        }
+    }
+
+    #[cfg(unix)]
+    fn large_stdout_command(timeout: Duration) -> CommandSpec {
+        CommandSpec {
+            program: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "dd if=/dev/zero bs=1024 count=1024 2>/dev/null".to_string(),
+            ],
+            env: Vec::new(),
+            cwd: None,
+            timeout: Some(timeout),
+        }
+    }
 }
