@@ -800,11 +800,28 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         let output = self.executor.run(&command)?;
         ensure_success(&command, output)?;
         if let Some(process) = self.clients[index].process.as_mut() {
-            wait_for_process_exit(
+            if let Err(primary) = wait_for_process_exit(
                 process.as_mut(),
                 self.config.mount_exit_timeout,
                 self.config.poll_interval,
-            )?;
+            ) {
+                if let Err(error) = force_kill_process_and_wait(
+                    process.as_mut(),
+                    "graceful unmount timeout",
+                    self.config.mount_exit_timeout,
+                    self.config.poll_interval,
+                ) {
+                    debug_log_kill_error(
+                        &self.clients[index].spec.name,
+                        "graceful unmount timeout",
+                        &error,
+                    );
+                }
+                self.clients[index].process = None;
+                self.clients[index].spec.process_id = None;
+                self.clients[index].spec.state = ClientLifecycleState::Killed;
+                return Err(primary);
+            }
         }
         self.clients[index].process = None;
         self.clients[index].spec.process_id = None;
@@ -990,7 +1007,12 @@ impl<E> Drop for MultiClientController<E> {
     fn drop(&mut self) {
         for runtime in &mut self.clients {
             if let Some(process) = runtime.process.as_mut() {
-                if let Err(error) = process.kill() {
+                if let Err(error) = force_kill_process_and_wait(
+                    process.as_mut(),
+                    "controller drop",
+                    self.config.mount_exit_timeout,
+                    self.config.poll_interval,
+                ) {
                     debug_log_kill_error(&runtime.spec.name, "controller drop", &error);
                 }
             }

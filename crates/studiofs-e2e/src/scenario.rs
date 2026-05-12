@@ -81,6 +81,7 @@ const COLLISION_NEW_COMMITTED_PAYLOAD: &[u8] = b"new committed payload\n";
 const OVERWRITE_READ_ATTEMPTS: u32 = 8;
 const ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(90);
 const ADVANCED_MOUNTED_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const HOTSPOT_CHURN_OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
 const LWW_RECONNECT_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(120);
 const FAULT_CHAOS_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -3198,61 +3199,123 @@ fn run_mounted_chaos_operations(
 fn run_hotspot_churn_operations(
     clients: &[ClientSpec],
 ) -> Result<Vec<NamespaceCollisionOperation>, ScenarioError> {
+    run_hotspot_churn_operations_with_timeout(clients, HOTSPOT_CHURN_OPERATION_TIMEOUT)
+}
+
+fn run_hotspot_churn_operations_with_timeout(
+    clients: &[ClientSpec],
+    operation_timeout: Duration,
+) -> Result<Vec<NamespaceCollisionOperation>, ScenarioError> {
     let started = Instant::now();
     let mut operations = Vec::new();
-    fs::create_dir_all(clients[0].mount_point.join("hotspot"))?;
+    let mkdir_client = clients[0].clone();
+    run_timed_hotspot_io(
+        operation_timeout,
+        format!("{} mkdir hotspot", mkdir_client.name),
+        move || fs::create_dir_all(mkdir_client.mount_point.join("hotspot")),
+    )?;
     for round in 0..10 {
         let slot = format!("hotspot/slot-{}.txt", round % 6);
         let renamed = format!("hotspot/slot-{}-renamed.txt", round % 6);
-        operations.push(fs_op(
+        let write_path = slot.clone();
+        operations.push(timed_fs_op(
             started,
             operations.len() + 1,
             &clients[0],
             "overwrite",
             &slot,
-            || {
+            operation_timeout,
+            move |client| {
                 write_parented(
-                    clients[0].mount_point.join(&slot),
+                    client.mount_point.join(&write_path),
                     format!("hotspot round {round}\n").as_bytes(),
                 )
             },
-        ));
-        operations.push(fs_op(
+        )?);
+        let append_path = slot.clone();
+        operations.push(timed_fs_op(
             started,
             operations.len() + 1,
             &clients[1],
             "append",
             &slot,
-            || {
+            operation_timeout,
+            move |client| {
                 append_payload(
-                    clients[1].mount_point.join(&slot),
+                    client.mount_point.join(&append_path),
                     format!("append round {round}\n").as_bytes(),
                 )
             },
-        ));
-        operations.push(fs_op(
+        )?);
+        let rename_source = slot.clone();
+        let rename_target = renamed.clone();
+        operations.push(timed_fs_op(
             started,
             operations.len() + 1,
             &clients[0],
             "rename",
             &slot,
-            || {
+            operation_timeout,
+            move |client| {
                 fs::rename(
-                    clients[0].mount_point.join(&slot),
-                    clients[0].mount_point.join(&renamed),
+                    client.mount_point.join(&rename_source),
+                    client.mount_point.join(&rename_target),
                 )
             },
-        ));
-        operations.push(fs_op(
+        )?);
+        operations.push(timed_fs_op(
             started,
             operations.len() + 1,
             &clients[2],
             "readdir",
             "hotspot",
-            || fs::read_dir(clients[2].mount_point.join("hotspot")).map(|_| ()),
-        ));
+            operation_timeout,
+            |client| fs::read_dir(client.mount_point.join("hotspot")).map(|_| ()),
+        )?);
     }
     Ok(operations)
+}
+
+fn timed_fs_op(
+    started: Instant,
+    order: usize,
+    client: &ClientSpec,
+    operation: &str,
+    path: &str,
+    timeout: Duration,
+    f: impl FnOnce(&ClientSpec) -> io::Result<()> + Send + 'static,
+) -> Result<NamespaceCollisionOperation, ScenarioError> {
+    let client = client.clone();
+    let operation = operation.to_string();
+    let path = path.to_string();
+    let label = format!("{} {} {}", client.name, operation, path);
+    run_timed_hotspot_io(timeout, label, move || {
+        Ok(fs_op(started, order, &client, &operation, &path, || {
+            f(&client)
+        }))
+    })
+}
+
+fn run_timed_hotspot_io<T: Send + 'static>(
+    timeout: Duration,
+    pending_label: String,
+    f: impl FnOnce() -> io::Result<T> + Send + 'static,
+) -> Result<T, ScenarioError> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(error.into()),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(namespace_collision_operation_timeout(
+            timeout,
+            vec![(1, pending_label)],
+        )),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(ScenarioError::Io(io::Error::other(
+            "hotspot operation worker channel closed before completion",
+        ))),
+    }
 }
 
 fn run_fault_chaos_operations(
@@ -4839,6 +4902,31 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_millis(150),
             "timeout must not wait for the hung namespace worker to finish"
+        );
+    }
+
+    #[test]
+    fn hotspot_churn_operation_timeout_reports_pending_without_waiting_forever() {
+        let started = Instant::now();
+
+        let err = run_timed_hotspot_io(
+            Duration::from_millis(20),
+            "client-a mkdir hotspot".to_string(),
+            || {
+                thread::sleep(Duration::from_millis(200));
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ScenarioError::NamespaceCollisionOperationTimeout { .. }
+        ));
+        assert!(err.to_string().contains("client-a mkdir hotspot"));
+        assert!(
+            started.elapsed() < Duration::from_millis(150),
+            "hotspot timeout must not wait for the hung mounted operation to finish"
         );
     }
 

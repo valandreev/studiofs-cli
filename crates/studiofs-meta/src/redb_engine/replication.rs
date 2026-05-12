@@ -630,11 +630,13 @@ impl RedbMetaEngine {
                         Self::remove_base_dentry_in_txn(&txn, *parent, name)?;
                     } else {
                         let prior_keys = Self::base_dentry_keys_for_rename_entry(&txn, entry)?;
-                        if prior_keys.len() != 1 {
+                        if prior_keys.len() > 1 {
                             continue;
                         }
-                        let (prior_parent, prior_name) = decode_dentry_key(&prior_keys[0])?;
-                        Self::remove_base_dentry_in_txn(&txn, prior_parent, prior_name)?;
+                        if let Some(prior_key) = prior_keys.first() {
+                            let (prior_parent, prior_name) = decode_dentry_key(prior_key)?;
+                            Self::remove_base_dentry_in_txn(&txn, prior_parent, prior_name)?;
+                        }
                     }
                     Self::remove_base_dentry_in_txn(&txn, *new_parent, new_name)?;
                     Self::set_base_dentry_in_txn(&txn, *new_parent, new_name, entry)?;
@@ -965,16 +967,31 @@ impl RedbMetaEngine {
         Self::remove_stale_dentries_for_base_entry(txn, entry)?;
 
         if dst_in_base {
-            Self::remove_dentry_mirror_in_txn(txn, parent, name)?;
+            Self::remove_dentry_mirror_if_matches_in_txn(txn, parent, name, entry)?;
             Self::set_dentry_mirror_in_txn(txn, new_parent, new_name, entry)?;
         } else if src_in_base {
-            Self::remove_dentry_mirror_in_txn(txn, new_parent, new_name)?;
+            Self::remove_dentry_mirror_if_matches_in_txn(txn, new_parent, new_name, entry)?;
             Self::set_dentry_mirror_in_txn(txn, parent, name, entry)?;
         } else {
-            Self::remove_dentry_mirror_in_txn(txn, parent, name)?;
-            Self::remove_dentry_mirror_in_txn(txn, new_parent, new_name)?;
+            Self::remove_dentry_mirror_if_matches_in_txn(txn, parent, name, entry)?;
+            Self::remove_dentry_mirror_if_matches_in_txn(txn, new_parent, new_name, entry)?;
         }
 
+        Ok(())
+    }
+
+    fn remove_dentry_mirror_if_matches_in_txn(
+        txn: &redb::WriteTransaction,
+        parent: Ino,
+        name: &[u8],
+        entry: &DirEntryValue,
+    ) -> MetaResult<()> {
+        let matches = Self::lookup_in_write_table(txn, DENTRIES_TABLE, parent, name)?
+            .map(|current| current.ino == entry.ino && current.kind == entry.kind)
+            .unwrap_or(false);
+        if matches {
+            Self::remove_dentry_mirror_in_txn(txn, parent, name)?;
+        }
         Ok(())
     }
 
