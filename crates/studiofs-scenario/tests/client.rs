@@ -289,7 +289,15 @@ fn create_and_mkdir_reject_root_absolute_traversal_and_windows_paths() {
     let mut runtime = SimulatedRuntime::new(33);
     runtime.add_client("client-a");
 
-    for invalid_path in ["", "../escape", "/absolute", "bad\\path"] {
+    for invalid_path in [
+        "",
+        "../escape",
+        "dir/../escape",
+        "./relative",
+        "dir//file",
+        "/absolute",
+        "bad\\path",
+    ] {
         assert!(runtime.create_file("client-a", invalid_path).is_err());
         assert!(runtime.mkdir("client-a", invalid_path).is_err());
     }

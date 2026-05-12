@@ -1090,40 +1090,73 @@ impl SparsePayload {
         if bytes.is_empty() {
             return Ok(());
         }
-        let end = offset
-            .checked_add(bytes.len() as u64)
-            .ok_or(ClientRuntimeError::SparseRangeOverflow)?;
+        let end = Self::extent_end(offset, bytes.len())?;
+        let mut right = self.replace_extents_in_range(offset, end)?;
+        self.extents.insert(offset, bytes.to_vec());
+        self.extents.append(&mut right);
+        self.size = self.size.max(end);
+        Ok(())
+    }
+
+    fn replace_extents_in_range(
+        &mut self,
+        offset: u64,
+        end: u64,
+    ) -> Result<BTreeMap<u64, Vec<u8>>, ClientRuntimeError> {
         let mut overlapping = self.extents.split_off(&offset);
-        if let Some((&extent_offset, extent_bytes)) = self.extents.last_key_value() {
-            let extent_end = extent_offset
-                .checked_add(extent_bytes.len() as u64)
-                .ok_or(ClientRuntimeError::SparseRangeOverflow)?;
-            if extent_end > offset {
-                let extent_bytes = extent_bytes.clone();
-                let keep_len = (offset - extent_offset) as usize;
-                self.extents
-                    .insert(extent_offset, extent_bytes[..keep_len].to_vec());
-                if extent_end > end {
-                    let keep_start = (end - extent_offset) as usize;
-                    overlapping.insert(end, extent_bytes[keep_start..].to_vec());
-                }
+        self.preserve_left_overlap(offset, end, &mut overlapping)?;
+        let mut right = overlapping.split_off(&end);
+        Self::preserve_right_overlap(end, &overlapping, &mut right)?;
+        Ok(right)
+    }
+
+    fn preserve_left_overlap(
+        &mut self,
+        offset: u64,
+        end: u64,
+        overlapping: &mut BTreeMap<u64, Vec<u8>>,
+    ) -> Result<(), ClientRuntimeError> {
+        if let Some((extent_offset, extent_bytes)) = self
+            .extents
+            .last_key_value()
+            .map(|(&extent_offset, extent_bytes)| (extent_offset, extent_bytes.clone()))
+        {
+            let extent_end = Self::extent_end(extent_offset, extent_bytes.len())?;
+            if extent_end <= offset {
+                return Ok(());
+            }
+
+            let keep_len = (offset - extent_offset) as usize;
+            self.extents
+                .insert(extent_offset, extent_bytes[..keep_len].to_vec());
+            if extent_end > end {
+                let keep_start = (end - extent_offset) as usize;
+                overlapping.insert(end, extent_bytes[keep_start..].to_vec());
             }
         }
-        let mut right = overlapping.split_off(&end);
-        for (&extent_offset, extent_bytes) in &overlapping {
-            let extent_end = extent_offset
-                .checked_add(extent_bytes.len() as u64)
-                .ok_or(ClientRuntimeError::SparseRangeOverflow)?;
+        Ok(())
+    }
+
+    fn preserve_right_overlap(
+        end: u64,
+        overlapping: &BTreeMap<u64, Vec<u8>>,
+        right: &mut BTreeMap<u64, Vec<u8>>,
+    ) -> Result<(), ClientRuntimeError> {
+        for (&extent_offset, extent_bytes) in overlapping {
+            let extent_end = Self::extent_end(extent_offset, extent_bytes.len())?;
             if extent_end > end {
                 let keep_start = (end - extent_offset) as usize;
                 right.insert(end, extent_bytes[keep_start..].to_vec());
                 break;
             }
         }
-        self.extents.insert(offset, bytes.to_vec());
-        self.extents.append(&mut right);
-        self.size = self.size.max(end);
         Ok(())
+    }
+
+    fn extent_end(offset: u64, len: usize) -> Result<u64, ClientRuntimeError> {
+        offset
+            .checked_add(len as u64)
+            .ok_or(ClientRuntimeError::SparseRangeOverflow)
     }
 
     fn truncate(&mut self, size: u64) {
@@ -1637,7 +1670,9 @@ fn validate_mutation_path(client: &str, path: &str) -> Result<(), ClientRuntimeE
     if path.is_empty()
         || path.starts_with('/')
         || path.contains('\\')
-        || path.split('/').any(|component| component == "..")
+        || path
+            .split('/')
+            .any(|component| component.is_empty() || component == "." || component == "..")
     {
         return Err(ClientRuntimeError::InvalidPath {
             client: client.to_string(),
