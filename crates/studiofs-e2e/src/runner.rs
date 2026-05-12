@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
-use std::io::Write as _;
+use std::io::{IsTerminal as _, Write as _};
 use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
@@ -33,6 +33,7 @@ const SCHEMA_VERSION: u32 = 1;
 const RUNNER_CRATE: &str = "studiofs-e2e";
 const RUNNER_MARKER_FILE: &str = ".studiofs-e2e-runner.json";
 const PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+const ANSI_RESET: &str = "\x1b[0m";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -1688,6 +1689,14 @@ impl ProgressStatus {
             Self::Failed => "failed",
         }
     }
+
+    fn ansi_color(self) -> &'static str {
+        match self {
+            Self::Started => "\x1b[33m",
+            Self::Passed => "\x1b[32m",
+            Self::Failed => "\x1b[31m",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1704,12 +1713,34 @@ fn progress_line(
     phase: &str,
     status: ProgressStatus,
 ) -> String {
+    progress_line_with_status_value(timestamp, run_id, task, progress, phase, status.as_str())
+}
+
+fn progress_line_with_status_color(
+    timestamp: &str,
+    run_id: &str,
+    task: &str,
+    progress: Option<ScenarioProgress>,
+    phase: &str,
+    status: ProgressStatus,
+) -> String {
+    let status_value = format!("{}{}{}", status.ansi_color(), status.as_str(), ANSI_RESET);
+    progress_line_with_status_value(timestamp, run_id, task, progress, phase, &status_value)
+}
+
+fn progress_line_with_status_value(
+    timestamp: &str,
+    run_id: &str,
+    task: &str,
+    progress: Option<ScenarioProgress>,
+    phase: &str,
+    status: &str,
+) -> String {
     let progress = progress
         .map(|progress| format!(" scenario_progress={}/{}", progress.index, progress.total))
         .unwrap_or_default();
     format!(
-        "timestamp={timestamp} studiofs-e2e run_id={run_id} task={task}{progress} phase={phase} status={}",
-        status.as_str()
+        "timestamp={timestamp} studiofs-e2e run_id={run_id} task={task}{progress} phase={phase} status={status}"
     )
 }
 
@@ -1720,12 +1751,15 @@ fn emit_progress(
     phase: &str,
     status: ProgressStatus,
 ) {
+    let timestamp = timestamp();
+    let color_status = std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    let line = if color_status {
+        progress_line_with_status_color(&timestamp, run_id, task, progress, phase, status)
+    } else {
+        progress_line(&timestamp, run_id, task, progress, phase, status)
+    };
     let mut stderr = std::io::stderr().lock();
-    let _ = writeln!(
-        stderr,
-        "{}",
-        progress_line(&timestamp(), run_id, task, progress, phase, status)
-    );
+    let _ = writeln!(stderr, "{line}");
     let _ = stderr.flush();
 }
 
@@ -2259,6 +2293,43 @@ mod tests {
                 ProgressStatus::Started
             ),
             "timestamp=2026-05-11T16:40:00.000Z studiofs-e2e run_id=run-1 task=runner phase=preflight status=started"
+        );
+    }
+
+    #[test]
+    fn progress_line_can_color_only_status_value() {
+        assert_eq!(
+            progress_line_with_status_color(
+                "2026-05-11T16:40:00.000Z",
+                "run-1",
+                "runner",
+                None,
+                "preflight",
+                ProgressStatus::Started
+            ),
+            "timestamp=2026-05-11T16:40:00.000Z studiofs-e2e run_id=run-1 task=runner phase=preflight status=\x1b[33mstarted\x1b[0m"
+        );
+        assert_eq!(
+            progress_line_with_status_color(
+                "2026-05-11T16:40:00.000Z",
+                "run-1",
+                "runner",
+                None,
+                "cleanup",
+                ProgressStatus::Passed
+            ),
+            "timestamp=2026-05-11T16:40:00.000Z studiofs-e2e run_id=run-1 task=runner phase=cleanup status=\x1b[32mpassed\x1b[0m"
+        );
+        assert_eq!(
+            progress_line_with_status_color(
+                "2026-05-11T16:40:00.000Z",
+                "run-1",
+                "collision-rename-vs-rename",
+                Some(ScenarioProgress { index: 3, total: 8 }),
+                "validate",
+                ProgressStatus::Failed
+            ),
+            "timestamp=2026-05-11T16:40:00.000Z studiofs-e2e run_id=run-1 task=collision-rename-vs-rename scenario_progress=3/8 phase=validate status=\x1b[31mfailed\x1b[0m"
         );
     }
 
