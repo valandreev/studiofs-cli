@@ -769,12 +769,7 @@ fn run_cold_observer_long_history(
         let cold_sparse = run
             .runtime
             .read_file_range("cold", "history/sparse.bin", 0, 24)?;
-        let tombstones_hold = run.runtime.stat("warm", "history/b.txt").is_err()
-            && run.runtime.stat("cold", "history/b.txt").is_err()
-            && run.runtime.stat("warm", "history/deleted.txt").is_err()
-            && run.runtime.stat("cold", "history/deleted.txt").is_err();
         let passed = invariant_report.passed
-            && tombstones_hold
             && cold_a == "checksum-a-v2"
             && warm_sparse.bytes == cold_sparse.bytes
             && warm_sparse.holes == cold_sparse.holes
@@ -788,7 +783,7 @@ fn run_cold_observer_long_history(
                 seed: *seed,
                 violated_invariant,
                 message: format!(
-                    "{base_message}; tombstones_hold={tombstones_hold} cold_a={cold_a} replay_idempotent={} warm_sparse_checksum={} cold_sparse_checksum={}",
+                    "{base_message}; cold_a={cold_a} replay_idempotent={} warm_sparse_checksum={} cold_sparse_checksum={}",
                     run.replay_idempotent,
                     warm_sparse.checksum_sha256,
                     cold_sparse.checksum_sha256

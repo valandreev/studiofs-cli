@@ -685,13 +685,15 @@ impl SimulatedRuntime {
     /// Function $name.
     pub fn deliver_all_metadata(&mut self, client: &str) -> Result<usize, ClientRuntimeError> {
         let mut delivered = 0;
-        loop {
+        let pending = self.metadata_bus.pending_count_for(client);
+        for _ in 0..pending {
             match self.deliver_next_metadata(client) {
                 Ok(_) => delivered += 1,
                 Err(ClientRuntimeError::NoPendingMetadata { .. }) => return Ok(delivered),
                 Err(error) => return Err(error),
             }
         }
+        Ok(delivered)
     }
 
     /// Function $name.
