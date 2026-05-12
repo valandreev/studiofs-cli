@@ -1,6 +1,6 @@
 //! Runner orchestration, sandbox creation, reports, and cleanup.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
@@ -19,8 +19,8 @@ use crate::client::{
     client_mount_point, client_root_dir,
 };
 use crate::infra::{
-    CommandExecutor, CommandSpec, ComposeConfig, DockerComposeStack, InfraCheck, InfraError,
-    InfraMode, SystemCommandExecutor,
+    COMPOSE_PROJECT_PREFIX, CommandExecutor, CommandSpec, ComposeConfig, ComposeServiceControl,
+    DockerComposeStack, InfraCheck, InfraError, InfraMode, SystemCommandExecutor,
 };
 use crate::report::{
     ArtifactReport, CleanupReport, ComposeImageReport, EnvironmentReport, EventRecord, HostReport,
@@ -920,6 +920,12 @@ fn prepare_preflight(
         });
     };
 
+    runner_checks.push(stale_compose_cleanup_check(
+        root,
+        sandbox,
+        stack.ports(),
+        executor,
+    ));
     stack.prepare_artifacts()?;
     let mut checks = runner_checks;
     checks.extend(
@@ -1003,6 +1009,271 @@ fn stale_process_cleanup_detail(stdout: &str) -> String {
     } else {
         format!("cleaned runner-owned stale StudioFS processes:\n{detail}")
     }
+}
+
+fn stale_compose_cleanup_check(
+    root: &Path,
+    current_sandbox: &Path,
+    current_ports: &[crate::infra::ServicePort],
+    executor: &dyn CommandExecutor,
+) -> PreflightCheckReport {
+    match cleanup_stale_compose_projects(root, current_sandbox, current_ports, executor) {
+        Ok(cleaned) => PreflightCheckReport {
+            name: "runner-owned stale compose cleanup".to_string(),
+            status: RunStatus::Passed,
+            detail: if cleaned.is_empty() {
+                "no runner-owned stale compose projects found".to_string()
+            } else {
+                format!(
+                    "cleaned runner-owned stale compose projects:\n{}",
+                    cleaned.join("\n")
+                )
+            },
+        },
+        Err(error) => PreflightCheckReport {
+            name: "runner-owned stale compose cleanup".to_string(),
+            status: RunStatus::PreflightFailed,
+            detail: error,
+        },
+    }
+}
+
+fn cleanup_stale_compose_projects(
+    root: &Path,
+    current_sandbox: &Path,
+    current_ports: &[crate::infra::ServicePort],
+    executor: &dyn CommandExecutor,
+) -> Result<Vec<String>, String> {
+    if current_ports.is_empty() || !root.exists() {
+        return Ok(Vec::new());
+    }
+    let current_sandbox = absolute_without_requiring_exists(current_sandbox);
+    let current_host_ports = current_ports
+        .iter()
+        .map(|port| port.host_port)
+        .collect::<BTreeSet<_>>();
+    let existing_projects = existing_compose_projects(executor)?;
+    let mut cleaned = Vec::new();
+    for project in existing_projects.values() {
+        if !is_runner_owned_compose_project(&project.name) {
+            continue;
+        }
+        let Some((sandbox, manifest)) = manifest_for_compose_project(root, &project.name) else {
+            continue;
+        };
+        if absolute_without_requiring_exists(&sandbox) == current_sandbox {
+            continue;
+        }
+        let overlaps_current_ports = manifest
+            .allocated_ports
+            .iter()
+            .any(|port| current_host_ports.contains(&port.host_port));
+        if !overlaps_current_ports {
+            continue;
+        }
+        match runner_owner_status(&sandbox, executor)? {
+            RunnerOwnerStatus::Active(pid) => {
+                return Err(format!(
+                    "runner-owned compose project {} overlaps current ports but owner pid {pid} is still active; leaving it running",
+                    project.name
+                ));
+            }
+            RunnerOwnerStatus::Unknown
+                if project.status.to_ascii_lowercase().contains("running") =>
+            {
+                return Err(format!(
+                    "runner-owned compose project {} overlaps current ports but has no owner_pid marker; leaving running project untouched",
+                    project.name
+                ));
+            }
+            RunnerOwnerStatus::Dead(_) | RunnerOwnerStatus::Unknown => {}
+        }
+        let control = ComposeServiceControl::for_project_with_environment(
+            project.name.clone(),
+            compose_environment_from_manifest(&manifest),
+        )
+        .map_err(|err| format!("{}: {err}", project.name))?;
+        control
+            .teardown(executor)
+            .map_err(|err| format!("{}: {err}", project.name))?;
+        cleaned.push(project.name.clone());
+    }
+    Ok(cleaned)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExistingComposeProject {
+    name: String,
+    status: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ComposeLsProject {
+    #[serde(rename = "Name", alias = "name")]
+    name: String,
+    #[serde(rename = "Status", alias = "status", default)]
+    status: String,
+}
+
+fn existing_compose_projects(
+    executor: &dyn CommandExecutor,
+) -> Result<BTreeMap<String, ExistingComposeProject>, String> {
+    let output = executor
+        .run(&CommandSpec {
+            program: "docker".to_string(),
+            args: vec![
+                "compose".to_string(),
+                "ls".to_string(),
+                "--all".to_string(),
+                "--format".to_string(),
+                "json".to_string(),
+            ],
+            env: Vec::new(),
+            cwd: None,
+            timeout: Some(Duration::from_secs(30)),
+        })
+        .map_err(|err| err.to_string())?;
+    if output.status != 0 {
+        return Err(command_failure_detail(output.status, &output.stderr));
+    }
+    let stdout = output.stdout.trim();
+    if stdout.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let entries = serde_json::from_str::<Vec<ComposeLsProject>>(stdout).map_err(|err| {
+        format!("docker compose ls --format json returned unexpected JSON: {err}")
+    })?;
+    Ok(entries
+        .into_iter()
+        .map(|entry| {
+            let name = entry.name;
+            (
+                name.clone(),
+                ExistingComposeProject {
+                    name,
+                    status: entry.status,
+                },
+            )
+        })
+        .collect())
+}
+
+fn manifest_for_compose_project(root: &Path, project: &str) -> Option<(PathBuf, RunManifest)> {
+    for run_id in run_id_candidates_for_compose_project(project)? {
+        let sandbox = root.join(run_id);
+        let manifest_path = sandbox.join("run.json");
+        let Some(manifest) = read_run_manifest(&manifest_path) else {
+            continue;
+        };
+        if manifest.infra == InfraMode::Compose
+            && manifest.compose_project.as_deref() == Some(project)
+            && is_runner_owned_compose_project(project)
+        {
+            return Some((sandbox, manifest));
+        }
+    }
+    None
+}
+
+fn read_run_manifest(path: &Path) -> Option<RunManifest> {
+    fs::File::open(path)
+        .ok()
+        .and_then(|file| serde_json::from_reader::<_, RunManifest>(file).ok())
+}
+
+fn run_id_candidates_for_compose_project(project: &str) -> Option<Vec<String>> {
+    let suffix = project.strip_prefix(COMPOSE_PROJECT_PREFIX)?;
+    let mut candidates = vec![suffix.to_string()];
+    let mut chars = suffix.chars().collect::<Vec<_>>();
+    if chars.len() > 15 && chars.get(8) == Some(&'t') && chars.get(15) == Some(&'z') {
+        chars[8] = 'T';
+        chars[15] = 'Z';
+        let generated = chars.into_iter().collect::<String>();
+        if generated != suffix {
+            candidates.push(generated);
+        }
+    }
+    Some(candidates)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunnerOwnerStatus {
+    Active(u32),
+    Dead(u32),
+    Unknown,
+}
+
+fn runner_owner_status(
+    sandbox: &Path,
+    executor: &dyn CommandExecutor,
+) -> Result<RunnerOwnerStatus, String> {
+    let marker_path = sandbox.join(RUNNER_MARKER_FILE);
+    let marker = fs::read(&marker_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+    let Some(pid) = marker
+        .as_ref()
+        .and_then(|value| value.get("owner_pid"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok())
+    else {
+        return Ok(RunnerOwnerStatus::Unknown);
+    };
+    let output = executor
+        .run(&owner_liveness_command(pid))
+        .map_err(|err| format!("owner pid {pid} liveness check failed: {err}"))?;
+    if output.status == 0 {
+        Ok(RunnerOwnerStatus::Active(pid))
+    } else {
+        Ok(RunnerOwnerStatus::Dead(pid))
+    }
+}
+
+fn owner_liveness_command(pid: u32) -> CommandSpec {
+    if cfg!(windows) {
+        CommandSpec {
+            program: "powershell".to_string(),
+            args: vec![
+                "-NoProfile".to_string(),
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
+                "-Command".to_string(),
+                "$ownerPid=$env:STUDIOFS_E2E_OWNER_PID; $process=Get-CimInstance Win32_Process -Filter \"ProcessId = $ownerPid\" -ErrorAction SilentlyContinue; if ($null -eq $process) { exit 1 } else { exit 0 }".to_string(),
+            ],
+            env: vec![("STUDIOFS_E2E_OWNER_PID".to_string(), pid.to_string())],
+            cwd: None,
+            timeout: Some(Duration::from_secs(5)),
+        }
+    } else {
+        CommandSpec {
+            program: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "kill -0 \"$STUDIOFS_E2E_OWNER_PID\" >/dev/null 2>&1".to_string(),
+            ],
+            env: vec![("STUDIOFS_E2E_OWNER_PID".to_string(), pid.to_string())],
+            cwd: None,
+            timeout: Some(Duration::from_secs(5)),
+        }
+    }
+}
+
+fn compose_environment_from_manifest(manifest: &RunManifest) -> Vec<(String, String)> {
+    let mut env = vec![("STUDIOFS_E2E_RUN_ID".to_string(), manifest.run_id.clone())];
+    env.extend(
+        manifest
+            .allocated_ports
+            .iter()
+            .map(|port| (port.env_var.clone(), port.host_port.to_string())),
+    );
+    env
+}
+
+fn is_runner_owned_compose_project(project: &str) -> bool {
+    project.starts_with(COMPOSE_PROJECT_PREFIX)
+        && project
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
 }
 
 fn command_failure_detail(status: i32, stderr: &str) -> String {
@@ -1722,6 +1993,7 @@ fn write_runner_marker(sandbox: &Path, run_id: &str) -> Result<(), RunnerError> 
             "schema_version": SCHEMA_VERSION,
             "runner_crate": RUNNER_CRATE,
             "run_id": run_id,
+            "owner_pid": std::process::id(),
             "sandbox": sandbox.display().to_string(),
         }),
     )
@@ -2382,6 +2654,243 @@ mod tests {
     }
 
     #[test]
+    fn runner_run_cleans_stale_compose_projects_before_port_preflight() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("e2e-runs");
+        let stale_sandbox = root.join("stale-run");
+        std::fs::create_dir_all(&stale_sandbox).unwrap();
+        std::fs::write(
+            stale_sandbox.join("run.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "runner_crate": RUNNER_CRATE,
+                "run_id": "stale-run",
+                "seed": 0,
+                "sandbox": stale_sandbox.display().to_string(),
+                "scenarios": [scenario::BASIC_MULTI_CLIENT_SMOKE],
+                "retention": "on-failure",
+                "selected_platform": "windows-winfsp",
+                "infra": "compose",
+                "compose_project": "studiofs-e2e-stale-run",
+                "allocated_ports": [
+                    {
+                        "service": "postgres",
+                        "host": "127.0.0.1",
+                        "host_port": 33600,
+                        "container_port": 5432,
+                        "env_var": "STUDIOFS_E2E_POSTGRES_PORT"
+                    }
+                ],
+                "studiofs_bin": null,
+                "port_range": "33600-33603",
+                "timeout": null,
+                "explicit_client_roots": [],
+                "cleanup_allowlist": [stale_sandbox.display().to_string()],
+                "created_at": "2026-05-12T19:55:45.337Z"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            stale_sandbox.join(RUNNER_MARKER_FILE),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "runner_crate": RUNNER_CRATE,
+                "run_id": "stale-run",
+                "owner_pid": 4242,
+                "sandbox": stale_sandbox.display().to_string()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let executor = RecordingExecutor::default();
+        executor.compose_ls_stdout.replace(
+            serde_json::json!([
+                {
+                    "Name": "studiofs-e2e-stale-run",
+                    "Status": "running(3)"
+                }
+            ])
+            .to_string(),
+        );
+
+        let outcome = run_with_executor(
+            RunRequest {
+                root,
+                run_id: Some("current-run".to_string()),
+                scenarios: vec![scenario::TEST_PASSING.to_string()],
+                seed: 407,
+                studiofs_bin: None,
+                platform: PlatformSelection::WindowsWinfsp,
+                retention: RetentionPolicy::Always,
+                report: None,
+                port_range: Some("33600-33603".to_string()),
+                timeout: None,
+                infra: InfraMode::Compose,
+            },
+            &executor,
+        )
+        .unwrap();
+
+        let calls = executor.calls.borrow();
+        let stale_down_index = calls
+            .iter()
+            .position(|call| {
+                call.args.contains(&"--project-name".to_string())
+                    && call.args.contains(&"studiofs-e2e-stale-run".to_string())
+                    && call.args.contains(&"down".to_string())
+            })
+            .expect("stale compose cleanup should run docker compose down");
+        let current_up_index = calls
+            .iter()
+            .position(|call| {
+                call.args.contains(&"--project-name".to_string())
+                    && call.args.contains(&"studiofs-e2e-current-run".to_string())
+                    && call.args.contains(&"up".to_string())
+            })
+            .expect("current compose stack should start after stale cleanup");
+        assert!(stale_down_index < current_up_index);
+
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(outcome.report_path).unwrap()).unwrap();
+        assert!(
+            report["preflight"]["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(
+                    |check| check["name"] == "runner-owned stale compose cleanup"
+                        && check["status"] == "passed"
+                        && check["detail"]
+                            .as_str()
+                            .unwrap()
+                            .contains("studiofs-e2e-stale-run")
+                )
+        );
+    }
+
+    #[test]
+    fn runner_run_refuses_to_clean_active_compose_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("e2e-runs");
+        let active_sandbox = root.join("active-run");
+        std::fs::create_dir_all(&active_sandbox).unwrap();
+        std::fs::write(
+            active_sandbox.join("run.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "runner_crate": RUNNER_CRATE,
+                "run_id": "active-run",
+                "seed": 0,
+                "sandbox": active_sandbox.display().to_string(),
+                "scenarios": [scenario::BASIC_MULTI_CLIENT_SMOKE],
+                "retention": "on-failure",
+                "selected_platform": "windows-winfsp",
+                "infra": "compose",
+                "compose_project": "studiofs-e2e-active-run",
+                "allocated_ports": [
+                    {
+                        "service": "postgres",
+                        "host": "127.0.0.1",
+                        "host_port": 33600,
+                        "container_port": 5432,
+                        "env_var": "STUDIOFS_E2E_POSTGRES_PORT"
+                    }
+                ],
+                "studiofs_bin": null,
+                "port_range": "33600-33603",
+                "timeout": null,
+                "explicit_client_roots": [],
+                "cleanup_allowlist": [active_sandbox.display().to_string()],
+                "created_at": "2026-05-12T19:55:45.337Z"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            active_sandbox.join(RUNNER_MARKER_FILE),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "runner_crate": RUNNER_CRATE,
+                "run_id": "active-run",
+                "owner_pid": 4242,
+                "sandbox": active_sandbox.display().to_string()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let executor = RecordingExecutor::default();
+        executor.active_owner_pids.borrow_mut().insert(4242);
+        executor.compose_ls_stdout.replace(
+            serde_json::json!([
+                {
+                    "Name": "studiofs-e2e-active-run",
+                    "Status": "running(3)"
+                }
+            ])
+            .to_string(),
+        );
+
+        let outcome = run_with_executor(
+            RunRequest {
+                root,
+                run_id: Some("current-run".to_string()),
+                scenarios: vec![scenario::TEST_PASSING.to_string()],
+                seed: 408,
+                studiofs_bin: None,
+                platform: PlatformSelection::WindowsWinfsp,
+                retention: RetentionPolicy::Always,
+                report: None,
+                port_range: Some("33600-33603".to_string()),
+                timeout: None,
+                infra: InfraMode::Compose,
+            },
+            &executor,
+        )
+        .unwrap();
+
+        let calls = executor.calls.borrow();
+        assert!(!calls.iter().any(|call| {
+            call.args.contains(&"studiofs-e2e-active-run".to_string())
+                && call.args.contains(&"down".to_string())
+        }));
+        assert!(!calls.iter().any(|call| {
+            call.args.contains(&"studiofs-e2e-current-run".to_string())
+                && call.args.contains(&"up".to_string())
+        }));
+
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(outcome.report_path).unwrap()).unwrap();
+        assert_eq!(report["status"], "preflight_failed");
+        assert!(
+            report["preflight"]["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(
+                    |check| check["name"] == "runner-owned stale compose cleanup"
+                        && check["status"] == "preflight_failed"
+                        && check["detail"]
+                            .as_str()
+                            .unwrap()
+                            .contains("owner pid 4242 is still active")
+                )
+        );
+    }
+
+    #[test]
+    fn existing_compose_projects_rejects_unexpected_json_shape() {
+        let executor = RecordingExecutor::default();
+        executor
+            .compose_ls_stdout
+            .replace(serde_json::json!({ "Name": "studiofs-e2e-old" }).to_string());
+
+        let err = existing_compose_projects(&executor).unwrap_err();
+
+        assert!(err.contains("unexpected JSON"));
+    }
+
+    #[test]
     fn run_with_compose_infra_tears_down_when_post_start_io_fails() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("e2e-runs");
@@ -2628,6 +3137,8 @@ mod tests {
     #[derive(Default)]
     struct RecordingExecutor {
         calls: RefCell<Vec<crate::infra::CommandSpec>>,
+        compose_ls_stdout: RefCell<String>,
+        active_owner_pids: RefCell<BTreeSet<u32>>,
         poison_events_path_after_up: RefCell<Option<PathBuf>>,
         poison_failure_boundary_path_after_up: RefCell<Option<PathBuf>>,
         fail_up: Cell<bool>,
@@ -2637,6 +3148,29 @@ mod tests {
     impl CommandExecutor for RecordingExecutor {
         fn run(&self, command: &crate::infra::CommandSpec) -> std::io::Result<CommandOutput> {
             self.calls.borrow_mut().push(command.clone());
+            if let Some((_, pid)) = command
+                .env
+                .iter()
+                .find(|(key, _)| key == "STUDIOFS_E2E_OWNER_PID")
+            {
+                let status = pid
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|pid| self.active_owner_pids.borrow().contains(pid))
+                    .map_or(1, |_| 0);
+                return Ok(CommandOutput {
+                    status,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                });
+            }
+            if command.args.contains(&"ls".to_string()) {
+                return Ok(CommandOutput {
+                    status: 0,
+                    stdout: self.compose_ls_stdout.borrow().clone(),
+                    stderr: String::new(),
+                });
+            }
             if command.args.contains(&"up".to_string()) {
                 if self.fail_up.get() {
                     return Ok(CommandOutput {

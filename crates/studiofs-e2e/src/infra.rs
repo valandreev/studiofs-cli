@@ -21,6 +21,7 @@ const DEFAULT_TOXIPROXY_API_PORT: u16 = 28_474;
 const COMPOSE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 const COMPOSE_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(30);
 
+pub const COMPOSE_PROJECT_PREFIX: &str = "studiofs-e2e-";
 pub const POSTGRES_SERVICE_NAME: &str = "postgres";
 pub const RUSTFS_SERVICE_NAME: &str = "rustfs";
 const RUSTFS_CONSOLE_SERVICE_NAME: &str = "rustfs-console";
@@ -691,6 +692,22 @@ impl ComposeServiceControl {
         Ok(())
     }
 
+    pub fn teardown(&self, executor: &dyn CommandExecutor) -> Result<(), InfraError> {
+        let mut command = self.compose_command();
+        command.timeout = Some(COMPOSE_CLEANUP_TIMEOUT);
+        command.args.extend([
+            "down".to_string(),
+            "--volumes".to_string(),
+            "--remove-orphans".to_string(),
+        ]);
+        run_success(
+            executor,
+            "docker compose down --volumes --remove-orphans",
+            command,
+        )?;
+        Ok(())
+    }
+
     fn compose_command(&self) -> CommandSpec {
         CommandSpec {
             program: "docker".to_string(),
@@ -815,7 +832,7 @@ fn compose_project_name(run_id: &str) -> String {
             }
         })
         .collect();
-    format!("studiofs-e2e-{normalized}")
+    format!("{COMPOSE_PROJECT_PREFIX}{normalized}")
 }
 
 fn default_compose_file() -> PathBuf {
