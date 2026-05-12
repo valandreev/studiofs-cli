@@ -32,14 +32,25 @@ pub const BASIC_MULTI_CLIENT_SMOKE: &str = "basic-multi-client-smoke";
 pub const POSTGRES_OUTAGE_MULTI_CLIENT_RECOVERY: &str = "postgres-outage-multi-client-recovery";
 pub const RUSTFS_OUTAGE_MULTI_CLIENT_RECOVERY: &str = "rustfs-outage-multi-client-recovery";
 pub const MOUNTED_CLIENT_CRASH_RESTART_RECOVERY: &str = "mounted-client-crash-restart-recovery";
+pub const MOUNTED_PUBLICATION_BOUNDARY_CRASH_MATRIX: &str =
+    "mounted-publication-boundary-crash-matrix";
 pub const COLLISION_RENAME_VS_RENAME: &str = "collision-rename-vs-rename";
 pub const COLLISION_RENAME_VS_UNLINK: &str = "collision-rename-vs-unlink";
 pub const COLLISION_UNLINK_VS_APPEND: &str = "collision-unlink-vs-append";
 pub const COLLISION_OVERWRITE_VS_READ: &str = "collision-overwrite-vs-read";
 pub const COLLISION_MKDIR_RMDIR_VS_CREATE: &str = "collision-mkdir-rmdir-vs-create";
 pub const COLLISION_READDIR_STAT_DURING_MUTATION: &str = "collision-readdir-stat-during-mutation";
+pub const MOUNTED_CHAOS_CONVERGENCE: &str = "mounted-chaos-convergence";
+pub const MOUNTED_HOTSPOT_CHURN_CONVERGENCE: &str = "mounted-hotspot-churn-convergence";
+pub const MOUNTED_FAULT_CHAOS_CONVERGENCE: &str = "mounted-fault-chaos-convergence";
+pub const MOUNTED_LWW_RECONNECT_CHAOS_CONVERGENCE: &str = "mounted-lww-reconnect-chaos-convergence";
+pub const MOUNTED_OPEN_HANDLE_CONVERGENCE: &str = "mounted-open-handle-convergence";
 const SMOKE_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
 const COLLISION_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
+const ADVANCED_MOUNTED_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
+const FAULT_CHAOS_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c", "client-d"];
+const LWW_RECONNECT_CLIENT_NAMES: &[&str] =
+    &["client-a", "client-b", "client-c", "client-d", "client-e"];
 const POSTGRES_OUTAGE_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
 const RUSTFS_OUTAGE_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c", "client-d"];
 const CRASH_RESTART_CLIENT_NAMES: &[&str] = &["client-a", "client-b"];
@@ -68,6 +79,10 @@ const COLLISION_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const COLLISION_OLD_COMMITTED_PAYLOAD: &[u8] = b"old committed payload\n";
 const COLLISION_NEW_COMMITTED_PAYLOAD: &[u8] = b"new committed payload\n";
 const OVERWRITE_READ_ATTEMPTS: u32 = 8;
+const ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(90);
+const ADVANCED_MOUNTED_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const LWW_RECONNECT_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(120);
+const FAULT_CHAOS_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[cfg(test)]
 pub(crate) const TEST_FAILING_VALIDATE: &str = "__test-failing-validate";
@@ -157,6 +172,14 @@ pub enum ScenarioError {
     InsufficientCollisionClients { expected: usize, actual: usize },
     #[error("namespace collision scenario failed: {primary}; unmount also failed: {cleanup}")]
     NamespaceCollisionUnmountAfterFailure { primary: String, cleanup: String },
+    #[error(
+        "advanced mounted scenario {scenario} failed: {primary}; unmount also failed: {cleanup}"
+    )]
+    AdvancedMountedUnmountAfterFailure {
+        scenario: String,
+        primary: String,
+        cleanup: String,
+    },
     #[error("namespace collision operations timed out after {timeout_ms} ms; pending: {pending:?}")]
     NamespaceCollisionOperationTimeout {
         timeout_ms: u128,
@@ -182,16 +205,23 @@ pub trait Scenario {
 pub fn available_scenarios() -> Vec<ScenarioDefinition> {
     vec![
         BasicMultiClientSmoke.definition(),
-        RustfsOutageMultiClientRecovery.definition(),
-        NamespaceCollisionScenario::new(NamespaceCollisionKind::RenameVsRename).definition(),
         PostgresOutageMultiClientRecovery.definition(),
+        RustfsOutageMultiClientRecovery.definition(),
         MountedClientCrashRestartRecovery.definition(),
+        AdvancedMountedScenario::new(AdvancedMountedKind::PublicationBoundaryCrashMatrix)
+            .definition(),
+        NamespaceCollisionScenario::new(NamespaceCollisionKind::RenameVsRename).definition(),
         NamespaceCollisionScenario::new(NamespaceCollisionKind::RenameVsUnlink).definition(),
         NamespaceCollisionScenario::new(NamespaceCollisionKind::UnlinkVsAppend).definition(),
         NamespaceCollisionScenario::new(NamespaceCollisionKind::OverwriteVsRead).definition(),
         NamespaceCollisionScenario::new(NamespaceCollisionKind::MkdirRmdirVsCreate).definition(),
         NamespaceCollisionScenario::new(NamespaceCollisionKind::ReaddirStatDuringMutation)
             .definition(),
+        AdvancedMountedScenario::new(AdvancedMountedKind::MountedChaos).definition(),
+        AdvancedMountedScenario::new(AdvancedMountedKind::HotspotChurn).definition(),
+        AdvancedMountedScenario::new(AdvancedMountedKind::FaultChaos).definition(),
+        AdvancedMountedScenario::new(AdvancedMountedKind::LwwReconnectChaos).definition(),
+        AdvancedMountedScenario::new(AdvancedMountedKind::OpenHandle).definition(),
     ]
 }
 
@@ -207,6 +237,11 @@ pub(crate) fn resolve_scenario(name: &str) -> Option<Box<dyn Scenario>> {
         MOUNTED_CLIENT_CRASH_RESTART_RECOVERY | "client-crash-restart" | "crash-restart" => {
             Some(Box::new(MountedClientCrashRestartRecovery))
         }
+        MOUNTED_PUBLICATION_BOUNDARY_CRASH_MATRIX
+        | "publication-boundary-crash"
+        | "publication-boundary" => Some(Box::new(AdvancedMountedScenario::new(
+            AdvancedMountedKind::PublicationBoundaryCrashMatrix,
+        ))),
         COLLISION_RENAME_VS_RENAME | "rename-vs-rename" => Some(Box::new(
             NamespaceCollisionScenario::new(NamespaceCollisionKind::RenameVsRename),
         )),
@@ -224,6 +259,21 @@ pub(crate) fn resolve_scenario(name: &str) -> Option<Box<dyn Scenario>> {
         )),
         COLLISION_READDIR_STAT_DURING_MUTATION | "readdir-stat-during-mutation" => Some(Box::new(
             NamespaceCollisionScenario::new(NamespaceCollisionKind::ReaddirStatDuringMutation),
+        )),
+        MOUNTED_CHAOS_CONVERGENCE | "mounted-chaos" | "chaos" => Some(Box::new(
+            AdvancedMountedScenario::new(AdvancedMountedKind::MountedChaos),
+        )),
+        MOUNTED_HOTSPOT_CHURN_CONVERGENCE | "hotspot-churn" | "hot-dir-churn" => Some(Box::new(
+            AdvancedMountedScenario::new(AdvancedMountedKind::HotspotChurn),
+        )),
+        MOUNTED_FAULT_CHAOS_CONVERGENCE | "fault-chaos" | "chaos-faults" => Some(Box::new(
+            AdvancedMountedScenario::new(AdvancedMountedKind::FaultChaos),
+        )),
+        MOUNTED_LWW_RECONNECT_CHAOS_CONVERGENCE | "lww-chaos" | "reconnect-lww" => Some(Box::new(
+            AdvancedMountedScenario::new(AdvancedMountedKind::LwwReconnectChaos),
+        )),
+        MOUNTED_OPEN_HANDLE_CONVERGENCE | "open-handle" | "open-unlink-rename" => Some(Box::new(
+            AdvancedMountedScenario::new(AdvancedMountedKind::OpenHandle),
         )),
         #[cfg(test)]
         TEST_FAILING_VALIDATE => Some(Box::new(TestFailingScenario {
@@ -2656,6 +2706,1021 @@ fn bytes_sha256(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     format!("{:x}", hasher.finalize())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdvancedMountedKind {
+    PublicationBoundaryCrashMatrix,
+    MountedChaos,
+    HotspotChurn,
+    FaultChaos,
+    LwwReconnectChaos,
+    OpenHandle,
+}
+
+impl AdvancedMountedKind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::PublicationBoundaryCrashMatrix => MOUNTED_PUBLICATION_BOUNDARY_CRASH_MATRIX,
+            Self::MountedChaos => MOUNTED_CHAOS_CONVERGENCE,
+            Self::HotspotChurn => MOUNTED_HOTSPOT_CHURN_CONVERGENCE,
+            Self::FaultChaos => MOUNTED_FAULT_CHAOS_CONVERGENCE,
+            Self::LwwReconnectChaos => MOUNTED_LWW_RECONNECT_CHAOS_CONVERGENCE,
+            Self::OpenHandle => MOUNTED_OPEN_HANDLE_CONVERGENCE,
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::PublicationBoundaryCrashMatrix => "mounted publication-boundary crash matrix",
+            Self::MountedChaos => "seeded mounted namespace chaos convergence",
+            Self::HotspotChurn => "mounted hot-spot churn convergence",
+            Self::FaultChaos => "mounted fault chaos convergence",
+            Self::LwwReconnectChaos => "mounted LWW reconnect chaos convergence",
+            Self::OpenHandle => "mounted open-handle convergence",
+        }
+    }
+
+    fn summary_file(self) -> &'static str {
+        match self {
+            Self::PublicationBoundaryCrashMatrix => "publication-boundary-summary.json",
+            Self::MountedChaos => "mounted-chaos-summary.json",
+            Self::HotspotChurn => "mounted-hotspot-churn-summary.json",
+            Self::FaultChaos => "mounted-fault-chaos-summary.json",
+            Self::LwwReconnectChaos => "mounted-lww-reconnect-chaos-summary.json",
+            Self::OpenHandle => "mounted-open-handle-summary.json",
+        }
+    }
+
+    fn client_names(self) -> &'static [&'static str] {
+        match self {
+            Self::FaultChaos => FAULT_CHAOS_CLIENT_NAMES,
+            Self::LwwReconnectChaos => LWW_RECONNECT_CLIENT_NAMES,
+            _ => ADVANCED_MOUNTED_CLIENT_NAMES,
+        }
+    }
+
+    fn convergence_timeout(self) -> Duration {
+        match self {
+            Self::FaultChaos => FAULT_CHAOS_CONVERGENCE_TIMEOUT,
+            Self::LwwReconnectChaos => LWW_RECONNECT_CONVERGENCE_TIMEOUT,
+            _ => ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT,
+        }
+    }
+
+    fn expected_absent_paths(self) -> &'static [&'static str] {
+        match self {
+            Self::OpenHandle => &["open-handles/unlink-target.txt"],
+            _ => &[],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AdvancedMountedScenario {
+    kind: AdvancedMountedKind,
+}
+
+impl AdvancedMountedScenario {
+    fn new(kind: AdvancedMountedKind) -> Self {
+        Self { kind }
+    }
+}
+
+impl Scenario for AdvancedMountedScenario {
+    fn definition(&self) -> ScenarioDefinition {
+        ScenarioDefinition {
+            name: self.kind.name(),
+            description: self.kind.description(),
+            requires_studiofs_bin: true,
+        }
+    }
+
+    fn setup(&self, context: &ScenarioContext) -> Result<(), ScenarioError> {
+        fs::create_dir_all(&context.scenario_dir)?;
+        Ok(())
+    }
+
+    fn run(&self, context: &ScenarioContext) -> Result<(), ScenarioError> {
+        if let Some(config) = &context.client_controller_config {
+            let mut controller =
+                MultiClientController::new(config.clone(), SystemClientProcessExecutor);
+            run_advanced_mounted_with_controller(context, self.kind, &mut controller)?;
+        } else {
+            write_advanced_mounted_plan_artifacts(context, self.kind)?;
+        }
+        Ok(())
+    }
+
+    fn validate(&self, context: &ScenarioContext) -> Result<Vec<String>, ScenarioError> {
+        let summary_path = context.scenario_dir.join(self.kind.summary_file());
+        if !summary_path.exists() {
+            return Err(ScenarioError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("missing summary artifact: {}", summary_path.display()),
+            )));
+        }
+        let summary: AdvancedMountedSummary = serde_json::from_slice(&fs::read(&summary_path)?)?;
+        let lww_oracle_matches = summary
+            .lww_oracle
+            .as_ref()
+            .map(|oracle| oracle.matched)
+            .unwrap_or(true);
+        let validation = json!({
+            "scenario": self.kind.name(),
+            "run_id": context.run_id,
+            "seed": context.seed,
+            "status": if summary.final_validator.converged
+                && summary.namespace_violations.is_empty()
+                && lww_oracle_matches { "passed" } else { "failed" },
+            "final_validator": summary.final_validator,
+            "namespace_violations": summary.namespace_violations,
+            "operation_log": summary.operation_log,
+            "lww_oracle": summary.lww_oracle,
+        });
+        fs::write(
+            context.scenario_dir.join("validation.json"),
+            serde_json::to_vec_pretty(&validation)?,
+        )?;
+        let mut artifacts = vec![
+            format!(
+                "artifacts/scenarios/{}/{}",
+                self.kind.name(),
+                self.kind.summary_file()
+            ),
+            format!("artifacts/scenarios/{}/validation.json", self.kind.name()),
+        ];
+        if self.kind == AdvancedMountedKind::LwwReconnectChaos {
+            artifacts.push(format!(
+                "artifacts/scenarios/{}/lww-oracle.json",
+                self.kind.name()
+            ));
+        }
+        Ok(artifacts)
+    }
+
+    fn cleanup(&self, _context: &ScenarioContext) -> Result<(), ScenarioError> {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct LwwReconnectOracle {
+    expected_payload_sha256: String,
+    actual_payload_sha256: String,
+    matched: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct AdvancedMountedSummary {
+    scenario: String,
+    bootstrap: Option<VolumeBootstrapSummary>,
+    clients: usize,
+    operations: Vec<NamespaceCollisionOperation>,
+    operation_log: String,
+    final_validator: TreeComparison,
+    namespace_violations: Vec<NamespaceInvariantViolation>,
+    lww_oracle: Option<LwwReconnectOracle>,
+}
+
+fn run_advanced_mounted_with_controller(
+    context: &ScenarioContext,
+    kind: AdvancedMountedKind,
+    controller: &mut MultiClientController<SystemClientProcessExecutor>,
+) -> Result<AdvancedMountedSummary, ScenarioError> {
+    let result = run_advanced_mounted_body(context, kind, controller);
+    let unmount_result = controller.unmount_all();
+    match (result, unmount_result) {
+        (Ok(summary), Ok(())) => Ok(summary),
+        (Err(primary), Err(cleanup)) => Err(ScenarioError::AdvancedMountedUnmountAfterFailure {
+            scenario: kind.name().to_string(),
+            primary: primary.to_string(),
+            cleanup: cleanup.to_string(),
+        }),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error.into()),
+    }
+}
+
+fn run_advanced_mounted_body(
+    context: &ScenarioContext,
+    kind: AdvancedMountedKind,
+    controller: &mut MultiClientController<SystemClientProcessExecutor>,
+) -> Result<AdvancedMountedSummary, ScenarioError> {
+    let bootstrap = controller.bootstrap_volume(VolumeBootstrapOptions {
+        client_names: kind
+            .client_names()
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect(),
+        clean_existing_local_metadata: true,
+    })?;
+    write_bootstrap_summary(context, &bootstrap)?;
+    controller.mount_all()?;
+    let clients = controller
+        .clients()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    if clients.len() < kind.client_names().len() {
+        return Err(ScenarioError::InsufficientMountedClients {
+            expected: kind.client_names().len(),
+            actual: clients.len(),
+        });
+    }
+
+    let (operations, lww_oracle) =
+        execute_advanced_mounted_operations(context, kind, controller, &clients)?;
+    write_namespace_collision_operations(context, &operations)?;
+    let summary = finish_advanced_mounted(
+        context,
+        kind,
+        Some(bootstrap),
+        &clients,
+        operations,
+        lww_oracle,
+    )?;
+    Ok(summary)
+}
+
+fn write_advanced_mounted_plan_artifacts(
+    context: &ScenarioContext,
+    kind: AdvancedMountedKind,
+) -> Result<AdvancedMountedSummary, ScenarioError> {
+    fs::create_dir_all(&context.scenario_dir)?;
+    let started = Instant::now();
+    let operations = planned_advanced_mounted_operations(kind, started);
+    write_namespace_collision_operations(context, &operations)?;
+    let lww_oracle = (kind == AdvancedMountedKind::LwwReconnectChaos).then(|| {
+        let checksum = bytes_sha256(b"planned lww reconnect winner\n");
+        LwwReconnectOracle {
+            expected_payload_sha256: checksum.clone(),
+            actual_payload_sha256: checksum,
+            matched: true,
+        }
+    });
+    if let Some(oracle) = &lww_oracle {
+        write_lww_oracle(context, oracle)?;
+    }
+    let compared_clients = kind
+        .client_names()
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect::<Vec<_>>();
+    let summary = AdvancedMountedSummary {
+        scenario: kind.name().to_string(),
+        bootstrap: None,
+        clients: kind.client_names().len(),
+        operations,
+        operation_log: format!("artifacts/scenarios/{}/operations.ndjson", kind.name()),
+        final_validator: TreeComparison {
+            converged: true,
+            reference_client: compared_clients.first().cloned(),
+            compared_clients,
+            differences: Vec::new(),
+        },
+        namespace_violations: Vec::new(),
+        lww_oracle,
+    };
+    write_advanced_mounted_summary(context, kind, &summary)?;
+    Ok(summary)
+}
+
+fn execute_advanced_mounted_operations(
+    context: &ScenarioContext,
+    kind: AdvancedMountedKind,
+    controller: &mut MultiClientController<SystemClientProcessExecutor>,
+    clients: &[ClientSpec],
+) -> Result<(Vec<NamespaceCollisionOperation>, Option<LwwReconnectOracle>), ScenarioError> {
+    match kind {
+        AdvancedMountedKind::PublicationBoundaryCrashMatrix => Ok((
+            run_publication_boundary_operations(controller, clients)?,
+            None,
+        )),
+        AdvancedMountedKind::MountedChaos => Ok((run_mounted_chaos_operations(clients)?, None)),
+        AdvancedMountedKind::HotspotChurn => Ok((run_hotspot_churn_operations(clients)?, None)),
+        AdvancedMountedKind::FaultChaos => Ok((
+            run_fault_chaos_operations(context, controller, clients)?,
+            None,
+        )),
+        AdvancedMountedKind::LwwReconnectChaos => {
+            let (operations, oracle) = run_lww_reconnect_operations(context, controller, clients)?;
+            Ok((operations, Some(oracle)))
+        }
+        AdvancedMountedKind::OpenHandle => Ok((run_open_handle_operations(clients)?, None)),
+    }
+}
+
+fn run_publication_boundary_operations(
+    controller: &mut MultiClientController<SystemClientProcessExecutor>,
+    clients: &[ClientSpec],
+) -> Result<Vec<NamespaceCollisionOperation>, ScenarioError> {
+    let started = Instant::now();
+    let writer = &clients[0];
+    let mut operations = Vec::new();
+    for (index, (boundary, path)) in [
+        ("flush", "publication-boundary/flush.txt"),
+        ("fsync", "publication-boundary/fsync.txt"),
+        ("release_close", "publication-boundary/release-close.txt"),
+        ("shutdown_drain", "publication-boundary/shutdown-drain.txt"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let payload = format!("publication boundary {boundary}\n").into_bytes();
+        operations.push(required_record(record_advanced_operation(
+            started,
+            operations.len() + 1,
+            writer,
+            boundary,
+            path,
+            write_boundary_payload(writer.mount_point.join(path), &payload, boundary)
+                .map_err(|error| error.to_string()),
+        ))?);
+        operations.push(required_record(record_advanced_operation(
+            started,
+            operations.len() + 1,
+            writer,
+            "force_kill",
+            path,
+            controller
+                .force_kill(&writer.name)
+                .map_err(|error| error.to_string()),
+        ))?);
+        operations.push(required_record(record_advanced_operation(
+            started,
+            operations.len() + 1,
+            writer,
+            "remount",
+            path,
+            controller
+                .remount(&writer.name)
+                .map_err(|error| error.to_string()),
+        ))?);
+        let recovered = fs::read(writer.mount_point.join(path)).map_err(|error| error.to_string());
+        operations.push(required_record(record_advanced_operation(
+            started,
+            index + 100,
+            writer,
+            "readback",
+            path,
+            recovered.and_then(|bytes| {
+                if bytes == payload {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "readback mismatch for {path}: expected checksum {}, got {}",
+                        bytes_sha256(&payload),
+                        bytes_sha256(&bytes)
+                    ))
+                }
+            }),
+        ))?);
+    }
+    operations.sort_by_key(|operation| operation.order);
+    Ok(operations)
+}
+
+fn write_boundary_payload(path: PathBuf, payload: &[u8], boundary: &str) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path)?;
+    file.write_all(payload)?;
+    match boundary {
+        "flush" => file.flush(),
+        "fsync" | "shutdown_drain" => file.sync_all(),
+        _ => Ok(()),
+    }
+}
+
+fn run_mounted_chaos_operations(
+    clients: &[ClientSpec],
+) -> Result<Vec<NamespaceCollisionOperation>, ScenarioError> {
+    let started = Instant::now();
+    let mut operations = Vec::new();
+    let writer = &clients[0];
+    for (path, payload) in [
+        ("chaos/rename-source.txt", b"rename source\n".as_slice()),
+        ("chaos/unlink-target.txt", b"unlink target\n".as_slice()),
+        ("chaos/append-target.txt", b"append target\n".as_slice()),
+        ("chaos/read-target.txt", COLLISION_OLD_COMMITTED_PAYLOAD),
+    ] {
+        write_parented(writer.mount_point.join(path), payload)?;
+    }
+    operations.push(fs_op(
+        started,
+        1,
+        &clients[0],
+        "rename",
+        "chaos/rename-source.txt",
+        || {
+            fs::rename(
+                clients[0].mount_point.join("chaos/rename-source.txt"),
+                clients[0].mount_point.join("chaos/renamed-by-a.txt"),
+            )
+        },
+    ));
+    operations.push(fs_op(
+        started,
+        2,
+        &clients[1],
+        "unlink",
+        "chaos/unlink-target.txt",
+        || fs::remove_file(clients[1].mount_point.join("chaos/unlink-target.txt")),
+    ));
+    operations.push(fs_op(
+        started,
+        3,
+        &clients[2],
+        "append",
+        "chaos/append-target.txt",
+        || {
+            append_payload(
+                clients[2].mount_point.join("chaos/append-target.txt"),
+                b"appended by chaos\n",
+            )
+        },
+    ));
+    operations.push(fs_op(
+        started,
+        4,
+        &clients[0],
+        "overwrite",
+        "chaos/read-target.txt",
+        || {
+            fs::write(
+                clients[0].mount_point.join("chaos/read-target.txt"),
+                COLLISION_NEW_COMMITTED_PAYLOAD,
+            )
+        },
+    ));
+    operations.push(fs_op(started, 5, &clients[1], "mkdir", "chaos/dir", || {
+        fs::create_dir_all(clients[1].mount_point.join("chaos/dir"))
+    }));
+    operations.push(fs_op(started, 6, &clients[2], "readdir", "chaos", || {
+        fs::read_dir(clients[2].mount_point.join("chaos")).map(|_| ())
+    }));
+    Ok(operations)
+}
+
+fn run_hotspot_churn_operations(
+    clients: &[ClientSpec],
+) -> Result<Vec<NamespaceCollisionOperation>, ScenarioError> {
+    let started = Instant::now();
+    let mut operations = Vec::new();
+    fs::create_dir_all(clients[0].mount_point.join("hotspot"))?;
+    for round in 0..10 {
+        let slot = format!("hotspot/slot-{}.txt", round % 6);
+        let renamed = format!("hotspot/slot-{}-renamed.txt", round % 6);
+        operations.push(fs_op(
+            started,
+            operations.len() + 1,
+            &clients[0],
+            "overwrite",
+            &slot,
+            || {
+                write_parented(
+                    clients[0].mount_point.join(&slot),
+                    format!("hotspot round {round}\n").as_bytes(),
+                )
+            },
+        ));
+        operations.push(fs_op(
+            started,
+            operations.len() + 1,
+            &clients[1],
+            "append",
+            &slot,
+            || {
+                append_payload(
+                    clients[1].mount_point.join(&slot),
+                    format!("append round {round}\n").as_bytes(),
+                )
+            },
+        ));
+        operations.push(fs_op(
+            started,
+            operations.len() + 1,
+            &clients[0],
+            "rename",
+            &slot,
+            || {
+                fs::rename(
+                    clients[0].mount_point.join(&slot),
+                    clients[0].mount_point.join(&renamed),
+                )
+            },
+        ));
+        operations.push(fs_op(
+            started,
+            operations.len() + 1,
+            &clients[2],
+            "readdir",
+            "hotspot",
+            || fs::read_dir(clients[2].mount_point.join("hotspot")).map(|_| ()),
+        ));
+    }
+    Ok(operations)
+}
+
+fn run_fault_chaos_operations(
+    context: &ScenarioContext,
+    controller: &mut MultiClientController<SystemClientProcessExecutor>,
+    clients: &[ClientSpec],
+) -> Result<Vec<NamespaceCollisionOperation>, ScenarioError> {
+    let started = Instant::now();
+    let mut operations = run_mounted_chaos_operations(&clients[..3])?;
+    let compose = compose_control_from_manifest(context)?;
+    let executor = SystemCommandExecutor;
+    operations.push(required_op(
+        started,
+        operations.len() + 1,
+        &clients[0],
+        "stop_postgres",
+        "compose/postgres",
+        compose
+            .stop_service(POSTGRES_SERVICE_NAME, &executor)
+            .map_err(ScenarioError::from),
+    )?);
+    operations.push(required_record(fs_op(
+        started,
+        operations.len() + 1,
+        &clients[0],
+        "local_write_during_pg_outage",
+        "fault-chaos/postgres-outage.txt",
+        || {
+            write_parented(
+                clients[0]
+                    .mount_point
+                    .join("fault-chaos/postgres-outage.txt"),
+                b"accepted while postgres is down\n",
+            )
+        },
+    ))?);
+    operations.push(required_op(
+        started,
+        operations.len() + 1,
+        &clients[0],
+        "start_postgres",
+        "compose/postgres",
+        compose
+            .start_service(POSTGRES_SERVICE_NAME, &executor)
+            .map_err(ScenarioError::from),
+    )?);
+    operations.push(required_op(
+        started,
+        operations.len() + 1,
+        &clients[0],
+        "crash_remount",
+        clients[0].name.as_str(),
+        controller
+            .force_kill(&clients[0].name)
+            .and_then(|()| controller.remount(&clients[0].name))
+            .map_err(ScenarioError::from),
+    )?);
+    operations.push(required_op(
+        started,
+        operations.len() + 1,
+        &clients[1],
+        "stop_rustfs",
+        "compose/rustfs",
+        compose
+            .stop_service(RUSTFS_SERVICE_NAME, &executor)
+            .map_err(ScenarioError::from),
+    )?);
+    operations.push(required_record(fs_op(
+        started,
+        operations.len() + 1,
+        &clients[1],
+        "local_write_during_s3_outage",
+        "fault-chaos/rustfs-outage.txt",
+        || {
+            write_parented(
+                clients[1].mount_point.join("fault-chaos/rustfs-outage.txt"),
+                b"accepted while rustfs is down\n",
+            )
+        },
+    ))?);
+    operations.push(required_op(
+        started,
+        operations.len() + 1,
+        &clients[1],
+        "start_rustfs",
+        "compose/rustfs",
+        compose
+            .start_service(RUSTFS_SERVICE_NAME, &executor)
+            .map_err(ScenarioError::from),
+    )?);
+    operations.push(fs_op(
+        started,
+        operations.len() + 1,
+        &clients[3],
+        "cold_observer_readdir",
+        "fault-chaos",
+        || fs::read_dir(clients[3].mount_point.join("fault-chaos")).map(|_| ()),
+    ));
+    Ok(operations)
+}
+
+fn run_lww_reconnect_operations(
+    context: &ScenarioContext,
+    controller: &mut MultiClientController<SystemClientProcessExecutor>,
+    clients: &[ClientSpec],
+) -> Result<(Vec<NamespaceCollisionOperation>, LwwReconnectOracle), ScenarioError> {
+    let started = Instant::now();
+    let mut operations = Vec::new();
+    let path = "lww-chaos/winner.txt";
+    operations.push(required_record(fs_op(
+        started,
+        1,
+        &clients[0],
+        "write",
+        path,
+        || {
+            write_parented(
+                clients[0].mount_point.join(path),
+                b"version from client-a\n",
+            )
+        },
+    ))?);
+    operations.push(required_op(
+        started,
+        2,
+        &clients[2],
+        "stale_writer_offline",
+        clients[2].name.as_str(),
+        controller
+            .force_kill(&clients[2].name)
+            .map_err(ScenarioError::from),
+    )?);
+    operations.push(required_record(fs_op(
+        started,
+        3,
+        &clients[1],
+        "write",
+        path,
+        || {
+            write_parented(
+                clients[1].mount_point.join(path),
+                b"version from client-b\n",
+            )
+        },
+    ))?);
+    operations.push(required_record(fs_op(
+        started,
+        4,
+        &clients[3],
+        "write",
+        path,
+        || {
+            write_parented(
+                clients[3].mount_point.join(path),
+                b"version from client-d\n",
+            )
+        },
+    ))?);
+    operations.push(required_op(
+        started,
+        5,
+        &clients[2],
+        "stale_writer_reconnect",
+        clients[2].name.as_str(),
+        controller
+            .remount(&clients[2].name)
+            .map_err(ScenarioError::from),
+    )?);
+    let winner = b"explicit lww winner from reconnected client-c\n";
+    operations.push(required_record(fs_op(
+        started,
+        6,
+        &clients[2],
+        "write_lww_winner",
+        path,
+        || write_parented(clients[2].mount_point.join(path), winner),
+    ))?);
+    operations.push(required_op(
+        started,
+        7,
+        &clients[2],
+        "winner_crash_restart",
+        clients[2].name.as_str(),
+        controller
+            .force_kill(&clients[2].name)
+            .and_then(|()| controller.remount(&clients[2].name))
+            .map_err(ScenarioError::from),
+    )?);
+    let actual = fs::read(clients[2].mount_point.join(path))?;
+    let oracle = LwwReconnectOracle {
+        expected_payload_sha256: bytes_sha256(winner),
+        actual_payload_sha256: bytes_sha256(&actual),
+        matched: actual == winner,
+    };
+    write_lww_oracle(context, &oracle)?;
+    Ok((operations, oracle))
+}
+
+fn run_open_handle_operations(
+    clients: &[ClientSpec],
+) -> Result<Vec<NamespaceCollisionOperation>, ScenarioError> {
+    let started = Instant::now();
+    let mut operations = Vec::new();
+    let original = "open-handles/unlink-target.txt";
+    let rename_source = "open-handles/rename-source.txt";
+    let rename_dest = "open-handles/renamed-destination.txt";
+    write_parented(
+        clients[0].mount_point.join(original),
+        b"open handle initial\n",
+    )?;
+    write_parented(
+        clients[1].mount_point.join(rename_source),
+        b"rename source\n",
+    )?;
+    let mut handle = OpenOptions::new()
+        .append(true)
+        .open(clients[0].mount_point.join(original))?;
+    operations.push(fs_op(started, 1, &clients[1], "unlink", original, || {
+        fs::remove_file(clients[1].mount_point.join(original))
+    }));
+    operations.push(fs_op(
+        started,
+        2,
+        &clients[1],
+        "rename",
+        rename_source,
+        || {
+            fs::rename(
+                clients[1].mount_point.join(rename_source),
+                clients[1].mount_point.join(rename_dest),
+            )
+        },
+    ));
+    operations.push(required_record(record_advanced_operation(
+        started,
+        3,
+        &clients[0],
+        "append_old_handle",
+        original,
+        handle
+            .write_all(b"append through old handle\n")
+            .and_then(|()| handle.sync_all())
+            .map_err(|error| error.to_string()),
+    ))?);
+    drop(handle);
+    Ok(operations)
+}
+
+fn finish_advanced_mounted(
+    context: &ScenarioContext,
+    kind: AdvancedMountedKind,
+    bootstrap: Option<VolumeBootstrapSummary>,
+    clients: &[ClientSpec],
+    operations: Vec<NamespaceCollisionOperation>,
+    lww_oracle: Option<LwwReconnectOracle>,
+) -> Result<AdvancedMountedSummary, ScenarioError> {
+    let mounts = clients
+        .iter()
+        .map(|client| ClientMount::new(client.name.clone(), client.mount_point.clone()))
+        .collect::<Vec<_>>();
+    let convergence = wait_for_convergence(
+        &mounts,
+        context.scenario_dir.join("validation"),
+        kind.convergence_timeout(),
+        ADVANCED_MOUNTED_CONVERGENCE_POLL_INTERVAL,
+    )?;
+    let mut namespace_violations = Vec::new();
+    for snapshot in &convergence.snapshots {
+        namespace_violations.extend(validate_namespace_invariants(
+            snapshot,
+            kind.expected_absent_paths(),
+        ));
+    }
+    if !namespace_violations.is_empty() {
+        return Err(ScenarioError::NamespaceInvariantViolations {
+            violations: namespace_violations,
+        });
+    }
+    let summary = AdvancedMountedSummary {
+        scenario: kind.name().to_string(),
+        bootstrap,
+        clients: clients.len(),
+        operations,
+        operation_log: format!("artifacts/scenarios/{}/operations.ndjson", kind.name()),
+        final_validator: convergence.comparison,
+        namespace_violations,
+        lww_oracle,
+    };
+    write_advanced_mounted_summary(context, kind, &summary)?;
+    Ok(summary)
+}
+
+fn planned_advanced_mounted_operations(
+    kind: AdvancedMountedKind,
+    started: Instant,
+) -> Vec<NamespaceCollisionOperation> {
+    let spec = match kind {
+        AdvancedMountedKind::PublicationBoundaryCrashMatrix => vec![
+            ("client-a", "flush", "publication-boundary/flush.txt"),
+            ("client-a", "fsync", "publication-boundary/fsync.txt"),
+            (
+                "client-a",
+                "release_close",
+                "publication-boundary/release-close.txt",
+            ),
+            (
+                "client-a",
+                "shutdown_drain",
+                "publication-boundary/shutdown-drain.txt",
+            ),
+        ],
+        AdvancedMountedKind::MountedChaos => vec![
+            ("client-a", "rename", "chaos/rename-source.txt"),
+            ("client-b", "unlink", "chaos/unlink-target.txt"),
+            ("client-c", "append", "chaos/append-target.txt"),
+        ],
+        AdvancedMountedKind::HotspotChurn => vec![
+            ("client-a", "overwrite", "hotspot/slot-0.txt"),
+            ("client-b", "append", "hotspot/slot-0.txt"),
+            ("client-c", "readdir", "hotspot"),
+        ],
+        AdvancedMountedKind::FaultChaos => vec![
+            ("client-a", "stop_postgres", "compose/postgres"),
+            (
+                "client-a",
+                "local_write_during_pg_outage",
+                "fault-chaos/postgres-outage.txt",
+            ),
+            ("client-b", "stop_rustfs", "compose/rustfs"),
+            ("client-d", "cold_observer_readdir", "fault-chaos"),
+        ],
+        AdvancedMountedKind::LwwReconnectChaos => vec![
+            ("client-c", "stale_writer_offline", "client-c"),
+            ("client-b", "write", "lww-chaos/winner.txt"),
+            ("client-c", "write_lww_winner", "lww-chaos/winner.txt"),
+            ("client-e", "late_observer_read", "lww-chaos/winner.txt"),
+        ],
+        AdvancedMountedKind::OpenHandle => vec![
+            ("client-a", "open", "open-handles/unlink-target.txt"),
+            ("client-b", "unlink", "open-handles/unlink-target.txt"),
+            ("client-b", "rename", "open-handles/rename-source.txt"),
+            (
+                "client-a",
+                "append_old_handle",
+                "open-handles/unlink-target.txt",
+            ),
+        ],
+    };
+    spec.into_iter()
+        .enumerate()
+        .map(
+            |(index, (client, operation, path))| NamespaceCollisionOperation {
+                order: index + 1,
+                client: client.to_string(),
+                operation: operation.to_string(),
+                path: path.to_string(),
+                result: "planned".to_string(),
+                timestamp_ms: elapsed_millis_u64(started),
+                error: None,
+            },
+        )
+        .collect()
+}
+
+fn fs_op(
+    started: Instant,
+    order: usize,
+    client: &ClientSpec,
+    operation: &str,
+    path: &str,
+    f: impl FnOnce() -> io::Result<()>,
+) -> NamespaceCollisionOperation {
+    record_advanced_operation(
+        started,
+        order,
+        client,
+        operation,
+        path,
+        f().map_err(|error| error.to_string()),
+    )
+}
+
+fn required_op(
+    started: Instant,
+    order: usize,
+    client: &ClientSpec,
+    operation: &str,
+    path: &str,
+    result: Result<(), ScenarioError>,
+) -> Result<NamespaceCollisionOperation, ScenarioError> {
+    match result {
+        Ok(()) => Ok(record_advanced_operation(
+            started,
+            order,
+            client,
+            operation,
+            path,
+            Ok(()),
+        )),
+        Err(error) => {
+            let operation_record = record_advanced_operation(
+                started,
+                order,
+                client,
+                operation,
+                path,
+                Err(error.to_string()),
+            );
+            Err(ScenarioError::Io(io::Error::other(format!(
+                "{} failed for {}: {:?}",
+                operation, path, operation_record.error
+            ))))
+        }
+    }
+}
+
+fn required_record(
+    operation: NamespaceCollisionOperation,
+) -> Result<NamespaceCollisionOperation, ScenarioError> {
+    if let Some(error) = &operation.error {
+        Err(ScenarioError::Io(io::Error::other(format!(
+            "{} failed for {}: {}",
+            operation.operation, operation.path, error
+        ))))
+    } else {
+        Ok(operation)
+    }
+}
+
+fn record_advanced_operation(
+    started: Instant,
+    order: usize,
+    client: &ClientSpec,
+    operation: &str,
+    path: &str,
+    result: Result<(), String>,
+) -> NamespaceCollisionOperation {
+    match result {
+        Ok(()) => NamespaceCollisionOperation {
+            order,
+            client: client.name.clone(),
+            operation: operation.to_string(),
+            path: path.to_string(),
+            result: "accepted".to_string(),
+            timestamp_ms: elapsed_millis_u64(started),
+            error: None,
+        },
+        Err(error) => NamespaceCollisionOperation {
+            order,
+            client: client.name.clone(),
+            operation: operation.to_string(),
+            path: path.to_string(),
+            result: "rejected".to_string(),
+            timestamp_ms: elapsed_millis_u64(started),
+            error: Some(error),
+        },
+    }
+}
+
+fn write_parented(path: PathBuf, payload: &[u8]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, payload)
+}
+
+fn append_payload(path: PathBuf, payload: &[u8]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    file.write_all(payload)
+}
+
+fn write_advanced_mounted_summary(
+    context: &ScenarioContext,
+    kind: AdvancedMountedKind,
+    summary: &AdvancedMountedSummary,
+) -> Result<(), ScenarioError> {
+    fs::write(
+        context.scenario_dir.join(kind.summary_file()),
+        serde_json::to_vec_pretty(summary)?,
+    )?;
+    Ok(())
+}
+
+fn write_lww_oracle(
+    context: &ScenarioContext,
+    oracle: &LwwReconnectOracle,
+) -> Result<(), ScenarioError> {
+    fs::write(
+        context.scenario_dir.join("lww-oracle.json"),
+        serde_json::to_vec_pretty(oracle)?,
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
