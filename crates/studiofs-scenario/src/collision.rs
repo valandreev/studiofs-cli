@@ -903,6 +903,11 @@ fn metadata_delivery_vs_local_mutation(h: &mut FamilyHarness) {
         h.runtime
             .rename("alpha", "remote.txt", "local_remote.txt")
             .ok();
+        if h.runtime.read_file("beta", "local_remote.txt").is_err() {
+            h.runtime
+                .rename("beta", "remote.txt", "local_remote.txt")
+                .ok();
+        }
         h.runtime.unlink("beta", "remote.txt").ok();
         h.runtime
             .write_file("beta", "local_remote.txt", 3, "checksum-remote-v2")

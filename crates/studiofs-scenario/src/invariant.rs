@@ -76,6 +76,9 @@ pub struct LogicalEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     /// Field $name.
     pub symlink_target: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    /// Field $name.
+    pub metadata_attributes: BTreeMap<String, String>,
 }
 
 impl LogicalEntry {
@@ -90,6 +93,7 @@ impl LogicalEntry {
             size: None,
             byte_ranges: Vec::new(),
             symlink_target: None,
+            metadata_attributes: BTreeMap::new(),
         }
     }
 
@@ -110,6 +114,26 @@ impl LogicalEntry {
             size,
             byte_ranges: Vec::new(),
             symlink_target: None,
+            metadata_attributes: BTreeMap::new(),
+        }
+    }
+
+    /// Function $name.
+    pub fn symlink(
+        path: impl Into<String>,
+        logical_id: impl Into<String>,
+        target: impl Into<String>,
+    ) -> Self {
+        Self {
+            path: path.into(),
+            kind: LogicalEntryKind::Symlink,
+            logical_id: Some(logical_id.into()),
+            object: None,
+            checksum_sha256: None,
+            size: None,
+            byte_ranges: Vec::new(),
+            symlink_target: Some(target.into()),
+            metadata_attributes: BTreeMap::new(),
         }
     }
 
@@ -121,6 +145,7 @@ impl LogicalEntry {
             size: self.size,
             byte_ranges: self.byte_ranges.as_slice(),
             symlink_target: self.symlink_target.as_deref(),
+            metadata_attributes: &self.metadata_attributes,
         }
     }
 }
@@ -607,4 +632,5 @@ struct EntryConvergenceKey<'a> {
     size: Option<u64>,
     byte_ranges: &'a [LogicalByteRange],
     symlink_target: Option<&'a str>,
+    metadata_attributes: &'a BTreeMap<String, String>,
 }

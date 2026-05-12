@@ -1,4 +1,5 @@
 //! Crate documentation for lint completion.
+use studiofs_scenario::ScenarioOperation;
 use studiofs_scenario::seed_corpus::{
     SIMULATION_COUNTEREXAMPLE_SCHEMA_VERSION, SimulationCorpusError, SimulationCorpusKind,
     SimulationCorpusOptions, SimulationScenarioGroup, corpus_plan, read_simulation_counterexample,
@@ -23,6 +24,7 @@ fn fast_and_deep_corpus_are_stable_named_seed_sets() {
             SimulationScenarioGroup::SparsePayloadChaos,
             SimulationScenarioGroup::ColdObserverLongHistory,
             SimulationScenarioGroup::InvalidationDropoutFallbackSync,
+            SimulationScenarioGroup::AuxiliaryMetadataConvergence,
         ]
     );
     assert_eq!(fast.seeds, vec![1, 2, 3]);
@@ -231,6 +233,87 @@ fn invalidation_dropout_fallback_sync_corpus_models_lossy_hints_and_replays_coun
 }
 
 #[test]
+fn auxiliary_metadata_corpus_models_symlink_xattr_capability_gates_and_replays_counterexample() {
+    let report = run_simulation_corpus(SimulationCorpusOptions {
+        kind: SimulationCorpusKind::Deep,
+        group: Some(SimulationScenarioGroup::AuxiliaryMetadataConvergence),
+        seed: None,
+        artifact_root: None,
+        inject_failure: false,
+    })
+    .expect("auxiliary metadata corpus runs");
+
+    assert!(report.passed, "{:#?}", report.failures);
+    let seed_reports = &report.group_reports[0].seed_reports;
+    assert_eq!(seed_reports.len(), 16);
+    assert!(
+        seed_reports
+            .iter()
+            .all(|seed| seed.invariant_checkpoints >= 3)
+    );
+    let distinct_trace_shapes = seed_reports
+        .iter()
+        .map(|seed| seed.trace_records)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        distinct_trace_shapes.len() >= 4,
+        "auxiliary metadata seeds have too little ordering diversity: {seed_reports:#?}"
+    );
+
+    let artifact_root = unique_temp_dir("sfs399-auxiliary-metadata-counterexample");
+    std::fs::create_dir_all(&artifact_root).expect("create artifact root");
+    let report = run_simulation_corpus(SimulationCorpusOptions {
+        kind: SimulationCorpusKind::Fast,
+        group: Some(SimulationScenarioGroup::AuxiliaryMetadataConvergence),
+        seed: Some(14),
+        artifact_root: Some(artifact_root),
+        inject_failure: true,
+    })
+    .expect("auxiliary metadata corpus writes failure artifact");
+    let artifact_path = report.failures[0]
+        .counterexample_artifact_path
+        .as_ref()
+        .expect("failure records an artifact path");
+
+    let artifact =
+        read_simulation_counterexample(artifact_path).expect("counterexample artifact can be read");
+    assert_eq!(
+        artifact.group,
+        SimulationScenarioGroup::AuxiliaryMetadataConvergence
+    );
+    assert!(
+        artifact
+            .operation_log
+            .iter()
+            .any(|record| !record.is_simulation_supported())
+    );
+    assert!(artifact.operation_log.iter().any(|record| matches!(
+        &record.operation,
+        ScenarioOperation::PublishMetadataAttribute { name, .. }
+            if name == "user.studiofs.label"
+    )));
+    assert!(artifact.operation_log.iter().any(|record| matches!(
+        &record.operation,
+        ScenarioOperation::UpdateSymlinkTarget { target, .. } if target == "target-b.txt"
+    )));
+    assert!(!artifact.operation_log.iter().any(|record| matches!(
+        &record.operation,
+        ScenarioOperation::SetMetadataAttribute { name, value, .. }
+            if name == "user.studiofs.label" && value.is_empty()
+    )));
+    assert!(artifact.final_snapshot.is_some());
+
+    let replay =
+        replay_simulation_counterexample(artifact_path).expect("counterexample artifact replays");
+    assert!(replay.reproduced);
+    assert_eq!(
+        replay.group,
+        SimulationScenarioGroup::AuxiliaryMetadataConvergence
+    );
+    assert_eq!(replay.violated_invariant, "injected_counterexample");
+}
+
+#[test]
 fn corpus_failures_include_group_seed_invariant_and_artifact_path() {
     let artifact_root = unique_temp_dir("sfs340-corpus-counterexamples");
     std::fs::create_dir_all(&artifact_root).expect("create artifact root");
@@ -267,6 +350,7 @@ fn all_corpus_group_failures_write_counterexample_artifacts() {
         SimulationScenarioGroup::SparsePayloadChaos,
         SimulationScenarioGroup::ColdObserverLongHistory,
         SimulationScenarioGroup::InvalidationDropoutFallbackSync,
+        SimulationScenarioGroup::AuxiliaryMetadataConvergence,
     ] {
         let artifact_root = unique_temp_dir(&format!("sfs340-{group:?}-counterexamples"));
         std::fs::create_dir_all(&artifact_root).expect("create artifact root");

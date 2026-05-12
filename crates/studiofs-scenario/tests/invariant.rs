@@ -1,4 +1,6 @@
 //! Crate documentation for lint completion.
+use std::collections::BTreeMap;
+
 use studiofs_scenario::invariant::{
     ClientLogicalSnapshot, DurableWriteExpectation, LogicalEntry, LogicalEntryKind,
     LogicalSnapshot, ObjectLifecycle, ObjectRef, validate_logical_invariants,
@@ -145,6 +147,7 @@ fn convergence_detects_symlink_target_divergence() {
                     size: None,
                     byte_ranges: Vec::new(),
                     symlink_target: Some("target-a".to_string()),
+                    metadata_attributes: BTreeMap::new(),
                 }],
             },
             ClientLogicalSnapshot {
@@ -158,6 +161,7 @@ fn convergence_detects_symlink_target_divergence() {
                     size: None,
                     byte_ranges: Vec::new(),
                     symlink_target: Some("target-b".to_string()),
+                    metadata_attributes: BTreeMap::new(),
                 }],
             },
         ],
@@ -181,6 +185,65 @@ fn convergence_detects_symlink_target_divergence() {
 }
 
 #[test]
+fn convergence_detects_supported_metadata_attribute_divergence() {
+    let snapshot = LogicalSnapshot {
+        schema_version: 1,
+        clients: vec![
+            ClientLogicalSnapshot {
+                client: "client-a".to_string(),
+                entries: vec![LogicalEntry {
+                    path: "file.txt".to_string(),
+                    kind: LogicalEntryKind::File,
+                    logical_id: Some("inode-file".to_string()),
+                    object: None,
+                    checksum_sha256: Some("checksum-a".to_string()),
+                    size: Some(4),
+                    byte_ranges: Vec::new(),
+                    symlink_target: None,
+                    metadata_attributes: BTreeMap::from([(
+                        "user.studiofs.label".to_string(),
+                        "blue".to_string(),
+                    )]),
+                }],
+            },
+            ClientLogicalSnapshot {
+                client: "client-b".to_string(),
+                entries: vec![LogicalEntry {
+                    path: "file.txt".to_string(),
+                    kind: LogicalEntryKind::File,
+                    logical_id: Some("inode-file".to_string()),
+                    object: None,
+                    checksum_sha256: Some("checksum-a".to_string()),
+                    size: Some(4),
+                    byte_ranges: Vec::new(),
+                    symlink_target: None,
+                    metadata_attributes: BTreeMap::from([(
+                        "user.studiofs.label".to_string(),
+                        "red".to_string(),
+                    )]),
+                }],
+            },
+        ],
+        expected_absent_paths: Vec::new(),
+        durable_writes: Vec::new(),
+        objects: Vec::new(),
+        allow_hard_links: false,
+        replay_idempotent: None,
+    };
+
+    let report = validate_logical_invariants(&snapshot);
+
+    assert!(!report.passed);
+    assert!(
+        report
+            .violations
+            .iter()
+            .any(|violation| violation.invariant == "eventual_convergence"
+                && violation.path.as_deref() == Some("file.txt"))
+    );
+}
+
+#[test]
 fn logical_snapshot_serializes_stable_schema_for_simulation_artifacts() {
     let snapshot = LogicalSnapshot {
         schema_version: 1,
@@ -195,6 +258,10 @@ fn logical_snapshot_serializes_stable_schema_for_simulation_artifacts() {
                 size: Some(5),
                 byte_ranges: Vec::new(),
                 symlink_target: None,
+                metadata_attributes: BTreeMap::from([(
+                    "user.studiofs.label".to_string(),
+                    "source".to_string(),
+                )]),
             }],
         }],
         expected_absent_paths: Vec::new(),
@@ -209,4 +276,6 @@ fn logical_snapshot_serializes_stable_schema_for_simulation_artifacts() {
     assert!(encoded.contains("\"schema_version\": 1"));
     assert!(encoded.contains("\"logical_id\": \"inode-1\""));
     assert!(encoded.contains("\"location\": \"local\""));
+    assert!(encoded.contains("\"metadata_attributes\""));
+    assert!(encoded.contains("\"user.studiofs.label\""));
 }

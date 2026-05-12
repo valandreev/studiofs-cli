@@ -173,6 +173,9 @@ fn parse_group(value: std::ffi::OsString) -> Result<SimulationScenarioGroup, Str
         Some("invalidation-dropout-fallback-sync") => {
             Ok(SimulationScenarioGroup::InvalidationDropoutFallbackSync)
         }
+        Some("auxiliary-metadata-convergence") => {
+            Ok(SimulationScenarioGroup::AuxiliaryMetadataConvergence)
+        }
         Some(other) => Err(format!("unknown scenario group: {other}")),
         None => Err("--scenario-group must be valid UTF-8".to_string()),
     }

@@ -113,6 +113,20 @@ pub enum ScenarioOperation {
         path: String,
     },
     /// Variant $name.
+    CreateSymlink {
+        /// Field $name.
+        path: String,
+        /// Field $name.
+        target: String,
+    },
+    /// Variant $name.
+    UpdateSymlinkTarget {
+        /// Field $name.
+        path: String,
+        /// Field $name.
+        target: String,
+    },
+    /// Variant $name.
     Write {
         /// Field $name.
         path: String,
@@ -164,6 +178,38 @@ pub enum ScenarioOperation {
         bytes: Option<u64>,
         /// Field $name.
         checksum_sha256: Option<String>,
+    },
+    /// Variant $name.
+    ReadSymlink {
+        /// Field $name.
+        path: String,
+        /// Field $name.
+        target: Option<String>,
+    },
+    /// Variant $name.
+    SetMetadataAttribute {
+        /// Field $name.
+        path: String,
+        /// Field $name.
+        name: String,
+        /// Field $name.
+        value: String,
+    },
+    /// Variant $name.
+    PublishMetadataAttribute {
+        /// Field $name.
+        path: String,
+        /// Field $name.
+        name: String,
+    },
+    /// Variant $name.
+    GetMetadataAttribute {
+        /// Field $name.
+        path: String,
+        /// Field $name.
+        name: String,
+        /// Field $name.
+        value: Option<String>,
     },
     /// Variant $name.
     Stat {
