@@ -140,6 +140,10 @@ pub enum MetadataTraceKind {
     DuplicateIgnored,
     /// Variant $name.
     DeliveryBlocked,
+    /// A queued metadata hint was dropped for a client.
+    HintDropped,
+    /// A client rebuilt pending metadata from authoritative history.
+    FallbackSync,
 }
 
 #[derive(Debug, Default)]
@@ -249,6 +253,21 @@ impl MetadataBus {
         self.client_queues.get(client).map_or(0, VecDeque::len)
     }
 
+    /// Returns the next queued metadata batch ID without cloning the batch.
+    pub fn peek_pending_id(&self, client: &str) -> Option<u64> {
+        self.client_queues
+            .get(client)
+            .and_then(|queue| queue.front().copied())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_stale_hint_for_test(&mut self, client: &str, batch_id: u64) {
+        self.client_queues
+            .entry(client.to_string())
+            .or_default()
+            .push_back(batch_id);
+    }
+
     /// Function $name.
     pub fn batch(&self, batch_id: u64) -> Option<MetadataBatch> {
         self.batches.get(&batch_id).cloned()
@@ -351,6 +370,71 @@ impl MetadataBus {
             .or_default()
             .push_back(batch_id);
         true
+    }
+
+    /// Drops a queued invalidation hint without deleting authoritative metadata.
+    pub fn drop_hint_for(&mut self, client: &str, batch_id: u64) -> bool {
+        if !self.batches.contains_key(&batch_id) {
+            return false;
+        }
+        let Some(queue) = self.client_queues.get_mut(client) else {
+            return false;
+        };
+        let Some(position) = queue.iter().position(|queued| *queued == batch_id) else {
+            return false;
+        };
+        queue.remove(position);
+        if let Some(delayed) = self.delayed.get_mut(client) {
+            delayed.remove(&batch_id);
+        }
+        if let Some(batch) = self.batches.get(&batch_id).cloned() {
+            self.record(batch_trace(
+                &batch,
+                MetadataTraceKind::HintDropped,
+                Some(client),
+            ));
+        }
+        true
+    }
+
+    /// Rebuilds the client queue from authoritative metadata history.
+    pub fn fallback_sync_for(&mut self, client: &str) -> usize {
+        let Some(existing_queue) = self.client_queues.get(client) else {
+            return 0;
+        };
+        let applied = self.applied_batches.get(client);
+        let queued = existing_queue.iter().copied().collect::<BTreeSet<_>>();
+        let pending_batches = self
+            .batches
+            .values()
+            .filter(|batch| {
+                batch.source_client != client
+                    && !applied.is_some_and(|applied| applied.contains(&batch.batch_id))
+            })
+            .map(|batch| (batch.version, batch.batch_id))
+            .collect::<Vec<_>>();
+
+        let missing = pending_batches
+            .iter()
+            .filter(|(_, batch_id)| !queued.contains(batch_id))
+            .count();
+        let rebuilt_queue = pending_batches
+            .into_iter()
+            .map(|(_, batch_id)| batch_id)
+            .collect();
+        if let Some(queue) = self.client_queues.get_mut(client) {
+            *queue = rebuilt_queue;
+        }
+        self.delayed.remove(client);
+        self.record(trace_record(
+            MetadataTraceKind::FallbackSync,
+            None,
+            None,
+            None,
+            Some(client.to_string()),
+            None,
+        ));
+        missing
     }
 
     /// Enqueues metadata history for a client in version order.

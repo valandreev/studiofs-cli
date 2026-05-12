@@ -171,6 +171,83 @@ fn delayed_head_blocks_later_batches_for_strict_version_ordering() {
 }
 
 #[test]
+fn dropped_hint_is_recovered_by_fallback_sync_without_marking_batch_applied() {
+    let mut bus = MetadataBus::new();
+    bus.connect_client("writer");
+    bus.connect_client("reader");
+
+    let first = bus.enqueue_local(batch("writer", "missed.txt"));
+    let second = bus.enqueue_local(batch("writer", "later.txt"));
+
+    assert!(bus.drop_hint_for("reader", first.batch_id));
+    assert_eq!(
+        bus.pending_for("reader")
+            .iter()
+            .map(|batch| batch.batch_id)
+            .collect::<Vec<_>>(),
+        vec![second.batch_id]
+    );
+    assert_eq!(bus.applied_versions("reader"), Vec::<u64>::new());
+
+    assert_eq!(bus.fallback_sync_for("reader"), 1);
+    assert_eq!(
+        bus.pending_for("reader")
+            .iter()
+            .map(|batch| batch.version)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert!(matches!(
+        bus.deliver_next("reader"),
+        Some(DeliveryOutcome::Applied { version: 1, .. })
+    ));
+    assert!(matches!(
+        bus.deliver_next("reader"),
+        Some(DeliveryOutcome::Applied { version: 2, .. })
+    ));
+    assert_eq!(bus.applied_versions("reader"), vec![1, 2]);
+    assert!(
+        bus.trace()
+            .iter()
+            .any(|record| record.kind == MetadataTraceKind::HintDropped
+                && record.batch_id == Some(first.batch_id)
+                && record.target_client.as_deref() == Some("reader"))
+    );
+    assert!(
+        bus.trace()
+            .iter()
+            .any(|record| record.kind == MetadataTraceKind::FallbackSync
+                && record.target_client.as_deref() == Some("reader"))
+    );
+}
+
+#[test]
+fn fallback_sync_does_not_enqueue_self_authored_batches() {
+    let mut bus = MetadataBus::new();
+    bus.connect_client("writer");
+    bus.connect_client("reader");
+
+    let own = bus.enqueue_local(batch("writer", "own.txt"));
+    let foreign = bus.enqueue_local(batch("reader", "foreign.txt"));
+    assert!(bus.drop_hint_for("writer", foreign.batch_id));
+
+    assert_eq!(bus.fallback_sync_for("writer"), 1);
+    assert_eq!(
+        bus.pending_for("writer")
+            .iter()
+            .map(|batch| batch.batch_id)
+            .collect::<Vec<_>>(),
+        vec![foreign.batch_id]
+    );
+    assert!(
+        !bus.pending_for("writer")
+            .iter()
+            .any(|batch| batch.batch_id == own.batch_id),
+        "fallback sync must preserve the normal no-self-hints bus contract"
+    );
+}
+
+#[test]
 fn trace_can_be_drained_between_long_simulation_windows() {
     let mut bus = MetadataBus::new();
     bus.connect_client("writer");

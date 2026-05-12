@@ -22,6 +22,7 @@ fn fast_and_deep_corpus_are_stable_named_seed_sets() {
             SimulationScenarioGroup::ObjectStoreOutage,
             SimulationScenarioGroup::SparsePayloadChaos,
             SimulationScenarioGroup::ColdObserverLongHistory,
+            SimulationScenarioGroup::InvalidationDropoutFallbackSync,
         ]
     );
     assert_eq!(fast.seeds, vec![1, 2, 3]);
@@ -164,6 +165,72 @@ fn cold_observer_long_history_corpus_runs_seed_variants_and_replays_counterexamp
 }
 
 #[test]
+fn invalidation_dropout_fallback_sync_corpus_models_lossy_hints_and_replays_counterexample() {
+    let report = run_simulation_corpus(SimulationCorpusOptions {
+        kind: SimulationCorpusKind::Deep,
+        group: Some(SimulationScenarioGroup::InvalidationDropoutFallbackSync),
+        seed: None,
+        artifact_root: None,
+        inject_failure: false,
+    })
+    .expect("invalidation dropout corpus runs");
+
+    assert!(report.passed, "{:#?}", report.failures);
+    let seed_reports = &report.group_reports[0].seed_reports;
+    assert_eq!(seed_reports.len(), 16);
+    assert!(
+        seed_reports
+            .iter()
+            .all(|seed| seed.invariant_checkpoints >= 3)
+    );
+    let distinct_trace_shapes = seed_reports
+        .iter()
+        .map(|seed| seed.trace_records)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        distinct_trace_shapes.len() >= 4,
+        "invalidation dropout seeds have too little hint/fallback diversity: {seed_reports:#?}"
+    );
+
+    let artifact_root = unique_temp_dir("sfs398-invalidation-dropout-counterexample");
+    std::fs::create_dir_all(&artifact_root).expect("create artifact root");
+    let report = run_simulation_corpus(SimulationCorpusOptions {
+        kind: SimulationCorpusKind::Fast,
+        group: Some(SimulationScenarioGroup::InvalidationDropoutFallbackSync),
+        seed: Some(12),
+        artifact_root: Some(artifact_root),
+        inject_failure: true,
+    })
+    .expect("invalidation dropout corpus writes failure artifact");
+    let artifact_path = report.failures[0]
+        .counterexample_artifact_path
+        .as_ref()
+        .expect("failure records an artifact path");
+
+    let artifact =
+        read_simulation_counterexample(artifact_path).expect("counterexample artifact can be read");
+    assert_eq!(
+        artifact.group,
+        SimulationScenarioGroup::InvalidationDropoutFallbackSync
+    );
+    assert!(artifact.event_trace.iter().any(|event| {
+        event.get("kind").and_then(serde_json::Value::as_str) == Some("metadata_hint_dropped")
+    }));
+    assert!(artifact.event_trace.iter().any(|event| {
+        event.get("kind").and_then(serde_json::Value::as_str) == Some("metadata_fallback_sync")
+    }));
+
+    let replay =
+        replay_simulation_counterexample(artifact_path).expect("counterexample artifact replays");
+    assert!(replay.reproduced);
+    assert_eq!(
+        replay.group,
+        SimulationScenarioGroup::InvalidationDropoutFallbackSync
+    );
+    assert_eq!(replay.violated_invariant, "injected_counterexample");
+}
+
+#[test]
 fn corpus_failures_include_group_seed_invariant_and_artifact_path() {
     let artifact_root = unique_temp_dir("sfs340-corpus-counterexamples");
     std::fs::create_dir_all(&artifact_root).expect("create artifact root");
@@ -199,6 +266,7 @@ fn all_corpus_group_failures_write_counterexample_artifacts() {
         SimulationScenarioGroup::ObjectStoreOutage,
         SimulationScenarioGroup::SparsePayloadChaos,
         SimulationScenarioGroup::ColdObserverLongHistory,
+        SimulationScenarioGroup::InvalidationDropoutFallbackSync,
     ] {
         let artifact_root = unique_temp_dir(&format!("sfs340-{group:?}-counterexamples"));
         std::fs::create_dir_all(&artifact_root).expect("create artifact root");

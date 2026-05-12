@@ -722,6 +722,80 @@ impl SimulatedRuntime {
         Ok(enqueued)
     }
 
+    /// Drops the next queued metadata invalidation hint for a client.
+    pub fn drop_next_metadata_hint(
+        &mut self,
+        client: &str,
+    ) -> Result<Option<u64>, ClientRuntimeError> {
+        self.ensure_client(client)?;
+        let batch_id = self.metadata_bus.peek_pending_id(client);
+        if let Some(batch_id) = batch_id {
+            if !self.metadata_bus.drop_hint_for(client, batch_id) {
+                return Err(ClientRuntimeError::MissingPendingMetadataHint {
+                    client: client.to_string(),
+                    batch_id,
+                });
+            }
+        }
+        self.record_with_metadata(
+            client,
+            "metadata_hint_dropped",
+            None,
+            [(
+                "batch_id".to_string(),
+                batch_id
+                    .map(|batch_id| batch_id.to_string())
+                    .unwrap_or_else(|| "<none>".to_string()),
+            )],
+        );
+        Ok(batch_id)
+    }
+
+    /// Delays the next queued metadata invalidation hint for a client.
+    pub fn delay_next_metadata_hint(
+        &mut self,
+        client: &str,
+    ) -> Result<Option<u64>, ClientRuntimeError> {
+        self.ensure_client(client)?;
+        let batch_id = self.metadata_bus.peek_pending_id(client);
+        if let Some(batch_id) = batch_id {
+            if !self.metadata_bus.delay_for(client, batch_id) {
+                return Err(ClientRuntimeError::MissingPendingMetadataHint {
+                    client: client.to_string(),
+                    batch_id,
+                });
+            }
+        }
+        self.record_with_metadata(
+            client,
+            "metadata_hint_delayed",
+            None,
+            [(
+                "batch_id".to_string(),
+                batch_id
+                    .map(|batch_id| batch_id.to_string())
+                    .unwrap_or_else(|| "<none>".to_string()),
+            )],
+        );
+        Ok(batch_id)
+    }
+
+    /// Rebuilds pending metadata from authoritative state after missed hints.
+    pub fn fallback_sync_metadata(&mut self, client: &str) -> Result<usize, ClientRuntimeError> {
+        self.ensure_client(client)?;
+        let enqueued = self.metadata_bus.fallback_sync_for(client);
+        self.record_with_metadata(
+            client,
+            "metadata_fallback_sync",
+            None,
+            [("enqueued_batches".to_string(), enqueued.to_string())],
+        );
+        self.scheduler.schedule_now(
+            ScheduledEvent::new(SchedulerEventType::MetadataDelivery).with_client(client),
+        );
+        Ok(enqueued)
+    }
+
     /// Function $name.
     pub fn set_metadata_available(&mut self, available: bool) {
         self.metadata_bus.set_metadata_outage(!available);
@@ -1591,6 +1665,14 @@ pub enum ClientRuntimeError {
         /// The client value.
         client: String,
     },
+    #[error("pending metadata hint {batch_id} disappeared for simulated client {client}")]
+    /// A queued metadata hint referenced a batch that is no longer available.
+    MissingPendingMetadataHint {
+        /// The client value.
+        client: String,
+        /// The batch_id value.
+        batch_id: u64,
+    },
     #[error("metadata delivery to simulated client {client} is blocked: {reason:?}")]
     /// Variant $name.
     MetadataBlocked {
@@ -1819,4 +1901,55 @@ fn validate_mutation_path(client: &str, path: &str) -> Result<(), ClientRuntimeE
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drop_next_metadata_hint_errors_when_pending_hint_disappears() {
+        let mut runtime = SimulatedRuntime::new(1);
+        runtime.add_client("reader");
+        runtime
+            .metadata_bus
+            .inject_stale_hint_for_test("reader", 99);
+
+        assert_eq!(
+            runtime.drop_next_metadata_hint("reader"),
+            Err(ClientRuntimeError::MissingPendingMetadataHint {
+                client: "reader".to_string(),
+                batch_id: 99,
+            })
+        );
+        assert!(
+            !runtime
+                .trace()
+                .iter()
+                .any(|record| record.kind == "metadata_hint_dropped")
+        );
+    }
+
+    #[test]
+    fn delay_next_metadata_hint_errors_when_pending_hint_disappears() {
+        let mut runtime = SimulatedRuntime::new(2);
+        runtime.add_client("reader");
+        runtime
+            .metadata_bus
+            .inject_stale_hint_for_test("reader", 100);
+
+        assert_eq!(
+            runtime.delay_next_metadata_hint("reader"),
+            Err(ClientRuntimeError::MissingPendingMetadataHint {
+                client: "reader".to_string(),
+                batch_id: 100,
+            })
+        );
+        assert!(
+            !runtime
+                .trace()
+                .iter()
+                .any(|record| record.kind == "metadata_hint_delayed")
+        );
+    }
 }

@@ -57,6 +57,8 @@ pub enum SimulationScenarioGroup {
     SparsePayloadChaos,
     /// Variant $name.
     ColdObserverLongHistory,
+    /// Variant $name.
+    InvalidationDropoutFallbackSync,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -349,6 +351,9 @@ fn run_group(
         SimulationScenarioGroup::SparsePayloadChaos => run_sparse_payload_chaos(seeds, options),
         SimulationScenarioGroup::ColdObserverLongHistory => {
             run_cold_observer_long_history(seeds, options)
+        }
+        SimulationScenarioGroup::InvalidationDropoutFallbackSync => {
+            run_invalidation_dropout_fallback_sync(seeds, options)
         }
     }
 }
@@ -842,6 +847,216 @@ fn run_cold_observer_long_history(
     })
 }
 
+fn run_invalidation_dropout_fallback_sync(
+    seeds: &[u64],
+    options: &SimulationCorpusOptions,
+) -> Result<GroupOutcome, SimulationCorpusError> {
+    let mut seed_reports = Vec::new();
+    let mut failures = Vec::new();
+    for seed in seeds {
+        let run = invalidation_dropout_seed(*seed)?;
+        let invariant_report = validate_logical_invariants(&run.final_snapshot);
+        let reader_checksum = run
+            .runtime
+            .read_file("reader", "notify/dropout.txt")?
+            .checksum_sha256;
+        let passed = invariant_report.passed
+            && reader_checksum == "checksum-hint-v2"
+            && run.hints_disrupted > 0
+            && run.fallback_syncs > 0
+            && run.stale_windows <= run.fallback_bound;
+
+        if !passed {
+            let (violated_invariant, base_message) =
+                first_violation_or(&invariant_report, "invalidation_dropout_fallback_sync");
+            failures.push(SimulationCorpusFailure {
+                group: SimulationScenarioGroup::InvalidationDropoutFallbackSync,
+                seed: *seed,
+                violated_invariant,
+                message: format!(
+                    "{base_message}; reader_checksum={reader_checksum} stale_windows={} fallback_bound={} fallback_syncs={} hints_disrupted={}",
+                    run.stale_windows, run.fallback_bound, run.fallback_syncs, run.hints_disrupted
+                ),
+                counterexample_artifact_path: None,
+                replay_evidence: Some(SimulationCounterexampleEvidence {
+                    sub_group: Some(invalidation_dropout_variant(*seed).to_string()),
+                    scheduler_trace: nonempty_scheduler_trace(
+                        *seed,
+                        run.scheduler_trace.clone(),
+                        "invalidation-dropout-final",
+                    ),
+                    operation_log: operation_log_from_client_trace(
+                        CORPUS_SCENARIO,
+                        run.runtime.trace(),
+                    ),
+                    event_trace: json_trace(run.runtime.trace())?,
+                    final_snapshot: Some(json_value(&run.final_snapshot)?),
+                }),
+            });
+        }
+        if options.inject_failure {
+            failures.push(SimulationCorpusFailure {
+                group: SimulationScenarioGroup::InvalidationDropoutFallbackSync,
+                seed: *seed,
+                violated_invariant: "injected_counterexample".to_string(),
+                message: "injected invalidation dropout failure for corpus artifact testing"
+                    .to_string(),
+                counterexample_artifact_path: None,
+                replay_evidence: Some(SimulationCounterexampleEvidence {
+                    sub_group: Some(invalidation_dropout_variant(*seed).to_string()),
+                    scheduler_trace: nonempty_scheduler_trace(
+                        *seed,
+                        run.scheduler_trace.clone(),
+                        "invalidation-dropout-injected",
+                    ),
+                    operation_log: operation_log_from_client_trace(
+                        CORPUS_SCENARIO,
+                        run.runtime.trace(),
+                    ),
+                    event_trace: json_trace(run.runtime.trace())?,
+                    final_snapshot: Some(json_value(&run.final_snapshot)?),
+                }),
+            });
+        }
+        seed_reports.push(SimulationSeedReport {
+            seed: *seed,
+            passed: passed && !options.inject_failure,
+            invariant_checkpoints: run.invariant_checkpoints,
+            trace_records: run.runtime.trace().len() + run.scheduler_trace.len(),
+        });
+    }
+    Ok(GroupOutcome {
+        seed_reports,
+        failures,
+    })
+}
+
+fn invalidation_dropout_seed(seed: u64) -> Result<InvalidationDropoutRun, SimulationCorpusError> {
+    let mut runtime = SimulatedRuntime::new(seed);
+    runtime.add_client("writer");
+    runtime.add_client("reader");
+    runtime.mkdir("writer", "notify")?;
+    runtime.create_file("writer", "notify/dropout.txt")?;
+    publish_checksum(&mut runtime, "notify/dropout.txt", "checksum-hint-v1", 16)?;
+
+    let variant_index = invalidation_dropout_variant_index(seed);
+    let fallback_bound = variant_index + 1;
+    let mut stale_windows = 0;
+    let mut fallback_syncs = 0;
+    let mut hints_disrupted = 0;
+
+    match variant_index {
+        0 => {
+            hints_disrupted += usize::from(runtime.drop_next_metadata_hint("reader")?.is_some());
+            stale_windows += usize::from(reader_is_stale(
+                &runtime,
+                "notify/dropout.txt",
+                "checksum-hint-v2",
+            )?);
+            publish_checksum(&mut runtime, "notify/dropout.txt", "checksum-hint-v2", 17)?;
+            runtime.fallback_sync_metadata("reader")?;
+            fallback_syncs += 1;
+            runtime.deliver_all_metadata("reader")?;
+        }
+        1 => {
+            hints_disrupted += usize::from(runtime.delay_next_metadata_hint("reader")?.is_some());
+            stale_windows += usize::from(runtime.deliver_next_metadata("reader").is_err());
+            publish_checksum(&mut runtime, "notify/dropout.txt", "checksum-hint-v2", 17)?;
+            runtime.fallback_sync_metadata("reader")?;
+            fallback_syncs += 1;
+            runtime.deliver_all_metadata("reader")?;
+        }
+        2 => {
+            runtime.deliver_next_metadata("reader")?;
+            publish_checksum(&mut runtime, "notify/dropout.txt", "checksum-hint-v2", 17)?;
+            hints_disrupted += usize::from(runtime.drop_next_metadata_hint("reader")?.is_some());
+            stale_windows += usize::from(reader_is_stale(
+                &runtime,
+                "notify/dropout.txt",
+                "checksum-hint-v2",
+            )?);
+            runtime.fallback_sync_metadata("reader")?;
+            fallback_syncs += 1;
+            runtime.deliver_all_metadata("reader")?;
+        }
+        _ => {
+            runtime.deliver_next_metadata("reader")?;
+            publish_checksum(&mut runtime, "notify/dropout.txt", "checksum-hint-v2", 17)?;
+            hints_disrupted += usize::from(runtime.delay_next_metadata_hint("reader")?.is_some());
+            stale_windows += usize::from(runtime.deliver_next_metadata("reader").is_err());
+            runtime.fallback_sync_metadata("reader")?;
+            fallback_syncs += 1;
+            runtime.deliver_all_metadata("reader")?;
+        }
+    }
+
+    let mut final_snapshot = runtime.logical_snapshot();
+    final_snapshot.replay_idempotent = Some(true);
+    Ok(InvalidationDropoutRun {
+        runtime,
+        scheduler_trace: invalidation_dropout_scheduler_trace(
+            seed,
+            invalidation_dropout_variant(seed),
+            "reader",
+            fallback_bound,
+        ),
+        final_snapshot,
+        stale_windows,
+        fallback_bound,
+        fallback_syncs,
+        hints_disrupted,
+        invariant_checkpoints: 3 + fallback_bound,
+    })
+}
+
+fn publish_checksum(
+    runtime: &mut SimulatedRuntime,
+    path: &str,
+    checksum: &str,
+    size: u64,
+) -> Result<(), SimulationCorpusError> {
+    runtime.write_file("writer", path, size, checksum)?;
+    runtime.flush("writer", path)?;
+    let upload = runtime.schedule_upload("writer", path)?;
+    runtime.complete_upload(upload.upload_id)?;
+    runtime.publish_file("writer", path)?;
+    Ok(())
+}
+
+fn reader_is_stale(
+    runtime: &SimulatedRuntime,
+    path: &str,
+    expected_checksum: &str,
+) -> Result<bool, SimulationCorpusError> {
+    match runtime.read_file("reader", path) {
+        Ok(view) => Ok(view.checksum_sha256 != expected_checksum),
+        Err(ClientRuntimeError::PathNotFound { .. }) => Ok(true),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn invalidation_dropout_scheduler_trace(
+    seed: u64,
+    variant: &str,
+    client: &str,
+    fallback_bound: usize,
+) -> Vec<SchedulerTraceRecord> {
+    (0..fallback_bound)
+        .map(|index| SchedulerTraceRecord {
+            step: (index + 1) as u64,
+            seed,
+            virtual_tick: index as u64,
+            event_id: (index + 1) as u64,
+            event_type: SchedulerEventType::MetadataDelivery,
+            client: Some(client.to_string()),
+            description: Some(format!("{variant}:fallback-window-{index}")),
+            interleaving_choice: 0,
+            ready_event_count: 1,
+            ready_event_ids: vec![(index + 1) as u64],
+        })
+        .collect()
+}
+
 fn cold_observer_long_history_seed(seed: u64) -> Result<ColdObserverRun, SimulationCorpusError> {
     let mut runtime = SimulatedRuntime::new(seed);
     runtime.add_client("writer");
@@ -998,6 +1213,19 @@ fn cold_observer_variant(seed: u64) -> &'static str {
 
 fn cold_observer_variant_index(seed: u64) -> usize {
     (seed % COLD_OBSERVER_SEED_VARIANTS) as usize
+}
+
+fn invalidation_dropout_variant(seed: u64) -> &'static str {
+    match invalidation_dropout_variant_index(seed) {
+        0 => "miss_first_hint_before_writer_continues",
+        1 => "delay_first_hint_until_fallback",
+        2 => "miss_second_hint_after_initial_apply",
+        _ => "delay_second_hint_until_fallback",
+    }
+}
+
+fn invalidation_dropout_variant_index(seed: u64) -> usize {
+    (seed % INVALIDATION_DROPOUT_SEED_VARIANTS) as usize
 }
 
 fn aggregate_seed_reports<FamilyReport, SeedReport>(
@@ -1409,6 +1637,7 @@ fn sparse_read_probes(seed: u64) -> usize {
 const OUTAGE_SEED_VARIANTS: u64 = 8;
 const SPARSE_SEED_VARIANTS: u64 = 4;
 const COLD_OBSERVER_SEED_VARIANTS: u64 = 4;
+const INVALIDATION_DROPOUT_SEED_VARIANTS: u64 = 4;
 
 fn seeds_for(kind: SimulationCorpusKind) -> &'static [u64] {
     match kind {
@@ -1425,6 +1654,7 @@ fn ordered_groups() -> &'static [SimulationScenarioGroup] {
         SimulationScenarioGroup::ObjectStoreOutage,
         SimulationScenarioGroup::SparsePayloadChaos,
         SimulationScenarioGroup::ColdObserverLongHistory,
+        SimulationScenarioGroup::InvalidationDropoutFallbackSync,
     ]
 }
 
@@ -1445,6 +1675,9 @@ pub fn group_arg(group: SimulationScenarioGroup) -> &'static str {
         SimulationScenarioGroup::ObjectStoreOutage => "object-store-outage",
         SimulationScenarioGroup::SparsePayloadChaos => "sparse-payload-chaos",
         SimulationScenarioGroup::ColdObserverLongHistory => "cold-observer-long-history",
+        SimulationScenarioGroup::InvalidationDropoutFallbackSync => {
+            "invalidation-dropout-fallback-sync"
+        }
     }
 }
 
@@ -1471,6 +1704,17 @@ struct ColdObserverRun {
     scheduler_trace: Vec<SchedulerTraceRecord>,
     final_snapshot: LogicalSnapshot,
     replay_idempotent: bool,
+    invariant_checkpoints: usize,
+}
+
+struct InvalidationDropoutRun {
+    runtime: SimulatedRuntime,
+    scheduler_trace: Vec<SchedulerTraceRecord>,
+    final_snapshot: LogicalSnapshot,
+    stale_windows: usize,
+    fallback_bound: usize,
+    fallback_syncs: usize,
+    hints_disrupted: usize,
     invariant_checkpoints: usize,
 }
 
