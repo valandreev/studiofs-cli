@@ -3338,8 +3338,9 @@ fn run_timed_hotspot_io_with_worker_limit<T: Send + 'static>(
     thread::Builder::new()
         .name("studiofs-e2e-hotspot-io".to_string())
         .spawn(move || {
-            let _permit = permit;
-            let _ = tx.send(f());
+            let result = f();
+            drop(permit);
+            let _ = tx.send(result);
         })?;
     match rx.recv_timeout(timeout) {
         Ok(Ok(value)) => Ok(value),
@@ -5055,6 +5056,27 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(active_workers.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn hotspot_churn_completed_operations_release_worker_before_next_operation() {
+        let active_workers = Arc::new(AtomicUsize::new(0));
+
+        for index in 0..256 {
+            run_timed_hotspot_io_with_worker_limit(
+                Duration::from_secs(1),
+                format!("completed hotspot operation {index}"),
+                || Ok(()),
+                Arc::clone(&active_workers),
+            )
+            .unwrap();
+
+            assert_eq!(
+                active_workers.load(Ordering::SeqCst),
+                0,
+                "completed hotspot operation {index} returned before releasing its worker permit"
+            );
+        }
     }
 
     #[test]
