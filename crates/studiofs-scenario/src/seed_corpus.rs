@@ -1,5 +1,6 @@
 //! Deterministic simulation seed corpus used by RWX simulation targets.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufReader, BufWriter, Write as _};
 use std::path::{Path, PathBuf};
@@ -750,24 +751,30 @@ fn aggregate_seed_reports<FamilyReport, SeedReport>(
     invariant_checkpoints: impl Fn(&SeedReport) -> usize,
     trace_records: impl Fn(&SeedReport) -> usize,
 ) -> Vec<SimulationSeedReport> {
+    let mut reports_by_seed: BTreeMap<u64, Vec<&SeedReport>> = BTreeMap::new();
+    for family_report in family_reports {
+        for seed_report in seed_reports(family_report) {
+            reports_by_seed
+                .entry(seed_value(seed_report))
+                .or_default()
+                .push(seed_report);
+        }
+    }
+
     seeds
         .iter()
         .map(|seed| {
-            let reports = family_reports
-                .iter()
-                .flat_map(&seed_reports)
-                .filter(|seed_report| seed_value(seed_report) == *seed)
-                .collect::<Vec<_>>();
+            let reports = reports_by_seed.get(seed).map_or(&[][..], Vec::as_slice);
             SimulationSeedReport {
                 seed: *seed,
-                passed: reports.iter().all(|seed_report| seed_passed(seed_report)),
+                passed: reports.iter().all(|&seed_report| seed_passed(seed_report)),
                 invariant_checkpoints: reports
                     .iter()
-                    .map(|seed_report| invariant_checkpoints(seed_report))
+                    .map(|&seed_report| invariant_checkpoints(seed_report))
                     .sum(),
                 trace_records: reports
                     .iter()
-                    .map(|seed_report| trace_records(seed_report))
+                    .map(|&seed_report| trace_records(seed_report))
                     .sum(),
             }
         })

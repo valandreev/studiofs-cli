@@ -225,7 +225,7 @@ impl SimulatedRuntime {
             let payload = entry
                 .payload
                 .get_or_insert_with(|| SparsePayload::new(entry.size.unwrap_or_default()));
-            payload.truncate(size);
+            payload.truncate(size)?;
             let checksum_sha256 = payload.file_checksum();
             let object_id = Self::object_id(client, &entry.logical_id, &checksum_sha256);
             entry.size = Some(size);
@@ -1131,6 +1131,10 @@ impl SparsePayload {
                 .insert(extent_offset, extent_bytes[..keep_len].to_vec());
             if extent_end > end {
                 let keep_start = (end - extent_offset) as usize;
+                debug_assert!(
+                    !overlapping.contains_key(&end),
+                    "sparse extents must not overlap at the replacement end"
+                );
                 overlapping.insert(end, extent_bytes[keep_start..].to_vec());
             }
         }
@@ -1146,6 +1150,10 @@ impl SparsePayload {
             let extent_end = Self::extent_end(extent_offset, extent_bytes.len())?;
             if extent_end > end {
                 let keep_start = (end - extent_offset) as usize;
+                debug_assert!(
+                    !right.contains_key(&end),
+                    "sparse extents must not overlap at the replacement end"
+                );
                 right.insert(end, extent_bytes[keep_start..].to_vec());
                 break;
             }
@@ -1159,20 +1167,61 @@ impl SparsePayload {
             .ok_or(ClientRuntimeError::SparseRangeOverflow)
     }
 
-    fn truncate(&mut self, size: u64) {
+    fn truncate(&mut self, size: u64) -> Result<(), ClientRuntimeError> {
         self.size = size;
-        self.extents = self
+        let _dropped_tail = self.extents.split_off(&size);
+        if let Some((extent_offset, extent_bytes)) = self
             .extents
-            .iter()
-            .filter_map(|(&offset, bytes)| {
-                if offset >= size {
-                    None
-                } else {
-                    let keep_len = bytes.len().min((size - offset) as usize);
-                    Some((offset, bytes[..keep_len].to_vec()))
-                }
+            .range(..size)
+            .next_back()
+            .map(|(&extent_offset, extent_bytes)| (extent_offset, extent_bytes.clone()))
+        {
+            let extent_end = Self::extent_end(extent_offset, extent_bytes.len())?;
+            if extent_end > size {
+                let keep_len = (size - extent_offset) as usize;
+                self.extents
+                    .insert(extent_offset, extent_bytes[..keep_len].to_vec());
+            }
+        }
+        Ok(())
+    }
+
+    fn overlapping_extent_offsets(
+        &self,
+        offset: u64,
+        end: u64,
+    ) -> Result<Vec<u64>, ClientRuntimeError> {
+        let mut offsets = Vec::new();
+        if let Some((&extent_offset, extent_bytes)) = self.extents.range(..offset).next_back() {
+            let extent_end = Self::extent_end(extent_offset, extent_bytes.len())?;
+            if extent_end > offset {
+                offsets.push(extent_offset);
+            }
+        }
+        offsets.extend(
+            self.extents
+                .range(offset..end)
+                .map(|(&extent_offset, _)| extent_offset),
+        );
+        Ok(offsets)
+    }
+
+    fn overlapping_extents(
+        &self,
+        offset: u64,
+        end: u64,
+    ) -> Result<Vec<(u64, &[u8])>, ClientRuntimeError> {
+        self.overlapping_extent_offsets(offset, end)?
+            .into_iter()
+            .map(|extent_offset| {
+                let extent_bytes = self.extents.get(&extent_offset).ok_or(
+                    ClientRuntimeError::MissingSparseExtent {
+                        offset: extent_offset,
+                    },
+                )?;
+                Ok((extent_offset, extent_bytes.as_slice()))
             })
-            .collect();
+            .collect()
     }
 
     fn read(&self, offset: u64, bytes: u64) -> Result<SimulatedReadRange, ClientRuntimeError> {
@@ -1206,13 +1255,8 @@ impl SparsePayload {
             });
         }
         let mut materialized = vec![0; (end - offset) as usize];
-        for (&extent_offset, extent_bytes) in &self.extents {
-            let extent_end = extent_offset
-                .checked_add(extent_bytes.len() as u64)
-                .ok_or(ClientRuntimeError::SparseRangeOverflow)?;
-            if extent_end <= offset || extent_offset >= end {
-                continue;
-            }
+        for (extent_offset, extent_bytes) in self.overlapping_extents(offset, end)? {
+            let extent_end = Self::extent_end(extent_offset, extent_bytes.len())?;
             let copy_start = extent_offset.max(offset);
             let copy_end = extent_end.min(end);
             let src_start = (copy_start - extent_offset) as usize;
@@ -1233,13 +1277,8 @@ impl SparsePayload {
     fn holes_in(&self, offset: u64, end: u64) -> Result<Vec<SimulatedRange>, ClientRuntimeError> {
         let mut holes = Vec::new();
         let mut cursor = offset;
-        for (&extent_offset, extent_bytes) in &self.extents {
-            let extent_end = extent_offset
-                .checked_add(extent_bytes.len() as u64)
-                .ok_or(ClientRuntimeError::SparseRangeOverflow)?;
-            if extent_end <= offset || extent_offset >= end {
-                continue;
-            }
+        for (extent_offset, extent_bytes) in self.overlapping_extents(offset, end)? {
+            let extent_end = Self::extent_end(extent_offset, extent_bytes.len())?;
             let data_start = extent_offset.max(offset);
             if cursor < data_start {
                 holes.push((cursor, data_start - cursor).into());
@@ -1487,6 +1526,12 @@ pub enum ClientRuntimeError {
     #[error("simulated sparse byte range overflows u64")]
     /// Variant $name.
     SparseRangeOverflow,
+    #[error("simulated sparse extent at offset {offset} disappeared during range iteration")]
+    /// Variant $name.
+    MissingSparseExtent {
+        /// The offset value.
+        offset: u64,
+    },
     #[error("object store error: {0:?}")]
     /// Variant $name.
     ObjectStore(ObjectStoreFault),
