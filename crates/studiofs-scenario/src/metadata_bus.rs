@@ -140,6 +140,10 @@ pub enum MetadataTraceKind {
     DuplicateIgnored,
     /// Variant $name.
     DeliveryBlocked,
+    /// Variant $name.
+    HintDropped,
+    /// Variant $name.
+    FallbackSync,
 }
 
 #[derive(Debug, Default)]
@@ -351,6 +355,63 @@ impl MetadataBus {
             .or_default()
             .push_back(batch_id);
         true
+    }
+
+    /// Drops a queued invalidation hint without deleting authoritative metadata.
+    pub fn drop_hint_for(&mut self, client: &str, batch_id: u64) -> bool {
+        if !self.batches.contains_key(&batch_id) {
+            return false;
+        }
+        let Some(queue) = self.client_queues.get_mut(client) else {
+            return false;
+        };
+        let Some(position) = queue.iter().position(|queued| *queued == batch_id) else {
+            return false;
+        };
+        queue.remove(position);
+        if let Some(delayed) = self.delayed.get_mut(client) {
+            delayed.remove(&batch_id);
+        }
+        if let Some(batch) = self.batches.get(&batch_id).cloned() {
+            self.record(batch_trace(
+                &batch,
+                MetadataTraceKind::HintDropped,
+                Some(client),
+            ));
+        }
+        true
+    }
+
+    /// Rebuilds the client queue from authoritative metadata history.
+    pub fn fallback_sync_for(&mut self, client: &str) -> usize {
+        let Some(queue) = self.client_queues.get_mut(client) else {
+            return 0;
+        };
+        let applied = self.applied_batches.get(client);
+        let queued = queue.iter().copied().collect::<BTreeSet<_>>();
+        let missing = self
+            .batches
+            .keys()
+            .copied()
+            .filter(|batch_id| !queued.contains(batch_id))
+            .filter(|batch_id| !applied.is_some_and(|applied| applied.contains(batch_id)))
+            .count();
+        *queue = self
+            .batches
+            .keys()
+            .copied()
+            .filter(|batch_id| !applied.is_some_and(|applied| applied.contains(batch_id)))
+            .collect();
+        self.delayed.remove(client);
+        self.record(trace_record(
+            MetadataTraceKind::FallbackSync,
+            None,
+            None,
+            None,
+            Some(client.to_string()),
+            None,
+        ));
+        missing
     }
 
     /// Enqueues metadata history for a client in version order.

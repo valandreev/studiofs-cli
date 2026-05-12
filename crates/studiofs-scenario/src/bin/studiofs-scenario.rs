@@ -170,6 +170,9 @@ fn parse_group(value: std::ffi::OsString) -> Result<SimulationScenarioGroup, Str
         Some("object-store-outage") => Ok(SimulationScenarioGroup::ObjectStoreOutage),
         Some("sparse-payload-chaos") => Ok(SimulationScenarioGroup::SparsePayloadChaos),
         Some("cold-observer-long-history") => Ok(SimulationScenarioGroup::ColdObserverLongHistory),
+        Some("invalidation-dropout-fallback-sync") => {
+            Ok(SimulationScenarioGroup::InvalidationDropoutFallbackSync)
+        }
         Some(other) => Err(format!("unknown scenario group: {other}")),
         None => Err("--scenario-group must be valid UTF-8".to_string()),
     }

@@ -722,6 +722,78 @@ impl SimulatedRuntime {
         Ok(enqueued)
     }
 
+    /// Drops the next queued metadata invalidation hint for a client.
+    pub fn drop_next_metadata_hint(
+        &mut self,
+        client: &str,
+    ) -> Result<Option<u64>, ClientRuntimeError> {
+        self.ensure_client(client)?;
+        let batch_id = self
+            .metadata_bus
+            .pending_for(client)
+            .first()
+            .map(|batch| batch.batch_id);
+        if let Some(batch_id) = batch_id {
+            self.metadata_bus.drop_hint_for(client, batch_id);
+        }
+        self.record_with_metadata(
+            client,
+            "metadata_hint_dropped",
+            None,
+            [(
+                "batch_id".to_string(),
+                batch_id
+                    .map(|batch_id| batch_id.to_string())
+                    .unwrap_or_else(|| "<none>".to_string()),
+            )],
+        );
+        Ok(batch_id)
+    }
+
+    /// Delays the next queued metadata invalidation hint for a client.
+    pub fn delay_next_metadata_hint(
+        &mut self,
+        client: &str,
+    ) -> Result<Option<u64>, ClientRuntimeError> {
+        self.ensure_client(client)?;
+        let batch_id = self
+            .metadata_bus
+            .pending_for(client)
+            .first()
+            .map(|batch| batch.batch_id);
+        if let Some(batch_id) = batch_id {
+            self.metadata_bus.delay_for(client, batch_id);
+        }
+        self.record_with_metadata(
+            client,
+            "metadata_hint_delayed",
+            None,
+            [(
+                "batch_id".to_string(),
+                batch_id
+                    .map(|batch_id| batch_id.to_string())
+                    .unwrap_or_else(|| "<none>".to_string()),
+            )],
+        );
+        Ok(batch_id)
+    }
+
+    /// Rebuilds pending metadata from authoritative state after missed hints.
+    pub fn fallback_sync_metadata(&mut self, client: &str) -> Result<usize, ClientRuntimeError> {
+        self.ensure_client(client)?;
+        let enqueued = self.metadata_bus.fallback_sync_for(client);
+        self.record_with_metadata(
+            client,
+            "metadata_fallback_sync",
+            None,
+            [("enqueued_batches".to_string(), enqueued.to_string())],
+        );
+        self.scheduler.schedule_now(
+            ScheduledEvent::new(SchedulerEventType::MetadataDelivery).with_client(client),
+        );
+        Ok(enqueued)
+    }
+
     /// Function $name.
     pub fn set_metadata_available(&mut self, available: bool) {
         self.metadata_bus.set_metadata_outage(!available);
