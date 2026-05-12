@@ -631,9 +631,16 @@ impl RedbMetaEngine {
                     } else {
                         let prior_keys = Self::base_dentry_keys_for_rename_entry(&txn, entry)?;
                         if prior_keys.len() > 1 {
-                            continue;
-                        }
-                        if let Some(prior_key) = prior_keys.first() {
+                            tracing::warn!(
+                                ino = entry.ino,
+                                source_parent = *parent,
+                                source_name = %String::from_utf8_lossy(name),
+                                destination_parent = *new_parent,
+                                destination_name = %String::from_utf8_lossy(new_name),
+                                prior_key_count = prior_keys.len(),
+                                "replica rename found multiple base dentries for inode; preserving existing links and applying destination"
+                            );
+                        } else if let Some(prior_key) = prior_keys.first() {
                             let (prior_parent, prior_name) = decode_dentry_key(prior_key)?;
                             Self::remove_base_dentry_in_txn(&txn, prior_parent, prior_name)?;
                         }

@@ -3302,16 +3302,25 @@ fn run_timed_hotspot_io<T: Send + 'static>(
     f: impl FnOnce() -> io::Result<T> + Send + 'static,
 ) -> Result<T, ScenarioError> {
     let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let _ = tx.send(f());
-    });
+    thread::Builder::new()
+        .name("studiofs-e2e-hotspot-io".to_string())
+        .spawn(move || {
+            let _ = tx.send(f());
+        })?;
     match rx.recv_timeout(timeout) {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(error)) => Err(error.into()),
-        Err(mpsc::RecvTimeoutError::Timeout) => Err(namespace_collision_operation_timeout(
-            timeout,
-            vec![(1, pending_label)],
-        )),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            eprintln!(
+                "studiofs-e2e: mounted hotspot operation timed out after {} ms; worker thread may remain blocked until process exit: {}",
+                timeout.as_millis(),
+                pending_label
+            );
+            Err(namespace_collision_operation_timeout(
+                timeout,
+                vec![(1, pending_label)],
+            ))
+        }
         Err(mpsc::RecvTimeoutError::Disconnected) => Err(ScenarioError::Io(io::Error::other(
             "hotspot operation worker channel closed before completion",
         ))),
