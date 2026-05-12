@@ -324,7 +324,7 @@ impl SimulatedRuntime {
         Ok(())
     }
 
-    /// Function $name.
+    /// Unlinks a file and publishes a deletion event to the metadata bus.
     pub fn publish_unlink(&mut self, client: &str, path: &str) -> Result<(), ClientRuntimeError> {
         let entry = self.entry(client, path)?;
         if entry.kind != LocalEntryKind::File {
@@ -682,7 +682,7 @@ impl SimulatedRuntime {
         Ok(outcome)
     }
 
-    /// Function $name.
+    /// Delivers all currently pending metadata batches for a client.
     pub fn deliver_all_metadata(&mut self, client: &str) -> Result<usize, ClientRuntimeError> {
         let mut delivered = 0;
         let pending = self.metadata_bus.pending_count_for(client);
@@ -696,7 +696,7 @@ impl SimulatedRuntime {
         Ok(delivered)
     }
 
-    /// Function $name.
+    /// Imports metadata history for a client, excluding already-applied batches.
     pub fn import_metadata_history(&mut self, client: &str) -> Result<usize, ClientRuntimeError> {
         self.ensure_client(client)?;
         let enqueued = self.metadata_bus.enqueue_history_for(client, false);
@@ -709,7 +709,7 @@ impl SimulatedRuntime {
         Ok(enqueued)
     }
 
-    /// Function $name.
+    /// Replays metadata history for a client, including already-applied batches.
     pub fn replay_metadata_history(&mut self, client: &str) -> Result<usize, ClientRuntimeError> {
         self.ensure_client(client)?;
         let enqueued = self.metadata_bus.enqueue_history_for(client, true);

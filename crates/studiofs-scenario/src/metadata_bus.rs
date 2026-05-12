@@ -244,7 +244,7 @@ impl MetadataBus {
             .collect()
     }
 
-    /// Function $name.
+    /// Returns the number of queued metadata batches for a client.
     pub fn pending_count_for(&self, client: &str) -> usize {
         self.client_queues.get(client).map_or(0, VecDeque::len)
     }
@@ -353,7 +353,7 @@ impl MetadataBus {
         true
     }
 
-    /// Function $name.
+    /// Enqueues metadata history for a client in version order.
     pub fn enqueue_history_for(&mut self, client: &str, include_applied: bool) -> usize {
         let applied = self.applied_batches.get(client);
         let Some(queue) = self.client_queues.get_mut(client) else {
