@@ -2556,10 +2556,16 @@ impl PgMetaEngine {
     fn removed_inodes_for_batch(&self, batch_events: &[MetaEvent]) -> HashSet<Ino> {
         let mut removed = HashSet::new();
         for event in batch_events {
-            if let MetaEvent::RemoveEntry { parent, name } = event
-                && let Ok(entry) = self.local.lookup(*parent, name)
-            {
-                removed.insert(entry.ino);
+            match event {
+                MetaEvent::RemoveEntry { parent, name } => {
+                    if let Ok(entry) = self.local.lookup(*parent, name) {
+                        removed.insert(entry.ino);
+                    }
+                }
+                MetaEvent::RemoveAttr { ino } => {
+                    removed.insert(*ino);
+                }
+                _ => {}
             }
         }
         removed
@@ -5348,6 +5354,37 @@ mod tests {
         remote
             .apply_foreign_batch(&projected, &OverlayConflictSets::default())
             .expect("apply projected remote batch");
+    }
+
+    #[test]
+    fn foreign_unlink_after_local_rename_removes_destination_alias() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+
+        let file = create_published_small_file(&pg, ROOT_INO, b"file.txt", 77_010);
+        let setup_end = pg.local.get_counter("nextEventSeq").expect("setup end");
+        pg.persist_flushed_event_seq(setup_end)
+            .expect("ack published setup");
+
+        pg.rename(ROOT_INO, b"file.txt", ROOT_INO, b"renamed.txt")
+            .expect("local rename");
+        let overlay = pg.local_overlay_conflicts().expect("overlay conflicts");
+        assert!(pg.lookup(ROOT_INO, b"renamed.txt").is_ok());
+
+        pg.apply_foreign_batch(
+            &[
+                MetaEvent::RemoveEntry {
+                    parent: ROOT_INO,
+                    name: b"file.txt".to_vec(),
+                },
+                MetaEvent::RemoveAttr { ino: file.ino },
+            ],
+            &overlay,
+        )
+        .expect("apply foreign unlink");
+
+        assert!(pg.lookup(ROOT_INO, b"file.txt").is_err());
+        assert!(pg.lookup(ROOT_INO, b"renamed.txt").is_err());
+        assert!(pg.get_attr(file.ino).is_err());
     }
 
     fn setup_pg_volume(dsn: &str, name: &str, uuid: &str, block_size: u32) -> MetaResult<i64> {

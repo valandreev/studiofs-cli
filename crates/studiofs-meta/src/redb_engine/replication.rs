@@ -1,6 +1,31 @@
 use super::*;
 
 impl RedbMetaEngine {
+    fn remove_dentry_mirrors_for_inode_in_txn(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+    ) -> MetaResult<()> {
+        let keys = Self::dentry_keys_for_inode_in_write_index(txn, DENTRIES_BY_INODE_TABLE, ino)?;
+        for key in keys {
+            let (parent, name) = decode_dentry_key(&key)?;
+            Self::remove_dentry_mirror_in_txn(txn, parent, name)?;
+        }
+        Ok(())
+    }
+
+    fn remove_base_dentries_for_inode_in_txn(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+    ) -> MetaResult<()> {
+        let keys =
+            Self::dentry_keys_for_inode_in_write_index(txn, BASE_DENTRIES_BY_INODE_TABLE, ino)?;
+        for key in keys {
+            let (parent, name) = decode_dentry_key(&key)?;
+            Self::remove_base_dentry_in_txn(txn, parent, name)?;
+        }
+        Ok(())
+    }
+
     /// Export a snapshot projected to the remote-visible published namespace.
     pub fn export_remote_snapshot(&self) -> MetaResult<RedbSnapshot> {
         let mut snapshot = self.export_snapshot()?;
@@ -520,6 +545,8 @@ impl RedbMetaEngine {
                         .map_err(|e| MetaError::Storage(e.to_string()))?;
                 }
                 crate::events::MetaEvent::RemoveAttr { ino } => {
+                    Self::remove_base_dentries_for_inode_in_txn(&txn, *ino)?;
+
                     let mut table = txn
                         .open_table(BASE_INODES_TABLE)
                         .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -744,6 +771,7 @@ impl RedbMetaEngine {
                     Self::set_inode_mirror_in_txn(&txn, attr)?;
                 }
                 crate::events::MetaEvent::RemoveAttr { ino } => {
+                    Self::remove_dentry_mirrors_for_inode_in_txn(&txn, *ino)?;
                     Self::remove_inode_mirror_in_txn(&txn, *ino)?;
                     Self::remove_symlink_mirror_in_txn(&txn, *ino)?;
 

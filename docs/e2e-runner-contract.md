@@ -58,7 +58,7 @@ Required initial run flags and environment:
 | Flag | Contract |
 |---|---|
 | `basic-multi-client-smoke` | Positional shorthand for the mounted three-client happy-path smoke scenario. |
-| `--scenario <name|number|range|list>` | Repeatable. Accepted values include scenario names/aliases, one-based numbers from `studiofs-e2e list`, numeric ranges such as `1-8`, and comma lists such as `2,5,10`. Names include `basic-multi-client-smoke` (`smoke`), `postgres-outage-multi-client-recovery` (`postgres-outage`), `rustfs-outage-multi-client-recovery` (`rustfs-outage`, `s3-outage`), `mounted-client-crash-restart-recovery` (`client-crash-restart`, `crash-restart`), and the mounted namespace collision scenarios `collision-rename-vs-rename`, `collision-rename-vs-unlink`, `collision-unlink-vs-append`, `collision-overwrite-vs-read`, `collision-mkdir-rmdir-vs-create`, and `collision-readdir-stat-during-mutation`. |
+| `--scenario <name|number|range|list>` | Repeatable. Accepted values include scenario names/aliases, one-based numbers from `studiofs-e2e list`, numeric ranges such as `1-8`, and comma lists such as `2,5,10`. Names include `basic-multi-client-smoke` (`smoke`), `postgres-outage-multi-client-recovery` (`postgres-outage`), `rustfs-outage-multi-client-recovery` (`rustfs-outage`, `s3-outage`), `mounted-client-crash-restart-recovery` (`client-crash-restart`, `crash-restart`), `mounted-publication-boundary-crash-matrix` (`publication-boundary-crash`, `publication-boundary`), `mounted-chaos-convergence` (`mounted-chaos`, `chaos`), `mounted-hotspot-churn-convergence` (`hotspot-churn`, `hot-dir-churn`), `mounted-fault-chaos-convergence` (`fault-chaos`, `chaos-faults`), `mounted-lww-reconnect-chaos-convergence` (`lww-chaos`, `reconnect-lww`), `mounted-open-handle-convergence` (`open-handle`, `open-unlink-rename`), and the mounted namespace collision scenarios `collision-rename-vs-rename`, `collision-rename-vs-unlink`, `collision-unlink-vs-append`, `collision-overwrite-vs-read`, `collision-mkdir-rmdir-vs-create`, and `collision-readdir-stat-during-mutation`. |
 | `--studiofs-bin <path>` | Path to the product CLI under test. Real mounted scenarios require it when `--infra compose` is used. The runner may build it only when an explicit build flag is added. |
 | `--root <path>` | Parent run directory. Defaults to `target/e2e-runs`. |
 | `--run-id <id>` | Optional stable run ID. If omitted, use an ISO-like UTC timestamp plus short random suffix. Explicit IDs must be safe single directory names: no separators, drive prefixes, traversal segments, leading dots, or other shell/path metacharacters. |
@@ -103,20 +103,20 @@ expectation before changing product semantics.
 The gate runs these accepted baseline scenarios in order:
 
 1. `basic-multi-client-smoke`
-2. `rustfs-outage-multi-client-recovery`
-3. `collision-rename-vs-rename`
-4. `postgres-outage-multi-client-recovery`
-5. `mounted-client-crash-restart-recovery`
-6. `collision-rename-vs-unlink`
-7. `collision-unlink-vs-append`
-8. `collision-overwrite-vs-read`
+2. `postgres-outage-multi-client-recovery`
+3. `rustfs-outage-multi-client-recovery`
+4. `mounted-client-crash-restart-recovery`
+5. `mounted-publication-boundary-crash-matrix`
+6. `collision-rename-vs-rename`
+7. `collision-rename-vs-unlink`
+8. `collision-unlink-vs-append`
 
 The same numbering is used by `studiofs-e2e list` and by `run --scenario`, so
 `--scenario 1-8` runs this baseline set and `--scenario 2,5,10` runs only those
 numbered scenarios when they are registered.
 
-Scenario 4 follows the rewritten PostgreSQL outage contract: writer recovery
-comes first, then normal publication, then peer convergence. Scenario 5 follows
+Scenario 2 follows the rewritten PostgreSQL outage contract: writer recovery
+comes first, then normal publication, then peer convergence. Scenario 4 follows
 the rewritten crash/restart contract: a readable recovered writer checksum is
 the convergence oracle, while unrecoverable local loss is reported separately
 from corrupt advertised files, publication failure, and peer convergence
@@ -339,14 +339,15 @@ restart. If the writer can read recovered bytes, that recovered checksum becomes
 the convergence oracle even when it differs from the pre-crash intended
 checksum. If the writer cannot recover the file from local log/cache, the
 scenario reports unrecoverable loss instead of requiring volatile OS-cache data
-to survive an unclean crash. For recovered writer state, the scenario waits for
-upload/publication and peer convergence, and then validates matching mounted
-tree checksums from all clients. The scenario runs two modes in one invocation:
+to survive an unclean crash. The scenario runs two modes in one invocation:
 
 - `after_local_durability_boundary`, which crashes immediately after the
-  documented local durability boundary is crossed.
+  documented local durability boundary is crossed. Recovered writer state is
+  expected to publish and converge across peers.
 - `before_remote_publication_completes`, which crashes after local durability
   but before the scenario waits for remote publication and peer convergence.
+  The writer's recovered local read is pass/fail; peer visibility is recorded
+  as diagnostics only.
 
 The scenario writes `operations.ndjson`,
 `crash-restart-recovery-summary.json`, and `validation.json`. The summary
@@ -355,12 +356,12 @@ local, and final checksums, whether a peer saw any pre-convergence checksum in
 the `before_remote_publication_completes` mode, restart timing, convergence
 timing, recovery outcome, and mounted tree validator result. Diagnostics must
 distinguish unrecoverable local loss, publication failure, peer convergence
-failure, and a corrupt advertised file whose final peer checksum differs from
-the writer's recovered checksum. Publication waiting is intentionally the public
-mounted-tree convergence loop; the scenario must not inspect private S3,
-PostgreSQL, VFS, cache, or redb state to decide success. It must not delete
-local metadata, rerun `discover`, or share one local metadata database between
-clients during recovery.
+failure in the post-durability mode, and a corrupt advertised file whose final
+peer checksum differs from the writer's recovered checksum. Publication waiting
+is intentionally the public mounted-tree convergence loop; the scenario must not
+inspect private S3, PostgreSQL, VFS, cache, or redb state to decide success. It
+must not delete local metadata, rerun `discover`, or share one local metadata
+database between clients during recovery.
 
 Mounted namespace collision scenarios use the first three default clients
 against one shared remote volume. Each scenario establishes a bounded initial
@@ -384,6 +385,16 @@ converge on the same public tree and rejects duplicate canonical paths, missing
 parent directories, unexpected resurrection, and checksum mismatch. The
 overwrite/read scenario records repeated read loops while another client
 overwrites the committed file version.
+
+The restored advanced mounted scenarios keep the same artifact shape:
+`operations.ndjson`, a scenario-specific summary JSON file, and
+`validation.json`. `mounted-publication-boundary-crash-matrix` records the
+flush, fsync, release/close, and shutdown-drain boundaries. `mounted-chaos-*`
+scenarios run bounded mounted mutations and converge through the public mounted
+tree validator. `mounted-lww-reconnect-chaos-convergence` also writes
+`lww-oracle.json`, and validation requires the observed winner checksum to
+match that oracle. `mounted-open-handle-convergence` includes the old-path
+absence check for `open-handles/unlink-target.txt`.
 
 ## Mounted Tree Convergence Validation
 

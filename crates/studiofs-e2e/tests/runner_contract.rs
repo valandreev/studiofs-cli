@@ -112,19 +112,50 @@ fn local_first_baseline_gate_uses_scenarios_1_through_8() {
         baseline_gate::SCENARIOS_1_THROUGH_8,
         [
             "basic-multi-client-smoke",
-            "rustfs-outage-multi-client-recovery",
-            "collision-rename-vs-rename",
             "postgres-outage-multi-client-recovery",
+            "rustfs-outage-multi-client-recovery",
             "mounted-client-crash-restart-recovery",
+            "mounted-publication-boundary-crash-matrix",
+            "collision-rename-vs-rename",
             "collision-rename-vs-unlink",
             "collision-unlink-vs-append",
-            "collision-overwrite-vs-read",
         ]
     );
 }
 
 #[test]
-fn scenario_list_order_matches_local_first_baseline_numbering() {
+fn scenario_list_order_restores_original_sixteen_scenario_numbering() {
+    let scenarios = studiofs_e2e::scenario::available_scenarios();
+    let names = scenarios
+        .iter()
+        .map(|scenario| scenario.name)
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        names,
+        [
+            "basic-multi-client-smoke",
+            "postgres-outage-multi-client-recovery",
+            "rustfs-outage-multi-client-recovery",
+            "mounted-client-crash-restart-recovery",
+            "mounted-publication-boundary-crash-matrix",
+            "collision-rename-vs-rename",
+            "collision-rename-vs-unlink",
+            "collision-unlink-vs-append",
+            "collision-overwrite-vs-read",
+            "collision-mkdir-rmdir-vs-create",
+            "collision-readdir-stat-during-mutation",
+            "mounted-chaos-convergence",
+            "mounted-hotspot-churn-convergence",
+            "mounted-fault-chaos-convergence",
+            "mounted-lww-reconnect-chaos-convergence",
+            "mounted-open-handle-convergence",
+        ]
+    );
+}
+
+#[test]
+fn scenario_list_first_eight_matches_local_first_baseline_gate() {
     let scenarios = studiofs_e2e::scenario::available_scenarios();
     let first_eight = scenarios
         .iter()
@@ -203,6 +234,29 @@ fn list_scenarios_exposes_namespace_collision_suite() {
         assert!(
             names.contains(&expected),
             "expected namespace collision scenario {expected}"
+        );
+    }
+}
+
+#[test]
+fn list_scenarios_exposes_restored_advanced_mounted_suite() {
+    let scenarios = studiofs_e2e::scenario::available_scenarios();
+    let names = scenarios
+        .iter()
+        .map(|scenario| scenario.name)
+        .collect::<Vec<_>>();
+
+    for expected in [
+        "mounted-publication-boundary-crash-matrix",
+        "mounted-chaos-convergence",
+        "mounted-hotspot-churn-convergence",
+        "mounted-fault-chaos-convergence",
+        "mounted-lww-reconnect-chaos-convergence",
+        "mounted-open-handle-convergence",
+    ] {
+        assert!(
+            names.contains(&expected),
+            "expected restored advanced mounted scenario {expected}"
         );
     }
 }
