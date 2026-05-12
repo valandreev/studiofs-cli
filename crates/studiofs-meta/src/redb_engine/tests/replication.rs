@@ -529,6 +529,188 @@ fn replica_serving_rename_still_applies_when_source_matches() {
 }
 
 #[test]
+fn replica_rename_materializes_destination_when_source_was_reused_by_local_inode() {
+    let engine = temp_engine();
+    let remote_entry = DirEntryValue {
+        ino: 790,
+        kind: FileType::RegularFile,
+    };
+    let local_entry = DirEntryValue {
+        ino: 791,
+        kind: FileType::RegularFile,
+    };
+    let remote_attr = InodeAttr::new_file(remote_entry.ino, ROOT_INO, 1000, 1000, 0o644);
+    let local_attr = InodeAttr::new_file(local_entry.ino, ROOT_INO, 1000, 1000, 0o644);
+
+    engine
+        .apply_replica_events_to_base(&[
+            MetaEvent::SetAttr {
+                attr: remote_attr.clone(),
+            },
+            MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: b"source.txt".to_vec(),
+                entry: remote_entry.clone(),
+            },
+        ])
+        .unwrap();
+    engine
+        .apply_replica_serving_state(&[
+            MetaEvent::SetAttr {
+                attr: remote_attr.clone(),
+            },
+            MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: b"source.txt".to_vec(),
+                entry: remote_entry.clone(),
+            },
+        ])
+        .unwrap();
+
+    engine
+        .apply_replica_events_to_base(&[
+            MetaEvent::SetAttr {
+                attr: local_attr.clone(),
+            },
+            MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: b"source.txt".to_vec(),
+                entry: local_entry.clone(),
+            },
+        ])
+        .unwrap();
+    engine
+        .apply_replica_serving_state(&[
+            MetaEvent::SetAttr { attr: local_attr },
+            MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: b"source.txt".to_vec(),
+                entry: local_entry,
+            },
+        ])
+        .unwrap();
+
+    let remote_rename = replica_rename_event(
+        ROOT_INO,
+        b"source.txt",
+        ROOT_INO,
+        b"renamed.txt",
+        remote_entry,
+    );
+    engine
+        .apply_replica_events_to_base(std::slice::from_ref(&remote_rename))
+        .unwrap();
+    engine
+        .apply_replica_serving_state(std::slice::from_ref(&remote_rename))
+        .unwrap();
+
+    assert_eq!(engine.lookup(ROOT_INO, b"source.txt").unwrap().ino, 791);
+    assert_eq!(engine.lookup(ROOT_INO, b"renamed.txt").unwrap().ino, 790);
+}
+
+#[test]
+fn replica_rename_applies_destination_when_reused_source_has_multiple_hardlinks() {
+    let engine = temp_engine();
+    let remote_entry = DirEntryValue {
+        ino: 792,
+        kind: FileType::RegularFile,
+    };
+    let local_entry = DirEntryValue {
+        ino: 793,
+        kind: FileType::RegularFile,
+    };
+    let remote_attr = InodeAttr::new_file(remote_entry.ino, ROOT_INO, 1000, 1000, 0o644);
+    let local_attr = InodeAttr::new_file(local_entry.ino, ROOT_INO, 1000, 1000, 0o644);
+
+    engine
+        .apply_replica_events_to_base(&[
+            MetaEvent::SetAttr {
+                attr: remote_attr.clone(),
+            },
+            MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: b"source.txt".to_vec(),
+                entry: remote_entry.clone(),
+            },
+            MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: b"hardlink-a.txt".to_vec(),
+                entry: remote_entry.clone(),
+            },
+            MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: b"hardlink-b.txt".to_vec(),
+                entry: remote_entry.clone(),
+            },
+        ])
+        .unwrap();
+    engine
+        .apply_replica_serving_state(&[
+            MetaEvent::SetAttr {
+                attr: remote_attr.clone(),
+            },
+            MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: b"source.txt".to_vec(),
+                entry: remote_entry.clone(),
+            },
+            MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: b"hardlink-a.txt".to_vec(),
+                entry: remote_entry.clone(),
+            },
+            MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: b"hardlink-b.txt".to_vec(),
+                entry: remote_entry.clone(),
+            },
+        ])
+        .unwrap();
+
+    engine
+        .apply_replica_events_to_base(&[
+            MetaEvent::SetAttr {
+                attr: local_attr.clone(),
+            },
+            MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: b"source.txt".to_vec(),
+                entry: local_entry.clone(),
+            },
+        ])
+        .unwrap();
+    engine
+        .apply_replica_serving_state(&[
+            MetaEvent::SetAttr { attr: local_attr },
+            MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: b"source.txt".to_vec(),
+                entry: local_entry,
+            },
+        ])
+        .unwrap();
+
+    let remote_rename = replica_rename_event(
+        ROOT_INO,
+        b"source.txt",
+        ROOT_INO,
+        b"renamed.txt",
+        remote_entry,
+    );
+    engine
+        .apply_replica_events_to_base(std::slice::from_ref(&remote_rename))
+        .unwrap();
+    engine
+        .apply_replica_serving_state(std::slice::from_ref(&remote_rename))
+        .unwrap();
+
+    assert_eq!(engine.lookup(ROOT_INO, b"source.txt").unwrap().ino, 793);
+    assert_eq!(engine.lookup(ROOT_INO, b"renamed.txt").unwrap().ino, 792);
+    assert_eq!(engine.lookup(ROOT_INO, b"hardlink-a.txt").unwrap().ino, 792);
+    assert_eq!(engine.lookup(ROOT_INO, b"hardlink-b.txt").unwrap().ino, 792);
+}
+
+#[test]
 fn test_replica_aux_block_events_accept_fragmented_base_graph() {
     let engine = temp_engine();
     let file = engine

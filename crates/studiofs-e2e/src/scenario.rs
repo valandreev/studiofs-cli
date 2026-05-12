@@ -4,7 +4,11 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Barrier, mpsc};
+use std::sync::{
+    Arc, Barrier, LazyLock,
+    atomic::{AtomicUsize, Ordering},
+    mpsc,
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -81,6 +85,10 @@ const COLLISION_NEW_COMMITTED_PAYLOAD: &[u8] = b"new committed payload\n";
 const OVERWRITE_READ_ATTEMPTS: u32 = 8;
 const ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(90);
 const ADVANCED_MOUNTED_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const HOTSPOT_CHURN_OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
+const HOTSPOT_IO_MAX_ACTIVE_WORKERS: usize = 1;
+static HOTSPOT_IO_ACTIVE_WORKERS: LazyLock<Arc<AtomicUsize>> =
+    LazyLock::new(|| Arc::new(AtomicUsize::new(0)));
 const LWW_RECONNECT_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(120);
 const FAULT_CHAOS_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -3198,61 +3206,189 @@ fn run_mounted_chaos_operations(
 fn run_hotspot_churn_operations(
     clients: &[ClientSpec],
 ) -> Result<Vec<NamespaceCollisionOperation>, ScenarioError> {
+    run_hotspot_churn_operations_with_timeout(clients, HOTSPOT_CHURN_OPERATION_TIMEOUT)
+}
+
+fn run_hotspot_churn_operations_with_timeout(
+    clients: &[ClientSpec],
+    operation_timeout: Duration,
+) -> Result<Vec<NamespaceCollisionOperation>, ScenarioError> {
     let started = Instant::now();
     let mut operations = Vec::new();
-    fs::create_dir_all(clients[0].mount_point.join("hotspot"))?;
+    let mkdir_client = clients[0].clone();
+    run_timed_hotspot_io(
+        operation_timeout,
+        format!("{} mkdir hotspot", mkdir_client.name),
+        move || fs::create_dir_all(mkdir_client.mount_point.join("hotspot")),
+    )?;
     for round in 0..10 {
         let slot = format!("hotspot/slot-{}.txt", round % 6);
         let renamed = format!("hotspot/slot-{}-renamed.txt", round % 6);
-        operations.push(fs_op(
+        let write_path = slot.clone();
+        operations.push(timed_fs_op(
             started,
             operations.len() + 1,
             &clients[0],
             "overwrite",
             &slot,
-            || {
+            operation_timeout,
+            move |client| {
                 write_parented(
-                    clients[0].mount_point.join(&slot),
+                    client.mount_point.join(&write_path),
                     format!("hotspot round {round}\n").as_bytes(),
                 )
             },
-        ));
-        operations.push(fs_op(
+        )?);
+        let append_path = slot.clone();
+        operations.push(timed_fs_op(
             started,
             operations.len() + 1,
             &clients[1],
             "append",
             &slot,
-            || {
+            operation_timeout,
+            move |client| {
                 append_payload(
-                    clients[1].mount_point.join(&slot),
+                    client.mount_point.join(&append_path),
                     format!("append round {round}\n").as_bytes(),
                 )
             },
-        ));
-        operations.push(fs_op(
+        )?);
+        let rename_source = slot.clone();
+        let rename_target = renamed.clone();
+        operations.push(timed_fs_op(
             started,
             operations.len() + 1,
             &clients[0],
             "rename",
             &slot,
-            || {
+            operation_timeout,
+            move |client| {
                 fs::rename(
-                    clients[0].mount_point.join(&slot),
-                    clients[0].mount_point.join(&renamed),
+                    client.mount_point.join(&rename_source),
+                    client.mount_point.join(&rename_target),
                 )
             },
-        ));
-        operations.push(fs_op(
+        )?);
+        operations.push(timed_fs_op(
             started,
             operations.len() + 1,
             &clients[2],
             "readdir",
             "hotspot",
-            || fs::read_dir(clients[2].mount_point.join("hotspot")).map(|_| ()),
-        ));
+            operation_timeout,
+            |client| fs::read_dir(client.mount_point.join("hotspot")).map(|_| ()),
+        )?);
     }
     Ok(operations)
+}
+
+fn timed_fs_op(
+    started: Instant,
+    order: usize,
+    client: &ClientSpec,
+    operation: &str,
+    path: &str,
+    timeout: Duration,
+    f: impl FnOnce(&ClientSpec) -> io::Result<()> + Send + 'static,
+) -> Result<NamespaceCollisionOperation, ScenarioError> {
+    let client = client.clone();
+    let operation = operation.to_string();
+    let path = path.to_string();
+    let label = format!("{} {} {}", client.name, operation, path);
+    run_timed_hotspot_io(timeout, label, move || {
+        Ok(fs_op(started, order, &client, &operation, &path, || {
+            f(&client)
+        }))
+    })
+}
+
+fn run_timed_hotspot_io<T: Send + 'static>(
+    timeout: Duration,
+    pending_label: String,
+    f: impl FnOnce() -> io::Result<T> + Send + 'static,
+) -> Result<T, ScenarioError> {
+    run_timed_hotspot_io_with_worker_limit(
+        timeout,
+        pending_label,
+        f,
+        Arc::clone(&HOTSPOT_IO_ACTIVE_WORKERS),
+    )
+}
+
+fn run_timed_hotspot_io_with_worker_limit<T: Send + 'static>(
+    timeout: Duration,
+    pending_label: String,
+    f: impl FnOnce() -> io::Result<T> + Send + 'static,
+    active_workers: Arc<AtomicUsize>,
+) -> Result<T, ScenarioError> {
+    let Some(permit) = HotspotIoWorkerPermit::try_acquire(active_workers) else {
+        let pending_label = format!(
+            "hotspot worker limit reached; previous timed operation may still be blocked before {pending_label}"
+        );
+        eprintln!(
+            "studiofs-e2e: {pending_label}; refusing to spawn another mounted hotspot worker"
+        );
+        return Err(namespace_collision_operation_timeout(
+            timeout,
+            vec![(1, pending_label)],
+        ));
+    };
+    let (tx, rx) = mpsc::channel();
+    thread::Builder::new()
+        .name("studiofs-e2e-hotspot-io".to_string())
+        .spawn(move || {
+            let _permit = permit;
+            let _ = tx.send(f());
+        })?;
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(error.into()),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            eprintln!(
+                "studiofs-e2e: mounted hotspot operation timed out after {} ms; worker thread may remain blocked until process exit: {}",
+                timeout.as_millis(),
+                pending_label
+            );
+            Err(namespace_collision_operation_timeout(
+                timeout,
+                vec![(1, pending_label)],
+            ))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(ScenarioError::Io(io::Error::other(
+            "hotspot operation worker channel closed before completion",
+        ))),
+    }
+}
+
+struct HotspotIoWorkerPermit {
+    active_workers: Arc<AtomicUsize>,
+}
+
+impl HotspotIoWorkerPermit {
+    fn try_acquire(active_workers: Arc<AtomicUsize>) -> Option<Self> {
+        let mut current = active_workers.load(Ordering::Acquire);
+        loop {
+            if current >= HOTSPOT_IO_MAX_ACTIVE_WORKERS {
+                return None;
+            }
+            match active_workers.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Self { active_workers }),
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+impl Drop for HotspotIoWorkerPermit {
+    fn drop(&mut self) {
+        self.active_workers.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 fn run_fault_chaos_operations(
@@ -4840,6 +4976,85 @@ mod tests {
             started.elapsed() < Duration::from_millis(150),
             "timeout must not wait for the hung namespace worker to finish"
         );
+    }
+
+    #[test]
+    fn hotspot_churn_operation_timeout_reports_pending_without_waiting_forever() {
+        let started = Instant::now();
+
+        let err = run_timed_hotspot_io_with_worker_limit(
+            Duration::from_millis(20),
+            "client-a mkdir hotspot".to_string(),
+            || {
+                thread::sleep(Duration::from_millis(200));
+                Ok(())
+            },
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ScenarioError::NamespaceCollisionOperationTimeout { .. }
+        ));
+        assert!(err.to_string().contains("client-a mkdir hotspot"));
+        assert!(
+            started.elapsed() < Duration::from_millis(150),
+            "hotspot timeout must not wait for the hung mounted operation to finish"
+        );
+    }
+
+    #[test]
+    fn hotspot_churn_operation_timeout_bounds_pending_workers() {
+        let active_workers = Arc::new(AtomicUsize::new(0));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        let err = run_timed_hotspot_io_with_worker_limit(
+            Duration::from_millis(20),
+            "client-a mkdir hotspot".to_string(),
+            move || {
+                release_rx
+                    .recv()
+                    .map_err(|_| io::Error::other("hotspot worker release channel closed"))?;
+                Ok(())
+            },
+            Arc::clone(&active_workers),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ScenarioError::NamespaceCollisionOperationTimeout { .. }
+        ));
+        assert_eq!(active_workers.load(Ordering::SeqCst), 1);
+
+        let started = Instant::now();
+        let err = run_timed_hotspot_io_with_worker_limit(
+            Duration::from_secs(1),
+            "client-b append hotspot/slot-1.txt".to_string(),
+            || Ok(()),
+            Arc::clone(&active_workers),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ScenarioError::NamespaceCollisionOperationTimeout { .. }
+        ));
+        assert!(err.to_string().contains("hotspot worker limit reached"));
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "saturated hotspot worker limit must fail without spawning another worker"
+        );
+
+        release_tx.send(()).unwrap();
+        for _ in 0..50 {
+            if active_workers.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(active_workers.load(Ordering::SeqCst), 0);
     }
 
     #[test]

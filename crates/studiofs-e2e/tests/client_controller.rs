@@ -636,6 +636,37 @@ fn force_kill_all_waits_for_mount_processes_to_exit_after_termination() {
 }
 
 #[test]
+fn unmount_all_force_kills_mount_process_that_survives_graceful_umount() {
+    let temp = tempdir().unwrap();
+    let mut config = test_config(temp.path());
+    config.mount_exit_timeout = Duration::from_millis(20);
+    config.poll_interval = Duration::from_millis(1);
+    let executor = RecordingExecutor {
+        exit_requires_kill: true,
+        ..RecordingExecutor::new()
+    };
+    let killed = Rc::clone(&executor.killed);
+    let mut controller = MultiClientController::new(config, executor);
+    controller.create_clients(["client-a"]).unwrap();
+    controller.init_first_client().unwrap();
+    controller.mount_all().unwrap();
+
+    let err = controller.unmount_all().unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("mount process did not exit after graceful unmount")
+    );
+    assert_eq!(
+        killed.get(),
+        1,
+        "graceful unmount timeout must force-kill the lingering mount process"
+    );
+    assert_eq!(controller.clients()[0].state, ClientLifecycleState::Killed);
+    assert_eq!(controller.clients()[0].process_id, None);
+}
+
+#[test]
 fn mount_reports_process_exit_while_waiting_for_readiness() {
     let temp = tempdir().unwrap();
     let executor = RecordingExecutor {
@@ -715,6 +746,7 @@ struct RecordingExecutor {
     create_local_metadata_db: bool,
     fail_if_local_metadata_dir_preexists: bool,
     kill_error_after: Cell<Option<usize>>,
+    exit_requires_kill: bool,
 }
 
 impl RecordingExecutor {
@@ -736,6 +768,7 @@ impl RecordingExecutor {
             create_local_metadata_db: false,
             fail_if_local_metadata_dir_preexists: false,
             kill_error_after: Cell::new(None),
+            exit_requires_kill: false,
         }
     }
 }
@@ -783,6 +816,8 @@ impl ClientProcessExecutor for RecordingExecutor {
             wait_calls: Rc::clone(&self.process_wait_calls),
             try_wait_calls: Cell::new(0),
             exit_status: self.process_exit_status.get(),
+            exit_requires_kill: self.exit_requires_kill,
+            was_killed: Cell::new(false),
         }))
     }
 
@@ -811,6 +846,8 @@ struct RecordingProcess {
     wait_calls: Rc<Cell<usize>>,
     try_wait_calls: Cell<usize>,
     exit_status: i32,
+    exit_requires_kill: bool,
+    was_killed: Cell<bool>,
 }
 
 impl ClientProcess for RecordingProcess {
@@ -822,6 +859,9 @@ impl ClientProcess for RecordingProcess {
         self.wait_calls.set(self.wait_calls.get() + 1);
         let calls = self.try_wait_calls.get() + 1;
         self.try_wait_calls.set(calls);
+        if self.exit_requires_kill && !self.was_killed.get() {
+            return Ok(None);
+        }
         Ok((calls > 1).then_some(self.exit_status))
     }
 
@@ -831,6 +871,7 @@ impl ClientProcess for RecordingProcess {
         if self.kill_error_after.get() == Some(next) {
             return Err(io::Error::other("injected kill failure"));
         }
+        self.was_killed.set(true);
         Ok(())
     }
 }
