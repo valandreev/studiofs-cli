@@ -74,6 +74,31 @@ The initial runner implements `list`, `run`, and `clean`. Future subcommands
 may add dedicated `preflight` or artifact commands, but those must reuse the
 same report schema and cleanup safety checks.
 
+## Scenario Supervision And Cleanup Gates
+
+Single-scenario `run` invocations execute the scenario lifecycle directly so
+the operator-facing workflow stays unchanged. Multi-scenario sweeps supervise
+each selected scenario in a hidden `run-one` child process owned by the parent
+runner. The parent remains responsible for preflight, compose lifecycle,
+top-level progress, report aggregation, and final cleanup; the child owns
+exactly one scenario lifecycle and writes
+`artifacts/scenarios/<scenario>/scenario-child-report.json` for aggregation.
+
+The parent forwards the requested timeout as the child process deadline. If
+the deadline expires, the parent reports the scenario as `timed_out`, records a
+`scenario_child` timeout event, and the command executor kills the child
+process boundary. On Windows the timeout path uses `taskkill /PID <pid> /T /F`
+as the process-tree fallback before waiting for exit.
+
+After every mounted scenario, the parent runs the runner-owned stale-process
+cleanup helper in a post-scenario verification phase. Any runner-owned
+`studiofs.exe` / `studiofs-e2e.exe` process found or cleaned in that phase is a
+scenario failure, because later mounted scenarios would be running on
+contaminated host state. Once this gate fails, later mounted scenarios are
+recorded as skipped instead of being started on potentially occupied default
+mount letters. External-env and non-runner-owned processes remain outside the
+cleanup allowlist.
+
 ## Local First Baseline Gate
 
 `local-first-baseline-gate` is the explicit SFS-405 gate for rerunning the

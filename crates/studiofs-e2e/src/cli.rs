@@ -8,7 +8,9 @@ use clap::{Args, Parser, Subcommand};
 
 use crate::baseline_gate::{self, BaselineGateRequest};
 use crate::infra::InfraMode;
-use crate::runner::{self, CleanRequest, PlatformSelection, RetentionPolicy, RunRequest};
+use crate::runner::{
+    self, CleanRequest, PlatformSelection, RetentionPolicy, RunOneRequest, RunRequest,
+};
 use crate::scenario;
 
 #[derive(Parser, Debug)]
@@ -26,6 +28,9 @@ pub enum Commands {
     List,
     /// Run one or more E2E scenarios.
     Run(RunArgs),
+    /// Run exactly one scenario inside an existing parent runner sandbox.
+    #[command(hide = true)]
+    RunOne(RunOneArgs),
     /// Run the SFS-405 Local First baseline gate for mounted scenarios 1-8.
     LocalFirstBaselineGate(BaselineGateArgs),
     /// Remove runner-owned sandboxes from the run root.
@@ -78,6 +83,33 @@ pub struct RunArgs {
     pub timeout: Option<String>,
 
     /// External infrastructure mode for the run.
+    #[arg(long, value_enum, default_value = "compose")]
+    pub infra: InfraMode,
+}
+
+#[derive(Args, Debug)]
+pub struct RunOneArgs {
+    /// Scenario name to run inside the parent sandbox.
+    #[arg(long)]
+    pub scenario: String,
+
+    /// Parent directory for per-run sandboxes.
+    #[arg(long, default_value = "target/e2e-runs")]
+    pub root: PathBuf,
+
+    /// Existing parent run ID.
+    #[arg(long)]
+    pub run_id: String,
+
+    /// Deterministic seed accepted for CLI symmetry; run.json remains authoritative.
+    #[arg(long, default_value_t = 0)]
+    pub seed: u64,
+
+    /// Mount backend accepted for CLI symmetry; run.json remains authoritative.
+    #[arg(long, value_enum, default_value = "auto")]
+    pub platform: PlatformSelection,
+
+    /// External infrastructure mode accepted for CLI symmetry; run.json remains authoritative.
     #[arg(long, value_enum, default_value = "compose")]
     pub infra: InfraMode,
 }
@@ -241,6 +273,24 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             );
             Ok(outcome.exit_code)
         }
+        Commands::RunOne(args) => {
+            let outcome = runner::run_one(RunOneRequest {
+                root: args.root,
+                run_id: args.run_id,
+                scenario: args.scenario,
+            })?;
+            if should_print_run_one_summary(outcome.exit_code) {
+                println!(
+                    "timestamp={} run_id={} scenario={} status={:?} report={}",
+                    timestamp(),
+                    outcome.run_id,
+                    outcome.scenario.name,
+                    outcome.scenario.status,
+                    outcome.report_path.display()
+                );
+            }
+            Ok(outcome.exit_code)
+        }
         Commands::LocalFirstBaselineGate(args) => {
             let outcome = baseline_gate::run(args.into_request())?;
             for run in &outcome.runs {
@@ -269,4 +319,49 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
 
 fn timestamp() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+fn should_print_run_one_summary(exit_code: i32) -> bool {
+    exit_code != 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hidden_run_one_subcommand_parses() {
+        let cli = Cli::try_parse_from([
+            "studiofs-e2e",
+            "run-one",
+            "--scenario",
+            "basic-multi-client-smoke",
+            "--root",
+            "target/e2e-runs",
+            "--run-id",
+            "run-one-test",
+            "--seed",
+            "410",
+            "--platform",
+            "windows-winfsp",
+            "--infra",
+            "disabled",
+        ])
+        .expect("hidden run-one command should parse");
+
+        let Commands::RunOne(args) = cli.command else {
+            panic!("expected hidden run-one command");
+        };
+        assert_eq!(args.scenario, "basic-multi-client-smoke");
+        assert_eq!(args.run_id, "run-one-test");
+        assert_eq!(args.seed, 410);
+        assert_eq!(args.infra, InfraMode::Disabled);
+    }
+
+    #[test]
+    fn run_one_summary_is_suppressed_for_successful_child() {
+        assert!(!should_print_run_one_summary(0));
+        assert!(should_print_run_one_summary(1));
+        assert!(should_print_run_one_summary(4));
+    }
 }
