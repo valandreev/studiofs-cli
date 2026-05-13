@@ -1287,6 +1287,7 @@ fn run_sync_with_timeout<T: Send + 'static>(
 
 struct UploadState {
     deleted_inodes: Mutex<std::collections::HashSet<Ino>>,
+    deleted_uploads_notify: tokio::sync::Notify,
     upload_cancel_tokens: Mutex<std::collections::HashMap<Ino, CancellationToken>>,
     pending_evictions: Mutex<std::collections::HashSet<u64>>,
     deferred_deleted_local_payloads:
@@ -1492,6 +1493,7 @@ impl UploadState {
     fn new(upload_cache_io_foreground_cost: u32) -> Self {
         Self {
             deleted_inodes: Mutex::new(std::collections::HashSet::new()),
+            deleted_uploads_notify: tokio::sync::Notify::new(),
             upload_cancel_tokens: Mutex::new(std::collections::HashMap::new()),
             pending_evictions: Mutex::new(std::collections::HashSet::new()),
             deferred_deleted_local_payloads: Mutex::new(std::collections::HashMap::new()),

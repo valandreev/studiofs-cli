@@ -16,6 +16,7 @@ use studiofs_cache::upload_queue::PendingUpload;
 use studiofs_data::object::{
     CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, create_object_buffer, format_object_fragment_keys,
 };
+use studiofs_meta::MetaError;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -71,6 +72,24 @@ impl ReadyUploads {
 
     fn is_empty(&self) -> bool {
         self.per_inode.is_empty()
+    }
+
+    fn remove_inodes(&mut self, inos: &HashSet<Ino>) -> Vec<PendingUpload> {
+        if inos.is_empty() {
+            return Vec::new();
+        }
+
+        let mut removed = Vec::new();
+        for ino in inos {
+            if let Some(mut queue) = self.per_inode.remove(ino) {
+                removed.extend(queue.drain(..));
+                self.ready_set.remove(ino);
+            }
+        }
+        if !removed.is_empty() {
+            self.ready_inodes.retain(|ino| !inos.contains(ino));
+        }
+        removed
     }
 }
 
@@ -1351,12 +1370,16 @@ impl UploadLifecycleWorker {
         let mut delayed = DelayedUploads::default();
         let mut dispatched_since_yield = 0u32;
         let mut inbound_closed = false;
+        let mut check_missing_deleted_attrs = false;
         loop {
             Self::reap_ready_workers(&mut workers);
             Self::promote_ready_uploads(&mut ready, &mut delayed);
+            self.drop_deleted_queued_uploads(&mut ready, &mut delayed, check_missing_deleted_attrs);
+            check_missing_deleted_attrs = false;
 
             while !ready.is_empty() {
                 Self::reap_ready_workers(&mut workers);
+                self.drop_deleted_queued_uploads(&mut ready, &mut delayed, false);
                 let Some(permit) = permits.clone().try_acquire_owned().ok() else {
                     break;
                 };
@@ -1364,6 +1387,11 @@ impl UploadLifecycleWorker {
                     drop(permit);
                     break;
                 };
+                if self.queued_upload_deleted_before_dispatch(op.ino) {
+                    self.cancel_deleted_queued_upload(op);
+                    drop(permit);
+                    continue;
+                }
                 debug!(
                     ino = op.ino,
                     object_id = op.object_id,
@@ -1383,6 +1411,7 @@ impl UploadLifecycleWorker {
                     tokio::task::yield_now().await;
                     Self::reap_ready_workers(&mut workers);
                     Self::promote_ready_uploads(&mut ready, &mut delayed);
+                    self.drop_deleted_queued_uploads(&mut ready, &mut delayed, false);
                 }
             }
 
@@ -1422,6 +1451,9 @@ impl UploadLifecycleWorker {
                         None => inbound_closed = true,
                     }
                 }
+                _ = self.vfs.state.upload.deleted_uploads_notify.notified() => {
+                    check_missing_deleted_attrs = true;
+                }
                 _ = &mut sleep_until_ready => {}
             }
         }
@@ -1456,6 +1488,112 @@ impl UploadLifecycleWorker {
                 ready.push_back(op);
             }
         }
+    }
+
+    fn remove_deleted_uploads_from_queues(
+        ready: &mut ReadyUploads,
+        delayed: &mut DelayedUploads,
+        deleted_inodes: &HashSet<Ino>,
+    ) -> Vec<PendingUpload> {
+        if deleted_inodes.is_empty() {
+            return Vec::new();
+        }
+
+        let mut removed = ready.remove_inodes(deleted_inodes);
+        let mut empty_delays = Vec::new();
+        for (not_before_unix_ms, queue) in delayed.iter_mut() {
+            let mut retained = VecDeque::with_capacity(queue.len());
+            while let Some(op) = queue.pop_front() {
+                if deleted_inodes.contains(&op.ino) {
+                    removed.push(op);
+                } else {
+                    retained.push_back(op);
+                }
+            }
+            *queue = retained;
+            if queue.is_empty() {
+                empty_delays.push(*not_before_unix_ms);
+            }
+        }
+        for not_before_unix_ms in empty_delays {
+            delayed.remove(&not_before_unix_ms);
+        }
+        removed
+    }
+
+    fn queued_upload_inodes(ready: &ReadyUploads, delayed: &DelayedUploads) -> HashSet<Ino> {
+        let mut inodes: HashSet<_> = ready.per_inode.keys().copied().collect();
+        for queue in delayed.values() {
+            inodes.extend(queue.iter().map(|op| op.ino));
+        }
+        inodes
+    }
+
+    fn deleted_queued_upload_inodes(
+        &self,
+        ready: &ReadyUploads,
+        delayed: &DelayedUploads,
+        check_missing_attrs: bool,
+    ) -> HashSet<Ino> {
+        let mut deleted_inodes = self.vfs.state.upload.deleted_inodes.lock().clone();
+        if !check_missing_attrs {
+            return deleted_inodes;
+        }
+
+        let queued_inodes = Self::queued_upload_inodes(ready, delayed);
+        if queued_inodes.is_empty() {
+            return deleted_inodes;
+        }
+        let meta = self.vfs.sync_meta();
+        for ino in queued_inodes {
+            if deleted_inodes.contains(&ino) {
+                continue;
+            }
+            if matches!(meta.get_attr(ino), Err(MetaError::InodeNotFound(_))) {
+                deleted_inodes.insert(ino);
+            }
+        }
+        deleted_inodes
+    }
+
+    fn drop_deleted_queued_uploads(
+        &self,
+        ready: &mut ReadyUploads,
+        delayed: &mut DelayedUploads,
+        check_missing_attrs: bool,
+    ) {
+        let deleted_inodes = self.deleted_queued_upload_inodes(ready, delayed, check_missing_attrs);
+        let removed = Self::remove_deleted_uploads_from_queues(ready, delayed, &deleted_inodes);
+        for op in removed {
+            self.cancel_deleted_queued_upload(op);
+        }
+    }
+
+    fn queued_upload_deleted_before_dispatch(&self, ino: Ino) -> bool {
+        if self.vfs.state.upload.deleted_inodes.lock().contains(&ino) {
+            return true;
+        }
+        matches!(
+            self.vfs.sync_meta().get_attr(ino),
+            Err(MetaError::InodeNotFound(_))
+        )
+    }
+
+    fn cancel_deleted_queued_upload(&self, op: PendingUpload) {
+        self.vfs.cached_store.cancel_upload(&op);
+        self.vfs
+            .state
+            .upload
+            .pending_evictions
+            .lock()
+            .remove(&op.object_id);
+        self.vfs
+            .state
+            .upload
+            .upload_canceled_deleted
+            .fetch_add(1, Ordering::Relaxed);
+        self.vfs
+            .debug_pending_inode_state(op.ino, "pending_upload_deleted_before_dispatch");
     }
 
     fn next_delayed_wait(delayed: &DelayedUploads) -> Option<Duration> {
@@ -2312,6 +2450,71 @@ mod tests {
         };
         assert_eq!(ready_op.object_id, op.object_id);
         assert!(delayed.is_empty());
+    }
+
+    #[test]
+    fn worker_queues_drop_deleted_pending_uploads_before_dispatch() {
+        let mut ready = ReadyUploads::default();
+        let mut delayed = DelayedUploads::default();
+        let mut ready_deleted = make_pending_upload();
+        ready_deleted.object_id = 101;
+        let mut delayed_deleted = make_pending_upload();
+        delayed_deleted.object_id = 102;
+        delayed_deleted.not_before_unix_ms = now_unix_millis().saturating_add(60_000);
+        let mut retained = make_pending_upload();
+        retained.ino = ready_deleted.ino + 1;
+        retained.object_id = 201;
+
+        UploadLifecycleWorker::enqueue_pending_upload(&mut ready, &mut delayed, ready_deleted);
+        UploadLifecycleWorker::enqueue_pending_upload(&mut ready, &mut delayed, delayed_deleted);
+        UploadLifecycleWorker::enqueue_pending_upload(&mut ready, &mut delayed, retained.clone());
+
+        let removed = UploadLifecycleWorker::remove_deleted_uploads_from_queues(
+            &mut ready,
+            &mut delayed,
+            &HashSet::from([make_pending_upload().ino]),
+        );
+
+        let mut removed_ids: Vec<_> = removed.into_iter().map(|op| op.object_id).collect();
+        removed_ids.sort_unstable();
+        assert_eq!(
+            removed_ids,
+            vec![101, 102],
+            "deleted inode uploads must leave ready and delayed queues before dispatch"
+        );
+
+        let Some(retained_op) = ready.pop_front() else {
+            panic!("non-deleted inode upload should remain ready");
+        };
+        assert_eq!(retained_op.object_id, retained.object_id);
+        assert!(ready.is_empty());
+        assert!(delayed.is_empty());
+    }
+
+    #[test]
+    fn worker_delete_wake_drops_missing_inode_uploads_after_marker_clears() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "deleted-queue-wake");
+        let worker = UploadLifecycleWorker::new(vfs);
+        let mut ready = ReadyUploads::default();
+        let mut delayed = DelayedUploads::default();
+        let mut op = make_pending_upload();
+        op.ino = 99_001;
+        op.object_id = 301;
+        UploadLifecycleWorker::enqueue_pending_upload(&mut ready, &mut delayed, op.clone());
+
+        let without_missing_attr_check =
+            worker.deleted_queued_upload_inodes(&ready, &delayed, false);
+        assert!(
+            !without_missing_attr_check.contains(&op.ino),
+            "a cleared delete marker should not be inferred without a delete wake"
+        );
+
+        let with_missing_attr_check = worker.deleted_queued_upload_inodes(&ready, &delayed, true);
+        assert!(
+            with_missing_attr_check.contains(&op.ino),
+            "delete wake should drop queued uploads whose inode metadata is already gone"
+        );
     }
 
     #[test]

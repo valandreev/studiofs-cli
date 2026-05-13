@@ -61,6 +61,7 @@ impl StudioVfs {
         // Data for still-open unlinked files must remain locally readable until
         // the last handle is released (POSIX open-unlink semantics).
         self.state.upload.deleted_inodes.lock().insert(ino);
+        self.state.upload.deleted_uploads_notify.notify_waiters();
         if let Some(token) = self
             .state
             .upload
