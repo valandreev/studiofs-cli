@@ -3047,7 +3047,15 @@ fn execute_advanced_mounted_operations(
             )?,
             None,
         )),
-        AdvancedMountedKind::HotspotChurn => Ok((run_hotspot_churn_operations(clients)?, None)),
+        AdvancedMountedKind::HotspotChurn => Ok((
+            run_hotspot_churn_operations(
+                context,
+                clients,
+                ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT,
+                ADVANCED_MOUNTED_CONVERGENCE_POLL_INTERVAL,
+            )?,
+            None,
+        )),
         AdvancedMountedKind::FaultChaos => Ok((
             run_fault_chaos_operations(context, controller, clients)?,
             None,
@@ -3258,14 +3266,26 @@ fn wait_for_mounted_chaos_initial_tree(
 }
 
 fn run_hotspot_churn_operations(
+    context: &ScenarioContext,
     clients: &[ClientSpec],
+    initial_convergence_timeout: Duration,
+    poll_interval: Duration,
 ) -> Result<Vec<NamespaceCollisionOperation>, ScenarioError> {
-    run_hotspot_churn_operations_with_timeout(clients, HOTSPOT_CHURN_OPERATION_TIMEOUT)
+    run_hotspot_churn_operations_with_timeout(
+        context,
+        clients,
+        HOTSPOT_CHURN_OPERATION_TIMEOUT,
+        initial_convergence_timeout,
+        poll_interval,
+    )
 }
 
 fn run_hotspot_churn_operations_with_timeout(
+    context: &ScenarioContext,
     clients: &[ClientSpec],
     operation_timeout: Duration,
+    initial_convergence_timeout: Duration,
+    poll_interval: Duration,
 ) -> Result<Vec<NamespaceCollisionOperation>, ScenarioError> {
     let started = Instant::now();
     let mut operations = Vec::new();
@@ -3275,6 +3295,7 @@ fn run_hotspot_churn_operations_with_timeout(
         format!("{} mkdir hotspot", mkdir_client.name),
         move || fs::create_dir_all(mkdir_client.mount_point.join("hotspot")),
     )?;
+    wait_for_hotspot_initial_tree(context, clients, initial_convergence_timeout, poll_interval)?;
     for round in 0..10 {
         let slot = format!("hotspot/slot-{}.txt", round % 6);
         let renamed = format!("hotspot/slot-{}-renamed.txt", round % 6);
@@ -3335,6 +3356,25 @@ fn run_hotspot_churn_operations_with_timeout(
         )?);
     }
     Ok(operations)
+}
+
+fn wait_for_hotspot_initial_tree(
+    context: &ScenarioContext,
+    clients: &[ClientSpec],
+    timeout: Duration,
+    poll_interval: Duration,
+) -> Result<ConvergenceOutcome, ScenarioError> {
+    let mounts = clients
+        .iter()
+        .map(|client| ClientMount::new(client.name.clone(), client.mount_point.clone()))
+        .collect::<Vec<_>>();
+    wait_for_convergence(
+        &mounts,
+        context.scenario_dir.join("validation-initial-hotspot"),
+        timeout,
+        poll_interval,
+    )
+    .map_err(ScenarioError::from)
 }
 
 fn timed_fs_op(
@@ -4902,6 +4942,87 @@ mod tests {
         }
 
         let convergence = wait_for_mounted_chaos_initial_tree(
+            &context,
+            &clients,
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+        )
+        .unwrap();
+
+        assert!(convergence.comparison.converged);
+        assert_eq!(convergence.comparison.differences, Vec::new());
+    }
+
+    #[test]
+    fn hotspot_churn_initial_barrier_rejects_unreplicated_hotspot_dir() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(MOUNTED_HOTSPOT_CHURN_CONVERGENCE);
+        let clients = ADVANCED_MOUNTED_CLIENT_NAMES
+            .iter()
+            .copied()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(&mount).unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let context = ScenarioContext {
+            run_id: "run-1".to_string(),
+            seed: 410,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+
+        let err = run_hotspot_churn_operations_with_timeout(
+            &context,
+            &clients,
+            Duration::from_secs(1),
+            Duration::from_millis(25),
+            Duration::from_millis(5),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, ScenarioError::MountedTree(_)));
+        assert!(
+            context
+                .scenario_dir
+                .join("validation-initial-hotspot")
+                .join("diff.json")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn hotspot_churn_initial_barrier_accepts_replicated_hotspot_dir() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(MOUNTED_HOTSPOT_CHURN_CONVERGENCE);
+        let clients = ADVANCED_MOUNTED_CLIENT_NAMES
+            .iter()
+            .copied()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(mount.join("hotspot")).unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let context = ScenarioContext {
+            run_id: "run-1".to_string(),
+            seed: 410,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+
+        let convergence = wait_for_hotspot_initial_tree(
             &context,
             &clients,
             Duration::from_secs(1),
