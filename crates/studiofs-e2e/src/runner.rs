@@ -35,6 +35,8 @@ const RUNNER_CRATE: &str = "studiofs-e2e";
 const RUNNER_MARKER_FILE: &str = ".studiofs-e2e-runner.json";
 const PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const POST_SCENARIO_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(windows)]
+const HOST_ENVIRONMENT_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const ANSI_RESET: &str = "\x1b[0m";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
@@ -446,7 +448,7 @@ pub fn run_with_executor(
             },
         };
 
-        let lifecycle = if supervise_scenarios {
+        let lifecycle_result = if supervise_scenarios {
             run_supervised_scenario(SupervisedScenarioInput {
                 events_path: &events_path,
                 run_id: &run_id,
@@ -459,7 +461,7 @@ pub fn run_with_executor(
                 definition,
                 scenario_progress,
                 executor,
-            })?
+            })
         } else {
             run_scenario_lifecycle(
                 &events_path,
@@ -467,7 +469,17 @@ pub fn run_with_executor(
                 resolved.scenario.as_ref(),
                 &context,
                 scenario_progress,
-            )?
+            )
+        };
+        let lifecycle = match lifecycle_result {
+            Ok(lifecycle) => lifecycle,
+            Err(error) if definition.requires_studiofs_bin => failed_scenario_child(
+                definition.name,
+                request.seed,
+                format!("scenario supervision failed before cleanup verification: {error}"),
+                None,
+            ),
+            Err(error) => return Err(error),
         };
         let mut lifecycle = lifecycle;
         if definition.requires_studiofs_bin {
@@ -1253,7 +1265,15 @@ fn build_environment_report(input: EnvironmentInput<'_>) -> EnvironmentReport {
         .iter()
         .map(|client| client_mount_point(input.sandbox, client))
         .collect();
-    let ownership = path_ownership_reports(&client_roots, &mount_roots);
+    let probe_host_environment = input.studiofs_bin.is_some() || input.compose_stack.is_some();
+    let ownership = if probe_host_environment {
+        path_ownership_reports(&client_roots, &mount_roots)
+    } else {
+        EnvironmentOwnership {
+            client_roots: fallback_path_ownership_reports(&client_roots),
+            mount_roots: fallback_path_ownership_reports(&mount_roots),
+        }
+    };
     EnvironmentReport {
         run_id: input.run_id.to_string(),
         scenarios: input.scenarios.to_vec(),
@@ -1273,7 +1293,7 @@ fn build_environment_report(input: EnvironmentInput<'_>) -> EnvironmentReport {
             .collect(),
         client_root_ownership: ownership.client_roots,
         mount_root_ownership: ownership.mount_roots,
-        winfsp_version: detect_winfsp_version(),
+        winfsp_version: probe_host_environment.then(detect_winfsp_version).flatten(),
     }
 }
 
@@ -1321,20 +1341,25 @@ fn detect_winfsp_version() -> Option<String> {
 
 #[cfg(windows)]
 fn detect_winfsp_version_from_host() -> Option<String> {
-    let output = std::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            "$paths = @('HKLM:\\SOFTWARE\\WinFsp', 'HKLM:\\SOFTWARE\\WOW6432Node\\WinFsp'); foreach ($path in $paths) { if (Test-Path $path) { $item = Get-ItemProperty -Path $path; foreach ($name in @('Version', 'ProductVersion')) { $value = $item.$name; if ($value) { Write-Output $value; exit 0 } } } }; exit 0",
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
+    let output = run_host_environment_probe(CommandSpec {
+        program: powershell_program(),
+        args: vec![
+            "-NoProfile".to_string(),
+            "-ExecutionPolicy".to_string(),
+            "Bypass".to_string(),
+            "-Command".to_string(),
+            "$paths = @('HKLM:\\SOFTWARE\\WinFsp', 'HKLM:\\SOFTWARE\\WOW6432Node\\WinFsp'); foreach ($path in $paths) { if (Test-Path $path) { $item = Get-ItemProperty -Path $path; foreach ($name in @('Version', 'ProductVersion')) { $value = $item.$name; if ($value) { Write-Output $value; exit 0 } } } }; exit 0".to_string(),
+        ],
+        env: Vec::new(),
+        cwd: None,
+        timeout: None,
+    })
+    .ok()?;
+    if output.status != 0 {
         return None;
     }
-    String::from_utf8_lossy(&output.stdout)
+    output
+        .stdout
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty())
@@ -1355,58 +1380,99 @@ fn detect_path_owners(paths: &[PathBuf]) -> Vec<PathOwnershipReport> {
             .collect::<Vec<_>>(),
     ) {
         Ok(paths_json) => paths_json,
-        Err(err) => {
-            return paths
-                .iter()
-                .map(|path| PathOwnershipReport {
-                    path: path.display().to_string(),
-                    owner: None,
-                    error: Some(err.to_string()),
-                })
-                .collect();
-        }
+        Err(err) => return path_ownership_error_reports(paths, err.to_string()),
     };
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/get-path-ownership.ps1");
     let script_arg = script.display().to_string();
-    let output = std::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            &script_arg,
-        ])
-        .env("STUDIOFS_E2E_OWNERSHIP_PATHS_JSON", paths_json)
-        .output()
-        .ok();
-    let Some(output) = output else {
-        return fallback_path_ownership_reports(paths);
+    let output = run_host_environment_probe(CommandSpec {
+        program: powershell_program(),
+        args: vec![
+            "-NoProfile".to_string(),
+            "-ExecutionPolicy".to_string(),
+            "Bypass".to_string(),
+            "-File".to_string(),
+            script_arg,
+        ],
+        env: vec![("STUDIOFS_E2E_OWNERSHIP_PATHS_JSON".to_string(), paths_json)],
+        cwd: None,
+        timeout: None,
+    });
+    let output = match output {
+        Ok(output) => output,
+        Err(error) => return path_ownership_error_reports(paths, error),
     };
-    if !output.status.success() {
-        let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return paths
-            .iter()
-            .map(|path| PathOwnershipReport {
-                path: path.display().to_string(),
-                owner: None,
-                error: Some(if error.is_empty() {
-                    format!("path ownership probe exited with status {}", output.status)
-                } else {
-                    error.clone()
-                }),
-            })
-            .collect();
+    if output.status != 0 {
+        let error = output.stderr.trim().to_string();
+        return path_ownership_error_reports(
+            paths,
+            if error.is_empty() {
+                format!("path ownership probe exited with status {}", output.status)
+            } else {
+                error
+            },
+        );
     }
-    serde_json::from_slice(&output.stdout).unwrap_or_else(|err| {
-        paths
+    serde_json::from_str(&output.stdout)
+        .unwrap_or_else(|err| path_ownership_error_reports(paths, err.to_string()))
+}
+
+#[cfg(windows)]
+fn run_host_environment_probe(command: CommandSpec) -> Result<crate::infra::CommandOutput, String> {
+    let mut process = std::process::Command::new(&command.program);
+    process.args(&command.args);
+    process.envs(
+        command
+            .env
             .iter()
-            .map(|path| PathOwnershipReport {
-                path: path.display().to_string(),
-                owner: None,
-                error: Some(err.to_string()),
-            })
-            .collect()
-    })
+            .map(|(key, value)| (key.as_str(), value.as_str())),
+    );
+    process.stdin(std::process::Stdio::null());
+    process.stdout(std::process::Stdio::piped());
+    process.stderr(std::process::Stdio::piped());
+    if let Some(cwd) = command.cwd {
+        process.current_dir(cwd);
+    }
+
+    let mut child = process.spawn().map_err(|err| err.to_string())?;
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                let output = child.wait_with_output().map_err(|err| err.to_string())?;
+                return Ok(crate::infra::CommandOutput {
+                    status: output.status.code().unwrap_or(-1),
+                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                });
+            }
+            Ok(None) if started.elapsed() >= HOST_ENVIRONMENT_PROBE_TIMEOUT => {
+                let _ = child.kill();
+                return Err(format!(
+                    "host environment probe timed out after {} ms",
+                    HOST_ENVIRONMENT_PROBE_TIMEOUT.as_millis()
+                ));
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(25)),
+            Err(err) => return Err(err.to_string()),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn powershell_program() -> String {
+    "powershell".to_string()
+}
+
+#[cfg(windows)]
+fn path_ownership_error_reports(paths: &[PathBuf], error: String) -> Vec<PathOwnershipReport> {
+    paths
+        .iter()
+        .map(|path| PathOwnershipReport {
+            path: path.display().to_string(),
+            owner: None,
+            error: Some(error.clone()),
+        })
+        .collect()
 }
 
 #[cfg(unix)]
@@ -3339,6 +3405,62 @@ plain child stderr\n",
     }
 
     #[test]
+    fn mounted_supervision_error_still_runs_cleanup_verification_and_writes_report() {
+        let temp = tempfile::tempdir().unwrap();
+        let executor = RecordingExecutor {
+            fail_child_supervision_io: Cell::new(true),
+            ..RecordingExecutor::default()
+        };
+
+        let outcome = run_with_executor(
+            RunRequest {
+                root: temp.path().join("e2e-runs"),
+                run_id: Some("supervision-error-cleanup-run".to_string()),
+                scenarios: vec![
+                    scenario::MOUNTED_CLIENT_CRASH_RESTART_RECOVERY.to_string(),
+                    scenario::TEST_PASSING.to_string(),
+                ],
+                seed: 410,
+                studiofs_bin: None,
+                platform: PlatformSelection::WindowsWinfsp,
+                retention: RetentionPolicy::Always,
+                report: None,
+                port_range: None,
+                timeout: Some("30s".to_string()),
+                infra: InfraMode::Disabled,
+            },
+            &executor,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.status, RunStatus::Failed);
+        let calls = executor.calls.borrow();
+        assert!(calls.iter().any(|call| {
+            call.args.contains(&"run-one".to_string())
+                && call
+                    .env
+                    .iter()
+                    .any(|(key, value)| key == "STUDIOFS_E2E_STREAM_OUTPUT" && value == "1")
+        }));
+        assert!(calls.iter().any(|call| {
+            call.env
+                .iter()
+                .any(|(key, value)| key == "STUDIOFS_E2E_CLEANUP_PHASE" && value == "post-scenario")
+                && call.timeout == Some(POST_SCENARIO_CLEANUP_TIMEOUT)
+        }));
+
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(outcome.report_path).unwrap()).unwrap();
+        assert_eq!(report["scenarios"][0]["status"], "failed");
+        assert!(
+            report["scenarios"][0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("scenario supervision failed before cleanup verification")
+        );
+    }
+
+    #[test]
     fn stale_process_cleanup_command_selects_platform_helper() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("e2e-runs");
@@ -3925,6 +4047,7 @@ plain child stderr\n",
         fail_up: Cell<bool>,
         fail_logs: Cell<bool>,
         fail_post_scenario_cleanup: Cell<bool>,
+        fail_child_supervision_io: Cell<bool>,
         child_run_count: Cell<usize>,
     }
 
@@ -3934,6 +4057,11 @@ plain child stderr\n",
             if command.args.contains(&"run-one".to_string()) {
                 self.child_run_count
                     .set(self.child_run_count.get().saturating_add(1));
+                if self.fail_child_supervision_io.get() && self.child_run_count.get() == 1 {
+                    return Err(std::io::Error::other(
+                        "simulated supervised child transport failure",
+                    ));
+                }
                 write_recorded_child_report(command)?;
                 return Ok(CommandOutput {
                     status: 0,

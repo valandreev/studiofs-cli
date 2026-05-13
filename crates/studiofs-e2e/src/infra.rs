@@ -1,7 +1,7 @@
 //! Docker Compose infrastructure for real E2E runs.
 
 use std::fs;
-use std::io;
+use std::io::{self, IsTerminal as _};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{ChildStderr, ChildStdout, Command, Stdio};
@@ -21,6 +21,10 @@ const DEFAULT_TOXIPROXY_API_PORT: u16 = 28_474;
 const COMPOSE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 const COMPOSE_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(30);
 const STREAM_OUTPUT_ENV: &str = "STUDIOFS_E2E_STREAM_OUTPUT";
+const ANSI_RESET: &str = "\x1b[0m";
+const ANSI_YELLOW: &str = "\x1b[33m";
+const ANSI_GREEN: &str = "\x1b[32m";
+const ANSI_RED: &str = "\x1b[31m";
 
 pub const COMPOSE_PROJECT_PREFIX: &str = "studiofs-e2e-";
 pub const POSTGRES_SERVICE_NAME: &str = "postgres";
@@ -268,14 +272,19 @@ fn read_stream<R: io::Read>(
         return Ok(output);
     }
     match sink {
-        OutputSink::Stdout => read_stream_to_sink(reader, io::stdout().lock()),
-        OutputSink::Stderr => read_stream_to_sink(reader, io::stderr().lock()),
+        OutputSink::Stdout => read_stream_to_sink(reader, io::stdout().lock(), false),
+        OutputSink::Stderr => {
+            let color_progress =
+                io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+            read_stream_to_sink(reader, io::stderr().lock(), color_progress)
+        }
     }
 }
 
 fn read_stream_to_sink<R: io::Read, W: io::Write>(
     mut reader: R,
     mut sink: W,
+    color_progress: bool,
 ) -> io::Result<Vec<u8>> {
     let mut output = Vec::new();
     let mut chunk = [0u8; 8192];
@@ -286,9 +295,44 @@ fn read_stream_to_sink<R: io::Read, W: io::Write>(
         }
         let bytes = &chunk[..read];
         output.extend_from_slice(bytes);
-        sink.write_all(bytes)?;
+        if color_progress {
+            let display = colorize_progress_statuses_bytes(bytes);
+            sink.write_all(&display)?;
+        } else {
+            sink.write_all(bytes)?;
+        }
         sink.flush()?;
     }
+}
+
+fn colorize_progress_statuses_bytes(bytes: &[u8]) -> Vec<u8> {
+    let Ok(output) = std::str::from_utf8(bytes) else {
+        return bytes.to_vec();
+    };
+    colorize_progress_statuses(output).into_bytes()
+}
+
+fn colorize_progress_statuses(output: &str) -> String {
+    output
+        .lines()
+        .map(colorize_progress_status_line)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + if output.ends_with('\n') { "\n" } else { "" }
+}
+
+fn colorize_progress_status_line(line: &str) -> String {
+    for (status, color) in [
+        ("started", ANSI_YELLOW),
+        ("passed", ANSI_GREEN),
+        ("failed", ANSI_RED),
+    ] {
+        let needle = format!("status={status}");
+        if line.contains(&needle) {
+            return line.replace(&needle, &format!("status={color}{status}{ANSI_RESET}"));
+        }
+    }
+    line.to_string()
 }
 
 fn collect_reader(reader: Option<JoinHandle<io::Result<Vec<u8>>>>) -> io::Result<Vec<u8>> {
@@ -1003,15 +1047,30 @@ mod tests {
         assert_eq!(output.stderr.trim(), "streamed stderr");
     }
 
+    #[test]
+    fn stream_progress_colorizer_colors_status_values_and_keeps_heartbeat_raw() {
+        assert_eq!(
+            String::from_utf8(colorize_progress_statuses_bytes(
+                b"timestamp=t studiofs-e2e phase=run status=started\n\
+timestamp=t studiofs-e2e phase=run status=passed\n\
+timestamp=t studiofs-e2e phase=run status=failed\n",
+            ))
+            .unwrap(),
+            "timestamp=t studiofs-e2e phase=run status=\x1b[33mstarted\x1b[0m\n\
+timestamp=t studiofs-e2e phase=run status=\x1b[32mpassed\x1b[0m\n\
+timestamp=t studiofs-e2e phase=run status=\x1b[31mfailed\x1b[0m\n",
+        );
+        assert_eq!(
+            colorize_progress_statuses_bytes(b"\r****"),
+            b"\r****".to_vec()
+        );
+    }
+
     #[cfg(windows)]
     fn hung_command(timeout: Duration) -> CommandSpec {
         CommandSpec {
-            program: "powershell".to_string(),
-            args: vec![
-                "-NoProfile".to_string(),
-                "-Command".to_string(),
-                "Start-Sleep -Seconds 5".to_string(),
-            ],
+            program: "cmd".to_string(),
+            args: vec!["/C".to_string(), "timeout /T 5 /NOBREAK >NUL".to_string()],
             env: Vec::new(),
             cwd: None,
             timeout: Some(timeout),
@@ -1021,11 +1080,10 @@ mod tests {
     #[cfg(windows)]
     fn large_stdout_command(timeout: Duration) -> CommandSpec {
         CommandSpec {
-            program: "powershell".to_string(),
+            program: "cmd".to_string(),
             args: vec![
-                "-NoProfile".to_string(),
-                "-Command".to_string(),
-                "[Console]::Out.Write(('x' * 1048576))".to_string(),
+                "/C".to_string(),
+                "for /L %i in (1,1,20000) do @echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx".to_string(),
             ],
             env: Vec::new(),
             cwd: None,
@@ -1036,11 +1094,10 @@ mod tests {
     #[cfg(windows)]
     fn small_output_command(timeout: Option<Duration>) -> CommandSpec {
         CommandSpec {
-            program: "powershell".to_string(),
+            program: "cmd".to_string(),
             args: vec![
-                "-NoProfile".to_string(),
-                "-Command".to_string(),
-                "[Console]::Out.WriteLine('streamed stdout'); [Console]::Error.WriteLine('streamed stderr')".to_string(),
+                "/C".to_string(),
+                "echo streamed stdout&&echo streamed stderr 1>&2".to_string(),
             ],
             env: Vec::new(),
             cwd: None,
