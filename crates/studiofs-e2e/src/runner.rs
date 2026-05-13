@@ -401,26 +401,26 @@ pub fn run_with_executor(
             "scenario",
             ProgressStatus::Started,
         );
-        if definition.requires_studiofs_bin
-            && let Some(block_reason) = &mounted_cleanup_block
-        {
-            let lifecycle = skipped_scenario_lifecycle(
-                definition,
-                request.seed,
-                format!(
-                    "skipped because contaminated runner state remains after an earlier mounted scenario: {block_reason}"
-                ),
-            );
-            emit_progress(
-                &run_id,
-                definition.name,
-                Some(scenario_progress),
-                "scenario",
-                ProgressStatus::Failed,
-            );
-            scenario_reports.push(lifecycle.report);
-            scenario_outcomes.push(lifecycle.outcome);
-            continue;
+        if definition.requires_studiofs_bin {
+            if let Some(block_reason) = &mounted_cleanup_block {
+                let lifecycle = skipped_scenario_lifecycle(
+                    definition,
+                    request.seed,
+                    format!(
+                        "skipped because contaminated runner state remains after an earlier mounted scenario: {block_reason}"
+                    ),
+                );
+                emit_progress(
+                    &run_id,
+                    definition.name,
+                    Some(scenario_progress),
+                    "scenario",
+                    ProgressStatus::Failed,
+                );
+                scenario_reports.push(lifecycle.report);
+                scenario_outcomes.push(lifecycle.outcome);
+                continue;
+            }
         }
         let context = ScenarioContext {
             run_id: run_id.clone(),
