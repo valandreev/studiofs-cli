@@ -2205,6 +2205,19 @@ fn run_namespace_collision_body(
 
     establish_collision_initial_tree(kind, &clients[0])?;
     driver.after_conflicting_operations(kind, &clients)?;
+    let initial_validation_deadline = Instant::now() + convergence_timeout;
+    let required_initial_paths = collision_required_initial_paths(kind);
+    wait_for_required_paths_visible_until(
+        &clients,
+        &required_initial_paths,
+        initial_validation_deadline,
+        poll_interval,
+        "namespace collision initial tree",
+    )?;
+    let initial_validation_timeout = remaining_initial_validation_timeout(
+        initial_validation_deadline,
+        "namespace collision initial tree",
+    )?;
     let initial_mounts = clients
         .iter()
         .map(|client| ClientMount::new(client.name.clone(), client.mount_point.clone()))
@@ -2212,7 +2225,7 @@ fn run_namespace_collision_body(
     wait_for_convergence(
         &initial_mounts,
         context.scenario_dir.join("initial-validation"),
-        convergence_timeout,
+        initial_validation_timeout,
         poll_interval,
     )?;
     let operations = match perform_namespace_collision_operations(context, kind, &clients) {
@@ -2285,6 +2298,18 @@ fn establish_collision_initial_tree(
         fs::write(path, payload)?;
     }
     Ok(())
+}
+
+fn collision_required_initial_paths(kind: NamespaceCollisionKind) -> Vec<&'static str> {
+    let mut paths = kind
+        .initial_paths()
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect::<Vec<_>>();
+    if kind == NamespaceCollisionKind::MkdirRmdirVsCreate {
+        paths.push("race");
+    }
+    paths
 }
 
 fn perform_namespace_collision_operations(
@@ -3265,6 +3290,19 @@ fn wait_for_mounted_chaos_initial_tree(
     timeout: Duration,
     poll_interval: Duration,
 ) -> Result<ConvergenceOutcome, ScenarioError> {
+    let deadline = Instant::now() + timeout;
+    let required_paths = MOUNTED_CHAOS_INITIAL_TREE
+        .iter()
+        .map(|(path, _)| *path)
+        .collect::<Vec<_>>();
+    wait_for_required_paths_visible_until(
+        clients,
+        &required_paths,
+        deadline,
+        poll_interval,
+        "mounted chaos initial tree",
+    )?;
+    let remaining = remaining_initial_validation_timeout(deadline, "mounted chaos initial tree")?;
     let mounts = clients
         .iter()
         .map(|client| ClientMount::new(client.name.clone(), client.mount_point.clone()))
@@ -3272,7 +3310,7 @@ fn wait_for_mounted_chaos_initial_tree(
     wait_for_convergence(
         &mounts,
         context.scenario_dir.join("validation-initial-chaos"),
-        timeout,
+        remaining,
         poll_interval,
     )
     .map_err(ScenarioError::from)
@@ -3377,6 +3415,15 @@ fn wait_for_hotspot_initial_tree(
     timeout: Duration,
     poll_interval: Duration,
 ) -> Result<ConvergenceOutcome, ScenarioError> {
+    let deadline = Instant::now() + timeout;
+    wait_for_required_paths_visible_until(
+        clients,
+        &["hotspot"],
+        deadline,
+        poll_interval,
+        "hotspot initial tree",
+    )?;
+    let remaining = remaining_initial_validation_timeout(deadline, "hotspot initial tree")?;
     let mounts = clients
         .iter()
         .map(|client| ClientMount::new(client.name.clone(), client.mount_point.clone()))
@@ -3384,7 +3431,7 @@ fn wait_for_hotspot_initial_tree(
     wait_for_convergence(
         &mounts,
         context.scenario_dir.join("validation-initial-hotspot"),
-        timeout,
+        remaining,
         poll_interval,
     )
     .map_err(ScenarioError::from)
@@ -3781,13 +3828,7 @@ fn wait_for_open_handle_initial_tree(
         poll_interval,
         "open handle initial tree",
     )?;
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
-        return Err(ScenarioError::Io(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "open handle initial tree became visible, but no time remained for convergence validation",
-        )));
-    }
+    let remaining = remaining_initial_validation_timeout(deadline, "open handle initial tree")?;
     let mounts = clients
         .iter()
         .map(|client| ClientMount::new(client.name.clone(), client.mount_point.clone()))
@@ -3825,6 +3866,21 @@ fn wait_for_required_paths_visible_until(
             )));
         }
         thread::sleep(poll_interval.min(deadline.saturating_duration_since(now)));
+    }
+}
+
+fn remaining_initial_validation_timeout(
+    deadline: Instant,
+    label: &str,
+) -> Result<Duration, ScenarioError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        Err(ScenarioError::Io(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("{label} became visible, but no time remained for convergence validation"),
+        )))
+    } else {
+        Ok(remaining)
     }
 }
 
@@ -5012,13 +5068,10 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(matches!(err, ScenarioError::MountedTree(_)));
+        assert!(matches!(err, ScenarioError::Io(_)));
         assert!(
-            context
-                .scenario_dir
-                .join("validation-initial-chaos")
-                .join("diff.json")
-                .exists()
+            err.to_string()
+                .contains("mounted chaos initial tree did not become visible")
         );
     }
 
@@ -5097,13 +5150,10 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(matches!(err, ScenarioError::MountedTree(_)));
+        assert!(matches!(err, ScenarioError::Io(_)));
         assert!(
-            context
-                .scenario_dir
-                .join("validation-initial-hotspot")
-                .join("diff.json")
-                .exists()
+            err.to_string()
+                .contains("hotspot initial tree did not become visible")
         );
     }
 
