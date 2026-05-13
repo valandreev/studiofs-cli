@@ -852,3 +852,138 @@ fn replica_serving_base_publish_replaces_stale_overlay_payload() {
         "serving reads must stop shadowing the PG/base payload winner"
     );
 }
+
+#[test]
+fn replica_serving_base_publish_preserves_unpublished_local_overlay() {
+    let engine = temp_engine();
+    let file = engine
+        .create_file(ROOT_INO, b"replica-serving-local-overlay.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let mut attr = engine.get_attr(file.ino).unwrap();
+    attr.size = u64::from(DEFAULT_BLOCK_SIZE);
+    attr.committed_size = u64::from(DEFAULT_BLOCK_SIZE);
+    attr.content_epoch = 2;
+    attr.committed_content_epoch = 1;
+    attr.upload_state = UploadState::Updating;
+    engine.set_attr(&attr).unwrap();
+
+    let local_overlay = PayloadRef::new_full(91_001, DEFAULT_BLOCK_SIZE);
+    let local_overlay_slices = RedbMetaEngine::chunk_slices_for_block(
+        0,
+        DEFAULT_BLOCK_SIZE,
+        Some(&local_overlay),
+        PayloadRefState::LocalOnly,
+    )
+    .unwrap();
+    engine
+        .apply_replica_serving_state(&[MetaEvent::SetRegularFileOverlaySlices {
+            ino: file.ino,
+            chunk_slices: local_overlay_slices,
+        }])
+        .unwrap();
+
+    let remote_winner = PayloadRef::new_full(91_002, DEFAULT_BLOCK_SIZE);
+    let remote_winner_slices = RedbMetaEngine::chunk_slices_for_block(
+        0,
+        DEFAULT_BLOCK_SIZE,
+        Some(&remote_winner),
+        PayloadRefState::Published,
+    )
+    .unwrap();
+    let publish_event = MetaEvent::PublishRegularFileBaseSlices {
+        ino: file.ino,
+        chunk_slices: remote_winner_slices,
+    };
+    engine
+        .apply_replica_events_to_base(std::slice::from_ref(&publish_event))
+        .unwrap();
+    engine
+        .apply_replica_serving_state(std::slice::from_ref(&publish_event))
+        .unwrap();
+
+    let object_ids: Vec<_> = engine
+        .lookup_regular_file_slices(file.ino, 0, u64::from(DEFAULT_BLOCK_SIZE))
+        .unwrap()
+        .into_iter()
+        .filter_map(|span| span.payload.map(|payload| payload.object_id))
+        .collect();
+    assert_eq!(
+        object_ids,
+        vec![local_overlay.object_id],
+        "base publish must not discard unpublished local overlay content"
+    );
+}
+
+#[test]
+fn replica_serving_remove_attr_clears_regular_file_overlay_payload() {
+    let engine = temp_engine();
+    let file = engine
+        .create_file(ROOT_INO, b"replica-serving-remove-attr.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let overlay = PayloadRef::new_full(92_001, DEFAULT_BLOCK_SIZE);
+    let overlay_slices = RedbMetaEngine::chunk_slices_for_block(
+        0,
+        DEFAULT_BLOCK_SIZE,
+        Some(&overlay),
+        PayloadRefState::LocalOnly,
+    )
+    .unwrap();
+    engine
+        .apply_replica_serving_state(&[MetaEvent::SetRegularFileOverlaySlices {
+            ino: file.ino,
+            chunk_slices: overlay_slices,
+        }])
+        .unwrap();
+
+    engine
+        .apply_replica_serving_state(&[MetaEvent::RemoveAttr { ino: file.ino }])
+        .unwrap();
+
+    let object_ids: Vec<_> = engine
+        .lookup_regular_file_slices(file.ino, 0, u64::from(DEFAULT_BLOCK_SIZE))
+        .unwrap()
+        .into_iter()
+        .filter_map(|span| span.payload.map(|payload| payload.object_id))
+        .collect();
+    assert!(
+        object_ids.is_empty(),
+        "remote remove attr must not leave serving overlay payload for the removed inode"
+    );
+}
+
+#[test]
+fn replica_serving_remove_regular_file_graph_clears_overlay_payload() {
+    let engine = temp_engine();
+    let file = engine
+        .create_file(ROOT_INO, b"replica-serving-remove-graph.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let overlay = PayloadRef::new_full(93_001, DEFAULT_BLOCK_SIZE);
+    let overlay_slices = RedbMetaEngine::chunk_slices_for_block(
+        0,
+        DEFAULT_BLOCK_SIZE,
+        Some(&overlay),
+        PayloadRefState::LocalOnly,
+    )
+    .unwrap();
+    engine
+        .apply_replica_serving_state(&[MetaEvent::SetRegularFileOverlaySlices {
+            ino: file.ino,
+            chunk_slices: overlay_slices,
+        }])
+        .unwrap();
+
+    engine
+        .apply_replica_serving_state(&[MetaEvent::RemoveRegularFileGraph { ino: file.ino }])
+        .unwrap();
+
+    let object_ids: Vec<_> = engine
+        .lookup_regular_file_slices(file.ino, 0, u64::from(DEFAULT_BLOCK_SIZE))
+        .unwrap()
+        .into_iter()
+        .filter_map(|span| span.payload.map(|payload| payload.object_id))
+        .collect();
+    assert!(
+        object_ids.is_empty(),
+        "remote graph removal must not leave stale serving overlay payload"
+    );
+}
