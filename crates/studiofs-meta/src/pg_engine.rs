@@ -2719,9 +2719,11 @@ impl PgMetaEngine {
                 overlay.attr_inodes.contains(ino)
                     || overlay.acl_keys.contains(&Self::acl_key(*ino, principal))
             }
-            MetaEvent::SetRegularFileOverlaySlices { .. }
-            | MetaEvent::PublishRegularFileBaseSlices { .. }
-            | MetaEvent::RemoveRegularFileGraph { .. }
+            MetaEvent::SetRegularFileOverlaySlices { .. } => false,
+            MetaEvent::PublishRegularFileBaseSlices { ino, .. } => {
+                overlay.block_inodes.contains(ino)
+            }
+            MetaEvent::RemoveRegularFileGraph { .. }
             | MetaEvent::AddPendingDeletion { .. }
             | MetaEvent::RemovePendingDeletion { .. }
             | MetaEvent::CreateSnapshot { .. }
@@ -5385,6 +5387,52 @@ mod tests {
         assert!(pg.lookup(ROOT_INO, b"file.txt").is_err());
         assert!(pg.lookup(ROOT_INO, b"renamed.txt").is_err());
         assert!(pg.get_attr(file.ino).is_err());
+    }
+
+    #[test]
+    fn foreign_base_publish_preserves_unflushed_local_overlay_payload() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+
+        let file = create_published_small_file(&pg, ROOT_INO, b"payload.txt", 77_020);
+        let setup_end = pg.local.get_counter("nextEventSeq").expect("setup end");
+        pg.persist_flushed_event_seq(setup_end)
+            .expect("ack published setup");
+
+        set_file_state(&pg, file.ino, 64, 2);
+        let local_payload = PayloadRef::new_partial(77_021, 64);
+        pg.stage_payload_slice(file.ino, 0, &local_payload)
+            .expect("stage local payload");
+        let overlay = pg.local_overlay_conflicts().expect("overlay conflicts");
+        assert!(overlay.block_inodes.contains(&file.ino));
+
+        let remote_payload = PayloadRef::new_partial(77_022, 64);
+        let mut remote_slice = SliceRecord::new(
+            SliceId(0),
+            SliceOrder(0),
+            SliceRange::new(0, 64).expect("remote slice range"),
+            remote_payload,
+        );
+        remote_slice.payload_state = PayloadRefState::Published;
+        pg.apply_foreign_batch(
+            &[MetaEvent::PublishRegularFileBaseSlices {
+                ino: file.ino,
+                chunk_slices: vec![(ChunkId(0), vec![remote_slice])],
+            }],
+            &overlay,
+        )
+        .expect("apply foreign publish");
+
+        let object_ids: Vec<_> = pg
+            .lookup_regular_file_slices(file.ino, 0, 64)
+            .expect("lookup local payload")
+            .into_iter()
+            .filter_map(|span| span.payload.map(|payload| payload.object_id))
+            .collect();
+        assert_eq!(
+            object_ids,
+            vec![local_payload.object_id],
+            "unflushed local payload must remain visible over a conflicting remote publish"
+        );
     }
 
     fn setup_pg_volume(dsn: &str, name: &str, uuid: &str, block_size: u32) -> MetaResult<i64> {

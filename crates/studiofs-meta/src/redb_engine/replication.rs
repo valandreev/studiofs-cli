@@ -918,7 +918,14 @@ impl RedbMetaEngine {
                         )?;
                     }
                 }
-                crate::events::MetaEvent::PublishRegularFileBaseSlices { .. } => {}
+                crate::events::MetaEvent::PublishRegularFileBaseSlices { ino, .. } => {
+                    Self::clear_regular_file_chunk_rows_in_txn(
+                        &txn,
+                        REGULAR_FILE_OVERLAY_TABLE,
+                        *ino,
+                    )?;
+                    Self::clear_regular_file_pending_compaction_rows_in_txn(&txn, *ino)?;
+                }
                 crate::events::MetaEvent::RemoveRegularFileGraph { .. }
                 | crate::events::MetaEvent::AddPendingDeletion { .. }
                 | crate::events::MetaEvent::RemovePendingDeletion { .. }
