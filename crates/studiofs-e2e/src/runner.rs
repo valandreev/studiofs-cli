@@ -21,6 +21,7 @@ use crate::client::{
 use crate::infra::{
     COMPOSE_PROJECT_PREFIX, CommandExecutor, CommandSpec, ComposeConfig, ComposeServiceControl,
     DockerComposeStack, InfraCheck, InfraError, InfraMode, SystemCommandExecutor,
+    command_streams_output,
 };
 use crate::report::{
     ArtifactReport, CleanupReport, ComposeImageReport, EnvironmentReport, EventRecord, HostReport,
@@ -677,7 +678,9 @@ fn run_supervised_scenario(
     let child_report_path = scenario_child_report_path(input.sandbox, input.definition.name);
     match input.executor.run(&command) {
         Ok(output) => {
-            relay_child_output(&output);
+            if !command_streams_output(&command) {
+                relay_child_output(&output);
+            }
             append_child_output(input.sandbox, input.definition.name, &output)?;
             let mut lifecycle = match read_scenario_child_report(&child_report_path) {
                 Ok(lifecycle) => lifecycle,
@@ -760,7 +763,10 @@ fn scenario_child_command(input: &SupervisedScenarioInput<'_>) -> Result<Command
             "--infra".to_string(),
             infra_cli_value(input.request_infra).to_string(),
         ],
-        env: vec![("STUDIOFS_E2E_SCENARIO_CHILD".to_string(), "1".to_string())],
+        env: vec![
+            ("STUDIOFS_E2E_SCENARIO_CHILD".to_string(), "1".to_string()),
+            ("STUDIOFS_E2E_STREAM_OUTPUT".to_string(), "1".to_string()),
+        ],
         cwd: None,
         timeout: input.request_timeout.and_then(parse_timeout_duration),
     })
@@ -3251,6 +3257,7 @@ plain child stderr\n",
         assert!(child_calls.iter().all(|call| {
             call.args.contains(&"run-one".to_string())
                 && call.args.contains(&"--scenario".to_string())
+                && command_streams_output(call)
                 && call.timeout == Some(Duration::from_secs(30))
         }));
 

@@ -1,7 +1,7 @@
 //! Docker Compose infrastructure for real E2E runs.
 
 use std::fs;
-use std::io::{self, Read as _};
+use std::io;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{ChildStderr, ChildStdout, Command, Stdio};
@@ -20,6 +20,7 @@ const DEFAULT_RUSTFS_CONSOLE_PORT: u16 = 29_001;
 const DEFAULT_TOXIPROXY_API_PORT: u16 = 28_474;
 const COMPOSE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 const COMPOSE_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(30);
+const STREAM_OUTPUT_ENV: &str = "STUDIOFS_E2E_STREAM_OUTPUT";
 
 pub const COMPOSE_PROJECT_PREFIX: &str = "studiofs-e2e-";
 pub const POSTGRES_SERVICE_NAME: &str = "postgres";
@@ -142,10 +143,11 @@ impl CommandExecutor for SystemCommandExecutor {
         if let Some(cwd) = &command.cwd {
             process.current_dir(cwd);
         }
-        if let Some(timeout) = command.timeout {
+        let stream_output = command_streams_output(command);
+        if command.timeout.is_some() || stream_output {
             process.stdout(Stdio::piped());
             process.stderr(Stdio::piped());
-            return run_command_with_timeout(process, timeout);
+            return run_command(process, command.timeout, stream_output);
         }
         let output = process.output()?;
         Ok(CommandOutput {
@@ -156,13 +158,27 @@ impl CommandExecutor for SystemCommandExecutor {
     }
 }
 
-fn run_command_with_timeout(
+pub fn command_streams_output(command: &CommandSpec) -> bool {
+    command
+        .env
+        .iter()
+        .any(|(key, value)| key == STREAM_OUTPUT_ENV && value == "1")
+}
+
+fn run_command(
     mut command: Command,
-    timeout: Duration,
+    timeout: Option<Duration>,
+    stream_output: bool,
 ) -> std::io::Result<CommandOutput> {
     let mut child = command.spawn()?;
-    let mut stdout_reader = child.stdout.take().map(spawn_stdout_reader);
-    let mut stderr_reader = child.stderr.take().map(spawn_stderr_reader);
+    let mut stdout_reader = child
+        .stdout
+        .take()
+        .map(|stdout| spawn_stdout_reader(stdout, stream_output));
+    let mut stderr_reader = child
+        .stderr
+        .take()
+        .map(|stderr| spawn_stderr_reader(stderr, stream_output));
     let started = Instant::now();
     loop {
         if child.try_wait()?.is_some() {
@@ -175,7 +191,7 @@ fn run_command_with_timeout(
                 stderr: String::from_utf8_lossy(&stderr).into_owned(),
             });
         }
-        if started.elapsed() >= timeout {
+        if timeout.is_some_and(|timeout| started.elapsed() >= timeout) {
             let process_tree_error = force_kill_process_tree(child.id()).err();
             let _ = child.kill();
             let _ = child.wait();
@@ -184,6 +200,7 @@ fn run_command_with_timeout(
             let detail = process_tree_error
                 .map(|error| format!("; process-tree kill fallback failed: {error}"))
                 .unwrap_or_default();
+            let timeout = timeout.expect("timeout checked above");
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 format!("command timed out after {} ms{detail}", timeout.as_millis()),
@@ -220,20 +237,58 @@ fn force_kill_process_tree(_pid: u32) -> Result<(), String> {
     Ok(())
 }
 
-fn spawn_stdout_reader(mut stdout: ChildStdout) -> JoinHandle<io::Result<Vec<u8>>> {
-    thread::spawn(move || {
-        let mut buffer = Vec::new();
-        stdout.read_to_end(&mut buffer)?;
-        Ok(buffer)
-    })
+fn spawn_stdout_reader(
+    stdout: ChildStdout,
+    stream_output: bool,
+) -> JoinHandle<io::Result<Vec<u8>>> {
+    thread::spawn(move || read_stream(stdout, OutputSink::Stdout, stream_output))
 }
 
-fn spawn_stderr_reader(mut stderr: ChildStderr) -> JoinHandle<io::Result<Vec<u8>>> {
-    thread::spawn(move || {
-        let mut buffer = Vec::new();
-        stderr.read_to_end(&mut buffer)?;
-        Ok(buffer)
-    })
+fn spawn_stderr_reader(
+    stderr: ChildStderr,
+    stream_output: bool,
+) -> JoinHandle<io::Result<Vec<u8>>> {
+    thread::spawn(move || read_stream(stderr, OutputSink::Stderr, stream_output))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum OutputSink {
+    Stdout,
+    Stderr,
+}
+
+fn read_stream<R: io::Read>(
+    mut reader: R,
+    sink: OutputSink,
+    stream_output: bool,
+) -> io::Result<Vec<u8>> {
+    if !stream_output {
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output)?;
+        return Ok(output);
+    }
+    match sink {
+        OutputSink::Stdout => read_stream_to_sink(reader, io::stdout().lock()),
+        OutputSink::Stderr => read_stream_to_sink(reader, io::stderr().lock()),
+    }
+}
+
+fn read_stream_to_sink<R: io::Read, W: io::Write>(
+    mut reader: R,
+    mut sink: W,
+) -> io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let read = reader.read(&mut chunk)?;
+        if read == 0 {
+            return Ok(output);
+        }
+        let bytes = &chunk[..read];
+        output.extend_from_slice(bytes);
+        sink.write_all(bytes)?;
+        sink.flush()?;
+    }
 }
 
 fn collect_reader(reader: Option<JoinHandle<io::Result<Vec<u8>>>>) -> io::Result<Vec<u8>> {
@@ -919,6 +974,35 @@ mod tests {
         assert!(output.stdout.len() >= 1_000_000);
     }
 
+    #[test]
+    fn command_streams_output_only_when_enabled() {
+        let mut command = large_stdout_command(Duration::from_secs(5));
+
+        assert!(!command_streams_output(&command));
+
+        command
+            .env
+            .push(("STUDIOFS_E2E_STREAM_OUTPUT".to_string(), "1".to_string()));
+
+        assert!(command_streams_output(&command));
+    }
+
+    #[test]
+    fn streaming_command_still_captures_output_without_timeout() {
+        let mut command = small_output_command(None);
+        command
+            .env
+            .push(("STUDIOFS_E2E_STREAM_OUTPUT".to_string(), "1".to_string()));
+
+        let output = SystemCommandExecutor
+            .run(&command)
+            .expect("streamed command should still complete");
+
+        assert_eq!(output.status, 0);
+        assert_eq!(output.stdout.trim(), "streamed stdout");
+        assert_eq!(output.stderr.trim(), "streamed stderr");
+    }
+
     #[cfg(windows)]
     fn hung_command(timeout: Duration) -> CommandSpec {
         CommandSpec {
@@ -949,6 +1033,21 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    fn small_output_command(timeout: Option<Duration>) -> CommandSpec {
+        CommandSpec {
+            program: "powershell".to_string(),
+            args: vec![
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                "[Console]::Out.WriteLine('streamed stdout'); [Console]::Error.WriteLine('streamed stderr')".to_string(),
+            ],
+            env: Vec::new(),
+            cwd: None,
+            timeout,
+        }
+    }
+
     #[cfg(unix)]
     fn hung_command(timeout: Duration) -> CommandSpec {
         CommandSpec {
@@ -971,6 +1070,20 @@ mod tests {
             env: Vec::new(),
             cwd: None,
             timeout: Some(timeout),
+        }
+    }
+
+    #[cfg(unix)]
+    fn small_output_command(timeout: Option<Duration>) -> CommandSpec {
+        CommandSpec {
+            program: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "printf 'streamed stdout\n'; printf 'streamed stderr\n' >&2".to_string(),
+            ],
+            env: Vec::new(),
+            cwd: None,
+            timeout,
         }
     }
 }

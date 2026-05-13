@@ -91,6 +91,12 @@ static HOTSPOT_IO_ACTIVE_WORKERS: LazyLock<Arc<AtomicUsize>> =
     LazyLock::new(|| Arc::new(AtomicUsize::new(0)));
 const LWW_RECONNECT_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(120);
 const FAULT_CHAOS_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(120);
+const MOUNTED_CHAOS_INITIAL_TREE: &[(&str, &[u8])] = &[
+    ("chaos/rename-source.txt", b"rename source\n"),
+    ("chaos/unlink-target.txt", b"unlink target\n"),
+    ("chaos/append-target.txt", b"append target\n"),
+    ("chaos/read-target.txt", COLLISION_OLD_COMMITTED_PAYLOAD),
+];
 
 #[cfg(test)]
 pub(crate) const TEST_FAILING_VALIDATE: &str = "__test-failing-validate";
@@ -3032,7 +3038,15 @@ fn execute_advanced_mounted_operations(
             run_publication_boundary_operations(controller, clients)?,
             None,
         )),
-        AdvancedMountedKind::MountedChaos => Ok((run_mounted_chaos_operations(clients)?, None)),
+        AdvancedMountedKind::MountedChaos => Ok((
+            run_mounted_chaos_operations(
+                context,
+                clients,
+                ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT,
+                ADVANCED_MOUNTED_CONVERGENCE_POLL_INTERVAL,
+            )?,
+            None,
+        )),
         AdvancedMountedKind::HotspotChurn => Ok((run_hotspot_churn_operations(clients)?, None)),
         AdvancedMountedKind::FaultChaos => Ok((
             run_fault_chaos_operations(context, controller, clients)?,
@@ -3134,18 +3148,32 @@ fn write_boundary_payload(path: PathBuf, payload: &[u8], boundary: &str) -> io::
 }
 
 fn run_mounted_chaos_operations(
+    context: &ScenarioContext,
     clients: &[ClientSpec],
+    initial_convergence_timeout: Duration,
+    poll_interval: Duration,
 ) -> Result<Vec<NamespaceCollisionOperation>, ScenarioError> {
     let started = Instant::now();
     let mut operations = Vec::new();
     let writer = &clients[0];
-    for (path, payload) in [
-        ("chaos/rename-source.txt", b"rename source\n".as_slice()),
-        ("chaos/unlink-target.txt", b"unlink target\n".as_slice()),
-        ("chaos/append-target.txt", b"append target\n".as_slice()),
-        ("chaos/read-target.txt", COLLISION_OLD_COMMITTED_PAYLOAD),
-    ] {
-        write_parented(writer.mount_point.join(path), payload)?;
+    seed_mounted_chaos_initial_tree(writer)?;
+    wait_for_mounted_chaos_initial_tree(
+        context,
+        clients,
+        initial_convergence_timeout,
+        poll_interval,
+    )?;
+    for &(path, _) in MOUNTED_CHAOS_INITIAL_TREE {
+        let path = writer.mount_point.join(path);
+        if !path.exists() {
+            return Err(ScenarioError::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "mounted chaos initial path disappeared before conflicting operations: {}",
+                    path.display()
+                ),
+            )));
+        }
     }
     operations.push(fs_op(
         started,
@@ -3201,6 +3229,32 @@ fn run_mounted_chaos_operations(
         fs::read_dir(clients[2].mount_point.join("chaos")).map(|_| ())
     }));
     Ok(operations)
+}
+
+fn seed_mounted_chaos_initial_tree(writer: &ClientSpec) -> Result<(), ScenarioError> {
+    for &(path, payload) in MOUNTED_CHAOS_INITIAL_TREE {
+        write_parented(writer.mount_point.join(path), payload)?;
+    }
+    Ok(())
+}
+
+fn wait_for_mounted_chaos_initial_tree(
+    context: &ScenarioContext,
+    clients: &[ClientSpec],
+    timeout: Duration,
+    poll_interval: Duration,
+) -> Result<ConvergenceOutcome, ScenarioError> {
+    let mounts = clients
+        .iter()
+        .map(|client| ClientMount::new(client.name.clone(), client.mount_point.clone()))
+        .collect::<Vec<_>>();
+    wait_for_convergence(
+        &mounts,
+        context.scenario_dir.join("validation-initial-chaos"),
+        timeout,
+        poll_interval,
+    )
+    .map_err(ScenarioError::from)
 }
 
 fn run_hotspot_churn_operations(
@@ -3398,7 +3452,12 @@ fn run_fault_chaos_operations(
     clients: &[ClientSpec],
 ) -> Result<Vec<NamespaceCollisionOperation>, ScenarioError> {
     let started = Instant::now();
-    let mut operations = run_mounted_chaos_operations(&clients[..3])?;
+    let mut operations = run_mounted_chaos_operations(
+        context,
+        &clients[..3],
+        ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT,
+        ADVANCED_MOUNTED_CONVERGENCE_POLL_INTERVAL,
+    )?;
     let compose = compose_control_from_manifest(context)?;
     let executor = SystemCommandExecutor;
     operations.push(required_op(
@@ -4767,6 +4826,91 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn mounted_chaos_initial_barrier_rejects_unreplicated_seed_tree() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(MOUNTED_CHAOS_CONVERGENCE);
+        let clients = ADVANCED_MOUNTED_CLIENT_NAMES
+            .iter()
+            .copied()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(&mount).unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let context = ScenarioContext {
+            run_id: "run-1".to_string(),
+            seed: 410,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+        seed_mounted_chaos_initial_tree(&clients[0]).unwrap();
+
+        let err = wait_for_mounted_chaos_initial_tree(
+            &context,
+            &clients,
+            Duration::from_millis(25),
+            Duration::from_millis(5),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, ScenarioError::MountedTree(_)));
+        assert!(
+            context
+                .scenario_dir
+                .join("validation-initial-chaos")
+                .join("diff.json")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn mounted_chaos_initial_barrier_accepts_replicated_seed_tree() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(MOUNTED_CHAOS_CONVERGENCE);
+        let clients = ADVANCED_MOUNTED_CLIENT_NAMES
+            .iter()
+            .copied()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(&mount).unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let context = ScenarioContext {
+            run_id: "run-1".to_string(),
+            seed: 410,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+        seed_mounted_chaos_initial_tree(&clients[0]).unwrap();
+        for peer in clients.iter().skip(1) {
+            replace_dir_contents(&clients[0].mount_point, &peer.mount_point).unwrap();
+        }
+
+        let convergence = wait_for_mounted_chaos_initial_tree(
+            &context,
+            &clients,
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+        )
+        .unwrap();
+
+        assert!(convergence.comparison.converged);
+        assert_eq!(convergence.comparison.differences, Vec::new());
     }
 
     #[test]
