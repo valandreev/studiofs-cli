@@ -1070,7 +1070,7 @@ timestamp=t studiofs-e2e phase=run status=\x1b[31mfailed\x1b[0m\n",
     fn hung_command(timeout: Duration) -> CommandSpec {
         CommandSpec {
             program: "cmd".to_string(),
-            args: vec!["/C".to_string(), "timeout /T 5 /NOBREAK >NUL".to_string()],
+            args: vec!["/C".to_string(), "ping -n 6 127.0.0.1 >NUL".to_string()],
             env: Vec::new(),
             cwd: None,
             timeout: Some(timeout),
