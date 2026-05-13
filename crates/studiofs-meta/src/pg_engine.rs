@@ -5140,6 +5140,7 @@ mod tests {
                     }],
                 )],
             },
+            MetaEvent::RemoveRegularFileGraph { ino: 42 },
             MetaEvent::PublishRegularFileBaseSlices {
                 ino: 42,
                 chunk_slices: vec![(

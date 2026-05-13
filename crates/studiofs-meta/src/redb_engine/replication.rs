@@ -924,10 +924,8 @@ impl RedbMetaEngine {
                         Self::clear_regular_file_serving_overlay_in_txn(&txn, *ino)?;
                     }
                 }
-                crate::events::MetaEvent::RemoveRegularFileGraph { ino } => {
-                    Self::clear_regular_file_serving_overlay_in_txn(&txn, *ino)?;
-                }
-                crate::events::MetaEvent::AddPendingDeletion { .. }
+                crate::events::MetaEvent::RemoveRegularFileGraph { .. }
+                | crate::events::MetaEvent::AddPendingDeletion { .. }
                 | crate::events::MetaEvent::RemovePendingDeletion { .. }
                 | crate::events::MetaEvent::CreateSnapshot { .. }
                 | crate::events::MetaEvent::UpdateSnapshotState { .. } => {}
