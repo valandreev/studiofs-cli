@@ -97,6 +97,11 @@ const MOUNTED_CHAOS_INITIAL_TREE: &[(&str, &[u8])] = &[
     ("chaos/append-target.txt", b"append target\n"),
     ("chaos/read-target.txt", COLLISION_OLD_COMMITTED_PAYLOAD),
 ];
+const OPEN_HANDLE_UNLINK_TARGET: &str = "open-handles/unlink-target.txt";
+const OPEN_HANDLE_RENAME_SOURCE: &str = "open-handles/rename-source.txt";
+const OPEN_HANDLE_RENAME_DEST: &str = "open-handles/renamed-destination.txt";
+const OPEN_HANDLE_UNLINK_TARGET_PAYLOAD: &[u8] = b"open handle initial\n";
+const OPEN_HANDLE_RENAME_SOURCE_PAYLOAD: &[u8] = b"rename source\n";
 
 #[cfg(test)]
 pub(crate) const TEST_FAILING_VALIDATE: &str = "__test-failing-validate";
@@ -3064,7 +3069,15 @@ fn execute_advanced_mounted_operations(
             let (operations, oracle) = run_lww_reconnect_operations(context, controller, clients)?;
             Ok((operations, Some(oracle)))
         }
-        AdvancedMountedKind::OpenHandle => Ok((run_open_handle_operations(clients)?, None)),
+        AdvancedMountedKind::OpenHandle => Ok((
+            run_open_handle_operations(
+                context,
+                clients,
+                ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT,
+                ADVANCED_MOUNTED_CONVERGENCE_POLL_INTERVAL,
+            )?,
+            None,
+        )),
     }
 }
 
@@ -3688,37 +3701,41 @@ fn run_lww_reconnect_operations(
 }
 
 fn run_open_handle_operations(
+    context: &ScenarioContext,
     clients: &[ClientSpec],
+    initial_convergence_timeout: Duration,
+    poll_interval: Duration,
 ) -> Result<Vec<NamespaceCollisionOperation>, ScenarioError> {
     let started = Instant::now();
     let mut operations = Vec::new();
-    let original = "open-handles/unlink-target.txt";
-    let rename_source = "open-handles/rename-source.txt";
-    let rename_dest = "open-handles/renamed-destination.txt";
-    write_parented(
-        clients[0].mount_point.join(original),
-        b"open handle initial\n",
-    )?;
-    write_parented(
-        clients[1].mount_point.join(rename_source),
-        b"rename source\n",
+    seed_open_handle_initial_tree(clients)?;
+    wait_for_open_handle_initial_tree(
+        context,
+        clients,
+        initial_convergence_timeout,
+        poll_interval,
     )?;
     let mut handle = OpenOptions::new()
         .append(true)
-        .open(clients[0].mount_point.join(original))?;
-    operations.push(fs_op(started, 1, &clients[1], "unlink", original, || {
-        fs::remove_file(clients[1].mount_point.join(original))
-    }));
+        .open(clients[0].mount_point.join(OPEN_HANDLE_UNLINK_TARGET))?;
+    operations.push(fs_op(
+        started,
+        1,
+        &clients[1],
+        "unlink",
+        OPEN_HANDLE_UNLINK_TARGET,
+        || fs::remove_file(clients[1].mount_point.join(OPEN_HANDLE_UNLINK_TARGET)),
+    ));
     operations.push(fs_op(
         started,
         2,
         &clients[1],
         "rename",
-        rename_source,
+        OPEN_HANDLE_RENAME_SOURCE,
         || {
             fs::rename(
-                clients[1].mount_point.join(rename_source),
-                clients[1].mount_point.join(rename_dest),
+                clients[1].mount_point.join(OPEN_HANDLE_RENAME_SOURCE),
+                clients[1].mount_point.join(OPEN_HANDLE_RENAME_DEST),
             )
         },
     ));
@@ -3727,7 +3744,7 @@ fn run_open_handle_operations(
         3,
         &clients[0],
         "append_old_handle",
-        original,
+        OPEN_HANDLE_UNLINK_TARGET,
         handle
             .write_all(b"append through old handle\n")
             .and_then(|()| handle.sync_all())
@@ -3735,6 +3752,99 @@ fn run_open_handle_operations(
     ))?);
     drop(handle);
     Ok(operations)
+}
+
+fn seed_open_handle_initial_tree(clients: &[ClientSpec]) -> Result<(), ScenarioError> {
+    let seed_mount = &clients[0].mount_point;
+    write_parented(
+        seed_mount.join(OPEN_HANDLE_UNLINK_TARGET),
+        OPEN_HANDLE_UNLINK_TARGET_PAYLOAD,
+    )?;
+    write_parented(
+        seed_mount.join(OPEN_HANDLE_RENAME_SOURCE),
+        OPEN_HANDLE_RENAME_SOURCE_PAYLOAD,
+    )?;
+    Ok(())
+}
+
+fn wait_for_open_handle_initial_tree(
+    context: &ScenarioContext,
+    clients: &[ClientSpec],
+    timeout: Duration,
+    poll_interval: Duration,
+) -> Result<ConvergenceOutcome, ScenarioError> {
+    let deadline = Instant::now() + timeout;
+    wait_for_required_paths_visible_until(
+        clients,
+        &[OPEN_HANDLE_UNLINK_TARGET, OPEN_HANDLE_RENAME_SOURCE],
+        deadline,
+        poll_interval,
+        "open handle initial tree",
+    )?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(ScenarioError::Io(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "open handle initial tree became visible, but no time remained for convergence validation",
+        )));
+    }
+    let mounts = clients
+        .iter()
+        .map(|client| ClientMount::new(client.name.clone(), client.mount_point.clone()))
+        .collect::<Vec<_>>();
+    wait_for_convergence(
+        &mounts,
+        context.scenario_dir.join("validation-initial-open-handle"),
+        remaining,
+        poll_interval,
+    )
+    .map_err(ScenarioError::from)
+}
+
+fn wait_for_required_paths_visible_until(
+    clients: &[ClientSpec],
+    required_paths: &[&str],
+    deadline: Instant,
+    poll_interval: Duration,
+    label: &str,
+) -> Result<(), ScenarioError> {
+    loop {
+        let last_missing = missing_required_paths(clients, required_paths);
+        if last_missing.is_empty() {
+            return Ok(());
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(ScenarioError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "{label} did not become visible before timeout; missing: {}",
+                    last_missing.join(", ")
+                ),
+            )));
+        }
+        thread::sleep(poll_interval.min(deadline.saturating_duration_since(now)));
+    }
+}
+
+fn missing_required_paths(clients: &[ClientSpec], required_paths: &[&str]) -> Vec<String> {
+    let mut missing = Vec::new();
+    for client in clients {
+        for relative_path in required_paths {
+            let path = client.mount_point.join(relative_path);
+            match fs::metadata(&path) {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    missing.push(format!("{}:{relative_path}", client.name));
+                }
+                Err(error) => {
+                    missing.push(format!("{}:{relative_path} ({error})", client.name));
+                }
+            }
+        }
+    }
+    missing
 }
 
 fn finish_advanced_mounted(
@@ -5023,6 +5133,94 @@ mod tests {
         };
 
         let convergence = wait_for_hotspot_initial_tree(
+            &context,
+            &clients,
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+        )
+        .unwrap();
+
+        assert!(convergence.comparison.converged);
+        assert_eq!(convergence.comparison.differences, Vec::new());
+    }
+
+    #[test]
+    fn open_handle_initial_barrier_rejects_unreplicated_initial_tree() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(MOUNTED_OPEN_HANDLE_CONVERGENCE);
+        let clients = ADVANCED_MOUNTED_CLIENT_NAMES
+            .iter()
+            .copied()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(&mount).unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let context = ScenarioContext {
+            run_id: "run-1".to_string(),
+            seed: 410,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+        seed_open_handle_initial_tree(&clients).unwrap();
+
+        let err = wait_for_open_handle_initial_tree(
+            &context,
+            &clients,
+            Duration::from_millis(25),
+            Duration::from_millis(5),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, ScenarioError::Io(_)));
+        assert!(
+            err.to_string()
+                .contains("open handle initial tree did not become visible")
+        );
+    }
+
+    #[test]
+    fn open_handle_initial_barrier_accepts_replicated_initial_tree() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(MOUNTED_OPEN_HANDLE_CONVERGENCE);
+        let clients = ADVANCED_MOUNTED_CLIENT_NAMES
+            .iter()
+            .copied()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(&mount).unwrap();
+                write_parented(
+                    mount.join(OPEN_HANDLE_UNLINK_TARGET),
+                    OPEN_HANDLE_UNLINK_TARGET_PAYLOAD,
+                )
+                .unwrap();
+                write_parented(
+                    mount.join(OPEN_HANDLE_RENAME_SOURCE),
+                    OPEN_HANDLE_RENAME_SOURCE_PAYLOAD,
+                )
+                .unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let context = ScenarioContext {
+            run_id: "run-1".to_string(),
+            seed: 410,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+
+        let convergence = wait_for_open_handle_initial_tree(
             &context,
             &clients,
             Duration::from_secs(1),
