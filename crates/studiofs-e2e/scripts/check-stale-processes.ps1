@@ -34,7 +34,10 @@ Get-CimInstance Win32_Process -Filter $processFilter |
     ForEach-Object {
         if ($cleanStale) {
             try {
-                Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop
+                $taskkill = Start-Process -FilePath 'taskkill.exe' -ArgumentList @('/PID', "$($_.ProcessId)", '/T', '/F') -NoNewWindow -Wait -PassThru -ErrorAction Stop
+                if ($taskkill.ExitCode -ne 0) {
+                    throw "taskkill exited with code $($taskkill.ExitCode)"
+                }
                 "stopped $($_.ProcessId) $($_.Name) $($_.CommandLine)"
             } catch {
                 "failed to stop $($_.ProcessId) $($_.Name): $($_.Exception.Message)"

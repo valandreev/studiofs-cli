@@ -176,6 +176,7 @@ fn run_command_with_timeout(
             });
         }
         if started.elapsed() >= timeout {
+            force_kill_process_tree(child.id());
             let _ = child.kill();
             let _ = child.wait();
             let _ = collect_reader(stdout_reader.take());
@@ -188,6 +189,18 @@ fn run_command_with_timeout(
         thread::sleep(Duration::from_millis(10));
     }
 }
+
+#[cfg(windows)]
+fn force_kill_process_tree(pid: u32) {
+    let _ = Command::new("taskkill.exe")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(not(windows))]
+fn force_kill_process_tree(_pid: u32) {}
 
 fn spawn_stdout_reader(mut stdout: ChildStdout) -> JoinHandle<io::Result<Vec<u8>>> {
     thread::spawn(move || {
