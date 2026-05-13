@@ -176,14 +176,17 @@ fn run_command_with_timeout(
             });
         }
         if started.elapsed() >= timeout {
-            force_kill_process_tree(child.id());
+            let process_tree_error = force_kill_process_tree(child.id()).err();
             let _ = child.kill();
             let _ = child.wait();
             let _ = collect_reader(stdout_reader.take());
             let _ = collect_reader(stderr_reader.take());
+            let detail = process_tree_error
+                .map(|error| format!("; process-tree kill fallback failed: {error}"))
+                .unwrap_or_default();
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
-                format!("command timed out after {} ms", timeout.as_millis()),
+                format!("command timed out after {} ms{detail}", timeout.as_millis()),
             ));
         }
         thread::sleep(Duration::from_millis(10));
@@ -191,16 +194,31 @@ fn run_command_with_timeout(
 }
 
 #[cfg(windows)]
-fn force_kill_process_tree(pid: u32) {
-    let _ = Command::new("taskkill.exe")
+fn force_kill_process_tree(pid: u32) -> Result<(), String> {
+    let status = Command::new(taskkill_program())
         .args(["/PID", &pid.to_string(), "/T", "/F"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status();
+        .status()
+        .map_err(|err| err.to_string())?;
+    match status.code() {
+        Some(0 | 128) => Ok(()),
+        _ => Err(format!("taskkill exited with status {status}")),
+    }
+}
+
+#[cfg(windows)]
+fn taskkill_program() -> PathBuf {
+    std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .map(|root| root.join("System32").join("taskkill.exe"))
+        .unwrap_or_else(|| PathBuf::from("taskkill.exe"))
 }
 
 #[cfg(not(windows))]
-fn force_kill_process_tree(_pid: u32) {}
+fn force_kill_process_tree(_pid: u32) -> Result<(), String> {
+    Ok(())
+}
 
 fn spawn_stdout_reader(mut stdout: ChildStdout) -> JoinHandle<io::Result<Vec<u8>>> {
     thread::spawn(move || {

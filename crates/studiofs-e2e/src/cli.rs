@@ -279,14 +279,16 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                 run_id: args.run_id,
                 scenario: args.scenario,
             })?;
-            println!(
-                "timestamp={} run_id={} scenario={} status={:?} report={}",
-                timestamp(),
-                outcome.run_id,
-                outcome.scenario.name,
-                outcome.scenario.status,
-                outcome.report_path.display()
-            );
+            if should_print_run_one_summary(outcome.exit_code) {
+                println!(
+                    "timestamp={} run_id={} scenario={} status={:?} report={}",
+                    timestamp(),
+                    outcome.run_id,
+                    outcome.scenario.name,
+                    outcome.scenario.status,
+                    outcome.report_path.display()
+                );
+            }
             Ok(outcome.exit_code)
         }
         Commands::LocalFirstBaselineGate(args) => {
@@ -317,6 +319,10 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
 
 fn timestamp() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+fn should_print_run_one_summary(exit_code: i32) -> bool {
+    exit_code != 0
 }
 
 #[cfg(test)]
@@ -350,5 +356,12 @@ mod tests {
         assert_eq!(args.run_id, "run-one-test");
         assert_eq!(args.seed, 410);
         assert_eq!(args.infra, InfraMode::Disabled);
+    }
+
+    #[test]
+    fn run_one_summary_is_suppressed_for_successful_child() {
+        assert!(!should_print_run_one_summary(0));
+        assert!(should_print_run_one_summary(1));
+        assert!(should_print_run_one_summary(4));
     }
 }

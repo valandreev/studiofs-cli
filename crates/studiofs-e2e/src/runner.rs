@@ -33,6 +33,7 @@ const SCHEMA_VERSION: u32 = 1;
 const RUNNER_CRATE: &str = "studiofs-e2e";
 const RUNNER_MARKER_FILE: &str = ".studiofs-e2e-runner.json";
 const PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+const POST_SCENARIO_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 const ANSI_RESET: &str = "\x1b[0m";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
@@ -569,6 +570,7 @@ fn verify_post_scenario_cleanup(
         "STUDIOFS_E2E_CLEANUP_PHASE".to_string(),
         "post-scenario".to_string(),
     ));
+    command.timeout = Some(POST_SCENARIO_CLEANUP_TIMEOUT);
     record_event(
         events_path,
         run_id,
@@ -869,9 +871,45 @@ fn relay_child_output(output: &crate::infra::CommandOutput) {
         let _ = std::io::stdout().flush();
     }
     if !output.stderr.is_empty() {
-        eprint!("{}", output.stderr);
+        let stderr = if std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none() {
+            colorize_progress_statuses(&output.stderr)
+        } else {
+            output.stderr.clone()
+        };
+        eprint!("{stderr}");
         let _ = std::io::stderr().flush();
     }
+}
+
+fn colorize_progress_statuses(output: &str) -> String {
+    output
+        .lines()
+        .map(colorize_progress_status_line)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + if output.ends_with('\n') { "\n" } else { "" }
+}
+
+fn colorize_progress_status_line(line: &str) -> String {
+    for status in [
+        ProgressStatus::Started,
+        ProgressStatus::Passed,
+        ProgressStatus::Failed,
+    ] {
+        let needle = format!("status={}", status.as_str());
+        if line.contains(&needle) {
+            return line.replace(
+                &needle,
+                &format!(
+                    "status={}{}{}",
+                    status.ansi_color(),
+                    status.as_str(),
+                    ANSI_RESET
+                ),
+            );
+        }
+    }
+    line.to_string()
 }
 
 fn append_child_output(
@@ -2862,6 +2900,20 @@ mod tests {
     }
 
     #[test]
+    fn relayed_child_progress_colorizes_status_values() {
+        assert_eq!(
+            colorize_progress_statuses(
+                "timestamp=2026-05-13T08:26:40.107Z studiofs-e2e run_id=run task=scenario phase=scenario_child status=started\n\
+timestamp=2026-05-13T08:26:41.107Z studiofs-e2e run_id=run task=scenario phase=scenario_child status=passed\n\
+plain child stderr\n",
+            ),
+            "timestamp=2026-05-13T08:26:40.107Z studiofs-e2e run_id=run task=scenario phase=scenario_child status=\x1b[33mstarted\x1b[0m\n\
+timestamp=2026-05-13T08:26:41.107Z studiofs-e2e run_id=run task=scenario phase=scenario_child status=\x1b[32mpassed\x1b[0m\n\
+plain child stderr\n",
+        );
+    }
+
+    #[test]
     fn artifact_report_names_include_relative_path_context() {
         let artifacts = required_artifacts(&[
             ScenarioOutcome {
@@ -3257,6 +3309,7 @@ mod tests {
             call.env
                 .iter()
                 .any(|(key, value)| key == "STUDIOFS_E2E_CLEANUP_PHASE" && value == "post-scenario")
+                && call.timeout == Some(POST_SCENARIO_CLEANUP_TIMEOUT)
         }));
 
         let report: serde_json::Value =
@@ -3451,6 +3504,8 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(outcome.status, RunStatus::Passed);
+
         let calls = executor.calls.borrow();
         let stale_down_index = calls
             .iter()
@@ -3511,13 +3566,13 @@ mod tests {
                     {
                         "service": "postgres",
                         "host": "127.0.0.1",
-                        "host_port": 33600,
+                        "host_port": 33700,
                         "container_port": 5432,
                         "env_var": "STUDIOFS_E2E_POSTGRES_PORT"
                     }
                 ],
                 "studiofs_bin": null,
-                "port_range": "33600-33603",
+                "port_range": "33700-33703",
                 "timeout": null,
                 "explicit_client_roots": [],
                 "cleanup_allowlist": [active_sandbox.display().to_string()],
@@ -3560,7 +3615,7 @@ mod tests {
                 platform: PlatformSelection::WindowsWinfsp,
                 retention: RetentionPolicy::Always,
                 report: None,
-                port_range: Some("33600-33603".to_string()),
+                port_range: Some("33700-33703".to_string()),
                 timeout: None,
                 infra: InfraMode::Compose,
             },
