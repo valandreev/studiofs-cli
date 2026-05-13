@@ -16,7 +16,6 @@ use studiofs_cache::upload_queue::PendingUpload;
 use studiofs_data::object::{
     CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, create_object_buffer, format_object_fragment_keys,
 };
-use studiofs_meta::MetaError;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -1370,16 +1369,14 @@ impl UploadLifecycleWorker {
         let mut delayed = DelayedUploads::default();
         let mut dispatched_since_yield = 0u32;
         let mut inbound_closed = false;
-        let mut check_missing_deleted_attrs = false;
         loop {
             Self::reap_ready_workers(&mut workers);
             Self::promote_ready_uploads(&mut ready, &mut delayed);
-            self.drop_deleted_queued_uploads(&mut ready, &mut delayed, check_missing_deleted_attrs);
-            check_missing_deleted_attrs = false;
+            self.drop_deleted_queued_uploads(&mut ready, &mut delayed);
 
             while !ready.is_empty() {
                 Self::reap_ready_workers(&mut workers);
-                self.drop_deleted_queued_uploads(&mut ready, &mut delayed, false);
+                self.drop_deleted_queued_uploads(&mut ready, &mut delayed);
                 let Some(permit) = permits.clone().try_acquire_owned().ok() else {
                     break;
                 };
@@ -1411,7 +1408,7 @@ impl UploadLifecycleWorker {
                     tokio::task::yield_now().await;
                     Self::reap_ready_workers(&mut workers);
                     Self::promote_ready_uploads(&mut ready, &mut delayed);
-                    self.drop_deleted_queued_uploads(&mut ready, &mut delayed, false);
+                    self.drop_deleted_queued_uploads(&mut ready, &mut delayed);
                 }
             }
 
@@ -1451,9 +1448,7 @@ impl UploadLifecycleWorker {
                         None => inbound_closed = true,
                     }
                 }
-                _ = self.vfs.state.upload.deleted_uploads_notify.notified() => {
-                    check_missing_deleted_attrs = true;
-                }
+                _ = self.vfs.state.upload.deleted_uploads_notify.notified() => {}
                 _ = &mut sleep_until_ready => {}
             }
         }
@@ -1521,48 +1516,8 @@ impl UploadLifecycleWorker {
         removed
     }
 
-    fn queued_upload_inodes(ready: &ReadyUploads, delayed: &DelayedUploads) -> HashSet<Ino> {
-        let mut inodes: HashSet<_> = ready.per_inode.keys().copied().collect();
-        for queue in delayed.values() {
-            inodes.extend(queue.iter().map(|op| op.ino));
-        }
-        inodes
-    }
-
-    fn deleted_queued_upload_inodes(
-        &self,
-        ready: &ReadyUploads,
-        delayed: &DelayedUploads,
-        check_missing_attrs: bool,
-    ) -> HashSet<Ino> {
-        let mut deleted_inodes = self.vfs.state.upload.deleted_inodes.lock().clone();
-        if !check_missing_attrs {
-            return deleted_inodes;
-        }
-
-        let queued_inodes = Self::queued_upload_inodes(ready, delayed);
-        if queued_inodes.is_empty() {
-            return deleted_inodes;
-        }
-        let meta = self.vfs.sync_meta();
-        for ino in queued_inodes {
-            if deleted_inodes.contains(&ino) {
-                continue;
-            }
-            if matches!(meta.get_attr(ino), Err(MetaError::InodeNotFound(_))) {
-                deleted_inodes.insert(ino);
-            }
-        }
-        deleted_inodes
-    }
-
-    fn drop_deleted_queued_uploads(
-        &self,
-        ready: &mut ReadyUploads,
-        delayed: &mut DelayedUploads,
-        check_missing_attrs: bool,
-    ) {
-        let deleted_inodes = self.deleted_queued_upload_inodes(ready, delayed, check_missing_attrs);
+    fn drop_deleted_queued_uploads(&self, ready: &mut ReadyUploads, delayed: &mut DelayedUploads) {
+        let deleted_inodes = self.vfs.state.upload.deleted_inodes.lock().clone();
         let removed = Self::remove_deleted_uploads_from_queues(ready, delayed, &deleted_inodes);
         for op in removed {
             self.cancel_deleted_queued_upload(op);
@@ -1570,13 +1525,7 @@ impl UploadLifecycleWorker {
     }
 
     fn queued_upload_deleted_before_dispatch(&self, ino: Ino) -> bool {
-        if self.vfs.state.upload.deleted_inodes.lock().contains(&ino) {
-            return true;
-        }
-        matches!(
-            self.vfs.sync_meta().get_attr(ino),
-            Err(MetaError::InodeNotFound(_))
-        )
+        self.vfs.state.upload.deleted_inodes.lock().contains(&ino)
     }
 
     fn cancel_deleted_queued_upload(&self, op: PendingUpload) {
@@ -2489,32 +2438,6 @@ mod tests {
         assert_eq!(retained_op.object_id, retained.object_id);
         assert!(ready.is_empty());
         assert!(delayed.is_empty());
-    }
-
-    #[test]
-    fn worker_delete_wake_drops_missing_inode_uploads_after_marker_clears() {
-        let tmp = TempDir::new().expect("tempdir");
-        let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "deleted-queue-wake");
-        let worker = UploadLifecycleWorker::new(vfs);
-        let mut ready = ReadyUploads::default();
-        let mut delayed = DelayedUploads::default();
-        let mut op = make_pending_upload();
-        op.ino = 99_001;
-        op.object_id = 301;
-        UploadLifecycleWorker::enqueue_pending_upload(&mut ready, &mut delayed, op.clone());
-
-        let without_missing_attr_check =
-            worker.deleted_queued_upload_inodes(&ready, &delayed, false);
-        assert!(
-            !without_missing_attr_check.contains(&op.ino),
-            "a cleared delete marker should not be inferred without a delete wake"
-        );
-
-        let with_missing_attr_check = worker.deleted_queued_upload_inodes(&ready, &delayed, true);
-        assert!(
-            with_missing_attr_check.contains(&op.ino),
-            "delete wake should drop queued uploads whose inode metadata is already gone"
-        );
     }
 
     #[test]
