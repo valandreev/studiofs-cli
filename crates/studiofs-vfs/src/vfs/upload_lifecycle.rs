@@ -61,6 +61,7 @@ impl StudioVfs {
         // Data for still-open unlinked files must remain locally readable until
         // the last handle is released (POSIX open-unlink semantics).
         self.state.upload.deleted_inodes.lock().insert(ino);
+        self.state.upload.deleted_uploads_notify.notify_waiters();
         if let Some(token) = self
             .state
             .upload
@@ -94,21 +95,10 @@ impl StudioVfs {
     }
 
     pub(super) fn maybe_clear_deleted_inode_marker(&self, ino: Ino) {
-        if !self.state.upload.deleted_inodes.lock().contains(&ino) {
-            return;
-        }
-        if self.handle_table.open_count(ino) > 0 {
-            return;
-        }
-        if self.inode_has_pending_uploads(ino) {
-            return;
-        }
-        // Only clear after inode metadata is actually gone. This keeps the
-        // marker stable for open-unlink inodes until final orphan cleanup.
-        if self.sync_meta().get_attr(ino).is_ok() {
-            return;
-        }
-        self.state.upload.deleted_inodes.lock().remove(&ino);
+        // Inode IDs are monotonic within a VFS runtime. Keep this marker as a
+        // runtime tombstone so uploader-channel backlog cannot start after the
+        // metadata row and cached-store queue have already been cleaned up.
+        let _ = ino;
     }
 
     pub(super) fn maybe_release_upload_cancel_token(&self, ino: Ino) {

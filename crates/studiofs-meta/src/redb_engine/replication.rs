@@ -817,6 +817,7 @@ impl RedbMetaEngine {
                     for key in acl_rule_keys {
                         let _ = acl_rules.remove(key.as_slice());
                     }
+                    Self::clear_regular_file_serving_overlay_in_txn(&txn, *ino)?;
                 }
                 crate::events::MetaEvent::AddEntry {
                     parent,
@@ -918,7 +919,11 @@ impl RedbMetaEngine {
                         )?;
                     }
                 }
-                crate::events::MetaEvent::PublishRegularFileBaseSlices { .. } => {}
+                crate::events::MetaEvent::PublishRegularFileBaseSlices { ino, .. } => {
+                    if Self::serving_overlay_can_follow_base_publish_in_txn(&txn, *ino)? {
+                        Self::clear_regular_file_serving_overlay_in_txn(&txn, *ino)?;
+                    }
+                }
                 crate::events::MetaEvent::RemoveRegularFileGraph { .. }
                 | crate::events::MetaEvent::AddPendingDeletion { .. }
                 | crate::events::MetaEvent::RemovePendingDeletion { .. }
@@ -929,6 +934,29 @@ impl RedbMetaEngine {
 
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn serving_overlay_can_follow_base_publish_in_txn(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+    ) -> MetaResult<bool> {
+        let attr = match Self::get_attr_merged_in_write_txn(txn, ino) {
+            Ok(attr) => attr,
+            Err(MetaError::InodeNotFound(_)) => return Ok(true),
+            Err(err) => return Err(err),
+        };
+        Ok(attr.kind != FileType::RegularFile
+            || (attr.content_epoch == attr.committed_content_epoch
+                && attr.size == attr.committed_size))
+    }
+
+    fn clear_regular_file_serving_overlay_in_txn(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+    ) -> MetaResult<()> {
+        Self::clear_regular_file_chunk_rows_in_txn(txn, REGULAR_FILE_OVERLAY_TABLE, ino)?;
+        Self::clear_regular_file_pending_compaction_rows_in_txn(txn, ino)?;
         Ok(())
     }
 

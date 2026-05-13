@@ -5304,6 +5304,10 @@ fn unlink_immediate_cleanup_removes_pending_upload_payload_artifacts() {
             "unlink should cancel queued uploads for the deleted inode"
         );
         assert!(
+            vfs.state.upload.deleted_inodes.lock().contains(&attr.ino),
+            "deleted inode marker must remain after metadata/cache cleanup so uploader channel backlog cannot start later uploads"
+        );
+        assert!(
             !vfs.cached_store().is_pinned(object_id),
             "unlink should unpin canceled upload payloads so they can be removed immediately"
         );
