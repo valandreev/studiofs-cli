@@ -414,12 +414,10 @@ impl RedbMetaEngine {
                     Self::clear_regular_file_graph_in_txn(&txn, *ino)?;
                 }
                 crate::events::MetaEvent::PublishRegularFileBaseSlices { ino, chunk_slices } => {
-                    Self::apply_regular_file_chunk_slices_in_txn(
+                    Self::merge_regular_file_base_publish_preserving_current_in_txn(
                         &txn,
-                        REGULAR_FILE_BASE_TABLE,
                         *ino,
                         chunk_slices.as_slice(),
-                        false,
                     )?;
                 }
                 crate::events::MetaEvent::SetSymlinkTarget { ino, target } => {
@@ -539,7 +537,7 @@ impl RedbMetaEngine {
     fn apply_replica_events_to_base_inner(
         &self,
         events: &[crate::events::MetaEvent],
-        protected_regular_file_inodes: &HashSet<Ino>,
+        _protected_regular_file_inodes: &HashSet<Ino>,
     ) -> MetaResult<()> {
         if events.is_empty() {
             return Ok(());
@@ -755,21 +753,11 @@ impl RedbMetaEngine {
                     }
                 }
                 crate::events::MetaEvent::PublishRegularFileBaseSlices { ino, chunk_slices } => {
-                    if protected_regular_file_inodes.contains(ino) {
-                        Self::merge_regular_file_base_publish_preserving_current_in_txn(
-                            &txn,
-                            *ino,
-                            chunk_slices.as_slice(),
-                        )?;
-                    } else {
-                        Self::apply_regular_file_chunk_slices_in_txn(
-                            &txn,
-                            REGULAR_FILE_BASE_TABLE,
-                            *ino,
-                            chunk_slices.as_slice(),
-                            false,
-                        )?;
-                    }
+                    Self::merge_regular_file_base_publish_preserving_current_in_txn(
+                        &txn,
+                        *ino,
+                        chunk_slices.as_slice(),
+                    )?;
                 }
                 crate::events::MetaEvent::RemoveRegularFileGraph { .. }
                 | crate::events::MetaEvent::AddPendingDeletion { .. }

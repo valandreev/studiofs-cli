@@ -2790,6 +2790,13 @@ impl PgMetaEngine {
             if !Self::event_has_aux_apply_effect(event) {
                 continue;
             }
+            if matches!(
+                event,
+                MetaEvent::PublishRegularFileBaseSlices { ino, .. }
+                    if base_protected_regular_file_inodes.contains(ino)
+            ) {
+                continue;
+            }
             if !self.aux_event_conflicts_with_overlay(event, overlay, &removed_inodes)? {
                 aux_events.push(event.clone());
             }
@@ -2822,6 +2829,9 @@ impl PgMetaEngine {
                 continue;
             };
             if current.kind != FileType::RegularFile || current.upload_state != UploadState::Ready {
+                continue;
+            }
+            if attr.content_epoch > current.content_epoch {
                 continue;
             }
             let mut merged_attr = attr.clone();
@@ -5491,6 +5501,97 @@ mod tests {
             object_ids,
             vec![local_payload.object_id],
             "unflushed local payload must remain visible over a conflicting remote publish"
+        );
+    }
+
+    #[test]
+    fn protected_attr_merge_accepts_newer_remote_shrink_epoch() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+
+        let file = create_published_small_file(&pg, ROOT_INO, b"protected-shrink.txt", 77_030);
+        let mut current = pg.get_attr(file.ino).expect("load local attr");
+        current.size = 2 * 1024 * 1024;
+        current.committed_size = current.size;
+        current.content_epoch = 5;
+        current.committed_content_epoch = 5;
+        current.upload_state = UploadState::Ready;
+        pg.set_attr(&current).expect("seed local protected attr");
+
+        let mut remote = current.clone();
+        remote.size = 1024 * 1024;
+        remote.committed_size = remote.size;
+        remote.content_epoch = 6;
+        remote.committed_content_epoch = 6;
+        remote.mtime = remote.mtime.saturating_add(1);
+        remote.ctime = remote.ctime.saturating_add(1);
+
+        pg.apply_foreign_batch(
+            &[MetaEvent::SetAttr { attr: remote }],
+            &OverlayConflictSets::default(),
+            &HashSet::from([file.ino]),
+        )
+        .expect("apply newer remote shrink");
+
+        let applied = pg.get_attr(file.ino).expect("load applied attr");
+        assert_eq!(
+            applied.size,
+            1024 * 1024,
+            "newer remote content epoch must be allowed to shrink a protected inode"
+        );
+        assert_eq!(applied.content_epoch, 6);
+        assert_eq!(applied.committed_content_epoch, 6);
+    }
+
+    #[test]
+    fn protected_foreign_publish_does_not_get_replaced_by_aux_replay() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+
+        let file = create_published_small_file(&pg, ROOT_INO, b"protected-aux-publish.txt", 77_040);
+        let mut attr = pg.get_attr(file.ino).expect("load local attr");
+        attr.content_epoch = 3;
+        attr.committed_content_epoch = 3;
+        attr.size = (3 * u64::from(DEFAULT_BLOCK_SIZE)) + 4096;
+        attr.committed_size = attr.size;
+        attr.upload_state = UploadState::Ready;
+        pg.set_attr(&attr).expect("seed local protected attr");
+
+        let local_tail = PayloadRef::new_partial(77_041, 4096);
+        pg.stage_payload_slice(file.ino, 3, &local_tail)
+            .expect("stage local tail");
+        mark_overlay_objects_uploaded(&pg, file.ino, 3, &[local_tail.object_id]);
+        assert!(
+            pg.local
+                .publish_regular_file_overlay_to_base_if_matches(file.ino, 3)
+                .expect("publish local tail")
+        );
+
+        let remote_middle = PayloadRef::new_partial(77_042, 4096);
+        let remote_publish = MetaEvent::PublishRegularFileBaseSlices {
+            ino: file.ino,
+            chunk_slices: fixture_payload_slices(
+                2,
+                Some(&remote_middle),
+                PayloadRefState::Published,
+            )
+            .expect("remote middle slices"),
+        };
+        pg.apply_foreign_batch(
+            &[remote_publish],
+            &OverlayConflictSets::default(),
+            &HashSet::from([file.ino]),
+        )
+        .expect("apply protected foreign publish");
+
+        let object_ids: Vec<_> = pg
+            .lookup_regular_file_slices(file.ino, 0, (4 * u64::from(DEFAULT_BLOCK_SIZE)) + 4096)
+            .expect("lookup merged protected base graph")
+            .into_iter()
+            .filter_map(|span| span.payload.map(|payload| payload.object_id))
+            .collect();
+        assert_eq!(
+            object_ids,
+            vec![77_040, remote_middle.object_id, local_tail.object_id],
+            "protected base merge must not be overwritten by aux replacement in the same foreign batch"
         );
     }
 

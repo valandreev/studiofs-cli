@@ -978,7 +978,7 @@ fn protected_base_publish_merges_disjoint_remote_ranges_without_losing_newer_loc
 }
 
 #[test]
-fn replica_base_publish_merges_disjoint_ranges_instead_of_replacing_whole_graph() {
+fn replica_base_publish_merges_disjoint_graph_for_unprotected_inode() {
     let engine = temp_engine();
     let file = engine
         .create_file(ROOT_INO, b"base-merge-disjoint.bin", 1000, 1000, 0o644)
@@ -1031,12 +1031,12 @@ fn replica_base_publish_merges_disjoint_ranges_instead_of_replacing_whole_graph(
     assert_eq!(
         object_ids,
         vec![remote_middle.object_id, local_tail.object_id],
-        "replaying a disjoint publish must not discard already-published base ranges"
+        "publish replay should apply incoming payloads without dropping disjoint local base ranges"
     );
 }
 
 #[test]
-fn replica_aux_base_publish_merges_disjoint_ranges_instead_of_replacing_whole_graph() {
+fn replica_aux_base_publish_merges_disjoint_graph_for_unprotected_inode() {
     let engine = temp_engine();
     let file = engine
         .create_file(ROOT_INO, b"aux-base-merge-disjoint.bin", 1000, 1000, 0o644)
@@ -1089,7 +1089,7 @@ fn replica_aux_base_publish_merges_disjoint_ranges_instead_of_replacing_whole_gr
     assert_eq!(
         object_ids,
         vec![remote_middle.object_id, local_tail.object_id],
-        "aux replay of a disjoint publish must not discard already-published base ranges"
+        "aux replay should apply incoming payloads without dropping disjoint local base ranges"
     );
 }
 
