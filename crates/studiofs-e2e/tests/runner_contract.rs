@@ -132,7 +132,7 @@ fn scenario_list_order_restores_original_sixteen_scenario_numbering() {
         .collect::<Vec<_>>();
 
     assert_eq!(
-        names,
+        &names[..16],
         [
             "basic-multi-client-smoke",
             "postgres-outage-multi-client-recovery",
@@ -257,6 +257,101 @@ fn list_scenarios_exposes_restored_advanced_mounted_suite() {
         assert!(
             names.contains(&expected),
             "expected restored advanced mounted scenario {expected}"
+        );
+    }
+}
+
+#[test]
+fn scenario_list_appends_sparse_range_promotion_after_accepted_sixteen() {
+    let scenarios = studiofs_e2e::scenario::available_scenarios();
+    let names = scenarios
+        .iter()
+        .map(|scenario| scenario.name)
+        .collect::<Vec<_>>();
+
+    assert_eq!(names[15], "mounted-open-handle-convergence");
+    assert_eq!(names[16], "mounted-sparse-file-range-convergence");
+}
+
+#[test]
+fn sparse_range_scenario_disabled_run_writes_reproducible_artifacts() {
+    let temp = tempdir().unwrap();
+    let request = RunRequest {
+        root: temp.path().join("e2e-runs"),
+        run_id: Some("sparse-range-contract-run".to_string()),
+        scenarios: vec!["mounted-sparse-file-range-convergence".to_string()],
+        seed: 377,
+        studiofs_bin: None,
+        platform: PlatformSelection::Auto,
+        retention: RetentionPolicy::Always,
+        report: None,
+        port_range: None,
+        timeout: None,
+        infra: InfraMode::Disabled,
+    };
+
+    let outcome = studiofs_e2e::runner::run(request).unwrap();
+
+    assert_eq!(outcome.status, RunStatus::Passed);
+    assert_eq!(
+        outcome.scenarios[0].name,
+        "mounted-sparse-file-range-convergence"
+    );
+    assert!(
+        outcome.scenarios[0].artifacts.contains(
+            &"artifacts/scenarios/mounted-sparse-file-range-convergence/sparse-range-summary.json"
+                .to_string()
+        )
+    );
+    assert!(outcome.scenarios[0].artifacts.contains(
+        &"artifacts/scenarios/mounted-sparse-file-range-convergence/validation.json".to_string()
+    ));
+
+    let sandbox = temp
+        .path()
+        .join("e2e-runs")
+        .join("sparse-range-contract-run");
+    let summary = read_json(sandbox.join(
+        "artifacts/scenarios/mounted-sparse-file-range-convergence/sparse-range-summary.json",
+    ));
+    assert_eq!(summary["scenario"], "mounted-sparse-file-range-convergence");
+    assert_eq!(summary["clients"], 3);
+    assert_eq!(summary["sparse_ranges"]["logical_size"], 3_146_061);
+    assert!(
+        summary["sparse_ranges"]["expected_byte_ranges"]
+            .as_array()
+            .unwrap()
+            .len()
+            >= 3
+    );
+    let zero_filled_holes = summary["sparse_ranges"]["zero_filled_holes"]
+        .as_array()
+        .unwrap();
+    assert_eq!(zero_filled_holes.len(), 6);
+    assert!(
+        zero_filled_holes
+            .iter()
+            .all(|probe| probe["client"].is_string())
+    );
+    assert!(
+        zero_filled_holes
+            .iter()
+            .all(|probe| probe["all_zero"] == true)
+    );
+
+    let operations = fs::read_to_string(
+        sandbox.join("artifacts/scenarios/mounted-sparse-file-range-convergence/operations.ndjson"),
+    )
+    .unwrap();
+    for expected in [
+        "write_range",
+        "truncate_shrink",
+        "truncate_extend",
+        "read_probe",
+    ] {
+        assert!(
+            operations.contains(expected),
+            "expected sparse operation {expected}"
         );
     }
 }

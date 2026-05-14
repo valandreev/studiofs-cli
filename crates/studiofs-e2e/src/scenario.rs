@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::{self, Write as _};
+use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Barrier, LazyLock,
@@ -49,6 +49,7 @@ pub const MOUNTED_HOTSPOT_CHURN_CONVERGENCE: &str = "mounted-hotspot-churn-conve
 pub const MOUNTED_FAULT_CHAOS_CONVERGENCE: &str = "mounted-fault-chaos-convergence";
 pub const MOUNTED_LWW_RECONNECT_CHAOS_CONVERGENCE: &str = "mounted-lww-reconnect-chaos-convergence";
 pub const MOUNTED_OPEN_HANDLE_CONVERGENCE: &str = "mounted-open-handle-convergence";
+pub const MOUNTED_SPARSE_FILE_RANGE_CONVERGENCE: &str = "mounted-sparse-file-range-convergence";
 const SMOKE_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
 const COLLISION_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
 const ADVANCED_MOUNTED_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
@@ -85,6 +86,8 @@ const COLLISION_NEW_COMMITTED_PAYLOAD: &[u8] = b"new committed payload\n";
 const OVERWRITE_READ_ATTEMPTS: u32 = 8;
 const ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(90);
 const ADVANCED_MOUNTED_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const MOUNTED_WRITE_READBACK_TIMEOUT: Duration = Duration::from_secs(5);
+const MOUNTED_WRITE_READBACK_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const HOTSPOT_CHURN_OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
 const HOTSPOT_IO_MAX_ACTIVE_WORKERS: usize = 1;
 static HOTSPOT_IO_ACTIVE_WORKERS: LazyLock<Arc<AtomicUsize>> =
@@ -102,6 +105,17 @@ const OPEN_HANDLE_RENAME_SOURCE: &str = "open-handles/rename-source.txt";
 const OPEN_HANDLE_RENAME_DEST: &str = "open-handles/renamed-destination.txt";
 const OPEN_HANDLE_UNLINK_TARGET_PAYLOAD: &[u8] = b"open handle initial\n";
 const OPEN_HANDLE_RENAME_SOURCE_PAYLOAD: &[u8] = b"rename source\n";
+const SPARSE_FILE_PATH: &str = "sparse/shared.bin";
+const SPARSE_INITIAL_LOGICAL_SIZE: u64 = 2_097_275;
+const SPARSE_SHRUNK_LOGICAL_SIZE: u64 = 1_048_833;
+const SPARSE_FINAL_LOGICAL_SIZE: u64 = 3_146_061;
+const SPARSE_FIRST_BOUNDARY_OFFSET: u64 = 1_048_569;
+const SPARSE_SECOND_BOUNDARY_OFFSET: u64 = 2_097_147;
+const SPARSE_FINAL_TAIL_OFFSET: u64 = 3_145_900;
+const SPARSE_PREFIX_PAYLOAD: &[u8] = b"sparse-prefix-sfs-377\n";
+const SPARSE_FIRST_BOUNDARY_PAYLOAD: &[u8] = b"crosses-first-chunk-boundary-sfs-377\n";
+const SPARSE_SECOND_BOUNDARY_PAYLOAD: &[u8] = b"crosses-second-chunk-boundary-sfs-377\n";
+const SPARSE_FINAL_TAIL_PAYLOAD: &[u8] = b"sparse-final-tail-sfs-377\n";
 
 #[cfg(test)]
 pub(crate) const TEST_FAILING_VALIDATE: &str = "__test-failing-validate";
@@ -241,6 +255,7 @@ pub fn available_scenarios() -> Vec<ScenarioDefinition> {
         AdvancedMountedScenario::new(AdvancedMountedKind::FaultChaos).definition(),
         AdvancedMountedScenario::new(AdvancedMountedKind::LwwReconnectChaos).definition(),
         AdvancedMountedScenario::new(AdvancedMountedKind::OpenHandle).definition(),
+        AdvancedMountedScenario::new(AdvancedMountedKind::SparseRange).definition(),
     ]
 }
 
@@ -294,6 +309,11 @@ pub(crate) fn resolve_scenario(name: &str) -> Option<Box<dyn Scenario>> {
         MOUNTED_OPEN_HANDLE_CONVERGENCE | "open-handle" | "open-unlink-rename" => Some(Box::new(
             AdvancedMountedScenario::new(AdvancedMountedKind::OpenHandle),
         )),
+        MOUNTED_SPARSE_FILE_RANGE_CONVERGENCE | "sparse-range" | "sparse-file-range" => {
+            Some(Box::new(AdvancedMountedScenario::new(
+                AdvancedMountedKind::SparseRange,
+            )))
+        }
         #[cfg(test)]
         TEST_FAILING_VALIDATE => Some(Box::new(TestFailingScenario {
             cleanup_fails: false,
@@ -2206,14 +2226,24 @@ fn run_namespace_collision_body(
     establish_collision_initial_tree(kind, &clients[0])?;
     driver.after_conflicting_operations(kind, &clients)?;
     let initial_validation_deadline = Instant::now() + convergence_timeout;
-    let required_initial_paths = collision_required_initial_paths(kind);
-    wait_for_required_paths_visible_until(
+    let initial_paths = kind.initial_paths();
+    wait_for_mounted_initial_payloads_until(
         &clients,
-        &required_initial_paths,
+        &initial_paths,
         initial_validation_deadline,
         poll_interval,
         "namespace collision initial tree",
     )?;
+    let required_initial_paths = collision_required_initial_paths(kind);
+    if !required_initial_paths.is_empty() {
+        wait_for_required_paths_visible_until(
+            &clients,
+            &required_initial_paths,
+            initial_validation_deadline,
+            poll_interval,
+            "namespace collision initial tree",
+        )?;
+    }
     let initial_validation_timeout = remaining_initial_validation_timeout(
         initial_validation_deadline,
         "namespace collision initial tree",
@@ -2291,25 +2321,21 @@ fn establish_collision_initial_tree(
         fs::create_dir_all(client.mount_point.join("race"))?;
     }
     for (relative_path, payload) in kind.initial_paths() {
-        let path = client.mount_point.join(relative_path);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(path, payload)?;
+        write_mounted_initial_file(
+            client.mount_point.join(relative_path),
+            payload,
+            "namespace collision initial tree",
+        )?;
     }
     Ok(())
 }
 
 fn collision_required_initial_paths(kind: NamespaceCollisionKind) -> Vec<&'static str> {
-    let mut paths = kind
-        .initial_paths()
-        .into_iter()
-        .map(|(path, _)| path)
-        .collect::<Vec<_>>();
     if kind == NamespaceCollisionKind::MkdirRmdirVsCreate {
-        paths.push("race");
+        vec!["race"]
+    } else {
+        Vec::new()
     }
-    paths
 }
 
 fn perform_namespace_collision_operations(
@@ -2742,6 +2768,29 @@ fn write_namespace_collision_operations(
     Ok(())
 }
 
+fn append_namespace_collision_operation(
+    context: &ScenarioContext,
+    operation: &NamespaceCollisionOperation,
+) -> Result<(), ScenarioError> {
+    let mut log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(context.scenario_dir.join("operations.ndjson"))?;
+    serde_json::to_writer(&mut log, operation)?;
+    log.write_all(b"\n")?;
+    Ok(())
+}
+
+fn record_sparse_operation(
+    context: &ScenarioContext,
+    operations: &mut Vec<NamespaceCollisionOperation>,
+    operation: NamespaceCollisionOperation,
+) -> Result<(), ScenarioError> {
+    append_namespace_collision_operation(context, &operation)?;
+    operations.push(operation);
+    Ok(())
+}
+
 fn write_namespace_collision_summary(
     context: &ScenarioContext,
     summary: &NamespaceCollisionSummary,
@@ -2787,6 +2836,7 @@ enum AdvancedMountedKind {
     FaultChaos,
     LwwReconnectChaos,
     OpenHandle,
+    SparseRange,
 }
 
 impl AdvancedMountedKind {
@@ -2798,6 +2848,7 @@ impl AdvancedMountedKind {
             Self::FaultChaos => MOUNTED_FAULT_CHAOS_CONVERGENCE,
             Self::LwwReconnectChaos => MOUNTED_LWW_RECONNECT_CHAOS_CONVERGENCE,
             Self::OpenHandle => MOUNTED_OPEN_HANDLE_CONVERGENCE,
+            Self::SparseRange => MOUNTED_SPARSE_FILE_RANGE_CONVERGENCE,
         }
     }
 
@@ -2809,6 +2860,7 @@ impl AdvancedMountedKind {
             Self::FaultChaos => "mounted fault chaos convergence",
             Self::LwwReconnectChaos => "mounted LWW reconnect chaos convergence",
             Self::OpenHandle => "mounted open-handle convergence",
+            Self::SparseRange => "mounted sparse-file range convergence",
         }
     }
 
@@ -2820,6 +2872,7 @@ impl AdvancedMountedKind {
             Self::FaultChaos => "mounted-fault-chaos-summary.json",
             Self::LwwReconnectChaos => "mounted-lww-reconnect-chaos-summary.json",
             Self::OpenHandle => "mounted-open-handle-summary.json",
+            Self::SparseRange => "sparse-range-summary.json",
         }
     }
 
@@ -2903,11 +2956,17 @@ impl Scenario for AdvancedMountedScenario {
             "seed": context.seed,
             "status": if summary.final_validator.converged
                 && summary.namespace_violations.is_empty()
-                && lww_oracle_matches { "passed" } else { "failed" },
+                && lww_oracle_matches
+                && sparse_ranges_match(self.kind, summary.sparse_ranges.as_ref()) {
+                    "passed"
+                } else {
+                    "failed"
+                },
             "final_validator": summary.final_validator,
             "namespace_violations": summary.namespace_violations,
             "operation_log": summary.operation_log,
             "lww_oracle": summary.lww_oracle,
+            "sparse_ranges": summary.sparse_ranges,
         });
         fs::write(
             context.scenario_dir.join("validation.json"),
@@ -2943,6 +3002,41 @@ struct LwwReconnectOracle {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SparseExpectedRange {
+    label: String,
+    offset: u64,
+    len: usize,
+    expected_checksum_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SparseHoleProbe {
+    client: String,
+    offset: u64,
+    len: usize,
+    all_zero: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SparseReadProbe {
+    client: String,
+    offset: u64,
+    len: usize,
+    actual_checksum_sha256: String,
+    matched: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SparseRangeSummary {
+    relative_path: String,
+    logical_size: u64,
+    final_checksum_sha256: String,
+    expected_byte_ranges: Vec<SparseExpectedRange>,
+    zero_filled_holes: Vec<SparseHoleProbe>,
+    read_probes: Vec<SparseReadProbe>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct AdvancedMountedSummary {
     scenario: String,
     bootstrap: Option<VolumeBootstrapSummary>,
@@ -2952,6 +3046,13 @@ struct AdvancedMountedSummary {
     final_validator: TreeComparison,
     namespace_violations: Vec<NamespaceInvariantViolation>,
     lww_oracle: Option<LwwReconnectOracle>,
+    sparse_ranges: Option<SparseRangeSummary>,
+}
+
+struct AdvancedMountedExecution {
+    operations: Vec<NamespaceCollisionOperation>,
+    lww_oracle: Option<LwwReconnectOracle>,
+    sparse_ranges: Option<SparseRangeSummary>,
 }
 
 fn run_advanced_mounted_with_controller(
@@ -3000,16 +3101,18 @@ fn run_advanced_mounted_body(
         });
     }
 
-    let (operations, lww_oracle) =
-        execute_advanced_mounted_operations(context, kind, controller, &clients)?;
-    write_namespace_collision_operations(context, &operations)?;
+    let execution = execute_advanced_mounted_operations(context, kind, controller, &clients)?;
+    if kind != AdvancedMountedKind::SparseRange {
+        write_namespace_collision_operations(context, &execution.operations)?;
+    }
     let summary = finish_advanced_mounted(
         context,
         kind,
         Some(bootstrap),
         &clients,
-        operations,
-        lww_oracle,
+        execution.operations,
+        execution.lww_oracle,
+        execution.sparse_ranges,
     )?;
     Ok(summary)
 }
@@ -3030,6 +3133,8 @@ fn write_advanced_mounted_plan_artifacts(
             matched: true,
         }
     });
+    let sparse_ranges =
+        (kind == AdvancedMountedKind::SparseRange).then(planned_sparse_range_summary);
     if let Some(oracle) = &lww_oracle {
         write_lww_oracle(context, oracle)?;
     }
@@ -3052,6 +3157,7 @@ fn write_advanced_mounted_plan_artifacts(
         },
         namespace_violations: Vec::new(),
         lww_oracle,
+        sparse_ranges,
     };
     write_advanced_mounted_summary(context, kind, &summary)?;
     Ok(summary)
@@ -3062,47 +3168,69 @@ fn execute_advanced_mounted_operations(
     kind: AdvancedMountedKind,
     controller: &mut MultiClientController<SystemClientProcessExecutor>,
     clients: &[ClientSpec],
-) -> Result<(Vec<NamespaceCollisionOperation>, Option<LwwReconnectOracle>), ScenarioError> {
+) -> Result<AdvancedMountedExecution, ScenarioError> {
     match kind {
-        AdvancedMountedKind::PublicationBoundaryCrashMatrix => Ok((
-            run_publication_boundary_operations(controller, clients)?,
-            None,
-        )),
-        AdvancedMountedKind::MountedChaos => Ok((
-            run_mounted_chaos_operations(
+        AdvancedMountedKind::PublicationBoundaryCrashMatrix => Ok(AdvancedMountedExecution {
+            operations: run_publication_boundary_operations(controller, clients)?,
+            lww_oracle: None,
+            sparse_ranges: None,
+        }),
+        AdvancedMountedKind::MountedChaos => Ok(AdvancedMountedExecution {
+            operations: run_mounted_chaos_operations(
                 context,
                 clients,
                 ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT,
                 ADVANCED_MOUNTED_CONVERGENCE_POLL_INTERVAL,
             )?,
-            None,
-        )),
-        AdvancedMountedKind::HotspotChurn => Ok((
-            run_hotspot_churn_operations(
+            lww_oracle: None,
+            sparse_ranges: None,
+        }),
+        AdvancedMountedKind::HotspotChurn => Ok(AdvancedMountedExecution {
+            operations: run_hotspot_churn_operations(
                 context,
                 clients,
                 ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT,
                 ADVANCED_MOUNTED_CONVERGENCE_POLL_INTERVAL,
             )?,
-            None,
-        )),
-        AdvancedMountedKind::FaultChaos => Ok((
-            run_fault_chaos_operations(context, controller, clients)?,
-            None,
-        )),
+            lww_oracle: None,
+            sparse_ranges: None,
+        }),
+        AdvancedMountedKind::FaultChaos => Ok(AdvancedMountedExecution {
+            operations: run_fault_chaos_operations(context, controller, clients)?,
+            lww_oracle: None,
+            sparse_ranges: None,
+        }),
         AdvancedMountedKind::LwwReconnectChaos => {
             let (operations, oracle) = run_lww_reconnect_operations(context, controller, clients)?;
-            Ok((operations, Some(oracle)))
+            Ok(AdvancedMountedExecution {
+                operations,
+                lww_oracle: Some(oracle),
+                sparse_ranges: None,
+            })
         }
-        AdvancedMountedKind::OpenHandle => Ok((
-            run_open_handle_operations(
+        AdvancedMountedKind::OpenHandle => Ok(AdvancedMountedExecution {
+            operations: run_open_handle_operations(
                 context,
                 clients,
                 ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT,
                 ADVANCED_MOUNTED_CONVERGENCE_POLL_INTERVAL,
             )?,
-            None,
-        )),
+            lww_oracle: None,
+            sparse_ranges: None,
+        }),
+        AdvancedMountedKind::SparseRange => {
+            let (operations, summary) = run_sparse_range_operations(
+                context,
+                clients,
+                ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT,
+                ADVANCED_MOUNTED_CONVERGENCE_POLL_INTERVAL,
+            )?;
+            Ok(AdvancedMountedExecution {
+                operations,
+                lww_oracle: None,
+                sparse_ranges: Some(summary),
+            })
+        }
     }
 }
 
@@ -3279,9 +3407,78 @@ fn run_mounted_chaos_operations(
 
 fn seed_mounted_chaos_initial_tree(writer: &ClientSpec) -> Result<(), ScenarioError> {
     for &(path, payload) in MOUNTED_CHAOS_INITIAL_TREE {
-        write_parented(writer.mount_point.join(path), payload)?;
+        write_mounted_initial_file(
+            writer.mount_point.join(path),
+            payload,
+            "mounted chaos initial tree",
+        )?;
     }
     Ok(())
+}
+
+fn write_mounted_initial_file(
+    path: PathBuf,
+    payload: &[u8],
+    label: &str,
+) -> Result<(), ScenarioError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut options = mounted_write_barrier_open_options();
+    let mut file = options.create_new(true).open(&path)?;
+    file.write_all(payload)?;
+    file.sync_all()?;
+    drop(file);
+    let readback = wait_for_mounted_payload_readback(
+        &path,
+        payload,
+        MOUNTED_WRITE_READBACK_TIMEOUT,
+        MOUNTED_WRITE_READBACK_POLL_INTERVAL,
+    )?;
+    if readback != payload {
+        return Err(ScenarioError::Io(io::Error::other(format!(
+            "{label} write readback mismatch for {}: expected {} bytes, read {} bytes",
+            path.display(),
+            payload.len(),
+            readback.len()
+        ))));
+    }
+    Ok(())
+}
+
+fn wait_for_mounted_payload_readback(
+    path: &Path,
+    payload: &[u8],
+    timeout: Duration,
+    poll_interval: Duration,
+) -> Result<Vec<u8>, ScenarioError> {
+    let deadline = Instant::now() + timeout;
+    let mut last_readback = Vec::new();
+    loop {
+        match fs::read(path) {
+            Ok(readback) if readback == payload => return Ok(readback),
+            Ok(readback) => last_readback = readback,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        if Instant::now() >= deadline {
+            return Ok(last_readback);
+        }
+        thread::sleep(poll_interval.max(Duration::from_millis(1)));
+    }
+}
+
+fn mounted_write_barrier_open_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options.write(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_FLAG_WRITE_THROUGH: u32 = 0x8000_0000;
+        options.custom_flags(FILE_FLAG_WRITE_THROUGH);
+    }
+    options
 }
 
 fn wait_for_mounted_chaos_initial_tree(
@@ -3293,9 +3490,9 @@ fn wait_for_mounted_chaos_initial_tree(
     let deadline = Instant::now() + timeout;
     let required_paths = MOUNTED_CHAOS_INITIAL_TREE
         .iter()
-        .map(|(path, _)| *path)
+        .map(|(path, payload)| (*path, *payload))
         .collect::<Vec<_>>();
-    wait_for_required_paths_visible_until(
+    wait_for_mounted_initial_payloads_until(
         clients,
         &required_paths,
         deadline,
@@ -3803,13 +4000,15 @@ fn run_open_handle_operations(
 
 fn seed_open_handle_initial_tree(clients: &[ClientSpec]) -> Result<(), ScenarioError> {
     let seed_mount = &clients[0].mount_point;
-    write_parented(
+    write_mounted_initial_file(
         seed_mount.join(OPEN_HANDLE_UNLINK_TARGET),
         OPEN_HANDLE_UNLINK_TARGET_PAYLOAD,
+        "open handle initial tree",
     )?;
-    write_parented(
+    write_mounted_initial_file(
         seed_mount.join(OPEN_HANDLE_RENAME_SOURCE),
         OPEN_HANDLE_RENAME_SOURCE_PAYLOAD,
+        "open handle initial tree",
     )?;
     Ok(())
 }
@@ -3821,9 +4020,12 @@ fn wait_for_open_handle_initial_tree(
     poll_interval: Duration,
 ) -> Result<ConvergenceOutcome, ScenarioError> {
     let deadline = Instant::now() + timeout;
-    wait_for_required_paths_visible_until(
+    wait_for_mounted_initial_payloads_until(
         clients,
-        &[OPEN_HANDLE_UNLINK_TARGET, OPEN_HANDLE_RENAME_SOURCE],
+        &[
+            (OPEN_HANDLE_UNLINK_TARGET, OPEN_HANDLE_UNLINK_TARGET_PAYLOAD),
+            (OPEN_HANDLE_RENAME_SOURCE, OPEN_HANDLE_RENAME_SOURCE_PAYLOAD),
+        ],
         deadline,
         poll_interval,
         "open handle initial tree",
@@ -3840,6 +4042,94 @@ fn wait_for_open_handle_initial_tree(
         poll_interval,
     )
     .map_err(ScenarioError::from)
+}
+
+fn wait_for_mounted_initial_payloads_until(
+    clients: &[ClientSpec],
+    required_payloads: &[(&str, &[u8])],
+    deadline: Instant,
+    poll_interval: Duration,
+    label: &str,
+) -> Result<(), ScenarioError> {
+    loop {
+        let last_missing = missing_mounted_initial_payloads(clients, required_payloads);
+        if last_missing.is_empty() {
+            return Ok(());
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(ScenarioError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "{label} did not become visible before timeout; missing: {}",
+                    last_missing.join(", ")
+                ),
+            )));
+        }
+        thread::sleep(poll_interval.min(deadline.saturating_duration_since(now)));
+    }
+}
+
+fn missing_mounted_initial_payloads(
+    clients: &[ClientSpec],
+    required_payloads: &[(&str, &[u8])],
+) -> Vec<String> {
+    let mut missing = Vec::new();
+    for client in clients {
+        for (relative_path, expected_payload) in required_payloads {
+            let path = client.mount_point.join(relative_path);
+            refresh_parent_directory(&path);
+            match fs::read(&path) {
+                Ok(payload) if payload == *expected_payload => {}
+                Ok(payload) => missing.push(format!(
+                    "{}:{relative_path} (expected {} bytes, read {} bytes)",
+                    client.name,
+                    expected_payload.len(),
+                    payload.len()
+                )),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    missing.push(format!("{}:{relative_path}", client.name));
+                }
+                Err(error) => {
+                    missing.push(format!("{}:{relative_path} ({error})", client.name));
+                }
+            }
+        }
+    }
+    missing
+}
+
+fn refresh_parent_directory(path: &Path) {
+    if let Some(parent) = path.parent() {
+        let _ = drain_directory(parent);
+    }
+}
+
+fn refresh_relative_path_ancestors(mount_point: &Path, relative_path: &str) {
+    let mut current = mount_point.to_path_buf();
+    let _ = drain_directory(&current);
+    let relative = Path::new(relative_path);
+    if let Some(parent) = relative.parent() {
+        for component in parent.components() {
+            current.push(component.as_os_str());
+            if !drain_directory(&current) {
+                break;
+            }
+        }
+    }
+}
+
+fn drain_directory(path: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(path) else {
+        return false;
+    };
+    for entry in entries {
+        if entry.is_err() {
+            return false;
+        }
+    }
+    true
 }
 
 fn wait_for_required_paths_visible_until(
@@ -3910,6 +4200,7 @@ fn finish_advanced_mounted(
     clients: &[ClientSpec],
     operations: Vec<NamespaceCollisionOperation>,
     lww_oracle: Option<LwwReconnectOracle>,
+    sparse_ranges: Option<SparseRangeSummary>,
 ) -> Result<AdvancedMountedSummary, ScenarioError> {
     let mounts = clients
         .iter()
@@ -3942,6 +4233,7 @@ fn finish_advanced_mounted(
         final_validator: convergence.comparison,
         namespace_violations,
         lww_oracle,
+        sparse_ranges,
     };
     write_advanced_mounted_summary(context, kind, &summary)?;
     Ok(summary)
@@ -4002,6 +4294,15 @@ fn planned_advanced_mounted_operations(
                 "open-handles/unlink-target.txt",
             ),
         ],
+        AdvancedMountedKind::SparseRange => vec![
+            ("client-a", "write_range", "sparse/shared.bin@0"),
+            ("client-a", "write_range", "sparse/shared.bin@1048569"),
+            ("client-b", "read_probe", "sparse/shared.bin@65536"),
+            ("client-b", "truncate_shrink", "sparse/shared.bin@1048833"),
+            ("client-c", "truncate_extend", "sparse/shared.bin@3146061"),
+            ("client-c", "write_range", "sparse/shared.bin@2097147"),
+            ("client-a", "read_probe", "sparse/shared.bin@3145900"),
+        ],
     };
     spec.into_iter()
         .enumerate()
@@ -4017,6 +4318,538 @@ fn planned_advanced_mounted_operations(
             },
         )
         .collect()
+}
+
+struct SparseRangeSpec {
+    label: &'static str,
+    offset: u64,
+    payload: &'static [u8],
+}
+
+struct SparseHoleSpec {
+    offset: u64,
+    len: usize,
+}
+
+fn sparse_expected_range_specs() -> &'static [SparseRangeSpec] {
+    &[
+        SparseRangeSpec {
+            label: "prefix",
+            offset: 0,
+            payload: SPARSE_PREFIX_PAYLOAD,
+        },
+        SparseRangeSpec {
+            label: "first_chunk_boundary",
+            offset: SPARSE_FIRST_BOUNDARY_OFFSET,
+            payload: SPARSE_FIRST_BOUNDARY_PAYLOAD,
+        },
+        SparseRangeSpec {
+            label: "second_chunk_boundary",
+            offset: SPARSE_SECOND_BOUNDARY_OFFSET,
+            payload: SPARSE_SECOND_BOUNDARY_PAYLOAD,
+        },
+        SparseRangeSpec {
+            label: "final_tail",
+            offset: SPARSE_FINAL_TAIL_OFFSET,
+            payload: SPARSE_FINAL_TAIL_PAYLOAD,
+        },
+    ]
+}
+
+fn sparse_hole_specs() -> &'static [SparseHoleSpec] {
+    &[
+        SparseHoleSpec {
+            offset: 65_536,
+            len: 4_096,
+        },
+        SparseHoleSpec {
+            offset: 1_572_864,
+            len: 4_096,
+        },
+    ]
+}
+
+fn run_sparse_range_operations(
+    context: &ScenarioContext,
+    clients: &[ClientSpec],
+    timeout: Duration,
+    poll_interval: Duration,
+) -> Result<(Vec<NamespaceCollisionOperation>, SparseRangeSummary), ScenarioError> {
+    let started = Instant::now();
+    let writer = &clients[0];
+    let reader = &clients[1];
+    let extender = &clients[2];
+    let mut operations = Vec::new();
+
+    record_sparse_operation(
+        context,
+        &mut operations,
+        required_op(
+            started,
+            1,
+            writer,
+            "write_range",
+            "sparse/shared.bin@0",
+            write_sparse_file_range(
+                writer.mount_point.join(SPARSE_FILE_PATH),
+                0,
+                SPARSE_PREFIX_PAYLOAD,
+                true,
+            )
+            .map_err(ScenarioError::from),
+        )?,
+    )?;
+    record_sparse_operation(
+        context,
+        &mut operations,
+        required_op(
+            started,
+            2,
+            writer,
+            "write_range",
+            "sparse/shared.bin@1048569",
+            write_sparse_file_range(
+                writer.mount_point.join(SPARSE_FILE_PATH),
+                SPARSE_FIRST_BOUNDARY_OFFSET,
+                SPARSE_FIRST_BOUNDARY_PAYLOAD,
+                false,
+            )
+            .map_err(ScenarioError::from),
+        )?,
+    )?;
+    record_sparse_operation(
+        context,
+        &mut operations,
+        required_op(
+            started,
+            3,
+            writer,
+            "truncate_extend",
+            "sparse/shared.bin@2097275",
+            truncate_sparse_file(
+                writer.mount_point.join(SPARSE_FILE_PATH),
+                SPARSE_INITIAL_LOGICAL_SIZE,
+            )
+            .map_err(ScenarioError::from),
+        )?,
+    )?;
+    wait_for_sparse_expected_until(
+        clients,
+        SPARSE_INITIAL_LOGICAL_SIZE,
+        &sparse_expected_range_specs()[..2],
+        &[],
+        Instant::now() + timeout,
+        poll_interval,
+        "initial sparse ranges",
+    )?;
+
+    record_sparse_operation(
+        context,
+        &mut operations,
+        required_op(
+            started,
+            4,
+            reader,
+            "read_probe",
+            "sparse/shared.bin@65536",
+            verify_sparse_hole(reader.mount_point.join(SPARSE_FILE_PATH), 65_536, 4_096),
+        )?,
+    )?;
+    record_sparse_operation(
+        context,
+        &mut operations,
+        required_op(
+            started,
+            5,
+            reader,
+            "truncate_shrink",
+            "sparse/shared.bin@1048833",
+            truncate_sparse_file(
+                reader.mount_point.join(SPARSE_FILE_PATH),
+                SPARSE_SHRUNK_LOGICAL_SIZE,
+            )
+            .map_err(ScenarioError::from),
+        )?,
+    )?;
+    wait_for_sparse_expected_until(
+        clients,
+        SPARSE_SHRUNK_LOGICAL_SIZE,
+        &sparse_expected_range_specs()[..2],
+        &[],
+        Instant::now() + timeout,
+        poll_interval,
+        "shrunk sparse ranges",
+    )?;
+
+    record_sparse_operation(
+        context,
+        &mut operations,
+        required_op(
+            started,
+            6,
+            extender,
+            "truncate_extend",
+            "sparse/shared.bin@3146061",
+            truncate_sparse_file(
+                extender.mount_point.join(SPARSE_FILE_PATH),
+                SPARSE_FINAL_LOGICAL_SIZE,
+            )
+            .map_err(ScenarioError::from),
+        )?,
+    )?;
+    record_sparse_operation(
+        context,
+        &mut operations,
+        required_op(
+            started,
+            7,
+            extender,
+            "write_range",
+            "sparse/shared.bin@2097147",
+            write_sparse_file_range(
+                extender.mount_point.join(SPARSE_FILE_PATH),
+                SPARSE_SECOND_BOUNDARY_OFFSET,
+                SPARSE_SECOND_BOUNDARY_PAYLOAD,
+                false,
+            )
+            .map_err(ScenarioError::from),
+        )?,
+    )?;
+    record_sparse_operation(
+        context,
+        &mut operations,
+        required_op(
+            started,
+            8,
+            writer,
+            "write_range",
+            "sparse/shared.bin@3145900",
+            write_sparse_file_range(
+                writer.mount_point.join(SPARSE_FILE_PATH),
+                SPARSE_FINAL_TAIL_OFFSET,
+                SPARSE_FINAL_TAIL_PAYLOAD,
+                false,
+            )
+            .map_err(ScenarioError::from),
+        )?,
+    )?;
+
+    let (read_probes, zero_filled_holes) = wait_for_sparse_expected_until(
+        clients,
+        SPARSE_FINAL_LOGICAL_SIZE,
+        sparse_expected_range_specs(),
+        sparse_hole_specs(),
+        Instant::now() + timeout,
+        poll_interval,
+        "final sparse ranges",
+    )?;
+    record_sparse_operation(
+        context,
+        &mut operations,
+        required_op(
+            started,
+            9,
+            writer,
+            "read_probe",
+            "sparse/shared.bin@3145900",
+            verify_sparse_range(
+                writer.mount_point.join(SPARSE_FILE_PATH),
+                SPARSE_FINAL_TAIL_OFFSET,
+                SPARSE_FINAL_TAIL_PAYLOAD,
+            ),
+        )?,
+    )?;
+
+    let final_payload = fs::read(writer.mount_point.join(SPARSE_FILE_PATH))?;
+    let expected_payload = expected_sparse_payload();
+    if final_payload != expected_payload {
+        return Err(ScenarioError::Io(io::Error::other(format!(
+            "sparse final payload mismatch: expected checksum {}, got {}",
+            bytes_sha256(&expected_payload),
+            bytes_sha256(&final_payload)
+        ))));
+    }
+
+    let summary = SparseRangeSummary {
+        relative_path: SPARSE_FILE_PATH.to_string(),
+        logical_size: SPARSE_FINAL_LOGICAL_SIZE,
+        final_checksum_sha256: bytes_sha256(&final_payload),
+        expected_byte_ranges: sparse_expected_ranges(),
+        zero_filled_holes,
+        read_probes,
+    };
+    Ok((operations, summary))
+}
+
+fn wait_for_sparse_expected_until(
+    clients: &[ClientSpec],
+    logical_size: u64,
+    expected_ranges: &[SparseRangeSpec],
+    hole_specs: &[SparseHoleSpec],
+    deadline: Instant,
+    poll_interval: Duration,
+    label: &str,
+) -> Result<(Vec<SparseReadProbe>, Vec<SparseHoleProbe>), ScenarioError> {
+    loop {
+        let observation = observe_sparse_ranges(clients, logical_size, expected_ranges, hole_specs);
+        if observation.missing.is_empty() {
+            return Ok((observation.read_probes, observation.zero_filled_holes));
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(ScenarioError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "{label} did not become visible before timeout; missing: {}",
+                    observation.missing.join(", ")
+                ),
+            )));
+        }
+        thread::sleep(poll_interval.min(deadline.saturating_duration_since(now)));
+    }
+}
+
+struct SparseObservation {
+    read_probes: Vec<SparseReadProbe>,
+    zero_filled_holes: Vec<SparseHoleProbe>,
+    missing: Vec<String>,
+}
+
+fn observe_sparse_ranges(
+    clients: &[ClientSpec],
+    logical_size: u64,
+    expected_ranges: &[SparseRangeSpec],
+    hole_specs: &[SparseHoleSpec],
+) -> SparseObservation {
+    let mut read_probes = Vec::new();
+    let mut hole_results = Vec::new();
+    let mut missing = Vec::new();
+
+    for client in clients {
+        let path = client.mount_point.join(SPARSE_FILE_PATH);
+        refresh_relative_path_ancestors(&client.mount_point, SPARSE_FILE_PATH);
+        match fs::metadata(&path) {
+            Ok(metadata) if metadata.len() == logical_size => {}
+            Ok(metadata) => missing.push(format!(
+                "{}:{SPARSE_FILE_PATH} logical size expected {logical_size}, got {}",
+                client.name,
+                metadata.len()
+            )),
+            Err(error) => {
+                missing.push(format!("{}:{SPARSE_FILE_PATH} ({error})", client.name));
+                continue;
+            }
+        }
+
+        let mut file = match fs::File::open(&path) {
+            Ok(file) => file,
+            Err(error) => {
+                missing.push(format!("{}:{SPARSE_FILE_PATH} ({error})", client.name));
+                continue;
+            }
+        };
+
+        for range in expected_ranges {
+            match read_exact_range_from(&mut file, range.offset, range.payload.len()) {
+                Ok(bytes) => {
+                    let matched = bytes == range.payload;
+                    if !matched {
+                        missing.push(format!(
+                            "{}:{SPARSE_FILE_PATH}@{} expected {}, got {}",
+                            client.name,
+                            range.offset,
+                            bytes_sha256(range.payload),
+                            bytes_sha256(&bytes)
+                        ));
+                    }
+                    read_probes.push(SparseReadProbe {
+                        client: client.name.clone(),
+                        offset: range.offset,
+                        len: range.payload.len(),
+                        actual_checksum_sha256: bytes_sha256(&bytes),
+                        matched,
+                    });
+                }
+                Err(error) => missing.push(format!(
+                    "{}:{SPARSE_FILE_PATH}@{} ({error})",
+                    client.name, range.offset
+                )),
+            }
+        }
+
+        for hole in hole_specs {
+            match read_exact_range_from(&mut file, hole.offset, hole.len) {
+                Ok(bytes) => {
+                    let all_zero = bytes.iter().all(|byte| *byte == 0);
+                    if !all_zero {
+                        missing.push(format!(
+                            "{}:{SPARSE_FILE_PATH}@{} expected zero-filled hole",
+                            client.name, hole.offset
+                        ));
+                    }
+                    hole_results.push(SparseHoleProbe {
+                        client: client.name.clone(),
+                        offset: hole.offset,
+                        len: hole.len,
+                        all_zero,
+                    });
+                }
+                Err(error) => missing.push(format!(
+                    "{}:{SPARSE_FILE_PATH}@{} ({error})",
+                    client.name, hole.offset
+                )),
+            }
+        }
+    }
+
+    SparseObservation {
+        read_probes,
+        zero_filled_holes: hole_results,
+        missing,
+    }
+}
+
+fn write_sparse_file_range(
+    path: PathBuf,
+    offset: u64,
+    payload: &[u8],
+    create: bool,
+) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut options = mounted_write_barrier_open_options();
+    let mut file = options.create(create).read(true).open(path)?;
+    file.seek(SeekFrom::Start(offset))?;
+    file.write_all(payload)?;
+    file.sync_all()
+}
+
+fn truncate_sparse_file(path: PathBuf, len: u64) -> io::Result<()> {
+    let options = mounted_write_barrier_open_options();
+    let file = options.open(path)?;
+    file.set_len(len)?;
+    file.sync_all()
+}
+
+fn verify_sparse_range(path: PathBuf, offset: u64, payload: &[u8]) -> Result<(), ScenarioError> {
+    let actual = read_exact_range(&path, offset, payload.len())?;
+    if actual == payload {
+        Ok(())
+    } else {
+        Err(ScenarioError::Io(io::Error::other(format!(
+            "sparse range mismatch for {}@{offset}: expected {}, got {}",
+            path.display(),
+            bytes_sha256(payload),
+            bytes_sha256(&actual)
+        ))))
+    }
+}
+
+fn verify_sparse_hole(path: PathBuf, offset: u64, len: usize) -> Result<(), ScenarioError> {
+    let actual = read_exact_range(&path, offset, len)?;
+    if actual.iter().all(|byte| *byte == 0) {
+        Ok(())
+    } else {
+        Err(ScenarioError::Io(io::Error::other(format!(
+            "sparse hole mismatch for {}@{offset}: expected {len} zero bytes",
+            path.display()
+        ))))
+    }
+}
+
+fn read_exact_range(path: &Path, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+    let mut file = fs::File::open(path)?;
+    read_exact_range_from(&mut file, offset, len)
+}
+
+fn read_exact_range_from(file: &mut fs::File, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+    file.seek(SeekFrom::Start(offset))?;
+    let mut buffer = vec![0; len];
+    file.read_exact(&mut buffer)?;
+    Ok(buffer)
+}
+
+fn expected_sparse_payload() -> Vec<u8> {
+    let mut payload = vec![0; SPARSE_FINAL_LOGICAL_SIZE as usize];
+    for range in sparse_expected_range_specs() {
+        let start = range.offset as usize;
+        let end = start + range.payload.len();
+        payload[start..end].copy_from_slice(range.payload);
+    }
+    payload
+}
+
+fn sparse_expected_ranges() -> Vec<SparseExpectedRange> {
+    sparse_expected_range_specs()
+        .iter()
+        .map(|range| SparseExpectedRange {
+            label: range.label.to_string(),
+            offset: range.offset,
+            len: range.payload.len(),
+            expected_checksum_sha256: bytes_sha256(range.payload),
+        })
+        .collect()
+}
+
+fn sparse_hole_summaries(
+    clients: &[&str],
+    hole_specs: &[SparseHoleSpec],
+    all_zero: bool,
+) -> Vec<SparseHoleProbe> {
+    clients
+        .iter()
+        .flat_map(|client| {
+            hole_specs.iter().map(move |hole| SparseHoleProbe {
+                client: (*client).to_string(),
+                offset: hole.offset,
+                len: hole.len,
+                all_zero,
+            })
+        })
+        .collect()
+}
+
+fn planned_sparse_range_summary() -> SparseRangeSummary {
+    let expected_payload = expected_sparse_payload();
+    SparseRangeSummary {
+        relative_path: SPARSE_FILE_PATH.to_string(),
+        logical_size: SPARSE_FINAL_LOGICAL_SIZE,
+        final_checksum_sha256: bytes_sha256(&expected_payload),
+        expected_byte_ranges: sparse_expected_ranges(),
+        zero_filled_holes: sparse_hole_summaries(
+            ADVANCED_MOUNTED_CLIENT_NAMES,
+            sparse_hole_specs(),
+            true,
+        ),
+        read_probes: ADVANCED_MOUNTED_CLIENT_NAMES
+            .iter()
+            .flat_map(|client| {
+                sparse_expected_range_specs()
+                    .iter()
+                    .map(move |range| SparseReadProbe {
+                        client: (*client).to_string(),
+                        offset: range.offset,
+                        len: range.payload.len(),
+                        actual_checksum_sha256: bytes_sha256(range.payload),
+                        matched: true,
+                    })
+            })
+            .collect(),
+    }
+}
+
+fn sparse_ranges_match(kind: AdvancedMountedKind, summary: Option<&SparseRangeSummary>) -> bool {
+    match (kind, summary) {
+        (AdvancedMountedKind::SparseRange, Some(summary)) => {
+            summary.logical_size == SPARSE_FINAL_LOGICAL_SIZE
+                && summary.read_probes.iter().all(|probe| probe.matched)
+                && summary.zero_filled_holes.iter().all(|hole| hole.all_zero)
+        }
+        (AdvancedMountedKind::SparseRange, None) => false,
+        (_, _) => true,
+    }
 }
 
 fn fs_op(
@@ -5073,6 +5906,125 @@ mod tests {
             err.to_string()
                 .contains("mounted chaos initial tree did not become visible")
         );
+    }
+
+    #[test]
+    fn mounted_chaos_initial_seed_rejects_stale_zero_byte_file() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let writer = client_spec_for(
+            &sandbox,
+            "projectfs",
+            "client-a",
+            temp.path().join("mounts").join("client-a"),
+        );
+        let stale_path = writer.mount_point.join("chaos/rename-source.txt");
+        std::fs::create_dir_all(stale_path.parent().unwrap()).unwrap();
+        std::fs::write(&stale_path, []).unwrap();
+
+        let err = seed_mounted_chaos_initial_tree(&writer).unwrap_err();
+
+        assert!(
+            matches!(&err, ScenarioError::Io(error) if error.kind() == io::ErrorKind::AlreadyExists),
+            "expected stale warmup file to be rejected before convergence validation, got {err:?}"
+        );
+        assert_eq!(
+            std::fs::read(&stale_path).unwrap(),
+            Vec::<u8>::new(),
+            "stale warmup files must not be overwritten in place"
+        );
+    }
+
+    #[test]
+    fn mounted_initial_payload_barrier_rejects_wrong_peer_payload() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let clients = ADVANCED_MOUNTED_CLIENT_NAMES
+            .iter()
+            .copied()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(&mount).unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let required_payloads = [("seed/file.txt", b"expected payload\n".as_slice())];
+        write_mounted_initial_file(
+            clients[0].mount_point.join("seed/file.txt"),
+            b"expected payload\n",
+            "test initial tree",
+        )
+        .unwrap();
+        write_mounted_initial_file(
+            clients[1].mount_point.join("seed/file.txt"),
+            b"wrong payload\n",
+            "test initial tree",
+        )
+        .unwrap();
+
+        let err = wait_for_mounted_initial_payloads_until(
+            &clients,
+            &required_payloads,
+            Instant::now() + Duration::from_millis(25),
+            Duration::from_millis(5),
+            "test initial tree",
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, ScenarioError::Io(_)));
+        assert!(
+            err.to_string()
+                .contains("client-b:seed/file.txt (expected 17 bytes, read 14 bytes)")
+        );
+    }
+
+    #[test]
+    fn open_handle_initial_seed_rejects_stale_zero_byte_file() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let writer = client_spec_for(
+            &sandbox,
+            "projectfs",
+            "client-a",
+            temp.path().join("mounts").join("client-a"),
+        );
+        let stale_path = writer.mount_point.join(OPEN_HANDLE_RENAME_SOURCE);
+        std::fs::create_dir_all(stale_path.parent().unwrap()).unwrap();
+        std::fs::write(&stale_path, []).unwrap();
+
+        let err = seed_open_handle_initial_tree(&[writer]).unwrap_err();
+
+        assert!(
+            matches!(&err, ScenarioError::Io(error) if error.kind() == io::ErrorKind::AlreadyExists),
+            "expected stale open-handle seed file to be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn mounted_chaos_initial_readback_waits_for_delayed_visibility() {
+        let temp = tempdir().unwrap();
+        let file_path = temp.path().join("chaos").join("delayed.txt");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(&file_path, b"").unwrap();
+        let payload = b"delayed mounted readback\n".to_vec();
+        let writer_path = file_path.clone();
+        let writer_payload = payload.clone();
+
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(40));
+            std::fs::write(writer_path, writer_payload).unwrap();
+        });
+
+        let readback = wait_for_mounted_payload_readback(
+            &file_path,
+            &payload,
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+        )
+        .unwrap();
+        writer.join().unwrap();
+
+        assert_eq!(readback, payload);
     }
 
     #[test]

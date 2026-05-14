@@ -140,6 +140,7 @@ cargo run -p studiofs-e2e -- run --scenario 1-8 --studiofs-bin target\debug\stud
 cargo run -p studiofs-e2e -- run --scenario 2,5,10 --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run mounted-chaos-convergence --seed 360 --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run mounted-lww-reconnect-chaos-convergence --seed 360 --studiofs-bin target\debug\studiofs.exe
+cargo run -p studiofs-e2e -- run mounted-sparse-file-range-convergence --seed 377 --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run rustfs-outage-multi-client-recovery --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run mounted-client-crash-restart-recovery --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run collision-rename-vs-unlink --studiofs-bin target\debug\studiofs.exe
@@ -172,6 +173,12 @@ rename/rename, rename/unlink, unlink/append, overwrite/read, mkdir/rmdir/create,
 and readdir/stat while mutations are in flight. The overwrite/read scenario
 records repeated read loops during the overwrite. Each collision run writes `operations.ndjson`,
 `namespace-collision-summary.json`, and `validation.json`.
+
+`mounted-sparse-file-range-convergence` is a deliberate post-1-16 promotion
+scenario. It uses a bounded sparse file, validates zero-filled holes,
+shrink/extend truncation, chunk-boundary writes, range read probes, logical
+size, and final checksums through mounted reads, and writes `operations.ndjson`,
+`sparse-range-summary.json`, and `validation.json`.
 
 Hosted Linux real mounted E2E is available as a manual RWX workflow:
 

@@ -35,6 +35,7 @@ const RUNNER_CRATE: &str = "studiofs-e2e";
 const RUNNER_MARKER_FILE: &str = ".studiofs-e2e-runner.json";
 const PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const POST_SCENARIO_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_SCENARIO_CHILD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 #[cfg(windows)]
 const HOST_ENVIRONMENT_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const ANSI_RESET: &str = "\x1b[0m";
@@ -780,8 +781,14 @@ fn scenario_child_command(input: &SupervisedScenarioInput<'_>) -> Result<Command
             ("STUDIOFS_E2E_STREAM_OUTPUT".to_string(), "1".to_string()),
         ],
         cwd: None,
-        timeout: input.request_timeout.and_then(parse_timeout_duration),
+        timeout: Some(scenario_child_timeout(input.request_timeout)),
     })
+}
+
+fn scenario_child_timeout(request_timeout: Option<&str>) -> Duration {
+    request_timeout
+        .and_then(parse_timeout_duration)
+        .unwrap_or(DEFAULT_SCENARIO_CHILD_TIMEOUT)
 }
 
 fn infra_cli_value(infra: InfraMode) -> &'static str {
@@ -3339,6 +3346,47 @@ plain child stderr\n",
                     .as_str()
                     .unwrap()
                     .ends_with(SCENARIO_CHILD_REPORT_FILE))
+        );
+    }
+
+    #[test]
+    fn multi_scenario_run_bounds_supervised_children_without_user_timeout() {
+        let temp = tempfile::tempdir().unwrap();
+        let executor = RecordingExecutor::default();
+
+        let outcome = run_with_executor(
+            RunRequest {
+                root: temp.path().join("e2e-runs"),
+                run_id: Some("default-supervised-timeout-run".to_string()),
+                scenarios: vec![
+                    scenario::TEST_PASSING.to_string(),
+                    scenario::TEST_PASSING.to_string(),
+                ],
+                seed: 410,
+                studiofs_bin: None,
+                platform: PlatformSelection::Auto,
+                retention: RetentionPolicy::Always,
+                report: None,
+                port_range: None,
+                timeout: None,
+                infra: InfraMode::Disabled,
+            },
+            &executor,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.status, RunStatus::Passed);
+        let calls = executor.calls.borrow();
+        let child_calls = calls
+            .iter()
+            .filter(|call| call.args.contains(&"run-one".to_string()))
+            .collect::<Vec<_>>();
+        assert_eq!(child_calls.len(), 2);
+        assert!(
+            child_calls
+                .iter()
+                .all(|call| call.timeout == Some(DEFAULT_SCENARIO_CHILD_TIMEOUT)),
+            "supervised children must always be bounded by the parent runner"
         );
     }
 
