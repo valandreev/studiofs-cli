@@ -2975,14 +2975,14 @@ impl PgMetaEngine {
             .collect()
     }
 
-    fn reconcile_regular_file_serving_from_base_when_unconflicted(
+    fn reconcile_regular_file_serving_from_base_with_overlay(
         &self,
         inodes: &HashSet<Ino>,
+        overlay: &OverlayConflictSets,
     ) -> MetaResult<bool> {
         if inodes.is_empty() {
             return Ok(false);
         }
-        let overlay = self.local_overlay_conflicts()?;
         let mut ready_inodes = HashSet::new();
         for ino in inodes {
             if overlay.attr_inodes.contains(ino) || overlay.block_inodes.contains(ino) {
@@ -3469,10 +3469,10 @@ impl PgMetaEngine {
         let mut reconcile_inodes = HashSet::new();
         let empty_protected_base_inodes = HashSet::new();
         for batch in batches {
+            Self::collect_replay_reconcile_inodes(&mut reconcile_inodes, &batch.events);
             if batch.is_self_batch {
                 applied_any |= self.apply_visible_self_batch(&batch.events)?;
                 self.acknowledge_local_prefix_from_self_batch(&batch.events)?;
-                Self::collect_replay_reconcile_inodes(&mut reconcile_inodes, &batch.events);
             } else {
                 let effective_overlay = if let Some(recent_flush) = recent_flush {
                     if batch.batch_version < recent_flush.batch_version {
@@ -3493,7 +3493,6 @@ impl PgMetaEngine {
                     &effective_overlay,
                     protected_base_inodes,
                 )?;
-                Self::collect_replay_reconcile_inodes(&mut reconcile_inodes, &batch.events);
                 if batch.events.iter().any(MetaEvent::is_namespace_mutation) {
                     max_namespace_version = max_namespace_version.max(batch.batch_version);
                 }
@@ -3501,8 +3500,8 @@ impl PgMetaEngine {
             max_version = batch.batch_version;
             overlay = self.local_overlay_conflicts()?;
         }
-        applied_any |=
-            self.reconcile_regular_file_serving_from_base_when_unconflicted(&reconcile_inodes)?;
+        applied_any |= self
+            .reconcile_regular_file_serving_from_base_with_overlay(&reconcile_inodes, &overlay)?;
         self.persist_local_version(max_version)?;
         if max_namespace_version > self.namespace_version.load(Ordering::SeqCst) {
             self.persist_namespace_version(max_namespace_version)?;
