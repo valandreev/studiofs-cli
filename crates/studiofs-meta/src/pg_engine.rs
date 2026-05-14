@@ -153,6 +153,12 @@ struct RecentFlush {
     overlay: OverlayConflictSets,
 }
 
+struct DecodedReplayBatch {
+    batch_version: i64,
+    events: Vec<MetaEvent>,
+    is_self_batch: bool,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MetadataSyncSource {
     Manual,
@@ -2969,14 +2975,14 @@ impl PgMetaEngine {
             .collect()
     }
 
-    fn reconcile_regular_file_serving_from_base_when_unconflicted(
+    fn reconcile_regular_file_serving_from_base_with_overlay(
         &self,
         inodes: &HashSet<Ino>,
+        overlay: &OverlayConflictSets,
     ) -> MetaResult<bool> {
         if inodes.is_empty() {
             return Ok(false);
         }
-        let overlay = self.local_overlay_conflicts()?;
         let mut ready_inodes = HashSet::new();
         for ino in inodes {
             if overlay.attr_inodes.contains(ino) || overlay.block_inodes.contains(ino) {
@@ -2989,6 +2995,10 @@ impl PgMetaEngine {
         }
         self.local
             .reconcile_regular_file_serving_from_base(&ready_inodes)
+    }
+
+    fn collect_replay_reconcile_inodes(candidates: &mut HashSet<Ino>, batch_events: &[MetaEvent]) {
+        candidates.extend(Self::regular_file_serving_reconcile_inodes(batch_events));
     }
 
     fn apply_visible_self_batch(&self, batch_events: &[MetaEvent]) -> MetaResult<bool> {
@@ -3427,24 +3437,45 @@ impl PgMetaEngine {
             return Ok(false);
         }
 
+        let mut batches = Vec::new();
+        let mut idx = 0;
+        while idx < rows.len() {
+            let (batch_version, next_idx, events, is_self_batch) =
+                Self::decode_foreign_batch(&rows, idx, client_id)?;
+            idx = next_idx;
+            batches.push(DecodedReplayBatch {
+                batch_version,
+                events,
+                is_self_batch,
+            });
+        }
+        self.apply_decoded_foreign_batches_locked(batches, recent_flush, last_seq)
+    }
+
+    fn apply_decoded_foreign_batches_locked(
+        &self,
+        batches: Vec<DecodedReplayBatch>,
+        recent_flush: Option<&RecentFlush>,
+        last_seq: i64,
+    ) -> MetaResult<bool> {
+        if batches.is_empty() {
+            return Ok(false);
+        }
+
         let mut overlay = self.local_overlay_conflicts()?;
         let mut applied_any = false;
         let mut max_version = last_seq;
         let mut max_namespace_version = self.namespace_version.load(Ordering::SeqCst);
-        let mut idx = 0;
+        let mut reconcile_inodes = HashSet::new();
         let empty_protected_base_inodes = HashSet::new();
-        while idx < rows.len() {
-            let (batch_version, next_idx, batch_events, is_self_batch) =
-                Self::decode_foreign_batch(&rows, idx, client_id)?;
-            idx = next_idx;
-
-            if is_self_batch {
-                applied_any |= self.apply_visible_self_batch(&batch_events)?;
-                self.acknowledge_local_prefix_from_self_batch(&batch_events)?;
+        for batch in batches {
+            Self::collect_replay_reconcile_inodes(&mut reconcile_inodes, &batch.events);
+            if batch.is_self_batch {
+                applied_any |= self.apply_visible_self_batch(&batch.events)?;
+                self.acknowledge_local_prefix_from_self_batch(&batch.events)?;
             } else {
-                let reconcile_inodes = Self::regular_file_serving_reconcile_inodes(&batch_events);
                 let effective_overlay = if let Some(recent_flush) = recent_flush {
-                    if batch_version < recent_flush.batch_version {
+                    if batch.batch_version < recent_flush.batch_version {
                         Self::merge_overlay_conflicts(&overlay, &recent_flush.overlay)
                     } else {
                         overlay.clone()
@@ -3458,20 +3489,19 @@ impl PgMetaEngine {
                     &empty_protected_base_inodes
                 };
                 applied_any |= self.apply_foreign_batch(
-                    &batch_events,
+                    &batch.events,
                     &effective_overlay,
                     protected_base_inodes,
                 )?;
-                applied_any |= self.reconcile_regular_file_serving_from_base_when_unconflicted(
-                    &reconcile_inodes,
-                )?;
-                if batch_events.iter().any(MetaEvent::is_namespace_mutation) {
-                    max_namespace_version = max_namespace_version.max(batch_version);
+                if batch.events.iter().any(MetaEvent::is_namespace_mutation) {
+                    max_namespace_version = max_namespace_version.max(batch.batch_version);
                 }
             }
-            max_version = batch_version;
+            max_version = batch.batch_version;
             overlay = self.local_overlay_conflicts()?;
         }
+        applied_any |= self
+            .reconcile_regular_file_serving_from_base_with_overlay(&reconcile_inodes, &overlay)?;
         self.persist_local_version(max_version)?;
         if max_namespace_version > self.namespace_version.load(Ordering::SeqCst) {
             self.persist_namespace_version(max_namespace_version)?;
@@ -5648,6 +5678,65 @@ mod tests {
             vec![local_payload.object_id],
             "unflushed local payload must remain visible over a conflicting remote publish"
         );
+    }
+
+    #[test]
+    fn decoded_replay_coalesces_regular_file_serving_reconciliation() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+
+        let first = create_published_small_file(&pg, ROOT_INO, b"first.bin", 77_023);
+        let second = create_published_small_file(&pg, ROOT_INO, b"second.bin", 77_024);
+        let setup_end = pg.local.get_counter("nextEventSeq").expect("setup end");
+        pg.persist_flushed_event_seq(setup_end)
+            .expect("ack published setup");
+
+        let mut first_remote = pg.get_attr(first.ino).expect("first attr");
+        first_remote.size = 128;
+        first_remote.committed_size = 128;
+        first_remote.content_epoch = 2;
+        first_remote.committed_content_epoch = 2;
+        first_remote.mtime = first_remote.mtime.saturating_add(1);
+        first_remote.ctime = first_remote.ctime.saturating_add(1);
+
+        let mut second_remote = pg.get_attr(second.ino).expect("second attr");
+        second_remote.size = 256;
+        second_remote.committed_size = 256;
+        second_remote.content_epoch = 2;
+        second_remote.committed_content_epoch = 2;
+        second_remote.mtime = second_remote.mtime.saturating_add(1);
+        second_remote.ctime = second_remote.ctime.saturating_add(1);
+
+        RedbMetaEngine::reset_regular_file_serving_reconcile_call_count_for_test();
+        let changed = pg
+            .apply_decoded_foreign_batches_locked(
+                vec![
+                    DecodedReplayBatch {
+                        batch_version: 1,
+                        events: vec![MetaEvent::SetAttr { attr: first_remote }],
+                        is_self_batch: false,
+                    },
+                    DecodedReplayBatch {
+                        batch_version: 2,
+                        events: vec![MetaEvent::SetAttr {
+                            attr: second_remote,
+                        }],
+                        is_self_batch: false,
+                    },
+                ],
+                None,
+                0,
+            )
+            .expect("apply decoded replay batches");
+
+        assert!(changed, "replay should report applied metadata changes");
+        assert_eq!(
+            RedbMetaEngine::regular_file_serving_reconcile_call_count_for_test(),
+            1,
+            "regular-file serving reconciliation should be coalesced for the replay pass"
+        );
+        assert_eq!(pg.local_version.load(Ordering::SeqCst), 2);
+        assert_eq!(pg.get_attr(first.ino).expect("first after").size, 128);
+        assert_eq!(pg.get_attr(second.ino).expect("second after").size, 256);
     }
 
     #[test]

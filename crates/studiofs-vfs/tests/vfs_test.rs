@@ -771,6 +771,14 @@ fn make_format_info_with_endpoint(volume_suffix: &str, endpoint: &str) -> Format
 
 /// Create a fresh VFS instance backed by a temporary redb and S3-compatible storage.
 fn make_vfs(tmp: &tempfile::TempDir, volume_suffix: &str) -> Arc<StudioVfs> {
+    make_vfs_with_config(tmp, volume_suffix, test_vfs_config_from_env())
+}
+
+fn make_vfs_with_config(
+    tmp: &tempfile::TempDir,
+    volume_suffix: &str,
+    vfs_config: VfsConfigValidated,
+) -> Arc<StudioVfs> {
     let db_path = tmp.path().join("meta.redb");
 
     let meta = Arc::new(RedbMetaEngine::open(&db_path).expect("failed to open RedbMetaEngine"));
@@ -794,7 +802,7 @@ fn make_vfs(tmp: &tempfile::TempDir, volume_suffix: &str) -> Arc<StudioVfs> {
         cache_dir_str,
         cache_size,
         512 * 1024 * 1024,
-        test_vfs_config_from_env(),
+        vfs_config,
     )
     .expect("failed to create StudioVfs");
     vfs.start()
@@ -8497,7 +8505,13 @@ async fn test_object_key_format() {
 async fn test_sequential_write_performance() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
-    let vfs = make_vfs(&tmp, "perf");
+    let vfs = make_vfs_with_config(
+        &tmp,
+        "perf",
+        VfsConfigRaw::default()
+            .validate()
+            .expect("default VFS config should validate"),
+    );
 
     let attr = vfs.create(1, b"perf.bin", 0, 0, 0o644).unwrap();
     let ino = attr.ino;
@@ -8511,7 +8525,11 @@ async fn test_sequential_write_performance() {
     for i in 0..(size / block_size) {
         let offset = (i * block_size) as u64;
         let payload: Vec<u8> = (0..block_size).map(|j| ((i + j) % 256) as u8).collect();
-        vfs.write(ino, offset, &payload).await.unwrap();
+        let written = vfs.write(ino, offset, &payload).await.unwrap();
+        assert_eq!(
+            written as usize, block_size,
+            "write {i} at offset {offset} accepted the wrong byte count"
+        );
     }
 
     let write_duration = start.elapsed();
@@ -8527,6 +8545,11 @@ async fn test_sequential_write_performance() {
     vfs.flush(ino).await.unwrap();
     let flush_duration = flush_start.elapsed();
     println!("Flush: {:?}", flush_duration);
+    let flushed_attr = vfs.getattr(ino).unwrap();
+    assert_eq!(
+        flushed_attr.size, size as u64,
+        "flush must leave the full sequential write size visible"
+    );
 
     // Read back
     let read_start = std::time::Instant::now();

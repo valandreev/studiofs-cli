@@ -1,6 +1,23 @@
 use super::*;
+#[cfg(test)]
+use std::cell::Cell;
+
+#[cfg(test)]
+thread_local! {
+    static REGULAR_FILE_SERVING_RECONCILE_CALLS: Cell<usize> = const { Cell::new(0) };
+}
 
 impl RedbMetaEngine {
+    #[cfg(test)]
+    pub(crate) fn reset_regular_file_serving_reconcile_call_count_for_test() {
+        REGULAR_FILE_SERVING_RECONCILE_CALLS.set(0);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn regular_file_serving_reconcile_call_count_for_test() -> usize {
+        REGULAR_FILE_SERVING_RECONCILE_CALLS.get()
+    }
+
     fn remove_dentry_mirrors_for_inode_in_txn(
         txn: &redb::WriteTransaction,
         ino: Ino,
@@ -962,6 +979,9 @@ impl RedbMetaEngine {
         if inodes.is_empty() {
             return Ok(false);
         }
+        #[cfg(test)]
+        REGULAR_FILE_SERVING_RECONCILE_CALLS
+            .set(REGULAR_FILE_SERVING_RECONCILE_CALLS.get().saturating_add(1));
 
         let txn = self
             .db
