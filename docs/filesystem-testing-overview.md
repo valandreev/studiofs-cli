@@ -79,7 +79,9 @@ scenarios 1-16.
 
 `studiofs-e2e list` currently exposes these mounted scenarios in this order.
 The same numbers are used by `run --scenario`, so `--scenario 1-8` runs the
-baseline gate set and `--scenario 12-16` runs the deeper mounted scenario group.
+baseline gate set and `--scenario 12-16` runs the accepted deeper mounted
+scenario group. New promotion scenarios append after those 16 entries instead
+of replacing or renumbering them.
 
 ### 1. Basic Multi-Client Smoke
 
@@ -182,6 +184,17 @@ be visible, and the final mounted tree must converge.
 This tests filesystem behavior that users commonly hit through editors,
 renderers, and other long-running processes.
 
+### 17. Sparse-File Range Convergence
+
+This scenario creates a bounded sparse file through public mounts, writes byte
+ranges around chunk boundaries, verifies zero-filled holes with range reads,
+shrinks and extends the logical size, then validates final checksums through
+mounted reads.
+
+This is the real mounted promotion of the deterministic sparse-range backstop.
+It is not part of the accepted 1-16 baseline and should be run deliberately
+when validating sparse-file behavior.
+
 ## What The Baseline Gate Means
 
 `local-first-baseline-gate` reruns scenarios 1 through 8 as the accepted
@@ -198,7 +211,8 @@ bridge behavior, or a specific bug fix.
 A passing mounted sweep means the current implementation survived the selected
 real-mount scenarios: basic sharing, service outages, crash/restart,
 publication boundaries, focused namespace collisions, seeded chaos, hot-spot
-churn, fault chaos, LWW reconnect, and open-handle behavior.
+churn, fault chaos, LWW reconnect, open-handle behavior, and any appended
+promotion scenarios selected for that run.
 
 It does not mean the filesystem is perfect. It means the current safety net is
 working and gives us a strong baseline before we add deeper scenarios.
