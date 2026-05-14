@@ -2828,6 +2828,51 @@ fn bytes_sha256(bytes: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScenarioIsolation {
+    root: String,
+    payload_marker: String,
+}
+
+impl ScenarioIsolation {
+    fn for_advanced(
+        context: &ScenarioContext,
+        kind: AdvancedMountedKind,
+        volume_name: &str,
+    ) -> Self {
+        let marker_input = format!(
+            "{}:{}:{}:{}",
+            context.run_id,
+            context.seed,
+            kind.name(),
+            volume_name
+        );
+        let marker_hash = bytes_sha256(marker_input.as_bytes());
+        let nonce = &marker_hash[..16];
+        Self {
+            root: format!("{}-{nonce}", kind.path_root()),
+            payload_marker: format!("studiofs-e2e:{marker_input}:{nonce}"),
+        }
+    }
+
+    fn path(&self, relative_path: &str) -> String {
+        let relative_path = relative_path.trim_matches('/');
+        if relative_path.is_empty() {
+            self.root.clone()
+        } else {
+            format!("{}/{}", self.root, relative_path)
+        }
+    }
+
+    fn payload(&self, label: &str, logical_path: &str, body: &str) -> Vec<u8> {
+        format!(
+            "{}\nlabel={label}\npath={logical_path}\n{body}",
+            self.payload_marker
+        )
+        .into_bytes()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AdvancedMountedKind {
     PublicationBoundaryCrashMatrix,
@@ -2864,6 +2909,18 @@ impl AdvancedMountedKind {
         }
     }
 
+    fn path_root(self) -> &'static str {
+        match self {
+            Self::PublicationBoundaryCrashMatrix => "publication-boundary",
+            Self::MountedChaos => "chaos",
+            Self::HotspotChurn => "hotspot",
+            Self::FaultChaos => "fault-chaos",
+            Self::LwwReconnectChaos => "lww-chaos",
+            Self::OpenHandle => "open-handles",
+            Self::SparseRange => "sparse",
+        }
+    }
+
     fn summary_file(self) -> &'static str {
         match self {
             Self::PublicationBoundaryCrashMatrix => "publication-boundary-summary.json",
@@ -2889,13 +2946,6 @@ impl AdvancedMountedKind {
             Self::FaultChaos => FAULT_CHAOS_CONVERGENCE_TIMEOUT,
             Self::LwwReconnectChaos => LWW_RECONNECT_CONVERGENCE_TIMEOUT,
             _ => ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT,
-        }
-    }
-
-    fn expected_absent_paths(self) -> &'static [&'static str] {
-        match self {
-            Self::OpenHandle => &["open-handles/unlink-target.txt"],
-            _ => &[],
         }
     }
 }
@@ -3101,13 +3151,16 @@ fn run_advanced_mounted_body(
         });
     }
 
-    let execution = execute_advanced_mounted_operations(context, kind, controller, &clients)?;
+    let isolation = ScenarioIsolation::for_advanced(context, kind, &bootstrap.volume_name);
+    let execution =
+        execute_advanced_mounted_operations(context, kind, controller, &clients, &isolation)?;
     if kind != AdvancedMountedKind::SparseRange {
         write_namespace_collision_operations(context, &execution.operations)?;
     }
     let summary = finish_advanced_mounted(
         context,
         kind,
+        Some(&isolation),
         Some(bootstrap),
         &clients,
         execution.operations,
@@ -3168,10 +3221,11 @@ fn execute_advanced_mounted_operations(
     kind: AdvancedMountedKind,
     controller: &mut MultiClientController<SystemClientProcessExecutor>,
     clients: &[ClientSpec],
+    isolation: &ScenarioIsolation,
 ) -> Result<AdvancedMountedExecution, ScenarioError> {
     match kind {
         AdvancedMountedKind::PublicationBoundaryCrashMatrix => Ok(AdvancedMountedExecution {
-            operations: run_publication_boundary_operations(controller, clients)?,
+            operations: run_publication_boundary_operations(controller, clients, isolation)?,
             lww_oracle: None,
             sparse_ranges: None,
         }),
@@ -3179,6 +3233,7 @@ fn execute_advanced_mounted_operations(
             operations: run_mounted_chaos_operations(
                 context,
                 clients,
+                isolation,
                 ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT,
                 ADVANCED_MOUNTED_CONVERGENCE_POLL_INTERVAL,
             )?,
@@ -3189,6 +3244,7 @@ fn execute_advanced_mounted_operations(
             operations: run_hotspot_churn_operations(
                 context,
                 clients,
+                isolation,
                 ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT,
                 ADVANCED_MOUNTED_CONVERGENCE_POLL_INTERVAL,
             )?,
@@ -3196,12 +3252,13 @@ fn execute_advanced_mounted_operations(
             sparse_ranges: None,
         }),
         AdvancedMountedKind::FaultChaos => Ok(AdvancedMountedExecution {
-            operations: run_fault_chaos_operations(context, controller, clients)?,
+            operations: run_fault_chaos_operations(context, controller, clients, isolation)?,
             lww_oracle: None,
             sparse_ranges: None,
         }),
         AdvancedMountedKind::LwwReconnectChaos => {
-            let (operations, oracle) = run_lww_reconnect_operations(context, controller, clients)?;
+            let (operations, oracle) =
+                run_lww_reconnect_operations(context, controller, clients, isolation)?;
             Ok(AdvancedMountedExecution {
                 operations,
                 lww_oracle: Some(oracle),
@@ -3212,6 +3269,7 @@ fn execute_advanced_mounted_operations(
             operations: run_open_handle_operations(
                 context,
                 clients,
+                isolation,
                 ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT,
                 ADVANCED_MOUNTED_CONVERGENCE_POLL_INTERVAL,
             )?,
@@ -3222,6 +3280,7 @@ fn execute_advanced_mounted_operations(
             let (operations, summary) = run_sparse_range_operations(
                 context,
                 clients,
+                isolation,
                 ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT,
                 ADVANCED_MOUNTED_CONVERGENCE_POLL_INTERVAL,
             )?;
@@ -3237,27 +3296,33 @@ fn execute_advanced_mounted_operations(
 fn run_publication_boundary_operations(
     controller: &mut MultiClientController<SystemClientProcessExecutor>,
     clients: &[ClientSpec],
+    isolation: &ScenarioIsolation,
 ) -> Result<Vec<NamespaceCollisionOperation>, ScenarioError> {
     let started = Instant::now();
     let writer = &clients[0];
     let mut operations = Vec::new();
-    for (index, (boundary, path)) in [
-        ("flush", "publication-boundary/flush.txt"),
-        ("fsync", "publication-boundary/fsync.txt"),
-        ("release_close", "publication-boundary/release-close.txt"),
-        ("shutdown_drain", "publication-boundary/shutdown-drain.txt"),
+    for (index, (boundary, file_name)) in [
+        ("flush", "flush.txt"),
+        ("fsync", "fsync.txt"),
+        ("release_close", "release-close.txt"),
+        ("shutdown_drain", "shutdown-drain.txt"),
     ]
     .into_iter()
     .enumerate()
     {
-        let payload = format!("publication boundary {boundary}\n").into_bytes();
+        let path = isolation.path(file_name);
+        let payload = isolation.payload(
+            boundary,
+            &path,
+            &format!("publication boundary {boundary}\n"),
+        );
         operations.push(required_record(record_advanced_operation(
             started,
             operations.len() + 1,
             writer,
             boundary,
-            path,
-            write_boundary_payload(writer.mount_point.join(path), &payload, boundary)
+            &path,
+            write_boundary_payload(writer.mount_point.join(&path), &payload, boundary)
                 .map_err(|error| error.to_string()),
         ))?);
         operations.push(required_record(record_advanced_operation(
@@ -3265,7 +3330,7 @@ fn run_publication_boundary_operations(
             operations.len() + 1,
             writer,
             "force_kill",
-            path,
+            &path,
             controller
                 .force_kill(&writer.name)
                 .map_err(|error| error.to_string()),
@@ -3275,18 +3340,18 @@ fn run_publication_boundary_operations(
             operations.len() + 1,
             writer,
             "remount",
-            path,
+            &path,
             controller
                 .remount(&writer.name)
                 .map_err(|error| error.to_string()),
         ))?);
-        let recovered = fs::read(writer.mount_point.join(path)).map_err(|error| error.to_string());
+        let recovered = fs::read(writer.mount_point.join(&path)).map_err(|error| error.to_string());
         operations.push(required_record(record_advanced_operation(
             started,
             index + 100,
             writer,
             "readback",
-            path,
+            &path,
             recovered.and_then(|bytes| {
                 if bytes == payload {
                     Ok(())
@@ -3324,20 +3389,23 @@ fn write_boundary_payload(path: PathBuf, payload: &[u8], boundary: &str) -> io::
 fn run_mounted_chaos_operations(
     context: &ScenarioContext,
     clients: &[ClientSpec],
+    isolation: &ScenarioIsolation,
     initial_convergence_timeout: Duration,
     poll_interval: Duration,
 ) -> Result<Vec<NamespaceCollisionOperation>, ScenarioError> {
     let started = Instant::now();
     let mut operations = Vec::new();
     let writer = &clients[0];
-    seed_mounted_chaos_initial_tree(writer)?;
+    seed_mounted_chaos_initial_tree(writer, isolation)?;
     wait_for_mounted_chaos_initial_tree(
         context,
         clients,
+        isolation,
         initial_convergence_timeout,
         poll_interval,
     )?;
     for &(path, _) in MOUNTED_CHAOS_INITIAL_TREE {
+        let path = isolation.path(path.strip_prefix("chaos/").unwrap_or(path));
         let path = writer.mount_point.join(path);
         if !path.exists() {
             return Err(ScenarioError::Io(io::Error::new(
@@ -3354,11 +3422,15 @@ fn run_mounted_chaos_operations(
         1,
         &clients[0],
         "rename",
-        "chaos/rename-source.txt",
+        &isolation.path("rename-source.txt"),
         || {
             fs::rename(
-                clients[0].mount_point.join("chaos/rename-source.txt"),
-                clients[0].mount_point.join("chaos/renamed-by-a.txt"),
+                clients[0]
+                    .mount_point
+                    .join(isolation.path("rename-source.txt")),
+                clients[0]
+                    .mount_point
+                    .join(isolation.path("renamed-by-a.txt")),
             )
         },
     ));
@@ -3367,19 +3439,27 @@ fn run_mounted_chaos_operations(
         2,
         &clients[1],
         "unlink",
-        "chaos/unlink-target.txt",
-        || fs::remove_file(clients[1].mount_point.join("chaos/unlink-target.txt")),
+        &isolation.path("unlink-target.txt"),
+        || {
+            fs::remove_file(
+                clients[1]
+                    .mount_point
+                    .join(isolation.path("unlink-target.txt")),
+            )
+        },
     ));
     operations.push(fs_op(
         started,
         3,
         &clients[2],
         "append",
-        "chaos/append-target.txt",
+        &isolation.path("append-target.txt"),
         || {
             append_payload(
-                clients[2].mount_point.join("chaos/append-target.txt"),
-                b"appended by chaos\n",
+                clients[2]
+                    .mount_point
+                    .join(isolation.path("append-target.txt")),
+                &isolation.payload("append", "append-target.txt", "appended by chaos\n"),
             )
         },
     ));
@@ -3388,28 +3468,47 @@ fn run_mounted_chaos_operations(
         4,
         &clients[0],
         "overwrite",
-        "chaos/read-target.txt",
+        &isolation.path("read-target.txt"),
         || {
             fs::write(
-                clients[0].mount_point.join("chaos/read-target.txt"),
-                COLLISION_NEW_COMMITTED_PAYLOAD,
+                clients[0]
+                    .mount_point
+                    .join(isolation.path("read-target.txt")),
+                isolation.payload("overwrite", "read-target.txt", "new committed payload\n"),
             )
         },
     ));
-    operations.push(fs_op(started, 5, &clients[1], "mkdir", "chaos/dir", || {
-        fs::create_dir_all(clients[1].mount_point.join("chaos/dir"))
-    }));
-    operations.push(fs_op(started, 6, &clients[2], "readdir", "chaos", || {
-        fs::read_dir(clients[2].mount_point.join("chaos")).map(|_| ())
-    }));
+    operations.push(fs_op(
+        started,
+        5,
+        &clients[1],
+        "mkdir",
+        &isolation.path("dir"),
+        || fs::create_dir_all(clients[1].mount_point.join(isolation.path("dir"))),
+    ));
+    operations.push(fs_op(
+        started,
+        6,
+        &clients[2],
+        "readdir",
+        &isolation.root,
+        || fs::read_dir(clients[2].mount_point.join(&isolation.root)).map(|_| ()),
+    ));
     Ok(operations)
 }
 
-fn seed_mounted_chaos_initial_tree(writer: &ClientSpec) -> Result<(), ScenarioError> {
+fn seed_mounted_chaos_initial_tree(
+    writer: &ClientSpec,
+    isolation: &ScenarioIsolation,
+) -> Result<(), ScenarioError> {
     for &(path, payload) in MOUNTED_CHAOS_INITIAL_TREE {
+        let logical_path = path.strip_prefix("chaos/").unwrap_or(path);
+        let mounted_path = isolation.path(logical_path);
+        let payload =
+            isolation.payload("initial", &mounted_path, &String::from_utf8_lossy(payload));
         write_mounted_initial_file(
-            writer.mount_point.join(path),
-            payload,
+            writer.mount_point.join(mounted_path),
+            &payload,
             "mounted chaos initial tree",
         )?;
     }
@@ -3484,13 +3583,24 @@ fn mounted_write_barrier_open_options() -> OpenOptions {
 fn wait_for_mounted_chaos_initial_tree(
     context: &ScenarioContext,
     clients: &[ClientSpec],
+    isolation: &ScenarioIsolation,
     timeout: Duration,
     poll_interval: Duration,
 ) -> Result<ConvergenceOutcome, ScenarioError> {
     let deadline = Instant::now() + timeout;
     let required_paths = MOUNTED_CHAOS_INITIAL_TREE
         .iter()
-        .map(|(path, payload)| (*path, *payload))
+        .map(|(path, payload)| {
+            let logical_path = path.strip_prefix("chaos/").unwrap_or(path);
+            let mounted_path = isolation.path(logical_path);
+            let payload =
+                isolation.payload("initial", &mounted_path, &String::from_utf8_lossy(payload));
+            (mounted_path, payload)
+        })
+        .collect::<Vec<_>>();
+    let required_paths = required_paths
+        .iter()
+        .map(|(path, payload)| (path.as_str(), payload.as_slice()))
         .collect::<Vec<_>>();
     wait_for_mounted_initial_payloads_until(
         clients,
@@ -3516,12 +3626,14 @@ fn wait_for_mounted_chaos_initial_tree(
 fn run_hotspot_churn_operations(
     context: &ScenarioContext,
     clients: &[ClientSpec],
+    isolation: &ScenarioIsolation,
     initial_convergence_timeout: Duration,
     poll_interval: Duration,
 ) -> Result<Vec<NamespaceCollisionOperation>, ScenarioError> {
     run_hotspot_churn_operations_with_timeout(
         context,
         clients,
+        isolation,
         HOTSPOT_CHURN_OPERATION_TIMEOUT,
         initial_convergence_timeout,
         poll_interval,
@@ -3531,6 +3643,7 @@ fn run_hotspot_churn_operations(
 fn run_hotspot_churn_operations_with_timeout(
     context: &ScenarioContext,
     clients: &[ClientSpec],
+    isolation: &ScenarioIsolation,
     operation_timeout: Duration,
     initial_convergence_timeout: Duration,
     poll_interval: Duration,
@@ -3540,14 +3653,28 @@ fn run_hotspot_churn_operations_with_timeout(
     let mkdir_client = clients[0].clone();
     run_timed_hotspot_io(
         operation_timeout,
-        format!("{} mkdir hotspot", mkdir_client.name),
-        move || fs::create_dir_all(mkdir_client.mount_point.join("hotspot")),
+        format!("{} mkdir {}", mkdir_client.name, isolation.root),
+        {
+            let root = isolation.root.clone();
+            move || fs::create_dir_all(mkdir_client.mount_point.join(root))
+        },
     )?;
-    wait_for_hotspot_initial_tree(context, clients, initial_convergence_timeout, poll_interval)?;
+    wait_for_hotspot_initial_tree(
+        context,
+        clients,
+        &isolation.root,
+        initial_convergence_timeout,
+        poll_interval,
+    )?;
     for round in 0..10 {
-        let slot = format!("hotspot/slot-{}.txt", round % 6);
-        let renamed = format!("hotspot/slot-{}-renamed.txt", round % 6);
+        let slot = isolation.path(&format!("slot-{}.txt", round % 6));
+        let renamed = isolation.path(&format!("slot-{}-renamed.txt", round % 6));
         let write_path = slot.clone();
+        let write_payload = isolation.payload(
+            "overwrite",
+            &write_path,
+            &format!("hotspot round {round}\n"),
+        );
         operations.push(timed_fs_op(
             started,
             operations.len() + 1,
@@ -3555,14 +3682,11 @@ fn run_hotspot_churn_operations_with_timeout(
             "overwrite",
             &slot,
             operation_timeout,
-            move |client| {
-                write_parented(
-                    client.mount_point.join(&write_path),
-                    format!("hotspot round {round}\n").as_bytes(),
-                )
-            },
+            move |client| write_parented(client.mount_point.join(&write_path), &write_payload),
         )?);
         let append_path = slot.clone();
+        let append_payload_bytes =
+            isolation.payload("append", &append_path, &format!("append round {round}\n"));
         operations.push(timed_fs_op(
             started,
             operations.len() + 1,
@@ -3571,10 +3695,7 @@ fn run_hotspot_churn_operations_with_timeout(
             &slot,
             operation_timeout,
             move |client| {
-                append_payload(
-                    client.mount_point.join(&append_path),
-                    format!("append round {round}\n").as_bytes(),
-                )
+                append_payload(client.mount_point.join(&append_path), &append_payload_bytes)
             },
         )?);
         let rename_source = slot.clone();
@@ -3598,9 +3719,12 @@ fn run_hotspot_churn_operations_with_timeout(
             operations.len() + 1,
             &clients[2],
             "readdir",
-            "hotspot",
+            &isolation.root,
             operation_timeout,
-            |client| fs::read_dir(client.mount_point.join("hotspot")).map(|_| ()),
+            {
+                let root = isolation.root.clone();
+                move |client| fs::read_dir(client.mount_point.join(root)).map(|_| ())
+            },
         )?);
     }
     Ok(operations)
@@ -3609,13 +3733,14 @@ fn run_hotspot_churn_operations_with_timeout(
 fn wait_for_hotspot_initial_tree(
     context: &ScenarioContext,
     clients: &[ClientSpec],
+    root: &str,
     timeout: Duration,
     poll_interval: Duration,
 ) -> Result<ConvergenceOutcome, ScenarioError> {
     let deadline = Instant::now() + timeout;
     wait_for_required_paths_visible_until(
         clients,
-        &["hotspot"],
+        &[root],
         deadline,
         poll_interval,
         "hotspot initial tree",
@@ -3747,11 +3872,13 @@ fn run_fault_chaos_operations(
     context: &ScenarioContext,
     controller: &mut MultiClientController<SystemClientProcessExecutor>,
     clients: &[ClientSpec],
+    isolation: &ScenarioIsolation,
 ) -> Result<Vec<NamespaceCollisionOperation>, ScenarioError> {
     let started = Instant::now();
     let mut operations = run_mounted_chaos_operations(
         context,
         &clients[..3],
+        isolation,
         ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT,
         ADVANCED_MOUNTED_CONVERGENCE_POLL_INTERVAL,
     )?;
@@ -3767,18 +3894,22 @@ fn run_fault_chaos_operations(
             .stop_service(POSTGRES_SERVICE_NAME, &executor)
             .map_err(ScenarioError::from),
     )?);
+    let postgres_outage_path = isolation.path("postgres-outage.txt");
+    let postgres_outage_payload = isolation.payload(
+        "postgres_outage",
+        &postgres_outage_path,
+        "accepted while postgres is down\n",
+    );
     operations.push(required_record(fs_op(
         started,
         operations.len() + 1,
         &clients[0],
         "local_write_during_pg_outage",
-        "fault-chaos/postgres-outage.txt",
+        &postgres_outage_path,
         || {
             write_parented(
-                clients[0]
-                    .mount_point
-                    .join("fault-chaos/postgres-outage.txt"),
-                b"accepted while postgres is down\n",
+                clients[0].mount_point.join(&postgres_outage_path),
+                &postgres_outage_payload,
             )
         },
     ))?);
@@ -3813,16 +3944,22 @@ fn run_fault_chaos_operations(
             .stop_service(RUSTFS_SERVICE_NAME, &executor)
             .map_err(ScenarioError::from),
     )?);
+    let rustfs_outage_path = isolation.path("rustfs-outage.txt");
+    let rustfs_outage_payload = isolation.payload(
+        "rustfs_outage",
+        &rustfs_outage_path,
+        "accepted while rustfs is down\n",
+    );
     operations.push(required_record(fs_op(
         started,
         operations.len() + 1,
         &clients[1],
         "local_write_during_s3_outage",
-        "fault-chaos/rustfs-outage.txt",
+        &rustfs_outage_path,
         || {
             write_parented(
-                clients[1].mount_point.join("fault-chaos/rustfs-outage.txt"),
-                b"accepted while rustfs is down\n",
+                clients[1].mount_point.join(&rustfs_outage_path),
+                &rustfs_outage_payload,
             )
         },
     ))?);
@@ -3841,8 +3978,8 @@ fn run_fault_chaos_operations(
         operations.len() + 1,
         &clients[3],
         "cold_observer_readdir",
-        "fault-chaos",
-        || fs::read_dir(clients[3].mount_point.join("fault-chaos")).map(|_| ()),
+        &isolation.root,
+        || fs::read_dir(clients[3].mount_point.join(&isolation.root)).map(|_| ()),
     ));
     Ok(operations)
 }
@@ -3851,22 +3988,19 @@ fn run_lww_reconnect_operations(
     context: &ScenarioContext,
     controller: &mut MultiClientController<SystemClientProcessExecutor>,
     clients: &[ClientSpec],
+    isolation: &ScenarioIsolation,
 ) -> Result<(Vec<NamespaceCollisionOperation>, LwwReconnectOracle), ScenarioError> {
     let started = Instant::now();
     let mut operations = Vec::new();
-    let path = "lww-chaos/winner.txt";
+    let path = isolation.path("winner.txt");
+    let client_a_payload = isolation.payload("write_client_a", &path, "version from client-a\n");
     operations.push(required_record(fs_op(
         started,
         1,
         &clients[0],
         "write",
-        path,
-        || {
-            write_parented(
-                clients[0].mount_point.join(path),
-                b"version from client-a\n",
-            )
-        },
+        &path,
+        || write_parented(clients[0].mount_point.join(&path), &client_a_payload),
     ))?);
     operations.push(required_op(
         started,
@@ -3878,31 +4012,23 @@ fn run_lww_reconnect_operations(
             .force_kill(&clients[2].name)
             .map_err(ScenarioError::from),
     )?);
+    let client_b_payload = isolation.payload("write_client_b", &path, "version from client-b\n");
     operations.push(required_record(fs_op(
         started,
         3,
         &clients[1],
         "write",
-        path,
-        || {
-            write_parented(
-                clients[1].mount_point.join(path),
-                b"version from client-b\n",
-            )
-        },
+        &path,
+        || write_parented(clients[1].mount_point.join(&path), &client_b_payload),
     ))?);
+    let client_d_payload = isolation.payload("write_client_d", &path, "version from client-d\n");
     operations.push(required_record(fs_op(
         started,
         4,
         &clients[3],
         "write",
-        path,
-        || {
-            write_parented(
-                clients[3].mount_point.join(path),
-                b"version from client-d\n",
-            )
-        },
+        &path,
+        || write_parented(clients[3].mount_point.join(&path), &client_d_payload),
     ))?);
     operations.push(required_op(
         started,
@@ -3914,14 +4040,18 @@ fn run_lww_reconnect_operations(
             .remount(&clients[2].name)
             .map_err(ScenarioError::from),
     )?);
-    let winner = b"explicit lww winner from reconnected client-c\n";
+    let winner = isolation.payload(
+        "write_lww_winner",
+        &path,
+        "explicit lww winner from reconnected client-c\n",
+    );
     operations.push(required_record(fs_op(
         started,
         6,
         &clients[2],
         "write_lww_winner",
-        path,
-        || write_parented(clients[2].mount_point.join(path), winner),
+        &path,
+        || write_parented(clients[2].mount_point.join(&path), &winner),
     ))?);
     operations.push(required_op(
         started,
@@ -3934,9 +4064,9 @@ fn run_lww_reconnect_operations(
             .and_then(|()| controller.remount(&clients[2].name))
             .map_err(ScenarioError::from),
     )?);
-    let actual = fs::read(clients[2].mount_point.join(path))?;
+    let actual = fs::read(clients[2].mount_point.join(&path))?;
     let oracle = LwwReconnectOracle {
-        expected_payload_sha256: bytes_sha256(winner),
+        expected_payload_sha256: bytes_sha256(&winner),
         actual_payload_sha256: bytes_sha256(&actual),
         matched: actual == winner,
     };
@@ -3947,50 +4077,60 @@ fn run_lww_reconnect_operations(
 fn run_open_handle_operations(
     context: &ScenarioContext,
     clients: &[ClientSpec],
+    isolation: &ScenarioIsolation,
     initial_convergence_timeout: Duration,
     poll_interval: Duration,
 ) -> Result<Vec<NamespaceCollisionOperation>, ScenarioError> {
     let started = Instant::now();
     let mut operations = Vec::new();
-    seed_open_handle_initial_tree(clients)?;
+    seed_open_handle_initial_tree(clients, isolation)?;
     wait_for_open_handle_initial_tree(
         context,
         clients,
+        isolation,
         initial_convergence_timeout,
         poll_interval,
     )?;
+    let unlink_target = open_handle_isolated_path(isolation, OPEN_HANDLE_UNLINK_TARGET);
+    let rename_source = open_handle_isolated_path(isolation, OPEN_HANDLE_RENAME_SOURCE);
+    let rename_dest = open_handle_isolated_path(isolation, OPEN_HANDLE_RENAME_DEST);
     let mut handle = OpenOptions::new()
         .append(true)
-        .open(clients[0].mount_point.join(OPEN_HANDLE_UNLINK_TARGET))?;
+        .open(clients[0].mount_point.join(&unlink_target))?;
     operations.push(fs_op(
         started,
         1,
         &clients[1],
         "unlink",
-        OPEN_HANDLE_UNLINK_TARGET,
-        || fs::remove_file(clients[1].mount_point.join(OPEN_HANDLE_UNLINK_TARGET)),
+        &unlink_target,
+        || fs::remove_file(clients[1].mount_point.join(&unlink_target)),
     ));
     operations.push(fs_op(
         started,
         2,
         &clients[1],
         "rename",
-        OPEN_HANDLE_RENAME_SOURCE,
+        &rename_source,
         || {
             fs::rename(
-                clients[1].mount_point.join(OPEN_HANDLE_RENAME_SOURCE),
-                clients[1].mount_point.join(OPEN_HANDLE_RENAME_DEST),
+                clients[1].mount_point.join(&rename_source),
+                clients[1].mount_point.join(&rename_dest),
             )
         },
     ));
+    let append_payload = isolation.payload(
+        "append_old_handle",
+        &unlink_target,
+        "append through old handle\n",
+    );
     operations.push(required_record(record_advanced_operation(
         started,
         3,
         &clients[0],
         "append_old_handle",
-        OPEN_HANDLE_UNLINK_TARGET,
+        &unlink_target,
         handle
-            .write_all(b"append through old handle\n")
+            .write_all(&append_payload)
             .and_then(|()| handle.sync_all())
             .map_err(|error| error.to_string()),
     ))?);
@@ -3998,16 +4138,31 @@ fn run_open_handle_operations(
     Ok(operations)
 }
 
-fn seed_open_handle_initial_tree(clients: &[ClientSpec]) -> Result<(), ScenarioError> {
+fn seed_open_handle_initial_tree(
+    clients: &[ClientSpec],
+    isolation: &ScenarioIsolation,
+) -> Result<(), ScenarioError> {
     let seed_mount = &clients[0].mount_point;
+    let unlink_target = open_handle_isolated_path(isolation, OPEN_HANDLE_UNLINK_TARGET);
+    let rename_source = open_handle_isolated_path(isolation, OPEN_HANDLE_RENAME_SOURCE);
+    let unlink_payload = isolation.payload(
+        "initial_unlink_target",
+        &unlink_target,
+        &String::from_utf8_lossy(OPEN_HANDLE_UNLINK_TARGET_PAYLOAD),
+    );
+    let rename_payload = isolation.payload(
+        "initial_rename_source",
+        &rename_source,
+        &String::from_utf8_lossy(OPEN_HANDLE_RENAME_SOURCE_PAYLOAD),
+    );
     write_mounted_initial_file(
-        seed_mount.join(OPEN_HANDLE_UNLINK_TARGET),
-        OPEN_HANDLE_UNLINK_TARGET_PAYLOAD,
+        seed_mount.join(unlink_target),
+        &unlink_payload,
         "open handle initial tree",
     )?;
     write_mounted_initial_file(
-        seed_mount.join(OPEN_HANDLE_RENAME_SOURCE),
-        OPEN_HANDLE_RENAME_SOURCE_PAYLOAD,
+        seed_mount.join(rename_source),
+        &rename_payload,
         "open handle initial tree",
     )?;
     Ok(())
@@ -4016,16 +4171,38 @@ fn seed_open_handle_initial_tree(clients: &[ClientSpec]) -> Result<(), ScenarioE
 fn wait_for_open_handle_initial_tree(
     context: &ScenarioContext,
     clients: &[ClientSpec],
+    isolation: &ScenarioIsolation,
     timeout: Duration,
     poll_interval: Duration,
 ) -> Result<ConvergenceOutcome, ScenarioError> {
     let deadline = Instant::now() + timeout;
+    let unlink_target = open_handle_isolated_path(isolation, OPEN_HANDLE_UNLINK_TARGET);
+    let rename_source = open_handle_isolated_path(isolation, OPEN_HANDLE_RENAME_SOURCE);
+    let required_payloads = [
+        (
+            unlink_target,
+            isolation.payload(
+                "initial_unlink_target",
+                &open_handle_isolated_path(isolation, OPEN_HANDLE_UNLINK_TARGET),
+                &String::from_utf8_lossy(OPEN_HANDLE_UNLINK_TARGET_PAYLOAD),
+            ),
+        ),
+        (
+            rename_source,
+            isolation.payload(
+                "initial_rename_source",
+                &open_handle_isolated_path(isolation, OPEN_HANDLE_RENAME_SOURCE),
+                &String::from_utf8_lossy(OPEN_HANDLE_RENAME_SOURCE_PAYLOAD),
+            ),
+        ),
+    ];
+    let required_payloads = required_payloads
+        .iter()
+        .map(|(path, payload)| (path.as_str(), payload.as_slice()))
+        .collect::<Vec<_>>();
     wait_for_mounted_initial_payloads_until(
         clients,
-        &[
-            (OPEN_HANDLE_UNLINK_TARGET, OPEN_HANDLE_UNLINK_TARGET_PAYLOAD),
-            (OPEN_HANDLE_RENAME_SOURCE, OPEN_HANDLE_RENAME_SOURCE_PAYLOAD),
-        ],
+        &required_payloads,
         deadline,
         poll_interval,
         "open handle initial tree",
@@ -4042,6 +4219,14 @@ fn wait_for_open_handle_initial_tree(
         poll_interval,
     )
     .map_err(ScenarioError::from)
+}
+
+fn open_handle_isolated_path(isolation: &ScenarioIsolation, legacy_path: &str) -> String {
+    isolation.path(
+        legacy_path
+            .strip_prefix("open-handles/")
+            .unwrap_or(legacy_path),
+    )
 }
 
 fn wait_for_mounted_initial_payloads_until(
@@ -4079,7 +4264,10 @@ fn missing_mounted_initial_payloads(
     for client in clients {
         for (relative_path, expected_payload) in required_payloads {
             let path = client.mount_point.join(relative_path);
-            refresh_parent_directory(&path);
+            if !refresh_relative_path_parent_contains_child(&client.mount_point, relative_path) {
+                missing.push(format!("{}:{relative_path}", client.name));
+                continue;
+            }
             match fs::read(&path) {
                 Ok(payload) if payload == *expected_payload => {}
                 Ok(payload) => missing.push(format!(
@@ -4100,10 +4288,43 @@ fn missing_mounted_initial_payloads(
     missing
 }
 
-fn refresh_parent_directory(path: &Path) {
-    if let Some(parent) = path.parent() {
-        let _ = drain_directory(parent);
+fn refresh_relative_path_parent_contains_child(mount_point: &Path, relative_path: &str) -> bool {
+    let relative = Path::new(relative_path);
+    let Some(file_name) = relative.file_name() else {
+        return true;
+    };
+    let mut current = mount_point.to_path_buf();
+    let _ = drain_directory(&current);
+    let Some(parent) = relative.parent() else {
+        return directory_contains_child(&current, file_name);
+    };
+    let mut components = parent.components().peekable();
+    while let Some(component) = components.next() {
+        current.push(component.as_os_str());
+        if components.peek().is_some() {
+            if !drain_directory(&current) {
+                return false;
+            }
+        } else {
+            return directory_contains_child(&current, file_name);
+        }
     }
+    directory_contains_child(&current, file_name)
+}
+
+fn directory_contains_child(parent: &Path, file_name: &std::ffi::OsStr) -> bool {
+    let Ok(entries) = fs::read_dir(parent) else {
+        return false;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        if entry.file_name() == file_name {
+            return true;
+        }
+    }
+    false
 }
 
 fn refresh_relative_path_ancestors(mount_point: &Path, relative_path: &str) {
@@ -4196,6 +4417,7 @@ fn missing_required_paths(clients: &[ClientSpec], required_paths: &[&str]) -> Ve
 fn finish_advanced_mounted(
     context: &ScenarioContext,
     kind: AdvancedMountedKind,
+    isolation: Option<&ScenarioIsolation>,
     bootstrap: Option<VolumeBootstrapSummary>,
     clients: &[ClientSpec],
     operations: Vec<NamespaceCollisionOperation>,
@@ -4212,11 +4434,16 @@ fn finish_advanced_mounted(
         kind.convergence_timeout(),
         ADVANCED_MOUNTED_CONVERGENCE_POLL_INTERVAL,
     )?;
+    let expected_absent_paths = expected_absent_paths_for(kind, isolation);
+    let expected_absent_paths = expected_absent_paths
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
     let mut namespace_violations = Vec::new();
     for snapshot in &convergence.snapshots {
         namespace_violations.extend(validate_namespace_invariants(
             snapshot,
-            kind.expected_absent_paths(),
+            &expected_absent_paths,
         ));
     }
     if !namespace_violations.is_empty() {
@@ -4237,6 +4464,22 @@ fn finish_advanced_mounted(
     };
     write_advanced_mounted_summary(context, kind, &summary)?;
     Ok(summary)
+}
+
+fn expected_absent_paths_for(
+    kind: AdvancedMountedKind,
+    isolation: Option<&ScenarioIsolation>,
+) -> Vec<String> {
+    match (kind, isolation) {
+        (AdvancedMountedKind::OpenHandle, Some(isolation)) => {
+            vec![open_handle_isolated_path(
+                isolation,
+                OPEN_HANDLE_UNLINK_TARGET,
+            )]
+        }
+        (AdvancedMountedKind::OpenHandle, None) => vec![OPEN_HANDLE_UNLINK_TARGET.to_string()],
+        _ => Vec::new(),
+    }
 }
 
 fn planned_advanced_mounted_operations(
@@ -4323,7 +4566,7 @@ fn planned_advanced_mounted_operations(
 struct SparseRangeSpec {
     label: &'static str,
     offset: u64,
-    payload: &'static [u8],
+    payload: Vec<u8>,
 }
 
 struct SparseHoleSpec {
@@ -4331,29 +4574,54 @@ struct SparseHoleSpec {
     len: usize,
 }
 
-fn sparse_expected_range_specs() -> &'static [SparseRangeSpec] {
-    &[
+fn sparse_expected_range_specs(
+    isolation: Option<(&ScenarioIsolation, &str)>,
+) -> Vec<SparseRangeSpec> {
+    [
         SparseRangeSpec {
             label: "prefix",
             offset: 0,
-            payload: SPARSE_PREFIX_PAYLOAD,
+            payload: sparse_range_payload(isolation, "prefix", SPARSE_PREFIX_PAYLOAD),
         },
         SparseRangeSpec {
             label: "first_chunk_boundary",
             offset: SPARSE_FIRST_BOUNDARY_OFFSET,
-            payload: SPARSE_FIRST_BOUNDARY_PAYLOAD,
+            payload: sparse_range_payload(
+                isolation,
+                "first_chunk_boundary",
+                SPARSE_FIRST_BOUNDARY_PAYLOAD,
+            ),
         },
         SparseRangeSpec {
             label: "second_chunk_boundary",
             offset: SPARSE_SECOND_BOUNDARY_OFFSET,
-            payload: SPARSE_SECOND_BOUNDARY_PAYLOAD,
+            payload: sparse_range_payload(
+                isolation,
+                "second_chunk_boundary",
+                SPARSE_SECOND_BOUNDARY_PAYLOAD,
+            ),
         },
         SparseRangeSpec {
             label: "final_tail",
             offset: SPARSE_FINAL_TAIL_OFFSET,
-            payload: SPARSE_FINAL_TAIL_PAYLOAD,
+            payload: sparse_range_payload(isolation, "final_tail", SPARSE_FINAL_TAIL_PAYLOAD),
         },
     ]
+    .into_iter()
+    .collect()
+}
+
+fn sparse_range_payload(
+    isolation: Option<(&ScenarioIsolation, &str)>,
+    label: &str,
+    payload: &[u8],
+) -> Vec<u8> {
+    match isolation {
+        Some((isolation, logical_path)) => {
+            isolation.payload(label, logical_path, &String::from_utf8_lossy(payload))
+        }
+        None => payload.to_vec(),
+    }
 }
 
 fn sparse_hole_specs() -> &'static [SparseHoleSpec] {
@@ -4372,6 +4640,7 @@ fn sparse_hole_specs() -> &'static [SparseHoleSpec] {
 fn run_sparse_range_operations(
     context: &ScenarioContext,
     clients: &[ClientSpec],
+    isolation: &ScenarioIsolation,
     timeout: Duration,
     poll_interval: Duration,
 ) -> Result<(Vec<NamespaceCollisionOperation>, SparseRangeSummary), ScenarioError> {
@@ -4380,6 +4649,12 @@ fn run_sparse_range_operations(
     let reader = &clients[1];
     let extender = &clients[2];
     let mut operations = Vec::new();
+    let sparse_path = isolation.path(
+        SPARSE_FILE_PATH
+            .strip_prefix("sparse/")
+            .unwrap_or(SPARSE_FILE_PATH),
+    );
+    let sparse_ranges = sparse_expected_range_specs(Some((isolation, &sparse_path)));
 
     record_sparse_operation(
         context,
@@ -4389,11 +4664,11 @@ fn run_sparse_range_operations(
             1,
             writer,
             "write_range",
-            "sparse/shared.bin@0",
+            &format!("{sparse_path}@0"),
             write_sparse_file_range(
-                writer.mount_point.join(SPARSE_FILE_PATH),
+                writer.mount_point.join(&sparse_path),
                 0,
-                SPARSE_PREFIX_PAYLOAD,
+                &sparse_ranges[0].payload,
                 true,
             )
             .map_err(ScenarioError::from),
@@ -4407,11 +4682,11 @@ fn run_sparse_range_operations(
             2,
             writer,
             "write_range",
-            "sparse/shared.bin@1048569",
+            &format!("{sparse_path}@1048569"),
             write_sparse_file_range(
-                writer.mount_point.join(SPARSE_FILE_PATH),
+                writer.mount_point.join(&sparse_path),
                 SPARSE_FIRST_BOUNDARY_OFFSET,
-                SPARSE_FIRST_BOUNDARY_PAYLOAD,
+                &sparse_ranges[1].payload,
                 false,
             )
             .map_err(ScenarioError::from),
@@ -4425,9 +4700,9 @@ fn run_sparse_range_operations(
             3,
             writer,
             "truncate_extend",
-            "sparse/shared.bin@2097275",
+            &format!("{sparse_path}@2097275"),
             truncate_sparse_file(
-                writer.mount_point.join(SPARSE_FILE_PATH),
+                writer.mount_point.join(&sparse_path),
                 SPARSE_INITIAL_LOGICAL_SIZE,
             )
             .map_err(ScenarioError::from),
@@ -4435,8 +4710,9 @@ fn run_sparse_range_operations(
     )?;
     wait_for_sparse_expected_until(
         clients,
+        &sparse_path,
         SPARSE_INITIAL_LOGICAL_SIZE,
-        &sparse_expected_range_specs()[..2],
+        &sparse_ranges[..2],
         &[],
         Instant::now() + timeout,
         poll_interval,
@@ -4451,8 +4727,8 @@ fn run_sparse_range_operations(
             4,
             reader,
             "read_probe",
-            "sparse/shared.bin@65536",
-            verify_sparse_hole(reader.mount_point.join(SPARSE_FILE_PATH), 65_536, 4_096),
+            &format!("{sparse_path}@65536"),
+            verify_sparse_hole(reader.mount_point.join(&sparse_path), 65_536, 4_096),
         )?,
     )?;
     record_sparse_operation(
@@ -4463,9 +4739,9 @@ fn run_sparse_range_operations(
             5,
             reader,
             "truncate_shrink",
-            "sparse/shared.bin@1048833",
+            &format!("{sparse_path}@1048833"),
             truncate_sparse_file(
-                reader.mount_point.join(SPARSE_FILE_PATH),
+                reader.mount_point.join(&sparse_path),
                 SPARSE_SHRUNK_LOGICAL_SIZE,
             )
             .map_err(ScenarioError::from),
@@ -4473,8 +4749,9 @@ fn run_sparse_range_operations(
     )?;
     wait_for_sparse_expected_until(
         clients,
+        &sparse_path,
         SPARSE_SHRUNK_LOGICAL_SIZE,
-        &sparse_expected_range_specs()[..2],
+        &sparse_ranges[..2],
         &[],
         Instant::now() + timeout,
         poll_interval,
@@ -4489,9 +4766,9 @@ fn run_sparse_range_operations(
             6,
             extender,
             "truncate_extend",
-            "sparse/shared.bin@3146061",
+            &format!("{sparse_path}@3146061"),
             truncate_sparse_file(
-                extender.mount_point.join(SPARSE_FILE_PATH),
+                extender.mount_point.join(&sparse_path),
                 SPARSE_FINAL_LOGICAL_SIZE,
             )
             .map_err(ScenarioError::from),
@@ -4505,11 +4782,11 @@ fn run_sparse_range_operations(
             7,
             extender,
             "write_range",
-            "sparse/shared.bin@2097147",
+            &format!("{sparse_path}@2097147"),
             write_sparse_file_range(
-                extender.mount_point.join(SPARSE_FILE_PATH),
+                extender.mount_point.join(&sparse_path),
                 SPARSE_SECOND_BOUNDARY_OFFSET,
-                SPARSE_SECOND_BOUNDARY_PAYLOAD,
+                &sparse_ranges[2].payload,
                 false,
             )
             .map_err(ScenarioError::from),
@@ -4523,11 +4800,11 @@ fn run_sparse_range_operations(
             8,
             writer,
             "write_range",
-            "sparse/shared.bin@3145900",
+            &format!("{sparse_path}@3145900"),
             write_sparse_file_range(
-                writer.mount_point.join(SPARSE_FILE_PATH),
+                writer.mount_point.join(&sparse_path),
                 SPARSE_FINAL_TAIL_OFFSET,
-                SPARSE_FINAL_TAIL_PAYLOAD,
+                &sparse_ranges[3].payload,
                 false,
             )
             .map_err(ScenarioError::from),
@@ -4536,8 +4813,9 @@ fn run_sparse_range_operations(
 
     let (read_probes, zero_filled_holes) = wait_for_sparse_expected_until(
         clients,
+        &sparse_path,
         SPARSE_FINAL_LOGICAL_SIZE,
-        sparse_expected_range_specs(),
+        &sparse_ranges,
         sparse_hole_specs(),
         Instant::now() + timeout,
         poll_interval,
@@ -4551,17 +4829,17 @@ fn run_sparse_range_operations(
             9,
             writer,
             "read_probe",
-            "sparse/shared.bin@3145900",
+            &format!("{sparse_path}@3145900"),
             verify_sparse_range(
-                writer.mount_point.join(SPARSE_FILE_PATH),
+                writer.mount_point.join(&sparse_path),
                 SPARSE_FINAL_TAIL_OFFSET,
-                SPARSE_FINAL_TAIL_PAYLOAD,
+                &sparse_ranges[3].payload,
             ),
         )?,
     )?;
 
-    let final_payload = fs::read(writer.mount_point.join(SPARSE_FILE_PATH))?;
-    let expected_payload = expected_sparse_payload();
+    let final_payload = fs::read(writer.mount_point.join(&sparse_path))?;
+    let expected_payload = expected_sparse_payload(&sparse_ranges);
     if final_payload != expected_payload {
         return Err(ScenarioError::Io(io::Error::other(format!(
             "sparse final payload mismatch: expected checksum {}, got {}",
@@ -4571,10 +4849,10 @@ fn run_sparse_range_operations(
     }
 
     let summary = SparseRangeSummary {
-        relative_path: SPARSE_FILE_PATH.to_string(),
+        relative_path: sparse_path,
         logical_size: SPARSE_FINAL_LOGICAL_SIZE,
         final_checksum_sha256: bytes_sha256(&final_payload),
-        expected_byte_ranges: sparse_expected_ranges(),
+        expected_byte_ranges: sparse_expected_ranges(&sparse_ranges),
         zero_filled_holes,
         read_probes,
     };
@@ -4583,6 +4861,7 @@ fn run_sparse_range_operations(
 
 fn wait_for_sparse_expected_until(
     clients: &[ClientSpec],
+    sparse_path: &str,
     logical_size: u64,
     expected_ranges: &[SparseRangeSpec],
     hole_specs: &[SparseHoleSpec],
@@ -4591,7 +4870,13 @@ fn wait_for_sparse_expected_until(
     label: &str,
 ) -> Result<(Vec<SparseReadProbe>, Vec<SparseHoleProbe>), ScenarioError> {
     loop {
-        let observation = observe_sparse_ranges(clients, logical_size, expected_ranges, hole_specs);
+        let observation = observe_sparse_ranges(
+            clients,
+            sparse_path,
+            logical_size,
+            expected_ranges,
+            hole_specs,
+        );
         if observation.missing.is_empty() {
             return Ok((observation.read_probes, observation.zero_filled_holes));
         }
@@ -4618,6 +4903,7 @@ struct SparseObservation {
 
 fn observe_sparse_ranges(
     clients: &[ClientSpec],
+    sparse_path: &str,
     logical_size: u64,
     expected_ranges: &[SparseRangeSpec],
     hole_specs: &[SparseHoleSpec],
@@ -4627,17 +4913,17 @@ fn observe_sparse_ranges(
     let mut missing = Vec::new();
 
     for client in clients {
-        let path = client.mount_point.join(SPARSE_FILE_PATH);
-        refresh_relative_path_ancestors(&client.mount_point, SPARSE_FILE_PATH);
+        let path = client.mount_point.join(sparse_path);
+        refresh_relative_path_ancestors(&client.mount_point, sparse_path);
         match fs::metadata(&path) {
             Ok(metadata) if metadata.len() == logical_size => {}
             Ok(metadata) => missing.push(format!(
-                "{}:{SPARSE_FILE_PATH} logical size expected {logical_size}, got {}",
+                "{}:{sparse_path} logical size expected {logical_size}, got {}",
                 client.name,
                 metadata.len()
             )),
             Err(error) => {
-                missing.push(format!("{}:{SPARSE_FILE_PATH} ({error})", client.name));
+                missing.push(format!("{}:{sparse_path} ({error})", client.name));
                 continue;
             }
         }
@@ -4645,7 +4931,7 @@ fn observe_sparse_ranges(
         let mut file = match fs::File::open(&path) {
             Ok(file) => file,
             Err(error) => {
-                missing.push(format!("{}:{SPARSE_FILE_PATH} ({error})", client.name));
+                missing.push(format!("{}:{sparse_path} ({error})", client.name));
                 continue;
             }
         };
@@ -4653,13 +4939,13 @@ fn observe_sparse_ranges(
         for range in expected_ranges {
             match read_exact_range_from(&mut file, range.offset, range.payload.len()) {
                 Ok(bytes) => {
-                    let matched = bytes == range.payload;
+                    let matched = bytes.as_slice() == range.payload.as_slice();
                     if !matched {
                         missing.push(format!(
-                            "{}:{SPARSE_FILE_PATH}@{} expected {}, got {}",
+                            "{}:{sparse_path}@{} expected {}, got {}",
                             client.name,
                             range.offset,
-                            bytes_sha256(range.payload),
+                            bytes_sha256(&range.payload),
                             bytes_sha256(&bytes)
                         ));
                     }
@@ -4672,7 +4958,7 @@ fn observe_sparse_ranges(
                     });
                 }
                 Err(error) => missing.push(format!(
-                    "{}:{SPARSE_FILE_PATH}@{} ({error})",
+                    "{}:{sparse_path}@{} ({error})",
                     client.name, range.offset
                 )),
             }
@@ -4684,7 +4970,7 @@ fn observe_sparse_ranges(
                     let all_zero = bytes.iter().all(|byte| *byte == 0);
                     if !all_zero {
                         missing.push(format!(
-                            "{}:{SPARSE_FILE_PATH}@{} expected zero-filled hole",
+                            "{}:{sparse_path}@{} expected zero-filled hole",
                             client.name, hole.offset
                         ));
                     }
@@ -4696,7 +4982,7 @@ fn observe_sparse_ranges(
                     });
                 }
                 Err(error) => missing.push(format!(
-                    "{}:{SPARSE_FILE_PATH}@{} ({error})",
+                    "{}:{sparse_path}@{} ({error})",
                     client.name, hole.offset
                 )),
             }
@@ -4771,24 +5057,24 @@ fn read_exact_range_from(file: &mut fs::File, offset: u64, len: usize) -> io::Re
     Ok(buffer)
 }
 
-fn expected_sparse_payload() -> Vec<u8> {
+fn expected_sparse_payload(ranges: &[SparseRangeSpec]) -> Vec<u8> {
     let mut payload = vec![0; SPARSE_FINAL_LOGICAL_SIZE as usize];
-    for range in sparse_expected_range_specs() {
+    for range in ranges {
         let start = range.offset as usize;
         let end = start + range.payload.len();
-        payload[start..end].copy_from_slice(range.payload);
+        payload[start..end].copy_from_slice(&range.payload);
     }
     payload
 }
 
-fn sparse_expected_ranges() -> Vec<SparseExpectedRange> {
-    sparse_expected_range_specs()
+fn sparse_expected_ranges(ranges: &[SparseRangeSpec]) -> Vec<SparseExpectedRange> {
+    ranges
         .iter()
         .map(|range| SparseExpectedRange {
             label: range.label.to_string(),
             offset: range.offset,
             len: range.payload.len(),
-            expected_checksum_sha256: bytes_sha256(range.payload),
+            expected_checksum_sha256: bytes_sha256(&range.payload),
         })
         .collect()
 }
@@ -4812,12 +5098,13 @@ fn sparse_hole_summaries(
 }
 
 fn planned_sparse_range_summary() -> SparseRangeSummary {
-    let expected_payload = expected_sparse_payload();
+    let ranges = sparse_expected_range_specs(None);
+    let expected_payload = expected_sparse_payload(&ranges);
     SparseRangeSummary {
         relative_path: SPARSE_FILE_PATH.to_string(),
         logical_size: SPARSE_FINAL_LOGICAL_SIZE,
         final_checksum_sha256: bytes_sha256(&expected_payload),
-        expected_byte_ranges: sparse_expected_ranges(),
+        expected_byte_ranges: sparse_expected_ranges(&ranges),
         zero_filled_holes: sparse_hole_summaries(
             ADVANCED_MOUNTED_CLIENT_NAMES,
             sparse_hole_specs(),
@@ -4826,15 +5113,13 @@ fn planned_sparse_range_summary() -> SparseRangeSummary {
         read_probes: ADVANCED_MOUNTED_CLIENT_NAMES
             .iter()
             .flat_map(|client| {
-                sparse_expected_range_specs()
-                    .iter()
-                    .map(move |range| SparseReadProbe {
-                        client: (*client).to_string(),
-                        offset: range.offset,
-                        len: range.payload.len(),
-                        actual_checksum_sha256: bytes_sha256(range.payload),
-                        matched: true,
-                    })
+                ranges.iter().map(move |range| SparseReadProbe {
+                    client: (*client).to_string(),
+                    offset: range.offset,
+                    len: range.payload.len(),
+                    actual_checksum_sha256: bytes_sha256(&range.payload),
+                    matched: true,
+                })
             })
             .collect(),
     }
@@ -5072,6 +5357,44 @@ mod tests {
 
     use super::*;
     use crate::client::{ClientLifecycleState, ClientSpec, S3Config, client_spec_for};
+
+    fn test_isolation(root: &str) -> ScenarioIsolation {
+        ScenarioIsolation {
+            root: root.to_string(),
+            payload_marker: format!("test-marker-{root}"),
+        }
+    }
+
+    #[test]
+    fn advanced_mounted_isolation_uses_volume_specific_roots_and_payloads() {
+        let context = ScenarioContext {
+            run_id: "run-1".to_string(),
+            seed: 410,
+            sandbox: PathBuf::from("sandbox"),
+            scenario_dir: PathBuf::from("scenario"),
+            client_controller_config: None,
+        };
+
+        let first = ScenarioIsolation::for_advanced(
+            &context,
+            AdvancedMountedKind::HotspotChurn,
+            "projectfs-volume-a",
+        );
+        let second = ScenarioIsolation::for_advanced(
+            &context,
+            AdvancedMountedKind::HotspotChurn,
+            "projectfs-volume-b",
+        );
+
+        assert_ne!(first.root, "hotspot");
+        assert_ne!(first.root, second.root);
+        assert!(first.path("slot-0.txt").starts_with("hotspot-"));
+        assert_ne!(
+            first.payload("overwrite", "slot-0.txt", "body"),
+            second.payload("overwrite", "slot-0.txt", "body"),
+            "payloads must vary with the mounted volume identity"
+        );
+    }
 
     #[test]
     fn mounted_smoke_writes_file_converges_three_mounts_and_unmounts() {
@@ -5891,11 +6214,13 @@ mod tests {
             scenario_dir,
             client_controller_config: None,
         };
-        seed_mounted_chaos_initial_tree(&clients[0]).unwrap();
+        let isolation = test_isolation("chaos-test");
+        seed_mounted_chaos_initial_tree(&clients[0], &isolation).unwrap();
 
         let err = wait_for_mounted_chaos_initial_tree(
             &context,
             &clients,
+            &isolation,
             Duration::from_millis(25),
             Duration::from_millis(5),
         )
@@ -5918,11 +6243,12 @@ mod tests {
             "client-a",
             temp.path().join("mounts").join("client-a"),
         );
-        let stale_path = writer.mount_point.join("chaos/rename-source.txt");
+        let isolation = test_isolation("chaos-test");
+        let stale_path = writer.mount_point.join(isolation.path("rename-source.txt"));
         std::fs::create_dir_all(stale_path.parent().unwrap()).unwrap();
         std::fs::write(&stale_path, []).unwrap();
 
-        let err = seed_mounted_chaos_initial_tree(&writer).unwrap_err();
+        let err = seed_mounted_chaos_initial_tree(&writer, &isolation).unwrap_err();
 
         assert!(
             matches!(&err, ScenarioError::Io(error) if error.kind() == io::ErrorKind::AlreadyExists),
@@ -5988,11 +6314,15 @@ mod tests {
             "client-a",
             temp.path().join("mounts").join("client-a"),
         );
-        let stale_path = writer.mount_point.join(OPEN_HANDLE_RENAME_SOURCE);
+        let isolation = test_isolation("open-handles-test");
+        let stale_path = writer.mount_point.join(open_handle_isolated_path(
+            &isolation,
+            OPEN_HANDLE_RENAME_SOURCE,
+        ));
         std::fs::create_dir_all(stale_path.parent().unwrap()).unwrap();
         std::fs::write(&stale_path, []).unwrap();
 
-        let err = seed_open_handle_initial_tree(&[writer]).unwrap_err();
+        let err = seed_open_handle_initial_tree(&[writer], &isolation).unwrap_err();
 
         assert!(
             matches!(&err, ScenarioError::Io(error) if error.kind() == io::ErrorKind::AlreadyExists),
@@ -6051,7 +6381,8 @@ mod tests {
             scenario_dir,
             client_controller_config: None,
         };
-        seed_mounted_chaos_initial_tree(&clients[0]).unwrap();
+        let isolation = test_isolation("chaos-test");
+        seed_mounted_chaos_initial_tree(&clients[0], &isolation).unwrap();
         for peer in clients.iter().skip(1) {
             replace_dir_contents(&clients[0].mount_point, &peer.mount_point).unwrap();
         }
@@ -6059,6 +6390,7 @@ mod tests {
         let convergence = wait_for_mounted_chaos_initial_tree(
             &context,
             &clients,
+            &isolation,
             Duration::from_secs(1),
             Duration::from_millis(5),
         )
@@ -6092,10 +6424,12 @@ mod tests {
             scenario_dir,
             client_controller_config: None,
         };
+        let isolation = test_isolation("hotspot-test");
 
         let err = run_hotspot_churn_operations_with_timeout(
             &context,
             &clients,
+            &isolation,
             Duration::from_secs(1),
             Duration::from_millis(25),
             Duration::from_millis(5),
@@ -6122,7 +6456,7 @@ mod tests {
             .copied()
             .map(|name| {
                 let mount = temp.path().join("mounts").join(name);
-                std::fs::create_dir_all(mount.join("hotspot")).unwrap();
+                std::fs::create_dir_all(mount.join("hotspot-test")).unwrap();
                 client_spec_for(&sandbox, "projectfs", name, mount)
             })
             .collect::<Vec<_>>();
@@ -6137,6 +6471,7 @@ mod tests {
         let convergence = wait_for_hotspot_initial_tree(
             &context,
             &clients,
+            "hotspot-test",
             Duration::from_secs(1),
             Duration::from_millis(5),
         )
@@ -6170,11 +6505,13 @@ mod tests {
             scenario_dir,
             client_controller_config: None,
         };
-        seed_open_handle_initial_tree(&clients).unwrap();
+        let isolation = test_isolation("open-handles-test");
+        seed_open_handle_initial_tree(&clients, &isolation).unwrap();
 
         let err = wait_for_open_handle_initial_tree(
             &context,
             &clients,
+            &isolation,
             Duration::from_millis(25),
             Duration::from_millis(5),
         )
@@ -6195,20 +6532,33 @@ mod tests {
             .join("artifacts")
             .join("scenarios")
             .join(MOUNTED_OPEN_HANDLE_CONVERGENCE);
+        let isolation = test_isolation("open-handles-test");
         let clients = ADVANCED_MOUNTED_CLIENT_NAMES
             .iter()
             .copied()
             .map(|name| {
                 let mount = temp.path().join("mounts").join(name);
                 std::fs::create_dir_all(&mount).unwrap();
+                let unlink_target =
+                    open_handle_isolated_path(&isolation, OPEN_HANDLE_UNLINK_TARGET);
+                let rename_source =
+                    open_handle_isolated_path(&isolation, OPEN_HANDLE_RENAME_SOURCE);
                 write_parented(
-                    mount.join(OPEN_HANDLE_UNLINK_TARGET),
-                    OPEN_HANDLE_UNLINK_TARGET_PAYLOAD,
+                    mount.join(&unlink_target),
+                    &isolation.payload(
+                        "initial_unlink_target",
+                        &unlink_target,
+                        &String::from_utf8_lossy(OPEN_HANDLE_UNLINK_TARGET_PAYLOAD),
+                    ),
                 )
                 .unwrap();
                 write_parented(
-                    mount.join(OPEN_HANDLE_RENAME_SOURCE),
-                    OPEN_HANDLE_RENAME_SOURCE_PAYLOAD,
+                    mount.join(&rename_source),
+                    &isolation.payload(
+                        "initial_rename_source",
+                        &rename_source,
+                        &String::from_utf8_lossy(OPEN_HANDLE_RENAME_SOURCE_PAYLOAD),
+                    ),
                 )
                 .unwrap();
                 client_spec_for(&sandbox, "projectfs", name, mount)
@@ -6225,6 +6575,7 @@ mod tests {
         let convergence = wait_for_open_handle_initial_tree(
             &context,
             &clients,
+            &isolation,
             Duration::from_secs(1),
             Duration::from_millis(5),
         )
