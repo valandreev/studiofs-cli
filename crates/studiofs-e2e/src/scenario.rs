@@ -85,6 +85,8 @@ const COLLISION_NEW_COMMITTED_PAYLOAD: &[u8] = b"new committed payload\n";
 const OVERWRITE_READ_ATTEMPTS: u32 = 8;
 const ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(90);
 const ADVANCED_MOUNTED_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const MOUNTED_WRITE_READBACK_TIMEOUT: Duration = Duration::from_secs(5);
+const MOUNTED_WRITE_READBACK_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const HOTSPOT_CHURN_OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
 const HOTSPOT_IO_MAX_ACTIVE_WORKERS: usize = 1;
 static HOTSPOT_IO_ACTIVE_WORKERS: LazyLock<Arc<AtomicUsize>> =
@@ -2206,14 +2208,24 @@ fn run_namespace_collision_body(
     establish_collision_initial_tree(kind, &clients[0])?;
     driver.after_conflicting_operations(kind, &clients)?;
     let initial_validation_deadline = Instant::now() + convergence_timeout;
-    let required_initial_paths = collision_required_initial_paths(kind);
-    wait_for_required_paths_visible_until(
+    let initial_paths = kind.initial_paths();
+    wait_for_mounted_initial_payloads_until(
         &clients,
-        &required_initial_paths,
+        &initial_paths,
         initial_validation_deadline,
         poll_interval,
         "namespace collision initial tree",
     )?;
+    let required_initial_paths = collision_required_initial_paths(kind);
+    if !required_initial_paths.is_empty() {
+        wait_for_required_paths_visible_until(
+            &clients,
+            &required_initial_paths,
+            initial_validation_deadline,
+            poll_interval,
+            "namespace collision initial tree",
+        )?;
+    }
     let initial_validation_timeout = remaining_initial_validation_timeout(
         initial_validation_deadline,
         "namespace collision initial tree",
@@ -2291,25 +2303,21 @@ fn establish_collision_initial_tree(
         fs::create_dir_all(client.mount_point.join("race"))?;
     }
     for (relative_path, payload) in kind.initial_paths() {
-        let path = client.mount_point.join(relative_path);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(path, payload)?;
+        write_mounted_initial_file(
+            client.mount_point.join(relative_path),
+            payload,
+            "namespace collision initial tree",
+        )?;
     }
     Ok(())
 }
 
 fn collision_required_initial_paths(kind: NamespaceCollisionKind) -> Vec<&'static str> {
-    let mut paths = kind
-        .initial_paths()
-        .into_iter()
-        .map(|(path, _)| path)
-        .collect::<Vec<_>>();
     if kind == NamespaceCollisionKind::MkdirRmdirVsCreate {
-        paths.push("race");
+        vec!["race"]
+    } else {
+        Vec::new()
     }
-    paths
 }
 
 fn perform_namespace_collision_operations(
@@ -3279,9 +3287,78 @@ fn run_mounted_chaos_operations(
 
 fn seed_mounted_chaos_initial_tree(writer: &ClientSpec) -> Result<(), ScenarioError> {
     for &(path, payload) in MOUNTED_CHAOS_INITIAL_TREE {
-        write_parented(writer.mount_point.join(path), payload)?;
+        write_mounted_initial_file(
+            writer.mount_point.join(path),
+            payload,
+            "mounted chaos initial tree",
+        )?;
     }
     Ok(())
+}
+
+fn write_mounted_initial_file(
+    path: PathBuf,
+    payload: &[u8],
+    label: &str,
+) -> Result<(), ScenarioError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut options = mounted_write_barrier_open_options();
+    let mut file = options.create_new(true).open(&path)?;
+    file.write_all(payload)?;
+    file.sync_all()?;
+    drop(file);
+    let readback = wait_for_mounted_payload_readback(
+        &path,
+        payload,
+        MOUNTED_WRITE_READBACK_TIMEOUT,
+        MOUNTED_WRITE_READBACK_POLL_INTERVAL,
+    )?;
+    if readback != payload {
+        return Err(ScenarioError::Io(io::Error::other(format!(
+            "{label} write readback mismatch for {}: expected {} bytes, read {} bytes",
+            path.display(),
+            payload.len(),
+            readback.len()
+        ))));
+    }
+    Ok(())
+}
+
+fn wait_for_mounted_payload_readback(
+    path: &Path,
+    payload: &[u8],
+    timeout: Duration,
+    poll_interval: Duration,
+) -> Result<Vec<u8>, ScenarioError> {
+    let deadline = Instant::now() + timeout;
+    let mut last_readback = Vec::new();
+    loop {
+        match fs::read(path) {
+            Ok(readback) if readback == payload => return Ok(readback),
+            Ok(readback) => last_readback = readback,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        if Instant::now() >= deadline {
+            return Ok(last_readback);
+        }
+        thread::sleep(poll_interval.max(Duration::from_millis(1)));
+    }
+}
+
+fn mounted_write_barrier_open_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options.write(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_FLAG_WRITE_THROUGH: u32 = 0x8000_0000;
+        options.custom_flags(FILE_FLAG_WRITE_THROUGH);
+    }
+    options
 }
 
 fn wait_for_mounted_chaos_initial_tree(
@@ -3293,9 +3370,9 @@ fn wait_for_mounted_chaos_initial_tree(
     let deadline = Instant::now() + timeout;
     let required_paths = MOUNTED_CHAOS_INITIAL_TREE
         .iter()
-        .map(|(path, _)| *path)
+        .map(|(path, payload)| (*path, *payload))
         .collect::<Vec<_>>();
-    wait_for_required_paths_visible_until(
+    wait_for_mounted_initial_payloads_until(
         clients,
         &required_paths,
         deadline,
@@ -3803,13 +3880,15 @@ fn run_open_handle_operations(
 
 fn seed_open_handle_initial_tree(clients: &[ClientSpec]) -> Result<(), ScenarioError> {
     let seed_mount = &clients[0].mount_point;
-    write_parented(
+    write_mounted_initial_file(
         seed_mount.join(OPEN_HANDLE_UNLINK_TARGET),
         OPEN_HANDLE_UNLINK_TARGET_PAYLOAD,
+        "open handle initial tree",
     )?;
-    write_parented(
+    write_mounted_initial_file(
         seed_mount.join(OPEN_HANDLE_RENAME_SOURCE),
         OPEN_HANDLE_RENAME_SOURCE_PAYLOAD,
+        "open handle initial tree",
     )?;
     Ok(())
 }
@@ -3821,9 +3900,12 @@ fn wait_for_open_handle_initial_tree(
     poll_interval: Duration,
 ) -> Result<ConvergenceOutcome, ScenarioError> {
     let deadline = Instant::now() + timeout;
-    wait_for_required_paths_visible_until(
+    wait_for_mounted_initial_payloads_until(
         clients,
-        &[OPEN_HANDLE_UNLINK_TARGET, OPEN_HANDLE_RENAME_SOURCE],
+        &[
+            (OPEN_HANDLE_UNLINK_TARGET, OPEN_HANDLE_UNLINK_TARGET_PAYLOAD),
+            (OPEN_HANDLE_RENAME_SOURCE, OPEN_HANDLE_RENAME_SOURCE_PAYLOAD),
+        ],
         deadline,
         poll_interval,
         "open handle initial tree",
@@ -3840,6 +3922,76 @@ fn wait_for_open_handle_initial_tree(
         poll_interval,
     )
     .map_err(ScenarioError::from)
+}
+
+fn wait_for_mounted_initial_payloads_until(
+    clients: &[ClientSpec],
+    required_payloads: &[(&str, &[u8])],
+    deadline: Instant,
+    poll_interval: Duration,
+    label: &str,
+) -> Result<(), ScenarioError> {
+    loop {
+        let last_missing = missing_mounted_initial_payloads(clients, required_payloads);
+        if last_missing.is_empty() {
+            return Ok(());
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(ScenarioError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "{label} did not become visible before timeout; missing: {}",
+                    last_missing.join(", ")
+                ),
+            )));
+        }
+        thread::sleep(poll_interval.min(deadline.saturating_duration_since(now)));
+    }
+}
+
+fn missing_mounted_initial_payloads(
+    clients: &[ClientSpec],
+    required_payloads: &[(&str, &[u8])],
+) -> Vec<String> {
+    let mut missing = Vec::new();
+    for client in clients {
+        for (relative_path, expected_payload) in required_payloads {
+            let path = client.mount_point.join(relative_path);
+            refresh_parent_directory(&path);
+            match fs::read(&path) {
+                Ok(payload) if payload == *expected_payload => {}
+                Ok(payload) => missing.push(format!(
+                    "{}:{relative_path} (expected {} bytes, read {} bytes)",
+                    client.name,
+                    expected_payload.len(),
+                    payload.len()
+                )),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    missing.push(format!("{}:{relative_path}", client.name));
+                }
+                Err(error) => {
+                    missing.push(format!("{}:{relative_path} ({error})", client.name));
+                }
+            }
+        }
+    }
+    missing
+}
+
+fn refresh_parent_directory(path: &Path) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries {
+        if entry.is_err() {
+            break;
+        }
+    }
 }
 
 fn wait_for_required_paths_visible_until(
@@ -5073,6 +5225,125 @@ mod tests {
             err.to_string()
                 .contains("mounted chaos initial tree did not become visible")
         );
+    }
+
+    #[test]
+    fn mounted_chaos_initial_seed_rejects_stale_zero_byte_file() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let writer = client_spec_for(
+            &sandbox,
+            "projectfs",
+            "client-a",
+            temp.path().join("mounts").join("client-a"),
+        );
+        let stale_path = writer.mount_point.join("chaos/rename-source.txt");
+        std::fs::create_dir_all(stale_path.parent().unwrap()).unwrap();
+        std::fs::write(&stale_path, []).unwrap();
+
+        let err = seed_mounted_chaos_initial_tree(&writer).unwrap_err();
+
+        assert!(
+            matches!(&err, ScenarioError::Io(error) if error.kind() == io::ErrorKind::AlreadyExists),
+            "expected stale warmup file to be rejected before convergence validation, got {err:?}"
+        );
+        assert_eq!(
+            std::fs::read(&stale_path).unwrap(),
+            Vec::<u8>::new(),
+            "stale warmup files must not be overwritten in place"
+        );
+    }
+
+    #[test]
+    fn mounted_initial_payload_barrier_rejects_wrong_peer_payload() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let clients = ADVANCED_MOUNTED_CLIENT_NAMES
+            .iter()
+            .copied()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(&mount).unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let required_payloads = [("seed/file.txt", b"expected payload\n".as_slice())];
+        write_mounted_initial_file(
+            clients[0].mount_point.join("seed/file.txt"),
+            b"expected payload\n",
+            "test initial tree",
+        )
+        .unwrap();
+        write_mounted_initial_file(
+            clients[1].mount_point.join("seed/file.txt"),
+            b"wrong payload\n",
+            "test initial tree",
+        )
+        .unwrap();
+
+        let err = wait_for_mounted_initial_payloads_until(
+            &clients,
+            &required_payloads,
+            Instant::now() + Duration::from_millis(25),
+            Duration::from_millis(5),
+            "test initial tree",
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, ScenarioError::Io(_)));
+        assert!(
+            err.to_string()
+                .contains("client-b:seed/file.txt (expected 17 bytes, read 14 bytes)")
+        );
+    }
+
+    #[test]
+    fn open_handle_initial_seed_rejects_stale_zero_byte_file() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let writer = client_spec_for(
+            &sandbox,
+            "projectfs",
+            "client-a",
+            temp.path().join("mounts").join("client-a"),
+        );
+        let stale_path = writer.mount_point.join(OPEN_HANDLE_RENAME_SOURCE);
+        std::fs::create_dir_all(stale_path.parent().unwrap()).unwrap();
+        std::fs::write(&stale_path, []).unwrap();
+
+        let err = seed_open_handle_initial_tree(&[writer]).unwrap_err();
+
+        assert!(
+            matches!(&err, ScenarioError::Io(error) if error.kind() == io::ErrorKind::AlreadyExists),
+            "expected stale open-handle seed file to be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn mounted_chaos_initial_readback_waits_for_delayed_visibility() {
+        let temp = tempdir().unwrap();
+        let file_path = temp.path().join("chaos").join("delayed.txt");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(&file_path, b"").unwrap();
+        let payload = b"delayed mounted readback\n".to_vec();
+        let writer_path = file_path.clone();
+        let writer_payload = payload.clone();
+
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(40));
+            std::fs::write(writer_path, writer_payload).unwrap();
+        });
+
+        let readback = wait_for_mounted_payload_readback(
+            &file_path,
+            &payload,
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+        )
+        .unwrap();
+        writer.join().unwrap();
+
+        assert_eq!(readback, payload);
     }
 
     #[test]
