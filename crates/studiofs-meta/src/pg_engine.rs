@@ -2461,11 +2461,12 @@ impl PgMetaEngine {
         event: &MetaEvent,
         overlay: &OverlayConflictSets,
         removed_inodes: &HashSet<Ino>,
+        removed_inodes_with_local_regular_file_state: &HashSet<Ino>,
     ) -> MetaResult<bool> {
         let conflict = match event {
             MetaEvent::RemoveAttr { ino } => {
                 if removed_inodes.contains(ino) {
-                    return Ok(false);
+                    return Ok(removed_inodes_with_local_regular_file_state.contains(ino));
                 }
                 overlay.block_inodes.contains(ino)
                     || overlay.attr_inodes.contains(ino)
@@ -2569,6 +2570,78 @@ impl PgMetaEngine {
             }
         }
         removed
+    }
+
+    fn local_regular_file_state_needs_foreign_protection(&self, ino: Ino) -> MetaResult<bool> {
+        if self.local.has_local_regular_file_overlay(ino)? {
+            return Ok(true);
+        }
+        let attr = match self.local.get_attr(ino) {
+            Ok(attr) => attr,
+            Err(MetaError::InodeNotFound(_)) => return Ok(false),
+            Err(err) => return Err(err),
+        };
+        if attr.kind != FileType::RegularFile {
+            return Ok(false);
+        }
+        Ok(attr.upload_state != UploadState::Ready
+            || attr.content_epoch != attr.committed_content_epoch
+            || attr.size != attr.committed_size)
+    }
+
+    fn removed_inode_has_local_regular_file_state_to_preserve(&self, ino: Ino) -> MetaResult<bool> {
+        self.local_regular_file_state_needs_foreign_protection(ino)
+    }
+
+    fn current_regular_file_overlay_conflicts_for_batch(
+        &self,
+        batch_events: &[MetaEvent],
+    ) -> MetaResult<OverlayConflictSets> {
+        let mut overlay = OverlayConflictSets::default();
+        for event in batch_events {
+            let ino = match event {
+                MetaEvent::SetAttr { attr } if attr.kind == FileType::RegularFile => attr.ino,
+                MetaEvent::PublishRegularFileBaseSlices { ino, .. }
+                | MetaEvent::RemoveRegularFileGraph { ino } => *ino,
+                MetaEvent::RemoveEntry { parent, name } => {
+                    let Ok(entry) = self.local.lookup(*parent, name) else {
+                        continue;
+                    };
+                    entry.ino
+                }
+                _ => continue,
+            };
+            if self.local_regular_file_state_needs_foreign_protection(ino)? {
+                overlay.attr_inodes.insert(ino);
+                overlay.block_inodes.insert(ino);
+                if let MetaEvent::RemoveEntry { parent, name } = event {
+                    overlay.dentry_keys.insert(Self::dentry_key(*parent, name));
+                }
+            }
+        }
+        Ok(overlay)
+    }
+
+    fn grandfather_removed_local_regular_file_attrs(
+        &self,
+        inodes: &HashSet<Ino>,
+    ) -> MetaResult<Vec<MetaEvent>> {
+        let mut events = Vec::new();
+        for ino in inodes {
+            let mut attr = match self.local.get_attr(*ino) {
+                Ok(attr) => attr,
+                Err(MetaError::InodeNotFound(_)) => continue,
+                Err(err) => return Err(err),
+            };
+            if attr.kind != FileType::RegularFile {
+                continue;
+            }
+            attr.committed_size = attr.size;
+            attr.committed_content_epoch = attr.content_epoch;
+            attr.upload_state = UploadState::Ready;
+            events.push(MetaEvent::SetAttr { attr });
+        }
+        Ok(events)
     }
 
     fn overlay_conflicts_for_events(events: &[MetaEvent]) -> OverlayConflictSets {
@@ -2684,6 +2757,7 @@ impl PgMetaEngine {
         event: &MetaEvent,
         overlay: &OverlayConflictSets,
         removed_inodes: &HashSet<Ino>,
+        removed_inodes_with_local_regular_file_state: &HashSet<Ino>,
     ) -> bool {
         match event {
             MetaEvent::SetAttr { attr } => {
@@ -2691,7 +2765,7 @@ impl PgMetaEngine {
             }
             MetaEvent::RemoveAttr { ino } => {
                 if removed_inodes.contains(ino) {
-                    return false;
+                    return removed_inodes_with_local_regular_file_state.contains(ino);
                 }
                 overlay.block_inodes.contains(ino)
                     || overlay.attr_inodes.contains(ino)
@@ -2765,13 +2839,25 @@ impl PgMetaEngine {
         overlay: &OverlayConflictSets,
         base_protected_regular_file_inodes: &HashSet<Ino>,
     ) -> MetaResult<bool> {
+        let current_regular_file_conflicts =
+            self.current_regular_file_overlay_conflicts_for_batch(batch_events)?;
+        let overlay = Self::merge_overlay_conflicts(overlay, &current_regular_file_conflicts);
+        let mut protected_regular_file_inodes = base_protected_regular_file_inodes.clone();
+        protected_regular_file_inodes
+            .extend(current_regular_file_conflicts.block_inodes.iter().copied());
         let removed_inodes = self.removed_inodes_for_batch(batch_events);
-        let protected_attr_merges = self
-            .protected_regular_file_attr_merges(batch_events, base_protected_regular_file_inodes)?;
+        let mut removed_inodes_with_local_regular_file_state = HashSet::new();
+        for ino in &removed_inodes {
+            if self.removed_inode_has_local_regular_file_state_to_preserve(*ino)? {
+                removed_inodes_with_local_regular_file_state.insert(*ino);
+            }
+        }
+        let protected_attr_merges =
+            self.protected_regular_file_attr_merges(batch_events, &protected_regular_file_inodes)?;
         self.local
             .apply_replica_events_to_base_preserving_protected_base_ranges(
                 batch_events,
-                base_protected_regular_file_inodes,
+                &protected_regular_file_inodes,
             )?;
         let serving_events: Vec<MetaEvent> = batch_events
             .iter()
@@ -2779,8 +2865,13 @@ impl PgMetaEngine {
                 matches!(
                     event,
                     MetaEvent::PublishRegularFileBaseSlices { ino, .. }
-                        if base_protected_regular_file_inodes.contains(ino)
-                ) || !Self::serving_event_conflicts_with_overlay(event, overlay, &removed_inodes)
+                        if protected_regular_file_inodes.contains(ino)
+                ) || !Self::serving_event_conflicts_with_overlay(
+                    event,
+                    &overlay,
+                    &removed_inodes,
+                    &removed_inodes_with_local_regular_file_state,
+                )
             })
             .cloned()
             .collect();
@@ -2788,6 +2879,13 @@ impl PgMetaEngine {
         if !protected_attr_merges.is_empty() {
             self.local
                 .apply_replica_serving_state(&protected_attr_merges)?;
+        }
+        let grandfathered_attrs = self.grandfather_removed_local_regular_file_attrs(
+            &removed_inodes_with_local_regular_file_state,
+        )?;
+        if !grandfathered_attrs.is_empty() {
+            self.local
+                .apply_replica_serving_state(&grandfathered_attrs)?;
         }
         let mut aux_events = Vec::new();
         for event in batch_events {
@@ -2797,21 +2895,24 @@ impl PgMetaEngine {
             if matches!(
                 event,
                 MetaEvent::PublishRegularFileBaseSlices { ino, .. }
-                    if base_protected_regular_file_inodes.contains(ino)
+                    if protected_regular_file_inodes.contains(ino)
             ) {
                 continue;
             }
-            if !self.aux_event_conflicts_with_overlay(event, overlay, &removed_inodes)? {
+            if !self.aux_event_conflicts_with_overlay(
+                event,
+                &overlay,
+                &removed_inodes,
+                &removed_inodes_with_local_regular_file_state,
+            )? {
                 aux_events.push(event.clone());
             }
         }
 
-        if aux_events.is_empty() {
-            return Ok(false);
+        if !aux_events.is_empty() {
+            self.local.apply_replica_aux_state(&aux_events)?;
         }
-
-        self.local.apply_replica_aux_state(&aux_events)?;
-        Ok(true)
+        Ok(!aux_events.is_empty() || !grandfathered_attrs.is_empty())
     }
 
     fn protected_regular_file_attr_merges(
@@ -2889,11 +2990,16 @@ impl PgMetaEngine {
             return Ok(false);
         }
         let overlay = self.local_overlay_conflicts()?;
-        let ready_inodes: HashSet<_> = inodes
-            .iter()
-            .copied()
-            .filter(|ino| !overlay.attr_inodes.contains(ino) && !overlay.block_inodes.contains(ino))
-            .collect();
+        let mut ready_inodes = HashSet::new();
+        for ino in inodes {
+            if overlay.attr_inodes.contains(ino) || overlay.block_inodes.contains(ino) {
+                continue;
+            }
+            if self.local_regular_file_state_needs_foreign_protection(*ino)? {
+                continue;
+            }
+            ready_inodes.insert(*ino);
+        }
         self.local
             .reconcile_regular_file_serving_from_base(&ready_inodes)
     }
@@ -3346,12 +3452,8 @@ impl PgMetaEngine {
             idx = next_idx;
 
             if is_self_batch {
-                let reconcile_inodes = Self::regular_file_serving_reconcile_inodes(&batch_events);
                 applied_any |= self.apply_visible_self_batch(&batch_events)?;
                 self.acknowledge_local_prefix_from_self_batch(&batch_events)?;
-                applied_any |= self.reconcile_regular_file_serving_from_base_when_unconflicted(
-                    &reconcile_inodes,
-                )?;
             } else {
                 let reconcile_inodes = Self::regular_file_serving_reconcile_inodes(&batch_events);
                 let effective_overlay = if let Some(recent_flush) = recent_flush {
@@ -3635,14 +3737,11 @@ impl PgMetaEngine {
             self.persist_flushed_event_seq(batch.event_end)?;
             return Ok(None);
         }
-        let reconcile_inodes = Self::regular_file_serving_reconcile_inodes(&remote_events);
         let batch_version = self.push_event_log_batch_locked(&events)?;
         // Do not advance `local_version` here. The writer may have published a
         // newer batch_version while still missing earlier foreign batches.
         // `pull_foreign_events_locked()` must remain able to read the full gap.
-        self.apply_visible_self_batch(&remote_events)?;
         self.persist_flushed_event_seq(batch.event_end)?;
-        self.reconcile_regular_file_serving_from_base_when_unconflicted(&reconcile_inodes)?;
         Ok(Some(RecentFlush {
             batch_version,
             overlay: Self::overlay_conflicts_for_events(&remote_events),
@@ -5962,6 +6061,7 @@ mod tests {
                 },
                 &overlay,
                 &HashSet::new(),
+                &HashSet::new(),
             )
             .expect("xattr conflict")
         );
@@ -5972,6 +6072,7 @@ mod tests {
                     target: b"target-c".to_vec(),
                 },
                 &overlay,
+                &HashSet::new(),
                 &HashSet::new(),
             )
             .expect("symlink conflict")

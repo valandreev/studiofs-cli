@@ -613,6 +613,13 @@ impl<'a> NamespaceDeleteTxn<'a> {
         published_base_chunks: Option<Vec<(ChunkId, Vec<SliceRecord>)>>,
     ) -> MetaResult<()> {
         if deleted_before_publish.is_some_and(|record| record.has_published_base) {
+            RedbMetaEngine::append_event_in_txn(
+                self.txn,
+                &crate::events::MetaEvent::RemoveEntry {
+                    parent: spec.parent,
+                    name: spec.name.to_vec(),
+                },
+            )?;
             let published_base_chunks = published_base_chunks.ok_or_else(|| {
                 MetaError::Storage(
                     "missing published base chunk rows for deleted-before-publish rollback"
