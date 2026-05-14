@@ -100,11 +100,26 @@ impl CommitCoordinator {
             );
             return Ok(EpochFinalizeStatus::Deferred);
         }
-        let published = run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+        let finalize_session = vfs
+            .state
+            .file_session
+            .enter_op(ino, FileSessionOperation::Finalize)
+            .await;
+        let published = match run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
             engine.publish_regular_file_overlay_to_base_if_matches(ino, content_epoch)
         })
-        .await?;
+        .await
+        {
+            Ok(published) => published,
+            Err(err) => {
+                drop(finalize_session);
+                vfs.state.file_session.gc_if_idle(ino);
+                return Err(err);
+            }
+        };
         if !published {
+            drop(finalize_session);
+            vfs.state.file_session.gc_if_idle(ino);
             let latest_attr = match run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
                 engine.get_attr(ino)
             })
@@ -139,25 +154,33 @@ impl CommitCoordinator {
         // published. dirty_attrs entries captured at write time carry
         // committed_content_epoch=0 / committed_size=0 because the file had not
         // been published yet. After publication those values are stale: if a
-        // subsequent flush_local_dirty_state finds this dirty_attr and the local dirty state is
-        // empty it will call engine.set_attr with committed_epoch=0, reverting
-        // INODES_TABLE back to {Uploading}. That triggers a second spurious
-        // finalize_inode_epoch and emits a garbage published-base event to PG,
-        // corrupting remote nodes' regular-file base graph.
+        // subsequent flush_local_dirty_state finds this dirty_attr and the local
+        // dirty state is empty it will call engine.set_attr with
+        // committed_epoch=0, reverting INODES_TABLE back to {Uploading}. That
+        // triggers a second spurious finalize_inode_epoch and emits a garbage
+        // published-base event to PG, corrupting remote nodes' regular-file base
+        // graph.
         //
         // Only remove the entry when content_epoch matches to avoid dropping a
         // dirty_attr that was written by a concurrent new write or setattr after
-        // this publication completed (those will carry a different epoch).
-        let was_dirty_visible = {
+        // this publication completed (those will carry a different epoch). The
+        // finalize session serializes publish+cleanup for this inode so a stale
+        // older finalizer cannot restore a dirty_attr after a newer finalizer has
+        // already published and removed it.
+        let (was_dirty_visible, newer_dirty_attr) = {
             let mut dirty_attrs = vfs.state.namespace.dirty_attrs.lock();
             let present = dirty_attrs.contains_key(&ino);
+            let newer = dirty_attrs
+                .get(&ino)
+                .filter(|attr| attr.content_epoch > content_epoch)
+                .cloned();
             if dirty_attrs
                 .get(&ino)
-                .is_some_and(|a| a.content_epoch == content_epoch)
+                .is_some_and(|attr| attr.content_epoch == content_epoch)
             {
                 dirty_attrs.remove(&ino);
             }
-            present
+            (present, newer)
         };
 
         if let Ok(attr) = run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
@@ -169,6 +192,15 @@ impl CommitCoordinator {
         } else {
             vfs.clear_inode_incarnation(ino);
         }
+        if let Some(newer_dirty_attr) = newer_dirty_attr {
+            let mut dirty_attrs = vfs.state.namespace.dirty_attrs.lock();
+            let should_restore = dirty_attrs
+                .get(&ino)
+                .is_none_or(|current| current.content_epoch < newer_dirty_attr.content_epoch);
+            if should_restore {
+                dirty_attrs.insert(ino, newer_dirty_attr);
+            }
+        }
         let removed_cached_attr = !vfs.invalidate_attr_read_cache([ino]).is_empty();
         // `getattr` can expose pending attrs from dirty_attrs without populating
         // attr_read_cache. A newer dirty attr must be preserved, but its presence
@@ -176,6 +208,8 @@ impl CommitCoordinator {
         if was_dirty_visible || removed_cached_attr {
             vfs.invalidate_kernel_inodes([ino]);
         }
+        drop(finalize_session);
+        vfs.state.file_session.gc_if_idle(ino);
 
         Ok(EpochFinalizeStatus::Published)
     }

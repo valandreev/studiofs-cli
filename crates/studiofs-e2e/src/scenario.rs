@@ -3161,11 +3161,13 @@ fn run_advanced_mounted_body(
         context,
         kind,
         Some(&isolation),
-        Some(bootstrap),
         &clients,
-        execution.operations,
-        execution.lww_oracle,
-        execution.sparse_ranges,
+        AdvancedMountedFinishInput {
+            bootstrap: Some(bootstrap),
+            operations: execution.operations,
+            lww_oracle: execution.lww_oracle,
+            sparse_ranges: execution.sparse_ranges,
+        },
     )?;
     Ok(summary)
 }
@@ -4414,16 +4416,26 @@ fn missing_required_paths(clients: &[ClientSpec], required_paths: &[&str]) -> Ve
     missing
 }
 
+struct AdvancedMountedFinishInput {
+    bootstrap: Option<VolumeBootstrapSummary>,
+    operations: Vec<NamespaceCollisionOperation>,
+    lww_oracle: Option<LwwReconnectOracle>,
+    sparse_ranges: Option<SparseRangeSummary>,
+}
+
 fn finish_advanced_mounted(
     context: &ScenarioContext,
     kind: AdvancedMountedKind,
     isolation: Option<&ScenarioIsolation>,
-    bootstrap: Option<VolumeBootstrapSummary>,
     clients: &[ClientSpec],
-    operations: Vec<NamespaceCollisionOperation>,
-    lww_oracle: Option<LwwReconnectOracle>,
-    sparse_ranges: Option<SparseRangeSummary>,
+    input: AdvancedMountedFinishInput,
 ) -> Result<AdvancedMountedSummary, ScenarioError> {
+    let AdvancedMountedFinishInput {
+        bootstrap,
+        operations,
+        lww_oracle,
+        sparse_ranges,
+    } = input;
     let mounts = clients
         .iter()
         .map(|client| ClientMount::new(client.name.clone(), client.mount_point.clone()))
@@ -4708,16 +4720,16 @@ fn run_sparse_range_operations(
             .map_err(ScenarioError::from),
         )?,
     )?;
-    wait_for_sparse_expected_until(
+    wait_for_sparse_expected_until(SparseExpectedWait {
         clients,
-        &sparse_path,
-        SPARSE_INITIAL_LOGICAL_SIZE,
-        &sparse_ranges[..2],
-        &[],
-        Instant::now() + timeout,
+        sparse_path: &sparse_path,
+        logical_size: SPARSE_INITIAL_LOGICAL_SIZE,
+        expected_ranges: &sparse_ranges[..2],
+        hole_specs: &[],
+        deadline: Instant::now() + timeout,
         poll_interval,
-        "initial sparse ranges",
-    )?;
+        label: "initial sparse ranges",
+    })?;
 
     record_sparse_operation(
         context,
@@ -4747,16 +4759,16 @@ fn run_sparse_range_operations(
             .map_err(ScenarioError::from),
         )?,
     )?;
-    wait_for_sparse_expected_until(
+    wait_for_sparse_expected_until(SparseExpectedWait {
         clients,
-        &sparse_path,
-        SPARSE_SHRUNK_LOGICAL_SIZE,
-        &sparse_ranges[..2],
-        &[],
-        Instant::now() + timeout,
+        sparse_path: &sparse_path,
+        logical_size: SPARSE_SHRUNK_LOGICAL_SIZE,
+        expected_ranges: &sparse_ranges[..2],
+        hole_specs: &[],
+        deadline: Instant::now() + timeout,
         poll_interval,
-        "shrunk sparse ranges",
-    )?;
+        label: "shrunk sparse ranges",
+    })?;
 
     record_sparse_operation(
         context,
@@ -4811,16 +4823,16 @@ fn run_sparse_range_operations(
         )?,
     )?;
 
-    let (read_probes, zero_filled_holes) = wait_for_sparse_expected_until(
+    let (read_probes, zero_filled_holes) = wait_for_sparse_expected_until(SparseExpectedWait {
         clients,
-        &sparse_path,
-        SPARSE_FINAL_LOGICAL_SIZE,
-        &sparse_ranges,
-        sparse_hole_specs(),
-        Instant::now() + timeout,
+        sparse_path: &sparse_path,
+        logical_size: SPARSE_FINAL_LOGICAL_SIZE,
+        expected_ranges: &sparse_ranges,
+        hole_specs: sparse_hole_specs(),
+        deadline: Instant::now() + timeout,
         poll_interval,
-        "final sparse ranges",
-    )?;
+        label: "final sparse ranges",
+    })?;
     record_sparse_operation(
         context,
         &mut operations,
@@ -4859,16 +4871,30 @@ fn run_sparse_range_operations(
     Ok((operations, summary))
 }
 
-fn wait_for_sparse_expected_until(
-    clients: &[ClientSpec],
-    sparse_path: &str,
+struct SparseExpectedWait<'a> {
+    clients: &'a [ClientSpec],
+    sparse_path: &'a str,
     logical_size: u64,
-    expected_ranges: &[SparseRangeSpec],
-    hole_specs: &[SparseHoleSpec],
+    expected_ranges: &'a [SparseRangeSpec],
+    hole_specs: &'a [SparseHoleSpec],
     deadline: Instant,
     poll_interval: Duration,
-    label: &str,
+    label: &'a str,
+}
+
+fn wait_for_sparse_expected_until(
+    wait: SparseExpectedWait<'_>,
 ) -> Result<(Vec<SparseReadProbe>, Vec<SparseHoleProbe>), ScenarioError> {
+    let SparseExpectedWait {
+        clients,
+        sparse_path,
+        logical_size,
+        expected_ranges,
+        hole_specs,
+        deadline,
+        poll_interval,
+        label,
+    } = wait;
     loop {
         let observation = observe_sparse_ranges(
             clients,

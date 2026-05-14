@@ -16,7 +16,8 @@ use std::sync::Arc;
 use std::time::Instant;
 use studiofs_meta::MetaError;
 use studiofs_meta::schema::{
-    DEFAULT_CHUNK_SIZE, ResolvedSliceSource, ResolvedSliceSpan, chunk_start_offset,
+    DEFAULT_CHUNK_SIZE, FileType, ResolvedSliceSource, ResolvedSliceSpan,
+    UploadState as MetaUploadState, chunk_start_offset,
 };
 use studiofs_meta::types::{Ino, InodeAttr, PayloadRef, block_index_from_offset};
 use tracing::{debug, error, info, warn};
@@ -838,13 +839,53 @@ impl<'a> ReadMetadataResolver<'a> {
     }
 
     fn dirty_attr(&self) -> Option<InodeAttr> {
-        self.vfs
+        let dirty_attr = self
+            .vfs
             .state
             .namespace
             .dirty_attrs
             .lock()
             .get(&self.ino)
-            .cloned()
+            .cloned()?;
+
+        if self
+            .vfs
+            .has_pending_local_dirty_payloads_for_inode(self.ino)
+            || self.vfs.inode_has_dirty_writer_stack(self.ino)
+            || !self.vfs.pending_uploads_for_inode(self.ino).is_empty()
+        {
+            return Some(dirty_attr);
+        }
+        let dirty_attr_tracks_pending_content = dirty_attr.kind == FileType::RegularFile
+            && (dirty_attr.upload_state != MetaUploadState::Ready
+                || dirty_attr.content_epoch != dirty_attr.committed_content_epoch);
+        if !dirty_attr_tracks_pending_content {
+            return Some(dirty_attr);
+        }
+
+        let remote_attr = match self.vfs.sync_meta().get_attr(self.ino) {
+            Ok(remote_attr) => remote_attr,
+            Err(error) => {
+                warn!(
+                    ino = self.ino,
+                    error = %error,
+                    "failed to refresh drained dirty attr from authoritative metadata"
+                );
+                return Some(dirty_attr);
+            }
+        };
+        if self
+            .vfs
+            .ready_attr_supersedes_local_regular_file_state(self.ino, &remote_attr)
+        {
+            self.vfs.clear_superseded_local_regular_file_state(
+                self.ino,
+                remote_attr.committed_content_epoch,
+            );
+            return Some(remote_attr);
+        }
+
+        Some(dirty_attr)
     }
 
     fn cached_attr(&self) -> Option<InodeAttr> {
@@ -2261,6 +2302,66 @@ mod tests {
             assert!(
                 !vfs.state.namespace.attr_read_cache.lock().contains(ino),
                 "ready metadata should drop cached drained dirty attrs"
+            );
+        });
+    }
+
+    #[test]
+    fn resolve_read_metadata_async_refreshes_drained_dirty_attr_from_ready_meta() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "resolve-refreshes-drained-dirty-attr");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let created = vfs
+                .create(
+                    ROOT_INO,
+                    b"resolve-refreshes-drained-dirty-attr.txt",
+                    1000,
+                    1000,
+                    0o644,
+                )
+                .expect("create file");
+            let ino = created.ino;
+            let published_payload = b"published winner";
+
+            vfs.write(ino, 0, published_payload)
+                .await
+                .expect("write published payload");
+            vfs.flush(ino).await.expect("flush published payload");
+            let (published_epoch, published_blocks) =
+                mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+            publish_current_file_graph(&meta, ino, published_epoch, &published_blocks);
+            vfs.cancel_pending_uploads_for_inode(ino);
+
+            let published_attr = meta.get_attr(ino).expect("load published attr");
+            let mut drained_dirty_attr = published_attr.clone();
+            drained_dirty_attr.size = 5;
+            drained_dirty_attr.upload_state = MetaUploadState::Updating;
+            drained_dirty_attr.content_epoch = published_attr.committed_content_epoch + 1;
+            vfs.state
+                .namespace
+                .dirty_attrs
+                .lock()
+                .insert(ino, drained_dirty_attr.clone());
+            vfs.state.namespace.attr_read_cache.lock().put(
+                ino,
+                drained_dirty_attr,
+                ATTR_CACHE_TTL,
+                Instant::now(),
+            );
+
+            let (resolved_attr, _) = vfs
+                .resolve_read_metadata_async(ino, 0, published_payload.len() as u64)
+                .await
+                .expect("resolve published metadata");
+
+            assert_eq!(
+                resolved_attr.size, published_attr.size,
+                "read resolution must refresh drained dirty attrs from authoritative ready metadata"
+            );
+            assert!(
+                !vfs.state.namespace.dirty_attrs.lock().contains_key(&ino),
+                "refresh should clear stale dirty attrs before serving the read"
             );
         });
     }

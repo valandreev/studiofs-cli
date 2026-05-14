@@ -425,7 +425,24 @@ impl RedbMetaEngine {
         preserve_current_tombstoned_ranges: bool,
     ) -> MetaResult<()> {
         // A published base event carries the sender's complete visible base graph.
-        // An empty graph is therefore an authoritative sparse/hole-only result for the inode.
+        // When there is no protected local base, replay it as an authoritative
+        // replacement so stale disjoint ranges from an older local winner cannot
+        // remain visible after all peers have applied the same PG order.
+        if !preserve_current_tombstoned_ranges {
+            Self::clear_regular_file_chunk_rows_in_txn(txn, REGULAR_FILE_BASE_TABLE, ino)?;
+            for (chunk_id, incoming_slices) in chunk_slices {
+                Self::set_regular_file_chunk_state_in_txn(
+                    txn,
+                    REGULAR_FILE_BASE_TABLE,
+                    false,
+                    ino,
+                    *chunk_id,
+                    incoming_slices,
+                )?;
+            }
+            return Ok(());
+        }
+
         if chunk_slices.is_empty() {
             Self::clear_regular_file_chunk_rows_in_txn(txn, REGULAR_FILE_BASE_TABLE, ino)?;
             return Ok(());

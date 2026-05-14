@@ -2868,6 +2868,36 @@ impl PgMetaEngine {
         Ok(merged)
     }
 
+    fn regular_file_serving_reconcile_inodes(events: &[MetaEvent]) -> HashSet<Ino> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                MetaEvent::SetAttr { attr } if attr.kind == FileType::RegularFile => Some(attr.ino),
+                MetaEvent::PublishRegularFileBaseSlices { ino, .. }
+                | MetaEvent::RemoveAttr { ino }
+                | MetaEvent::RemoveRegularFileGraph { ino } => Some(*ino),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn reconcile_regular_file_serving_from_base_when_unconflicted(
+        &self,
+        inodes: &HashSet<Ino>,
+    ) -> MetaResult<bool> {
+        if inodes.is_empty() {
+            return Ok(false);
+        }
+        let overlay = self.local_overlay_conflicts()?;
+        let ready_inodes: HashSet<_> = inodes
+            .iter()
+            .copied()
+            .filter(|ino| !overlay.attr_inodes.contains(ino) && !overlay.block_inodes.contains(ino))
+            .collect();
+        self.local
+            .reconcile_regular_file_serving_from_base(&ready_inodes)
+    }
+
     fn apply_visible_self_batch(&self, batch_events: &[MetaEvent]) -> MetaResult<bool> {
         if batch_events.is_empty() {
             return Ok(false);
@@ -3316,9 +3346,14 @@ impl PgMetaEngine {
             idx = next_idx;
 
             if is_self_batch {
+                let reconcile_inodes = Self::regular_file_serving_reconcile_inodes(&batch_events);
                 applied_any |= self.apply_visible_self_batch(&batch_events)?;
                 self.acknowledge_local_prefix_from_self_batch(&batch_events)?;
+                applied_any |= self.reconcile_regular_file_serving_from_base_when_unconflicted(
+                    &reconcile_inodes,
+                )?;
             } else {
+                let reconcile_inodes = Self::regular_file_serving_reconcile_inodes(&batch_events);
                 let effective_overlay = if let Some(recent_flush) = recent_flush {
                     if batch_version < recent_flush.batch_version {
                         Self::merge_overlay_conflicts(&overlay, &recent_flush.overlay)
@@ -3337,6 +3372,9 @@ impl PgMetaEngine {
                     &batch_events,
                     &effective_overlay,
                     protected_base_inodes,
+                )?;
+                applied_any |= self.reconcile_regular_file_serving_from_base_when_unconflicted(
+                    &reconcile_inodes,
                 )?;
                 if batch_events.iter().any(MetaEvent::is_namespace_mutation) {
                     max_namespace_version = max_namespace_version.max(batch_version);
@@ -3597,12 +3635,14 @@ impl PgMetaEngine {
             self.persist_flushed_event_seq(batch.event_end)?;
             return Ok(None);
         }
+        let reconcile_inodes = Self::regular_file_serving_reconcile_inodes(&remote_events);
         let batch_version = self.push_event_log_batch_locked(&events)?;
         // Do not advance `local_version` here. The writer may have published a
         // newer batch_version while still missing earlier foreign batches.
         // `pull_foreign_events_locked()` must remain able to read the full gap.
         self.apply_visible_self_batch(&remote_events)?;
         self.persist_flushed_event_seq(batch.event_end)?;
+        self.reconcile_regular_file_serving_from_base_when_unconflicted(&reconcile_inodes)?;
         Ok(Some(RecentFlush {
             batch_version,
             overlay: Self::overlay_conflicts_for_events(&remote_events),

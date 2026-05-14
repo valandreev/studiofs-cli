@@ -5002,6 +5002,9 @@ impl StudioVfs {
             .get(&ino)
             .and_then(|state| state.pending_incarnation.as_ref())
             .is_some_and(|pending| pending.content_epoch > committed_epoch);
+        if pending_incarnation_newer_than_committed {
+            return false;
+        }
         let pending_uploads = self.pending_uploads_for_inode(ino);
         let has_newer_pending_upload = pending_uploads
             .iter()
@@ -5033,9 +5036,7 @@ impl StudioVfs {
             || has_dirty_writers
             || has_newer_pending_upload
             || has_newer_pending_epoch_finalization;
-        if (dirty_attr_newer_than_committed || pending_incarnation_newer_than_committed)
-            && has_newer_local_content_work
-        {
+        if dirty_attr_newer_than_committed && has_newer_local_content_work {
             return false;
         }
         has_pending_local_payloads

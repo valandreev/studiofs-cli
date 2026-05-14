@@ -917,6 +917,87 @@ fn replica_serving_base_publish_preserves_unpublished_local_overlay() {
 }
 
 #[test]
+fn reconcile_regular_file_serving_from_base_resets_stale_ready_attr() {
+    let engine = temp_engine();
+    let file = engine
+        .create_file(ROOT_INO, b"reconcile-serving-attr.bin", 1000, 1000, 0o644)
+        .unwrap();
+
+    let mut base_attr = engine.get_attr(file.ino).unwrap();
+    base_attr.size = u64::from(DEFAULT_BLOCK_SIZE);
+    base_attr.committed_size = u64::from(DEFAULT_BLOCK_SIZE);
+    base_attr.content_epoch = 1;
+    base_attr.committed_content_epoch = 1;
+    base_attr.upload_state = UploadState::Ready;
+    let base_payload = PayloadRef::new_full(94_001, DEFAULT_BLOCK_SIZE);
+    let base_slices = RedbMetaEngine::chunk_slices_for_block(
+        0,
+        DEFAULT_BLOCK_SIZE,
+        Some(&base_payload),
+        PayloadRefState::Published,
+    )
+    .unwrap();
+    engine
+        .apply_replica_events_to_base(&[
+            MetaEvent::PublishRegularFileBaseSlices {
+                ino: file.ino,
+                chunk_slices: base_slices,
+            },
+            MetaEvent::SetAttr {
+                attr: base_attr.clone(),
+            },
+        ])
+        .unwrap();
+
+    let mut stale_serving_attr = base_attr.clone();
+    stale_serving_attr.size = u64::from(DEFAULT_BLOCK_SIZE) + 223;
+    stale_serving_attr.committed_size = stale_serving_attr.size;
+    engine
+        .apply_replica_serving_state(&[MetaEvent::SetAttr {
+            attr: stale_serving_attr,
+        }])
+        .unwrap();
+    assert_eq!(
+        engine.get_attr(file.ino).unwrap().size,
+        u64::from(DEFAULT_BLOCK_SIZE) + 223
+    );
+    assert!(
+        engine
+            .local_overlay_attr_inodes()
+            .unwrap()
+            .contains(&file.ino),
+        "stale serving attr should be visible as a local attr overlay before reconciliation"
+    );
+
+    assert!(
+        engine
+            .reconcile_regular_file_serving_from_base(&HashSet::from([file.ino]))
+            .unwrap(),
+        "reconciliation should rewrite the stale serving mirror"
+    );
+
+    let attr = engine.get_attr(file.ino).unwrap();
+    assert_eq!(attr.size, u64::from(DEFAULT_BLOCK_SIZE));
+    assert_eq!(attr.committed_size, u64::from(DEFAULT_BLOCK_SIZE));
+    assert!(
+        !engine
+            .local_overlay_attr_inodes()
+            .unwrap()
+            .contains(&file.ino),
+        "serving attr should match the base attr after reconciliation"
+    );
+    assert_eq!(
+        engine
+            .lookup_regular_file_slices(file.ino, 0, attr.size)
+            .unwrap()
+            .into_iter()
+            .filter_map(|span| span.payload.map(|payload| payload.object_id))
+            .collect::<Vec<_>>(),
+        vec![base_payload.object_id]
+    );
+}
+
+#[test]
 fn protected_base_publish_merges_disjoint_remote_ranges_without_losing_newer_local_ranges() {
     let engine = temp_engine();
     let file = engine
@@ -1036,7 +1117,7 @@ fn protected_base_publish_does_not_shadow_overlapping_local_range() {
 }
 
 #[test]
-fn replica_base_publish_merges_disjoint_graph_for_unprotected_inode() {
+fn replica_base_publish_replaces_disjoint_graph_for_unprotected_inode() {
     let engine = temp_engine();
     let file = engine
         .create_file(ROOT_INO, b"base-merge-disjoint.bin", 1000, 1000, 0o644)
@@ -1088,13 +1169,13 @@ fn replica_base_publish_merges_disjoint_graph_for_unprotected_inode() {
         .collect();
     assert_eq!(
         object_ids,
-        vec![remote_middle.object_id, local_tail.object_id],
-        "publish replay should apply incoming payloads without dropping disjoint local base ranges"
+        vec![remote_middle.object_id],
+        "unprotected publish replay should replace the local base graph with the incoming authoritative graph"
     );
 }
 
 #[test]
-fn replica_aux_base_publish_merges_disjoint_graph_for_unprotected_inode() {
+fn replica_aux_base_publish_replaces_disjoint_graph_for_unprotected_inode() {
     let engine = temp_engine();
     let file = engine
         .create_file(ROOT_INO, b"aux-base-merge-disjoint.bin", 1000, 1000, 0o644)
@@ -1146,8 +1227,8 @@ fn replica_aux_base_publish_merges_disjoint_graph_for_unprotected_inode() {
         .collect();
     assert_eq!(
         object_ids,
-        vec![remote_middle.object_id, local_tail.object_id],
-        "aux replay should apply incoming payloads without dropping disjoint local base ranges"
+        vec![remote_middle.object_id],
+        "aux replay should replace the local base graph with the incoming authoritative graph"
     );
 }
 

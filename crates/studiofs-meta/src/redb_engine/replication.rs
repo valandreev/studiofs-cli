@@ -952,6 +952,59 @@ impl RedbMetaEngine {
         Ok(())
     }
 
+    /// Reconcile stale regular-file serving mirrors to the imported base view
+    /// after the PG layer has proven that no local event-log overlay still owns
+    /// those inodes.
+    pub fn reconcile_regular_file_serving_from_base(
+        &self,
+        inodes: &HashSet<Ino>,
+    ) -> MetaResult<bool> {
+        if inodes.is_empty() {
+            return Ok(false);
+        }
+
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let mut changed = false;
+
+        for ino in inodes {
+            let base_attr = {
+                let base = txn
+                    .open_table(BASE_INODES_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                base.get(*ino)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?
+                    .map(|value| decode::<InodeAttr>(value.value()))
+                    .transpose()?
+            };
+
+            match base_attr {
+                Some(attr) if attr.kind == FileType::RegularFile => {
+                    Self::set_inode_mirror_in_txn(&txn, &attr)?;
+                    if attr.upload_state == UploadState::Ready
+                        && attr.content_epoch == attr.committed_content_epoch
+                        && attr.size == attr.committed_size
+                    {
+                        Self::clear_regular_file_serving_overlay_in_txn(&txn, *ino)?;
+                    }
+                    changed = true;
+                }
+                Some(_) => {}
+                None => {
+                    Self::remove_inode_mirror_in_txn(&txn, *ino)?;
+                    Self::clear_regular_file_serving_overlay_in_txn(&txn, *ino)?;
+                    changed = true;
+                }
+            }
+        }
+
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(changed)
+    }
+
     fn serving_overlay_can_follow_base_publish_in_txn(
         txn: &redb::WriteTransaction,
         ino: Ino,
