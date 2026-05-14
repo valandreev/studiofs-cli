@@ -915,6 +915,185 @@ fn replica_serving_base_publish_preserves_unpublished_local_overlay() {
 }
 
 #[test]
+fn protected_base_publish_merges_disjoint_remote_ranges_without_losing_newer_local_ranges() {
+    let engine = temp_engine();
+    let file = engine
+        .create_file(ROOT_INO, b"protected-base-merge.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let mut attr = engine.get_attr(file.ino).unwrap();
+    attr.content_epoch = 3;
+    attr.committed_content_epoch = 3;
+    attr.size = (3 * u64::from(DEFAULT_BLOCK_SIZE)) + 4096;
+    attr.committed_size = attr.size;
+    attr.upload_state = UploadState::Ready;
+    engine.set_attr(&attr).unwrap();
+
+    let newer_local_tail = PayloadRef::new_partial(93_001, 4096);
+    engine
+        .stage_payload_slice(file.ino, 3, &newer_local_tail)
+        .unwrap();
+    mark_overlay_objects_uploaded(&engine, file.ino, 3, &[newer_local_tail.object_id]);
+    assert!(
+        engine
+            .publish_regular_file_overlay_to_base_if_matches(file.ino, 3)
+            .unwrap()
+    );
+    let local_object_ids: Vec<_> = engine
+        .lookup_regular_file_slices(file.ino, 0, (4 * u64::from(DEFAULT_BLOCK_SIZE)) + 4096)
+        .unwrap()
+        .into_iter()
+        .filter_map(|span| span.payload.map(|payload| payload.object_id))
+        .collect();
+    assert_eq!(local_object_ids, vec![newer_local_tail.object_id]);
+
+    let older_remote_middle = PayloadRef::new_partial(93_002, 4096);
+    let older_remote_event = MetaEvent::PublishRegularFileBaseSlices {
+        ino: file.ino,
+        chunk_slices: RedbMetaEngine::chunk_slices_for_block(
+            2,
+            DEFAULT_BLOCK_SIZE,
+            Some(&older_remote_middle),
+            PayloadRefState::Published,
+        )
+        .unwrap(),
+    };
+    engine
+        .apply_replica_events_to_base_preserving_protected_base_ranges(
+            std::slice::from_ref(&older_remote_event),
+            &HashSet::from([file.ino]),
+        )
+        .unwrap();
+
+    let object_ids: Vec<_> = engine
+        .lookup_regular_file_slices(file.ino, 0, (4 * u64::from(DEFAULT_BLOCK_SIZE)) + 4096)
+        .unwrap()
+        .into_iter()
+        .filter_map(|span| span.payload.map(|payload| payload.object_id))
+        .collect();
+    assert_eq!(
+        object_ids,
+        vec![older_remote_middle.object_id, newer_local_tail.object_id],
+        "an older protected publish should fill disjoint holes without replacing newer local base ranges"
+    );
+}
+
+#[test]
+fn replica_base_publish_merges_disjoint_ranges_instead_of_replacing_whole_graph() {
+    let engine = temp_engine();
+    let file = engine
+        .create_file(ROOT_INO, b"base-merge-disjoint.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let mut attr = engine.get_attr(file.ino).unwrap();
+    attr.content_epoch = 3;
+    attr.committed_content_epoch = 3;
+    attr.size = (3 * u64::from(DEFAULT_BLOCK_SIZE)) + 4096;
+    attr.committed_size = attr.size;
+    attr.upload_state = UploadState::Ready;
+    engine.set_attr(&attr).unwrap();
+
+    let local_tail = PayloadRef::new_partial(93_101, 4096);
+    engine.stage_payload_slice(file.ino, 3, &local_tail).unwrap();
+    mark_overlay_objects_uploaded(&engine, file.ino, 3, &[local_tail.object_id]);
+    assert!(
+        engine
+            .publish_regular_file_overlay_to_base_if_matches(file.ino, 3)
+            .unwrap()
+    );
+
+    let remote_middle = PayloadRef::new_partial(93_102, 4096);
+    let remote_event = MetaEvent::PublishRegularFileBaseSlices {
+        ino: file.ino,
+        chunk_slices: vec![(
+            ChunkId(0),
+            vec![SliceRecord {
+                slice_id: SliceId(0),
+                order: SliceOrder(0),
+                range: SliceRange::new(
+                    2 * DEFAULT_BLOCK_SIZE,
+                    (2 * DEFAULT_BLOCK_SIZE) + 4096,
+                )
+                .unwrap(),
+                payload: Some(remote_middle.clone()),
+                payload_state: PayloadRefState::Published,
+            }],
+        )],
+    };
+    engine
+        .apply_replica_events_to_base(std::slice::from_ref(&remote_event))
+        .unwrap();
+
+    let object_ids: Vec<_> = engine
+        .lookup_regular_file_slices(file.ino, 0, (4 * u64::from(DEFAULT_BLOCK_SIZE)) + 4096)
+        .unwrap()
+        .into_iter()
+        .filter_map(|span| span.payload.map(|payload| payload.object_id))
+        .collect();
+    assert_eq!(
+        object_ids,
+        vec![remote_middle.object_id, local_tail.object_id],
+        "replaying a disjoint publish must not discard already-published base ranges"
+    );
+}
+
+#[test]
+fn replica_aux_base_publish_merges_disjoint_ranges_instead_of_replacing_whole_graph() {
+    let engine = temp_engine();
+    let file = engine
+        .create_file(ROOT_INO, b"aux-base-merge-disjoint.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let mut attr = engine.get_attr(file.ino).unwrap();
+    attr.content_epoch = 3;
+    attr.committed_content_epoch = 3;
+    attr.size = (3 * u64::from(DEFAULT_BLOCK_SIZE)) + 4096;
+    attr.committed_size = attr.size;
+    attr.upload_state = UploadState::Ready;
+    engine.set_attr(&attr).unwrap();
+
+    let local_tail = PayloadRef::new_partial(93_201, 4096);
+    engine.stage_payload_slice(file.ino, 3, &local_tail).unwrap();
+    mark_overlay_objects_uploaded(&engine, file.ino, 3, &[local_tail.object_id]);
+    assert!(
+        engine
+            .publish_regular_file_overlay_to_base_if_matches(file.ino, 3)
+            .unwrap()
+    );
+
+    let remote_middle = PayloadRef::new_partial(93_202, 4096);
+    let remote_event = MetaEvent::PublishRegularFileBaseSlices {
+        ino: file.ino,
+        chunk_slices: vec![(
+            ChunkId(0),
+            vec![SliceRecord {
+                slice_id: SliceId(0),
+                order: SliceOrder(0),
+                range: SliceRange::new(
+                    2 * DEFAULT_BLOCK_SIZE,
+                    (2 * DEFAULT_BLOCK_SIZE) + 4096,
+                )
+                .unwrap(),
+                payload: Some(remote_middle.clone()),
+                payload_state: PayloadRefState::Published,
+            }],
+        )],
+    };
+    engine
+        .apply_replica_aux_state(std::slice::from_ref(&remote_event))
+        .unwrap();
+
+    let object_ids: Vec<_> = engine
+        .lookup_regular_file_slices(file.ino, 0, (4 * u64::from(DEFAULT_BLOCK_SIZE)) + 4096)
+        .unwrap()
+        .into_iter()
+        .filter_map(|span| span.payload.map(|payload| payload.object_id))
+        .collect();
+    assert_eq!(
+        object_ids,
+        vec![remote_middle.object_id, local_tail.object_id],
+        "aux replay of a disjoint publish must not discard already-published base ranges"
+    );
+}
+
+#[test]
 fn replica_serving_remove_attr_clears_regular_file_overlay_payload() {
     let engine = temp_engine();
     let file = engine

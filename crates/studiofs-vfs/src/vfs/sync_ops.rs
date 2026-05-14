@@ -741,12 +741,14 @@ impl StudioVfs {
             self.fail_inline_dirty_attr_persist_for_test()?;
             let meta = self.meta.clone();
             let attr_to_persist = attr.clone();
-            run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
-                engine.set_attr(&attr_to_persist)
+            let committed_attr = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+                engine.flush_regular_file_overlay_slices_with_attr(ino, &[], Some(&attr_to_persist))
             })
             .await?;
-            self.clear_matching_dirty_attr_if_committed(ino, &attr);
+            let committed_attr = committed_attr.as_ref().unwrap_or(&attr);
+            self.clear_matching_dirty_attr_if_committed(ino, committed_attr);
             self.state.namespace.attr_read_cache.lock().remove(ino);
+            self.refresh_inode_incarnation_state_from_attr(ino, committed_attr);
             true
         } else {
             false

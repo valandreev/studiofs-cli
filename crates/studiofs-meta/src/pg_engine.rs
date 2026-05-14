@@ -2763,9 +2763,16 @@ impl PgMetaEngine {
         &self,
         batch_events: &[MetaEvent],
         overlay: &OverlayConflictSets,
+        base_protected_regular_file_inodes: &HashSet<Ino>,
     ) -> MetaResult<bool> {
         let removed_inodes = self.removed_inodes_for_batch(batch_events);
-        self.local.apply_replica_events_to_base(batch_events)?;
+        let protected_attr_merges = self
+            .protected_regular_file_attr_merges(batch_events, base_protected_regular_file_inodes)?;
+        self.local
+            .apply_replica_events_to_base_preserving_protected_base_ranges(
+                batch_events,
+                base_protected_regular_file_inodes,
+            )?;
         let serving_events: Vec<MetaEvent> = batch_events
             .iter()
             .filter(|event| {
@@ -2774,6 +2781,10 @@ impl PgMetaEngine {
             .cloned()
             .collect();
         self.local.apply_replica_serving_state(&serving_events)?;
+        if !protected_attr_merges.is_empty() {
+            self.local
+                .apply_replica_serving_state(&protected_attr_merges)?;
+        }
         let mut aux_events = Vec::new();
         for event in batch_events {
             if !Self::event_has_aux_apply_effect(event) {
@@ -2790,6 +2801,41 @@ impl PgMetaEngine {
 
         self.local.apply_replica_aux_state(&aux_events)?;
         Ok(true)
+    }
+
+    fn protected_regular_file_attr_merges(
+        &self,
+        batch_events: &[MetaEvent],
+        protected_regular_file_inodes: &HashSet<Ino>,
+    ) -> MetaResult<Vec<MetaEvent>> {
+        let mut merged = Vec::new();
+        for event in batch_events {
+            let MetaEvent::SetAttr { attr } = event else {
+                continue;
+            };
+            if attr.kind != FileType::RegularFile
+                || !protected_regular_file_inodes.contains(&attr.ino)
+            {
+                continue;
+            }
+            let Ok(current) = self.local.get_attr(attr.ino) else {
+                continue;
+            };
+            if current.kind != FileType::RegularFile || current.upload_state != UploadState::Ready {
+                continue;
+            }
+            let mut merged_attr = attr.clone();
+            merged_attr.size = merged_attr.size.max(current.size);
+            merged_attr.committed_size = merged_attr.committed_size.max(current.committed_size);
+            merged_attr.content_epoch = merged_attr.content_epoch.max(current.content_epoch);
+            merged_attr.committed_content_epoch = merged_attr
+                .committed_content_epoch
+                .max(current.committed_content_epoch);
+            merged_attr.mtime = merged_attr.mtime.max(current.mtime);
+            merged_attr.ctime = merged_attr.ctime.max(current.ctime);
+            merged.push(MetaEvent::SetAttr { attr: merged_attr });
+        }
+        Ok(merged)
     }
 
     fn apply_visible_self_batch(&self, batch_events: &[MetaEvent]) -> MetaResult<bool> {
@@ -3233,6 +3279,7 @@ impl PgMetaEngine {
         let mut max_version = last_seq;
         let mut max_namespace_version = self.namespace_version.load(Ordering::SeqCst);
         let mut idx = 0;
+        let empty_protected_base_inodes = HashSet::new();
         while idx < rows.len() {
             let (batch_version, next_idx, batch_events, is_self_batch) =
                 Self::decode_foreign_batch(&rows, idx, client_id)?;
@@ -3251,7 +3298,16 @@ impl PgMetaEngine {
                 } else {
                     overlay.clone()
                 };
-                applied_any |= self.apply_foreign_batch(&batch_events, &effective_overlay)?;
+                let protected_base_inodes = if let Some(recent_flush) = recent_flush {
+                    &recent_flush.overlay.block_inodes
+                } else {
+                    &empty_protected_base_inodes
+                };
+                applied_any |= self.apply_foreign_batch(
+                    &batch_events,
+                    &effective_overlay,
+                    protected_base_inodes,
+                )?;
                 if batch_events.iter().any(MetaEvent::is_namespace_mutation) {
                     max_namespace_version = max_namespace_version.max(batch_version);
                 }
@@ -5355,7 +5411,7 @@ mod tests {
             .expect("read local events");
         let projected = PgMetaEngine::project_remote_events(&events);
         remote
-            .apply_foreign_batch(&projected, &OverlayConflictSets::default())
+            .apply_foreign_batch(&projected, &OverlayConflictSets::default(), &HashSet::new())
             .expect("apply projected remote batch");
     }
 
@@ -5382,6 +5438,7 @@ mod tests {
                 MetaEvent::RemoveAttr { ino: file.ino },
             ],
             &overlay,
+            &HashSet::new(),
         )
         .expect("apply foreign unlink");
 
@@ -5420,6 +5477,7 @@ mod tests {
                 chunk_slices: vec![(ChunkId(0), vec![remote_slice])],
             }],
             &overlay,
+            &HashSet::new(),
         )
         .expect("apply foreign publish");
 

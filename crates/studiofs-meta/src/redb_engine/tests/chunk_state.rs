@@ -1493,10 +1493,16 @@ fn test_publish_regular_file_overlay_to_base_preserves_untouched_base_ranges() {
 }
 
 #[test]
-fn test_publish_regular_file_overlay_to_base_keeps_sparse_tail_committed_size_below_size() {
+fn test_publish_regular_file_overlay_to_base_commits_sparse_tail_logical_size() {
     let engine = temp_engine();
     let file = engine
-        .create_file(ROOT_INO, b"publish-sparse-tail.bin", 1000, 1000, 0o644)
+        .create_file(
+            ROOT_INO,
+            b"publish-sparse-tail-logical-size.bin",
+            1000,
+            1000,
+            0o644,
+        )
         .unwrap();
     let mut attr = engine.get_attr(file.ino).unwrap();
     attr.content_epoch = 5;
@@ -1521,8 +1527,18 @@ fn test_publish_regular_file_overlay_to_base_keeps_sparse_tail_committed_size_be
 
     let published_attr = engine.get_attr(file.ino).unwrap();
     assert_eq!(published_attr.size, 16 * 1024);
-    assert_eq!(published_attr.committed_size, 4096);
-    assert!(published_attr.committed_size < published_attr.size);
+    assert_eq!(
+        published_attr.committed_size,
+        published_attr.size,
+        "publishing a sparse tail must publish the logical EOF, not only the last payload byte"
+    );
+    let tail = engine
+        .lookup_regular_file_slices(file.ino, 4096, 12 * 1024)
+        .unwrap();
+    assert!(
+        tail.iter().all(|span| span.payload.is_none()),
+        "the published sparse tail should remain hole-backed rather than requiring payload bytes"
+    );
 }
 
 #[test]
@@ -1567,6 +1583,60 @@ fn test_publish_regular_file_overlay_to_base_accepts_fragmented_slice_graph() {
     assert_eq!(published_attr.upload_state, UploadState::Ready);
     assert_eq!(published_attr.committed_content_epoch, 9);
     assert_eq!(published_attr.committed_size, 8192);
+}
+
+#[test]
+fn test_tombstone_only_overlay_is_publish_ready_for_sparse_shrink() {
+    let engine = temp_engine();
+    let file = engine
+        .create_file(ROOT_INO, b"publish-sparse-shrink.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let mut attr = engine.get_attr(file.ino).unwrap();
+    attr.content_epoch = 1;
+    attr.size = 8192;
+    engine.set_attr(&attr).unwrap();
+
+    engine
+        .stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(7_701, 4096))
+        .unwrap();
+    mark_overlay_objects_uploaded(&engine, file.ino, 1, &[7_701]);
+    assert!(
+        engine
+            .publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
+            .unwrap()
+    );
+
+    let mut shrink_attr = engine.get_attr(file.ino).unwrap();
+    shrink_attr.content_epoch = 2;
+    shrink_attr.size = 4096;
+    engine
+        .flush_regular_file_overlay_slices_with_attr(
+            file.ino,
+            &[(
+                ChunkId(0),
+                vec![SliceRecord::tombstone(
+                    SliceId(0),
+                    SliceOrder(0),
+                    SliceRange::new(4096, 8192).expect("valid sparse shrink tombstone"),
+                )],
+            )],
+            Some(&shrink_attr),
+        )
+        .unwrap();
+
+    let lifecycle = engine
+        .get_inode_lifecycle(file.ino)
+        .unwrap()
+        .expect("sparse shrink lifecycle");
+    assert_eq!(lifecycle.state, InodeLifecycleState::PublishReady);
+    assert!(
+        engine
+            .publish_regular_file_overlay_to_base_if_matches(file.ino, 2)
+            .unwrap()
+    );
+    let published_attr = engine.get_attr(file.ino).unwrap();
+    assert_eq!(published_attr.size, 4096);
+    assert_eq!(published_attr.committed_size, 4096);
 }
 
 #[test]

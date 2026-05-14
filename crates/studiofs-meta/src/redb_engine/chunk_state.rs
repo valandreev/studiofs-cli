@@ -418,32 +418,85 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    pub(super) fn replace_regular_file_chunk_rows_from_chunk_slices_in_txn(
+    pub(super) fn merge_regular_file_base_publish_preserving_current_in_txn(
         txn: &redb::WriteTransaction,
-        table_def: TableDefinition<&[u8], &[u8]>,
         ino: Ino,
         chunk_slices: &[(ChunkId, Vec<SliceRecord>)],
-        track_pending_compaction: bool,
     ) -> MetaResult<()> {
-        if track_pending_compaction {
-            Self::clear_regular_file_pending_compaction_rows_in_txn(txn, ino)?;
-        }
-        Self::clear_regular_file_chunk_rows_in_txn(txn, table_def, ino)?;
-        for (chunk_id, slices) in chunk_slices {
-            Self::set_regular_file_chunk_state_in_txn(
-                txn,
-                table_def,
-                track_pending_compaction,
-                ino,
-                *chunk_id,
-                slices,
-            )?;
+        let mut table = txn
+            .open_table(REGULAR_FILE_BASE_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        for (chunk_id, incoming_slices) in chunk_slices {
+            let key = encode_regular_file_chunk_key(ino, *chunk_id);
+            let mut state = if let Some(entry) = table
+                .get(key.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                decode::<RegularFileChunkState>(entry.value())?
+            } else {
+                RegularFileChunkState::default()
+            };
+
+            for incoming in incoming_slices {
+                let Some(payload) = incoming.payload.as_ref() else {
+                    continue;
+                };
+                let uncovered_ranges =
+                    resolve_chunk_slice_spans(*chunk_id, incoming.range, Some(&state), None)
+                        .into_iter()
+                        .filter_map(|span| span.payload.is_none().then_some(span.range))
+                        .collect::<Vec<_>>();
+
+                for uncovered in uncovered_ranges {
+                    let offset_delta = uncovered
+                        .start
+                        .checked_sub(incoming.range.start)
+                        .ok_or_else(|| {
+                            MetaError::Storage(
+                                "protected base merge produced an invalid range".to_string(),
+                            )
+                        })?;
+                    let mut clipped_payload = payload.clone();
+                    clipped_payload.offset = clipped_payload
+                        .offset
+                        .checked_add(offset_delta)
+                        .ok_or_else(|| MetaError::Storage("payload offset overflow".to_string()))?;
+                    clipped_payload.length = uncovered.len();
+                    let slice_id = state
+                        .try_alloc_slice_id()
+                        .ok_or_else(|| MetaError::Storage("slice id overflow".to_string()))?;
+                    let slice_order = state
+                        .try_alloc_slice_order()
+                        .ok_or_else(|| MetaError::Storage("slice order overflow".to_string()))?;
+                    state.slices.insert(
+                        slice_id,
+                        SliceRecord {
+                            slice_id,
+                            order: slice_order,
+                            range: uncovered,
+                            payload: Some(clipped_payload),
+                            payload_state: PayloadRefState::Published,
+                        },
+                    );
+                }
+            }
+
+            state.refresh_fragmentation_metrics();
+            if state.is_empty() {
+                let _ = table
+                    .remove(key.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            } else {
+                let encoded = encode(&state)?;
+                table
+                    .insert(key.as_slice(), encoded.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            }
         }
         Ok(())
     }
 
-    #[cfg(test)]
-    #[allow(dead_code)]
     pub(super) fn apply_regular_file_chunk_slices_in_txn(
         txn: &redb::WriteTransaction,
         table_def: TableDefinition<&[u8], &[u8]>,
@@ -746,7 +799,7 @@ impl RedbMetaEngine {
         let mut published = RegularFileChunkState::default();
 
         for span in resolved {
-            if span.source == ResolvedSliceSource::Hole {
+            if span.payload.is_none() {
                 continue;
             }
             let slice_id = published

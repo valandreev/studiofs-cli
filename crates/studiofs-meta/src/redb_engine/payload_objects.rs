@@ -424,7 +424,7 @@ impl MetaPayloadObjects for RedbMetaEngine {
                 return Ok(false);
             }
 
-            let Some((committed_size, removed_object_ids)) =
+            let Some((_payload_covered_size, removed_object_ids)) =
                 Self::publish_regular_file_overlay_to_base_in_txn(&txn, ino)?
             else {
                 return Ok(false);
@@ -455,7 +455,7 @@ impl MetaPayloadObjects for RedbMetaEngine {
                     )?;
                 }
             }
-            attr.committed_size = committed_size.min(attr.size);
+            attr.committed_size = attr.size;
             attr.committed_content_epoch = attr.content_epoch;
             attr.upload_state = UploadState::Ready;
             drop(inodes);
