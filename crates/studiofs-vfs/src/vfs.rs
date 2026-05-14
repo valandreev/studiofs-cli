@@ -4865,6 +4865,10 @@ impl StudioVfs {
         ino: Ino,
         attr: &InodeAttr,
     ) -> InodeIncarnationState {
+        if self.ready_attr_supersedes_local_regular_file_state(ino, attr) {
+            self.clear_superseded_local_regular_file_state(ino, attr.committed_content_epoch);
+        }
+
         let has_pending_uploads = self.inode_has_pending_uploads(ino);
         if Self::is_fully_published_regular_file(attr)
             && !has_pending_uploads
@@ -4975,6 +4979,85 @@ impl StudioVfs {
             self.queue_epoch_finalization(ino, attr.content_epoch);
         }
         next_state
+    }
+
+    fn ready_attr_supersedes_local_regular_file_state(&self, ino: Ino, attr: &InodeAttr) -> bool {
+        if !Self::is_fully_published_regular_file(attr) {
+            return false;
+        }
+        let committed_epoch = attr.committed_content_epoch;
+        let (dirty_attr_present, dirty_attr_newer_than_committed) = {
+            let dirty_attrs = self.state.namespace.dirty_attrs.lock();
+            let dirty_attr = dirty_attrs.get(&ino);
+            (
+                dirty_attr.is_some(),
+                dirty_attr.is_some_and(|attr| attr.content_epoch > committed_epoch),
+            )
+        };
+        let pending_incarnation_newer_than_committed = self
+            .state
+            .incarnation
+            .inode_incarnations
+            .lock()
+            .get(&ino)
+            .and_then(|state| state.pending_incarnation.as_ref())
+            .is_some_and(|pending| pending.content_epoch > committed_epoch);
+        let pending_uploads = self.pending_uploads_for_inode(ino);
+        let has_newer_pending_upload = pending_uploads
+            .iter()
+            .any(|(_, _, content_epoch)| *content_epoch > committed_epoch);
+        if has_newer_pending_upload {
+            return false;
+        }
+        let live_extents = self.live_extent_records_for_inode(ino);
+        let (has_pending_epoch_finalization, has_newer_pending_epoch_finalization) = {
+            let pending_epoch_finalizations = self.state.upload.pending_epoch_finalizations.lock();
+            (
+                pending_epoch_finalizations
+                    .iter()
+                    .any(|pending| pending.0 == ino),
+                pending_epoch_finalizations
+                    .iter()
+                    .any(|pending| pending.0 == ino && pending.1 > committed_epoch),
+            )
+        };
+        if has_newer_pending_epoch_finalization {
+            return false;
+        }
+        let has_pending_local_payloads = self.has_pending_local_dirty_payloads_for_inode(ino);
+        let has_dirty_writers = self.state.writer_stack.has_dirty_writers(ino);
+        if has_dirty_writers && !dirty_attr_present {
+            return false;
+        }
+        let has_newer_local_content_work = has_pending_local_payloads
+            || has_dirty_writers
+            || has_newer_pending_upload
+            || has_newer_pending_epoch_finalization;
+        if (dirty_attr_newer_than_committed || pending_incarnation_newer_than_committed)
+            && has_newer_local_content_work
+        {
+            return false;
+        }
+        has_pending_local_payloads
+            || dirty_attr_present
+            || has_dirty_writers
+            || !pending_uploads.is_empty()
+            || !live_extents.is_empty()
+            || has_pending_epoch_finalization
+    }
+
+    fn clear_superseded_local_regular_file_state(&self, ino: Ino, committed_epoch: u64) {
+        debug!(
+            ino,
+            committed_epoch, "authoritative ready metadata superseded local regular-file state"
+        );
+        self.cancel_pending_uploads_for_inode(ino);
+        self.clear_pending_payloads_for_inode(ino);
+        self.state.writer_stack.clear_inode(ino);
+        self.state.namespace.dirty_attrs.lock().remove(&ino);
+        self.remove_live_extents_for_inode(ino);
+        self.remove_pending_epoch_finalizations_for_inode(ino);
+        self.invalidate_attr_read_cache([ino]);
     }
 
     fn clear_inode_incarnation(&self, ino: Ino) {

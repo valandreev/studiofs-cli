@@ -2007,6 +2007,265 @@ mod tests {
     }
 
     #[test]
+    fn ready_remote_attr_supersedes_matching_local_dirty_read_state() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, vfs, meta) =
+            make_unstarted_test_vfs(&tmp, "ready-remote-supersedes-local-read-state");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let created = vfs
+                .create(
+                    ROOT_INO,
+                    b"ready-remote-supersedes-local-read-state.txt",
+                    1000,
+                    1000,
+                    0o644,
+                )
+                .expect("create file");
+            let ino = created.ino;
+            let published_payload = b"published winner";
+
+            vfs.write(ino, 0, published_payload)
+                .await
+                .expect("write published payload");
+            vfs.flush(ino).await.expect("flush published payload");
+            let (published_epoch, published_blocks) =
+                mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+            publish_current_file_graph(&meta, ino, published_epoch, &published_blocks);
+            vfs.cancel_pending_uploads_for_inode(ino);
+
+            let published_attr = meta.get_attr(ino).expect("load published attr");
+            assert_eq!(published_attr.upload_state, MetaUploadState::Ready);
+            assert_eq!(
+                published_attr.content_epoch,
+                published_attr.committed_content_epoch
+            );
+
+            let mut stale_dirty_attr = published_attr.clone();
+            stale_dirty_attr.size = 5;
+            stale_dirty_attr.upload_state = MetaUploadState::Updating;
+            vfs.state
+                .namespace
+                .dirty_attrs
+                .lock()
+                .insert(ino, stale_dirty_attr.clone());
+            vfs.state.namespace.attr_read_cache.lock().put(
+                ino,
+                stale_dirty_attr,
+                ATTR_CACHE_TTL,
+                Instant::now(),
+            );
+            vfs.state.local_dirty.pending_payloads.lock().insert(
+                (ino, 0),
+                PendingPayload {
+                    data: BytesMut::from(&b"stale"[..]),
+                    dirty: true,
+                    reserved_object_id: None,
+                    persisted_len: None,
+                },
+            );
+            vfs.state
+                .local_dirty
+                .pending_payload_indexes
+                .lock()
+                .entry(ino)
+                .or_default()
+                .insert(0);
+            vfs.state
+                .local_dirty
+                .pending_bytes
+                .fetch_add(5, AtomicOrdering::Relaxed);
+
+            vfs.refresh_inode_incarnation_state_from_attr(ino, &published_attr);
+
+            assert!(
+                !vfs.has_pending_local_dirty_payloads_for_inode(ino),
+                "authoritative ready attr should clear same-epoch stale local payloads"
+            );
+            assert!(
+                !vfs.state.namespace.dirty_attrs.lock().contains_key(&ino),
+                "authoritative ready attr should clear same-epoch dirty attrs"
+            );
+            assert!(
+                !vfs.state.namespace.attr_read_cache.lock().contains(ino),
+                "authoritative ready attr should drop cached stale attrs"
+            );
+
+            let read = vfs
+                .read(ino, 0, published_payload.len() as u32)
+                .await
+                .expect("read published winner");
+            assert_eq!(read.as_ref(), published_payload);
+        });
+    }
+
+    #[test]
+    fn ready_remote_attr_preserves_newer_local_dirty_read_state() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, vfs, meta) =
+            make_unstarted_test_vfs(&tmp, "ready-remote-preserves-newer-local-read-state");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let created = vfs
+                .create(
+                    ROOT_INO,
+                    b"ready-remote-preserves-newer-local-read-state.txt",
+                    1000,
+                    1000,
+                    0o644,
+                )
+                .expect("create file");
+            let ino = created.ino;
+            let published_payload = b"published winner";
+
+            vfs.write(ino, 0, published_payload)
+                .await
+                .expect("write published payload");
+            vfs.flush(ino).await.expect("flush published payload");
+            let (published_epoch, published_blocks) =
+                mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+            publish_current_file_graph(&meta, ino, published_epoch, &published_blocks);
+            vfs.cancel_pending_uploads_for_inode(ino);
+
+            let published_attr = meta.get_attr(ino).expect("load published attr");
+            let mut newer_dirty_attr = published_attr.clone();
+            newer_dirty_attr.size = 5;
+            newer_dirty_attr.upload_state = MetaUploadState::Updating;
+            newer_dirty_attr.content_epoch = published_attr.committed_content_epoch + 1;
+            vfs.state
+                .namespace
+                .dirty_attrs
+                .lock()
+                .insert(ino, newer_dirty_attr.clone());
+            vfs.state.namespace.attr_read_cache.lock().put(
+                ino,
+                newer_dirty_attr,
+                ATTR_CACHE_TTL,
+                Instant::now(),
+            );
+            vfs.state.local_dirty.pending_payloads.lock().insert(
+                (ino, 0),
+                PendingPayload {
+                    data: BytesMut::from(&b"local"[..]),
+                    dirty: true,
+                    reserved_object_id: None,
+                    persisted_len: None,
+                },
+            );
+            vfs.state
+                .local_dirty
+                .pending_payload_indexes
+                .lock()
+                .entry(ino)
+                .or_default()
+                .insert(0);
+            vfs.state
+                .local_dirty
+                .pending_bytes
+                .fetch_add(5, AtomicOrdering::Relaxed);
+
+            vfs.refresh_inode_incarnation_state_from_attr(ino, &published_attr);
+
+            assert!(
+                vfs.has_pending_local_dirty_payloads_for_inode(ino),
+                "ready metadata must not clear newer local payloads"
+            );
+            assert!(
+                vfs.state.namespace.dirty_attrs.lock().contains_key(&ino),
+                "ready metadata must not clear newer dirty attrs"
+            );
+            assert!(
+                vfs.state.namespace.attr_read_cache.lock().contains(ino),
+                "ready metadata must not drop newer cached attrs"
+            );
+        });
+    }
+
+    #[test]
+    fn ready_remote_attr_supersedes_newer_dirty_attr_after_local_payloads_drain() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, vfs, meta) =
+            make_unstarted_test_vfs(&tmp, "ready-remote-supersedes-drained-dirty-attr");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let created = vfs
+                .create(
+                    ROOT_INO,
+                    b"ready-remote-supersedes-drained-dirty-attr.txt",
+                    1000,
+                    1000,
+                    0o644,
+                )
+                .expect("create file");
+            let ino = created.ino;
+            let published_payload = b"published winner";
+
+            vfs.write(ino, 0, published_payload)
+                .await
+                .expect("write published payload");
+            vfs.flush(ino).await.expect("flush published payload");
+            let (published_epoch, published_blocks) =
+                mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+            publish_current_file_graph(&meta, ino, published_epoch, &published_blocks);
+            vfs.cancel_pending_uploads_for_inode(ino);
+
+            let published_attr = meta.get_attr(ino).expect("load published attr");
+            let mut drained_dirty_attr = published_attr.clone();
+            drained_dirty_attr.size = 5;
+            drained_dirty_attr.upload_state = MetaUploadState::Updating;
+            drained_dirty_attr.content_epoch = published_attr.committed_content_epoch + 1;
+            vfs.state
+                .namespace
+                .dirty_attrs
+                .lock()
+                .insert(ino, drained_dirty_attr.clone());
+            vfs.state.namespace.attr_read_cache.lock().put(
+                ino,
+                drained_dirty_attr,
+                ATTR_CACHE_TTL,
+                Instant::now(),
+            );
+
+            assert!(
+                !vfs.has_pending_local_dirty_payloads_for_inode(ino),
+                "setup should model a dirty attr whose local payloads already drained"
+            );
+            assert!(
+                vfs.pending_uploads_for_inode(ino).is_empty(),
+                "setup should have no pending uploads"
+            );
+            assert!(
+                !vfs.live_extent_records_for_inode(ino).is_empty(),
+                "setup should keep stale live extents before authoritative ready refresh"
+            );
+            assert!(
+                !vfs.state.writer_stack.has_dirty_writers(ino),
+                "setup should have no dirty writer-stack state"
+            );
+            assert!(
+                vfs.state
+                    .upload
+                    .pending_epoch_finalizations
+                    .lock()
+                    .iter()
+                    .any(|pending| pending.0 == ino),
+                "setup should keep stale pending finalization before authoritative ready refresh"
+            );
+
+            vfs.refresh_inode_incarnation_state_from_attr(ino, &published_attr);
+
+            assert!(
+                !vfs.state.namespace.dirty_attrs.lock().contains_key(&ino),
+                "ready metadata should clear newer dirty attrs once local payloads are drained"
+            );
+            assert!(
+                !vfs.state.namespace.attr_read_cache.lock().contains(ino),
+                "ready metadata should drop cached drained dirty attrs"
+            );
+        });
+    }
+
+    #[test]
     fn resolve_read_metadata_async_bypasses_dirty_attr_read_plan_when_local_dirty_exists() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let (rt, vfs, meta) =
