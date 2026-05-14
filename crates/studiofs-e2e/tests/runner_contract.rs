@@ -324,12 +324,19 @@ fn sparse_range_scenario_disabled_run_writes_reproducible_artifacts() {
             .len()
             >= 3
     );
+    let zero_filled_holes = summary["sparse_ranges"]["zero_filled_holes"]
+        .as_array()
+        .unwrap();
+    assert_eq!(zero_filled_holes.len(), 6);
     assert!(
-        summary["sparse_ranges"]["zero_filled_holes"]
-            .as_array()
-            .unwrap()
-            .len()
-            >= 2
+        zero_filled_holes
+            .iter()
+            .all(|probe| probe["client"].is_string())
+    );
+    assert!(
+        zero_filled_holes
+            .iter()
+            .all(|probe| probe["all_zero"] == true)
     );
 
     let operations = fs::read_to_string(

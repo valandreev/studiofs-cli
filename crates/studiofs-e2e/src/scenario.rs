@@ -3017,6 +3017,7 @@ struct SparseExpectedRange {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SparseHoleProbe {
+    client: String,
     offset: u64,
     len: usize,
     all_zero: bool,
@@ -4636,7 +4637,7 @@ fn observe_sparse_ranges(
     hole_specs: &[SparseHoleSpec],
 ) -> SparseObservation {
     let mut read_probes = Vec::new();
-    let mut hole_results = sparse_hole_summaries(hole_specs, true);
+    let mut hole_results = Vec::new();
     let mut missing = Vec::new();
 
     for client in clients {
@@ -4655,8 +4656,16 @@ fn observe_sparse_ranges(
             }
         }
 
+        let mut file = match fs::File::open(&path) {
+            Ok(file) => file,
+            Err(error) => {
+                missing.push(format!("{}:{SPARSE_FILE_PATH} ({error})", client.name));
+                continue;
+            }
+        };
+
         for range in expected_ranges {
-            match read_exact_range(&path, range.offset, range.payload.len()) {
+            match read_exact_range_from(&mut file, range.offset, range.payload.len()) {
                 Ok(bytes) => {
                     let matched = bytes == range.payload;
                     if !matched {
@@ -4683,17 +4692,22 @@ fn observe_sparse_ranges(
             }
         }
 
-        for (index, hole) in hole_specs.iter().enumerate() {
-            match read_exact_range(&path, hole.offset, hole.len) {
+        for hole in hole_specs {
+            match read_exact_range_from(&mut file, hole.offset, hole.len) {
                 Ok(bytes) => {
                     let all_zero = bytes.iter().all(|byte| *byte == 0);
-                    hole_results[index].all_zero &= all_zero;
                     if !all_zero {
                         missing.push(format!(
                             "{}:{SPARSE_FILE_PATH}@{} expected zero-filled hole",
                             client.name, hole.offset
                         ));
                     }
+                    hole_results.push(SparseHoleProbe {
+                        client: client.name.clone(),
+                        offset: hole.offset,
+                        len: hole.len,
+                        all_zero,
+                    });
                 }
                 Err(error) => missing.push(format!(
                     "{}:{SPARSE_FILE_PATH}@{} ({error})",
@@ -4727,8 +4741,8 @@ fn write_sparse_file_range(
 }
 
 fn truncate_sparse_file(path: PathBuf, len: u64) -> io::Result<()> {
-    let mut options = mounted_write_barrier_open_options();
-    let file = options.read(true).open(path)?;
+    let options = mounted_write_barrier_open_options();
+    let file = options.open(path)?;
     file.set_len(len)?;
     file.sync_all()
 }
@@ -4761,6 +4775,10 @@ fn verify_sparse_hole(path: PathBuf, offset: u64, len: usize) -> Result<(), Scen
 
 fn read_exact_range(path: &Path, offset: u64, len: usize) -> io::Result<Vec<u8>> {
     let mut file = fs::File::open(path)?;
+    read_exact_range_from(&mut file, offset, len)
+}
+
+fn read_exact_range_from(file: &mut fs::File, offset: u64, len: usize) -> io::Result<Vec<u8>> {
     file.seek(SeekFrom::Start(offset))?;
     let mut buffer = vec![0; len];
     file.read_exact(&mut buffer)?;
@@ -4789,13 +4807,20 @@ fn sparse_expected_ranges() -> Vec<SparseExpectedRange> {
         .collect()
 }
 
-fn sparse_hole_summaries(hole_specs: &[SparseHoleSpec], all_zero: bool) -> Vec<SparseHoleProbe> {
-    hole_specs
+fn sparse_hole_summaries(
+    clients: &[&str],
+    hole_specs: &[SparseHoleSpec],
+    all_zero: bool,
+) -> Vec<SparseHoleProbe> {
+    clients
         .iter()
-        .map(|hole| SparseHoleProbe {
-            offset: hole.offset,
-            len: hole.len,
-            all_zero,
+        .flat_map(|client| {
+            hole_specs.iter().map(move |hole| SparseHoleProbe {
+                client: (*client).to_string(),
+                offset: hole.offset,
+                len: hole.len,
+                all_zero,
+            })
         })
         .collect()
 }
@@ -4807,7 +4832,11 @@ fn planned_sparse_range_summary() -> SparseRangeSummary {
         logical_size: SPARSE_FINAL_LOGICAL_SIZE,
         final_checksum_sha256: bytes_sha256(&expected_payload),
         expected_byte_ranges: sparse_expected_ranges(),
-        zero_filled_holes: sparse_hole_summaries(sparse_hole_specs(), true),
+        zero_filled_holes: sparse_hole_summaries(
+            ADVANCED_MOUNTED_CLIENT_NAMES,
+            sparse_hole_specs(),
+            true,
+        ),
         read_probes: ADVANCED_MOUNTED_CLIENT_NAMES
             .iter()
             .flat_map(|client| {
