@@ -2776,7 +2776,11 @@ impl PgMetaEngine {
         let serving_events: Vec<MetaEvent> = batch_events
             .iter()
             .filter(|event| {
-                !Self::serving_event_conflicts_with_overlay(event, overlay, &removed_inodes)
+                matches!(
+                    event,
+                    MetaEvent::PublishRegularFileBaseSlices { ino, .. }
+                        if base_protected_regular_file_inodes.contains(ino)
+                ) || !Self::serving_event_conflicts_with_overlay(event, overlay, &removed_inodes)
             })
             .cloned()
             .collect();
@@ -2816,6 +2820,20 @@ impl PgMetaEngine {
         protected_regular_file_inodes: &HashSet<Ino>,
     ) -> MetaResult<Vec<MetaEvent>> {
         let mut merged = Vec::new();
+        let payload_publish_inodes: HashSet<Ino> = batch_events
+            .iter()
+            .filter_map(|event| match event {
+                MetaEvent::PublishRegularFileBaseSlices { ino, chunk_slices }
+                    if chunk_slices
+                        .iter()
+                        .flat_map(|(_, slices)| slices)
+                        .any(|slice| slice.payload.is_some()) =>
+                {
+                    Some(*ino)
+                }
+                _ => None,
+            })
+            .collect();
         for event in batch_events {
             let MetaEvent::SetAttr { attr } = event else {
                 continue;
@@ -2831,7 +2849,9 @@ impl PgMetaEngine {
             if current.kind != FileType::RegularFile || current.upload_state != UploadState::Ready {
                 continue;
             }
-            if attr.content_epoch > current.content_epoch {
+            if attr.content_epoch > current.content_epoch
+                && !payload_publish_inodes.contains(&attr.ino)
+            {
                 continue;
             }
             let mut merged_attr = attr.clone();
@@ -5543,6 +5563,62 @@ mod tests {
     }
 
     #[test]
+    fn protected_attr_merge_preserves_larger_size_for_newer_remote_payload_publish() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+
+        let file = create_published_small_file(&pg, ROOT_INO, b"protected-newer-write.txt", 77_035);
+        let mut current = pg.get_attr(file.ino).expect("load local attr");
+        current.size = 3_146_061;
+        current.committed_size = current.size;
+        current.content_epoch = 5;
+        current.committed_content_epoch = 5;
+        current.upload_state = UploadState::Ready;
+        pg.set_attr(&current).expect("seed local protected attr");
+
+        let mut remote = current.clone();
+        remote.size = 3_145_926;
+        remote.committed_size = remote.size;
+        remote.content_epoch = 6;
+        remote.committed_content_epoch = 6;
+        remote.mtime = remote.mtime.saturating_add(1);
+        remote.ctime = remote.ctime.saturating_add(1);
+
+        let remote_tail = PayloadRef::new_partial(77_036, 26);
+        let remote_publish = MetaEvent::PublishRegularFileBaseSlices {
+            ino: file.ino,
+            chunk_slices: vec![(
+                ChunkId(0),
+                vec![SliceRecord {
+                    slice_id: SliceId(0),
+                    order: SliceOrder(0),
+                    range: SliceRange::new(
+                        3_145_900 % DEFAULT_CHUNK_SIZE,
+                        (3_145_900 % DEFAULT_CHUNK_SIZE) + 26,
+                    )
+                    .expect("remote tail range"),
+                    payload: Some(remote_tail),
+                    payload_state: PayloadRefState::Published,
+                }],
+            )],
+        };
+
+        pg.apply_foreign_batch(
+            &[MetaEvent::SetAttr { attr: remote }, remote_publish],
+            &OverlayConflictSets::default(),
+            &HashSet::from([file.ino]),
+        )
+        .expect("apply newer remote write publish");
+
+        let applied = pg.get_attr(file.ino).expect("load applied attr");
+        assert_eq!(
+            applied.size, current.size,
+            "a newer remote write publish must not shrink a protected larger logical EOF"
+        );
+        assert_eq!(applied.content_epoch, 6);
+        assert_eq!(applied.committed_content_epoch, 6);
+    }
+
+    #[test]
     fn protected_foreign_publish_does_not_get_replaced_by_aux_replay() {
         let (_dir, pg) = temp_pg_engine_for_unit();
 
@@ -5592,6 +5668,46 @@ mod tests {
             object_ids,
             vec![77_040, remote_middle.object_id, local_tail.object_id],
             "protected base merge must not be overwritten by aux replacement in the same foreign batch"
+        );
+    }
+
+    #[test]
+    fn protected_foreign_publish_can_clear_committed_serving_overlay() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+
+        let file =
+            create_published_small_file(&pg, ROOT_INO, b"protected-serving-overlay.txt", 77_050);
+        let mut attr = pg.get_attr(file.ino).expect("load local attr");
+        attr.size = 2 * u64::from(DEFAULT_BLOCK_SIZE);
+        attr.committed_size = attr.size;
+        attr.content_epoch = 3;
+        attr.committed_content_epoch = 3;
+        attr.upload_state = UploadState::Ready;
+        pg.set_attr(&attr).expect("seed committed attr");
+        pg.stage_payload_tombstone(file.ino, 1)
+            .expect("stage stale serving tombstone");
+        let overlay = pg.local_overlay_conflicts().expect("overlay conflicts");
+        assert!(overlay.block_inodes.contains(&file.ino));
+
+        let remote_tail = PayloadRef::new_partial(77_051, DEFAULT_BLOCK_SIZE);
+        let remote_publish = MetaEvent::PublishRegularFileBaseSlices {
+            ino: file.ino,
+            chunk_slices: fixture_payload_slices(1, Some(&remote_tail), PayloadRefState::Published)
+                .expect("remote tail slices"),
+        };
+        pg.apply_foreign_batch(&[remote_publish], &overlay, &HashSet::from([file.ino]))
+            .expect("apply protected foreign publish");
+
+        let object_ids: Vec<_> = pg
+            .lookup_regular_file_slices(file.ino, 0, 2 * u64::from(DEFAULT_BLOCK_SIZE))
+            .expect("lookup merged protected graph")
+            .into_iter()
+            .filter_map(|span| span.payload.map(|payload| payload.object_id))
+            .collect();
+        assert_eq!(
+            object_ids,
+            vec![77_050, remote_tail.object_id],
+            "a committed serving overlay must not keep hiding a protected base payload merge"
         );
     }
 

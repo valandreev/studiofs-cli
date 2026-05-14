@@ -418,11 +418,14 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    pub(super) fn merge_regular_file_base_publish_preserving_current_in_txn(
+    pub(super) fn merge_regular_file_base_publish_in_txn(
         txn: &redb::WriteTransaction,
         ino: Ino,
         chunk_slices: &[(ChunkId, Vec<SliceRecord>)],
+        preserve_current_tombstoned_ranges: bool,
     ) -> MetaResult<()> {
+        // A published base event carries the sender's complete visible base graph.
+        // An empty graph is therefore an authoritative sparse/hole-only result for the inode.
         if chunk_slices.is_empty() {
             Self::clear_regular_file_chunk_rows_in_txn(txn, REGULAR_FILE_BASE_TABLE, ino)?;
             return Ok(());
@@ -442,43 +445,72 @@ impl RedbMetaEngine {
             } else {
                 RegularFileChunkState::default()
             };
-            for existing in state.slices.values() {
-                state.next_slice_id =
-                    SliceId(
-                        state.next_slice_id.0.max(
-                            existing.slice_id.0.checked_add(1).ok_or_else(|| {
-                                MetaError::Storage("slice id overflow".to_string())
-                            })?,
-                        ),
-                    );
-                state.next_slice_order =
-                    SliceOrder(state.next_slice_order.0.max(
-                        existing.order.0.checked_add(1).ok_or_else(|| {
-                            MetaError::Storage("slice order overflow".to_string())
-                        })?,
-                    ));
-            }
 
             for incoming in incoming_slices {
-                let Some(payload) = incoming.payload.as_ref() else {
+                if incoming.payload.is_none() && preserve_current_tombstoned_ranges {
                     continue;
-                };
-                let slice_id = state
-                    .try_alloc_slice_id()
-                    .ok_or_else(|| MetaError::Storage("slice id overflow".to_string()))?;
-                let slice_order = state
-                    .try_alloc_slice_order()
-                    .ok_or_else(|| MetaError::Storage("slice order overflow".to_string()))?;
-                state.slices.insert(
-                    slice_id,
-                    SliceRecord {
+                }
+                if preserve_current_tombstoned_ranges {
+                    let Some(payload) = incoming.payload.as_ref() else {
+                        continue;
+                    };
+                    let uncovered_ranges =
+                        resolve_chunk_slice_spans(*chunk_id, incoming.range, Some(&state), None)
+                            .into_iter()
+                            .filter_map(|span| span.payload.is_none().then_some(span.range))
+                            .collect::<Vec<_>>();
+                    for uncovered in uncovered_ranges {
+                        let offset_delta = uncovered
+                            .start
+                            .checked_sub(incoming.range.start)
+                            .ok_or_else(|| {
+                                MetaError::Storage(
+                                    "protected base merge produced an invalid range".to_string(),
+                                )
+                            })?;
+                        let mut clipped_payload = payload.clone();
+                        clipped_payload.offset = clipped_payload
+                            .offset
+                            .checked_add(offset_delta)
+                            .ok_or_else(|| {
+                            MetaError::Storage("payload offset overflow".to_string())
+                        })?;
+                        clipped_payload.length = uncovered.len();
+                        let slice_id = state
+                            .try_alloc_slice_id()
+                            .ok_or_else(|| MetaError::Storage("slice id overflow".to_string()))?;
+                        let slice_order = state.try_alloc_slice_order().ok_or_else(|| {
+                            MetaError::Storage("slice order overflow".to_string())
+                        })?;
+                        state.slices.insert(
+                            slice_id,
+                            SliceRecord {
+                                slice_id,
+                                order: slice_order,
+                                range: uncovered,
+                                payload: Some(clipped_payload),
+                                payload_state: PayloadRefState::Published,
+                            },
+                        );
+                    }
+                } else {
+                    let slice_id = state
+                        .try_alloc_slice_id()
+                        .ok_or_else(|| MetaError::Storage("slice id overflow".to_string()))?;
+                    let slice_order = state
+                        .try_alloc_slice_order()
+                        .ok_or_else(|| MetaError::Storage("slice order overflow".to_string()))?;
+                    state.slices.insert(
                         slice_id,
-                        order: slice_order,
-                        range: incoming.range,
-                        payload: Some(payload.clone()),
-                        payload_state: PayloadRefState::Published,
-                    },
-                );
+                        SliceRecord {
+                            slice_id,
+                            order: slice_order,
+                            range: incoming.range,
+                            payload: incoming.payload.clone(),
+                            payload_state: PayloadRefState::Published,
+                        },
+                    );
+                }
             }
 
             state.refresh_fragmentation_metrics();

@@ -414,10 +414,11 @@ impl RedbMetaEngine {
                     Self::clear_regular_file_graph_in_txn(&txn, *ino)?;
                 }
                 crate::events::MetaEvent::PublishRegularFileBaseSlices { ino, chunk_slices } => {
-                    Self::merge_regular_file_base_publish_preserving_current_in_txn(
+                    Self::merge_regular_file_base_publish_in_txn(
                         &txn,
                         *ino,
                         chunk_slices.as_slice(),
+                        false,
                     )?;
                 }
                 crate::events::MetaEvent::SetSymlinkTarget { ino, target } => {
@@ -537,7 +538,7 @@ impl RedbMetaEngine {
     fn apply_replica_events_to_base_inner(
         &self,
         events: &[crate::events::MetaEvent],
-        _protected_regular_file_inodes: &HashSet<Ino>,
+        protected_regular_file_inodes: &HashSet<Ino>,
     ) -> MetaResult<()> {
         if events.is_empty() {
             return Ok(());
@@ -753,10 +754,11 @@ impl RedbMetaEngine {
                     }
                 }
                 crate::events::MetaEvent::PublishRegularFileBaseSlices { ino, chunk_slices } => {
-                    Self::merge_regular_file_base_publish_preserving_current_in_txn(
+                    Self::merge_regular_file_base_publish_in_txn(
                         &txn,
                         *ino,
                         chunk_slices.as_slice(),
+                        protected_regular_file_inodes.contains(ino),
                     )?;
                 }
                 crate::events::MetaEvent::RemoveRegularFileGraph { .. }
