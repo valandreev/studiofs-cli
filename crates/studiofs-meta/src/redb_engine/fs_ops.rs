@@ -405,6 +405,16 @@ impl<'a> NamespaceDeleteTxn<'a> {
         }
         let mut parent_attr = RedbMetaEngine::get_attr_merged_in_write_txn(self.txn, spec.parent)?;
 
+        let deleted_base_dentry = {
+            let key = encode_dentry_key(spec.parent, spec.name);
+            self.txn
+                .open_table(BASE_DENTRIES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .get(key.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .is_some()
+        };
+
         RedbMetaEngine::remove_dentry_overlay_in_txn(self.txn, spec.parent, spec.name)?;
 
         attr.nlink = attr.nlink.saturating_sub(1);
@@ -478,6 +488,7 @@ impl<'a> NamespaceDeleteTxn<'a> {
             &parent_attr,
             deleted_before_publish.as_ref(),
             published_base_chunks,
+            deleted_base_dentry,
         )?;
         Ok(NamespaceDeleteResult::File(attr))
     }
@@ -611,15 +622,18 @@ impl<'a> NamespaceDeleteTxn<'a> {
         parent_attr: &InodeAttr,
         deleted_before_publish: Option<&InodeLifecycleRecord>,
         published_base_chunks: Option<Vec<(ChunkId, Vec<SliceRecord>)>>,
+        deleted_base_dentry: bool,
     ) -> MetaResult<()> {
         if deleted_before_publish.is_some_and(|record| record.has_published_base) {
-            RedbMetaEngine::append_event_in_txn(
-                self.txn,
-                &crate::events::MetaEvent::RemoveEntry {
-                    parent: spec.parent,
-                    name: spec.name.to_vec(),
-                },
-            )?;
+            if deleted_base_dentry {
+                RedbMetaEngine::append_event_in_txn(
+                    self.txn,
+                    &crate::events::MetaEvent::RemoveEntry {
+                        parent: spec.parent,
+                        name: spec.name.to_vec(),
+                    },
+                )?;
+            }
             let published_base_chunks = published_base_chunks.ok_or_else(|| {
                 MetaError::Storage(
                     "missing published base chunk rows for deleted-before-publish rollback"

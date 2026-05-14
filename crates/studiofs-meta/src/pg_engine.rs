@@ -2573,20 +2573,7 @@ impl PgMetaEngine {
     }
 
     fn local_regular_file_state_needs_foreign_protection(&self, ino: Ino) -> MetaResult<bool> {
-        if self.local.has_local_regular_file_overlay(ino)? {
-            return Ok(true);
-        }
-        let attr = match self.local.get_attr(ino) {
-            Ok(attr) => attr,
-            Err(MetaError::InodeNotFound(_)) => return Ok(false),
-            Err(err) => return Err(err),
-        };
-        if attr.kind != FileType::RegularFile {
-            return Ok(false);
-        }
-        Ok(attr.upload_state != UploadState::Ready
-            || attr.content_epoch != attr.committed_content_epoch
-            || attr.size != attr.committed_size)
+        self.local.has_local_regular_file_overlay(ino)
     }
 
     fn removed_inode_has_local_regular_file_state_to_preserve(&self, ino: Ino) -> MetaResult<bool> {
