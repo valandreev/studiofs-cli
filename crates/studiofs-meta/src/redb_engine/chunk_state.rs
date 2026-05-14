@@ -418,113 +418,24 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    pub(super) fn replace_regular_file_chunk_rows_from_chunk_slices_in_txn(
+    pub(super) fn merge_regular_file_base_publish_in_txn(
         txn: &redb::WriteTransaction,
-        table_def: TableDefinition<&[u8], &[u8]>,
         ino: Ino,
         chunk_slices: &[(ChunkId, Vec<SliceRecord>)],
-        track_pending_compaction: bool,
+        preserve_current_tombstoned_ranges: bool,
     ) -> MetaResult<()> {
-        if track_pending_compaction {
-            Self::clear_regular_file_pending_compaction_rows_in_txn(txn, ino)?;
-        }
-        Self::clear_regular_file_chunk_rows_in_txn(txn, table_def, ino)?;
-        for (chunk_id, slices) in chunk_slices {
-            Self::set_regular_file_chunk_state_in_txn(
-                txn,
-                table_def,
-                track_pending_compaction,
-                ino,
-                *chunk_id,
-                slices,
-            )?;
-        }
-        Ok(())
-    }
-
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub(super) fn apply_regular_file_chunk_slices_in_txn(
-        txn: &redb::WriteTransaction,
-        table_def: TableDefinition<&[u8], &[u8]>,
-        ino: Ino,
-        chunk_slices: &[(ChunkId, Vec<SliceRecord>)],
-        track_pending_compaction: bool,
-    ) -> MetaResult<()> {
-        fn visible_data_ranges(
-            chunk_id: ChunkId,
-            current: &RegularFileChunkState,
-            lower_precedence: Option<&RegularFileChunkState>,
-            queries: &[SliceRange],
-        ) -> Vec<SliceRange> {
-            if queries.is_empty() {
-                return Vec::new();
-            }
-            let mut visible = Vec::new();
-            for query in queries {
-                visible.extend(
-                    resolve_chunk_slice_spans(chunk_id, *query, Some(current), lower_precedence)
-                        .into_iter()
-                        .filter_map(|span| span.payload.map(|_| span.range)),
-                );
-            }
-            if visible.len() <= 1 {
-                visible
-            } else {
-                merge_covered_ranges(visible)
-            }
-        }
-
-        fn intersect_ranges(query: SliceRange, visible: &[SliceRange]) -> Vec<SliceRange> {
-            visible
-                .iter()
-                .filter_map(|range| query.intersection(*range))
-                .collect()
-        }
-
-        fn merge_covered_ranges(mut merged: Vec<SliceRange>) -> Vec<SliceRange> {
-            merged.sort_unstable_by_key(|range| (range.start, range.end));
-
-            let mut out: Vec<SliceRange> = Vec::new();
-            for range in merged {
-                if let Some(last) = out.last_mut()
-                    && range.start <= last.end
-                {
-                    last.end = last.end.max(range.end);
-                    continue;
-                }
-                out.push(range);
-            }
-            out
-        }
-
+        // A published base event carries the sender's complete visible base graph.
+        // An empty graph is therefore an authoritative sparse/hole-only result for the inode.
         if chunk_slices.is_empty() {
+            Self::clear_regular_file_chunk_rows_in_txn(txn, REGULAR_FILE_BASE_TABLE, ino)?;
             return Ok(());
         }
 
         let mut table = txn
-            .open_table(table_def)
+            .open_table(REGULAR_FILE_BASE_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let mut pending = if track_pending_compaction {
-            Some(
-                txn.open_table(PENDING_REGULAR_FILE_COMPACTION_TABLE)
-                    .map_err(|e| MetaError::Storage(e.to_string()))?,
-            )
-        } else {
-            None
-        };
-        let use_overlay_base_precedence = redb::TableHandle::name(&table_def)
-            == redb::TableHandle::name(&REGULAR_FILE_OVERLAY_TABLE);
-        let base_table = if use_overlay_base_precedence {
-            Some(
-                txn.open_table(REGULAR_FILE_BASE_TABLE)
-                    .map_err(|e| MetaError::Storage(e.to_string()))?,
-            )
-        } else {
-            None
-        };
 
-        for (chunk_id, new_slices) in chunk_slices {
+        for (chunk_id, incoming_slices) in chunk_slices {
             let key = encode_regular_file_chunk_key(ino, *chunk_id);
             let mut state = if let Some(entry) = table
                 .get(key.as_slice())
@@ -534,76 +445,75 @@ impl RedbMetaEngine {
             } else {
                 RegularFileChunkState::default()
             };
-            let tombstone_queries = merge_covered_ranges(
-                new_slices
-                    .iter()
-                    .filter(|slice| slice.payload.is_none())
-                    .map(|slice| slice.range)
-                    .collect::<Vec<_>>(),
-            );
-            let lower_precedence = if tombstone_queries.is_empty() {
-                None
-            } else if let Some(base_table) = base_table.as_ref() {
-                base_table
-                    .get(key.as_slice())
-                    .map_err(|e| MetaError::Storage(e.to_string()))?
-                    .map(|value| decode::<RegularFileChunkState>(value.value()))
-                    .transpose()?
-            } else {
-                None
-            };
-            let visible_ranges = visible_data_ranges(
-                *chunk_id,
-                &state,
-                lower_precedence.as_ref(),
-                tombstone_queries.as_slice(),
-            );
-            let mut effective_new_slices = Vec::new();
-            for new_slice in new_slices.iter().cloned() {
-                if new_slice.payload.is_some() {
-                    effective_new_slices.push(new_slice);
+
+            for incoming in incoming_slices {
+                if incoming.payload.is_none() && preserve_current_tombstoned_ranges {
                     continue;
                 }
-                for intersection in intersect_ranges(new_slice.range, &visible_ranges) {
-                    let mut pruned = new_slice.clone();
-                    pruned.range = intersection;
-                    effective_new_slices.push(pruned);
+                if preserve_current_tombstoned_ranges {
+                    let Some(payload) = incoming.payload.as_ref() else {
+                        continue;
+                    };
+                    let uncovered_ranges =
+                        resolve_chunk_slice_spans(*chunk_id, incoming.range, Some(&state), None)
+                            .into_iter()
+                            .filter_map(|span| span.payload.is_none().then_some(span.range))
+                            .collect::<Vec<_>>();
+                    for uncovered in uncovered_ranges {
+                        let offset_delta = uncovered
+                            .start
+                            .checked_sub(incoming.range.start)
+                            .ok_or_else(|| {
+                                MetaError::Storage(
+                                    "protected base merge produced an invalid range".to_string(),
+                                )
+                            })?;
+                        let mut clipped_payload = payload.clone();
+                        clipped_payload.offset = clipped_payload
+                            .offset
+                            .checked_add(offset_delta)
+                            .ok_or_else(|| {
+                            MetaError::Storage("payload offset overflow".to_string())
+                        })?;
+                        clipped_payload.length = uncovered.len();
+                        let slice_id = state
+                            .try_alloc_slice_id()
+                            .ok_or_else(|| MetaError::Storage("slice id overflow".to_string()))?;
+                        let slice_order = state.try_alloc_slice_order().ok_or_else(|| {
+                            MetaError::Storage("slice order overflow".to_string())
+                        })?;
+                        state.slices.insert(
+                            slice_id,
+                            SliceRecord {
+                                slice_id,
+                                order: slice_order,
+                                range: uncovered,
+                                payload: Some(clipped_payload),
+                                payload_state: PayloadRefState::Published,
+                            },
+                        );
+                    }
+                } else {
+                    let slice_id = state
+                        .try_alloc_slice_id()
+                        .ok_or_else(|| MetaError::Storage("slice id overflow".to_string()))?;
+                    let slice_order = state
+                        .try_alloc_slice_order()
+                        .ok_or_else(|| MetaError::Storage("slice order overflow".to_string()))?;
+                    state.slices.insert(
+                        slice_id,
+                        SliceRecord {
+                            slice_id,
+                            order: slice_order,
+                            range: incoming.range,
+                            payload: incoming.payload.clone(),
+                            payload_state: PayloadRefState::Published,
+                        },
+                    );
                 }
-            }
-
-            let covered_ranges = merge_covered_ranges(
-                effective_new_slices
-                    .iter()
-                    .map(|slice| slice.range)
-                    .collect::<Vec<_>>(),
-            );
-            let mut fully_covered = Vec::new();
-            for (id, existing) in &state.slices {
-                if covered_ranges.iter().any(|range| {
-                    range.start <= existing.range.start && range.end >= existing.range.end
-                }) {
-                    fully_covered.push(*id);
-                }
-            }
-
-            for id in fully_covered {
-                state.slices.remove(&id);
-            }
-
-            for mut new_slice in effective_new_slices {
-                let slice_id = state
-                    .try_alloc_slice_id()
-                    .ok_or_else(|| MetaError::Storage("slice id overflow".to_string()))?;
-                let slice_order = state
-                    .try_alloc_slice_order()
-                    .ok_or_else(|| MetaError::Storage("slice order overflow".to_string()))?;
-                new_slice.slice_id = slice_id;
-                new_slice.order = slice_order;
-                state.slices.insert(slice_id, new_slice);
             }
 
             state.refresh_fragmentation_metrics();
-
             if state.is_empty() {
                 let _ = table
                     .remove(key.as_slice())
@@ -614,20 +524,7 @@ impl RedbMetaEngine {
                     .insert(key.as_slice(), encoded.as_slice())
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
             }
-
-            if let Some(pending) = pending.as_mut() {
-                if state.fragmentation.should_compact() {
-                    pending
-                        .insert(key.as_slice(), 1)
-                        .map_err(|e| MetaError::Storage(e.to_string()))?;
-                } else {
-                    let _ = pending
-                        .remove(key.as_slice())
-                        .map_err(|e| MetaError::Storage(e.to_string()))?;
-                }
-            }
         }
-
         Ok(())
     }
 

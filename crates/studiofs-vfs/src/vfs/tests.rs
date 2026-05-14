@@ -461,8 +461,15 @@ fn mark_all_overlay_objects_uploaded(
     let object_ids = meta
         .get_regular_file_overlay_object_ids(ino)
         .expect("load overlay object ids");
+    let pending_uploads = vfs.pending_uploads_snapshot();
     for object_id in &object_ids {
         vfs.local_payload_backend().mark_uploaded(*object_id);
+        for pending in pending_uploads
+            .iter()
+            .filter(|pending| pending.object_id == *object_id)
+        {
+            vfs.cached_store().complete_upload(pending);
+        }
         assert!(
             meta.mark_regular_file_overlay_object_uploaded_if_matches(
                 ino,
@@ -2297,6 +2304,226 @@ fn handle_backed_extend_keeps_writer_stack_buffered_without_strict_sync() {
         );
 
         vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn explicit_flush_after_clean_handle_extend_queues_metadata_only_publish() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "clean-handle-extend-flush-publish");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"clean-handle-extend-flush-publish.bin", 0, 0, 0o644)
+            .expect("create test file");
+        let ino = attr.ino;
+        let payload = b"already-published-head";
+
+        vfs.write(ino, 0, payload)
+            .await
+            .expect("write published payload");
+        vfs.flush(ino).await.expect("flush published payload");
+        let (content_epoch, blocks) = mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+        publish_current_file_graph(&meta, ino, content_epoch, &blocks);
+
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open clean writable handle");
+        let logical_size = 8192u64;
+        vfs.setattr_with_handle(Some(fh), ino, SetattrArgs::size_only(logical_size))
+            .expect("extend clean handle");
+        let outcome = vfs
+            .flush_winfsp_writeback_with_outcome(ino, fh)
+            .await
+            .expect("explicit flush should persist dirty attr");
+        assert!(
+            outcome.flushed_local_dirty_state,
+            "explicit flush should report the metadata-only dirty attr"
+        );
+
+        let extended_attr = meta.get_attr(ino).expect("load extended attr");
+        assert_eq!(extended_attr.size, logical_size);
+        assert!(
+            vfs.state
+                .upload
+                .pending_epoch_finalizations
+                .lock()
+                .contains(&(ino, extended_attr.content_epoch)),
+            "inline dirty-attr persistence must queue metadata-only publication"
+        );
+        assert!(
+            !vfs.inode_has_unmaterialized_overlay_for_finalize(ino),
+            "metadata-only grow should not wait on local payload work"
+        );
+        let lifecycle = meta
+            .get_inode_lifecycle(ino)
+            .expect("load metadata-only grow lifecycle")
+            .expect("metadata-only grow should have lifecycle");
+        assert_eq!(
+            lifecycle.state,
+            InodeLifecycleState::PublishReady,
+            "metadata-only grow should be publish-ready"
+        );
+
+        let status = super::commit::CommitCoordinator::finalize_inode_epoch(
+            &vfs,
+            ino,
+            extended_attr.content_epoch,
+        )
+        .await
+        .expect("finalize metadata-only grow");
+        match status {
+            super::commit::EpochFinalizeStatus::Published => {}
+            super::commit::EpochFinalizeStatus::Deferred => {
+                panic!("metadata-only grow unexpectedly deferred")
+            }
+            super::commit::EpochFinalizeStatus::Skipped => {
+                panic!("metadata-only grow unexpectedly skipped")
+            }
+        }
+        let published_attr = meta.get_attr(ino).expect("load published attr");
+        assert_eq!(published_attr.committed_size, logical_size);
+
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn handle_backed_sparse_extend_publishes_logical_size_without_tail_payload() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "handle-sparse-extend-publish-size");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"handle-sparse-extend-publish-size.bin", 0, 0, 0o644)
+            .expect("create sparse test file");
+        let ino = attr.ino;
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open writable handle");
+        let head = b"sparse-head";
+        let tail = b"sparse-tail-range";
+        let tail_offset = 1_048_569u64;
+        let logical_size = 2_097_275u64;
+
+        vfs.write_fh_with_local_sync_policy(fh, ino, 0, head, LocalSyncPolicy::Opportunistic)
+            .await
+            .expect("write sparse head");
+        vfs.write_fh_with_local_sync_policy(
+            fh,
+            ino,
+            tail_offset,
+            tail,
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .expect("write sparse tail range");
+        vfs.setattr_with_handle(Some(fh), ino, SetattrArgs::size_only(logical_size))
+            .expect("extend logical EOF without tail payload");
+
+        let outcome = vfs
+            .release_fh_with_outcome(fh)
+            .await
+            .expect("release should persist local sparse metadata");
+        assert!(outcome.closed_last_handle);
+        assert!(outcome.flushed_local_dirty_state);
+
+        let (content_epoch, _blocks) = mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+        assert!(
+            vfs.pending_uploads_for_inode(ino).is_empty(),
+            "setup should model completed uploads before finalization"
+        );
+        assert!(
+            !vfs.inode_has_unmaterialized_overlay_for_finalize(ino),
+            "completed uploads and drained writer state should allow finalization"
+        );
+        let lifecycle = meta
+            .get_inode_lifecycle(ino)
+            .expect("load lifecycle")
+            .expect("published candidate should have lifecycle state");
+        assert_eq!(
+            lifecycle.state,
+            InodeLifecycleState::PublishReady,
+            "uploaded overlay should become publish-ready"
+        );
+        publish_current_file_graph(&meta, ino, content_epoch, &_blocks);
+
+        let published_attr = meta.get_attr(ino).expect("load published attr");
+        assert_eq!(published_attr.size, logical_size);
+        assert_eq!(
+            published_attr.committed_size, logical_size,
+            "published sparse truncate-extend must expose the logical EOF to peers"
+        );
+        let hole = meta
+            .lookup_regular_file_slices(
+                ino,
+                tail_offset + tail.len() as u64,
+                logical_size - tail_offset - tail.len() as u64,
+            )
+            .expect("resolve sparse EOF tail");
+        assert!(
+            hole.iter().all(|span| span.payload.is_none()),
+            "logical EOF extension should remain hole-backed"
+        );
+
+        let shrink_size = 1_048_833u64;
+        let shrink_fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open handle for sparse shrink");
+        vfs.setattr_with_handle(Some(shrink_fh), ino, SetattrArgs::size_only(shrink_size))
+            .expect("shrink logical EOF without new payload");
+        let outcome = vfs
+            .release_fh_with_outcome(shrink_fh)
+            .await
+            .expect("release shrink handle");
+        assert!(outcome.closed_last_handle);
+        assert!(outcome.flushed_local_dirty_state);
+
+        let shrink_attr = meta.get_attr(ino).expect("load shrink candidate attr");
+        assert_eq!(shrink_attr.size, shrink_size);
+        assert_ne!(shrink_attr.upload_state, MetaUploadState::Ready);
+        assert!(
+            vfs.pending_uploads_for_inode(ino).is_empty(),
+            "metadata-only sparse shrink should not wait on payload uploads"
+        );
+        assert!(
+            !vfs.inode_has_unmaterialized_overlay_for_finalize(ino),
+            "metadata-only sparse shrink should be materialized enough to finalize"
+        );
+        let shrink_lifecycle = meta
+            .get_inode_lifecycle(ino)
+            .expect("load shrink lifecycle")
+            .expect("shrink candidate should have lifecycle");
+        assert_eq!(
+            shrink_lifecycle.state,
+            InodeLifecycleState::PublishReady,
+            "metadata-only sparse shrink should be publish-ready"
+        );
+        let status = super::commit::CommitCoordinator::finalize_inode_epoch(
+            &vfs,
+            ino,
+            shrink_attr.content_epoch,
+        )
+        .await
+        .expect("finalize sparse shrink");
+        match status {
+            super::commit::EpochFinalizeStatus::Published => {}
+            super::commit::EpochFinalizeStatus::Deferred => {
+                panic!("sparse shrink unexpectedly deferred")
+            }
+            super::commit::EpochFinalizeStatus::Skipped => {
+                panic!("sparse shrink unexpectedly skipped")
+            }
+        }
+
+        let shrunk_attr = meta.get_attr(ino).expect("load published shrink attr");
+        assert_eq!(shrunk_attr.size, shrink_size);
+        assert_eq!(
+            shrunk_attr.committed_size, shrink_size,
+            "published sparse shrink must reduce the peer-visible logical EOF"
+        );
     });
 }
 

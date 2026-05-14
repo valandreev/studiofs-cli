@@ -1890,6 +1890,75 @@ mod tests {
     }
 
     #[test]
+    fn metadata_invalidation_clears_published_read_plan_cache_without_attr_change() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "read-metadata-plan-cache-invalidate");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let created = vfs
+                .create(ROOT_INO, b"published-read-plan-cache-invalidate.txt", 1000, 1000, 0o644)
+                .expect("create file");
+            let ino = created.ino;
+            let payload = b"prefix payload";
+
+            vfs.write(ino, 0, payload).await.expect("write payload");
+            vfs.flush(ino).await.expect("flush durable local payload");
+
+            let (content_epoch, blocks) = mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+            publish_current_file_graph(&meta, ino, content_epoch, &blocks);
+
+            let tail_start = 3_145_900_u64;
+            let tail_len = 26_u32;
+            let mut attr = meta.get_attr(ino).expect("load published attr");
+            attr.size = tail_start + u64::from(tail_len);
+            attr.committed_size = attr.size;
+            attr.upload_state = MetaUploadState::Ready;
+            meta.set_attr(&attr).expect("extend logical EOF");
+            vfs.state.namespace.dirty_attrs.lock().remove(&ino);
+            vfs.state.namespace.attr_read_cache.lock().remove(ino);
+
+            let (_, stale_slices) = vfs
+                .resolve_read_metadata_async(ino, tail_start, u64::from(tail_len))
+                .await
+                .expect("resolve stale tail hole");
+            assert!(
+                stale_slices.iter().all(|span| span.payload.is_none()),
+                "setup should cache the old hole-only tail plan: {stale_slices:?}"
+            );
+
+            let tail_payload = PayloadRef::new_partial(93_301, tail_len);
+            meta.apply_replica_aux_state(&[studiofs_meta::events::MetaEvent::PublishRegularFileBaseSlices {
+                ino,
+                chunk_slices: vec![(
+                    ChunkId(0),
+                    vec![SliceRecord {
+                        slice_id: SliceId(0),
+                        order: SliceOrder(0),
+                        range: SliceRange::new(tail_start as u32, tail_start as u32 + tail_len)
+                            .expect("tail range fits in chunk"),
+                        payload: Some(tail_payload.clone()),
+                        payload_state: PayloadRefState::Published,
+                    }],
+                )],
+            }])
+            .expect("apply foreign base graph update");
+
+            vfs.invalidate_attr_read_cache([ino]);
+            let (_, fresh_slices) = vfs
+                .resolve_read_metadata_async(ino, tail_start, u64::from(tail_len))
+                .await
+                .expect("resolve fresh tail payload");
+            assert!(
+                fresh_slices
+                    .iter()
+                    .any(|span| span.payload.as_ref().map(|payload| payload.object_id)
+                        == Some(tail_payload.object_id)),
+                "metadata invalidation should drop the stale published read-plan cache: {fresh_slices:?}"
+            );
+        });
+    }
+
+    #[test]
     fn resolve_read_metadata_async_reuses_dirty_attr_read_plan_when_local_dirty_is_drained() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "read-metadata-dirty-plan-cache");

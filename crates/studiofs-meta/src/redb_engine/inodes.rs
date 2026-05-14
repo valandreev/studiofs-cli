@@ -287,7 +287,8 @@ impl RedbMetaEngine {
             (
                 attr.size == attr.committed_size
                     && attr.content_epoch == attr.committed_content_epoch,
-                attr.size == 0 && attr.content_epoch != attr.committed_content_epoch,
+                attr.size != attr.committed_size
+                    || attr.content_epoch != attr.committed_content_epoch,
             )
         };
         let (state, retention) = Self::derive_inode_lifecycle_state_and_retention(
@@ -339,7 +340,8 @@ impl RedbMetaEngine {
             (
                 attr.size == attr.committed_size
                     && attr.content_epoch == attr.committed_content_epoch,
-                attr.size == 0 && attr.content_epoch != attr.committed_content_epoch,
+                attr.size != attr.committed_size
+                    || attr.content_epoch != attr.committed_content_epoch,
             )
         };
         let (state, retention) = Self::derive_inode_lifecycle_state_and_retention(
@@ -414,6 +416,10 @@ impl RedbMetaEngine {
         let mut saw_uploaded = false;
         for chunk_state in chunk_states {
             for slice in chunk_state.slices.values() {
+                if slice.payload.is_none() {
+                    saw_uploaded = true;
+                    continue;
+                }
                 match slice.payload_state {
                     PayloadRefState::Uploading => return Some(InodeLifecycleState::Uploading),
                     PayloadRefState::LocalOnly | PayloadRefState::Recovering => {

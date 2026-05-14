@@ -479,8 +479,10 @@ impl StudioVfs {
         inodes: impl IntoIterator<Item = Ino>,
     ) -> Vec<Ino> {
         let mut cache = self.state.namespace.attr_read_cache.lock();
+        let mut read_plan_cache = self.state.read.published_read_plan_cache.lock();
         let mut removed = Vec::new();
         for ino in inodes {
+            read_plan_cache.remove(&ino);
             if cache.remove(ino) {
                 removed.push(ino);
             }

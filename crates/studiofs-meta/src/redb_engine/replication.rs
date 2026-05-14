@@ -414,9 +414,8 @@ impl RedbMetaEngine {
                     Self::clear_regular_file_graph_in_txn(&txn, *ino)?;
                 }
                 crate::events::MetaEvent::PublishRegularFileBaseSlices { ino, chunk_slices } => {
-                    Self::replace_regular_file_chunk_rows_from_chunk_slices_in_txn(
+                    Self::merge_regular_file_base_publish_in_txn(
                         &txn,
-                        REGULAR_FILE_BASE_TABLE,
                         *ino,
                         chunk_slices.as_slice(),
                         false,
@@ -523,6 +522,23 @@ impl RedbMetaEngine {
     pub fn apply_replica_events_to_base(
         &self,
         events: &[crate::events::MetaEvent],
+    ) -> MetaResult<()> {
+        self.apply_replica_events_to_base_inner(events, &HashSet::new())
+    }
+
+    /// Apply replica events while preserving protected local base ranges for stale publish batches.
+    pub fn apply_replica_events_to_base_preserving_protected_base_ranges(
+        &self,
+        events: &[crate::events::MetaEvent],
+        protected_regular_file_inodes: &HashSet<Ino>,
+    ) -> MetaResult<()> {
+        self.apply_replica_events_to_base_inner(events, protected_regular_file_inodes)
+    }
+
+    fn apply_replica_events_to_base_inner(
+        &self,
+        events: &[crate::events::MetaEvent],
+        protected_regular_file_inodes: &HashSet<Ino>,
     ) -> MetaResult<()> {
         if events.is_empty() {
             return Ok(());
@@ -738,12 +754,11 @@ impl RedbMetaEngine {
                     }
                 }
                 crate::events::MetaEvent::PublishRegularFileBaseSlices { ino, chunk_slices } => {
-                    Self::replace_regular_file_chunk_rows_from_chunk_slices_in_txn(
+                    Self::merge_regular_file_base_publish_in_txn(
                         &txn,
-                        REGULAR_FILE_BASE_TABLE,
                         *ino,
                         chunk_slices.as_slice(),
-                        false,
+                        protected_regular_file_inodes.contains(ino),
                     )?;
                 }
                 crate::events::MetaEvent::RemoveRegularFileGraph { .. }
