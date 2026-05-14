@@ -2986,12 +2986,6 @@ impl Scenario for AdvancedMountedScenario {
                 self.kind.name()
             ));
         }
-        if self.kind == AdvancedMountedKind::SparseRange {
-            artifacts.push(format!(
-                "artifacts/scenarios/{}/operations.ndjson",
-                self.kind.name()
-            ));
-        }
         Ok(artifacts)
     }
 
@@ -4107,16 +4101,8 @@ fn missing_mounted_initial_payloads(
 }
 
 fn refresh_parent_directory(path: &Path) {
-    let Some(parent) = path.parent() else {
-        return;
-    };
-    let Ok(entries) = fs::read_dir(parent) else {
-        return;
-    };
-    for entry in entries {
-        if entry.is_err() {
-            break;
-        }
+    if let Some(parent) = path.parent() {
+        let _ = drain_directory(parent);
     }
 }
 
