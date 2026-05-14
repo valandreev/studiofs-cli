@@ -504,6 +504,17 @@ fn stop_host_before_vfs_shutdown(host: &mut impl WinfspShutdownHost, shutdown_vf
     unmount_guard.unmount_now();
 }
 
+fn stop_host_before_vfs_shutdown_and_process_exit(
+    mut host: impl WinfspShutdownHost,
+    shutdown_vfs: impl FnOnce(),
+) {
+    stop_host_before_vfs_shutdown(&mut host, shutdown_vfs);
+    // The foreground mount process exits immediately after this path. Avoid a
+    // second WinFSP teardown in FileSystemHost::drop, which can hang after the
+    // graceful stop/unmount sequence and leave an unkillable terminating PID.
+    std::mem::forget(host);
+}
+
 /// Start the WinFSP filesystem, mount, and block until unmounted.
 ///
 /// `shutdown_event_name` — if `Some`, a Win32 named event is created so that an
@@ -670,7 +681,7 @@ this usually means Administrator privileges are required, or WinFSP must be conf
     let upload_drain_timeout = std::time::Duration::from_secs(upload_secs);
     // Stop WinFSP before the VFS shutdown drain so late callbacks cannot race
     // after the local metadata/cache checkpoint has been flushed.
-    stop_host_before_vfs_shutdown(&mut host, || {
+    stop_host_before_vfs_shutdown_and_process_exit(host, || {
         runtime_handle.block_on(vfs.shutdown(upload_drain_timeout));
     });
 
@@ -718,7 +729,8 @@ mod tests {
         DEFAULT_SECTORS_PER_ALLOCATION_UNIT, DEFAULT_VOLUME_INFO_TIMEOUT_MS, MountOptionError,
         WinfspShutdownHost, canonical_drive_mount_point, default_dispatcher_threads,
         is_drive_root_mount_point, mount_manager_mount_point, parse_mount_options,
-        stop_host_before_vfs_shutdown, winfsp_dll_stem_for_arch,
+        stop_host_before_vfs_shutdown, stop_host_before_vfs_shutdown_and_process_exit,
+        winfsp_dll_stem_for_arch,
     };
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -1027,6 +1039,12 @@ mod tests {
         }
     }
 
+    impl Drop for FakeShutdownHost {
+        fn drop(&mut self) {
+            self.events.borrow_mut().push("host.drop");
+        }
+    }
+
     #[test]
     fn graceful_shutdown_stops_winfsp_host_before_vfs_shutdown() {
         let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
@@ -1042,6 +1060,30 @@ mod tests {
             events.borrow().as_slice(),
             ["host.stop", "vfs.shutdown", "host.unmount"],
             "WinFSP callbacks must be stopped before the VFS shutdown checkpoint"
+        );
+        drop(host);
+        assert_eq!(
+            events.borrow().as_slice(),
+            ["host.stop", "vfs.shutdown", "host.unmount", "host.drop"],
+            "borrowed shutdown helper must leave ordinary host Drop behavior intact"
+        );
+    }
+
+    #[test]
+    fn graceful_shutdown_for_process_exit_skips_winfsp_host_drop() {
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let host = FakeShutdownHost {
+            events: events.clone(),
+        };
+
+        stop_host_before_vfs_shutdown_and_process_exit(host, || {
+            events.borrow_mut().push("vfs.shutdown");
+        });
+
+        assert_eq!(
+            events.borrow().as_slice(),
+            ["host.stop", "vfs.shutdown", "host.unmount"],
+            "the foreground mount process must not enter WinFSP host Drop after graceful shutdown"
         );
     }
 
