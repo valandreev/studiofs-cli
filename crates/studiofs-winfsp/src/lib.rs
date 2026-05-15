@@ -456,6 +456,7 @@ fn invalid_input_io_error(err: MountOptionError) -> std::io::Error {
 
 trait WinfspShutdownHost {
     fn stop_for_shutdown(&mut self);
+    #[cfg(test)]
     fn unmount_after_shutdown(&mut self);
 }
 
@@ -466,15 +467,18 @@ impl<T: winfsp::filesystem::FileSystemContext> WinfspShutdownHost
         self.stop();
     }
 
+    #[cfg(test)]
     fn unmount_after_shutdown(&mut self) {
         self.unmount();
     }
 }
 
+#[cfg(test)]
 struct WinfspUnmountGuard<'a, H: WinfspShutdownHost + ?Sized> {
     host: Option<&'a mut H>,
 }
 
+#[cfg(test)]
 impl<'a, H: WinfspShutdownHost + ?Sized> WinfspUnmountGuard<'a, H> {
     fn new(host: &'a mut H) -> Self {
         Self { host: Some(host) }
@@ -491,12 +495,14 @@ impl<'a, H: WinfspShutdownHost + ?Sized> WinfspUnmountGuard<'a, H> {
     }
 }
 
+#[cfg(test)]
 impl<H: WinfspShutdownHost + ?Sized> Drop for WinfspUnmountGuard<'_, H> {
     fn drop(&mut self) {
         self.unmount_if_needed();
     }
 }
 
+#[cfg(test)]
 fn stop_host_before_vfs_shutdown(host: &mut impl WinfspShutdownHost, shutdown_vfs: impl FnOnce()) {
     host.stop_for_shutdown();
     let unmount_guard = WinfspUnmountGuard::new(host);
@@ -508,11 +514,11 @@ fn stop_host_before_vfs_shutdown_and_process_exit(
     mut host: impl WinfspShutdownHost,
     shutdown_vfs: impl FnOnce(),
 ) {
-    stop_host_before_vfs_shutdown(&mut host, shutdown_vfs);
-    // The foreground mount process exits immediately after this path. Avoid a
-    // second WinFSP teardown in FileSystemHost::drop, which can hang after the
-    // graceful stop/unmount sequence and leave an unkillable terminating PID.
-    std::mem::forget(host);
+    host.stop_for_shutdown();
+    shutdown_vfs();
+    // Let FileSystemHost::drop release the user context after callbacks have
+    // stopped and the VFS checkpoint has finished. Dropping the host releases
+    // the context's Arc<StudioVfs>, allowing redb::Database to close cleanly.
 }
 
 /// Start the WinFSP filesystem, mount, and block until unmounted.
@@ -1070,7 +1076,7 @@ mod tests {
     }
 
     #[test]
-    fn graceful_shutdown_for_process_exit_skips_winfsp_host_drop() {
+    fn graceful_shutdown_for_process_exit_drops_winfsp_host_after_vfs_shutdown() {
         let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let host = FakeShutdownHost {
             events: events.clone(),
@@ -1082,8 +1088,8 @@ mod tests {
 
         assert_eq!(
             events.borrow().as_slice(),
-            ["host.stop", "vfs.shutdown", "host.unmount"],
-            "the foreground mount process must not enter WinFSP host Drop after graceful shutdown"
+            ["host.stop", "vfs.shutdown", "host.drop"],
+            "the foreground mount process must release the WinFSP host context after VFS shutdown"
         );
     }
 
