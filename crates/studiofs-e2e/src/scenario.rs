@@ -3467,7 +3467,7 @@ fn run_cold_observer_warm_history(
 ) -> Result<(Vec<NamespaceCollisionOperation>, LongHistorySummary), ScenarioError> {
     let started = Instant::now();
     let mut operations = Vec::new();
-    let root = isolation.path("");
+    let nested_dir = isolation.path("nested");
     let delete_target = isolation.path(COLD_OBSERVER_DELETE_TARGET);
     let rename_source = isolation.path(COLD_OBSERVER_RENAME_SOURCE);
     let rename_dest = isolation.path(COLD_OBSERVER_RENAME_DEST);
@@ -3476,27 +3476,41 @@ fn run_cold_observer_warm_history(
     let nested_file = isolation.path(COLD_OBSERVER_NESTED_FILE);
 
     let payload = |label: &str, path: &str| isolation.payload(label, path, label);
-    for (order, (client_index, operation, path, action)) in (1..).zip([
-        // Keep the root mkdir as a first-class operation: it is part of the
-        // warm-history artifact even though later parented writes would create it.
-        (0, "mkdir", root.clone(), None),
+    let nested_payload = payload("nested_child", &nested_file);
+    for (order, (client_index, operation, path, log_path, action)) in (1..).zip([
+        (0, "mkdir", nested_dir.clone(), nested_dir.clone(), None),
         (
             0,
             "create",
             delete_target.clone(),
+            delete_target.clone(),
             Some(payload("delete_target", &delete_target)),
         ),
-        (1, "delete", delete_target.clone(), None),
+        (
+            1,
+            "delete",
+            delete_target.clone(),
+            delete_target.clone(),
+            None,
+        ),
         (
             0,
             "create",
             rename_source.clone(),
+            rename_source.clone(),
             Some(payload("rename_source", &rename_source)),
         ),
-        (1, "rename", rename_dest.clone(), None),
+        (
+            1,
+            "rename",
+            rename_dest.clone(),
+            format!("{rename_source} -> {rename_dest}"),
+            None,
+        ),
         (
             2,
             "create",
+            overwrite_target.clone(),
             overwrite_target.clone(),
             Some(payload("overwrite_v1", &overwrite_target)),
         ),
@@ -3504,13 +3518,22 @@ fn run_cold_observer_warm_history(
             0,
             "overwrite",
             overwrite_target.clone(),
+            overwrite_target.clone(),
             Some(payload("overwrite_v2", &overwrite_target)),
         ),
         (
             1,
             "append",
             append_target.clone(),
+            append_target.clone(),
             Some(payload("append", &append_target)),
+        ),
+        (
+            2,
+            "create",
+            nested_file.clone(),
+            nested_file.clone(),
+            Some(nested_payload.clone()),
         ),
     ]) {
         let client = &clients[client_index];
@@ -3532,7 +3555,7 @@ fn run_cold_observer_warm_history(
                 .map_err(ScenarioError::from),
         };
         operations.push(required_op(
-            started, order, client, operation, &path, result,
+            started, order, client, operation, &log_path, result,
         )?);
         match operation {
             "create" if path == delete_target || path == rename_source => {
@@ -3557,8 +3580,6 @@ fn run_cold_observer_warm_history(
         }
     }
 
-    let nested_payload = payload("nested_child", &nested_file);
-    write_parented(clients[2].mount_point.join(&nested_file), &nested_payload)?;
     let final_payload = payload("overwrite_v2", &overwrite_target);
     wait_for_mounted_initial_payloads_until(
         clients,
@@ -4886,7 +4907,11 @@ fn planned_advanced_mounted_operations(
             ("client-a", "create", "cold-observer/delete-target.txt"),
             ("client-b", "delete", "cold-observer/delete-target.txt"),
             ("client-a", "create", "cold-observer/rename-source.txt"),
-            ("client-b", "rename", "cold-observer/renamed-final.txt"),
+            (
+                "client-b",
+                "rename",
+                "cold-observer/rename-source.txt -> cold-observer/renamed-final.txt",
+            ),
             ("client-c", "create", "cold-observer/overwrite-target.txt"),
             (
                 "client-a",
@@ -4894,6 +4919,7 @@ fn planned_advanced_mounted_operations(
                 "cold-observer/overwrite-target.txt",
             ),
             ("client-b", "append", "cold-observer/append-target.txt"),
+            ("client-c", "create", "cold-observer/nested/child.txt"),
         ],
     };
     spec.into_iter()
@@ -5519,6 +5545,12 @@ fn write_planned_cold_observer_diagnostics(context: &ScenarioContext) -> Result<
 }
 
 fn planned_long_history_summary() -> LongHistorySummary {
+    let overwrite_target = format!(
+        "{}/{}",
+        AdvancedMountedKind::ColdObserverLongHistory.path_root(),
+        COLD_OBSERVER_OVERWRITE_TARGET
+    );
+    let final_payload = cold_observer_planned_payload("overwrite_v2", &overwrite_target);
     LongHistorySummary {
         bounded_operation_count: planned_advanced_mounted_operations(
             AdvancedMountedKind::ColdObserverLongHistory,
@@ -5535,8 +5567,12 @@ fn planned_long_history_summary() -> LongHistorySummary {
             "cold-observer/delete-target.txt".to_string(),
             "cold-observer/rename-source.txt".to_string(),
         ],
-        final_checksum_sha256: bytes_sha256(b"planned cold-observer long-history final payload\n"),
+        final_checksum_sha256: bytes_sha256(&final_payload),
     }
+}
+
+fn cold_observer_planned_payload(label: &str, logical_path: &str) -> Vec<u8> {
+    format!("planned\nlabel={label}\npath={logical_path}\n{label}").into_bytes()
 }
 
 fn sparse_ranges_match(kind: AdvancedMountedKind, summary: Option<&SparseRangeSummary>) -> bool {
