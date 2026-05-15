@@ -2001,6 +2001,72 @@ mod tests {
     }
 
     #[test]
+    fn local_write_clears_stale_published_read_plan_cache() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "read-metadata-plan-cache-write");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let created = vfs
+                .create(
+                    ROOT_INO,
+                    b"published-read-plan-cache-write.txt",
+                    1000,
+                    1000,
+                    0o644,
+                )
+                .expect("create file");
+            let ino = created.ino;
+            let tail_start = 64 * 1024_u64;
+            let tail_payload = b"tail payload after cached hole";
+
+            let mut attr = meta.get_attr(ino).expect("load attr");
+            attr.size = tail_start + tail_payload.len() as u64;
+            attr.committed_size = attr.size;
+            attr.upload_state = MetaUploadState::Ready;
+            attr.content_epoch = 7;
+            attr.committed_content_epoch = 7;
+            meta.set_attr(&attr).expect("publish sparse hole attr");
+            vfs.state.namespace.dirty_attrs.lock().remove(&ino);
+            vfs.state.namespace.attr_read_cache.lock().remove(ino);
+
+            let (_, stale_slices) = vfs
+                .resolve_read_metadata_async(ino, tail_start, tail_payload.len() as u64)
+                .await
+                .expect("resolve stale hole");
+            assert!(
+                stale_slices.iter().all(|span| span.payload.is_none()),
+                "setup should cache the hole-only read plan: {stale_slices:?}"
+            );
+            assert!(
+                vfs.state
+                    .read
+                    .published_read_plan_cache
+                    .lock()
+                    .contains_key(&ino),
+                "setup should leave a published read-plan cache entry"
+            );
+
+            vfs.write_with_local_sync_policy(
+                ino,
+                tail_start,
+                tail_payload,
+                LocalSyncPolicy::Strict,
+            )
+            .await
+            .expect("write tail payload");
+
+            assert!(
+                !vfs.state
+                    .read
+                    .published_read_plan_cache
+                    .lock()
+                    .contains_key(&ino),
+                "local writes must evict cached hole read plans for the same inode"
+            );
+        });
+    }
+
+    #[test]
     fn resolve_read_metadata_async_reuses_dirty_attr_read_plan_when_local_dirty_is_drained() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "read-metadata-dirty-plan-cache");

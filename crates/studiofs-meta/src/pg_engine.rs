@@ -2579,7 +2579,13 @@ impl PgMetaEngine {
     }
 
     fn local_regular_file_state_needs_foreign_protection(&self, ino: Ino) -> MetaResult<bool> {
-        self.local.has_local_regular_file_overlay(ino)
+        if self.local.has_local_regular_file_overlay(ino)? {
+            return Ok(true);
+        }
+        Ok(self
+            .local
+            .get_inode_lifecycle(ino)?
+            .is_some_and(|lifecycle| lifecycle.state != InodeLifecycleState::Published))
     }
 
     fn removed_inode_has_local_regular_file_state_to_preserve(&self, ino: Ino) -> MetaResult<bool> {
@@ -2604,9 +2610,14 @@ impl PgMetaEngine {
                 }
                 _ => continue,
             };
-            if self.local_regular_file_state_needs_foreign_protection(ino)? {
+            if self.local.has_local_regular_file_overlay(ino)? {
                 overlay.attr_inodes.insert(ino);
                 overlay.block_inodes.insert(ino);
+                if let MetaEvent::RemoveEntry { parent, name } = event {
+                    overlay.dentry_keys.insert(Self::dentry_key(*parent, name));
+                }
+            } else if self.local_regular_file_state_needs_foreign_protection(ino)? {
+                overlay.attr_inodes.insert(ino);
                 if let MetaEvent::RemoveEntry { parent, name } = event {
                     overlay.dentry_keys.insert(Self::dentry_key(*parent, name));
                 }
@@ -2847,8 +2858,10 @@ impl PgMetaEngine {
         }
         let protected_attr_merges =
             self.protected_regular_file_attr_merges(batch_events, &protected_regular_file_inodes)?;
-        let base_range_preserve_inodes = self
+        let partial_publish_inodes = Self::partial_regular_file_publish_inodes(batch_events);
+        let mut base_range_preserve_inodes = self
             .protected_base_range_preserve_inodes(batch_events, &protected_regular_file_inodes)?;
+        base_range_preserve_inodes.extend(partial_publish_inodes.iter().copied());
         self.local
             .apply_replica_events_to_base_preserving_protected_base_ranges(
                 batch_events,
@@ -2870,6 +2883,7 @@ impl PgMetaEngine {
             })
             .cloned()
             .collect();
+        let applied_serving_state = !serving_events.is_empty();
         self.local.apply_replica_serving_state(&serving_events)?;
         if !protected_attr_merges.is_empty() {
             self.local
@@ -2891,6 +2905,7 @@ impl PgMetaEngine {
                 event,
                 MetaEvent::PublishRegularFileBaseSlices { ino, .. }
                     if protected_regular_file_inodes.contains(ino)
+                        || partial_publish_inodes.contains(ino)
             ) {
                 continue;
             }
@@ -2907,7 +2922,7 @@ impl PgMetaEngine {
         if !aux_events.is_empty() {
             self.local.apply_replica_aux_state(&aux_events)?;
         }
-        Ok(!aux_events.is_empty() || !grandfathered_attrs.is_empty())
+        Ok(applied_serving_state || !aux_events.is_empty() || !grandfathered_attrs.is_empty())
     }
 
     fn protected_base_range_preserve_inodes(
@@ -3014,6 +3029,39 @@ impl PgMetaEngine {
             }
         }
         false
+    }
+
+    fn partial_regular_file_publish_inodes(batch_events: &[MetaEvent]) -> HashSet<Ino> {
+        let mut ready_sizes = HashMap::new();
+        let mut publish_inodes = HashSet::new();
+        for event in batch_events {
+            match event {
+                MetaEvent::SetAttr { attr }
+                    if attr.kind == FileType::RegularFile
+                        && attr.upload_state == UploadState::Ready
+                        && attr.content_epoch == attr.committed_content_epoch
+                        && attr.size == attr.committed_size =>
+                {
+                    ready_sizes.insert(attr.ino, attr.committed_size);
+                }
+                MetaEvent::PublishRegularFileBaseSlices { ino, .. } => {
+                    publish_inodes.insert(*ino);
+                }
+                _ => {}
+            }
+        }
+
+        publish_inodes
+            .into_iter()
+            .filter(|ino| match ready_sizes.get(ino) {
+                Some(committed_size) => !Self::batch_publish_covers_committed_extent(
+                    batch_events,
+                    *ino,
+                    *committed_size,
+                ),
+                None => true,
+            })
+            .collect()
     }
 
     fn protected_regular_file_attr_merges(
@@ -3127,7 +3175,16 @@ impl PgMetaEngine {
             return Ok(false);
         }
 
-        self.local.apply_replica_events_to_base(batch_events)?;
+        let partial_publish_inodes = Self::partial_regular_file_publish_inodes(batch_events);
+        if partial_publish_inodes.is_empty() {
+            self.local.apply_replica_events_to_base(batch_events)?;
+        } else {
+            self.local
+                .apply_replica_events_to_base_preserving_protected_base_ranges(
+                    batch_events,
+                    &partial_publish_inodes,
+                )?;
+        }
         for event in batch_events {
             if let MetaEvent::RenameEntry {
                 parent,
@@ -3149,7 +3206,14 @@ impl PgMetaEngine {
         }
         let aux_events: Vec<MetaEvent> = batch_events
             .iter()
-            .filter(|event| Self::event_has_aux_apply_effect(event))
+            .filter(|event| {
+                Self::event_has_aux_apply_effect(event)
+                    && !matches!(
+                        event,
+                        MetaEvent::PublishRegularFileBaseSlices { ino, .. }
+                            if partial_publish_inodes.contains(ino)
+                    )
+            })
             .cloned()
             .collect();
         if aux_events.is_empty() {
@@ -6031,8 +6095,13 @@ mod tests {
             chunk_slices: fixture_payload_slices(1, Some(&remote_tail), PayloadRefState::Published)
                 .expect("remote tail slices"),
         };
-        pg.apply_foreign_batch(&[remote_publish], &overlay, &HashSet::from([file.ino]))
+        let changed = pg
+            .apply_foreign_batch(&[remote_publish], &overlay, &HashSet::from([file.ino]))
             .expect("apply protected foreign publish");
+        assert!(
+            changed,
+            "protected publish-only batches that update serving metadata must wake VFS invalidation"
+        );
 
         let object_ids: Vec<_> = pg
             .lookup_regular_file_slices(file.ino, 0, 2 * u64::from(DEFAULT_BLOCK_SIZE))
@@ -6044,6 +6113,279 @@ mod tests {
             object_ids,
             vec![77_050, remote_tail.object_id],
             "a committed serving overlay must not keep hiding a protected base payload merge"
+        );
+    }
+
+    #[test]
+    fn sparse_ready_foreign_publish_preserves_disjoint_base_ranges_when_not_complete() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+
+        let file = pg
+            .create_file(ROOT_INO, b"sparse-ready-merge.txt", 0, 0, 0o644)
+            .expect("create file");
+        set_file_state(&pg, file.ino, (4 * u64::from(DEFAULT_BLOCK_SIZE)) + 4096, 3);
+        let local_tail = PayloadRef::new_full(77_055, DEFAULT_BLOCK_SIZE);
+        pg.stage_payload_slice(file.ino, 4, &local_tail)
+            .expect("stage local tail");
+        mark_overlay_objects_uploaded(&pg, file.ino, 3, &[local_tail.object_id]);
+        assert!(
+            pg.publish_regular_file_overlay_to_base_if_matches(file.ino, 3)
+                .expect("publish local tail"),
+            "local sparse tail publish should succeed"
+        );
+        let start = pg.flushed_event_seq.load(Ordering::SeqCst);
+        let end = pg.local.get_counter("nextEventSeq").expect("event end");
+        let local_events = pg
+            .local
+            .read_events_range(start, end)
+            .expect("read local events");
+        let projected_self_batch = PgMetaEngine::project_remote_events(&local_events);
+        pg.acknowledge_local_prefix_from_self_batch(&projected_self_batch)
+            .expect("ack local sparse publish");
+        assert!(
+            pg.local_overlay_conflicts()
+                .expect("overlay conflicts")
+                .block_inodes
+                .is_empty(),
+            "this reproduces an unprotected peer that already acked its own sparse publish"
+        );
+        assert_eq!(
+            lookup_object_ids(&pg, file.ino, (4 * u64::from(DEFAULT_BLOCK_SIZE)) + 4096)
+                .expect("lookup local sparse graph"),
+            vec![local_tail.object_id],
+            "setup should have a committed sparse tail before the remote peer publishes"
+        );
+
+        let remote_middle = PayloadRef::new_full(77_056, DEFAULT_BLOCK_SIZE);
+        let remote_publish = MetaEvent::PublishRegularFileBaseSlices {
+            ino: file.ino,
+            chunk_slices: fixture_payload_slices(
+                2,
+                Some(&remote_middle),
+                PayloadRefState::Published,
+            )
+            .expect("remote middle slices"),
+        };
+        let mut remote_attr = pg.get_attr(file.ino).expect("load attr");
+        remote_attr.size = (4 * u64::from(DEFAULT_BLOCK_SIZE)) + 4096;
+        remote_attr.committed_size = remote_attr.size;
+        remote_attr.content_epoch = 4;
+        remote_attr.committed_content_epoch = 4;
+        remote_attr.upload_state = UploadState::Ready;
+        let remote_batch = vec![
+            remote_publish,
+            MetaEvent::SetAttr {
+                attr: remote_attr.clone(),
+            },
+        ];
+        assert!(
+            PgMetaEngine::partial_regular_file_publish_inodes(&remote_batch).contains(&file.ino),
+            "sparse ready publish payloads do not cover committed EOF"
+        );
+
+        pg.apply_foreign_batch(
+            &remote_batch,
+            &OverlayConflictSets::default(),
+            &HashSet::new(),
+        )
+        .expect("apply sparse ready foreign publish");
+
+        let object_ids = pg
+            .lookup_regular_file_slices(file.ino, 0, remote_attr.size)
+            .expect("lookup merged sparse graph")
+            .into_iter()
+            .filter_map(|span| span.payload.map(|payload| payload.object_id))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            object_ids,
+            vec![remote_middle.object_id, local_tail.object_id],
+            "a sparse ready publish that does not cover committed EOF must not erase disjoint published ranges"
+        );
+    }
+
+    #[test]
+    fn sparse_ready_self_batch_preserves_imported_disjoint_base_ranges_when_not_complete() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+
+        let file = pg
+            .create_file(ROOT_INO, b"sparse-ready-self-merge.txt", 0, 0, 0o644)
+            .expect("create file");
+        let logical_size = (4 * u64::from(DEFAULT_BLOCK_SIZE)) + 4096;
+        set_file_state(&pg, file.ino, logical_size, 3);
+
+        let imported_tail = PayloadRef::new_full(77_057, DEFAULT_BLOCK_SIZE);
+        let imported_publish = MetaEvent::PublishRegularFileBaseSlices {
+            ino: file.ino,
+            chunk_slices: fixture_payload_slices(
+                4,
+                Some(&imported_tail),
+                PayloadRefState::Published,
+            )
+            .expect("imported tail slices"),
+        };
+        pg.local
+            .apply_replica_events_to_base_preserving_protected_base_ranges(
+                std::slice::from_ref(&imported_publish),
+                &HashSet::from([file.ino]),
+            )
+            .expect("seed imported sparse tail");
+        assert_eq!(
+            lookup_object_ids(&pg, file.ino, logical_size).expect("lookup imported graph"),
+            vec![imported_tail.object_id],
+            "setup should have an imported sparse tail before self replay"
+        );
+
+        let local_middle = PayloadRef::new_full(77_058, DEFAULT_BLOCK_SIZE);
+        let local_publish = MetaEvent::PublishRegularFileBaseSlices {
+            ino: file.ino,
+            chunk_slices: fixture_payload_slices(
+                2,
+                Some(&local_middle),
+                PayloadRefState::Published,
+            )
+            .expect("local middle slices"),
+        };
+        let mut local_attr = pg.get_attr(file.ino).expect("load attr");
+        local_attr.size = logical_size;
+        local_attr.committed_size = local_attr.size;
+        local_attr.content_epoch = 4;
+        local_attr.committed_content_epoch = 4;
+        local_attr.upload_state = UploadState::Ready;
+        let self_batch = vec![
+            local_publish,
+            MetaEvent::SetAttr {
+                attr: local_attr.clone(),
+            },
+        ];
+        assert!(
+            PgMetaEngine::partial_regular_file_publish_inodes(&self_batch).contains(&file.ino),
+            "self sparse publish payloads do not cover committed EOF"
+        );
+
+        pg.apply_visible_self_batch(&self_batch)
+            .expect("apply visible self sparse publish");
+
+        let object_ids =
+            lookup_object_ids(&pg, file.ino, logical_size).expect("lookup merged sparse graph");
+        assert_eq!(
+            object_ids,
+            vec![local_middle.object_id, imported_tail.object_id],
+            "a sparse self publish that does not cover committed EOF must not erase imported disjoint ranges"
+        );
+    }
+
+    #[test]
+    fn lifecycle_publish_ready_without_overlay_still_protects_foreign_replay() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+
+        let file = pg
+            .create_file(
+                ROOT_INO,
+                b"publish-ready-lifecycle-protect.txt",
+                0,
+                0,
+                0o644,
+            )
+            .expect("create file");
+        let mut attr = pg.get_attr(file.ino).expect("load attr");
+        attr.size = 4096;
+        attr.content_epoch = attr.content_epoch.saturating_add(1);
+        pg.set_attr(&attr)
+            .expect("stage blockless publish-ready attr");
+
+        assert!(
+            !pg.local
+                .has_local_regular_file_overlay(file.ino)
+                .expect("probe regular-file overlay"),
+            "setup should rely on lifecycle state, not chunk overlay rows"
+        );
+        let lifecycle = pg
+            .local
+            .get_inode_lifecycle(file.ino)
+            .expect("load lifecycle")
+            .expect("lifecycle should exist");
+        assert_eq!(lifecycle.state, InodeLifecycleState::PublishReady);
+
+        assert!(
+            pg.local_regular_file_state_needs_foreign_protection(file.ino)
+                .expect("probe protection"),
+            "publish-ready lifecycle rows represent local publication work even without chunk overlay rows"
+        );
+    }
+
+    #[test]
+    fn attr_only_lifecycle_overlay_does_not_block_committed_base_payload_replay() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+
+        let file = create_published_small_file(&pg, ROOT_INO, b"attr-only-block-replay.txt", 87);
+
+        let mut local_attr = pg.get_attr(file.ino).expect("load local attr");
+        local_attr.size = 8192;
+        pg.set_attr(&local_attr).expect("set local attr overlay");
+
+        assert!(
+            pg.local_regular_file_state_needs_foreign_protection(file.ino)
+                .expect("probe attr protection"),
+            "local attr lifecycle must still protect the local attr overlay"
+        );
+        assert!(
+            !pg.local
+                .has_local_regular_file_overlay(file.ino)
+                .expect("probe block overlay"),
+            "setup must not have local chunk overlay rows"
+        );
+
+        let overlay = pg
+            .current_regular_file_overlay_conflicts_for_batch(&[MetaEvent::SetAttr {
+                attr: local_attr.clone(),
+            }])
+            .expect("collect overlay conflicts");
+        assert!(overlay.attr_inodes.contains(&file.ino));
+        assert!(
+            !overlay.block_inodes.contains(&file.ino),
+            "attr-only lifecycle protection must not protect committed base ranges"
+        );
+
+        let remote_payload = PayloadRef::new_full(88, DEFAULT_BLOCK_SIZE);
+        let remote_publish = MetaEvent::PublishRegularFileBaseSlices {
+            ino: file.ino,
+            chunk_slices: fixture_payload_slices(
+                0,
+                Some(&remote_payload),
+                PayloadRefState::Published,
+            )
+            .expect("remote payload slices"),
+        };
+        let mut remote_attr = pg.get_attr(file.ino).expect("load remote attr");
+        remote_attr.size = 4096;
+        remote_attr.committed_size = 4096;
+        remote_attr.content_epoch = remote_attr.content_epoch.saturating_add(1);
+        remote_attr.committed_content_epoch = remote_attr.content_epoch;
+        remote_attr.upload_state = UploadState::Ready;
+
+        pg.apply_foreign_batch(
+            &[
+                MetaEvent::SetAttr {
+                    attr: remote_attr.clone(),
+                },
+                remote_publish,
+            ],
+            &overlay,
+            &HashSet::new(),
+        )
+        .expect("apply committed payload under local attr overlay");
+
+        assert_eq!(
+            lookup_first_object_id(&pg, file.ino).expect("lookup committed payload"),
+            Some(remote_payload.object_id),
+            "committed payload replay must replace the base graph despite local attr overlay"
+        );
+        assert_eq!(
+            pg.get_attr(file.ino)
+                .expect("local attr should remain")
+                .size,
+            8192,
+            "local attr overlay should still mask remote size"
         );
     }
 

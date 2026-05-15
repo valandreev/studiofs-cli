@@ -199,7 +199,23 @@ impl StudioVfs {
                     )?);
                     requeue_retained_uploads = true;
                 } else {
-                    self.begin_pending_incarnation(ino, &mut attr);
+                    let has_publish_work_for_current_epoch = self
+                        .pending_uploads_for_inode(ino)
+                        .iter()
+                        .any(|(_, _, content_epoch)| *content_epoch == attr.content_epoch)
+                        || self
+                            .state
+                            .upload
+                            .pending_epoch_finalizations
+                            .lock()
+                            .iter()
+                            .any(|pending| pending.0 == ino && pending.1 == attr.content_epoch);
+                    if has_publish_work_for_current_epoch {
+                        self.begin_size_change_incarnation(ino, &mut attr);
+                        requeue_retained_uploads = true;
+                    } else {
+                        self.begin_pending_incarnation(ino, &mut attr);
+                    }
                 }
                 attr.size = new_size;
                 self.update_pending_incarnation_size(ino, attr.size);

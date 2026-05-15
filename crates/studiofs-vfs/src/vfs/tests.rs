@@ -2227,6 +2227,101 @@ fn epoch_finalizer_invalidates_kernel_when_publication_shrinks_visible_size() {
 }
 
 #[test]
+fn epoch_finalizer_invalidates_kernel_when_same_size_sparse_graph_changes() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "graph-finalizer-same-size-graph");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"graph-finalizer-same-size-graph.bin", 0, 0, 0o644)
+            .expect("create test file");
+        let logical_size = 3 * 1024 * 1024_u64;
+        let tail_offset = logical_size - 256;
+        let tail_len = 128_u32;
+        let tail_start = u32::try_from(tail_offset).expect("tail offset fits in one chunk");
+        let tail_end = tail_start + tail_len;
+
+        let mut published_attr = meta.get_attr(attr.ino).expect("load created attr");
+        published_attr.size = logical_size;
+        published_attr.content_epoch = 1;
+        published_attr.upload_state = MetaUploadState::Updating;
+        meta.flush_regular_file_overlay_slices_with_attr(
+            attr.ino,
+            &[(
+                ChunkId(0),
+                vec![SliceRecord::new(
+                    SliceId(0),
+                    SliceOrder(0),
+                    SliceRange::new(tail_start, tail_end).expect("valid tail payload range"),
+                    PayloadRef::new_partial(70_001, tail_len),
+                )],
+            )],
+            Some(&published_attr),
+        )
+        .expect("stage published sparse tail payload");
+        assert!(
+            meta.mark_regular_file_overlay_object_uploaded_if_matches(attr.ino, 1, 70_001)
+                .expect("mark initial tail uploaded")
+        );
+        publish_current_file_graph(&meta, attr.ino, 1, &[70_001]);
+        let published_attr = meta.get_attr(attr.ino).expect("load published attr");
+        assert_eq!(published_attr.size, logical_size);
+        assert_eq!(published_attr.committed_size, logical_size);
+
+        let mut tombstone_attr = published_attr.clone();
+        tombstone_attr.content_epoch = tombstone_attr.content_epoch.saturating_add(1);
+        tombstone_attr.upload_state = MetaUploadState::Updating;
+        meta.flush_regular_file_overlay_slices_with_attr(
+            attr.ino,
+            &[(
+                ChunkId(0),
+                vec![SliceRecord::tombstone(
+                    SliceId(0),
+                    SliceOrder(0),
+                    SliceRange::new(tail_start, tail_end).expect("valid tail tombstone range"),
+                )],
+            )],
+            Some(&tombstone_attr),
+        )
+        .expect("stage same-size sparse tail tombstone");
+        let tail_epoch = tombstone_attr.content_epoch;
+        vfs.state.namespace.dirty_attrs.lock().remove(&attr.ino);
+        vfs.state.namespace.attr_read_cache.lock().remove(attr.ino);
+        assert_eq!(
+            meta.get_attr(attr.ino).expect("load staged tombstone attr").size,
+            logical_size,
+            "regression setup should publish graph coverage without changing EOF"
+        );
+
+        let invalidator = Arc::new(RecordingKernelInvalidator::default());
+        vfs.set_kernel_invalidator(invalidator.clone());
+
+        let status = super::commit::CommitCoordinator::finalize_inode_epoch(
+            &vfs, attr.ino, tail_epoch,
+        )
+        .await
+        .expect("finalize same-size sparse tail");
+        assert!(
+            matches!(status, super::commit::EpochFinalizeStatus::Published),
+            "expected tail payload publication, got status {} with attr {:?}",
+            match status {
+                super::commit::EpochFinalizeStatus::Published => "published",
+                super::commit::EpochFinalizeStatus::Deferred => "deferred",
+                super::commit::EpochFinalizeStatus::Skipped => "skipped",
+            },
+            meta.get_attr(attr.ino)
+                .expect("load attr after finalize attempt")
+        );
+        assert_eq!(
+            invalidator.snapshot(),
+            vec![attr.ino],
+            "publication that changes payload coverage at the same logical size must invalidate cached reads"
+        );
+    });
+}
+
+#[test]
 fn remote_ready_attr_superseding_local_dirty_state_invalidates_kernel_inode() {
     let tmp = TempDir::new().expect("tempdir");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "remote-ready-supersede-kernel-inval");
@@ -2247,6 +2342,11 @@ fn remote_ready_attr_superseding_local_dirty_state_invalidates_kernel_inode() {
         let (published_epoch, published_blocks) =
             mark_all_overlay_objects_uploaded(&vfs, &meta, attr.ino);
         publish_current_file_graph(&meta, attr.ino, published_epoch, &published_blocks);
+        vfs.cancel_pending_uploads_for_inode(attr.ino);
+        vfs.clear_pending_payloads_for_inode(attr.ino);
+        vfs.state.writer_stack.clear_inode(attr.ino);
+        vfs.remove_live_extents_for_inode(attr.ino);
+        vfs.remove_pending_epoch_finalizations_for_inode(attr.ino);
         let published_attr = meta.get_attr(attr.ino).expect("load published attr");
         assert_eq!(published_attr.upload_state, MetaUploadState::Ready);
 
@@ -2275,6 +2375,105 @@ fn remote_ready_attr_superseding_local_dirty_state_invalidates_kernel_inode() {
             invalidator.snapshot(),
             vec![attr.ino],
             "remote ready metadata that supersedes locally visible dirty state must invalidate mounted kernel data"
+        );
+    });
+}
+
+#[test]
+fn remote_ready_attr_with_same_epoch_preserves_pending_local_write() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "remote-ready-same-epoch-keeps-local");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"remote-ready-same-epoch-keeps-local.bin", 0, 0, 0o644)
+            .expect("create test file");
+        let ino = attr.ino;
+
+        vfs.write_with_local_sync_policy(
+            ino,
+            64 * 1024,
+            b"pending local tail",
+            LocalSyncPolicy::Strict,
+        )
+        .await
+        .expect("write pending local payload");
+
+        let local_attr = meta.get_attr(ino).expect("load local pending attr");
+        let pending_epoch = local_attr.content_epoch;
+        assert!(
+            !vfs.pending_uploads_for_inode(ino).is_empty()
+                || vfs
+                    .state
+                    .upload
+                    .pending_epoch_finalizations
+                    .lock()
+                    .iter()
+                    .any(|pending| pending.0 == ino && pending.1 == pending_epoch),
+            "setup should leave local content work in the pending epoch"
+        );
+
+        let mut remote_ready = local_attr.clone();
+        remote_ready.upload_state = MetaUploadState::Ready;
+        remote_ready.committed_size = remote_ready.size;
+        remote_ready.committed_content_epoch = remote_ready.content_epoch;
+        meta.set_attr(&remote_ready)
+            .expect("simulate same-epoch remote ready attr");
+
+        vfs.refresh_inode_incarnation_state_from_attr(ino, &remote_ready);
+
+        assert!(
+            !vfs.pending_uploads_for_inode(ino).is_empty()
+                || vfs
+                    .state
+                    .upload
+                    .pending_epoch_finalizations
+                    .lock()
+                    .iter()
+                    .any(|pending| pending.0 == ino && pending.1 == pending_epoch),
+            "same-epoch remote ready metadata must not drop the local payload publication work"
+        );
+    });
+}
+
+#[test]
+fn same_size_strict_sparse_tail_write_advances_past_committed_epoch() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "same-size-strict-tail-publish");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let mut attr = vfs
+            .create(1, b"same-size-strict-tail-publish.bin", 0, 0, 0o644)
+            .expect("create sparse file");
+        let ino = attr.ino;
+        let logical_size = 3_146_158;
+        let tail_offset = 3_145_900;
+        let payload = b"strict sparse tail payload";
+
+        attr.size = logical_size;
+        attr.committed_size = logical_size;
+        attr.content_epoch = 1;
+        attr.committed_content_epoch = 1;
+        attr.upload_state = MetaUploadState::Ready;
+        meta.set_attr(&attr).expect("seed ready sparse attr");
+        vfs.refresh_inode_incarnation_state_from_attr(ino, &attr);
+
+        vfs.write_with_local_sync_policy(ino, tail_offset, payload, LocalSyncPolicy::Strict)
+            .await
+            .expect("write strict tail payload");
+        let (content_epoch, blocks) = mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+        assert!(
+            !blocks.is_empty(),
+            "strict tail write should stage an overlay payload"
+        );
+
+        let pending_attr = meta.get_attr(ino).expect("load pending tail attr");
+        assert_eq!(pending_attr.content_epoch, content_epoch);
+        assert!(
+            pending_attr.content_epoch > pending_attr.committed_content_epoch,
+            "same-size payload writes still need a publishable epoch: {pending_attr:?}"
         );
     });
 }
@@ -2336,6 +2535,70 @@ fn size_change_after_unpublished_flush_advances_content_epoch() {
 }
 
 #[test]
+fn handle_backed_extend_after_write_through_upload_work_advances_content_epoch() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "handle-extend-after-write-through");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"handle-extend-after-write-through.bin", 0, 0, 0o644)
+            .expect("create sparse file");
+        let ino = attr.ino;
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open writable handle");
+        let tail_offset = 1_048_569u64;
+        let logical_size = 2_097_275u64;
+
+        vfs.write_fh_with_local_sync_policy(fh, ino, 0, b"sparse-head", LocalSyncPolicy::Strict)
+            .await
+            .expect("write-through sparse head");
+        vfs.write_fh_with_local_sync_policy(
+            fh,
+            ino,
+            tail_offset,
+            b"sparse-tail-range",
+            LocalSyncPolicy::Strict,
+        )
+        .await
+        .expect("write-through sparse tail");
+
+        let payload_epoch = meta.get_attr(ino).expect("load payload attr").content_epoch;
+        assert!(
+            !vfs.pending_uploads_for_inode(ino).is_empty()
+                || vfs
+                    .state
+                    .upload
+                    .pending_epoch_finalizations
+                    .lock()
+                    .iter()
+                    .any(|pending| pending.0 == ino && pending.1 == payload_epoch),
+            "setup should leave old write-through publish work in flight"
+        );
+
+        vfs.setattr_with_handle(Some(fh), ino, SetattrArgs::size_only(logical_size))
+            .expect("extend logical EOF after write-through payloads");
+
+        let dirty_attr = vfs
+            .state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .get(&ino)
+            .cloned()
+            .expect("handle-backed growth should stage a dirty attr");
+        assert_eq!(dirty_attr.size, logical_size);
+        assert!(
+            dirty_attr.content_epoch > payload_epoch,
+            "logical-size growth must not share the epoch already queued for payload publication"
+        );
+
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
 fn nonzero_truncate_requeues_retained_overlay_uploads_with_new_epoch() {
     let tmp = TempDir::new().expect("tempdir");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "truncate-requeues-retained");
@@ -2388,7 +2651,7 @@ fn nonzero_truncate_requeues_retained_overlay_uploads_with_new_epoch() {
 }
 
 #[test]
-fn nonzero_extend_keeps_retained_overlay_uploads_on_current_epoch() {
+fn nonzero_extend_requeues_retained_overlay_uploads_when_publish_work_is_in_flight() {
     let tmp = TempDir::new().expect("tempdir");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "extend-keeps-retained");
     let _guard = rt.enter();
@@ -2414,8 +2677,15 @@ fn nonzero_extend_keeps_retained_overlay_uploads_on_current_epoch() {
 
         let pending_after = vfs.pending_uploads_for_inode(ino);
         assert_eq!(
-            pending_after, pending_before,
-            "logical-size growth must not cancel/requeue retained overlay uploads"
+            pending_after.len(),
+            pending_before.len(),
+            "logical-size growth must retain existing overlay uploads"
+        );
+        assert!(
+            pending_after
+                .iter()
+                .all(|(_, _, content_epoch)| *content_epoch > pending_before[0].2),
+            "retained overlay uploads must move to the new size-change epoch"
         );
     });
 }

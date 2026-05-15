@@ -4554,7 +4554,7 @@ fn planned_advanced_mounted_operations(
             ("client-a", "write_range", "sparse/shared.bin@1048569"),
             ("client-b", "read_probe", "sparse/shared.bin@65536"),
             ("client-b", "truncate_shrink", "sparse/shared.bin@1048833"),
-            ("client-c", "truncate_extend", "sparse/shared.bin@3146061"),
+            ("client-c", "truncate_extend", "sparse/shared.bin@3146061+"),
             ("client-c", "write_range", "sparse/shared.bin@2097147"),
             ("client-a", "read_probe", "sparse/shared.bin@3145900"),
         ],
@@ -4649,6 +4649,16 @@ fn sparse_hole_specs() -> &'static [SparseHoleSpec] {
     ]
 }
 
+fn sparse_logical_size(base_logical_size: u64, ranges: &[SparseRangeSpec]) -> u64 {
+    ranges.iter().fold(base_logical_size, |size, range| {
+        size.max(range.offset + range.payload.len() as u64)
+    })
+}
+
+fn sparse_final_logical_size(ranges: &[SparseRangeSpec]) -> u64 {
+    sparse_logical_size(SPARSE_FINAL_LOGICAL_SIZE, ranges)
+}
+
 fn run_sparse_range_operations(
     context: &ScenarioContext,
     clients: &[ClientSpec],
@@ -4667,6 +4677,10 @@ fn run_sparse_range_operations(
             .unwrap_or(SPARSE_FILE_PATH),
     );
     let sparse_ranges = sparse_expected_range_specs(Some((isolation, &sparse_path)));
+    let initial_logical_size =
+        sparse_logical_size(SPARSE_INITIAL_LOGICAL_SIZE, &sparse_ranges[..2]);
+    let shrunk_logical_size = sparse_logical_size(SPARSE_SHRUNK_LOGICAL_SIZE, &sparse_ranges[..2]);
+    let final_logical_size = sparse_final_logical_size(&sparse_ranges);
 
     record_sparse_operation(
         context,
@@ -4712,18 +4726,15 @@ fn run_sparse_range_operations(
             3,
             writer,
             "truncate_extend",
-            &format!("{sparse_path}@2097275"),
-            truncate_sparse_file(
-                writer.mount_point.join(&sparse_path),
-                SPARSE_INITIAL_LOGICAL_SIZE,
-            )
-            .map_err(ScenarioError::from),
+            &format!("{sparse_path}@{initial_logical_size}"),
+            truncate_sparse_file(writer.mount_point.join(&sparse_path), initial_logical_size)
+                .map_err(ScenarioError::from),
         )?,
     )?;
     wait_for_sparse_expected_until(SparseExpectedWait {
         clients,
         sparse_path: &sparse_path,
-        logical_size: SPARSE_INITIAL_LOGICAL_SIZE,
+        logical_size: initial_logical_size,
         expected_ranges: &sparse_ranges[..2],
         hole_specs: &[],
         deadline: Instant::now() + timeout,
@@ -4751,18 +4762,15 @@ fn run_sparse_range_operations(
             5,
             reader,
             "truncate_shrink",
-            &format!("{sparse_path}@1048833"),
-            truncate_sparse_file(
-                reader.mount_point.join(&sparse_path),
-                SPARSE_SHRUNK_LOGICAL_SIZE,
-            )
-            .map_err(ScenarioError::from),
+            &format!("{sparse_path}@{shrunk_logical_size}"),
+            truncate_sparse_file(reader.mount_point.join(&sparse_path), shrunk_logical_size)
+                .map_err(ScenarioError::from),
         )?,
     )?;
     wait_for_sparse_expected_until(SparseExpectedWait {
         clients,
         sparse_path: &sparse_path,
-        logical_size: SPARSE_SHRUNK_LOGICAL_SIZE,
+        logical_size: shrunk_logical_size,
         expected_ranges: &sparse_ranges[..2],
         hole_specs: &[],
         deadline: Instant::now() + timeout,
@@ -4778,12 +4786,9 @@ fn run_sparse_range_operations(
             6,
             extender,
             "truncate_extend",
-            &format!("{sparse_path}@3146061"),
-            truncate_sparse_file(
-                extender.mount_point.join(&sparse_path),
-                SPARSE_FINAL_LOGICAL_SIZE,
-            )
-            .map_err(ScenarioError::from),
+            &format!("{sparse_path}@{final_logical_size}"),
+            truncate_sparse_file(extender.mount_point.join(&sparse_path), final_logical_size)
+                .map_err(ScenarioError::from),
         )?,
     )?;
     record_sparse_operation(
@@ -4826,7 +4831,7 @@ fn run_sparse_range_operations(
     let (read_probes, zero_filled_holes) = wait_for_sparse_expected_until(SparseExpectedWait {
         clients,
         sparse_path: &sparse_path,
-        logical_size: SPARSE_FINAL_LOGICAL_SIZE,
+        logical_size: final_logical_size,
         expected_ranges: &sparse_ranges,
         hole_specs: sparse_hole_specs(),
         deadline: Instant::now() + timeout,
@@ -4851,7 +4856,7 @@ fn run_sparse_range_operations(
     )?;
 
     let final_payload = fs::read(writer.mount_point.join(&sparse_path))?;
-    let expected_payload = expected_sparse_payload(&sparse_ranges);
+    let expected_payload = expected_sparse_payload(&sparse_ranges, final_logical_size);
     if final_payload != expected_payload {
         return Err(ScenarioError::Io(io::Error::other(format!(
             "sparse final payload mismatch: expected checksum {}, got {}",
@@ -4862,7 +4867,7 @@ fn run_sparse_range_operations(
 
     let summary = SparseRangeSummary {
         relative_path: sparse_path,
-        logical_size: SPARSE_FINAL_LOGICAL_SIZE,
+        logical_size: final_logical_size,
         final_checksum_sha256: bytes_sha256(&final_payload),
         expected_byte_ranges: sparse_expected_ranges(&sparse_ranges),
         zero_filled_holes,
@@ -5083,8 +5088,8 @@ fn read_exact_range_from(file: &mut fs::File, offset: u64, len: usize) -> io::Re
     Ok(buffer)
 }
 
-fn expected_sparse_payload(ranges: &[SparseRangeSpec]) -> Vec<u8> {
-    let mut payload = vec![0; SPARSE_FINAL_LOGICAL_SIZE as usize];
+fn expected_sparse_payload(ranges: &[SparseRangeSpec], logical_size: u64) -> Vec<u8> {
+    let mut payload = vec![0; logical_size as usize];
     for range in ranges {
         let start = range.offset as usize;
         let end = start + range.payload.len();
@@ -5125,10 +5130,11 @@ fn sparse_hole_summaries(
 
 fn planned_sparse_range_summary() -> SparseRangeSummary {
     let ranges = sparse_expected_range_specs(None);
-    let expected_payload = expected_sparse_payload(&ranges);
+    let final_logical_size = sparse_final_logical_size(&ranges);
+    let expected_payload = expected_sparse_payload(&ranges, final_logical_size);
     SparseRangeSummary {
         relative_path: SPARSE_FILE_PATH.to_string(),
-        logical_size: SPARSE_FINAL_LOGICAL_SIZE,
+        logical_size: final_logical_size,
         final_checksum_sha256: bytes_sha256(&expected_payload),
         expected_byte_ranges: sparse_expected_ranges(&ranges),
         zero_filled_holes: sparse_hole_summaries(
@@ -5154,7 +5160,13 @@ fn planned_sparse_range_summary() -> SparseRangeSummary {
 fn sparse_ranges_match(kind: AdvancedMountedKind, summary: Option<&SparseRangeSummary>) -> bool {
     match (kind, summary) {
         (AdvancedMountedKind::SparseRange, Some(summary)) => {
-            summary.logical_size == SPARSE_FINAL_LOGICAL_SIZE
+            let final_logical_size = summary
+                .expected_byte_ranges
+                .iter()
+                .fold(SPARSE_FINAL_LOGICAL_SIZE, |size, range| {
+                    size.max(range.offset + range.len as u64)
+                });
+            summary.logical_size == final_logical_size
                 && summary.read_probes.iter().all(|probe| probe.matched)
                 && summary.zero_filled_holes.iter().all(|hole| hole.all_zero)
         }
@@ -5420,6 +5432,92 @@ mod tests {
             second.payload("overwrite", "slot-0.txt", "body"),
             "payloads must vary with the mounted volume identity"
         );
+    }
+
+    #[test]
+    fn isolated_sparse_ranges_fit_final_logical_size() {
+        let context = ScenarioContext {
+            run_id: "focused-13-17-20260515".to_string(),
+            seed: 377,
+            sandbox: PathBuf::from("sandbox"),
+            scenario_dir: PathBuf::from("scenario"),
+            client_controller_config: None,
+        };
+        let isolation = ScenarioIsolation::for_advanced(
+            &context,
+            AdvancedMountedKind::SparseRange,
+            "projectfs-volume-sparse-range-contract",
+        );
+        let sparse_path = isolation.path(
+            SPARSE_FILE_PATH
+                .strip_prefix("sparse/")
+                .unwrap_or(SPARSE_FILE_PATH),
+        );
+        let ranges = sparse_expected_range_specs(Some((&isolation, &sparse_path)));
+        let final_logical_size = sparse_final_logical_size(&ranges);
+
+        assert!(
+            final_logical_size > SPARSE_FINAL_LOGICAL_SIZE,
+            "realistic isolated payloads should extend beyond the legacy fixed EOF"
+        );
+
+        for range in ranges {
+            let end = range.offset + range.payload.len() as u64;
+            assert!(
+                end <= final_logical_size,
+                "{} range ends at {end}, beyond sparse logical size {final_logical_size}",
+                range.label
+            );
+        }
+    }
+
+    #[test]
+    fn isolated_sparse_ranges_fit_each_phase_logical_size() {
+        let context = ScenarioContext {
+            run_id: "repro-s17-sparse-after-contract-fix".to_string(),
+            seed: 0,
+            sandbox: PathBuf::from("sandbox"),
+            scenario_dir: PathBuf::from("scenario"),
+            client_controller_config: None,
+        };
+        let isolation = ScenarioIsolation::for_advanced(
+            &context,
+            AdvancedMountedKind::SparseRange,
+            "sfs-e2e-repro-s17-sparse-after-contract-fix-0-28afb97ba53ab496",
+        );
+        let sparse_path = isolation.path(
+            SPARSE_FILE_PATH
+                .strip_prefix("sparse/")
+                .unwrap_or(SPARSE_FILE_PATH),
+        );
+        let ranges = sparse_expected_range_specs(Some((&isolation, &sparse_path)));
+
+        for (phase, logical_size, expected_ranges) in [
+            (
+                "initial sparse ranges",
+                sparse_logical_size(SPARSE_INITIAL_LOGICAL_SIZE, &ranges[..2]),
+                &ranges[..2],
+            ),
+            (
+                "shrunk sparse ranges",
+                sparse_logical_size(SPARSE_SHRUNK_LOGICAL_SIZE, &ranges[..2]),
+                &ranges[..2],
+            ),
+            (
+                "final sparse ranges",
+                sparse_final_logical_size(&ranges),
+                &ranges[..],
+            ),
+        ] {
+            for range in expected_ranges {
+                let end = range.offset + range.payload.len() as u64;
+                assert!(
+                    end <= logical_size,
+                    "{phase}: {} range ends at {end}, beyond sparse logical size {logical_size}",
+                    range.label
+                );
+            }
+        }
     }
 
     #[test]
