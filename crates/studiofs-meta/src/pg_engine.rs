@@ -508,6 +508,20 @@ impl PgMetaEngine {
         Ok(true)
     }
 
+    fn snapshot_replay_start_version(
+        snapshot: &RedbSnapshot,
+        advertised_head_version: i64,
+        previous_local_version: i64,
+    ) -> i64 {
+        snapshot
+            .counters
+            .iter()
+            .find(|(name, _)| name == LOCAL_PG_VERSION_COUNTER)
+            .map(|(_, version)| (*version).min(i64::MAX as u64) as i64)
+            .unwrap_or(previous_local_version)
+            .min(advertised_head_version)
+    }
+
     fn load_persisted_inode_allocator_state(
         local: &RedbMetaEngine,
     ) -> MetaResult<InodeAllocatorState> {
@@ -2235,7 +2249,12 @@ impl PgMetaEngine {
         if Self::should_pull_startup_snapshot(&engine.local, restored_local_version)? {
             let _ = engine.pull_snapshot_locked();
         }
-        let _ = engine.sync_metadata();
+        if let Err(error) = engine.sync_metadata_to_current_head() {
+            warn!(
+                error = %error,
+                "postgres metadata startup catch-up did not reach the current remote head"
+            );
+        }
         let _ = engine.restore_pending_state_from_local_log();
         let _ = engine.prime_local_id_ranges(client_slot);
         if options.background_poll {
@@ -3327,9 +3346,42 @@ impl PgMetaEngine {
         let bytes: Vec<u8> = row.get(1);
 
         let snapshot = Self::decode_snapshot(&bytes)?;
+        let replay_start_version =
+            Self::snapshot_replay_start_version(&snapshot, version, local_version);
         self.local.import_remote_snapshot(&snapshot)?;
-        self.persist_local_version(version)?;
+        self.persist_local_version(replay_start_version)?;
         Ok(true)
+    }
+
+    fn remote_metadata_head_version(&self) -> MetaResult<i64> {
+        let postgres_url = self.postgres_url.clone();
+        let volume_id = self.volume_id;
+        let connect_timeout = self.connect_timeout;
+        let command_timeout = self.command_timeout;
+
+        self.run_async(async move {
+            Self::with_postgres_client_timeout(
+                postgres_url,
+                connect_timeout,
+                command_timeout,
+                "metadata head version",
+                move |client| async move {
+                    let row = client
+                        .query_opt(
+                            "SELECT version FROM metadata_state WHERE vol=$1",
+                            &[&volume_id],
+                        )
+                        .await
+                        .map_err(|e| {
+                            MetaError::Storage(format!(
+                                "postgres metadata head version select failed: {e}"
+                            ))
+                        })?;
+                    Ok(row.map(|row| row.get(0)).unwrap_or(0))
+                },
+            )
+            .await
+        })
     }
 
     fn push_event_log_batch_locked(&self, events: &[MetaEvent]) -> MetaResult<i64> {
@@ -3720,6 +3772,36 @@ impl PgMetaEngine {
         })();
         self.record_metadata_sync_result(source, &result);
         result
+    }
+
+    fn sync_metadata_to_current_head(&self) -> MetaResult<()> {
+        // Startup catch-up normally needs one pass. The bound keeps a peer that
+        // is racing a continuously advancing PG head from blocking open forever.
+        const MAX_STARTUP_CATCHUP_ROUNDS: usize = 16;
+
+        let mut target_head = self.remote_metadata_head_version()?;
+        for _ in 0..MAX_STARTUP_CATCHUP_ROUNDS {
+            if self.local_version.load(Ordering::SeqCst) >= target_head {
+                return Ok(());
+            }
+
+            let before = self.local_version.load(Ordering::SeqCst);
+            self.sync_metadata()?;
+            let after = self.local_version.load(Ordering::SeqCst);
+            target_head = self.remote_metadata_head_version()?;
+            if after >= target_head {
+                return Ok(());
+            }
+            if after == before {
+                return Err(MetaError::Storage(format!(
+                    "postgres metadata catch-up stalled at local version {after} while remote head is {target_head}"
+                )));
+            }
+        }
+
+        Err(MetaError::Storage(
+            "postgres metadata catch-up did not reach the current remote head".to_string(),
+        ))
     }
 
     fn pull_foreign_events_locked(&self, recent_flush: Option<&RecentFlush>) -> MetaResult<bool> {
@@ -6965,6 +7047,45 @@ mod tests {
             !PgMetaEngine::should_pull_startup_snapshot(&pg.local, 42)
                 .expect("startup snapshot decision"),
             "persisted PG version should suppress checkpoint bootstrap overwrite"
+        );
+    }
+
+    #[test]
+    fn startup_snapshot_replay_starts_from_snapshot_epoch_not_pg_head() {
+        let mut snapshot = RedbSnapshot::default();
+        snapshot
+            .counters
+            .push((LOCAL_PG_VERSION_COUNTER.to_string(), 3));
+
+        assert_eq!(
+            PgMetaEngine::snapshot_replay_start_version(&snapshot, 9, 0),
+            3,
+            "metadata_state.version is the remote head; snapshot import must resume from the checkpoint epoch"
+        );
+    }
+
+    #[test]
+    fn startup_snapshot_replay_caps_snapshot_epoch_to_pg_head() {
+        let mut snapshot = RedbSnapshot::default();
+        snapshot
+            .counters
+            .push((LOCAL_PG_VERSION_COUNTER.to_string(), 12));
+
+        assert_eq!(
+            PgMetaEngine::snapshot_replay_start_version(&snapshot, 9, 0),
+            9,
+            "a stale or corrupt checkpoint cursor must not advance past the advertised PG head"
+        );
+    }
+
+    #[test]
+    fn startup_snapshot_replay_uses_previous_epoch_when_snapshot_has_no_cursor() {
+        let snapshot = RedbSnapshot::default();
+
+        assert_eq!(
+            PgMetaEngine::snapshot_replay_start_version(&snapshot, 9, 2),
+            2,
+            "legacy checkpoints without a PG cursor must keep the previous local replay floor"
         );
     }
 
