@@ -142,6 +142,7 @@ cargo run -p studiofs-e2e -- run mounted-chaos-convergence --seed 360 --studiofs
 cargo run -p studiofs-e2e -- run mounted-lww-reconnect-chaos-convergence --seed 360 --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run mounted-sparse-file-range-convergence --seed 377 --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run mounted-cold-observer-long-history-convergence --seed 378 --studiofs-bin target\debug\studiofs.exe
+cargo run -p studiofs-e2e -- run mounted-stale-remount-cold-discover-catchup-convergence --seed 418 --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run rustfs-outage-multi-client-recovery --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run mounted-client-crash-restart-recovery --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run collision-rename-vs-unlink --studiofs-bin target\debug\studiofs.exe
@@ -187,6 +188,14 @@ volume, then validates canonical paths, content checksums, tombstone behavior,
 and absence of resurrected entries through mounted reads. It writes
 `operations.ndjson`, `cold-observer-long-history-summary.json`,
 `cold-observer-diagnostics.json`, and `validation.json`.
+`mounted-stale-remount-cold-discover-catchup-convergence` is the next
+post-1-16 promotion scenario. It starts `client-a`, `client-b`, and `client-c`,
+unmounts `client-c` after a public baseline is visible, lets `client-a` and
+`client-b` publish mixed namespace and payload history, then remounts stale
+`client-c` and discovers fresh `client-d` after the history exists. Validation
+uses only public mounted reads and tree convergence. It writes
+`operations.ndjson`, `stale-remount-cold-discover-summary.json`,
+`catchup-diagnostics.json`, and `validation.json`.
 
 Hosted Linux real mounted E2E is available as a manual RWX workflow:
 
