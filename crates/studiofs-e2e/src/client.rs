@@ -682,6 +682,11 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         Ok(())
     }
 
+    pub fn unmount(&mut self, client: &str) -> Result<(), ClientControllerError> {
+        let index = self.client_index(client)?;
+        self.unmount_index(index)
+    }
+
     pub fn force_kill_all(&mut self) -> Result<(), ClientControllerError> {
         let mut kill_error = None;
         for index in 0..self.clients.len() {

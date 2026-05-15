@@ -203,6 +203,25 @@ activity and still converge to the same final workspace: deleted paths stay
 gone, renamed paths appear under the final name, overwritten content has the
 expected winner, and nested content is visible.
 
+### 19. Stale-Remount And Cold-Discover Catch-Up
+
+This scenario starts three mounted clients together. One of them, `client-c`,
+sees an initial baseline and then goes away while keeping its local StudioFS
+state on disk. While it is offline, `client-a` and `client-b` keep changing the
+workspace: they create, delete, rename, overwrite, append, and add nested
+content.
+
+After that history exists, two different kinds of clients join close together.
+`client-c` comes back with old local knowledge and must catch up from where it
+left off. `client-d` joins as a brand-new observer and must discover the
+already-active volume from scratch. The test passes only if both end up seeing
+the same final mounted workspace as the warm writers.
+
+This protects a common real-world shape: one machine sleeps or disconnects,
+another new machine joins later, and both must still see the current filesystem
+without resurrecting deleted files, missing renamed paths, or reading stale
+payloads.
+
 ## What The Baseline Gate Means
 
 `local-first-baseline-gate` reruns scenarios 1 through 8 as the accepted
@@ -219,8 +238,9 @@ bridge behavior, or a specific bug fix.
 A passing mounted sweep means the current implementation survived the selected
 real-mount scenarios: basic sharing, service outages, crash/restart,
 publication boundaries, focused namespace collisions, seeded chaos, hot-spot
-churn, fault chaos, LWW reconnect, open-handle behavior, and any appended
-promotion scenarios selected for that run.
+churn, fault chaos, LWW reconnect, open-handle behavior, sparse files, late
+observers, stale remounts, cold discovery, and any appended promotion scenarios
+selected for that run.
 
 It does not mean the filesystem is perfect. It means the current safety net is
 working and gives us a strong baseline before we add deeper scenarios.
@@ -246,5 +266,5 @@ only then move to the next level.
 
 Future deterministic backstops can go deeper into sparse-file
 truncate/write/read-range races, cold-observer long-history convergence,
-invalidation dropout and fallback sync, symlink and metadata-attribute
-convergence, and adversarial runner cleanup.
+stale-remount catch-up, invalidation dropout and fallback sync, symlink and
+metadata-attribute convergence, and adversarial runner cleanup.

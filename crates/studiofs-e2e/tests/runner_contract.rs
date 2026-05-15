@@ -286,6 +286,99 @@ fn scenario_list_appends_cold_observer_promotion_after_sparse_range() {
 }
 
 #[test]
+fn scenario_list_appends_stale_remount_cold_discover_after_cold_observer() {
+    let scenarios = studiofs_e2e::scenario::available_scenarios();
+    let names = scenarios
+        .iter()
+        .map(|scenario| scenario.name)
+        .collect::<Vec<_>>();
+
+    assert_eq!(names[17], "mounted-cold-observer-long-history-convergence");
+    assert_eq!(
+        names[18],
+        "mounted-stale-remount-cold-discover-catchup-convergence"
+    );
+}
+
+#[test]
+fn stale_remount_cold_discover_disabled_run_writes_reproducible_artifacts() {
+    let temp = tempdir().unwrap();
+    let request = RunRequest {
+        root: temp.path().join("e2e-runs"),
+        run_id: Some("stale-remount-cold-discover-contract-run".to_string()),
+        scenarios: vec!["mounted-stale-remount-cold-discover-catchup-convergence".to_string()],
+        seed: 418,
+        studiofs_bin: None,
+        platform: PlatformSelection::Auto,
+        retention: RetentionPolicy::Always,
+        report: None,
+        port_range: None,
+        timeout: None,
+        infra: InfraMode::Disabled,
+    };
+
+    let outcome = studiofs_e2e::runner::run(request).unwrap();
+
+    assert_eq!(outcome.status, RunStatus::Passed);
+    assert_eq!(
+        outcome.scenarios[0].name,
+        "mounted-stale-remount-cold-discover-catchup-convergence"
+    );
+    assert!(outcome.scenarios[0].artifacts.contains(
+        &"artifacts/scenarios/mounted-stale-remount-cold-discover-catchup-convergence/stale-remount-cold-discover-summary.json".to_string()
+    ));
+    assert!(outcome.scenarios[0].artifacts.contains(
+        &"artifacts/scenarios/mounted-stale-remount-cold-discover-catchup-convergence/catchup-diagnostics.json".to_string()
+    ));
+
+    let sandbox = temp
+        .path()
+        .join("e2e-runs")
+        .join("stale-remount-cold-discover-contract-run");
+    let summary = read_json(sandbox.join(
+        "artifacts/scenarios/mounted-stale-remount-cold-discover-catchup-convergence/stale-remount-cold-discover-summary.json",
+    ));
+    assert_eq!(
+        summary["scenario"],
+        "mounted-stale-remount-cold-discover-catchup-convergence"
+    );
+    assert_eq!(summary["clients"], 4);
+    assert_eq!(
+        summary["catchup"]["warm_writers"].as_array().unwrap(),
+        &vec![
+            Value::String("client-a".to_string()),
+            Value::String("client-b".to_string()),
+        ]
+    );
+    assert_eq!(summary["catchup"]["stale_remount_client"], "client-c");
+    assert_eq!(summary["catchup"]["cold_discover_client"], "client-d");
+    assert_eq!(summary["catchup"]["stale_remount_after_history"], true);
+    assert_eq!(summary["catchup"]["cold_discover_after_history"], true);
+    assert_eq!(summary["long_history"]["bounded_operation_count"], 11);
+
+    let operations = fs::read_to_string(sandbox.join(
+        "artifacts/scenarios/mounted-stale-remount-cold-discover-catchup-convergence/operations.ndjson",
+    ))
+    .unwrap();
+    for expected in [
+        "initial_baseline",
+        "stale_client_unmount",
+        "create",
+        "delete",
+        "rename",
+        "overwrite",
+        "append",
+        "stale_remount_after_history",
+        "cold_discover_after_history",
+    ] {
+        assert!(
+            operations.contains(expected),
+            "expected stale/cold catch-up operation {expected}"
+        );
+    }
+}
+
+#[test]
 fn cold_observer_long_history_disabled_run_writes_reproducible_artifacts() {
     let temp = tempdir().unwrap();
     let request = RunRequest {
