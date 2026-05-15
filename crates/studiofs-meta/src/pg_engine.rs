@@ -2941,11 +2941,17 @@ impl PgMetaEngine {
             // `content_epoch` is scoped to the publishing client/incarnation, not a global
             // cross-client version. Scenario 13 can legitimately receive a fully Ready
             // remote growth with a lower epoch than the protected local base head; once
-            // the batch carries Ready attrs, the larger committed extent is authoritative
-            // and must replace the protected graph instead of splicing histories.
+            // the batch carries Ready attrs plus a complete committed graph, that graph is
+            // authoritative and must replace protected ranges instead of splicing histories.
+            let remote_carries_complete_graph = Self::batch_publish_covers_committed_extent(
+                batch_events,
+                attr.ino,
+                attr.committed_size,
+            );
             if attr.committed_size > current.committed_size
                 || attr.content_epoch > current.content_epoch
-                || (attr.content_epoch == current.content_epoch && attr.mtime >= current.mtime)
+                || (attr.content_epoch == current.content_epoch
+                    && (attr.mtime >= current.mtime || remote_carries_complete_graph))
             {
                 tracing::debug!(
                     ino = attr.ino,
@@ -2961,6 +2967,51 @@ impl PgMetaEngine {
             }
         }
         Ok(preserve_inodes)
+    }
+
+    fn batch_publish_covers_committed_extent(
+        batch_events: &[MetaEvent],
+        target_ino: Ino,
+        committed_size: u64,
+    ) -> bool {
+        if committed_size == 0 {
+            return false;
+        }
+
+        let mut ranges = Vec::new();
+        for event in batch_events {
+            let MetaEvent::PublishRegularFileBaseSlices { ino, chunk_slices } = event else {
+                continue;
+            };
+            if *ino != target_ino {
+                continue;
+            }
+            for (chunk_id, slices) in chunk_slices {
+                let chunk_start = chunk_start_offset(*chunk_id, DEFAULT_CHUNK_SIZE);
+                for slice in slices {
+                    let start = chunk_start.saturating_add(u64::from(slice.range.start));
+                    let end = chunk_start
+                        .saturating_add(u64::from(slice.range.end))
+                        .min(committed_size);
+                    if start < end {
+                        ranges.push((start, end));
+                    }
+                }
+            }
+        }
+
+        ranges.sort_unstable_by_key(|(start, end)| (*start, *end));
+        let mut covered_until = 0;
+        for (start, end) in ranges {
+            if start > covered_until {
+                return false;
+            }
+            covered_until = covered_until.max(end);
+            if covered_until >= committed_size {
+                return true;
+            }
+        }
+        false
     }
 
     fn protected_regular_file_attr_merges(
@@ -2996,6 +3047,17 @@ impl PgMetaEngine {
                 continue;
             };
             if current.kind != FileType::RegularFile || current.upload_state != UploadState::Ready {
+                continue;
+            }
+            if attr.upload_state == UploadState::Ready
+                && attr.content_epoch == attr.committed_content_epoch
+                && attr.size == attr.committed_size
+                && Self::batch_publish_covers_committed_extent(
+                    batch_events,
+                    attr.ino,
+                    attr.committed_size,
+                )
+            {
                 continue;
             }
             if attr.content_epoch > current.content_epoch
@@ -6141,6 +6203,89 @@ mod tests {
             object_ids,
             vec![remote_head.object_id, remote_tail.object_id],
             "growing ready remote publish should replace, not splice into, a protected committed base graph"
+        );
+    }
+
+    #[test]
+    fn ready_foreign_overwrite_replaces_larger_same_epoch_protected_base_graph() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+
+        let file = pg
+            .create_file(ROOT_INO, b"protected-ready-overwrite.txt", 0, 0, 0o644)
+            .expect("create file");
+        set_file_state(&pg, file.ino, 223, 0);
+        let local_head = PayloadRef::new_partial(77_090, 223);
+        pg.stage_payload_slice(file.ino, 0, &local_head)
+            .expect("stage local head");
+        mark_overlay_objects_uploaded(&pg, file.ino, 0, &[local_head.object_id]);
+        assert!(
+            pg.publish_regular_file_overlay_to_base_if_matches(file.ino, 0)
+                .expect("publish local head"),
+            "local head publish should succeed"
+        );
+
+        set_file_state(&pg, file.ino, 446, 1);
+        let local_tail = PayloadRef::new_partial(77_091, 223);
+        pg.stage_payload_slice(file.ino, 223, &local_tail)
+            .expect("stage local tail");
+        mark_overlay_objects_uploaded(&pg, file.ino, 1, &[local_tail.object_id]);
+        assert!(
+            pg.publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
+                .expect("publish local tail"),
+            "local append publish should succeed"
+        );
+
+        let overlay = pg.local_overlay_conflicts().expect("overlay conflicts");
+        assert!(
+            overlay.block_inodes.contains(&file.ino),
+            "unacknowledged local append should protect the inode before the remote overwrite arrives"
+        );
+
+        let remote_payload = PayloadRef::new_partial(77_092, 227);
+        let remote_publish = MetaEvent::PublishRegularFileBaseSlices {
+            ino: file.ino,
+            chunk_slices: vec![(
+                ChunkId(0),
+                vec![SliceRecord {
+                    slice_id: SliceId(0),
+                    order: SliceOrder(0),
+                    range: SliceRange::new(0, 227).expect("remote overwrite range"),
+                    payload: Some(remote_payload.clone()),
+                    payload_state: PayloadRefState::Published,
+                }],
+            )],
+        };
+        let mut remote_attr = pg.get_attr(file.ino).expect("local attr");
+        remote_attr.size = 227;
+        remote_attr.committed_size = 227;
+        remote_attr.content_epoch = 1;
+        remote_attr.committed_content_epoch = 1;
+        remote_attr.upload_state = UploadState::Ready;
+        remote_attr.mtime = remote_attr.mtime.saturating_sub(1);
+        remote_attr.ctime = remote_attr.ctime.saturating_sub(1);
+
+        pg.apply_foreign_batch(
+            &[
+                remote_publish,
+                MetaEvent::SetAttr {
+                    attr: remote_attr.clone(),
+                },
+            ],
+            &overlay,
+            &HashSet::from([file.ino]),
+        )
+        .expect("apply ready foreign overwrite");
+
+        let object_ids = pg
+            .lookup_regular_file_slices(file.ino, 0, remote_attr.size)
+            .expect("lookup merged graph")
+            .into_iter()
+            .filter_map(|span| span.payload.map(|payload| payload.object_id))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            object_ids,
+            vec![remote_payload.object_id],
+            "ready remote overwrite should replace, not splice into, a larger same-epoch protected graph"
         );
     }
 
