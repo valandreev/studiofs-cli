@@ -913,6 +913,24 @@ fn run_mount_vfs_shutdown(
     Ok(runtime)
 }
 
+fn stop_mount_diagnostics_host(
+    runtime: &Runtime,
+    diagnostics_host: LocalDiagnosticsHost,
+) -> anyhow::Result<()> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        let runtime_handle = runtime.handle().clone();
+        let shutdown = std::thread::spawn(move || {
+            runtime_handle.block_on(diagnostics_host.stop());
+        });
+        return shutdown.join().map_err(|_| {
+            anyhow::anyhow!("mount diagnostics shutdown thread panicked during unmount")
+        });
+    }
+
+    runtime.block_on(diagnostics_host.stop());
+    Ok(())
+}
+
 fn shutdown_mount_runtime(
     runtime: Runtime,
     runtime_shutdown_timeout: Duration,
@@ -1226,11 +1244,14 @@ impl PreparedMount {
         let runtime_shutdown_timeout = runtime_shutdown_timeout();
         let runtime = run_mount_vfs_shutdown(runtime, vfs, upload_drain_timeout)?;
         if let Some(diagnostics_host) = diagnostics_host {
-            diagnostics_host.stop();
+            stop_mount_diagnostics_host(&runtime, diagnostics_host)?;
         }
         if let Some(mut finish_profiling) = profiling.take() {
             finish_profiling();
         }
+        // Release every foreground owner that can retain StudioVfs metadata
+        // before shutting the runtime down, so redb observes a deterministic
+        // final drop instead of being left to process teardown ordering.
         drop(diagnostics_source);
         drop(profiling_backend);
         drop(write_path_observability_publisher);
