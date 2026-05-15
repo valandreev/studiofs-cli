@@ -14,6 +14,8 @@ use chrono::Utc;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
+use std::sync::{Mutex as StdMutex, OnceLock, Weak};
 use std::thread::JoinHandle;
 use std::time::Duration;
 #[cfg(test)]
@@ -911,10 +913,34 @@ fn run_mount_vfs_shutdown(
     Ok(runtime)
 }
 
+fn stop_mount_diagnostics_host(
+    runtime: &Runtime,
+    diagnostics_host: LocalDiagnosticsHost,
+) -> anyhow::Result<()> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        let runtime_handle = runtime.handle().clone();
+        let shutdown = std::thread::Builder::new()
+            .name("mount-diagnostics-shutdown".to_string())
+            .spawn(move || {
+                runtime_handle.block_on(diagnostics_host.stop());
+            })
+            .map_err(|error| {
+                anyhow::anyhow!("failed to spawn mount diagnostics shutdown thread: {error}")
+            })?;
+        return shutdown.join().map_err(|_| {
+            anyhow::anyhow!("mount diagnostics shutdown thread panicked during unmount")
+        });
+    }
+
+    runtime.block_on(diagnostics_host.stop());
+    Ok(())
+}
+
 fn shutdown_mount_runtime(
     runtime: Runtime,
     runtime_shutdown_timeout: Duration,
 ) -> anyhow::Result<()> {
+    runtime_shutdown_boundary_for_test();
     if tokio::runtime::Handle::try_current().is_ok() {
         let shutdown = std::thread::spawn(move || {
             runtime.shutdown_timeout(runtime_shutdown_timeout);
@@ -927,6 +953,42 @@ fn shutdown_mount_runtime(
     runtime.shutdown_timeout(runtime_shutdown_timeout);
     Ok(())
 }
+
+#[cfg(test)]
+fn observed_runtime_shutdown_vfs_for_test() -> &'static StdMutex<(Option<Weak<StudioVfs>>, bool)> {
+    static OBSERVED: OnceLock<StdMutex<(Option<Weak<StudioVfs>>, bool)>> = OnceLock::new();
+    OBSERVED.get_or_init(|| StdMutex::new((None, false)))
+}
+
+#[cfg(test)]
+fn observe_runtime_shutdown_vfs_for_test(vfs: &Arc<StudioVfs>) {
+    let mut observed = observed_runtime_shutdown_vfs_for_test()
+        .lock()
+        .expect("lock observed runtime-shutdown vfs");
+    *observed = (Some(Arc::downgrade(vfs)), false);
+}
+
+#[cfg(test)]
+fn runtime_shutdown_observed_vfs_was_released_for_test() -> bool {
+    observed_runtime_shutdown_vfs_for_test()
+        .lock()
+        .expect("lock observed runtime-shutdown vfs")
+        .1
+}
+
+#[cfg(test)]
+fn runtime_shutdown_boundary_for_test() {
+    let mut observed = observed_runtime_shutdown_vfs_for_test()
+        .lock()
+        .expect("lock observed runtime-shutdown vfs");
+    observed.1 = observed
+        .0
+        .as_ref()
+        .is_some_and(|vfs| vfs.upgrade().is_none());
+}
+
+#[cfg(not(test))]
+fn runtime_shutdown_boundary_for_test() {}
 
 impl MountSession {
     pub(crate) fn prepare(command: MountCommand) -> anyhow::Result<Self> {
@@ -1170,8 +1232,8 @@ impl PreparedMount {
         let diagnostics_host = LocalDiagnosticsHost::start_best_effort(
             runtime.handle(),
             &self.plan.actual_mount_path,
-            diagnostics_source,
-            profiling_backend,
+            diagnostics_source.clone(),
+            profiling_backend.clone(),
         );
         let serve_result = backend.serve(BackendLaunch {
             vfs: vfs.clone(),
@@ -1187,11 +1249,19 @@ impl PreparedMount {
         let runtime_shutdown_timeout = runtime_shutdown_timeout();
         let runtime = run_mount_vfs_shutdown(runtime, vfs, upload_drain_timeout)?;
         if let Some(diagnostics_host) = diagnostics_host {
-            diagnostics_host.stop();
+            stop_mount_diagnostics_host(&runtime, diagnostics_host)?;
         }
         if let Some(mut finish_profiling) = profiling.take() {
             finish_profiling();
         }
+        // Release every foreground owner that can retain StudioVfs metadata
+        // before shutting the runtime down, so redb observes a deterministic
+        // final drop instead of being left to process teardown ordering.
+        drop(diagnostics_source);
+        drop(profiling_backend);
+        drop(write_path_observability_publisher);
+        drop(backend);
+        info!("mount metadata engine closed cleanly");
         let _ = utils::remove_pid_file(&self.plan.actual_mount_path);
         drop(self.mount_lock.take());
         cleanup_snapshot_mount_db(self.snapshot_mount_db_path.take().as_deref());
@@ -2123,6 +2193,49 @@ mod tests {
             session.meta.get_format_info().expect("meta info").uuid,
             format_info.uuid
         );
+    }
+
+    #[test]
+    fn foreground_shutdown_releases_vfs_handles_before_runtime_shutdown() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (meta_dir, seed_engine, _format_info) = seed_mount_meta_db(&temp, "demo");
+        drop(seed_engine);
+        let mount_point = startup_mount_point(&temp);
+        let settings_config = startup_settings_config(mount_point.clone(), None, Some("64MB"));
+        let command = mount_command("demo", &meta_dir, Some(mount_point), None, Some("64MB"));
+        let backend_events = Arc::new(Mutex::new(Vec::new()));
+        let observed_vfs = Arc::new(Mutex::new(std::sync::Weak::new()));
+        let observed_vfs_for_backend = observed_vfs.clone();
+
+        let session = MountSession::prepare_with_backend_factory(command, settings_config, || {
+            Box::new(FakeBackend {
+                events: backend_events,
+                fail: false,
+                inspect: Some(Arc::new(move |launch| {
+                    observe_runtime_shutdown_vfs_for_test(&launch.vfs);
+                    *observed_vfs_for_backend.lock().expect("lock observed vfs") =
+                        Arc::downgrade(&launch.vfs);
+                    Ok(())
+                })),
+            })
+        })
+        .expect("prepare foreground mount");
+
+        session.launch().expect("launch fake foreground mount");
+
+        assert!(
+            runtime_shutdown_observed_vfs_was_released_for_test(),
+            "foreground teardown must release every Arc<StudioVfs> before runtime shutdown"
+        );
+        assert!(
+            observed_vfs
+                .lock()
+                .expect("lock observed vfs")
+                .upgrade()
+                .is_none()
+        );
+        RedbMetaEngine::read_format_info_readonly(meta_dir.join("demo.db"))
+            .expect("clean shutdown leaves redb readable by read-only format probe");
     }
 
     #[test]

@@ -11191,7 +11191,10 @@ async fn test_rename_overwrite_existing_file() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn test_unlink_with_open_handle_deferred_cleanup() {
-    ensure_bucket().await;
+    let _env = setup_offline_sfs121_env();
+    unsafe {
+        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "60000");
+    }
     let tmp = tempfile::tempdir().unwrap();
     let vfs = make_vfs(&tmp, "open-unlink-gc");
 
@@ -11413,7 +11416,10 @@ async fn test_create_write_unlink_race() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn test_multiple_handles_orphan_cleanup_after_last_close() {
-    ensure_bucket().await;
+    let _env = setup_offline_sfs121_env();
+    unsafe {
+        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "60000");
+    }
     let tmp = tempfile::tempdir().unwrap();
     let vfs = make_vfs(&tmp, "multi-fh-orphan");
 

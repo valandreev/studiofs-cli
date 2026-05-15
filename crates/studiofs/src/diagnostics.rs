@@ -4009,9 +4009,14 @@ impl LocalDiagnosticsHost {
         }
     }
 
-    pub(crate) fn stop(self) {
+    pub(crate) async fn stop(self) {
         let _ = self.shutdown_tx.send(true);
         self.task.abort();
+        if let Err(error) = self.task.await
+            && !error.is_cancelled()
+        {
+            warn!(error = %error, "diagnostics host task join failed during shutdown");
+        }
         #[cfg(unix)]
         let _ = fs::remove_file(self.endpoint_path);
     }
