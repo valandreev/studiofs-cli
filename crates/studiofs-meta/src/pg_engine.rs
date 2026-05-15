@@ -2928,8 +2928,10 @@ impl PgMetaEngine {
             {
                 continue;
             }
-            let Ok(current) = self.local.get_attr(attr.ino) else {
-                continue;
+            let current = match self.local.get_attr(attr.ino) {
+                Ok(current) => current,
+                Err(MetaError::InodeNotFound(_)) => continue,
+                Err(err) => return Err(err),
             };
             if current.kind != FileType::RegularFile
                 || current.upload_state != UploadState::Ready
@@ -3043,8 +3045,10 @@ impl PgMetaEngine {
             {
                 continue;
             }
-            let Ok(current) = self.local.get_attr(attr.ino) else {
-                continue;
+            let current = match self.local.get_attr(attr.ino) {
+                Ok(current) => current,
+                Err(MetaError::InodeNotFound(_)) => continue,
+                Err(err) => return Err(err),
             };
             if current.kind != FileType::RegularFile || current.upload_state != UploadState::Ready {
                 continue;

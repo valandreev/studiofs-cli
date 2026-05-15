@@ -48,7 +48,7 @@ impl CommitCoordinator {
         if vfs.inode_has_unmaterialized_overlay_for_finalize(ino) {
             return Ok(EpochFinalizeStatus::Deferred);
         }
-        let publication_advances_visible_size = attr.committed_size < attr.size;
+        let publication_changes_visible_size = attr.committed_size != attr.size;
 
         let meta = run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
             let has_persisted_overlay = engine.has_local_regular_file_overlay(ino)?;
@@ -206,7 +206,7 @@ impl CommitCoordinator {
         // `getattr` can expose pending attrs from dirty_attrs without populating
         // attr_read_cache. A newer dirty attr must be preserved, but its presence
         // still means the kernel may hold stale attrs for the epoch just published.
-        if was_dirty_visible || removed_cached_attr || publication_advances_visible_size {
+        if was_dirty_visible || removed_cached_attr || publication_changes_visible_size {
             vfs.invalidate_kernel_inodes([ino]);
         }
         drop(finalize_session);
