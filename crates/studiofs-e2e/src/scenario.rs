@@ -3044,6 +3044,11 @@ impl Scenario for AdvancedMountedScenario {
             .as_ref()
             .map(|oracle| oracle.matched)
             .unwrap_or(true);
+        let long_history_matches = summary
+            .long_history_validation
+            .as_ref()
+            .map(|validation| validation.matched)
+            .unwrap_or_else(|| summary.long_history.is_none());
         let validation = json!({
             "scenario": self.kind.name(),
             "run_id": context.run_id,
@@ -3051,6 +3056,7 @@ impl Scenario for AdvancedMountedScenario {
             "status": if summary.final_validator.converged
                 && summary.namespace_violations.is_empty()
                 && lww_oracle_matches
+                && long_history_matches
                 && sparse_ranges_match(self.kind, summary.sparse_ranges.as_ref()) {
                     "passed"
                 } else {
@@ -3063,6 +3069,7 @@ impl Scenario for AdvancedMountedScenario {
             "sparse_ranges": summary.sparse_ranges,
             "cold_observer": summary.cold_observer,
             "long_history": summary.long_history,
+            "long_history_validation": summary.long_history_validation,
             "catchup": summary.catchup,
         });
         fs::write(
@@ -3162,6 +3169,14 @@ struct LongHistorySummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct LongHistoryValidation {
+    matched: bool,
+    missing_present_paths: Vec<String>,
+    unexpected_present_absent_paths: Vec<String>,
+    checksum_mismatches: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct CatchupSummary {
     warm_writers: Vec<String>,
     stale_remount_client: String,
@@ -3187,6 +3202,8 @@ struct AdvancedMountedSummary {
     #[serde(default)]
     long_history: Option<LongHistorySummary>,
     #[serde(default)]
+    long_history_validation: Option<LongHistoryValidation>,
+    #[serde(default)]
     catchup: Option<CatchupSummary>,
 }
 
@@ -3197,6 +3214,17 @@ struct AdvancedMountedExecution {
     cold_observer: Option<ColdObserverSummary>,
     long_history: Option<LongHistorySummary>,
     catchup: Option<CatchupSummary>,
+}
+
+impl LongHistoryValidation {
+    fn matched() -> Self {
+        Self {
+            matched: true,
+            missing_present_paths: Vec::new(),
+            unexpected_present_absent_paths: Vec::new(),
+            checksum_mismatches: Vec::new(),
+        }
+    }
 }
 
 fn run_advanced_mounted_with_controller(
@@ -3329,6 +3357,13 @@ fn write_advanced_mounted_plan_artifacts(
             AdvancedMountedKind::ColdObserverLongHistory => Some(planned_long_history_summary()),
             AdvancedMountedKind::StaleRemountColdDiscoverCatchup => {
                 Some(planned_stale_remount_long_history_summary())
+            }
+            _ => None,
+        },
+        long_history_validation: match kind {
+            AdvancedMountedKind::ColdObserverLongHistory
+            | AdvancedMountedKind::StaleRemountColdDiscoverCatchup => {
+                Some(LongHistoryValidation::matched())
             }
             _ => None,
         },
@@ -3695,6 +3730,8 @@ fn run_stale_remount_warm_history(
     let append_target = isolation.path(COLD_OBSERVER_APPEND_TARGET);
     let nested_file = isolation.path(COLD_OBSERVER_NESTED_FILE);
     let payload = |label: &str, path: &str| isolation.payload(label, path, label);
+    let rename_payload = payload("rename_source", &rename_source);
+    let append_payload_bytes = payload("append", &append_target);
     let nested_payload = payload("nested_child", &nested_file);
 
     for (offset, (client_index, operation, path, log_path, action)) in [
@@ -3717,7 +3754,7 @@ fn run_stale_remount_warm_history(
             "create",
             rename_source.clone(),
             rename_source.clone(),
-            Some(payload("rename_source", &rename_source)),
+            Some(rename_payload.clone()),
         ),
         (
             1,
@@ -3738,7 +3775,7 @@ fn run_stale_remount_warm_history(
             "append",
             append_target.clone(),
             append_target.clone(),
-            Some(payload("append", &append_target)),
+            Some(append_payload_bytes.clone()),
         ),
         (
             0,
@@ -3786,10 +3823,13 @@ fn run_stale_remount_warm_history(
     }
 
     let final_payload = payload("overwrite_v2", &overwrite_target);
+    let bounded_operation_count = first_order + operations.len() - 1;
     wait_for_mounted_initial_payloads_until(
         clients,
         &[
+            (&rename_dest, rename_payload.as_slice()),
             (&overwrite_target, final_payload.as_slice()),
+            (&append_target, append_payload_bytes.as_slice()),
             (&nested_file, nested_payload.as_slice()),
         ],
         Instant::now() + ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT,
@@ -3799,7 +3839,7 @@ fn run_stale_remount_warm_history(
     Ok((
         operations,
         LongHistorySummary {
-            bounded_operation_count: first_order + 8,
+            bounded_operation_count,
             expected_present_paths: vec![
                 rename_dest,
                 overwrite_target.clone(),
@@ -5154,6 +5194,9 @@ fn finish_advanced_mounted(
         lww_oracle,
         sparse_ranges,
         cold_observer,
+        long_history_validation: long_history
+            .as_ref()
+            .map(|history| validate_long_history_snapshots(&convergence.snapshots, history)),
         long_history,
         catchup,
     };
@@ -5207,6 +5250,66 @@ fn expected_absent_paths_for(
         ],
         _ => Vec::new(),
     }
+}
+
+fn validate_long_history_snapshots(
+    snapshots: &[crate::mounted_tree::MountedTreeSnapshot],
+    history: &LongHistorySummary,
+) -> LongHistoryValidation {
+    let mut missing_present_paths = Vec::new();
+    let mut unexpected_present_absent_paths = Vec::new();
+    let mut checksum_mismatches = Vec::new();
+    let checksum_path = long_history_checksum_path(history);
+
+    for snapshot in snapshots {
+        for expected_path in &history.expected_present_paths {
+            let Some(entry) = snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.path == *expected_path)
+            else {
+                missing_present_paths.push(format!("{}:{expected_path}", snapshot.client));
+                continue;
+            };
+            if checksum_path.as_deref() == Some(expected_path.as_str())
+                && entry.checksum_sha256.as_deref() != Some(history.final_checksum_sha256.as_str())
+            {
+                checksum_mismatches.push(format!(
+                    "{}:{expected_path}: expected {}, got {}",
+                    snapshot.client,
+                    history.final_checksum_sha256,
+                    entry.checksum_sha256.as_deref().unwrap_or("<missing>")
+                ));
+            }
+        }
+        for absent_path in &history.expected_absent_paths {
+            if snapshot
+                .entries
+                .iter()
+                .any(|entry| entry.path == *absent_path)
+            {
+                unexpected_present_absent_paths.push(format!("{}:{absent_path}", snapshot.client));
+            }
+        }
+    }
+
+    LongHistoryValidation {
+        matched: missing_present_paths.is_empty()
+            && unexpected_present_absent_paths.is_empty()
+            && checksum_mismatches.is_empty(),
+        missing_present_paths,
+        unexpected_present_absent_paths,
+        checksum_mismatches,
+    }
+}
+
+fn long_history_checksum_path(history: &LongHistorySummary) -> Option<String> {
+    history
+        .expected_present_paths
+        .iter()
+        .find(|path| path.ends_with(COLD_OBSERVER_OVERWRITE_TARGET))
+        .cloned()
+        .or_else(|| history.expected_present_paths.first().cloned())
 }
 
 fn planned_advanced_mounted_operations(
@@ -5299,7 +5402,6 @@ fn planned_advanced_mounted_operations(
                 "stale-remount-cold-discover/baseline.txt",
             ),
             ("client-c", "stale_client_unmount", "client-c"),
-            ("client-a", "mkdir", "stale-remount-cold-discover/nested"),
             (
                 "client-a",
                 "create",
@@ -5329,6 +5431,11 @@ fn planned_advanced_mounted_operations(
                 "client-b",
                 "append",
                 "stale-remount-cold-discover/append-target.txt",
+            ),
+            (
+                "client-a",
+                "create",
+                "stale-remount-cold-discover/nested/child.txt",
             ),
             ("client-c", "stale_remount_after_history", "client-c"),
             ("client-d", "cold_discover_after_history", "client-d"),
@@ -7493,6 +7600,76 @@ mod tests {
 
         assert!(convergence.comparison.converged);
         assert_eq!(convergence.comparison.differences, Vec::new());
+    }
+
+    #[test]
+    fn advanced_mounted_validate_rejects_failed_long_history_oracle() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-long-history-validation");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(MOUNTED_STALE_REMOUNT_COLD_DISCOVER_CATCHUP_CONVERGENCE);
+        std::fs::create_dir_all(&scenario_dir).unwrap();
+        let summary = AdvancedMountedSummary {
+            scenario: MOUNTED_STALE_REMOUNT_COLD_DISCOVER_CATCHUP_CONVERGENCE.to_string(),
+            bootstrap: None,
+            clients: 4,
+            operations: Vec::new(),
+            operation_log: format!(
+                "artifacts/scenarios/{MOUNTED_STALE_REMOUNT_COLD_DISCOVER_CATCHUP_CONVERGENCE}/operations.ndjson"
+            ),
+            final_validator: TreeComparison {
+                converged: true,
+                reference_client: Some("client-a".to_string()),
+                compared_clients: vec![
+                    "client-a".to_string(),
+                    "client-b".to_string(),
+                    "client-c".to_string(),
+                    "client-d".to_string(),
+                ],
+                differences: Vec::new(),
+            },
+            namespace_violations: Vec::new(),
+            lww_oracle: None,
+            sparse_ranges: None,
+            cold_observer: None,
+            long_history: Some(LongHistorySummary {
+                bounded_operation_count: 11,
+                expected_present_paths: vec!["missing.txt".to_string()],
+                expected_absent_paths: Vec::new(),
+                final_checksum_sha256: "bad-checksum".to_string(),
+            }),
+            long_history_validation: Some(LongHistoryValidation {
+                matched: false,
+                missing_present_paths: vec!["client-a:missing.txt".to_string()],
+                unexpected_present_absent_paths: Vec::new(),
+                checksum_mismatches: Vec::new(),
+            }),
+            catchup: Some(planned_catchup_summary()),
+        };
+        std::fs::write(
+            scenario_dir.join("stale-remount-cold-discover-summary.json"),
+            serde_json::to_vec_pretty(&summary).unwrap(),
+        )
+        .unwrap();
+        let context = ScenarioContext {
+            run_id: "run-long-history-validation".to_string(),
+            seed: 418,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+        let scenario =
+            AdvancedMountedScenario::new(AdvancedMountedKind::StaleRemountColdDiscoverCatchup);
+
+        scenario.validate(&context).unwrap();
+        let validation: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(context.scenario_dir.join("validation.json")).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(validation["status"], "failed");
     }
 
     #[test]
