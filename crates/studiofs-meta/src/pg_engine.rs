@@ -11234,6 +11234,7 @@ mod tests {
         let Some(dsn) = pg_dsn() else {
             return;
         };
+        let _poll_guard = set_test_env("STUDIOFS_PG_SYNC_POLL_SECS", "3600");
 
         let dir_a = tempdir().expect("tempdir a");
         let dir_b = tempdir().expect("tempdir b");
@@ -11274,6 +11275,7 @@ mod tests {
         let Some(dsn) = pg_dsn() else {
             return;
         };
+        let _poll_guard = set_test_env("STUDIOFS_PG_SYNC_POLL_SECS", "3600");
 
         let dir_a = tempdir().expect("tempdir a");
         let dir_b = tempdir().expect("tempdir b");

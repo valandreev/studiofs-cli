@@ -50,12 +50,16 @@ pub const MOUNTED_FAULT_CHAOS_CONVERGENCE: &str = "mounted-fault-chaos-convergen
 pub const MOUNTED_LWW_RECONNECT_CHAOS_CONVERGENCE: &str = "mounted-lww-reconnect-chaos-convergence";
 pub const MOUNTED_OPEN_HANDLE_CONVERGENCE: &str = "mounted-open-handle-convergence";
 pub const MOUNTED_SPARSE_FILE_RANGE_CONVERGENCE: &str = "mounted-sparse-file-range-convergence";
+pub const MOUNTED_COLD_OBSERVER_LONG_HISTORY_CONVERGENCE: &str =
+    "mounted-cold-observer-long-history-convergence";
 const SMOKE_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
 const COLLISION_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
 const ADVANCED_MOUNTED_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
 const FAULT_CHAOS_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c", "client-d"];
 const LWW_RECONNECT_CLIENT_NAMES: &[&str] =
     &["client-a", "client-b", "client-c", "client-d", "client-e"];
+const COLD_OBSERVER_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c", "client-d"];
+const COLD_OBSERVER_WARM_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
 const POSTGRES_OUTAGE_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
 const RUSTFS_OUTAGE_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c", "client-d"];
 const CRASH_RESTART_CLIENT_NAMES: &[&str] = &["client-a", "client-b"];
@@ -116,6 +120,12 @@ const SPARSE_PREFIX_PAYLOAD: &[u8] = b"sparse-prefix-sfs-377\n";
 const SPARSE_FIRST_BOUNDARY_PAYLOAD: &[u8] = b"crosses-first-chunk-boundary-sfs-377\n";
 const SPARSE_SECOND_BOUNDARY_PAYLOAD: &[u8] = b"crosses-second-chunk-boundary-sfs-377\n";
 const SPARSE_FINAL_TAIL_PAYLOAD: &[u8] = b"sparse-final-tail-sfs-377\n";
+const COLD_OBSERVER_DELETE_TARGET: &str = "delete-target.txt";
+const COLD_OBSERVER_RENAME_SOURCE: &str = "rename-source.txt";
+const COLD_OBSERVER_RENAME_DEST: &str = "renamed-final.txt";
+const COLD_OBSERVER_OVERWRITE_TARGET: &str = "overwrite-target.txt";
+const COLD_OBSERVER_APPEND_TARGET: &str = "append-target.txt";
+const COLD_OBSERVER_NESTED_FILE: &str = "nested/child.txt";
 
 #[cfg(test)]
 pub(crate) const TEST_FAILING_VALIDATE: &str = "__test-failing-validate";
@@ -256,6 +266,7 @@ pub fn available_scenarios() -> Vec<ScenarioDefinition> {
         AdvancedMountedScenario::new(AdvancedMountedKind::LwwReconnectChaos).definition(),
         AdvancedMountedScenario::new(AdvancedMountedKind::OpenHandle).definition(),
         AdvancedMountedScenario::new(AdvancedMountedKind::SparseRange).definition(),
+        AdvancedMountedScenario::new(AdvancedMountedKind::ColdObserverLongHistory).definition(),
     ]
 }
 
@@ -314,6 +325,11 @@ pub(crate) fn resolve_scenario(name: &str) -> Option<Box<dyn Scenario>> {
                 AdvancedMountedKind::SparseRange,
             )))
         }
+        MOUNTED_COLD_OBSERVER_LONG_HISTORY_CONVERGENCE
+        | "cold-observer"
+        | "cold-observer-long-history" => Some(Box::new(AdvancedMountedScenario::new(
+            AdvancedMountedKind::ColdObserverLongHistory,
+        ))),
         #[cfg(test)]
         TEST_FAILING_VALIDATE => Some(Box::new(TestFailingScenario {
             cleanup_fails: false,
@@ -2882,6 +2898,7 @@ enum AdvancedMountedKind {
     LwwReconnectChaos,
     OpenHandle,
     SparseRange,
+    ColdObserverLongHistory,
 }
 
 impl AdvancedMountedKind {
@@ -2894,6 +2911,7 @@ impl AdvancedMountedKind {
             Self::LwwReconnectChaos => MOUNTED_LWW_RECONNECT_CHAOS_CONVERGENCE,
             Self::OpenHandle => MOUNTED_OPEN_HANDLE_CONVERGENCE,
             Self::SparseRange => MOUNTED_SPARSE_FILE_RANGE_CONVERGENCE,
+            Self::ColdObserverLongHistory => MOUNTED_COLD_OBSERVER_LONG_HISTORY_CONVERGENCE,
         }
     }
 
@@ -2906,6 +2924,7 @@ impl AdvancedMountedKind {
             Self::LwwReconnectChaos => "mounted LWW reconnect chaos convergence",
             Self::OpenHandle => "mounted open-handle convergence",
             Self::SparseRange => "mounted sparse-file range convergence",
+            Self::ColdObserverLongHistory => "mounted cold-observer long-history convergence",
         }
     }
 
@@ -2918,6 +2937,7 @@ impl AdvancedMountedKind {
             Self::LwwReconnectChaos => "lww-chaos",
             Self::OpenHandle => "open-handles",
             Self::SparseRange => "sparse",
+            Self::ColdObserverLongHistory => "cold-observer",
         }
     }
 
@@ -2930,6 +2950,7 @@ impl AdvancedMountedKind {
             Self::LwwReconnectChaos => "mounted-lww-reconnect-chaos-summary.json",
             Self::OpenHandle => "mounted-open-handle-summary.json",
             Self::SparseRange => "sparse-range-summary.json",
+            Self::ColdObserverLongHistory => "cold-observer-long-history-summary.json",
         }
     }
 
@@ -2937,6 +2958,7 @@ impl AdvancedMountedKind {
         match self {
             Self::FaultChaos => FAULT_CHAOS_CLIENT_NAMES,
             Self::LwwReconnectChaos => LWW_RECONNECT_CLIENT_NAMES,
+            Self::ColdObserverLongHistory => COLD_OBSERVER_CLIENT_NAMES,
             _ => ADVANCED_MOUNTED_CLIENT_NAMES,
         }
     }
@@ -3017,6 +3039,8 @@ impl Scenario for AdvancedMountedScenario {
             "operation_log": summary.operation_log,
             "lww_oracle": summary.lww_oracle,
             "sparse_ranges": summary.sparse_ranges,
+            "cold_observer": summary.cold_observer,
+            "long_history": summary.long_history,
         });
         fs::write(
             context.scenario_dir.join("validation.json"),
@@ -3033,6 +3057,12 @@ impl Scenario for AdvancedMountedScenario {
         if self.kind == AdvancedMountedKind::LwwReconnectChaos {
             artifacts.push(format!(
                 "artifacts/scenarios/{}/lww-oracle.json",
+                self.kind.name()
+            ));
+        }
+        if self.kind == AdvancedMountedKind::ColdObserverLongHistory {
+            artifacts.push(format!(
+                "artifacts/scenarios/{}/cold-observer-diagnostics.json",
                 self.kind.name()
             ));
         }
@@ -3087,6 +3117,22 @@ struct SparseRangeSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ColdObserverSummary {
+    client: String,
+    local_metadata_db: PathBuf,
+    cache_dir: PathBuf,
+    discovered_after_history: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct LongHistorySummary {
+    bounded_operation_count: usize,
+    expected_present_paths: Vec<String>,
+    expected_absent_paths: Vec<String>,
+    final_checksum_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct AdvancedMountedSummary {
     scenario: String,
     bootstrap: Option<VolumeBootstrapSummary>,
@@ -3097,12 +3143,18 @@ struct AdvancedMountedSummary {
     namespace_violations: Vec<NamespaceInvariantViolation>,
     lww_oracle: Option<LwwReconnectOracle>,
     sparse_ranges: Option<SparseRangeSummary>,
+    #[serde(default)]
+    cold_observer: Option<ColdObserverSummary>,
+    #[serde(default)]
+    long_history: Option<LongHistorySummary>,
 }
 
 struct AdvancedMountedExecution {
     operations: Vec<NamespaceCollisionOperation>,
     lww_oracle: Option<LwwReconnectOracle>,
     sparse_ranges: Option<SparseRangeSummary>,
+    cold_observer: Option<ColdObserverSummary>,
+    long_history: Option<LongHistorySummary>,
 }
 
 fn run_advanced_mounted_with_controller(
@@ -3129,6 +3181,10 @@ fn run_advanced_mounted_body(
     kind: AdvancedMountedKind,
     controller: &mut MultiClientController<SystemClientProcessExecutor>,
 ) -> Result<AdvancedMountedSummary, ScenarioError> {
+    if kind == AdvancedMountedKind::ColdObserverLongHistory {
+        return run_cold_observer_long_history_body(context, controller);
+    }
+
     let bootstrap = controller.bootstrap_volume(VolumeBootstrapOptions {
         client_names: kind
             .client_names()
@@ -3167,6 +3223,8 @@ fn run_advanced_mounted_body(
             operations: execution.operations,
             lww_oracle: execution.lww_oracle,
             sparse_ranges: execution.sparse_ranges,
+            cold_observer: execution.cold_observer,
+            long_history: execution.long_history,
         },
     )?;
     Ok(summary)
@@ -3193,6 +3251,9 @@ fn write_advanced_mounted_plan_artifacts(
     if let Some(oracle) = &lww_oracle {
         write_lww_oracle(context, oracle)?;
     }
+    if kind == AdvancedMountedKind::ColdObserverLongHistory {
+        write_planned_cold_observer_diagnostics(context)?;
+    }
     let compared_clients = kind
         .client_names()
         .iter()
@@ -3213,6 +3274,10 @@ fn write_advanced_mounted_plan_artifacts(
         namespace_violations: Vec::new(),
         lww_oracle,
         sparse_ranges,
+        cold_observer: (kind == AdvancedMountedKind::ColdObserverLongHistory)
+            .then(planned_cold_observer_summary),
+        long_history: (kind == AdvancedMountedKind::ColdObserverLongHistory)
+            .then(planned_long_history_summary),
     };
     write_advanced_mounted_summary(context, kind, &summary)?;
     Ok(summary)
@@ -3230,6 +3295,8 @@ fn execute_advanced_mounted_operations(
             operations: run_publication_boundary_operations(controller, clients, isolation)?,
             lww_oracle: None,
             sparse_ranges: None,
+            cold_observer: None,
+            long_history: None,
         }),
         AdvancedMountedKind::MountedChaos => Ok(AdvancedMountedExecution {
             operations: run_mounted_chaos_operations(
@@ -3241,6 +3308,8 @@ fn execute_advanced_mounted_operations(
             )?,
             lww_oracle: None,
             sparse_ranges: None,
+            cold_observer: None,
+            long_history: None,
         }),
         AdvancedMountedKind::HotspotChurn => Ok(AdvancedMountedExecution {
             operations: run_hotspot_churn_operations(
@@ -3252,11 +3321,15 @@ fn execute_advanced_mounted_operations(
             )?,
             lww_oracle: None,
             sparse_ranges: None,
+            cold_observer: None,
+            long_history: None,
         }),
         AdvancedMountedKind::FaultChaos => Ok(AdvancedMountedExecution {
             operations: run_fault_chaos_operations(context, controller, clients, isolation)?,
             lww_oracle: None,
             sparse_ranges: None,
+            cold_observer: None,
+            long_history: None,
         }),
         AdvancedMountedKind::LwwReconnectChaos => {
             let (operations, oracle) =
@@ -3265,6 +3338,8 @@ fn execute_advanced_mounted_operations(
                 operations,
                 lww_oracle: Some(oracle),
                 sparse_ranges: None,
+                cold_observer: None,
+                long_history: None,
             })
         }
         AdvancedMountedKind::OpenHandle => Ok(AdvancedMountedExecution {
@@ -3277,6 +3352,8 @@ fn execute_advanced_mounted_operations(
             )?,
             lww_oracle: None,
             sparse_ranges: None,
+            cold_observer: None,
+            long_history: None,
         }),
         AdvancedMountedKind::SparseRange => {
             let (operations, summary) = run_sparse_range_operations(
@@ -3290,9 +3367,254 @@ fn execute_advanced_mounted_operations(
                 operations,
                 lww_oracle: None,
                 sparse_ranges: Some(summary),
+                cold_observer: None,
+                long_history: None,
             })
         }
+        AdvancedMountedKind::ColdObserverLongHistory => unreachable!(
+            "cold-observer long-history uses delayed discovery and is handled before common bootstrap"
+        ),
     }
+}
+
+fn run_cold_observer_long_history_body(
+    context: &ScenarioContext,
+    controller: &mut MultiClientController<SystemClientProcessExecutor>,
+) -> Result<AdvancedMountedSummary, ScenarioError> {
+    controller.create_clients(COLD_OBSERVER_CLIENT_NAMES.iter().copied())?;
+    controller.init_first_client()?;
+    for client in &COLD_OBSERVER_WARM_CLIENT_NAMES[1..] {
+        controller.discover(client)?;
+    }
+    for client in COLD_OBSERVER_WARM_CLIENT_NAMES {
+        controller.mount(client)?;
+    }
+
+    let warm_clients = controller
+        .clients()
+        .into_iter()
+        .filter(|client| COLD_OBSERVER_WARM_CLIENT_NAMES.contains(&client.name.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let bootstrap = VolumeBootstrapSummary {
+        volume_name: warm_clients
+            .first()
+            .map(|client| client.volume_name.clone())
+            .unwrap_or_else(|| "projectfs".to_string()),
+        init_client: COLD_OBSERVER_WARM_CLIENT_NAMES[0].to_string(),
+        discovered_clients: COLD_OBSERVER_WARM_CLIENT_NAMES[1..]
+            .iter()
+            .map(|client| (*client).to_string())
+            .collect(),
+        clients: warm_clients
+            .iter()
+            .map(|client| crate::client::ClientBootstrapRecord {
+                name: client.name.clone(),
+                local_metadata_db: client.local_metadata_db.clone(),
+                state: client.state,
+            })
+            .collect(),
+    };
+    write_bootstrap_summary(context, &bootstrap)?;
+
+    let isolation = ScenarioIsolation::for_advanced(
+        context,
+        AdvancedMountedKind::ColdObserverLongHistory,
+        &bootstrap.volume_name,
+    );
+    let (operations, long_history) =
+        run_cold_observer_warm_history(context, &warm_clients, &isolation)?;
+    write_namespace_collision_operations(context, &operations)?;
+
+    controller.discover("client-d")?;
+    controller.mount("client-d")?;
+    let clients = controller
+        .clients()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let cold = clients
+        .iter()
+        .find(|client| client.name == "client-d")
+        .ok_or_else(|| ScenarioError::Io(io::Error::other("missing cold observer client-d")))?;
+    let cold_observer = ColdObserverSummary {
+        client: cold.name.clone(),
+        local_metadata_db: cold.local_metadata_db.clone(),
+        cache_dir: cold.cache_dir.clone(),
+        discovered_after_history: true,
+    };
+
+    finish_advanced_mounted(
+        context,
+        AdvancedMountedKind::ColdObserverLongHistory,
+        Some(&isolation),
+        &clients,
+        AdvancedMountedFinishInput {
+            bootstrap: Some(bootstrap),
+            operations,
+            lww_oracle: None,
+            sparse_ranges: None,
+            cold_observer: Some(cold_observer),
+            long_history: Some(long_history),
+        },
+    )
+}
+
+fn run_cold_observer_warm_history(
+    context: &ScenarioContext,
+    clients: &[ClientSpec],
+    isolation: &ScenarioIsolation,
+) -> Result<(Vec<NamespaceCollisionOperation>, LongHistorySummary), ScenarioError> {
+    let started = Instant::now();
+    let mut operations = Vec::new();
+    let nested_dir = isolation.path("nested");
+    let delete_target = isolation.path(COLD_OBSERVER_DELETE_TARGET);
+    let rename_source = isolation.path(COLD_OBSERVER_RENAME_SOURCE);
+    let rename_dest = isolation.path(COLD_OBSERVER_RENAME_DEST);
+    let overwrite_target = isolation.path(COLD_OBSERVER_OVERWRITE_TARGET);
+    let append_target = isolation.path(COLD_OBSERVER_APPEND_TARGET);
+    let nested_file = isolation.path(COLD_OBSERVER_NESTED_FILE);
+
+    let payload = |label: &str, path: &str| isolation.payload(label, path, label);
+    let nested_payload = payload("nested_child", &nested_file);
+    for (order, (client_index, operation, path, log_path, action)) in (1..).zip([
+        (0, "mkdir", nested_dir.clone(), nested_dir.clone(), None),
+        (
+            0,
+            "create",
+            delete_target.clone(),
+            delete_target.clone(),
+            Some(payload("delete_target", &delete_target)),
+        ),
+        (
+            1,
+            "delete",
+            delete_target.clone(),
+            delete_target.clone(),
+            None,
+        ),
+        (
+            0,
+            "create",
+            rename_source.clone(),
+            rename_source.clone(),
+            Some(payload("rename_source", &rename_source)),
+        ),
+        (
+            1,
+            "rename",
+            rename_dest.clone(),
+            format!("{rename_source} -> {rename_dest}"),
+            None,
+        ),
+        (
+            2,
+            "create",
+            overwrite_target.clone(),
+            overwrite_target.clone(),
+            Some(payload("overwrite_v1", &overwrite_target)),
+        ),
+        (
+            0,
+            "overwrite",
+            overwrite_target.clone(),
+            overwrite_target.clone(),
+            Some(payload("overwrite_v2", &overwrite_target)),
+        ),
+        (
+            1,
+            "append",
+            append_target.clone(),
+            append_target.clone(),
+            Some(payload("append", &append_target)),
+        ),
+        (
+            2,
+            "create",
+            nested_file.clone(),
+            nested_file.clone(),
+            Some(nested_payload.clone()),
+        ),
+    ]) {
+        let client = &clients[client_index];
+        let result = match operation {
+            "mkdir" => {
+                fs::create_dir_all(client.mount_point.join(&path)).map_err(ScenarioError::from)
+            }
+            "delete" => {
+                fs::remove_file(client.mount_point.join(&path)).map_err(ScenarioError::from)
+            }
+            "rename" => fs::rename(
+                client.mount_point.join(&rename_source),
+                client.mount_point.join(&rename_dest),
+            )
+            .map_err(ScenarioError::from),
+            "append" => append_payload(client.mount_point.join(&path), action.as_deref().unwrap())
+                .map_err(ScenarioError::from),
+            _ => write_parented(client.mount_point.join(&path), action.as_deref().unwrap())
+                .map_err(ScenarioError::from),
+        };
+        operations.push(required_op(
+            started, order, client, operation, &log_path, result,
+        )?);
+        match operation {
+            "create" if path == delete_target || path == rename_source => {
+                wait_for_mounted_initial_payloads_until(
+                    clients,
+                    &[(&path, action.as_deref().unwrap())],
+                    Instant::now() + ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT,
+                    ADVANCED_MOUNTED_CONVERGENCE_POLL_INTERVAL,
+                    "cold observer warm history",
+                )?;
+            }
+            "create" | "overwrite" if path == overwrite_target => {
+                wait_for_mounted_initial_payloads_until(
+                    clients,
+                    &[(&path, action.as_deref().unwrap())],
+                    Instant::now() + ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT,
+                    ADVANCED_MOUNTED_CONVERGENCE_POLL_INTERVAL,
+                    "cold observer warm history",
+                )?;
+            }
+            _ => {}
+        }
+    }
+
+    let final_payload = payload("overwrite_v2", &overwrite_target);
+    wait_for_mounted_initial_payloads_until(
+        clients,
+        &[
+            (&overwrite_target, final_payload.as_slice()),
+            (&nested_file, nested_payload.as_slice()),
+        ],
+        Instant::now() + ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT,
+        ADVANCED_MOUNTED_CONVERGENCE_POLL_INTERVAL,
+        "cold observer warm history",
+    )?;
+    fs::write(
+        context.scenario_dir.join("cold-observer-diagnostics.json"),
+        serde_json::to_vec_pretty(&json!({
+            "cold_observer": "client-d",
+            "warm_clients": COLD_OBSERVER_WARM_CLIENT_NAMES,
+            "discovered_after_history": true,
+        }))?,
+    )?;
+
+    let bounded_operation_count = operations.len();
+    Ok((
+        operations,
+        LongHistorySummary {
+            bounded_operation_count,
+            expected_present_paths: vec![
+                rename_dest,
+                overwrite_target.clone(),
+                append_target,
+                nested_file,
+            ],
+            expected_absent_paths: vec![delete_target, rename_source],
+            final_checksum_sha256: bytes_sha256(&final_payload),
+        },
+    ))
 }
 
 fn run_publication_boundary_operations(
@@ -4421,6 +4743,8 @@ struct AdvancedMountedFinishInput {
     operations: Vec<NamespaceCollisionOperation>,
     lww_oracle: Option<LwwReconnectOracle>,
     sparse_ranges: Option<SparseRangeSummary>,
+    cold_observer: Option<ColdObserverSummary>,
+    long_history: Option<LongHistorySummary>,
 }
 
 fn finish_advanced_mounted(
@@ -4435,6 +4759,8 @@ fn finish_advanced_mounted(
         operations,
         lww_oracle,
         sparse_ranges,
+        cold_observer,
+        long_history,
     } = input;
     let mounts = clients
         .iter()
@@ -4473,6 +4799,8 @@ fn finish_advanced_mounted(
         namespace_violations,
         lww_oracle,
         sparse_ranges,
+        cold_observer,
+        long_history,
     };
     write_advanced_mounted_summary(context, kind, &summary)?;
     Ok(summary)
@@ -4490,6 +4818,22 @@ fn expected_absent_paths_for(
             )]
         }
         (AdvancedMountedKind::OpenHandle, None) => vec![OPEN_HANDLE_UNLINK_TARGET.to_string()],
+        (AdvancedMountedKind::ColdObserverLongHistory, Some(isolation)) => vec![
+            isolation.path(COLD_OBSERVER_DELETE_TARGET),
+            isolation.path(COLD_OBSERVER_RENAME_SOURCE),
+        ],
+        (AdvancedMountedKind::ColdObserverLongHistory, None) => vec![
+            format!(
+                "{}/{}",
+                AdvancedMountedKind::ColdObserverLongHistory.path_root(),
+                COLD_OBSERVER_DELETE_TARGET
+            ),
+            format!(
+                "{}/{}",
+                AdvancedMountedKind::ColdObserverLongHistory.path_root(),
+                COLD_OBSERVER_RENAME_SOURCE
+            ),
+        ],
         _ => Vec::new(),
     }
 }
@@ -4557,6 +4901,25 @@ fn planned_advanced_mounted_operations(
             ("client-c", "truncate_extend", "sparse/shared.bin@3146061+"),
             ("client-c", "write_range", "sparse/shared.bin@2097147"),
             ("client-a", "read_probe", "sparse/shared.bin@3145900"),
+        ],
+        AdvancedMountedKind::ColdObserverLongHistory => vec![
+            ("client-a", "mkdir", "cold-observer/nested"),
+            ("client-a", "create", "cold-observer/delete-target.txt"),
+            ("client-b", "delete", "cold-observer/delete-target.txt"),
+            ("client-a", "create", "cold-observer/rename-source.txt"),
+            (
+                "client-b",
+                "rename",
+                "cold-observer/rename-source.txt -> cold-observer/renamed-final.txt",
+            ),
+            ("client-c", "create", "cold-observer/overwrite-target.txt"),
+            (
+                "client-a",
+                "overwrite",
+                "cold-observer/overwrite-target.txt",
+            ),
+            ("client-b", "append", "cold-observer/append-target.txt"),
+            ("client-c", "create", "cold-observer/nested/child.txt"),
         ],
     };
     spec.into_iter()
@@ -5155,6 +5518,61 @@ fn planned_sparse_range_summary() -> SparseRangeSummary {
             })
             .collect(),
     }
+}
+
+fn planned_cold_observer_summary() -> ColdObserverSummary {
+    ColdObserverSummary {
+        client: "client-d".to_string(),
+        local_metadata_db: PathBuf::from(
+            "artifacts/clients/client-d/client-root/meta/projectfs/projectfs.db",
+        ),
+        cache_dir: PathBuf::from("artifacts/clients/client-d/cache"),
+        discovered_after_history: true,
+    }
+}
+
+fn write_planned_cold_observer_diagnostics(context: &ScenarioContext) -> Result<(), ScenarioError> {
+    fs::write(
+        context.scenario_dir.join("cold-observer-diagnostics.json"),
+        serde_json::to_vec_pretty(&json!({
+            "cold_observer": "client-d",
+            "warm_clients": COLD_OBSERVER_WARM_CLIENT_NAMES,
+            "discovered_after_history": true,
+            "mode": "planned",
+        }))?,
+    )?;
+    Ok(())
+}
+
+fn planned_long_history_summary() -> LongHistorySummary {
+    let overwrite_target = format!(
+        "{}/{}",
+        AdvancedMountedKind::ColdObserverLongHistory.path_root(),
+        COLD_OBSERVER_OVERWRITE_TARGET
+    );
+    let final_payload = cold_observer_planned_payload("overwrite_v2", &overwrite_target);
+    LongHistorySummary {
+        bounded_operation_count: planned_advanced_mounted_operations(
+            AdvancedMountedKind::ColdObserverLongHistory,
+            Instant::now(),
+        )
+        .len(),
+        expected_present_paths: vec![
+            "cold-observer/renamed-final.txt".to_string(),
+            "cold-observer/overwrite-target.txt".to_string(),
+            "cold-observer/append-target.txt".to_string(),
+            "cold-observer/nested/child.txt".to_string(),
+        ],
+        expected_absent_paths: vec![
+            "cold-observer/delete-target.txt".to_string(),
+            "cold-observer/rename-source.txt".to_string(),
+        ],
+        final_checksum_sha256: bytes_sha256(&final_payload),
+    }
+}
+
+fn cold_observer_planned_payload(label: &str, logical_path: &str) -> Vec<u8> {
+    format!("planned\nlabel={label}\npath={logical_path}\n{label}").into_bytes()
 }
 
 fn sparse_ranges_match(kind: AdvancedMountedKind, summary: Option<&SparseRangeSummary>) -> bool {

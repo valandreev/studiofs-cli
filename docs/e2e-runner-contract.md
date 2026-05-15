@@ -58,7 +58,7 @@ Required initial run flags and environment:
 | Flag | Contract |
 |---|---|
 | `basic-multi-client-smoke` | Positional shorthand for the mounted three-client happy-path smoke scenario. |
-| `--scenario <name|number|range|list>` | Repeatable. Accepted values include scenario names/aliases, one-based numbers from `studiofs-e2e list`, numeric ranges such as `1-8`, and comma lists such as `2,5,10`. Names include `basic-multi-client-smoke` (`smoke`), `postgres-outage-multi-client-recovery` (`postgres-outage`), `rustfs-outage-multi-client-recovery` (`rustfs-outage`, `s3-outage`), `mounted-client-crash-restart-recovery` (`client-crash-restart`, `crash-restart`), `mounted-publication-boundary-crash-matrix` (`publication-boundary-crash`, `publication-boundary`), `mounted-chaos-convergence` (`mounted-chaos`, `chaos`), `mounted-hotspot-churn-convergence` (`hotspot-churn`, `hot-dir-churn`), `mounted-fault-chaos-convergence` (`fault-chaos`, `chaos-faults`), `mounted-lww-reconnect-chaos-convergence` (`lww-chaos`, `reconnect-lww`), `mounted-open-handle-convergence` (`open-handle`, `open-unlink-rename`), `mounted-sparse-file-range-convergence` (`sparse-range`, `sparse-file-range`), and the mounted namespace collision scenarios `collision-rename-vs-rename`, `collision-rename-vs-unlink`, `collision-unlink-vs-append`, `collision-overwrite-vs-read`, `collision-mkdir-rmdir-vs-create`, and `collision-readdir-stat-during-mutation`. |
+| `--scenario <name|number|range|list>` | Repeatable. Accepted values include scenario names/aliases, one-based numbers from `studiofs-e2e list`, numeric ranges such as `1-8`, and comma lists such as `2,5,10`. Names include `basic-multi-client-smoke` (`smoke`), `postgres-outage-multi-client-recovery` (`postgres-outage`), `rustfs-outage-multi-client-recovery` (`rustfs-outage`, `s3-outage`), `mounted-client-crash-restart-recovery` (`client-crash-restart`, `crash-restart`), `mounted-publication-boundary-crash-matrix` (`publication-boundary-crash`, `publication-boundary`), `mounted-chaos-convergence` (`mounted-chaos`, `chaos`), `mounted-hotspot-churn-convergence` (`hotspot-churn`, `hot-dir-churn`), `mounted-fault-chaos-convergence` (`fault-chaos`, `chaos-faults`), `mounted-lww-reconnect-chaos-convergence` (`lww-chaos`, `reconnect-lww`), `mounted-open-handle-convergence` (`open-handle`, `open-unlink-rename`), `mounted-sparse-file-range-convergence` (`sparse-range`, `sparse-file-range`), `mounted-cold-observer-long-history-convergence` (`cold-observer`, `cold-observer-long-history`), and the mounted namespace collision scenarios `collision-rename-vs-rename`, `collision-rename-vs-unlink`, `collision-unlink-vs-append`, `collision-overwrite-vs-read`, `collision-mkdir-rmdir-vs-create`, and `collision-readdir-stat-during-mutation`. |
 | `--studiofs-bin <path>` | Path to the product CLI under test. Real mounted scenarios require it when `--infra compose` is used. The runner may build it only when an explicit build flag is added. |
 | `--root <path>` | Parent run directory. Defaults to `target/e2e-runs`. |
 | `--run-id <id>` | Optional stable run ID. If omitted, use an ISO-like UTC timestamp plus short random suffix. Explicit IDs must be safe single directory names: no separators, drive prefixes, traversal segments, leading dots, or other shell/path metacharacters. |
@@ -424,6 +424,14 @@ absence check for `open-handles/unlink-target.txt`.
 and writes `sparse-range-summary.json`; it validates sparse holes,
 shrink/extend truncation, chunk-boundary writes, range read probes, logical
 size, and final checksums through public mounted reads.
+`mounted-cold-observer-long-history-convergence` appends after the sparse
+promotion scenario and writes `cold-observer-long-history-summary.json`,
+`cold-observer-diagnostics.json`, `operations.ndjson`, and `validation.json`.
+Warm clients build a bounded history with create, delete, rename, overwrite,
+append, and nested directory mutations before `client-d` is discovered and
+mounted with a fresh local root/cache. Validation uses public mounted reads and
+tree convergence to reject resurrected tombstones, stale source paths,
+checksum mismatches, and non-canonical namespace results.
 
 ## Mounted Tree Convergence Validation
 

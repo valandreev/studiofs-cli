@@ -565,6 +565,15 @@ where
             }
         }
 
+        if self.cancel_upload_if_inode_deleted(op).await? {
+            debug!(
+                object_id = op.object_id,
+                ino = op.ino,
+                "process_upload canceled: inode deleted after remote put"
+            );
+            return Ok(SingleUploadOutcome::CancelledDeleted);
+        }
+
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_secs() as i64)
@@ -1829,6 +1838,7 @@ mod tests {
         visibility: Arc<Mutex<RemoteVisibility>>,
         upload_result: Arc<Mutex<Option<UploadPutOutcome>>>,
         remove_overlay_after_upload: Arc<Mutex<Option<(FakeMeta, Ino, u64)>>>,
+        mark_deleted_after_upload: Arc<Mutex<Option<(FakeShutdown, Ino)>>>,
     }
 
     impl Default for FakeRemote {
@@ -1838,6 +1848,7 @@ mod tests {
                 visibility: Arc::new(Mutex::new(RemoteVisibility::NotVisible)),
                 upload_result: Arc::new(Mutex::new(Some(UploadPutOutcome::Uploaded))),
                 remove_overlay_after_upload: Arc::new(Mutex::new(None)),
+                mark_deleted_after_upload: Arc::new(Mutex::new(None)),
             }
         }
     }
@@ -1878,6 +1889,11 @@ mod tests {
                 && let Some(objects) = meta.overlay_objects.lock().get_mut(&ino)
             {
                 objects.remove(&object_id);
+            }
+            if matches!(outcome, UploadPutOutcome::Uploaded)
+                && let Some((shutdown, ino)) = self.mark_deleted_after_upload.lock().take()
+            {
+                shutdown.deleted_inodes.lock().insert(ino);
             }
             outcome
         }
@@ -2159,6 +2175,36 @@ mod tests {
         assert_eq!(outcome, UploadOutcome::CancelledDeleted);
         assert_eq!(coordinator.cancelled.lock().as_slice(), &[77]);
         assert_eq!(local_payloads.removed.lock().as_slice(), &[77]);
+        assert_eq!(shutdown.canceled_deleted.load(Ordering::Relaxed), 1);
+        assert_eq!(shutdown.released_tokens.lock().as_slice(), &[11]);
+    }
+
+    #[tokio::test]
+    async fn process_upload_cancels_deleted_inode_after_remote_put_before_uploaded_mark() {
+        let (processor, coordinator, local_payloads, meta, remote, shutdown, policy) =
+            processor_fixture();
+        let op = make_pending_upload();
+        let ino = op.ino;
+        let content_epoch = op.content_epoch;
+        coordinator.pending_inodes.lock().insert(op.ino);
+        meta.attrs
+            .lock()
+            .insert(op.ino, Some(make_attr(op.ino, op.content_epoch)));
+        meta.overlay_objects
+            .lock()
+            .insert(op.ino, HashSet::from([op.object_id]));
+        *remote.mark_deleted_after_upload.lock() = Some((shutdown.clone(), op.ino));
+
+        let outcome = processor.process_upload(op).await;
+
+        assert_eq!(outcome, UploadOutcome::CancelledDeleted);
+        assert_eq!(coordinator.cancelled.lock().as_slice(), &[77]);
+        assert_eq!(local_payloads.removed.lock().as_slice(), &[77]);
+        assert!(meta.uploaded_overlay_objects.lock().is_empty());
+        assert_eq!(
+            *policy.finalized_upload_epochs.lock(),
+            vec![(ino, content_epoch)]
+        );
         assert_eq!(shutdown.canceled_deleted.load(Ordering::Relaxed), 1);
         assert_eq!(shutdown.released_tokens.lock().as_slice(), &[11]);
     }

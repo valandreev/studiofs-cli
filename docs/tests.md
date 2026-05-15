@@ -141,6 +141,7 @@ cargo run -p studiofs-e2e -- run --scenario 2,5,10 --studiofs-bin target\debug\s
 cargo run -p studiofs-e2e -- run mounted-chaos-convergence --seed 360 --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run mounted-lww-reconnect-chaos-convergence --seed 360 --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run mounted-sparse-file-range-convergence --seed 377 --studiofs-bin target\debug\studiofs.exe
+cargo run -p studiofs-e2e -- run mounted-cold-observer-long-history-convergence --seed 378 --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run rustfs-outage-multi-client-recovery --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run mounted-client-crash-restart-recovery --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run collision-rename-vs-unlink --studiofs-bin target\debug\studiofs.exe
@@ -179,6 +180,13 @@ scenario. It uses a bounded sparse file, validates zero-filled holes,
 shrink/extend truncation, chunk-boundary writes, range read probes, logical
 size, and final checksums through mounted reads, and writes `operations.ndjson`,
 `sparse-range-summary.json`, and `validation.json`.
+`mounted-cold-observer-long-history-convergence` is the next post-1-16
+promotion scenario. It lets warm mounted clients build a bounded mutation
+history before a fresh `client-d` local root/cache discovers and mounts the
+volume, then validates canonical paths, content checksums, tombstone behavior,
+and absence of resurrected entries through mounted reads. It writes
+`operations.ndjson`, `cold-observer-long-history-summary.json`,
+`cold-observer-diagnostics.json`, and `validation.json`.
 
 Hosted Linux real mounted E2E is available as a manual RWX workflow:
 
