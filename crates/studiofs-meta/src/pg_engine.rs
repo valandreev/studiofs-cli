@@ -2938,10 +2938,25 @@ impl PgMetaEngine {
             {
                 continue;
             }
+            // `content_epoch` is scoped to the publishing client/incarnation, not a global
+            // cross-client version. Scenario 13 can legitimately receive a fully Ready
+            // remote growth with a lower epoch than the protected local base head; once
+            // the batch carries Ready attrs, the larger committed extent is authoritative
+            // and must replace the protected graph instead of splicing histories.
             if attr.committed_size > current.committed_size
                 || attr.content_epoch > current.content_epoch
                 || (attr.content_epoch == current.content_epoch && attr.mtime >= current.mtime)
             {
+                tracing::debug!(
+                    ino = attr.ino,
+                    remote_committed_size = attr.committed_size,
+                    current_committed_size = current.committed_size,
+                    remote_content_epoch = attr.content_epoch,
+                    current_content_epoch = current.content_epoch,
+                    remote_mtime = attr.mtime,
+                    current_mtime = current.mtime,
+                    "ready foreign attr replaces protected committed base graph"
+                );
                 preserve_inodes.remove(&attr.ino);
             }
         }
@@ -6126,6 +6141,66 @@ mod tests {
             object_ids,
             vec![remote_head.object_id, remote_tail.object_id],
             "growing ready remote publish should replace, not splice into, a protected committed base graph"
+        );
+    }
+
+    #[test]
+    fn publish_without_ready_attr_preserves_protected_base_graph() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+
+        let file = pg
+            .create_file(ROOT_INO, b"protected-publish-only.txt", 0, 0, 0o644)
+            .expect("create file");
+        set_file_state(&pg, file.ino, 235, 1);
+        let local_head = PayloadRef::new_partial(77_080, 235);
+        pg.stage_payload_slice(file.ino, 0, &local_head)
+            .expect("stage local head");
+        mark_overlay_objects_uploaded(&pg, file.ino, 1, &[local_head.object_id]);
+        assert!(
+            pg.publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
+                .expect("publish local head"),
+            "local head publish should succeed"
+        );
+
+        let overlay = pg.local_overlay_conflicts().expect("overlay conflicts");
+        let remote_head = PayloadRef::new_partial(77_081, 231);
+        let remote_tail = PayloadRef::new_partial(77_082, 231);
+        let remote_publish = MetaEvent::PublishRegularFileBaseSlices {
+            ino: file.ino,
+            chunk_slices: vec![(
+                ChunkId(0),
+                vec![
+                    SliceRecord {
+                        slice_id: SliceId(0),
+                        order: SliceOrder(0),
+                        range: SliceRange::new(0, 231).expect("head range"),
+                        payload: Some(remote_head),
+                        payload_state: PayloadRefState::Published,
+                    },
+                    SliceRecord {
+                        slice_id: SliceId(1),
+                        order: SliceOrder(1),
+                        range: SliceRange::new(231, 462).expect("tail range"),
+                        payload: Some(remote_tail.clone()),
+                        payload_state: PayloadRefState::Published,
+                    },
+                ],
+            )],
+        };
+
+        pg.apply_foreign_batch(&[remote_publish], &overlay, &HashSet::from([file.ino]))
+            .expect("apply publish-only foreign batch");
+
+        let object_ids = pg
+            .lookup_regular_file_slices(file.ino, 0, 462)
+            .expect("lookup merged graph")
+            .into_iter()
+            .filter_map(|span| span.payload.map(|payload| payload.object_id))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            object_ids,
+            vec![local_head.object_id, remote_tail.object_id],
+            "publish-only foreign batches are not authoritative enough to replace protected base ranges"
         );
     }
 
