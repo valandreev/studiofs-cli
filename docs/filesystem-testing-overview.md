@@ -191,9 +191,17 @@ ranges around chunk boundaries, verifies zero-filled holes with range reads,
 shrinks and extends the logical size, then validates final checksums through
 mounted reads.
 
-This is the real mounted promotion of the deterministic sparse-range backstop.
-It is not part of the accepted 1-16 baseline and should be run deliberately
-when validating sparse-file behavior.
+### 18. Cold-Observer Long-History Convergence
+
+This scenario lets three mounted clients build a small but meaningful history:
+they create files, delete one path, rename another, overwrite shared content,
+append data, and create a nested child file. A fourth client joins only after
+that history already exists.
+
+This tests whether a late observer can discover the volume after prior
+activity and still converge to the same final workspace: deleted paths stay
+gone, renamed paths appear under the final name, overwritten content has the
+expected winner, and nested content is visible.
 
 ## What The Baseline Gate Means
 

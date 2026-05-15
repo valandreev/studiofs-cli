@@ -3477,6 +3477,8 @@ fn run_cold_observer_warm_history(
 
     let payload = |label: &str, path: &str| isolation.payload(label, path, label);
     for (order, (client_index, operation, path, action)) in (1..).zip([
+        // Keep the root mkdir as a first-class operation: it is part of the
+        // warm-history artifact even though later parented writes would create it.
         (0, "mkdir", root.clone(), None),
         (
             0,
