@@ -1938,8 +1938,8 @@ fn epoch_finalizer_publishes_slice_graph_zero_length_epoch() {
         );
         assert_eq!(
             invalidator.snapshot(),
-            Vec::<Ino>::new(),
-            "local epoch publication should not emit a kernel invalidation; the writer already owns the fresh file state, matching JuiceFS"
+            vec![attr.ino],
+            "publication that truncates visible size to zero must invalidate mounted kernel data so cached pages past EOF are dropped"
         );
     });
 }
@@ -2104,6 +2104,177 @@ fn epoch_finalizer_invalidates_kernel_when_newer_dirty_attr_remains_visible() {
             invalidator.snapshot(),
             vec![attr.ino],
             "a visible dirty attr must invalidate the kernel even when it belongs to a newer epoch"
+        );
+    });
+}
+
+#[test]
+fn epoch_finalizer_invalidates_kernel_when_publication_advances_visible_size() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "graph-finalizer-size-advance-invalidate");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"graph-finalizer-size-advance.bin", 0, 0, 0o644)
+            .expect("create test file");
+        let baseline_attr = meta.get_attr(attr.ino).expect("load baseline attr");
+        assert_eq!(baseline_attr.size, 0);
+        assert_eq!(baseline_attr.committed_size, 0);
+        vfs.state.namespace.dirty_attrs.lock().remove(&attr.ino);
+        vfs.state.namespace.attr_read_cache.lock().remove(attr.ino);
+
+        let mut staged_attr = baseline_attr.clone();
+        staged_attr.size = 4096;
+        staged_attr.content_epoch = staged_attr.content_epoch.saturating_add(1);
+        staged_attr.upload_state = MetaUploadState::Updating;
+        meta.set_attr(&staged_attr)
+            .expect("stage sparse size-increase epoch");
+        meta.remove_regular_file_graph(attr.ino)
+            .expect("stage sparse graph for size-increase epoch");
+        let unpublished_attr = meta.get_attr(attr.ino).expect("load unpublished append attr");
+        assert!(
+            unpublished_attr.committed_size < unpublished_attr.size,
+            "regression setup should publish a larger visible file"
+        );
+        vfs.state.namespace.dirty_attrs.lock().remove(&attr.ino);
+        vfs.state.namespace.attr_read_cache.lock().remove(attr.ino);
+
+        let (append_epoch, _) = mark_all_overlay_objects_uploaded(&vfs, &meta, attr.ino);
+        assert_eq!(append_epoch, unpublished_attr.content_epoch);
+        let invalidator = Arc::new(RecordingKernelInvalidator::default());
+        vfs.set_kernel_invalidator(invalidator.clone());
+
+        let status = super::commit::CommitCoordinator::finalize_inode_epoch(
+            &vfs,
+            attr.ino,
+            append_epoch,
+        )
+        .await
+        .expect("finalize append epoch");
+        assert!(matches!(status, super::commit::EpochFinalizeStatus::Published));
+        assert_eq!(
+            invalidator.snapshot(),
+            vec![attr.ino],
+            "publication that advances visible size must invalidate mounted kernel data even without dirty attr cache"
+        );
+        let published = meta.get_attr(attr.ino).expect("load published append attr");
+        assert_eq!(published.size, 4096);
+        assert_eq!(published.committed_size, published.size);
+    });
+}
+
+#[test]
+fn epoch_finalizer_invalidates_kernel_when_publication_shrinks_visible_size() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "graph-finalizer-size-shrink-invalidate");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"graph-finalizer-size-shrink.bin", 0, 0, 0o644)
+            .expect("create test file");
+        let payload = vec![0xA5; 8192];
+        vfs.write(attr.ino, 0, &payload)
+            .await
+            .expect("write baseline payload");
+        vfs.flush(attr.ino)
+            .await
+            .expect("materialize baseline payload");
+
+        let (published_epoch, published_blocks) =
+            mark_all_overlay_objects_uploaded(&vfs, &meta, attr.ino);
+        publish_current_file_graph(&meta, attr.ino, published_epoch, &published_blocks);
+        let published_attr = meta.get_attr(attr.ino).expect("load published attr");
+        assert_eq!(published_attr.size, 8192);
+        assert_eq!(published_attr.committed_size, 8192);
+
+        vfs.setattr(attr.ino, SetattrArgs::size_only(4096))
+            .expect("stage local shrink epoch");
+        vfs.state.namespace.dirty_attrs.lock().remove(&attr.ino);
+        vfs.state.namespace.attr_read_cache.lock().remove(attr.ino);
+        let unpublished_attr = meta.get_attr(attr.ino).expect("load unpublished shrink attr");
+        assert!(
+            unpublished_attr.committed_size > unpublished_attr.size,
+            "regression setup should publish a smaller visible file"
+        );
+
+        let (shrink_epoch, _) = mark_all_overlay_objects_uploaded(&vfs, &meta, attr.ino);
+        assert_eq!(shrink_epoch, unpublished_attr.content_epoch);
+        let invalidator = Arc::new(RecordingKernelInvalidator::default());
+        vfs.set_kernel_invalidator(invalidator.clone());
+
+        let status = super::commit::CommitCoordinator::finalize_inode_epoch(
+            &vfs,
+            attr.ino,
+            shrink_epoch,
+        )
+        .await
+        .expect("finalize shrink epoch");
+        assert!(matches!(
+            status,
+            super::commit::EpochFinalizeStatus::Published
+        ));
+        assert_eq!(
+            invalidator.snapshot(),
+            vec![attr.ino],
+            "publication that shrinks visible size must invalidate mounted kernel data even without dirty attr cache"
+        );
+        let published = meta.get_attr(attr.ino).expect("load published shrink attr");
+        assert_eq!(published.size, 4096);
+        assert_eq!(published.committed_size, published.size);
+    });
+}
+
+#[test]
+fn remote_ready_attr_superseding_local_dirty_state_invalidates_kernel_inode() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "remote-ready-supersede-kernel-inval");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"remote-ready-supersede-kernel-inval.bin", 0, 0, 0o644)
+            .expect("create test file");
+        let winner = b"remote winner payload";
+        vfs.write(attr.ino, 0, winner)
+            .await
+            .expect("write winner payload");
+        vfs.flush(attr.ino)
+            .await
+            .expect("materialize winner payload");
+
+        let (published_epoch, published_blocks) =
+            mark_all_overlay_objects_uploaded(&vfs, &meta, attr.ino);
+        publish_current_file_graph(&meta, attr.ino, published_epoch, &published_blocks);
+        let published_attr = meta.get_attr(attr.ino).expect("load published attr");
+        assert_eq!(published_attr.upload_state, MetaUploadState::Ready);
+
+        let mut stale_dirty_attr = published_attr.clone();
+        stale_dirty_attr.upload_state = MetaUploadState::Updating;
+        vfs.state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .insert(attr.ino, stale_dirty_attr);
+
+        let invalidator = Arc::new(RecordingKernelInvalidator::default());
+        vfs.set_kernel_invalidator(invalidator.clone());
+
+        vfs.refresh_inode_incarnation_state_from_attr(attr.ino, &published_attr);
+
+        assert!(
+            !vfs.state
+                .namespace
+                .dirty_attrs
+                .lock()
+                .contains_key(&attr.ino),
+            "authoritative ready metadata should clear superseded local dirty attrs"
+        );
+        assert_eq!(
+            invalidator.snapshot(),
+            vec![attr.ino],
+            "remote ready metadata that supersedes locally visible dirty state must invalidate mounted kernel data"
         );
     });
 }

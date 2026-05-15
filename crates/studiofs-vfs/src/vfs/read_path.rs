@@ -881,6 +881,7 @@ impl<'a> ReadMetadataResolver<'a> {
             self.vfs.clear_superseded_local_regular_file_state(
                 self.ino,
                 remote_attr.committed_content_epoch,
+                true,
             );
             return Some(remote_attr);
         }

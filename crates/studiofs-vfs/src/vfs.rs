@@ -4865,8 +4865,21 @@ impl StudioVfs {
         ino: Ino,
         attr: &InodeAttr,
     ) -> InodeIncarnationState {
+        self.refresh_inode_incarnation_state_from_attr_inner(ino, attr, true)
+    }
+
+    fn refresh_inode_incarnation_state_from_attr_inner(
+        &self,
+        ino: Ino,
+        attr: &InodeAttr,
+        invalidate_kernel_on_supersede: bool,
+    ) -> InodeIncarnationState {
         if self.ready_attr_supersedes_local_regular_file_state(ino, attr) {
-            self.clear_superseded_local_regular_file_state(ino, attr.committed_content_epoch);
+            self.clear_superseded_local_regular_file_state(
+                ino,
+                attr.committed_content_epoch,
+                invalidate_kernel_on_supersede,
+            );
         }
 
         let has_pending_uploads = self.inode_has_pending_uploads(ino);
@@ -5047,7 +5060,12 @@ impl StudioVfs {
             || has_pending_epoch_finalization
     }
 
-    fn clear_superseded_local_regular_file_state(&self, ino: Ino, committed_epoch: u64) {
+    fn clear_superseded_local_regular_file_state(
+        &self,
+        ino: Ino,
+        committed_epoch: u64,
+        invalidate_kernel: bool,
+    ) {
         debug!(
             ino,
             committed_epoch, "authoritative ready metadata superseded local regular-file state"
@@ -5059,6 +5077,9 @@ impl StudioVfs {
         self.remove_live_extents_for_inode(ino);
         self.remove_pending_epoch_finalizations_for_inode(ino);
         self.invalidate_attr_read_cache([ino]);
+        if invalidate_kernel {
+            self.invalidate_kernel_inodes([ino]);
+        }
     }
 
     fn clear_inode_incarnation(&self, ino: Ino) {
