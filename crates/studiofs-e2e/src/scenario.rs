@@ -3172,7 +3172,7 @@ struct LongHistorySummary {
 struct LongHistoryValidation {
     matched: bool,
     missing_present_paths: Vec<String>,
-    unexpected_present_absent_paths: Vec<String>,
+    unexpected_present_paths: Vec<String>,
     checksum_mismatches: Vec<String>,
 }
 
@@ -3221,7 +3221,7 @@ impl LongHistoryValidation {
         Self {
             matched: true,
             missing_present_paths: Vec::new(),
-            unexpected_present_absent_paths: Vec::new(),
+            unexpected_present_paths: Vec::new(),
             checksum_mismatches: Vec::new(),
         }
     }
@@ -5257,7 +5257,7 @@ fn validate_long_history_snapshots(
     history: &LongHistorySummary,
 ) -> LongHistoryValidation {
     let mut missing_present_paths = Vec::new();
-    let mut unexpected_present_absent_paths = Vec::new();
+    let mut unexpected_present_paths = Vec::new();
     let mut checksum_mismatches = Vec::new();
     let checksum_path = long_history_checksum_path(history);
 
@@ -5288,17 +5288,17 @@ fn validate_long_history_snapshots(
                 .iter()
                 .any(|entry| entry.path == *absent_path)
             {
-                unexpected_present_absent_paths.push(format!("{}:{absent_path}", snapshot.client));
+                unexpected_present_paths.push(format!("{}:{absent_path}", snapshot.client));
             }
         }
     }
 
     LongHistoryValidation {
         matched: missing_present_paths.is_empty()
-            && unexpected_present_absent_paths.is_empty()
+            && unexpected_present_paths.is_empty()
             && checksum_mismatches.is_empty(),
         missing_present_paths,
-        unexpected_present_absent_paths,
+        unexpected_present_paths,
         checksum_mismatches,
     }
 }
@@ -7643,7 +7643,7 @@ mod tests {
             long_history_validation: Some(LongHistoryValidation {
                 matched: false,
                 missing_present_paths: vec!["client-a:missing.txt".to_string()],
-                unexpected_present_absent_paths: Vec::new(),
+                unexpected_present_paths: Vec::new(),
                 checksum_mismatches: Vec::new(),
             }),
             catchup: Some(planned_catchup_summary()),
