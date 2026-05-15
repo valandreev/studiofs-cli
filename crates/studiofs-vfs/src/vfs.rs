@@ -4763,6 +4763,16 @@ impl StudioVfs {
             pending_incarnation: None,
             upload_state: VfsUploadState::Idle,
         });
+        if Self::is_fully_published_regular_file(attr)
+            && state
+                .pending_incarnation
+                .as_ref()
+                .is_some_and(|pending| pending.content_epoch <= attr.committed_content_epoch)
+        {
+            state.committed_incarnation = self.derive_committed_incarnation_from_attr(attr);
+            state.pending_incarnation = None;
+            state.upload_state = VfsUploadState::Idle;
+        }
 
         if state.pending_incarnation.is_none() {
             let committed = state.committed_incarnation.clone().or({
@@ -5015,9 +5025,6 @@ impl StudioVfs {
             .get(&ino)
             .and_then(|state| state.pending_incarnation.as_ref())
             .is_some_and(|pending| pending.content_epoch > committed_epoch);
-        if pending_incarnation_newer_than_committed {
-            return false;
-        }
         let pending_uploads = self.pending_uploads_for_inode(ino);
         let has_newer_pending_upload = pending_uploads
             .iter()
@@ -5045,8 +5052,18 @@ impl StudioVfs {
         if has_dirty_writers && !dirty_attr_present {
             return false;
         }
+        if !dirty_attr_present
+            && (!pending_uploads.is_empty()
+                || pending_incarnation_newer_than_committed
+                || !live_extents.is_empty()
+                || has_pending_epoch_finalization)
+        {
+            return false;
+        }
         let has_newer_local_content_work = has_pending_local_payloads
             || has_dirty_writers
+            || !pending_uploads.is_empty()
+            || pending_incarnation_newer_than_committed
             || has_newer_pending_upload
             || has_newer_pending_epoch_finalization;
         if dirty_attr_newer_than_committed && has_newer_local_content_work {

@@ -312,6 +312,7 @@ impl StudioVfs {
                 attr.touch_ctime();
                 self.update_pending_incarnation_size(ino, attr.size);
             }
+            self.invalidate_attr_read_cache([ino]);
 
             let writes = [(offset, Bytes::copy_from_slice(data))];
             self.materialize_buffered_writes_direct(ino, &writes, local_sync_policy)

@@ -11,6 +11,7 @@ pub(super) enum EpochFinalizeStatus {
 
 struct FinalizeMetaSnapshot {
     lifecycle: Option<studiofs_meta::InodeLifecycleRecord>,
+    has_persisted_overlay: bool,
     object_ids: Vec<u64>,
 }
 
@@ -60,6 +61,7 @@ impl CommitCoordinator {
             };
             Ok(FinalizeMetaSnapshot {
                 lifecycle,
+                has_persisted_overlay,
                 object_ids,
             })
         })
@@ -206,7 +208,11 @@ impl CommitCoordinator {
         // `getattr` can expose pending attrs from dirty_attrs without populating
         // attr_read_cache. A newer dirty attr must be preserved, but its presence
         // still means the kernel may hold stale attrs for the epoch just published.
-        if was_dirty_visible || removed_cached_attr || publication_changes_visible_size {
+        if was_dirty_visible
+            || removed_cached_attr
+            || publication_changes_visible_size
+            || meta.has_persisted_overlay
+        {
             vfs.invalidate_kernel_inodes([ino]);
         }
         drop(finalize_session);

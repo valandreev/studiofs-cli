@@ -642,6 +642,10 @@ where
             .remove_upload_stage(op.object_id)
             .await?;
         self.local_payloads.clear_pending_eviction(op.object_id);
+        self.policy.refresh_incarnation_state(op.ino).await;
+        self.policy
+            .finalize_completed_upload_epoch(op.ino, op.content_epoch)
+            .await;
         Ok(())
     }
 
@@ -2157,6 +2161,27 @@ mod tests {
         assert_eq!(local_payloads.removed.lock().as_slice(), &[77]);
         assert_eq!(shutdown.canceled_deleted.load(Ordering::Relaxed), 1);
         assert_eq!(shutdown.released_tokens.lock().as_slice(), &[11]);
+    }
+
+    #[tokio::test]
+    async fn deleted_upload_cleanup_finalizes_completed_upload_epoch_not_fresh_attr_epoch() {
+        let (processor, coordinator, _local_payloads, meta, _remote, shutdown, policy) =
+            processor_fixture();
+        let op = make_pending_upload();
+        coordinator.pending_inodes.lock().insert(op.ino);
+        shutdown.deleted_inodes.lock().insert(op.ino);
+        meta.attrs
+            .lock()
+            .insert(op.ino, Some(make_attr(op.ino, op.content_epoch + 1)));
+
+        let outcome = processor.process_upload(op.clone()).await;
+
+        assert_eq!(outcome, UploadOutcome::CancelledDeleted);
+        assert_eq!(
+            *policy.finalized_upload_epochs.lock(),
+            vec![(op.ino, op.content_epoch)],
+            "deleted-upload cleanup must finalize the completed upload epoch, not a newer attr epoch"
+        );
     }
 
     #[tokio::test]
