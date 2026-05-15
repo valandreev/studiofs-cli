@@ -919,9 +919,14 @@ fn stop_mount_diagnostics_host(
 ) -> anyhow::Result<()> {
     if tokio::runtime::Handle::try_current().is_ok() {
         let runtime_handle = runtime.handle().clone();
-        let shutdown = std::thread::spawn(move || {
-            runtime_handle.block_on(diagnostics_host.stop());
-        });
+        let shutdown = std::thread::Builder::new()
+            .name("mount-diagnostics-shutdown".to_string())
+            .spawn(move || {
+                runtime_handle.block_on(diagnostics_host.stop());
+            })
+            .map_err(|error| {
+                anyhow::anyhow!("failed to spawn mount diagnostics shutdown thread: {error}")
+            })?;
         return shutdown.join().map_err(|_| {
             anyhow::anyhow!("mount diagnostics shutdown thread panicked during unmount")
         });
