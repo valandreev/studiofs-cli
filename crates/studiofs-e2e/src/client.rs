@@ -502,6 +502,15 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         Ok(())
     }
 
+    pub fn discover(&mut self, client: &str) -> Result<(), ClientControllerError> {
+        let index = self.client_index(client)?;
+        let command = self.discover_command(index)?;
+        let output = self.executor.run(&command)?;
+        ensure_success(&command, output)?;
+        self.clients[index].spec.state = ClientLifecycleState::Discovered;
+        Ok(())
+    }
+
     pub fn bootstrap_volume(
         &mut self,
         options: VolumeBootstrapOptions,
@@ -630,6 +639,11 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
             self.mount_index(index)?;
         }
         Ok(())
+    }
+
+    pub fn mount(&mut self, client: &str) -> Result<(), ClientControllerError> {
+        let index = self.client_index(client)?;
+        self.mount_index(index)
     }
 
     pub fn restart(&mut self, client: &str) -> Result<(), ClientControllerError> {
@@ -796,6 +810,11 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
     }
 
     fn unmount_index(&mut self, index: usize) -> Result<(), ClientControllerError> {
+        if self.clients[index].process.is_none() {
+            self.clients[index].spec.process_id = None;
+            self.clients[index].spec.state = ClientLifecycleState::Unmounted;
+            return Ok(());
+        }
         let command = self.unmount_command(index)?;
         let output = self.executor.run(&command)?;
         ensure_success(&command, output)?;

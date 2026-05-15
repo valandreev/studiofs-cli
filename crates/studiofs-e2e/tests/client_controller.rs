@@ -91,6 +91,42 @@ fn controller_bootstraps_mounts_restarts_and_kills_isolated_clients() {
 }
 
 #[test]
+fn controller_can_discover_and_mount_late_observer_after_warm_clients() {
+    let temp = tempdir().unwrap();
+    let executor = RecordingExecutor::new();
+    let calls = Rc::clone(&executor.calls);
+    let config = test_config(temp.path());
+    let mut controller = MultiClientController::new(config, executor);
+
+    controller
+        .create_clients(["client-a", "client-b", "client-d"])
+        .unwrap();
+    controller.init_first_client().unwrap();
+    controller.discover("client-b").unwrap();
+    controller.mount("client-a").unwrap();
+    controller.mount("client-b").unwrap();
+    controller.discover("client-d").unwrap();
+    controller.mount("client-d").unwrap();
+
+    let actions = calls
+        .borrow()
+        .iter()
+        .map(|command| format!("{}:{}", command.client, command.action))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actions,
+        [
+            "client-a:init",
+            "client-b:discover",
+            "client-a:mount",
+            "client-b:mount",
+            "client-d:discover",
+            "client-d:mount",
+        ]
+    );
+}
+
+#[test]
 fn bootstrap_workflow_initializes_one_volume_and_discovers_isolated_clients() {
     let temp = tempdir().unwrap();
     let executor = RecordingExecutor {

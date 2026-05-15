@@ -274,6 +274,87 @@ fn scenario_list_appends_sparse_range_promotion_after_accepted_sixteen() {
 }
 
 #[test]
+fn scenario_list_appends_cold_observer_promotion_after_sparse_range() {
+    let scenarios = studiofs_e2e::scenario::available_scenarios();
+    let names = scenarios
+        .iter()
+        .map(|scenario| scenario.name)
+        .collect::<Vec<_>>();
+
+    assert_eq!(names[16], "mounted-sparse-file-range-convergence");
+    assert_eq!(names[17], "mounted-cold-observer-long-history-convergence");
+}
+
+#[test]
+fn cold_observer_long_history_disabled_run_writes_reproducible_artifacts() {
+    let temp = tempdir().unwrap();
+    let request = RunRequest {
+        root: temp.path().join("e2e-runs"),
+        run_id: Some("cold-observer-contract-run".to_string()),
+        scenarios: vec!["mounted-cold-observer-long-history-convergence".to_string()],
+        seed: 378,
+        studiofs_bin: None,
+        platform: PlatformSelection::Auto,
+        retention: RetentionPolicy::Always,
+        report: None,
+        port_range: None,
+        timeout: None,
+        infra: InfraMode::Disabled,
+    };
+
+    let outcome = studiofs_e2e::runner::run(request).unwrap();
+
+    assert_eq!(outcome.status, RunStatus::Passed);
+    assert_eq!(
+        outcome.scenarios[0].name,
+        "mounted-cold-observer-long-history-convergence"
+    );
+    assert!(outcome.scenarios[0].artifacts.contains(
+        &"artifacts/scenarios/mounted-cold-observer-long-history-convergence/cold-observer-long-history-summary.json".to_string()
+    ));
+    assert!(
+        outcome.scenarios[0].artifacts.contains(
+            &"artifacts/scenarios/mounted-cold-observer-long-history-convergence/validation.json"
+                .to_string()
+        )
+    );
+
+    let sandbox = temp
+        .path()
+        .join("e2e-runs")
+        .join("cold-observer-contract-run");
+    let summary = read_json(sandbox.join(
+        "artifacts/scenarios/mounted-cold-observer-long-history-convergence/cold-observer-long-history-summary.json",
+    ));
+    assert_eq!(
+        summary["scenario"],
+        "mounted-cold-observer-long-history-convergence"
+    );
+    assert_eq!(summary["clients"], 4);
+    assert_eq!(summary["cold_observer"]["client"], "client-d");
+    assert_eq!(summary["cold_observer"]["discovered_after_history"], true);
+    assert_eq!(summary["long_history"]["bounded_operation_count"], 8);
+    assert!(
+        summary["long_history"]["expected_absent_paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|path| path == "cold-observer/delete-target.txt")
+    );
+
+    let operations = fs::read_to_string(sandbox.join(
+        "artifacts/scenarios/mounted-cold-observer-long-history-convergence/operations.ndjson",
+    ))
+    .unwrap();
+    for expected in ["create", "delete", "rename", "overwrite", "mkdir", "append"] {
+        assert!(
+            operations.contains(expected),
+            "expected cold-observer operation {expected}"
+        );
+    }
+}
+
+#[test]
 fn sparse_range_scenario_disabled_run_writes_reproducible_artifacts() {
     let temp = tempdir().unwrap();
     let request = RunRequest {
