@@ -229,9 +229,13 @@ fn create_disposition_from_create_options(create_options: u32) -> u32 {
     create_options >> CREATE_DISPOSITION_SHIFT
 }
 
+fn open_flags_allow_write(open_flags: OpenFlags) -> bool {
+    open_flags.contains(OpenFlags::WRONLY) || open_flags.contains(OpenFlags::RDWR)
+}
+
 fn should_truncate_existing_file_on_open(create_options: u32, open_flags: OpenFlags) -> bool {
     let disposition = create_disposition_from_create_options(create_options);
-    open_flags.bits() != OpenFlags::RDONLY.bits()
+    open_flags_allow_write(open_flags)
         && matches!(
             disposition,
             FILE_OVERWRITE_DISPOSITION | FILE_OVERWRITE_IF_DISPOSITION
@@ -268,7 +272,7 @@ fn write_local_sync_policy_from_create_options(create_options: u32) -> LocalSync
 }
 
 fn should_disable_winfsp_file_cache(is_dir: bool, open_flags: OpenFlags) -> bool {
-    !is_dir && (open_flags.contains(OpenFlags::WRONLY) || open_flags.contains(OpenFlags::RDWR))
+    !is_dir && open_flags_allow_write(open_flags)
 }
 
 fn should_disable_winfsp_file_cache_for_handle(handle: &StudioFileHandle) -> bool {
@@ -2124,6 +2128,10 @@ mod tests {
         assert!(should_truncate_existing_file_on_open(
             0x0500_0000,
             OpenFlags::WRONLY
+        ));
+        assert!(should_truncate_existing_file_on_open(
+            0x0500_0000,
+            OpenFlags::RDWR
         ));
         assert!(!should_truncate_existing_file_on_open(
             0x0000_0000,
