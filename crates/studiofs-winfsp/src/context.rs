@@ -27,7 +27,10 @@ use winfsp::U16CStr;
 use winfsp::filesystem::*;
 use winfsp::filesystem::{AsyncFileSystemContext, DirBuffer};
 use winfsp::notify::{Notifier, NotifyInfo, NotifyingFileSystemContext};
-use winfsp_sys::{FILE_ACCESS_RIGHTS, FILE_FLAGS_AND_ATTRIBUTES, FspFileSystemGetOperationContext};
+use winfsp_sys::{
+    FILE_ACCESS_RIGHTS, FILE_FLAGS_AND_ATTRIBUTES, FspFileSystemGetOperationContext,
+    FspFsctlTransactCreateKind,
+};
 
 use crate::{ensure_winfsp_runtime_loaded, ensure_winfsp_runtime_loaded_or_panic};
 
@@ -241,7 +244,7 @@ fn should_truncate_existing_file_on_open(create_options: u32, open_flags: OpenFl
     // separate overwrite callback.
     disposition == FILE_OPEN_IF_DISPOSITION
         && (create_options & FILE_WRITE_THROUGH_CREATE_OPTION) != 0
-        && open_flags.contains(OpenFlags::WRONLY)
+        && (open_flags.contains(OpenFlags::WRONLY) || open_flags.contains(OpenFlags::RDWR))
 }
 
 fn current_winfsp_create_options(callback_create_options: u32) -> u32 {
@@ -250,11 +253,16 @@ fn current_winfsp_create_options(callback_create_options: u32) -> u32 {
     // this falls back to the callback argument.
     unsafe {
         let operation_context = FspFileSystemGetOperationContext();
-        if operation_context.is_null() || (*operation_context).Request.is_null() {
+        if operation_context.is_null() {
             return callback_create_options;
         }
 
-        (*(*operation_context).Request).Req.Create.CreateOptions
+        let request = (*operation_context).Request;
+        if request.is_null() || (*request).Kind != FspFsctlTransactCreateKind as u32 {
+            return callback_create_options;
+        }
+
+        (*request).Req.Create.CreateOptions
     }
 }
 
@@ -2128,6 +2136,10 @@ mod tests {
             0x0300_0062,
             OpenFlags::WRONLY
         ));
+        assert!(should_truncate_existing_file_on_open(
+            0x0300_0062,
+            OpenFlags::RDWR
+        ));
         assert!(!should_truncate_existing_file_on_open(
             0x0000_0000,
             OpenFlags::WRONLY
@@ -2139,10 +2151,6 @@ mod tests {
         assert!(!should_truncate_existing_file_on_open(
             0x0300_0000,
             OpenFlags::WRONLY
-        ));
-        assert!(!should_truncate_existing_file_on_open(
-            0x0300_0062,
-            OpenFlags::RDWR
         ));
     }
 
