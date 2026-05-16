@@ -5898,10 +5898,6 @@ fn write_mounted_file_with_readback(
         options.create_new(true);
     }
     let mut file = options.open(&path)?;
-    if !create_new {
-        file.set_len(0)?;
-        file.seek(SeekFrom::Start(0))?;
-    }
     file.write_all(payload)?;
     file.sync_all()?;
     drop(file);
