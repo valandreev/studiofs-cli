@@ -483,6 +483,15 @@ pub fn run_with_executor(
             Err(error) => return Err(error),
         };
         let mut lifecycle = lifecycle;
+        if definition.requires_studiofs_bin && lifecycle.outcome.status == ScenarioStatus::TimedOut
+        {
+            let detail = lifecycle
+                .report
+                .error
+                .clone()
+                .unwrap_or_else(|| "scenario child timed out".to_string());
+            mounted_cleanup_block = Some(detail);
+        }
         if definition.requires_studiofs_bin {
             if let Err(error) = verify_post_scenario_cleanup(
                 &root,
@@ -738,12 +747,13 @@ fn run_supervised_scenario(
         Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {
             let lifecycle =
                 timed_out_scenario_child(input.definition.name, input.request_seed, &err);
-            record_event(
+            record_event_with_detail(
                 input.events_path,
                 input.run_id,
                 Some(input.definition.name),
                 "scenario_child",
                 "timed_out",
+                err.to_string(),
             )?;
             emit_progress(
                 input.run_id,
@@ -2443,12 +2453,35 @@ fn record_event(
     hook: &str,
     phase: &str,
 ) -> Result<(), RunnerError> {
+    record_event_with_optional_detail(events_path, run_id, scenario, hook, phase, None)
+}
+
+fn record_event_with_detail(
+    events_path: &Path,
+    run_id: &str,
+    scenario: Option<&str>,
+    hook: &str,
+    phase: &str,
+    detail: String,
+) -> Result<(), RunnerError> {
+    record_event_with_optional_detail(events_path, run_id, scenario, hook, phase, Some(detail))
+}
+
+fn record_event_with_optional_detail(
+    events_path: &Path,
+    run_id: &str,
+    scenario: Option<&str>,
+    hook: &str,
+    phase: &str,
+    detail: Option<String>,
+) -> Result<(), RunnerError> {
     let record = EventRecord {
         timestamp: timestamp(),
         run_id: run_id.to_string(),
         scenario: scenario.map(str::to_string),
         hook: hook.to_string(),
         phase: phase.to_string(),
+        detail,
     };
     let mut file = OpenOptions::new()
         .create(true)
@@ -3391,6 +3424,60 @@ plain child stderr\n",
     }
 
     #[test]
+    fn supervised_child_timeout_records_executor_cleanup_detail() {
+        let temp = tempfile::tempdir().unwrap();
+        let executor = RecordingExecutor {
+            time_out_first_child: Cell::new(true),
+            ..RecordingExecutor::default()
+        };
+
+        let outcome = run_with_executor(
+            RunRequest {
+                root: temp.path().join("e2e-runs"),
+                run_id: Some("child-timeout-detail-run".to_string()),
+                scenarios: vec![
+                    scenario::TEST_PASSING.to_string(),
+                    scenario::TEST_PASSING.to_string(),
+                ],
+                seed: 410,
+                studiofs_bin: None,
+                platform: PlatformSelection::Auto,
+                retention: RetentionPolicy::Always,
+                report: None,
+                port_range: None,
+                timeout: Some("30s".to_string()),
+                infra: InfraMode::Disabled,
+            },
+            &executor,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.status, RunStatus::Failed);
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(outcome.report_path).unwrap()).unwrap();
+        assert_eq!(report["scenarios"][0]["status"], "timed_out");
+        assert!(
+            report["scenarios"][0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("child still running after kill attempts")
+        );
+
+        let events = std::fs::read_to_string(outcome.sandbox.join("events.ndjson")).unwrap();
+        let timeout_event = events
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|event| event["hook"] == "scenario_child" && event["phase"] == "timed_out")
+            .expect("scenario child timeout event should be written");
+        assert!(
+            timeout_event["detail"]
+                .as_str()
+                .unwrap()
+                .contains("child still running after kill attempts")
+        );
+    }
+
+    #[test]
     fn mounted_cleanup_verification_failure_blocks_later_mounted_children() {
         let temp = tempfile::tempdir().unwrap();
         let executor = RecordingExecutor {
@@ -3449,6 +3536,61 @@ plain child stderr\n",
                 .as_str()
                 .unwrap()
                 .contains("contaminated runner state")
+        );
+    }
+
+    #[test]
+    fn mounted_child_timeout_blocks_later_mounted_children() {
+        let temp = tempfile::tempdir().unwrap();
+        let executor = RecordingExecutor {
+            time_out_first_child: Cell::new(true),
+            ..RecordingExecutor::default()
+        };
+
+        let outcome = run_with_executor(
+            RunRequest {
+                root: temp.path().join("e2e-runs"),
+                run_id: Some("mounted-timeout-block-run".to_string()),
+                scenarios: vec![
+                    scenario::BASIC_MULTI_CLIENT_SMOKE.to_string(),
+                    scenario::MOUNTED_CLIENT_CRASH_RESTART_RECOVERY.to_string(),
+                ],
+                seed: 410,
+                studiofs_bin: None,
+                platform: PlatformSelection::WindowsWinfsp,
+                retention: RetentionPolicy::Always,
+                report: None,
+                port_range: None,
+                timeout: Some("30s".to_string()),
+                infra: InfraMode::Disabled,
+            },
+            &executor,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.status, RunStatus::Failed);
+        let calls = executor.calls.borrow();
+        let child_calls = calls
+            .iter()
+            .filter(|call| call.args.contains(&"run-one".to_string()))
+            .count();
+        assert_eq!(child_calls, 1, "second mounted scenario must not start");
+        assert!(calls.iter().any(|call| {
+            call.env
+                .iter()
+                .any(|(key, value)| key == "STUDIOFS_E2E_CLEANUP_PHASE" && value == "post-scenario")
+                && call.timeout == Some(POST_SCENARIO_CLEANUP_TIMEOUT)
+        }));
+
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(outcome.report_path).unwrap()).unwrap();
+        assert_eq!(report["scenarios"][0]["status"], "timed_out");
+        assert_eq!(report["scenarios"][1]["status"], "skipped");
+        assert!(
+            report["scenarios"][1]["error"]
+                .as_str()
+                .unwrap()
+                .contains("command timed out after 30000 ms")
         );
     }
 
@@ -4096,6 +4238,7 @@ plain child stderr\n",
         fail_logs: Cell<bool>,
         fail_post_scenario_cleanup: Cell<bool>,
         fail_child_supervision_io: Cell<bool>,
+        time_out_first_child: Cell<bool>,
         child_run_count: Cell<usize>,
     }
 
@@ -4108,6 +4251,12 @@ plain child stderr\n",
                 if self.fail_child_supervision_io.get() && self.child_run_count.get() == 1 {
                     return Err(std::io::Error::other(
                         "simulated supervised child transport failure",
+                    ));
+                }
+                if self.time_out_first_child.get() && self.child_run_count.get() == 1 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "command timed out after 30000 ms; child still running after kill attempts",
                     ));
                 }
                 write_recorded_child_report(command)?;
