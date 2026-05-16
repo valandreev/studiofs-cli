@@ -365,6 +365,14 @@ fn invalidation_dropout_disabled_run_writes_reproducible_artifacts() {
         "client-c"
     );
     assert_eq!(summary["invalidation_dropout"]["notify_suppressed"], true);
+    assert_eq!(
+        summary["invalidation_dropout"]["stale_window_observed"],
+        true
+    );
+    assert_eq!(
+        summary["invalidation_dropout"]["delete_stale_window_observed"],
+        true
+    );
     assert_eq!(summary["invalidation_dropout"]["fallback_resumed"], true);
     assert_eq!(
         summary["invalidation_dropout"]["final_validation_result"],
@@ -381,6 +389,7 @@ fn invalidation_dropout_disabled_run_writes_reproducible_artifacts() {
         "writer_overwrite",
         "writer_delete",
         "observer_stale_window",
+        "observer_delete_stale_window",
         "fallback_sync_resume",
     ] {
         assert!(

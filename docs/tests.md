@@ -201,8 +201,9 @@ uses only public mounted reads and tree convergence. It writes
 promotion scenario. It suppresses metadata notify/background polling for
 `client-c` through an explicit E2E-only mount environment switch, keeps
 fallback sync enabled on a bounded interval, publishes create/overwrite/delete
-activity from `client-a` and `client-b`, verifies the observer's stale window,
-and then validates final convergence through public mounted reads. It writes
+activity from `client-a` and `client-b`, verifies the observer's stale window
+for both payload updates and deleted-path visibility, and then validates final
+convergence plus deleted-path absence through public mounted reads. It writes
 `operations.ndjson`, `invalidation-dropout-summary.json`,
 `invalidation-fallback-diagnostics.json`, and `validation.json`.
 

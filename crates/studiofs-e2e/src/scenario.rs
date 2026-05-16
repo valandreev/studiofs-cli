@@ -135,7 +135,7 @@ const COLD_OBSERVER_RENAME_DEST: &str = "renamed-final.txt";
 const COLD_OBSERVER_OVERWRITE_TARGET: &str = "overwrite-target.txt";
 const COLD_OBSERVER_APPEND_TARGET: &str = "append-target.txt";
 const COLD_OBSERVER_NESTED_FILE: &str = "nested/child.txt";
-const INVALIDATION_DROPOUT_FALLBACK_INTERVAL_MS: u64 = 1_500;
+const INVALIDATION_DROPOUT_FALLBACK_INTERVAL_MS: u64 = 3_000;
 const INVALIDATION_DROPOUT_STALE_WINDOW_MS: u64 = 500;
 const INVALIDATION_DROPOUT_BASELINE_FILE: &str = "baseline.txt";
 const INVALIDATION_DROPOUT_TARGET_FILE: &str = "fallback-target.txt";
@@ -3231,6 +3231,7 @@ struct InvalidationDropoutSummary {
     fallback_interval_ms: u64,
     stale_window_ms: u64,
     stale_window_observed: bool,
+    delete_stale_window_observed: bool,
     fallback_resumed: bool,
     final_observer_path: String,
     final_observer_checksum_sha256: String,
@@ -3239,7 +3240,10 @@ struct InvalidationDropoutSummary {
 
 impl InvalidationDropoutSummary {
     fn matched(&self) -> bool {
-        self.notify_suppressed && self.stale_window_observed && self.fallback_resumed
+        self.notify_suppressed
+            && self.stale_window_observed
+            && self.delete_stale_window_observed
+            && self.fallback_resumed
     }
 }
 
@@ -5097,6 +5101,48 @@ fn wait_for_mounted_initial_payloads_until(
     }
 }
 
+fn wait_for_mounted_paths_absent_until(
+    clients: &[ClientSpec],
+    absent_paths: &[&str],
+    deadline: Instant,
+    poll_interval: Duration,
+    label: &str,
+) -> Result<(), ScenarioError> {
+    loop {
+        let present = present_mounted_paths(clients, absent_paths);
+        if present.is_empty() {
+            return Ok(());
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(ScenarioError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "{label} did not disappear before timeout; still present: {}",
+                    present.join(", ")
+                ),
+            )));
+        }
+        thread::sleep(poll_interval.min(deadline.saturating_duration_since(now)));
+    }
+}
+
+fn present_mounted_paths(clients: &[ClientSpec], absent_paths: &[&str]) -> Vec<String> {
+    let mut present = Vec::new();
+    for client in clients {
+        for relative_path in absent_paths {
+            let _ = refresh_relative_path_parent_contains_child(&client.mount_point, relative_path);
+            match fs::metadata(client.mount_point.join(relative_path)) {
+                Ok(_) => present.push(format!("{}:{relative_path}", client.name)),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => present.push(format!("{}:{relative_path} ({error})", client.name)),
+            }
+        }
+    }
+    present
+}
+
 fn missing_mounted_initial_payloads(
     clients: &[ClientSpec],
     required_payloads: &[(&str, &[u8])],
@@ -5602,6 +5648,11 @@ fn planned_advanced_mounted_operations(
             ),
             (
                 "client-c",
+                "observer_delete_stale_window",
+                "invalidation-dropout/delete-target.txt",
+            ),
+            (
+                "client-c",
                 "fallback_sync_resume",
                 "invalidation-dropout/fallback-target.txt",
             ),
@@ -5679,9 +5730,18 @@ fn run_invalidation_dropout_fallback_operations(
         "invalidation dropout baseline",
         true,
     )?;
+    write_mounted_file_with_readback(
+        writer_a.mount_point.join(&delete_path),
+        &delete_payload,
+        "invalidation dropout delete baseline",
+        true,
+    )?;
     wait_for_mounted_initial_payloads_until(
         clients,
-        &[(&baseline_path, baseline_payload.as_slice())],
+        &[
+            (&baseline_path, baseline_payload.as_slice()),
+            (&delete_path, delete_payload.as_slice()),
+        ],
         Instant::now() + timeout,
         poll_interval,
         "invalidation dropout baseline",
@@ -5734,26 +5794,48 @@ fn run_invalidation_dropout_fallback_operations(
         writer_a,
         "writer_delete",
         &delete_path,
-        create_then_delete_mounted_file(
-            writer_a.mount_point.join(&delete_path),
-            &delete_payload,
-            "invalidation dropout delete target",
-        ),
+        remove_mounted_file(writer_a.mount_point.join(&delete_path)),
     )?);
 
+    let stale_window_observed = assert_observer_stays_stale_for_window(
+        observer,
+        &target_path,
+        &final_payload,
+        Duration::from_millis(INVALIDATION_DROPOUT_STALE_WINDOW_MS),
+        poll_interval,
+    )
+    .is_ok();
     operations.push(required_op(
         started,
         operations.len() + 1,
         observer,
         "observer_stale_window",
         &target_path,
-        assert_observer_stays_stale_for_window(
-            observer,
-            &target_path,
-            &final_payload,
-            Duration::from_millis(INVALIDATION_DROPOUT_STALE_WINDOW_MS),
-            poll_interval,
-        ),
+        stale_window_observed.then_some(()).ok_or_else(|| {
+            ScenarioError::Io(io::Error::other(
+                "observer saw final payload before stale window elapsed",
+            ))
+        }),
+    )?);
+    let delete_stale_window_observed = assert_observer_keeps_payload_for_window(
+        observer,
+        &delete_path,
+        &delete_payload,
+        Duration::from_millis(INVALIDATION_DROPOUT_STALE_WINDOW_MS),
+        poll_interval,
+    )
+    .is_ok();
+    operations.push(required_op(
+        started,
+        operations.len() + 1,
+        observer,
+        "observer_delete_stale_window",
+        &delete_path,
+        delete_stale_window_observed.then_some(()).ok_or_else(|| {
+            ScenarioError::Io(io::Error::other(
+                "observer lost deleted path before stale window elapsed",
+            ))
+        }),
     )?);
     operations.push(required_op(
         started,
@@ -5761,12 +5843,13 @@ fn run_invalidation_dropout_fallback_operations(
         observer,
         "fallback_sync_resume",
         &target_path,
-        wait_for_mounted_initial_payloads_until(
+        wait_for_invalidation_fallback_resume(
             clients,
-            &[(&target_path, final_payload.as_slice())],
-            Instant::now() + timeout,
+            &target_path,
+            final_payload.as_slice(),
+            &delete_path,
+            timeout,
             poll_interval,
-            "invalidation dropout fallback sync",
         ),
     )?);
 
@@ -5779,7 +5862,8 @@ fn run_invalidation_dropout_fallback_operations(
         notify_suppressed: true,
         fallback_interval_ms: INVALIDATION_DROPOUT_FALLBACK_INTERVAL_MS,
         stale_window_ms: INVALIDATION_DROPOUT_STALE_WINDOW_MS,
-        stale_window_observed: true,
+        stale_window_observed,
+        delete_stale_window_observed,
         fallback_resumed: true,
         final_observer_path: target_path,
         final_observer_checksum_sha256: bytes_sha256(&final_payload),
@@ -5838,14 +5922,34 @@ fn write_mounted_file_with_readback(
     Ok(())
 }
 
-fn create_then_delete_mounted_file(
-    path: PathBuf,
-    payload: &[u8],
-    label: &str,
-) -> Result<(), ScenarioError> {
-    write_mounted_file_with_readback(path.clone(), payload, label, true)?;
+fn remove_mounted_file(path: PathBuf) -> Result<(), ScenarioError> {
     fs::remove_file(path)?;
     Ok(())
+}
+
+fn wait_for_invalidation_fallback_resume(
+    clients: &[ClientSpec],
+    target_path: &str,
+    final_payload: &[u8],
+    delete_path: &str,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> Result<(), ScenarioError> {
+    let deadline = Instant::now() + timeout;
+    wait_for_mounted_initial_payloads_until(
+        clients,
+        &[(target_path, final_payload)],
+        deadline,
+        poll_interval,
+        "invalidation dropout fallback payload sync",
+    )?;
+    wait_for_mounted_paths_absent_until(
+        clients,
+        &[delete_path],
+        deadline,
+        poll_interval,
+        "invalidation dropout fallback delete sync",
+    )
 }
 
 fn assert_observer_stays_stale_for_window(
@@ -5860,6 +5964,30 @@ fn assert_observer_stays_stale_for_window(
         if observer_sees_payload(observer, relative_path, final_payload)? {
             return Err(ScenarioError::Io(io::Error::other(format!(
                 "{} observed final payload for {relative_path} before the {} ms stale window elapsed",
+                observer.name,
+                stale_window.as_millis()
+            ))));
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(());
+        }
+        thread::sleep(poll_interval.min(deadline.saturating_duration_since(now)));
+    }
+}
+
+fn assert_observer_keeps_payload_for_window(
+    observer: &ClientSpec,
+    relative_path: &str,
+    expected_payload: &[u8],
+    stale_window: Duration,
+    poll_interval: Duration,
+) -> Result<(), ScenarioError> {
+    let deadline = Instant::now() + stale_window;
+    loop {
+        if !observer_sees_payload(observer, relative_path, expected_payload)? {
+            return Err(ScenarioError::Io(io::Error::other(format!(
+                "{} stopped seeing stale payload for {relative_path} before the {} ms stale window elapsed",
                 observer.name,
                 stale_window.as_millis()
             ))));
@@ -6497,6 +6625,7 @@ fn planned_invalidation_dropout_summary() -> InvalidationDropoutSummary {
         fallback_interval_ms: INVALIDATION_DROPOUT_FALLBACK_INTERVAL_MS,
         stale_window_ms: INVALIDATION_DROPOUT_STALE_WINDOW_MS,
         stale_window_observed: true,
+        delete_stale_window_observed: true,
         fallback_resumed: true,
         final_observer_path: target_path,
         final_observer_checksum_sha256: bytes_sha256(&final_payload),
@@ -6561,6 +6690,7 @@ fn write_invalidation_dropout_diagnostics(
             "fallback_interval_ms": summary.fallback_interval_ms,
             "stale_window_ms": summary.stale_window_ms,
             "stale_window_observed": summary.stale_window_observed,
+            "delete_stale_window_observed": summary.delete_stale_window_observed,
             "fallback_resumed": summary.fallback_resumed,
             "final_observer_path": summary.final_observer_path,
             "final_observer_checksum_sha256": summary.final_observer_checksum_sha256,

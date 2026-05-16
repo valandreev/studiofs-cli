@@ -449,10 +449,12 @@ stale-remount/cold-discover promotion scenario and writes
 `client-c` an explicit E2E-only metadata notify suppression seam while leaving
 the periodic fallback sync enabled, lets `client-a` and `client-b` publish
 create/overwrite/delete activity, proves `client-c` stays stale only inside the
-bounded dropout window, and then requires public mounted-tree convergence after
-fallback sync catches up. The seam is only the debug/E2E
-`STUDIOFS_E2E_DISABLE_METADATA_BACKGROUND_POLL=1` mount environment switch; it
-must not be used as a production behavior or scenario pass condition.
+bounded dropout window for both final payload visibility and deleted-path
+visibility, and then requires public mounted-tree convergence after fallback
+sync catches up, including disappearance of the deleted path. The seam is only
+the debug/E2E `STUDIOFS_E2E_DISABLE_METADATA_BACKGROUND_POLL=1` mount
+environment switch; it must not be used as a production behavior or scenario
+pass condition.
 
 ## Mounted Tree Convergence Validation
 
