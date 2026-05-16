@@ -301,6 +301,96 @@ fn scenario_list_appends_stale_remount_cold_discover_after_cold_observer() {
 }
 
 #[test]
+fn scenario_list_appends_invalidation_dropout_after_stale_remount_cold_discover() {
+    let scenarios = studiofs_e2e::scenario::available_scenarios();
+    let names = scenarios
+        .iter()
+        .map(|scenario| scenario.name)
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        names[18],
+        "mounted-stale-remount-cold-discover-catchup-convergence"
+    );
+    assert_eq!(
+        names[19],
+        "mounted-invalidation-dropout-fallback-convergence"
+    );
+}
+
+#[test]
+fn invalidation_dropout_disabled_run_writes_reproducible_artifacts() {
+    let temp = tempdir().unwrap();
+    let request = RunRequest {
+        root: temp.path().join("e2e-runs"),
+        run_id: Some("invalidation-dropout-contract-run".to_string()),
+        scenarios: vec!["mounted-invalidation-dropout-fallback-convergence".to_string()],
+        seed: 379,
+        studiofs_bin: None,
+        platform: PlatformSelection::Auto,
+        retention: RetentionPolicy::Always,
+        report: None,
+        port_range: None,
+        timeout: None,
+        infra: InfraMode::Disabled,
+    };
+
+    let outcome = studiofs_e2e::runner::run(request).unwrap();
+
+    assert_eq!(outcome.status, RunStatus::Passed);
+    assert_eq!(
+        outcome.scenarios[0].name,
+        "mounted-invalidation-dropout-fallback-convergence"
+    );
+    assert!(outcome.scenarios[0].artifacts.contains(
+        &"artifacts/scenarios/mounted-invalidation-dropout-fallback-convergence/invalidation-dropout-summary.json".to_string()
+    ));
+    assert!(outcome.scenarios[0].artifacts.contains(
+        &"artifacts/scenarios/mounted-invalidation-dropout-fallback-convergence/invalidation-fallback-diagnostics.json".to_string()
+    ));
+
+    let sandbox = temp
+        .path()
+        .join("e2e-runs")
+        .join("invalidation-dropout-contract-run");
+    let summary = read_json(sandbox.join(
+        "artifacts/scenarios/mounted-invalidation-dropout-fallback-convergence/invalidation-dropout-summary.json",
+    ));
+    assert_eq!(
+        summary["scenario"],
+        "mounted-invalidation-dropout-fallback-convergence"
+    );
+    assert_eq!(
+        summary["invalidation_dropout"]["observer_client"],
+        "client-c"
+    );
+    assert_eq!(summary["invalidation_dropout"]["notify_suppressed"], true);
+    assert_eq!(summary["invalidation_dropout"]["fallback_resumed"], true);
+    assert_eq!(
+        summary["invalidation_dropout"]["final_validation_result"],
+        "mounted_tree_convergence"
+    );
+
+    let operations = fs::read_to_string(sandbox.join(
+        "artifacts/scenarios/mounted-invalidation-dropout-fallback-convergence/operations.ndjson",
+    ))
+    .unwrap();
+    for expected in [
+        "observer_dropout_start",
+        "writer_create",
+        "writer_overwrite",
+        "writer_delete",
+        "observer_stale_window",
+        "fallback_sync_resume",
+    ] {
+        assert!(
+            operations.contains(expected),
+            "expected invalidation dropout operation {expected}"
+        );
+    }
+}
+
+#[test]
 fn stale_remount_cold_discover_disabled_run_writes_reproducible_artifacts() {
     let temp = tempdir().unwrap();
     let request = RunRequest {

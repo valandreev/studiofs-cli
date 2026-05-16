@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use std::{
-    collections::HashSet, collections::hash_map::DefaultHasher, ffi::OsString, hash::Hasher,
+    collections::BTreeMap, collections::HashSet, collections::hash_map::DefaultHasher,
+    ffi::OsString, hash::Hasher,
 };
 
 use serde::{Deserialize, Serialize};
@@ -35,6 +36,7 @@ pub struct ClientControllerConfig {
     pub mount_exit_timeout: Duration,
     pub poll_interval: Duration,
     pub mount_points: Vec<PathBuf>,
+    pub client_env_overrides: BTreeMap<String, Vec<(String, String)>>,
 }
 
 impl ClientControllerConfig {
@@ -111,6 +113,7 @@ impl ClientControllerConfig {
             mount_exit_timeout: Duration::from_secs(15),
             poll_interval: Duration::from_millis(100),
             mount_points: Vec::new(),
+            client_env_overrides: BTreeMap::new(),
         })
     }
 }
@@ -476,6 +479,27 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
 
     pub fn client_at(&self, index: usize) -> Result<&ClientSpec, ClientControllerError> {
         self.client(index)
+    }
+
+    pub fn set_client_env_overrides<I, K, V>(
+        &mut self,
+        client: &str,
+        overrides: I,
+    ) -> Result<(), ClientControllerError>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.client_index(client)?;
+        let overrides = overrides
+            .into_iter()
+            .map(|(key, value)| (key.into(), value.into()))
+            .collect::<Vec<_>>();
+        self.config
+            .client_env_overrides
+            .insert(client.to_string(), overrides);
+        Ok(())
     }
 
     pub fn init_first_client(&mut self) -> Result<(), ClientControllerError> {
@@ -972,7 +996,13 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
             action: action.to_string(),
             program: self.config.studiofs_bin.display().to_string(),
             args,
-            env: client_env(client),
+            env: client_env_with_overrides(
+                client,
+                self.config
+                    .client_env_overrides
+                    .get(client.name.as_str())
+                    .map(Vec::as_slice),
+            ),
             client_root: client.client_root.clone(),
             cache_dir: client.cache_dir.clone(),
             mount_point: client.mount_point.clone(),
@@ -1189,6 +1219,20 @@ fn client_env(client: &ClientSpec) -> Vec<(String, String)> {
             "1000".to_string(),
         ),
     ]
+}
+
+fn client_env_with_overrides(
+    client: &ClientSpec,
+    overrides: Option<&[(String, String)]>,
+) -> Vec<(String, String)> {
+    let mut env = client_env(client);
+    if let Some(overrides) = overrides {
+        for (key, value) in overrides {
+            env.retain(|(existing_key, _)| existing_key != key);
+            env.push((key.clone(), value.clone()));
+        }
+    }
+    env
 }
 
 fn base_command(command: &ClientCommand) -> Command {

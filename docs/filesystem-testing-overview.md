@@ -239,8 +239,8 @@ A passing mounted sweep means the current implementation survived the selected
 real-mount scenarios: basic sharing, service outages, crash/restart,
 publication boundaries, focused namespace collisions, seeded chaos, hot-spot
 churn, fault chaos, LWW reconnect, open-handle behavior, sparse files, late
-observers, stale remounts, cold discovery, and any appended promotion scenarios
-selected for that run.
+observers, stale remounts, cold discovery, invalidation dropout/fallback sync,
+and any appended promotion scenarios selected for that run.
 
 It does not mean the filesystem is perfect. It means the current safety net is
 working and gives us a strong baseline before we add deeper scenarios.
@@ -266,5 +266,5 @@ only then move to the next level.
 
 Future deterministic backstops can go deeper into sparse-file
 truncate/write/read-range races, cold-observer long-history convergence,
-stale-remount catch-up, invalidation dropout and fallback sync, symlink and
-metadata-attribute convergence, and adversarial runner cleanup.
+stale-remount catch-up, symlink and metadata-attribute convergence, and
+adversarial runner cleanup.

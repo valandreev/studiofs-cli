@@ -25,8 +25,8 @@ use studiofs_cache::{
 };
 use studiofs_data::DataStoreConfig;
 use studiofs_meta::{
-    FormatInfo, MetaEngine, MetaFormat, MetaReplication, MetaSnapshots, MetadataBackend,
-    RedbMetaEngine, open_meta_engine,
+    FormatInfo, MetaEngine, MetaFormat, MetaOpenOptions, MetaReplication, MetaSnapshots,
+    MetadataBackend, RedbMetaEngine, open_meta_engine, open_meta_engine_with_options,
 };
 #[cfg(test)]
 use studiofs_vfs::VfsConfig;
@@ -40,6 +40,8 @@ use tracing::{debug, info, warn};
 const WRITE_PATH_OBSERVABILITY_INTERVAL: Duration = Duration::from_secs(1);
 const DAEMON_RECORD_PUBLISH_TIMEOUT: Duration = Duration::from_secs(15);
 const DAEMON_RECORD_PUBLISH_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const E2E_DISABLE_METADATA_BACKGROUND_POLL_ENV: &str =
+    "STUDIOFS_E2E_DISABLE_METADATA_BACKGROUND_POLL";
 type MountProfileFinish = Box<dyn FnMut()>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1438,7 +1440,12 @@ fn open_live_mount_meta(
 ) -> anyhow::Result<OpenedLiveMountMeta<dyn MetaEngine>> {
     let db_path = meta_dir.join(format!("{name}.db"));
     debug!("opening volume {name:?} from {db_path:?}");
-    let source_meta = open_meta_engine(&db_path)?;
+    let source_meta = open_meta_engine_with_options(
+        &db_path,
+        MetaOpenOptions {
+            background_poll: metadata_background_poll_enabled(),
+        },
+    )?;
     let format_info = read_live_mount_format_info(name, source_meta.as_ref())?;
     let runtime_meta = into_vfs_meta(source_meta.clone());
     Ok(OpenedLiveMountMeta {
@@ -1446,6 +1453,35 @@ fn open_live_mount_meta(
         runtime_meta,
         format_info,
     })
+}
+
+fn metadata_background_poll_enabled() -> bool {
+    metadata_background_poll_enabled_with(|key| std::env::var(key))
+}
+
+fn metadata_background_poll_enabled_with<F>(read_var: F) -> bool
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
+    #[cfg(debug_assertions)]
+    {
+        !read_var(E2E_DISABLE_METADATA_BACKGROUND_POLL_ENV)
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| {
+                value == "1"
+                    || value.eq_ignore_ascii_case("true")
+                    || value.eq_ignore_ascii_case("yes")
+                    || value.eq_ignore_ascii_case("on")
+            })
+    }
+
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = read_var;
+        true
+    }
 }
 
 fn materialize_snapshot_mount_meta<M: ?Sized + SnapshotSourceMeta>(
@@ -2128,6 +2164,22 @@ mod tests {
         });
 
         assert_eq!(resolved.upload_delay_ms, None);
+    }
+
+    #[test]
+    fn e2e_metadata_poll_switch_disables_background_poll_only_when_explicit() {
+        let enabled =
+            metadata_background_poll_enabled_with(|_| Err(std::env::VarError::NotPresent));
+        let disabled = metadata_background_poll_enabled_with(|key| match key {
+            "STUDIOFS_E2E_DISABLE_METADATA_BACKGROUND_POLL" => Ok("1".to_string()),
+            _ => Err(std::env::VarError::NotPresent),
+        });
+
+        assert!(enabled);
+        #[cfg(debug_assertions)]
+        assert!(!disabled);
+        #[cfg(not(debug_assertions))]
+        assert!(disabled);
     }
 
     #[test]

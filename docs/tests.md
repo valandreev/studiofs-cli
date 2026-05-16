@@ -143,6 +143,7 @@ cargo run -p studiofs-e2e -- run mounted-lww-reconnect-chaos-convergence --seed 
 cargo run -p studiofs-e2e -- run mounted-sparse-file-range-convergence --seed 377 --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run mounted-cold-observer-long-history-convergence --seed 378 --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run mounted-stale-remount-cold-discover-catchup-convergence --seed 418 --studiofs-bin target\debug\studiofs.exe
+cargo run -p studiofs-e2e -- run mounted-invalidation-dropout-fallback-convergence --seed 379 --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run rustfs-outage-multi-client-recovery --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run mounted-client-crash-restart-recovery --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run collision-rename-vs-unlink --studiofs-bin target\debug\studiofs.exe
@@ -196,6 +197,14 @@ unmounts `client-c` after a public baseline is visible, lets `client-a` and
 uses only public mounted reads and tree convergence. It writes
 `operations.ndjson`, `stale-remount-cold-discover-summary.json`,
 `catchup-diagnostics.json`, and `validation.json`.
+`mounted-invalidation-dropout-fallback-convergence` is the next post-1-16
+promotion scenario. It suppresses metadata notify/background polling for
+`client-c` through an explicit E2E-only mount environment switch, keeps
+fallback sync enabled on a bounded interval, publishes create/overwrite/delete
+activity from `client-a` and `client-b`, verifies the observer's stale window,
+and then validates final convergence through public mounted reads. It writes
+`operations.ndjson`, `invalidation-dropout-summary.json`,
+`invalidation-fallback-diagnostics.json`, and `validation.json`.
 
 Hosted Linux real mounted E2E is available as a manual RWX workflow:
 
