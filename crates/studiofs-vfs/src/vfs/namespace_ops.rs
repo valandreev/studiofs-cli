@@ -1177,11 +1177,29 @@ impl StudioVfs {
         new_parent: Ino,
         new_name: &[u8],
     ) -> VfsResult<()> {
+        let rename_started = Instant::now();
+        let name_display = String::from_utf8_lossy(name);
+        let new_name_display = String::from_utf8_lossy(new_name);
+        info!(
+            parent,
+            name = %name_display,
+            new_parent,
+            new_name = %new_name_display,
+            "VFS rename started"
+        );
         let namespace_mutations = self.namespace_mutations();
         let meta = self.sync_meta();
         self.enforce_access(parent, AccessLevel::ReadWrite)?;
         self.enforce_access(new_parent, AccessLevel::ReadWrite)?;
         if parent == new_parent && name == new_name {
+            info!(
+                parent,
+                name = %name_display,
+                new_parent,
+                new_name = %new_name_display,
+                elapsed_ms = rename_started.elapsed().as_millis(),
+                "VFS rename skipped identical source and target"
+            );
             return Ok(());
         }
         validate_name(new_name)?;
@@ -1202,10 +1220,27 @@ impl StudioVfs {
             self.unlink_ignored_subtree(parent, name);
             self.bump_acl_namespace_epoch();
             namespace_mutations.record_ignored_rename(parent, name, new_parent, std::iter::empty());
+            info!(
+                parent,
+                name = %name_display,
+                new_parent,
+                new_name = %new_name_display,
+                elapsed_ms = rename_started.elapsed().as_millis(),
+                "VFS rename completed for ignored source"
+            );
             return Ok(());
         }
         if target_is_ignored {
             let source_entry = meta.lookup(parent, name)?;
+            info!(
+                parent,
+                name = %name_display,
+                source_ino = source_entry.ino,
+                new_parent,
+                new_name = %new_name_display,
+                elapsed_ms = rename_started.elapsed().as_millis(),
+                "VFS rename target is ignored; unlinking source"
+            );
             let source_attr = meta.get_attr(source_entry.ino)?;
             self.enforce_no_known_foreign_hard_lock(source_entry.ino)?;
             let target_is_ignored_trash = self.ignored_dir_attr(new_parent).is_some()
@@ -1232,16 +1267,85 @@ impl StudioVfs {
                 }
             }
             self.bump_namespace_for_parents([new_parent]);
-            return self.unlink_inner(parent, name).await;
+            let result = self.unlink_inner(parent, name).await;
+            match &result {
+                Ok(()) => info!(
+                    parent,
+                    name = %name_display,
+                    source_ino = source_entry.ino,
+                    new_parent,
+                    new_name = %new_name_display,
+                    elapsed_ms = rename_started.elapsed().as_millis(),
+                    "VFS rename completed via ignored target unlink"
+                ),
+                Err(err) => warn!(
+                    parent,
+                    name = %name_display,
+                    source_ino = source_entry.ino,
+                    new_parent,
+                    new_name = %new_name_display,
+                    elapsed_ms = rename_started.elapsed().as_millis(),
+                    error = %err,
+                    "VFS rename failed during ignored target unlink"
+                ),
+            }
+            return result;
         }
+        info!(
+            parent,
+            name = %name_display,
+            new_parent,
+            new_name = %new_name_display,
+            elapsed_ms = rename_started.elapsed().as_millis(),
+            "VFS rename looking up source"
+        );
         let source_entry = meta.lookup(parent, name)?;
+        info!(
+            parent,
+            name = %name_display,
+            source_ino = source_entry.ino,
+            new_parent,
+            new_name = %new_name_display,
+            elapsed_ms = rename_started.elapsed().as_millis(),
+            "VFS rename checking source lock"
+        );
         self.enforce_no_known_foreign_hard_lock(source_entry.ino)?;
         if let Ok(target_entry) = meta.lookup(new_parent, new_name)
             && target_entry.ino != source_entry.ino
         {
+            info!(
+                parent,
+                name = %name_display,
+                source_ino = source_entry.ino,
+                new_parent,
+                new_name = %new_name_display,
+                target_ino = target_entry.ino,
+                elapsed_ms = rename_started.elapsed().as_millis(),
+                "VFS rename checking displaced target lock"
+            );
             self.enforce_no_known_foreign_hard_lock(target_entry.ino)?;
         }
+        info!(
+            parent,
+            name = %name_display,
+            source_ino = source_entry.ino,
+            new_parent,
+            new_name = %new_name_display,
+            elapsed_ms = rename_started.elapsed().as_millis(),
+            "VFS rename calling metadata rename_atomic"
+        );
         let rename_result = meta.rename_atomic(parent, name, new_parent, new_name)?;
+        info!(
+            parent,
+            name = %name_display,
+            source_ino = source_entry.ino,
+            new_parent,
+            new_name = %new_name_display,
+            moved_ino = rename_result.moved_ino,
+            displaced_ino = ?rename_result.displaced_ino,
+            elapsed_ms = rename_started.elapsed().as_millis(),
+            "VFS rename metadata rename_atomic returned"
+        );
         namespace_mutations.record_rename(
             parent,
             name,
@@ -1255,6 +1359,15 @@ impl StudioVfs {
             && self.directory_has_probable_trash_ancestor(new_parent)?;
 
         if let Some(ino) = rename_result.displaced_ino {
+            info!(
+                parent,
+                name = %name_display,
+                new_parent,
+                new_name = %new_name_display,
+                displaced_ino = ino,
+                elapsed_ms = rename_started.elapsed().as_millis(),
+                "VFS rename collecting displaced target storage usage"
+            );
             let displaced_usage = meta.get_regular_file_graph_object_usage(ino)?;
             let total_bytes = displaced_usage
                 .iter()
@@ -1264,6 +1377,16 @@ impl StudioVfs {
                 .map(|(object_id, _)| object_id)
                 .collect();
 
+            info!(
+                parent,
+                name = %name_display,
+                new_parent,
+                new_name = %new_name_display,
+                displaced_ino = ino,
+                total_bytes,
+                elapsed_ms = rename_started.elapsed().as_millis(),
+                "VFS rename cleaning displaced target storage"
+            );
             self.cleanup_deleted_inode_storage(
                 &meta,
                 ino,
@@ -1277,9 +1400,28 @@ impl StudioVfs {
         }
 
         if moved_into_trash {
+            info!(
+                parent,
+                name = %name_display,
+                new_parent,
+                new_name = %new_name_display,
+                moved_ino = rename_result.moved_ino,
+                elapsed_ms = rename_started.elapsed().as_millis(),
+                "VFS rename evicting moved file cache after trash rename"
+            );
             self.evict_file_cache_only(rename_result.moved_ino).await?;
         }
         meta.request_eager_flush();
+        info!(
+            parent,
+            name = %name_display,
+            new_parent,
+            new_name = %new_name_display,
+            moved_ino = rename_result.moved_ino,
+            displaced_ino = ?rename_result.displaced_ino,
+            elapsed_ms = rename_started.elapsed().as_millis(),
+            "VFS rename completed"
+        );
         Ok(())
     }
 }

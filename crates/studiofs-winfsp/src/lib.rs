@@ -514,11 +514,34 @@ fn stop_host_before_vfs_shutdown_and_process_exit(
     mut host: impl WinfspShutdownHost,
     shutdown_vfs: impl FnOnce(),
 ) {
+    let shutdown_started = std::time::Instant::now();
+    tracing::info!("WinFSP shutdown: stopping host before VFS shutdown");
+    let stop_started = std::time::Instant::now();
     host.stop_for_shutdown();
+    tracing::info!(
+        elapsed_ms = stop_started.elapsed().as_millis(),
+        total_elapsed_ms = shutdown_started.elapsed().as_millis(),
+        "WinFSP shutdown: host stop returned"
+    );
+    let vfs_shutdown_started = std::time::Instant::now();
+    tracing::info!("WinFSP shutdown: running VFS shutdown");
     shutdown_vfs();
+    tracing::info!(
+        elapsed_ms = vfs_shutdown_started.elapsed().as_millis(),
+        total_elapsed_ms = shutdown_started.elapsed().as_millis(),
+        "WinFSP shutdown: VFS shutdown returned"
+    );
     // Let FileSystemHost::drop release the user context after callbacks have
     // stopped and the VFS checkpoint has finished. Dropping the host releases
     // the context's Arc<StudioVfs>, allowing redb::Database to close cleanly.
+    tracing::info!("WinFSP shutdown: dropping host");
+    let drop_started = std::time::Instant::now();
+    drop(host);
+    tracing::info!(
+        elapsed_ms = drop_started.elapsed().as_millis(),
+        total_elapsed_ms = shutdown_started.elapsed().as_millis(),
+        "WinFSP shutdown: host dropped"
+    );
 }
 
 /// Start the WinFSP filesystem, mount, and block until unmounted.
