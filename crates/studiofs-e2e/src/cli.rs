@@ -238,6 +238,10 @@ fn scenario_name_by_one_based_index(
         .unwrap_or_else(|| index.to_string())
 }
 
+pub fn format_scenario_list_line(index: usize, scenario: &scenario::ScenarioDefinition) -> String {
+    format!("{}\t{}", index + 1, scenario.description)
+}
+
 impl BaselineGateArgs {
     pub fn into_request(self) -> BaselineGateRequest {
         BaselineGateRequest {
@@ -258,7 +262,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
     match cli.command {
         Commands::List => {
             for (index, scenario) in scenario::available_scenarios().iter().enumerate() {
-                println!("{}\t{}\t{}", index + 1, scenario.name, scenario.description);
+                println!("{}", format_scenario_list_line(index, scenario));
             }
             Ok(0)
         }

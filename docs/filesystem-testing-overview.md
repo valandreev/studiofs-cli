@@ -222,6 +222,24 @@ another new machine joins later, and both must still see the current filesystem
 without resurrecting deleted files, missing renamed paths, or reading stale
 payloads.
 
+### 20. Invalidation-Dropout Fallback Convergence
+
+This scenario checks what happens when one mounted observer temporarily misses
+the normal "something changed" signals. While `client-c` is in that quiet
+window, other clients keep publishing ordinary filesystem activity: new files,
+overwritten content, and deleted paths.
+
+The important part is that the observer is allowed to be stale for a while, but
+not forever. Its slower fallback sync must eventually notice the missed changes
+through the public filesystem path. The final workspace must converge, updated
+payloads must become readable, and deleted paths must stay deleted instead of
+reappearing from old local knowledge.
+
+This protects machines that miss live notifications because of a dropped event,
+a sleeping process, or a short local scheduling gap. They may lag behind for a
+bounded period, but they still need a reliable way back to the current shared
+filesystem state.
+
 ## What The Baseline Gate Means
 
 `local-first-baseline-gate` reruns scenarios 1 through 8 as the accepted
