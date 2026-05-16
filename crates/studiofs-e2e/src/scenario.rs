@@ -54,6 +54,8 @@ pub const MOUNTED_COLD_OBSERVER_LONG_HISTORY_CONVERGENCE: &str =
     "mounted-cold-observer-long-history-convergence";
 pub const MOUNTED_STALE_REMOUNT_COLD_DISCOVER_CATCHUP_CONVERGENCE: &str =
     "mounted-stale-remount-cold-discover-catchup-convergence";
+pub const MOUNTED_INVALIDATION_DROPOUT_FALLBACK_CONVERGENCE: &str =
+    "mounted-invalidation-dropout-fallback-convergence";
 const SMOKE_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
 const COLLISION_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
 const ADVANCED_MOUNTED_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
@@ -64,6 +66,9 @@ const COLD_OBSERVER_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"
 const COLD_OBSERVER_WARM_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
 const STALE_REMOUNT_WARM_WRITER_NAMES: &[&str] = &["client-a", "client-b"];
 const STALE_REMOUNT_INITIAL_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
+const INVALIDATION_DROPOUT_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
+const INVALIDATION_DROPOUT_WRITER_CLIENTS: &[&str] = &["client-a", "client-b"];
+const INVALIDATION_DROPOUT_OBSERVER_CLIENT: &str = "client-c";
 const POSTGRES_OUTAGE_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
 const RUSTFS_OUTAGE_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c", "client-d"];
 const CRASH_RESTART_CLIENT_NAMES: &[&str] = &["client-a", "client-b"];
@@ -130,6 +135,11 @@ const COLD_OBSERVER_RENAME_DEST: &str = "renamed-final.txt";
 const COLD_OBSERVER_OVERWRITE_TARGET: &str = "overwrite-target.txt";
 const COLD_OBSERVER_APPEND_TARGET: &str = "append-target.txt";
 const COLD_OBSERVER_NESTED_FILE: &str = "nested/child.txt";
+const INVALIDATION_DROPOUT_FALLBACK_INTERVAL_MS: u64 = 3_000;
+const INVALIDATION_DROPOUT_STALE_WINDOW_MS: u64 = 500;
+const INVALIDATION_DROPOUT_BASELINE_FILE: &str = "baseline.txt";
+const INVALIDATION_DROPOUT_TARGET_FILE: &str = "fallback-target.txt";
+const INVALIDATION_DROPOUT_DELETE_TARGET: &str = "delete-target.txt";
 
 #[cfg(test)]
 pub(crate) const TEST_FAILING_VALIDATE: &str = "__test-failing-validate";
@@ -273,6 +283,7 @@ pub fn available_scenarios() -> Vec<ScenarioDefinition> {
         AdvancedMountedScenario::new(AdvancedMountedKind::ColdObserverLongHistory).definition(),
         AdvancedMountedScenario::new(AdvancedMountedKind::StaleRemountColdDiscoverCatchup)
             .definition(),
+        AdvancedMountedScenario::new(AdvancedMountedKind::InvalidationDropoutFallback).definition(),
     ]
 }
 
@@ -340,6 +351,11 @@ pub(crate) fn resolve_scenario(name: &str) -> Option<Box<dyn Scenario>> {
         | "stale-remount"
         | "cold-discover-catchup" => Some(Box::new(AdvancedMountedScenario::new(
             AdvancedMountedKind::StaleRemountColdDiscoverCatchup,
+        ))),
+        MOUNTED_INVALIDATION_DROPOUT_FALLBACK_CONVERGENCE
+        | "invalidation-dropout"
+        | "fallback-sync" => Some(Box::new(AdvancedMountedScenario::new(
+            AdvancedMountedKind::InvalidationDropoutFallback,
         ))),
         #[cfg(test)]
         TEST_FAILING_VALIDATE => Some(Box::new(TestFailingScenario {
@@ -2911,6 +2927,7 @@ enum AdvancedMountedKind {
     SparseRange,
     ColdObserverLongHistory,
     StaleRemountColdDiscoverCatchup,
+    InvalidationDropoutFallback,
 }
 
 impl AdvancedMountedKind {
@@ -2927,6 +2944,7 @@ impl AdvancedMountedKind {
             Self::StaleRemountColdDiscoverCatchup => {
                 MOUNTED_STALE_REMOUNT_COLD_DISCOVER_CATCHUP_CONVERGENCE
             }
+            Self::InvalidationDropoutFallback => MOUNTED_INVALIDATION_DROPOUT_FALLBACK_CONVERGENCE,
         }
     }
 
@@ -2943,6 +2961,9 @@ impl AdvancedMountedKind {
             Self::StaleRemountColdDiscoverCatchup => {
                 "mounted stale-remount and cold-discover catch-up convergence"
             }
+            Self::InvalidationDropoutFallback => {
+                "mounted invalidation-dropout fallback-sync convergence"
+            }
         }
     }
 
@@ -2957,6 +2978,7 @@ impl AdvancedMountedKind {
             Self::SparseRange => "sparse",
             Self::ColdObserverLongHistory => "cold-observer",
             Self::StaleRemountColdDiscoverCatchup => "stale-remount-cold-discover",
+            Self::InvalidationDropoutFallback => "invalidation-dropout",
         }
     }
 
@@ -2971,6 +2993,7 @@ impl AdvancedMountedKind {
             Self::SparseRange => "sparse-range-summary.json",
             Self::ColdObserverLongHistory => "cold-observer-long-history-summary.json",
             Self::StaleRemountColdDiscoverCatchup => "stale-remount-cold-discover-summary.json",
+            Self::InvalidationDropoutFallback => "invalidation-dropout-summary.json",
         }
     }
 
@@ -2978,6 +3001,7 @@ impl AdvancedMountedKind {
         match self {
             Self::FaultChaos => FAULT_CHAOS_CLIENT_NAMES,
             Self::LwwReconnectChaos => LWW_RECONNECT_CLIENT_NAMES,
+            Self::InvalidationDropoutFallback => INVALIDATION_DROPOUT_CLIENT_NAMES,
             Self::ColdObserverLongHistory | Self::StaleRemountColdDiscoverCatchup => {
                 COLD_OBSERVER_CLIENT_NAMES
             }
@@ -3049,6 +3073,11 @@ impl Scenario for AdvancedMountedScenario {
             .as_ref()
             .map(|validation| validation.matched)
             .unwrap_or_else(|| summary.long_history.is_none());
+        let invalidation_dropout_matches = summary
+            .invalidation_dropout
+            .as_ref()
+            .map(InvalidationDropoutSummary::matched)
+            .unwrap_or(self.kind != AdvancedMountedKind::InvalidationDropoutFallback);
         let validation = json!({
             "scenario": self.kind.name(),
             "run_id": context.run_id,
@@ -3057,6 +3086,7 @@ impl Scenario for AdvancedMountedScenario {
                 && summary.namespace_violations.is_empty()
                 && lww_oracle_matches
                 && long_history_matches
+                && invalidation_dropout_matches
                 && sparse_ranges_match(self.kind, summary.sparse_ranges.as_ref()) {
                     "passed"
                 } else {
@@ -3071,6 +3101,7 @@ impl Scenario for AdvancedMountedScenario {
             "long_history": summary.long_history,
             "long_history_validation": summary.long_history_validation,
             "catchup": summary.catchup,
+            "invalidation_dropout": summary.invalidation_dropout,
         });
         fs::write(
             context.scenario_dir.join("validation.json"),
@@ -3099,6 +3130,12 @@ impl Scenario for AdvancedMountedScenario {
         if self.kind == AdvancedMountedKind::StaleRemountColdDiscoverCatchup {
             artifacts.push(format!(
                 "artifacts/scenarios/{}/catchup-diagnostics.json",
+                self.kind.name()
+            ));
+        }
+        if self.kind == AdvancedMountedKind::InvalidationDropoutFallback {
+            artifacts.push(format!(
+                "artifacts/scenarios/{}/invalidation-fallback-diagnostics.json",
                 self.kind.name()
             ));
         }
@@ -3187,6 +3224,30 @@ struct CatchupSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct InvalidationDropoutSummary {
+    observer_client: String,
+    writer_clients: Vec<String>,
+    notify_suppressed: bool,
+    fallback_interval_ms: u64,
+    stale_window_ms: u64,
+    stale_window_observed: bool,
+    delete_stale_window_observed: bool,
+    fallback_resumed: bool,
+    final_observer_path: String,
+    final_observer_checksum_sha256: String,
+    final_validation_result: String,
+}
+
+impl InvalidationDropoutSummary {
+    fn matched(&self) -> bool {
+        self.notify_suppressed
+            && self.stale_window_observed
+            && self.delete_stale_window_observed
+            && self.fallback_resumed
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct AdvancedMountedSummary {
     scenario: String,
     bootstrap: Option<VolumeBootstrapSummary>,
@@ -3205,6 +3266,8 @@ struct AdvancedMountedSummary {
     long_history_validation: Option<LongHistoryValidation>,
     #[serde(default)]
     catchup: Option<CatchupSummary>,
+    #[serde(default)]
+    invalidation_dropout: Option<InvalidationDropoutSummary>,
 }
 
 struct AdvancedMountedExecution {
@@ -3214,6 +3277,7 @@ struct AdvancedMountedExecution {
     cold_observer: Option<ColdObserverSummary>,
     long_history: Option<LongHistorySummary>,
     catchup: Option<CatchupSummary>,
+    invalidation_dropout: Option<InvalidationDropoutSummary>,
 }
 
 impl LongHistoryValidation {
@@ -3267,6 +3331,12 @@ fn run_advanced_mounted_body(
         clean_existing_local_metadata: true,
     })?;
     write_bootstrap_summary(context, &bootstrap)?;
+    if kind == AdvancedMountedKind::InvalidationDropoutFallback {
+        controller.set_client_env_overrides(
+            INVALIDATION_DROPOUT_OBSERVER_CLIENT,
+            invalidation_dropout_observer_env_overrides(),
+        )?;
+    }
     controller.mount_all()?;
     let clients = controller
         .clients()
@@ -3299,6 +3369,7 @@ fn run_advanced_mounted_body(
             cold_observer: execution.cold_observer,
             long_history: execution.long_history,
             catchup: execution.catchup,
+            invalidation_dropout: execution.invalidation_dropout,
         },
     )?;
     Ok(summary)
@@ -3330,6 +3401,12 @@ fn write_advanced_mounted_plan_artifacts(
     }
     if kind == AdvancedMountedKind::StaleRemountColdDiscoverCatchup {
         write_planned_catchup_diagnostics(context)?;
+    }
+    if kind == AdvancedMountedKind::InvalidationDropoutFallback {
+        write_planned_invalidation_dropout_diagnostics(
+            context,
+            &planned_invalidation_dropout_summary(),
+        )?;
     }
     let compared_clients = kind
         .client_names()
@@ -3369,6 +3446,8 @@ fn write_advanced_mounted_plan_artifacts(
         },
         catchup: (kind == AdvancedMountedKind::StaleRemountColdDiscoverCatchup)
             .then(planned_catchup_summary),
+        invalidation_dropout: (kind == AdvancedMountedKind::InvalidationDropoutFallback)
+            .then(planned_invalidation_dropout_summary),
     };
     write_advanced_mounted_summary(context, kind, &summary)?;
     Ok(summary)
@@ -3389,6 +3468,7 @@ fn execute_advanced_mounted_operations(
             cold_observer: None,
             long_history: None,
             catchup: None,
+            invalidation_dropout: None,
         }),
         AdvancedMountedKind::MountedChaos => Ok(AdvancedMountedExecution {
             operations: run_mounted_chaos_operations(
@@ -3403,6 +3483,7 @@ fn execute_advanced_mounted_operations(
             cold_observer: None,
             long_history: None,
             catchup: None,
+            invalidation_dropout: None,
         }),
         AdvancedMountedKind::HotspotChurn => Ok(AdvancedMountedExecution {
             operations: run_hotspot_churn_operations(
@@ -3417,6 +3498,7 @@ fn execute_advanced_mounted_operations(
             cold_observer: None,
             long_history: None,
             catchup: None,
+            invalidation_dropout: None,
         }),
         AdvancedMountedKind::FaultChaos => Ok(AdvancedMountedExecution {
             operations: run_fault_chaos_operations(context, controller, clients, isolation)?,
@@ -3425,6 +3507,7 @@ fn execute_advanced_mounted_operations(
             cold_observer: None,
             long_history: None,
             catchup: None,
+            invalidation_dropout: None,
         }),
         AdvancedMountedKind::LwwReconnectChaos => {
             let (operations, oracle) =
@@ -3436,6 +3519,7 @@ fn execute_advanced_mounted_operations(
                 cold_observer: None,
                 long_history: None,
                 catchup: None,
+                invalidation_dropout: None,
             })
         }
         AdvancedMountedKind::OpenHandle => Ok(AdvancedMountedExecution {
@@ -3451,6 +3535,7 @@ fn execute_advanced_mounted_operations(
             cold_observer: None,
             long_history: None,
             catchup: None,
+            invalidation_dropout: None,
         }),
         AdvancedMountedKind::SparseRange => {
             let (operations, summary) = run_sparse_range_operations(
@@ -3467,6 +3552,25 @@ fn execute_advanced_mounted_operations(
                 cold_observer: None,
                 long_history: None,
                 catchup: None,
+                invalidation_dropout: None,
+            })
+        }
+        AdvancedMountedKind::InvalidationDropoutFallback => {
+            let (operations, summary) = run_invalidation_dropout_fallback_operations(
+                context,
+                clients,
+                isolation,
+                ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT,
+                ADVANCED_MOUNTED_CONVERGENCE_POLL_INTERVAL,
+            )?;
+            Ok(AdvancedMountedExecution {
+                operations,
+                lww_oracle: None,
+                sparse_ranges: None,
+                cold_observer: None,
+                long_history: None,
+                catchup: None,
+                invalidation_dropout: Some(summary),
             })
         }
         AdvancedMountedKind::ColdObserverLongHistory => unreachable!(
@@ -3581,6 +3685,7 @@ fn run_cold_observer_long_history_body(
             cold_observer: Some(cold_observer),
             long_history: Some(long_history),
             catchup: None,
+            invalidation_dropout: None,
         },
     )
 }
@@ -3735,6 +3840,7 @@ fn run_stale_remount_cold_discover_body(
             cold_observer: None,
             long_history: Some(long_history),
             catchup: Some(catchup),
+            invalidation_dropout: None,
         },
     )
 }
@@ -4995,6 +5101,48 @@ fn wait_for_mounted_initial_payloads_until(
     }
 }
 
+fn wait_for_mounted_paths_absent_until(
+    clients: &[ClientSpec],
+    absent_paths: &[&str],
+    deadline: Instant,
+    poll_interval: Duration,
+    label: &str,
+) -> Result<(), ScenarioError> {
+    loop {
+        let present = present_mounted_paths(clients, absent_paths);
+        if present.is_empty() {
+            return Ok(());
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(ScenarioError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "{label} did not disappear before timeout; still present: {}",
+                    present.join(", ")
+                ),
+            )));
+        }
+        thread::sleep(poll_interval.min(deadline.saturating_duration_since(now)));
+    }
+}
+
+fn present_mounted_paths(clients: &[ClientSpec], absent_paths: &[&str]) -> Vec<String> {
+    let mut present = Vec::new();
+    for client in clients {
+        for relative_path in absent_paths {
+            let _ = refresh_relative_path_parent_contains_child(&client.mount_point, relative_path);
+            match fs::metadata(client.mount_point.join(relative_path)) {
+                Ok(_) => present.push(format!("{}:{relative_path}", client.name)),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => present.push(format!("{}:{relative_path} ({error})", client.name)),
+            }
+        }
+    }
+    present
+}
+
 fn missing_mounted_initial_payloads(
     clients: &[ClientSpec],
     required_payloads: &[(&str, &[u8])],
@@ -5161,6 +5309,7 @@ struct AdvancedMountedFinishInput {
     cold_observer: Option<ColdObserverSummary>,
     long_history: Option<LongHistorySummary>,
     catchup: Option<CatchupSummary>,
+    invalidation_dropout: Option<InvalidationDropoutSummary>,
 }
 
 fn finish_advanced_mounted(
@@ -5178,6 +5327,7 @@ fn finish_advanced_mounted(
         cold_observer,
         long_history,
         catchup,
+        invalidation_dropout,
     } = input;
     let mounts = clients
         .iter()
@@ -5222,6 +5372,7 @@ fn finish_advanced_mounted(
             .map(|history| validate_long_history_snapshots(&convergence.snapshots, history)),
         long_history,
         catchup,
+        invalidation_dropout,
     };
     write_advanced_mounted_summary(context, kind, &summary)?;
     Ok(summary)
@@ -5271,6 +5422,14 @@ fn expected_absent_paths_for(
                 COLD_OBSERVER_RENAME_SOURCE
             ),
         ],
+        (AdvancedMountedKind::InvalidationDropoutFallback, Some(isolation)) => {
+            vec![isolation.path(INVALIDATION_DROPOUT_DELETE_TARGET)]
+        }
+        (AdvancedMountedKind::InvalidationDropoutFallback, None) => vec![format!(
+            "{}/{}",
+            AdvancedMountedKind::InvalidationDropoutFallback.path_root(),
+            INVALIDATION_DROPOUT_DELETE_TARGET
+        )],
         _ => Vec::new(),
     }
 }
@@ -5465,6 +5624,39 @@ fn planned_advanced_mounted_operations(
             ("client-c", "stale_remount_after_history", "client-c"),
             ("client-d", "cold_discover_after_history", "client-d"),
         ],
+        AdvancedMountedKind::InvalidationDropoutFallback => vec![
+            ("client-c", "observer_dropout_start", "client-c"),
+            (
+                "client-a",
+                "writer_create",
+                "invalidation-dropout/fallback-target.txt",
+            ),
+            (
+                "client-b",
+                "writer_overwrite",
+                "invalidation-dropout/fallback-target.txt",
+            ),
+            (
+                "client-a",
+                "writer_delete",
+                "invalidation-dropout/delete-target.txt",
+            ),
+            (
+                "client-c",
+                "observer_stale_window",
+                "invalidation-dropout/fallback-target.txt",
+            ),
+            (
+                "client-c",
+                "observer_delete_stale_window",
+                "invalidation-dropout/delete-target.txt",
+            ),
+            (
+                "client-c",
+                "fallback_sync_resume",
+                "invalidation-dropout/fallback-target.txt",
+            ),
+        ],
     };
     spec.into_iter()
         .enumerate()
@@ -5491,6 +5683,330 @@ struct SparseRangeSpec {
 struct SparseHoleSpec {
     offset: u64,
     len: usize,
+}
+
+fn invalidation_dropout_observer_env_overrides() -> Vec<(String, String)> {
+    vec![
+        (
+            "STUDIOFS_E2E_DISABLE_METADATA_BACKGROUND_POLL".to_string(),
+            "1".to_string(),
+        ),
+        (
+            "STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS".to_string(),
+            INVALIDATION_DROPOUT_FALLBACK_INTERVAL_MS.to_string(),
+        ),
+    ]
+}
+
+fn run_invalidation_dropout_fallback_operations(
+    context: &ScenarioContext,
+    clients: &[ClientSpec],
+    isolation: &ScenarioIsolation,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> Result<(Vec<NamespaceCollisionOperation>, InvalidationDropoutSummary), ScenarioError> {
+    let started = Instant::now();
+    let writer_a = advanced_client_by_name(clients, "client-a")?;
+    let writer_b = advanced_client_by_name(clients, "client-b")?;
+    let observer = advanced_client_by_name(clients, INVALIDATION_DROPOUT_OBSERVER_CLIENT)?;
+    let writer_clients = clients
+        .iter()
+        .filter(|client| INVALIDATION_DROPOUT_WRITER_CLIENTS.contains(&client.name.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut operations = Vec::new();
+
+    let baseline_path = isolation.path(INVALIDATION_DROPOUT_BASELINE_FILE);
+    let target_path = isolation.path(INVALIDATION_DROPOUT_TARGET_FILE);
+    let delete_path = isolation.path(INVALIDATION_DROPOUT_DELETE_TARGET);
+    let baseline_payload = isolation.payload("baseline", &baseline_path, "baseline visible");
+    let create_payload = isolation.payload("writer_create", &target_path, "created before dropout");
+    let final_payload = isolation.payload("writer_overwrite", &target_path, "fallback final");
+    let delete_payload = isolation.payload("writer_delete", &delete_path, "delete before fallback");
+
+    write_mounted_file_with_readback(
+        writer_a.mount_point.join(&baseline_path),
+        &baseline_payload,
+        "invalidation dropout baseline",
+        true,
+    )?;
+    write_mounted_file_with_readback(
+        writer_a.mount_point.join(&delete_path),
+        &delete_payload,
+        "invalidation dropout delete baseline",
+        true,
+    )?;
+    wait_for_mounted_initial_payloads_until(
+        clients,
+        &[
+            (&baseline_path, baseline_payload.as_slice()),
+            (&delete_path, delete_payload.as_slice()),
+        ],
+        Instant::now() + timeout,
+        poll_interval,
+        "invalidation dropout baseline",
+    )?;
+
+    operations.push(required_op(
+        started,
+        operations.len() + 1,
+        observer,
+        "observer_dropout_start",
+        INVALIDATION_DROPOUT_OBSERVER_CLIENT,
+        Ok(()),
+    )?);
+    operations.push(required_op(
+        started,
+        operations.len() + 1,
+        writer_a,
+        "writer_create",
+        &target_path,
+        write_mounted_file_with_readback(
+            writer_a.mount_point.join(&target_path),
+            &create_payload,
+            "invalidation dropout writer create",
+            true,
+        ),
+    )?);
+    wait_for_mounted_initial_payloads_until(
+        &writer_clients,
+        &[(&target_path, create_payload.as_slice())],
+        Instant::now() + timeout,
+        poll_interval,
+        "invalidation dropout writer create",
+    )?;
+    operations.push(required_op(
+        started,
+        operations.len() + 1,
+        writer_b,
+        "writer_overwrite",
+        &target_path,
+        write_mounted_file_with_readback(
+            writer_b.mount_point.join(&target_path),
+            &final_payload,
+            "invalidation dropout writer overwrite",
+            false,
+        ),
+    )?);
+    operations.push(required_op(
+        started,
+        operations.len() + 1,
+        writer_a,
+        "writer_delete",
+        &delete_path,
+        remove_mounted_file(writer_a.mount_point.join(&delete_path)),
+    )?);
+
+    let stale_window_observed = assert_observer_stays_stale_for_window(
+        observer,
+        &target_path,
+        &final_payload,
+        Duration::from_millis(INVALIDATION_DROPOUT_STALE_WINDOW_MS),
+        poll_interval,
+    )
+    .is_ok();
+    operations.push(required_op(
+        started,
+        operations.len() + 1,
+        observer,
+        "observer_stale_window",
+        &target_path,
+        stale_window_observed.then_some(()).ok_or_else(|| {
+            ScenarioError::Io(io::Error::other(
+                "observer saw final payload before stale window elapsed",
+            ))
+        }),
+    )?);
+    let delete_stale_window_observed = assert_observer_keeps_payload_for_window(
+        observer,
+        &delete_path,
+        &delete_payload,
+        Duration::from_millis(INVALIDATION_DROPOUT_STALE_WINDOW_MS),
+        poll_interval,
+    )
+    .is_ok();
+    operations.push(required_op(
+        started,
+        operations.len() + 1,
+        observer,
+        "observer_delete_stale_window",
+        &delete_path,
+        delete_stale_window_observed.then_some(()).ok_or_else(|| {
+            ScenarioError::Io(io::Error::other(
+                "observer lost deleted path before stale window elapsed",
+            ))
+        }),
+    )?);
+    operations.push(required_op(
+        started,
+        operations.len() + 1,
+        observer,
+        "fallback_sync_resume",
+        &target_path,
+        wait_for_invalidation_fallback_resume(
+            clients,
+            &target_path,
+            final_payload.as_slice(),
+            &delete_path,
+            timeout,
+            poll_interval,
+        ),
+    )?);
+
+    let summary = InvalidationDropoutSummary {
+        observer_client: observer.name.clone(),
+        writer_clients: INVALIDATION_DROPOUT_WRITER_CLIENTS
+            .iter()
+            .map(|client| (*client).to_string())
+            .collect(),
+        notify_suppressed: true,
+        fallback_interval_ms: INVALIDATION_DROPOUT_FALLBACK_INTERVAL_MS,
+        stale_window_ms: INVALIDATION_DROPOUT_STALE_WINDOW_MS,
+        stale_window_observed,
+        delete_stale_window_observed,
+        fallback_resumed: true,
+        final_observer_path: target_path,
+        final_observer_checksum_sha256: bytes_sha256(&final_payload),
+        final_validation_result: "mounted_tree_convergence".to_string(),
+    };
+    write_invalidation_dropout_diagnostics(context, &summary)?;
+    Ok((operations, summary))
+}
+
+fn advanced_client_by_name<'a>(
+    clients: &'a [ClientSpec],
+    name: &str,
+) -> Result<&'a ClientSpec, ScenarioError> {
+    clients
+        .iter()
+        .find(|client| client.name == name)
+        .ok_or_else(|| ScenarioError::Io(io::Error::other(format!("missing client {name}"))))
+}
+
+fn write_mounted_file_with_readback(
+    path: PathBuf,
+    payload: &[u8],
+    label: &str,
+    create_new: bool,
+) -> Result<(), ScenarioError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut options = mounted_write_barrier_open_options();
+    options.create(true).truncate(true);
+    if create_new {
+        options.create_new(true);
+    }
+    let mut file = options.open(&path)?;
+    file.write_all(payload)?;
+    file.sync_all()?;
+    drop(file);
+    let readback = wait_for_mounted_payload_readback(
+        &path,
+        payload,
+        MOUNTED_WRITE_READBACK_TIMEOUT,
+        MOUNTED_WRITE_READBACK_POLL_INTERVAL,
+    )?;
+    if readback != payload {
+        return Err(ScenarioError::Io(io::Error::other(format!(
+            "{label} write readback mismatch for {}: expected {} bytes, read {} bytes",
+            path.display(),
+            payload.len(),
+            readback.len()
+        ))));
+    }
+    Ok(())
+}
+
+fn remove_mounted_file(path: PathBuf) -> Result<(), ScenarioError> {
+    fs::remove_file(path)?;
+    Ok(())
+}
+
+fn wait_for_invalidation_fallback_resume(
+    clients: &[ClientSpec],
+    target_path: &str,
+    final_payload: &[u8],
+    delete_path: &str,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> Result<(), ScenarioError> {
+    let deadline = Instant::now() + timeout;
+    wait_for_mounted_initial_payloads_until(
+        clients,
+        &[(target_path, final_payload)],
+        deadline,
+        poll_interval,
+        "invalidation dropout fallback payload sync",
+    )?;
+    wait_for_mounted_paths_absent_until(
+        clients,
+        &[delete_path],
+        deadline,
+        poll_interval,
+        "invalidation dropout fallback delete sync",
+    )
+}
+
+fn assert_observer_stays_stale_for_window(
+    observer: &ClientSpec,
+    relative_path: &str,
+    final_payload: &[u8],
+    stale_window: Duration,
+    poll_interval: Duration,
+) -> Result<(), ScenarioError> {
+    let deadline = Instant::now() + stale_window;
+    loop {
+        if observer_sees_payload(observer, relative_path, final_payload)? {
+            return Err(ScenarioError::Io(io::Error::other(format!(
+                "{} observed final payload for {relative_path} before the {} ms stale window elapsed",
+                observer.name,
+                stale_window.as_millis()
+            ))));
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(());
+        }
+        thread::sleep(poll_interval.min(deadline.saturating_duration_since(now)));
+    }
+}
+
+fn assert_observer_keeps_payload_for_window(
+    observer: &ClientSpec,
+    relative_path: &str,
+    expected_payload: &[u8],
+    stale_window: Duration,
+    poll_interval: Duration,
+) -> Result<(), ScenarioError> {
+    let deadline = Instant::now() + stale_window;
+    loop {
+        if !observer_sees_payload(observer, relative_path, expected_payload)? {
+            return Err(ScenarioError::Io(io::Error::other(format!(
+                "{} stopped seeing stale payload for {relative_path} before the {} ms stale window elapsed",
+                observer.name,
+                stale_window.as_millis()
+            ))));
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(());
+        }
+        thread::sleep(poll_interval.min(deadline.saturating_duration_since(now)));
+    }
+}
+
+fn observer_sees_payload(
+    observer: &ClientSpec,
+    relative_path: &str,
+    expected_payload: &[u8],
+) -> Result<bool, ScenarioError> {
+    let _ = refresh_relative_path_parent_contains_child(&observer.mount_point, relative_path);
+    match fs::read(observer.mount_point.join(relative_path)) {
+        Ok(payload) => Ok(payload == expected_payload),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn sparse_expected_range_specs(
@@ -6089,6 +6605,30 @@ fn planned_catchup_summary() -> CatchupSummary {
     }
 }
 
+fn planned_invalidation_dropout_summary() -> InvalidationDropoutSummary {
+    let root = AdvancedMountedKind::InvalidationDropoutFallback.path_root();
+    let target_path = format!("{root}/{INVALIDATION_DROPOUT_TARGET_FILE}");
+    let final_payload =
+        format!("planned invalidation dropout\npath={target_path}\nbody=fallback final\n")
+            .into_bytes();
+    InvalidationDropoutSummary {
+        observer_client: INVALIDATION_DROPOUT_OBSERVER_CLIENT.to_string(),
+        writer_clients: INVALIDATION_DROPOUT_WRITER_CLIENTS
+            .iter()
+            .map(|client| (*client).to_string())
+            .collect(),
+        notify_suppressed: true,
+        fallback_interval_ms: INVALIDATION_DROPOUT_FALLBACK_INTERVAL_MS,
+        stale_window_ms: INVALIDATION_DROPOUT_STALE_WINDOW_MS,
+        stale_window_observed: true,
+        delete_stale_window_observed: true,
+        fallback_resumed: true,
+        final_observer_path: target_path,
+        final_observer_checksum_sha256: bytes_sha256(&final_payload),
+        final_validation_result: "mounted_tree_convergence".to_string(),
+    }
+}
+
 fn write_planned_cold_observer_diagnostics(context: &ScenarioContext) -> Result<(), ScenarioError> {
     fs::write(
         context.scenario_dir.join("cold-observer-diagnostics.json"),
@@ -6106,6 +6646,13 @@ fn write_planned_catchup_diagnostics(context: &ScenarioContext) -> Result<(), Sc
     write_catchup_diagnostics(context, &planned_catchup_summary())
 }
 
+fn write_planned_invalidation_dropout_diagnostics(
+    context: &ScenarioContext,
+    summary: &InvalidationDropoutSummary,
+) -> Result<(), ScenarioError> {
+    write_invalidation_dropout_diagnostics(context, summary)
+}
+
 fn write_catchup_diagnostics(
     context: &ScenarioContext,
     catchup: &CatchupSummary,
@@ -6119,6 +6666,31 @@ fn write_catchup_diagnostics(
             "stale_remount_after_history": catchup.stale_remount_after_history,
             "cold_discover_after_history": catchup.cold_discover_after_history,
             "final_validation_result": catchup.final_validation_result,
+        }))?,
+    )?;
+    Ok(())
+}
+
+fn write_invalidation_dropout_diagnostics(
+    context: &ScenarioContext,
+    summary: &InvalidationDropoutSummary,
+) -> Result<(), ScenarioError> {
+    fs::write(
+        context
+            .scenario_dir
+            .join("invalidation-fallback-diagnostics.json"),
+        serde_json::to_vec_pretty(&json!({
+            "observer_client": summary.observer_client,
+            "writer_clients": summary.writer_clients,
+            "notify_suppressed": summary.notify_suppressed,
+            "fallback_interval_ms": summary.fallback_interval_ms,
+            "stale_window_ms": summary.stale_window_ms,
+            "stale_window_observed": summary.stale_window_observed,
+            "delete_stale_window_observed": summary.delete_stale_window_observed,
+            "fallback_resumed": summary.fallback_resumed,
+            "final_observer_path": summary.final_observer_path,
+            "final_observer_checksum_sha256": summary.final_observer_checksum_sha256,
+            "final_validation_result": summary.final_validation_result,
         }))?,
     )?;
     Ok(())
@@ -7672,6 +8244,7 @@ mod tests {
                 checksum_mismatches: Vec::new(),
             }),
             catchup: Some(planned_catchup_summary()),
+            invalidation_dropout: None,
         };
         std::fs::write(
             scenario_dir.join("stale-remount-cold-discover-summary.json"),
@@ -9204,6 +9777,7 @@ mod tests {
             mount_exit_timeout: Duration::from_secs(1),
             poll_interval: Duration::from_millis(10),
             mount_points: Vec::new(),
+            client_env_overrides: std::collections::BTreeMap::new(),
         }
     }
 }

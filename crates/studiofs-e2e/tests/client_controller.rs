@@ -127,6 +127,60 @@ fn controller_can_discover_and_mount_late_observer_after_warm_clients() {
 }
 
 #[test]
+fn mount_env_overrides_are_scoped_to_the_named_client() {
+    let temp = tempdir().unwrap();
+    let executor = RecordingExecutor::new();
+    let calls = Rc::clone(&executor.calls);
+    let mut controller = MultiClientController::new(test_config(temp.path()), executor);
+
+    controller.create_clients(["client-a", "client-b"]).unwrap();
+    controller.init_first_client().unwrap();
+    controller.discover_additional_clients().unwrap();
+    controller
+        .set_client_env_overrides(
+            "client-b",
+            [
+                (
+                    "STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS".to_string(),
+                    "1500".to_string(),
+                ),
+                (
+                    "STUDIOFS_E2E_DISABLE_METADATA_BACKGROUND_POLL".to_string(),
+                    "1".to_string(),
+                ),
+            ],
+        )
+        .unwrap();
+    controller.mount_all().unwrap();
+
+    let calls = calls.borrow();
+    let mount_a = calls
+        .iter()
+        .find(|call| call.action == "mount" && call.client == "client-a")
+        .unwrap();
+    let mount_b = calls
+        .iter()
+        .find(|call| call.action == "mount" && call.client == "client-b")
+        .unwrap();
+
+    assert!(mount_a.env.iter().any(|(key, value)| {
+        key == "STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS" && value == "250"
+    }));
+    assert!(
+        !mount_a
+            .env
+            .iter()
+            .any(|(key, _)| key == "STUDIOFS_E2E_DISABLE_METADATA_BACKGROUND_POLL")
+    );
+    assert!(mount_b.env.iter().any(|(key, value)| {
+        key == "STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS" && value == "1500"
+    }));
+    assert!(mount_b.env.iter().any(|(key, value)| {
+        key == "STUDIOFS_E2E_DISABLE_METADATA_BACKGROUND_POLL" && value == "1"
+    }));
+}
+
+#[test]
 fn bootstrap_workflow_initializes_one_volume_and_discovers_isolated_clients() {
     let temp = tempdir().unwrap();
     let executor = RecordingExecutor {
@@ -929,6 +983,7 @@ fn test_config(root: &Path) -> ClientControllerConfig {
         mount_exit_timeout: Duration::from_secs(15),
         poll_interval: Duration::from_millis(20),
         mount_points: Vec::new(),
+        client_env_overrides: std::collections::BTreeMap::new(),
     }
 }
 
