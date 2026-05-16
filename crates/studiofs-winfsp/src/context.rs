@@ -222,7 +222,6 @@ fn open_flags_from_access(granted_access: FILE_ACCESS_RIGHTS, _create_options: u
 const FILE_WRITE_THROUGH_CREATE_OPTION: u32 = 0x0000_0002;
 const FILE_NO_INTERMEDIATE_BUFFERING_CREATE_OPTION: u32 = 0x0000_0008;
 const CREATE_DISPOSITION_SHIFT: u32 = 24;
-const FILE_OPEN_IF_DISPOSITION: u32 = 3;
 const FILE_OVERWRITE_DISPOSITION: u32 = 4;
 const FILE_OVERWRITE_IF_DISPOSITION: u32 = 5;
 
@@ -232,19 +231,11 @@ fn create_disposition_from_create_options(create_options: u32) -> u32 {
 
 fn should_truncate_existing_file_on_open(create_options: u32, open_flags: OpenFlags) -> bool {
     let disposition = create_disposition_from_create_options(create_options);
-    if matches!(
-        disposition,
-        FILE_OVERWRITE_DISPOSITION | FILE_OVERWRITE_IF_DISPOSITION
-    ) {
-        return true;
-    }
-
-    // Rust `OpenOptions::create(true).truncate(true)` on the WinFSP mounted
-    // path has been observed as FILE_OPEN_IF plus write-through, without a
-    // separate overwrite callback.
-    disposition == FILE_OPEN_IF_DISPOSITION
-        && (create_options & FILE_WRITE_THROUGH_CREATE_OPTION) != 0
-        && (open_flags.contains(OpenFlags::WRONLY) || open_flags.contains(OpenFlags::RDWR))
+    open_flags.bits() != OpenFlags::RDONLY.bits()
+        && matches!(
+            disposition,
+            FILE_OVERWRITE_DISPOSITION | FILE_OVERWRITE_IF_DISPOSITION
+        )
 }
 
 fn current_winfsp_create_options(callback_create_options: u32) -> u32 {
@@ -359,7 +350,7 @@ fn resolve_file_size_callback_action(
     new_size: u64,
     set_allocation_size: bool,
 ) -> FileSizeCallbackAction {
-    if set_allocation_size {
+    if set_allocation_size && new_size != 0 {
         FileSizeCallbackAction::KeepLogicalSize
     } else {
         FileSizeCallbackAction::SetLogicalSize(new_size)
@@ -1541,9 +1532,11 @@ impl FileSystemContext for StudioFsContext {
         set_allocation_size: bool,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
-        // WinFSP can call this with set_allocation_size=true to reserve capacity
-        // without changing logical EOF. We don't track allocation size separately,
-        // so treat allocation-size updates as a no-op for file length.
+        // WinFSP can call this with set_allocation_size=true to reserve
+        // capacity without changing logical EOF. Rust's Windows stdlib also
+        // uses a zero allocation-size request as the first truncation step for
+        // OpenOptions::create(true).truncate(true); honor that zero-EOF
+        // transition so stale tail bytes are not exposed.
         self.execute_file_size_callback(
             context.fh,
             context.ino,
@@ -2132,14 +2125,6 @@ mod tests {
             0x0500_0000,
             OpenFlags::WRONLY
         ));
-        assert!(should_truncate_existing_file_on_open(
-            0x0300_0062,
-            OpenFlags::WRONLY
-        ));
-        assert!(should_truncate_existing_file_on_open(
-            0x0300_0062,
-            OpenFlags::RDWR
-        ));
         assert!(!should_truncate_existing_file_on_open(
             0x0000_0000,
             OpenFlags::WRONLY
@@ -2151,6 +2136,14 @@ mod tests {
         assert!(!should_truncate_existing_file_on_open(
             0x0300_0000,
             OpenFlags::WRONLY
+        ));
+        assert!(!should_truncate_existing_file_on_open(
+            0x0300_0062,
+            OpenFlags::WRONLY
+        ));
+        assert!(!should_truncate_existing_file_on_open(
+            0x0300_0062,
+            OpenFlags::RDWR
         ));
     }
 
@@ -2176,7 +2169,7 @@ mod tests {
         let handle = <StudioFsContext as FileSystemContext>::open(
             &ctx,
             file_name.as_ucstr(),
-            0x0300_0062,
+            0x0500_0000,
             FILE_GENERIC_WRITE_ACCESS,
             &mut file_info,
         )
@@ -2206,6 +2199,57 @@ mod tests {
         ctx.spawn_wait({
             let vfs = vfs.clone();
             async move { vfs.release_fh(handle.fh).await }
+        })
+        .expect("release handle");
+    }
+
+    #[test]
+    fn winfsp_zero_allocation_size_truncates_existing_file_before_write() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("zero-allocation-truncates");
+        let attr = vfs
+            .create(ROOT_INO, b"zero-allocation.txt", 0, 0, 0o644)
+            .expect("create existing file");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open existing file");
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.write(attr.ino, 0, b"old-payload-tail").await }
+        })
+        .expect("seed existing contents");
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.flush(attr.ino).await }
+        })
+        .expect("flush existing contents");
+
+        let handle = StudioFileHandle::new(attr.ino, false, fh, OpenFlags::RDWR);
+        let mut file_info = winfsp::filesystem::FileInfo::default();
+        <StudioFsContext as FileSystemContext>::set_file_size(
+            &ctx,
+            &handle,
+            0,
+            true,
+            &mut file_info,
+        )
+        .expect("zero allocation-size request should truncate logical EOF");
+
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.write(attr.ino, 0, b"new").await }
+        })
+        .expect("write shorter replacement");
+        let readback = ctx
+            .spawn_wait({
+                let vfs = vfs.clone();
+                async move { vfs.read(attr.ino, 0, 32).await }
+            })
+            .expect("read replacement");
+        assert_eq!(readback.as_ref(), b"new");
+
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.release_fh(fh).await }
         })
         .expect("release handle");
     }
@@ -2241,6 +2285,10 @@ mod tests {
         assert_eq!(
             resolve_file_size_callback_action(123, true),
             FileSizeCallbackAction::KeepLogicalSize
+        );
+        assert_eq!(
+            resolve_file_size_callback_action(0, true),
+            FileSizeCallbackAction::SetLogicalSize(0)
         );
         assert_eq!(
             resolve_file_size_callback_action(456, false),
