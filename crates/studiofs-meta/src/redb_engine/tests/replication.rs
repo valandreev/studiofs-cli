@@ -998,6 +998,74 @@ fn reconcile_regular_file_serving_from_base_resets_stale_ready_attr() {
 }
 
 #[test]
+fn reconcile_regular_file_serving_from_base_removes_stale_namespace_alias() {
+    let engine = temp_engine();
+    let ino = 95_001;
+    let mut attr = InodeAttr::new_file(ino, ROOT_INO, 1000, 1000, 0o644);
+    attr.size = 39;
+    attr.committed_size = 39;
+    attr.content_epoch = 1;
+    attr.committed_content_epoch = 1;
+    attr.upload_state = UploadState::Ready;
+    let entry = DirEntryValue {
+        ino,
+        kind: FileType::RegularFile,
+    };
+
+    engine
+        .apply_replica_events_to_base(&[
+            MetaEvent::SetAttr { attr: attr.clone() },
+            MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: b"stale-after-delete.txt".to_vec(),
+                entry: entry.clone(),
+            },
+        ])
+        .unwrap();
+    engine
+        .apply_replica_serving_state(&[
+            MetaEvent::SetAttr { attr: attr.clone() },
+            MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: b"stale-after-delete.txt".to_vec(),
+                entry,
+            },
+        ])
+        .unwrap();
+    assert!(engine.lookup(ROOT_INO, b"stale-after-delete.txt").is_ok());
+
+    engine
+        .apply_replica_events_to_base(&[
+            MetaEvent::RemoveEntry {
+                parent: ROOT_INO,
+                name: b"stale-after-delete.txt".to_vec(),
+            },
+            MetaEvent::SetAttr { attr: attr.clone() },
+        ])
+        .unwrap();
+
+    assert!(
+        engine.lookup(ROOT_INO, b"stale-after-delete.txt").is_ok(),
+        "setup should reproduce a serving dentry that outlived the base namespace"
+    );
+    assert!(
+        engine
+            .reconcile_regular_file_serving_from_base(&HashSet::from([ino]))
+            .unwrap(),
+        "regular file serving reconciliation should notice the stale namespace alias"
+    );
+    assert!(
+        engine.lookup(ROOT_INO, b"stale-after-delete.txt").is_err(),
+        "stale serving dentries must follow the base namespace after local overlay clears"
+    );
+    assert_eq!(
+        engine.get_attr(ino).unwrap().size,
+        39,
+        "the payload/attr may remain addressable by inode, but the deleted path must not"
+    );
+}
+
+#[test]
 fn protected_base_publish_merges_disjoint_remote_ranges_without_losing_newer_local_ranges() {
     let engine = temp_engine();
     let file = engine

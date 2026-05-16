@@ -1003,6 +1003,13 @@ impl RedbMetaEngine {
             match base_attr {
                 Some(attr) if attr.kind == FileType::RegularFile => {
                     Self::set_inode_mirror_in_txn(&txn, &attr)?;
+                    Self::remove_stale_dentries_for_base_entry(
+                        &txn,
+                        &DirEntryValue {
+                            ino: *ino,
+                            kind: attr.kind,
+                        },
+                    )?;
                     if attr.upload_state == UploadState::Ready
                         && attr.content_epoch == attr.committed_content_epoch
                         && attr.size == attr.committed_size
@@ -1013,6 +1020,7 @@ impl RedbMetaEngine {
                 }
                 Some(_) => {}
                 None => {
+                    Self::remove_dentry_mirrors_for_inode_in_txn(&txn, *ino)?;
                     Self::remove_inode_mirror_in_txn(&txn, *ino)?;
                     Self::clear_regular_file_serving_overlay_in_txn(&txn, *ino)?;
                     changed = true;
