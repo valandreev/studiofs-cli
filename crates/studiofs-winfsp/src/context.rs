@@ -218,6 +218,45 @@ fn open_flags_from_access(granted_access: FILE_ACCESS_RIGHTS, _create_options: u
 
 const FILE_WRITE_THROUGH_CREATE_OPTION: u32 = 0x0000_0002;
 const FILE_NO_INTERMEDIATE_BUFFERING_CREATE_OPTION: u32 = 0x0000_0008;
+const CREATE_DISPOSITION_SHIFT: u32 = 24;
+const FILE_OPEN_IF_DISPOSITION: u32 = 3;
+const FILE_OVERWRITE_DISPOSITION: u32 = 4;
+const FILE_OVERWRITE_IF_DISPOSITION: u32 = 5;
+
+fn create_disposition_from_create_options(create_options: u32) -> u32 {
+    create_options >> CREATE_DISPOSITION_SHIFT
+}
+
+fn should_truncate_existing_file_on_open(create_options: u32, open_flags: OpenFlags) -> bool {
+    let disposition = create_disposition_from_create_options(create_options);
+    if matches!(
+        disposition,
+        FILE_OVERWRITE_DISPOSITION | FILE_OVERWRITE_IF_DISPOSITION
+    ) {
+        return true;
+    }
+
+    // Rust `OpenOptions::create(true).truncate(true)` on the WinFSP mounted
+    // path has been observed as FILE_OPEN_IF plus write-through, without a
+    // separate overwrite callback.
+    disposition == FILE_OPEN_IF_DISPOSITION
+        && (create_options & FILE_WRITE_THROUGH_CREATE_OPTION) != 0
+        && open_flags.contains(OpenFlags::WRONLY)
+}
+
+fn current_winfsp_create_options(callback_create_options: u32) -> u32 {
+    // SAFETY: WinFSP exposes the current request only while a callback is
+    // running on a dispatcher thread. Outside that context, or in unit tests,
+    // this falls back to the callback argument.
+    unsafe {
+        let operation_context = FspFileSystemGetOperationContext();
+        if operation_context.is_null() || (*operation_context).Request.is_null() {
+            return callback_create_options;
+        }
+
+        (*(*operation_context).Request).Req.Create.CreateOptions
+    }
+}
 
 fn write_local_sync_policy_from_create_options(create_options: u32) -> LocalSyncPolicy {
     if (create_options
@@ -869,6 +908,7 @@ impl StudioFsContext {
         &self,
         attr: &InodeAttr,
         open_flags: OpenFlags,
+        trunc: bool,
         write_local_sync_policy: LocalSyncPolicy,
     ) -> winfsp::Result<StudioFileHandle> {
         let is_dir = attr.kind == FileType::Directory;
@@ -876,7 +916,7 @@ impl StudioFsContext {
             0
         } else {
             self.vfs
-                .open_file(attr.ino, open_flags, false)
+                .open_file(attr.ino, open_flags, trunc)
                 .map_err(vfs_to_winfsp_err)?
         };
         Ok(StudioFileHandle::new_with_local_sync_policy(
@@ -948,7 +988,12 @@ impl StudioFsContext {
                 plan.write_local_sync_policy,
             ))
         } else {
-            self.open_file_handle_for_attr(&attr, plan.open_flags, plan.write_local_sync_policy)
+            self.open_file_handle_for_attr(
+                &attr,
+                plan.open_flags,
+                false,
+                plan.write_local_sync_policy,
+            )
         }
     }
 
@@ -1103,9 +1148,12 @@ impl FileSystemContext for StudioFsContext {
         }
         let attr = resolve_path(&self.vfs, file_name)?;
         let open_flags = open_flags_from_access(granted_access, create_options);
+        let raw_create_options = current_winfsp_create_options(create_options);
+        let trunc = should_truncate_existing_file_on_open(raw_create_options, open_flags);
         let write_local_sync_policy = write_local_sync_policy_from_create_options(create_options);
         Self::write_open_file_info(file_info, &attr);
-        let handle = self.open_file_handle_for_attr(&attr, open_flags, write_local_sync_policy)?;
+        let handle =
+            self.open_file_handle_for_attr(&attr, open_flags, trunc, write_local_sync_policy)?;
         let disable_os_cache = should_disable_winfsp_file_cache_for_handle(&handle);
         set_current_winfsp_open_disable_cache(disable_os_cache);
 
@@ -1114,6 +1162,9 @@ impl FileSystemContext for StudioFsContext {
             fh = handle.fh,
             is_dir = handle.is_dir,
             open_flags = open_flags.bits(),
+            create_options,
+            raw_create_options,
+            trunc,
             disable_os_cache,
             "open"
         );
@@ -1880,8 +1931,8 @@ mod tests {
         build_notify_info, encode_symlink_reparse, hidden_non_macos_root_path_component,
         ino_to_windows_path, maybe_hide_non_macos_root_entry, notify_filter_for_kind,
         open_flags_from_access, resolve_create_callback_kind, resolve_file_size_callback_action,
-        should_disable_winfsp_file_cache, unix_nanos_to_filetime, vfs_to_winfsp_err,
-        write_local_sync_policy_from_create_options,
+        should_disable_winfsp_file_cache, should_truncate_existing_file_on_open,
+        unix_nanos_to_filetime, vfs_to_winfsp_err, write_local_sync_policy_from_create_options,
     };
     use parking_lot::Mutex;
     use std::collections::BTreeSet;
@@ -2061,6 +2112,94 @@ mod tests {
         assert!(should_disable_winfsp_file_cache(false, OpenFlags::RDWR));
         assert!(!should_disable_winfsp_file_cache(true, OpenFlags::WRONLY));
         assert!(!should_disable_winfsp_file_cache(true, OpenFlags::RDWR));
+    }
+
+    #[test]
+    fn winfsp_create_disposition_identifies_truncate_on_existing_open() {
+        assert!(should_truncate_existing_file_on_open(
+            0x0400_0000,
+            OpenFlags::WRONLY
+        ));
+        assert!(should_truncate_existing_file_on_open(
+            0x0500_0000,
+            OpenFlags::WRONLY
+        ));
+        assert!(should_truncate_existing_file_on_open(
+            0x0300_0062,
+            OpenFlags::WRONLY
+        ));
+        assert!(!should_truncate_existing_file_on_open(
+            0x0000_0000,
+            OpenFlags::WRONLY
+        ));
+        assert!(!should_truncate_existing_file_on_open(
+            0x0100_0000,
+            OpenFlags::WRONLY
+        ));
+        assert!(!should_truncate_existing_file_on_open(
+            0x0300_0000,
+            OpenFlags::WRONLY
+        ));
+        assert!(!should_truncate_existing_file_on_open(
+            0x0300_0062,
+            OpenFlags::RDWR
+        ));
+    }
+
+    #[test]
+    fn winfsp_open_overwrite_disposition_truncates_existing_file_before_write() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("open-overwrite-truncates");
+        let attr = vfs
+            .create(ROOT_INO, b"open-overwrite.txt", 0, 0, 0o644)
+            .expect("create existing file");
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.write(attr.ino, 0, b"old-payload-tail").await }
+        })
+        .expect("seed existing contents");
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.flush(attr.ino).await }
+        })
+        .expect("flush existing contents");
+
+        let file_name = U16CString::from_str(r"\open-overwrite.txt").expect("u16 path");
+        let mut file_info = empty_open_file_info();
+        let handle = <StudioFsContext as FileSystemContext>::open(
+            &ctx,
+            file_name.as_ucstr(),
+            0x0300_0062,
+            FILE_GENERIC_WRITE_ACCESS,
+            &mut file_info,
+        )
+        .expect("open existing file with FILE_OVERWRITE disposition");
+
+        assert_eq!(
+            vfs.getattr(attr.ino)
+                .expect("attr after overwrite open")
+                .size,
+            0,
+            "FILE_OVERWRITE open should synchronously truncate the logical EOF"
+        );
+
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.write(attr.ino, 0, b"new").await }
+        })
+        .expect("write shorter replacement");
+        let readback = ctx
+            .spawn_wait({
+                let vfs = vfs.clone();
+                async move { vfs.read(attr.ino, 0, 32).await }
+            })
+            .expect("read replacement");
+        assert_eq!(readback.as_ref(), b"new");
+
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.release_fh(handle.fh).await }
+        })
+        .expect("release handle");
     }
 
     #[test]
