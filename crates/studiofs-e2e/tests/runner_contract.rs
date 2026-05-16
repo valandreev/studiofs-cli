@@ -87,6 +87,15 @@ fn cli_parses_local_first_baseline_gate() {
 }
 
 #[test]
+fn list_scenario_line_omits_slug_name() {
+    let scenarios = studiofs_e2e::scenario::available_scenarios();
+    let line = studiofs_e2e::cli::format_scenario_list_line(0, &scenarios[0]);
+
+    assert_eq!(line, "1\tmounted multi-client smoke scenario");
+    assert!(!line.contains("basic-multi-client-smoke"));
+}
+
+#[test]
 fn run_scenario_selection_expands_numeric_ranges() {
     let cli = Cli::try_parse_from(["studiofs-e2e", "run", "--scenario", "1-3"]).unwrap();
     let Commands::Run(args) = cli.command else {
