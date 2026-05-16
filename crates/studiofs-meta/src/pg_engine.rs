@@ -2632,14 +2632,8 @@ impl PgMetaEngine {
             if self.local.has_local_regular_file_overlay(ino)? {
                 overlay.attr_inodes.insert(ino);
                 overlay.block_inodes.insert(ino);
-                if let MetaEvent::RemoveEntry { parent, name } = event {
-                    overlay.dentry_keys.insert(Self::dentry_key(*parent, name));
-                }
             } else if self.local_regular_file_state_needs_foreign_protection(ino)? {
                 overlay.attr_inodes.insert(ino);
-                if let MetaEvent::RemoveEntry { parent, name } = event {
-                    overlay.dentry_keys.insert(Self::dentry_key(*parent, name));
-                }
             }
         }
         Ok(overlay)
@@ -5898,6 +5892,73 @@ mod tests {
         assert!(pg.lookup(ROOT_INO, b"file.txt").is_err());
         assert!(pg.lookup(ROOT_INO, b"renamed.txt").is_err());
         assert!(pg.get_attr(file.ino).is_err());
+    }
+
+    #[test]
+    fn foreign_unlink_during_local_append_removes_serving_dentry() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+
+        let file = create_published_small_file(&pg, ROOT_INO, b"append-target.txt", 77_011);
+        let setup_end = pg.local.get_counter("nextEventSeq").expect("setup end");
+        pg.persist_flushed_event_seq(setup_end)
+            .expect("ack published setup");
+
+        set_file_state(&pg, file.ino, 64 + u64::from(DEFAULT_BLOCK_SIZE), 2);
+        let local_tail = PayloadRef::new_partial(77_012, DEFAULT_BLOCK_SIZE);
+        pg.stage_payload_slice(file.ino, 1, &local_tail)
+            .expect("stage local append overlay");
+        let local_append_start = pg.flushed_event_seq.load(Ordering::SeqCst);
+        let overlay = pg.local_overlay_conflicts().expect("overlay conflicts");
+        assert!(overlay.block_inodes.contains(&file.ino));
+        assert!(pg.lookup(ROOT_INO, b"append-target.txt").is_ok());
+
+        pg.apply_foreign_batch(
+            &[
+                MetaEvent::RemoveEntry {
+                    parent: ROOT_INO,
+                    name: b"append-target.txt".to_vec(),
+                },
+                MetaEvent::RemoveAttr { ino: file.ino },
+            ],
+            &overlay,
+            &HashSet::new(),
+        )
+        .expect("apply foreign unlink");
+
+        assert!(
+            matches!(
+                pg.lookup(ROOT_INO, b"append-target.txt"),
+                Err(MetaError::EntryNotFound { .. })
+            ),
+            "foreign unlink must remove namespace visibility even when local append state is preserved"
+        );
+        assert!(
+            pg.get_attr(file.ino).is_ok(),
+            "accepted local payload state may remain observable by inode"
+        );
+
+        mark_overlay_objects_uploaded(&pg, file.ino, 2, &[local_tail.object_id]);
+        assert!(
+            pg.publish_regular_file_overlay_to_base_if_matches(file.ino, 2)
+                .expect("publish local append"),
+            "local append publish should still succeed by inode"
+        );
+        let local_append_end = pg.local.get_counter("nextEventSeq").expect("event end");
+        let local_events = pg
+            .local
+            .read_events_range(local_append_start, local_append_end)
+            .expect("read local append events");
+        let projected_self_batch = PgMetaEngine::project_remote_events(&local_events);
+        pg.acknowledge_local_prefix_from_self_batch(&projected_self_batch)
+            .expect("ack local append self batch");
+
+        assert!(
+            matches!(
+                pg.lookup(ROOT_INO, b"append-target.txt"),
+                Err(MetaError::EntryNotFound { .. })
+            ),
+            "self-ack of the local append must not resurrect the deleted path"
+        );
     }
 
     #[test]
