@@ -6,7 +6,7 @@ use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Barrier, LazyLock,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     mpsc,
 };
 use std::thread;
@@ -101,6 +101,8 @@ const ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(90);
 const ADVANCED_MOUNTED_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const MOUNTED_WRITE_READBACK_TIMEOUT: Duration = Duration::from_secs(5);
 const MOUNTED_WRITE_READBACK_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const MOUNTED_VALIDATION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const MOUNTED_VALIDATION_MAX_ACTIVE_PROBES: usize = 1;
 const HOTSPOT_CHURN_OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
 const HOTSPOT_IO_MAX_ACTIVE_WORKERS: usize = 1;
 static HOTSPOT_IO_ACTIVE_WORKERS: LazyLock<Arc<AtomicUsize>> =
@@ -5081,10 +5083,21 @@ fn wait_for_mounted_initial_payloads_until(
     poll_interval: Duration,
     label: &str,
 ) -> Result<(), ScenarioError> {
+    let probe_limiter = MountedProbeLimiter::new(MOUNTED_VALIDATION_MAX_ACTIVE_PROBES);
     loop {
-        let last_missing = missing_mounted_initial_payloads(clients, required_payloads);
+        let last_missing =
+            missing_mounted_initial_payloads(clients, required_payloads, &probe_limiter);
         if last_missing.is_empty() {
             return Ok(());
+        }
+        if probe_limiter.is_poisoned() {
+            return Err(ScenarioError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "{label} mounted validation probe timed out; missing: {}",
+                    last_missing.join(", ")
+                ),
+            )));
         }
 
         let now = Instant::now();
@@ -5108,10 +5121,20 @@ fn wait_for_mounted_paths_absent_until(
     poll_interval: Duration,
     label: &str,
 ) -> Result<(), ScenarioError> {
+    let probe_limiter = MountedProbeLimiter::new(MOUNTED_VALIDATION_MAX_ACTIVE_PROBES);
     loop {
-        let present = present_mounted_paths(clients, absent_paths);
+        let present = present_mounted_paths(clients, absent_paths, &probe_limiter);
         if present.is_empty() {
             return Ok(());
+        }
+        if probe_limiter.is_poisoned() {
+            return Err(ScenarioError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "{label} mounted validation probe timed out; still present: {}",
+                    present.join(", ")
+                ),
+            )));
         }
 
         let now = Instant::now();
@@ -5128,51 +5151,245 @@ fn wait_for_mounted_paths_absent_until(
     }
 }
 
-fn present_mounted_paths(clients: &[ClientSpec], absent_paths: &[&str]) -> Vec<String> {
+fn present_mounted_paths(
+    clients: &[ClientSpec],
+    absent_paths: &[&str],
+    probe_limiter: &MountedProbeLimiter,
+) -> Vec<String> {
     let mut present = Vec::new();
     for client in clients {
         for relative_path in absent_paths {
-            let _ = refresh_relative_path_parent_contains_child(&client.mount_point, relative_path);
-            match fs::metadata(client.mount_point.join(relative_path)) {
-                Ok(_) => present.push(format!("{}:{relative_path}", client.name)),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => present.push(format!("{}:{relative_path} ({error})", client.name)),
+            let client = client.clone();
+            let relative_path = (*relative_path).to_string();
+            let client_name = client.name.clone();
+            let timeout_path = relative_path.clone();
+            match run_mounted_probe_with_timeout(
+                probe_limiter,
+                MOUNTED_VALIDATION_PROBE_TIMEOUT,
+                move || present_mounted_path_probe(client, relative_path),
+            ) {
+                Ok(Some(present_path)) => present.push(present_path),
+                Ok(None) => {}
+                Err(error) => present.push(format!(
+                    "{}:{} ({})",
+                    client_name,
+                    timeout_path,
+                    error.detail()
+                )),
             }
         }
     }
     present
 }
 
+fn present_mounted_path_probe(client: ClientSpec, relative_path: String) -> Option<String> {
+    let _ = refresh_relative_path_parent_contains_child(&client.mount_point, &relative_path);
+    match fs::metadata(client.mount_point.join(&relative_path)) {
+        Ok(_) => Some(format!("{}:{relative_path}", client.name)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => Some(format!("{}:{relative_path} ({error})", client.name)),
+    }
+}
+
 fn missing_mounted_initial_payloads(
     clients: &[ClientSpec],
     required_payloads: &[(&str, &[u8])],
+    probe_limiter: &MountedProbeLimiter,
 ) -> Vec<String> {
+    missing_mounted_initial_payloads_with_probe(
+        clients,
+        required_payloads,
+        probe_limiter,
+        MOUNTED_VALIDATION_PROBE_TIMEOUT,
+        mounted_initial_payload_probe,
+    )
+}
+
+fn missing_mounted_initial_payloads_with_probe<F>(
+    clients: &[ClientSpec],
+    required_payloads: &[(&str, &[u8])],
+    probe_limiter: &MountedProbeLimiter,
+    probe_timeout: Duration,
+    probe: F,
+) -> Vec<String>
+where
+    F: Fn(ClientSpec, String, Vec<u8>) -> MountedPayloadProbeStatus + Copy + Send + 'static,
+{
     let mut missing = Vec::new();
     for client in clients {
         for (relative_path, expected_payload) in required_payloads {
-            let path = client.mount_point.join(relative_path);
-            if !refresh_relative_path_parent_contains_child(&client.mount_point, relative_path) {
-                missing.push(format!("{}:{relative_path}", client.name));
-                continue;
-            }
-            match fs::read(&path) {
-                Ok(payload) if payload == *expected_payload => {}
-                Ok(payload) => missing.push(format!(
-                    "{}:{relative_path} (expected {} bytes, read {} bytes)",
-                    client.name,
-                    expected_payload.len(),
-                    payload.len()
-                )),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    missing.push(format!("{}:{relative_path}", client.name));
-                }
+            let client = client.clone();
+            let client_name = client.name.clone();
+            let relative_path = (*relative_path).to_string();
+            let expected_payload = expected_payload.to_vec();
+            let timeout_path = relative_path.clone();
+            match run_mounted_probe_with_timeout(probe_limiter, probe_timeout, move || {
+                probe(client, relative_path, expected_payload)
+            }) {
+                Ok(MountedPayloadProbeStatus::Present) => {}
+                Ok(MountedPayloadProbeStatus::Missing(path)) => missing.push(path),
                 Err(error) => {
-                    missing.push(format!("{}:{relative_path} ({error})", client.name));
+                    missing.push(format!("{client_name}:{timeout_path} ({})", error.detail()));
                 }
             }
         }
     }
     missing
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MountedPayloadProbeStatus {
+    Present,
+    Missing(String),
+}
+
+fn mounted_initial_payload_probe(
+    client: ClientSpec,
+    relative_path: String,
+    expected_payload: Vec<u8>,
+) -> MountedPayloadProbeStatus {
+    let path = client.mount_point.join(&relative_path);
+    if !refresh_relative_path_parent_contains_child(&client.mount_point, &relative_path) {
+        return MountedPayloadProbeStatus::Missing(format!("{}:{relative_path}", client.name));
+    }
+    match fs::read(&path) {
+        Ok(payload) if payload == expected_payload => MountedPayloadProbeStatus::Present,
+        Ok(payload) => MountedPayloadProbeStatus::Missing(format!(
+            "{}:{relative_path} (expected {} bytes, read {} bytes)",
+            client.name,
+            expected_payload.len(),
+            payload.len()
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            MountedPayloadProbeStatus::Missing(format!("{}:{relative_path}", client.name))
+        }
+        Err(error) => {
+            MountedPayloadProbeStatus::Missing(format!("{}:{relative_path} ({error})", client.name))
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MountedProbeFailure {
+    TimedOut {
+        timeout: Duration,
+    },
+    WorkerExited,
+    WorkerLimitReached {
+        active_workers: usize,
+        max_active_workers: usize,
+    },
+}
+
+impl MountedProbeFailure {
+    fn detail(self) -> String {
+        match self {
+            Self::TimedOut { timeout } => {
+                format!("probe timed out after {} ms", timeout.as_millis())
+            }
+            Self::WorkerExited => "probe worker exited without result".to_string(),
+            Self::WorkerLimitReached {
+                active_workers,
+                max_active_workers,
+            } => format!(
+                "probe skipped because a previous mounted probe timed out; active probe workers {active_workers}/{max_active_workers}"
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MountedProbeLimiter {
+    active_workers: Arc<AtomicUsize>,
+    poisoned: Arc<AtomicBool>,
+    max_active_workers: usize,
+}
+
+impl MountedProbeLimiter {
+    fn new(max_active_workers: usize) -> Self {
+        Self {
+            active_workers: Arc::new(AtomicUsize::new(0)),
+            poisoned: Arc::new(AtomicBool::new(false)),
+            max_active_workers,
+        }
+    }
+
+    fn is_poisoned(&self) -> bool {
+        self.poisoned.load(Ordering::Acquire)
+    }
+
+    fn mark_poisoned(&self) {
+        self.poisoned.store(true, Ordering::Release);
+    }
+
+    fn try_acquire(&self) -> Result<MountedProbePermit, MountedProbeFailure> {
+        if self.is_poisoned() {
+            return Err(self.worker_limit_reached());
+        }
+
+        loop {
+            let active_workers = self.active_workers.load(Ordering::Acquire);
+            if active_workers >= self.max_active_workers {
+                return Err(self.worker_limit_reached());
+            }
+            if self
+                .active_workers
+                .compare_exchange(
+                    active_workers,
+                    active_workers.saturating_add(1),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return Ok(MountedProbePermit {
+                    active_workers: Arc::clone(&self.active_workers),
+                });
+            }
+        }
+    }
+
+    fn worker_limit_reached(&self) -> MountedProbeFailure {
+        MountedProbeFailure::WorkerLimitReached {
+            active_workers: self.active_workers.load(Ordering::Acquire),
+            max_active_workers: self.max_active_workers,
+        }
+    }
+}
+
+struct MountedProbePermit {
+    active_workers: Arc<AtomicUsize>,
+}
+
+impl Drop for MountedProbePermit {
+    fn drop(&mut self) {
+        self.active_workers.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn run_mounted_probe_with_timeout<T, F>(
+    probe_limiter: &MountedProbeLimiter,
+    timeout: Duration,
+    probe: F,
+) -> Result<T, MountedProbeFailure>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let permit = probe_limiter.try_acquire()?;
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _permit = permit;
+        let _ = tx.send(probe());
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(result) => Ok(result),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            probe_limiter.mark_poisoned();
+            Err(MountedProbeFailure::TimedOut { timeout })
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(MountedProbeFailure::WorkerExited),
+    }
 }
 
 fn refresh_relative_path_parent_contains_child(mount_point: &Path, relative_path: &str) -> bool {
@@ -5247,10 +5464,20 @@ fn wait_for_required_paths_visible_until(
     poll_interval: Duration,
     label: &str,
 ) -> Result<(), ScenarioError> {
+    let probe_limiter = MountedProbeLimiter::new(MOUNTED_VALIDATION_MAX_ACTIVE_PROBES);
     loop {
-        let last_missing = missing_required_paths(clients, required_paths);
+        let last_missing = missing_required_paths(clients, required_paths, &probe_limiter);
         if last_missing.is_empty() {
             return Ok(());
+        }
+        if probe_limiter.is_poisoned() {
+            return Err(ScenarioError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "{label} mounted validation probe timed out; missing: {}",
+                    last_missing.join(", ")
+                ),
+            )));
         }
 
         let now = Instant::now();
@@ -5282,23 +5509,46 @@ fn remaining_initial_validation_timeout(
     }
 }
 
-fn missing_required_paths(clients: &[ClientSpec], required_paths: &[&str]) -> Vec<String> {
+fn missing_required_paths(
+    clients: &[ClientSpec],
+    required_paths: &[&str],
+    probe_limiter: &MountedProbeLimiter,
+) -> Vec<String> {
     let mut missing = Vec::new();
     for client in clients {
         for relative_path in required_paths {
-            let path = client.mount_point.join(relative_path);
-            match fs::metadata(&path) {
-                Ok(_) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    missing.push(format!("{}:{relative_path}", client.name));
-                }
-                Err(error) => {
-                    missing.push(format!("{}:{relative_path} ({error})", client.name));
-                }
+            let client = client.clone();
+            let relative_path = (*relative_path).to_string();
+            let client_name = client.name.clone();
+            let timeout_path = relative_path.clone();
+            match run_mounted_probe_with_timeout(
+                probe_limiter,
+                MOUNTED_VALIDATION_PROBE_TIMEOUT,
+                move || missing_required_path_probe(client, relative_path),
+            ) {
+                Ok(Some(missing_path)) => missing.push(missing_path),
+                Ok(None) => {}
+                Err(error) => missing.push(format!(
+                    "{}:{} ({})",
+                    client_name,
+                    timeout_path,
+                    error.detail()
+                )),
             }
         }
     }
     missing
+}
+
+fn missing_required_path_probe(client: ClientSpec, relative_path: String) -> Option<String> {
+    let path = client.mount_point.join(&relative_path);
+    match fs::metadata(&path) {
+        Ok(_) => None,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Some(format!("{}:{relative_path}", client.name))
+        }
+        Err(error) => Some(format!("{}:{relative_path} ({error})", client.name)),
+    }
 }
 
 struct AdvancedMountedFinishInput {
@@ -8019,6 +8269,92 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("client-b:seed/file.txt (expected 17 bytes, read 14 bytes)")
+        );
+    }
+
+    #[test]
+    fn mounted_initial_payload_probe_timeout_reports_blocked_client_without_waiting_forever() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let clients = ["client-a", "client-b"]
+            .into_iter()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(&mount).unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let required_payloads = [("seed/file.txt", b"expected payload\n".as_slice())];
+        let probe_limiter = MountedProbeLimiter::new(MOUNTED_VALIDATION_MAX_ACTIVE_PROBES);
+        let started = Instant::now();
+
+        let missing = missing_mounted_initial_payloads_with_probe(
+            &clients,
+            &required_payloads,
+            &probe_limiter,
+            Duration::from_millis(20),
+            |client, _relative_path, _expected_payload| {
+                if client.name == "client-b" {
+                    thread::sleep(Duration::from_secs(5));
+                }
+                MountedPayloadProbeStatus::Present
+            },
+        );
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "blocked mounted probe must not consume the scenario-child timeout"
+        );
+        assert_eq!(
+            missing,
+            vec!["client-b:seed/file.txt (probe timed out after 20 ms)"]
+        );
+    }
+
+    #[test]
+    fn mounted_probe_timeout_poison_skips_remaining_validation_probes() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let clients = ["client-a", "client-b"]
+            .into_iter()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(&mount).unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let required_payloads = [
+            ("seed/file-a.txt", b"expected payload\n".as_slice()),
+            ("seed/file-b.txt", b"expected payload\n".as_slice()),
+        ];
+        let probe_limiter = MountedProbeLimiter::new(MOUNTED_VALIDATION_MAX_ACTIVE_PROBES);
+        let started = Instant::now();
+
+        let missing = missing_mounted_initial_payloads_with_probe(
+            &clients,
+            &required_payloads,
+            &probe_limiter,
+            Duration::from_millis(20),
+            |client, _relative_path, _expected_payload| {
+                if client.name == "client-a" {
+                    thread::sleep(Duration::from_secs(5));
+                }
+                MountedPayloadProbeStatus::Present
+            },
+        );
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "remaining mounted probes must fail fast after the first blocked probe timeout"
+        );
+        assert_eq!(
+            missing,
+            vec![
+                "client-a:seed/file-a.txt (probe timed out after 20 ms)".to_string(),
+                "client-a:seed/file-b.txt (probe skipped because a previous mounted probe timed out; active probe workers 1/1)".to_string(),
+                "client-b:seed/file-a.txt (probe skipped because a previous mounted probe timed out; active probe workers 1/1)".to_string(),
+                "client-b:seed/file-b.txt (probe skipped because a previous mounted probe timed out; active probe workers 1/1)".to_string(),
+            ]
         );
     }
 

@@ -197,13 +197,31 @@ fn run_command(
         }
         if timeout.is_some_and(|timeout| started.elapsed() >= timeout) {
             let process_tree_error = force_kill_process_tree(child.id()).err();
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = collect_reader(stdout_reader.take());
-            let _ = collect_reader(stderr_reader.take());
-            let detail = process_tree_error
-                .map(|error| format!("; process-tree kill fallback failed: {error}"))
-                .unwrap_or_default();
+            let child_kill_error = child.kill().err();
+            let child_exit_detail = match child.try_wait() {
+                Ok(Some(_)) => None,
+                Ok(None) => Some("child still running after kill attempts".to_string()),
+                Err(error) => Some(format!(
+                    "child exit probe failed after kill attempts: {error}"
+                )),
+            };
+            discard_timed_out_reader(stdout_reader.take());
+            discard_timed_out_reader(stderr_reader.take());
+            let mut details = Vec::new();
+            if let Some(error) = process_tree_error {
+                details.push(format!("process-tree kill fallback failed: {error}"));
+            }
+            if let Some(error) = child_kill_error {
+                details.push(format!("direct child kill failed: {error}"));
+            }
+            if let Some(detail) = child_exit_detail {
+                details.push(detail);
+            }
+            let detail = if details.is_empty() {
+                String::new()
+            } else {
+                format!("; {}", details.join("; "))
+            };
             let timeout = timeout.expect("timeout checked above");
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
@@ -342,6 +360,10 @@ fn collect_reader(reader: Option<JoinHandle<io::Result<Vec<u8>>>>) -> io::Result
     reader
         .join()
         .map_err(|_| io::Error::other("command output reader thread panicked"))?
+}
+
+fn discard_timed_out_reader(reader: Option<JoinHandle<io::Result<Vec<u8>>>>) {
+    drop(reader);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1003,6 +1025,22 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "timeout-aware executor should not wait for the hung command to finish"
+        );
+    }
+
+    #[test]
+    fn timeout_cleanup_detaches_blocked_output_reader() {
+        let blocked_reader = thread::spawn(|| {
+            thread::sleep(Duration::from_secs(5));
+            Ok(Vec::new())
+        });
+        let started = Instant::now();
+
+        discard_timed_out_reader(Some(blocked_reader));
+
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "timeout cleanup must not join blocked output reader threads"
         );
     }
 

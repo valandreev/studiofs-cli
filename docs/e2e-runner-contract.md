@@ -86,9 +86,10 @@ exactly one scenario lifecycle and writes
 
 The parent forwards the requested timeout as the child process deadline. If
 the deadline expires, the parent reports the scenario as `timed_out`, records a
-`scenario_child` timeout event, and the command executor kills the child
-process boundary. On Windows the timeout path uses `taskkill /PID <pid> /T /F`
-as the process-tree fallback before waiting for exit.
+`scenario_child` timeout event with the executor cleanup detail, and the command
+executor kills the child process boundary. On Windows the timeout path uses
+`taskkill /PID <pid> /T /F` as the process-tree fallback, then probes child exit
+without blocking the runner on a wedged WinFSP process.
 
 After every mounted scenario, the parent runs the runner-owned stale-process
 cleanup helper in a post-scenario verification phase. Any runner-owned
@@ -98,6 +99,12 @@ contaminated host state. Once this gate fails, later mounted scenarios are
 recorded as skipped instead of being started on potentially occupied default
 mount letters. External-env and non-runner-owned processes remain outside the
 cleanup allowlist.
+
+A mounted child-process timeout is also treated as a mounted contamination
+boundary: the parent still runs the bounded post-scenario cleanup verification,
+but later mounted scenarios are skipped even if the cleanup probe returns clean.
+That keeps a wedged WinFSP callback from being followed by more mounted
+filesystem operations in the same sweep.
 
 ## Local First Baseline Gate
 

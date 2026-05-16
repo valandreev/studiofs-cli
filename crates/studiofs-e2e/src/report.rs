@@ -143,6 +143,8 @@ pub struct EventRecord {
     pub scenario: Option<String>,
     pub hook: String,
     pub phase: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 #[cfg(test)]
