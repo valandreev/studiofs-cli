@@ -9408,10 +9408,12 @@ mod tests {
             "listener startup should force an immediate sync for missed notifications"
         );
         assert!(
-            b.metadata_invalidation_diagnostics()
+            wait_until(Duration::from_secs(10), || b
+                .metadata_invalidation_diagnostics()
                 .last_successful_sync_unix_ms
-                .is_some(),
-            "forced reconnect/start sync should update metadata sync diagnostics"
+                .is_some()),
+            "forced reconnect/start sync should update metadata sync diagnostics; diagnostics={:?}",
+            b.metadata_invalidation_diagnostics()
         );
     }
 
