@@ -3523,12 +3523,35 @@ fn run_cold_observer_long_history_body(
         AdvancedMountedKind::ColdObserverLongHistory,
         &bootstrap.volume_name,
     );
-    let (operations, long_history) =
-        run_cold_observer_warm_history(context, &warm_clients, &isolation)?;
-    write_namespace_collision_operations(context, &operations)?;
+    let started = Instant::now();
+    let (mut operations, mut long_history) =
+        run_cold_observer_warm_history(started, context, &warm_clients, &isolation)?;
 
     controller.discover("client-d")?;
-    controller.mount("client-d")?;
+    let cold_client = controller
+        .clients()
+        .into_iter()
+        .find(|client| client.name == "client-d")
+        .cloned()
+        .ok_or_else(|| ScenarioError::Io(io::Error::other("missing cold observer client-d")))?;
+    operations.push(required_op(
+        started,
+        operations.len() + 1,
+        &cold_client,
+        "cold_discover_after_history",
+        "client-d",
+        Ok(()),
+    )?);
+    operations.push(required_op(
+        started,
+        operations.len() + 1,
+        &cold_client,
+        "cold_mount_after_history",
+        "client-d",
+        controller.mount("client-d").map_err(ScenarioError::from),
+    )?);
+    long_history.bounded_operation_count = operations.len();
+    write_namespace_collision_operations(context, &operations)?;
     let clients = controller
         .clients()
         .into_iter()
@@ -3853,11 +3876,11 @@ fn run_stale_remount_warm_history(
 }
 
 fn run_cold_observer_warm_history(
+    started: Instant,
     context: &ScenarioContext,
     clients: &[ClientSpec],
     isolation: &ScenarioIsolation,
 ) -> Result<(Vec<NamespaceCollisionOperation>, LongHistorySummary), ScenarioError> {
-    let started = Instant::now();
     let mut operations = Vec::new();
     let nested_dir = isolation.path("nested");
     let delete_target = isolation.path(COLD_OBSERVER_DELETE_TARGET);
@@ -5394,6 +5417,8 @@ fn planned_advanced_mounted_operations(
             ),
             ("client-b", "append", "cold-observer/append-target.txt"),
             ("client-c", "create", "cold-observer/nested/child.txt"),
+            ("client-d", "cold_discover_after_history", "client-d"),
+            ("client-d", "cold_mount_after_history", "client-d"),
         ],
         AdvancedMountedKind::StaleRemountColdDiscoverCatchup => vec![
             (

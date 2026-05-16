@@ -426,7 +426,7 @@ fn cold_observer_long_history_disabled_run_writes_reproducible_artifacts() {
     assert_eq!(summary["clients"], 4);
     assert_eq!(summary["cold_observer"]["client"], "client-d");
     assert_eq!(summary["cold_observer"]["discovered_after_history"], true);
-    assert_eq!(summary["long_history"]["bounded_operation_count"], 9);
+    assert_eq!(summary["long_history"]["bounded_operation_count"], 11);
     assert!(
         summary["long_history"]["expected_absent_paths"]
             .as_array()
@@ -446,6 +446,8 @@ fn cold_observer_long_history_disabled_run_writes_reproducible_artifacts() {
         "overwrite",
         "mkdir",
         "append",
+        "cold_discover_after_history",
+        "cold_mount_after_history",
         "cold-observer/nested/child.txt",
         "cold-observer/rename-source.txt -> cold-observer/renamed-final.txt",
     ] {
