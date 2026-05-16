@@ -13,8 +13,8 @@ An open-source, self-hosted virtual filesystem optimized for VFX and post-produc
 - **A single source of truth**
   Say goodbye to duplicate files, broken links, and version chaos. The entire team sees the exact same workspace, always in sync.
 
-- **Seamless NLE integration**
-  Edit collaboratively out of your existing toolkit, including DaVinci Resolve, Flame, Fusion, Nuke, After Effects, Maya, Houdini, and Blender.
+- **Seamless DCC integration**
+  Edit collaboratively out of your existing toolkit, including DaVinci Resolve, Flame, Fusion, Nuke, After Effects, Maya, Houdini, and Blender. StudioFS drive acts as a local drive, so you can use your existing workflows without any changes.
 
 - **Built for performance with Rust**
   Engineered from the ground up in Rust to guarantee memory safety, zero-overhead performance, and rock-solid stability under the heaviest multi-gigabyte editing workloads.
@@ -206,7 +206,7 @@ Real mounted E2E runner skeleton:
 
 ```bash
 cargo run -p studiofs-e2e -- list
-cargo run -p studiofs-e2e -- run basic-multi-client-smoke
+cargo run -p studiofs-e2e -- run --scenario 1-20 --studiofs-bin ./studiofs
 cargo run -p studiofs-e2e -- clean
 ```
 
@@ -232,19 +232,6 @@ Useful test/runtime variables include:
 - `STUDIOFS_S3_SECRET_KEY`
 - `STUDIOFS_S3_BUCKET`
 - `STUDIOFS_TEST_PG_DSN`
-
-Recent notes:
-- Added documentation for "Completion-aware local read semantics" (SFS-123) in [docs/vfs.md](docs/vfs.md).
-  This documents Local-First read resolution, the foreground-vs-background
-  fetch priority split, and the current observability counters.
-- Finalized the committed read path (SFS-139): foreground reads, readahead,
-  and upload cache rereads now use the current `v3` local cache backend as the
-  primary committed cache, while async VFS workers route blocking local cache mutations
-  through Tokio's blocking pool.
-- Reduced Windows local-cache growth stalls (SFS-146): the data file is marked
-  sparse on Windows when possible, physical growth is serialized separately
-  from allocator bookkeeping, and `set_len()` no longer holds the allocator
-  lock while NTFS extends the file.
 
 ## Documentation
 
