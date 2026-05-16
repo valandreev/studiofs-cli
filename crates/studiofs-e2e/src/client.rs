@@ -1575,8 +1575,33 @@ fn windows_drive_root(path: &Path) -> Option<PathBuf> {
 
 #[cfg(windows)]
 fn windows_available_drive_root(letter: char) -> Option<PathBuf> {
-    let root = PathBuf::from(format!("{letter}:\\"));
-    (!root.exists()).then_some(root)
+    (!windows_drive_letter_in_use(letter)).then(|| PathBuf::from(format!("{letter}:\\")))
+}
+
+#[cfg(windows)]
+fn windows_drive_letter_in_use(letter: char) -> bool {
+    windows_drive_letter_in_mask(letter, windows_logical_drive_mask())
+}
+
+#[cfg(windows)]
+fn windows_drive_letter_in_mask(letter: char, mask: u32) -> bool {
+    let upper = letter.to_ascii_uppercase();
+    if !upper.is_ascii_uppercase() {
+        return true;
+    }
+    let index = u32::from(upper) - u32::from('A');
+    mask & (1_u32 << index) != 0
+}
+
+#[cfg(windows)]
+fn windows_logical_drive_mask() -> u32 {
+    unsafe extern "system" {
+        fn GetLogicalDrives() -> u32;
+    }
+
+    // SAFETY: `GetLogicalDrives` takes no pointers and only returns the
+    // process-visible drive-letter bitmask.
+    unsafe { GetLogicalDrives() }
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -1660,5 +1685,16 @@ mod tests {
     #[test]
     fn decode_mountinfo_path_rejects_invalid_utf8_without_lossy_replacement() {
         assert!(decode_mountinfo_path(b"/var/mint-workspace/mount-\xff").is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_drive_letter_mask_treats_mapped_letters_as_unavailable() {
+        let y_bit = 1_u32 << (u32::from('Y') - u32::from('A'));
+        let mask = y_bit;
+
+        assert!(windows_drive_letter_in_mask('Y', mask));
+        assert!(windows_drive_letter_in_mask('y', mask));
+        assert!(!windows_drive_letter_in_mask('X', mask));
     }
 }
