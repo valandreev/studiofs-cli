@@ -2535,6 +2535,163 @@ fn size_change_after_unpublished_flush_advances_content_epoch() {
 }
 
 #[test]
+fn handle_overwrite_after_truncate_publishes_recovered_payload_not_tombstone() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "overwrite-truncate-publishes-payload");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"overwrite-truncate-publishes-payload.bin", 0, 0, 0o644)
+            .expect("create test file");
+        let ino = attr.ino;
+        let initial = b"rustfs outage initial payload";
+        let recovered = b"rustfs outage recovered payload";
+
+        vfs.write(ino, 0, initial).await.expect("write initial payload");
+        vfs.flush(ino).await.expect("flush initial payload");
+        let (published_epoch, published_blocks) = mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+        publish_current_file_graph(&meta, ino, published_epoch, &published_blocks);
+
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open overwrite handle");
+        vfs.setattr_with_handle(Some(fh), ino, SetattrArgs::size_only(0))
+            .expect("truncate through overwrite handle");
+        vfs.write_fh(fh, ino, 0, recovered)
+            .await
+            .expect("write recovered payload after truncate");
+        vfs.flush_fh(fh)
+            .await
+            .expect("flush recovered overwrite");
+
+        let local = vfs
+            .read(ino, 0, recovered.len() as u32)
+            .await
+            .expect("read accepted recovered payload locally");
+        assert_eq!(local.as_ref(), recovered);
+
+        let (content_epoch, blocks) = mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+        assert!(
+            !blocks.is_empty(),
+            "recovered overwrite must carry payload objects into publication"
+        );
+        assert!(
+            meta.publish_regular_file_overlay_to_base_if_matches(ino, content_epoch)
+                .expect("publish recovered overwrite epoch"),
+            "recovered overwrite epoch should be publish-ready; attr={:?}; lifecycle={:?}; blocks={blocks:?}",
+            meta.get_attr(ino).expect("load attr before publish attempt"),
+            meta.get_inode_lifecycle(ino).expect("load lifecycle before publish attempt")
+        );
+
+        let published_attr = meta.get_attr(ino).expect("load published overwrite attr");
+        assert_eq!(published_attr.size, recovered.len() as u64);
+        assert_eq!(published_attr.committed_size, recovered.len() as u64);
+        assert_eq!(published_attr.upload_state, MetaUploadState::Ready);
+        assert_eq!(
+            published_attr.committed_content_epoch,
+            published_attr.content_epoch
+        );
+
+        let spans = meta
+            .lookup_regular_file_slices(ino, 0, recovered.len() as u64)
+            .expect("load published recovered slices");
+        let published_objects: Vec<_> = spans
+            .into_iter()
+            .filter_map(|span| span.payload.map(|payload| payload.object_id))
+            .collect();
+        assert_eq!(
+            published_objects, blocks,
+            "published graph must reference the recovered payload objects, not a tombstone-only epoch"
+        );
+
+        vfs.release_fh(fh).await.expect("release overwrite handle");
+    });
+}
+
+#[test]
+fn stale_zero_size_dirty_attr_after_recovered_publish_would_revert_to_tombstone() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "stale-zero-dirty-attr-after-publish");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"stale-zero-dirty-attr-after-publish.bin", 0, 0, 0o644)
+            .expect("create test file");
+        let ino = attr.ino;
+        let initial = b"rustfs outage initial payload";
+        let recovered = b"rustfs outage recovered payload";
+
+        vfs.write(ino, 0, initial).await.expect("write initial payload");
+        vfs.flush(ino).await.expect("flush initial payload");
+        let (published_epoch, published_blocks) =
+            mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+        publish_current_file_graph(&meta, ino, published_epoch, &published_blocks);
+        let base_attr = meta.get_attr(ino).expect("load initial published attr");
+
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open overwrite handle");
+        vfs.setattr_with_handle(Some(fh), ino, SetattrArgs::size_only(0))
+            .expect("truncate through overwrite handle");
+        let stale_zero_attr = meta.get_attr(ino).expect("load staged zero-size attr");
+        assert_eq!(stale_zero_attr.size, 0);
+        assert_eq!(stale_zero_attr.committed_size, base_attr.committed_size);
+
+        vfs.write_fh(fh, ino, 0, recovered)
+            .await
+            .expect("write recovered payload after truncate");
+        vfs.flush_fh(fh).await.expect("flush recovered overwrite");
+        let (content_epoch, blocks) = mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+        assert!(
+            meta.publish_regular_file_overlay_to_base_if_matches(ino, content_epoch)
+                .expect("publish recovered overwrite epoch"),
+            "recovered overwrite epoch should publish before the stale dirty attr retry"
+        );
+
+        let published_attr = meta.get_attr(ino).expect("load recovered published attr");
+        assert_eq!(published_attr.size, recovered.len() as u64);
+        assert_eq!(published_attr.committed_size, recovered.len() as u64);
+        assert_eq!(published_attr.committed_content_epoch, content_epoch);
+
+        let mut stale_retry = stale_zero_attr;
+        stale_retry.content_epoch = content_epoch;
+        stale_retry.upload_state = MetaUploadState::Ready;
+        vfs.state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .insert(ino, stale_retry);
+        vfs.clear_matching_dirty_attr_if_committed(ino, &published_attr);
+        assert!(
+            !vfs.state.namespace.dirty_attrs.lock().contains_key(&ino),
+            "a stale zero-size dirty attr from the truncate half of an overwrite must be discarded after recovered payload publication"
+        );
+
+        vfs.flush_local_dirty_state(ino, LocalSyncPolicy::Strict)
+            .await
+            .expect("retrying local dirty flush after publication should be harmless");
+        let final_attr = meta.get_attr(ino).expect("load attr after stale retry");
+        assert_eq!(final_attr.size, recovered.len() as u64);
+        assert_eq!(final_attr.committed_size, recovered.len() as u64);
+        assert_eq!(final_attr.committed_content_epoch, content_epoch);
+        let published_objects: Vec<_> = meta
+            .lookup_regular_file_slices(ino, 0, recovered.len() as u64)
+            .expect("load recovered published graph")
+            .into_iter()
+            .filter_map(|span| span.payload.map(|payload| payload.object_id))
+            .collect();
+        assert_eq!(
+            published_objects, blocks,
+            "stale zero-size dirty attr retry must not replace recovered payload graph with tombstones"
+        );
+
+        vfs.release_fh(fh).await.expect("release overwrite handle");
+    });
+}
+
+#[test]
 fn handle_backed_extend_after_write_through_upload_work_advances_content_epoch() {
     let tmp = TempDir::new().expect("tempdir");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "handle-extend-after-write-through");

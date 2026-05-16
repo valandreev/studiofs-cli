@@ -2555,12 +2555,14 @@ impl StudioVfs {
             return;
         }
         let mut dirty_attrs = self.state.namespace.dirty_attrs.lock();
-        if let Some(current) = dirty_attrs.get(&ino)
-            && current.content_epoch == attr.content_epoch
-            && current.size == attr.size
-            && current.mtime == attr.mtime
-            && current.ctime == attr.ctime
-        {
+        let should_clear = dirty_attrs.get(&ino).is_some_and(|current| {
+            current.content_epoch == attr.content_epoch
+                && (Self::is_fully_published_regular_file(attr)
+                    || (current.size == attr.size
+                        && current.mtime == attr.mtime
+                        && current.ctime == attr.ctime))
+        });
+        if should_clear {
             dirty_attrs.remove(&ino);
         }
     }
