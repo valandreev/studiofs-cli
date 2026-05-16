@@ -40,6 +40,7 @@ use tracing::{debug, info, warn};
 const WRITE_PATH_OBSERVABILITY_INTERVAL: Duration = Duration::from_secs(1);
 const DAEMON_RECORD_PUBLISH_TIMEOUT: Duration = Duration::from_secs(15);
 const DAEMON_RECORD_PUBLISH_POLL_INTERVAL: Duration = Duration::from_millis(50);
+#[cfg(any(debug_assertions, test))]
 const E2E_DISABLE_METADATA_BACKGROUND_POLL_ENV: &str =
     "STUDIOFS_E2E_DISABLE_METADATA_BACKGROUND_POLL";
 type MountProfileFinish = Box<dyn FnMut()>;
@@ -2171,7 +2172,7 @@ mod tests {
         let enabled =
             metadata_background_poll_enabled_with(|_| Err(std::env::VarError::NotPresent));
         let disabled = metadata_background_poll_enabled_with(|key| match key {
-            "STUDIOFS_E2E_DISABLE_METADATA_BACKGROUND_POLL" => Ok("1".to_string()),
+            E2E_DISABLE_METADATA_BACKGROUND_POLL_ENV => Ok("1".to_string()),
             _ => Err(std::env::VarError::NotPresent),
         });
 
