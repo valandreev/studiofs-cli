@@ -2557,9 +2557,7 @@ impl StudioVfs {
         let mut dirty_attrs = self.state.namespace.dirty_attrs.lock();
         let should_clear = dirty_attrs.get(&ino).is_some_and(|current| {
             current.content_epoch == attr.content_epoch
-                && ((attr.kind == FileType::RegularFile
-                    && attr.upload_state == MetaUploadState::Ready
-                    && attr.committed_content_epoch == attr.content_epoch)
+                && (Self::is_fully_published_regular_file(attr)
                     || (current.size == attr.size
                         && current.mtime == attr.mtime
                         && current.ctime == attr.ctime))
