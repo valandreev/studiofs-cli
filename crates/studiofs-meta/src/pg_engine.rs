@@ -5911,19 +5911,28 @@ mod tests {
         let overlay = pg.local_overlay_conflicts().expect("overlay conflicts");
         assert!(overlay.block_inodes.contains(&file.ino));
         assert!(pg.lookup(ROOT_INO, b"append-target.txt").is_ok());
+        let batch = [
+            MetaEvent::RemoveEntry {
+                parent: ROOT_INO,
+                name: b"append-target.txt".to_vec(),
+            },
+            MetaEvent::RemoveAttr { ino: file.ino },
+        ];
+        let current_regular_file_conflicts = pg
+            .current_regular_file_overlay_conflicts_for_batch(&batch)
+            .expect("collect current regular-file conflicts");
+        assert!(
+            current_regular_file_conflicts
+                .block_inodes
+                .contains(&file.ino)
+        );
+        assert!(
+            current_regular_file_conflicts.dentry_keys.is_empty(),
+            "regular-file overlay protection must not mask the foreign unlink path"
+        );
 
-        pg.apply_foreign_batch(
-            &[
-                MetaEvent::RemoveEntry {
-                    parent: ROOT_INO,
-                    name: b"append-target.txt".to_vec(),
-                },
-                MetaEvent::RemoveAttr { ino: file.ino },
-            ],
-            &overlay,
-            &HashSet::new(),
-        )
-        .expect("apply foreign unlink");
+        pg.apply_foreign_batch(&batch, &overlay, &HashSet::new())
+            .expect("apply foreign unlink");
 
         assert!(
             matches!(
