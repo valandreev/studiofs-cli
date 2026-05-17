@@ -5446,8 +5446,9 @@ where
     let permit = probe_limiter.try_acquire()?;
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let _permit = permit;
-        let _ = tx.send(probe());
+        let result = probe();
+        drop(permit);
+        let _ = tx.send(result);
     });
     match rx.recv_timeout(timeout) {
         Ok(result) => Ok(result),
@@ -8754,7 +8755,6 @@ mod tests {
                 client_spec_for(&sandbox, "projectfs", name, mount)
             })
             .collect::<Vec<_>>();
-        let required_payloads = [("seed/file.txt", b"expected payload\n".as_slice())];
         write_mounted_initial_file(
             clients[0].mount_point.join("seed/file.txt"),
             b"expected payload\n",
@@ -8768,19 +8768,25 @@ mod tests {
         )
         .unwrap();
 
-        let err = wait_for_mounted_initial_payloads_until(
-            &clients,
-            &required_payloads,
-            Instant::now() + Duration::from_millis(25),
-            Duration::from_millis(5),
-            "test initial tree",
-        )
-        .unwrap_err();
+        let missing = clients
+            .iter()
+            .filter_map(|client| {
+                match mounted_initial_payload_probe(
+                    client.clone(),
+                    "seed/file.txt".to_string(),
+                    b"expected payload\n".to_vec(),
+                ) {
+                    MountedPayloadProbeStatus::Present => None,
+                    MountedPayloadProbeStatus::Missing(path) => Some(path),
+                }
+            })
+            .collect::<Vec<_>>();
 
-        assert!(matches!(err, ScenarioError::Io(_)));
         assert!(
-            err.to_string()
-                .contains("client-b:seed/file.txt (expected 17 bytes, read 14 bytes)")
+            missing
+                .iter()
+                .any(|entry| entry == "client-b:seed/file.txt (expected 17 bytes, read 14 bytes)"),
+            "wrong peer payload must be reported in missing initial payloads, got {missing:?}"
         );
     }
 
