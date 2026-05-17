@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::infra::ServicePort;
+use crate::process_job::ChildJob;
 
 pub const DEFAULT_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c", "client-d"];
 #[cfg(windows)]
@@ -264,7 +265,7 @@ impl ClientProcessExecutor for SystemClientProcessExecutor {
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr))
             .spawn()?;
-        Ok(Box::new(SystemClientProcess { child }))
+        Ok(Box::new(SystemClientProcess::new(child)?))
     }
 
     fn is_mount_ready(&self, command: &ClientCommand) -> io::Result<bool> {
@@ -278,6 +279,24 @@ impl ClientProcessExecutor for SystemClientProcessExecutor {
 
 struct SystemClientProcess {
     child: Child,
+    job: ChildJob,
+}
+
+impl SystemClientProcess {
+    fn new(mut child: Child) -> io::Result<Self> {
+        let job = match ChildJob::assign_to_child(&child) {
+            Ok(job) => job,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("failed to isolate mount process in job object: {error}"),
+                ));
+            }
+        };
+        Ok(Self { child, job })
+    }
 }
 
 impl ClientProcess for SystemClientProcess {
@@ -297,7 +316,20 @@ impl ClientProcess for SystemClientProcess {
     }
 
     fn kill_process_tree(&mut self, context: &str) -> io::Result<()> {
-        force_kill_child_process_tree(&mut self.child, context)
+        match (
+            self.job.terminate(),
+            force_kill_child_process_tree(&mut self.child, context),
+        ) {
+            (Ok(true), _) => Ok(()),
+            (Ok(false), child_result) => child_result,
+            (Err(job_error), Ok(())) => {
+                debug_log_process_job_error(context, &job_error);
+                Ok(())
+            }
+            (Err(job_error), Err(child_error)) => Err(io::Error::other(format!(
+                "failed to terminate process job and child process tree for {context}: job termination: {job_error}; child process tree termination: {child_error}"
+            ))),
+        }
     }
 }
 
@@ -312,22 +344,14 @@ fn force_kill_child_process_tree(child: &mut Child, context: &str) -> io::Result
         let primary_result = child.kill();
         match (tree_result, primary_result) {
             (Ok(output), _) if windows_taskkill_status_is_success(output.status.code()) => Ok(()),
-            (Ok(_), Ok(())) if !windows_pid_is_running(pid) => Ok(()),
-            (Ok(output), Ok(())) => Err(io::Error::other(format!(
-                "failed to terminate process tree for {context} pid {pid}: taskkill exit: {}; stdout: {}; stderr: {}; primary kill: ok",
-                output.status.code().unwrap_or(-1),
-                String::from_utf8_lossy(&output.stdout).trim(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            ))),
+            (Ok(_), Ok(())) => Ok(()),
             (Ok(output), Err(primary)) => Err(io::Error::other(format!(
                 "failed to terminate process tree for {context} pid {pid}: taskkill exit: {}; stdout: {}; stderr: {}; primary kill: {primary}",
                 output.status.code().unwrap_or(-1),
                 String::from_utf8_lossy(&output.stdout).trim(),
                 String::from_utf8_lossy(&output.stderr).trim()
             ))),
-            (Err(tree), Ok(())) => Err(io::Error::other(format!(
-                "failed to terminate process tree for {context} pid {pid}: taskkill failed: {tree}; primary kill: ok"
-            ))),
+            (Err(_), Ok(())) => Ok(()),
             (Err(tree), Err(primary)) => Err(io::Error::other(format!(
                 "failed to terminate process tree for {context} pid {pid}: taskkill failed: {tree}; primary kill: {primary}"
             ))),
@@ -346,40 +370,6 @@ fn force_kill_child_process_tree(child: &mut Child, context: &str) -> io::Result
 #[doc(hidden)]
 pub fn windows_taskkill_status_is_success(status_code: Option<i32>) -> bool {
     status_code == Some(0) || status_code == Some(128)
-}
-
-#[cfg(windows)]
-pub(crate) fn windows_pid_is_running(pid: u32) -> bool {
-    unsafe extern "system" {
-        fn OpenProcess(
-            dwDesiredAccess: u32,
-            bInheritHandle: i32,
-            dwProcessId: u32,
-        ) -> *mut core::ffi::c_void;
-        fn WaitForSingleObject(hHandle: *mut core::ffi::c_void, dwMilliseconds: u32) -> u32;
-        fn CloseHandle(hObject: *mut core::ffi::c_void) -> i32;
-    }
-
-    const SYNCHRONIZE: u32 = 0x00100000;
-    const WAIT_OBJECT_0: u32 = 0x00000000;
-    const WAIT_TIMEOUT: u32 = 0x00000102;
-
-    // SAFETY: `OpenProcess` returns a nullable process handle for this PID.
-    let handle = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
-    if handle.is_null() {
-        return false;
-    }
-
-    // SAFETY: `handle` is a valid process handle with SYNCHRONIZE access.
-    let wait_result = unsafe { WaitForSingleObject(handle, 0) };
-    // SAFETY: `handle` is non-null and must be closed to release OS resources.
-    unsafe { CloseHandle(handle) };
-
-    match wait_result {
-        WAIT_TIMEOUT => true,
-        WAIT_OBJECT_0 => false,
-        _ => true,
-    }
 }
 
 #[derive(Debug, Error)]
@@ -1443,6 +1433,14 @@ fn debug_log_kill_error(client: &str, context: &str, error: &impl std::fmt::Disp
 #[cfg(not(debug_assertions))]
 fn debug_log_kill_error(_client: &str, _context: &str, _error: &impl std::fmt::Display) {}
 
+#[cfg(debug_assertions)]
+fn debug_log_process_job_error(context: &str, error: &impl std::fmt::Display) {
+    eprintln!("studiofs-e2e: process job termination failed during {context}: {error}");
+}
+
+#[cfg(not(debug_assertions))]
+fn debug_log_process_job_error(_context: &str, _error: &impl std::fmt::Display) {}
+
 #[cfg(unix)]
 fn mount_point_is_active(path: &Path) -> io::Result<bool> {
     use std::os::unix::fs::MetadataExt as _;
@@ -1553,9 +1551,98 @@ fn cleanup_stale_mount_before_remount(path: &Path) -> io::Result<()> {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
+fn cleanup_stale_mount_before_remount(path: &Path) -> io::Result<()> {
+    match mount_point_is_active(path) {
+        Ok(false) => Ok(()),
+        Ok(true) => force_unmount_stale_windows_mount(path, None),
+        Err(err) => force_unmount_stale_windows_mount(path, Some(err)),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
 fn cleanup_stale_mount_before_remount(_path: &Path) -> io::Result<()> {
     Ok(())
+}
+
+#[cfg(windows)]
+fn force_unmount_stale_windows_mount(
+    path: &Path,
+    readiness_error: Option<io::Error>,
+) -> io::Result<()> {
+    let Some(root) = windows_drive_root(path) else {
+        return Ok(());
+    };
+    let drive = windows_drive_arg(&root)?;
+    let root_arg = root.display().to_string();
+    let attempts: &[(&str, &[&str])] = &[
+        ("net", &["use", drive.as_str(), "/delete", "/y"]),
+        ("mountvol", &[root_arg.as_str(), "/d"]),
+    ];
+
+    let mut diagnostics = Vec::new();
+    for (program, args) in attempts {
+        match Command::new(program).args(*args).output() {
+            Ok(output) if output.status.success() => {
+                if !mount_point_is_active(&root)? {
+                    return Ok(());
+                }
+                diagnostics.push(format!(
+                    "{} {} exited successfully but {} is still active",
+                    program,
+                    args.join(" "),
+                    root.display()
+                ));
+            }
+            Ok(output) => diagnostics.push(format!(
+                "{} {} exited with {}; stderr: {}; stdout: {}",
+                program,
+                args.join(" "),
+                output.status.code().unwrap_or(-1),
+                diagnostic_excerpt(&String::from_utf8_lossy(&output.stderr)),
+                diagnostic_excerpt(&String::from_utf8_lossy(&output.stdout))
+            )),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => diagnostics.push(format!(
+                "{program} was not found while cleaning stale Windows mount {}",
+                root.display()
+            )),
+            Err(err) => diagnostics.push(format!(
+                "{program} failed while cleaning stale Windows mount {}: {err}",
+                root.display()
+            )),
+        }
+    }
+
+    if !mount_point_is_active(&root)? {
+        return Ok(());
+    }
+
+    let readiness = readiness_error
+        .map(|err| format!("; readiness probe error: {err}"))
+        .unwrap_or_default();
+    Err(io::Error::other(format!(
+        "failed to force-unmount stale Windows mount {}{}; attempts: {}",
+        root.display(),
+        readiness,
+        diagnostics.join(" | ")
+    )))
+}
+
+#[cfg(windows)]
+fn windows_drive_arg(root: &Path) -> io::Result<String> {
+    root.display()
+        .to_string()
+        .strip_suffix('\\')
+        .map(str::to_string)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "expected Windows drive root ending with '\\': {}",
+                    root.display()
+                ),
+            )
+        })
 }
 
 #[cfg(target_os = "linux")]
@@ -1740,5 +1827,11 @@ mod tests {
         assert!(windows_drive_letter_in_mask('Y', mask));
         assert!(windows_drive_letter_in_mask('y', mask));
         assert!(!windows_drive_letter_in_mask('X', mask));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_drive_arg_strips_root_backslash_for_net_use() {
+        assert_eq!(windows_drive_arg(Path::new("Z:\\")).unwrap(), "Z:");
     }
 }
