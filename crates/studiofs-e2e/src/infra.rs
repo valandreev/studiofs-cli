@@ -13,6 +13,8 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::process_job::ChildJob;
+
 const DEFAULT_WAIT_TIMEOUT_SECS: u64 = 120;
 const DEFAULT_POSTGRES_PORT: u16 = 25_432;
 const DEFAULT_RUSTFS_PORT: u16 = 29_000;
@@ -148,17 +150,9 @@ impl CommandExecutor for SystemCommandExecutor {
             process.current_dir(cwd);
         }
         let stream_output = command_streams_output(command);
-        if command.timeout.is_some() || stream_output {
-            process.stdout(Stdio::piped());
-            process.stderr(Stdio::piped());
-            return run_command(process, command.timeout, stream_output);
-        }
-        let output = process.output()?;
-        Ok(CommandOutput {
-            status: output.status.code().unwrap_or(-1),
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        })
+        process.stdout(Stdio::piped());
+        process.stderr(Stdio::piped());
+        run_command(process, command.timeout, stream_output)
     }
 }
 
@@ -175,6 +169,17 @@ fn run_command(
     stream_output: bool,
 ) -> std::io::Result<CommandOutput> {
     let mut child = command.spawn()?;
+    let job = match ChildJob::assign_to_child(&child) {
+        Ok(job) => job,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                error.kind(),
+                format!("failed to isolate command child in job object: {error}"),
+            ));
+        }
+    };
     let mut stdout_reader = child
         .stdout
         .take()
@@ -196,6 +201,7 @@ fn run_command(
             });
         }
         if timeout.is_some_and(|timeout| started.elapsed() >= timeout) {
+            let job_kill_error = job.terminate().err();
             let process_tree_error = force_kill_process_tree(child.id()).err();
             let child_kill_error = child.kill().err();
             let child_exit_detail = match child.try_wait() {
@@ -208,6 +214,9 @@ fn run_command(
             discard_timed_out_reader(stdout_reader.take());
             discard_timed_out_reader(stderr_reader.take());
             let mut details = Vec::new();
+            if let Some(error) = job_kill_error {
+                details.push(format!("job kill-on-close termination failed: {error}"));
+            }
             if let Some(error) = process_tree_error {
                 details.push(format!("process-tree kill fallback failed: {error}"));
             }
