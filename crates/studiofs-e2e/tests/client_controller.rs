@@ -1,3 +1,10 @@
+//! Integration tests for the `studiofs_e2e` client controller.
+//!
+//! These tests exercise `MultiClientController` orchestration (bootstrap, discovery, mount/unmount,
+//! restart, and force-kill flows) using in-process test doubles.
+//! `RecordingExecutor` and `RecordingProcess` capture command construction and lifecycle behavior
+//! without spawning real `studiofs` processes.
+
 use std::cell::{Cell, RefCell};
 use std::io;
 use std::path::Path;
@@ -819,6 +826,10 @@ fn command_failure_truncates_large_stdout_and_stderr() {
 }
 
 #[derive(Clone)]
+/// Test double for [`ClientProcessExecutor`] that records all commands and can inject failures.
+///
+/// Used to validate controller command construction (args, env, derived paths) and to simulate
+/// readiness/progress/exit behavior deterministically.
 struct RecordingExecutor {
     calls: Rc<RefCell<Vec<ClientCommand>>>,
     killed: Rc<Cell<usize>>,
@@ -929,6 +940,9 @@ impl ClientProcessExecutor for RecordingExecutor {
     }
 }
 
+/// Test double for [`ClientProcess`] returned by [`RecordingExecutor`].
+///
+/// Records kill/wait calls and can simulate a mount process that only exits after being killed.
 struct RecordingProcess {
     pid: u32,
     killed: Rc<Cell<usize>>,
@@ -966,6 +980,9 @@ impl ClientProcess for RecordingProcess {
     }
 }
 
+/// Builds a minimal [`ClientControllerConfig`] rooted under the supplied sandbox directory.
+///
+/// Values are chosen for controller testing (short timeouts, loopback endpoints, stable defaults).
 fn test_config(root: &Path) -> ClientControllerConfig {
     ClientControllerConfig {
         studiofs_bin: Path::new("studiofs-test-bin").to_path_buf(),
@@ -987,6 +1004,7 @@ fn test_config(root: &Path) -> ClientControllerConfig {
     }
 }
 
+/// Builds a [`ServicePort`] descriptor matching the e2e compose harness conventions.
 fn service_port(service: &str, host_port: u16) -> ServicePort {
     ServicePort {
         service: service.to_string(),
@@ -997,6 +1015,7 @@ fn service_port(service: &str, host_port: u16) -> ServicePort {
     }
 }
 
+/// Constructs a baseline `mount` [`ClientCommand`] for controller validation tests.
 fn client_command_for_mount_point(mount_point: std::path::PathBuf) -> ClientCommand {
     ClientCommand {
         client: "client-a".to_string(),

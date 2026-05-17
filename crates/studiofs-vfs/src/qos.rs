@@ -8,6 +8,10 @@ use tokio_util::sync::CancellationToken;
 use crate::vfs::VfsConfig;
 
 #[derive(Debug)]
+/// Controls concurrent request budgets for the four main VFS pipelines.
+///
+/// `QosController` owns semaphores that limit in-flight operations across:
+/// acceptance, materialization, commit, and fetch stages.
 pub struct QosController {
     accept_slots: Arc<Semaphore>,
     materialize_slots: Arc<Semaphore>,
@@ -16,6 +20,10 @@ pub struct QosController {
 }
 
 impl QosController {
+    /// Builds controller limits from VFS configuration.
+    ///
+    /// Each slot count is clamped to at least one permit to keep the semaphores
+    /// functional even when the config sets zero.
     pub fn from_config(config: &VfsConfig) -> Self {
         Self {
             accept_slots: Arc::new(Semaphore::new(config.qos_accept_slots.max(1))),
@@ -25,61 +33,82 @@ impl QosController {
         }
     }
 
+    /// Acquires one accept permit, waiting until one becomes available.
     pub async fn acquire_accept(&self) -> Result<OwnedSemaphorePermit, tokio::sync::AcquireError> {
         self.accept_slots.clone().acquire_owned().await
     }
 
+    /// Tries to acquire one accept permit without waiting.
+    ///
+    /// Returns `Some` when acquired, otherwise `None` if no permit is available.
     pub fn try_acquire_accept(&self) -> Option<OwnedSemaphorePermit> {
         self.accept_slots.clone().try_acquire_owned().ok()
     }
 
+    /// Acquires one materialization permit, waiting until one becomes available.
     pub async fn acquire_materialize(
         &self,
     ) -> Result<OwnedSemaphorePermit, tokio::sync::AcquireError> {
         self.materialize_slots.clone().acquire_owned().await
     }
 
+    /// Acquires one commit permit, waiting until one becomes available.
     pub async fn acquire_commit(&self) -> Result<OwnedSemaphorePermit, tokio::sync::AcquireError> {
         self.commit_slots.clone().acquire_owned().await
     }
 
+    /// Acquires one fetch permit, waiting until one becomes available.
     pub async fn acquire_fetch(&self) -> Result<OwnedSemaphorePermit, tokio::sync::AcquireError> {
         self.fetch_slots.clone().acquire_owned().await
     }
 
+    /// Returns currently available accept permits.
     pub fn accept_available(&self) -> usize {
         self.accept_slots.available_permits()
     }
 
+    /// Returns currently available materialization permits.
     pub fn materialize_available(&self) -> usize {
         self.materialize_slots.available_permits()
     }
 
+    /// Returns currently available commit permits.
     pub fn commit_available(&self) -> usize {
         self.commit_slots.available_permits()
     }
 
+    /// Returns currently available fetch permits.
     pub fn fetch_available(&self) -> usize {
         self.fetch_slots.available_permits()
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Priority class for transit-memory acquisition.
 pub enum TransitPriority {
+    /// Foreground work that may preempt waiting background work.
     Foreground,
+    /// Background work that yields behind foreground waiters.
     Background,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Snapshot of the current transit-memory budget and queue state.
 pub struct TransitMemorySnapshot {
+    /// Total budget limit in bytes.
     pub budget_bytes: usize,
+    /// Currently used budget in bytes.
     pub used_bytes: usize,
+    /// Remaining budget in bytes.
     pub available_bytes: usize,
+    /// Number of foreground waiters currently queued.
     pub waiting_foreground: usize,
+    /// Number of background waiters currently queued.
     pub waiting_background: usize,
 }
 
 #[derive(Debug)]
+/// In-memory budget tracker for limiting transient transit-memory usage.
 pub struct TransitMemoryBudget {
     budget_bytes: AtomicUsize,
     state: Mutex<TransitMemoryBudgetState>,
@@ -95,12 +124,16 @@ struct TransitMemoryBudgetState {
 
 #[derive(Debug)]
 #[must_use = "guard must be held to maintain transit memory budget reservation"]
+/// RAII guard for a reserved transit-memory budget chunk.
 pub struct TransitMemoryGuard {
     budget: Arc<TransitMemoryBudget>,
     bytes: usize,
 }
 
 impl TransitMemoryBudget {
+    /// Creates a budget with the provided byte limit.
+    ///
+    /// The limit is clamped to at least one byte.
     pub fn new(budget_bytes: usize) -> Arc<Self> {
         Arc::new(Self {
             budget_bytes: AtomicUsize::new(budget_bytes.max(1)),
@@ -109,6 +142,7 @@ impl TransitMemoryBudget {
         })
     }
 
+    /// Returns the current total budget in bytes.
     pub fn budget_bytes(&self) -> usize {
         self.budget_bytes.load(Ordering::Acquire)
     }
@@ -124,6 +158,7 @@ impl TransitMemoryBudget {
         self.notify.notify_waiters();
     }
 
+    /// Takes a snapshot of current budget usage and waiter queue lengths.
     pub fn snapshot(&self) -> TransitMemorySnapshot {
         let budget = self.budget_bytes();
         let state = self.state.lock();
@@ -136,14 +171,23 @@ impl TransitMemoryBudget {
         }
     }
 
+    /// Acquires transit-memory budget for a foreground request.
+    ///
+    /// This waits until enough budget is available.
     pub async fn acquire_foreground(self: &Arc<Self>, bytes: usize) -> TransitMemoryGuard {
         self.acquire(TransitPriority::Foreground, bytes).await
     }
 
+    /// Acquires transit-memory budget for a background request.
+    ///
+    /// This waits until enough budget is available.
     pub async fn acquire_background(self: &Arc<Self>, bytes: usize) -> TransitMemoryGuard {
         self.acquire(TransitPriority::Background, bytes).await
     }
 
+    /// Acquires transit-memory budget for a background request with cancellation.
+    ///
+    /// Returns `None` if `cancel_token` is triggered before allocation completes.
     pub async fn acquire_background_cancelable(
         self: &Arc<Self>,
         bytes: usize,

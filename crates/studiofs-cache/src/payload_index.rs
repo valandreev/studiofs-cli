@@ -64,15 +64,25 @@ const LEGACY_ENTRY_OFFSET_PAYLOAD_KEY_LEN: usize = 28;
 const LEGACY_ENTRY_HEADER_LEN: usize = 32;
 
 #[derive(Debug, thiserror::Error)]
+/// Errors returned by [`CacheIndex`] operations.
 pub enum CacheIndexError {
+    /// I/O error while creating/opening or writing the index file.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// Error reported by the underlying `redb` storage engine.
     #[error("index storage error: {0}")]
     Storage(#[source] RedbError),
+    /// The on-disk index contents are internally inconsistent or malformed.
     #[error("index corruption: {0}")]
     Corruption(String),
+    /// The on-disk index format is not supported by this binary.
     #[error("unsupported cache index format: expected {expected}, found {found}")]
-    UnsupportedFormat { expected: u64, found: u64 },
+    UnsupportedFormat {
+        /// The index format version this binary requires.
+        expected: u64,
+        /// The index format version stored in the on-disk index.
+        found: u64,
+    },
 }
 
 impl CacheIndexError {
@@ -82,63 +92,103 @@ impl CacheIndexError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Snapshot of the index accounting counters.
 pub struct CacheIndexStats {
+    /// Total bytes currently tracked in the index.
     pub current_bytes: u64,
+    /// Bytes currently considered dirty (pending upload / not evictable).
     pub dirty_bytes: u64,
+    /// Bytes that are eligible for eviction (uploaded + evictable).
     pub evictable_bytes: u64,
 }
 
 #[derive(Clone, PartialEq, Eq)]
+/// Public view of a payload-index row for a single object id.
 pub struct CacheIndexEntry {
+    /// The unique object id for the payload object.
     pub object_id: u64,
+    /// Opaque payload key (storage key / content key bytes).
     pub payload_key: Vec<u8>,
+    /// Payload length in bytes.
     pub payload_len: u64,
+    /// Current local lifecycle state for the object.
     pub lifecycle: LocalPayloadLifecycleState,
+    /// Origin classification for the payload (local vs downloaded).
     pub origin: LocalPayloadOrigin,
+    /// Upload state for the payload (pending/uploading/none).
     pub upload_state: LocalPayloadUploadState,
+    /// Last access timestamp in Unix milliseconds.
     pub last_access_unix_millis: u64,
+    /// Whether this object is currently eligible for eviction.
     pub evictable: bool,
+    /// Dirty-order sequence number if the object is dirty-like.
     pub dirty_order: Option<u64>,
+    /// Access-order sequence number used for deterministic eviction ordering.
     pub access_order: u64,
 }
 
 #[derive(Clone, PartialEq, Eq)]
+/// Input for inserting or updating a payload-index row.
 pub struct CacheIndexUpsert {
+    /// The unique object id for the payload object.
     pub object_id: u64,
+    /// Opaque payload key (storage key / content key bytes).
     pub payload_key: Vec<u8>,
+    /// Payload length in bytes.
     pub payload_len: u64,
+    /// Desired lifecycle state for the row.
     pub lifecycle: LocalPayloadLifecycleState,
+    /// Desired origin classification for the row.
     pub origin: LocalPayloadOrigin,
+    /// Desired upload state for the row.
     pub upload_state: LocalPayloadUploadState,
+    /// Whether the row should be marked evictable (subject to normalization).
     pub evictable: bool,
 }
 
 #[derive(Clone, PartialEq, Eq)]
+/// Entry returned by dirty/uploading replay enumeration.
 pub struct DirtyReplayEntry {
+    /// The unique object id for the payload object.
     pub object_id: u64,
+    /// Opaque payload key (storage key / content key bytes).
     pub payload_key: Vec<u8>,
+    /// Payload length in bytes.
     pub payload_len: u64,
+    /// Current local lifecycle state for the object.
     pub lifecycle: LocalPayloadLifecycleState,
+    /// Origin classification for the payload (local vs downloaded).
     pub origin: LocalPayloadOrigin,
+    /// Upload state for the payload (pending/uploading/none).
     pub upload_state: LocalPayloadUploadState,
+    /// Dirty-order sequence number for deterministic replay ordering.
     pub dirty_order: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Single eviction candidate row, ordered by access sequence.
 pub struct EvictionCandidateEntry {
+    /// The unique object id for the payload object.
     pub object_id: u64,
+    /// Payload length in bytes.
     pub payload_len: u64,
+    /// Access-order sequence number used for ordering eviction candidates.
     pub access_order: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// A page of eviction candidates along with scan statistics.
 pub struct EvictionCandidatePage {
+    /// Eviction-candidate entries returned for this page.
     pub entries: Vec<EvictionCandidateEntry>,
+    /// Total rows scanned from the access-order table while building the page.
     pub scanned_rows: u64,
+    /// Rows skipped because they were not uploaded+evictable at scan time.
     pub skipped_non_evictable: u64,
 }
 
 #[derive(Debug)]
+/// Persistent on-disk index for local cache payload objects.
 pub struct CacheIndex {
     db_path: PathBuf,
     db: Arc<Database>,
@@ -163,6 +213,7 @@ fn normalize_upsert(mut update: CacheIndexUpsert) -> CacheIndexUpsert {
 }
 
 impl CacheIndex {
+    /// Open (or create) a cache index database at `path`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, CacheIndexError> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
@@ -183,10 +234,12 @@ impl CacheIndex {
         Ok(index)
     }
 
+    /// Return the filesystem path backing this index.
     pub fn db_path(&self) -> &Path {
         &self.db_path
     }
 
+    /// Read current accounting counters from the index.
     pub fn stats(&self) -> Result<CacheIndexStats, CacheIndexError> {
         let txn = self.db.begin_read().map_err(storage_error)?;
         let counters = txn.open_table(COUNTERS_TABLE).map_err(storage_error)?;
@@ -197,6 +250,7 @@ impl CacheIndex {
         })
     }
 
+    /// Return the number of objects currently present in dirty order.
     pub fn dirty_object_count(&self) -> Result<usize, CacheIndexError> {
         let txn = self.db.begin_read().map_err(storage_error)?;
         let dirty_order = txn.open_table(DIRTY_ORDER_TABLE).map_err(storage_error)?;
@@ -205,6 +259,7 @@ impl CacheIndex {
         })
     }
 
+    /// Look up a single object id and return its current index entry, if present.
     pub fn get_entry(&self, object_id: u64) -> Result<Option<CacheIndexEntry>, CacheIndexError> {
         let txn = self.db.begin_read().map_err(storage_error)?;
         let payloads = txn
@@ -214,6 +269,7 @@ impl CacheIndex {
             .map(|entry| entry.into_public(object_id)))
     }
 
+    /// Insert or update a single entry, updating accounting counters atomically.
     pub fn upsert(&self, mut update: CacheIndexUpsert) -> Result<(), CacheIndexError> {
         update = normalize_upsert(update);
 
@@ -257,6 +313,7 @@ impl CacheIndex {
         Ok(())
     }
 
+    /// Insert or update many entries in a single transaction.
     pub fn upsert_many(&self, updates: &[CacheIndexUpsert]) -> Result<(), CacheIndexError> {
         if updates.is_empty() {
             return Ok(());
@@ -305,6 +362,7 @@ impl CacheIndex {
         Ok(())
     }
 
+    /// Update the access order for a single object id.
     pub fn touch_access(&self, object_id: u64) -> Result<(), CacheIndexError> {
         self.touch_access_batch(&[object_id])
     }
@@ -367,6 +425,7 @@ impl CacheIndex {
         Ok(due.len())
     }
 
+    /// Touch the access order if `min_interval` has elapsed since the last touch.
     pub fn touch_access_if_stale(
         &self,
         object_id: u64,
@@ -413,6 +472,7 @@ impl CacheIndex {
         Ok(())
     }
 
+    /// Mark a dirty object as uploading.
     pub fn mark_uploading(&self, object_id: u64) -> Result<(), CacheIndexError> {
         let txn = self.db.begin_write().map_err(storage_error)?;
         {
@@ -453,6 +513,7 @@ impl CacheIndex {
         Ok(())
     }
 
+    /// Mark a previously uploading object as upload-failed / pending (dirty).
     pub fn mark_upload_failed(&self, object_id: u64) -> Result<(), CacheIndexError> {
         let txn = self.db.begin_write().map_err(storage_error)?;
         {
@@ -491,6 +552,7 @@ impl CacheIndex {
         Ok(())
     }
 
+    /// Mark an object as uploaded and eligible for eviction.
     pub fn mark_uploaded(&self, object_id: u64) -> Result<(), CacheIndexError> {
         let txn = self.db.begin_write().map_err(storage_error)?;
         {
@@ -525,6 +587,7 @@ impl CacheIndex {
         Ok(())
     }
 
+    /// Remove a single object id from the index.
     pub fn remove(&self, object_id: u64) -> Result<(), CacheIndexError> {
         let txn = self.db.begin_write().map_err(storage_error)?;
         {
@@ -596,6 +659,7 @@ impl CacheIndex {
         Ok(())
     }
 
+    /// Return all dirty/uploading entries ordered by dirty sequence.
     pub fn dirty_uploading_entries(&self) -> Result<Vec<DirtyReplayEntry>, CacheIndexError> {
         let mut cursor = None;
         let mut out = Vec::new();
@@ -675,6 +739,7 @@ impl CacheIndex {
         Ok(ordered)
     }
 
+    /// Return all object ids ordered by access sequence.
     pub fn access_order_object_ids(&self) -> Result<Vec<u64>, CacheIndexError> {
         let mut cursor = None;
         let mut out = Vec::new();
@@ -728,6 +793,7 @@ impl CacheIndex {
         Ok(ordered)
     }
 
+    /// Alias for [`CacheIndex::access_order_page`].
     pub fn access_order_object_ids_page(
         &self,
         start_after: Option<u64>,

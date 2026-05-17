@@ -24,17 +24,25 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use studiofs_meta::types::Ino;
 
+/// Uniquely identifies a logical read stream for readahead tracking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ReadStreamKey {
+    /// Inode that owns the stream.
     pub ino: Ino,
+    /// Per-handle stream identifier.
     pub stream_id: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
+/// Tunable controls that are applied when deciding prefetch depth.
 pub struct ReadAheadPolicy {
+    /// Baseline width for prefetch scheduling.
     pub base_width: u32,
+    /// Maximum width for prefetch scheduling.
     pub max_width: u32,
+    /// Minimum width used once sequential access is detected.
     pub min_prefetch_on_seq: u32,
+    /// Master switch to disable prefetch scheduling.
     pub prefetch_enabled: bool,
 }
 
@@ -213,6 +221,10 @@ impl ReadAheadTracker {
         )
     }
 
+    /// Record read coverage for a specific stream key under an explicit policy.
+    ///
+    /// Returns the same upcoming blocks as [`record_read`], but allows multiple
+    /// independent streams per inode.
     pub fn record_read_for_stream(
         &self,
         key: ReadStreamKey,
@@ -264,6 +276,10 @@ impl ReadAheadTracker {
         !found_stream
     }
 
+    /// Check whether a prefetch candidate is still relevant for a specific stream.
+    ///
+    /// Returns `true` if the block still sits near the current stream head, or
+    /// if the stream is not currently tracked (conservative fallback).
     pub fn stream_prefetch_relevant(&self, key: ReadStreamKey, block: u32) -> bool {
         let Some(state) = self.states.get(&key) else {
             return true;
@@ -271,6 +287,7 @@ impl ReadAheadTracker {
         Self::state_considers_block_relevant(&state, self.width.max(1), block)
     }
 
+    /// Remove cached tracking state for a specific stream key.
     pub fn evict_stream(&self, key: ReadStreamKey) {
         self.states.remove(&key);
     }
@@ -708,6 +725,7 @@ struct DirPrefetchState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// A directory entry being tracked for sequence-aware prefetching.
 pub struct DirAccessEntry<'a> {
     /// Inode for a regular-file directory child.
     pub ino: Ino,

@@ -1,3 +1,12 @@
+//! Compose infra contract tests.
+//!
+//! These tests validate the repository `docker/compose.e2e.yml` contract and the
+//! command construction behavior of `DockerComposeStack`.
+//!
+//! The tests are intentionally "dry": they use in-process `CommandExecutor`
+//! fakes to record and inspect the generated `CommandSpec`s rather than invoking
+//! Docker on the host.
+
 use std::cell::RefCell;
 use std::path::PathBuf;
 
@@ -343,7 +352,9 @@ fn compose_stack_accepts_whitespace_around_port_range_bounds() {
 }
 
 #[derive(Default)]
+/// A `CommandExecutor` that records every call for later assertions in tests.
 struct RecordingExecutor {
+    /// Captured invocations in call order.
     calls: RefCell<Vec<studiofs_e2e::infra::CommandSpec>>,
 }
 
@@ -368,6 +379,8 @@ impl CommandExecutor for RecordingExecutor {
     }
 }
 
+/// A `CommandExecutor` that forces `pg_dump` to fail while still returning a
+/// partial stdout payload, for exercising optional diagnostics behavior.
 struct FailingDiagnosticsExecutor;
 
 impl CommandExecutor for FailingDiagnosticsExecutor {
@@ -387,6 +400,7 @@ impl CommandExecutor for FailingDiagnosticsExecutor {
     }
 }
 
+/// Returns the workspace repository root (two ancestors above `studiofs-e2e`).
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .ancestors()

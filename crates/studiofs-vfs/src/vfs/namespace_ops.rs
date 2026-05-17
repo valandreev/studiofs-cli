@@ -29,10 +29,19 @@ fn setattr_args_are_size_only(args: &SetattrArgs) -> bool {
 }
 
 impl StudioVfs {
+    /// Update inode metadata fields without an open-file handle context.
+    ///
+    /// This is the handle-free entry point for setattr operations and delegates to
+    /// `setattr_with_handle` with no handle.
     pub fn setattr(&self, ino: Ino, args: SetattrArgs) -> VfsResult<InodeAttr> {
         self.setattr_with_handle(None, ino, args)
     }
 
+    /// Update inode attributes, optionally while holding an open handle.
+    ///
+    /// `fh` is used to enforce mutating handle access for size-changing updates.
+    /// Other metadata updates mutate VFS and metadata-layer state in place while
+    /// updating ctime and dirty attribute caches.
     pub fn setattr_with_handle(
         &self,
         fh: Option<u64>,
@@ -702,6 +711,10 @@ impl StudioVfs {
         self.dentry_cache_insert_negative(parent, name);
     }
 
+    /// Heal a directory entry whose name still exists in metadata but whose inode vanished.
+    ///
+    /// Returns `true` when the dangling dentry was detected and repaired, and
+    /// `false` when there was no repairable dangling reference.
     pub fn heal_dangling_entry_if_inode_missing(
         &self,
         parent: Ino,
@@ -784,11 +797,20 @@ impl StudioVfs {
         }
     }
 
+    /// Resolve `name` in `parent` using POSIX namespace semantics.
+    ///
+    /// Returns the resolved `InodeAttr` or a metadata error when the entry is
+    /// absent or blocked.
     pub fn lookup(&self, parent: Ino, name: &[u8]) -> VfsResult<InodeAttr> {
         self.namespace_resolver(NamespacePathStyle::Posix)
             .lookup_component(parent, name)
     }
 
+    /// Read directory entries from `ino` with namespace filtering and access checks.
+    ///
+    /// The method applies ACL filtering, skips inaccessible entries, drops platform/root
+    /// blocked entries when necessary, and schedules batched attribute hydration for the
+    /// returned entries.
     pub fn readdir(&self, ino: Ino) -> VfsResult<Vec<DirEntry>> {
         let parent_effective = self.effective_access_level(ino)?;
         if parent_effective == AccessLevel::NoAccess {
@@ -981,6 +1003,10 @@ impl StudioVfs {
         Ok(Some(attr))
     }
 
+    /// Create a new hard link named `new_name` under `new_parent` for `ino`.
+    ///
+    /// In ignored-path mode, this records a synthetic ignored entry so namespace
+    /// behavior remains consistent while avoiding metadata mutations.
     pub fn link(&self, ino: Ino, new_parent: Ino, new_name: &[u8]) -> VfsResult<InodeAttr> {
         let namespace_mutations = self.namespace_mutations();
         self.enforce_access(ino, AccessLevel::ReadOnly)?;
@@ -1017,6 +1043,10 @@ impl StudioVfs {
         Ok(attr)
     }
 
+    /// Create a regular file under `parent`.
+    ///
+    /// Applies name validation, handles ignored-path routing, sets up the initial
+    /// incarnation state for upload, and returns the created inode attributes.
     pub fn create(
         &self,
         parent: Ino,
@@ -1054,6 +1084,10 @@ impl StudioVfs {
         Ok(attr)
     }
 
+    /// Create a directory under `parent`.
+    ///
+    /// Applies name validation, handles ignored-path routing, records namespace
+    /// mutations, and returns the created directory attributes.
     pub fn mkdir(
         &self,
         parent: Ino,
@@ -1078,6 +1112,7 @@ impl StudioVfs {
         Ok(attr)
     }
 
+    /// Create a symlink entry under `parent` named `name` pointing to `target`.
     pub fn symlink(
         &self,
         parent: Ino,
@@ -1102,6 +1137,7 @@ impl StudioVfs {
         Ok(attr)
     }
 
+    /// Read the symlink target bytes for `ino`.
     pub fn readlink(&self, ino: Ino) -> VfsResult<Vec<u8>> {
         self.enforce_access(ino, AccessLevel::ReadOnly)?;
         if matches!(self.ignored_entry_attr(ino), Some(attr) if attr.kind == FileType::Symlink) {
@@ -1110,6 +1146,7 @@ impl StudioVfs {
         Ok(self.sync_meta().get_symlink_target(ino)?)
     }
 
+    /// Unlink the entry `name` from directory `parent`.
     pub fn unlink(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
         Self::run_sync_future(self.unlink_inner(parent, name))
     }
@@ -1147,6 +1184,7 @@ impl StudioVfs {
         Ok(())
     }
 
+    /// Remove an empty directory `name` from directory `parent`.
     pub fn rmdir(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
         let namespace_mutations = self.namespace_mutations();
         self.enforce_access(parent, AccessLevel::ReadWrite)?;
@@ -1168,6 +1206,7 @@ impl StudioVfs {
         Ok(())
     }
 
+    /// Atomically rename `name` in `parent` to `new_name` in `new_parent`.
     pub fn rename(
         &self,
         parent: Ino,

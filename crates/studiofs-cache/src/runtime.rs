@@ -22,16 +22,22 @@ use crate::local::{
     LocalPayloadUploadState,
 };
 
+/// Cache index (redb) backing store for the local payload runtime.
 #[path = "payload_index.rs"]
 pub mod cache_index;
+/// Cache eviction and budget-governor implementation for the local payload runtime.
 #[path = "payload_eviction.rs"]
 pub mod eviction;
+/// File-per-object payload store implementation for the local payload runtime.
 #[path = "payload_store.rs"]
 pub mod file_payload_store;
+/// Local payload layout contract (paths, sharding, marker files).
 #[path = "payload_layout.rs"]
 pub mod layout;
+/// Platform-specific helpers used by the local payload runtime.
 #[path = "payload_platform.rs"]
 pub mod platform;
+/// Startup reconciliation logic for repairing on-disk cache artifacts.
 #[path = "startup_recovery.rs"]
 pub mod reconcile;
 
@@ -63,10 +69,12 @@ const LOW_SPACE_UPLOAD_DRAIN_PROGRESS_RETRIES: usize = 4;
 /// Backend kind available on the runtime path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalPayloadBackendKind {
+    /// Current on-disk local payload runtime layout (file-per-object store + redb index).
     Current,
 }
 
 impl LocalPayloadBackendKind {
+    /// Stable string identifier for the backend kind (used for diagnostics / telemetry).
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Current => "local-payload-runtime",
@@ -83,15 +91,22 @@ impl fmt::Display for LocalPayloadBackendKind {
 /// Detection snapshot for a per-volume cache root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalPayloadRuntimeDetection {
+    /// The derived layout paths rooted under the cache root.
     pub layout: LocalPayloadLayout,
+    /// Whether the redb index file exists.
     pub index_exists: bool,
+    /// Whether the payload objects directory exists.
     pub payload_objects_dir_exists: bool,
+    /// Whether the upload-stage objects directory exists.
     pub upload_objects_dir_exists: bool,
+    /// Whether the temporary directory exists.
     pub tmp_dir_exists: bool,
+    /// Whether the index directory exists.
     pub index_dir_exists: bool,
 }
 
 impl LocalPayloadRuntimeDetection {
+    /// Returns `true` when any runtime layout component is present under the cache root.
     pub fn has_runtime_layout(&self) -> bool {
         self.index_exists
             || self.payload_objects_dir_exists
@@ -100,10 +115,12 @@ impl LocalPayloadRuntimeDetection {
             || self.index_dir_exists
     }
 
+    /// Returns `true` when the cache root contains a complete runtime layout.
     pub const fn has_complete_runtime_layout(&self) -> bool {
         !self.needs_runtime_provisioning()
     }
 
+    /// Returns `true` when runtime provisioning is required (one or more required dirs missing).
     pub const fn needs_runtime_provisioning(&self) -> bool {
         !self.payload_objects_dir_exists
             || !self.upload_objects_dir_exists
@@ -111,6 +128,7 @@ impl LocalPayloadRuntimeDetection {
             || !self.index_dir_exists
     }
 
+    /// Returns the backend kind if the cache root contains a complete runtime layout.
     pub fn runtime_backend(&self) -> Option<LocalPayloadBackendKind> {
         if !self.has_complete_runtime_layout() {
             None
@@ -141,7 +159,9 @@ pub fn detect_cache_backends(cache_root: &Path) -> io::Result<LocalPayloadRuntim
 /// Configuration for opening the current local payload object backend.
 #[derive(Debug, Clone)]
 pub struct LocalPayloadBackendConfig {
+    /// Root directory for the local payload cache runtime (per-volume cache root).
     pub cache_root: PathBuf,
+    /// Stable UUID identifying the mounted volume (used in on-disk markers and diagnostics).
     pub volume_uuid: [u8; 16],
 }
 
@@ -167,6 +187,7 @@ pub enum LocalPayloadWriteMode {
 }
 
 impl LocalPayloadWriteMode {
+    /// Default write mode for mounted filesystem paths.
     pub const fn default_for_mount_path() -> Self {
         if cfg!(windows) {
             Self::UnbufferedFast
@@ -179,31 +200,46 @@ impl LocalPayloadWriteMode {
 /// Errors returned while opening the current local payload object backend.
 #[derive(Debug, thiserror::Error)]
 pub enum LocalPayloadBackendOpenError {
+    /// An underlying I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
+    /// The cache root is missing one or more required runtime layout components.
     #[error("local payload object runtime layout under '{cache_root}' is incomplete")]
-    IncompleteRuntimeLayout { cache_root: PathBuf },
+    IncompleteRuntimeLayout {
+        /// Cache root that is missing required runtime layout pieces.
+        cache_root: PathBuf,
+    },
+    /// Opening the redb cache index failed.
     #[error("failed to open local payload index at '{path}': {source}")]
     OpenCacheIndex {
+        /// Path to the redb index file that could not be opened.
         path: PathBuf,
+        /// Underlying redb/open index error.
         #[source]
         source: CacheIndexError,
     },
+    /// Opening the payload store failed.
     #[error("failed to open local payload payload store at '{cache_root}': {source}")]
     OpenPayloadStore {
+        /// Cache root that contains the local payload store.
         cache_root: PathBuf,
+        /// Underlying payload store open error.
         #[source]
         source: FilePayloadStoreError,
     },
+    /// Startup reconciliation of the runtime state failed.
     #[error("failed to reconcile local payload startup state under '{cache_root}': {source}")]
     StartupReconcile {
+        /// Cache root whose startup state was being reconciled.
         cache_root: PathBuf,
+        /// Underlying startup reconciliation error.
         #[source]
         source: LocalPayloadStartupReconcileError,
     },
 }
 
 impl LocalPayloadBackendOpenError {
+    /// Returns `true` when the open failure is likely transient (e.g. another process holds a lock).
     pub fn is_transient_open_lock_conflict(&self) -> bool {
         match self {
             Self::OpenCacheIndex { source, .. } => source.is_database_lock_conflict(),
@@ -251,10 +287,12 @@ impl Drop for LocalPayloadBackendRuntime {
 }
 
 impl LocalPayloadBackendRuntime {
+    /// Opens the local payload backend with default settings.
     pub fn open(config: LocalPayloadBackendConfig) -> Result<Self, LocalPayloadBackendOpenError> {
         Self::open_with_budget_and_sync_mode(config, None, LocalPayloadSyncMode::Durable)
     }
 
+    /// Opens the local payload backend with an optional cache budget.
     pub fn open_with_budget(
         config: LocalPayloadBackendConfig,
         cache_budget_bytes: Option<u64>,
@@ -266,6 +304,7 @@ impl LocalPayloadBackendRuntime {
         )
     }
 
+    /// Opens the local payload backend with explicit budget and sync-mode settings.
     pub fn open_with_budget_and_sync_mode(
         config: LocalPayloadBackendConfig,
         cache_budget_bytes: Option<u64>,
@@ -279,6 +318,7 @@ impl LocalPayloadBackendRuntime {
         )
     }
 
+    /// Opens the local payload backend with explicit budget, sync-mode, and write-mode settings.
     pub fn open_with_budget_sync_and_write_mode(
         config: LocalPayloadBackendConfig,
         cache_budget_bytes: Option<u64>,

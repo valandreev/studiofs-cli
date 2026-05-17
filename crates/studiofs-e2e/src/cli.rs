@@ -17,12 +17,15 @@ use crate::scenario;
 #[command(name = "studiofs-e2e")]
 #[command(version)]
 #[command(about = "Run StudioFS real mounted E2E scenarios")]
+/// Parsed CLI arguments for the `studiofs-e2e` binary.
 pub struct Cli {
     #[command(subcommand)]
+    /// Top-level command selected from the CLI.
     pub command: Commands,
 }
 
 #[derive(Subcommand, Debug)]
+/// High-level command modes supported by the CLI.
 pub enum Commands {
     /// List available E2E scenarios.
     List,
@@ -38,6 +41,7 @@ pub enum Commands {
 }
 
 #[derive(Args, Debug)]
+/// Options used to run one or many E2E scenarios.
 pub struct RunArgs {
     /// Scenario name, for example basic-multi-client-smoke.
     pub scenario: Option<String>,
@@ -88,6 +92,7 @@ pub struct RunArgs {
 }
 
 #[derive(Args, Debug)]
+/// Options used to run a single scenario in a pre-existing parent sandbox.
 pub struct RunOneArgs {
     /// Scenario name to run inside the parent sandbox.
     #[arg(long)]
@@ -115,6 +120,7 @@ pub struct RunOneArgs {
 }
 
 #[derive(Args, Debug)]
+/// Options used to remove stale scenario sandboxes from the run root.
 pub struct CleanArgs {
     /// Parent directory containing per-run sandboxes.
     #[arg(long, default_value = "target/e2e-runs")]
@@ -122,6 +128,7 @@ pub struct CleanArgs {
 }
 
 #[derive(Args, Debug)]
+/// Options for the Local First baseline gate execution loop.
 pub struct BaselineGateArgs {
     /// Path to the StudioFS product binary under test.
     #[arg(long)]
@@ -161,6 +168,7 @@ pub struct BaselineGateArgs {
 }
 
 impl RunArgs {
+    /// Expands positional or repeated selectors into a concrete list of scenario names.
     pub fn scenario_names(&self) -> Vec<String> {
         let mut names = Vec::new();
         if let Some(scenario) = &self.scenario {
@@ -177,6 +185,7 @@ impl RunArgs {
         names
     }
 
+    /// Builds a `RunRequest` consumed by the runner backend.
     pub fn into_request(self) -> RunRequest {
         let scenarios = self.scenario_names();
         RunRequest {
@@ -238,11 +247,13 @@ fn scenario_name_by_one_based_index(
         .unwrap_or_else(|| index.to_string())
 }
 
+/// Formats one indexed scenario row for `List` command output.
 pub fn format_scenario_list_line(index: usize, scenario: &scenario::ScenarioDefinition) -> String {
     format!("{}\t{}", index + 1, scenario.description)
 }
 
 impl BaselineGateArgs {
+    /// Builds a `BaselineGateRequest` consumed by the baseline gate runner.
     pub fn into_request(self) -> BaselineGateRequest {
         BaselineGateRequest {
             root: self.root,
@@ -258,6 +269,7 @@ impl BaselineGateArgs {
     }
 }
 
+/// Executes the CLI command and returns the process exit code.
 pub fn dispatch(cli: Cli) -> Result<i32> {
     match cli.command {
         Commands::List => {

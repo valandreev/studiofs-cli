@@ -1,3 +1,5 @@
+//! Sanity-level FUSE test coverage for mount lifecycle and metadata edge cases.
+
 #![cfg(unix)]
 
 use std::sync::{Arc, OnceLock};
@@ -126,6 +128,10 @@ fn make_test_vfs(
     vfs
 }
 
+/// Verifies that creating and dropping a FUSE session does not panic or leak.
+///
+/// This test is intentionally ignored unless `STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1`
+/// is set to avoid requiring a mounted FUSE environment in normal CI runs.
 #[test]
 #[ignore = "requires /dev/fuse or macFUSE and STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
 fn fuse_session_mount_and_drop_smoke() {
@@ -154,6 +160,10 @@ fn fuse_session_mount_and_drop_smoke() {
     drop(session);
 }
 
+/// Verifies macOS resource fork xattrs can be set, queried, listed, and removed.
+///
+/// This is macOS-only and validates compatibility with native xattr naming used by
+/// Finder metadata paths.
 #[cfg(target_os = "macos")]
 #[test]
 fn macos_resource_fork_roundtrip_uses_native_xattr_store() {

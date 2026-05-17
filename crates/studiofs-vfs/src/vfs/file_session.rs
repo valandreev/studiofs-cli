@@ -14,15 +14,24 @@ use crate::utils::now_unix_millis;
 // Open File Handle Tracking
 // =============================================================================
 
+/// Aggregated metrics for file sessions.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VfsFileSessionStats {
+    /// Number of active inode sessions currently tracked.
     pub active_sessions: usize,
+    /// Total count of currently open file handles.
     pub open_handles: u64,
+    /// Number of operations queued for processing.
     pub queued_ops: u64,
+    /// Maximum observed queue depth.
     pub max_queue_depth: u64,
+    /// Number of queued operations that waited for the session gate.
     pub wait_events: u64,
+    /// Total accumulated queue wait time in milliseconds.
     pub wait_ms: u64,
+    /// Total number of observed state transitions.
     pub transitions: u64,
+    /// Aggregated wait counts by operation type.
     pub wait_reasons: Vec<(String, u64)>,
 }
 
@@ -31,23 +40,31 @@ pub struct VfsFileSessionStats {
 pub struct OpenFlags(u32);
 
 impl OpenFlags {
+    /// Open in read-only mode.
     pub const RDONLY: Self = Self(0x01);
+    /// Open in write-only mode.
     pub const WRONLY: Self = Self(0x02);
+    /// Open in read-write mode.
     pub const RDWR: Self = Self(0x04);
+    /// Open with append-only semantics.
     pub const APPEND: Self = Self(0x08);
 
+    /// Returns an empty set of flags.
     pub const fn empty() -> Self {
         Self(0)
     }
 
+    /// Returns the raw bit value of these flags.
     pub const fn bits(self) -> u32 {
         self.0
     }
 
+    /// Returns true when all bits from `other` are present.
     pub const fn contains(self, other: Self) -> bool {
         (self.0 & other.0) == other.0
     }
 
+    /// Returns the union of this and another flag set.
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
     }
@@ -55,6 +72,7 @@ impl OpenFlags {
 
 impl std::ops::BitOr for OpenFlags {
     type Output = Self;
+    /// Combines two flag sets with bitwise OR.
     fn bitor(self, rhs: Self) -> Self {
         Self(self.0 | rhs.0)
     }
@@ -63,8 +81,11 @@ impl std::ops::BitOr for OpenFlags {
 /// Information about a single open file descriptor.
 #[derive(Clone, Debug)]
 pub struct OpenFile {
+    /// VFS-level file handle identifier.
     pub fh: u64,
+    /// Inode for the opened file.
     pub ino: Ino,
+    /// Open flags applied to this handle.
     pub flags: OpenFlags,
     access_state: Arc<Mutex<HandleAccessState>>,
 }
@@ -87,6 +108,7 @@ impl OpenFile {
         self.access_state.lock().current_class()
     }
 
+    /// Returns the current file-access class string label for this handle.
     pub fn access_class_name(&self) -> &'static str {
         self.current_access_class().as_str()
     }
@@ -112,14 +134,23 @@ impl OpenFile {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FileSessionOperation {
+    /// Read operation.
     Read,
+    /// Write operation.
     Write,
+    /// Flush operation.
     Flush,
+    /// Fsync operation.
     Fsync,
+    /// Release operation.
     Release,
+    /// Materialize operation.
     Materialize,
+    /// Upload operation.
     Upload,
+    /// Finalize operation.
     Finalize,
+    /// Delete operation.
     Delete,
 }
 
@@ -176,6 +207,7 @@ impl FileSessionOperation {
 
 #[derive(Debug)]
 pub(super) struct FileSessionEntry {
+    /// Gate that serializes conflicting operations for this inode.
     gate: Arc<tokio::sync::RwLock<()>>,
     open_handles: AtomicU32,
     queued_ops: AtomicU64,
@@ -188,6 +220,7 @@ pub(super) struct FileSessionEntry {
 }
 
 impl FileSessionEntry {
+    /// Constructs a new file-session state entry.
     fn new() -> Self {
         Self {
             gate: Arc::new(tokio::sync::RwLock::new(())),
@@ -220,14 +253,20 @@ impl FileSessionEntry {
 
 #[derive(Debug)]
 pub(super) struct FileSessionPermit {
+    /// Read side lock guard held while the operation is active.
     _read_gate: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+    /// Write side lock guard held while the operation is active.
     _write_gate: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
+    /// Shared counters used by the permit.
     counters: Arc<FileSessionCounters>,
+    /// Session that owns the active permit.
     session: Arc<FileSessionEntry>,
+    /// Operation that created this permit.
     op: FileSessionOperation,
 }
 
 impl Drop for FileSessionPermit {
+    /// Releases lock guards and records the finish transition.
     fn drop(&mut self) {
         // Release session lock(s) before publishing "finish" so waiters can
         // observe lower tail latency on contended inodes.
@@ -275,11 +314,13 @@ impl FileSessionCounters {
 
 #[derive(Debug)]
 pub(super) struct FileSessionState {
+    /// Active sessions tracked by inode.
     sessions: Mutex<HashMap<Ino, Weak<FileSessionEntry>>>,
     counters: Arc<FileSessionCounters>,
 }
 
 impl FileSessionState {
+    /// Creates a new file-session state map.
     pub(super) fn new() -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
@@ -287,6 +328,7 @@ impl FileSessionState {
         }
     }
 
+    /// Gets (or creates) the session entry for `ino`.
     pub(super) fn session(&self, ino: Ino) -> Arc<FileSessionEntry> {
         let mut sessions = self.sessions.lock();
         if let Some(existing) = sessions.get(&ino).and_then(Weak::upgrade) {
@@ -310,6 +352,7 @@ impl FileSessionState {
         session
     }
 
+    /// Removes an idle session entry when no handles remain.
     pub(super) fn gc_if_idle(&self, ino: Ino) {
         let mut sessions = self.sessions.lock();
         if sessions.get(&ino).and_then(Weak::upgrade).is_none() {
@@ -324,6 +367,7 @@ impl FileSessionState {
         }
     }
 
+    /// Enters the operation gate for `ino` and returns a session permit.
     pub(super) async fn enter_op(&self, ino: Ino, op: FileSessionOperation) -> FileSessionPermit {
         let session = self.session(ino);
         let counters = self.counters.clone();
@@ -370,6 +414,7 @@ impl FileSessionState {
         }
     }
 
+    /// Increments handle counters for `ino` and returns new open handle count.
     pub(super) fn note_open_handle(&self, ino: Ino) -> u32 {
         let session = self.session(ino);
         let next = session.open_handles.fetch_add(1, Ordering::Relaxed) + 1;
@@ -380,6 +425,7 @@ impl FileSessionState {
         next
     }
 
+    /// Updates close counters for `ino` and triggers GC when empty.
     pub(super) fn note_close_handle(&self, ino: Ino, remaining: u32) {
         let session = self.session(ino);
         session.open_handles.store(remaining, Ordering::Relaxed);
@@ -397,6 +443,7 @@ impl FileSessionState {
         }
     }
 
+    /// Records background transition metadata for the given operation and phase.
     pub(super) fn note_background_transition(
         &self,
         ino: Ino,
@@ -410,6 +457,7 @@ impl FileSessionState {
         }
     }
 
+    /// Returns a snapshot of file-session statistics.
     pub(super) fn stats(&self) -> VfsFileSessionStats {
         let counters = self.counters.clone();
         let mut stats = VfsFileSessionStats {

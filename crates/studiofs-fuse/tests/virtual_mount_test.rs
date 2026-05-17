@@ -1,3 +1,9 @@
+//! Integration tests for `studiofs-fuse` virtual mount and VFS behavior.
+//!
+//! These tests exercise core filesystem paths directly through `StudioVfs` and
+//! `StudioFuseFs` on Unix targets, including macOS-specific checks for xattrs and
+//! compatibility-specific metadata logic.
+
 #![cfg(unix)]
 
 use std::sync::{Arc, OnceLock};
@@ -9,6 +15,7 @@ use studiofs_meta::{
 use studiofs_vfs::{StudioVfs, VfsConfig};
 use tempfile::tempdir;
 
+/// Resolves the workspace root directory from the current crate manifest path.
 fn workspace_root() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -17,10 +24,12 @@ fn workspace_root() -> std::path::PathBuf {
         .to_path_buf()
 }
 
+/// Computes the path to the repository `.env` file.
 fn workspace_env_path() -> std::path::PathBuf {
     workspace_root().join(".env")
 }
 
+/// Loads environment variables from `.env` once for the current test process.
 fn load_test_env() {
     static ONCE: OnceLock<()> = OnceLock::new();
     let _ = ONCE.get_or_init(|| {
@@ -33,6 +42,7 @@ fn load_test_env() {
     });
 }
 
+/// Returns cached repository-level `.env` variables loaded from disk.
 fn workspace_dotenv_vars() -> &'static std::collections::BTreeMap<String, String> {
     static VARS: OnceLock<std::collections::BTreeMap<String, String>> = OnceLock::new();
     VARS.get_or_init(|| {
@@ -47,10 +57,12 @@ fn workspace_dotenv_vars() -> &'static std::collections::BTreeMap<String, String
     })
 }
 
+/// Gets a cached `.env` variable by key.
 fn workspace_dotenv_var(key: &str) -> Option<String> {
     workspace_dotenv_vars().get(key).cloned()
 }
 
+/// Resolves a test environment variable from process env, repository `.env`, and legacy key.
 fn test_online_env_var(primary: &str, legacy: &str, default: &str) -> String {
     load_test_env();
     std::env::var(primary)
@@ -64,6 +76,7 @@ fn test_online_env_var(primary: &str, legacy: &str, default: &str) -> String {
 // NOTE: Testing StudioFuseFs directly is hard because fuser::Request is not public.
 // We test the VFS logic directly to ensure platform-specific code paths pass.
 
+/// Smoke test for macOS-compatible virtual mount behavior through the VFS layer.
 #[test]
 fn test_macos_logic_smoke_virtual() {
     let tmp = tempdir().expect("tempdir");

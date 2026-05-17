@@ -69,6 +69,10 @@ impl StudioVfs {
         result
     }
 
+    /// Calculate block offsets and spans needed to read `buffer_len` bytes from `offset`.
+    ///
+    /// The returned tuples are `(block_index, offset_within_block, bytes_to_copy)` and
+    /// contain only ranges that intersect the given `file_size`.
     pub(super) fn calculate_blocks_needed(
         &self,
         offset: u64,
@@ -92,6 +96,10 @@ impl StudioVfs {
         blocks_needed
     }
 
+    /// Read file data into `buffer` (optionally pinned to a specific handle).
+    ///
+    /// Returns the number of bytes written, honoring current file size, local cache state,
+    /// and foreground read planning.
     pub(super) async fn read_into_impl(
         &self,
         fh: Option<u64>,
@@ -143,6 +151,10 @@ impl StudioVfs {
         Ok(written as u32)
     }
 
+    /// Fetch a payload block from remote object storage.
+    ///
+    /// When `prefetch` is true, the block is fetched through the prefetch scheduler
+    /// to prioritize non-critical background retrieval.
     pub(super) async fn fetch_block_for_ref(
         &self,
         block: &PayloadRef,
@@ -160,6 +172,10 @@ impl StudioVfs {
         }
     }
 
+    /// Fetch a payload block after a local cache miss.
+    ///
+    /// This path is used when a block lookup misses local cache and should retry fetching
+    /// from the remote source immediately.
     pub(super) async fn fetch_block_for_ref_after_local_miss(
         &self,
         block: &PayloadRef,
@@ -170,6 +186,10 @@ impl StudioVfs {
             .await
     }
 
+    /// Copy raw payload bytes into `dst`, zero-filling areas beyond available source data.
+    ///
+    /// This helper converts block-relative offsets into destination spans while preserving
+    /// partial-read behavior with zero padding.
     pub(super) fn copy_payload_into_range(&self, data: &[u8], block_offset: u64, dst: &mut [u8]) {
         let Ok(src_start) = usize::try_from(block_offset) else {
             warn!(
@@ -207,6 +227,10 @@ impl StudioVfs {
         }
     }
 
+    /// Copy a committed payload span into `dst` by exact byte range.
+    ///
+    /// Returns `VfsError::Other` on invalid ranges or when the source payload is shorter
+    /// than the requested destination span.
     pub(super) fn copy_committed_payload_into_range(
         &self,
         data: &[u8],
@@ -260,6 +284,10 @@ impl StudioVfs {
             .await
     }
 
+    /// Write data with an explicit local synchronization policy.
+    ///
+    /// Allows callers to choose how strongly the caller wants the write materialized
+    /// before completion while sharing the same write path as `write()`.
     pub async fn write_with_local_sync_policy(
         &self,
         ino: Ino,
@@ -339,6 +367,9 @@ impl StudioVfs {
             .await
     }
 
+    /// Flush buffered data and wait for `flush_with_outcome` completion.
+    ///
+    /// Drops all detail and only reports success/failure of the flush attempt.
     pub async fn flush(&self, ino: Ino) -> VfsResult<()> {
         self.flush_with_outcome(ino).await.map(|_| ())
     }

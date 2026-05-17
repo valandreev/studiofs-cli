@@ -1,3 +1,5 @@
+//! Integration tests for mounted tree snapshots, comparisons, and convergence behavior.
+
 use std::fs;
 use std::thread;
 use std::time::Duration;

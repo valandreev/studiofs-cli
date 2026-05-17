@@ -18,6 +18,10 @@ use studiofs_meta::types::block_index_from_offset;
 const MAX_FLUSH_QUIESCE_PASSES: usize = 8;
 
 impl StudioVfs {
+    /// Spawn a background task that replays landing-zone segments left from a previous run.
+    ///
+    /// This is used during startup to recover data that was durably written locally but not
+    /// yet integrated into the normal dirty/memory materialization pipeline.
     pub(super) fn spawn_landing_zone_recovery_worker(self: &Arc<Self>) {
         let vfs = self.clone();
         self.track_background_task(tokio::spawn(async move {
@@ -218,6 +222,10 @@ impl StudioVfs {
         // #endregion debug log
     }
 
+    /// Spawn a background deferred-materialization task for `ino` when needed.
+    ///
+    /// Deferred materialization drains buffered writer-stack data into the local dirty-state
+    /// persistence path in the background, while the inode still has open handles.
     pub(super) async fn spawn_deferred_materialization_if_needed(self: &Arc<Self>, ino: Ino) {
         if self.shutdown_requested() {
             return;
@@ -428,6 +436,10 @@ impl StudioVfs {
         }));
     }
 
+    /// Finish bookkeeping for a deferred-materialization task for `ino`.
+    ///
+    /// Clears the in-flight marker and optionally re-schedules work if additional dirty bytes
+    /// were observed while the task was running.
     pub(super) fn finish_deferred_materialization_task(
         self: &Arc<Self>,
         ino: Ino,
@@ -621,6 +633,11 @@ impl StudioVfs {
         result
     }
 
+    /// Release a handle and defer the last-handle durability barrier to a background task.
+    ///
+    /// This returns synchronously with an outcome describing whether this close observed the
+    /// last-handle transition, while the actual last-handle drain work is executed later on the
+    /// provided runtime (and any error is logged).
     pub fn release_fh_with_deferred_last_handle_barrier(
         self: &Arc<Self>,
         fh: u64,
@@ -656,6 +673,12 @@ impl StudioVfs {
         }
     }
 
+    /// Flush pending local state for a WinFSP writeback callback and report whether it drained
+    /// local dirty state.
+    ///
+    /// WinFSP passes both an inode and (sometimes) a file handle; when a handle is present we
+    /// prefer it to identify the target inode. The flush is a local durability barrier and does
+    /// not wait for remote upload completion.
     pub async fn flush_winfsp_writeback_with_outcome(
         self: &Arc<Self>,
         ino: Ino,
@@ -828,6 +851,9 @@ impl StudioVfs {
         }
     }
 
+    /// Run an ino-scoped local sync barrier and return whether it flushed local dirty state.
+    ///
+    /// This is used for callback paths that need an explicit per-inode durability barrier.
     pub(super) async fn flush_inode_barrier_with_outcome(
         &self,
         ino: Ino,
@@ -902,10 +928,12 @@ impl StudioVfs {
         result
     }
 
+    /// Flush data for a file handle (per-fd close in POSIX).
     pub async fn flush_fh(&self, fh: u64) -> VfsResult<()> {
         self.flush_fh_with_outcome(fh).await.map(|_| ())
     }
 
+    /// fsync implementation that reports whether file data and/or dirty attrs were persisted.
     pub(super) async fn fsync_with_outcome(
         &self,
         ino: Ino,
@@ -990,6 +1018,10 @@ impl StudioVfs {
             .await
     }
 
+    /// Write file data using the buffered write path with an explicit local sync policy.
+    ///
+    /// The `local_sync_policy` controls whether this write must establish strict local
+    /// durability ordering with concurrent flush/fsync operations on the same inode.
     pub async fn write_fh_with_local_sync_policy(
         &self,
         fh: u64,
@@ -1254,6 +1286,10 @@ impl StudioVfs {
         result
     }
 
+    /// Record a write into the per-inode writer stack and update relevant local metadata.
+    ///
+    /// This is the shared entry point used by write paths to stage data for eventual
+    /// materialization into local dirty state and upload.
     pub(super) async fn record_writer_stack_state_bytes(
         &self,
         fh: u64,
@@ -1346,6 +1382,9 @@ impl StudioVfs {
             .map_err(|_| VfsError::Other("writer stack object reservation exceeds u32::MAX".into()))
     }
 
+    /// Materialize pending writer-stack data for `ino` into persisted local dirty state.
+    ///
+    /// Returns the number of bytes materialized in this pass.
     pub(super) async fn materialize_writer_stack_for_inode(&self, ino: Ino) -> VfsResult<usize> {
         let object_count = self
             .state
@@ -1377,6 +1416,9 @@ impl StudioVfs {
         Ok(materialized_bytes)
     }
 
+    /// Materialize writer-stack data for `ino` when it has been idle for at least `min_idle`.
+    ///
+    /// Returns the number of bytes materialized in this pass.
     pub(super) async fn materialize_writer_stack_idle_tail_for_inode(
         &self,
         ino: Ino,
@@ -1412,6 +1454,9 @@ impl StudioVfs {
         Ok(materialized_bytes)
     }
 
+    /// Materialize writer-stack completed blocks for `ino` into persisted local dirty state.
+    ///
+    /// Returns the number of bytes materialized in this pass.
     pub(super) async fn materialize_writer_stack_completed_blocks_for_inode(
         &self,
         ino: Ino,

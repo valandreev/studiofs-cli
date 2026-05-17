@@ -1,3 +1,20 @@
+//! WinFSP mount sanity tests (Windows-only).
+//!
+//! This integration test suite exercises `studiofs-winfsp` end-to-end through a
+//! real WinFSP mountpoint. The goal is to catch regressions in the WinFSP bridge
+//! and the VFS integration that are hard to detect with unit tests alone.
+//!
+//! ## What these tests cover
+//!
+//! - Mounting and serving a `StudioVfs` instance via WinFSP.
+//! - Basic file I/O via the mounted drive, including sequential write paths.
+//! - Smoke checks around write-path observability and backpressure behavior.
+//!
+//! ## Test environment
+//!
+//! These tests are gated behind `cfg(windows)` and expect a Windows host with
+//! WinFSP available. Some tests may depend on a configured `.env` at the
+//! workspace root (or environment variables) for online/storage configuration.
 #![cfg(windows)]
 
 use std::net::ToSocketAddrs;

@@ -59,12 +59,19 @@ enum MountOptionError {
     InvalidDriveMountPoint(String),
 }
 
+/// Parameters required to mount StudioFS via WinFSP on Windows.
 pub struct WinfspMountRequest {
+    /// VFS instance that will be exposed via the WinFSP mount.
     pub vfs: std::sync::Arc<studiofs_vfs::StudioVfs>,
+    /// Tokio runtime handle used by the WinFSP backend for async work.
     pub runtime_handle: tokio::runtime::Handle,
+    /// Target mount point (drive root), for example `Z:`.
     pub mount_point: String,
+    /// Volume label reported to Windows for the mounted filesystem.
     pub volume_label: String,
+    /// Whether the mount should be read-only.
     pub read_only: bool,
+    /// Optional named shutdown event used to trigger a graceful unmount/shutdown.
     pub shutdown_event_name: Option<String>,
 }
 

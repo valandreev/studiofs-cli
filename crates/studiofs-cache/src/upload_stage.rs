@@ -4,22 +4,33 @@ use std::io;
 use tracing::warn;
 
 #[derive(Debug, thiserror::Error)]
+/// Errors returned by [`UploadStageStore`] operations.
 pub enum UploadStageStoreError {
     #[error("I/O error: {0}")]
+    /// An underlying filesystem I/O error.
     Io(#[from] io::Error),
 }
 
 #[derive(Debug, Clone)]
+/// A small local store for upload-staged payload objects.
+///
+/// The upload stage is backed by files in `layout.upload_stage_objects_dir` and is populated by
+/// creating hardlinks that point at durable payload objects in the main payload store.
 pub struct UploadStageStore {
     layout: LocalPayloadLayout,
 }
 
 impl UploadStageStore {
+    /// Opens (and creates if needed) the upload stage directory for the given payload layout.
     pub fn open(layout: LocalPayloadLayout) -> Result<Self, UploadStageStoreError> {
         fs::create_dir_all(&layout.upload_stage_objects_dir)?;
         Ok(Self { layout })
     }
 
+    /// Reads the staged payload bytes for `object_id` if present.
+    ///
+    /// Returns `None` if the staged file does not exist or if the read fails (a warning is logged
+    /// in the latter case).
     pub fn get(&self, object_id: u64) -> Option<bytes::Bytes> {
         let path = self.layout.upload_stage_object_path(object_id);
         match fs::read(&path) {
@@ -37,6 +48,7 @@ impl UploadStageStore {
         }
     }
 
+    /// Returns `true` if a staged payload file for `object_id` exists.
     pub fn contains(&self, object_id: u64) -> bool {
         self.layout
             .upload_stage_object_path(object_id)
@@ -44,6 +56,11 @@ impl UploadStageStore {
             .unwrap_or(false)
     }
 
+    /// Ensures the payload for `object_id` is present in the upload stage.
+    ///
+    /// This creates a hardlink from the durable payload object into the upload stage directory.
+    /// The operation is intended to be idempotent: if the staged file already exists, it is a
+    /// no-op.
     pub fn link_payload(&self, object_id: u64) -> Result<(), UploadStageStoreError> {
         let payload_path = self.layout.payload_object_path(object_id);
         let stage_path = self.layout.upload_stage_object_path(object_id);
@@ -74,6 +91,7 @@ impl UploadStageStore {
         }
     }
 
+    /// Calls [`Self::link_payload`] for each object id in `object_ids`.
     pub fn link_payload_batch(&self, object_ids: &[u64]) -> Result<(), UploadStageStoreError> {
         for &object_id in object_ids {
             self.link_payload(object_id)?;
@@ -81,6 +99,9 @@ impl UploadStageStore {
         Ok(())
     }
 
+    /// Removes the staged payload file for `object_id` if it exists.
+    ///
+    /// Non-`NotFound` errors are logged as warnings and otherwise ignored.
     pub fn remove(&self, object_id: u64) {
         let path = self.layout.upload_stage_object_path(object_id);
         if let Err(error) = fs::remove_file(&path)
@@ -95,6 +116,7 @@ impl UploadStageStore {
         }
     }
 
+    /// Calls [`Self::remove`] for each object id in `object_ids`.
     pub fn remove_batch(&self, object_ids: &[u64]) {
         for &object_id in object_ids {
             self.remove(object_id);

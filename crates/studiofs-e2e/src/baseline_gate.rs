@@ -8,6 +8,10 @@ use crate::infra::{CommandExecutor, InfraMode, SystemCommandExecutor};
 use crate::runner::{self, PlatformSelection, RetentionPolicy, RunOutcome, RunRequest, RunStatus};
 use crate::scenario;
 
+/// Baseline scenarios selected for the accepted mounted Local First gate run.
+///
+/// The order is intentionally fixed and spans the eight accepted scenario
+/// entry points in `studiofs-scenario`.
 pub const SCENARIOS_1_THROUGH_8: [&str; 8] = [
     scenario::BASIC_MULTI_CLIENT_SMOKE,
     scenario::POSTGRES_OUTAGE_MULTI_CLIENT_RECOVERY,
@@ -19,25 +23,38 @@ pub const SCENARIOS_1_THROUGH_8: [&str; 8] = [
     scenario::COLLISION_RENAME_VS_RENAME,
 ];
 
+/// Baseline gate input parameters shared across all executed iterations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BaselineGateRequest {
+    /// Root directory under which run artifacts and scenario state are created.
     pub root: PathBuf,
+    /// Prefix used for generated run identifiers and report naming.
     pub run_id_prefix: String,
+    /// Number of baseline iterations to execute.
     pub iterations: usize,
+    /// Seed value shared across all iterations and scenarios.
     pub seed: u64,
+    /// Path to the `studiofs` binary used for runs.
     pub studiofs_bin: PathBuf,
+    /// Target platform selection used for scenario execution.
     pub platform: PlatformSelection,
+    /// Retention policy applied to artifacts and generated reports.
     pub retention: RetentionPolicy,
+    /// Optional port range for ephemeral infra services.
     pub port_range: Option<String>,
+    /// Optional timeout override forwarded to scenario runs.
     pub timeout: Option<String>,
 }
 
+/// Aggregated outcomes of all baseline gate iterations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BaselineGateOutcome {
+    /// Outcomes for each executed baseline iteration.
     pub runs: Vec<RunOutcome>,
 }
 
 impl BaselineGateOutcome {
+    /// Aggregates run status; returns `RunStatus::Passed` only when all runs pass.
     pub fn status(&self) -> RunStatus {
         if self.runs.iter().all(|run| run.status == RunStatus::Passed) {
             RunStatus::Passed
@@ -46,6 +63,9 @@ impl BaselineGateOutcome {
         }
     }
 
+    /// Returns a conventional process exit code for the aggregate outcome.
+    ///
+    /// `0` indicates all runs passed; `1` indicates any failure.
     pub fn exit_code(&self) -> i32 {
         if self.status() == RunStatus::Passed {
             0
@@ -55,11 +75,18 @@ impl BaselineGateOutcome {
     }
 }
 
+/// Runs the baseline gate using the default system command executor.
+///
+/// This is a convenience entry point for the common case where external
+/// scenario and infra execution is delegated to `SystemCommandExecutor`.
 pub fn run(request: BaselineGateRequest) -> Result<BaselineGateOutcome> {
     let executor = SystemCommandExecutor;
     run_with_executor(request, &executor)
 }
 
+/// Runs the baseline gate with an explicit command executor.
+///
+/// This entry point is useful in tests and alternate transport layers.
 pub fn run_with_executor(
     request: BaselineGateRequest,
     executor: &dyn CommandExecutor,

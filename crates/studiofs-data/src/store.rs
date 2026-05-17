@@ -10,25 +10,36 @@ use studiofs_meta::FormatInfo;
 use thiserror::Error;
 use tracing::{debug, info};
 
+/// Errors returned by the data store layer during storage operations.
 #[derive(Debug, Error)]
 pub enum DataError {
+    /// Storage service rejected the operation or returned an invalid response.
     #[error("storage error: {0}")]
     Storage(String),
 
+    /// OpenDAL reported an underlying storage-layer failure.
     #[error("opendal error: {0}")]
     OpenDal(#[from] opendal::Error),
 }
 
+/// Result type for all datastore operations.
 pub type DataResult<T> = Result<T, DataError>;
 
 /// Configuration for the data store.
 #[derive(Clone)]
 pub struct DataStoreConfig {
+    /// Endpoint URL for the S3-compatible backend (for example,
+    /// `http://127.0.0.1:9000`).
     pub endpoint: String,
+    /// Target bucket name where objects are stored.
     pub bucket: String,
+    /// Access key for backend authentication.
     pub access_key: String,
+    /// Secret key for backend authentication.
     pub secret_key: String,
+    /// Optional region used for signature generation; empty defaults to `us-east-1`.
     pub region: String,
+    /// Stable namespace used as the object key prefix (often a volume name).
     pub volume_name: String,
 }
 

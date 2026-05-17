@@ -209,6 +209,7 @@ impl UploadQueue {
         self.pending_state.lock().by_object.contains_key(&object_id)
     }
 
+    /// Request shutdown of this queue and wake all `wait_for_idle` callers.
     pub fn shutdown(&self) {
         self.shutdown_requested.store(true, Ordering::Release);
         self.shutdown_notify.notify_waiters();

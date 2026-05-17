@@ -50,17 +50,22 @@ mod upload_lifecycle;
 mod workers;
 mod writer_stack;
 
+/// Public VFS configuration types used by clients and tests.
 pub use config::{
     ExplicitFlushOutcome, LocalSyncPolicy, ReleaseFhOutcome, VfsConfig, VfsConfigRaw,
     VfsConfigValidated,
 };
+/// File session primitives returned by open operations and reported by diagnostics.
 pub use file_session::{OpenFile, OpenFlags, VfsFileSessionStats};
+/// Public handle-drain barrier types and ports.
 pub use handle_drain_barrier::{
     BarrierObservabilityPort, DeferredCleanupHintPort, DeleteCleanupPort, FlushGatePort,
     HandleDrainBarrier, HandleDrainDeleteRequest, HandleDrainRequest, HandleReleasePort,
     LocalSyncBarrierPort,
 };
+/// Re-exported lock kind used by the public locking API.
 pub use locking::LockKind;
+/// Re-exported VFS observability snapshot and metrics types.
 pub use metrics::{
     StatFs, VfsAttrReadCacheSnapshot, VfsCacheStateSnapshot, VfsFetchStats,
     VfsForegroundReadProtectionStats, VfsIngressLane, VfsIngressPressure, VfsIngressStats,
@@ -76,6 +81,7 @@ pub use metrics::{
     VfsZeroIoCacheBytesSnapshot, VfsZeroIoDrilldownEntry, VfsZeroIoHealthSignal,
     VfsZeroIoRuntimeSnapshot, VfsZeroIoShutdownSnapshot, VfsZeroIoStartupReplaySnapshot,
 };
+/// Public namespace helpers used by bridge and diagnostics integrations.
 pub use namespace::{KernelInvalidator, NamespaceParent, NamespacePathStyle, NamespaceResolver};
 
 use acl::AclState;
@@ -168,10 +174,13 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+/// Maximum number of runtime events retained for VFS diagnostics.
 pub const VFS_RUNTIME_EVENT_CAPACITY: usize = 128;
 const ZEROIO_DIAGNOSTIC_DRILLDOWN_LIMIT: usize = 32;
 const ZEROIO_HEALTH_SIGNAL_LIMIT: usize = 16;
 const ZEROIO_REPLAY_EVENT_SAMPLE_LIMIT: usize = 16;
+
+/// Relative directory where zero-io startup/runtime snapshots are persisted.
 pub(crate) const ZEROIO_RUNTIME_STATE_DIR: &str = "runtime";
 const ZEROIO_LAST_SHUTDOWN_SNAPSHOT_FILE: &str = "zeroio-last-shutdown.json";
 const HARD_BACKPRESSURE_DIRTY_MULTIPLIER: usize = 2;
@@ -509,64 +518,92 @@ fn sustained_write_effective_buffer_bytes(
 // Error Types
 // =============================================================================
 
+/// Errors returned by VFS public APIs.
 #[derive(Debug, Error)]
 pub enum VfsError {
+    /// Metadata-layer failure.
     #[error("metadata error: {0}")]
     Meta(#[from] studiofs_meta::MetaError),
 
+    /// Data-layer failure.
     #[error("data error: {0}")]
     Data(#[from] studiofs_data::store::DataError),
 
+    /// I/O failure from a blocking or async operation.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// Task join failure while waiting for asynchronous work.
     #[error("task join error: {0}")]
     Join(#[from] tokio::task::JoinError),
 
+    /// Object-layer failure while decoding or writing payload objects.
     #[error("object error: {0}")]
     Object(#[from] studiofs_data::object::ObjectError),
 
+    /// Requested metadata block was not found.
     #[error("block not found: inode {0}, block {1}")]
-    BlockNotFound(Ino, u32),
+    BlockNotFound(
+        #[doc = "Inode containing the missing block."]
+        Ino,
+        #[doc = "Block number that is missing."]
+        u32,
+    ),
 
+    /// Operation would block due to conflicting lock state.
     #[error("lock conflict (EAGAIN)")]
     WouldBlock,
 
+    /// Open/read is blocked while remote content is still uploading.
     #[error("remote content is still uploading (EAGAIN)")]
     RemoteContentPending,
 
+    /// Rejecting an invalid filename or malformed name.
     #[error("invalid filename: {0}")]
     InvalidName(String),
 
+    /// QoS-related rejection while reserving capacity for object work.
     #[error("qos permit failure at {stage} for object {object_id} (0x{object_id:016x}): {message}")]
     QosFailure {
+        /// Stage during which QoS denied the request.
         stage: Cow<'static, str>,
+        /// Numeric identifier of the object that failed QoS checks.
         object_id: u64,
+        /// Human-readable QoS error message.
         message: String,
     },
 
+    /// Upstream fetch pipeline failed.
     #[error("fetch error: {0}")]
     Fetch(#[from] crate::fetch::FetchError),
 
+    /// Failed to detect the configured local payload backend.
     #[error("cache backend detection failed for root '{cache_root}': {source}")]
     LocalPayloadRuntimeDetection {
+        /// Local cache root path to inspect.
         cache_root: String,
+        /// Low-level detection error.
         #[source]
         source: std::io::Error,
     },
 
+    /// Generic fallback VFS error.
     #[error("{0}")]
     Other(String),
 }
 
+/// Result type alias used by the VFS public API.
+pub type VfsResult<T> = Result<T, VfsError>;
+
 #[derive(Debug, Clone, Copy)]
 enum WinfspBarrierType {
+    /// Barrier for WinFSP cleanup callbacks.
     Cleanup,
+    /// Barrier for WinFSP flush callbacks.
     Flush,
+    /// Barrier for WinFSP close callbacks.
     Close,
 }
-
-pub type VfsResult<T> = Result<T, VfsError>;
 
 // =============================================================================
 // Filename Validation
@@ -619,6 +656,7 @@ fn is_probable_trash_component(name: &[u8]) -> bool {
     is_unix_trash_component(name) || is_windows_recycle_bin_component(name)
 }
 
+/// Returns true when a root metadata entry should be hidden for non-macOS platforms.
 pub fn is_hidden_non_macos_root_metadata_name(name: &[u8]) -> bool {
     name == b".Trashes"
 }
@@ -738,7 +776,9 @@ const CACHE_RUNTIME_MAX_DIRTY_BYTES_BASE: usize = 300 * 1024 * 1024;
 const DEBUG_PENDING_PATH_SUFFIX_ENV: &str = "STUDIOFS_DEBUG_PENDING_PATH_SUFFIX";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TwoTierSegment {
+    /// Newly inserted cache entries eligible for promotion.
     Probationary,
+    /// Protected cache entries shielded from immediate eviction.
     Protected,
 }
 
@@ -3589,6 +3629,7 @@ impl StudioVfs {
         self.cached_store.pending_upload_count()
     }
 
+    /// Snapshot all pending uploads currently tracked by the cached store.
     pub(crate) fn pending_uploads_snapshot(&self) -> Vec<PendingUpload> {
         self.cached_store.snapshot_pending_uploads()
     }
@@ -3613,6 +3654,7 @@ impl StudioVfs {
         self.state.namespace.attr_read_cache.lock().metrics()
     }
 
+    /// Classify upload pipeline activity into optional diagnostics event labels.
     pub(crate) fn upload_pipeline_runtime_event(
         activity_started: bool,
         became_idle: bool,
@@ -3629,6 +3671,7 @@ impl StudioVfs {
         }
     }
 
+    /// Snapshot cache runtime state for diagnostics and API consumers.
     pub fn cache_state_snapshot(&self) -> VfsCacheStateSnapshot {
         let dentry = self.dentry_cache_metrics();
         let path_shortcut = self.path_shortcut_cache_metrics();
@@ -3654,6 +3697,7 @@ impl StudioVfs {
         }
     }
 
+    /// Snapshot metadata replication and session synchronization state.
     pub fn synchronization_state_snapshot(&self) -> VfsSynchronizationStateSnapshot {
         let metadata_backlog = self.sync_meta().replication_backlog();
         VfsSynchronizationStateSnapshot {
@@ -3884,6 +3928,7 @@ impl StudioVfs {
         }
     }
 
+    /// Snapshot zero-IO startup/runtime state for diagnostics.
     pub fn zeroio_runtime_snapshot(&self) -> VfsZeroIoRuntimeSnapshot {
         let generated_unix_ms = now_unix_millis();
         let storage_stats = self.local_payload_backend.storage_stats();
@@ -4345,6 +4390,7 @@ impl StudioVfs {
         snapshot
     }
 
+    /// Return the most recent runtime events, preserving tail order and bounded by `limit`.
     pub fn recent_runtime_events(&self, limit: usize) -> Vec<VfsRuntimeEvent> {
         let events = self.state.metrics.runtime_events.lock();
         let keep = limit.min(events.len());
@@ -4355,6 +4401,7 @@ impl StudioVfs {
             .collect()
     }
 
+    /// Reset diagnostics counters and event history for fresh observability baselines.
     pub fn reset_diagnostics_observability(&self) {
         self.state.metrics.reset_diagnostics_observability();
         self.state.write_admission_governor.lock().reset_stats();
@@ -4366,6 +4413,7 @@ impl StudioVfs {
         self.cached_store.reset_diagnostics_metrics();
     }
 
+    /// Push a custom runtime event into diagnostics history.
     pub fn record_runtime_event(
         &self,
         subsystem: &str,
@@ -5461,6 +5509,7 @@ impl StudioVfs {
         self.collect_regular_file_object_ids_for_recovery(ino, size)
     }
 
+    /// Return the current incarnation state for an inode.
     pub async fn inode_incarnation_state(&self, ino: Ino) -> VfsResult<InodeIncarnationState> {
         let attr = self.getattr_async(ino).await?;
         Ok(self.refresh_inode_incarnation_state_from_attr(ino, &attr))
@@ -5496,6 +5545,7 @@ impl StudioVfs {
         false
     }
 
+    /// Return live extent records for an inode as `(block_index, object_id, content_epoch)`.
     pub fn live_extent_records_for_inode(&self, ino: Ino) -> Vec<(u32, u64, u64)> {
         let mut out: Vec<_> = self
             .state
@@ -5512,6 +5562,7 @@ impl StudioVfs {
         out
     }
 
+    /// Return pending uploads for an inode as `(offset, object_id, content_epoch)`.
     pub fn pending_uploads_for_inode(&self, ino: Ino) -> Vec<(u64, u64, u64)> {
         let mut out: Vec<_> = self
             .pending_uploads_snapshot()
@@ -5523,6 +5574,7 @@ impl StudioVfs {
         out
     }
 
+    /// Read a single cached payload block by object id, if present.
     pub fn read_cached_block(&self, object_id: u64) -> Option<Bytes> {
         let (cached, timing) = run_local_cache_io(|| self.local_payload_backend.get(object_id));
         self.record_local_cache_io_timing(timing);
@@ -5864,6 +5916,7 @@ impl StudioVfs {
         self.cached_store.remove_hot_upload_batch(object_ids);
     }
 
+    /// Return upload queue and throughput statistics for diagnostics.
     pub fn upload_stats(&self) -> VfsUploadStats {
         let pending_uploads = self.pending_uploads_snapshot();
         let now_ms = now_unix_millis();
@@ -5935,10 +5988,12 @@ impl StudioVfs {
         }
     }
 
+    /// Return file-session statistics for open handles and handles lifecycle.
     pub fn file_session_stats(&self) -> VfsFileSessionStats {
         self.state.file_session.stats()
     }
 
+    /// Return foreground-read protection and speedometer metrics.
     pub fn foreground_read_protection_stats(&self) -> VfsForegroundReadProtectionStats {
         let (p90_latency_ns, speedometer_samples, window_bytes, window_coverage_ms) = self
             .state
@@ -6216,6 +6271,7 @@ impl StudioVfs {
     }
 
     #[cfg(test)]
+    /// Test helper: wait until foreground reads complete or timeout elapses.
     pub(crate) async fn wait_for_foreground_reads_idle(&self, timeout: Duration) -> bool {
         let started = Instant::now();
         loop {
@@ -6723,6 +6779,7 @@ impl StudioVfs {
         );
     }
 
+    /// Record payload-persist observability metrics for the current burst.
     pub(super) fn record_payload_persist_observability(
         &self,
         burst_payloads: usize,
@@ -6764,6 +6821,7 @@ impl StudioVfs {
         );
     }
 
+    /// Record metadata-commit observability metrics and cadence events.
     pub(super) fn record_metadata_commit_observability(
         &self,
         elapsed: Duration,
@@ -6838,6 +6896,7 @@ impl StudioVfs {
         self.meta.sync_view().metadata_authority_status()
     }
 
+    /// Ensure current metadata authority allows mutating operations for an inode.
     pub(super) fn enforce_metadata_mutation_authority(&self, ino: Ino) -> VfsResult<()> {
         if self.metadata_authority_status().allows_new_mutations() {
             return Ok(());
@@ -6873,6 +6932,7 @@ impl StudioVfs {
         }
     }
 
+    /// Reject write operations when a known foreign hard lock is present.
     pub(super) fn enforce_no_known_foreign_hard_lock(&self, ino: Ino) -> VfsResult<()> {
         if self.known_hard_lock_blocks_new_mutation(ino).is_some() {
             return Err(VfsError::WouldBlock);
@@ -6880,6 +6940,7 @@ impl StudioVfs {
         Ok(())
     }
 
+    /// Verify handle access allows write for a specific inode and return open-file state.
     pub(super) fn enforce_mutating_handle_access(&self, fh: u64, ino: Ino) -> VfsResult<OpenFile> {
         let denied = || {
             VfsError::Meta(MetaError::AccessDenied {
@@ -6900,6 +6961,7 @@ impl StudioVfs {
         Err(denied())
     }
 
+    /// Test-only override for known file lock lease.
     #[doc(hidden)]
     pub fn set_known_file_lock_for_test(&self, ino: Ino, lease: Option<FileLockLease>) {
         let mut overrides = self.known_file_lock_overrides.lock();
@@ -6911,11 +6973,13 @@ impl StudioVfs {
     }
 
     #[cfg(test)]
+    /// Test-only override for metadata authority status.
     #[doc(hidden)]
     pub fn set_metadata_authority_status_for_test(&self, status: Option<MetadataAuthorityStatus>) {
         *self.metadata_authority_override.lock() = status;
     }
 
+    /// Record a WinFSP write callback metric.
     pub fn note_winfsp_write_callback(&self) {
         self.state
             .metrics
@@ -6923,6 +6987,7 @@ impl StudioVfs {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record WinFSP write callback observability including bytes, policy and latency.
     pub fn record_winfsp_write_callback_observability(
         &self,
         write_bytes: usize,
@@ -6992,6 +7057,7 @@ impl StudioVfs {
         );
     }
 
+    /// Record VFS write call counters and byte totals.
     pub(super) fn note_vfs_write_call(&self, write_bytes: usize) {
         self.state
             .metrics
@@ -7003,6 +7069,7 @@ impl StudioVfs {
             .fetch_add(write_bytes as u64, Ordering::Relaxed);
     }
 
+    /// Record write-path stage latency for recording writer stack state.
     pub(super) fn record_vfs_write_record_writer_stack_state(&self, elapsed: Duration) {
         let metrics = &self.state.metrics;
         Self::observe_latency_counter(
@@ -7014,6 +7081,7 @@ impl StudioVfs {
         );
     }
 
+    /// Record write-path stage latency for completed materialization.
     pub(super) fn record_vfs_write_materialize_completed(&self, elapsed: Duration) {
         let metrics = &self.state.metrics;
         Self::observe_latency_counter(
@@ -7025,6 +7093,7 @@ impl StudioVfs {
         );
     }
 
+    /// Record write-path stage latency for strict materialization.
     pub(super) fn record_vfs_write_materialize_strict(&self, elapsed: Duration) {
         let metrics = &self.state.metrics;
         Self::observe_latency_counter(
@@ -7036,6 +7105,7 @@ impl StudioVfs {
         );
     }
 
+    /// Record write-path stage latency for limit-related materialization.
     pub(super) fn record_vfs_write_materialize_for_limits(&self, elapsed: Duration) {
         let metrics = &self.state.metrics;
         Self::observe_latency_counter(
@@ -7047,6 +7117,7 @@ impl StudioVfs {
         );
     }
 
+    /// Record a WinFSP overwrite callback metric.
     pub fn note_winfsp_overwrite_callback(&self) {
         self.state
             .metrics
@@ -7054,6 +7125,7 @@ impl StudioVfs {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record a WinFSP cleanup callback metric.
     pub fn note_winfsp_cleanup_callback(&self) {
         self.state
             .metrics
@@ -7061,6 +7133,7 @@ impl StudioVfs {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record a WinFSP flush callback metric.
     pub fn note_winfsp_flush_callback(&self) {
         self.state
             .metrics
@@ -7068,6 +7141,7 @@ impl StudioVfs {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record a WinFSP close callback metric.
     pub fn note_winfsp_close_callback(&self) {
         self.state
             .metrics
@@ -7075,6 +7149,7 @@ impl StudioVfs {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record a WinFSP cleanup+flush file-handle callback metric.
     pub fn note_winfsp_cleanup_flush_fh_callback(&self) {
         self.state
             .metrics
@@ -7106,14 +7181,17 @@ impl StudioVfs {
         }
     }
 
+    /// Record WinFSP cleanup barrier outcome for observability counters.
     pub fn note_winfsp_cleanup_barrier_outcome(&self, flushed: bool) {
         self.note_winfsp_barrier_outcome(WinfspBarrierType::Cleanup, flushed);
     }
 
+    /// Record WinFSP flush barrier outcome for observability counters.
     pub fn note_winfsp_flush_barrier_outcome(&self, flushed: bool) {
         self.note_winfsp_barrier_outcome(WinfspBarrierType::Flush, flushed);
     }
 
+    /// Record WinFSP close barrier outcome for observability counters.
     pub fn note_winfsp_close_barrier_outcome(&self, flushed: bool) {
         self.note_winfsp_barrier_outcome(WinfspBarrierType::Close, flushed);
     }
@@ -7126,6 +7204,7 @@ impl StudioVfs {
             || self.state.writer_stack.has_dirty_writers(ino)
     }
 
+    /// Snapshot write-path observability counters and metrics.
     pub fn write_path_observability_snapshot(&self) -> VfsWritePathObservabilitySnapshot {
         let elapsed = self.write_path_started_at.elapsed();
         macro_rules! load_metric {
@@ -7901,6 +7980,7 @@ impl StudioVfs {
     }
 
     #[cfg(test)]
+    /// Test-only helper to recover persisted landing-zone segments.
     pub(crate) fn recover_landing_zone_segments(
         &self,
     ) -> std::io::Result<Vec<RecoveredLandingSegment>> {

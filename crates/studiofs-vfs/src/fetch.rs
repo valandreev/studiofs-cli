@@ -46,29 +46,51 @@ const MAX_FRAGMENT_FETCH_IN_FLIGHT: usize = 8;
 /// Error returned by a fetch operation.
 #[derive(Debug, thiserror::Error)]
 pub enum FetchError {
+    /// Remote read or metadata lookup found no object by the requested key.
     #[error("object not found: {key}")]
-    NotFound { key: String },
+    NotFound {
+        /// Object key requested by the fetcher that was not found.
+        key: String,
+    },
 
+    /// Remote fetch failed after exhausting all attempts.
     #[error("fetch failed after {attempts} attempts: {source}")]
-    Exhausted { attempts: u32, source: DataError },
+    Exhausted {
+        /// Number of attempts that were made for this fetch.
+        attempts: u32,
+        /// Underlying storage or protocol error returned by the final attempt.
+        source: DataError,
+    },
 
+    /// Object decode failed after downloading a remote fragment payload.
     #[error("object decode error: {0}")]
     Decode(#[from] studiofs_data::object::ObjectError),
 
+    /// Local cache layer returned an error.
     #[error("cache access error: {0}")]
     CacheAccess(String),
 
+    /// Prefetch was skipped due to temporary scheduling pressure.
     #[error("prefetch skipped: no foreground headroom")]
     PrefetchSkipped,
 
+    /// The fetched object fragment layout did not pass validation.
     #[error("corrupt fragment layout for object {object_id}: {reason}")]
-    CorruptFragment { object_id: u64, reason: String },
+    CorruptFragment {
+        /// Object identifier associated with the invalid fragment payload.
+        object_id: u64,
+        /// Validation failure detail.
+        reason: String,
+    },
 
+    /// Transit-memory budget was insufficient to stage in-flight fragment buffers.
     #[error(
         "transit memory budget too small: required={required_bytes} bytes, budget={budget_bytes} bytes"
     )]
     TransitBudgetTooSmall {
+        /// Bytes required for the requested transit buffer layout.
         required_bytes: usize,
+        /// Available budget bytes at the time of fetch scheduling.
         budget_bytes: usize,
     },
 }
@@ -79,32 +101,59 @@ pub enum FetchError {
 
 /// Lock-free counters for observability (logged periodically by the VFS).
 pub struct FetchMetrics {
+    /// Cache hit count.
     pub cache_hits: AtomicU64,
+    /// Number of S3 fetch attempts (including retries that progressed to fetch stage).
     pub s3_fetches: AtomicU64,
+    /// Number of fetch errors reported by S3.
     pub s3_errors: AtomicU64,
+    /// Singleflight join count (non-owner readers for in-flight objects).
     pub singleflight_joins: AtomicU64,
+    /// Retry count across fetch stages.
     pub retries: AtomicU64,
+    /// Total bytes downloaded from remote and validated payloads.
     pub bytes_downloaded: AtomicU64,
+    /// Number of prefetches skipped because admission was closed.
     pub prefetch_skips: AtomicU64,
+    /// Total count of local cache I/O calls.
     pub local_cache_io_calls: AtomicU64,
+    /// Total local cache handoff latency in nanoseconds.
     pub local_cache_io_handoff_total_ns: AtomicU64,
+    /// Peak local cache handoff latency in nanoseconds.
     pub local_cache_io_handoff_max_ns: AtomicU64,
+    /// Total local cache backend I/O latency in nanoseconds.
     pub local_cache_io_backend_total_ns: AtomicU64,
+    /// Peak local cache backend I/O latency in nanoseconds.
     pub local_cache_io_backend_max_ns: AtomicU64,
+    /// Count of S3 GET requests.
     pub s3_get_calls: AtomicU64,
+    /// Total S3 GET latency in nanoseconds.
     pub s3_get_total_ns: AtomicU64,
+    /// Peak S3 GET latency in nanoseconds.
     pub s3_get_max_ns: AtomicU64,
+    /// Count of object decode calls.
     pub object_decode_calls: AtomicU64,
+    /// Total object decode latency in nanoseconds.
     pub object_decode_total_ns: AtomicU64,
+    /// Peak object decode latency in nanoseconds.
     pub object_decode_max_ns: AtomicU64,
+    /// Count of assembled-copy operations during reassembly.
     pub assemble_copy_calls: AtomicU64,
+    /// Total assembled-copy latency in nanoseconds.
     pub assemble_copy_total_ns: AtomicU64,
+    /// Peak assembled-copy latency in nanoseconds.
     pub assemble_copy_max_ns: AtomicU64,
+    /// Count of local cache put calls.
     pub local_cache_put_calls: AtomicU64,
+    /// Total local cache put latency in nanoseconds.
     pub local_cache_put_total_ns: AtomicU64,
+    /// Peak local cache put latency in nanoseconds.
     pub local_cache_put_max_ns: AtomicU64,
+    /// Total fetch call count.
     pub fetch_total_calls: AtomicU64,
+    /// Total end-to-end fetch latency in nanoseconds.
     pub fetch_total_ns: AtomicU64,
+    /// Peak end-to-end fetch latency in nanoseconds.
     pub fetch_total_max_ns: AtomicU64,
 }
 
@@ -173,7 +222,9 @@ impl std::fmt::Display for FetchMetrics {
 /// Result broadcast to singleflight waiters.
 #[derive(Clone, Debug)]
 pub(crate) enum BroadcastResult {
+    /// Singleflight fetch completed successfully and carried the payload.
     Success(Bytes),
+    /// Singleflight fetch failed; waiters must retry via cache or upstream logic.
     Failure,
 }
 
@@ -620,6 +671,7 @@ impl FetchScheduler {
     }
 
     #[cfg(test)]
+    /// Insert an inflight singleflight sender for deterministic test coordination.
     pub(crate) fn test_insert_inflight_fetch(
         &self,
         object_id: u64,
@@ -1197,8 +1249,11 @@ enum LocalCacheHint {
 /// that waiters receive `RecvError::Closed` (and can re-enter as fetchers)
 /// rather than hanging forever.
 struct InFlightCleanup<'a> {
+    /// Object identifier for the singleflight in-flight guard.
     object_id: u64,
+    /// Shared singleflight map containing active sender channels.
     inflight: &'a DashMap<u64, broadcast::Sender<BroadcastResult>>,
+    /// Whether cleanup should run on drop.
     active: std::cell::Cell<bool>,
 }
 

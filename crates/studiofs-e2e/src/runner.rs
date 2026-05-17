@@ -40,20 +40,29 @@ const DEFAULT_SCENARIO_CHILD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const HOST_ENVIRONMENT_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const ANSI_RESET: &str = "\x1b[0m";
 
+/// Controls when the runner's output artifacts and working directories are retained.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RetentionPolicy {
+    /// Keep all run artifacts and sandbox data.
     Always,
+    /// Keep artifacts only for failing runs.
     OnFailure,
+    /// Remove artifacts and sandbox data after the run ends.
     Never,
 }
 
+/// Selects the target platform/backend used by the runner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PlatformSelection {
+    /// Select the platform automatically for the current host.
     Auto,
+    /// Force Linux FUSE execution.
     LinuxFuse,
+    /// Force macOS FUSE execution.
     MacosFuse,
+    /// Force WinFSP execution.
     WindowsWinfsp,
 }
 
@@ -77,119 +86,229 @@ impl PlatformSelection {
     }
 }
 
+/// Final status for a full runner execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
+    /// The runner completed all scenarios and cleanup successfully.
     Passed,
+    /// One or more scenarios failed.
     Failed,
+    /// The run was intentionally skipped.
     Skipped,
+    /// Preflight checks failed before scenario execution.
     PreflightFailed,
+    /// Cleanup phase did not complete successfully.
     CleanupFailed,
+    /// The run timed out.
     TimedOut,
+    /// The run was interrupted by the user or environment.
     Interrupted,
 }
 
+/// Status reported for a single scenario in a run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScenarioStatus {
+    /// The scenario completed successfully.
     Passed,
+    /// The scenario failed.
     Failed,
+    /// The scenario was skipped.
     Skipped,
+    /// The scenario timed out.
     TimedOut,
 }
 
+/// Parameters for running one or more scenarios from the CLI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunRequest {
+    /// Root directory for all runner sandboxes and artifacts.
     pub root: PathBuf,
+    /// Optional explicit run identifier; generated automatically when omitted.
     pub run_id: Option<String>,
+    /// Scenario names to run in order.
     pub scenarios: Vec<String>,
+    /// Seed used for deterministic execution.
     pub seed: u64,
+    /// Optional path to the studiofs binary (required for compose-mounted scenarios).
     pub studiofs_bin: Option<PathBuf>,
+    /// Platform backend to use for this run.
     pub platform: PlatformSelection,
+    /// Artifact retention policy for this run.
     pub retention: RetentionPolicy,
+    /// Optional path to save a copy of the final report.
     pub report: Option<PathBuf>,
+    /// Optional compose port range.
     pub port_range: Option<String>,
+    /// Optional timeout value passed to scenarios.
     pub timeout: Option<String>,
+    /// Infrastructure mode to execute with.
     pub infra: InfraMode,
 }
 
+/// Parameters for running a single scenario independently.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunOneRequest {
+    /// Root directory for scenario artifacts.
     pub root: PathBuf,
+    /// Explicit run identifier for the one-shot run.
     pub run_id: String,
+    /// Name of the scenario to execute.
     pub scenario: String,
 }
 
+/// Result data for a one-shot scenario run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunOneOutcome {
+    /// Identifier of the run that produced this outcome.
     pub run_id: String,
+    /// Final outcome of the scenario.
     pub scenario: ScenarioOutcome,
+    /// Path to the generated report.
     pub report_path: PathBuf,
+    /// Exit code returned by the runner.
     pub exit_code: i32,
 }
 
+/// Parameters for cleaning stale runner sandboxes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CleanRequest {
+    /// Root directory to scan for stale runs.
     pub root: PathBuf,
 }
 
+/// Result of a cleanup operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CleanOutcome {
+    /// Paths successfully removed.
     pub removed: Vec<PathBuf>,
+    /// Paths that were not removed and the associated error.
     pub skipped: Vec<CleanSkipped>,
 }
 
+/// A skipped cleanup path and the reason for skip.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CleanSkipped {
+    /// Path that was skipped.
     pub path: PathBuf,
+    /// Error describing why cleanup skipped this path.
     pub error: String,
 }
 
+/// Outcome summary for a single scenario execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScenarioOutcome {
+    /// Scenario name.
     pub name: String,
+    /// Final status for this scenario.
     pub status: ScenarioStatus,
+    /// Relative artifact paths collected for this scenario.
     pub artifacts: Vec<String>,
 }
 
+/// Final outcome of a full run including metadata and per-scenario results.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunOutcome {
+    /// Identifier of the run.
     pub run_id: String,
+    /// Final status of the run.
     pub status: RunStatus,
+    /// Shell exit code selected for this run.
     pub exit_code: i32,
+    /// Sandbox path used by this run.
     pub sandbox: PathBuf,
+    /// Path to the generated report.
     pub report_path: PathBuf,
+    /// Scenario-level outcomes.
     pub scenarios: Vec<ScenarioOutcome>,
 }
 
+/// Runner failures surfaced from command execution, validation, and orchestration.
 #[derive(Debug, Error)]
 pub enum RunnerError {
+    /// A requested scenario name was not recognized.
     #[error("unknown E2E scenario: {0}")]
-    UnknownScenario(String),
+    UnknownScenario(
+        /// Requested scenario name.
+        String,
+    ),
+    /// A compose-mode run requires a studiofs binary for mounted scenarios.
     #[error("E2E scenario {scenario} requires --studiofs-bin when --infra compose is used")]
-    MissingStudiofsBin { scenario: String },
+    MissingStudiofsBin {
+        /// Mounted scenario that requires a local studiofs binary.
+        scenario: String,
+    },
+    /// Run ID was empty.
     #[error("run ID must not be empty")]
     EmptyRunId,
+    /// Run ID contains characters outside a safe single-directory name.
     #[error("run ID must be a safe single directory name: {0}")]
-    UnsafeRunId(String),
+    UnsafeRunId(
+        /// Run ID value rejected by the path safety check.
+        String,
+    ),
+    /// Cleanup root is outside the configured root directory.
     #[error("unsafe cleanup root: {0}")]
-    UnsafeCleanupRoot(String),
+    UnsafeCleanupRoot(
+        /// Normalized cleanup root path that failed validation.
+        String,
+    ),
+    /// A report artifact path is outside the run sandbox.
     #[error("E2E artifact path is outside the run sandbox")]
-    ArtifactPathOutsideSandbox { path: PathBuf, sandbox: PathBuf },
+    ArtifactPathOutsideSandbox {
+        /// Path reported as an artifact.
+        path: PathBuf,
+        /// Sandbox root against which the artifact path was validated.
+        sandbox: PathBuf,
+    },
+    /// Artifact path contains non-UTF-8 components.
     #[error("E2E artifact path contains a non-UTF-8 component")]
-    NonUtf8ArtifactPath { path: PathBuf },
+    NonUtf8ArtifactPath {
+        /// Artifact path that cannot be represented as UTF-8.
+        path: PathBuf,
+    },
+    /// Artifact path is relative/unsafe for artifact recording.
     #[error("E2E artifact path must be relative and must not contain parent components")]
-    UnsafeArtifactPath { path: PathBuf },
+    UnsafeArtifactPath {
+        /// Relative artifact path rejected for safety.
+        path: PathBuf,
+    },
+    /// I/O failed while running or producing reports.
     #[error("runner I/O failed: {0}")]
-    Io(#[from] std::io::Error),
+    Io(
+        /// I/O-level failure while producing artifacts or executing runner tasks.
+        #[from]
+        std::io::Error,
+    ),
+    /// JSON (de)serialization failed.
     #[error("runner JSON failed: {0}")]
-    Json(#[from] serde_json::Error),
+    Json(
+        /// JSON serialization or parsing error for run/scenario reports.
+        #[from]
+        serde_json::Error,
+    ),
+    /// A scenario hook returned an error.
     #[error("scenario hook failed: {0}")]
-    Scenario(#[from] scenario::ScenarioError),
+    Scenario(
+        /// Low-level scenario lifecycle error.
+        #[from]
+        scenario::ScenarioError,
+    ),
+    /// The client controller failed.
     #[error("runner client controller failed: {0}")]
-    Client(#[from] ClientControllerError),
+    Client(
+        /// Failure returned by the client controller integration layer.
+        #[from]
+        ClientControllerError,
+    ),
+    /// The infrastructure layer failed.
     #[error("runner infra failed: {0}")]
-    Infra(#[from] InfraError),
+    Infra(
+        /// Failure returned by the infra layer (compose setup, mount checks, etc.).
+        #[from]
+        InfraError,
+    ),
 }
 
 #[derive(Debug)]
@@ -204,11 +323,13 @@ struct ResolvedScenario {
     scenario: Box<dyn scenario::Scenario>,
 }
 
+/// Run a full scenario set using the default command executor.
 pub fn run(request: RunRequest) -> Result<RunOutcome, RunnerError> {
     let executor = SystemCommandExecutor;
     run_with_executor(request, &executor)
 }
 
+/// Run one or more scenarios using a custom command executor.
 pub fn run_with_executor(
     request: RunRequest,
     executor: &dyn CommandExecutor,
@@ -977,6 +1098,10 @@ fn append_text(path: &Path, text: &str) -> Result<(), RunnerError> {
     Ok(())
 }
 
+/// Run a single scenario from an existing run directory.
+///
+/// Use `run_id` to point to a previous run created by [`run`], and execute
+/// the same scenario workflow in a one-off mode for inspection.
 pub fn run_one(request: RunOneRequest) -> Result<RunOneOutcome, RunnerError> {
     let root = absolutize(&request.root)?;
     validate_run_id(&request.run_id)?;
@@ -2059,6 +2184,11 @@ fn collect_compose_cleanup(
     }
 }
 
+/// Clean up stale run sandboxes under `request.root`.
+///
+/// Only directories that match the runner-owned manifest marker and are older
+/// than the retention-safe safety checks are removed. Returns both removed paths
+/// and those that could not be removed.
 pub fn clean(request: CleanRequest) -> Result<CleanOutcome, RunnerError> {
     if !request.root.exists() {
         return Ok(CleanOutcome {

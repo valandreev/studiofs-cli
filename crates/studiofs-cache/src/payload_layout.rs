@@ -32,14 +32,23 @@ pub const LOCAL_PAYLOAD_REDB_INDEX_FILE: &str = "cache.redb";
 /// Fully resolved local payload object runtime paths for a cache root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalPayloadLayout {
+    /// Caller-provided per-volume cache root used to derive all runtime paths.
     pub cache_root: PathBuf,
+    /// Runtime root directory for the active on-disk payload layout.
     pub runtime_root: PathBuf,
+    /// Temporary directory for atomic writes and staging.
     pub tmp_dir: PathBuf,
+    /// Root directory holding committed payload objects (`payload/`).
     pub payload_root: PathBuf,
+    /// Root directory holding committed payload object files (`payload/objects/`).
     pub payload_objects_dir: PathBuf,
+    /// Root directory holding upload-staged payload objects (`upload/`).
     pub upload_stage_root: PathBuf,
+    /// Root directory holding upload-staged payload object files (`upload/objects/`).
     pub upload_stage_objects_dir: PathBuf,
+    /// Root directory holding payload metadata/index files (`index/`).
     pub index_dir: PathBuf,
+    /// Full path to the redb payload index file (`index/cache.redb`).
     pub redb_index_path: PathBuf,
 }
 
