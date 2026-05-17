@@ -214,6 +214,35 @@ fn runner_contract_documents_mounted_level_9_promotion_gate() {
 }
 
 #[test]
+fn runner_contract_documents_adversarial_cleanup_proof() {
+    let contract_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("docs/e2e-runner-contract.md");
+    let tests_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("docs/tests.md");
+    let contract = fs::read_to_string(contract_path).unwrap();
+    let tests = fs::read_to_string(tests_path).unwrap();
+    let combined = format!("{contract}\n{tests}");
+    let normalized = combined.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    for expected in [
+        "Adversarial Runner Cleanup Proof",
+        "SFS-381",
+        "adversarial-cleanup-proof.json",
+        "compose_partial_launch_failure_writes_adversarial_cleanup_proof",
+        "post_start_cleanup_report_errors_do_not_shadow_primary_error",
+        "mounted_cleanup_verification_failure_blocks_later_mounted_children",
+        "does not add or renumber a mounted scenario",
+    ] {
+        assert!(
+            normalized.contains(expected),
+            "runner docs must describe adversarial cleanup proof phrase: {expected}"
+        );
+    }
+}
+
+#[test]
 fn list_scenarios_exposes_initial_basic_smoke_scenario() {
     let scenarios = studiofs_e2e::scenario::available_scenarios();
 

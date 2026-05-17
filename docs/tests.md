@@ -152,6 +152,19 @@ cargo run -p studiofs-e2e -- local-first-baseline-gate --studiofs-bin target\deb
 cargo run -p studiofs-e2e -- clean
 ```
 
+SFS-381 adversarial cleanup proof is a focused runner self-test layer, not a
+new mounted scenario number. It validates partial setup failure cleanup, hung
+supervised child timeout reporting, post-scenario mounted cleanup
+contamination, and primary-error preservation through infra-disabled tests and
+the best-effort `artifacts/runner/adversarial-cleanup-proof.json` artifact:
+
+```powershell
+cargo test -p studiofs-e2e runner::tests::compose_partial_launch_failure_writes_adversarial_cleanup_proof -- --exact --nocapture
+cargo test -p studiofs-e2e runner::tests::post_start_cleanup_report_errors_do_not_shadow_primary_error -- --exact --nocapture
+cargo test -p studiofs-e2e runner::tests::mounted_cleanup_verification_failure_blocks_later_mounted_children -- --exact --nocapture
+cargo test -p studiofs-e2e runner::tests::supervised_child_timeout_records_executor_cleanup_detail -- --exact --nocapture
+```
+
 `run` uses Docker Compose infrastructure by default. The stack is defined in
 `docker/compose.e2e.yml` and includes PostgreSQL 18, RustFS, and a Toxiproxy
 placeholder. Use `--port-range <start-end>` to allocate deterministic
