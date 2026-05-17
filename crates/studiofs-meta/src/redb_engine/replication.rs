@@ -1098,6 +1098,11 @@ impl RedbMetaEngine {
         Self::remove_stale_dentries_for_base_entry(txn, entry)?;
 
         if dst_in_base {
+            // The base rename winner moved this logical source to the
+            // destination.  Remove any serving entry still occupying the old
+            // source name, even if it points at a local overlay inode; payload
+            // and inode protection are handled separately from namespace
+            // visibility.
             Self::remove_dentry_mirror_in_txn(txn, parent, name)?;
             Self::set_dentry_mirror_in_txn(txn, new_parent, new_name, entry)?;
         } else if src_in_base {

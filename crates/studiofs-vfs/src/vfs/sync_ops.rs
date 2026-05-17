@@ -808,7 +808,7 @@ impl StudioVfs {
             }
         }
         Err(VfsError::Other(format!(
-            "flush barrier did not quiesce local dirty state for inode {ino}"
+            "strict flush barrier failed to quiesce local dirty state for inode {ino} after {MAX_FLUSH_QUIESCE_PASSES} passes"
         )))
     }
 
