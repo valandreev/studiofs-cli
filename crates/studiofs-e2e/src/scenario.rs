@@ -6335,11 +6335,18 @@ fn run_symlink_attribute_operations(
                 Instant::now() + timeout,
                 poll_interval,
             )?;
-            write_mounted_file_without_barrier_with_readback(
-                renamer.mount_point.join(&target_v2),
-                &target_v2_payload,
-                "symlink target v2",
-            )?;
+            operations.push(required_op(
+                started,
+                operations.len() + 1,
+                renamer,
+                "symlink_target_replacement_write",
+                &target_v2,
+                write_mounted_file_without_barrier_with_readback(
+                    renamer.mount_point.join(&target_v2),
+                    &target_v2_payload,
+                    "symlink target v2",
+                ),
+            )?);
             operations.push(required_op(
                 started,
                 operations.len() + 1,
@@ -6374,11 +6381,18 @@ fn run_symlink_attribute_operations(
         Err(error) => return Err(ScenarioError::Io(error)),
     };
 
-    write_mounted_file_without_barrier_with_readback(
-        attr_writer.mount_point.join(&readonly_path),
-        &readonly_payload,
-        "readonly attribute target",
-    )?;
+    operations.push(required_op(
+        started,
+        operations.len() + 1,
+        attr_writer,
+        "readonly_attribute_target_write",
+        &readonly_path,
+        write_mounted_file_without_barrier_with_readback(
+            attr_writer.mount_point.join(&readonly_path),
+            &readonly_payload,
+            "readonly attribute target",
+        ),
+    )?);
     let readonly_result = set_mounted_readonly(attr_writer.mount_point.join(&readonly_path));
     let (readonly_attribute_supported, readonly_attribute_skip_reason) = match readonly_result {
         Ok(()) => {
@@ -6575,8 +6589,16 @@ fn retry_mounted_io(
 }
 
 fn is_transient_mounted_io_error(error: &io::Error) -> bool {
-    const ERROR_GEN_FAILURE: i32 = 31;
-    error.raw_os_error() == Some(ERROR_GEN_FAILURE)
+    #[cfg(windows)]
+    {
+        const ERROR_GEN_FAILURE: i32 = 31;
+        error.raw_os_error() == Some(ERROR_GEN_FAILURE)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = error;
+        false
+    }
 }
 
 fn is_supported_symlink_skip_error(error: &io::Error) -> bool {
