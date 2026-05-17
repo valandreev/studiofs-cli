@@ -2625,6 +2625,9 @@ impl PgMetaEngine {
                     let Ok(entry) = self.local.lookup(*parent, name) else {
                         continue;
                     };
+                    if self.local_uploading_dentry_needs_foreign_protection(entry.ino)? {
+                        overlay.dentry_keys.insert(Self::dentry_key(*parent, name));
+                    }
                     entry.ino
                 }
                 _ => continue,
@@ -2637,6 +2640,18 @@ impl PgMetaEngine {
             }
         }
         Ok(overlay)
+    }
+
+    fn local_uploading_dentry_needs_foreign_protection(&self, ino: Ino) -> MetaResult<bool> {
+        let attr = match self.local.get_attr(ino) {
+            Ok(attr) => attr,
+            Err(MetaError::InodeNotFound(_)) => return Ok(false),
+            Err(err) => return Err(err),
+        };
+        Ok(attr.kind == FileType::RegularFile
+            && attr.upload_state != UploadState::Ready
+            && attr.size <= attr.committed_size
+            && self.local.has_local_regular_file_overlay(ino)?)
     }
 
     fn grandfather_removed_local_regular_file_attrs(
@@ -5967,6 +5982,57 @@ mod tests {
                 Err(MetaError::EntryNotFound { .. })
             ),
             "self-ack of the local append must not resurrect the deleted path"
+        );
+    }
+
+    #[test]
+    fn foreign_unlink_during_local_uploading_preserves_writer_dentry() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+
+        let file = create_published_small_file(&pg, ROOT_INO, b"uploading-target.txt", 77_014);
+        let setup_end = pg.local.get_counter("nextEventSeq").expect("setup end");
+        pg.persist_flushed_event_seq(setup_end)
+            .expect("ack published setup");
+
+        set_file_state(&pg, file.ino, 64, 2);
+        let local_payload = PayloadRef::new_partial(77_015, 64);
+        pg.stage_payload_slice(file.ino, 0, &local_payload)
+            .expect("stage active local upload overlay");
+        let overlay = pg.local_overlay_conflicts().expect("overlay conflicts");
+        assert!(overlay.block_inodes.contains(&file.ino));
+        assert!(pg.lookup(ROOT_INO, b"uploading-target.txt").is_ok());
+
+        let batch = [
+            MetaEvent::RemoveEntry {
+                parent: ROOT_INO,
+                name: b"uploading-target.txt".to_vec(),
+            },
+            MetaEvent::RemoveAttr { ino: file.ino },
+        ];
+        let current_regular_file_conflicts = pg
+            .current_regular_file_overlay_conflicts_for_batch(&batch)
+            .expect("collect current regular-file conflicts");
+        assert!(
+            current_regular_file_conflicts
+                .dentry_keys
+                .contains(&PgMetaEngine::dentry_key(ROOT_INO, b"uploading-target.txt")),
+            "active writer-local uploads must keep the serving dentry private"
+        );
+
+        pg.apply_foreign_batch(&batch, &overlay, &HashSet::new())
+            .expect("apply foreign unlink");
+
+        assert!(
+            pg.lookup(ROOT_INO, b"uploading-target.txt").is_ok(),
+            "foreign unlink must not remove an active writer-local uploading path"
+        );
+        let local_attr = pg.get_attr(file.ino).expect("local attr after unlink");
+        assert_eq!(local_attr.upload_state, UploadState::Ready);
+        assert_eq!(
+            lookup_first_object_id(&pg, file.ino)
+                .expect("lookup local payload")
+                .expect("local payload remains visible"),
+            local_payload.object_id
         );
     }
 
