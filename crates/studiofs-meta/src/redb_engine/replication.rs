@@ -1098,7 +1098,7 @@ impl RedbMetaEngine {
         Self::remove_stale_dentries_for_base_entry(txn, entry)?;
 
         if dst_in_base {
-            Self::remove_dentry_mirror_if_matches_in_txn(txn, parent, name, entry)?;
+            Self::remove_dentry_mirror_in_txn(txn, parent, name)?;
             Self::set_dentry_mirror_in_txn(txn, new_parent, new_name, entry)?;
         } else if src_in_base {
             Self::remove_dentry_mirror_if_matches_in_txn(txn, new_parent, new_name, entry)?;

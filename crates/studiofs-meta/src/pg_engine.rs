@@ -5986,6 +5986,85 @@ mod tests {
     }
 
     #[test]
+    fn foreign_rename_replace_during_local_append_removes_source_dentry() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+
+        let source = create_published_small_file(&pg, ROOT_INO, b"slot-3.txt", 77_112);
+        let target = create_published_small_file(&pg, ROOT_INO, b"slot-3-renamed.txt", 77_113);
+        let setup_end = pg.local.get_counter("nextEventSeq").expect("setup end");
+        pg.persist_flushed_event_seq(setup_end)
+            .expect("ack published setup");
+
+        set_file_state(&pg, source.ino, 227, 2);
+        let local_tail = PayloadRef::new_partial(77_114, 163);
+        pg.stage_payload_slice(source.ino, 1, &local_tail)
+            .expect("stage local append overlay");
+        let local_append_start = pg.flushed_event_seq.load(Ordering::SeqCst);
+        let overlay = pg.local_overlay_conflicts().expect("overlay conflicts");
+        assert!(overlay.block_inodes.contains(&source.ino));
+        assert!(pg.lookup(ROOT_INO, b"slot-3.txt").is_ok());
+
+        let rename_replace = MetaEvent::RenameEntry {
+            parent: ROOT_INO,
+            name: b"slot-3.txt".to_vec(),
+            new_parent: ROOT_INO,
+            new_name: b"slot-3-renamed.txt".to_vec(),
+            entry: DirEntryValue {
+                ino: source.ino,
+                kind: FileType::RegularFile,
+            },
+            displaced_set_attr: Box::new(None),
+            displaced_remove_attr_ino: Some(target.ino),
+            moved_dir_attr: Box::new(None),
+            old_parent_attr: Box::new(None),
+            new_parent_attr: Box::new(None),
+        };
+
+        pg.apply_foreign_batch(&[rename_replace], &overlay, &HashSet::new())
+            .expect("apply foreign rename replace");
+
+        assert!(
+            matches!(
+                pg.lookup(ROOT_INO, b"slot-3.txt"),
+                Err(MetaError::EntryNotFound { .. })
+            ),
+            "foreign rename/replace must remove the old source path even with local append state"
+        );
+        let renamed = pg
+            .lookup(ROOT_INO, b"slot-3-renamed.txt")
+            .expect("lookup renamed target");
+        assert_eq!(renamed.ino, source.ino);
+        assert!(pg.get_attr(target.ino).is_err());
+
+        mark_overlay_objects_uploaded(&pg, source.ino, 2, &[local_tail.object_id]);
+        assert!(
+            pg.publish_regular_file_overlay_to_base_if_matches(source.ino, 2)
+                .expect("publish local append"),
+            "local append publish should still succeed by inode after source rename"
+        );
+        let local_append_end = pg.local.get_counter("nextEventSeq").expect("event end");
+        let local_events = pg
+            .local
+            .read_events_range(local_append_start, local_append_end)
+            .expect("read local append events");
+        let projected_self_batch = PgMetaEngine::project_remote_events(&local_events);
+        pg.acknowledge_local_prefix_from_self_batch(&projected_self_batch)
+            .expect("ack local append self batch");
+
+        assert!(
+            matches!(
+                pg.lookup(ROOT_INO, b"slot-3.txt"),
+                Err(MetaError::EntryNotFound { .. })
+            ),
+            "self-ack of the local append must not resurrect the renamed source path"
+        );
+        let renamed = pg
+            .lookup(ROOT_INO, b"slot-3-renamed.txt")
+            .expect("lookup renamed target after self-ack");
+        assert_eq!(renamed.ino, source.ino);
+    }
+
+    #[test]
     fn foreign_unlink_during_local_uploading_preserves_writer_dentry() {
         let (_dir, pg) = temp_pg_engine_for_unit();
 

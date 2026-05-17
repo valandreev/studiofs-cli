@@ -356,6 +356,94 @@ fn replica_serving_rename_uses_base_winner_when_local_loser_moved_to_b() {
 }
 
 #[test]
+fn replica_serving_rename_removes_source_even_when_overlay_points_at_other_inode() {
+    let engine = temp_engine();
+    let source = DirEntryValue {
+        ino: 784,
+        kind: FileType::RegularFile,
+    };
+    let target = DirEntryValue {
+        ino: 785,
+        kind: FileType::RegularFile,
+    };
+    let local_overlay = DirEntryValue {
+        ino: 786,
+        kind: FileType::RegularFile,
+    };
+    let source_attr = InodeAttr::new_file(source.ino, ROOT_INO, 1000, 1000, 0o644);
+    let target_attr = InodeAttr::new_file(target.ino, ROOT_INO, 1000, 1000, 0o644);
+    let local_attr = InodeAttr::new_file(local_overlay.ino, ROOT_INO, 1000, 1000, 0o644);
+
+    engine
+        .apply_replica_events_to_base(&[
+            MetaEvent::SetAttr {
+                attr: source_attr.clone(),
+            },
+            MetaEvent::SetAttr {
+                attr: target_attr.clone(),
+            },
+            MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: b"slot-3.txt".to_vec(),
+                entry: source.clone(),
+            },
+            MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: b"slot-3-renamed.txt".to_vec(),
+                entry: target.clone(),
+            },
+        ])
+        .unwrap();
+    engine
+        .apply_replica_serving_state(&[
+            MetaEvent::SetAttr { attr: source_attr },
+            MetaEvent::SetAttr { attr: target_attr },
+            MetaEvent::SetAttr { attr: local_attr },
+            MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: b"slot-3.txt".to_vec(),
+                entry: local_overlay,
+            },
+            MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: b"slot-3-renamed.txt".to_vec(),
+                entry: target.clone(),
+            },
+        ])
+        .unwrap();
+
+    let rename_replace = MetaEvent::RenameEntry {
+        parent: ROOT_INO,
+        name: b"slot-3.txt".to_vec(),
+        new_parent: ROOT_INO,
+        new_name: b"slot-3-renamed.txt".to_vec(),
+        entry: source.clone(),
+        displaced_set_attr: Box::new(None),
+        displaced_remove_attr_ino: Some(target.ino),
+        moved_dir_attr: Box::new(None),
+        old_parent_attr: Box::new(None),
+        new_parent_attr: Box::new(None),
+    };
+
+    engine
+        .apply_replica_events_to_base(std::slice::from_ref(&rename_replace))
+        .unwrap();
+    engine
+        .apply_replica_serving_state(std::slice::from_ref(&rename_replace))
+        .unwrap();
+
+    assert_only_visible_name(
+        &engine,
+        b"slot-3-renamed.txt",
+        &[b"slot-3.txt".as_slice()],
+    );
+    let renamed = engine
+        .lookup(ROOT_INO, b"slot-3-renamed.txt")
+        .expect("lookup renamed target");
+    assert_eq!(renamed.ino, source.ino);
+}
+
+#[test]
 fn replica_base_rename_uses_pg_order_when_source_already_moved_to_prior_winner() {
     let engine = temp_engine();
     let entry = DirEntryValue {
