@@ -112,19 +112,8 @@ impl RedbMetaEngine {
         snapshot.regular_file_overlay = snapshot.regular_file_base.clone();
         snapshot.event_log.clear();
         snapshot.counters.retain(|(name, _)| {
-            !matches!(
-                name.as_str(),
-                "nextEventSeq"
-                    | "pgClientSlotPlusOne"
-                    | "pgInodeActiveRangeStart"
-                    | "pgInodeActiveRangeEnd"
-                    | "pgInodeReservedRangeEnd"
-                    | "pgInodeCurrentWindowStart"
-                    | "pgInodeCurrentWindowEnd"
-                    | "pgInodePrefetchedWindowStart"
-                    | "pgInodePrefetchedWindowNext"
-                    | "pgInodePrefetchedWindowEnd"
-            )
+            name.as_str() != "nextEventSeq"
+                && !crate::pg_engine::is_local_pg_snapshot_state_counter(name)
         });
         if let Some((_, value)) = snapshot
             .counters

@@ -43,6 +43,22 @@ const LEGACY_PG_INODE_RANGE_WINDOW: u64 = 1_000_000;
 const PG_INODE_WINDOW_SIZE: u64 = 250_000;
 const PG_INODE_PREFETCH_LOW_WATERMARK: u64 = 50_000;
 
+pub(crate) fn is_local_pg_snapshot_state_counter(name: &str) -> bool {
+    matches!(
+        name,
+        LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER
+            | LOCAL_PG_CLIENT_SLOT_COUNTER
+            | LEGACY_LOCAL_PG_INODE_ACTIVE_RANGE_START_COUNTER
+            | LEGACY_LOCAL_PG_INODE_ACTIVE_RANGE_END_COUNTER
+            | LEGACY_LOCAL_PG_INODE_RESERVED_RANGE_END_COUNTER
+            | LOCAL_PG_INODE_CURRENT_WINDOW_START_COUNTER
+            | LOCAL_PG_INODE_CURRENT_WINDOW_END_COUNTER
+            | LOCAL_PG_INODE_PREFETCHED_WINDOW_START_COUNTER
+            | LOCAL_PG_INODE_PREFETCHED_WINDOW_NEXT_COUNTER
+            | LOCAL_PG_INODE_PREFETCHED_WINDOW_END_COUNTER
+    )
+}
+
 /// PostgreSQL-backed metadata engine.
 ///
 /// Current implementation strategy:
@@ -7364,24 +7380,51 @@ mod tests {
     }
 
     #[test]
-    fn remote_snapshot_does_not_export_local_pg_client_slot() {
+    fn remote_snapshot_does_not_export_local_pg_state() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("meta.redb");
         let local = RedbMetaEngine::open(&path).expect("open local redb");
         local.init_root(0, 0).expect("init root");
         PgMetaEngine::persist_client_slot(&local, 7).expect("persist client slot");
+        local
+            .write_counters(|counters| {
+                counters.set(LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER, 150)?;
+                counters.set(LEGACY_LOCAL_PG_INODE_ACTIVE_RANGE_START_COUNTER, 1_000)?;
+                counters.set(LEGACY_LOCAL_PG_INODE_ACTIVE_RANGE_END_COUNTER, 1_100)?;
+                counters.set(LEGACY_LOCAL_PG_INODE_RESERVED_RANGE_END_COUNTER, 1_200)?;
+                counters.set(LOCAL_PG_INODE_CURRENT_WINDOW_START_COUNTER, 2_000)?;
+                counters.set(LOCAL_PG_INODE_CURRENT_WINDOW_END_COUNTER, 2_100)?;
+                counters.set(LOCAL_PG_INODE_PREFETCHED_WINDOW_START_COUNTER, 2_100)?;
+                counters.set(LOCAL_PG_INODE_PREFETCHED_WINDOW_NEXT_COUNTER, 2_100)?;
+                counters.set(LOCAL_PG_INODE_PREFETCHED_WINDOW_END_COUNTER, 2_200)?;
+                Ok(())
+            })
+            .expect("seed local pg counters");
 
         let snapshot = local
             .export_remote_snapshot()
             .expect("export remote snapshot");
 
-        assert!(
-            snapshot
-                .counters
-                .iter()
-                .all(|(name, _)| name != LOCAL_PG_CLIENT_SLOT_COUNTER),
-            "remote discovery snapshots must not make a new client reuse the writer slot"
-        );
+        for local_counter in [
+            LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER,
+            LOCAL_PG_CLIENT_SLOT_COUNTER,
+            LEGACY_LOCAL_PG_INODE_ACTIVE_RANGE_START_COUNTER,
+            LEGACY_LOCAL_PG_INODE_ACTIVE_RANGE_END_COUNTER,
+            LEGACY_LOCAL_PG_INODE_RESERVED_RANGE_END_COUNTER,
+            LOCAL_PG_INODE_CURRENT_WINDOW_START_COUNTER,
+            LOCAL_PG_INODE_CURRENT_WINDOW_END_COUNTER,
+            LOCAL_PG_INODE_PREFETCHED_WINDOW_START_COUNTER,
+            LOCAL_PG_INODE_PREFETCHED_WINDOW_NEXT_COUNTER,
+            LOCAL_PG_INODE_PREFETCHED_WINDOW_END_COUNTER,
+        ] {
+            assert!(
+                snapshot
+                    .counters
+                    .iter()
+                    .all(|(name, _)| name != local_counter),
+                "remote discovery snapshots must not export local-only PG counter {local_counter}"
+            );
+        }
     }
 
     fn persist_inode_state(local: &RedbMetaEngine, state: InodeAllocatorState) {
