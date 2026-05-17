@@ -15,6 +15,8 @@ use crate::{VfsError, VfsMeta};
 use std::time::{Duration, Instant};
 use studiofs_meta::types::block_index_from_offset;
 
+const MAX_FLUSH_QUIESCE_PASSES: usize = 8;
+
 impl StudioVfs {
     pub(super) fn spawn_landing_zone_recovery_worker(self: &Arc<Self>) {
         let vfs = self.clone();
@@ -700,7 +702,8 @@ impl StudioVfs {
         // tokio::sync::Mutex which blocks until the background task releases it.
         self.wait_for_deferred_materialization_inflight(ino).await;
 
-        let materialized_writer_stack_bytes = self.materialize_writer_stack_for_inode(ino).await?;
+        let mut materialized_writer_stack_bytes =
+            self.materialize_writer_stack_for_inode(ino).await?;
         let flushed_file_data = materialized_writer_stack_bytes > 0
             || self.has_pending_local_dirty_payloads_for_inode(ino);
         let residual_pending_local_payloads = self.has_pending_local_dirty_payloads_for_inode(ino);
@@ -719,7 +722,14 @@ impl StudioVfs {
         let persisted_slice_bytes_before_flush =
             self.total_pending_persisted_local_dirty_slice_bytes();
         if residual_local_dirty_state {
-            self.flush_local_dirty_state(ino, local_sync_policy).await?;
+            if local_sync_policy.requires_write_path_durability() {
+                materialized_writer_stack_bytes = materialized_writer_stack_bytes.saturating_add(
+                    self.flush_local_dirty_state_until_quiescent(ino, local_sync_policy)
+                        .await?,
+                );
+            } else {
+                self.flush_local_dirty_state(ino, local_sync_policy).await?;
+            }
         }
         if local_sync_policy.requires_write_path_durability() {
             self.maybe_payload_store_sync_data_async(
@@ -776,6 +786,30 @@ impl StudioVfs {
             flushed_file_data,
             persisted_dirty_attrs,
         })
+    }
+
+    async fn flush_local_dirty_state_until_quiescent(
+        &self,
+        ino: Ino,
+        local_sync_policy: LocalSyncPolicy,
+    ) -> VfsResult<usize> {
+        let mut materialized_writer_stack_bytes = 0usize;
+        // A strict flush is a finite barrier: each pass drains dirty state
+        // that may have appeared while the previous pass materialized slices.
+        for _ in 0..MAX_FLUSH_QUIESCE_PASSES {
+            materialized_writer_stack_bytes = materialized_writer_stack_bytes
+                .saturating_add(self.materialize_writer_stack_for_inode(ino).await?);
+            if !self.inode_has_local_dirty_state(ino) {
+                return Ok(materialized_writer_stack_bytes);
+            }
+            self.flush_local_dirty_state(ino, local_sync_policy).await?;
+            if !self.inode_has_local_dirty_state(ino) {
+                return Ok(materialized_writer_stack_bytes);
+            }
+        }
+        Err(VfsError::Other(format!(
+            "strict flush barrier failed to quiesce local dirty state for inode {ino} after {MAX_FLUSH_QUIESCE_PASSES} passes"
+        )))
     }
 
     fn local_sync_policy_for_barrier(&self, ino: Ino) -> LocalSyncPolicy {
