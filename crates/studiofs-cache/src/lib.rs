@@ -12,7 +12,7 @@ use std::time::Duration;
 
 /// Benchmark cache facade used only by local benchmark/test tooling.
 pub mod benchmark_cache;
-/// Benchmark cache facade used only by local benchmark/test tooling.
+/// Production cache runtime backing VFS mount paths with staged writeback and local payload caching.
 pub mod cached_store;
 /// Local payload backends and object-store layout helpers.
 pub mod local;
