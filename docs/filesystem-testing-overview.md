@@ -240,6 +240,27 @@ a sleeping process, or a short local scheduling gap. They may lag behind for a
 bounded period, but they still need a reliable way back to the current shared
 filesystem state.
 
+### 21. Symlink And Metadata-Attribute Convergence
+
+This scenario checks filesystem details that are easy to forget when we only
+look at regular files and directories. It creates normal target files, tries to
+create a symlink to one of them, renames the symlink, and, on platforms where
+the bridge exposes it, checks that the symlink target is still the same through
+the public mounted filesystem.
+
+It also checks a simple metadata attribute that users can observe without
+looking inside StudioFS internals: the read-only flag on a file. One mounted
+client marks a file as read-only, and the others must eventually see that same
+public attribute through their own mounts.
+
+Not every platform exposes every detail the same way. On Windows/WinFSP, for
+example, symlink creation can be unavailable in the current bridge path. That
+is not treated as a mysterious failure. The scenario records an explicit
+platform skip for the unsupported symlink behavior, then still validates the
+supported parts of the scenario. This keeps the test honest: we do not fake
+features a bridge cannot expose, but we do require supported public filesystem
+state to converge.
+
 ## What The Baseline Gate Means
 
 `local-first-baseline-gate` reruns scenarios 1 through 8 as the accepted
@@ -258,7 +279,8 @@ real-mount scenarios: basic sharing, service outages, crash/restart,
 publication boundaries, focused namespace collisions, seeded chaos, hot-spot
 churn, fault chaos, LWW reconnect, open-handle behavior, sparse files, late
 observers, stale remounts, cold discovery, invalidation dropout/fallback sync,
-and any appended promotion scenarios selected for that run.
+symlink and metadata-attribute behavior, and any later appended promotion
+scenarios selected for that run.
 
 It does not mean the filesystem is perfect. It means the current safety net is
 working and gives us a strong baseline before we add deeper scenarios.
@@ -284,5 +306,7 @@ only then move to the next level.
 
 Future deterministic backstops can go deeper into sparse-file
 truncate/write/read-range races, cold-observer long-history convergence,
-stale-remount catch-up, symlink and metadata-attribute convergence, and
-adversarial runner cleanup.
+stale-remount catch-up, and adversarial runner cleanup. Symlink and
+metadata-attribute convergence now has a real mounted promotion scenario,
+`mounted-symlink-attribute-convergence`, with platform-gated public filesystem
+checks.

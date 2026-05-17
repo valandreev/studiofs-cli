@@ -56,6 +56,7 @@ pub const MOUNTED_STALE_REMOUNT_COLD_DISCOVER_CATCHUP_CONVERGENCE: &str =
     "mounted-stale-remount-cold-discover-catchup-convergence";
 pub const MOUNTED_INVALIDATION_DROPOUT_FALLBACK_CONVERGENCE: &str =
     "mounted-invalidation-dropout-fallback-convergence";
+pub const MOUNTED_SYMLINK_ATTRIBUTE_CONVERGENCE: &str = "mounted-symlink-attribute-convergence";
 const SMOKE_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
 const COLLISION_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
 const ADVANCED_MOUNTED_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
@@ -69,6 +70,7 @@ const STALE_REMOUNT_INITIAL_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "c
 const INVALIDATION_DROPOUT_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
 const INVALIDATION_DROPOUT_WRITER_CLIENTS: &[&str] = &["client-a", "client-b"];
 const INVALIDATION_DROPOUT_OBSERVER_CLIENT: &str = "client-c";
+const SYMLINK_ATTRIBUTE_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
 const POSTGRES_OUTAGE_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c"];
 const RUSTFS_OUTAGE_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c", "client-d"];
 const CRASH_RESTART_CLIENT_NAMES: &[&str] = &["client-a", "client-b"];
@@ -137,6 +139,12 @@ const COLD_OBSERVER_RENAME_DEST: &str = "renamed-final.txt";
 const COLD_OBSERVER_OVERWRITE_TARGET: &str = "overwrite-target.txt";
 const COLD_OBSERVER_APPEND_TARGET: &str = "append-target.txt";
 const COLD_OBSERVER_NESTED_FILE: &str = "nested/child.txt";
+const SYMLINK_ATTRIBUTE_TARGET_V1: &str = "target-v1.txt";
+const SYMLINK_ATTRIBUTE_TARGET_V2: &str = "target-v2.txt";
+const SYMLINK_ATTRIBUTE_LINK: &str = "link-to-target";
+const SYMLINK_ATTRIBUTE_RENAMED_LINK: &str = "renamed-link";
+const SYMLINK_ATTRIBUTE_READONLY_FILE: &str = "readonly-attribute.txt";
+const SYMLINK_ATTRIBUTE_NEARBY_FILE: &str = "near-symlink-write.txt";
 const INVALIDATION_DROPOUT_FALLBACK_INTERVAL_MS: u64 = 3_000;
 const INVALIDATION_DROPOUT_STALE_WINDOW_MS: u64 = 500;
 const INVALIDATION_DROPOUT_BASELINE_FILE: &str = "baseline.txt";
@@ -286,6 +294,7 @@ pub fn available_scenarios() -> Vec<ScenarioDefinition> {
         AdvancedMountedScenario::new(AdvancedMountedKind::StaleRemountColdDiscoverCatchup)
             .definition(),
         AdvancedMountedScenario::new(AdvancedMountedKind::InvalidationDropoutFallback).definition(),
+        AdvancedMountedScenario::new(AdvancedMountedKind::SymlinkAttribute).definition(),
     ]
 }
 
@@ -359,6 +368,11 @@ pub(crate) fn resolve_scenario(name: &str) -> Option<Box<dyn Scenario>> {
         | "fallback-sync" => Some(Box::new(AdvancedMountedScenario::new(
             AdvancedMountedKind::InvalidationDropoutFallback,
         ))),
+        MOUNTED_SYMLINK_ATTRIBUTE_CONVERGENCE | "symlink-attribute" | "symlink-attrs" => {
+            Some(Box::new(AdvancedMountedScenario::new(
+                AdvancedMountedKind::SymlinkAttribute,
+            )))
+        }
         #[cfg(test)]
         TEST_FAILING_VALIDATE => Some(Box::new(TestFailingScenario {
             cleanup_fails: false,
@@ -2930,6 +2944,7 @@ enum AdvancedMountedKind {
     ColdObserverLongHistory,
     StaleRemountColdDiscoverCatchup,
     InvalidationDropoutFallback,
+    SymlinkAttribute,
 }
 
 impl AdvancedMountedKind {
@@ -2947,6 +2962,7 @@ impl AdvancedMountedKind {
                 MOUNTED_STALE_REMOUNT_COLD_DISCOVER_CATCHUP_CONVERGENCE
             }
             Self::InvalidationDropoutFallback => MOUNTED_INVALIDATION_DROPOUT_FALLBACK_CONVERGENCE,
+            Self::SymlinkAttribute => MOUNTED_SYMLINK_ATTRIBUTE_CONVERGENCE,
         }
     }
 
@@ -2966,6 +2982,7 @@ impl AdvancedMountedKind {
             Self::InvalidationDropoutFallback => {
                 "mounted invalidation-dropout fallback-sync convergence"
             }
+            Self::SymlinkAttribute => "mounted symlink and metadata-attribute convergence",
         }
     }
 
@@ -2981,6 +2998,7 @@ impl AdvancedMountedKind {
             Self::ColdObserverLongHistory => "cold-observer",
             Self::StaleRemountColdDiscoverCatchup => "stale-remount-cold-discover",
             Self::InvalidationDropoutFallback => "invalidation-dropout",
+            Self::SymlinkAttribute => "symlink-attribute",
         }
     }
 
@@ -2996,6 +3014,7 @@ impl AdvancedMountedKind {
             Self::ColdObserverLongHistory => "cold-observer-long-history-summary.json",
             Self::StaleRemountColdDiscoverCatchup => "stale-remount-cold-discover-summary.json",
             Self::InvalidationDropoutFallback => "invalidation-dropout-summary.json",
+            Self::SymlinkAttribute => "symlink-attribute-summary.json",
         }
     }
 
@@ -3004,6 +3023,7 @@ impl AdvancedMountedKind {
             Self::FaultChaos => FAULT_CHAOS_CLIENT_NAMES,
             Self::LwwReconnectChaos => LWW_RECONNECT_CLIENT_NAMES,
             Self::InvalidationDropoutFallback => INVALIDATION_DROPOUT_CLIENT_NAMES,
+            Self::SymlinkAttribute => SYMLINK_ATTRIBUTE_CLIENT_NAMES,
             Self::ColdObserverLongHistory | Self::StaleRemountColdDiscoverCatchup => {
                 COLD_OBSERVER_CLIENT_NAMES
             }
@@ -3240,6 +3260,19 @@ struct InvalidationDropoutSummary {
     final_validation_result: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SymlinkAttributeSummary {
+    symlink_supported: bool,
+    symlink_skip_reason: Option<String>,
+    readonly_attribute_supported: bool,
+    readonly_attribute_skip_reason: Option<String>,
+    final_symlink_path: String,
+    final_symlink_target: String,
+    readonly_path: String,
+    readonly_observed_clients: Vec<String>,
+    final_validation_result: String,
+}
+
 impl InvalidationDropoutSummary {
     fn matched(&self) -> bool {
         self.notify_suppressed
@@ -3270,6 +3303,8 @@ struct AdvancedMountedSummary {
     catchup: Option<CatchupSummary>,
     #[serde(default)]
     invalidation_dropout: Option<InvalidationDropoutSummary>,
+    #[serde(default)]
+    symlink_attributes: Option<SymlinkAttributeSummary>,
 }
 
 struct AdvancedMountedExecution {
@@ -3280,6 +3315,7 @@ struct AdvancedMountedExecution {
     long_history: Option<LongHistorySummary>,
     catchup: Option<CatchupSummary>,
     invalidation_dropout: Option<InvalidationDropoutSummary>,
+    symlink_attributes: Option<SymlinkAttributeSummary>,
 }
 
 impl LongHistoryValidation {
@@ -3372,6 +3408,7 @@ fn run_advanced_mounted_body(
             long_history: execution.long_history,
             catchup: execution.catchup,
             invalidation_dropout: execution.invalidation_dropout,
+            symlink_attributes: execution.symlink_attributes,
         },
     )?;
     Ok(summary)
@@ -3450,6 +3487,8 @@ fn write_advanced_mounted_plan_artifacts(
             .then(planned_catchup_summary),
         invalidation_dropout: (kind == AdvancedMountedKind::InvalidationDropoutFallback)
             .then(planned_invalidation_dropout_summary),
+        symlink_attributes: (kind == AdvancedMountedKind::SymlinkAttribute)
+            .then(planned_symlink_attribute_summary),
     };
     write_advanced_mounted_summary(context, kind, &summary)?;
     Ok(summary)
@@ -3471,6 +3510,7 @@ fn execute_advanced_mounted_operations(
             long_history: None,
             catchup: None,
             invalidation_dropout: None,
+            symlink_attributes: None,
         }),
         AdvancedMountedKind::MountedChaos => Ok(AdvancedMountedExecution {
             operations: run_mounted_chaos_operations(
@@ -3486,6 +3526,7 @@ fn execute_advanced_mounted_operations(
             long_history: None,
             catchup: None,
             invalidation_dropout: None,
+            symlink_attributes: None,
         }),
         AdvancedMountedKind::HotspotChurn => Ok(AdvancedMountedExecution {
             operations: run_hotspot_churn_operations(
@@ -3501,6 +3542,7 @@ fn execute_advanced_mounted_operations(
             long_history: None,
             catchup: None,
             invalidation_dropout: None,
+            symlink_attributes: None,
         }),
         AdvancedMountedKind::FaultChaos => Ok(AdvancedMountedExecution {
             operations: run_fault_chaos_operations(context, controller, clients, isolation)?,
@@ -3510,6 +3552,7 @@ fn execute_advanced_mounted_operations(
             long_history: None,
             catchup: None,
             invalidation_dropout: None,
+            symlink_attributes: None,
         }),
         AdvancedMountedKind::LwwReconnectChaos => {
             let (operations, oracle) =
@@ -3522,6 +3565,7 @@ fn execute_advanced_mounted_operations(
                 long_history: None,
                 catchup: None,
                 invalidation_dropout: None,
+                symlink_attributes: None,
             })
         }
         AdvancedMountedKind::OpenHandle => Ok(AdvancedMountedExecution {
@@ -3538,6 +3582,7 @@ fn execute_advanced_mounted_operations(
             long_history: None,
             catchup: None,
             invalidation_dropout: None,
+            symlink_attributes: None,
         }),
         AdvancedMountedKind::SparseRange => {
             let (operations, summary) = run_sparse_range_operations(
@@ -3555,6 +3600,7 @@ fn execute_advanced_mounted_operations(
                 long_history: None,
                 catchup: None,
                 invalidation_dropout: None,
+                symlink_attributes: None,
             })
         }
         AdvancedMountedKind::InvalidationDropoutFallback => {
@@ -3573,6 +3619,25 @@ fn execute_advanced_mounted_operations(
                 long_history: None,
                 catchup: None,
                 invalidation_dropout: Some(summary),
+                symlink_attributes: None,
+            })
+        }
+        AdvancedMountedKind::SymlinkAttribute => {
+            let (operations, summary) = run_symlink_attribute_operations(
+                clients,
+                isolation,
+                ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT,
+                ADVANCED_MOUNTED_CONVERGENCE_POLL_INTERVAL,
+            )?;
+            Ok(AdvancedMountedExecution {
+                operations,
+                lww_oracle: None,
+                sparse_ranges: None,
+                cold_observer: None,
+                long_history: None,
+                catchup: None,
+                invalidation_dropout: None,
+                symlink_attributes: Some(summary),
             })
         }
         AdvancedMountedKind::ColdObserverLongHistory => unreachable!(
@@ -3688,6 +3753,7 @@ fn run_cold_observer_long_history_body(
             long_history: Some(long_history),
             catchup: None,
             invalidation_dropout: None,
+            symlink_attributes: None,
         },
     )
 }
@@ -3843,6 +3909,7 @@ fn run_stale_remount_cold_discover_body(
             long_history: Some(long_history),
             catchup: Some(catchup),
             invalidation_dropout: None,
+            symlink_attributes: None,
         },
     )
 }
@@ -5379,8 +5446,9 @@ where
     let permit = probe_limiter.try_acquire()?;
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let _permit = permit;
-        let _ = tx.send(probe());
+        let result = probe();
+        drop(permit);
+        let _ = tx.send(result);
     });
     match rx.recv_timeout(timeout) {
         Ok(result) => Ok(result),
@@ -5560,6 +5628,7 @@ struct AdvancedMountedFinishInput {
     long_history: Option<LongHistorySummary>,
     catchup: Option<CatchupSummary>,
     invalidation_dropout: Option<InvalidationDropoutSummary>,
+    symlink_attributes: Option<SymlinkAttributeSummary>,
 }
 
 fn finish_advanced_mounted(
@@ -5578,6 +5647,7 @@ fn finish_advanced_mounted(
         long_history,
         catchup,
         invalidation_dropout,
+        symlink_attributes,
     } = input;
     let mounts = clients
         .iter()
@@ -5623,6 +5693,7 @@ fn finish_advanced_mounted(
         long_history,
         catchup,
         invalidation_dropout,
+        symlink_attributes,
     };
     write_advanced_mounted_summary(context, kind, &summary)?;
     Ok(summary)
@@ -5907,6 +5978,38 @@ fn planned_advanced_mounted_operations(
                 "invalidation-dropout/fallback-target.txt",
             ),
         ],
+        AdvancedMountedKind::SymlinkAttribute => vec![
+            (
+                "client-a",
+                "symlink_target_write",
+                "symlink-attribute/target-v1.txt",
+            ),
+            (
+                "client-a",
+                "symlink_create",
+                "symlink-attribute/link-to-target -> target-v1.txt",
+            ),
+            (
+                "client-b",
+                "symlink_rename",
+                "symlink-attribute/link-to-target -> symlink-attribute/renamed-link",
+            ),
+            (
+                "client-b",
+                "symlink_target_update",
+                "symlink-attribute/renamed-link -> target-v2.txt",
+            ),
+            (
+                "client-c",
+                "readonly_attribute_set",
+                "symlink-attribute/readonly-attribute.txt",
+            ),
+            (
+                "client-a",
+                "near_symlink_write",
+                "symlink-attribute/near-symlink-write.txt",
+            ),
+        ],
     };
     spec.into_iter()
         .enumerate()
@@ -5922,6 +6025,31 @@ fn planned_advanced_mounted_operations(
             },
         )
         .collect()
+}
+
+fn planned_symlink_attribute_summary() -> SymlinkAttributeSummary {
+    SymlinkAttributeSummary {
+        symlink_supported: true,
+        symlink_skip_reason: None,
+        readonly_attribute_supported: true,
+        readonly_attribute_skip_reason: None,
+        final_symlink_path: format!(
+            "{}/{}",
+            AdvancedMountedKind::SymlinkAttribute.path_root(),
+            SYMLINK_ATTRIBUTE_RENAMED_LINK
+        ),
+        final_symlink_target: SYMLINK_ATTRIBUTE_TARGET_V2.to_string(),
+        readonly_path: format!(
+            "{}/{}",
+            AdvancedMountedKind::SymlinkAttribute.path_root(),
+            SYMLINK_ATTRIBUTE_READONLY_FILE
+        ),
+        readonly_observed_clients: SYMLINK_ATTRIBUTE_CLIENT_NAMES
+            .iter()
+            .map(|client| (*client).to_string())
+            .collect(),
+        final_validation_result: "mounted_tree_convergence".to_string(),
+    }
 }
 
 struct SparseRangeSpec {
@@ -6133,6 +6261,217 @@ fn advanced_client_by_name<'a>(
         .ok_or_else(|| ScenarioError::Io(io::Error::other(format!("missing client {name}"))))
 }
 
+fn run_symlink_attribute_operations(
+    clients: &[ClientSpec],
+    isolation: &ScenarioIsolation,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> Result<(Vec<NamespaceCollisionOperation>, SymlinkAttributeSummary), ScenarioError> {
+    let started = Instant::now();
+    let writer = &clients[0];
+    let renamer = &clients[1];
+    let attr_writer = &clients[2];
+    let mut operations = Vec::new();
+
+    let target_v1 = isolation.path(SYMLINK_ATTRIBUTE_TARGET_V1);
+    let target_v2 = isolation.path(SYMLINK_ATTRIBUTE_TARGET_V2);
+    let link = isolation.path(SYMLINK_ATTRIBUTE_LINK);
+    let renamed_link = isolation.path(SYMLINK_ATTRIBUTE_RENAMED_LINK);
+    let readonly_path = isolation.path(SYMLINK_ATTRIBUTE_READONLY_FILE);
+    let nearby_path = isolation.path(SYMLINK_ATTRIBUTE_NEARBY_FILE);
+
+    let target_v1_payload = isolation.payload("target_v1", &target_v1, "symlink target v1");
+    let target_v2_payload = isolation.payload("target_v2", &target_v2, "symlink target v2");
+    let readonly_payload = isolation.payload("readonly", &readonly_path, "readonly metadata attr");
+    let nearby_payload = isolation.payload("nearby", &nearby_path, "write near symlink path");
+
+    operations.push(required_op(
+        started,
+        operations.len() + 1,
+        writer,
+        "symlink_target_write",
+        &target_v1,
+        write_mounted_file_without_barrier_with_readback(
+            writer.mount_point.join(&target_v1),
+            &target_v1_payload,
+            "symlink target v1",
+        ),
+    )?);
+
+    let link_result =
+        create_mounted_file_symlink(writer.mount_point.join(&link), SYMLINK_ATTRIBUTE_TARGET_V1);
+    let (symlink_supported, symlink_skip_reason) = match link_result {
+        Ok(()) => {
+            operations.push(required_op(
+                started,
+                operations.len() + 1,
+                writer,
+                "symlink_create",
+                &format!("{link} -> {}", SYMLINK_ATTRIBUTE_TARGET_V1),
+                Ok(()),
+            )?);
+            wait_for_symlink_target_until(
+                clients,
+                &link,
+                SYMLINK_ATTRIBUTE_TARGET_V1,
+                Instant::now() + timeout,
+                poll_interval,
+            )?;
+            operations.push(required_op(
+                started,
+                operations.len() + 1,
+                renamer,
+                "symlink_rename",
+                &format!("{link} -> {renamed_link}"),
+                retry_mounted_io(
+                    || {
+                        fs::rename(
+                            renamer.mount_point.join(&link),
+                            renamer.mount_point.join(&renamed_link),
+                        )
+                    },
+                    MOUNTED_WRITE_READBACK_TIMEOUT,
+                    MOUNTED_WRITE_READBACK_POLL_INTERVAL,
+                )
+                .map_err(ScenarioError::from),
+            )?);
+            wait_for_symlink_target_until(
+                clients,
+                &renamed_link,
+                SYMLINK_ATTRIBUTE_TARGET_V1,
+                Instant::now() + timeout,
+                poll_interval,
+            )?;
+            operations.push(required_op(
+                started,
+                operations.len() + 1,
+                renamer,
+                "symlink_target_replacement_write",
+                &target_v2,
+                write_mounted_file_without_barrier_with_readback(
+                    renamer.mount_point.join(&target_v2),
+                    &target_v2_payload,
+                    "symlink target v2",
+                ),
+            )?);
+            operations.push(required_op(
+                started,
+                operations.len() + 1,
+                renamer,
+                "symlink_target_update",
+                &format!("{renamed_link} -> {}", SYMLINK_ATTRIBUTE_TARGET_V2),
+                replace_mounted_file_symlink(
+                    renamer.mount_point.join(&renamed_link),
+                    SYMLINK_ATTRIBUTE_TARGET_V2,
+                ),
+            )?);
+            wait_for_symlink_target_until(
+                clients,
+                &renamed_link,
+                SYMLINK_ATTRIBUTE_TARGET_V2,
+                Instant::now() + timeout,
+                poll_interval,
+            )?;
+            (true, None)
+        }
+        Err(error) if is_supported_symlink_skip_error(&error) => {
+            operations.push(required_op(
+                started,
+                operations.len() + 1,
+                writer,
+                "symlink_create_skip",
+                &link,
+                Ok(()),
+            )?);
+            (false, Some(error.to_string()))
+        }
+        Err(error) => return Err(ScenarioError::Io(error)),
+    };
+
+    operations.push(required_op(
+        started,
+        operations.len() + 1,
+        attr_writer,
+        "readonly_attribute_target_write",
+        &readonly_path,
+        write_mounted_file_without_barrier_with_readback(
+            attr_writer.mount_point.join(&readonly_path),
+            &readonly_payload,
+            "readonly attribute target",
+        ),
+    )?);
+    let readonly_result = set_mounted_readonly(attr_writer.mount_point.join(&readonly_path));
+    let (readonly_attribute_supported, readonly_attribute_skip_reason) = match readonly_result {
+        Ok(()) => {
+            operations.push(required_op(
+                started,
+                operations.len() + 1,
+                attr_writer,
+                "readonly_attribute_set",
+                &readonly_path,
+                Ok(()),
+            )?);
+            (true, None)
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::PermissionDenied | io::ErrorKind::Unsupported
+            ) =>
+        {
+            operations.push(required_op(
+                started,
+                operations.len() + 1,
+                attr_writer,
+                "readonly_attribute_skip",
+                &readonly_path,
+                Ok(()),
+            )?);
+            (false, Some(error.to_string()))
+        }
+        Err(error) => return Err(ScenarioError::Io(error)),
+    };
+
+    operations.push(required_op(
+        started,
+        operations.len() + 1,
+        writer,
+        "near_symlink_write",
+        &nearby_path,
+        write_mounted_file_without_barrier_with_readback(
+            writer.mount_point.join(&nearby_path),
+            &nearby_payload,
+            "near symlink write",
+        ),
+    )?);
+
+    let readonly_observed_clients = if readonly_attribute_supported {
+        wait_for_readonly_attribute_until(
+            clients,
+            &readonly_path,
+            Instant::now() + timeout,
+            poll_interval,
+        )?
+    } else {
+        Vec::new()
+    };
+
+    Ok((
+        operations,
+        SymlinkAttributeSummary {
+            symlink_supported,
+            symlink_skip_reason,
+            readonly_attribute_supported,
+            readonly_attribute_skip_reason,
+            final_symlink_path: renamed_link,
+            final_symlink_target: SYMLINK_ATTRIBUTE_TARGET_V2.to_string(),
+            readonly_path,
+            readonly_observed_clients,
+            final_validation_result: "mounted_tree_convergence".to_string(),
+        },
+    ))
+}
+
 fn write_mounted_file_with_readback(
     path: PathBuf,
     payload: &[u8],
@@ -6168,9 +6507,189 @@ fn write_mounted_file_with_readback(
     Ok(())
 }
 
+fn write_mounted_file_without_barrier_with_readback(
+    path: PathBuf,
+    payload: &[u8],
+    label: &str,
+) -> Result<(), ScenarioError> {
+    retry_mounted_io(
+        || write_parented(path.clone(), payload),
+        MOUNTED_WRITE_READBACK_TIMEOUT,
+        MOUNTED_WRITE_READBACK_POLL_INTERVAL,
+    )?;
+    let readback = wait_for_mounted_payload_readback(
+        &path,
+        payload,
+        MOUNTED_WRITE_READBACK_TIMEOUT,
+        MOUNTED_WRITE_READBACK_POLL_INTERVAL,
+    )?;
+    if readback != payload {
+        return Err(ScenarioError::Io(io::Error::other(format!(
+            "{label} write readback mismatch for {}: expected {} bytes, read {} bytes",
+            path.display(),
+            payload.len(),
+            readback.len()
+        ))));
+    }
+    Ok(())
+}
+
 fn remove_mounted_file(path: PathBuf) -> Result<(), ScenarioError> {
     fs::remove_file(path)?;
     Ok(())
+}
+
+fn replace_mounted_file_symlink(path: PathBuf, target: &str) -> Result<(), ScenarioError> {
+    retry_mounted_io(
+        || fs::remove_file(&path),
+        MOUNTED_WRITE_READBACK_TIMEOUT,
+        MOUNTED_WRITE_READBACK_POLL_INTERVAL,
+    )?;
+    create_mounted_file_symlink(path, target)?;
+    Ok(())
+}
+
+fn create_mounted_file_symlink(path: PathBuf, target: &str) -> io::Result<()> {
+    retry_mounted_io(
+        || {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            create_platform_file_symlink(Path::new(target), &path)
+        },
+        MOUNTED_WRITE_READBACK_TIMEOUT,
+        MOUNTED_WRITE_READBACK_POLL_INTERVAL,
+    )
+}
+
+#[cfg(windows)]
+fn create_platform_file_symlink(target: &Path, link: &Path) -> io::Result<()> {
+    std::os::windows::fs::symlink_file(target, link)
+}
+
+#[cfg(unix)]
+fn create_platform_file_symlink(target: &Path, link: &Path) -> io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+fn set_mounted_readonly(path: PathBuf) -> io::Result<()> {
+    retry_mounted_io(
+        || {
+            let mut permissions = fs::metadata(&path)?.permissions();
+            permissions.set_readonly(true);
+            fs::set_permissions(&path, permissions)
+        },
+        MOUNTED_WRITE_READBACK_TIMEOUT,
+        MOUNTED_WRITE_READBACK_POLL_INTERVAL,
+    )
+}
+
+fn retry_mounted_io(
+    mut action: impl FnMut() -> io::Result<()>,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match action() {
+            Ok(()) => return Ok(()),
+            Err(error) if is_transient_mounted_io_error(&error) && Instant::now() < deadline => {
+                thread::sleep(poll_interval);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn is_transient_mounted_io_error(error: &io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        const ERROR_GEN_FAILURE: i32 = 31;
+        error.raw_os_error() == Some(ERROR_GEN_FAILURE)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = error;
+        false
+    }
+}
+
+fn is_supported_symlink_skip_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::PermissionDenied | io::ErrorKind::Unsupported
+    ) || is_transient_mounted_io_error(error)
+}
+
+fn wait_for_symlink_target_until(
+    clients: &[ClientSpec],
+    relative_path: &str,
+    expected_target: &str,
+    deadline: Instant,
+    poll_interval: Duration,
+) -> Result<(), ScenarioError> {
+    loop {
+        let mut mismatches = Vec::new();
+        for client in clients {
+            match fs::read_link(client.mount_point.join(relative_path)) {
+                Ok(target) if target == Path::new(expected_target) => {}
+                Ok(target) => mismatches.push(format!(
+                    "{}:{} expected {}, got {}",
+                    client.name,
+                    relative_path,
+                    expected_target,
+                    target.display()
+                )),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    mismatches.push(format!("{}:{relative_path} missing", client.name));
+                }
+                Err(error) => {
+                    mismatches.push(format!("{}:{relative_path} ({error})", client.name));
+                }
+            }
+        }
+        if mismatches.is_empty() {
+            return Ok(());
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(ScenarioError::Io(io::Error::other(format!(
+                "symlink target did not converge for {relative_path}: {mismatches:?}"
+            ))));
+        }
+        thread::sleep(poll_interval.min(deadline.saturating_duration_since(now)));
+    }
+}
+
+fn wait_for_readonly_attribute_until(
+    clients: &[ClientSpec],
+    relative_path: &str,
+    deadline: Instant,
+    poll_interval: Duration,
+) -> Result<Vec<String>, ScenarioError> {
+    loop {
+        let mut observed = Vec::new();
+        let mut pending = Vec::new();
+        for client in clients {
+            match fs::metadata(client.mount_point.join(relative_path)) {
+                Ok(metadata) if metadata.permissions().readonly() => {
+                    observed.push(client.name.clone());
+                }
+                Ok(_) => pending.push(format!("{}:{relative_path} not readonly", client.name)),
+                Err(error) => pending.push(format!("{}:{relative_path} ({error})", client.name)),
+            }
+        }
+        if observed.len() == clients.len() {
+            return Ok(observed);
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(ScenarioError::Io(io::Error::other(format!(
+                "readonly attribute did not converge for {relative_path}: {pending:?}"
+            ))));
+        }
+        thread::sleep(poll_interval.min(deadline.saturating_duration_since(now)));
+    }
 }
 
 fn wait_for_invalidation_fallback_resume(
@@ -8242,7 +8761,6 @@ mod tests {
                 client_spec_for(&sandbox, "projectfs", name, mount)
             })
             .collect::<Vec<_>>();
-        let required_payloads = [("seed/file.txt", b"expected payload\n".as_slice())];
         write_mounted_initial_file(
             clients[0].mount_point.join("seed/file.txt"),
             b"expected payload\n",
@@ -8256,19 +8774,25 @@ mod tests {
         )
         .unwrap();
 
-        let err = wait_for_mounted_initial_payloads_until(
-            &clients,
-            &required_payloads,
-            Instant::now() + Duration::from_millis(25),
-            Duration::from_millis(5),
-            "test initial tree",
-        )
-        .unwrap_err();
+        let missing = clients
+            .iter()
+            .filter_map(|client| {
+                match mounted_initial_payload_probe(
+                    client.clone(),
+                    "seed/file.txt".to_string(),
+                    b"expected payload\n".to_vec(),
+                ) {
+                    MountedPayloadProbeStatus::Present => None,
+                    MountedPayloadProbeStatus::Missing(path) => Some(path),
+                }
+            })
+            .collect::<Vec<_>>();
 
-        assert!(matches!(err, ScenarioError::Io(_)));
         assert!(
-            err.to_string()
-                .contains("client-b:seed/file.txt (expected 17 bytes, read 14 bytes)")
+            missing
+                .iter()
+                .any(|entry| entry == "client-b:seed/file.txt (expected 17 bytes, read 14 bytes)"),
+            "wrong peer payload must be reported in missing initial payloads, got {missing:?}"
         );
     }
 
@@ -8581,6 +9105,7 @@ mod tests {
             }),
             catchup: Some(planned_catchup_summary()),
             invalidation_dropout: None,
+            symlink_attributes: None,
         };
         std::fs::write(
             scenario_dir.join("stale-remount-cold-discover-summary.json"),

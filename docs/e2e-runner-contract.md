@@ -58,7 +58,7 @@ Required initial run flags and environment:
 | Flag | Contract |
 |---|---|
 | `basic-multi-client-smoke` | Positional shorthand for the mounted three-client happy-path smoke scenario. |
-| `--scenario <name|number|range|list>` | Repeatable. Accepted values include scenario names/aliases, one-based numbers from `studiofs-e2e list`, numeric ranges such as `1-8`, and comma lists such as `2,5,10`. Names include `basic-multi-client-smoke` (`smoke`), `postgres-outage-multi-client-recovery` (`postgres-outage`), `rustfs-outage-multi-client-recovery` (`rustfs-outage`, `s3-outage`), `mounted-client-crash-restart-recovery` (`client-crash-restart`, `crash-restart`), `mounted-publication-boundary-crash-matrix` (`publication-boundary-crash`, `publication-boundary`), `mounted-chaos-convergence` (`mounted-chaos`, `chaos`), `mounted-hotspot-churn-convergence` (`hotspot-churn`, `hot-dir-churn`), `mounted-fault-chaos-convergence` (`fault-chaos`, `chaos-faults`), `mounted-lww-reconnect-chaos-convergence` (`lww-chaos`, `reconnect-lww`), `mounted-open-handle-convergence` (`open-handle`, `open-unlink-rename`), `mounted-sparse-file-range-convergence` (`sparse-range`, `sparse-file-range`), `mounted-cold-observer-long-history-convergence` (`cold-observer`, `cold-observer-long-history`), `mounted-stale-remount-cold-discover-catchup-convergence` (`stale-remount`, `cold-discover-catchup`), `mounted-invalidation-dropout-fallback-convergence` (`invalidation-dropout`, `fallback-sync`), and the mounted namespace collision scenarios `collision-rename-vs-rename`, `collision-rename-vs-unlink`, `collision-unlink-vs-append`, `collision-overwrite-vs-read`, `collision-mkdir-rmdir-vs-create`, and `collision-readdir-stat-during-mutation`. |
+| `--scenario <name|number|range|list>` | Repeatable. Accepted values include scenario names/aliases, one-based numbers from `studiofs-e2e list`, numeric ranges such as `1-8`, and comma lists such as `2,5,10`. Names include `basic-multi-client-smoke` (`smoke`), `postgres-outage-multi-client-recovery` (`postgres-outage`), `rustfs-outage-multi-client-recovery` (`rustfs-outage`, `s3-outage`), `mounted-client-crash-restart-recovery` (`client-crash-restart`, `crash-restart`), `mounted-publication-boundary-crash-matrix` (`publication-boundary-crash`, `publication-boundary`), `mounted-chaos-convergence` (`mounted-chaos`, `chaos`), `mounted-hotspot-churn-convergence` (`hotspot-churn`, `hot-dir-churn`), `mounted-fault-chaos-convergence` (`fault-chaos`, `chaos-faults`), `mounted-lww-reconnect-chaos-convergence` (`lww-chaos`, `reconnect-lww`), `mounted-open-handle-convergence` (`open-handle`, `open-unlink-rename`), `mounted-sparse-file-range-convergence` (`sparse-range`, `sparse-file-range`), `mounted-cold-observer-long-history-convergence` (`cold-observer`, `cold-observer-long-history`), `mounted-stale-remount-cold-discover-catchup-convergence` (`stale-remount`, `cold-discover-catchup`), `mounted-invalidation-dropout-fallback-convergence` (`invalidation-dropout`, `fallback-sync`), `mounted-symlink-attribute-convergence` (`symlink-attribute`, `symlink-attrs`), and the mounted namespace collision scenarios `collision-rename-vs-rename`, `collision-rename-vs-unlink`, `collision-unlink-vs-append`, `collision-overwrite-vs-read`, `collision-mkdir-rmdir-vs-create`, and `collision-readdir-stat-during-mutation`. |
 | `--studiofs-bin <path>` | Path to the product CLI under test. Real mounted scenarios require it when `--infra compose` is used. The runner may build it only when an explicit build flag is added. |
 | `--root <path>` | Parent run directory. Defaults to `target/e2e-runs`. |
 | `--run-id <id>` | Optional stable run ID. If omitted, use an ISO-like UTC timestamp plus short random suffix. Explicit IDs must be safe single directory names: no separators, drive prefixes, traversal segments, leading dots, or other shell/path metacharacters. |
@@ -462,6 +462,17 @@ sync catches up, including disappearance of the deleted path. The seam is only
 the debug/E2E `STUDIOFS_E2E_DISABLE_METADATA_BACKGROUND_POLL=1` mount
 environment switch; it must not be used as a production behavior or scenario
 pass condition.
+`mounted-symlink-attribute-convergence` appends after the invalidation-dropout
+promotion scenario and writes `symlink-attribute-summary.json`,
+`operations.ndjson`, and `validation.json`. It uses three mounted clients to
+exercise symlink creation, public target readback, rename, target replacement
+by unlink/recreate, a write near the symlink namespace, and a supported
+read-only file attribute. Symlink and attribute behavior are platform-gated:
+permission or unsupported errors are recorded as explicit skips in the summary,
+while supported behavior must converge through public mounted filesystem
+observations and the normal mounted-tree validator. On Windows/WinFSP,
+`ERROR_GEN_FAILURE` from symlink creation after the bounded mount-readiness
+retry is recorded as an unsupported symlink capability skip.
 
 ## Mounted Tree Convergence Validation
 
@@ -479,6 +490,9 @@ The portable equality contract is intentionally narrow:
 - diagnostic-only fields: mtimes and other platform-derived metadata;
 - out-of-initial-scope metadata: xattrs, hard links, and platform-specific file
   attributes unless a later StudioFS contract explicitly makes them mandatory.
+  `mounted-symlink-attribute-convergence` is the first such later contract for
+  the public read-only file attribute, with explicit platform skips when the
+  mounted backend cannot expose it.
 
 Snapshot JSON must be deterministic across repeated runs and operating systems:
 entries are sorted by forward-slash relative path, and per-client snapshots are
