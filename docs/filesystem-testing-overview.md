@@ -69,11 +69,10 @@ Docker services and OS filesystem bridges such as WinFSP on Windows or FUSE on
 Linux/macOS. It is slower, but it proves behavior through the actual filesystem
 interface instead of through private internals.
 
-Simulation v2 is being recalibrated as a future deterministic backstop for this
-accepted mounted Windows baseline. It should catch logical metadata, payload,
-publication, replay, and convergence regressions cheaply, but it is not a
-replacement for real mounted E2E and it is no longer a gate for accepting
-scenarios 1-16.
+Simulation v2 now serves as the deterministic backstop for this accepted
+mounted Windows baseline. It catches logical metadata, payload, publication,
+replay, and convergence regressions cheaply, but it is not a replacement for
+real mounted E2E and it is no longer a blocker for accepting scenarios 1-16.
 
 ## Real Mounted E2E Scenarios We Have Today
 
@@ -81,7 +80,10 @@ scenarios 1-16.
 The same numbers are used by `run --scenario`, so `--scenario 1-8` runs the
 baseline gate set and `--scenario 12-16` runs the accepted deeper mounted
 scenario group. New promotion scenarios append after those 16 entries instead
-of replacing or renumbering them.
+of replacing or renumbering them. The current appended promotion scenarios are
+17-21: sparse-file range convergence, cold-observer long-history convergence,
+stale-remount plus cold-discover catch-up, invalidation-dropout fallback
+convergence, and symlink plus metadata-attribute convergence.
 
 ### 1. Basic Multi-Client Smoke
 

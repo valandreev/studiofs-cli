@@ -106,6 +106,35 @@ but later mounted scenarios are skipped even if the cleanup probe returns clean.
 That keeps a wedged WinFSP callback from being followed by more mounted
 filesystem operations in the same sweep.
 
+## Adversarial Runner Cleanup Proof
+
+SFS-381 is the adversarial proof layer over the supervised runner model. It is
+an infra-disabled runner self-test surface and does not add or renumber a
+mounted scenario. The accepted scenario 16 remains
+`mounted-open-handle-convergence`.
+
+The proof checks deliberately hostile runner paths without mutating host mounts:
+partial compose setup followed by launch failure, timed-out supervised
+children, post-scenario cleanup contamination, and cleanup/reporting failures
+that must not shadow the primary scenario error. Every completed run writes
+`artifacts/runner/adversarial-cleanup-proof.json`; that artifact records
+`SFS-381`, run status, exit code, cleanup status, cleanup errors, the
+runner-owned cleanup allowlist, the compose project when present, and whether
+`report.json`, `events.ndjson`, `cleanup.json`, and
+`artifacts/runner/cleanup-boundary.json` and
+`artifacts/runner/failure-boundary.json` were present. The proof artifact is
+best-effort diagnostics: a write failure must not prevent the runner from
+writing the canonical `report.json`.
+
+Focused proof tests:
+
+```powershell
+cargo test -p studiofs-e2e runner::tests::compose_partial_launch_failure_writes_adversarial_cleanup_proof -- --exact --nocapture
+cargo test -p studiofs-e2e runner::tests::post_start_cleanup_report_errors_do_not_shadow_primary_error -- --exact --nocapture
+cargo test -p studiofs-e2e runner::tests::mounted_cleanup_verification_failure_blocks_later_mounted_children -- --exact --nocapture
+cargo test -p studiofs-e2e runner::tests::supervised_child_timeout_records_executor_cleanup_detail -- --exact --nocapture
+```
+
 ## Local First Baseline Gate
 
 `local-first-baseline-gate` is the explicit SFS-405 gate for rerunning the

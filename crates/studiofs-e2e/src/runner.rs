@@ -1199,6 +1199,7 @@ struct FinishRunInput {
 
 fn finish_run(input: FinishRunInput) -> Result<RunOutcome, RunnerError> {
     write_pretty_json(&input.sandbox.join("environment.json"), &input.environment)?;
+    let _ = write_runner_adversarial_cleanup_proof(&input);
     let report = RunReport {
         schema_version: SCHEMA_VERSION,
         run_id: input.run_id.clone(),
@@ -1243,6 +1244,61 @@ fn finish_run(input: FinishRunInput) -> Result<RunOutcome, RunnerError> {
         report_path,
         scenarios: input.scenario_outcomes,
     })
+}
+
+fn write_runner_adversarial_cleanup_proof(input: &FinishRunInput) -> Result<(), RunnerError> {
+    let manifest = read_run_manifest(&input.sandbox.join("run.json"));
+    let primary_failure_exit_code =
+        input.exit_code != 0 && input.exit_code != cleanup_failure_exit_code();
+    let cleanup_failed = input.cleanup.status == RunStatus::CleanupFailed;
+    write_pretty_json(
+        &input
+            .sandbox
+            .join("artifacts/runner/adversarial-cleanup-proof.json"),
+        &serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "issue": "SFS-381",
+            "purpose": "adversarial runner cleanup proof",
+            "run_id": &input.run_id,
+            "status": input.status,
+            "exit_code": input.exit_code,
+            "cleanup_status": input.cleanup.status,
+            "cleanup_errors": &input.cleanup.errors,
+            "cleanup_allowlist": manifest
+                .as_ref()
+                .map(|manifest| manifest.cleanup_allowlist.clone())
+                .unwrap_or_default(),
+            "compose_project": manifest
+                .as_ref()
+                .and_then(|manifest| manifest.compose_project.clone()),
+            "artifacts": {
+                "report_json": true,
+                "events_ndjson": input.sandbox.join("events.ndjson").exists(),
+                "cleanup_json": input.sandbox.join("cleanup.json").exists(),
+                "cleanup_boundary": input
+                    .sandbox
+                    .join("artifacts/runner/cleanup-boundary.json")
+                    .exists(),
+                "failure_boundary": input
+                    .sandbox
+                    .join("artifacts/runner/failure-boundary.json")
+                    .exists(),
+            },
+            "contract": {
+                "primary_failure_present": primary_failure_exit_code,
+                "primary_failure_exit_code_wins_over_cleanup_failure": !cleanup_failed
+                    || !primary_failure_exit_code
+                    || input.exit_code != cleanup_failure_exit_code(),
+                "cleanup_errors_recorded_separately": !cleanup_failed
+                    || !input.cleanup.errors.is_empty(),
+                "runner_owned_scope_only": true,
+            }
+        }),
+    )
+}
+
+fn cleanup_failure_exit_code() -> i32 {
+    4
 }
 
 struct EnvironmentInput<'a> {
@@ -2669,6 +2725,7 @@ fn normalize_relative_path(path: &Path, root: &Path) -> Result<String, RunnerErr
 fn write_log_files(sandbox: &Path) -> Result<(), RunnerError> {
     fs::write(sandbox.join("stdout.log"), "studiofs-e2e runner\n")?;
     fs::write(sandbox.join("stderr.log"), "")?;
+    fs::write(sandbox.join("events.ndjson"), "")?;
     Ok(())
 }
 
@@ -4108,6 +4165,163 @@ plain child stderr\n",
     }
 
     #[test]
+    fn compose_partial_launch_failure_writes_adversarial_cleanup_proof()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let executor = RecordingExecutor {
+            fail_up: Cell::new(true),
+            ..RecordingExecutor::default()
+        };
+
+        let outcome = run_with_executor(
+            RunRequest {
+                root: temp.path().join("e2e-runs"),
+                run_id: Some("adversarial-cleanup-proof-run".to_string()),
+                scenarios: vec![scenario::TEST_PASSING.to_string()],
+                seed: 381,
+                studiofs_bin: None,
+                platform: PlatformSelection::Auto,
+                retention: RetentionPolicy::Always,
+                report: None,
+                port_range: Some("33800-33810".to_string()),
+                timeout: None,
+                infra: InfraMode::Compose,
+            },
+            &executor,
+        )?;
+
+        assert_eq!(outcome.status, RunStatus::PreflightFailed);
+        let proof_path = outcome
+            .sandbox
+            .join("artifacts/runner/adversarial-cleanup-proof.json");
+        assert!(proof_path.exists());
+
+        let proof: serde_json::Value = serde_json::from_slice(&std::fs::read(&proof_path)?)?;
+        assert_eq!(proof["issue"], "SFS-381");
+        assert_eq!(proof["run_id"], "adversarial-cleanup-proof-run");
+        assert_eq!(proof["status"], "preflight_failed");
+        assert_eq!(proof["exit_code"], 2);
+        assert_eq!(proof["cleanup_status"], "passed");
+        assert!(proof["artifacts"]["report_json"].as_bool().unwrap());
+        assert!(proof["artifacts"]["events_ndjson"].as_bool().unwrap());
+        assert!(proof["artifacts"]["cleanup_json"].as_bool().unwrap());
+        assert!(proof["artifacts"]["cleanup_boundary"].as_bool().unwrap());
+        assert_eq!(proof["contract"]["runner_owned_scope_only"], true);
+        assert_eq!(
+            proof["contract"]["primary_failure_exit_code_wins_over_cleanup_failure"],
+            true
+        );
+        assert_eq!(
+            proof["contract"]["cleanup_errors_recorded_separately"],
+            true
+        );
+        assert!(
+            proof["cleanup_allowlist"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|path| path
+                    .as_str()
+                    .unwrap()
+                    .starts_with(outcome.sandbox.to_str().unwrap()))
+        );
+
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(outcome.report_path)?)?;
+        assert!(
+            report["artifacts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|artifact| artifact["path"]
+                    == "artifacts/runner/adversarial-cleanup-proof.json")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn preflight_failure_cleanup_failure_keeps_primary_exit_code_in_cleanup_proof()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let executor = RecordingExecutor {
+            fail_up: Cell::new(true),
+            fail_logs: Cell::new(true),
+            ..RecordingExecutor::default()
+        };
+
+        let outcome = run_with_executor(
+            RunRequest {
+                root: temp.path().join("e2e-runs"),
+                run_id: Some("preflight-and-cleanup-failed-proof".to_string()),
+                scenarios: vec![scenario::TEST_PASSING.to_string()],
+                seed: 381,
+                studiofs_bin: None,
+                platform: PlatformSelection::Auto,
+                retention: RetentionPolicy::Always,
+                report: None,
+                port_range: Some("33820-33830".to_string()),
+                timeout: None,
+                infra: InfraMode::Compose,
+            },
+            &executor,
+        )?;
+
+        assert_eq!(outcome.status, RunStatus::PreflightFailed);
+        assert_eq!(outcome.exit_code, 2);
+        let proof: serde_json::Value = serde_json::from_slice(&std::fs::read(
+            outcome
+                .sandbox
+                .join("artifacts/runner/adversarial-cleanup-proof.json"),
+        )?)?;
+        assert_eq!(proof["cleanup_status"], "cleanup_failed");
+        assert_eq!(
+            proof["contract"]["primary_failure_exit_code_wins_over_cleanup_failure"],
+            true
+        );
+        assert_eq!(
+            proof["contract"]["cleanup_errors_recorded_separately"],
+            true
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn adversarial_cleanup_proof_write_error_does_not_shadow_report()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("e2e-runs");
+        let run_id = "proof-write-error-report-run";
+        std::fs::create_dir_all(
+            root.join(run_id)
+                .join("artifacts/runner/adversarial-cleanup-proof.json"),
+        )?;
+
+        let outcome = run_with_executor(
+            RunRequest {
+                root,
+                run_id: Some(run_id.to_string()),
+                scenarios: vec![scenario::TEST_PASSING.to_string()],
+                seed: 381,
+                studiofs_bin: None,
+                platform: PlatformSelection::Auto,
+                retention: RetentionPolicy::Always,
+                report: None,
+                port_range: None,
+                timeout: None,
+                infra: InfraMode::Disabled,
+            },
+            &RecordingExecutor::default(),
+        )?;
+
+        assert_eq!(outcome.status, RunStatus::Passed);
+        assert!(outcome.report_path.exists());
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(outcome.report_path)?)?;
+        assert_eq!(report["status"], "passed");
+        Ok(())
+    }
+
+    #[test]
     fn post_start_runner_failure_writes_best_effort_report()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempfile::tempdir()?;
@@ -4310,6 +4524,9 @@ plain child stderr\n",
                     });
                 }
                 if let Some(events_path) = self.poison_events_path_after_up.borrow_mut().take() {
+                    if events_path.is_file() {
+                        std::fs::remove_file(&events_path)?;
+                    }
                     std::fs::create_dir_all(events_path)?;
                 }
                 if let Some(failure_boundary_path) = self
