@@ -15,6 +15,8 @@ use crate::{VfsError, VfsMeta};
 use std::time::{Duration, Instant};
 use studiofs_meta::types::block_index_from_offset;
 
+const MAX_FLUSH_QUIESCE_PASSES: usize = 8;
+
 impl StudioVfs {
     pub(super) fn spawn_landing_zone_recovery_worker(self: &Arc<Self>) {
         let vfs = self.clone();
@@ -792,7 +794,9 @@ impl StudioVfs {
         local_sync_policy: LocalSyncPolicy,
     ) -> VfsResult<usize> {
         let mut materialized_writer_stack_bytes = 0usize;
-        for _ in 0..8 {
+        // A strict flush is a finite barrier: each pass drains dirty state
+        // that may have appeared while the previous pass materialized slices.
+        for _ in 0..MAX_FLUSH_QUIESCE_PASSES {
             materialized_writer_stack_bytes = materialized_writer_stack_bytes
                 .saturating_add(self.materialize_writer_stack_for_inode(ino).await?);
             if !self.inode_has_local_dirty_state(ino) {
