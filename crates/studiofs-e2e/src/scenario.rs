@@ -6533,17 +6533,23 @@ fn remove_mounted_file(path: PathBuf) -> Result<(), ScenarioError> {
 }
 
 fn replace_mounted_file_symlink(path: PathBuf, target: &str) -> Result<(), ScenarioError> {
-    fs::remove_file(&path)?;
+    retry_mounted_io(
+        || fs::remove_file(&path),
+        MOUNTED_WRITE_READBACK_TIMEOUT,
+        MOUNTED_WRITE_READBACK_POLL_INTERVAL,
+    )?;
     create_mounted_file_symlink(path, target)?;
     Ok(())
 }
 
 fn create_mounted_file_symlink(path: PathBuf, target: &str) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
     retry_mounted_io(
-        || create_platform_file_symlink(Path::new(target), &path),
+        || {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            create_platform_file_symlink(Path::new(target), &path)
+        },
         MOUNTED_WRITE_READBACK_TIMEOUT,
         MOUNTED_WRITE_READBACK_POLL_INTERVAL,
     )

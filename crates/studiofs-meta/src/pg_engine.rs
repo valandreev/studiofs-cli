@@ -2650,7 +2650,7 @@ impl PgMetaEngine {
         };
         Ok(attr.kind == FileType::RegularFile
             && attr.upload_state != UploadState::Ready
-            && attr.size <= attr.committed_size
+            && (attr.size <= attr.committed_size || attr.committed_size == 0)
             && self.local.has_local_regular_file_overlay(ino)?)
     }
 
@@ -6033,6 +6033,47 @@ mod tests {
                 .expect("lookup local payload")
                 .expect("local payload remains visible"),
             local_payload.object_id
+        );
+    }
+
+    #[test]
+    fn foreign_unlink_during_unpublished_local_uploading_preserves_writer_dentry() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+
+        let file = pg
+            .create_file(ROOT_INO, b"new-uploading-target.txt", 0, 0, 0o644)
+            .expect("create unpublished local file");
+        set_file_state(&pg, file.ino, 64, 1);
+        let local_payload = PayloadRef::new_partial(77_016, 64);
+        pg.stage_payload_slice(file.ino, 0, &local_payload)
+            .expect("stage unpublished local upload overlay");
+        let overlay = pg.local_overlay_conflicts().expect("overlay conflicts");
+        assert!(overlay.block_inodes.contains(&file.ino));
+        assert!(pg.lookup(ROOT_INO, b"new-uploading-target.txt").is_ok());
+
+        let batch = [MetaEvent::RemoveEntry {
+            parent: ROOT_INO,
+            name: b"new-uploading-target.txt".to_vec(),
+        }];
+        let current_regular_file_conflicts = pg
+            .current_regular_file_overlay_conflicts_for_batch(&batch)
+            .expect("collect current regular-file conflicts");
+        assert!(
+            current_regular_file_conflicts
+                .dentry_keys
+                .contains(&PgMetaEngine::dentry_key(
+                    ROOT_INO,
+                    b"new-uploading-target.txt"
+                )),
+            "unpublished writer-local uploads must keep the serving dentry private"
+        );
+
+        pg.apply_foreign_batch(&batch, &overlay, &HashSet::new())
+            .expect("apply foreign unlink");
+
+        assert!(
+            pg.lookup(ROOT_INO, b"new-uploading-target.txt").is_ok(),
+            "foreign unlink must not remove an unpublished writer-local uploading path"
         );
     }
 
