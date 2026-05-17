@@ -121,7 +121,8 @@ that must not shadow the primary scenario error. Every completed run writes
 `SFS-381`, run status, exit code, cleanup status, cleanup errors, the
 runner-owned cleanup allowlist, the compose project when present, and whether
 `report.json`, `events.ndjson`, `cleanup.json`, and
-`artifacts/runner/cleanup-boundary.json` were present. The proof artifact is
+`artifacts/runner/cleanup-boundary.json` and
+`artifacts/runner/failure-boundary.json` were present. The proof artifact is
 best-effort diagnostics: a write failure must not prevent the runner from
 writing the canonical `report.json`.
 

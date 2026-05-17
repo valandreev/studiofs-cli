@@ -230,6 +230,7 @@ fn runner_contract_documents_adversarial_cleanup_proof() {
         "Adversarial Runner Cleanup Proof",
         "SFS-381",
         "adversarial-cleanup-proof.json",
+        "artifacts/runner/failure-boundary.json",
         "compose_partial_launch_failure_writes_adversarial_cleanup_proof",
         "post_start_cleanup_report_errors_do_not_shadow_primary_error",
         "mounted_cleanup_verification_failure_blocks_later_mounted_children",
