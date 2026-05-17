@@ -274,6 +274,12 @@ impl RedbMetaEngine {
                 .retain(|_, _| false)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
             for (k, v) in &snapshot.counters {
+                if enable_remote_namespace_filter
+                    && (k.as_str() == "nextEventSeq"
+                        || crate::pg_engine::is_local_pg_snapshot_state_counter(k))
+                {
+                    continue;
+                }
                 table
                     .insert(k.as_str(), *v)
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
