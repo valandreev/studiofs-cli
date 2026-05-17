@@ -6323,9 +6323,15 @@ fn run_symlink_attribute_operations(
                 renamer,
                 "symlink_rename",
                 &format!("{link} -> {renamed_link}"),
-                fs::rename(
-                    renamer.mount_point.join(&link),
-                    renamer.mount_point.join(&renamed_link),
+                retry_mounted_io(
+                    || {
+                        fs::rename(
+                            renamer.mount_point.join(&link),
+                            renamer.mount_point.join(&renamed_link),
+                        )
+                    },
+                    MOUNTED_WRITE_READBACK_TIMEOUT,
+                    MOUNTED_WRITE_READBACK_POLL_INTERVAL,
                 )
                 .map_err(ScenarioError::from),
             )?);
