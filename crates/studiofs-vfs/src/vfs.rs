@@ -4517,6 +4517,9 @@ impl StudioVfs {
     }
 
     fn spawn_local_dirty_flush_worker(self: &Arc<Self>) {
+        if std::env::var_os("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH").is_some() {
+            return;
+        }
         let vfs = self.clone();
         self.track_background_task(tokio::spawn(async move {
             vfs.background_local_dirty_flush().await;
