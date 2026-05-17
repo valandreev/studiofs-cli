@@ -36,8 +36,11 @@ pub const BASIC_MULTI_CLIENT_SMOKE: &str = "basic-multi-client-smoke";
 pub const POSTGRES_OUTAGE_MULTI_CLIENT_RECOVERY: &str = "postgres-outage-multi-client-recovery";
 pub const RUSTFS_OUTAGE_MULTI_CLIENT_RECOVERY: &str = "rustfs-outage-multi-client-recovery";
 pub const MOUNTED_CLIENT_CRASH_RESTART_RECOVERY: &str = "mounted-client-crash-restart-recovery";
-pub const MOUNTED_PUBLICATION_BOUNDARY_CRASH_MATRIX: &str =
-    "mounted-publication-boundary-crash-matrix";
+pub const MOUNTED_CRASH_BEFORE_WRITE_ACCEPTANCE: &str = "mounted-crash-before-write-acceptance";
+pub const MOUNTED_CRASH_AFTER_PARTIAL_WRITE_ACCEPTANCE: &str =
+    "mounted-crash-after-partial-write-acceptance";
+pub const MOUNTED_CRASH_AFTER_FULL_WRITE_ACCEPTANCE: &str =
+    "mounted-crash-after-full-write-acceptance";
 pub const COLLISION_RENAME_VS_RENAME: &str = "collision-rename-vs-rename";
 pub const COLLISION_RENAME_VS_UNLINK: &str = "collision-rename-vs-unlink";
 pub const COLLISION_UNLINK_VS_APPEND: &str = "collision-unlink-vs-append";
@@ -275,7 +278,10 @@ pub fn available_scenarios() -> Vec<ScenarioDefinition> {
         PostgresOutageMultiClientRecovery.definition(),
         RustfsOutageMultiClientRecovery.definition(),
         MountedClientCrashRestartRecovery.definition(),
-        AdvancedMountedScenario::new(AdvancedMountedKind::PublicationBoundaryCrashMatrix)
+        AdvancedMountedScenario::new(AdvancedMountedKind::CrashBeforeWriteAcceptance).definition(),
+        AdvancedMountedScenario::new(AdvancedMountedKind::CrashAfterPartialWriteAcceptance)
+            .definition(),
+        AdvancedMountedScenario::new(AdvancedMountedKind::CrashAfterFullWriteAcceptance)
             .definition(),
         NamespaceCollisionScenario::new(NamespaceCollisionKind::RenameVsRename).definition(),
         NamespaceCollisionScenario::new(NamespaceCollisionKind::RenameVsUnlink).definition(),
@@ -310,10 +316,21 @@ pub(crate) fn resolve_scenario(name: &str) -> Option<Box<dyn Scenario>> {
         MOUNTED_CLIENT_CRASH_RESTART_RECOVERY | "client-crash-restart" | "crash-restart" => {
             Some(Box::new(MountedClientCrashRestartRecovery))
         }
-        MOUNTED_PUBLICATION_BOUNDARY_CRASH_MATRIX
-        | "publication-boundary-crash"
-        | "publication-boundary" => Some(Box::new(AdvancedMountedScenario::new(
-            AdvancedMountedKind::PublicationBoundaryCrashMatrix,
+        MOUNTED_CRASH_BEFORE_WRITE_ACCEPTANCE
+        | "crash-before-write-acceptance"
+        | "publication-boundary-before-write" => Some(Box::new(AdvancedMountedScenario::new(
+            AdvancedMountedKind::CrashBeforeWriteAcceptance,
+        ))),
+        MOUNTED_CRASH_AFTER_PARTIAL_WRITE_ACCEPTANCE
+        | "crash-after-partial-write-acceptance"
+        | "publication-boundary-partial-write" => Some(Box::new(AdvancedMountedScenario::new(
+            AdvancedMountedKind::CrashAfterPartialWriteAcceptance,
+        ))),
+        MOUNTED_CRASH_AFTER_FULL_WRITE_ACCEPTANCE
+        | "crash-after-full-write-acceptance"
+        | "publication-boundary"
+        | "publication-boundary-crash" => Some(Box::new(AdvancedMountedScenario::new(
+            AdvancedMountedKind::CrashAfterFullWriteAcceptance,
         ))),
         COLLISION_RENAME_VS_RENAME | "rename-vs-rename" => Some(Box::new(
             NamespaceCollisionScenario::new(NamespaceCollisionKind::RenameVsRename),
@@ -2934,7 +2951,9 @@ impl ScenarioIsolation {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AdvancedMountedKind {
-    PublicationBoundaryCrashMatrix,
+    CrashBeforeWriteAcceptance,
+    CrashAfterPartialWriteAcceptance,
+    CrashAfterFullWriteAcceptance,
     MountedChaos,
     HotspotChurn,
     FaultChaos,
@@ -2950,7 +2969,9 @@ enum AdvancedMountedKind {
 impl AdvancedMountedKind {
     fn name(self) -> &'static str {
         match self {
-            Self::PublicationBoundaryCrashMatrix => MOUNTED_PUBLICATION_BOUNDARY_CRASH_MATRIX,
+            Self::CrashBeforeWriteAcceptance => MOUNTED_CRASH_BEFORE_WRITE_ACCEPTANCE,
+            Self::CrashAfterPartialWriteAcceptance => MOUNTED_CRASH_AFTER_PARTIAL_WRITE_ACCEPTANCE,
+            Self::CrashAfterFullWriteAcceptance => MOUNTED_CRASH_AFTER_FULL_WRITE_ACCEPTANCE,
             Self::MountedChaos => MOUNTED_CHAOS_CONVERGENCE,
             Self::HotspotChurn => MOUNTED_HOTSPOT_CHURN_CONVERGENCE,
             Self::FaultChaos => MOUNTED_FAULT_CHAOS_CONVERGENCE,
@@ -2968,7 +2989,13 @@ impl AdvancedMountedKind {
 
     fn description(self) -> &'static str {
         match self {
-            Self::PublicationBoundaryCrashMatrix => "mounted publication-boundary crash matrix",
+            Self::CrashBeforeWriteAcceptance => "mounted crash before write acceptance recovery",
+            Self::CrashAfterPartialWriteAcceptance => {
+                "mounted crash after partial write acceptance recovery"
+            }
+            Self::CrashAfterFullWriteAcceptance => {
+                "mounted crash after full write acceptance recovery"
+            }
             Self::MountedChaos => "seeded mounted namespace chaos convergence",
             Self::HotspotChurn => "mounted hot-spot churn convergence",
             Self::FaultChaos => "mounted fault chaos convergence",
@@ -2988,7 +3015,9 @@ impl AdvancedMountedKind {
 
     fn path_root(self) -> &'static str {
         match self {
-            Self::PublicationBoundaryCrashMatrix => "publication-boundary",
+            Self::CrashBeforeWriteAcceptance => "crash-before-write-acceptance",
+            Self::CrashAfterPartialWriteAcceptance => "crash-after-partial-write-acceptance",
+            Self::CrashAfterFullWriteAcceptance => "crash-after-full-write-acceptance",
             Self::MountedChaos => "chaos",
             Self::HotspotChurn => "hotspot",
             Self::FaultChaos => "fault-chaos",
@@ -3004,7 +3033,9 @@ impl AdvancedMountedKind {
 
     fn summary_file(self) -> &'static str {
         match self {
-            Self::PublicationBoundaryCrashMatrix => "publication-boundary-summary.json",
+            Self::CrashBeforeWriteAcceptance
+            | Self::CrashAfterPartialWriteAcceptance
+            | Self::CrashAfterFullWriteAcceptance => "write-acceptance-crash-summary.json",
             Self::MountedChaos => "mounted-chaos-summary.json",
             Self::HotspotChurn => "mounted-hotspot-churn-summary.json",
             Self::FaultChaos => "mounted-fault-chaos-summary.json",
@@ -3502,8 +3533,12 @@ fn execute_advanced_mounted_operations(
     isolation: &ScenarioIsolation,
 ) -> Result<AdvancedMountedExecution, ScenarioError> {
     match kind {
-        AdvancedMountedKind::PublicationBoundaryCrashMatrix => Ok(AdvancedMountedExecution {
-            operations: run_publication_boundary_operations(controller, clients, isolation)?,
+        AdvancedMountedKind::CrashBeforeWriteAcceptance
+        | AdvancedMountedKind::CrashAfterPartialWriteAcceptance
+        | AdvancedMountedKind::CrashAfterFullWriteAcceptance => Ok(AdvancedMountedExecution {
+            operations: run_write_acceptance_crash_operations(
+                kind, controller, clients, isolation,
+            )?,
             lww_oracle: None,
             sparse_ranges: None,
             cold_observer: None,
@@ -4214,7 +4249,8 @@ fn run_cold_observer_warm_history(
     ))
 }
 
-fn run_publication_boundary_operations(
+fn run_write_acceptance_crash_operations(
+    kind: AdvancedMountedKind,
     controller: &mut MultiClientController<SystemClientProcessExecutor>,
     clients: &[ClientSpec],
     isolation: &ScenarioIsolation,
@@ -4222,89 +4258,124 @@ fn run_publication_boundary_operations(
     let started = Instant::now();
     let writer = &clients[0];
     let mut operations = Vec::new();
-    for (index, (boundary, file_name)) in [
-        ("flush", "flush.txt"),
-        ("fsync", "fsync.txt"),
-        ("release_close", "release-close.txt"),
-        ("shutdown_drain", "shutdown-drain.txt"),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let path = isolation.path(file_name);
-        let payload = isolation.payload(
-            boundary,
-            &path,
-            &format!("publication boundary {boundary}\n"),
-        );
-        operations.push(required_record(record_advanced_operation(
-            started,
-            operations.len() + 1,
-            writer,
-            boundary,
-            &path,
-            write_boundary_payload(writer.mount_point.join(&path), &payload, boundary)
-                .map_err(|error| error.to_string()),
-        ))?);
-        operations.push(required_record(record_advanced_operation(
-            started,
-            operations.len() + 1,
-            writer,
-            "force_kill",
-            &path,
-            controller
-                .force_kill(&writer.name)
-                .map_err(|error| error.to_string()),
-        ))?);
-        operations.push(required_record(record_advanced_operation(
-            started,
-            operations.len() + 1,
-            writer,
-            "remount",
-            &path,
-            controller
-                .remount(&writer.name)
-                .map_err(|error| error.to_string()),
-        ))?);
-        let recovered = fs::read(writer.mount_point.join(&path)).map_err(|error| error.to_string());
-        operations.push(required_record(record_advanced_operation(
-            started,
-            index + 100,
-            writer,
-            "readback",
-            &path,
-            recovered.and_then(|bytes| {
-                if bytes == payload {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "readback mismatch for {path}: expected checksum {}, got {}",
-                        bytes_sha256(&payload),
-                        bytes_sha256(&bytes)
-                    ))
-                }
-            }),
-        ))?);
-    }
+    let phase = match kind {
+        AdvancedMountedKind::CrashBeforeWriteAcceptance => "attempt_create_before_crash",
+        AdvancedMountedKind::CrashAfterPartialWriteAcceptance => "partial_write",
+        AdvancedMountedKind::CrashAfterFullWriteAcceptance => "full_write",
+        _ => unreachable!("write acceptance crash scenario expected"),
+    };
+    let file_name = match kind {
+        AdvancedMountedKind::CrashBeforeWriteAcceptance => "before-write.txt",
+        AdvancedMountedKind::CrashAfterPartialWriteAcceptance => "partial-write.txt",
+        AdvancedMountedKind::CrashAfterFullWriteAcceptance => "full-write.txt",
+        _ => unreachable!("write acceptance crash scenario expected"),
+    };
+    let path = isolation.path(file_name);
+    let payload = isolation.payload(
+        phase,
+        &path,
+        &format!("write acceptance crash phase {phase}\n"),
+    );
+    let expected = expected_write_acceptance_payload(kind, &payload);
+    operations.push(required_record(record_advanced_operation(
+        started,
+        operations.len() + 1,
+        writer,
+        phase,
+        &path,
+        match expected.as_deref() {
+            Some(accepted_payload) => {
+                write_acceptance_payload(writer.mount_point.join(&path), accepted_payload)
+                    .map_err(|error| error.to_string())
+            }
+            None => Ok(()),
+        },
+    ))?);
+    operations.push(required_record(record_advanced_operation(
+        started,
+        operations.len() + 1,
+        writer,
+        "force_kill",
+        &path,
+        controller
+            .force_kill(&writer.name)
+            .map_err(|error| error.to_string()),
+    ))?);
+    operations.push(required_record(record_advanced_operation(
+        started,
+        operations.len() + 1,
+        writer,
+        "remount",
+        &path,
+        controller
+            .remount(&writer.name)
+            .map_err(|error| error.to_string()),
+    ))?);
+    let recovered = fs::read(writer.mount_point.join(&path));
+    operations.push(required_record(record_advanced_operation(
+        started,
+        operations.len() + 1,
+        writer,
+        "readback",
+        &path,
+        match expected.as_deref() {
+            Some(expected) => recovered
+                .map_err(|error| error.to_string())
+                .and_then(|bytes| {
+                    if bytes == expected {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "readback mismatch for {path}: expected checksum {}, got {}",
+                            bytes_sha256(expected),
+                            bytes_sha256(&bytes)
+                        ))
+                    }
+                }),
+            None => match recovered {
+                Ok(bytes) => Err(format!(
+                    "readback unexpectedly found {path}: {} bytes, checksum {}",
+                    bytes.len(),
+                    bytes_sha256(&bytes)
+                )),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error.to_string()),
+            },
+        },
+    ))?);
     operations.sort_by_key(|operation| operation.order);
     Ok(operations)
 }
 
-fn write_boundary_payload(path: PathBuf, payload: &[u8], boundary: &str) -> io::Result<()> {
+fn expected_write_acceptance_payload(kind: AdvancedMountedKind, payload: &[u8]) -> Option<Vec<u8>> {
+    match kind {
+        AdvancedMountedKind::CrashBeforeWriteAcceptance => None,
+        AdvancedMountedKind::CrashAfterPartialWriteAcceptance => {
+            Some(payload[..payload.len() / 2].to_vec())
+        }
+        AdvancedMountedKind::CrashAfterFullWriteAcceptance => Some(payload.to_vec()),
+        _ => unreachable!("write acceptance crash scenario expected"),
+    }
+}
+
+fn write_acceptance_payload(path: PathBuf, accepted_payload: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(path)?;
-    file.write_all(payload)?;
-    match boundary {
-        "flush" => file.flush(),
-        "fsync" | "shutdown_drain" => file.sync_all(),
-        _ => Ok(()),
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_FLAG_WRITE_THROUGH: u32 = 0x8000_0000;
+        options.custom_flags(FILE_FLAG_WRITE_THROUGH);
     }
+    let mut file = options.open(path)?;
+    if !accepted_payload.is_empty() {
+        file.write_all(accepted_payload)?;
+    }
+    file.sync_all()
 }
 
 fn run_mounted_chaos_operations(
@@ -5832,20 +5903,21 @@ fn planned_advanced_mounted_operations(
     started: Instant,
 ) -> Vec<NamespaceCollisionOperation> {
     let spec = match kind {
-        AdvancedMountedKind::PublicationBoundaryCrashMatrix => vec![
-            ("client-a", "flush", "publication-boundary/flush.txt"),
-            ("client-a", "fsync", "publication-boundary/fsync.txt"),
-            (
-                "client-a",
-                "release_close",
-                "publication-boundary/release-close.txt",
-            ),
-            (
-                "client-a",
-                "shutdown_drain",
-                "publication-boundary/shutdown-drain.txt",
-            ),
-        ],
+        AdvancedMountedKind::CrashBeforeWriteAcceptance => vec![(
+            "client-a",
+            "before_write",
+            "crash-before-write-acceptance/before-write.txt",
+        )],
+        AdvancedMountedKind::CrashAfterPartialWriteAcceptance => vec![(
+            "client-a",
+            "partial_write",
+            "crash-after-partial-write-acceptance/partial-write.txt",
+        )],
+        AdvancedMountedKind::CrashAfterFullWriteAcceptance => vec![(
+            "client-a",
+            "full_write",
+            "crash-after-full-write-acceptance/full-write.txt",
+        )],
         AdvancedMountedKind::MountedChaos => vec![
             ("client-a", "rename", "chaos/rename-source.txt"),
             ("client-b", "unlink", "chaos/unlink-target.txt"),

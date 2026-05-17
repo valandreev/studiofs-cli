@@ -72,16 +72,17 @@ interface instead of through private internals.
 Simulation v2 now serves as the deterministic backstop for this accepted
 mounted Windows baseline. It catches logical metadata, payload, publication,
 replay, and convergence regressions cheaply, but it is not a replacement for
-real mounted E2E and it is no longer a blocker for accepting scenarios 1-16.
+real mounted E2E and it is no longer a blocker for accepting scenarios 1-18.
 
 ## Real Mounted E2E Scenarios We Have Today
 
 `studiofs-e2e list` currently exposes these mounted scenarios in this order.
 The same numbers are used by `run --scenario`, so `--scenario 1-8` runs the
-baseline gate set and `--scenario 12-16` runs the accepted deeper mounted
-scenario group. New promotion scenarios append after those 16 entries instead
-of replacing or renumbering them. The current appended promotion scenarios are
-17-21: sparse-file range convergence, cold-observer long-history convergence,
+baseline gate set and `--scenario 14-18` runs the accepted deeper mounted
+scenario group. The old publication-boundary matrix was split into three
+separate crash-acceptance scenarios, so later numbers moved by two positions.
+The current appended promotion scenarios are 19-23: sparse-file range convergence,
+cold-observer long-history convergence,
 stale-remount plus cold-discover catch-up, invalidation-dropout fallback
 convergence, and symlink plus metadata-attribute convergence.
 
@@ -123,15 +124,34 @@ pre-publication crash mode, peer visibility is diagnostic rather than pass/fail.
 
 This tests whether accepted local work survives process death.
 
-### 5. Publication Boundary Crash Matrix
+### 5. Crash Before Write Acceptance
 
-This scenario writes data and crashes or remounts around important publication
-boundaries: flush, fsync, release/close, and shutdown drain. The writer must be
-able to read the exact payload after remount.
+This scenario attempts to create the target file, but the client crashes before
+that create crosses an acceptance boundary in StudioFS. After remount, the
+writer and peers must not see the file at all.
 
-This tests the line between local durability and public visibility.
+This tests that we do not turn a pre-acceptance crash into fake local recovery
+or fake publication.
 
-### 6-11. Focused Namespace Collisions
+### 6. Crash After Partial Write Acceptance
+
+This scenario writes and locally syncs only part of the intended payload, then
+kills the mounted client. After remount, the writer must recover exactly the
+accepted prefix, not the full payload and not unrelated bytes.
+
+This tests that partial accepted local work is recoverable without pretending
+the user finished the whole file.
+
+### 7. Crash After Full Write Acceptance
+
+This scenario writes the full payload through a mounted client and crosses a
+real local sync boundary before the process is killed. After remount, the
+writer must read back the exact full payload.
+
+This tests the boundary where local durability is real, while peer visibility
+can still remain eventual.
+
+### 8-13. Focused Namespace Collisions
 
 These are smaller conflict scenarios that target specific filesystem races:
 
@@ -145,13 +165,13 @@ These are smaller conflict scenarios that target specific filesystem races:
 They test whether clients converge on one valid namespace without duplicate
 paths, missing parents, unexpected resurrection, or checksum mismatch.
 
-### 12. Seeded Mounted Chaos
+### 14. Seeded Mounted Chaos
 
 The mounted chaos scenario combines several namespace collision families across
 seeded rounds. It is still bounded and explainable, but it mixes enough
 operations to catch bugs that focused one-race tests can miss.
 
-### 13. Mounted Hot-Spot Churn
+### 15. Mounted Hot-Spot Churn
 
 Hot-spot churn keeps mutating a small set of `slot-*` paths while another
 client probes the directory. Temporary divergence is allowed during the run,
@@ -160,7 +180,7 @@ but the final mounted tree must converge and remain structurally valid.
 This tests busy real-world directories where the same names are created,
 deleted, renamed, overwritten, and observed repeatedly.
 
-### 14. Mounted Fault Chaos
+### 16. Mounted Fault Chaos
 
 Fault chaos combines mounted namespace churn with service and process failures:
 PostgreSQL outage, client crash/remount, RustFS outage, and a cold observer.
@@ -168,7 +188,7 @@ PostgreSQL outage, client crash/remount, RustFS outage, and a cold observer.
 This tests whether StudioFS still converges when several realistic bad things
 happen in one run.
 
-### 15. LWW Reconnect Chaos
+### 17. LWW Reconnect Chaos
 
 This scenario focuses on last-writer-wins behavior during reconnect. A stale
 writer goes offline, online peers write ordered versions, then the stale writer
@@ -177,7 +197,7 @@ returns and writes the final expected version. A late observer joins at the end.
 The test does not only check that clients converge. It also checks that they
 converge to the expected winner recorded in the LWW oracle artifact.
 
-### 16. Open-Handle Convergence
+### 18. Open-Handle Convergence
 
 This scenario keeps an old file handle open while another client unlinks or
 renames paths. The old deleted path must not come back, rename destinations must
@@ -186,14 +206,14 @@ be visible, and the final mounted tree must converge.
 This tests filesystem behavior that users commonly hit through editors,
 renderers, and other long-running processes.
 
-### 17. Sparse-File Range Convergence
+### 19. Sparse-File Range Convergence
 
 This scenario creates a bounded sparse file through public mounts, writes byte
 ranges around chunk boundaries, verifies zero-filled holes with range reads,
 shrinks and extends the logical size, then validates final checksums through
 mounted reads.
 
-### 18. Cold-Observer Long-History Convergence
+### 20. Cold-Observer Long-History Convergence
 
 This scenario lets three mounted clients build a small but meaningful history:
 they create files, delete one path, rename another, overwrite shared content,
@@ -205,7 +225,7 @@ activity and still converge to the same final workspace: deleted paths stay
 gone, renamed paths appear under the final name, overwritten content has the
 expected winner, and nested content is visible.
 
-### 19. Stale-Remount And Cold-Discover Catch-Up
+### 21. Stale-Remount And Cold-Discover Catch-Up
 
 This scenario starts three mounted clients together. One of them, `client-c`,
 sees an initial baseline and then goes away while keeping its local StudioFS
@@ -224,7 +244,7 @@ another new machine joins later, and both must still see the current filesystem
 without resurrecting deleted files, missing renamed paths, or reading stale
 payloads.
 
-### 20. Invalidation-Dropout Fallback Convergence
+### 22. Invalidation-Dropout Fallback Convergence
 
 This scenario checks what happens when one mounted observer temporarily misses
 the normal "something changed" signals. While `client-c` is in that quiet
@@ -242,7 +262,7 @@ a sleeping process, or a short local scheduling gap. They may lag behind for a
 bounded period, but they still need a reliable way back to the current shared
 filesystem state.
 
-### 21. Symlink And Metadata-Attribute Convergence
+### 23. Symlink And Metadata-Attribute Convergence
 
 This scenario checks filesystem details that are easy to forget when we only
 look at regular files and directories. It creates normal target files, tries to
@@ -278,7 +298,7 @@ bridge behavior, or a specific bug fix.
 
 A passing mounted sweep means the current implementation survived the selected
 real-mount scenarios: basic sharing, service outages, crash/restart,
-publication boundaries, focused namespace collisions, seeded chaos, hot-spot
+write-acceptance crash boundaries, focused namespace collisions, seeded chaos, hot-spot
 churn, fault chaos, LWW reconnect, open-handle behavior, sparse files, late
 observers, stale remounts, cold discovery, invalidation dropout/fallback sync,
 symlink and metadata-attribute behavior, and any later appended promotion

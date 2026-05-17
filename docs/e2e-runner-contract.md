@@ -58,7 +58,7 @@ Required initial run flags and environment:
 | Flag | Contract |
 |---|---|
 | `basic-multi-client-smoke` | Positional shorthand for the mounted three-client happy-path smoke scenario. |
-| `--scenario <name|number|range|list>` | Repeatable. Accepted values include scenario names/aliases, one-based numbers from `studiofs-e2e list`, numeric ranges such as `1-8`, and comma lists such as `2,5,10`. Names include `basic-multi-client-smoke` (`smoke`), `postgres-outage-multi-client-recovery` (`postgres-outage`), `rustfs-outage-multi-client-recovery` (`rustfs-outage`, `s3-outage`), `mounted-client-crash-restart-recovery` (`client-crash-restart`, `crash-restart`), `mounted-publication-boundary-crash-matrix` (`publication-boundary-crash`, `publication-boundary`), `mounted-chaos-convergence` (`mounted-chaos`, `chaos`), `mounted-hotspot-churn-convergence` (`hotspot-churn`, `hot-dir-churn`), `mounted-fault-chaos-convergence` (`fault-chaos`, `chaos-faults`), `mounted-lww-reconnect-chaos-convergence` (`lww-chaos`, `reconnect-lww`), `mounted-open-handle-convergence` (`open-handle`, `open-unlink-rename`), `mounted-sparse-file-range-convergence` (`sparse-range`, `sparse-file-range`), `mounted-cold-observer-long-history-convergence` (`cold-observer`, `cold-observer-long-history`), `mounted-stale-remount-cold-discover-catchup-convergence` (`stale-remount`, `cold-discover-catchup`), `mounted-invalidation-dropout-fallback-convergence` (`invalidation-dropout`, `fallback-sync`), `mounted-symlink-attribute-convergence` (`symlink-attribute`, `symlink-attrs`), and the mounted namespace collision scenarios `collision-rename-vs-rename`, `collision-rename-vs-unlink`, `collision-unlink-vs-append`, `collision-overwrite-vs-read`, `collision-mkdir-rmdir-vs-create`, and `collision-readdir-stat-during-mutation`. |
+| `--scenario <name|number|range|list>` | Repeatable. Accepted values include scenario names/aliases, one-based numbers from `studiofs-e2e list`, numeric ranges such as `1-8`, and comma lists such as `2,5,10`. Names include `basic-multi-client-smoke` (`smoke`), `postgres-outage-multi-client-recovery` (`postgres-outage`), `rustfs-outage-multi-client-recovery` (`rustfs-outage`, `s3-outage`), `mounted-client-crash-restart-recovery` (`client-crash-restart`, `crash-restart`), `mounted-crash-before-write-acceptance` (`crash-before-write-acceptance`, `publication-boundary-before-write`), `mounted-crash-after-partial-write-acceptance` (`crash-after-partial-write-acceptance`, `publication-boundary-partial-write`), `mounted-crash-after-full-write-acceptance` (`crash-after-full-write-acceptance`, `publication-boundary-crash`, `publication-boundary`), `mounted-chaos-convergence` (`mounted-chaos`, `chaos`), `mounted-hotspot-churn-convergence` (`hotspot-churn`, `hot-dir-churn`), `mounted-fault-chaos-convergence` (`fault-chaos`, `chaos-faults`), `mounted-lww-reconnect-chaos-convergence` (`lww-chaos`, `reconnect-lww`), `mounted-open-handle-convergence` (`open-handle`, `open-unlink-rename`), `mounted-sparse-file-range-convergence` (`sparse-range`, `sparse-file-range`), `mounted-cold-observer-long-history-convergence` (`cold-observer`, `cold-observer-long-history`), `mounted-stale-remount-cold-discover-catchup-convergence` (`stale-remount`, `cold-discover-catchup`), `mounted-invalidation-dropout-fallback-convergence` (`invalidation-dropout`, `fallback-sync`), `mounted-symlink-attribute-convergence` (`symlink-attribute`, `symlink-attrs`), and the mounted namespace collision scenarios `collision-rename-vs-rename`, `collision-rename-vs-unlink`, `collision-unlink-vs-append`, `collision-overwrite-vs-read`, `collision-mkdir-rmdir-vs-create`, and `collision-readdir-stat-during-mutation`. |
 | `--studiofs-bin <path>` | Path to the product CLI under test. Real mounted scenarios require it when `--infra compose` is used. The runner may build it only when an explicit build flag is added. |
 | `--root <path>` | Parent run directory. Defaults to `target/e2e-runs`. |
 | `--run-id <id>` | Optional stable run ID. If omitted, use an ISO-like UTC timestamp plus short random suffix. Explicit IDs must be safe single directory names: no separators, drive prefixes, traversal segments, leading dots, or other shell/path metacharacters. |
@@ -167,10 +167,10 @@ The gate runs these accepted baseline scenarios in order:
 2. `postgres-outage-multi-client-recovery`
 3. `rustfs-outage-multi-client-recovery`
 4. `mounted-client-crash-restart-recovery`
-5. `mounted-publication-boundary-crash-matrix`
-6. `collision-rename-vs-rename`
-7. `collision-rename-vs-unlink`
-8. `collision-unlink-vs-append`
+5. `mounted-crash-before-write-acceptance`
+6. `mounted-crash-after-partial-write-acceptance`
+7. `mounted-crash-after-full-write-acceptance`
+8. `collision-rename-vs-rename`
 
 The same numbering is used by `studiofs-e2e list` and by `run --scenario`, so
 `--scenario 1-8` runs this baseline set and `--scenario 2,5,10` runs only those
@@ -449,14 +449,14 @@ overwrites the committed file version.
 
 The restored advanced mounted scenarios keep the same artifact shape:
 `operations.ndjson`, a scenario-specific summary JSON file, and
-`validation.json`. `mounted-publication-boundary-crash-matrix` records the
-flush, fsync, release/close, and shutdown-drain boundaries. `mounted-chaos-*`
+`validation.json`. The three mounted write-acceptance crash scenarios split
+pre-write, partial-write, and full-write local recovery boundaries. `mounted-chaos-*`
 scenarios run bounded mounted mutations and converge through the public mounted
 tree validator. `mounted-lww-reconnect-chaos-convergence` also writes
 `lww-oracle.json`, and validation requires the observed winner checksum to
 match that oracle. `mounted-open-handle-convergence` includes the old-path
 absence check for `open-handles/unlink-target.txt`.
-`mounted-sparse-file-range-convergence` appends after the accepted 1-16 list
+`mounted-sparse-file-range-convergence` appends after the accepted 1-18 list
 and writes `sparse-range-summary.json`; it validates sparse holes,
 shrink/extend truncation, chunk-boundary writes, range read probes, logical
 size, and final checksums through public mounted reads.

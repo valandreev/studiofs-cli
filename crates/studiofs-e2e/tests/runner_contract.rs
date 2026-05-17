@@ -124,16 +124,16 @@ fn local_first_baseline_gate_uses_scenarios_1_through_8() {
             "postgres-outage-multi-client-recovery",
             "rustfs-outage-multi-client-recovery",
             "mounted-client-crash-restart-recovery",
-            "mounted-publication-boundary-crash-matrix",
+            "mounted-crash-before-write-acceptance",
+            "mounted-crash-after-partial-write-acceptance",
+            "mounted-crash-after-full-write-acceptance",
             "collision-rename-vs-rename",
-            "collision-rename-vs-unlink",
-            "collision-unlink-vs-append",
         ]
     );
 }
 
 #[test]
-fn scenario_list_order_restores_original_sixteen_scenario_numbering() {
+fn scenario_list_order_exposes_accepted_eighteen_scenario_numbering() {
     let scenarios = studiofs_e2e::scenario::available_scenarios();
     let names = scenarios
         .iter()
@@ -141,13 +141,15 @@ fn scenario_list_order_restores_original_sixteen_scenario_numbering() {
         .collect::<Vec<_>>();
 
     assert_eq!(
-        &names[..16],
+        &names[..18],
         [
             "basic-multi-client-smoke",
             "postgres-outage-multi-client-recovery",
             "rustfs-outage-multi-client-recovery",
             "mounted-client-crash-restart-recovery",
-            "mounted-publication-boundary-crash-matrix",
+            "mounted-crash-before-write-acceptance",
+            "mounted-crash-after-partial-write-acceptance",
+            "mounted-crash-after-full-write-acceptance",
             "collision-rename-vs-rename",
             "collision-rename-vs-unlink",
             "collision-unlink-vs-append",
@@ -286,7 +288,9 @@ fn list_scenarios_exposes_restored_advanced_mounted_suite() {
         .collect::<Vec<_>>();
 
     for expected in [
-        "mounted-publication-boundary-crash-matrix",
+        "mounted-crash-before-write-acceptance",
+        "mounted-crash-after-partial-write-acceptance",
+        "mounted-crash-after-full-write-acceptance",
         "mounted-chaos-convergence",
         "mounted-hotspot-churn-convergence",
         "mounted-fault-chaos-convergence",
@@ -301,15 +305,15 @@ fn list_scenarios_exposes_restored_advanced_mounted_suite() {
 }
 
 #[test]
-fn scenario_list_appends_sparse_range_promotion_after_accepted_sixteen() {
+fn scenario_list_appends_sparse_range_promotion_after_accepted_eighteen() {
     let scenarios = studiofs_e2e::scenario::available_scenarios();
     let names = scenarios
         .iter()
         .map(|scenario| scenario.name)
         .collect::<Vec<_>>();
 
-    assert_eq!(names[15], "mounted-open-handle-convergence");
-    assert_eq!(names[16], "mounted-sparse-file-range-convergence");
+    assert_eq!(names[17], "mounted-open-handle-convergence");
+    assert_eq!(names[18], "mounted-sparse-file-range-convergence");
 }
 
 #[test]
@@ -320,8 +324,8 @@ fn scenario_list_appends_cold_observer_promotion_after_sparse_range() {
         .map(|scenario| scenario.name)
         .collect::<Vec<_>>();
 
-    assert_eq!(names[16], "mounted-sparse-file-range-convergence");
-    assert_eq!(names[17], "mounted-cold-observer-long-history-convergence");
+    assert_eq!(names[18], "mounted-sparse-file-range-convergence");
+    assert_eq!(names[19], "mounted-cold-observer-long-history-convergence");
 }
 
 #[test]
@@ -332,9 +336,9 @@ fn scenario_list_appends_stale_remount_cold_discover_after_cold_observer() {
         .map(|scenario| scenario.name)
         .collect::<Vec<_>>();
 
-    assert_eq!(names[17], "mounted-cold-observer-long-history-convergence");
+    assert_eq!(names[19], "mounted-cold-observer-long-history-convergence");
     assert_eq!(
-        names[18],
+        names[20],
         "mounted-stale-remount-cold-discover-catchup-convergence"
     );
 }
@@ -348,11 +352,11 @@ fn scenario_list_appends_invalidation_dropout_after_stale_remount_cold_discover(
         .collect::<Vec<_>>();
 
     assert_eq!(
-        names[18],
+        names[20],
         "mounted-stale-remount-cold-discover-catchup-convergence"
     );
     assert_eq!(
-        names[19],
+        names[21],
         "mounted-invalidation-dropout-fallback-convergence"
     );
 }
@@ -366,10 +370,10 @@ fn scenario_list_appends_symlink_attribute_after_invalidation_dropout() {
         .collect::<Vec<_>>();
 
     assert_eq!(
-        names[19],
+        names[21],
         "mounted-invalidation-dropout-fallback-convergence"
     );
-    assert_eq!(names[20], "mounted-symlink-attribute-convergence");
+    assert_eq!(names[22], "mounted-symlink-attribute-convergence");
 }
 
 #[test]
