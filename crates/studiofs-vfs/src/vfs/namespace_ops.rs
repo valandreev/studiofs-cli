@@ -725,6 +725,11 @@ impl StudioVfs {
 
     pub(super) fn lookup_component_impl(&self, parent: Ino, name: &[u8]) -> VfsResult<InodeAttr> {
         self.enforce_access(parent, AccessLevel::ReadOnly)?;
+        if parent == super::ROOT_INO && super::is_probable_trash_component(name) {
+            self.heal_dangling_entry_if_inode_missing(parent, name)?;
+            self.dentry_cache_insert_negative(parent, name);
+            return Err(Self::ignored_entry_not_found(parent, name));
+        }
         if let Some(ignored) = self.ignored_entry_lookup(parent, name) {
             return Ok(ignored.attr);
         }
@@ -1118,28 +1123,41 @@ impl StudioVfs {
         }
 
         let meta = self.sync_meta();
-        let unlink_target = self.resolve_unlink_target(&meta, parent, name)?;
-        self.enforce_no_known_foreign_hard_lock(unlink_target.ino)?;
-        let Some(unlinked_attr) = (if unlink_target.open_handles > 0 {
-            self.unlink_with_open_handles(&meta, parent, name, unlink_target)?
-        } else {
-            self.unlink_without_open_handles(&meta, parent, name, unlink_target)
-                .await?
-        }) else {
-            return Ok(());
-        };
+        let initial_target = self.resolve_unlink_target(&meta, parent, name)?;
+        let delete_session = self
+            .state
+            .file_session
+            .enter_op(initial_target.ino, FileSessionOperation::Delete)
+            .await;
+        let result = async {
+            let mut unlink_target = self.resolve_unlink_target(&meta, parent, name)?;
+            self.enforce_no_known_foreign_hard_lock(unlink_target.ino)?;
+            unlink_target.open_handles = self.handle_table.open_count(unlink_target.ino);
+            let Some(unlinked_attr) = (if unlink_target.open_handles > 0 {
+                self.unlink_with_open_handles(&meta, parent, name, unlink_target)?
+            } else {
+                self.unlink_without_open_handles(&meta, parent, name, unlink_target)
+                    .await?
+            }) else {
+                return Ok(());
+            };
 
-        namespace_mutations.record_removal(parent, name, [unlinked_attr.ino]);
-        if unlinked_attr.nlink > 0 {
-            self.state.namespace.attr_read_cache.lock().put(
-                unlinked_attr.ino,
-                unlinked_attr,
-                ATTR_CACHE_TTL,
-                Instant::now(),
-            );
+            namespace_mutations.record_removal(parent, name, [unlinked_attr.ino]);
+            if unlinked_attr.nlink > 0 {
+                self.state.namespace.attr_read_cache.lock().put(
+                    unlinked_attr.ino,
+                    unlinked_attr,
+                    ATTR_CACHE_TTL,
+                    Instant::now(),
+                );
+            }
+            meta.request_eager_flush();
+            Ok(())
         }
-        meta.request_eager_flush();
-        Ok(())
+        .await;
+        drop(delete_session);
+        self.state.file_session.gc_if_idle(initial_target.ino);
+        result
     }
 
     pub fn rmdir(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {

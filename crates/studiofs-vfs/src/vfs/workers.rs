@@ -196,10 +196,24 @@ impl StudioVfs {
                 if !self.should_background_flush_pending_local_dirty_inode(ino) {
                     continue;
                 }
-                if let Err(error) = self
-                    .flush_local_dirty_state_background(ino, LocalSyncPolicy::Opportunistic)
-                    .await
-                {
+                let session = self
+                    .state
+                    .file_session
+                    .enter_op(ino, FileSessionOperation::Materialize)
+                    .await;
+                let flush_result = async {
+                    if self.shutdown_requested()
+                        || !self.should_background_flush_pending_local_dirty_inode(ino)
+                    {
+                        return Ok(());
+                    }
+                    self.flush_local_dirty_state_background(ino, LocalSyncPolicy::Opportunistic)
+                        .await
+                }
+                .await;
+                drop(session);
+                self.state.file_session.gc_if_idle(ino);
+                if let Err(error) = flush_result {
                     warn!(
                         ino,
                         error = %error,

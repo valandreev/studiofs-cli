@@ -11124,10 +11124,10 @@ async fn readdir_and_lookup_should_hide_legacy_root_macos_metadata_dirs() {
     let entries = vfs.readdir(1).unwrap();
     let mut names: Vec<Vec<u8>> = entries.into_iter().map(|entry| entry.name).collect();
     names.sort();
-    assert_eq!(names, vec![b".Trashes".to_vec(), b"visible".to_vec()]);
+    assert_eq!(names, vec![b"visible".to_vec()]);
 
     assert!(vfs.lookup(1, b".Spotlight-V100").is_err());
-    assert!(vfs.lookup(1, b".Trashes").is_ok());
+    assert!(vfs.lookup(1, b".Trashes").is_err());
     assert!(vfs.lookup(1, b".fseventsd").is_err());
     assert!(vfs.lookup(1, b"visible").is_ok());
 }
@@ -11485,9 +11485,11 @@ async fn test_multiple_handles_orphan_cleanup_after_last_close() {
     let fh1 = vfs.open_file(ino, OpenFlags::RDONLY, false).unwrap();
     let fh2 = vfs.open_file(ino, OpenFlags::RDONLY, false).unwrap();
     let fh3 = vfs.open_file(ino, OpenFlags::RDONLY, false).unwrap();
+    assert_eq!(vfs.open_count(ino), 3);
 
     // Unlink.
     vfs.unlink(1, b"multi-fh.txt").unwrap();
+    assert!(vfs.lookup(1, b"multi-fh.txt").is_err());
 
     // Close first two — payload slices should still exist (orphan still alive).
     vfs.release_fh(fh1).await.unwrap();
@@ -11503,7 +11505,10 @@ async fn test_multiple_handles_orphan_cleanup_after_last_close() {
     match vfs.meta().lookup_payload_slices(ino) {
         Ok(blocks_final) => assert!(
             blocks_final.is_empty(),
-            "payload graph should be cleaned up after last handle closes"
+            "payload graph should be cleaned up after last handle closes; blocks_final={blocks_final:?} open_count={} pending_uploads={:?} attr_after={:?}",
+            vfs.open_count(ino),
+            vfs.pending_uploads_for_inode(ino),
+            vfs.getattr(ino).ok()
         ),
         Err(MetaError::InodeNotFound(missing)) if missing == ino => {}
         Err(error) => panic!("payload graph lookup after last handle failed unexpectedly: {error}"),

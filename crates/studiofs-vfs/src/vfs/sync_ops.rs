@@ -510,6 +510,12 @@ impl StudioVfs {
         // Last handle closed on an unlinked file — final cleanup
         debug!("orphan cleanup: ino={} (last fd closed)", ino);
 
+        // A deferred materialization task may have snapped dirty state before
+        // unlink marked this inode deleted. Let it finish first so final orphan
+        // cleanup removes the complete graph and no late materialization can
+        // recreate payload refs after the last handle closes.
+        self.wait_for_deferred_materialization_inflight(ino).await;
+
         let cleanup = self.collect_orphan_deleted_inode_cleanup(ino).await?;
         let removed_blocks = cleanup.removed_ids.len();
         let freed_bytes = cleanup.freed_bytes;

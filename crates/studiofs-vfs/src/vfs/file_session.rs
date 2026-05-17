@@ -120,10 +120,11 @@ pub(super) enum FileSessionOperation {
     Materialize,
     Upload,
     Finalize,
+    Delete,
 }
 
 impl FileSessionOperation {
-    const COUNT: usize = 8;
+    const COUNT: usize = 9;
 
     fn as_str(self) -> &'static str {
         match self {
@@ -135,6 +136,7 @@ impl FileSessionOperation {
             Self::Materialize => "materialize",
             Self::Upload => "upload",
             Self::Finalize => "finalize",
+            Self::Delete => "delete",
         }
     }
 
@@ -152,6 +154,7 @@ impl FileSessionOperation {
             Self::Materialize => 5,
             Self::Upload => 6,
             Self::Finalize => 7,
+            Self::Delete => 8,
         }
     }
 
@@ -165,6 +168,7 @@ impl FileSessionOperation {
             5 => Some(Self::Materialize),
             6 => Some(Self::Upload),
             7 => Some(Self::Finalize),
+            8 => Some(Self::Delete),
             _ => None,
         }
     }

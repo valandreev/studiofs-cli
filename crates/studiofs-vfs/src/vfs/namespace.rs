@@ -1730,16 +1730,13 @@ mod tests {
 
         meta.create_dir(ROOT_INO, b".Trashes", 1000, 1000, 0o755)
             .expect("seed blocked root dir in metadata");
-        let trashes = vfs
-            .lookup(ROOT_INO, b".Trashes")
-            .expect("component lookup .Trashes");
-        assert_eq!(
-            resolver
-                .resolve_path("\\.Trashes")
-                .expect("resolve .Trashes")
-                .ino,
-            trashes.ino,
-            "blocked-root policy should allow .Trashes to be materialized"
+        assert!(
+            vfs.lookup(ROOT_INO, b".Trashes").is_err(),
+            "trash-like root entries should be hidden from component lookup"
+        );
+        assert!(
+            resolver.resolve_path("\\.Trashes").is_err(),
+            "trash-like root entries should be hidden from full-path resolution"
         );
     }
 
