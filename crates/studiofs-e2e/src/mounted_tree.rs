@@ -11,16 +11,22 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
+/// Snapshot schema version used by serialized tree snapshots.
 const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+/// Buffer size in bytes for streaming file reads during checksum generation.
 const READ_BUFFER_BYTES: usize = 64 * 1024;
 
+/// Metadata for a single mounted client under convergence checks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientMount {
+    /// Logical client name shown in reports.
     pub client: String,
+    /// Mount point path that will be scanned for tree snapshots.
     pub mount_point: PathBuf,
 }
 
 impl ClientMount {
+    /// Creates a new client mount descriptor.
     pub fn new(client: impl Into<String>, mount_point: impl Into<PathBuf>) -> Self {
         Self {
             client: client.into(),
@@ -30,102 +36,165 @@ impl ClientMount {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Serialized snapshot of a mounted filesystem tree state.
 pub struct MountedTreeSnapshot {
+    /// Snapshot schema version for backward-compatible deserialization.
     pub schema_version: u32,
+    /// Client label associated with this snapshot.
     pub client: String,
+    /// Mount point serialized as a JSON string.
     pub mount_point: String,
+    /// Canonicalized entries in the tree at snapshot time.
     pub entries: Vec<TreeEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Single entry in a mounted tree snapshot.
 pub struct TreeEntry {
+    /// Relative path from the mount root.
     pub path: String,
+    /// Kind of filesystem object.
     pub entry_type: TreeEntryKind,
+    /// File size in bytes for file entries.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
+    /// Last modification time in Unix milliseconds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub modified_unix_ms: Option<u128>,
+    /// SHA-256 checksum in lower hex for file contents.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checksum_sha256: Option<String>,
+    /// Symlink target path for symlink entries.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symlink_target: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Normalized kind for an entry found during snapshot.
 #[serde(rename_all = "snake_case")]
 pub enum TreeEntryKind {
+    /// Directory entry.
     Directory,
+    /// Regular file entry.
     File,
+    /// Symbolic link entry.
     Symlink,
+    /// Any other non-directory, non-file, non-symlink entry.
     Other,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Result of comparing multiple mounted snapshots.
 pub struct TreeComparison {
+    /// `true` when all provided snapshots are byte-for-byte equivalent.
     pub converged: bool,
+    /// Reference client used for comparison, if any snapshots existed.
     pub reference_client: Option<String>,
+    /// Clients that were included in this comparison.
     pub compared_clients: Vec<String>,
+    /// Differences detected against the reference snapshot.
     pub differences: Vec<TreeDifference>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Difference details for a single compared path.
 pub struct TreeDifference {
+    /// Client that differs from the reference.
     pub client: String,
+    /// Reference client name used for this comparison.
     pub reference_client: Option<String>,
+    /// Path where mismatch was detected.
     pub path: String,
+    /// Human-readable mismatch reason.
     pub message: String,
+    /// Expected serialized representation from reference.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected: Option<String>,
+    /// Actual serialized representation from the compared client.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub actual: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Invariant violation reported while validating a single snapshot.
 pub struct NamespaceInvariantViolation {
+    /// Client that violates the namespace invariant.
     pub client: String,
+    /// Offending path in the snapshot.
     pub path: String,
+    /// Description of the namespace violation.
     pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Convergence attempt summary including final snapshots and comparison result.
 pub struct ConvergenceOutcome {
+    /// Number of polling iterations performed.
     pub attempts: usize,
+    /// Total elapsed time in milliseconds.
     pub elapsed_ms: u128,
+    /// Last snapshots collected for each client.
     pub snapshots: Vec<MountedTreeSnapshot>,
+    /// Comparison result at completion.
     pub comparison: TreeComparison,
 }
 
 #[derive(Debug, Error)]
+/// Errors produced by mounted tree snapshotting and convergence checks.
 pub enum MountedTreeError {
+    /// A filesystem I/O operation failed while accessing a path.
     #[error("mounted tree I/O failed at {path}: {source}")]
-    Io { path: PathBuf, source: io::Error },
+    Io {
+        /// File-system path involved in the failed I/O operation.
+        path: PathBuf,
+        /// Underlying I/O error returned by the OS.
+        source: io::Error,
+    },
+    /// JSON serialization or deserialization failed.
     #[error("mounted tree JSON failed at {path}: {source}")]
     Json {
+        /// Path to the JSON file involved in the operation.
         path: PathBuf,
+        /// Underlying JSON library error.
         source: serde_json::Error,
     },
+    /// Convergence polling exceeded timeout and no consistent snapshot was found.
     #[error(
         "mounted filesystem trees did not converge after {attempts} attempts in {elapsed_ms}ms; artifacts written to {artifact_dir}"
     )]
     ConvergenceTimedOut {
+        /// Number of polling iterations performed before timing out.
         attempts: usize,
+        /// Elapsed time in milliseconds at timeout.
         elapsed_ms: u128,
+        /// Directory where convergence artifacts were written.
         artifact_dir: PathBuf,
+        /// Final comparison result observed during timeout.
         comparison: Box<TreeComparison>,
     },
+    /// Snapshots could not be produced before timeout.
     #[error(
         "mounted filesystem trees could not be snapshotted after {attempts} attempts in {elapsed_ms}ms; last error: {source}"
     )]
     SnapshotUnavailableTimedOut {
+        /// Number of snapshot attempts performed before timing out.
         attempts: usize,
+        /// Elapsed time in milliseconds at timeout.
         elapsed_ms: u128,
+        /// Directory where failure artifacts were written.
         artifact_dir: PathBuf,
+        /// Last error that prevented successful snapshotting.
         source: Box<MountedTreeError>,
     },
+    /// A scanned path was not valid UTF-8.
     #[error("mounted tree path is not valid UTF-8: {path}")]
-    NonUtf8Path { path: PathBuf },
+    NonUtf8Path {
+        /// Path that could not be converted to UTF-8 text.
+        path: PathBuf,
+    },
 }
 
+/// Captures a sorted snapshot of a mounted client tree.
 pub fn snapshot_client_tree(
     client: impl Into<String>,
     mount_point: impl AsRef<Path>,
@@ -144,6 +213,7 @@ pub fn snapshot_client_tree(
     })
 }
 
+/// Compares multiple snapshots and returns the full set of differences.
 pub fn compare_snapshots(snapshots: &[MountedTreeSnapshot]) -> TreeComparison {
     let compared_clients = snapshots
         .iter()
@@ -204,6 +274,7 @@ pub fn compare_snapshots(snapshots: &[MountedTreeSnapshot]) -> TreeComparison {
     }
 }
 
+/// Validates namespace consistency rules such as unique paths and existing parents.
 pub fn validate_namespace_invariants(
     snapshot: &MountedTreeSnapshot,
     expected_absent_paths: &[&str],
@@ -252,6 +323,7 @@ pub fn validate_namespace_invariants(
     violations
 }
 
+/// Writes snapshot and diff artifacts for failed convergence and returns file names.
 pub fn write_divergence_artifacts(
     artifact_dir: impl AsRef<Path>,
     snapshots: &[MountedTreeSnapshot],
@@ -272,6 +344,7 @@ pub fn write_divergence_artifacts(
     Ok(artifacts)
 }
 
+/// Polls mounted snapshots until all clients converge or the timeout is reached.
 pub fn wait_for_convergence(
     mounts: &[ClientMount],
     artifact_dir: impl AsRef<Path>,
@@ -339,6 +412,9 @@ pub fn wait_for_convergence(
     }
 }
 
+/// Recursively scans `current` and appends normalized tree entries to `entries`.
+///
+/// `root` is the mount root used to compute relative snapshot paths.
 fn scan_dir(
     root: &Path,
     current: &Path,
@@ -394,6 +470,7 @@ fn scan_dir(
     Ok(())
 }
 
+/// Reads all children of a directory and returns them as a vector.
 fn read_dir_entries(path: &Path) -> Result<Vec<fs::DirEntry>, MountedTreeError> {
     let mut children = Vec::new();
     for child in fs::read_dir(path).map_err(|source| io_error(path, source))? {
@@ -402,6 +479,7 @@ fn read_dir_entries(path: &Path) -> Result<Vec<fs::DirEntry>, MountedTreeError> 
     Ok(children)
 }
 
+/// Builds a fast lookup map of snapshot entries keyed by relative path.
 fn entries_by_path(snapshot: &MountedTreeSnapshot) -> BTreeMap<&str, &TreeEntry> {
     snapshot
         .entries
@@ -410,10 +488,12 @@ fn entries_by_path(snapshot: &MountedTreeSnapshot) -> BTreeMap<&str, &TreeEntry>
         .collect()
 }
 
+/// Returns the parent path segment for a `/`-separated path, if present.
 fn parent_path(path: &str) -> Option<&str> {
     path.rsplit_once('/').map(|(parent, _)| parent)
 }
 
+/// Compares two entries from different snapshots and records differences.
 fn compare_entry(
     reference_client: &str,
     client: &str,
@@ -472,6 +552,7 @@ fn compare_entry(
     }
 }
 
+/// Captures snapshots for every provided mounted client.
 fn snapshot_mounts(mounts: &[ClientMount]) -> Result<Vec<MountedTreeSnapshot>, MountedTreeError> {
     mounts
         .iter()
@@ -479,6 +560,7 @@ fn snapshot_mounts(mounts: &[ClientMount]) -> Result<Vec<MountedTreeSnapshot>, M
         .collect()
 }
 
+/// Computes a relative path from `root` to `path`, normalized with `/` separators.
 fn relative_path(root: &Path, path: &Path) -> Result<String, MountedTreeError> {
     path.strip_prefix(root)
         .unwrap_or(path)
@@ -496,6 +578,7 @@ fn relative_path(root: &Path, path: &Path) -> Result<String, MountedTreeError> {
         .map(|components| components.join("/"))
 }
 
+/// Computes a lower-case SHA-256 checksum for file contents.
 fn file_sha256(path: &Path) -> Result<String, MountedTreeError> {
     let mut file = File::open(path).map_err(|source| io_error(path, source))?;
     let mut hasher = Sha256::new();
@@ -512,11 +595,13 @@ fn file_sha256(path: &Path) -> Result<String, MountedTreeError> {
     Ok(hex_lower(&hasher.finalize()))
 }
 
+/// Reads a symlink target path and serializes it for snapshot output.
 fn read_link_target(path: &Path) -> Result<String, MountedTreeError> {
     let target = fs::read_link(path).map_err(|source| io_error(path, source))?;
     path_to_json_string(&target)
 }
 
+/// Converts a path to UTF-8 string form used in snapshot JSON.
 fn path_to_json_string(path: &Path) -> Result<String, MountedTreeError> {
     path.as_os_str()
         .to_str()
@@ -526,6 +611,7 @@ fn path_to_json_string(path: &Path) -> Result<String, MountedTreeError> {
         })
 }
 
+/// Encodes bytes into a lowercase hexadecimal string.
 fn hex_lower(bytes: &[u8]) -> String {
     let mut encoded = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -534,6 +620,7 @@ fn hex_lower(bytes: &[u8]) -> String {
     encoded
 }
 
+/// Extracts the modified timestamp as milliseconds since Unix epoch.
 fn modified_unix_ms(metadata: &fs::Metadata) -> Option<u128> {
     metadata
         .modified()
@@ -542,6 +629,7 @@ fn modified_unix_ms(metadata: &fs::Metadata) -> Option<u128> {
         .map(|duration| duration.as_millis())
 }
 
+/// Builds a compact human-readable contract summary for a snapshot entry.
 fn entry_contract(entry: &TreeEntry) -> String {
     match entry.entry_type {
         TreeEntryKind::File => format!(
@@ -561,6 +649,7 @@ fn entry_contract(entry: &TreeEntry) -> String {
     }
 }
 
+/// Computes the next sleep duration while respecting the convergence deadline.
 fn next_sleep(poll_interval: Duration, deadline: Instant) -> Duration {
     let interval = if poll_interval.is_zero() {
         Duration::from_millis(1)
@@ -573,14 +662,17 @@ fn next_sleep(poll_interval: Duration, deadline: Instant) -> Duration {
         .unwrap_or(Duration::ZERO)
 }
 
+/// Creates the directory and all missing parent components.
 fn create_dir_all(path: &Path) -> Result<(), MountedTreeError> {
     fs::create_dir_all(path).map_err(|source| io_error(path, source))
 }
 
+/// Reads metadata without following symlinks.
 fn symlink_metadata(path: &Path) -> Result<fs::Metadata, MountedTreeError> {
     fs::symlink_metadata(path).map_err(|source| io_error(path, source))
 }
 
+/// Serializes `value` as pretty JSON and writes it to `path`.
 fn write_pretty_json<T: Serialize>(path: &Path, value: &T) -> Result<(), MountedTreeError> {
     if let Some(parent) = path.parent() {
         create_dir_all(parent)?;
@@ -592,6 +684,7 @@ fn write_pretty_json<T: Serialize>(path: &Path, value: &T) -> Result<(), Mounted
     fs::write(path, bytes).map_err(|source| io_error(path, source))
 }
 
+/// Wraps an I/O error with the corresponding path context.
 fn io_error(path: &Path, source: io::Error) -> MountedTreeError {
     MountedTreeError::Io {
         path: path.to_path_buf(),

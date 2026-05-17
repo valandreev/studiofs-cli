@@ -16,15 +16,25 @@ use tracing::{debug, error};
 
 /// Lock-free counters for upload observability.
 pub struct UploadMetrics {
+    /// Total number of upload attempts made since process start.
     pub attempts: AtomicU64,
+    /// Number of uploads that completed successfully.
     pub uploads_ok: AtomicU64,
+    /// Number of upload attempts that failed.
     pub uploads_err: AtomicU64,
+    /// Number of times an upload request was retried.
     pub retries: AtomicU64,
+    /// Number of uploads that exhausted all allowed attempts.
     pub exhausted: AtomicU64,
+    /// Number of upload attempts that failed due to request timeouts.
     pub timeout_err: AtomicU64,
+    /// Number of errors categorized as temporary.
     pub temporary_err: AtomicU64,
+    /// Number of 5xx HTTP/storage responses observed.
     pub status_5xx_err: AtomicU64,
+    /// Number of failures classified as network-related.
     pub network_err: AtomicU64,
+    /// Total number of bytes successfully uploaded.
     pub bytes_uploaded: AtomicU64,
 }
 
@@ -65,9 +75,17 @@ impl std::fmt::Display for UploadMetrics {
 }
 
 #[derive(Debug, thiserror::Error)]
+/// Errors that can occur while uploading data through the scheduler.
 pub enum UploadError {
+    /// Upload failed after the configured retry budget was exhausted.
     #[error("upload failed after {attempts} attempts: {source}")]
-    Exhausted { attempts: u32, source: DataError },
+    Exhausted {
+        /// Number of attempts performed before giving up.
+        attempts: u32,
+        /// Last underlying data layer error observed during upload attempts.
+        source: DataError,
+    },
+    /// Upload operation was cancelled.
     #[error("upload cancelled")]
     Cancelled,
 }
@@ -82,10 +100,12 @@ pub struct UploadScheduler {
     retry_base_delay: Duration,
     retry_max_delay: Duration,
     adaptive_penalty_ms: AtomicU64,
+    /// Runtime metrics for upload requests and outcomes.
     pub metrics: UploadMetrics,
 }
 
 impl UploadScheduler {
+    /// Creates a new scheduler bound to the supplied data store and configuration.
     pub fn new(data_store: Arc<DataStore>, aimd_config: AimdConfig, config: &VfsConfig) -> Self {
         let max_attempts = config.upload_max_attempts.max(1);
         let request_timeout_s = config.upload_request_timeout_secs.max(1);
@@ -120,12 +140,14 @@ impl UploadScheduler {
         }
     }
 
+    /// Sets the current adaptive penalty delay, in milliseconds, for future window calculations.
     pub fn set_adaptive_penalty(&self, delay: Duration) {
         let penalty_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
         self.adaptive_penalty_ms
             .store(penalty_ms, Ordering::Relaxed);
     }
 
+    /// Returns the currently configured adaptive penalty in milliseconds.
     pub fn adaptive_penalty_ms(&self) -> u64 {
         self.adaptive_penalty_ms.load(Ordering::Relaxed)
     }
@@ -279,14 +301,17 @@ impl UploadScheduler {
         })
     }
 
+    /// Returns the current AIMD window size as a floating-point control value.
     pub fn window(&self) -> f64 {
         self.aimd.window()
     }
 
+    /// Returns the number of requests currently in flight.
     pub fn in_flight(&self) -> usize {
         self.aimd.in_flight()
     }
 
+    /// Returns the effective concurrency cap for upload scheduling.
     pub fn max_concurrency_hint(&self) -> usize {
         self.max_concurrency_hint.max(1)
     }
@@ -308,6 +333,9 @@ impl UploadScheduler {
     }
 }
 
+/// Indicates whether upload logging is considered idle.
+///
+/// The scheduler treats pending and in-flight work as idle only when both are zero.
 pub(crate) fn upload_log_is_idle(pending: usize, inflight: usize) -> bool {
     pending == 0 && inflight == 0
 }

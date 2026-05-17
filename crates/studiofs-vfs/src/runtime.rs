@@ -18,7 +18,11 @@ use tokio_util::sync::CancellationToken;
 
 use super::{VfsError, VfsResult};
 
+/// Runtime-facing wrapper over metadata engine methods used when committing file
+/// graph updates and optional attribute changes.
 pub trait VfsCommitMeta: Send + Sync {
+    /// Flush overlay slice data for regular files and optionally update the inode
+    /// attributes in one metadata operation.
     fn flush_regular_file_overlay_slices_with_attr(
         &self,
         ino: Ino,
@@ -46,6 +50,7 @@ where
     }
 }
 
+/// Combined metadata surface required by the VFS runtime.
 pub trait VfsMeta:
     Send
     + Sync
@@ -85,15 +90,19 @@ impl<T> VfsMeta for T where
 {
 }
 
+/// Read path runtime metadata facade used by VFS read-path operations.
 pub trait ReadPathMeta: Send + Sync + MetaInodes + MetaPayloadObjects {}
 impl<T> ReadPathMeta for T where T: ?Sized + Send + Sync + MetaInodes + MetaPayloadObjects {}
 
+/// ACL-specific metadata facade for VFS callers.
 pub trait AclMeta: Send + Sync + MetaInodes + MetaAcl {}
 impl<T> AclMeta for T where T: ?Sized + Send + Sync + MetaInodes + MetaAcl {}
 
+/// Upload path metadata facade used while staging and publishing file payloads.
 pub trait UploadMeta: Send + Sync + MetaInodes + MetaPayloadObjects + MetaGc {}
 impl<T> UploadMeta for T where T: ?Sized + Send + Sync + MetaInodes + MetaPayloadObjects + MetaGc {}
 
+/// Metadata facade required by janitor maintenance tasks.
 pub trait JanitorMeta:
     Send
     + Sync
@@ -438,6 +447,7 @@ where
     Arc::new(RuntimeMetaHandle::new(meta))
 }
 
+/// Runtime adapter around sync metadata engines with async/sync execution helpers.
 pub struct MetaExecutor<M: ?Sized> {
     backend: SyncMetaEngineAdapter<M>,
 }
@@ -451,20 +461,24 @@ impl<M: ?Sized> Clone for MetaExecutor<M> {
 }
 
 impl<M: ?Sized + Send + Sync + 'static> MetaExecutor<M> {
+    /// Build a metadata executor backed by the provided engine reference.
     pub fn new(engine: Arc<M>) -> Self {
         Self {
             backend: SyncMetaEngineAdapter::new(engine),
         }
     }
 
+    /// Return the synchronous metadata view from the adapter.
     pub fn sync_view(&self) -> Arc<M> {
         self.backend.sync_engine()
     }
 
+    /// Execute a metadata operation synchronously on the current thread.
     pub fn run_sync<T>(&self, operation: impl FnOnce(Arc<M>) -> MetaResult<T>) -> VfsResult<T> {
         operation(self.sync_view()).map_err(VfsError::Meta)
     }
 
+    /// Execute a metadata operation on the sync adapter from async context.
     pub async fn run<T: Send + 'static>(
         &self,
         operation: impl FnOnce(Arc<M>) -> MetaResult<T> + Send + 'static,
@@ -476,9 +490,13 @@ impl<M: ?Sized + Send + Sync + 'static> MetaExecutor<M> {
     }
 }
 
+/// Result state for operations raced against timeout and cancellation.
 pub enum TimeoutOrCancel<T> {
+    /// Operation completed successfully with a value.
     Completed(T),
+    /// Operation exceeded the configured timeout.
     TimedOut,
+    /// Operation was cancelled before completion.
     Cancelled,
 }
 
@@ -491,6 +509,7 @@ pub enum TimeoutOrCancel<T> {
 /// blocking pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalCacheIoExecutionModel {
+    /// Execute inline on the runtime worker, isolating blocking I/O where needed.
     InlineRuntimeWorkerWithBlockingIsolation,
 }
 
@@ -506,7 +525,9 @@ impl LocalCacheIoExecutionModel {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LocalCacheIoTiming {
+    /// Nanoseconds spent in handoff/dispatch before backend IO starts.
     pub handoff_ns: u64,
+    /// Nanoseconds spent performing backend cache IO itself.
     pub backend_io_ns: u64,
 }
 

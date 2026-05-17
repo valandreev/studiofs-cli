@@ -10,12 +10,14 @@ const WINDOWS_UNBUFFERED_WRITE_ALIGNMENT: usize = 4096;
 const WINDOWS_VOLUME_PATH_BUFFER_U16: usize = 32_768;
 
 #[derive(Debug, Default)]
+/// Scratch buffer used to build aligned writes for unbuffered payload I/O.
 pub struct UnbufferedWriteBuffer {
     #[cfg(any(windows, test))]
     backing: Vec<u8>,
 }
 
 impl UnbufferedWriteBuffer {
+    /// Create an empty scratch buffer for unbuffered payload writes.
     pub fn new() -> Self {
         Self::default()
     }

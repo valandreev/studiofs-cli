@@ -1,3 +1,5 @@
+//! Entry point for the StudioFS end-to-end test CLI.
+
 use clap::Parser as _;
 
 fn main() -> anyhow::Result<()> {

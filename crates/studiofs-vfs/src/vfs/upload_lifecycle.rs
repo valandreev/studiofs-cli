@@ -109,6 +109,8 @@ impl StudioVfs {
         tokens.remove(&ino);
     }
 
+    /// Returns `true` if the VFS is in the process of shutting down (or has
+    /// already completed shutdown).
     pub fn is_shutting_down(&self) -> bool {
         self.shutdown_requested()
             || self.uploader_shutdown_requested()

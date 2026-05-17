@@ -36,102 +36,157 @@ use crate::vfs::{
 
 use super::{OpenFile, VfsError, VfsResult};
 
+/// Maximum runtime dirty budget for large cache classes.
 pub(super) const CACHE_RUNTIME_MAX_DIRTY_BYTES_LARGE: usize = 300 * 1024 * 1024;
+/// Maximum runtime dirty budget for huge cache classes.
 pub(super) const CACHE_RUNTIME_MAX_DIRTY_BYTES_HUGE: usize = 300 * 1024 * 1024;
+/// Minimum eager write flush batch size for cache runtime tuning.
 pub(super) const CACHE_RUNTIME_MIN_WRITE_EAGER_BATCH_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum eager write flush batch size for cache runtime tuning.
 pub(super) const CACHE_RUNTIME_MAX_WRITE_EAGER_BATCH_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum chunk drained by one eager write flush.
 pub(super) const WRITE_EAGER_DRAIN_CHUNK_MAX_BYTES: usize = 32 * 1024 * 1024;
+/// Target payload size used for payload upload concurrency.
 pub(super) const PAYLOAD_PUT_CONCURRENCY_TARGET_BYTES: usize = 32 * 1024 * 1024;
+/// Maximum number of payload upload workers.
 pub(super) const PAYLOAD_PUT_CONCURRENCY_MAX: usize = 32;
+/// Minimum byte threshold for opportunistic fast-mode sync grouping.
 pub(super) const FAST_MODE_SYNC_GROUP_MIN_BYTES_FLOOR: u64 = 32 * 1024 * 1024;
+/// Maximum byte threshold for opportunistic fast-mode sync grouping.
 pub(super) const FAST_MODE_SYNC_GROUP_MIN_BYTES_CEIL: u64 = 256 * 1024 * 1024;
+/// Minimum transit-memory budget for runtime tuning.
 pub(super) const CACHE_RUNTIME_MIN_TRANSIT_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum transit-memory budget for runtime tuning.
 pub(super) const CACHE_RUNTIME_MAX_TRANSIT_BUDGET_BYTES: usize = 300 * 1024 * 1024;
+/// Small cache runtime budget (bytes).
 pub(super) const CACHE_RUNTIME_SMALL_BUDGET_BYTES: u64 = 128 * 1024 * 1024 * 1024;
+/// Large cache runtime budget (bytes).
 pub(super) const CACHE_RUNTIME_LARGE_BUDGET_BYTES: u64 = 512 * 1024 * 1024 * 1024;
+/// Huge cache runtime budget (bytes).
 pub(super) const CACHE_RUNTIME_HUGE_BUDGET_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Policy for local sync behavior.
 pub enum LocalSyncPolicy {
+    /// Opportunistically sync based on thresholds.
     Opportunistic,
+    /// Always sync for durability on write completion.
     Strict,
+    /// Synchronous write-through durability semantics.
     WriteThrough,
 }
 
 impl LocalSyncPolicy {
+    /// Returns `true` when this policy is opportunistic.
     pub const fn is_opportunistic(self) -> bool {
         matches!(self, Self::Opportunistic)
     }
 
+    /// Returns `true` when the policy requires durable write-path synchronization.
     pub const fn requires_write_path_durability(self) -> bool {
         matches!(self, Self::Strict | Self::WriteThrough)
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// How sticky errors are handled.
 pub(super) enum StickyErrorPolicy {
+    /// Ignore sticky errors and continue.
     Ignore,
+    /// Report sticky errors to callers.
     Report,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Dirty-attribute persistence policy.
 pub(super) enum DirtyAttrPersistPolicy {
+    /// Do not persist dirty attributes.
     Ignore,
+    /// Persist dirty attributes only if they already exist.
     PersistIfPresent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Result of closing a file handle.
 pub struct ReleaseFhOutcome {
+    /// Whether this was the last handle for the inode.
     pub closed_last_handle: bool,
+    /// Whether local dirty state was flushed.
     pub flushed_local_dirty_state: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Result of an explicit flush request.
 pub struct ExplicitFlushOutcome {
+    /// Whether local dirty state was flushed.
     pub flushed_local_dirty_state: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Result of `fsync`-like operation.
 pub(super) struct FsyncOutcome {
+    /// Whether file data was flushed.
     pub(super) flushed_file_data: bool,
+    /// Whether dirty attributes were persisted.
     pub(super) persisted_dirty_attrs: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Outcome of local sync barrier execution.
 pub(super) struct LocalSyncBarrierOutcome {
+    /// Whether local dirty state was present.
     pub(super) had_local_dirty_state: bool,
+    /// Whether file data was flushed.
     pub(super) flushed_file_data: bool,
+    /// Whether dirty attributes were persisted.
     pub(super) persisted_dirty_attrs: bool,
 }
 
+/// Context passed during handle release.
 pub(super) struct HandleReleaseContext {
+    /// The open file handle context.
     pub(super) open_file: OpenFile,
+    /// Inode associated with the handle.
     pub(super) ino: Ino,
 }
 
+/// Target inode and open-handle count for unlink handling.
 pub(super) struct UnlinkTarget {
+    /// Inode being unlinked.
     pub(super) ino: Ino,
+    /// Number of open handles for this inode.
     pub(super) open_handles: u32,
 }
 
+/// Summary of deleted inode cleanup.
 pub(super) struct DeletedInodeCleanup {
+    /// Removed inode IDs.
     pub(super) removed_ids: Vec<u64>,
+    /// Total bytes freed from removed data.
     pub(super) freed_bytes: u64,
 }
 
+/// Action selected after the last handle is released.
 pub(super) enum LastHandleReleaseAction {
+    /// Do not take any action.
     IgnoredEntry,
+    /// Clean up orphaned state.
     OrphanCleanup,
+    /// Run local sync using sticky-error policy.
     LocalSync {
+        /// Sticky error handling policy for local sync.
         sticky_error_policy: StickyErrorPolicy,
     },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Reason the local sync pipeline was triggered.
 pub(super) enum LocalSyncTrigger {
+    /// Explicit sync request (fsync/release path).
     Explicit,
 }
 
+/// Determine whether local sync should be triggered for current write state.
 pub(super) fn write_path_sync_trigger(
     local_sync_policy: LocalSyncPolicy,
     pending_bytes: u64,
@@ -324,101 +379,185 @@ pub struct VfsConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct VfsConfigRaw {
+    /// Optional override for background janitor interval in seconds.
     pub janitor_interval_secs: Option<u64>,
+    /// Optional override for janitor skip-newer-than window in seconds.
     pub janitor_skip_newer_secs: Option<u64>,
+    /// Optional override for maximum janitor deletes per cycle.
     pub janitor_max_deletes: Option<u64>,
+    /// Optional override for janitor lease TTL in seconds.
     pub janitor_lease_ttl_secs: Option<u64>,
+    /// Optional override for metadata invalidation sync interval in milliseconds.
     pub metadata_invalidation_sync_interval_ms: Option<u64>,
+    /// Optional override for read buffer size in megabytes.
     pub read_buffer_mb: Option<u64>,
+    /// Optional override for prefetch concurrency.
     pub prefetch_concurrency: Option<usize>,
+    /// Optional override for readahead width.
     pub readahead_width: Option<u32>,
+    /// Optional override for minimum readahead prefetch count.
     pub readahead_min_prefetch: Option<u32>,
+    /// Optional override for readahead sequence step.
     pub readahead_seq_step: Option<u8>,
+    /// Optional override for random read penalty.
     pub readahead_random_penalty: Option<u8>,
+    /// Optional override for max directory prefetch batch size.
     pub dir_prefetch_max_batch: Option<usize>,
+    /// Optional override for readdir attr batch chunk size.
     pub readdir_attr_batch_chunk: Option<usize>,
+    /// Optional override for max inodes in readdir attr batch.
     pub readdir_attr_batch_max_inodes: Option<usize>,
+    /// Optional override for prefetch foreground reserve.
     pub prefetch_foreground_reserve: Option<usize>,
+    /// Optional override for max prefetches per cycle.
     pub prefetch_max_per_cycle: Option<usize>,
+    /// Optional override for prefetch network-error pause (ms).
     pub prefetch_pause_on_neterr_ms: Option<u64>,
+    /// Optional override for lock lease TTL.
     pub lock_ttl_secs: Option<u64>,
+    /// Optional override for lock retry base backoff (ms).
     pub lock_retry_base_ms: Option<u64>,
+    /// Optional override for lock retry max backoff (ms).
     pub lock_retry_max_ms: Option<u64>,
+    /// Optional override for max dirty bytes.
     pub max_dirty_bytes: Option<usize>,
+    /// Optional override for eager write flush batch bytes.
     pub write_eager_flush_batch_bytes: Option<usize>,
+    /// Optional override for max xattr bytes.
     pub max_xattr_bytes: Option<usize>,
+    /// Optional override for dentry cache capacity.
     pub dentry_cache_capacity: Option<usize>,
+    /// Optional override for dentry cache bytes.
     pub dentry_cache_bytes: Option<usize>,
+    /// Optional override for path shortcut cache capacity.
     pub path_shortcut_cache_capacity: Option<usize>,
+    /// Optional override for path shortcut cache bytes.
     pub path_shortcut_cache_bytes: Option<usize>,
+    /// Optional override for attr read cache capacity.
     pub attr_read_cache_capacity: Option<usize>,
+    /// Optional override for attr read cache bytes.
     pub attr_read_cache_bytes: Option<usize>,
+    /// Optional override for effective ACL cache capacity.
     pub effective_acl_cache_capacity: Option<usize>,
+    /// Optional override for principal string.
     pub principal: Option<String>,
+    /// Optional override for initial fetch window.
     pub fetch_initial_window: Option<f64>,
+    /// Optional override for minimum fetch window.
     pub fetch_min_window: Option<f64>,
+    /// Optional override for maximum fetch window.
     pub fetch_max_window: Option<f64>,
+    /// Optional override for fetch increase step.
     pub fetch_increase_step: Option<f64>,
+    /// Optional override for fetch decrease factor.
     pub fetch_decrease_factor: Option<f64>,
+    /// Optional override for fetch decrease cooldown in seconds.
     pub fetch_decrease_cooldown_secs: Option<u64>,
+    /// Optional override for initial upload window.
     pub upload_initial_window: Option<f64>,
+    /// Optional override for minimum upload window.
     pub upload_min_window: Option<f64>,
+    /// Optional override for maximum upload window.
     pub upload_max_window: Option<f64>,
+    /// Optional override for upload increase step.
     pub upload_increase_step: Option<f64>,
+    /// Optional override for upload decrease factor.
     pub upload_decrease_factor: Option<f64>,
+    /// Optional override for upload decrease cooldown in seconds.
     pub upload_decrease_cooldown_secs: Option<u64>,
+    /// Optional override for upload delay in milliseconds.
     pub upload_delay_ms: Option<u64>,
+    /// Optional override for upload requeue base delay in milliseconds.
     pub upload_requeue_base_ms: Option<u64>,
+    /// Optional override for upload requeue max delay in milliseconds.
     pub upload_requeue_max_ms: Option<u64>,
+    /// Optional override for upload stats interval (seconds).
     pub upload_stats_interval_secs: Option<u64>,
+    /// Optional override for slab flush interval (ms).
     pub slab_flush_interval_ms: Option<u64>,
+    /// Optional override for upload cache I/O slots.
     pub upload_cache_io_slots: Option<usize>,
+    /// Optional override for transit memory budget bytes.
     pub transit_memory_budget_bytes: Option<usize>,
+    /// Optional override for upload foreground idle grace (ms).
     pub upload_user_idle_grace_ms: Option<u64>,
+    /// Optional override for foreground read latency target (ms).
     pub upload_fg_read_latency_target_ms: Option<u64>,
+    /// Optional override for foreground read latency window (ms).
     pub upload_fg_read_latency_window_ms: Option<u64>,
+    /// Optional override for sticky latency windows.
     pub upload_fg_read_latency_sticky_windows: Option<u64>,
+    /// Optional override for upload worker count.
     pub upload_worker_count: Option<usize>,
+    /// Optional override for upload max attempts.
     pub upload_max_attempts: Option<u32>,
+    /// Optional override for upload request timeout seconds.
     pub upload_request_timeout_secs: Option<u64>,
+    /// Optional override for upload retry base delay (ms).
     pub upload_retry_base_ms: Option<u64>,
+    /// Optional override for upload retry max delay (ms).
     pub upload_retry_max_ms: Option<u64>,
+    /// Optional override for fetch max attempts.
     pub fetch_max_attempts: Option<u32>,
+    /// Optional override for prefetch fetch max attempts.
     pub prefetch_fetch_max_attempts: Option<u32>,
+    /// Optional override for fetch request timeout seconds.
     pub fetch_request_timeout_secs: Option<u64>,
+    /// Optional override for fetch retry base delay (ms).
     pub fetch_retry_base_ms: Option<u64>,
+    /// Optional override for fetch retry max delay (ms).
     pub fetch_retry_max_ms: Option<u64>,
+    /// Optional override for fetch prefetch reserve slots.
     pub fetch_prefetch_reserve: Option<usize>,
+    /// Optional override for fetch prefetch acquire wait (ms).
     pub fetch_prefetch_acquire_wait_ms: Option<u64>,
+    /// Optional override for maximum drain batch size.
     pub max_drain_batch: Option<usize>,
+    /// Optional override for publish visibility timeout seconds.
     pub publish_visibility_timeout_secs: Option<u64>,
+    /// Optional override for shutdown metadata flush timeout seconds.
     pub shutdown_metadata_flush_timeout_secs: Option<u64>,
+    /// Optional override for QoS accept slots.
     pub qos_accept_slots: Option<usize>,
+    /// Optional override for QoS materialize slots.
     pub qos_materialize_slots: Option<usize>,
+    /// Optional override for QoS commit slots.
     pub qos_commit_slots: Option<usize>,
+    /// Optional override for QoS fetch slots.
     pub qos_fetch_slots: Option<usize>,
+    /// Optional override for foreground read speedometer shards.
     pub foreground_read_speedometer_shards: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
+/// Validated VFS configuration container.
 pub struct VfsConfigValidated {
+    /// Validated VFS configuration.
     config: VfsConfig,
+    /// Cached flags for which cache runtime values were explicitly overridden.
     cache_runtime_overrides: CacheRuntimeTuningOverrides,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
+/// Internal cache runtime tuning override flags.
 pub(super) struct CacheRuntimeTuningOverrides {
+    /// Whether `max_dirty_bytes` was set.
     pub(super) max_dirty_bytes: bool,
+    /// Whether `write_eager_flush_batch_bytes` was set.
     pub(super) write_eager_flush_batch_bytes: bool,
+    /// Whether `upload_cache_io_slots` was set.
     pub(super) upload_cache_io_slots: bool,
+    /// Whether `transit_memory_budget_bytes` was set.
     pub(super) transit_memory_budget_bytes: bool,
 }
 
 impl VfsConfigValidated {
+    /// Consume the wrapper and return owned validated config.
     pub fn into_inner(self) -> VfsConfig {
         self.config
     }
 
+    /// Get a snapshot of cache runtime override flags.
     pub(super) fn cache_runtime_overrides(&self) -> CacheRuntimeTuningOverrides {
         self.cache_runtime_overrides
     }
@@ -455,6 +594,7 @@ impl TryFrom<VfsConfig> for VfsConfigValidated {
 }
 
 impl VfsConfigRaw {
+    /// Resolve defaults and validate normalized values.
     fn resolve_defaults(self) -> (VfsConfig, CacheRuntimeTuningOverrides) {
         let overrides = CacheRuntimeTuningOverrides {
             max_dirty_bytes: self.max_dirty_bytes.is_some(),
@@ -548,6 +688,7 @@ impl VfsConfigRaw {
         (cfg, overrides)
     }
 
+    /// Validate the raw config and return a normalized [`VfsConfigValidated`].
     pub fn validate(self) -> VfsResult<VfsConfigValidated> {
         let (cfg, overrides) = self.resolve_defaults();
         normalize_vfs_config(cfg, overrides)

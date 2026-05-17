@@ -10,12 +10,19 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Benchmark cache facade used only by local benchmark/test tooling.
 pub mod benchmark_cache;
+/// Production cache runtime backing VFS mount paths with staged writeback and local payload caching.
 pub mod cached_store;
+/// Local payload backends and object-store layout helpers.
 pub mod local;
+/// Runtime statistics and cache pipeline metric snapshots.
 pub mod metrics;
+/// Local payload runtime detection/provisioning and backend runtime configuration.
 pub mod runtime;
+/// Upload queue staging APIs and pending upload surface.
 pub mod upload_queue;
+/// Upload-stage cache layer and local upload backend staging types.
 pub mod upload_stage;
 
 // --- Re-exports ---
@@ -66,32 +73,43 @@ fn is_recognized_retired_runtime_root(path: &Path, metadata: &std::fs::Metadata)
 
 /// Open result for the selected local backend implementation.
 pub struct OpenedLocalPayloadBackend {
+    /// Backend runtime detection result used to re-open or inspect current layout.
     pub detection: runtime::LocalPayloadRuntimeDetection,
+    /// Concrete backend family chosen for this cache root.
     pub backend_kind: runtime::LocalPayloadBackendKind,
+    /// Trait object for the opened local payload backend.
     pub backend: Arc<dyn local::LocalPayloadBackend>,
 }
 
 /// Prepared local payload object runtime state for a per-volume cache root.
 #[derive(Debug, Clone)]
 pub struct PreparedLocalPayloadRuntime {
+    /// Stable cache layout coordinates for metadata, payload and staging paths.
     pub layout: runtime::LocalPayloadLayout,
+    /// Runtime detection snapshot used when re-opening backend instances.
     pub detection: runtime::LocalPayloadRuntimeDetection,
 }
 
 /// Errors surfaced while provisioning the local payload object runtime state.
 #[derive(Debug, thiserror::Error)]
 pub enum PrepareLocalPayloadRuntimeError {
+    /// Runtime detection failed while inspecting an existing cache root.
     #[error("failed to inspect cache backend contract at '{cache_root}': {source}")]
     DetectCacheBackend {
+        /// Cache root path being inspected.
         cache_root: String,
+        /// Original I/O error from cache inspection.
         #[source]
         source: std::io::Error,
     },
+    /// Cache layout creation failed while provisioning required payload directories.
     #[error(
         "failed to provision local payload object runtime layout under '{cache_root}': {source}"
     )]
     ProvisionLocalPayloadLayout {
+        /// Cache root path where provisioning was attempted.
         cache_root: String,
+        /// Original I/O error from layout provisioning.
         #[source]
         source: std::io::Error,
     },
@@ -100,23 +118,32 @@ pub enum PrepareLocalPayloadRuntimeError {
 /// Errors surfaced while selecting and opening the local backend.
 #[derive(Debug, thiserror::Error)]
 pub enum OpenLocalPayloadBackendError {
+    /// Runtime detection failed while selecting backend contract.
     #[error("failed to inspect cache backend contract at '{cache_root}': {source}")]
     DetectCacheBackend {
+        /// Cache root path being inspected.
         cache_root: String,
+        /// Original I/O error from backend detection.
         #[source]
         source: std::io::Error,
     },
+    /// Failed to provision local runtime layout before opening.
     #[error(
         "failed to provision local payload object runtime layout under '{cache_root}': {source}"
     )]
     ProvisionLocalPayloadLayout {
+        /// Cache root path where provisioning was attempted.
         cache_root: String,
+        /// Original I/O error from layout provisioning.
         #[source]
         source: std::io::Error,
     },
+    /// Backend open failed; includes the underlying backend-specific cause.
     #[error("failed to open local payload object backend at '{cache_root}': {source}")]
     OpenLocalPayloadBackend {
+        /// Cache root path whose backend could not be opened.
         cache_root: String,
+        /// Backend-opening failure from local payload runtime.
         #[source]
         source: Box<runtime::LocalPayloadBackendOpenError>,
     },

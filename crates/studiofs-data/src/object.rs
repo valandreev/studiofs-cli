@@ -41,21 +41,42 @@ const _: [(); DEFAULT_BLOCK_SIZE as usize] = [(); CLOUD_FRAGMENT_SIZE * CLOUD_FR
 // =============================================================================
 
 #[derive(Debug, Error)]
+/// Errors that can occur while encoding, decoding, or validating object payloads.
 pub enum ObjectError {
+    /// Header magic bytes do not match the expected STFS marker.
     #[error("invalid magic bytes")]
     InvalidMagic,
+
+    /// The serialized object uses a version newer than supported.
     #[error("unsupported version: {0}")]
     UnsupportedVersion(u16),
+
+    /// Underlying I/O failure while reading or writing object bytes.
     #[error("IO error: {0}")]
     Io(#[from] io::Error),
+
+    /// The object declares legacy LZ4 compression that is no longer supported.
     #[error("legacy compressed object is not supported in this build")]
     LegacyCompressionUnsupported,
+
+    /// Header checksum check failed against the payload contents.
     #[error("checksum mismatch: expected {expected:016x}, got {computed:016x}")]
-    ChecksumMismatch { expected: u64, computed: u64 },
+    ChecksumMismatch {
+        /// Expected checksum from header.
+        expected: u64,
+        /// Computed checksum of the payload bytes.
+        computed: u64,
+    },
+
+    /// Encoded object payload exceeds the supported maximum size.
     #[error("object too large: {0} bytes")]
     ObjectTooLarge(u64),
+
+    /// The parsed object identifier is malformed or cannot be interpreted.
     #[error("invalid object ID: {0}")]
     InvalidObjectId(String),
+
+    /// Cloud fragment list does not satisfy layout constraints.
     #[error("invalid cloud fragment layout: {0}")]
     InvalidFragmentLayout(String),
 }
@@ -300,6 +321,7 @@ pub fn create_object_buffer_with(data: Bytes, flags: ObjectFlags) -> Result<Buff
     Ok(Buffer::from(chunks))
 }
 
+/// Alias for creating an object buffer with explicit flags.
 pub use create_object_buffer_with as create_object_buffer_with_flags;
 
 /// Read and validate an object.
@@ -434,6 +456,7 @@ pub fn format_fragment_keys(data_prefix: &str, object_id: u64) -> [String; CLOUD
     })
 }
 
+/// Alias for generating all fragment keys for an object.
 pub use format_fragment_keys as format_object_fragment_keys;
 
 /// Validate cloud fragment shape and return reconstructed payload size.

@@ -28,8 +28,11 @@ const ANSI_YELLOW: &str = "\x1b[33m";
 const ANSI_GREEN: &str = "\x1b[32m";
 const ANSI_RED: &str = "\x1b[31m";
 
+/// Compose project-name prefix used by infra helpers.
 pub const COMPOSE_PROJECT_PREFIX: &str = "studiofs-e2e-";
+/// Default service name for PostgreSQL in compose-based tests.
 pub const POSTGRES_SERVICE_NAME: &str = "postgres";
+/// Default service name for RustFS in compose-based tests.
 pub const RUSTFS_SERVICE_NAME: &str = "rustfs";
 const RUSTFS_CONSOLE_SERVICE_NAME: &str = "rustfs-console";
 const TOXIPROXY_API_SERVICE_NAME: &str = "toxiproxy-api";
@@ -71,21 +74,31 @@ struct ServicePortSpec {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+/// Supported infra launch modes for E2E environment setup.
 pub enum InfraMode {
+    /// Infra stack is disabled.
     Disabled,
+    /// Infra stack is managed via `docker compose`.
     Compose,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Static configuration for compose stack creation.
 pub struct ComposeConfig {
+    /// Stable run id for naming and artifact grouping.
     pub run_id: String,
+    /// Sandbox directory used to store run artifacts.
     pub sandbox: PathBuf,
+    /// Resolved compose file path.
     pub compose_file: PathBuf,
+    /// Optional explicit host port range.
     pub port_range: Option<String>,
+    /// Timeout in seconds for compose wait operations.
     pub wait_timeout_secs: u64,
 }
 
 impl ComposeConfig {
+    /// Builds a config from a run identifier and sandbox path.
     pub fn for_run(run_id: &str, sandbox: &Path, port_range: Option<String>) -> Self {
         Self {
             run_id: run_id.to_string(),
@@ -98,41 +111,63 @@ impl ComposeConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Bindings resolved for a compose service.
 pub struct ServicePort {
+    /// Compose service name.
     pub service: String,
+    /// Bound host interface.
     pub host: String,
+    /// Allocated host port number.
     pub host_port: u16,
+    /// Exposed container port number.
     pub container_port: u16,
+    /// Environment variable key used for this port.
     pub env_var: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Service image declaration discovered from compose metadata.
 pub struct ComposeServiceImage {
+    /// Compose service name.
     pub service: String,
+    /// Image name in compose file.
     pub image: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Command specification used by infra helpers.
 pub struct CommandSpec {
+    /// Executable name/path.
     pub program: String,
+    /// Arguments for the executable.
     pub args: Vec<String>,
+    /// Environment variables injected for the process.
     pub env: Vec<(String, String)>,
+    /// Optional working directory.
     pub cwd: Option<PathBuf>,
+    /// Optional command timeout.
     pub timeout: Option<Duration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Command execution output.
 pub struct CommandOutput {
+    /// Exit status code.
     pub status: i32,
+    /// UTF-8 decoded standard output.
     pub stdout: String,
+    /// UTF-8 decoded standard error.
     pub stderr: String,
 }
 
+/// Abstraction for executing infra commands.
 pub trait CommandExecutor {
+    /// Runs a prepared command and captures output.
     fn run(&self, command: &CommandSpec) -> std::io::Result<CommandOutput>;
 }
 
 #[derive(Debug, Clone, Copy, Default)]
+/// Default executor used by infra helpers.
 pub struct SystemCommandExecutor;
 
 impl CommandExecutor for SystemCommandExecutor {
@@ -156,6 +191,7 @@ impl CommandExecutor for SystemCommandExecutor {
     }
 }
 
+/// Reads command env to determine whether output should be streamed.
 pub fn command_streams_output(command: &CommandSpec) -> bool {
     command
         .env
@@ -376,39 +412,58 @@ fn discard_timed_out_reader(reader: Option<JoinHandle<io::Result<Vec<u8>>>>) {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Result of an infra preflight check.
 pub struct InfraCheck {
+    /// Human-readable check name.
     pub name: String,
+    /// Whether the check passed.
     pub passed: bool,
+    /// Human-readable detail string for reporters.
     pub detail: String,
 }
 
 #[derive(Debug, Error)]
+/// Infra-level errors emitted by helper operations.
 pub enum InfraError {
+    /// Compose file was expected but missing.
     #[error("compose file does not exist: {0}")]
     MissingComposeFile(PathBuf),
+    /// Port range cannot be parsed.
     #[error("invalid port range: {0}")]
     InvalidPortRange(String),
+    /// Declared range has too few ports for required services.
     #[error("port range {range} has {available} ports, but {needed} are required")]
     PortRangeTooSmall {
+        /// Input range string.
         range: String,
+        /// Number of available ports in range.
         available: usize,
+        /// Number of required ports for all services.
         needed: usize,
     },
+    /// Subprocess exited unsuccessfully.
     #[error("{action} failed with exit status {status}: {stderr}")]
     CommandFailed {
+        /// Action description used for caller logs.
         action: String,
+        /// Exit code from command.
         status: i32,
+        /// Captured stderr payload.
         stderr: String,
     },
+    /// Underlying I/O failure.
     #[error("infra I/O failed: {0}")]
     Io(#[from] std::io::Error),
+    /// JSON encoding/decoding failure.
     #[error("infra JSON failed: {0}")]
     Json(#[from] serde_json::Error),
+    /// YAML encoding/decoding failure.
     #[error("infra YAML failed: {0}")]
     Yaml(#[from] serde_yaml::Error),
 }
 
 #[derive(Debug, Clone)]
+/// Docker compose stack helper used by real E2E scenarios.
 pub struct DockerComposeStack {
     run_id: String,
     project_name: String,
@@ -419,6 +474,7 @@ pub struct DockerComposeStack {
 }
 
 impl DockerComposeStack {
+    /// Creates and validates a docker-compose stack state holder.
     pub fn new(config: ComposeConfig) -> Result<Self, InfraError> {
         if !config.compose_file.exists() {
             return Err(InfraError::MissingComposeFile(config.compose_file));
@@ -435,20 +491,24 @@ impl DockerComposeStack {
         })
     }
 
+    /// Returns the docker-compose project name.
     pub fn project_name(&self) -> &str {
         &self.project_name
     }
 
+    /// Returns allocated ports for compose services.
     pub fn ports(&self) -> &[ServicePort] {
         &self.ports
     }
 
+    /// Returns composed service images from the resolved compose file.
     pub fn compose_images(&self) -> Result<Vec<ComposeServiceImage>, InfraError> {
         Ok(compose_service_images(&fs::read_to_string(
             &self.compose_file,
         )?)?)
     }
 
+    /// Prepares compose and port artifacts under the sandbox.
     pub fn prepare_artifacts(&self) -> Result<(), InfraError> {
         fs::create_dir_all(self.docker_artifact_dir())?;
         fs::copy(&self.compose_file, self.artifact_compose_file())?;
@@ -459,6 +519,7 @@ impl DockerComposeStack {
         Ok(())
     }
 
+    /// Runs preflight checks for compose and required network resources.
     pub fn preflight(&self, executor: &dyn CommandExecutor) -> Vec<InfraCheck> {
         let mut checks = Vec::new();
         checks.push(self.compose_contract_check());
@@ -541,6 +602,7 @@ impl DockerComposeStack {
         }
     }
 
+    /// Returns the command spec for running `docker compose up`.
     pub fn up_command(&self) -> CommandSpec {
         let mut command = self.compose_command();
         command.args.extend([
@@ -553,11 +615,13 @@ impl DockerComposeStack {
         command
     }
 
+    /// Executes compose up and waits for services to become ready.
     pub fn start(&self, executor: &dyn CommandExecutor) -> Result<(), InfraError> {
         run_success(executor, "docker compose up --wait", self.up_command())?;
         Ok(())
     }
 
+    /// Stops all compose services.
     pub fn stop(&self, executor: &dyn CommandExecutor) -> Result<(), InfraError> {
         let mut command = self.compose_command();
         command.args.push("stop".to_string());
@@ -565,6 +629,7 @@ impl DockerComposeStack {
         Ok(())
     }
 
+    /// Restarts all compose services.
     pub fn restart(&self, executor: &dyn CommandExecutor) -> Result<(), InfraError> {
         let mut command = self.compose_command();
         command.args.push("restart".to_string());
@@ -573,6 +638,7 @@ impl DockerComposeStack {
         Ok(())
     }
 
+    /// Stops one service in this stack.
     pub fn stop_service(
         &self,
         service: &str,
@@ -581,6 +647,7 @@ impl DockerComposeStack {
         self.service_control().stop_service(service, executor)
     }
 
+    /// Starts one service in this stack.
     pub fn start_service(
         &self,
         service: &str,
@@ -589,6 +656,7 @@ impl DockerComposeStack {
         self.service_control().start_service(service, executor)
     }
 
+    /// Collects logs into artifact files and returns the stdout file path.
     pub fn collect_logs(&self, executor: &dyn CommandExecutor) -> Result<PathBuf, InfraError> {
         fs::create_dir_all(self.docker_artifact_dir())?;
         let mut command = self.compose_command();
@@ -608,6 +676,7 @@ impl DockerComposeStack {
         Ok(log_path)
     }
 
+    /// Collects optional diagnostic artifacts when needed.
     pub fn collect_optional_diagnostics(
         &self,
         executor: &dyn CommandExecutor,
@@ -654,6 +723,7 @@ impl DockerComposeStack {
         Ok(collected)
     }
 
+    /// Runs compose down and removes volumes/orphans with cleanup timeout.
     pub fn teardown(&self, executor: &dyn CommandExecutor) -> Result<(), InfraError> {
         let mut command = self.compose_command();
         command.timeout = Some(COMPOSE_CLEANUP_TIMEOUT);
@@ -790,18 +860,24 @@ fn mapping_value<'a>(value: &'a serde_yaml::Value, key: &str) -> Option<&'a serd
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Compose service control handle for an existing project.
 pub struct ComposeServiceControl {
+    /// Compose project name.
     pub project_name: String,
+    /// Absolute or relative compose file path used by operations.
     pub compose_file: PathBuf,
+    /// Default wait timeout for compose commands.
     pub wait_timeout_secs: u64,
     env: Vec<(String, String)>,
 }
 
 impl ComposeServiceControl {
+    /// Creates a compose control handle for the provided project name.
     pub fn for_project(project_name: String) -> Result<Self, InfraError> {
         Self::for_project_with_environment(project_name, Vec::new())
     }
 
+    /// Creates a compose control handle with explicit environment variables.
     pub fn for_project_with_environment(
         project_name: String,
         env: Vec<(String, String)>,
@@ -818,6 +894,7 @@ impl ComposeServiceControl {
         })
     }
 
+    /// Stops a compose service in this project.
     pub fn stop_service(
         &self,
         service: &str,
@@ -831,6 +908,7 @@ impl ComposeServiceControl {
         Ok(())
     }
 
+    /// Starts a compose service in this project.
     pub fn start_service(
         &self,
         service: &str,
@@ -853,6 +931,7 @@ impl ComposeServiceControl {
         Ok(())
     }
 
+    /// Tears down this compose project and cleans up resources.
     pub fn teardown(&self, executor: &dyn CommandExecutor) -> Result<(), InfraError> {
         let mut command = self.compose_command();
         command.timeout = Some(COMPOSE_CLEANUP_TIMEOUT);

@@ -1,3 +1,4 @@
+//! Tests that validate repository-wide architecture vocabulary and product-contract terms.
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};

@@ -16,6 +16,7 @@ use thiserror::Error;
 use crate::infra::ServicePort;
 use crate::process_job::ChildJob;
 
+/// Default client names used by the E2E mounted scenarios.
 pub const DEFAULT_CLIENT_NAMES: &[&str] = &["client-a", "client-b", "client-c", "client-d"];
 #[cfg(windows)]
 const DEFAULT_WINDOWS_MOUNT_LETTERS: &[char] = &[
@@ -27,20 +28,32 @@ const E2E_BUCKET_PREFIX: &str = "studiofs-e2e-";
 const E2E_VOLUME_PREFIX: &str = "sfs-e2e-";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Shared configuration used to create and run a multi-client controller.
 pub struct ClientControllerConfig {
+    /// Path to the `studiofs` binary used to run each client command.
     pub studiofs_bin: PathBuf,
+    /// Base sandbox path shared by all clients.
     pub sandbox: PathBuf,
+    /// Name of the mounted volume shared by the controller.
     pub volume_name: String,
+    /// PostgreSQL DSN for local metadata service.
     pub meta_dsn: String,
+    /// S3-compatible storage credentials and endpoint.
     pub s3: S3Config,
+    /// Timeout while waiting for a mount point to become ready.
     pub mount_ready_timeout: Duration,
+    /// Timeout while waiting for a mounted process to exit.
     pub mount_exit_timeout: Duration,
+    /// Poll cadence used for readiness/exit polling loops.
     pub poll_interval: Duration,
+    /// Pre-configured mount points (1-1 with client names when provided).
     pub mount_points: Vec<PathBuf>,
+    /// Per-client environment variable overrides.
     pub client_env_overrides: BTreeMap<String, Vec<(String, String)>>,
 }
 
 impl ClientControllerConfig {
+    /// Build a controller configuration from compose service ports.
     pub fn from_compose_services(
         studiofs_bin: PathBuf,
         sandbox: PathBuf,
@@ -51,6 +64,7 @@ impl ClientControllerConfig {
         Self::from_compose_services_inner(studiofs_bin, sandbox, run_id, seed, None, ports)
     }
 
+    /// Build a controller configuration from compose service ports and scenario name.
     pub fn from_compose_services_for_scenario(
         studiofs_bin: PathBuf,
         sandbox: PathBuf,
@@ -120,117 +134,190 @@ impl ClientControllerConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// S3 connection parameters consumed by client bootstrap and mount commands.
 pub struct S3Config {
+    /// S3 endpoint URL.
     pub endpoint: String,
+    /// Bucket name for scenario metadata and test objects.
     pub bucket: String,
+    /// Access key for S3 authentication.
     pub access_key: String,
+    /// Secret key for S3 authentication.
     pub secret_key: String,
+    /// AWS region used by the S3 backend.
     pub region: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Lifecycle phases used by `ClientSpec` and bootstrap summaries.
 pub enum ClientLifecycleState {
+    /// Client was declared but no action performed yet.
     Planned,
+    /// Client initialization has been executed.
     Initialized,
+    /// Client has been discovered for an existing volume.
     Discovered,
+    /// Client mount process is running.
     Mounted,
+    /// Client has been unmounted.
     Unmounted,
+    /// Client was force-killed.
     Killed,
+    /// Process exited before success or without explicit kill.
     Exited,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Runtime specification for a single E2E client.
 pub struct ClientSpec {
+    /// Client identifier.
     pub name: String,
+    /// Volume name assigned to this client.
     pub volume_name: String,
+    /// Root working directory used by the CLI for this client.
     pub client_root: PathBuf,
+    /// Local metadata directory for the client.
     pub local_metadata_dir: PathBuf,
+    /// Path to the local metadata sqlite database for the client.
     pub local_metadata_db: PathBuf,
+    /// Cache directory used by mounted process.
     pub cache_dir: PathBuf,
+    /// Directory where mount metadata files are stored.
     pub mount_metadata_dir: PathBuf,
+    /// Mount point path for this client.
     pub mount_point: PathBuf,
+    /// Path to stdout log for child command.
     pub stdout_log: PathBuf,
+    /// Path to stderr log for child command.
     pub stderr_log: PathBuf,
+    /// Path to tracing log for child process.
     pub tracing_log: PathBuf,
+    /// PID of the mounted child process if present.
     pub process_id: Option<u32>,
+    /// Current lifecycle state.
     pub state: ClientLifecycleState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Fully resolved command payload passed to clients.
 pub struct ClientCommand {
+    /// Client name.
     pub client: String,
+    /// Action label used for diagnostics.
     pub action: String,
+    /// Executable name/path (typically `studiofs`).
     pub program: String,
+    /// Arguments forwarded to the executable.
     pub args: Vec<String>,
+    /// Environment overrides for child command.
     pub env: Vec<(String, String)>,
+    /// Client root directory.
     pub client_root: PathBuf,
+    /// Client cache directory.
     pub cache_dir: PathBuf,
+    /// Mount point path.
     pub mount_point: PathBuf,
+    /// Stdout log path.
     pub stdout_log: PathBuf,
+    /// Stderr log path.
     pub stderr_log: PathBuf,
+    /// Tracing log path.
     pub tracing_log: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Captured command output used by success checks.
 pub struct ClientCommandOutput {
+    /// Exit status code.
     pub status: i32,
+    /// Captured stdout (UTF-8 lossy string).
     pub stdout: String,
+    /// Captured stderr (UTF-8 lossy string).
     pub stderr: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Options for bootstrapping a single shared volume.
 pub struct VolumeBootstrapOptions {
+    /// Client names to create.
     pub client_names: Vec<String>,
+    /// Remove pre-existing local metadata before bootstrap.
     pub clean_existing_local_metadata: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Options for bootstrapping multiple peer volumes.
 pub struct PeerVolumeBootstrapOptions {
+    /// Client names participating in peer bootstrap.
     pub client_names: Vec<String>,
+    /// Remove per-client metadata roots before bootstrap.
     pub clean_existing_local_metadata: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Client record included in bootstrap summaries.
 pub struct ClientBootstrapRecord {
+    /// Client name.
     pub name: String,
+    /// Local metadata database path for this client.
     pub local_metadata_db: PathBuf,
+    /// Current lifecycle state captured in bootstrap summary.
     pub state: ClientLifecycleState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Summary for a single volume bootstrap invocation.
 pub struct VolumeBootstrapSummary {
+    /// Name of the bootstrapped volume.
     pub volume_name: String,
+    /// Initializing client name.
     pub init_client: String,
+    /// Clients joined after the initializer.
     pub discovered_clients: Vec<String>,
+    /// Full client records for the volume.
     pub clients: Vec<ClientBootstrapRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Summary for peer volume bootstrap across multiple owners.
 pub struct PeerVolumeBootstrapSummary {
+    /// Base/original volume name used for peer peers.
     pub base_volume_name: String,
+    /// Summaries for each peer volume.
     pub volumes: Vec<VolumeBootstrapSummary>,
 }
 
+/// Abstraction for a running client process.
 pub trait ClientProcess {
+    /// Returns the child process identifier.
     fn id(&self) -> u32;
+    /// Polls process wait status without blocking.
     fn try_wait(&mut self) -> io::Result<Option<i32>>;
+    /// Sends a best-effort kill request to the process.
     fn kill(&mut self) -> io::Result<()>;
+    /// Terminates process and known process tree.
     fn kill_process_tree(&mut self, _context: &str) -> io::Result<()> {
         self.kill()
     }
 }
 
+/// Executor abstraction for spawning and observing client commands.
 pub trait ClientProcessExecutor {
+    /// Run a command and capture output.
     fn run(&self, command: &ClientCommand) -> io::Result<ClientCommandOutput>;
+    /// Spawn a command and return a live process handle.
     fn spawn(&self, command: &ClientCommand) -> io::Result<Box<dyn ClientProcess>>;
+    /// Probe if a client mount point is already active.
     fn is_mount_ready(&self, command: &ClientCommand) -> io::Result<bool>;
+    /// Remove stale mounts that may remain from previous runs.
     fn cleanup_stale_mount_before_remount(&self, _command: &ClientCommand) -> io::Result<()> {
         Ok(())
     }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
+/// Default process executor used in mounted E2E scenario runs.
 pub struct SystemClientProcessExecutor;
 
 impl ClientProcessExecutor for SystemClientProcessExecutor {
@@ -368,56 +455,113 @@ fn force_kill_child_process_tree(child: &mut Child, context: &str) -> io::Result
 
 #[cfg(windows)]
 #[doc(hidden)]
+/// Checks whether a `taskkill` status code should be treated as success.
 pub fn windows_taskkill_status_is_success(status_code: Option<i32>) -> bool {
     status_code == Some(0) || status_code == Some(128)
 }
 
 #[derive(Debug, Error)]
+/// Errors returned by `MultiClientController`.
 pub enum ClientControllerError {
+    /// No clients are configured.
     #[error("no E2E clients have been created")]
     NoClients,
+    /// Attempted to replace or mutate while clients are still mounted.
     #[error("cannot replace E2E clients while mount processes are still tracked")]
     ClientsStillMounted,
+    /// Provided client name is not safe for filesystem/service use.
     #[error("client name must be a safe single directory name: {0}")]
-    UnsafeClientName(String),
+    UnsafeClientName(
+        /// Provided client name string that failed validation.
+        String,
+    ),
+    /// Unknown client name was requested.
     #[error("unknown E2E client: {0}")]
-    UnknownClient(String),
+    UnknownClient(
+        /// Requested client name that is not present in current configuration.
+        String,
+    ),
+    /// Requested client index is outside the configured range.
     #[error("E2E client index {index} is out of range for {len} clients")]
-    ClientIndexOutOfRange { index: usize, len: usize },
+    ClientIndexOutOfRange {
+        /// Requested index that does not match any configured client.
+        index: usize,
+        /// Total number of clients in the current controller configuration.
+        len: usize,
+    },
+    /// Mountpoint was already active when a mount was attempted.
     #[error("E2E client {client} mount point is already active before mount: {path}")]
-    MountPointAlreadyActive { client: String, path: PathBuf },
+    MountPointAlreadyActive {
+        /// Client name for which mountpoint readiness was checked.
+        client: String,
+        /// Path that was already active at mount attempt time.
+        path: PathBuf,
+    },
+    /// A compose service port was not found.
     #[error("Docker compose service port is missing for {0}")]
-    MissingServicePort(String),
+    MissingServicePort(
+        /// Service name without an available port binding.
+        String,
+    ),
+    /// Spawned command failed with non-zero status.
     #[error(
         "client command {action} for {client} failed with exit status {status}: stderr: {stderr}; stdout: {stdout}"
     )]
     CommandFailed {
+        /// Client name for the failed command.
         client: String,
+        /// Command action.
         action: String,
+        /// Raw exit status.
         status: i32,
+        /// Command stdout excerpt.
         stdout: String,
+        /// Command stderr excerpt.
         stderr: String,
     },
+    /// Local metadata DB was not created for the client.
     #[error("E2E client {client} did not create local metadata DB: {path}")]
-    MissingLocalMetadataDb { client: String, path: PathBuf },
+    MissingLocalMetadataDb {
+        /// Client name without a created local metadata DB.
+        client: String,
+        /// Expected local metadata database path.
+        path: PathBuf,
+    },
+    /// Same local metadata DB path was reused across clients.
     #[error("E2E local metadata DB path is shared by multiple clients: {0}")]
-    DuplicateLocalMetadataDb(PathBuf),
+    DuplicateLocalMetadataDb(
+        /// Shared local metadata DB path used by more than one client.
+        PathBuf,
+    ),
+    /// Metadata DB could not be canonicalized.
     #[error("failed to canonicalize local metadata DB for E2E client {client} at {path}: {source}")]
     CanonicalizeLocalMetadataDbFailed {
+        /// Client name.
         client: String,
+        /// Declared local metadata DB path.
         path: PathBuf,
+        /// Underlying OS error.
         source: io::Error,
     },
+    /// Local metadata could not be cleaned.
     #[error("failed to clean local metadata for E2E client {client} at {path}: {source}")]
     CleanLocalMetadataFailed {
+        /// Client name.
         client: String,
+        /// Metadata path attempted to clean.
         path: PathBuf,
+        /// Underlying OS error.
         source: io::Error,
     },
+    /// Underlying I/O failure.
     #[error("client controller I/O failed: {0}")]
-    Io(#[from] io::Error),
+    Io(
+        /// Underlying OS and stdlib error returned by I/O operations.
+        #[from] io::Error,
+    ),
 }
 
+/// Controller for creating, mounting, discovering and killing multiple clients.
 pub struct MultiClientController<E> {
     config: ClientControllerConfig,
     executor: E,
@@ -425,6 +569,7 @@ pub struct MultiClientController<E> {
 }
 
 impl<E: ClientProcessExecutor> MultiClientController<E> {
+    /// Creates a new controller from configuration and executor.
     pub fn new(config: ClientControllerConfig, executor: E) -> Self {
         Self {
             config,
@@ -433,6 +578,9 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         }
     }
 
+    /// Replaces configured clients with names.
+    ///
+    /// Existing mounted clients are rejected to prevent unsafe mutation.
     pub fn create_clients<I, N>(&mut self, names: I) -> Result<(), ClientControllerError>
     where
         I: IntoIterator<Item = N>,
@@ -460,6 +608,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         Ok(())
     }
 
+    /// Returns specs for all tracked clients.
     pub fn clients(&self) -> Vec<&ClientSpec> {
         self.clients
             .iter()
@@ -467,10 +616,12 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
             .collect::<Vec<_>>()
     }
 
+    /// Returns the client by index.
     pub fn client_at(&self, index: usize) -> Result<&ClientSpec, ClientControllerError> {
         self.client(index)
     }
 
+    /// Sets environment variable overrides for a named client.
     pub fn set_client_env_overrides<I, K, V>(
         &mut self,
         client: &str,
@@ -492,6 +643,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         Ok(())
     }
 
+    /// Initializes the first client (`client-0`) and marks it as initialized.
     pub fn init_first_client(&mut self) -> Result<(), ClientControllerError> {
         if self.clients.is_empty() {
             return Err(ClientControllerError::NoClients);
@@ -503,6 +655,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         Ok(())
     }
 
+    /// Discovers all additional clients after the first one.
     pub fn discover_additional_clients(&mut self) -> Result<(), ClientControllerError> {
         if self.clients.is_empty() {
             return Err(ClientControllerError::NoClients);
@@ -516,6 +669,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         Ok(())
     }
 
+    /// Discovers a single named client.
     pub fn discover(&mut self, client: &str) -> Result<(), ClientControllerError> {
         let index = self.client_index(client)?;
         let command = self.discover_command(index)?;
@@ -525,6 +679,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         Ok(())
     }
 
+    /// Bootstraps a single shared volume for the configured clients.
     pub fn bootstrap_volume(
         &mut self,
         options: VolumeBootstrapOptions,
@@ -564,6 +719,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         })
     }
 
+    /// Bootstraps peer volume variants for each client as owner.
     pub fn bootstrap_peer_volumes(
         &mut self,
         options: PeerVolumeBootstrapOptions,
@@ -627,6 +783,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         })
     }
 
+    /// Re-targets existing clients to a new volume name.
     pub fn select_volume_for_clients(
         &mut self,
         volume_name: &str,
@@ -648,6 +805,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         Ok(())
     }
 
+    /// Mounts all configured clients.
     pub fn mount_all(&mut self) -> Result<(), ClientControllerError> {
         for index in 0..self.clients.len() {
             self.mount_index(index)?;
@@ -655,17 +813,20 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         Ok(())
     }
 
+    /// Mounts a single named client.
     pub fn mount(&mut self, client: &str) -> Result<(), ClientControllerError> {
         let index = self.client_index(client)?;
         self.mount_index(index)
     }
 
+    /// Restarts (unmount then mount) a named client.
     pub fn restart(&mut self, client: &str) -> Result<(), ClientControllerError> {
         let index = self.client_index(client)?;
         self.unmount_index(index)?;
         self.mount_index(index)
     }
 
+    /// Force-kills a named client process and marks it as killed.
     pub fn force_kill(&mut self, client: &str) -> Result<(), ClientControllerError> {
         let index = self.client_index(client)?;
         if let Some(process) = self.clients[index].process.as_mut() {
@@ -682,6 +843,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         Ok(())
     }
 
+    /// Cleans up stale mount artifacts and remounts a named client.
     pub fn remount(&mut self, client: &str) -> Result<(), ClientControllerError> {
         let index = self.client_index(client)?;
         let command = self.mount_command(index)?;
@@ -689,6 +851,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         self.mount_index(index)
     }
 
+    /// Unmounts all mounted clients.
     pub fn unmount_all(&mut self) -> Result<(), ClientControllerError> {
         for index in 0..self.clients.len() {
             self.unmount_index(index)?;
@@ -696,11 +859,13 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         Ok(())
     }
 
+    /// Unmounts a single named client.
     pub fn unmount(&mut self, client: &str) -> Result<(), ClientControllerError> {
         let index = self.client_index(client)?;
         self.unmount_index(index)
     }
 
+    /// Force-kills all tracked client processes.
     pub fn force_kill_all(&mut self) -> Result<(), ClientControllerError> {
         let mut kill_error = None;
         for index in 0..self.clients.len() {
@@ -1086,34 +1251,42 @@ fn ensure_success(
     }
 }
 
+/// Returns the base artifact directory for a client.
 pub fn client_artifact_dir(sandbox: &Path, client: &str) -> PathBuf {
     sandbox.join("artifacts").join("clients").join(client)
 }
 
+/// Returns the default client root directory for a client.
 pub fn client_root_dir(sandbox: &Path, client: &str) -> PathBuf {
     client_artifact_dir(sandbox, client).join("client-root")
 }
 
+/// Returns the default client cache directory for a client.
 pub fn client_cache_dir(sandbox: &Path, client: &str) -> PathBuf {
     client_artifact_dir(sandbox, client).join("cache")
 }
 
+/// Returns the default mount-point directory for a client.
 pub fn client_mount_point(sandbox: &Path, client: &str) -> PathBuf {
     client_artifact_dir(sandbox, client).join("mount")
 }
 
+/// Returns the default stdout log path for a client.
 pub fn client_stdout_log(sandbox: &Path, client: &str) -> PathBuf {
     client_artifact_dir(sandbox, client).join("studiofs.stdout.log")
 }
 
+/// Returns the default stderr log path for a client.
 pub fn client_stderr_log(sandbox: &Path, client: &str) -> PathBuf {
     client_artifact_dir(sandbox, client).join("studiofs.stderr.log")
 }
 
+/// Returns the default tracing log path for a client.
 pub fn client_tracing_log(sandbox: &Path, client: &str) -> PathBuf {
     client_artifact_dir(sandbox, client).join("studiofs-tracing.log")
 }
 
+/// Builds a fully populated `ClientSpec` for a client and volume.
 pub fn client_spec_for(
     sandbox: &Path,
     volume_name: &str,

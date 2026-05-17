@@ -39,29 +39,42 @@ static TEMP_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
 static BATCH_INTENT_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug)]
+/// A single payload entry for a batched [`FilePayloadStore::put_batch`] operation.
 pub struct PayloadBatchEntry<'a> {
+    /// Object id for the payload.
     pub object_id: u64,
+    /// Payload bytes to persist.
     pub data: &'a [u8],
 }
 
 #[derive(Debug)]
 #[must_use = "batch payload commit intents must be completed after the index commit succeeds"]
+/// A handle that completes the payload-side intent for a batched write.
 pub struct PayloadBatchCommit {
     intent_path: PathBuf,
 }
 
 impl PayloadBatchCommit {
+    /// Completes the payload-side intent by removing the staged intent marker.
     pub fn complete(self) {
         remove_batch_payload_intent(&self.intent_path);
     }
 }
 
 #[derive(Debug, thiserror::Error)]
+/// Errors returned by [`FilePayloadStore`] operations.
 pub enum FilePayloadStoreError {
+    /// An underlying I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
+    /// Exhausted attempts to create a unique temp file for the payload write.
     #[error("failed to create a unique temp payload file for object_id={object_id} in '{dir}'")]
-    TempFileCreateExhausted { object_id: u64, dir: PathBuf },
+    TempFileCreateExhausted {
+        /// The object id for which temp-file creation failed.
+        object_id: u64,
+        /// The directory where temp-file creation attempts were performed.
+        dir: PathBuf,
+    },
 }
 
 /// File-per-object payload store rooted under the current local payload runtime
@@ -79,10 +92,12 @@ pub struct FilePayloadStore {
 }
 
 impl FilePayloadStore {
+    /// Opens a payload store rooted at `layout` using durable sync mode and buffered writes.
     pub fn open(layout: LocalPayloadLayout) -> Result<Self, FilePayloadStoreError> {
         Self::open_with_sync_mode(layout, LocalPayloadSyncMode::Durable)
     }
 
+    /// Opens a payload store rooted at `layout` using the provided sync mode and buffered writes.
     pub fn open_with_sync_mode(
         layout: LocalPayloadLayout,
         sync_mode: LocalPayloadSyncMode,
@@ -90,6 +105,7 @@ impl FilePayloadStore {
         Self::open_with_sync_and_write_mode(layout, sync_mode, LocalPayloadWriteMode::Buffered)
     }
 
+    /// Opens a payload store rooted at `layout` using the provided sync and write modes.
     pub fn open_with_sync_and_write_mode(
         layout: LocalPayloadLayout,
         sync_mode: LocalPayloadSyncMode,
@@ -114,6 +130,9 @@ impl FilePayloadStore {
         })
     }
 
+    /// Loads the full payload for `object_id` into memory.
+    ///
+    /// Returns `None` if the payload is missing or if an error occurs while reading it.
     pub fn get(&self, object_id: u64) -> Option<Bytes> {
         let path = self.layout.payload_object_path(object_id);
         let file = self.cached_read_handle(object_id, &path).ok()?;
@@ -156,6 +175,9 @@ impl FilePayloadStore {
         Some(Bytes::from(payload))
     }
 
+    /// Reads up to `out.len()` bytes from the payload for `object_id` starting at `data_offset`.
+    ///
+    /// Returns `None` if the payload is missing or if an error occurs while reading it.
     pub fn read_into(&self, object_id: u64, data_offset: usize, out: &mut [u8]) -> Option<usize> {
         if out.is_empty() {
             return Some(0);
@@ -192,6 +214,9 @@ impl FilePayloadStore {
         }
     }
 
+    /// Hints that the payload for `object_id` will be read soon.
+    ///
+    /// On supported platforms, this may warm OS caches to reduce subsequent read latency.
     pub fn advise_will_need(&self, object_id: u64) {
         let path = self.layout.payload_object_path(object_id);
         let Ok(file) = self.cached_read_handle(object_id, &path) else {
@@ -244,6 +269,7 @@ impl FilePayloadStore {
         }
     }
 
+    /// Returns `true` if a payload exists for `object_id`.
     pub fn contains(&self, object_id: u64) -> bool {
         match self.payload_exists(object_id) {
             Ok(exists) => exists,
@@ -258,10 +284,12 @@ impl FilePayloadStore {
         }
     }
 
+    /// Checks whether a payload exists for `object_id`.
     pub fn payload_exists(&self, object_id: u64) -> io::Result<bool> {
         self.layout.payload_object_path(object_id).try_exists()
     }
 
+    /// Persists `data` as the payload for `object_id`.
     pub fn put(&self, object_id: u64, data: &[u8]) -> Result<(), FilePayloadStoreError> {
         let payload_path = self.layout.payload_object_path(object_id);
         let payload_dir = payload_path.parent().ok_or_else(|| {
@@ -312,6 +340,9 @@ impl FilePayloadStore {
         Ok(())
     }
 
+    /// Persists a batch of payloads and returns a commit handle for the payload-side intent.
+    ///
+    /// Call [`PayloadBatchCommit::complete`] after the corresponding index/metadata commit succeeds.
     pub fn put_batch(
         &self,
         entries: &[PayloadBatchEntry<'_>],
@@ -493,6 +524,7 @@ impl FilePayloadStore {
         })
     }
 
+    /// Removes the payload for `object_id`, if present.
     pub fn remove(&self, object_id: u64) {
         self.invalidate_cached_read_handle(object_id);
         self.pending_grouped_sync
@@ -512,12 +544,14 @@ impl FilePayloadStore {
         }
     }
 
+    /// Removes payloads for all `object_ids`.
     pub fn remove_batch(&self, object_ids: &[u64]) {
         for object_id in object_ids {
             self.remove(*object_id);
         }
     }
 
+    /// Flushes and syncs pending payload writes according to the configured sync mode.
     pub fn sync_data(&self) -> Result<(), FilePayloadStoreError> {
         if matches!(self.sync_mode, LocalPayloadSyncMode::Fast) {
             let (pending_object_ids, pending_dirs) = self.take_grouped_sync_targets();

@@ -1,14 +1,20 @@
 use super::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Controls how namespace paths are parsed and rendered (POSIX vs Windows separator rules).
 pub enum NamespacePathStyle {
+    /// POSIX-style paths using forward-slash (`/`) separators.
     Posix,
+    /// Windows-style paths using backslash (`\`) separators.
     Windows,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Represents the resolved parent directory and its target component name.
 pub struct NamespaceParent {
+    /// Inode of the directory that owns the component.
     pub parent: Ino,
+    /// Raw name bytes of the component under `parent`.
     pub name: Vec<u8>,
 }
 
@@ -27,9 +33,12 @@ impl DentryCacheKey {
     }
 }
 
+/// Cached result for one `(parent, name)` namespace lookup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DentryCacheValue {
+    /// Positive cache entry pointing to an existing inode.
     Positive(Ino),
+    /// Negative cache entry indicating component is absent under the parent.
     Negative,
 }
 
@@ -45,22 +54,35 @@ struct NamespaceCacheToken {
     parent_generation: u64,
 }
 
+/// Metrics for dentry cache hits, misses, and hot-set occupancy.
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct DentryCacheMetrics {
+    /// Total cache hits across protected and unprotected rings.
     pub(super) hits: u64,
+    /// Hits served from protected (hot) ring.
     pub(super) protected_hits: u64,
+    /// Misses from all rings.
     pub(super) misses: u64,
+    /// Hits for entries that cache a missing child.
     pub(super) negative_hits: u64,
+    /// Entries evicted under capacity pressure.
     pub(super) evictions: u64,
+    /// Current number of entries in cache.
     pub(super) occupancy_entries: usize,
+    /// Current estimated bytes consumed by cache entries.
     pub(super) occupancy_bytes: usize,
+    /// Current entries in protected (hot) ring.
     pub(super) protected_occupancy_entries: usize,
+    /// Current estimated bytes consumed by protected (hot) ring.
     pub(super) protected_occupancy_bytes: usize,
+    /// Configured entry capacity bound for this cache.
     pub(super) entry_budget: usize,
+    /// Configured byte capacity bound for this cache.
     pub(super) byte_budget: usize,
 }
 
 impl DentryCacheMetrics {
+    /// Returns the fraction of hits that were negative cache entries.
     pub(super) fn negative_hit_ratio(self) -> f64 {
         if self.hits == 0 {
             return 0.0;
@@ -68,6 +90,7 @@ impl DentryCacheMetrics {
         self.negative_hits as f64 / self.hits as f64
     }
 
+    /// Returns the fraction of hits served from protected (hot) storage.
     pub(super) fn hot_hit_ratio(self) -> f64 {
         if self.hits == 0 {
             return 0.0;
@@ -174,6 +197,7 @@ impl CachePolicy<DentryCacheKey, DentryCacheValue> for DentryCachePolicy {
     }
 }
 
+/// Two-tier cache for direct dentry lookups keyed by `(parent, name)`.
 #[derive(Debug)]
 pub(super) struct DentryCache {
     inner: TwoTierCache<DentryCacheKey, DentryCacheValue, DentryCachePolicy>,
@@ -274,6 +298,7 @@ impl DentryCache {
     }
 }
 
+/// Encoded normalized full-path token used by the path-shortcut cache.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct PathShortcutCacheKey {
     style: NamespacePathStyle,
@@ -304,12 +329,16 @@ impl PathShortcutCacheKey {
     }
 }
 
+/// Cached value for memoized full-path resolution.
 #[derive(Debug, Clone)]
 pub(super) enum PathShortcutCacheValue {
+    /// Positive path resolution: full path maps to inode.
     Positive(Ino),
+    /// Negative path resolution: parent+name pair is known missing.
     Negative { parent: Ino, name: Arc<[u8]> },
 }
 
+/// Captured parent and generation snapshot used to validate shortcut freshness.
 #[derive(Debug, Clone)]
 pub(super) struct PathShortcutParentToken {
     parent: Ino,
@@ -332,22 +361,35 @@ struct PathShortcutInsertCtx {
     parent_tokens: Arc<[PathShortcutParentToken]>,
 }
 
+/// Metrics for path shortcut cache hits, misses, and capacity state.
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct PathShortcutCacheMetrics {
+    /// Total cache hits across protected and unprotected rings.
     pub(super) hits: u64,
+    /// Hits served from protected (hot) ring.
     pub(super) protected_hits: u64,
+    /// Misses from all rings.
     pub(super) misses: u64,
+    /// Hits for negative path-shortcut entries.
     pub(super) negative_hits: u64,
+    /// Entries evicted under capacity pressure.
     pub(super) evictions: u64,
+    /// Current number of entries in cache.
     pub(super) occupancy_entries: usize,
+    /// Current estimated bytes consumed by cache entries.
     pub(super) occupancy_bytes: usize,
+    /// Entries currently in protected (hot) ring.
     pub(super) protected_occupancy_entries: usize,
+    /// Current estimated bytes consumed by protected (hot) ring.
     pub(super) protected_occupancy_bytes: usize,
+    /// Configured entry capacity bound for this cache.
     pub(super) entry_budget: usize,
+    /// Configured byte capacity bound for this cache.
     pub(super) byte_budget: usize,
 }
 
 impl PathShortcutCacheMetrics {
+    /// Returns the fraction of hits that were negative cache entries.
     pub(super) fn negative_hit_ratio(self) -> f64 {
         if self.hits == 0 {
             return 0.0;
@@ -355,6 +397,7 @@ impl PathShortcutCacheMetrics {
         self.negative_hits as f64 / self.hits as f64
     }
 
+    /// Returns the fraction of hits served from protected (hot) storage.
     pub(super) fn hot_hit_ratio(self) -> f64 {
         if self.hits == 0 {
             return 0.0;
@@ -462,6 +505,7 @@ impl CachePolicy<PathShortcutCacheKey, PathShortcutCacheValue> for PathShortcutC
     }
 }
 
+/// Full path memoization cache for normalized paths to reduce component walk cost.
 #[derive(Debug)]
 pub(super) struct PathShortcutCache {
     inner: TwoTierCache<PathShortcutCacheKey, PathShortcutCacheValue, PathShortcutCachePolicy>,
@@ -538,12 +582,14 @@ impl PathShortcutCache {
     }
 }
 
+/// Resolves namespace paths and components with path-style normalization and cache reuse.
 pub struct NamespaceResolver<'a> {
     vfs: &'a StudioVfs,
     style: NamespacePathStyle,
 }
 
 impl<'a> NamespaceResolver<'a> {
+    /// Builds a resolver for a chosen namespace path style.
     pub(super) fn new(vfs: &'a StudioVfs, style: NamespacePathStyle) -> Self {
         Self { vfs, style }
     }
@@ -656,15 +702,18 @@ impl<'a> NamespaceResolver<'a> {
         do_resolve()
     }
 
+    /// Resolves a single path component under `parent` into inode metadata.
     pub fn lookup_component(&self, parent: Ino, name: &[u8]) -> VfsResult<InodeAttr> {
         self.vfs.lookup_component_impl(parent, name)
     }
 
+    /// Resolves a full path, applying `.`/`..` trimming and platform-specific separators.
     pub fn resolve_path(&self, path: &str) -> VfsResult<InodeAttr> {
         let components = self.path_components(path);
         self.resolve_components_cached(&components)
     }
 
+    /// Resolves a path to `(parent_inode, final_component_name)`.
     pub fn resolve_parent(&self, path: &str) -> VfsResult<NamespaceParent> {
         let components = self.path_components(path);
         if components.is_empty() {
@@ -684,6 +733,9 @@ impl<'a> NamespaceResolver<'a> {
         })
     }
 
+    /// Builds a best-effort absolute path for an inode using cached/readdir ancestry.
+    ///
+    /// Returns `None` when ancestry cannot be reconstructed within the lookup window.
     pub fn path_for_inode(&self, ino: Ino) -> Option<String> {
         if ino == ROOT_INO {
             return Some(match self.style {
@@ -723,15 +775,18 @@ impl<'a> NamespaceResolver<'a> {
     }
 }
 
+/// Coordinates cache/epoch side effects for namespace mutating operations.
 pub(super) struct NamespaceMutationOps<'a> {
     vfs: &'a StudioVfs,
 }
 
 impl<'a> NamespaceMutationOps<'a> {
+    /// Creates a mutation coordinator tied to the current VFS.
     pub(super) fn new(vfs: &'a StudioVfs) -> Self {
         Self { vfs }
     }
 
+    /// Records insertion: invalidates affected attr caches and stores positive dentry cache.
     pub(super) fn record_insertion(
         &self,
         parent: Ino,
@@ -746,6 +801,7 @@ impl<'a> NamespaceMutationOps<'a> {
         self.vfs.dentry_cache_insert_positive(parent, name, child);
     }
 
+    /// Records ignored insertions where filesystem state is already visible elsewhere.
     pub(super) fn record_ignored_insertion(
         &self,
         parent: Ino,
@@ -757,6 +813,7 @@ impl<'a> NamespaceMutationOps<'a> {
         self.vfs.bump_namespace_for_parents([parent]);
     }
 
+    /// Records removal: invalidates caches and stores a negative dentry marker.
     pub(super) fn record_removal(
         &self,
         parent: Ino,
@@ -770,6 +827,7 @@ impl<'a> NamespaceMutationOps<'a> {
         self.vfs.dentry_cache_insert_negative(parent, name);
     }
 
+    /// Records a rename that is rejected for destination update but should invalidate source state.
     pub(super) fn record_ignored_rename(
         &self,
         parent: Ino,
@@ -787,6 +845,7 @@ impl<'a> NamespaceMutationOps<'a> {
         self.vfs.dentry_cache_insert_negative(parent, name);
     }
 
+    /// Records successful rename/move and updates both old and new parent cache states.
     pub(super) fn record_rename(
         &self,
         parent: Ino,
@@ -808,20 +867,30 @@ impl<'a> NamespaceMutationOps<'a> {
     }
 }
 
+/// Abstraction for backends that can invalidate inode-specific kernel cache entries.
 pub trait KernelInvalidator: Send + Sync {
+    /// Invalidate kernel cache state associated with the given inode.
     fn inval_inode(&self, ino: u64);
 }
 
+/// Holds namespace-scoped caches and generation counters used for coherence.
 pub(super) struct NamespaceState {
+    /// Dentry cache by `(parent, name)` with positive/negative entries.
     pub(super) dentry_cache: Mutex<DentryCache>,
+    /// Memoized full-path lookup cache.
     pub(super) path_shortcut_cache: Mutex<PathShortcutCache>,
+    /// Cached inode attribute reads.
     pub(super) attr_read_cache: Mutex<AttrReadCache>,
+    /// Local dirty attribute snapshots awaiting persistence.
     pub(super) dirty_attrs: Mutex<std::collections::HashMap<Ino, InodeAttr>>,
+    /// Global namespace epoch to invalidate stale dentry/path cache entries.
     pub(super) namespace_epoch: AtomicU64,
+    /// Per-directory generation map used to detect stale parent chains.
     pub(super) directory_generations: Mutex<std::collections::HashMap<Ino, u64>>,
 }
 
 impl NamespaceState {
+    /// Creates namespace caches with configured capacity limits for all cache layers.
     pub(super) fn new(
         dentry_cache_capacity: usize,
         dentry_cache_bytes: usize,
@@ -863,6 +932,7 @@ impl StudioVfs {
         }
     }
 
+    /// Increments the global namespace epoch used for cache freshness checks.
     pub(super) fn bump_namespace_epoch(&self) {
         self.state
             .namespace
@@ -876,6 +946,7 @@ impl StudioVfs {
             .ok();
     }
 
+    /// Increments generation for a directory whose child set changed.
     pub(super) fn bump_directory_generation(&self, ino: Ino) {
         let mut generations = self.state.namespace.directory_generations.lock();
         let current = generations.get(&ino).copied().unwrap_or(0);
@@ -886,6 +957,7 @@ impl StudioVfs {
         generations.insert(ino, next);
     }
 
+    /// Bumps namespace epoch and generation for all listed parent directories.
     pub(super) fn bump_namespace_for_parents(&self, parents: impl IntoIterator<Item = Ino>) {
         self.bump_namespace_epoch();
         let mut generations = self.state.namespace.directory_generations.lock();
@@ -903,6 +975,7 @@ impl StudioVfs {
         }
     }
 
+    /// Looks up `(parent,name)` in dentry cache using current namespace tokens.
     pub(super) fn dentry_cache_lookup(&self, parent: Ino, name: &[u8]) -> Option<DentryCacheValue> {
         let token = self.namespace_cache_token_for_parent(parent);
         self.state.namespace.dentry_cache.lock().get(
@@ -913,6 +986,7 @@ impl StudioVfs {
         )
     }
 
+    /// Caches a successful child lookup for `(parent,name)`.
     pub(super) fn dentry_cache_insert_positive(&self, parent: Ino, name: &[u8], child: Ino) {
         let token = self.namespace_cache_token_for_parent(parent);
         self.state.namespace.dentry_cache.lock().put(
@@ -924,6 +998,7 @@ impl StudioVfs {
         );
     }
 
+    /// Caches a confirmed missing child for `(parent,name)`.
     pub(super) fn dentry_cache_insert_negative(&self, parent: Ino, name: &[u8]) {
         let token = self.namespace_cache_token_for_parent(parent);
         self.state.namespace.dentry_cache.lock().put(
@@ -935,6 +1010,7 @@ impl StudioVfs {
         );
     }
 
+    /// Removes one dentry entry from cache.
     pub(super) fn dentry_cache_invalidate(&self, parent: Ino, name: &[u8]) {
         self.state
             .namespace
@@ -943,6 +1019,7 @@ impl StudioVfs {
             .invalidate(parent, name);
     }
 
+    /// Removes all dentry entries for a given parent directory.
     pub(super) fn dentry_cache_invalidate_parent(&self, parent: Ino) {
         self.state
             .namespace
@@ -951,10 +1028,12 @@ impl StudioVfs {
             .invalidate_parent(parent);
     }
 
+    /// Returns current dentry cache counters and capacity snapshot.
     pub(super) fn dentry_cache_metrics(&self) -> DentryCacheMetrics {
         self.state.namespace.dentry_cache.lock().metrics()
     }
 
+    /// Reads directory generation token for inode, defaulting to `0`.
     pub(super) fn directory_generation(&self, ino: Ino) -> u64 {
         self.state
             .namespace
@@ -965,6 +1044,7 @@ impl StudioVfs {
             .unwrap_or(0)
     }
 
+    /// Looks up path-shortcut cache by pre-encoded key and validates by generations.
     pub(super) fn path_shortcut_cache_lookup_by_key(
         &self,
         key: &PathShortcutCacheKey,
@@ -980,6 +1060,7 @@ impl StudioVfs {
             })
     }
 
+    /// Caches positive full-path resolution by key with captured parent generation tokens.
     pub(super) fn path_shortcut_cache_insert_positive_by_key(
         &self,
         key: PathShortcutCacheKey,
@@ -995,6 +1076,7 @@ impl StudioVfs {
         );
     }
 
+    /// Caches negative full-path resolution by key with missing `(parent,name)` pair.
     pub(super) fn path_shortcut_cache_insert_negative_by_key(
         &self,
         key: PathShortcutCacheKey,
@@ -1014,22 +1096,27 @@ impl StudioVfs {
         );
     }
 
+    /// Returns current path-shortcut cache counters and capacity snapshot.
     pub(super) fn path_shortcut_cache_metrics(&self) -> PathShortcutCacheMetrics {
         self.state.namespace.path_shortcut_cache.lock().metrics()
     }
 
+    /// Creates a resolver bound to this VFS for the requested path style.
     pub fn namespace_resolver(&self, style: NamespacePathStyle) -> NamespaceResolver<'_> {
         NamespaceResolver::new(self, style)
     }
 
+    /// Returns namespace mutation coordinator helper.
     pub(super) fn namespace_mutations(&self) -> NamespaceMutationOps<'_> {
         NamespaceMutationOps::new(self)
     }
 
+    /// Installs a kernel invalidation callback used by bridge backends.
     pub fn set_kernel_invalidator(&self, inv: Arc<dyn KernelInvalidator>) {
         *self.kernel_invalidator.write() = Some(inv);
     }
 
+    /// Clears the kernel invalidation callback.
     pub fn clear_kernel_invalidator(&self) {
         *self.kernel_invalidator.write() = None;
     }

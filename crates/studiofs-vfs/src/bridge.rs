@@ -5,32 +5,54 @@ use studiofs_meta::{InodeAttr, MetaError};
 use crate::{VfsError, fetch::FetchError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Categories of VFS-facing errors mapped from internal `VfsError` values.
 pub enum BridgeVfsErrorKind {
+    /// Target object or entry was not found.
     NotFound,
+    /// Operation failed because the resource already exists.
     AlreadyExists,
+    /// Path component expected a directory but found a non-directory.
     NotDirectory,
+    /// Operation expects a non-directory but found a directory.
     IsDirectory,
+    /// Directory was expected to be empty but contained entries.
     DirectoryNotEmpty,
+    /// The mounted volume does not appear to be recognized/initialized.
     UnrecognizedVolume,
+    /// xattr value exceeds the platform or bridge limit.
     XattrValueTooLarge,
+    /// Input arguments or values were malformed or invalid.
     InvalidInput,
+    /// Access was denied for the requested operation.
     PermissionDenied,
+    /// The operation can be retried.
     Retryable,
+    /// The operation exceeded a timeout.
     TimedOut,
+    /// Insufficient resources are available to satisfy the request.
     InsufficientResources,
+    /// Persistent corruption was detected in metadata, data, or payload.
     DataCorruption,
+    /// Internal runtime failure interrupted request processing.
     CriticalRuntimeFailure,
+    /// General fallback category for unmapped or unexpected failures.
     GenericFailure,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Bridge-facing normalized inode times in Unix nanoseconds.
 pub struct BridgeAttrTimes {
+    /// Last access time as Unix nanoseconds.
     pub atime_unix_nanos: u64,
+    /// Last modification time as Unix nanoseconds.
     pub mtime_unix_nanos: u64,
+    /// Last metadata change time as Unix nanoseconds.
     pub ctime_unix_nanos: u64,
+    /// Effective creation time as Unix nanoseconds.
     pub creation_time_unix_nanos: u64,
 }
 
+/// Maps an internal [`VfsError`] to a bridge error kind.
 pub fn classify_vfs_error(error: &VfsError) -> BridgeVfsErrorKind {
     match error {
         VfsError::Meta(meta_error) => classify_meta_error(meta_error),
@@ -44,6 +66,7 @@ pub fn classify_vfs_error(error: &VfsError) -> BridgeVfsErrorKind {
     }
 }
 
+/// Converts filesystem inode timestamps into bridge normalized nanosecond form.
 pub fn normalize_attr_times(attr: &InodeAttr) -> BridgeAttrTimes {
     BridgeAttrTimes {
         atime_unix_nanos: clamp_unix_nanos(attr.atime),

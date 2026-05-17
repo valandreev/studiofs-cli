@@ -1406,6 +1406,12 @@ impl StudioVfs {
         }
     }
 
+    /// Returns the persisted inode attributes for `ino`, enforcing `ReadOnly` access.
+    ///
+    /// This is the read-path entrypoint used by metadata callbacks that need a consistent view of
+    /// file type, size, timestamps, and related attributes. Callers that only need the current
+    /// in-memory attribute immediately after a successful write should prefer
+    /// [`peek_dirty_attr`](Self::peek_dirty_attr) to avoid a metadata round-trip.
     pub fn getattr(&self, ino: Ino) -> VfsResult<InodeAttr> {
         let attr = self.getattr_unchecked(ino)?;
         self.enforce_access(ino, AccessLevel::ReadOnly)?;

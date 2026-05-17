@@ -1,62 +1,90 @@
 use super::{ExplicitFlushOutcome, ReleaseFhOutcome, VfsError, VfsResult};
 use studiofs_meta::types::Ino;
 
+/// Request describing a flush/release/close operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HandleDrainRequest {
+    /// Inode of the file referenced by the drain callback.
     pub ino: Ino,
+    /// Handle identifier returned by the bridge for this open handle.
     pub fh: u64,
 }
 
+/// Request describing an inode delete cleanup event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HandleDrainDeleteRequest {
+    /// Inode of the deleted entry.
     pub ino: Ino,
+    /// Parent inode of the deleted entry.
     pub parent_ino: Ino,
+    /// Byte name payload as passed by the bridge callback.
     pub name: Vec<u8>,
     /// The bridge passes the callback's delete intent explicitly so the delete
     /// adapter can choose `unlink` vs `rmdir` without reloading inode state
     /// after the callback has already classified the path.
+    /// Whether deleted entry is a directory.
     pub is_dir: bool,
 }
 
+/// Abstraction for querying and flushing local sync state for a drain callback.
 pub trait LocalSyncBarrierPort {
+    /// Returns true when the inode currently has local dirty state.
     fn inode_has_local_dirty_state(&self, ino: Ino) -> bool;
 
+    /// Flushes and clears local dirty state for a specific handle request.
     fn explicit_flush(&self, request: HandleDrainRequest) -> VfsResult<ExplicitFlushOutcome>;
 }
 
+/// Abstraction for handle release execution during barrier flows.
 pub trait HandleReleasePort {
+    /// Releases a handle and returns the release outcome.
     fn release_handle(&self, request: HandleDrainRequest) -> VfsResult<ReleaseFhOutcome>;
 }
 
+/// Abstraction for deferred cleanup-hint state used across release/flush paths.
 pub trait DeferredCleanupHintPort {
+    /// Tracks a deferred cleanup hint for the inode.
     fn set_deferred_cleanup_hint(&self, ino: Ino);
 
+    /// Removes a deferred cleanup hint for the inode.
     fn clear_deferred_cleanup_hint(&self, ino: Ino);
 
+    /// Removes and returns whether a deferred cleanup hint was present.
     fn take_deferred_cleanup_hint(&self, ino: Ino) -> bool;
 
+    /// Checks whether a deferred cleanup hint exists for the inode.
     fn has_deferred_cleanup_hint(&self, ino: Ino) -> bool;
 }
 
+/// Abstraction for serializing flush callbacks per inode.
 pub trait FlushGatePort {
+    /// Runs an operation under an inode-scoped flush gate.
     fn with_flush_gate<T, F>(&self, ino: Ino, op: F) -> VfsResult<T>
     where
         F: FnOnce() -> VfsResult<T>;
 }
 
+/// Abstraction for executing delete cleanup work.
 pub trait DeleteCleanupPort {
+    /// Performs delete cleanup for the provided request.
     fn cleanup_delete(&self, request: HandleDrainDeleteRequest);
 }
 
+/// Abstraction for observability hooks emitted by barrier lifecycle events.
 pub trait BarrierObservabilityPort {
+    /// Records that cleanup callback logic has started.
     fn note_cleanup_callback(&self);
 
+    /// Records that flush callback logic has started.
     fn note_flush_callback(&self);
 
+    /// Records whether flush observed local dirty state.
     fn note_flush_barrier_outcome(&self, flushed_local_dirty_state: bool);
 
+    /// Records that close callback logic has started.
     fn note_close_callback(&self);
 
+    /// Records successful handle release with hint and outcome details.
     fn note_release_success(
         &self,
         request: HandleDrainRequest,
@@ -64,6 +92,7 @@ pub trait BarrierObservabilityPort {
         outcome: ReleaseFhOutcome,
     );
 
+    /// Records handle release error with hint and root error.
     fn note_release_error(
         &self,
         request: HandleDrainRequest,
@@ -72,6 +101,7 @@ pub trait BarrierObservabilityPort {
     );
 }
 
+/// Coordinates drain callbacks across sync, release, and cleanup ports.
 pub struct HandleDrainBarrier<
     LocalSync,
     HandleRelease,
@@ -105,6 +135,7 @@ where
     DeleteCleanup: DeleteCleanupPort,
     Observability: BarrierObservabilityPort,
 {
+    /// Constructs a barrier with all required strategy ports.
     pub fn new(
         local_sync: LocalSync,
         handle_release: HandleRelease,
@@ -123,6 +154,7 @@ where
         }
     }
 
+    /// Executes flush callback handling under the flush gate.
     pub fn on_flush(&self, request: HandleDrainRequest) -> VfsResult<()> {
         self.observability.note_flush_callback();
         let flushed = self.flush_gate.with_flush_gate(request.ino, || {
@@ -138,6 +170,7 @@ where
         Ok(())
     }
 
+    /// Records deferred cleanup state for non-delete paths.
     pub fn on_cleanup_non_delete(&self, request: HandleDrainRequest) {
         self.observability.note_cleanup_callback();
         if request.fh != 0 && self.local_sync.inode_has_local_dirty_state(request.ino) {
@@ -146,6 +179,7 @@ where
         }
     }
 
+    /// Handles close callbacks and attempts release for non-zero handles.
     pub fn on_close(&self, request: HandleDrainRequest) {
         self.observability.note_close_callback();
         if request.fh == 0 {
@@ -157,10 +191,12 @@ where
         let _ = self.try_release(request);
     }
 
+    /// Handles explicit release callback path.
     pub fn on_release(&self, request: HandleDrainRequest) -> VfsResult<()> {
         self.try_release(request)
     }
 
+    /// Runs delete cleanup callback through the cleanup port.
     pub fn on_cleanup_delete(&self, request: HandleDrainDeleteRequest) {
         self.observability.note_cleanup_callback();
         self.delete_cleanup.cleanup_delete(request);

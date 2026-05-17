@@ -14,18 +14,23 @@ use std::time::{Duration, Instant};
 
 use crate::metrics::{CachePipelineMetrics, CachePipelineMetricsSnapshot};
 
+/// Stable identifier for cache payload entries in benchmark cache workflows.
 pub type ObjectId = u64;
 
 /// Default in-memory benchmark cache size: 2 GiB.
 pub const DEFAULT_MEMORY_CACHE_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 
+/// Tuning configuration used when opening a benchmark cache.
 #[derive(Debug, Clone)]
 pub struct BenchmarkCacheConfig {
+    /// In-memory L1 payload budget in bytes.
     pub memory_cache_size: u64,
+    /// Root directory used for benchmark cache artifacts.
     pub cache_dir: PathBuf,
 }
 
 impl BenchmarkCacheConfig {
+    /// Construct a benchmark cache configuration.
     pub fn new(cache_dir: impl Into<PathBuf>, memory_cache_size: u64) -> Self {
         Self {
             memory_cache_size,
@@ -34,20 +39,28 @@ impl BenchmarkCacheConfig {
     }
 }
 
+/// Logical read-path outcome reported for a cache lookup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheReadLevel {
+    /// Object came from the in-memory L1 path.
     L1,
+    /// Object was absent from cache and treated as a miss.
     Miss,
 }
 
+/// Per-lookup trace for cache reads.
 #[derive(Debug, Clone)]
 pub struct CacheReadTrace {
+    /// Cache source used to fulfill the lookup.
     pub level: CacheReadLevel,
+    /// Time spent resolving the object within the benchmark cache.
     pub l1_lookup_latency: Duration,
 }
 
+/// Snapshot of benchmark cache counters.
 #[derive(Debug, Clone, Default)]
 pub struct BenchmarkCacheStats {
+    /// Bytes currently cached in the in-memory L1 layer.
     pub l1_bytes: u64,
 }
 
@@ -121,14 +134,20 @@ impl L1State {
     }
 }
 
+/// Compact benchmark cache with staged in-memory payload cache and metrics snapshot hooks.
 pub struct BenchmarkCache {
+    /// Cache configuration used for current instance.
     config: BenchmarkCacheConfig,
+    /// Exclusive in-memory state for L1 objects.
     l1: Mutex<L1State>,
+    /// Current L1 byte limit used for evictions.
     l1_max_bytes: AtomicU64,
+    /// Metrics collector used for benchmark observability.
     metrics: CachePipelineMetrics,
 }
 
 impl BenchmarkCache {
+    /// Open a benchmark cache and initialize fresh in-memory state.
     pub fn open(config: BenchmarkCacheConfig) -> io::Result<Arc<Self>> {
         Ok(Arc::new(Self {
             l1: Mutex::new(L1State::default()),
@@ -138,10 +157,12 @@ impl BenchmarkCache {
         }))
     }
 
+    /// Get a cached payload value, returning `None` on miss.
     pub async fn get(&self, object_id: ObjectId) -> Option<Bytes> {
         self.get_with_trace(object_id).await.0
     }
 
+    /// Get a payload and detailed hit/miss read trace.
     pub async fn get_with_trace(&self, object_id: ObjectId) -> (Option<Bytes>, CacheReadTrace) {
         let started = Instant::now();
         let l1_hit = self.l1.lock().get_cloned(object_id);
@@ -164,46 +185,56 @@ impl BenchmarkCache {
         }
     }
 
+    /// Store bytes into L1 cache asynchronously.
     pub async fn put(&self, object_id: ObjectId, data: Bytes) -> io::Result<()> {
         self.stage_l1(object_id, data);
         Ok(())
     }
 
+    /// Remove payload bytes asynchronously from cache.
     pub async fn remove(&self, object_id: ObjectId) {
         self.remove_sync(object_id);
     }
 
+    /// Remove payload bytes synchronously from cache.
     pub fn remove_sync(&self, object_id: ObjectId) {
         let _ = self.l1.lock().remove(object_id);
     }
 
+    /// Check whether payload exists in cache.
     pub fn contains(&self, object_id: ObjectId) -> bool {
         self.l1.lock().contains(object_id)
     }
 
+    /// Insert payload into L1 cache state.
     pub fn stage_l1(&self, object_id: ObjectId, data: Bytes) {
         let max_bytes = self.l1_max_bytes.load(Ordering::Acquire).max(1);
         self.l1.lock().insert(object_id, data, max_bytes);
     }
 
+    /// Read current cache statistics snapshot.
     pub fn stats(&self) -> BenchmarkCacheStats {
         BenchmarkCacheStats {
             l1_bytes: self.l1_bytes(),
         }
     }
 
+    /// Current number of bytes retained in L1.
     pub fn l1_bytes(&self) -> u64 {
         self.l1.lock().total_bytes.get()
     }
 
+    /// Return configured L1 byte budget.
     pub fn memory_cache_size(&self) -> u64 {
         self.l1_max_bytes.load(Ordering::Acquire)
     }
 
+    /// Return benchmark cache directory for persistence side effects.
     pub fn cache_dir(&self) -> &Path {
         &self.config.cache_dir
     }
 
+    /// Return latest pipeline metrics snapshot.
     pub fn cache_pipeline_metrics(&self) -> CachePipelineMetricsSnapshot {
         self.metrics.snapshot(0)
     }

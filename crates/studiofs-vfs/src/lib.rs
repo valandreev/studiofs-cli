@@ -3,14 +3,18 @@
 //!
 //! Platform-agnostic virtual filesystem operations. Bridges metadata, data, and cache layers.
 
+/// Access control and permission checks shared by VFS entry points.
 pub mod access;
 pub mod aimd;
+/// Bridge integration utilities for error normalization and VFS boundary conversions.
 pub mod bridge;
 pub mod contract_harness;
 pub mod fetch;
+/// File incarnation and upload state tracking for durable VFS metadata.
 pub mod incarnation;
 mod landing_zone;
 pub mod lock_order;
+/// Quality-of-service policies and controller plumbing for write-path behavior.
 pub mod qos;
 pub mod readahead;
 mod runtime;

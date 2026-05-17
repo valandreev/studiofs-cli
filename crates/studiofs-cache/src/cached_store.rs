@@ -24,60 +24,94 @@ use crate::runtime::LocalPayloadLayout;
 use crate::upload_queue::{PendingUpload, UploadQueue};
 use crate::upload_stage::{UploadStageStore, UploadStageStoreError};
 
+/// Stable identifier for cached payload objects.
 pub type ObjectId = u64;
 const DEFAULT_WRITER_MAX_BUFFER_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
+/// Configuration for opening a [`CachedStore`].
 pub struct CachedStoreConfig {
+    /// Root directory for on-disk cache state.
     pub cache_dir: PathBuf,
+    /// In-memory budget (bytes) for the hot-upload buffer. `0` disables it.
     pub upload_hot_bytes: usize,
 }
 
 #[derive(Debug, Clone)]
+/// Parameters for constructing a [`CachedStoreWriterSlice`].
 pub struct CachedStoreWriterConfig {
+    /// Inode number associated with the write stream.
     pub ino: u64,
+    /// Absolute offset (bytes) of the first byte represented by this slice.
     pub base_offset: u64,
+    /// Initial object id to assign to the first staged block.
     pub first_object_id: ObjectId,
+    /// Content epoch used to route/validate uploads for this write stream.
     pub content_epoch: u64,
+    /// Block size (bytes) to stage at a time.
     pub block_size: usize,
+    /// Writer page size (bytes) used for internal buffering/alignment.
     pub page_size: usize,
+    /// Optional dirty-byte threshold for throttling signals.
     pub dirty_byte_limit: Option<usize>,
+    /// Optional cap on the writer's buffered bytes.
     pub max_buffer_bytes: Option<usize>,
+    /// Whether to enqueue uploads as blocks are staged.
     pub submit_upload: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Summary of the effects of a single write call.
 pub struct WriterWriteResult {
+    /// Bytes accepted from the caller.
     pub accepted_bytes: usize,
+    /// Total dirty bytes retained in the writer after the write.
     pub dirty_bytes: usize,
+    /// Whether the writer considers itself over the configured dirty limit.
     pub throttled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Metadata describing a staged block persisted to the local cache.
 pub struct StagedSlice {
+    /// Inode number associated with the staged block.
     pub ino: u64,
+    /// Absolute start offset (bytes) for this block.
     pub offset: u64,
+    /// Object id assigned to the staged payload.
     pub object_id: ObjectId,
+    /// Payload length (bytes).
     pub len: usize,
+    /// Content epoch associated with this staged write.
     pub content_epoch: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// A staged block along with its detached payload bytes.
 pub struct DetachedStagedSlice {
+    /// Staged block metadata.
     pub staged: StagedSlice,
+    /// Payload bytes for the staged block.
     pub payload: Bytes,
+    /// Whether the staged block should be submitted to the upload queue.
     pub submit_upload: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Snapshot of writer counters maintained by the cached-store pipeline.
 pub struct CachedStoreWriterCountersSnapshot {
     /// Writer-owned bytes retained by the cached-store slice writer, including
     /// zero-filled sparse gaps that will be staged locally.
     pub dirty_bytes: u64,
+    /// Total bytes staged into the local cache backend.
     pub staged_bytes: u64,
+    /// Bytes currently attributed to pending uploads.
     pub pending_upload_bytes: u64,
+    /// Total number of slices staged.
     pub staged_slices: u64,
+    /// Total number of staging latency observations recorded.
     pub staging_latency_observations: u64,
+    /// Total number of throttle events recorded.
     pub throttle_events: u64,
 }
 
@@ -145,40 +179,70 @@ fn subtract_saturating(value: &AtomicU64, amount: u64) {
 }
 
 #[derive(Debug, thiserror::Error)]
+/// Errors produced by [`CachedStoreWriterSlice`].
 pub enum CachedStoreWriterError {
+    /// Invalid block/page geometry (must be greater than zero).
     #[error("writer page size and block size must be greater than zero")]
     InvalidPageGeometry,
+    /// The requested write offset targets bytes already frozen.
     #[error("write offset {offset} targets bytes already frozen before {frozen_before}")]
-    WriteBeforeFrozen { offset: u64, frozen_before: u64 },
+    WriteBeforeFrozen {
+        /// File offset (in bytes) where the write would begin.
+        offset: u64,
+        /// Smallest byte offset that is still writable.
+        frozen_before: u64,
+    },
+    /// The requested offset could not be represented on this platform.
     #[error("writer offset is too large for this platform")]
     OffsetTooLarge,
+    /// The writer's buffered bytes would exceed its configured limit.
     #[error("writer buffer limit exceeded: requested {requested} bytes, limit {limit} bytes")]
-    BufferLimitExceeded { requested: usize, limit: usize },
+    BufferLimitExceeded {
+        /// Requested buffer size in bytes for the current write operation.
+        requested: usize,
+        /// Configured hard limit in bytes for the writer buffer.
+        limit: usize,
+    },
+    /// The local payload backend failed while staging an object.
     #[error("local payload backend failed while staging object {object_id}: {source}")]
     LocalPayload {
+        /// Object id that failed to stage.
         object_id: ObjectId,
+        /// Underlying local payload error.
         #[source]
         source: crate::local::LocalPayloadBackendError,
     },
+    /// The upload stage store failed while staging an object.
     #[error("upload stage failed while staging object {object_id}: {source}")]
     UploadStage {
+        /// Object id that failed to stage.
         object_id: ObjectId,
+        /// Underlying upload-stage store error.
         #[source]
         source: UploadStageStoreError,
     },
 }
 
+/// In-memory writer for staging blocks into a [`CachedStore`].
 pub struct CachedStoreWriterSlice {
+    /// Cached-store backing instance for this writer.
     store: Arc<CachedStore>,
+    /// Static writer configuration used for block sizing and buffering rules.
     config: CachedStoreWriterConfig,
+    /// Offset of the first byte covered by currently active buffered pages.
     active_start: u64,
+    /// Next object id that should be assigned to a staged block.
     next_object_id: ObjectId,
+    /// Timestamp when this writer slice was created.
     created_at: Instant,
+    /// Buffered write pages pending staging or flushing.
     pages: VecDeque<BytesMut>,
+    /// Current number of bytes buffered as dirty in this writer.
     dirty_len: usize,
 }
 
 impl CachedStoreConfig {
+    /// Creates a new config rooted at `cache_dir` with hot-upload buffering disabled.
     pub fn new(cache_dir: impl Into<PathBuf>) -> Self {
         Self {
             cache_dir: cache_dir.into(),
@@ -186,6 +250,7 @@ impl CachedStoreConfig {
         }
     }
 
+    /// Sets the hot-upload in-memory buffer budget (bytes).
     pub fn with_upload_hot_bytes(mut self, upload_hot_bytes: usize) -> Self {
         self.upload_hot_bytes = upload_hot_bytes;
         self
@@ -333,19 +398,30 @@ impl UploadHotState {
     }
 }
 
+/// Cached payload store backing the local-first mount runtime.
 pub struct CachedStore {
+    /// Cache configuration used to build this runtime instance.
     config: CachedStoreConfig,
+    /// Active local payload backend for cached object storage.
     local_payload_backend: Arc<dyn LocalPayloadBackend>,
+    /// Upload staging layer for payloads awaiting remote publication.
     upload_stage_store: UploadStageStore,
+    /// In-memory hot-upload cache state.
     upload_hot: Mutex<UploadHotState>,
+    /// Pin accounting for currently referenced cached objects.
     pinned: Mutex<PinnedState>,
+    /// Queue that schedules staged uploads for worker dispatch.
     upload_queue: Arc<UploadQueue>,
+    /// Bytes currently pending upload per object id.
     pending_upload_bytes_by_object: Mutex<HashMap<ObjectId, u64>>,
+    /// Atomic counters for writer staging and upload metrics.
     writer_counters: CachedStoreWriterCounters,
+    /// Pipeline metrics exposed for diagnostics and observability.
     metrics: CachePipelineMetrics,
 }
 
 impl CachedStore {
+    /// Opens the cached store and returns an upload receiver for new pending uploads.
     pub fn open(
         config: CachedStoreConfig,
         local_payload_backend: Arc<dyn LocalPayloadBackend>,
@@ -370,6 +446,7 @@ impl CachedStore {
         Ok((cached_store, upload_rx))
     }
 
+    /// Creates a new writer slice for staging writes into this cache.
     pub fn open_writer_slice(
         self: &Arc<Self>,
         config: CachedStoreWriterConfig,
@@ -385,18 +462,22 @@ impl CachedStore {
         }
     }
 
+    /// Returns a point-in-time snapshot of writer counters.
     pub fn snapshot_writer_counters(&self) -> CachedStoreWriterCountersSnapshot {
         self.writer_counters.snapshot()
     }
 
+    /// Returns the active local payload backend used by this cached store.
     pub fn local_payload_backend(&self) -> &Arc<dyn LocalPayloadBackend> {
         &self.local_payload_backend
     }
 
+    /// Loads an object payload from the local payload backend.
     pub fn get(&self, object_id: ObjectId) -> Option<bytes::Bytes> {
         self.local_payload_backend.get(object_id)
     }
 
+    /// Reads a subrange of an object payload into `out`.
     pub fn read_into(
         &self,
         object_id: ObjectId,
@@ -407,30 +488,37 @@ impl CachedStore {
             .read_into(object_id, data_offset, out)
     }
 
+    /// Loads an object payload that is eligible for upload.
     pub fn get_for_upload(&self, object_id: ObjectId) -> Option<bytes::Bytes> {
         self.local_payload_backend.get_for_upload(object_id)
     }
 
+    /// Loads an object payload from the upload stage store.
     pub fn get_staged_for_upload(&self, object_id: ObjectId) -> Option<bytes::Bytes> {
         self.upload_stage_store.get(object_id)
     }
 
+    /// Returns whether an object is present in the upload stage store.
     pub fn has_staged_upload(&self, object_id: ObjectId) -> bool {
         self.upload_stage_store.contains(object_id)
     }
 
+    /// Returns a cached copy of the object payload from the in-memory hot-upload buffer.
     pub fn get_hot_upload(&self, object_id: ObjectId) -> Option<Bytes> {
         self.upload_hot.lock().get(object_id)
     }
 
+    /// Returns whether the local payload backend currently contains this object.
     pub fn contains(&self, object_id: ObjectId) -> bool {
         self.local_payload_backend.contains(object_id)
     }
 
+    /// Advises the local payload backend that the object will be needed soon.
     pub fn advise_will_need(&self, object_id: ObjectId) {
         self.local_payload_backend.advise_will_need(object_id);
     }
 
+    /// Stores an object payload in the local payload backend.
     pub fn put(
         &self,
         object_id: ObjectId,
@@ -440,6 +528,7 @@ impl CachedStore {
         self.local_payload_backend.put(object_id, data, evictable)
     }
 
+    /// Stores an owned payload object in the local payload backend.
     pub fn put_owned(
         &self,
         put: LocalPayloadPut,
@@ -447,6 +536,7 @@ impl CachedStore {
         self.local_payload_backend.put_owned(put)
     }
 
+    /// Stores a batch of owned payload objects in the local payload backend.
     pub fn put_batch(
         &self,
         entries: &[LocalPayloadPut],
@@ -454,34 +544,42 @@ impl CachedStore {
         self.local_payload_backend.put_batch(entries)
     }
 
+    /// Flushes data durability for the local payload backend.
     pub fn sync_data(&self) -> Result<(), crate::local::LocalPayloadBackendError> {
         self.local_payload_backend.sync_data()
     }
 
+    /// Performs pressure/eviction maintenance on the local payload backend.
     pub fn run_pressure_maintenance(&self) -> Result<(), crate::local::LocalPayloadBackendError> {
         self.local_payload_backend.run_pressure_maintenance()
     }
 
+    /// Marks an object as currently uploading in the local payload backend.
     pub fn mark_uploading(&self, object_id: ObjectId) {
         self.local_payload_backend.mark_uploading(object_id);
     }
 
+    /// Marks an object upload as failed in the local payload backend.
     pub fn mark_upload_failed(&self, object_id: ObjectId) {
         self.local_payload_backend.mark_upload_failed(object_id);
     }
 
+    /// Marks an object as fully uploaded in the local payload backend.
     pub fn mark_uploaded(&self, object_id: ObjectId) {
         self.local_payload_backend.mark_uploaded(object_id);
     }
 
+    /// Removes an object from the local payload backend.
     pub fn remove(&self, object_id: ObjectId) {
         self.local_payload_backend.remove(object_id);
     }
 
+    /// Removes a batch of objects from the local payload backend.
     pub fn remove_batch(&self, object_ids: &[ObjectId]) {
         self.local_payload_backend.remove_batch(object_ids);
     }
 
+    /// Links a batch of staged payloads into the upload stage store.
     pub fn link_upload_stage_batch(
         &self,
         object_ids: &[ObjectId],
@@ -489,6 +587,7 @@ impl CachedStore {
         self.upload_stage_store.link_payload_batch(object_ids)
     }
 
+    /// Populates the in-memory hot-upload buffer with payload bytes from `entries`.
     pub fn cache_hot_upload_batch(&self, entries: &[LocalPayloadPut]) {
         let mut upload_hot = self.upload_hot.lock();
         for entry in entries {
@@ -496,6 +595,7 @@ impl CachedStore {
         }
     }
 
+    /// Persists detached staged slices to the local cache backend and upload stage store.
     pub fn persist_detached_staged_slices(
         &self,
         entries: Vec<DetachedStagedSlice>,
@@ -562,18 +662,22 @@ impl CachedStore {
         Ok(())
     }
 
+    /// Removes a staged upload payload from the upload stage store.
     pub fn remove_staged_upload(&self, object_id: ObjectId) {
         self.upload_stage_store.remove(object_id);
     }
 
+    /// Removes a batch of staged upload payloads from the upload stage store.
     pub fn remove_staged_upload_batch(&self, object_ids: &[ObjectId]) {
         self.upload_stage_store.remove_batch(object_ids);
     }
 
+    /// Removes an entry from the in-memory hot-upload buffer.
     pub fn remove_hot_upload(&self, object_id: ObjectId) {
         self.upload_hot.lock().remove(object_id);
     }
 
+    /// Removes a batch of entries from the in-memory hot-upload buffer.
     pub fn remove_hot_upload_batch(&self, object_ids: &[ObjectId]) {
         let mut upload_hot = self.upload_hot.lock();
         for &object_id in object_ids {
@@ -581,34 +685,42 @@ impl CachedStore {
         }
     }
 
+    /// Returns object ids that are considered dirty by the local payload backend.
     pub fn dirty_object_ids(&self) -> Vec<ObjectId> {
         self.local_payload_backend.dirty_object_ids()
     }
 
+    /// Returns the number of objects that are considered dirty by the local payload backend.
     pub fn dirty_object_count(&self) -> usize {
         self.local_payload_backend.dirty_object_count()
     }
 
+    /// Returns the lifecycle state for an object in the local payload backend.
     pub fn lifecycle_state(&self, object_id: ObjectId) -> LocalPayloadLifecycleState {
         self.local_payload_backend.lifecycle_state(object_id)
     }
 
+    /// Returns whether the object is evictable (and not currently pinned).
     pub fn is_evictable(&self, object_id: ObjectId) -> bool {
         self.local_payload_backend.is_evictable(object_id) && !self.is_pinned(object_id)
     }
 
+    /// Returns storage accounting stats for the local payload backend.
     pub fn storage_stats(&self) -> LocalPayloadStorageStats {
         self.local_payload_backend.storage_stats()
     }
 
+    /// Returns per-object stats for the given object id.
     pub fn object_stats(&self, object_id: ObjectId) -> Option<LocalPayloadObjectStats> {
         self.local_payload_backend.object_stats(object_id)
     }
 
+    /// Returns the set of object ids currently known to the local payload backend.
     pub fn object_ids(&self) -> Vec<ObjectId> {
         self.local_payload_backend.object_ids()
     }
 
+    /// Pins an object so it is not evicted while in use or pending upload.
     pub fn pin(&self, object_id: ObjectId) {
         let first_pin = self.pinned.lock().insert(object_id);
         if first_pin {
@@ -616,10 +728,12 @@ impl CachedStore {
         }
     }
 
+    /// Returns whether the object is currently pinned.
     pub fn is_pinned(&self, object_id: ObjectId) -> bool {
         self.pinned.lock().contains(object_id)
     }
 
+    /// Releases a pin on an object, allowing eviction once the final pin is dropped.
     pub fn unpin(&self, object_id: ObjectId) {
         let last_pin = self.pinned.lock().remove(object_id);
         if last_pin {
@@ -627,6 +741,7 @@ impl CachedStore {
         }
     }
 
+    /// Submits a single upload op to the upload queue and pins the object until terminal.
     pub fn submit_upload(&self, ino: u64, offset: u64, object_id: ObjectId, content_epoch: u64) {
         self.pin(object_id);
         self.upload_queue
@@ -636,6 +751,7 @@ impl CachedStore {
             .record_submit(self.upload_queue.pending_count());
     }
 
+    /// Submits a batch of upload ops to the upload queue and pins all referenced objects.
     pub fn submit_uploads_batch(&self, ops: &[(u64, u64, ObjectId, u64)]) {
         let first_pins = {
             let mut pinned = self.pinned.lock();
@@ -651,6 +767,7 @@ impl CachedStore {
         }
     }
 
+    /// Records completion for an upload op, unpinning the object if it reached terminal.
     pub fn complete_upload(&self, op: &PendingUpload) {
         if self.upload_queue.complete(op) {
             let mut bytes = self.record_upload_terminal(op.object_id);
@@ -666,6 +783,7 @@ impl CachedStore {
         }
     }
 
+    /// Requeues an upload op back into the upload queue.
     pub fn requeue_upload(&self, op: PendingUpload) -> bool {
         let queued = self.upload_queue.requeue(op);
         if queued {
@@ -674,6 +792,7 @@ impl CachedStore {
         queued
     }
 
+    /// Cancels an upload op and unpins the object if the cancellation succeeded.
     pub fn cancel_upload(&self, op: &PendingUpload) {
         if self.upload_queue.cancel(op) {
             self.record_upload_terminal(op.object_id);
@@ -682,38 +801,47 @@ impl CachedStore {
         }
     }
 
+    /// Returns the number of currently pending uploads.
     pub fn pending_upload_count(&self) -> usize {
         self.upload_queue.pending_count()
     }
 
+    /// Waits until the upload queue becomes idle or `timeout` elapses.
     pub async fn wait_for_uploads_idle(&self, timeout: Duration) -> bool {
         self.upload_queue.wait_for_idle(timeout).await
     }
 
+    /// Returns a snapshot of currently pending uploads.
     pub fn snapshot_pending_uploads(&self) -> Vec<PendingUpload> {
         self.upload_queue.snapshot_pending()
     }
 
+    /// Returns whether the upload queue has any pending uploads for `ino`.
     pub fn has_pending_uploads_for_ino(&self, ino: u64) -> bool {
         self.upload_queue.has_pending_for_ino(ino)
     }
 
+    /// Flushes the upload queue journal to disk.
     pub async fn flush_upload_journal(&self) {
         self.upload_queue.flush_journal().await;
     }
 
+    /// Returns the configured cache directory.
     pub fn cache_dir(&self) -> &Path {
         &self.config.cache_dir
     }
 
+    /// Returns a snapshot of cache pipeline metrics.
     pub fn cache_pipeline_metrics(&self) -> CachePipelineMetricsSnapshot {
         self.metrics.snapshot(self.upload_queue.pending_count())
     }
 
+    /// Resets cache pipeline diagnostics metrics.
     pub fn reset_diagnostics_metrics(&self) {
         self.metrics.reset();
     }
 
+    /// Requests upload queue shutdown and flushes any remaining journal state.
     pub async fn shutdown(&self) {
         self.upload_queue.shutdown();
         self.flush_upload_journal().await;
@@ -750,6 +878,7 @@ impl CachedStore {
 }
 
 impl CachedStoreWriterSlice {
+    /// Writes `data` at absolute `offset`, extending the dirty range as needed.
     pub fn write_at(
         &mut self,
         offset: u64,
@@ -796,6 +925,7 @@ impl CachedStoreWriterSlice {
         })
     }
 
+    /// Stages completed blocks up to `target_offset` and returns their metadata.
     pub fn flush_to(
         &mut self,
         target_offset: u64,
@@ -813,6 +943,7 @@ impl CachedStoreWriterSlice {
         Ok(staged)
     }
 
+    /// Returns the number of whole blocks currently available to stage.
     pub fn completed_block_count(&self) -> usize {
         if self.config.block_size == 0 {
             return 0;
@@ -820,6 +951,7 @@ impl CachedStoreWriterSlice {
         self.dirty_bytes() / self.config.block_size
     }
 
+    /// Stages up to `max_blocks` completed blocks and returns their metadata.
     pub fn flush_completed_blocks(
         &mut self,
         max_blocks: usize,
@@ -834,6 +966,7 @@ impl CachedStoreWriterSlice {
         self.flush_to(target_offset)
     }
 
+    /// Detaches up to `max_blocks` completed blocks, returning payload bytes without persisting them.
     pub fn detach_completed_blocks(
         &mut self,
         max_blocks: usize,
@@ -848,6 +981,7 @@ impl CachedStoreWriterSlice {
         self.detach_to(target_offset)
     }
 
+    /// Stages all remaining dirty bytes (including a final partial block) and returns their metadata.
     pub fn finish(&mut self) -> Result<Vec<StagedSlice>, CachedStoreWriterError> {
         self.validate_geometry()?;
         let mut staged = Vec::new();
@@ -858,6 +992,7 @@ impl CachedStoreWriterSlice {
         Ok(staged)
     }
 
+    /// Detaches all remaining dirty bytes (including a final partial block) without persisting them.
     pub fn detach_finish(&mut self) -> Result<Vec<DetachedStagedSlice>, CachedStoreWriterError> {
         self.validate_geometry()?;
         let mut staged = Vec::new();
@@ -868,6 +1003,7 @@ impl CachedStoreWriterSlice {
         Ok(staged)
     }
 
+    /// Freezes (stages) pending dirty bytes if the writer is older than `max_age`.
     pub fn freeze_if_older_than(
         &mut self,
         max_age: Duration,
@@ -878,6 +1014,7 @@ impl CachedStoreWriterSlice {
         self.finish()
     }
 
+    /// Reads accepted dirty bytes starting at absolute `offset` into `out`.
     pub fn read_accepted(&self, offset: u64, out: &mut [u8]) -> usize {
         if offset < self.active_start {
             return 0;
@@ -894,6 +1031,7 @@ impl CachedStoreWriterSlice {
         len
     }
 
+    /// Returns the absolute `[start, end)` range currently retained as dirty bytes.
     pub fn accepted_range(&self) -> Option<(u64, u64)> {
         let dirty_bytes = self.dirty_bytes();
         if dirty_bytes == 0 {
@@ -905,10 +1043,12 @@ impl CachedStoreWriterSlice {
         ))
     }
 
+    /// Returns the current number of dirty bytes retained in memory.
     pub fn dirty_bytes(&self) -> usize {
         self.dirty_len
     }
 
+    /// Overrides the next object id that will be assigned to a staged block.
     pub fn set_next_object_id(&mut self, next_object_id: ObjectId) {
         self.next_object_id = next_object_id;
     }

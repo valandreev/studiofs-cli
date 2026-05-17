@@ -787,6 +787,12 @@ pub struct StudioFsContext {
 }
 
 impl StudioFsContext {
+    /// Creates a WinFSP filesystem context backed by the provided [`StudioVfs`]
+    /// and tokio runtime [`Handle`].
+    ///
+    /// The `invalidation_queue` is shared with [`WinfspKernelInvalidator`] so
+    /// metadata refresh events can enqueue inode numbers and the WinFSP notify
+    /// timer can drain and emit change notifications.
     pub fn new(
         vfs: Arc<StudioVfs>,
         rt: Handle,
@@ -806,6 +812,10 @@ impl StudioFsContext {
     }
 
     #[cfg(test)]
+    /// Creates a WinFSP filesystem context for tests.
+    ///
+    /// Unlike [`Self::new`], this constructor retains the provided tokio
+    /// [`Runtime`] so it remains alive for the duration of the test.
     pub fn new_for_tests(
         vfs: Arc<StudioVfs>,
         rt: Arc<tokio::runtime::Runtime>,
@@ -1872,6 +1882,7 @@ pub struct WinfspKernelInvalidator {
 }
 
 impl WinfspKernelInvalidator {
+    /// Creates a new invalidator backed by the shared inode queue.
     pub fn new(queue: Arc<Mutex<Vec<Ino>>>) -> Self {
         Self { queue }
     }

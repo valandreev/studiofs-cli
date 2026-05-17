@@ -25,11 +25,24 @@ const STARTUP_RECONCILE_MODE_FULL: &str = "full";
 /// `Full` additionally runs expensive global index/payload mismatch sweeps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalPayloadStartupReconcileMode {
+    /// Recover only lightweight startup mismatches for fast mount availability.
+    ///
+    /// This mode repairs interrupted temporary writes and dirty replay state without
+    /// running a full payload/index sweep.
     Lightweight,
+    /// Run a full startup reconciliation including expensive global integrity sweeps.
+    ///
+    /// In addition to lightweight repairs, this mode performs full index validation and
+    /// orphan payload cleanup to enforce cache consistency.
     Full,
 }
 
 impl LocalPayloadStartupReconcileMode {
+    /// Read the startup reconciliation mode from environment variables.
+    ///
+    /// Prefers [`STARTUP_RECONCILE_MODE_ENV`], falling back to
+    /// [`LEGACY_STARTUP_RECONCILE_MODE_ENV`] for compatibility. Any value other
+    /// than `"full"` (case-insensitive) selects [`LocalPayloadStartupReconcileMode::Lightweight`].
     pub fn from_env() -> Self {
         let configured = std::env::var(STARTUP_RECONCILE_MODE_ENV)
             .ok()
@@ -44,13 +57,18 @@ impl LocalPayloadStartupReconcileMode {
 /// Result of startup reconciliation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LocalPayloadStartupReconcileReport {
+    /// Number of temporary files removed during reconciliation.
     pub temp_files_removed: u64,
+    /// Number of stale index entries removed during reconciliation.
     pub stale_index_entries_removed: u64,
+    /// Number of orphan payload files removed during reconciliation.
     pub orphan_payload_files_removed: u64,
+    /// Number of batch intent files resolved during reconciliation.
     pub batch_intents_resolved: u64,
 }
 
 impl LocalPayloadStartupReconcileReport {
+    /// Returns `true` when reconciliation did not perform any cleanup actions.
     pub fn is_clean(self) -> bool {
         self.temp_files_removed == 0
             && self.stale_index_entries_removed == 0
@@ -62,8 +80,10 @@ impl LocalPayloadStartupReconcileReport {
 /// Errors returned by startup reconciliation.
 #[derive(Debug, thiserror::Error)]
 pub enum LocalPayloadStartupReconcileError {
+    /// The filesystem returned an I/O error while scanning or mutating the local cache runtime.
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
+    /// The local payload index returned an error while validating or mutating index state.
     #[error("local payload object runtime index error: {0}")]
     Index(#[from] CacheIndexError),
 }

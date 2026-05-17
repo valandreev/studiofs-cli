@@ -5,13 +5,18 @@ use super::{
 use crate::AclMeta;
 use std::collections::HashMap;
 
+/// Shared state used by ACL computations, including caches and cache invalidation epochs.
 pub(super) struct AclState {
+    /// Cache of effective ACL values computed per inode.
     pub(super) effective_acl_cache: Mutex<HashMap<Ino, EffectiveAclCacheEntry>>,
+    /// Epoch counter invalidating access-level cache entries when ACL entries change.
     pub(super) acl_epoch: AtomicU64,
+    /// Epoch counter invalidating access-level cache entries when namespace ACL policy changes.
     pub(super) acl_namespace_epoch: AtomicU64,
 }
 
 impl AclState {
+    /// Creates a fresh ACL state with empty cache and zeroed epochs.
     pub(super) fn new() -> Self {
         Self {
             effective_acl_cache: Mutex::new(HashMap::new()),
@@ -22,6 +27,7 @@ impl AclState {
 }
 
 #[derive(Debug, Clone, Copy)]
+/// Cached effective-access result for a single inode with its invalidation epochs.
 pub(super) struct EffectiveAclCacheEntry {
     access_level: AccessLevel,
     acl_epoch: u64,
@@ -29,6 +35,7 @@ pub(super) struct EffectiveAclCacheEntry {
 }
 
 impl StudioVfs {
+    /// Increments the ACL epoch to invalidate cached effective access levels.
     pub(super) fn bump_acl_epoch(&self) {
         self.state
             .acl
@@ -39,6 +46,7 @@ impl StudioVfs {
             .ok();
     }
 
+    /// Increments the namespace ACL epoch to invalidate cached ACL derivations.
     pub(super) fn bump_acl_namespace_epoch(&self) {
         self.state
             .acl
@@ -49,6 +57,7 @@ impl StudioVfs {
             .ok();
     }
 
+    /// Returns the ACL entry for an inode for the active principal, falling back to wildcard.
     pub(super) fn acl_rule_for_inode(&self, ino: Ino) -> VfsResult<Option<AccessLevel>> {
         let meta = self.sync_meta();
         if let Some(level) = meta.get_acl_rule(ino, &self.acl_principal)? {
@@ -78,6 +87,7 @@ impl StudioVfs {
         (actual as u8) >= (required as u8)
     }
 
+    /// Reads a cached access level for the inode if it is still valid for current epochs.
     pub(super) fn effective_access_level_cached(&self, ino: Ino) -> Option<AccessLevel> {
         let acl_epoch = self.state.acl.acl_epoch.load(Ordering::Acquire);
         let acl_namespace_epoch = self.state.acl.acl_namespace_epoch.load(Ordering::Acquire);
@@ -93,6 +103,7 @@ impl StudioVfs {
             .map(|entry| entry.access_level)
     }
 
+    /// Stores an effective access level for an inode in the bounded cache.
     pub(super) fn effective_access_level_cache_insert(&self, ino: Ino, access_level: AccessLevel) {
         let acl_epoch = self.state.acl.acl_epoch.load(Ordering::Acquire);
         let acl_namespace_epoch = self.state.acl.acl_namespace_epoch.load(Ordering::Acquire);
@@ -114,6 +125,7 @@ impl StudioVfs {
         );
     }
 
+    /// Computes effective access for an inode by walking up namespace ACL rules and caching the result.
     pub(super) fn effective_access_level(&self, ino: Ino) -> VfsResult<AccessLevel> {
         if let Some(access_level) = self.effective_access_level_cached(ino) {
             return Ok(access_level);
@@ -164,6 +176,7 @@ impl StudioVfs {
         }
     }
 
+    /// Enforces minimum required access level, or returns `AccessDenied` / not-found errors.
     pub(super) fn enforce_access(&self, ino: Ino, required: AccessLevel) -> VfsResult<()> {
         let actual = self.effective_access_level(ino)?;
         if Self::access_satisfies(actual, required) {
@@ -183,6 +196,7 @@ impl StudioVfs {
         }))
     }
 
+    /// Same as [`Self::enforce_access`], but fetches metadata using async execution path when needed.
     pub(super) async fn enforce_access_async(
         &self,
         ino: Ino,
@@ -230,6 +244,7 @@ impl StudioVfs {
         }))
     }
 
+    /// Sets (or overwrites) an ACL rule for an inode and principal.
     pub fn set_acl_rule(
         &self,
         ino: Ino,
@@ -243,6 +258,7 @@ impl StudioVfs {
         Ok(())
     }
 
+    /// Removes an ACL rule for an inode and principal.
     pub fn remove_acl_rule(&self, ino: Ino, principal: &str) -> VfsResult<()> {
         let meta = self.sync_meta();
         meta.remove_acl_rule(ino, principal)?;

@@ -1,14 +1,25 @@
-#![cfg(unix)]
-
 //! StudioFS FUSE backend for Linux and macOS using `fuser`.
 //!
-//! Implements `fuser::Filesystem` to expose StudioVfs via FUSE.
+//! Implements `fuser::Filesystem` to expose `studiofs_vfs::StudioVfs` via FUSE.
+//!
+//! # Mount options
+//!
+//! The `STUDIOFS_FUSE_ALLOW_OTHER=1` environment variable enables the
+//! `AllowOther` mount option on Linux. On macOS, `AllowOther` is enabled
+//! unconditionally (per the macFUSE behavior expected by StudioFS).
+
+#![cfg(unix)]
 
 mod fs;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-pub use fs::{FuseKernelInvalidator, StudioFuseFs};
+/// A `fuser::Notifier`-backed cache invalidator used by `studiofs_vfs` to
+/// proactively clear kernel FUSE dentry/attribute caches.
+pub use fs::FuseKernelInvalidator;
+/// The `fuser::Filesystem` implementation that bridges StudioFS VFS operations
+/// into FUSE callbacks.
+pub use fs::StudioFuseFs;
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq, Eq)]

@@ -57,6 +57,9 @@ pub enum LockTier {
 }
 
 impl LockTier {
+    /// Returns this tier's numeric priority level.
+    ///
+    /// Lower values indicate higher lock priority and must be acquired before higher values.
     pub const fn level(self) -> u8 {
         match self {
             LockTier::Shutdown => 1,
@@ -72,6 +75,9 @@ impl LockTier {
         }
     }
 
+    /// Returns the canonical, human-readable name for the lock tier.
+    ///
+    /// The returned string matches the tier vocabulary used in diagnostics and lock-order warnings.
     pub fn name(&self) -> &'static str {
         match self {
             LockTier::Shutdown => "Shutdown",

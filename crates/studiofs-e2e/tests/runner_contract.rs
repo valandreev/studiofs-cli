@@ -1,3 +1,12 @@
+//! Runner contract and CLI surface tests for `studiofs-e2e`.
+//!
+//! These tests are intentionally "contract shaped":
+//! - They lock down the public CLI entrypoints and parsing behavior.
+//! - They pin scenario list ordering/numbering used by promotion gates.
+//! - They assert runner artifact layout and reporting invariants (sandbox files, report links).
+//! - They verify runner safety checks (e.g., rejecting path traversal run IDs).
+//! - They ensure key documentation phrases remain present in the runner contract docs.
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -1153,6 +1162,7 @@ fn clean_continues_after_malformed_owned_candidate() {
     assert!(!temp.path().join("e2e-runs").join("valid-run").exists());
 }
 
+/// Asserts that a runner sandbox contains the required base files that the report expects.
 fn assert_required_sandbox_files(sandbox: &Path) {
     for relative in [
         "run.json",
@@ -1172,11 +1182,13 @@ fn assert_required_sandbox_files(sandbox: &Path) {
     }
 }
 
+/// Reads a JSON file into a loosely-typed value for contract assertions.
 fn read_json(path: impl AsRef<Path>) -> Value {
     let content = fs::read_to_string(path).unwrap();
     serde_json::from_str(&content).unwrap()
 }
 
+/// Maps 1-based scenario indexes to scenario names using the runner's exported scenario list.
 fn scenario_names_by_index(indexes: &[usize]) -> Vec<String> {
     let scenarios = studiofs_e2e::scenario::available_scenarios();
     indexes
