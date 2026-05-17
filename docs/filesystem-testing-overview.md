@@ -284,5 +284,7 @@ only then move to the next level.
 
 Future deterministic backstops can go deeper into sparse-file
 truncate/write/read-range races, cold-observer long-history convergence,
-stale-remount catch-up, symlink and metadata-attribute convergence, and
-adversarial runner cleanup.
+stale-remount catch-up, and adversarial runner cleanup. Symlink and
+metadata-attribute convergence now has a real mounted promotion scenario,
+`mounted-symlink-attribute-convergence`, with platform-gated public filesystem
+checks.

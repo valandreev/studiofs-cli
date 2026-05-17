@@ -328,6 +328,93 @@ fn scenario_list_appends_invalidation_dropout_after_stale_remount_cold_discover(
 }
 
 #[test]
+fn scenario_list_appends_symlink_attribute_after_invalidation_dropout() {
+    let scenarios = studiofs_e2e::scenario::available_scenarios();
+    let names = scenarios
+        .iter()
+        .map(|scenario| scenario.name)
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        names[19],
+        "mounted-invalidation-dropout-fallback-convergence"
+    );
+    assert_eq!(names[20], "mounted-symlink-attribute-convergence");
+}
+
+#[test]
+fn symlink_attribute_disabled_run_writes_reproducible_artifacts() {
+    let temp = tempdir().unwrap();
+    let request = RunRequest {
+        root: temp.path().join("e2e-runs"),
+        run_id: Some("symlink-attribute-contract-run".to_string()),
+        scenarios: vec!["mounted-symlink-attribute-convergence".to_string()],
+        seed: 380,
+        studiofs_bin: None,
+        platform: PlatformSelection::Auto,
+        retention: RetentionPolicy::Always,
+        report: None,
+        port_range: None,
+        timeout: None,
+        infra: InfraMode::Disabled,
+    };
+
+    let outcome = studiofs_e2e::runner::run(request).unwrap();
+
+    assert_eq!(outcome.status, RunStatus::Passed);
+    assert_eq!(
+        outcome.scenarios[0].name,
+        "mounted-symlink-attribute-convergence"
+    );
+    assert!(outcome.scenarios[0].artifacts.contains(
+        &"artifacts/scenarios/mounted-symlink-attribute-convergence/symlink-attribute-summary.json".to_string()
+    ));
+    assert!(outcome.scenarios[0].artifacts.contains(
+        &"artifacts/scenarios/mounted-symlink-attribute-convergence/validation.json".to_string()
+    ));
+
+    let sandbox = temp
+        .path()
+        .join("e2e-runs")
+        .join("symlink-attribute-contract-run");
+    let summary = read_json(sandbox.join(
+        "artifacts/scenarios/mounted-symlink-attribute-convergence/symlink-attribute-summary.json",
+    ));
+    assert_eq!(summary["scenario"], "mounted-symlink-attribute-convergence");
+    assert_eq!(summary["clients"], 3);
+    assert_eq!(summary["symlink_attributes"]["symlink_supported"], true);
+    assert_eq!(
+        summary["symlink_attributes"]["readonly_attribute_supported"],
+        true
+    );
+    assert_eq!(
+        summary["symlink_attributes"]["final_symlink_target"],
+        "target-v2.txt"
+    );
+    assert_eq!(
+        summary["symlink_attributes"]["final_validation_result"],
+        "mounted_tree_convergence"
+    );
+
+    let operations = fs::read_to_string(
+        sandbox.join("artifacts/scenarios/mounted-symlink-attribute-convergence/operations.ndjson"),
+    )
+    .unwrap();
+    for expected in [
+        "symlink_create",
+        "symlink_rename",
+        "symlink_target_update",
+        "readonly_attribute_set",
+        "near_symlink_write",
+    ] {
+        assert!(
+            operations.contains(expected),
+            "expected symlink/attribute operation {expected}"
+        );
+    }
+}
+
+#[test]
 fn invalidation_dropout_disabled_run_writes_reproducible_artifacts() {
     let temp = tempdir().unwrap();
     let request = RunRequest {

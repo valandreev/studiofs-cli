@@ -337,3 +337,10 @@ mount_and_serve(vfs, rt, mount_point, volume_name, foreground, read_only)
 | Symlinks | Supported via reparse points | Full support |
 | Extended attrs | Via `xattrs` table | Via FUSE xattr callbacks |
 | File locking | Via WinFSP mechanisms | `flock()` support |
+
+`mounted-symlink-attribute-convergence` validates only behavior exposed through
+the mounted filesystem. It treats symlink creation and read-only file attributes
+as capability-gated operations: unsupported, permission-denied, or WinFSP
+`ERROR_GEN_FAILURE` symlink-create responses after the bounded mount-readiness
+retry are recorded as explicit scenario skips, while supported operations must
+converge through public mountpoint reads and metadata calls.

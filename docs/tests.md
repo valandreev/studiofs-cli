@@ -144,6 +144,7 @@ cargo run -p studiofs-e2e -- run mounted-sparse-file-range-convergence --seed 37
 cargo run -p studiofs-e2e -- run mounted-cold-observer-long-history-convergence --seed 378 --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run mounted-stale-remount-cold-discover-catchup-convergence --seed 418 --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run mounted-invalidation-dropout-fallback-convergence --seed 379 --studiofs-bin target\debug\studiofs.exe
+cargo run -p studiofs-e2e -- run mounted-symlink-attribute-convergence --seed 380 --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run rustfs-outage-multi-client-recovery --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run mounted-client-crash-restart-recovery --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run collision-rename-vs-unlink --studiofs-bin target\debug\studiofs.exe
@@ -206,6 +207,16 @@ for both payload updates and deleted-path visibility, and then validates final
 convergence plus deleted-path absence through public mounted reads. It writes
 `operations.ndjson`, `invalidation-dropout-summary.json`,
 `invalidation-fallback-diagnostics.json`, and `validation.json`.
+`mounted-symlink-attribute-convergence` is the next post-1-16 promotion
+scenario. It uses public mounted filesystem behavior for symlink
+create/read-target/rename/unlink-recreate target replacement, writes near the
+symlink namespace, and checks the supported read-only file attribute. Platform
+capability skips are explicit in `symlink-attribute-summary.json`; on
+Windows/WinFSP, `ERROR_GEN_FAILURE` from symlink creation after the bounded
+mount-readiness retry is treated as an unsupported symlink skip. Supported
+behavior must converge through mounted reads and the mounted-tree validator. It
+writes `operations.ndjson`, `symlink-attribute-summary.json`, and
+`validation.json`.
 
 Hosted Linux real mounted E2E is available as a manual RWX workflow:
 
