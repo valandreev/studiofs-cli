@@ -4473,16 +4473,21 @@ fn wait_for_mounted_payload_readback(
     poll_interval: Duration,
 ) -> Result<Vec<u8>, ScenarioError> {
     let deadline = Instant::now() + timeout;
-    let mut last_readback = Vec::new();
+    let mut last_readback = None;
     loop {
         match fs::read(path) {
             Ok(readback) if readback == payload => return Ok(readback),
-            Ok(readback) => last_readback = readback,
+            Ok(readback) => last_readback = Some(readback),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
         if Instant::now() >= deadline {
-            return Ok(last_readback);
+            return last_readback.ok_or_else(|| {
+                ScenarioError::Io(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("mounted payload readback did not find {}", path.display()),
+                ))
+            });
         }
         thread::sleep(poll_interval.max(Duration::from_millis(1)));
     }
@@ -9008,6 +9013,25 @@ mod tests {
         writer.join().unwrap();
 
         assert_eq!(readback, payload);
+    }
+
+    #[test]
+    fn mounted_payload_readback_distinguishes_missing_path_from_empty_file() {
+        let temp = tempdir().unwrap();
+        let missing_path = temp.path().join("missing-empty.txt");
+
+        let err = wait_for_mounted_payload_readback(
+            &missing_path,
+            b"",
+            Duration::from_millis(10),
+            Duration::from_millis(1),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(&err, ScenarioError::Io(error) if error.kind() == io::ErrorKind::NotFound),
+            "missing path with empty expected payload must not pass readback, got {err:?}"
+        );
     }
 
     #[test]
