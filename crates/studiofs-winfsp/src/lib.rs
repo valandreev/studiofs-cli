@@ -510,10 +510,36 @@ fn stop_host_before_vfs_shutdown(host: &mut impl WinfspShutdownHost, shutdown_vf
     unmount_guard.unmount_now();
 }
 
+#[cfg(test)]
 fn stop_host_before_vfs_shutdown_and_process_exit(
     mut host: impl WinfspShutdownHost,
     shutdown_vfs: impl FnOnce(),
 ) {
+    let shutdown_started = stop_host_and_shutdown_vfs(&mut host, shutdown_vfs);
+    tracing::info!(
+        total_elapsed_ms = shutdown_started.elapsed().as_millis(),
+        "WinFSP shutdown: dropping host"
+    );
+    drop(host);
+    tracing::info!(
+        total_elapsed_ms = shutdown_started.elapsed().as_millis(),
+        "WinFSP shutdown: host dropped"
+    );
+}
+
+#[cfg(not(test))]
+fn stop_host_before_vfs_shutdown_and_process_exit<H>(mut host: H, shutdown_vfs: impl FnOnce())
+where
+    H: WinfspShutdownHost + Send + 'static,
+{
+    let shutdown_started = stop_host_and_shutdown_vfs(&mut host, shutdown_vfs);
+    drop_host_before_process_exit(host, shutdown_started);
+}
+
+fn stop_host_and_shutdown_vfs(
+    host: &mut impl WinfspShutdownHost,
+    shutdown_vfs: impl FnOnce(),
+) -> std::time::Instant {
     let shutdown_started = std::time::Instant::now();
     tracing::info!("WinFSP shutdown: stopping host before VFS shutdown");
     let stop_started = std::time::Instant::now();
@@ -531,22 +557,73 @@ fn stop_host_before_vfs_shutdown_and_process_exit(
         total_elapsed_ms = shutdown_started.elapsed().as_millis(),
         "WinFSP shutdown: VFS shutdown returned"
     );
-    // `FileSystemHost::drop` can block forever when WinFSP still has a stuck
-    // kernel callback during forced scenario cleanup. At this point the host
-    // has already been stopped and VFS dirty state has been checkpointed, so
-    // the mount process must prefer a bounded process exit over becoming an
-    // unkillable Windows process object.
-    tracing::warn!(
+    shutdown_started
+}
+
+#[cfg(not(test))]
+fn drop_host_before_process_exit<H>(host: H, shutdown_started: std::time::Instant)
+where
+    H: WinfspShutdownHost + Send + 'static,
+{
+    let drop_started = std::time::Instant::now();
+    let timeout = winfsp_host_drop_timeout();
+    tracing::info!(
+        timeout_ms = timeout.as_millis(),
         total_elapsed_ms = shutdown_started.elapsed().as_millis(),
-        "WinFSP shutdown: skipping host drop before process exit"
+        "WinFSP shutdown: dropping host"
     );
-    #[cfg(test)]
-    drop(host);
-    #[cfg(not(test))]
-    {
-        std::mem::forget(host);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spawn_result = std::thread::Builder::new()
+        .name("winfsp-host-drop".to_string())
+        .spawn(move || {
+            drop(host);
+            let _ = tx.send(());
+        });
+
+    let Ok(handle) = spawn_result else {
+        tracing::warn!(
+            total_elapsed_ms = shutdown_started.elapsed().as_millis(),
+            "WinFSP shutdown: failed to spawn host drop thread; exiting mount process"
+        );
         std::process::exit(0);
+    };
+
+    match rx.recv_timeout(timeout) {
+        Ok(()) => {
+            let _ = handle.join();
+            tracing::info!(
+                elapsed_ms = drop_started.elapsed().as_millis(),
+                total_elapsed_ms = shutdown_started.elapsed().as_millis(),
+                "WinFSP shutdown: host dropped"
+            );
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            tracing::warn!(
+                timeout_ms = timeout.as_millis(),
+                total_elapsed_ms = shutdown_started.elapsed().as_millis(),
+                "WinFSP shutdown: host drop timed out; exiting mount process"
+            );
+            std::process::exit(0);
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            tracing::warn!(
+                total_elapsed_ms = shutdown_started.elapsed().as_millis(),
+                "WinFSP shutdown: host drop thread ended before completion signal"
+            );
+            std::process::exit(1);
+        }
     }
+}
+
+#[cfg(not(test))]
+fn winfsp_host_drop_timeout() -> std::time::Duration {
+    const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    std::env::var("STUDIOFS_WINFSP_HOST_DROP_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(DEFAULT_TIMEOUT)
 }
 
 /// Start the WinFSP filesystem, mount, and block until unmounted.
