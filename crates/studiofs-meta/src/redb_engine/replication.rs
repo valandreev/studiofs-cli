@@ -111,9 +111,21 @@ impl RedbMetaEngine {
 
         snapshot.regular_file_overlay = snapshot.regular_file_base.clone();
         snapshot.event_log.clear();
-        snapshot
-            .counters
-            .retain(|(name, _)| name.as_str() != "nextEventSeq");
+        snapshot.counters.retain(|(name, _)| {
+            !matches!(
+                name.as_str(),
+                "nextEventSeq"
+                    | "pgClientSlotPlusOne"
+                    | "pgInodeActiveRangeStart"
+                    | "pgInodeActiveRangeEnd"
+                    | "pgInodeReservedRangeEnd"
+                    | "pgInodeCurrentWindowStart"
+                    | "pgInodeCurrentWindowEnd"
+                    | "pgInodePrefetchedWindowStart"
+                    | "pgInodePrefetchedWindowNext"
+                    | "pgInodePrefetchedWindowEnd"
+            )
+        });
         if let Some((_, value)) = snapshot
             .counters
             .iter_mut()

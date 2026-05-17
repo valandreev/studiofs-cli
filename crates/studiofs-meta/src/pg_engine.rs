@@ -7363,6 +7363,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn remote_snapshot_does_not_export_local_pg_client_slot() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("meta.redb");
+        let local = RedbMetaEngine::open(&path).expect("open local redb");
+        local.init_root(0, 0).expect("init root");
+        PgMetaEngine::persist_client_slot(&local, 7).expect("persist client slot");
+
+        let snapshot = local
+            .export_remote_snapshot()
+            .expect("export remote snapshot");
+
+        assert!(
+            snapshot
+                .counters
+                .iter()
+                .all(|(name, _)| name != LOCAL_PG_CLIENT_SLOT_COUNTER),
+            "remote discovery snapshots must not make a new client reuse the writer slot"
+        );
+    }
+
     fn persist_inode_state(local: &RedbMetaEngine, state: InodeAllocatorState) {
         local
             .write_counters(|counters| {
