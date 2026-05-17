@@ -7,7 +7,7 @@ replacement for Contract/Core tests or real mounted E2E tests.
 
 The initial design covered Phase 3 planning for the Deterministic Simulation
 Testing milestone. SFS-395 rebases that plan onto the accepted mounted Windows
-E2E 1-18 baseline and keeps future simulation work as regression backstops, not
+E2E 1-16 baseline and keeps future simulation work as regression backstops, not
 as prerequisites for accepting that baseline.
 
 ## SFS-407 Replan From Accepted Local First Contracts
@@ -56,21 +56,21 @@ or mounted baseline gap it models, and explains why that invariant is better
 explored deterministically than by another focused Contract/Core or real mounted
 E2E check.
 
-## SFS-395 Rebase On Accepted Windows E2E 1-18 Baseline
+## SFS-395 Rebase On Accepted Windows E2E 1-16 Baseline
 
 The v2 simulation rule is: deterministic simulation should catch logical
 metadata, payload, publication, replay, and convergence regressions cheaply
 before they require a real mounted Windows rerun. It is a deterministic
-backstop for the accepted mounted Windows E2E 1-18 baseline and for future
+backstop for the accepted mounted Windows E2E 1-16 baseline and for future
 deeper filesystem scenarios. It is no longer a blocker for accepting scenarios
-1-18.
+1-16.
 
 The accepted mounted baseline is:
 
 - scenarios 1-7: smoke, outages, crash/restart, and the three write-acceptance
   crash boundaries;
 - scenarios 8-13: focused mounted namespace collision families;
-- scenarios 14-18: seeded mounted chaos, hot-spot churn, fault chaos, LWW
+- scenarios 14-16: seeded mounted chaos, hot-spot churn, fault chaos, LWW
   reconnect chaos, and open-handle convergence.
 
 Simulation v2 should model logical state-machine behavior that can be explored
@@ -92,7 +92,7 @@ Updated checklist for the next simulation slices:
 | SFS-400 | The accepted baseline depends on trustworthy runner artifacts and cleanup, but adversarial partial-failure cleanup is mostly harness behavior. | Add deterministic simulation or infra-disabled runner self-tests for adversarial runner cleanup, including partial launch failure, hung helper timeout, primary-error preservation, and runner-owned cleanup boundaries. |
 
 These issues are independently implementable regression backstops. They must not
-be presented as prerequisites for the already-green mounted Windows E2E 1-18
+be presented as prerequisites for the already-green mounted Windows E2E 1-16
 baseline.
 
 ## Scope And Non-Goals

@@ -72,7 +72,7 @@ interface instead of through private internals.
 Simulation v2 now serves as the deterministic backstop for this accepted
 mounted Windows baseline. It catches logical metadata, payload, publication,
 replay, and convergence regressions cheaply, but it is not a replacement for
-real mounted E2E and it is no longer a blocker for accepting scenarios 1-18.
+real mounted E2E and it is no longer a blocker for accepting scenarios 1-16.
 
 ## Real Mounted E2E Scenarios We Have Today
 

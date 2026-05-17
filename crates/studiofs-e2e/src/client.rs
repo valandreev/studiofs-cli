@@ -557,7 +557,8 @@ pub enum ClientControllerError {
     #[error("client controller I/O failed: {0}")]
     Io(
         /// Underlying OS and stdlib error returned by I/O operations.
-        #[from] io::Error,
+        #[from]
+        io::Error,
     ),
 }
 

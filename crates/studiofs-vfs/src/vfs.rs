@@ -544,10 +544,8 @@ pub enum VfsError {
     /// Requested metadata block was not found.
     #[error("block not found: inode {0}, block {1}")]
     BlockNotFound(
-        #[doc = "Inode containing the missing block."]
-        Ino,
-        #[doc = "Block number that is missing."]
-        u32,
+        #[doc = "Inode containing the missing block."] Ino,
+        #[doc = "Block number that is missing."] u32,
     ),
 
     /// Operation would block due to conflicting lock state.
@@ -5574,7 +5572,7 @@ impl StudioVfs {
         out
     }
 
-    /// Read a single cached payload block by object id, if present.
+    /// Read a single cached payload segment by object id, if present.
     pub fn read_cached_block(&self, object_id: u64) -> Option<Bytes> {
         let (cached, timing) = run_local_cache_io(|| self.local_payload_backend.get(object_id));
         self.record_local_cache_io_timing(timing);

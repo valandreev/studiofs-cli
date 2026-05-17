@@ -151,7 +151,7 @@ impl StudioVfs {
         Ok(written as u32)
     }
 
-    /// Fetch a payload block from remote object storage.
+    /// Fetch a payload segment from remote object storage.
     ///
     /// When `prefetch` is true, the block is fetched through the prefetch scheduler
     /// to prioritize non-critical background retrieval.
@@ -172,7 +172,7 @@ impl StudioVfs {
         }
     }
 
-    /// Fetch a payload block after a local cache miss.
+    /// Fetch a payload segment after a local cache miss.
     ///
     /// This path is used when a block lookup misses local cache and should retry fetching
     /// from the remote source immediately.
