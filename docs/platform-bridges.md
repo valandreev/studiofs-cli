@@ -189,23 +189,19 @@ On macOS, StudioFS handles `getxattr` / `setxattr` / `listxattr` /
 and resource-fork writes stay in xattrs rather than relying on AppleDouble
 fallback.
 
-### macOS Trash behavior
+### Trash and recycle-bin behavior
 
-On macOS, Finder-style delete may arrive at the filesystem as a rename into a
-Trash directory (`.Trash`, `.Trashes`, `.Trash-<uid>`) instead of a direct
-`unlink`.
+Desktop delete may arrive at the filesystem as a rename into a trash directory
+instead of a direct `unlink`; common forms include Freedesktop-style
+`.Trash-<uid>/files`, `.Trash/<uid>/files`, macOS `.Trashes`, and Windows
+`$RECYCLE.BIN`.
 
-StudioFS mounts the volume as a local drive (via `local`) and allows
-`.Trashes` to be materialized as a real directory. Finder then performs native
-Trash semantics, so deletes go through ordinary rename/restore flow instead of
-`unlink` fallback:
-- the file remains available in Trash
-- inode metadata is preserved
-- local cache payload objects for the file are evicted promptly via the background
-  cache priority path so delete bursts do not contend with foreground reads
-
-This keeps Trash recovery semantics intact while preventing local cache growth
-from Finder-driven deletes.
+StudioFS does not provide recoverable trash/recycle-bin semantics. Renames into
+trash-like roots are treated as immediate deletes: the source file or directory
+subtree is removed through the ordinary delete path, no trash destination entry
+is retained, and local payload cache cleanup follows normal unlink behavior.
+Existing trash-like roots are hidden from root directory listings so they are
+not exposed as user-visible folders in mounted trees.
 
 ### macOS metadata file filtering
 

@@ -341,8 +341,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let (_rt, vfs, _meta) =
             make_test_vfs(&tmp, "ignored-trash-rename-invalidates-parent-attr-cache");
-        let source = vfs
-            .create(ROOT_INO, b"source.txt", 1000, 1000, 0o644)
+        vfs.create(ROOT_INO, b"source.txt", 1000, 1000, 0o644)
             .expect("create source");
         let trash_root = vfs
             .mkdir(ROOT_INO, b".Trash", 1000, 1000, 0o755)
@@ -373,10 +372,38 @@ mod tests {
                 .contains(trash_child.ino)
         );
         assert!(vfs.lookup(ROOT_INO, b"source.txt").is_err());
-        let moved = vfs
-            .lookup(trash_child.ino, b"source.txt")
-            .expect("ignored trash target should resolve");
-        assert_eq!(moved.size, source.size);
+        assert!(
+            vfs.lookup(trash_child.ino, b"source.txt").is_err(),
+            "ignored trash target should not preserve a recoverable entry"
+        );
+    }
+
+    #[test]
+    fn rename_ignored_source_into_ignored_trash_does_not_create_target() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "ignored-source-trash-rename-deletes");
+        vfs.mkdir(ROOT_INO, b".Spotlight-V100", 1000, 1000, 0o755)
+            .expect("create ignored source");
+        let trash_root = vfs
+            .mkdir(ROOT_INO, b".Trash", 1000, 1000, 0o755)
+            .expect("create ignored trash root");
+        let trash_child = vfs
+            .mkdir(trash_root.ino, b"501", 1000, 1000, 0o755)
+            .expect("create ignored trash child");
+
+        vfs.rename(
+            ROOT_INO,
+            b".Spotlight-V100",
+            trash_child.ino,
+            b".Spotlight-V100",
+        )
+        .expect("rename ignored source into ignored trash subtree");
+
+        assert!(vfs.lookup(ROOT_INO, b".Spotlight-V100").is_err());
+        assert!(
+            vfs.lookup(trash_child.ino, b".Spotlight-V100").is_err(),
+            "ignored-source trash rename must not create a recoverable target"
+        );
     }
 
     #[test]

@@ -7072,8 +7072,125 @@ fn test_probable_trash_component_names() {
     assert!(is_probable_trash_component(b".Trash"));
     assert!(is_probable_trash_component(b".Trashes"));
     assert!(is_probable_trash_component(b".Trash-501"));
+    assert!(is_probable_trash_component(b"$RECYCLE.BIN"));
+    assert!(is_probable_trash_component(b"$Recycle.Bin"));
     assert!(!is_probable_trash_component(b"Trash"));
+    assert!(!is_probable_trash_component(b".trash"));
     assert!(!is_probable_trash_component(b".Trashcan"));
+}
+
+#[test]
+fn root_readdir_hides_trash_like_directories() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "root-readdir-hides-trash-like");
+
+    for name in [
+        b".Trash".as_slice(),
+        b".Trashes",
+        b".Trash-1000",
+        b"$RECYCLE.BIN",
+    ] {
+        vfs.mkdir(ROOT_INO, name, 1000, 1000, 0o755)
+            .unwrap_or_else(|err| panic!("create {}: {err}", String::from_utf8_lossy(name)));
+    }
+    vfs.mkdir(ROOT_INO, b"visible", 1000, 1000, 0o755)
+        .expect("create visible directory");
+
+    let mut names = vfs
+        .readdir(ROOT_INO)
+        .expect("readdir root")
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect::<Vec<_>>();
+    names.sort();
+
+    assert_eq!(names, vec![b"visible".to_vec()]);
+}
+
+#[test]
+fn trash_rename_deletes_file_entry() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "trash-rename-deletes-file");
+
+    vfs.create(ROOT_INO, b"recover-me.txt", 1000, 1000, 0o644)
+        .expect("create source file");
+    let trash_root = vfs
+        .mkdir(ROOT_INO, b".Trashes", 1000, 1000, 0o755)
+        .expect("create .Trashes");
+    let trash_user = vfs
+        .mkdir(trash_root.ino, b"501", 1000, 1000, 0o755)
+        .expect("create user trash");
+
+    vfs.rename(
+        ROOT_INO,
+        b"recover-me.txt",
+        trash_user.ino,
+        b"recover-me.txt",
+    )
+    .expect("rename into trash-like directory");
+
+    assert!(vfs.lookup(ROOT_INO, b"recover-me.txt").is_err());
+    assert!(
+        vfs.lookup(trash_user.ino, b"recover-me.txt").is_err(),
+        "trash rename must delete instead of preserving a recoverable destination entry"
+    );
+}
+
+#[test]
+fn linux_trash_rename_deletes_directory_subtree() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "linux-trash-directory-delete");
+
+    let source = vfs
+        .mkdir(ROOT_INO, b"delete-tree", 1000, 1000, 0o755)
+        .expect("create source directory");
+    let child = vfs
+        .mkdir(source.ino, b"nested", 1000, 1000, 0o755)
+        .expect("create nested directory");
+    vfs.create(child.ino, b"leaf.txt", 1000, 1000, 0o644)
+        .expect("create leaf file");
+    let trash_root = vfs
+        .mkdir(ROOT_INO, b".Trash-1000", 1000, 1000, 0o755)
+        .expect("create Linux trash root");
+    let trash_files = vfs
+        .mkdir(trash_root.ino, b"files", 1000, 1000, 0o755)
+        .expect("create Linux trash files directory");
+
+    vfs.rename(ROOT_INO, b"delete-tree", trash_files.ino, b"delete-tree")
+        .expect("rename directory into Linux trash files directory");
+
+    assert!(vfs.lookup(ROOT_INO, b"delete-tree").is_err());
+    assert!(
+        vfs.lookup(trash_files.ino, b"delete-tree").is_err(),
+        "Linux trash directory rename must delete, not preserve a trash entry"
+    );
+}
+
+#[test]
+fn windows_recycle_bin_rename_deletes_directory_subtree() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "windows-recycle-bin-directory-delete");
+
+    let source = vfs
+        .mkdir(ROOT_INO, b"delete-tree", 1000, 1000, 0o755)
+        .expect("create source directory");
+    let child = vfs
+        .mkdir(source.ino, b"nested", 1000, 1000, 0o755)
+        .expect("create nested directory");
+    vfs.create(child.ino, b"leaf.txt", 1000, 1000, 0o644)
+        .expect("create leaf file");
+    let recycle_bin = vfs
+        .mkdir(ROOT_INO, b"$RECYCLE.BIN", 1000, 1000, 0o755)
+        .expect("create recycle bin");
+
+    vfs.rename(ROOT_INO, b"delete-tree", recycle_bin.ino, b"$RDIR")
+        .expect("rename directory into recycle bin");
+
+    assert!(vfs.lookup(ROOT_INO, b"delete-tree").is_err());
+    assert!(
+        vfs.lookup(recycle_bin.ino, b"$RDIR").is_err(),
+        "Windows recycle-bin directory rename must delete, not preserve a trash entry"
+    );
 }
 
 #[test]

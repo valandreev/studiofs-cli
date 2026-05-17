@@ -1,8 +1,8 @@
 # Roadmap
 
-Current plans for project development:
+Current plans for project development (in no particular order):
 
-- Optimization of client speed and responsiveness (Mac and Linux clients)
+- Optimization of client speed and responsiveness (for Mac and Linux clients)
 - Optimization of S3 storage upload speed in WAN environments
 - Data encryption
 - Separate hub service for volume, user, and snapshots management

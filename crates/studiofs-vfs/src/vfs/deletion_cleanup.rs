@@ -1,6 +1,6 @@
 use super::{DeletedInodeCleanup, Ino, MetaError, StudioVfs, VfsMeta, VfsResult};
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::runtime::run_meta;
 
@@ -319,42 +319,5 @@ impl StudioVfs {
 
         self.readahead.evict(ino);
         self.clear_access_tracking(ino);
-    }
-
-    pub(super) async fn evict_file_cache_only(&self, ino: Ino) -> VfsResult<()> {
-        let object_ids = self
-            .regular_file_graph_usage(&self.sync_meta(), ino)?
-            .object_ids;
-        let mut evicted = Vec::new();
-        let mut deferred_pinned = 0;
-        let mut pending_evictions_to_add = Vec::new();
-        for object_id in object_ids {
-            if self.cached_store.is_pinned(object_id) {
-                pending_evictions_to_add.push(object_id);
-                deferred_pinned += 1;
-                continue;
-            }
-            evicted.push(object_id);
-        }
-        if !pending_evictions_to_add.is_empty() {
-            let mut pending_evictions = self.state.upload.pending_evictions.lock();
-            for object_id in pending_evictions_to_add {
-                pending_evictions.insert(object_id);
-            }
-        }
-        if !evicted.is_empty() {
-            self.payload_store_remove_batch_async(&evicted).await?;
-        }
-        if !evicted.is_empty() || deferred_pinned > 0 {
-            info!(
-                "trash-move cache eviction: ino={} evicted {} blocks, deferred pinned={}",
-                ino,
-                evicted.len(),
-                deferred_pinned
-            );
-        }
-        self.readahead.evict(ino);
-        self.clear_access_tracking(ino);
-        Ok(())
     }
 }

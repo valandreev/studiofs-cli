@@ -5953,7 +5953,7 @@ fn large_file_rename_does_not_restart_or_duplicate_uploads() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn rename_into_trashes_evicts_local_payload_objects() {
+async fn rename_into_trashes_deletes_and_evicts_local_payload_objects() {
     apply_test_online_s3_env();
     ensure_bucket().await;
 
@@ -5998,10 +5998,62 @@ async fn rename_into_trashes_evicts_local_payload_objects() {
                 .all(|object_id| vfs.read_cached_block(*object_id).is_none())
         })
         .await,
-        "moving into .Trashes should evict committed local payload payloads promptly"
+        "moving into .Trashes should evict committed local payload objects promptly"
     );
-    assert!(vfs.lookup(trash_user.ino, b"trash-me.bin").is_ok());
+    assert!(vfs.lookup(trash_user.ino, b"trash-me.bin").is_err());
     assert!(vfs.lookup(1, b"trash-me.bin").is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn rename_into_windows_recycle_bin_deletes_and_evicts_local_payload_objects() {
+    apply_test_online_s3_env();
+    ensure_bucket().await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("recycle-bin-rename-cache-{}", std::process::id());
+    let format_info = make_format_info(&volume_suffix);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let block_size = format_info.block_size as usize;
+    let payload = vec![0x5au8; block_size + block_size / 2];
+    let (ino, blocks) = seed_committed_file(&meta, &format_info, b"delete-me.bin", &payload).await;
+    let object_ids: Vec<u64> = blocks.iter().map(|(_, block)| block.object_id).collect();
+
+    let vfs = make_vfs_with_meta(meta.clone(), &format_info, &cache_dir_str);
+    let recycle_root = vfs.mkdir(1, b"$RECYCLE.BIN", 0, 0, 0o755).unwrap();
+
+    let read_back = vfs.read(ino, 0, payload.len() as u32).await.unwrap();
+    assert_eq!(read_back, payload);
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            object_ids
+                .iter()
+                .all(|object_id| vfs.read_cached_block(*object_id).is_some())
+        })
+        .await,
+        "seeded file should be present in the local payload backend before recycle-bin rename"
+    );
+
+    vfs.rename(1, b"delete-me.bin", recycle_root.ino, b"$RPYEQM2.dat")
+        .unwrap();
+
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            object_ids
+                .iter()
+                .all(|object_id| vfs.read_cached_block(*object_id).is_none())
+        })
+        .await,
+        "moving into $RECYCLE.BIN should evict committed local payloads promptly"
+    );
+    assert!(vfs.lookup(recycle_root.ino, b"$RPYEQM2.dat").is_err());
+    assert!(vfs.lookup(1, b"delete-me.bin").is_err());
 }
 
 #[test]

@@ -607,8 +607,16 @@ fn validate_name(name: &[u8]) -> VfsResult<()> {
     Ok(())
 }
 
-fn is_probable_trash_component(name: &[u8]) -> bool {
+fn is_unix_trash_component(name: &[u8]) -> bool {
     matches!(name, b".Trash" | b".Trashes") || name.starts_with(b".Trash-")
+}
+
+fn is_windows_recycle_bin_component(name: &[u8]) -> bool {
+    name.eq_ignore_ascii_case(b"$RECYCLE.BIN")
+}
+
+fn is_probable_trash_component(name: &[u8]) -> bool {
+    is_unix_trash_component(name) || is_windows_recycle_bin_component(name)
 }
 
 pub fn is_hidden_non_macos_root_metadata_name(name: &[u8]) -> bool {

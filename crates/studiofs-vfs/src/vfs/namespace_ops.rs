@@ -796,7 +796,10 @@ impl StudioVfs {
 
         let mut entries = self.sync_meta().readdir(ino)?;
         if ino == super::ROOT_INO {
-            entries.retain(|entry| !super::is_blocked_root_macos_metadata(&entry.name));
+            entries.retain(|entry| {
+                !super::is_blocked_root_macos_metadata(&entry.name)
+                    && !super::is_probable_trash_component(&entry.name)
+            });
         }
 
         let mut cache_updates: Vec<(Ino, AccessLevel)> = Vec::with_capacity(entries.len());
@@ -1170,6 +1173,62 @@ impl StudioVfs {
         Self::run_sync_future(self.rename_inner(parent, name, new_parent, new_name))
     }
 
+    async fn delete_source_tree_and_invalidate_trash_target(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        new_parent: Ino,
+        new_name: &[u8],
+        attr: InodeAttr,
+    ) -> VfsResult<()> {
+        info!(
+            parent,
+            name = %String::from_utf8_lossy(name),
+            source_ino = attr.ino,
+            new_parent,
+            new_name = %String::from_utf8_lossy(new_name),
+            source_kind = ?attr.kind,
+            "VFS trash rename is destructive and non-atomic; deleting source tree instead of preserving a trash entry"
+        );
+        let mut stack = vec![(parent, name.to_vec(), attr.ino, attr.kind, false)];
+        while let Some((current_parent, current_name, current_ino, current_kind, visited)) =
+            stack.pop()
+        {
+            if current_kind != FileType::Directory {
+                self.unlink_inner(current_parent, &current_name).await?;
+                continue;
+            }
+
+            if visited {
+                self.rmdir(current_parent, &current_name)?;
+                continue;
+            }
+
+            stack.push((
+                current_parent,
+                current_name,
+                current_ino,
+                current_kind,
+                true,
+            ));
+            for entry in self.sync_meta().readdir(current_ino)? {
+                stack.push((current_ino, entry.name, entry.ino, entry.kind, false));
+            }
+        }
+        self.invalidate_attr_read_cache([new_parent]);
+        self.bump_namespace_for_parents([new_parent]);
+        self.dentry_cache_insert_negative(new_parent, new_name);
+        info!(
+            parent,
+            name = %String::from_utf8_lossy(name),
+            source_ino = attr.ino,
+            new_parent,
+            new_name = %String::from_utf8_lossy(new_name),
+            "VFS trash rename destructive delete completed"
+        );
+        Ok(())
+    }
+
     async fn rename_inner(
         &self,
         parent: Ino,
@@ -1206,8 +1265,10 @@ impl StudioVfs {
         let source_ignored = self.ignored_entry_lookup(parent, name);
         let target_is_ignored = self.should_ignore_regular_file_path(new_parent, new_name)
             || self.should_ignore_directory_path(new_parent, new_name);
+        let target_is_ignored_trash = self.ignored_dir_attr(new_parent).is_some()
+            && self.ignored_directory_has_probable_trash_ancestor(new_parent);
         if let Some(source) = source_ignored {
-            if target_is_ignored {
+            if target_is_ignored && !target_is_ignored_trash {
                 self.create_ignored_entry(
                     new_parent,
                     new_name,
@@ -1220,6 +1281,9 @@ impl StudioVfs {
             self.unlink_ignored_subtree(parent, name);
             self.bump_acl_namespace_epoch();
             namespace_mutations.record_ignored_rename(parent, name, new_parent, std::iter::empty());
+            if target_is_ignored_trash {
+                self.dentry_cache_insert_negative(new_parent, new_name);
+            }
             info!(
                 parent,
                 name = %name_display,
@@ -1243,28 +1307,16 @@ impl StudioVfs {
             );
             let source_attr = meta.get_attr(source_entry.ino)?;
             self.enforce_no_known_foreign_hard_lock(source_entry.ino)?;
-            let target_is_ignored_trash = self.ignored_dir_attr(new_parent).is_some()
-                && self.ignored_directory_has_probable_trash_ancestor(new_parent);
             if target_is_ignored_trash {
-                let ignored = self.create_ignored_entry(
-                    new_parent,
-                    new_name,
-                    source_attr.uid,
-                    source_attr.gid,
-                    source_attr.mode,
-                    source_attr.kind,
-                );
-                let _ = self.update_ignored_entry(ignored.ino, |attr| {
-                    attr.size = source_attr.size;
-                    attr.committed_size = source_attr.committed_size;
-                    attr.atime = source_attr.atime;
-                    attr.mtime = source_attr.mtime;
-                    attr.ctime = source_attr.ctime;
-                    attr.crtime = source_attr.crtime;
-                });
-                if source_attr.kind == FileType::RegularFile {
-                    self.evict_file_cache_only(source_attr.ino).await?;
-                }
+                return self
+                    .delete_source_tree_and_invalidate_trash_target(
+                        parent,
+                        name,
+                        new_parent,
+                        new_name,
+                        source_attr,
+                    )
+                    .await;
             }
             self.bump_namespace_for_parents([new_parent]);
             let result = self.unlink_inner(parent, name).await;
@@ -1310,6 +1362,28 @@ impl StudioVfs {
             "VFS rename checking source lock"
         );
         self.enforce_no_known_foreign_hard_lock(source_entry.ino)?;
+        let source_attr = meta.get_attr(source_entry.ino)?;
+        let target_is_trash = self.directory_has_probable_trash_ancestor(new_parent)?;
+        if target_is_trash {
+            info!(
+                parent,
+                name = %name_display,
+                source_ino = source_entry.ino,
+                new_parent,
+                new_name = %new_name_display,
+                elapsed_ms = rename_started.elapsed().as_millis(),
+                "VFS rename into trash-like directory completed via delete"
+            );
+            return self
+                .delete_source_tree_and_invalidate_trash_target(
+                    parent,
+                    name,
+                    new_parent,
+                    new_name,
+                    source_attr,
+                )
+                .await;
+        }
         if let Ok(target_entry) = meta.lookup(new_parent, new_name)
             && target_entry.ino != source_entry.ino
         {
@@ -1354,9 +1428,6 @@ impl StudioVfs {
             rename_result.moved_ino,
         );
         self.bump_acl_namespace_epoch();
-        let moved_attr = meta.get_attr(rename_result.moved_ino)?;
-        let moved_into_trash = moved_attr.kind == FileType::RegularFile
-            && self.directory_has_probable_trash_ancestor(new_parent)?;
 
         if let Some(ino) = rename_result.displaced_ino {
             info!(
@@ -1399,18 +1470,6 @@ impl StudioVfs {
             self.dentry_cache_invalidate_parent(ino);
         }
 
-        if moved_into_trash {
-            info!(
-                parent,
-                name = %name_display,
-                new_parent,
-                new_name = %new_name_display,
-                moved_ino = rename_result.moved_ino,
-                elapsed_ms = rename_started.elapsed().as_millis(),
-                "VFS rename evicting moved file cache after trash rename"
-            );
-            self.evict_file_cache_only(rename_result.moved_ino).await?;
-        }
         meta.request_eager_flush();
         info!(
             parent,

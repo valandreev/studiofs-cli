@@ -70,6 +70,14 @@ impl StudioVfs {
 
     pub(super) fn directory_has_probable_trash_ancestor(&self, dir_ino: Ino) -> VfsResult<bool> {
         let trash_roots = self.root_trash_dir_inodes()?;
+        self.directory_has_any_root_ancestor(dir_ino, &trash_roots)
+    }
+
+    fn directory_has_any_root_ancestor(
+        &self,
+        dir_ino: Ino,
+        trash_roots: &HashSet<Ino>,
+    ) -> VfsResult<bool> {
         if trash_roots.is_empty() {
             return Ok(false);
         }
@@ -94,6 +102,13 @@ impl StudioVfs {
     }
 
     fn root_trash_dir_inodes(&self) -> VfsResult<HashSet<Ino>> {
+        self.root_directory_inodes_matching(super::is_probable_trash_component)
+    }
+
+    fn root_directory_inodes_matching(
+        &self,
+        predicate: fn(&[u8]) -> bool,
+    ) -> VfsResult<HashSet<Ino>> {
         let mut trash_roots = HashSet::new();
         for entry in self
             .sync_meta()
@@ -101,7 +116,7 @@ impl StudioVfs {
             .into_iter()
             .filter(|entry| entry.kind == FileType::Directory)
         {
-            if super::is_probable_trash_component(&entry.name) {
+            if predicate(&entry.name) {
                 trash_roots.insert(entry.ino);
             }
         }
