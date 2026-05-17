@@ -3996,10 +3996,17 @@ fn run_stale_remount_warm_history(
                 client.mount_point.join(&rename_dest),
             )
             .map_err(ScenarioError::from),
-            "append" => append_payload(client.mount_point.join(&path), action.as_deref().unwrap())
-                .map_err(ScenarioError::from),
-            _ => write_parented(client.mount_point.join(&path), action.as_deref().unwrap())
-                .map_err(ScenarioError::from),
+            "append" => append_mounted_file_with_readback(
+                client.mount_point.join(&path),
+                action.as_deref().unwrap(),
+                "stale remount warm history append",
+            ),
+            _ => write_mounted_file_with_readback(
+                client.mount_point.join(&path),
+                action.as_deref().unwrap(),
+                &format!("stale remount warm history {operation}"),
+                operation == "create",
+            ),
         };
         operations.push(required_op(
             started,
@@ -6507,6 +6514,43 @@ fn write_mounted_file_with_readback(
     Ok(())
 }
 
+fn append_mounted_file_with_readback(
+    path: PathBuf,
+    payload: &[u8],
+    label: &str,
+) -> Result<(), ScenarioError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut expected = match fs::read(&path) {
+        Ok(existing) => existing,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error.into()),
+    };
+    let mut options = mounted_write_barrier_open_options();
+    options.create(true).append(true);
+    let mut file = options.open(&path)?;
+    file.write_all(payload)?;
+    file.sync_all()?;
+    drop(file);
+    expected.extend_from_slice(payload);
+    let readback = wait_for_mounted_payload_readback(
+        &path,
+        &expected,
+        MOUNTED_WRITE_READBACK_TIMEOUT,
+        MOUNTED_WRITE_READBACK_POLL_INTERVAL,
+    )?;
+    if readback != expected {
+        return Err(ScenarioError::Io(io::Error::other(format!(
+            "{label} append readback mismatch for {}: expected {} bytes, read {} bytes",
+            path.display(),
+            expected.len(),
+            readback.len()
+        ))));
+    }
+    Ok(())
+}
+
 fn write_mounted_file_without_barrier_with_readback(
     path: PathBuf,
     payload: &[u8],
@@ -8745,6 +8789,37 @@ mod tests {
             std::fs::read(&stale_path).unwrap(),
             Vec::<u8>::new(),
             "stale warmup files must not be overwritten in place"
+        );
+    }
+
+    #[test]
+    fn stale_remount_warm_history_rejects_stale_zero_byte_nested_file() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let shared_mount = temp.path().join("mounts").join("shared");
+        std::fs::create_dir_all(&shared_mount).unwrap();
+        let clients = STALE_REMOUNT_WARM_WRITER_NAMES
+            .iter()
+            .copied()
+            .map(|name| client_spec_for(&sandbox, "projectfs", name, shared_mount.clone()))
+            .collect::<Vec<_>>();
+        let isolation = test_isolation("stale-remount-test");
+        let nested_path = shared_mount.join(isolation.path(COLD_OBSERVER_NESTED_FILE));
+        std::fs::create_dir_all(nested_path.parent().unwrap()).unwrap();
+        std::fs::write(&nested_path, []).unwrap();
+
+        let err =
+            run_stale_remount_warm_history(Instant::now(), &clients, &isolation, 3).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains(&isolation.path(COLD_OBSERVER_NESTED_FILE)),
+            "expected stale nested file rejection, got {err:?}"
+        );
+        assert_eq!(
+            std::fs::read(&nested_path).unwrap(),
+            Vec::<u8>::new(),
+            "stale warm-history files must not be overwritten in place"
         );
     }
 
