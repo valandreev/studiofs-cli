@@ -1120,7 +1120,7 @@ mod tests {
 
     #[test]
     fn system_command_executor_returns_timed_out_for_hung_command() {
-        let command = hung_command(Duration::from_millis(50));
+        let command = hung_command(Duration::from_millis(250));
         let started = Instant::now();
 
         let err = SystemCommandExecutor.run(&command).unwrap_err();
@@ -1213,9 +1213,11 @@ timestamp=t studiofs-e2e phase=run status=\x1b[31mfailed\x1b[0m\n",
         CommandSpec {
             program: "powershell".to_string(),
             args: vec![
+                "-NoLogo".to_string(),
                 "-NoProfile".to_string(),
+                "-NonInteractive".to_string(),
                 "-Command".to_string(),
-                "Start-Sleep -Seconds 5".to_string(),
+                "[System.Threading.Thread]::Sleep(5000)".to_string(),
             ],
             env: Vec::new(),
             cwd: None,
