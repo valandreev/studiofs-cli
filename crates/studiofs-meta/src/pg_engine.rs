@@ -2886,7 +2886,7 @@ impl PgMetaEngine {
         batch_events: &[MetaEvent],
         overlay: &OverlayConflictSets,
         base_protected_regular_file_inodes: &HashSet<Ino>,
-    ) -> MetaResult<bool> {
+    ) -> MetaResult<(bool, OverlayConflictSets)> {
         let current_regular_file_conflicts =
             self.current_regular_file_overlay_conflicts_for_batch(batch_events)?;
         let overlay = Self::merge_overlay_conflicts(overlay, &current_regular_file_conflicts);
@@ -2984,7 +2984,10 @@ impl PgMetaEngine {
         if !aux_events.is_empty() {
             self.local.apply_replica_aux_state(&aux_events)?;
         }
-        Ok(applied_serving_state || !aux_events.is_empty() || !grandfathered_attrs.is_empty())
+        Ok((
+            applied_serving_state || !aux_events.is_empty() || !grandfathered_attrs.is_empty(),
+            current_regular_file_conflicts,
+        ))
     }
 
     fn protected_base_range_preserve_inodes(
@@ -3229,11 +3232,33 @@ impl PgMetaEngine {
             ready_inodes.insert(*ino);
         }
         self.local
-            .reconcile_regular_file_serving_from_base(&ready_inodes)
+            .reconcile_regular_file_serving_from_base_with_protected_dentries(
+                &ready_inodes,
+                &overlay.dentry_keys,
+            )
+    }
+
+    fn reconcile_serving_dentries_from_base_with_overlay(
+        &self,
+        dentry_keys: &HashSet<Vec<u8>>,
+        overlay: &OverlayConflictSets,
+    ) -> MetaResult<bool> {
+        if dentry_keys.is_empty() {
+            return Ok(false);
+        }
+        self.local
+            .reconcile_serving_dentries_from_base(dentry_keys, &overlay.dentry_keys)
     }
 
     fn collect_replay_reconcile_inodes(candidates: &mut HashSet<Ino>, batch_events: &[MetaEvent]) {
         candidates.extend(Self::regular_file_serving_reconcile_inodes(batch_events));
+    }
+
+    fn collect_replay_reconcile_dentries(
+        candidates: &mut HashSet<Vec<u8>>,
+        batch_events: &[MetaEvent],
+    ) {
+        candidates.extend(Self::overlay_conflicts_for_events(batch_events).dentry_keys);
     }
 
     fn apply_visible_self_batch(&self, batch_events: &[MetaEvent]) -> MetaResult<bool> {
@@ -3427,7 +3452,13 @@ impl PgMetaEngine {
         let mut reconcile_inodes = recent_flush.overlay.attr_inodes.clone();
         reconcile_inodes.extend(recent_flush.overlay.block_inodes.iter().copied());
         let overlay = self.local_overlay_conflicts()?;
-        self.reconcile_regular_file_serving_from_base_with_overlay(&reconcile_inodes, &overlay)
+        let mut changed = self
+            .reconcile_regular_file_serving_from_base_with_overlay(&reconcile_inodes, &overlay)?;
+        changed |= self.reconcile_serving_dentries_from_base_with_overlay(
+            &recent_flush.overlay.dentry_keys,
+            &overlay,
+        )?;
+        Ok(changed)
     }
 
     fn remote_metadata_head_version(&self) -> MetaResult<i64> {
@@ -3781,9 +3812,12 @@ impl PgMetaEngine {
         let mut max_version = last_seq;
         let mut max_namespace_version = self.namespace_version.load(Ordering::SeqCst);
         let mut reconcile_inodes = HashSet::new();
+        let mut reconcile_dentry_keys = HashSet::new();
+        let mut replay_protected_overlay = OverlayConflictSets::default();
         let empty_protected_base_inodes = HashSet::new();
         for batch in batches {
             Self::collect_replay_reconcile_inodes(&mut reconcile_inodes, &batch.events);
+            Self::collect_replay_reconcile_dentries(&mut reconcile_dentry_keys, &batch.events);
             if batch.is_self_batch {
                 applied_any |= self.apply_visible_self_batch(&batch.events)?;
                 self.acknowledge_local_prefix_from_self_batch(&batch.events)?;
@@ -3802,11 +3836,14 @@ impl PgMetaEngine {
                 } else {
                     &empty_protected_base_inodes
                 };
-                applied_any |= self.apply_foreign_batch(
+                let (changed, protected_overlay) = self.apply_foreign_batch(
                     &batch.events,
                     &effective_overlay,
                     protected_base_inodes,
                 )?;
+                applied_any |= changed;
+                replay_protected_overlay =
+                    Self::merge_overlay_conflicts(&replay_protected_overlay, &protected_overlay);
                 if batch.events.iter().any(MetaEvent::is_namespace_mutation) {
                     max_namespace_version = max_namespace_version.max(batch.batch_version);
                 }
@@ -3814,8 +3851,15 @@ impl PgMetaEngine {
             max_version = batch.batch_version;
             overlay = self.local_overlay_conflicts()?;
         }
-        applied_any |= self
-            .reconcile_regular_file_serving_from_base_with_overlay(&reconcile_inodes, &overlay)?;
+        let final_overlay = Self::merge_overlay_conflicts(&overlay, &replay_protected_overlay);
+        applied_any |= self.reconcile_regular_file_serving_from_base_with_overlay(
+            &reconcile_inodes,
+            &final_overlay,
+        )?;
+        applied_any |= self.reconcile_serving_dentries_from_base_with_overlay(
+            &reconcile_dentry_keys,
+            &final_overlay,
+        )?;
         self.persist_local_version(max_version)?;
         if max_namespace_version > self.namespace_version.load(Ordering::SeqCst) {
             self.persist_namespace_version(max_namespace_version)?;
@@ -6219,6 +6263,76 @@ mod tests {
     }
 
     #[test]
+    fn recent_flush_dentry_reconcile_applies_deferred_foreign_base_entry() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+
+        let local_file = pg
+            .create_file(ROOT_INO, b"slot.txt", 0, 0, 0o644)
+            .expect("create local slot");
+        let local_end = pg.local.get_counter("nextEventSeq").expect("local end");
+        let overlay = pg.local_overlay_conflicts().expect("overlay conflicts");
+        let slot_key = PgMetaEngine::dentry_key(ROOT_INO, b"slot.txt");
+        assert!(
+            overlay.dentry_keys.contains(&slot_key),
+            "local create should protect the serving dentry key"
+        );
+
+        let remote_ino = 77_017;
+        let mut remote_attr = InodeAttr::new_file(remote_ino, ROOT_INO, 0, 0, 0o644);
+        remote_attr.size = 1;
+        remote_attr.committed_size = 1;
+        remote_attr.content_epoch = 1;
+        remote_attr.committed_content_epoch = 1;
+        let remote_entry = DirEntryValue {
+            ino: remote_ino,
+            kind: FileType::RegularFile,
+        };
+        let remote_batch = [
+            MetaEvent::SetAttr {
+                attr: remote_attr.clone(),
+            },
+            MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: b"slot.txt".to_vec(),
+                entry: remote_entry,
+            },
+        ];
+
+        pg.apply_foreign_batch(&remote_batch, &overlay, &HashSet::new())
+            .expect("apply deferred foreign dentry");
+        assert_eq!(
+            pg.lookup(ROOT_INO, b"slot.txt")
+                .expect("local slot still visible")
+                .ino,
+            local_file.ino,
+            "conflicting foreign AddEntry must not replace the local serving key yet"
+        );
+
+        pg.persist_flushed_event_seq(local_end)
+            .expect("ack local create");
+        let overlay_after_ack = pg.local_overlay_conflicts().expect("overlay after ack");
+        assert!(
+            !overlay_after_ack.dentry_keys.contains(&slot_key),
+            "the local dentry key should be safe to reconcile after self-ack"
+        );
+
+        assert!(
+            pg.reconcile_serving_dentries_from_base_with_overlay(
+                &HashSet::from([slot_key]),
+                &overlay_after_ack,
+            )
+            .expect("reconcile deferred dentry"),
+            "deferred base dentry should be replayed into serving"
+        );
+        assert_eq!(
+            pg.lookup(ROOT_INO, b"slot.txt")
+                .expect("remote slot visible after reconcile")
+                .ino,
+            remote_ino
+        );
+    }
+
+    #[test]
     fn foreign_base_publish_preserves_unflushed_local_overlay_payload() {
         let (_dir, pg) = temp_pg_engine_for_unit();
 
@@ -6495,7 +6609,7 @@ mod tests {
             chunk_slices: fixture_payload_slices(1, Some(&remote_tail), PayloadRefState::Published)
                 .expect("remote tail slices"),
         };
-        let changed = pg
+        let (changed, _) = pg
             .apply_foreign_batch(&[remote_publish], &overlay, &HashSet::from([file.ino]))
             .expect("apply protected foreign publish");
         assert!(

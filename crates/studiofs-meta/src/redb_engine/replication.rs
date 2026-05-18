@@ -977,6 +977,19 @@ impl RedbMetaEngine {
         &self,
         inodes: &HashSet<Ino>,
     ) -> MetaResult<bool> {
+        self.reconcile_regular_file_serving_from_base_with_protected_dentries(
+            inodes,
+            &HashSet::new(),
+        )
+    }
+
+    /// Reconcile stale regular-file serving mirrors while preserving dentry keys
+    /// that the PG layer still considers local overlay state.
+    pub fn reconcile_regular_file_serving_from_base_with_protected_dentries(
+        &self,
+        inodes: &HashSet<Ino>,
+        protected_dentry_keys: &HashSet<Vec<u8>>,
+    ) -> MetaResult<bool> {
         if inodes.is_empty() {
             return Ok(false);
         }
@@ -1010,6 +1023,15 @@ impl RedbMetaEngine {
                             ino: *ino,
                             kind: attr.kind,
                         },
+                        protected_dentry_keys,
+                    )?;
+                    Self::install_base_dentries_for_entry_in_txn(
+                        &txn,
+                        &DirEntryValue {
+                            ino: *ino,
+                            kind: attr.kind,
+                        },
+                        protected_dentry_keys,
                     )?;
                     if attr.upload_state == UploadState::Ready
                         && attr.content_epoch == attr.committed_content_epoch
@@ -1027,6 +1049,47 @@ impl RedbMetaEngine {
                     changed = true;
                 }
             }
+        }
+
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(changed)
+    }
+
+    /// Reconcile exact dentry keys from the authoritative base namespace into
+    /// serving after a local namespace overlay for those keys has been flushed.
+    pub fn reconcile_serving_dentries_from_base(
+        &self,
+        dentry_keys: &HashSet<Vec<u8>>,
+        protected_dentry_keys: &HashSet<Vec<u8>>,
+    ) -> MetaResult<bool> {
+        if dentry_keys.is_empty() {
+            return Ok(false);
+        }
+
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let mut changed = false;
+
+        for key in dentry_keys {
+            if protected_dentry_keys.contains(key) {
+                continue;
+            }
+            let (parent, name) = decode_dentry_key(key)?;
+            let base_entry = {
+                let base = txn
+                    .open_table(BASE_DENTRIES_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                Self::lookup_in_opened_dentry_table(&base, parent, name)?
+            };
+            if let Some(entry) = base_entry {
+                Self::set_dentry_mirror_in_txn(&txn, parent, name, &entry)?;
+            } else {
+                Self::remove_dentry_mirror_in_txn(&txn, parent, name)?;
+            }
+            changed = true;
         }
 
         txn.commit()
@@ -1096,7 +1159,7 @@ impl RedbMetaEngine {
                 .map(|value| value.ino == entry.ino && value.kind == entry.kind)
                 .unwrap_or(false);
 
-        Self::remove_stale_dentries_for_base_entry(txn, entry)?;
+        Self::remove_stale_dentries_for_base_entry(txn, entry, &HashSet::new())?;
 
         if dst_in_base {
             // The base rename winner moved this logical source to the
@@ -1135,6 +1198,7 @@ impl RedbMetaEngine {
     fn remove_stale_dentries_for_base_entry(
         txn: &redb::WriteTransaction,
         entry: &DirEntryValue,
+        protected_dentry_keys: &HashSet<Vec<u8>>,
     ) -> MetaResult<()> {
         let keys =
             Self::dentry_keys_for_inode_in_write_index(txn, DENTRIES_BY_INODE_TABLE, entry.ino)?;
@@ -1158,7 +1222,7 @@ impl RedbMetaEngine {
             let base_matches = Self::lookup_in_opened_dentry_table(&base, parent, name)?
                 .map(|value| value.ino == entry.ino && value.kind == entry.kind)
                 .unwrap_or(false);
-            if !base_matches && !protected.contains(&key) {
+            if !base_matches && !protected.contains(&key) && !protected_dentry_keys.contains(&key) {
                 stale.push((parent, name.to_vec()));
             }
         }
@@ -1167,6 +1231,22 @@ impl RedbMetaEngine {
 
         for (parent, name) in stale {
             Self::remove_dentry_mirror_in_txn(txn, parent, &name)?;
+        }
+        Ok(())
+    }
+
+    fn install_base_dentries_for_entry_in_txn(
+        txn: &redb::WriteTransaction,
+        entry: &DirEntryValue,
+        protected_dentry_keys: &HashSet<Vec<u8>>,
+    ) -> MetaResult<()> {
+        let keys = Self::base_dentry_keys_for_rename_entry(txn, entry)?;
+        for key in keys {
+            if protected_dentry_keys.contains(&key) {
+                continue;
+            }
+            let (parent, name) = decode_dentry_key(&key)?;
+            Self::set_dentry_mirror_in_txn(txn, parent, name, entry)?;
         }
         Ok(())
     }
