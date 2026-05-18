@@ -628,6 +628,14 @@ pub fn run_with_executor(
                 mounted_cleanup_block = Some(detail);
             }
         }
+        if let Some(stack) = compose_stack.as_ref() {
+            collect_post_scenario_postgres_state_artifact(
+                stack,
+                executor,
+                &sandbox,
+                &mut lifecycle,
+            )?;
+        }
         if let Some(cleanup_error) = &lifecycle.cleanup_error {
             cleanup_errors.push(format!("{}: {cleanup_error}", lifecycle.outcome.name));
         }
@@ -698,6 +706,25 @@ pub fn run_with_executor(
         scenario_outcomes,
         cleanup,
     })
+}
+
+fn collect_post_scenario_postgres_state_artifact(
+    stack: &DockerComposeStack,
+    executor: &dyn CommandExecutor,
+    sandbox: &Path,
+    lifecycle: &mut ScenarioLifecycleOutcome,
+) -> Result<(), RunnerError> {
+    let status = format!("{:?}", lifecycle.outcome.status).to_ascii_lowercase();
+    let artifact =
+        stack.collect_post_scenario_postgres_state(executor, &lifecycle.outcome.name, &status)?;
+    let relative = normalize_relative_path(&artifact, sandbox)?;
+    if !lifecycle.report.artifacts.contains(&relative) {
+        lifecycle.report.artifacts.push(relative.clone());
+    }
+    if !lifecycle.outcome.artifacts.contains(&relative) {
+        lifecycle.outcome.artifacts.push(relative);
+    }
+    Ok(())
 }
 
 fn verify_post_scenario_cleanup(
@@ -3495,6 +3522,21 @@ plain child stderr\n",
                 .len(),
             4
         );
+        let postgres_state = outcome
+            .sandbox
+            .join("artifacts/scenarios/__test-passing/post-scenario-postgres-state.json");
+        assert!(
+            postgres_state.exists(),
+            "compose runs should capture post-scenario PostgreSQL state"
+        );
+        assert!(
+            report["scenarios"][0]["artifacts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|artifact| artifact
+                    == "artifacts/scenarios/__test-passing/post-scenario-postgres-state.json")
+        );
         assert!(
             report["environment"]["compose_images"]
                 .as_array()
@@ -4746,6 +4788,8 @@ plain child stderr\n",
             }
             let stdout = if command.args.contains(&"logs".to_string()) {
                 "compose logs\n"
+            } else if command.args.contains(&"psql".to_string()) {
+                r#"[{"vol":1,"name":"projectfs","uuid":"vol-uuid","metadata_version":2,"event_count":3,"max_seq_id":3,"last_event_created_at":"2026-05-18T00:00:00Z"}]"#
             } else {
                 ""
             };

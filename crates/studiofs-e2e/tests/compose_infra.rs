@@ -183,6 +183,9 @@ fn compose_stack_lifecycle_collects_logs_and_tears_down_volumes() {
     stack.start_service("postgres", &executor).unwrap();
     let log_path = stack.collect_logs(&executor).unwrap();
     let diagnostics = stack.collect_optional_diagnostics(&executor).unwrap();
+    let postgres_state = stack
+        .collect_post_scenario_postgres_state(&executor, "basic-multi-client-smoke", "passed")
+        .unwrap();
     stack.stop(&executor).unwrap();
     stack.teardown(&executor).unwrap();
 
@@ -215,6 +218,12 @@ fn compose_stack_lifecycle_collects_logs_and_tears_down_volumes() {
         .unwrap(),
         "/data/studiofs-e2e/object\n"
     );
+    let postgres_state_json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(postgres_state).unwrap()).unwrap();
+    assert_eq!(postgres_state_json["scenario"], "basic-multi-client-smoke");
+    assert_eq!(postgres_state_json["scenario_status"], "passed");
+    assert_eq!(postgres_state_json["volumes"][0]["name"], "projectfs");
+    assert_eq!(postgres_state_json["volumes"][0]["event_count"], 3);
     let calls = executor.calls.borrow();
     assert!(calls.iter().any(|call| {
         call.args.contains(&"up".to_string()) && call.args.contains(&"--wait".to_string())
@@ -363,6 +372,8 @@ impl CommandExecutor for RecordingExecutor {
         self.calls.borrow_mut().push(command.clone());
         let stdout = if command.args.contains(&"pg_dump".to_string()) {
             "postgres schema\n"
+        } else if command.args.contains(&"psql".to_string()) {
+            r#"[{"vol":1,"name":"projectfs","uuid":"vol-uuid","metadata_version":2,"event_count":3,"max_seq_id":3,"last_event_created_at":"2026-05-18T00:00:00Z"}]"#
         } else if command
             .args
             .contains(&"find /data -mindepth 1 -maxdepth 8 -print | sort".to_string())

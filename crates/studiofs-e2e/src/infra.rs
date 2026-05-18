@@ -739,6 +739,127 @@ impl DockerComposeStack {
         Ok(collected)
     }
 
+    /// Captures per-volume PostgreSQL metadata state after a scenario finishes.
+    ///
+    /// The artifact is intentionally keyed by `vol`/volume name so long runs can
+    /// prove that one scenario's volume did not bleed into another scenario's
+    /// metadata stream.
+    pub fn collect_post_scenario_postgres_state(
+        &self,
+        executor: &dyn CommandExecutor,
+        scenario: &str,
+        scenario_status: &str,
+    ) -> Result<PathBuf, InfraError> {
+        let artifact = self
+            .sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(scenario)
+            .join("post-scenario-postgres-state.json");
+        let sql = r#"
+SELECT COALESCE(
+    jsonb_agg(
+        jsonb_build_object(
+            'vol', v.vol,
+            'name', v.name,
+            'uuid', v.uuid,
+            'metadata_version', ms.version,
+            'event_count', COALESCE(events.event_count, 0),
+            'max_seq_id', events.max_seq_id,
+            'last_event_created_at', events.last_event_created_at,
+            'event_types', COALESCE(event_types.items, '[]'::jsonb),
+            'recent_events', COALESCE(recent_events.items, '[]'::jsonb)
+        )
+        ORDER BY v.name
+    ),
+    '[]'::jsonb
+)::text
+FROM volumes v
+LEFT JOIN metadata_state ms ON ms.vol = v.vol
+LEFT JOIN (
+    SELECT
+        vol,
+        COUNT(*) AS event_count,
+        MAX(seq_id) AS max_seq_id,
+        MAX(created_at) AS last_event_created_at
+    FROM event_log
+    GROUP BY vol
+) events ON events.vol = v.vol
+LEFT JOIN LATERAL (
+    SELECT jsonb_agg(
+        jsonb_build_object('event_type', event_type, 'count', event_count)
+        ORDER BY event_type
+    ) AS items
+    FROM (
+        SELECT event_type, COUNT(*) AS event_count
+        FROM event_log
+        WHERE vol = v.vol
+        GROUP BY event_type
+    ) grouped_event_types
+) event_types ON TRUE
+LEFT JOIN LATERAL (
+    SELECT jsonb_agg(
+        jsonb_build_object(
+            'seq_id', seq_id,
+            'event_type', event_type,
+            'client_id', client_id,
+            'created_at', created_at
+        )
+        ORDER BY seq_id
+    ) AS items
+    FROM (
+        SELECT seq_id, event_type, client_id, created_at
+        FROM event_log
+        WHERE vol = v.vol
+        ORDER BY seq_id DESC
+        LIMIT 20
+    ) recent
+) recent_events ON TRUE;
+"#;
+        let mut command = self.compose_command();
+        command.timeout = Some(COMPOSE_DIAGNOSTIC_TIMEOUT);
+        command.args.extend([
+            "exec".to_string(),
+            "-T".to_string(),
+            POSTGRES_SERVICE_NAME.to_string(),
+            "psql".to_string(),
+            "--username".to_string(),
+            "studiofs".to_string(),
+            "--dbname".to_string(),
+            "studiofs".to_string(),
+            "--tuples-only".to_string(),
+            "--no-align".to_string(),
+            "--command".to_string(),
+            sql.to_string(),
+        ]);
+        let output = executor.run(&command)?;
+        let stdout = output.stdout.trim();
+        let volumes = if output.status == 0 {
+            serde_json::from_str::<serde_json::Value>(stdout)
+                .unwrap_or_else(|_| serde_json::Value::String(stdout.to_string()))
+        } else {
+            serde_json::Value::Null
+        };
+        if let Some(parent) = artifact.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(
+            &artifact,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "run_id": &self.run_id,
+                "compose_project": &self.project_name,
+                "scenario": scenario,
+                "scenario_status": scenario_status,
+                "postgres_query_status": output.status,
+                "volumes": volumes,
+                "stdout": output.stdout,
+                "stderr": output.stderr,
+            }))?,
+        )?;
+        Ok(artifact)
+    }
+
     /// Runs compose down and removes volumes/orphans with cleanup timeout.
     pub fn teardown(&self, executor: &dyn CommandExecutor) -> Result<(), InfraError> {
         let mut command = self.compose_command();
