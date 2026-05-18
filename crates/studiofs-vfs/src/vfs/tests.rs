@@ -8321,6 +8321,54 @@ fn explicit_winfsp_flush_waits_for_deferred_last_handle_release_barrier() {
 }
 
 #[test]
+fn deferred_release_barrier_replaces_older_inflight_marker() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-427-release-replaces-marker");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-427-release-replaces-marker.bin", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+
+        let older = vfs.register_deferred_release_barrier(ino);
+        let newer = vfs.register_deferred_release_barrier(ino);
+        let newer_guard = newer.task_lock().lock_owned().await;
+
+        drop(older);
+        assert!(
+            vfs.state
+                .deferred_release_inflight
+                .lock()
+                .contains_key(&ino),
+            "dropping a replaced barrier must not remove the current marker"
+        );
+
+        let waiting_vfs = Arc::clone(&vfs);
+        let wait = tokio::spawn(async move {
+            waiting_vfs.wait_for_deferred_release_inflight(ino).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !wait.is_finished(),
+            "foreground sync must wait for the newest deferred release marker, not the replaced one"
+        );
+
+        drop(newer_guard);
+        wait.await.expect("wait task should not panic");
+        drop(newer);
+        assert!(
+            !vfs.state
+                .deferred_release_inflight
+                .lock()
+                .contains_key(&ino),
+            "dropping the current barrier guard must remove its marker"
+        );
+    });
+}
+
+#[test]
 fn write_path_observability_tracks_burst_shape_and_metadata_commit_stalls() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (rt, vfs, meta) = make_test_vfs(&tmp, "write-path-observability-bursts");
