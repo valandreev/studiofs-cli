@@ -1120,6 +1120,7 @@ mod tests {
 
     #[test]
     fn system_command_executor_returns_timed_out_for_hung_command() {
+        let _guard = crate::process_job::child_job_test_lock();
         let command = hung_command(Duration::from_millis(250));
         let started = Instant::now();
 
@@ -1150,6 +1151,7 @@ mod tests {
 
     #[test]
     fn timeout_executor_drains_large_stdout_while_waiting() {
+        let _guard = crate::process_job::child_job_test_lock();
         let command = large_stdout_command(Duration::from_secs(10));
 
         let output = SystemCommandExecutor
@@ -1175,6 +1177,7 @@ mod tests {
 
     #[test]
     fn streaming_command_still_captures_output_without_timeout() {
+        let _guard = crate::process_job::child_job_test_lock();
         let mut command = small_output_command(None);
         command
             .env

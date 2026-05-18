@@ -40,6 +40,36 @@ pub(crate) fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> io::R
     }
 }
 
+#[cfg(test)]
+pub(crate) fn child_job_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+struct ChildJobTestCleanupRegistrationGuard;
+
+#[cfg(test)]
+impl Drop for ChildJobTestCleanupRegistrationGuard {
+    fn drop(&mut self) {
+        CHILD_JOB_TEST_CLEANUP_REGISTRATION.with(|enabled| enabled.set(false));
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static CHILD_JOB_TEST_CLEANUP_REGISTRATION: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn child_job_test_cleanup_registration_scope() -> ChildJobTestCleanupRegistrationGuard {
+    CHILD_JOB_TEST_CLEANUP_REGISTRATION.with(|enabled| enabled.set(true));
+    ChildJobTestCleanupRegistrationGuard
+}
+
 #[cfg(windows)]
 mod imp {
     use super::*;
@@ -224,6 +254,11 @@ mod imp {
     }
 
     fn register_job(handle: *mut c_void) {
+        #[cfg(test)]
+        if !super::CHILD_JOB_TEST_CLEANUP_REGISTRATION.with(|enabled| enabled.get()) {
+            return;
+        }
+
         let mut jobs = child_jobs()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -256,6 +291,7 @@ mod imp {
 
         #[test]
         fn kill_on_close_job_terminates_assigned_child() {
+            let _guard = super::super::child_job_test_lock();
             let mut child = Command::new("cmd")
                 .args(["/C", "ping -n 30 127.0.0.1 >NUL"])
                 .stdin(Stdio::null())
@@ -276,6 +312,8 @@ mod imp {
 
         #[test]
         fn signal_cleanup_terminates_registered_job_child() {
+            let _guard = super::super::child_job_test_lock();
+            let _registration = super::super::child_job_test_cleanup_registration_scope();
             let mut child = Command::new("cmd")
                 .args(["/C", "ping -n 30 127.0.0.1 >NUL"])
                 .stdin(Stdio::null())
