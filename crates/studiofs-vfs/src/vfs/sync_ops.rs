@@ -861,7 +861,7 @@ impl StudioVfs {
         }
         if local_sync_policy.requires_write_path_durability()
             && (self.state.writer_stack.has_dirty_writers(ino)
-                || self.inode_has_local_dirty_state(ino))
+                || self.has_pending_local_dirty_payloads_for_inode(ino))
         {
             materialized_writer_stack_bytes = materialized_writer_stack_bytes.saturating_add(
                 self.flush_local_dirty_state_until_quiescent(ino, local_sync_policy)
@@ -933,11 +933,15 @@ impl StudioVfs {
         for _ in 0..MAX_FLUSH_QUIESCE_PASSES {
             materialized_writer_stack_bytes = materialized_writer_stack_bytes
                 .saturating_add(self.materialize_writer_stack_for_inode(ino).await?);
-            if !self.inode_has_local_dirty_state(ino) {
+            if !self.state.writer_stack.has_dirty_writers(ino)
+                && !self.has_pending_local_dirty_payloads_for_inode(ino)
+            {
                 return Ok(materialized_writer_stack_bytes);
             }
             self.flush_local_dirty_state(ino, local_sync_policy).await?;
-            if !self.inode_has_local_dirty_state(ino) {
+            if !self.state.writer_stack.has_dirty_writers(ino)
+                && !self.has_pending_local_dirty_payloads_for_inode(ino)
+            {
                 return Ok(materialized_writer_stack_bytes);
             }
         }
