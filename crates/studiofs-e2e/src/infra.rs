@@ -1150,7 +1150,7 @@ mod tests {
 
     #[test]
     fn timeout_executor_drains_large_stdout_while_waiting() {
-        let command = large_stdout_command(Duration::from_secs(5));
+        let command = large_stdout_command(Duration::from_secs(10));
 
         let output = SystemCommandExecutor
             .run(&command)
@@ -1211,8 +1211,12 @@ timestamp=t studiofs-e2e phase=run status=\x1b[31mfailed\x1b[0m\n",
     #[cfg(windows)]
     fn hung_command(timeout: Duration) -> CommandSpec {
         CommandSpec {
-            program: "cmd".to_string(),
-            args: vec!["/C".to_string(), "ping -n 6 127.0.0.1 >NUL".to_string()],
+            program: "powershell".to_string(),
+            args: vec![
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                "Start-Sleep -Seconds 5".to_string(),
+            ],
             env: Vec::new(),
             cwd: None,
             timeout: Some(timeout),
@@ -1222,10 +1226,11 @@ timestamp=t studiofs-e2e phase=run status=\x1b[31mfailed\x1b[0m\n",
     #[cfg(windows)]
     fn large_stdout_command(timeout: Duration) -> CommandSpec {
         CommandSpec {
-            program: "cmd".to_string(),
+            program: "powershell".to_string(),
             args: vec![
-                "/C".to_string(),
-                "for /L %i in (1,1,20000) do @echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx".to_string(),
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                "$bytes = [byte[]]::new(1048576); [Console]::OpenStandardOutput().Write($bytes, 0, $bytes.Length)".to_string(),
             ],
             env: Vec::new(),
             cwd: None,
@@ -1236,10 +1241,11 @@ timestamp=t studiofs-e2e phase=run status=\x1b[31mfailed\x1b[0m\n",
     #[cfg(windows)]
     fn small_output_command(timeout: Option<Duration>) -> CommandSpec {
         CommandSpec {
-            program: "cmd".to_string(),
+            program: "powershell".to_string(),
             args: vec![
-                "/C".to_string(),
-                "echo streamed stdout&&echo streamed stderr 1>&2".to_string(),
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                "[Console]::Out.WriteLine('streamed stdout'); [Console]::Error.WriteLine('streamed stderr')".to_string(),
             ],
             env: Vec::new(),
             cwd: None,

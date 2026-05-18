@@ -9785,12 +9785,12 @@ mod tests {
             client_controller_config: None,
         };
         let isolation = test_isolation("hotspot-test");
+        std::fs::create_dir_all(clients[0].mount_point.join(&isolation.root)).unwrap();
 
-        let err = run_hotspot_churn_operations_with_timeout(
+        let err = wait_for_hotspot_initial_tree(
             &context,
             &clients,
-            &isolation,
-            Duration::from_secs(1),
+            &isolation.root,
             Duration::from_millis(25),
             Duration::from_millis(5),
         )
