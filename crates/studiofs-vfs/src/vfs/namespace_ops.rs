@@ -7,7 +7,7 @@ use super::{
     block_index_from_offset, chunk_id_from_offset, chunk_start_offset, debug, info,
     offset_within_block, validate_name, warn,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use studiofs_meta::schema::PayloadRefState;
 
 struct TruncateMutation {
@@ -758,7 +758,10 @@ impl StudioVfs {
             match cached {
                 super::DentryCacheValue::Positive(child_ino) => {
                     match self.getattr_unchecked(child_ino) {
-                        Ok(attr) => return Ok(attr),
+                        Ok(attr) => {
+                            self.enforce_access(child_ino, AccessLevel::ReadOnly)?;
+                            return Ok(attr);
+                        }
                         Err(VfsError::Meta(MetaError::InodeNotFound(_))) => {
                             self.dentry_cache_invalidate(parent, name);
                             self.heal_orphaned_dentry(parent, name, Some(child_ino));
@@ -832,6 +835,7 @@ impl StudioVfs {
             });
         }
 
+        let mut confirmed_entry_inos = HashSet::new();
         if !entries.is_empty() {
             let child_inos = entries.iter().map(|entry| entry.ino).collect::<Vec<_>>();
             let attrs = meta.get_attrs_batch(&child_inos)?;
@@ -839,36 +843,17 @@ impl StudioVfs {
                 .into_iter()
                 .map(|attr| (attr.ino, attr))
                 .collect::<HashMap<_, _>>();
+            confirmed_entry_inos.extend(attrs_by_ino.keys().copied());
             let now = Instant::now();
             let mut attr_cache = self.state.namespace.attr_read_cache.lock();
-            entries.retain(|entry| {
+            for entry in &entries {
                 if let Some(attr) = attrs_by_ino.get(&entry.ino) {
                     attr_cache.put(entry.ino, attr.clone(), ATTR_CACHE_TTL, now);
-                    true
                 } else {
                     attr_cache.remove(entry.ino);
-                    false
                 }
-            });
+            }
             drop(attr_cache);
-
-            let mut needs_generation_bump = false;
-            for entry in &entries {
-                match self.dentry_cache_lookup(ino, &entry.name) {
-                    Some(DentryCacheValue::Positive(cached_ino)) if cached_ino == entry.ino => {}
-                    Some(_) => {
-                        needs_generation_bump = true;
-                        break;
-                    }
-                    None => {}
-                }
-            }
-            if needs_generation_bump {
-                self.bump_directory_generation(ino);
-            }
-            for entry in &entries {
-                self.dentry_cache_insert_positive(ino, &entry.name, entry.ino);
-            }
         }
 
         let mut cache_updates: Vec<(Ino, AccessLevel)> = Vec::with_capacity(entries.len());
@@ -885,6 +870,30 @@ impl StudioVfs {
         });
         for (entry_ino, level) in cache_updates {
             self.effective_access_level_cache_insert(entry_ino, level);
+        }
+
+        let mut needs_generation_bump = false;
+        for entry in &entries {
+            if !confirmed_entry_inos.contains(&entry.ino) {
+                continue;
+            }
+            match self.dentry_cache_lookup(ino, &entry.name) {
+                Some(DentryCacheValue::Positive(cached_ino)) if cached_ino == entry.ino => {}
+                Some(_) => {
+                    needs_generation_bump = true;
+                    break;
+                }
+                None => {}
+            }
+        }
+        if needs_generation_bump {
+            self.bump_directory_generation(ino);
+        }
+        for entry in &entries {
+            if !confirmed_entry_inos.contains(&entry.ino) {
+                continue;
+            }
+            self.dentry_cache_insert_positive(ino, &entry.name, entry.ino);
         }
 
         let file_children: Vec<DirAccessEntry<'_>> = entries

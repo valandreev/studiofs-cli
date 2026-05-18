@@ -892,18 +892,21 @@ impl StudioFsContext {
     }
 
     fn heal_directory_orphans_for_delete(&self, dir_ino: Ino) -> winfsp::Result<usize> {
-        let entries = self.vfs.readdir(dir_ino).map_err(vfs_to_winfsp_err)?;
+        let meta = self.vfs.meta();
+        let entries = meta
+            .readdir(dir_ino)
+            .map_err(|err| vfs_to_winfsp_err(studiofs_vfs::VfsError::Meta(err)))?;
         let mut healed = 0usize;
 
         for entry in entries {
-            match self.vfs.getattr(entry.ino) {
+            match meta.get_attr(entry.ino) {
                 Ok(_) => {}
-                Err(studiofs_vfs::VfsError::Meta(MetaError::InodeNotFound(_))) => {
+                Err(MetaError::InodeNotFound(_)) => {
                     if self.remove_orphaned_directory_child(dir_ino, &entry.name, entry.kind)? {
                         healed += 1;
                     }
                 }
-                Err(err) => return Err(vfs_to_winfsp_err(err)),
+                Err(err) => return Err(vfs_to_winfsp_err(studiofs_vfs::VfsError::Meta(err))),
             }
         }
 

@@ -61,7 +61,7 @@ Key points:
 
 ## Features
 
-- S3-compatible data path via OpenDAL
+- S3-compatible data path via Apache OpenDAL
 - Local-first metadata path with eventual multi-client convergence
 - Local payload backend + upload queue
 - Append-only ingress and crash recovery for accepted local writes

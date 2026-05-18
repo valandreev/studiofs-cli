@@ -1515,7 +1515,7 @@ mod tests {
     }
 
     #[test]
-    fn readdir_filters_dangling_dentry_even_when_attr_cache_is_stale() {
+    fn readdir_keeps_dangling_dentry_but_evicts_stale_attr_cache() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let (_rt, vfs, meta) = make_test_vfs(&tmp, "readdir-stale-attr-dangling-dentry");
         let created = vfs
@@ -1536,10 +1536,10 @@ mod tests {
 
         let entries = vfs.readdir(ROOT_INO).expect("readdir root");
         assert!(
-            !entries
+            entries
                 .iter()
                 .any(|entry| entry.name.as_slice() == b"dangling-cached.txt"),
-            "readdir must not expose a dentry whose inode attr is missing"
+            "readdir should not perform inode-existence healing"
         );
         assert!(
             !vfs.state
@@ -1548,6 +1548,10 @@ mod tests {
                 .lock()
                 .contains(created.ino),
             "readdir should evict stale attr cache entries for dangling dentries"
+        );
+        assert!(
+            meta.lookup(ROOT_INO, b"dangling-cached.txt").is_ok(),
+            "readdir should leave the dangling dentry for foreground repair"
         );
     }
 
