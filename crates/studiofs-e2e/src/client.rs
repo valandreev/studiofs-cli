@@ -347,11 +347,13 @@ impl ClientProcessExecutor for SystemClientProcessExecutor {
             .create(true)
             .append(true)
             .open(&command.stderr_log)?;
-        let child = base_command(command)
+        let mut process = base_command(command);
+        process
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(stderr))
-            .spawn()?;
+            .stderr(Stdio::from(stderr));
+        ChildJob::prepare_command(&mut process)?;
+        let child = process.spawn()?;
         Ok(Box::new(SystemClientProcess::new(child)?))
     }
 
@@ -403,17 +405,26 @@ impl ClientProcess for SystemClientProcess {
     }
 
     fn kill_process_tree(&mut self, context: &str) -> io::Result<()> {
+        let job_terminate_result = self.job.terminate();
+        let job_force_result = self.job.force_kill();
         match (
-            self.job.terminate(),
+            job_terminate_result,
+            job_force_result,
             force_kill_child_process_tree(&mut self.child, context),
         ) {
-            (Ok(true), _) => Ok(()),
-            (Ok(false), child_result) => child_result,
-            (Err(job_error), Ok(())) => {
+            (Ok(true), _, _) | (_, Ok(true), _) => Ok(()),
+            (Ok(false), Ok(false), child_result) => child_result,
+            (Err(job_error), _, Ok(())) | (_, Err(job_error), Ok(())) => {
                 debug_log_process_job_error(context, &job_error);
                 Ok(())
             }
-            (Err(job_error), Err(child_error)) => Err(io::Error::other(format!(
+            (Err(terminate_error), Err(force_error), Err(child_error)) => {
+                Err(io::Error::other(format!(
+                    "failed to terminate process job and child process tree for {context}: job termination: {terminate_error}; job force-kill: {force_error}; child process tree termination: {child_error}"
+                )))
+            }
+            (Err(job_error), Ok(false), Err(child_error))
+            | (Ok(false), Err(job_error), Err(child_error)) => Err(io::Error::other(format!(
                 "failed to terminate process job and child process tree for {context}: job termination: {job_error}; child process tree termination: {child_error}"
             ))),
         }

@@ -1,7 +1,44 @@
 //! Process containment helpers for spawned E2E children.
 
 use std::io;
-use std::process::Child;
+use std::process::{Child, Command};
+use std::sync::Once;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+pub(crate) const CHILD_TERMINATION_GRACE: Duration = Duration::from_secs(2);
+#[cfg(unix)]
+const SIGNAL_CLEANUP_GRACE: Duration = Duration::from_millis(750);
+const CONTROL_C_EXIT_CODE: i32 = 130;
+
+static SIGNAL_HANDLER_INSTALLED: Once = Once::new();
+static SIGNAL_CLEANUP_STARTED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn install_cleanup_handler() {
+    SIGNAL_HANDLER_INSTALLED.call_once(|| {
+        if let Err(error) = ctrlc::set_handler(|| {
+            if !SIGNAL_CLEANUP_STARTED.swap(true, Ordering::SeqCst) {
+                imp::terminate_registered_children_for_process_exit();
+            }
+            std::process::exit(CONTROL_C_EXIT_CODE);
+        }) {
+            eprintln!("studiofs-e2e: failed to install process cleanup signal handler: {error}");
+        }
+    });
+}
+
+pub(crate) fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> io::Result<bool> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait()?.is_some() {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
 
 #[cfg(windows)]
 mod imp {
@@ -69,6 +106,10 @@ mod imp {
     }
 
     impl ChildJob {
+        pub(crate) fn prepare_command(_command: &mut Command) -> io::Result<()> {
+            Ok(())
+        }
+
         pub(crate) fn assign_to_child(child: &Child) -> io::Result<Self> {
             // SAFETY: null attributes/name request a private unnamed job object.
             let handle = unsafe { CreateJobObjectW(ptr::null_mut(), ptr::null()) };
@@ -99,6 +140,10 @@ mod imp {
             } else {
                 Ok(true)
             }
+        }
+
+        pub(crate) fn force_kill(&self) -> io::Result<bool> {
+            self.terminate()
         }
 
         fn enable_kill_on_close(&mut self) -> io::Result<()> {
@@ -161,6 +206,11 @@ mod imp {
         }
     }
 
+    pub(super) fn terminate_registered_children_for_process_exit() {
+        // Windows Job Object handles are owned by the runner process. On process
+        // exit the OS closes those handles, and kill-on-close terminates members.
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -213,13 +263,218 @@ mod imp {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
+mod imp {
+    use super::*;
+    use std::os::unix::process::CommandExt as _;
+    use std::sync::{Mutex, OnceLock};
+
+    static CHILD_GROUPS: OnceLock<Mutex<Vec<libc::pid_t>>> = OnceLock::new();
+
+    pub(crate) struct ChildJob {
+        pgid: libc::pid_t,
+    }
+
+    impl ChildJob {
+        pub(crate) fn prepare_command(command: &mut Command) -> io::Result<()> {
+            // SAFETY: `pre_exec` runs in the child process after fork and before
+            // exec. The closure only calls async-signal-safe libc functions.
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() == -1 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    #[cfg(target_os = "linux")]
+                    {
+                        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
+                            return Err(io::Error::last_os_error());
+                        }
+                    }
+                    Ok(())
+                });
+            }
+            Ok(())
+        }
+
+        pub(crate) fn assign_to_child(child: &Child) -> io::Result<Self> {
+            let pgid = child_pid(child)?;
+            register_group(pgid);
+            Ok(Self { pgid })
+        }
+
+        pub(crate) fn terminate(&self) -> io::Result<bool> {
+            signal_process_group(self.pgid, libc::SIGTERM)
+        }
+
+        pub(crate) fn force_kill(&self) -> io::Result<bool> {
+            signal_process_group(self.pgid, libc::SIGKILL)
+        }
+    }
+
+    impl Drop for ChildJob {
+        fn drop(&mut self) {
+            let _ = self.force_kill();
+            unregister_group(self.pgid);
+        }
+    }
+
+    pub(super) fn terminate_registered_children_for_process_exit() {
+        let groups = registered_groups();
+        for pgid in &groups {
+            let _ = signal_process_group(*pgid, libc::SIGTERM);
+        }
+        std::thread::sleep(SIGNAL_CLEANUP_GRACE);
+        for pgid in &groups {
+            let _ = signal_process_group(*pgid, libc::SIGKILL);
+        }
+    }
+
+    fn child_pid(child: &Child) -> io::Result<libc::pid_t> {
+        child.id().try_into().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("child pid {} does not fit libc::pid_t", child.id()),
+            )
+        })
+    }
+
+    fn child_groups() -> &'static Mutex<Vec<libc::pid_t>> {
+        CHILD_GROUPS.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    fn register_group(pgid: libc::pid_t) {
+        let mut groups = child_groups()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !groups.contains(&pgid) {
+            groups.push(pgid);
+        }
+    }
+
+    fn unregister_group(pgid: libc::pid_t) {
+        let mut groups = child_groups()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        groups.retain(|registered| *registered != pgid);
+    }
+
+    fn registered_groups() -> Vec<libc::pid_t> {
+        child_groups()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn signal_process_group(pgid: libc::pid_t, signal: libc::c_int) -> io::Result<bool> {
+        if pgid <= 0 {
+            return Ok(false);
+        }
+        // SAFETY: negative pid targets the process group whose id is `pgid`.
+        let result = unsafe { libc::kill(-pgid, signal) };
+        if result == 0 {
+            return Ok(true);
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(false)
+        } else {
+            Err(error)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::fs;
+        use std::process::Stdio;
+
+        #[test]
+        fn force_kill_terminates_child_process_group() {
+            let pid_file = std::env::temp_dir().join(format!(
+                "studiofs-e2e-process-group-{}-{}.pid",
+                std::process::id(),
+                unique_suffix()
+            ));
+            let mut command = Command::new("sh");
+            command
+                .args(["-c", "sleep 30 & echo $! > \"$PID_FILE\"; wait"])
+                .env("PID_FILE", &pid_file)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            ChildJob::prepare_command(&mut command).expect("prepare isolated process group");
+            let mut child = command.spawn().expect("spawn child with grandchild");
+            let job = ChildJob::assign_to_child(&child).expect("track child group");
+            let grandchild = wait_for_pid_file(&pid_file, Duration::from_secs(2))
+                .expect("grandchild pid should be written");
+
+            job.force_kill().expect("kill process group");
+
+            assert!(
+                wait_for_child_exit(&mut child, Duration::from_secs(2)).expect("probe child exit"),
+                "child shell should exit after process-group kill"
+            );
+            assert!(
+                wait_for_pid_exit(grandchild, Duration::from_secs(2)),
+                "grandchild process should exit after process-group kill"
+            );
+            let _ = fs::remove_file(pid_file);
+        }
+
+        fn unique_suffix() -> u128 {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default()
+        }
+
+        fn wait_for_pid_file(path: &std::path::Path, timeout: Duration) -> Option<libc::pid_t> {
+            let deadline = Instant::now() + timeout;
+            loop {
+                if let Ok(contents) = fs::read_to_string(path) {
+                    if let Ok(pid) = contents.trim().parse() {
+                        return Some(pid);
+                    }
+                }
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+
+        fn wait_for_pid_exit(pid: libc::pid_t, timeout: Duration) -> bool {
+            let deadline = Instant::now() + timeout;
+            loop {
+                if !pid_is_running(pid) {
+                    return true;
+                }
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+
+        fn pid_is_running(pid: libc::pid_t) -> bool {
+            // SAFETY: signal 0 probes for pid existence without sending a signal.
+            let result = unsafe { libc::kill(pid, 0) };
+            result == 0 || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+        }
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
 mod imp {
     use super::*;
 
     pub(crate) struct ChildJob;
 
     impl ChildJob {
+        pub(crate) fn prepare_command(_command: &mut Command) -> io::Result<()> {
+            Ok(())
+        }
+
         pub(crate) fn assign_to_child(_child: &Child) -> io::Result<Self> {
             Ok(Self)
         }
@@ -227,7 +482,13 @@ mod imp {
         pub(crate) fn terminate(&self) -> io::Result<bool> {
             Ok(false)
         }
+
+        pub(crate) fn force_kill(&self) -> io::Result<bool> {
+            Ok(false)
+        }
     }
+
+    pub(super) fn terminate_registered_children_for_process_exit() {}
 }
 
 pub(crate) use imp::ChildJob;

@@ -144,6 +144,10 @@ pub struct HotspotOpArgs {
     /// Payload file for write and append operations.
     #[arg(long)]
     pub payload: Option<PathBuf>,
+
+    /// Parent sandbox path used only so stale-process cleanup can identify helpers.
+    #[arg(long, hide = true)]
+    pub sandbox: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -298,6 +302,7 @@ impl BaselineGateArgs {
 
 /// Executes the CLI command and returns the process exit code.
 pub fn dispatch(cli: Cli) -> Result<i32> {
+    crate::process_job::install_cleanup_handler();
     match cli.command {
         Commands::List => {
             for (index, scenario) in scenario::available_scenarios().iter().enumerate() {
@@ -422,6 +427,8 @@ mod tests {
             "hotspot-op",
             "--operation",
             "rename",
+            "--sandbox",
+            "target/e2e-runs/run-1",
             "--mount-point",
             "Z:\\",
             "--path",
@@ -435,6 +442,7 @@ mod tests {
             panic!("expected hidden hotspot-op command");
         };
         assert_eq!(args.operation, "rename");
+        assert_eq!(args.sandbox, Some(PathBuf::from("target/e2e-runs/run-1")));
         assert_eq!(args.mount_point, PathBuf::from("Z:\\"));
         assert_eq!(args.path, "hotspot/slot-1.txt");
         assert_eq!(args.target.as_deref(), Some("hotspot/slot-1-renamed.txt"));

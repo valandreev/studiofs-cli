@@ -18,6 +18,10 @@ sha2 = "0.10"
 thiserror.workspace = true
 uuid.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+ctrlc = { version = "3", features = ["termination"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

@@ -13,7 +13,7 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::process_job::ChildJob;
+use crate::process_job::{CHILD_TERMINATION_GRACE, ChildJob, wait_for_child_exit};
 
 const DEFAULT_WAIT_TIMEOUT_SECS: u64 = 120;
 const DEFAULT_POSTGRES_PORT: u16 = 25_432;
@@ -204,6 +204,7 @@ fn run_command(
     timeout: Option<Duration>,
     stream_output: bool,
 ) -> std::io::Result<CommandOutput> {
+    ChildJob::prepare_command(&mut command)?;
     let mut child = command.spawn()?;
     let job = match ChildJob::assign_to_child(&child) {
         Ok(job) => job,
@@ -237,21 +238,36 @@ fn run_command(
             });
         }
         if timeout.is_some_and(|timeout| started.elapsed() >= timeout) {
-            let job_kill_error = job.terminate().err();
-            let process_tree_error = force_kill_process_tree(child.id()).err();
-            let child_kill_error = child.kill().err();
-            let child_exit_detail = match child.try_wait() {
-                Ok(Some(_)) => None,
-                Ok(None) => Some("child still running after kill attempts".to_string()),
+            let job_terminate_error = job.terminate().err();
+            let mut job_force_kill_error = None;
+            let mut process_tree_error = None;
+            let mut child_kill_error = None;
+            let child_exit_detail = match wait_for_child_exit(&mut child, CHILD_TERMINATION_GRACE) {
+                Ok(true) => None,
+                Ok(false) => {
+                    job_force_kill_error = job.force_kill().err();
+                    process_tree_error = force_kill_process_tree(child.id()).err();
+                    child_kill_error = child.kill().err();
+                    match wait_for_child_exit(&mut child, CHILD_TERMINATION_GRACE) {
+                        Ok(true) => None,
+                        Ok(false) => Some("child still running after kill attempts".to_string()),
+                        Err(error) => Some(format!(
+                            "child exit probe failed after kill attempts: {error}"
+                        )),
+                    }
+                }
                 Err(error) => Some(format!(
-                    "child exit probe failed after kill attempts: {error}"
+                    "child exit probe failed after termination request: {error}"
                 )),
             };
             discard_timed_out_reader(stdout_reader.take());
             discard_timed_out_reader(stderr_reader.take());
             let mut details = Vec::new();
-            if let Some(error) = job_kill_error {
-                details.push(format!("job kill-on-close termination failed: {error}"));
+            if let Some(error) = job_terminate_error {
+                details.push(format!("job termination request failed: {error}"));
+            }
+            if let Some(error) = job_force_kill_error {
+                details.push(format!("job force-kill failed: {error}"));
             }
             if let Some(error) = process_tree_error {
                 details.push(format!("process-tree kill fallback failed: {error}"));

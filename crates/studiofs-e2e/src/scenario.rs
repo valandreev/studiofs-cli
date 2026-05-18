@@ -31,7 +31,7 @@ use crate::mounted_tree::{
     ClientMount, ConvergenceOutcome, MountedTreeError, NamespaceInvariantViolation, TreeComparison,
     validate_namespace_invariants, wait_for_convergence,
 };
-use crate::process_job::ChildJob;
+use crate::process_job::{CHILD_TERMINATION_GRACE, ChildJob, wait_for_child_exit};
 use crate::report::RunManifest;
 
 /// Basic multi-client smoke scenario identifier.
@@ -4944,6 +4944,7 @@ fn wait_for_hotspot_initial_tree(
     .map_err(ScenarioError::from)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn timed_hotspot_helper_fs_op(
     context: &ScenarioContext,
     started: Instant,
@@ -4979,6 +4980,7 @@ fn timed_hotspot_helper_fs_op(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_hotspot_helper_process(
     context: &ScenarioContext,
     timeout: Duration,
@@ -5008,6 +5010,8 @@ fn run_hotspot_helper_process(
         .arg("hotspot-op")
         .arg("--operation")
         .arg(operation)
+        .arg("--sandbox")
+        .arg(&context.sandbox)
         .arg("--mount-point")
         .arg(&client.mount_point)
         .arg("--path")
@@ -5022,6 +5026,7 @@ fn run_hotspot_helper_process(
         command.arg("--payload").arg(payload_path);
     }
 
+    ChildJob::prepare_command(&mut command)?;
     let mut child = command.spawn()?;
     let job = ChildJob::assign_to_child(&child).map_err(|error| {
         let _ = child.kill();
@@ -5058,7 +5063,11 @@ fn run_hotspot_helper_process(
                 pending_label
             );
             let _ = job.terminate();
-            let _ = child.kill();
+            if !wait_for_child_exit(&mut child, CHILD_TERMINATION_GRACE).unwrap_or(false) {
+                let _ = job.force_kill();
+                let _ = child.kill();
+                let _ = wait_for_child_exit(&mut child, CHILD_TERMINATION_GRACE);
+            }
             return Err(namespace_collision_operation_timeout(
                 timeout,
                 vec![(1, pending_label)],

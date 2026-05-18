@@ -23,6 +23,8 @@ use crate::infra::{
     DockerComposeStack, InfraCheck, InfraError, InfraMode, SystemCommandExecutor,
     command_streams_output,
 };
+#[cfg(windows)]
+use crate::process_job::{CHILD_TERMINATION_GRACE, ChildJob, wait_for_child_exit};
 use crate::report::{
     ArtifactReport, CleanupReport, ComposeImageReport, EnvironmentReport, EventRecord, HostReport,
     PathOwnershipReport, PreflightCheckReport, PreflightReport, RunManifest, RunReport,
@@ -1630,7 +1632,13 @@ fn run_host_environment_probe(command: CommandSpec) -> Result<crate::infra::Comm
         process.current_dir(cwd);
     }
 
+    ChildJob::prepare_command(&mut process).map_err(|err| err.to_string())?;
     let mut child = process.spawn().map_err(|err| err.to_string())?;
+    let job = ChildJob::assign_to_child(&child).map_err(|err| {
+        let _ = child.kill();
+        let _ = child.wait();
+        format!("failed to isolate host environment probe in job object: {err}")
+    })?;
     let started = Instant::now();
     loop {
         match child.try_wait() {
@@ -1643,7 +1651,12 @@ fn run_host_environment_probe(command: CommandSpec) -> Result<crate::infra::Comm
                 });
             }
             Ok(None) if started.elapsed() >= HOST_ENVIRONMENT_PROBE_TIMEOUT => {
-                let _ = child.kill();
+                let _ = job.terminate();
+                if !wait_for_child_exit(&mut child, CHILD_TERMINATION_GRACE).unwrap_or(false) {
+                    let _ = job.force_kill();
+                    let _ = child.kill();
+                    let _ = wait_for_child_exit(&mut child, CHILD_TERMINATION_GRACE);
+                }
                 return Err(format!(
                     "host environment probe timed out after {} ms",
                     HOST_ENVIRONMENT_PROBE_TIMEOUT.as_millis()
