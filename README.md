@@ -206,7 +206,7 @@ Real mounted E2E runner skeleton:
 
 ```bash
 cargo run -p studiofs-e2e -- list
-cargo run -p studiofs-e2e -- run --scenario 1-20 --studiofs-bin ./studiofs
+cargo run -p studiofs-e2e -- run --scenario X-Y,Z --studiofs-bin <PATH TO studiofs BINARY>
 cargo run -p studiofs-e2e -- clean
 ```
 
