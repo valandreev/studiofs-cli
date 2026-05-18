@@ -3414,6 +3414,22 @@ impl PgMetaEngine {
         Ok(())
     }
 
+    fn reconcile_recent_flush_regular_files(
+        &self,
+        recent_flush: Option<&RecentFlush>,
+    ) -> MetaResult<bool> {
+        let Some(recent_flush) = recent_flush else {
+            return Ok(false);
+        };
+        if self.local_version.load(Ordering::SeqCst) < recent_flush.batch_version {
+            return Ok(false);
+        }
+        let mut reconcile_inodes = recent_flush.overlay.attr_inodes.clone();
+        reconcile_inodes.extend(recent_flush.overlay.block_inodes.iter().copied());
+        let overlay = self.local_overlay_conflicts()?;
+        self.reconcile_regular_file_serving_from_base_with_overlay(&reconcile_inodes, &overlay)
+    }
+
     fn remote_metadata_head_version(&self) -> MetaResult<i64> {
         let postgres_url = self.postgres_url.clone();
         let volume_id = self.volume_id;
@@ -4127,6 +4143,7 @@ impl PgMetaEngine {
         };
         let recent_flush = self.flush_pending_claimed_batch_with_restore(batch)?;
         let _ = self.pull_foreign_events_locked(recent_flush.as_ref())?;
+        let _ = self.reconcile_recent_flush_regular_files(recent_flush.as_ref())?;
         Ok(())
     }
 
@@ -5071,6 +5088,7 @@ impl MetaReplication for PgMetaEngine {
             None
         };
         let _ = self.pull_foreign_events_locked(recent_flush.as_ref())?;
+        let _ = self.reconcile_recent_flush_regular_files(recent_flush.as_ref())?;
         self.write_checkpoint_locked()?;
         Ok(())
     }
@@ -7641,6 +7659,66 @@ mod tests {
             pg.get_attr(file.ino).expect("load reconciled attr").size,
             remote_attr.size,
             "snapshot reconciliation must reset stale regular-file serving attrs from base"
+        );
+    }
+
+    #[test]
+    fn recent_flush_reconcile_resets_stale_regular_file_serving_attr() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+        let file = pg
+            .create_file(ROOT_INO, b"recent-flush-stale-serving.txt", 0, 0, 0o644)
+            .expect("create file");
+        set_file_state(&pg, file.ino, 227, 3);
+        let local_payload = PayloadRef::new_partial(91_011, 227);
+        pg.stage_payload_slice(file.ino, 0, &local_payload)
+            .expect("stage local payload");
+        mark_overlay_objects_uploaded(&pg, file.ino, 3, &[local_payload.object_id]);
+        assert!(
+            pg.publish_regular_file_overlay_to_base_if_matches(file.ino, 3)
+                .expect("publish local payload"),
+            "local publish should succeed"
+        );
+        let events_start = pg.flushed_event_seq.load(Ordering::SeqCst);
+        let events_end = pg.local.get_counter("nextEventSeq").expect("events end");
+        let local_events = pg
+            .local
+            .read_events_range(events_start, events_end)
+            .expect("read local events");
+        pg.persist_flushed_event_seq(events_end)
+            .expect("mark local publish flushed");
+
+        let mut remote_attr = pg.get_attr(file.ino).expect("load published attr");
+        remote_attr.size = 446;
+        remote_attr.committed_size = 446;
+        remote_attr.content_epoch = 4;
+        remote_attr.committed_content_epoch = 4;
+        remote_attr.upload_state = UploadState::Ready;
+        pg.local
+            .apply_replica_events_to_base(&[MetaEvent::SetAttr {
+                attr: remote_attr.clone(),
+            }])
+            .expect("apply authoritative base attr");
+        pg.persist_local_version(7).expect("catch up local version");
+
+        assert_eq!(
+            pg.get_attr(file.ino).expect("load stale serving attr").size,
+            227,
+            "flushed local serving attr can remain stale after base advances"
+        );
+
+        let recent_flush = RecentFlush {
+            batch_version: 7,
+            overlay: PgMetaEngine::overlay_conflicts_for_events(
+                &PgMetaEngine::project_remote_events(&local_events),
+            ),
+        };
+        pg.reconcile_recent_flush_regular_files(Some(&recent_flush))
+            .expect("reconcile recent flush");
+
+        assert_eq!(
+            pg.get_attr(file.ino).expect("load reconciled attr").size,
+            remote_attr.size,
+            "recent-flush reconciliation must reset stale regular-file serving attrs from base"
         );
     }
 
