@@ -192,7 +192,7 @@ impl StudioVfs {
             .try_lock_owned()
             .expect("new deferred release barrier lock should be uncontended");
         if inflight.insert(ino, Arc::clone(&task_lock)).is_some() {
-            warn!(
+            debug!(
                 ino,
                 "replaced in-flight deferred last-handle release barrier"
             );
