@@ -8269,11 +8269,11 @@ fn strict_deferred_write_waits_for_inflight_materialization() {
         );
 
         drop(guard);
+        vfs.state.deferred_materialize_inflight.lock().remove(&ino);
         strict_write
             .await
             .expect("strict write task should not panic")
             .expect("strict write should complete after inflight materialization drains");
-        vfs.state.deferred_materialize_inflight.lock().remove(&ino);
         vfs.release_fh(fh).await.unwrap();
     });
 }
