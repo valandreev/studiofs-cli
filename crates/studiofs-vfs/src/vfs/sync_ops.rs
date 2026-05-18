@@ -31,10 +31,6 @@ impl DeferredReleaseBarrier {
             task_lock,
         }
     }
-
-    pub(super) fn task_lock(&self) -> Arc<tokio::sync::Mutex<()>> {
-        Arc::clone(&self.task_lock)
-    }
 }
 
 impl Drop for DeferredReleaseBarrier {
@@ -171,14 +167,17 @@ impl StudioVfs {
     }
 
     pub(super) async fn wait_for_deferred_release_inflight(&self, ino: Ino) {
-        let task_lock = {
-            self.state
-                .deferred_release_inflight
-                .lock()
-                .get(&ino)
-                .cloned()
-        };
-        if let Some(task_lock) = task_lock {
+        loop {
+            let task_lock = {
+                self.state
+                    .deferred_release_inflight
+                    .lock()
+                    .get(&ino)
+                    .cloned()
+            };
+            let Some(task_lock) = task_lock else {
+                return;
+            };
             let _guard = task_lock.lock().await;
         }
     }
@@ -186,16 +185,22 @@ impl StudioVfs {
     pub(super) fn register_deferred_release_barrier(
         self: &Arc<Self>,
         ino: Ino,
-    ) -> DeferredReleaseBarrier {
+    ) -> (DeferredReleaseBarrier, tokio::sync::OwnedMutexGuard<()>) {
         let mut inflight = self.state.deferred_release_inflight.lock();
         let task_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let guard = Arc::clone(&task_lock)
+            .try_lock_owned()
+            .expect("new deferred release barrier lock should be uncontended");
         if inflight.insert(ino, Arc::clone(&task_lock)).is_some() {
             warn!(
                 ino,
                 "replaced in-flight deferred last-handle release barrier"
             );
         }
-        DeferredReleaseBarrier::new(Arc::clone(self), ino, task_lock)
+        (
+            DeferredReleaseBarrier::new(Arc::clone(self), ino, task_lock),
+            guard,
+        )
     }
 
     fn finish_deferred_release_barrier(&self, ino: Ino, task_lock: &Arc<tokio::sync::Mutex<()>>) {
@@ -731,11 +736,7 @@ impl StudioVfs {
         let ino = context.ino;
         let flushed_local_dirty_state = self.inode_has_local_dirty_state(ino);
         let vfs = Arc::clone(self);
-        let barrier = self.register_deferred_release_barrier(ino);
-        let guard = barrier
-            .task_lock()
-            .try_lock_owned()
-            .expect("new deferred release barrier lock should be uncontended");
+        let (barrier, guard) = self.register_deferred_release_barrier(ino);
         self.track_background_task(runtime.spawn(async move {
             let _barrier = barrier;
             let _guard = guard;

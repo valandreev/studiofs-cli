@@ -8311,11 +8311,11 @@ fn explicit_winfsp_flush_waits_for_deferred_last_handle_release_barrier() {
         );
 
         drop(guard);
+        vfs.state.deferred_release_inflight.lock().remove(&ino);
         flush
             .await
             .expect("flush task should not panic")
             .expect("flush should complete after deferred release barrier drains");
-        vfs.state.deferred_release_inflight.lock().remove(&ino);
         vfs.release_fh(fh).await.unwrap();
     });
 }
@@ -8331,9 +8331,8 @@ fn deferred_release_barrier_replaces_older_inflight_marker() {
             .unwrap();
         let ino = attr.ino;
 
-        let older = vfs.register_deferred_release_barrier(ino);
-        let newer = vfs.register_deferred_release_barrier(ino);
-        let newer_guard = newer.task_lock().lock_owned().await;
+        let (older, _older_guard) = vfs.register_deferred_release_barrier(ino);
+        let (newer, newer_guard) = vfs.register_deferred_release_barrier(ino);
 
         drop(older);
         assert!(
@@ -8356,8 +8355,8 @@ fn deferred_release_barrier_replaces_older_inflight_marker() {
         );
 
         drop(newer_guard);
-        wait.await.expect("wait task should not panic");
         drop(newer);
+        wait.await.expect("wait task should not panic");
         assert!(
             !vfs.state
                 .deferred_release_inflight
@@ -8365,6 +8364,35 @@ fn deferred_release_barrier_replaces_older_inflight_marker() {
                 .contains_key(&ino),
             "dropping the current barrier guard must remove its marker"
         );
+    });
+}
+
+#[test]
+fn deferred_release_barrier_registration_holds_lock_before_marker_is_visible() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-427-release-atomic-register");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-427-release-atomic-register.bin", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+
+        let (barrier, guard) = vfs.register_deferred_release_barrier(ino);
+        let waiting_vfs = Arc::clone(&vfs);
+        let wait = tokio::spawn(async move {
+            waiting_vfs.wait_for_deferred_release_inflight(ino).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !wait.is_finished(),
+            "foreground sync must not be able to acquire a newly registered deferred release marker before the background release task owns it"
+        );
+
+        drop(guard);
+        drop(barrier);
+        wait.await.expect("wait task should not panic");
     });
 }
 
