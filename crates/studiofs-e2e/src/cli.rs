@@ -148,6 +148,10 @@ pub struct HotspotOpArgs {
     /// Parent sandbox path used only so stale-process cleanup can identify helpers.
     #[arg(long, hide = true)]
     pub sandbox: Option<PathBuf>,
+
+    /// Per-operation progress JSONL path used to diagnose bounded helper timeouts.
+    #[arg(long, hide = true)]
+    pub progress: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -346,6 +350,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                 &args.path,
                 args.target.as_deref(),
                 args.payload.as_deref(),
+                args.progress.as_deref(),
             )?;
             // This helper exists only to isolate one potentially blocking mounted
             // filesystem call.  Once the call has returned successfully, exit
@@ -446,6 +451,7 @@ mod tests {
         assert_eq!(args.mount_point, PathBuf::from("Z:\\"));
         assert_eq!(args.path, "hotspot/slot-1.txt");
         assert_eq!(args.target.as_deref(), Some("hotspot/slot-1-renamed.txt"));
+        assert_eq!(args.progress, None);
     }
 
     #[test]

@@ -11,7 +11,7 @@ use std::sync::{
     mpsc,
 };
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -5003,6 +5003,17 @@ fn run_hotspot_helper_process(
         }
         None => None,
     };
+    let progress_path = {
+        let progress_dir = context.scenario_dir.join("hotspot-helper-progress");
+        fs::create_dir_all(&progress_dir)?;
+        let id = HOTSPOT_HELPER_PAYLOAD_ID.fetch_add(1, Ordering::SeqCst);
+        progress_dir.join(format!(
+            "{id:06}-{}-{}-{}.jsonl",
+            client.name,
+            sanitize_hotspot_progress_component(operation),
+            sanitize_hotspot_progress_component(path)
+        ))
+    };
 
     let exe = std::env::current_exe()?;
     let mut command = Command::new(exe);
@@ -5016,6 +5027,8 @@ fn run_hotspot_helper_process(
         .arg(&client.mount_point)
         .arg("--path")
         .arg(path)
+        .arg("--progress")
+        .arg(&progress_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
@@ -5051,16 +5064,24 @@ fn run_hotspot_helper_process(
                     stderr.read_to_string(&mut output).ok().map(|_| output)
                 })
                 .unwrap_or_default();
+            let progress = read_hotspot_helper_progress_tail(&progress_path);
             return Err(ScenarioError::Io(io::Error::other(format!(
-                "hotspot helper failed for {pending_label}: status={status}; stderr={}",
-                stderr.trim()
+                "hotspot helper failed for {pending_label}: status={status}; stderr={}; progress={}",
+                stderr.trim(),
+                progress.as_deref().unwrap_or("<none>")
             ))));
         }
         if Instant::now() >= deadline {
+            let progress = read_hotspot_helper_progress_tail(&progress_path);
+            let progress_suffix = progress
+                .as_ref()
+                .map(|progress| format!("; progress={progress}"))
+                .unwrap_or_default();
             eprintln!(
-                "studiofs-e2e: mounted hotspot operation timed out after {} ms; terminating helper process: {}",
+                "studiofs-e2e: mounted hotspot operation timed out after {} ms; terminating helper process: {}{}",
                 timeout.as_millis(),
-                pending_label
+                pending_label,
+                progress_suffix
             );
             let _ = job.terminate();
             if !wait_for_child_exit(&mut child, CHILD_TERMINATION_GRACE).unwrap_or(false) {
@@ -5070,7 +5091,7 @@ fn run_hotspot_helper_process(
             }
             return Err(namespace_collision_operation_timeout(
                 timeout,
-                vec![(1, pending_label)],
+                vec![(1, format!("{pending_label}{progress_suffix}"))],
             ));
         }
         thread::sleep(Duration::from_millis(50));
@@ -8062,30 +8083,166 @@ pub fn run_hotspot_op_helper(
     path: &str,
     target: Option<&str>,
     payload: Option<&Path>,
+    progress: Option<&Path>,
 ) -> Result<(), anyhow::Error> {
     let path = mount_point.join(path);
+    record_hotspot_helper_progress(progress, "started", operation, &path, target, None)?;
     match operation {
-        "mkdir" => fs::create_dir_all(path)?,
+        "mkdir" => {
+            record_hotspot_helper_progress(
+                progress,
+                "before_create_dir_all",
+                operation,
+                &path,
+                target,
+                None,
+            )?;
+            fs::create_dir_all(&path)?;
+            record_hotspot_helper_progress(
+                progress,
+                "after_create_dir_all",
+                operation,
+                &path,
+                target,
+                None,
+            )?;
+        }
         "write" | "overwrite" => {
             let payload_path = payload.ok_or_else(|| anyhow::anyhow!("missing payload"))?;
+            record_hotspot_helper_progress(
+                progress,
+                "before_read_payload",
+                operation,
+                &path,
+                target,
+                None,
+            )?;
             let payload = fs::read(payload_path)?;
-            write_parented(path, &payload)?;
+            record_hotspot_helper_progress(
+                progress,
+                "after_read_payload",
+                operation,
+                &path,
+                target,
+                Some(payload.len()),
+            )?;
+            write_parented_with_progress(&path, &payload, progress, operation, target)?;
         }
         "append" => {
             let payload_path = payload.ok_or_else(|| anyhow::anyhow!("missing payload"))?;
+            record_hotspot_helper_progress(
+                progress,
+                "before_read_payload",
+                operation,
+                &path,
+                target,
+                None,
+            )?;
             let payload = fs::read(payload_path)?;
-            append_payload(path, &payload)?;
+            record_hotspot_helper_progress(
+                progress,
+                "after_read_payload",
+                operation,
+                &path,
+                target,
+                Some(payload.len()),
+            )?;
+            append_payload_with_progress(&path, &payload, progress, operation, target)?;
         }
         "rename" => {
             let target = target.ok_or_else(|| anyhow::anyhow!("missing rename target"))?;
-            fs::rename(path, mount_point.join(target))?;
+            record_hotspot_helper_progress(
+                progress,
+                "before_rename",
+                operation,
+                &path,
+                Some(target),
+                None,
+            )?;
+            fs::rename(&path, mount_point.join(target))?;
+            record_hotspot_helper_progress(
+                progress,
+                "after_rename",
+                operation,
+                &path,
+                Some(target),
+                None,
+            )?;
         }
         "readdir" => {
-            fs::read_dir(path)?;
+            record_hotspot_helper_progress(
+                progress,
+                "before_read_dir",
+                operation,
+                &path,
+                target,
+                None,
+            )?;
+            fs::read_dir(&path)?;
+            record_hotspot_helper_progress(
+                progress,
+                "after_read_dir",
+                operation,
+                &path,
+                target,
+                None,
+            )?;
         }
         other => anyhow::bail!("unsupported hotspot operation: {other}"),
     }
+    record_hotspot_helper_progress(progress, "completed", operation, &path, target, None)?;
     Ok(())
+}
+
+fn write_parented_with_progress(
+    path: &Path,
+    payload: &[u8],
+    progress: Option<&Path>,
+    operation: &str,
+    target: Option<&str>,
+) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        record_hotspot_helper_progress(
+            progress,
+            "before_create_parent",
+            operation,
+            path,
+            target,
+            None,
+        )?;
+        fs::create_dir_all(parent)?;
+        record_hotspot_helper_progress(
+            progress,
+            "after_create_parent",
+            operation,
+            path,
+            target,
+            None,
+        )?;
+    }
+    record_hotspot_helper_progress(
+        progress,
+        "before_write",
+        operation,
+        path,
+        target,
+        Some(payload.len()),
+    )?;
+    fs::write(path, payload)?;
+    record_hotspot_helper_progress(
+        progress,
+        "after_write",
+        operation,
+        path,
+        target,
+        Some(payload.len()),
+    )?;
+    record_hotspot_helper_progress(progress, "before_reopen", operation, path, target, None)?;
+    let file = OpenOptions::new().read(true).write(true).open(path)?;
+    record_hotspot_helper_progress(progress, "after_reopen", operation, path, target, None)?;
+    record_hotspot_helper_progress(progress, "before_sync_all", operation, path, target, None)?;
+    file.sync_all()?;
+    record_hotspot_helper_progress(progress, "after_sync_all", operation, path, target, None)
 }
 
 fn append_payload(path: PathBuf, payload: &[u8]) -> io::Result<()> {
@@ -8095,6 +8252,132 @@ fn append_payload(path: PathBuf, payload: &[u8]) -> io::Result<()> {
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     file.write_all(payload)?;
     file.sync_all()
+}
+
+fn append_payload_with_progress(
+    path: &Path,
+    payload: &[u8],
+    progress: Option<&Path>,
+    operation: &str,
+    target: Option<&str>,
+) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        record_hotspot_helper_progress(
+            progress,
+            "before_create_parent",
+            operation,
+            path,
+            target,
+            None,
+        )?;
+        fs::create_dir_all(parent)?;
+        record_hotspot_helper_progress(
+            progress,
+            "after_create_parent",
+            operation,
+            path,
+            target,
+            None,
+        )?;
+    }
+    record_hotspot_helper_progress(
+        progress,
+        "before_open_append",
+        operation,
+        path,
+        target,
+        Some(payload.len()),
+    )?;
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    record_hotspot_helper_progress(
+        progress,
+        "after_open_append",
+        operation,
+        path,
+        target,
+        Some(payload.len()),
+    )?;
+    record_hotspot_helper_progress(
+        progress,
+        "before_write_all",
+        operation,
+        path,
+        target,
+        Some(payload.len()),
+    )?;
+    file.write_all(payload)?;
+    record_hotspot_helper_progress(
+        progress,
+        "after_write_all",
+        operation,
+        path,
+        target,
+        Some(payload.len()),
+    )?;
+    record_hotspot_helper_progress(progress, "before_sync_all", operation, path, target, None)?;
+    file.sync_all()?;
+    record_hotspot_helper_progress(progress, "after_sync_all", operation, path, target, None)
+}
+
+fn record_hotspot_helper_progress(
+    progress: Option<&Path>,
+    phase: &str,
+    operation: &str,
+    path: &Path,
+    target: Option<&str>,
+    payload_len: Option<usize>,
+) -> io::Result<()> {
+    let Some(progress) = progress else {
+        return Ok(());
+    };
+    if let Some(parent) = progress.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(progress)?;
+    serde_json::to_writer(
+        &mut file,
+        &json!({
+            "timestamp_ms": timestamp_ms,
+            "phase": phase,
+            "operation": operation,
+            "path": path.display().to_string(),
+            "target": target,
+            "payload_len": payload_len,
+        }),
+    )
+    .map_err(io::Error::other)?;
+    writeln!(file)?;
+    file.flush()
+}
+
+fn read_hotspot_helper_progress_tail(progress: &Path) -> Option<String> {
+    let contents = fs::read_to_string(progress).ok()?;
+    contents
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .map(str::to_string)
+}
+
+fn sanitize_hotspot_progress_component(value: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    sanitized.trim_matches('_').chars().take(80).collect()
 }
 
 fn write_advanced_mounted_summary(
@@ -10080,6 +10363,33 @@ mod tests {
 
         assert_eq!(record.result, "rejected");
         assert!(record.error.unwrap().contains("hotspot helper failed"));
+    }
+
+    #[test]
+    fn hotspot_helper_records_progress_for_sync_barrier_phases() {
+        let temp = tempdir().unwrap();
+        let mount = temp.path().join("mount");
+        let payload = temp.path().join("payload.bin");
+        let progress = temp.path().join("progress.jsonl");
+        std::fs::create_dir_all(&mount).unwrap();
+        std::fs::write(&payload, b"hotspot payload").unwrap();
+
+        run_hotspot_op_helper(
+            "overwrite",
+            mount,
+            "hotspot/slot-1.txt",
+            None,
+            Some(&payload),
+            Some(&progress),
+        )
+        .unwrap();
+
+        let progress_log = std::fs::read_to_string(progress).unwrap();
+        assert!(progress_log.contains("\"phase\":\"before_write\""));
+        assert!(progress_log.contains("\"phase\":\"after_write\""));
+        assert!(progress_log.contains("\"phase\":\"before_sync_all\""));
+        assert!(progress_log.contains("\"phase\":\"after_sync_all\""));
+        assert!(progress_log.contains("\"phase\":\"completed\""));
     }
 
     #[test]
