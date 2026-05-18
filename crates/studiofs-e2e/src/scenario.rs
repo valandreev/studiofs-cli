@@ -4066,8 +4066,13 @@ fn run_stale_remount_cold_discover_body(
         .filter(|client| STALE_REMOUNT_WARM_WRITER_NAMES.contains(&client.name.as_str()))
         .cloned()
         .collect::<Vec<_>>();
-    let (mut warm_history, long_history) =
-        run_stale_remount_warm_history(started, &warm_clients, &isolation, operations.len() + 1)?;
+    let (mut warm_history, long_history) = run_stale_remount_warm_history(
+        context,
+        started,
+        &warm_clients,
+        &isolation,
+        operations.len() + 1,
+    )?;
     operations.append(&mut warm_history);
     write_namespace_collision_operations(context, &operations)?;
 
@@ -4139,6 +4144,7 @@ fn run_stale_remount_cold_discover_body(
 }
 
 fn run_stale_remount_warm_history(
+    context: &ScenarioContext,
     started: Instant,
     clients: &[ClientSpec],
     isolation: &ScenarioIsolation,
@@ -4232,14 +4238,15 @@ fn run_stale_remount_warm_history(
                 operation == "create",
             ),
         };
-        operations.push(required_op(
+        let recorded = required_op(
             started,
             first_order + offset,
             client,
             operation,
             &log_path,
             result,
-        )?);
+        )?;
+        record_sparse_operation(context, &mut operations, recorded)?;
         if matches!(operation, "create" | "overwrite") {
             wait_for_mounted_initial_payloads_until(
                 clients,
@@ -4863,54 +4870,62 @@ fn run_hotspot_churn_operations_with_timeout(
             &write_path,
             &format!("hotspot round {round}\n"),
         );
-        operations.push(timed_hotspot_helper_fs_op(
+        let order = operations.len() + 1;
+        let operation = timed_hotspot_helper_fs_op(
             context,
             started,
-            operations.len() + 1,
+            order,
             &clients[0],
             "overwrite",
             &slot,
             operation_timeout,
             Some(&write_payload),
             None,
-        )?);
+        )?;
+        record_sparse_operation(context, &mut operations, operation)?;
         let append_path = slot.clone();
         let append_payload_bytes =
             isolation.payload("append", &append_path, &format!("append round {round}\n"));
-        operations.push(timed_hotspot_helper_fs_op(
+        let order = operations.len() + 1;
+        let operation = timed_hotspot_helper_fs_op(
             context,
             started,
-            operations.len() + 1,
+            order,
             &clients[1],
             "append",
             &slot,
             operation_timeout,
             Some(&append_payload_bytes),
             None,
-        )?);
+        )?;
+        record_sparse_operation(context, &mut operations, operation)?;
         let rename_target = renamed.clone();
-        operations.push(timed_hotspot_helper_fs_op(
+        let order = operations.len() + 1;
+        let operation = timed_hotspot_helper_fs_op(
             context,
             started,
-            operations.len() + 1,
+            order,
             &clients[0],
             "rename",
             &slot,
             operation_timeout,
             None,
             Some(&rename_target),
-        )?);
-        operations.push(timed_hotspot_helper_fs_op(
+        )?;
+        record_sparse_operation(context, &mut operations, operation)?;
+        let order = operations.len() + 1;
+        let operation = timed_hotspot_helper_fs_op(
             context,
             started,
-            operations.len() + 1,
+            order,
             &clients[2],
             "readdir",
             &isolation.root,
             operation_timeout,
             None,
             None,
-        )?);
+        )?;
+        record_sparse_operation(context, &mut operations, operation)?;
     }
     Ok(operations)
 }
@@ -5712,22 +5727,47 @@ fn mounted_initial_payload_probe(
     expected_payload: Vec<u8>,
 ) -> MountedPayloadProbeStatus {
     let path = client.mount_point.join(&relative_path);
-    if !refresh_relative_path_parent_contains_child(&client.mount_point, &relative_path) {
-        return MountedPayloadProbeStatus::Missing(format!("{}:{relative_path}", client.name));
+    let parent_contains_child =
+        refresh_relative_path_parent_contains_child(&client.mount_point, &relative_path);
+    if !parent_contains_child {
+        let metadata_detail = match fs::metadata(&path) {
+            Ok(metadata) => format!("metadata_len={}", metadata.len()),
+            Err(error) => format!("metadata_error={error}"),
+        };
+        return MountedPayloadProbeStatus::Missing(format!(
+            "{}:{relative_path} (parent_contains_child=false; {metadata_detail})",
+            client.name
+        ));
     }
     match fs::read(&path) {
         Ok(payload) if payload == expected_payload => MountedPayloadProbeStatus::Present,
         Ok(payload) => MountedPayloadProbeStatus::Missing(format!(
-            "{}:{relative_path} (expected {} bytes, read {} bytes)",
+            "{}:{relative_path} (parent_contains_child=true; expected {} bytes sha256={}, read {} bytes sha256={})",
             client.name,
             expected_payload.len(),
-            payload.len()
+            bytes_sha256(&expected_payload),
+            payload.len(),
+            bytes_sha256(&payload)
         )),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            MountedPayloadProbeStatus::Missing(format!("{}:{relative_path}", client.name))
+            let metadata_detail = match fs::metadata(&path) {
+                Ok(metadata) => format!("metadata_len={}", metadata.len()),
+                Err(metadata_error) => format!("metadata_error={metadata_error}"),
+            };
+            MountedPayloadProbeStatus::Missing(format!(
+                "{}:{relative_path} (parent_contains_child=true; read_error={error}; {metadata_detail})",
+                client.name
+            ))
         }
         Err(error) => {
-            MountedPayloadProbeStatus::Missing(format!("{}:{relative_path} ({error})", client.name))
+            let metadata_detail = match fs::metadata(&path) {
+                Ok(metadata) => format!("metadata_len={}", metadata.len()),
+                Err(metadata_error) => format!("metadata_error={metadata_error}"),
+            };
+            MountedPayloadProbeStatus::Missing(format!(
+                "{}:{relative_path} (parent_contains_child=true; read_error={error}; {metadata_detail})",
+                client.name
+            ))
         }
     }
 }
@@ -9885,8 +9925,17 @@ mod tests {
     fn stale_remount_warm_history_rejects_stale_zero_byte_nested_file() {
         let temp = tempdir().unwrap();
         let sandbox = temp.path().join("run-1");
+        let scenario_dir = temp.path().join("scenario");
         let shared_mount = temp.path().join("mounts").join("shared");
+        std::fs::create_dir_all(&scenario_dir).unwrap();
         std::fs::create_dir_all(&shared_mount).unwrap();
+        let context = ScenarioContext {
+            run_id: "run-1".to_string(),
+            seed: 325,
+            sandbox: sandbox.clone(),
+            scenario_dir,
+            client_controller_config: None,
+        };
         let clients = STALE_REMOUNT_WARM_WRITER_NAMES
             .iter()
             .copied()
@@ -9897,8 +9946,8 @@ mod tests {
         std::fs::create_dir_all(nested_path.parent().unwrap()).unwrap();
         std::fs::write(&nested_path, []).unwrap();
 
-        let err =
-            run_stale_remount_warm_history(Instant::now(), &clients, &isolation, 3).unwrap_err();
+        let err = run_stale_remount_warm_history(&context, Instant::now(), &clients, &isolation, 3)
+            .unwrap_err();
 
         assert!(
             err.to_string()
@@ -9953,9 +10002,11 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(
-            missing
-                .iter()
-                .any(|entry| entry == "client-b:seed/file.txt (expected 17 bytes, read 14 bytes)"),
+            missing.iter().any(|entry| {
+                entry.contains("client-b:seed/file.txt")
+                    && entry.contains("expected 17 bytes sha256=")
+                    && entry.contains("read 14 bytes sha256=")
+            }),
             "wrong peer payload must be reported in missing initial payloads, got {missing:?}"
         );
     }
