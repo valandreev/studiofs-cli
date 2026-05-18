@@ -3918,15 +3918,6 @@ impl PgMetaEngine {
     }
 
     fn restore_pending_state_from_local_log(&self) -> MetaResult<()> {
-        if !Self::has_any_local_overlay_mutation(&self.local)? {
-            let mut state = self
-                .pending_state
-                .lock()
-                .map_err(|_| MetaError::Storage("pg pending state lock poisoned".to_string()))?;
-            Self::clear_pending_state(&mut state);
-            return Ok(());
-        }
-
         let event_start = self.flushed_event_seq.load(Ordering::SeqCst);
         let event_end = self.local.get_counter("nextEventSeq")?;
         let mut state = self
@@ -3939,6 +3930,7 @@ impl PgMetaEngine {
         }
 
         let pending_events = self.local.read_events_range(event_start, event_end)?;
+        self.local.apply_replica_serving_state(&pending_events)?;
         let remote_visible_ops = Self::remote_visible_event_count(&pending_events);
         if remote_visible_ops == 0 {
             Self::clear_pending_state(&mut state);
@@ -9706,6 +9698,82 @@ mod tests {
         assert!(state.force_flush);
         assert_eq!(state.event_start, Some(start));
         assert_eq!(state.event_end, end);
+    }
+
+    #[test]
+    fn restore_pending_state_from_local_log_replays_unflushed_serving_state() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+        let file = pg
+            .create_file(ROOT_INO, b"lww-winner.txt", 0, 0, 0o644)
+            .expect("create file");
+        let setup_start = pg.flushed_event_seq.load(Ordering::SeqCst);
+        let setup_end = pg.local.get_counter("nextEventSeq").expect("setup end");
+        let setup_events = pg
+            .local
+            .read_events_range(setup_start, setup_end)
+            .expect("read setup events");
+        pg.local
+            .apply_replica_events_to_base(&setup_events)
+            .expect("publish setup to local base");
+        pg.persist_flushed_event_seq(setup_end)
+            .expect("mark setup flushed");
+
+        let mut remote_empty = pg.get_attr(file.ino).expect("remote empty attr");
+        remote_empty.size = 0;
+        remote_empty.committed_size = 0;
+        remote_empty.content_epoch = 2;
+        remote_empty.committed_content_epoch = 2;
+        remote_empty.upload_state = UploadState::Ready;
+        pg.local
+            .apply_replica_events_to_base(&[MetaEvent::SetAttr {
+                attr: remote_empty.clone(),
+            }])
+            .expect("apply empty remote base attr");
+        pg.local
+            .apply_replica_serving_state(&[MetaEvent::SetAttr {
+                attr: remote_empty.clone(),
+            }])
+            .expect("apply empty remote serving attr");
+
+        let winner_payload = PayloadRef::new_partial(150_003, 271);
+        pg.stage_payload_slice(file.ino, 0, &winner_payload)
+            .expect("stage local winner payload");
+        let mut local_winner = remote_empty.clone();
+        local_winner.size = 271;
+        local_winner.content_epoch = 3;
+        local_winner.committed_content_epoch = 2;
+        local_winner.upload_state = UploadState::Updating;
+        pg.set_attr(&local_winner).expect("set local winner attr");
+        assert_eq!(pg.get_attr(file.ino).expect("winner visible").size, 271);
+
+        let mut reconcile = HashSet::new();
+        reconcile.insert(file.ino);
+        pg.local
+            .reconcile_regular_file_serving_from_base(&reconcile)
+            .expect("simulate startup remote reconcile over serving state");
+        assert_eq!(
+            pg.get_attr(file.ino).expect("remote attr visible").size,
+            0,
+            "remote catch-up can leave serving state stale before pending replay"
+        );
+
+        pg.restore_pending_state_from_local_log()
+            .expect("restore pending local log");
+        let restored = pg.get_attr(file.ino).expect("restored winner attr");
+        assert_eq!(restored.size, local_winner.size);
+        assert_eq!(restored.content_epoch, local_winner.content_epoch);
+        let spans = pg
+            .lookup_regular_file_slices(file.ino, 0, local_winner.size)
+            .expect("restored winner slices");
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.payload.as_ref().is_some_and(|payload| {
+                    payload.object_id == winner_payload.object_id
+                        && payload.length == winner_payload.length
+                })),
+            "pending log replay must restore the unflushed local payload overlay"
+        );
     }
 
     #[test]
