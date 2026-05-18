@@ -17,6 +17,8 @@ use studiofs_meta::{
 use tracing::info;
 use uuid::Uuid;
 
+const INITIAL_METADATA_STATE_VERSION: i64 = 0;
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 #[cfg(unix)]
@@ -435,10 +437,10 @@ fn seed_pg_metadata_state(
             .execute(
                 r#"
                 INSERT INTO metadata_state (vol, version, snapshot)
-                VALUES ($1, 1, $2)
+                VALUES ($1, $2, $3)
                 ON CONFLICT (vol) DO NOTHING
                 "#,
-                &[&volume_id, &snapshot_json],
+                &[&volume_id, &INITIAL_METADATA_STATE_VERSION, &snapshot_json],
             )
             .await
             .map_err(|e| anyhow::anyhow!("failed to seed metadata_state: {e}"))?;
@@ -648,5 +650,13 @@ mod tests {
             Err(err) => err,
         };
         assert_eq!(err.kind(), ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn init_seeds_empty_pg_head_at_zero() {
+        assert_eq!(
+            INITIAL_METADATA_STATE_VERSION, 0,
+            "init publishes a snapshot before any event_log batch exists, so the initial PG head must not advertise a missing batch"
+        );
     }
 }
