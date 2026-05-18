@@ -1,11 +1,13 @@
 use super::{
-    ATTR_CACHE_TTL, AccessLevel, Arc, ChunkId, DEFAULT_CHUNK_SIZE, DirAccessEntry, DirEntry,
-    FileSessionOperation, FileType, Ino, InodeAttr, InodeIncarnationState, Instant,
-    LocalSyncPolicy, MetaError, NamespacePathStyle, PendingIncarnation, ResolvedSliceSource,
-    SetattrArgs, SliceId, SliceOrder, SliceRange, SliceRecord, StudioVfs, UnlinkTarget, VfsError,
-    VfsMeta, VfsResult, VfsState, VfsUploadState, block_index_from_offset, chunk_id_from_offset,
-    chunk_start_offset, debug, info, offset_within_block, validate_name, warn,
+    ATTR_CACHE_TTL, AccessLevel, Arc, ChunkId, DEFAULT_CHUNK_SIZE, DentryCacheValue,
+    DirAccessEntry, DirEntry, FileSessionOperation, FileType, Ino, InodeAttr,
+    InodeIncarnationState, Instant, LocalSyncPolicy, MetaError, NamespacePathStyle,
+    PendingIncarnation, ResolvedSliceSource, SetattrArgs, SliceId, SliceOrder, SliceRange,
+    SliceRecord, StudioVfs, UnlinkTarget, VfsError, VfsMeta, VfsResult, VfsState, VfsUploadState,
+    block_index_from_offset, chunk_id_from_offset, chunk_start_offset, debug, info,
+    offset_within_block, validate_name, warn,
 };
+use std::collections::HashMap;
 use studiofs_meta::schema::PayloadRefState;
 
 struct TruncateMutation {
@@ -821,12 +823,52 @@ impl StudioVfs {
             return Ok(Vec::new());
         }
 
-        let mut entries = self.sync_meta().readdir(ino)?;
+        let meta = self.sync_meta();
+        let mut entries = meta.readdir(ino)?;
         if ino == super::ROOT_INO {
             entries.retain(|entry| {
                 !super::is_blocked_root_macos_metadata(&entry.name)
                     && !super::is_probable_trash_component(&entry.name)
             });
+        }
+
+        if !entries.is_empty() {
+            let child_inos = entries.iter().map(|entry| entry.ino).collect::<Vec<_>>();
+            let attrs = meta.get_attrs_batch(&child_inos)?;
+            let attrs_by_ino = attrs
+                .into_iter()
+                .map(|attr| (attr.ino, attr))
+                .collect::<HashMap<_, _>>();
+            let now = Instant::now();
+            let mut attr_cache = self.state.namespace.attr_read_cache.lock();
+            entries.retain(|entry| {
+                if let Some(attr) = attrs_by_ino.get(&entry.ino) {
+                    attr_cache.put(entry.ino, attr.clone(), ATTR_CACHE_TTL, now);
+                    true
+                } else {
+                    attr_cache.remove(entry.ino);
+                    false
+                }
+            });
+            drop(attr_cache);
+
+            let mut needs_generation_bump = false;
+            for entry in &entries {
+                match self.dentry_cache_lookup(ino, &entry.name) {
+                    Some(DentryCacheValue::Positive(cached_ino)) if cached_ino == entry.ino => {}
+                    Some(_) => {
+                        needs_generation_bump = true;
+                        break;
+                    }
+                    None => {}
+                }
+            }
+            if needs_generation_bump {
+                self.bump_directory_generation(ino);
+            }
+            for entry in &entries {
+                self.dentry_cache_insert_positive(ino, &entry.name, entry.ino);
+            }
         }
 
         let mut cache_updates: Vec<(Ino, AccessLevel)> = Vec::with_capacity(entries.len());

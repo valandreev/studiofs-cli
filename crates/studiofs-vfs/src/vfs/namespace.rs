@@ -1515,6 +1515,83 @@ mod tests {
     }
 
     #[test]
+    fn readdir_filters_dangling_dentry_even_when_attr_cache_is_stale() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (_rt, vfs, meta) = make_test_vfs(&tmp, "readdir-stale-attr-dangling-dentry");
+        let created = vfs
+            .create(ROOT_INO, b"dangling-cached.txt", 1000, 1000, 0o644)
+            .expect("create file");
+        vfs.getattr(created.ino).expect("prime attr cache");
+        assert!(
+            vfs.state
+                .namespace
+                .attr_read_cache
+                .lock()
+                .contains(created.ino),
+            "test setup should prime the attr cache"
+        );
+
+        meta.remove_attr(created.ino)
+            .expect("remove attr while leaving dentry behind");
+
+        let entries = vfs.readdir(ROOT_INO).expect("readdir root");
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| entry.name.as_slice() == b"dangling-cached.txt"),
+            "readdir must not expose a dentry whose inode attr is missing"
+        );
+        assert!(
+            !vfs.state
+                .namespace
+                .attr_read_cache
+                .lock()
+                .contains(created.ino),
+            "readdir should evict stale attr cache entries for dangling dentries"
+        );
+    }
+
+    #[test]
+    fn readdir_invalidates_stale_negative_path_shortcut_for_observed_child() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (_rt, vfs, meta) = make_test_vfs(&tmp, "readdir-stale-negative-path-shortcut");
+        let dir = vfs
+            .mkdir(ROOT_INO, b"observer", 1000, 1000, 0o755)
+            .expect("mkdir observer");
+        let resolver = vfs.namespace_resolver(NamespacePathStyle::Windows);
+
+        assert!(
+            resolver
+                .resolve_path(r"\observer\rename-source.txt")
+                .is_err(),
+            "initial miss should seed negative dentry and path-shortcut caches"
+        );
+        assert_eq!(
+            vfs.dentry_cache_lookup(dir.ino, b"rename-source.txt"),
+            Some(DentryCacheValue::Negative)
+        );
+
+        let created = meta
+            .create_file(dir.ino, b"rename-source.txt", 1000, 1000, 0o644)
+            .expect("simulate remotely projected file");
+        let before_generation = vfs.directory_generation(dir.ino);
+        let entries = vfs.readdir(dir.ino).expect("readdir observer dir");
+        assert!(
+            entries.iter().any(|entry| entry.ino == created.ino),
+            "readdir should observe the remotely projected child"
+        );
+        assert!(
+            vfs.directory_generation(dir.ino) > before_generation,
+            "observing a child over a stale negative dentry should invalidate parent generation"
+        );
+
+        let resolved = resolver
+            .resolve_path(r"\observer\rename-source.txt")
+            .expect("readdir should invalidate stale negative full-path cache");
+        assert_eq!(resolved.ino, created.ino);
+    }
+
+    #[test]
     fn remote_upload_placeholder_visibility_is_disabled_before_first_publish() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let (_rt, vfs, _meta) = make_test_vfs(&tmp, "remote-upload-placeholder-visibility");
