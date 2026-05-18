@@ -154,15 +154,18 @@ impl StudioVfs {
         )
     }
 
-    async fn wait_for_deferred_materialization_inflight(&self, ino: Ino) {
-        let task_lock = {
-            self.state
-                .deferred_materialize_inflight
-                .lock()
-                .get(&ino)
-                .cloned()
-        };
-        if let Some(task_lock) = task_lock {
+    pub(super) async fn wait_for_deferred_materialization_inflight(&self, ino: Ino) {
+        loop {
+            let task_lock = {
+                self.state
+                    .deferred_materialize_inflight
+                    .lock()
+                    .get(&ino)
+                    .cloned()
+            };
+            let Some(task_lock) = task_lock else {
+                return;
+            };
             let _guard = task_lock.lock().await;
         }
     }
@@ -296,7 +299,7 @@ impl StudioVfs {
             return;
         }
 
-        let task_lock = {
+        let (task_lock, guard) = {
             let mut inflight = self.state.deferred_materialize_inflight.lock();
             match inflight.entry(ino) {
                 std::collections::hash_map::Entry::Occupied(_) => {
@@ -323,8 +326,12 @@ impl StudioVfs {
                 }
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     let task_lock = Arc::new(tokio::sync::Mutex::new(()));
+                    let guard = task_lock
+                        .clone()
+                        .try_lock_owned()
+                        .expect("new deferred materialization task lock should be uncontended");
                     entry.insert(Arc::clone(&task_lock));
-                    task_lock
+                    (task_lock, guard)
                 }
             }
         };
@@ -341,18 +348,15 @@ impl StudioVfs {
             }),
         );
         // #endregion debug log
-        self.start_deferred_materialization_task(ino, task_lock);
+        self.start_deferred_materialization_task(ino, task_lock, guard);
     }
 
     fn start_deferred_materialization_task(
         self: &Arc<Self>,
         ino: Ino,
         task_lock: Arc<tokio::sync::Mutex<()>>,
+        guard: tokio::sync::OwnedMutexGuard<()>,
     ) {
-        let guard = task_lock
-            .clone()
-            .try_lock_owned()
-            .expect("new deferred materialization task lock should be uncontended");
         let vfs = Arc::clone(self);
         self.track_background_task(tokio::spawn(async move {
             let mut allow_reschedule_on_exit = true;
@@ -496,8 +500,8 @@ impl StudioVfs {
                 tokio::task::yield_now().await;
             }
 
+            vfs.finish_deferred_materialization_task(ino, task_lock, allow_reschedule_on_exit);
             drop(guard);
-            vfs.finish_deferred_materialization_task(ino, allow_reschedule_on_exit);
         }));
     }
 
@@ -508,32 +512,45 @@ impl StudioVfs {
     pub(super) fn finish_deferred_materialization_task(
         self: &Arc<Self>,
         ino: Ino,
+        task_lock: Arc<tokio::sync::Mutex<()>>,
         allow_reschedule: bool,
     ) {
-        self.state.deferred_materialize_inflight.lock().remove(&ino);
         let reschedule_needed = self
             .state
             .deferred_materialize_reschedule_needed
             .lock()
             .remove(&ino);
-        if !allow_reschedule || !reschedule_needed || self.shutdown_requested() {
-            return;
-        }
-        if self.state.writer_stack.dirty_bytes_for_inode(ino) == 0 {
-            return;
-        }
-        let task_lock = {
+        let should_reschedule = allow_reschedule
+            && reschedule_needed
+            && !self.shutdown_requested()
+            && self.state.writer_stack.dirty_bytes_for_inode(ino) > 0;
+        let next_task = if should_reschedule {
+            let next_task_lock = Arc::new(tokio::sync::Mutex::new(()));
+            let next_guard = next_task_lock
+                .clone()
+                .try_lock_owned()
+                .expect("new deferred materialization task lock should be uncontended");
+            Some((next_task_lock, next_guard))
+        } else {
+            None
+        };
+        {
             let mut inflight = self.state.deferred_materialize_inflight.lock();
-            match inflight.entry(ino) {
-                std::collections::hash_map::Entry::Occupied(_) => return,
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    let task_lock = Arc::new(tokio::sync::Mutex::new(()));
-                    entry.insert(Arc::clone(&task_lock));
-                    task_lock
+            if inflight
+                .get(&ino)
+                .is_some_and(|current| Arc::ptr_eq(current, &task_lock))
+            {
+                if let Some((next_task_lock, _)) = &next_task {
+                    inflight.insert(ino, Arc::clone(next_task_lock));
+                } else {
+                    inflight.remove(&ino);
                 }
             }
+        }
+        let Some((next_task_lock, next_guard)) = next_task else {
+            return;
         };
-        self.start_deferred_materialization_task(ino, task_lock);
+        self.start_deferred_materialization_task(ino, next_task_lock, next_guard);
     }
 
     /// Release a file handle.
@@ -837,6 +854,20 @@ impl StudioVfs {
             self.maybe_payload_store_sync_data_async(
                 materialized_writer_stack_bytes.saturating_add(persisted_slice_bytes_before_flush)
                     as u64,
+                local_sync_policy,
+            )
+            .await?;
+        }
+        if local_sync_policy.requires_write_path_durability()
+            && (self.state.writer_stack.has_dirty_writers(ino)
+                || self.inode_has_local_dirty_state(ino))
+        {
+            materialized_writer_stack_bytes = materialized_writer_stack_bytes.saturating_add(
+                self.flush_local_dirty_state_until_quiescent(ino, local_sync_policy)
+                    .await?,
+            );
+            self.maybe_payload_store_sync_data_async(
+                materialized_writer_stack_bytes as u64,
                 local_sync_policy,
             )
             .await?;

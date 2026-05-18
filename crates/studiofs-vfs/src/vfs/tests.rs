@@ -8191,7 +8191,7 @@ fn deferred_materialization_reschedules_write_that_arrives_while_inflight_finish
         vfs.state
             .deferred_materialize_inflight
             .lock()
-            .insert(ino, task_lock);
+            .insert(ino, Arc::clone(&task_lock));
 
         let payload = vec![0xD4; vfs.block_size as usize];
         vfs.write_fh_with_deferred_materialize(
@@ -8212,7 +8212,7 @@ fn deferred_materialization_reschedules_write_that_arrives_while_inflight_finish
             "write should remain buffered until the finishing materializer reschedules"
         );
 
-        vfs.finish_deferred_materialization_task(ino, true);
+        vfs.finish_deferred_materialization_task(ino, task_lock, true);
 
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -8365,6 +8365,57 @@ fn deferred_release_barrier_replaces_older_inflight_marker() {
                 .contains_key(&ino),
             "dropping the current barrier guard must remove its marker"
         );
+    });
+}
+
+#[test]
+fn deferred_materialization_wait_tracks_rescheduled_marker() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "materialize-wait-reschedule");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"materialize-wait-reschedule.bin", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+
+        let older = Arc::new(tokio::sync::Mutex::new(()));
+        let older_guard = older.clone().lock_owned().await;
+        vfs.state
+            .deferred_materialize_inflight
+            .lock()
+            .insert(ino, older);
+
+        let waiting_vfs = Arc::clone(&vfs);
+        let wait = tokio::spawn(async move {
+            waiting_vfs
+                .wait_for_deferred_materialization_inflight(ino)
+                .await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !wait.is_finished(),
+            "strict barriers must wait for the current materialization task"
+        );
+
+        let newer = Arc::new(tokio::sync::Mutex::new(()));
+        let newer_guard = newer.clone().lock_owned().await;
+        vfs.state
+            .deferred_materialize_inflight
+            .lock()
+            .insert(ino, newer);
+        drop(older_guard);
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !wait.is_finished(),
+            "strict barriers must continue waiting when materialization reschedules another task"
+        );
+
+        drop(newer_guard);
+        vfs.state.deferred_materialize_inflight.lock().remove(&ino);
+        wait.await.expect("wait task should not panic");
     });
 }
 
