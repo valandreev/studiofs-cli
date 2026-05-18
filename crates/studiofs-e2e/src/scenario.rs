@@ -7358,6 +7358,7 @@ fn run_sparse_range_operations(
         )?,
     )?;
     wait_for_sparse_expected_until(SparseExpectedWait {
+        context,
         clients,
         sparse_path: &sparse_path,
         logical_size: initial_logical_size,
@@ -7394,6 +7395,7 @@ fn run_sparse_range_operations(
         )?,
     )?;
     wait_for_sparse_expected_until(SparseExpectedWait {
+        context,
         clients,
         sparse_path: &sparse_path,
         logical_size: shrunk_logical_size,
@@ -7455,6 +7457,7 @@ fn run_sparse_range_operations(
     )?;
 
     let (read_probes, zero_filled_holes) = wait_for_sparse_expected_until(SparseExpectedWait {
+        context,
         clients,
         sparse_path: &sparse_path,
         logical_size: final_logical_size,
@@ -7503,6 +7506,7 @@ fn run_sparse_range_operations(
 }
 
 struct SparseExpectedWait<'a> {
+    context: &'a ScenarioContext,
     clients: &'a [ClientSpec],
     sparse_path: &'a str,
     logical_size: u64,
@@ -7516,7 +7520,9 @@ struct SparseExpectedWait<'a> {
 fn wait_for_sparse_expected_until(
     wait: SparseExpectedWait<'_>,
 ) -> Result<(Vec<SparseReadProbe>, Vec<SparseHoleProbe>), ScenarioError> {
+    let wait_started = Instant::now();
     let SparseExpectedWait {
+        context,
         clients,
         sparse_path,
         logical_size,
@@ -7540,11 +7546,33 @@ fn wait_for_sparse_expected_until(
 
         let now = Instant::now();
         if now >= deadline {
+            let artifact = write_sparse_timeout_diagnostics(
+                context,
+                SparseTimeoutDiagnosticsInput {
+                    label,
+                    sparse_path,
+                    logical_size,
+                    expected_ranges,
+                    hole_specs,
+                    poll_interval,
+                    elapsed: wait_started.elapsed(),
+                    observation: &observation,
+                },
+            );
+            let artifact_note = match artifact {
+                Ok(artifact) => format!(
+                    "; diagnostics: artifacts/scenarios/{}/{}",
+                    AdvancedMountedKind::SparseRange.name(),
+                    artifact
+                ),
+                Err(error) => format!("; diagnostics write failed: {error}"),
+            };
             return Err(ScenarioError::Io(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!(
-                    "{label} did not become visible before timeout; missing: {}",
-                    observation.missing.join(", ")
+                    "{label} did not become visible before timeout; missing: {}{}",
+                    observation.missing.join(", "),
+                    artifact_note
                 ),
             )));
         }
@@ -7552,10 +7580,110 @@ fn wait_for_sparse_expected_until(
     }
 }
 
+#[derive(Debug, Serialize)]
+struct SparseTimeoutDiagnostics {
+    schema_version: u32,
+    run_id: String,
+    scenario: String,
+    label: String,
+    sparse_path: String,
+    logical_size: u64,
+    elapsed_ms: u64,
+    poll_interval_ms: u64,
+    missing: Vec<String>,
+    expected_ranges: Vec<SparseTimeoutRangeSpec>,
+    expected_holes: Vec<SparseTimeoutHoleSpec>,
+    environment: Vec<SparseEnvironmentValue>,
+    clients: Vec<SparseClientObservation>,
+}
+
+#[derive(Debug, Serialize)]
+struct SparseTimeoutRangeSpec {
+    label: String,
+    offset: u64,
+    len: usize,
+    expected_checksum_sha256: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SparseTimeoutHoleSpec {
+    offset: u64,
+    len: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct SparseEnvironmentValue {
+    name: &'static str,
+    value: Option<String>,
+}
+
+struct SparseTimeoutDiagnosticsInput<'a> {
+    label: &'a str,
+    sparse_path: &'a str,
+    logical_size: u64,
+    expected_ranges: &'a [SparseRangeSpec],
+    hole_specs: &'a [SparseHoleSpec],
+    poll_interval: Duration,
+    elapsed: Duration,
+    observation: &'a SparseObservation,
+}
+
 struct SparseObservation {
     read_probes: Vec<SparseReadProbe>,
     zero_filled_holes: Vec<SparseHoleProbe>,
     missing: Vec<String>,
+    clients: Vec<SparseClientObservation>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SparseClientObservation {
+    client: String,
+    mount_point: String,
+    path: String,
+    parent_visible: bool,
+    metadata: SparseMetadataObservation,
+    open: SparseOpenObservation,
+    ranges: Vec<SparseRangeObservation>,
+    holes: Vec<SparseHoleObservation>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SparseMetadataObservation {
+    ok: bool,
+    len: Option<u64>,
+    is_file: Option<bool>,
+    error: Option<SparseIoErrorObservation>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SparseOpenObservation {
+    ok: bool,
+    error: Option<SparseIoErrorObservation>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SparseRangeObservation {
+    label: String,
+    offset: u64,
+    len: usize,
+    expected_checksum_sha256: String,
+    actual_checksum_sha256: Option<String>,
+    matched: Option<bool>,
+    error: Option<SparseIoErrorObservation>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SparseHoleObservation {
+    offset: u64,
+    len: usize,
+    all_zero: Option<bool>,
+    error: Option<SparseIoErrorObservation>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SparseIoErrorObservation {
+    kind: String,
+    message: String,
 }
 
 fn observe_sparse_ranges(
@@ -7568,27 +7696,74 @@ fn observe_sparse_ranges(
     let mut read_probes = Vec::new();
     let mut hole_results = Vec::new();
     let mut missing = Vec::new();
+    let mut client_observations = Vec::new();
 
     for client in clients {
         let path = client.mount_point.join(sparse_path);
         refresh_relative_path_ancestors(&client.mount_point, sparse_path);
+        let mut client_observation = SparseClientObservation {
+            client: client.name.clone(),
+            mount_point: client.mount_point.display().to_string(),
+            path: path.display().to_string(),
+            parent_visible: refresh_relative_path_parent_contains_child(
+                &client.mount_point,
+                sparse_path,
+            ),
+            metadata: SparseMetadataObservation {
+                ok: false,
+                len: None,
+                is_file: None,
+                error: None,
+            },
+            open: SparseOpenObservation {
+                ok: false,
+                error: None,
+            },
+            ranges: Vec::new(),
+            holes: Vec::new(),
+        };
         match fs::metadata(&path) {
-            Ok(metadata) if metadata.len() == logical_size => {}
-            Ok(metadata) => missing.push(format!(
-                "{}:{sparse_path} logical size expected {logical_size}, got {}",
-                client.name,
-                metadata.len()
-            )),
+            Ok(metadata) if metadata.len() == logical_size => {
+                client_observation.metadata = SparseMetadataObservation {
+                    ok: true,
+                    len: Some(metadata.len()),
+                    is_file: Some(metadata.is_file()),
+                    error: None,
+                };
+            }
+            Ok(metadata) => {
+                client_observation.metadata = SparseMetadataObservation {
+                    ok: true,
+                    len: Some(metadata.len()),
+                    is_file: Some(metadata.is_file()),
+                    error: None,
+                };
+                missing.push(format!(
+                    "{}:{sparse_path} logical size expected {logical_size}, got {}",
+                    client.name,
+                    metadata.len()
+                ));
+            }
             Err(error) => {
+                client_observation.metadata.error = Some(sparse_io_error_observation(&error));
                 missing.push(format!("{}:{sparse_path} ({error})", client.name));
+                client_observations.push(client_observation);
                 continue;
             }
         }
 
         let mut file = match fs::File::open(&path) {
-            Ok(file) => file,
+            Ok(file) => {
+                client_observation.open = SparseOpenObservation {
+                    ok: true,
+                    error: None,
+                };
+                file
+            }
             Err(error) => {
+                client_observation.open.error = Some(sparse_io_error_observation(&error));
                 missing.push(format!("{}:{sparse_path} ({error})", client.name));
+                client_observations.push(client_observation);
                 continue;
             }
         };
@@ -7596,28 +7771,47 @@ fn observe_sparse_ranges(
         for range in expected_ranges {
             match read_exact_range_from(&mut file, range.offset, range.payload.len()) {
                 Ok(bytes) => {
+                    let expected_checksum = bytes_sha256(&range.payload);
+                    let actual_checksum = bytes_sha256(&bytes);
                     let matched = bytes.as_slice() == range.payload.as_slice();
                     if !matched {
                         missing.push(format!(
                             "{}:{sparse_path}@{} expected {}, got {}",
-                            client.name,
-                            range.offset,
-                            bytes_sha256(&range.payload),
-                            bytes_sha256(&bytes)
+                            client.name, range.offset, expected_checksum, actual_checksum
                         ));
                     }
+                    client_observation.ranges.push(SparseRangeObservation {
+                        label: range.label.to_string(),
+                        offset: range.offset,
+                        len: range.payload.len(),
+                        expected_checksum_sha256: expected_checksum,
+                        actual_checksum_sha256: Some(actual_checksum.clone()),
+                        matched: Some(matched),
+                        error: None,
+                    });
                     read_probes.push(SparseReadProbe {
                         client: client.name.clone(),
                         offset: range.offset,
                         len: range.payload.len(),
-                        actual_checksum_sha256: bytes_sha256(&bytes),
+                        actual_checksum_sha256: actual_checksum,
                         matched,
                     });
                 }
-                Err(error) => missing.push(format!(
-                    "{}:{sparse_path}@{} ({error})",
-                    client.name, range.offset
-                )),
+                Err(error) => {
+                    client_observation.ranges.push(SparseRangeObservation {
+                        label: range.label.to_string(),
+                        offset: range.offset,
+                        len: range.payload.len(),
+                        expected_checksum_sha256: bytes_sha256(&range.payload),
+                        actual_checksum_sha256: None,
+                        matched: None,
+                        error: Some(sparse_io_error_observation(&error)),
+                    });
+                    missing.push(format!(
+                        "{}:{sparse_path}@{} ({error})",
+                        client.name, range.offset
+                    ));
+                }
             }
         }
 
@@ -7631,6 +7825,12 @@ fn observe_sparse_ranges(
                             client.name, hole.offset
                         ));
                     }
+                    client_observation.holes.push(SparseHoleObservation {
+                        offset: hole.offset,
+                        len: hole.len,
+                        all_zero: Some(all_zero),
+                        error: None,
+                    });
                     hole_results.push(SparseHoleProbe {
                         client: client.name.clone(),
                         offset: hole.offset,
@@ -7638,19 +7838,149 @@ fn observe_sparse_ranges(
                         all_zero,
                     });
                 }
-                Err(error) => missing.push(format!(
-                    "{}:{sparse_path}@{} ({error})",
-                    client.name, hole.offset
-                )),
+                Err(error) => {
+                    client_observation.holes.push(SparseHoleObservation {
+                        offset: hole.offset,
+                        len: hole.len,
+                        all_zero: None,
+                        error: Some(sparse_io_error_observation(&error)),
+                    });
+                    missing.push(format!(
+                        "{}:{sparse_path}@{} ({error})",
+                        client.name, hole.offset
+                    ));
+                }
             }
         }
+        client_observations.push(client_observation);
     }
 
     SparseObservation {
         read_probes,
         zero_filled_holes: hole_results,
         missing,
+        clients: client_observations,
     }
+}
+
+fn write_sparse_timeout_diagnostics(
+    context: &ScenarioContext,
+    input: SparseTimeoutDiagnosticsInput<'_>,
+) -> Result<String, ScenarioError> {
+    let artifact = sparse_timeout_diagnostics_file_name(input.label);
+    let diagnostics = SparseTimeoutDiagnostics {
+        schema_version: 1,
+        run_id: context.run_id.clone(),
+        scenario: AdvancedMountedKind::SparseRange.name().to_string(),
+        label: input.label.to_string(),
+        sparse_path: input.sparse_path.to_string(),
+        logical_size: input.logical_size,
+        elapsed_ms: duration_millis_u64(input.elapsed),
+        poll_interval_ms: duration_millis_u64(input.poll_interval),
+        missing: input.observation.missing.clone(),
+        expected_ranges: input
+            .expected_ranges
+            .iter()
+            .map(|range| SparseTimeoutRangeSpec {
+                label: range.label.to_string(),
+                offset: range.offset,
+                len: range.payload.len(),
+                expected_checksum_sha256: bytes_sha256(&range.payload),
+            })
+            .collect(),
+        expected_holes: input
+            .hole_specs
+            .iter()
+            .map(|hole| SparseTimeoutHoleSpec {
+                offset: hole.offset,
+                len: hole.len,
+            })
+            .collect(),
+        environment: sparse_timeout_environment(),
+        clients: input.observation.clients.clone(),
+    };
+    fs::write(
+        context.scenario_dir.join(&artifact),
+        serde_json::to_vec_pretty(&diagnostics)?,
+    )?;
+    append_sparse_timeout_diagnostics_event(context, input.label, &artifact, &diagnostics)?;
+    Ok(artifact)
+}
+
+fn append_sparse_timeout_diagnostics_event(
+    context: &ScenarioContext,
+    label: &str,
+    artifact: &str,
+    diagnostics: &SparseTimeoutDiagnostics,
+) -> Result<(), ScenarioError> {
+    let mut log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(context.scenario_dir.join("operations.ndjson"))?;
+    serde_json::to_writer(
+        &mut log,
+        &json!({
+            "run_id": context.run_id,
+            "scenario": AdvancedMountedKind::SparseRange.name(),
+            "operation": "sparse_timeout_diagnostics",
+            "label": label,
+            "path": diagnostics.sparse_path,
+            "logical_size": diagnostics.logical_size,
+            "artifact": format!(
+                "artifacts/scenarios/{}/{}",
+                AdvancedMountedKind::SparseRange.name(),
+                artifact
+            ),
+            "missing": diagnostics.missing,
+            "clients": diagnostics.clients,
+        }),
+    )?;
+    log.write_all(b"\n")?;
+    Ok(())
+}
+
+fn sparse_timeout_diagnostics_file_name(label: &str) -> String {
+    let slug = label
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    format!("sparse-{slug}-timeout-diagnostics.json")
+}
+
+fn sparse_timeout_environment() -> Vec<SparseEnvironmentValue> {
+    [
+        "STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS",
+        "STUDIOFS_PG_SYNC_POLL_SECS",
+        "STUDIOFS_E2E_DISABLE_METADATA_BACKGROUND_POLL",
+    ]
+    .into_iter()
+    .map(|name| SparseEnvironmentValue {
+        name,
+        value: std::env::var(name).ok(),
+    })
+    .collect()
+}
+
+fn sparse_io_error_observation(error: &io::Error) -> SparseIoErrorObservation {
+    SparseIoErrorObservation {
+        kind: format!("{:?}", error.kind()),
+        message: error.to_string(),
+    }
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    let millis = duration.as_millis();
+    millis.min(u128::from(u64::MAX)) as u64
 }
 
 fn write_sparse_file_range(
@@ -8613,6 +8943,77 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn sparse_wait_timeout_writes_diagnostics_artifacts() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(MOUNTED_SPARSE_FILE_RANGE_CONVERGENCE);
+        std::fs::create_dir_all(&scenario_dir).unwrap();
+        let clients = ["client-a", "client-b"]
+            .into_iter()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(&mount).unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let context = ScenarioContext {
+            run_id: "run-sparse-diagnostics".to_string(),
+            seed: 377,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+        let expected_ranges = [SparseRangeSpec {
+            label: "prefix",
+            offset: 0,
+            payload: b"expected".to_vec(),
+        }];
+        let hole_specs: [SparseHoleSpec; 0] = [];
+
+        let error = wait_for_sparse_expected_until(SparseExpectedWait {
+            context: &context,
+            clients: &clients,
+            sparse_path: "sparse/shared.bin",
+            logical_size: 64,
+            expected_ranges: &expected_ranges,
+            hole_specs: &hole_specs,
+            deadline: Instant::now(),
+            poll_interval: Duration::from_millis(1),
+            label: "initial sparse ranges",
+        })
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains(
+                "diagnostics: artifacts/scenarios/mounted-sparse-file-range-convergence/sparse-initial-sparse-ranges-timeout-diagnostics.json"
+            ),
+            "{error}"
+        );
+        let diagnostics_path = context
+            .scenario_dir
+            .join("sparse-initial-sparse-ranges-timeout-diagnostics.json");
+        let diagnostics: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(diagnostics_path).unwrap()).unwrap();
+        assert_eq!(diagnostics["schema_version"], 1);
+        assert_eq!(diagnostics["run_id"], "run-sparse-diagnostics");
+        assert_eq!(diagnostics["label"], "initial sparse ranges");
+        assert_eq!(diagnostics["clients"].as_array().unwrap().len(), 2);
+        assert_eq!(diagnostics["clients"][0]["parent_visible"], false);
+        assert_eq!(
+            diagnostics["clients"][0]["metadata"]["error"]["kind"],
+            "NotFound"
+        );
+
+        let operations_log =
+            std::fs::read_to_string(context.scenario_dir.join("operations.ndjson")).unwrap();
+        assert!(operations_log.contains("sparse_timeout_diagnostics"));
+        assert!(operations_log.contains("sparse-initial-sparse-ranges-timeout-diagnostics.json"));
     }
 
     #[test]
