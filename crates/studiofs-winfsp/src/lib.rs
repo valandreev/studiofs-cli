@@ -592,7 +592,7 @@ where
             total_elapsed_ms = shutdown_started.elapsed().as_millis(),
             "WinFSP shutdown: failed to spawn host drop thread; exiting mount process"
         );
-        std::process::exit(0);
+        terminate_current_process(0);
     };
 
     match rx.recv_timeout(timeout) {
@@ -610,16 +610,38 @@ where
                 total_elapsed_ms = shutdown_started.elapsed().as_millis(),
                 "WinFSP shutdown: host drop timed out; exiting mount process"
             );
-            std::process::exit(0);
+            terminate_current_process(0);
         }
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
             tracing::warn!(
                 total_elapsed_ms = shutdown_started.elapsed().as_millis(),
                 "WinFSP shutdown: host drop thread ended before completion signal"
             );
-            std::process::exit(1);
+            terminate_current_process(1);
         }
     }
+}
+
+#[cfg(all(windows, not(test)))]
+fn terminate_current_process(exit_code: u32) -> ! {
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> *mut core::ffi::c_void;
+        fn TerminateProcess(hProcess: *mut core::ffi::c_void, uExitCode: u32) -> i32;
+    }
+
+    // SAFETY: `GetCurrentProcess` returns the documented pseudo-handle for this
+    // process. Passing it to `TerminateProcess` is the Windows-supported hard
+    // termination path and avoids `ExitProcess` DLL detach work that can wedge
+    // while WinFSP host teardown is already stuck.
+    unsafe {
+        TerminateProcess(GetCurrentProcess(), exit_code);
+    }
+    std::process::exit(exit_code as i32)
+}
+
+#[cfg(all(not(windows), not(test)))]
+fn terminate_current_process(exit_code: u32) -> ! {
+    std::process::exit(exit_code as i32)
 }
 
 #[cfg(not(test))]

@@ -334,14 +334,20 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             }
             Ok(outcome.exit_code)
         }
-        Commands::HotspotOp(args) => scenario::run_hotspot_op_helper(
-            &args.operation,
-            args.mount_point,
-            &args.path,
-            args.target.as_deref(),
-            args.payload.as_deref(),
-        )
-        .map(|()| 0),
+        Commands::HotspotOp(args) => {
+            scenario::run_hotspot_op_helper(
+                &args.operation,
+                args.mount_point,
+                &args.path,
+                args.target.as_deref(),
+                args.payload.as_deref(),
+            )?;
+            // This helper exists only to isolate one potentially blocking mounted
+            // filesystem call.  Once the call has returned successfully, exit
+            // without running any remaining process teardown that can wedge while
+            // WinFSP is under churn.
+            std::process::exit(0);
+        }
         Commands::LocalFirstBaselineGate(args) => {
             let outcome = baseline_gate::run(args.into_request())?;
             for run in &outcome.runs {

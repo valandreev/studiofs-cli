@@ -2900,12 +2900,15 @@ impl PgMetaEngine {
                 removed_inodes_with_local_regular_file_state.insert(*ino);
             }
         }
-        let protected_attr_merges =
-            self.protected_regular_file_attr_merges(batch_events, &protected_regular_file_inodes)?;
         let partial_publish_inodes = Self::partial_regular_file_publish_inodes(batch_events);
         let mut base_range_preserve_inodes = self
             .protected_base_range_preserve_inodes(batch_events, &protected_regular_file_inodes)?;
         base_range_preserve_inodes.extend(partial_publish_inodes.iter().copied());
+        let protected_attr_merges = self.protected_regular_file_attr_merges(
+            batch_events,
+            &protected_regular_file_inodes,
+            &base_range_preserve_inodes,
+        )?;
         self.local
             .apply_replica_events_to_base_preserving_protected_base_ranges(
                 batch_events,
@@ -2914,6 +2917,21 @@ impl PgMetaEngine {
         let serving_events: Vec<MetaEvent> = batch_events
             .iter()
             .filter(|event| {
+                if let MetaEvent::SetAttr { attr } = event
+                    && attr.kind == FileType::RegularFile
+                    && protected_regular_file_inodes.contains(&attr.ino)
+                    && !base_range_preserve_inodes.contains(&attr.ino)
+                    && attr.upload_state == UploadState::Ready
+                    && attr.content_epoch == attr.committed_content_epoch
+                    && attr.size == attr.committed_size
+                    && Self::batch_publish_covers_committed_extent(
+                        batch_events,
+                        attr.ino,
+                        attr.committed_size,
+                    )
+                {
+                    return true;
+                }
                 matches!(
                     event,
                     MetaEvent::PublishRegularFileBaseSlices { ino, .. }
@@ -3112,6 +3130,7 @@ impl PgMetaEngine {
         &self,
         batch_events: &[MetaEvent],
         protected_regular_file_inodes: &HashSet<Ino>,
+        base_range_preserve_inodes: &HashSet<Ino>,
     ) -> MetaResult<Vec<MetaEvent>> {
         let mut merged = Vec::new();
         let payload_publish_inodes: HashSet<Ino> = batch_events
@@ -3145,15 +3164,18 @@ impl PgMetaEngine {
             if current.kind != FileType::RegularFile || current.upload_state != UploadState::Ready {
                 continue;
             }
-            if attr.upload_state == UploadState::Ready
+            let ready_complete_publish = attr.upload_state == UploadState::Ready
                 && attr.content_epoch == attr.committed_content_epoch
                 && attr.size == attr.committed_size
                 && Self::batch_publish_covers_committed_extent(
                     batch_events,
                     attr.ino,
                     attr.committed_size,
-                )
-            {
+                );
+            if ready_complete_publish {
+                if base_range_preserve_inodes.contains(&attr.ino) {
+                    merged.push(MetaEvent::SetAttr { attr: attr.clone() });
+                }
                 continue;
             }
             if attr.content_epoch > current.content_epoch
@@ -3374,8 +3396,22 @@ impl PgMetaEngine {
         let replay_start_version =
             Self::snapshot_replay_start_version(&snapshot, version, local_version);
         self.local.import_remote_snapshot(&snapshot)?;
+        self.reconcile_imported_snapshot_regular_files()?;
         self.persist_local_version(replay_start_version)?;
         Ok(true)
+    }
+
+    fn reconcile_imported_snapshot_regular_files(&self) -> MetaResult<()> {
+        let reconcile_inodes = self
+            .local
+            .list_inode_attrs()?
+            .into_iter()
+            .filter(|attr| attr.kind == FileType::RegularFile)
+            .map(|attr| attr.ino)
+            .collect::<HashSet<_>>();
+        let overlay = self.local_overlay_conflicts()?;
+        self.reconcile_regular_file_serving_from_base_with_overlay(&reconcile_inodes, &overlay)?;
+        Ok(())
     }
 
     fn remote_metadata_head_version(&self) -> MetaResult<i64> {
@@ -6904,6 +6940,11 @@ mod tests {
             vec![remote_head.object_id, remote_tail.object_id],
             "growing ready remote publish should replace, not splice into, a protected committed base graph"
         );
+        assert_eq!(
+            pg.get_attr(file.ino).expect("load applied attr").size,
+            remote_attr.size,
+            "serving attr must grow with the authoritative ready foreign publish"
+        );
     }
 
     #[test]
@@ -7046,6 +7087,65 @@ mod tests {
             object_ids,
             vec![local_head.object_id, remote_tail.object_id],
             "publish-only foreign batches are not authoritative enough to replace protected base ranges"
+        );
+    }
+
+    #[test]
+    fn ready_complete_publish_preserved_base_ranges_sets_remote_serving_size() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+
+        let file = pg
+            .create_file(ROOT_INO, b"protected-ready-preserved-size.txt", 0, 0, 0o644)
+            .expect("create file");
+        set_file_state(&pg, file.ino, 446, 4);
+        let local_payload = PayloadRef::new_partial(77_083, 446);
+        pg.stage_payload_slice(file.ino, 0, &local_payload)
+            .expect("stage local payload");
+        mark_overlay_objects_uploaded(&pg, file.ino, 4, &[local_payload.object_id]);
+        assert!(
+            pg.publish_regular_file_overlay_to_base_if_matches(file.ino, 4)
+                .expect("publish local payload"),
+            "local payload publish should succeed"
+        );
+
+        let overlay = pg.local_overlay_conflicts().expect("overlay conflicts");
+        let remote_full = PayloadRef::new_partial(77_084, 227);
+        let remote_publish = MetaEvent::PublishRegularFileBaseSlices {
+            ino: file.ino,
+            chunk_slices: vec![(
+                ChunkId(0),
+                vec![SliceRecord {
+                    slice_id: SliceId(0),
+                    order: SliceOrder(0),
+                    range: SliceRange::new(0, 227).expect("remote full range"),
+                    payload: Some(remote_full),
+                    payload_state: PayloadRefState::Published,
+                }],
+            )],
+        };
+        let mut ready_attr = pg.get_attr(file.ino).expect("load current attr");
+        ready_attr.size = 227;
+        ready_attr.committed_size = 227;
+        ready_attr.content_epoch = 4;
+        ready_attr.committed_content_epoch = 4;
+        ready_attr.upload_state = UploadState::Ready;
+
+        pg.apply_foreign_batch(
+            &[
+                remote_publish,
+                MetaEvent::SetAttr {
+                    attr: ready_attr.clone(),
+                },
+            ],
+            &overlay,
+            &HashSet::from([file.ino]),
+        )
+        .expect("apply ready foreign publish");
+
+        let served = pg.get_attr(file.ino).expect("load served attr");
+        assert_eq!(
+            served.size, ready_attr.size,
+            "full Ready foreign publish must set remote serving size even when protected base ranges are preserved"
         );
     }
 
@@ -7494,6 +7594,53 @@ mod tests {
                 .expect("load applied version"),
             9,
             "remote replay cursor must remain part of the imported data snapshot"
+        );
+    }
+
+    #[test]
+    fn snapshot_reconcile_resets_stale_regular_file_serving_attr() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+        let file = pg
+            .create_file(ROOT_INO, b"snapshot-stale-serving.txt", 0, 0, 0o644)
+            .expect("create file");
+        set_file_state(&pg, file.ino, 227, 1);
+        let local_payload = PayloadRef::new_partial(91_001, 227);
+        pg.stage_payload_slice(file.ino, 0, &local_payload)
+            .expect("stage local payload");
+        mark_overlay_objects_uploaded(&pg, file.ino, 1, &[local_payload.object_id]);
+        assert!(
+            pg.publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
+                .expect("publish local payload"),
+            "local publish should make the file unprotected"
+        );
+        let event_end = pg.local.get_counter("nextEventSeq").expect("event end");
+        pg.flushed_event_seq.store(event_end, Ordering::SeqCst);
+
+        let mut remote_attr = pg.get_attr(file.ino).expect("load published attr");
+        remote_attr.size = 223;
+        remote_attr.committed_size = 223;
+        remote_attr.content_epoch = 1;
+        remote_attr.committed_content_epoch = 1;
+        remote_attr.upload_state = UploadState::Ready;
+        pg.local
+            .apply_replica_events_to_base(&[MetaEvent::SetAttr {
+                attr: remote_attr.clone(),
+            }])
+            .expect("apply remote base attr");
+
+        assert_eq!(
+            pg.get_attr(file.ino).expect("load stale serving attr").size,
+            227,
+            "base-only import can leave a stale serving attr until reconciliation"
+        );
+
+        pg.reconcile_imported_snapshot_regular_files()
+            .expect("reconcile imported snapshot");
+
+        assert_eq!(
+            pg.get_attr(file.ino).expect("load reconciled attr").size,
+            remote_attr.size,
+            "snapshot reconciliation must reset stale regular-file serving attrs from base"
         );
     }
 
