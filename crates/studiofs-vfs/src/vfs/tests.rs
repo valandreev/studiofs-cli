@@ -8191,7 +8191,7 @@ fn deferred_materialization_reschedules_write_that_arrives_while_inflight_finish
         vfs.state
             .deferred_materialize_inflight
             .lock()
-            .insert(ino, task_lock);
+            .insert(ino, Arc::clone(&task_lock));
 
         let payload = vec![0xD4; vfs.block_size as usize];
         vfs.write_fh_with_deferred_materialize(
@@ -8212,7 +8212,7 @@ fn deferred_materialization_reschedules_write_that_arrives_while_inflight_finish
             "write should remain buffered until the finishing materializer reschedules"
         );
 
-        vfs.finish_deferred_materialization_task(ino, true);
+        vfs.finish_deferred_materialization_task(ino, task_lock, true);
 
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -8269,12 +8269,181 @@ fn strict_deferred_write_waits_for_inflight_materialization() {
         );
 
         drop(guard);
+        vfs.state.deferred_materialize_inflight.lock().remove(&ino);
         strict_write
             .await
             .expect("strict write task should not panic")
             .expect("strict write should complete after inflight materialization drains");
-        vfs.state.deferred_materialize_inflight.lock().remove(&ino);
         vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn explicit_winfsp_flush_waits_for_deferred_last_handle_release_barrier() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-427-flush-waits-release");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-427-flush-waits-release.bin", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+
+        let task_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let guard = task_lock.clone().lock_owned().await;
+        vfs.state
+            .deferred_release_inflight
+            .lock()
+            .insert(ino, task_lock);
+
+        let flushing_vfs = Arc::clone(&vfs);
+        let flush = tokio::spawn(async move {
+            flushing_vfs
+                .flush_winfsp_writeback_with_outcome(ino, fh)
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !flush.is_finished(),
+            "explicit WinFSP flush must wait for an in-flight deferred last-handle release barrier before reporting sync success"
+        );
+
+        drop(guard);
+        vfs.state.deferred_release_inflight.lock().remove(&ino);
+        flush
+            .await
+            .expect("flush task should not panic")
+            .expect("flush should complete after deferred release barrier drains");
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn deferred_release_barrier_replaces_older_inflight_marker() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-427-release-replaces-marker");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-427-release-replaces-marker.bin", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+
+        let (older, _older_guard) = vfs.register_deferred_release_barrier(ino);
+        let (newer, newer_guard) = vfs.register_deferred_release_barrier(ino);
+
+        drop(older);
+        assert!(
+            vfs.state
+                .deferred_release_inflight
+                .lock()
+                .contains_key(&ino),
+            "dropping a replaced barrier must not remove the current marker"
+        );
+
+        let waiting_vfs = Arc::clone(&vfs);
+        let wait = tokio::spawn(async move {
+            waiting_vfs.wait_for_deferred_release_inflight(ino).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !wait.is_finished(),
+            "foreground sync must wait for the newest deferred release marker, not the replaced one"
+        );
+
+        drop(newer_guard);
+        drop(newer);
+        wait.await.expect("wait task should not panic");
+        assert!(
+            !vfs.state
+                .deferred_release_inflight
+                .lock()
+                .contains_key(&ino),
+            "dropping the current barrier guard must remove its marker"
+        );
+    });
+}
+
+#[test]
+fn deferred_release_barrier_registration_holds_lock_before_marker_is_visible() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-427-release-atomic-register");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-427-release-atomic-register.bin", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+
+        let (barrier, guard) = vfs.register_deferred_release_barrier(ino);
+        let waiting_vfs = Arc::clone(&vfs);
+        let wait = tokio::spawn(async move {
+            waiting_vfs.wait_for_deferred_release_inflight(ino).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !wait.is_finished(),
+            "foreground sync must not be able to acquire a newly registered deferred release marker before the background release task owns it"
+        );
+
+        drop(guard);
+        drop(barrier);
+        wait.await.expect("wait task should not panic");
+    });
+}
+
+#[test]
+fn deferred_materialization_wait_tracks_rescheduled_marker() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "materialize-wait-reschedule");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"materialize-wait-reschedule.bin", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+
+        let older = Arc::new(tokio::sync::Mutex::new(()));
+        let older_guard = older.clone().lock_owned().await;
+        vfs.state
+            .deferred_materialize_inflight
+            .lock()
+            .insert(ino, older);
+
+        let waiting_vfs = Arc::clone(&vfs);
+        let wait = tokio::spawn(async move {
+            waiting_vfs
+                .wait_for_deferred_materialization_inflight(ino)
+                .await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !wait.is_finished(),
+            "strict barriers must wait for the current materialization task"
+        );
+
+        let newer = Arc::new(tokio::sync::Mutex::new(()));
+        let newer_guard = newer.clone().lock_owned().await;
+        vfs.state
+            .deferred_materialize_inflight
+            .lock()
+            .insert(ino, newer);
+        drop(older_guard);
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !wait.is_finished(),
+            "strict barriers must continue waiting when materialization reschedules another task"
+        );
+
+        drop(newer_guard);
+        vfs.state.deferred_materialize_inflight.lock().remove(&ino);
+        wait.await.expect("wait task should not panic");
     });
 }
 

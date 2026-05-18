@@ -1120,7 +1120,8 @@ mod tests {
 
     #[test]
     fn system_command_executor_returns_timed_out_for_hung_command() {
-        let command = hung_command(Duration::from_millis(50));
+        let _guard = crate::process_job::child_job_test_lock();
+        let command = hung_command(Duration::from_millis(250));
         let started = Instant::now();
 
         let err = SystemCommandExecutor.run(&command).unwrap_err();
@@ -1150,7 +1151,8 @@ mod tests {
 
     #[test]
     fn timeout_executor_drains_large_stdout_while_waiting() {
-        let command = large_stdout_command(Duration::from_secs(5));
+        let _guard = crate::process_job::child_job_test_lock();
+        let command = large_stdout_command(Duration::from_secs(10));
 
         let output = SystemCommandExecutor
             .run(&command)
@@ -1175,6 +1177,7 @@ mod tests {
 
     #[test]
     fn streaming_command_still_captures_output_without_timeout() {
+        let _guard = crate::process_job::child_job_test_lock();
         let mut command = small_output_command(None);
         command
             .env
@@ -1211,8 +1214,14 @@ timestamp=t studiofs-e2e phase=run status=\x1b[31mfailed\x1b[0m\n",
     #[cfg(windows)]
     fn hung_command(timeout: Duration) -> CommandSpec {
         CommandSpec {
-            program: "cmd".to_string(),
-            args: vec!["/C".to_string(), "ping -n 6 127.0.0.1 >NUL".to_string()],
+            program: "powershell".to_string(),
+            args: vec![
+                "-NoLogo".to_string(),
+                "-NoProfile".to_string(),
+                "-NonInteractive".to_string(),
+                "-Command".to_string(),
+                "[System.Threading.Thread]::Sleep(5000)".to_string(),
+            ],
             env: Vec::new(),
             cwd: None,
             timeout: Some(timeout),
@@ -1222,10 +1231,11 @@ timestamp=t studiofs-e2e phase=run status=\x1b[31mfailed\x1b[0m\n",
     #[cfg(windows)]
     fn large_stdout_command(timeout: Duration) -> CommandSpec {
         CommandSpec {
-            program: "cmd".to_string(),
+            program: "powershell".to_string(),
             args: vec![
-                "/C".to_string(),
-                "for /L %i in (1,1,20000) do @echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx".to_string(),
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                "$bytes = [byte[]]::new(1048576); [Console]::OpenStandardOutput().Write($bytes, 0, $bytes.Length)".to_string(),
             ],
             env: Vec::new(),
             cwd: None,
@@ -1236,10 +1246,11 @@ timestamp=t studiofs-e2e phase=run status=\x1b[31mfailed\x1b[0m\n",
     #[cfg(windows)]
     fn small_output_command(timeout: Option<Duration>) -> CommandSpec {
         CommandSpec {
-            program: "cmd".to_string(),
+            program: "powershell".to_string(),
             args: vec![
-                "/C".to_string(),
-                "echo streamed stdout&&echo streamed stderr 1>&2".to_string(),
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                "[Console]::Out.WriteLine('streamed stdout'); [Console]::Error.WriteLine('streamed stderr')".to_string(),
             ],
             env: Vec::new(),
             cwd: None,
