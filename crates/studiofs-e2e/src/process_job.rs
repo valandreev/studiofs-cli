@@ -47,6 +47,7 @@ mod imp {
     use std::mem;
     use std::os::windows::io::AsRawHandle as _;
     use std::ptr;
+    use std::sync::{Mutex, OnceLock};
 
     const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS: u32 = 9;
     const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
@@ -105,6 +106,8 @@ mod imp {
         handle: *mut c_void,
     }
 
+    static CHILD_JOBS: OnceLock<Mutex<Vec<usize>>> = OnceLock::new();
+
     impl ChildJob {
         pub(crate) fn prepare_command(_command: &mut Command) -> io::Result<()> {
             Ok(())
@@ -126,6 +129,7 @@ mod imp {
                 let _ = job.close();
                 return Err(job_assignment_error(error));
             }
+            register_job(handle);
             Ok(job)
         }
 
@@ -180,6 +184,7 @@ mod imp {
             if self.handle.is_null() {
                 return Ok(());
             }
+            unregister_job(self.handle);
             // SAFETY: `handle` is owned by `self` and closed at most once.
             let ok = unsafe { CloseHandle(self.handle) };
             self.handle = ptr::null_mut();
@@ -207,8 +212,40 @@ mod imp {
     }
 
     pub(super) fn terminate_registered_children_for_process_exit() {
-        // Windows Job Object handles are owned by the runner process. On process
-        // exit the OS closes those handles, and kill-on-close terminates members.
+        for handle in registered_jobs() {
+            // SAFETY: entries are live job handles registered by ChildJob. A stale
+            // handle may fail TerminateJobObject, which is acceptable during exit.
+            let _ = unsafe { TerminateJobObject(handle as *mut c_void, 1) };
+        }
+    }
+
+    fn child_jobs() -> &'static Mutex<Vec<usize>> {
+        CHILD_JOBS.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    fn register_job(handle: *mut c_void) {
+        let mut jobs = child_jobs()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let handle = handle as usize;
+        if !jobs.contains(&handle) {
+            jobs.push(handle);
+        }
+    }
+
+    fn unregister_job(handle: *mut c_void) {
+        let mut jobs = child_jobs()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let handle = handle as usize;
+        jobs.retain(|registered| *registered != handle);
+    }
+
+    fn registered_jobs() -> Vec<usize> {
+        child_jobs()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     #[cfg(test)]
@@ -235,6 +272,27 @@ mod imp {
                 let _ = child.wait();
                 panic!("kill-on-close job did not terminate child: {error}");
             }
+        }
+
+        #[test]
+        fn signal_cleanup_terminates_registered_job_child() {
+            let mut child = Command::new("cmd")
+                .args(["/C", "ping -n 30 127.0.0.1 >NUL"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn hung command");
+            let job = ChildJob::assign_to_child(&child).expect("assign child to registered job");
+
+            terminate_registered_children_for_process_exit();
+
+            if let Err(error) = wait_for_child_exit(&mut child, Duration::from_secs(2)) {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("registered job cleanup did not terminate child: {error}");
+            }
+            drop(job);
         }
 
         #[test]
