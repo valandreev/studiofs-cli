@@ -8279,6 +8279,48 @@ fn strict_deferred_write_waits_for_inflight_materialization() {
 }
 
 #[test]
+fn explicit_winfsp_flush_waits_for_deferred_last_handle_release_barrier() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-427-flush-waits-release");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-427-flush-waits-release.bin", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+
+        let task_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let guard = task_lock.clone().lock_owned().await;
+        vfs.state
+            .deferred_release_inflight
+            .lock()
+            .insert(ino, task_lock);
+
+        let flushing_vfs = Arc::clone(&vfs);
+        let flush = tokio::spawn(async move {
+            flushing_vfs
+                .flush_winfsp_writeback_with_outcome(ino, fh)
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !flush.is_finished(),
+            "explicit WinFSP flush must wait for an in-flight deferred last-handle release barrier before reporting sync success"
+        );
+
+        drop(guard);
+        flush
+            .await
+            .expect("flush task should not panic")
+            .expect("flush should complete after deferred release barrier drains");
+        vfs.state.deferred_release_inflight.lock().remove(&ino);
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
 fn write_path_observability_tracks_burst_shape_and_metadata_commit_stalls() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (rt, vfs, meta) = make_test_vfs(&tmp, "write-path-observability-bursts");

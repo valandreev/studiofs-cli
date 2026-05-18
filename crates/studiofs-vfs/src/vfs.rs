@@ -2427,6 +2427,7 @@ impl VfsState {
             sustained_write_streams: Mutex::new(HashMap::new()),
             deferred_materialize_inflight: Mutex::new(HashMap::new()),
             deferred_materialize_reschedule_needed: Mutex::new(HashSet::new()),
+            deferred_release_inflight: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -2456,6 +2457,10 @@ struct VfsState {
     /// in-flight. The finishing task consumes this flag and schedules one more
     /// pass if dirty writer-stack bytes remain.
     deferred_materialize_reschedule_needed: Mutex<HashSet<Ino>>,
+    /// Tracks last-handle release barriers scheduled by WinFSP close callbacks.
+    /// Foreground flush/fsync paths wait on this before reporting success so a
+    /// close-deferred metadata commit cannot race an immediate explicit sync.
+    deferred_release_inflight: Mutex<HashMap<Ino, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 #[derive(Clone)]

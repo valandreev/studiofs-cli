@@ -140,6 +140,47 @@ impl StudioVfs {
         }
     }
 
+    async fn wait_for_deferred_release_inflight(&self, ino: Ino) {
+        let task_lock = {
+            self.state
+                .deferred_release_inflight
+                .lock()
+                .get(&ino)
+                .cloned()
+        };
+        if let Some(task_lock) = task_lock {
+            let _guard = task_lock.lock().await;
+        }
+    }
+
+    fn register_deferred_release_barrier(&self, ino: Ino) -> Option<Arc<tokio::sync::Mutex<()>>> {
+        let mut inflight = self.state.deferred_release_inflight.lock();
+        match inflight.entry(ino) {
+            std::collections::hash_map::Entry::Occupied(_) => {
+                warn!(
+                    ino,
+                    "deferred last-handle release barrier already in-flight"
+                );
+                None
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let task_lock = Arc::new(tokio::sync::Mutex::new(()));
+                entry.insert(task_lock.clone());
+                Some(task_lock)
+            }
+        }
+    }
+
+    fn finish_deferred_release_barrier(&self, ino: Ino, task_lock: &Arc<tokio::sync::Mutex<()>>) {
+        let mut inflight = self.state.deferred_release_inflight.lock();
+        if inflight
+            .get(&ino)
+            .is_some_and(|current| Arc::ptr_eq(current, task_lock))
+        {
+            inflight.remove(&ino);
+        }
+    }
+
     fn observe_sustained_write_admission(
         &self,
         ino: Ino,
@@ -649,7 +690,15 @@ impl StudioVfs {
         let ino = context.ino;
         let flushed_local_dirty_state = self.inode_has_local_dirty_state(ino);
         let vfs = Arc::clone(self);
+        let task_lock = self.register_deferred_release_barrier(ino);
+        let guard = task_lock.as_ref().map(|task_lock| {
+            task_lock
+                .clone()
+                .try_lock_owned()
+                .expect("new deferred release barrier lock should be uncontended")
+        });
         self.track_background_task(runtime.spawn(async move {
+            let _guard = guard;
             tokio::time::sleep(Duration::from_millis(1)).await;
             let session = vfs
                 .state
@@ -659,6 +708,9 @@ impl StudioVfs {
             let result = vfs.release_last_handle_with_outcome(context).await;
             drop(session);
             vfs.state.file_session.gc_if_idle(ino);
+            if let Some(task_lock) = task_lock {
+                vfs.finish_deferred_release_barrier(ino, &task_lock);
+            }
             if let Err(error) = result {
                 warn!(
                     ino,
@@ -690,6 +742,7 @@ impl StudioVfs {
             None
         }
         .unwrap_or(ino);
+        self.wait_for_deferred_release_inflight(target_ino).await;
         let session = self
             .state
             .file_session
@@ -859,6 +912,7 @@ impl StudioVfs {
         ino: Ino,
         sticky_error_policy: StickyErrorPolicy,
     ) -> VfsResult<ExplicitFlushOutcome> {
+        self.wait_for_deferred_release_inflight(ino).await;
         let session = self
             .state
             .file_session
@@ -897,6 +951,7 @@ impl StudioVfs {
         let Some(open_file) = self.handle_table.get(fh) else {
             return Ok(ExplicitFlushOutcome::default());
         };
+        self.wait_for_deferred_release_inflight(open_file.ino).await;
         let session = self
             .state
             .file_session
@@ -939,6 +994,7 @@ impl StudioVfs {
         ino: Ino,
         datasync: bool,
     ) -> VfsResult<FsyncOutcome> {
+        self.wait_for_deferred_release_inflight(ino).await;
         let session = self
             .state
             .file_session
