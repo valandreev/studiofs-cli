@@ -604,13 +604,12 @@ pub fn run_with_executor(
             Err(error) => return Err(error),
         };
         let mut lifecycle = lifecycle;
-        if definition.requires_studiofs_bin && lifecycle.outcome.status == ScenarioStatus::TimedOut
-        {
+        if definition.requires_studiofs_bin && lifecycle.outcome.status != ScenarioStatus::Passed {
             let detail = lifecycle
                 .report
                 .error
                 .clone()
-                .unwrap_or_else(|| "scenario child timed out".to_string());
+                .unwrap_or_else(|| "mounted scenario failed".to_string());
             mounted_cleanup_block = Some(detail);
         }
         if definition.requires_studiofs_bin {
@@ -3782,6 +3781,55 @@ plain child stderr\n",
     }
 
     #[test]
+    fn mounted_child_failure_blocks_later_mounted_children() {
+        let temp = tempfile::tempdir().unwrap();
+        let executor = RecordingExecutor {
+            fail_first_child_report: Cell::new(true),
+            ..RecordingExecutor::default()
+        };
+
+        let outcome = run_with_executor(
+            RunRequest {
+                root: temp.path().join("e2e-runs"),
+                run_id: Some("mounted-failure-block-run".to_string()),
+                scenarios: vec![
+                    scenario::BASIC_MULTI_CLIENT_SMOKE.to_string(),
+                    scenario::MOUNTED_CLIENT_CRASH_RESTART_RECOVERY.to_string(),
+                ],
+                seed: 410,
+                studiofs_bin: None,
+                platform: PlatformSelection::WindowsWinfsp,
+                retention: RetentionPolicy::Always,
+                report: None,
+                port_range: None,
+                timeout: Some("30s".to_string()),
+                infra: InfraMode::Disabled,
+            },
+            &executor,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.status, RunStatus::Failed);
+        let calls = executor.calls.borrow();
+        let child_calls = calls
+            .iter()
+            .filter(|call| call.args.contains(&"run-one".to_string()))
+            .count();
+        assert_eq!(child_calls, 1, "second mounted scenario must not start");
+
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(outcome.report_path).unwrap()).unwrap();
+        assert_eq!(report["scenarios"][0]["status"], "failed");
+        assert_eq!(report["scenarios"][1]["status"], "skipped");
+        assert!(
+            report["scenarios"][1]["error"]
+                .as_str()
+                .unwrap()
+                .contains("simulated child scenario failure")
+        );
+    }
+
+    #[test]
     fn mounted_supervision_error_still_runs_cleanup_verification_and_writes_report() {
         let temp = tempfile::tempdir().unwrap();
         let executor = RecordingExecutor {
@@ -4582,6 +4630,7 @@ plain child stderr\n",
         fail_logs: Cell<bool>,
         fail_post_scenario_cleanup: Cell<bool>,
         fail_child_supervision_io: Cell<bool>,
+        fail_first_child_report: Cell<bool>,
         time_out_first_child: Cell<bool>,
         child_run_count: Cell<usize>,
     }
@@ -4603,10 +4652,18 @@ plain child stderr\n",
                         "command timed out after 30000 ms; child still running after kill attempts",
                     ));
                 }
-                write_recorded_child_report(command)?;
+                write_recorded_child_report(
+                    command,
+                    self.fail_first_child_report.get() && self.child_run_count.get() == 1,
+                )?;
                 return Ok(CommandOutput {
                     status: 0,
-                    stdout: "child scenario passed\n".to_string(),
+                    stdout: if self.fail_first_child_report.get() && self.child_run_count.get() == 1
+                    {
+                        "child scenario failed\n".to_string()
+                    } else {
+                        "child scenario passed\n".to_string()
+                    },
                     stderr: "timestamp=2026-05-13T07:21:44.783Z studiofs-e2e child\n".to_string(),
                 });
             }
@@ -4687,7 +4744,10 @@ plain child stderr\n",
         }
     }
 
-    fn write_recorded_child_report(command: &crate::infra::CommandSpec) -> std::io::Result<()> {
+    fn write_recorded_child_report(
+        command: &crate::infra::CommandSpec,
+        failed: bool,
+    ) -> std::io::Result<()> {
         let arg_value = |name: &str| {
             command
                 .args
@@ -4710,12 +4770,16 @@ plain child stderr\n",
                 scenario: ScenarioReport {
                     name: scenario.clone(),
                     seed: 410,
-                    status: ScenarioStatus::Passed,
+                    status: if failed {
+                        ScenarioStatus::Failed
+                    } else {
+                        ScenarioStatus::Passed
+                    },
                     started_at: "2026-05-13T07:21:44.783Z".to_string(),
                     finished_at: "2026-05-13T07:21:45.783Z".to_string(),
                     duration_ms: 1000,
                     artifacts: vec![scenario_artifact_path(&scenario, "operations.ndjson")],
-                    error: None,
+                    error: failed.then(|| "simulated child scenario failure".to_string()),
                 },
                 cleanup_error: None,
             })?,

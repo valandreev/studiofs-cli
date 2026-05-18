@@ -34,6 +34,9 @@ pub enum Commands {
     /// Run exactly one scenario inside an existing parent runner sandbox.
     #[command(hide = true)]
     RunOne(RunOneArgs),
+    /// Execute one bounded mounted hotspot filesystem operation.
+    #[command(hide = true)]
+    HotspotOp(HotspotOpArgs),
     /// Run the SFS-405 Local First baseline gate for mounted scenarios 1-8.
     LocalFirstBaselineGate(BaselineGateArgs),
     /// Remove runner-owned sandboxes from the run root.
@@ -117,6 +120,30 @@ pub struct RunOneArgs {
     /// External infrastructure mode accepted for CLI symmetry; run.json remains authoritative.
     #[arg(long, value_enum, default_value = "compose")]
     pub infra: InfraMode,
+}
+
+#[derive(Args, Debug)]
+/// Hidden helper arguments for one mounted hotspot filesystem operation.
+pub struct HotspotOpArgs {
+    /// Operation name: mkdir, write, append, rename, or readdir.
+    #[arg(long)]
+    pub operation: String,
+
+    /// Mounted root for the client that executes the operation.
+    #[arg(long)]
+    pub mount_point: PathBuf,
+
+    /// Relative path under the mount point.
+    #[arg(long)]
+    pub path: String,
+
+    /// Relative destination path for rename operations.
+    #[arg(long)]
+    pub target: Option<String>,
+
+    /// Payload file for write and append operations.
+    #[arg(long)]
+    pub payload: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -307,6 +334,14 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             }
             Ok(outcome.exit_code)
         }
+        Commands::HotspotOp(args) => scenario::run_hotspot_op_helper(
+            &args.operation,
+            args.mount_point,
+            &args.path,
+            args.target.as_deref(),
+            args.payload.as_deref(),
+        )
+        .map(|()| 0),
         Commands::LocalFirstBaselineGate(args) => {
             let outcome = baseline_gate::run(args.into_request())?;
             for run in &outcome.runs {
@@ -372,6 +407,31 @@ mod tests {
         assert_eq!(args.run_id, "run-one-test");
         assert_eq!(args.seed, 410);
         assert_eq!(args.infra, InfraMode::Disabled);
+    }
+
+    #[test]
+    fn hidden_hotspot_op_subcommand_parses() {
+        let cli = Cli::try_parse_from([
+            "studiofs-e2e",
+            "hotspot-op",
+            "--operation",
+            "rename",
+            "--mount-point",
+            "Z:\\",
+            "--path",
+            "hotspot/slot-1.txt",
+            "--target",
+            "hotspot/slot-1-renamed.txt",
+        ])
+        .expect("hidden hotspot-op command should parse");
+
+        let Commands::HotspotOp(args) = cli.command else {
+            panic!("expected hidden hotspot-op command");
+        };
+        assert_eq!(args.operation, "rename");
+        assert_eq!(args.mount_point, PathBuf::from("Z:\\"));
+        assert_eq!(args.path, "hotspot/slot-1.txt");
+        assert_eq!(args.target.as_deref(), Some("hotspot/slot-1-renamed.txt"));
     }
 
     #[test]
