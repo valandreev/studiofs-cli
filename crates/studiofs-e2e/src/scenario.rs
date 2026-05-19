@@ -2442,6 +2442,36 @@ impl NamespaceCollisionTask {
     }
 }
 
+fn namespace_collision_helper_task(
+    context: &ScenarioContext,
+    order: usize,
+    client: ClientSpec,
+    operation: &'static str,
+    helper_operation: &'static str,
+    path: &'static str,
+    target: Option<&'static str>,
+    payload: Option<&'static [u8]>,
+) -> NamespaceCollisionTask {
+    let context = context.clone();
+    NamespaceCollisionTask::new(order, client, operation, path, move |client| {
+        let pending_label = match target {
+            Some(target) => format!("{} {operation} {path} -> {target}", client.name),
+            None => format!("{} {operation} {path}", client.name),
+        };
+        run_hotspot_helper_process(
+            &context,
+            COLLISION_OPERATION_TIMEOUT,
+            client,
+            helper_operation,
+            path,
+            target,
+            payload,
+            pending_label,
+        )
+        .map_err(scenario_error_to_io)
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct NamespaceCollisionSummary {
     scenario: String,
@@ -2627,29 +2657,25 @@ fn perform_namespace_collision_operations(
         NamespaceCollisionKind::RenameVsRename => run_concurrent_namespace_operations(
             started,
             vec![
-                NamespaceCollisionTask::new(
+                namespace_collision_helper_task(
+                    context,
                     1,
                     clients[0].clone(),
                     "rename",
-                    "shared/file.txt -> shared/renamed-a.txt",
-                    |client| {
-                        fs::rename(
-                            client.mount_point.join("shared/file.txt"),
-                            client.mount_point.join("shared/renamed-a.txt"),
-                        )
-                    },
+                    "rename",
+                    "shared/file.txt",
+                    Some("shared/renamed-a.txt"),
+                    None,
                 ),
-                NamespaceCollisionTask::new(
+                namespace_collision_helper_task(
+                    context,
                     2,
                     clients[1].clone(),
                     "rename",
-                    "shared/file.txt -> shared/renamed-b.txt",
-                    |client| {
-                        fs::rename(
-                            client.mount_point.join("shared/file.txt"),
-                            client.mount_point.join("shared/renamed-b.txt"),
-                        )
-                    },
+                    "rename",
+                    "shared/file.txt",
+                    Some("shared/renamed-b.txt"),
+                    None,
                 ),
             ],
             COLLISION_OPERATION_TIMEOUT,
@@ -2657,24 +2683,25 @@ fn perform_namespace_collision_operations(
         NamespaceCollisionKind::RenameVsUnlink => run_concurrent_namespace_operations(
             started,
             vec![
-                NamespaceCollisionTask::new(
+                namespace_collision_helper_task(
+                    context,
                     1,
                     clients[0].clone(),
                     "rename",
-                    "shared/file.txt -> shared/renamed.txt",
-                    |client| {
-                        fs::rename(
-                            client.mount_point.join("shared/file.txt"),
-                            client.mount_point.join("shared/renamed.txt"),
-                        )
-                    },
+                    "rename",
+                    "shared/file.txt",
+                    Some("shared/renamed.txt"),
+                    None,
                 ),
-                NamespaceCollisionTask::new(
+                namespace_collision_helper_task(
+                    context,
                     2,
                     clients[1].clone(),
                     "unlink",
+                    "delete",
                     "shared/file.txt",
-                    |client| fs::remove_file(client.mount_point.join("shared/file.txt")),
+                    None,
+                    None,
                 ),
             ],
             COLLISION_OPERATION_TIMEOUT,
@@ -2682,25 +2709,25 @@ fn perform_namespace_collision_operations(
         NamespaceCollisionKind::UnlinkVsAppend => run_concurrent_namespace_operations(
             started,
             vec![
-                NamespaceCollisionTask::new(
+                namespace_collision_helper_task(
+                    context,
                     1,
                     clients[0].clone(),
                     "unlink",
+                    "delete",
                     "shared/data.txt",
-                    |client| fs::remove_file(client.mount_point.join("shared/data.txt")),
+                    None,
+                    None,
                 ),
-                NamespaceCollisionTask::new(
+                namespace_collision_helper_task(
+                    context,
                     2,
                     clients[1].clone(),
                     "append",
+                    "append",
                     "shared/data.txt",
-                    |client| {
-                        let mut file = OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(client.mount_point.join("shared/data.txt"))?;
-                        file.write_all(b"appended payload\n")
-                    },
+                    None,
+                    Some(b"appended payload\n"),
                 ),
             ],
             COLLISION_OPERATION_TIMEOUT,
@@ -2715,17 +2742,15 @@ fn perform_namespace_collision_operations(
                     "shared/data.txt",
                     |client| repeated_committed_read(client, "shared/data.txt"),
                 ),
-                NamespaceCollisionTask::new(
+                namespace_collision_helper_task(
+                    context,
                     2,
                     clients[0].clone(),
                     "overwrite",
+                    "overwrite-barrier",
                     "shared/data.txt",
-                    |client| {
-                        fs::write(
-                            client.mount_point.join("shared/data.txt"),
-                            COLLISION_NEW_COMMITTED_PAYLOAD,
-                        )
-                    },
+                    None,
+                    Some(COLLISION_NEW_COMMITTED_PAYLOAD),
                 ),
                 NamespaceCollisionTask::new(
                     3,
@@ -2740,23 +2765,36 @@ fn perform_namespace_collision_operations(
         NamespaceCollisionKind::MkdirRmdirVsCreate => run_concurrent_namespace_operations(
             started,
             vec![
-                NamespaceCollisionTask::new(
+                namespace_collision_helper_task(
+                    context,
                     1,
                     clients[0].clone(),
                     "mkdir",
+                    "mkdir",
                     "race/subdir",
-                    |client| fs::create_dir_all(client.mount_point.join("race/subdir")),
+                    None,
+                    None,
                 ),
-                NamespaceCollisionTask::new(
+                namespace_collision_helper_task(
+                    context,
                     2,
                     clients[1].clone(),
                     "create",
+                    "create",
                     "race/child.txt",
-                    |client| fs::write(client.mount_point.join("race/child.txt"), b"child\n"),
+                    None,
+                    Some(b"child\n"),
                 ),
-                NamespaceCollisionTask::new(3, clients[2].clone(), "rmdir", "race", |client| {
-                    fs::remove_dir(client.mount_point.join("race"))
-                }),
+                namespace_collision_helper_task(
+                    context,
+                    3,
+                    clients[2].clone(),
+                    "rmdir",
+                    "rmdir",
+                    "race",
+                    None,
+                    None,
+                ),
             ],
             COLLISION_OPERATION_TIMEOUT,
         ),
@@ -2766,17 +2804,15 @@ fn perform_namespace_collision_operations(
                 NamespaceCollisionTask::new(1, clients[1].clone(), "readdir", "scan", |client| {
                     fs::read_dir(client.mount_point.join("scan")).map(|_| ())
                 }),
-                NamespaceCollisionTask::new(
+                namespace_collision_helper_task(
+                    context,
                     2,
                     clients[0].clone(),
                     "rename",
-                    "scan/a.txt -> scan/c.txt",
-                    |client| {
-                        fs::rename(
-                            client.mount_point.join("scan/a.txt"),
-                            client.mount_point.join("scan/c.txt"),
-                        )
-                    },
+                    "rename",
+                    "scan/a.txt",
+                    Some("scan/c.txt"),
+                    None,
                 ),
                 NamespaceCollisionTask::new(
                     3,
@@ -4189,7 +4225,7 @@ fn run_stale_remount_warm_history(
             Some(payload("delete_target", &delete_target)),
         ),
         (
-            1,
+            0,
             "delete",
             delete_target.clone(),
             delete_target.clone(),
@@ -4265,7 +4301,7 @@ fn run_stale_remount_warm_history(
             result,
         )?;
         record_sparse_operation(context, &mut operations, recorded)?;
-        if matches!(operation, "create" | "overwrite") {
+        if matches!(operation, "create" | "overwrite") && path != delete_target {
             wait_for_mounted_initial_payloads_until(
                 clients,
                 &[(&path, action.as_deref().unwrap())],
@@ -6520,7 +6556,7 @@ fn planned_advanced_mounted_operations(
                 "stale-remount-cold-discover/delete-target.txt",
             ),
             (
-                "client-b",
+                "client-a",
                 "delete",
                 "stale-remount-cold-discover/delete-target.txt",
             ),
@@ -8764,6 +8800,25 @@ pub fn run_hotspot_op_helper(
                 None,
             )?;
         }
+        "rmdir" => {
+            record_hotspot_helper_progress(
+                progress,
+                "before_remove_dir",
+                operation,
+                &path,
+                target,
+                None,
+            )?;
+            fs::remove_dir(&path)?;
+            record_hotspot_helper_progress(
+                progress,
+                "after_remove_dir",
+                operation,
+                &path,
+                target,
+                None,
+            )?;
+        }
         "rename" => {
             let target = target.ok_or_else(|| anyhow::anyhow!("missing rename target"))?;
             record_hotspot_helper_progress(
@@ -8797,6 +8852,25 @@ pub fn run_hotspot_op_helper(
             record_hotspot_helper_progress(
                 progress,
                 "after_read_dir",
+                operation,
+                &path,
+                target,
+                None,
+            )?;
+        }
+        "stat" => {
+            record_hotspot_helper_progress(
+                progress,
+                "before_metadata",
+                operation,
+                &path,
+                target,
+                None,
+            )?;
+            fs::metadata(&path)?;
+            record_hotspot_helper_progress(
+                progress,
+                "after_metadata",
                 operation,
                 &path,
                 target,
