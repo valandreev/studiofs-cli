@@ -571,11 +571,123 @@ impl<'a> RemoteApplyCoordinator<'a> {
         overlay: &OverlayConflictSets,
         base_protected_regular_file_inodes: &HashSet<Ino>,
     ) -> MetaResult<RemoteApplyBatchOutcome> {
-        self.engine.apply_foreign_batch_impl(
-            batch_events,
-            overlay,
-            base_protected_regular_file_inodes,
-        )
+        let batch_events = self
+            .engine
+            .preserve_published_content_state_for_attr_only_events(batch_events)?;
+        let current_regular_file_conflicts = self
+            .engine
+            .current_regular_file_overlay_conflicts_for_batch(&batch_events)?;
+        let overlay = Self::merge_overlay_conflicts(overlay, &current_regular_file_conflicts);
+        let mut protected_regular_file_inodes = base_protected_regular_file_inodes.clone();
+        protected_regular_file_inodes
+            .extend(current_regular_file_conflicts.block_inodes.iter().copied());
+        let removed_inodes = self.engine.removed_inodes_for_batch(&batch_events);
+        let mut removed_inodes_with_local_regular_file_state = HashSet::new();
+        for ino in &removed_inodes {
+            if self
+                .engine
+                .removed_inode_has_local_regular_file_state_to_preserve(*ino)?
+            {
+                removed_inodes_with_local_regular_file_state.insert(*ino);
+            }
+        }
+        let partial_publish_inodes =
+            PgMetaEngine::partial_regular_file_publish_inodes(&batch_events);
+        let mut base_range_preserve_inodes = self
+            .engine
+            .protected_base_range_preserve_inodes(&batch_events, &protected_regular_file_inodes)?;
+        base_range_preserve_inodes.extend(partial_publish_inodes.iter().copied());
+        let protected_attr_merges = self.engine.protected_regular_file_attr_merges(
+            &batch_events,
+            &protected_regular_file_inodes,
+            &base_range_preserve_inodes,
+        )?;
+        self.engine
+            .local
+            .apply_replica_events_to_base_preserving_protected_base_ranges(
+                &batch_events,
+                &base_range_preserve_inodes,
+            )?;
+        let serving_events: Vec<MetaEvent> = batch_events
+            .iter()
+            .filter(|event| {
+                if let MetaEvent::SetAttr { attr } = event
+                    && attr.kind == FileType::RegularFile
+                    && protected_regular_file_inodes.contains(&attr.ino)
+                    && !base_range_preserve_inodes.contains(&attr.ino)
+                    && attr.upload_state == UploadState::Ready
+                    && attr.content_epoch == attr.committed_content_epoch
+                    && attr.size == attr.committed_size
+                    && PgMetaEngine::batch_publish_covers_committed_extent(
+                        &batch_events,
+                        attr.ino,
+                        attr.committed_size,
+                    )
+                {
+                    return true;
+                }
+                matches!(
+                    event,
+                    MetaEvent::PublishRegularFileBaseSlices { ino, .. }
+                        if protected_regular_file_inodes.contains(ino)
+                ) || !Self::serving_event_conflicts_with_overlay(
+                    event,
+                    &overlay,
+                    &removed_inodes,
+                    &removed_inodes_with_local_regular_file_state,
+                )
+            })
+            .cloned()
+            .collect();
+        let applied_serving_state = !serving_events.is_empty();
+        self.engine
+            .local
+            .apply_replica_serving_state(&serving_events)?;
+        if !protected_attr_merges.is_empty() {
+            self.engine
+                .local
+                .apply_replica_serving_state(&protected_attr_merges)?;
+        }
+        let grandfathered_attrs = self.engine.grandfather_removed_local_regular_file_attrs(
+            &removed_inodes_with_local_regular_file_state,
+        )?;
+        if !grandfathered_attrs.is_empty() {
+            self.engine
+                .local
+                .apply_replica_serving_state(&grandfathered_attrs)?;
+        }
+        let mut aux_events = Vec::new();
+        for event in &batch_events {
+            if !Self::event_has_aux_apply_effect(event) {
+                continue;
+            }
+            if matches!(
+                event,
+                MetaEvent::PublishRegularFileBaseSlices { ino, .. }
+                    if protected_regular_file_inodes.contains(ino)
+                        || partial_publish_inodes.contains(ino)
+            ) {
+                continue;
+            }
+            if !self.engine.aux_event_conflicts_with_overlay(
+                event,
+                &overlay,
+                &removed_inodes,
+                &removed_inodes_with_local_regular_file_state,
+            )? {
+                aux_events.push(event.clone());
+            }
+        }
+
+        if !aux_events.is_empty() {
+            self.engine.local.apply_replica_aux_state(&aux_events)?;
+        }
+        Ok(RemoteApplyBatchOutcome {
+            changed: applied_serving_state
+                || !aux_events.is_empty()
+                || !grandfathered_attrs.is_empty(),
+            protected_overlay: current_regular_file_conflicts,
+        })
     }
 
     fn apply_visible_self_batch(&self, batch_events: &[MetaEvent]) -> MetaResult<bool> {
@@ -3049,13 +3161,6 @@ impl PgMetaEngine {
         RemoteApplyCoordinator::overlay_conflicts_for_events(events)
     }
 
-    fn merge_overlay_conflicts(
-        base: &OverlayConflictSets,
-        extra: &OverlayConflictSets,
-    ) -> OverlayConflictSets {
-        RemoteApplyCoordinator::merge_overlay_conflicts(base, extra)
-    }
-
     fn local_overlay_conflicts(&self) -> MetaResult<OverlayConflictSets> {
         let start = self.flushed_event_seq.load(Ordering::SeqCst);
         let end = self.local.get_counter("nextEventSeq")?;
@@ -3088,119 +3193,6 @@ impl PgMetaEngine {
             base_protected_regular_file_inodes,
         )?;
         Ok((outcome.changed, outcome.protected_overlay))
-    }
-
-    fn apply_foreign_batch_impl(
-        &self,
-        batch_events: &[MetaEvent],
-        overlay: &OverlayConflictSets,
-        base_protected_regular_file_inodes: &HashSet<Ino>,
-    ) -> MetaResult<RemoteApplyBatchOutcome> {
-        let batch_events =
-            self.preserve_published_content_state_for_attr_only_events(batch_events)?;
-        let current_regular_file_conflicts =
-            self.current_regular_file_overlay_conflicts_for_batch(&batch_events)?;
-        let overlay = Self::merge_overlay_conflicts(overlay, &current_regular_file_conflicts);
-        let mut protected_regular_file_inodes = base_protected_regular_file_inodes.clone();
-        protected_regular_file_inodes
-            .extend(current_regular_file_conflicts.block_inodes.iter().copied());
-        let removed_inodes = self.removed_inodes_for_batch(&batch_events);
-        let mut removed_inodes_with_local_regular_file_state = HashSet::new();
-        for ino in &removed_inodes {
-            if self.removed_inode_has_local_regular_file_state_to_preserve(*ino)? {
-                removed_inodes_with_local_regular_file_state.insert(*ino);
-            }
-        }
-        let partial_publish_inodes = Self::partial_regular_file_publish_inodes(&batch_events);
-        let mut base_range_preserve_inodes = self
-            .protected_base_range_preserve_inodes(&batch_events, &protected_regular_file_inodes)?;
-        base_range_preserve_inodes.extend(partial_publish_inodes.iter().copied());
-        let protected_attr_merges = self.protected_regular_file_attr_merges(
-            &batch_events,
-            &protected_regular_file_inodes,
-            &base_range_preserve_inodes,
-        )?;
-        self.local
-            .apply_replica_events_to_base_preserving_protected_base_ranges(
-                &batch_events,
-                &base_range_preserve_inodes,
-            )?;
-        let serving_events: Vec<MetaEvent> = batch_events
-            .iter()
-            .filter(|event| {
-                if let MetaEvent::SetAttr { attr } = event
-                    && attr.kind == FileType::RegularFile
-                    && protected_regular_file_inodes.contains(&attr.ino)
-                    && !base_range_preserve_inodes.contains(&attr.ino)
-                    && attr.upload_state == UploadState::Ready
-                    && attr.content_epoch == attr.committed_content_epoch
-                    && attr.size == attr.committed_size
-                    && Self::batch_publish_covers_committed_extent(
-                        &batch_events,
-                        attr.ino,
-                        attr.committed_size,
-                    )
-                {
-                    return true;
-                }
-                matches!(
-                    event,
-                    MetaEvent::PublishRegularFileBaseSlices { ino, .. }
-                        if protected_regular_file_inodes.contains(ino)
-                ) || !RemoteApplyCoordinator::serving_event_conflicts_with_overlay(
-                    event,
-                    &overlay,
-                    &removed_inodes,
-                    &removed_inodes_with_local_regular_file_state,
-                )
-            })
-            .cloned()
-            .collect();
-        let applied_serving_state = !serving_events.is_empty();
-        self.local.apply_replica_serving_state(&serving_events)?;
-        if !protected_attr_merges.is_empty() {
-            self.local
-                .apply_replica_serving_state(&protected_attr_merges)?;
-        }
-        let grandfathered_attrs = self.grandfather_removed_local_regular_file_attrs(
-            &removed_inodes_with_local_regular_file_state,
-        )?;
-        if !grandfathered_attrs.is_empty() {
-            self.local
-                .apply_replica_serving_state(&grandfathered_attrs)?;
-        }
-        let mut aux_events = Vec::new();
-        for event in &batch_events {
-            if !RemoteApplyCoordinator::event_has_aux_apply_effect(event) {
-                continue;
-            }
-            if matches!(
-                event,
-                MetaEvent::PublishRegularFileBaseSlices { ino, .. }
-                    if protected_regular_file_inodes.contains(ino)
-                        || partial_publish_inodes.contains(ino)
-            ) {
-                continue;
-            }
-            if !self.aux_event_conflicts_with_overlay(
-                event,
-                &overlay,
-                &removed_inodes,
-                &removed_inodes_with_local_regular_file_state,
-            )? {
-                aux_events.push(event.clone());
-            }
-        }
-
-        if !aux_events.is_empty() {
-            self.local.apply_replica_aux_state(&aux_events)?;
-        }
-        Ok(RemoteApplyBatchOutcome {
-            changed: applied_serving_state
-                || !aux_events.is_empty()
-                || !grandfathered_attrs.is_empty(),
-            protected_overlay: current_regular_file_conflicts,
-        })
     }
 
     fn preserve_published_content_state_for_attr_only_events(
