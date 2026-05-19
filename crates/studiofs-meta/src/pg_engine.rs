@@ -811,6 +811,25 @@ impl<'a> RemoteApplyCoordinator<'a> {
         Ok(())
     }
 
+    fn effective_replay_overlay(
+        overlay: &OverlayConflictSets,
+        recent_flush: Option<&RecentFlush>,
+        batch_version: i64,
+    ) -> OverlayConflictSets {
+        if let Some(recent_flush) = recent_flush
+            && batch_version < recent_flush.batch_version
+        {
+            return Self::merge_overlay_conflicts(overlay, &recent_flush.overlay);
+        }
+        overlay.clone()
+    }
+
+    fn protected_base_inodes_for_replay(
+        recent_flush: Option<&RecentFlush>,
+    ) -> Option<&HashSet<Ino>> {
+        recent_flush.map(|recent_flush| &recent_flush.overlay.block_inodes)
+    }
+
     fn apply_decoded_batches(
         &self,
         batches: Vec<DecodedReplayBatch>,
@@ -836,20 +855,10 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 applied_any |= self.apply_visible_self_batch(&batch.events)?;
                 self.acknowledge_local_prefix_from_self_batch(&batch.events)?;
             } else {
-                let effective_overlay = if let Some(recent_flush) = recent_flush {
-                    if batch.batch_version < recent_flush.batch_version {
-                        Self::merge_overlay_conflicts(&overlay, &recent_flush.overlay)
-                    } else {
-                        overlay.clone()
-                    }
-                } else {
-                    overlay.clone()
-                };
-                let protected_base_inodes = if let Some(recent_flush) = recent_flush {
-                    &recent_flush.overlay.block_inodes
-                } else {
-                    &empty_protected_base_inodes
-                };
+                let effective_overlay =
+                    Self::effective_replay_overlay(&overlay, recent_flush, batch.batch_version);
+                let protected_base_inodes = Self::protected_base_inodes_for_replay(recent_flush)
+                    .unwrap_or(&empty_protected_base_inodes);
                 let outcome = self.apply_foreign_batch(
                     &batch.events,
                     &effective_overlay,
