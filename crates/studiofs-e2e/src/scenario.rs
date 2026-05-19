@@ -4899,6 +4899,13 @@ fn run_hotspot_churn_operations_with_timeout(
             None,
         )?;
         record_sparse_operation(context, &mut operations, operation)?;
+        wait_for_client_path_visible_until(
+            &clients[0],
+            &slot,
+            Instant::now() + operation_timeout,
+            poll_interval,
+            "hotspot rename source",
+        )?;
         let rename_target = renamed.clone();
         let order = operations.len() + 1;
         let operation = timed_hotspot_helper_fs_op(
@@ -5998,6 +6005,43 @@ fn wait_for_required_paths_visible_until(
     }
 }
 
+fn wait_for_client_path_visible_until(
+    client: &ClientSpec,
+    relative_path: &str,
+    deadline: Instant,
+    poll_interval: Duration,
+    label: &str,
+) -> Result<(), ScenarioError> {
+    let probe_limiter = MountedProbeLimiter::new(1);
+    loop {
+        match client_path_missing(client, relative_path, &probe_limiter) {
+            Ok(None) => return Ok(()),
+            Ok(Some(missing)) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(ScenarioError::Io(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "{label} did not become visible before timeout; missing: {missing}"
+                        ),
+                    )));
+                }
+                thread::sleep(poll_interval.min(deadline.saturating_duration_since(now)));
+            }
+            Err(error) => {
+                return Err(ScenarioError::Io(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "{label} mounted validation probe timed out for {}:{relative_path}: {}",
+                        client.name,
+                        error.detail()
+                    ),
+                )));
+            }
+        }
+    }
+}
+
 fn remaining_initial_validation_timeout(
     deadline: Instant,
     label: &str,
@@ -6044,7 +6088,22 @@ fn missing_required_paths(
     missing
 }
 
+fn client_path_missing(
+    client: &ClientSpec,
+    relative_path: &str,
+    probe_limiter: &MountedProbeLimiter,
+) -> Result<Option<String>, MountedProbeFailure> {
+    let client = client.clone();
+    let relative_path = relative_path.to_string();
+    run_mounted_probe_with_timeout(probe_limiter, MOUNTED_VALIDATION_PROBE_TIMEOUT, move || {
+        missing_required_path_probe(client, relative_path)
+    })
+}
+
 fn missing_required_path_probe(client: ClientSpec, relative_path: String) -> Option<String> {
+    if !refresh_relative_path_parent_contains_child(&client.mount_point, &relative_path) {
+        return Some(format!("{}:{relative_path}", client.name));
+    }
     let path = client.mount_point.join(&relative_path);
     match fs::metadata(&path) {
         Ok(_) => None,
@@ -10704,6 +10763,48 @@ mod tests {
             started.elapsed() < Duration::from_millis(150),
             "hotspot timeout must not wait for the hung mounted operation to finish"
         );
+    }
+
+    #[test]
+    fn hotspot_rename_source_barrier_accepts_visible_source() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-hotspot-source-visible");
+        let mount = temp.path().join("mounts").join("client-a");
+        let source = mount.join("hotspot").join("slot-0.txt");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, b"payload").unwrap();
+        let client = client_spec_for(&sandbox, "projectfs", "client-a", mount);
+
+        wait_for_client_path_visible_until(
+            &client,
+            "hotspot/slot-0.txt",
+            Instant::now() + Duration::from_secs(1),
+            Duration::from_millis(5),
+            "hotspot rename source",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn hotspot_rename_source_barrier_rejects_missing_source_before_rename() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-hotspot-source-missing");
+        let mount = temp.path().join("mounts").join("client-a");
+        std::fs::create_dir_all(&mount).unwrap();
+        let client = client_spec_for(&sandbox, "projectfs", "client-a", mount);
+
+        let err = wait_for_client_path_visible_until(
+            &client,
+            "hotspot/slot-0.txt",
+            Instant::now() + Duration::from_millis(20),
+            Duration::from_millis(5),
+            "hotspot rename source",
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, ScenarioError::Io(_)));
+        assert!(err.to_string().contains("hotspot rename source"));
+        assert!(err.to_string().contains("client-a:hotspot/slot-0.txt"));
     }
 
     #[test]
