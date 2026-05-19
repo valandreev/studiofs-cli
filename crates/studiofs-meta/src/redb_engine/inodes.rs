@@ -4,6 +4,21 @@ const INODE_LIFECYCLE_SCHEMA_VERSION_KEY: &str = "inode_lifecycle_schema_version
 const CURRENT_INODE_LIFECYCLE_SCHEMA_VERSION: u64 = 1;
 
 impl RedbMetaEngine {
+    pub(crate) fn get_base_attr(&self, ino: Ino) -> MetaResult<Option<InodeAttr>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let table = txn
+            .open_table(BASE_INODES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        table
+            .get(ino)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .map(|value| decode::<InodeAttr>(value.value()))
+            .transpose()
+    }
+
     /// Ensure the inode lifecycle table exists and matches the current schema version.
     pub fn ensure_inode_lifecycle_table(&self) -> MetaResult<()> {
         let txn = self

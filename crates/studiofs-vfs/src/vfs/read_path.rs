@@ -881,7 +881,7 @@ impl<'a> ReadMetadataResolver<'a> {
             self.vfs.clear_superseded_local_regular_file_state(
                 self.ino,
                 remote_attr.committed_content_epoch,
-                true,
+                false,
             );
             return Some(remote_attr);
         }
@@ -926,7 +926,7 @@ impl<'a> ReadMetadataResolver<'a> {
             self.vfs.clear_superseded_local_regular_file_state(
                 self.ino,
                 remote_attr.committed_content_epoch,
-                true,
+                false,
             );
             self.cache_attr(&remote_attr);
             return Some(remote_attr);
@@ -1483,6 +1483,7 @@ mod tests {
     use bytes::{Bytes, BytesMut};
     use std::any::Any;
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
     use std::time::Instant;
     use studiofs_cache::local::{
@@ -1500,6 +1501,23 @@ mod tests {
 
     fn read_range(start: u64, end: u64) -> ReadRange {
         ReadRange::new(start, end).expect("test range is non-empty")
+    }
+
+    #[derive(Default)]
+    struct RecordingReadPathKernelInvalidator {
+        inodes: Mutex<Vec<Ino>>,
+    }
+
+    impl RecordingReadPathKernelInvalidator {
+        fn snapshot(&self) -> Vec<Ino> {
+            self.inodes.lock().expect("invalidator lock").clone()
+        }
+    }
+
+    impl KernelInvalidator for RecordingReadPathKernelInvalidator {
+        fn inval_inode(&self, ino: Ino) {
+            self.inodes.lock().expect("invalidator lock").push(ino);
+        }
     }
 
     trait FileGraphMetaFixture {
@@ -2459,6 +2477,8 @@ mod tests {
                 ATTR_CACHE_TTL,
                 Instant::now(),
             );
+            let invalidator = Arc::new(RecordingReadPathKernelInvalidator::default());
+            vfs.set_kernel_invalidator(invalidator.clone());
 
             let (resolved_attr, _) = vfs
                 .resolve_read_metadata_async(ino, 0, published_payload.len() as u64)
@@ -2472,6 +2492,11 @@ mod tests {
             assert!(
                 !vfs.state.namespace.dirty_attrs.lock().contains_key(&ino),
                 "refresh should clear stale dirty attrs before serving the read"
+            );
+            assert_eq!(
+                invalidator.snapshot(),
+                Vec::<Ino>::new(),
+                "read-path refresh must not call WinFSP kernel invalidation while a mounted syscall is in flight"
             );
         });
     }
@@ -2515,6 +2540,8 @@ mod tests {
                 ATTR_CACHE_TTL,
                 Instant::now(),
             );
+            let invalidator = Arc::new(RecordingReadPathKernelInvalidator::default());
+            vfs.set_kernel_invalidator(invalidator.clone());
 
             let (resolved_attr, _) = vfs
                 .resolve_read_metadata_async(ino, 0, published_payload.len() as u64)
@@ -2535,6 +2562,11 @@ mod tests {
                     .size,
                 published_attr.size,
                 "stale pending attr cache should be replaced with authoritative ready metadata"
+            );
+            assert_eq!(
+                invalidator.snapshot(),
+                Vec::<Ino>::new(),
+                "read-path cache refresh must not call WinFSP kernel invalidation while a mounted syscall is in flight"
             );
         });
     }

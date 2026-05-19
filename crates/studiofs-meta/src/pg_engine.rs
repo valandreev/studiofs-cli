@@ -2887,31 +2887,33 @@ impl PgMetaEngine {
         overlay: &OverlayConflictSets,
         base_protected_regular_file_inodes: &HashSet<Ino>,
     ) -> MetaResult<(bool, OverlayConflictSets)> {
+        let batch_events =
+            self.preserve_published_content_state_for_attr_only_events(batch_events)?;
         let current_regular_file_conflicts =
-            self.current_regular_file_overlay_conflicts_for_batch(batch_events)?;
+            self.current_regular_file_overlay_conflicts_for_batch(&batch_events)?;
         let overlay = Self::merge_overlay_conflicts(overlay, &current_regular_file_conflicts);
         let mut protected_regular_file_inodes = base_protected_regular_file_inodes.clone();
         protected_regular_file_inodes
             .extend(current_regular_file_conflicts.block_inodes.iter().copied());
-        let removed_inodes = self.removed_inodes_for_batch(batch_events);
+        let removed_inodes = self.removed_inodes_for_batch(&batch_events);
         let mut removed_inodes_with_local_regular_file_state = HashSet::new();
         for ino in &removed_inodes {
             if self.removed_inode_has_local_regular_file_state_to_preserve(*ino)? {
                 removed_inodes_with_local_regular_file_state.insert(*ino);
             }
         }
-        let partial_publish_inodes = Self::partial_regular_file_publish_inodes(batch_events);
+        let partial_publish_inodes = Self::partial_regular_file_publish_inodes(&batch_events);
         let mut base_range_preserve_inodes = self
-            .protected_base_range_preserve_inodes(batch_events, &protected_regular_file_inodes)?;
+            .protected_base_range_preserve_inodes(&batch_events, &protected_regular_file_inodes)?;
         base_range_preserve_inodes.extend(partial_publish_inodes.iter().copied());
         let protected_attr_merges = self.protected_regular_file_attr_merges(
-            batch_events,
+            &batch_events,
             &protected_regular_file_inodes,
             &base_range_preserve_inodes,
         )?;
         self.local
             .apply_replica_events_to_base_preserving_protected_base_ranges(
-                batch_events,
+                &batch_events,
                 &base_range_preserve_inodes,
             )?;
         let serving_events: Vec<MetaEvent> = batch_events
@@ -2925,7 +2927,7 @@ impl PgMetaEngine {
                     && attr.content_epoch == attr.committed_content_epoch
                     && attr.size == attr.committed_size
                     && Self::batch_publish_covers_committed_extent(
-                        batch_events,
+                        &batch_events,
                         attr.ino,
                         attr.committed_size,
                     )
@@ -2959,7 +2961,7 @@ impl PgMetaEngine {
                 .apply_replica_serving_state(&grandfathered_attrs)?;
         }
         let mut aux_events = Vec::new();
-        for event in batch_events {
+        for event in &batch_events {
             if !Self::event_has_aux_apply_effect(event) {
                 continue;
             }
@@ -2988,6 +2990,65 @@ impl PgMetaEngine {
             applied_serving_state || !aux_events.is_empty() || !grandfathered_attrs.is_empty(),
             current_regular_file_conflicts,
         ))
+    }
+
+    fn preserve_published_content_state_for_attr_only_events(
+        &self,
+        batch_events: &[MetaEvent],
+    ) -> MetaResult<Vec<MetaEvent>> {
+        let published_inodes: HashSet<Ino> = batch_events
+            .iter()
+            .filter_map(|event| match event {
+                MetaEvent::PublishRegularFileBaseSlices { ino, .. } => Some(*ino),
+                _ => None,
+            })
+            .collect();
+        if published_inodes.is_empty()
+            && !batch_events.iter().any(|event| {
+                matches!(
+                    event,
+                    MetaEvent::SetAttr { attr }
+                        if attr.kind == FileType::RegularFile
+                            && attr.upload_state == UploadState::Ready
+                )
+            })
+        {
+            return Ok(batch_events.to_vec());
+        }
+
+        batch_events
+            .iter()
+            .map(|event| {
+                let MetaEvent::SetAttr { attr } = event else {
+                    return Ok(event.clone());
+                };
+                if attr.kind != FileType::RegularFile
+                    || attr.upload_state != UploadState::Ready
+                    || published_inodes.contains(&attr.ino)
+                {
+                    return Ok(event.clone());
+                }
+                let Some(base_attr) = self.local.get_base_attr(attr.ino)? else {
+                    return Ok(event.clone());
+                };
+                if base_attr.kind != FileType::RegularFile
+                    || base_attr.upload_state != UploadState::Ready
+                    || base_attr.content_epoch != base_attr.committed_content_epoch
+                    || base_attr.size != base_attr.committed_size
+                    || attr.content_epoch > base_attr.content_epoch
+                    || attr.committed_size >= base_attr.committed_size
+                {
+                    return Ok(event.clone());
+                }
+
+                let mut merged = attr.clone();
+                merged.size = base_attr.size;
+                merged.committed_size = base_attr.committed_size;
+                merged.content_epoch = base_attr.content_epoch;
+                merged.committed_content_epoch = base_attr.committed_content_epoch;
+                Ok(MetaEvent::SetAttr { attr: merged })
+            })
+            .collect()
     }
 
     fn protected_base_range_preserve_inodes(
@@ -3266,17 +3327,19 @@ impl PgMetaEngine {
             return Ok(false);
         }
 
-        let partial_publish_inodes = Self::partial_regular_file_publish_inodes(batch_events);
+        let batch_events =
+            self.preserve_published_content_state_for_attr_only_events(batch_events)?;
+        let partial_publish_inodes = Self::partial_regular_file_publish_inodes(&batch_events);
         if partial_publish_inodes.is_empty() {
-            self.local.apply_replica_events_to_base(batch_events)?;
+            self.local.apply_replica_events_to_base(&batch_events)?;
         } else {
             self.local
                 .apply_replica_events_to_base_preserving_protected_base_ranges(
-                    batch_events,
+                    &batch_events,
                     &partial_publish_inodes,
                 )?;
         }
-        for event in batch_events {
+        for event in &batch_events {
             if let MetaEvent::RenameEntry {
                 parent,
                 name,
@@ -6627,6 +6690,79 @@ mod tests {
             object_ids,
             vec![77_050, remote_tail.object_id],
             "a committed serving overlay must not keep hiding a protected base payload merge"
+        );
+    }
+
+    #[test]
+    fn attr_only_foreign_batch_must_not_regress_published_file_content_state() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+
+        let file = create_published_small_file(&pg, ROOT_INO, b"attr-only-regression.txt", 77_052);
+        let start = pg.flushed_event_seq.load(Ordering::SeqCst);
+        let end = pg.local.get_counter("nextEventSeq").expect("event end");
+        let local_events = pg
+            .local
+            .read_events_range(start, end)
+            .expect("read local events");
+        let projected_self_batch = PgMetaEngine::project_remote_events(&local_events);
+        pg.acknowledge_local_prefix_from_self_batch(&projected_self_batch)
+            .expect("ack local seed publish");
+        let mut winner_attr = pg.get_attr(file.ino).expect("load winner attr");
+        winner_attr.size = u64::from(DEFAULT_BLOCK_SIZE);
+        winner_attr.committed_size = u64::from(DEFAULT_BLOCK_SIZE);
+        winner_attr.content_epoch = 3;
+        winner_attr.committed_content_epoch = 3;
+        winner_attr.upload_state = UploadState::Ready;
+        let winner_payload = PayloadRef::new_full(77_053, DEFAULT_BLOCK_SIZE);
+        let winner_batch = vec![
+            MetaEvent::PublishRegularFileBaseSlices {
+                ino: file.ino,
+                chunk_slices: fixture_payload_slices(
+                    0,
+                    Some(&winner_payload),
+                    PayloadRefState::Published,
+                )
+                .expect("winner slices"),
+            },
+            MetaEvent::SetAttr {
+                attr: winner_attr.clone(),
+            },
+        ];
+        pg.apply_foreign_batch(
+            &winner_batch,
+            &OverlayConflictSets::default(),
+            &HashSet::new(),
+        )
+        .expect("apply winner batch");
+        assert_eq!(
+            lookup_object_ids(&pg, file.ino, winner_attr.size).expect("lookup winner object ids"),
+            vec![winner_payload.object_id],
+            "setup should expose the winner payload before the attr-only batch"
+        );
+
+        let mut stale_attr = winner_attr.clone();
+        stale_attr.size = 0;
+        stale_attr.committed_size = 0;
+        stale_attr.content_epoch = 1;
+        stale_attr.committed_content_epoch = 1;
+        stale_attr.mtime = winner_attr.mtime.saturating_add(1);
+        stale_attr.ctime = stale_attr.mtime;
+        pg.apply_foreign_batch(
+            &[MetaEvent::SetAttr { attr: stale_attr }],
+            &OverlayConflictSets::default(),
+            &HashSet::new(),
+        )
+        .expect("apply attr-only stale batch");
+
+        let attr = pg.get_attr(file.ino).expect("load final attr");
+        assert_eq!(attr.size, u64::from(DEFAULT_BLOCK_SIZE));
+        assert_eq!(attr.committed_size, u64::from(DEFAULT_BLOCK_SIZE));
+        assert_eq!(attr.content_epoch, 3);
+        assert_eq!(attr.committed_content_epoch, 3);
+        assert_eq!(
+            lookup_object_ids(&pg, file.ino, attr.size).expect("lookup final object ids"),
+            vec![winner_payload.object_id],
+            "an attr-only batch must not hide the latest published content graph"
         );
     }
 

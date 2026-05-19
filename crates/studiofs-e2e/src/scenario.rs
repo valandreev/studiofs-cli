@@ -5037,7 +5037,7 @@ fn run_hotspot_helper_process(
         ))
     };
 
-    let exe = std::env::current_exe()?;
+    let exe = prepare_hotspot_helper_exe(context)?;
     let mut command = Command::new(exe);
     command
         .arg("hotspot-op")
@@ -5118,6 +5118,21 @@ fn run_hotspot_helper_process(
         }
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+fn prepare_hotspot_helper_exe(context: &ScenarioContext) -> io::Result<PathBuf> {
+    let source = std::env::current_exe()?;
+    let helper_dir = context.scenario_dir.join("hotspot-helper-bin");
+    fs::create_dir_all(&helper_dir)?;
+    let extension = source
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("exe");
+    let helper = helper_dir.join(format!("studiofs-e2e-hotspot-helper.{extension}"));
+    if !helper.exists() {
+        fs::copy(source, &helper)?;
+    }
+    Ok(helper)
 }
 
 #[cfg(test)]
