@@ -1658,7 +1658,11 @@ fn run_rustfs_outage_body(
 
     let relative_path = RUSTFS_OUTAGE_FILE_NAME;
     let source_file = clients[0].mount_point.join(relative_path);
-    fs::write(&source_file, RUSTFS_OUTAGE_INITIAL_PAYLOAD)?;
+    write_mounted_initial_file(
+        source_file.clone(),
+        RUSTFS_OUTAGE_INITIAL_PAYLOAD,
+        "rustfs outage initial payload",
+    )?;
     driver.after_initial_write(&clients, relative_path)?;
     let initial_mounts = clients
         .iter()
@@ -1675,7 +1679,14 @@ fn run_rustfs_outage_body(
     let outage_started = Instant::now();
     driver.stop_rustfs()?;
     fs::write(&source_file, RUSTFS_OUTAGE_RECOVERED_PAYLOAD)?;
-    let local_read_checksum_sha256 = bytes_sha256(&fs::read(&source_file)?);
+    let local_read = wait_for_mounted_payload_readback(
+        &source_file,
+        RUSTFS_OUTAGE_RECOVERED_PAYLOAD,
+        MOUNTED_WRITE_READBACK_TIMEOUT,
+        MOUNTED_WRITE_READBACK_POLL_INTERVAL,
+    )
+    .map_err(scenario_error_to_io)?;
+    let local_read_checksum_sha256 = bytes_sha256(&local_read);
     let outage_duration_ms = outage_started.elapsed().as_millis();
     let mut peer_visibility_during_outage = Vec::new();
     for peer in clients
@@ -1701,6 +1712,13 @@ fn run_rustfs_outage_body(
         context.scenario_dir.join("validation"),
         convergence_timeout,
         poll_interval,
+    )?;
+    wait_for_mounted_initial_payloads_until(
+        &clients[..RUSTFS_OUTAGE_CLIENT_NAMES.len()],
+        &[(relative_path, RUSTFS_OUTAGE_RECOVERED_PAYLOAD)],
+        Instant::now() + convergence_timeout,
+        poll_interval,
+        "rustfs outage recovered payload",
     )?;
     let upload_recovery_time_ms = recovery_started.elapsed().as_millis();
     let mut final_client_checksums = Vec::new();
@@ -4371,12 +4389,18 @@ fn run_cold_observer_warm_history(
             path.as_str()
         };
         let target = (operation == "rename").then_some(rename_dest.as_str());
+        let helper_operation = if operation == "overwrite" {
+            "overwrite-barrier"
+        } else {
+            operation
+        };
         let operation_record = timed_cold_observer_helper_fs_op(
             context,
             started,
             order,
             client,
             operation,
+            helper_operation,
             operation_path,
             &log_path,
             HOTSPOT_CHURN_OPERATION_TIMEOUT,
@@ -4451,6 +4475,7 @@ fn timed_cold_observer_helper_fs_op(
     order: usize,
     client: &ClientSpec,
     operation: &str,
+    helper_operation: &str,
     path: &str,
     log_path: &str,
     timeout: Duration,
@@ -4459,7 +4484,14 @@ fn timed_cold_observer_helper_fs_op(
 ) -> Result<NamespaceCollisionOperation, ScenarioError> {
     let label = format!("{} {} {}", client.name, operation, log_path);
     run_hotspot_helper_process(
-        context, timeout, client, operation, path, target, payload, label,
+        context,
+        timeout,
+        client,
+        helper_operation,
+        path,
+        target,
+        payload,
+        label,
     )?;
     required_op(started, order, client, operation, log_path, Ok(()))
 }
@@ -4750,6 +4782,13 @@ fn write_mounted_initial_file(
         ))));
     }
     Ok(())
+}
+
+fn scenario_error_to_io(error: ScenarioError) -> io::Error {
+    match error {
+        ScenarioError::Io(error) => error,
+        error => io::Error::other(error),
+    }
 }
 
 fn wait_for_mounted_payload_readback(
@@ -5366,7 +5405,15 @@ fn run_lww_reconnect_operations(
         &clients[0],
         "write",
         &path,
-        || write_parented(clients[0].mount_point.join(&path), &client_a_payload),
+        || {
+            write_mounted_file_with_readback(
+                clients[0].mount_point.join(&path),
+                &client_a_payload,
+                "lww reconnect client-a write",
+                false,
+            )
+            .map_err(scenario_error_to_io)
+        },
     ))?);
     operations.push(required_op(
         started,
@@ -5385,7 +5432,15 @@ fn run_lww_reconnect_operations(
         &clients[1],
         "write",
         &path,
-        || write_parented(clients[1].mount_point.join(&path), &client_b_payload),
+        || {
+            write_mounted_file_with_readback(
+                clients[1].mount_point.join(&path),
+                &client_b_payload,
+                "lww reconnect client-b write",
+                false,
+            )
+            .map_err(scenario_error_to_io)
+        },
     ))?);
     let client_d_payload = isolation.payload("write_client_d", &path, "version from client-d\n");
     operations.push(required_record(fs_op(
@@ -5394,7 +5449,15 @@ fn run_lww_reconnect_operations(
         &clients[3],
         "write",
         &path,
-        || write_parented(clients[3].mount_point.join(&path), &client_d_payload),
+        || {
+            write_mounted_file_with_readback(
+                clients[3].mount_point.join(&path),
+                &client_d_payload,
+                "lww reconnect client-d write",
+                false,
+            )
+            .map_err(scenario_error_to_io)
+        },
     ))?);
     operations.push(required_op(
         started,
@@ -5417,7 +5480,15 @@ fn run_lww_reconnect_operations(
         &clients[2],
         "write_lww_winner",
         &path,
-        || write_parented(clients[2].mount_point.join(&path), &winner),
+        || {
+            write_mounted_file_with_readback(
+                clients[2].mount_point.join(&path),
+                &winner,
+                "lww reconnect winner write",
+                false,
+            )
+            .map_err(scenario_error_to_io)
+        },
     ))?);
     operations.push(required_op(
         started,
@@ -5430,7 +5501,13 @@ fn run_lww_reconnect_operations(
             .and_then(|()| controller.remount(&clients[2].name))
             .map_err(ScenarioError::from),
     )?);
-    let actual = fs::read(clients[2].mount_point.join(&path))?;
+    let actual = wait_for_mounted_payload_readback(
+        &clients[2].mount_point.join(&path),
+        &winner,
+        MOUNTED_WRITE_READBACK_TIMEOUT,
+        MOUNTED_WRITE_READBACK_POLL_INTERVAL,
+    )
+    .map_err(scenario_error_to_io)?;
     let oracle = LwwReconnectOracle {
         expected_payload_sha256: bytes_sha256(&winner),
         actual_payload_sha256: bytes_sha256(&actual),
@@ -8570,7 +8647,63 @@ pub fn run_hotspot_op_helper(
                 None,
             )?;
         }
-        "create" | "write" | "overwrite" => {
+        "create" => {
+            let payload_path = payload.ok_or_else(|| anyhow::anyhow!("missing payload"))?;
+            record_hotspot_helper_progress(
+                progress,
+                "before_read_payload",
+                operation,
+                &path,
+                target,
+                None,
+            )?;
+            let payload = fs::read(payload_path)?;
+            record_hotspot_helper_progress(
+                progress,
+                "after_read_payload",
+                operation,
+                &path,
+                target,
+                Some(payload.len()),
+            )?;
+            write_parented_with_barrier_progress(
+                &path,
+                &payload,
+                progress,
+                operation,
+                target,
+                BarrierWriteMode::CreateNew,
+            )?;
+        }
+        "overwrite-barrier" => {
+            let payload_path = payload.ok_or_else(|| anyhow::anyhow!("missing payload"))?;
+            record_hotspot_helper_progress(
+                progress,
+                "before_read_payload",
+                operation,
+                &path,
+                target,
+                None,
+            )?;
+            let payload = fs::read(payload_path)?;
+            record_hotspot_helper_progress(
+                progress,
+                "after_read_payload",
+                operation,
+                &path,
+                target,
+                Some(payload.len()),
+            )?;
+            write_parented_with_barrier_progress(
+                &path,
+                &payload,
+                progress,
+                operation,
+                target,
+                BarrierWriteMode::Overwrite,
+            )?;
+        }
+        "write" | "overwrite" => {
             let payload_path = payload.ok_or_else(|| anyhow::anyhow!("missing payload"))?;
             record_hotspot_helper_progress(
                 progress,
@@ -8725,6 +8858,103 @@ fn write_parented_with_progress(
     record_hotspot_helper_progress(progress, "before_sync_all", operation, path, target, None)?;
     file.sync_all()?;
     record_hotspot_helper_progress(progress, "after_sync_all", operation, path, target, None)
+}
+
+enum BarrierWriteMode {
+    CreateNew,
+    Overwrite,
+}
+
+fn write_parented_with_barrier_progress(
+    path: &Path,
+    payload: &[u8],
+    progress: Option<&Path>,
+    operation: &str,
+    target: Option<&str>,
+    mode: BarrierWriteMode,
+) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        record_hotspot_helper_progress(
+            progress,
+            "before_create_parent",
+            operation,
+            path,
+            target,
+            None,
+        )?;
+        fs::create_dir_all(parent)?;
+        record_hotspot_helper_progress(
+            progress,
+            "after_create_parent",
+            operation,
+            path,
+            target,
+            None,
+        )?;
+    }
+    record_hotspot_helper_progress(
+        progress,
+        "before_open_barrier_write",
+        operation,
+        path,
+        target,
+        Some(payload.len()),
+    )?;
+    let mut options = mounted_write_barrier_open_options();
+    match mode {
+        BarrierWriteMode::CreateNew => {
+            options.create_new(true);
+        }
+        BarrierWriteMode::Overwrite => {
+            options.create(true).truncate(true).read(true);
+        }
+    }
+    let mut file = options.open(path)?;
+    record_hotspot_helper_progress(
+        progress,
+        "after_open_barrier_write",
+        operation,
+        path,
+        target,
+        Some(payload.len()),
+    )?;
+    record_hotspot_helper_progress(
+        progress,
+        "before_write_all",
+        operation,
+        path,
+        target,
+        Some(payload.len()),
+    )?;
+    file.write_all(payload)?;
+    record_hotspot_helper_progress(
+        progress,
+        "after_write_all",
+        operation,
+        path,
+        target,
+        Some(payload.len()),
+    )?;
+    record_hotspot_helper_progress(progress, "before_sync_all", operation, path, target, None)?;
+    file.sync_all()?;
+    record_hotspot_helper_progress(progress, "after_sync_all", operation, path, target, None)?;
+    drop(file);
+    record_hotspot_helper_progress(progress, "before_readback", operation, path, target, None)?;
+    let readback = wait_for_mounted_payload_readback(
+        path,
+        payload,
+        MOUNTED_WRITE_READBACK_TIMEOUT,
+        MOUNTED_WRITE_READBACK_POLL_INTERVAL,
+    )
+    .map_err(io::Error::other)?;
+    record_hotspot_helper_progress(
+        progress,
+        "after_readback",
+        operation,
+        path,
+        target,
+        Some(readback.len()),
+    )
 }
 
 fn append_payload(path: PathBuf, payload: &[u8]) -> io::Result<()> {
