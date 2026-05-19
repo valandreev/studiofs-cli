@@ -397,8 +397,79 @@ impl<'a> RemoteApplyCoordinator<'a> {
         recent_flush: Option<&RecentFlush>,
         last_seq: i64,
     ) -> MetaResult<bool> {
-        self.engine
-            .apply_decoded_foreign_batches_locked_impl(batches, recent_flush, last_seq)
+        if batches.is_empty() {
+            return Ok(false);
+        }
+
+        let mut overlay = self.engine.local_overlay_conflicts()?;
+        let mut applied_any = false;
+        let mut max_version = last_seq;
+        let mut max_namespace_version = self.engine.namespace_version.load(Ordering::SeqCst);
+        let mut reconcile_inodes = HashSet::new();
+        let mut reconcile_dentry_keys = HashSet::new();
+        let mut replay_protected_overlay = OverlayConflictSets::default();
+        let empty_protected_base_inodes = HashSet::new();
+        for batch in batches {
+            PgMetaEngine::collect_replay_reconcile_inodes(&mut reconcile_inodes, &batch.events);
+            PgMetaEngine::collect_replay_reconcile_dentries(
+                &mut reconcile_dentry_keys,
+                &batch.events,
+            );
+            if batch.is_self_batch {
+                applied_any |= self.apply_visible_self_batch(&batch.events)?;
+                self.acknowledge_local_prefix_from_self_batch(&batch.events)?;
+            } else {
+                let effective_overlay = if let Some(recent_flush) = recent_flush {
+                    if batch.batch_version < recent_flush.batch_version {
+                        PgMetaEngine::merge_overlay_conflicts(&overlay, &recent_flush.overlay)
+                    } else {
+                        overlay.clone()
+                    }
+                } else {
+                    overlay.clone()
+                };
+                let protected_base_inodes = if let Some(recent_flush) = recent_flush {
+                    &recent_flush.overlay.block_inodes
+                } else {
+                    &empty_protected_base_inodes
+                };
+                let outcome = self.apply_foreign_batch(
+                    &batch.events,
+                    &effective_overlay,
+                    protected_base_inodes,
+                )?;
+                applied_any |= outcome.changed;
+                replay_protected_overlay = PgMetaEngine::merge_overlay_conflicts(
+                    &replay_protected_overlay,
+                    &outcome.protected_overlay,
+                );
+                if batch.events.iter().any(MetaEvent::is_namespace_mutation) {
+                    max_namespace_version = max_namespace_version.max(batch.batch_version);
+                }
+            }
+            max_version = batch.batch_version;
+            overlay = self.engine.local_overlay_conflicts()?;
+        }
+        let final_overlay =
+            PgMetaEngine::merge_overlay_conflicts(&overlay, &replay_protected_overlay);
+        applied_any |= self
+            .engine
+            .reconcile_regular_file_serving_from_base_with_overlay(
+                &reconcile_inodes,
+                &final_overlay,
+            )?;
+        applied_any |= self
+            .engine
+            .reconcile_serving_dentries_from_base_with_overlay(
+                &reconcile_dentry_keys,
+                &final_overlay,
+            )?;
+        self.engine.persist_local_version(max_version)?;
+        if max_namespace_version > self.engine.namespace_version.load(Ordering::SeqCst) {
+            self.engine
+                .persist_namespace_version(max_namespace_version)?;
+        }
+        Ok(applied_any)
     }
 }
 
@@ -2968,6 +3039,7 @@ impl PgMetaEngine {
         RemoteApplyCoordinator::decode_foreign_batch(rows, start_idx, client_id)
     }
 
+    #[cfg(test)]
     fn apply_foreign_batch(
         &self,
         batch_events: &[MetaEvent],
@@ -3454,6 +3526,7 @@ impl PgMetaEngine {
         candidates.extend(Self::overlay_conflicts_for_events(batch_events).dentry_keys);
     }
 
+    #[cfg(test)]
     fn apply_visible_self_batch(&self, batch_events: &[MetaEvent]) -> MetaResult<bool> {
         RemoteApplyCoordinator::new(self).apply_visible_self_batch(batch_events)
     }
@@ -3514,6 +3587,7 @@ impl PgMetaEngine {
         Ok(true)
     }
 
+    #[cfg(test)]
     fn acknowledge_local_prefix_from_self_batch(
         &self,
         batch_events: &[MetaEvent],
@@ -4010,76 +4084,6 @@ impl PgMetaEngine {
         last_seq: i64,
     ) -> MetaResult<bool> {
         RemoteApplyCoordinator::new(self).apply_decoded_batches(batches, recent_flush, last_seq)
-    }
-
-    fn apply_decoded_foreign_batches_locked_impl(
-        &self,
-        batches: Vec<DecodedReplayBatch>,
-        recent_flush: Option<&RecentFlush>,
-        last_seq: i64,
-    ) -> MetaResult<bool> {
-        if batches.is_empty() {
-            return Ok(false);
-        }
-
-        let mut overlay = self.local_overlay_conflicts()?;
-        let mut applied_any = false;
-        let mut max_version = last_seq;
-        let mut max_namespace_version = self.namespace_version.load(Ordering::SeqCst);
-        let mut reconcile_inodes = HashSet::new();
-        let mut reconcile_dentry_keys = HashSet::new();
-        let mut replay_protected_overlay = OverlayConflictSets::default();
-        let empty_protected_base_inodes = HashSet::new();
-        for batch in batches {
-            Self::collect_replay_reconcile_inodes(&mut reconcile_inodes, &batch.events);
-            Self::collect_replay_reconcile_dentries(&mut reconcile_dentry_keys, &batch.events);
-            if batch.is_self_batch {
-                applied_any |= self.apply_visible_self_batch(&batch.events)?;
-                self.acknowledge_local_prefix_from_self_batch(&batch.events)?;
-            } else {
-                let effective_overlay = if let Some(recent_flush) = recent_flush {
-                    if batch.batch_version < recent_flush.batch_version {
-                        Self::merge_overlay_conflicts(&overlay, &recent_flush.overlay)
-                    } else {
-                        overlay.clone()
-                    }
-                } else {
-                    overlay.clone()
-                };
-                let protected_base_inodes = if let Some(recent_flush) = recent_flush {
-                    &recent_flush.overlay.block_inodes
-                } else {
-                    &empty_protected_base_inodes
-                };
-                let (changed, protected_overlay) = self.apply_foreign_batch(
-                    &batch.events,
-                    &effective_overlay,
-                    protected_base_inodes,
-                )?;
-                applied_any |= changed;
-                replay_protected_overlay =
-                    Self::merge_overlay_conflicts(&replay_protected_overlay, &protected_overlay);
-                if batch.events.iter().any(MetaEvent::is_namespace_mutation) {
-                    max_namespace_version = max_namespace_version.max(batch.batch_version);
-                }
-            }
-            max_version = batch.batch_version;
-            overlay = self.local_overlay_conflicts()?;
-        }
-        let final_overlay = Self::merge_overlay_conflicts(&overlay, &replay_protected_overlay);
-        applied_any |= self.reconcile_regular_file_serving_from_base_with_overlay(
-            &reconcile_inodes,
-            &final_overlay,
-        )?;
-        applied_any |= self.reconcile_serving_dentries_from_base_with_overlay(
-            &reconcile_dentry_keys,
-            &final_overlay,
-        )?;
-        self.persist_local_version(max_version)?;
-        if max_namespace_version > self.namespace_version.load(Ordering::SeqCst) {
-            self.persist_namespace_version(max_namespace_version)?;
-        }
-        Ok(applied_any)
     }
 
     fn record_metadata_sync_result(&self, source: MetadataSyncSource, result: &MetaResult<bool>) {
