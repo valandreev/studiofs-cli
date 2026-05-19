@@ -338,6 +338,125 @@ impl<'a> RemoteApplyCoordinator<'a> {
         })
     }
 
+    fn overlay_conflicts_for_events(events: &[MetaEvent]) -> OverlayConflictSets {
+        let mut overlay = OverlayConflictSets::default();
+        for event in events {
+            match event {
+                MetaEvent::SetAttr { attr } => {
+                    overlay.attr_inodes.insert(attr.ino);
+                }
+                MetaEvent::RemoveAttr { ino } => {
+                    overlay.attr_inodes.insert(*ino);
+                    overlay.block_inodes.insert(*ino);
+                    overlay.symlink_inodes.insert(*ino);
+                    overlay.xattr_inodes.insert(*ino);
+                }
+                MetaEvent::AddEntry { parent, name, .. }
+                | MetaEvent::RemoveEntry { parent, name } => {
+                    overlay
+                        .dentry_keys
+                        .insert(PgMetaEngine::dentry_key(*parent, name));
+                }
+                MetaEvent::RenameEntry {
+                    parent,
+                    name,
+                    new_parent,
+                    new_name,
+                    entry,
+                    displaced_set_attr,
+                    displaced_remove_attr_ino,
+                    moved_dir_attr,
+                    old_parent_attr,
+                    new_parent_attr,
+                } => {
+                    overlay
+                        .dentry_keys
+                        .insert(PgMetaEngine::dentry_key(*parent, name));
+                    overlay
+                        .dentry_keys
+                        .insert(PgMetaEngine::dentry_key(*new_parent, new_name));
+                    overlay.attr_inodes.insert(entry.ino);
+                    if let Some(attr) = displaced_set_attr.as_ref() {
+                        overlay.attr_inodes.insert(attr.ino);
+                    }
+                    if let Some(ino) = displaced_remove_attr_ino {
+                        overlay.attr_inodes.insert(*ino);
+                    }
+                    if let Some(attr) = moved_dir_attr.as_ref() {
+                        overlay.attr_inodes.insert(attr.ino);
+                    }
+                    if let Some(attr) = old_parent_attr.as_ref() {
+                        overlay.attr_inodes.insert(attr.ino);
+                    }
+                    if let Some(attr) = new_parent_attr.as_ref() {
+                        overlay.attr_inodes.insert(attr.ino);
+                    }
+                }
+                MetaEvent::SetRegularFileOverlaySlices { ino, .. }
+                | MetaEvent::PublishRegularFileBaseSlices { ino, .. }
+                | MetaEvent::RemoveRegularFileGraph { ino } => {
+                    overlay.block_inodes.insert(*ino);
+                }
+                MetaEvent::SetSymlinkTarget { ino, .. } => {
+                    overlay.symlink_inodes.insert(*ino);
+                    overlay.attr_inodes.insert(*ino);
+                }
+                MetaEvent::SetXattr { ino, name, .. } | MetaEvent::RemoveXattr { ino, name } => {
+                    overlay.xattr_inodes.insert(*ino);
+                    overlay
+                        .xattr_keys
+                        .insert(PgMetaEngine::xattr_key(*ino, name));
+                }
+                MetaEvent::SetAclRule { ino, principal, .. }
+                | MetaEvent::RemoveAclRule { ino, principal } => {
+                    overlay.attr_inodes.insert(*ino);
+                    overlay
+                        .acl_keys
+                        .insert(PgMetaEngine::acl_key(*ino, principal));
+                }
+                MetaEvent::AddPendingDeletion { .. }
+                | MetaEvent::RemovePendingDeletion { .. }
+                | MetaEvent::CreateSnapshot { .. }
+                | MetaEvent::UpdateSnapshotState { .. } => {}
+            }
+        }
+        overlay
+    }
+
+    fn merge_overlay_conflicts(
+        base: &OverlayConflictSets,
+        extra: &OverlayConflictSets,
+    ) -> OverlayConflictSets {
+        let mut merged = base.clone();
+        merged
+            .block_inodes
+            .extend(extra.block_inodes.iter().copied());
+        merged.attr_inodes.extend(extra.attr_inodes.iter().copied());
+        merged.dentry_keys.extend(extra.dentry_keys.iter().cloned());
+        merged
+            .symlink_inodes
+            .extend(extra.symlink_inodes.iter().copied());
+        merged
+            .xattr_inodes
+            .extend(extra.xattr_inodes.iter().copied());
+        merged.xattr_keys.extend(extra.xattr_keys.iter().cloned());
+        merged.acl_keys.extend(extra.acl_keys.iter().cloned());
+        merged
+    }
+
+    fn collect_replay_reconcile_inodes(candidates: &mut HashSet<Ino>, batch_events: &[MetaEvent]) {
+        candidates.extend(PgMetaEngine::regular_file_serving_reconcile_inodes(
+            batch_events,
+        ));
+    }
+
+    fn collect_replay_reconcile_dentries(
+        candidates: &mut HashSet<Vec<u8>>,
+        batch_events: &[MetaEvent],
+    ) {
+        candidates.extend(Self::overlay_conflicts_for_events(batch_events).dentry_keys);
+    }
+
     fn decode_foreign_batch(
         rows: &[tokio_postgres::Row],
         start_idx: usize,
@@ -410,18 +529,15 @@ impl<'a> RemoteApplyCoordinator<'a> {
         let mut replay_protected_overlay = OverlayConflictSets::default();
         let empty_protected_base_inodes = HashSet::new();
         for batch in batches {
-            PgMetaEngine::collect_replay_reconcile_inodes(&mut reconcile_inodes, &batch.events);
-            PgMetaEngine::collect_replay_reconcile_dentries(
-                &mut reconcile_dentry_keys,
-                &batch.events,
-            );
+            Self::collect_replay_reconcile_inodes(&mut reconcile_inodes, &batch.events);
+            Self::collect_replay_reconcile_dentries(&mut reconcile_dentry_keys, &batch.events);
             if batch.is_self_batch {
                 applied_any |= self.apply_visible_self_batch(&batch.events)?;
                 self.acknowledge_local_prefix_from_self_batch(&batch.events)?;
             } else {
                 let effective_overlay = if let Some(recent_flush) = recent_flush {
                     if batch.batch_version < recent_flush.batch_version {
-                        PgMetaEngine::merge_overlay_conflicts(&overlay, &recent_flush.overlay)
+                        Self::merge_overlay_conflicts(&overlay, &recent_flush.overlay)
                     } else {
                         overlay.clone()
                     }
@@ -439,7 +555,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     protected_base_inodes,
                 )?;
                 applied_any |= outcome.changed;
-                replay_protected_overlay = PgMetaEngine::merge_overlay_conflicts(
+                replay_protected_overlay = Self::merge_overlay_conflicts(
                     &replay_protected_overlay,
                     &outcome.protected_overlay,
                 );
@@ -450,8 +566,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
             max_version = batch.batch_version;
             overlay = self.engine.local_overlay_conflicts()?;
         }
-        let final_overlay =
-            PgMetaEngine::merge_overlay_conflicts(&overlay, &replay_protected_overlay);
+        let final_overlay = Self::merge_overlay_conflicts(&overlay, &replay_protected_overlay);
         applied_any |= self
             .engine
             .reconcile_regular_file_serving_from_base_with_overlay(
@@ -2869,101 +2984,14 @@ impl PgMetaEngine {
     }
 
     fn overlay_conflicts_for_events(events: &[MetaEvent]) -> OverlayConflictSets {
-        let mut overlay = OverlayConflictSets::default();
-        for event in events {
-            match event {
-                MetaEvent::SetAttr { attr } => {
-                    overlay.attr_inodes.insert(attr.ino);
-                }
-                MetaEvent::RemoveAttr { ino } => {
-                    overlay.attr_inodes.insert(*ino);
-                    overlay.block_inodes.insert(*ino);
-                    overlay.symlink_inodes.insert(*ino);
-                    overlay.xattr_inodes.insert(*ino);
-                }
-                MetaEvent::AddEntry { parent, name, .. }
-                | MetaEvent::RemoveEntry { parent, name } => {
-                    overlay.dentry_keys.insert(Self::dentry_key(*parent, name));
-                }
-                MetaEvent::RenameEntry {
-                    parent,
-                    name,
-                    new_parent,
-                    new_name,
-                    entry,
-                    displaced_set_attr,
-                    displaced_remove_attr_ino,
-                    moved_dir_attr,
-                    old_parent_attr,
-                    new_parent_attr,
-                } => {
-                    overlay.dentry_keys.insert(Self::dentry_key(*parent, name));
-                    overlay
-                        .dentry_keys
-                        .insert(Self::dentry_key(*new_parent, new_name));
-                    overlay.attr_inodes.insert(entry.ino);
-                    if let Some(attr) = displaced_set_attr.as_ref() {
-                        overlay.attr_inodes.insert(attr.ino);
-                    }
-                    if let Some(ino) = displaced_remove_attr_ino {
-                        overlay.attr_inodes.insert(*ino);
-                    }
-                    if let Some(attr) = moved_dir_attr.as_ref() {
-                        overlay.attr_inodes.insert(attr.ino);
-                    }
-                    if let Some(attr) = old_parent_attr.as_ref() {
-                        overlay.attr_inodes.insert(attr.ino);
-                    }
-                    if let Some(attr) = new_parent_attr.as_ref() {
-                        overlay.attr_inodes.insert(attr.ino);
-                    }
-                }
-                MetaEvent::SetRegularFileOverlaySlices { ino, .. }
-                | MetaEvent::PublishRegularFileBaseSlices { ino, .. }
-                | MetaEvent::RemoveRegularFileGraph { ino } => {
-                    overlay.block_inodes.insert(*ino);
-                }
-                MetaEvent::SetSymlinkTarget { ino, .. } => {
-                    overlay.symlink_inodes.insert(*ino);
-                    overlay.attr_inodes.insert(*ino);
-                }
-                MetaEvent::SetXattr { ino, name, .. } | MetaEvent::RemoveXattr { ino, name } => {
-                    overlay.xattr_inodes.insert(*ino);
-                    overlay.xattr_keys.insert(Self::xattr_key(*ino, name));
-                }
-                MetaEvent::SetAclRule { ino, principal, .. }
-                | MetaEvent::RemoveAclRule { ino, principal } => {
-                    overlay.attr_inodes.insert(*ino);
-                    overlay.acl_keys.insert(Self::acl_key(*ino, principal));
-                }
-                MetaEvent::AddPendingDeletion { .. }
-                | MetaEvent::RemovePendingDeletion { .. }
-                | MetaEvent::CreateSnapshot { .. }
-                | MetaEvent::UpdateSnapshotState { .. } => {}
-            }
-        }
-        overlay
+        RemoteApplyCoordinator::overlay_conflicts_for_events(events)
     }
 
     fn merge_overlay_conflicts(
         base: &OverlayConflictSets,
         extra: &OverlayConflictSets,
     ) -> OverlayConflictSets {
-        let mut merged = base.clone();
-        merged
-            .block_inodes
-            .extend(extra.block_inodes.iter().copied());
-        merged.attr_inodes.extend(extra.attr_inodes.iter().copied());
-        merged.dentry_keys.extend(extra.dentry_keys.iter().cloned());
-        merged
-            .symlink_inodes
-            .extend(extra.symlink_inodes.iter().copied());
-        merged
-            .xattr_inodes
-            .extend(extra.xattr_inodes.iter().copied());
-        merged.xattr_keys.extend(extra.xattr_keys.iter().cloned());
-        merged.acl_keys.extend(extra.acl_keys.iter().cloned());
-        merged
+        RemoteApplyCoordinator::merge_overlay_conflicts(base, extra)
     }
 
     fn local_overlay_conflicts(&self) -> MetaResult<OverlayConflictSets> {
@@ -3513,17 +3541,6 @@ impl PgMetaEngine {
         }
         self.local
             .reconcile_serving_dentries_from_base(dentry_keys, &overlay.dentry_keys)
-    }
-
-    fn collect_replay_reconcile_inodes(candidates: &mut HashSet<Ino>, batch_events: &[MetaEvent]) {
-        candidates.extend(Self::regular_file_serving_reconcile_inodes(batch_events));
-    }
-
-    fn collect_replay_reconcile_dentries(
-        candidates: &mut HashSet<Vec<u8>>,
-        batch_events: &[MetaEvent],
-    ) {
-        candidates.extend(Self::overlay_conflicts_for_events(batch_events).dentry_keys);
     }
 
     #[cfg(test)]
