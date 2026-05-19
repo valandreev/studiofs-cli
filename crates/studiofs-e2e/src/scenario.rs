@@ -4365,26 +4365,25 @@ fn run_cold_observer_warm_history(
         ),
     ]) {
         let client = &clients[client_index];
-        let result = match operation {
-            "mkdir" => {
-                fs::create_dir_all(client.mount_point.join(&path)).map_err(ScenarioError::from)
-            }
-            "delete" => {
-                fs::remove_file(client.mount_point.join(&path)).map_err(ScenarioError::from)
-            }
-            "rename" => fs::rename(
-                client.mount_point.join(&rename_source),
-                client.mount_point.join(&rename_dest),
-            )
-            .map_err(ScenarioError::from),
-            "append" => append_payload(client.mount_point.join(&path), action.as_deref().unwrap())
-                .map_err(ScenarioError::from),
-            _ => write_parented(client.mount_point.join(&path), action.as_deref().unwrap())
-                .map_err(ScenarioError::from),
+        let operation_path = if operation == "rename" {
+            rename_source.as_str()
+        } else {
+            path.as_str()
         };
-        operations.push(required_op(
-            started, order, client, operation, &log_path, result,
-        )?);
+        let target = (operation == "rename").then_some(rename_dest.as_str());
+        let operation_record = timed_cold_observer_helper_fs_op(
+            context,
+            started,
+            order,
+            client,
+            operation,
+            operation_path,
+            &log_path,
+            HOTSPOT_CHURN_OPERATION_TIMEOUT,
+            action.as_deref(),
+            target,
+        )?;
+        operations.push(operation_record);
         match operation {
             "create" if path == delete_target || path == rename_source => {
                 wait_for_mounted_initial_payloads_until(
@@ -4443,6 +4442,26 @@ fn run_cold_observer_warm_history(
             final_checksum_sha256: bytes_sha256(&final_payload),
         },
     ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn timed_cold_observer_helper_fs_op(
+    context: &ScenarioContext,
+    started: Instant,
+    order: usize,
+    client: &ClientSpec,
+    operation: &str,
+    path: &str,
+    log_path: &str,
+    timeout: Duration,
+    payload: Option<&[u8]>,
+    target: Option<&str>,
+) -> Result<NamespaceCollisionOperation, ScenarioError> {
+    let label = format!("{} {} {}", client.name, operation, log_path);
+    run_hotspot_helper_process(
+        context, timeout, client, operation, path, target, payload, label,
+    )?;
+    required_op(started, order, client, operation, log_path, Ok(()))
 }
 
 fn run_write_acceptance_crash_operations(
@@ -8551,7 +8570,7 @@ pub fn run_hotspot_op_helper(
                 None,
             )?;
         }
-        "write" | "overwrite" => {
+        "create" | "write" | "overwrite" => {
             let payload_path = payload.ok_or_else(|| anyhow::anyhow!("missing payload"))?;
             record_hotspot_helper_progress(
                 progress,
@@ -8592,6 +8611,25 @@ pub fn run_hotspot_op_helper(
                 Some(payload.len()),
             )?;
             append_payload_with_progress(&path, &payload, progress, operation, target)?;
+        }
+        "delete" => {
+            record_hotspot_helper_progress(
+                progress,
+                "before_remove_file",
+                operation,
+                &path,
+                target,
+                None,
+            )?;
+            fs::remove_file(&path)?;
+            record_hotspot_helper_progress(
+                progress,
+                "after_remove_file",
+                operation,
+                &path,
+                target,
+                None,
+            )?;
         }
         "rename" => {
             let target = target.ok_or_else(|| anyhow::anyhow!("missing rename target"))?;
