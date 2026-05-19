@@ -79,12 +79,7 @@ real mounted E2E and it is no longer a blocker for accepting scenarios 1-16.
 `studiofs-e2e list` currently exposes these mounted scenarios in this order.
 The same numbers are used by `run --scenario`, so `--scenario 1-8` runs the
 baseline gate set and `--scenario 14-18` runs the accepted deeper mounted
-scenario group. The old publication-boundary matrix was split into three
-separate crash-acceptance scenarios, so later numbers moved by two positions.
-The current appended promotion scenarios are 19-23: sparse-file range convergence,
-cold-observer long-history convergence,
-stale-remount plus cold-discover catch-up, invalidation-dropout fallback
-convergence, and symlink plus metadata-attribute convergence.
+scenario group. Next are current appended promotion scenarios: `--scenario 19-23` sparse-file range convergence, cold-observer long-history convergence, stale-remount plus cold-discover catch-up, invalidation-dropout fallback convergence, and symlink plus metadata-attribute convergence.
 
 ### 1. Basic Multi-Client Smoke
 
