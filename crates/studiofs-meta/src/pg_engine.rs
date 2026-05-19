@@ -457,6 +457,86 @@ impl<'a> RemoteApplyCoordinator<'a> {
         candidates.extend(Self::overlay_conflicts_for_events(batch_events).dentry_keys);
     }
 
+    fn event_has_aux_apply_effect(event: &MetaEvent) -> bool {
+        match event {
+            MetaEvent::RemoveAttr { .. }
+            | MetaEvent::RemoveRegularFileGraph { .. }
+            | MetaEvent::PublishRegularFileBaseSlices { .. }
+            | MetaEvent::SetSymlinkTarget { .. }
+            | MetaEvent::SetXattr { .. }
+            | MetaEvent::RemoveXattr { .. }
+            | MetaEvent::SetAclRule { .. }
+            | MetaEvent::RemoveAclRule { .. }
+            | MetaEvent::AddPendingDeletion { .. }
+            | MetaEvent::RemovePendingDeletion { .. }
+            | MetaEvent::CreateSnapshot { .. }
+            | MetaEvent::UpdateSnapshotState { .. } => true,
+            MetaEvent::SetAttr { .. }
+            | MetaEvent::SetRegularFileOverlaySlices { .. }
+            | MetaEvent::AddEntry { .. }
+            | MetaEvent::RemoveEntry { .. }
+            | MetaEvent::RenameEntry { .. } => false,
+        }
+    }
+
+    fn serving_event_conflicts_with_overlay(
+        event: &MetaEvent,
+        overlay: &OverlayConflictSets,
+        removed_inodes: &HashSet<Ino>,
+        removed_inodes_with_local_regular_file_state: &HashSet<Ino>,
+    ) -> bool {
+        match event {
+            MetaEvent::SetAttr { attr } => {
+                overlay.block_inodes.contains(&attr.ino) || overlay.attr_inodes.contains(&attr.ino)
+            }
+            MetaEvent::RemoveAttr { ino } => {
+                if overlay.block_inodes.contains(ino) {
+                    return true;
+                }
+                if removed_inodes.contains(ino) {
+                    return removed_inodes_with_local_regular_file_state.contains(ino);
+                }
+                overlay.attr_inodes.contains(ino)
+                    || overlay.symlink_inodes.contains(ino)
+                    || overlay.xattr_inodes.contains(ino)
+            }
+            MetaEvent::AddEntry { parent, name, .. } | MetaEvent::RemoveEntry { parent, name } => {
+                overlay
+                    .dentry_keys
+                    .contains(&PgMetaEngine::dentry_key(*parent, name))
+            }
+            MetaEvent::RenameEntry { .. } => false,
+            MetaEvent::SetSymlinkTarget { ino, .. } => {
+                overlay.block_inodes.contains(ino)
+                    || overlay.attr_inodes.contains(ino)
+                    || overlay.symlink_inodes.contains(ino)
+            }
+            MetaEvent::SetXattr { ino, name, .. } | MetaEvent::RemoveXattr { ino, name } => {
+                overlay.block_inodes.contains(ino)
+                    || overlay.attr_inodes.contains(ino)
+                    || overlay
+                        .xattr_keys
+                        .contains(&PgMetaEngine::xattr_key(*ino, name))
+            }
+            MetaEvent::SetAclRule { ino, principal, .. }
+            | MetaEvent::RemoveAclRule { ino, principal } => {
+                overlay.attr_inodes.contains(ino)
+                    || overlay
+                        .acl_keys
+                        .contains(&PgMetaEngine::acl_key(*ino, principal))
+            }
+            MetaEvent::SetRegularFileOverlaySlices { .. } => false,
+            MetaEvent::PublishRegularFileBaseSlices { ino, .. } => {
+                overlay.block_inodes.contains(ino)
+            }
+            MetaEvent::RemoveRegularFileGraph { .. }
+            | MetaEvent::AddPendingDeletion { .. }
+            | MetaEvent::RemovePendingDeletion { .. }
+            | MetaEvent::CreateSnapshot { .. }
+            | MetaEvent::UpdateSnapshotState { .. } => false,
+        }
+    }
+
     fn decode_foreign_batch(
         rows: &[tokio_postgres::Row],
         start_idx: usize,
@@ -2830,25 +2910,7 @@ impl PgMetaEngine {
     }
 
     fn event_has_aux_apply_effect(event: &MetaEvent) -> bool {
-        match event {
-            MetaEvent::RemoveAttr { .. }
-            | MetaEvent::RemoveRegularFileGraph { .. }
-            | MetaEvent::PublishRegularFileBaseSlices { .. }
-            | MetaEvent::SetSymlinkTarget { .. }
-            | MetaEvent::SetXattr { .. }
-            | MetaEvent::RemoveXattr { .. }
-            | MetaEvent::SetAclRule { .. }
-            | MetaEvent::RemoveAclRule { .. }
-            | MetaEvent::AddPendingDeletion { .. }
-            | MetaEvent::RemovePendingDeletion { .. }
-            | MetaEvent::CreateSnapshot { .. }
-            | MetaEvent::UpdateSnapshotState { .. } => true,
-            MetaEvent::SetAttr { .. }
-            | MetaEvent::SetRegularFileOverlaySlices { .. }
-            | MetaEvent::AddEntry { .. }
-            | MetaEvent::RemoveEntry { .. }
-            | MetaEvent::RenameEntry { .. } => false,
-        }
+        RemoteApplyCoordinator::event_has_aux_apply_effect(event)
     }
 
     fn xattr_key(ino: Ino, name: &[u8]) -> Vec<u8> {
@@ -3005,60 +3067,6 @@ impl PgMetaEngine {
         Ok(Self::overlay_conflicts_for_events(&events))
     }
 
-    fn serving_event_conflicts_with_overlay(
-        event: &MetaEvent,
-        overlay: &OverlayConflictSets,
-        removed_inodes: &HashSet<Ino>,
-        removed_inodes_with_local_regular_file_state: &HashSet<Ino>,
-    ) -> bool {
-        match event {
-            MetaEvent::SetAttr { attr } => {
-                overlay.block_inodes.contains(&attr.ino) || overlay.attr_inodes.contains(&attr.ino)
-            }
-            MetaEvent::RemoveAttr { ino } => {
-                if overlay.block_inodes.contains(ino) {
-                    return true;
-                }
-                if removed_inodes.contains(ino) {
-                    return removed_inodes_with_local_regular_file_state.contains(ino);
-                }
-                overlay.attr_inodes.contains(ino)
-                    || overlay.symlink_inodes.contains(ino)
-                    || overlay.xattr_inodes.contains(ino)
-            }
-            MetaEvent::AddEntry { parent, name, .. } | MetaEvent::RemoveEntry { parent, name } => {
-                overlay
-                    .dentry_keys
-                    .contains(&Self::dentry_key(*parent, name))
-            }
-            MetaEvent::RenameEntry { .. } => false,
-            MetaEvent::SetSymlinkTarget { ino, .. } => {
-                overlay.block_inodes.contains(ino)
-                    || overlay.attr_inodes.contains(ino)
-                    || overlay.symlink_inodes.contains(ino)
-            }
-            MetaEvent::SetXattr { ino, name, .. } | MetaEvent::RemoveXattr { ino, name } => {
-                overlay.block_inodes.contains(ino)
-                    || overlay.attr_inodes.contains(ino)
-                    || overlay.xattr_keys.contains(&Self::xattr_key(*ino, name))
-            }
-            MetaEvent::SetAclRule { ino, principal, .. }
-            | MetaEvent::RemoveAclRule { ino, principal } => {
-                overlay.attr_inodes.contains(ino)
-                    || overlay.acl_keys.contains(&Self::acl_key(*ino, principal))
-            }
-            MetaEvent::SetRegularFileOverlaySlices { .. } => false,
-            MetaEvent::PublishRegularFileBaseSlices { ino, .. } => {
-                overlay.block_inodes.contains(ino)
-            }
-            MetaEvent::RemoveRegularFileGraph { .. }
-            | MetaEvent::AddPendingDeletion { .. }
-            | MetaEvent::RemovePendingDeletion { .. }
-            | MetaEvent::CreateSnapshot { .. }
-            | MetaEvent::UpdateSnapshotState { .. } => false,
-        }
-    }
-
     fn decode_foreign_batch(
         rows: &[tokio_postgres::Row],
         start_idx: usize,
@@ -3139,7 +3147,7 @@ impl PgMetaEngine {
                     event,
                     MetaEvent::PublishRegularFileBaseSlices { ino, .. }
                         if protected_regular_file_inodes.contains(ino)
-                ) || !Self::serving_event_conflicts_with_overlay(
+                ) || !RemoteApplyCoordinator::serving_event_conflicts_with_overlay(
                     event,
                     &overlay,
                     &removed_inodes,
@@ -3163,7 +3171,7 @@ impl PgMetaEngine {
         }
         let mut aux_events = Vec::new();
         for event in &batch_events {
-            if !Self::event_has_aux_apply_effect(event) {
+            if !RemoteApplyCoordinator::event_has_aux_apply_effect(event) {
                 continue;
             }
             if matches!(
