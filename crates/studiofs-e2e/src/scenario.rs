@@ -2442,8 +2442,7 @@ impl NamespaceCollisionTask {
     }
 }
 
-fn namespace_collision_helper_task(
-    context: &ScenarioContext,
+struct NamespaceCollisionHelperSpec {
     order: usize,
     client: ClientSpec,
     operation: &'static str,
@@ -2451,25 +2450,41 @@ fn namespace_collision_helper_task(
     path: &'static str,
     target: Option<&'static str>,
     payload: Option<&'static [u8]>,
+}
+
+fn namespace_collision_helper_task(
+    context: &ScenarioContext,
+    spec: NamespaceCollisionHelperSpec,
 ) -> NamespaceCollisionTask {
     let context = context.clone();
-    NamespaceCollisionTask::new(order, client, operation, path, move |client| {
-        let pending_label = match target {
-            Some(target) => format!("{} {operation} {path} -> {target}", client.name),
-            None => format!("{} {operation} {path}", client.name),
-        };
-        run_hotspot_helper_process(
-            &context,
-            COLLISION_OPERATION_TIMEOUT,
-            client,
-            helper_operation,
-            path,
-            target,
-            payload,
-            pending_label,
-        )
-        .map_err(scenario_error_to_io)
-    })
+    NamespaceCollisionTask::new(
+        spec.order,
+        spec.client,
+        spec.operation,
+        spec.path,
+        move |client| {
+            let pending_label = match spec.target {
+                Some(target) => {
+                    format!(
+                        "{} {} {} -> {target}",
+                        client.name, spec.operation, spec.path
+                    )
+                }
+                None => format!("{} {} {}", client.name, spec.operation, spec.path),
+            };
+            run_hotspot_helper_process(
+                &context,
+                COLLISION_OPERATION_TIMEOUT,
+                client,
+                spec.helper_operation,
+                spec.path,
+                spec.target,
+                spec.payload,
+                pending_label,
+            )
+            .map_err(scenario_error_to_io)
+        },
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2659,23 +2674,27 @@ fn perform_namespace_collision_operations(
             vec![
                 namespace_collision_helper_task(
                     context,
-                    1,
-                    clients[0].clone(),
-                    "rename",
-                    "rename",
-                    "shared/file.txt",
-                    Some("shared/renamed-a.txt"),
-                    None,
+                    NamespaceCollisionHelperSpec {
+                        order: 1,
+                        client: clients[0].clone(),
+                        operation: "rename",
+                        helper_operation: "rename",
+                        path: "shared/file.txt",
+                        target: Some("shared/renamed-a.txt"),
+                        payload: None,
+                    },
                 ),
                 namespace_collision_helper_task(
                     context,
-                    2,
-                    clients[1].clone(),
-                    "rename",
-                    "rename",
-                    "shared/file.txt",
-                    Some("shared/renamed-b.txt"),
-                    None,
+                    NamespaceCollisionHelperSpec {
+                        order: 2,
+                        client: clients[1].clone(),
+                        operation: "rename",
+                        helper_operation: "rename",
+                        path: "shared/file.txt",
+                        target: Some("shared/renamed-b.txt"),
+                        payload: None,
+                    },
                 ),
             ],
             COLLISION_OPERATION_TIMEOUT,
@@ -2685,23 +2704,27 @@ fn perform_namespace_collision_operations(
             vec![
                 namespace_collision_helper_task(
                     context,
-                    1,
-                    clients[0].clone(),
-                    "rename",
-                    "rename",
-                    "shared/file.txt",
-                    Some("shared/renamed.txt"),
-                    None,
+                    NamespaceCollisionHelperSpec {
+                        order: 1,
+                        client: clients[0].clone(),
+                        operation: "rename",
+                        helper_operation: "rename",
+                        path: "shared/file.txt",
+                        target: Some("shared/renamed.txt"),
+                        payload: None,
+                    },
                 ),
                 namespace_collision_helper_task(
                     context,
-                    2,
-                    clients[1].clone(),
-                    "unlink",
-                    "delete",
-                    "shared/file.txt",
-                    None,
-                    None,
+                    NamespaceCollisionHelperSpec {
+                        order: 2,
+                        client: clients[1].clone(),
+                        operation: "unlink",
+                        helper_operation: "delete",
+                        path: "shared/file.txt",
+                        target: None,
+                        payload: None,
+                    },
                 ),
             ],
             COLLISION_OPERATION_TIMEOUT,
@@ -2711,23 +2734,27 @@ fn perform_namespace_collision_operations(
             vec![
                 namespace_collision_helper_task(
                     context,
-                    1,
-                    clients[0].clone(),
-                    "unlink",
-                    "delete",
-                    "shared/data.txt",
-                    None,
-                    None,
+                    NamespaceCollisionHelperSpec {
+                        order: 1,
+                        client: clients[0].clone(),
+                        operation: "unlink",
+                        helper_operation: "delete",
+                        path: "shared/data.txt",
+                        target: None,
+                        payload: None,
+                    },
                 ),
                 namespace_collision_helper_task(
                     context,
-                    2,
-                    clients[1].clone(),
-                    "append",
-                    "append",
-                    "shared/data.txt",
-                    None,
-                    Some(b"appended payload\n"),
+                    NamespaceCollisionHelperSpec {
+                        order: 2,
+                        client: clients[1].clone(),
+                        operation: "append",
+                        helper_operation: "append",
+                        path: "shared/data.txt",
+                        target: None,
+                        payload: Some(b"appended payload\n"),
+                    },
                 ),
             ],
             COLLISION_OPERATION_TIMEOUT,
@@ -2744,13 +2771,15 @@ fn perform_namespace_collision_operations(
                 ),
                 namespace_collision_helper_task(
                     context,
-                    2,
-                    clients[0].clone(),
-                    "overwrite",
-                    "overwrite-barrier",
-                    "shared/data.txt",
-                    None,
-                    Some(COLLISION_NEW_COMMITTED_PAYLOAD),
+                    NamespaceCollisionHelperSpec {
+                        order: 2,
+                        client: clients[0].clone(),
+                        operation: "overwrite",
+                        helper_operation: "overwrite-barrier",
+                        path: "shared/data.txt",
+                        target: None,
+                        payload: Some(COLLISION_NEW_COMMITTED_PAYLOAD),
+                    },
                 ),
                 NamespaceCollisionTask::new(
                     3,
@@ -2767,33 +2796,39 @@ fn perform_namespace_collision_operations(
             vec![
                 namespace_collision_helper_task(
                     context,
-                    1,
-                    clients[0].clone(),
-                    "mkdir",
-                    "mkdir",
-                    "race/subdir",
-                    None,
-                    None,
+                    NamespaceCollisionHelperSpec {
+                        order: 1,
+                        client: clients[0].clone(),
+                        operation: "mkdir",
+                        helper_operation: "mkdir",
+                        path: "race/subdir",
+                        target: None,
+                        payload: None,
+                    },
                 ),
                 namespace_collision_helper_task(
                     context,
-                    2,
-                    clients[1].clone(),
-                    "create",
-                    "create",
-                    "race/child.txt",
-                    None,
-                    Some(b"child\n"),
+                    NamespaceCollisionHelperSpec {
+                        order: 2,
+                        client: clients[1].clone(),
+                        operation: "create",
+                        helper_operation: "create",
+                        path: "race/child.txt",
+                        target: None,
+                        payload: Some(b"child\n"),
+                    },
                 ),
                 namespace_collision_helper_task(
                     context,
-                    3,
-                    clients[2].clone(),
-                    "rmdir",
-                    "rmdir",
-                    "race",
-                    None,
-                    None,
+                    NamespaceCollisionHelperSpec {
+                        order: 3,
+                        client: clients[2].clone(),
+                        operation: "rmdir",
+                        helper_operation: "rmdir",
+                        path: "race",
+                        target: None,
+                        payload: None,
+                    },
                 ),
             ],
             COLLISION_OPERATION_TIMEOUT,
@@ -2806,13 +2841,15 @@ fn perform_namespace_collision_operations(
                 }),
                 namespace_collision_helper_task(
                     context,
-                    2,
-                    clients[0].clone(),
-                    "rename",
-                    "rename",
-                    "scan/a.txt",
-                    Some("scan/c.txt"),
-                    None,
+                    NamespaceCollisionHelperSpec {
+                        order: 2,
+                        client: clients[0].clone(),
+                        operation: "rename",
+                        helper_operation: "rename",
+                        path: "scan/a.txt",
+                        target: Some("scan/c.txt"),
+                        payload: None,
+                    },
                 ),
                 NamespaceCollisionTask::new(
                     3,
