@@ -315,11 +315,6 @@ impl<'a> RemoteApplyCoordinator<'a> {
         out
     }
 
-    fn remote_visible_event_count(events: &[MetaEvent]) -> u32 {
-        let count = Self::project_remote_events(events).len();
-        u32::try_from(count).unwrap_or(u32::MAX)
-    }
-
     fn remote_events_need_eager_flush(events: &[MetaEvent]) -> bool {
         events.iter().any(|event| match event {
             MetaEvent::SetRegularFileOverlaySlices { .. }
@@ -3115,11 +3110,6 @@ impl PgMetaEngine {
             .map_err(|e| MetaError::Serialization(format!("postcard encode failed: {e}")))
     }
 
-    #[cfg(test)]
-    fn project_remote_events(events: &[MetaEvent]) -> Vec<MetaEvent> {
-        RemoteApplyCoordinator::project_remote_events(events)
-    }
-
     fn aux_event_conflicts_with_overlay(
         &self,
         event: &MetaEvent,
@@ -3306,11 +3296,6 @@ impl PgMetaEngine {
             events.push(MetaEvent::SetAttr { attr });
         }
         Ok(events)
-    }
-
-    #[cfg(test)]
-    fn overlay_conflicts_for_events(events: &[MetaEvent]) -> OverlayConflictSets {
-        RemoteApplyCoordinator::overlay_conflicts_for_events(events)
     }
 
     fn local_overlay_conflicts(&self) -> MetaResult<OverlayConflictSets> {
@@ -4229,9 +4214,8 @@ impl PgMetaEngine {
 
         let pending_events = self.local.read_events_range(event_start, event_end)?;
         self.local.apply_replica_serving_state(&pending_events)?;
-        let remote_visible_ops =
-            RemoteApplyCoordinator::remote_visible_event_count(&pending_events);
-        if remote_visible_ops == 0 {
+        let projected = RemoteApplyCoordinator::project_local_batch(&pending_events);
+        if projected.visible_ops == 0 {
             Self::clear_pending_state(&mut state);
             drop(state);
             self.persist_flushed_event_seq(event_end)?;
@@ -4239,7 +4223,7 @@ impl PgMetaEngine {
         }
 
         let now = Instant::now();
-        state.ops = remote_visible_ops;
+        state.ops = projected.visible_ops;
         state.force_flush = true;
         state.event_start = Some(event_start);
         state.event_end = event_end;
@@ -6033,7 +6017,7 @@ mod tests {
             },
         ];
 
-        let projected = PgMetaEngine::project_remote_events(&events);
+        let projected = RemoteApplyCoordinator::project_remote_events(&events);
         assert_eq!(projected.len(), 1);
         assert!(matches!(
             projected.first(),
@@ -6071,7 +6055,7 @@ mod tests {
             .local
             .read_events_range(start, end)
             .expect("read local events");
-        let projected = PgMetaEngine::project_remote_events(&events);
+        let projected = RemoteApplyCoordinator::project_remote_events(&events);
         assert!(
             events.len() > projected.len(),
             "setup should include local-only overlay events before the remote-visible publish"
@@ -6230,7 +6214,7 @@ mod tests {
             .local
             .read_events_range(start, end)
             .expect("read local events");
-        let projected = PgMetaEngine::project_remote_events(&events);
+        let projected = RemoteApplyCoordinator::project_remote_events(&events);
         remote
             .apply_foreign_batch(&projected, &OverlayConflictSets::default(), &HashSet::new())
             .expect("apply projected remote batch");
@@ -6331,7 +6315,7 @@ mod tests {
             .local
             .read_events_range(local_append_start, local_append_end)
             .expect("read local append events");
-        let projected_self_batch = PgMetaEngine::project_remote_events(&local_events);
+        let projected_self_batch = RemoteApplyCoordinator::project_remote_events(&local_events);
         pg.acknowledge_local_prefix_from_self_batch(&projected_self_batch)
             .expect("ack local append self batch");
 
@@ -6406,7 +6390,7 @@ mod tests {
             .local
             .read_events_range(local_append_start, local_append_end)
             .expect("read local append events");
-        let projected_self_batch = PgMetaEngine::project_remote_events(&local_events);
+        let projected_self_batch = RemoteApplyCoordinator::project_remote_events(&local_events);
         pg.acknowledge_local_prefix_from_self_batch(&projected_self_batch)
             .expect("ack local append self batch");
 
@@ -6894,7 +6878,7 @@ mod tests {
             .local
             .read_events_range(start, end)
             .expect("read local events");
-        let projected_self_batch = PgMetaEngine::project_remote_events(&local_events);
+        let projected_self_batch = RemoteApplyCoordinator::project_remote_events(&local_events);
         pg.acknowledge_local_prefix_from_self_batch(&projected_self_batch)
             .expect("ack local seed publish");
         let mut winner_attr = pg.get_attr(file.ino).expect("load winner attr");
@@ -6972,7 +6956,7 @@ mod tests {
             .local
             .read_events_range(start, end)
             .expect("read local events");
-        let projected_self_batch = PgMetaEngine::project_remote_events(&local_events);
+        let projected_self_batch = RemoteApplyCoordinator::project_remote_events(&local_events);
         pg.acknowledge_local_prefix_from_self_batch(&projected_self_batch)
             .expect("ack local seed publish");
 
@@ -7058,7 +7042,7 @@ mod tests {
             .local
             .read_events_range(start, end)
             .expect("read local events");
-        let projected_self_batch = PgMetaEngine::project_remote_events(&local_events);
+        let projected_self_batch = RemoteApplyCoordinator::project_remote_events(&local_events);
         pg.acknowledge_local_prefix_from_self_batch(&projected_self_batch)
             .expect("ack local seed publish");
 
@@ -7111,7 +7095,7 @@ mod tests {
             .local
             .read_events_range(start, end)
             .expect("read local events");
-        let projected_self_batch = PgMetaEngine::project_remote_events(&local_events);
+        let projected_self_batch = RemoteApplyCoordinator::project_remote_events(&local_events);
         pg.acknowledge_local_prefix_from_self_batch(&projected_self_batch)
             .expect("ack local sparse publish");
         assert!(
@@ -8335,8 +8319,8 @@ mod tests {
 
         let recent_flush = RecentFlush {
             batch_version: 7,
-            overlay: PgMetaEngine::overlay_conflicts_for_events(
-                &PgMetaEngine::project_remote_events(&local_events),
+            overlay: RemoteApplyCoordinator::overlay_conflicts_for_events(
+                &RemoteApplyCoordinator::project_remote_events(&local_events),
             ),
         };
         pg.reconcile_recent_flush_regular_files(Some(&recent_flush))
@@ -9661,7 +9645,7 @@ mod tests {
             .local
             .read_events_range(batch.event_start, batch.event_end)
             .expect("read unlink events");
-        let projected = PgMetaEngine::project_remote_events(&events);
+        let projected = RemoteApplyCoordinator::project_remote_events(&events);
         assert!(
             projected
                 .iter()
