@@ -11161,16 +11161,19 @@ mod tests {
 
     #[test]
     fn hotspot_churn_operation_timeout_reports_pending_without_waiting_forever() {
-        let started = Instant::now();
+        let active_workers = Arc::new(AtomicUsize::new(0));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
 
         let err = run_timed_hotspot_io_with_worker_limit(
             Duration::from_millis(20),
             "client-a mkdir hotspot".to_string(),
-            || {
-                thread::sleep(Duration::from_millis(200));
+            move || {
+                release_rx
+                    .recv()
+                    .map_err(|_| io::Error::other("hotspot worker release channel closed"))?;
                 Ok(())
             },
-            Arc::new(AtomicUsize::new(0)),
+            Arc::clone(&active_workers),
         )
         .unwrap_err();
 
@@ -11179,10 +11182,20 @@ mod tests {
             ScenarioError::NamespaceCollisionOperationTimeout { .. }
         ));
         assert!(err.to_string().contains("client-a mkdir hotspot"));
-        assert!(
-            started.elapsed() < Duration::from_millis(150),
-            "hotspot timeout must not wait for the hung mounted operation to finish"
+        assert_eq!(
+            active_workers.load(Ordering::SeqCst),
+            1,
+            "hotspot timeout must return while the mounted operation worker is still pending"
         );
+
+        release_tx.send(()).unwrap();
+        for _ in 0..50 {
+            if active_workers.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(active_workers.load(Ordering::SeqCst), 0);
     }
 
     #[test]

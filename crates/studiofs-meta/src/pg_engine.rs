@@ -180,6 +180,13 @@ struct RemoteApplyBatchOutcome {
     protected_overlay: OverlayConflictSets,
 }
 
+struct ProjectedRemoteBatch {
+    events: Vec<MetaEvent>,
+    visible_ops: u32,
+    needs_eager_flush: bool,
+    overlay: OverlayConflictSets,
+}
+
 struct RemoteApplyCoordinator<'a> {
     engine: &'a PgMetaEngine,
 }
@@ -336,6 +343,19 @@ impl<'a> RemoteApplyCoordinator<'a> {
             | MetaEvent::SetAclRule { .. }
             | MetaEvent::RemoveAclRule { .. } => false,
         })
+    }
+
+    fn project_local_batch(events: &[MetaEvent]) -> ProjectedRemoteBatch {
+        let remote_events = Self::project_remote_events(events);
+        let visible_ops = u32::try_from(remote_events.len()).unwrap_or(u32::MAX);
+        let needs_eager_flush = Self::remote_events_need_eager_flush(&remote_events);
+        let overlay = Self::overlay_conflicts_for_events(&remote_events);
+        ProjectedRemoteBatch {
+            events: remote_events,
+            visible_ops,
+            needs_eager_flush,
+            overlay,
+        }
     }
 
     fn overlay_conflicts_for_events(events: &[MetaEvent]) -> OverlayConflictSets {
@@ -3802,9 +3822,14 @@ impl PgMetaEngine {
         })
     }
 
+    #[cfg(test)]
     fn push_event_log_batch_locked(&self, events: &[MetaEvent]) -> MetaResult<i64> {
-        let remote_events = RemoteApplyCoordinator::project_remote_events(events);
-        if remote_events.is_empty() {
+        let projected = RemoteApplyCoordinator::project_local_batch(events);
+        self.push_projected_event_log_batch_locked(projected.events)
+    }
+
+    fn push_projected_event_log_batch_locked(&self, events: Vec<MetaEvent>) -> MetaResult<i64> {
+        if events.is_empty() {
             return Ok(self.local_version.load(Ordering::SeqCst));
         }
 
@@ -3812,7 +3837,7 @@ impl PgMetaEngine {
         let volume_id = self.volume_id;
         let client_id = self.client_id.clone();
         let now_ms = Self::now_millis();
-        let events_vec = remote_events;
+        let events_vec = events;
         let connect_timeout = self.connect_timeout;
         let command_timeout = self.command_timeout;
 
@@ -4228,16 +4253,13 @@ impl PgMetaEngine {
             return Ok(false);
         }
         let events = self.local.read_events_range(before_seq, after_seq)?;
-        let remote_events = RemoteApplyCoordinator::project_remote_events(&events);
-        let remote_visible_ops = u32::try_from(remote_events.len()).unwrap_or(u32::MAX);
-        let needs_eager_flush =
-            RemoteApplyCoordinator::remote_events_need_eager_flush(&remote_events);
+        let projected = RemoteApplyCoordinator::project_local_batch(&events);
         let now = Instant::now();
         let mut state = self
             .pending_state
             .lock()
             .map_err(|_| MetaError::Storage("pg pending state lock poisoned".to_string()))?;
-        if remote_visible_ops == 0 {
+        if projected.visible_ops == 0 {
             if state.ops == 0 {
                 Self::clear_pending_state(&mut state);
                 drop(state);
@@ -4253,16 +4275,16 @@ impl PgMetaEngine {
         if state.ops == 0 {
             state.started_at = Some(now);
         }
-        state.ops = state.ops.saturating_add(remote_visible_ops);
+        state.ops = state.ops.saturating_add(projected.visible_ops);
         state.last_mutation_at = Some(now);
         if state.event_start.is_none() {
             state.event_start = Some(before_seq);
         }
         state.event_end = state.event_end.max(after_seq);
-        if needs_eager_flush || state.ops >= self.flush_ops_threshold {
+        if projected.needs_eager_flush || state.ops >= self.flush_ops_threshold {
             state.force_flush = true;
         }
-        Ok(needs_eager_flush)
+        Ok(projected.needs_eager_flush)
     }
 
     fn request_pending_flush(&self) {
@@ -4360,19 +4382,19 @@ impl PgMetaEngine {
         if events.is_empty() {
             return Ok(None);
         }
-        let remote_events = RemoteApplyCoordinator::project_remote_events(&events);
-        if remote_events.is_empty() {
+        let projected = RemoteApplyCoordinator::project_local_batch(&events);
+        if projected.events.is_empty() {
             self.persist_flushed_event_seq(batch.event_end)?;
             return Ok(None);
         }
-        let batch_version = self.push_event_log_batch_locked(&events)?;
+        let batch_version = self.push_projected_event_log_batch_locked(projected.events)?;
         // Do not advance `local_version` here. The writer may have published a
         // newer batch_version while still missing earlier foreign batches.
         // `pull_foreign_events_locked()` must remain able to read the full gap.
         self.persist_flushed_event_seq(batch.event_end)?;
         Ok(Some(RecentFlush {
             batch_version,
-            overlay: RemoteApplyCoordinator::overlay_conflicts_for_events(&remote_events),
+            overlay: projected.overlay,
         }))
     }
 
