@@ -133,6 +133,20 @@ fn should_run_invalidation_poll_sync(
     }
 }
 
+fn metadata_attr_cache_invalidation_set(
+    previous_snapshot: &HashSet<Ino>,
+    current_snapshot: &HashSet<Ino>,
+    namespace_changed: bool,
+    runtime_inodes: HashSet<Ino>,
+) -> HashSet<Ino> {
+    let mut attr_cache_inodes = previous_snapshot.clone();
+    attr_cache_inodes.extend(current_snapshot.iter().copied());
+    if namespace_changed {
+        attr_cache_inodes.extend(runtime_inodes);
+    }
+    attr_cache_inodes
+}
+
 impl StudioVfs {
     pub(super) async fn background_aggressive_materialization(self: Arc<Self>) {
         let mut interval = tokio::time::interval(AGGRESSIVE_MATERIALIZATION_INTERVAL);
@@ -619,13 +633,18 @@ impl StudioVfs {
             self.lazy_evict_removed_metadata_payloads(removed_payloads, &current_snapshot.inodes)
                 .await;
 
-            let mut to_invalidate = last_snapshot.clone();
-            to_invalidate.extend(current_snapshot.inodes.iter().copied());
-            if namespace_changed {
-                to_invalidate.extend(self.runtime_namespace_invalidation_inodes());
-            }
-            self.invalidate_attr_read_cache(to_invalidate.iter().copied());
-            self.invalidate_kernel_inodes(to_invalidate.iter().copied());
+            let runtime_inodes = if namespace_changed {
+                self.runtime_namespace_invalidation_inodes()
+            } else {
+                HashSet::new()
+            };
+            let attr_cache_inodes = metadata_attr_cache_invalidation_set(
+                &last_snapshot,
+                &current_snapshot.inodes,
+                namespace_changed,
+                runtime_inodes,
+            );
+            self.invalidate_attr_read_cache(attr_cache_inodes.iter().copied());
             if namespace_changed {
                 self.bump_namespace_epoch();
             }
@@ -1471,5 +1490,20 @@ mod tests {
             &token("2"),
             &token("1"),
         ));
+    }
+
+    #[test]
+    fn metadata_background_invalidation_keeps_runtime_only_inodes_in_attr_cache_set() {
+        let previous = HashSet::from([ROOT_INO, 10]);
+        let current = HashSet::from([ROOT_INO, 20]);
+        let runtime_only = HashSet::from([30]);
+
+        let attr_cache_inodes =
+            metadata_attr_cache_invalidation_set(&previous, &current, true, runtime_only);
+
+        assert!(
+            attr_cache_inodes.contains(&30),
+            "runtime-only inodes should still clear VFS attr/read caches after namespace changes"
+        );
     }
 }
