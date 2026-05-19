@@ -3047,16 +3047,9 @@ impl PgMetaEngine {
             .map_err(|e| MetaError::Serialization(format!("postcard encode failed: {e}")))
     }
 
+    #[cfg(test)]
     fn project_remote_events(events: &[MetaEvent]) -> Vec<MetaEvent> {
         RemoteApplyCoordinator::project_remote_events(events)
-    }
-
-    fn remote_visible_event_count(events: &[MetaEvent]) -> u32 {
-        RemoteApplyCoordinator::remote_visible_event_count(events)
-    }
-
-    fn remote_events_need_eager_flush(events: &[MetaEvent]) -> bool {
-        RemoteApplyCoordinator::remote_events_need_eager_flush(events)
     }
 
     fn aux_event_conflicts_with_overlay(
@@ -3247,6 +3240,7 @@ impl PgMetaEngine {
         Ok(events)
     }
 
+    #[cfg(test)]
     fn overlay_conflicts_for_events(events: &[MetaEvent]) -> OverlayConflictSets {
         RemoteApplyCoordinator::overlay_conflicts_for_events(events)
     }
@@ -3259,15 +3253,9 @@ impl PgMetaEngine {
         }
 
         let events = self.local.read_events_range(start, end)?;
-        Ok(Self::overlay_conflicts_for_events(&events))
-    }
-
-    fn decode_foreign_batch(
-        rows: &[tokio_postgres::Row],
-        start_idx: usize,
-        client_id: &str,
-    ) -> MetaResult<(i64, usize, Vec<MetaEvent>, bool)> {
-        RemoteApplyCoordinator::decode_foreign_batch(rows, start_idx, client_id)
+        Ok(RemoteApplyCoordinator::overlay_conflicts_for_events(
+            &events,
+        ))
     }
 
     #[cfg(test)]
@@ -3781,7 +3769,7 @@ impl PgMetaEngine {
     }
 
     fn push_event_log_batch_locked(&self, events: &[MetaEvent]) -> MetaResult<i64> {
-        let remote_events = Self::project_remote_events(events);
+        let remote_events = RemoteApplyCoordinator::project_remote_events(events);
         if remote_events.is_empty() {
             return Ok(self.local_version.load(Ordering::SeqCst));
         }
@@ -4074,7 +4062,7 @@ impl PgMetaEngine {
         let mut idx = 0;
         while idx < rows.len() {
             let (batch_version, next_idx, events, is_self_batch) =
-                Self::decode_foreign_batch(&rows, idx, client_id)?;
+                RemoteApplyCoordinator::decode_foreign_batch(&rows, idx, client_id)?;
             idx = next_idx;
             batches.push(DecodedReplayBatch {
                 batch_version,
@@ -4202,7 +4190,8 @@ impl PgMetaEngine {
 
         let pending_events = self.local.read_events_range(event_start, event_end)?;
         self.local.apply_replica_serving_state(&pending_events)?;
-        let remote_visible_ops = Self::remote_visible_event_count(&pending_events);
+        let remote_visible_ops =
+            RemoteApplyCoordinator::remote_visible_event_count(&pending_events);
         if remote_visible_ops == 0 {
             Self::clear_pending_state(&mut state);
             drop(state);
@@ -4225,9 +4214,10 @@ impl PgMetaEngine {
             return Ok(false);
         }
         let events = self.local.read_events_range(before_seq, after_seq)?;
-        let remote_events = Self::project_remote_events(&events);
+        let remote_events = RemoteApplyCoordinator::project_remote_events(&events);
         let remote_visible_ops = u32::try_from(remote_events.len()).unwrap_or(u32::MAX);
-        let needs_eager_flush = Self::remote_events_need_eager_flush(&remote_events);
+        let needs_eager_flush =
+            RemoteApplyCoordinator::remote_events_need_eager_flush(&remote_events);
         let now = Instant::now();
         let mut state = self
             .pending_state
@@ -4356,7 +4346,7 @@ impl PgMetaEngine {
         if events.is_empty() {
             return Ok(None);
         }
-        let remote_events = Self::project_remote_events(&events);
+        let remote_events = RemoteApplyCoordinator::project_remote_events(&events);
         if remote_events.is_empty() {
             self.persist_flushed_event_seq(batch.event_end)?;
             return Ok(None);
@@ -4368,7 +4358,7 @@ impl PgMetaEngine {
         self.persist_flushed_event_seq(batch.event_end)?;
         Ok(Some(RecentFlush {
             batch_version,
-            overlay: Self::overlay_conflicts_for_events(&remote_events),
+            overlay: RemoteApplyCoordinator::overlay_conflicts_for_events(&remote_events),
         }))
     }
 
