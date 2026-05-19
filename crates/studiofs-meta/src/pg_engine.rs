@@ -691,15 +691,109 @@ impl<'a> RemoteApplyCoordinator<'a> {
     }
 
     fn apply_visible_self_batch(&self, batch_events: &[MetaEvent]) -> MetaResult<bool> {
-        self.engine.apply_visible_self_batch_impl(batch_events)
+        if batch_events.is_empty() {
+            return Ok(false);
+        }
+
+        let batch_events = self
+            .engine
+            .preserve_published_content_state_for_attr_only_events(batch_events)?;
+        let partial_publish_inodes =
+            PgMetaEngine::partial_regular_file_publish_inodes(&batch_events);
+        if partial_publish_inodes.is_empty() {
+            self.engine
+                .local
+                .apply_replica_events_to_base(&batch_events)?;
+        } else {
+            self.engine
+                .local
+                .apply_replica_events_to_base_preserving_protected_base_ranges(
+                    &batch_events,
+                    &partial_publish_inodes,
+                )?;
+        }
+        for event in &batch_events {
+            if let MetaEvent::RenameEntry {
+                parent,
+                name,
+                new_parent,
+                new_name,
+                entry,
+                ..
+            } = event
+            {
+                self.engine.local.reconcile_serving_rename_from_base(
+                    *parent,
+                    name,
+                    *new_parent,
+                    new_name,
+                    entry,
+                )?;
+            }
+        }
+        let aux_events: Vec<MetaEvent> = batch_events
+            .iter()
+            .filter(|event| {
+                Self::event_has_aux_apply_effect(event)
+                    && !matches!(
+                        event,
+                        MetaEvent::PublishRegularFileBaseSlices { ino, .. }
+                            if partial_publish_inodes.contains(ino)
+                    )
+            })
+            .cloned()
+            .collect();
+        if aux_events.is_empty() {
+            return Ok(false);
+        }
+
+        self.engine.local.apply_replica_aux_state(&aux_events)?;
+        Ok(true)
     }
 
     fn acknowledge_local_prefix_from_self_batch(
         &self,
         batch_events: &[MetaEvent],
     ) -> MetaResult<()> {
-        self.engine
-            .acknowledge_local_prefix_from_self_batch_impl(batch_events)
+        if batch_events.is_empty() {
+            return Ok(());
+        }
+
+        let start = self.engine.flushed_event_seq.load(Ordering::SeqCst);
+        let end = self.engine.local.get_counter("nextEventSeq")?;
+        if end <= start {
+            return Ok(());
+        }
+
+        let local_events = self.engine.local.read_events_range(start, end)?;
+        let mut projected_prefix = Vec::with_capacity(batch_events.len());
+        let mut consumed_events = 0usize;
+        for event in &local_events {
+            consumed_events = consumed_events.saturating_add(1);
+            let projected = Self::project_remote_events(std::slice::from_ref(event));
+            projected_prefix.extend(projected);
+            if projected_prefix.len() >= batch_events.len() {
+                break;
+            }
+        }
+        if projected_prefix.len() != batch_events.len() {
+            return Ok(());
+        }
+
+        let matches_prefix =
+            projected_prefix
+                .iter()
+                .zip(batch_events.iter())
+                .all(|(local, remote)| {
+                    PgMetaEngine::encode_postcard(local).ok()
+                        == PgMetaEngine::encode_postcard(remote).ok()
+                });
+        if matches_prefix {
+            let next_seq = start.max(1).saturating_add(consumed_events as u64);
+            self.engine.persist_flushed_event_seq(next_seq)?;
+        }
+
+        Ok(())
     }
 
     fn apply_decoded_batches(
@@ -3021,10 +3115,6 @@ impl PgMetaEngine {
         Ok(conflict)
     }
 
-    fn event_has_aux_apply_effect(event: &MetaEvent) -> bool {
-        RemoteApplyCoordinator::event_has_aux_apply_effect(event)
-    }
-
     fn xattr_key(ino: Ino, name: &[u8]) -> Vec<u8> {
         let mut key = Vec::with_capacity(8 + name.len());
         key.extend_from_slice(&ino.to_le_bytes());
@@ -3548,111 +3638,12 @@ impl PgMetaEngine {
         RemoteApplyCoordinator::new(self).apply_visible_self_batch(batch_events)
     }
 
-    fn apply_visible_self_batch_impl(&self, batch_events: &[MetaEvent]) -> MetaResult<bool> {
-        if batch_events.is_empty() {
-            return Ok(false);
-        }
-
-        let batch_events =
-            self.preserve_published_content_state_for_attr_only_events(batch_events)?;
-        let partial_publish_inodes = Self::partial_regular_file_publish_inodes(&batch_events);
-        if partial_publish_inodes.is_empty() {
-            self.local.apply_replica_events_to_base(&batch_events)?;
-        } else {
-            self.local
-                .apply_replica_events_to_base_preserving_protected_base_ranges(
-                    &batch_events,
-                    &partial_publish_inodes,
-                )?;
-        }
-        for event in &batch_events {
-            if let MetaEvent::RenameEntry {
-                parent,
-                name,
-                new_parent,
-                new_name,
-                entry,
-                ..
-            } = event
-            {
-                self.local.reconcile_serving_rename_from_base(
-                    *parent,
-                    name,
-                    *new_parent,
-                    new_name,
-                    entry,
-                )?;
-            }
-        }
-        let aux_events: Vec<MetaEvent> = batch_events
-            .iter()
-            .filter(|event| {
-                Self::event_has_aux_apply_effect(event)
-                    && !matches!(
-                        event,
-                        MetaEvent::PublishRegularFileBaseSlices { ino, .. }
-                            if partial_publish_inodes.contains(ino)
-                    )
-            })
-            .cloned()
-            .collect();
-        if aux_events.is_empty() {
-            return Ok(false);
-        }
-
-        self.local.apply_replica_aux_state(&aux_events)?;
-        Ok(true)
-    }
-
     #[cfg(test)]
     fn acknowledge_local_prefix_from_self_batch(
         &self,
         batch_events: &[MetaEvent],
     ) -> MetaResult<()> {
         RemoteApplyCoordinator::new(self).acknowledge_local_prefix_from_self_batch(batch_events)
-    }
-
-    fn acknowledge_local_prefix_from_self_batch_impl(
-        &self,
-        batch_events: &[MetaEvent],
-    ) -> MetaResult<()> {
-        if batch_events.is_empty() {
-            return Ok(());
-        }
-
-        let start = self.flushed_event_seq.load(Ordering::SeqCst);
-        let end = self.local.get_counter("nextEventSeq")?;
-        if end <= start {
-            return Ok(());
-        }
-
-        let local_events = self.local.read_events_range(start, end)?;
-        let mut projected_prefix = Vec::with_capacity(batch_events.len());
-        let mut consumed_events = 0usize;
-        for event in &local_events {
-            consumed_events = consumed_events.saturating_add(1);
-            let projected = Self::project_remote_events(std::slice::from_ref(event));
-            projected_prefix.extend(projected);
-            if projected_prefix.len() >= batch_events.len() {
-                break;
-            }
-        }
-        if projected_prefix.len() != batch_events.len() {
-            return Ok(());
-        }
-
-        let matches_prefix =
-            projected_prefix
-                .iter()
-                .zip(batch_events.iter())
-                .all(|(local, remote)| {
-                    Self::encode_postcard(local).ok() == Self::encode_postcard(remote).ok()
-                });
-        if matches_prefix {
-            let next_seq = start.max(1).saturating_add(consumed_events as u64);
-            self.persist_flushed_event_seq(next_seq)?;
-        }
-        Ok(())
     }
 
     fn pull_snapshot_locked(&self) -> MetaResult<bool> {
