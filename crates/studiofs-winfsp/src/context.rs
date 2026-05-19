@@ -14,7 +14,8 @@ use studiofs_meta::types::{SetattrArgs, TimeSpec};
 use studiofs_meta::{FileType, Ino, InodeAttr, MetaError, ROOT_INO};
 use studiofs_vfs::{
     BridgeVfsErrorKind, KernelInvalidator, LocalSyncPolicy, NamespacePathStyle, OpenFlags,
-    StudioVfs, classify_vfs_error, is_hidden_non_macos_root_metadata_name, normalize_attr_times,
+    StudioVfs, VfsError, classify_vfs_error, is_hidden_non_macos_root_metadata_name,
+    normalize_attr_times,
 };
 use tokio::runtime::Handle;
 use tracing::{debug, error, trace, warn};
@@ -222,6 +223,8 @@ fn open_flags_from_access(granted_access: FILE_ACCESS_RIGHTS, _create_options: u
 const FILE_WRITE_THROUGH_CREATE_OPTION: u32 = 0x0000_0002;
 const FILE_NO_INTERMEDIATE_BUFFERING_CREATE_OPTION: u32 = 0x0000_0008;
 const CREATE_DISPOSITION_SHIFT: u32 = 24;
+const FILE_SUPERSEDE_DISPOSITION: u32 = 0;
+const FILE_OPEN_IF_DISPOSITION: u32 = 3;
 const FILE_OVERWRITE_DISPOSITION: u32 = 4;
 const FILE_OVERWRITE_IF_DISPOSITION: u32 = 5;
 
@@ -240,6 +243,13 @@ fn should_truncate_existing_file_on_open(create_options: u32, open_flags: OpenFl
             disposition,
             FILE_OVERWRITE_DISPOSITION | FILE_OVERWRITE_IF_DISPOSITION
         )
+}
+
+fn should_open_existing_on_create_collision(create_options: u32) -> bool {
+    matches!(
+        create_disposition_from_create_options(create_options),
+        FILE_SUPERSEDE_DISPOSITION | FILE_OPEN_IF_DISPOSITION | FILE_OVERWRITE_IF_DISPOSITION
+    )
 }
 
 fn current_winfsp_create_options(callback_create_options: u32) -> u32 {
@@ -319,6 +329,7 @@ enum FileSizeCallbackAction {
 struct CreateCallbackPlan {
     parent_ino: Ino,
     name: Vec<u8>,
+    create_options: u32,
     open_flags: OpenFlags,
     write_local_sync_policy: LocalSyncPolicy,
     kind: CreateCallbackKind,
@@ -964,6 +975,7 @@ impl StudioFsContext {
         Ok(CreateCallbackPlan {
             parent_ino,
             name,
+            create_options,
             open_flags: open_flags_from_access(granted_access, create_options),
             write_local_sync_policy: write_local_sync_policy_from_create_options(create_options),
             kind: resolve_create_callback_kind(
@@ -980,6 +992,8 @@ impl StudioFsContext {
         file_info: &mut OpenFileInfo,
     ) -> winfsp::Result<StudioFileHandle> {
         let opens_symlink = matches!(plan.kind, CreateCallbackKind::Symlink(_));
+        let open_existing_on_collision = matches!(plan.kind, CreateCallbackKind::RegularFile)
+            && should_open_existing_on_create_collision(plan.create_options);
         let attr = match &plan.kind {
             CreateCallbackKind::Symlink(target) => self
                 .vfs
@@ -989,10 +1003,19 @@ impl StudioFsContext {
                 .vfs
                 .mkdir(plan.parent_ino, &plan.name, 0, 0, 0o755)
                 .map_err(vfs_to_winfsp_err)?,
-            CreateCallbackKind::RegularFile => self
-                .vfs
-                .create(plan.parent_ino, &plan.name, 0, 0, 0o644)
-                .map_err(vfs_to_winfsp_err)?,
+            CreateCallbackKind::RegularFile => {
+                match self.vfs.create(plan.parent_ino, &plan.name, 0, 0, 0o644) {
+                    Ok(attr) => attr,
+                    Err(VfsError::Meta(MetaError::EntryExists { .. }))
+                        if open_existing_on_collision =>
+                    {
+                        self.vfs
+                            .lookup(plan.parent_ino, &plan.name)
+                            .map_err(vfs_to_winfsp_err)?
+                    }
+                    Err(error) => return Err(vfs_to_winfsp_err(error)),
+                }
+            }
         };
         Self::write_open_file_info(file_info, &attr);
         if opens_symlink {
@@ -1007,7 +1030,7 @@ impl StudioFsContext {
             self.open_file_handle_for_attr(
                 &attr,
                 plan.open_flags,
-                false,
+                should_truncate_existing_file_on_open(plan.create_options, plan.open_flags),
                 plan.write_local_sync_policy,
             )
         }
@@ -2217,6 +2240,58 @@ mod tests {
             })
             .expect("read replacement");
         assert_eq!(readback.as_ref(), b"new");
+
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.release_fh(handle.fh).await }
+        })
+        .expect("release handle");
+    }
+
+    #[test]
+    fn winfsp_create_overwrite_if_collision_opens_and_truncates_existing_file() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("create-overwrite-if-collision");
+        let attr = vfs
+            .create(ROOT_INO, b"create-overwrite-if.txt", 0, 0, 0o644)
+            .expect("create existing file");
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.write(attr.ino, 0, b"old-payload-tail").await }
+        })
+        .expect("seed existing contents");
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.flush(attr.ino).await }
+        })
+        .expect("flush existing contents");
+
+        let file_name = U16CString::from_str(r"\create-overwrite-if.txt").expect("u16 path");
+        let mut file_info = empty_open_file_info();
+        let handle = <StudioFsContext as FileSystemContext>::create(
+            &ctx,
+            file_name.as_ucstr(),
+            0x0500_0000,
+            FILE_GENERIC_WRITE_ACCESS,
+            0,
+            None,
+            0,
+            None,
+            false,
+            &mut file_info,
+        )
+        .expect("CREATE_ALWAYS should open and truncate an existing regular file");
+
+        assert_eq!(
+            handle.ino, attr.ino,
+            "collision fallback must open the existing inode"
+        );
+        assert_eq!(
+            vfs.getattr(attr.ino)
+                .expect("attr after create overwrite-if")
+                .size,
+            0,
+            "FILE_OVERWRITE_IF create fallback should synchronously truncate the logical EOF"
+        );
 
         ctx.spawn_wait({
             let vfs = vfs.clone();

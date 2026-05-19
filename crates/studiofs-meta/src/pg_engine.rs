@@ -2506,11 +2506,13 @@ impl PgMetaEngine {
     ) -> MetaResult<bool> {
         let conflict = match event {
             MetaEvent::RemoveAttr { ino } => {
+                if overlay.block_inodes.contains(ino) {
+                    return Ok(true);
+                }
                 if removed_inodes.contains(ino) {
                     return Ok(removed_inodes_with_local_regular_file_state.contains(ino));
                 }
-                overlay.block_inodes.contains(ino)
-                    || overlay.attr_inodes.contains(ino)
+                overlay.attr_inodes.contains(ino)
                     || overlay.symlink_inodes.contains(ino)
                     || overlay.xattr_inodes.contains(ino)
             }
@@ -2617,10 +2619,25 @@ impl PgMetaEngine {
         if self.local.has_local_regular_file_overlay(ino)? {
             return Ok(true);
         }
-        Ok(self
-            .local
-            .get_inode_lifecycle(ino)?
-            .is_some_and(|lifecycle| lifecycle.state != InodeLifecycleState::Published))
+        let Some(lifecycle) = self.local.get_inode_lifecycle(ino)? else {
+            return Ok(false);
+        };
+        if lifecycle.state == InodeLifecycleState::Published {
+            return Ok(false);
+        }
+        let attr = match self.local.get_attr(ino) {
+            Ok(attr) => attr,
+            Err(MetaError::InodeNotFound(_)) => return Ok(false),
+            Err(err) => return Err(err),
+        };
+        let current_attr_is_committed_base = attr.kind == FileType::RegularFile
+            && attr.upload_state == UploadState::Ready
+            && attr.size == attr.committed_size
+            && attr.content_epoch == attr.committed_content_epoch
+            && (lifecycle.has_published_base
+                || attr.committed_size > 0
+                || attr.committed_content_epoch > 0);
+        Ok(!current_attr_is_committed_base)
     }
 
     fn removed_inode_has_local_regular_file_state_to_preserve(&self, ino: Ino) -> MetaResult<bool> {
@@ -2684,8 +2701,6 @@ impl PgMetaEngine {
             if attr.kind != FileType::RegularFile {
                 continue;
             }
-            attr.committed_size = attr.size;
-            attr.committed_content_epoch = attr.content_epoch;
             attr.upload_state = UploadState::Ready;
             events.push(MetaEvent::SetAttr { attr });
         }
@@ -2812,11 +2827,13 @@ impl PgMetaEngine {
                 overlay.block_inodes.contains(&attr.ino) || overlay.attr_inodes.contains(&attr.ino)
             }
             MetaEvent::RemoveAttr { ino } => {
+                if overlay.block_inodes.contains(ino) {
+                    return true;
+                }
                 if removed_inodes.contains(ino) {
                     return removed_inodes_with_local_regular_file_state.contains(ino);
                 }
-                overlay.block_inodes.contains(ino)
-                    || overlay.attr_inodes.contains(ino)
+                overlay.attr_inodes.contains(ino)
                     || overlay.symlink_inodes.contains(ino)
                     || overlay.xattr_inodes.contains(ino)
             }
@@ -3003,16 +3020,22 @@ impl PgMetaEngine {
                 _ => None,
             })
             .collect();
-        if published_inodes.is_empty()
-            && !batch_events.iter().any(|event| {
-                matches!(
-                    event,
-                    MetaEvent::SetAttr { attr }
-                        if attr.kind == FileType::RegularFile
-                            && attr.upload_state == UploadState::Ready
-                )
+        let graph_event_inodes: HashSet<Ino> = batch_events
+            .iter()
+            .filter_map(|event| match event {
+                MetaEvent::SetRegularFileOverlaySlices { ino, .. }
+                | MetaEvent::PublishRegularFileBaseSlices { ino, .. } => Some(*ino),
+                _ => None,
             })
-        {
+            .collect();
+        if !batch_events.iter().any(|event| {
+            matches!(
+                event,
+                MetaEvent::SetAttr { attr }
+                    if attr.kind == FileType::RegularFile
+                        && !graph_event_inodes.contains(&attr.ino)
+            )
+        }) {
             return Ok(batch_events.to_vec());
         }
 
@@ -3023,7 +3046,7 @@ impl PgMetaEngine {
                     return Ok(event.clone());
                 };
                 if attr.kind != FileType::RegularFile
-                    || attr.upload_state != UploadState::Ready
+                    || graph_event_inodes.contains(&attr.ino)
                     || published_inodes.contains(&attr.ino)
                 {
                     return Ok(event.clone());
@@ -3035,10 +3058,24 @@ impl PgMetaEngine {
                     || base_attr.upload_state != UploadState::Ready
                     || base_attr.content_epoch != base_attr.committed_content_epoch
                     || base_attr.size != base_attr.committed_size
-                    || attr.content_epoch > base_attr.content_epoch
-                    || attr.committed_size >= base_attr.committed_size
                 {
                     return Ok(event.clone());
+                }
+                if attr.upload_state == UploadState::Ready
+                    && (attr.content_epoch > base_attr.content_epoch
+                        || attr.committed_size >= base_attr.committed_size)
+                {
+                    return Ok(event.clone());
+                }
+                if base_attr.committed_size > 0 {
+                    let object_backed = self
+                        .local
+                        .lookup_regular_file_slices(base_attr.ino, 0, base_attr.committed_size)?
+                        .iter()
+                        .any(|span| span.payload.is_some());
+                    if !object_backed {
+                        return Ok(event.clone());
+                    }
                 }
 
                 let mut merged = attr.clone();
@@ -3046,6 +3083,7 @@ impl PgMetaEngine {
                 merged.committed_size = base_attr.committed_size;
                 merged.content_epoch = base_attr.content_epoch;
                 merged.committed_content_epoch = base_attr.committed_content_epoch;
+                merged.upload_state = base_attr.upload_state;
                 Ok(MetaEvent::SetAttr { attr: merged })
             })
             .collect()
@@ -6767,6 +6805,96 @@ mod tests {
     }
 
     #[test]
+    fn attr_only_updating_foreign_batch_must_not_hide_published_file_content_state() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+
+        let file = create_published_small_file(
+            &pg,
+            ROOT_INO,
+            b"attr-only-updating-regression.txt",
+            77_054,
+        );
+        let start = pg.flushed_event_seq.load(Ordering::SeqCst);
+        let end = pg.local.get_counter("nextEventSeq").expect("event end");
+        let local_events = pg
+            .local
+            .read_events_range(start, end)
+            .expect("read local events");
+        let projected_self_batch = PgMetaEngine::project_remote_events(&local_events);
+        pg.acknowledge_local_prefix_from_self_batch(&projected_self_batch)
+            .expect("ack local seed publish");
+
+        let mut winner_attr = pg.get_attr(file.ino).expect("load winner attr");
+        winner_attr.size = u64::from(DEFAULT_BLOCK_SIZE);
+        winner_attr.committed_size = u64::from(DEFAULT_BLOCK_SIZE);
+        winner_attr.content_epoch = 5;
+        winner_attr.committed_content_epoch = 5;
+        winner_attr.upload_state = UploadState::Ready;
+        let winner_payload = PayloadRef::new_full(77_055, DEFAULT_BLOCK_SIZE);
+        let winner_batch = vec![
+            MetaEvent::PublishRegularFileBaseSlices {
+                ino: file.ino,
+                chunk_slices: fixture_payload_slices(
+                    0,
+                    Some(&winner_payload),
+                    PayloadRefState::Published,
+                )
+                .expect("winner slices"),
+            },
+            MetaEvent::SetAttr {
+                attr: winner_attr.clone(),
+            },
+        ];
+        pg.apply_foreign_batch(
+            &winner_batch,
+            &OverlayConflictSets::default(),
+            &HashSet::new(),
+        )
+        .expect("apply winner batch");
+        assert_eq!(
+            lookup_object_ids(&pg, file.ino, winner_attr.size).expect("lookup winner object ids"),
+            vec![winner_payload.object_id],
+            "setup should expose the winner payload before the attr-only Updating batch"
+        );
+        let base_attr = pg
+            .local
+            .get_base_attr(file.ino)
+            .expect("load base attr")
+            .expect("base attr exists");
+        assert_eq!(base_attr.size, u64::from(DEFAULT_BLOCK_SIZE));
+        assert_eq!(base_attr.upload_state, UploadState::Ready);
+
+        let mut stale_updating_attr = winner_attr.clone();
+        stale_updating_attr.size = 0;
+        stale_updating_attr.committed_size = 0;
+        stale_updating_attr.content_epoch = 3;
+        stale_updating_attr.committed_content_epoch = 2;
+        stale_updating_attr.upload_state = UploadState::Updating;
+        stale_updating_attr.mtime = winner_attr.mtime.saturating_add(1);
+        stale_updating_attr.ctime = stale_updating_attr.mtime;
+        pg.apply_foreign_batch(
+            &[MetaEvent::SetAttr {
+                attr: stale_updating_attr,
+            }],
+            &OverlayConflictSets::default(),
+            &HashSet::new(),
+        )
+        .expect("apply attr-only updating batch");
+
+        let attr = pg.get_attr(file.ino).expect("load final attr");
+        assert_eq!(attr.size, u64::from(DEFAULT_BLOCK_SIZE));
+        assert_eq!(attr.committed_size, u64::from(DEFAULT_BLOCK_SIZE));
+        assert_eq!(attr.content_epoch, 5);
+        assert_eq!(attr.committed_content_epoch, 5);
+        assert_eq!(attr.upload_state, UploadState::Ready);
+        assert_eq!(
+            lookup_object_ids(&pg, file.ino, attr.size).expect("lookup final object ids"),
+            vec![winner_payload.object_id],
+            "a late attr-only Updating batch must not hide the latest published content graph"
+        );
+    }
+
+    #[test]
     fn sparse_ready_foreign_publish_preserves_disjoint_base_ranges_when_not_complete() {
         let (_dir, pg) = temp_pg_engine_for_unit();
 
@@ -6960,6 +7088,69 @@ mod tests {
             pg.local_regular_file_state_needs_foreign_protection(file.ino)
                 .expect("probe protection"),
             "publish-ready lifecycle rows represent local publication work even without chunk overlay rows"
+        );
+    }
+
+    #[test]
+    fn stale_local_only_lifecycle_without_overlay_does_not_protect_committed_base_attr() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+
+        let file = create_published_small_file(&pg, ROOT_INO, b"stale-lifecycle-ready.txt", 87);
+        let published_attr = pg.get_attr(file.ino).expect("load published attr");
+
+        let mut local_attr = published_attr.clone();
+        local_attr.size = local_attr.size.saturating_add(128);
+        local_attr.content_epoch = local_attr.content_epoch.saturating_add(1);
+        local_attr.upload_state = UploadState::Updating;
+        pg.set_attr(&local_attr)
+            .expect("stage local attr lifecycle");
+
+        assert_ne!(
+            pg.local
+                .get_inode_lifecycle(file.ino)
+                .expect("load local lifecycle")
+                .expect("local lifecycle")
+                .state,
+            InodeLifecycleState::Published
+        );
+
+        pg.local
+            .apply_replica_events_to_base(&[MetaEvent::SetAttr {
+                attr: published_attr.clone(),
+            }])
+            .expect("restore committed base attr without refreshing stale lifecycle");
+        pg.local
+            .apply_replica_serving_state(&[MetaEvent::SetAttr {
+                attr: published_attr.clone(),
+            }])
+            .expect("restore visible attr without refreshing stale lifecycle");
+
+        assert!(
+            !pg.local
+                .has_local_regular_file_overlay(file.ino)
+                .expect("probe overlay"),
+            "setup must not have local overlay rows"
+        );
+        assert_ne!(
+            pg.local
+                .get_inode_lifecycle(file.ino)
+                .expect("load stale lifecycle")
+                .expect("stale lifecycle")
+                .state,
+            InodeLifecycleState::Published,
+            "setup should retain a stale unpublished lifecycle row like mounted replay"
+        );
+        let current_attr = pg.local.get_attr(file.ino).expect("load current attr");
+        assert_eq!(current_attr.upload_state, UploadState::Ready);
+        assert_eq!(current_attr.size, current_attr.committed_size);
+        assert_eq!(
+            current_attr.content_epoch,
+            current_attr.committed_content_epoch
+        );
+        assert!(
+            !pg.local_regular_file_state_needs_foreign_protection(file.ino)
+                .expect("probe protection"),
+            "a stale LocalOnly lifecycle row must not protect a Ready committed base attr without overlay"
         );
     }
 
