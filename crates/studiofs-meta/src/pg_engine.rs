@@ -898,6 +898,28 @@ impl<'a> RemoteApplyCoordinator<'a> {
         }
         self.apply_decoded_batches(batches, recent_flush, last_seq)
     }
+
+    fn reconcile_recent_flush(&self, recent_flush: Option<&RecentFlush>) -> MetaResult<bool> {
+        let Some(recent_flush) = recent_flush else {
+            return Ok(false);
+        };
+        if self.engine.local_version.load(Ordering::SeqCst) < recent_flush.batch_version {
+            return Ok(false);
+        }
+        let mut reconcile_inodes = recent_flush.overlay.attr_inodes.clone();
+        reconcile_inodes.extend(recent_flush.overlay.block_inodes.iter().copied());
+        let overlay = self.engine.local_overlay_conflicts()?;
+        let mut changed = self
+            .engine
+            .reconcile_regular_file_serving_from_base_with_overlay(&reconcile_inodes, &overlay)?;
+        changed |= self
+            .engine
+            .reconcile_serving_dentries_from_base_with_overlay(
+                &recent_flush.overlay.dentry_keys,
+                &overlay,
+            )?;
+        Ok(changed)
+    }
 }
 
 impl PgMetaEngine {
@@ -3741,26 +3763,12 @@ impl PgMetaEngine {
         Ok(())
     }
 
+    #[cfg(test)]
     fn reconcile_recent_flush_regular_files(
         &self,
         recent_flush: Option<&RecentFlush>,
     ) -> MetaResult<bool> {
-        let Some(recent_flush) = recent_flush else {
-            return Ok(false);
-        };
-        if self.local_version.load(Ordering::SeqCst) < recent_flush.batch_version {
-            return Ok(false);
-        }
-        let mut reconcile_inodes = recent_flush.overlay.attr_inodes.clone();
-        reconcile_inodes.extend(recent_flush.overlay.block_inodes.iter().copied());
-        let overlay = self.local_overlay_conflicts()?;
-        let mut changed = self
-            .reconcile_regular_file_serving_from_base_with_overlay(&reconcile_inodes, &overlay)?;
-        changed |= self.reconcile_serving_dentries_from_base_with_overlay(
-            &recent_flush.overlay.dentry_keys,
-            &overlay,
-        )?;
-        Ok(changed)
+        RemoteApplyCoordinator::new(self).reconcile_recent_flush(recent_flush)
     }
 
     fn remote_metadata_head_version(&self) -> MetaResult<i64> {
@@ -4402,7 +4410,7 @@ impl PgMetaEngine {
         };
         let recent_flush = self.flush_pending_claimed_batch_with_restore(batch)?;
         let _ = self.pull_foreign_events_locked(recent_flush.as_ref())?;
-        let _ = self.reconcile_recent_flush_regular_files(recent_flush.as_ref())?;
+        let _ = RemoteApplyCoordinator::new(self).reconcile_recent_flush(recent_flush.as_ref())?;
         Ok(())
     }
 
@@ -5347,7 +5355,7 @@ impl MetaReplication for PgMetaEngine {
             None
         };
         let _ = self.pull_foreign_events_locked(recent_flush.as_ref())?;
-        let _ = self.reconcile_recent_flush_regular_files(recent_flush.as_ref())?;
+        let _ = RemoteApplyCoordinator::new(self).reconcile_recent_flush(recent_flush.as_ref())?;
         self.write_checkpoint_locked()?;
         Ok(())
     }
