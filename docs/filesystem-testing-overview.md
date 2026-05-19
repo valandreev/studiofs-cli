@@ -317,13 +317,6 @@ failure should become a smaller focused regression before we move on.
 
 ## What Comes Next
 
-The workflow is intentionally staged. We add or restore one level, run it, fix
-the bugs it finds, rerun the focused slice to make sure nothing regressed, and
-only then move to the next level.
+The process of expanding our testing suite is strictly phased. We consistently introduce new testing layers, verify system stability, resolve any discovered issues, and move forward only when we are fully confident in the reliability of the current slice.
 
-Future deterministic backstops can go deeper into sparse-file
-truncate/write/read-range races, cold-observer long-history convergence,
-stale-remount catch-up, and adversarial runner cleanup. Symlink and
-metadata-attribute convergence now has a real mounted promotion scenario,
-`mounted-symlink-attribute-convergence`, with platform-gated public filesystem
-checks.
+Looking ahead, the matrix of deterministic checks and real-world mounted scenarios will be steadily expanded to cover more complex edge cases, specific collaboration patterns, and platform-dependent filesystem behaviors. This will allow us to continuously elevate the safety net and resilience of StudioFS as the project grows.

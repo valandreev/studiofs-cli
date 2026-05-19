@@ -811,6 +811,9 @@ impl RedbMetaEngine {
             match event {
                 crate::events::MetaEvent::SetAttr { attr } => {
                     Self::set_inode_mirror_in_txn(&txn, attr)?;
+                    if Self::ready_regular_file_attr_can_follow_base_in_txn(&txn, attr)? {
+                        Self::clear_regular_file_serving_overlay_in_txn(&txn, attr.ino)?;
+                    }
                 }
                 crate::events::MetaEvent::RemoveAttr { ino } => {
                     Self::remove_dentry_mirrors_for_inode_in_txn(&txn, *ino)?;
@@ -1109,6 +1112,38 @@ impl RedbMetaEngine {
         Ok(attr.kind != FileType::RegularFile
             || (attr.content_epoch == attr.committed_content_epoch
                 && attr.size == attr.committed_size))
+    }
+
+    fn ready_regular_file_attr_can_follow_base_in_txn(
+        txn: &redb::WriteTransaction,
+        attr: &InodeAttr,
+    ) -> MetaResult<bool> {
+        if attr.kind != FileType::RegularFile
+            || attr.upload_state != UploadState::Ready
+            || attr.content_epoch != attr.committed_content_epoch
+            || attr.size != attr.committed_size
+        {
+            return Ok(false);
+        }
+
+        if attr.committed_size == 0 {
+            return Ok(true);
+        }
+
+        let base = txn
+            .open_table(REGULAR_FILE_BASE_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let prefix = regular_file_chunk_prefix(attr.ino);
+        let mut rows = base
+            .range(prefix.as_ref()..)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        match rows.next() {
+            Some(row) => {
+                let (key, _) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+                Ok(key.value().starts_with(prefix.as_ref()))
+            }
+            None => Ok(false),
+        }
     }
 
     fn clear_regular_file_serving_overlay_in_txn(

@@ -1005,6 +1005,102 @@ fn replica_serving_base_publish_preserves_unpublished_local_overlay() {
 }
 
 #[test]
+fn replica_serving_ready_attr_after_publish_replaces_stale_overlay_payload() {
+    let engine = temp_engine();
+    let file = engine
+        .create_file(
+            ROOT_INO,
+            b"replica-serving-ready-after-publish.bin",
+            1000,
+            1000,
+            0o644,
+        )
+        .unwrap();
+
+    let stale_overlay = PayloadRef::new_full(92_101, DEFAULT_BLOCK_SIZE);
+    let stale_overlay_slices = RedbMetaEngine::chunk_slices_for_block(
+        0,
+        DEFAULT_BLOCK_SIZE,
+        Some(&stale_overlay),
+        PayloadRefState::LocalOnly,
+    )
+    .unwrap();
+    let mut stale_attr = engine.get_attr(file.ino).unwrap();
+    stale_attr.size = u64::from(DEFAULT_BLOCK_SIZE) - 11;
+    stale_attr.committed_size = stale_attr.size;
+    stale_attr.content_epoch = 2;
+    stale_attr.committed_content_epoch = 2;
+    stale_attr.upload_state = UploadState::Ready;
+    engine
+        .apply_replica_serving_state(&[
+            MetaEvent::SetRegularFileOverlaySlices {
+                ino: file.ino,
+                chunk_slices: stale_overlay_slices,
+            },
+            MetaEvent::SetAttr {
+                attr: stale_attr.clone(),
+            },
+        ])
+        .unwrap();
+
+    let remote_winner = PayloadRef::new_full(92_102, DEFAULT_BLOCK_SIZE);
+    let remote_winner_slices = RedbMetaEngine::chunk_slices_for_block(
+        0,
+        DEFAULT_BLOCK_SIZE,
+        Some(&remote_winner),
+        PayloadRefState::Published,
+    )
+    .unwrap();
+    let publish_event = MetaEvent::PublishRegularFileBaseSlices {
+        ino: file.ino,
+        chunk_slices: remote_winner_slices,
+    };
+    let mut updating_attr = stale_attr.clone();
+    updating_attr.size = u64::from(DEFAULT_BLOCK_SIZE);
+    updating_attr.content_epoch = 3;
+    updating_attr.committed_content_epoch = 2;
+    updating_attr.committed_size = stale_attr.size;
+    updating_attr.upload_state = UploadState::Updating;
+    let mut ready_attr = updating_attr.clone();
+    ready_attr.committed_content_epoch = 3;
+    ready_attr.committed_size = ready_attr.size;
+    ready_attr.upload_state = UploadState::Ready;
+
+    engine
+        .apply_replica_events_to_base(&[
+            MetaEvent::SetAttr {
+                attr: updating_attr.clone(),
+            },
+            publish_event.clone(),
+            MetaEvent::SetAttr {
+                attr: ready_attr.clone(),
+            },
+        ])
+        .unwrap();
+    engine
+        .apply_replica_serving_state(&[
+            MetaEvent::SetAttr {
+                attr: updating_attr,
+            },
+            publish_event,
+            MetaEvent::SetAttr { attr: ready_attr },
+        ])
+        .unwrap();
+
+    let object_ids: Vec<_> = engine
+        .lookup_regular_file_slices(file.ino, 0, u64::from(DEFAULT_BLOCK_SIZE))
+        .unwrap()
+        .into_iter()
+        .filter_map(|span| span.payload.map(|payload| payload.object_id))
+        .collect();
+    assert_eq!(
+        object_ids,
+        vec![remote_winner.object_id],
+        "final Ready attr must stop a stale serving overlay from shadowing the base winner"
+    );
+}
+
+#[test]
 fn reconcile_regular_file_serving_from_base_resets_stale_ready_attr() {
     let engine = temp_engine();
     let file = engine
