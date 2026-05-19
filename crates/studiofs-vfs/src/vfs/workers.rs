@@ -645,6 +645,7 @@ impl StudioVfs {
                 runtime_inodes,
             );
             self.invalidate_attr_read_cache(attr_cache_inodes.iter().copied());
+            self.invalidate_kernel_inodes(attr_cache_inodes.iter().copied());
             if namespace_changed {
                 self.bump_namespace_epoch();
             }
@@ -1504,6 +1505,20 @@ mod tests {
         assert!(
             attr_cache_inodes.contains(&30),
             "runtime-only inodes should still clear VFS attr/read caches after namespace changes"
+        );
+    }
+
+    #[test]
+    fn metadata_background_invalidation_includes_metadata_only_published_inodes() {
+        let previous = HashSet::from([ROOT_INO, 10]);
+        let current = HashSet::from([ROOT_INO, 10, 20]);
+
+        let attr_cache_inodes =
+            metadata_attr_cache_invalidation_set(&previous, &current, false, HashSet::new());
+
+        assert!(
+            attr_cache_inodes.contains(&20),
+            "metadata-only publishes must invalidate newly reachable inode attrs"
         );
     }
 }
