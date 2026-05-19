@@ -4142,6 +4142,15 @@ impl PgMetaEngine {
         )
     }
 
+    fn pull_and_reconcile_foreign_events_locked(
+        &self,
+        recent_flush: Option<&RecentFlush>,
+    ) -> MetaResult<bool> {
+        let mut changed = self.pull_foreign_events_locked(recent_flush)?;
+        changed |= RemoteApplyCoordinator::new(self).reconcile_recent_flush(recent_flush)?;
+        Ok(changed)
+    }
+
     fn clear_pending_state(state: &mut PendingReplicationState) {
         *state = PendingReplicationState::default();
     }
@@ -4369,8 +4378,7 @@ impl PgMetaEngine {
             return Ok(());
         };
         let recent_flush = self.flush_pending_claimed_batch_with_restore(batch)?;
-        let _ = self.pull_foreign_events_locked(recent_flush.as_ref())?;
-        let _ = RemoteApplyCoordinator::new(self).reconcile_recent_flush(recent_flush.as_ref())?;
+        let _ = self.pull_and_reconcile_foreign_events_locked(recent_flush.as_ref())?;
         Ok(())
     }
 
@@ -5314,8 +5322,7 @@ impl MetaReplication for PgMetaEngine {
         } else {
             None
         };
-        let _ = self.pull_foreign_events_locked(recent_flush.as_ref())?;
-        let _ = RemoteApplyCoordinator::new(self).reconcile_recent_flush(recent_flush.as_ref())?;
+        let _ = self.pull_and_reconcile_foreign_events_locked(recent_flush.as_ref())?;
         self.write_checkpoint_locked()?;
         Ok(())
     }
