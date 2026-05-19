@@ -3078,12 +3078,20 @@ impl PgMetaEngine {
                     }
                 }
 
-                let mut merged = attr.clone();
-                merged.size = base_attr.size;
+                let incoming_is_newer_unpublished = attr.upload_state != UploadState::Ready
+                    && attr.content_epoch > base_attr.content_epoch;
+                let mut merged = if incoming_is_newer_unpublished {
+                    attr.clone()
+                } else {
+                    base_attr.clone()
+                };
                 merged.committed_size = base_attr.committed_size;
-                merged.content_epoch = base_attr.content_epoch;
                 merged.committed_content_epoch = base_attr.committed_content_epoch;
-                merged.upload_state = base_attr.upload_state;
+                if !incoming_is_newer_unpublished {
+                    merged.size = base_attr.size;
+                    merged.content_epoch = base_attr.content_epoch;
+                    merged.upload_state = base_attr.upload_state;
+                }
                 Ok(MetaEvent::SetAttr { attr: merged })
             })
             .collect()
@@ -6891,6 +6899,48 @@ mod tests {
             lookup_object_ids(&pg, file.ino, attr.size).expect("lookup final object ids"),
             vec![winner_payload.object_id],
             "a late attr-only Updating batch must not hide the latest published content graph"
+        );
+    }
+
+    #[test]
+    fn newer_attr_only_updating_foreign_batch_preserves_uploading_marker_and_old_content() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+
+        let file =
+            create_published_small_file(&pg, ROOT_INO, b"newer-attr-only-updating.txt", 77_060);
+        let start = pg.flushed_event_seq.load(Ordering::SeqCst);
+        let end = pg.local.get_counter("nextEventSeq").expect("event end");
+        let local_events = pg
+            .local
+            .read_events_range(start, end)
+            .expect("read local events");
+        let projected_self_batch = PgMetaEngine::project_remote_events(&local_events);
+        pg.acknowledge_local_prefix_from_self_batch(&projected_self_batch)
+            .expect("ack local seed publish");
+
+        let mut updating_attr = pg.get_attr(file.ino).expect("load attr");
+        updating_attr.content_epoch = updating_attr.content_epoch.saturating_add(1);
+        updating_attr.upload_state = UploadState::Updating;
+        pg.apply_foreign_batch(
+            &[MetaEvent::SetAttr {
+                attr: updating_attr.clone(),
+            }],
+            &OverlayConflictSets::default(),
+            &HashSet::new(),
+        )
+        .expect("apply newer attr-only updating batch");
+
+        let attr = pg.get_attr(file.ino).expect("load final attr");
+        assert_eq!(attr.upload_state, UploadState::Updating);
+        assert_eq!(attr.content_epoch, updating_attr.content_epoch);
+        assert_eq!(
+            attr.committed_content_epoch, updating_attr.committed_content_epoch,
+            "the committed epoch must remain pinned to the old published content"
+        );
+        assert_eq!(
+            lookup_object_ids(&pg, file.ino, attr.committed_size).expect("lookup object ids"),
+            vec![77_060],
+            "attr-only Updating must keep serving the previous committed payload"
         );
     }
 

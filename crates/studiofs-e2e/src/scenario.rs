@@ -4,6 +4,7 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
+#[cfg(not(test))]
 use std::process::{Command, Stdio};
 use std::sync::{
     Arc, Barrier,
@@ -31,6 +32,7 @@ use crate::mounted_tree::{
     ClientMount, ConvergenceOutcome, MountedTreeError, NamespaceInvariantViolation, TreeComparison,
     validate_namespace_invariants, wait_for_convergence,
 };
+#[cfg(not(test))]
 use crate::process_job::{CHILD_TERMINATION_GRACE, ChildJob, wait_for_child_exit};
 use crate::report::RunManifest;
 
@@ -5168,89 +5170,112 @@ fn run_hotspot_helper_process(
         ))
     };
 
-    let exe = prepare_hotspot_helper_exe(context)?;
-    let mut command = Command::new(exe);
-    command
-        .arg("hotspot-op")
-        .arg("--operation")
-        .arg(operation)
-        .arg("--sandbox")
-        .arg(&context.sandbox)
-        .arg("--mount-point")
-        .arg(&client.mount_point)
-        .arg("--path")
-        .arg(path)
-        .arg("--progress")
-        .arg(&progress_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    if let Some(target) = target {
-        command.arg("--target").arg(target);
-    }
-    if let Some(payload_path) = &payload_path {
-        command.arg("--payload").arg(payload_path);
+    #[cfg(test)]
+    {
+        let _ = timeout;
+        let _ = pending_label;
+        let result = run_hotspot_op_helper(
+            operation,
+            client.mount_point.clone(),
+            path,
+            target,
+            payload_path.as_deref(),
+            Some(&progress_path),
+        );
+        result.map_err(|error| {
+            ScenarioError::Io(io::Error::other(format!(
+                "hotspot helper failed for {pending_label}: {error}"
+            )))
+        })
     }
 
-    ChildJob::prepare_command(&mut command)?;
-    let mut child = command.spawn()?;
-    let job = ChildJob::assign_to_child(&child).map_err(|error| {
-        let _ = child.kill();
-        let _ = child.wait();
-        ScenarioError::Io(io::Error::new(
-            error.kind(),
-            format!("failed to isolate hotspot helper process: {error}"),
-        ))
-    })?;
+    #[cfg(not(test))]
+    {
+        let exe = prepare_hotspot_helper_exe(context)?;
+        let mut command = Command::new(exe);
+        command
+            .arg("hotspot-op")
+            .arg("--operation")
+            .arg(operation)
+            .arg("--sandbox")
+            .arg(&context.sandbox)
+            .arg("--mount-point")
+            .arg(&client.mount_point)
+            .arg("--path")
+            .arg(path)
+            .arg("--progress")
+            .arg(&progress_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        if let Some(target) = target {
+            command.arg("--target").arg(target);
+        }
+        if let Some(payload_path) = &payload_path {
+            command.arg("--payload").arg(payload_path);
+        }
 
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(status) = child.try_wait()? {
-            if status.success() {
-                return Ok(());
+        ChildJob::prepare_command(&mut command)?;
+        let mut child = command.spawn()?;
+        let job = ChildJob::assign_to_child(&child).map_err(|error| {
+            let _ = child.kill();
+            let _ = child.wait();
+            ScenarioError::Io(io::Error::new(
+                error.kind(),
+                format!("failed to isolate hotspot helper process: {error}"),
+            ))
+        })?;
+
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = child.try_wait()? {
+                if status.success() {
+                    return Ok(());
+                }
+                let stderr = child
+                    .stderr
+                    .take()
+                    .and_then(|mut stderr| {
+                        let mut output = String::new();
+                        stderr.read_to_string(&mut output).ok().map(|_| output)
+                    })
+                    .unwrap_or_default();
+                let progress = read_hotspot_helper_progress_tail(&progress_path);
+                return Err(ScenarioError::Io(io::Error::other(format!(
+                    "hotspot helper failed for {pending_label}: status={status}; stderr={}; progress={}",
+                    stderr.trim(),
+                    progress.as_deref().unwrap_or("<none>")
+                ))));
             }
-            let stderr = child
-                .stderr
-                .take()
-                .and_then(|mut stderr| {
-                    let mut output = String::new();
-                    stderr.read_to_string(&mut output).ok().map(|_| output)
-                })
-                .unwrap_or_default();
-            let progress = read_hotspot_helper_progress_tail(&progress_path);
-            return Err(ScenarioError::Io(io::Error::other(format!(
-                "hotspot helper failed for {pending_label}: status={status}; stderr={}; progress={}",
-                stderr.trim(),
-                progress.as_deref().unwrap_or("<none>")
-            ))));
-        }
-        if Instant::now() >= deadline {
-            let progress = read_hotspot_helper_progress_tail(&progress_path);
-            let progress_suffix = progress
-                .as_ref()
-                .map(|progress| format!("; progress={progress}"))
-                .unwrap_or_default();
-            eprintln!(
-                "studiofs-e2e: mounted hotspot operation timed out after {} ms; terminating helper process: {}{}",
-                timeout.as_millis(),
-                pending_label,
-                progress_suffix
-            );
-            let _ = job.terminate();
-            if !wait_for_child_exit(&mut child, CHILD_TERMINATION_GRACE).unwrap_or(false) {
-                let _ = job.force_kill();
-                let _ = child.kill();
-                let _ = wait_for_child_exit(&mut child, CHILD_TERMINATION_GRACE);
+            if Instant::now() >= deadline {
+                let progress = read_hotspot_helper_progress_tail(&progress_path);
+                let progress_suffix = progress
+                    .as_ref()
+                    .map(|progress| format!("; progress={progress}"))
+                    .unwrap_or_default();
+                eprintln!(
+                    "studiofs-e2e: mounted hotspot operation timed out after {} ms; terminating helper process: {}{}",
+                    timeout.as_millis(),
+                    pending_label,
+                    progress_suffix
+                );
+                let _ = job.terminate();
+                if !wait_for_child_exit(&mut child, CHILD_TERMINATION_GRACE).unwrap_or(false) {
+                    let _ = job.force_kill();
+                    let _ = child.kill();
+                    let _ = wait_for_child_exit(&mut child, CHILD_TERMINATION_GRACE);
+                }
+                return Err(namespace_collision_operation_timeout(
+                    timeout,
+                    vec![(1, format!("{pending_label}{progress_suffix}"))],
+                ));
             }
-            return Err(namespace_collision_operation_timeout(
-                timeout,
-                vec![(1, format!("{pending_label}{progress_suffix}"))],
-            ));
+            thread::sleep(Duration::from_millis(50));
         }
-        thread::sleep(Duration::from_millis(50));
     }
 }
 
+#[cfg(not(test))]
 fn prepare_hotspot_helper_exe(context: &ScenarioContext) -> io::Result<PathBuf> {
     let source = std::env::current_exe()?;
     let helper_dir = context.scenario_dir.join("hotspot-helper-bin");
@@ -9180,6 +9205,7 @@ fn record_hotspot_helper_progress(
     file.flush()
 }
 
+#[cfg(not(test))]
 fn read_hotspot_helper_progress_tail(progress: &Path) -> Option<String> {
     let contents = fs::read_to_string(progress).ok()?;
     contents
