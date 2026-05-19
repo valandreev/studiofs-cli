@@ -180,15 +180,6 @@ struct RemoteApplyBatchOutcome {
     protected_overlay: OverlayConflictSets,
 }
 
-struct RemoteReplayProgress {
-    applied_any: bool,
-    max_version: i64,
-    max_namespace_version: i64,
-    reconcile_inodes: HashSet<Ino>,
-    reconcile_dentry_keys: HashSet<Vec<u8>>,
-    protected_overlay: OverlayConflictSets,
-}
-
 struct ProjectedRemoteBatch {
     events: Vec<MetaEvent>,
     visible_ops: u32,
@@ -839,28 +830,6 @@ impl<'a> RemoteApplyCoordinator<'a> {
         recent_flush.map(|recent_flush| &recent_flush.overlay.block_inodes)
     }
 
-    fn record_replay_batch_progress(
-        progress: &mut RemoteReplayProgress,
-        batch: &DecodedReplayBatch,
-    ) {
-        Self::collect_replay_reconcile_inodes(&mut progress.reconcile_inodes, &batch.events);
-        Self::collect_replay_reconcile_dentries(&mut progress.reconcile_dentry_keys, &batch.events);
-        progress.max_version = batch.batch_version;
-        if !batch.is_self_batch && batch.events.iter().any(MetaEvent::is_namespace_mutation) {
-            progress.max_namespace_version =
-                progress.max_namespace_version.max(batch.batch_version);
-        }
-    }
-
-    fn record_foreign_apply_outcome(
-        progress: &mut RemoteReplayProgress,
-        outcome: RemoteApplyBatchOutcome,
-    ) {
-        progress.applied_any |= outcome.changed;
-        progress.protected_overlay =
-            Self::merge_overlay_conflicts(&progress.protected_overlay, &outcome.protected_overlay);
-    }
-
     fn apply_decoded_batches(
         &self,
         batches: Vec<DecodedReplayBatch>,
@@ -872,19 +841,18 @@ impl<'a> RemoteApplyCoordinator<'a> {
         }
 
         let mut overlay = self.engine.local_overlay_conflicts()?;
-        let mut progress = RemoteReplayProgress {
-            applied_any: false,
-            max_version: last_seq,
-            max_namespace_version: self.engine.namespace_version.load(Ordering::SeqCst),
-            reconcile_inodes: HashSet::new(),
-            reconcile_dentry_keys: HashSet::new(),
-            protected_overlay: OverlayConflictSets::default(),
-        };
+        let mut applied_any = false;
+        let mut max_version = last_seq;
+        let mut max_namespace_version = self.engine.namespace_version.load(Ordering::SeqCst);
+        let mut reconcile_inodes = HashSet::new();
+        let mut reconcile_dentry_keys = HashSet::new();
+        let mut replay_protected_overlay = OverlayConflictSets::default();
         let empty_protected_base_inodes = HashSet::new();
         for batch in batches {
-            Self::record_replay_batch_progress(&mut progress, &batch);
+            Self::collect_replay_reconcile_inodes(&mut reconcile_inodes, &batch.events);
+            Self::collect_replay_reconcile_dentries(&mut reconcile_dentry_keys, &batch.events);
             if batch.is_self_batch {
-                progress.applied_any |= self.apply_visible_self_batch(&batch.events)?;
+                applied_any |= self.apply_visible_self_batch(&batch.events)?;
                 self.acknowledge_local_prefix_from_self_batch(&batch.events)?;
             } else {
                 let effective_overlay =
@@ -896,29 +864,37 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     &effective_overlay,
                     protected_base_inodes,
                 )?;
-                Self::record_foreign_apply_outcome(&mut progress, outcome);
+                applied_any |= outcome.changed;
+                replay_protected_overlay = Self::merge_overlay_conflicts(
+                    &replay_protected_overlay,
+                    &outcome.protected_overlay,
+                );
+                if batch.events.iter().any(MetaEvent::is_namespace_mutation) {
+                    max_namespace_version = max_namespace_version.max(batch.batch_version);
+                }
             }
+            max_version = batch.batch_version;
             overlay = self.engine.local_overlay_conflicts()?;
         }
-        let final_overlay = Self::merge_overlay_conflicts(&overlay, &progress.protected_overlay);
-        progress.applied_any |= self
+        let final_overlay = Self::merge_overlay_conflicts(&overlay, &replay_protected_overlay);
+        applied_any |= self
             .engine
             .reconcile_regular_file_serving_from_base_with_overlay(
-                &progress.reconcile_inodes,
+                &reconcile_inodes,
                 &final_overlay,
             )?;
-        progress.applied_any |= self
+        applied_any |= self
             .engine
             .reconcile_serving_dentries_from_base_with_overlay(
-                &progress.reconcile_dentry_keys,
+                &reconcile_dentry_keys,
                 &final_overlay,
             )?;
-        self.engine.persist_local_version(progress.max_version)?;
-        if progress.max_namespace_version > self.engine.namespace_version.load(Ordering::SeqCst) {
+        self.engine.persist_local_version(max_version)?;
+        if max_namespace_version > self.engine.namespace_version.load(Ordering::SeqCst) {
             self.engine
-                .persist_namespace_version(progress.max_namespace_version)?;
+                .persist_namespace_version(max_namespace_version)?;
         }
-        Ok(progress.applied_any)
+        Ok(applied_any)
     }
 
     fn apply_event_rows(

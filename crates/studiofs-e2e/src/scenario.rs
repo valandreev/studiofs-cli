@@ -5259,6 +5259,21 @@ fn run_hotspot_helper_process(
                     pending_label,
                     progress_suffix
                 );
+                #[cfg(windows)]
+                if let Some(pid) = client.process_id {
+                    eprintln!(
+                        "studiofs-e2e: terminating mounted client process {pid} to release blocked hotspot helper I/O: {pending_label}"
+                    );
+                    let _ = Command::new("taskkill")
+                        .arg("/PID")
+                        .arg(pid.to_string())
+                        .arg("/T")
+                        .arg("/F")
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                }
                 let _ = job.terminate();
                 if !wait_for_child_exit(&mut child, CHILD_TERMINATION_GRACE).unwrap_or(false) {
                     let _ = job.force_kill();
