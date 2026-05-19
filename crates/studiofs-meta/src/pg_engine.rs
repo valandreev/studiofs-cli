@@ -3311,21 +3311,6 @@ impl PgMetaEngine {
         ))
     }
 
-    #[cfg(test)]
-    fn apply_foreign_batch(
-        &self,
-        batch_events: &[MetaEvent],
-        overlay: &OverlayConflictSets,
-        base_protected_regular_file_inodes: &HashSet<Ino>,
-    ) -> MetaResult<(bool, OverlayConflictSets)> {
-        let outcome = RemoteApplyCoordinator::new(self).apply_foreign_batch(
-            batch_events,
-            overlay,
-            base_protected_regular_file_inodes,
-        )?;
-        Ok((outcome.changed, outcome.protected_overlay))
-    }
-
     fn preserve_published_content_state_for_attr_only_events(
         &self,
         batch_events: &[MetaEvent],
@@ -3674,19 +3659,6 @@ impl PgMetaEngine {
             .reconcile_serving_dentries_from_base(dentry_keys, &overlay.dentry_keys)
     }
 
-    #[cfg(test)]
-    fn apply_visible_self_batch(&self, batch_events: &[MetaEvent]) -> MetaResult<bool> {
-        RemoteApplyCoordinator::new(self).apply_visible_self_batch(batch_events)
-    }
-
-    #[cfg(test)]
-    fn acknowledge_local_prefix_from_self_batch(
-        &self,
-        batch_events: &[MetaEvent],
-    ) -> MetaResult<()> {
-        RemoteApplyCoordinator::new(self).acknowledge_local_prefix_from_self_batch(batch_events)
-    }
-
     fn pull_snapshot_locked(&self) -> MetaResult<bool> {
         let postgres_url = self.postgres_url.clone();
         let volume_id = self.volume_id;
@@ -3766,14 +3738,6 @@ impl PgMetaEngine {
         let overlay = self.local_overlay_conflicts()?;
         self.reconcile_regular_file_serving_from_base_with_overlay(&reconcile_inodes, &overlay)?;
         Ok(())
-    }
-
-    #[cfg(test)]
-    fn reconcile_recent_flush_regular_files(
-        &self,
-        recent_flush: Option<&RecentFlush>,
-    ) -> MetaResult<bool> {
-        RemoteApplyCoordinator::new(self).reconcile_recent_flush(recent_flush)
     }
 
     fn remote_metadata_head_version(&self) -> MetaResult<i64> {
@@ -4089,16 +4053,6 @@ impl PgMetaEngine {
                     Self::format_pg_error(e)
                 ))
             })
-    }
-
-    #[cfg(test)]
-    fn apply_decoded_foreign_batches_locked(
-        &self,
-        batches: Vec<DecodedReplayBatch>,
-        recent_flush: Option<&RecentFlush>,
-        last_seq: i64,
-    ) -> MetaResult<bool> {
-        RemoteApplyCoordinator::new(self).apply_decoded_batches(batches, recent_flush, last_seq)
     }
 
     fn record_metadata_sync_result(&self, source: MetadataSyncSource, result: &MetaResult<bool>) {
@@ -6062,7 +6016,7 @@ mod tests {
         );
 
         pg.flushed_event_seq.store(start, Ordering::SeqCst);
-        pg.acknowledge_local_prefix_from_self_batch(&projected)
+        acknowledge_local_prefix_from_self_batch(&pg, &projected)
             .expect("ack projected self batch");
 
         assert_eq!(
@@ -6215,9 +6169,54 @@ mod tests {
             .read_events_range(start, end)
             .expect("read local events");
         let projected = RemoteApplyCoordinator::project_remote_events(&events);
-        remote
-            .apply_foreign_batch(&projected, &OverlayConflictSets::default(), &HashSet::new())
-            .expect("apply projected remote batch");
+        apply_foreign_batch(
+            remote,
+            &projected,
+            &OverlayConflictSets::default(),
+            &HashSet::new(),
+        )
+        .expect("apply projected remote batch");
+    }
+
+    fn apply_foreign_batch(
+        pg: &PgMetaEngine,
+        batch_events: &[MetaEvent],
+        overlay: &OverlayConflictSets,
+        base_protected_regular_file_inodes: &HashSet<Ino>,
+    ) -> MetaResult<(bool, OverlayConflictSets)> {
+        let outcome = RemoteApplyCoordinator::new(pg).apply_foreign_batch(
+            batch_events,
+            overlay,
+            base_protected_regular_file_inodes,
+        )?;
+        Ok((outcome.changed, outcome.protected_overlay))
+    }
+
+    fn apply_visible_self_batch(pg: &PgMetaEngine, batch_events: &[MetaEvent]) -> MetaResult<bool> {
+        RemoteApplyCoordinator::new(pg).apply_visible_self_batch(batch_events)
+    }
+
+    fn acknowledge_local_prefix_from_self_batch(
+        pg: &PgMetaEngine,
+        batch_events: &[MetaEvent],
+    ) -> MetaResult<()> {
+        RemoteApplyCoordinator::new(pg).acknowledge_local_prefix_from_self_batch(batch_events)
+    }
+
+    fn apply_decoded_foreign_batches_locked(
+        pg: &PgMetaEngine,
+        batches: Vec<DecodedReplayBatch>,
+        recent_flush: Option<&RecentFlush>,
+        last_seq: i64,
+    ) -> MetaResult<bool> {
+        RemoteApplyCoordinator::new(pg).apply_decoded_batches(batches, recent_flush, last_seq)
+    }
+
+    fn reconcile_recent_flush_regular_files(
+        pg: &PgMetaEngine,
+        recent_flush: Option<&RecentFlush>,
+    ) -> MetaResult<bool> {
+        RemoteApplyCoordinator::new(pg).reconcile_recent_flush(recent_flush)
     }
 
     #[test]
@@ -6234,7 +6233,8 @@ mod tests {
         let overlay = pg.local_overlay_conflicts().expect("overlay conflicts");
         assert!(pg.lookup(ROOT_INO, b"renamed.txt").is_ok());
 
-        pg.apply_foreign_batch(
+        apply_foreign_batch(
+            &pg,
             &[
                 MetaEvent::RemoveEntry {
                     parent: ROOT_INO,
@@ -6289,8 +6289,7 @@ mod tests {
             "regular-file overlay protection must not mask the foreign unlink path"
         );
 
-        pg.apply_foreign_batch(&batch, &overlay, &HashSet::new())
-            .expect("apply foreign unlink");
+        apply_foreign_batch(&pg, &batch, &overlay, &HashSet::new()).expect("apply foreign unlink");
 
         assert!(
             matches!(
@@ -6316,7 +6315,7 @@ mod tests {
             .read_events_range(local_append_start, local_append_end)
             .expect("read local append events");
         let projected_self_batch = RemoteApplyCoordinator::project_remote_events(&local_events);
-        pg.acknowledge_local_prefix_from_self_batch(&projected_self_batch)
+        acknowledge_local_prefix_from_self_batch(&pg, &projected_self_batch)
             .expect("ack local append self batch");
 
         assert!(
@@ -6363,7 +6362,7 @@ mod tests {
             new_parent_attr: Box::new(None),
         };
 
-        pg.apply_foreign_batch(&[rename_replace], &overlay, &HashSet::new())
+        apply_foreign_batch(&pg, &[rename_replace], &overlay, &HashSet::new())
             .expect("apply foreign rename replace");
 
         assert!(
@@ -6391,7 +6390,7 @@ mod tests {
             .read_events_range(local_append_start, local_append_end)
             .expect("read local append events");
         let projected_self_batch = RemoteApplyCoordinator::project_remote_events(&local_events);
-        pg.acknowledge_local_prefix_from_self_batch(&projected_self_batch)
+        acknowledge_local_prefix_from_self_batch(&pg, &projected_self_batch)
             .expect("ack local append self batch");
 
         assert!(
@@ -6441,8 +6440,7 @@ mod tests {
             "active writer-local uploads must keep the serving dentry private"
         );
 
-        pg.apply_foreign_batch(&batch, &overlay, &HashSet::new())
-            .expect("apply foreign unlink");
+        apply_foreign_batch(&pg, &batch, &overlay, &HashSet::new()).expect("apply foreign unlink");
 
         assert!(
             pg.lookup(ROOT_INO, b"uploading-target.txt").is_ok(),
@@ -6490,8 +6488,7 @@ mod tests {
             "unpublished writer-local uploads must keep the serving dentry private"
         );
 
-        pg.apply_foreign_batch(&batch, &overlay, &HashSet::new())
-            .expect("apply foreign unlink");
+        apply_foreign_batch(&pg, &batch, &overlay, &HashSet::new()).expect("apply foreign unlink");
 
         assert!(
             pg.lookup(ROOT_INO, b"new-uploading-target.txt").is_ok(),
@@ -6535,7 +6532,7 @@ mod tests {
             },
         ];
 
-        pg.apply_foreign_batch(&remote_batch, &overlay, &HashSet::new())
+        apply_foreign_batch(&pg, &remote_batch, &overlay, &HashSet::new())
             .expect("apply deferred foreign dentry");
         assert_eq!(
             pg.lookup(ROOT_INO, b"slot.txt")
@@ -6593,7 +6590,8 @@ mod tests {
             remote_payload,
         );
         remote_slice.payload_state = PayloadRefState::Published;
-        pg.apply_foreign_batch(
+        apply_foreign_batch(
+            &pg,
             &[MetaEvent::PublishRegularFileBaseSlices {
                 ino: file.ino,
                 chunk_slices: vec![(ChunkId(0), vec![remote_slice])],
@@ -6643,26 +6641,26 @@ mod tests {
         second_remote.ctime = second_remote.ctime.saturating_add(1);
 
         RedbMetaEngine::reset_regular_file_serving_reconcile_call_count_for_test();
-        let changed = pg
-            .apply_decoded_foreign_batches_locked(
-                vec![
-                    DecodedReplayBatch {
-                        batch_version: 1,
-                        events: vec![MetaEvent::SetAttr { attr: first_remote }],
-                        is_self_batch: false,
-                    },
-                    DecodedReplayBatch {
-                        batch_version: 2,
-                        events: vec![MetaEvent::SetAttr {
-                            attr: second_remote,
-                        }],
-                        is_self_batch: false,
-                    },
-                ],
-                None,
-                0,
-            )
-            .expect("apply decoded replay batches");
+        let changed = apply_decoded_foreign_batches_locked(
+            &pg,
+            vec![
+                DecodedReplayBatch {
+                    batch_version: 1,
+                    events: vec![MetaEvent::SetAttr { attr: first_remote }],
+                    is_self_batch: false,
+                },
+                DecodedReplayBatch {
+                    batch_version: 2,
+                    events: vec![MetaEvent::SetAttr {
+                        attr: second_remote,
+                    }],
+                    is_self_batch: false,
+                },
+            ],
+            None,
+            0,
+        )
+        .expect("apply decoded replay batches");
 
         assert!(changed, "replay should report applied metadata changes");
         assert_eq!(
@@ -6696,7 +6694,8 @@ mod tests {
         remote.mtime = remote.mtime.saturating_add(1);
         remote.ctime = remote.ctime.saturating_add(1);
 
-        pg.apply_foreign_batch(
+        apply_foreign_batch(
+            &pg,
             &[MetaEvent::SetAttr { attr: remote }],
             &OverlayConflictSets::default(),
             &HashSet::from([file.ino]),
@@ -6753,7 +6752,8 @@ mod tests {
             )],
         };
 
-        pg.apply_foreign_batch(
+        apply_foreign_batch(
+            &pg,
             &[MetaEvent::SetAttr { attr: remote }, remote_publish],
             &OverlayConflictSets::default(),
             &HashSet::from([file.ino]),
@@ -6802,7 +6802,8 @@ mod tests {
             )
             .expect("remote middle slices"),
         };
-        pg.apply_foreign_batch(
+        apply_foreign_batch(
+            &pg,
             &[remote_publish],
             &OverlayConflictSets::default(),
             &HashSet::from([file.ino]),
@@ -6846,9 +6847,9 @@ mod tests {
             chunk_slices: fixture_payload_slices(1, Some(&remote_tail), PayloadRefState::Published)
                 .expect("remote tail slices"),
         };
-        let (changed, _) = pg
-            .apply_foreign_batch(&[remote_publish], &overlay, &HashSet::from([file.ino]))
-            .expect("apply protected foreign publish");
+        let (changed, _) =
+            apply_foreign_batch(&pg, &[remote_publish], &overlay, &HashSet::from([file.ino]))
+                .expect("apply protected foreign publish");
         assert!(
             changed,
             "protected publish-only batches that update serving metadata must wake VFS invalidation"
@@ -6879,7 +6880,7 @@ mod tests {
             .read_events_range(start, end)
             .expect("read local events");
         let projected_self_batch = RemoteApplyCoordinator::project_remote_events(&local_events);
-        pg.acknowledge_local_prefix_from_self_batch(&projected_self_batch)
+        acknowledge_local_prefix_from_self_batch(&pg, &projected_self_batch)
             .expect("ack local seed publish");
         let mut winner_attr = pg.get_attr(file.ino).expect("load winner attr");
         winner_attr.size = u64::from(DEFAULT_BLOCK_SIZE);
@@ -6902,7 +6903,8 @@ mod tests {
                 attr: winner_attr.clone(),
             },
         ];
-        pg.apply_foreign_batch(
+        apply_foreign_batch(
+            &pg,
             &winner_batch,
             &OverlayConflictSets::default(),
             &HashSet::new(),
@@ -6921,7 +6923,8 @@ mod tests {
         stale_attr.committed_content_epoch = 1;
         stale_attr.mtime = winner_attr.mtime.saturating_add(1);
         stale_attr.ctime = stale_attr.mtime;
-        pg.apply_foreign_batch(
+        apply_foreign_batch(
+            &pg,
             &[MetaEvent::SetAttr { attr: stale_attr }],
             &OverlayConflictSets::default(),
             &HashSet::new(),
@@ -6957,7 +6960,7 @@ mod tests {
             .read_events_range(start, end)
             .expect("read local events");
         let projected_self_batch = RemoteApplyCoordinator::project_remote_events(&local_events);
-        pg.acknowledge_local_prefix_from_self_batch(&projected_self_batch)
+        acknowledge_local_prefix_from_self_batch(&pg, &projected_self_batch)
             .expect("ack local seed publish");
 
         let mut winner_attr = pg.get_attr(file.ino).expect("load winner attr");
@@ -6981,7 +6984,8 @@ mod tests {
                 attr: winner_attr.clone(),
             },
         ];
-        pg.apply_foreign_batch(
+        apply_foreign_batch(
+            &pg,
             &winner_batch,
             &OverlayConflictSets::default(),
             &HashSet::new(),
@@ -7008,7 +7012,8 @@ mod tests {
         stale_updating_attr.upload_state = UploadState::Updating;
         stale_updating_attr.mtime = winner_attr.mtime.saturating_add(1);
         stale_updating_attr.ctime = stale_updating_attr.mtime;
-        pg.apply_foreign_batch(
+        apply_foreign_batch(
+            &pg,
             &[MetaEvent::SetAttr {
                 attr: stale_updating_attr,
             }],
@@ -7043,13 +7048,14 @@ mod tests {
             .read_events_range(start, end)
             .expect("read local events");
         let projected_self_batch = RemoteApplyCoordinator::project_remote_events(&local_events);
-        pg.acknowledge_local_prefix_from_self_batch(&projected_self_batch)
+        acknowledge_local_prefix_from_self_batch(&pg, &projected_self_batch)
             .expect("ack local seed publish");
 
         let mut updating_attr = pg.get_attr(file.ino).expect("load attr");
         updating_attr.content_epoch = updating_attr.content_epoch.saturating_add(1);
         updating_attr.upload_state = UploadState::Updating;
-        pg.apply_foreign_batch(
+        apply_foreign_batch(
+            &pg,
             &[MetaEvent::SetAttr {
                 attr: updating_attr.clone(),
             }],
@@ -7096,7 +7102,7 @@ mod tests {
             .read_events_range(start, end)
             .expect("read local events");
         let projected_self_batch = RemoteApplyCoordinator::project_remote_events(&local_events);
-        pg.acknowledge_local_prefix_from_self_batch(&projected_self_batch)
+        acknowledge_local_prefix_from_self_batch(&pg, &projected_self_batch)
             .expect("ack local sparse publish");
         assert!(
             pg.local_overlay_conflicts()
@@ -7139,7 +7145,8 @@ mod tests {
             "sparse ready publish payloads do not cover committed EOF"
         );
 
-        pg.apply_foreign_batch(
+        apply_foreign_batch(
+            &pg,
             &remote_batch,
             &OverlayConflictSets::default(),
             &HashSet::new(),
@@ -7218,8 +7225,7 @@ mod tests {
             "self sparse publish payloads do not cover committed EOF"
         );
 
-        pg.apply_visible_self_batch(&self_batch)
-            .expect("apply visible self sparse publish");
+        apply_visible_self_batch(&pg, &self_batch).expect("apply visible self sparse publish");
 
         let object_ids =
             lookup_object_ids(&pg, file.ino, logical_size).expect("lookup merged sparse graph");
@@ -7382,7 +7388,8 @@ mod tests {
         remote_attr.committed_content_epoch = remote_attr.content_epoch;
         remote_attr.upload_state = UploadState::Ready;
 
-        pg.apply_foreign_batch(
+        apply_foreign_batch(
+            &pg,
             &[
                 MetaEvent::SetAttr {
                     attr: remote_attr.clone(),
@@ -7465,7 +7472,8 @@ mod tests {
         remote_attr.mtime = remote_attr.mtime.saturating_add(1);
         remote_attr.ctime = remote_attr.ctime.saturating_add(1);
 
-        pg.apply_foreign_batch(
+        apply_foreign_batch(
+            &pg,
             &[
                 remote_publish,
                 MetaEvent::SetAttr {
@@ -7546,7 +7554,8 @@ mod tests {
         remote_attr.committed_content_epoch = 0;
         remote_attr.upload_state = UploadState::Ready;
 
-        pg.apply_foreign_batch(
+        apply_foreign_batch(
+            &pg,
             &[
                 remote_publish,
                 MetaEvent::SetAttr {
@@ -7634,7 +7643,8 @@ mod tests {
         remote_attr.mtime = remote_attr.mtime.saturating_sub(1);
         remote_attr.ctime = remote_attr.ctime.saturating_sub(1);
 
-        pg.apply_foreign_batch(
+        apply_foreign_batch(
+            &pg,
             &[
                 remote_publish,
                 MetaEvent::SetAttr {
@@ -7703,7 +7713,7 @@ mod tests {
             )],
         };
 
-        pg.apply_foreign_batch(&[remote_publish], &overlay, &HashSet::from([file.ino]))
+        apply_foreign_batch(&pg, &[remote_publish], &overlay, &HashSet::from([file.ino]))
             .expect("apply publish-only foreign batch");
 
         let object_ids = pg
@@ -7759,7 +7769,8 @@ mod tests {
         ready_attr.committed_content_epoch = 4;
         ready_attr.upload_state = UploadState::Ready;
 
-        pg.apply_foreign_batch(
+        apply_foreign_batch(
+            &pg,
             &[
                 remote_publish,
                 MetaEvent::SetAttr {
@@ -8323,7 +8334,7 @@ mod tests {
                 &RemoteApplyCoordinator::project_remote_events(&local_events),
             ),
         };
-        pg.reconcile_recent_flush_regular_files(Some(&recent_flush))
+        reconcile_recent_flush_regular_files(&pg, Some(&recent_flush))
             .expect("reconcile recent flush");
 
         assert_eq!(
