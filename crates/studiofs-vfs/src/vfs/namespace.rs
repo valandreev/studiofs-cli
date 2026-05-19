@@ -854,11 +854,12 @@ impl<'a> NamespaceMutationOps<'a> {
         new_name: &[u8],
         moved_ino: Ino,
     ) {
-        let invalidated = if parent == new_parent {
+        let mut invalidated = if parent == new_parent {
             vec![parent]
         } else {
             vec![parent, new_parent]
         };
+        invalidated.push(moved_ino);
         self.vfs.invalidate_attr_read_cache(invalidated);
         self.vfs.bump_namespace_for_parents([parent, new_parent]);
         self.vfs.dentry_cache_insert_negative(parent, name);

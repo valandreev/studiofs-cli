@@ -890,12 +890,49 @@ impl<'a> ReadMetadataResolver<'a> {
     }
 
     fn cached_attr(&self) -> Option<InodeAttr> {
-        self.vfs
+        let cached_attr = self
+            .vfs
             .state
             .namespace
             .attr_read_cache
             .lock()
-            .get(self.ino, Instant::now())
+            .get(self.ino, Instant::now())?;
+
+        let cached_attr_tracks_pending_content = cached_attr.kind == FileType::RegularFile
+            && (cached_attr.upload_state != MetaUploadState::Ready
+                || cached_attr.content_epoch != cached_attr.committed_content_epoch);
+        if !cached_attr_tracks_pending_content
+            || self
+                .vfs
+                .has_pending_local_dirty_payloads_for_inode(self.ino)
+            || self.vfs.inode_has_dirty_writer_stack(self.ino)
+            || !self.vfs.pending_uploads_for_inode(self.ino).is_empty()
+        {
+            return Some(cached_attr);
+        }
+
+        let remote_attr = match self.vfs.sync_meta().get_attr(self.ino) {
+            Ok(remote_attr) => remote_attr,
+            Err(error) => {
+                warn!(
+                    ino = self.ino,
+                    error = %error,
+                    "failed to refresh cached pending attr from authoritative metadata"
+                );
+                return Some(cached_attr);
+            }
+        };
+        if StudioVfs::is_fully_published_regular_file(&remote_attr) {
+            self.vfs.clear_superseded_local_regular_file_state(
+                self.ino,
+                remote_attr.committed_content_epoch,
+                true,
+            );
+            self.cache_attr(&remote_attr);
+            return Some(remote_attr);
+        }
+
+        Some(cached_attr)
     }
 
     fn cache_attr(&self, attr: &InodeAttr) {
@@ -2435,6 +2472,69 @@ mod tests {
             assert!(
                 !vfs.state.namespace.dirty_attrs.lock().contains_key(&ino),
                 "refresh should clear stale dirty attrs before serving the read"
+            );
+        });
+    }
+
+    #[test]
+    fn resolve_read_metadata_async_refreshes_drained_cached_pending_attr_from_ready_meta() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, vfs, meta) =
+            make_unstarted_test_vfs(&tmp, "resolve-refreshes-drained-cached-pending-attr");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let created = vfs
+                .create(
+                    ROOT_INO,
+                    b"resolve-refreshes-drained-cached-pending-attr.txt",
+                    1000,
+                    1000,
+                    0o644,
+                )
+                .expect("create file");
+            let ino = created.ino;
+            let published_payload = b"published winner";
+
+            vfs.write(ino, 0, published_payload)
+                .await
+                .expect("write published payload");
+            vfs.flush(ino).await.expect("flush published payload");
+            let (published_epoch, published_blocks) =
+                mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+            publish_current_file_graph(&meta, ino, published_epoch, &published_blocks);
+            vfs.cancel_pending_uploads_for_inode(ino);
+
+            let published_attr = meta.get_attr(ino).expect("load published attr");
+            let mut stale_cached_attr = published_attr.clone();
+            stale_cached_attr.size = 5;
+            stale_cached_attr.upload_state = MetaUploadState::Updating;
+            stale_cached_attr.content_epoch = published_attr.committed_content_epoch + 1;
+            vfs.state.namespace.attr_read_cache.lock().put(
+                ino,
+                stale_cached_attr,
+                ATTR_CACHE_TTL,
+                Instant::now(),
+            );
+
+            let (resolved_attr, _) = vfs
+                .resolve_read_metadata_async(ino, 0, published_payload.len() as u64)
+                .await
+                .expect("resolve published metadata");
+
+            assert_eq!(
+                resolved_attr.size, published_attr.size,
+                "read resolution must refresh drained cached pending attrs from authoritative ready metadata"
+            );
+            assert_eq!(
+                vfs.state
+                    .namespace
+                    .attr_read_cache
+                    .lock()
+                    .get(ino, Instant::now())
+                    .expect("cached attr should be repopulated from ready metadata")
+                    .size,
+                published_attr.size,
+                "stale pending attr cache should be replaced with authoritative ready metadata"
             );
         });
     }

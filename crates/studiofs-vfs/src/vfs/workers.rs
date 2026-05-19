@@ -504,6 +504,24 @@ impl StudioVfs {
         removed
     }
 
+    pub(super) fn runtime_namespace_invalidation_inodes(&self) -> HashSet<Ino> {
+        let mut inodes = self
+            .state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .keys()
+            .copied()
+            .collect::<HashSet<_>>();
+        inodes.extend(self.state.namespace.attr_read_cache.lock().keys());
+        inodes.extend(
+            self.pending_uploads_snapshot()
+                .into_iter()
+                .map(|upload| upload.ino),
+        );
+        inodes
+    }
+
     async fn wait_for_metadata_invalidation_notify(notifier: Option<&Arc<tokio::sync::Notify>>) {
         if let Some(notifier) = notifier {
             notifier.notified().await;
@@ -603,6 +621,9 @@ impl StudioVfs {
 
             let mut to_invalidate = last_snapshot.clone();
             to_invalidate.extend(current_snapshot.inodes.iter().copied());
+            if namespace_changed {
+                to_invalidate.extend(self.runtime_namespace_invalidation_inodes());
+            }
             self.invalidate_attr_read_cache(to_invalidate.iter().copied());
             self.invalidate_kernel_inodes(to_invalidate.iter().copied());
             if namespace_changed {

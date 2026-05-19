@@ -2380,6 +2380,41 @@ fn remote_ready_attr_superseding_local_dirty_state_invalidates_kernel_inode() {
 }
 
 #[test]
+fn rename_invalidates_moved_inode_attr_cache_without_kernel_callback() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "rename-invalidates-moved-inode");
+
+    let attr = vfs
+        .create(ROOT_INO, b"rename-cache-source.txt", 0, 0, 0o644)
+        .expect("create test file");
+    let mut stale_attr = meta.get_attr(attr.ino).expect("load attr");
+    stale_attr.size = 0;
+    vfs.state.namespace.attr_read_cache.lock().put(
+        attr.ino,
+        stale_attr,
+        ATTR_CACHE_TTL,
+        std::time::Instant::now(),
+    );
+
+    vfs.rename(
+        ROOT_INO,
+        b"rename-cache-source.txt",
+        ROOT_INO,
+        b"rename-cache-target.txt",
+    )
+    .expect("rename test file");
+
+    assert!(
+        !vfs.state
+            .namespace
+            .attr_read_cache
+            .lock()
+            .contains(attr.ino),
+        "successful rename must drop cached attrs for the moved inode"
+    );
+}
+
+#[test]
 fn remote_ready_attr_with_same_epoch_preserves_pending_local_write() {
     let tmp = TempDir::new().expect("tempdir");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "remote-ready-same-epoch-keeps-local");
@@ -5200,6 +5235,43 @@ fn writer_stack_write_invalidates_attr_cache_without_kernel_notify() {
         );
 
         vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn namespace_invalidation_includes_runtime_only_inodes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "namespace-invalidation-runtime-inodes");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let dirty = vfs.create(1, b"dirty-runtime-only.bin", 0, 0, 0o644).unwrap();
+        let cached = vfs.create(1, b"cached-runtime-only.bin", 0, 0, 0o644).unwrap();
+
+        let mut dirty_attr = dirty.clone();
+        dirty_attr.size = 227;
+        dirty_attr.upload_state = MetaUploadState::Updating;
+        vfs.state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .insert(dirty.ino, dirty_attr);
+        vfs.state.namespace.attr_read_cache.lock().put(
+            cached.ino,
+            cached.clone(),
+            ATTR_CACHE_TTL,
+            Instant::now(),
+        );
+
+        let inodes = vfs.runtime_namespace_invalidation_inodes();
+
+        assert!(
+            inodes.contains(&dirty.ino),
+            "namespace invalidation must include dirty attrs for local loser inodes that may not appear in metadata traversal snapshots"
+        );
+        assert!(
+            inodes.contains(&cached.ino),
+            "namespace invalidation must include attr/read cache keys whose path may have been replaced by remote rename reconciliation"
+        );
     });
 }
 

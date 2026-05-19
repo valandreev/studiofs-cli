@@ -916,6 +916,10 @@ where
         self.metrics
     }
 
+    fn keys(&self) -> Vec<K> {
+        self.entries.keys().cloned().collect()
+    }
+
     fn policy_mut(&mut self) -> &mut P {
         &mut self.policy
     }
@@ -1278,6 +1282,10 @@ impl AttrReadCache {
 
     fn remove(&mut self, ino: Ino) -> bool {
         self.inner.remove(&ino)
+    }
+
+    fn keys(&self) -> Vec<Ino> {
+        self.inner.keys()
     }
 
     #[cfg(test)]
