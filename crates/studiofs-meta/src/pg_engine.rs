@@ -175,6 +175,15 @@ struct DecodedReplayBatch {
     is_self_batch: bool,
 }
 
+struct RemoteApplyBatchOutcome {
+    changed: bool,
+    protected_overlay: OverlayConflictSets,
+}
+
+struct RemoteApplyCoordinator<'a> {
+    engine: &'a PgMetaEngine,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MetadataSyncSource {
     Manual,
@@ -269,6 +278,128 @@ struct PgJanitorLock {
 struct HeldFileLockLease {
     lease_ttl: Duration,
     next_renew_at: Instant,
+}
+
+impl<'a> RemoteApplyCoordinator<'a> {
+    fn new(engine: &'a PgMetaEngine) -> Self {
+        Self { engine }
+    }
+
+    fn project_remote_events(events: &[MetaEvent]) -> Vec<MetaEvent> {
+        let mut out = Vec::with_capacity(events.len());
+        for event in events {
+            match event {
+                MetaEvent::SetRegularFileOverlaySlices { .. }
+                | MetaEvent::RemoveRegularFileGraph { .. } => {}
+                MetaEvent::AddPendingDeletion { .. } | MetaEvent::RemovePendingDeletion { .. } => {}
+                MetaEvent::CreateSnapshot { snapshot } => {
+                    let mut synced = snapshot.clone();
+                    synced.state = SnapshotState::Synced;
+                    out.push(MetaEvent::CreateSnapshot { snapshot: synced });
+                }
+                MetaEvent::SetAttr { attr } if attr.kind == FileType::RegularFile => {
+                    let mut remote_attr = attr.clone();
+                    remote_attr.size = remote_attr.committed_size;
+                    out.push(MetaEvent::SetAttr { attr: remote_attr });
+                }
+                _ => out.push(event.clone()),
+            }
+        }
+        out
+    }
+
+    fn remote_visible_event_count(events: &[MetaEvent]) -> u32 {
+        let count = Self::project_remote_events(events).len();
+        u32::try_from(count).unwrap_or(u32::MAX)
+    }
+
+    fn remote_events_need_eager_flush(events: &[MetaEvent]) -> bool {
+        events.iter().any(|event| match event {
+            MetaEvent::SetRegularFileOverlaySlices { .. }
+            | MetaEvent::RemoveRegularFileGraph { .. }
+            | MetaEvent::AddPendingDeletion { .. }
+            | MetaEvent::RemovePendingDeletion { .. } => false,
+            MetaEvent::SetAttr { attr } if attr.kind == FileType::RegularFile => {
+                attr.upload_state == UploadState::Ready
+            }
+            MetaEvent::SetAttr { .. }
+            | MetaEvent::RemoveAttr { .. }
+            | MetaEvent::AddEntry { .. }
+            | MetaEvent::RemoveEntry { .. }
+            | MetaEvent::RenameEntry { .. }
+            | MetaEvent::PublishRegularFileBaseSlices { .. }
+            | MetaEvent::CreateSnapshot { .. }
+            | MetaEvent::UpdateSnapshotState { .. } => true,
+            MetaEvent::SetSymlinkTarget { .. }
+            | MetaEvent::SetXattr { .. }
+            | MetaEvent::RemoveXattr { .. }
+            | MetaEvent::SetAclRule { .. }
+            | MetaEvent::RemoveAclRule { .. } => false,
+        })
+    }
+
+    fn decode_foreign_batch(
+        rows: &[tokio_postgres::Row],
+        start_idx: usize,
+        client_id: &str,
+    ) -> MetaResult<(i64, usize, Vec<MetaEvent>, bool)> {
+        let batch_version: i64 = rows[start_idx].get(0);
+        let batch_client: Option<String> = rows[start_idx].get(3);
+        let is_self_batch = batch_client.as_deref() == Some(client_id);
+        let mut idx = start_idx;
+        let mut batch_events = Vec::new();
+
+        while idx < rows.len() {
+            let row_batch_version: i64 = rows[idx].get(0);
+            let row_client: Option<String> = rows[idx].get(3);
+            if row_batch_version != batch_version || row_client != batch_client {
+                break;
+            }
+            let payload: Vec<u8> = rows[idx].get(2);
+            let event: MetaEvent = postcard::from_bytes(&payload).map_err(|e| {
+                MetaError::Serialization(format!("postgres event decode failed: {e}"))
+            })?;
+            batch_events.push(event);
+            idx += 1;
+        }
+
+        Ok((batch_version, idx, batch_events, is_self_batch))
+    }
+
+    fn apply_foreign_batch(
+        &self,
+        batch_events: &[MetaEvent],
+        overlay: &OverlayConflictSets,
+        base_protected_regular_file_inodes: &HashSet<Ino>,
+    ) -> MetaResult<RemoteApplyBatchOutcome> {
+        self.engine.apply_foreign_batch_impl(
+            batch_events,
+            overlay,
+            base_protected_regular_file_inodes,
+        )
+    }
+
+    fn apply_visible_self_batch(&self, batch_events: &[MetaEvent]) -> MetaResult<bool> {
+        self.engine.apply_visible_self_batch_impl(batch_events)
+    }
+
+    fn acknowledge_local_prefix_from_self_batch(
+        &self,
+        batch_events: &[MetaEvent],
+    ) -> MetaResult<()> {
+        self.engine
+            .acknowledge_local_prefix_from_self_batch_impl(batch_events)
+    }
+
+    fn apply_decoded_batches(
+        &self,
+        batches: Vec<DecodedReplayBatch>,
+        recent_flush: Option<&RecentFlush>,
+        last_seq: i64,
+    ) -> MetaResult<bool> {
+        self.engine
+            .apply_decoded_foreign_batches_locked_impl(batches, recent_flush, last_seq)
+    }
 }
 
 impl PgMetaEngine {
@@ -2445,56 +2576,15 @@ impl PgMetaEngine {
     }
 
     fn project_remote_events(events: &[MetaEvent]) -> Vec<MetaEvent> {
-        let mut out = Vec::with_capacity(events.len());
-        for event in events {
-            match event {
-                MetaEvent::SetRegularFileOverlaySlices { .. }
-                | MetaEvent::RemoveRegularFileGraph { .. } => {}
-                MetaEvent::AddPendingDeletion { .. } | MetaEvent::RemovePendingDeletion { .. } => {}
-                MetaEvent::CreateSnapshot { snapshot } => {
-                    let mut synced = snapshot.clone();
-                    synced.state = SnapshotState::Synced;
-                    out.push(MetaEvent::CreateSnapshot { snapshot: synced });
-                }
-                MetaEvent::SetAttr { attr } if attr.kind == FileType::RegularFile => {
-                    let mut remote_attr = attr.clone();
-                    remote_attr.size = remote_attr.committed_size;
-                    out.push(MetaEvent::SetAttr { attr: remote_attr });
-                }
-                _ => out.push(event.clone()),
-            }
-        }
-        out
+        RemoteApplyCoordinator::project_remote_events(events)
     }
 
     fn remote_visible_event_count(events: &[MetaEvent]) -> u32 {
-        let count = Self::project_remote_events(events).len();
-        u32::try_from(count).unwrap_or(u32::MAX)
+        RemoteApplyCoordinator::remote_visible_event_count(events)
     }
 
     fn remote_events_need_eager_flush(events: &[MetaEvent]) -> bool {
-        events.iter().any(|event| match event {
-            MetaEvent::SetRegularFileOverlaySlices { .. }
-            | MetaEvent::RemoveRegularFileGraph { .. }
-            | MetaEvent::AddPendingDeletion { .. }
-            | MetaEvent::RemovePendingDeletion { .. } => false,
-            MetaEvent::SetAttr { attr } if attr.kind == FileType::RegularFile => {
-                attr.upload_state == UploadState::Ready
-            }
-            MetaEvent::SetAttr { .. }
-            | MetaEvent::RemoveAttr { .. }
-            | MetaEvent::AddEntry { .. }
-            | MetaEvent::RemoveEntry { .. }
-            | MetaEvent::RenameEntry { .. }
-            | MetaEvent::PublishRegularFileBaseSlices { .. }
-            | MetaEvent::CreateSnapshot { .. }
-            | MetaEvent::UpdateSnapshotState { .. } => true,
-            MetaEvent::SetSymlinkTarget { .. }
-            | MetaEvent::SetXattr { .. }
-            | MetaEvent::RemoveXattr { .. }
-            | MetaEvent::SetAclRule { .. }
-            | MetaEvent::RemoveAclRule { .. } => false,
-        })
+        RemoteApplyCoordinator::remote_events_need_eager_flush(events)
     }
 
     fn aux_event_conflicts_with_overlay(
@@ -2875,27 +2965,7 @@ impl PgMetaEngine {
         start_idx: usize,
         client_id: &str,
     ) -> MetaResult<(i64, usize, Vec<MetaEvent>, bool)> {
-        let batch_version: i64 = rows[start_idx].get(0);
-        let batch_client: Option<String> = rows[start_idx].get(3);
-        let is_self_batch = batch_client.as_deref() == Some(client_id);
-        let mut idx = start_idx;
-        let mut batch_events = Vec::new();
-
-        while idx < rows.len() {
-            let row_batch_version: i64 = rows[idx].get(0);
-            let row_client: Option<String> = rows[idx].get(3);
-            if row_batch_version != batch_version || row_client != batch_client {
-                break;
-            }
-            let payload: Vec<u8> = rows[idx].get(2);
-            let event: MetaEvent = postcard::from_bytes(&payload).map_err(|e| {
-                MetaError::Serialization(format!("postgres event decode failed: {e}"))
-            })?;
-            batch_events.push(event);
-            idx += 1;
-        }
-
-        Ok((batch_version, idx, batch_events, is_self_batch))
+        RemoteApplyCoordinator::decode_foreign_batch(rows, start_idx, client_id)
     }
 
     fn apply_foreign_batch(
@@ -2904,6 +2974,20 @@ impl PgMetaEngine {
         overlay: &OverlayConflictSets,
         base_protected_regular_file_inodes: &HashSet<Ino>,
     ) -> MetaResult<(bool, OverlayConflictSets)> {
+        let outcome = RemoteApplyCoordinator::new(self).apply_foreign_batch(
+            batch_events,
+            overlay,
+            base_protected_regular_file_inodes,
+        )?;
+        Ok((outcome.changed, outcome.protected_overlay))
+    }
+
+    fn apply_foreign_batch_impl(
+        &self,
+        batch_events: &[MetaEvent],
+        overlay: &OverlayConflictSets,
+        base_protected_regular_file_inodes: &HashSet<Ino>,
+    ) -> MetaResult<RemoteApplyBatchOutcome> {
         let batch_events =
             self.preserve_published_content_state_for_attr_only_events(batch_events)?;
         let current_regular_file_conflicts =
@@ -3003,10 +3087,12 @@ impl PgMetaEngine {
         if !aux_events.is_empty() {
             self.local.apply_replica_aux_state(&aux_events)?;
         }
-        Ok((
-            applied_serving_state || !aux_events.is_empty() || !grandfathered_attrs.is_empty(),
-            current_regular_file_conflicts,
-        ))
+        Ok(RemoteApplyBatchOutcome {
+            changed: applied_serving_state
+                || !aux_events.is_empty()
+                || !grandfathered_attrs.is_empty(),
+            protected_overlay: current_regular_file_conflicts,
+        })
     }
 
     fn preserve_published_content_state_for_attr_only_events(
@@ -3369,6 +3455,10 @@ impl PgMetaEngine {
     }
 
     fn apply_visible_self_batch(&self, batch_events: &[MetaEvent]) -> MetaResult<bool> {
+        RemoteApplyCoordinator::new(self).apply_visible_self_batch(batch_events)
+    }
+
+    fn apply_visible_self_batch_impl(&self, batch_events: &[MetaEvent]) -> MetaResult<bool> {
         if batch_events.is_empty() {
             return Ok(false);
         }
@@ -3425,6 +3515,13 @@ impl PgMetaEngine {
     }
 
     fn acknowledge_local_prefix_from_self_batch(
+        &self,
+        batch_events: &[MetaEvent],
+    ) -> MetaResult<()> {
+        RemoteApplyCoordinator::new(self).acknowledge_local_prefix_from_self_batch(batch_events)
+    }
+
+    fn acknowledge_local_prefix_from_self_batch_impl(
         &self,
         batch_events: &[MetaEvent],
     ) -> MetaResult<()> {
@@ -3907,6 +4004,15 @@ impl PgMetaEngine {
     }
 
     fn apply_decoded_foreign_batches_locked(
+        &self,
+        batches: Vec<DecodedReplayBatch>,
+        recent_flush: Option<&RecentFlush>,
+        last_seq: i64,
+    ) -> MetaResult<bool> {
+        RemoteApplyCoordinator::new(self).apply_decoded_batches(batches, recent_flush, last_seq)
+    }
+
+    fn apply_decoded_foreign_batches_locked_impl(
         &self,
         batches: Vec<DecodedReplayBatch>,
         recent_flush: Option<&RecentFlush>,
