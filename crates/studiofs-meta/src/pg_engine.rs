@@ -872,6 +872,32 @@ impl<'a> RemoteApplyCoordinator<'a> {
         }
         Ok(applied_any)
     }
+
+    fn apply_event_rows(
+        &self,
+        rows: Vec<tokio_postgres::Row>,
+        recent_flush: Option<&RecentFlush>,
+        last_seq: i64,
+        client_id: &str,
+    ) -> MetaResult<bool> {
+        if rows.is_empty() {
+            return Ok(false);
+        }
+
+        let mut batches = Vec::new();
+        let mut idx = 0;
+        while idx < rows.len() {
+            let (batch_version, next_idx, events, is_self_batch) =
+                Self::decode_foreign_batch(&rows, idx, client_id)?;
+            idx = next_idx;
+            batches.push(DecodedReplayBatch {
+                batch_version,
+                events,
+                is_self_batch,
+            });
+        }
+        self.apply_decoded_batches(batches, recent_flush, last_seq)
+    }
 }
 
 impl PgMetaEngine {
@@ -4047,32 +4073,7 @@ impl PgMetaEngine {
             })
     }
 
-    fn apply_foreign_event_rows_locked(
-        &self,
-        rows: Vec<tokio_postgres::Row>,
-        recent_flush: Option<&RecentFlush>,
-        last_seq: i64,
-        client_id: &str,
-    ) -> MetaResult<bool> {
-        if rows.is_empty() {
-            return Ok(false);
-        }
-
-        let mut batches = Vec::new();
-        let mut idx = 0;
-        while idx < rows.len() {
-            let (batch_version, next_idx, events, is_self_batch) =
-                RemoteApplyCoordinator::decode_foreign_batch(&rows, idx, client_id)?;
-            idx = next_idx;
-            batches.push(DecodedReplayBatch {
-                batch_version,
-                events,
-                is_self_batch,
-            });
-        }
-        self.apply_decoded_foreign_batches_locked(batches, recent_flush, last_seq)
-    }
-
+    #[cfg(test)]
     fn apply_decoded_foreign_batches_locked(
         &self,
         batches: Vec<DecodedReplayBatch>,
@@ -4161,7 +4162,12 @@ impl PgMetaEngine {
             .await
         })?;
 
-        self.apply_foreign_event_rows_locked(rows, recent_flush, last_seq, client_id.as_str())
+        RemoteApplyCoordinator::new(self).apply_event_rows(
+            rows,
+            recent_flush,
+            last_seq,
+            client_id.as_str(),
+        )
     }
 
     fn clear_pending_state(state: &mut PendingReplicationState) {
