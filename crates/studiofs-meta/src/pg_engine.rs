@@ -152,10 +152,14 @@ struct ClaimedPendingBatch {
     event_end: u64,
 }
 
+#[path = "pg_engine/codec_keys.rs"]
+mod codec_keys;
 #[path = "pg_engine/inode_allocator.rs"]
 mod inode_allocator;
 #[path = "pg_engine/janitor.rs"]
 mod janitor;
+#[path = "pg_engine/lifecycle.rs"]
+mod lifecycle;
 #[path = "pg_engine/lock_leases.rs"]
 mod lock_leases;
 #[path = "pg_engine/lock_workers.rs"]
@@ -253,43 +257,6 @@ impl PgMetaEngine {
             "STUDIOFS_PG_LOCK_NOTIFY_SAFETY_REFRESH_MS",
             Self::LOCK_NOTIFY_SAFETY_REFRESH_INTERVAL_MS,
         )
-    }
-
-    fn default_prepare_for_close_join_timeout() -> Duration {
-        Self::env_duration_ms("STUDIOFS_PG_PREPARE_FOR_CLOSE_JOIN_TIMEOUT_MS", 2_000)
-    }
-
-    fn join_background_thread_with_timeout(
-        handle: std::thread::JoinHandle<()>,
-        timeout: Duration,
-        worker: &'static str,
-    ) {
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        let _ = std::thread::Builder::new()
-            .name(format!("pg-close-join-{worker}"))
-            .spawn(move || {
-                let _ = tx.send(handle.join());
-            });
-
-        match rx.recv_timeout(timeout) {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) => {
-                warn!(worker, "pg background thread panicked during shutdown join");
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                warn!(
-                    worker,
-                    timeout_ms = timeout.as_millis() as u64,
-                    "pg background thread did not stop before shutdown join timeout"
-                );
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                warn!(
-                    worker,
-                    "pg background thread join helper disconnected unexpectedly"
-                );
-            }
-        }
     }
 
     fn ensure_file_lock_lease_schema(
@@ -624,88 +591,6 @@ impl PgMetaEngine {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0)
-    }
-
-    fn start_background_poll(
-        engine: std::sync::Weak<Self>,
-        interval: Duration,
-        shutdown: Arc<AtomicBool>,
-        wakeup: Arc<(Mutex<bool>, Condvar)>,
-    ) -> MetaResult<std::thread::JoinHandle<()>> {
-        std::thread::Builder::new()
-            .name("pg-meta-poll".into())
-            .spawn(move || {
-                loop {
-                    if shutdown.load(Ordering::Acquire) {
-                        break;
-                    }
-                    let (wakeup_lock, wakeup_cv) = &*wakeup;
-                    let mut wakeup_guard = wakeup_lock
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let deadline = Instant::now() + interval;
-                    while !*wakeup_guard {
-                        if shutdown.load(Ordering::Acquire) {
-                            return;
-                        }
-                        let remaining = deadline.saturating_duration_since(Instant::now());
-                        if remaining == Duration::ZERO {
-                            break;
-                        }
-                        let nap = remaining.min(Duration::from_millis(250));
-                        let wait_result = wakeup_cv.wait_timeout(wakeup_guard, nap);
-                        wakeup_guard = match wait_result {
-                            Ok((guard, _)) => guard,
-                            Err(poisoned) => poisoned.into_inner().0,
-                        };
-                    }
-                    *wakeup_guard = false;
-                    drop(wakeup_guard);
-                    if shutdown.load(Ordering::Acquire) {
-                        return;
-                    }
-                    let Some(engine) = engine.upgrade() else {
-                        break;
-                    };
-                    let _ = engine.flush_due_pending();
-                    let _ = engine.sync_metadata_with_source(MetadataSyncSource::FallbackPoll);
-                }
-            })
-            .map_err(|error| {
-                MetaError::Storage(format!("failed to spawn pg-meta-poll thread: {error}"))
-            })
-    }
-
-    fn decode_snapshot(bytes: &[u8]) -> MetaResult<RedbSnapshot> {
-        serde_json::from_slice(bytes)
-            .map_err(|e| MetaError::Serialization(format!("snapshot decode failed: {e}")))
-    }
-
-    fn encode_postcard<T: serde::Serialize>(val: &T) -> MetaResult<Vec<u8>> {
-        postcard::to_stdvec(val)
-            .map_err(|e| MetaError::Serialization(format!("postcard encode failed: {e}")))
-    }
-
-    fn xattr_key(ino: Ino, name: &[u8]) -> Vec<u8> {
-        let mut key = Vec::with_capacity(8 + name.len());
-        key.extend_from_slice(&ino.to_le_bytes());
-        key.extend_from_slice(name);
-        key
-    }
-
-    fn acl_key(ino: Ino, principal: &str) -> Vec<u8> {
-        let principal = principal.as_bytes();
-        let mut key = Vec::with_capacity(8 + principal.len());
-        key.extend_from_slice(&ino.to_le_bytes());
-        key.extend_from_slice(principal);
-        key
-    }
-
-    fn dentry_key(parent: Ino, name: &[u8]) -> Vec<u8> {
-        let mut key = Vec::with_capacity(8 + name.len());
-        key.extend_from_slice(&parent.to_le_bytes());
-        key.extend_from_slice(name);
-        key
     }
 
     fn mutate<T, F>(&self, f: F) -> MetaResult<T>
