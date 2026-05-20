@@ -466,9 +466,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
     }
 
     fn collect_replay_reconcile_inodes(candidates: &mut HashSet<Ino>, batch_events: &[MetaEvent]) {
-        candidates.extend(PgMetaEngine::regular_file_serving_reconcile_inodes(
-            batch_events,
-        ));
+        candidates.extend(Self::regular_file_serving_reconcile_inodes(batch_events));
     }
 
     fn collect_replay_reconcile_dentries(
@@ -497,6 +495,64 @@ impl<'a> RemoteApplyCoordinator<'a> {
             | MetaEvent::AddEntry { .. }
             | MetaEvent::RemoveEntry { .. }
             | MetaEvent::RenameEntry { .. } => false,
+        }
+    }
+
+    fn aux_event_conflicts_with_overlay(
+        event: &MetaEvent,
+        overlay: &OverlayConflictSets,
+        removed_inodes: &HashSet<Ino>,
+        removed_inodes_with_local_regular_file_state: &HashSet<Ino>,
+    ) -> bool {
+        match event {
+            MetaEvent::RemoveAttr { ino } => {
+                if overlay.block_inodes.contains(ino) {
+                    return true;
+                }
+                if removed_inodes.contains(ino) {
+                    return removed_inodes_with_local_regular_file_state.contains(ino);
+                }
+                overlay.attr_inodes.contains(ino)
+                    || overlay.symlink_inodes.contains(ino)
+                    || overlay.xattr_inodes.contains(ino)
+            }
+            MetaEvent::SetRegularFileOverlaySlices { .. } => false,
+            MetaEvent::RemoveRegularFileGraph { ino } => {
+                if removed_inodes.contains(ino) {
+                    return false;
+                }
+                overlay.block_inodes.contains(ino)
+            }
+            MetaEvent::PublishRegularFileBaseSlices { ino, .. } => {
+                overlay.block_inodes.contains(ino)
+            }
+            MetaEvent::SetSymlinkTarget { ino, .. } => {
+                overlay.block_inodes.contains(ino)
+                    || overlay.attr_inodes.contains(ino)
+                    || overlay.symlink_inodes.contains(ino)
+            }
+            MetaEvent::SetXattr { ino, name, .. } | MetaEvent::RemoveXattr { ino, name } => {
+                overlay.block_inodes.contains(ino)
+                    || overlay.attr_inodes.contains(ino)
+                    || overlay
+                        .xattr_keys
+                        .contains(&PgMetaEngine::xattr_key(*ino, name))
+            }
+            MetaEvent::SetAclRule { ino, principal, .. }
+            | MetaEvent::RemoveAclRule { ino, principal } => {
+                overlay.attr_inodes.contains(ino)
+                    || overlay
+                        .acl_keys
+                        .contains(&PgMetaEngine::acl_key(*ino, principal))
+            }
+            MetaEvent::SetAttr { .. }
+            | MetaEvent::AddEntry { .. }
+            | MetaEvent::RemoveEntry { .. }
+            | MetaEvent::RenameEntry { .. }
+            | MetaEvent::AddPendingDeletion { .. }
+            | MetaEvent::RemovePendingDeletion { .. }
+            | MetaEvent::CreateSnapshot { .. }
+            | MetaEvent::UpdateSnapshotState { .. } => false,
         }
     }
 
@@ -558,6 +614,52 @@ impl<'a> RemoteApplyCoordinator<'a> {
         }
     }
 
+    fn regular_file_serving_reconcile_inodes(events: &[MetaEvent]) -> HashSet<Ino> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                MetaEvent::SetAttr { attr } if attr.kind == FileType::RegularFile => Some(attr.ino),
+                MetaEvent::PublishRegularFileBaseSlices { ino, .. }
+                | MetaEvent::RemoveAttr { ino }
+                | MetaEvent::RemoveRegularFileGraph { ino } => Some(*ino),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn partial_regular_file_publish_inodes(batch_events: &[MetaEvent]) -> HashSet<Ino> {
+        let mut ready_sizes = HashMap::new();
+        let mut publish_inodes = HashSet::new();
+        for event in batch_events {
+            match event {
+                MetaEvent::SetAttr { attr }
+                    if attr.kind == FileType::RegularFile
+                        && attr.upload_state == UploadState::Ready
+                        && attr.content_epoch == attr.committed_content_epoch
+                        && attr.size == attr.committed_size =>
+                {
+                    ready_sizes.insert(attr.ino, attr.committed_size);
+                }
+                MetaEvent::PublishRegularFileBaseSlices { ino, .. } => {
+                    publish_inodes.insert(*ino);
+                }
+                _ => {}
+            }
+        }
+
+        publish_inodes
+            .into_iter()
+            .filter(|ino| match ready_sizes.get(ino) {
+                Some(committed_size) => !PgMetaEngine::batch_publish_covers_committed_extent(
+                    batch_events,
+                    *ino,
+                    *committed_size,
+                ),
+                None => true,
+            })
+            .collect()
+    }
+
     fn decode_foreign_batch(
         rows: &[tokio_postgres::Row],
         start_idx: usize,
@@ -612,8 +714,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 removed_inodes_with_local_regular_file_state.insert(*ino);
             }
         }
-        let partial_publish_inodes =
-            PgMetaEngine::partial_regular_file_publish_inodes(&batch_events);
+        let partial_publish_inodes = Self::partial_regular_file_publish_inodes(&batch_events);
         let mut base_range_preserve_inodes = self
             .engine
             .protected_base_range_preserve_inodes(&batch_events, &protected_regular_file_inodes)?;
@@ -690,12 +791,12 @@ impl<'a> RemoteApplyCoordinator<'a> {
             ) {
                 continue;
             }
-            if !self.engine.aux_event_conflicts_with_overlay(
+            if !Self::aux_event_conflicts_with_overlay(
                 event,
                 &overlay,
                 &removed_inodes,
                 &removed_inodes_with_local_regular_file_state,
-            )? {
+            ) {
                 aux_events.push(event.clone());
             }
         }
@@ -719,8 +820,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
         let batch_events = self
             .engine
             .preserve_published_content_state_for_attr_only_events(batch_events)?;
-        let partial_publish_inodes =
-            PgMetaEngine::partial_regular_file_publish_inodes(&batch_events);
+        let partial_publish_inodes = Self::partial_regular_file_publish_inodes(&batch_events);
         if partial_publish_inodes.is_empty() {
             self.engine
                 .local
@@ -3139,62 +3239,6 @@ impl PgMetaEngine {
             .map_err(|e| MetaError::Serialization(format!("postcard encode failed: {e}")))
     }
 
-    fn aux_event_conflicts_with_overlay(
-        &self,
-        event: &MetaEvent,
-        overlay: &OverlayConflictSets,
-        removed_inodes: &HashSet<Ino>,
-        removed_inodes_with_local_regular_file_state: &HashSet<Ino>,
-    ) -> MetaResult<bool> {
-        let conflict = match event {
-            MetaEvent::RemoveAttr { ino } => {
-                if overlay.block_inodes.contains(ino) {
-                    return Ok(true);
-                }
-                if removed_inodes.contains(ino) {
-                    return Ok(removed_inodes_with_local_regular_file_state.contains(ino));
-                }
-                overlay.attr_inodes.contains(ino)
-                    || overlay.symlink_inodes.contains(ino)
-                    || overlay.xattr_inodes.contains(ino)
-            }
-            MetaEvent::SetRegularFileOverlaySlices { .. } => false,
-            MetaEvent::RemoveRegularFileGraph { ino } => {
-                if removed_inodes.contains(ino) {
-                    return Ok(false);
-                }
-                overlay.block_inodes.contains(ino)
-            }
-            MetaEvent::PublishRegularFileBaseSlices { ino, .. } => {
-                overlay.block_inodes.contains(ino)
-            }
-            MetaEvent::SetSymlinkTarget { ino, .. } => {
-                overlay.block_inodes.contains(ino)
-                    || overlay.attr_inodes.contains(ino)
-                    || overlay.symlink_inodes.contains(ino)
-            }
-            MetaEvent::SetXattr { ino, name, .. } | MetaEvent::RemoveXattr { ino, name } => {
-                overlay.block_inodes.contains(ino)
-                    || overlay.attr_inodes.contains(ino)
-                    || overlay.xattr_keys.contains(&Self::xattr_key(*ino, name))
-            }
-            MetaEvent::SetAclRule { ino, principal, .. }
-            | MetaEvent::RemoveAclRule { ino, principal } => {
-                overlay.attr_inodes.contains(ino)
-                    || overlay.acl_keys.contains(&Self::acl_key(*ino, principal))
-            }
-            MetaEvent::SetAttr { .. }
-            | MetaEvent::AddEntry { .. }
-            | MetaEvent::RemoveEntry { .. }
-            | MetaEvent::RenameEntry { .. }
-            | MetaEvent::AddPendingDeletion { .. }
-            | MetaEvent::RemovePendingDeletion { .. }
-            | MetaEvent::CreateSnapshot { .. }
-            | MetaEvent::UpdateSnapshotState { .. } => false,
-        };
-        Ok(conflict)
-    }
-
     fn xattr_key(ino: Ino, name: &[u8]) -> Vec<u8> {
         let mut key = Vec::with_capacity(8 + name.len());
         key.extend_from_slice(&ino.to_le_bytes());
@@ -3534,39 +3578,6 @@ impl PgMetaEngine {
         false
     }
 
-    fn partial_regular_file_publish_inodes(batch_events: &[MetaEvent]) -> HashSet<Ino> {
-        let mut ready_sizes = HashMap::new();
-        let mut publish_inodes = HashSet::new();
-        for event in batch_events {
-            match event {
-                MetaEvent::SetAttr { attr }
-                    if attr.kind == FileType::RegularFile
-                        && attr.upload_state == UploadState::Ready
-                        && attr.content_epoch == attr.committed_content_epoch
-                        && attr.size == attr.committed_size =>
-                {
-                    ready_sizes.insert(attr.ino, attr.committed_size);
-                }
-                MetaEvent::PublishRegularFileBaseSlices { ino, .. } => {
-                    publish_inodes.insert(*ino);
-                }
-                _ => {}
-            }
-        }
-
-        publish_inodes
-            .into_iter()
-            .filter(|ino| match ready_sizes.get(ino) {
-                Some(committed_size) => !Self::batch_publish_covers_committed_extent(
-                    batch_events,
-                    *ino,
-                    *committed_size,
-                ),
-                None => true,
-            })
-            .collect()
-    }
-
     fn protected_regular_file_attr_merges(
         &self,
         batch_events: &[MetaEvent],
@@ -3636,19 +3647,6 @@ impl PgMetaEngine {
             merged.push(MetaEvent::SetAttr { attr: merged_attr });
         }
         Ok(merged)
-    }
-
-    fn regular_file_serving_reconcile_inodes(events: &[MetaEvent]) -> HashSet<Ino> {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                MetaEvent::SetAttr { attr } if attr.kind == FileType::RegularFile => Some(attr.ino),
-                MetaEvent::PublishRegularFileBaseSlices { ino, .. }
-                | MetaEvent::RemoveAttr { ino }
-                | MetaEvent::RemoveRegularFileGraph { ino } => Some(*ino),
-                _ => None,
-            })
-            .collect()
     }
 
     fn reconcile_regular_file_serving_from_base_with_overlay(
@@ -7180,7 +7178,8 @@ mod tests {
             },
         ];
         assert!(
-            PgMetaEngine::partial_regular_file_publish_inodes(&remote_batch).contains(&file.ino),
+            RemoteApplyCoordinator::partial_regular_file_publish_inodes(&remote_batch)
+                .contains(&file.ino),
             "sparse ready publish payloads do not cover committed EOF"
         );
 
@@ -7260,7 +7259,8 @@ mod tests {
             },
         ];
         assert!(
-            PgMetaEngine::partial_regular_file_publish_inodes(&self_batch).contains(&file.ino),
+            RemoteApplyCoordinator::partial_regular_file_publish_inodes(&self_batch)
+                .contains(&file.ino),
             "self sparse publish payloads do not cover committed EOF"
         );
 
@@ -8029,32 +8029,26 @@ mod tests {
                 .xattr_keys
                 .contains(&PgMetaEngine::xattr_key(file.ino, b"user.other"))
         );
-        assert!(
-            pg.aux_event_conflicts_with_overlay(
-                &MetaEvent::SetXattr {
-                    ino: file.ino,
-                    name: b"user.color".to_vec(),
-                    value: b"blue".to_vec(),
-                    flags: 0,
-                },
-                &overlay,
-                &HashSet::new(),
-                &HashSet::new(),
-            )
-            .expect("xattr conflict")
-        );
-        assert!(
-            pg.aux_event_conflicts_with_overlay(
-                &MetaEvent::SetSymlinkTarget {
-                    ino: sym.ino,
-                    target: b"target-c".to_vec(),
-                },
-                &overlay,
-                &HashSet::new(),
-                &HashSet::new(),
-            )
-            .expect("symlink conflict")
-        );
+        assert!(RemoteApplyCoordinator::aux_event_conflicts_with_overlay(
+            &MetaEvent::SetXattr {
+                ino: file.ino,
+                name: b"user.color".to_vec(),
+                value: b"blue".to_vec(),
+                flags: 0,
+            },
+            &overlay,
+            &HashSet::new(),
+            &HashSet::new(),
+        ));
+        assert!(RemoteApplyCoordinator::aux_event_conflicts_with_overlay(
+            &MetaEvent::SetSymlinkTarget {
+                ino: sym.ino,
+                target: b"target-c".to_vec(),
+            },
+            &overlay,
+            &HashSet::new(),
+            &HashSet::new(),
+        ));
 
         let state = pg.pending_state.lock().expect("pending_state");
         let start = state.event_start.expect("pending start set");
