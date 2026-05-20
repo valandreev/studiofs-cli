@@ -784,6 +784,36 @@ impl PgMetaEngine {
         Ok(())
     }
 
+    fn can_refresh_local_id_headroom(&self) -> MetaResult<bool> {
+        #[cfg(test)]
+        if let Some(value) = super::tests::headroom_refresh_test_override() {
+            return Ok(value);
+        }
+
+        let postgres_url = self.postgres_url.clone();
+        let connect_timeout = self.connect_timeout;
+        let command_timeout = self.command_timeout;
+        Self::run_async_once(async move {
+            Self::with_postgres_client_timeout(
+                postgres_url,
+                connect_timeout,
+                command_timeout,
+                "refresh local id headroom",
+                move |client| async move {
+                    client.simple_query("SELECT 1").await.map_err(|e| {
+                        MetaError::Storage(format!(
+                            "postgres local id headroom refresh check failed: {}",
+                            Self::format_pg_error(e)
+                        ))
+                    })?;
+                    Ok(true)
+                },
+            )
+            .await
+            .or(Ok(false))
+        })
+    }
+
     pub(super) fn prime_local_id_ranges(&self, slot: u64) -> MetaResult<()> {
         self.cache_client_slot(slot);
 

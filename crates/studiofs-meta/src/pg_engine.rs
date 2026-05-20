@@ -431,36 +431,6 @@ impl PgMetaEngine {
             .min(advertised_head_version)
     }
 
-    fn can_refresh_local_id_headroom(&self) -> MetaResult<bool> {
-        #[cfg(test)]
-        if let Some(value) = tests::headroom_refresh_test_override() {
-            return Ok(value);
-        }
-
-        let postgres_url = self.postgres_url.clone();
-        let connect_timeout = self.connect_timeout;
-        let command_timeout = self.command_timeout;
-        Self::run_async_once(async move {
-            Self::with_postgres_client_timeout(
-                postgres_url,
-                connect_timeout,
-                command_timeout,
-                "refresh local id headroom",
-                move |client| async move {
-                    client.simple_query("SELECT 1").await.map_err(|e| {
-                        MetaError::Storage(format!(
-                            "postgres local id headroom refresh check failed: {}",
-                            Self::format_pg_error(e)
-                        ))
-                    })?;
-                    Ok(true)
-                },
-            )
-            .await
-            .or(Ok(false))
-        })
-    }
-
     fn run_async_once<T, F>(fut: F) -> MetaResult<T>
     where
         T: Send,
@@ -552,50 +522,6 @@ impl PgMetaEngine {
             Ok(result) => result,
             Err(err) => Err(err),
         }
-    }
-
-    fn load_pg_global_snapshot_pins(&self) -> MetaResult<HashSet<u64>> {
-        let postgres_url = self.postgres_url.clone();
-        let volume_id = self.volume_id;
-        let connect_timeout = self.connect_timeout;
-        let command_timeout = self.command_timeout;
-        let rows = self.run_async(async move {
-            Self::with_postgres_client_timeout(
-                postgres_url,
-                connect_timeout,
-                command_timeout,
-                "janitor snapshot pin query",
-                move |client| async move {
-                    client
-                        .query(
-                            "SELECT pinned_object_ids FROM snapshots WHERE vol = $1",
-                            &[&volume_id],
-                        )
-                        .await
-                        .map_err(|e| {
-                            MetaError::Storage(format!(
-                                "postgres janitor snapshot pin query failed: {}",
-                                Self::format_pg_error(e)
-                            ))
-                        })
-                },
-            )
-            .await
-        })?;
-
-        let mut pins = HashSet::new();
-        for row in rows {
-            let raw_ids: Vec<i64> = row.get(0);
-            for object_id in raw_ids {
-                let object_id = u64::try_from(object_id).map_err(|_| {
-                    MetaError::Storage(format!(
-                        "snapshot pinned object id must be non-negative: {object_id}"
-                    ))
-                })?;
-                pins.insert(object_id);
-            }
-        }
-        Ok(pins)
     }
 
     /// Open the PostgreSQL-backed metadata engine using default startup options.
