@@ -2561,10 +2561,24 @@ impl StudioVfs {
                     || (current.size == attr.size
                         && current.mtime == attr.mtime
                         && current.ctime == attr.ctime))
+                || Self::is_stale_zero_size_dirty_attr_after_publish(current, attr)
         });
         if should_clear {
             dirty_attrs.remove(&ino);
         }
+    }
+
+    fn is_stale_zero_size_dirty_attr_after_publish(
+        current: &InodeAttr,
+        published: &InodeAttr,
+    ) -> bool {
+        current.kind == FileType::RegularFile
+            && published.kind == FileType::RegularFile
+            && Self::is_fully_published_regular_file(published)
+            && current.upload_state != MetaUploadState::Ready
+            && current.size == 0
+            && current.committed_size <= published.committed_size
+            && current.committed_content_epoch <= published.committed_content_epoch
     }
 
     fn add_pending_local_dirty_bytes(&self, bytes: usize) {
