@@ -5,6 +5,8 @@ use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
@@ -15,6 +17,8 @@ use thiserror::Error;
 const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 /// Buffer size in bytes for streaming file reads during checksum generation.
 const READ_BUFFER_BYTES: usize = 64 * 1024;
+/// Maximum wall time for a single mounted tree snapshot attempt.
+const SNAPSHOT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Metadata for a single mounted client under convergence checks.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,6 +189,12 @@ pub enum MountedTreeError {
         artifact_dir: PathBuf,
         /// Last error that prevented successful snapshotting.
         source: Box<MountedTreeError>,
+    },
+    /// A single snapshot attempt blocked longer than the per-attempt bound.
+    #[error("mounted filesystem tree snapshot attempt timed out after {timeout_ms}ms")]
+    SnapshotAttemptTimedOut {
+        /// Per-attempt timeout in milliseconds.
+        timeout_ms: u128,
     },
     /// A scanned path was not valid UTF-8.
     #[error("mounted tree path is not valid UTF-8: {path}")]
@@ -360,7 +370,7 @@ pub fn wait_for_convergence(
 
     loop {
         attempts += 1;
-        match snapshot_mounts(mounts) {
+        match snapshot_mounts_with_timeout(mounts, SNAPSHOT_ATTEMPT_TIMEOUT) {
             Ok(snapshots) => {
                 let comparison = compare_snapshots(&snapshots);
                 let elapsed_ms = started.elapsed().as_millis();
@@ -375,6 +385,15 @@ pub fn wait_for_convergence(
                 last_divergence = Some((snapshots, comparison));
             }
             Err(error) => {
+                let elapsed_ms = started.elapsed().as_millis();
+                if matches!(error, MountedTreeError::SnapshotAttemptTimedOut { .. }) {
+                    return Err(MountedTreeError::SnapshotUnavailableTimedOut {
+                        attempts,
+                        elapsed_ms,
+                        artifact_dir: artifact_dir.to_path_buf(),
+                        source: Box::new(error),
+                    });
+                }
                 last_snapshot_error = Some(error);
             }
         }
@@ -560,6 +579,31 @@ fn snapshot_mounts(mounts: &[ClientMount]) -> Result<Vec<MountedTreeSnapshot>, M
         .collect()
 }
 
+fn snapshot_mounts_with_timeout(
+    mounts: &[ClientMount],
+    timeout: Duration,
+) -> Result<Vec<MountedTreeSnapshot>, MountedTreeError> {
+    let mounts = mounts.to_vec();
+    run_snapshot_attempt_with_timeout(timeout, move || snapshot_mounts(&mounts))
+}
+
+fn run_snapshot_attempt_with_timeout<F>(
+    timeout: Duration,
+    snapshot: F,
+) -> Result<Vec<MountedTreeSnapshot>, MountedTreeError>
+where
+    F: FnOnce() -> Result<Vec<MountedTreeSnapshot>, MountedTreeError> + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(snapshot());
+    });
+    rx.recv_timeout(timeout)
+        .map_err(|_| MountedTreeError::SnapshotAttemptTimedOut {
+            timeout_ms: timeout.as_millis(),
+        })?
+}
+
 /// Computes a relative path from `root` to `path`, normalized with `/` separators.
 fn relative_path(root: &Path, path: &Path) -> Result<String, MountedTreeError> {
     path.strip_prefix(root)
@@ -689,5 +733,29 @@ fn io_error(path: &Path, source: io::Error) -> MountedTreeError {
     MountedTreeError::Io {
         path: path.to_path_buf(),
         source,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_attempt_timeout_returns_without_waiting_for_blocked_probe() {
+        let started = Instant::now();
+        let err = run_snapshot_attempt_with_timeout(Duration::from_millis(25), || {
+            thread::sleep(Duration::from_secs(5));
+            Ok(Vec::new())
+        })
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            MountedTreeError::SnapshotAttemptTimedOut { .. }
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "blocked snapshot attempt must not consume the scenario-child timeout"
+        );
     }
 }
