@@ -5012,9 +5012,8 @@ fn run_hotspot_churn_operations_with_timeout(
 ) -> Result<Vec<NamespaceCollisionOperation>, ScenarioError> {
     let started = Instant::now();
     let mut operations = Vec::new();
-    let active_workers = Arc::new(AtomicUsize::new(0));
     let mkdir_client = clients[0].clone();
-    run_hotspot_worker_process(
+    run_hotspot_helper_process(
         context,
         operation_timeout,
         &mkdir_client,
@@ -5023,8 +5022,6 @@ fn run_hotspot_churn_operations_with_timeout(
         None,
         None,
         format!("{} mkdir {}", mkdir_client.name, isolation.root),
-        HOTSPOT_IO_MAX_ACTIVE_WORKERS,
-        Arc::clone(&active_workers),
     )?;
     wait_for_hotspot_initial_tree(
         context,
@@ -5053,7 +5050,6 @@ fn run_hotspot_churn_operations_with_timeout(
             operation_timeout,
             Some(&write_payload),
             None,
-            &active_workers,
         )?;
         record_sparse_operation(context, &mut operations, operation)?;
         let append_path = slot.clone();
@@ -5070,7 +5066,6 @@ fn run_hotspot_churn_operations_with_timeout(
             operation_timeout,
             Some(&append_payload_bytes),
             None,
-            &active_workers,
         )?;
         record_sparse_operation(context, &mut operations, operation)?;
         wait_for_client_path_visible_until(
@@ -5092,7 +5087,6 @@ fn run_hotspot_churn_operations_with_timeout(
             operation_timeout,
             None,
             Some(&rename_target),
-            &active_workers,
         )?;
         record_sparse_operation(context, &mut operations, operation)?;
         let order = operations.len() + 1;
@@ -5106,7 +5100,6 @@ fn run_hotspot_churn_operations_with_timeout(
             operation_timeout,
             None,
             None,
-            &active_workers,
         )?;
         record_sparse_operation(context, &mut operations, operation)?;
     }
@@ -5153,20 +5146,10 @@ fn timed_hotspot_helper_fs_op(
     timeout: Duration,
     payload: Option<&[u8]>,
     target: Option<&str>,
-    active_workers: &Arc<AtomicUsize>,
 ) -> Result<NamespaceCollisionOperation, ScenarioError> {
     let label = format!("{} {} {}", client.name, operation, path);
-    match run_hotspot_worker_process(
-        context,
-        timeout,
-        client,
-        operation,
-        path,
-        target,
-        payload,
-        label,
-        HOTSPOT_IO_MAX_ACTIVE_WORKERS,
-        Arc::clone(active_workers),
+    match run_hotspot_helper_process(
+        context, timeout, client, operation, path, target, payload, label,
     ) {
         Ok(()) => Ok(record_advanced_operation(
             started,
@@ -11566,8 +11549,6 @@ mod tests {
             scenario_dir,
             client_controller_config: None,
         };
-        let active_workers = Arc::new(AtomicUsize::new(0));
-
         let record = timed_hotspot_helper_fs_op(
             &context,
             Instant::now(),
@@ -11578,7 +11559,6 @@ mod tests {
             Duration::from_secs(5),
             None,
             Some("renamed.txt"),
-            &active_workers,
         )
         .unwrap();
 
