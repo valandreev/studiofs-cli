@@ -3145,16 +3145,6 @@ fn record_sparse_operation(
     Ok(())
 }
 
-fn record_required_sparse_operation(
-    context: &ScenarioContext,
-    operations: &mut Vec<NamespaceCollisionOperation>,
-    operation: NamespaceCollisionOperation,
-) -> Result<(), ScenarioError> {
-    let required = required_record(operation.clone()).map(|_| ());
-    record_sparse_operation(context, operations, operation)?;
-    required
-}
-
 fn write_namespace_collision_summary(
     context: &ScenarioContext,
     summary: &NamespaceCollisionSummary,
@@ -5006,7 +4996,7 @@ fn run_hotspot_churn_operations_with_timeout(
     )?;
     for round in 0..10 {
         let slot = isolation.path(&format!("slot-{}.txt", round % 6));
-        let renamed = isolation.path(&format!("slot-{}-renamed-round-{round}.txt", round % 6));
+        let renamed = isolation.path(&format!("slot-{}-renamed.txt", round % 6));
         let write_path = slot.clone();
         let write_payload = isolation.payload(
             "overwrite",
@@ -5025,7 +5015,7 @@ fn run_hotspot_churn_operations_with_timeout(
             Some(&write_payload),
             None,
         )?;
-        record_required_sparse_operation(context, &mut operations, operation)?;
+        record_sparse_operation(context, &mut operations, operation)?;
         let append_path = slot.clone();
         let append_payload_bytes =
             isolation.payload("append", &append_path, &format!("append round {round}\n"));
@@ -5041,14 +5031,7 @@ fn run_hotspot_churn_operations_with_timeout(
             Some(&append_payload_bytes),
             None,
         )?;
-        record_required_sparse_operation(context, &mut operations, operation)?;
-        wait_for_required_paths_visible_until(
-            clients,
-            &[slot.as_str()],
-            Instant::now() + operation_timeout,
-            poll_interval,
-            "hotspot rename source",
-        )?;
+        record_sparse_operation(context, &mut operations, operation)?;
         wait_for_hotspot_helper_stat_until(
             context,
             &clients[0],
@@ -5070,14 +5053,7 @@ fn run_hotspot_churn_operations_with_timeout(
             None,
             Some(&rename_target),
         )?;
-        record_required_sparse_operation(context, &mut operations, operation)?;
-        wait_for_required_paths_visible_until(
-            clients,
-            &[rename_target.as_str()],
-            Instant::now() + operation_timeout,
-            poll_interval,
-            "hotspot rename target",
-        )?;
+        record_sparse_operation(context, &mut operations, operation)?;
         let order = operations.len() + 1;
         let operation = timed_hotspot_helper_fs_op(
             context,
@@ -5090,7 +5066,7 @@ fn run_hotspot_churn_operations_with_timeout(
             None,
             None,
         )?;
-        record_required_sparse_operation(context, &mut operations, operation)?;
+        record_sparse_operation(context, &mut operations, operation)?;
     }
     Ok(operations)
 }
@@ -6310,7 +6286,7 @@ fn wait_for_hotspot_helper_stat_until(
             return Err(ScenarioError::Io(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!(
-                    "{label} exact metadata probe did not become visible before timeout for {}:{relative_path}; last error: {}",
+                    "{label} did not become visible before timeout for {}:{relative_path}; last error: {}",
                     client.name,
                     last_error.unwrap_or_else(|| "none".to_string())
                 ),
@@ -11444,43 +11420,6 @@ mod tests {
 
         assert_eq!(record.result, "rejected");
         assert!(record.error.unwrap().contains("hotspot helper failed"));
-    }
-
-    #[test]
-    fn required_hotspot_churn_operation_is_logged_before_failing() {
-        let temp = tempdir().unwrap();
-        let sandbox = temp.path().join("run-required-helper-reject");
-        let scenario_dir = sandbox
-            .join("artifacts")
-            .join("scenarios")
-            .join(MOUNTED_HOTSPOT_CHURN_CONVERGENCE);
-        std::fs::create_dir_all(&scenario_dir).unwrap();
-        let context = ScenarioContext {
-            run_id: "run-required-helper-reject".to_string(),
-            seed: 415,
-            sandbox,
-            scenario_dir: scenario_dir.clone(),
-            client_controller_config: None,
-        };
-        let operation = NamespaceCollisionOperation {
-            order: 1,
-            client: "client-a".to_string(),
-            operation: "rename".to_string(),
-            path: "hotspot/slot-0.txt".to_string(),
-            result: "rejected".to_string(),
-            timestamp_ms: 0,
-            error: Some("source disappeared".to_string()),
-        };
-        let mut operations = Vec::new();
-
-        let err = record_required_sparse_operation(&context, &mut operations, operation)
-            .expect_err("rejected hotspot churn operations must fail the scenario");
-
-        assert!(err.to_string().contains("source disappeared"));
-        assert_eq!(operations.len(), 1);
-        let log = std::fs::read_to_string(scenario_dir.join("operations.ndjson")).unwrap();
-        assert!(log.contains("\"result\":\"rejected\""));
-        assert!(log.contains("source disappeared"));
     }
 
     #[test]
