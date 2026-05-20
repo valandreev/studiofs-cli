@@ -41,7 +41,14 @@ Get-CimInstance Win32_Process -Filter $processFilter |
                         $taskkillPath = $systemTaskkill
                     }
                 }
-                $taskkill = Start-Process -FilePath $taskkillPath -ArgumentList @('/PID', "$($_.ProcessId)", '/T', '/F') -NoNewWindow -Wait -PassThru -ErrorAction Stop
+                $taskkill = Start-Process -FilePath $taskkillPath -ArgumentList @('/PID', "$($_.ProcessId)", '/T', '/F') -NoNewWindow -PassThru -ErrorAction Stop
+                if (-not $taskkill.WaitForExit(5000)) {
+                    try {
+                        $taskkill.Kill()
+                    } catch {
+                    }
+                    throw "taskkill timed out after 5000 ms"
+                }
                 if ($taskkill.ExitCode -ne 0 -and $taskkill.ExitCode -ne 128) {
                     throw "taskkill exited with code $($taskkill.ExitCode)"
                 }

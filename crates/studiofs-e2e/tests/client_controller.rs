@@ -825,6 +825,34 @@ fn command_failure_truncates_large_stdout_and_stderr() {
     assert!(message.contains("truncated"));
 }
 
+#[test]
+fn unmount_all_continues_after_stuck_client_and_keeps_failed_handle_tracked() {
+    let temp = tempdir().unwrap();
+    let executor = RecordingExecutor {
+        exit_requires_kill: true,
+        kill_error_after: Cell::new(Some(1)),
+        ..RecordingExecutor::new()
+    };
+    let killed = Rc::clone(&executor.killed);
+    let mut config = test_config(temp.path());
+    config.mount_exit_timeout = Duration::from_millis(1);
+    config.poll_interval = Duration::from_millis(1);
+    let mut controller = MultiClientController::new(config, executor);
+
+    controller.create_clients(["client-a", "client-b"]).unwrap();
+    controller.mount_all().unwrap();
+
+    let err = controller.unmount_all().unwrap_err();
+    let clients = controller.clients();
+
+    assert!(err.to_string().contains("graceful unmount"));
+    assert_eq!(killed.get(), 2);
+    assert_eq!(clients[0].state, ClientLifecycleState::Killed);
+    assert_eq!(clients[0].process_id, Some(100));
+    assert_eq!(clients[1].state, ClientLifecycleState::Killed);
+    assert_eq!(clients[1].process_id, None);
+}
+
 #[derive(Clone)]
 /// Test double for [`ClientProcessExecutor`] that records all commands and can inject failures.
 ///

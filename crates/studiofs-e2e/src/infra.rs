@@ -22,6 +22,8 @@ const DEFAULT_RUSTFS_CONSOLE_PORT: u16 = 29_001;
 const DEFAULT_TOXIPROXY_API_PORT: u16 = 28_474;
 const COMPOSE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 const COMPOSE_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(windows)]
+const TASKKILL_FALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
 const STREAM_OUTPUT_ENV: &str = "STUDIOFS_E2E_STREAM_OUTPUT";
 const ANSI_RESET: &str = "\x1b[0m";
 const ANSI_YELLOW: &str = "\x1b[33m";
@@ -295,12 +297,27 @@ fn run_command(
 
 #[cfg(windows)]
 fn force_kill_process_tree(pid: u32) -> Result<(), String> {
-    let status = Command::new(taskkill_program())
+    let mut taskkill = Command::new(taskkill_program())
         .args(["/PID", &pid.to_string(), "/T", "/F"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
+        .spawn()
         .map_err(|err| err.to_string())?;
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = taskkill.try_wait().map_err(|err| err.to_string())? {
+            break status;
+        }
+        if started.elapsed() >= TASKKILL_FALLBACK_TIMEOUT {
+            let _ = taskkill.kill();
+            let _ = taskkill.wait();
+            return Err(format!(
+                "taskkill timed out after {} ms",
+                TASKKILL_FALLBACK_TIMEOUT.as_millis()
+            ));
+        }
+        thread::sleep(Duration::from_millis(25));
+    };
     match status.code() {
         Some(0 | 128) => Ok(()),
         _ => Err(format!("taskkill exited with status {status}")),
