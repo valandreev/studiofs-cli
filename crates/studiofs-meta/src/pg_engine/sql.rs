@@ -51,4 +51,10 @@ pub(super) const SELECT_REMOTE_METADATA_SIZE: &str = r#"
         (SELECT COALESCE(SUM(pg_column_size(snapshot)), 0) FROM metadata_state WHERE vol = $1) +
         (SELECT COALESCE(SUM(pg_column_size(event_payload)), 0) FROM event_log WHERE vol = $1) +
         (SELECT COALESCE(SUM(pg_column_size(snapshot_payload)), 0) FROM snapshots WHERE vol = $1)
-    "#;
+"#;
+
+pub(super) const SELECT_FILE_LOCK_LEASE: &str = r#"
+    SELECT ino, kind, exclusive_owner, shared_owners, lease_expires_at_unix_ms, generation
+    FROM file_lock_leases
+    WHERE vol = $1 AND ino = $2
+"#;
