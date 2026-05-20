@@ -5004,12 +5004,13 @@ fn run_hotspot_churn_operations_with_timeout(
             &format!("hotspot round {round}\n"),
         );
         let order = operations.len() + 1;
-        let operation = timed_hotspot_helper_fs_op(
+        let operation = timed_hotspot_helper_fs_op_with_helper(
             context,
             started,
             order,
             &clients[0],
             "overwrite",
+            "overwrite-barrier",
             &slot,
             operation_timeout,
             Some(&write_payload),
@@ -5112,9 +5113,34 @@ fn timed_hotspot_helper_fs_op(
     payload: Option<&[u8]>,
     target: Option<&str>,
 ) -> Result<NamespaceCollisionOperation, ScenarioError> {
+    timed_hotspot_helper_fs_op_with_helper(
+        context, started, order, client, operation, operation, path, timeout, payload, target,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn timed_hotspot_helper_fs_op_with_helper(
+    context: &ScenarioContext,
+    started: Instant,
+    order: usize,
+    client: &ClientSpec,
+    operation: &str,
+    helper_operation: &str,
+    path: &str,
+    timeout: Duration,
+    payload: Option<&[u8]>,
+    target: Option<&str>,
+) -> Result<NamespaceCollisionOperation, ScenarioError> {
     let label = format!("{} {} {}", client.name, operation, path);
     match run_hotspot_helper_process(
-        context, timeout, client, operation, path, target, payload, label,
+        context,
+        timeout,
+        client,
+        helper_operation,
+        path,
+        target,
+        payload,
+        label,
     ) {
         Ok(()) => Ok(record_advanced_operation(
             started,
@@ -11420,6 +11446,59 @@ mod tests {
 
         assert_eq!(record.result, "rejected");
         assert!(record.error.unwrap().contains("hotspot helper failed"));
+    }
+
+    #[test]
+    fn hotspot_overwrite_can_use_barrier_helper_while_recording_overwrite() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-helper-barrier");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(MOUNTED_HOTSPOT_CHURN_CONVERGENCE);
+        std::fs::create_dir_all(&scenario_dir).unwrap();
+        let mount = temp.path().join("mount");
+        std::fs::create_dir_all(&mount).unwrap();
+        let client = client_spec_for(&sandbox, "projectfs", "client-a", mount.clone());
+        let context = ScenarioContext {
+            run_id: "run-helper-barrier".to_string(),
+            seed: 415,
+            sandbox,
+            scenario_dir: scenario_dir.clone(),
+            client_controller_config: None,
+        };
+
+        let record = timed_hotspot_helper_fs_op_with_helper(
+            &context,
+            Instant::now(),
+            1,
+            &client,
+            "overwrite",
+            "overwrite-barrier",
+            "hotspot/slot-1.txt",
+            Duration::from_secs(5),
+            Some(b"barrier payload"),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(record.operation, "overwrite");
+        assert_eq!(record.result, "accepted");
+        assert_eq!(
+            std::fs::read(mount.join("hotspot").join("slot-1.txt")).unwrap(),
+            b"barrier payload"
+        );
+
+        let progress_dir = scenario_dir.join("hotspot-helper-progress");
+        let progress_file = std::fs::read_dir(progress_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.to_string_lossy().contains("overwrite-barrier"))
+            .expect("barrier helper progress file");
+        let progress_log = std::fs::read_to_string(progress_file).unwrap();
+        assert!(progress_log.contains("\"phase\":\"before_open_barrier_write\""));
+        assert!(progress_log.contains("\"phase\":\"after_readback\""));
+        assert!(progress_log.contains("\"phase\":\"completed\""));
     }
 
     #[test]
