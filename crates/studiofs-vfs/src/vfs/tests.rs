@@ -2380,6 +2380,59 @@ fn remote_ready_attr_superseding_local_dirty_state_invalidates_kernel_inode() {
 }
 
 #[test]
+fn authoritative_ready_metadata_does_not_clear_newer_local_dirty_attr() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "ready-keeps-newer-dirty-attr");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(ROOT_INO, b"newer-dirty-attr.txt", 0, 0, 0o644)
+            .expect("create file");
+        vfs.write(attr.ino, 0, b"published")
+            .await
+            .expect("write base");
+        vfs.flush(attr.ino).await.expect("flush base");
+
+        let (published_epoch, published_blocks) =
+            mark_all_overlay_objects_uploaded(&vfs, &meta, attr.ino);
+        publish_current_file_graph(&meta, attr.ino, published_epoch, &published_blocks);
+        vfs.cancel_pending_uploads_for_inode(attr.ino);
+        vfs.clear_pending_payloads_for_inode(attr.ino);
+        vfs.state.writer_stack.clear_inode(attr.ino);
+        vfs.remove_live_extents_for_inode(attr.ino);
+        vfs.remove_pending_epoch_finalizations_for_inode(attr.ino);
+
+        let published_attr = meta.get_attr(attr.ino).expect("load published attr");
+        let mut newer_dirty_attr = published_attr.clone();
+        newer_dirty_attr.size = published_attr.size + 4096;
+        newer_dirty_attr.content_epoch = published_attr.committed_content_epoch + 1;
+        newer_dirty_attr.upload_state = MetaUploadState::Updating;
+        vfs.state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .insert(attr.ino, newer_dirty_attr.clone());
+
+        vfs.refresh_inode_incarnation_state_from_attr(attr.ino, &published_attr);
+
+        let retained = vfs
+            .state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .get(&attr.ino)
+            .cloned()
+            .expect("newer local dirty attr must remain visible");
+        assert_eq!(retained.size, newer_dirty_attr.size);
+        assert_eq!(
+            vfs.getattr(attr.ino).expect("visible attr").size,
+            newer_dirty_attr.size
+        );
+    });
+}
+
+#[test]
 fn rename_invalidates_moved_inode_attr_cache_without_kernel_callback() {
     let tmp = TempDir::new().expect("tempdir");
     let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "rename-invalidates-moved-inode");
