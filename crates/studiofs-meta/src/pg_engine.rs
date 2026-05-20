@@ -180,6 +180,12 @@ struct RemoteApplyBatchOutcome {
     protected_overlay: OverlayConflictSets,
 }
 
+struct RemoteReplayApplyOutcome {
+    changed: bool,
+    max_version: i64,
+    max_namespace_version: i64,
+}
+
 struct ProjectedRemoteBatch {
     events: Vec<MetaEvent>,
     visible_ops: u32,
@@ -835,9 +841,13 @@ impl<'a> RemoteApplyCoordinator<'a> {
         batches: Vec<DecodedReplayBatch>,
         recent_flush: Option<&RecentFlush>,
         last_seq: i64,
-    ) -> MetaResult<bool> {
+    ) -> MetaResult<RemoteReplayApplyOutcome> {
         if batches.is_empty() {
-            return Ok(false);
+            return Ok(RemoteReplayApplyOutcome {
+                changed: false,
+                max_version: last_seq,
+                max_namespace_version: self.engine.namespace_version.load(Ordering::SeqCst),
+            });
         }
 
         let mut overlay = self.engine.local_overlay_conflicts()?;
@@ -889,12 +899,20 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 &reconcile_dentry_keys,
                 &final_overlay,
             )?;
-        self.engine.persist_local_version(max_version)?;
-        if max_namespace_version > self.engine.namespace_version.load(Ordering::SeqCst) {
+        Ok(RemoteReplayApplyOutcome {
+            changed: applied_any,
+            max_version,
+            max_namespace_version,
+        })
+    }
+
+    fn persist_replay_outcome(&self, outcome: &RemoteReplayApplyOutcome) -> MetaResult<()> {
+        self.engine.persist_local_version(outcome.max_version)?;
+        if outcome.max_namespace_version > self.engine.namespace_version.load(Ordering::SeqCst) {
             self.engine
-                .persist_namespace_version(max_namespace_version)?;
+                .persist_namespace_version(outcome.max_namespace_version)?;
         }
-        Ok(applied_any)
+        Ok(())
     }
 
     fn apply_event_rows(
@@ -920,7 +938,9 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 is_self_batch,
             });
         }
-        self.apply_decoded_batches(batches, recent_flush, last_seq)
+        let outcome = self.apply_decoded_batches(batches, recent_flush, last_seq)?;
+        self.persist_replay_outcome(&outcome)?;
+        Ok(outcome.changed)
     }
 
     fn reconcile_recent_flush(&self, recent_flush: Option<&RecentFlush>) -> MetaResult<bool> {
@@ -6225,7 +6245,10 @@ mod tests {
         recent_flush: Option<&RecentFlush>,
         last_seq: i64,
     ) -> MetaResult<bool> {
-        RemoteApplyCoordinator::new(pg).apply_decoded_batches(batches, recent_flush, last_seq)
+        let coordinator = RemoteApplyCoordinator::new(pg);
+        let outcome = coordinator.apply_decoded_batches(batches, recent_flush, last_seq)?;
+        coordinator.persist_replay_outcome(&outcome)?;
+        Ok(outcome.changed)
     }
 
     fn reconcile_recent_flush_regular_files(
