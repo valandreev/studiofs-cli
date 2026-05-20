@@ -1068,6 +1068,57 @@ fn recent_flush_dentry_reconcile_applies_deferred_foreign_base_entry() {
 }
 
 #[test]
+fn foreign_unready_add_entry_does_not_hide_visible_local_regular_file() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+
+    let local_file = create_published_small_file(&pg, ROOT_INO, b"slot.txt", 77_018);
+    let setup_end = pg.local.get_counter("nextEventSeq").expect("setup end");
+    pg.persist_flushed_event_seq(setup_end)
+        .expect("ack published setup");
+
+    let remote_ino = 77_019;
+    let mut remote_attr = InodeAttr::new_file(remote_ino, ROOT_INO, 0, 0, 0o644);
+    remote_attr.size = 227;
+    remote_attr.content_epoch = 1;
+    remote_attr.upload_state = UploadState::Updating;
+    let remote_entry = DirEntryValue {
+        ino: remote_ino,
+        kind: FileType::RegularFile,
+    };
+    let remote_batch = [
+        MetaEvent::SetAttr {
+            attr: remote_attr.clone(),
+        },
+        MetaEvent::AddEntry {
+            parent: ROOT_INO,
+            name: b"slot.txt".to_vec(),
+            entry: remote_entry,
+        },
+    ];
+
+    let (_changed, protected_overlay) = apply_foreign_batch(
+        &pg,
+        &remote_batch,
+        &OverlayConflictSets::default(),
+        &HashSet::new(),
+    )
+    .expect("apply unready foreign add entry");
+    assert!(
+        protected_overlay
+            .dentry_keys
+            .contains(&PgMetaEngine::dentry_key(ROOT_INO, b"slot.txt")),
+        "unready foreign regular-file dentry must be deferred until publish"
+    );
+    assert_eq!(
+        pg.lookup(ROOT_INO, b"slot.txt")
+            .expect("local slot remains visible")
+            .ino,
+        local_file.ino,
+        "an unready foreign AddEntry must not hide the current serving source path"
+    );
+}
+
+#[test]
 fn foreign_base_publish_preserves_unflushed_local_overlay_payload() {
     let (_dir, pg) = temp_pg_engine_for_unit();
 

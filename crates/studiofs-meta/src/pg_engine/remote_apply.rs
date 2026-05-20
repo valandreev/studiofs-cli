@@ -478,9 +478,23 @@ impl<'a> RemoteApplyCoordinator<'a> {
         batch_events: &[MetaEvent],
     ) -> MetaResult<OverlayConflictSets> {
         let mut overlay = OverlayConflictSets::default();
+        let serving_ready_regular_files =
+            self.serving_ready_regular_files_for_batch(batch_events)?;
         for event in batch_events {
             let ino = match event {
                 MetaEvent::SetAttr { attr } if attr.kind == FileType::RegularFile => attr.ino,
+                MetaEvent::AddEntry {
+                    parent,
+                    name,
+                    entry,
+                } if entry.kind == FileType::RegularFile
+                    && !serving_ready_regular_files.contains(&entry.ino) =>
+                {
+                    overlay
+                        .dentry_keys
+                        .insert(PgMetaEngine::dentry_key(*parent, name));
+                    continue;
+                }
                 MetaEvent::PublishRegularFileBaseSlices { ino, .. }
                 | MetaEvent::RemoveRegularFileGraph { ino } => *ino,
                 MetaEvent::RemoveEntry { parent, name } => {
@@ -504,6 +518,43 @@ impl<'a> RemoteApplyCoordinator<'a> {
             }
         }
         Ok(overlay)
+    }
+
+    fn serving_ready_regular_files_for_batch(
+        &self,
+        batch_events: &[MetaEvent],
+    ) -> MetaResult<HashSet<Ino>> {
+        let mut ready = HashSet::new();
+        for event in batch_events {
+            let MetaEvent::SetAttr { attr } = event else {
+                continue;
+            };
+            if Self::regular_file_attr_is_ready_for_serving(attr)
+                && (attr.committed_size == 0
+                    || Self::batch_publish_covers_committed_extent(
+                        batch_events,
+                        attr.ino,
+                        attr.committed_size,
+                    )
+                    || self
+                        .engine
+                        .local
+                        .get_base_attr(attr.ino)?
+                        .is_some_and(|base_attr| {
+                            Self::regular_file_attr_is_ready_for_serving(&base_attr)
+                        }))
+            {
+                ready.insert(attr.ino);
+            }
+        }
+        Ok(ready)
+    }
+
+    fn regular_file_attr_is_ready_for_serving(attr: &InodeAttr) -> bool {
+        attr.kind == FileType::RegularFile
+            && attr.upload_state == UploadState::Ready
+            && attr.content_epoch == attr.committed_content_epoch
+            && attr.size == attr.committed_size
     }
 
     pub(super) fn local_uploading_dentry_needs_foreign_protection(

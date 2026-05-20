@@ -1,7 +1,5 @@
 //! Scenario registry and lifecycle hooks for mounted E2E runs.
 
-#[cfg(windows)]
-use std::ffi::c_void;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
@@ -137,8 +135,8 @@ const MOUNTED_WRITE_READBACK_TIMEOUT: Duration = Duration::from_secs(5);
 const MOUNTED_WRITE_READBACK_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const MOUNTED_VALIDATION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const MOUNTED_VALIDATION_MAX_ACTIVE_PROBES: usize = 1;
-const MOUNTED_HELPER_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const HOTSPOT_CHURN_OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(test)]
 const HOTSPOT_IO_MAX_ACTIVE_WORKERS: usize = 1;
 static HOTSPOT_HELPER_PAYLOAD_ID: AtomicUsize = AtomicUsize::new(0);
 const LWW_RECONNECT_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -3147,6 +3145,16 @@ fn record_sparse_operation(
     Ok(())
 }
 
+fn record_required_sparse_operation(
+    context: &ScenarioContext,
+    operations: &mut Vec<NamespaceCollisionOperation>,
+    operation: NamespaceCollisionOperation,
+) -> Result<(), ScenarioError> {
+    let required = required_record(operation.clone()).map(|_| ());
+    record_sparse_operation(context, operations, operation)?;
+    required
+}
+
 fn write_namespace_collision_summary(
     context: &ScenarioContext,
     summary: &NamespaceCollisionSummary,
@@ -4711,9 +4719,8 @@ fn run_mounted_chaos_operations(
 ) -> Result<Vec<NamespaceCollisionOperation>, ScenarioError> {
     let started = Instant::now();
     let mut operations = Vec::new();
-    let active_workers = Arc::new(AtomicUsize::new(0));
     let writer = &clients[0];
-    seed_mounted_chaos_initial_tree(context, writer, isolation)?;
+    seed_mounted_chaos_initial_tree(writer, isolation)?;
     wait_for_mounted_chaos_initial_tree(
         context,
         clients,
@@ -4723,143 +4730,110 @@ fn run_mounted_chaos_operations(
     )?;
     for &(path, _) in MOUNTED_CHAOS_INITIAL_TREE {
         let path = isolation.path(path.strip_prefix("chaos/").unwrap_or(path));
-        run_hotspot_worker_process(
-            context,
-            MOUNTED_VALIDATION_PROBE_TIMEOUT,
-            writer,
-            "stat",
-            &path,
-            None,
-            None,
-            format!(
-                "{} stat mounted chaos initial path before conflicting operations: {path}",
-                writer.name
-            ),
-            HOTSPOT_IO_MAX_ACTIVE_WORKERS,
-            Arc::clone(&active_workers),
-        )?;
+        let path = writer.mount_point.join(path);
+        if !path.exists() {
+            return Err(ScenarioError::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "mounted chaos initial path disappeared before conflicting operations: {}",
+                    path.display()
+                ),
+            )));
+        }
     }
-    let rename_source = isolation.path("rename-source.txt");
-    let renamed_by_a = isolation.path("renamed-by-a.txt");
-    let operation = timed_mounted_worker_fs_op(
-        context,
+    operations.push(fs_op(
         started,
         1,
         &clients[0],
         "rename",
-        "rename",
-        &rename_source,
-        MOUNTED_HELPER_OPERATION_TIMEOUT,
-        None,
-        Some(&renamed_by_a),
-        &active_workers,
-    )?;
-    record_sparse_operation(context, &mut operations, operation)?;
-    let unlink_target = isolation.path("unlink-target.txt");
-    let operation = timed_mounted_worker_fs_op(
-        context,
+        &isolation.path("rename-source.txt"),
+        || {
+            fs::rename(
+                clients[0]
+                    .mount_point
+                    .join(isolation.path("rename-source.txt")),
+                clients[0]
+                    .mount_point
+                    .join(isolation.path("renamed-by-a.txt")),
+            )
+        },
+    ));
+    operations.push(fs_op(
         started,
         2,
         &clients[1],
         "unlink",
-        "delete",
-        &unlink_target,
-        MOUNTED_HELPER_OPERATION_TIMEOUT,
-        None,
-        None,
-        &active_workers,
-    )?;
-    record_sparse_operation(context, &mut operations, operation)?;
-    let append_target = isolation.path("append-target.txt");
-    let append_payload = isolation.payload("append", "append-target.txt", "appended by chaos\n");
-    let operation = timed_mounted_worker_fs_op(
-        context,
+        &isolation.path("unlink-target.txt"),
+        || {
+            fs::remove_file(
+                clients[1]
+                    .mount_point
+                    .join(isolation.path("unlink-target.txt")),
+            )
+        },
+    ));
+    operations.push(fs_op(
         started,
         3,
         &clients[2],
         "append",
-        "append",
-        &append_target,
-        MOUNTED_HELPER_OPERATION_TIMEOUT,
-        Some(&append_payload),
-        None,
-        &active_workers,
-    )?;
-    record_sparse_operation(context, &mut operations, operation)?;
-    let read_target = isolation.path("read-target.txt");
-    let overwrite_payload =
-        isolation.payload("overwrite", "read-target.txt", "new committed payload\n");
-    let operation = timed_mounted_worker_fs_op(
-        context,
+        &isolation.path("append-target.txt"),
+        || {
+            append_payload(
+                clients[2]
+                    .mount_point
+                    .join(isolation.path("append-target.txt")),
+                &isolation.payload("append", "append-target.txt", "appended by chaos\n"),
+            )
+        },
+    ));
+    operations.push(fs_op(
         started,
         4,
         &clients[0],
         "overwrite",
-        "overwrite",
-        &read_target,
-        MOUNTED_HELPER_OPERATION_TIMEOUT,
-        Some(&overwrite_payload),
-        None,
-        &active_workers,
-    )?;
-    record_sparse_operation(context, &mut operations, operation)?;
-    let dir = isolation.path("dir");
-    let operation = timed_mounted_worker_fs_op(
-        context,
+        &isolation.path("read-target.txt"),
+        || {
+            fs::write(
+                clients[0]
+                    .mount_point
+                    .join(isolation.path("read-target.txt")),
+                isolation.payload("overwrite", "read-target.txt", "new committed payload\n"),
+            )
+        },
+    ));
+    operations.push(fs_op(
         started,
         5,
         &clients[1],
         "mkdir",
-        "mkdir",
-        &dir,
-        MOUNTED_HELPER_OPERATION_TIMEOUT,
-        None,
-        None,
-        &active_workers,
-    )?;
-    record_sparse_operation(context, &mut operations, operation)?;
-    let operation = timed_mounted_worker_fs_op(
-        context,
+        &isolation.path("dir"),
+        || fs::create_dir_all(clients[1].mount_point.join(isolation.path("dir"))),
+    ));
+    operations.push(fs_op(
         started,
         6,
         &clients[2],
         "readdir",
-        "readdir",
         &isolation.root,
-        MOUNTED_HELPER_OPERATION_TIMEOUT,
-        None,
-        None,
-        &active_workers,
-    )?;
-    record_sparse_operation(context, &mut operations, operation)?;
+        || fs::read_dir(clients[2].mount_point.join(&isolation.root)).map(|_| ()),
+    ));
     Ok(operations)
 }
 
 fn seed_mounted_chaos_initial_tree(
-    context: &ScenarioContext,
     writer: &ClientSpec,
     isolation: &ScenarioIsolation,
 ) -> Result<(), ScenarioError> {
-    let active_workers = Arc::new(AtomicUsize::new(0));
     for &(path, payload) in MOUNTED_CHAOS_INITIAL_TREE {
         let logical_path = path.strip_prefix("chaos/").unwrap_or(path);
         let mounted_path = isolation.path(logical_path);
         let payload =
             isolation.payload("initial", &mounted_path, &String::from_utf8_lossy(payload));
-        run_hotspot_worker_process(
-            context,
-            MOUNTED_WRITE_READBACK_TIMEOUT,
-            writer,
-            "create",
-            &mounted_path,
-            None,
-            Some(&payload),
-            format!(
-                "{} create mounted chaos initial tree {mounted_path}",
-                writer.name
-            ),
-            HOTSPOT_IO_MAX_ACTIVE_WORKERS,
-            Arc::clone(&active_workers),
+        write_mounted_initial_file(
+            writer.mount_point.join(mounted_path),
+            &payload,
+            "mounted chaos initial tree",
         )?;
     }
     Ok(())
@@ -5051,7 +5025,7 @@ fn run_hotspot_churn_operations_with_timeout(
             Some(&write_payload),
             None,
         )?;
-        record_sparse_operation(context, &mut operations, operation)?;
+        record_required_sparse_operation(context, &mut operations, operation)?;
         let append_path = slot.clone();
         let append_payload_bytes =
             isolation.payload("append", &append_path, &format!("append round {round}\n"));
@@ -5067,8 +5041,16 @@ fn run_hotspot_churn_operations_with_timeout(
             Some(&append_payload_bytes),
             None,
         )?;
-        record_sparse_operation(context, &mut operations, operation)?;
-        wait_for_client_path_visible_until(
+        record_required_sparse_operation(context, &mut operations, operation)?;
+        wait_for_required_paths_visible_until(
+            clients,
+            &[slot.as_str()],
+            Instant::now() + operation_timeout,
+            poll_interval,
+            "hotspot rename source",
+        )?;
+        wait_for_hotspot_helper_stat_until(
+            context,
             &clients[0],
             &slot,
             Instant::now() + operation_timeout,
@@ -5088,7 +5070,14 @@ fn run_hotspot_churn_operations_with_timeout(
             None,
             Some(&rename_target),
         )?;
-        record_sparse_operation(context, &mut operations, operation)?;
+        record_required_sparse_operation(context, &mut operations, operation)?;
+        wait_for_required_paths_visible_until(
+            clients,
+            &[rename_target.as_str()],
+            Instant::now() + operation_timeout,
+            poll_interval,
+            "hotspot rename target",
+        )?;
         let order = operations.len() + 1;
         let operation = timed_hotspot_helper_fs_op(
             context,
@@ -5101,7 +5090,7 @@ fn run_hotspot_churn_operations_with_timeout(
             None,
             None,
         )?;
-        record_sparse_operation(context, &mut operations, operation)?;
+        record_required_sparse_operation(context, &mut operations, operation)?;
     }
     Ok(operations)
 }
@@ -5150,56 +5139,6 @@ fn timed_hotspot_helper_fs_op(
     let label = format!("{} {} {}", client.name, operation, path);
     match run_hotspot_helper_process(
         context, timeout, client, operation, path, target, payload, label,
-    ) {
-        Ok(()) => Ok(record_advanced_operation(
-            started,
-            order,
-            client,
-            operation,
-            path,
-            Ok(()),
-        )),
-        Err(error @ ScenarioError::NamespaceCollisionOperationTimeout { .. }) => Err(error),
-        Err(error) => Ok(record_advanced_operation(
-            started,
-            order,
-            client,
-            operation,
-            path,
-            Err(error.to_string()),
-        )),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn timed_mounted_worker_fs_op(
-    context: &ScenarioContext,
-    started: Instant,
-    order: usize,
-    client: &ClientSpec,
-    operation: &str,
-    helper_operation: &str,
-    path: &str,
-    timeout: Duration,
-    payload: Option<&[u8]>,
-    target: Option<&str>,
-    active_workers: &Arc<AtomicUsize>,
-) -> Result<NamespaceCollisionOperation, ScenarioError> {
-    let label = match target {
-        Some(target) => format!("{} {} {} -> {target}", client.name, operation, path),
-        None => format!("{} {} {}", client.name, operation, path),
-    };
-    match run_hotspot_worker_process(
-        context,
-        timeout,
-        client,
-        helper_operation,
-        path,
-        target,
-        payload,
-        label,
-        HOTSPOT_IO_MAX_ACTIVE_WORKERS,
-        Arc::clone(active_workers),
     ) {
         Ok(()) => Ok(record_advanced_operation(
             started,
@@ -5340,117 +5279,6 @@ fn run_hotspot_helper_process(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_hotspot_worker_process(
-    context: &ScenarioContext,
-    timeout: Duration,
-    client: &ClientSpec,
-    operation: &str,
-    path: &str,
-    target: Option<&str>,
-    payload: Option<&[u8]>,
-    pending_label: String,
-    max_active_workers: usize,
-    active_workers: Arc<AtomicUsize>,
-) -> Result<(), ScenarioError> {
-    let payload_path = write_helper_payload(context, client, operation, payload)?;
-    let progress_path = helper_progress_path(context, client, operation, path)?;
-
-    let operation = operation.to_string();
-    let mount_point = client.mount_point.clone();
-    let path = path.to_string();
-    let target = target.map(str::to_string);
-    let worker_progress_path = progress_path.clone();
-    let worker_payload_path = payload_path.clone();
-    let result = run_timed_hotspot_io_with_worker_limit(
-        timeout,
-        pending_label.clone(),
-        move || {
-            run_hotspot_op_helper(
-                &operation,
-                mount_point,
-                &path,
-                target.as_deref(),
-                worker_payload_path.as_deref(),
-                Some(&worker_progress_path),
-            )
-            .map_err(|error| match error.downcast::<io::Error>() {
-                Ok(source) => source,
-                Err(error) => io::Error::other(error),
-            })
-        },
-        active_workers,
-        max_active_workers,
-    );
-    if matches!(
-        result,
-        Err(ScenarioError::NamespaceCollisionOperationTimeout { .. })
-    ) {
-        let progress = read_hotspot_helper_progress_tail(&progress_path);
-        let progress_suffix = progress
-            .as_ref()
-            .map(|progress| format!("; progress={progress}"))
-            .unwrap_or_default();
-        eprintln!(
-            "studiofs-e2e: mounted hotspot operation timed out after {} ms; terminating mounted client if still running: {}{}",
-            timeout.as_millis(),
-            pending_label,
-            progress_suffix
-        );
-        #[cfg(windows)]
-        if let Some(pid) = client.process_id {
-            eprintln!(
-                "studiofs-e2e: terminating mounted client process {pid} to release blocked hotspot worker I/O: {pending_label}"
-            );
-            if let Err(error) = terminate_process_by_pid(pid) {
-                eprintln!(
-                    "studiofs-e2e: failed to terminate mounted client process {pid}: {error}"
-                );
-            }
-        }
-    }
-    result.map_err(|error| match error {
-        ScenarioError::Io(source) => ScenarioError::Io(io::Error::new(
-            source.kind(),
-            format!("hotspot helper failed for {pending_label}: {source}"),
-        )),
-        other => other,
-    })
-}
-
-#[cfg(windows)]
-fn terminate_process_by_pid(pid: u32) -> io::Result<()> {
-    const PROCESS_TERMINATE: u32 = 0x0001;
-    const ERROR_INVALID_PARAMETER: i32 = 87;
-
-    unsafe extern "system" {
-        fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> *mut c_void;
-        fn TerminateProcess(hProcess: *mut c_void, uExitCode: u32) -> i32;
-        fn CloseHandle(hObject: *mut c_void) -> i32;
-    }
-
-    // SAFETY: OpenProcess is called with a concrete PID from the mounted client spec.
-    let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
-    if handle.is_null() {
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER) {
-            return Ok(());
-        }
-        return Err(error);
-    }
-
-    // SAFETY: handle is a process handle returned by OpenProcess above.
-    let terminated = unsafe { TerminateProcess(handle, 1) };
-    let result = if terminated == 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    };
-    // SAFETY: handle is owned by this function and is closed exactly once.
-    let _ = unsafe { CloseHandle(handle) };
-    result
-}
-
 fn write_helper_payload(
     context: &ScenarioContext,
     client: &ClientSpec,
@@ -5504,6 +5332,7 @@ fn prepare_hotspot_helper_exe(context: &ScenarioContext) -> io::Result<PathBuf> 
     Ok(helper)
 }
 
+#[cfg(test)]
 fn run_timed_hotspot_io_with_worker_limit<T: Send + 'static>(
     timeout: Duration,
     pending_label: String,
@@ -5552,10 +5381,12 @@ fn run_timed_hotspot_io_with_worker_limit<T: Send + 'static>(
     }
 }
 
+#[cfg(test)]
 struct HotspotIoWorkerPermit {
     active_workers: Arc<AtomicUsize>,
 }
 
+#[cfg(test)]
 impl HotspotIoWorkerPermit {
     fn try_acquire(active_workers: Arc<AtomicUsize>, max_active_workers: usize) -> Option<Self> {
         let mut current = active_workers.load(Ordering::Acquire);
@@ -5576,6 +5407,7 @@ impl HotspotIoWorkerPermit {
     }
 }
 
+#[cfg(test)]
 impl Drop for HotspotIoWorkerPermit {
     fn drop(&mut self) {
         self.active_workers.fetch_sub(1, Ordering::AcqRel);
@@ -6425,6 +6257,7 @@ fn wait_for_required_paths_visible_until(
     }
 }
 
+#[cfg(test)]
 fn wait_for_client_path_visible_until(
     client: &ClientSpec,
     relative_path: &str,
@@ -6457,6 +6290,53 @@ fn wait_for_client_path_visible_until(
                         error.detail()
                     ),
                 )));
+            }
+        }
+    }
+}
+
+fn wait_for_hotspot_helper_stat_until(
+    context: &ScenarioContext,
+    client: &ClientSpec,
+    relative_path: &str,
+    deadline: Instant,
+    poll_interval: Duration,
+    label: &str,
+) -> Result<(), ScenarioError> {
+    let mut last_error = None;
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(ScenarioError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "{label} exact metadata probe did not become visible before timeout for {}:{relative_path}; last error: {}",
+                    client.name,
+                    last_error.unwrap_or_else(|| "none".to_string())
+                ),
+            )));
+        }
+
+        let remaining = deadline.saturating_duration_since(now);
+        match run_hotspot_helper_process(
+            context,
+            remaining,
+            client,
+            "stat",
+            relative_path,
+            None,
+            None,
+            format!("{} stat {label} {relative_path}", client.name),
+        ) {
+            Ok(()) => return Ok(()),
+            Err(error @ ScenarioError::NamespaceCollisionOperationTimeout { .. }) => {
+                return Err(error);
+            }
+            Err(error) => {
+                last_error = Some(error.to_string());
+                thread::sleep(
+                    poll_interval.min(deadline.saturating_duration_since(Instant::now())),
+                );
             }
         }
     }
@@ -6508,6 +6388,7 @@ fn missing_required_paths(
     missing
 }
 
+#[cfg(test)]
 fn client_path_missing(
     client: &ClientSpec,
     relative_path: &str,
@@ -9304,6 +9185,15 @@ fn write_parented_with_barrier_progress(
     )
 }
 
+fn append_payload(path: PathBuf, payload: &[u8]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    file.write_all(payload)?;
+    file.sync_all()
+}
+
 fn append_payload_with_progress(
     path: &Path,
     payload: &[u8],
@@ -9407,6 +9297,7 @@ fn record_hotspot_helper_progress(
     file.flush()
 }
 
+#[cfg(not(test))]
 fn read_hotspot_helper_progress_tail(progress: &Path) -> Option<String> {
     let contents = fs::read_to_string(progress).ok()?;
     contents
@@ -10555,7 +10446,7 @@ mod tests {
             client_controller_config: None,
         };
         let isolation = test_isolation("chaos-test");
-        seed_mounted_chaos_initial_tree(&context, &clients[0], &isolation).unwrap();
+        seed_mounted_chaos_initial_tree(&clients[0], &isolation).unwrap();
 
         let err = wait_for_mounted_chaos_initial_tree(
             &context,
@@ -10577,29 +10468,18 @@ mod tests {
     fn mounted_chaos_initial_seed_rejects_stale_zero_byte_file() {
         let temp = tempdir().unwrap();
         let sandbox = temp.path().join("run-1");
-        let scenario_dir = sandbox
-            .join("artifacts")
-            .join("scenarios")
-            .join(MOUNTED_CHAOS_CONVERGENCE);
         let writer = client_spec_for(
             &sandbox,
             "projectfs",
             "client-a",
             temp.path().join("mounts").join("client-a"),
         );
-        let context = ScenarioContext {
-            run_id: "run-1".to_string(),
-            seed: 410,
-            sandbox,
-            scenario_dir,
-            client_controller_config: None,
-        };
         let isolation = test_isolation("chaos-test");
         let stale_path = writer.mount_point.join(isolation.path("rename-source.txt"));
         std::fs::create_dir_all(stale_path.parent().unwrap()).unwrap();
         std::fs::write(&stale_path, []).unwrap();
 
-        let err = seed_mounted_chaos_initial_tree(&context, &writer, &isolation).unwrap_err();
+        let err = seed_mounted_chaos_initial_tree(&writer, &isolation).unwrap_err();
 
         assert!(
             matches!(&err, ScenarioError::Io(error) if error.kind() == io::ErrorKind::AlreadyExists),
@@ -10885,7 +10765,7 @@ mod tests {
             client_controller_config: None,
         };
         let isolation = test_isolation("chaos-test");
-        seed_mounted_chaos_initial_tree(&context, &clients[0], &isolation).unwrap();
+        seed_mounted_chaos_initial_tree(&clients[0], &isolation).unwrap();
         for peer in clients.iter().skip(1) {
             replace_dir_contents(&clients[0].mount_point, &peer.mount_point).unwrap();
         }
@@ -11564,6 +11444,67 @@ mod tests {
 
         assert_eq!(record.result, "rejected");
         assert!(record.error.unwrap().contains("hotspot helper failed"));
+    }
+
+    #[test]
+    fn required_hotspot_churn_operation_is_logged_before_failing() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-required-helper-reject");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(MOUNTED_HOTSPOT_CHURN_CONVERGENCE);
+        std::fs::create_dir_all(&scenario_dir).unwrap();
+        let context = ScenarioContext {
+            run_id: "run-required-helper-reject".to_string(),
+            seed: 415,
+            sandbox,
+            scenario_dir: scenario_dir.clone(),
+            client_controller_config: None,
+        };
+        let operation = NamespaceCollisionOperation {
+            order: 1,
+            client: "client-a".to_string(),
+            operation: "rename".to_string(),
+            path: "hotspot/slot-0.txt".to_string(),
+            result: "rejected".to_string(),
+            timestamp_ms: 0,
+            error: Some("source disappeared".to_string()),
+        };
+        let mut operations = Vec::new();
+
+        let err = record_required_sparse_operation(&context, &mut operations, operation)
+            .expect_err("rejected hotspot churn operations must fail the scenario");
+
+        assert!(err.to_string().contains("source disappeared"));
+        assert_eq!(operations.len(), 1);
+        let log = std::fs::read_to_string(scenario_dir.join("operations.ndjson")).unwrap();
+        assert!(log.contains("\"result\":\"rejected\""));
+        assert!(log.contains("source disappeared"));
+    }
+
+    #[test]
+    fn hotspot_helper_stat_records_exact_metadata_probe() {
+        let temp = tempdir().unwrap();
+        let mount = temp.path().join("mount");
+        let progress = temp.path().join("progress.jsonl");
+        std::fs::create_dir_all(mount.join("hotspot")).unwrap();
+        std::fs::write(mount.join("hotspot").join("slot-1.txt"), b"payload").unwrap();
+
+        run_hotspot_op_helper(
+            "stat",
+            mount,
+            "hotspot/slot-1.txt",
+            None,
+            None,
+            Some(&progress),
+        )
+        .unwrap();
+
+        let progress_log = std::fs::read_to_string(progress).unwrap();
+        assert!(progress_log.contains("\"phase\":\"before_metadata\""));
+        assert!(progress_log.contains("\"phase\":\"after_metadata\""));
+        assert!(progress_log.contains("\"phase\":\"completed\""));
     }
 
     #[test]
