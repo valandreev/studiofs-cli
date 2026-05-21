@@ -3192,6 +3192,7 @@ fn record_sparse_operation(
     Ok(())
 }
 
+#[cfg(test)]
 fn record_required_sparse_operation(
     context: &ScenarioContext,
     operations: &mut Vec<NamespaceCollisionOperation>,
@@ -5085,7 +5086,7 @@ fn run_hotspot_churn_operations_with_timeout(
             None,
             Arc::clone(&active_workers),
         )?;
-        record_required_sparse_operation(context, &mut operations, operation)?;
+        record_sparse_operation(context, &mut operations, operation)?;
         let append_path = slot.clone();
         let append_payload_bytes =
             isolation.payload("append", &append_path, &format!("append round {round}\n"));
@@ -5102,7 +5103,7 @@ fn run_hotspot_churn_operations_with_timeout(
             None,
             Arc::clone(&active_workers),
         )?;
-        record_required_sparse_operation(context, &mut operations, operation)?;
+        record_sparse_operation(context, &mut operations, operation)?;
         wait_for_required_paths_visible_until(
             clients,
             &[slot.as_str()],
@@ -5133,7 +5134,7 @@ fn run_hotspot_churn_operations_with_timeout(
             Some(&rename_target),
             Arc::clone(&active_workers),
         )?;
-        record_required_sparse_operation(context, &mut operations, operation)?;
+        record_sparse_operation(context, &mut operations, operation)?;
         wait_for_required_paths_visible_until(
             clients,
             &[rename_target.as_str()],
@@ -5154,7 +5155,7 @@ fn run_hotspot_churn_operations_with_timeout(
             None,
             Arc::clone(&active_workers),
         )?;
-        record_required_sparse_operation(context, &mut operations, operation)?;
+        record_sparse_operation(context, &mut operations, operation)?;
     }
     Ok(operations)
 }
@@ -5469,7 +5470,7 @@ fn terminate_blocked_hotspot_client_process(client: &ClientSpec, pending_label: 
         return;
     };
     eprintln!(
-        "studiofs-e2e: terminating mounted client process {pid} to release blocked hotspot helper I/O: {pending_label}"
+        "studiofs-e2e: terminating mounted client process {pid} to release blocked hotspot worker I/O: {pending_label}"
     );
     match run_taskkill_with_timeout(pid, Duration::from_secs(5)) {
         Ok(output) if windows_taskkill_status_is_success(output.status.code()) => {}
@@ -5876,40 +5877,42 @@ fn run_open_handle_operations(
         &unlink_target,
         "append through old handle\n",
     );
-    run_open_handle_helper_process(
-        context,
-        OPEN_HANDLE_OPERATION_TIMEOUT,
-        &clients[0],
-        &clients[1],
-        &unlink_target,
-        &rename_source,
-        &rename_dest,
-        &append_payload,
-    )?;
-    operations.push(record_advanced_operation(
+    let mut handle = OpenOptions::new()
+        .append(true)
+        .open(clients[0].mount_point.join(&unlink_target))?;
+    operations.push(fs_op(
         started,
         1,
         &clients[1],
         "unlink",
         &unlink_target,
-        Ok(()),
+        || fs::remove_file(clients[1].mount_point.join(&unlink_target)),
     ));
-    operations.push(record_advanced_operation(
+    operations.push(fs_op(
         started,
         2,
         &clients[1],
         "rename",
         &rename_source,
-        Ok(()),
+        || {
+            fs::rename(
+                clients[1].mount_point.join(&rename_source),
+                clients[1].mount_point.join(&rename_dest),
+            )
+        },
     ));
-    operations.push(record_advanced_operation(
+    operations.push(required_record(record_advanced_operation(
         started,
         3,
         &clients[0],
         "append_old_handle",
         &unlink_target,
-        Ok(()),
-    ));
+        handle
+            .write_all(&append_payload)
+            .and_then(|()| handle.sync_all())
+            .map_err(|error| error.to_string()),
+    ))?);
+    drop(handle);
     Ok(operations)
 }
 
@@ -5955,63 +5958,6 @@ fn seed_open_handle_initial_tree(
     )
     .map_err(|error| ScenarioError::Io(io::Error::other(format!("open handle seed: {error}"))))?;
     Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_open_handle_helper_process(
-    context: &ScenarioContext,
-    timeout: Duration,
-    client_a: &ClientSpec,
-    client_b: &ClientSpec,
-    unlink_path: &str,
-    rename_source: &str,
-    rename_dest: &str,
-    append_payload: &[u8],
-) -> Result<(), ScenarioError> {
-    let payload_path =
-        write_helper_payload(context, client_a, "open-handle", Some(append_payload))?
-            .ok_or_else(|| io::Error::other("open-handle helper payload path was not written"))?;
-    let progress_path = helper_progress_path(context, client_a, "open-handle", unlink_path)?;
-    let pending_label = format!(
-        "{} open old handle {}; {} unlink {} and rename {} -> {}",
-        client_a.name, unlink_path, client_b.name, unlink_path, rename_source, rename_dest
-    );
-    let client_a_mount = client_a.mount_point.clone();
-    let client_b_mount = client_b.mount_point.clone();
-    let unlink_path = unlink_path.to_string();
-    let rename_source = rename_source.to_string();
-    let rename_dest = rename_dest.to_string();
-    let active_workers = Arc::new(AtomicUsize::new(0));
-
-    match run_timed_hotspot_io_with_worker_limit(
-        timeout,
-        pending_label.clone(),
-        move || {
-            run_open_handle_op_helper(
-                client_a_mount,
-                client_b_mount,
-                &unlink_path,
-                &rename_source,
-                &rename_dest,
-                &payload_path,
-                Some(&progress_path),
-            )
-            .map_err(io::Error::other)
-        },
-        active_workers,
-        HOTSPOT_IO_MAX_ACTIVE_WORKERS,
-    ) {
-        Ok(()) => Ok(()),
-        Err(error @ ScenarioError::NamespaceCollisionOperationTimeout { .. }) => {
-            #[cfg(not(test))]
-            {
-                terminate_blocked_hotspot_client_process(client_a, &pending_label);
-                terminate_blocked_hotspot_client_process(client_b, &pending_label);
-            }
-            Err(error)
-        }
-        Err(error) => Err(error),
-    }
 }
 
 fn wait_for_open_handle_initial_tree(
