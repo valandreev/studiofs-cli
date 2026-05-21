@@ -91,6 +91,10 @@ impl PgMetaEngine {
         shutdown: Arc<AtomicBool>,
         cancel: CancellationToken,
     ) -> MetaResult<std::thread::JoinHandle<()>> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| MetaError::Storage(format!("failed to build tokio runtime: {e}")))?;
         std::thread::Builder::new()
             .name("pg-lock-notify".into())
             .spawn(move || {
@@ -110,7 +114,7 @@ impl PgMetaEngine {
                     let weak_engine = engine.clone();
                     let shutdown_for_task = shutdown.clone();
                     let cancel_for_task = cancel.clone();
-                    let connect_result = (|| -> MetaResult<()> {
+                    let connect_result = {
                         let fut = async move {
                             let connect_result = tokio::select! {
                                 biased;
@@ -198,20 +202,20 @@ impl PgMetaEngine {
                             Ok(())
                         };
 
-                        let rt = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()
-                            .map_err(|e| {
-                                MetaError::Storage(format!("failed to build tokio runtime: {e}"))
-                            })?;
                         rt.block_on(fut)
-                    })();
+                    };
 
                     if shutdown.load(Ordering::Acquire) || cancel.is_cancelled() {
                         break;
                     }
                     if connect_result.is_err() {
-                        std::thread::sleep(Duration::from_millis(250));
+                        rt.block_on(async {
+                            tokio::select! {
+                                biased;
+                                _ = cancel.cancelled() => {}
+                                _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+                            }
+                        });
                     }
                 }
             })

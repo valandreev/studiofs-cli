@@ -901,7 +901,7 @@ impl StudioVfs {
                 .await?;
                 let committed_attr = committed_attr.as_ref().unwrap_or(&attr);
                 self.clear_matching_dirty_attr_if_committed(ino, committed_attr);
-                self.state.namespace.attr_read_cache.lock().remove(ino);
+                self.invalidate_attr_read_cache([ino]);
                 self.refresh_inode_incarnation_state_from_attr(ino, committed_attr);
                 true
             }

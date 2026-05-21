@@ -48,6 +48,8 @@ Get-CimInstance Win32_Process -Filter $processFilter |
                 $taskkillStartInfo.RedirectStandardError = $true
                 $taskkillStartInfo.Arguments = "/PID $($_.ProcessId) /T /F"
                 $taskkill = [System.Diagnostics.Process]::Start($taskkillStartInfo)
+                $stdoutTask = $taskkill.StandardOutput.ReadToEndAsync()
+                $stderrTask = $taskkill.StandardError.ReadToEndAsync()
                 if (-not $taskkill.WaitForExit(5000)) {
                     try {
                         $taskkill.Kill()
@@ -56,9 +58,9 @@ Get-CimInstance Win32_Process -Filter $processFilter |
                     throw "taskkill timed out after 5000 ms"
                 }
                 $exitCode = $taskkill.ExitCode
+                $stdout = $stdoutTask.GetAwaiter().GetResult().Trim()
+                $stderr = $stderrTask.GetAwaiter().GetResult().Trim()
                 if ($exitCode -ne 0 -and $exitCode -ne 128) {
-                    $stdout = $taskkill.StandardOutput.ReadToEnd().Trim()
-                    $stderr = $taskkill.StandardError.ReadToEnd().Trim()
                     throw "taskkill exited with code $exitCode; stdout=$stdout; stderr=$stderr"
                 }
                 "stopped $($_.ProcessId) $($_.Name) $($_.CommandLine)"

@@ -195,7 +195,13 @@ impl PgMetaEngine {
                         break;
                     }
                     if connect_result.is_err() {
-                        std::thread::sleep(reconnect_delay);
+                        rt.block_on(async {
+                            tokio::select! {
+                                biased;
+                                _ = cancel.cancelled() => {}
+                                _ = tokio::time::sleep(reconnect_delay) => {}
+                            }
+                        });
                         reconnect_delay = reconnect_delay.saturating_mul(2).min(
                             Duration::from_millis(Self::METADATA_NOTIFY_RECONNECT_MAX_DELAY_MS),
                         );

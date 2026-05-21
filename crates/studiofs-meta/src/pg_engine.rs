@@ -224,6 +224,13 @@ struct HeldFileLockLease {
 
 impl PgMetaEngine {
     const FILE_LOCK_LEASES_SCHEMA_SQL: &str = r#"
+        CREATE TABLE IF NOT EXISTS counters (
+            vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            value BIGINT NOT NULL,
+            PRIMARY KEY (vol, name)
+        );
+
         CREATE TABLE IF NOT EXISTS file_lock_leases (
             vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
             ino BIGINT NOT NULL,

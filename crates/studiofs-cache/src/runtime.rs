@@ -527,6 +527,7 @@ impl LocalPayloadBackendRuntime {
         mut current_after_evict: u64,
     ) -> Result<u64, LocalPayloadBackendError> {
         let mut progress_waits = 0;
+        let mut no_progress_waits = 0;
         loop {
             if !self
                 .budget_governor
@@ -565,6 +566,10 @@ impl LocalPayloadBackendRuntime {
                 {
                     break;
                 }
+                no_progress_waits += 1;
+                if no_progress_waits < LOW_SPACE_UPLOAD_DRAIN_PROGRESS_RETRIES {
+                    continue;
+                }
                 let exhausted_total = self
                     .low_space_exhausted_waits
                     .fetch_add(1, Ordering::Relaxed)
@@ -580,6 +585,7 @@ impl LocalPayloadBackendRuntime {
                 break;
             }
 
+            no_progress_waits = 0;
             progress_waits += 1;
             let progress_total = self
                 .low_space_progress_waits
@@ -2027,7 +2033,7 @@ mod tests {
 
         let background = std::sync::Arc::clone(&backend);
         let join = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(LOW_SPACE_UPLOAD_DRAIN_WAIT / 2);
             background.mark_uploaded(10);
         });
 

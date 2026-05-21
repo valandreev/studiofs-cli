@@ -135,23 +135,6 @@ impl PgMetaEngine {
                             Self::format_pg_error(e)
                         ))
                     })?;
-                    tx.batch_execute(
-                        r#"
-                        CREATE TABLE IF NOT EXISTS counters (
-                            vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
-                            name TEXT NOT NULL,
-                            value BIGINT NOT NULL,
-                            PRIMARY KEY (vol, name)
-                        )
-                        "#,
-                    )
-                    .await
-                    .map_err(|e| {
-                        MetaError::Storage(format!(
-                            "postgres counters ensure failed: {}",
-                            Self::format_pg_error(e)
-                        ))
-                    })?;
                     tx.execute(
                         r#"
                         INSERT INTO counters (vol, name, value)
@@ -379,24 +362,6 @@ impl PgMetaEngine {
                             Self::format_pg_error(e)
                         ))
                     })?;
-                    tx.batch_execute(
-                        r#"
-                        CREATE TABLE IF NOT EXISTS counters (
-                            vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
-                            name TEXT NOT NULL,
-                            value BIGINT NOT NULL,
-                            PRIMARY KEY (vol, name)
-                        )
-                        "#,
-                    )
-                    .await
-                    .map_err(|e| {
-                        MetaError::Storage(format!(
-                            "postgres counters ensure failed: {}",
-                            Self::format_pg_error(e)
-                        ))
-                    })?;
-
                     let initial_next_hint = i64::try_from(initial_next_hint).map_err(|_| {
                         MetaError::Storage(format!(
                             "invalid inode window seed hint: {initial_next_hint} exceeds PostgreSQL BIGINT max {}",
