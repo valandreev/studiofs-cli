@@ -155,6 +155,10 @@ pub struct HotspotOpArgs {
     /// Per-operation progress JSONL path used to diagnose bounded helper timeouts.
     #[arg(long, hide = true)]
     pub progress: Option<PathBuf>,
+
+    /// Internal operation timeout so the helper can cancel mounted I/O before parent kill.
+    #[arg(long, hide = true)]
+    pub timeout_ms: Option<u64>,
 }
 
 #[derive(Args, Debug)]
@@ -383,13 +387,14 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             Ok(outcome.exit_code)
         }
         Commands::HotspotOp(args) => {
-            scenario::run_hotspot_op_helper(
+            scenario::run_hotspot_op_helper_with_timeout(
                 &args.operation,
                 args.mount_point,
                 &args.path,
                 args.target.as_deref(),
                 args.payload.as_deref(),
                 args.progress.as_deref(),
+                args.timeout_ms.map(std::time::Duration::from_millis),
             )?;
             // This helper exists only to isolate one potentially blocking mounted
             // filesystem call.  Once the call has returned successfully, exit
@@ -494,6 +499,8 @@ mod tests {
             "hotspot/slot-1.txt",
             "--target",
             "hotspot/slot-1-renamed.txt",
+            "--timeout-ms",
+            "13000",
         ])
         .expect("hidden hotspot-op command should parse");
 
@@ -505,6 +512,7 @@ mod tests {
         assert_eq!(args.mount_point, PathBuf::from("Z:\\"));
         assert_eq!(args.path, "hotspot/slot-1.txt");
         assert_eq!(args.target.as_deref(), Some("hotspot/slot-1-renamed.txt"));
+        assert_eq!(args.timeout_ms, Some(13_000));
         assert_eq!(args.progress, None);
     }
 

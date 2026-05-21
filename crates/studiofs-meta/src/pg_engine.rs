@@ -556,5 +556,4 @@ impl PgMetaEngine {
 }
 
 #[cfg(test)]
-#[path = "pg_engine/tests.rs"]
 mod tests;
