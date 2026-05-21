@@ -34,8 +34,9 @@ use crate::mounted_tree::{
     ClientMount, ConvergenceOutcome, MountedTreeError, NamespaceInvariantViolation, TreeComparison,
     validate_namespace_invariants, wait_for_convergence,
 };
+use crate::process_job::CHILD_TERMINATION_GRACE;
 #[cfg(not(test))]
-use crate::process_job::{CHILD_TERMINATION_GRACE, ChildJob, wait_for_child_exit};
+use crate::process_job::{ChildJob, wait_for_child_exit};
 use crate::report::RunManifest;
 
 /// Basic multi-client smoke scenario identifier.
@@ -138,6 +139,8 @@ const MOUNTED_WRITE_READBACK_POLL_INTERVAL: Duration = Duration::from_millis(25)
 const MOUNTED_VALIDATION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const MOUNTED_VALIDATION_MAX_ACTIVE_PROBES: usize = 1;
 const HOTSPOT_CHURN_OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
+const HOTSPOT_HELPER_CANCEL_GRACE: Duration = Duration::from_millis(750);
+const HOTSPOT_HELPER_INTERNAL_TIMEOUT_MARKER: &str = "hotspot helper internal timeout";
 const OPEN_HANDLE_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const OPEN_HANDLE_SYNC_RETRY_TIMEOUT: Duration = Duration::from_secs(2);
 const OPEN_HANDLE_SYNC_RETRY_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -5357,6 +5360,9 @@ fn run_hotspot_helper_process(
         if let Some(payload_path) = &payload_path {
             command.arg("--payload").arg(payload_path);
         }
+        command
+            .arg("--timeout-ms")
+            .arg(duration_millis_u64(hotspot_helper_internal_timeout(timeout)).to_string());
 
         ChildJob::prepare_command(&mut command)?;
         let mut child = command.spawn()?;
@@ -5384,6 +5390,16 @@ fn run_hotspot_helper_process(
                     })
                     .unwrap_or_default();
                 let progress = read_hotspot_helper_progress_tail(&progress_path);
+                let progress_suffix = progress
+                    .as_ref()
+                    .map(|progress| format!("; progress={progress}"))
+                    .unwrap_or_default();
+                if stderr.contains(HOTSPOT_HELPER_INTERNAL_TIMEOUT_MARKER) {
+                    return Err(namespace_collision_operation_timeout(
+                        timeout,
+                        vec![(1, format!("{pending_label}{progress_suffix}"))],
+                    ));
+                }
                 return Err(ScenarioError::Io(io::Error::other(format!(
                     "hotspot helper failed for {pending_label}: status={status}; stderr={}; progress={}",
                     stderr.trim(),
@@ -5419,6 +5435,13 @@ fn run_hotspot_helper_process(
             thread::sleep(Duration::from_millis(50));
         }
     }
+}
+
+fn hotspot_helper_internal_timeout(parent_timeout: Duration) -> Duration {
+    let reserve = CHILD_TERMINATION_GRACE + HOTSPOT_HELPER_CANCEL_GRACE;
+    parent_timeout
+        .checked_sub(reserve)
+        .unwrap_or(parent_timeout)
 }
 
 #[cfg(all(windows, not(test)))]
@@ -9023,6 +9046,142 @@ fn write_parented(path: PathBuf, payload: &[u8]) -> io::Result<()> {
 }
 
 /// Executes one mounted hotspot filesystem operation in a helper process.
+pub fn run_hotspot_op_helper_with_timeout(
+    operation: &str,
+    mount_point: PathBuf,
+    path: &str,
+    target: Option<&str>,
+    payload: Option<&Path>,
+    progress: Option<&Path>,
+    timeout: Option<Duration>,
+) -> Result<(), anyhow::Error> {
+    #[cfg(windows)]
+    if let Some(timeout) = timeout {
+        return run_hotspot_op_helper_with_windows_timeout(
+            operation,
+            mount_point,
+            path,
+            target,
+            payload,
+            progress,
+            timeout,
+        );
+    }
+
+    let _ = timeout;
+    run_hotspot_op_helper(operation, mount_point, path, target, payload, progress)
+}
+
+#[cfg(windows)]
+fn run_hotspot_op_helper_with_windows_timeout(
+    operation: &str,
+    mount_point: PathBuf,
+    path: &str,
+    target: Option<&str>,
+    payload: Option<&Path>,
+    progress: Option<&Path>,
+    timeout: Duration,
+) -> Result<(), anyhow::Error> {
+    let operation_for_worker = operation.to_string();
+    let operation_for_timeout = operation.to_string();
+    let path_for_worker = path.to_string();
+    let path_for_timeout = path.to_string();
+    let target_for_worker = target.map(str::to_string);
+    let target_for_timeout = target.map(str::to_string);
+    let payload_for_worker = payload.map(Path::to_path_buf);
+    let progress_for_worker = progress.map(Path::to_path_buf);
+    let progress_for_timeout = progress.map(Path::to_path_buf);
+    let mount_for_worker = mount_point.clone();
+    let mount_for_timeout = mount_point;
+    let (tx, rx) = mpsc::channel();
+
+    let worker = thread::Builder::new()
+        .name("studiofs-e2e-hotspot-helper-io".to_string())
+        .spawn(move || {
+            let result = run_hotspot_op_helper(
+                &operation_for_worker,
+                mount_for_worker,
+                &path_for_worker,
+                target_for_worker.as_deref(),
+                payload_for_worker.as_deref(),
+                progress_for_worker.as_deref(),
+            );
+            let _ = tx.send(result);
+        })?;
+
+    match rx.recv_timeout(timeout) {
+        Ok(result) => {
+            join_hotspot_helper_worker(worker)?;
+            result
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            let mounted_path = mount_for_timeout.join(&path_for_timeout);
+            let _ = record_hotspot_helper_progress(
+                progress_for_timeout.as_deref(),
+                "timeout_cancel_requested",
+                &operation_for_timeout,
+                &mounted_path,
+                target_for_timeout.as_deref(),
+                None,
+            );
+            let cancel_result = cancel_hotspot_helper_worker_io(&worker);
+            let cancel_detail = match cancel_result {
+                Ok(()) => "CancelSynchronousIo requested".to_string(),
+                Err(error) => format!("CancelSynchronousIo failed: {error}"),
+            };
+            match rx.recv_timeout(HOTSPOT_HELPER_CANCEL_GRACE) {
+                Ok(result) => {
+                    join_hotspot_helper_worker(worker)?;
+                    Err(anyhow::anyhow!(
+                        "{HOTSPOT_HELPER_INTERNAL_TIMEOUT_MARKER}: operation timed out after {} ms; {cancel_detail}; result after cancellation: {}",
+                        timeout.as_millis(),
+                        match result {
+                            Ok(()) => "completed".to_string(),
+                            Err(error) => error.to_string(),
+                        }
+                    ))
+                }
+                Err(_) => Err(anyhow::anyhow!(
+                    "{HOTSPOT_HELPER_INTERNAL_TIMEOUT_MARKER}: operation timed out after {} ms; {cancel_detail}; worker did not finish within {} ms",
+                    timeout.as_millis(),
+                    HOTSPOT_HELPER_CANCEL_GRACE.as_millis()
+                )),
+            }
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            join_hotspot_helper_worker(worker)?;
+            Err(anyhow::anyhow!(
+                "hotspot helper worker exited without result"
+            ))
+        }
+    }
+}
+
+#[cfg(windows)]
+fn join_hotspot_helper_worker(worker: thread::JoinHandle<()>) -> Result<(), anyhow::Error> {
+    worker
+        .join()
+        .map_err(|_| anyhow::anyhow!("hotspot helper worker panicked"))
+}
+
+#[cfg(windows)]
+fn cancel_hotspot_helper_worker_io(worker: &thread::JoinHandle<()>) -> io::Result<()> {
+    use std::ffi::c_void;
+    use std::os::windows::io::AsRawHandle as _;
+
+    unsafe extern "system" {
+        fn CancelSynchronousIo(hThread: *mut c_void) -> i32;
+    }
+
+    let ok = unsafe { CancelSynchronousIo(worker.as_raw_handle().cast()) };
+    if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Executes one mounted hotspot filesystem operation without an internal timeout guard.
 pub fn run_hotspot_op_helper(
     operation: &str,
     mount_point: PathBuf,
@@ -11918,6 +12077,19 @@ mod tests {
                 "completed hotspot operation {index} returned before releasing its worker permit"
             );
         }
+    }
+
+    #[test]
+    fn hotspot_helper_internal_timeout_leaves_parent_kill_reserve() {
+        assert_eq!(
+            hotspot_helper_internal_timeout(Duration::from_secs(15)),
+            Duration::from_millis(12_250)
+        );
+        assert_eq!(
+            hotspot_helper_internal_timeout(Duration::from_secs(1)),
+            Duration::from_secs(1),
+            "short operation timeouts should not underflow"
+        );
     }
 
     #[test]
