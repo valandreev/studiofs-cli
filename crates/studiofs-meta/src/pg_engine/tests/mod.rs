@@ -42,19 +42,24 @@ fn pg_dsn() -> Option<String> {
     let raw = std::env::var("STUDIOFS_TEST_PG_DSN")
         .ok()
         .filter(|v| !v.trim().is_empty())?;
-    run_async(async { ensure_studiofs_database(&raw).await })
-        .ok()
-        .map(|v| v.metadata_dsn)
+    Some(
+        run_async(async { ensure_studiofs_database(&raw).await })
+            .expect("failed to ensure studiofs database")
+            .metadata_dsn,
+    )
 }
 
 fn run_async<T, F>(fut: F) -> MetaResult<T>
 where
     F: std::future::Future<Output = MetaResult<T>>,
 {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| MetaError::Storage(format!("failed to build tokio runtime: {e}")))?;
+    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    let rt = RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build tokio runtime")
+    });
     rt.block_on(fut)
 }
 
@@ -422,6 +427,7 @@ pub(super) fn pop_inode_window_reservation_override() -> Option<Result<InodeWind
 struct TestEnvGuard {
     key: &'static str,
     previous: Option<String>,
+    _lock: std::sync::MutexGuard<'static, ()>,
 }
 
 impl Drop for TestEnvGuard {
@@ -438,12 +444,22 @@ impl Drop for TestEnvGuard {
     }
 }
 
+static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
+
 fn set_test_env(key: &'static str, value: &str) -> TestEnvGuard {
+    // Rust environment mutation is process-global and unsafe around concurrent
+    // readers/writers; serializing these few tests trades parallel throughput
+    // for defined behavior.
+    let lock = TEST_ENV_LOCK.lock().expect("test env lock poisoned");
     let previous = std::env::var(key).ok();
     unsafe {
         std::env::set_var(key, value);
     }
-    TestEnvGuard { key, previous }
+    TestEnvGuard {
+        key,
+        previous,
+        _lock: lock,
+    }
 }
 
 fn set_file_state(engine: &PgMetaEngine, ino: Ino, size: u64, content_epoch: u64) {
@@ -620,6 +636,8 @@ fn reconcile_recent_flush_regular_files(
     RemoteApplyCoordinator::new(pg).reconcile_recent_flush(recent_flush)
 }
 
+const SETUP_PG_VOLUME_ADVISORY_LOCK_ID: i64 = 902_202_603;
+
 fn setup_pg_volume(dsn: &str, name: &str, uuid: &str, block_size: u32) -> MetaResult<i64> {
     run_async(async move {
         let (mut client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
@@ -634,11 +652,12 @@ fn setup_pg_volume(dsn: &str, name: &str, uuid: &str, block_size: u32) -> MetaRe
             .await
             .map_err(|e| MetaError::Storage(format!("postgres begin tx failed: {}", pg_err(e))))?;
 
-        tx.execute("SELECT pg_advisory_xact_lock($1)", &[&902_202_603_i64])
-            .await
-            .map_err(|e| {
-                MetaError::Storage(format!("postgres advisory lock failed: {}", pg_err(e)))
-            })?;
+        tx.execute(
+            "SELECT pg_advisory_xact_lock($1)",
+            &[&SETUP_PG_VOLUME_ADVISORY_LOCK_ID],
+        )
+        .await
+        .map_err(|e| MetaError::Storage(format!("postgres advisory lock failed: {}", pg_err(e))))?;
 
         tx.batch_execute(
             r#"
@@ -695,13 +714,6 @@ fn setup_pg_volume(dsn: &str, name: &str, uuid: &str, block_size: u32) -> MetaRe
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                     PRIMARY KEY (vol, ino)
                 );
-                ALTER TABLE event_log
-                    ADD COLUMN IF NOT EXISTS batch_version BIGINT;
-                UPDATE event_log
-                    SET batch_version = 0
-                    WHERE batch_version IS NULL;
-                ALTER TABLE event_log
-                    ALTER COLUMN batch_version SET NOT NULL;
                 "#,
         )
         .await
