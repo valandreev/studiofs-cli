@@ -3031,7 +3031,13 @@ impl StudioVfs {
             .filter_map(|block_index| {
                 let pending = pending.get(&(ino, *block_index))?;
                 if pending.is_local_extent() {
-                    let data = self.local_payload_backend.get(pending.local_extent_id()?)?;
+                    let object_id = pending
+                        .local_extent_id()
+                        .expect("local extent pending payload must have an object id");
+                    let data = self
+                        .local_payload_backend
+                        .get(object_id)
+                        .expect("local payload missing for dirty local extent snapshot");
                     Some(DirtyWriteSnapshot::from_shared(*block_index, data))
                 } else if pending.dirty {
                     Some(DirtyWriteSnapshot::from_mutable(
@@ -3222,12 +3228,13 @@ impl StudioVfs {
                 continue;
             };
             if block.is_local_extent() {
-                let Some(object_id) = block.local_extent_id() else {
-                    continue;
-                };
-                let Some(data) = self.local_payload_backend.get(object_id) else {
-                    continue;
-                };
+                let object_id = block
+                    .local_extent_id()
+                    .expect("local extent pending payload must have an object id");
+                let data = self
+                    .local_payload_backend
+                    .get(object_id)
+                    .expect("local payload missing during dirty read span resolution");
                 let block_start =
                     u64::from(*block_index).saturating_mul(u64::from(self.block_size));
                 let block_end = block_start.saturating_add(block.logical_len() as u64);

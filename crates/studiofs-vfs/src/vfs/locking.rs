@@ -156,7 +156,11 @@ impl StudioVfs {
                 };
 
                 if had_local_lock {
-                    if release_remote_lock && let Some(cfg) = &self.distributed_flock {
+                    if release_remote_lock {
+                        let Some(cfg) = &self.distributed_flock else {
+                            self.state.file_lock.lock_notify.notify_waiters();
+                            return Ok(());
+                        };
                         let mut first_error = None;
                         if let Err(error) = self.flush(ino).await {
                             first_error = Some(error);
@@ -174,9 +178,10 @@ impl StudioVfs {
                         if let Err(error) = self
                             .acquire_distributed_flock(cfg, ino, LockKind::Unlock)
                             .await
-                            && first_error.is_none()
                         {
-                            first_error = Some(error);
+                            if first_error.is_none() {
+                                first_error = Some(error);
+                            }
                         }
                         if let Some(error) = first_error {
                             self.state.file_lock.lock_notify.notify_waiters();
@@ -192,9 +197,10 @@ impl StudioVfs {
             let notified = self.state.file_lock.lock_notify.notified();
             let local_allowed = {
                 let mut pending = self.state.file_lock.pending_acquires.lock();
-                if let Some(existing) = pending.get(&ino)
-                    && pending_flock_conflicts(existing, op)
-                {
+                if match pending.get(&ino) {
+                    Some(existing) => pending_flock_conflicts(existing, op),
+                    None => false,
+                } {
                     false
                 } else {
                     let locks = self.state.file_lock.file_locks.lock();
@@ -254,7 +260,6 @@ impl StudioVfs {
                 })?;
             }
 
-            let notified = self.state.file_lock.lock_notify.notified();
             let committed = {
                 let mut pending = self.state.file_lock.pending_acquires.lock();
                 let mut locks = self.state.file_lock.file_locks.lock();
