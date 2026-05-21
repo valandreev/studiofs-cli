@@ -826,7 +826,7 @@ fn command_failure_truncates_large_stdout_and_stderr() {
 }
 
 #[test]
-fn unmount_all_continues_after_stuck_client_and_keeps_failed_handle_tracked() {
+fn unmount_all_continues_after_stuck_client_and_clears_failed_handle_state() {
     let temp = tempdir().unwrap();
     let executor = RecordingExecutor {
         exit_requires_kill: true,
@@ -848,7 +848,7 @@ fn unmount_all_continues_after_stuck_client_and_keeps_failed_handle_tracked() {
     assert!(err.to_string().contains("graceful unmount"));
     assert_eq!(killed.get(), 2);
     assert_eq!(clients[0].state, ClientLifecycleState::Killed);
-    assert_eq!(clients[0].process_id, Some(100));
+    assert_eq!(clients[0].process_id, None);
     assert_eq!(clients[1].state, ClientLifecycleState::Killed);
     assert_eq!(clients[1].process_id, None);
 }

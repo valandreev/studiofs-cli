@@ -1056,10 +1056,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
                     self.config.mount_exit_timeout,
                     self.config.poll_interval,
                 ) {
-                    Ok(()) => {
-                        self.clients[index].process = None;
-                        self.clients[index].spec.process_id = None;
-                    }
+                    Ok(()) => {}
                     Err(error) => {
                         debug_log_kill_error(
                             &self.clients[index].spec.name,
@@ -1068,6 +1065,8 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
                         );
                     }
                 }
+                self.clients[index].process = None;
+                self.clients[index].spec.process_id = None;
                 self.clients[index].spec.state = ClientLifecycleState::Killed;
                 return Err(primary);
             }

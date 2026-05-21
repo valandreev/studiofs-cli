@@ -2096,7 +2096,7 @@ fn owner_liveness_command(pid: u32) -> CommandSpec {
                 "-ExecutionPolicy".to_string(),
                 "Bypass".to_string(),
                 "-Command".to_string(),
-                "$ownerPid=$env:STUDIOFS_E2E_OWNER_PID; $process=Get-CimInstance Win32_Process -Filter \"ProcessId = $ownerPid\" -ErrorAction SilentlyContinue; if ($null -eq $process) { exit 1 } else { exit 0 }".to_string(),
+                "$ownerPid=$env:STUDIOFS_E2E_OWNER_PID; $process=Get-CimInstance Win32_Process -Filter \"ProcessId = $ownerPid\" -ErrorAction SilentlyContinue; if ($null -eq $process) { exit 1 }; $name=[string]$process.Name; $commandLine=[string]$process.CommandLine; if ($name -ieq 'studiofs-e2e.exe' -or $commandLine -match '(^|[\\\\/])studiofs-e2e(\\.exe)?(\\s|$)' -or $commandLine -match 'cargo(\\.exe)?\\s+.*studiofs-e2e') { exit 0 } else { exit 1 }".to_string(),
             ],
             env: vec![("STUDIOFS_E2E_OWNER_PID".to_string(), pid.to_string())],
             cwd: None,
@@ -2107,7 +2107,7 @@ fn owner_liveness_command(pid: u32) -> CommandSpec {
             program: "sh".to_string(),
             args: vec![
                 "-c".to_string(),
-                "kill -0 \"$STUDIOFS_E2E_OWNER_PID\" >/dev/null 2>&1".to_string(),
+                "kill -0 \"$STUDIOFS_E2E_OWNER_PID\" >/dev/null 2>&1 && ps -p \"$STUDIOFS_E2E_OWNER_PID\" -o comm= -o args= 2>/dev/null | grep -Eq '(^|[ /])studiofs-e2e( |$)|cargo( |.* )studiofs-e2e'".to_string(),
             ],
             env: vec![("STUDIOFS_E2E_OWNER_PID".to_string(), pid.to_string())],
             cwd: None,
@@ -4258,6 +4258,17 @@ plain child stderr\n",
                             .unwrap()
                             .contains("owner pid 4242 is still active")
                 )
+        );
+    }
+
+    #[test]
+    fn owner_liveness_command_rejects_pid_reuse_by_non_runner_process() {
+        let command = owner_liveness_command(4242);
+        let script = command.args.join(" ");
+
+        assert!(
+            script.contains("studiofs-e2e"),
+            "owner liveness must verify the PID still belongs to the e2e runner, not just any reused process"
         );
     }
 

@@ -2598,7 +2598,10 @@ impl StudioVfs {
             && current.upload_state != MetaUploadState::Ready
             && current.size == 0
             && current.committed_size <= published.committed_size
-            && current.committed_content_epoch < published.committed_content_epoch
+            && (current.committed_content_epoch < published.committed_content_epoch
+                || (current.committed_content_epoch == published.committed_content_epoch
+                    && current.mtime <= published.mtime
+                    && current.ctime <= published.ctime))
     }
 
     pub(super) async fn discard_stale_zero_size_dirty_attr_after_current_publish(
