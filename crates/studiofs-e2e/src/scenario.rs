@@ -5987,6 +5987,8 @@ fn run_open_handle_helper_process(
                     pending_label,
                     progress_suffix
                 );
+                terminate_blocked_hotspot_client_process(client_a, &pending_label);
+                terminate_blocked_hotspot_client_process(client_b, &pending_label);
                 let _ = job.terminate();
                 if !wait_for_child_exit(&mut child, CHILD_TERMINATION_GRACE).unwrap_or(false) {
                     let _ = job.force_kill();
