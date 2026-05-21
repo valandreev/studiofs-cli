@@ -935,6 +935,31 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         }
     }
 
+    /// Sends best-effort termination to all tracked client processes without
+    /// waiting for exit. This is reserved for blocked mounted I/O paths where
+    /// waiting for process exit can keep the scenario child alive.
+    pub fn emergency_kill_all_no_wait(
+        &mut self,
+        context: &str,
+    ) -> Result<(), ClientControllerError> {
+        let mut kill_error = None;
+        for index in 0..self.clients.len() {
+            if let Some(process) = self.clients[index].process.as_mut() {
+                if let Err(err) = process.kill_process_tree(context) {
+                    kill_error.get_or_insert(ClientControllerError::Io(err));
+                }
+            }
+            self.clients[index].process = None;
+            self.clients[index].spec.process_id = None;
+            self.clients[index].spec.state = ClientLifecycleState::Killed;
+        }
+        if let Some(err) = kill_error {
+            Err(err)
+        } else {
+            Ok(())
+        }
+    }
+
     fn mount_index(&mut self, index: usize) -> Result<(), ClientControllerError> {
         let command = self.mount_command(index)?;
         if self.executor.is_mount_ready(&command)? {

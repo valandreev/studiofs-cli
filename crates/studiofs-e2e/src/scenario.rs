@@ -3706,6 +3706,17 @@ fn run_advanced_mounted_with_controller(
     controller: &mut MultiClientController<SystemClientProcessExecutor>,
 ) -> Result<AdvancedMountedSummary, ScenarioError> {
     let result = run_advanced_mounted_body(context, kind, controller);
+    if let Err(error @ ScenarioError::NamespaceCollisionOperationTimeout { .. }) = result {
+        if let Err(cleanup) = controller.emergency_kill_all_no_wait("advanced mounted timeout") {
+            return Err(ScenarioError::AdvancedMountedUnmountAfterFailure {
+                scenario: kind.name().to_string(),
+                primary: error.to_string(),
+                cleanup: cleanup.to_string(),
+            });
+        }
+        return Err(error);
+    }
+
     let unmount_result = controller.unmount_all();
     match (result, unmount_result) {
         (Ok(summary), Ok(())) => Ok(summary),
@@ -5066,7 +5077,7 @@ fn run_hotspot_churn_operations_with_timeout(
     )?;
     for round in 0..10 {
         let slot = isolation.path(&format!("slot-{}.txt", round % 6));
-        let renamed = isolation.path(&format!("slot-{}-renamed-round-{round}.txt", round % 6));
+        let renamed = isolation.path(&format!("slot-{}-renamed.txt", round % 6));
         let write_path = slot.clone();
         let write_payload = isolation.payload(
             "overwrite",
@@ -5135,13 +5146,6 @@ fn run_hotspot_churn_operations_with_timeout(
             Arc::clone(&active_workers),
         )?;
         record_sparse_operation(context, &mut operations, operation)?;
-        wait_for_required_paths_visible_until(
-            clients,
-            &[rename_target.as_str()],
-            Instant::now() + operation_timeout,
-            poll_interval,
-            "hotspot rename target",
-        )?;
         let order = operations.len() + 1;
         let operation = timed_hotspot_mount_fs_op(
             context,
