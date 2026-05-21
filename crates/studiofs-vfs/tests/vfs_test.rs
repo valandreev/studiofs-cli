@@ -394,7 +394,7 @@ fn set_test_env(key: &'static str, value: impl AsRef<str>) {
 
 fn remove_test_env(key: &'static str) {
     TEST_ENV_OVERRIDES.with(|overrides| {
-        overrides.borrow_mut().remove(key);
+        overrides.borrow_mut().insert(key, None);
     });
 }
 

@@ -1,4 +1,4 @@
-//! Regression guard for unsafe process environment mutation in test code.
+//! Regression guard for unsafe process environment mutation in Rust code.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -23,30 +23,46 @@ fn collect_rust_files(dir: &Path, files: &mut Vec<PathBuf>) {
     }
 }
 
+fn mutation_patterns() -> [String; 4] {
+    [
+        ["std", "::", "env", "::", "set_var", "("].concat(),
+        ["std", "::", "env", "::", "remove_var", "("].concat(),
+        ["env", "::", "set_var", "("].concat(),
+        ["env", "::", "remove_var", "("].concat(),
+    ]
+}
+
+fn normalize_for_call_scan(content: &str) -> String {
+    content.chars().filter(|ch| !ch.is_whitespace()).collect()
+}
+
 #[test]
-fn test_code_does_not_mutate_process_environment() {
+fn rust_code_does_not_mutate_process_environment() {
     let root = workspace_root();
     let mut files = Vec::new();
     collect_rust_files(&root.join("crates"), &mut files);
+    let patterns = mutation_patterns();
 
     let offenders = files
         .into_iter()
-        .filter(|path| {
-            path.components().any(|component| {
-                component.as_os_str() == "tests"
-                    || component.as_os_str() == "benches"
-                    || component.as_os_str() == "examples"
-            }) || path.file_name().is_some_and(|name| name == "lib.rs")
-        })
         .filter_map(|path| {
             let content = fs::read_to_string(&path).expect("read rust file");
+            let normalized_content = normalize_for_call_scan(&content);
+            if !patterns
+                .iter()
+                .any(|pattern| normalized_content.contains(pattern))
+            {
+                return None;
+            }
+
             let matches = content
                 .lines()
                 .enumerate()
                 .filter(|(_, line)| {
-                    let set_var = ["std::env::", "set_var("].concat();
-                    let remove_var = ["std::env::", "remove_var("].concat();
-                    line.contains(&set_var) || line.contains(&remove_var)
+                    let normalized_line = normalize_for_call_scan(line);
+                    patterns
+                        .iter()
+                        .any(|pattern| normalized_line.contains(pattern))
                 })
                 .map(|(idx, line)| {
                     format!(
@@ -57,6 +73,15 @@ fn test_code_does_not_mutate_process_environment() {
                     )
                 })
                 .collect::<Vec<_>>();
+
+            let matches = if matches.is_empty() {
+                vec![format!(
+                    "{}: contains process environment mutation call",
+                    path.strip_prefix(&root).unwrap_or(&path).display()
+                )]
+            } else {
+                matches
+            };
             (!matches.is_empty()).then_some(matches)
         })
         .flatten()
@@ -64,7 +89,7 @@ fn test_code_does_not_mutate_process_environment() {
 
     assert!(
         offenders.is_empty(),
-        "test code must not mutate the process environment; use injected test config or child-process Command::env instead:\n{}",
+        "Rust code must not mutate the process environment; use injected config, thread-local test overrides, or child-process Command::env instead:\n{}",
         offenders.join("\n")
     );
 }

@@ -336,7 +336,7 @@ fn set_test_mount_option_env(key: &'static str, value: impl Into<String>) {
 #[cfg(test)]
 fn remove_test_mount_option_env(key: &'static str) {
     TEST_MOUNT_OPTION_ENV.with(|env| {
-        env.borrow_mut().remove(key);
+        env.borrow_mut().insert(key, None);
     });
 }
 
