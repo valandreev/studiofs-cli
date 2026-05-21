@@ -23,7 +23,6 @@ impl PendingPayload {
         }
     }
 
-    #[cfg(test)]
     fn local_extent(object_id: u64, len: usize) -> Self {
         Self {
             data: BytesMut::new(),
@@ -304,7 +303,6 @@ impl PersistedPayloadEntry {
         }
     }
 
-    #[cfg(test)]
     fn from_local_extent(block_index: u32, object_id: u64, len: usize) -> Self {
         Self {
             block_index,
@@ -631,7 +629,9 @@ where
                 pending
                     .get(&(ino, block.block_index))
                     .filter(|current| {
-                        !current.is_local_extent() && current.data.as_ref() == block.as_ref()
+                        (current.is_local_extent() && current.persisted_len == Some(block.len()))
+                            || (!current.is_local_extent()
+                                && current.data.as_ref() == block.as_ref())
                     })
                     .and_then(|current| current.reserved_object_id)
                     .is_none()
@@ -655,25 +655,33 @@ where
         let mut persisted_blocks = Vec::with_capacity(blocks.len());
         for block in blocks {
             let key = (ino, block.block_index);
-            if let Some(current) = pending.get_mut(&key)
-                && !current.is_local_extent()
-                && current.data.as_ref() == block.as_ref()
-            {
-                let object_id = if let Some(object_id) = current.reserved_object_id {
-                    object_id
-                } else {
-                    let object_id = fresh_object_ids
-                        .pop_front()
-                        .expect("fresh object ids prevalidated");
-                    current.reserved_object_id = Some(object_id);
-                    object_id
-                };
-                persisted_blocks.push(PersistedPayloadEntry::from_payload(
-                    block.block_index,
-                    object_id,
-                    block.data.freeze(),
-                ));
-                continue;
+            if let Some(current) = pending.get_mut(&key) {
+                if current.is_local_extent() && current.persisted_len == Some(block.len()) {
+                    if let Some(object_id) = current.reserved_object_id {
+                        persisted_blocks.push(PersistedPayloadEntry::from_local_extent(
+                            block.block_index,
+                            object_id,
+                            block.len(),
+                        ));
+                        continue;
+                    }
+                } else if current.data.as_ref() == block.as_ref() {
+                    let object_id = if let Some(object_id) = current.reserved_object_id {
+                        object_id
+                    } else {
+                        let object_id = fresh_object_ids
+                            .pop_front()
+                            .expect("fresh object ids prevalidated");
+                        current.reserved_object_id = Some(object_id);
+                        object_id
+                    };
+                    persisted_blocks.push(PersistedPayloadEntry::from_payload(
+                        block.block_index,
+                        object_id,
+                        block.data.freeze(),
+                    ));
+                    continue;
+                }
             }
 
             let object_id = fresh_object_ids
@@ -1818,6 +1826,53 @@ impl StudioVfs {
         Ok(true)
     }
 
+    async fn persist_buffered_write_blocks_as_local_extents(
+        &self,
+        ino: Ino,
+        blocks: Vec<DirtyWriteSnapshot>,
+        local_sync_policy: LocalSyncPolicy,
+    ) -> VfsResult<()> {
+        if blocks.is_empty() {
+            return Ok(());
+        }
+
+        let object_count = u32::try_from(blocks.len()).map_err(|_| {
+            VfsError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "requested buffered-write local extent count {} exceeds u32::MAX",
+                    blocks.len()
+                ),
+            ))
+        })?;
+        let object_ids = self
+            .local_dirty_drain()
+            .allocate_object_ids(object_count)
+            .await?;
+        let mut local_extents = Vec::with_capacity(blocks.len());
+        let payloads = blocks
+            .into_iter()
+            .zip(object_ids.iter().copied())
+            .map(|(block, object_id)| {
+                let block_index = block.block_index;
+                let len = block.len();
+                local_extents.push((block_index, object_id, len));
+                (object_id, block.data.freeze())
+            })
+            .collect::<Vec<_>>();
+        self.persist_local_object_payloads(payloads, local_extents.len(), local_sync_policy)
+            .await?;
+        for (block_index, object_id, len) in local_extents {
+            self.replace_pending_local_dirty_payload(
+                ino,
+                block_index,
+                PendingPayload::local_extent(object_id, len),
+            );
+            self.clear_pending_dirty_slices_for_block(ino, block_index);
+        }
+        Ok(())
+    }
+
     fn fully_overwritten_block_indexes_for_buffered_writes(
         &self,
         writes: &[(u64, Bytes)],
@@ -1893,6 +1948,21 @@ impl StudioVfs {
         }
 
         if matches!(local_sync_policy, LocalSyncPolicy::Opportunistic) {
+            if self.disable_background_slab_flush {
+                let (completed_blocks, buffered_blocks): (Vec<_>, Vec<_>) = blocks
+                    .into_iter()
+                    .partition(|block| block.len() == self.block_size as usize);
+                self.persist_buffered_write_blocks_as_local_extents(
+                    ino,
+                    completed_blocks,
+                    local_sync_policy,
+                )
+                .await?;
+                if !buffered_blocks.is_empty() {
+                    self.stage_dirty_write_snapshots(ino, buffered_blocks);
+                }
+                return Ok(());
+            }
             let (completed_blocks, buffered_blocks): (Vec<_>, Vec<_>) = blocks
                 .into_iter()
                 .partition(|block| block.len() == self.block_size as usize);
@@ -2959,15 +3029,24 @@ impl StudioVfs {
             .into_iter()
             .flat_map(|inode_indexes| inode_indexes.iter())
             .filter_map(|block_index| {
-                pending
-                    .get(&(ino, *block_index))
-                    .filter(|pending| pending.dirty)
-                    .map(|pending| {
-                        DirtyWriteSnapshot::from_mutable(
-                            *block_index,
-                            self.clone_into_write_buffer(pending.data.as_ref()),
-                        )
-                    })
+                let pending = pending.get(&(ino, *block_index))?;
+                if pending.is_local_extent() {
+                    let object_id = pending
+                        .local_extent_id()
+                        .expect("local extent pending payload must have an object id");
+                    let data = self
+                        .local_payload_backend
+                        .get(object_id)
+                        .expect("local payload missing for dirty local extent snapshot");
+                    Some(DirtyWriteSnapshot::from_shared(*block_index, data))
+                } else if pending.dirty {
+                    Some(DirtyWriteSnapshot::from_mutable(
+                        *block_index,
+                        self.clone_into_write_buffer(pending.data.as_ref()),
+                    ))
+                } else {
+                    None
+                }
             })
             .collect()
     }
@@ -3148,7 +3227,36 @@ impl StudioVfs {
             let Some(block) = pending.get(&(ino, *block_index)) else {
                 continue;
             };
-            if block.is_local_extent() || !block.dirty || block.data.is_empty() {
+            if block.is_local_extent() {
+                let object_id = block
+                    .local_extent_id()
+                    .expect("local extent pending payload must have an object id");
+                let data = self
+                    .local_payload_backend
+                    .get(object_id)
+                    .expect("local payload missing during dirty read span resolution");
+                let block_start =
+                    u64::from(*block_index).saturating_mul(u64::from(self.block_size));
+                let block_end = block_start.saturating_add(block.logical_len() as u64);
+                let start = block_start.max(offset);
+                let stop = block_end.min(end);
+                if start >= stop {
+                    continue;
+                }
+                let delta = start.saturating_sub(block_start);
+                let Some(block_offset) = u32::try_from(delta).ok() else {
+                    continue;
+                };
+                spans.push(PendingDirtyReadSpan {
+                    start,
+                    end: stop,
+                    block_offset,
+                    seq: 0,
+                    data,
+                });
+                continue;
+            }
+            if !block.dirty || block.data.is_empty() {
                 continue;
             }
 

@@ -3622,6 +3622,9 @@ impl StudioVfs {
     // #endregion debug log
 
     fn aggressive_materialization_should_run(&self) -> bool {
+        if self.disable_background_slab_flush {
+            return false;
+        }
         let total_dirty_bytes = self.state.writer_stack.total_dirty_bytes();
         if total_dirty_bytes == 0 {
             return false;

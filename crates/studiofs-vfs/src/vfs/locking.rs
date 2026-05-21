@@ -36,8 +36,14 @@ pub(super) struct FileLock {
     shared_counts: HashMap<u64, u32>,
 }
 
+#[derive(Debug)]
+struct PendingFlockAcquire {
+    kind: LockKind,
+}
+
 pub(super) struct FileLockState {
     pub(super) file_locks: Mutex<HashMap<Ino, FileLock>>,
+    pending_acquires: Mutex<HashMap<Ino, PendingFlockAcquire>>,
     pub(super) lock_notify: tokio::sync::Notify,
 }
 
@@ -45,9 +51,36 @@ impl FileLockState {
     pub(super) fn new() -> Self {
         Self {
             file_locks: Mutex::new(HashMap::new()),
+            pending_acquires: Mutex::new(HashMap::new()),
             lock_notify: tokio::sync::Notify::new(),
         }
     }
+}
+
+fn file_lock_allows(entry: Option<&FileLock>, op: LockKind, owner: u64) -> bool {
+    match entry {
+        None => true,
+        Some(entry) => match op {
+            LockKind::Shared => {
+                entry.kind == LockKind::Shared
+                    || (entry.kind == LockKind::Exclusive && entry.owner == owner)
+            }
+            LockKind::Exclusive => match entry.kind {
+                LockKind::Unlock => true,
+                LockKind::Exclusive => entry.owner == owner,
+                LockKind::Shared => {
+                    entry.shared_counts.len() == 1 && entry.shared_counts.contains_key(&owner)
+                }
+            },
+            LockKind::Unlock => true,
+        },
+    }
+}
+
+fn pending_flock_conflicts(pending: &PendingFlockAcquire, op: LockKind) -> bool {
+    debug_assert_ne!(pending.kind, LockKind::Unlock);
+    debug_assert_ne!(op, LockKind::Unlock);
+    true
 }
 
 impl StudioVfs {
@@ -123,55 +156,89 @@ impl StudioVfs {
                 };
 
                 if had_local_lock {
-                    if release_remote_lock && let Some(cfg) = &self.distributed_flock {
-                        self.flush(ino).await?;
-                        let meta = self.meta.clone();
-                        run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
-                            engine.flush_metadata()?;
-                            Ok(())
-                        })
-                        .await?;
-                        let _ = self
+                    if release_remote_lock {
+                        let Some(cfg) = &self.distributed_flock else {
+                            self.state.file_lock.lock_notify.notify_waiters();
+                            return Ok(());
+                        };
+                        let mut first_error = None;
+                        if let Err(error) = self.flush(ino).await {
+                            first_error = Some(error);
+                        } else {
+                            let meta = self.meta.clone();
+                            if let Err(error) = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+                                engine.flush_metadata()?;
+                                Ok(())
+                            })
+                            .await
+                            {
+                                first_error = Some(error);
+                            }
+                        }
+                        if let Err(error) = self
                             .acquire_distributed_flock(cfg, ino, LockKind::Unlock)
-                            .await?;
+                            .await
+                        {
+                            if first_error.is_none() {
+                                first_error = Some(error);
+                            }
+                        }
+                        if let Some(error) = first_error {
+                            self.state.file_lock.lock_notify.notify_waiters();
+                            return Err(error);
+                        }
                     }
                     self.state.file_lock.lock_notify.notify_waiters();
                 }
                 return Ok(());
             }
 
+            let mut inserted_pending = false;
+            let notified = self.state.file_lock.lock_notify.notified();
             let local_allowed = {
-                let locks = self.state.file_lock.file_locks.lock();
-                match locks.get(&ino) {
-                    None => true,
-                    Some(entry) => match op {
-                        LockKind::Shared => {
-                            entry.kind == LockKind::Shared
-                                || (entry.kind == LockKind::Exclusive && entry.owner == owner)
+                let mut pending = self.state.file_lock.pending_acquires.lock();
+                if match pending.get(&ino) {
+                    Some(existing) => pending_flock_conflicts(existing, op),
+                    None => false,
+                } {
+                    false
+                } else {
+                    let locks = self.state.file_lock.file_locks.lock();
+                    if file_lock_allows(locks.get(&ino), op, owner) {
+                        if self.distributed_flock.is_some() {
+                            pending.insert(ino, PendingFlockAcquire { kind: op });
+                            inserted_pending = true;
                         }
-                        LockKind::Exclusive => match entry.kind {
-                            LockKind::Unlock => true,
-                            LockKind::Exclusive => entry.owner == owner,
-                            LockKind::Shared => {
-                                entry.shared_counts.len() == 1
-                                    && entry.shared_counts.contains_key(&owner)
-                            }
-                        },
-                        LockKind::Unlock => true,
-                    },
+                        true
+                    } else {
+                        false
+                    }
                 }
             };
             if !local_allowed {
                 if !blocking {
                     return Err(VfsError::WouldBlock);
                 }
-                self.state.file_lock.lock_notify.notified().await;
+                notified.await;
                 continue;
             }
 
             if let Some(cfg) = &self.distributed_flock {
-                let acquired = self.acquire_distributed_flock(cfg, ino, op).await?;
+                let acquired = match self.acquire_distributed_flock(cfg, ino, op).await {
+                    Ok(acquired) => acquired,
+                    Err(err) => {
+                        if inserted_pending {
+                            self.state.file_lock.pending_acquires.lock().remove(&ino);
+                            self.state.file_lock.lock_notify.notify_waiters();
+                        }
+                        return Err(err);
+                    }
+                };
                 if !acquired {
+                    if inserted_pending {
+                        self.state.file_lock.pending_acquires.lock().remove(&ino);
+                        self.state.file_lock.lock_notify.notify_waiters();
+                    }
                     if !blocking {
                         return Err(VfsError::WouldBlock);
                     }
@@ -184,11 +251,21 @@ impl StudioVfs {
                     engine.sync_metadata()?;
                     Ok(())
                 })
-                .await?;
+                .await
+                .inspect_err(|_| {
+                    if inserted_pending {
+                        self.state.file_lock.pending_acquires.lock().remove(&ino);
+                        self.state.file_lock.lock_notify.notify_waiters();
+                    }
+                })?;
             }
 
             let committed = {
+                let mut pending = self.state.file_lock.pending_acquires.lock();
                 let mut locks = self.state.file_lock.file_locks.lock();
+                if inserted_pending {
+                    pending.remove(&ino);
+                }
                 match op {
                     LockKind::Shared => {
                         let entry = locks.entry(ino).or_insert(FileLock {
@@ -248,6 +325,9 @@ impl StudioVfs {
                     LockKind::Unlock => true,
                 }
             };
+            if inserted_pending {
+                self.state.file_lock.lock_notify.notify_waiters();
+            }
             if committed {
                 return Ok(());
             }
@@ -260,7 +340,7 @@ impl StudioVfs {
             if !blocking {
                 return Err(VfsError::WouldBlock);
             }
-            self.state.file_lock.lock_notify.notified().await;
+            notified.await;
         }
     }
 }
@@ -385,6 +465,85 @@ mod tests {
             vfs.flock(file.ino, LockKind::Exclusive, 1, false)
                 .await
                 .expect("owner 1 can upgrade once sole remaining shared owner");
+        });
+    }
+
+    #[test]
+    fn pending_acquire_blocks_second_local_distributed_attempt() {
+        let pending = PendingFlockAcquire {
+            kind: LockKind::Exclusive,
+        };
+
+        assert!(
+            pending_flock_conflicts(&pending, LockKind::Exclusive),
+            "a second exclusive owner must not start a duplicate distributed acquire"
+        );
+        assert!(
+            pending_flock_conflicts(&pending, LockKind::Shared),
+            "a shared owner must wait for the in-flight exclusive acquire"
+        );
+        assert!(
+            pending_flock_conflicts(&pending, LockKind::Exclusive),
+            "same-owner reentrant attempts still wait until the first acquire commits locally"
+        );
+    }
+
+    #[test]
+    fn pending_shared_acquire_still_serializes_local_pg_attempts() {
+        let pending = PendingFlockAcquire {
+            kind: LockKind::Shared,
+        };
+
+        assert!(
+            pending_flock_conflicts(&pending, LockKind::Shared),
+            "compatible shared owners should not stampede into PostgreSQL while the first acquire is pending"
+        );
+        assert!(
+            pending_flock_conflicts(&pending, LockKind::Exclusive),
+            "exclusive owners must wait for an in-flight shared acquire"
+        );
+    }
+
+    #[test]
+    fn blocking_flock_rechecks_after_pending_acquire_resolves() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, vfs, _meta) = make_test_vfs(&tmp, "pending-recheck");
+        let file = vfs
+            .create(1, b"pending.txt", 1000, 1000, 0o644)
+            .expect("create file");
+
+        rt.block_on(async {
+            vfs.state.file_lock.pending_acquires.lock().insert(
+                file.ino,
+                PendingFlockAcquire {
+                    kind: LockKind::Exclusive,
+                },
+            );
+
+            let waiter_vfs = vfs.clone();
+            let waiter = tokio::spawn(async move {
+                waiter_vfs
+                    .flock(file.ino, LockKind::Exclusive, 2, true)
+                    .await
+            });
+
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            assert!(
+                !waiter.is_finished(),
+                "blocking flock should wait while a local acquire is pending"
+            );
+
+            vfs.state
+                .file_lock
+                .pending_acquires
+                .lock()
+                .remove(&file.ino);
+            vfs.state.file_lock.lock_notify.notify_waiters();
+
+            waiter
+                .await
+                .expect("waiter task should complete")
+                .expect("waiter should acquire after pending state is cleared");
         });
     }
 }

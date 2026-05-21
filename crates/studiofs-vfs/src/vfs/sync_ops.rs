@@ -300,6 +300,9 @@ impl StudioVfs {
     /// Deferred materialization drains buffered writer-stack data into the local dirty-state
     /// persistence path in the background, while the inode still has open handles.
     pub(super) async fn spawn_deferred_materialization_if_needed(self: &Arc<Self>, ino: Ino) {
+        if self.disable_background_slab_flush {
+            return;
+        }
         if self.shutdown_requested() {
             return;
         }
@@ -1227,8 +1230,7 @@ impl StudioVfs {
             }
             let dirty_pressure_requires_materialization = self.total_pending_write_buffer_bytes()
                 > self.max_dirty_bytes()
-                || self.state.writer_stack.total_dirty_bytes()
-                    >= self.write_eager_flush_batch_bytes;
+                || self.state.writer_stack.total_dirty_bytes() > self.write_eager_flush_batch_bytes;
             let should_materialize_for_limits =
                 local_sync_policy.is_opportunistic() && dirty_pressure_requires_materialization;
             if should_materialize_for_limits {
