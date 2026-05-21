@@ -4750,7 +4750,7 @@ fn run_mounted_chaos_operations(
     let mut operations = Vec::new();
     let active_workers = Arc::new(AtomicUsize::new(0));
     let writer = &clients[0];
-    seed_mounted_chaos_initial_tree(context, writer, isolation)?;
+    seed_mounted_chaos_initial_tree(writer, isolation)?;
     wait_for_mounted_chaos_initial_tree(
         context,
         clients,
@@ -4855,25 +4855,18 @@ fn run_mounted_chaos_operations(
 }
 
 fn seed_mounted_chaos_initial_tree(
-    context: &ScenarioContext,
     writer: &ClientSpec,
     isolation: &ScenarioIsolation,
 ) -> Result<(), ScenarioError> {
-    let active_workers = Arc::new(AtomicUsize::new(0));
     for &(path, payload) in MOUNTED_CHAOS_INITIAL_TREE {
         let logical_path = path.strip_prefix("chaos/").unwrap_or(path);
         let mounted_path = isolation.path(logical_path);
         let payload =
             isolation.payload("initial", &mounted_path, &String::from_utf8_lossy(payload));
-        run_hotspot_mount_operation_with_timeout(
-            context,
-            writer,
-            "create",
-            &mounted_path,
-            HOTSPOT_CHURN_OPERATION_TIMEOUT,
-            Some(&payload),
-            None,
-            Arc::clone(&active_workers),
+        write_mounted_initial_file(
+            writer.mount_point.join(mounted_path),
+            &payload,
+            "mounted chaos initial tree",
         )?;
     }
     Ok(())
@@ -4888,7 +4881,12 @@ fn write_mounted_initial_file(
         fs::create_dir_all(parent)?;
     }
     let mut options = mounted_write_barrier_open_options();
-    let mut file = options.create_new(true).open(&path)?;
+    let mut file = options.create_new(true).open(&path).map_err(|error| {
+        ScenarioError::Io(io::Error::new(
+            error.kind(),
+            format!("{label}: open {}: {error}", path.display()),
+        ))
+    })?;
     file.write_all(payload)?;
     file.sync_all()?;
     drop(file);
@@ -10821,7 +10819,7 @@ mod tests {
             client_controller_config: None,
         };
         let isolation = test_isolation("chaos-test");
-        seed_mounted_chaos_initial_tree(&context, &clients[0], &isolation).unwrap();
+        seed_mounted_chaos_initial_tree(&clients[0], &isolation).unwrap();
 
         let err = wait_for_mounted_chaos_initial_tree(
             &context,
@@ -10843,17 +10841,6 @@ mod tests {
     fn mounted_chaos_initial_seed_rejects_stale_zero_byte_file() {
         let temp = tempdir().unwrap();
         let sandbox = temp.path().join("run-1");
-        let scenario_dir = sandbox
-            .join("artifacts")
-            .join("scenarios")
-            .join(MOUNTED_CHAOS_CONVERGENCE);
-        let context = ScenarioContext {
-            run_id: "run-1".to_string(),
-            seed: 410,
-            sandbox: sandbox.clone(),
-            scenario_dir,
-            client_controller_config: None,
-        };
         let writer = client_spec_for(
             &sandbox,
             "projectfs",
@@ -10865,7 +10852,7 @@ mod tests {
         std::fs::create_dir_all(stale_path.parent().unwrap()).unwrap();
         std::fs::write(&stale_path, []).unwrap();
 
-        let err = seed_mounted_chaos_initial_tree(&context, &writer, &isolation).unwrap_err();
+        let err = seed_mounted_chaos_initial_tree(&writer, &isolation).unwrap_err();
 
         let err_text = err.to_string().to_ascii_lowercase();
         assert!(
@@ -11166,7 +11153,7 @@ mod tests {
             client_controller_config: None,
         };
         let isolation = test_isolation("chaos-test");
-        seed_mounted_chaos_initial_tree(&context, &clients[0], &isolation).unwrap();
+        seed_mounted_chaos_initial_tree(&clients[0], &isolation).unwrap();
         for peer in clients.iter().skip(1) {
             replace_dir_contents(&clients[0].mount_point, &peer.mount_point).unwrap();
         }
