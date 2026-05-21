@@ -5107,8 +5107,16 @@ fn run_hotspot_churn_operations_with_timeout(
         )?;
         record_required_sparse_operation(context, &mut operations, operation)?;
         wait_for_required_paths_visible_until(
-            std::slice::from_ref(&clients[0]),
+            clients,
             &[slot.as_str()],
+            Instant::now() + operation_timeout,
+            poll_interval,
+            "hotspot rename source",
+        )?;
+        wait_for_hotspot_helper_stat_until(
+            context,
+            &clients[0],
+            &slot,
             Instant::now() + operation_timeout,
             poll_interval,
             "hotspot rename source",
