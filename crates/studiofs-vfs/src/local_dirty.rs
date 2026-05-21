@@ -1893,6 +1893,10 @@ impl StudioVfs {
         }
 
         if matches!(local_sync_policy, LocalSyncPolicy::Opportunistic) {
+            if self.disable_background_slab_flush {
+                self.stage_dirty_write_snapshots(ino, blocks);
+                return Ok(());
+            }
             let (completed_blocks, buffered_blocks): (Vec<_>, Vec<_>) = blocks
                 .into_iter()
                 .partition(|block| block.len() == self.block_size as usize);
