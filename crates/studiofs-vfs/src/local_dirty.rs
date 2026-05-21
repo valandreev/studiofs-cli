@@ -1949,8 +1949,18 @@ impl StudioVfs {
 
         if matches!(local_sync_policy, LocalSyncPolicy::Opportunistic) {
             if self.disable_background_slab_flush {
-                self.persist_buffered_write_blocks_as_local_extents(ino, blocks, local_sync_policy)
-                    .await?;
+                let (completed_blocks, buffered_blocks): (Vec<_>, Vec<_>) = blocks
+                    .into_iter()
+                    .partition(|block| block.len() == self.block_size as usize);
+                self.persist_buffered_write_blocks_as_local_extents(
+                    ino,
+                    completed_blocks,
+                    local_sync_policy,
+                )
+                .await?;
+                if !buffered_blocks.is_empty() {
+                    self.stage_dirty_write_snapshots(ino, buffered_blocks);
+                }
                 return Ok(());
             }
             let (completed_blocks, buffered_blocks): (Vec<_>, Vec<_>) = blocks
