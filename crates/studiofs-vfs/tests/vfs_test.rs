@@ -379,7 +379,33 @@ fn workspace_dotenv_var(key: &str) -> Option<String> {
     workspace_dotenv_vars().get(key).cloned()
 }
 
+thread_local! {
+    static TEST_ENV_OVERRIDES: std::cell::RefCell<std::collections::HashMap<&'static str, Option<String>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn set_test_env(key: &'static str, value: impl AsRef<str>) {
+    TEST_ENV_OVERRIDES.with(|overrides| {
+        overrides
+            .borrow_mut()
+            .insert(key, Some(value.as_ref().to_string()));
+    });
+}
+
+fn remove_test_env(key: &'static str) {
+    TEST_ENV_OVERRIDES.with(|overrides| {
+        overrides.borrow_mut().remove(key);
+    });
+}
+
+fn test_env_override(key: &str) -> Option<Option<String>> {
+    TEST_ENV_OVERRIDES.with(|overrides| overrides.borrow().get(key).cloned())
+}
+
 fn locked_env_var(key: &str) -> Option<String> {
+    if let Some(value) = test_env_override(key) {
+        return value;
+    }
     let _env_lock = acquire_test_env_lock();
     std::env::var(key).ok()
 }
@@ -447,6 +473,9 @@ fn test_vfs_config_from_env() -> VfsConfigValidated {
     }
     if let Some(ms) = parse_env_u64("STUDIOFS_SLAB_FLUSH_INTERVAL_MS") {
         config.slab_flush_interval_ms = Some(ms);
+    }
+    if locked_env_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH").is_some() {
+        config.disable_background_slab_flush = Some(true);
     }
     if let Some(secs) = parse_env_u64("STUDIOFS_SHUTDOWN_METADATA_FLUSH_TIMEOUT_SECS") {
         config.shutdown_metadata_flush_timeout_secs = Some(secs);
@@ -729,38 +758,32 @@ fn test_online_s3_env() -> &'static TestS3Env {
 fn apply_test_online_s3_env() {
     let _env_lock = acquire_test_env_lock();
     let env = test_online_s3_env();
-    unsafe {
-        std::env::set_var("STUDIOFS_S3_ENDPOINT", &env.endpoint);
-        std::env::set_var("STUDIOFS_S3_BUCKET", &env.bucket);
-        std::env::set_var("STUDIOFS_S3_ACCESS_KEY", &env.access_key);
-        std::env::set_var("STUDIOFS_S3_SECRET_KEY", &env.secret_key);
-    }
+    set_test_env("STUDIOFS_S3_ENDPOINT", &env.endpoint);
+    set_test_env("STUDIOFS_S3_BUCKET", &env.bucket);
+    set_test_env("STUDIOFS_S3_ACCESS_KEY", &env.access_key);
+    set_test_env("STUDIOFS_S3_SECRET_KEY", &env.secret_key);
 }
 
 fn install_zeroio_replay_offline_env() {
     let _env_lock = acquire_test_env_lock();
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
-        std::env::set_var("STUDIOFS_S3_BUCKET", "studiofs-test");
-        std::env::set_var("STUDIOFS_S3_ACCESS_KEY", "studiofs");
-        std::env::set_var("STUDIOFS_S3_SECRET_KEY", "studiofs123");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
-    }
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+    set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+    set_test_env("STUDIOFS_S3_BUCKET", "studiofs-test");
+    set_test_env("STUDIOFS_S3_ACCESS_KEY", "studiofs");
+    set_test_env("STUDIOFS_S3_SECRET_KEY", "studiofs123");
+    set_test_env("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
 }
 
 fn install_zeroio_replay_online_env(upload_delay_ms: &str) {
     let _env_lock = acquire_test_env_lock();
     apply_test_online_s3_env();
-    unsafe {
-        std::env::remove_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
-        std::env::remove_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
-        std::env::remove_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
-        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", upload_delay_ms);
-    }
+    remove_test_env("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
+    remove_test_env("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
+    remove_test_env("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
+    set_test_env("STUDIOFS_UPLOAD_DELAY_MS", upload_delay_ms);
 }
 
 fn make_format_info_with_endpoint(volume_suffix: &str, endpoint: &str) -> FormatInfo {
@@ -900,18 +923,17 @@ fn setup_offline_sfs121_env() -> OfflineTestEnv {
         ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS"),
         ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS"),
     ];
-    unsafe {
-        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
-        std::env::set_var("STUDIOFS_S3_BUCKET", "studiofs-test");
-        std::env::set_var("STUDIOFS_S3_ACCESS_KEY", "studiofs");
-        std::env::set_var("STUDIOFS_S3_SECRET_KEY", "studiofs123");
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "0");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
-    }
+    set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+    set_test_env("STUDIOFS_S3_BUCKET", "studiofs-test");
+    set_test_env("STUDIOFS_S3_ACCESS_KEY", "studiofs");
+    set_test_env("STUDIOFS_S3_SECRET_KEY", "studiofs123");
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+    set_test_env("STUDIOFS_UPLOAD_DELAY_MS", "0");
+    set_test_env("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+
     OfflineTestEnv {
         _guards: guards,
         _lock: lock,
@@ -946,12 +968,11 @@ fn setup_online_sfs121_env() -> OnlineTestEnv {
         ScopedEnvVar::capture("STUDIOFS_UPLOAD_WORKER_COUNT"),
     ];
     let env = test_online_s3_env();
-    unsafe {
-        std::env::set_var("STUDIOFS_S3_ENDPOINT", &env.endpoint);
-        std::env::set_var("STUDIOFS_S3_BUCKET", &env.bucket);
-        std::env::set_var("STUDIOFS_S3_ACCESS_KEY", &env.access_key);
-        std::env::set_var("STUDIOFS_S3_SECRET_KEY", &env.secret_key);
-    }
+    set_test_env("STUDIOFS_S3_ENDPOINT", &env.endpoint);
+    set_test_env("STUDIOFS_S3_BUCKET", &env.bucket);
+    set_test_env("STUDIOFS_S3_ACCESS_KEY", &env.access_key);
+    set_test_env("STUDIOFS_S3_SECRET_KEY", &env.secret_key);
+
     OnlineTestEnv {
         _guards: guards,
         _lock: lock,
@@ -1936,12 +1957,10 @@ async fn test_background_janitor_removes_orphan_object() {
     let _restore_skip = EnvRestore::capture("STUDIOFS_JANITOR_SKIP_NEWER_SECS");
     let _restore_max = EnvRestore::capture("STUDIOFS_JANITOR_MAX_DELETES");
     let _restore_lease_ttl = EnvRestore::capture("STUDIOFS_JANITOR_LEASE_TTL_SECS");
-    unsafe {
-        std::env::set_var("STUDIOFS_JANITOR_INTERVAL_SECS", "2");
-        std::env::set_var("STUDIOFS_JANITOR_SKIP_NEWER_SECS", "0");
-        std::env::set_var("STUDIOFS_JANITOR_MAX_DELETES", "50");
-        std::env::set_var("STUDIOFS_JANITOR_LEASE_TTL_SECS", "10");
-    }
+    set_test_env("STUDIOFS_JANITOR_INTERVAL_SECS", "2");
+    set_test_env("STUDIOFS_JANITOR_SKIP_NEWER_SECS", "0");
+    set_test_env("STUDIOFS_JANITOR_MAX_DELETES", "50");
+    set_test_env("STUDIOFS_JANITOR_LEASE_TTL_SECS", "10");
 
     let tmp = tempfile::tempdir().unwrap();
     let vfs = make_vfs(&tmp, "janitor_orphan");
@@ -1990,12 +2009,10 @@ async fn test_background_janitor_cleans_simulated_crash_orphan() {
     let _restore_skip = EnvRestore::capture("STUDIOFS_JANITOR_SKIP_NEWER_SECS");
     let _restore_max = EnvRestore::capture("STUDIOFS_JANITOR_MAX_DELETES");
     let _restore_lease_ttl = EnvRestore::capture("STUDIOFS_JANITOR_LEASE_TTL_SECS");
-    unsafe {
-        std::env::set_var("STUDIOFS_JANITOR_INTERVAL_SECS", "2");
-        std::env::set_var("STUDIOFS_JANITOR_SKIP_NEWER_SECS", "0");
-        std::env::set_var("STUDIOFS_JANITOR_MAX_DELETES", "50");
-        std::env::set_var("STUDIOFS_JANITOR_LEASE_TTL_SECS", "10");
-    }
+    set_test_env("STUDIOFS_JANITOR_INTERVAL_SECS", "2");
+    set_test_env("STUDIOFS_JANITOR_SKIP_NEWER_SECS", "0");
+    set_test_env("STUDIOFS_JANITOR_MAX_DELETES", "50");
+    set_test_env("STUDIOFS_JANITOR_LEASE_TTL_SECS", "10");
 
     let tmp = tempfile::tempdir().unwrap();
     let vfs = make_vfs(&tmp, "janitor_crash_orphan");
@@ -2059,12 +2076,10 @@ async fn test_background_janitor_does_not_heal_dangling_dentry_without_foregroun
     let _restore_skip = EnvRestore::capture("STUDIOFS_JANITOR_SKIP_NEWER_SECS");
     let _restore_max = EnvRestore::capture("STUDIOFS_JANITOR_MAX_DELETES");
     let _restore_lease_ttl = EnvRestore::capture("STUDIOFS_JANITOR_LEASE_TTL_SECS");
-    unsafe {
-        std::env::set_var("STUDIOFS_JANITOR_INTERVAL_SECS", "2");
-        std::env::set_var("STUDIOFS_JANITOR_SKIP_NEWER_SECS", "0");
-        std::env::set_var("STUDIOFS_JANITOR_MAX_DELETES", "50");
-        std::env::set_var("STUDIOFS_JANITOR_LEASE_TTL_SECS", "10");
-    }
+    set_test_env("STUDIOFS_JANITOR_INTERVAL_SECS", "2");
+    set_test_env("STUDIOFS_JANITOR_SKIP_NEWER_SECS", "0");
+    set_test_env("STUDIOFS_JANITOR_MAX_DELETES", "50");
+    set_test_env("STUDIOFS_JANITOR_LEASE_TTL_SECS", "10");
 
     let tmp = tempfile::tempdir().unwrap();
     let vfs = make_vfs(&tmp, "janitor_dangling_dentry");
@@ -2094,12 +2109,10 @@ async fn test_background_janitor_recovers_pending_create_intent_runtime() {
     let _restore_skip = EnvRestore::capture("STUDIOFS_JANITOR_SKIP_NEWER_SECS");
     let _restore_max = EnvRestore::capture("STUDIOFS_JANITOR_MAX_DELETES");
     let _restore_lease_ttl = EnvRestore::capture("STUDIOFS_JANITOR_LEASE_TTL_SECS");
-    unsafe {
-        std::env::set_var("STUDIOFS_JANITOR_INTERVAL_SECS", "2");
-        std::env::set_var("STUDIOFS_JANITOR_SKIP_NEWER_SECS", "0");
-        std::env::set_var("STUDIOFS_JANITOR_MAX_DELETES", "50");
-        std::env::set_var("STUDIOFS_JANITOR_LEASE_TTL_SECS", "10");
-    }
+    set_test_env("STUDIOFS_JANITOR_INTERVAL_SECS", "2");
+    set_test_env("STUDIOFS_JANITOR_SKIP_NEWER_SECS", "0");
+    set_test_env("STUDIOFS_JANITOR_MAX_DELETES", "50");
+    set_test_env("STUDIOFS_JANITOR_LEASE_TTL_SECS", "10");
 
     let tmp = tempfile::tempdir().unwrap();
     let vfs = make_vfs(&tmp, "janitor_pending_create_runtime");
@@ -2166,12 +2179,10 @@ async fn test_background_janitor_does_not_recover_deferred_delete_undo_runtime()
     let _restore_skip = EnvRestore::capture("STUDIOFS_JANITOR_SKIP_NEWER_SECS");
     let _restore_max = EnvRestore::capture("STUDIOFS_JANITOR_MAX_DELETES");
     let _restore_lease_ttl = EnvRestore::capture("STUDIOFS_JANITOR_LEASE_TTL_SECS");
-    unsafe {
-        std::env::set_var("STUDIOFS_JANITOR_INTERVAL_SECS", "2");
-        std::env::set_var("STUDIOFS_JANITOR_SKIP_NEWER_SECS", "0");
-        std::env::set_var("STUDIOFS_JANITOR_MAX_DELETES", "50");
-        std::env::set_var("STUDIOFS_JANITOR_LEASE_TTL_SECS", "10");
-    }
+    set_test_env("STUDIOFS_JANITOR_INTERVAL_SECS", "2");
+    set_test_env("STUDIOFS_JANITOR_SKIP_NEWER_SECS", "0");
+    set_test_env("STUDIOFS_JANITOR_MAX_DELETES", "50");
+    set_test_env("STUDIOFS_JANITOR_LEASE_TTL_SECS", "10");
 
     let tmp = tempfile::tempdir().unwrap();
     let vfs = make_vfs(&tmp, "janitor_deferred_undo_runtime");
@@ -2236,12 +2247,10 @@ async fn test_background_janitor_recovers_only_pending_create_in_mixed_runtime()
     let _restore_skip = EnvRestore::capture("STUDIOFS_JANITOR_SKIP_NEWER_SECS");
     let _restore_max = EnvRestore::capture("STUDIOFS_JANITOR_MAX_DELETES");
     let _restore_lease_ttl = EnvRestore::capture("STUDIOFS_JANITOR_LEASE_TTL_SECS");
-    unsafe {
-        std::env::set_var("STUDIOFS_JANITOR_INTERVAL_SECS", "2");
-        std::env::set_var("STUDIOFS_JANITOR_SKIP_NEWER_SECS", "0");
-        std::env::set_var("STUDIOFS_JANITOR_MAX_DELETES", "50");
-        std::env::set_var("STUDIOFS_JANITOR_LEASE_TTL_SECS", "10");
-    }
+    set_test_env("STUDIOFS_JANITOR_INTERVAL_SECS", "2");
+    set_test_env("STUDIOFS_JANITOR_SKIP_NEWER_SECS", "0");
+    set_test_env("STUDIOFS_JANITOR_MAX_DELETES", "50");
+    set_test_env("STUDIOFS_JANITOR_LEASE_TTL_SECS", "10");
 
     let tmp = tempfile::tempdir().unwrap();
     let vfs = make_vfs(&tmp, "janitor_mixed_undo_runtime");
@@ -2654,14 +2663,12 @@ fn writer_reads_full_file_before_any_remote_commit() {
     let _restore_disable = EnvRestore::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
     let _restore_endpoint = EnvRestore::capture("STUDIOFS_S3_ENDPOINT");
 
-    unsafe {
-        // Keep uploads remote-offline; local flush should still commit through
-        // Local backend + metadata immediately.
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "8MB");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "16MB");
-        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
-        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
-    }
+    // Keep uploads remote-offline; local flush should still commit through
+    // Local backend + metadata immediately.
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "8MB");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "16MB");
+    set_test_env("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
+    set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
@@ -2723,12 +2730,10 @@ fn full_block_write_flush_recovers_pending_upload_after_restart() {
     let _restore_spill = EnvRestore::capture("STUDIOFS_MAX_SPILL_BYTES");
     let _restore_disable = EnvRestore::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
 
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "8MB");
-        std::env::set_var("STUDIOFS_WRITE_EAGER_FLUSH_BATCH_BYTES", "4MB");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "16MB");
-        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
-    }
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "8MB");
+    set_test_env("STUDIOFS_WRITE_EAGER_FLUSH_BATCH_BYTES", "4MB");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "16MB");
+    set_test_env("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
@@ -2851,12 +2856,10 @@ fn writer_recovers_local_file_after_restart_before_upload_complete() {
     let _restore_spill = EnvRestore::capture("STUDIOFS_MAX_SPILL_BYTES");
     let _restore_disable = EnvRestore::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
 
-    unsafe {
-        // Force spill path and avoid background drain so acceptance is WAL-backed.
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "16MB");
-        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
-    }
+    // Force spill path and avoid background drain so acceptance is WAL-backed.
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "16MB");
+    set_test_env("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
@@ -3174,9 +3177,7 @@ fn repeated_graceful_restarts_during_upload_replay_are_idempotent() {
     meta.set_format_info(&offline_info).unwrap();
 
     install_zeroio_replay_offline_env();
-    unsafe {
-        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "60000");
-    }
+    set_test_env("STUDIOFS_UPLOAD_DELAY_MS", "60000");
 
     let payload = vec![0xA5u8; 512 * 1024];
     let ino = {
@@ -3313,12 +3314,10 @@ fn remote_clients_see_uploading_marker_without_precise_progress() {
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
     let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
     let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "16MB");
-        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
-        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
-    }
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "16MB");
+    set_test_env("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
+    set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
 
     let writer_tmp = tempfile::tempdir().unwrap();
     let writer_db = writer_tmp.path().join("writer.redb");
@@ -3367,12 +3366,10 @@ fn remote_open_on_uploading_new_file_returns_transient_unavailable() {
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
     let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
     let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "16MB");
-        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
-        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
-    }
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "16MB");
+    set_test_env("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
+    set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
 
     let writer_tmp = tempfile::tempdir().unwrap();
     let writer_db = writer_tmp.path().join("writer.redb");
@@ -3427,12 +3424,10 @@ fn local_reads_do_not_surface_remote_pending_during_final_upload_transition() {
     let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
     let _restore_upload_workers = ScopedEnvVar::capture("STUDIOFS_UPLOAD_WORKER_COUNT");
     apply_test_online_s3_env();
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "50");
-        std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
-    }
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+    set_test_env("STUDIOFS_UPLOAD_DELAY_MS", "50");
+    set_test_env("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
 
     let boot_rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -3535,10 +3530,8 @@ fn remote_clients_keep_previous_committed_version_during_update() {
     let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
     let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
     let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-    }
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "64MB");
 
     let boot_rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -3588,12 +3581,10 @@ fn remote_clients_keep_previous_committed_version_during_update() {
         rt.shutdown_background();
     }
 
-    unsafe {
-        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
-    }
+    set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+    set_test_env("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -3641,15 +3632,13 @@ fn atomic_switch_to_new_incarnation_after_full_commit() {
     let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
     let _restore_upload_workers = ScopedEnvVar::capture("STUDIOFS_UPLOAD_WORKER_COUNT");
     apply_test_online_s3_env();
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-        std::env::remove_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
-        std::env::remove_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
-        std::env::remove_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
-        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "250");
-        std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
-    }
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+    remove_test_env("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
+    remove_test_env("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
+    remove_test_env("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
+    set_test_env("STUDIOFS_UPLOAD_DELAY_MS", "250");
+    set_test_env("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
 
     let boot_rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -3786,12 +3775,10 @@ fn remote_snapshot_reads_nested_file_after_temp_rename_publish() {
     let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
     let _restore_upload_workers = ScopedEnvVar::capture("STUDIOFS_UPLOAD_WORKER_COUNT");
     apply_test_online_s3_env();
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "50");
-        std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
-    }
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+    set_test_env("STUDIOFS_UPLOAD_DELAY_MS", "50");
+    set_test_env("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
 
     let boot_rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -3881,12 +3868,10 @@ fn remote_snapshot_switches_nested_overwrite_to_replacement_inode() {
     let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
     let _restore_upload_workers = ScopedEnvVar::capture("STUDIOFS_UPLOAD_WORKER_COUNT");
     apply_test_online_s3_env();
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "50");
-        std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
-    }
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+    set_test_env("STUDIOFS_UPLOAD_DELAY_MS", "50");
+    set_test_env("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
 
     let boot_rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -4004,13 +3989,11 @@ fn remote_attr_cache_refreshes_after_nested_publish_sync() {
     let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
     let _restore_upload_workers = ScopedEnvVar::capture("STUDIOFS_UPLOAD_WORKER_COUNT");
     apply_test_online_s3_env();
-    unsafe {
-        std::env::set_var("STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS", "50");
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "250");
-        std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
-    }
+    set_test_env("STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS", "50");
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+    set_test_env("STUDIOFS_UPLOAD_DELAY_MS", "250");
+    set_test_env("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
 
     let writer_tmp = tempfile::tempdir().unwrap();
     let writer_db = writer_tmp.path().join("meta-a.redb");
@@ -4125,9 +4108,7 @@ fn pg_backed_flock_blocks_conflicting_peer_until_unlock() {
     };
     let _restore_sync = ScopedEnvVar::capture("STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS");
     apply_test_online_s3_env();
-    unsafe {
-        std::env::set_var("STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS", "50");
-    }
+    set_test_env("STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS", "50");
 
     let writer_tmp = tempfile::tempdir().unwrap();
     let writer_db = writer_tmp.path().join("meta-a.redb");
@@ -4389,16 +4370,17 @@ fn test_crash_recovery_replays_local_committed_block_before_remote_fetch() {
 
 struct ScopedEnvVar {
     key: &'static str,
-    old: Option<String>,
+    old: Option<Option<String>>,
     _env_lock: ReentrantMutexGuard<'static, ()>,
 }
 
 impl ScopedEnvVar {
     fn capture(key: &'static str) -> Self {
         let env_lock = acquire_test_env_lock();
+        let old = TEST_ENV_OVERRIDES.with(|overrides| overrides.borrow().get(key).cloned());
         Self {
             key,
-            old: std::env::var(key).ok(),
+            old,
             _env_lock: env_lock,
         }
     }
@@ -4406,13 +4388,17 @@ impl ScopedEnvVar {
 
 impl Drop for ScopedEnvVar {
     fn drop(&mut self) {
-        unsafe {
-            if let Some(value) = &self.old {
-                std::env::set_var(self.key, value);
-            } else {
-                std::env::remove_var(self.key);
+        TEST_ENV_OVERRIDES.with(|overrides| {
+            let mut overrides = overrides.borrow_mut();
+            match self.old.take() {
+                Some(value) => {
+                    overrides.insert(self.key, value);
+                }
+                None => {
+                    overrides.remove(self.key);
+                }
             }
-        }
+        });
     }
 }
 
@@ -4522,9 +4508,8 @@ fn env_read_helpers_wait_for_scoped_env_mutations() {
     let writer_release = Arc::clone(&release);
     let writer = thread::spawn(move || {
         let _restore = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
-        unsafe {
-            std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        }
+        set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+
         writer_ready.wait();
         writer_release.wait();
     });
@@ -4554,9 +4539,7 @@ fn env_read_helpers_wait_for_scoped_env_mutations() {
 #[test]
 fn new_empty_file_stays_idle_without_pending_incarnation() {
     let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
-    unsafe {
-        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
-    }
+    set_test_env("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
@@ -4612,11 +4595,9 @@ fn committed_file_mutation_enters_updating_state() {
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
     let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
     let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "16MB");
-        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "50");
-    }
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "16MB");
+    set_test_env("STUDIOFS_UPLOAD_DELAY_MS", "50");
 
     let boot_rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -4680,10 +4661,8 @@ fn committed_file_mutation_enters_updating_state() {
         rt.shutdown_background();
     }
 
-    unsafe {
-        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
-        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "60000");
-    }
+    set_test_env("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
+    set_test_env("STUDIOFS_UPLOAD_DELAY_MS", "60000");
 
     {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -4733,13 +4712,11 @@ fn published_file_returns_to_idle_state_and_invalidates_cached_attr_immediately(
     let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
     let _restore_upload_workers = ScopedEnvVar::capture("STUDIOFS_UPLOAD_WORKER_COUNT");
     apply_test_online_s3_env();
-    unsafe {
-        std::env::set_var("STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS", "60000");
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "200");
-        std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
-    }
+    set_test_env("STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS", "60000");
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+    set_test_env("STUDIOFS_UPLOAD_DELAY_MS", "200");
+    set_test_env("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
 
     let boot_rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -4837,10 +4814,8 @@ fn local_reads_prefer_pending_overlay_over_committed_base() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
     let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "16MB");
-    }
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "16MB");
 
     let boot_rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -4904,9 +4879,7 @@ fn local_reads_prefer_pending_overlay_over_committed_base() {
         rt.shutdown_background();
     }
 
-    unsafe {
-        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
-    }
+    set_test_env("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
 
     {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -4978,12 +4951,10 @@ fn committed_random_unaligned_reads_match_payload_after_publish_and_cold_reopen(
     let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
     let _restore_upload_workers = ScopedEnvVar::capture("STUDIOFS_UPLOAD_WORKER_COUNT");
     apply_test_online_s3_env();
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "200");
-        std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
-    }
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+    set_test_env("STUDIOFS_UPLOAD_DELAY_MS", "200");
+    set_test_env("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
 
     let boot_rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -5142,14 +5113,12 @@ fn local_reads_of_pending_incarnation_prefer_materialized_extent_over_spill() {
     let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
     let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
     let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
-    }
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+    set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+    set_test_env("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
@@ -5219,14 +5188,12 @@ fn partial_overwrite_after_materialization_reuses_pending_extent_as_write_base()
     let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
     let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
     let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
-    }
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+    set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+    set_test_env("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
@@ -5298,10 +5265,8 @@ fn single_inode_never_has_two_pending_incarnations() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
     let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "16MB");
-    }
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "16MB");
 
     let boot_rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -5366,9 +5331,7 @@ fn single_inode_never_has_two_pending_incarnations() {
         rt.shutdown_background();
     }
 
-    unsafe {
-        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
-    }
+    set_test_env("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
 
     {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -5421,14 +5384,12 @@ fn large_file_unlink_cancels_pending_uploads() {
     let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
     let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
     let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
-        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
-    }
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+    set_test_env("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+    set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
@@ -5502,14 +5463,12 @@ fn open_unlink_keeps_data_readable_while_canceling_pending_uploads() {
     let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
     let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
     let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
-        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
-    }
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+    set_test_env("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+    set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
@@ -5595,11 +5554,9 @@ fn large_file_partial_overwrite_reuploads_only_touched_extents() {
     let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
     let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
     let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-        std::env::remove_var("STUDIOFS_UPLOAD_DELAY_MS");
-    }
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+    remove_test_env("STUDIOFS_UPLOAD_DELAY_MS");
 
     let boot_rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -5646,12 +5603,11 @@ fn large_file_partial_overwrite_reuploads_only_touched_extents() {
         rt.shutdown_background();
     }
 
-    unsafe {
-        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
-    }
+    set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+    set_test_env("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+
     meta.set_format_info(&offline_info).unwrap();
 
     {
@@ -5713,11 +5669,9 @@ fn stale_upload_completion_is_ignored_after_extent_invalidate() {
     let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
     let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
     let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-        std::env::remove_var("STUDIOFS_UPLOAD_DELAY_MS");
-    }
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+    remove_test_env("STUDIOFS_UPLOAD_DELAY_MS");
 
     let boot_rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -5765,12 +5719,11 @@ fn stale_upload_completion_is_ignored_after_extent_invalidate() {
         rt.shutdown_background();
     }
 
-    unsafe {
-        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
-    }
+    set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+    set_test_env("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+
     meta.set_format_info(&offline_info).unwrap();
 
     {
@@ -5819,12 +5772,10 @@ fn stale_upload_completion_is_ignored_after_extent_invalidate() {
         rt.shutdown_background();
     }
 
-    unsafe {
-        apply_test_online_s3_env();
-        std::env::remove_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
-        std::env::remove_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
-        std::env::remove_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
-    }
+    apply_test_online_s3_env();
+    remove_test_env("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
+    remove_test_env("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
+    remove_test_env("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
     meta.set_format_info(&online_info).unwrap();
 
     {
@@ -5876,14 +5827,12 @@ fn large_file_rename_does_not_restart_or_duplicate_uploads() {
     let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
     let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
     let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
-        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
-    }
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+    set_test_env("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+    set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
@@ -6065,10 +6014,8 @@ fn update_base_graph_reuses_untouched_committed_extents() {
     let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
     let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
     let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-    }
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "64MB");
 
     let boot_rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -6114,12 +6061,11 @@ fn update_base_graph_reuses_untouched_committed_extents() {
         rt.shutdown_background();
     }
 
-    unsafe {
-        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
-    }
+    set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+    set_test_env("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+
     meta.set_format_info(&offline_info).unwrap();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -6178,15 +6124,13 @@ fn restart_replays_only_live_pending_extents() {
     let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
     let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
     let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
-        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
-    }
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+    set_test_env("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
+    set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+    set_test_env("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
@@ -6238,9 +6182,7 @@ fn restart_replays_only_live_pending_extents() {
         rt.shutdown_background();
     }
 
-    unsafe {
-        std::env::remove_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
-    }
+    remove_test_env("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -6286,11 +6228,9 @@ fn recovered_pending_uploads_publish_new_file_after_restart() {
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
     let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
 
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "60000");
-    }
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+    set_test_env("STUDIOFS_UPLOAD_DELAY_MS", "60000");
 
     let boot_rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -6353,9 +6293,7 @@ fn recovered_pending_uploads_publish_new_file_after_restart() {
         rt.shutdown_background();
     }
 
-    unsafe {
-        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "0");
-    }
+    set_test_env("STUDIOFS_UPLOAD_DELAY_MS", "0");
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -6413,12 +6351,10 @@ fn published_file_remains_readable_after_cache_wipe_and_restart() {
     let _restore_upload_workers = ScopedEnvVar::capture("STUDIOFS_UPLOAD_WORKER_COUNT");
     apply_test_online_s3_env();
 
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "0");
-        std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
-    }
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+    set_test_env("STUDIOFS_UPLOAD_DELAY_MS", "0");
+    set_test_env("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
 
     let boot_rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -6701,11 +6637,9 @@ fn startup_recovery_replays_fragmented_regular_file_graph_without_quarantine() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
     let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "60000");
-    }
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+    set_test_env("STUDIOFS_UPLOAD_DELAY_MS", "60000");
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
@@ -6837,14 +6771,12 @@ fn offline_s3_does_not_break_local_read_after_write() {
     let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
     let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
     let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
-    }
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+    set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+    set_test_env("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
@@ -6915,14 +6847,12 @@ fn local_payload_restart_with_offline_s3_replays_dirty_uploads_from_index() {
     let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
     let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
     let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
-    }
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+    set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+    set_test_env("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
@@ -7051,10 +6981,8 @@ fn local_payload_restart_with_offline_s3_replays_dirty_uploads_from_index() {
 fn upload_completion_batching_does_not_change_visibility_contract() {
     let _env = ScopedTestEnv::new();
     apply_test_online_s3_env();
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-    }
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "64MB");
 
     let boot_rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -7100,14 +7028,13 @@ fn upload_completion_batching_does_not_change_visibility_contract() {
         rt.shutdown_background();
     }
 
-    unsafe {
-        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
-        std::env::remove_var("STUDIOFS_UPLOAD_DELAY_MS");
-        std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
-    }
+    set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+    set_test_env("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+    remove_test_env("STUDIOFS_UPLOAD_DELAY_MS");
+    set_test_env("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
+
     meta.set_format_info(&offline_info).unwrap();
 
     {
@@ -7149,14 +7076,12 @@ fn upload_completion_batching_does_not_change_visibility_contract() {
         rt.shutdown_background();
     }
 
-    unsafe {
-        apply_test_online_s3_env();
-        std::env::remove_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
-        std::env::remove_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
-        std::env::remove_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
-        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "75");
-        std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
-    }
+    apply_test_online_s3_env();
+    remove_test_env("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
+    remove_test_env("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
+    remove_test_env("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
+    set_test_env("STUDIOFS_UPLOAD_DELAY_MS", "75");
+    set_test_env("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
     meta.set_format_info(&online_info).unwrap();
 
     {
@@ -7260,18 +7185,16 @@ fn slow_s3_does_not_stall_local_reads_and_writes() {
     let _restore_upload_workers = ScopedEnvVar::capture("STUDIOFS_UPLOAD_WORKER_COUNT");
     let _restore_qos_materialize = ScopedEnvVar::capture("STUDIOFS_QOS_MATERIALIZE_SLOTS");
     let _restore_qos_commit = ScopedEnvVar::capture("STUDIOFS_QOS_COMMIT_SLOTS");
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "8MB");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "128MB");
-        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
-        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "0");
-        std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "2");
-        std::env::set_var("STUDIOFS_QOS_MATERIALIZE_SLOTS", "1");
-        std::env::set_var("STUDIOFS_QOS_COMMIT_SLOTS", "1");
-    }
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "8MB");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "128MB");
+    set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+    set_test_env("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+    set_test_env("STUDIOFS_UPLOAD_DELAY_MS", "0");
+    set_test_env("STUDIOFS_UPLOAD_WORKER_COUNT", "2");
+    set_test_env("STUDIOFS_QOS_MATERIALIZE_SLOTS", "1");
+    set_test_env("STUDIOFS_QOS_COMMIT_SLOTS", "1");
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
@@ -7371,18 +7294,16 @@ fn upload_backlog_does_not_create_local_backpressure_after_write_commit() {
     roomy_meta.set_format_info(&roomy_info).unwrap();
     let payload = vec![0x55u8; roomy_info.block_size as usize];
 
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-        std::env::remove_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
-        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
-        std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
-        std::env::set_var("STUDIOFS_QOS_MATERIALIZE_SLOTS", "1");
-        std::env::set_var("STUDIOFS_QOS_COMMIT_SLOTS", "1");
-    }
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+    remove_test_env("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
+    set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+    set_test_env("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+    set_test_env("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
+    set_test_env("STUDIOFS_QOS_MATERIALIZE_SLOTS", "1");
+    set_test_env("STUDIOFS_QOS_COMMIT_SLOTS", "1");
 
     {
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -7436,21 +7357,19 @@ fn upload_backlog_does_not_create_local_backpressure_after_write_commit() {
     tight_meta.set_format_info(&tight_info).unwrap();
     let partial_payload = vec![0x44u8; (tight_info.block_size as usize) / 2];
 
-    unsafe {
-        std::env::set_var(
-            "STUDIOFS_MAX_DIRTY_BYTES",
-            partial_payload.len().to_string(),
-        );
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "0");
-        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
-        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
-        std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
-        std::env::set_var("STUDIOFS_QOS_MATERIALIZE_SLOTS", "1");
-        std::env::set_var("STUDIOFS_QOS_COMMIT_SLOTS", "1");
-    }
+    set_test_env(
+        "STUDIOFS_MAX_DIRTY_BYTES",
+        partial_payload.len().to_string(),
+    );
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "0");
+    set_test_env("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
+    set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+    set_test_env("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+    set_test_env("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
+    set_test_env("STUDIOFS_QOS_MATERIALIZE_SLOTS", "1");
+    set_test_env("STUDIOFS_QOS_COMMIT_SLOTS", "1");
 
     {
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -7509,13 +7428,11 @@ fn single_large_file_upload_does_not_starve_small_foreground_io() {
     let _restore_upload_workers = ScopedEnvVar::capture("STUDIOFS_UPLOAD_WORKER_COUNT");
     let _restore_qos_materialize = ScopedEnvVar::capture("STUDIOFS_QOS_MATERIALIZE_SLOTS");
 
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "256MB");
-        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "400");
-        std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
-        std::env::set_var("STUDIOFS_QOS_MATERIALIZE_SLOTS", "1");
-    }
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "256MB");
+    set_test_env("STUDIOFS_UPLOAD_DELAY_MS", "400");
+    set_test_env("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
+    set_test_env("STUDIOFS_QOS_MATERIALIZE_SLOTS", "1");
 
     let boot_rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -7604,13 +7521,11 @@ fn recovery_after_offline_s3_preserves_local_accepted_view() {
     let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
     let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
     let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
-    }
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+    set_test_env("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
 
     let boot_rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -7654,9 +7569,8 @@ fn recovery_after_offline_s3_preserves_local_accepted_view() {
         ino
     };
 
-    unsafe {
-        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
-    }
+    set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+
     meta.set_format_info(&offline_info).unwrap();
 
     {
@@ -7750,17 +7664,15 @@ fn twenty_four_hour_soak_no_global_fs_stall() {
     let _restore_upload_workers = ScopedEnvVar::capture("STUDIOFS_UPLOAD_WORKER_COUNT");
     let _restore_qos_materialize = ScopedEnvVar::capture("STUDIOFS_QOS_MATERIALIZE_SLOTS");
     let _restore_qos_commit = ScopedEnvVar::capture("STUDIOFS_QOS_COMMIT_SLOTS");
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "256MB");
-        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
-        std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "2");
-        std::env::set_var("STUDIOFS_QOS_MATERIALIZE_SLOTS", "1");
-        std::env::set_var("STUDIOFS_QOS_COMMIT_SLOTS", "1");
-    }
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "256MB");
+    set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+    set_test_env("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+    set_test_env("STUDIOFS_UPLOAD_WORKER_COUNT", "2");
+    set_test_env("STUDIOFS_QOS_MATERIALIZE_SLOTS", "1");
+    set_test_env("STUDIOFS_QOS_COMMIT_SLOTS", "1");
 
     let iterations = parse_env_usize("STUDIOFS_SOAK_ITERATIONS").unwrap_or(200);
     let max_op_ms = parse_env_u64("STUDIOFS_SOAK_MAX_OP_MS").unwrap_or(1500);
@@ -7851,10 +7763,8 @@ fn test_ingress_prefers_spill_before_backpressure() {
 
     let _restore_dirty = EnvRestore::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = EnvRestore::capture("STUDIOFS_MAX_SPILL_BYTES");
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "16MB");
-    }
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "16MB");
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
@@ -7908,10 +7818,8 @@ fn test_single_mode_ingress_write_path_materializes_local_payloads() {
     type EnvRestore = ScopedEnvVar;
     let _restore_dirty = EnvRestore::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = EnvRestore::capture("STUDIOFS_MAX_SPILL_BYTES");
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "16MB");
-    }
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "16MB");
 
     fn build_vfs(tmp: &tempfile::TempDir, volume_suffix: &str) -> (Arc<StudioVfs>, Vec<u8>) {
         let db_path = tmp.path().join("meta.redb");
@@ -8073,12 +7981,10 @@ fn test_ingress_pressure_reflects_buffered_partial_write_until_flush() {
     let _restore_spill = EnvRestore::capture("STUDIOFS_MAX_SPILL_BYTES");
     let _restore_flush = EnvRestore::capture("STUDIOFS_SLAB_FLUSH_INTERVAL_MS");
     let _restore_assist = EnvRestore::capture("STUDIOFS_FOREGROUND_DRAIN_ASSIST");
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "512KB");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "512KB");
-        std::env::set_var("STUDIOFS_SLAB_FLUSH_INTERVAL_MS", "200");
-        std::env::set_var("STUDIOFS_FOREGROUND_DRAIN_ASSIST", "0");
-    }
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "512KB");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "512KB");
+    set_test_env("STUDIOFS_SLAB_FLUSH_INTERVAL_MS", "200");
+    set_test_env("STUDIOFS_FOREGROUND_DRAIN_ASSIST", "0");
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
@@ -8157,12 +8063,10 @@ fn test_ingress_backpressure_wait_time_accumulates_until_drain() {
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
     let _restore_flush_interval = ScopedEnvVar::capture("STUDIOFS_SLAB_FLUSH_INTERVAL_MS");
     let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
-    unsafe {
-        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "512KB");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "512KB");
-        std::env::set_var("STUDIOFS_SLAB_FLUSH_INTERVAL_MS", "250");
-    }
+    set_test_env("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "512KB");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "512KB");
+    set_test_env("STUDIOFS_SLAB_FLUSH_INTERVAL_MS", "250");
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
@@ -9363,9 +9267,7 @@ async fn test_xattr_multiple_attrs() {
 async fn test_xattr_limit_exact_and_exceeds_boundaries() {
     ensure_bucket().await;
     let _restore_xattr_limit = ScopedEnvVar::capture("STUDIOFS_XATTR_MAX_BYTES");
-    unsafe {
-        std::env::set_var("STUDIOFS_XATTR_MAX_BYTES", "16");
-    }
+    set_test_env("STUDIOFS_XATTR_MAX_BYTES", "16");
 
     let tmp = tempfile::tempdir().unwrap();
     let vfs = make_vfs(&tmp, "xattr_limit_boundary");
@@ -9393,9 +9295,7 @@ async fn test_xattr_limit_exact_and_exceeds_boundaries() {
 async fn test_xattr_resource_fork_honors_limit() {
     ensure_bucket().await;
     let _restore_xattr_limit = ScopedEnvVar::capture("STUDIOFS_XATTR_MAX_BYTES");
-    unsafe {
-        std::env::set_var("STUDIOFS_XATTR_MAX_BYTES", "8");
-    }
+    set_test_env("STUDIOFS_XATTR_MAX_BYTES", "8");
 
     let tmp = tempfile::tempdir().unwrap();
     let vfs = make_vfs(&tmp, "xattr_limit_resource_fork");
@@ -9691,10 +9591,8 @@ async fn test_write_at_exact_block_boundary_transition() {
 fn flush_with_offline_s3_keeps_data_locally_committed_and_queued() {
     let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
-    unsafe {
-        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1048576");
-    }
+    set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1048576");
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
@@ -9788,9 +9686,7 @@ fn make_local_zeroio_test_vfs(
 #[test]
 fn write_returns_after_small_new_file_is_locally_readable_until_flush() {
     let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
-    unsafe {
-        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
-    }
+    set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
@@ -9866,10 +9762,8 @@ fn write_returns_after_small_new_file_is_locally_readable_until_flush() {
 fn overwrite_of_published_file_is_locally_readable_without_flush() {
     let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
-    unsafe {
-        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
-        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "60000");
-    }
+    set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+    set_test_env("STUDIOFS_UPLOAD_DELAY_MS", "60000");
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
@@ -9946,10 +9840,8 @@ fn overwrite_of_published_file_is_locally_readable_without_flush() {
 fn truncate_of_published_file_keeps_committed_size_and_pending_incarnation() {
     let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
-    unsafe {
-        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
-        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "60000");
-    }
+    set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+    set_test_env("STUDIOFS_UPLOAD_DELAY_MS", "60000");
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
@@ -10051,9 +9943,7 @@ fn truncate_of_published_file_keeps_committed_size_and_pending_incarnation() {
 #[test]
 fn append_after_create_stays_buffered_until_flush() {
     let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
-    unsafe {
-        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
-    }
+    set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
@@ -10124,9 +10014,7 @@ fn append_after_create_stays_buffered_until_flush() {
 fn truncate_after_create_is_locally_durable_without_flush() {
     let _test_env = ScopedTestEnv::new();
     let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
-    unsafe {
-        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
-    }
+    set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
@@ -10182,9 +10070,7 @@ fn truncate_after_create_is_locally_durable_without_flush() {
 #[test]
 fn full_block_write_with_offline_s3_stays_local_until_flush_then_queues_upload() {
     let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
-    unsafe {
-        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
-    }
+    set_test_env("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
@@ -10284,9 +10170,8 @@ fn full_block_write_with_offline_s3_stays_local_until_flush_then_queues_upload()
 #[test]
 fn write_stages_successive_full_blocks_without_waiting_for_threshold() {
     let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
-    unsafe {
-        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
-    }
+    set_test_env("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
+
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
@@ -10406,9 +10291,8 @@ fn write_stages_successive_full_blocks_without_waiting_for_threshold() {
 #[test]
 fn write_stages_full_blocks_without_explicit_flush() {
     let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
-    unsafe {
-        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
-    }
+    set_test_env("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
+
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
@@ -10481,9 +10365,8 @@ fn write_stages_full_blocks_without_explicit_flush() {
 #[test]
 fn write_stages_full_block_prefix_and_buffers_tail_until_flush() {
     let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
-    unsafe {
-        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
-    }
+    set_test_env("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
+
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
@@ -10579,9 +10462,8 @@ fn write_stages_full_block_prefix_and_buffers_tail_until_flush() {
 #[test]
 fn read_from_start_does_not_depend_on_metadata_materialization() {
     let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
-    unsafe {
-        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
-    }
+    set_test_env("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
+
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
@@ -10664,9 +10546,8 @@ fn read_from_start_does_not_depend_on_metadata_materialization() {
 fn write_stages_full_blocks_and_buffers_tail_without_buffered_relief() {
     let _test_env = ScopedTestEnv::new();
     let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
-    unsafe {
-        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
-    }
+    set_test_env("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
+
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
@@ -11244,9 +11125,8 @@ async fn test_rename_overwrite_existing_file() {
 #[ignore]
 async fn test_unlink_with_open_handle_deferred_cleanup() {
     let _env = setup_offline_sfs121_env();
-    unsafe {
-        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "60000");
-    }
+    set_test_env("STUDIOFS_UPLOAD_DELAY_MS", "60000");
+
     let tmp = tempfile::tempdir().unwrap();
     let vfs = make_vfs(&tmp, "open-unlink-gc");
 
@@ -11469,9 +11349,8 @@ async fn test_create_write_unlink_race() {
 #[ignore]
 async fn test_multiple_handles_orphan_cleanup_after_last_close() {
     let _env = setup_offline_sfs121_env();
-    unsafe {
-        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "60000");
-    }
+    set_test_env("STUDIOFS_UPLOAD_DELAY_MS", "60000");
+
     let tmp = tempfile::tempdir().unwrap();
     let vfs = make_vfs(&tmp, "multi-fh-orphan");
 
@@ -11620,13 +11499,11 @@ async fn test_xattr_on_directory() {
 #[ignore = "requires S3 backend and STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1 or valid .env"]
 fn buffered_large_file_read_succeeds_across_full_upload_lifecycle() {
     let _env = setup_online_sfs121_env();
-    unsafe {
-        // Force immediate materialization and keep the upload window open.
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "40");
-        std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
-    }
+    // Force immediate materialization and keep the upload window open.
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+    set_test_env("STUDIOFS_UPLOAD_DELAY_MS", "40");
+    set_test_env("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
@@ -11738,14 +11615,12 @@ fn buffered_large_file_read_succeeds_across_full_upload_lifecycle() {
 #[ignore = "requires S3 backend; validates foreground throughput during background upload"]
 fn sequential_foreground_read_throughput_during_upload_meets_minimum() {
     let _env = setup_online_sfs121_env();
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-        // Deliberately slow upload so the read sweep overlaps the active upload
-        // window rather than racing to beat it.
-        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "200");
-        std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
-    }
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+    // Deliberately slow upload so the read sweep overlaps the active upload
+    // window rather than racing to beat it.
+    set_test_env("STUDIOFS_UPLOAD_DELAY_MS", "200");
+    set_test_env("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
@@ -11836,12 +11711,10 @@ fn sequential_foreground_read_throughput_during_upload_meets_minimum() {
 #[ignore = "requires S3 backend; compares buffered foreground read baseline/during/post upload"]
 fn foreground_read_baseline_during_and_post_upload_are_comparable() {
     let _env = setup_online_sfs121_env();
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "200");
-        std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
-    }
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+    set_test_env("STUDIOFS_UPLOAD_DELAY_MS", "200");
+    set_test_env("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
@@ -12002,11 +11875,9 @@ fn upload_backlog_progresses_via_persisted_local_payload_reads() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
     let _restore_workers = ScopedEnvVar::capture("STUDIOFS_UPLOAD_WORKER_COUNT");
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "8MB");
-        std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
-    }
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "8MB");
+    set_test_env("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -12678,14 +12549,12 @@ async fn shutdown_with_pending_uploads_completes_within_bound() {
     let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
     let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
     let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
-    }
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+    set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+    set_test_env("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
@@ -12724,14 +12593,12 @@ async fn zeroio_shutdown_snapshot_uses_runtime_dir_without_ingress_spill() {
     let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
     let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
     let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
-    }
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+    set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+    set_test_env("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
@@ -12788,9 +12655,7 @@ async fn zeroio_shutdown_snapshot_uses_runtime_dir_without_ingress_spill() {
 #[test]
 fn zeroio_startup_removes_retired_ingress_spill_on_startup() {
     let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
-    unsafe {
-        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
-    }
+    set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
@@ -12830,9 +12695,7 @@ fn zeroio_startup_removes_retired_ingress_spill_on_startup() {
 #[test]
 fn zeroio_direct_studiovfs_new_removes_retired_ingress_spill_on_startup() {
     let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
-    unsafe {
-        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
-    }
+    set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
@@ -12886,14 +12749,12 @@ async fn ctrl_c_during_small_file_churn_does_not_hang() {
     let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
     let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
     let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
-    }
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+    set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+    set_test_env("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
@@ -12943,14 +12804,12 @@ async fn remount_after_delete_shutdown_does_not_resurrect_ghost_entry() {
     let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
     let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
     let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
-    }
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+    set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+    set_test_env("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
@@ -12996,14 +12855,12 @@ async fn unmount_after_recursive_delete_preserves_consistent_namespace() {
     let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
     let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
     let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
-    }
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+    set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+    set_test_env("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
@@ -13058,16 +12915,14 @@ async fn pending_upload_helpers_use_live_index_without_directory_scan() {
     let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
     let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
     let _restore_upload_workers = ScopedEnvVar::capture("STUDIOFS_UPLOAD_WORKER_COUNT");
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
-        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "60000");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
-        std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
-    }
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+    set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+    set_test_env("STUDIOFS_UPLOAD_DELAY_MS", "60000");
+    set_test_env("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+    set_test_env("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+    set_test_env("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
@@ -13423,9 +13278,7 @@ async fn acl_read_only_denies_writes_but_allows_reads() {
 #[tokio::test]
 async fn acl_wildcard_applies_as_fallback_for_specific_principal() {
     let _restore_principal = ScopedEnvVar::capture("STUDIOFS_PRINCIPAL");
-    unsafe {
-        std::env::set_var("STUDIOFS_PRINCIPAL", "alice");
-    }
+    set_test_env("STUDIOFS_PRINCIPAL", "alice");
 
     let tmp = tempfile::tempdir().unwrap();
     let vfs = make_vfs(&tmp, "acl-wildcard-fallback");
@@ -13459,12 +13312,10 @@ fn local_reads_through_upload_with_partial_tail_block() {
     let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
     let _restore_upload_workers = ScopedEnvVar::capture("STUDIOFS_UPLOAD_WORKER_COUNT");
     apply_test_online_s3_env();
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "50");
-        std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
-    }
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+    set_test_env("STUDIOFS_UPLOAD_DELAY_MS", "50");
+    set_test_env("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
 
     let boot_rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -13583,12 +13434,10 @@ fn concurrent_reads_through_upload_finalization() {
     let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
     let _restore_upload_workers = ScopedEnvVar::capture("STUDIOFS_UPLOAD_WORKER_COUNT");
     apply_test_online_s3_env();
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "30");
-        std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
-    }
+    set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
+    set_test_env("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+    set_test_env("STUDIOFS_UPLOAD_DELAY_MS", "30");
+    set_test_env("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
 
     let boot_rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()

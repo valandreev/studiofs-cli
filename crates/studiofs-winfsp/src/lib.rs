@@ -307,9 +307,42 @@ fn parse_geometry_env() -> (u16, u16) {
     (sector_size, sectors)
 }
 
+fn mount_option_env_var(key: &str) -> Option<String> {
+    #[cfg(test)]
+    if let Some(value) = test_mount_option_env_var(key) {
+        return value;
+    }
+    std::env::var(key).ok()
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_MOUNT_OPTION_ENV: std::cell::RefCell<std::collections::HashMap<&'static str, Option<String>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+#[cfg(test)]
+fn test_mount_option_env_var(key: &str) -> Option<Option<String>> {
+    TEST_MOUNT_OPTION_ENV.with(|env| env.borrow().get(key).cloned())
+}
+
+#[cfg(test)]
+fn set_test_mount_option_env(key: &'static str, value: impl Into<String>) {
+    TEST_MOUNT_OPTION_ENV.with(|env| {
+        env.borrow_mut().insert(key, Some(value.into()));
+    });
+}
+
+#[cfg(test)]
+fn remove_test_mount_option_env(key: &'static str) {
+    TEST_MOUNT_OPTION_ENV.with(|env| {
+        env.borrow_mut().remove(key);
+    });
+}
+
 fn parse_positive_u32_env(key: &str, default: u32) -> u32 {
-    match std::env::var(key) {
-        Ok(raw) => {
+    match mount_option_env_var(key) {
+        Some(raw) => {
             let trimmed = raw.trim();
             match trimmed.parse::<u32>() {
                 Ok(value) if value > 0 => value,
@@ -334,13 +367,13 @@ fn parse_positive_u32_env(key: &str, default: u32) -> u32 {
                 }
             }
         }
-        Err(_) => default,
+        None => default,
     }
 }
 
 fn parse_timeout_env(key: &str, default: u32) -> u32 {
-    match std::env::var(key) {
-        Ok(raw) => {
+    match mount_option_env_var(key) {
+        Some(raw) => {
             let trimmed = raw.trim();
             if trimmed.eq_ignore_ascii_case("-1") || trimmed.eq_ignore_ascii_case("max") {
                 return u32::MAX;
@@ -359,13 +392,13 @@ fn parse_timeout_env(key: &str, default: u32) -> u32 {
                 }
             }
         }
-        Err(_) => default,
+        None => default,
     }
 }
 
 fn parse_bool_env(key: &str, default: bool) -> bool {
-    match std::env::var(key) {
-        Ok(raw) => {
+    match mount_option_env_var(key) {
+        Some(raw) => {
             let trimmed = raw.trim();
             if trimmed.eq_ignore_ascii_case("1")
                 || trimmed.eq_ignore_ascii_case("true")
@@ -389,7 +422,7 @@ fn parse_bool_env(key: &str, default: bool) -> bool {
             );
             default
         }
-        Err(_) => default,
+        None => default,
     }
 }
 
@@ -860,8 +893,6 @@ unsafe extern "system" fn ctrl_handler(_ctrl_type: u32) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
     use super::{
         DEFAULT_ALLOCATION_UNIT_SIZE, DEFAULT_ALLOW_OPEN_IN_KERNEL_MODE,
         DEFAULT_DIR_INFO_TIMEOUT_MS, DEFAULT_FILE_INFO_TIMEOUT_MS,
@@ -869,11 +900,9 @@ mod tests {
         DEFAULT_SECTORS_PER_ALLOCATION_UNIT, DEFAULT_VOLUME_INFO_TIMEOUT_MS, MountOptionError,
         WinfspShutdownHost, canonical_drive_mount_point, default_dispatcher_threads,
         is_drive_root_mount_point, mount_manager_mount_point, parse_mount_options,
-        stop_host_before_vfs_shutdown, stop_host_before_vfs_shutdown_and_process_exit,
-        winfsp_dll_stem_for_arch,
+        remove_test_mount_option_env, set_test_mount_option_env, stop_host_before_vfs_shutdown,
+        stop_host_before_vfs_shutdown_and_process_exit, winfsp_dll_stem_for_arch,
     };
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
     #[test]
     fn parse_mount_options_rejects_invalid_labels() {
         assert_eq!(
@@ -888,18 +917,14 @@ mod tests {
 
     #[test]
     fn parse_mount_options_normalizes_and_sets_defaults() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
-        // SAFETY: Tests are single-threaded via `_guard` and temporarily mutate
-        // process environment variables for deterministic parsing behavior.
-        unsafe {
-            std::env::remove_var("STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS");
-            std::env::remove_var("STUDIOFS_WINFSP_DIR_INFO_TIMEOUT_MS");
-            std::env::remove_var("STUDIOFS_WINFSP_VOLUME_INFO_TIMEOUT_MS");
-            std::env::remove_var("STUDIOFS_WINFSP_SECTOR_SIZE");
-            std::env::remove_var("STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE");
-            std::env::remove_var("STUDIOFS_WINFSP_ALLOW_OPEN_IN_KERNEL_MODE");
-            std::env::remove_var("STUDIOFS_WINFSP_FLUSH_AND_PURGE_ON_CLEANUP");
-        }
+        remove_test_mount_option_env("STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS");
+        remove_test_mount_option_env("STUDIOFS_WINFSP_DIR_INFO_TIMEOUT_MS");
+        remove_test_mount_option_env("STUDIOFS_WINFSP_VOLUME_INFO_TIMEOUT_MS");
+        remove_test_mount_option_env("STUDIOFS_WINFSP_SECTOR_SIZE");
+        remove_test_mount_option_env("STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE");
+        remove_test_mount_option_env("STUDIOFS_WINFSP_ALLOW_OPEN_IN_KERNEL_MODE");
+        remove_test_mount_option_env("STUDIOFS_WINFSP_FLUSH_AND_PURGE_ON_CLEANUP");
+
         let opts = parse_mount_options("  StudioFS  ").expect("options");
         assert_eq!(opts.volume_label, "StudioFS");
         assert_eq!(opts.file_info_timeout_ms, DEFAULT_FILE_INFO_TIMEOUT_MS);
@@ -923,12 +948,7 @@ mod tests {
 
     #[test]
     fn parse_mount_options_defaults_to_non_persistent_acls() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
-        // SAFETY: Tests are single-threaded via `_guard` and temporarily mutate
-        // process environment variables for deterministic parsing behavior.
-        unsafe {
-            std::env::remove_var("STUDIOFS_WINFSP_PERSISTENT_ACLS");
-        }
+        remove_test_mount_option_env("STUDIOFS_WINFSP_PERSISTENT_ACLS");
 
         let opts = parse_mount_options("StudioFS").expect("options");
         assert_eq!(opts.persistent_acls, DEFAULT_PERSISTENT_ACLS);
@@ -937,12 +957,7 @@ mod tests {
 
     #[test]
     fn parse_mount_options_allows_persistent_acls_override() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
-        // SAFETY: Tests are single-threaded via `_guard` and temporarily mutate
-        // process environment variables for deterministic parsing behavior.
-        unsafe {
-            std::env::set_var("STUDIOFS_WINFSP_PERSISTENT_ACLS", "1");
-        }
+        set_test_mount_option_env("STUDIOFS_WINFSP_PERSISTENT_ACLS", "1");
 
         let opts = parse_mount_options("StudioFS").expect("options");
         assert!(
@@ -950,21 +965,12 @@ mod tests {
             "explicit WinFSP boolean override should be able to advertise persistent ACLs"
         );
 
-        // SAFETY: Tests are single-threaded via `_guard` and restore environment
-        // variables that were written earlier in the test.
-        unsafe {
-            std::env::remove_var("STUDIOFS_WINFSP_PERSISTENT_ACLS");
-        }
+        remove_test_mount_option_env("STUDIOFS_WINFSP_PERSISTENT_ACLS");
     }
 
     #[test]
     fn parse_mount_options_defaults_to_winfsp_cache_manager_file_info_timeout() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
-        // SAFETY: Tests are single-threaded via `_guard` and temporarily mutate
-        // process environment variables for deterministic parsing behavior.
-        unsafe {
-            std::env::remove_var("STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS");
-        }
+        remove_test_mount_option_env("STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS");
 
         let opts = parse_mount_options("StudioFS").expect("options");
         assert_eq!(opts.file_info_timeout_ms, u32::MAX);
@@ -972,56 +978,33 @@ mod tests {
 
     #[test]
     fn parse_mount_options_allows_env_timeout_overrides() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
-        // SAFETY: Tests are single-threaded via `_guard` and temporarily mutate
-        // process environment variables for deterministic parsing behavior.
-        unsafe {
-            std::env::set_var("STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS", "240000");
-            std::env::set_var("STUDIOFS_WINFSP_DIR_INFO_TIMEOUT_MS", "-1");
-            std::env::set_var("STUDIOFS_WINFSP_VOLUME_INFO_TIMEOUT_MS", "480000");
-        }
+        set_test_mount_option_env("STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS", "240000");
+        set_test_mount_option_env("STUDIOFS_WINFSP_DIR_INFO_TIMEOUT_MS", "-1");
+        set_test_mount_option_env("STUDIOFS_WINFSP_VOLUME_INFO_TIMEOUT_MS", "480000");
 
         let opts = parse_mount_options("StudioFS").expect("options");
         assert_eq!(opts.file_info_timeout_ms, 240_000);
         assert_eq!(opts.dir_info_timeout_ms, u32::MAX);
         assert_eq!(opts.volume_info_timeout_ms, 480_000);
 
-        // SAFETY: Tests are single-threaded via `_guard` and restore environment
-        // variables that were written earlier in the test.
-        unsafe {
-            std::env::remove_var("STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS");
-            std::env::remove_var("STUDIOFS_WINFSP_DIR_INFO_TIMEOUT_MS");
-            std::env::remove_var("STUDIOFS_WINFSP_VOLUME_INFO_TIMEOUT_MS");
-        }
+        remove_test_mount_option_env("STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS");
+        remove_test_mount_option_env("STUDIOFS_WINFSP_DIR_INFO_TIMEOUT_MS");
+        remove_test_mount_option_env("STUDIOFS_WINFSP_VOLUME_INFO_TIMEOUT_MS");
     }
 
     #[test]
     fn parse_mount_options_invalid_env_value_falls_back_to_default() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
-        // SAFETY: Tests are single-threaded via `_guard` and temporarily mutate
-        // process environment variables for deterministic parsing behavior.
-        unsafe {
-            std::env::set_var("STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS", "abc");
-        }
+        set_test_mount_option_env("STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS", "abc");
 
         let opts = parse_mount_options("StudioFS").expect("options");
         assert_eq!(opts.file_info_timeout_ms, DEFAULT_FILE_INFO_TIMEOUT_MS);
 
-        // SAFETY: Tests are single-threaded via `_guard` and restore environment
-        // variables that were written earlier in the test.
-        unsafe {
-            std::env::remove_var("STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS");
-        }
+        remove_test_mount_option_env("STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS");
     }
 
     #[test]
     fn parse_mount_options_allows_active_bool_overrides() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
-        // SAFETY: Tests are single-threaded via `_guard` and temporarily mutate
-        // process environment variables for deterministic parsing behavior.
-        unsafe {
-            std::env::set_var("STUDIOFS_WINFSP_ALLOW_OPEN_IN_KERNEL_MODE", "0");
-        }
+        set_test_mount_option_env("STUDIOFS_WINFSP_ALLOW_OPEN_IN_KERNEL_MODE", "0");
 
         let opts = parse_mount_options("StudioFS").expect("options");
         assert!(
@@ -1029,21 +1012,12 @@ mod tests {
             "active WinFSP boolean overrides should still be honored"
         );
 
-        // SAFETY: Tests are single-threaded via `_guard` and restore environment
-        // variables that were written earlier in the test.
-        unsafe {
-            std::env::remove_var("STUDIOFS_WINFSP_ALLOW_OPEN_IN_KERNEL_MODE");
-        }
+        remove_test_mount_option_env("STUDIOFS_WINFSP_ALLOW_OPEN_IN_KERNEL_MODE");
     }
 
     #[test]
     fn parse_mount_options_allows_flush_and_purge_on_cleanup_override() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
-        // SAFETY: Tests are single-threaded via `_guard` and temporarily mutate
-        // process environment variables for deterministic parsing behavior.
-        unsafe {
-            std::env::set_var("STUDIOFS_WINFSP_FLUSH_AND_PURGE_ON_CLEANUP", "1");
-        }
+        set_test_mount_option_env("STUDIOFS_WINFSP_FLUSH_AND_PURGE_ON_CLEANUP", "1");
 
         let opts = parse_mount_options("StudioFS").expect("options");
         assert!(
@@ -1051,21 +1025,12 @@ mod tests {
             "WinFSP cleanup flush/purge override should be honored"
         );
 
-        // SAFETY: Tests are single-threaded via `_guard` and restore environment
-        // variables that were written earlier in the test.
-        unsafe {
-            std::env::remove_var("STUDIOFS_WINFSP_FLUSH_AND_PURGE_ON_CLEANUP");
-        }
+        remove_test_mount_option_env("STUDIOFS_WINFSP_FLUSH_AND_PURGE_ON_CLEANUP");
     }
 
     #[test]
     fn parse_mount_options_invalid_bool_falls_back_to_default() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
-        // SAFETY: Tests are single-threaded via `_guard` and temporarily mutate
-        // process environment variables for deterministic parsing behavior.
-        unsafe {
-            std::env::set_var("STUDIOFS_WINFSP_ALLOW_OPEN_IN_KERNEL_MODE", "maybe");
-        }
+        set_test_mount_option_env("STUDIOFS_WINFSP_ALLOW_OPEN_IN_KERNEL_MODE", "maybe");
 
         let opts = parse_mount_options("StudioFS").expect("options");
         assert_eq!(
@@ -1073,44 +1038,26 @@ mod tests {
             DEFAULT_ALLOW_OPEN_IN_KERNEL_MODE
         );
 
-        // SAFETY: Tests are single-threaded via `_guard` and restore environment
-        // variables that were written earlier in the test.
-        unsafe {
-            std::env::remove_var("STUDIOFS_WINFSP_ALLOW_OPEN_IN_KERNEL_MODE");
-        }
+        remove_test_mount_option_env("STUDIOFS_WINFSP_ALLOW_OPEN_IN_KERNEL_MODE");
     }
 
     #[test]
     fn parse_mount_options_allows_geometry_overrides() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
-        // SAFETY: Tests are single-threaded via `_guard` and temporarily mutate
-        // process environment variables for deterministic parsing behavior.
-        unsafe {
-            std::env::set_var("STUDIOFS_WINFSP_SECTOR_SIZE", "4096");
-            std::env::set_var("STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE", "4194304");
-        }
+        set_test_mount_option_env("STUDIOFS_WINFSP_SECTOR_SIZE", "4096");
+        set_test_mount_option_env("STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE", "4194304");
 
         let opts = parse_mount_options("StudioFS").expect("options");
         assert_eq!(opts.sector_size, 4096);
         assert_eq!(opts.sectors_per_allocation_unit, 1024);
 
-        // SAFETY: Tests are single-threaded via `_guard` and restore environment
-        // variables that were written earlier in the test.
-        unsafe {
-            std::env::remove_var("STUDIOFS_WINFSP_SECTOR_SIZE");
-            std::env::remove_var("STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE");
-        }
+        remove_test_mount_option_env("STUDIOFS_WINFSP_SECTOR_SIZE");
+        remove_test_mount_option_env("STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE");
     }
 
     #[test]
     fn parse_mount_options_invalid_geometry_falls_back_to_defaults() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
-        // SAFETY: Tests are single-threaded via `_guard` and temporarily mutate
-        // process environment variables for deterministic parsing behavior.
-        unsafe {
-            std::env::set_var("STUDIOFS_WINFSP_SECTOR_SIZE", "3000");
-            std::env::set_var("STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE", "1048576");
-        }
+        set_test_mount_option_env("STUDIOFS_WINFSP_SECTOR_SIZE", "3000");
+        set_test_mount_option_env("STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE", "1048576");
 
         let opts = parse_mount_options("StudioFS").expect("options");
         assert_eq!(opts.sector_size, DEFAULT_SECTOR_SIZE);
@@ -1119,12 +1066,8 @@ mod tests {
             DEFAULT_SECTORS_PER_ALLOCATION_UNIT
         );
 
-        // SAFETY: Tests are single-threaded via `_guard` and restore environment
-        // variables that were written earlier in the test.
-        unsafe {
-            std::env::remove_var("STUDIOFS_WINFSP_SECTOR_SIZE");
-            std::env::remove_var("STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE");
-        }
+        remove_test_mount_option_env("STUDIOFS_WINFSP_SECTOR_SIZE");
+        remove_test_mount_option_env("STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE");
     }
 
     #[test]

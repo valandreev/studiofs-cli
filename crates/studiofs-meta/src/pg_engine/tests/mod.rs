@@ -424,44 +424,6 @@ pub(super) fn pop_inode_window_reservation_override() -> Option<Result<InodeWind
         .with(|override_state| override_state.borrow_mut().pop_front())
 }
 
-struct TestEnvGuard {
-    key: &'static str,
-    previous: Option<String>,
-    _lock: std::sync::MutexGuard<'static, ()>,
-}
-
-impl Drop for TestEnvGuard {
-    fn drop(&mut self) {
-        if let Some(previous) = &self.previous {
-            unsafe {
-                std::env::set_var(self.key, previous);
-            }
-        } else {
-            unsafe {
-                std::env::remove_var(self.key);
-            }
-        }
-    }
-}
-
-static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
-
-fn set_test_env(key: &'static str, value: &str) -> TestEnvGuard {
-    // Rust environment mutation is process-global and unsafe around concurrent
-    // readers/writers; serializing these few tests trades parallel throughput
-    // for defined behavior.
-    let lock = TEST_ENV_LOCK.lock().expect("test env lock poisoned");
-    let previous = std::env::var(key).ok();
-    unsafe {
-        std::env::set_var(key, value);
-    }
-    TestEnvGuard {
-        key,
-        previous,
-        _lock: lock,
-    }
-}
-
 fn set_file_state(engine: &PgMetaEngine, ino: Ino, size: u64, content_epoch: u64) {
     let mut attr = engine.get_attr(ino).expect("get file attr");
     attr.size = size;
