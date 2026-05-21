@@ -32,8 +32,9 @@ use crate::mounted_tree::{
     ClientMount, ConvergenceOutcome, MountedTreeError, NamespaceInvariantViolation, TreeComparison,
     validate_namespace_invariants, wait_for_convergence,
 };
+use crate::process_job::CHILD_TERMINATION_GRACE;
 #[cfg(not(test))]
-use crate::process_job::{CHILD_TERMINATION_GRACE, ChildJob, wait_for_child_exit};
+use crate::process_job::{ChildJob, wait_for_child_exit};
 use crate::report::RunManifest;
 
 /// Basic multi-client smoke scenario identifier.
@@ -137,6 +138,8 @@ const MOUNTED_VALIDATION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const MOUNTED_VALIDATION_MAX_ACTIVE_PROBES: usize = 1;
 const HOTSPOT_CHURN_OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
 const OPEN_HANDLE_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+const OPEN_HANDLE_SYNC_RETRY_TIMEOUT: Duration = Duration::from_secs(2);
+const OPEN_HANDLE_SYNC_RETRY_POLL_INTERVAL: Duration = Duration::from_millis(25);
 #[cfg(test)]
 const HOTSPOT_IO_MAX_ACTIVE_WORKERS: usize = 1;
 static HOTSPOT_HELPER_PAYLOAD_ID: AtomicUsize = AtomicUsize::new(0);
@@ -2425,6 +2428,7 @@ struct NamespaceCollisionTask {
     operation: &'static str,
     path: &'static str,
     action: NamespaceCollisionAction,
+    completion_grace: Duration,
 }
 
 impl NamespaceCollisionTask {
@@ -2441,7 +2445,13 @@ impl NamespaceCollisionTask {
             operation,
             path,
             action: Box::new(action),
+            completion_grace: Duration::ZERO,
         }
+    }
+
+    fn with_completion_grace(mut self, completion_grace: Duration) -> Self {
+        self.completion_grace = completion_grace;
+        self
     }
 }
 
@@ -2488,6 +2498,11 @@ fn namespace_collision_helper_task(
             .map_err(scenario_error_to_io)
         },
     )
+    .with_completion_grace(helper_process_completion_grace())
+}
+
+fn helper_process_completion_grace() -> Duration {
+    CHILD_TERMINATION_GRACE * 2 + Duration::from_secs(1)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2550,7 +2565,7 @@ fn run_namespace_collision_body(
         .take(COLLISION_CLIENT_NAMES.len())
         .collect::<Vec<_>>();
 
-    establish_collision_initial_tree(kind, &clients[0])?;
+    establish_collision_initial_tree(context, kind, &clients[0])?;
     driver.after_conflicting_operations(kind, &clients)?;
     let initial_validation_deadline = Instant::now() + convergence_timeout;
     let initial_paths = kind.initial_paths();
@@ -2641,17 +2656,38 @@ fn write_namespace_collision_plan_artifacts(
 }
 
 fn establish_collision_initial_tree(
+    context: &ScenarioContext,
     kind: NamespaceCollisionKind,
     client: &ClientSpec,
 ) -> Result<(), ScenarioError> {
     if kind == NamespaceCollisionKind::MkdirRmdirVsCreate {
-        fs::create_dir_all(client.mount_point.join("race"))?;
+        run_hotspot_helper_process(
+            context,
+            COLLISION_OPERATION_TIMEOUT,
+            client,
+            "mkdir",
+            "race",
+            None,
+            None,
+            format!(
+                "{} mkdir race for namespace collision initial tree",
+                client.name
+            ),
+        )?;
     }
     for (relative_path, payload) in kind.initial_paths() {
-        write_mounted_initial_file(
-            client.mount_point.join(relative_path),
-            payload,
-            "namespace collision initial tree",
+        run_hotspot_helper_process(
+            context,
+            COLLISION_OPERATION_TIMEOUT,
+            client,
+            "create",
+            relative_path,
+            None,
+            Some(payload),
+            format!(
+                "{} create {relative_path} for namespace collision initial tree",
+                client.name
+            ),
         )?;
     }
     Ok(())
@@ -2839,9 +2875,18 @@ fn perform_namespace_collision_operations(
         NamespaceCollisionKind::ReaddirStatDuringMutation => run_concurrent_namespace_operations(
             started,
             vec![
-                NamespaceCollisionTask::new(1, clients[1].clone(), "readdir", "scan", |client| {
-                    fs::read_dir(client.mount_point.join("scan")).map(|_| ())
-                }),
+                namespace_collision_helper_task(
+                    context,
+                    NamespaceCollisionHelperSpec {
+                        order: 1,
+                        client: clients[1].clone(),
+                        operation: "readdir",
+                        helper_operation: "readdir",
+                        path: "scan",
+                        target: None,
+                        payload: None,
+                    },
+                ),
                 namespace_collision_helper_task(
                     context,
                     NamespaceCollisionHelperSpec {
@@ -2854,12 +2899,17 @@ fn perform_namespace_collision_operations(
                         payload: None,
                     },
                 ),
-                NamespaceCollisionTask::new(
-                    3,
-                    clients[2].clone(),
-                    "stat",
-                    "scan/b.txt",
-                    |client| fs::metadata(client.mount_point.join("scan/b.txt")).map(|_| ()),
+                namespace_collision_helper_task(
+                    context,
+                    NamespaceCollisionHelperSpec {
+                        order: 3,
+                        client: clients[2].clone(),
+                        operation: "stat",
+                        helper_operation: "stat",
+                        path: "scan/b.txt",
+                        target: None,
+                        payload: None,
+                    },
                 ),
             ],
             COLLISION_OPERATION_TIMEOUT,
@@ -2884,6 +2934,11 @@ fn run_concurrent_namespace_operations(
         .map(|task| (task.order, namespace_collision_task_label(task)))
         .collect::<Vec<_>>();
     let expected_operations = pending.len();
+    let completion_grace = tasks
+        .iter()
+        .map(|task| task.completion_grace)
+        .max()
+        .unwrap_or(Duration::ZERO);
     let mut handles = Vec::with_capacity(tasks.len());
     for task in tasks {
         let barrier = Arc::clone(&barrier);
@@ -2903,7 +2958,7 @@ fn run_concurrent_namespace_operations(
     }
     drop(tx);
 
-    let deadline = Instant::now() + timeout;
+    let deadline = Instant::now() + timeout + completion_grace;
     let mut operations = Vec::with_capacity(expected_operations);
     while operations.len() < expected_operations {
         let now = Instant::now();
@@ -4711,7 +4766,7 @@ fn run_mounted_chaos_operations(
     let started = Instant::now();
     let mut operations = Vec::new();
     let writer = &clients[0];
-    seed_mounted_chaos_initial_tree(writer, isolation)?;
+    seed_mounted_chaos_initial_tree(context, writer, isolation)?;
     wait_for_mounted_chaos_initial_tree(
         context,
         clients,
@@ -4721,98 +4776,96 @@ fn run_mounted_chaos_operations(
     )?;
     for &(path, _) in MOUNTED_CHAOS_INITIAL_TREE {
         let path = isolation.path(path.strip_prefix("chaos/").unwrap_or(path));
-        let path = writer.mount_point.join(path);
-        if !path.exists() {
-            return Err(ScenarioError::Io(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!(
-                    "mounted chaos initial path disappeared before conflicting operations: {}",
-                    path.display()
-                ),
-            )));
-        }
+        wait_for_hotspot_helper_stat_until(
+            context,
+            writer,
+            &path,
+            Instant::now() + HOTSPOT_CHURN_OPERATION_TIMEOUT,
+            poll_interval,
+            "mounted chaos initial path before conflicting operations",
+        )?;
     }
-    operations.push(fs_op(
+    let operation = timed_hotspot_helper_fs_op(
+        context,
         started,
         1,
         &clients[0],
         "rename",
         &isolation.path("rename-source.txt"),
-        || {
-            fs::rename(
-                clients[0]
-                    .mount_point
-                    .join(isolation.path("rename-source.txt")),
-                clients[0]
-                    .mount_point
-                    .join(isolation.path("renamed-by-a.txt")),
-            )
-        },
-    ));
-    operations.push(fs_op(
+        HOTSPOT_CHURN_OPERATION_TIMEOUT,
+        None,
+        Some(&isolation.path("renamed-by-a.txt")),
+    )?;
+    record_sparse_operation(context, &mut operations, operation)?;
+    let operation = timed_hotspot_helper_fs_op_with_helper(
+        context,
         started,
         2,
         &clients[1],
         "unlink",
+        "delete",
         &isolation.path("unlink-target.txt"),
-        || {
-            fs::remove_file(
-                clients[1]
-                    .mount_point
-                    .join(isolation.path("unlink-target.txt")),
-            )
-        },
-    ));
-    operations.push(fs_op(
+        HOTSPOT_CHURN_OPERATION_TIMEOUT,
+        None,
+        None,
+    )?;
+    record_sparse_operation(context, &mut operations, operation)?;
+    let append_payload = isolation.payload("append", "append-target.txt", "appended by chaos\n");
+    let operation = timed_hotspot_helper_fs_op(
+        context,
         started,
         3,
         &clients[2],
         "append",
         &isolation.path("append-target.txt"),
-        || {
-            append_payload(
-                clients[2]
-                    .mount_point
-                    .join(isolation.path("append-target.txt")),
-                &isolation.payload("append", "append-target.txt", "appended by chaos\n"),
-            )
-        },
-    ));
-    operations.push(fs_op(
+        HOTSPOT_CHURN_OPERATION_TIMEOUT,
+        Some(&append_payload),
+        None,
+    )?;
+    record_sparse_operation(context, &mut operations, operation)?;
+    let overwrite_payload =
+        isolation.payload("overwrite", "read-target.txt", "new committed payload\n");
+    let operation = timed_hotspot_helper_fs_op(
+        context,
         started,
         4,
         &clients[0],
         "overwrite",
         &isolation.path("read-target.txt"),
-        || {
-            fs::write(
-                clients[0]
-                    .mount_point
-                    .join(isolation.path("read-target.txt")),
-                isolation.payload("overwrite", "read-target.txt", "new committed payload\n"),
-            )
-        },
-    ));
-    operations.push(fs_op(
+        HOTSPOT_CHURN_OPERATION_TIMEOUT,
+        Some(&overwrite_payload),
+        None,
+    )?;
+    record_sparse_operation(context, &mut operations, operation)?;
+    let operation = timed_hotspot_helper_fs_op(
+        context,
         started,
         5,
         &clients[1],
         "mkdir",
         &isolation.path("dir"),
-        || fs::create_dir_all(clients[1].mount_point.join(isolation.path("dir"))),
-    ));
-    operations.push(fs_op(
+        HOTSPOT_CHURN_OPERATION_TIMEOUT,
+        None,
+        None,
+    )?;
+    record_sparse_operation(context, &mut operations, operation)?;
+    let operation = timed_hotspot_helper_fs_op(
+        context,
         started,
         6,
         &clients[2],
         "readdir",
         &isolation.root,
-        || fs::read_dir(clients[2].mount_point.join(&isolation.root)).map(|_| ()),
-    ));
+        HOTSPOT_CHURN_OPERATION_TIMEOUT,
+        None,
+        None,
+    )?;
+    record_sparse_operation(context, &mut operations, operation)?;
     Ok(operations)
 }
 
 fn seed_mounted_chaos_initial_tree(
+    context: &ScenarioContext,
     writer: &ClientSpec,
     isolation: &ScenarioIsolation,
 ) -> Result<(), ScenarioError> {
@@ -4821,10 +4874,18 @@ fn seed_mounted_chaos_initial_tree(
         let mounted_path = isolation.path(logical_path);
         let payload =
             isolation.payload("initial", &mounted_path, &String::from_utf8_lossy(payload));
-        write_mounted_initial_file(
-            writer.mount_point.join(mounted_path),
-            &payload,
-            "mounted chaos initial tree",
+        run_hotspot_helper_process(
+            context,
+            HOTSPOT_CHURN_OPERATION_TIMEOUT,
+            writer,
+            "create",
+            &mounted_path,
+            None,
+            Some(&payload),
+            format!(
+                "{} create {mounted_path} for mounted chaos initial tree",
+                writer.name
+            ),
         )?;
     }
     Ok(())
@@ -5699,14 +5760,6 @@ fn run_open_handle_operations(
     operations.push(record_advanced_operation(
         started,
         1,
-        &clients[0],
-        "open",
-        &unlink_target,
-        Ok(()),
-    ));
-    operations.push(record_advanced_operation(
-        started,
-        2,
         &clients[1],
         "unlink",
         &unlink_target,
@@ -5714,7 +5767,7 @@ fn run_open_handle_operations(
     ));
     operations.push(record_advanced_operation(
         started,
-        3,
+        2,
         &clients[1],
         "rename",
         &rename_source,
@@ -5722,7 +5775,7 @@ fn run_open_handle_operations(
     ));
     operations.push(record_advanced_operation(
         started,
-        4,
+        3,
         &clients[0],
         "append_old_handle",
         &unlink_target,
@@ -9306,7 +9359,21 @@ pub fn run_open_handle_op_helper(
         Some(rename_dest),
         None,
     )?;
-    handle.sync_all()?;
+    let sync_retries = sync_open_handle_with_retry(
+        || handle.sync_all(),
+        OPEN_HANDLE_SYNC_RETRY_TIMEOUT,
+        OPEN_HANDLE_SYNC_RETRY_POLL_INTERVAL,
+    )?;
+    if sync_retries > 0 {
+        record_hotspot_helper_progress(
+            progress,
+            "after_sync_all_retry",
+            operation,
+            &client_a_unlink_path,
+            Some(rename_dest),
+            None,
+        )?;
+    }
     record_hotspot_helper_progress(
         progress,
         "after_sync_all",
@@ -9325,6 +9392,29 @@ pub fn run_open_handle_op_helper(
         None,
     )?;
     Ok(())
+}
+
+fn sync_open_handle_with_retry(
+    mut sync_all: impl FnMut() -> io::Result<()>,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> io::Result<usize> {
+    let deadline = Instant::now() + timeout;
+    let mut retries = 0;
+    loop {
+        match sync_all() {
+            Ok(()) => return Ok(retries),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(error);
+                }
+                retries += 1;
+                thread::sleep(poll_interval.min(remaining));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn write_parented_with_progress(
@@ -9473,15 +9563,6 @@ fn write_parented_with_barrier_progress(
         target,
         Some(readback.len()),
     )
-}
-
-fn append_payload(path: PathBuf, payload: &[u8]) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    file.write_all(payload)?;
-    file.sync_all()
 }
 
 fn append_payload_with_progress(
@@ -10736,7 +10817,7 @@ mod tests {
             client_controller_config: None,
         };
         let isolation = test_isolation("chaos-test");
-        seed_mounted_chaos_initial_tree(&clients[0], &isolation).unwrap();
+        seed_mounted_chaos_initial_tree(&context, &clients[0], &isolation).unwrap();
 
         let err = wait_for_mounted_chaos_initial_tree(
             &context,
@@ -10758,6 +10839,17 @@ mod tests {
     fn mounted_chaos_initial_seed_rejects_stale_zero_byte_file() {
         let temp = tempdir().unwrap();
         let sandbox = temp.path().join("run-1");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(MOUNTED_CHAOS_CONVERGENCE);
+        let context = ScenarioContext {
+            run_id: "run-1".to_string(),
+            seed: 410,
+            sandbox: sandbox.clone(),
+            scenario_dir,
+            client_controller_config: None,
+        };
         let writer = client_spec_for(
             &sandbox,
             "projectfs",
@@ -10769,10 +10861,11 @@ mod tests {
         std::fs::create_dir_all(stale_path.parent().unwrap()).unwrap();
         std::fs::write(&stale_path, []).unwrap();
 
-        let err = seed_mounted_chaos_initial_tree(&writer, &isolation).unwrap_err();
+        let err = seed_mounted_chaos_initial_tree(&context, &writer, &isolation).unwrap_err();
 
+        let err_text = err.to_string().to_ascii_lowercase();
         assert!(
-            matches!(&err, ScenarioError::Io(error) if error.kind() == io::ErrorKind::AlreadyExists),
+            err_text.contains("mounted chaos initial tree") && err_text.contains("file exists"),
             "expected stale warmup file to be rejected before convergence validation, got {err:?}"
         );
         assert_eq!(
@@ -11069,7 +11162,7 @@ mod tests {
             client_controller_config: None,
         };
         let isolation = test_isolation("chaos-test");
-        seed_mounted_chaos_initial_tree(&clients[0], &isolation).unwrap();
+        seed_mounted_chaos_initial_tree(&context, &clients[0], &isolation).unwrap();
         for peer in clients.iter().skip(1) {
             replace_dir_contents(&clients[0].mount_point, &peer.mount_point).unwrap();
         }
@@ -11554,6 +11647,104 @@ mod tests {
             started.elapsed() < Duration::from_millis(150),
             "timeout must not wait for the hung namespace worker to finish"
         );
+    }
+
+    #[test]
+    fn namespace_collision_collect_timeout_allows_helper_cleanup_grace() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-collision-helper-grace");
+        let mount = temp.path().join("mounts").join("client-a");
+        std::fs::create_dir_all(&mount).unwrap();
+        let client = client_spec_for(&sandbox, "projectfs", "client-a", mount);
+        let started = Instant::now();
+
+        let operations = run_concurrent_namespace_operations(
+            started,
+            vec![
+                NamespaceCollisionTask::new(1, client, "rename", "shared/file.txt", |_client| {
+                    thread::sleep(Duration::from_millis(80));
+                    Ok(())
+                })
+                .with_completion_grace(Duration::from_millis(100)),
+            ],
+            Duration::from_millis(20),
+        )
+        .unwrap();
+
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0].result, "accepted");
+        assert!(
+            started.elapsed() >= Duration::from_millis(80),
+            "helper-backed namespace operations must be allowed to finish bounded cleanup after the operation timeout"
+        );
+    }
+
+    #[test]
+    fn namespace_collision_initial_tree_uses_bounded_helper_progress() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-collision-seed-helper");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(COLLISION_RENAME_VS_UNLINK);
+        let mount = temp.path().join("mounts").join("client-a");
+        std::fs::create_dir_all(&mount).unwrap();
+        let client = client_spec_for(&sandbox, "projectfs", "client-a", mount);
+        let context = ScenarioContext {
+            run_id: "run-collision-seed-helper".to_string(),
+            seed: 410,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+
+        establish_collision_initial_tree(&context, NamespaceCollisionKind::RenameVsUnlink, &client)
+            .unwrap();
+
+        let progress_dir = context.scenario_dir.join("hotspot-helper-progress");
+        let progress_files = std::fs::read_dir(progress_dir)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(progress_files.len(), 1);
+        let progress_log = std::fs::read_to_string(progress_files[0].path()).unwrap();
+        assert!(progress_log.contains("\"operation\":\"create\""));
+        assert!(progress_log.contains("\"phase\":\"after_readback\""));
+        assert!(progress_log.contains("\"phase\":\"completed\""));
+    }
+
+    #[test]
+    fn open_handle_sync_retry_accepts_transient_not_found() {
+        let mut attempts = 0;
+
+        let retries = sync_open_handle_with_retry(
+            || {
+                attempts += 1;
+                if attempts < 3 {
+                    Err(io::Error::new(io::ErrorKind::NotFound, "transient"))
+                } else {
+                    Ok(())
+                }
+            },
+            Duration::from_millis(100),
+            Duration::from_millis(1),
+        )
+        .unwrap();
+
+        assert_eq!(retries, 2);
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn open_handle_sync_retry_preserves_non_not_found_error() {
+        let err = sync_open_handle_with_retry(
+            || Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied")),
+            Duration::from_millis(100),
+            Duration::from_millis(1),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
     }
 
     #[test]
