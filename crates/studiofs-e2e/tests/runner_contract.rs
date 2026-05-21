@@ -1053,6 +1053,41 @@ fn clean_removes_only_runner_owned_sandboxes() {
 }
 
 #[test]
+fn clean_removes_interrupted_runner_owned_sandbox_without_final_reports() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().join("e2e-runs");
+    let run_id = "interrupted-run";
+    let sandbox = root.join(run_id);
+    fs::create_dir_all(sandbox.join("artifacts")).unwrap();
+    fs::write(
+        sandbox.join("run.json"),
+        serde_json::json!({
+            "runner_crate": "studiofs-e2e",
+            "run_id": run_id,
+            "sandbox": sandbox.display().to_string()
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        sandbox.join(".studiofs-e2e-runner.json"),
+        serde_json::json!({
+            "runner_crate": "studiofs-e2e",
+            "run_id": run_id
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let removed = studiofs_e2e::runner::clean(CleanRequest { root })
+        .unwrap()
+        .removed;
+
+    assert_eq!(removed, vec![PathBuf::from(run_id)]);
+    assert!(!sandbox.exists());
+}
+
+#[test]
 fn clean_ignores_manifest_only_directories_without_runner_marker_and_layout() {
     let temp = tempdir().unwrap();
     let root = temp.path().join("e2e-runs");

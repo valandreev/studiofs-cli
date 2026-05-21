@@ -3002,18 +3002,8 @@ fn is_runner_owned_sandbox(path: &Path) -> Result<bool, RunnerError> {
     {
         return Ok(false);
     }
-    for required in [
-        RUNNER_MARKER_FILE,
-        "run.json",
-        "report.json",
-        "events.ndjson",
-        "preflight.json",
-        "cleanup.json",
-        "artifacts",
-    ] {
-        if !path.join(required).exists() {
-            return Ok(false);
-        }
+    if !path.join("artifacts").exists() {
+        return Ok(false);
     }
     Ok(true)
 }
