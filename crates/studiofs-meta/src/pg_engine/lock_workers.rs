@@ -252,24 +252,24 @@ impl PgMetaEngine {
                         let result = engine_arc.renew_file_lock_lease(ino, lease_ttl);
                         match result {
                             Ok(FileLockLeaseRenewOutcome::Renewed(_)) => {
-                                if let Ok(mut held) = engine_arc.held_file_locks.lock()
-                                    && let Some(state) = held.get_mut(&ino)
-                                {
-                                    state.next_renew_at =
-                                        Instant::now() + Self::half_duration(lease_ttl);
+                                if let Ok(mut held) = engine_arc.held_file_locks.lock() {
+                                    if let Some(state) = held.get_mut(&ino) {
+                                        state.next_renew_at =
+                                            Instant::now() + Self::half_duration(lease_ttl);
+                                    }
                                 }
                             }
                             Ok(FileLockLeaseRenewOutcome::Lost(_)) => {
                                 engine_arc.forget_held_file_lock(ino);
                             }
                             Err(_) => {
-                                if let Ok(mut held) = engine_arc.held_file_locks.lock()
-                                    && let Some(state) = held.get_mut(&ino)
-                                {
-                                    state.next_renew_at = Instant::now()
-                                        + Self::half_duration(
-                                            lease_ttl.min(Duration::from_secs(1)),
-                                        );
+                                if let Ok(mut held) = engine_arc.held_file_locks.lock() {
+                                    if let Some(state) = held.get_mut(&ino) {
+                                        state.next_renew_at = Instant::now()
+                                            + Self::half_duration(
+                                                lease_ttl.min(Duration::from_secs(1)),
+                                            );
+                                    }
                                 }
                             }
                         }

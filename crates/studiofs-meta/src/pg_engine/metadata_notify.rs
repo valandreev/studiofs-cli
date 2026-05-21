@@ -59,12 +59,12 @@ impl PgMetaEngine {
                         None => break,
                     };
 
-                    if attempted_listen
-                        && let Some(engine_arc) = engine.upgrade()
-                    {
-                        engine_arc
-                            .metadata_notify_reconnects
-                            .fetch_add(1, Ordering::Relaxed);
+                    if attempted_listen {
+                        if let Some(engine_arc) = engine.upgrade() {
+                            engine_arc
+                                .metadata_notify_reconnects
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                     attempted_listen = true;
 

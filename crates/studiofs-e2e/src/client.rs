@@ -470,8 +470,8 @@ pub(crate) fn run_taskkill_with_timeout(
 ) -> io::Result<std::process::Output> {
     let mut child = Command::new("taskkill")
         .args(["/PID", &pid.to_string(), "/T", "/F"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()?;
     let started = Instant::now();
     loop {

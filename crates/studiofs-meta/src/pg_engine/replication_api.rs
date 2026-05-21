@@ -146,25 +146,25 @@ impl MetaReplication for PgMetaEngine {
         self.poll_shutdown.store(true, Ordering::Release);
         self.signal_poll_wakeup();
         let join_timeout = Self::default_prepare_for_close_join_timeout();
-        if let Ok(mut guard) = self.poll_handle.lock()
-            && let Some(handle) = guard.take()
-        {
-            Self::join_background_thread_with_timeout(handle, join_timeout, "poll");
+        if let Ok(mut guard) = self.poll_handle.lock() {
+            if let Some(handle) = guard.take() {
+                Self::join_background_thread_with_timeout(handle, join_timeout, "poll");
+            }
         }
-        if let Ok(mut guard) = self.metadata_notify_handle.lock()
-            && let Some(handle) = guard.take()
-        {
-            Self::join_background_thread_with_timeout(handle, join_timeout, "metadata-notify");
+        if let Ok(mut guard) = self.metadata_notify_handle.lock() {
+            if let Some(handle) = guard.take() {
+                Self::join_background_thread_with_timeout(handle, join_timeout, "metadata-notify");
+            }
         }
-        if let Ok(mut guard) = self.lock_notify_handle.lock()
-            && let Some(handle) = guard.take()
-        {
-            Self::join_background_thread_with_timeout(handle, join_timeout, "notify");
+        if let Ok(mut guard) = self.lock_notify_handle.lock() {
+            if let Some(handle) = guard.take() {
+                Self::join_background_thread_with_timeout(handle, join_timeout, "notify");
+            }
         }
-        if let Ok(mut guard) = self.lock_renew_handle.lock()
-            && let Some(handle) = guard.take()
-        {
-            Self::join_background_thread_with_timeout(handle, join_timeout, "renew");
+        if let Ok(mut guard) = self.lock_renew_handle.lock() {
+            if let Some(handle) = guard.take() {
+                Self::join_background_thread_with_timeout(handle, join_timeout, "renew");
+            }
         }
     }
 }
