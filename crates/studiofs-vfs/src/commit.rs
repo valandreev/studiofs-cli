@@ -45,6 +45,9 @@ impl CommitCoordinator {
         {
             return Ok(EpochFinalizeStatus::Skipped);
         }
+        if attr.size == 0 && attr.committed_size > 0 && vfs.handle_table.open_count(ino) > 0 {
+            return Ok(EpochFinalizeStatus::Deferred);
+        }
 
         if vfs.inode_has_unmaterialized_overlay_for_finalize(ino) {
             return Ok(EpochFinalizeStatus::Deferred);

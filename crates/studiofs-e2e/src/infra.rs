@@ -22,6 +22,8 @@ const DEFAULT_RUSTFS_CONSOLE_PORT: u16 = 29_001;
 const DEFAULT_TOXIPROXY_API_PORT: u16 = 28_474;
 const COMPOSE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 const COMPOSE_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(windows)]
+const TASKKILL_FALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
 const STREAM_OUTPUT_ENV: &str = "STUDIOFS_E2E_STREAM_OUTPUT";
 const ANSI_RESET: &str = "\x1b[0m";
 const ANSI_YELLOW: &str = "\x1b[33m";
@@ -229,6 +231,7 @@ fn run_command(
     loop {
         if child.try_wait()?.is_some() {
             let status = child.wait()?;
+            terminate_descendants_after_primary_exit(&job);
             let stdout = collect_reader(stdout_reader.take())?;
             let stderr = collect_reader(stderr_reader.take())?;
             return Ok(CommandOutput {
@@ -293,14 +296,34 @@ fn run_command(
     }
 }
 
+fn terminate_descendants_after_primary_exit(job: &ChildJob) {
+    let _ = job.terminate();
+    let _ = job.force_kill();
+}
+
 #[cfg(windows)]
 fn force_kill_process_tree(pid: u32) -> Result<(), String> {
-    let status = Command::new(taskkill_program())
+    let mut taskkill = Command::new(taskkill_program())
         .args(["/PID", &pid.to_string(), "/T", "/F"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
+        .spawn()
         .map_err(|err| err.to_string())?;
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = taskkill.try_wait().map_err(|err| err.to_string())? {
+            break status;
+        }
+        if started.elapsed() >= TASKKILL_FALLBACK_TIMEOUT {
+            let _ = taskkill.kill();
+            let _ = taskkill.wait();
+            return Err(format!(
+                "taskkill timed out after {} ms",
+                TASKKILL_FALLBACK_TIMEOUT.as_millis()
+            ));
+        }
+        thread::sleep(Duration::from_millis(25));
+    };
     match status.code() {
         Some(0 | 128) => Ok(()),
         _ => Err(format!("taskkill exited with status {status}")),
@@ -1284,6 +1307,23 @@ mod tests {
     }
 
     #[test]
+    fn executor_does_not_wait_for_descendant_pipe_handles_after_primary_exit() {
+        let _guard = crate::process_job::child_job_test_lock();
+        let command = exits_with_descendant_holding_stdio(Duration::from_secs(10));
+        let started = Instant::now();
+
+        let output = SystemCommandExecutor
+            .run(&command)
+            .expect("primary child exit should be reported without waiting for descendants");
+
+        assert_eq!(output.status, 7);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "executor must close the child job before joining output reader threads"
+        );
+    }
+
+    #[test]
     fn command_streams_output_only_when_enabled() {
         let mut command = large_stdout_command(Duration::from_secs(5));
 
@@ -1379,6 +1419,20 @@ timestamp=t studiofs-e2e phase=run status=\x1b[31mfailed\x1b[0m\n",
         }
     }
 
+    #[cfg(windows)]
+    fn exits_with_descendant_holding_stdio(timeout: Duration) -> CommandSpec {
+        CommandSpec {
+            program: "cmd".to_string(),
+            args: vec![
+                "/C".to_string(),
+                "start /B powershell -NoLogo -NoProfile -NonInteractive -Command Start-Sleep -Seconds 5 & exit /B 7".to_string(),
+            ],
+            env: Vec::new(),
+            cwd: None,
+            timeout: Some(timeout),
+        }
+    }
+
     #[cfg(unix)]
     fn hung_command(timeout: Duration) -> CommandSpec {
         CommandSpec {
@@ -1415,6 +1469,17 @@ timestamp=t studiofs-e2e phase=run status=\x1b[31mfailed\x1b[0m\n",
             env: Vec::new(),
             cwd: None,
             timeout,
+        }
+    }
+
+    #[cfg(unix)]
+    fn exits_with_descendant_holding_stdio(timeout: Duration) -> CommandSpec {
+        CommandSpec {
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), "sleep 5 & exit 7".to_string()],
+            env: Vec::new(),
+            cwd: None,
+            timeout: Some(timeout),
         }
     }
 }

@@ -1109,6 +1109,19 @@ impl OverlayCommitPort for VfsOverlayCommitter<'_> {
         )>,
         attr: Option<InodeAttr>,
     ) -> VfsResult<Option<InodeAttr>> {
+        let attr = if let Some(attr) = attr {
+            if chunk_slices.is_empty()
+                && self
+                    .vfs
+                    .discard_stale_zero_size_dirty_attr_after_current_publish(ino, &attr)
+                    .await?
+            {
+                return Ok(None);
+            }
+            Some(attr)
+        } else {
+            None
+        };
         let started = Instant::now();
         let result = run_meta(self.vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
             engine.flush_regular_file_overlay_slices_with_attr(ino, &chunk_slices, attr.as_ref())
@@ -1522,6 +1535,13 @@ impl<'a> LocalDirtyFlushSession<'a> {
                     .vfs
                     .has_pending_local_dirty_payloads_for_inode(self.ino))
         {
+            if self
+                .vfs
+                .discard_stale_zero_size_dirty_attr_after_current_publish(self.ino, &attr)
+                .await?
+            {
+                return Ok(());
+            }
             let _ = self
                 .drain
                 .execute_drain(
@@ -2561,10 +2581,45 @@ impl StudioVfs {
                     || (current.size == attr.size
                         && current.mtime == attr.mtime
                         && current.ctime == attr.ctime))
+                || Self::is_stale_zero_size_dirty_attr_after_publish(current, attr)
         });
         if should_clear {
             dirty_attrs.remove(&ino);
         }
+    }
+
+    pub(super) fn is_stale_zero_size_dirty_attr_after_publish(
+        current: &InodeAttr,
+        published: &InodeAttr,
+    ) -> bool {
+        current.kind == FileType::RegularFile
+            && published.kind == FileType::RegularFile
+            && Self::is_fully_published_regular_file(published)
+            && current.upload_state != MetaUploadState::Ready
+            && current.size == 0
+            && current.committed_size <= published.committed_size
+            && (current.committed_content_epoch < published.committed_content_epoch
+                || (current.committed_content_epoch == published.committed_content_epoch
+                    && current.mtime <= published.mtime
+                    && current.ctime <= published.ctime))
+    }
+
+    pub(super) async fn discard_stale_zero_size_dirty_attr_after_current_publish(
+        &self,
+        ino: Ino,
+        attr: &InodeAttr,
+    ) -> VfsResult<bool> {
+        let current_attr = {
+            let meta = self.meta.clone();
+            run_meta(meta, move |engine: Arc<dyn VfsMeta>| engine.get_attr(ino)).await?
+        };
+        if !Self::is_stale_zero_size_dirty_attr_after_publish(attr, &current_attr) {
+            return Ok(false);
+        }
+        self.clear_matching_dirty_attr_if_committed(ino, &current_attr);
+        self.invalidate_attr_read_cache([ino]);
+        self.refresh_inode_incarnation_state_from_attr(ino, &current_attr);
+        Ok(true)
     }
 
     fn add_pending_local_dirty_bytes(&self, bytes: usize) {

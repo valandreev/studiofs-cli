@@ -2380,6 +2380,108 @@ fn remote_ready_attr_superseding_local_dirty_state_invalidates_kernel_inode() {
 }
 
 #[test]
+fn authoritative_ready_metadata_does_not_clear_newer_local_dirty_attr() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "ready-keeps-newer-dirty-attr");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(ROOT_INO, b"newer-dirty-attr.txt", 0, 0, 0o644)
+            .expect("create file");
+        vfs.write(attr.ino, 0, b"published")
+            .await
+            .expect("write base");
+        vfs.flush(attr.ino).await.expect("flush base");
+
+        let (published_epoch, published_blocks) =
+            mark_all_overlay_objects_uploaded(&vfs, &meta, attr.ino);
+        publish_current_file_graph(&meta, attr.ino, published_epoch, &published_blocks);
+        vfs.cancel_pending_uploads_for_inode(attr.ino);
+        vfs.clear_pending_payloads_for_inode(attr.ino);
+        vfs.state.writer_stack.clear_inode(attr.ino);
+        vfs.remove_live_extents_for_inode(attr.ino);
+        vfs.remove_pending_epoch_finalizations_for_inode(attr.ino);
+
+        let published_attr = meta.get_attr(attr.ino).expect("load published attr");
+        let mut newer_dirty_attr = published_attr.clone();
+        newer_dirty_attr.size = published_attr.size + 4096;
+        newer_dirty_attr.content_epoch = published_attr.committed_content_epoch + 1;
+        newer_dirty_attr.upload_state = MetaUploadState::Updating;
+        vfs.state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .insert(attr.ino, newer_dirty_attr.clone());
+
+        vfs.refresh_inode_incarnation_state_from_attr(attr.ino, &published_attr);
+
+        let retained = vfs
+            .state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .get(&attr.ino)
+            .cloned()
+            .expect("newer local dirty attr must remain visible");
+        assert_eq!(retained.size, newer_dirty_attr.size);
+        assert_eq!(
+            vfs.getattr(attr.ino).expect("visible attr").size,
+            newer_dirty_attr.size
+        );
+    });
+}
+
+#[test]
+fn authoritative_ready_metadata_does_not_clear_same_size_newer_dirty_attr() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "ready-keeps-same-size-newer-dirty-attr");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(ROOT_INO, b"same-size-newer-dirty-attr.txt", 0, 0, 0o644)
+            .expect("create file");
+        vfs.write(attr.ino, 0, b"published")
+            .await
+            .expect("write base");
+        vfs.flush(attr.ino).await.expect("flush base");
+
+        let (published_epoch, published_blocks) =
+            mark_all_overlay_objects_uploaded(&vfs, &meta, attr.ino);
+        publish_current_file_graph(&meta, attr.ino, published_epoch, &published_blocks);
+        vfs.cancel_pending_uploads_for_inode(attr.ino);
+        vfs.clear_pending_payloads_for_inode(attr.ino);
+        vfs.state.writer_stack.clear_inode(attr.ino);
+        vfs.remove_live_extents_for_inode(attr.ino);
+        vfs.remove_pending_epoch_finalizations_for_inode(attr.ino);
+
+        let published_attr = meta.get_attr(attr.ino).expect("load published attr");
+        let mut newer_dirty_attr = published_attr.clone();
+        newer_dirty_attr.content_epoch = published_attr.committed_content_epoch + 1;
+        newer_dirty_attr.upload_state = MetaUploadState::Updating;
+        vfs.state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .insert(attr.ino, newer_dirty_attr.clone());
+
+        vfs.refresh_inode_incarnation_state_from_attr(attr.ino, &published_attr);
+
+        let retained = vfs
+            .state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .get(&attr.ino)
+            .cloned()
+            .expect("same-size newer dirty attr must remain visible");
+        assert_eq!(retained.size, newer_dirty_attr.size);
+        assert_eq!(retained.content_epoch, newer_dirty_attr.content_epoch);
+    });
+}
+
+#[test]
 fn rename_invalidates_moved_inode_attr_cache_without_kernel_callback() {
     let tmp = TempDir::new().expect("tempdir");
     let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "rename-invalidates-moved-inode");
@@ -2469,6 +2571,83 @@ fn remote_ready_attr_with_same_epoch_preserves_pending_local_write() {
                     .any(|pending| pending.0 == ino && pending.1 == pending_epoch),
             "same-epoch remote ready metadata must not drop the local payload publication work"
         );
+    });
+}
+
+#[test]
+fn remote_ready_attr_with_same_epoch_preserves_buffered_writer_stack_tail() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "remote-ready-same-epoch-keeps-writer");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"remote-ready-same-epoch-keeps-writer.bin", 0, 0, 0o644)
+            .expect("create test file");
+        let ino = attr.ino;
+
+        vfs.write(ino, 0, b"published-prefix")
+            .await
+            .expect("write base payload");
+        vfs.flush(ino).await.expect("flush base payload");
+        let (published_epoch, published_blocks) =
+            mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+        publish_current_file_graph(&meta, ino, published_epoch, &published_blocks);
+        vfs.cancel_pending_uploads_for_inode(ino);
+        vfs.clear_pending_payloads_for_inode(ino);
+        vfs.state.writer_stack.clear_inode(ino);
+        vfs.remove_live_extents_for_inode(ino);
+        vfs.remove_pending_epoch_finalizations_for_inode(ino);
+
+        let published_attr = meta.get_attr(ino).expect("load published attr");
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open writable handle");
+        let tail_offset = published_attr.size + 4096;
+        let tail = b"local writer-stack tail";
+
+        vfs.write_fh_with_local_sync_policy(
+            fh,
+            ino,
+            tail_offset,
+            tail,
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .expect("buffer local tail");
+        assert!(
+            vfs.state.writer_stack.has_dirty_writers(ino),
+            "setup should keep the tail only in the mounted writer stack"
+        );
+
+        let dirty_epoch = vfs
+            .state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .get(&ino)
+            .expect("dirty attr")
+            .content_epoch;
+        let mut remote_ready = published_attr.clone();
+        remote_ready.size = tail_offset + tail.len() as u64;
+        remote_ready.committed_size = remote_ready.size;
+        remote_ready.content_epoch = dirty_epoch;
+        remote_ready.committed_content_epoch = dirty_epoch;
+        remote_ready.upload_state = MetaUploadState::Ready;
+
+        vfs.refresh_inode_incarnation_state_from_attr(ino, &remote_ready);
+
+        assert!(
+            vfs.state.writer_stack.has_dirty_writers(ino),
+            "same-epoch remote ready metadata must not discard local writer-stack bytes"
+        );
+        let actual = vfs
+            .read(ino, tail_offset, tail.len() as u32)
+            .await
+            .expect("read local tail");
+        assert_eq!(actual.as_ref(), tail);
+
+        vfs.release_fh(fh).await.unwrap();
     });
 }
 
@@ -2645,6 +2824,59 @@ fn handle_overwrite_after_truncate_publishes_recovered_payload_not_tombstone() {
 }
 
 #[test]
+fn zero_size_epoch_finalization_defers_while_overwrite_handle_is_open() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "zero-finalize-defers-open-handle");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"zero-finalize-defers-open-handle.bin", 0, 0, 0o644)
+            .expect("create test file");
+        let ino = attr.ino;
+        let initial = b"rustfs outage initial payload";
+
+        vfs.write(ino, 0, initial)
+            .await
+            .expect("write initial payload");
+        vfs.flush(ino).await.expect("flush initial payload");
+        let (published_epoch, published_blocks) =
+            mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+        publish_current_file_graph(&meta, ino, published_epoch, &published_blocks);
+
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open overwrite handle");
+        vfs.setattr_with_handle(Some(fh), ino, SetattrArgs::size_only(0))
+            .expect("truncate through overwrite handle");
+        let zero_attr = meta.get_attr(ino).expect("load zero-size attr");
+        assert_eq!(zero_attr.size, 0);
+        assert_ne!(zero_attr.content_epoch, zero_attr.committed_content_epoch);
+
+        let status =
+            commit::CommitCoordinator::finalize_inode_epoch(&vfs, ino, zero_attr.content_epoch)
+                .await
+                .expect("zero finalization should not fail");
+        assert!(
+            matches!(status, commit::EpochFinalizeStatus::Deferred),
+            "zero-size finalization must wait for the overwrite handle to close"
+        );
+
+        let after = meta
+            .get_attr(ino)
+            .expect("load attr after deferred finalizer");
+        assert_eq!(after.size, 0);
+        assert_eq!(
+            after.committed_size,
+            initial.len() as u64,
+            "open-handle zero truncate must not publish over the previous payload yet"
+        );
+
+        vfs.release_fh(fh).await.expect("release overwrite handle");
+    });
+}
+
+#[test]
 fn stale_zero_size_dirty_attr_after_recovered_publish_would_revert_to_tombstone() {
     let tmp = TempDir::new().expect("tempdir");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "stale-zero-dirty-attr-after-publish");
@@ -2720,6 +2952,343 @@ fn stale_zero_size_dirty_attr_after_recovered_publish_would_revert_to_tombstone(
         assert_eq!(
             published_objects, blocks,
             "stale zero-size dirty attr retry must not replace recovered payload graph with tombstones"
+        );
+
+        vfs.release_fh(fh).await.expect("release overwrite handle");
+    });
+}
+
+#[test]
+fn stale_newer_zero_size_dirty_attr_after_recovered_publish_is_discarded() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) =
+        make_unstarted_test_vfs(&tmp, "stale-newer-zero-dirty-attr-after-publish");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"stale-newer-zero-dirty-attr-after-publish.bin", 0, 0, 0o644)
+            .expect("create test file");
+        let ino = attr.ino;
+        let initial = b"rustfs outage initial payload";
+        let recovered = b"rustfs outage recovered payload";
+
+        vfs.write(ino, 0, initial).await.expect("write initial payload");
+        vfs.flush(ino).await.expect("flush initial payload");
+        let (published_epoch, published_blocks) =
+            mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+        publish_current_file_graph(&meta, ino, published_epoch, &published_blocks);
+        let base_attr = meta.get_attr(ino).expect("load initial published attr");
+
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open overwrite handle");
+        vfs.setattr_with_handle(Some(fh), ino, SetattrArgs::size_only(0))
+            .expect("truncate through overwrite handle");
+        let stale_zero_attr = meta.get_attr(ino).expect("load staged zero-size attr");
+        assert_eq!(stale_zero_attr.size, 0);
+        assert_eq!(stale_zero_attr.committed_size, base_attr.committed_size);
+
+        vfs.write_fh(fh, ino, 0, recovered)
+            .await
+            .expect("write recovered payload after truncate");
+        vfs.flush_fh(fh).await.expect("flush recovered overwrite");
+        let (content_epoch, blocks) = mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+        assert!(
+            meta.publish_regular_file_overlay_to_base_if_matches(ino, content_epoch)
+                .expect("publish recovered overwrite epoch"),
+            "recovered overwrite epoch should publish before the stale dirty attr retry"
+        );
+
+        let published_attr = meta.get_attr(ino).expect("load recovered published attr");
+        assert_eq!(published_attr.size, recovered.len() as u64);
+        assert_eq!(published_attr.committed_size, recovered.len() as u64);
+
+        let mut stale_retry = stale_zero_attr;
+        stale_retry.content_epoch = content_epoch.saturating_add(1);
+        vfs.state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .insert(ino, stale_retry);
+        vfs.clear_matching_dirty_attr_if_committed(ino, &published_attr);
+        assert!(
+            !vfs.state.namespace.dirty_attrs.lock().contains_key(&ino),
+            "a stale zero-size attr that sorts after the recovered publish must not survive as a newer dirty attr"
+        );
+
+        vfs.flush_local_dirty_state(ino, LocalSyncPolicy::Strict)
+            .await
+            .expect("retrying local dirty flush after publication should be harmless");
+        let final_attr = meta.get_attr(ino).expect("load attr after stale retry");
+        assert_eq!(final_attr.size, recovered.len() as u64);
+        assert_eq!(final_attr.committed_size, recovered.len() as u64);
+        let published_objects: Vec<_> = meta
+            .lookup_regular_file_slices(ino, 0, recovered.len() as u64)
+            .expect("load recovered published graph")
+            .into_iter()
+            .filter_map(|span| span.payload.map(|payload| payload.object_id))
+            .collect();
+        assert_eq!(
+            published_objects, blocks,
+            "stale newer zero-size dirty attr retry must not replace recovered payload graph"
+        );
+
+        vfs.release_fh(fh).await.expect("release overwrite handle");
+    });
+}
+
+#[test]
+fn stale_zero_dirty_attr_with_equal_committed_epoch_after_recovered_publish_is_discarded() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(
+        &tmp,
+        "stale-zero-equal-committed-epoch-dirty-attr-after-publish",
+    );
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(
+                1,
+                b"stale-zero-equal-committed-epoch-dirty-attr-after-publish.bin",
+                0,
+                0,
+                0o644,
+            )
+            .expect("create test file");
+        let ino = attr.ino;
+        let initial = b"rustfs outage initial payload";
+        let recovered = b"rustfs outage recovered payload";
+
+        vfs.write(ino, 0, initial)
+            .await
+            .expect("write initial payload");
+        vfs.flush(ino).await.expect("flush initial payload");
+        let (published_epoch, published_blocks) =
+            mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+        publish_current_file_graph(&meta, ino, published_epoch, &published_blocks);
+
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open overwrite handle");
+        vfs.setattr_with_handle(Some(fh), ino, SetattrArgs::size_only(0))
+            .expect("truncate through overwrite handle");
+        let stale_zero_attr = meta.get_attr(ino).expect("load staged zero-size attr");
+        assert_eq!(stale_zero_attr.size, 0);
+
+        vfs.write_fh(fh, ino, 0, recovered)
+            .await
+            .expect("write recovered payload after truncate");
+        vfs.flush_fh(fh).await.expect("flush recovered overwrite");
+        let (content_epoch, blocks) = mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+        assert!(
+            meta.publish_regular_file_overlay_to_base_if_matches(ino, content_epoch)
+                .expect("publish recovered overwrite epoch"),
+            "recovered overwrite epoch should publish before the stale dirty attr retry"
+        );
+
+        let published_attr = meta.get_attr(ino).expect("load recovered published attr");
+        assert_eq!(published_attr.size, recovered.len() as u64);
+        assert_eq!(published_attr.committed_size, recovered.len() as u64);
+        assert_eq!(published_attr.committed_content_epoch, content_epoch);
+
+        let mut stale_retry = stale_zero_attr;
+        stale_retry.content_epoch = content_epoch.saturating_add(1);
+        stale_retry.committed_content_epoch = published_attr.committed_content_epoch;
+        stale_retry.committed_size = published_attr.committed_size;
+        vfs.state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .insert(ino, stale_retry);
+
+        vfs.flush_local_dirty_state(ino, LocalSyncPolicy::Strict)
+            .await
+            .expect("local dirty flush should discard stale equal-committed zero dirty attr");
+
+        let final_attr = meta.get_attr(ino).expect("load attr after stale retry");
+        assert_eq!(final_attr.size, recovered.len() as u64);
+        assert_eq!(final_attr.committed_size, recovered.len() as u64);
+        let published_objects: Vec<_> = meta
+            .lookup_regular_file_slices(ino, 0, recovered.len() as u64)
+            .expect("load recovered published graph")
+            .into_iter()
+            .filter_map(|span| span.payload.map(|payload| payload.object_id))
+            .collect();
+        assert_eq!(
+            published_objects, blocks,
+            "equal-committed stale zero attr must not replace recovered payload graph"
+        );
+
+        vfs.release_fh(fh).await.expect("release overwrite handle");
+    });
+}
+
+#[test]
+fn stale_zero_dirty_attr_after_recovered_publish_is_not_persisted_by_flush_fh() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) =
+        make_unstarted_test_vfs(&tmp, "stale-zero-dirty-attr-not-persisted-by-flush-fh");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(
+                1,
+                b"stale-zero-dirty-attr-not-persisted-by-flush-fh.bin",
+                0,
+                0,
+                0o644,
+            )
+            .expect("create test file");
+        let ino = attr.ino;
+        let initial = b"rustfs outage initial payload";
+        let recovered = b"rustfs outage recovered payload";
+
+        vfs.write(ino, 0, initial)
+            .await
+            .expect("write initial payload");
+        vfs.flush(ino).await.expect("flush initial payload");
+        let (published_epoch, published_blocks) =
+            mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+        publish_current_file_graph(&meta, ino, published_epoch, &published_blocks);
+        let base_attr = meta.get_attr(ino).expect("load initial published attr");
+
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open overwrite handle");
+        vfs.setattr_with_handle(Some(fh), ino, SetattrArgs::size_only(0))
+            .expect("truncate through overwrite handle");
+        let stale_zero_attr = meta.get_attr(ino).expect("load staged zero-size attr");
+        assert_eq!(stale_zero_attr.size, 0);
+        assert_eq!(stale_zero_attr.committed_size, base_attr.committed_size);
+
+        vfs.write_fh(fh, ino, 0, recovered)
+            .await
+            .expect("write recovered payload after truncate");
+        vfs.flush_fh(fh).await.expect("flush recovered overwrite");
+        let (content_epoch, blocks) = mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+        assert!(
+            meta.publish_regular_file_overlay_to_base_if_matches(ino, content_epoch)
+                .expect("publish recovered overwrite epoch"),
+            "recovered overwrite epoch should publish before the stale dirty attr retry"
+        );
+
+        let published_attr = meta.get_attr(ino).expect("load recovered published attr");
+        assert_eq!(published_attr.size, recovered.len() as u64);
+        assert_eq!(published_attr.committed_size, recovered.len() as u64);
+
+        let mut stale_retry = stale_zero_attr;
+        stale_retry.content_epoch = content_epoch.saturating_add(1);
+        vfs.state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .insert(ino, stale_retry);
+
+        vfs.flush_fh_with_outcome(fh)
+            .await
+            .expect("flush_fh should discard stale zero dirty attr");
+
+        let final_attr = meta.get_attr(ino).expect("load attr after stale retry");
+        assert_eq!(final_attr.size, recovered.len() as u64);
+        assert_eq!(final_attr.committed_size, recovered.len() as u64);
+        let published_objects: Vec<_> = meta
+            .lookup_regular_file_slices(ino, 0, recovered.len() as u64)
+            .expect("load recovered published graph")
+            .into_iter()
+            .filter_map(|span| span.payload.map(|payload| payload.object_id))
+            .collect();
+        assert_eq!(
+            published_objects, blocks,
+            "flush_fh must not replace recovered payload graph with stale tombstones"
+        );
+
+        vfs.release_fh(fh).await.expect("release overwrite handle");
+    });
+}
+
+#[test]
+fn stale_zero_dirty_attr_after_recovered_publish_is_not_persisted_by_local_dirty_flush() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(
+        &tmp,
+        "stale-zero-dirty-attr-not-persisted-by-local-dirty-flush",
+    );
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(
+                1,
+                b"stale-zero-dirty-attr-not-persisted-by-local-dirty-flush.bin",
+                0,
+                0,
+                0o644,
+            )
+            .expect("create test file");
+        let ino = attr.ino;
+        let initial = b"rustfs outage initial payload";
+        let recovered = b"rustfs outage recovered payload";
+
+        vfs.write(ino, 0, initial)
+            .await
+            .expect("write initial payload");
+        vfs.flush(ino).await.expect("flush initial payload");
+        let (published_epoch, published_blocks) =
+            mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+        publish_current_file_graph(&meta, ino, published_epoch, &published_blocks);
+        let base_attr = meta.get_attr(ino).expect("load initial published attr");
+
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open overwrite handle");
+        vfs.setattr_with_handle(Some(fh), ino, SetattrArgs::size_only(0))
+            .expect("truncate through overwrite handle");
+        let stale_zero_attr = meta.get_attr(ino).expect("load staged zero-size attr");
+        assert_eq!(stale_zero_attr.size, 0);
+        assert_eq!(stale_zero_attr.committed_size, base_attr.committed_size);
+
+        vfs.write_fh(fh, ino, 0, recovered)
+            .await
+            .expect("write recovered payload after truncate");
+        vfs.flush_fh(fh).await.expect("flush recovered overwrite");
+        let (content_epoch, blocks) = mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+        assert!(
+            meta.publish_regular_file_overlay_to_base_if_matches(ino, content_epoch)
+                .expect("publish recovered overwrite epoch"),
+            "recovered overwrite epoch should publish before the stale dirty attr retry"
+        );
+
+        let published_attr = meta.get_attr(ino).expect("load recovered published attr");
+        assert_eq!(published_attr.size, recovered.len() as u64);
+        assert_eq!(published_attr.committed_size, recovered.len() as u64);
+
+        let mut stale_retry = stale_zero_attr;
+        stale_retry.content_epoch = content_epoch.saturating_add(1);
+        vfs.state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .insert(ino, stale_retry);
+
+        vfs.flush_local_dirty_state(ino, LocalSyncPolicy::Strict)
+            .await
+            .expect("local dirty flush should discard stale zero dirty attr");
+
+        let final_attr = meta.get_attr(ino).expect("load attr after stale retry");
+        assert_eq!(final_attr.size, recovered.len() as u64);
+        assert_eq!(final_attr.committed_size, recovered.len() as u64);
+        let published_objects: Vec<_> = meta
+            .lookup_regular_file_slices(ino, 0, recovered.len() as u64)
+            .expect("load recovered published graph")
+            .into_iter()
+            .filter_map(|span| span.payload.map(|payload| payload.object_id))
+            .collect();
+        assert_eq!(
+            published_objects, blocks,
+            "local dirty flush must not replace recovered payload graph with stale tombstones"
         );
 
         vfs.release_fh(fh).await.expect("release overwrite handle");

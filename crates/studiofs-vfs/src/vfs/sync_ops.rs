@@ -882,18 +882,29 @@ impl StudioVfs {
             }
         };
         let persisted_dirty_attrs = if let Some(attr) = dirty_attr {
-            self.fail_inline_dirty_attr_persist_for_test()?;
-            let meta = self.meta.clone();
-            let attr_to_persist = attr.clone();
-            let committed_attr = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
-                engine.flush_regular_file_overlay_slices_with_attr(ino, &[], Some(&attr_to_persist))
-            })
-            .await?;
-            let committed_attr = committed_attr.as_ref().unwrap_or(&attr);
-            self.clear_matching_dirty_attr_if_committed(ino, committed_attr);
-            self.state.namespace.attr_read_cache.lock().remove(ino);
-            self.refresh_inode_incarnation_state_from_attr(ino, committed_attr);
-            true
+            if self
+                .discard_stale_zero_size_dirty_attr_after_current_publish(ino, &attr)
+                .await?
+            {
+                false
+            } else {
+                self.fail_inline_dirty_attr_persist_for_test()?;
+                let meta = self.meta.clone();
+                let attr_to_persist = attr.clone();
+                let committed_attr = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+                    engine.flush_regular_file_overlay_slices_with_attr(
+                        ino,
+                        &[],
+                        Some(&attr_to_persist),
+                    )
+                })
+                .await?;
+                let committed_attr = committed_attr.as_ref().unwrap_or(&attr);
+                self.clear_matching_dirty_attr_if_committed(ino, committed_attr);
+                self.invalidate_attr_read_cache([ino]);
+                self.refresh_inode_incarnation_state_from_attr(ino, committed_attr);
+                true
+            }
         } else {
             false
         };

@@ -751,7 +751,20 @@ fn verify_post_scenario_cleanup(
         "started",
     )
     .map_err(|err| err.to_string())?;
-    let output = executor.run(&command).map_err(|err| err.to_string())?;
+    let output = match executor.run(&command) {
+        Ok(output) => output,
+        Err(err) => {
+            record_event(
+                events_path,
+                run_id,
+                Some(scenario),
+                "cleanup_verify",
+                "failed",
+            )
+            .map_err(|event_err| event_err.to_string())?;
+            return Err(err.to_string());
+        }
+    };
     let cleanup_detail = stale_process_cleanup_detail(&output.stdout);
     if output.status == 0 && output.stdout.trim().is_empty() {
         record_event(
@@ -2096,7 +2109,7 @@ fn owner_liveness_command(pid: u32) -> CommandSpec {
                 "-ExecutionPolicy".to_string(),
                 "Bypass".to_string(),
                 "-Command".to_string(),
-                "$ownerPid=$env:STUDIOFS_E2E_OWNER_PID; $process=Get-CimInstance Win32_Process -Filter \"ProcessId = $ownerPid\" -ErrorAction SilentlyContinue; if ($null -eq $process) { exit 1 } else { exit 0 }".to_string(),
+                "$ownerPid=$env:STUDIOFS_E2E_OWNER_PID; $process=Get-CimInstance Win32_Process -Filter \"ProcessId = $ownerPid\" -ErrorAction SilentlyContinue; if ($null -eq $process) { exit 1 }; $name=[string]$process.Name; $commandLine=[string]$process.CommandLine; if ($name -ieq 'studiofs-e2e.exe' -or $commandLine -match '(^|[\\\\/])studiofs-e2e(\\.exe)?(\\s|$)' -or $commandLine -match 'cargo(\\.exe)?\\s+.*studiofs-e2e') { exit 0 } else { exit 1 }".to_string(),
             ],
             env: vec![("STUDIOFS_E2E_OWNER_PID".to_string(), pid.to_string())],
             cwd: None,
@@ -2107,7 +2120,7 @@ fn owner_liveness_command(pid: u32) -> CommandSpec {
             program: "sh".to_string(),
             args: vec![
                 "-c".to_string(),
-                "kill -0 \"$STUDIOFS_E2E_OWNER_PID\" >/dev/null 2>&1".to_string(),
+                "kill -0 \"$STUDIOFS_E2E_OWNER_PID\" >/dev/null 2>&1 && ps -p \"$STUDIOFS_E2E_OWNER_PID\" -o comm= -o args= 2>/dev/null | grep -Eq '(^|[ /])studiofs-e2e( |$)|cargo( |.* )studiofs-e2e'".to_string(),
             ],
             env: vec![("STUDIOFS_E2E_OWNER_PID".to_string(), pid.to_string())],
             cwd: None,
@@ -3002,18 +3015,8 @@ fn is_runner_owned_sandbox(path: &Path) -> Result<bool, RunnerError> {
     {
         return Ok(false);
     }
-    for required in [
-        RUNNER_MARKER_FILE,
-        "run.json",
-        "report.json",
-        "events.ndjson",
-        "preflight.json",
-        "cleanup.json",
-        "artifacts",
-    ] {
-        if !path.join(required).exists() {
-            return Ok(false);
-        }
+    if !path.join("artifacts").exists() {
+        return Ok(false);
     }
     Ok(true)
 }
@@ -3885,6 +3888,40 @@ plain child stderr\n",
     }
 
     #[test]
+    fn post_scenario_cleanup_transport_error_records_failed_event() {
+        let temp = tempfile::tempdir().unwrap();
+        let executor = RecordingExecutor {
+            time_out_post_scenario_cleanup: Cell::new(true),
+            ..RecordingExecutor::default()
+        };
+
+        let outcome = run_with_executor(
+            RunRequest {
+                root: temp.path().join("e2e-runs"),
+                run_id: Some("cleanup-timeout-event-run".to_string()),
+                scenarios: vec![scenario::COLLISION_RENAME_VS_UNLINK.to_string()],
+                seed: 410,
+                studiofs_bin: None,
+                platform: PlatformSelection::WindowsWinfsp,
+                retention: RetentionPolicy::Always,
+                report: None,
+                port_range: None,
+                timeout: Some("30s".to_string()),
+                infra: InfraMode::Disabled,
+            },
+            &executor,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.status, RunStatus::Failed);
+        let events_path = outcome.report_path.parent().unwrap().join("events.ndjson");
+        let events = std::fs::read_to_string(events_path).unwrap();
+        assert!(events.contains(
+            r#""scenario":"collision-rename-vs-unlink","hook":"cleanup_verify","phase":"failed""#
+        ));
+    }
+
+    #[test]
     fn mounted_supervision_error_still_runs_cleanup_verification_and_writes_report() {
         let temp = tempfile::tempdir().unwrap();
         let executor = RecordingExecutor {
@@ -3972,6 +4009,15 @@ plain child stderr\n",
                 .iter()
                 .any(|arg| arg.ends_with("check-stale-processes.ps1"))
         );
+    }
+
+    #[test]
+    fn stale_process_cleanup_scripts_match_named_hotspot_helper() {
+        let windows_script = include_str!("../scripts/check-stale-processes.ps1");
+        let unix_script = include_str!("../scripts/check-stale-processes.sh");
+
+        assert!(windows_script.contains("studiofs-e2e-hotspot-helper.exe"));
+        assert!(unix_script.contains("studiofs-e2e-hotspot-helper"));
     }
 
     #[test]
@@ -4258,6 +4304,17 @@ plain child stderr\n",
                             .unwrap()
                             .contains("owner pid 4242 is still active")
                 )
+        );
+    }
+
+    #[test]
+    fn owner_liveness_command_rejects_pid_reuse_by_non_runner_process() {
+        let command = owner_liveness_command(4242);
+        let script = command.args.join(" ");
+
+        assert!(
+            script.contains("studiofs-e2e"),
+            "owner liveness must verify the PID still belongs to the e2e runner, not just any reused process"
         );
     }
 
@@ -4684,6 +4741,7 @@ plain child stderr\n",
         fail_up: Cell<bool>,
         fail_logs: Cell<bool>,
         fail_post_scenario_cleanup: Cell<bool>,
+        time_out_post_scenario_cleanup: Cell<bool>,
         fail_child_supervision_io: Cell<bool>,
         fail_first_child_report: Cell<bool>,
         time_out_first_child: Cell<bool>,
@@ -4738,12 +4796,16 @@ plain child stderr\n",
                     stderr: String::new(),
                 });
             }
-            if self.fail_post_scenario_cleanup.get()
-                && self.child_run_count.get() > 0
-                && command.env.iter().any(|(key, value)| {
-                    key == "STUDIOFS_E2E_CLEANUP_PHASE" && value == "post-scenario"
-                })
-            {
+            let is_post_scenario_cleanup = command.env.iter().any(|(key, value)| {
+                key == "STUDIOFS_E2E_CLEANUP_PHASE" && value == "post-scenario"
+            });
+            if is_post_scenario_cleanup && self.time_out_post_scenario_cleanup.get() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "command timed out after 30000 ms; child still running after kill attempts",
+                ));
+            }
+            if is_post_scenario_cleanup && self.fail_post_scenario_cleanup.get() {
                 return Ok(CommandOutput {
                     status: 1,
                     stdout: String::new(),

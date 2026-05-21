@@ -23,6 +23,8 @@ const DEFAULT_WINDOWS_MOUNT_LETTERS: &[char] = &[
     'Z', 'Y', 'X', 'W', 'V', 'U', 'T', 'S', 'R', 'Q', 'P', 'O', 'N', 'M', 'L', 'K',
 ];
 const MAX_COMMAND_OUTPUT_CHARS: usize = 4096;
+#[cfg(windows)]
+const TASKKILL_FALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
 const S3_BUCKET_NAME_MAX_CHARS: usize = 63;
 const E2E_BUCKET_PREFIX: &str = "studiofs-e2e-";
 const E2E_VOLUME_PREFIX: &str = "sfs-e2e-";
@@ -435,10 +437,7 @@ fn force_kill_child_process_tree(child: &mut Child, context: &str) -> io::Result
     let pid = child.id();
     #[cfg(windows)]
     {
-        let pid_arg = pid.to_string();
-        let tree_result = Command::new("taskkill")
-            .args(["/PID", &pid_arg, "/T", "/F"])
-            .output();
+        let tree_result = run_taskkill_with_timeout(pid, TASKKILL_FALLBACK_TIMEOUT);
         let primary_result = child.kill();
         match (tree_result, primary_result) {
             (Ok(output), _) if windows_taskkill_status_is_success(output.status.code()) => Ok(()),
@@ -461,6 +460,33 @@ fn force_kill_child_process_tree(child: &mut Child, context: &str) -> io::Result
         let _ = context;
         let _ = pid;
         child.kill()
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn run_taskkill_with_timeout(
+    pid: u32,
+    timeout: Duration,
+) -> io::Result<std::process::Output> {
+    let mut child = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let started = Instant::now();
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output();
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("taskkill timed out after {} ms", timeout.as_millis()),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(25));
     }
 }
 
@@ -865,10 +891,17 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
 
     /// Unmounts all mounted clients.
     pub fn unmount_all(&mut self) -> Result<(), ClientControllerError> {
+        let mut unmount_error = None;
         for index in 0..self.clients.len() {
-            self.unmount_index(index)?;
+            if let Err(error) = self.unmount_index(index) {
+                unmount_error.get_or_insert(error);
+            }
         }
-        Ok(())
+        if let Some(error) = unmount_error {
+            Err(error)
+        } else {
+            Ok(())
+        }
     }
 
     /// Unmounts a single named client.
@@ -889,6 +922,31 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
                     self.config.poll_interval,
                 ) {
                     kill_error.get_or_insert(err);
+                }
+            }
+            self.clients[index].process = None;
+            self.clients[index].spec.process_id = None;
+            self.clients[index].spec.state = ClientLifecycleState::Killed;
+        }
+        if let Some(err) = kill_error {
+            Err(err)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Sends best-effort termination to all tracked client processes without
+    /// waiting for exit. This is reserved for blocked mounted I/O paths where
+    /// waiting for process exit can keep the scenario child alive.
+    pub fn emergency_kill_all_no_wait(
+        &mut self,
+        context: &str,
+    ) -> Result<(), ClientControllerError> {
+        let mut kill_error = None;
+        for index in 0..self.clients.len() {
+            if let Some(process) = self.clients[index].process.as_mut() {
+                if let Err(err) = process.kill_process_tree(context) {
+                    kill_error.get_or_insert(ClientControllerError::Io(err));
                 }
             }
             self.clients[index].process = None;
@@ -1020,17 +1078,20 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
                 self.config.mount_exit_timeout,
                 self.config.poll_interval,
             ) {
-                if let Err(error) = force_kill_process_and_wait(
+                match force_kill_process_and_wait(
                     process.as_mut(),
                     "graceful unmount timeout",
                     self.config.mount_exit_timeout,
                     self.config.poll_interval,
                 ) {
-                    debug_log_kill_error(
-                        &self.clients[index].spec.name,
-                        "graceful unmount timeout",
-                        &error,
-                    );
+                    Ok(()) => {}
+                    Err(error) => {
+                        debug_log_kill_error(
+                            &self.clients[index].spec.name,
+                            "graceful unmount timeout",
+                            &error,
+                        );
+                    }
                 }
                 self.clients[index].process = None;
                 self.clients[index].spec.process_id = None;

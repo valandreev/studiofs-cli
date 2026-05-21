@@ -20,7 +20,7 @@ if ([string]::IsNullOrWhiteSpace($runnerRoot)) {
 
 $normalizedRunnerRoot = $runnerRoot.Replace('/', '\')
 $rootPattern = [regex]::Escape($normalizedRunnerRoot)
-$processFilter = "Name = 'studiofs.exe' OR Name = 'studiofs-e2e.exe'"
+$processFilter = "Name = 'studiofs.exe' OR Name = 'studiofs-e2e.exe' OR Name = 'studiofs-e2e-hotspot-helper.exe'"
 
 Get-CimInstance Win32_Process -Filter $processFilter |
     Where-Object {
@@ -41,9 +41,27 @@ Get-CimInstance Win32_Process -Filter $processFilter |
                         $taskkillPath = $systemTaskkill
                     }
                 }
-                $taskkill = Start-Process -FilePath $taskkillPath -ArgumentList @('/PID', "$($_.ProcessId)", '/T', '/F') -NoNewWindow -Wait -PassThru -ErrorAction Stop
-                if ($taskkill.ExitCode -ne 0 -and $taskkill.ExitCode -ne 128) {
-                    throw "taskkill exited with code $($taskkill.ExitCode)"
+                $taskkillStartInfo = [System.Diagnostics.ProcessStartInfo]::new()
+                $taskkillStartInfo.FileName = $taskkillPath
+                $taskkillStartInfo.UseShellExecute = $false
+                $taskkillStartInfo.RedirectStandardOutput = $true
+                $taskkillStartInfo.RedirectStandardError = $true
+                $taskkillStartInfo.Arguments = "/PID $($_.ProcessId) /T /F"
+                $taskkill = [System.Diagnostics.Process]::Start($taskkillStartInfo)
+                $stdoutTask = $taskkill.StandardOutput.ReadToEndAsync()
+                $stderrTask = $taskkill.StandardError.ReadToEndAsync()
+                if (-not $taskkill.WaitForExit(5000)) {
+                    try {
+                        $taskkill.Kill()
+                    } catch {
+                    }
+                    throw "taskkill timed out after 5000 ms"
+                }
+                $exitCode = $taskkill.ExitCode
+                $stdout = $stdoutTask.GetAwaiter().GetResult().Trim()
+                $stderr = $stderrTask.GetAwaiter().GetResult().Trim()
+                if ($exitCode -ne 0 -and $exitCode -ne 128) {
+                    throw "taskkill exited with code $exitCode; stdout=$stdout; stderr=$stderr"
                 }
                 "stopped $($_.ProcessId) $($_.Name) $($_.CommandLine)"
             } catch {
