@@ -45,13 +45,26 @@ fn build_mount_options(
     #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] foreground: bool,
     read_only: bool,
 ) -> Result<Vec<fuser::MountOption>, MountOptionError> {
+    build_mount_options_with_allow_other(
+        volume_name,
+        foreground,
+        read_only,
+        std::env::var("STUDIOFS_FUSE_ALLOW_OTHER").as_deref() == Ok("1"),
+    )
+}
+
+fn build_mount_options_with_allow_other(
+    volume_name: &str,
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] foreground: bool,
+    read_only: bool,
+    allow_other_env: bool,
+) -> Result<Vec<fuser::MountOption>, MountOptionError> {
     validate_volume_name(volume_name)?;
     let mut options = vec![
         fuser::MountOption::FSName(volume_name.into()),
         fuser::MountOption::AutoUnmount,
     ];
-    if std::env::var("STUDIOFS_FUSE_ALLOW_OTHER").as_deref() == Ok("1") || cfg!(target_os = "macos")
-    {
+    if allow_other_env || cfg!(target_os = "macos") {
         options.push(fuser::MountOption::AllowOther);
     }
     #[cfg(target_os = "macos")]
@@ -190,70 +203,15 @@ pub fn mount_and_serve(
 
 #[cfg(test)]
 mod tests {
-    #[cfg(target_os = "linux")]
-    use std::ffi::OsString;
-    #[cfg(target_os = "linux")]
-    use std::sync::{Mutex, OnceLock};
-
-    use super::{MountOptionError, build_mount_options, validate_volume_name};
+    use super::{
+        MountOptionError, build_mount_options, build_mount_options_with_allow_other,
+        validate_volume_name,
+    };
 
     fn mount_options_include_allow_other(options: &[fuser::MountOption]) -> bool {
         options
             .iter()
             .any(|opt| matches!(opt, fuser::MountOption::AllowOther))
-    }
-
-    #[cfg(target_os = "linux")]
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    #[cfg(target_os = "linux")]
-    struct EnvVarGuard {
-        key: &'static str,
-        previous: Option<OsString>,
-    }
-
-    #[cfg(target_os = "linux")]
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let previous = std::env::var_os(key);
-            // SAFETY: test helpers serialize env updates with a process-global lock.
-            unsafe {
-                std::env::set_var(key, value);
-            }
-            Self { key, previous }
-        }
-
-        fn unset(key: &'static str) -> Self {
-            let previous = std::env::var_os(key);
-            // SAFETY: test helpers serialize env updates with a process-global lock.
-            unsafe {
-                std::env::remove_var(key);
-            }
-            Self { key, previous }
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match self.previous.take() {
-                Some(value) => {
-                    // SAFETY: test helpers serialize env updates with a process-global lock.
-                    unsafe {
-                        std::env::set_var(self.key, value);
-                    }
-                }
-                None => {
-                    // SAFETY: test helpers serialize env updates with a process-global lock.
-                    unsafe {
-                        std::env::remove_var(self.key);
-                    }
-                }
-            }
-        }
     }
 
     #[test]
@@ -271,11 +229,8 @@ mod tests {
 
     #[test]
     fn build_mount_options_sets_core_fuse_flags() {
-        #[cfg(target_os = "linux")]
-        let _env_lock = env_lock().lock().expect("env lock");
-        #[cfg(target_os = "linux")]
-        let _guard = EnvVarGuard::unset("STUDIOFS_FUSE_ALLOW_OTHER");
-        let options = build_mount_options("studiofs", false, false).expect("options");
+        let options =
+            build_mount_options_with_allow_other("studiofs", false, false, false).expect("options");
         assert!(
             options
                 .iter()
@@ -298,16 +253,16 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn build_mount_options_adds_allow_other_when_opted_in_on_linux() {
-        let _env_lock = env_lock().lock().expect("env lock");
-        let _guard = EnvVarGuard::set("STUDIOFS_FUSE_ALLOW_OTHER", "1");
-        let options = build_mount_options("studiofs", false, false).expect("options");
+        let options =
+            build_mount_options_with_allow_other("studiofs", false, false, true).expect("options");
         assert!(mount_options_include_allow_other(&options));
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn build_mount_options_includes_foreground_when_requested() {
-        let options = build_mount_options("studiofs", true, false).expect("options");
+        let options =
+            build_mount_options_with_allow_other("studiofs", true, false, false).expect("options");
         assert!(options.iter().any(
             |opt| matches!(opt, fuser::MountOption::CUSTOM(custom) if custom == "foreground")
         ));
@@ -318,7 +273,8 @@ mod tests {
     fn build_mount_options_foreground_not_added_on_linux() {
         // On Linux, fusermount3 does not accept 'foreground' as a mount option.
         // fuser keeps the process in the foreground via session.run() itself.
-        let options = build_mount_options("studiofs", true, false).expect("options");
+        let options =
+            build_mount_options_with_allow_other("studiofs", true, false, false).expect("options");
         assert!(!options.iter().any(
             |opt| matches!(opt, fuser::MountOption::CUSTOM(custom) if custom == "foreground")
         ));
@@ -327,7 +283,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn build_mount_options_sets_macos_volume_name() {
-        let options = build_mount_options("studiofs-mac", false, false).expect("options");
+        let options = build_mount_options_with_allow_other("studiofs-mac", false, false, false)
+            .expect("options");
         assert!(options.iter().any(
             |opt| matches!(opt, fuser::MountOption::CUSTOM(custom) if custom == "volname=studiofs-mac")
         ));
@@ -336,7 +293,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn build_mount_options_sets_macos_local_flag() {
-        let options = build_mount_options("studiofs-mac", false, false).expect("options");
+        let options = build_mount_options_with_allow_other("studiofs-mac", false, false, false)
+            .expect("options");
         assert!(
             options
                 .iter()

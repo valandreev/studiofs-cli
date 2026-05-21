@@ -855,6 +855,9 @@ where
     {
         config.upload_worker_count = Some(max_spawned);
     }
+    if read_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH").is_ok() {
+        config.disable_background_slab_flush = Some(true);
+    }
 
     config
 }

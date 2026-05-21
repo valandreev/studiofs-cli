@@ -315,6 +315,8 @@ pub struct VfsConfig {
     pub upload_stats_interval_secs: u64,
     /// Background slab flusher wake interval.
     pub slab_flush_interval_ms: u64,
+    /// Whether to skip the background slab flush worker.
+    pub disable_background_slab_flush: bool,
     /// Upload local-cache I/O slots.
     pub upload_cache_io_slots: usize,
     /// Max active transit-memory bytes used by in-flight read/upload buffers.
@@ -475,6 +477,8 @@ pub struct VfsConfigRaw {
     pub upload_stats_interval_secs: Option<u64>,
     /// Optional override for slab flush interval (ms).
     pub slab_flush_interval_ms: Option<u64>,
+    /// Optional override for disabling the background slab flush worker.
+    pub disable_background_slab_flush: Option<bool>,
     /// Optional override for upload cache I/O slots.
     pub upload_cache_io_slots: Option<usize>,
     /// Optional override for transit memory budget bytes.
@@ -657,6 +661,7 @@ impl VfsConfigRaw {
             upload_requeue_max_ms,
             upload_stats_interval_secs,
             slab_flush_interval_ms,
+            disable_background_slab_flush,
             upload_cache_io_slots,
             transit_memory_budget_bytes,
             upload_user_idle_grace_ms,
@@ -825,6 +830,7 @@ impl From<VfsConfig> for VfsConfigRaw {
             upload_requeue_max_ms: Some(cfg.upload_requeue_max_ms),
             upload_stats_interval_secs: Some(cfg.upload_stats_interval_secs),
             slab_flush_interval_ms: Some(cfg.slab_flush_interval_ms),
+            disable_background_slab_flush: Some(cfg.disable_background_slab_flush),
             upload_cache_io_slots: Some(cfg.upload_cache_io_slots),
             transit_memory_budget_bytes: Some(cfg.transit_memory_budget_bytes),
             upload_user_idle_grace_ms: Some(cfg.upload_user_idle_grace_ms),
@@ -907,6 +913,7 @@ impl Default for VfsConfig {
             upload_requeue_max_ms: DEFAULT_UPLOAD_REQUEUE_MAX_MS,
             upload_stats_interval_secs: DEFAULT_UPLOAD_STATS_INTERVAL_SECS,
             slab_flush_interval_ms: DEFAULT_SLAB_FLUSH_INTERVAL_MS,
+            disable_background_slab_flush: false,
             upload_cache_io_slots: DEFAULT_UPLOAD_CACHE_IO_SLOTS,
             transit_memory_budget_bytes: DEFAULT_TRANSIT_MEMORY_BUDGET_BYTES,
             upload_user_idle_grace_ms: DEFAULT_UPLOAD_USER_IDLE_GRACE_MS,

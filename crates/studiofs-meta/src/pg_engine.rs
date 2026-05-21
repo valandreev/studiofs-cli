@@ -22,6 +22,50 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
+#[cfg(test)]
+thread_local! {
+    static TEST_ENV_OVERRIDES: std::cell::RefCell<HashMap<&'static str, Option<String>>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+fn pg_env_var(key: &str) -> Option<String> {
+    #[cfg(test)]
+    if let Some(value) = TEST_ENV_OVERRIDES.with(|overrides| overrides.borrow().get(key).cloned()) {
+        return value;
+    }
+    std::env::var(key).ok()
+}
+
+#[cfg(test)]
+struct TestEnvGuard {
+    key: &'static str,
+    previous: Option<Option<String>>,
+}
+
+#[cfg(test)]
+impl Drop for TestEnvGuard {
+    fn drop(&mut self) {
+        TEST_ENV_OVERRIDES.with(|overrides| {
+            let mut overrides = overrides.borrow_mut();
+            match self.previous.take() {
+                Some(value) => {
+                    overrides.insert(self.key, value);
+                }
+                None => {
+                    overrides.remove(self.key);
+                }
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+fn set_test_env(key: &'static str, value: &str) -> TestEnvGuard {
+    let previous = TEST_ENV_OVERRIDES
+        .with(|overrides| overrides.borrow_mut().insert(key, Some(value.to_string())));
+    TestEnvGuard { key, previous }
+}
+
 const LOCAL_PG_VERSION_COUNTER: &str = "pgLastAppliedBatchVersion";
 const LOCAL_PG_NAMESPACE_VERSION_COUNTER: &str = "pgLastAppliedNamespaceBatchVersion";
 const LOCAL_PG_CLIENT_SLOT_COUNTER: &str = "pgClientSlotPlusOne";
@@ -251,8 +295,7 @@ impl PgMetaEngine {
 
     fn env_duration_ms(key: &str, default_ms: u64) -> Duration {
         Duration::from_millis(
-            std::env::var(key)
-                .ok()
+            pg_env_var(key)
                 .and_then(|v| v.parse::<u64>().ok())
                 .filter(|v| *v > 0)
                 .unwrap_or(default_ms),
@@ -363,27 +406,23 @@ impl PgMetaEngine {
             ));
         }
 
-        let poll_secs = std::env::var("STUDIOFS_PG_SYNC_POLL_SECS")
-            .ok()
+        let poll_secs = pg_env_var("STUDIOFS_PG_SYNC_POLL_SECS")
             .and_then(|v| v.parse::<u64>().ok())
             .filter(|v| *v > 0)
             .unwrap_or(2);
         let flush_idle_grace = Duration::from_millis(
-            std::env::var("STUDIOFS_PG_FLUSH_IDLE_MS")
-                .ok()
+            pg_env_var("STUDIOFS_PG_FLUSH_IDLE_MS")
                 .and_then(|v| v.parse::<u64>().ok())
                 .filter(|v| *v > 0)
                 .unwrap_or(5_000),
         );
         let flush_interval = Duration::from_secs(
-            std::env::var("STUDIOFS_PG_FLUSH_INTERVAL_SECS")
-                .ok()
+            pg_env_var("STUDIOFS_PG_FLUSH_INTERVAL_SECS")
                 .and_then(|v| v.parse::<u64>().ok())
                 .filter(|v| *v > 0)
                 .unwrap_or(DEFAULT_PG_FLUSH_INTERVAL_SECS),
         );
-        let flush_ops_threshold = std::env::var("STUDIOFS_PG_FLUSH_OPS_THRESHOLD")
-            .ok()
+        let flush_ops_threshold = pg_env_var("STUDIOFS_PG_FLUSH_OPS_THRESHOLD")
             .and_then(|v| v.parse::<u32>().ok())
             .filter(|v| *v > 0)
             .unwrap_or(DEFAULT_PG_FLUSH_OPS_THRESHOLD);

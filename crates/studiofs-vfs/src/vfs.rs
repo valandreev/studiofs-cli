@@ -2798,6 +2798,7 @@ pub struct StudioVfs {
     upload_user_idle_grace: Duration,
     /// Upload worker pool size.
     upload_worker_count: usize,
+    disable_background_slab_flush: bool,
     publish_visibility_timeout: Duration,
     /// Sequential read-ahead tracker.
     readahead: Arc<ReadAheadTracker>,
@@ -4530,7 +4531,7 @@ impl StudioVfs {
     }
 
     fn spawn_local_dirty_flush_worker(self: &Arc<Self>) {
-        if std::env::var_os("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH").is_some() {
+        if self.disable_background_slab_flush {
             return;
         }
         let vfs = self.clone();

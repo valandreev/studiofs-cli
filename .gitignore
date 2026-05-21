@@ -5,7 +5,8 @@ cargo-audit.json
 *.db-wal
 # Cargo.lock
 /docs/done
-# /docs/ideas
+/docs/ideas
+/docs/code-reviews/*.*
 docs/logs/*.*
 *.exe
 .env
