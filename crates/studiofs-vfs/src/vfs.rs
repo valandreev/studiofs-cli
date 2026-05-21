@@ -5122,10 +5122,12 @@ impl StudioVfs {
         }
         let has_pending_local_payloads = self.has_pending_local_dirty_payloads_for_inode(ino);
         let has_dirty_writers = self.state.writer_stack.has_dirty_writers(ino);
+        if has_dirty_writers {
+            return false;
+        }
         let local_state_is_newer_than_ready_attr =
             dirty_attr_epoch.is_none_or(|content_epoch| content_epoch > committed_epoch);
-        if (has_pending_local_payloads || has_dirty_writers) && local_state_is_newer_than_ready_attr
-        {
+        if has_pending_local_payloads && local_state_is_newer_than_ready_attr {
             return false;
         }
         if dirty_attr_covers_ready_attr {
