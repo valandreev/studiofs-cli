@@ -255,8 +255,11 @@ pub struct VfsConfig {
     /// Maximum total bytes allowed in the dirty-write memory buffer.
     /// Parsed from env via `parse_size_bytes` (for example `1.5GB`).
     pub max_dirty_bytes: usize,
-    /// Minimum bytes of dirty full-block data to coalesce before `write()`
+    /// Minimum bytes of dirty full-block data to exceed before `write()`
     /// triggers an eager local persist batch.
+    ///
+    /// Reaching this value exactly is still allowed to stay staged until
+    /// either more dirty data arrives or an explicit flush barrier runs.
     /// Parsed from env via `parse_size_bytes` (for example `32MB`).
     pub write_eager_flush_batch_bytes: usize,
     /// Maximum bytes allowed for a single xattr value.
@@ -423,7 +426,8 @@ pub struct VfsConfigRaw {
     pub lock_retry_max_ms: Option<u64>,
     /// Optional override for max dirty bytes.
     pub max_dirty_bytes: Option<usize>,
-    /// Optional override for eager write flush batch bytes.
+    /// Optional override for eager write flush batch bytes. The eager persist
+    /// path starts only after dirty full-block data exceeds this value.
     pub write_eager_flush_batch_bytes: Option<usize>,
     /// Optional override for max xattr bytes.
     pub max_xattr_bytes: Option<usize>,

@@ -10195,6 +10195,7 @@ fn write_stages_successive_full_blocks_without_waiting_for_threshold() {
         let vfs_config = VfsConfigRaw {
             max_dirty_bytes: Some(16 * 1024 * 1024),
             write_eager_flush_batch_bytes: Some(block_size * 4),
+            disable_background_slab_flush: Some(true),
             ..VfsConfigRaw::default()
         };
         let vfs = StudioVfs::new(
