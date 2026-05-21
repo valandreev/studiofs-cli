@@ -751,7 +751,20 @@ fn verify_post_scenario_cleanup(
         "started",
     )
     .map_err(|err| err.to_string())?;
-    let output = executor.run(&command).map_err(|err| err.to_string())?;
+    let output = match executor.run(&command) {
+        Ok(output) => output,
+        Err(err) => {
+            record_event(
+                events_path,
+                run_id,
+                Some(scenario),
+                "cleanup_verify",
+                "failed",
+            )
+            .map_err(|event_err| event_err.to_string())?;
+            return Err(err.to_string());
+        }
+    };
     let cleanup_detail = stale_process_cleanup_detail(&output.stdout);
     if output.status == 0 && output.stdout.trim().is_empty() {
         record_event(
@@ -3875,6 +3888,40 @@ plain child stderr\n",
     }
 
     #[test]
+    fn post_scenario_cleanup_transport_error_records_failed_event() {
+        let temp = tempfile::tempdir().unwrap();
+        let executor = RecordingExecutor {
+            time_out_post_scenario_cleanup: Cell::new(true),
+            ..RecordingExecutor::default()
+        };
+
+        let outcome = run_with_executor(
+            RunRequest {
+                root: temp.path().join("e2e-runs"),
+                run_id: Some("cleanup-timeout-event-run".to_string()),
+                scenarios: vec![scenario::COLLISION_RENAME_VS_UNLINK.to_string()],
+                seed: 410,
+                studiofs_bin: None,
+                platform: PlatformSelection::WindowsWinfsp,
+                retention: RetentionPolicy::Always,
+                report: None,
+                port_range: None,
+                timeout: Some("30s".to_string()),
+                infra: InfraMode::Disabled,
+            },
+            &executor,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.status, RunStatus::Failed);
+        let events_path = outcome.report_path.parent().unwrap().join("events.ndjson");
+        let events = std::fs::read_to_string(events_path).unwrap();
+        assert!(events.contains(
+            r#""scenario":"collision-rename-vs-unlink","hook":"cleanup_verify","phase":"failed""#
+        ));
+    }
+
+    #[test]
     fn mounted_supervision_error_still_runs_cleanup_verification_and_writes_report() {
         let temp = tempfile::tempdir().unwrap();
         let executor = RecordingExecutor {
@@ -3962,6 +4009,15 @@ plain child stderr\n",
                 .iter()
                 .any(|arg| arg.ends_with("check-stale-processes.ps1"))
         );
+    }
+
+    #[test]
+    fn stale_process_cleanup_scripts_match_named_hotspot_helper() {
+        let windows_script = include_str!("../scripts/check-stale-processes.ps1");
+        let unix_script = include_str!("../scripts/check-stale-processes.sh");
+
+        assert!(windows_script.contains("studiofs-e2e-hotspot-helper.exe"));
+        assert!(unix_script.contains("studiofs-e2e-hotspot-helper"));
     }
 
     #[test]
@@ -4685,6 +4741,7 @@ plain child stderr\n",
         fail_up: Cell<bool>,
         fail_logs: Cell<bool>,
         fail_post_scenario_cleanup: Cell<bool>,
+        time_out_post_scenario_cleanup: Cell<bool>,
         fail_child_supervision_io: Cell<bool>,
         fail_first_child_report: Cell<bool>,
         time_out_first_child: Cell<bool>,
@@ -4739,12 +4796,16 @@ plain child stderr\n",
                     stderr: String::new(),
                 });
             }
-            if self.fail_post_scenario_cleanup.get()
-                && self.child_run_count.get() > 0
-                && command.env.iter().any(|(key, value)| {
-                    key == "STUDIOFS_E2E_CLEANUP_PHASE" && value == "post-scenario"
-                })
-            {
+            let is_post_scenario_cleanup = command.env.iter().any(|(key, value)| {
+                key == "STUDIOFS_E2E_CLEANUP_PHASE" && value == "post-scenario"
+            });
+            if is_post_scenario_cleanup && self.time_out_post_scenario_cleanup.get() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "command timed out after 30000 ms; child still running after kill attempts",
+                ));
+            }
+            if is_post_scenario_cleanup && self.fail_post_scenario_cleanup.get() {
                 return Ok(CommandOutput {
                     status: 1,
                     stdout: String::new(),

@@ -231,6 +231,7 @@ fn run_command(
     loop {
         if child.try_wait()?.is_some() {
             let status = child.wait()?;
+            terminate_descendants_after_primary_exit(&job);
             let stdout = collect_reader(stdout_reader.take())?;
             let stderr = collect_reader(stderr_reader.take())?;
             return Ok(CommandOutput {
@@ -293,6 +294,11 @@ fn run_command(
         }
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn terminate_descendants_after_primary_exit(job: &ChildJob) {
+    let _ = job.terminate();
+    let _ = job.force_kill();
 }
 
 #[cfg(windows)]
@@ -1301,6 +1307,23 @@ mod tests {
     }
 
     #[test]
+    fn executor_does_not_wait_for_descendant_pipe_handles_after_primary_exit() {
+        let _guard = crate::process_job::child_job_test_lock();
+        let command = exits_with_descendant_holding_stdio(Duration::from_secs(10));
+        let started = Instant::now();
+
+        let output = SystemCommandExecutor
+            .run(&command)
+            .expect("primary child exit should be reported without waiting for descendants");
+
+        assert_eq!(output.status, 7);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "executor must close the child job before joining output reader threads"
+        );
+    }
+
+    #[test]
     fn command_streams_output_only_when_enabled() {
         let mut command = large_stdout_command(Duration::from_secs(5));
 
@@ -1396,6 +1419,20 @@ timestamp=t studiofs-e2e phase=run status=\x1b[31mfailed\x1b[0m\n",
         }
     }
 
+    #[cfg(windows)]
+    fn exits_with_descendant_holding_stdio(timeout: Duration) -> CommandSpec {
+        CommandSpec {
+            program: "cmd".to_string(),
+            args: vec![
+                "/C".to_string(),
+                "start /B powershell -NoLogo -NoProfile -NonInteractive -Command Start-Sleep -Seconds 5 & exit /B 7".to_string(),
+            ],
+            env: Vec::new(),
+            cwd: None,
+            timeout: Some(timeout),
+        }
+    }
+
     #[cfg(unix)]
     fn hung_command(timeout: Duration) -> CommandSpec {
         CommandSpec {
@@ -1432,6 +1469,17 @@ timestamp=t studiofs-e2e phase=run status=\x1b[31mfailed\x1b[0m\n",
             env: Vec::new(),
             cwd: None,
             timeout,
+        }
+    }
+
+    #[cfg(unix)]
+    fn exits_with_descendant_holding_stdio(timeout: Duration) -> CommandSpec {
+        CommandSpec {
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), "sleep 5 & exit 7".to_string()],
+            env: Vec::new(),
+            cwd: None,
+            timeout: Some(timeout),
         }
     }
 }
