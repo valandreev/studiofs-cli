@@ -464,7 +464,10 @@ fn force_kill_child_process_tree(child: &mut Child, context: &str) -> io::Result
 }
 
 #[cfg(windows)]
-fn run_taskkill_with_timeout(pid: u32, timeout: Duration) -> io::Result<std::process::Output> {
+pub(crate) fn run_taskkill_with_timeout(
+    pid: u32,
+    timeout: Duration,
+) -> io::Result<std::process::Output> {
     let mut child = Command::new("taskkill")
         .args(["/PID", &pid.to_string(), "/T", "/F"])
         .stdout(Stdio::piped())

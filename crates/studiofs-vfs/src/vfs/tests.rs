@@ -2575,6 +2575,83 @@ fn remote_ready_attr_with_same_epoch_preserves_pending_local_write() {
 }
 
 #[test]
+fn remote_ready_attr_with_same_epoch_preserves_buffered_writer_stack_tail() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "remote-ready-same-epoch-keeps-writer");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"remote-ready-same-epoch-keeps-writer.bin", 0, 0, 0o644)
+            .expect("create test file");
+        let ino = attr.ino;
+
+        vfs.write(ino, 0, b"published-prefix")
+            .await
+            .expect("write base payload");
+        vfs.flush(ino).await.expect("flush base payload");
+        let (published_epoch, published_blocks) =
+            mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+        publish_current_file_graph(&meta, ino, published_epoch, &published_blocks);
+        vfs.cancel_pending_uploads_for_inode(ino);
+        vfs.clear_pending_payloads_for_inode(ino);
+        vfs.state.writer_stack.clear_inode(ino);
+        vfs.remove_live_extents_for_inode(ino);
+        vfs.remove_pending_epoch_finalizations_for_inode(ino);
+
+        let published_attr = meta.get_attr(ino).expect("load published attr");
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open writable handle");
+        let tail_offset = published_attr.size + 4096;
+        let tail = b"local writer-stack tail";
+
+        vfs.write_fh_with_local_sync_policy(
+            fh,
+            ino,
+            tail_offset,
+            tail,
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .expect("buffer local tail");
+        assert!(
+            vfs.state.writer_stack.has_dirty_writers(ino),
+            "setup should keep the tail only in the mounted writer stack"
+        );
+
+        let dirty_epoch = vfs
+            .state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .get(&ino)
+            .expect("dirty attr")
+            .content_epoch;
+        let mut remote_ready = published_attr.clone();
+        remote_ready.size = tail_offset + tail.len() as u64;
+        remote_ready.committed_size = remote_ready.size;
+        remote_ready.content_epoch = dirty_epoch;
+        remote_ready.committed_content_epoch = dirty_epoch;
+        remote_ready.upload_state = MetaUploadState::Ready;
+
+        vfs.refresh_inode_incarnation_state_from_attr(ino, &remote_ready);
+
+        assert!(
+            vfs.state.writer_stack.has_dirty_writers(ino),
+            "same-epoch remote ready metadata must not discard local writer-stack bytes"
+        );
+        let actual = vfs
+            .read(ino, tail_offset, tail.len() as u32)
+            .await
+            .expect("read local tail");
+        assert_eq!(actual.as_ref(), tail);
+
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
 fn same_size_strict_sparse_tail_write_advances_past_committed_epoch() {
     let tmp = TempDir::new().expect("tempdir");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "same-size-strict-tail-publish");

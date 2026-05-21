@@ -24,6 +24,8 @@ use crate::client::{
     PeerVolumeBootstrapOptions, PeerVolumeBootstrapSummary, SystemClientProcessExecutor,
     VolumeBootstrapOptions, VolumeBootstrapSummary,
 };
+#[cfg(all(windows, not(test)))]
+use crate::client::{run_taskkill_with_timeout, windows_taskkill_status_is_success};
 use crate::infra::{
     CommandExecutor, ComposeServiceControl, InfraError, POSTGRES_SERVICE_NAME, RUSTFS_SERVICE_NAME,
     SystemCommandExecutor,
@@ -5066,13 +5068,12 @@ fn run_hotspot_churn_operations_with_timeout(
             &format!("hotspot round {round}\n"),
         );
         let order = operations.len() + 1;
-        let operation = timed_hotspot_helper_fs_op_with_helper(
+        let operation = timed_hotspot_helper_fs_op(
             context,
             started,
             order,
             &clients[0],
             "overwrite",
-            "overwrite-barrier",
             &slot,
             operation_timeout,
             Some(&write_payload),
@@ -5095,10 +5096,9 @@ fn run_hotspot_churn_operations_with_timeout(
             None,
         )?;
         record_sparse_operation(context, &mut operations, operation)?;
-        wait_for_hotspot_helper_stat_until(
-            context,
-            &clients[0],
-            &slot,
+        wait_for_required_paths_visible_until(
+            std::slice::from_ref(&clients[0]),
+            &[slot.as_str()],
             Instant::now() + operation_timeout,
             poll_interval,
             "hotspot rename source",
@@ -5327,6 +5327,7 @@ fn run_hotspot_helper_process(
                     pending_label,
                     progress_suffix
                 );
+                terminate_blocked_hotspot_client_process(client, &pending_label);
                 let _ = job.terminate();
                 if !wait_for_child_exit(&mut child, CHILD_TERMINATION_GRACE).unwrap_or(false) {
                     let _ = job.force_kill();
@@ -5342,6 +5343,35 @@ fn run_hotspot_helper_process(
         }
     }
 }
+
+#[cfg(all(windows, not(test)))]
+fn terminate_blocked_hotspot_client_process(client: &ClientSpec, pending_label: &str) {
+    let Some(pid) = client.process_id else {
+        return;
+    };
+    eprintln!(
+        "studiofs-e2e: terminating mounted client process {pid} to release blocked hotspot helper I/O: {pending_label}"
+    );
+    match run_taskkill_with_timeout(pid, Duration::from_secs(5)) {
+        Ok(output) if windows_taskkill_status_is_success(output.status.code()) => {}
+        Ok(output) => {
+            eprintln!(
+                "studiofs-e2e: taskkill for blocked mounted client process {pid} exited with {}; stdout={}; stderr={}",
+                output.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&output.stdout).trim(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Err(error) => {
+            eprintln!(
+                "studiofs-e2e: taskkill for blocked mounted client process {pid} failed: {error}"
+            );
+        }
+    }
+}
+
+#[cfg(all(not(windows), not(test)))]
+fn terminate_blocked_hotspot_client_process(_client: &ClientSpec, _pending_label: &str) {}
 
 fn write_helper_payload(
     context: &ScenarioContext,

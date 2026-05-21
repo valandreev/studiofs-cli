@@ -5079,12 +5079,11 @@ impl StudioVfs {
             return false;
         }
         let committed_epoch = attr.committed_content_epoch;
-        let (dirty_attr_present, dirty_attr_newer_than_committed, dirty_attr_covers_ready_attr) = {
+        let (dirty_attr_present, dirty_attr_covers_ready_attr) = {
             let dirty_attrs = self.state.namespace.dirty_attrs.lock();
             let dirty_attr = dirty_attrs.get(&ino);
             (
                 dirty_attr.is_some(),
-                dirty_attr.is_some_and(|dirty_attr| dirty_attr.content_epoch > committed_epoch),
                 dirty_attr.is_some_and(|dirty_attr| {
                     dirty_attr.content_epoch > committed_epoch && dirty_attr.size >= attr.size
                 }),
@@ -5122,13 +5121,10 @@ impl StudioVfs {
         }
         let has_pending_local_payloads = self.has_pending_local_dirty_payloads_for_inode(ino);
         let has_dirty_writers = self.state.writer_stack.has_dirty_writers(ino);
-        if dirty_attr_covers_ready_attr
-            || (dirty_attr_newer_than_committed
-                && (has_pending_local_payloads || has_dirty_writers))
-        {
+        if has_pending_local_payloads || has_dirty_writers {
             return false;
         }
-        if has_dirty_writers && !dirty_attr_present {
+        if dirty_attr_covers_ready_attr {
             return false;
         }
         if !dirty_attr_present
