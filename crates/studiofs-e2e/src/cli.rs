@@ -37,6 +37,9 @@ pub enum Commands {
     /// Execute one bounded mounted hotspot filesystem operation.
     #[command(hide = true)]
     HotspotOp(HotspotOpArgs),
+    /// Execute the mounted open-handle mutation sequence in a bounded helper.
+    #[command(hide = true)]
+    OpenHandleOp(OpenHandleOpArgs),
     /// Run the SFS-405 Local First baseline gate for mounted scenarios 1-8.
     LocalFirstBaselineGate(BaselineGateArgs),
     /// Remove runner-owned sandboxes from the run root.
@@ -150,6 +153,42 @@ pub struct HotspotOpArgs {
     pub sandbox: Option<PathBuf>,
 
     /// Per-operation progress JSONL path used to diagnose bounded helper timeouts.
+    #[arg(long, hide = true)]
+    pub progress: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+/// Hidden helper arguments for the mounted open-handle mutation sequence.
+pub struct OpenHandleOpArgs {
+    /// Mounted root for the client that keeps the old handle open.
+    #[arg(long)]
+    pub client_a_mount: PathBuf,
+
+    /// Mounted root for the client that mutates namespace entries.
+    #[arg(long)]
+    pub client_b_mount: PathBuf,
+
+    /// Relative unlink target path under both mounts.
+    #[arg(long)]
+    pub unlink_path: String,
+
+    /// Relative rename source path under client-b's mount.
+    #[arg(long)]
+    pub rename_source: String,
+
+    /// Relative rename destination path under client-b's mount.
+    #[arg(long)]
+    pub rename_dest: String,
+
+    /// Payload file appended through the old client-a handle.
+    #[arg(long)]
+    pub append_payload: PathBuf,
+
+    /// Parent sandbox path used only so stale-process cleanup can identify helpers.
+    #[arg(long, hide = true)]
+    pub sandbox: Option<PathBuf>,
+
+    /// Per-sequence progress JSONL path used to diagnose bounded helper timeouts.
     #[arg(long, hide = true)]
     pub progress: Option<PathBuf>,
 }
@@ -358,6 +397,21 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             // WinFSP is under churn.
             std::process::exit(0);
         }
+        Commands::OpenHandleOp(args) => {
+            scenario::run_open_handle_op_helper(
+                args.client_a_mount,
+                args.client_b_mount,
+                &args.unlink_path,
+                &args.rename_source,
+                &args.rename_dest,
+                &args.append_payload,
+                args.progress.as_deref(),
+            )?;
+            // This helper isolates the whole open-handle mutation sequence.  Exit
+            // immediately after the bounded filesystem work returns so parent
+            // cleanup does not inherit any helper-local teardown risk.
+            std::process::exit(0);
+        }
         Commands::LocalFirstBaselineGate(args) => {
             let outcome = baseline_gate::run(args.into_request())?;
             for run in &outcome.runs {
@@ -451,6 +505,44 @@ mod tests {
         assert_eq!(args.mount_point, PathBuf::from("Z:\\"));
         assert_eq!(args.path, "hotspot/slot-1.txt");
         assert_eq!(args.target.as_deref(), Some("hotspot/slot-1-renamed.txt"));
+        assert_eq!(args.progress, None);
+    }
+
+    #[test]
+    fn hidden_open_handle_op_subcommand_parses() {
+        let cli = Cli::try_parse_from([
+            "studiofs-e2e",
+            "open-handle-op",
+            "--sandbox",
+            "target/e2e-runs/run-1",
+            "--client-a-mount",
+            "Z:\\",
+            "--client-b-mount",
+            "V:\\",
+            "--unlink-path",
+            "open-handles/unlink-target.txt",
+            "--rename-source",
+            "open-handles/rename-source.txt",
+            "--rename-dest",
+            "open-handles/renamed-destination.txt",
+            "--append-payload",
+            "target/e2e-runs/run-1/open-handle.payload",
+        ])
+        .expect("hidden open-handle-op command should parse");
+
+        let Commands::OpenHandleOp(args) = cli.command else {
+            panic!("expected hidden open-handle-op command");
+        };
+        assert_eq!(args.sandbox, Some(PathBuf::from("target/e2e-runs/run-1")));
+        assert_eq!(args.client_a_mount, PathBuf::from("Z:\\"));
+        assert_eq!(args.client_b_mount, PathBuf::from("V:\\"));
+        assert_eq!(args.unlink_path, "open-handles/unlink-target.txt");
+        assert_eq!(args.rename_source, "open-handles/rename-source.txt");
+        assert_eq!(args.rename_dest, "open-handles/renamed-destination.txt");
+        assert_eq!(
+            args.append_payload,
+            PathBuf::from("target/e2e-runs/run-1/open-handle.payload")
+        );
         assert_eq!(args.progress, None);
     }
 

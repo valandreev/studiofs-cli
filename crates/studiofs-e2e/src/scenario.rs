@@ -136,6 +136,7 @@ const MOUNTED_WRITE_READBACK_POLL_INTERVAL: Duration = Duration::from_millis(25)
 const MOUNTED_VALIDATION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const MOUNTED_VALIDATION_MAX_ACTIVE_PROBES: usize = 1;
 const HOTSPOT_CHURN_OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
+const OPEN_HANDLE_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
 const HOTSPOT_IO_MAX_ACTIVE_WORKERS: usize = 1;
 static HOTSPOT_HELPER_PAYLOAD_ID: AtomicUsize = AtomicUsize::new(0);
@@ -5669,7 +5670,7 @@ fn run_open_handle_operations(
 ) -> Result<Vec<NamespaceCollisionOperation>, ScenarioError> {
     let started = Instant::now();
     let mut operations = Vec::new();
-    seed_open_handle_initial_tree(clients, isolation)?;
+    seed_open_handle_initial_tree(context, clients, isolation, OPEN_HANDLE_OPERATION_TIMEOUT)?;
     wait_for_open_handle_initial_tree(
         context,
         clients,
@@ -5680,55 +5681,62 @@ fn run_open_handle_operations(
     let unlink_target = open_handle_isolated_path(isolation, OPEN_HANDLE_UNLINK_TARGET);
     let rename_source = open_handle_isolated_path(isolation, OPEN_HANDLE_RENAME_SOURCE);
     let rename_dest = open_handle_isolated_path(isolation, OPEN_HANDLE_RENAME_DEST);
-    let mut handle = OpenOptions::new()
-        .append(true)
-        .open(clients[0].mount_point.join(&unlink_target))?;
-    operations.push(fs_op(
-        started,
-        1,
-        &clients[1],
-        "unlink",
-        &unlink_target,
-        || fs::remove_file(clients[1].mount_point.join(&unlink_target)),
-    ));
-    operations.push(fs_op(
-        started,
-        2,
-        &clients[1],
-        "rename",
-        &rename_source,
-        || {
-            fs::rename(
-                clients[1].mount_point.join(&rename_source),
-                clients[1].mount_point.join(&rename_dest),
-            )
-        },
-    ));
     let append_payload = isolation.payload(
         "append_old_handle",
         &unlink_target,
         "append through old handle\n",
     );
-    operations.push(required_record(record_advanced_operation(
+    run_open_handle_helper_process(
+        context,
+        OPEN_HANDLE_OPERATION_TIMEOUT,
+        &clients[0],
+        &clients[1],
+        &unlink_target,
+        &rename_source,
+        &rename_dest,
+        &append_payload,
+    )?;
+    operations.push(record_advanced_operation(
+        started,
+        1,
+        &clients[0],
+        "open",
+        &unlink_target,
+        Ok(()),
+    ));
+    operations.push(record_advanced_operation(
+        started,
+        2,
+        &clients[1],
+        "unlink",
+        &unlink_target,
+        Ok(()),
+    ));
+    operations.push(record_advanced_operation(
         started,
         3,
+        &clients[1],
+        "rename",
+        &rename_source,
+        Ok(()),
+    ));
+    operations.push(record_advanced_operation(
+        started,
+        4,
         &clients[0],
         "append_old_handle",
         &unlink_target,
-        handle
-            .write_all(&append_payload)
-            .and_then(|()| handle.sync_all())
-            .map_err(|error| error.to_string()),
-    ))?);
-    drop(handle);
+        Ok(()),
+    ));
     Ok(operations)
 }
 
 fn seed_open_handle_initial_tree(
+    context: &ScenarioContext,
     clients: &[ClientSpec],
     isolation: &ScenarioIsolation,
+    operation_timeout: Duration,
 ) -> Result<(), ScenarioError> {
-    let seed_mount = &clients[0].mount_point;
     let unlink_target = open_handle_isolated_path(isolation, OPEN_HANDLE_UNLINK_TARGET);
     let rename_source = open_handle_isolated_path(isolation, OPEN_HANDLE_RENAME_SOURCE);
     let unlink_payload = isolation.payload(
@@ -5741,17 +5749,158 @@ fn seed_open_handle_initial_tree(
         &rename_source,
         &String::from_utf8_lossy(OPEN_HANDLE_RENAME_SOURCE_PAYLOAD),
     );
-    write_mounted_initial_file(
-        seed_mount.join(unlink_target),
-        &unlink_payload,
-        "open handle initial tree",
+    run_hotspot_helper_process(
+        context,
+        operation_timeout,
+        &clients[0],
+        "create",
+        &unlink_target,
+        None,
+        Some(&unlink_payload),
+        format!(
+            "{} create {unlink_target} for open handle seed",
+            clients[0].name
+        ),
     )?;
-    write_mounted_initial_file(
-        seed_mount.join(rename_source),
-        &rename_payload,
-        "open handle initial tree",
+    run_hotspot_helper_process(
+        context,
+        operation_timeout,
+        &clients[0],
+        "create",
+        &rename_source,
+        None,
+        Some(&rename_payload),
+        format!(
+            "{} create {rename_source} for open handle seed",
+            clients[0].name
+        ),
     )?;
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_open_handle_helper_process(
+    context: &ScenarioContext,
+    timeout: Duration,
+    client_a: &ClientSpec,
+    client_b: &ClientSpec,
+    unlink_path: &str,
+    rename_source: &str,
+    rename_dest: &str,
+    append_payload: &[u8],
+) -> Result<(), ScenarioError> {
+    let payload_path =
+        write_helper_payload(context, client_a, "open-handle", Some(append_payload))?
+            .ok_or_else(|| io::Error::other("open-handle helper payload path was not written"))?;
+    let progress_path = helper_progress_path(context, client_a, "open-handle", unlink_path)?;
+    let pending_label = format!(
+        "{} open old handle {}; {} unlink {} and rename {} -> {}",
+        client_a.name, unlink_path, client_b.name, unlink_path, rename_source, rename_dest
+    );
+
+    #[cfg(test)]
+    {
+        let _ = timeout;
+        run_open_handle_op_helper(
+            client_a.mount_point.clone(),
+            client_b.mount_point.clone(),
+            unlink_path,
+            rename_source,
+            rename_dest,
+            &payload_path,
+            Some(&progress_path),
+        )
+        .map_err(|error| {
+            ScenarioError::Io(io::Error::other(format!(
+                "open-handle helper failed for {pending_label}: {error}"
+            )))
+        })
+    }
+
+    #[cfg(not(test))]
+    {
+        let exe = prepare_hotspot_helper_exe(context)?;
+        let mut command = Command::new(exe);
+        command
+            .arg("open-handle-op")
+            .arg("--sandbox")
+            .arg(&context.sandbox)
+            .arg("--client-a-mount")
+            .arg(&client_a.mount_point)
+            .arg("--client-b-mount")
+            .arg(&client_b.mount_point)
+            .arg("--unlink-path")
+            .arg(unlink_path)
+            .arg("--rename-source")
+            .arg(rename_source)
+            .arg("--rename-dest")
+            .arg(rename_dest)
+            .arg("--append-payload")
+            .arg(&payload_path)
+            .arg("--progress")
+            .arg(&progress_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+
+        ChildJob::prepare_command(&mut command)?;
+        let mut child = command.spawn()?;
+        let job = ChildJob::assign_to_child(&child).map_err(|error| {
+            let _ = child.kill();
+            let _ = child.wait();
+            ScenarioError::Io(io::Error::new(
+                error.kind(),
+                format!("failed to isolate open-handle helper process: {error}"),
+            ))
+        })?;
+
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = child.try_wait()? {
+                if status.success() {
+                    return Ok(());
+                }
+                let stderr = child
+                    .stderr
+                    .take()
+                    .and_then(|mut stderr| {
+                        let mut output = String::new();
+                        stderr.read_to_string(&mut output).ok().map(|_| output)
+                    })
+                    .unwrap_or_default();
+                let progress = read_hotspot_helper_progress_tail(&progress_path);
+                return Err(ScenarioError::Io(io::Error::other(format!(
+                    "open-handle helper failed for {pending_label}: status={status}; stderr={}; progress={}",
+                    stderr.trim(),
+                    progress.as_deref().unwrap_or("<none>")
+                ))));
+            }
+            if Instant::now() >= deadline {
+                let progress = read_hotspot_helper_progress_tail(&progress_path);
+                let progress_suffix = progress
+                    .as_ref()
+                    .map(|progress| format!("; progress={progress}"))
+                    .unwrap_or_default();
+                eprintln!(
+                    "studiofs-e2e: mounted open-handle helper timed out after {} ms; terminating helper process: {}{}",
+                    timeout.as_millis(),
+                    pending_label,
+                    progress_suffix
+                );
+                let _ = job.terminate();
+                if !wait_for_child_exit(&mut child, CHILD_TERMINATION_GRACE).unwrap_or(false) {
+                    let _ = job.force_kill();
+                    let _ = child.kill();
+                    let _ = wait_for_child_exit(&mut child, CHILD_TERMINATION_GRACE);
+                }
+                return Err(namespace_collision_operation_timeout(
+                    timeout,
+                    vec![(1, format!("{pending_label}{progress_suffix}"))],
+                ));
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
 }
 
 fn wait_for_open_handle_initial_tree(
@@ -9039,6 +9188,145 @@ pub fn run_hotspot_op_helper(
     Ok(())
 }
 
+/// Executes the mounted open-handle mutation sequence in a helper process.
+pub fn run_open_handle_op_helper(
+    client_a_mount: PathBuf,
+    client_b_mount: PathBuf,
+    unlink_path: &str,
+    rename_source: &str,
+    rename_dest: &str,
+    append_payload: &Path,
+    progress: Option<&Path>,
+) -> Result<(), anyhow::Error> {
+    let operation = "open-handle";
+    let client_a_unlink_path = client_a_mount.join(unlink_path);
+    let client_b_unlink_path = client_b_mount.join(unlink_path);
+    let client_b_rename_source = client_b_mount.join(rename_source);
+    let client_b_rename_dest = client_b_mount.join(rename_dest);
+    record_hotspot_helper_progress(
+        progress,
+        "started",
+        operation,
+        &client_a_unlink_path,
+        Some(rename_dest),
+        None,
+    )?;
+    record_hotspot_helper_progress(
+        progress,
+        "before_read_payload",
+        operation,
+        &client_a_unlink_path,
+        Some(rename_dest),
+        None,
+    )?;
+    let append_payload = fs::read(append_payload)?;
+    record_hotspot_helper_progress(
+        progress,
+        "after_read_payload",
+        operation,
+        &client_a_unlink_path,
+        Some(rename_dest),
+        Some(append_payload.len()),
+    )?;
+    record_hotspot_helper_progress(
+        progress,
+        "before_open_old_handle",
+        operation,
+        &client_a_unlink_path,
+        Some(rename_dest),
+        None,
+    )?;
+    let mut handle = OpenOptions::new()
+        .append(true)
+        .open(&client_a_unlink_path)?;
+    record_hotspot_helper_progress(
+        progress,
+        "after_open_old_handle",
+        operation,
+        &client_a_unlink_path,
+        Some(rename_dest),
+        None,
+    )?;
+    record_hotspot_helper_progress(
+        progress,
+        "before_remove_file",
+        operation,
+        &client_b_unlink_path,
+        Some(rename_dest),
+        None,
+    )?;
+    fs::remove_file(&client_b_unlink_path)?;
+    record_hotspot_helper_progress(
+        progress,
+        "after_remove_file",
+        operation,
+        &client_b_unlink_path,
+        Some(rename_dest),
+        None,
+    )?;
+    record_hotspot_helper_progress(
+        progress,
+        "before_rename",
+        operation,
+        &client_b_rename_source,
+        Some(rename_dest),
+        None,
+    )?;
+    fs::rename(&client_b_rename_source, &client_b_rename_dest)?;
+    record_hotspot_helper_progress(
+        progress,
+        "after_rename",
+        operation,
+        &client_b_rename_source,
+        Some(rename_dest),
+        None,
+    )?;
+    record_hotspot_helper_progress(
+        progress,
+        "before_write_all",
+        operation,
+        &client_a_unlink_path,
+        Some(rename_dest),
+        Some(append_payload.len()),
+    )?;
+    handle.write_all(&append_payload)?;
+    record_hotspot_helper_progress(
+        progress,
+        "after_write_all",
+        operation,
+        &client_a_unlink_path,
+        Some(rename_dest),
+        Some(append_payload.len()),
+    )?;
+    record_hotspot_helper_progress(
+        progress,
+        "before_sync_all",
+        operation,
+        &client_a_unlink_path,
+        Some(rename_dest),
+        None,
+    )?;
+    handle.sync_all()?;
+    record_hotspot_helper_progress(
+        progress,
+        "after_sync_all",
+        operation,
+        &client_a_unlink_path,
+        Some(rename_dest),
+        None,
+    )?;
+    drop(handle);
+    record_hotspot_helper_progress(
+        progress,
+        "completed",
+        operation,
+        &client_a_unlink_path,
+        Some(rename_dest),
+        None,
+    )?;
+    Ok(())
+}
+
 fn write_parented_with_progress(
     path: &Path,
     payload: &[u8],
@@ -10680,6 +10968,17 @@ mod tests {
             "client-a",
             temp.path().join("mounts").join("client-a"),
         );
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(MOUNTED_OPEN_HANDLE_CONVERGENCE);
+        let context = ScenarioContext {
+            run_id: "run-1".to_string(),
+            seed: 410,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
         let isolation = test_isolation("open-handles-test");
         let stale_path = writer.mount_point.join(open_handle_isolated_path(
             &isolation,
@@ -10688,10 +10987,13 @@ mod tests {
         std::fs::create_dir_all(stale_path.parent().unwrap()).unwrap();
         std::fs::write(&stale_path, []).unwrap();
 
-        let err = seed_open_handle_initial_tree(&[writer], &isolation).unwrap_err();
+        let err =
+            seed_open_handle_initial_tree(&context, &[writer], &isolation, Duration::from_secs(1))
+                .unwrap_err();
 
+        let err_text = err.to_string().to_ascii_lowercase();
         assert!(
-            matches!(&err, ScenarioError::Io(error) if error.kind() == io::ErrorKind::AlreadyExists),
+            err_text.contains("open handle seed") && err_text.contains("file exists"),
             "expected stale open-handle seed file to be rejected, got {err:?}"
         );
     }
@@ -10964,7 +11266,8 @@ mod tests {
             client_controller_config: None,
         };
         let isolation = test_isolation("open-handles-test");
-        seed_open_handle_initial_tree(&clients, &isolation).unwrap();
+        seed_open_handle_initial_tree(&context, &clients, &isolation, Duration::from_secs(1))
+            .unwrap();
 
         let err = wait_for_open_handle_initial_tree(
             &context,
@@ -11251,6 +11554,49 @@ mod tests {
             started.elapsed() < Duration::from_millis(150),
             "timeout must not wait for the hung namespace worker to finish"
         );
+    }
+
+    #[test]
+    fn open_handle_helper_records_progress_for_old_handle_sequence() {
+        let temp = tempdir().unwrap();
+        let client_a_mount = temp.path().join("mounts").join("client-a");
+        let client_b_mount = temp.path().join("mounts").join("client-b");
+        let unlink_path = "open-handles/unlink-target.txt";
+        let rename_source = "open-handles/rename-source.txt";
+        let rename_dest = "open-handles/renamed-destination.txt";
+        let append_payload_path = temp.path().join("append.payload");
+        let progress = temp.path().join("progress.jsonl");
+
+        std::fs::create_dir_all(client_a_mount.join("open-handles")).unwrap();
+        std::fs::create_dir_all(client_b_mount.join("open-handles")).unwrap();
+        std::fs::write(client_a_mount.join(unlink_path), b"initial\n").unwrap();
+        std::fs::write(client_b_mount.join(unlink_path), b"initial\n").unwrap();
+        std::fs::write(client_b_mount.join(rename_source), b"rename source\n").unwrap();
+        std::fs::write(&append_payload_path, b"append through old handle\n").unwrap();
+
+        run_open_handle_op_helper(
+            client_a_mount.clone(),
+            client_b_mount.clone(),
+            unlink_path,
+            rename_source,
+            rename_dest,
+            &append_payload_path,
+            Some(&progress),
+        )
+        .unwrap();
+
+        assert!(!client_b_mount.join(unlink_path).exists());
+        assert!(client_b_mount.join(rename_dest).exists());
+        assert_eq!(
+            std::fs::read(client_a_mount.join(unlink_path)).unwrap(),
+            b"initial\nappend through old handle\n"
+        );
+        let progress_log = std::fs::read_to_string(progress).unwrap();
+        assert!(progress_log.contains("\"phase\":\"before_open_old_handle\""));
+        assert!(progress_log.contains("\"phase\":\"after_remove_file\""));
+        assert!(progress_log.contains("\"phase\":\"after_rename\""));
+        assert!(progress_log.contains("\"phase\":\"after_sync_all\""));
+        assert!(progress_log.contains("\"phase\":\"completed\""));
     }
 
     #[test]
