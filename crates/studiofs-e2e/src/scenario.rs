@@ -2381,7 +2381,7 @@ trait NamespaceCollisionDriver {
     ) -> Result<(), ScenarioError> {
         Ok(())
     }
-    fn force_kill_all(&mut self) -> Result<(), ScenarioError>;
+    fn emergency_kill_all_no_wait(&mut self, context: &str) -> Result<(), ScenarioError>;
     fn unmount_all(&mut self) -> Result<(), ScenarioError>;
 }
 
@@ -2407,8 +2407,8 @@ impl NamespaceCollisionDriver for RealNamespaceCollisionDriver {
         Ok(self.0.unmount_all()?)
     }
 
-    fn force_kill_all(&mut self) -> Result<(), ScenarioError> {
-        Ok(self.0.force_kill_all()?)
+    fn emergency_kill_all_no_wait(&mut self, context: &str) -> Result<(), ScenarioError> {
+        Ok(self.0.emergency_kill_all_no_wait(context)?)
     }
 }
 
@@ -2602,13 +2602,7 @@ fn run_namespace_collision_body(
     let operations = match perform_namespace_collision_operations(context, kind, &clients) {
         Ok(operations) => operations,
         Err(error @ ScenarioError::NamespaceCollisionOperationTimeout { .. }) => {
-            if let Err(cleanup) = driver.force_kill_all() {
-                return Err(ScenarioError::NamespaceCollisionUnmountAfterFailure {
-                    primary: error.to_string(),
-                    cleanup: cleanup.to_string(),
-                });
-            }
-            return Err(error);
+            return handle_namespace_collision_operation_timeout(error, driver);
         }
         Err(error) => return Err(error),
     };
@@ -2623,6 +2617,19 @@ fn run_namespace_collision_body(
         poll_interval,
     )?;
     Ok(summary)
+}
+
+fn handle_namespace_collision_operation_timeout<T>(
+    error: ScenarioError,
+    driver: &mut dyn NamespaceCollisionDriver,
+) -> Result<T, ScenarioError> {
+    match driver.emergency_kill_all_no_wait("namespace collision operation timeout") {
+        Ok(()) => Err(error),
+        Err(cleanup) => Err(ScenarioError::NamespaceCollisionUnmountAfterFailure {
+            primary: error.to_string(),
+            cleanup: cleanup.to_string(),
+        }),
+    }
 }
 
 fn write_namespace_collision_plan_artifacts(
@@ -10917,8 +10924,8 @@ mod tests {
             Ok(())
         }
 
-        fn force_kill_all(&mut self) -> Result<(), ScenarioError> {
-            self.actions.borrow_mut().push("force_kill_all");
+        fn emergency_kill_all_no_wait(&mut self, _context: &str) -> Result<(), ScenarioError> {
+            self.actions.borrow_mut().push("emergency_kill_all_no_wait");
             Ok(())
         }
     }
@@ -11796,6 +11803,47 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_millis(150),
             "timeout must not wait for the hung namespace worker to finish"
+        );
+    }
+
+    #[test]
+    fn namespace_collision_timeout_does_not_wait_for_blocked_mount_force_kill() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-collision-timeout-cleanup");
+        let clients = COLLISION_CLIENT_NAMES
+            .iter()
+            .copied()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(&mount).unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let mut driver = RecordingNamespaceCollisionDriver::new(clients);
+        let primary = ScenarioError::NamespaceCollisionOperationTimeout {
+            timeout_ms: 30_000,
+            pending: vec!["client-a rename shared/file.txt".to_string()],
+        };
+        let started = Instant::now();
+
+        let err = handle_namespace_collision_operation_timeout::<NamespaceCollisionSummary>(
+            primary,
+            &mut driver,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ScenarioError::NamespaceCollisionOperationTimeout { .. }
+        ));
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "timeout cleanup should return to the parent process boundary instead of waiting for blocked mount force-kill"
+        );
+        assert_eq!(
+            driver.actions.borrow().as_slice(),
+            ["emergency_kill_all_no_wait"],
+            "operation timeout should delegate cleanup to the parent process boundary"
         );
     }
 

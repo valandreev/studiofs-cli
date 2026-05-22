@@ -106,6 +106,13 @@ but later mounted scenarios are skipped even if the cleanup probe returns clean.
 That keeps a wedged WinFSP callback from being followed by more mounted
 filesystem operations in the same sweep.
 
+Namespace-collision operation timeouts use the same containment boundary. Once
+a bounded mounted operation times out, the scenario child sends best-effort
+termination to the mounted clients without waiting for the mount processes to
+exit. The parent-owned `run-one` Job Object remains the hard cleanup boundary,
+so a stuck mount cannot keep the scenario child alive long enough to contaminate
+the command shell.
+
 ## Adversarial Runner Cleanup Proof
 
 SFS-381 is the adversarial proof layer over the supervised runner model. It is
@@ -133,6 +140,7 @@ cargo test -p studiofs-e2e runner::tests::compose_partial_launch_failure_writes_
 cargo test -p studiofs-e2e runner::tests::post_start_cleanup_report_errors_do_not_shadow_primary_error -- --exact --nocapture
 cargo test -p studiofs-e2e runner::tests::mounted_cleanup_verification_failure_blocks_later_mounted_children -- --exact --nocapture
 cargo test -p studiofs-e2e runner::tests::supervised_child_timeout_records_executor_cleanup_detail -- --exact --nocapture
+cargo test -p studiofs-e2e scenario::tests::namespace_collision_timeout_does_not_wait_for_blocked_mount_force_kill -- --exact --nocapture
 ```
 
 ## Local First Baseline Gate
