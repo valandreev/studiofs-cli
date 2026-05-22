@@ -3836,8 +3836,9 @@ plain child stderr\n",
         let windows_script = include_str!("../scripts/check-stale-processes.ps1");
         let unix_script = include_str!("../scripts/check-stale-processes.sh");
 
-        assert!(windows_script.contains("studiofs-e2e-hotspot-helper.exe"));
+        assert!(windows_script.contains("'studiofs-e2e-hotspot-helper'"));
         assert!(unix_script.contains("studiofs-e2e-hotspot-helper"));
+        assert!(unix_script.contains("studiofs-e2e-hotspot-helper.exe"));
     }
 
     #[test]
