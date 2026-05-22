@@ -3868,8 +3868,8 @@ fn test_pg_reopen_after_publish_before_local_persist_recovers_without_discover()
     seed_local(&db, &info);
 
     let a = PgMetaEngine::open(&db).expect("open a");
-    a.create_file(ROOT_INO, b"draft.txt", 0, 0, 0o644)
-        .expect("create local file");
+    a.create_dir(ROOT_INO, b"draft", 0, 0, 0o755)
+        .expect("create local directory");
 
     let start = a.flushed_event_seq.load(Ordering::SeqCst);
     let end = a.local.get_counter("nextEventSeq").expect("nextEventSeq");
@@ -3883,7 +3883,7 @@ fn test_pg_reopen_after_publish_before_local_persist_recovers_without_discover()
     let reopened = reopen_pg_engine_with_retry(&db);
     assert!(wait_until(Duration::from_secs(12), || {
         let _ = reopened.sync_metadata();
-        reopened.lookup(ROOT_INO, b"draft.txt").is_ok()
+        reopened.lookup(ROOT_INO, b"draft").is_ok()
             && reopened.flushed_event_seq.load(Ordering::SeqCst)
                 == reopened.local.get_counter("nextEventSeq").unwrap_or(0)
     }));

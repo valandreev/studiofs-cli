@@ -35,6 +35,9 @@ impl PgMetaEngine {
         let projected = RemoteApplyCoordinator::project_local_batch(&pending_events);
         if projected.visible_ops == 0 {
             Self::clear_pending_state(&mut state);
+            if projected.needs_local_replay {
+                return Ok(());
+            }
             drop(state);
             self.persist_flushed_event_seq(event_end)?;
             return Ok(());
@@ -67,6 +70,17 @@ impl PgMetaEngine {
         let events = self.local.read_events_range(event_start, after_seq)?;
         let projected = RemoteApplyCoordinator::project_local_batch(&events);
         if projected.visible_ops == 0 {
+            if projected.needs_local_replay {
+                state.ops = 0;
+                state.force_flush = false;
+                state.event_start = Some(event_start);
+                state.event_end = state.event_end.max(after_seq);
+                state.last_mutation_at = Some(now);
+                if state.started_at.is_none() {
+                    state.started_at = Some(now);
+                }
+                return Ok(false);
+            }
             if state.ops == 0 {
                 if self.inflight_replication_ops.load(Ordering::SeqCst) > 0 {
                     return Ok(false);

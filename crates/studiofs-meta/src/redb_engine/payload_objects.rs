@@ -462,6 +462,22 @@ impl MetaPayloadObjects for RedbMetaEngine {
             Self::set_inode_overlay_in_txn(&txn, &attr)?;
             Self::sync_inode_lifecycle_in_txn(&txn, ino)?;
 
+            let dentry_keys =
+                Self::dentry_keys_for_inode_in_write_index(&txn, DENTRIES_BY_INODE_TABLE, ino)?;
+            for key in dentry_keys {
+                let (parent, name) = decode_dentry_key(&key)?;
+                Self::append_event_in_txn(
+                    &txn,
+                    &crate::events::MetaEvent::AddEntry {
+                        parent,
+                        name: name.to_vec(),
+                        entry: DirEntryValue {
+                            ino,
+                            kind: FileType::RegularFile,
+                        },
+                    },
+                )?;
+            }
             Self::append_event_in_txn(
                 &txn,
                 &crate::events::MetaEvent::PublishRegularFileBaseSlices {
