@@ -36,7 +36,6 @@ const SCHEMA_VERSION: u32 = 1;
 const RUNNER_CRATE: &str = "studiofs-e2e";
 const RUNNER_MARKER_FILE: &str = ".studiofs-e2e-runner.json";
 const PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
-const POST_SCENARIO_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_SCENARIO_CHILD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 #[cfg(windows)]
 const HOST_ENVIRONMENT_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -600,7 +599,7 @@ pub fn run_with_executor(
             Err(error) if definition.requires_studiofs_bin => failed_scenario_child(
                 definition.name,
                 request.seed,
-                format!("scenario supervision failed before cleanup verification: {error}"),
+                format!("scenario supervision failed: {error}"),
                 None,
             ),
             Err(error) => return Err(error),
@@ -613,20 +612,6 @@ pub fn run_with_executor(
                 .clone()
                 .unwrap_or_else(|| "mounted scenario failed".to_string());
             mounted_cleanup_block = Some(detail);
-        }
-        if definition.requires_studiofs_bin {
-            if let Err(error) = verify_post_scenario_cleanup(
-                &sandbox,
-                request.platform,
-                executor,
-                &events_path,
-                &run_id,
-                definition.name,
-            ) {
-                let detail = format!("post-scenario cleanup verification failed: {error}");
-                mark_lifecycle_failed(&mut lifecycle, detail.clone());
-                mounted_cleanup_block = Some(detail);
-            }
         }
         if let Some(stack) = compose_stack.as_ref() {
             collect_post_scenario_postgres_state_artifact(
@@ -725,79 +710,6 @@ fn collect_post_scenario_postgres_state_artifact(
         lifecycle.outcome.artifacts.push(relative);
     }
     Ok(())
-}
-
-fn verify_post_scenario_cleanup(
-    root: &Path,
-    platform: PlatformSelection,
-    executor: &dyn CommandExecutor,
-    events_path: &Path,
-    run_id: &str,
-    scenario: &str,
-) -> Result<(), String> {
-    let Some(mut command) = stale_process_cleanup_command(root, platform) else {
-        return Ok(());
-    };
-    command.env.push((
-        "STUDIOFS_E2E_CLEANUP_PHASE".to_string(),
-        "post-scenario".to_string(),
-    ));
-    command.timeout = Some(POST_SCENARIO_CLEANUP_TIMEOUT);
-    record_event(
-        events_path,
-        run_id,
-        Some(scenario),
-        "cleanup_verify",
-        "started",
-    )
-    .map_err(|err| err.to_string())?;
-    let output = match executor.run(&command) {
-        Ok(output) => output,
-        Err(err) => {
-            record_event(
-                events_path,
-                run_id,
-                Some(scenario),
-                "cleanup_verify",
-                "failed",
-            )
-            .map_err(|event_err| event_err.to_string())?;
-            return Err(err.to_string());
-        }
-    };
-    let cleanup_detail = stale_process_cleanup_detail(&output.stdout);
-    if output.status == 0 && output.stdout.trim().is_empty() {
-        record_event(
-            events_path,
-            run_id,
-            Some(scenario),
-            "cleanup_verify",
-            "finished",
-        )
-        .map_err(|err| err.to_string())?;
-        Ok(())
-    } else {
-        record_event(
-            events_path,
-            run_id,
-            Some(scenario),
-            "cleanup_verify",
-            "failed",
-        )
-        .map_err(|err| err.to_string())?;
-        if output.status == 0 {
-            Err(cleanup_detail)
-        } else {
-            Err(command_failure_detail(output.status, &output.stderr))
-        }
-    }
-}
-
-fn mark_lifecycle_failed(lifecycle: &mut ScenarioLifecycleOutcome, error: String) {
-    lifecycle.report.status = ScenarioStatus::Failed;
-    lifecycle.report.error = Some(error.clone());
-    lifecycle.outcome.status = ScenarioStatus::Failed;
-    lifecycle.cleanup_error = Some(error);
 }
 
 fn skipped_scenario_lifecycle(
@@ -3722,68 +3634,6 @@ plain child stderr\n",
     }
 
     #[test]
-    fn mounted_cleanup_verification_failure_blocks_later_mounted_children() {
-        let temp = tempfile::tempdir().unwrap();
-        let executor = RecordingExecutor {
-            fail_post_scenario_cleanup: Cell::new(true),
-            ..RecordingExecutor::default()
-        };
-
-        let outcome = run_with_executor(
-            RunRequest {
-                root: temp.path().join("e2e-runs"),
-                run_id: Some("blocked-mounted-run".to_string()),
-                scenarios: vec![
-                    scenario::BASIC_MULTI_CLIENT_SMOKE.to_string(),
-                    scenario::MOUNTED_CLIENT_CRASH_RESTART_RECOVERY.to_string(),
-                ],
-                seed: 410,
-                studiofs_bin: None,
-                platform: PlatformSelection::WindowsWinfsp,
-                retention: RetentionPolicy::Always,
-                report: None,
-                port_range: None,
-                timeout: Some("30s".to_string()),
-                infra: InfraMode::Disabled,
-            },
-            &executor,
-        )
-        .unwrap();
-
-        assert_eq!(outcome.status, RunStatus::Failed);
-        let calls = executor.calls.borrow();
-        let child_calls = calls
-            .iter()
-            .filter(|call| call.args.contains(&"run-one".to_string()))
-            .count();
-        assert_eq!(child_calls, 1, "second mounted scenario must not start");
-        assert!(calls.iter().any(|call| {
-            call.env
-                .iter()
-                .any(|(key, value)| key == "STUDIOFS_E2E_CLEANUP_PHASE" && value == "post-scenario")
-                && call.timeout == Some(POST_SCENARIO_CLEANUP_TIMEOUT)
-        }));
-
-        let report: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(outcome.report_path).unwrap()).unwrap();
-        assert_eq!(report["scenarios"].as_array().unwrap().len(), 2);
-        assert_eq!(report["scenarios"][0]["status"], "failed");
-        assert!(
-            report["scenarios"][0]["error"]
-                .as_str()
-                .unwrap()
-                .contains("post-scenario cleanup verification failed")
-        );
-        assert_eq!(report["scenarios"][1]["status"], "skipped");
-        assert!(
-            report["scenarios"][1]["error"]
-                .as_str()
-                .unwrap()
-                .contains("contaminated runner state")
-        );
-    }
-
-    #[test]
     fn mounted_child_timeout_blocks_later_mounted_children() {
         let temp = tempfile::tempdir().unwrap();
         let executor = RecordingExecutor {
@@ -3819,12 +3669,14 @@ plain child stderr\n",
             .filter(|call| call.args.contains(&"run-one".to_string()))
             .count();
         assert_eq!(child_calls, 1, "second mounted scenario must not start");
-        assert!(calls.iter().any(|call| {
-            call.env
-                .iter()
-                .any(|(key, value)| key == "STUDIOFS_E2E_CLEANUP_PHASE" && value == "post-scenario")
-                && call.timeout == Some(POST_SCENARIO_CLEANUP_TIMEOUT)
-        }));
+        assert!(
+            !calls.iter().any(|call| {
+                call.env.iter().any(|(key, value)| {
+                    key == "STUDIOFS_E2E_CLEANUP_PHASE" && value == "post-scenario"
+                })
+            }),
+            "failed mounted scenarios must not start the external post-scenario cleanup verifier"
+        );
 
         let report: serde_json::Value =
             serde_json::from_slice(&std::fs::read(outcome.report_path).unwrap()).unwrap();
@@ -3888,41 +3740,7 @@ plain child stderr\n",
     }
 
     #[test]
-    fn post_scenario_cleanup_transport_error_records_failed_event() {
-        let temp = tempfile::tempdir().unwrap();
-        let executor = RecordingExecutor {
-            time_out_post_scenario_cleanup: Cell::new(true),
-            ..RecordingExecutor::default()
-        };
-
-        let outcome = run_with_executor(
-            RunRequest {
-                root: temp.path().join("e2e-runs"),
-                run_id: Some("cleanup-timeout-event-run".to_string()),
-                scenarios: vec![scenario::COLLISION_RENAME_VS_UNLINK.to_string()],
-                seed: 410,
-                studiofs_bin: None,
-                platform: PlatformSelection::WindowsWinfsp,
-                retention: RetentionPolicy::Always,
-                report: None,
-                port_range: None,
-                timeout: Some("30s".to_string()),
-                infra: InfraMode::Disabled,
-            },
-            &executor,
-        )
-        .unwrap();
-
-        assert_eq!(outcome.status, RunStatus::Failed);
-        let events_path = outcome.report_path.parent().unwrap().join("events.ndjson");
-        let events = std::fs::read_to_string(events_path).unwrap();
-        assert!(events.contains(
-            r#""scenario":"collision-rename-vs-unlink","hook":"cleanup_verify","phase":"failed""#
-        ));
-    }
-
-    #[test]
-    fn mounted_supervision_error_still_runs_cleanup_verification_and_writes_report() {
+    fn mounted_supervision_error_writes_report_without_post_scenario_cleanup_verifier() {
         let temp = tempfile::tempdir().unwrap();
         let executor = RecordingExecutor {
             fail_child_supervision_io: Cell::new(true),
@@ -3959,12 +3777,14 @@ plain child stderr\n",
                     .iter()
                     .any(|(key, value)| key == "STUDIOFS_E2E_STREAM_OUTPUT" && value == "1")
         }));
-        assert!(calls.iter().any(|call| {
-            call.env
-                .iter()
-                .any(|(key, value)| key == "STUDIOFS_E2E_CLEANUP_PHASE" && value == "post-scenario")
-                && call.timeout == Some(POST_SCENARIO_CLEANUP_TIMEOUT)
-        }));
+        assert!(
+            !calls.iter().any(|call| {
+                call.env.iter().any(|(key, value)| {
+                    key == "STUDIOFS_E2E_CLEANUP_PHASE" && value == "post-scenario"
+                })
+            }),
+            "supervision errors must not start the external post-scenario cleanup verifier"
+        );
 
         let report: serde_json::Value =
             serde_json::from_slice(&std::fs::read(outcome.report_path).unwrap()).unwrap();
@@ -3973,7 +3793,7 @@ plain child stderr\n",
             report["scenarios"][0]["error"]
                 .as_str()
                 .unwrap()
-                .contains("scenario supervision failed before cleanup verification")
+                .contains("scenario supervision failed")
         );
     }
 
@@ -4033,6 +3853,8 @@ plain child stderr\n",
         assert!(windows_script.contains("Stop-CandidateDirectly"));
         assert!(windows_script.contains("$process.Kill()"));
         assert!(!windows_script.contains("Get-CimInstance Win32_Process"));
+        assert!(!windows_script.contains("-Recurse -Filter 'mount-point.json'"));
+        assert!(!windows_script.contains("Get-Process -Name 'studiofs-e2e-hotspot-helper'"));
         assert!(
             !windows_script
                 .contains("$taskkillStartInfo.Arguments = \"/PID $($_.ProcessId) /T /F\"")
@@ -4759,8 +4581,6 @@ plain child stderr\n",
         poison_failure_boundary_path_after_up: RefCell<Option<PathBuf>>,
         fail_up: Cell<bool>,
         fail_logs: Cell<bool>,
-        fail_post_scenario_cleanup: Cell<bool>,
-        time_out_post_scenario_cleanup: Cell<bool>,
         fail_child_supervision_io: Cell<bool>,
         fail_first_child_report: Cell<bool>,
         time_out_first_child: Cell<bool>,
@@ -4813,22 +4633,6 @@ plain child stderr\n",
                     status,
                     stdout: String::new(),
                     stderr: String::new(),
-                });
-            }
-            let is_post_scenario_cleanup = command.env.iter().any(|(key, value)| {
-                key == "STUDIOFS_E2E_CLEANUP_PHASE" && value == "post-scenario"
-            });
-            if is_post_scenario_cleanup && self.time_out_post_scenario_cleanup.get() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "command timed out after 30000 ms; child still running after kill attempts",
-                ));
-            }
-            if is_post_scenario_cleanup && self.fail_post_scenario_cleanup.get() {
-                return Ok(CommandOutput {
-                    status: 1,
-                    stdout: String::new(),
-                    stderr: "stale runner-owned studiofs.exe remains mounted at Z:\\".to_string(),
                 });
             }
             if command.args.contains(&"ls".to_string()) {

@@ -66,27 +66,30 @@ function Stop-CandidateDirectly {
     }
 }
 
-Get-ChildItem -Path $normalizedRunnerRoot -Recurse -Filter 'mount-point.json' -File -ErrorAction SilentlyContinue |
+$processMetadataPatterns = @(
+    (Join-Path $normalizedRunnerRoot 'artifacts\clients\*\mount\mount-point.json'),
+    (Join-Path $normalizedRunnerRoot '*\artifacts\clients\*\mount\mount-point.json')
+)
+
+foreach ($metadataPattern in $processMetadataPatterns) {
+    Get-ChildItem -Path $metadataPattern -File -ErrorAction SilentlyContinue |
+        ForEach-Object {
+            try {
+                $metadata = Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json
+                if ($null -ne $metadata.process_id) {
+                    Add-CandidateProcess -ProcessId ([UInt32]$metadata.process_id) -Source $_.FullName
+                }
+            } catch {
+            }
+        }
+}
+
+Get-ChildItem -Path $normalizedRunnerRoot -Filter 'mount-point.json' -File -ErrorAction SilentlyContinue |
     ForEach-Object {
         try {
             $metadata = Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json
             if ($null -ne $metadata.process_id) {
                 Add-CandidateProcess -ProcessId ([UInt32]$metadata.process_id) -Source $_.FullName
-            }
-        } catch {
-        }
-    }
-
-Get-Process -Name 'studiofs-e2e-hotspot-helper' -ErrorAction SilentlyContinue |
-    ForEach-Object {
-        try {
-            $path = ($_.Path -as [string])
-            if ([string]::IsNullOrWhiteSpace($path)) {
-                return
-            }
-            $normalizedPath = $path.Replace('/', '\')
-            if ($normalizedPath.StartsWith($normalizedRunnerRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
-                Add-CandidateProcess -ProcessId ([UInt32]$_.Id) -Source $path
             }
         } catch {
         }

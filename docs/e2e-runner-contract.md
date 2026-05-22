@@ -91,27 +91,25 @@ executor kills the child process boundary. On Windows the timeout path uses
 `taskkill /PID <pid> /T /F` as the process-tree fallback, then probes child exit
 without blocking the runner on a wedged WinFSP process.
 
-After every mounted scenario, the parent runs the runner-owned stale-process
-cleanup helper in a post-scenario verification phase. Any runner-owned
-`studiofs.exe` / `studiofs-e2e.exe` process found or cleaned in that phase is a
-scenario failure, because later mounted scenarios would be running on
-contaminated host state. Once this gate fails, later mounted scenarios are
-recorded as skipped instead of being started on potentially occupied default
-mount letters. External-env and non-runner-owned processes remain outside the
-cleanup allowlist.
+The parent does not start an external post-scenario cleanup verifier. That
+keeps the cleanup model close to the original direct runner behavior: scenario
+artifacts and the child report are the debugging surface, while failed mounted
+scenarios themselves are the contamination boundary. Once a mounted scenario
+fails or times out, later mounted scenarios are recorded as skipped instead of
+being started on potentially occupied default mount letters. External-env and
+non-runner-owned processes remain outside the cleanup allowlist.
 
 A mounted child-process timeout is also treated as a mounted contamination
-boundary: the parent still runs the bounded post-scenario cleanup verification,
-but later mounted scenarios are skipped even if the cleanup probe returns clean.
-That keeps a wedged WinFSP callback from being followed by more mounted
-filesystem operations in the same sweep.
+boundary. That keeps a wedged WinFSP callback from being followed by more
+mounted filesystem operations in the same sweep without launching an additional
+cleanup process that can wedge on damaged WinFSP state.
 
 Namespace-collision operation timeouts use the same containment boundary. Once
 a bounded mounted operation times out, the scenario child sends best-effort
-termination to the mounted clients without waiting for the mount processes to
-exit. The parent-owned `run-one` Job Object remains the hard cleanup boundary,
-so a stuck mount cannot keep the scenario child alive long enough to contaminate
-the command shell.
+termination to the helper process and mounted clients without waiting for the
+mount processes to exit. The parent-owned `run-one` Job Object remains the hard
+cleanup boundary, so a stuck mount cannot keep the scenario child alive long
+enough to contaminate the command shell.
 
 After a supervised `run-one` primary process exits, the parent must also treat
 blocked child output pipes as a containment boundary. The command executor may
@@ -119,9 +117,9 @@ give stdout/stderr reader threads a short drain window for normal diagnostics,
 but it must detach those readers instead of joining forever if an escaped or
 wedged descendant still holds the pipe handle open. The run result may lose
 late buffered diagnostic output in that case; preserving an interactive shell
-and keeping post-scenario cleanup reachable takes priority. Streaming output
-readers must not hold the parent console lock while waiting for pipe reads, so
-a detached reader cannot block later runner progress lines or cleanup events.
+takes priority. Streaming output readers must not hold the parent console lock
+while waiting for pipe reads, so a detached reader cannot block later runner
+progress lines or cleanup events.
 
 ## Adversarial Runner Cleanup Proof
 
@@ -132,7 +130,7 @@ mounted scenario. The accepted scenario 16 remains
 
 The proof checks deliberately hostile runner paths without mutating host mounts:
 partial compose setup followed by launch failure, timed-out supervised
-children, post-scenario cleanup contamination, and cleanup/reporting failures
+children, mounted contamination boundaries, and cleanup/reporting failures
 that must not shadow the primary scenario error. Every completed run writes
 `artifacts/runner/adversarial-cleanup-proof.json`; that artifact records
 `SFS-381`, run status, exit code, cleanup status, cleanup errors, the
@@ -148,7 +146,8 @@ Focused proof tests:
 ```powershell
 cargo test -p studiofs-e2e runner::tests::compose_partial_launch_failure_writes_adversarial_cleanup_proof -- --exact --nocapture
 cargo test -p studiofs-e2e runner::tests::post_start_cleanup_report_errors_do_not_shadow_primary_error -- --exact --nocapture
-cargo test -p studiofs-e2e runner::tests::mounted_cleanup_verification_failure_blocks_later_mounted_children -- --exact --nocapture
+cargo test -p studiofs-e2e runner::tests::mounted_child_failure_blocks_later_mounted_children -- --exact --nocapture
+cargo test -p studiofs-e2e runner::tests::mounted_supervision_error_writes_report_without_post_scenario_cleanup_verifier -- --exact --nocapture
 cargo test -p studiofs-e2e runner::tests::supervised_child_timeout_records_executor_cleanup_detail -- --exact --nocapture
 cargo test -p studiofs-e2e scenario::tests::namespace_collision_timeout_does_not_wait_for_blocked_mount_force_kill -- --exact --nocapture
 ```
