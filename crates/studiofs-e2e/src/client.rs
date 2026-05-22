@@ -989,6 +989,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         }
         self.clients[index].spec.process_id = Some(process_id);
         self.clients[index].spec.state = ClientLifecycleState::Mounted;
+        write_mount_metadata(&self.clients[index].spec)?;
         self.clients[index].process = Some(process);
         Ok(())
     }
@@ -1611,6 +1612,7 @@ fn write_mount_metadata(spec: &ClientSpec) -> Result<(), ClientControllerError> 
     let payload = serde_json::json!({
         "client": spec.name,
         "mount_point": spec.mount_point.display().to_string(),
+        "process_id": spec.process_id,
     });
     fs::write(
         spec.mount_metadata_dir.join("mount-point.json"),

@@ -616,7 +616,7 @@ pub fn run_with_executor(
         }
         if definition.requires_studiofs_bin {
             if let Err(error) = verify_post_scenario_cleanup(
-                &root,
+                &sandbox,
                 request.platform,
                 executor,
                 &events_path,
@@ -4018,6 +4018,25 @@ plain child stderr\n",
 
         assert!(windows_script.contains("studiofs-e2e-hotspot-helper.exe"));
         assert!(unix_script.contains("studiofs-e2e-hotspot-helper"));
+    }
+
+    #[test]
+    fn windows_stale_process_cleanup_batches_taskkill_for_all_candidates() {
+        let windows_script = include_str!("../scripts/check-stale-processes.ps1");
+
+        assert!(windows_script.contains("$candidates = @("));
+        assert!(windows_script.contains("mount-point.json"));
+        assert!(windows_script.contains("Add-CandidateProcess"));
+        assert!(windows_script.contains("$taskkillArgs = @()"));
+        assert!(windows_script.contains("[string]::Join(' ', $taskkillArgs)"));
+        assert!(windows_script.contains("batched taskkill timed out after 5000 ms"));
+        assert!(windows_script.contains("Stop-CandidateDirectly"));
+        assert!(windows_script.contains("$process.Kill()"));
+        assert!(!windows_script.contains("Get-CimInstance Win32_Process"));
+        assert!(
+            !windows_script
+                .contains("$taskkillStartInfo.Arguments = \"/PID $($_.ProcessId) /T /F\"")
+        );
     }
 
     #[test]

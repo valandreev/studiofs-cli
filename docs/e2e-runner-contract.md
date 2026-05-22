@@ -119,7 +119,9 @@ give stdout/stderr reader threads a short drain window for normal diagnostics,
 but it must detach those readers instead of joining forever if an escaped or
 wedged descendant still holds the pipe handle open. The run result may lose
 late buffered diagnostic output in that case; preserving an interactive shell
-and keeping post-scenario cleanup reachable takes priority.
+and keeping post-scenario cleanup reachable takes priority. Streaming output
+readers must not hold the parent console lock while waiting for pipe reads, so
+a detached reader cannot block later runner progress lines or cleanup events.
 
 ## Adversarial Runner Cleanup Proof
 

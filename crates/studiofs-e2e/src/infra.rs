@@ -1,7 +1,7 @@
 //! Docker Compose infrastructure for real E2E runs.
 
 use std::fs;
-use std::io::{self, IsTerminal as _};
+use std::io::{self, IsTerminal as _, Write as _};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{ChildStderr, ChildStdout, Command, Stdio};
@@ -375,20 +375,35 @@ fn read_stream<R: io::Read>(
         return Ok(output);
     }
     match sink {
-        OutputSink::Stdout => read_stream_to_sink(reader, io::stdout().lock(), false),
+        OutputSink::Stdout => read_stream_with_writer(reader, |bytes| {
+            let mut stdout = io::stdout().lock();
+            stdout.write_all(bytes)?;
+            stdout.flush()
+        }),
         OutputSink::Stderr => {
             let color_progress =
                 io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
-            read_stream_to_sink(reader, io::stderr().lock(), color_progress)
+            read_stream_with_writer(reader, |bytes| {
+                let display;
+                let bytes = if color_progress {
+                    display = colorize_progress_statuses_bytes(bytes);
+                    display.as_slice()
+                } else {
+                    bytes
+                };
+                let mut stderr = io::stderr().lock();
+                stderr.write_all(bytes)?;
+                stderr.flush()
+            })
         }
     }
 }
 
-fn read_stream_to_sink<R: io::Read, W: io::Write>(
-    mut reader: R,
-    mut sink: W,
-    color_progress: bool,
-) -> io::Result<Vec<u8>> {
+fn read_stream_with_writer<R, F>(mut reader: R, mut write_chunk: F) -> io::Result<Vec<u8>>
+where
+    R: io::Read,
+    F: FnMut(&[u8]) -> io::Result<()>,
+{
     let mut output = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
@@ -398,13 +413,7 @@ fn read_stream_to_sink<R: io::Read, W: io::Write>(
         }
         let bytes = &chunk[..read];
         output.extend_from_slice(bytes);
-        if color_progress {
-            let display = colorize_progress_statuses_bytes(bytes);
-            sink.write_all(&display)?;
-        } else {
-            sink.write_all(bytes)?;
-        }
-        sink.flush()?;
+        write_chunk(bytes)?;
     }
 }
 
@@ -1271,6 +1280,7 @@ fn default_compose_file() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex, mpsc};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -1320,6 +1330,82 @@ mod tests {
             started.elapsed() < Duration::from_secs(1),
             "primary-exit cleanup must not join reader threads held open by escaped descendants"
         );
+    }
+
+    #[test]
+    fn streaming_reader_does_not_hold_output_lock_while_waiting_for_pipe() {
+        let output_lock = Arc::new(Mutex::new(()));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let reader = BlockingReader {
+            entered: Some(entered_tx),
+            release: release_rx,
+        };
+        let writer_lock = Arc::clone(&output_lock);
+
+        let reader_thread = thread::spawn(move || {
+            read_stream_with_writer(reader, |_bytes| {
+                let _guard = writer_lock.lock().expect("output lock poisoned");
+                Ok(())
+            })
+        });
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("reader should enter the blocking pipe read");
+        let guard = output_lock
+            .try_lock()
+            .expect("streaming reader must not hold the output lock while blocked on pipe read");
+        drop(guard);
+
+        release_tx
+            .send(())
+            .expect("blocking reader release channel should be open");
+        let output = reader_thread
+            .join()
+            .expect("reader thread should not panic")
+            .expect("reader should finish cleanly");
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn blocked_streaming_stderr_reader_does_not_block_later_stderr_writes() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let reader = BlockingReader {
+            entered: Some(entered_tx),
+            release: release_rx,
+        };
+
+        let reader_thread = thread::spawn(move || read_stream(reader, OutputSink::Stderr, true));
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("stderr reader should enter the blocking pipe read");
+
+        let (wrote_tx, wrote_rx) = mpsc::channel();
+        let writer_thread = thread::spawn(move || {
+            let mut stderr = io::stderr().lock();
+            let result = writeln!(stderr, "studiofs-e2e stderr lock probe");
+            let _ = wrote_tx.send(result);
+        });
+
+        wrote_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("blocked streaming reader must not hold stderr lock")
+            .expect("stderr lock probe should write successfully");
+
+        release_tx
+            .send(())
+            .expect("blocking reader release channel should be open");
+        let output = reader_thread
+            .join()
+            .expect("reader thread should not panic")
+            .expect("reader should finish cleanly");
+        assert!(output.is_empty());
+        writer_thread
+            .join()
+            .expect("writer thread should not panic");
     }
 
     #[test]
@@ -1399,6 +1485,21 @@ timestamp=t studiofs-e2e phase=run status=\x1b[31mfailed\x1b[0m\n",
             colorize_progress_statuses_bytes(b"\r****"),
             b"\r****".to_vec()
         );
+    }
+
+    struct BlockingReader {
+        entered: Option<mpsc::Sender<()>>,
+        release: mpsc::Receiver<()>,
+    }
+
+    impl io::Read for BlockingReader {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            if let Some(entered) = self.entered.take() {
+                let _ = entered.send(());
+            }
+            let _ = self.release.recv();
+            Ok(0)
+        }
     }
 
     #[cfg(windows)]

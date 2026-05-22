@@ -19,55 +19,145 @@ if ([string]::IsNullOrWhiteSpace($runnerRoot)) {
 }
 
 $normalizedRunnerRoot = $runnerRoot.Replace('/', '\')
-$rootPattern = [regex]::Escape($normalizedRunnerRoot)
-$processFilter = "Name = 'studiofs.exe' OR Name = 'studiofs-e2e.exe' OR Name = 'studiofs-e2e-hotspot-helper.exe'"
+$candidateByPid = [ordered]@{}
+$allowedProcessNames = @('studiofs', 'studiofs-e2e', 'studiofs-e2e-hotspot-helper')
 
-Get-CimInstance Win32_Process -Filter $processFilter |
-    Where-Object {
-        $cmd = $_.CommandLine -as [string]
-        $normalizedCmd = $cmd.Replace('/', '\')
-        # Runner-owned mount commands still include the sandbox root via --cache-dir;
-        # avoid matching every user-owned "studiofs mount" process on this machine.
-        $_.ProcessId -ne $selfPid -and
-            ($normalizedCmd -match $rootPattern -or $cmd -match '__mounted-chaos-op')
-    } |
+function Add-CandidateProcess {
+    param(
+        [UInt32] $ProcessId,
+        [string] $Source
+    )
+
+    if ($ProcessId -eq 0 -or $ProcessId -eq $selfPid -or $candidateByPid.Contains($ProcessId)) {
+        return
+    }
+
+    $process = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+    if ($null -eq $process) {
+        return
+    }
+    if ($allowedProcessNames -notcontains $process.ProcessName) {
+        return
+    }
+    $candidateByPid[$ProcessId] = [pscustomobject]@{
+        ProcessId = $ProcessId
+        Name = $process.ProcessName
+        Source = $Source
+    }
+}
+
+function Stop-CandidateDirectly {
+    param(
+        [pscustomobject] $Candidate
+    )
+
+    try {
+        $process = Get-Process -Id $Candidate.ProcessId -ErrorAction SilentlyContinue
+        if ($null -eq $process) {
+            return "stopped $($Candidate.ProcessId) $($Candidate.Name) $($Candidate.Source)"
+        }
+        $process.Kill()
+        if (-not $process.WaitForExit(1000)) {
+            return "failed to stop $($Candidate.ProcessId) $($Candidate.Name): direct kill timed out after 1000 ms"
+        }
+        return "stopped $($Candidate.ProcessId) $($Candidate.Name) $($Candidate.Source)"
+    } catch {
+        return "failed to stop $($Candidate.ProcessId) $($Candidate.Name): direct kill failed: $($_.Exception.Message)"
+    }
+}
+
+Get-ChildItem -Path $normalizedRunnerRoot -Recurse -Filter 'mount-point.json' -File -ErrorAction SilentlyContinue |
     ForEach-Object {
-        if ($cleanStale) {
-            try {
-                $taskkillPath = 'taskkill.exe'
-                if (-not [string]::IsNullOrWhiteSpace($env:SystemRoot)) {
-                    $systemTaskkill = Join-Path $env:SystemRoot 'System32\taskkill.exe'
-                    if (Test-Path $systemTaskkill) {
-                        $taskkillPath = $systemTaskkill
-                    }
-                }
-                $taskkillStartInfo = [System.Diagnostics.ProcessStartInfo]::new()
-                $taskkillStartInfo.FileName = $taskkillPath
-                $taskkillStartInfo.UseShellExecute = $false
-                $taskkillStartInfo.RedirectStandardOutput = $true
-                $taskkillStartInfo.RedirectStandardError = $true
-                $taskkillStartInfo.Arguments = "/PID $($_.ProcessId) /T /F"
-                $taskkill = [System.Diagnostics.Process]::Start($taskkillStartInfo)
-                $stdoutTask = $taskkill.StandardOutput.ReadToEndAsync()
-                $stderrTask = $taskkill.StandardError.ReadToEndAsync()
-                if (-not $taskkill.WaitForExit(5000)) {
-                    try {
-                        $taskkill.Kill()
-                    } catch {
-                    }
-                    throw "taskkill timed out after 5000 ms"
-                }
-                $exitCode = $taskkill.ExitCode
-                $stdout = $stdoutTask.GetAwaiter().GetResult().Trim()
-                $stderr = $stderrTask.GetAwaiter().GetResult().Trim()
-                if ($exitCode -ne 0 -and $exitCode -ne 128) {
-                    throw "taskkill exited with code $exitCode; stdout=$stdout; stderr=$stderr"
-                }
-                "stopped $($_.ProcessId) $($_.Name) $($_.CommandLine)"
-            } catch {
-                "failed to stop $($_.ProcessId) $($_.Name): $($_.Exception.Message)"
+        try {
+            $metadata = Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json
+            if ($null -ne $metadata.process_id) {
+                Add-CandidateProcess -ProcessId ([UInt32]$metadata.process_id) -Source $_.FullName
             }
-        } else {
-            "$($_.ProcessId) $($_.Name) $($_.CommandLine)"
+        } catch {
         }
     }
+
+Get-Process -Name 'studiofs-e2e-hotspot-helper' -ErrorAction SilentlyContinue |
+    ForEach-Object {
+        try {
+            $path = ($_.Path -as [string])
+            if ([string]::IsNullOrWhiteSpace($path)) {
+                return
+            }
+            $normalizedPath = $path.Replace('/', '\')
+            if ($normalizedPath.StartsWith($normalizedRunnerRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+                Add-CandidateProcess -ProcessId ([UInt32]$_.Id) -Source $path
+            }
+        } catch {
+        }
+    }
+
+$candidates = @($candidateByPid.Values)
+
+if ($candidates.Count -eq 0) {
+    return
+}
+
+if (-not $cleanStale) {
+    foreach ($candidate in $candidates) {
+        "$($candidate.ProcessId) $($candidate.Name) $($candidate.Source)"
+    }
+    return
+}
+
+$taskkillPath = 'taskkill.exe'
+if (-not [string]::IsNullOrWhiteSpace($env:SystemRoot)) {
+    $systemTaskkill = Join-Path $env:SystemRoot 'System32\taskkill.exe'
+    if (Test-Path $systemTaskkill) {
+        $taskkillPath = $systemTaskkill
+    }
+}
+
+$taskkillArgs = @()
+foreach ($candidate in $candidates) {
+    $taskkillArgs += @('/PID', "$($candidate.ProcessId)")
+}
+$taskkillArgs += @('/T', '/F')
+
+$taskkillStartInfo = [System.Diagnostics.ProcessStartInfo]::new()
+$taskkillStartInfo.FileName = $taskkillPath
+$taskkillStartInfo.UseShellExecute = $false
+$taskkillStartInfo.RedirectStandardOutput = $true
+$taskkillStartInfo.RedirectStandardError = $true
+$taskkillStartInfo.Arguments = [string]::Join(' ', $taskkillArgs)
+$taskkill = [System.Diagnostics.Process]::Start($taskkillStartInfo)
+$stdoutTask = $taskkill.StandardOutput.ReadToEndAsync()
+$stderrTask = $taskkill.StandardError.ReadToEndAsync()
+if (-not $taskkill.WaitForExit(5000)) {
+    try {
+        $taskkill.Kill()
+    } catch {
+    }
+    foreach ($candidate in $candidates) {
+        $directResult = Stop-CandidateDirectly -Candidate $candidate
+        if ($directResult.StartsWith('stopped ', [System.StringComparison]::Ordinal)) {
+            $directResult
+        } else {
+            "failed to stop $($candidate.ProcessId) $($candidate.Name): batched taskkill timed out after 5000 ms; $directResult"
+        }
+    }
+    return
+}
+
+$exitCode = $taskkill.ExitCode
+$stdout = $stdoutTask.GetAwaiter().GetResult().Trim()
+$stderr = $stderrTask.GetAwaiter().GetResult().Trim()
+if ($exitCode -eq 0 -or $exitCode -eq 128) {
+    foreach ($candidate in $candidates) {
+        "stopped $($candidate.ProcessId) $($candidate.Name) $($candidate.Source)"
+    }
+} else {
+    foreach ($candidate in $candidates) {
+        $directResult = Stop-CandidateDirectly -Candidate $candidate
+        if ($directResult.StartsWith('stopped ', [System.StringComparison]::Ordinal)) {
+            $directResult
+        } else {
+            "failed to stop $($candidate.ProcessId) $($candidate.Name): taskkill exited with code $exitCode; stdout=$stdout; stderr=$stderr; $directResult"
+        }
+    }
+}
