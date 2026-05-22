@@ -2931,6 +2931,7 @@ struct StartupReplayCoordinator<'a> {
     seen_replay_inodes: HashSet<Ino>,
     valid_pending_uploads: HashSet<PendingUploadKey>,
     stale_pending_uploads: HashMap<PendingUploadKey, PendingUpload>,
+    lost_unpublished_upload_inodes: HashSet<Ino>,
     restored_live_extents: usize,
     replay_failures: u64,
     orphan_dirty_payloads_removed: u64,
@@ -2979,6 +2980,7 @@ impl<'a> StartupReplayCoordinator<'a> {
             seen_replay_inodes: HashSet::new(),
             valid_pending_uploads: HashSet::new(),
             stale_pending_uploads: HashMap::new(),
+            lost_unpublished_upload_inodes: HashSet::new(),
             restored_live_extents: 0,
             replay_failures: 0,
             orphan_dirty_payloads_removed: 0,
@@ -3021,6 +3023,14 @@ impl<'a> StartupReplayCoordinator<'a> {
             self.classify_pending_uploads_for_attr(attr, graph_objects.as_slice());
         }
 
+        if has_pending_uploads
+            && graph_objects.is_empty()
+            && Self::is_lost_unpublished_regular_upload(attr)
+        {
+            self.lost_unpublished_upload_inodes.insert(ino);
+            return;
+        }
+
         if self.has_dirty_or_recovered_objects() {
             for graph_object in &graph_objects {
                 self.record_recovered_graph_object_if_local(ino, graph_object, attr.content_epoch);
@@ -3030,6 +3040,13 @@ impl<'a> StartupReplayCoordinator<'a> {
         if needs_finalization {
             self.record_epoch_finalization(ino, attr.content_epoch, graph_objects.as_slice());
         }
+    }
+
+    fn is_lost_unpublished_regular_upload(attr: &InodeAttr) -> bool {
+        attr.kind == FileType::RegularFile
+            && attr.upload_state != MetaUploadState::Ready
+            && attr.committed_size == 0
+            && attr.committed_content_epoch == 0
     }
 
     fn classify_pending_uploads_for_attr(
@@ -3211,6 +3228,66 @@ impl<'a> StartupReplayCoordinator<'a> {
                 .remove(&op.object_id);
             self.vfs
                 .debug_pending_inode_state(op.ino, "startup_stale_pending_upload_canceled");
+        }
+    }
+
+    fn remove_lost_unpublished_upload_inodes(&self) {
+        if self.lost_unpublished_upload_inodes.is_empty() {
+            return;
+        }
+
+        for ino in &self.lost_unpublished_upload_inodes {
+            let meta = self.vfs.sync_meta();
+            let attr = match meta.get_attr(*ino) {
+                Ok(attr) => attr,
+                Err(MetaError::InodeNotFound(_)) => continue,
+                Err(error) => {
+                    warn!(
+                        ino,
+                        error = %error,
+                        "startup recovery failed to load lost unpublished upload inode"
+                    );
+                    continue;
+                }
+            };
+            if !Self::is_lost_unpublished_regular_upload(&attr) {
+                continue;
+            }
+            let entries = match meta.readdir(attr.parent) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    warn!(
+                        ino,
+                        parent = attr.parent,
+                        error = %error,
+                        "startup recovery failed to enumerate parent for lost unpublished upload inode"
+                    );
+                    continue;
+                }
+            };
+            for entry in entries.into_iter().filter(|entry| entry.ino == *ino) {
+                if let Err(error) = meta.remove_entry(attr.parent, &entry.name) {
+                    warn!(
+                        ino,
+                        parent = attr.parent,
+                        name = %String::from_utf8_lossy(&entry.name),
+                        error = %error,
+                        "startup recovery failed to remove lost unpublished upload dentry"
+                    );
+                }
+            }
+            if let Err(error) = meta.remove_attr(*ino) {
+                warn!(
+                    ino,
+                    error = %error,
+                    "startup recovery failed to remove lost unpublished upload inode"
+                );
+                continue;
+            }
+            info!(
+                ino,
+                "startup recovery removed lost unpublished upload inode without durable payload graph"
+            );
         }
     }
 
@@ -3476,6 +3553,7 @@ impl<'a> StartupReplayCoordinator<'a> {
             }
         }
 
+        self.remove_lost_unpublished_upload_inodes();
         for (ino, content_epoch) in &self.pending_epoch_finalizations {
             self.vfs.queue_epoch_finalization(*ino, *content_epoch);
         }

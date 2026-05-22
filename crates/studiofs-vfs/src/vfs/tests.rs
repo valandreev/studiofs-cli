@@ -12,7 +12,7 @@ use studiofs_meta::schema::{
     SliceRange, SliceRecord,
 };
 use studiofs_meta::{
-    FileLockLease, HardLockKind, MetaEngine, MetaFormat, MetaFsOps, RedbMetaEngine,
+    FileLockLease, HardLockKind, MetaEngine, MetaFormat, MetaFsOps, MetaNamespace, RedbMetaEngine,
 };
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
@@ -643,6 +643,52 @@ fn startup_replay_cancels_ready_inode_stale_pending_upload() {
     assert!(
         !vfs.cached_store().is_pinned(stale_object_id),
         "replaying stale cancellation must not restore the canceled runtime pin"
+    );
+}
+
+#[test]
+fn startup_replay_removes_lost_unpublished_upload_inode_without_payload_graph() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "startup-lost-unpublished-upload");
+
+    let created = vfs
+        .create(1, b"startup-lost-unpublished-upload.bin", 0, 0, 0o644)
+        .expect("create test file");
+    let ino = created.ino;
+    let stale_object_id = 7_001;
+    let mut attr = meta.get_attr(ino).expect("load test attr");
+    attr.size = 48;
+    attr.committed_size = 0;
+    attr.content_epoch = 1;
+    attr.committed_content_epoch = 0;
+    attr.upload_state = MetaUploadState::Uploading;
+    meta.set_attr(&attr).expect("persist staged attr");
+
+    vfs.cached_store()
+        .submit_upload(ino, 0, stale_object_id, attr.content_epoch);
+    let pending_uploads = vfs.cached_store().snapshot_pending_uploads();
+    assert_eq!(
+        pending_uploads.len(),
+        1,
+        "test setup should install one runtime upload without a durable payload graph"
+    );
+
+    vfs.replay_dirty_uploads_from_local_backend(&pending_uploads, std::slice::from_ref(&attr));
+
+    assert!(
+        matches!(
+            meta.lookup(1, b"startup-lost-unpublished-upload.bin"),
+            Err(MetaError::EntryNotFound { .. })
+        ),
+        "startup replay must not leave a local zero-byte placeholder for a lost unpublished upload"
+    );
+    assert!(
+        matches!(meta.get_attr(ino), Err(MetaError::InodeNotFound(_))),
+        "startup replay should remove the orphaned inode once its payload graph is unrecoverable"
+    );
+    assert!(
+        vfs.pending_uploads_for_inode(ino).is_empty(),
+        "startup replay should cancel stale runtime uploads for the removed inode"
     );
 }
 
