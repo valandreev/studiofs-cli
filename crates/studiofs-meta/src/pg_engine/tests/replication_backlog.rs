@@ -275,9 +275,7 @@ fn published_base_graph_wakes_pg_poll_worker() {
 fn ready_file_attr_change_wakes_pg_poll_worker() {
     let (_dir, pg) = temp_pg_engine_for_unit();
 
-    let file = pg
-        .create_file(ROOT_INO, b"ready-attr-wakeup.bin", 0, 0, 0o644)
-        .expect("create file");
+    let file = create_published_small_file(&pg, ROOT_INO, b"ready-attr-wakeup.bin", 77_030);
     let setup_end = pg.local.get_counter("nextEventSeq").expect("setup end");
     pg.persist_flushed_event_seq(setup_end)
         .expect("ack setup events");

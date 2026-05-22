@@ -78,8 +78,91 @@ impl<'a> RemoteApplyCoordinator<'a> {
         out
     }
 
-    pub(super) fn remote_events_need_eager_flush(events: &[MetaEvent]) -> bool {
+    pub(super) fn project_local_batch(events: &[MetaEvent]) -> ProjectedRemoteBatch {
+        let remote_events = Self::project_local_events(events);
+        let visible_ops = u32::try_from(remote_events.len()).unwrap_or(u32::MAX);
+        let needs_eager_flush = Self::local_events_need_eager_flush(&remote_events);
+        let overlay = Self::overlay_conflicts_for_events(&remote_events);
+        ProjectedRemoteBatch {
+            events: remote_events,
+            visible_ops,
+            needs_eager_flush,
+            overlay,
+        }
+    }
+
+    fn project_local_events(events: &[MetaEvent]) -> Vec<MetaEvent> {
+        let mut hidden_regular_inodes = HashSet::new();
+        let mut published_regular_inodes = HashSet::new();
+        for event in events {
+            match event {
+                MetaEvent::SetAttr { attr }
+                    if attr.kind == FileType::RegularFile
+                        && !Self::regular_file_attr_is_ready_for_serving(attr) =>
+                {
+                    hidden_regular_inodes.insert(attr.ino);
+                }
+                MetaEvent::SetAttr { attr }
+                    if attr.kind == FileType::RegularFile
+                        && attr.upload_state == UploadState::Ready
+                        && attr.size == 0
+                        && attr.committed_size == 0
+                        && attr.content_epoch == attr.committed_content_epoch
+                        && attr.committed_content_epoch == 0 =>
+                {
+                    hidden_regular_inodes.insert(attr.ino);
+                }
+                MetaEvent::SetRegularFileOverlaySlices { ino, chunk_slices }
+                    if chunk_slices.iter().any(|(_, slices)| {
+                        slices
+                            .iter()
+                            .any(|slice| slice.payload_state != PayloadRefState::Published)
+                    }) =>
+                {
+                    hidden_regular_inodes.insert(*ino);
+                }
+                MetaEvent::PublishRegularFileBaseSlices { ino, chunk_slices }
+                    if chunk_slices.iter().any(|(_, slices)| {
+                        slices.iter().any(|slice| {
+                            slice.payload_state == PayloadRefState::Published
+                                && slice.payload.is_some()
+                        })
+                    }) =>
+                {
+                    published_regular_inodes.insert(*ino);
+                }
+                _ => {}
+            }
+        }
+        for ino in published_regular_inodes {
+            hidden_regular_inodes.remove(&ino);
+        }
+
+        let mut out = Vec::with_capacity(events.len());
+        for event in Self::project_remote_events(events) {
+            match &event {
+                MetaEvent::AddEntry { entry, .. }
+                    if entry.kind == FileType::RegularFile
+                        && hidden_regular_inodes.contains(&entry.ino) => {}
+                MetaEvent::RemoveAttr { ino } if hidden_regular_inodes.contains(ino) => {}
+                _ => out.push(event),
+            }
+        }
+        out
+    }
+
+    fn local_events_need_eager_flush(events: &[MetaEvent]) -> bool {
         events.iter().any(|event| match event {
+            MetaEvent::SetAttr { attr }
+                if attr.kind == FileType::RegularFile
+                    && attr.upload_state == UploadState::Ready
+                    && attr.size == 0
+                    && attr.committed_size == 0
+                    && attr.content_epoch == attr.committed_content_epoch
+                    && attr.committed_content_epoch == 0 =>
+            {
+                false
+            }
             MetaEvent::SetRegularFileOverlaySlices { .. }
             | MetaEvent::RemoveRegularFileGraph { .. }
             | MetaEvent::AddPendingDeletion { .. }
@@ -101,19 +184,6 @@ impl<'a> RemoteApplyCoordinator<'a> {
             | MetaEvent::SetAclRule { .. }
             | MetaEvent::RemoveAclRule { .. } => false,
         })
-    }
-
-    pub(super) fn project_local_batch(events: &[MetaEvent]) -> ProjectedRemoteBatch {
-        let remote_events = Self::project_remote_events(events);
-        let visible_ops = u32::try_from(remote_events.len()).unwrap_or(u32::MAX);
-        let needs_eager_flush = Self::remote_events_need_eager_flush(&remote_events);
-        let overlay = Self::overlay_conflicts_for_events(&remote_events);
-        ProjectedRemoteBatch {
-            events: remote_events,
-            visible_ops,
-            needs_eager_flush,
-            overlay,
-        }
     }
 
     pub(super) fn overlay_conflicts_for_events(events: &[MetaEvent]) -> OverlayConflictSets {

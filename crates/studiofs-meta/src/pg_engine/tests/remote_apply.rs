@@ -41,6 +41,176 @@ fn project_remote_events_filters_unpublished_overlay_slices() {
 }
 
 #[test]
+fn project_local_batch_hides_uncommitted_regular_file_namespace() {
+    let mut draft = InodeAttr::new_file(ROOT_INO + 10, ROOT_INO, 0, 0, 0o644);
+    draft.size = 4096;
+    draft.content_epoch = 1;
+    draft.committed_size = 0;
+    draft.committed_content_epoch = 0;
+    draft.upload_state = UploadState::Uploading;
+
+    let projected = RemoteApplyCoordinator::project_local_batch(&[
+        MetaEvent::SetAttr {
+            attr: draft.clone(),
+        },
+        MetaEvent::AddEntry {
+            parent: ROOT_INO,
+            name: b"draft.bin".to_vec(),
+            entry: DirEntryValue {
+                ino: draft.ino,
+                kind: FileType::RegularFile,
+            },
+        },
+        MetaEvent::SetRegularFileOverlaySlices {
+            ino: draft.ino,
+            chunk_slices: vec![(
+                ChunkId(0),
+                vec![SliceRecord {
+                    slice_id: SliceId(1),
+                    order: SliceOrder(0),
+                    range: SliceRange::new(0, 4096).unwrap(),
+                    payload: Some(PayloadRef::new_partial(9001, 4096)),
+                    payload_state: PayloadRefState::LocalOnly,
+                }],
+            )],
+        },
+    ]);
+
+    assert!(
+        !projected.events.iter().any(
+            |event| matches!(event, MetaEvent::AddEntry { entry, .. } if entry.ino == draft.ino)
+                || matches!(event, MetaEvent::SetRegularFileOverlaySlices { ino, .. } if *ino == draft.ino)
+        ),
+        "local draft namespace and payload state must not be projected to PG"
+    );
+    assert!(
+        projected
+            .events
+            .iter()
+            .any(|event| matches!(event, MetaEvent::SetAttr { attr } if attr.ino == draft.ino)),
+        "uploading attr metadata remains batchable while the namespace stays hidden"
+    );
+}
+
+#[test]
+fn project_local_batch_hides_uncommitted_regular_file_namespace_from_local_log() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let draft = pg
+        .create_file(ROOT_INO, b"log-draft.bin", 0, 0, 0o644)
+        .expect("create draft");
+    set_file_state(&pg, draft.ino, 4096, 1);
+    pg.stage_payload_slice(draft.ino, 0, &PayloadRef::new_partial(9003, 4096))
+        .expect("stage local-only payload");
+    let end = pg.local.get_counter("nextEventSeq").expect("event end");
+    let start = pg.flushed_event_seq.load(Ordering::SeqCst);
+    let events = pg.local.read_events_range(start, end).expect("read events");
+    let projected = RemoteApplyCoordinator::project_local_batch(&events);
+
+    assert!(
+        !projected.events.iter().any(
+            |event| matches!(event, MetaEvent::AddEntry { entry, .. } if entry.ino == draft.ino)
+        ),
+        "local event log projection must hide the draft dentry"
+    );
+
+    let batch = pg
+        .claim_pending_batch(true)
+        .expect("claim pending draft batch");
+    let claimed_events = pg
+        .local
+        .read_events_range(batch.event_start, batch.event_end)
+        .expect("read claimed events");
+    let claimed_projected = RemoteApplyCoordinator::project_local_batch(&claimed_events);
+    assert!(
+        !claimed_projected.events.iter().any(
+            |event| matches!(event, MetaEvent::AddEntry { entry, .. } if entry.ino == draft.ino)
+        ),
+        "claimed local batch projection must hide the draft dentry"
+    );
+}
+
+#[test]
+fn project_local_batch_hides_brand_new_empty_regular_file_namespace() {
+    let draft = InodeAttr::new_file(ROOT_INO + 11, ROOT_INO, 0, 0, 0o644);
+
+    let projected = RemoteApplyCoordinator::project_local_batch(&[
+        MetaEvent::SetAttr {
+            attr: draft.clone(),
+        },
+        MetaEvent::AddEntry {
+            parent: ROOT_INO,
+            name: b"empty-draft.bin".to_vec(),
+            entry: DirEntryValue {
+                ino: draft.ino,
+                kind: FileType::RegularFile,
+            },
+        },
+    ]);
+
+    assert!(
+        !projected.events.iter().any(
+            |event| matches!(event, MetaEvent::AddEntry { entry, .. } if entry.ino == draft.ino)
+        ),
+        "brand-new empty local files are not remote-visible until they publish data"
+    );
+}
+
+#[test]
+fn remote_snapshot_hides_uncommitted_regular_file_namespace() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let draft = pg
+        .create_file(ROOT_INO, b"snapshot-draft.bin", 0, 0, 0o644)
+        .expect("create draft");
+    set_file_state(&pg, draft.ino, 4096, 1);
+    pg.stage_payload_slice(draft.ino, 0, &PayloadRef::new_partial(9002, 4096))
+        .expect("stage local-only payload");
+
+    let snapshot = pg
+        .local
+        .export_remote_snapshot()
+        .expect("export remote snapshot");
+
+    assert!(
+        !snapshot.inodes.iter().any(|(ino, _)| *ino == draft.ino),
+        "remote snapshot must hide the uncommitted regular-file inode"
+    );
+    assert!(
+        !snapshot.dentries.iter().any(|(_, raw)| {
+            postcard::from_bytes::<DirEntryValue>(raw)
+                .map(|entry| entry.ino == draft.ino)
+                .unwrap_or(false)
+        }),
+        "remote snapshot must hide dentries pointing at the uncommitted inode"
+    );
+}
+
+#[test]
+fn remote_snapshot_hides_brand_new_empty_regular_file_namespace() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let draft = pg
+        .create_file(ROOT_INO, b"snapshot-empty-draft.bin", 0, 0, 0o644)
+        .expect("create empty draft");
+
+    let snapshot = pg
+        .local
+        .export_remote_snapshot()
+        .expect("export remote snapshot");
+
+    assert!(
+        !snapshot.inodes.iter().any(|(ino, _)| *ino == draft.ino),
+        "remote snapshot must hide a brand-new empty local file"
+    );
+    assert!(
+        !snapshot.dentries.iter().any(|(_, raw)| {
+            postcard::from_bytes::<DirEntryValue>(raw)
+                .map(|entry| entry.ino == draft.ino)
+                .unwrap_or(false)
+        }),
+        "remote snapshot must hide dentries pointing at a brand-new empty local file"
+    );
+}
+
+#[test]
 fn self_batch_acknowledges_projected_prefix_with_filtered_overlay_events() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     let file = pg

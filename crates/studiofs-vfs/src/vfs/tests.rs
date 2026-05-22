@@ -6948,6 +6948,49 @@ fn test_rename_over_existing_target_discards_pending_local_state() {
 }
 
 #[test]
+fn rename_over_existing_target_invalidates_displaced_inode_attr_cache() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "rename-displaced-cache-invalidation");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let source = vfs.create(1, b"rename-source.txt", 0, 0, 0o644).unwrap();
+        let displaced = vfs.create(1, b"rename-target.txt", 0, 0, 0o644).unwrap();
+
+        vfs.write(source.ino, 0, b"source").await.unwrap();
+        vfs.write(displaced.ino, 0, b"target").await.unwrap();
+        let cached_displaced = meta
+            .get_attr(displaced.ino)
+            .expect("load displaced attr before rename");
+        vfs.state.namespace.attr_read_cache.lock().put(
+            displaced.ino,
+            cached_displaced,
+            ATTR_CACHE_TTL,
+            Instant::now(),
+        );
+        assert!(
+            vfs.state
+                .namespace
+                .attr_read_cache
+                .lock()
+                .contains(displaced.ino),
+            "setup must prime displaced inode attr cache"
+        );
+
+        vfs.rename(1, b"rename-source.txt", 1, b"rename-target.txt")
+            .unwrap();
+
+        assert!(
+            !vfs.state
+                .namespace
+                .attr_read_cache
+                .lock()
+                .contains(displaced.ino),
+            "rename overwrite must drop stale cache for the deleted target inode"
+        );
+    });
+}
+
+#[test]
 fn orphan_cleanup_clears_dirty_writer_stack_state_for_deleted_inode() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "orphan-writer-stack-cleanup");

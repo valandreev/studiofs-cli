@@ -378,10 +378,11 @@ waiting, and remounts `client-a`. After writer recovery, the scenario always
 uses the mounted tree validator to check final convergence across `client-a`,
 `client-b`, and `client-c`. If the unclean writer shutdown recovers zero bytes,
 the scenario records `lost_after_unclean_shutdown` and treats the write as
-having no payload to publish, but it still requires every mounted client to
-converge on that final empty/lost result. The scenario does not require peers to
-observe the writer's outage payload before writer recovery and publication after
-PostgreSQL returns. The scenario writes the accepted writer
+having no peer-visible state to publish: no empty placeholder file is required
+or allowed as a substitute for the lost write. It still requires every mounted
+client to converge on that final empty/lost result. The scenario does not
+require peers to observe the writer's outage payload before writer recovery and
+publication after PostgreSQL returns. The scenario writes the accepted writer
 outage operation to `operations.ndjson` and `outage-operations.ndjson`, and
 writes `postgres-outage-recovery-summary.json` with outage duration,
 accepted-operation count, writer recovery client/status/checksum/time, peer
@@ -549,8 +550,10 @@ artifact directory. Temporary divergence during the convergence window is
 recorded by repeated polling but is not a failure until the timeout expires.
 Every real mounted scenario must end with a final all-participating-client
 convergence result. Converging on an empty tree or on an accepted lost/absent
-outcome is still convergence; replacing that final check with writer-only
-success is not valid.
+outcome is still convergence, but only as absence from the shared namespace;
+tests must not satisfy that rule by publishing empty placeholder files for work
+that never reached a publishable state. Replacing that final check with
+writer-only success is not valid.
 Transient snapshot I/O failures, such as files being renamed during traversal or
 temporary Windows sharing violations, are treated the same way: retry until the
 convergence deadline, then report the last stable divergence or snapshot error.

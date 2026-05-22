@@ -1566,14 +1566,13 @@ impl StudioVfs {
                 elapsed_ms = rename_started.elapsed().as_millis(),
                 "VFS rename cleaning displaced target storage"
             );
-            self.cleanup_deleted_inode_storage(
+            self.cleanup_deleted_inode_storage_deferred_cache_eviction(
                 &meta,
                 ino,
                 total_bytes,
                 "rename overwrite",
                 displaced_object_ids,
-            )
-            .await?;
+            )?;
             self.bump_directory_generation(ino);
             self.dentry_cache_invalidate_parent(ino);
         }
