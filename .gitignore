@@ -27,3 +27,4 @@ test*.txt
 .worktrees/
 deslop*.txt
 .rwx/bin/
+.antigravitycli/
