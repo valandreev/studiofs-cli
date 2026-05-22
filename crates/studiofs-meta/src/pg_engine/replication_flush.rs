@@ -67,6 +67,9 @@ impl PgMetaEngine {
             .map_err(|_| MetaError::Storage("pg pending state lock poisoned".to_string()))?;
         if projected.visible_ops == 0 {
             if state.ops == 0 {
+                if self.inflight_replication_ops.load(Ordering::SeqCst) > 0 {
+                    return Ok(false);
+                }
                 Self::clear_pending_state(&mut state);
                 drop(state);
                 self.persist_flushed_event_seq(after_seq)?;
