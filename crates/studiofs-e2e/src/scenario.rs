@@ -1419,38 +1419,23 @@ fn run_postgres_outage_body(
         });
     };
     let writer_recovery_time_ms = elapsed_millis_nonzero(writer_recovery_started);
-    let (peer_observation_time_ms, final_validator) =
-        if writer_recovery_status == PostgresOutageWriterRecoveryStatus::Recovered {
-            let mounts = clients
-                .iter()
-                .take(POSTGRES_OUTAGE_CLIENT_NAMES.len())
-                .map(|client| ClientMount::new(client.name.clone(), client.mount_point.clone()))
-                .collect::<Vec<_>>();
-            let peer_observation_started = Instant::now();
-            let convergence = wait_for_convergence(
-                &mounts,
-                context.scenario_dir.join("validation"),
-                convergence_timeout,
-                poll_interval,
-            )
-            .map_err(|error| ScenarioError::PostgresOutagePeerConvergenceFailed {
-                detail: error.to_string(),
-            })?;
-            (
-                elapsed_millis_nonzero(peer_observation_started),
-                convergence.comparison,
-            )
-        } else {
-            (
-                0,
-                TreeComparison {
-                    converged: true,
-                    reference_client: Some(writer.name.clone()),
-                    compared_clients: vec![writer.name.clone()],
-                    differences: Vec::new(),
-                },
-            )
-        };
+    let mounts = clients
+        .iter()
+        .take(POSTGRES_OUTAGE_CLIENT_NAMES.len())
+        .map(|client| ClientMount::new(client.name.clone(), client.mount_point.clone()))
+        .collect::<Vec<_>>();
+    let peer_observation_started = Instant::now();
+    let convergence = wait_for_convergence(
+        &mounts,
+        context.scenario_dir.join("validation"),
+        convergence_timeout,
+        poll_interval,
+    )
+    .map_err(|error| ScenarioError::PostgresOutagePeerConvergenceFailed {
+        detail: error.to_string(),
+    })?;
+    let peer_observation_time_ms = elapsed_millis_nonzero(peer_observation_started);
+    let final_validator = convergence.comparison;
     let recovery_time_ms = elapsed_millis_nonzero(recovery_started);
 
     let summary = PostgresOutageRecoverySummary {
@@ -2067,22 +2052,9 @@ fn run_crash_restart_mode(
 
     driver.before_peer_convergence_wait(&crashed.name, relative_path)?;
 
-    let convergence = if mode == CrashRestartMode::BeforeRemotePublicationCompletes {
-        ConvergenceOutcome {
-            attempts: 1,
-            elapsed_ms: 0,
-            snapshots: Vec::new(),
-            comparison: TreeComparison {
-                converged: true,
-                reference_client: Some(crashed.name.clone()),
-                compared_clients: vec![crashed.name.clone()],
-                differences: Vec::new(),
-            },
-        }
-    } else {
+    let convergence =
         wait_for_convergence(&mounts, validation_dir, convergence_timeout, poll_interval)
-            .map_err(|error| crash_restart_convergence_error(relative_path, error))?
-    };
+            .map_err(|error| crash_restart_convergence_error(relative_path, error))?;
     let convergence_elapsed_ms = convergence_started.elapsed().as_millis();
 
     let summary = match outcome {
@@ -2091,11 +2063,7 @@ fn run_crash_restart_mode(
             local_read_checksum_sha256,
             peer_visible_before_convergence,
         } => {
-            let final_payload = if mode == CrashRestartMode::BeforeRemotePublicationCompletes {
-                local_read_payload.clone()
-            } else {
-                fs::read(clients[1].mount_point.join(relative_path))?
-            };
+            let final_payload = fs::read(clients[1].mount_point.join(relative_path))?;
             let final_checksum_sha256 = bytes_sha256(&final_payload);
             if final_checksum_sha256 != local_read_checksum_sha256 {
                 return Err(ScenarioError::CrashRestartCorruptAdvertisedFile {
@@ -12649,7 +12617,7 @@ mod tests {
     }
 
     #[test]
-    fn crash_restart_before_publication_does_not_require_peer_convergence() {
+    fn crash_restart_before_publication_requires_final_peer_convergence() {
         let temp = tempdir().unwrap();
         let sandbox = temp.path().join("run-before-publication-writer-only");
         let scenario_dir = sandbox
@@ -12666,7 +12634,8 @@ mod tests {
                 client_spec_for(&sandbox, "projectfs", name, mount)
             })
             .collect::<Vec<_>>();
-        let mut driver = RecordingCrashRestartDriver::new(clients.clone());
+        let mut driver = RecordingCrashRestartDriver::new(clients.clone())
+            .publish_current_file_before_convergence();
         let context = ScenarioContext {
             run_id: "run-before-publication-writer-only".to_string(),
             seed: 405,
@@ -12689,12 +12658,61 @@ mod tests {
 
         assert_eq!(
             summary.final_validator.compared_clients,
-            vec![CRASH_RESTART_CLIENT_NAMES[0].to_string()]
+            CRASH_RESTART_CLIENT_NAMES
+                .iter()
+                .copied()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
         );
         assert_eq!(
             summary.local_read_checksum_sha256,
             summary.final_checksum_sha256
         );
+    }
+
+    #[test]
+    fn crash_restart_before_publication_fails_when_recovered_state_never_converges() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-before-publication-missing-peer");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(MOUNTED_CLIENT_CRASH_RESTART_RECOVERY);
+        std::fs::create_dir_all(&scenario_dir).unwrap();
+        let clients = CRASH_RESTART_CLIENT_NAMES
+            .iter()
+            .copied()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(&mount).unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let mut driver = RecordingCrashRestartDriver::new(clients.clone());
+        let context = ScenarioContext {
+            run_id: "run-before-publication-missing-peer".to_string(),
+            seed: 405,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+
+        let err = run_crash_restart_mode(
+            &context,
+            &mut driver,
+            &clients,
+            CrashRestartMode::BeforeRemotePublicationCompletes,
+            CRASH_RESTART_BEFORE_PUBLICATION_FILE_NAME,
+            b"writer-only before publication\n",
+            Duration::from_millis(100),
+            Duration::from_millis(10),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ScenarioError::CrashRestartPeerConvergenceFailed { .. }
+        ));
     }
 
     #[test]
@@ -12866,7 +12884,10 @@ mod tests {
         );
         assert_eq!(
             summary.modes[1].final_validator.compared_clients,
-            vec![client_names[0].to_string()]
+            client_names
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect::<Vec<_>>()
         );
     }
 
@@ -13009,8 +13030,15 @@ mod tests {
         assert_eq!(summary.writer_recovery_bytes, 0);
         assert_eq!(summary.writer_recovery_checksum_sha256, bytes_sha256(&[]));
         assert!(summary.final_validator.converged);
-        assert_eq!(summary.final_validator.compared_clients, ["client-a"]);
-        assert_eq!(summary.peer_observation_time_ms, 0);
+        assert_eq!(
+            summary.final_validator.compared_clients,
+            POSTGRES_OUTAGE_CLIENT_NAMES
+                .iter()
+                .copied()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        );
+        assert!(summary.peer_observation_time_ms > 0);
     }
 
     #[test]

@@ -374,14 +374,14 @@ the skeleton validation artifact.
 bootstrap, writes an initial file while PostgreSQL is healthy, stops only the
 PostgreSQL compose service, accepts a writer-local outage write through
 `client-a`, force-kills that writer, starts PostgreSQL again with compose health
-waiting, and remounts `client-a`. If the writer recovers the accepted local
-payload, the scenario uses the mounted tree validator to check peer observation
-from `client-b` and `client-c`. If the unclean writer shutdown recovers zero
-bytes, the scenario records `lost_after_unclean_shutdown` and treats the write
-as having no payload to publish; peer convergence for that lost write is skipped
-because every peer remaining empty is a valid outcome. The scenario does not
-require peers to observe the writer's outage payload before writer recovery and
-publication after PostgreSQL returns. The scenario writes the accepted writer
+waiting, and remounts `client-a`. After writer recovery, the scenario always
+uses the mounted tree validator to check final convergence across `client-a`,
+`client-b`, and `client-c`. If the unclean writer shutdown recovers zero bytes,
+the scenario records `lost_after_unclean_shutdown` and treats the write as
+having no payload to publish, but it still requires every mounted client to
+converge on that final empty/lost result. The scenario does not require peers to
+observe the writer's outage payload before writer recovery and publication after
+PostgreSQL returns. The scenario writes the accepted writer
 outage operation to `operations.ndjson` and `outage-operations.ndjson`, and
 writes `postgres-outage-recovery-summary.json` with outage duration,
 accepted-operation count, writer recovery client/status/checksum/time, peer
@@ -424,8 +424,9 @@ to survive an unclean crash. The scenario runs two modes in one invocation:
   expected to publish and converge across peers.
 - `before_remote_publication_completes`, which crashes after local durability
   but before the scenario waits for remote publication and peer convergence.
-  The writer's recovered local read is pass/fail; peer visibility is recorded
-  as diagnostics only.
+  The writer's recovered local read is pass/fail, pre-convergence peer
+  visibility is diagnostic, and the final result must still converge through the
+  mounted tree validator across all crash-restart clients.
 
 The scenario writes `operations.ndjson`,
 `crash-restart-recovery-summary.json`, and `validation.json`. The summary
@@ -434,7 +435,7 @@ local, and final checksums, whether a peer saw any pre-convergence checksum in
 the `before_remote_publication_completes` mode, restart timing, convergence
 timing, recovery outcome, and mounted tree validator result. Diagnostics must
 distinguish unrecoverable local loss, publication failure, peer convergence
-failure in the post-durability mode, and a corrupt advertised file whose final
+failure in either mode, and a corrupt advertised file whose final
 peer checksum differs from the writer's recovered checksum. Publication waiting
 is intentionally the public mounted-tree convergence loop; the scenario must not
 inspect private S3, PostgreSQL, VFS, cache, or redb state to decide success. It
@@ -546,6 +547,10 @@ written as `tree-client-N.json`. When convergence times out, validation writes
 one tree snapshot per client plus `diff.json` in the scenario validation
 artifact directory. Temporary divergence during the convergence window is
 recorded by repeated polling but is not a failure until the timeout expires.
+Every real mounted scenario must end with a final all-participating-client
+convergence result. Converging on an empty tree or on an accepted lost/absent
+outcome is still convergence; replacing that final check with writer-only
+success is not valid.
 Transient snapshot I/O failures, such as files being renamed during traversal or
 temporary Windows sharing violations, are treated the same way: retry until the
 convergence deadline, then report the last stable divergence or snapshot error.
