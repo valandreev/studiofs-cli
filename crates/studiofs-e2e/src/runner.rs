@@ -24,6 +24,9 @@ use crate::infra::{
     command_streams_output,
 };
 #[cfg(windows)]
+use crate::process_diagnostics::capture_process_diagnostics_best_effort;
+use crate::process_diagnostics::set_process_diagnostics_dir;
+#[cfg(windows)]
 use crate::process_job::{CHILD_TERMINATION_GRACE, ChildJob, wait_for_child_exit};
 use crate::report::{
     ArtifactReport, CleanupReport, ComposeImageReport, EnvironmentReport, EventRecord, HostReport,
@@ -381,6 +384,7 @@ pub fn run_with_executor(
         .unwrap_or_default();
 
     create_sandbox_layout(&sandbox, &scenarios)?;
+    set_process_diagnostics_dir(sandbox.join("artifacts").join("process-diagnostics"))?;
     let manifest = build_manifest(ManifestInput {
         run_id: &run_id,
         seed: request.seed,
@@ -1098,6 +1102,7 @@ pub fn run_one(request: RunOneRequest) -> Result<RunOneOutcome, RunnerError> {
             _ => None,
         },
     };
+    set_process_diagnostics_dir(context.scenario_dir.join("process-diagnostics"))?;
     let lifecycle = run_scenario_lifecycle(
         &sandbox.join("events.ndjson"),
         &request.run_id,
@@ -1603,6 +1608,10 @@ fn run_host_environment_probe(command: CommandSpec) -> Result<crate::infra::Comm
                 });
             }
             Ok(None) if started.elapsed() >= HOST_ENVIRONMENT_PROBE_TIMEOUT => {
+                capture_process_diagnostics_best_effort(
+                    child.id(),
+                    "host environment probe timeout",
+                );
                 let _ = job.terminate();
                 if !wait_for_child_exit(&mut child, CHILD_TERMINATION_GRACE).unwrap_or(false) {
                     let _ = job.force_kill();

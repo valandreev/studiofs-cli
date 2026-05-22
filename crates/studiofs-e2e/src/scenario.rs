@@ -34,6 +34,8 @@ use crate::mounted_tree::{
     ClientMount, ConvergenceOutcome, MountedTreeError, NamespaceInvariantViolation, TreeComparison,
     validate_namespace_invariants, wait_for_convergence,
 };
+#[cfg(all(windows, not(test)))]
+use crate::process_diagnostics::capture_process_diagnostics_best_effort;
 use crate::process_job::CHILD_TERMINATION_GRACE;
 #[cfg(not(test))]
 use crate::process_job::{ChildJob, wait_for_child_exit};
@@ -5512,6 +5514,7 @@ fn terminate_blocked_hotspot_client_process(
 
 #[cfg(all(windows, not(test)))]
 fn terminate_windows_pid_tree(pid: u32, label: &str, pending_label: &str) -> io::Result<()> {
+    capture_process_diagnostics_best_effort(pid, &format!("{label}: {pending_label}"));
     match run_taskkill_with_timeout(pid, Duration::from_secs(5)) {
         Ok(output) if windows_taskkill_status_is_success(output.status.code()) => return Ok(()),
         Ok(output) => {
@@ -5521,51 +5524,16 @@ fn terminate_windows_pid_tree(pid: u32, label: &str, pending_label: &str) -> io:
                 String::from_utf8_lossy(&output.stdout).trim(),
                 String::from_utf8_lossy(&output.stderr).trim()
             );
+            return Err(io::Error::other(format!(
+                "taskkill for {label} {pid} exited with {}; {pending_label}",
+                output.status.code().unwrap_or(-1)
+            )));
         }
         Err(error) => {
             eprintln!("studiofs-e2e: taskkill for {label} {pid} failed: {error}");
+            Err(error)
         }
     }
-
-    let stop_output = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            &format!("Stop-Process -Id {pid} -Force -ErrorAction SilentlyContinue"),
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .output();
-    if let Err(error) = stop_output {
-        eprintln!("studiofs-e2e: Stop-Process fallback for {label} {pid} failed: {error}");
-    }
-
-    if windows_process_is_running(pid) {
-        Err(io::Error::other(format!(
-            "{label} {pid} is still running after forced termination attempt: {pending_label}"
-        )))
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(all(windows, not(test)))]
-fn windows_process_is_running(pid: u32) -> bool {
-    Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            &format!("if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}"),
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(true)
 }
 
 #[cfg(not(test))]

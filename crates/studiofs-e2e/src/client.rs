@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::infra::ServicePort;
+use crate::process_diagnostics::capture_process_diagnostics_best_effort;
 use crate::process_job::ChildJob;
 
 /// Default client names used by the E2E mounted scenarios.
@@ -403,10 +404,15 @@ impl ClientProcess for SystemClientProcess {
     }
 
     fn kill(&mut self) -> io::Result<()> {
+        capture_process_diagnostics_best_effort(self.child.id(), "direct client process kill");
         self.child.kill()
     }
 
     fn kill_process_tree(&mut self, context: &str) -> io::Result<()> {
+        capture_process_diagnostics_best_effort(
+            self.child.id(),
+            &format!("client process tree termination: {context}"),
+        );
         let job_terminate_result = self.job.terminate();
         let job_force_result = self.job.force_kill();
         match (

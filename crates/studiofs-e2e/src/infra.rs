@@ -13,6 +13,7 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::process_diagnostics::capture_process_diagnostics_best_effort;
 use crate::process_job::{CHILD_TERMINATION_GRACE, ChildJob, wait_for_child_exit};
 
 const DEFAULT_WAIT_TIMEOUT_SECS: u64 = 120;
@@ -190,7 +191,12 @@ impl CommandExecutor for SystemCommandExecutor {
         let stream_output = command_streams_output(command);
         process.stdout(Stdio::piped());
         process.stderr(Stdio::piped());
-        run_command(process, command.timeout, stream_output)
+        run_command(
+            process,
+            command.timeout,
+            stream_output,
+            command_diagnostic_label(command),
+        )
     }
 }
 
@@ -206,6 +212,7 @@ fn run_command(
     mut command: Command,
     timeout: Option<Duration>,
     stream_output: bool,
+    diagnostic_label: String,
 ) -> std::io::Result<CommandOutput> {
     ChildJob::prepare_command(&mut command)?;
     let mut child = command.spawn()?;
@@ -242,6 +249,10 @@ fn run_command(
             });
         }
         if timeout.is_some_and(|timeout| started.elapsed() >= timeout) {
+            capture_process_diagnostics_best_effort(
+                child.id(),
+                &format!("command timeout: {diagnostic_label}"),
+            );
             let job_terminate_error = job.terminate().err();
             let mut job_force_kill_error = None;
             let mut process_tree_error = None;
@@ -295,6 +306,15 @@ fn run_command(
         }
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn command_diagnostic_label(command: &CommandSpec) -> String {
+    let mut label = command.program.clone();
+    if !command.args.is_empty() {
+        label.push(' ');
+        label.push_str(&command.args.join(" "));
+    }
+    label
 }
 
 fn terminate_descendants_after_primary_exit(job: &ChildJob) {
@@ -1286,6 +1306,9 @@ mod tests {
     #[test]
     fn system_command_executor_returns_timed_out_for_hung_command() {
         let _guard = crate::process_job::child_job_test_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let diagnostics_dir = temp.path().join("process-diagnostics");
+        crate::process_diagnostics::set_process_diagnostics_dir(diagnostics_dir.clone()).unwrap();
         let command = hung_command(Duration::from_millis(250));
         let started = Instant::now();
 
@@ -1295,6 +1318,16 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "timeout-aware executor should not wait for the hung command to finish"
+        );
+        let diagnostics = std::fs::read_dir(diagnostics_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|path| path.extension() == Some(std::ffi::OsStr::new("json"))),
+            "command timeout should capture process diagnostics before kill"
         );
     }
 
