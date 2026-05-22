@@ -68,7 +68,9 @@ function Stop-CandidateDirectly {
 
 $processMetadataPatterns = @(
     (Join-Path $normalizedRunnerRoot 'artifacts\clients\*\mount\mount-point.json'),
-    (Join-Path $normalizedRunnerRoot '*\artifacts\clients\*\mount\mount-point.json')
+    (Join-Path $normalizedRunnerRoot '*\artifacts\clients\*\mount\mount-point.json'),
+    (Join-Path $normalizedRunnerRoot 'artifacts\scenarios\*\hotspot-helper-processes\*.json'),
+    (Join-Path $normalizedRunnerRoot '*\artifacts\scenarios\*\hotspot-helper-processes\*.json')
 )
 
 foreach ($metadataPattern in $processMetadataPatterns) {

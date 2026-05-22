@@ -3847,6 +3847,7 @@ plain child stderr\n",
 
         assert!(windows_script.contains("$candidates = @("));
         assert!(windows_script.contains("mount-point.json"));
+        assert!(windows_script.contains("hotspot-helper-processes"));
         assert!(windows_script.contains("Add-CandidateProcess"));
         assert!(windows_script.contains("$taskkillArgs = @()"));
         assert!(windows_script.contains("[string]::Join(' ', $taskkillArgs)"));

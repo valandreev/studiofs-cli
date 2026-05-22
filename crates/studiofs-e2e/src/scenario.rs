@@ -5268,7 +5268,7 @@ fn run_hotspot_mount_operation_with_timeout(
         Ok(()) => Ok(()),
         Err(error @ ScenarioError::NamespaceCollisionOperationTimeout { .. }) => {
             #[cfg(not(test))]
-            terminate_blocked_hotspot_client_process(client, &pending_label);
+            let _ = terminate_blocked_hotspot_client_process(client, &pending_label);
             Err(error)
         }
         Err(error) => Err(ScenarioError::Io(io::Error::other(format!(
@@ -5341,6 +5341,14 @@ fn run_hotspot_helper_process(
 
         ChildJob::prepare_command(&mut command)?;
         let mut child = command.spawn()?;
+        write_hotspot_helper_process_metadata(
+            context,
+            child.id(),
+            client,
+            operation,
+            path,
+            target,
+        )?;
         let job = ChildJob::assign_to_child(&child).map_err(|error| {
             let _ = child.kill();
             let _ = child.wait();
@@ -5393,19 +5401,36 @@ fn run_hotspot_helper_process(
                     pending_label,
                     progress_suffix
                 );
-                terminate_blocked_hotspot_client_process(client, &pending_label);
+                let mut cleanup_error =
+                    terminate_blocked_hotspot_client_process(client, &pending_label)
+                        .err()
+                        .map(|error| error.to_string());
                 let _ = job.terminate();
                 if !wait_for_child_exit(&mut child, CHILD_TERMINATION_GRACE).unwrap_or(false) {
                     let _ = job.force_kill();
-                    terminate_blocked_hotspot_helper_process(child.id(), &pending_label);
+                    if let Err(error) =
+                        terminate_blocked_hotspot_helper_process(child.id(), &pending_label)
+                    {
+                        cleanup_error.get_or_insert_with(|| error.to_string());
+                    }
                     let _ = child.kill();
                     let _ = wait_for_child_exit(&mut child, CHILD_TERMINATION_GRACE);
                 }
-                terminate_blocked_hotspot_client_process(client, &pending_label);
-                return Err(namespace_collision_operation_timeout(
+                if let Err(error) = terminate_blocked_hotspot_client_process(client, &pending_label)
+                {
+                    cleanup_error.get_or_insert_with(|| error.to_string());
+                }
+                let primary = namespace_collision_operation_timeout(
                     timeout,
                     vec![(1, format!("{pending_label}{progress_suffix}"))],
-                ));
+                );
+                if let Some(cleanup) = cleanup_error {
+                    return Err(ScenarioError::NamespaceCollisionUnmountAfterFailure {
+                        primary: primary.to_string(),
+                        cleanup,
+                    });
+                }
+                return Err(primary);
             }
             thread::sleep(Duration::from_millis(50));
         }
@@ -5420,59 +5445,113 @@ fn hotspot_helper_internal_timeout(parent_timeout: Duration) -> Duration {
 }
 
 #[cfg(all(windows, not(test)))]
-fn terminate_blocked_hotspot_helper_process(pid: u32, pending_label: &str) {
+fn terminate_blocked_hotspot_helper_process(pid: u32, pending_label: &str) -> io::Result<()> {
     eprintln!(
         "studiofs-e2e: force terminating hotspot helper process {pid} to release blocked I/O: {pending_label}"
     );
-    match run_taskkill_with_timeout(pid, Duration::from_secs(5)) {
-        Ok(output) if windows_taskkill_status_is_success(output.status.code()) => {}
-        Ok(output) => {
-            eprintln!(
-                "studiofs-e2e: taskkill for blocked hotspot helper process {pid} exited with {}; stdout={}; stderr={}",
-                output.status.code().unwrap_or(-1),
-                String::from_utf8_lossy(&output.stdout).trim(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
+    match terminate_windows_pid_tree(pid, "blocked hotspot helper process", pending_label) {
+        Ok(()) => Ok(()),
         Err(error) => {
             eprintln!(
-                "studiofs-e2e: taskkill for blocked hotspot helper process {pid} failed: {error}"
+                "studiofs-e2e: failed to terminate blocked hotspot helper process {pid}: {error}"
             );
+            Err(error)
         }
     }
 }
 
 #[cfg(all(not(windows), not(test)))]
-fn terminate_blocked_hotspot_helper_process(_pid: u32, _pending_label: &str) {}
+fn terminate_blocked_hotspot_helper_process(_pid: u32, _pending_label: &str) -> io::Result<()> {
+    Ok(())
+}
 
 #[cfg(all(windows, not(test)))]
-fn terminate_blocked_hotspot_client_process(client: &ClientSpec, pending_label: &str) {
+fn terminate_blocked_hotspot_client_process(
+    client: &ClientSpec,
+    pending_label: &str,
+) -> io::Result<()> {
     let Some(pid) = client.process_id else {
-        return;
+        return Ok(());
     };
     eprintln!(
         "studiofs-e2e: terminating mounted client process {pid} to release blocked hotspot worker I/O: {pending_label}"
     );
+    match terminate_windows_pid_tree(pid, "blocked mounted client process", pending_label) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            eprintln!(
+                "studiofs-e2e: failed to terminate blocked mounted client process {pid}: {error}"
+            );
+            Err(error)
+        }
+    }
+}
+
+#[cfg(all(not(windows), not(test)))]
+fn terminate_blocked_hotspot_client_process(
+    _client: &ClientSpec,
+    _pending_label: &str,
+) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(all(windows, not(test)))]
+fn terminate_windows_pid_tree(pid: u32, label: &str, pending_label: &str) -> io::Result<()> {
     match run_taskkill_with_timeout(pid, Duration::from_secs(5)) {
-        Ok(output) if windows_taskkill_status_is_success(output.status.code()) => {}
+        Ok(output) if windows_taskkill_status_is_success(output.status.code()) => return Ok(()),
         Ok(output) => {
             eprintln!(
-                "studiofs-e2e: taskkill for blocked mounted client process {pid} exited with {}; stdout={}; stderr={}",
+                "studiofs-e2e: taskkill for {label} {pid} exited with {}; stdout={}; stderr={}",
                 output.status.code().unwrap_or(-1),
                 String::from_utf8_lossy(&output.stdout).trim(),
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
         Err(error) => {
-            eprintln!(
-                "studiofs-e2e: taskkill for blocked mounted client process {pid} failed: {error}"
-            );
+            eprintln!("studiofs-e2e: taskkill for {label} {pid} failed: {error}");
         }
+    }
+
+    let stop_output = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &format!("Stop-Process -Id {pid} -Force -ErrorAction SilentlyContinue"),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
+    if let Err(error) = stop_output {
+        eprintln!("studiofs-e2e: Stop-Process fallback for {label} {pid} failed: {error}");
+    }
+
+    if windows_process_is_running(pid) {
+        Err(io::Error::other(format!(
+            "{label} {pid} is still running after forced termination attempt: {pending_label}"
+        )))
+    } else {
+        Ok(())
     }
 }
 
-#[cfg(all(not(windows), not(test)))]
-fn terminate_blocked_hotspot_client_process(_client: &ClientSpec, _pending_label: &str) {}
+#[cfg(all(windows, not(test)))]
+fn windows_process_is_running(pid: u32) -> bool {
+    Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &format!("if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}"),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(true)
+}
 
 #[cfg(not(test))]
 fn prepare_hotspot_helper_exe(context: &ScenarioContext) -> io::Result<PathBuf> {
@@ -5525,6 +5604,31 @@ fn helper_progress_path(
         sanitize_hotspot_progress_component(operation),
         sanitize_hotspot_progress_component(path)
     )))
+}
+
+#[cfg(not(test))]
+fn write_hotspot_helper_process_metadata(
+    context: &ScenarioContext,
+    pid: u32,
+    client: &ClientSpec,
+    operation: &str,
+    path: &str,
+    target: Option<&str>,
+) -> io::Result<()> {
+    let process_dir = context.scenario_dir.join("hotspot-helper-processes");
+    fs::create_dir_all(&process_dir)?;
+    let metadata = json!({
+        "process_id": pid,
+        "process_name": "studiofs-e2e-hotspot-helper",
+        "client": client.name,
+        "operation": operation,
+        "path": path,
+        "target": target,
+    });
+    fs::write(
+        process_dir.join(format!("{pid}.json")),
+        serde_json::to_vec_pretty(&metadata).map_err(io::Error::other)?,
+    )
 }
 
 #[cfg(not(test))]
