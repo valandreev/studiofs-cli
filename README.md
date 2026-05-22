@@ -5,21 +5,35 @@
 </div>
 
 
-An open-source, self-hosted virtual filesystem optimized for VFX and post-production studios. Access and edit large files instantly from the cloud or remote hosted storage. No downloads, no syncing, just pure collaboration.
+StudioFS is an open-source, self-hostable virtual filesystem designed for
+computer graphics, animation, VFX, and post-production studios. It lets teams
+access and edit heavy source assets (4K, RAW, proxies, geometry, caches)
+directly from cloud or remote storage without waiting for full downloads or
+background sync jobs.
 
 - **Real-time access to heavy media**
-  Work directly with proxy, 4K, and RAW footage from the cloud as if it were on a local SSD. No more waiting for downloads.
+  Work directly with proxies, 4K, RAW footage, and other large assets from the
+  cloud as if they were stored on a local fast SSD.
 
 - **A single source of truth**
   Say goodbye to duplicate files, broken links, and version chaos. The entire team sees the exact same workspace, always in sync.
 
 - **Seamless DCC integration**
-  Edit collaboratively out of your existing toolkit, including DaVinci Resolve, Flame, Fusion, Nuke, After Effects, Maya, Houdini, and Blender. StudioFS drive acts as a local drive, so you can use your existing workflows without any changes.
+  Work in your existing tools: DaVinci Resolve, Flame, Fusion, Nuke, After
+  Effects, Maya, Houdini, and Blender. A StudioFS volume mounts like a regular
+  drive, so you can keep your current pipeline without custom plugins.
 
 - **Built for performance with Rust**
   Engineered from the ground up in Rust to guarantee memory safety, zero-overhead performance, and rock-solid stability under the heaviest multi-gigabyte editing workloads.
 
-Unlike proprietary SaaS alternatives, StudioFS is **100% open-source and self-hosted**, giving you absolute control over your storage and infrastructure. No telemetry included.
+- **Self-hosted and open**
+  Unlike proprietary SaaS alternatives, StudioFS is **100% open-source and
+  self-hosted**, giving you control over your storage, metadata, and
+  infrastructure. No hidden telemetry included.
+
+- **Cat logo**
+  Because infrastructure is better with a little personality. 🐱
+
 
 
 ### ⚠️ Caution
@@ -28,6 +42,59 @@ Unlike proprietary SaaS alternatives, StudioFS is **100% open-source and self-ho
 > Project is in its early stages. Breaking changes will happen.
 > Use with caution.
 
+
+
+## What Problem Does StudioFS Solve?
+
+In a classic remote production pipeline, artists often need to download hundreds
+of gigabytes of assets, wait for transfers to finish, relink paths manually, and
+then upload changed files back to shared storage.
+
+StudioFS is designed to remove that loop:
+
+- **Instant start**
+  StudioFS fetches only the file bytes that are actually needed. An artist opens
+  a project and can start working with video, geometry, or cache files without a
+  full local copy first.
+
+- **Background upload**
+  Saves are accepted locally first, so the artist can keep working. StudioFS then
+  uploads the new data to S3-compatible storage in the background.
+
+- **Freedom of deployment**
+  Run the system on your own infrastructure with any S3-compatible storage
+  backend, such as AWS S3, RustFS, or Backblaze B2, plus PostgreSQL for shared
+  metadata coordination.
+
+- **Security and end-to-end encryption**
+  Encryption support is in development. The intended model is to store source
+  assets in encrypted form in S3-compatible storage and decrypt them on local
+  workstations, while keeping key management simple for studio administrators.
+
+## How It Works
+
+StudioFS combines S3-compatible object storage with local caching and
+PostgreSQL-backed metadata coordination:
+
+- **Cloud storage holds the assets**
+  Heavy media and project data are stored as immutable objects in
+  S3-compatible storage.
+
+- **PostgreSQL coordinates the team**
+  PostgreSQL stores shared metadata, orders changes between clients, and helps
+  clients discover file additions, deletes, renames, snapshots, and other
+  metadata updates.
+
+- **Local cache keeps active work fast**
+  StudioFS caches only the file blocks that are actually accessed. This
+  block-level, on-demand cache reduces disk usage, lowers network traffic, and
+  hides most remote-storage latency.
+
+- **Local-first runtime keeps the mount responsive**
+  Interactive filesystem operations use local state first. Metadata lives in the
+  embedded `redb` database, written data becomes visible locally immediately,
+  and background workers upload payloads and replicate metadata through
+  PostgreSQL.
 
 ## Technical Foundation
 
@@ -196,12 +263,6 @@ Infra-heavy ignored suite:
 cargo test --workspace --all-targets -- --ignored --nocapture --test-threads=1
 ```
 
-Focused Local-First regression:
-
-```bash
-cargo test -p studiofs-vfs --test vfs_test foreground_read_baseline_during_and_post_upload_are_comparable -- --ignored --nocapture --test-threads=1
-```
-
 Real mounted E2E runner skeleton:
 
 ```bash
@@ -252,6 +313,18 @@ Project docs live in [docs/](docs/):
 - [docs/data-layer.md](docs/data-layer.md) - S3 object I/O and format details
 - [docs/platform-bridges.md](docs/platform-bridges.md) - WinFSP and FUSE integration
 
+## Credits and Inspiration
+
+StudioFS is heavily inspired by the design choices of
+[JuiceFS Community Edition](https://github.com/juicedata/juicefs), especially
+its metadata/data separation model and distributed filesystem architecture.
+
+We appreciate the JuiceFS team's contributions to the open-source storage
+community and their thoughtful work on practical distributed storage systems.
+JuiceFS has served as an important technical reference point for StudioFS.
+
 ## License
 
-GPL-3.0
+This project is distributed under the GPL-3.0 license. You may use and modify
+StudioFS for personal or commercial purposes, subject to the terms of the
+license.

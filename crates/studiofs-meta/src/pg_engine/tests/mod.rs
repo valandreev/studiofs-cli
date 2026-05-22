@@ -1,5 +1,6 @@
 use super::*;
 use crate::pg_dsn::ensure_studiofs_database;
+use crate::pg_engine::runtime::PgRemoteRuntime;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use tempfile::tempdir;
@@ -456,7 +457,7 @@ fn create_published_small_file(
     file
 }
 
-fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
+pub(crate) fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
     let dir = tempdir().expect("tempdir");
     let path = dir.path().join("meta.redb");
     let local = Arc::new(RedbMetaEngine::open(&path).expect("open local redb"));
@@ -492,6 +493,8 @@ fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
         command_timeout: Duration::from_millis(50),
         inflight_replication_ops: AtomicU32::new(0),
         pending_state: Mutex::new(PendingReplicationState::default()),
+        remote_runtime: PgRemoteRuntime::new("studiofs-pg-remote-runtime-test")
+            .expect("unit test remote runtime"),
         inode_allocator_lock: Mutex::new(()),
         inode_window_reservation_lock: Mutex::new(()),
         inode_id_headroom_available: AtomicBool::new(false),
