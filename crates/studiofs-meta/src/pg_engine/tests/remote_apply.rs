@@ -211,6 +211,64 @@ fn remote_snapshot_hides_brand_new_empty_regular_file_namespace() {
 }
 
 #[test]
+fn project_local_batch_publishes_explicit_empty_regular_file_namespace() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let (_remote_dir, remote) = temp_pg_engine_for_unit();
+    let start = pg.local.get_counter("nextEventSeq").expect("start seq");
+    let file = pg
+        .create_file(ROOT_INO, b"published-empty.bin", 0, 0, 0o644)
+        .expect("create empty file");
+    assert!(
+        pg.publish_regular_file_overlay_to_base_if_matches(file.ino, 0)
+            .expect("publish empty file"),
+        "empty file publish should succeed"
+    );
+    let end = pg.local.get_counter("nextEventSeq").expect("end seq");
+
+    let events = pg
+        .local
+        .read_events_range(start, end)
+        .expect("read empty publish events");
+    let projected = RemoteApplyCoordinator::project_local_batch(&events);
+
+    assert!(
+        projected.events.iter().any(
+            |event| matches!(event, MetaEvent::AddEntry { entry, .. } if entry.ino == file.ino)
+        ),
+        "explicit empty-file publish must make the dentry remote-visible"
+    );
+    assert!(
+        projected.events.iter().any(
+            |event| matches!(event, MetaEvent::SetAttr { attr } if attr.ino == file.ino
+                && attr.size == 0
+                && attr.committed_size == 0
+                && attr.content_epoch == 1
+                && attr.committed_content_epoch == 1)
+        ),
+        "explicit empty-file publish must advance the committed generation"
+    );
+
+    apply_foreign_batch(
+        &remote,
+        &projected.events,
+        &OverlayConflictSets::default(),
+        &std::collections::HashSet::new(),
+    )
+    .expect("apply empty publish to remote peer");
+    let remote_entry = remote
+        .lookup(ROOT_INO, b"published-empty.bin")
+        .expect("remote peer should see published empty file");
+    assert_eq!(remote_entry.ino, file.ino);
+    let remote_attr = remote
+        .get_attr(file.ino)
+        .expect("remote peer should have published empty attr");
+    assert_eq!(remote_attr.size, 0);
+    assert_eq!(remote_attr.committed_size, 0);
+    assert_eq!(remote_attr.content_epoch, 1);
+    assert_eq!(remote_attr.committed_content_epoch, 1);
+}
+
+#[test]
 fn self_batch_acknowledges_projected_prefix_with_filtered_overlay_events() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     let file = pg

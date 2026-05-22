@@ -105,14 +105,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 {
                     hidden_regular_inodes.insert(attr.ino);
                 }
-                MetaEvent::SetAttr { attr }
-                    if attr.kind == FileType::RegularFile
-                        && attr.upload_state == UploadState::Ready
-                        && attr.size == 0
-                        && attr.committed_size == 0
-                        && attr.content_epoch == attr.committed_content_epoch
-                        && attr.committed_content_epoch == 0 =>
-                {
+                MetaEvent::SetAttr { attr } if attr.is_unpublished_empty_draft() => {
                     hidden_regular_inodes.insert(attr.ino);
                 }
                 MetaEvent::SetRegularFileOverlaySlices { ino, chunk_slices }
@@ -125,12 +118,13 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     hidden_regular_inodes.insert(*ino);
                 }
                 MetaEvent::PublishRegularFileBaseSlices { ino, chunk_slices }
-                    if chunk_slices.iter().any(|(_, slices)| {
-                        slices.iter().any(|slice| {
-                            slice.payload_state == PayloadRefState::Published
-                                && slice.payload.is_some()
-                        })
-                    }) =>
+                    if chunk_slices.is_empty()
+                        || chunk_slices.iter().any(|(_, slices)| {
+                            slices.iter().any(|slice| {
+                                slice.payload_state == PayloadRefState::Published
+                                    && slice.payload.is_some()
+                            })
+                        }) =>
                 {
                     published_regular_inodes.insert(*ino);
                 }
@@ -166,13 +160,8 @@ impl<'a> RemoteApplyCoordinator<'a> {
             .iter()
             .filter_map(|event| match event {
                 MetaEvent::SetAttr { attr }
-                    if attr.kind == FileType::RegularFile
-                        && hidden_regular_inodes.contains(&attr.ino)
-                        && attr.upload_state == UploadState::Ready
-                        && attr.size == 0
-                        && attr.committed_size == 0
-                        && attr.content_epoch == attr.committed_content_epoch
-                        && attr.committed_content_epoch == 0 =>
+                    if hidden_regular_inodes.contains(&attr.ino)
+                        && attr.is_unpublished_empty_draft() =>
                 {
                     Some(attr.ino)
                 }
@@ -187,13 +176,8 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     if entry.kind == FileType::RegularFile
                         && hidden_regular_inodes.contains(&entry.ino) => {}
                 MetaEvent::SetAttr { attr }
-                    if attr.kind == FileType::RegularFile
-                        && hidden_zero_regular_add_inodes.contains(&attr.ino)
-                        && attr.upload_state == UploadState::Ready
-                        && attr.size == 0
-                        && attr.committed_size == 0
-                        && attr.content_epoch == attr.committed_content_epoch
-                        && attr.committed_content_epoch == 0 => {}
+                    if hidden_zero_regular_add_inodes.contains(&attr.ino)
+                        && attr.is_unpublished_empty_draft() => {}
                 MetaEvent::RemoveAttr { ino } if hidden_regular_inodes.contains(ino) => {}
                 _ => out.push(event),
             }
@@ -203,16 +187,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
 
     fn local_events_need_eager_flush(events: &[MetaEvent]) -> bool {
         events.iter().any(|event| match event {
-            MetaEvent::SetAttr { attr }
-                if attr.kind == FileType::RegularFile
-                    && attr.upload_state == UploadState::Ready
-                    && attr.size == 0
-                    && attr.committed_size == 0
-                    && attr.content_epoch == attr.committed_content_epoch
-                    && attr.committed_content_epoch == 0 =>
-            {
-                false
-            }
+            MetaEvent::SetAttr { attr } if attr.is_unpublished_empty_draft() => false,
             MetaEvent::SetRegularFileOverlaySlices { .. }
             | MetaEvent::RemoveRegularFileGraph { .. }
             | MetaEvent::AddPendingDeletion { .. }

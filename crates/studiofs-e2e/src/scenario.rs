@@ -5209,20 +5209,11 @@ fn timed_hotspot_mount_fs_op(
     active_workers: Arc<AtomicUsize>,
 ) -> Result<NamespaceCollisionOperation, ScenarioError> {
     let _ = active_workers;
-    let helper_operation = match operation {
-        "append" => "append",
-        "mkdir" => "mkdir",
-        "overwrite" => "overwrite",
-        "readdir" => "readdir",
-        "rename" => "rename",
-        "unlink" => "unlink",
-        other => other,
-    };
     match run_hotspot_helper_process(
         context,
         timeout,
         client,
-        helper_operation,
+        operation,
         path,
         target,
         payload,
@@ -5518,7 +5509,7 @@ fn terminate_blocked_hotspot_client_process(
 fn terminate_windows_pid_tree(pid: u32, label: &str, pending_label: &str) -> io::Result<()> {
     capture_process_diagnostics_best_effort(pid, &format!("{label}: {pending_label}"));
     match run_taskkill_with_timeout(pid, Duration::from_secs(5)) {
-        Ok(output) if windows_taskkill_status_is_success(output.status.code()) => return Ok(()),
+        Ok(output) if windows_taskkill_status_is_success(output.status.code()) => Ok(()),
         Ok(output) => {
             eprintln!(
                 "studiofs-e2e: taskkill for {label} {pid} exited with {}; stdout={}; stderr={}",
@@ -5526,10 +5517,10 @@ fn terminate_windows_pid_tree(pid: u32, label: &str, pending_label: &str) -> io:
                 String::from_utf8_lossy(&output.stdout).trim(),
                 String::from_utf8_lossy(&output.stderr).trim()
             );
-            return Err(io::Error::other(format!(
+            Err(io::Error::other(format!(
                 "taskkill for {label} {pid} exited with {}; {pending_label}",
                 output.status.code().unwrap_or(-1)
-            )));
+            )))
         }
         Err(error) => {
             eprintln!("studiofs-e2e: taskkill for {label} {pid} failed: {error}");

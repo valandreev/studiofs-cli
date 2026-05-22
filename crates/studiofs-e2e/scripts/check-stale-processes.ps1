@@ -118,51 +118,79 @@ if (-not [string]::IsNullOrWhiteSpace($env:SystemRoot)) {
     }
 }
 
-$taskkillArgs = @()
-foreach ($candidate in $candidates) {
-    $taskkillArgs += @('/PID', "$($candidate.ProcessId)")
-}
-$taskkillArgs += @('/T', '/F')
+$taskkillBatchSize = 100
 
-$taskkillStartInfo = [System.Diagnostics.ProcessStartInfo]::new()
-$taskkillStartInfo.FileName = $taskkillPath
-$taskkillStartInfo.UseShellExecute = $false
-$taskkillStartInfo.RedirectStandardOutput = $true
-$taskkillStartInfo.RedirectStandardError = $true
-$taskkillStartInfo.Arguments = [string]::Join(' ', $taskkillArgs)
-$taskkill = [System.Diagnostics.Process]::Start($taskkillStartInfo)
-$stdoutTask = $taskkill.StandardOutput.ReadToEndAsync()
-$stderrTask = $taskkill.StandardError.ReadToEndAsync()
-if (-not $taskkill.WaitForExit(5000)) {
-    try {
-        $taskkill.Kill()
-    } catch {
+function Invoke-TaskkillBatch {
+    param(
+        [object[]] $Batch
+    )
+
+    $taskkillArgs = @()
+    foreach ($candidate in $Batch) {
+        $taskkillArgs += @('/PID', "$($candidate.ProcessId)")
     }
-    foreach ($candidate in $candidates) {
-        $directResult = Stop-CandidateDirectly -Candidate $candidate
-        if ($directResult.StartsWith('stopped ', [System.StringComparison]::Ordinal)) {
-            $directResult
-        } else {
-            "failed to stop $($candidate.ProcessId) $($candidate.Name): batched taskkill timed out after 5000 ms; $directResult"
+    $taskkillArgs += @('/T', '/F')
+
+    $taskkillStartInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $taskkillStartInfo.FileName = $taskkillPath
+    $taskkillStartInfo.UseShellExecute = $false
+    $taskkillStartInfo.RedirectStandardOutput = $true
+    $taskkillStartInfo.RedirectStandardError = $true
+    $taskkillStartInfo.Arguments = [string]::Join(' ', $taskkillArgs)
+    $taskkill = [System.Diagnostics.Process]::Start($taskkillStartInfo)
+    $stdoutTask = $taskkill.StandardOutput.ReadToEndAsync()
+    $stderrTask = $taskkill.StandardError.ReadToEndAsync()
+    if (-not $taskkill.WaitForExit(5000)) {
+        try {
+            $taskkill.Kill()
+        } catch {
+        }
+        return [pscustomobject]@{
+            TimedOut = $true
+            ExitCode = $null
+            Stdout = ''
+            Stderr = ''
         }
     }
-    return
+
+    return [pscustomobject]@{
+        TimedOut = $false
+        ExitCode = $taskkill.ExitCode
+        Stdout = $stdoutTask.GetAwaiter().GetResult().Trim()
+        Stderr = $stderrTask.GetAwaiter().GetResult().Trim()
+    }
 }
 
-$exitCode = $taskkill.ExitCode
-$stdout = $stdoutTask.GetAwaiter().GetResult().Trim()
-$stderr = $stderrTask.GetAwaiter().GetResult().Trim()
-if ($exitCode -eq 0 -or $exitCode -eq 128) {
-    foreach ($candidate in $candidates) {
-        "stopped $($candidate.ProcessId) $($candidate.Name) $($candidate.Source)"
+for ($offset = 0; $offset -lt $candidates.Count; $offset += $taskkillBatchSize) {
+    $batchEnd = [Math]::Min($offset + $taskkillBatchSize - 1, $candidates.Count - 1)
+    $batch = @($candidates[$offset..$batchEnd])
+    $result = Invoke-TaskkillBatch -Batch $batch
+
+    if ($result.TimedOut) {
+        foreach ($candidate in $batch) {
+            $directResult = Stop-CandidateDirectly -Candidate $candidate
+            if ($directResult.StartsWith('stopped ', [System.StringComparison]::Ordinal)) {
+                $directResult
+            } else {
+                "failed to stop $($candidate.ProcessId) $($candidate.Name): batched taskkill timed out after 5000 ms; $directResult"
+            }
+        }
+        continue
     }
-} else {
-    foreach ($candidate in $candidates) {
+
+    if ($result.ExitCode -eq 0 -or $result.ExitCode -eq 128) {
+        foreach ($candidate in $batch) {
+            "stopped $($candidate.ProcessId) $($candidate.Name) $($candidate.Source)"
+        }
+        continue
+    }
+
+    foreach ($candidate in $batch) {
         $directResult = Stop-CandidateDirectly -Candidate $candidate
         if ($directResult.StartsWith('stopped ', [System.StringComparison]::Ordinal)) {
             $directResult
         } else {
-            "failed to stop $($candidate.ProcessId) $($candidate.Name): taskkill exited with code $exitCode; stdout=$stdout; stderr=$stderr; $directResult"
+            "failed to stop $($candidate.ProcessId) $($candidate.Name): taskkill exited with code $($result.ExitCode); stdout=$($result.Stdout); stderr=$($result.Stderr); $directResult"
         }
     }
 }

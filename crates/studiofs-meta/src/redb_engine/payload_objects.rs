@@ -455,6 +455,9 @@ impl MetaPayloadObjects for RedbMetaEngine {
                     )?;
                 }
             }
+            if attr.is_unpublished_empty_draft() {
+                attr.content_epoch = attr.content_epoch.saturating_add(1);
+            }
             attr.committed_size = attr.size;
             attr.committed_content_epoch = attr.content_epoch;
             attr.upload_state = UploadState::Ready;

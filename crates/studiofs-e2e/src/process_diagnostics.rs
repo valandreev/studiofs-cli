@@ -343,6 +343,22 @@ fn write_platform_process_dump(pid: u32, dump_path: &Path) -> io::Result<()> {
         fn CloseHandle(hObject: *mut c_void) -> i32;
     }
 
+    struct ProcessHandle(*mut c_void);
+
+    impl ProcessHandle {
+        fn as_raw(&self) -> *mut c_void {
+            self.0
+        }
+    }
+
+    impl Drop for ProcessHandle {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                let _ = unsafe { CloseHandle(self.0) };
+            }
+        }
+    }
+
     let process = unsafe {
         OpenProcess(
             PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_DUP_HANDLE,
@@ -353,18 +369,13 @@ fn write_platform_process_dump(pid: u32, dump_path: &Path) -> io::Result<()> {
     if process.is_null() {
         return Err(io::Error::last_os_error());
     }
+    let process = ProcessHandle(process);
 
-    let file = match File::create(dump_path) {
-        Ok(file) => file,
-        Err(error) => {
-            let _ = unsafe { CloseHandle(process) };
-            return Err(error);
-        }
-    };
+    let file = File::create(dump_path)?;
     let dump_type = MINI_DUMP_WITH_HANDLE_DATA | MINI_DUMP_WITH_THREAD_INFO;
     let ok = unsafe {
         MiniDumpWriteDump(
-            process,
+            process.as_raw(),
             pid,
             file.as_raw_handle().cast(),
             dump_type,
@@ -378,12 +389,8 @@ fn write_platform_process_dump(pid: u32, dump_path: &Path) -> io::Result<()> {
     } else {
         None
     };
-    let close_result = unsafe { CloseHandle(process) };
     if let Some(error) = dump_error {
         return Err(error);
-    }
-    if close_result == 0 {
-        return Err(io::Error::last_os_error());
     }
     Ok(())
 }

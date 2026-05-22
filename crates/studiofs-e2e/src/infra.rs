@@ -474,6 +474,8 @@ fn collect_reader_after_primary_exit(
         return Ok(Vec::new());
     };
     let deadline = Instant::now() + PRIMARY_EXIT_OUTPUT_DRAIN_GRACE;
+    // JoinHandle has no timeout; poll briefly so an inherited stdout/stderr
+    // pipe cannot deadlock runner teardown after the primary child exits.
     while !reader.is_finished() {
         if Instant::now() >= deadline {
             discard_timed_out_reader(Some(reader));
