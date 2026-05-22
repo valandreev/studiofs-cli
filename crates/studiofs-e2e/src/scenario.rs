@@ -1419,9 +1419,14 @@ fn run_postgres_outage_body(
         });
     };
     let writer_recovery_time_ms = elapsed_millis_nonzero(writer_recovery_started);
-    let mounts = clients
+    let convergence_clients =
+        if writer_recovery_status == PostgresOutageWriterRecoveryStatus::LostAfterUncleanShutdown {
+            &clients[1..POSTGRES_OUTAGE_CLIENT_NAMES.len()]
+        } else {
+            &clients[..POSTGRES_OUTAGE_CLIENT_NAMES.len()]
+        };
+    let mounts = convergence_clients
         .iter()
-        .take(POSTGRES_OUTAGE_CLIENT_NAMES.len())
         .map(|client| ClientMount::new(client.name.clone(), client.mount_point.clone()))
         .collect::<Vec<_>>();
     let peer_observation_started = Instant::now();
@@ -5199,15 +5204,25 @@ fn timed_hotspot_mount_fs_op(
     target: Option<&str>,
     active_workers: Arc<AtomicUsize>,
 ) -> Result<NamespaceCollisionOperation, ScenarioError> {
-    match run_hotspot_mount_operation_with_timeout(
+    let _ = active_workers;
+    let helper_operation = match operation {
+        "append" => "append",
+        "mkdir" => "mkdir",
+        "overwrite" => "overwrite",
+        "readdir" => "readdir",
+        "rename" => "rename",
+        "unlink" => "unlink",
+        other => other,
+    };
+    match run_hotspot_helper_process(
         context,
-        client,
-        operation,
-        path,
         timeout,
-        payload,
+        client,
+        helper_operation,
+        path,
         target,
-        active_workers,
+        payload,
+        format!("{} {} {}", client.name, operation, path),
     ) {
         Ok(()) => Ok(record_advanced_operation(
             started,
@@ -9389,7 +9404,7 @@ pub fn run_hotspot_op_helper(
             )?;
             append_payload_with_progress(&path, &payload, progress, operation, target)?;
         }
-        "delete" => {
+        "delete" | "unlink" => {
             record_hotspot_helper_progress(
                 progress,
                 "before_remove_file",
@@ -10462,6 +10477,7 @@ mod tests {
         actions: RefCell<Vec<&'static str>>,
         publish_writer_on_remount: bool,
         lose_writer_payload_on_remount: bool,
+        keep_lost_writer_payload_local_on_remount: bool,
         corrupt_writer_payload_on_remount: bool,
         start_postgres_delay: Duration,
     }
@@ -10473,6 +10489,7 @@ mod tests {
                 actions: RefCell::new(Vec::new()),
                 publish_writer_on_remount: false,
                 lose_writer_payload_on_remount: false,
+                keep_lost_writer_payload_local_on_remount: false,
                 corrupt_writer_payload_on_remount: false,
                 start_postgres_delay: Duration::from_millis(0),
             }
@@ -10486,6 +10503,11 @@ mod tests {
         fn lose_writer_payload_on_remount(mut self) -> Self {
             self.publish_writer_on_remount = true;
             self.lose_writer_payload_on_remount = true;
+            self
+        }
+
+        fn keep_lost_writer_payload_local_on_remount(mut self) -> Self {
+            self.keep_lost_writer_payload_local_on_remount = true;
             self
         }
 
@@ -10578,6 +10600,10 @@ mod tests {
                     writer.mount_point.join(POSTGRES_OUTAGE_FILE_NAME),
                     vec![b'x'; POSTGRES_OUTAGE_RECOVERED_PAYLOAD.len()],
                 )?;
+            }
+            if self.keep_lost_writer_payload_local_on_remount && self.lose_writer_payload_on_remount
+            {
+                return Ok(());
             }
             let mut entries = Vec::new();
             for entry in std::fs::read_dir(&writer.mount_point)? {
@@ -12363,6 +12389,32 @@ mod tests {
     }
 
     #[test]
+    fn hotspot_helper_unlink_removes_file_and_records_progress() {
+        let temp = tempdir().unwrap();
+        let mount = temp.path().join("mount");
+        let progress = temp.path().join("progress.jsonl");
+        let target = mount.join("hotspot").join("unlink-target.txt");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, b"payload").unwrap();
+
+        run_hotspot_op_helper(
+            "unlink",
+            mount,
+            "hotspot/unlink-target.txt",
+            None,
+            None,
+            Some(&progress),
+        )
+        .unwrap();
+
+        assert!(!target.exists());
+        let progress_log = std::fs::read_to_string(progress).unwrap();
+        assert!(progress_log.contains("\"phase\":\"before_remove_file\""));
+        assert!(progress_log.contains("\"phase\":\"after_remove_file\""));
+        assert!(progress_log.contains("\"phase\":\"completed\""));
+    }
+
+    #[test]
     fn hotspot_helper_records_progress_for_sync_barrier_phases() {
         let temp = tempdir().unwrap();
         let mount = temp.path().join("mount");
@@ -13136,13 +13188,64 @@ mod tests {
         assert!(summary.final_validator.converged);
         assert_eq!(
             summary.final_validator.compared_clients,
-            POSTGRES_OUTAGE_CLIENT_NAMES
+            POSTGRES_OUTAGE_CLIENT_NAMES[1..]
                 .iter()
                 .copied()
                 .map(str::to_string)
                 .collect::<Vec<_>>()
         );
         assert!(summary.peer_observation_time_ms > 0);
+    }
+
+    #[test]
+    fn postgres_outage_empty_writer_recovery_does_not_require_peer_empty_file() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(POSTGRES_OUTAGE_MULTI_CLIENT_RECOVERY);
+        let clients = POSTGRES_OUTAGE_CLIENT_NAMES
+            .iter()
+            .copied()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(&mount).unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let mut driver = RecordingOutageDriver::new(clients)
+            .lose_writer_payload_on_remount()
+            .keep_lost_writer_payload_local_on_remount();
+        let context = ScenarioContext {
+            run_id: "run-1".to_string(),
+            seed: 404,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+
+        let summary = run_postgres_outage_with_driver(
+            &context,
+            &mut driver,
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+
+        assert_eq!(
+            summary.writer_recovery_status,
+            PostgresOutageWriterRecoveryStatus::LostAfterUncleanShutdown
+        );
+        assert_eq!(
+            summary.final_validator.compared_clients,
+            POSTGRES_OUTAGE_CLIENT_NAMES[1..]
+                .iter()
+                .copied()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        );
+        assert!(summary.final_validator.converged);
     }
 
     #[test]

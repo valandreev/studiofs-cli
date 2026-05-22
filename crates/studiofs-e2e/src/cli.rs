@@ -387,7 +387,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             Ok(outcome.exit_code)
         }
         Commands::HotspotOp(args) => {
-            scenario::run_hotspot_op_helper_with_timeout(
+            let result = scenario::run_hotspot_op_helper_with_timeout(
                 &args.operation,
                 args.mount_point,
                 &args.path,
@@ -395,12 +395,18 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                 args.payload.as_deref(),
                 args.progress.as_deref(),
                 args.timeout_ms.map(std::time::Duration::from_millis),
-            )?;
+            );
             // This helper exists only to isolate one potentially blocking mounted
             // filesystem call.  Once the call has returned successfully, exit
             // without running any remaining process teardown that can wedge while
             // WinFSP is under churn.
-            std::process::exit(0);
+            match result {
+                Ok(()) => std::process::exit(0),
+                Err(error) => {
+                    eprintln!("{error:#}");
+                    std::process::exit(1);
+                }
+            }
         }
         Commands::OpenHandleOp(args) => {
             scenario::run_open_handle_op_helper(
