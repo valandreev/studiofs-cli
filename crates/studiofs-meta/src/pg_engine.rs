@@ -135,6 +135,7 @@ pub struct PgMetaEngine {
     command_timeout: Duration,
     inflight_replication_ops: AtomicU32,
     pending_state: Mutex<PendingReplicationState>,
+    remote_runtime: runtime::PgRemoteRuntime,
     inode_allocator_lock: Mutex<()>,
     inode_window_reservation_lock: Mutex<()>,
     inode_id_headroom_available: AtomicBool,
@@ -333,9 +334,10 @@ impl PgMetaEngine {
             return Err(MetaError::Storage(message));
         }
 
+        let postgres_url = postgres_url.to_string();
         Self::run_async_once(async move {
             Self::with_postgres_client_timeout(
-                postgres_url.to_string(),
+                postgres_url,
                 connect_timeout,
                 command_timeout,
                 "ensure file lock lease schema",
@@ -478,6 +480,7 @@ impl PgMetaEngine {
             command_timeout,
             inflight_replication_ops: AtomicU32::new(0),
             pending_state: Mutex::new(PendingReplicationState::default()),
+            remote_runtime: runtime::PgRemoteRuntime::new("studiofs-pg-remote-runtime")?,
             inode_allocator_lock: Mutex::new(()),
             inode_window_reservation_lock: Mutex::new(()),
             // Optimistic: assume headroom is available until proven exhausted.
