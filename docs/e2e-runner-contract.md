@@ -113,6 +113,14 @@ exit. The parent-owned `run-one` Job Object remains the hard cleanup boundary,
 so a stuck mount cannot keep the scenario child alive long enough to contaminate
 the command shell.
 
+After a supervised `run-one` primary process exits, the parent must also treat
+blocked child output pipes as a containment boundary. The command executor may
+give stdout/stderr reader threads a short drain window for normal diagnostics,
+but it must detach those readers instead of joining forever if an escaped or
+wedged descendant still holds the pipe handle open. The run result may lose
+late buffered diagnostic output in that case; preserving an interactive shell
+and keeping post-scenario cleanup reachable takes priority.
+
 ## Adversarial Runner Cleanup Proof
 
 SFS-381 is the adversarial proof layer over the supervised runner model. It is

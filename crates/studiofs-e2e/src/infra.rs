@@ -22,6 +22,7 @@ const DEFAULT_RUSTFS_CONSOLE_PORT: u16 = 29_001;
 const DEFAULT_TOXIPROXY_API_PORT: u16 = 28_474;
 const COMPOSE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 const COMPOSE_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(30);
+const PRIMARY_EXIT_OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(500);
 #[cfg(windows)]
 const TASKKILL_FALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
 const STREAM_OUTPUT_ENV: &str = "STUDIOFS_E2E_STREAM_OUTPUT";
@@ -232,8 +233,8 @@ fn run_command(
         if child.try_wait()?.is_some() {
             let status = child.wait()?;
             terminate_descendants_after_primary_exit(&job);
-            let stdout = collect_reader(stdout_reader.take())?;
-            let stderr = collect_reader(stderr_reader.take())?;
+            let stdout = collect_reader_after_primary_exit(stdout_reader.take())?;
+            let stderr = collect_reader_after_primary_exit(stderr_reader.take())?;
             return Ok(CommandOutput {
                 status: status.code().unwrap_or(-1),
                 stdout: String::from_utf8_lossy(&stdout).into_owned(),
@@ -437,10 +438,20 @@ fn colorize_progress_status_line(line: &str) -> String {
     line.to_string()
 }
 
-fn collect_reader(reader: Option<JoinHandle<io::Result<Vec<u8>>>>) -> io::Result<Vec<u8>> {
+fn collect_reader_after_primary_exit(
+    reader: Option<JoinHandle<io::Result<Vec<u8>>>>,
+) -> io::Result<Vec<u8>> {
     let Some(reader) = reader else {
         return Ok(Vec::new());
     };
+    let deadline = Instant::now() + PRIMARY_EXIT_OUTPUT_DRAIN_GRACE;
+    while !reader.is_finished() {
+        if Instant::now() >= deadline {
+            discard_timed_out_reader(Some(reader));
+            return Ok(Vec::new());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
     reader
         .join()
         .map_err(|_| io::Error::other("command output reader thread panicked"))?
@@ -1290,6 +1301,24 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_millis(200),
             "timeout cleanup must not join blocked output reader threads"
+        );
+    }
+
+    #[test]
+    fn primary_exit_cleanup_detaches_blocked_output_reader() {
+        let blocked_reader = thread::spawn(|| {
+            thread::sleep(Duration::from_secs(5));
+            Ok(Vec::new())
+        });
+        let started = Instant::now();
+
+        let output = collect_reader_after_primary_exit(Some(blocked_reader))
+            .expect("blocked reader should be detached after primary exit");
+
+        assert!(output.is_empty());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "primary-exit cleanup must not join reader threads held open by escaped descendants"
         );
     }
 
