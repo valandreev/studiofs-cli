@@ -203,6 +203,9 @@ Rules:
   into their own local metadata view.
 - New files with payload are hidden from peers until their first complete
   published version exists.
+- A new regular-file placeholder with no published payload is not peer-visible
+  state. If the writer crashes or rolls back before publication, peers converge
+  on absence, not on an empty file created as a placeholder.
 - Updates to already published files keep the previous peer-visible version
   until the next complete version is published and applied.
 - Metadata-only updates may publish through PostgreSQL without object upload.

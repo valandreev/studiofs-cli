@@ -154,14 +154,15 @@ cargo run -p studiofs-e2e -- clean
 
 SFS-381 adversarial cleanup proof is a focused runner self-test layer, not a
 new mounted scenario number. It validates partial setup failure cleanup, hung
-supervised child timeout reporting, post-scenario mounted cleanup
-contamination, and primary-error preservation through infra-disabled tests and
+supervised child timeout reporting, mounted contamination boundaries, and
+primary-error preservation through infra-disabled tests and
 the best-effort `artifacts/runner/adversarial-cleanup-proof.json` artifact:
 
 ```powershell
 cargo test -p studiofs-e2e runner::tests::compose_partial_launch_failure_writes_adversarial_cleanup_proof -- --exact --nocapture
 cargo test -p studiofs-e2e runner::tests::post_start_cleanup_report_errors_do_not_shadow_primary_error -- --exact --nocapture
-cargo test -p studiofs-e2e runner::tests::mounted_cleanup_verification_failure_blocks_later_mounted_children -- --exact --nocapture
+cargo test -p studiofs-e2e runner::tests::mounted_child_failure_blocks_later_mounted_children -- --exact --nocapture
+cargo test -p studiofs-e2e runner::tests::mounted_supervision_error_writes_report_without_post_scenario_cleanup_verifier -- --exact --nocapture
 cargo test -p studiofs-e2e runner::tests::supervised_child_timeout_records_executor_cleanup_detail -- --exact --nocapture
 ```
 

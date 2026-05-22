@@ -95,7 +95,10 @@ sync peers, validate the mounted tree, and clean up.
 Here we publish a healthy baseline, stop PostgreSQL while clients are mounted,
 accept local-first work where the contract allows it, then bring PostgreSQL
 back. The writer must recover first, then normal publication and peer
-convergence must finish.
+convergence must finish. If the writer's unclean shutdown means the accepted
+outage write is lost and the final result is empty, that means no peer-visible
+file or placeholder was published. All mounted clients must converge on that
+same absence.
 
 This tests that temporary metadata-service loss does not automatically mean
 accepted local work is lost, and that recovery does not corrupt the shared
@@ -114,8 +117,9 @@ This tests the split between local durability and remote publication.
 
 We kill a mounted client after it has accepted local work, then remount it with
 the same client root. The restarted client must recover readable local state,
-and the run records whether peers can see the work after that recovery. For the
-pre-publication crash mode, peer visibility is diagnostic rather than pass/fail.
+and the run records whether peers can see the work before the final convergence
+wait. For the pre-publication crash mode, early peer visibility is diagnostic,
+but the final mounted tree still has to converge across the clients.
 
 This tests whether accepted local work survives process death.
 
@@ -127,6 +131,10 @@ writer and peers must not see the file at all.
 
 This tests that we do not turn a pre-acceptance crash into fake local recovery
 or fake publication.
+
+An empty final result is therefore not a requirement to publish an empty file.
+It is a valid convergence result only when the attempted operation never reached
+a publishable state and the shared namespace remains unchanged.
 
 ### 6. Crash After Partial Write Acceptance
 

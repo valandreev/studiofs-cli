@@ -35,6 +35,9 @@ impl PgMetaEngine {
         let projected = RemoteApplyCoordinator::project_local_batch(&pending_events);
         if projected.visible_ops == 0 {
             Self::clear_pending_state(&mut state);
+            if projected.needs_local_replay {
+                return Ok(());
+            }
             drop(state);
             self.persist_flushed_event_seq(event_end)?;
             return Ok(());
@@ -58,15 +61,30 @@ impl PgMetaEngine {
         if after_seq <= before_seq {
             return Ok(false);
         }
-        let events = self.local.read_events_range(before_seq, after_seq)?;
-        let projected = RemoteApplyCoordinator::project_local_batch(&events);
         let now = Instant::now();
         let mut state = self
             .pending_state
             .lock()
             .map_err(|_| MetaError::Storage("pg pending state lock poisoned".to_string()))?;
+        let event_start = state.event_start.unwrap_or(before_seq);
+        let events = self.local.read_events_range(event_start, after_seq)?;
+        let projected = RemoteApplyCoordinator::project_local_batch(&events);
         if projected.visible_ops == 0 {
+            if projected.needs_local_replay {
+                state.ops = 0;
+                state.force_flush = false;
+                state.event_start = Some(event_start);
+                state.event_end = state.event_end.max(after_seq);
+                state.last_mutation_at = Some(now);
+                if state.started_at.is_none() {
+                    state.started_at = Some(now);
+                }
+                return Ok(false);
+            }
             if state.ops == 0 {
+                if self.inflight_replication_ops.load(Ordering::SeqCst) > 0 {
+                    return Ok(false);
+                }
                 Self::clear_pending_state(&mut state);
                 drop(state);
                 self.persist_flushed_event_seq(after_seq)?;
@@ -81,15 +99,11 @@ impl PgMetaEngine {
         if state.ops == 0 {
             state.started_at = Some(now);
         }
-        state.ops = state.ops.saturating_add(projected.visible_ops);
+        state.ops = projected.visible_ops;
         state.last_mutation_at = Some(now);
-        if state.event_start.is_none() {
-            state.event_start = Some(before_seq);
-        }
+        state.event_start = Some(event_start);
         state.event_end = state.event_end.max(after_seq);
-        if projected.needs_eager_flush || state.ops >= self.flush_ops_threshold {
-            state.force_flush = true;
-        }
+        state.force_flush = projected.needs_eager_flush || state.ops >= self.flush_ops_threshold;
         Ok(projected.needs_eager_flush)
     }
 

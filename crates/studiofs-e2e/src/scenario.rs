@@ -34,6 +34,8 @@ use crate::mounted_tree::{
     ClientMount, ConvergenceOutcome, MountedTreeError, NamespaceInvariantViolation, TreeComparison,
     validate_namespace_invariants, wait_for_convergence,
 };
+#[cfg(all(windows, not(test)))]
+use crate::process_diagnostics::capture_process_diagnostics_best_effort;
 use crate::process_job::CHILD_TERMINATION_GRACE;
 #[cfg(not(test))]
 use crate::process_job::{ChildJob, wait_for_child_exit};
@@ -1390,67 +1392,62 @@ fn run_postgres_outage_body(
             detail: error.to_string(),
         }
     })?;
-    let writer_payload =
-        fs::read(writer.mount_point.join(POSTGRES_OUTAGE_FILE_NAME)).map_err(|error| {
-            ScenarioError::PostgresOutageWriterRecoveryFailed {
+    let expected_checksum = bytes_sha256(POSTGRES_OUTAGE_RECOVERED_PAYLOAD);
+    let writer_payload_path = writer.mount_point.join(POSTGRES_OUTAGE_FILE_NAME);
+    let writer_payload_result = fs::read(&writer_payload_path);
+    let (writer_payload, writer_recovery_status) = match writer_payload_result {
+        Ok(payload) if payload == POSTGRES_OUTAGE_RECOVERED_PAYLOAD => {
+            (payload, PostgresOutageWriterRecoveryStatus::Recovered)
+        }
+        Ok(payload) if payload.is_empty() => (
+            payload,
+            PostgresOutageWriterRecoveryStatus::LostAfterUncleanShutdown,
+        ),
+        Ok(payload) => {
+            let recovered_checksum = bytes_sha256(&payload);
+            return Err(ScenarioError::PostgresOutageWriterRecoveryFailed {
+                client: writer.name.clone(),
+                path: POSTGRES_OUTAGE_FILE_NAME.to_string(),
+                detail: format!(
+                    "recovered payload differs: expected {} bytes with expected checksum {}, got {} bytes with recovered checksum {}",
+                    POSTGRES_OUTAGE_RECOVERED_PAYLOAD.len(),
+                    expected_checksum,
+                    payload.len(),
+                    recovered_checksum
+                ),
+            });
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (
+            Vec::new(),
+            PostgresOutageWriterRecoveryStatus::LostAfterUncleanShutdown,
+        ),
+        Err(error) => {
+            return Err(ScenarioError::PostgresOutageWriterRecoveryFailed {
                 client: writer.name.clone(),
                 path: POSTGRES_OUTAGE_FILE_NAME.to_string(),
                 detail: error.to_string(),
-            }
-        })?;
-    let expected_checksum = bytes_sha256(POSTGRES_OUTAGE_RECOVERED_PAYLOAD);
-    let recovered_checksum = bytes_sha256(&writer_payload);
-    let writer_recovery_status = if writer_payload == POSTGRES_OUTAGE_RECOVERED_PAYLOAD {
-        PostgresOutageWriterRecoveryStatus::Recovered
-    } else if writer_payload.is_empty() {
-        PostgresOutageWriterRecoveryStatus::LostAfterUncleanShutdown
-    } else {
-        let recovered_checksum = bytes_sha256(&writer_payload);
-        return Err(ScenarioError::PostgresOutageWriterRecoveryFailed {
-            client: writer.name.clone(),
-            path: POSTGRES_OUTAGE_FILE_NAME.to_string(),
-            detail: format!(
-                "recovered payload differs: expected {} bytes with expected checksum {}, got {} bytes with recovered checksum {}",
-                POSTGRES_OUTAGE_RECOVERED_PAYLOAD.len(),
-                expected_checksum,
-                writer_payload.len(),
-                recovered_checksum
-            ),
-        });
+            });
+        }
     };
+    let recovered_checksum = bytes_sha256(&writer_payload);
     let writer_recovery_time_ms = elapsed_millis_nonzero(writer_recovery_started);
-    let (peer_observation_time_ms, final_validator) =
-        if writer_recovery_status == PostgresOutageWriterRecoveryStatus::Recovered {
-            let mounts = clients
-                .iter()
-                .take(POSTGRES_OUTAGE_CLIENT_NAMES.len())
-                .map(|client| ClientMount::new(client.name.clone(), client.mount_point.clone()))
-                .collect::<Vec<_>>();
-            let peer_observation_started = Instant::now();
-            let convergence = wait_for_convergence(
-                &mounts,
-                context.scenario_dir.join("validation"),
-                convergence_timeout,
-                poll_interval,
-            )
-            .map_err(|error| ScenarioError::PostgresOutagePeerConvergenceFailed {
-                detail: error.to_string(),
-            })?;
-            (
-                elapsed_millis_nonzero(peer_observation_started),
-                convergence.comparison,
-            )
-        } else {
-            (
-                0,
-                TreeComparison {
-                    converged: true,
-                    reference_client: Some(writer.name.clone()),
-                    compared_clients: vec![writer.name.clone()],
-                    differences: Vec::new(),
-                },
-            )
-        };
+    let convergence_clients = &clients[..POSTGRES_OUTAGE_CLIENT_NAMES.len()];
+    let mounts = convergence_clients
+        .iter()
+        .map(|client| ClientMount::new(client.name.clone(), client.mount_point.clone()))
+        .collect::<Vec<_>>();
+    let peer_observation_started = Instant::now();
+    let convergence = wait_for_convergence(
+        &mounts,
+        context.scenario_dir.join("validation"),
+        convergence_timeout,
+        poll_interval,
+    )
+    .map_err(|error| ScenarioError::PostgresOutagePeerConvergenceFailed {
+        detail: error.to_string(),
+    })?;
+    let peer_observation_time_ms = elapsed_millis_nonzero(peer_observation_started);
+    let final_validator = convergence.comparison;
     let recovery_time_ms = elapsed_millis_nonzero(recovery_started);
 
     let summary = PostgresOutageRecoverySummary {
@@ -2067,22 +2064,9 @@ fn run_crash_restart_mode(
 
     driver.before_peer_convergence_wait(&crashed.name, relative_path)?;
 
-    let convergence = if mode == CrashRestartMode::BeforeRemotePublicationCompletes {
-        ConvergenceOutcome {
-            attempts: 1,
-            elapsed_ms: 0,
-            snapshots: Vec::new(),
-            comparison: TreeComparison {
-                converged: true,
-                reference_client: Some(crashed.name.clone()),
-                compared_clients: vec![crashed.name.clone()],
-                differences: Vec::new(),
-            },
-        }
-    } else {
+    let convergence =
         wait_for_convergence(&mounts, validation_dir, convergence_timeout, poll_interval)
-            .map_err(|error| crash_restart_convergence_error(relative_path, error))?
-    };
+            .map_err(|error| crash_restart_convergence_error(relative_path, error))?;
     let convergence_elapsed_ms = convergence_started.elapsed().as_millis();
 
     let summary = match outcome {
@@ -2091,11 +2075,7 @@ fn run_crash_restart_mode(
             local_read_checksum_sha256,
             peer_visible_before_convergence,
         } => {
-            let final_payload = if mode == CrashRestartMode::BeforeRemotePublicationCompletes {
-                local_read_payload.clone()
-            } else {
-                fs::read(clients[1].mount_point.join(relative_path))?
-            };
+            let final_payload = fs::read(clients[1].mount_point.join(relative_path))?;
             let final_checksum_sha256 = bytes_sha256(&final_payload);
             if final_checksum_sha256 != local_read_checksum_sha256 {
                 return Err(ScenarioError::CrashRestartCorruptAdvertisedFile {
@@ -2381,7 +2361,7 @@ trait NamespaceCollisionDriver {
     ) -> Result<(), ScenarioError> {
         Ok(())
     }
-    fn force_kill_all(&mut self) -> Result<(), ScenarioError>;
+    fn emergency_kill_all_no_wait(&mut self, context: &str) -> Result<(), ScenarioError>;
     fn unmount_all(&mut self) -> Result<(), ScenarioError>;
 }
 
@@ -2407,8 +2387,8 @@ impl NamespaceCollisionDriver for RealNamespaceCollisionDriver {
         Ok(self.0.unmount_all()?)
     }
 
-    fn force_kill_all(&mut self) -> Result<(), ScenarioError> {
-        Ok(self.0.force_kill_all()?)
+    fn emergency_kill_all_no_wait(&mut self, context: &str) -> Result<(), ScenarioError> {
+        Ok(self.0.emergency_kill_all_no_wait(context)?)
     }
 }
 
@@ -2602,13 +2582,7 @@ fn run_namespace_collision_body(
     let operations = match perform_namespace_collision_operations(context, kind, &clients) {
         Ok(operations) => operations,
         Err(error @ ScenarioError::NamespaceCollisionOperationTimeout { .. }) => {
-            if let Err(cleanup) = driver.force_kill_all() {
-                return Err(ScenarioError::NamespaceCollisionUnmountAfterFailure {
-                    primary: error.to_string(),
-                    cleanup: cleanup.to_string(),
-                });
-            }
-            return Err(error);
+            return handle_namespace_collision_operation_timeout(error, driver);
         }
         Err(error) => return Err(error),
     };
@@ -2623,6 +2597,19 @@ fn run_namespace_collision_body(
         poll_interval,
     )?;
     Ok(summary)
+}
+
+fn handle_namespace_collision_operation_timeout<T>(
+    error: ScenarioError,
+    driver: &mut dyn NamespaceCollisionDriver,
+) -> Result<T, ScenarioError> {
+    match driver.emergency_kill_all_no_wait("namespace collision operation timeout") {
+        Ok(()) => Err(error),
+        Err(cleanup) => Err(ScenarioError::NamespaceCollisionUnmountAfterFailure {
+            primary: error.to_string(),
+            cleanup: cleanup.to_string(),
+        }),
+    }
 }
 
 fn write_namespace_collision_plan_artifacts(
@@ -4167,18 +4154,20 @@ fn run_stale_remount_cold_discover_body(
         .ok_or_else(|| ScenarioError::Io(io::Error::other("missing stale remount client-c")))?;
     let baseline_path = isolation.path("baseline.txt");
     let baseline_payload = isolation.payload("initial_baseline", &baseline_path, "baseline");
-    operations.push(required_op(
+    operations.push(timed_cold_observer_helper_fs_op(
+        context,
         started,
         1,
         stale_client,
         "initial_baseline",
+        "create",
         &baseline_path,
-        write_parented(
-            stale_client.mount_point.join(&baseline_path),
-            &baseline_payload,
-        )
-        .map_err(ScenarioError::from),
+        &baseline_path,
+        HOTSPOT_CHURN_OPERATION_TIMEOUT,
+        Some(&baseline_payload),
+        None,
     )?);
+    write_namespace_collision_operations(context, &operations)?;
     wait_for_mounted_initial_payloads_until(
         &initial_clients,
         &[(&baseline_path, baseline_payload.as_slice())],
@@ -4194,6 +4183,7 @@ fn run_stale_remount_cold_discover_body(
         "client-c",
         controller.unmount("client-c").map_err(ScenarioError::from),
     )?);
+    write_namespace_collision_operations(context, &operations)?;
 
     let warm_clients = controller
         .clients()
@@ -4207,6 +4197,7 @@ fn run_stale_remount_cold_discover_body(
         &warm_clients,
         &isolation,
         operations.len() + 1,
+        &operations,
     )?;
     operations.append(&mut warm_history);
     write_namespace_collision_operations(context, &operations)?;
@@ -4284,8 +4275,10 @@ fn run_stale_remount_warm_history(
     clients: &[ClientSpec],
     isolation: &ScenarioIsolation,
     first_order: usize,
+    previously_recorded: &[NamespaceCollisionOperation],
 ) -> Result<(Vec<NamespaceCollisionOperation>, LongHistorySummary), ScenarioError> {
     let mut operations = Vec::new();
+    let mut persisted_operations = previously_recorded.to_vec();
     let delete_target = isolation.path(COLD_OBSERVER_DELETE_TARGET);
     let rename_source = isolation.path(COLD_OBSERVER_RENAME_SOURCE);
     let rename_dest = isolation.path(COLD_OBSERVER_RENAME_DEST);
@@ -4352,36 +4345,32 @@ fn run_stale_remount_warm_history(
     .enumerate()
     {
         let client = &clients[client_index];
-        let result = match operation {
-            "delete" => {
-                fs::remove_file(client.mount_point.join(&path)).map_err(ScenarioError::from)
-            }
-            "rename" => fs::rename(
-                client.mount_point.join(&rename_source),
-                client.mount_point.join(&rename_dest),
-            )
-            .map_err(ScenarioError::from),
-            "append" => append_mounted_file_with_readback(
-                client.mount_point.join(&path),
-                action.as_deref().unwrap(),
-                "stale remount warm history append",
-            ),
-            _ => write_mounted_file_with_readback(
-                client.mount_point.join(&path),
-                action.as_deref().unwrap(),
-                &format!("stale remount warm history {operation}"),
-                operation == "create",
-            ),
+        let operation_path = if operation == "rename" {
+            rename_source.as_str()
+        } else {
+            path.as_str()
         };
-        let recorded = required_op(
+        let target = (operation == "rename").then_some(rename_dest.as_str());
+        let helper_operation = if operation == "overwrite" {
+            "overwrite-barrier"
+        } else {
+            operation
+        };
+        let recorded = timed_cold_observer_helper_fs_op(
+            context,
             started,
             first_order + offset,
             client,
             operation,
+            helper_operation,
+            operation_path,
             &log_path,
-            result,
+            HOTSPOT_CHURN_OPERATION_TIMEOUT,
+            action.as_deref(),
+            target,
         )?;
-        record_sparse_operation(context, &mut operations, recorded)?;
+        record_sparse_operation(context, &mut persisted_operations, recorded.clone())?;
+        operations.push(recorded);
         if matches!(operation, "create" | "overwrite") && path != delete_target {
             wait_for_mounted_initial_payloads_until(
                 clients,
@@ -5224,15 +5213,16 @@ fn timed_hotspot_mount_fs_op(
     target: Option<&str>,
     active_workers: Arc<AtomicUsize>,
 ) -> Result<NamespaceCollisionOperation, ScenarioError> {
-    match run_hotspot_mount_operation_with_timeout(
+    let _ = active_workers;
+    match run_hotspot_helper_process(
         context,
+        timeout,
         client,
         operation,
         path,
-        timeout,
-        payload,
         target,
-        active_workers,
+        payload,
+        format!("{} {} {}", client.name, operation, path),
     ) {
         Ok(()) => Ok(record_advanced_operation(
             started,
@@ -5293,7 +5283,7 @@ fn run_hotspot_mount_operation_with_timeout(
         Ok(()) => Ok(()),
         Err(error @ ScenarioError::NamespaceCollisionOperationTimeout { .. }) => {
             #[cfg(not(test))]
-            terminate_blocked_hotspot_client_process(client, &pending_label);
+            let _ = terminate_blocked_hotspot_client_process(client, &pending_label);
             Err(error)
         }
         Err(error) => Err(ScenarioError::Io(io::Error::other(format!(
@@ -5366,6 +5356,14 @@ fn run_hotspot_helper_process(
 
         ChildJob::prepare_command(&mut command)?;
         let mut child = command.spawn()?;
+        write_hotspot_helper_process_metadata(
+            context,
+            child.id(),
+            client,
+            operation,
+            path,
+            target,
+        )?;
         let job = ChildJob::assign_to_child(&child).map_err(|error| {
             let _ = child.kill();
             let _ = child.wait();
@@ -5418,19 +5416,36 @@ fn run_hotspot_helper_process(
                     pending_label,
                     progress_suffix
                 );
-                terminate_blocked_hotspot_client_process(client, &pending_label);
+                let mut cleanup_error =
+                    terminate_blocked_hotspot_client_process(client, &pending_label)
+                        .err()
+                        .map(|error| error.to_string());
                 let _ = job.terminate();
                 if !wait_for_child_exit(&mut child, CHILD_TERMINATION_GRACE).unwrap_or(false) {
                     let _ = job.force_kill();
-                    terminate_blocked_hotspot_helper_process(child.id(), &pending_label);
+                    if let Err(error) =
+                        terminate_blocked_hotspot_helper_process(child.id(), &pending_label)
+                    {
+                        cleanup_error.get_or_insert_with(|| error.to_string());
+                    }
                     let _ = child.kill();
                     let _ = wait_for_child_exit(&mut child, CHILD_TERMINATION_GRACE);
                 }
-                terminate_blocked_hotspot_client_process(client, &pending_label);
-                return Err(namespace_collision_operation_timeout(
+                if let Err(error) = terminate_blocked_hotspot_client_process(client, &pending_label)
+                {
+                    cleanup_error.get_or_insert_with(|| error.to_string());
+                }
+                let primary = namespace_collision_operation_timeout(
                     timeout,
                     vec![(1, format!("{pending_label}{progress_suffix}"))],
-                ));
+                );
+                if let Some(cleanup) = cleanup_error {
+                    return Err(ScenarioError::NamespaceCollisionUnmountAfterFailure {
+                        primary: primary.to_string(),
+                        cleanup,
+                    });
+                }
+                return Err(primary);
             }
             thread::sleep(Duration::from_millis(50));
         }
@@ -5445,59 +5460,79 @@ fn hotspot_helper_internal_timeout(parent_timeout: Duration) -> Duration {
 }
 
 #[cfg(all(windows, not(test)))]
-fn terminate_blocked_hotspot_helper_process(pid: u32, pending_label: &str) {
+fn terminate_blocked_hotspot_helper_process(pid: u32, pending_label: &str) -> io::Result<()> {
     eprintln!(
         "studiofs-e2e: force terminating hotspot helper process {pid} to release blocked I/O: {pending_label}"
     );
-    match run_taskkill_with_timeout(pid, Duration::from_secs(5)) {
-        Ok(output) if windows_taskkill_status_is_success(output.status.code()) => {}
-        Ok(output) => {
-            eprintln!(
-                "studiofs-e2e: taskkill for blocked hotspot helper process {pid} exited with {}; stdout={}; stderr={}",
-                output.status.code().unwrap_or(-1),
-                String::from_utf8_lossy(&output.stdout).trim(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
+    match terminate_windows_pid_tree(pid, "blocked hotspot helper process", pending_label) {
+        Ok(()) => Ok(()),
         Err(error) => {
             eprintln!(
-                "studiofs-e2e: taskkill for blocked hotspot helper process {pid} failed: {error}"
+                "studiofs-e2e: failed to terminate blocked hotspot helper process {pid}: {error}"
             );
+            Err(error)
         }
     }
 }
 
 #[cfg(all(not(windows), not(test)))]
-fn terminate_blocked_hotspot_helper_process(_pid: u32, _pending_label: &str) {}
+fn terminate_blocked_hotspot_helper_process(_pid: u32, _pending_label: &str) -> io::Result<()> {
+    Ok(())
+}
 
 #[cfg(all(windows, not(test)))]
-fn terminate_blocked_hotspot_client_process(client: &ClientSpec, pending_label: &str) {
+fn terminate_blocked_hotspot_client_process(
+    client: &ClientSpec,
+    pending_label: &str,
+) -> io::Result<()> {
     let Some(pid) = client.process_id else {
-        return;
+        return Ok(());
     };
     eprintln!(
         "studiofs-e2e: terminating mounted client process {pid} to release blocked hotspot worker I/O: {pending_label}"
     );
-    match run_taskkill_with_timeout(pid, Duration::from_secs(5)) {
-        Ok(output) if windows_taskkill_status_is_success(output.status.code()) => {}
-        Ok(output) => {
-            eprintln!(
-                "studiofs-e2e: taskkill for blocked mounted client process {pid} exited with {}; stdout={}; stderr={}",
-                output.status.code().unwrap_or(-1),
-                String::from_utf8_lossy(&output.stdout).trim(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
+    match terminate_windows_pid_tree(pid, "blocked mounted client process", pending_label) {
+        Ok(()) => Ok(()),
         Err(error) => {
             eprintln!(
-                "studiofs-e2e: taskkill for blocked mounted client process {pid} failed: {error}"
+                "studiofs-e2e: failed to terminate blocked mounted client process {pid}: {error}"
             );
+            Err(error)
         }
     }
 }
 
 #[cfg(all(not(windows), not(test)))]
-fn terminate_blocked_hotspot_client_process(_client: &ClientSpec, _pending_label: &str) {}
+fn terminate_blocked_hotspot_client_process(
+    _client: &ClientSpec,
+    _pending_label: &str,
+) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(all(windows, not(test)))]
+fn terminate_windows_pid_tree(pid: u32, label: &str, pending_label: &str) -> io::Result<()> {
+    capture_process_diagnostics_best_effort(pid, &format!("{label}: {pending_label}"));
+    match run_taskkill_with_timeout(pid, Duration::from_secs(5)) {
+        Ok(output) if windows_taskkill_status_is_success(output.status.code()) => Ok(()),
+        Ok(output) => {
+            eprintln!(
+                "studiofs-e2e: taskkill for {label} {pid} exited with {}; stdout={}; stderr={}",
+                output.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&output.stdout).trim(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            Err(io::Error::other(format!(
+                "taskkill for {label} {pid} exited with {}; {pending_label}",
+                output.status.code().unwrap_or(-1)
+            )))
+        }
+        Err(error) => {
+            eprintln!("studiofs-e2e: taskkill for {label} {pid} failed: {error}");
+            Err(error)
+        }
+    }
+}
 
 #[cfg(not(test))]
 fn prepare_hotspot_helper_exe(context: &ScenarioContext) -> io::Result<PathBuf> {
@@ -5550,6 +5585,31 @@ fn helper_progress_path(
         sanitize_hotspot_progress_component(operation),
         sanitize_hotspot_progress_component(path)
     )))
+}
+
+#[cfg(not(test))]
+fn write_hotspot_helper_process_metadata(
+    context: &ScenarioContext,
+    pid: u32,
+    client: &ClientSpec,
+    operation: &str,
+    path: &str,
+    target: Option<&str>,
+) -> io::Result<()> {
+    let process_dir = context.scenario_dir.join("hotspot-helper-processes");
+    fs::create_dir_all(&process_dir)?;
+    let metadata = json!({
+        "process_id": pid,
+        "process_name": "studiofs-e2e-hotspot-helper",
+        "client": client.name,
+        "operation": operation,
+        "path": path,
+        "target": target,
+    });
+    fs::write(
+        process_dir.join(format!("{pid}.json")),
+        serde_json::to_vec_pretty(&metadata).map_err(io::Error::other)?,
+    )
 }
 
 #[cfg(not(test))]
@@ -7543,43 +7603,6 @@ fn write_mounted_file_with_readback(
     Ok(())
 }
 
-fn append_mounted_file_with_readback(
-    path: PathBuf,
-    payload: &[u8],
-    label: &str,
-) -> Result<(), ScenarioError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut expected = match fs::read(&path) {
-        Ok(existing) => existing,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
-        Err(error) => return Err(error.into()),
-    };
-    let mut options = mounted_write_barrier_open_options();
-    options.create(true).append(true);
-    let mut file = options.open(&path)?;
-    file.write_all(payload)?;
-    file.sync_all()?;
-    drop(file);
-    expected.extend_from_slice(payload);
-    let readback = wait_for_mounted_payload_readback(
-        &path,
-        &expected,
-        MOUNTED_WRITE_READBACK_TIMEOUT,
-        MOUNTED_WRITE_READBACK_POLL_INTERVAL,
-    )?;
-    if readback != expected {
-        return Err(ScenarioError::Io(io::Error::other(format!(
-            "{label} append readback mismatch for {}: expected {} bytes, read {} bytes",
-            path.display(),
-            expected.len(),
-            readback.len()
-        ))));
-    }
-    Ok(())
-}
-
 fn write_mounted_file_without_barrier_with_readback(
     path: PathBuf,
     payload: &[u8],
@@ -9310,7 +9333,7 @@ pub fn run_hotspot_op_helper(
             )?;
             append_payload_with_progress(&path, &payload, progress, operation, target)?;
         }
-        "delete" => {
+        "delete" | "unlink" => {
             record_hotspot_helper_progress(
                 progress,
                 "before_remove_file",
@@ -10383,6 +10406,7 @@ mod tests {
         actions: RefCell<Vec<&'static str>>,
         publish_writer_on_remount: bool,
         lose_writer_payload_on_remount: bool,
+        keep_lost_writer_payload_local_on_remount: bool,
         corrupt_writer_payload_on_remount: bool,
         start_postgres_delay: Duration,
     }
@@ -10394,6 +10418,7 @@ mod tests {
                 actions: RefCell::new(Vec::new()),
                 publish_writer_on_remount: false,
                 lose_writer_payload_on_remount: false,
+                keep_lost_writer_payload_local_on_remount: false,
                 corrupt_writer_payload_on_remount: false,
                 start_postgres_delay: Duration::from_millis(0),
             }
@@ -10407,6 +10432,11 @@ mod tests {
         fn lose_writer_payload_on_remount(mut self) -> Self {
             self.publish_writer_on_remount = true;
             self.lose_writer_payload_on_remount = true;
+            self
+        }
+
+        fn keep_lost_writer_payload_local_on_remount(mut self) -> Self {
+            self.keep_lost_writer_payload_local_on_remount = true;
             self
         }
 
@@ -10491,14 +10521,26 @@ mod tests {
                 .iter()
                 .find(|candidate| candidate.name == client)
                 .expect("recording writer client exists");
-            if self.lose_writer_payload_on_remount {
-                std::fs::write(writer.mount_point.join(POSTGRES_OUTAGE_FILE_NAME), [])?;
+            let writer_path = writer.mount_point.join(POSTGRES_OUTAGE_FILE_NAME);
+            if self.lose_writer_payload_on_remount && self.keep_lost_writer_payload_local_on_remount
+            {
+                std::fs::write(&writer_path, [])?;
+            } else if self.lose_writer_payload_on_remount {
+                match std::fs::remove_file(&writer_path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
             }
             if self.corrupt_writer_payload_on_remount {
                 std::fs::write(
                     writer.mount_point.join(POSTGRES_OUTAGE_FILE_NAME),
                     vec![b'x'; POSTGRES_OUTAGE_RECOVERED_PAYLOAD.len()],
                 )?;
+            }
+            if self.keep_lost_writer_payload_local_on_remount && self.lose_writer_payload_on_remount
+            {
+                return Ok(());
             }
             let mut entries = Vec::new();
             for entry in std::fs::read_dir(&writer.mount_point)? {
@@ -10917,8 +10959,8 @@ mod tests {
             Ok(())
         }
 
-        fn force_kill_all(&mut self) -> Result<(), ScenarioError> {
-            self.actions.borrow_mut().push("force_kill_all");
+        fn emergency_kill_all_no_wait(&mut self, _context: &str) -> Result<(), ScenarioError> {
+            self.actions.borrow_mut().push("emergency_kill_all_no_wait");
             Ok(())
         }
     }
@@ -11050,8 +11092,9 @@ mod tests {
         std::fs::create_dir_all(nested_path.parent().unwrap()).unwrap();
         std::fs::write(&nested_path, []).unwrap();
 
-        let err = run_stale_remount_warm_history(&context, Instant::now(), &clients, &isolation, 3)
-            .unwrap_err();
+        let err =
+            run_stale_remount_warm_history(&context, Instant::now(), &clients, &isolation, 3, &[])
+                .unwrap_err();
 
         assert!(
             err.to_string()
@@ -11063,6 +11106,46 @@ mod tests {
             Vec::<u8>::new(),
             "stale warm-history files must not be overwritten in place"
         );
+    }
+
+    #[test]
+    fn stale_remount_warm_history_uses_bounded_helper_for_rename() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let scenario_dir = temp.path().join("scenario");
+        let shared_mount = temp.path().join("mounts").join("shared");
+        std::fs::create_dir_all(&scenario_dir).unwrap();
+        std::fs::create_dir_all(&shared_mount).unwrap();
+        let context = ScenarioContext {
+            run_id: "run-1".to_string(),
+            seed: 325,
+            sandbox: sandbox.clone(),
+            scenario_dir: scenario_dir.clone(),
+            client_controller_config: None,
+        };
+        let clients = STALE_REMOUNT_WARM_WRITER_NAMES
+            .iter()
+            .copied()
+            .map(|name| client_spec_for(&sandbox, "projectfs", name, shared_mount.clone()))
+            .collect::<Vec<_>>();
+        let isolation = test_isolation("stale-remount-helper-test");
+
+        let (operations, _summary) =
+            run_stale_remount_warm_history(&context, Instant::now(), &clients, &isolation, 3, &[])
+                .unwrap();
+
+        assert!(operations.iter().any(|operation| {
+            operation.operation == "rename" && operation.result == "accepted"
+        }));
+        let progress_dir = scenario_dir.join("hotspot-helper-progress");
+        let rename_progress_log = std::fs::read_dir(progress_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter_map(|path| std::fs::read_to_string(path).ok())
+            .find(|log| log.contains("\"operation\":\"rename\""))
+            .expect("stale-remount rename should run through bounded helper");
+        assert!(rename_progress_log.contains("\"phase\":\"before_rename\""));
+        assert!(rename_progress_log.contains("\"phase\":\"after_rename\""));
     }
 
     #[test]
@@ -11800,6 +11883,47 @@ mod tests {
     }
 
     #[test]
+    fn namespace_collision_timeout_does_not_wait_for_blocked_mount_force_kill() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-collision-timeout-cleanup");
+        let clients = COLLISION_CLIENT_NAMES
+            .iter()
+            .copied()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(&mount).unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let mut driver = RecordingNamespaceCollisionDriver::new(clients);
+        let primary = ScenarioError::NamespaceCollisionOperationTimeout {
+            timeout_ms: 30_000,
+            pending: vec!["client-a rename shared/file.txt".to_string()],
+        };
+        let started = Instant::now();
+
+        let err = handle_namespace_collision_operation_timeout::<NamespaceCollisionSummary>(
+            primary,
+            &mut driver,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ScenarioError::NamespaceCollisionOperationTimeout { .. }
+        ));
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "timeout cleanup should return to the parent process boundary instead of waiting for blocked mount force-kill"
+        );
+        assert_eq!(
+            driver.actions.borrow().as_slice(),
+            ["emergency_kill_all_no_wait"],
+            "operation timeout should delegate cleanup to the parent process boundary"
+        );
+    }
+
+    #[test]
     fn namespace_collision_collect_timeout_allows_helper_cleanup_grace() {
         let temp = tempdir().unwrap();
         let sandbox = temp.path().join("run-collision-helper-grace");
@@ -12243,6 +12367,32 @@ mod tests {
     }
 
     #[test]
+    fn hotspot_helper_unlink_removes_file_and_records_progress() {
+        let temp = tempdir().unwrap();
+        let mount = temp.path().join("mount");
+        let progress = temp.path().join("progress.jsonl");
+        let target = mount.join("hotspot").join("unlink-target.txt");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, b"payload").unwrap();
+
+        run_hotspot_op_helper(
+            "unlink",
+            mount,
+            "hotspot/unlink-target.txt",
+            None,
+            None,
+            Some(&progress),
+        )
+        .unwrap();
+
+        assert!(!target.exists());
+        let progress_log = std::fs::read_to_string(progress).unwrap();
+        assert!(progress_log.contains("\"phase\":\"before_remove_file\""));
+        assert!(progress_log.contains("\"phase\":\"after_remove_file\""));
+        assert!(progress_log.contains("\"phase\":\"completed\""));
+    }
+
+    #[test]
     fn hotspot_helper_records_progress_for_sync_barrier_phases() {
         let temp = tempdir().unwrap();
         let mount = temp.path().join("mount");
@@ -12601,7 +12751,7 @@ mod tests {
     }
 
     #[test]
-    fn crash_restart_before_publication_does_not_require_peer_convergence() {
+    fn crash_restart_before_publication_requires_final_peer_convergence() {
         let temp = tempdir().unwrap();
         let sandbox = temp.path().join("run-before-publication-writer-only");
         let scenario_dir = sandbox
@@ -12618,7 +12768,8 @@ mod tests {
                 client_spec_for(&sandbox, "projectfs", name, mount)
             })
             .collect::<Vec<_>>();
-        let mut driver = RecordingCrashRestartDriver::new(clients.clone());
+        let mut driver = RecordingCrashRestartDriver::new(clients.clone())
+            .publish_current_file_before_convergence();
         let context = ScenarioContext {
             run_id: "run-before-publication-writer-only".to_string(),
             seed: 405,
@@ -12641,12 +12792,61 @@ mod tests {
 
         assert_eq!(
             summary.final_validator.compared_clients,
-            vec![CRASH_RESTART_CLIENT_NAMES[0].to_string()]
+            CRASH_RESTART_CLIENT_NAMES
+                .iter()
+                .copied()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
         );
         assert_eq!(
             summary.local_read_checksum_sha256,
             summary.final_checksum_sha256
         );
+    }
+
+    #[test]
+    fn crash_restart_before_publication_fails_when_recovered_state_never_converges() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-before-publication-missing-peer");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(MOUNTED_CLIENT_CRASH_RESTART_RECOVERY);
+        std::fs::create_dir_all(&scenario_dir).unwrap();
+        let clients = CRASH_RESTART_CLIENT_NAMES
+            .iter()
+            .copied()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(&mount).unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let mut driver = RecordingCrashRestartDriver::new(clients.clone());
+        let context = ScenarioContext {
+            run_id: "run-before-publication-missing-peer".to_string(),
+            seed: 405,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+
+        let err = run_crash_restart_mode(
+            &context,
+            &mut driver,
+            &clients,
+            CrashRestartMode::BeforeRemotePublicationCompletes,
+            CRASH_RESTART_BEFORE_PUBLICATION_FILE_NAME,
+            b"writer-only before publication\n",
+            Duration::from_millis(100),
+            Duration::from_millis(10),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ScenarioError::CrashRestartPeerConvergenceFailed { .. }
+        ));
     }
 
     #[test]
@@ -12818,7 +13018,10 @@ mod tests {
         );
         assert_eq!(
             summary.modes[1].final_validator.compared_clients,
-            vec![client_names[0].to_string()]
+            client_names
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect::<Vec<_>>()
         );
     }
 
@@ -12921,7 +13124,7 @@ mod tests {
     }
 
     #[test]
-    fn postgres_outage_allows_empty_writer_recovery_after_unclean_shutdown() {
+    fn postgres_outage_allows_missing_writer_recovery_after_unclean_shutdown() {
         let temp = tempdir().unwrap();
         let sandbox = temp.path().join("run-1");
         let scenario_dir = sandbox
@@ -12961,8 +13164,60 @@ mod tests {
         assert_eq!(summary.writer_recovery_bytes, 0);
         assert_eq!(summary.writer_recovery_checksum_sha256, bytes_sha256(&[]));
         assert!(summary.final_validator.converged);
-        assert_eq!(summary.final_validator.compared_clients, ["client-a"]);
-        assert_eq!(summary.peer_observation_time_ms, 0);
+        assert_eq!(
+            summary.final_validator.compared_clients,
+            POSTGRES_OUTAGE_CLIENT_NAMES
+                .iter()
+                .copied()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        );
+        assert!(summary.peer_observation_time_ms > 0);
+    }
+
+    #[test]
+    fn postgres_outage_empty_writer_placeholder_fails_final_convergence() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let scenario_dir = sandbox
+            .join("artifacts")
+            .join("scenarios")
+            .join(POSTGRES_OUTAGE_MULTI_CLIENT_RECOVERY);
+        let clients = POSTGRES_OUTAGE_CLIENT_NAMES
+            .iter()
+            .copied()
+            .map(|name| {
+                let mount = temp.path().join("mounts").join(name);
+                std::fs::create_dir_all(&mount).unwrap();
+                client_spec_for(&sandbox, "projectfs", name, mount)
+            })
+            .collect::<Vec<_>>();
+        let mut driver = RecordingOutageDriver::new(clients)
+            .lose_writer_payload_on_remount()
+            .keep_lost_writer_payload_local_on_remount();
+        let context = ScenarioContext {
+            run_id: "run-1".to_string(),
+            seed: 404,
+            sandbox,
+            scenario_dir,
+            client_controller_config: None,
+        };
+
+        let err = run_postgres_outage_with_driver(
+            &context,
+            &mut driver,
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+        )
+        .unwrap_err();
+
+        let ScenarioError::PostgresOutagePeerConvergenceFailed { detail } = err else {
+            panic!("expected peer convergence failure, got {err:?}");
+        };
+        assert!(
+            detail.contains("did not converge"),
+            "lost writer placeholder should fail final convergence: {detail}"
+        );
     }
 
     #[test]

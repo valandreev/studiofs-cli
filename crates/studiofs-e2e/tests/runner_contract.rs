@@ -244,7 +244,8 @@ fn runner_contract_documents_adversarial_cleanup_proof() {
         "artifacts/runner/failure-boundary.json",
         "compose_partial_launch_failure_writes_adversarial_cleanup_proof",
         "post_start_cleanup_report_errors_do_not_shadow_primary_error",
-        "mounted_cleanup_verification_failure_blocks_later_mounted_children",
+        "mounted_child_failure_blocks_later_mounted_children",
+        "mounted_supervision_error_writes_report_without_post_scenario_cleanup_verifier",
         "does not add or renumber a mounted scenario",
     ] {
         assert!(

@@ -188,6 +188,24 @@ fn mount_env_overrides_are_scoped_to_the_named_client() {
 }
 
 #[test]
+fn mount_metadata_records_process_id_after_successful_mount() {
+    let temp = tempdir().unwrap();
+    let executor = RecordingExecutor::new();
+    let mut controller = MultiClientController::new(test_config(temp.path()), executor);
+
+    controller.create_clients(["client-a"]).unwrap();
+    controller.mount_all().unwrap();
+
+    let clients = controller.clients();
+    assert_eq!(clients[0].process_id, Some(100));
+    let mount_metadata: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(clients[0].mount_metadata_dir.join("mount-point.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(mount_metadata["process_id"], 100);
+}
+
+#[test]
 fn bootstrap_workflow_initializes_one_volume_and_discovers_isolated_clients() {
     let temp = tempdir().unwrap();
     let executor = RecordingExecutor {

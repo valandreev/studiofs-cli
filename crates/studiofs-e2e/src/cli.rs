@@ -8,6 +8,7 @@ use clap::{Args, Parser, Subcommand};
 
 use crate::baseline_gate::{self, BaselineGateRequest};
 use crate::infra::InfraMode;
+use crate::process_diagnostics;
 use crate::runner::{
     self, CleanRequest, PlatformSelection, RetentionPolicy, RunOneRequest, RunRequest,
 };
@@ -40,6 +41,9 @@ pub enum Commands {
     /// Execute the mounted open-handle mutation sequence in a bounded helper.
     #[command(hide = true)]
     OpenHandleOp(OpenHandleOpArgs),
+    /// Capture best-effort diagnostics for a process before forced termination.
+    #[command(hide = true)]
+    ProcessDump(ProcessDumpArgs),
     /// Run the SFS-405 Local First baseline gate for mounted scenarios 1-8.
     LocalFirstBaselineGate(BaselineGateArgs),
     /// Remove runner-owned sandboxes from the run root.
@@ -195,6 +199,26 @@ pub struct OpenHandleOpArgs {
     /// Per-sequence progress JSONL path used to diagnose bounded helper timeouts.
     #[arg(long, hide = true)]
     pub progress: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+/// Hidden helper arguments for process diagnostics capture.
+pub struct ProcessDumpArgs {
+    /// Process ID to inspect.
+    #[arg(long)]
+    pub pid: u32,
+
+    /// Human-readable termination context.
+    #[arg(long)]
+    pub label: String,
+
+    /// Directory where diagnostics artifacts should be written.
+    #[arg(long)]
+    pub output_dir: PathBuf,
+
+    /// Exact artifact stem selected by the supervising process.
+    #[arg(long, hide = true)]
+    pub artifact_stem: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -387,7 +411,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             Ok(outcome.exit_code)
         }
         Commands::HotspotOp(args) => {
-            scenario::run_hotspot_op_helper_with_timeout(
+            let result = scenario::run_hotspot_op_helper_with_timeout(
                 &args.operation,
                 args.mount_point,
                 &args.path,
@@ -395,12 +419,18 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                 args.payload.as_deref(),
                 args.progress.as_deref(),
                 args.timeout_ms.map(std::time::Duration::from_millis),
-            )?;
+            );
             // This helper exists only to isolate one potentially blocking mounted
             // filesystem call.  Once the call has returned successfully, exit
             // without running any remaining process teardown that can wedge while
             // WinFSP is under churn.
-            std::process::exit(0);
+            match result {
+                Ok(()) => std::process::exit(0),
+                Err(error) => {
+                    eprintln!("{error:#}");
+                    std::process::exit(1);
+                }
+            }
         }
         Commands::OpenHandleOp(args) => {
             scenario::run_open_handle_op_helper(
@@ -415,6 +445,19 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             // This helper isolates the whole open-handle mutation sequence.  Exit
             // immediately after the bounded filesystem work returns so parent
             // cleanup does not inherit any helper-local teardown risk.
+            std::process::exit(0);
+        }
+        Commands::ProcessDump(args) => {
+            if let Some(artifact_stem) = args.artifact_stem {
+                process_diagnostics::write_process_dump_with_stem(
+                    args.pid,
+                    &args.label,
+                    &args.output_dir,
+                    &artifact_stem,
+                )?;
+            } else {
+                process_diagnostics::write_process_dump(args.pid, &args.label, &args.output_dir)?;
+            }
             std::process::exit(0);
         }
         Commands::LocalFirstBaselineGate(args) => {
@@ -552,6 +595,37 @@ mod tests {
             PathBuf::from("target/e2e-runs/run-1/open-handle.payload")
         );
         assert_eq!(args.progress, None);
+    }
+
+    #[test]
+    fn hidden_process_dump_subcommand_parses() {
+        let cli = Cli::try_parse_from([
+            "studiofs-e2e",
+            "process-dump",
+            "--pid",
+            "4242",
+            "--label",
+            "timeout before kill",
+            "--output-dir",
+            "target/e2e-runs/run-1/artifacts/process-diagnostics",
+            "--artifact-stem",
+            "000042-pid-4242-timeout-before-kill",
+        ])
+        .expect("hidden process-dump command should parse");
+
+        let Commands::ProcessDump(args) = cli.command else {
+            panic!("expected hidden process-dump command");
+        };
+        assert_eq!(args.pid, 4242);
+        assert_eq!(args.label, "timeout before kill");
+        assert_eq!(
+            args.output_dir,
+            PathBuf::from("target/e2e-runs/run-1/artifacts/process-diagnostics")
+        );
+        assert_eq!(
+            args.artifact_stem,
+            Some("000042-pid-4242-timeout-before-kill".to_string())
+        );
     }
 
     #[test]

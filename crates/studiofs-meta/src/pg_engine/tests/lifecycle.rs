@@ -295,8 +295,7 @@ fn test_pg_flush_advances_checkpoint_version() {
     seed_local(&db, &volume.format_info());
 
     let pg = PgMetaEngine::open(&db).expect("open pg");
-    pg.create_file(ROOT_INO, b"a.txt", 0, 0, 0o644)
-        .expect("create file");
+    create_published_small_file(&pg, ROOT_INO, b"a.txt", 44_010);
     pg.flush_metadata().expect("flush metadata");
     let ok = wait_until(Duration::from_secs(10), || {
         run_async(async {

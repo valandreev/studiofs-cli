@@ -292,6 +292,17 @@ impl InodeLifecycleRecord {
 }
 
 impl InodeAttr {
+    /// Return `true` for a brand-new empty regular file that has not published
+    /// its dentry to remote peers yet.
+    pub fn is_unpublished_empty_draft(&self) -> bool {
+        self.kind == FileType::RegularFile
+            && self.upload_state == UploadState::Ready
+            && self.size == 0
+            && self.committed_size == 0
+            && self.content_epoch == self.committed_content_epoch
+            && self.committed_content_epoch == 0
+    }
+
     /// Get current time as nanoseconds since Unix epoch.
     pub fn now_nanos() -> i64 {
         let elapsed = SystemTime::now()

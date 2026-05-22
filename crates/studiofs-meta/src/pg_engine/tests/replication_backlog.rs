@@ -141,6 +141,39 @@ fn upload_progress_only_mutation_does_not_create_pg_replication_backlog() {
 }
 
 #[test]
+fn upload_progress_only_mutation_does_not_advance_cursor_past_inflight_visible_batch() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+
+    let file = pg
+        .create_file(ROOT_INO, b"inflight-visible-create.bin", 0, 0, 0o644)
+        .expect("create file");
+    set_file_state(&pg, file.ino, 4096, 1);
+    let payload = PayloadRef::new_partial(77_003, 4096);
+    pg.stage_payload_slice(file.ino, 0, &payload)
+        .expect("stage local overlay");
+    let batch = pg
+        .claim_pending_batch(true)
+        .expect("visible create and local overlay setup should be claimable");
+    let claimed_start = batch.event_start;
+    assert!(
+        pg.replication_backlog().inflight_ops > 0,
+        "claimed visible batch should remain inflight until published or restored"
+    );
+
+    assert!(
+        pg.mark_regular_file_overlay_object_uploaded_if_matches(file.ino, 1, payload.object_id)
+            .expect("mark uploaded"),
+        "upload marker must update the local overlay"
+    );
+
+    assert_eq!(
+        pg.flushed_event_seq.load(Ordering::SeqCst),
+        claimed_start,
+        "local-only upload progress must not skip an inflight visible batch"
+    );
+}
+
+#[test]
 fn published_unlink_creates_remote_visible_pg_replication_backlog() {
     let (_dir, pg) = temp_pg_engine_for_unit();
 
@@ -242,9 +275,7 @@ fn published_base_graph_wakes_pg_poll_worker() {
 fn ready_file_attr_change_wakes_pg_poll_worker() {
     let (_dir, pg) = temp_pg_engine_for_unit();
 
-    let file = pg
-        .create_file(ROOT_INO, b"ready-attr-wakeup.bin", 0, 0, 0o644)
-        .expect("create file");
+    let file = create_published_small_file(&pg, ROOT_INO, b"ready-attr-wakeup.bin", 77_030);
     let setup_end = pg.local.get_counter("nextEventSeq").expect("setup end");
     pg.persist_flushed_event_seq(setup_end)
         .expect("ack setup events");

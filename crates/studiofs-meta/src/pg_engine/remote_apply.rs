@@ -43,6 +43,7 @@ pub(super) struct ProjectedRemoteBatch {
     pub(super) events: Vec<MetaEvent>,
     pub(super) visible_ops: u32,
     pub(super) needs_eager_flush: bool,
+    pub(super) needs_local_replay: bool,
     pub(super) overlay: OverlayConflictSets,
 }
 
@@ -78,8 +79,115 @@ impl<'a> RemoteApplyCoordinator<'a> {
         out
     }
 
-    pub(super) fn remote_events_need_eager_flush(events: &[MetaEvent]) -> bool {
+    pub(super) fn project_local_batch(events: &[MetaEvent]) -> ProjectedRemoteBatch {
+        let remote_events = Self::project_local_events(events);
+        let visible_ops = u32::try_from(remote_events.len()).unwrap_or(u32::MAX);
+        let needs_eager_flush = Self::local_events_need_eager_flush(&remote_events);
+        let needs_local_replay = Self::local_events_need_serving_replay(events);
+        let overlay = Self::overlay_conflicts_for_events(&remote_events);
+        ProjectedRemoteBatch {
+            events: remote_events,
+            visible_ops,
+            needs_eager_flush,
+            needs_local_replay,
+            overlay,
+        }
+    }
+
+    fn hidden_regular_inodes_for_local_events(events: &[MetaEvent]) -> HashSet<Ino> {
+        let mut hidden_regular_inodes = HashSet::new();
+        let mut published_regular_inodes = HashSet::new();
+        for event in events {
+            match event {
+                MetaEvent::SetAttr { attr }
+                    if attr.kind == FileType::RegularFile
+                        && !Self::regular_file_attr_is_ready_for_serving(attr) =>
+                {
+                    hidden_regular_inodes.insert(attr.ino);
+                }
+                MetaEvent::SetAttr { attr } if attr.is_unpublished_empty_draft() => {
+                    hidden_regular_inodes.insert(attr.ino);
+                }
+                MetaEvent::SetRegularFileOverlaySlices { ino, chunk_slices }
+                    if chunk_slices.iter().any(|(_, slices)| {
+                        slices
+                            .iter()
+                            .any(|slice| slice.payload_state != PayloadRefState::Published)
+                    }) =>
+                {
+                    hidden_regular_inodes.insert(*ino);
+                }
+                MetaEvent::PublishRegularFileBaseSlices { ino, chunk_slices }
+                    if chunk_slices.is_empty()
+                        || chunk_slices.iter().any(|(_, slices)| {
+                            slices.iter().any(|slice| {
+                                slice.payload_state == PayloadRefState::Published
+                                    && slice.payload.is_some()
+                            })
+                        }) =>
+                {
+                    published_regular_inodes.insert(*ino);
+                }
+                _ => {}
+            }
+        }
+        for ino in published_regular_inodes {
+            hidden_regular_inodes.remove(&ino);
+        }
+        hidden_regular_inodes
+    }
+
+    fn local_events_need_serving_replay(events: &[MetaEvent]) -> bool {
+        let hidden_regular_inodes = Self::hidden_regular_inodes_for_local_events(events);
         events.iter().any(|event| match event {
+            MetaEvent::AddEntry { entry, .. } => {
+                entry.kind == FileType::RegularFile && hidden_regular_inodes.contains(&entry.ino)
+            }
+            MetaEvent::SetRegularFileOverlaySlices { chunk_slices, .. } => {
+                chunk_slices.iter().any(|(_, slices)| {
+                    slices.iter().any(|slice| {
+                        slice.payload.is_some() && slice.payload_state == PayloadRefState::LocalOnly
+                    })
+                })
+            }
+            _ => false,
+        })
+    }
+
+    fn project_local_events(events: &[MetaEvent]) -> Vec<MetaEvent> {
+        let hidden_regular_inodes = Self::hidden_regular_inodes_for_local_events(events);
+        let hidden_zero_regular_add_inodes = events
+            .iter()
+            .filter_map(|event| match event {
+                MetaEvent::SetAttr { attr }
+                    if hidden_regular_inodes.contains(&attr.ino)
+                        && attr.is_unpublished_empty_draft() =>
+                {
+                    Some(attr.ino)
+                }
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+
+        let mut out = Vec::with_capacity(events.len());
+        for event in Self::project_remote_events(events) {
+            match &event {
+                MetaEvent::AddEntry { entry, .. }
+                    if entry.kind == FileType::RegularFile
+                        && hidden_regular_inodes.contains(&entry.ino) => {}
+                MetaEvent::SetAttr { attr }
+                    if hidden_zero_regular_add_inodes.contains(&attr.ino)
+                        && attr.is_unpublished_empty_draft() => {}
+                MetaEvent::RemoveAttr { ino } if hidden_regular_inodes.contains(ino) => {}
+                _ => out.push(event),
+            }
+        }
+        out
+    }
+
+    fn local_events_need_eager_flush(events: &[MetaEvent]) -> bool {
+        events.iter().any(|event| match event {
+            MetaEvent::SetAttr { attr } if attr.is_unpublished_empty_draft() => false,
             MetaEvent::SetRegularFileOverlaySlices { .. }
             | MetaEvent::RemoveRegularFileGraph { .. }
             | MetaEvent::AddPendingDeletion { .. }
@@ -101,19 +209,6 @@ impl<'a> RemoteApplyCoordinator<'a> {
             | MetaEvent::SetAclRule { .. }
             | MetaEvent::RemoveAclRule { .. } => false,
         })
-    }
-
-    pub(super) fn project_local_batch(events: &[MetaEvent]) -> ProjectedRemoteBatch {
-        let remote_events = Self::project_remote_events(events);
-        let visible_ops = u32::try_from(remote_events.len()).unwrap_or(u32::MAX);
-        let needs_eager_flush = Self::remote_events_need_eager_flush(&remote_events);
-        let overlay = Self::overlay_conflicts_for_events(&remote_events);
-        ProjectedRemoteBatch {
-            events: remote_events,
-            visible_ops,
-            needs_eager_flush,
-            overlay,
-        }
     }
 
     pub(super) fn overlay_conflicts_for_events(events: &[MetaEvent]) -> OverlayConflictSets {
@@ -488,7 +583,8 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     name,
                     entry,
                 } if entry.kind == FileType::RegularFile
-                    && !serving_ready_regular_files.contains(&entry.ino) =>
+                    && !serving_ready_regular_files.contains(&entry.ino)
+                    && self.engine.local.lookup(*parent, name).is_ok() =>
                 {
                     overlay
                         .dentry_keys
@@ -1177,6 +1273,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
         }
 
         let mut overlay = self.engine.local_overlay_conflicts()?;
+        let initial_overlay = overlay.clone();
         let mut applied_any = false;
         let mut max_version = last_seq;
         let mut max_namespace_version = self.engine.namespace_version.load(Ordering::SeqCst);
@@ -1205,21 +1302,23 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     &replay_protected_overlay,
                     &outcome.protected_overlay,
                 );
-                if batch.events.iter().any(MetaEvent::is_namespace_mutation) {
-                    max_namespace_version = max_namespace_version.max(batch.batch_version);
-                }
+            }
+            if batch.events.iter().any(MetaEvent::is_namespace_mutation) {
+                max_namespace_version = max_namespace_version.max(batch.batch_version);
             }
             max_version = batch.batch_version;
             overlay = self.engine.local_overlay_conflicts()?;
         }
         let final_overlay = Self::merge_overlay_conflicts(&overlay, &replay_protected_overlay);
+        let final_dentry_overlay =
+            Self::merge_overlay_conflicts(&initial_overlay, &replay_protected_overlay);
         applied_any |= self.reconcile_regular_file_serving_from_base_with_overlay(
             &reconcile_inodes,
             &final_overlay,
         )?;
         applied_any |= self.reconcile_serving_dentries_from_base_with_overlay(
             &reconcile_dentry_keys,
-            &final_overlay,
+            &final_dentry_overlay,
         )?;
         Ok(RemoteReplayApplyOutcome {
             changed: applied_any,

@@ -2,7 +2,7 @@ use super::{DeletedInodeCleanup, Ino, MetaError, StudioVfs, VfsMeta, VfsResult};
 use std::sync::Arc;
 use tracing::{debug, warn};
 
-use crate::runtime::run_meta;
+use crate::runtime::{run_local_cache_io_blocking, run_meta};
 
 pub(super) struct RegularFileGraphUsage {
     pub(super) object_ids: Vec<u64>,
@@ -185,6 +185,90 @@ impl StudioVfs {
         deferred_local_payloads_len
     }
 
+    pub(super) fn finalize_deleted_inode_runtime_cleanup_deferred_cache_eviction(
+        &self,
+        ino: Ino,
+        removed_ids: Vec<u64>,
+    ) -> usize {
+        let removed_ids_len = removed_ids.len();
+        self.cancel_pending_uploads_for_inode(ino);
+        self.state.writer_stack.clear_inode(ino);
+        self.clear_pending_payloads_for_inode(ino);
+        self.remove_live_extents_for_inode(ino);
+        self.readahead.evict(ino);
+        self.clear_access_tracking(ino);
+
+        if removed_ids_len > 0 {
+            self.schedule_deleted_inode_cache_eviction(ino, removed_ids);
+        }
+
+        let deferred_local_payloads = self.take_deferred_deleted_local_payloads(ino);
+        let deferred_local_payloads_len = deferred_local_payloads.len();
+        if deferred_local_payloads_len > 0 {
+            self.schedule_deleted_inode_cache_eviction(ino, deferred_local_payloads);
+        }
+
+        self.clear_inode_incarnation(ino);
+        self.state.namespace.dirty_attrs.lock().remove(&ino);
+        self.state.namespace.attr_read_cache.lock().remove(ino);
+        self.maybe_clear_deleted_inode_marker(ino);
+        deferred_local_payloads_len
+    }
+
+    fn schedule_deleted_inode_cache_eviction(&self, ino: Ino, object_ids: Vec<u64>) {
+        if object_ids.is_empty() {
+            return;
+        }
+        let cached_store = self.cached_store.clone();
+        let local_payload_backend = self.local_payload_backend.clone();
+        let state = self.state.clone();
+        let cleanup = move || {
+            let mut forced_pinned = 0;
+            for &object_id in &object_ids {
+                if cached_store.is_pinned(object_id) {
+                    forced_pinned += 1;
+                    cached_store.unpin(object_id);
+                }
+            }
+            {
+                let mut pending_evictions = state.upload.pending_evictions.lock();
+                for object_id in &object_ids {
+                    pending_evictions.remove(object_id);
+                }
+            }
+            cached_store.remove_hot_upload_batch(&object_ids);
+            cached_store.remove_staged_upload_batch(&object_ids);
+            local_payload_backend.remove_batch(&object_ids);
+            debug!(
+                "deferred deleted inode cache eviction: ino={} evicted {} blocks, forced_pinned={}",
+                ino,
+                object_ids.len(),
+                forced_pinned
+            );
+        };
+
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            self.track_background_task(handle.spawn(async move {
+                if let Err(error) = run_local_cache_io_blocking(move || {
+                    cleanup();
+                    Ok(())
+                })
+                .await
+                {
+                    warn!(
+                        ino,
+                        error = %error,
+                        "deferred deleted inode cache eviction failed"
+                    );
+                }
+            }));
+        } else {
+            let _ = std::thread::Builder::new()
+                .name("studiofs-deleted-inode-cache-evict".to_string())
+                .spawn(cleanup);
+        }
+    }
+
     pub(super) async fn cleanup_deleted_inode_storage(
         &self,
         meta: &Arc<dyn VfsMeta>,
@@ -202,6 +286,28 @@ impl StudioVfs {
         )?;
         self.finalize_deleted_inode_runtime_cleanup(ino, cleanup.removed_ids)
             .await;
+        Ok(())
+    }
+
+    pub(super) fn cleanup_deleted_inode_storage_deferred_cache_eviction(
+        &self,
+        meta: &Arc<dyn VfsMeta>,
+        ino: Ino,
+        used_space_bytes: u64,
+        gc_reason: &str,
+        fallback_object_ids: Vec<u64>,
+    ) -> VfsResult<()> {
+        let cleanup = self.collect_deleted_inode_cleanup(
+            meta,
+            ino,
+            used_space_bytes,
+            gc_reason,
+            fallback_object_ids,
+        )?;
+        self.finalize_deleted_inode_runtime_cleanup_deferred_cache_eviction(
+            ino,
+            cleanup.removed_ids,
+        );
         Ok(())
     }
 

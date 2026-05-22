@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::infra::ServicePort;
+use crate::process_diagnostics::capture_process_diagnostics_best_effort;
 use crate::process_job::ChildJob;
 
 /// Default client names used by the E2E mounted scenarios.
@@ -403,10 +404,15 @@ impl ClientProcess for SystemClientProcess {
     }
 
     fn kill(&mut self) -> io::Result<()> {
+        capture_process_diagnostics_best_effort(self.child.id(), "direct client process kill");
         self.child.kill()
     }
 
     fn kill_process_tree(&mut self, context: &str) -> io::Result<()> {
+        capture_process_diagnostics_best_effort(
+            self.child.id(),
+            &format!("client process tree termination: {context}"),
+        );
         let job_terminate_result = self.job.terminate();
         let job_force_result = self.job.force_kill();
         match (
@@ -989,6 +995,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         }
         self.clients[index].spec.process_id = Some(process_id);
         self.clients[index].spec.state = ClientLifecycleState::Mounted;
+        write_mount_metadata(&self.clients[index].spec)?;
         self.clients[index].process = Some(process);
         Ok(())
     }
@@ -1611,6 +1618,7 @@ fn write_mount_metadata(spec: &ClientSpec) -> Result<(), ClientControllerError> 
     let payload = serde_json::json!({
         "client": spec.name,
         "mount_point": spec.mount_point.display().to_string(),
+        "process_id": spec.process_id,
     });
     fs::write(
         spec.mount_metadata_dir.join("mount-point.json"),

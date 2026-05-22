@@ -41,6 +41,234 @@ fn project_remote_events_filters_unpublished_overlay_slices() {
 }
 
 #[test]
+fn project_local_batch_hides_uncommitted_regular_file_namespace() {
+    let mut draft = InodeAttr::new_file(ROOT_INO + 10, ROOT_INO, 0, 0, 0o644);
+    draft.size = 4096;
+    draft.content_epoch = 1;
+    draft.committed_size = 0;
+    draft.committed_content_epoch = 0;
+    draft.upload_state = UploadState::Uploading;
+
+    let projected = RemoteApplyCoordinator::project_local_batch(&[
+        MetaEvent::SetAttr {
+            attr: draft.clone(),
+        },
+        MetaEvent::AddEntry {
+            parent: ROOT_INO,
+            name: b"draft.bin".to_vec(),
+            entry: DirEntryValue {
+                ino: draft.ino,
+                kind: FileType::RegularFile,
+            },
+        },
+        MetaEvent::SetRegularFileOverlaySlices {
+            ino: draft.ino,
+            chunk_slices: vec![(
+                ChunkId(0),
+                vec![SliceRecord {
+                    slice_id: SliceId(1),
+                    order: SliceOrder(0),
+                    range: SliceRange::new(0, 4096).unwrap(),
+                    payload: Some(PayloadRef::new_partial(9001, 4096)),
+                    payload_state: PayloadRefState::LocalOnly,
+                }],
+            )],
+        },
+    ]);
+
+    assert!(
+        !projected.events.iter().any(
+            |event| matches!(event, MetaEvent::AddEntry { entry, .. } if entry.ino == draft.ino)
+                || matches!(event, MetaEvent::SetRegularFileOverlaySlices { ino, .. } if *ino == draft.ino)
+        ),
+        "local draft namespace and payload state must not be projected to PG"
+    );
+    assert!(
+        projected
+            .events
+            .iter()
+            .any(|event| matches!(event, MetaEvent::SetAttr { attr } if attr.ino == draft.ino)),
+        "uploading attr metadata remains batchable while the namespace stays hidden"
+    );
+}
+
+#[test]
+fn project_local_batch_hides_uncommitted_regular_file_namespace_from_local_log() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let draft = pg
+        .create_file(ROOT_INO, b"log-draft.bin", 0, 0, 0o644)
+        .expect("create draft");
+    set_file_state(&pg, draft.ino, 4096, 1);
+    pg.stage_payload_slice(draft.ino, 0, &PayloadRef::new_partial(9003, 4096))
+        .expect("stage local-only payload");
+    let end = pg.local.get_counter("nextEventSeq").expect("event end");
+    let start = pg.flushed_event_seq.load(Ordering::SeqCst);
+    let events = pg.local.read_events_range(start, end).expect("read events");
+    let projected = RemoteApplyCoordinator::project_local_batch(&events);
+
+    assert!(
+        !projected.events.iter().any(
+            |event| matches!(event, MetaEvent::AddEntry { entry, .. } if entry.ino == draft.ino)
+        ),
+        "local event log projection must hide the draft dentry"
+    );
+
+    let batch = pg
+        .claim_pending_batch(true)
+        .expect("claim pending draft batch");
+    let claimed_events = pg
+        .local
+        .read_events_range(batch.event_start, batch.event_end)
+        .expect("read claimed events");
+    let claimed_projected = RemoteApplyCoordinator::project_local_batch(&claimed_events);
+    assert!(
+        !claimed_projected.events.iter().any(
+            |event| matches!(event, MetaEvent::AddEntry { entry, .. } if entry.ino == draft.ino)
+        ),
+        "claimed local batch projection must hide the draft dentry"
+    );
+}
+
+#[test]
+fn project_local_batch_hides_brand_new_empty_regular_file_namespace() {
+    let draft = InodeAttr::new_file(ROOT_INO + 11, ROOT_INO, 0, 0, 0o644);
+
+    let projected = RemoteApplyCoordinator::project_local_batch(&[
+        MetaEvent::SetAttr {
+            attr: draft.clone(),
+        },
+        MetaEvent::AddEntry {
+            parent: ROOT_INO,
+            name: b"empty-draft.bin".to_vec(),
+            entry: DirEntryValue {
+                ino: draft.ino,
+                kind: FileType::RegularFile,
+            },
+        },
+    ]);
+
+    assert!(
+        !projected.events.iter().any(
+            |event| matches!(event, MetaEvent::AddEntry { entry, .. } if entry.ino == draft.ino)
+        ),
+        "brand-new empty local files are not remote-visible until they publish data"
+    );
+}
+
+#[test]
+fn remote_snapshot_hides_uncommitted_regular_file_namespace() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let draft = pg
+        .create_file(ROOT_INO, b"snapshot-draft.bin", 0, 0, 0o644)
+        .expect("create draft");
+    set_file_state(&pg, draft.ino, 4096, 1);
+    pg.stage_payload_slice(draft.ino, 0, &PayloadRef::new_partial(9002, 4096))
+        .expect("stage local-only payload");
+
+    let snapshot = pg
+        .local
+        .export_remote_snapshot()
+        .expect("export remote snapshot");
+
+    assert!(
+        !snapshot.inodes.iter().any(|(ino, _)| *ino == draft.ino),
+        "remote snapshot must hide the uncommitted regular-file inode"
+    );
+    assert!(
+        !snapshot.dentries.iter().any(|(_, raw)| {
+            postcard::from_bytes::<DirEntryValue>(raw)
+                .map(|entry| entry.ino == draft.ino)
+                .unwrap_or(false)
+        }),
+        "remote snapshot must hide dentries pointing at the uncommitted inode"
+    );
+}
+
+#[test]
+fn remote_snapshot_hides_brand_new_empty_regular_file_namespace() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let draft = pg
+        .create_file(ROOT_INO, b"snapshot-empty-draft.bin", 0, 0, 0o644)
+        .expect("create empty draft");
+
+    let snapshot = pg
+        .local
+        .export_remote_snapshot()
+        .expect("export remote snapshot");
+
+    assert!(
+        !snapshot.inodes.iter().any(|(ino, _)| *ino == draft.ino),
+        "remote snapshot must hide a brand-new empty local file"
+    );
+    assert!(
+        !snapshot.dentries.iter().any(|(_, raw)| {
+            postcard::from_bytes::<DirEntryValue>(raw)
+                .map(|entry| entry.ino == draft.ino)
+                .unwrap_or(false)
+        }),
+        "remote snapshot must hide dentries pointing at a brand-new empty local file"
+    );
+}
+
+#[test]
+fn project_local_batch_publishes_explicit_empty_regular_file_namespace() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let (_remote_dir, remote) = temp_pg_engine_for_unit();
+    let start = pg.local.get_counter("nextEventSeq").expect("start seq");
+    let file = pg
+        .create_file(ROOT_INO, b"published-empty.bin", 0, 0, 0o644)
+        .expect("create empty file");
+    assert!(
+        pg.publish_regular_file_overlay_to_base_if_matches(file.ino, 0)
+            .expect("publish empty file"),
+        "empty file publish should succeed"
+    );
+    let end = pg.local.get_counter("nextEventSeq").expect("end seq");
+
+    let events = pg
+        .local
+        .read_events_range(start, end)
+        .expect("read empty publish events");
+    let projected = RemoteApplyCoordinator::project_local_batch(&events);
+
+    assert!(
+        projected.events.iter().any(
+            |event| matches!(event, MetaEvent::AddEntry { entry, .. } if entry.ino == file.ino)
+        ),
+        "explicit empty-file publish must make the dentry remote-visible"
+    );
+    assert!(
+        projected.events.iter().any(
+            |event| matches!(event, MetaEvent::SetAttr { attr } if attr.ino == file.ino
+                && attr.size == 0
+                && attr.committed_size == 0
+                && attr.content_epoch == 1
+                && attr.committed_content_epoch == 1)
+        ),
+        "explicit empty-file publish must advance the committed generation"
+    );
+
+    apply_foreign_batch(
+        &remote,
+        &projected.events,
+        &OverlayConflictSets::default(),
+        &std::collections::HashSet::new(),
+    )
+    .expect("apply empty publish to remote peer");
+    let remote_entry = remote
+        .lookup(ROOT_INO, b"published-empty.bin")
+        .expect("remote peer should see published empty file");
+    assert_eq!(remote_entry.ino, file.ino);
+    let remote_attr = remote
+        .get_attr(file.ino)
+        .expect("remote peer should have published empty attr");
+    assert_eq!(remote_attr.size, 0);
+    assert_eq!(remote_attr.committed_size, 0);
+    assert_eq!(remote_attr.content_epoch, 1);
+    assert_eq!(remote_attr.committed_content_epoch, 1);
+}
+
+#[test]
 fn self_batch_acknowledges_projected_prefix_with_filtered_overlay_events() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     let file = pg
@@ -83,6 +311,46 @@ fn self_batch_acknowledges_projected_prefix_with_filtered_overlay_events() {
         pg.flushed_event_seq.load(Ordering::SeqCst),
         end,
         "self-batch ack must advance over the raw local events that produced the projected batch"
+    );
+}
+
+#[test]
+fn self_batch_namespace_mutation_advances_namespace_version_token() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let attr = InodeAttr::new_file(ROOT_INO + 10, ROOT_INO, 0, 0, 0o644);
+    let batch_version = 17;
+
+    apply_decoded_foreign_batches_locked(
+        &pg,
+        vec![DecodedReplayBatch {
+            batch_version,
+            events: vec![
+                MetaEvent::SetAttr { attr },
+                MetaEvent::AddEntry {
+                    parent: ROOT_INO,
+                    name: b"self-visible-namespace.txt".to_vec(),
+                    entry: DirEntryValue {
+                        ino: ROOT_INO + 10,
+                        kind: FileType::RegularFile,
+                    },
+                },
+            ],
+            is_self_batch: true,
+        }],
+        None,
+        0,
+    )
+    .expect("apply visible self namespace batch");
+
+    assert_eq!(
+        pg.local_version.load(Ordering::SeqCst),
+        batch_version,
+        "self-visible replay must still advance the metadata token"
+    );
+    assert_eq!(
+        pg.namespace_version.load(Ordering::SeqCst),
+        batch_version,
+        "self-visible namespace replay must advance the namespace token for VFS invalidation"
     );
 }
 
@@ -482,6 +750,61 @@ fn foreign_unready_add_entry_does_not_hide_visible_local_regular_file() {
             .ino,
         local_file.ino,
         "an unready foreign AddEntry must not hide the current serving source path"
+    );
+}
+
+#[test]
+fn foreign_unready_add_entry_without_local_slot_becomes_visible_for_zero_convergence() {
+    let remote_ino = 77_020;
+    let mut remote_attr = InodeAttr::new_file(remote_ino, ROOT_INO, 0, 0, 0o644);
+    remote_attr.upload_state = UploadState::Updating;
+    let remote_entry = DirEntryValue {
+        ino: remote_ino,
+        kind: FileType::RegularFile,
+    };
+    let remote_batch = [
+        MetaEvent::SetAttr {
+            attr: remote_attr.clone(),
+        },
+        MetaEvent::AddEntry {
+            parent: ROOT_INO,
+            name: b"remote-draft.txt".to_vec(),
+            entry: remote_entry,
+        },
+    ];
+
+    let (_overlay_dir, overlay_pg) = temp_pg_engine_for_unit();
+    let (_changed, protected_overlay) = apply_foreign_batch(
+        &overlay_pg,
+        &remote_batch,
+        &OverlayConflictSets::default(),
+        &HashSet::new(),
+    )
+    .expect("apply unready foreign add entry without local slot");
+    assert!(
+        !protected_overlay
+            .dentry_keys
+            .contains(&PgMetaEngine::dentry_key(ROOT_INO, b"remote-draft.txt")),
+        "new unready remote dentry should not be deferred when no local serving path exists"
+    );
+
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    apply_decoded_foreign_batches_locked(
+        &pg,
+        vec![DecodedReplayBatch {
+            batch_version: 9,
+            events: remote_batch.to_vec(),
+            is_self_batch: false,
+        }],
+        None,
+        0,
+    )
+    .expect("apply full decoded replay");
+    assert_eq!(
+        pg.lookup(ROOT_INO, b"remote-draft.txt")
+            .expect("remote draft should be visible")
+            .ino,
+        remote_ino
     );
 }
 
@@ -3603,8 +3926,8 @@ fn test_pg_reopen_after_publish_before_local_persist_recovers_without_discover()
     seed_local(&db, &info);
 
     let a = PgMetaEngine::open(&db).expect("open a");
-    a.create_file(ROOT_INO, b"draft.txt", 0, 0, 0o644)
-        .expect("create local file");
+    a.create_dir(ROOT_INO, b"draft", 0, 0, 0o755)
+        .expect("create local directory");
 
     let start = a.flushed_event_seq.load(Ordering::SeqCst);
     let end = a.local.get_counter("nextEventSeq").expect("nextEventSeq");
@@ -3618,7 +3941,7 @@ fn test_pg_reopen_after_publish_before_local_persist_recovers_without_discover()
     let reopened = reopen_pg_engine_with_retry(&db);
     assert!(wait_until(Duration::from_secs(12), || {
         let _ = reopened.sync_metadata();
-        reopened.lookup(ROOT_INO, b"draft.txt").is_ok()
+        reopened.lookup(ROOT_INO, b"draft").is_ok()
             && reopened.flushed_event_seq.load(Ordering::SeqCst)
                 == reopened.local.get_counter("nextEventSeq").unwrap_or(0)
     }));
@@ -4397,6 +4720,73 @@ fn sparse_ready_self_batch_preserves_imported_disjoint_base_ranges_when_not_comp
         object_ids,
         vec![local_middle.object_id, imported_tail.object_id],
         "a sparse self publish that does not cover committed EOF must not erase imported disjoint ranges"
+    );
+}
+
+#[test]
+fn sparse_ready_foreign_publish_sets_serving_size_when_payload_graph_is_partial() {
+    let (_writer_dir, writer) = temp_pg_engine_for_unit();
+    let (_remote_dir, remote) = temp_pg_engine_for_unit();
+
+    let seed_start = writer
+        .local
+        .get_counter("nextEventSeq")
+        .expect("seed start");
+    let file = writer
+        .create_file(ROOT_INO, b"sparse-partial-serving-size.bin", 0, 0, 0o644)
+        .expect("create sparse file");
+    set_file_state(&writer, file.ino, 233, 1);
+    let head = PayloadRef::new_partial(77_070, 233);
+    writer
+        .stage_payload_slice(file.ino, 0, &head)
+        .expect("stage sparse head");
+    mark_overlay_objects_uploaded(&writer, file.ino, 1, &[head.object_id]);
+    assert!(
+        writer
+            .publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
+            .expect("publish sparse head"),
+        "initial sparse head publish should succeed"
+    );
+    let seed_end = writer.local.get_counter("nextEventSeq").expect("seed end");
+    apply_projected_remote_range(&writer, &remote, seed_start, seed_end);
+
+    let remote_file = remote
+        .lookup(ROOT_INO, b"sparse-partial-serving-size.bin")
+        .expect("lookup remote sparse file");
+    let seeded_attr = remote.get_attr(remote_file.ino).expect("load seeded attr");
+    assert_eq!(seeded_attr.size, 233);
+
+    let sparse_start = seed_end;
+    let logical_size = (2 * u64::from(DEFAULT_BLOCK_SIZE)) + 4096;
+    set_file_state(&writer, file.ino, logical_size, 2);
+    let tail = PayloadRef::new_partial(77_071, 4096);
+    writer
+        .stage_payload_slice(file.ino, 2, &tail)
+        .expect("stage sparse tail");
+    mark_overlay_objects_uploaded(&writer, file.ino, 2, &[tail.object_id]);
+    assert!(
+        writer
+            .publish_regular_file_overlay_to_base_if_matches(file.ino, 2)
+            .expect("publish sparse tail"),
+        "sparse tail publish should succeed"
+    );
+    let sparse_end = writer
+        .local
+        .get_counter("nextEventSeq")
+        .expect("sparse end");
+
+    apply_projected_remote_range(&writer, &remote, sparse_start, sparse_end);
+
+    let remote_attr = remote.get_attr(remote_file.ino).expect("load remote attr");
+    assert_eq!(
+        remote_attr.size, logical_size,
+        "sparse Ready publish must advance peer serving size even when the publish graph has holes"
+    );
+    assert_eq!(remote_attr.committed_size, logical_size);
+    assert_eq!(
+        lookup_object_ids(&remote, remote_file.ino, logical_size)
+            .expect("lookup remote sparse graph"),
+        vec![head.object_id, tail.object_id]
     );
 }
 

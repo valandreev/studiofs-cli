@@ -147,6 +147,18 @@ fn metadata_attr_cache_invalidation_set(
     attr_cache_inodes
 }
 
+fn metadata_token_changes(
+    last_namespace_token: &Option<String>,
+    last_metadata_token: &Option<String>,
+    after_namespace_token: &Option<String>,
+    after_metadata_token: &Option<String>,
+) -> (bool, bool) {
+    (
+        last_namespace_token != after_namespace_token,
+        last_metadata_token != after_metadata_token,
+    )
+}
+
 impl StudioVfs {
     pub(super) async fn background_aggressive_materialization(self: Arc<Self>) {
         let mut interval = tokio::time::interval(AGGRESSIVE_MATERIALIZATION_INTERVAL);
@@ -547,12 +559,17 @@ impl StudioVfs {
     pub(super) async fn background_metadata_invalidation(self: Arc<Self>, interval: Duration) {
         let meta = self.sync_meta();
         let metadata_notifier = meta.metadata_invalidation_notifier();
-        let mut last_namespace_token = meta.namespace_version_token();
-        let mut last_metadata_token = meta.metadata_version_token();
+        let initial_namespace_token = meta.namespace_version_token();
+        let initial_metadata_token = meta.metadata_version_token();
+        // Do not mark the startup tokens as already invalidated. PG notify/sync
+        // can advance local metadata before this task reaches its first wait;
+        // the first wake must still clear VFS and kernel caches for that state.
+        let mut last_namespace_token = None;
+        let mut last_metadata_token = None;
         let mut last_snapshot: HashSet<Ino> = HashSet::new();
         let mut last_payload_snapshot = HashMap::<Ino, Vec<u64>>::new();
 
-        if last_namespace_token.is_some() || last_metadata_token.is_some() {
+        if initial_namespace_token.is_some() || initial_metadata_token.is_some() {
             let meta = self.meta.clone();
             if let Ok(snapshot) = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
                 Self::collect_metadata_snapshot(engine.as_ref())
@@ -610,8 +627,12 @@ impl StudioVfs {
                 continue;
             };
 
-            let namespace_changed = last_namespace_token != after_namespace_token;
-            let metadata_changed = last_metadata_token != after_metadata_token;
+            let (namespace_changed, metadata_changed) = metadata_token_changes(
+                &last_namespace_token,
+                &last_metadata_token,
+                &after_namespace_token,
+                &after_metadata_token,
+            );
             last_namespace_token = after_namespace_token.clone();
             last_metadata_token = after_metadata_token.clone();
 
@@ -1491,6 +1512,30 @@ mod tests {
             &token("2"),
             &token("1"),
         ));
+    }
+
+    #[test]
+    fn unprimed_metadata_tokens_force_first_invalidation() {
+        let (namespace_changed, metadata_changed) =
+            metadata_token_changes(&None, &None, &token("7"), &token("9"));
+
+        assert!(
+            namespace_changed,
+            "startup namespace token must be treated as pending until the first worker wake"
+        );
+        assert!(
+            metadata_changed,
+            "startup metadata token must be treated as pending until the first worker wake"
+        );
+    }
+
+    #[test]
+    fn matching_metadata_tokens_do_not_invalidate_after_first_wake() {
+        let (namespace_changed, metadata_changed) =
+            metadata_token_changes(&token("7"), &token("9"), &token("7"), &token("9"));
+
+        assert!(!namespace_changed);
+        assert!(!metadata_changed);
     }
 
     #[test]
