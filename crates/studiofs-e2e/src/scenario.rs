@@ -4149,18 +4149,20 @@ fn run_stale_remount_cold_discover_body(
         .ok_or_else(|| ScenarioError::Io(io::Error::other("missing stale remount client-c")))?;
     let baseline_path = isolation.path("baseline.txt");
     let baseline_payload = isolation.payload("initial_baseline", &baseline_path, "baseline");
-    operations.push(required_op(
+    operations.push(timed_cold_observer_helper_fs_op(
+        context,
         started,
         1,
         stale_client,
         "initial_baseline",
+        "create",
         &baseline_path,
-        write_parented(
-            stale_client.mount_point.join(&baseline_path),
-            &baseline_payload,
-        )
-        .map_err(ScenarioError::from),
+        &baseline_path,
+        HOTSPOT_CHURN_OPERATION_TIMEOUT,
+        Some(&baseline_payload),
+        None,
     )?);
+    write_namespace_collision_operations(context, &operations)?;
     wait_for_mounted_initial_payloads_until(
         &initial_clients,
         &[(&baseline_path, baseline_payload.as_slice())],
@@ -4176,6 +4178,7 @@ fn run_stale_remount_cold_discover_body(
         "client-c",
         controller.unmount("client-c").map_err(ScenarioError::from),
     )?);
+    write_namespace_collision_operations(context, &operations)?;
 
     let warm_clients = controller
         .clients()
@@ -4189,6 +4192,7 @@ fn run_stale_remount_cold_discover_body(
         &warm_clients,
         &isolation,
         operations.len() + 1,
+        &operations,
     )?;
     operations.append(&mut warm_history);
     write_namespace_collision_operations(context, &operations)?;
@@ -4266,8 +4270,10 @@ fn run_stale_remount_warm_history(
     clients: &[ClientSpec],
     isolation: &ScenarioIsolation,
     first_order: usize,
+    previously_recorded: &[NamespaceCollisionOperation],
 ) -> Result<(Vec<NamespaceCollisionOperation>, LongHistorySummary), ScenarioError> {
     let mut operations = Vec::new();
+    let mut persisted_operations = previously_recorded.to_vec();
     let delete_target = isolation.path(COLD_OBSERVER_DELETE_TARGET);
     let rename_source = isolation.path(COLD_OBSERVER_RENAME_SOURCE);
     let rename_dest = isolation.path(COLD_OBSERVER_RENAME_DEST);
@@ -4334,36 +4340,32 @@ fn run_stale_remount_warm_history(
     .enumerate()
     {
         let client = &clients[client_index];
-        let result = match operation {
-            "delete" => {
-                fs::remove_file(client.mount_point.join(&path)).map_err(ScenarioError::from)
-            }
-            "rename" => fs::rename(
-                client.mount_point.join(&rename_source),
-                client.mount_point.join(&rename_dest),
-            )
-            .map_err(ScenarioError::from),
-            "append" => append_mounted_file_with_readback(
-                client.mount_point.join(&path),
-                action.as_deref().unwrap(),
-                "stale remount warm history append",
-            ),
-            _ => write_mounted_file_with_readback(
-                client.mount_point.join(&path),
-                action.as_deref().unwrap(),
-                &format!("stale remount warm history {operation}"),
-                operation == "create",
-            ),
+        let operation_path = if operation == "rename" {
+            rename_source.as_str()
+        } else {
+            path.as_str()
         };
-        let recorded = required_op(
+        let target = (operation == "rename").then_some(rename_dest.as_str());
+        let helper_operation = if operation == "overwrite" {
+            "overwrite-barrier"
+        } else {
+            operation
+        };
+        let recorded = timed_cold_observer_helper_fs_op(
+            context,
             started,
             first_order + offset,
             client,
             operation,
+            helper_operation,
+            operation_path,
             &log_path,
-            result,
+            HOTSPOT_CHURN_OPERATION_TIMEOUT,
+            action.as_deref(),
+            target,
         )?;
-        record_sparse_operation(context, &mut operations, recorded)?;
+        record_sparse_operation(context, &mut persisted_operations, recorded.clone())?;
+        operations.push(recorded);
         if matches!(operation, "create" | "overwrite") && path != delete_target {
             wait_for_mounted_initial_payloads_until(
                 clients,
@@ -7599,43 +7601,6 @@ fn write_mounted_file_with_readback(
             "{label} write readback mismatch for {}: expected {} bytes, read {} bytes",
             path.display(),
             payload.len(),
-            readback.len()
-        ))));
-    }
-    Ok(())
-}
-
-fn append_mounted_file_with_readback(
-    path: PathBuf,
-    payload: &[u8],
-    label: &str,
-) -> Result<(), ScenarioError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut expected = match fs::read(&path) {
-        Ok(existing) => existing,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
-        Err(error) => return Err(error.into()),
-    };
-    let mut options = mounted_write_barrier_open_options();
-    options.create(true).append(true);
-    let mut file = options.open(&path)?;
-    file.write_all(payload)?;
-    file.sync_all()?;
-    drop(file);
-    expected.extend_from_slice(payload);
-    let readback = wait_for_mounted_payload_readback(
-        &path,
-        &expected,
-        MOUNTED_WRITE_READBACK_TIMEOUT,
-        MOUNTED_WRITE_READBACK_POLL_INTERVAL,
-    )?;
-    if readback != expected {
-        return Err(ScenarioError::Io(io::Error::other(format!(
-            "{label} append readback mismatch for {}: expected {} bytes, read {} bytes",
-            path.display(),
-            expected.len(),
             readback.len()
         ))));
     }
@@ -11123,8 +11088,9 @@ mod tests {
         std::fs::create_dir_all(nested_path.parent().unwrap()).unwrap();
         std::fs::write(&nested_path, []).unwrap();
 
-        let err = run_stale_remount_warm_history(&context, Instant::now(), &clients, &isolation, 3)
-            .unwrap_err();
+        let err =
+            run_stale_remount_warm_history(&context, Instant::now(), &clients, &isolation, 3, &[])
+                .unwrap_err();
 
         assert!(
             err.to_string()
@@ -11136,6 +11102,46 @@ mod tests {
             Vec::<u8>::new(),
             "stale warm-history files must not be overwritten in place"
         );
+    }
+
+    #[test]
+    fn stale_remount_warm_history_uses_bounded_helper_for_rename() {
+        let temp = tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let scenario_dir = temp.path().join("scenario");
+        let shared_mount = temp.path().join("mounts").join("shared");
+        std::fs::create_dir_all(&scenario_dir).unwrap();
+        std::fs::create_dir_all(&shared_mount).unwrap();
+        let context = ScenarioContext {
+            run_id: "run-1".to_string(),
+            seed: 325,
+            sandbox: sandbox.clone(),
+            scenario_dir: scenario_dir.clone(),
+            client_controller_config: None,
+        };
+        let clients = STALE_REMOUNT_WARM_WRITER_NAMES
+            .iter()
+            .copied()
+            .map(|name| client_spec_for(&sandbox, "projectfs", name, shared_mount.clone()))
+            .collect::<Vec<_>>();
+        let isolation = test_isolation("stale-remount-helper-test");
+
+        let (operations, _summary) =
+            run_stale_remount_warm_history(&context, Instant::now(), &clients, &isolation, 3, &[])
+                .unwrap();
+
+        assert!(operations.iter().any(|operation| {
+            operation.operation == "rename" && operation.result == "accepted"
+        }));
+        let progress_dir = scenario_dir.join("hotspot-helper-progress");
+        let rename_progress_log = std::fs::read_dir(progress_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter_map(|path| std::fs::read_to_string(path).ok())
+            .find(|log| log.contains("\"operation\":\"rename\""))
+            .expect("stale-remount rename should run through bounded helper");
+        assert!(rename_progress_log.contains("\"phase\":\"before_rename\""));
+        assert!(rename_progress_log.contains("\"phase\":\"after_rename\""));
     }
 
     #[test]

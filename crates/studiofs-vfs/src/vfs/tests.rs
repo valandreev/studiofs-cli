@@ -3360,6 +3360,119 @@ fn handle_backed_extend_after_write_through_upload_work_advances_content_epoch()
 }
 
 #[test]
+fn write_through_sparse_extend_requeues_all_retained_overlay_uploads() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "write-through-sparse-extend-retains");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"write-through-sparse-extend-retains.bin", 0, 0, 0o644)
+            .expect("create sparse file");
+        let ino = attr.ino;
+        let head = b"sparse-head";
+        let tail = b"sparse-tail-range";
+        let tail_offset = 1_048_569u64;
+        let logical_size = 2_097_275u64;
+
+        let head_fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open head writer");
+        vfs.write_fh_with_deferred_materialize(
+            head_fh,
+            ino,
+            0,
+            head,
+            LocalSyncPolicy::WriteThrough,
+        )
+        .await
+        .expect("write-through sparse head");
+        vfs.release_fh(head_fh).await.expect("release head writer");
+
+        let tail_fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open tail writer");
+        vfs.write_fh_with_deferred_materialize(
+            tail_fh,
+            ino,
+            tail_offset,
+            tail,
+            LocalSyncPolicy::WriteThrough,
+        )
+        .await
+        .expect("write-through sparse tail");
+        vfs.release_fh(tail_fh).await.expect("release tail writer");
+
+        let object_ids_for_range = |length| -> studiofs_meta::MetaResult<Vec<u64>> {
+            Ok(meta
+                .lookup_regular_file_slices(ino, 0, length)?
+                .into_iter()
+                .filter_map(|span| span.payload.map(|payload| payload.object_id))
+                .collect())
+        };
+        let before_extend_objects = object_ids_for_range(tail_offset + tail.len() as u64)
+            .expect("lookup sparse overlay before extend");
+        assert_eq!(
+            before_extend_objects.len(),
+            2,
+            "setup should retain both sparse payload ranges before set_len"
+        );
+
+        let payload_epoch = meta.get_attr(ino).expect("load payload attr").content_epoch;
+        let grow_fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open grow writer");
+        vfs.setattr_with_handle(Some(grow_fh), ino, SetattrArgs::size_only(logical_size))
+            .expect("extend logical EOF");
+        vfs.flush_winfsp_writeback_with_outcome(ino, grow_fh)
+            .await
+            .expect("flush handle-backed grow");
+
+        let extended_attr = meta.get_attr(ino).expect("load extended attr");
+        assert_eq!(extended_attr.size, logical_size);
+        assert!(
+            extended_attr.content_epoch > payload_epoch,
+            "set_len after queued payload work must advance the content epoch"
+        );
+
+        let pending_after_extend = vfs.pending_uploads_for_inode(ino);
+        let pending_object_ids = pending_after_extend
+            .iter()
+            .map(|(_, object_id, _)| *object_id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            pending_object_ids,
+            before_extend_objects
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            "set_len must requeue every retained sparse payload object for the new epoch"
+        );
+        assert!(
+            pending_after_extend
+                .iter()
+                .all(|(_, _, content_epoch)| *content_epoch == extended_attr.content_epoch),
+            "retained sparse uploads must be queued under the size-change epoch"
+        );
+
+        let (content_epoch, blocks) = mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+        assert_eq!(content_epoch, extended_attr.content_epoch);
+        publish_current_file_graph(&meta, ino, content_epoch, &blocks);
+
+        let published_attr = meta.get_attr(ino).expect("load published attr");
+        assert_eq!(published_attr.committed_size, logical_size);
+        let published_objects =
+            object_ids_for_range(logical_size).expect("lookup published sparse graph");
+        assert_eq!(
+            published_objects, before_extend_objects,
+            "published sparse graph must include both retained payload ranges"
+        );
+
+        vfs.release_fh(grow_fh).await.expect("release grow writer");
+    });
+}
+
+#[test]
 fn nonzero_truncate_requeues_retained_overlay_uploads_with_new_epoch() {
     let tmp = TempDir::new().expect("tempdir");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "truncate-requeues-retained");

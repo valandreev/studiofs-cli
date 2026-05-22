@@ -4666,6 +4666,73 @@ fn sparse_ready_self_batch_preserves_imported_disjoint_base_ranges_when_not_comp
 }
 
 #[test]
+fn sparse_ready_foreign_publish_sets_serving_size_when_payload_graph_is_partial() {
+    let (_writer_dir, writer) = temp_pg_engine_for_unit();
+    let (_remote_dir, remote) = temp_pg_engine_for_unit();
+
+    let seed_start = writer
+        .local
+        .get_counter("nextEventSeq")
+        .expect("seed start");
+    let file = writer
+        .create_file(ROOT_INO, b"sparse-partial-serving-size.bin", 0, 0, 0o644)
+        .expect("create sparse file");
+    set_file_state(&writer, file.ino, 233, 1);
+    let head = PayloadRef::new_partial(77_070, 233);
+    writer
+        .stage_payload_slice(file.ino, 0, &head)
+        .expect("stage sparse head");
+    mark_overlay_objects_uploaded(&writer, file.ino, 1, &[head.object_id]);
+    assert!(
+        writer
+            .publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
+            .expect("publish sparse head"),
+        "initial sparse head publish should succeed"
+    );
+    let seed_end = writer.local.get_counter("nextEventSeq").expect("seed end");
+    apply_projected_remote_range(&writer, &remote, seed_start, seed_end);
+
+    let remote_file = remote
+        .lookup(ROOT_INO, b"sparse-partial-serving-size.bin")
+        .expect("lookup remote sparse file");
+    let seeded_attr = remote.get_attr(remote_file.ino).expect("load seeded attr");
+    assert_eq!(seeded_attr.size, 233);
+
+    let sparse_start = seed_end;
+    let logical_size = (2 * u64::from(DEFAULT_BLOCK_SIZE)) + 4096;
+    set_file_state(&writer, file.ino, logical_size, 2);
+    let tail = PayloadRef::new_partial(77_071, 4096);
+    writer
+        .stage_payload_slice(file.ino, 2, &tail)
+        .expect("stage sparse tail");
+    mark_overlay_objects_uploaded(&writer, file.ino, 2, &[tail.object_id]);
+    assert!(
+        writer
+            .publish_regular_file_overlay_to_base_if_matches(file.ino, 2)
+            .expect("publish sparse tail"),
+        "sparse tail publish should succeed"
+    );
+    let sparse_end = writer
+        .local
+        .get_counter("nextEventSeq")
+        .expect("sparse end");
+
+    apply_projected_remote_range(&writer, &remote, sparse_start, sparse_end);
+
+    let remote_attr = remote.get_attr(remote_file.ino).expect("load remote attr");
+    assert_eq!(
+        remote_attr.size, logical_size,
+        "sparse Ready publish must advance peer serving size even when the publish graph has holes"
+    );
+    assert_eq!(remote_attr.committed_size, logical_size);
+    assert_eq!(
+        lookup_object_ids(&remote, remote_file.ino, logical_size)
+            .expect("lookup remote sparse graph"),
+        vec![head.object_id, tail.object_id]
+    );
+}
+
+#[test]
 fn ready_complete_publish_preserved_base_ranges_sets_remote_serving_size() {
     let (_dir, pg) = temp_pg_engine_for_unit();
 
