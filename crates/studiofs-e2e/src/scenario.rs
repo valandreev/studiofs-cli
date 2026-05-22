@@ -1392,41 +1392,46 @@ fn run_postgres_outage_body(
             detail: error.to_string(),
         }
     })?;
-    let writer_payload =
-        fs::read(writer.mount_point.join(POSTGRES_OUTAGE_FILE_NAME)).map_err(|error| {
-            ScenarioError::PostgresOutageWriterRecoveryFailed {
+    let expected_checksum = bytes_sha256(POSTGRES_OUTAGE_RECOVERED_PAYLOAD);
+    let writer_payload_path = writer.mount_point.join(POSTGRES_OUTAGE_FILE_NAME);
+    let writer_payload_result = fs::read(&writer_payload_path);
+    let (writer_payload, writer_recovery_status) = match writer_payload_result {
+        Ok(payload) if payload == POSTGRES_OUTAGE_RECOVERED_PAYLOAD => {
+            (payload, PostgresOutageWriterRecoveryStatus::Recovered)
+        }
+        Ok(payload) if payload.is_empty() => (
+            payload,
+            PostgresOutageWriterRecoveryStatus::LostAfterUncleanShutdown,
+        ),
+        Ok(payload) => {
+            let recovered_checksum = bytes_sha256(&payload);
+            return Err(ScenarioError::PostgresOutageWriterRecoveryFailed {
+                client: writer.name.clone(),
+                path: POSTGRES_OUTAGE_FILE_NAME.to_string(),
+                detail: format!(
+                    "recovered payload differs: expected {} bytes with expected checksum {}, got {} bytes with recovered checksum {}",
+                    POSTGRES_OUTAGE_RECOVERED_PAYLOAD.len(),
+                    expected_checksum,
+                    payload.len(),
+                    recovered_checksum
+                ),
+            });
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (
+            Vec::new(),
+            PostgresOutageWriterRecoveryStatus::LostAfterUncleanShutdown,
+        ),
+        Err(error) => {
+            return Err(ScenarioError::PostgresOutageWriterRecoveryFailed {
                 client: writer.name.clone(),
                 path: POSTGRES_OUTAGE_FILE_NAME.to_string(),
                 detail: error.to_string(),
-            }
-        })?;
-    let expected_checksum = bytes_sha256(POSTGRES_OUTAGE_RECOVERED_PAYLOAD);
-    let recovered_checksum = bytes_sha256(&writer_payload);
-    let writer_recovery_status = if writer_payload == POSTGRES_OUTAGE_RECOVERED_PAYLOAD {
-        PostgresOutageWriterRecoveryStatus::Recovered
-    } else if writer_payload.is_empty() {
-        PostgresOutageWriterRecoveryStatus::LostAfterUncleanShutdown
-    } else {
-        let recovered_checksum = bytes_sha256(&writer_payload);
-        return Err(ScenarioError::PostgresOutageWriterRecoveryFailed {
-            client: writer.name.clone(),
-            path: POSTGRES_OUTAGE_FILE_NAME.to_string(),
-            detail: format!(
-                "recovered payload differs: expected {} bytes with expected checksum {}, got {} bytes with recovered checksum {}",
-                POSTGRES_OUTAGE_RECOVERED_PAYLOAD.len(),
-                expected_checksum,
-                writer_payload.len(),
-                recovered_checksum
-            ),
-        });
+            });
+        }
     };
+    let recovered_checksum = bytes_sha256(&writer_payload);
     let writer_recovery_time_ms = elapsed_millis_nonzero(writer_recovery_started);
-    let convergence_clients =
-        if writer_recovery_status == PostgresOutageWriterRecoveryStatus::LostAfterUncleanShutdown {
-            &clients[1..POSTGRES_OUTAGE_CLIENT_NAMES.len()]
-        } else {
-            &clients[..POSTGRES_OUTAGE_CLIENT_NAMES.len()]
-        };
+    let convergence_clients = &clients[..POSTGRES_OUTAGE_CLIENT_NAMES.len()];
     let mounts = convergence_clients
         .iter()
         .map(|client| ClientMount::new(client.name.clone(), client.mount_point.clone()))
@@ -10516,8 +10521,16 @@ mod tests {
                 .iter()
                 .find(|candidate| candidate.name == client)
                 .expect("recording writer client exists");
-            if self.lose_writer_payload_on_remount {
-                std::fs::write(writer.mount_point.join(POSTGRES_OUTAGE_FILE_NAME), [])?;
+            let writer_path = writer.mount_point.join(POSTGRES_OUTAGE_FILE_NAME);
+            if self.lose_writer_payload_on_remount && self.keep_lost_writer_payload_local_on_remount
+            {
+                std::fs::write(&writer_path, [])?;
+            } else if self.lose_writer_payload_on_remount {
+                match std::fs::remove_file(&writer_path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
             }
             if self.corrupt_writer_payload_on_remount {
                 std::fs::write(
@@ -13111,7 +13124,7 @@ mod tests {
     }
 
     #[test]
-    fn postgres_outage_allows_empty_writer_recovery_after_unclean_shutdown() {
+    fn postgres_outage_allows_missing_writer_recovery_after_unclean_shutdown() {
         let temp = tempdir().unwrap();
         let sandbox = temp.path().join("run-1");
         let scenario_dir = sandbox
@@ -13153,7 +13166,7 @@ mod tests {
         assert!(summary.final_validator.converged);
         assert_eq!(
             summary.final_validator.compared_clients,
-            POSTGRES_OUTAGE_CLIENT_NAMES[1..]
+            POSTGRES_OUTAGE_CLIENT_NAMES
                 .iter()
                 .copied()
                 .map(str::to_string)
@@ -13163,7 +13176,7 @@ mod tests {
     }
 
     #[test]
-    fn postgres_outage_empty_writer_recovery_does_not_require_peer_empty_file() {
+    fn postgres_outage_empty_writer_placeholder_fails_final_convergence() {
         let temp = tempdir().unwrap();
         let sandbox = temp.path().join("run-1");
         let scenario_dir = sandbox
@@ -13190,27 +13203,21 @@ mod tests {
             client_controller_config: None,
         };
 
-        let summary = run_postgres_outage_with_driver(
+        let err = run_postgres_outage_with_driver(
             &context,
             &mut driver,
             Duration::from_secs(1),
             Duration::from_millis(10),
         )
-        .unwrap();
+        .unwrap_err();
 
-        assert_eq!(
-            summary.writer_recovery_status,
-            PostgresOutageWriterRecoveryStatus::LostAfterUncleanShutdown
+        let ScenarioError::PostgresOutagePeerConvergenceFailed { detail } = err else {
+            panic!("expected peer convergence failure, got {err:?}");
+        };
+        assert!(
+            detail.contains("did not converge"),
+            "lost writer placeholder should fail final convergence: {detail}"
         );
-        assert_eq!(
-            summary.final_validator.compared_clients,
-            POSTGRES_OUTAGE_CLIENT_NAMES[1..]
-                .iter()
-                .copied()
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        );
-        assert!(summary.final_validator.converged);
     }
 
     #[test]

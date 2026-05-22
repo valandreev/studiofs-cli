@@ -760,7 +760,11 @@ fn test_flush_regular_file_overlay_slices_with_attr_skips_stale_epoch() {
     }];
 
     let committed_attr = engine
-        .flush_regular_file_overlay_slices_with_attr(ino, &[(ChunkId(0), incoming)], Some(&stale_attr))
+        .flush_regular_file_overlay_slices_with_attr(
+            ino,
+            &[(ChunkId(0), incoming)],
+            Some(&stale_attr),
+        )
         .unwrap();
     assert!(
         committed_attr.is_none(),
@@ -796,11 +800,7 @@ fn test_local_slice_batch_commits_with_attr_and_resolves_holes() {
         .expect("hole range stays chunk-local");
 
     let committed_attr = engine
-        .flush_regular_file_overlay_slices_with_attr(
-            ino,
-            &batch.into_chunk_slices(),
-            Some(&attr),
-        )
+        .flush_regular_file_overlay_slices_with_attr(ino, &batch.into_chunk_slices(), Some(&attr))
         .unwrap()
         .expect("attr committed with slice batch");
     assert_eq!(committed_attr.size, DEFAULT_CHUNK_SIZE as u64 + 64);
@@ -1427,6 +1427,54 @@ fn test_publish_regular_file_overlay_to_base_if_matches_promotes_base_rows() {
 }
 
 #[test]
+fn publish_regular_file_overlay_to_base_appends_dentry_only_on_first_visibility() {
+    let engine = temp_engine();
+    let file = engine
+        .create_file(ROOT_INO, b"publish-dentry-once.bin", 0, 0, 0o644)
+        .unwrap();
+
+    let mut attr = engine.get_attr(file.ino).unwrap();
+    attr.size = 4096;
+    attr.content_epoch = 1;
+    engine.set_attr(&attr).unwrap();
+    engine
+        .stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(40_101, 4096))
+        .unwrap();
+    mark_overlay_objects_uploaded(&engine, file.ino, 1, &[40_101]);
+    assert!(
+        engine
+            .publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
+            .unwrap()
+    );
+
+    let second_publish_start = engine.get_counter("nextEventSeq").unwrap();
+    let mut attr = engine.get_attr(file.ino).unwrap();
+    attr.size = 8192;
+    attr.content_epoch = 2;
+    engine.set_attr(&attr).unwrap();
+    engine
+        .stage_payload_slice(file.ino, 1, &PayloadRef::new_partial(40_102, 4096))
+        .unwrap();
+    mark_overlay_objects_uploaded(&engine, file.ino, 2, &[40_102]);
+    assert!(
+        engine
+            .publish_regular_file_overlay_to_base_if_matches(file.ino, 2)
+            .unwrap()
+    );
+    let second_publish_end = engine.get_counter("nextEventSeq").unwrap();
+
+    let second_publish_events = engine
+        .read_events_range(second_publish_start, second_publish_end)
+        .unwrap();
+    assert!(
+        !second_publish_events.iter().any(
+            |event| matches!(event, MetaEvent::AddEntry { entry, .. } if entry.ino == file.ino)
+        ),
+        "republishing an already visible file must not emit a duplicate AddEntry"
+    );
+}
+
+#[test]
 fn test_publish_regular_file_overlay_to_base_preserves_untouched_base_ranges() {
     let engine = temp_engine();
     let file = engine
@@ -1528,8 +1576,7 @@ fn test_publish_regular_file_overlay_to_base_commits_sparse_tail_logical_size() 
     let published_attr = engine.get_attr(file.ino).unwrap();
     assert_eq!(published_attr.size, 16 * 1024);
     assert_eq!(
-        published_attr.committed_size,
-        published_attr.size,
+        published_attr.committed_size, published_attr.size,
         "publishing a sparse tail must publish the logical EOF, not only the last payload byte"
     );
     let tail = engine
@@ -1545,7 +1592,13 @@ fn test_publish_regular_file_overlay_to_base_commits_sparse_tail_logical_size() 
 fn test_publish_regular_file_overlay_to_base_accepts_fragmented_slice_graph() {
     let engine = temp_engine();
     let file = engine
-        .create_file(ROOT_INO, b"publish-fragmented-slices.bin", 1000, 1000, 0o644)
+        .create_file(
+            ROOT_INO,
+            b"publish-fragmented-slices.bin",
+            1000,
+            1000,
+            0o644,
+        )
         .unwrap();
     let mut attr = engine.get_attr(file.ino).unwrap();
     attr.content_epoch = 9;
@@ -1688,15 +1741,15 @@ fn redb_base_graph_publish_sets_committed_head() {
 
     let block0 = PayloadRef::new_full(101, DEFAULT_BLOCK_SIZE);
     let block1 = PayloadRef::new_partial(102, 4096);
-    engine
-        .stage_payload_slice(file.ino, 0, &block0)
-        .unwrap();
-    engine
-        .stage_payload_slice(file.ino, 1, &block1)
-        .unwrap();
+    engine.stage_payload_slice(file.ino, 0, &block0).unwrap();
+    engine.stage_payload_slice(file.ino, 1, &block1).unwrap();
 
     mark_overlay_objects_uploaded(&engine, file.ino, 1, &[101, 102]);
-    assert!(engine.publish_regular_file_overlay_to_base_if_matches(file.ino, 1).unwrap());
+    assert!(
+        engine
+            .publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
+            .unwrap()
+    );
 
     let published_attr = engine.get_attr(file.ino).unwrap();
     assert_eq!(published_attr.committed_size, block_size + 4096);
@@ -1772,7 +1825,10 @@ fn sfs314_publish_requires_all_overlay_payloads_uploaded() {
             .any(|(ino, _)| *ino == file.ino),
         "uploaded-but-unpublished payload must not make a new file peer-visible"
     );
-    assert_eq!(engine.get_attr(file.ino).unwrap().committed_content_epoch, 0);
+    assert_eq!(
+        engine.get_attr(file.ino).unwrap().committed_content_epoch,
+        0
+    );
 
     mark_overlay_objects_uploaded(&engine, file.ino, 1, &[31_402]);
     assert!(
@@ -1928,7 +1984,8 @@ fn sfs314_partial_publish_preserves_base_tail_and_committed_size() {
     let published_attr = engine.get_attr(file.ino).unwrap();
     assert_eq!(published_attr.committed_content_epoch, 2);
     assert_eq!(
-        published_attr.committed_size, 12 * 1024,
+        published_attr.committed_size,
+        12 * 1024,
         "publishing a partial overlay must keep untouched committed base ranges in the new head"
     );
     assert_eq!(

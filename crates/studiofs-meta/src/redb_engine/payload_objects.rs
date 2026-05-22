@@ -423,6 +423,16 @@ impl MetaPayloadObjects for RedbMetaEngine {
             if attr.content_epoch != expected_epoch {
                 return Ok(false);
             }
+            let base_regular_file = txn
+                .open_table(REGULAR_FILE_BASE_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let was_remote_visible =
+                Self::regular_file_remote_visible_without_published_base(&attr)
+                    || Self::regular_file_has_published_base_from_opened_table(
+                        &base_regular_file,
+                        ino,
+                    )?;
+            drop(base_regular_file);
 
             let Some((_payload_covered_size, removed_object_ids)) =
                 Self::publish_regular_file_overlay_to_base_in_txn(&txn, ino)?
@@ -467,19 +477,21 @@ impl MetaPayloadObjects for RedbMetaEngine {
 
             let dentry_keys =
                 Self::dentry_keys_for_inode_in_write_index(&txn, DENTRIES_BY_INODE_TABLE, ino)?;
-            for key in dentry_keys {
-                let (parent, name) = decode_dentry_key(&key)?;
-                Self::append_event_in_txn(
-                    &txn,
-                    &crate::events::MetaEvent::AddEntry {
-                        parent,
-                        name: name.to_vec(),
-                        entry: DirEntryValue {
-                            ino,
-                            kind: FileType::RegularFile,
+            if !was_remote_visible {
+                for key in dentry_keys {
+                    let (parent, name) = decode_dentry_key(&key)?;
+                    Self::append_event_in_txn(
+                        &txn,
+                        &crate::events::MetaEvent::AddEntry {
+                            parent,
+                            name: name.to_vec(),
+                            entry: DirEntryValue {
+                                ino,
+                                kind: FileType::RegularFile,
+                            },
                         },
-                    },
-                )?;
+                    )?;
+                }
             }
             Self::append_event_in_txn(
                 &txn,

@@ -66,6 +66,23 @@ fn test_snapshot_pins_objects_and_is_listed() {
 }
 
 #[test]
+fn remote_snapshot_hides_root_empty_regular_file_draft() {
+    let engine = temp_engine();
+    engine
+        .create_file(ROOT_INO, b"root-empty-draft.bin", 0, 0, 0o644)
+        .unwrap();
+
+    let snapshot = engine.export_remote_snapshot().unwrap();
+    let remote = temp_engine();
+    remote.import_remote_snapshot(&snapshot).unwrap();
+
+    assert!(
+        remote.lookup(ROOT_INO, b"root-empty-draft.bin").is_err(),
+        "brand-new empty files at root must stay hidden until publication"
+    );
+}
+
+#[test]
 fn test_snapshot_payload_codec_roundtrips_and_reads_json() {
     let engine = temp_engine();
     let state = engine.export_snapshot().unwrap();
@@ -122,8 +139,7 @@ fn unix_now_secs() -> i64 {
 
 #[test]
 fn sfs316_reachability_reports_active_base_overlay_and_snapshot_pins() {
-    let fixture = ContractCoreFixture::new("sfs316-reachability")
-        .expect("create contract fixture");
+    let fixture = ContractCoreFixture::new("sfs316-reachability").expect("create contract fixture");
     let engine = fixture.meta();
 
     let file = engine
@@ -180,8 +196,8 @@ fn sfs316_reachability_reports_active_base_overlay_and_snapshot_pins() {
 
 #[test]
 fn sfs316_publish_queues_displaced_objects_and_reachability_scan_is_idempotent() {
-    let fixture = ContractCoreFixture::new("sfs316-pending-deletion")
-        .expect("create contract fixture");
+    let fixture =
+        ContractCoreFixture::new("sfs316-pending-deletion").expect("create contract fixture");
     let engine = fixture.meta();
 
     let file = engine
@@ -229,7 +245,10 @@ fn sfs316_publish_queues_displaced_objects_and_reachability_scan_is_idempotent()
     let second_refs = engine.get_referenced_object_ids().unwrap();
     let second_pending = engine.get_pending_deletions().unwrap();
 
-    assert_eq!(first_refs, second_refs, "reachability scans must be idempotent");
+    assert_eq!(
+        first_refs, second_refs,
+        "reachability scans must be idempotent"
+    );
     assert_eq!(
         first_pending, second_pending,
         "pending deletion scans must be idempotent"
@@ -271,8 +290,8 @@ fn sfs316_publish_queues_displaced_objects_and_reachability_scan_is_idempotent()
 
 #[test]
 fn sfs316_delete_before_publish_tombstone_does_not_publish_deleted_content() {
-    let fixture = ContractCoreFixture::new("sfs316-delete-before-publish")
-        .expect("create contract fixture");
+    let fixture =
+        ContractCoreFixture::new("sfs316-delete-before-publish").expect("create contract fixture");
     let engine = fixture.meta();
 
     let file = engine
@@ -539,15 +558,15 @@ fn test_import_snapshot_keeps_unpublished_regular_file_visible() {
     attr.content_epoch = 1;
     source.set_attr(&attr).unwrap();
     let block = PayloadRef::new_partial(40_001, 4096);
-    source
-        .stage_payload_slice(file.ino, 0, &block)
-        .unwrap();
+    source.stage_payload_slice(file.ino, 0, &block).unwrap();
 
     let snapshot = source.export_snapshot().unwrap();
     let imported = temp_engine();
     imported.import_snapshot(&snapshot).unwrap();
 
-    let imported_file = imported.lookup(ROOT_INO, b"snapshot-local-only.bin").unwrap();
+    let imported_file = imported
+        .lookup(ROOT_INO, b"snapshot-local-only.bin")
+        .unwrap();
     assert_eq!(imported_file.ino, file.ino);
     let imported_attr = imported.get_attr(imported_file.ino).unwrap();
     assert_eq!(imported_attr.size, 4096);

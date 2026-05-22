@@ -59,13 +59,7 @@ impl RedbMetaEngine {
     }
 
     pub(super) fn regular_file_remote_visible_without_published_base(attr: &InodeAttr) -> bool {
-        (attr.parent == ROOT_INO
-            && attr.size == 0
-            && attr.committed_size == 0
-            && attr.content_epoch == attr.committed_content_epoch
-            && attr.committed_content_epoch == 0)
-            || attr.committed_size > 0
-            || attr.committed_content_epoch > 0
+        attr.committed_size > 0 || attr.committed_content_epoch > 0
     }
 
     pub(super) fn ensure_dentry_by_inode_indexes(&self) -> MetaResult<()> {
