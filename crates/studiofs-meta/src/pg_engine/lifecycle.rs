@@ -85,7 +85,12 @@ impl PgMetaEngine {
                         break;
                     };
                     let _ = engine.flush_due_pending();
-                    let _ = engine.sync_metadata_with_source(MetadataSyncSource::FallbackPoll);
+                    if matches!(
+                        engine.sync_metadata_with_source(MetadataSyncSource::FallbackPoll),
+                        Ok(true)
+                    ) {
+                        engine.metadata_invalidation_notify.notify_one();
+                    }
                 }
             })
             .map_err(|error| {

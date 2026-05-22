@@ -488,7 +488,8 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     name,
                     entry,
                 } if entry.kind == FileType::RegularFile
-                    && !serving_ready_regular_files.contains(&entry.ino) =>
+                    && !serving_ready_regular_files.contains(&entry.ino)
+                    && self.engine.local.lookup(*parent, name).is_ok() =>
                 {
                     overlay
                         .dentry_keys
@@ -1177,6 +1178,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
         }
 
         let mut overlay = self.engine.local_overlay_conflicts()?;
+        let initial_overlay = overlay.clone();
         let mut applied_any = false;
         let mut max_version = last_seq;
         let mut max_namespace_version = self.engine.namespace_version.load(Ordering::SeqCst);
@@ -1205,21 +1207,23 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     &replay_protected_overlay,
                     &outcome.protected_overlay,
                 );
-                if batch.events.iter().any(MetaEvent::is_namespace_mutation) {
-                    max_namespace_version = max_namespace_version.max(batch.batch_version);
-                }
+            }
+            if batch.events.iter().any(MetaEvent::is_namespace_mutation) {
+                max_namespace_version = max_namespace_version.max(batch.batch_version);
             }
             max_version = batch.batch_version;
             overlay = self.engine.local_overlay_conflicts()?;
         }
         let final_overlay = Self::merge_overlay_conflicts(&overlay, &replay_protected_overlay);
+        let final_dentry_overlay =
+            Self::merge_overlay_conflicts(&initial_overlay, &replay_protected_overlay);
         applied_any |= self.reconcile_regular_file_serving_from_base_with_overlay(
             &reconcile_inodes,
             &final_overlay,
         )?;
         applied_any |= self.reconcile_serving_dentries_from_base_with_overlay(
             &reconcile_dentry_keys,
-            &final_overlay,
+            &final_dentry_overlay,
         )?;
         Ok(RemoteReplayApplyOutcome {
             changed: applied_any,

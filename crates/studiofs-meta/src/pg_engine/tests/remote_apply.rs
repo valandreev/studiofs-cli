@@ -87,6 +87,46 @@ fn self_batch_acknowledges_projected_prefix_with_filtered_overlay_events() {
 }
 
 #[test]
+fn self_batch_namespace_mutation_advances_namespace_version_token() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let attr = InodeAttr::new_file(ROOT_INO + 10, ROOT_INO, 0, 0, 0o644);
+    let batch_version = 17;
+
+    apply_decoded_foreign_batches_locked(
+        &pg,
+        vec![DecodedReplayBatch {
+            batch_version,
+            events: vec![
+                MetaEvent::SetAttr { attr },
+                MetaEvent::AddEntry {
+                    parent: ROOT_INO,
+                    name: b"self-visible-namespace.txt".to_vec(),
+                    entry: DirEntryValue {
+                        ino: ROOT_INO + 10,
+                        kind: FileType::RegularFile,
+                    },
+                },
+            ],
+            is_self_batch: true,
+        }],
+        None,
+        0,
+    )
+    .expect("apply visible self namespace batch");
+
+    assert_eq!(
+        pg.local_version.load(Ordering::SeqCst),
+        batch_version,
+        "self-visible replay must still advance the metadata token"
+    );
+    assert_eq!(
+        pg.namespace_version.load(Ordering::SeqCst),
+        batch_version,
+        "self-visible namespace replay must advance the namespace token for VFS invalidation"
+    );
+}
+
+#[test]
 fn foreign_unlink_after_local_rename_removes_destination_alias() {
     let (_dir, pg) = temp_pg_engine_for_unit();
 
@@ -482,6 +522,61 @@ fn foreign_unready_add_entry_does_not_hide_visible_local_regular_file() {
             .ino,
         local_file.ino,
         "an unready foreign AddEntry must not hide the current serving source path"
+    );
+}
+
+#[test]
+fn foreign_unready_add_entry_without_local_slot_becomes_visible_for_zero_convergence() {
+    let remote_ino = 77_020;
+    let mut remote_attr = InodeAttr::new_file(remote_ino, ROOT_INO, 0, 0, 0o644);
+    remote_attr.upload_state = UploadState::Updating;
+    let remote_entry = DirEntryValue {
+        ino: remote_ino,
+        kind: FileType::RegularFile,
+    };
+    let remote_batch = [
+        MetaEvent::SetAttr {
+            attr: remote_attr.clone(),
+        },
+        MetaEvent::AddEntry {
+            parent: ROOT_INO,
+            name: b"remote-draft.txt".to_vec(),
+            entry: remote_entry,
+        },
+    ];
+
+    let (_overlay_dir, overlay_pg) = temp_pg_engine_for_unit();
+    let (_changed, protected_overlay) = apply_foreign_batch(
+        &overlay_pg,
+        &remote_batch,
+        &OverlayConflictSets::default(),
+        &HashSet::new(),
+    )
+    .expect("apply unready foreign add entry without local slot");
+    assert!(
+        !protected_overlay
+            .dentry_keys
+            .contains(&PgMetaEngine::dentry_key(ROOT_INO, b"remote-draft.txt")),
+        "new unready remote dentry should not be deferred when no local serving path exists"
+    );
+
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    apply_decoded_foreign_batches_locked(
+        &pg,
+        vec![DecodedReplayBatch {
+            batch_version: 9,
+            events: remote_batch.to_vec(),
+            is_self_batch: false,
+        }],
+        None,
+        0,
+    )
+    .expect("apply full decoded replay");
+    assert_eq!(
+        pg.lookup(ROOT_INO, b"remote-draft.txt")
+            .expect("remote draft should be visible")
+            .ino,
+        remote_ino
     );
 }
 
