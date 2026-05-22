@@ -86,9 +86,9 @@ PostgreSQL-backed metadata coordination:
   metadata updates.
 
 - **Local cache keeps active work fast**
-  StudioFS caches only the file blocks that are actually accessed. This
-  block-level, on-demand cache reduces disk usage, lowers network traffic, and
-  hides most remote-storage latency.
+  StudioFS caches only the regular-file byte ranges that are actually accessed.
+  This range-oriented, on-demand cache reduces disk usage, lowers network
+  traffic, and hides most remote-storage latency.
 
 - **Local-first runtime keeps the mount responsive**
   Interactive filesystem operations use local state first. Metadata lives in the
