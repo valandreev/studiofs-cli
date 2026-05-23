@@ -615,7 +615,7 @@ fn apply_decoded_foreign_batches_locked(
             initial_overlay,
         },
     )?;
-    pg.persist_replay_outcome(&outcome)?;
+    pg.persist_replay_position(&outcome)?;
     Ok(outcome.changed)
 }
 

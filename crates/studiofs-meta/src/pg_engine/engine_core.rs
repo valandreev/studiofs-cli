@@ -1,3 +1,5 @@
+//! Owns trait delegation from public metadata traits into PG engine internals.
+
 use super::PgMetaEngine;
 use crate::engine::{MetaEngineCore, MetaError, MetaResult};
 use crate::types::*;

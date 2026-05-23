@@ -1,3 +1,5 @@
+//! Owns remote metadata snapshot reads and local snapshot import.
+
 #[cfg(test)]
 use super::RemoteApplyCoordinator;
 use super::{PG_EVENT_INSERT_CHUNK_SIZE, PgMetaEngine, sql};

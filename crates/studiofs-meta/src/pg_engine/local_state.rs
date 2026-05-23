@@ -48,6 +48,22 @@ impl PgMetaEngine {
         Ok(())
     }
 
+    pub(super) fn persist_replay_position(
+        &self,
+        outcome: &super::RemoteReplayApplyOutcome,
+    ) -> MetaResult<()> {
+        if outcome.max_version > self.local_version.load(Ordering::SeqCst) {
+            self.persist_local_version(outcome.max_version)?;
+        }
+        if outcome.max_namespace_version > self.namespace_version.load(Ordering::SeqCst) {
+            self.persist_namespace_version(outcome.max_namespace_version)?;
+        }
+        if let Some(flushed_event_seq) = outcome.flushed_event_seq {
+            self.persist_flushed_event_seq(flushed_event_seq)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn has_any_local_overlay_mutation(local: &RedbMetaEngine) -> MetaResult<bool> {
         Ok(!local.local_overlay_inodes()?.is_empty()
             || !local.local_overlay_attr_inodes()?.is_empty()
