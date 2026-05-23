@@ -72,17 +72,15 @@ struct ReadDataPlanner {
 }
 
 impl ReadDataPlanner {
-    fn new(offset: u64, length: u64) -> Self {
-        let read_end = offset
-            .checked_add(length)
-            .expect("read planner range must not overflow");
-        let requested = ReadRange::new(offset, read_end).expect("read planner range is non-empty");
-        Self {
+    fn new(offset: u64, length: u64) -> Option<Self> {
+        let read_end = offset.checked_add(length)?;
+        let requested = ReadRange::new(offset, read_end)?;
+        Some(Self {
             requested,
             unresolved: smallvec![requested],
             segments: Vec::new(),
             claim_buffers: ReadClaimBuffers::new(),
-        }
+        })
     }
 
     fn is_complete(&self) -> bool {
@@ -91,14 +89,6 @@ impl ReadDataPlanner {
 
     fn claim_range(&mut self, candidate: ReadRange) {
         Self::claim_unresolved_ranges(&mut self.unresolved, candidate, &mut self.claim_buffers);
-    }
-
-    fn claimed_ranges(&self) -> &[ReadRange] {
-        &self.claim_buffers.claimed
-    }
-
-    fn push_segment(&mut self, range: ReadRange, source: ReadSegmentSource) {
-        self.segments.push(ReadSegment { range, source });
     }
 
     #[cfg(test)]
@@ -126,7 +116,7 @@ impl ReadDataPlanner {
         F: Fn(PayloadRef) -> ReadSegmentSource + Copy,
     {
         for span in resolved {
-            if self.unresolved.is_empty() {
+            if self.is_complete() {
                 break;
             }
             if span.source != source_filter {
@@ -146,8 +136,9 @@ impl ReadDataPlanner {
                 continue;
             };
             self.claim_range(clipped);
-            let claimed: Vec<_> = self.claimed_ranges().to_vec();
-            for overlap in claimed {
+            let claim_buffers = &self.claim_buffers;
+            let segments = &mut self.segments;
+            for overlap in &claim_buffers.claimed {
                 let delta = overlap.start().saturating_sub(span_range.start());
                 let Some(delta_u32) = u32::try_from(delta).ok() else {
                     continue;
@@ -162,7 +153,10 @@ impl ReadDataPlanner {
                 let mut planned_block = block.clone();
                 planned_block.offset = block_offset;
                 planned_block.length = block_length;
-                self.push_segment(overlap, source_ctor(planned_block));
+                segments.push(ReadSegment {
+                    range: *overlap,
+                    source: source_ctor(planned_block),
+                });
             }
         }
     }
@@ -357,12 +351,11 @@ impl<'a> DataReader<'a> {
         if length == 0 {
             return Ok(Vec::new());
         }
-        if offset.checked_add(length).is_none() {
-            return Err(VfsError::Other(format!(
+        let mut planner = ReadDataPlanner::new(offset, length).ok_or_else(|| {
+            VfsError::Other(format!(
                 "read range overflow: ino={ino}, offset={offset}, length={length}"
-            )));
-        };
-        let mut planner = ReadDataPlanner::new(offset, length);
+            ))
+        })?;
         let pending_upload_index = vfs.snapshot_pending_upload_index();
 
         for claim in writer_stack_claims {
@@ -384,8 +377,9 @@ impl<'a> DataReader<'a> {
                 continue;
             };
             planner.claim_range(dirty_range);
-            let claimed: Vec<_> = planner.claimed_ranges().to_vec();
-            for overlap in claimed {
+            let claim_buffers = &planner.claim_buffers;
+            let segments = &mut planner.segments;
+            for overlap in &claim_buffers.claimed {
                 let delta = overlap.start().saturating_sub(dirty.start);
                 let Some(delta_u32) = u32::try_from(delta).ok() else {
                     continue;
@@ -393,13 +387,13 @@ impl<'a> DataReader<'a> {
                 let Some(block_offset) = dirty.block_offset.checked_add(delta_u32) else {
                     continue;
                 };
-                planner.push_segment(
-                    overlap,
-                    ReadSegmentSource::Dirty {
+                segments.push(ReadSegment {
+                    range: *overlap,
+                    source: ReadSegmentSource::Dirty {
                         data: dirty.data.clone(),
                         block_offset: u64::from(block_offset),
                     },
-                );
+                });
             }
         }
 
@@ -413,8 +407,9 @@ impl<'a> DataReader<'a> {
                 continue;
             };
             planner.claim_range(dirty_range);
-            let claimed: Vec<_> = planner.claimed_ranges().to_vec();
-            for overlap in claimed {
+            let claim_buffers = &planner.claim_buffers;
+            let segments = &mut planner.segments;
+            for overlap in &claim_buffers.claimed {
                 let delta = overlap.start().saturating_sub(dirty.start);
                 let Some(delta_u32) = u32::try_from(delta).ok() else {
                     continue;
@@ -422,13 +417,13 @@ impl<'a> DataReader<'a> {
                 let Some(block_offset) = dirty.block_offset.checked_add(delta_u32) else {
                     continue;
                 };
-                planner.push_segment(
-                    overlap,
-                    ReadSegmentSource::Dirty {
+                segments.push(ReadSegment {
+                    range: *overlap,
+                    source: ReadSegmentSource::Dirty {
                         data: dirty.data.clone(),
                         block_offset: u64::from(block_offset),
                     },
-                );
+                });
             }
         }
 
@@ -468,8 +463,9 @@ impl<'a> DataReader<'a> {
                 planner.claim_range(
                     ReadRange::new(block_start, block_end).expect("block range is non-empty"),
                 );
-                let claimed: Vec<_> = planner.claimed_ranges().to_vec();
-                for overlap in claimed {
+                let claim_buffers = &planner.claim_buffers;
+                let segments = &mut planner.segments;
+                for overlap in &claim_buffers.claimed {
                     let delta = overlap.start().saturating_sub(block_start);
                     let Some(block_offset) = u32::try_from(delta).ok() else {
                         continue;
@@ -488,7 +484,10 @@ impl<'a> DataReader<'a> {
                             }
                         }
                     };
-                    planner.push_segment(overlap, source);
+                    segments.push(ReadSegment {
+                        range: *overlap,
+                        source,
+                    });
                 }
             }
         }
@@ -903,7 +902,7 @@ impl<'a> ReadMetadataResolver<'a> {
             self.vfs
                 .has_pending_local_dirty_payloads_for_inode(self.ino),
             self.vfs.inode_has_dirty_writer_stack(self.ino),
-            !self.vfs.pending_uploads_for_inode(self.ino).is_empty(),
+            self.vfs.inode_has_pending_uploads(self.ino),
         ) == MetadataRefreshDecision::UseLocal
         {
             return Some(dirty_attr);
@@ -949,7 +948,7 @@ impl<'a> ReadMetadataResolver<'a> {
             self.vfs
                 .has_pending_local_dirty_payloads_for_inode(self.ino),
             self.vfs.inode_has_dirty_writer_stack(self.ino),
-            !self.vfs.pending_uploads_for_inode(self.ino).is_empty(),
+            self.vfs.inode_has_pending_uploads(self.ino),
         ) == MetadataRefreshDecision::UseLocal
         {
             return Some(cached_attr);
@@ -1997,6 +1996,7 @@ mod tests {
         ];
 
         let segments = ReadDataPlanner::new(0, 12)
+            .expect("valid planner")
             .claim_resolved_metadata(&resolved)
             .finish();
 

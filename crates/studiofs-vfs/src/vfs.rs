@@ -4881,7 +4881,7 @@ impl StudioVfs {
         }
     }
 
-    fn inode_has_pending_uploads(&self, ino: Ino) -> bool {
+    pub(super) fn inode_has_pending_uploads(&self, ino: Ino) -> bool {
         self.cached_store.has_pending_uploads_for_ino(ino)
     }
 
