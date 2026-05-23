@@ -279,23 +279,23 @@ impl<'a> DiagnosticsSessionService<'a> {
                 }
             }
         };
-        if outcome.loud
-            && let Err(error) = append_safe_action_audit(
+        if outcome.loud {
+            if let Err(error) = append_safe_action_audit(
                 store,
                 run_id,
                 outcome.action,
                 actor.as_deref(),
                 reason.as_deref(),
                 &outcome,
-            )
-        {
-            warn!(
-                run_id,
-                action = ?outcome.action,
-                error = %error,
-                "failed to persist safe action audit entry"
-            );
-            outcome.audit_error = Some(error.to_string());
+            ) {
+                warn!(
+                    run_id,
+                    action = ?outcome.action,
+                    error = %error,
+                    "failed to persist safe action audit entry"
+                );
+                outcome.audit_error = Some(error.to_string());
+            }
         }
         Ok(outcome)
     }
@@ -465,11 +465,12 @@ impl<'a> DiagnosticsSessionService<'a> {
                 format!("workflow step '{}' is not waiting for operator", step_id),
             ));
         }
-        if let Some(marker_title) = workflow.steps[step_index].on_exit_marker.as_deref()
-            && let Err(error) =
+        if let Some(marker_title) = workflow.steps[step_index].on_exit_marker.as_deref() {
+            if let Err(error) =
                 append_workflow_marker(store, &workflow.run_id, marker_title, self.deps.source)
-        {
-            return Err(DiagnosticsServiceError::InvestigationStore(error));
+            {
+                return Err(DiagnosticsServiceError::InvestigationStore(error));
+            }
         }
         workflow.steps[step_index].status = InvestigationWorkflowStepStatus::Completed;
         workflow.steps[step_index].completed_unix_ms = Some(now_unix_millis());
@@ -512,13 +513,14 @@ impl<'a> DiagnosticsSessionService<'a> {
         let mut workflow = store
             .load_workflow_run(workflow_run_id)
             .map_err(DiagnosticsServiceError::InvestigationStore)?;
-        if let Some(current_step_id) = workflow.current_step_id.as_deref()
-            && let Ok(step_index) = workflow_step_index(&workflow, current_step_id)
-            && !workflow_step_is_terminal(workflow.steps[step_index].status)
-        {
-            workflow.steps[step_index].status = InvestigationWorkflowStepStatus::Aborted;
-            workflow.steps[step_index].completed_unix_ms = Some(now_unix_millis());
-            workflow.steps[step_index].last_error = reason.clone();
+        if let Some(current_step_id) = workflow.current_step_id.as_deref() {
+            if let Ok(step_index) = workflow_step_index(&workflow, current_step_id) {
+                if !workflow_step_is_terminal(workflow.steps[step_index].status) {
+                    workflow.steps[step_index].status = InvestigationWorkflowStepStatus::Aborted;
+                    workflow.steps[step_index].completed_unix_ms = Some(now_unix_millis());
+                    workflow.steps[step_index].last_error = reason.clone();
+                }
+            }
         }
         workflow.status = InvestigationWorkflowStatus::Aborted;
         workflow.current_step_id = None;
@@ -662,24 +664,23 @@ impl<'a> DiagnosticsSessionService<'a> {
         let entry = store
             .append_timeline_entry(run_id, entry)
             .map_err(DiagnosticsServiceError::InvestigationStore)?;
-        let marker_runtime_snapshot =
-            (entry.kind == TimelineEntryKind::Marker).then(|| self.deps.source.runtime_snapshot());
-        if let Some(runtime_snapshot) = marker_runtime_snapshot
-            && let Err(error) = store.append_marker_snapshot(
+        if entry.kind == TimelineEntryKind::Marker {
+            let runtime_snapshot = self.deps.source.runtime_snapshot();
+            if let Err(error) = store.append_marker_snapshot(
                 run_id,
                 NewInvestigationMarkerSnapshot {
                     marker_sequence: entry.sequence,
                     marker_title: entry.title.clone(),
                     runtime_snapshot,
                 },
-            )
-        {
-            warn!(
-                run_id = %run_id,
-                marker_sequence = entry.sequence,
-                error = %error,
-                "failed to persist marker snapshot after timeline marker append"
-            );
+            ) {
+                warn!(
+                    run_id = %run_id,
+                    marker_sequence = entry.sequence,
+                    error = %error,
+                    "failed to persist marker snapshot after timeline marker append"
+                );
+            }
         }
         Ok(entry)
     }
@@ -1114,11 +1115,12 @@ fn advance_workflow_step_operation(
         workflow.steps[step_index].started_unix_ms = Some(now_unix_millis());
         workflow.updated_unix_ms = now_unix_millis();
         workflow.status = InvestigationWorkflowStatus::WaitingForOperator;
-        if let Some(marker_title) = workflow.steps[step_index].on_enter_marker.as_deref()
-            && let Err(error) =
+        if let Some(marker_title) = workflow.steps[step_index].on_enter_marker.as_deref() {
+            if let Err(error) =
                 append_workflow_marker(store, &workflow.run_id, marker_title, source)
-        {
-            return Err(DiagnosticsServiceError::InvestigationStore(error));
+            {
+                return Err(DiagnosticsServiceError::InvestigationStore(error));
+            }
         }
         store
             .save_workflow_run(&workflow)

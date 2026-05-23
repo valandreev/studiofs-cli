@@ -20,6 +20,10 @@ fn read_workspace_file(path: &str) -> String {
     })
 }
 
+fn workspace_line_count(path: &str) -> usize {
+    read_workspace_file(path).lines().count()
+}
+
 fn normalize_doc_whitespace(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -71,6 +75,35 @@ fn collect_term_hits_recursively(path: &str, terms: &[&str]) -> Vec<String> {
     }
 
     hits
+}
+
+#[test]
+fn diagnostics_public_module_stays_a_facade() {
+    let facade = read_workspace_file("crates/studiofs/src/diagnostics.rs");
+    let line_count = workspace_line_count("crates/studiofs/src/diagnostics.rs");
+    assert!(
+        line_count <= 400,
+        "diagnostics.rs should stay a facade; found {line_count} lines"
+    );
+
+    let inline_internals = [
+        "struct DiagnosticsProfilingCoordinator",
+        "struct LocalDiagnosticsHost",
+        "struct LocalDiagnosticsClient",
+        "struct ControllerLeaseManager",
+        "enum DiagnosticsRequest",
+        "enum DiagnosticsResponse",
+    ];
+    let unexpected = inline_internals
+        .iter()
+        .filter(|needle| facade.contains(**needle))
+        .copied()
+        .collect::<Vec<_>>();
+    assert!(
+        unexpected.is_empty(),
+        "diagnostics.rs should re-export focused diagnostics submodules instead of owning internals inline: {}",
+        unexpected.join(", ")
+    );
 }
 
 fn collect_term_hits_outside_test_modules(path: &str, terms: &[&str]) -> Vec<String> {
