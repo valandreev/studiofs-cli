@@ -1,8 +1,9 @@
-#![cfg(windows)]
 //! StudioFS WinFSP backend for Windows.
 //!
 //! Implements `winfsp::filesystem::FileSystemContext` to expose the VFS
 //! as a Windows drive letter via the WinFSP (Windows File System Proxy) driver.
+
+#![cfg(windows)]
 
 mod context;
 

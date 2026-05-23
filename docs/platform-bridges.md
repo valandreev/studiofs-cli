@@ -322,6 +322,20 @@ mount_and_serve(vfs, rt, mount_point, volume_name, foreground, read_only)
        └─ Persist cache checkpoint
 ```
 
+Signal ownership is explicit. The reusable FUSE library path defaults to
+`SignalHandling::Disabled` and does not install process-global `SIGINT` /
+`SIGTERM` handlers. Library embedders can pass a `FuseUnmountSignal` in
+`FuseMountRequest` and trigger it from their own lifecycle code to request
+graceful in-process unmount. The mount lifecycle watcher also remains active
+without process signal handlers so critical VFS runtime failures can request an
+emergency unmount. The StudioFS CLI opts into `SignalHandling::InstallForCli`
+so Ctrl+C/SIGTERM still trigger graceful in-process unmount; that CLI-only path
+restores the previously installed signal dispositions during cleanup instead of
+resetting them to `SIG_DFL`. Because Unix signal disposition is process-global,
+only one active FUSE mount in a process may use `InstallForCli` at a time.
+The watcher uses a simple 100 ms polling loop to bridge both process signals
+and explicit unmount requests into `fuser::SessionUnmounter`.
+
 ## Platform Differences
 
 | Feature | Windows (WinFSP) | Linux/macOS (FUSE) |

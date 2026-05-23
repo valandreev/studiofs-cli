@@ -48,23 +48,23 @@ pub(crate) fn child_job_test_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 struct ChildJobTestCleanupRegistrationGuard;
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 impl Drop for ChildJobTestCleanupRegistrationGuard {
     fn drop(&mut self) {
         CHILD_JOB_TEST_CLEANUP_REGISTRATION.with(|enabled| enabled.set(false));
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 thread_local! {
     static CHILD_JOB_TEST_CLEANUP_REGISTRATION: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 fn child_job_test_cleanup_registration_scope() -> ChildJobTestCleanupRegistrationGuard {
     CHILD_JOB_TEST_CLEANUP_REGISTRATION.with(|enabled| enabled.set(true));
     ChildJobTestCleanupRegistrationGuard

@@ -341,6 +341,7 @@ fn fuse_file_type(kind: FileType) -> FuseFileType {
 
 // ─── StudioFuseFs ────────────────────────────────────────────────────────────
 
+/// FUSE filesystem adapter that forwards kernel callbacks to `StudioVfs`.
 pub struct StudioFuseFs {
     vfs: Arc<StudioVfs>,
     rt: Handle,
@@ -352,6 +353,7 @@ pub struct StudioFuseFs {
 }
 
 impl StudioFuseFs {
+    /// Create a FUSE adapter backed by a shared VFS and Tokio runtime handle.
     pub fn new(vfs: Arc<StudioVfs>, rt: Handle) -> Self {
         // SAFETY: getuid/getgid read process-wide credential values from libc and are
         // side-effect-free.
@@ -1613,6 +1615,7 @@ pub struct FuseKernelInvalidator {
 }
 
 impl FuseKernelInvalidator {
+    /// Create a kernel invalidator from a live FUSE notifier.
     pub fn new(notifier: fuser::Notifier) -> Self {
         Self { notifier }
     }
