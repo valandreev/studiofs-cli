@@ -261,6 +261,7 @@ fn runner_process_lifecycle_has_dedicated_module_boundary() {
     let lib = fs::read_to_string(source_root.join("lib.rs")).unwrap();
     let runner = fs::read_to_string(source_root.join("runner.rs")).unwrap();
     let lifecycle_path = source_root.join("runner_lifecycle.rs");
+    let runner_syntax = syn::parse_file(&runner).unwrap();
 
     assert!(
         lifecycle_path.exists(),
@@ -270,17 +271,27 @@ fn runner_process_lifecycle_has_dedicated_module_boundary() {
         lib.contains("mod runner_lifecycle;"),
         "studiofs-e2e must register the runner_lifecycle module"
     );
+    let runner_functions = runner_syntax
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            syn::Item::Fn(function) => Some(function.sig.ident.to_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
     for runner_owned_symbol in [
-        "fn run_supervised_scenario(",
-        "fn scenario_child_command(",
-        "fn scenario_child_timeout(",
-        "fn read_scenario_child_report(",
-        "fn timed_out_scenario_child(",
-        "fn failed_scenario_child(",
+        "run_supervised_scenario",
+        "scenario_child_command",
+        "scenario_child_timeout",
+        "read_scenario_child_report",
+        "timed_out_scenario_child",
+        "failed_scenario_child",
     ] {
         assert!(
-            !runner.contains(runner_owned_symbol),
-            "runner.rs should delegate process lifecycle symbol `{runner_owned_symbol}` to runner_lifecycle.rs"
+            !runner_functions
+                .iter()
+                .any(|function| function == runner_owned_symbol),
+            "runner.rs should delegate process lifecycle function `{runner_owned_symbol}` to runner_lifecycle.rs"
         );
     }
 }

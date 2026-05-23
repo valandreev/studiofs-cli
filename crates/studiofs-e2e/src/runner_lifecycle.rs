@@ -70,6 +70,7 @@ pub(crate) fn run_supervised_scenario(
                     input.request_seed,
                     command_failure_detail(output.status, &output.stderr),
                     Some(err.to_string()),
+                    true,
                 ),
                 Err(err) => return Err(err),
             };
@@ -150,14 +151,17 @@ fn scenario_child_command(input: &SupervisedScenarioInput<'_>) -> Result<Command
             ("STUDIOFS_E2E_STREAM_OUTPUT".to_string(), "1".to_string()),
         ],
         cwd: None,
-        timeout: Some(scenario_child_timeout(input.request_timeout)),
+        timeout: Some(scenario_child_timeout(input.request_timeout)?),
     })
 }
 
-fn scenario_child_timeout(request_timeout: Option<&str>) -> Duration {
-    request_timeout
-        .and_then(parse_timeout_duration)
-        .unwrap_or(DEFAULT_SCENARIO_CHILD_TIMEOUT)
+fn scenario_child_timeout(request_timeout: Option<&str>) -> Result<Duration, RunnerError> {
+    let Some(request_timeout) = request_timeout else {
+        return Ok(DEFAULT_SCENARIO_CHILD_TIMEOUT);
+    };
+    parse_timeout_duration(request_timeout).ok_or_else(|| RunnerError::InvalidTimeout {
+        value: request_timeout.to_string(),
+    })
 }
 
 fn infra_cli_value(infra: InfraMode) -> &'static str {
@@ -172,6 +176,7 @@ fn parse_timeout_duration(value: &str) -> Option<Duration> {
     if trimmed.is_empty() {
         return None;
     }
+    // Keep "ms" before "s": milliseconds also end with the seconds suffix.
     if let Some(ms) = trimmed.strip_suffix("ms") {
         return ms.trim().parse::<u64>().ok().map(Duration::from_millis);
     }
@@ -207,7 +212,7 @@ fn timed_out_scenario_child(
     seed: u64,
     err: &std::io::Error,
 ) -> ScenarioLifecycleOutcome {
-    failed_scenario_child(scenario, seed, err.to_string(), None)
+    failed_scenario_child(scenario, seed, err.to_string(), None, false)
         .with_status(ScenarioStatus::TimedOut)
 }
 
@@ -216,15 +221,19 @@ pub(crate) fn failed_scenario_child(
     seed: u64,
     error: String,
     report_error: Option<String>,
+    logs_written: bool,
 ) -> ScenarioLifecycleOutcome {
     let started_at = timestamp();
     let finished_at = timestamp();
-    let mut artifacts = vec![scenario_artifact_path(scenario, SCENARIO_CHILD_STDERR_FILE)];
-    if report_error.is_some() {
+    let mut artifacts = Vec::new();
+    if logs_written {
+        artifacts.push(scenario_artifact_path(scenario, SCENARIO_CHILD_STDERR_FILE));
+    }
+    if logs_written && report_error.is_some() {
         artifacts.push(scenario_artifact_path(scenario, SCENARIO_CHILD_STDOUT_FILE));
     }
     let error = match report_error {
-        Some(report_error) => format!("{error}; child report unavailable: {report_error}"),
+        Some(report_err) => format!("{error}; child report unavailable: {report_err}"),
         None => error,
     };
     ScenarioLifecycleOutcome {
@@ -247,11 +256,7 @@ pub(crate) fn failed_scenario_child(
     }
 }
 
-trait ScenarioLifecycleStatus {
-    fn with_status(self, status: ScenarioStatus) -> Self;
-}
-
-impl ScenarioLifecycleStatus for ScenarioLifecycleOutcome {
+impl ScenarioLifecycleOutcome {
     fn with_status(mut self, status: ScenarioStatus) -> Self {
         self.report.status = status;
         self.outcome.status = status;
@@ -303,4 +308,60 @@ fn append_text(path: &Path, text: &str) -> Result<(), RunnerError> {
     file.write_all(text.as_bytes())?;
     file.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn parse_timeout_duration_accepts_supported_units_in_suffix_order() {
+        assert_eq!(
+            parse_timeout_duration("500ms"),
+            Some(Duration::from_millis(500))
+        );
+        assert_eq!(parse_timeout_duration("10s"), Some(Duration::from_secs(10)));
+        assert_eq!(parse_timeout_duration("5m"), Some(Duration::from_secs(300)));
+        assert_eq!(parse_timeout_duration("7"), Some(Duration::from_secs(7)));
+    }
+
+    #[test]
+    fn scenario_child_command_rejects_invalid_timeout_format() {
+        let definition = scenario::resolve_scenario(scenario::TEST_PASSING)
+            .unwrap()
+            .definition();
+        let temp = tempfile::tempdir().unwrap();
+        let events_path = temp.path().join("events.ndjson");
+        let executor = crate::infra::SystemCommandExecutor;
+
+        let err = scenario_child_command(&SupervisedScenarioInput {
+            events_path: &events_path,
+            run_id: "invalid-timeout-run",
+            root: temp.path(),
+            sandbox: temp.path(),
+            request_seed: 438,
+            request_platform: PlatformSelection::Auto,
+            request_infra: InfraMode::Disabled,
+            request_timeout: Some("30x"),
+            definition,
+            scenario_progress: ScenarioProgress { index: 1, total: 1 },
+            executor: &executor,
+        })
+        .unwrap_err();
+
+        assert!(matches!(err, RunnerError::InvalidTimeout { .. }));
+        assert!(err.to_string().contains("30x"));
+    }
+
+    #[test]
+    fn timed_out_scenario_child_does_not_advertise_unwritten_logs() {
+        let err = std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out");
+
+        let lifecycle = timed_out_scenario_child(scenario::TEST_PASSING, 438, &err);
+
+        assert_eq!(lifecycle.report.status, ScenarioStatus::TimedOut);
+        assert!(lifecycle.report.artifacts.is_empty());
+        assert!(lifecycle.outcome.artifacts.is_empty());
+    }
 }

@@ -245,6 +245,14 @@ pub enum RunnerError {
         /// Mounted scenario that requires a local studiofs binary.
         scenario: String,
     },
+    /// Timeout string could not be parsed.
+    #[error(
+        "invalid E2E timeout '{value}': expected integer seconds or a value ending in ms, s, or m"
+    )]
+    InvalidTimeout {
+        /// Invalid timeout value from the request.
+        value: String,
+    },
     /// Run ID was empty.
     #[error("run ID must not be empty")]
     EmptyRunId,
@@ -600,6 +608,7 @@ pub fn run_with_executor(
                 request.seed,
                 format!("scenario supervision failed: {error}"),
                 None,
+                false,
             ),
             Err(error) => return Err(error),
         };
