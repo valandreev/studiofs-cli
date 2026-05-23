@@ -1,10 +1,10 @@
-use super::PgMetaEngine;
 use crate::engine::{MetaError, MetaInodes, MetaNamespace, MetaPayloadObjects, MetaResult};
 use crate::events::MetaEvent;
+use crate::redb_engine::RedbMetaEngine;
+use crate::redb_engine::layout::{encode_acl_rule_key, encode_dentry_key, encode_xattr_key};
 use crate::schema::{DEFAULT_CHUNK_SIZE, chunk_start_offset};
 use crate::types::*;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::Ordering;
 
 #[derive(Clone, Default)]
 pub(super) struct OverlayConflictSets {
@@ -37,6 +37,15 @@ pub(super) struct RemoteReplayApplyOutcome {
     pub(super) changed: bool,
     pub(super) max_version: i64,
     pub(super) max_namespace_version: i64,
+    pub(super) flushed_event_seq: Option<u64>,
+}
+
+pub(super) struct RemoteReplayApplyContext {
+    pub(super) last_seq: i64,
+    pub(super) current_namespace_version: i64,
+    pub(super) flushed_event_seq: u64,
+    pub(super) next_event_seq: u64,
+    pub(super) initial_overlay: OverlayConflictSets,
 }
 
 pub(super) struct ProjectedRemoteBatch {
@@ -48,12 +57,12 @@ pub(super) struct ProjectedRemoteBatch {
 }
 
 pub(super) struct RemoteApplyCoordinator<'a> {
-    pub(super) engine: &'a PgMetaEngine,
+    pub(super) local: &'a RedbMetaEngine,
 }
 
 impl<'a> RemoteApplyCoordinator<'a> {
-    pub(super) fn new(engine: &'a PgMetaEngine) -> Self {
-        Self { engine }
+    pub(super) fn new(local: &'a RedbMetaEngine) -> Self {
+        Self { local }
     }
 
     pub(super) fn project_remote_events(events: &[MetaEvent]) -> Vec<MetaEvent> {
@@ -226,9 +235,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 }
                 MetaEvent::AddEntry { parent, name, .. }
                 | MetaEvent::RemoveEntry { parent, name } => {
-                    overlay
-                        .dentry_keys
-                        .insert(PgMetaEngine::dentry_key(*parent, name));
+                    overlay.dentry_keys.insert(encode_dentry_key(*parent, name));
                 }
                 MetaEvent::RenameEntry {
                     parent,
@@ -242,12 +249,10 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     old_parent_attr,
                     new_parent_attr,
                 } => {
+                    overlay.dentry_keys.insert(encode_dentry_key(*parent, name));
                     overlay
                         .dentry_keys
-                        .insert(PgMetaEngine::dentry_key(*parent, name));
-                    overlay
-                        .dentry_keys
-                        .insert(PgMetaEngine::dentry_key(*new_parent, new_name));
+                        .insert(encode_dentry_key(*new_parent, new_name));
                     overlay.attr_inodes.insert(entry.ino);
                     if let Some(attr) = displaced_set_attr.as_ref() {
                         overlay.attr_inodes.insert(attr.ino);
@@ -276,16 +281,14 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 }
                 MetaEvent::SetXattr { ino, name, .. } | MetaEvent::RemoveXattr { ino, name } => {
                     overlay.xattr_inodes.insert(*ino);
-                    overlay
-                        .xattr_keys
-                        .insert(PgMetaEngine::xattr_key(*ino, name));
+                    overlay.xattr_keys.insert(encode_xattr_key(*ino, name));
                 }
                 MetaEvent::SetAclRule { ino, principal, .. }
                 | MetaEvent::RemoveAclRule { ino, principal } => {
                     overlay.attr_inodes.insert(*ino);
                     overlay
                         .acl_keys
-                        .insert(PgMetaEngine::acl_key(*ino, principal));
+                        .insert(encode_acl_rule_key(*ino, principal));
                 }
                 MetaEvent::AddPendingDeletion { .. }
                 | MetaEvent::RemovePendingDeletion { .. }
@@ -389,16 +392,14 @@ impl<'a> RemoteApplyCoordinator<'a> {
             MetaEvent::SetXattr { ino, name, .. } | MetaEvent::RemoveXattr { ino, name } => {
                 overlay.block_inodes.contains(ino)
                     || overlay.attr_inodes.contains(ino)
-                    || overlay
-                        .xattr_keys
-                        .contains(&PgMetaEngine::xattr_key(*ino, name))
+                    || overlay.xattr_keys.contains(&encode_xattr_key(*ino, name))
             }
             MetaEvent::SetAclRule { ino, principal, .. }
             | MetaEvent::RemoveAclRule { ino, principal } => {
                 overlay.attr_inodes.contains(ino)
                     || overlay
                         .acl_keys
-                        .contains(&PgMetaEngine::acl_key(*ino, principal))
+                        .contains(&encode_acl_rule_key(*ino, principal))
             }
             MetaEvent::SetAttr { .. }
             | MetaEvent::AddEntry { .. }
@@ -435,7 +436,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
             MetaEvent::AddEntry { parent, name, .. } | MetaEvent::RemoveEntry { parent, name } => {
                 overlay
                     .dentry_keys
-                    .contains(&PgMetaEngine::dentry_key(*parent, name))
+                    .contains(&encode_dentry_key(*parent, name))
             }
             MetaEvent::RenameEntry { .. } => false,
             MetaEvent::SetSymlinkTarget { ino, .. } => {
@@ -446,16 +447,14 @@ impl<'a> RemoteApplyCoordinator<'a> {
             MetaEvent::SetXattr { ino, name, .. } | MetaEvent::RemoveXattr { ino, name } => {
                 overlay.block_inodes.contains(ino)
                     || overlay.attr_inodes.contains(ino)
-                    || overlay
-                        .xattr_keys
-                        .contains(&PgMetaEngine::xattr_key(*ino, name))
+                    || overlay.xattr_keys.contains(&encode_xattr_key(*ino, name))
             }
             MetaEvent::SetAclRule { ino, principal, .. }
             | MetaEvent::RemoveAclRule { ino, principal } => {
                 overlay.attr_inodes.contains(ino)
                     || overlay
                         .acl_keys
-                        .contains(&PgMetaEngine::acl_key(*ino, principal))
+                        .contains(&encode_acl_rule_key(*ino, principal))
             }
             MetaEvent::SetRegularFileOverlaySlices { .. } => false,
             MetaEvent::PublishRegularFileBaseSlices { ino, .. } => {
@@ -520,7 +519,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
         for event in batch_events {
             match event {
                 MetaEvent::RemoveEntry { parent, name } => {
-                    if let Ok(entry) = self.engine.local.lookup(*parent, name) {
+                    if let Ok(entry) = self.local.lookup(*parent, name) {
                         removed.insert(entry.ino);
                     }
                 }
@@ -537,16 +536,16 @@ impl<'a> RemoteApplyCoordinator<'a> {
         &self,
         ino: Ino,
     ) -> MetaResult<bool> {
-        if self.engine.local.has_local_regular_file_overlay(ino)? {
+        if self.local.has_local_regular_file_overlay(ino)? {
             return Ok(true);
         }
-        let Some(lifecycle) = self.engine.local.get_inode_lifecycle(ino)? else {
+        let Some(lifecycle) = self.local.get_inode_lifecycle(ino)? else {
             return Ok(false);
         };
         if lifecycle.state == InodeLifecycleState::Published {
             return Ok(false);
         }
-        let attr = match self.engine.local.get_attr(ino) {
+        let attr = match self.local.get_attr(ino) {
             Ok(attr) => attr,
             Err(MetaError::InodeNotFound(_)) => return Ok(false),
             Err(err) => return Err(err),
@@ -584,29 +583,25 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     entry,
                 } if entry.kind == FileType::RegularFile
                     && !serving_ready_regular_files.contains(&entry.ino)
-                    && self.engine.local.lookup(*parent, name).is_ok() =>
+                    && self.local.lookup(*parent, name).is_ok() =>
                 {
-                    overlay
-                        .dentry_keys
-                        .insert(PgMetaEngine::dentry_key(*parent, name));
+                    overlay.dentry_keys.insert(encode_dentry_key(*parent, name));
                     continue;
                 }
                 MetaEvent::PublishRegularFileBaseSlices { ino, .. }
                 | MetaEvent::RemoveRegularFileGraph { ino } => *ino,
                 MetaEvent::RemoveEntry { parent, name } => {
-                    let Ok(entry) = self.engine.local.lookup(*parent, name) else {
+                    let Ok(entry) = self.local.lookup(*parent, name) else {
                         continue;
                     };
                     if self.local_uploading_dentry_needs_foreign_protection(entry.ino)? {
-                        overlay
-                            .dentry_keys
-                            .insert(PgMetaEngine::dentry_key(*parent, name));
+                        overlay.dentry_keys.insert(encode_dentry_key(*parent, name));
                     }
                     entry.ino
                 }
                 _ => continue,
             };
-            if self.engine.local.has_local_regular_file_overlay(ino)? {
+            if self.local.has_local_regular_file_overlay(ino)? {
                 overlay.attr_inodes.insert(ino);
                 overlay.block_inodes.insert(ino);
             } else if self.local_regular_file_state_needs_foreign_protection(ino)? {
@@ -633,7 +628,6 @@ impl<'a> RemoteApplyCoordinator<'a> {
                         attr.committed_size,
                     )
                     || self
-                        .engine
                         .local
                         .get_base_attr(attr.ino)?
                         .is_some_and(|base_attr| {
@@ -657,7 +651,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
         &self,
         ino: Ino,
     ) -> MetaResult<bool> {
-        let attr = match self.engine.local.get_attr(ino) {
+        let attr = match self.local.get_attr(ino) {
             Ok(attr) => attr,
             Err(MetaError::InodeNotFound(_)) => return Ok(false),
             Err(err) => return Err(err),
@@ -665,7 +659,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
         Ok(attr.kind == FileType::RegularFile
             && attr.upload_state != UploadState::Ready
             && (attr.size <= attr.committed_size || attr.committed_size == 0)
-            && self.engine.local.has_local_regular_file_overlay(ino)?)
+            && self.local.has_local_regular_file_overlay(ino)?)
     }
 
     pub(super) fn grandfather_removed_local_regular_file_attrs(
@@ -674,7 +668,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
     ) -> MetaResult<Vec<MetaEvent>> {
         let mut events = Vec::new();
         for ino in inodes {
-            let mut attr = match self.engine.local.get_attr(*ino) {
+            let mut attr = match self.local.get_attr(*ino) {
                 Ok(attr) => attr,
                 Err(MetaError::InodeNotFound(_)) => continue,
                 Err(err) => return Err(err),
@@ -775,7 +769,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 {
                     return Ok(event.clone());
                 }
-                let Some(base_attr) = self.engine.local.get_base_attr(attr.ino)? else {
+                let Some(base_attr) = self.local.get_base_attr(attr.ino)? else {
                     return Ok(event.clone());
                 };
                 if base_attr.kind != FileType::RegularFile
@@ -793,7 +787,6 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 }
                 if base_attr.committed_size > 0 {
                     let object_backed = self
-                        .engine
                         .local
                         .lookup_regular_file_slices(base_attr.ino, 0, base_attr.committed_size)?
                         .iter()
@@ -840,7 +833,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
             {
                 continue;
             }
-            let current = match self.engine.local.get_attr(attr.ino) {
+            let current = match self.local.get_attr(attr.ino) {
                 Ok(current) => current,
                 Err(MetaError::InodeNotFound(_)) => continue,
                 Err(err) => return Err(err),
@@ -908,7 +901,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
             {
                 continue;
             }
-            let current = match self.engine.local.get_attr(attr.ino) {
+            let current = match self.local.get_attr(attr.ino) {
                 Ok(current) => current,
                 Err(MetaError::InodeNotFound(_)) => continue,
                 Err(err) => return Err(err),
@@ -1007,8 +1000,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
             &protected_regular_file_inodes,
             &base_range_preserve_inodes,
         )?;
-        self.engine
-            .local
+        self.local
             .apply_replica_events_to_base_preserving_protected_base_ranges(
                 &batch_events,
                 &base_range_preserve_inodes,
@@ -1046,20 +1038,16 @@ impl<'a> RemoteApplyCoordinator<'a> {
             .cloned()
             .collect();
         let applied_serving_state = !serving_events.is_empty();
-        self.engine
-            .local
-            .apply_replica_serving_state(&serving_events)?;
+        self.local.apply_replica_serving_state(&serving_events)?;
         if !protected_attr_merges.is_empty() {
-            self.engine
-                .local
+            self.local
                 .apply_replica_serving_state(&protected_attr_merges)?;
         }
         let grandfathered_attrs = self.grandfather_removed_local_regular_file_attrs(
             &removed_inodes_with_local_regular_file_state,
         )?;
         if !grandfathered_attrs.is_empty() {
-            self.engine
-                .local
+            self.local
                 .apply_replica_serving_state(&grandfathered_attrs)?;
         }
         let mut aux_events = Vec::new();
@@ -1086,7 +1074,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
         }
 
         if !aux_events.is_empty() {
-            self.engine.local.apply_replica_aux_state(&aux_events)?;
+            self.local.apply_replica_aux_state(&aux_events)?;
         }
         Ok(RemoteApplyBatchOutcome {
             changed: applied_serving_state
@@ -1105,12 +1093,9 @@ impl<'a> RemoteApplyCoordinator<'a> {
             self.preserve_published_content_state_for_attr_only_events(batch_events)?;
         let partial_publish_inodes = Self::partial_regular_file_publish_inodes(&batch_events);
         if partial_publish_inodes.is_empty() {
-            self.engine
-                .local
-                .apply_replica_events_to_base(&batch_events)?;
+            self.local.apply_replica_events_to_base(&batch_events)?;
         } else {
-            self.engine
-                .local
+            self.local
                 .apply_replica_events_to_base_preserving_protected_base_ranges(
                     &batch_events,
                     &partial_publish_inodes,
@@ -1126,7 +1111,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 ..
             } = event
             {
-                self.engine.local.reconcile_serving_rename_from_base(
+                self.local.reconcile_serving_rename_from_base(
                     *parent,
                     name,
                     *new_parent,
@@ -1151,25 +1136,40 @@ impl<'a> RemoteApplyCoordinator<'a> {
             return Ok(false);
         }
 
-        self.engine.local.apply_replica_aux_state(&aux_events)?;
+        self.local.apply_replica_aux_state(&aux_events)?;
         Ok(true)
+    }
+
+    pub(super) fn overlay_conflicts_for_local_range(
+        local: &RedbMetaEngine,
+        start: u64,
+        end: u64,
+    ) -> MetaResult<OverlayConflictSets> {
+        if end <= start {
+            return Ok(OverlayConflictSets::default());
+        }
+
+        let events = local.read_events_range(start, end)?;
+        Ok(Self::overlay_conflicts_for_events(&events))
     }
 
     pub(super) fn acknowledge_local_prefix_from_self_batch(
         &self,
         batch_events: &[MetaEvent],
-    ) -> MetaResult<()> {
+        flushed_event_seq: u64,
+        next_event_seq: u64,
+    ) -> MetaResult<Option<u64>> {
         if batch_events.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
 
-        let start = self.engine.flushed_event_seq.load(Ordering::SeqCst);
-        let end = self.engine.local.get_counter("nextEventSeq")?;
+        let start = flushed_event_seq;
+        let end = next_event_seq;
         if end <= start {
-            return Ok(());
+            return Ok(None);
         }
 
-        let local_events = self.engine.local.read_events_range(start, end)?;
+        let local_events = self.local.read_events_range(start, end)?;
         let mut projected_prefix = Vec::with_capacity(batch_events.len());
         let mut consumed_events = 0usize;
         for event in &local_events {
@@ -1181,7 +1181,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
             }
         }
         if projected_prefix.len() != batch_events.len() {
-            return Ok(());
+            return Ok(None);
         }
 
         let matches_prefix =
@@ -1189,15 +1189,17 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 .iter()
                 .zip(batch_events.iter())
                 .all(|(local, remote)| {
-                    PgMetaEngine::encode_postcard(local).ok()
-                        == PgMetaEngine::encode_postcard(remote).ok()
+                    match (postcard::to_stdvec(local), postcard::to_stdvec(remote)) {
+                        (Ok(local), Ok(remote)) => local == remote,
+                        _ => false,
+                    }
                 });
         if matches_prefix {
             let next_seq = start.max(1).saturating_add(consumed_events as u64);
-            self.engine.persist_flushed_event_seq(next_seq)?;
+            return Ok(Some(next_seq));
         }
 
-        Ok(())
+        Ok(None)
     }
 
     pub(super) fn effective_replay_overlay(
@@ -1237,8 +1239,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
             }
             ready_inodes.insert(*ino);
         }
-        self.engine
-            .local
+        self.local
             .reconcile_regular_file_serving_from_base_with_protected_dentries(
                 &ready_inodes,
                 &overlay.dentry_keys,
@@ -1253,8 +1254,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
         if dentry_keys.is_empty() {
             return Ok(false);
         }
-        self.engine
-            .local
+        self.local
             .reconcile_serving_dentries_from_base(dentry_keys, &overlay.dentry_keys)
     }
 
@@ -1262,31 +1262,44 @@ impl<'a> RemoteApplyCoordinator<'a> {
         &self,
         batches: Vec<DecodedReplayBatch>,
         recent_flush: Option<&RecentFlush>,
-        last_seq: i64,
+        mut context: RemoteReplayApplyContext,
     ) -> MetaResult<RemoteReplayApplyOutcome> {
         if batches.is_empty() {
             return Ok(RemoteReplayApplyOutcome {
                 changed: false,
-                max_version: last_seq,
-                max_namespace_version: self.engine.namespace_version.load(Ordering::SeqCst),
+                max_version: context.last_seq,
+                max_namespace_version: context.current_namespace_version,
+                flushed_event_seq: None,
             });
         }
 
-        let mut overlay = self.engine.local_overlay_conflicts()?;
+        let mut overlay = context.initial_overlay.clone();
         let initial_overlay = overlay.clone();
         let mut applied_any = false;
-        let mut max_version = last_seq;
-        let mut max_namespace_version = self.engine.namespace_version.load(Ordering::SeqCst);
+        let mut max_version = context.last_seq;
+        let mut max_namespace_version = context.current_namespace_version;
         let mut reconcile_inodes = HashSet::new();
         let mut reconcile_dentry_keys = HashSet::new();
         let mut replay_protected_overlay = OverlayConflictSets::default();
+        let mut acknowledged_flushed_event_seq = None;
+        let mut overlay_is_dirty = false;
         let empty_protected_base_inodes = HashSet::new();
         for batch in batches {
             Self::collect_replay_reconcile_inodes(&mut reconcile_inodes, &batch.events);
             Self::collect_replay_reconcile_dentries(&mut reconcile_dentry_keys, &batch.events);
             if batch.is_self_batch {
                 applied_any |= self.apply_visible_self_batch(&batch.events)?;
-                self.acknowledge_local_prefix_from_self_batch(&batch.events)?;
+                if let Some(next_flushed_event_seq) = self
+                    .acknowledge_local_prefix_from_self_batch(
+                        &batch.events,
+                        context.flushed_event_seq,
+                        context.next_event_seq,
+                    )?
+                {
+                    context.flushed_event_seq = next_flushed_event_seq;
+                    acknowledged_flushed_event_seq = Some(next_flushed_event_seq);
+                    overlay_is_dirty = true;
+                }
             } else {
                 let effective_overlay =
                     Self::effective_replay_overlay(&overlay, recent_flush, batch.batch_version);
@@ -1307,7 +1320,14 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 max_namespace_version = max_namespace_version.max(batch.batch_version);
             }
             max_version = batch.batch_version;
-            overlay = self.engine.local_overlay_conflicts()?;
+            if overlay_is_dirty {
+                overlay = Self::overlay_conflicts_for_local_range(
+                    self.local,
+                    context.flushed_event_seq,
+                    context.next_event_seq,
+                )?;
+                overlay_is_dirty = false;
+            }
         }
         let final_overlay = Self::merge_overlay_conflicts(&overlay, &replay_protected_overlay);
         let final_dentry_overlay =
@@ -1324,30 +1344,24 @@ impl<'a> RemoteApplyCoordinator<'a> {
             changed: applied_any,
             max_version,
             max_namespace_version,
+            flushed_event_seq: acknowledged_flushed_event_seq,
         })
-    }
-
-    pub(super) fn persist_replay_outcome(
-        &self,
-        outcome: &RemoteReplayApplyOutcome,
-    ) -> MetaResult<()> {
-        self.engine.persist_local_version(outcome.max_version)?;
-        if outcome.max_namespace_version > self.engine.namespace_version.load(Ordering::SeqCst) {
-            self.engine
-                .persist_namespace_version(outcome.max_namespace_version)?;
-        }
-        Ok(())
     }
 
     pub(super) fn apply_event_rows(
         &self,
         rows: Vec<tokio_postgres::Row>,
         recent_flush: Option<&RecentFlush>,
-        last_seq: i64,
         client_id: &str,
-    ) -> MetaResult<bool> {
+        context: RemoteReplayApplyContext,
+    ) -> MetaResult<RemoteReplayApplyOutcome> {
         if rows.is_empty() {
-            return Ok(false);
+            return Ok(RemoteReplayApplyOutcome {
+                changed: false,
+                max_version: context.last_seq,
+                max_namespace_version: context.current_namespace_version,
+                flushed_event_seq: None,
+            });
         }
 
         let mut batches = Vec::new();
@@ -1362,29 +1376,28 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 is_self_batch,
             });
         }
-        let outcome = self.apply_decoded_batches(batches, recent_flush, last_seq)?;
-        self.persist_replay_outcome(&outcome)?;
-        Ok(outcome.changed)
+        self.apply_decoded_batches(batches, recent_flush, context)
     }
 
     pub(super) fn reconcile_recent_flush(
         &self,
         recent_flush: Option<&RecentFlush>,
+        local_version: i64,
+        overlay: &OverlayConflictSets,
     ) -> MetaResult<bool> {
         let Some(recent_flush) = recent_flush else {
             return Ok(false);
         };
-        if self.engine.local_version.load(Ordering::SeqCst) < recent_flush.batch_version {
+        if local_version < recent_flush.batch_version {
             return Ok(false);
         }
         let mut reconcile_inodes = recent_flush.overlay.attr_inodes.clone();
         reconcile_inodes.extend(recent_flush.overlay.block_inodes.iter().copied());
-        let overlay = self.engine.local_overlay_conflicts()?;
-        let mut changed = self
-            .reconcile_regular_file_serving_from_base_with_overlay(&reconcile_inodes, &overlay)?;
+        let mut changed =
+            self.reconcile_regular_file_serving_from_base_with_overlay(&reconcile_inodes, overlay)?;
         changed |= self.reconcile_serving_dentries_from_base_with_overlay(
             &recent_flush.overlay.dentry_keys,
-            &overlay,
+            overlay,
         )?;
         Ok(changed)
     }

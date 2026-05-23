@@ -243,7 +243,10 @@ use inode_allocator::{InodeAllocatorState, InodeWindow, LocalIdRangeState};
 use janitor::PgJanitorLock;
 #[cfg(test)]
 use remote_apply::DecodedReplayBatch;
-use remote_apply::{OverlayConflictSets, RecentFlush, RemoteApplyCoordinator};
+use remote_apply::{
+    OverlayConflictSets, RecentFlush, RemoteApplyCoordinator, RemoteReplayApplyContext,
+    RemoteReplayApplyOutcome,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MetadataSyncSource {

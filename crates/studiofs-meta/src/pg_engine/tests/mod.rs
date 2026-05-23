@@ -563,7 +563,7 @@ fn apply_foreign_batch(
     overlay: &OverlayConflictSets,
     base_protected_regular_file_inodes: &HashSet<Ino>,
 ) -> MetaResult<(bool, OverlayConflictSets)> {
-    let outcome = RemoteApplyCoordinator::new(pg).apply_foreign_batch(
+    let outcome = RemoteApplyCoordinator::new(&pg.local).apply_foreign_batch(
         batch_events,
         overlay,
         base_protected_regular_file_inodes,
@@ -572,14 +572,21 @@ fn apply_foreign_batch(
 }
 
 fn apply_visible_self_batch(pg: &PgMetaEngine, batch_events: &[MetaEvent]) -> MetaResult<bool> {
-    RemoteApplyCoordinator::new(pg).apply_visible_self_batch(batch_events)
+    RemoteApplyCoordinator::new(&pg.local).apply_visible_self_batch(batch_events)
 }
 
 fn acknowledge_local_prefix_from_self_batch(
     pg: &PgMetaEngine,
     batch_events: &[MetaEvent],
 ) -> MetaResult<()> {
-    RemoteApplyCoordinator::new(pg).acknowledge_local_prefix_from_self_batch(batch_events)
+    let flushed_event_seq = pg.flushed_event_seq.load(Ordering::SeqCst);
+    let next_event_seq = pg.local.get_counter("nextEventSeq")?;
+    if let Some(next_flushed_event_seq) = RemoteApplyCoordinator::new(&pg.local)
+        .acknowledge_local_prefix_from_self_batch(batch_events, flushed_event_seq, next_event_seq)?
+    {
+        pg.persist_flushed_event_seq(next_flushed_event_seq)?;
+    }
+    Ok(())
 }
 
 fn apply_decoded_foreign_batches_locked(
@@ -588,9 +595,22 @@ fn apply_decoded_foreign_batches_locked(
     recent_flush: Option<&RecentFlush>,
     last_seq: i64,
 ) -> MetaResult<bool> {
-    let coordinator = RemoteApplyCoordinator::new(pg);
-    let outcome = coordinator.apply_decoded_batches(batches, recent_flush, last_seq)?;
-    coordinator.persist_replay_outcome(&outcome)?;
+    let coordinator = RemoteApplyCoordinator::new(&pg.local);
+    let flushed_event_seq = pg.flushed_event_seq.load(Ordering::SeqCst);
+    let next_event_seq = pg.local.get_counter("nextEventSeq")?;
+    let initial_overlay = pg.local_overlay_conflicts()?;
+    let outcome = coordinator.apply_decoded_batches(
+        batches,
+        recent_flush,
+        RemoteReplayApplyContext {
+            last_seq,
+            current_namespace_version: pg.namespace_version.load(Ordering::SeqCst),
+            flushed_event_seq,
+            next_event_seq,
+            initial_overlay,
+        },
+    )?;
+    pg.persist_replay_outcome(&outcome)?;
     Ok(outcome.changed)
 }
 
@@ -598,7 +618,12 @@ fn reconcile_recent_flush_regular_files(
     pg: &PgMetaEngine,
     recent_flush: Option<&RecentFlush>,
 ) -> MetaResult<bool> {
-    RemoteApplyCoordinator::new(pg).reconcile_recent_flush(recent_flush)
+    let overlay = pg.local_overlay_conflicts()?;
+    RemoteApplyCoordinator::new(&pg.local).reconcile_recent_flush(
+        recent_flush,
+        pg.local_version.load(Ordering::SeqCst),
+        &overlay,
+    )
 }
 
 const SETUP_PG_VOLUME_ADVISORY_LOCK_ID: i64 = 902_202_603;

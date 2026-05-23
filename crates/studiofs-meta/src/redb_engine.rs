@@ -14,7 +14,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tracing::debug;
 
-mod layout;
+pub(crate) mod layout;
 pub use self::layout::RedbSnapshot;
 use self::layout::*;
 

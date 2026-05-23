@@ -14,10 +14,7 @@ impl PgMetaEngine {
             return Ok(OverlayConflictSets::default());
         }
 
-        let events = self.local.read_events_range(start, end)?;
-        Ok(RemoteApplyCoordinator::overlay_conflicts_for_events(
-            &events,
-        ))
+        RemoteApplyCoordinator::overlay_conflicts_for_local_range(&self.local, start, end)
     }
 
     pub(super) fn reconcile_imported_snapshot_regular_files(&self) -> MetaResult<()> {
@@ -29,8 +26,24 @@ impl PgMetaEngine {
             .map(|attr| attr.ino)
             .collect::<HashSet<_>>();
         let overlay = self.local_overlay_conflicts()?;
-        RemoteApplyCoordinator::new(self)
+        RemoteApplyCoordinator::new(&self.local)
             .reconcile_regular_file_serving_from_base_with_overlay(&reconcile_inodes, &overlay)?;
+        Ok(())
+    }
+
+    pub(super) fn persist_replay_outcome(
+        &self,
+        outcome: &super::RemoteReplayApplyOutcome,
+    ) -> MetaResult<()> {
+        if outcome.max_version > self.local_version.load(Ordering::SeqCst) {
+            self.persist_local_version(outcome.max_version)?;
+        }
+        if outcome.max_namespace_version > self.namespace_version.load(Ordering::SeqCst) {
+            self.persist_namespace_version(outcome.max_namespace_version)?;
+        }
+        if let Some(flushed_event_seq) = outcome.flushed_event_seq {
+            self.persist_flushed_event_seq(flushed_event_seq)?;
+        }
         Ok(())
     }
 
@@ -114,12 +127,23 @@ impl PgMetaEngine {
             .await
         })?;
 
-        RemoteApplyCoordinator::new(self).apply_event_rows(
+        let flushed_event_seq = self.flushed_event_seq.load(Ordering::SeqCst);
+        let next_event_seq = self.local.get_counter("nextEventSeq")?;
+        let initial_overlay = self.local_overlay_conflicts()?;
+        let outcome = RemoteApplyCoordinator::new(&self.local).apply_event_rows(
             rows,
             recent_flush,
-            last_seq,
             client_id.as_str(),
-        )
+            super::RemoteReplayApplyContext {
+                last_seq,
+                current_namespace_version: self.namespace_version.load(Ordering::SeqCst),
+                flushed_event_seq,
+                next_event_seq,
+                initial_overlay,
+            },
+        )?;
+        self.persist_replay_outcome(&outcome)?;
+        Ok(outcome.changed)
     }
 
     pub(super) fn pull_and_reconcile_foreign_events_locked(
@@ -127,7 +151,12 @@ impl PgMetaEngine {
         recent_flush: Option<&RecentFlush>,
     ) -> MetaResult<bool> {
         let mut changed = self.pull_foreign_events_locked(recent_flush)?;
-        changed |= RemoteApplyCoordinator::new(self).reconcile_recent_flush(recent_flush)?;
+        let overlay = self.local_overlay_conflicts()?;
+        changed |= RemoteApplyCoordinator::new(&self.local).reconcile_recent_flush(
+            recent_flush,
+            self.local_version.load(Ordering::SeqCst),
+            &overlay,
+        )?;
         Ok(changed)
     }
 }

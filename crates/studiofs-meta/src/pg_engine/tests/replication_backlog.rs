@@ -1,4 +1,5 @@
 use super::*;
+use crate::redb_engine::layout::encode_xattr_key;
 
 #[test]
 fn test_local_overlay_conflicts_reserve_pending_xattr_and_symlink() {
@@ -37,12 +38,12 @@ fn test_local_overlay_conflicts_reserve_pending_xattr_and_symlink() {
     assert!(
         overlay
             .xattr_keys
-            .contains(&PgMetaEngine::xattr_key(file.ino, b"user.color"))
+            .contains(&encode_xattr_key(file.ino, b"user.color"))
     );
     assert!(
         !overlay
             .xattr_keys
-            .contains(&PgMetaEngine::xattr_key(file.ino, b"user.other"))
+            .contains(&encode_xattr_key(file.ino, b"user.other"))
     );
     assert!(RemoteApplyCoordinator::aux_event_conflicts_with_overlay(
         &MetaEvent::SetXattr {

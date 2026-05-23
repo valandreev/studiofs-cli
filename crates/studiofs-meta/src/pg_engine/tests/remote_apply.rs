@@ -1,4 +1,28 @@
 use super::*;
+use crate::redb_engine::layout::encode_dentry_key;
+
+#[test]
+fn remote_apply_coordinator_does_not_capture_pg_engine_state() {
+    let source = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("pg_engine")
+            .join("remote_apply.rs"),
+    )
+    .expect("read remote_apply source");
+    let code_without_line_comments = source
+        .lines()
+        .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        !code_without_line_comments.contains("PgMetaEngine")
+            && !code_without_line_comments.contains("engine: &")
+            && !code_without_line_comments.contains("self.engine"),
+        "RemoteApplyCoordinator must not retain or reach through broad PgMetaEngine state"
+    );
+}
 
 #[test]
 fn project_remote_events_filters_unpublished_overlay_slices() {
@@ -411,7 +435,7 @@ fn foreign_unlink_during_local_append_removes_serving_dentry() {
         },
         MetaEvent::RemoveAttr { ino: file.ino },
     ];
-    let current_regular_file_conflicts = RemoteApplyCoordinator::new(&pg)
+    let current_regular_file_conflicts = RemoteApplyCoordinator::new(&pg.local)
         .current_regular_file_overlay_conflicts_for_batch(&batch)
         .expect("collect current regular-file conflicts");
     assert!(
@@ -565,13 +589,13 @@ fn foreign_unlink_during_local_uploading_preserves_writer_dentry() {
         },
         MetaEvent::RemoveAttr { ino: file.ino },
     ];
-    let current_regular_file_conflicts = RemoteApplyCoordinator::new(&pg)
+    let current_regular_file_conflicts = RemoteApplyCoordinator::new(&pg.local)
         .current_regular_file_overlay_conflicts_for_batch(&batch)
         .expect("collect current regular-file conflicts");
     assert!(
         current_regular_file_conflicts
             .dentry_keys
-            .contains(&PgMetaEngine::dentry_key(ROOT_INO, b"uploading-target.txt")),
+            .contains(&encode_dentry_key(ROOT_INO, b"uploading-target.txt")),
         "active writer-local uploads must keep the serving dentry private"
     );
 
@@ -610,16 +634,13 @@ fn foreign_unlink_during_unpublished_local_uploading_preserves_writer_dentry() {
         parent: ROOT_INO,
         name: b"new-uploading-target.txt".to_vec(),
     }];
-    let current_regular_file_conflicts = RemoteApplyCoordinator::new(&pg)
+    let current_regular_file_conflicts = RemoteApplyCoordinator::new(&pg.local)
         .current_regular_file_overlay_conflicts_for_batch(&batch)
         .expect("collect current regular-file conflicts");
     assert!(
         current_regular_file_conflicts
             .dentry_keys
-            .contains(&PgMetaEngine::dentry_key(
-                ROOT_INO,
-                b"new-uploading-target.txt"
-            )),
+            .contains(&encode_dentry_key(ROOT_INO, b"new-uploading-target.txt")),
         "unpublished writer-local uploads must keep the serving dentry private"
     );
 
@@ -640,7 +661,7 @@ fn recent_flush_dentry_reconcile_applies_deferred_foreign_base_entry() {
         .expect("create local slot");
     let local_end = pg.local.get_counter("nextEventSeq").expect("local end");
     let overlay = pg.local_overlay_conflicts().expect("overlay conflicts");
-    let slot_key = PgMetaEngine::dentry_key(ROOT_INO, b"slot.txt");
+    let slot_key = encode_dentry_key(ROOT_INO, b"slot.txt");
     assert!(
         overlay.dentry_keys.contains(&slot_key),
         "local create should protect the serving dentry key"
@@ -686,7 +707,7 @@ fn recent_flush_dentry_reconcile_applies_deferred_foreign_base_entry() {
     );
 
     assert!(
-        RemoteApplyCoordinator::new(&pg)
+        RemoteApplyCoordinator::new(&pg.local)
             .reconcile_serving_dentries_from_base_with_overlay(
                 &HashSet::from([slot_key]),
                 &overlay_after_ack,
@@ -741,7 +762,7 @@ fn foreign_unready_add_entry_does_not_hide_visible_local_regular_file() {
     assert!(
         protected_overlay
             .dentry_keys
-            .contains(&PgMetaEngine::dentry_key(ROOT_INO, b"slot.txt")),
+            .contains(&encode_dentry_key(ROOT_INO, b"slot.txt")),
         "unready foreign regular-file dentry must be deferred until publish"
     );
     assert_eq!(
@@ -784,7 +805,7 @@ fn foreign_unready_add_entry_without_local_slot_becomes_visible_for_zero_converg
     assert!(
         !protected_overlay
             .dentry_keys
-            .contains(&PgMetaEngine::dentry_key(ROOT_INO, b"remote-draft.txt")),
+            .contains(&encode_dentry_key(ROOT_INO, b"remote-draft.txt")),
         "new unready remote dentry should not be deferred when no local serving path exists"
     );
 
@@ -1343,7 +1364,7 @@ fn lifecycle_publish_ready_without_overlay_still_protects_foreign_replay() {
     assert_eq!(lifecycle.state, InodeLifecycleState::PublishReady);
 
     assert!(
-        RemoteApplyCoordinator::new(&pg)
+        RemoteApplyCoordinator::new(&pg.local)
             .local_regular_file_state_needs_foreign_protection(file.ino)
             .expect("probe protection"),
         "publish-ready lifecycle rows represent local publication work even without chunk overlay rows"
@@ -1407,7 +1428,7 @@ fn stale_local_only_lifecycle_without_overlay_does_not_protect_committed_base_at
         current_attr.committed_content_epoch
     );
     assert!(
-        !RemoteApplyCoordinator::new(&pg)
+        !RemoteApplyCoordinator::new(&pg.local)
             .local_regular_file_state_needs_foreign_protection(file.ino)
             .expect("probe protection"),
         "a stale LocalOnly lifecycle row must not protect a Ready committed base attr without overlay"
@@ -1425,7 +1446,7 @@ fn attr_only_lifecycle_overlay_does_not_block_committed_base_payload_replay() {
     pg.set_attr(&local_attr).expect("set local attr overlay");
 
     assert!(
-        RemoteApplyCoordinator::new(&pg)
+        RemoteApplyCoordinator::new(&pg.local)
             .local_regular_file_state_needs_foreign_protection(file.ino)
             .expect("probe attr protection"),
         "local attr lifecycle must still protect the local attr overlay"
@@ -1437,7 +1458,7 @@ fn attr_only_lifecycle_overlay_does_not_block_committed_base_payload_replay() {
         "setup must not have local chunk overlay rows"
     );
 
-    let overlay = RemoteApplyCoordinator::new(&pg)
+    let overlay = RemoteApplyCoordinator::new(&pg.local)
         .current_regular_file_overlay_conflicts_for_batch(&[MetaEvent::SetAttr {
             attr: local_attr.clone(),
         }])
