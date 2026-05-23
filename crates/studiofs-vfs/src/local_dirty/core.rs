@@ -224,10 +224,11 @@ where
             // Dirty-chunk-slices path: persisted slice payloads can commit
             // directly as overlay SliceRecords, while buffered block snapshots
             // still validate against the final block geometry below.
-            let block_lengths_by_block_index: Vec<(u32, usize)> = persisted_blocks
-                .iter()
-                .map(|persisted| (persisted.block_index, persisted.len()))
-                .collect();
+            let block_lengths_by_block_index: std::collections::HashMap<u32, usize> =
+                persisted_blocks
+                    .iter()
+                    .map(|persisted| (persisted.block_index, persisted.len()))
+                    .collect();
             for (chunk_id, mut slices) in dirty_chunk_slices {
                 slices.sort_by_key(|slice| slice.order_key(chunk_id));
                 for slice in slices {
@@ -249,9 +250,7 @@ where
                         );
                         continue;
                     }
-                    let Some((_, block_len)) = block_lengths_by_block_index
-                        .iter()
-                        .find(|(block_index, _)| *block_index == slice.block_index)
+                    let Some(&block_len) = block_lengths_by_block_index.get(&slice.block_index)
                     else {
                         continue;
                     };
@@ -267,7 +266,7 @@ where
                             ),
                         )));
                     };
-                    if block_end > *block_len {
+                    if block_end > block_len {
                         return Err(crate::VfsError::Io(std::io::Error::new(
                             std::io::ErrorKind::InvalidInput,
                             format!(
