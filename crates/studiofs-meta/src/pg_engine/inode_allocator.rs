@@ -122,61 +122,62 @@ impl PgMetaEngine {
         let connect_timeout = Self::default_connect_timeout();
         let command_timeout = Self::default_command_timeout();
         Self::run_async_once(async move {
-            Self::with_postgres_client_timeout(
+            Self::with_postgres_client_timeout_once(
                 postgres_url,
                 connect_timeout,
                 command_timeout,
                 "reserve client slot",
-                move |client| async move {
-                    let mut client = client;
-                    let tx = client.transaction().await.map_err(|e| {
-                        MetaError::Storage(format!(
-                            "postgres tx failed: {}",
-                            Self::format_pg_error(e)
-                        ))
-                    })?;
-                    tx.execute(
-                        r#"
+                move |mut client| {
+                    Box::pin(async move {
+                        let tx = client.transaction().await.map_err(|e| {
+                            MetaError::Storage(format!(
+                                "postgres tx failed: {}",
+                                Self::format_pg_error(e)
+                            ))
+                        })?;
+                        tx.execute(
+                            r#"
                         INSERT INTO counters (vol, name, value)
                         VALUES ($1, $2, 0)
                         ON CONFLICT (vol, name) DO NOTHING
                         "#,
-                        &[&volume_id, &PG_NEXT_CLIENT_SLOT_COUNTER],
-                    )
-                    .await
-                    .map_err(|e| {
-                        MetaError::Storage(format!(
-                            "postgres slot seed failed: {}",
-                            Self::format_pg_error(e)
-                        ))
-                    })?;
-                    let row = tx
-                        .query_one(
-                            r#"
-                            UPDATE counters
-                            SET value = value + 1
-                            WHERE vol = $1 AND name = $2
-                            RETURNING value - 1
-                            "#,
                             &[&volume_id, &PG_NEXT_CLIENT_SLOT_COUNTER],
                         )
                         .await
                         .map_err(|e| {
                             MetaError::Storage(format!(
-                                "postgres slot reserve failed: {}",
+                                "postgres slot seed failed: {}",
                                 Self::format_pg_error(e)
                             ))
                         })?;
-                    tx.commit().await.map_err(|e| {
-                        MetaError::Storage(format!(
-                            "postgres slot commit failed: {}",
-                            Self::format_pg_error(e)
-                        ))
-                    })?;
+                        let row = tx
+                            .query_one(
+                                r#"
+                            UPDATE counters
+                            SET value = value + 1
+                            WHERE vol = $1 AND name = $2
+                            RETURNING value - 1
+                            "#,
+                                &[&volume_id, &PG_NEXT_CLIENT_SLOT_COUNTER],
+                            )
+                            .await
+                            .map_err(|e| {
+                                MetaError::Storage(format!(
+                                    "postgres slot reserve failed: {}",
+                                    Self::format_pg_error(e)
+                                ))
+                            })?;
+                        tx.commit().await.map_err(|e| {
+                            MetaError::Storage(format!(
+                                "postgres slot commit failed: {}",
+                                Self::format_pg_error(e)
+                            ))
+                        })?;
 
-                    let slot: i64 = row.get(0);
-                    u64::try_from(slot).map_err(|_| {
-                        MetaError::Storage(format!("invalid negative pg client slot: {slot}"))
+                        let slot: i64 = row.get(0);
+                        u64::try_from(slot).map_err(|_| {
+                            MetaError::Storage(format!("invalid negative pg client slot: {slot}"))
+                        })
                     })
                 },
             )
@@ -342,20 +343,17 @@ impl PgMetaEngine {
             return override_result.map_err(MetaError::Storage);
         }
 
-        let postgres_url = self.postgres_url.clone();
+        let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
-        let connect_timeout = self.connect_timeout;
         let command_timeout = self.command_timeout;
         let initial_next_hint = initial_next_hint.max(ROOT_INO + 1);
         let window_size = PG_INODE_WINDOW_SIZE.max(minimum_window_size);
         Self::run_async_once(async move {
             Self::with_postgres_client_timeout(
-                postgres_url,
-                connect_timeout,
+                command_pool,
                 command_timeout,
                 "reserve inode window",
-                move |client| async move {
-                    let mut client = client;
+                move |client| Box::pin(async move {
                     let tx = client.transaction().await.map_err(|e| {
                         MetaError::Storage(format!(
                             "postgres tx failed: {}",
@@ -438,7 +436,7 @@ impl PgMetaEngine {
                         next: start,
                         end,
                     })
-                },
+                }),
             )
             .await
         })
@@ -755,23 +753,23 @@ impl PgMetaEngine {
             return Ok(value);
         }
 
-        let postgres_url = self.postgres_url.clone();
-        let connect_timeout = self.connect_timeout;
+        let command_pool = self.command_pool.clone();
         let command_timeout = self.command_timeout;
         Self::run_async_once(async move {
             Self::with_postgres_client_timeout(
-                postgres_url,
-                connect_timeout,
+                command_pool,
                 command_timeout,
                 "refresh local id headroom",
-                move |client| async move {
-                    client.simple_query("SELECT 1").await.map_err(|e| {
-                        MetaError::Storage(format!(
-                            "postgres local id headroom refresh check failed: {}",
-                            Self::format_pg_error(e)
-                        ))
-                    })?;
-                    Ok(true)
+                move |client| {
+                    Box::pin(async move {
+                        client.simple_query("SELECT 1").await.map_err(|e| {
+                            MetaError::Storage(format!(
+                                "postgres local id headroom refresh check failed: {}",
+                                Self::format_pg_error(e)
+                            ))
+                        })?;
+                        Ok(true)
+                    })
                 },
             )
             .await

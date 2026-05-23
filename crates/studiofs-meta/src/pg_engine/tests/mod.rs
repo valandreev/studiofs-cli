@@ -1,6 +1,6 @@
 use super::*;
 use crate::pg_dsn::ensure_studiofs_database;
-use crate::pg_engine::runtime::PgRemoteRuntime;
+use crate::pg_engine::runtime::{PgConnectionPool, PgRemoteRuntime};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use tempfile::tempdir;
@@ -491,6 +491,11 @@ pub(crate) fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
         flush_ops_threshold: 8,
         connect_timeout: Duration::from_millis(50),
         command_timeout: Duration::from_millis(50),
+        command_pool: Arc::new(PgConnectionPool::new(
+            "postgres://127.0.0.1:1/studiofs".to_string(),
+            Duration::from_millis(50),
+            Duration::from_millis(50),
+        )),
         inflight_replication_ops: AtomicU32::new(0),
         pending_state: Mutex::new(PendingReplicationState::default()),
         remote_runtime: PgRemoteRuntime::new("studiofs-pg-remote-runtime-test")

@@ -85,29 +85,29 @@ impl PgMetaEngine {
     }
 
     pub(super) fn load_pg_global_snapshot_pins(&self) -> MetaResult<HashSet<u64>> {
-        let postgres_url = self.postgres_url.clone();
+        let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
-        let connect_timeout = self.connect_timeout;
         let command_timeout = self.command_timeout;
         let rows = self.run_async(async move {
             Self::with_postgres_client_timeout(
-                postgres_url,
-                connect_timeout,
+                command_pool,
                 command_timeout,
                 "janitor snapshot pin query",
-                move |client| async move {
-                    client
-                        .query(
-                            "SELECT pinned_object_ids FROM snapshots WHERE vol = $1",
-                            &[&volume_id],
-                        )
-                        .await
-                        .map_err(|e| {
-                            MetaError::Storage(format!(
-                                "postgres janitor snapshot pin query failed: {}",
-                                Self::format_pg_error(e)
-                            ))
-                        })
+                move |client| {
+                    Box::pin(async move {
+                        client
+                            .query(
+                                "SELECT pinned_object_ids FROM snapshots WHERE vol = $1",
+                                &[&volume_id],
+                            )
+                            .await
+                            .map_err(|e| {
+                                MetaError::Storage(format!(
+                                    "postgres janitor snapshot pin query failed: {}",
+                                    Self::format_pg_error(e)
+                                ))
+                            })
+                    })
                 },
             )
             .await

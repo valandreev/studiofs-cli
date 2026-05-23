@@ -24,19 +24,16 @@ impl MetaEngineCore for PgMetaEngine {
         lease_ttl: Duration,
     ) -> MetaResult<FileLockLeaseAcquireOutcome> {
         self.ensure_lock_workers_started()?;
-        let postgres_url = self.postgres_url.clone();
+        let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
         let client_id = self.client_id.clone();
-        let connect_timeout = self.connect_timeout;
         let command_timeout = self.command_timeout;
         let outcome = self.run_async(async move {
             Self::with_postgres_client_timeout(
-                postgres_url,
-                connect_timeout,
+                command_pool,
                 command_timeout,
                 "acquire file lock lease",
-                move |client| async move {
-                    let mut client = client;
+                move |client| Box::pin(async move {
                     let tx = client.transaction().await.map_err(|e| {
                         MetaError::Storage(format!(
                             "postgres file lock acquire begin tx failed: {}",
@@ -203,7 +200,7 @@ impl MetaEngineCore for PgMetaEngine {
                         })?)
                     };
                     Ok(outcome)
-                },
+                }),
             )
             .await
         })?;
@@ -220,19 +217,16 @@ impl MetaEngineCore for PgMetaEngine {
     }
 
     fn release_file_lock_lease(&self, ino: Ino) -> MetaResult<FileLockLeaseReleaseOutcome> {
-        let postgres_url = self.postgres_url.clone();
+        let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
         let client_id = self.client_id.clone();
-        let connect_timeout = self.connect_timeout;
         let command_timeout = self.command_timeout;
         let outcome = self.run_async(async move {
             Self::with_postgres_client_timeout(
-                postgres_url,
-                connect_timeout,
+                command_pool,
                 command_timeout,
                 "release file lock lease",
-                move |client| async move {
-                    let mut client = client;
+                move |client| Box::pin(async move {
                     let tx = client.transaction().await.map_err(|e| {
                         MetaError::Storage(format!(
                             "postgres file lock release begin tx failed: {}",
@@ -356,7 +350,7 @@ impl MetaEngineCore for PgMetaEngine {
                         ))
                     })?;
                     Ok(FileLockLeaseReleaseOutcome::Released(next))
-                },
+                }),
             )
             .await
         })?;
@@ -376,19 +370,16 @@ impl MetaEngineCore for PgMetaEngine {
         lease_ttl: Duration,
     ) -> MetaResult<FileLockLeaseRenewOutcome> {
         self.ensure_lock_workers_started()?;
-        let postgres_url = self.postgres_url.clone();
+        let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
         let client_id = self.client_id.clone();
-        let connect_timeout = self.connect_timeout;
         let command_timeout = self.command_timeout;
         let outcome = self.run_async(async move {
             Self::with_postgres_client_timeout(
-                postgres_url,
-                connect_timeout,
+                command_pool,
                 command_timeout,
                 "renew file lock lease",
-                move |client| async move {
-                    let mut client = client;
+                move |client| Box::pin(async move {
                     let tx = client.transaction().await.map_err(|e| {
                         MetaError::Storage(format!(
                             "postgres file lock renew begin tx failed: {}",
@@ -488,7 +479,7 @@ impl MetaEngineCore for PgMetaEngine {
                         ))
                     })?;
                     Ok(FileLockLeaseRenewOutcome::Renewed(current))
-                },
+                }),
             )
             .await
         })?;
@@ -506,18 +497,19 @@ impl MetaEngineCore for PgMetaEngine {
     }
 
     fn current_file_lock_lease(&self, ino: Ino) -> MetaResult<Option<FileLockLease>> {
-        let postgres_url = self.postgres_url.clone();
+        let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
-        let connect_timeout = self.connect_timeout;
         let command_timeout = self.command_timeout;
         let snapshot = self.run_async(async move {
             Self::with_postgres_client_timeout(
-                postgres_url,
-                connect_timeout,
+                command_pool,
                 command_timeout,
                 "read current file lock lease",
-                move |client| async move {
-                    Self::current_file_lock_lease_with_client(&client, volume_id, ino).await
+                move |client| {
+                    Box::pin(async move {
+                        let client: &tokio_postgres::Client = client;
+                        Self::current_file_lock_lease_with_client(client, volume_id, ino).await
+                    })
                 },
             )
             .await

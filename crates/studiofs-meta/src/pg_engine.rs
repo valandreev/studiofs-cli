@@ -133,6 +133,7 @@ pub struct PgMetaEngine {
     flush_ops_threshold: u32,
     connect_timeout: Duration,
     command_timeout: Duration,
+    command_pool: Arc<runtime::PgConnectionPool>,
     inflight_replication_ops: AtomicU32,
     pending_state: Mutex<PendingReplicationState>,
     remote_runtime: runtime::PgRemoteRuntime,
@@ -339,7 +340,7 @@ impl PgMetaEngine {
 
         let postgres_url = postgres_url.to_string();
         Self::run_async_once(async move {
-            Self::with_postgres_client_timeout(
+            Self::with_postgres_client_timeout_once(
                 postgres_url,
                 connect_timeout,
                 command_timeout,
@@ -467,7 +468,7 @@ impl PgMetaEngine {
         let poll_wakeup = Arc::new((Mutex::new(false), Condvar::new()));
         let engine = Arc::new(Self {
             local,
-            postgres_url: pg.url,
+            postgres_url: pg.url.clone(),
             volume_id: pg.volume_id,
             client_id: format!("client-slot:{client_slot}"),
             client_slot_plus_one: AtomicU64::new(client_slot.saturating_add(1)),
@@ -481,6 +482,11 @@ impl PgMetaEngine {
             flush_ops_threshold,
             connect_timeout,
             command_timeout,
+            command_pool: Arc::new(runtime::PgConnectionPool::new(
+                pg.url.clone(),
+                connect_timeout,
+                connect_timeout,
+            )),
             inflight_replication_ops: AtomicU32::new(0),
             pending_state: Mutex::new(PendingReplicationState::default()),
             remote_runtime: runtime::PgRemoteRuntime::new("studiofs-pg-remote-runtime")?,
@@ -547,29 +553,32 @@ impl PgMetaEngine {
     }
 
     fn fetch_remote_uuid(&self, volume_id: i64) -> MetaResult<String> {
-        let postgres_url = self.postgres_url.clone();
-        let connect_timeout = self.connect_timeout;
+        let command_pool = self.command_pool.clone();
         let command_timeout = self.command_timeout;
         self.run_async(async move {
             Self::with_postgres_client_timeout(
-                postgres_url,
-                connect_timeout,
+                command_pool,
                 command_timeout,
                 "fetch volume uuid",
-                move |client| async move {
-                    let row = client
-                        .query_opt("SELECT uuid FROM volumes WHERE vol = $1", &[&volume_id])
-                        .await
-                        .map_err(|e| {
+                move |client| {
+                    Box::pin(async move {
+                        let row = client
+                            .query_opt("SELECT uuid FROM volumes WHERE vol = $1", &[&volume_id])
+                            .await
+                            .map_err(|e| {
+                                MetaError::Storage(format!(
+                                    "postgres volume uuid query failed: {}",
+                                    Self::format_pg_error(e)
+                                ))
+                            })?;
+                        let row = row.ok_or_else(|| {
                             MetaError::Storage(format!(
-                                "postgres volume uuid query failed: {}",
-                                Self::format_pg_error(e)
+                                "volume id {} not found in postgres",
+                                volume_id
                             ))
                         })?;
-                    let row = row.ok_or_else(|| {
-                        MetaError::Storage(format!("volume id {} not found in postgres", volume_id))
-                    })?;
-                    Ok(row.get::<_, String>(0))
+                        Ok(row.get::<_, String>(0))
+                    })
                 },
             )
             .await
