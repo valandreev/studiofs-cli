@@ -18,6 +18,16 @@ This file stores detailed project instructions that do not belong in the root `A
 ## Rust conventions
 
 - Use Rust 2024 conventions.
+- Workspace lint policy lives in the root `[workspace.lints]` tables in
+  `Cargo.toml`. Every workspace member manifest must opt in with:
+  ```toml
+  [lints]
+  workspace = true
+  ```
+- Keep the shared lint baseline conservative and low-noise. Do not turn on
+  broad Clippy groups such as `all`, `pedantic`, `unwrap_used`, or
+  `expect_used` across the workspace unless that cleanup is planned and
+  validated separately.
 - Prefer domain errors with `thiserror` for library code:
   - `pub enum <ErrorName> { ... }`
 - Use `Result<T, E>` for recoverable failures, avoid panics in library logic.

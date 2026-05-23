@@ -56,6 +56,27 @@ advisory on a `windows-sys` crate) are surfaced in the same audit run.
 
 ---
 
+## Workspace Lint Policy
+
+StudioFS uses Cargo workspace lint inheritance. The root `Cargo.toml` owns the
+shared lint baseline under `[workspace.lints]`; each member crate must opt in
+with a root-level manifest table:
+
+```toml
+[lints]
+workspace = true
+```
+
+Do not use a `[package] lints.workspace = true` entry. Cargo's supported member
+syntax is the separate `[lints]` table above.
+
+The baseline is intentionally conservative. New lints should start as warnings
+only when they are low-noise across the workspace. Large hygiene migrations
+such as broad Clippy groups, `unwrap_used`, or `expect_used` need their own
+issue and focused cleanup plan rather than being folded into unrelated PRs.
+
+---
+
 ## CI Ownership
 
 ### Manual PR verification
@@ -261,6 +282,7 @@ Types: `feat`, `fix`, `docs`, `refactor`, `test`, `perf`, `ci`
 - [ ] `cargo fmt --all` applied
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings` passes
 - [ ] `cargo test --workspace --all-targets -- --nocapture` passes
+- [ ] New crates inherit workspace lints with `[lints] workspace = true`
 - [ ] `cargo machete --with-metadata` reviewed when direct dependencies change; false positives belong in `[package.metadata.cargo-machete].ignored` with a short justification comment near the manifest entry
 - [ ] New or changed platform-specific code explains how it is verified (see rules above)
 - [ ] New public items have `///` doc comments

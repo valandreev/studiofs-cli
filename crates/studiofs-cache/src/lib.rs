@@ -230,7 +230,6 @@ fn open_current_local_payload_backend_budgeted(
     payload_write_mode: runtime::LocalPayloadWriteMode,
 ) -> Result<Arc<dyn local::LocalPayloadBackend>, OpenLocalPayloadBackendError> {
     let volume_uuid = local::derive_backend_volume_uuid(volume_uuid);
-    let mut last_conflict: Option<Box<runtime::LocalPayloadBackendOpenError>> = None;
 
     for attempt in 0..=LOCAL_PAYLOAD_OPEN_LOCK_RETRY_ATTEMPTS {
         let config = runtime::LocalPayloadBackendConfig {
@@ -248,7 +247,6 @@ fn open_current_local_payload_backend_budgeted(
                 if source.is_transient_open_lock_conflict()
                     && attempt < LOCAL_PAYLOAD_OPEN_LOCK_RETRY_ATTEMPTS =>
             {
-                last_conflict = Some(Box::new(source));
                 std::thread::sleep(LOCAL_PAYLOAD_OPEN_LOCK_RETRY_DELAY);
             }
             Err(source) => {
@@ -260,12 +258,7 @@ fn open_current_local_payload_backend_budgeted(
         }
     }
 
-    let source =
-        last_conflict.expect("local payload open loop must capture the final transient conflict");
-    Err(OpenLocalPayloadBackendError::OpenLocalPayloadBackend {
-        cache_root: cache_root_display.to_owned(),
-        source,
-    })
+    unreachable!("local payload open loop returns on success or final failure")
 }
 
 /// Open the current local cache backend for a cache root.

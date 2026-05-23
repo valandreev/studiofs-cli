@@ -241,13 +241,18 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo check --workspace
 ```
 
+Workspace lint policy is inherited from the root `[workspace.lints]` tables.
+Member crates opt in with `[lints] workspace = true`; keep new shared lints
+low-noise and stage broad hygiene migrations separately.
+
 Fast test suite:
 
 ```bash
 cargo test --workspace --all-targets -- --nocapture
 ```
 
-CI runs four jobs on every push and PR — see
+CI verification is manual-only: RWX covers Linux quality/Linux lanes, and
+GitHub Actions remains available for hosted macOS and Windows lanes. See
 [`.github/workflows/rust.yml`](.github/workflows/rust.yml),
 [`docs/development.md`](docs/development.md), and
 [`docs/contributing.md`](docs/contributing.md) for the full verification
