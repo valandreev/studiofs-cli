@@ -864,6 +864,42 @@ fn vfs_facade_does_not_inline_startup_replay_and_read_context_internals() {
 }
 
 #[test]
+fn local_dirty_facade_splits_ports_adapters_core_and_test_support() {
+    for path in [
+        "crates/studiofs-vfs/src/local_dirty/ports.rs",
+        "crates/studiofs-vfs/src/local_dirty/core.rs",
+        "crates/studiofs-vfs/src/local_dirty/adapters.rs",
+        "crates/studiofs-vfs/src/local_dirty/test_support.rs",
+    ] {
+        assert!(
+            repo_root().join(path).is_file(),
+            "local_dirty should keep focused implementation surface in {path}"
+        );
+    }
+
+    let hits = collect_term_hits(
+        "crates/studiofs-vfs/src/local_dirty.rs",
+        &[
+            "trait BlockIdAllocatorPort",
+            "trait LocalPayloadWriterPort",
+            "trait OverlayCommitPort",
+            "trait UploadSubmissionPort",
+            "trait DrainCommitObserverPort",
+            "struct TestLocalPayloadWriter",
+            "struct TestOverlayCommitter",
+            "struct TestUploadSubmitter",
+            "struct TestDrainObserver",
+        ],
+    );
+
+    assert!(
+        hits.is_empty(),
+        "local_dirty.rs should stay a facade and keep ports/adapters/test helpers in focused modules:\n{}",
+        hits.join("\n")
+    );
+}
+
+#[test]
 fn prefetch_helper_name_drops_planner_wording() {
     let hits = collect_term_hits(
         "crates/studiofs-vfs/src/vfs/prefetch.rs",
