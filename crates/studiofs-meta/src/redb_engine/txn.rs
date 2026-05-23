@@ -274,10 +274,13 @@ impl RedbMetaEngine {
         T: ReadableTable<&'static [u8], &'static [u8]>,
     {
         let prefix = regular_file_chunk_prefix(ino);
-        for row in table
-            .range(prefix.as_ref()..)
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-        {
+        let range_end = prefix_successor(&prefix);
+        let rows = match range_end.as_ref() {
+            Some(end) => table.range(prefix.as_ref()..end.as_ref()),
+            None => table.range(prefix.as_ref()..),
+        }
+        .map_err(|e| MetaError::Storage(e.to_string()))?;
+        for row in rows {
             let (key, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
             if !key.value().starts_with(prefix.as_ref()) {
                 break;
@@ -722,11 +725,14 @@ impl RedbMetaEngine {
             .open_table(DENTRY_TOMBSTONES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         let prefix = dentry_prefix(parent);
+        let range_end = prefix_successor(&prefix);
 
-        for row in current
-            .range(prefix.as_ref()..)
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-        {
+        let current_rows = match range_end.as_ref() {
+            Some(end) => current.range(prefix.as_ref()..end.as_ref()),
+            None => current.range(prefix.as_ref()..),
+        }
+        .map_err(|e| MetaError::Storage(e.to_string()))?;
+        for row in current_rows {
             let (key, _) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
             if !key.value().starts_with(prefix.as_ref()) {
                 break;
@@ -740,10 +746,12 @@ impl RedbMetaEngine {
             }
         }
 
-        for row in base
-            .range(prefix.as_ref()..)
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-        {
+        let base_rows = match range_end.as_ref() {
+            Some(end) => base.range(prefix.as_ref()..end.as_ref()),
+            None => base.range(prefix.as_ref()..),
+        }
+        .map_err(|e| MetaError::Storage(e.to_string()))?;
+        for row in base_rows {
             let (key, _) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
             if !key.value().starts_with(prefix.as_ref()) {
                 break;
@@ -826,9 +834,12 @@ impl RedbMetaEngine {
         let table = txn
             .open_table(table_def)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let range = table
-            .range(prefix.as_ref()..)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let range_end = prefix_successor(&prefix);
+        let range = match range_end.as_ref() {
+            Some(end) => table.range(prefix.as_ref()..end.as_ref()),
+            None => table.range(prefix.as_ref()..),
+        }
+        .map_err(|e| MetaError::Storage(e.to_string()))?;
         let mut keys = Vec::new();
         for item in range {
             let (k, _v) = item.map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -850,9 +861,12 @@ impl RedbMetaEngine {
         let table = txn
             .open_table(table_def)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let range = table
-            .range(prefix.as_ref()..)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let range_end = prefix_successor(&prefix);
+        let range = match range_end.as_ref() {
+            Some(end) => table.range(prefix.as_ref()..end.as_ref()),
+            None => table.range(prefix.as_ref()..),
+        }
+        .map_err(|e| MetaError::Storage(e.to_string()))?;
         let mut keys = Vec::new();
         for item in range {
             let (k, _v) = item.map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -874,9 +888,12 @@ impl RedbMetaEngine {
         let table = txn
             .open_table(table_def)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let range = table
-            .range(prefix.as_ref()..)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let range_end = prefix_successor(&prefix);
+        let range = match range_end.as_ref() {
+            Some(end) => table.range(prefix.as_ref()..end.as_ref()),
+            None => table.range(prefix.as_ref()..),
+        }
+        .map_err(|e| MetaError::Storage(e.to_string()))?;
         let mut keys = Vec::new();
         for item in range {
             let (k, _v) = item.map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -1566,9 +1583,12 @@ impl RedbMetaEngine {
                 .open_table(XATTRS_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
             let prefix = xattr_prefix(ino);
-            let range = txn_read
-                .range(prefix.as_ref()..)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let range_end = prefix_successor(&prefix);
+            let range = match range_end.as_ref() {
+                Some(end) => txn_read.range(prefix.as_ref()..end.as_ref()),
+                None => txn_read.range(prefix.as_ref()..),
+            }
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
             let mut keys = Vec::new();
             for item in range {
                 let (k, _v) = item.map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -1594,9 +1614,12 @@ impl RedbMetaEngine {
                 .open_table(BASE_XATTRS_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
             let prefix = xattr_prefix(ino);
-            let range = txn_read
-                .range(prefix.as_ref()..)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let range_end = prefix_successor(&prefix);
+            let range = match range_end.as_ref() {
+                Some(end) => txn_read.range(prefix.as_ref()..end.as_ref()),
+                None => txn_read.range(prefix.as_ref()..),
+            }
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
             let mut keys = Vec::new();
             for item in range {
                 let (k, _v) = item.map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -1622,9 +1645,12 @@ impl RedbMetaEngine {
                 .open_table(ACL_RULES_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
             let prefix = acl_rule_prefix(ino);
-            let range = table
-                .range(prefix.as_ref()..)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let range_end = prefix_successor(&prefix);
+            let range = match range_end.as_ref() {
+                Some(end) => table.range(prefix.as_ref()..end.as_ref()),
+                None => table.range(prefix.as_ref()..),
+            }
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
             let mut keys = Vec::new();
             for item in range {
                 let (k, _v) = item.map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -1651,9 +1677,12 @@ impl RedbMetaEngine {
                 .open_table(BASE_ACL_RULES_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
             let prefix = acl_rule_prefix(ino);
-            let range = table
-                .range(prefix.as_ref()..)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let range_end = prefix_successor(&prefix);
+            let range = match range_end.as_ref() {
+                Some(end) => table.range(prefix.as_ref()..end.as_ref()),
+                None => table.range(prefix.as_ref()..),
+            }
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
             let mut keys = Vec::new();
             for item in range {
                 let (k, _v) = item.map_err(|e| MetaError::Storage(e.to_string()))?;
