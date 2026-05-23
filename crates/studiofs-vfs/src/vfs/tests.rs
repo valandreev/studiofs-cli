@@ -1630,6 +1630,14 @@ fn startup_replay_removes_orphan_dirty_payloads_and_clears_pending_evictions() {
     vfs.local_payload_backend()
         .sync_data()
         .expect("sync orphan dirty payload");
+    vfs.cache_upload_hot_batch(vec![studiofs_cache::local::LocalPayloadPut {
+        object_id,
+        data: Bytes::from_static(b"orphan-dirty-payload"),
+        evictable: false,
+    }]);
+    vfs.cached_store
+        .link_upload_stage_batch(&[object_id])
+        .expect("seed stale dirty upload-stage hardlink");
     vfs.state.upload.pending_evictions.lock().insert(object_id);
 
     assert!(
@@ -1666,6 +1674,16 @@ fn startup_replay_removes_orphan_dirty_payloads_and_clears_pending_evictions() {
             .lock()
             .contains(&object_id),
         "startup replay should clear pending eviction bookkeeping for removed orphan"
+    );
+    assert!(
+        vfs.cached_store().get_hot_upload(object_id).is_none(),
+        "startup replay should clear stale hot-upload cache entries for removed orphan"
+    );
+    assert!(
+        vfs.cached_store()
+            .get_staged_for_upload(object_id)
+            .is_none(),
+        "startup replay should clear stale upload-stage links for removed orphan"
     );
     assert_eq!(
         vfs.state

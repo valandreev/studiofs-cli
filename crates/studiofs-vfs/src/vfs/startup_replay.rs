@@ -16,8 +16,10 @@ pub(super) struct StartupReplayCoordinator<'a> {
     pending_catalog: PendingUploadCatalog,
     dirty_set: HashSet<u64>,
     recovered_dirty_object_ids: HashSet<u64>,
+    recovered_dirty_object_bytes: HashMap<u64, u64>,
     quarantined_inodes: HashSet<Ino>,
     quarantined_object_ids: HashSet<u64>,
+    removed_orphan_dirty_object_ids: HashSet<u64>,
     replay_ops: Vec<(u64, u64, u64, u64)>,
     live_extents: HashMap<(Ino, u32), ExtentRecordId>,
     pending_epoch_finalizations: Vec<(Ino, u64)>,
@@ -35,6 +37,7 @@ pub(super) struct StartupReplayCoordinator<'a> {
 struct StartupGraphObject {
     block_index: u32,
     object_id: u64,
+    payload_len: u64,
     absolute_offset: u64,
 }
 
@@ -49,8 +52,10 @@ impl<'a> StartupReplayCoordinator<'a> {
                 .into_iter()
                 .collect(),
             recovered_dirty_object_ids: HashSet::new(),
+            recovered_dirty_object_bytes: HashMap::new(),
             quarantined_inodes: HashSet::new(),
             quarantined_object_ids: HashSet::new(),
+            removed_orphan_dirty_object_ids: HashSet::new(),
             replay_ops: Vec::new(),
             live_extents: HashMap::new(),
             pending_epoch_finalizations: Vec::new(),
@@ -168,6 +173,7 @@ impl<'a> StartupReplayCoordinator<'a> {
             objects.push(StartupGraphObject {
                 block_index: block_index_from_offset(absolute_offset, self.vfs.block_size),
                 object_id: block.object_id,
+                payload_len: u64::from(block.offset).saturating_add(u64::from(block.length)),
                 absolute_offset,
             });
         }
@@ -226,13 +232,22 @@ impl<'a> StartupReplayCoordinator<'a> {
         if self.take_dirty_object(graph_object.object_id) {
             self.recovered_dirty_object_ids
                 .insert(graph_object.object_id);
+            self.record_recovered_object_bytes(graph_object);
             self.record_replayed_graph_object(ino, graph_object, content_epoch);
         } else if self
             .recovered_dirty_object_ids
             .contains(&graph_object.object_id)
         {
+            self.record_recovered_object_bytes(graph_object);
             self.record_recovered_live_extent(ino, graph_object, content_epoch);
         }
+    }
+
+    fn record_recovered_object_bytes(&mut self, graph_object: &StartupGraphObject) {
+        self.recovered_dirty_object_bytes
+            .entry(graph_object.object_id)
+            .and_modify(|current| *current = (*current).max(graph_object.payload_len))
+            .or_insert(graph_object.payload_len);
     }
 
     fn record_recovered_live_extent(
@@ -467,16 +482,27 @@ impl<'a> StartupReplayCoordinator<'a> {
         self.orphan_dirty_payloads_removed = self
             .orphan_dirty_payloads_removed
             .saturating_add(orphan_count);
-        for object_id in &self.dirty_set {
+        let orphan_object_ids: Vec<_> = self.dirty_set.iter().copied().collect();
+        self.removed_orphan_dirty_object_ids
+            .extend(orphan_object_ids.iter().copied());
+        for object_id in &orphan_object_ids {
             warn!(
                 object_id,
                 "removing orphan dirty payload object without metadata reference"
             );
+        }
+        self.vfs
+            .cached_store
+            .remove_hot_upload_batch(&orphan_object_ids);
+        self.vfs
+            .cached_store
+            .remove_staged_upload_batch(&orphan_object_ids);
+        for object_id in &orphan_object_ids {
             self.vfs.local_payload_backend.remove(*object_id);
         }
         {
             let mut pending_evictions = self.vfs.state.upload.pending_evictions.lock();
-            for object_id in &self.dirty_set {
+            for object_id in &orphan_object_ids {
                 pending_evictions.remove(object_id);
             }
         }
@@ -486,9 +512,10 @@ impl<'a> StartupReplayCoordinator<'a> {
             .upload_canceled_stale
             .fetch_add(orphan_count, Ordering::Relaxed);
         info!(
-            orphan_dirty_payloads = self.dirty_set.len(),
+            orphan_dirty_payloads = orphan_object_ids.len(),
             "startup cleanup removed orphan dirty local backend entries"
         );
+        self.dirty_set.clear();
     }
 
     fn cleanup_unreferenced_local_payloads(
@@ -511,6 +538,7 @@ impl<'a> StartupReplayCoordinator<'a> {
                 !reachable_object_ids.contains(object_id)
                     && !protected_object_ids.contains(object_id)
                     && !self.quarantined_object_ids.contains(object_id)
+                    && !self.removed_orphan_dirty_object_ids.contains(object_id)
             })
             .collect();
         if stale_object_ids.is_empty() {
@@ -579,12 +607,14 @@ impl<'a> StartupReplayCoordinator<'a> {
             .collect();
         replayed_object_ids.sort_unstable();
         replayed_object_ids.dedup();
-        let replayed_bytes = replayed_object_ids
-            .iter()
-            .filter_map(|object_id| self.vfs.local_payload_backend.object_stats(*object_id))
-            .fold(0_u64, |total, stats| {
-                total.saturating_add(stats.payload_len)
-            });
+        let replayed_bytes = replayed_object_ids.iter().fold(0_u64, |total, object_id| {
+            total.saturating_add(
+                self.recovered_dirty_object_bytes
+                    .get(object_id)
+                    .copied()
+                    .unwrap_or(0),
+            )
+        });
         let replayed_epochs: BTreeSet<_> = self
             .replay_ops
             .iter()
