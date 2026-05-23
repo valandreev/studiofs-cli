@@ -1,14 +1,14 @@
 use super::{
-    AccessLevel, AtomicU64, Ino, MetaError, MetaResult, Mutex, Ordering, ROOT_INO, StudioVfs,
-    VfsError, VfsResult, run_meta,
+    AccessLevel, AtomicU64, Ino, MetaError, MetaResult, Ordering, ROOT_INO, StudioVfs, VfsError,
+    VfsResult, run_meta,
 };
-use crate::AclMeta;
+use crate::{AclMeta, LockTier, OrderedMutex};
 use std::collections::HashMap;
 
 /// Shared state used by ACL computations, including caches and cache invalidation epochs.
 pub(super) struct AclState {
     /// Cache of effective ACL values computed per inode.
-    pub(super) effective_acl_cache: Mutex<HashMap<Ino, EffectiveAclCacheEntry>>,
+    pub(super) effective_acl_cache: OrderedMutex<HashMap<Ino, EffectiveAclCacheEntry>>,
     /// Epoch counter invalidating access-level cache entries when ACL entries change.
     pub(super) acl_epoch: AtomicU64,
     /// Epoch counter invalidating access-level cache entries when namespace ACL policy changes.
@@ -19,7 +19,7 @@ impl AclState {
     /// Creates a fresh ACL state with empty cache and zeroed epochs.
     pub(super) fn new() -> Self {
         Self {
-            effective_acl_cache: Mutex::new(HashMap::new()),
+            effective_acl_cache: OrderedMutex::new(HashMap::new(), LockTier::Acl),
             acl_epoch: AtomicU64::new(0),
             acl_namespace_epoch: AtomicU64::new(0),
         }

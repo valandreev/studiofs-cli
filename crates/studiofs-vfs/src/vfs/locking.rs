@@ -1,4 +1,3 @@
-use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,6 +7,7 @@ use studiofs_meta::{FileLockLeaseAcquireOutcome, HardLockKind};
 use super::{StudioVfs, VfsError, VfsResult};
 use crate::VfsMeta;
 use crate::runtime::run_meta;
+use crate::{LockTier, OrderedMutex};
 
 #[derive(Clone)]
 pub(super) struct DistributedFlock {
@@ -42,16 +42,16 @@ struct PendingFlockAcquire {
 }
 
 pub(super) struct FileLockState {
-    pub(super) file_locks: Mutex<HashMap<Ino, FileLock>>,
-    pending_acquires: Mutex<HashMap<Ino, PendingFlockAcquire>>,
+    pub(super) file_locks: OrderedMutex<HashMap<Ino, FileLock>>,
+    pending_acquires: OrderedMutex<HashMap<Ino, PendingFlockAcquire>>,
     pub(super) lock_notify: tokio::sync::Notify,
 }
 
 impl FileLockState {
     pub(super) fn new() -> Self {
         Self {
-            file_locks: Mutex::new(HashMap::new()),
-            pending_acquires: Mutex::new(HashMap::new()),
+            file_locks: OrderedMutex::new(HashMap::new(), LockTier::FileLock),
+            pending_acquires: OrderedMutex::new(HashMap::new(), LockTier::FileLock),
             lock_notify: tokio::sync::Notify::new(),
         }
     }

@@ -1,5 +1,6 @@
 use super::*;
 use crate::utils::{IntervalRange, trim_range_to_available_len};
+use crate::{LockTier, OrderedMutex};
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::time::{Duration, Instant};
 
@@ -438,10 +439,11 @@ pub(super) struct LocalSyncGroupState {
 }
 
 pub(super) struct LocalDirtyState {
-    pub(super) pending_payloads: Mutex<std::collections::HashMap<(Ino, u32), PendingPayload>>,
+    pub(super) pending_payloads:
+        OrderedMutex<std::collections::HashMap<(Ino, u32), PendingPayload>>,
     pub(super) pending_payload_indexes:
-        Mutex<std::collections::HashMap<Ino, std::collections::BTreeSet<u32>>>,
-    pending_chunk_slices: Mutex<
+        OrderedMutex<std::collections::HashMap<Ino, std::collections::BTreeSet<u32>>>,
+    pending_chunk_slices: OrderedMutex<
         std::collections::HashMap<Ino, std::collections::BTreeMap<u64, Vec<PendingDirtySlice>>>,
     >,
     pub(super) pending_bytes: AtomicUsize,
@@ -462,9 +464,18 @@ pub(super) struct LocalDirtyState {
 impl LocalDirtyState {
     pub(super) fn new() -> Self {
         Self {
-            pending_payloads: Mutex::new(std::collections::HashMap::new()),
-            pending_payload_indexes: Mutex::new(std::collections::HashMap::new()),
-            pending_chunk_slices: Mutex::new(std::collections::HashMap::new()),
+            pending_payloads: OrderedMutex::new(
+                std::collections::HashMap::new(),
+                LockTier::LocalDirty,
+            ),
+            pending_payload_indexes: OrderedMutex::new(
+                std::collections::HashMap::new(),
+                LockTier::LocalDirty,
+            ),
+            pending_chunk_slices: OrderedMutex::new(
+                std::collections::HashMap::new(),
+                LockTier::LocalDirty,
+            ),
             pending_bytes: AtomicUsize::new(0),
             pending_persisted_slice_bytes: AtomicUsize::new(0),
             pending_slice_count: AtomicUsize::new(0),

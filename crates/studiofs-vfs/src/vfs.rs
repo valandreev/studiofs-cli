@@ -123,6 +123,7 @@ use crate::landing_zone::LandingZone;
 use crate::landing_zone::RecoveredLandingSegment;
 use crate::qos::{QosController, TransitMemoryBudget};
 use crate::readahead::{DirAccessEntry, DirAccessTracker, ReadAheadTracker, ReadStreamKey};
+use crate::{LockTier, OrderedMutex};
 
 use crate::runtime::{
     LocalCacheIoTiming, MetaExecutor, VfsMeta, cache_io_execution_model, into_vfs_meta,
@@ -1340,16 +1341,16 @@ fn run_sync_with_timeout<T: Send + 'static>(
 // =============================================================================
 
 struct UploadState {
-    deleted_inodes: Mutex<std::collections::HashSet<Ino>>,
+    deleted_inodes: OrderedMutex<std::collections::HashSet<Ino>>,
     deleted_uploads_notify: tokio::sync::Notify,
-    upload_cancel_tokens: Mutex<std::collections::HashMap<Ino, CancellationToken>>,
-    pending_evictions: Mutex<std::collections::HashSet<u64>>,
+    upload_cancel_tokens: OrderedMutex<std::collections::HashMap<Ino, CancellationToken>>,
+    pending_evictions: OrderedMutex<std::collections::HashSet<u64>>,
     deferred_deleted_local_payloads:
-        Mutex<std::collections::HashMap<Ino, std::collections::HashSet<u64>>>,
-    pending_epoch_finalizations: Mutex<BTreeSet<(Ino, u64)>>,
+        OrderedMutex<std::collections::HashMap<Ino, std::collections::HashSet<u64>>>,
+    pending_epoch_finalizations: OrderedMutex<BTreeSet<(Ino, u64)>>,
     pending_epoch_finalizations_notify: tokio::sync::Notify,
-    upload_sticky_errors: Mutex<std::collections::HashMap<Ino, String>>,
-    startup_replay_counts: Mutex<HashMap<(Ino, u64), u64>>,
+    upload_sticky_errors: OrderedMutex<std::collections::HashMap<Ino, String>>,
+    startup_replay_counts: OrderedMutex<HashMap<(Ino, u64), u64>>,
     upload_requeues: AtomicU64,
     upload_canceled_deleted: AtomicU64,
     upload_canceled_stale: AtomicU64,
@@ -1546,15 +1547,27 @@ fn derive_upload_cache_io_foreground_cost_step(upload_cache_io_slots: usize) -> 
 impl UploadState {
     fn new(upload_cache_io_foreground_cost: u32) -> Self {
         Self {
-            deleted_inodes: Mutex::new(std::collections::HashSet::new()),
+            deleted_inodes: OrderedMutex::new(std::collections::HashSet::new(), LockTier::Upload),
             deleted_uploads_notify: tokio::sync::Notify::new(),
-            upload_cancel_tokens: Mutex::new(std::collections::HashMap::new()),
-            pending_evictions: Mutex::new(std::collections::HashSet::new()),
-            deferred_deleted_local_payloads: Mutex::new(std::collections::HashMap::new()),
-            pending_epoch_finalizations: Mutex::new(BTreeSet::new()),
+            upload_cancel_tokens: OrderedMutex::new(
+                std::collections::HashMap::new(),
+                LockTier::Upload,
+            ),
+            pending_evictions: OrderedMutex::new(
+                std::collections::HashSet::new(),
+                LockTier::Upload,
+            ),
+            deferred_deleted_local_payloads: OrderedMutex::new(
+                std::collections::HashMap::new(),
+                LockTier::Upload,
+            ),
+            pending_epoch_finalizations: OrderedMutex::new(BTreeSet::new(), LockTier::Upload),
             pending_epoch_finalizations_notify: tokio::sync::Notify::new(),
-            upload_sticky_errors: Mutex::new(std::collections::HashMap::new()),
-            startup_replay_counts: Mutex::new(HashMap::new()),
+            upload_sticky_errors: OrderedMutex::new(
+                std::collections::HashMap::new(),
+                LockTier::Upload,
+            ),
+            startup_replay_counts: OrderedMutex::new(HashMap::new(), LockTier::Upload),
             upload_requeues: AtomicU64::new(0),
             upload_canceled_deleted: AtomicU64::new(0),
             upload_canceled_stale: AtomicU64::new(0),
@@ -1577,15 +1590,21 @@ impl UploadState {
 }
 
 struct IncarnationState {
-    inode_incarnations: Mutex<std::collections::HashMap<Ino, InodeIncarnationState>>,
-    live_extent_records: Mutex<std::collections::HashMap<(Ino, u32), ExtentRecordId>>,
+    inode_incarnations: OrderedMutex<std::collections::HashMap<Ino, InodeIncarnationState>>,
+    live_extent_records: OrderedMutex<std::collections::HashMap<(Ino, u32), ExtentRecordId>>,
 }
 
 impl IncarnationState {
     fn new() -> Self {
         Self {
-            inode_incarnations: Mutex::new(std::collections::HashMap::new()),
-            live_extent_records: Mutex::new(std::collections::HashMap::new()),
+            inode_incarnations: OrderedMutex::new(
+                std::collections::HashMap::new(),
+                LockTier::Incarnation,
+            ),
+            live_extent_records: OrderedMutex::new(
+                std::collections::HashMap::new(),
+                LockTier::Incarnation,
+            ),
         }
     }
 }
@@ -2029,8 +2048,8 @@ struct ShutdownState {
     shutdown_notify: tokio::sync::Notify,
     uploader_shutdown_token: CancellationToken,
     slab_flusher_stopped: std::sync::atomic::AtomicBool,
-    background_tasks: Mutex<Vec<JoinHandle<()>>>,
-    uploader_task: Mutex<Option<JoinHandle<()>>>,
+    background_tasks: OrderedMutex<Vec<JoinHandle<()>>>,
+    uploader_task: OrderedMutex<Option<JoinHandle<()>>>,
 }
 
 impl ShutdownState {
@@ -2042,15 +2061,15 @@ impl ShutdownState {
             shutdown_notify: tokio::sync::Notify::new(),
             uploader_shutdown_token: CancellationToken::new(),
             slab_flusher_stopped: std::sync::atomic::AtomicBool::new(false),
-            background_tasks: Mutex::new(Vec::new()),
-            uploader_task: Mutex::new(None),
+            background_tasks: OrderedMutex::new(Vec::new(), LockTier::Shutdown),
+            uploader_task: OrderedMutex::new(None, LockTier::Shutdown),
         }
     }
 }
 
 struct MetricsState {
     materialize_batch_stats: MaterializeBatchStats,
-    ignored_entries: Mutex<IgnoredEntryRegistry>,
+    ignored_entries: OrderedMutex<IgnoredEntryRegistry>,
     next_ignored_ino: AtomicU64,
     /// Current number of items queued in the prefetch worker's pending queue.
     /// Useful for detecting backpressure under high handle-count workloads.
@@ -2157,14 +2176,14 @@ struct MetricsState {
     zeroio_replay_failures: AtomicU64,
     zeroio_publish_failures: AtomicU64,
     runtime_event_sequence: AtomicU64,
-    runtime_events: Mutex<VecDeque<VfsRuntimeEvent>>,
+    runtime_events: OrderedMutex<VecDeque<VfsRuntimeEvent>>,
 }
 
 impl MetricsState {
     fn new() -> Self {
         Self {
             materialize_batch_stats: MaterializeBatchStats::default(),
-            ignored_entries: Mutex::new(IgnoredEntryRegistry::default()),
+            ignored_entries: OrderedMutex::new(IgnoredEntryRegistry::default(), LockTier::Metrics),
             next_ignored_ino: AtomicU64::new(1u64 << 63),
             prefetch_queue_depth: AtomicU64::new(0),
             flush_barrier_calls: AtomicU64::new(0),
@@ -2269,7 +2288,7 @@ impl MetricsState {
             zeroio_replay_failures: AtomicU64::new(0),
             zeroio_publish_failures: AtomicU64::new(0),
             runtime_event_sequence: AtomicU64::new(0),
-            runtime_events: Mutex::new(VecDeque::new()),
+            runtime_events: OrderedMutex::new(VecDeque::new(), LockTier::Metrics),
         }
     }
 
