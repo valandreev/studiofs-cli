@@ -121,22 +121,27 @@ fn e2e_scenario_module_stays_split_by_responsibility() {
         "scenario module facade should live at crates/studiofs-e2e/src/scenario/mod.rs"
     );
 
+    for module in ["mod.rs", "registry.rs", "types.rs", "workloads.rs"] {
+        assert!(
+            module_dir.join(module).exists(),
+            "missing focused scenario submodule {module}"
+        );
+    }
+
+    let workloads_dir = module_dir.join("workloads");
     for module in [
         "actions.rs",
         "advanced_mounted.rs",
         "assertions.rs",
         "faults.rs",
         "namespace_collision.rs",
-        "registry.rs",
         "smoke_outage.rs",
         "test_fixtures.rs",
-        "types.rs",
-        "workloads.rs",
-        "workloads_tests.rs",
+        "tests.rs",
     ] {
         assert!(
-            module_dir.join(module).exists(),
-            "missing focused scenario submodule {module}"
+            workloads_dir.join(module).exists(),
+            "missing focused scenario workloads submodule {module}"
         );
     }
 
@@ -144,6 +149,12 @@ fn e2e_scenario_module_stays_split_by_responsibility() {
     assert!(
         workloads_lines <= 300,
         "scenario/workloads.rs should only wire shared constants and focused modules; found {workloads_lines} lines"
+    );
+
+    let workloads = read_workspace_file("crates/studiofs-e2e/src/scenario/workloads.rs");
+    assert!(
+        !workloads.contains("#[path"),
+        "scenario/workloads.rs should use Rust's file layout instead of #[path] indirection"
     );
 }
 

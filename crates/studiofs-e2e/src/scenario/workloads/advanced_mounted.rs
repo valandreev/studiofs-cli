@@ -69,108 +69,148 @@ pub(in crate::scenario) enum AdvancedMountedKind {
     SymlinkAttribute,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct AdvancedMountedProperties {
+    name: &'static str,
+    description: &'static str,
+    path_root: &'static str,
+    summary_file: &'static str,
+    client_names: &'static [&'static str],
+    convergence_timeout: Duration,
+}
+
 impl AdvancedMountedKind {
-    fn name(self) -> &'static str {
+    fn properties(self) -> AdvancedMountedProperties {
         match self {
-            Self::CrashBeforeWriteAcceptance => MOUNTED_CRASH_BEFORE_WRITE_ACCEPTANCE,
-            Self::CrashAfterPartialWriteAcceptance => MOUNTED_CRASH_AFTER_PARTIAL_WRITE_ACCEPTANCE,
-            Self::CrashAfterFullWriteAcceptance => MOUNTED_CRASH_AFTER_FULL_WRITE_ACCEPTANCE,
-            Self::MountedChaos => MOUNTED_CHAOS_CONVERGENCE,
-            Self::HotspotChurn => MOUNTED_HOTSPOT_CHURN_CONVERGENCE,
-            Self::FaultChaos => MOUNTED_FAULT_CHAOS_CONVERGENCE,
-            Self::LwwReconnectChaos => MOUNTED_LWW_RECONNECT_CHAOS_CONVERGENCE,
-            Self::OpenHandle => MOUNTED_OPEN_HANDLE_CONVERGENCE,
-            Self::SparseRange => MOUNTED_SPARSE_FILE_RANGE_CONVERGENCE,
-            Self::ColdObserverLongHistory => MOUNTED_COLD_OBSERVER_LONG_HISTORY_CONVERGENCE,
-            Self::StaleRemountColdDiscoverCatchup => {
-                MOUNTED_STALE_REMOUNT_COLD_DISCOVER_CATCHUP_CONVERGENCE
-            }
-            Self::InvalidationDropoutFallback => MOUNTED_INVALIDATION_DROPOUT_FALLBACK_CONVERGENCE,
-            Self::SymlinkAttribute => MOUNTED_SYMLINK_ATTRIBUTE_CONVERGENCE,
+            Self::CrashBeforeWriteAcceptance => AdvancedMountedProperties {
+                name: MOUNTED_CRASH_BEFORE_WRITE_ACCEPTANCE,
+                description: "mounted crash before write acceptance recovery",
+                path_root: "crash-before-write-acceptance",
+                summary_file: "write-acceptance-crash-summary.json",
+                client_names: ADVANCED_MOUNTED_CLIENT_NAMES,
+                convergence_timeout: ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT,
+            },
+            Self::CrashAfterPartialWriteAcceptance => AdvancedMountedProperties {
+                name: MOUNTED_CRASH_AFTER_PARTIAL_WRITE_ACCEPTANCE,
+                description: "mounted crash after partial write acceptance recovery",
+                path_root: "crash-after-partial-write-acceptance",
+                summary_file: "write-acceptance-crash-summary.json",
+                client_names: ADVANCED_MOUNTED_CLIENT_NAMES,
+                convergence_timeout: ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT,
+            },
+            Self::CrashAfterFullWriteAcceptance => AdvancedMountedProperties {
+                name: MOUNTED_CRASH_AFTER_FULL_WRITE_ACCEPTANCE,
+                description: "mounted crash after full write acceptance recovery",
+                path_root: "crash-after-full-write-acceptance",
+                summary_file: "write-acceptance-crash-summary.json",
+                client_names: ADVANCED_MOUNTED_CLIENT_NAMES,
+                convergence_timeout: ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT,
+            },
+            Self::MountedChaos => AdvancedMountedProperties {
+                name: MOUNTED_CHAOS_CONVERGENCE,
+                description: "seeded mounted namespace chaos convergence",
+                path_root: "chaos",
+                summary_file: "mounted-chaos-summary.json",
+                client_names: ADVANCED_MOUNTED_CLIENT_NAMES,
+                convergence_timeout: ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT,
+            },
+            Self::HotspotChurn => AdvancedMountedProperties {
+                name: MOUNTED_HOTSPOT_CHURN_CONVERGENCE,
+                description: "mounted hot-spot churn convergence",
+                path_root: "hotspot",
+                summary_file: "mounted-hotspot-churn-summary.json",
+                client_names: ADVANCED_MOUNTED_CLIENT_NAMES,
+                convergence_timeout: ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT,
+            },
+            Self::FaultChaos => AdvancedMountedProperties {
+                name: MOUNTED_FAULT_CHAOS_CONVERGENCE,
+                description: "mounted fault chaos convergence",
+                path_root: "fault-chaos",
+                summary_file: "mounted-fault-chaos-summary.json",
+                client_names: FAULT_CHAOS_CLIENT_NAMES,
+                convergence_timeout: FAULT_CHAOS_CONVERGENCE_TIMEOUT,
+            },
+            Self::LwwReconnectChaos => AdvancedMountedProperties {
+                name: MOUNTED_LWW_RECONNECT_CHAOS_CONVERGENCE,
+                description: "mounted LWW reconnect chaos convergence",
+                path_root: "lww-chaos",
+                summary_file: "mounted-lww-reconnect-chaos-summary.json",
+                client_names: LWW_RECONNECT_CLIENT_NAMES,
+                convergence_timeout: LWW_RECONNECT_CONVERGENCE_TIMEOUT,
+            },
+            Self::OpenHandle => AdvancedMountedProperties {
+                name: MOUNTED_OPEN_HANDLE_CONVERGENCE,
+                description: "mounted open-handle convergence",
+                path_root: "open-handles",
+                summary_file: "mounted-open-handle-summary.json",
+                client_names: ADVANCED_MOUNTED_CLIENT_NAMES,
+                convergence_timeout: ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT,
+            },
+            Self::SparseRange => AdvancedMountedProperties {
+                name: MOUNTED_SPARSE_FILE_RANGE_CONVERGENCE,
+                description: "mounted sparse-file range convergence",
+                path_root: "sparse",
+                summary_file: "sparse-range-summary.json",
+                client_names: ADVANCED_MOUNTED_CLIENT_NAMES,
+                convergence_timeout: ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT,
+            },
+            Self::ColdObserverLongHistory => AdvancedMountedProperties {
+                name: MOUNTED_COLD_OBSERVER_LONG_HISTORY_CONVERGENCE,
+                description: "mounted cold-observer long-history convergence",
+                path_root: "cold-observer",
+                summary_file: "cold-observer-long-history-summary.json",
+                client_names: COLD_OBSERVER_CLIENT_NAMES,
+                convergence_timeout: ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT,
+            },
+            Self::StaleRemountColdDiscoverCatchup => AdvancedMountedProperties {
+                name: MOUNTED_STALE_REMOUNT_COLD_DISCOVER_CATCHUP_CONVERGENCE,
+                description: "mounted stale-remount and cold-discover catch-up convergence",
+                path_root: "stale-remount-cold-discover",
+                summary_file: "stale-remount-cold-discover-summary.json",
+                client_names: COLD_OBSERVER_CLIENT_NAMES,
+                convergence_timeout: ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT,
+            },
+            Self::InvalidationDropoutFallback => AdvancedMountedProperties {
+                name: MOUNTED_INVALIDATION_DROPOUT_FALLBACK_CONVERGENCE,
+                description: "mounted invalidation-dropout fallback-sync convergence",
+                path_root: "invalidation-dropout",
+                summary_file: "invalidation-dropout-summary.json",
+                client_names: INVALIDATION_DROPOUT_CLIENT_NAMES,
+                convergence_timeout: ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT,
+            },
+            Self::SymlinkAttribute => AdvancedMountedProperties {
+                name: MOUNTED_SYMLINK_ATTRIBUTE_CONVERGENCE,
+                description: "mounted symlink and metadata-attribute convergence",
+                path_root: "symlink-attribute",
+                summary_file: "symlink-attribute-summary.json",
+                client_names: SYMLINK_ATTRIBUTE_CLIENT_NAMES,
+                convergence_timeout: ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT,
+            },
         }
+    }
+
+    fn name(self) -> &'static str {
+        self.properties().name
     }
 
     fn description(self) -> &'static str {
-        match self {
-            Self::CrashBeforeWriteAcceptance => "mounted crash before write acceptance recovery",
-            Self::CrashAfterPartialWriteAcceptance => {
-                "mounted crash after partial write acceptance recovery"
-            }
-            Self::CrashAfterFullWriteAcceptance => {
-                "mounted crash after full write acceptance recovery"
-            }
-            Self::MountedChaos => "seeded mounted namespace chaos convergence",
-            Self::HotspotChurn => "mounted hot-spot churn convergence",
-            Self::FaultChaos => "mounted fault chaos convergence",
-            Self::LwwReconnectChaos => "mounted LWW reconnect chaos convergence",
-            Self::OpenHandle => "mounted open-handle convergence",
-            Self::SparseRange => "mounted sparse-file range convergence",
-            Self::ColdObserverLongHistory => "mounted cold-observer long-history convergence",
-            Self::StaleRemountColdDiscoverCatchup => {
-                "mounted stale-remount and cold-discover catch-up convergence"
-            }
-            Self::InvalidationDropoutFallback => {
-                "mounted invalidation-dropout fallback-sync convergence"
-            }
-            Self::SymlinkAttribute => "mounted symlink and metadata-attribute convergence",
-        }
+        self.properties().description
     }
 
     fn path_root(self) -> &'static str {
-        match self {
-            Self::CrashBeforeWriteAcceptance => "crash-before-write-acceptance",
-            Self::CrashAfterPartialWriteAcceptance => "crash-after-partial-write-acceptance",
-            Self::CrashAfterFullWriteAcceptance => "crash-after-full-write-acceptance",
-            Self::MountedChaos => "chaos",
-            Self::HotspotChurn => "hotspot",
-            Self::FaultChaos => "fault-chaos",
-            Self::LwwReconnectChaos => "lww-chaos",
-            Self::OpenHandle => "open-handles",
-            Self::SparseRange => "sparse",
-            Self::ColdObserverLongHistory => "cold-observer",
-            Self::StaleRemountColdDiscoverCatchup => "stale-remount-cold-discover",
-            Self::InvalidationDropoutFallback => "invalidation-dropout",
-            Self::SymlinkAttribute => "symlink-attribute",
-        }
+        self.properties().path_root
     }
 
     fn summary_file(self) -> &'static str {
-        match self {
-            Self::CrashBeforeWriteAcceptance
-            | Self::CrashAfterPartialWriteAcceptance
-            | Self::CrashAfterFullWriteAcceptance => "write-acceptance-crash-summary.json",
-            Self::MountedChaos => "mounted-chaos-summary.json",
-            Self::HotspotChurn => "mounted-hotspot-churn-summary.json",
-            Self::FaultChaos => "mounted-fault-chaos-summary.json",
-            Self::LwwReconnectChaos => "mounted-lww-reconnect-chaos-summary.json",
-            Self::OpenHandle => "mounted-open-handle-summary.json",
-            Self::SparseRange => "sparse-range-summary.json",
-            Self::ColdObserverLongHistory => "cold-observer-long-history-summary.json",
-            Self::StaleRemountColdDiscoverCatchup => "stale-remount-cold-discover-summary.json",
-            Self::InvalidationDropoutFallback => "invalidation-dropout-summary.json",
-            Self::SymlinkAttribute => "symlink-attribute-summary.json",
-        }
+        self.properties().summary_file
     }
 
     fn client_names(self) -> &'static [&'static str] {
-        match self {
-            Self::FaultChaos => FAULT_CHAOS_CLIENT_NAMES,
-            Self::LwwReconnectChaos => LWW_RECONNECT_CLIENT_NAMES,
-            Self::InvalidationDropoutFallback => INVALIDATION_DROPOUT_CLIENT_NAMES,
-            Self::SymlinkAttribute => SYMLINK_ATTRIBUTE_CLIENT_NAMES,
-            Self::ColdObserverLongHistory | Self::StaleRemountColdDiscoverCatchup => {
-                COLD_OBSERVER_CLIENT_NAMES
-            }
-            _ => ADVANCED_MOUNTED_CLIENT_NAMES,
-        }
+        self.properties().client_names
     }
 
     fn convergence_timeout(self) -> Duration {
-        match self {
-            Self::FaultChaos => FAULT_CHAOS_CONVERGENCE_TIMEOUT,
-            Self::LwwReconnectChaos => LWW_RECONNECT_CONVERGENCE_TIMEOUT,
-            _ => ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT,
-        }
+        self.properties().convergence_timeout
     }
 }
 

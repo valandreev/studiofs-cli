@@ -167,8 +167,12 @@ pub(in crate::scenario) fn write_parented(path: PathBuf, payload: &[u8]) -> io::
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&path, payload)?;
-    let file = OpenOptions::new().read(true).write(true).open(path)?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&path)?;
+    file.write_all(payload)?;
     file.sync_all()
 }
 
@@ -747,13 +751,34 @@ pub(in crate::scenario) fn write_parented_with_progress(
     }
     record_hotspot_helper_progress(
         progress,
+        "before_open",
+        operation,
+        path,
+        target,
+        Some(payload.len()),
+    )?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path)?;
+    record_hotspot_helper_progress(
+        progress,
+        "after_open",
+        operation,
+        path,
+        target,
+        Some(payload.len()),
+    )?;
+    record_hotspot_helper_progress(
+        progress,
         "before_write",
         operation,
         path,
         target,
         Some(payload.len()),
     )?;
-    fs::write(path, payload)?;
+    file.write_all(payload)?;
     record_hotspot_helper_progress(
         progress,
         "after_write",
@@ -762,9 +787,6 @@ pub(in crate::scenario) fn write_parented_with_progress(
         target,
         Some(payload.len()),
     )?;
-    record_hotspot_helper_progress(progress, "before_reopen", operation, path, target, None)?;
-    let file = OpenOptions::new().read(true).write(true).open(path)?;
-    record_hotspot_helper_progress(progress, "after_reopen", operation, path, target, None)?;
     record_hotspot_helper_progress(progress, "before_sync_all", operation, path, target, None)?;
     file.sync_all()?;
     record_hotspot_helper_progress(progress, "after_sync_all", operation, path, target, None)

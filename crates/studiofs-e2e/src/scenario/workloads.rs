@@ -1,5 +1,4 @@
 //! Scenario registry and lifecycle hooks for mounted E2E runs.
-#![allow(unused_imports)]
 
 use std::fs;
 use std::fs::OpenOptions;
@@ -205,20 +204,13 @@ pub(crate) const TEST_PASSING: &str = "__test-passing";
 
 use super::types::{Scenario, ScenarioContext, ScenarioDefinition, ScenarioError};
 
-#[path = "actions.rs"]
 mod actions;
-#[path = "advanced_mounted.rs"]
 mod advanced_mounted;
-#[path = "assertions.rs"]
 mod assertions;
-#[path = "faults.rs"]
 mod faults;
-#[path = "namespace_collision.rs"]
 mod namespace_collision;
-#[path = "smoke_outage.rs"]
 mod smoke_outage;
 #[cfg(test)]
-#[path = "test_fixtures.rs"]
 mod test_fixtures;
 
 pub(super) use actions::*;
@@ -232,5 +224,4 @@ pub(super) use smoke_outage::*;
 pub(super) use test_fixtures::*;
 
 #[cfg(test)]
-#[path = "workloads_tests.rs"]
-mod workloads_tests;
+mod tests;
