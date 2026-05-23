@@ -310,7 +310,7 @@ fn expand_scenario_selector(selector: &str) -> Vec<String> {
     let scenarios = scenario::available_scenarios();
     selector
         .split(',')
-        .flat_map(|part| expand_scenario_selector_part(part.trim(), &scenarios))
+        .flat_map(|part| expand_scenario_selector_part(part.trim(), scenarios))
         .collect()
 }
 

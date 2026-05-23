@@ -1,6 +1,7 @@
 target/
 cargo-audit.json
 *.db
+*.diff
 *.db-shm
 *.db-wal
 # Cargo.lock
