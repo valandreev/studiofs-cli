@@ -14,11 +14,10 @@ pub(super) type PgClientFuture<'a, T> = Pin<Box<dyn Future<Output = MetaResult<T
 
 enum RuntimeMessage {
     Run(RuntimeJob),
-    Shutdown,
 }
 
 pub(super) struct PgRemoteRuntime {
-    tx: Mutex<Option<std::sync::mpsc::SyncSender<RuntimeMessage>>>,
+    tx: Mutex<Option<tokio::sync::mpsc::Sender<RuntimeMessage>>>,
     handle: Mutex<Option<JoinHandle<()>>>,
     runtime_thread_id: ThreadId,
 }
@@ -29,7 +28,8 @@ struct IdlePgConnection {
 }
 
 struct PooledPgConnection {
-    idle: IdlePgConnection,
+    idle: Option<IdlePgConnection>,
+    pool: Arc<PgConnectionPool>,
     _active_permit: OwnedSemaphorePermit,
 }
 
@@ -85,6 +85,41 @@ impl Drop for PendingPgConnectionSlot<'_> {
     }
 }
 
+impl PooledPgConnection {
+    fn client_mut(&mut self) -> &mut tokio_postgres::Client {
+        &mut self
+            .idle
+            .as_mut()
+            .expect("pooled postgres connection missing client")
+            .client
+    }
+
+    fn is_closed(&self) -> bool {
+        self.idle
+            .as_ref()
+            .map(|idle| idle.client.is_closed() || idle.task.is_finished())
+            .unwrap_or(true)
+    }
+
+    fn discard(mut self) {
+        if let Some(idle) = self.idle.take() {
+            self.pool.discard_idle(idle);
+        }
+    }
+}
+
+impl Drop for PooledPgConnection {
+    fn drop(&mut self) {
+        if let Some(idle) = self.idle.take() {
+            if idle.client.is_closed() || idle.task.is_finished() {
+                self.pool.discard_idle(idle);
+            } else {
+                self.pool.put_back_idle(idle);
+            }
+        }
+    }
+}
+
 impl PgConnectionPool {
     const DEFAULT_MAX_SIZE: usize = 4;
 
@@ -118,30 +153,22 @@ impl PgConnectionPool {
         }
     }
 
-    async fn checkout(&self, context: &'static str) -> MetaResult<PooledPgConnection> {
-        let permit = if self.active_slots.available_permits() == 0 {
-            self.checkout_waits.fetch_add(1, Ordering::SeqCst);
-            tokio::time::timeout(
-                self.checkout_timeout,
-                self.active_slots.clone().acquire_owned(),
-            )
-            .await
-            .map_err(|_| {
-                PgMetaEngine::pg_timeout_error(
-                    &format!("{context} checkout"),
-                    self.checkout_timeout,
-                )
-            })?
-            .map_err(|_| MetaError::Storage("postgres command pool is closed".to_string()))?
-        } else {
-            self.active_slots
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|_| MetaError::Storage("postgres command pool is closed".to_string()))?
-        };
-
+    async fn checkout(self: &Arc<Self>, context: &'static str) -> MetaResult<PooledPgConnection> {
         let checkout = async {
+            let permit = match self.active_slots.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    self.checkout_waits.fetch_add(1, Ordering::SeqCst);
+                    self.active_slots
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| {
+                            MetaError::Storage("postgres command pool is closed".to_string())
+                        })?
+                }
+            };
+
             let pending_slot = {
                 let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
                 while let Some(connection) = state.idle.pop() {
@@ -152,7 +179,8 @@ impl PgConnectionPool {
                     }
                     self.checkouts.fetch_add(1, Ordering::SeqCst);
                     return Ok(PooledPgConnection {
-                        idle: connection,
+                        idle: Some(connection),
+                        pool: Arc::clone(self),
                         _active_permit: permit,
                     });
                 }
@@ -176,7 +204,8 @@ impl PgConnectionPool {
                     }
                     self.checkouts.fetch_add(1, Ordering::SeqCst);
                     Ok(PooledPgConnection {
-                        idle: connection,
+                        idle: Some(connection),
+                        pool: Arc::clone(self),
                         _active_permit: permit,
                     })
                 }
@@ -212,22 +241,22 @@ impl PgConnectionPool {
         Ok(IdlePgConnection { client, task })
     }
 
-    fn put_back(&self, connection: PooledPgConnection) {
+    fn put_back_idle(&self, connection: IdlePgConnection) {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        if connection.idle.task.is_finished() || state.idle.len() >= self.max_size {
+        if connection.task.is_finished() || state.idle.len() >= self.max_size {
             state.total = state.total.saturating_sub(1);
             self.discarded.fetch_add(1, Ordering::SeqCst);
-            connection.idle.task.abort();
+            connection.task.abort();
             return;
         }
-        state.idle.push(connection.idle);
+        state.idle.push(connection);
     }
 
-    fn discard(&self, connection: PooledPgConnection) {
+    fn discard_idle(&self, connection: IdlePgConnection) {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         state.total = state.total.saturating_sub(1);
         self.discarded.fetch_add(1, Ordering::SeqCst);
-        connection.idle.task.abort();
+        connection.task.abort();
     }
 }
 
@@ -243,7 +272,7 @@ impl Drop for PgConnectionPool {
 
 impl PgRemoteRuntime {
     pub(super) fn new(name: &'static str) -> MetaResult<Self> {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<RuntimeMessage>(128);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<RuntimeMessage>(128);
         let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel::<Result<ThreadId, String>>(1);
         let handle = std::thread::Builder::new()
             .name(name.to_string())
@@ -260,22 +289,12 @@ impl PgRemoteRuntime {
                     }
                 };
                 let _ = startup_tx.send(Ok(std::thread::current().id()));
-                let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
                 rt.block_on(async move {
-                    loop {
-                        let rx = rx.clone();
-                        let message = tokio::task::spawn_blocking(move || {
-                            rx.lock().unwrap_or_else(|p| p.into_inner()).recv()
-                        })
-                        .await;
-                        let Ok(Ok(message)) = message else {
-                            break;
-                        };
+                    while let Some(message) = rx.recv().await {
                         match message {
                             RuntimeMessage::Run(job) => {
                                 tokio::spawn(job);
                             }
-                            RuntimeMessage::Shutdown => break,
                         }
                     }
                 });
@@ -329,9 +348,7 @@ impl PgRemoteRuntime {
 
 impl Drop for PgRemoteRuntime {
     fn drop(&mut self) {
-        if let Some(tx) = self.tx.lock().unwrap_or_else(|p| p.into_inner()).take() {
-            let _ = tx.send(RuntimeMessage::Shutdown);
-        }
+        self.tx.lock().unwrap_or_else(|p| p.into_inner()).take();
         if let Some(handle) = self.handle.lock().unwrap_or_else(|p| p.into_inner()).take() {
             let _ = handle.join();
         }
@@ -430,25 +447,25 @@ impl PgMetaEngine {
         F: for<'a> FnOnce(&'a mut tokio_postgres::Client) -> PgClientFuture<'a, T>,
     {
         let mut connection = command_pool.checkout(context).await?;
-        let result = tokio::time::timeout(command_timeout, f(&mut connection.idle.client))
+        let result = tokio::time::timeout(command_timeout, f(connection.client_mut()))
             .await
             .map_err(|_| Self::pg_timeout_error(context, command_timeout));
 
         match result {
             Ok(Ok(value)) => {
-                command_pool.put_back(connection);
+                drop(connection);
                 Ok(value)
             }
             Ok(Err(error)) => {
-                if connection.idle.client.is_closed() {
-                    command_pool.discard(connection);
+                if connection.is_closed() {
+                    connection.discard();
                 } else {
-                    command_pool.put_back(connection);
+                    drop(connection);
                 }
                 Err(error)
             }
             Err(error) => {
-                command_pool.discard(connection);
+                connection.discard();
                 Err(error)
             }
         }
@@ -557,11 +574,11 @@ mod tests {
             .enable_all()
             .build()
             .expect("build runtime");
-        let pool = PgConnectionPool::new(
+        let pool = Arc::new(PgConnectionPool::new(
             "postgres://10.255.255.1:5432/studiofs".to_string(),
             Duration::from_millis(1),
             Duration::from_millis(1),
-        );
+        ));
 
         let result = runtime.block_on(pool.checkout("unit test connect timeout"));
 
@@ -571,5 +588,50 @@ mod tests {
             0,
             "failed or canceled connection creation must release its reserved total slot"
         );
+    }
+
+    #[test]
+    fn command_pool_cancelled_checkout_does_not_leak_total_slots() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        let pool = Arc::new(PgConnectionPool::new(
+            "postgres://10.255.255.1:5432/studiofs".to_string(),
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+        ));
+
+        runtime.block_on(async {
+            let checkout_pool = pool.clone();
+            let handle = tokio::spawn(async move {
+                let _ = checkout_pool.checkout("unit test canceled checkout").await;
+            });
+
+            let observed_reserved_slot = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if pool.stats().total == 1 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_ok();
+            assert!(
+                observed_reserved_slot,
+                "checkout should reserve a connection slot before the test aborts it"
+            );
+
+            handle.abort();
+            let _ = handle.await;
+            tokio::task::yield_now().await;
+
+            assert_eq!(
+                pool.stats().total,
+                0,
+                "dropping a checkout future must release its reserved total slot"
+            );
+        });
     }
 }
