@@ -31,6 +31,8 @@ impl<T> OrderedMutex<T> {
 
 /// Guard returned by [`OrderedMutex::lock`].
 pub struct OrderedMutexGuard<'a, T> {
+    // Field order is intentional: Rust drops fields top-to-bottom, so the
+    // actual mutex guard must be released before the validation tier is popped.
     guard: MutexGuard<'a, T>,
     #[allow(dead_code)]
     lock_order: LockOrderGuard,

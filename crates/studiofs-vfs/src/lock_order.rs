@@ -24,6 +24,7 @@
 //! ```
 
 use std::cell::RefCell;
+use std::marker::PhantomData;
 
 use tracing::warn;
 
@@ -98,6 +99,7 @@ thread_local! {
 pub struct LockOrderGuard {
     tier: LockTier,
     pushed: bool,
+    _marker: PhantomData<*mut ()>,
 }
 
 impl LockOrderGuard {
@@ -111,6 +113,7 @@ impl LockOrderGuard {
             return LockOrderGuard {
                 tier,
                 pushed: false,
+                _marker: PhantomData,
             };
         }
 
@@ -125,7 +128,6 @@ impl LockOrderGuard {
             if let Some(&last_tier) = held.last()
                 && tier < last_tier
             {
-                // Lock ordering violation!
                 let msg = format!(
                     "Lock ordering violation: trying to acquire {} (tier {}) while holding {} (tier {})",
                     tier.name(),
@@ -134,7 +136,11 @@ impl LockOrderGuard {
                     last_tier.level()
                 );
 
-                warn!("{}", msg);
+                if cfg!(test) {
+                    panic!("{msg}");
+                } else {
+                    warn!("{}", msg);
+                }
             }
 
             held.push(tier);
@@ -142,6 +148,7 @@ impl LockOrderGuard {
             LockOrderGuard {
                 tier,
                 pushed: true,
+                _marker: PhantomData,
             }
         })
     }
@@ -155,12 +162,17 @@ impl LockOrderGuard {
             return LockOrderGuard {
                 tier,
                 pushed: false,
+                _marker: PhantomData,
             };
         }
 
         HELD_LOCKS.with(|held| {
             held.borrow_mut().push(tier);
-            LockOrderGuard { tier, pushed: true }
+            LockOrderGuard {
+                tier,
+                pushed: true,
+                _marker: PhantomData,
+            }
         })
     }
 }
@@ -174,16 +186,22 @@ impl Drop for LockOrderGuard {
         HELD_LOCKS.with(|held| {
             let mut held = held.borrow_mut();
 
-            // Remove the most recent lock (should be this one).
-            if let Some(last) = held.pop()
-                && last != self.tier
-            {
-                // This indicates a bug - guards dropped in wrong order
-                warn!(
-                    expected = self.tier.name(),
-                    actual = last.name(),
-                    "Lock guard dropped in wrong order"
-                );
+            match held.iter().rposition(|&tier| tier == self.tier) {
+                Some(pos) => {
+                    if pos != held.len() - 1 {
+                        warn!(
+                            expected = self.tier.name(),
+                            "Lock guard dropped in wrong order"
+                        );
+                    }
+                    held.remove(pos);
+                }
+                None => {
+                    warn!(
+                        expected = self.tier.name(),
+                        "Lock guard dropped but tier was not found in thread-local stack"
+                    );
+                }
             }
             // Note: We don't track a global minimum since all state is thread-local.
             // Each thread maintains its own lock stack independently.
@@ -201,10 +219,12 @@ pub fn is_validation_enabled() -> bool {
     }
     #[cfg(not(debug_assertions))]
     {
-        // In release, check environment variable
-        std::env::var("STUDIOFS_LOCK_ORDER_VALIDATION")
-            .map(|v| v == "1" || v == "true")
-            .unwrap_or(false)
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("STUDIOFS_LOCK_ORDER_VALIDATION")
+                .map(|v| v == "1" || v == "true")
+                .unwrap_or(false)
+        })
     }
 }
 
@@ -218,10 +238,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_lock_ordering_violation_reports_warning() {
+    #[should_panic(expected = "Lock ordering violation")]
+    fn test_lock_ordering_violation_panics_in_tests() {
         // Acquire lower priority lock first
         let _guard1 = LockOrderGuard::acquire(LockTier::Namespace);
-        // Try to acquire higher priority lock - should warn and continue
+        // Try to acquire higher priority lock - should panic in tests.
         let _guard2 = LockOrderGuard::acquire(LockTier::Shutdown);
     }
 
@@ -244,6 +265,21 @@ mod tests {
     }
 
     #[test]
+    fn test_out_of_order_release_keeps_stack_consistent() {
+        let mut guards = vec![
+            LockOrderGuard::acquire(LockTier::Shutdown),
+            LockOrderGuard::acquire(LockTier::Namespace),
+        ];
+
+        drop(guards.remove(0));
+        assert_eq!(debug_lock_stack(), vec![LockTier::Namespace]);
+
+        drop(guards);
+        assert!(debug_lock_stack().is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "Lock ordering violation")]
     fn test_lock_ordering_with_multiple_tiers() {
         // Acquire Tier 1, then Tier 5
         let _guard1 = LockOrderGuard::acquire(LockTier::Shutdown);
