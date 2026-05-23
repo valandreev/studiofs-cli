@@ -21,7 +21,6 @@ use crate::client::{
 use crate::infra::{
     COMPOSE_PROJECT_PREFIX, CommandExecutor, CommandSpec, ComposeConfig, ComposeServiceControl,
     DockerComposeStack, InfraCheck, InfraError, InfraMode, SystemCommandExecutor,
-    command_streams_output,
 };
 #[cfg(windows)]
 use crate::process_diagnostics::capture_process_diagnostics_best_effort;
@@ -33,13 +32,16 @@ use crate::report::{
     PathOwnershipReport, PreflightCheckReport, PreflightReport, RunManifest, RunReport,
     RunnerReport, SandboxReport, ScenarioReport,
 };
+use crate::runner_lifecycle::{
+    ScenarioLifecycleOutcome, SupervisedScenarioInput, failed_scenario_child,
+    run_supervised_scenario,
+};
 use crate::scenario::{self, ScenarioContext};
 
 const SCHEMA_VERSION: u32 = 1;
 const RUNNER_CRATE: &str = "studiofs-e2e";
 const RUNNER_MARKER_FILE: &str = ".studiofs-e2e-runner.json";
 const PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
-const DEFAULT_SCENARIO_CHILD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 #[cfg(windows)]
 const HOST_ENVIRONMENT_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const ANSI_RESET: &str = "\x1b[0m";
@@ -80,7 +82,7 @@ impl PlatformSelection {
         }
     }
 
-    fn as_cli_value(self) -> &'static str {
+    pub(crate) fn as_cli_value(self) -> &'static str {
         match self {
             Self::Auto => "auto",
             Self::LinuxFuse => "linux-fuse",
@@ -243,6 +245,14 @@ pub enum RunnerError {
         /// Mounted scenario that requires a local studiofs binary.
         scenario: String,
     },
+    /// Timeout string could not be parsed.
+    #[error(
+        "invalid E2E timeout '{value}': expected integer seconds or a value ending in ms, s, or m"
+    )]
+    InvalidTimeout {
+        /// Invalid timeout value from the request.
+        value: String,
+    },
     /// Run ID was empty.
     #[error("run ID must not be empty")]
     EmptyRunId,
@@ -313,13 +323,6 @@ pub enum RunnerError {
         #[from]
         InfraError,
     ),
-}
-
-#[derive(Debug)]
-struct ScenarioLifecycleOutcome {
-    report: ScenarioReport,
-    outcome: ScenarioOutcome,
-    cleanup_error: Option<String>,
 }
 
 struct ResolvedScenario {
@@ -605,6 +608,7 @@ pub fn run_with_executor(
                 request.seed,
                 format!("scenario supervision failed: {error}"),
                 None,
+                false,
             ),
             Err(error) => return Err(error),
         };
@@ -743,258 +747,7 @@ fn skipped_scenario_lifecycle(
     }
 }
 
-struct SupervisedScenarioInput<'a> {
-    events_path: &'a Path,
-    run_id: &'a str,
-    root: &'a Path,
-    sandbox: &'a Path,
-    request_seed: u64,
-    request_platform: PlatformSelection,
-    request_infra: InfraMode,
-    request_timeout: Option<&'a str>,
-    definition: scenario::ScenarioDefinition,
-    scenario_progress: ScenarioProgress,
-    executor: &'a dyn CommandExecutor,
-}
-
-fn run_supervised_scenario(
-    input: SupervisedScenarioInput<'_>,
-) -> Result<ScenarioLifecycleOutcome, RunnerError> {
-    record_event(
-        input.events_path,
-        input.run_id,
-        Some(input.definition.name),
-        "scenario_child",
-        "started",
-    )?;
-    emit_progress(
-        input.run_id,
-        input.definition.name,
-        Some(input.scenario_progress),
-        "scenario_child",
-        ProgressStatus::Started,
-    );
-    let command = scenario_child_command(&input)?;
-    let child_report_path = scenario_child_report_path(input.sandbox, input.definition.name);
-    match input.executor.run(&command) {
-        Ok(output) => {
-            if !command_streams_output(&command) {
-                relay_child_output(&output);
-            }
-            append_child_output(input.sandbox, input.definition.name, &output)?;
-            let mut lifecycle = match read_scenario_child_report(&child_report_path) {
-                Ok(lifecycle) => lifecycle,
-                Err(err) if output.status != 0 => failed_scenario_child(
-                    input.definition.name,
-                    input.request_seed,
-                    command_failure_detail(output.status, &output.stderr),
-                    Some(err.to_string()),
-                ),
-                Err(err) => return Err(err),
-            };
-            if output.status != 0 && lifecycle.report.status == ScenarioStatus::Passed {
-                lifecycle.report.status = ScenarioStatus::Failed;
-                lifecycle.outcome.status = ScenarioStatus::Failed;
-                lifecycle.report.error =
-                    Some(command_failure_detail(output.status, &output.stderr));
-            }
-            record_event(
-                input.events_path,
-                input.run_id,
-                Some(input.definition.name),
-                "scenario_child",
-                if lifecycle.outcome.status == ScenarioStatus::Passed {
-                    "finished"
-                } else {
-                    "failed"
-                },
-            )?;
-            emit_progress(
-                input.run_id,
-                input.definition.name,
-                Some(input.scenario_progress),
-                "scenario_child",
-                if lifecycle.outcome.status == ScenarioStatus::Passed {
-                    ProgressStatus::Passed
-                } else {
-                    ProgressStatus::Failed
-                },
-            );
-            Ok(lifecycle)
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {
-            let lifecycle =
-                timed_out_scenario_child(input.definition.name, input.request_seed, &err);
-            record_event_with_detail(
-                input.events_path,
-                input.run_id,
-                Some(input.definition.name),
-                "scenario_child",
-                "timed_out",
-                err.to_string(),
-            )?;
-            emit_progress(
-                input.run_id,
-                input.definition.name,
-                Some(input.scenario_progress),
-                "scenario_child",
-                ProgressStatus::Failed,
-            );
-            Ok(lifecycle)
-        }
-        Err(err) => Err(RunnerError::Io(err)),
-    }
-}
-
-fn scenario_child_command(input: &SupervisedScenarioInput<'_>) -> Result<CommandSpec, RunnerError> {
-    Ok(CommandSpec {
-        program: std::env::current_exe()?.display().to_string(),
-        args: vec![
-            "run-one".to_string(),
-            "--scenario".to_string(),
-            input.definition.name.to_string(),
-            "--root".to_string(),
-            input.root.display().to_string(),
-            "--run-id".to_string(),
-            input.run_id.to_string(),
-            "--seed".to_string(),
-            input.request_seed.to_string(),
-            "--platform".to_string(),
-            input.request_platform.as_cli_value().to_string(),
-            "--infra".to_string(),
-            infra_cli_value(input.request_infra).to_string(),
-        ],
-        env: vec![
-            ("STUDIOFS_E2E_SCENARIO_CHILD".to_string(), "1".to_string()),
-            ("STUDIOFS_E2E_STREAM_OUTPUT".to_string(), "1".to_string()),
-        ],
-        cwd: None,
-        timeout: Some(scenario_child_timeout(input.request_timeout)),
-    })
-}
-
-fn scenario_child_timeout(request_timeout: Option<&str>) -> Duration {
-    request_timeout
-        .and_then(parse_timeout_duration)
-        .unwrap_or(DEFAULT_SCENARIO_CHILD_TIMEOUT)
-}
-
-fn infra_cli_value(infra: InfraMode) -> &'static str {
-    match infra {
-        InfraMode::Disabled => "disabled",
-        InfraMode::Compose => "compose",
-    }
-}
-
-fn parse_timeout_duration(value: &str) -> Option<Duration> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if let Some(ms) = trimmed.strip_suffix("ms") {
-        return ms.trim().parse::<u64>().ok().map(Duration::from_millis);
-    }
-    if let Some(seconds) = trimmed.strip_suffix('s') {
-        return seconds.trim().parse::<u64>().ok().map(Duration::from_secs);
-    }
-    if let Some(minutes) = trimmed.strip_suffix('m') {
-        return minutes
-            .trim()
-            .parse::<u64>()
-            .ok()
-            .and_then(|minutes| minutes.checked_mul(60))
-            .map(Duration::from_secs);
-    }
-    trimmed.parse::<u64>().ok().map(Duration::from_secs)
-}
-
-fn read_scenario_child_report(path: &Path) -> Result<ScenarioLifecycleOutcome, RunnerError> {
-    let child: ScenarioChildReport = serde_json::from_slice(&fs::read(path)?)?;
-    Ok(ScenarioLifecycleOutcome {
-        outcome: ScenarioOutcome {
-            name: child.scenario.name.clone(),
-            status: child.scenario.status,
-            artifacts: child.scenario.artifacts.clone(),
-        },
-        report: child.scenario,
-        cleanup_error: child.cleanup_error,
-    })
-}
-
-fn timed_out_scenario_child(
-    scenario: &str,
-    seed: u64,
-    err: &std::io::Error,
-) -> ScenarioLifecycleOutcome {
-    failed_scenario_child(scenario, seed, err.to_string(), None)
-        .with_status(ScenarioStatus::TimedOut)
-}
-
-fn failed_scenario_child(
-    scenario: &str,
-    seed: u64,
-    error: String,
-    report_error: Option<String>,
-) -> ScenarioLifecycleOutcome {
-    let started_at = timestamp();
-    let finished_at = timestamp();
-    let mut artifacts = vec![scenario_artifact_path(scenario, SCENARIO_CHILD_STDERR_FILE)];
-    if report_error.is_some() {
-        artifacts.push(scenario_artifact_path(scenario, SCENARIO_CHILD_STDOUT_FILE));
-    }
-    let error = match report_error {
-        Some(report_error) => format!("{error}; child report unavailable: {report_error}"),
-        None => error,
-    };
-    ScenarioLifecycleOutcome {
-        report: ScenarioReport {
-            name: scenario.to_string(),
-            seed,
-            status: ScenarioStatus::Failed,
-            started_at,
-            finished_at,
-            duration_ms: 0,
-            artifacts: artifacts.clone(),
-            error: Some(error.clone()),
-        },
-        outcome: ScenarioOutcome {
-            name: scenario.to_string(),
-            status: ScenarioStatus::Failed,
-            artifacts,
-        },
-        cleanup_error: Some(error),
-    }
-}
-
-trait ScenarioLifecycleStatus {
-    fn with_status(self, status: ScenarioStatus) -> Self;
-}
-
-impl ScenarioLifecycleStatus for ScenarioLifecycleOutcome {
-    fn with_status(mut self, status: ScenarioStatus) -> Self {
-        self.report.status = status;
-        self.outcome.status = status;
-        self
-    }
-}
-
-fn relay_child_output(output: &crate::infra::CommandOutput) {
-    if !output.stdout.is_empty() {
-        print!("{}", output.stdout);
-        let _ = std::io::stdout().flush();
-    }
-    if !output.stderr.is_empty() {
-        let stderr = if std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none() {
-            colorize_progress_statuses(&output.stderr)
-        } else {
-            output.stderr.clone()
-        };
-        eprint!("{stderr}");
-        let _ = std::io::stderr().flush();
-    }
-}
-
-fn colorize_progress_statuses(output: &str) -> String {
+pub(crate) fn colorize_progress_statuses(output: &str) -> String {
     output
         .lines()
         .map(colorize_progress_status_line)
@@ -1023,36 +776,6 @@ fn colorize_progress_status_line(line: &str) -> String {
         }
     }
     line.to_string()
-}
-
-fn append_child_output(
-    sandbox: &Path,
-    scenario: &str,
-    output: &crate::infra::CommandOutput,
-) -> Result<(), RunnerError> {
-    let scenario_dir = sandbox.join("artifacts").join("scenarios").join(scenario);
-    fs::create_dir_all(&scenario_dir)?;
-    append_text(
-        &scenario_dir.join(SCENARIO_CHILD_STDOUT_FILE),
-        &output.stdout,
-    )?;
-    append_text(
-        &scenario_dir.join(SCENARIO_CHILD_STDERR_FILE),
-        &output.stderr,
-    )?;
-    append_text(&sandbox.join("stdout.log"), &output.stdout)?;
-    append_text(&sandbox.join("stderr.log"), &output.stderr)?;
-    Ok(())
-}
-
-fn append_text(path: &Path, text: &str) -> Result<(), RunnerError> {
-    if text.is_empty() {
-        return Ok(());
-    }
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    file.write_all(text.as_bytes())?;
-    file.flush()?;
-    Ok(())
 }
 
 /// Run a single scenario from an existing run directory.
@@ -2068,7 +1791,7 @@ fn is_runner_owned_compose_project(project: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
 }
 
-fn command_failure_detail(status: i32, stderr: &str) -> String {
+pub(crate) fn command_failure_detail(status: i32, stderr: &str) -> String {
     let stderr = stderr.trim();
     if stderr.is_empty() {
         format!("exit status {status}")
@@ -2471,7 +2194,7 @@ fn run_hook<T>(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProgressStatus {
+pub(crate) enum ProgressStatus {
     Started,
     Passed,
     Failed,
@@ -2496,9 +2219,9 @@ impl ProgressStatus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ScenarioProgress {
-    index: usize,
-    total: usize,
+pub(crate) struct ScenarioProgress {
+    pub(crate) index: usize,
+    pub(crate) total: usize,
 }
 
 fn progress_line(
@@ -2540,7 +2263,7 @@ fn progress_line_with_status_value(
     )
 }
 
-fn emit_progress(
+pub(crate) fn emit_progress(
     run_id: &str,
     task: &str,
     progress: Option<ScenarioProgress>,
@@ -2605,7 +2328,7 @@ impl ProgressHeartbeat {
     }
 }
 
-fn record_event(
+pub(crate) fn record_event(
     events_path: &Path,
     run_id: &str,
     scenario: Option<&str>,
@@ -2615,7 +2338,7 @@ fn record_event(
     record_event_with_optional_detail(events_path, run_id, scenario, hook, phase, None)
 }
 
-fn record_event_with_detail(
+pub(crate) fn record_event_with_detail(
     events_path: &Path,
     run_id: &str,
     scenario: Option<&str>,
@@ -2787,7 +2510,7 @@ fn artifact_name(path: &str) -> String {
     }
 }
 
-fn scenario_artifact_path(scenario: &str, artifact: &str) -> String {
+pub(crate) fn scenario_artifact_path(scenario: &str, artifact: &str) -> String {
     format!("artifacts/scenarios/{scenario}/{artifact}")
 }
 
@@ -2890,11 +2613,11 @@ fn write_runner_failure_boundary(
     )
 }
 
-const SCENARIO_CHILD_REPORT_FILE: &str = "scenario-child-report.json";
-const SCENARIO_CHILD_STDOUT_FILE: &str = "scenario-child.stdout.log";
-const SCENARIO_CHILD_STDERR_FILE: &str = "scenario-child.stderr.log";
+pub(crate) const SCENARIO_CHILD_REPORT_FILE: &str = "scenario-child-report.json";
+pub(crate) const SCENARIO_CHILD_STDOUT_FILE: &str = "scenario-child.stdout.log";
+pub(crate) const SCENARIO_CHILD_STDERR_FILE: &str = "scenario-child.stderr.log";
 
-fn scenario_child_report_path(sandbox: &Path, scenario: &str) -> PathBuf {
+pub(crate) fn scenario_child_report_path(sandbox: &Path, scenario: &str) -> PathBuf {
     sandbox
         .join("artifacts")
         .join("scenarios")
@@ -2903,9 +2626,9 @@ fn scenario_child_report_path(sandbox: &Path, scenario: &str) -> PathBuf {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct ScenarioChildReport {
-    scenario: ScenarioReport,
-    cleanup_error: Option<String>,
+pub(crate) struct ScenarioChildReport {
+    pub(crate) scenario: ScenarioReport,
+    pub(crate) cleanup_error: Option<String>,
 }
 
 fn is_runner_owned_sandbox(path: &Path) -> Result<bool, RunnerError> {
@@ -2989,7 +2712,7 @@ fn generated_run_id() -> String {
     format!("{}-{}", Utc::now().format("%Y%m%dT%H%M%SZ"), &suffix[..6])
 }
 
-fn timestamp() -> String {
+pub(crate) fn timestamp() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
@@ -3009,7 +2732,9 @@ fn host_platform() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::infra::command_streams_output;
     use crate::infra::{CommandExecutor, CommandOutput, InfraMode};
+    use crate::runner_lifecycle::DEFAULT_SCENARIO_CHILD_TIMEOUT;
     use std::cell::{Cell, RefCell};
 
     #[derive(Debug)]
