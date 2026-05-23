@@ -846,6 +846,24 @@ fn internal_vfs_types_and_helpers_drop_write_buffer_wording() {
 }
 
 #[test]
+fn vfs_facade_does_not_inline_startup_replay_and_read_context_internals() {
+    let hits = collect_term_hits(
+        "crates/studiofs-vfs/src/vfs.rs",
+        &[
+            "struct ReadRequestContext",
+            "struct ForegroundReadScope",
+            "struct StartupReplayCoordinator",
+        ],
+    );
+
+    assert!(
+        hits.is_empty(),
+        "vfs.rs should stay a facade and keep startup replay / read-context internals in focused modules:\n{}",
+        hits.join("\n")
+    );
+}
+
+#[test]
 fn prefetch_helper_name_drops_planner_wording() {
     let hits = collect_term_hits(
         "crates/studiofs-vfs/src/vfs/prefetch.rs",

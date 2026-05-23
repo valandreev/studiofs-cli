@@ -1,3 +1,4 @@
+use super::overlay::PendingUploadCatalog;
 use super::*;
 use crate::utils::{IntervalRange, trim_range_to_available_len};
 use crate::{LockTier, OrderedMutex};
