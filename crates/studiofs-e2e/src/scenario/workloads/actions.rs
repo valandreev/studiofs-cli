@@ -2,6 +2,46 @@
 
 use super::*;
 
+#[cfg(windows)]
+static HOTSPOT_HELPER_TIMED_IO_ACTIVE_WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(windows)]
+struct HotspotHelperTimedIoPermit {
+    active_workers: &'static AtomicUsize,
+}
+
+#[cfg(windows)]
+impl HotspotHelperTimedIoPermit {
+    fn try_acquire(pending_label: &str, timeout: Duration) -> Result<Self, anyhow::Error> {
+        let active_workers = &HOTSPOT_HELPER_TIMED_IO_ACTIVE_WORKERS;
+        let mut current = active_workers.load(Ordering::Acquire);
+        loop {
+            if current >= HOTSPOT_IO_MAX_ACTIVE_WORKERS {
+                return Err(anyhow::anyhow!(
+                    "{HOTSPOT_HELPER_INTERNAL_TIMEOUT_MARKER}: hotspot helper worker limit reached; previous timed operation may still be blocked before {pending_label}; refusing to spawn another worker after {} ms timeout budget",
+                    timeout.as_millis()
+                ));
+            }
+            match active_workers.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(Self { active_workers }),
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for HotspotHelperTimedIoPermit {
+    fn drop(&mut self) {
+        self.active_workers.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 pub(in crate::scenario) fn write_mounted_file_with_readback(
     path: PathBuf,
     payload: &[u8],
@@ -225,10 +265,16 @@ pub(in crate::scenario) fn run_hotspot_op_helper_with_windows_timeout(
     let mount_for_worker = mount_point.clone();
     let mount_for_timeout = mount_point;
     let (tx, rx) = mpsc::channel();
+    let pending_label = format!(
+        "{operation_for_timeout} {}",
+        mount_for_timeout.join(&path_for_timeout).display()
+    );
+    let worker_permit = HotspotHelperTimedIoPermit::try_acquire(&pending_label, timeout)?;
 
     let worker = thread::Builder::new()
         .name("studiofs-e2e-hotspot-helper-io".to_string())
         .spawn(move || {
+            let _worker_permit = worker_permit;
             let result = run_hotspot_op_helper(
                 &operation_for_worker,
                 mount_for_worker,
@@ -976,19 +1022,17 @@ pub(in crate::scenario) fn record_hotspot_helper_progress(
         .create(true)
         .append(true)
         .open(progress)?;
-    serde_json::to_writer(
-        &mut file,
-        &json!({
-            "timestamp_ms": timestamp_ms,
-            "phase": phase,
-            "operation": operation,
-            "path": path.display().to_string(),
-            "target": target,
-            "payload_len": payload_len,
-        }),
-    )
+    let mut line = serde_json::to_vec(&json!({
+        "timestamp_ms": timestamp_ms,
+        "phase": phase,
+        "operation": operation,
+        "path": path.display().to_string(),
+        "target": target,
+        "payload_len": payload_len,
+    }))
     .map_err(io::Error::other)?;
-    writeln!(file)?;
+    line.push(b'\n');
+    file.write_all(&line)?;
     file.flush()
 }
 

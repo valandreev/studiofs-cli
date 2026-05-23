@@ -2440,6 +2440,45 @@ fn hotspot_helper_records_progress_for_sync_barrier_phases() {
 }
 
 #[test]
+fn hotspot_helper_progress_records_complete_ndjson_lines() {
+    let temp = tempdir().unwrap();
+    let progress = temp.path().join("progress.jsonl");
+    let path = temp.path().join("mount").join("hotspot").join("slot.txt");
+
+    record_hotspot_helper_progress(
+        Some(&progress),
+        "before_write",
+        "overwrite",
+        &path,
+        Some("target.txt"),
+        Some(42),
+    )
+    .unwrap();
+    record_hotspot_helper_progress(
+        Some(&progress),
+        "after_write",
+        "overwrite",
+        &path,
+        None,
+        None,
+    )
+    .unwrap();
+
+    let progress_log = std::fs::read_to_string(progress).unwrap();
+    let lines = progress_log.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 2);
+    for line in lines {
+        let value: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(value["operation"], "overwrite");
+        assert!(value["timestamp_ms"].is_u64());
+    }
+    assert!(
+        progress_log.ends_with('\n'),
+        "progress log should end each NDJSON record with a newline"
+    );
+}
+
+#[test]
 fn overwrite_vs_read_collision_records_repeated_read_loop() {
     let temp = tempdir().unwrap();
     let sandbox = temp.path().join("run-1");

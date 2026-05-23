@@ -2,6 +2,44 @@
 
 use super::*;
 
+#[cfg(not(test))]
+static NAMESPACE_COLLISION_ACTIVE_WORKER_BATCHES: AtomicBool = AtomicBool::new(false);
+
+#[cfg(not(test))]
+struct NamespaceCollisionWorkerBatchPermit;
+
+#[cfg(not(test))]
+impl NamespaceCollisionWorkerBatchPermit {
+    fn try_acquire(timeout: Duration, pending: &[(usize, String)]) -> Result<Self, ScenarioError> {
+        if NAMESPACE_COLLISION_ACTIVE_WORKER_BATCHES
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return Ok(Self);
+        }
+
+        let pending = pending
+            .iter()
+            .map(|(_, label)| label.clone())
+            .chain(std::iter::once(
+                "namespace collision worker limit reached; previous timed operation may still be blocked"
+                    .to_string(),
+            ))
+            .collect();
+        Err(ScenarioError::NamespaceCollisionOperationTimeout {
+            timeout_ms: timeout.as_millis(),
+            pending,
+        })
+    }
+}
+
+#[cfg(not(test))]
+impl Drop for NamespaceCollisionWorkerBatchPermit {
+    fn drop(&mut self) {
+        NAMESPACE_COLLISION_ACTIVE_WORKER_BATCHES.store(false, Ordering::Release);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(in crate::scenario) enum NamespaceCollisionKind {
@@ -689,6 +727,10 @@ pub(in crate::scenario) fn run_concurrent_namespace_operations(
         .iter()
         .map(|task| (task.order, namespace_collision_task_label(task)))
         .collect::<Vec<_>>();
+    #[cfg(not(test))]
+    let batch_permit = Arc::new(NamespaceCollisionWorkerBatchPermit::try_acquire(
+        timeout, &pending,
+    )?);
     let expected_operations = pending.len();
     let completion_grace = tasks
         .iter()
@@ -699,7 +741,11 @@ pub(in crate::scenario) fn run_concurrent_namespace_operations(
     for task in tasks {
         let barrier = Arc::clone(&barrier);
         let tx = tx.clone();
+        #[cfg(not(test))]
+        let batch_permit = Arc::clone(&batch_permit);
         handles.push(thread::spawn(move || {
+            #[cfg(not(test))]
+            let _batch_permit = batch_permit;
             barrier.wait();
             let operation = record_fs_operation(
                 started,

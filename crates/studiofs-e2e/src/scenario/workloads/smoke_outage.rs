@@ -1510,15 +1510,16 @@ pub(in crate::scenario) fn run_crash_restart_mode(
             detail,
             peer_visible_before_convergence,
         } => {
-            if mode != CrashRestartMode::BeforeRemotePublicationCompletes
-                && let Some(final_checksum_sha256) = read_peer_checksum(&clients[1], relative_path)?
-            {
-                return Err(ScenarioError::CrashRestartCorruptAdvertisedFile {
-                    client: clients[1].name.clone(),
-                    path: relative_path.to_string(),
-                    expected_checksum: "unrecoverable_loss".to_string(),
-                    actual_checksum: final_checksum_sha256,
-                });
+            if mode != CrashRestartMode::BeforeRemotePublicationCompletes {
+                if let Some(final_checksum_sha256) = read_peer_checksum(&clients[1], relative_path)?
+                {
+                    return Err(ScenarioError::CrashRestartCorruptAdvertisedFile {
+                        client: clients[1].name.clone(),
+                        path: relative_path.to_string(),
+                        expected_checksum: "unrecoverable_loss".to_string(),
+                        actual_checksum: final_checksum_sha256,
+                    });
+                }
             }
 
             CrashRestartModeSummary {
