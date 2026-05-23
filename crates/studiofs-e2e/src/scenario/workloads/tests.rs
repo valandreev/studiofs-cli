@@ -1394,6 +1394,65 @@ fn mounted_payload_readback_distinguishes_missing_path_from_empty_file() {
 }
 
 #[test]
+fn bounded_mounted_io_times_out_blocked_operation() {
+    let pool = BoundedMountedIoPool::new(1);
+
+    let started = Instant::now();
+    let err = pool
+        .run(
+            "blocked read",
+            Duration::from_millis(20),
+            || -> io::Result<Vec<u8>> {
+                thread::sleep(Duration::from_millis(200));
+                Ok(Vec::new())
+            },
+        )
+        .unwrap_err();
+
+    assert!(
+        started.elapsed() < Duration::from_millis(150),
+        "bounded mounted I/O should return on timeout instead of waiting for the worker"
+    );
+    assert!(
+        matches!(err, ScenarioError::MountedIoTimeout { .. }),
+        "expected mounted I/O timeout, got {err:?}"
+    );
+}
+
+#[test]
+fn bounded_mounted_io_fails_fast_when_previous_worker_is_stuck() {
+    let pool = BoundedMountedIoPool::new(1);
+
+    let first = pool.run(
+        "blocked write",
+        Duration::from_millis(20),
+        || -> io::Result<()> {
+            thread::sleep(Duration::from_millis(200));
+            Ok(())
+        },
+    );
+    assert!(matches!(first, Err(ScenarioError::MountedIoTimeout { .. })));
+
+    let started = Instant::now();
+    let second = pool
+        .run(
+            "later read",
+            Duration::from_secs(1),
+            || -> io::Result<()> { Ok(()) },
+        )
+        .unwrap_err();
+
+    assert!(
+        started.elapsed() < Duration::from_millis(100),
+        "second mounted I/O should fail fast while the previous worker is still active"
+    );
+    assert!(
+        matches!(second, ScenarioError::MountedIoWorkerLimit { .. }),
+        "expected mounted I/O worker-limit diagnostic, got {second:?}"
+    );
+}
+
+#[test]
 fn mounted_chaos_initial_barrier_accepts_replicated_seed_tree() {
     let temp = tempdir().unwrap();
     let sandbox = temp.path().join("run-1");

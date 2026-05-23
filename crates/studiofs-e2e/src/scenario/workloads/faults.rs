@@ -41,10 +41,13 @@ pub(in crate::scenario) fn run_fault_chaos_operations(
         "local_write_during_pg_outage",
         &postgres_outage_path,
         || {
-            write_parented(
-                clients[0].mount_point.join(&postgres_outage_path),
-                &postgres_outage_payload,
+            let path = clients[0].mount_point.join(&postgres_outage_path);
+            run_bounded_mounted_io(
+                format!("fault chaos postgres outage write {}", path.display()),
+                MOUNTED_WRITE_READBACK_TIMEOUT,
+                move || write_parented(path, &postgres_outage_payload),
             )
+            .map_err(scenario_error_to_io)
         },
     ))?);
     operations.push(required_op(
@@ -91,10 +94,13 @@ pub(in crate::scenario) fn run_fault_chaos_operations(
         "local_write_during_s3_outage",
         &rustfs_outage_path,
         || {
-            write_parented(
-                clients[1].mount_point.join(&rustfs_outage_path),
-                &rustfs_outage_payload,
+            let path = clients[1].mount_point.join(&rustfs_outage_path);
+            run_bounded_mounted_io(
+                format!("fault chaos rustfs outage write {}", path.display()),
+                MOUNTED_WRITE_READBACK_TIMEOUT,
+                move || write_parented(path, &rustfs_outage_payload),
             )
+            .map_err(scenario_error_to_io)
         },
     ))?);
     operations.push(required_op(
@@ -113,7 +119,15 @@ pub(in crate::scenario) fn run_fault_chaos_operations(
         &clients[3],
         "cold_observer_readdir",
         &isolation.root,
-        || fs::read_dir(clients[3].mount_point.join(&isolation.root)).map(|_| ()),
+        || {
+            let path = clients[3].mount_point.join(&isolation.root);
+            run_bounded_mounted_io(
+                format!("fault chaos cold observer readdir {}", path.display()),
+                MOUNTED_VALIDATION_PROBE_TIMEOUT,
+                move || fs::read_dir(path).map(|_| ()),
+            )
+            .map_err(scenario_error_to_io)
+        },
     ));
     Ok(operations)
 }

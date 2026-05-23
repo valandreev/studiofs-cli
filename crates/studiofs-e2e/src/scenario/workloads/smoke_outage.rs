@@ -571,7 +571,12 @@ pub(in crate::scenario) fn run_mounted_smoke_body(
         let smoke_file = writer
             .mount_point
             .join(format!("{}-{SMOKE_FILE_NAME}", volume.volume_name));
-        fs::write(&smoke_file, SMOKE_FILE_PAYLOAD)?;
+        bounded_mounted_write(
+            smoke_file.clone(),
+            SMOKE_FILE_PAYLOAD.to_vec(),
+            format!("smoke write {}", smoke_file.display()),
+            MOUNTED_WRITE_READBACK_TIMEOUT,
+        )?;
         driver.after_smoke_file_written(&volume.volume_name, &smoke_file)?;
         let mounts = clients
             .iter()
@@ -766,9 +771,15 @@ pub(in crate::scenario) fn run_postgres_outage_body(
         });
     }
 
-    fs::write(
-        clients[0].mount_point.join(OUTAGE_INITIAL_FILE_NAME),
-        b"initial healthy PostgreSQL write\n",
+    let postgres_initial = clients[0].mount_point.join(OUTAGE_INITIAL_FILE_NAME);
+    bounded_mounted_write(
+        postgres_initial.clone(),
+        b"initial healthy PostgreSQL write\n".to_vec(),
+        format!(
+            "postgres outage initial write {}",
+            postgres_initial.display()
+        ),
+        MOUNTED_WRITE_READBACK_TIMEOUT,
     )?;
 
     let writer = &clients[0];
@@ -796,7 +807,14 @@ pub(in crate::scenario) fn run_postgres_outage_body(
     })?;
     let expected_checksum = bytes_sha256(POSTGRES_OUTAGE_RECOVERED_PAYLOAD);
     let writer_payload_path = writer.mount_point.join(POSTGRES_OUTAGE_FILE_NAME);
-    let writer_payload_result = fs::read(&writer_payload_path);
+    let writer_payload_result = bounded_mounted_read(
+        writer_payload_path.clone(),
+        format!(
+            "postgres outage writer recovery read {}",
+            writer_payload_path.display()
+        ),
+        MOUNTED_WRITE_READBACK_TIMEOUT,
+    );
     let (writer_payload, writer_recovery_status) = match writer_payload_result {
         Ok(payload) if payload == POSTGRES_OUTAGE_RECOVERED_PAYLOAD => {
             (payload, PostgresOutageWriterRecoveryStatus::Recovered)
@@ -819,7 +837,7 @@ pub(in crate::scenario) fn run_postgres_outage_body(
                 ),
             });
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => (
+        Err(ScenarioError::Io(error)) if error.kind() == io::ErrorKind::NotFound => (
             Vec::new(),
             PostgresOutageWriterRecoveryStatus::LostAfterUncleanShutdown,
         ),
@@ -890,7 +908,13 @@ pub(in crate::scenario) fn perform_postgres_writer_outage_operation(
         .create(true)
         .append(true)
         .open(context.scenario_dir.join("operations.ndjson"))?;
-    let write_result = fs::write(client.mount_point.join(relative), payload);
+    let mounted_path = client.mount_point.join(relative);
+    let write_result = bounded_mounted_write(
+        mounted_path.clone(),
+        payload.to_vec(),
+        format!("postgres outage writer write {}", mounted_path.display()),
+        MOUNTED_WRITE_READBACK_TIMEOUT,
+    );
     let error = write_result.err().map(|err| err.to_string());
     let operation_accepted = error.is_none();
     let record = OutageOperationRecord {
@@ -1086,7 +1110,12 @@ pub(in crate::scenario) fn run_rustfs_outage_body(
 
     let outage_started = Instant::now();
     driver.stop_rustfs()?;
-    fs::write(&source_file, RUSTFS_OUTAGE_RECOVERED_PAYLOAD)?;
+    bounded_mounted_write(
+        source_file.clone(),
+        RUSTFS_OUTAGE_RECOVERED_PAYLOAD.to_vec(),
+        format!("rustfs outage recovered write {}", source_file.display()),
+        MOUNTED_WRITE_READBACK_TIMEOUT,
+    )?;
     let local_read = wait_for_mounted_payload_readback(
         &source_file,
         RUSTFS_OUTAGE_RECOVERED_PAYLOAD,
@@ -1131,7 +1160,12 @@ pub(in crate::scenario) fn run_rustfs_outage_body(
     let upload_recovery_time_ms = recovery_started.elapsed().as_millis();
     let mut final_client_checksums = Vec::new();
     for client in clients.iter().take(RUSTFS_OUTAGE_CLIENT_NAMES.len()) {
-        let checksum = bytes_sha256(&fs::read(client.mount_point.join(relative_path))?);
+        let path = client.mount_point.join(relative_path);
+        let checksum = bytes_sha256(&bounded_mounted_read(
+            path.clone(),
+            format!("rustfs outage final read {}", path.display()),
+            MOUNTED_WRITE_READBACK_TIMEOUT,
+        )?);
         if checksum != local_read_checksum_sha256 {
             return Err(ScenarioError::Io(std::io::Error::other(format!(
                 "recovery convergence failure: {} read checksum {} but expected {} for {relative_path}",
@@ -1189,10 +1223,15 @@ pub(in crate::scenario) fn read_peer_checksum(
     peer: &ClientSpec,
     relative_path: &str,
 ) -> Result<Option<String>, ScenarioError> {
-    match fs::read(peer.mount_point.join(relative_path)) {
+    let path = peer.mount_point.join(relative_path);
+    match bounded_mounted_read(
+        path.clone(),
+        format!("peer checksum read {}", path.display()),
+        MOUNTED_WRITE_READBACK_TIMEOUT,
+    ) {
         Ok(payload) => Ok(Some(bytes_sha256(&payload))),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(err.into()),
+        Err(ScenarioError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
     }
 }
 
@@ -1478,7 +1517,12 @@ pub(in crate::scenario) fn run_crash_restart_mode(
             local_read_checksum_sha256,
             peer_visible_before_convergence,
         } => {
-            let final_payload = fs::read(clients[1].mount_point.join(relative_path))?;
+            let final_path = clients[1].mount_point.join(relative_path);
+            let final_payload = bounded_mounted_read(
+                final_path.clone(),
+                format!("crash restart final read {}", final_path.display()),
+                MOUNTED_WRITE_READBACK_TIMEOUT,
+            )?;
             let final_checksum_sha256 = bytes_sha256(&final_payload);
             if final_checksum_sha256 != local_read_checksum_sha256 {
                 return Err(ScenarioError::CrashRestartCorruptAdvertisedFile {
@@ -1549,9 +1593,13 @@ pub(in crate::scenario) fn read_crash_restart_recovered_payload(
     relative_path: &str,
 ) -> Result<CrashRestartRecoveredPayload, ScenarioError> {
     let path = client.mount_point.join(relative_path);
-    match fs::read(&path) {
+    match bounded_mounted_read(
+        path.clone(),
+        format!("crash restart recovered read {}", path.display()),
+        MOUNTED_WRITE_READBACK_TIMEOUT,
+    ) {
         Ok(payload) => Ok(CrashRestartRecoveredPayload::Recovered(payload)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        Err(ScenarioError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
             Ok(CrashRestartRecoveredPayload::UnrecoverableLoss {
                 detail: format!(
                     "{} could not read recovered bytes for {relative_path} after restart",
@@ -1559,7 +1607,7 @@ pub(in crate::scenario) fn read_crash_restart_recovered_payload(
                 ),
             })
         }
-        Err(error) => Err(ScenarioError::Io(error)),
+        Err(error) => Err(error),
     }
 }
 

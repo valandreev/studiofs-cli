@@ -2,8 +2,213 @@
 
 use super::*;
 
+static BOUNDED_MOUNTED_IO_POOL: OnceLock<BoundedMountedIoPool> = OnceLock::new();
+
 #[cfg(windows)]
 static HOTSPOT_HELPER_TIMED_IO_ACTIVE_WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug, Clone)]
+pub(in crate::scenario) struct BoundedMountedIoPool {
+    active_workers: Arc<AtomicUsize>,
+    max_workers: usize,
+}
+
+impl BoundedMountedIoPool {
+    pub(in crate::scenario) fn new(max_workers: usize) -> Self {
+        Self {
+            active_workers: Arc::new(AtomicUsize::new(0)),
+            max_workers,
+        }
+    }
+
+    pub(in crate::scenario) fn run<T>(
+        &self,
+        label: impl Into<String>,
+        timeout: Duration,
+        action: impl FnOnce() -> io::Result<T> + Send + 'static,
+    ) -> Result<T, ScenarioError>
+    where
+        T: Send + 'static,
+    {
+        let label = label.into();
+        let permit = self.try_acquire(&label, timeout)?;
+        let (tx, rx) = mpsc::channel();
+        let worker = thread::Builder::new()
+            .name("studiofs-e2e-mounted-io".to_string())
+            .spawn(move || {
+                let _permit = permit;
+                let _ = tx.send(action());
+            })
+            .map_err(ScenarioError::Io)?;
+
+        match rx.recv_timeout(timeout) {
+            Ok(result) => {
+                join_bounded_mounted_io_worker(worker)?;
+                result.map_err(ScenarioError::Io)
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let cancel_detail = cancel_bounded_mounted_io_worker(&worker);
+                Err(ScenarioError::MountedIoTimeout {
+                    label,
+                    timeout_ms: timeout.as_millis(),
+                    cancel_detail,
+                })
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                join_bounded_mounted_io_worker(worker)?;
+                Err(ScenarioError::Io(io::Error::other(
+                    "bounded mounted I/O worker exited without result",
+                )))
+            }
+        }
+    }
+
+    fn try_acquire(
+        &self,
+        label: &str,
+        timeout: Duration,
+    ) -> Result<BoundedMountedIoPermit, ScenarioError> {
+        let mut current = self.active_workers.load(Ordering::Acquire);
+        loop {
+            if current >= self.max_workers {
+                return Err(ScenarioError::MountedIoWorkerLimit {
+                    label: label.to_string(),
+                    active_workers: current,
+                    max_workers: self.max_workers,
+                    timeout_ms: timeout.as_millis(),
+                });
+            }
+            match self.active_workers.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Ok(BoundedMountedIoPermit {
+                        active_workers: Arc::clone(&self.active_workers),
+                    });
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+struct BoundedMountedIoPermit {
+    active_workers: Arc<AtomicUsize>,
+}
+
+impl Drop for BoundedMountedIoPermit {
+    fn drop(&mut self) {
+        self.active_workers.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn default_bounded_mounted_io_pool() -> &'static BoundedMountedIoPool {
+    BOUNDED_MOUNTED_IO_POOL
+        .get_or_init(|| BoundedMountedIoPool::new(BOUNDED_MOUNTED_IO_MAX_WORKERS))
+}
+
+pub(in crate::scenario) fn run_bounded_mounted_io<T>(
+    label: impl Into<String>,
+    timeout: Duration,
+    action: impl FnOnce() -> io::Result<T> + Send + 'static,
+) -> Result<T, ScenarioError>
+where
+    T: Send + 'static,
+{
+    default_bounded_mounted_io_pool().run(label, timeout, action)
+}
+
+pub(in crate::scenario) fn bounded_mounted_read(
+    path: PathBuf,
+    label: impl Into<String>,
+    timeout: Duration,
+) -> Result<Vec<u8>, ScenarioError> {
+    let label = label.into();
+    run_bounded_mounted_io(label, timeout, move || fs::read(path))
+}
+
+pub(in crate::scenario) fn bounded_mounted_write(
+    path: PathBuf,
+    payload: Vec<u8>,
+    label: impl Into<String>,
+    timeout: Duration,
+) -> Result<(), ScenarioError> {
+    let label = label.into();
+    run_bounded_mounted_io(label, timeout, move || fs::write(path, payload))
+}
+
+pub(in crate::scenario) fn bounded_mounted_metadata(
+    path: PathBuf,
+    label: impl Into<String>,
+    timeout: Duration,
+) -> Result<fs::Metadata, ScenarioError> {
+    let label = label.into();
+    run_bounded_mounted_io(label, timeout, move || fs::metadata(path))
+}
+
+pub(in crate::scenario) fn bounded_mounted_read_link(
+    path: PathBuf,
+    label: impl Into<String>,
+    timeout: Duration,
+) -> Result<PathBuf, ScenarioError> {
+    let label = label.into();
+    run_bounded_mounted_io(label, timeout, move || fs::read_link(path))
+}
+
+pub(in crate::scenario) fn bounded_mounted_read_dir_names(
+    path: PathBuf,
+    label: impl Into<String>,
+    timeout: Duration,
+) -> Result<Vec<std::ffi::OsString>, ScenarioError> {
+    let label = label.into();
+    run_bounded_mounted_io(label, timeout, move || {
+        let mut names = Vec::new();
+        for entry in fs::read_dir(path)? {
+            names.push(entry?.file_name());
+        }
+        Ok(names)
+    })
+}
+
+pub(in crate::scenario) fn bounded_mounted_open_file(
+    path: PathBuf,
+    label: impl Into<String>,
+    timeout: Duration,
+) -> Result<fs::File, ScenarioError> {
+    let label = label.into();
+    run_bounded_mounted_io(label, timeout, move || fs::File::open(path))
+}
+
+fn join_bounded_mounted_io_worker(worker: thread::JoinHandle<()>) -> Result<(), ScenarioError> {
+    worker
+        .join()
+        .map_err(|_| ScenarioError::Io(io::Error::other("bounded mounted I/O worker panicked")))
+}
+
+#[cfg(windows)]
+fn cancel_bounded_mounted_io_worker(worker: &thread::JoinHandle<()>) -> String {
+    use std::ffi::c_void;
+    use std::os::windows::io::AsRawHandle as _;
+
+    unsafe extern "system" {
+        fn CancelSynchronousIo(hThread: *mut c_void) -> i32;
+    }
+
+    let ok = unsafe { CancelSynchronousIo(worker.as_raw_handle().cast()) };
+    if ok == 0 {
+        format!("CancelSynchronousIo failed: {}", io::Error::last_os_error())
+    } else {
+        "CancelSynchronousIo requested".to_string()
+    }
+}
+
+#[cfg(not(windows))]
+fn cancel_bounded_mounted_io_worker(_worker: &thread::JoinHandle<()>) -> String {
+    "thread cancellation is not available on this platform".to_string()
+}
 
 #[cfg(windows)]
 struct HotspotHelperTimedIoPermit {
@@ -48,18 +253,25 @@ pub(in crate::scenario) fn write_mounted_file_with_readback(
     label: &str,
     create_new: bool,
 ) -> Result<(), ScenarioError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut options = mounted_write_barrier_open_options();
-    options.create(true).truncate(true);
-    if create_new {
-        options.create_new(true);
-    }
-    let mut file = options.open(&path)?;
-    file.write_all(payload)?;
-    file.sync_all()?;
-    drop(file);
+    let write_path = path.clone();
+    let write_payload = payload.to_vec();
+    run_bounded_mounted_io(
+        format!("{label}: write {}", path.display()),
+        MOUNTED_WRITE_READBACK_TIMEOUT,
+        move || {
+            if let Some(parent) = write_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut options = mounted_write_barrier_open_options();
+            options.create(true).truncate(true);
+            if create_new {
+                options.create_new(true);
+            }
+            let mut file = options.open(&write_path)?;
+            file.write_all(&write_payload)?;
+            file.sync_all()
+        },
+    )?;
     let readback = wait_for_mounted_payload_readback(
         &path,
         payload,
@@ -82,10 +294,12 @@ pub(in crate::scenario) fn write_mounted_file_without_barrier_with_readback(
     payload: &[u8],
     label: &str,
 ) -> Result<(), ScenarioError> {
-    retry_mounted_io(
-        || write_parented(path.clone(), payload),
+    let write_path = path.clone();
+    let write_payload = payload.to_vec();
+    run_bounded_mounted_io(
+        format!("{label}: write {}", path.display()),
         MOUNTED_WRITE_READBACK_TIMEOUT,
-        MOUNTED_WRITE_READBACK_POLL_INTERVAL,
+        move || write_parented(write_path, &write_payload),
     )?;
     let readback = wait_for_mounted_payload_readback(
         &path,
@@ -105,7 +319,11 @@ pub(in crate::scenario) fn write_mounted_file_without_barrier_with_readback(
 }
 
 pub(in crate::scenario) fn remove_mounted_file(path: PathBuf) -> Result<(), ScenarioError> {
-    fs::remove_file(path)?;
+    run_bounded_mounted_io(
+        format!("remove {}", path.display()),
+        MOUNTED_WRITE_READBACK_TIMEOUT,
+        move || fs::remove_file(path),
+    )?;
     Ok(())
 }
 
