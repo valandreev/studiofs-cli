@@ -43,11 +43,17 @@ pub(super) fn canonical_subsystem(value: &str) -> &str {
 }
 
 pub(super) fn subsystem_matches(filter: Option<&str>, candidate: &str) -> bool {
-    filter.is_none_or(|filter| canonical_subsystem(filter) == canonical_subsystem(candidate))
+    match filter {
+        Some(filter) => canonical_subsystem(filter) == canonical_subsystem(candidate),
+        None => true,
+    }
 }
 
 pub(super) fn operation_matches(filter: Option<&str>, candidate: &str) -> bool {
-    filter.is_none_or(|filter| filter == candidate)
+    match filter {
+        Some(filter) => filter == candidate,
+        None => true,
+    }
 }
 
 pub(super) fn json_contains_u64(value: &serde_json::Value, keys: &[&str], expected: u64) -> bool {
@@ -90,20 +96,22 @@ pub(super) fn object_identity_matches_fields(
     fields: &serde_json::Value,
     identity: &DiagnosticsObjectIdentity,
 ) -> bool {
-    if let Some(inode) = identity.inode
-        && !json_contains_u64(fields, &["ino", "inode"], inode)
-    {
-        return false;
+    if let Some(inode) = identity.inode {
+        if !json_contains_u64(fields, &["ino", "inode"], inode) {
+            return false;
+        }
     }
-    if let Some(path) = identity.path.as_deref()
-        && !json_contains_string(fields, &["path"], path)
-    {
-        return false;
+    match &identity.path {
+        Some(path) if !json_contains_string(fields, &["path"], path) => return false,
+        _ => {}
     }
-    if let Some(file_handle) = identity.file_handle.as_deref()
-        && !json_contains_string(fields, &["file_handle", "fh", "handle_id"], file_handle)
-    {
-        return false;
+    match &identity.file_handle {
+        Some(file_handle)
+            if !json_contains_string(fields, &["file_handle", "fh", "handle_id"], file_handle) =>
+        {
+            return false;
+        }
+        _ => {}
     }
     true
 }
@@ -119,16 +127,18 @@ pub(super) fn event_matches_scope(
     if !operation_matches(scope.operation_type.as_deref(), &event.kind) {
         return false;
     }
-    if let Some(identity) = scope.object_identity.as_ref()
-        && !object_identity_matches_fields(&event.fields, identity)
-    {
-        return false;
+    match &scope.object_identity {
+        Some(identity) if !object_identity_matches_fields(&event.fields, identity) => {
+            return false;
+        }
+        _ => {}
     }
-    if let Some(marker_span) = marker_span
-        && (event.generated_unix_ms < marker_span.start_unix_ms
-            || event.generated_unix_ms > marker_span.end_unix_ms)
-    {
-        return false;
+    if let Some(marker_span) = marker_span {
+        if event.generated_unix_ms < marker_span.start_unix_ms
+            || event.generated_unix_ms > marker_span.end_unix_ms
+        {
+            return false;
+        }
     }
     true
 }
@@ -317,15 +327,15 @@ pub(super) fn derive_queue_growth_episodes(
         }
     }
 
-    if let Some((start_event, start_pending, end_event, end_pending)) = current
-        && end_pending > start_pending
-    {
-        episodes.push(queue_growth_episode(
-            start_event,
-            start_pending,
-            end_event,
-            end_pending,
-        ));
+    if let Some((start_event, start_pending, end_event, end_pending)) = current {
+        if end_pending > start_pending {
+            episodes.push(queue_growth_episode(
+                start_event,
+                start_pending,
+                end_event,
+                end_pending,
+            ));
+        }
     }
 
     truncate_to_limit(episodes, limit)
@@ -820,10 +830,11 @@ pub(super) fn build_evidence_view_with_snapshot(
     let filtered_timeline_entries = run
         .timeline
         .iter()
-        .filter(|entry| {
-            resolved_marker_span.as_ref().is_none_or(|span| {
+        .filter(|entry| match resolved_marker_span.as_ref() {
+            Some(span) => {
                 entry.sequence >= span.start_sequence && entry.sequence <= span.end_sequence
-            })
+            }
+            None => true,
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -835,11 +846,12 @@ pub(super) fn build_evidence_view_with_snapshot(
     let filtered_profiling_windows = run
         .profiling_windows
         .iter()
-        .filter(|window| {
-            resolved_marker_span.as_ref().is_none_or(|span| {
+        .filter(|window| match resolved_marker_span.as_ref() {
+            Some(span) => {
                 window.occurred_unix_ms >= span.start_unix_ms
                     && window.occurred_unix_ms <= span.end_unix_ms
-            })
+            }
+            None => true,
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -887,13 +899,21 @@ pub(super) fn build_evidence_view_with_snapshot(
     );
     let (blocking_intervals, blocking_intervals_truncated) = derive_blocking_intervals(
         &request.scope,
-        snapshot_in_view.then_some(&snapshot),
+        if snapshot_in_view {
+            Some(&snapshot)
+        } else {
+            None
+        },
         &typed_profiling_windows,
         applied_budget.max_derived_items_per_kind,
     );
     let (hotspots, hotspots_truncated) = derive_hotspots(
         &request.scope,
-        snapshot_in_view.then_some(&snapshot),
+        if snapshot_in_view {
+            Some(&snapshot)
+        } else {
+            None
+        },
         &typed_profiling_windows,
         applied_budget.max_derived_items_per_kind,
     );
@@ -1491,15 +1511,17 @@ pub(super) fn materialize_run_span_comparison(
             let baseline_count = baseline_refs.len();
             let candidate_count = candidate_refs.len();
             let delta = candidate_count as i64 - baseline_count as i64;
-            (baseline_count > 0 || candidate_count > 0).then_some(
-                InvestigationComparisonAnomalyDelta {
+            if baseline_count > 0 || candidate_count > 0 {
+                Some(InvestigationComparisonAnomalyDelta {
                     title,
                     baseline_count,
                     candidate_count,
                     delta,
                     supporting_evidence: baseline_refs.into_iter().chain(candidate_refs).collect(),
-                },
-            )
+                })
+            } else {
+                None
+            }
         })
         .collect::<Vec<_>>();
 
@@ -1682,9 +1704,10 @@ pub(super) fn capture_bundle_artifact(
         "runtime_snapshot": snapshot,
         "recent_events": recent_events,
     });
-    fs::write(&path, serde_json::to_vec_pretty(&payload)?)
+    let payload_bytes = serde_json::to_vec_pretty(&payload)?;
+    let bytes = payload_bytes.len() as u64;
+    fs::write(&path, payload_bytes)
         .with_context(|| format!("write diagnostics bundle '{}'", path.display()))?;
-    let bytes = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
     Ok(ProfileArtifactRecord {
         kind: "diagnostics_bundle".to_string(),
         path: path.to_string_lossy().into_owned(),

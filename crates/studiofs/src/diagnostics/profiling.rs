@@ -209,8 +209,7 @@ impl RuntimeProfilingStopper for WallBlockingProfileStopper {
         let mut artifact = None;
         let mut error = None;
         match write_wall_blocking_artifact(&self.cache_path, &payload) {
-            Ok(path) => {
-                let bytes = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+            Ok((path, bytes)) => {
                 artifact = Some(ProfileArtifactRecord {
                     kind: "wall_blocking_summary".to_string(),
                     path: path.to_string_lossy().into_owned(),
@@ -459,14 +458,14 @@ pub(super) fn validate_profiling_request(
             max_duration_ms: MAX_PROFILE_WINDOW_DURATION_MS,
         });
     }
-    if let Some(sample_rate_hz) = request.budget.sample_rate_hz
-        && !(MIN_PROFILE_SAMPLE_RATE_HZ..=MAX_PROFILE_SAMPLE_RATE_HZ).contains(&sample_rate_hz)
-    {
-        return Err(ProfilingBudgetValidationError::InvalidSampleRate {
-            requested_hz: sample_rate_hz,
-            min_hz: MIN_PROFILE_SAMPLE_RATE_HZ,
-            max_hz: MAX_PROFILE_SAMPLE_RATE_HZ,
-        });
+    if let Some(sample_rate_hz) = request.budget.sample_rate_hz {
+        if !(MIN_PROFILE_SAMPLE_RATE_HZ..=MAX_PROFILE_SAMPLE_RATE_HZ).contains(&sample_rate_hz) {
+            return Err(ProfilingBudgetValidationError::InvalidSampleRate {
+                requested_hz: sample_rate_hz,
+                min_hz: MIN_PROFILE_SAMPLE_RATE_HZ,
+                max_hz: MAX_PROFILE_SAMPLE_RATE_HZ,
+            });
+        }
     }
     Ok(())
 }

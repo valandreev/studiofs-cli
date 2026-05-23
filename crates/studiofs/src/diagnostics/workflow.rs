@@ -230,11 +230,14 @@ pub(super) fn workflow_dependencies_satisfied(
     step: &crate::investigation::InvestigationWorkflowStepState,
 ) -> bool {
     step.allowed_after.iter().all(|dependency| {
-        workflow
+        match workflow
             .steps
             .iter()
             .find(|candidate| candidate.step_id == *dependency)
-            .is_some_and(|candidate| workflow_step_is_terminal(candidate.status))
+        {
+            Some(candidate) => workflow_step_is_terminal(candidate.status),
+            None => false,
+        }
     })
 }
 
@@ -658,7 +661,7 @@ pub(super) fn execute_workflow_tool_like_step(
 pub(super) fn write_wall_blocking_artifact(
     cache_path: &Path,
     payload: &serde_json::Value,
-) -> Result<PathBuf> {
+) -> Result<(PathBuf, u64)> {
     let output_dir = cache_path.join(DIAGNOSTICS_PROFILE_ARTIFACT_DIR_NAME);
     fs::create_dir_all(&output_dir).with_context(|| {
         format!(
@@ -672,11 +675,13 @@ pub(super) fn write_wall_blocking_artifact(
         Uuid::new_v4()
     );
     let path = output_dir.join(filename);
-    fs::write(&path, serde_json::to_vec_pretty(payload)?).with_context(|| {
+    let bytes = serde_json::to_vec_pretty(payload)?;
+    let len = bytes.len() as u64;
+    fs::write(&path, &bytes).with_context(|| {
         format!(
             "write wall-blocking profiling artifact '{}'",
             path.display()
         )
     })?;
-    Ok(path)
+    Ok((path, len))
 }
