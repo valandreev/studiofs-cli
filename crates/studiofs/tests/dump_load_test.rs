@@ -369,7 +369,7 @@ async fn verify_payload_from_discovered(home: &Path, disk_name: &str, expected: 
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires RustFS/S3 + PostgreSQL test env (STUDIOFS_S3_*, STUDIOFS_TEST_PG_DSN)"]
 async fn dump_load_restores_volume_and_discovery_reads_data() {
     let Some(env) = load_test_env() else {
         eprintln!("skipping: env not ready");
@@ -449,7 +449,7 @@ async fn dump_load_restores_volume_and_discovery_reads_data() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires RustFS/S3 + PostgreSQL test env (STUDIOFS_S3_*, STUDIOFS_TEST_PG_DSN)"]
 async fn dump_load_restores_target_volume_without_breaking_other_volumes() {
     let Some(env) = load_test_env() else {
         eprintln!("skipping: env not ready");

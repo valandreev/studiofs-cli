@@ -111,7 +111,7 @@ async fn ensure_bucket() {
 // ────────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3 backend (set STUDIOFS_S3_* or .env)"]
 async fn put_and_get_object() {
     ensure_bucket().await;
     let store = make_store();
@@ -128,7 +128,7 @@ async fn put_and_get_object() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3 backend (set STUDIOFS_S3_* or .env)"]
 async fn put_and_get_by_key() {
     ensure_bucket().await;
     let store = make_store();
@@ -147,7 +147,7 @@ async fn put_and_get_by_key() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3 backend (set STUDIOFS_S3_* or .env)"]
 async fn object_exists_lifecycle() {
     ensure_bucket().await;
     let store = make_store();
@@ -166,7 +166,7 @@ async fn object_exists_lifecycle() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3 backend (set STUDIOFS_S3_* or .env)"]
 async fn delete_object_idempotent() {
     ensure_bucket().await;
     let store = make_store();
@@ -182,7 +182,7 @@ async fn delete_object_idempotent() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3 backend (set STUDIOFS_S3_* or .env)"]
 async fn large_multi_object_write() {
     ensure_bucket().await;
     let store = make_store();

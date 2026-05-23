@@ -359,7 +359,7 @@ fn destroy_fails_for_missing_volume_name() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "requires RustFS/S3 + PostgreSQL test env (STUDIOFS_S3_*, STUDIOFS_TEST_PG_DSN)"]
 fn destroy_fails_cleanly_with_incorrect_s3_permissions() {
     let Some(fixture) = build_infra_fixture("destroy-bad-creds") else {
         eprintln!("skipping: STUDIOFS_TEST_PG_DSN/S3 env not ready");
@@ -403,7 +403,7 @@ fn destroy_fails_cleanly_with_incorrect_s3_permissions() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "requires RustFS/S3 + PostgreSQL test env (STUDIOFS_S3_*, STUDIOFS_TEST_PG_DSN)"]
 fn destroy_local_only_removes_local_state_and_keeps_remote() {
     let Some(fixture) = build_infra_fixture("destroy-local-only") else {
         eprintln!("skipping: STUDIOFS_TEST_PG_DSN/S3 env not ready");
@@ -450,7 +450,7 @@ fn destroy_local_only_removes_local_state_and_keeps_remote() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "requires RustFS/S3 + PostgreSQL test env (STUDIOFS_S3_*, STUDIOFS_TEST_PG_DSN)"]
 fn destroy_full_removes_local_s3_and_postgres_state() {
     let Some(fixture) = build_infra_fixture("destroy-full") else {
         eprintln!("skipping: STUDIOFS_TEST_PG_DSN/S3 env not ready");

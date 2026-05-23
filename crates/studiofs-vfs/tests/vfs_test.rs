@@ -895,7 +895,7 @@ fn make_vfs_with_meta_without_background_workers(
     .expect("failed to create StudioVfs")
 }
 
-/// RAII guard that captures and restores all SFS-121 offline test env vars on drop.
+/// RAII guard that captures and restores all offline S3 test env vars on drop.
 /// The explicit `_lock` field holds the global env lock for the **entire** test
 /// duration, preventing other parallel tests from observing a partially-set env.
 struct OfflineTestEnv {
@@ -904,12 +904,12 @@ struct OfflineTestEnv {
 }
 
 /// Capture current env state and install the standard offline S3 config for
-/// SFS-121 tests: unreachable endpoint + fast upload-retry timeouts.
+/// offline local S3 tests: unreachable endpoint + fast upload-retry timeouts.
 ///
 /// The global env lock is acquired **before** any captures so that no other
 /// test can observe the environment mid-setup.  The returned guard holds the
 /// lock and restores all captured variables when dropped.
-fn setup_offline_sfs121_env() -> OfflineTestEnv {
+fn setup_offline_local_s3_env() -> OfflineTestEnv {
     let lock = acquire_test_env_lock();
     let guards = vec![
         ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES"),
@@ -940,7 +940,7 @@ fn setup_offline_sfs121_env() -> OfflineTestEnv {
     }
 }
 
-/// RAII guard that captures and restores all SFS-121 S3-backed test env vars on drop.
+/// RAII guard that captures and restores all offline S3-backed test env vars on drop.
 /// The explicit `_lock` field holds the global env lock for the **entire** test
 /// duration, preventing other parallel tests from observing a partially-set env.
 struct OnlineTestEnv {
@@ -948,14 +948,14 @@ struct OnlineTestEnv {
     _lock: ReentrantMutexGuard<'static, ()>,
 }
 
-/// Capture current env state and install S3 connection vars for SFS-121 tests
+/// Capture current env state and install S3 connection vars for offline local S3 tests
 /// that require a real S3 backend.
 ///
 /// Upload timing vars (`STUDIOFS_MAX_DIRTY_BYTES`, `STUDIOFS_MAX_SPILL_BYTES`,
 /// `STUDIOFS_UPLOAD_DELAY_MS`, `STUDIOFS_UPLOAD_WORKER_COUNT`) are intentionally
 /// left unset — they differ per test and must be set by the caller under the
 /// held lock.  All captured vars are restored when the returned guard is dropped.
-fn setup_online_sfs121_env() -> OnlineTestEnv {
+fn setup_online_local_s3_env() -> OnlineTestEnv {
     let lock = acquire_test_env_lock();
     let guards = vec![
         ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES"),
@@ -979,18 +979,18 @@ fn setup_online_sfs121_env() -> OnlineTestEnv {
     }
 }
 
-/// Create a VFS wired to an unreachable S3 endpoint for SFS-121 offline tests.
+/// Create a VFS wired to an unreachable S3 endpoint for offline S3 tests.
 /// Returns `(format_info, vfs)` so callers can derive block sizes and volume
 /// names without reconstructing format info.
 ///
-/// Assumes `setup_offline_sfs121_env()` has already been called in the test.
-fn make_offline_vfs_sfs121(
+/// Assumes `setup_offline_local_s3_env()` has already been called in the test.
+fn make_offline_vfs_local_s3(
     tmp: &tempfile::TempDir,
     suffix: &str,
     block_size_override: Option<u32>,
 ) -> (FormatInfo, Arc<StudioVfs>) {
     let mut format_info = make_format_info_with_endpoint(
-        &format!("sfs121-{suffix}-{}", std::process::id()),
+        &format!("local-s3-{suffix}-{}", std::process::id()),
         "http://127.0.0.1:59999",
     );
     if let Some(bs) = block_size_override {
@@ -1565,7 +1565,7 @@ fn wait_until_n_payload_slices(
 // =============================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_create_write_read_file() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -1594,7 +1594,7 @@ async fn test_create_write_read_file() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_write_read_large_file() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -1619,7 +1619,7 @@ async fn test_write_read_large_file() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_write_at_offset() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -1646,7 +1646,7 @@ async fn test_write_at_offset() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_overwrite_and_read() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -1675,7 +1675,7 @@ async fn test_overwrite_and_read() {
 // =============================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_block_allocation() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -1714,7 +1714,7 @@ async fn test_block_allocation() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_partial_block() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -1746,7 +1746,7 @@ async fn test_partial_block() {
 // =============================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_directory_operations() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -1791,7 +1791,7 @@ async fn test_directory_operations() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_rename_file() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -1824,7 +1824,7 @@ async fn test_rename_file() {
 // =============================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_truncate_file() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -1866,7 +1866,7 @@ async fn test_truncate_file() {
 // =============================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_pending_deletions_gc() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -1946,7 +1946,7 @@ async fn test_pending_deletions_gc() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_background_janitor_removes_orphan_object() {
     ensure_bucket().await;
 
@@ -1998,7 +1998,7 @@ async fn test_background_janitor_removes_orphan_object() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_background_janitor_cleans_simulated_crash_orphan() {
     ensure_bucket().await;
 
@@ -2066,7 +2066,7 @@ async fn test_background_janitor_cleans_simulated_crash_orphan() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_background_janitor_does_not_heal_dangling_dentry_without_foreground_access() {
     ensure_bucket().await;
 
@@ -2099,7 +2099,7 @@ async fn test_background_janitor_does_not_heal_dangling_dentry_without_foregroun
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_background_janitor_recovers_pending_create_intent_runtime() {
     ensure_bucket().await;
 
@@ -2169,7 +2169,7 @@ async fn test_background_janitor_recovers_pending_create_intent_runtime() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_background_janitor_does_not_recover_deferred_delete_undo_runtime() {
     ensure_bucket().await;
 
@@ -2237,7 +2237,7 @@ async fn test_background_janitor_does_not_recover_deferred_delete_undo_runtime()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_background_janitor_recovers_only_pending_create_in_mixed_runtime() {
     ensure_bucket().await;
 
@@ -2327,7 +2327,7 @@ async fn test_background_janitor_recovers_only_pending_create_in_mixed_runtime()
 }
 
 #[test]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 fn test_crash_recovery_replays_pending_journal() {
     let boot_rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -5901,7 +5901,7 @@ fn large_file_rename_does_not_restart_or_duplicate_uploads() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3 backend for offline S3 tests (STUDIOFS_S3_*)"]
 async fn rename_into_trashes_deletes_and_evicts_local_payload_objects() {
     apply_test_online_s3_env();
     ensure_bucket().await;
@@ -5954,7 +5954,7 @@ async fn rename_into_trashes_deletes_and_evicts_local_payload_objects() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3 backend for offline S3 tests (STUDIOFS_S3_*)"]
 async fn rename_into_windows_recycle_bin_deletes_and_evicts_local_payload_objects() {
     apply_test_online_s3_env();
     ensure_bucket().await;
@@ -7653,7 +7653,7 @@ fn recovery_after_offline_s3_preserves_local_accepted_view() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "requires long-running soak test setup and tuned upload/spill environment"]
 fn twenty_four_hour_soak_no_global_fs_stall() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
@@ -8296,7 +8296,7 @@ fn test_ingress_multi_writer_spill_recovers_after_crash() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "requires crash-recovery + spill-segment stress setup and is intentionally ignored by default"]
 fn test_crash_recovery_replays_from_segments_when_spill_files_are_missing() {
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
@@ -8457,7 +8457,7 @@ async fn test_object_key_format() {
 // =============================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_sequential_write_performance() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -8572,7 +8572,7 @@ async fn test_attr_cache_ttl() {
 // =============================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_open_file_and_release() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -8606,7 +8606,7 @@ async fn test_open_file_and_release() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_open_trunc() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -8630,7 +8630,7 @@ async fn test_open_trunc() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_open_unlink_deferred_cleanup() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -8674,7 +8674,7 @@ async fn test_open_unlink_deferred_cleanup() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_release_fh_orphan_cleanup_is_idempotent_when_inode_already_missing() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -8700,7 +8700,7 @@ async fn test_release_fh_orphan_cleanup_is_idempotent_when_inode_already_missing
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_restart_recovers_deferred_open_unlink_cleanup() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -8748,7 +8748,7 @@ async fn test_restart_recovers_deferred_open_unlink_cleanup() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_multiple_handles_open_unlink() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -8790,7 +8790,7 @@ async fn test_multiple_handles_open_unlink() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_dangling_dentry_is_self_healed_on_lookup_and_unlink() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -8819,7 +8819,7 @@ async fn test_dangling_dentry_is_self_healed_on_lookup_and_unlink() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_dangling_dentry_is_self_healed_on_readdir() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -8851,7 +8851,7 @@ async fn test_dangling_dentry_is_self_healed_on_readdir() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_fsync() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -8882,7 +8882,7 @@ async fn test_fsync() {
 // =============================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_setattr_timestamps() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -8928,7 +8928,7 @@ async fn test_setattr_timestamps() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_setattr_mode_uid_gid() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -8958,7 +8958,7 @@ async fn test_setattr_mode_uid_gid() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_symlink_create_and_readlink() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -8983,7 +8983,7 @@ async fn test_symlink_create_and_readlink() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_symlink_unlink() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -9005,7 +9005,7 @@ async fn test_symlink_unlink() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_symlink_in_readdir() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -9030,7 +9030,7 @@ async fn test_symlink_in_readdir() {
 // =============================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_hardlink_create_and_read() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -9057,7 +9057,7 @@ async fn test_hardlink_create_and_read() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_hardlink_unlink_keeps_data() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -9094,7 +9094,7 @@ async fn test_hardlink_unlink_keeps_data() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_hardlink_dir_fails() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -9110,7 +9110,7 @@ async fn test_hardlink_dir_fails() {
 // =============================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_flock_exclusive_blocks() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -9138,7 +9138,7 @@ async fn test_flock_exclusive_blocks() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_flock_shared_allows_multiple() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -9166,7 +9166,7 @@ async fn test_flock_shared_allows_multiple() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_flock_unlock_and_relock() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -9195,7 +9195,7 @@ async fn test_flock_unlock_and_relock() {
 // =============================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_xattr_set_get_remove() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -9223,7 +9223,7 @@ async fn test_xattr_set_get_remove() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_xattr_cascade_on_unlink() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -9241,7 +9241,7 @@ async fn test_xattr_cascade_on_unlink() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_xattr_multiple_attrs() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -9263,7 +9263,7 @@ async fn test_xattr_multiple_attrs() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_xattr_limit_exact_and_exceeds_boundaries() {
     ensure_bucket().await;
     let _restore_xattr_limit = ScopedEnvVar::capture("STUDIOFS_XATTR_MAX_BYTES");
@@ -9291,7 +9291,7 @@ async fn test_xattr_limit_exact_and_exceeds_boundaries() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_xattr_resource_fork_honors_limit() {
     ensure_bucket().await;
     let _restore_xattr_limit = ScopedEnvVar::capture("STUDIOFS_XATTR_MAX_BYTES");
@@ -9319,7 +9319,7 @@ async fn test_xattr_resource_fork_honors_limit() {
 // =============================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_validate_name_create_rejects_invalid() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -9344,7 +9344,7 @@ async fn test_validate_name_create_rejects_invalid() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_validate_name_mkdir_rejects_invalid() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -9357,7 +9357,7 @@ async fn test_validate_name_mkdir_rejects_invalid() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_validate_name_rename_rejects_invalid() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -9379,7 +9379,7 @@ async fn test_validate_name_rename_rejects_invalid() {
 // =============================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_statfs_initial() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -9397,7 +9397,7 @@ async fn test_statfs_initial() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_statfs_after_write() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -9444,7 +9444,7 @@ async fn test_statfs_after_write() {
 /// Truncate a file to exactly a block boundary.
 /// Verify the remaining payload range has full block_size length.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_truncate_to_exact_block_boundary() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -9482,7 +9482,7 @@ async fn test_truncate_to_exact_block_boundary() {
 /// Extend a file beyond its current size (sparse hole).
 /// Verify reading the hole returns zeroes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_truncate_extend_creates_sparse_hole() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -9520,7 +9520,7 @@ async fn test_truncate_extend_creates_sparse_hole() {
 /// Bytes between the truncated EOF and the new write offset must be zeroed,
 /// not preserved from the old tail.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_truncate_shrink_then_extend_zero_fills_old_tail() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -9550,7 +9550,7 @@ async fn test_truncate_shrink_then_extend_zero_fills_old_tail() {
 /// Write exactly block_size bytes then 1 byte at the next block boundary.
 /// Exercises the full-block eager flush path + new partial block creation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_write_at_exact_block_boundary_transition() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -10657,9 +10657,9 @@ fn write_stages_full_blocks_and_buffers_tail_without_buffered_relief() {
 /// Truncate to zero, then write again. Verify old payload slices stop being
 /// visible locally and new data is correct.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires offline S3 test env with injected unreachable endpoint and tuned local settings"]
 async fn test_truncate_to_zero_then_rewrite() {
-    let _env = setup_offline_sfs121_env();
+    let _env = setup_offline_local_s3_env();
     let tmp = tempfile::tempdir().unwrap();
     let vfs = make_vfs(&tmp, "trunc-zero-rw");
 
@@ -10709,7 +10709,7 @@ async fn test_truncate_to_zero_then_rewrite() {
 
 /// Reading past EOF should return empty bytes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_read_beyond_eof_returns_empty() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -10731,7 +10731,7 @@ async fn test_read_beyond_eof_returns_empty() {
 /// Read spanning an allocated block and unallocated blocks (sparse file).
 /// Allocated part returns data, unallocated returns zeroes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_read_spanning_allocated_and_sparse_blocks() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -10765,7 +10765,7 @@ async fn test_read_spanning_allocated_and_sparse_blocks() {
 
 /// Flush an empty file (no writes) — should be a no-op without errors.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_flush_empty_file_is_noop() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -10785,7 +10785,7 @@ async fn test_flush_empty_file_is_noop() {
 
 /// Read zero bytes from a file — should return empty immediately.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_read_zero_bytes() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -10801,7 +10801,7 @@ async fn test_read_zero_bytes() {
 
 /// Write zero bytes — should be a no-op and return 0.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_write_zero_bytes_is_noop() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -10814,7 +10814,7 @@ async fn test_write_zero_bytes_is_noop() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn create_should_ignore_ds_store_without_persisting_metadata_or_data() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -10837,7 +10837,7 @@ async fn create_should_ignore_ds_store_without_persisting_metadata_or_data() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn create_should_ignore_appledouble_without_persisting_metadata_or_data() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -10860,7 +10860,7 @@ async fn create_should_ignore_appledouble_without_persisting_metadata_or_data() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn rename_should_drop_blocked_macos_metadata_target_without_persisting_it() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -10878,7 +10878,7 @@ async fn rename_should_drop_blocked_macos_metadata_target_without_persisting_it(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn concurrent_create_should_reuse_single_ignored_file_inode_per_path() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -10910,7 +10910,7 @@ async fn concurrent_create_should_reuse_single_ignored_file_inode_per_path() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn mkdir_should_blackhole_root_macos_metadata_dirs_without_persisting_children() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -10954,7 +10954,7 @@ async fn mkdir_should_blackhole_root_macos_metadata_dirs_without_persisting_chil
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn blocked_root_metadata_names_should_be_ignored_for_file_and_symlink_creation() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -10984,7 +10984,7 @@ async fn blocked_root_metadata_names_should_be_ignored_for_file_and_symlink_crea
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn readdir_and_lookup_should_hide_legacy_root_macos_metadata_dirs() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -11015,7 +11015,7 @@ async fn readdir_and_lookup_should_hide_legacy_root_macos_metadata_dirs() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn unlink_should_remove_legacy_persisted_root_blocked_regular_file() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -11035,7 +11035,7 @@ async fn unlink_should_remove_legacy_persisted_root_blocked_regular_file() {
 /// Rename a file across directories.
 /// Verify both parent caches are invalidated and the file is accessible at the new path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_rename_cross_directory() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -11081,7 +11081,7 @@ async fn test_rename_cross_directory() {
 /// Rename a file over an existing file (overwrite).
 /// Verify the displaced file's blocks are GC'd.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_rename_overwrite_existing_file() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -11123,9 +11123,9 @@ async fn test_rename_overwrite_existing_file() {
 /// Unlink a file while it has an open handle (open-unlink / orphan pattern).
 /// Verify data is accessible until the last handle is released, then cleaned up.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires offline S3 test env with injected unreachable endpoint and tuned local settings"]
 async fn test_unlink_with_open_handle_deferred_cleanup() {
-    let _env = setup_offline_sfs121_env();
+    let _env = setup_offline_local_s3_env();
     set_test_env("STUDIOFS_UPLOAD_DELAY_MS", "60000");
 
     let tmp = tempfile::tempdir().unwrap();
@@ -11179,7 +11179,7 @@ async fn test_unlink_with_open_handle_deferred_cleanup() {
 
 /// Rmdir on non-empty directory should fail.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_rmdir_nonempty_fails() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -11194,7 +11194,7 @@ async fn test_rmdir_nonempty_fails() {
 
 /// Create many files in one directory and verify readdir returns all of them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_readdir_many_entries() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -11225,7 +11225,7 @@ async fn test_readdir_many_entries() {
 /// Concurrent reads and writes to the same file.
 /// Verify reads see consistent data (no torn blocks).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_concurrent_read_write_same_file() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -11283,7 +11283,7 @@ async fn test_concurrent_read_write_same_file() {
 
 /// Multiple concurrent flush() calls on the same inode should not deadlock or lose data.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_concurrent_flush_does_not_deadlock() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -11315,7 +11315,7 @@ async fn test_concurrent_flush_does_not_deadlock() {
 
 /// Race between create + write + unlink — verify no panic and consistent state.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_create_write_unlink_race() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -11347,9 +11347,9 @@ async fn test_create_write_unlink_race() {
 
 /// Multiple handles open, unlink, close all — verify cleanup only after last close.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires offline S3 test env with injected unreachable endpoint and tuned local settings"]
 async fn test_multiple_handles_orphan_cleanup_after_last_close() {
-    let _env = setup_offline_sfs121_env();
+    let _env = setup_offline_local_s3_env();
     set_test_env("STUDIOFS_UPLOAD_DELAY_MS", "60000");
 
     let tmp = tempfile::tempdir().unwrap();
@@ -11397,7 +11397,7 @@ async fn test_multiple_handles_orphan_cleanup_after_last_close() {
 
 /// open_file with O_TRUNC on a file with data — should truncate to 0.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_open_trunc_clears_data() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -11427,7 +11427,7 @@ async fn test_open_trunc_clears_data() {
 
 /// Setattr mode/uid/gid/times on a directory (not just files).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_setattr_on_directory() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -11456,7 +11456,7 @@ async fn test_setattr_on_directory() {
 
 /// Xattr operations on a directory.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_xattr_on_directory() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -11475,7 +11475,7 @@ async fn test_xattr_on_directory() {
 }
 
 // =============================================================================
-// Local-First correctness and performance coverage (SFS-121)
+// Local-First correctness and performance coverage (offline S3 scenario)
 //
 // These tests encode the target user experience for the Local-First
 // architecture on Windows and macOS: background upload must not break or
@@ -11499,7 +11499,7 @@ async fn test_xattr_on_directory() {
 #[test]
 #[ignore = "requires S3 backend and STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1 or valid .env"]
 fn buffered_large_file_read_succeeds_across_full_upload_lifecycle() {
-    let _env = setup_online_sfs121_env();
+    let _env = setup_online_local_s3_env();
     // Force immediate materialization and keep the upload window open.
     set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
     set_test_env("STUDIOFS_MAX_SPILL_BYTES", "64MB");
@@ -11510,7 +11510,7 @@ fn buffered_large_file_read_succeeds_across_full_upload_lifecycle() {
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
-    let volume_suffix = format!("sfs121-large-lifecycle-{}", std::process::id());
+    let volume_suffix = format!("local-s3-large-lifecycle-{}", std::process::id());
     let mut format_info = make_format_info(&volume_suffix);
     format_info.block_size = 512 * 1024; // 512 KiB blocks
 
@@ -11534,7 +11534,7 @@ fn buffered_large_file_read_succeeds_across_full_upload_lifecycle() {
         let vfs = make_vfs_with_meta(meta, &format_info, &cache_dir_str);
 
         let attr = vfs
-            .create(1, b"sfs121-large-lifecycle.bin", 0, 0, 0o644)
+            .create(1, b"local-s3-large-lifecycle.bin", 0, 0, 0o644)
             .unwrap();
         vfs.write(attr.ino, 0, &payload).await.unwrap();
         vfs.flush(attr.ino).await.unwrap();
@@ -11615,7 +11615,7 @@ fn buffered_large_file_read_succeeds_across_full_upload_lifecycle() {
 #[test]
 #[ignore = "requires S3 backend; validates foreground throughput during background upload"]
 fn sequential_foreground_read_throughput_during_upload_meets_minimum() {
-    let _env = setup_online_sfs121_env();
+    let _env = setup_online_local_s3_env();
     set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
     set_test_env("STUDIOFS_MAX_SPILL_BYTES", "64MB");
     // Deliberately slow upload so the read sweep overlaps the active upload
@@ -11627,7 +11627,7 @@ fn sequential_foreground_read_throughput_during_upload_meets_minimum() {
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
-    let volume_suffix = format!("sfs121-throughput-{}", std::process::id());
+    let volume_suffix = format!("local-s3-throughput-{}", std::process::id());
     let mut format_info = make_format_info(&volume_suffix);
     format_info.block_size = 1024 * 1024; // 1 MiB blocks
 
@@ -11652,7 +11652,7 @@ fn sequential_foreground_read_throughput_during_upload_meets_minimum() {
         let vfs = make_vfs_with_meta(meta, &format_info, &cache_dir_str);
 
         let attr = vfs
-            .create(1, b"sfs121-throughput.bin", 0, 0, 0o644)
+            .create(1, b"local-s3-throughput.bin", 0, 0, 0o644)
             .unwrap();
         vfs.write(attr.ino, 0, &payload).await.unwrap();
         vfs.flush(attr.ino).await.unwrap();
@@ -11711,7 +11711,7 @@ fn sequential_foreground_read_throughput_during_upload_meets_minimum() {
 #[test]
 #[ignore = "requires S3 backend; compares buffered foreground read baseline/during/post upload"]
 fn foreground_read_baseline_during_and_post_upload_are_comparable() {
-    let _env = setup_online_sfs121_env();
+    let _env = setup_online_local_s3_env();
     set_test_env("STUDIOFS_MAX_DIRTY_BYTES", "1");
     set_test_env("STUDIOFS_MAX_SPILL_BYTES", "64MB");
     set_test_env("STUDIOFS_UPLOAD_DELAY_MS", "200");
@@ -11721,7 +11721,7 @@ fn foreground_read_baseline_during_and_post_upload_are_comparable() {
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
-    let volume_suffix = format!("sfs121-phases-{}", std::process::id());
+    let volume_suffix = format!("local-s3-phases-{}", std::process::id());
     let mut format_info = make_format_info(&volume_suffix);
     format_info.block_size = 1024 * 1024;
 
@@ -11748,7 +11748,7 @@ fn foreground_read_baseline_during_and_post_upload_are_comparable() {
         ensure_bucket().await;
         let vfs = make_vfs_with_meta(meta, &format_info, &cache_dir_str);
 
-        let attr = vfs.create(1, b"sfs121-phases.bin", 0, 0, 0o644).unwrap();
+        let attr = vfs.create(1, b"local-s3-phases.bin", 0, 0, 0o644).unwrap();
 
         vfs.write(attr.ino, 0, &baseline_payload).await.unwrap();
         vfs.flush(attr.ino).await.unwrap();
@@ -11872,7 +11872,7 @@ fn foreground_read_baseline_during_and_post_upload_are_comparable() {
 #[test]
 fn upload_backlog_progresses_via_persisted_local_payload_reads() {
     let tmp = tempfile::tempdir().unwrap();
-    let _env = setup_offline_sfs121_env();
+    let _env = setup_offline_local_s3_env();
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
     let _restore_workers = ScopedEnvVar::capture("STUDIOFS_UPLOAD_WORKER_COUNT");
@@ -11887,7 +11887,7 @@ fn upload_backlog_progresses_via_persisted_local_payload_reads() {
         .unwrap();
     rt.block_on(async {
         let (format_info, vfs) =
-            make_offline_vfs_sfs121(&tmp, "sfs124-stage-head", Some(64 * 1024));
+            make_offline_vfs_local_s3(&tmp, "sfs124-stage-head", Some(64 * 1024));
         let block_size = format_info.block_size as usize;
         let full_size = block_size * 8;
         let payload: Vec<u8> = (0..full_size)
@@ -11941,7 +11941,7 @@ fn upload_backlog_progresses_via_persisted_local_payload_reads() {
 #[test]
 fn warm_cache_sequential_read_bounded_latency_after_write() {
     let tmp = tempfile::tempdir().unwrap();
-    let _env = setup_offline_sfs121_env();
+    let _env = setup_offline_local_s3_env();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -11949,7 +11949,7 @@ fn warm_cache_sequential_read_bounded_latency_after_write() {
         .build()
         .unwrap();
     rt.block_on(async {
-        let (format_info, vfs) = make_offline_vfs_sfs121(&tmp, "warm-cache", Some(512 * 1024));
+        let (format_info, vfs) = make_offline_vfs_local_s3(&tmp, "warm-cache", Some(512 * 1024));
 
         // 3 blocks — large enough to measure, small enough for deterministic timing.
         let block_size = format_info.block_size as usize;
@@ -11960,7 +11960,7 @@ fn warm_cache_sequential_read_bounded_latency_after_write() {
         // Cold + warm reads must each individually complete well within 5 s.
         const MAX_SINGLE_READ_DURATION: Duration = Duration::from_secs(5);
 
-        let attr = vfs.create(1, b"sfs121-warm-cache.bin", 0, 0, 0o644).unwrap();
+        let attr = vfs.create(1, b"local-s3-warm-cache.bin", 0, 0, 0o644).unwrap();
         vfs.write(attr.ino, 0, &payload).await.unwrap();
         vfs.flush(attr.ino).await.unwrap();
 
@@ -12017,7 +12017,7 @@ fn warm_cache_sequential_read_bounded_latency_after_write() {
 /// Verify that concurrent sequential, random-offset, and mixed readers all
 /// observe correct data while a background upload is active.
 ///
-/// This covers the "mixed workload classification" requirement from SFS-121:
+/// This covers the "mixed workload classification" requirement from offline S3 scenario:
 /// sequential stream, random seeks, mixed patterns, and concurrent readers
 /// must all work correctly simultaneously.
 ///
@@ -12026,7 +12026,7 @@ fn warm_cache_sequential_read_bounded_latency_after_write() {
 #[test]
 fn mixed_workload_concurrent_readers_during_pending_upload_no_errors() {
     let tmp = tempfile::tempdir().unwrap();
-    let _env = setup_offline_sfs121_env();
+    let _env = setup_offline_local_s3_env();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -12034,7 +12034,7 @@ fn mixed_workload_concurrent_readers_during_pending_upload_no_errors() {
         .build()
         .unwrap();
     rt.block_on(async {
-        let (format_info, vfs) = make_offline_vfs_sfs121(&tmp, "mixed-workload", None);
+        let (format_info, vfs) = make_offline_vfs_local_s3(&tmp, "mixed-workload", None);
 
         let block_size = format_info.block_size as usize;
         // Use 4 blocks so random-offset reads land at block boundaries, midpoints,
@@ -12045,7 +12045,7 @@ fn mixed_workload_concurrent_readers_during_pending_upload_no_errors() {
             .collect();
 
         let attr = vfs
-            .create(1, b"sfs121-mixed-workload.bin", 0, 0, 0o644)
+            .create(1, b"local-s3-mixed-workload.bin", 0, 0, 0o644)
             .unwrap();
         vfs.write(attr.ino, 0, &payload).await.unwrap();
         vfs.flush(attr.ino).await.unwrap();
@@ -12179,7 +12179,7 @@ fn mixed_workload_concurrent_readers_during_pending_upload_no_errors() {
 #[test]
 fn handle_aware_read_policy_keeps_sequential_and_random_streams_separate() {
     let tmp = tempfile::tempdir().unwrap();
-    let _env = setup_offline_sfs121_env();
+    let _env = setup_offline_local_s3_env();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -12187,7 +12187,7 @@ fn handle_aware_read_policy_keeps_sequential_and_random_streams_separate() {
         .build()
         .unwrap();
     rt.block_on(async {
-        let (format_info, vfs) = make_offline_vfs_sfs121(&tmp, "sfs125-streams", Some(128 * 1024));
+        let (format_info, vfs) = make_offline_vfs_local_s3(&tmp, "sfs125-streams", Some(128 * 1024));
         let block_size = format_info.block_size as usize;
         let full_size = block_size * 8;
         let payload: Vec<u8> = (0..full_size)
@@ -12257,17 +12257,17 @@ fn handle_aware_read_policy_keeps_sequential_and_random_streams_separate() {
 /// to different inodes must not cross-contaminate.
 ///
 /// This encodes the "deterministic file-session ordering" requirement from
-/// SFS-121: write/flush/finalize transitions must produce a consistent
+/// offline S3 scenario: write/flush/finalize transitions must produce a consistent
 /// observable state for readers on the same client.
 ///
 /// Does not require a real S3 backend.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn file_session_flush_ordering_is_deterministic() {
     let tmp = tempfile::tempdir().unwrap();
-    let _env = setup_offline_sfs121_env();
+    let _env = setup_offline_local_s3_env();
     // Use a modest block size so the test runs quickly on any machine.
     let block_size: u32 = 128 * 1024;
-    let (_format_info, vfs) = make_offline_vfs_sfs121(&tmp, "session-order", Some(block_size));
+    let (_format_info, vfs) = make_offline_vfs_local_s3(&tmp, "session-order", Some(block_size));
 
     let payload_a1: Vec<u8> = (0..block_size as usize).map(|i| (i as u8) ^ 0xAA).collect();
     let payload_a2: Vec<u8> = (0..block_size as usize).map(|i| (i as u8) ^ 0xBB).collect();
@@ -12337,7 +12337,7 @@ async fn file_session_flush_ordering_is_deterministic() {
 
 /// Getattr on non-existent inode should return an error.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_getattr_nonexistent_inode() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -12349,7 +12349,7 @@ async fn test_getattr_nonexistent_inode() {
 
 /// Lookup non-existent entry in a directory.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_lookup_nonexistent_entry() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -12364,7 +12364,7 @@ async fn test_lookup_nonexistent_entry() {
 
 /// Create a file, verify counter TOTAL_INODES increments.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_create_increments_total_inodes() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -12389,7 +12389,7 @@ async fn test_create_increments_total_inodes() {
 /// Create a symlink pointing to a non-existent target. readlink should return
 /// the target path even though the target doesn't exist.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_symlink_dangling_target() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -12404,7 +12404,7 @@ async fn test_symlink_dangling_target() {
 
 /// Hardlink increases nlink and can be read from both paths.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_hardlink_nlink_increments() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -12434,7 +12434,7 @@ async fn test_hardlink_nlink_increments() {
 
 /// Unlink one hardlink — file should survive because nlink > 0.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_hardlink_unlink_one_keeps_other() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -12471,7 +12471,7 @@ async fn test_hardlink_unlink_one_keeps_other() {
 
 /// Exclusive flock on a file, try exclusive from second owner — should fail non-blocking.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_flock_exclusive_nonblocking_conflict() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -12501,7 +12501,7 @@ async fn test_flock_exclusive_nonblocking_conflict() {
 /// Shared lock + try shared from another owner → should succeed.
 /// Then try exclusive → should fail.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_flock_shared_then_exclusive_conflict() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -12968,7 +12968,7 @@ async fn pending_upload_helpers_use_live_index_without_directory_scan() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_shutdown_drains_dirty_buffers() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -12999,7 +12999,7 @@ async fn test_shutdown_drains_dirty_buffers() {
 
 /// Double shutdown should not panic.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_double_shutdown_does_not_panic() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -13015,7 +13015,7 @@ async fn test_double_shutdown_does_not_panic() {
 
 /// Double unlink of the same file should fail on the second call.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_double_unlink_fails() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -13029,7 +13029,7 @@ async fn test_double_unlink_fails() {
 
 /// Rename a file to itself should be a no-op (or succeed without error).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_rename_to_self_is_noop() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -13051,7 +13051,7 @@ async fn test_rename_to_self_is_noop() {
 
 /// Write at a high offset (sparse) then read back — gap should be zero-filled.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_sparse_write_at_high_offset() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -13090,7 +13090,7 @@ async fn test_sparse_write_at_high_offset() {
 /// Create a file in a subdirectory, unlink it, rmdir the parent.
 /// Verify the directory can be removed after all children are gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_unlink_child_then_rmdir_parent() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -13113,7 +13113,7 @@ async fn test_unlink_child_then_rmdir_parent() {
 
 /// mkdir with duplicate name should fail.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_mkdir_duplicate_name_fails() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -13126,7 +13126,7 @@ async fn test_mkdir_duplicate_name_fails() {
 
 /// Create a file with duplicate name should fail.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_create_duplicate_name_fails() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -13140,7 +13140,7 @@ async fn test_create_duplicate_name_fails() {
 /// Overwrite a partial block within an existing block (mid-block write).
 /// Verify only the written region changes and the rest is preserved.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_mid_block_overwrite_preserves_surrounding_data() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -13182,7 +13182,7 @@ async fn test_mid_block_overwrite_preserves_surrounding_data() {
 
 /// Multiple xattrs set, then remove one — remaining should persist.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_xattr_remove_one_preserves_others() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -13206,7 +13206,7 @@ async fn test_xattr_remove_one_preserves_others() {
 
 /// Rename a directory with children — children should follow.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
 async fn test_rename_directory_with_children() {
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
@@ -13422,7 +13422,7 @@ fn local_reads_through_upload_with_partial_tail_block() {
 /// waits for epoch finalization.  Neither task must ever see `RemoteContentPending`
 /// or incorrect data.
 ///
-/// This is part of the SFS-121 / SFS-123 Local-First coverage suite.
+/// This is part of the offline-S3 / SFS-123 Local-First coverage suite.
 #[test]
 #[ignore = "requires live S3 backend; run with --ignored and valid .env"]
 fn concurrent_reads_through_upload_finalization() {
@@ -13570,3 +13570,6 @@ fn concurrent_reads_through_upload_finalization() {
     });
     rt.shutdown_background();
 }
+
+
+
