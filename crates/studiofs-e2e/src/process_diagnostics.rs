@@ -16,6 +16,12 @@ use serde::Serialize;
 #[cfg(not(test))]
 const PROCESS_DUMP_HELPER_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[cfg(test)]
+thread_local! {
+    static TEST_PROCESS_DIAGNOSTICS_DIR: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 static PROCESS_DIAGNOSTICS_DIR: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 static PROCESS_DIAGNOSTICS_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -44,6 +50,10 @@ struct ProcessDiagnosticMetadata<'a> {
 
 pub(crate) fn set_process_diagnostics_dir(path: PathBuf) -> io::Result<()> {
     fs::create_dir_all(&path)?;
+    #[cfg(test)]
+    TEST_PROCESS_DIAGNOSTICS_DIR.with(|configured| {
+        *configured.borrow_mut() = Some(path.clone());
+    });
     let lock = PROCESS_DIAGNOSTICS_DIR.get_or_init(|| Mutex::new(None));
     let mut configured = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     *configured = Some(path);
@@ -179,6 +189,11 @@ fn write_process_dump_to_paths(
 }
 
 fn configured_process_diagnostics_dir() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(path) = TEST_PROCESS_DIAGNOSTICS_DIR.with(|configured| configured.borrow().clone())
+    {
+        return Some(path);
+    }
     PROCESS_DIAGNOSTICS_DIR
         .get_or_init(|| Mutex::new(None))
         .lock()
