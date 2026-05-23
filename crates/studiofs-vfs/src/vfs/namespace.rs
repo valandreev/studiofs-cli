@@ -1,4 +1,5 @@
 use super::*;
+use crate::{LockTier, OrderedMutex};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 /// Controls how namespace paths are parsed and rendered (POSIX vs Windows separator rules).
@@ -877,17 +878,17 @@ pub trait KernelInvalidator: Send + Sync {
 /// Holds namespace-scoped caches and generation counters used for coherence.
 pub(super) struct NamespaceState {
     /// Dentry cache by `(parent, name)` with positive/negative entries.
-    pub(super) dentry_cache: Mutex<DentryCache>,
+    pub(super) dentry_cache: OrderedMutex<DentryCache>,
     /// Memoized full-path lookup cache.
-    pub(super) path_shortcut_cache: Mutex<PathShortcutCache>,
+    pub(super) path_shortcut_cache: OrderedMutex<PathShortcutCache>,
     /// Cached inode attribute reads.
-    pub(super) attr_read_cache: Mutex<AttrReadCache>,
+    pub(super) attr_read_cache: OrderedMutex<AttrReadCache>,
     /// Local dirty attribute snapshots awaiting persistence.
-    pub(super) dirty_attrs: Mutex<std::collections::HashMap<Ino, InodeAttr>>,
+    pub(super) dirty_attrs: OrderedMutex<std::collections::HashMap<Ino, InodeAttr>>,
     /// Global namespace epoch to invalidate stale dentry/path cache entries.
     pub(super) namespace_epoch: AtomicU64,
     /// Per-directory generation map used to detect stale parent chains.
-    pub(super) directory_generations: Mutex<std::collections::HashMap<Ino, u64>>,
+    pub(super) directory_generations: OrderedMutex<std::collections::HashMap<Ino, u64>>,
 }
 
 impl NamespaceState {
@@ -901,18 +902,24 @@ impl NamespaceState {
         attr_read_cache_bytes: usize,
     ) -> Self {
         Self {
-            dentry_cache: Mutex::new(DentryCache::new(dentry_cache_capacity, dentry_cache_bytes)),
-            path_shortcut_cache: Mutex::new(PathShortcutCache::new(
-                path_shortcut_cache_capacity,
-                path_shortcut_cache_bytes,
-            )),
-            attr_read_cache: Mutex::new(AttrReadCache::new(
-                attr_read_cache_capacity,
-                attr_read_cache_bytes,
-            )),
-            dirty_attrs: Mutex::new(std::collections::HashMap::new()),
+            dentry_cache: OrderedMutex::new(
+                DentryCache::new(dentry_cache_capacity, dentry_cache_bytes),
+                LockTier::Namespace,
+            ),
+            path_shortcut_cache: OrderedMutex::new(
+                PathShortcutCache::new(path_shortcut_cache_capacity, path_shortcut_cache_bytes),
+                LockTier::Namespace,
+            ),
+            attr_read_cache: OrderedMutex::new(
+                AttrReadCache::new(attr_read_cache_capacity, attr_read_cache_bytes),
+                LockTier::Namespace,
+            ),
+            dirty_attrs: OrderedMutex::new(std::collections::HashMap::new(), LockTier::Namespace),
             namespace_epoch: AtomicU64::new(0),
-            directory_generations: Mutex::new(std::collections::HashMap::new()),
+            directory_generations: OrderedMutex::new(
+                std::collections::HashMap::new(),
+                LockTier::Namespace,
+            ),
         }
     }
 }
@@ -1189,6 +1196,18 @@ mod tests {
         let _guard = rt.enter();
         vfs.start().expect("start vfs background workers");
         (rt, vfs, meta)
+    }
+
+    #[test]
+    fn namespace_mutex_lock_populates_lock_order_stack() {
+        let state = NamespaceState::new(8, 1024, 8, 1024, 8, 1024);
+
+        let guard = state.attr_read_cache.lock();
+
+        assert_eq!(crate::debug_lock_stack(), vec![crate::LockTier::Namespace]);
+
+        drop(guard);
+        assert!(crate::debug_lock_stack().is_empty());
     }
 
     #[test]

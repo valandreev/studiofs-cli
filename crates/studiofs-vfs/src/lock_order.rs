@@ -7,14 +7,12 @@
 //!
 //! 1.  `ShutdownState` — shutdown flags
 //! 2.  `local_dirty` subsystem — pending local dirty-state bookkeeping
-//! 3.  reserved legacy `DirtyBufferState` slot — kept for ordering compatibility
-//! 4.  reserved legacy `IngressState` slot — no active subsystem
-//! 5.  `NamespaceState` — dentry/attr caches
-//! 6.  `IncarnationState` — inode incarnation tracking
-//! 7.  `UploadState` — upload queue and cancellations
-//! 8.  `AclState` — ACL state
-//! 9.  `FileLockState` — file locks
-//! 10. `MetricsState` — metrics (rarely needs locking)
+//! 3.  `NamespaceState` — dentry/attr caches
+//! 4.  `IncarnationState` — inode incarnation tracking
+//! 5.  `UploadState` — upload queue and cancellations
+//! 6.  `AclState` — ACL state
+//! 7.  `FileLockState` — file locks
+//! 8.  `MetricsState` — metrics (rarely needs locking)
 //!
 //! # Usage
 //!
@@ -26,6 +24,7 @@
 //! ```
 
 use std::cell::RefCell;
+
 use tracing::warn;
 
 /// Lock tiers in order of priority (lower = higher priority).
@@ -38,22 +37,18 @@ pub enum LockTier {
     Shutdown = 1,
     /// Tier 2: `local_dirty` subsystem
     LocalDirty = 2,
-    /// Tier 3: reserved legacy DirtyBufferState slot
-    DirtyBuffer = 3,
-    /// Tier 4: reserved legacy IngressState slot
-    Ingress = 4,
-    /// Tier 5: NamespaceState
-    Namespace = 5,
-    /// Tier 6: IncarnationState
-    Incarnation = 6,
-    /// Tier 7: UploadState
-    Upload = 7,
-    /// Tier 8: AclState
-    Acl = 8,
-    /// Tier 9: FileLockState
-    FileLock = 9,
-    /// Tier 10: MetricsState
-    Metrics = 10,
+    /// Tier 3: NamespaceState
+    Namespace = 3,
+    /// Tier 4: IncarnationState
+    Incarnation = 4,
+    /// Tier 5: UploadState
+    Upload = 5,
+    /// Tier 6: AclState
+    Acl = 6,
+    /// Tier 7: FileLockState
+    FileLock = 7,
+    /// Tier 8: MetricsState
+    Metrics = 8,
 }
 
 impl LockTier {
@@ -64,14 +59,12 @@ impl LockTier {
         match self {
             LockTier::Shutdown => 1,
             LockTier::LocalDirty => 2,
-            LockTier::DirtyBuffer => 3,
-            LockTier::Ingress => 4,
-            LockTier::Namespace => 5,
-            LockTier::Incarnation => 6,
-            LockTier::Upload => 7,
-            LockTier::Acl => 8,
-            LockTier::FileLock => 9,
-            LockTier::Metrics => 10,
+            LockTier::Namespace => 3,
+            LockTier::Incarnation => 4,
+            LockTier::Upload => 5,
+            LockTier::Acl => 6,
+            LockTier::FileLock => 7,
+            LockTier::Metrics => 8,
         }
     }
 
@@ -82,8 +75,6 @@ impl LockTier {
         match self {
             LockTier::Shutdown => "Shutdown",
             LockTier::LocalDirty => "LocalDirty",
-            LockTier::DirtyBuffer => "DirtyBuffer",
-            LockTier::Ingress => "Ingress",
             LockTier::Namespace => "Namespace",
             LockTier::Incarnation => "Incarnation",
             LockTier::Upload => "Upload",
@@ -116,6 +107,13 @@ impl LockOrderGuard {
     /// Returns a guard that must be held while the lock is held.
     ///
     pub fn acquire(tier: LockTier) -> Self {
+        if !is_validation_enabled() {
+            return LockOrderGuard {
+                tier,
+                pushed: false,
+            };
+        }
+
         HELD_LOCKS.with(|held| {
             let mut held = held.borrow_mut();
 
@@ -153,6 +151,13 @@ impl LockOrderGuard {
     /// Use this when lock ordering cannot be statically determined.
     /// The caller is responsible for ensuring correct ordering.
     pub fn acquire_unchecked(tier: LockTier) -> Self {
+        if !is_validation_enabled() {
+            return LockOrderGuard {
+                tier,
+                pushed: false,
+            };
+        }
+
         HELD_LOCKS.with(|held| {
             held.borrow_mut().push(tier);
             LockOrderGuard { tier, pushed: true }
@@ -243,9 +248,9 @@ mod tests {
         // Acquire Tier 1, then Tier 5
         let _guard1 = LockOrderGuard::acquire(LockTier::Shutdown);
         let _guard2 = LockOrderGuard::acquire(LockTier::Namespace);
-        // Should NOT be able to acquire Tier 3 (DirtyBuffer) while holding Tier 5
-        // This would violate ordering since 3 < 5
-        let _guard3 = LockOrderGuard::acquire(LockTier::DirtyBuffer);
+        // Should NOT be able to acquire LocalDirty while holding Namespace.
+        // This would violate ordering since 2 < 3.
+        let _guard3 = LockOrderGuard::acquire(LockTier::LocalDirty);
     }
 
     #[test]
