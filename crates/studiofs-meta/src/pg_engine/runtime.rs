@@ -339,9 +339,15 @@ impl PgRemoteRuntime {
             .unwrap_or_else(|p| p.into_inner())
             .clone()
             .ok_or_else(|| MetaError::Storage("postgres runtime is shut down".to_string()))?;
-        tx.blocking_send(job).map_err(|e| {
-            MetaError::Storage(format!("failed to submit postgres runtime job: {e}"))
-        })?;
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tx.try_send(job).map_err(|e| {
+                MetaError::Storage(format!("failed to submit postgres runtime job: {e}"))
+            })?;
+        } else {
+            tx.blocking_send(job).map_err(|e| {
+                MetaError::Storage(format!("failed to submit postgres runtime job: {e}"))
+            })?;
+        }
         result_rx.recv().map_err(|e| {
             MetaError::Storage(format!(
                 "failed to receive result from postgres runtime: {e}"
