@@ -2,7 +2,7 @@ use super::{
     LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER, LOCAL_PG_NAMESPACE_VERSION_COUNTER,
     LOCAL_PG_VERSION_COUNTER, PgMetaEngine,
 };
-use crate::engine::{MetaInodes, MetaResult};
+use crate::engine::{MetaError, MetaInodes, MetaResult};
 use crate::redb_engine::{RedbMetaEngine, RedbSnapshot};
 use std::sync::atomic::Ordering;
 
@@ -21,6 +21,13 @@ impl PgMetaEngine {
         if version < 0 {
             return Ok(());
         }
+        let _guard = self
+            .local_position_lock
+            .lock()
+            .map_err(|_| MetaError::Storage("pg local position lock poisoned".to_string()))?;
+        if version <= self.local_version.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         self.local
             .set_counter(LOCAL_PG_VERSION_COUNTER, version as u64)?;
         self.local_version.store(version, Ordering::SeqCst);
@@ -29,6 +36,13 @@ impl PgMetaEngine {
 
     pub(super) fn persist_namespace_version(&self, version: i64) -> MetaResult<()> {
         if version < 0 {
+            return Ok(());
+        }
+        let _guard = self
+            .local_position_lock
+            .lock()
+            .map_err(|_| MetaError::Storage("pg local position lock poisoned".to_string()))?;
+        if version <= self.namespace_version.load(Ordering::SeqCst) {
             return Ok(());
         }
         self.local
@@ -42,6 +56,13 @@ impl PgMetaEngine {
     }
 
     pub(super) fn persist_flushed_event_seq(&self, seq: u64) -> MetaResult<()> {
+        let _guard = self
+            .local_position_lock
+            .lock()
+            .map_err(|_| MetaError::Storage("pg local position lock poisoned".to_string()))?;
+        if seq <= self.flushed_event_seq.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         self.local
             .set_counter(LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER, seq)?;
         self.flushed_event_seq.store(seq, Ordering::SeqCst);
@@ -59,9 +80,7 @@ impl PgMetaEngine {
             self.persist_namespace_version(outcome.max_namespace_version)?;
         }
         if let Some(flushed_event_seq) = outcome.flushed_event_seq {
-            if flushed_event_seq > self.flushed_event_seq.load(Ordering::SeqCst) {
-                self.persist_flushed_event_seq(flushed_event_seq)?;
-            }
+            self.persist_flushed_event_seq(flushed_event_seq)?;
         }
         Ok(())
     }
