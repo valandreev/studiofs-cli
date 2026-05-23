@@ -44,6 +44,30 @@ pub enum ScenarioError {
         #[from]
         std::io::Error,
     ),
+    /// Mounted filesystem operation exceeded its per-call timeout.
+    #[error("bounded mounted I/O timed out for {label} after {timeout_ms} ms; {cancel_detail}")]
+    MountedIoTimeout {
+        /// Operation label.
+        label: String,
+        /// Timeout in milliseconds.
+        timeout_ms: u128,
+        /// Best-effort cancellation result.
+        cancel_detail: String,
+    },
+    /// A previous bounded mounted I/O operation is still running.
+    #[error(
+        "bounded mounted I/O worker limit reached before {label}; active workers {active_workers}/{max_workers}; previous timed operation may still be blocked after {timeout_ms} ms timeout budget"
+    )]
+    MountedIoWorkerLimit {
+        /// Operation label.
+        label: String,
+        /// Current active worker count.
+        active_workers: usize,
+        /// Maximum active workers allowed.
+        max_workers: usize,
+        /// Requested timeout in milliseconds.
+        timeout_ms: u128,
+    },
     /// JSON serialization or deserialization failed.
     #[error("scenario JSON failed: {0}")]
     Json(

@@ -1511,7 +1511,16 @@ pub(in crate::scenario) fn run_write_acceptance_crash_operations(
             .remount(&writer.name)
             .map_err(|error| error.to_string()),
     ))?);
-    let recovered = fs::read(writer.mount_point.join(&path));
+    let recovered_path = writer.mount_point.join(&path);
+    let recovered = bounded_mounted_read(
+        recovered_path.clone(),
+        format!(
+            "write acceptance recovered read {}",
+            recovered_path.display()
+        ),
+        MOUNTED_WRITE_READBACK_TIMEOUT,
+    )
+    .map_err(scenario_error_to_io);
     operations.push(required_record(record_advanced_operation(
         started,
         operations.len() + 1,
@@ -1565,23 +1574,31 @@ pub(in crate::scenario) fn write_acceptance_payload(
     path: PathBuf,
     accepted_payload: &[u8],
 ) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut options = OpenOptions::new();
-    options.create(true).truncate(true).write(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
+    let payload = accepted_payload.to_vec();
+    run_bounded_mounted_io(
+        format!("write acceptance payload {}", path.display()),
+        MOUNTED_WRITE_READBACK_TIMEOUT,
+        move || {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut options = OpenOptions::new();
+            options.create(true).truncate(true).write(true);
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
 
-        const FILE_FLAG_WRITE_THROUGH: u32 = 0x8000_0000;
-        options.custom_flags(FILE_FLAG_WRITE_THROUGH);
-    }
-    let mut file = options.open(path)?;
-    if !accepted_payload.is_empty() {
-        file.write_all(accepted_payload)?;
-    }
-    file.sync_all()
+                const FILE_FLAG_WRITE_THROUGH: u32 = 0x8000_0000;
+                options.custom_flags(FILE_FLAG_WRITE_THROUGH);
+            }
+            let mut file = options.open(path)?;
+            if !payload.is_empty() {
+                file.write_all(&payload)?;
+            }
+            file.sync_all()
+        },
+    )
+    .map_err(scenario_error_to_io)
 }
 
 pub(in crate::scenario) fn run_mounted_chaos_operations(
@@ -1722,19 +1739,30 @@ pub(in crate::scenario) fn write_mounted_initial_file(
     payload: &[u8],
     label: &str,
 ) -> Result<(), ScenarioError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut options = mounted_write_barrier_open_options();
-    let mut file = options.create_new(true).open(&path).map_err(|error| {
-        ScenarioError::Io(io::Error::new(
-            error.kind(),
-            format!("{label}: open {}: {error}", path.display()),
-        ))
-    })?;
-    file.write_all(payload)?;
-    file.sync_all()?;
-    drop(file);
+    let write_path = path.clone();
+    let write_payload = payload.to_vec();
+    let write_label = label.to_string();
+    run_bounded_mounted_io(
+        format!("{label}: write {}", path.display()),
+        MOUNTED_WRITE_READBACK_TIMEOUT,
+        move || {
+            if let Some(parent) = write_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut options = mounted_write_barrier_open_options();
+            let mut file = options
+                .create_new(true)
+                .open(&write_path)
+                .map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!("{write_label}: open {}: {error}", write_path.display()),
+                    )
+                })?;
+            file.write_all(&write_payload)?;
+            file.sync_all()
+        },
+    )?;
     let readback = wait_for_mounted_payload_readback(
         &path,
         payload,
@@ -1768,11 +1796,24 @@ pub(in crate::scenario) fn wait_for_mounted_payload_readback(
     let deadline = Instant::now() + timeout;
     let mut last_readback = None;
     loop {
-        match fs::read(path) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return last_readback.ok_or_else(|| {
+                ScenarioError::Io(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("mounted payload readback did not find {}", path.display()),
+                ))
+            });
+        }
+        match bounded_mounted_read(
+            path.to_path_buf(),
+            format!("readback {}", path.display()),
+            remaining.min(MOUNTED_WRITE_READBACK_TIMEOUT),
+        ) {
             Ok(readback) if readback == payload => return Ok(readback),
             Ok(readback) => last_readback = Some(readback),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
+            Err(ScenarioError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
         if Instant::now() >= deadline {
             return last_readback.ok_or_else(|| {
@@ -2718,16 +2759,27 @@ pub(in crate::scenario) fn run_open_handle_operations(
         &unlink_target,
         "append through old handle\n",
     );
-    let mut handle = OpenOptions::new()
-        .append(true)
-        .open(clients[0].mount_point.join(&unlink_target))?;
+    let handle_path = clients[0].mount_point.join(&unlink_target);
+    let mut handle = run_bounded_mounted_io(
+        format!("open handle append open {}", handle_path.display()),
+        OPEN_HANDLE_OPERATION_TIMEOUT,
+        move || OpenOptions::new().append(true).open(handle_path),
+    )?;
     operations.push(fs_op(
         started,
         1,
         &clients[1],
         "unlink",
         &unlink_target,
-        || fs::remove_file(clients[1].mount_point.join(&unlink_target)),
+        || {
+            let path = clients[1].mount_point.join(&unlink_target);
+            run_bounded_mounted_io(
+                format!("open handle unlink {}", path.display()),
+                OPEN_HANDLE_OPERATION_TIMEOUT,
+                move || fs::remove_file(path),
+            )
+            .map_err(scenario_error_to_io)
+        },
     ));
     operations.push(fs_op(
         started,
@@ -2736,10 +2788,18 @@ pub(in crate::scenario) fn run_open_handle_operations(
         "rename",
         &rename_source,
         || {
-            fs::rename(
-                clients[1].mount_point.join(&rename_source),
-                clients[1].mount_point.join(&rename_dest),
+            let source = clients[1].mount_point.join(&rename_source);
+            let dest = clients[1].mount_point.join(&rename_dest);
+            run_bounded_mounted_io(
+                format!(
+                    "open handle rename {} to {}",
+                    source.display(),
+                    dest.display()
+                ),
+                OPEN_HANDLE_OPERATION_TIMEOUT,
+                move || fs::rename(source, dest),
             )
+            .map_err(scenario_error_to_io)
         },
     ));
     operations.push(required_record(record_advanced_operation(
@@ -2748,12 +2808,17 @@ pub(in crate::scenario) fn run_open_handle_operations(
         &clients[0],
         "append_old_handle",
         &unlink_target,
-        handle
-            .write_all(&append_payload)
-            .and_then(|()| handle.sync_all())
-            .map_err(|error| error.to_string()),
+        run_bounded_mounted_io(
+            format!("open handle append {}", clients[0].mount_point.display()),
+            OPEN_HANDLE_OPERATION_TIMEOUT,
+            move || {
+                handle
+                    .write_all(&append_payload)
+                    .and_then(|()| handle.sync_all())
+            },
+        )
+        .map_err(|error| error.to_string()),
     ))?);
-    drop(handle);
     Ok(operations)
 }
 
@@ -3241,14 +3306,15 @@ pub(in crate::scenario) fn directory_contains_child(
     parent: &Path,
     file_name: &std::ffi::OsStr,
 ) -> bool {
-    let Ok(entries) = fs::read_dir(parent) else {
+    let Ok(entries) = bounded_mounted_read_dir_names(
+        parent.to_path_buf(),
+        format!("directory contains child {}", parent.display()),
+        MOUNTED_VALIDATION_PROBE_TIMEOUT,
+    ) else {
         return false;
     };
-    for entry in entries {
-        let Ok(entry) = entry else {
-            return false;
-        };
-        if entry.file_name() == file_name {
+    for entry_name in entries {
+        if entry_name == file_name {
             return true;
         }
     }
@@ -3273,15 +3339,12 @@ pub(in crate::scenario) fn refresh_relative_path_ancestors(
 }
 
 pub(in crate::scenario) fn drain_directory(path: &Path) -> bool {
-    let Ok(entries) = fs::read_dir(path) else {
-        return false;
-    };
-    for entry in entries {
-        if entry.is_err() {
-            return false;
-        }
-    }
-    true
+    bounded_mounted_read_dir_names(
+        path.to_path_buf(),
+        format!("drain directory {}", path.display()),
+        MOUNTED_VALIDATION_PROBE_TIMEOUT,
+    )
+    .is_ok()
 }
 
 pub(in crate::scenario) fn wait_for_required_paths_visible_until(
@@ -4612,7 +4675,12 @@ pub(in crate::scenario) fn run_sparse_range_operations(
         )?,
     )?;
 
-    let final_payload = fs::read(writer.mount_point.join(&sparse_path))?;
+    let final_path = writer.mount_point.join(&sparse_path);
+    let final_payload = bounded_mounted_read(
+        final_path.clone(),
+        format!("sparse final read {}", final_path.display()),
+        MOUNTED_WRITE_READBACK_TIMEOUT,
+    )?;
     let expected_payload = expected_sparse_payload(&sparse_ranges, final_logical_size);
     if final_payload != expected_payload {
         return Err(ScenarioError::Io(io::Error::other(format!(
@@ -4850,7 +4918,11 @@ pub(in crate::scenario) fn observe_sparse_ranges(
             ranges: Vec::new(),
             holes: Vec::new(),
         };
-        match fs::metadata(&path) {
+        match bounded_mounted_metadata(
+            path.clone(),
+            format!("sparse observe metadata {}", path.display()),
+            MOUNTED_VALIDATION_PROBE_TIMEOUT,
+        ) {
             Ok(metadata) if metadata.len() == logical_size => {
                 client_observation.metadata = SparseMetadataObservation {
                     ok: true,
@@ -4873,14 +4945,18 @@ pub(in crate::scenario) fn observe_sparse_ranges(
                 ));
             }
             Err(error) => {
-                client_observation.metadata.error = Some(sparse_io_error_observation(&error));
+                client_observation.metadata.error = Some(sparse_scenario_error_observation(&error));
                 missing.push(format!("{}:{sparse_path} ({error})", client.name));
                 client_observations.push(client_observation);
                 continue;
             }
         }
 
-        let mut file = match fs::File::open(&path) {
+        let mut file = match bounded_mounted_open_file(
+            path.clone(),
+            format!("sparse observe open {}", path.display()),
+            MOUNTED_VALIDATION_PROBE_TIMEOUT,
+        ) {
             Ok(file) => {
                 client_observation.open = SparseOpenObservation {
                     ok: true,
@@ -4889,7 +4965,7 @@ pub(in crate::scenario) fn observe_sparse_ranges(
                 file
             }
             Err(error) => {
-                client_observation.open.error = Some(sparse_io_error_observation(&error));
+                client_observation.open.error = Some(sparse_scenario_error_observation(&error));
                 missing.push(format!("{}:{sparse_path} ({error})", client.name));
                 client_observations.push(client_observation);
                 continue;
@@ -4897,7 +4973,12 @@ pub(in crate::scenario) fn observe_sparse_ranges(
         };
 
         for range in expected_ranges {
-            match read_exact_range_from(&mut file, range.offset, range.payload.len()) {
+            match read_exact_range_from_bounded(
+                &mut file,
+                range.offset,
+                range.payload.len(),
+                &format!("sparse observe range {}@{}", path.display(), range.offset),
+            ) {
                 Ok(bytes) => {
                     let expected_checksum = bytes_sha256(&range.payload);
                     let actual_checksum = bytes_sha256(&bytes);
@@ -4944,7 +5025,12 @@ pub(in crate::scenario) fn observe_sparse_ranges(
         }
 
         for hole in hole_specs {
-            match read_exact_range_from(&mut file, hole.offset, hole.len) {
+            match read_exact_range_from_bounded(
+                &mut file,
+                hole.offset,
+                hole.len,
+                &format!("sparse observe hole {}@{}", path.display(), hole.offset),
+            ) {
                 Ok(bytes) => {
                     let all_zero = bytes.iter().all(|byte| *byte == 0);
                     if !all_zero {
@@ -5108,6 +5194,18 @@ pub(in crate::scenario) fn sparse_io_error_observation(
     }
 }
 
+pub(in crate::scenario) fn sparse_scenario_error_observation(
+    error: &ScenarioError,
+) -> SparseIoErrorObservation {
+    match error {
+        ScenarioError::Io(error) => sparse_io_error_observation(error),
+        error => SparseIoErrorObservation {
+            kind: "ScenarioError".to_string(),
+            message: error.to_string(),
+        },
+    }
+}
+
 pub(in crate::scenario) fn duration_millis_u64(duration: Duration) -> u64 {
     let millis = duration.as_millis();
     millis.min(u128::from(u64::MAX)) as u64
@@ -5119,21 +5217,36 @@ pub(in crate::scenario) fn write_sparse_file_range(
     payload: &[u8],
     create: bool,
 ) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut options = mounted_write_barrier_open_options();
-    let mut file = options.create(create).read(true).open(path)?;
-    file.seek(SeekFrom::Start(offset))?;
-    file.write_all(payload)?;
-    file.sync_all()
+    let payload = payload.to_vec();
+    run_bounded_mounted_io(
+        format!("sparse write {}", path.display()),
+        MOUNTED_WRITE_READBACK_TIMEOUT,
+        move || {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut options = mounted_write_barrier_open_options();
+            let mut file = options.create(create).read(true).open(path)?;
+            file.seek(SeekFrom::Start(offset))?;
+            file.write_all(&payload)?;
+            file.sync_all()
+        },
+    )
+    .map_err(scenario_error_to_io)
 }
 
 pub(in crate::scenario) fn truncate_sparse_file(path: PathBuf, len: u64) -> io::Result<()> {
-    let options = mounted_write_barrier_open_options();
-    let file = options.open(path)?;
-    file.set_len(len)?;
-    file.sync_all()
+    run_bounded_mounted_io(
+        format!("sparse truncate {}", path.display()),
+        MOUNTED_WRITE_READBACK_TIMEOUT,
+        move || {
+            let options = mounted_write_barrier_open_options();
+            let file = options.open(path)?;
+            file.set_len(len)?;
+            file.sync_all()
+        },
+    )
+    .map_err(scenario_error_to_io)
 }
 
 pub(in crate::scenario) fn verify_sparse_range(
@@ -5175,8 +5288,30 @@ pub(in crate::scenario) fn read_exact_range(
     offset: u64,
     len: usize,
 ) -> io::Result<Vec<u8>> {
-    let mut file = fs::File::open(path)?;
-    read_exact_range_from(&mut file, offset, len)
+    let path = path.to_path_buf();
+    run_bounded_mounted_io(
+        format!("sparse range read {}", path.display()),
+        MOUNTED_WRITE_READBACK_TIMEOUT,
+        move || {
+            let mut file = fs::File::open(path)?;
+            read_exact_range_from(&mut file, offset, len)
+        },
+    )
+    .map_err(scenario_error_to_io)
+}
+
+pub(in crate::scenario) fn read_exact_range_from_bounded(
+    file: &mut fs::File,
+    offset: u64,
+    len: usize,
+    label: &str,
+) -> io::Result<Vec<u8>> {
+    let mut file = file.try_clone()?;
+    let label = label.to_string();
+    run_bounded_mounted_io(label, MOUNTED_VALIDATION_PROBE_TIMEOUT, move || {
+        read_exact_range_from(&mut file, offset, len)
+    })
+    .map_err(scenario_error_to_io)
 }
 
 pub(in crate::scenario) fn read_exact_range_from(

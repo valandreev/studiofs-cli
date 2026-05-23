@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 #[cfg(not(test))]
 use std::process::{Command, Stdio};
 use std::sync::{
-    Arc, Barrier,
+    Arc, Barrier, OnceLock,
     atomic::{AtomicBool, AtomicUsize, Ordering},
     mpsc,
 };
@@ -139,6 +139,10 @@ const ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(90);
 const ADVANCED_MOUNTED_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const MOUNTED_WRITE_READBACK_TIMEOUT: Duration = Duration::from_secs(5);
 const MOUNTED_WRITE_READBACK_POLL_INTERVAL: Duration = Duration::from_millis(25);
+#[cfg(not(test))]
+const BOUNDED_MOUNTED_IO_MAX_WORKERS: usize = 1;
+#[cfg(test)]
+const BOUNDED_MOUNTED_IO_MAX_WORKERS: usize = 64;
 const MOUNTED_VALIDATION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const MOUNTED_VALIDATION_MAX_ACTIVE_PROBES: usize = 1;
 const HOTSPOT_CHURN_OPERATION_TIMEOUT: Duration = Duration::from_secs(15);

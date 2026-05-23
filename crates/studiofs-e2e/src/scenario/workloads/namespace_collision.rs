@@ -487,7 +487,12 @@ pub(in crate::scenario) fn establish_collision_initial_tree(
     client: &ClientSpec,
 ) -> Result<(), ScenarioError> {
     if kind == NamespaceCollisionKind::MkdirRmdirVsCreate {
-        fs::create_dir_all(client.mount_point.join("race"))?;
+        let race_dir = client.mount_point.join("race");
+        run_bounded_mounted_io(
+            format!("namespace collision mkdir {}", race_dir.display()),
+            COLLISION_OPERATION_TIMEOUT,
+            move || fs::create_dir_all(race_dir),
+        )?;
     }
     for (relative_path, payload) in kind.initial_paths() {
         write_mounted_initial_file(
@@ -811,7 +816,13 @@ pub(in crate::scenario) fn repeated_committed_read(
     relative_path: &str,
 ) -> io::Result<()> {
     for _ in 0..OVERWRITE_READ_ATTEMPTS {
-        let payload = fs::read(client.mount_point.join(relative_path))?;
+        let path = client.mount_point.join(relative_path);
+        let payload = bounded_mounted_read(
+            path.clone(),
+            format!("namespace collision repeated read {}", path.display()),
+            COLLISION_OPERATION_TIMEOUT,
+        )
+        .map_err(scenario_error_to_io)?;
         if payload != COLLISION_OLD_COMMITTED_PAYLOAD && payload != COLLISION_NEW_COMMITTED_PAYLOAD
         {
             return Err(io::Error::other(format!(
@@ -1034,14 +1045,20 @@ pub(in crate::scenario) fn write_local_durable_payload(
     path: PathBuf,
     payload: &[u8],
 ) -> Result<(), ScenarioError> {
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(path)?;
-    file.write_all(payload)?;
-    file.sync_all()?;
-    Ok(())
+    let write_payload = payload.to_vec();
+    run_bounded_mounted_io(
+        format!("write local durable payload {}", path.display()),
+        MOUNTED_WRITE_READBACK_TIMEOUT,
+        move || {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(path)?;
+            file.write_all(&write_payload)?;
+            file.sync_all()
+        },
+    )
 }
 
 pub(in crate::scenario) fn crash_restart_mode_slug(mode: CrashRestartMode) -> &'static str {

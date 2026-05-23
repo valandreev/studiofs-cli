@@ -12,7 +12,12 @@ pub(in crate::scenario) fn wait_for_symlink_target_until(
     loop {
         let mut mismatches = Vec::new();
         for client in clients {
-            match fs::read_link(client.mount_point.join(relative_path)) {
+            let path = client.mount_point.join(relative_path);
+            match bounded_mounted_read_link(
+                path.clone(),
+                format!("symlink target read {}", path.display()),
+                MOUNTED_VALIDATION_PROBE_TIMEOUT,
+            ) {
                 Ok(target) if target == Path::new(expected_target) => {}
                 Ok(target) => mismatches.push(format!(
                     "{}:{} expected {}, got {}",
@@ -21,7 +26,7 @@ pub(in crate::scenario) fn wait_for_symlink_target_until(
                     expected_target,
                     target.display()
                 )),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                Err(ScenarioError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
                     mismatches.push(format!("{}:{relative_path} missing", client.name));
                 }
                 Err(error) => {
@@ -52,7 +57,12 @@ pub(in crate::scenario) fn wait_for_readonly_attribute_until(
         let mut observed = Vec::new();
         let mut pending = Vec::new();
         for client in clients {
-            match fs::metadata(client.mount_point.join(relative_path)) {
+            let path = client.mount_point.join(relative_path);
+            match bounded_mounted_metadata(
+                path.clone(),
+                format!("readonly metadata {}", path.display()),
+                MOUNTED_VALIDATION_PROBE_TIMEOUT,
+            ) {
                 Ok(metadata) if metadata.permissions().readonly() => {
                     observed.push(client.name.clone());
                 }
@@ -152,9 +162,14 @@ pub(in crate::scenario) fn observer_sees_payload(
     expected_payload: &[u8],
 ) -> Result<bool, ScenarioError> {
     let _ = refresh_relative_path_parent_contains_child(&observer.mount_point, relative_path);
-    match fs::read(observer.mount_point.join(relative_path)) {
+    let path = observer.mount_point.join(relative_path);
+    match bounded_mounted_read(
+        path.clone(),
+        format!("observer payload read {}", path.display()),
+        MOUNTED_VALIDATION_PROBE_TIMEOUT,
+    ) {
         Ok(payload) => Ok(payload == expected_payload),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error.into()),
+        Err(ScenarioError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
     }
 }
