@@ -283,6 +283,65 @@ fn persisted_pg_flushed_event_seq_roundtrips_in_local_counter() {
 }
 
 #[test]
+fn local_position_leaf_persistence_is_monotonic() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+
+    pg.persist_local_version(42).expect("persist local version");
+    pg.persist_local_version(17)
+        .expect("ignore older local version");
+    assert_eq!(pg.local_version.load(Ordering::SeqCst), 42);
+    assert_eq!(
+        PgMetaEngine::load_persisted_local_version(&pg.local).expect("reload local version"),
+        42
+    );
+
+    pg.persist_namespace_version(23)
+        .expect("persist namespace version");
+    pg.persist_namespace_version(11)
+        .expect("ignore older namespace version");
+    assert_eq!(pg.namespace_version.load(Ordering::SeqCst), 23);
+    assert_eq!(
+        PgMetaEngine::load_persisted_namespace_version(&pg.local)
+            .expect("reload namespace version"),
+        23
+    );
+
+    pg.persist_flushed_event_seq(25)
+        .expect("persist flushed event seq");
+    pg.persist_flushed_event_seq(19)
+        .expect("ignore older flushed event seq");
+    assert_eq!(pg.flushed_event_seq.load(Ordering::SeqCst), 25);
+    assert_eq!(
+        PgMetaEngine::load_persisted_flushed_event_seq(&pg.local)
+            .expect("reload flushed event seq"),
+        25
+    );
+}
+
+#[test]
+fn replay_position_does_not_regress_flushed_event_seq() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+
+    pg.persist_flushed_event_seq(25)
+        .expect("persist newer flushed event seq");
+    pg.persist_replay_position(&RemoteReplayApplyOutcome {
+        changed: true,
+        max_version: 7,
+        max_namespace_version: 3,
+        flushed_event_seq: Some(19),
+    })
+    .expect("persist replay position");
+
+    assert_eq!(pg.flushed_event_seq.load(Ordering::SeqCst), 25);
+    assert_eq!(
+        PgMetaEngine::load_persisted_flushed_event_seq(&pg.local)
+            .expect("reload flushed event seq"),
+        25,
+        "replay position persistence must not move the local flushed cursor backwards"
+    );
+}
+
+#[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn test_pg_flush_advances_checkpoint_version() {
     let Some(dsn) = pg_dsn() else {

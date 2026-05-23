@@ -1,3 +1,5 @@
+//! Owns local event replication backlog claims and flush completion.
+
 use super::{
     ClaimedPendingBatch, PendingReplicationState, PgMetaEngine, RecentFlush, RemoteApplyCoordinator,
 };

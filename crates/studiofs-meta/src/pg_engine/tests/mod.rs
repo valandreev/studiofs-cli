@@ -484,6 +484,7 @@ pub(crate) fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
         local_version: AtomicI64::new(0),
         namespace_version: AtomicI64::new(0),
         flushed_event_seq: AtomicU64::new(flushed_event_seq),
+        local_position_lock: Mutex::new(()),
         replication_lock: Mutex::new(()),
         poll_interval: Duration::from_secs(60),
         flush_interval: Duration::from_secs(60),
@@ -615,7 +616,7 @@ fn apply_decoded_foreign_batches_locked(
             initial_overlay,
         },
     )?;
-    pg.persist_replay_outcome(&outcome)?;
+    pg.persist_replay_position(&outcome)?;
     Ok(outcome.changed)
 }
 

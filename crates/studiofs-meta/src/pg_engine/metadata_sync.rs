@@ -1,3 +1,5 @@
+//! Owns foreign metadata catch-up orchestration and local replay application.
+
 use super::{
     MetadataSyncSource, OverlayConflictSets, PgMetaEngine, RecentFlush, RemoteApplyCoordinator,
 };
@@ -28,22 +30,6 @@ impl PgMetaEngine {
         let overlay = self.local_overlay_conflicts()?;
         RemoteApplyCoordinator::new(&self.local)
             .reconcile_regular_file_serving_from_base_with_overlay(&reconcile_inodes, &overlay)?;
-        Ok(())
-    }
-
-    pub(super) fn persist_replay_outcome(
-        &self,
-        outcome: &super::RemoteReplayApplyOutcome,
-    ) -> MetaResult<()> {
-        if outcome.max_version > self.local_version.load(Ordering::SeqCst) {
-            self.persist_local_version(outcome.max_version)?;
-        }
-        if outcome.max_namespace_version > self.namespace_version.load(Ordering::SeqCst) {
-            self.persist_namespace_version(outcome.max_namespace_version)?;
-        }
-        if let Some(flushed_event_seq) = outcome.flushed_event_seq {
-            self.persist_flushed_event_seq(flushed_event_seq)?;
-        }
         Ok(())
     }
 
@@ -143,7 +129,7 @@ impl PgMetaEngine {
                 initial_overlay,
             },
         )?;
-        self.persist_replay_outcome(&outcome)?;
+        self.persist_replay_position(&outcome)?;
         Ok(outcome.changed)
     }
 
