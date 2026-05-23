@@ -31,7 +31,7 @@ pub(super) struct StartupReplayCoordinator<'a> {
     unreferenced_local_payloads_removed: u64,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone, Copy)]
 struct StartupGraphObject {
     block_index: u32,
     object_id: u64,
@@ -384,12 +384,13 @@ impl<'a> StartupReplayCoordinator<'a> {
         self.pending_epoch_finalizations.len()
     }
 
-    fn record_live_extent(
+    fn record_live_extent_entry(
         &mut self,
         ino: Ino,
         block_index: u32,
         object_id: u64,
         content_epoch: u64,
+        allow_equal_epoch: bool,
     ) {
         let next = ExtentRecordId {
             object_id,
@@ -400,11 +401,24 @@ impl<'a> StartupReplayCoordinator<'a> {
                 entry.insert(next);
             }
             std::collections::hash_map::Entry::Occupied(mut entry) => {
-                if next.content_epoch >= entry.get().content_epoch {
+                let current_epoch = entry.get().content_epoch;
+                if next.content_epoch > current_epoch
+                    || (allow_equal_epoch && next.content_epoch == current_epoch)
+                {
                     entry.insert(next);
                 }
             }
         }
+    }
+
+    fn record_live_extent(
+        &mut self,
+        ino: Ino,
+        block_index: u32,
+        object_id: u64,
+        content_epoch: u64,
+    ) {
+        self.record_live_extent_entry(ino, block_index, object_id, content_epoch, true);
     }
 
     fn record_pending_live_extent(
@@ -414,20 +428,7 @@ impl<'a> StartupReplayCoordinator<'a> {
         object_id: u64,
         content_epoch: u64,
     ) {
-        let next = ExtentRecordId {
-            object_id,
-            content_epoch,
-        };
-        match self.live_extents.entry((ino, block_index)) {
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(next);
-            }
-            std::collections::hash_map::Entry::Occupied(mut entry) => {
-                if next.content_epoch > entry.get().content_epoch {
-                    entry.insert(next);
-                }
-            }
-        }
+        self.record_live_extent_entry(ino, block_index, object_id, content_epoch, false);
     }
 
     fn cleanup_orphan_dirty_payloads(&mut self, reachable_object_ids: Option<&HashSet<u64>>) {
@@ -472,12 +473,12 @@ impl<'a> StartupReplayCoordinator<'a> {
                 "removing orphan dirty payload object without metadata reference"
             );
             self.vfs.local_payload_backend.remove(*object_id);
-            self.vfs
-                .state
-                .upload
-                .pending_evictions
-                .lock()
-                .remove(object_id);
+        }
+        {
+            let mut pending_evictions = self.vfs.state.upload.pending_evictions.lock();
+            for object_id in &self.dirty_set {
+                pending_evictions.remove(object_id);
+            }
         }
         self.vfs
             .state
@@ -492,7 +493,7 @@ impl<'a> StartupReplayCoordinator<'a> {
 
     fn cleanup_unreferenced_local_payloads(
         &mut self,
-        local_object_ids: BTreeSet<u64>,
+        local_object_ids: Vec<u64>,
         protected_object_ids: &HashSet<u64>,
         reachable_object_ids: Option<&HashSet<u64>>,
     ) {
@@ -571,13 +572,13 @@ impl<'a> StartupReplayCoordinator<'a> {
         self.discard_quarantined_dirty_objects();
         self.merge_pending_live_extents();
         let replayed_blocks = self.restored_live_extents as u64;
-        let replayed_object_ids: Vec<_> = self
+        let mut replayed_object_ids: Vec<_> = self
             .replay_ops
             .iter()
             .map(|(_, _, object_id, _)| *object_id)
-            .collect::<BTreeSet<_>>()
-            .into_iter()
             .collect();
+        replayed_object_ids.sort_unstable();
+        replayed_object_ids.dedup();
         let replayed_bytes = replayed_object_ids
             .iter()
             .filter_map(|object_id| self.vfs.local_payload_backend.object_stats(*object_id))
@@ -664,12 +665,7 @@ impl<'a> StartupReplayCoordinator<'a> {
                 }),
             );
         }
-        let local_object_ids: BTreeSet<_> = self
-            .vfs
-            .local_payload_backend
-            .object_ids()
-            .into_iter()
-            .collect();
+        let local_object_ids = self.vfs.local_payload_backend.object_ids();
         let reachable_object_ids = if self.dirty_set.is_empty() && local_object_ids.is_empty() {
             None
         } else {
