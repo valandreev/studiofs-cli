@@ -12187,7 +12187,8 @@ fn handle_aware_read_policy_keeps_sequential_and_random_streams_separate() {
         .build()
         .unwrap();
     rt.block_on(async {
-        let (format_info, vfs) = make_offline_vfs_local_s3(&tmp, "sfs125-streams", Some(128 * 1024));
+        let (format_info, vfs) =
+            make_offline_vfs_local_s3(&tmp, "sfs125-streams", Some(128 * 1024));
         let block_size = format_info.block_size as usize;
         let full_size = block_size * 8;
         let payload: Vec<u8> = (0..full_size)
@@ -13570,6 +13571,3 @@ fn concurrent_reads_through_upload_finalization() {
     });
     rt.shutdown_background();
 }
-
-
-

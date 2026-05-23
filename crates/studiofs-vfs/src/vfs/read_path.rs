@@ -64,6 +64,130 @@ impl ReadClaimBuffers {
     }
 }
 
+struct ReadDataPlanner {
+    requested: ReadRange,
+    unresolved: ReadRangeList,
+    segments: Vec<ReadSegment>,
+    claim_buffers: ReadClaimBuffers,
+}
+
+impl ReadDataPlanner {
+    fn new(offset: u64, length: u64) -> Option<Self> {
+        let read_end = offset.checked_add(length)?;
+        let requested = ReadRange::new(offset, read_end)?;
+        Some(Self {
+            requested,
+            unresolved: smallvec![requested],
+            segments: Vec::new(),
+            claim_buffers: ReadClaimBuffers::new(),
+        })
+    }
+
+    fn is_complete(&self) -> bool {
+        self.unresolved.is_empty()
+    }
+
+    fn claim_range(&mut self, candidate: ReadRange) {
+        Self::claim_unresolved_ranges(&mut self.unresolved, candidate, &mut self.claim_buffers);
+    }
+
+    #[cfg(test)]
+    fn claim_resolved_metadata(mut self, resolved: &[ResolvedSliceSpan]) -> Self {
+        self.claim_resolved_metadata_in_place(resolved);
+        self
+    }
+
+    fn claim_resolved_metadata_in_place(&mut self, resolved: &[ResolvedSliceSpan]) {
+        self.claim_meta_spans(resolved.iter(), ResolvedSliceSource::Overlay, |payload| {
+            ReadSegmentSource::Overlay { payload }
+        });
+        self.claim_meta_spans(resolved.iter(), ResolvedSliceSource::Base, |payload| {
+            ReadSegmentSource::Base { payload }
+        });
+    }
+
+    fn claim_meta_spans<'b, I, F>(
+        &mut self,
+        resolved: I,
+        source_filter: ResolvedSliceSource,
+        source_ctor: F,
+    ) where
+        I: Iterator<Item = &'b ResolvedSliceSpan>,
+        F: Fn(PayloadRef) -> ReadSegmentSource + Copy,
+    {
+        for span in resolved {
+            if self.is_complete() {
+                break;
+            }
+            if span.source != source_filter {
+                continue;
+            }
+            let Some(block) = span.payload.as_ref() else {
+                continue;
+            };
+            let chunk_base = chunk_start_offset(span.chunk_id, DEFAULT_CHUNK_SIZE);
+            let Some(span_range) = ReadRange::new(
+                chunk_base.saturating_add(span.range.start as u64),
+                chunk_base.saturating_add(span.range.end as u64),
+            ) else {
+                continue;
+            };
+            let Some(clipped) = span_range.intersection(self.requested) else {
+                continue;
+            };
+            self.claim_range(clipped);
+            let claim_buffers = &self.claim_buffers;
+            let segments = &mut self.segments;
+            for overlap in &claim_buffers.claimed {
+                let delta = overlap.start().saturating_sub(span_range.start());
+                let Some(delta_u32) = u32::try_from(delta).ok() else {
+                    continue;
+                };
+                let Some(block_offset) = block.offset.checked_add(delta_u32) else {
+                    continue;
+                };
+                let length = overlap.end().saturating_sub(overlap.start());
+                let Some(block_length) = u32::try_from(length).ok() else {
+                    continue;
+                };
+                let mut planned_block = block.clone();
+                planned_block.offset = block_offset;
+                planned_block.length = block_length;
+                segments.push(ReadSegment {
+                    range: *overlap,
+                    source: source_ctor(planned_block),
+                });
+            }
+        }
+    }
+
+    fn finish(mut self) -> Vec<ReadSegment> {
+        for gap in self.unresolved {
+            self.segments.push(ReadSegment {
+                range: gap,
+                source: ReadSegmentSource::Zero,
+            });
+        }
+        self.segments
+    }
+
+    fn claim_unresolved_ranges(
+        unresolved: &mut ReadRangeList,
+        candidate: ReadRange,
+        buffers: &mut ReadClaimBuffers,
+    ) {
+        buffers.claimed.clear();
+        buffers.scratch.clear();
+        subtract_claimed_range(
+            unresolved.drain(..),
+            candidate,
+            &mut buffers.scratch,
+            &mut buffers.claimed,
+        );
+        std::mem::swap(unresolved, &mut buffers.scratch);
+    }
+}
+
 struct DataReader<'a> {
     vfs: &'a StudioVfs,
     ino: Ino,
@@ -227,37 +351,35 @@ impl<'a> DataReader<'a> {
         if length == 0 {
             return Ok(Vec::new());
         }
-        let Some(read_end) = offset.checked_add(length) else {
-            return Err(VfsError::Other(format!(
+        let mut planner = ReadDataPlanner::new(offset, length).ok_or_else(|| {
+            VfsError::Other(format!(
                 "read range overflow: ino={ino}, offset={offset}, length={length}"
-            )));
-        };
-        let requested = ReadRange::new(offset, read_end).expect("non-empty checked read range");
-        let mut unresolved = smallvec![requested];
-        let mut claim_buffers = ReadClaimBuffers::new();
-        let mut segments = Vec::new();
+            ))
+        })?;
         let pending_upload_index = vfs.snapshot_pending_upload_index();
 
         for claim in writer_stack_claims {
-            if unresolved.is_empty() {
+            if planner.is_complete() {
                 break;
             }
             let Some(dirty_range) = ReadRange::new(claim.start, claim.end) else {
                 continue;
             };
-            Self::claim_unresolved_ranges(&mut unresolved, dirty_range, &mut claim_buffers);
+            planner.claim_range(dirty_range);
         }
 
         let dirty_spans = vfs.snapshot_pending_dirty_slice_read_spans(ino, offset, length);
         for dirty in dirty_spans {
-            if unresolved.is_empty() {
+            if planner.is_complete() {
                 break;
             }
             let Some(dirty_range) = ReadRange::new(dirty.start, dirty.end) else {
                 continue;
             };
-            Self::claim_unresolved_ranges(&mut unresolved, dirty_range, &mut claim_buffers);
-            for overlap in claim_buffers.claimed.iter().copied() {
+            planner.claim_range(dirty_range);
+            let claim_buffers = &planner.claim_buffers;
+            let segments = &mut planner.segments;
+            for overlap in &claim_buffers.claimed {
                 let delta = overlap.start().saturating_sub(dirty.start);
                 let Some(delta_u32) = u32::try_from(delta).ok() else {
                     continue;
@@ -266,7 +388,7 @@ impl<'a> DataReader<'a> {
                     continue;
                 };
                 segments.push(ReadSegment {
-                    range: overlap,
+                    range: *overlap,
                     source: ReadSegmentSource::Dirty {
                         data: dirty.data.clone(),
                         block_offset: u64::from(block_offset),
@@ -278,14 +400,16 @@ impl<'a> DataReader<'a> {
         let pending_payload_spans =
             vfs.snapshot_pending_local_dirty_block_read_spans(ino, offset, length);
         for dirty in pending_payload_spans {
-            if unresolved.is_empty() {
+            if planner.is_complete() {
                 break;
             }
             let Some(dirty_range) = ReadRange::new(dirty.start, dirty.end) else {
                 continue;
             };
-            Self::claim_unresolved_ranges(&mut unresolved, dirty_range, &mut claim_buffers);
-            for overlap in claim_buffers.claimed.iter().copied() {
+            planner.claim_range(dirty_range);
+            let claim_buffers = &planner.claim_buffers;
+            let segments = &mut planner.segments;
+            for overlap in &claim_buffers.claimed {
                 let delta = overlap.start().saturating_sub(dirty.start);
                 let Some(delta_u32) = u32::try_from(delta).ok() else {
                     continue;
@@ -294,7 +418,7 @@ impl<'a> DataReader<'a> {
                     continue;
                 };
                 segments.push(ReadSegment {
-                    range: overlap,
+                    range: *overlap,
                     source: ReadSegmentSource::Dirty {
                         data: dirty.data.clone(),
                         block_offset: u64::from(block_offset),
@@ -303,9 +427,9 @@ impl<'a> DataReader<'a> {
             }
         }
 
-        if !unresolved.is_empty() {
+        if !planner.is_complete() {
             let mut candidate_blocks = ReadBlockList::new();
-            for range in &unresolved {
+            for range in &planner.unresolved {
                 let start_block = block_index_from_offset(range.start(), vfs.block_size);
                 let end_block =
                     block_index_from_offset(range.end().saturating_sub(1), vfs.block_size);
@@ -316,7 +440,7 @@ impl<'a> DataReader<'a> {
             candidate_blocks.sort_unstable();
             candidate_blocks.dedup();
             for block_index in candidate_blocks {
-                if unresolved.is_empty() {
+                if planner.is_complete() {
                     break;
                 }
                 let Some(source) = vfs.pending_overlay_block_source(
@@ -336,163 +460,61 @@ impl<'a> DataReader<'a> {
                 }
                 let block_start = (block_index as u64).saturating_mul(vfs.block_size as u64);
                 let block_end = block_start.saturating_add(vfs.block_size as u64);
-                Self::claim_unresolved_ranges(
-                    &mut unresolved,
+                planner.claim_range(
                     ReadRange::new(block_start, block_end).expect("block range is non-empty"),
-                    &mut claim_buffers,
                 );
-                for overlap in claim_buffers.claimed.iter().copied() {
+                let claim_buffers = &planner.claim_buffers;
+                let segments = &mut planner.segments;
+                for overlap in &claim_buffers.claimed {
                     let delta = overlap.start().saturating_sub(block_start);
                     let Some(block_offset) = u32::try_from(delta).ok() else {
                         continue;
                     };
+                    let source = match &source {
+                        PendingOverlayBlockSource::Pending(data) => {
+                            ReadSegmentSource::PendingOverlay {
+                                data: data.clone(),
+                                block_offset,
+                            }
+                        }
+                        PendingOverlayBlockSource::Extent(object_id) => {
+                            ReadSegmentSource::PendingExtent {
+                                object_id: *object_id,
+                                block_offset,
+                            }
+                        }
+                    };
                     segments.push(ReadSegment {
-                        range: overlap,
-                        source: match &source {
-                            PendingOverlayBlockSource::Pending(data) => {
-                                ReadSegmentSource::PendingOverlay {
-                                    data: data.clone(),
-                                    block_offset,
-                                }
-                            }
-                            PendingOverlayBlockSource::Extent(object_id) => {
-                                ReadSegmentSource::PendingExtent {
-                                    object_id: *object_id,
-                                    block_offset,
-                                }
-                            }
-                        },
+                        range: *overlap,
+                        source,
                     });
                 }
             }
         }
 
-        if !unresolved.is_empty() {
+        if !planner.is_complete() {
             if let Some(resolved) = resolved_regular_file_slices {
-                Self::claim_meta_spans_into_segments(
-                    resolved.iter(),
-                    &mut unresolved,
-                    &mut segments,
-                    requested,
-                    ResolvedSliceSource::Overlay,
-                    |payload| ReadSegmentSource::Overlay { payload },
-                    &mut claim_buffers,
-                );
-                Self::claim_meta_spans_into_segments(
-                    resolved.iter(),
-                    &mut unresolved,
-                    &mut segments,
-                    requested,
-                    ResolvedSliceSource::Base,
-                    |payload| ReadSegmentSource::Base { payload },
-                    &mut claim_buffers,
-                );
+                planner.claim_resolved_metadata_in_place(resolved);
             } else {
                 let meta = vfs.meta.clone();
                 let resolved = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
                     engine.lookup_regular_file_slices(ino, offset, length)
                 })
                 .await?;
-                Self::claim_meta_spans_into_segments(
-                    resolved.iter(),
-                    &mut unresolved,
-                    &mut segments,
-                    requested,
-                    ResolvedSliceSource::Overlay,
-                    |payload| ReadSegmentSource::Overlay { payload },
-                    &mut claim_buffers,
-                );
-                Self::claim_meta_spans_into_segments(
-                    resolved.iter(),
-                    &mut unresolved,
-                    &mut segments,
-                    requested,
-                    ResolvedSliceSource::Base,
-                    |payload| ReadSegmentSource::Base { payload },
-                    &mut claim_buffers,
-                );
+                planner.claim_resolved_metadata_in_place(&resolved);
             }
         }
 
-        for gap in unresolved {
-            segments.push(ReadSegment {
-                range: gap,
-                source: ReadSegmentSource::Zero,
-            });
-        }
-        Ok(segments)
+        Ok(planner.finish())
     }
 
+    #[cfg(test)]
     fn claim_unresolved_ranges(
         unresolved: &mut ReadRangeList,
         candidate: ReadRange,
         buffers: &mut ReadClaimBuffers,
     ) {
-        buffers.claimed.clear();
-        buffers.scratch.clear();
-        subtract_claimed_range(
-            unresolved.drain(..),
-            candidate,
-            &mut buffers.scratch,
-            &mut buffers.claimed,
-        );
-        std::mem::swap(unresolved, &mut buffers.scratch);
-    }
-
-    fn claim_meta_spans_into_segments<'b, I, F>(
-        resolved: I,
-        unresolved: &mut ReadRangeList,
-        segments: &mut Vec<ReadSegment>,
-        requested: ReadRange,
-        source_filter: ResolvedSliceSource,
-        source_ctor: F,
-        buffers: &mut ReadClaimBuffers,
-    ) where
-        I: Iterator<Item = &'b ResolvedSliceSpan>,
-        F: Fn(PayloadRef) -> ReadSegmentSource + Copy,
-    {
-        for span in resolved {
-            if unresolved.is_empty() {
-                break;
-            }
-            if span.source != source_filter {
-                continue;
-            }
-            let Some(block) = span.payload.as_ref() else {
-                continue;
-            };
-            let chunk_base = chunk_start_offset(span.chunk_id, DEFAULT_CHUNK_SIZE);
-            let Some(span_range) = ReadRange::new(
-                chunk_base.saturating_add(span.range.start as u64),
-                chunk_base.saturating_add(span.range.end as u64),
-            ) else {
-                continue;
-            };
-            let Some(clipped) = span_range.intersection(requested) else {
-                continue;
-            };
-            Self::claim_unresolved_ranges(unresolved, clipped, buffers);
-            for overlap in buffers.claimed.iter().copied() {
-                let delta = overlap.start().saturating_sub(span_range.start());
-                let Some(delta_u32) = u32::try_from(delta).ok() else {
-                    continue;
-                };
-                let Some(block_offset) = block.offset.checked_add(delta_u32) else {
-                    continue;
-                };
-                let length = overlap.end().saturating_sub(overlap.start());
-                let Some(block_length) = u32::try_from(length).ok() else {
-                    continue;
-                };
-                let mut planned_block = block.clone();
-                planned_block.offset = block_offset;
-                planned_block.length = block_length;
-                segments.push(ReadSegment {
-                    range: overlap,
-                    source: source_ctor(planned_block),
-                });
-            }
-        }
+        ReadDataPlanner::claim_unresolved_ranges(unresolved, candidate, buffers);
     }
 
     async fn populate_missing_remote_blocks(
@@ -763,6 +785,33 @@ struct ReadMetadata {
     resolved_slices: Arc<[ResolvedSliceSpan]>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetadataRefreshDecision {
+    UseLocal,
+    RefreshAuthoritative,
+}
+
+impl MetadataRefreshDecision {
+    fn for_local_attr(
+        attr: &InodeAttr,
+        has_pending_local_payloads: bool,
+        has_dirty_writer_stack: bool,
+        has_pending_uploads: bool,
+    ) -> Self {
+        let tracks_pending_regular_content = attr.kind == FileType::RegularFile
+            && (attr.upload_state != MetaUploadState::Ready
+                || attr.content_epoch != attr.committed_content_epoch);
+        if !tracks_pending_regular_content
+            || has_pending_local_payloads
+            || has_dirty_writer_stack
+            || has_pending_uploads
+        {
+            return Self::UseLocal;
+        }
+        Self::RefreshAuthoritative
+    }
+}
+
 pub(super) struct PreparedForegroundRead {
     pub(super) context: ReadRequestContext,
     pub(super) resolved_slices: Arc<[ResolvedSliceSpan]>,
@@ -848,18 +897,14 @@ impl<'a> ReadMetadataResolver<'a> {
             .get(&self.ino)
             .cloned()?;
 
-        if self
-            .vfs
-            .has_pending_local_dirty_payloads_for_inode(self.ino)
-            || self.vfs.inode_has_dirty_writer_stack(self.ino)
-            || !self.vfs.pending_uploads_for_inode(self.ino).is_empty()
+        if MetadataRefreshDecision::for_local_attr(
+            &dirty_attr,
+            self.vfs
+                .has_pending_local_dirty_payloads_for_inode(self.ino),
+            self.vfs.inode_has_dirty_writer_stack(self.ino),
+            self.vfs.inode_has_pending_uploads(self.ino),
+        ) == MetadataRefreshDecision::UseLocal
         {
-            return Some(dirty_attr);
-        }
-        let dirty_attr_tracks_pending_content = dirty_attr.kind == FileType::RegularFile
-            && (dirty_attr.upload_state != MetaUploadState::Ready
-                || dirty_attr.content_epoch != dirty_attr.committed_content_epoch);
-        if !dirty_attr_tracks_pending_content {
             return Some(dirty_attr);
         }
 
@@ -898,15 +943,13 @@ impl<'a> ReadMetadataResolver<'a> {
             .lock()
             .get(self.ino, Instant::now())?;
 
-        let cached_attr_tracks_pending_content = cached_attr.kind == FileType::RegularFile
-            && (cached_attr.upload_state != MetaUploadState::Ready
-                || cached_attr.content_epoch != cached_attr.committed_content_epoch);
-        if !cached_attr_tracks_pending_content
-            || self
-                .vfs
-                .has_pending_local_dirty_payloads_for_inode(self.ino)
-            || self.vfs.inode_has_dirty_writer_stack(self.ino)
-            || !self.vfs.pending_uploads_for_inode(self.ino).is_empty()
+        if MetadataRefreshDecision::for_local_attr(
+            &cached_attr,
+            self.vfs
+                .has_pending_local_dirty_payloads_for_inode(self.ino),
+            self.vfs.inode_has_dirty_writer_stack(self.ino),
+            self.vfs.inode_has_pending_uploads(self.ino),
+        ) == MetadataRefreshDecision::UseLocal
         {
             return Some(cached_attr);
         }
@@ -1478,7 +1521,8 @@ mod tests {
     use super::super::local_dirty::PendingPayload;
     use super::super::*;
     use super::{
-        DataReader, ReadClaimBuffers, ReadRange, ReadRangeList, ReadSegment, ReadSegmentSource,
+        DataReader, MetadataRefreshDecision, ReadClaimBuffers, ReadDataPlanner, ReadRange,
+        ReadRangeList, ReadSegment, ReadSegmentSource,
     };
     use bytes::{Bytes, BytesMut};
     use std::any::Any;
@@ -1492,7 +1536,7 @@ mod tests {
     };
     use studiofs_meta::schema::{
         CURRENT_FORMAT_VERSION, ChunkId, DEFAULT_BLOCK_SIZE, FormatInfo, MetadataConfig,
-        PayloadRefState, ROOT_INO, SliceId, SliceOrder, SliceRange, SliceRecord,
+        PayloadRefState, ROOT_INO, ResolvedSliceSpan, SliceId, SliceOrder, SliceRange, SliceRecord,
     };
     use studiofs_meta::types::BlockFlags as MetaBlockFlags;
     use studiofs_meta::{MetaFormat, MetaInodes, MetaPayloadObjects, RedbMetaEngine};
@@ -1916,6 +1960,87 @@ mod tests {
         assert!(unresolved.capacity() >= scratch_capacity);
         assert_eq!(buffers.claimed.len(), 4);
         assert!(unresolved.is_empty());
+    }
+
+    #[test]
+    fn data_planner_builds_metadata_segments_without_vfs_reads() {
+        let overlay_payload = PayloadRef {
+            object_id: 7,
+            offset: 4,
+            length: 4,
+            flags: MetaBlockFlags::PARTIAL_BLOCK,
+        };
+        let base_payload = PayloadRef {
+            object_id: 8,
+            offset: 10,
+            length: 4,
+            flags: MetaBlockFlags::PARTIAL_BLOCK,
+        };
+        let resolved = vec![
+            ResolvedSliceSpan {
+                chunk_id: ChunkId(0),
+                range: SliceRange::new(0, 4).expect("overlay range"),
+                source: ResolvedSliceSource::Overlay,
+                slice_id: Some(SliceId(1)),
+                slice_order: Some(SliceOrder(1)),
+                payload: Some(overlay_payload.clone()),
+            },
+            ResolvedSliceSpan {
+                chunk_id: ChunkId(0),
+                range: SliceRange::new(8, 12).expect("base range"),
+                source: ResolvedSliceSource::Base,
+                slice_id: Some(SliceId(2)),
+                slice_order: Some(SliceOrder(2)),
+                payload: Some(base_payload.clone()),
+            },
+        ];
+
+        let segments = ReadDataPlanner::new(0, 12)
+            .expect("valid planner")
+            .claim_resolved_metadata(&resolved)
+            .finish();
+
+        assert_eq!(segments.len(), 3);
+        assert!(matches!(
+            &segments[0].source,
+            ReadSegmentSource::Overlay { payload }
+                if segments[0].range == read_range(0, 4)
+                    && payload.object_id == overlay_payload.object_id
+                    && payload.offset == overlay_payload.offset
+                    && payload.length == overlay_payload.length
+        ));
+        assert!(matches!(
+            &segments[1].source,
+            ReadSegmentSource::Base { payload }
+                if segments[1].range == read_range(8, 12)
+                    && payload.object_id == base_payload.object_id
+                    && payload.offset == base_payload.offset
+                    && payload.length == base_payload.length
+        ));
+        assert!(matches!(&segments[2].source, ReadSegmentSource::Zero));
+        assert_eq!(segments[2].range, read_range(4, 8));
+    }
+
+    #[test]
+    fn metadata_refresh_decision_separates_drained_attrs_from_active_local_state() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "metadata-refresh-decision");
+        let _guard = rt.enter();
+        let created = vfs
+            .create(ROOT_INO, b"refresh-decision.txt", 1000, 1000, 0o644)
+            .expect("create file");
+        let mut pending_attr = meta.get_attr(created.ino).expect("load attr");
+        pending_attr.upload_state = MetaUploadState::Updating;
+        pending_attr.content_epoch = pending_attr.committed_content_epoch + 1;
+
+        assert_eq!(
+            MetadataRefreshDecision::for_local_attr(&pending_attr, true, false, false),
+            MetadataRefreshDecision::UseLocal
+        );
+        assert_eq!(
+            MetadataRefreshDecision::for_local_attr(&pending_attr, false, false, false),
+            MetadataRefreshDecision::RefreshAuthoritative
+        );
     }
 
     #[test]
