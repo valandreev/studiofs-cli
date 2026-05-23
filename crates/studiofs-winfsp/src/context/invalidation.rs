@@ -82,23 +82,22 @@ impl NotifyingFileSystemContext<Vec<Ino>> for StudioFsContext {
         }
         // Drain and deduplicate while preserving the queue allocation for the
         // next invalidation burst.
-        let mut inodes = Vec::with_capacity(queue.len());
-        inodes.append(&mut *queue);
+        let replacement = Vec::with_capacity(queue.capacity());
+        let mut inodes = std::mem::replace(&mut *queue, replacement);
         inodes.sort_unstable();
         inodes.dedup();
         Some(inodes)
     }
 
     fn notify(&self, inodes: Vec<Ino>, notifier: &Notifier) {
+        let meta = self.vfs.meta();
         for ino in &inodes {
             let Some(path) = ino_to_windows_path(&self.vfs, *ino) else {
                 trace!(ino, "skipping notify - inode no longer resolvable");
                 continue;
             };
 
-            let kind = self
-                .vfs
-                .meta()
+            let kind = meta
                 .get_attr(*ino)
                 .map(|a| a.kind)
                 .unwrap_or(FileType::RegularFile);
