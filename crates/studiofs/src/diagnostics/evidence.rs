@@ -234,7 +234,7 @@ pub(super) fn load_wall_blocking_profile_artifact(
         .with_context(|| format!("read profiling artifact '{}'", artifact.path))?;
     let summary = serde_json::from_slice::<serde_json::Value>(&bytes)
         .with_context(|| format!("parse profiling artifact '{}'", artifact.path))?;
-    let typed = serde_json::from_value::<WallBlockingProfileArtifact>(summary.clone())
+    let typed = serde_json::from_slice::<WallBlockingProfileArtifact>(&bytes)
         .with_context(|| format!("decode profiling artifact '{}'", artifact.path))?;
     Ok(Some((summary, typed)))
 }

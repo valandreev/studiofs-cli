@@ -162,14 +162,17 @@ pub(super) fn static_machine_fingerprint() -> MachineFingerprint {
     static MACHINE_FINGERPRINT: OnceLock<MachineFingerprint> = OnceLock::new();
     MACHINE_FINGERPRINT
         .get_or_init(|| {
-            let system = sysinfo::System::new_all();
+            let mut system = sysinfo::System::new();
+            system.refresh_memory();
             MachineFingerprint {
                 host_name: sysinfo::System::host_name(),
                 system_name: sysinfo::System::name(),
                 kernel_version: sysinfo::System::kernel_version(),
                 os_version: sysinfo::System::os_version(),
                 total_memory_bytes: system.total_memory(),
-                cpu_count: system.cpus().len(),
+                cpu_count: std::thread::available_parallelism()
+                    .map(usize::from)
+                    .unwrap_or_else(|_| system.cpus().len()),
             }
         })
         .clone()

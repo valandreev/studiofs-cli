@@ -295,8 +295,8 @@ pub(super) fn complete_workflow_progress(workflow: &mut InvestigationWorkflowRun
     }
 }
 
-pub(super) fn workflow_artifact_dir(cache_path: &str, workflow_run_id: &str) -> Result<PathBuf> {
-    let dir = PathBuf::from(cache_path)
+pub(super) fn workflow_artifact_dir(cache_path: &Path, workflow_run_id: &str) -> Result<PathBuf> {
+    let dir = cache_path
         .join(DIAGNOSTICS_WORKFLOW_ARTIFACT_DIR_NAME)
         .join(workflow_run_id);
     fs::create_dir_all(&dir)
@@ -305,7 +305,7 @@ pub(super) fn workflow_artifact_dir(cache_path: &str, workflow_run_id: &str) -> 
 }
 
 pub(super) fn write_workflow_artifact(
-    cache_path: &str,
+    cache_path: &Path,
     workflow_run_id: &str,
     step_id: &str,
     kind: &str,
@@ -359,42 +359,39 @@ pub(super) fn run_command_with_timeout(
     mut command: std::process::Command,
     timeout: Duration,
 ) -> Result<(i32, String, String)> {
-    use std::io::Read;
+    use std::io::{Read, Seek, SeekFrom};
     use std::process::Stdio;
-    use std::thread;
 
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut stdout_file = tempfile::tempfile().context("create workflow stdout capture")?;
+    let mut stderr_file = tempfile::tempfile().context("create workflow stderr capture")?;
+    command
+        .stdout(Stdio::from(
+            stdout_file
+                .try_clone()
+                .context("clone workflow stdout capture")?,
+        ))
+        .stderr(Stdio::from(
+            stderr_file
+                .try_clone()
+                .context("clone workflow stderr capture")?,
+        ));
     let mut child = command.spawn().context("spawn workflow command")?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("workflow command stdout was not captured"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow!("workflow command stderr was not captured"))?;
-    let stdout_reader = thread::spawn(move || -> std::io::Result<Vec<u8>> {
-        let mut stdout = stdout;
-        let mut buffer = Vec::new();
-        stdout.read_to_end(&mut buffer)?;
-        Ok(buffer)
-    });
-    let stderr_reader = thread::spawn(move || -> std::io::Result<Vec<u8>> {
-        let mut stderr = stderr;
-        let mut buffer = Vec::new();
-        stderr.read_to_end(&mut buffer)?;
-        Ok(buffer)
-    });
     let started = Instant::now();
     loop {
         if let Some(status) = child.try_wait().context("poll workflow command")? {
-            let stdout = stdout_reader
-                .join()
-                .map_err(|_| anyhow!("stdout reader thread panicked"))?
+            let mut stdout = Vec::new();
+            stdout_file
+                .seek(SeekFrom::Start(0))
+                .context("rewind workflow command stdout")?;
+            stdout_file
+                .read_to_end(&mut stdout)
                 .context("collect workflow command stdout")?;
-            let stderr = stderr_reader
-                .join()
-                .map_err(|_| anyhow!("stderr reader thread panicked"))?
+            let mut stderr = Vec::new();
+            stderr_file
+                .seek(SeekFrom::Start(0))
+                .context("rewind workflow command stderr")?;
+            stderr_file
+                .read_to_end(&mut stderr)
                 .context("collect workflow command stderr")?;
             let exit_code = status
                 .code()
@@ -408,8 +405,6 @@ pub(super) fn run_command_with_timeout(
         if started.elapsed() >= timeout {
             child.kill().ok();
             let _ = child.wait();
-            let _ = stdout_reader.join();
-            let _ = stderr_reader.join();
             return Err(anyhow!(
                 "workflow command exceeded timeout of {} ms",
                 timeout.as_millis()
@@ -452,7 +447,7 @@ pub(super) fn run_attach_snapshot_tool(
     #[cfg(test)]
     if let Some(output) = test_workflow_attach_snapshot_output() {
         let artifact = write_workflow_artifact(
-            &session.cache_path,
+            Path::new(&session.cache_path),
             &workflow_run.id,
             &step.step_id,
             "attach_snapshot",
@@ -497,7 +492,7 @@ pub(super) fn run_attach_snapshot_tool(
         ));
     }
     let artifact = write_workflow_artifact(
-        &session.cache_path,
+        Path::new(&session.cache_path),
         &workflow_run.id,
         &step.step_id,
         "attach_snapshot",
