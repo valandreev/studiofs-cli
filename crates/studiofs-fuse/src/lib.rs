@@ -90,6 +90,7 @@ fn build_mount_options_with_allow_other(
 
 /// Flag set by the SIGINT/SIGTERM handler.
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+static CLI_SIGNAL_HANDLERS_INSTALLED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn shutdown_signal_handler(_sig: libc::c_int) {
     SHUTDOWN_REQUESTED.store(true, Ordering::Release);
@@ -103,6 +104,9 @@ pub enum SignalHandling {
     #[default]
     Disabled,
     /// Install temporary SIGINT/SIGTERM handlers for the StudioFS CLI.
+    ///
+    /// This mode mutates process-global Unix signal dispositions and only one
+    /// active mount in the current process may use it at a time.
     InstallForCli,
 }
 
@@ -122,6 +126,8 @@ pub struct FuseMountRequest {
     pub read_only: bool,
     /// Process signal ownership policy for this mount.
     pub signal_handling: SignalHandling,
+    /// Optional caller-owned signal used to request a graceful in-process unmount.
+    pub unmount_signal: Option<FuseUnmountSignal>,
 }
 
 impl FuseMountRequest {
@@ -140,7 +146,31 @@ impl FuseMountRequest {
             foreground: false,
             read_only: false,
             signal_handling: SignalHandling::default(),
+            unmount_signal: None,
         }
+    }
+}
+
+/// Caller-owned handle for requesting graceful FUSE unmount without process signals.
+#[derive(Clone, Debug, Default)]
+pub struct FuseUnmountSignal {
+    requested: Arc<AtomicBool>,
+}
+
+impl FuseUnmountSignal {
+    /// Create a new unmount signal.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Request the mount session to unmount.
+    pub fn request_unmount(&self) {
+        self.requested.store(true, Ordering::Release);
+    }
+
+    /// Return whether unmount has been requested.
+    pub fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::Acquire)
     }
 }
 
@@ -151,7 +181,14 @@ struct CliSignalHandlers {
 
 impl CliSignalHandlers {
     fn install() -> std::io::Result<Self> {
-        SHUTDOWN_REQUESTED.store(false, Ordering::Release);
+        CLI_SIGNAL_HANDLERS_INSTALLED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "FUSE CLI signal handlers are already installed",
+                )
+            })?;
         // SAFETY: `libc::signal` mutates process-global signal disposition.
         // This path is explicit CLI policy, and the previous handlers are kept
         // so cleanup restores the host disposition instead of SIG_DFL.
@@ -161,6 +198,7 @@ impl CliSignalHandlers {
                 shutdown_signal_handler as *const () as libc::sighandler_t,
             );
             if previous_sigint == libc::SIG_ERR {
+                CLI_SIGNAL_HANDLERS_INSTALLED.store(false, Ordering::Release);
                 return Err(std::io::Error::last_os_error());
             }
             let previous_sigterm = libc::signal(
@@ -169,6 +207,7 @@ impl CliSignalHandlers {
             );
             if previous_sigterm == libc::SIG_ERR {
                 let _ = libc::signal(libc::SIGINT, previous_sigint);
+                CLI_SIGNAL_HANDLERS_INSTALLED.store(false, Ordering::Release);
                 return Err(std::io::Error::last_os_error());
             }
             Ok(Self {
@@ -177,14 +216,26 @@ impl CliSignalHandlers {
             })
         }
     }
+}
 
-    fn restore(self) {
+impl Drop for CliSignalHandlers {
+    fn drop(&mut self) {
         // SAFETY: these values came from successful `libc::signal` calls in
         // `install`, so they are valid signal dispositions to restore.
         unsafe {
             libc::signal(libc::SIGINT, self.previous_sigint);
             libc::signal(libc::SIGTERM, self.previous_sigterm);
         }
+        CLI_SIGNAL_HANDLERS_INSTALLED.store(false, Ordering::Release);
+    }
+}
+
+fn signal_handlers_for_policy(
+    signal_handling: SignalHandling,
+) -> std::io::Result<Option<CliSignalHandlers>> {
+    match signal_handling {
+        SignalHandling::Disabled => Ok(None),
+        SignalHandling::InstallForCli => CliSignalHandlers::install().map(Some),
     }
 }
 
@@ -196,9 +247,7 @@ struct SignalWatcher {
 
 impl SignalWatcher {
     fn restore_handlers(&self) {
-        if let Some(handlers) = self.handlers.lock().expect("signal handler lock").take() {
-            handlers.restore();
-        }
+        let _ = self.handlers.lock().expect("signal handler lock").take();
     }
 }
 
@@ -218,10 +267,12 @@ impl Drop for SignalWatcher {
 fn spawn_signal_watcher(
     mount_point: String,
     mut unmount: fuser::SessionUnmounter,
+    signal_handling: SignalHandling,
+    unmount_signal: Option<FuseUnmountSignal>,
 ) -> std::io::Result<SignalWatcher> {
     let mp = mount_point.to_string();
     let stop = Arc::new(AtomicBool::new(false));
-    let handlers = Arc::new(Mutex::new(Some(CliSignalHandlers::install()?)));
+    let handlers = Arc::new(Mutex::new(signal_handlers_for_policy(signal_handling)?));
     let watcher_stop = Arc::clone(&stop);
     let watcher_handlers = Arc::clone(&handlers);
     let thread = std::thread::Builder::new()
@@ -230,16 +281,18 @@ fn spawn_signal_watcher(
             // Poll the atomic flag until a signal arrives.
             while !watcher_stop.load(Ordering::Acquire)
                 && !SHUTDOWN_REQUESTED.load(Ordering::Acquire)
+                && !unmount_signal
+                    .as_ref()
+                    .is_some_and(FuseUnmountSignal::is_requested)
             {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
             if watcher_stop.load(Ordering::Acquire) {
                 return;
             }
-            tracing::info!("received shutdown signal, unmounting {mp} …");
-            if let Some(handlers) = watcher_handlers.lock().expect("signal handler lock").take() {
-                handlers.restore();
-            }
+            SHUTDOWN_REQUESTED.store(true, Ordering::Release);
+            tracing::info!("received shutdown request, unmounting {mp} …");
+            let _ = watcher_handlers.lock().expect("signal handler lock").take();
             let _ = unmount.unmount();
         })?;
     Ok(SignalWatcher {
@@ -276,7 +329,9 @@ pub fn mount_with_request(request: FuseMountRequest) -> std::io::Result<()> {
         foreground,
         read_only,
         signal_handling,
+        unmount_signal,
     } = request;
+    SHUTDOWN_REQUESTED.store(false, Ordering::Release);
     let fs = StudioFuseFs::new(vfs.clone(), runtime_handle);
     // Do NOT add DefaultPermissions here: it would make the kernel enforce
     // POSIX mode/uid/gid from getattr() in-kernel.  Old volumes have the
@@ -303,10 +358,12 @@ pub fn mount_with_request(request: FuseMountRequest) -> std::io::Result<()> {
     // creates/deletes visible immediately without waiting for TTL expiry.
     let mut session = fuser::Session::new(fs, mount_point.as_ref() as &std::path::Path, &options)?;
     let unmount = session.unmount_callable();
-    let signal_watcher = match signal_handling {
-        SignalHandling::Disabled => None,
-        SignalHandling::InstallForCli => Some(spawn_signal_watcher(mount_point.clone(), unmount)?),
-    };
+    let signal_watcher = spawn_signal_watcher(
+        mount_point.clone(),
+        unmount,
+        signal_handling,
+        unmount_signal,
+    )?;
     let notifier = session.notifier();
 
     // Register the kernel cache invalidator with the VFS.
@@ -340,11 +397,41 @@ mod tests {
     use std::sync::Mutex;
 
     use super::{
-        MountOptionError, SignalHandling, build_mount_options_with_allow_other,
+        FuseUnmountSignal, MountOptionError, SignalHandling, build_mount_options_with_allow_other,
         validate_volume_name,
     };
 
     static SIGNAL_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct SignalDispositionGuard {
+        sigint: libc::sighandler_t,
+        sigterm: libc::sighandler_t,
+    }
+
+    impl SignalDispositionGuard {
+        fn replace_with(handler: libc::sighandler_t) -> Self {
+            // SAFETY: signal-disposition tests hold `SIGNAL_TEST_LOCK` and
+            // restore the original dispositions through this guard's `Drop`.
+            let (sigint, sigterm) = unsafe {
+                (
+                    libc::signal(libc::SIGINT, handler),
+                    libc::signal(libc::SIGTERM, handler),
+                )
+            };
+            Self { sigint, sigterm }
+        }
+    }
+
+    impl Drop for SignalDispositionGuard {
+        fn drop(&mut self) {
+            // SAFETY: these dispositions were returned by `libc::signal` when
+            // the guard was created.
+            unsafe {
+                libc::signal(libc::SIGINT, self.sigint);
+                libc::signal(libc::SIGTERM, self.sigterm);
+            }
+        }
+    }
 
     fn mount_options_include_allow_other(options: &[fuser::MountOption]) -> bool {
         options
@@ -394,27 +481,58 @@ mod tests {
     }
 
     #[test]
+    fn disabled_signal_policy_does_not_install_process_handlers() {
+        let _guard = SIGNAL_TEST_LOCK.lock().expect("signal test lock");
+        extern "C" fn previous_handler(_sig: libc::c_int) {}
+
+        let _signals = SignalDispositionGuard::replace_with(
+            previous_handler as *const () as libc::sighandler_t,
+        );
+
+        let handlers = super::signal_handlers_for_policy(SignalHandling::Disabled)
+            .expect("disabled signal policy");
+        assert!(handlers.is_none());
+
+        unsafe {
+            assert_eq!(
+                libc::signal(
+                    libc::SIGINT,
+                    previous_handler as *const () as libc::sighandler_t
+                ),
+                previous_handler as *const () as libc::sighandler_t
+            );
+            assert_eq!(
+                libc::signal(
+                    libc::SIGTERM,
+                    previous_handler as *const () as libc::sighandler_t
+                ),
+                previous_handler as *const () as libc::sighandler_t
+            );
+        }
+    }
+
+    #[test]
+    fn fuse_unmount_signal_records_programmatic_unmount_request() {
+        let signal = FuseUnmountSignal::new();
+        assert!(!signal.is_requested());
+
+        let cloned = signal.clone();
+        cloned.request_unmount();
+
+        assert!(signal.is_requested());
+    }
+
+    #[test]
     fn cli_signal_handler_restores_previous_signal_dispositions() {
         let _guard = SIGNAL_TEST_LOCK.lock().expect("signal test lock");
         extern "C" fn previous_handler(_sig: libc::c_int) {}
 
-        // SAFETY: this test owns the process-global dispositions briefly and
-        // restores them before returning.
-        let (original_sigint, original_sigterm) = unsafe {
-            (
-                libc::signal(
-                    libc::SIGINT,
-                    previous_handler as *const () as libc::sighandler_t,
-                ),
-                libc::signal(
-                    libc::SIGTERM,
-                    previous_handler as *const () as libc::sighandler_t,
-                ),
-            )
-        };
+        let _signals = SignalDispositionGuard::replace_with(
+            previous_handler as *const () as libc::sighandler_t,
+        );
 
         let previous = super::CliSignalHandlers::install().expect("install signal handlers");
-        previous.restore();
+        drop(previous);
 
         unsafe {
             assert_eq!(
@@ -425,9 +543,21 @@ mod tests {
                 libc::signal(libc::SIGTERM, libc::SIG_DFL),
                 previous_handler as *const () as libc::sighandler_t
             );
-            libc::signal(libc::SIGINT, original_sigint);
-            libc::signal(libc::SIGTERM, original_sigterm);
         }
+    }
+
+    #[test]
+    fn cli_signal_handler_rejects_concurrent_install() {
+        let _guard = SIGNAL_TEST_LOCK.lock().expect("signal test lock");
+        let first = super::CliSignalHandlers::install().expect("first signal handler install");
+
+        let err = match super::CliSignalHandlers::install() {
+            Ok(_) => panic!("second install should fail"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+
+        drop(first);
     }
 
     #[cfg(target_os = "linux")]
