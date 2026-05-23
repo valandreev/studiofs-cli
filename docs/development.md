@@ -52,9 +52,22 @@ cargo build --release
 
 ```bash
 cargo fmt --all
-cargo clippy --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
 cargo check --workspace
 ```
+
+The workspace lint baseline is defined once in the root `Cargo.toml` under
+`[workspace.lints]`. Member crates inherit it explicitly with:
+
+```toml
+[lints]
+workspace = true
+```
+
+Keep new lint policy staged and low-noise. Prefer focused Clippy or check runs
+for the touched crates during local work; on Windows, use a task-specific
+`--target-dir` when the default `target/` directory is locked by another
+process.
 
 ## CI Matrix
 

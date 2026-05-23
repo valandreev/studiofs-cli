@@ -12,7 +12,7 @@ pub struct SyncMetaEngineAdapter<M: ?Sized> {
 impl<M: ?Sized> Clone for SyncMetaEngineAdapter<M> {
     fn clone(&self) -> Self {
         Self {
-            inner: self.inner.clone(),
+            inner: Arc::clone(&self.inner),
         }
     }
 }
@@ -25,7 +25,7 @@ impl<M: ?Sized> SyncMetaEngineAdapter<M> {
 
     /// Return the underlying synchronous capability principal.
     pub fn sync_engine(&self) -> Arc<M> {
-        self.inner.clone()
+        Arc::clone(&self.inner)
     }
 }
 
@@ -69,7 +69,7 @@ mod tests {
     fn sync_meta_engine_adapter_accepts_narrow_capability_principal() {
         let (_temp, engine) = seed_format_engine();
         let narrow: Arc<dyn MetaFormat> = engine;
-        let adapter = SyncMetaEngineAdapter::new(narrow.clone());
+        let adapter = SyncMetaEngineAdapter::new(Arc::clone(&narrow));
         let observed = adapter
             .sync_engine()
             .get_format_info()

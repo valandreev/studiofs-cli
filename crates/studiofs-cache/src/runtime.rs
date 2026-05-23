@@ -832,6 +832,8 @@ impl LocalPayloadBackendRuntime {
     }
 
     fn runtime_pinned_evictable_bytes(&self) -> u64 {
+        // Collect object ids before index lookups so runtime_pinned is not
+        // held across synchronous index access.
         let object_ids = self
             .runtime_pinned
             .lock()

@@ -71,6 +71,8 @@ S3-compatible side unless a test explicitly checks another provider.
 
 | Scope | Command |
 |---|---|
+| Workspace lint inheritance guard | `cargo test -p studiofs --test architecture_vocabulary_test workspace_members_inherit_workspace_lints` |
+| Focused lint/check validation | `cargo clippy -p <crate> --all-targets -- -D warnings` and `cargo check -p <crate>` |
 | Full fast suite | `cargo test --workspace --all-targets -- --nocapture` |
 | Full ignored integration suite | `cargo test --workspace --all-targets -- --ignored --nocapture --test-threads=1` |
 | PG metadata suite | `cargo test -p studiofs-meta pg_engine::tests::test_pg_ -- --ignored --nocapture --test-threads=1` |

@@ -18,6 +18,13 @@ edition = "2024"
 license = "GPL-3.0"
 repository = "https://github.com/valandreev/studiofs-cli"
 
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+
 [workspace.dependencies]
 # Async
 tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros", "fs", "io-util", "net"] }

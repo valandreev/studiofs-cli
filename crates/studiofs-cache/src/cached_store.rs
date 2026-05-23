@@ -1173,6 +1173,8 @@ impl CachedStoreWriterSlice {
                     remaining.min(self.config.page_size),
                 ));
             }
+            // INVARIANT: the branch above creates a page whenever the deque is
+            // empty or the previous tail cannot accept more bytes.
             let page = self.pages.back_mut().expect("page exists after push");
             let remaining = target_len - self.dirty_len;
             let append = remaining.min(self.config.page_size - page.len());
@@ -1248,6 +1250,7 @@ impl CachedStoreWriterSlice {
                 break;
             };
             if len < front_len {
+                // INVARIANT: front_len came from the current front page.
                 let _ = self
                     .pages
                     .front_mut()
@@ -1270,10 +1273,12 @@ impl CachedStoreWriterSlice {
         }
         let payload = match self.pages.front().map(BytesMut::len) {
             Some(front_len) if len == front_len => {
+                // INVARIANT: front_len came from the current front page.
                 self.pages.pop_front().expect("front page exists").freeze()
             }
             Some(front_len) if len < front_len => self
                 .pages
+                // INVARIANT: front_len came from the current front page.
                 .front_mut()
                 .expect("front page exists")
                 .split_to(len)
@@ -1639,9 +1644,10 @@ mod tests {
                 .expect("open backend")
                 .backend;
         let backend = Arc::new(RecordingOwnedPayloadBackend::new(inner_backend));
+        let backend_for_store = Arc::clone(&backend);
         let (cached_store, _rx) = CachedStore::open(
             CachedStoreConfig::new(dir.path()).with_upload_hot_bytes(64),
-            backend.clone(),
+            backend_for_store,
         )
         .expect("open cached store");
         let mut writer = cached_store.open_writer_slice(writer_config());
@@ -1678,9 +1684,10 @@ mod tests {
                 .expect("open backend")
                 .backend;
         let backend = Arc::new(RecordingOwnedPayloadBackend::new(inner_backend));
+        let backend_for_store = Arc::clone(&backend);
         let (cached_store, _rx) = CachedStore::open(
             CachedStoreConfig::new(dir.path()).with_upload_hot_bytes(64),
-            backend.clone(),
+            backend_for_store,
         )
         .expect("open cached store");
         let mut writer = cached_store.open_writer_slice(writer_config());

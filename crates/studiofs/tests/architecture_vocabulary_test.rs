@@ -24,6 +24,48 @@ fn workspace_line_count(path: &str) -> usize {
     read_workspace_file(path).lines().count()
 }
 
+fn workspace_member_manifests(root_manifest: &str) -> Vec<String> {
+    let manifest =
+        toml::from_str::<toml::Table>(root_manifest).expect("root Cargo.toml should be valid TOML");
+    let members = manifest
+        .get("workspace")
+        .and_then(|workspace| workspace.get("members"))
+        .and_then(toml::Value::as_array)
+        .expect("root Cargo.toml should define [workspace].members");
+
+    members
+        .iter()
+        .map(|member| {
+            let member = member
+                .as_str()
+                .expect("workspace member entries should be strings");
+            format!("{member}/Cargo.toml")
+        })
+        .collect()
+}
+
+#[test]
+fn workspace_members_inherit_workspace_lints() {
+    let root_manifest = read_workspace_file("Cargo.toml");
+    assert!(
+        root_manifest.contains("[workspace.lints.rust]"),
+        "root Cargo.toml should define a conservative Rust lint baseline"
+    );
+    assert!(
+        root_manifest.contains("[workspace.lints.clippy]"),
+        "root Cargo.toml should define a conservative Clippy lint baseline"
+    );
+
+    for manifest in workspace_member_manifests(&root_manifest) {
+        let contents = read_workspace_file(&manifest);
+        assert!(
+            contents.contains("[lints]\nworkspace = true")
+                || contents.contains("[lints]\r\nworkspace = true"),
+            "{manifest} should opt into workspace lint inheritance with [lints] workspace = true"
+        );
+    }
+}
+
 fn normalize_doc_whitespace(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
