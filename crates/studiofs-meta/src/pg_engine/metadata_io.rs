@@ -143,7 +143,13 @@ impl PgMetaEngine {
                             chunk.iter().map(|event| event.kind()).collect();
                         let payloads: Vec<Vec<u8>> = chunk
                             .iter()
-                            .map(Self::encode_postcard)
+                            .map(|event| {
+                                postcard::to_stdvec(event).map_err(|e| {
+                                    MetaError::Serialization(format!(
+                                        "postcard encode failed: {e}"
+                                    ))
+                                })
+                            })
                             .collect::<MetaResult<Vec<_>>>()?;
                         tx.execute(
                             sql::INSERT_EVENT_LOG_BATCH,

@@ -147,7 +147,7 @@ pub struct RedbSnapshot {
     pub snapshots: Vec<(String, Vec<u8>)>,
 }
 
-pub(super) fn encode_dentry_key(parent: Ino, name: &[u8]) -> Vec<u8> {
+pub(crate) fn encode_dentry_key(parent: Ino, name: &[u8]) -> Vec<u8> {
     let mut key = Vec::with_capacity(8 + name.len());
     key.extend_from_slice(&parent.to_le_bytes());
     key.extend_from_slice(name);
@@ -238,7 +238,7 @@ pub(super) fn regular_file_chunk_prefix(ino: Ino) -> [u8; 8] {
 }
 
 /// Encode an xattr key: ino (8 bytes LE) + name bytes.
-pub(super) fn encode_xattr_key(ino: Ino, name: &[u8]) -> Vec<u8> {
+pub(crate) fn encode_xattr_key(ino: Ino, name: &[u8]) -> Vec<u8> {
     let mut key = Vec::with_capacity(8 + name.len());
     key.extend_from_slice(&ino.to_le_bytes());
     key.extend_from_slice(name);
@@ -411,7 +411,7 @@ pub(super) fn decode_xattr_value_from_storage_owned(name: &[u8], stored: Vec<u8>
     }
 }
 
-pub(super) fn encode_acl_rule_key(ino: Ino, principal: &str) -> Vec<u8> {
+pub(crate) fn encode_acl_rule_key(ino: Ino, principal: &str) -> Vec<u8> {
     let principal_bytes = principal.as_bytes();
     let mut key = Vec::with_capacity(8 + principal_bytes.len());
     key.extend_from_slice(&ino.to_le_bytes());
