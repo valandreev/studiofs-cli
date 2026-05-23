@@ -434,7 +434,7 @@ fn command_pool_reuses_connection_for_repeated_remote_metadata_queries() {
 
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
-fn command_pool_keeps_open_client_after_application_error() {
+fn command_pool_discards_client_after_application_error() {
     let Some(dsn) = pg_dsn() else {
         return;
     };
@@ -480,11 +480,12 @@ fn command_pool_keeps_open_client_after_application_error() {
 
     assert_eq!(
         after.discarded - before.discarded,
-        0,
-        "application errors should not discard an otherwise open pooled client"
+        1,
+        "application errors should discard the pooled client to avoid stale transaction state"
     );
-    assert!(
-        after.connection_creations - before.connection_creations <= 1,
-        "the next command should reuse the open pooled client after an application error"
+    assert_eq!(
+        after.connection_creations - before.connection_creations,
+        1,
+        "the next command should reconnect after the failed client is discarded"
     );
 }

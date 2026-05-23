@@ -507,7 +507,8 @@ impl MetaEngineCore for PgMetaEngine {
                 "read current file lock lease",
                 move |client| {
                     Box::pin(async move {
-                        Self::current_file_lock_lease_with_client(&*client, volume_id, ino).await
+                        let client: &tokio_postgres::Client = client;
+                        Self::current_file_lock_lease_with_client(client, volume_id, ino).await
                     })
                 },
             )

@@ -485,7 +485,7 @@ impl PgMetaEngine {
             command_pool: Arc::new(runtime::PgConnectionPool::new(
                 pg.url.clone(),
                 connect_timeout,
-                command_timeout,
+                connect_timeout,
             )),
             inflight_replication_ops: AtomicU32::new(0),
             pending_state: Mutex::new(PendingReplicationState::default()),

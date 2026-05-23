@@ -8,6 +8,7 @@ use std::thread::{JoinHandle, ThreadId};
 use std::time::Duration;
 use tokio::runtime::RuntimeFlavor;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tracing::warn;
 
 type RuntimeJob = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 pub(super) type PgClientFuture<'a, T> = Pin<Box<dyn Future<Output = MetaResult<T>> + Send + 'a>>;
@@ -45,7 +46,7 @@ pub(super) struct PgConnectionPool {
     checkout_timeout: Duration,
     max_size: usize,
     active_slots: Arc<Semaphore>,
-    state: Mutex<PgConnectionPoolState>,
+    state: Arc<Mutex<PgConnectionPoolState>>,
     connection_creations: AtomicU64,
     checkouts: AtomicU64,
     checkout_waits: AtomicU64,
@@ -61,13 +62,13 @@ pub(super) struct PgConnectionPoolStats {
     pub(super) total: usize,
 }
 
-struct PendingPgConnectionSlot<'a> {
-    state: &'a Mutex<PgConnectionPoolState>,
+struct PendingPgConnectionSlot {
+    state: Arc<Mutex<PgConnectionPoolState>>,
     armed: bool,
 }
 
-impl<'a> PendingPgConnectionSlot<'a> {
-    fn new(state: &'a Mutex<PgConnectionPoolState>) -> Self {
+impl PendingPgConnectionSlot {
+    fn new(state: Arc<Mutex<PgConnectionPoolState>>) -> Self {
         Self { state, armed: true }
     }
 
@@ -76,7 +77,7 @@ impl<'a> PendingPgConnectionSlot<'a> {
     }
 }
 
-impl Drop for PendingPgConnectionSlot<'_> {
+impl Drop for PendingPgConnectionSlot {
     fn drop(&mut self) {
         if self.armed {
             let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -86,19 +87,11 @@ impl Drop for PendingPgConnectionSlot<'_> {
 }
 
 impl PooledPgConnection {
-    fn client_mut(&mut self) -> &mut tokio_postgres::Client {
-        &mut self
-            .idle
-            .as_mut()
-            .expect("pooled postgres connection missing client")
-            .client
-    }
-
-    fn is_closed(&self) -> bool {
-        self.idle
-            .as_ref()
-            .map(|idle| idle.client.is_closed() || idle.task.is_finished())
-            .unwrap_or(true)
+    fn client_mut(&mut self) -> MetaResult<&mut tokio_postgres::Client> {
+        let idle = self.idle.as_mut().ok_or_else(|| {
+            MetaError::Storage("pooled postgres connection missing client".to_string())
+        })?;
+        Ok(&mut idle.client)
     }
 
     fn discard(mut self) {
@@ -134,7 +127,7 @@ impl PgConnectionPool {
             checkout_timeout,
             max_size: Self::DEFAULT_MAX_SIZE,
             active_slots: Arc::new(Semaphore::new(Self::DEFAULT_MAX_SIZE)),
-            state: Mutex::new(PgConnectionPoolState::default()),
+            state: Arc::new(Mutex::new(PgConnectionPoolState::default())),
             connection_creations: AtomicU64::new(0),
             checkouts: AtomicU64::new(0),
             checkout_waits: AtomicU64::new(0),
@@ -145,10 +138,10 @@ impl PgConnectionPool {
     #[cfg(test)]
     pub(super) fn stats(&self) -> PgConnectionPoolStats {
         PgConnectionPoolStats {
-            connection_creations: self.connection_creations.load(Ordering::SeqCst),
-            checkouts: self.checkouts.load(Ordering::SeqCst),
-            checkout_waits: self.checkout_waits.load(Ordering::SeqCst),
-            discarded: self.discarded.load(Ordering::SeqCst),
+            connection_creations: self.connection_creations.load(Ordering::Relaxed),
+            checkouts: self.checkouts.load(Ordering::Relaxed),
+            checkout_waits: self.checkout_waits.load(Ordering::Relaxed),
+            discarded: self.discarded.load(Ordering::Relaxed),
             total: self.state.lock().unwrap_or_else(|p| p.into_inner()).total,
         }
     }
@@ -158,7 +151,7 @@ impl PgConnectionPool {
             let permit = match self.active_slots.clone().try_acquire_owned() {
                 Ok(permit) => permit,
                 Err(_) => {
-                    self.checkout_waits.fetch_add(1, Ordering::SeqCst);
+                    self.checkout_waits.fetch_add(1, Ordering::Relaxed);
                     self.active_slots
                         .clone()
                         .acquire_owned()
@@ -172,12 +165,12 @@ impl PgConnectionPool {
             let pending_slot = {
                 let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
                 while let Some(connection) = state.idle.pop() {
-                    if connection.task.is_finished() {
+                    if connection.client.is_closed() || connection.task.is_finished() {
                         state.total = state.total.saturating_sub(1);
-                        self.discarded.fetch_add(1, Ordering::SeqCst);
+                        self.discarded.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
-                    self.checkouts.fetch_add(1, Ordering::SeqCst);
+                    self.checkouts.fetch_add(1, Ordering::Relaxed);
                     return Ok(PooledPgConnection {
                         idle: Some(connection),
                         pool: Arc::clone(self),
@@ -187,7 +180,7 @@ impl PgConnectionPool {
 
                 if state.total < self.max_size {
                     state.total += 1;
-                    Some(PendingPgConnectionSlot::new(&self.state))
+                    Some(PendingPgConnectionSlot::new(self.state.clone()))
                 } else {
                     None
                 }
@@ -202,7 +195,7 @@ impl PgConnectionPool {
                     if let Some(pending_slot) = pending_slot {
                         pending_slot.commit();
                     }
-                    self.checkouts.fetch_add(1, Ordering::SeqCst);
+                    self.checkouts.fetch_add(1, Ordering::Relaxed);
                     Ok(PooledPgConnection {
                         idle: Some(connection),
                         pool: Arc::clone(self),
@@ -234,7 +227,7 @@ impl PgConnectionPool {
                     PgMetaEngine::format_pg_error(e)
                 ))
             })?;
-        self.connection_creations.fetch_add(1, Ordering::SeqCst);
+        self.connection_creations.fetch_add(1, Ordering::Relaxed);
         let task = tokio::spawn(async move {
             let _ = connection.await;
         });
@@ -245,7 +238,7 @@ impl PgConnectionPool {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         if connection.task.is_finished() || state.idle.len() >= self.max_size {
             state.total = state.total.saturating_sub(1);
-            self.discarded.fetch_add(1, Ordering::SeqCst);
+            self.discarded.fetch_add(1, Ordering::Relaxed);
             connection.task.abort();
             return;
         }
@@ -255,20 +248,31 @@ impl PgConnectionPool {
     fn discard_idle(&self, connection: IdlePgConnection) {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         state.total = state.total.saturating_sub(1);
-        self.discarded.fetch_add(1, Ordering::SeqCst);
+        self.discarded.fetch_add(1, Ordering::Relaxed);
         connection.task.abort();
     }
 }
 
 impl Drop for PgConnectionPool {
     fn drop(&mut self) {
+        self.active_slots.close();
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.total > state.idle.len() {
+            warn!(
+                checked_out = state.total - state.idle.len(),
+                "postgres command pool dropped with checked-out connections"
+            );
+        }
         for connection in state.idle.drain(..) {
             connection.task.abort();
         }
         state.total = 0;
     }
 }
+
+struct _AssertPgConnectionPoolSendSync
+where
+    PgConnectionPool: Send + Sync;
 
 impl PgRemoteRuntime {
     pub(super) fn new(name: &'static str) -> MetaResult<Self> {
@@ -335,7 +339,7 @@ impl PgRemoteRuntime {
             .unwrap_or_else(|p| p.into_inner())
             .clone()
             .ok_or_else(|| MetaError::Storage("postgres runtime is shut down".to_string()))?;
-        tx.try_send(job).map_err(|e| {
+        tx.blocking_send(job).map_err(|e| {
             MetaError::Storage(format!("failed to submit postgres runtime job: {e}"))
         })?;
         result_rx.recv().map_err(|e| {
@@ -447,7 +451,7 @@ impl PgMetaEngine {
         F: for<'a> FnOnce(&'a mut tokio_postgres::Client) -> PgClientFuture<'a, T>,
     {
         let mut connection = command_pool.checkout(context).await?;
-        let result = tokio::time::timeout(command_timeout, f(connection.client_mut()))
+        let result = tokio::time::timeout(command_timeout, f(connection.client_mut()?))
             .await
             .map_err(|_| Self::pg_timeout_error(context, command_timeout));
 
@@ -457,11 +461,7 @@ impl PgMetaEngine {
                 Ok(value)
             }
             Ok(Err(error)) => {
-                if connection.is_closed() {
-                    connection.discard();
-                } else {
-                    drop(connection);
-                }
+                connection.discard();
                 Err(error)
             }
             Err(error) => {

@@ -120,7 +120,8 @@ impl PgMetaEngine {
                 "pull foreign events",
                 move |client| {
                     Box::pin(async move {
-                        Self::query_foreign_event_rows(&*client, volume_id, last_seq).await
+                        let client: &tokio_postgres::Client = client;
+                        Self::query_foreign_event_rows(client, volume_id, last_seq).await
                     })
                 },
             )
