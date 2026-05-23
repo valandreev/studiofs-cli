@@ -256,6 +256,56 @@ fn runner_contract_documents_adversarial_cleanup_proof() {
 }
 
 #[test]
+fn runner_process_lifecycle_has_dedicated_module_boundary() {
+    let source_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let lib = fs::read_to_string(source_root.join("lib.rs")).unwrap();
+    let runner = fs::read_to_string(source_root.join("runner.rs")).unwrap();
+    let lifecycle_path = source_root.join("runner_lifecycle.rs");
+
+    assert!(
+        lifecycle_path.exists(),
+        "runner process supervision, child timeout, and child report aggregation must live in runner_lifecycle.rs"
+    );
+    assert!(
+        lib.contains("mod runner_lifecycle;"),
+        "studiofs-e2e must register the runner_lifecycle module"
+    );
+    for runner_owned_symbol in [
+        "fn run_supervised_scenario(",
+        "fn scenario_child_command(",
+        "fn scenario_child_timeout(",
+        "fn read_scenario_child_report(",
+        "fn timed_out_scenario_child(",
+        "fn failed_scenario_child(",
+    ] {
+        assert!(
+            !runner.contains(runner_owned_symbol),
+            "runner.rs should delegate process lifecycle symbol `{runner_owned_symbol}` to runner_lifecycle.rs"
+        );
+    }
+}
+
+#[test]
+fn runner_contract_documents_sfs438_operator_smoke() {
+    let tests_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("docs/tests.md");
+    let tests = fs::read_to_string(tests_path).unwrap();
+    let normalized = tests.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    for expected in [
+        "SFS-438 mounted runner lifecycle smoke",
+        "cargo run -p studiofs-e2e -- run basic-multi-client-smoke --studiofs-bin target\\debug\\studiofs.exe",
+        "Do not use the full mounted scenario sweep for this local operator check",
+    ] {
+        assert!(
+            normalized.contains(expected),
+            "tests guide must document SFS-438 operator smoke phrase: {expected}"
+        );
+    }
+}
+
+#[test]
 fn list_scenarios_exposes_initial_basic_smoke_scenario() {
     let scenarios = studiofs_e2e::scenario::available_scenarios();
 

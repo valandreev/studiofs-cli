@@ -152,6 +152,17 @@ cargo run -p studiofs-e2e -- local-first-baseline-gate --studiofs-bin target\deb
 cargo run -p studiofs-e2e -- clean
 ```
 
+SFS-438 mounted runner lifecycle smoke for local operator validation:
+
+```powershell
+cargo build -p studiofs
+cargo run -p studiofs-e2e -- run basic-multi-client-smoke --studiofs-bin target\debug\studiofs.exe
+```
+
+Do not use the full mounted scenario sweep for this local operator check. The
+focused smoke is enough to validate the runner lifecycle boundary before a
+broader hosted or manual mounted pass.
+
 SFS-381 adversarial cleanup proof is a focused runner self-test layer, not a
 new mounted scenario number. It validates partial setup failure cleanup, hung
 supervised child timeout reporting, mounted contamination boundaries, and

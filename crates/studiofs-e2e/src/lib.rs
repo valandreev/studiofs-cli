@@ -9,6 +9,7 @@ mod process_diagnostics;
 mod process_job;
 pub mod report;
 pub mod runner;
+mod runner_lifecycle;
 pub mod scenario;
 
 #[cfg(test)]
