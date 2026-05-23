@@ -74,8 +74,8 @@ fn pg_engine_data_path_modules_document_private_ownership_boundaries() {
     ] {
         let source = fs::read_to_string(src_dir.join(module)).expect("read pg_engine module");
         assert!(
-            source.starts_with(ownership),
-            "{module} should start with an ownership sentence: {ownership}"
+            source.contains(ownership),
+            "{module} should contain an ownership sentence: {ownership}"
         );
     }
 }

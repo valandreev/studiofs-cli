@@ -283,6 +283,29 @@ fn persisted_pg_flushed_event_seq_roundtrips_in_local_counter() {
 }
 
 #[test]
+fn replay_position_does_not_regress_flushed_event_seq() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+
+    pg.persist_flushed_event_seq(25)
+        .expect("persist newer flushed event seq");
+    pg.persist_replay_position(&RemoteReplayApplyOutcome {
+        changed: true,
+        max_version: 7,
+        max_namespace_version: 3,
+        flushed_event_seq: Some(19),
+    })
+    .expect("persist replay position");
+
+    assert_eq!(pg.flushed_event_seq.load(Ordering::SeqCst), 25);
+    assert_eq!(
+        PgMetaEngine::load_persisted_flushed_event_seq(&pg.local)
+            .expect("reload flushed event seq"),
+        25,
+        "replay position persistence must not move the local flushed cursor backwards"
+    );
+}
+
+#[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn test_pg_flush_advances_checkpoint_version() {
     let Some(dsn) = pg_dsn() else {

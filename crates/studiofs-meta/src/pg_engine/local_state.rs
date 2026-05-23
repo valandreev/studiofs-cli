@@ -59,7 +59,9 @@ impl PgMetaEngine {
             self.persist_namespace_version(outcome.max_namespace_version)?;
         }
         if let Some(flushed_event_seq) = outcome.flushed_event_seq {
-            self.persist_flushed_event_seq(flushed_event_seq)?;
+            if flushed_event_seq > self.flushed_event_seq.load(Ordering::SeqCst) {
+                self.persist_flushed_event_seq(flushed_event_seq)?;
+            }
         }
         Ok(())
     }
