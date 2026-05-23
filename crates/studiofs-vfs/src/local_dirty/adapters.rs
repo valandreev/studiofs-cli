@@ -57,7 +57,7 @@ impl LocalPayloadWriterPort for VfsLocalPayloadWriter<'_> {
                 .map(|block| block.object_id)
                 .collect();
             for chunk in payload_entries.chunks(persist_config.put_concurrency.max(1)) {
-                let batch = chunk
+                let batch: Vec<_> = chunk
                     .iter()
                     .map(|block| studiofs_cache::local::LocalPayloadPut {
                         object_id: block.object_id,
@@ -68,20 +68,9 @@ impl LocalPayloadWriterPort for VfsLocalPayloadWriter<'_> {
                         evictable: false,
                     })
                     .collect();
-                self.vfs.payload_store_put_batch_async(batch).await?;
-            }
-            for chunk in payload_entries.chunks(persist_config.put_concurrency.max(1)) {
-                let batch = chunk
-                    .iter()
-                    .map(|block| studiofs_cache::local::LocalPayloadPut {
-                        object_id: block.object_id,
-                        data: block
-                            .payload_bytes()
-                            .expect("payload entries keep inline bytes")
-                            .clone(),
-                        evictable: false,
-                    })
-                    .collect();
+                self.vfs
+                    .payload_store_put_batch_async(batch.clone())
+                    .await?;
                 self.vfs.cache_upload_hot_batch(batch);
             }
             self.vfs

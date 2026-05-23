@@ -97,6 +97,7 @@ mod tests {
 
     type UploadRecord = (u64, u64, u64, u64);
     type SharedUploads = Arc<StdMutex<Vec<UploadRecord>>>;
+    type SharedCommittedPayloads = Arc<StdMutex<Vec<Vec<u64>>>>;
     type SharedInodes = Arc<StdMutex<Vec<Ino>>>;
 
     fn test_format_info(volume_suffix: &str) -> FormatInfo {
@@ -978,6 +979,7 @@ mod tests {
         events: EventLog,
         fail_commit: bool,
         committed_attr: Option<InodeAttr>,
+        committed_payloads: SharedCommittedPayloads,
     }
 
     impl OverlayCommitPort for TestOverlayCommitter {
@@ -991,6 +993,13 @@ mod tests {
             _attr: Option<InodeAttr>,
         ) -> VfsResult<Option<InodeAttr>> {
             self.events.push("metadata");
+            self.committed_payloads.lock().expect("commit lock").push(
+                _chunk_slices
+                    .iter()
+                    .flat_map(|(_, records)| records)
+                    .filter_map(|record| record.payload.as_ref().map(|payload| payload.object_id))
+                    .collect(),
+            );
             if self.fail_commit {
                 Err(VfsError::Io(std::io::Error::other("metadata failure")))
             } else {
@@ -1053,6 +1062,32 @@ mod tests {
         TestUploadSubmitter,
         TestDrainObserver,
     > {
+        test_drain_recording_commits(
+            events,
+            fail_persist,
+            fail_commit,
+            committed_attr,
+            uploads,
+            observed_inodes,
+            Arc::new(StdMutex::new(Vec::new())),
+        )
+    }
+
+    fn test_drain_recording_commits(
+        events: EventLog,
+        fail_persist: bool,
+        fail_commit: bool,
+        committed_attr: Option<InodeAttr>,
+        uploads: SharedUploads,
+        observed_inodes: SharedInodes,
+        committed_payloads: SharedCommittedPayloads,
+    ) -> LocalDirtyDrainCore<
+        TestLocalPayloadWriter,
+        TestOverlayCommitter,
+        PanicBlockIds,
+        TestUploadSubmitter,
+        TestDrainObserver,
+    > {
         LocalDirtyDrainCore {
             local_payloads: TestLocalPayloadWriter {
                 events: events.clone(),
@@ -1062,6 +1097,7 @@ mod tests {
                 events: events.clone(),
                 fail_commit,
                 committed_attr,
+                committed_payloads,
             },
             object_ids: PanicBlockIds,
             uploads: TestUploadSubmitter {
@@ -1264,6 +1300,61 @@ mod tests {
         .expect("attr-only drain succeeds");
 
         assert!(outcome.persisted_blocks.is_empty());
+        assert_eq!(
+            events.snapshot(),
+            vec!["metadata".to_string(), "observer".to_string()]
+        );
+        assert!(uploads.lock().expect("uploads lock").is_empty());
+        assert_eq!(*observed_inodes.lock().expect("observer lock"), vec![ino]);
+    }
+
+    #[test]
+    fn drain_core_commits_persisted_pending_slices_without_new_payloads() {
+        let ino = 14;
+        let events = EventLog::default();
+        let uploads = Arc::new(StdMutex::new(Vec::new()));
+        let observed_inodes = Arc::new(StdMutex::new(Vec::new()));
+        let committed_payloads = Arc::new(StdMutex::new(Vec::new()));
+        let drain = test_drain_recording_commits(
+            events.clone(),
+            false,
+            false,
+            None,
+            uploads.clone(),
+            observed_inodes.clone(),
+            committed_payloads.clone(),
+        );
+        let mut dirty_chunk_slices = std::collections::BTreeMap::new();
+        dirty_chunk_slices.insert(
+            3,
+            vec![PendingDirtySlice::persisted(
+                studiofs_meta::schema::SliceRange::new(0, 4096).expect("slice range"),
+                0,
+                0,
+                9,
+                9014,
+                0,
+            )],
+        );
+
+        let outcome = futures::executor::block_on(drain.execute_drain(
+            ino,
+            Vec::new(),
+            dirty_chunk_slices,
+            4,
+            None,
+            PayloadPersistConfig {
+                put_concurrency: 4,
+                local_sync_policy: LocalSyncPolicy::Opportunistic,
+            },
+        ))
+        .expect("persisted pending-slice drain succeeds");
+
+        assert!(outcome.persisted_blocks.is_empty());
+        assert_eq!(
+            *committed_payloads.lock().expect("commit lock"),
+            vec![vec![9014]]
+        );
         assert_eq!(
             events.snapshot(),
             vec!["metadata".to_string(), "observer".to_string()]

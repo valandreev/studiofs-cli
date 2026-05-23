@@ -224,11 +224,10 @@ where
             // Dirty-chunk-slices path: persisted slice payloads can commit
             // directly as overlay SliceRecords, while buffered block snapshots
             // still validate against the final block geometry below.
-            let block_lengths_by_block_index: std::collections::HashMap<u32, usize> =
-                persisted_blocks
-                    .iter()
-                    .map(|persisted| (persisted.block_index, persisted.len()))
-                    .collect();
+            let block_lengths_by_block_index: Vec<(u32, usize)> = persisted_blocks
+                .iter()
+                .map(|persisted| (persisted.block_index, persisted.len()))
+                .collect();
             for (chunk_id, mut slices) in dirty_chunk_slices {
                 slices.sort_by_key(|slice| slice.order_key(chunk_id));
                 for slice in slices {
@@ -250,14 +249,25 @@ where
                         );
                         continue;
                     }
-                    let Some(&block_len) = block_lengths_by_block_index.get(&slice.block_index)
+                    let Some((_, block_len)) = block_lengths_by_block_index
+                        .iter()
+                        .find(|(block_index, _)| *block_index == slice.block_index)
                     else {
                         continue;
                     };
-                    let slice_len = slice.range.len();
-                    let block_offset = slice.block_offset;
-                    let block_end = (block_offset as usize).saturating_add(slice_len as usize);
-                    if block_end > block_len {
+                    let slice_len = slice.range.len() as usize;
+                    let block_offset = slice.block_offset as usize;
+                    let Some(block_end) = block_offset.checked_add(slice_len) else {
+                        return Err(crate::VfsError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!(
+                                "dirty slice offset overflow: ino={}, \
+                                 block_index={}, block_offset={}, slice_len={}",
+                                ino, slice.block_index, block_offset, slice_len
+                            ),
+                        )));
+                    };
+                    if block_end > *block_len {
                         return Err(crate::VfsError::Io(std::io::Error::new(
                             std::io::ErrorKind::InvalidInput,
                             format!(
@@ -414,7 +424,7 @@ where
         attr_to_persist: Option<InodeAttr>,
         persist_config: PayloadPersistConfig,
     ) -> VfsResult<DrainOutcome> {
-        if persisted_blocks.is_empty() {
+        if persisted_blocks.is_empty() && dirty_chunk_slices.is_empty() {
             if let Some(attr) = attr_to_persist {
                 let committed_attr = self
                     .commit_meta
@@ -428,15 +438,17 @@ where
             });
         }
 
-        if let Err(error) = self
-            .local_payloads
-            .persist_payload(&persisted_blocks, persist_config)
-            .await
-        {
-            self.local_payloads
-                .cleanup_uncommitted(ino, &persisted_blocks, "payload-persist")
-                .await;
-            return Err(error);
+        if !persisted_blocks.is_empty() {
+            if let Err(error) = self
+                .local_payloads
+                .persist_payload(&persisted_blocks, persist_config)
+                .await
+            {
+                self.local_payloads
+                    .cleanup_uncommitted(ino, &persisted_blocks, "payload-persist")
+                    .await;
+                return Err(error);
+            }
         }
 
         let chunk_slices =
@@ -472,9 +484,11 @@ where
 
         self.observer
             .on_metadata_committed(ino, committed_attr.as_ref());
-        self.uploads
-            .submit_uploads(ino, &persisted_blocks, content_epoch)
-            .await;
+        if !persisted_blocks.is_empty() {
+            self.uploads
+                .submit_uploads(ino, &persisted_blocks, content_epoch)
+                .await;
+        }
 
         Ok(DrainOutcome { persisted_blocks })
     }
