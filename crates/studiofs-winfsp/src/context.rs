@@ -1,21 +1,32 @@
 #![cfg(windows)]
 //! FileSystemContext implementation — bridges WinFSP calls to StudioVfs.
 
+mod buffers;
 mod handle_drain;
+mod invalidation;
+mod plans;
 
 use std::ffi::c_void;
 use std::sync::Arc;
 use std::time::Instant;
 
+use buffers::{SendConstBuffer, SendMutBuffer};
 use futures::FutureExt;
 use handle_drain::{CallbackBarrierState, WinfspHandleDrainFacade};
+pub use invalidation::WinfspKernelInvalidator;
+#[cfg(test)]
+use invalidation::{
+    FILE_ACTION_MODIFIED, FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_DIR_NAME,
+    FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE,
+    build_notify_info, ino_to_windows_path, notify_filter_for_kind,
+};
 use parking_lot::Mutex;
+use plans::{CreateCallbackPlan, RenameCallbackPlan};
 use studiofs_meta::types::{SetattrArgs, TimeSpec};
 use studiofs_meta::{FileType, Ino, InodeAttr, MetaError, ROOT_INO};
 use studiofs_vfs::{
-    BridgeVfsErrorKind, KernelInvalidator, LocalSyncPolicy, NamespacePathStyle, OpenFlags,
-    StudioVfs, VfsError, classify_vfs_error, is_hidden_non_macos_root_metadata_name,
-    normalize_attr_times,
+    BridgeVfsErrorKind, LocalSyncPolicy, NamespacePathStyle, OpenFlags, StudioVfs, VfsError,
+    classify_vfs_error, is_hidden_non_macos_root_metadata_name, normalize_attr_times,
 };
 use tokio::runtime::Handle;
 use tracing::{debug, error, trace, warn};
@@ -27,7 +38,6 @@ use windows::Win32::Security::{
 use winfsp::U16CStr;
 use winfsp::filesystem::*;
 use winfsp::filesystem::{AsyncFileSystemContext, DirBuffer};
-use winfsp::notify::{Notifier, NotifyInfo, NotifyingFileSystemContext};
 use winfsp_sys::{
     FILE_ACCESS_RIGHTS, FILE_FLAGS_AND_ATTRIBUTES, FspFileSystemGetOperationContext,
     FspFsctlTransactCreateKind,
@@ -123,44 +133,6 @@ impl StudioFileHandle {
     }
 }
 
-#[derive(Copy, Clone)]
-struct SendMutBuffer {
-    ptr: *mut u8,
-    len: usize,
-}
-
-// SAFETY: The wrapper only marks transport capability across threads.
-// Call sites must guarantee pointer validity, exclusivity, and lifetime.
-unsafe impl Send for SendMutBuffer {}
-
-impl SendMutBuffer {
-    fn from_slice(slice: &mut [u8]) -> Self {
-        Self {
-            ptr: slice.as_mut_ptr(),
-            len: slice.len(),
-        }
-    }
-
-    /// # Safety
-    ///
-    /// `self.ptr` must be valid, properly aligned, and point to `self.len`
-    /// initialised bytes.  The caller must ensure exclusive access to the
-    /// backing memory for the entire lifetime `'a`.
-    unsafe fn as_mut_slice<'a>(self) -> &'a mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
-    }
-}
-
-#[derive(Copy, Clone)]
-struct SendConstBuffer {
-    ptr: *const u8,
-    len: usize,
-}
-
-// SAFETY: The wrapper only marks transport capability across threads.
-// Call sites must guarantee pointer validity and lifetime.
-unsafe impl Send for SendConstBuffer {}
-
 trait SpawnWaitFallback {
     fn task_panic_fallback() -> Self;
 }
@@ -186,19 +158,6 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
         message.clone()
     } else {
         "non-string panic payload".to_string()
-    }
-}
-
-impl SendConstBuffer {
-    fn from_slice(slice: &[u8]) -> Self {
-        Self {
-            ptr: slice.as_ptr(),
-            len: slice.len(),
-        }
-    }
-
-    unsafe fn as_slice<'a>(self) -> &'a [u8] {
-        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 }
 
@@ -324,22 +283,6 @@ enum CreateCallbackKind {
 enum FileSizeCallbackAction {
     KeepLogicalSize,
     SetLogicalSize(u64),
-}
-
-struct CreateCallbackPlan {
-    parent_ino: Ino,
-    name: Vec<u8>,
-    create_options: u32,
-    open_flags: OpenFlags,
-    write_local_sync_policy: LocalSyncPolicy,
-    kind: CreateCallbackKind,
-}
-
-struct RenameCallbackPlan {
-    old_parent: Ino,
-    old_name: Vec<u8>,
-    new_parent: Ino,
-    new_name: Vec<u8>,
 }
 
 fn resolve_create_callback_kind(
@@ -1285,7 +1228,7 @@ impl FileSystemContext for StudioFsContext {
             // - `spawn_wait` blocks until this task completes, so the caller cannot
             //   observe or alias `buffer` concurrently while this mutable slice exists.
             // - `u8` alignment is always valid (alignment = 1).
-            let out = unsafe { out_buf.as_mut_slice() };
+            let out = unsafe { out_buf.into_mut_slice() };
             vfs.read_into_fh(fh, ino, offset, out).await
         });
 
@@ -1853,110 +1796,6 @@ impl AsyncFileSystemContext for StudioFsContext {
     }
 }
 
-// ─── WinFSP Notify (Metadata Change Signals) ────────────────────────────────
-
-/// Windows FILE_NOTIFY_CHANGE_* / FILE_ACTION_* constants.
-const FILE_NOTIFY_CHANGE_FILE_NAME: u32 = 0x0000_0001;
-const FILE_NOTIFY_CHANGE_DIR_NAME: u32 = 0x0000_0002;
-const FILE_NOTIFY_CHANGE_ATTRIBUTES: u32 = 0x0000_0004;
-const FILE_NOTIFY_CHANGE_SIZE: u32 = 0x0000_0008;
-const FILE_NOTIFY_CHANGE_LAST_WRITE: u32 = 0x0000_0010;
-const FILE_ACTION_MODIFIED: u32 = 0x0000_0003;
-
-fn notify_filter_for_kind(kind: FileType) -> u32 {
-    if kind == FileType::Directory {
-        FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_ATTRIBUTES
-    } else {
-        FILE_NOTIFY_CHANGE_FILE_NAME
-            | FILE_NOTIFY_CHANGE_SIZE
-            | FILE_NOTIFY_CHANGE_ATTRIBUTES
-            | FILE_NOTIFY_CHANGE_LAST_WRITE
-    }
-}
-
-fn build_notify_info(path: &str, kind: FileType) -> Option<NotifyInfo<512>> {
-    if let Err(error) = ensure_winfsp_runtime_loaded() {
-        warn!(
-            error = %error,
-            "WinFSP runtime unavailable while building notify info; skipping notification"
-        );
-        return None;
-    }
-    let mut info = NotifyInfo::<512>::new();
-    info.filter = notify_filter_for_kind(kind);
-    info.action = FILE_ACTION_MODIFIED;
-    info.set_name(path).ok()?;
-    Some(info)
-}
-
-/// Resolve an inode number to a Windows-style path (`\dir\file`) by walking
-/// the parent chain.  Returns `None` if the inode or any ancestor no longer
-/// exists (e.g. already deleted).
-fn ino_to_windows_path(vfs: &StudioVfs, ino: Ino) -> Option<String> {
-    vfs.namespace_resolver(NamespacePathStyle::Windows)
-        .path_for_inode(ino)
-}
-
-/// Bridges VFS metadata invalidation to WinFSP's
-/// `FspFileSystemNotify` mechanism.
-///
-/// Metadata refreshes push inode numbers into a shared queue.
-/// The WinFSP timer drains the queue and sends Windows change notifications
-/// so that Explorer and other applications see remote changes promptly.
-pub struct WinfspKernelInvalidator {
-    queue: Arc<Mutex<Vec<Ino>>>,
-}
-
-impl WinfspKernelInvalidator {
-    /// Creates a new invalidator backed by the shared inode queue.
-    pub fn new(queue: Arc<Mutex<Vec<Ino>>>) -> Self {
-        Self { queue }
-    }
-}
-
-impl KernelInvalidator for WinfspKernelInvalidator {
-    fn inval_inode(&self, ino: u64) {
-        self.queue.lock().push(ino);
-    }
-}
-
-impl NotifyingFileSystemContext<Vec<Ino>> for StudioFsContext {
-    fn should_notify(&self) -> Option<Vec<Ino>> {
-        let mut queue = self.invalidation_queue.lock();
-        if queue.is_empty() {
-            return None;
-        }
-        // Drain and deduplicate.
-        let mut inodes: Vec<Ino> = std::mem::take(&mut *queue);
-        inodes.sort_unstable();
-        inodes.dedup();
-        Some(inodes)
-    }
-
-    fn notify(&self, inodes: Vec<Ino>, notifier: &Notifier) {
-        for ino in &inodes {
-            let Some(path) = ino_to_windows_path(&self.vfs, *ino) else {
-                trace!(ino, "skipping notify — inode no longer resolvable");
-                continue;
-            };
-
-            let kind = self
-                .vfs
-                .meta()
-                .get_attr(*ino)
-                .map(|a| a.kind)
-                .unwrap_or(FileType::RegularFile);
-
-            let Some(info) = build_notify_info(&path, kind) else {
-                warn!(ino, path, "notify path too long, skipping");
-                continue;
-            };
-            notifier.notify(&info);
-            debug!(ino, path, "WinFSP notify sent");
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::is_benign_cleanup_delete_error;
@@ -1995,6 +1834,25 @@ mod tests {
 
     const FILE_WRITE_THROUGH_OPTION: u32 = 0x0000_0002;
     const FILE_NO_INTERMEDIATE_BUFFERING_OPTION: u32 = 0x0000_0008;
+
+    #[test]
+    fn callback_buffer_helpers_live_in_focused_module_and_remain_send() {
+        fn assert_send<T: Send>() {}
+
+        assert_send::<super::buffers::SendMutBuffer>();
+        assert_send::<super::buffers::SendConstBuffer>();
+    }
+
+    #[test]
+    fn callback_plan_helpers_live_in_focused_module() {
+        assert!(std::mem::size_of::<super::plans::CreateCallbackPlan>() > 0);
+        assert!(std::mem::size_of::<super::plans::RenameCallbackPlan>() > 0);
+    }
+
+    #[test]
+    fn callback_invalidation_helper_lives_in_focused_module() {
+        assert!(std::mem::size_of::<super::invalidation::WinfspKernelInvalidator>() > 0);
+    }
 
     fn test_format_info(volume_suffix: &str) -> FormatInfo {
         let volume_name = format!("winfsp-test-{volume_suffix}-{}", std::process::id());
@@ -3822,6 +3680,25 @@ mod tests {
 
         let second = <StudioFsContext as winfsp::notify::NotifyingFileSystemContext<Vec<u64>>>::should_notify(&ctx);
         assert_eq!(second, None);
+    }
+
+    #[test]
+    fn should_notify_preserves_queue_capacity_after_drain() {
+        let (_tmp, _vfs, ctx, queue) = make_test_context("notify_capacity");
+        {
+            let mut queue = queue.lock();
+            queue.reserve(32);
+            queue.extend([9, 2, 9, 7, 2]);
+        }
+        let capacity_before = queue.lock().capacity();
+
+        let drained = <StudioFsContext as winfsp::notify::NotifyingFileSystemContext<Vec<u64>>>::should_notify(&ctx);
+
+        assert_eq!(drained, Some(vec![2, 7, 9]));
+        assert!(
+            queue.lock().capacity() >= capacity_before,
+            "draining should preserve the queue allocation for future invalidations"
+        );
     }
 
     #[test]
