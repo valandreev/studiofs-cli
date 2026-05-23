@@ -137,12 +137,12 @@ impl RedbMetaEngine {
 
         let name_lower = String::from_utf8_lossy(name).to_lowercase();
         let prefix = dentry_prefix(parent);
-        let mut range_end = prefix.to_vec();
-        *range_end.last_mut().unwrap() += 1;
-
-        let iter = table
-            .range(prefix.as_slice()..range_end.as_slice())
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let range_end = prefix_successor(&prefix);
+        let iter = match range_end.as_ref() {
+            Some(end) => table.range(prefix.as_slice()..end.as_ref()),
+            None => table.range(prefix.as_slice()..),
+        }
+        .map_err(|e| MetaError::Storage(e.to_string()))?;
 
         for result in iter {
             let (k, v) = result.map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -168,13 +168,12 @@ impl RedbMetaEngine {
     {
         let prefix = dentry_prefix(parent);
         let mut entries = Vec::new();
-        let range_start = prefix.as_slice();
-        let mut range_end = prefix.to_vec();
-        *range_end.last_mut().unwrap() += 1;
-
-        let iter = table
-            .range(range_start..range_end.as_slice())
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let range_end = prefix_successor(&prefix);
+        let iter = match range_end.as_ref() {
+            Some(end) => table.range(prefix.as_slice()..end.as_ref()),
+            None => table.range(prefix.as_slice()..),
+        }
+        .map_err(|e| MetaError::Storage(e.to_string()))?;
 
         for result in iter {
             let (key, value) = result.map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -363,12 +362,13 @@ impl RedbMetaEngine {
         }
 
         let prefix = dentry_prefix(parent);
-        let mut range_end = prefix.to_vec();
-        *range_end.last_mut().unwrap() += 1;
-        for row in tombstones
-            .range(prefix.as_slice()..range_end.as_slice())
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-        {
+        let range_end = prefix_successor(&prefix);
+        let rows = match range_end.as_ref() {
+            Some(end) => tombstones.range(prefix.as_slice()..end.as_ref()),
+            None => tombstones.range(prefix.as_slice()..),
+        }
+        .map_err(|e| MetaError::Storage(e.to_string()))?;
+        for row in rows {
             let (key, _value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
             let (decoded_parent, name) = decode_dentry_key(key.value())?;
             if decoded_parent != parent {

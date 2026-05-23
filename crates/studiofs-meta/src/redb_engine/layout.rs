@@ -204,6 +204,32 @@ pub(super) fn dentry_prefix(parent: Ino) -> [u8; 8] {
     parent.to_le_bytes()
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct BoundedPrefix8 {
+    bytes: [u8; 8],
+    len: usize,
+}
+
+impl AsRef<[u8]> for BoundedPrefix8 {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+pub(super) fn prefix_successor(prefix: &[u8; 8]) -> Option<BoundedPrefix8> {
+    let mut bytes = *prefix;
+    for index in (0..bytes.len()).rev() {
+        if bytes[index] != u8::MAX {
+            bytes[index] += 1;
+            return Some(BoundedPrefix8 {
+                bytes,
+                len: index + 1,
+            });
+        }
+    }
+    None
+}
+
 pub(super) fn dentry_by_inode_prefix(ino: Ino) -> [u8; 8] {
     ino.to_le_bytes()
 }
@@ -445,6 +471,31 @@ mod tests {
             MetaError::Storage(message)
                 if message.contains("invalid redb dentry key length")
         ));
+    }
+
+    #[test]
+    fn dentry_prefix_successor_carries_byte_prefix_bounds() {
+        fn successor_bytes(prefix: [u8; 8]) -> Option<Vec<u8>> {
+            prefix_successor(&prefix).map(|successor| successor.as_ref().to_vec())
+        }
+
+        assert_eq!(
+            successor_bytes([0x12, 0x34, 0x56, 0, 0, 0, 0, 0]),
+            Some(vec![0x12, 0x34, 0x56, 0, 0, 0, 0, 1])
+        );
+        assert_eq!(
+            successor_bytes([0x12, 0x34, 0x56, 0, 0, 0, 0, 0xfe]),
+            Some(vec![0x12, 0x34, 0x56, 0, 0, 0, 0, 0xff])
+        );
+        assert_eq!(
+            successor_bytes([0x12, 0x34, 0x56, 0, 0, 0, 0, 0xff]),
+            Some(vec![0x12, 0x34, 0x56, 0, 0, 0, 1])
+        );
+        assert_eq!(
+            successor_bytes([0x12, 0x34, 0x56, 0, 0, 0, 0xfe, 0xff]),
+            Some(vec![0x12, 0x34, 0x56, 0, 0, 0, 0xff])
+        );
+        assert_eq!(prefix_successor(&[0xff; 8]), None);
     }
 
     #[test]
