@@ -382,3 +382,109 @@ fn test_pg_snapshot_eventually_visible_and_mountable_on_peer() {
         .expect("import payload");
     assert!(mount_engine.lookup(ROOT_INO, b"snap-peer.txt").is_ok());
 }
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn command_pool_reuses_connection_for_repeated_remote_metadata_queries() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("meta.redb");
+    let volume = PgTestVolume::new(&dsn, "pg-command-pool-reuse");
+    seed_local(&db, &volume.format_info());
+    let engine = PgMetaEngine::open_with_options(
+        &db,
+        PgOpenOptions {
+            background_poll: false,
+        },
+    )
+    .expect("open pg engine");
+
+    let before = engine.command_pool_stats();
+    engine
+        .remote_metadata_head_version()
+        .expect("first metadata head query");
+    engine
+        .remote_metadata_head_version()
+        .expect("second metadata head query");
+    let after = engine.command_pool_stats();
+
+    assert!(
+        after.connection_creations - before.connection_creations <= 1,
+        "repeated command-path queries should reuse one pooled PostgreSQL connection"
+    );
+    assert_eq!(
+        after.checkouts - before.checkouts,
+        2,
+        "both metadata head queries should go through the command pool"
+    );
+    assert_eq!(
+        after.discarded - before.discarded,
+        0,
+        "successful repeated queries should keep the pooled connection healthy"
+    );
+    assert_eq!(
+        after.checkout_waits - before.checkout_waits,
+        0,
+        "serial repeated queries should not wait for a saturated command pool"
+    );
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn command_pool_keeps_open_client_after_application_error() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+
+    let dir = tempdir().expect("tempdir");
+    let db = dir.path().join("meta.redb");
+    let volume = PgTestVolume::new(&dsn, "pg-command-pool-app-error");
+    seed_local(&db, &volume.format_info());
+    let engine = PgMetaEngine::open_with_options(
+        &db,
+        PgOpenOptions {
+            background_poll: false,
+        },
+    )
+    .expect("open pg engine");
+
+    let before = engine.command_pool_stats();
+    let command_pool = engine.command_pool.clone();
+    let command_timeout = engine.command_timeout;
+    let bad_query = engine.run_async(async move {
+        PgMetaEngine::with_postgres_client_timeout(
+            command_pool,
+            command_timeout,
+            "intentional application error",
+            move |client| {
+                Box::pin(async move {
+                    client
+                        .batch_execute("SELECT * FROM studiofs_missing_pool_test_table")
+                        .await
+                        .map_err(|e| MetaError::Storage(PgMetaEngine::format_pg_error(e)))?;
+                    Ok(())
+                })
+            },
+        )
+        .await
+    });
+    assert!(bad_query.is_err(), "bad query should fail");
+
+    engine
+        .remote_metadata_head_version()
+        .expect("metadata head query after application error");
+    let after = engine.command_pool_stats();
+
+    assert_eq!(
+        after.discarded - before.discarded,
+        0,
+        "application errors should not discard an otherwise open pooled client"
+    );
+    assert!(
+        after.connection_creations - before.connection_creations <= 1,
+        "the next command should reuse the open pooled client after an application error"
+    );
+}

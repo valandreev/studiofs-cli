@@ -107,21 +107,21 @@ impl PgMetaEngine {
         &self,
         recent_flush: Option<&RecentFlush>,
     ) -> MetaResult<bool> {
-        let postgres_url = self.postgres_url.clone();
+        let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
         let client_id = self.client_id.clone();
         let last_seq = self.local_version.load(Ordering::SeqCst);
-        let connect_timeout = self.connect_timeout;
         let command_timeout = self.command_timeout;
 
         let rows = self.run_async(async move {
             Self::with_postgres_client_timeout(
-                postgres_url,
-                connect_timeout,
+                command_pool,
                 command_timeout,
                 "pull foreign events",
-                move |client| async move {
-                    Self::query_foreign_event_rows(&client, volume_id, last_seq).await
+                move |client| {
+                    Box::pin(async move {
+                        Self::query_foreign_event_rows(&*client, volume_id, last_seq).await
+                    })
                 },
             )
             .await

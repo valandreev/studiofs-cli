@@ -7,46 +7,46 @@ use std::sync::atomic::Ordering;
 
 impl PgMetaEngine {
     pub(super) fn pull_snapshot_locked(&self) -> MetaResult<bool> {
-        let postgres_url = self.postgres_url.clone();
+        let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
         let local_version = self.local_version.load(Ordering::SeqCst);
-        let connect_timeout = self.connect_timeout;
         let command_timeout = self.command_timeout;
 
         let row = self.run_async(async move {
             Self::with_postgres_client_timeout(
-                postgres_url,
-                connect_timeout,
+                command_pool,
                 command_timeout,
                 "pull snapshot",
-                move |client| async move {
-                    let version_row = client
-                        .query_opt(sql::SELECT_METADATA_VERSION, &[&volume_id])
-                        .await
-                        .map_err(|e| {
-                            MetaError::Storage(format!(
-                                "postgres snapshot version select failed: {e}"
-                            ))
-                        })?;
+                move |client| {
+                    Box::pin(async move {
+                        let version_row = client
+                            .query_opt(sql::SELECT_METADATA_VERSION, &[&volume_id])
+                            .await
+                            .map_err(|e| {
+                                MetaError::Storage(format!(
+                                    "postgres snapshot version select failed: {e}"
+                                ))
+                            })?;
 
-                    let Some(version_row) = version_row else {
-                        return Ok(None);
-                    };
-                    let version: i64 = version_row.get(0);
-                    if version <= local_version {
-                        return Ok(None);
-                    }
+                        let Some(version_row) = version_row else {
+                            return Ok(None);
+                        };
+                        let version: i64 = version_row.get(0);
+                        if version <= local_version {
+                            return Ok(None);
+                        }
 
-                    let row = client
-                        .query_one(sql::SELECT_METADATA_SNAPSHOT, &[&volume_id])
-                        .await
-                        .map_err(|e| {
-                            MetaError::Storage(format!(
-                                "postgres snapshot payload select failed: {e}"
-                            ))
-                        })?;
+                        let row = client
+                            .query_one(sql::SELECT_METADATA_SNAPSHOT, &[&volume_id])
+                            .await
+                            .map_err(|e| {
+                                MetaError::Storage(format!(
+                                    "postgres snapshot payload select failed: {e}"
+                                ))
+                            })?;
 
-                    Ok(Some(row))
+                        Ok(Some(row))
+                    })
                 },
             )
             .await
@@ -69,27 +69,27 @@ impl PgMetaEngine {
     }
 
     pub(super) fn remote_metadata_head_version(&self) -> MetaResult<i64> {
-        let postgres_url = self.postgres_url.clone();
+        let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
-        let connect_timeout = self.connect_timeout;
         let command_timeout = self.command_timeout;
 
         self.run_async(async move {
             Self::with_postgres_client_timeout(
-                postgres_url,
-                connect_timeout,
+                command_pool,
                 command_timeout,
                 "metadata head version",
-                move |client| async move {
-                    let row = client
-                        .query_opt(sql::SELECT_METADATA_VERSION, &[&volume_id])
-                        .await
-                        .map_err(|e| {
-                            MetaError::Storage(format!(
-                                "postgres metadata head version select failed: {e}"
-                            ))
-                        })?;
-                    Ok(row.map(|row| row.get(0)).unwrap_or(0))
+                move |client| {
+                    Box::pin(async move {
+                        let row = client
+                            .query_opt(sql::SELECT_METADATA_VERSION, &[&volume_id])
+                            .await
+                            .map_err(|e| {
+                                MetaError::Storage(format!(
+                                    "postgres metadata head version select failed: {e}"
+                                ))
+                            })?;
+                        Ok(row.map(|row| row.get(0)).unwrap_or(0))
+                    })
                 },
             )
             .await
@@ -110,22 +110,19 @@ impl PgMetaEngine {
             return Ok(self.local_version.load(Ordering::SeqCst));
         }
 
-        let postgres_url = self.postgres_url.clone();
+        let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
         let client_id = self.client_id.clone();
         let now_ms = Self::now_millis();
         let events_vec = events;
-        let connect_timeout = self.connect_timeout;
         let command_timeout = self.command_timeout;
 
         self.run_async(async move {
             Self::with_postgres_client_timeout(
-                postgres_url,
-                connect_timeout,
+                command_pool,
                 command_timeout,
                 "push event log batch",
-                move |client| async move {
-                    let mut client = client;
+                move |client| Box::pin(async move {
                     let tx = client.transaction().await.map_err(|e| {
                         MetaError::Storage(format!("postgres begin tx failed: {e}"))
                     })?;
@@ -289,7 +286,7 @@ impl PgMetaEngine {
                         .await
                         .map_err(|e| MetaError::Storage(format!("postgres commit failed: {e}")))?;
                     Ok(batch_version)
-                },
+                }),
             )
             .await
         })
@@ -315,33 +312,35 @@ impl PgMetaEngine {
     }
 
     pub(super) fn write_checkpoint_locked(&self) -> MetaResult<()> {
-        let postgres_url = self.postgres_url.clone();
+        let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
         let snapshot = self.local.export_remote_snapshot()?;
         let payload = serde_json::to_vec(&snapshot)
             .map_err(|e| MetaError::Serialization(format!("snapshot encode failed: {e}")))?;
         let version = self.local_version.load(Ordering::SeqCst);
-        let connect_timeout = self.connect_timeout;
         let command_timeout = self.command_timeout;
 
         self.run_async(async move {
             Self::with_postgres_client_timeout(
-                postgres_url,
-                connect_timeout,
+                command_pool,
                 command_timeout,
                 "write checkpoint",
-                move |client| async move {
-                    client
-                        .execute(
-                            sql::UPSERT_METADATA_CHECKPOINT,
-                            &[&volume_id, &version, &payload],
-                        )
-                        .await
-                        .map_err(|e| {
-                            MetaError::Storage(format!("postgres checkpoint upsert failed: {e}"))
-                        })?;
+                move |client| {
+                    Box::pin(async move {
+                        client
+                            .execute(
+                                sql::UPSERT_METADATA_CHECKPOINT,
+                                &[&volume_id, &version, &payload],
+                            )
+                            .await
+                            .map_err(|e| {
+                                MetaError::Storage(format!(
+                                    "postgres checkpoint upsert failed: {e}"
+                                ))
+                            })?;
 
-                    Ok(())
+                        Ok(())
+                    })
                 },
             )
             .await

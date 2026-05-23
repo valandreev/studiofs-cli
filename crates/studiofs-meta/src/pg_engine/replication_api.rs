@@ -102,28 +102,28 @@ impl MetaReplication for PgMetaEngine {
     }
 
     fn remote_metadata_size(&self) -> MetaResult<Option<u64>> {
-        let postgres_url = self.postgres_url.clone();
+        let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
-        let connect_timeout = self.connect_timeout;
         let command_timeout = self.command_timeout;
         let size = self.run_async(async move {
             Self::with_postgres_client_timeout(
-                postgres_url,
-                connect_timeout,
+                command_pool,
                 command_timeout,
                 "fetch remote metadata size",
-                move |client| async move {
-                    let row = client
-                        .query_one(sql::SELECT_REMOTE_METADATA_SIZE, &[&volume_id])
-                        .await
-                        .map_err(|e| {
-                            MetaError::Storage(format!(
-                                "postgres metadata size query failed: {}",
-                                Self::format_pg_error(e)
-                            ))
-                        })?;
-                    let bytes: i64 = row.get(0);
-                    Ok(bytes.max(0) as u64)
+                move |client| {
+                    Box::pin(async move {
+                        let row = client
+                            .query_one(sql::SELECT_REMOTE_METADATA_SIZE, &[&volume_id])
+                            .await
+                            .map_err(|e| {
+                                MetaError::Storage(format!(
+                                    "postgres metadata size query failed: {}",
+                                    Self::format_pg_error(e)
+                                ))
+                            })?;
+                        let bytes: i64 = row.get(0);
+                        Ok(bytes.max(0) as u64)
+                    })
                 },
             )
             .await
