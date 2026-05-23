@@ -142,6 +142,7 @@ const MOUNTED_VALIDATION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const MOUNTED_VALIDATION_MAX_ACTIVE_PROBES: usize = 1;
 const HOTSPOT_CHURN_OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
 const HOTSPOT_HELPER_CANCEL_GRACE: Duration = Duration::from_millis(750);
+#[allow(dead_code)]
 const HOTSPOT_HELPER_INTERNAL_TIMEOUT_MARKER: &str = "hotspot helper internal timeout";
 const OPEN_HANDLE_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const OPEN_HANDLE_SYNC_RETRY_TIMEOUT: Duration = Duration::from_secs(2);

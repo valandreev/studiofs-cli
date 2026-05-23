@@ -12,7 +12,10 @@
 
 mod fs;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 /// A `fuser::Notifier`-backed cache invalidator used by `studiofs_vfs` to
 /// proactively clear kernel FUSE dentry/attribute caches.
@@ -92,51 +95,158 @@ extern "C" fn shutdown_signal_handler(_sig: libc::c_int) {
     SHUTDOWN_REQUESTED.store(true, Ordering::Release);
 }
 
+/// Controls whether StudioFS owns process-global FUSE shutdown signals.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum SignalHandling {
+    /// Do not install SIGINT/SIGTERM handlers. Embedders remain responsible for
+    /// unmounting through their own process lifecycle.
+    #[default]
+    Disabled,
+    /// Install temporary SIGINT/SIGTERM handlers for the StudioFS CLI.
+    InstallForCli,
+}
+
+/// Mount request for the FUSE bridge.
+pub struct FuseMountRequest {
+    /// Shared VFS instance exposed through FUSE callbacks.
+    pub vfs: Arc<studiofs_vfs::StudioVfs>,
+    /// Tokio runtime handle used to execute VFS async operations from FUSE callbacks.
+    pub runtime_handle: tokio::runtime::Handle,
+    /// Filesystem mount point path.
+    pub mount_point: String,
+    /// Volume name passed to the FUSE mount options.
+    pub volume_name: String,
+    /// Whether to request foreground mode where supported by the platform.
+    pub foreground: bool,
+    /// Whether the mounted filesystem should reject mutating operations.
+    pub read_only: bool,
+    /// Process signal ownership policy for this mount.
+    pub signal_handling: SignalHandling,
+}
+
+impl FuseMountRequest {
+    /// Create a FUSE mount request with embeddable defaults.
+    pub fn new(
+        vfs: Arc<studiofs_vfs::StudioVfs>,
+        runtime_handle: tokio::runtime::Handle,
+        mount_point: impl Into<String>,
+        volume_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            vfs,
+            runtime_handle,
+            mount_point: mount_point.into(),
+            volume_name: volume_name.into(),
+            foreground: false,
+            read_only: false,
+            signal_handling: SignalHandling::default(),
+        }
+    }
+}
+
+struct CliSignalHandlers {
+    previous_sigint: libc::sighandler_t,
+    previous_sigterm: libc::sighandler_t,
+}
+
+impl CliSignalHandlers {
+    fn install() -> std::io::Result<Self> {
+        SHUTDOWN_REQUESTED.store(false, Ordering::Release);
+        // SAFETY: `libc::signal` mutates process-global signal disposition.
+        // This path is explicit CLI policy, and the previous handlers are kept
+        // so cleanup restores the host disposition instead of SIG_DFL.
+        unsafe {
+            let previous_sigint = libc::signal(
+                libc::SIGINT,
+                shutdown_signal_handler as *const () as libc::sighandler_t,
+            );
+            if previous_sigint == libc::SIG_ERR {
+                return Err(std::io::Error::last_os_error());
+            }
+            let previous_sigterm = libc::signal(
+                libc::SIGTERM,
+                shutdown_signal_handler as *const () as libc::sighandler_t,
+            );
+            if previous_sigterm == libc::SIG_ERR {
+                let _ = libc::signal(libc::SIGINT, previous_sigint);
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(Self {
+                previous_sigint,
+                previous_sigterm,
+            })
+        }
+    }
+
+    fn restore(self) {
+        // SAFETY: these values came from successful `libc::signal` calls in
+        // `install`, so they are valid signal dispositions to restore.
+        unsafe {
+            libc::signal(libc::SIGINT, self.previous_sigint);
+            libc::signal(libc::SIGTERM, self.previous_sigterm);
+        }
+    }
+}
+
+struct SignalWatcher {
+    stop: Arc<AtomicBool>,
+    handlers: Arc<Mutex<Option<CliSignalHandlers>>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SignalWatcher {
+    fn restore_handlers(&self) {
+        if let Some(handlers) = self.handlers.lock().expect("signal handler lock").take() {
+            handlers.restore();
+        }
+    }
+}
+
+impl Drop for SignalWatcher {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        self.restore_handlers();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 /// Spawn a background thread that watches for SIGINT/SIGTERM and triggers
 /// an in-process unmount so `fuser::Session::run` returns cleanly and
 /// the VFS shutdown/drain logic can execute.
 fn spawn_signal_watcher(
     mount_point: String,
     mut unmount: fuser::SessionUnmounter,
-) -> std::io::Result<()> {
+) -> std::io::Result<SignalWatcher> {
     let mp = mount_point.to_string();
-    // SAFETY: `libc::signal` mutates process-global signal disposition. We register a
-    // process-lifetime signal handler for shutdown before entering the mount loop.
-    unsafe {
-        let previous = libc::signal(
-            libc::SIGINT,
-            shutdown_signal_handler as *const () as libc::sighandler_t,
-        );
-        if previous == libc::SIG_ERR {
-            return Err(std::io::Error::last_os_error());
-        }
-        let previous = libc::signal(
-            libc::SIGTERM,
-            shutdown_signal_handler as *const () as libc::sighandler_t,
-        );
-        if previous == libc::SIG_ERR {
-            return Err(std::io::Error::last_os_error());
-        }
-    }
-    std::thread::Builder::new()
+    let stop = Arc::new(AtomicBool::new(false));
+    let handlers = Arc::new(Mutex::new(Some(CliSignalHandlers::install()?)));
+    let watcher_stop = Arc::clone(&stop);
+    let watcher_handlers = Arc::clone(&handlers);
+    let thread = std::thread::Builder::new()
         .name("signal-watcher".into())
         .spawn(move || {
             // Poll the atomic flag until a signal arrives.
-            while !SHUTDOWN_REQUESTED.load(Ordering::Acquire) {
+            while !watcher_stop.load(Ordering::Acquire)
+                && !SHUTDOWN_REQUESTED.load(Ordering::Acquire)
+            {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
+            if watcher_stop.load(Ordering::Acquire) {
+                return;
+            }
             tracing::info!("received shutdown signal, unmounting {mp} …");
-            // Restore default signal handlers immediately so a second Ctrl+C
-            // force-kills the process in case unmount or shutdown stalls.
-            // SAFETY: we restore the process-global default handlers with libc constants.
-            unsafe {
-                libc::signal(libc::SIGINT, libc::SIG_DFL);
-                libc::signal(libc::SIGTERM, libc::SIG_DFL);
+            if let Some(handlers) = watcher_handlers.lock().expect("signal handler lock").take() {
+                handlers.restore();
             }
             let _ = unmount.unmount();
-        })
-        .map(|_| ())?;
-    Ok(())
+        })?;
+    Ok(SignalWatcher {
+        stop,
+        handlers,
+        thread: Some(thread),
+    })
 }
 
 // ─── Public API ──────────────────────────────────────────────────────────────
@@ -150,13 +260,30 @@ pub fn mount_and_serve(
     foreground: bool,
     read_only: bool,
 ) -> std::io::Result<()> {
+    let mut request = FuseMountRequest::new(vfs, runtime_handle, mount_point, volume_name);
+    request.foreground = foreground;
+    request.read_only = read_only;
+    mount_with_request(request)
+}
+
+/// Mount and serve a FUSE filesystem with explicit library/CLI ownership policy.
+pub fn mount_with_request(request: FuseMountRequest) -> std::io::Result<()> {
+    let FuseMountRequest {
+        vfs,
+        runtime_handle,
+        mount_point,
+        volume_name,
+        foreground,
+        read_only,
+        signal_handling,
+    } = request;
     let fs = StudioFuseFs::new(vfs.clone(), runtime_handle);
     // Do NOT add DefaultPermissions here: it would make the kernel enforce
     // POSIX mode/uid/gid from getattr() in-kernel.  Old volumes have the
     // root inode stored with uid=0/gid=0 (historic default), so the kernel
     // would see the mounting user as "other" (r-x only) and block writes.
     // Instead we implement access() -> ok() so the FUSE daemon decides.
-    let options = build_mount_options(volume_name, foreground, read_only)
+    let options = build_mount_options(&volume_name, foreground, read_only)
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
     // macOS-specific options:
     //  volname – display name in Finder
@@ -164,7 +291,11 @@ pub fn mount_and_serve(
     // Do not use `noappledouble` or `noapplexattr`: StudioFS accepts native
     // macOS xattrs (including resource forks) via FUSE xattr callbacks, and
     // these options would interfere with expected metadata behavior.
-    tracing::info!("mounting StudioFS at {mount_point}, press Ctrl+C to unmount");
+    let shutdown_hint = match signal_handling {
+        SignalHandling::Disabled => "unmount through the host lifecycle",
+        SignalHandling::InstallForCli => "press Ctrl+C to unmount",
+    };
+    tracing::info!("mounting StudioFS at {mount_point}, {shutdown_hint}");
 
     // Use Session::new + run() instead of fuser::mount2 so we can obtain a
     // Notifier. The notifier allows VFS metadata refresh paths to
@@ -172,8 +303,10 @@ pub fn mount_and_serve(
     // creates/deletes visible immediately without waiting for TTL expiry.
     let mut session = fuser::Session::new(fs, mount_point.as_ref() as &std::path::Path, &options)?;
     let unmount = session.unmount_callable();
-    // Watch for Ctrl+C / SIGTERM and trigger in-process unmount.
-    spawn_signal_watcher(mount_point.to_string(), unmount)?;
+    let signal_watcher = match signal_handling {
+        SignalHandling::Disabled => None,
+        SignalHandling::InstallForCli => Some(spawn_signal_watcher(mount_point.clone(), unmount)?),
+    };
     let notifier = session.notifier();
 
     // Register the kernel cache invalidator with the VFS.
@@ -181,6 +314,7 @@ pub fn mount_and_serve(
     vfs.set_kernel_invalidator(invalidator);
 
     session.run()?;
+    drop(signal_watcher);
 
     // Session::run returns when the filesystem is unmounted.
     vfs.clear_kernel_invalidator();
@@ -203,10 +337,14 @@ pub fn mount_and_serve(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::{
-        MountOptionError, build_mount_options, build_mount_options_with_allow_other,
+        MountOptionError, SignalHandling, build_mount_options_with_allow_other,
         validate_volume_name,
     };
+
+    static SIGNAL_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn mount_options_include_allow_other(options: &[fuser::MountOption]) -> bool {
         options
@@ -248,6 +386,48 @@ mod tests {
         assert!(!options.iter().any(
             |opt| matches!(opt, fuser::MountOption::CUSTOM(custom) if custom == "foreground")
         ));
+    }
+
+    #[test]
+    fn fuse_mount_request_defaults_to_library_owned_signal_policy() {
+        assert_eq!(SignalHandling::default(), SignalHandling::Disabled);
+    }
+
+    #[test]
+    fn cli_signal_handler_restores_previous_signal_dispositions() {
+        let _guard = SIGNAL_TEST_LOCK.lock().expect("signal test lock");
+        extern "C" fn previous_handler(_sig: libc::c_int) {}
+
+        // SAFETY: this test owns the process-global dispositions briefly and
+        // restores them before returning.
+        let (original_sigint, original_sigterm) = unsafe {
+            (
+                libc::signal(
+                    libc::SIGINT,
+                    previous_handler as *const () as libc::sighandler_t,
+                ),
+                libc::signal(
+                    libc::SIGTERM,
+                    previous_handler as *const () as libc::sighandler_t,
+                ),
+            )
+        };
+
+        let previous = super::CliSignalHandlers::install().expect("install signal handlers");
+        previous.restore();
+
+        unsafe {
+            assert_eq!(
+                libc::signal(libc::SIGINT, libc::SIG_DFL),
+                previous_handler as *const () as libc::sighandler_t
+            );
+            assert_eq!(
+                libc::signal(libc::SIGTERM, libc::SIG_DFL),
+                previous_handler as *const () as libc::sighandler_t
+            );
+            libc::signal(libc::SIGINT, original_sigint);
+            libc::signal(libc::SIGTERM, original_sigterm);
+        }
     }
 
     #[cfg(target_os = "linux")]

@@ -39,14 +39,16 @@ impl MountBackend for FuseMountBackend {
     }
 
     fn serve(&self, launch: BackendLaunch) -> io::Result<()> {
-        studiofs_fuse::mount_and_serve(
+        let mut request = studiofs_fuse::FuseMountRequest::new(
             launch.vfs,
             launch.runtime_handle,
-            &launch.mount_point,
-            &launch.volume_name,
-            launch.run_in_foreground,
-            launch.read_only,
-        )
+            launch.mount_point,
+            launch.volume_name,
+        );
+        request.foreground = launch.run_in_foreground;
+        request.read_only = launch.read_only;
+        request.signal_handling = studiofs_fuse::SignalHandling::InstallForCli;
+        studiofs_fuse::mount_with_request(request)
     }
 }
 
