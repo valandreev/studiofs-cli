@@ -106,6 +106,47 @@ fn diagnostics_public_module_stays_a_facade() {
     );
 }
 
+#[test]
+fn e2e_scenario_module_stays_split_by_responsibility() {
+    let repo = repo_root();
+    let legacy_monolith = repo.join("crates/studiofs-e2e/src/scenario.rs");
+    let module_dir = repo.join("crates/studiofs-e2e/src/scenario");
+
+    assert!(
+        !legacy_monolith.exists(),
+        "studiofs-e2e scenario code should live in focused scenario/ modules, not scenario.rs"
+    );
+    assert!(
+        module_dir.join("mod.rs").exists(),
+        "scenario module facade should live at crates/studiofs-e2e/src/scenario/mod.rs"
+    );
+
+    for module in [
+        "actions.rs",
+        "advanced_mounted.rs",
+        "assertions.rs",
+        "faults.rs",
+        "namespace_collision.rs",
+        "registry.rs",
+        "smoke_outage.rs",
+        "test_fixtures.rs",
+        "types.rs",
+        "workloads.rs",
+        "workloads_tests.rs",
+    ] {
+        assert!(
+            module_dir.join(module).exists(),
+            "missing focused scenario submodule {module}"
+        );
+    }
+
+    let workloads_lines = workspace_line_count("crates/studiofs-e2e/src/scenario/workloads.rs");
+    assert!(
+        workloads_lines <= 300,
+        "scenario/workloads.rs should only wire shared constants and focused modules; found {workloads_lines} lines"
+    );
+}
+
 fn collect_term_hits_outside_test_modules(path: &str, terms: &[&str]) -> Vec<String> {
     let contents = read_workspace_file(path);
     let filtered = strip_cfg_test_items(&contents);

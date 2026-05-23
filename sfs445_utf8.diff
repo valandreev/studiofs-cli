@@ -1,0 +1,1051 @@
+﻿diff --git a/crates/studiofs-e2e/src/scenario/actions.rs b/crates/studiofs-e2e/src/scenario/actions.rs
+new file mode 100644
+index 00000000..5b3ed2d9
+--- /dev/null
++++ b/crates/studiofs-e2e/src/scenario/actions.rs
+@@ -0,0 +1 @@
++//! Common mounted file actions and client workload helpers.
+diff --git a/crates/studiofs-e2e/src/scenario/assertions.rs b/crates/studiofs-e2e/src/scenario/assertions.rs
+new file mode 100644
+index 00000000..0becebbb
+--- /dev/null
++++ b/crates/studiofs-e2e/src/scenario/assertions.rs
+@@ -0,0 +1 @@
++//! Convergence, checksum, oracle, and artifact validation helpers.
+diff --git a/crates/studiofs-e2e/src/scenario/faults.rs b/crates/studiofs-e2e/src/scenario/faults.rs
+new file mode 100644
+index 00000000..068f555c
+--- /dev/null
++++ b/crates/studiofs-e2e/src/scenario/faults.rs
+@@ -0,0 +1 @@
++//! Fault orchestration helpers for outage, crash, restart, and chaos scenarios.
+diff --git a/crates/studiofs-e2e/src/scenario/mod.rs b/crates/studiofs-e2e/src/scenario/mod.rs
+new file mode 100644
+index 00000000..38eaa173
+--- /dev/null
++++ b/crates/studiofs-e2e/src/scenario/mod.rs
+@@ -0,0 +1,14 @@
++//! Scenario registry and lifecycle hooks for mounted E2E runs.
++
++pub mod actions;
++pub mod assertions;
++pub mod faults;
++pub mod registry;
++pub mod types;
++
++mod workloads;
++
++pub use registry::available_scenarios;
++pub(crate) use registry::resolve_scenario;
++pub use types::{Scenario, ScenarioContext, ScenarioDefinition, ScenarioError};
++pub use workloads::*;
+diff --git a/crates/studiofs-e2e/src/scenario/registry.rs b/crates/studiofs-e2e/src/scenario/registry.rs
+new file mode 100644
+index 00000000..36b60b79
+--- /dev/null
++++ b/crates/studiofs-e2e/src/scenario/registry.rs
+@@ -0,0 +1,138 @@
++//! Scenario registration and stable-name ownership.
++
++use super::types::{Scenario, ScenarioDefinition};
++use super::workloads::*;
++
++/// Returns the full registry of available scenario definitions.
++pub fn available_scenarios() -> Vec<ScenarioDefinition> {
++    vec![
++        BasicMultiClientSmoke.definition(),
++        PostgresOutageMultiClientRecovery.definition(),
++        RustfsOutageMultiClientRecovery.definition(),
++        MountedClientCrashRestartRecovery.definition(),
++        AdvancedMountedScenario::new(AdvancedMountedKind::CrashBeforeWriteAcceptance).definition(),
++        AdvancedMountedScenario::new(AdvancedMountedKind::CrashAfterPartialWriteAcceptance)
++            .definition(),
++        AdvancedMountedScenario::new(AdvancedMountedKind::CrashAfterFullWriteAcceptance)
++            .definition(),
++        NamespaceCollisionScenario::new(NamespaceCollisionKind::RenameVsRename).definition(),
++        NamespaceCollisionScenario::new(NamespaceCollisionKind::RenameVsUnlink).definition(),
++        NamespaceCollisionScenario::new(NamespaceCollisionKind::UnlinkVsAppend).definition(),
++        NamespaceCollisionScenario::new(NamespaceCollisionKind::OverwriteVsRead).definition(),
++        NamespaceCollisionScenario::new(NamespaceCollisionKind::MkdirRmdirVsCreate).definition(),
++        NamespaceCollisionScenario::new(NamespaceCollisionKind::ReaddirStatDuringMutation)
++            .definition(),
++        AdvancedMountedScenario::new(AdvancedMountedKind::MountedChaos).definition(),
++        AdvancedMountedScenario::new(AdvancedMountedKind::HotspotChurn).definition(),
++        AdvancedMountedScenario::new(AdvancedMountedKind::FaultChaos).definition(),
++        AdvancedMountedScenario::new(AdvancedMountedKind::LwwReconnectChaos).definition(),
++        AdvancedMountedScenario::new(AdvancedMountedKind::OpenHandle).definition(),
++        AdvancedMountedScenario::new(AdvancedMountedKind::SparseRange).definition(),
++        AdvancedMountedScenario::new(AdvancedMountedKind::ColdObserverLongHistory).definition(),
++        AdvancedMountedScenario::new(AdvancedMountedKind::StaleRemountColdDiscoverCatchup)
++            .definition(),
++        AdvancedMountedScenario::new(AdvancedMountedKind::InvalidationDropoutFallback).definition(),
++        AdvancedMountedScenario::new(AdvancedMountedKind::SymlinkAttribute).definition(),
++    ]
++}
++
++/// Resolves a scenario name to a concrete scenario implementation.
++pub(crate) fn resolve_scenario(name: &str) -> Option<Box<dyn Scenario>> {
++    match name {
++        BASIC_MULTI_CLIENT_SMOKE | "smoke" => Some(Box::new(BasicMultiClientSmoke)),
++        POSTGRES_OUTAGE_MULTI_CLIENT_RECOVERY | "postgres-outage" => {
++            Some(Box::new(PostgresOutageMultiClientRecovery))
++        }
++        RUSTFS_OUTAGE_MULTI_CLIENT_RECOVERY | "rustfs-outage" | "s3-outage" => {
++            Some(Box::new(RustfsOutageMultiClientRecovery))
++        }
++        MOUNTED_CLIENT_CRASH_RESTART_RECOVERY | "client-crash-restart" | "crash-restart" => {
++            Some(Box::new(MountedClientCrashRestartRecovery))
++        }
++        MOUNTED_CRASH_BEFORE_WRITE_ACCEPTANCE
++        | "crash-before-write-acceptance"
++        | "publication-boundary-before-write" => Some(Box::new(AdvancedMountedScenario::new(
++            AdvancedMountedKind::CrashBeforeWriteAcceptance,
++        ))),
++        MOUNTED_CRASH_AFTER_PARTIAL_WRITE_ACCEPTANCE
++        | "crash-after-partial-write-acceptance"
++        | "publication-boundary-partial-write" => Some(Box::new(AdvancedMountedScenario::new(
++            AdvancedMountedKind::CrashAfterPartialWriteAcceptance,
++        ))),
++        MOUNTED_CRASH_AFTER_FULL_WRITE_ACCEPTANCE
++        | "crash-after-full-write-acceptance"
++        | "publication-boundary"
++        | "publication-boundary-crash" => Some(Box::new(AdvancedMountedScenario::new(
++            AdvancedMountedKind::CrashAfterFullWriteAcceptance,
++        ))),
++        COLLISION_RENAME_VS_RENAME | "rename-vs-rename" => Some(Box::new(
++            NamespaceCollisionScenario::new(NamespaceCollisionKind::RenameVsRename),
++        )),
++        COLLISION_RENAME_VS_UNLINK | "rename-vs-unlink" => Some(Box::new(
++            NamespaceCollisionScenario::new(NamespaceCollisionKind::RenameVsUnlink),
++        )),
++        COLLISION_UNLINK_VS_APPEND | "unlink-vs-append" => Some(Box::new(
++            NamespaceCollisionScenario::new(NamespaceCollisionKind::UnlinkVsAppend),
++        )),
++        COLLISION_OVERWRITE_VS_READ | "overwrite-vs-read" => Some(Box::new(
++            NamespaceCollisionScenario::new(NamespaceCollisionKind::OverwriteVsRead),
++        )),
++        COLLISION_MKDIR_RMDIR_VS_CREATE | "mkdir-rmdir-vs-create" => Some(Box::new(
++            NamespaceCollisionScenario::new(NamespaceCollisionKind::MkdirRmdirVsCreate),
++        )),
++        COLLISION_READDIR_STAT_DURING_MUTATION | "readdir-stat-during-mutation" => Some(Box::new(
++            NamespaceCollisionScenario::new(NamespaceCollisionKind::ReaddirStatDuringMutation),
++        )),
++        MOUNTED_CHAOS_CONVERGENCE | "mounted-chaos" | "chaos" => Some(Box::new(
++            AdvancedMountedScenario::new(AdvancedMountedKind::MountedChaos),
++        )),
++        MOUNTED_HOTSPOT_CHURN_CONVERGENCE | "hotspot-churn" | "hot-dir-churn" => Some(Box::new(
++            AdvancedMountedScenario::new(AdvancedMountedKind::HotspotChurn),
++        )),
++        MOUNTED_FAULT_CHAOS_CONVERGENCE | "fault-chaos" | "chaos-faults" => Some(Box::new(
++            AdvancedMountedScenario::new(AdvancedMountedKind::FaultChaos),
++        )),
++        MOUNTED_LWW_RECONNECT_CHAOS_CONVERGENCE | "lww-chaos" | "reconnect-lww" => Some(Box::new(
++            AdvancedMountedScenario::new(AdvancedMountedKind::LwwReconnectChaos),
++        )),
++        MOUNTED_OPEN_HANDLE_CONVERGENCE | "open-handle" | "open-unlink-rename" => Some(Box::new(
++            AdvancedMountedScenario::new(AdvancedMountedKind::OpenHandle),
++        )),
++        MOUNTED_SPARSE_FILE_RANGE_CONVERGENCE | "sparse-range" | "sparse-file-range" => {
++            Some(Box::new(AdvancedMountedScenario::new(
++                AdvancedMountedKind::SparseRange,
++            )))
++        }
++        MOUNTED_COLD_OBSERVER_LONG_HISTORY_CONVERGENCE
++        | "cold-observer"
++        | "cold-observer-long-history" => Some(Box::new(AdvancedMountedScenario::new(
++            AdvancedMountedKind::ColdObserverLongHistory,
++        ))),
++        MOUNTED_STALE_REMOUNT_COLD_DISCOVER_CATCHUP_CONVERGENCE
++        | "stale-remount"
++        | "cold-discover-catchup" => Some(Box::new(AdvancedMountedScenario::new(
++            AdvancedMountedKind::StaleRemountColdDiscoverCatchup,
++        ))),
++        MOUNTED_INVALIDATION_DROPOUT_FALLBACK_CONVERGENCE
++        | "invalidation-dropout"
++        | "fallback-sync" => Some(Box::new(AdvancedMountedScenario::new(
++            AdvancedMountedKind::InvalidationDropoutFallback,
++        ))),
++        MOUNTED_SYMLINK_ATTRIBUTE_CONVERGENCE | "symlink-attribute" | "symlink-attrs" => {
++            Some(Box::new(AdvancedMountedScenario::new(
++                AdvancedMountedKind::SymlinkAttribute,
++            )))
++        }
++        #[cfg(test)]
++        TEST_FAILING_VALIDATE => Some(Box::new(TestFailingScenario {
++            cleanup_fails: false,
++        })),
++        #[cfg(test)]
++        TEST_FAILING_VALIDATE_AND_CLEANUP => Some(Box::new(TestFailingScenario {
++            cleanup_fails: true,
++        })),
++        #[cfg(test)]
++        TEST_PASSING => Some(Box::new(TestPassingScenario)),
++        _ => None,
++    }
++}
+diff --git a/crates/studiofs-e2e/src/scenario/types.rs b/crates/studiofs-e2e/src/scenario/types.rs
+new file mode 100644
+index 00000000..43ecee18
+--- /dev/null
++++ b/crates/studiofs-e2e/src/scenario/types.rs
+@@ -0,0 +1,275 @@
++//! Shared scenario contracts and result types.
++
++use std::path::PathBuf;
++
++use thiserror::Error;
++
++use crate::client::{ClientControllerConfig, ClientControllerError};
++use crate::infra::InfraError;
++use crate::mounted_tree::{MountedTreeError, NamespaceInvariantViolation};
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++/// Static definition of a scenario, including user-facing metadata.
++pub struct ScenarioDefinition {
++    /// Scenario name.
++    pub name: &'static str,
++    /// Human-readable description.
++    pub description: &'static str,
++    /// Whether this scenario requires `studiofs` binary explicitly.
++    pub requires_studiofs_bin: bool,
++}
++
++#[derive(Debug, Clone)]
++/// Shared context provided to scenario setup, execution, validation, and cleanup.
++pub struct ScenarioContext {
++    /// Identifier for this run.
++    pub run_id: String,
++    /// Deterministic random seed for this run.
++    pub seed: u64,
++    /// Sandbox directory for this run.
++    pub sandbox: PathBuf,
++    /// Scenario artifact directory.
++    pub scenario_dir: PathBuf,
++    /// Optional client controller configuration override.
++    pub client_controller_config: Option<ClientControllerConfig>,
++}
++
++#[derive(Debug, Error)]
++/// Error surface for scenario orchestration.
++pub enum ScenarioError {
++    /// Underlying I/O error while manipulating files or process output.
++    #[error("scenario I/O failed: {0}")]
++    Io(
++        /// Source I/O error.
++        #[from]
++        std::io::Error,
++    ),
++    /// JSON serialization or deserialization failed.
++    #[error("scenario JSON failed: {0}")]
++    Json(
++        /// Source JSON encoding/decoding error.
++        #[from]
++        serde_json::Error,
++    ),
++    /// Client controller returned an operational failure.
++    #[error("scenario client controller failed: {0}")]
++    Client(
++        /// Source client controller error.
++        #[from]
++        ClientControllerError,
++    ),
++    /// Mounted smoke scenario failed and unmount also failed.
++    #[error("mounted smoke scenario failed: {primary}; unmount also failed: {cleanup}")]
++    MountedSmokeUnmountAfterFailure {
++        /// Primary scenario failure.
++        primary: String,
++        /// Unmount and cleanup failure while tearing down.
++        cleanup: String,
++    },
++    /// PostgreSQL outage scenario failed and unmount also failed.
++    #[error("PostgreSQL outage scenario failed: {primary}; unmount also failed: {cleanup}")]
++    PostgresOutageUnmountAfterFailure {
++        /// Primary scenario failure.
++        primary: String,
++        /// Unmount and cleanup failure while tearing down.
++        cleanup: String,
++    },
++    /// RustFS outage scenario failed and unmount also failed.
++    #[error("RustFS/S3 outage scenario failed: {primary}; unmount also failed: {cleanup}")]
++    RustfsOutageUnmountAfterFailure {
++        /// Primary scenario failure.
++        primary: String,
++        /// Unmount and cleanup failure while tearing down.
++        cleanup: String,
++    },
++    /// Crash/restart scenario failed and unmount also failed.
++    #[error(
++        "mounted client crash/restart scenario failed: {primary}; unmount also failed: {cleanup}"
++    )]
++    CrashRestartUnmountAfterFailure {
++        /// Primary scenario failure.
++        primary: String,
++        /// Unmount and cleanup failure while tearing down.
++        cleanup: String,
++    },
++    /// Mounted tree validation error.
++    #[error("mounted tree validation failed: {0}")]
++    MountedTree(
++        /// Source mounted-tree validation error.
++        #[from]
++        MountedTreeError,
++    ),
++    /// Infrastructure-related failure.
++    #[error("scenario infrastructure failed: {0}")]
++    Infra(
++        /// Source infrastructure error.
++        #[from]
++        InfraError,
++    ),
++    /// PostgreSQL outage scenario requires compose infrastructure.
++    #[error("PostgreSQL outage scenario requires compose infrastructure")]
++    MissingComposeInfrastructure,
++    /// Scenario manifest path is missing.
++    #[error("missing E2E run manifest: {path}")]
++    MissingRunManifest {
++        /// Path to the expected run manifest.
++        path: PathBuf,
++    },
++    /// Outage operation rejected by scenario coordinator.
++    #[error("PostgreSQL outage operations rejected {rejected} of {total} expected local writes")]
++    RejectedOutageOperations {
++        /// Number of rejected outage operations.
++        rejected: usize,
++        /// Total outage operations attempted.
++        total: usize,
++    },
++    /// PostgreSQL outage writer recovery failed.
++    #[error("PostgreSQL outage writer recovery failed for {client}:{path}: {detail}")]
++    PostgresOutageWriterRecoveryFailed {
++        /// Client that failed recovery.
++        client: String,
++        /// Recovered file path.
++        path: String,
++        /// Recovery failure details.
++        detail: String,
++    },
++    /// Writer remount failed during outage recovery.
++    #[error("PostgreSQL outage writer remount failed for {client}: {detail}")]
++    PostgresOutageWriterRemountFailed {
++        /// Client that could not remount.
++        client: String,
++        /// Remount failure details.
++        detail: String,
++    },
++    /// Peer convergence failed after writer publication.
++    #[error("PostgreSQL outage peer convergence failed after writer publication: {detail}")]
++    PostgresOutagePeerConvergenceFailed {
++        /// Peer convergence failure details.
++        detail: String,
++    },
++    /// A peer observed outage write visibility too early.
++    #[error("peer client observed the RustFS/S3 outage write before recovery: {checksum}")]
++    PeerObservedOutageWrite {
++        /// Observed checksum value.
++        checksum: String,
++    },
++    /// Insufficient clients provided for smoke scenarios.
++    #[error("mounted smoke scenario requires at least {expected} clients, got {actual}")]
++    InsufficientMountedClients {
++        /// Minimum number of clients required.
++        expected: usize,
++        /// Number of clients actually provided.
++        actual: usize,
++    },
++    /// Insufficient clients provided for outage scenarios.
++    #[error("PostgreSQL outage scenario requires at least {expected} clients, got {actual}")]
++    InsufficientOutageClients {
++        /// Minimum number of clients required.
++        expected: usize,
++        /// Number of clients actually provided.
++        actual: usize,
++    },
++    /// Insufficient clients provided for crash/restart scenarios.
++    #[error(
++        "mounted client crash/restart scenario requires at least {expected} clients, got {actual}"
++    )]
++    InsufficientCrashRestartClients {
++        /// Minimum number of clients required.
++        expected: usize,
++        /// Number of clients actually provided.
++        actual: usize,
++    },
++    /// Writer publication failed.
++    #[error("mounted client crash/restart publication failed for {path}: {detail}")]
++    CrashRestartPublicationFailed {
++        /// Recovered file path.
++        path: String,
++        /// Publication failure details.
++        detail: String,
++    },
++    /// Peer convergence failed after crash/restart recovery.
++    #[error("mounted client crash/restart peer convergence failed for {path}: {detail}")]
++    CrashRestartPeerConvergenceFailed {
++        /// Recovered file path.
++        path: String,
++        /// Peer convergence failure details.
++        detail: String,
++    },
++    /// Crash/restart produced a corrupted advertised file checksum.
++    #[error(
++        "mounted client crash/restart corrupt advertised file for {client}:{path}: expected recovered checksum {expected_checksum}, got {actual_checksum}"
++    )]
++    CrashRestartCorruptAdvertisedFile {
++        /// Client with the corrupted advertised file.
++        client: String,
++        /// Advertised file path.
++        path: String,
++        /// Expected checksum from the writer.
++        expected_checksum: String,
++        /// Observed checksum after recovery.
++        actual_checksum: String,
++    },
++    /// Namespace collision scenarios require enough clients.
++    #[error("namespace collision scenario requires at least {expected} clients, got {actual}")]
++    InsufficientCollisionClients {
++        /// Minimum number of clients required.
++        expected: usize,
++        /// Number of clients actually provided.
++        actual: usize,
++    },
++    /// Namespace collision scenario failed and cleanup unmount also failed.
++    #[error("namespace collision scenario failed: {primary}; unmount also failed: {cleanup}")]
++    NamespaceCollisionUnmountAfterFailure {
++        /// Primary scenario failure.
++        primary: String,
++        /// Unmount and cleanup failure while tearing down.
++        cleanup: String,
++    },
++    /// Advanced mounted scenario failed and cleanup unmount also failed.
++    #[error(
++        "advanced mounted scenario {scenario} failed: {primary}; unmount also failed: {cleanup}"
++    )]
++    AdvancedMountedUnmountAfterFailure {
++        /// Scenario name.
++        scenario: String,
++        /// Primary error detail.
++        primary: String,
++        /// Cleanup error detail.
++        cleanup: String,
++    },
++    /// Namespace collision operations exceeded timeout.
++    #[error("namespace collision operations timed out after {timeout_ms} ms; pending: {pending:?}")]
++    NamespaceCollisionOperationTimeout {
++        /// Timeout in milliseconds.
++        timeout_ms: u128,
++        /// Pending operations when timeout was hit.
++        pending: Vec<String>,
++    },
++    /// Namespace invariant validation failed.
++    #[error("namespace collision validation failed: {violations:?}")]
++    NamespaceInvariantViolations {
++        /// Set of invariant violations.
++        violations: Vec<NamespaceInvariantViolation>,
++    },
++    /// Test-only replication failure emitted by namespace collision fixtures.
++    #[cfg(test)]
++    #[error("namespace collision recording replication failed: {errors:?}")]
++    ReplicationFailure {
++        /// Assertion error messages produced while validating the replication recording.
++        errors: Vec<String>,
++    },
++}
++
++/// Contract implemented by scenario implementations used by mounted E2E runs.
++pub trait Scenario {
++    /// Returns scenario definition metadata.
++    fn definition(&self) -> ScenarioDefinition;
++    /// Runs setup actions before scenario execution.
++    fn setup(&self, context: &ScenarioContext) -> Result<(), ScenarioError>;
++    /// Executes the scenario under test.
++    fn run(&self, context: &ScenarioContext) -> Result<(), ScenarioError>;
++    /// Validates final scenario behavior and returns warnings if any.
++    fn validate(&self, context: &ScenarioContext) -> Result<Vec<String>, ScenarioError>;
++    /// Cleans scenario state and unmounts clients.
++    fn cleanup(&self, context: &ScenarioContext) -> Result<(), ScenarioError>;
++}
+diff --git a/crates/studiofs-e2e/src/scenario.rs b/crates/studiofs-e2e/src/scenario/workloads.rs
+similarity index 96%
+rename from crates/studiofs-e2e/src/scenario.rs
+rename to crates/studiofs-e2e/src/scenario/workloads.rs
+index 89cc126f..e25f933a 100644
+--- a/crates/studiofs-e2e/src/scenario.rs
++++ b/crates/studiofs-e2e/src/scenario/workloads.rs
+@@ -17,17 +17,18 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+ use serde::{Deserialize, Serialize};
+ use serde_json::json;
+ use sha2::{Digest as _, Sha256};
+-use thiserror::Error;
+ 
++#[cfg(test)]
++use crate::client::ClientControllerConfig;
+ use crate::client::{
+-    ClientControllerConfig, ClientControllerError, ClientSpec, MultiClientController,
+-    PeerVolumeBootstrapOptions, PeerVolumeBootstrapSummary, SystemClientProcessExecutor,
+-    VolumeBootstrapOptions, VolumeBootstrapSummary,
++    ClientControllerError, ClientSpec, MultiClientController, PeerVolumeBootstrapOptions,
++    PeerVolumeBootstrapSummary, SystemClientProcessExecutor, VolumeBootstrapOptions,
++    VolumeBootstrapSummary,
+ };
+ #[cfg(all(windows, not(test)))]
+ use crate::client::{run_taskkill_with_timeout, windows_taskkill_status_is_success};
+ use crate::infra::{
+-    CommandExecutor, ComposeServiceControl, InfraError, POSTGRES_SERVICE_NAME, RUSTFS_SERVICE_NAME,
++    CommandExecutor, ComposeServiceControl, POSTGRES_SERVICE_NAME, RUSTFS_SERVICE_NAME,
+     SystemCommandExecutor,
+ };
+ use crate::mounted_tree::{
+@@ -201,408 +202,10 @@ pub(crate) const TEST_FAILING_VALIDATE_AND_CLEANUP: &str = "__test-failing-valid
+ /// Scenario identifier for test helper that expects passing validation.
+ pub(crate) const TEST_PASSING: &str = "__test-passing";
+ 
+-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+-/// Static definition of a scenario, including user-facing metadata.
+-pub struct ScenarioDefinition {
+-    /// Scenario name.
+-    pub name: &'static str,
+-    /// Human-readable description.
+-    pub description: &'static str,
+-    /// Whether this scenario requires `studiofs` binary explicitly.
+-    pub requires_studiofs_bin: bool,
+-}
+-
+-#[derive(Debug, Clone)]
+-/// Shared context provided to scenario setup, execution, validation, and cleanup.
+-pub struct ScenarioContext {
+-    /// Identifier for this run.
+-    pub run_id: String,
+-    /// Deterministic random seed for this run.
+-    pub seed: u64,
+-    /// Sandbox directory for this run.
+-    pub sandbox: PathBuf,
+-    /// Scenario artifact directory.
+-    pub scenario_dir: PathBuf,
+-    /// Optional client controller configuration override.
+-    pub client_controller_config: Option<ClientControllerConfig>,
+-}
+-
+-#[derive(Debug, Error)]
+-/// Error surface for scenario orchestration.
+-pub enum ScenarioError {
+-    /// Underlying I/O error while manipulating files or process output.
+-    #[error("scenario I/O failed: {0}")]
+-    Io(
+-        /// Source I/O error.
+-        #[from]
+-        std::io::Error,
+-    ),
+-    /// JSON serialization or deserialization failed.
+-    #[error("scenario JSON failed: {0}")]
+-    Json(
+-        /// Source JSON encoding/decoding error.
+-        #[from]
+-        serde_json::Error,
+-    ),
+-    /// Client controller returned an operational failure.
+-    #[error("scenario client controller failed: {0}")]
+-    Client(
+-        /// Source client controller error.
+-        #[from]
+-        ClientControllerError,
+-    ),
+-    /// Mounted smoke scenario failed and unmount also failed.
+-    #[error("mounted smoke scenario failed: {primary}; unmount also failed: {cleanup}")]
+-    MountedSmokeUnmountAfterFailure {
+-        /// Primary scenario failure.
+-        primary: String,
+-        /// Unmount and cleanup failure while tearing down.
+-        cleanup: String,
+-    },
+-    /// PostgreSQL outage scenario failed and unmount also failed.
+-    #[error("PostgreSQL outage scenario failed: {primary}; unmount also failed: {cleanup}")]
+-    PostgresOutageUnmountAfterFailure {
+-        /// Primary scenario failure.
+-        primary: String,
+-        /// Unmount and cleanup failure while tearing down.
+-        cleanup: String,
+-    },
+-    /// RustFS outage scenario failed and unmount also failed.
+-    #[error("RustFS/S3 outage scenario failed: {primary}; unmount also failed: {cleanup}")]
+-    RustfsOutageUnmountAfterFailure {
+-        /// Primary scenario failure.
+-        primary: String,
+-        /// Unmount and cleanup failure while tearing down.
+-        cleanup: String,
+-    },
+-    /// Crash/restart scenario failed and unmount also failed.
+-    #[error(
+-        "mounted client crash/restart scenario failed: {primary}; unmount also failed: {cleanup}"
+-    )]
+-    CrashRestartUnmountAfterFailure {
+-        /// Primary scenario failure.
+-        primary: String,
+-        /// Unmount and cleanup failure while tearing down.
+-        cleanup: String,
+-    },
+-    /// Mounted tree validation error.
+-    #[error("mounted tree validation failed: {0}")]
+-    MountedTree(
+-        /// Source mounted-tree validation error.
+-        #[from]
+-        MountedTreeError,
+-    ),
+-    /// Infrastructure-related failure.
+-    #[error("scenario infrastructure failed: {0}")]
+-    Infra(
+-        /// Source infrastructure error.
+-        #[from]
+-        InfraError,
+-    ),
+-    /// PostgreSQL outage scenario requires compose infrastructure.
+-    #[error("PostgreSQL outage scenario requires compose infrastructure")]
+-    MissingComposeInfrastructure,
+-    /// Scenario manifest path is missing.
+-    #[error("missing E2E run manifest: {path}")]
+-    MissingRunManifest {
+-        /// Path to the expected run manifest.
+-        path: PathBuf,
+-    },
+-    /// Outage operation rejected by scenario coordinator.
+-    #[error("PostgreSQL outage operations rejected {rejected} of {total} expected local writes")]
+-    RejectedOutageOperations {
+-        /// Number of rejected outage operations.
+-        rejected: usize,
+-        /// Total outage operations attempted.
+-        total: usize,
+-    },
+-    /// PostgreSQL outage writer recovery failed.
+-    #[error("PostgreSQL outage writer recovery failed for {client}:{path}: {detail}")]
+-    PostgresOutageWriterRecoveryFailed {
+-        /// Client that failed recovery.
+-        client: String,
+-        /// Recovered file path.
+-        path: String,
+-        /// Recovery failure details.
+-        detail: String,
+-    },
+-    /// Writer remount failed during outage recovery.
+-    #[error("PostgreSQL outage writer remount failed for {client}: {detail}")]
+-    PostgresOutageWriterRemountFailed {
+-        /// Client that could not remount.
+-        client: String,
+-        /// Remount failure details.
+-        detail: String,
+-    },
+-    /// Peer convergence failed after writer publication.
+-    #[error("PostgreSQL outage peer convergence failed after writer publication: {detail}")]
+-    PostgresOutagePeerConvergenceFailed {
+-        /// Peer convergence failure details.
+-        detail: String,
+-    },
+-    /// A peer observed outage write visibility too early.
+-    #[error("peer client observed the RustFS/S3 outage write before recovery: {checksum}")]
+-    PeerObservedOutageWrite {
+-        /// Observed checksum value.
+-        checksum: String,
+-    },
+-    /// Insufficient clients provided for smoke scenarios.
+-    #[error("mounted smoke scenario requires at least {expected} clients, got {actual}")]
+-    InsufficientMountedClients {
+-        /// Minimum number of clients required.
+-        expected: usize,
+-        /// Number of clients actually provided.
+-        actual: usize,
+-    },
+-    /// Insufficient clients provided for outage scenarios.
+-    #[error("PostgreSQL outage scenario requires at least {expected} clients, got {actual}")]
+-    InsufficientOutageClients {
+-        /// Minimum number of clients required.
+-        expected: usize,
+-        /// Number of clients actually provided.
+-        actual: usize,
+-    },
+-    /// Insufficient clients provided for crash/restart scenarios.
+-    #[error(
+-        "mounted client crash/restart scenario requires at least {expected} clients, got {actual}"
+-    )]
+-    InsufficientCrashRestartClients {
+-        /// Minimum number of clients required.
+-        expected: usize,
+-        /// Number of clients actually provided.
+-        actual: usize,
+-    },
+-    /// Writer publication failed.
+-    #[error("mounted client crash/restart publication failed for {path}: {detail}")]
+-    CrashRestartPublicationFailed {
+-        /// Recovered file path.
+-        path: String,
+-        /// Publication failure details.
+-        detail: String,
+-    },
+-    /// Peer convergence failed after crash/restart recovery.
+-    #[error("mounted client crash/restart peer convergence failed for {path}: {detail}")]
+-    CrashRestartPeerConvergenceFailed {
+-        /// Recovered file path.
+-        path: String,
+-        /// Peer convergence failure details.
+-        detail: String,
+-    },
+-    /// Crash/restart produced a corrupted advertised file checksum.
+-    #[error(
+-        "mounted client crash/restart corrupt advertised file for {client}:{path}: expected recovered checksum {expected_checksum}, got {actual_checksum}"
+-    )]
+-    CrashRestartCorruptAdvertisedFile {
+-        /// Client with the corrupted advertised file.
+-        client: String,
+-        /// Advertised file path.
+-        path: String,
+-        /// Expected checksum from the writer.
+-        expected_checksum: String,
+-        /// Observed checksum after recovery.
+-        actual_checksum: String,
+-    },
+-    /// Namespace collision scenarios require enough clients.
+-    #[error("namespace collision scenario requires at least {expected} clients, got {actual}")]
+-    InsufficientCollisionClients {
+-        /// Minimum number of clients required.
+-        expected: usize,
+-        /// Number of clients actually provided.
+-        actual: usize,
+-    },
+-    /// Namespace collision scenario failed and cleanup unmount also failed.
+-    #[error("namespace collision scenario failed: {primary}; unmount also failed: {cleanup}")]
+-    NamespaceCollisionUnmountAfterFailure {
+-        /// Primary scenario failure.
+-        primary: String,
+-        /// Unmount and cleanup failure while tearing down.
+-        cleanup: String,
+-    },
+-    /// Advanced mounted scenario failed and cleanup unmount also failed.
+-    #[error(
+-        "advanced mounted scenario {scenario} failed: {primary}; unmount also failed: {cleanup}"
+-    )]
+-    AdvancedMountedUnmountAfterFailure {
+-        /// Scenario name.
+-        scenario: String,
+-        /// Primary error detail.
+-        primary: String,
+-        /// Cleanup error detail.
+-        cleanup: String,
+-    },
+-    /// Namespace collision operations exceeded timeout.
+-    #[error("namespace collision operations timed out after {timeout_ms} ms; pending: {pending:?}")]
+-    NamespaceCollisionOperationTimeout {
+-        /// Timeout in milliseconds.
+-        timeout_ms: u128,
+-        /// Pending operations when timeout was hit.
+-        pending: Vec<String>,
+-    },
+-    /// Namespace invariant validation failed.
+-    #[error("namespace collision validation failed: {violations:?}")]
+-    NamespaceInvariantViolations {
+-        /// Set of invariant violations.
+-        violations: Vec<NamespaceInvariantViolation>,
+-    },
+-    /// Test-only replication failure emitted by namespace collision fixtures.
+-    #[cfg(test)]
+-    #[error("namespace collision recording replication failed: {errors:?}")]
+-    ReplicationFailure {
+-        /// Assertion error messages produced while validating the replication recording.
+-        errors: Vec<String>,
+-    },
+-}
+-
+-/// Contract implemented by scenario implementations used by mounted E2E runs.
+-pub trait Scenario {
+-    /// Returns scenario definition metadata.
+-    fn definition(&self) -> ScenarioDefinition;
+-    /// Runs setup actions before scenario execution.
+-    fn setup(&self, context: &ScenarioContext) -> Result<(), ScenarioError>;
+-    /// Executes the scenario under test.
+-    fn run(&self, context: &ScenarioContext) -> Result<(), ScenarioError>;
+-    /// Validates final scenario behavior and returns warnings if any.
+-    fn validate(&self, context: &ScenarioContext) -> Result<Vec<String>, ScenarioError>;
+-    /// Cleans scenario state and unmounts clients.
+-    fn cleanup(&self, context: &ScenarioContext) -> Result<(), ScenarioError>;
+-}
+-
+-/// Returns the full registry of available scenario definitions.
+-pub fn available_scenarios() -> Vec<ScenarioDefinition> {
+-    vec![
+-        BasicMultiClientSmoke.definition(),
+-        PostgresOutageMultiClientRecovery.definition(),
+-        RustfsOutageMultiClientRecovery.definition(),
+-        MountedClientCrashRestartRecovery.definition(),
+-        AdvancedMountedScenario::new(AdvancedMountedKind::CrashBeforeWriteAcceptance).definition(),
+-        AdvancedMountedScenario::new(AdvancedMountedKind::CrashAfterPartialWriteAcceptance)
+-            .definition(),
+-        AdvancedMountedScenario::new(AdvancedMountedKind::CrashAfterFullWriteAcceptance)
+-            .definition(),
+-        NamespaceCollisionScenario::new(NamespaceCollisionKind::RenameVsRename).definition(),
+-        NamespaceCollisionScenario::new(NamespaceCollisionKind::RenameVsUnlink).definition(),
+-        NamespaceCollisionScenario::new(NamespaceCollisionKind::UnlinkVsAppend).definition(),
+-        NamespaceCollisionScenario::new(NamespaceCollisionKind::OverwriteVsRead).definition(),
+-        NamespaceCollisionScenario::new(NamespaceCollisionKind::MkdirRmdirVsCreate).definition(),
+-        NamespaceCollisionScenario::new(NamespaceCollisionKind::ReaddirStatDuringMutation)
+-            .definition(),
+-        AdvancedMountedScenario::new(AdvancedMountedKind::MountedChaos).definition(),
+-        AdvancedMountedScenario::new(AdvancedMountedKind::HotspotChurn).definition(),
+-        AdvancedMountedScenario::new(AdvancedMountedKind::FaultChaos).definition(),
+-        AdvancedMountedScenario::new(AdvancedMountedKind::LwwReconnectChaos).definition(),
+-        AdvancedMountedScenario::new(AdvancedMountedKind::OpenHandle).definition(),
+-        AdvancedMountedScenario::new(AdvancedMountedKind::SparseRange).definition(),
+-        AdvancedMountedScenario::new(AdvancedMountedKind::ColdObserverLongHistory).definition(),
+-        AdvancedMountedScenario::new(AdvancedMountedKind::StaleRemountColdDiscoverCatchup)
+-            .definition(),
+-        AdvancedMountedScenario::new(AdvancedMountedKind::InvalidationDropoutFallback).definition(),
+-        AdvancedMountedScenario::new(AdvancedMountedKind::SymlinkAttribute).definition(),
+-    ]
+-}
+-
+-/// Resolves a scenario name to a concrete scenario implementation.
+-pub(crate) fn resolve_scenario(name: &str) -> Option<Box<dyn Scenario>> {
+-    match name {
+-        BASIC_MULTI_CLIENT_SMOKE | "smoke" => Some(Box::new(BasicMultiClientSmoke)),
+-        POSTGRES_OUTAGE_MULTI_CLIENT_RECOVERY | "postgres-outage" => {
+-            Some(Box::new(PostgresOutageMultiClientRecovery))
+-        }
+-        RUSTFS_OUTAGE_MULTI_CLIENT_RECOVERY | "rustfs-outage" | "s3-outage" => {
+-            Some(Box::new(RustfsOutageMultiClientRecovery))
+-        }
+-        MOUNTED_CLIENT_CRASH_RESTART_RECOVERY | "client-crash-restart" | "crash-restart" => {
+-            Some(Box::new(MountedClientCrashRestartRecovery))
+-        }
+-        MOUNTED_CRASH_BEFORE_WRITE_ACCEPTANCE
+-        | "crash-before-write-acceptance"
+-        | "publication-boundary-before-write" => Some(Box::new(AdvancedMountedScenario::new(
+-            AdvancedMountedKind::CrashBeforeWriteAcceptance,
+-        ))),
+-        MOUNTED_CRASH_AFTER_PARTIAL_WRITE_ACCEPTANCE
+-        | "crash-after-partial-write-acceptance"
+-        | "publication-boundary-partial-write" => Some(Box::new(AdvancedMountedScenario::new(
+-            AdvancedMountedKind::CrashAfterPartialWriteAcceptance,
+-        ))),
+-        MOUNTED_CRASH_AFTER_FULL_WRITE_ACCEPTANCE
+-        | "crash-after-full-write-acceptance"
+-        | "publication-boundary"
+-        | "publication-boundary-crash" => Some(Box::new(AdvancedMountedScenario::new(
+-            AdvancedMountedKind::CrashAfterFullWriteAcceptance,
+-        ))),
+-        COLLISION_RENAME_VS_RENAME | "rename-vs-rename" => Some(Box::new(
+-            NamespaceCollisionScenario::new(NamespaceCollisionKind::RenameVsRename),
+-        )),
+-        COLLISION_RENAME_VS_UNLINK | "rename-vs-unlink" => Some(Box::new(
+-            NamespaceCollisionScenario::new(NamespaceCollisionKind::RenameVsUnlink),
+-        )),
+-        COLLISION_UNLINK_VS_APPEND | "unlink-vs-append" => Some(Box::new(
+-            NamespaceCollisionScenario::new(NamespaceCollisionKind::UnlinkVsAppend),
+-        )),
+-        COLLISION_OVERWRITE_VS_READ | "overwrite-vs-read" => Some(Box::new(
+-            NamespaceCollisionScenario::new(NamespaceCollisionKind::OverwriteVsRead),
+-        )),
+-        COLLISION_MKDIR_RMDIR_VS_CREATE | "mkdir-rmdir-vs-create" => Some(Box::new(
+-            NamespaceCollisionScenario::new(NamespaceCollisionKind::MkdirRmdirVsCreate),
+-        )),
+-        COLLISION_READDIR_STAT_DURING_MUTATION | "readdir-stat-during-mutation" => Some(Box::new(
+-            NamespaceCollisionScenario::new(NamespaceCollisionKind::ReaddirStatDuringMutation),
+-        )),
+-        MOUNTED_CHAOS_CONVERGENCE | "mounted-chaos" | "chaos" => Some(Box::new(
+-            AdvancedMountedScenario::new(AdvancedMountedKind::MountedChaos),
+-        )),
+-        MOUNTED_HOTSPOT_CHURN_CONVERGENCE | "hotspot-churn" | "hot-dir-churn" => Some(Box::new(
+-            AdvancedMountedScenario::new(AdvancedMountedKind::HotspotChurn),
+-        )),
+-        MOUNTED_FAULT_CHAOS_CONVERGENCE | "fault-chaos" | "chaos-faults" => Some(Box::new(
+-            AdvancedMountedScenario::new(AdvancedMountedKind::FaultChaos),
+-        )),
+-        MOUNTED_LWW_RECONNECT_CHAOS_CONVERGENCE | "lww-chaos" | "reconnect-lww" => Some(Box::new(
+-            AdvancedMountedScenario::new(AdvancedMountedKind::LwwReconnectChaos),
+-        )),
+-        MOUNTED_OPEN_HANDLE_CONVERGENCE | "open-handle" | "open-unlink-rename" => Some(Box::new(
+-            AdvancedMountedScenario::new(AdvancedMountedKind::OpenHandle),
+-        )),
+-        MOUNTED_SPARSE_FILE_RANGE_CONVERGENCE | "sparse-range" | "sparse-file-range" => {
+-            Some(Box::new(AdvancedMountedScenario::new(
+-                AdvancedMountedKind::SparseRange,
+-            )))
+-        }
+-        MOUNTED_COLD_OBSERVER_LONG_HISTORY_CONVERGENCE
+-        | "cold-observer"
+-        | "cold-observer-long-history" => Some(Box::new(AdvancedMountedScenario::new(
+-            AdvancedMountedKind::ColdObserverLongHistory,
+-        ))),
+-        MOUNTED_STALE_REMOUNT_COLD_DISCOVER_CATCHUP_CONVERGENCE
+-        | "stale-remount"
+-        | "cold-discover-catchup" => Some(Box::new(AdvancedMountedScenario::new(
+-            AdvancedMountedKind::StaleRemountColdDiscoverCatchup,
+-        ))),
+-        MOUNTED_INVALIDATION_DROPOUT_FALLBACK_CONVERGENCE
+-        | "invalidation-dropout"
+-        | "fallback-sync" => Some(Box::new(AdvancedMountedScenario::new(
+-            AdvancedMountedKind::InvalidationDropoutFallback,
+-        ))),
+-        MOUNTED_SYMLINK_ATTRIBUTE_CONVERGENCE | "symlink-attribute" | "symlink-attrs" => {
+-            Some(Box::new(AdvancedMountedScenario::new(
+-                AdvancedMountedKind::SymlinkAttribute,
+-            )))
+-        }
+-        #[cfg(test)]
+-        TEST_FAILING_VALIDATE => Some(Box::new(TestFailingScenario {
+-            cleanup_fails: false,
+-        })),
+-        #[cfg(test)]
+-        TEST_FAILING_VALIDATE_AND_CLEANUP => Some(Box::new(TestFailingScenario {
+-            cleanup_fails: true,
+-        })),
+-        #[cfg(test)]
+-        TEST_PASSING => Some(Box::new(TestPassingScenario)),
+-        _ => None,
+-    }
+-}
++use super::types::{Scenario, ScenarioContext, ScenarioDefinition, ScenarioError};
+ 
+ #[derive(Debug, Clone, Copy)]
+-struct BasicMultiClientSmoke;
++pub(super) struct BasicMultiClientSmoke;
+ 
+ impl Scenario for BasicMultiClientSmoke {
+     fn definition(&self) -> ScenarioDefinition {
+@@ -730,7 +333,7 @@ impl Scenario for BasicMultiClientSmoke {
+ }
+ 
+ #[derive(Debug, Clone, Copy)]
+-struct PostgresOutageMultiClientRecovery;
++pub(super) struct PostgresOutageMultiClientRecovery;
+ 
+ impl Scenario for PostgresOutageMultiClientRecovery {
+     fn definition(&self) -> ScenarioDefinition {
+@@ -812,7 +415,7 @@ impl Scenario for PostgresOutageMultiClientRecovery {
+ }
+ 
+ #[derive(Debug, Clone, Copy)]
+-struct RustfsOutageMultiClientRecovery;
++pub(super) struct RustfsOutageMultiClientRecovery;
+ 
+ impl Scenario for RustfsOutageMultiClientRecovery {
+     fn definition(&self) -> ScenarioDefinition {
+@@ -893,7 +496,7 @@ impl Scenario for RustfsOutageMultiClientRecovery {
+ }
+ 
+ #[derive(Debug, Clone, Copy)]
+-struct MountedClientCrashRestartRecovery;
++pub(super) struct MountedClientCrashRestartRecovery;
+ 
+ impl Scenario for MountedClientCrashRestartRecovery {
+     fn definition(&self) -> ScenarioDefinition {
+@@ -2204,7 +1807,7 @@ fn write_crash_restart_operation(
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+ #[serde(rename_all = "snake_case")]
+-enum NamespaceCollisionKind {
++pub(super) enum NamespaceCollisionKind {
+     RenameVsRename,
+     RenameVsUnlink,
+     UnlinkVsAppend,
+@@ -2266,12 +1869,12 @@ impl NamespaceCollisionKind {
+ }
+ 
+ #[derive(Debug, Clone, Copy)]
+-struct NamespaceCollisionScenario {
++pub(super) struct NamespaceCollisionScenario {
+     kind: NamespaceCollisionKind,
+ }
+ 
+ impl NamespaceCollisionScenario {
+-    fn new(kind: NamespaceCollisionKind) -> Self {
++    pub(super) fn new(kind: NamespaceCollisionKind) -> Self {
+         Self { kind }
+     }
+ }
+@@ -3247,7 +2850,7 @@ impl ScenarioIsolation {
+ }
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+-enum AdvancedMountedKind {
++pub(super) enum AdvancedMountedKind {
+     CrashBeforeWriteAcceptance,
+     CrashAfterPartialWriteAcceptance,
+     CrashAfterFullWriteAcceptance,
+@@ -3369,12 +2972,12 @@ impl AdvancedMountedKind {
+ }
+ 
+ #[derive(Debug, Clone, Copy)]
+-struct AdvancedMountedScenario {
++pub(super) struct AdvancedMountedScenario {
+     kind: AdvancedMountedKind,
+ }
+ 
+ impl AdvancedMountedScenario {
+-    fn new(kind: AdvancedMountedKind) -> Self {
++    pub(super) fn new(kind: AdvancedMountedKind) -> Self {
+         Self { kind }
+     }
+ }
+@@ -9902,8 +9505,8 @@ fn write_lww_oracle(
+ 
+ #[cfg(test)]
+ #[derive(Debug, Clone, Copy)]
+-struct TestFailingScenario {
+-    cleanup_fails: bool,
++pub(super) struct TestFailingScenario {
++    pub(super) cleanup_fails: bool,
+ }
+ 
+ #[cfg(test)]
+@@ -9946,7 +9549,7 @@ impl Scenario for TestFailingScenario {
+ 
+ #[cfg(test)]
+ #[derive(Debug, Clone, Copy)]
+-struct TestPassingScenario;
++pub(super) struct TestPassingScenario;
+ 
+ #[cfg(test)]
+ impl Scenario for TestPassingScenario {
+@@ -9987,6 +9590,7 @@ mod tests {
+ 
+     use super::*;
+     use crate::client::{ClientLifecycleState, ClientSpec, S3Config, client_spec_for};
++    use crate::scenario::{available_scenarios, resolve_scenario};
+ 
+     fn test_isolation(root: &str) -> ScenarioIsolation {
+         ScenarioIsolation {
+diff --git a/crates/studiofs/tests/architecture_vocabulary_test.rs b/crates/studiofs/tests/architecture_vocabulary_test.rs
+index ea3610fe..cc281b72 100644
+--- a/crates/studiofs/tests/architecture_vocabulary_test.rs
++++ b/crates/studiofs/tests/architecture_vocabulary_test.rs
+@@ -106,6 +106,35 @@ fn diagnostics_public_module_stays_a_facade() {
+     );
+ }
+ 
++#[test]
++fn e2e_scenario_module_stays_split_by_responsibility() {
++    let repo = repo_root();
++    let legacy_monolith = repo.join("crates/studiofs-e2e/src/scenario.rs");
++    let module_dir = repo.join("crates/studiofs-e2e/src/scenario");
++
++    assert!(
++        !legacy_monolith.exists(),
++        "studiofs-e2e scenario code should live in focused scenario/ modules, not scenario.rs"
++    );
++    assert!(
++        module_dir.join("mod.rs").exists(),
++        "scenario module facade should live at crates/studiofs-e2e/src/scenario/mod.rs"
++    );
++
++    for module in [
++        "registry.rs",
++        "types.rs",
++        "actions.rs",
++        "faults.rs",
++        "assertions.rs",
++    ] {
++        assert!(
++            module_dir.join(module).exists(),
++            "missing focused scenario submodule {module}"
++        );
++    }
++}
++
+ fn collect_term_hits_outside_test_modules(path: &str, terms: &[&str]) -> Vec<String> {
+     let contents = read_workspace_file(path);
+     let filtered = strip_cfg_test_items(&contents);
