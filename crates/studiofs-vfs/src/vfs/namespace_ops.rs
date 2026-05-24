@@ -173,6 +173,9 @@ impl StudioVfs {
                 candidate_old_attr.as_ref().is_some_and(|old_attr| {
                     args.size.is_some_and(|new_size| new_size > old_attr.size)
                         && setattr_args_are_size_only(&args)
+                        && !Self::needs_epoch_finalization(old_attr)
+                        && !self.inode_has_materialized_publish_work(ino, old_attr.content_epoch)
+                        && !self.inode_has_unmaterialized_overlay_for_finalize(ino)
                 });
             let old_attr = if defer_strict_flush_for_growth {
                 candidate_old_attr.expect("candidate attr present for deferred growth")
@@ -210,17 +213,8 @@ impl StudioVfs {
                     )?);
                     requeue_retained_uploads = true;
                 } else {
-                    let has_publish_work_for_current_epoch = self
-                        .pending_uploads_for_inode(ino)
-                        .iter()
-                        .any(|(_, _, content_epoch)| *content_epoch == attr.content_epoch)
-                        || self
-                            .state
-                            .upload
-                            .pending_epoch_finalizations
-                            .lock()
-                            .iter()
-                            .any(|pending| pending.0 == ino && pending.1 == attr.content_epoch);
+                    let has_publish_work_for_current_epoch = Self::needs_epoch_finalization(&attr)
+                        || self.inode_has_materialized_publish_work(ino, attr.content_epoch);
                     if has_publish_work_for_current_epoch {
                         self.begin_size_change_incarnation(ino, &mut attr);
                         requeue_retained_uploads = true;
@@ -301,6 +295,30 @@ impl StudioVfs {
         drop(session);
         self.state.file_session.gc_if_idle(ino);
         result
+    }
+
+    fn inode_has_materialized_publish_work(&self, ino: Ino, content_epoch: u64) -> bool {
+        self.pending_uploads_for_inode(ino)
+            .iter()
+            .any(|(_, _, pending_epoch)| *pending_epoch == content_epoch)
+            || self
+                .sync_meta()
+                .has_local_regular_file_overlay(ino)
+                .unwrap_or_else(|error| {
+                    warn!(
+                        ino,
+                        error = %error,
+                        "failed to inspect local regular-file overlay before size growth"
+                    );
+                    true
+                })
+            || self
+                .state
+                .upload
+                .pending_epoch_finalizations
+                .lock()
+                .iter()
+                .any(|pending| pending.0 == ino && pending.1 == content_epoch)
     }
 
     fn rollback_failed_size_change_setattr(

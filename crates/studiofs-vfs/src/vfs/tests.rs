@@ -3490,7 +3490,7 @@ fn write_through_sparse_extend_requeues_all_retained_overlay_uploads() {
             .expect("create sparse file");
         let ino = attr.ino;
         let head = b"sparse-head";
-        let tail = b"sparse-tail-range";
+        let tail = vec![b't'; 258];
         let tail_offset = 1_048_569u64;
         let logical_size = 2_097_275u64;
 
@@ -3515,7 +3515,7 @@ fn write_through_sparse_extend_requeues_all_retained_overlay_uploads() {
             tail_fh,
             ino,
             tail_offset,
-            tail,
+            &tail,
             LocalSyncPolicy::WriteThrough,
         )
         .await
@@ -3588,6 +3588,136 @@ fn write_through_sparse_extend_requeues_all_retained_overlay_uploads() {
         );
 
         vfs.release_fh(grow_fh).await.expect("release grow writer");
+    });
+}
+
+#[test]
+fn sparse_extend_requeues_retained_overlay_when_runtime_upload_queue_is_empty() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sparse-extend-retains-metadata-overlay");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sparse-extend-retains-metadata-overlay.bin", 0, 0, 0o644)
+            .expect("create sparse file");
+        let ino = attr.ino;
+        let head = b"sparse-head";
+        let tail = b"sparse-tail-range";
+        let tail_offset = u64::from(vfs.block_size) + 7;
+        let logical_size = u64::from(vfs.block_size) * 2 + 123;
+
+        vfs.write(ino, 0, head)
+            .await
+            .expect("write sparse head");
+        vfs.write(ino, tail_offset, tail)
+            .await
+            .expect("write sparse tail");
+        vfs.flush(ino).await.expect("flush sparse overlay");
+
+        let retained_objects = meta
+            .lookup_regular_file_slices(ino, 0, tail_offset + tail.len() as u64)
+            .expect("lookup retained overlay")
+            .into_iter()
+            .filter_map(|span| span.payload.map(|payload| payload.object_id))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(retained_objects.len(), 2);
+        let payload_epoch = meta.get_attr(ino).expect("load payload attr").content_epoch;
+
+        vfs.cancel_pending_uploads_for_inode(ino);
+        assert!(
+            vfs.pending_uploads_for_inode(ino).is_empty(),
+            "setup models the post-PUT window where metadata overlay exists but the runtime queue is empty"
+        );
+
+        vfs.setattr(ino, SetattrArgs::size_only(logical_size))
+            .expect("extend logical EOF");
+
+        let extended_attr = meta.get_attr(ino).expect("load extended attr");
+        assert!(
+            extended_attr.content_epoch > payload_epoch,
+            "size growth over retained overlay metadata must advance to a fresh content epoch"
+        );
+        let pending_after_extend = vfs.pending_uploads_for_inode(ino);
+        let pending_object_ids = pending_after_extend
+            .iter()
+            .map(|(_, object_id, _)| *object_id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            pending_object_ids, retained_objects,
+            "set_len must requeue retained overlay objects even when the runtime queue was empty"
+        );
+        assert!(
+            pending_after_extend
+                .iter()
+                .all(|(_, _, content_epoch)| *content_epoch == extended_attr.content_epoch),
+            "retained uploads must be queued under the size-change epoch"
+        );
+    });
+}
+
+#[test]
+fn chunk_boundary_sparse_extend_requeues_retained_overlay_when_runtime_queue_is_empty() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) =
+        make_unstarted_test_vfs(&tmp, "chunk-boundary-sparse-extend-retains-overlay");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(
+                1,
+                b"chunk-boundary-sparse-extend-retains-overlay.bin",
+                0,
+                0,
+                0o644,
+            )
+            .expect("create sparse file");
+        let ino = attr.ino;
+        let head = b"sparse-head";
+        let tail = b"sparse-tail-range-crossing-chunk-boundary";
+        let tail_offset = DEFAULT_CHUNK_SIZE as u64 - 7;
+        let logical_size = DEFAULT_CHUNK_SIZE as u64 * 2 + 123;
+
+        vfs.write(ino, 0, head).await.expect("write sparse head");
+        vfs.write(ino, tail_offset, tail)
+            .await
+            .expect("write cross-chunk sparse tail");
+        vfs.flush(ino).await.expect("flush sparse overlay");
+
+        let retained_objects = meta
+            .lookup_regular_file_slices(ino, 0, tail_offset + tail.len() as u64)
+            .expect("lookup retained overlay")
+            .into_iter()
+            .filter_map(|span| span.payload.map(|payload| payload.object_id))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            retained_objects.len(),
+            3,
+            "setup should retain head and both cross-chunk tail payload fragments"
+        );
+        let payload_epoch = meta.get_attr(ino).expect("load payload attr").content_epoch;
+
+        vfs.cancel_pending_uploads_for_inode(ino);
+        assert!(vfs.pending_uploads_for_inode(ino).is_empty());
+
+        vfs.setattr(ino, SetattrArgs::size_only(logical_size))
+            .expect("extend logical EOF");
+
+        let extended_attr = meta.get_attr(ino).expect("load extended attr");
+        assert!(
+            extended_attr.content_epoch > payload_epoch,
+            "chunk-boundary size growth over retained overlay must advance epoch"
+        );
+        let pending_object_ids = vfs
+            .pending_uploads_for_inode(ino)
+            .iter()
+            .map(|(_, object_id, _)| *object_id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            pending_object_ids, retained_objects,
+            "set_len must requeue retained cross-chunk overlay objects"
+        );
     });
 }
 

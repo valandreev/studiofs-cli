@@ -578,6 +578,7 @@ where
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_secs() as i64)
             .unwrap_or(0);
+        let mut finalize_content_epoch = op.content_epoch;
         let keep_local_object = if self
             .meta
             .has_regular_file_overlay_object_if_matches(op.ino, op.content_epoch, op.object_id)
@@ -591,17 +592,39 @@ where
                 )
                 .await?
         } else {
-            self.shutdown.record_canceled_stale_after_put(payload_len);
-            self.meta
-                .add_pending_deletion(op.object_id, timestamp)
-                .await?;
-            false
+            let latest_attr = self.meta.get_attr(op.ino).await?;
+            if let Some(latest_attr) = latest_attr
+                && latest_attr.content_epoch != op.content_epoch
+                && self
+                    .meta
+                    .has_regular_file_overlay_object_if_matches(
+                        op.ino,
+                        latest_attr.content_epoch,
+                        op.object_id,
+                    )
+                    .await?
+            {
+                finalize_content_epoch = latest_attr.content_epoch;
+                self.meta
+                    .mark_regular_file_overlay_object_uploaded_if_matches(
+                        op.ino,
+                        latest_attr.content_epoch,
+                        op.object_id,
+                    )
+                    .await?
+            } else {
+                self.shutdown.record_canceled_stale_after_put(payload_len);
+                self.meta
+                    .add_pending_deletion(op.object_id, timestamp)
+                    .await?;
+                false
+            }
         };
         self.coordinator.complete_upload(op);
 
         self.policy.refresh_incarnation_state(op.ino).await;
         self.policy
-            .finalize_completed_upload_epoch(op.ino, op.content_epoch)
+            .finalize_completed_upload_epoch(op.ino, finalize_content_epoch)
             .await;
         self.policy.clear_upload_sticky_error(op.ino);
         self.policy
@@ -1838,6 +1861,7 @@ mod tests {
         visibility: Arc<Mutex<RemoteVisibility>>,
         upload_result: Arc<Mutex<Option<UploadPutOutcome>>>,
         remove_overlay_after_upload: Arc<Mutex<Option<(FakeMeta, Ino, u64)>>>,
+        advance_epoch_after_upload: Arc<Mutex<Option<(FakeMeta, Ino, u64)>>>,
         mark_deleted_after_upload: Arc<Mutex<Option<(FakeShutdown, Ino)>>>,
     }
 
@@ -1848,6 +1872,7 @@ mod tests {
                 visibility: Arc::new(Mutex::new(RemoteVisibility::NotVisible)),
                 upload_result: Arc::new(Mutex::new(Some(UploadPutOutcome::Uploaded))),
                 remove_overlay_after_upload: Arc::new(Mutex::new(None)),
+                advance_epoch_after_upload: Arc::new(Mutex::new(None)),
                 mark_deleted_after_upload: Arc::new(Mutex::new(None)),
             }
         }
@@ -1889,6 +1914,13 @@ mod tests {
                 && let Some(objects) = meta.overlay_objects.lock().get_mut(&ino)
             {
                 objects.remove(&object_id);
+            }
+            if matches!(outcome, UploadPutOutcome::Uploaded)
+                && let Some((meta, ino, content_epoch)) =
+                    self.advance_epoch_after_upload.lock().take()
+                && let Some(Some(attr)) = meta.attrs.lock().get_mut(&ino)
+            {
+                attr.content_epoch = content_epoch;
             }
             if matches!(outcome, UploadPutOutcome::Uploaded)
                 && let Some((shutdown, ino)) = self.mark_deleted_after_upload.lock().take()
@@ -2424,6 +2456,50 @@ mod tests {
                 .canceled_stale_after_put_bytes
                 .load(Ordering::Relaxed),
             "remote stale payload".len() as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn process_upload_reconciles_post_put_stale_object_retained_by_new_epoch() {
+        let (processor, coordinator, local_payloads, meta, remote, shutdown, policy) =
+            processor_fixture();
+        let op = make_pending_upload();
+        let retained_epoch = op.content_epoch + 1;
+        coordinator.pending_inodes.lock().insert(op.ino);
+        meta.attrs
+            .lock()
+            .insert(op.ino, Some(make_attr(op.ino, op.content_epoch)));
+        meta.overlay_objects
+            .lock()
+            .insert(op.ino, HashSet::from([op.object_id]));
+        local_payloads
+            .upload_reads
+            .lock()
+            .insert(op.object_id, Some(Bytes::from_static(b"retained payload")));
+        *remote.advance_epoch_after_upload.lock() = Some((meta.clone(), op.ino, retained_epoch));
+
+        let outcome = processor.process_upload(op).await;
+
+        assert_eq!(outcome, UploadOutcome::Completed);
+        assert_eq!(coordinator.completed.lock().as_slice(), &[77]);
+        assert_eq!(
+            meta.uploaded_overlay_objects.lock().as_slice(),
+            &[(11, retained_epoch, 77)],
+            "a successful PUT for a retained object must satisfy the current epoch"
+        );
+        assert!(
+            meta.pending_deletions.lock().is_empty(),
+            "retained current-epoch payloads must not be scheduled for deletion"
+        );
+        assert_eq!(local_payloads.uploaded.lock().as_slice(), &[77]);
+        assert!(
+            local_payloads.removed.lock().is_empty(),
+            "retained current-epoch payloads must remain in the local backend"
+        );
+        assert_eq!(shutdown.canceled_stale_after_put.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            *policy.finalized_upload_epochs.lock(),
+            vec![(11, retained_epoch)]
         );
     }
 
