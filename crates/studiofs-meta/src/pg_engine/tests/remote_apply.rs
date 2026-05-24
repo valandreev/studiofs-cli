@@ -1,4 +1,5 @@
 use super::*;
+use crate::engine::MetaEngine;
 use crate::redb_engine::layout::encode_dentry_key;
 
 #[test]
@@ -529,6 +530,42 @@ fn foreign_unlink_during_active_open_handle_preserves_inode_binding() {
     assert!(!overlay.remove_attr_inodes.contains(&file.ino));
     assert!(!overlay.attr_inodes.contains(&file.ino));
     assert!(!overlay.block_inodes.contains(&file.ino));
+}
+
+#[test]
+fn active_open_handle_can_flush_dirty_attr_after_foreign_unlink() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+
+    let file = create_published_small_file(&pg, ROOT_INO, b"open-target.txt", 77_212);
+    let setup_end = pg.local.get_counter("nextEventSeq").expect("setup end");
+    pg.persist_flushed_event_seq(setup_end)
+        .expect("ack published setup");
+    pg.note_active_open_inode(file.ino);
+
+    let overlay = pg.local_overlay_conflicts().expect("overlay conflicts");
+    let batch = [
+        MetaEvent::RemoveEntry {
+            parent: ROOT_INO,
+            name: b"open-target.txt".to_vec(),
+        },
+        MetaEvent::RemoveAttr { ino: file.ino },
+    ];
+    apply_foreign_batch(&pg, &batch, &overlay, &HashSet::new()).expect("apply foreign unlink");
+
+    let mut dirty_attr = pg
+        .get_attr(file.ino)
+        .expect("active open handle keeps attr visible");
+    dirty_attr.size += 7;
+    dirty_attr.committed_size = dirty_attr.size;
+    dirty_attr.touch_mtime();
+
+    pg.flush_regular_file_overlay_slices_with_attr(file.ino, &[], Some(&dirty_attr))
+        .expect("dirty attr flush after active foreign unlink");
+
+    assert_eq!(
+        pg.get_attr(file.ino).expect("attr after dirty flush").size,
+        dirty_attr.size
+    );
 }
 
 #[test]

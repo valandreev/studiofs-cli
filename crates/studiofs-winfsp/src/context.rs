@@ -1203,7 +1203,12 @@ impl FileSystemContext for StudioFsContext {
         context: &Self::FileContext,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
-        let attr = self.vfs.getattr(context.ino).map_err(vfs_to_winfsp_err)?;
+        let attr = self
+            .vfs
+            .peek_dirty_attr(context.ino)
+            .map(Ok)
+            .unwrap_or_else(|| self.vfs.getattr(context.ino))
+            .map_err(vfs_to_winfsp_err)?;
         trace!(ino = context.ino, size = attr.size, "get_file_info");
         *file_info = attr_to_file_info(&attr);
         Ok(())
@@ -1658,7 +1663,12 @@ impl FileSystemContext for StudioFsContext {
             self.run_flush_callback(ctx.ino, ctx.fh)
                 .map_err(vfs_to_winfsp_err)?;
 
-            let attr = self.vfs.getattr(ctx.ino).map_err(vfs_to_winfsp_err)?;
+            let attr = self
+                .vfs
+                .peek_dirty_attr(ctx.ino)
+                .map(Ok)
+                .unwrap_or_else(|| self.vfs.getattr(ctx.ino))
+                .map_err(vfs_to_winfsp_err)?;
             *file_info = attr_to_file_info(&attr);
             debug!(ino = ctx.ino, "flush");
         } else {

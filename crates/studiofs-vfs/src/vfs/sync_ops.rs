@@ -1,8 +1,8 @@
 use super::{
     AccessLevel, DirtyAttrPersistPolicy, ExplicitFlushOutcome, FileSessionOperation, FileType,
     FsyncOutcome, HandleReleaseContext, Ino, LastHandleReleaseAction, LocalSyncBarrierOutcome,
-    LocalSyncPolicy, OpenFile, OpenFlags, ReleaseFhOutcome, StickyErrorPolicy, StudioVfs,
-    VfsResult,
+    LocalSyncPolicy, MetaError, OpenFile, OpenFlags, ReleaseFhOutcome, StickyErrorPolicy,
+    StudioVfs, VfsResult,
 };
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -793,14 +793,30 @@ impl StudioVfs {
             .enter_op(target_ino, FileSessionOperation::Flush)
             .await;
         let result: VfsResult<ExplicitFlushOutcome> = async {
-            let outcome = self
+            let outcome = match self
                 .local_sync_barrier_with_outcome(
                     target_ino,
                     LocalSyncPolicy::Opportunistic,
                     StickyErrorPolicy::Ignore,
                     DirtyAttrPersistPolicy::PersistIfPresent,
                 )
-                .await?;
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(VfsError::Meta(MetaError::InodeNotFound(_)))
+                    if self.inode_has_local_dirty_state(target_ino)
+                        || self.state.writer_stack.has_dirty_writers(target_ino) =>
+                {
+                    warn!(
+                        ino = target_ino,
+                        "WinFSP writeback flush kept local dirty state for removed inode"
+                    );
+                    return Ok(ExplicitFlushOutcome {
+                        flushed_local_dirty_state: true,
+                    });
+                }
+                Err(error) => return Err(error),
+            };
             Ok(ExplicitFlushOutcome {
                 flushed_local_dirty_state: outcome.had_local_dirty_state,
             })
@@ -897,14 +913,29 @@ impl StudioVfs {
                 self.fail_inline_dirty_attr_persist_for_test()?;
                 let meta = self.meta.clone();
                 let attr_to_persist = attr.clone();
-                let committed_attr = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+                let committed_attr = match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
                     engine.flush_regular_file_overlay_slices_with_attr(
                         ino,
                         &[],
                         Some(&attr_to_persist),
                     )
                 })
-                .await?;
+                .await
+                {
+                    Ok(committed_attr) => committed_attr,
+                    Err(VfsError::Meta(MetaError::InodeNotFound(_))) => {
+                        warn!(
+                            ino,
+                            "dirty attr persist skipped because authoritative inode was removed"
+                        );
+                        return Ok(LocalSyncBarrierOutcome {
+                            had_local_dirty_state,
+                            flushed_file_data,
+                            persisted_dirty_attrs: false,
+                        });
+                    }
+                    Err(error) => return Err(error),
+                };
                 let committed_attr = committed_attr.as_ref().unwrap_or(&attr);
                 self.clear_matching_dirty_attr_if_committed(ino, committed_attr);
                 self.invalidate_attr_read_cache([ino]);
