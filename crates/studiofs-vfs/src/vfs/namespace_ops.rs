@@ -174,7 +174,6 @@ impl StudioVfs {
             let defer_strict_flush_for_growth =
                 candidate_old_attr.as_ref().is_some_and(|old_attr| {
                     args.size.is_some_and(|new_size| new_size > old_attr.size)
-                        && setattr_args_are_size_only(&args)
                         && (has_active_dirty_writer
                             || (!Self::needs_epoch_finalization(old_attr)
                                 && !self.inode_has_materialized_publish_work(
