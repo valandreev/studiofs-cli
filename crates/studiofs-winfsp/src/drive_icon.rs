@@ -58,18 +58,18 @@ fn set_drive_icon(letter: char, icon_path: &Path) -> std::io::Result<MountedDriv
         .and_then(|key| key.get_value::<String, _>("").ok());
     let (icon_key, _) = hkcu.create_subkey(&key_path)?;
     icon_key.set_value("", &icon_path.to_string_lossy().to_string())?;
-    icon_key.set_value(DRIVE_ICON_METADATA_SOURCE, &DRIVE_ICON_METADATA_MARKER)?;
     icon_key.set_value(DRIVE_ICON_METADATA_PID, &process::id())?;
+    icon_key.set_value(DRIVE_ICON_METADATA_SOURCE, &DRIVE_ICON_METADATA_MARKER)?;
     Ok(MountedDriveIcon { letter, previous })
 }
 
 fn restore_drive_icon(letter: char, previous: Option<String>) -> std::io::Result<()> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let key_path = format!(r"{DRIVE_ICON_KEY_ROOT}\{letter}\DefaultIcon");
-    let icon_key = hkcu.open_subkey_with_flags(&key_path, KEY_ALL_ACCESS)?;
 
     match previous {
         Some(value) => {
+            let icon_key = hkcu.open_subkey_with_flags(&key_path, KEY_ALL_ACCESS)?;
             icon_key.set_value("", &value)?;
             let _ = icon_key.delete_value(DRIVE_ICON_METADATA_SOURCE);
             let _ = icon_key.delete_value(DRIVE_ICON_METADATA_PID);
@@ -93,7 +93,7 @@ fn ensure_embedded_drive_icon_path() -> std::io::Result<PathBuf> {
 
     let icon_path = icon_dir.join(DRIVE_ICON_NAME);
     if !std::fs::metadata(&icon_path).is_ok_and(|meta| meta.len() == DRIVE_ICON_ICO.len() as u64)
-        || std::fs::read(&icon_path).ok() != Some(DRIVE_ICON_ICO.to_vec())
+        || std::fs::read(&icon_path).ok().as_deref() != Some(DRIVE_ICON_ICO)
     {
         std::fs::write(&icon_path, DRIVE_ICON_ICO)?;
     }
@@ -106,7 +106,7 @@ fn cleanup_orphaned_drive_icons(icon_path: &Path) {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let self_pid = process::id();
 
-    for letter in b'A'..=b'Z' {
+    for letter in 'A'..='Z' {
         let key_path = format!(r"{DRIVE_ICON_KEY_ROOT}\{letter}\DefaultIcon");
         let key = match hkcu.open_subkey(&key_path) {
             Ok(key) => key,
@@ -128,6 +128,7 @@ fn cleanup_orphaned_drive_icons(icon_path: &Path) {
         }
 
         if owning_pid.is_none_or(|pid| !is_process_alive(pid, self_pid)) {
+            drop(key);
             let _ = hkcu.delete_subkey_all(&key_path);
         }
     }
