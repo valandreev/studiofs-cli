@@ -13,6 +13,7 @@ use std::time::Instant;
 use buffers::{SendConstBuffer, SendMutBuffer};
 use futures::FutureExt;
 use handle_drain::{CallbackBarrierState, WinfspHandleDrainFacade};
+pub(crate) use invalidation::PreparedWinfspNotifications;
 pub use invalidation::WinfspKernelInvalidator;
 #[cfg(test)]
 use invalidation::{
@@ -1805,10 +1806,10 @@ mod tests {
         FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
         FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE, FILE_READ_ATTRIBUTES_ACCESS,
         FILE_READ_DATA_ACCESS, FILE_WRITE_ATTRIBUTES_ACCESS, FILE_WRITE_DATA_ACCESS,
-        FileSizeCallbackAction, READ_CONTROL_ACCESS, STATUS_ACCESS_DENIED, STATUS_DATA_ERROR,
-        STATUS_EA_TOO_LARGE, STATUS_INVALID_PARAMETER, STATUS_IO_TIMEOUT,
-        STATUS_OBJECT_NAME_NOT_FOUND, SYNCHRONIZE_ACCESS, StudioFileHandle, StudioFsContext,
-        WinfspKernelInvalidator, attr_to_file_info, build_basic_info_setattr_args,
+        FileSizeCallbackAction, PreparedWinfspNotifications, READ_CONTROL_ACCESS,
+        STATUS_ACCESS_DENIED, STATUS_DATA_ERROR, STATUS_EA_TOO_LARGE, STATUS_INVALID_PARAMETER,
+        STATUS_IO_TIMEOUT, STATUS_OBJECT_NAME_NOT_FOUND, SYNCHRONIZE_ACCESS, StudioFileHandle,
+        StudioFsContext, WinfspKernelInvalidator, attr_to_file_info, build_basic_info_setattr_args,
         build_notify_info, encode_symlink_reparse, hidden_non_macos_root_path_component,
         ino_to_windows_path, maybe_hide_non_macos_root_entry, notify_filter_for_kind,
         open_flags_from_access, resolve_create_callback_kind, resolve_file_size_callback_action,
@@ -3668,33 +3669,64 @@ mod tests {
 
     #[test]
     fn should_notify_drains_and_deduplicates_queue() {
-        let (_tmp, _vfs, ctx, queue) = make_test_context("notify_dedup");
-        queue.lock().extend([9, 2, 9, 7, 2]);
+        let (_tmp, vfs, ctx, queue) = make_test_context("notify_dedup");
+        let alpha = vfs
+            .create(ROOT_INO, b"alpha.txt", 0, 0, 0o644)
+            .expect("create alpha");
+        let beta = vfs
+            .create(ROOT_INO, b"beta.txt", 0, 0, 0o644)
+            .expect("create beta");
+        queue
+            .lock()
+            .extend([beta.ino, alpha.ino, beta.ino, alpha.ino]);
 
-        let first = <StudioFsContext as winfsp::notify::NotifyingFileSystemContext<Vec<u64>>>::should_notify(&ctx);
-        assert_eq!(first, Some(vec![2, 7, 9]));
+        let first = <StudioFsContext as winfsp::notify::NotifyingFileSystemContext<
+            PreparedWinfspNotifications,
+        >>::should_notify(&ctx)
+        .expect("prepared notifications");
+        assert_eq!(
+            first
+                .iter()
+                .map(|notification| notification.ino)
+                .collect::<Vec<_>>(),
+            vec![alpha.ino, beta.ino]
+        );
         assert!(
             queue.lock().is_empty(),
             "queue should be drained after should_notify"
         );
 
-        let second = <StudioFsContext as winfsp::notify::NotifyingFileSystemContext<Vec<u64>>>::should_notify(&ctx);
-        assert_eq!(second, None);
+        let second = <StudioFsContext as winfsp::notify::NotifyingFileSystemContext<
+            PreparedWinfspNotifications,
+        >>::should_notify(&ctx);
+        assert!(second.is_none());
     }
 
     #[test]
     fn should_notify_preserves_queue_capacity_after_drain() {
-        let (_tmp, _vfs, ctx, queue) = make_test_context("notify_capacity");
+        let (_tmp, vfs, ctx, queue) = make_test_context("notify_capacity");
+        let file = vfs
+            .create(ROOT_INO, b"capacity.txt", 0, 0, 0o644)
+            .expect("create file");
         {
             let mut queue = queue.lock();
             queue.reserve(32);
-            queue.extend([9, 2, 9, 7, 2]);
+            queue.extend([file.ino, file.ino]);
         }
         let capacity_before = queue.lock().capacity();
 
-        let drained = <StudioFsContext as winfsp::notify::NotifyingFileSystemContext<Vec<u64>>>::should_notify(&ctx);
+        let drained = <StudioFsContext as winfsp::notify::NotifyingFileSystemContext<
+            PreparedWinfspNotifications,
+        >>::should_notify(&ctx)
+        .expect("prepared notifications");
 
-        assert_eq!(drained, Some(vec![2, 7, 9]));
+        assert_eq!(
+            drained
+                .iter()
+                .map(|notification| notification.ino)
+                .collect::<Vec<_>>(),
+            vec![file.ino]
+        );
         assert!(
             queue.lock().capacity() >= capacity_before,
             "draining should preserve the queue allocation for future invalidations"

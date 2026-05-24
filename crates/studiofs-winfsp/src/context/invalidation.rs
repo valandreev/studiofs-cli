@@ -43,6 +43,15 @@ pub(super) fn build_notify_info(path: &str, kind: FileType) -> Option<NotifyInfo
     Some(info)
 }
 
+#[derive(Debug)]
+pub(crate) struct PreparedWinfspNotify {
+    pub(super) ino: Ino,
+    pub(super) path: String,
+    pub(super) info: NotifyInfo<512>,
+}
+
+pub(crate) type PreparedWinfspNotifications = Vec<PreparedWinfspNotify>;
+
 /// Resolve an inode number to a Windows-style path (`\dir\file`) by walking
 /// the parent chain. Returns `None` if the inode or any ancestor no longer
 /// exists (e.g. already deleted).
@@ -74,8 +83,8 @@ impl KernelInvalidator for WinfspKernelInvalidator {
     }
 }
 
-impl NotifyingFileSystemContext<Vec<Ino>> for StudioFsContext {
-    fn should_notify(&self) -> Option<Vec<Ino>> {
+impl NotifyingFileSystemContext<PreparedWinfspNotifications> for StudioFsContext {
+    fn should_notify(&self) -> Option<PreparedWinfspNotifications> {
         let mut queue = self.invalidation_queue.lock();
         if queue.is_empty() {
             return None;
@@ -86,11 +95,10 @@ impl NotifyingFileSystemContext<Vec<Ino>> for StudioFsContext {
         let mut inodes = std::mem::replace(&mut *queue, replacement);
         inodes.sort_unstable();
         inodes.dedup();
-        Some(inodes)
-    }
+        drop(queue);
 
-    fn notify(&self, inodes: Vec<Ino>, notifier: &Notifier) {
         let meta = self.vfs.meta();
+        let mut notifications = Vec::with_capacity(inodes.len());
         for ino in &inodes {
             let Some(path) = ino_to_windows_path(&self.vfs, *ino) else {
                 trace!(ino, "skipping notify - inode no longer resolvable");
@@ -106,8 +114,23 @@ impl NotifyingFileSystemContext<Vec<Ino>> for StudioFsContext {
                 warn!(ino, path, "notify path too long, skipping");
                 continue;
             };
-            notifier.notify(&info);
-            debug!(ino, path, "WinFSP notify sent");
+            notifications.push(PreparedWinfspNotify {
+                ino: *ino,
+                path,
+                info,
+            });
+        }
+        (!notifications.is_empty()).then_some(notifications)
+    }
+
+    fn notify(&self, notifications: PreparedWinfspNotifications, notifier: &Notifier) {
+        for notification in &notifications {
+            notifier.notify(&notification.info);
+            debug!(
+                ino = notification.ino,
+                path = %notification.path,
+                "WinFSP notify sent"
+            );
         }
     }
 }
