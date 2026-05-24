@@ -16,6 +16,10 @@ use studiofs_cache::upload_queue::PendingUpload;
 use studiofs_data::object::{
     CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, create_object_buffer, format_object_fragment_keys,
 };
+use studiofs_meta::schema::{
+    ChunkId, FileType, PayloadRef, PayloadRefState, ResolvedSliceSpan, SliceId, SliceOrder,
+    SliceRange, SliceRecord,
+};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -169,6 +173,30 @@ fn foreground_upload_reread_pacing_delay(foreground_active: bool, reread_bytes: 
     Duration::from_nanos(nanos)
 }
 
+fn spans_leave_range_uncovered(
+    spans: &[ResolvedSliceSpan],
+    expected_chunk: ChunkId,
+    expected_range: SliceRange,
+) -> bool {
+    let mut covered_until = expected_range.start;
+    for span in spans {
+        if span.chunk_id != expected_chunk {
+            continue;
+        }
+        let Some(intersection) = span.range.intersection(expected_range) else {
+            continue;
+        };
+        if intersection.start > covered_until || span.payload.is_some() {
+            return false;
+        }
+        covered_until = covered_until.max(intersection.end);
+        if covered_until >= expected_range.end {
+            return true;
+        }
+    }
+    false
+}
+
 trait CachedStorePort: Clone + Send + Sync + 'static {
     fn complete_upload(&self, op: &PendingUpload);
     fn requeue_upload(&self, op: PendingUpload) -> bool;
@@ -207,6 +235,15 @@ trait UploadMetaPort: Clone + Send + Sync + 'static {
         expected_epoch: u64,
         object_id: u64,
     ) -> VfsResult<bool>;
+    async fn reattach_uploaded_object_if_uncovered(
+        &self,
+        ino: Ino,
+        content_epoch: u64,
+        object_id: u64,
+        offset: u64,
+        payload_len: u64,
+        block_size: u32,
+    ) -> VfsResult<Option<u64>>;
     async fn add_pending_deletion(&self, object_id: u64, timestamp: i64) -> VfsResult<()>;
 }
 
@@ -612,6 +649,20 @@ where
                         op.object_id,
                     )
                     .await?
+            } else if let Some(rebased_epoch) = self
+                .meta
+                .reattach_uploaded_object_if_uncovered(
+                    op.ino,
+                    op.content_epoch,
+                    op.object_id,
+                    op.offset,
+                    payload_len,
+                    self.block_size,
+                )
+                .await?
+            {
+                finalize_content_epoch = rebased_epoch;
+                true
             } else {
                 self.shutdown.record_canceled_stale_after_put(payload_len);
                 self.meta
@@ -1046,6 +1097,85 @@ impl UploadMetaPort for VfsUploadMetaPort {
                 expected_epoch,
                 object_id,
             )
+        })
+        .await
+    }
+
+    async fn reattach_uploaded_object_if_uncovered(
+        &self,
+        ino: Ino,
+        content_epoch: u64,
+        object_id: u64,
+        offset: u64,
+        payload_len: u64,
+        block_size: u32,
+    ) -> VfsResult<Option<u64>> {
+        if payload_len == 0 {
+            return Ok(None);
+        }
+        let block_size_u64 = u64::from(block_size);
+        let Some(end_offset) = offset.checked_add(payload_len) else {
+            return Ok(None);
+        };
+        let chunk_index = block_index_from_offset(offset, block_size);
+        let chunk_start = offset % block_size_u64;
+        let Some(chunk_end) = chunk_start.checked_add(payload_len) else {
+            return Ok(None);
+        };
+        let Ok(chunk_start) = u32::try_from(chunk_start) else {
+            return Ok(None);
+        };
+        let Ok(chunk_end) = u32::try_from(chunk_end) else {
+            return Ok(None);
+        };
+        let Some(range) = SliceRange::new(chunk_start, chunk_end) else {
+            return Ok(None);
+        };
+        let Ok(payload_len_u32) = u32::try_from(payload_len) else {
+            return Ok(None);
+        };
+        let chunk_id = ChunkId(u64::from(chunk_index));
+        let meta = self.vfs.meta.clone();
+        run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+            let latest_attr = match engine.get_attr(ino) {
+                Ok(attr) => attr,
+                Err(studiofs_meta::MetaError::InodeNotFound(_)) => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            if latest_attr.kind != FileType::RegularFile || latest_attr.size < end_offset {
+                return Ok(None);
+            }
+
+            let spans = engine.lookup_regular_file_slices(ino, offset, payload_len)?;
+            if !spans_leave_range_uncovered(&spans, chunk_id, range) {
+                return Ok(None);
+            }
+
+            let mut rebased_attr = latest_attr;
+            let rebased_epoch = if content_epoch > rebased_attr.content_epoch {
+                content_epoch
+            } else {
+                let Some(next_epoch) = rebased_attr.content_epoch.checked_add(1) else {
+                    return Ok(None);
+                };
+                next_epoch
+            };
+            rebased_attr.content_epoch = rebased_epoch;
+            rebased_attr.touch_mtime();
+
+            let payload = if payload_len_u32 == block_size {
+                PayloadRef::new_full(object_id, payload_len_u32)
+            } else {
+                PayloadRef::new_partial(object_id, payload_len_u32)
+            };
+            let mut slice = SliceRecord::new(SliceId(0), SliceOrder(0), range, payload);
+            slice.payload_state = PayloadRefState::Uploaded;
+            let applied = engine.flush_regular_file_overlay_slices_with_attr(
+                ino,
+                &[(chunk_id, vec![slice])],
+                Some(&rebased_attr),
+            )?;
+            Ok(applied.map(|attr| attr.content_epoch))
         })
         .await
     }
@@ -1664,8 +1794,8 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use studiofs_data::DataStoreConfig;
-    use studiofs_meta::schema::{CURRENT_FORMAT_VERSION, FormatInfo, MetadataConfig};
-    use studiofs_meta::{MetaFormat, RedbMetaEngine};
+    use studiofs_meta::schema::{CURRENT_FORMAT_VERSION, FormatInfo, MetadataConfig, UploadState};
+    use studiofs_meta::{MetaFormat, MetaInodes, MetaPayloadObjects, RedbMetaEngine};
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
 
@@ -1782,6 +1912,8 @@ mod tests {
         overlay_objects: Arc<Mutex<HashMap<Ino, HashSet<u64>>>>,
         pending_deletions: Arc<Mutex<Vec<u64>>>,
         uploaded_overlay_objects: Arc<Mutex<Vec<UploadedOverlayObjectRecord>>>,
+        reattached_uploads: Arc<Mutex<Vec<(Ino, u64, u64, u64, u64, u32)>>>,
+        reattach_epoch: Arc<Mutex<Option<u64>>>,
     }
 
     impl Default for FakeMeta {
@@ -1791,6 +1923,8 @@ mod tests {
                 overlay_objects: Arc::new(Mutex::new(HashMap::new())),
                 pending_deletions: Arc::new(Mutex::new(Vec::new())),
                 uploaded_overlay_objects: Arc::new(Mutex::new(Vec::new())),
+                reattached_uploads: Arc::new(Mutex::new(Vec::new())),
+                reattach_epoch: Arc::new(Mutex::new(None)),
             }
         }
     }
@@ -1847,6 +1981,26 @@ mod tests {
                     .push((ino, expected_epoch, object_id));
             }
             Ok(matches)
+        }
+
+        async fn reattach_uploaded_object_if_uncovered(
+            &self,
+            ino: Ino,
+            content_epoch: u64,
+            object_id: u64,
+            offset: u64,
+            payload_len: u64,
+            block_size: u32,
+        ) -> VfsResult<Option<u64>> {
+            self.reattached_uploads.lock().push((
+                ino,
+                content_epoch,
+                object_id,
+                offset,
+                payload_len,
+                block_size,
+            ));
+            Ok(*self.reattach_epoch.lock())
         }
 
         async fn add_pending_deletion(&self, object_id: u64, _timestamp: i64) -> VfsResult<()> {
@@ -2104,6 +2258,50 @@ mod tests {
         )
         .expect("create vfs");
         (rt, vfs, meta)
+    }
+
+    #[test]
+    fn vfs_upload_meta_reattaches_newer_stale_upload_when_latest_range_is_hole() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "reattach-newer-stale-upload");
+        let created = vfs
+            .create(1, b"reattach-newer-stale-upload.bin", 0, 0, 0o644)
+            .expect("create sparse file");
+        let mut ready_attr = created;
+        ready_attr.size = 2_097_275;
+        ready_attr.committed_size = ready_attr.size;
+        ready_attr.content_epoch = 2;
+        ready_attr.committed_content_epoch = 2;
+        ready_attr.upload_state = UploadState::Ready;
+        meta.set_attr(&ready_attr)
+            .expect("seed published sparse attr");
+
+        let port = VfsUploadMetaPort { vfs: vfs.clone() };
+        let rebased_epoch = rt
+            .block_on(port.reattach_uploaded_object_if_uncovered(
+                ready_attr.ino,
+                3,
+                6,
+                1_048_569,
+                262,
+                vfs.block_size,
+            ))
+            .expect("reattach uploaded payload");
+
+        assert_eq!(
+            rebased_epoch,
+            Some(3),
+            "a newer queued upload should be restored at its queued epoch when the latest graph still has a hole"
+        );
+        let attr = meta.get_attr(ready_attr.ino).expect("load rebased attr");
+        assert_eq!(attr.content_epoch, 3);
+        assert_eq!(attr.committed_content_epoch, 2);
+        assert_eq!(attr.size, ready_attr.size);
+        assert!(
+            meta.has_regular_file_overlay_object_if_matches(ready_attr.ino, 3, 6)
+                .expect("rebased overlay object present"),
+            "rebased upload must become the current overlay object"
+        );
     }
 
     fn processor_fixture() -> (
@@ -2456,6 +2654,61 @@ mod tests {
                 .canceled_stale_after_put_bytes
                 .load(Ordering::Relaxed),
             "remote stale payload".len() as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn process_upload_rebases_post_put_stale_object_when_latest_range_is_hole() {
+        let (processor, coordinator, local_payloads, meta, remote, shutdown, policy) =
+            processor_fixture();
+        let op = PendingUpload {
+            offset: 1024,
+            ..make_pending_upload()
+        };
+        let rebased_epoch = op.content_epoch + 1;
+        coordinator.pending_inodes.lock().insert(op.ino);
+        meta.attrs
+            .lock()
+            .insert(op.ino, Some(make_attr(op.ino, op.content_epoch)));
+        meta.overlay_objects
+            .lock()
+            .insert(op.ino, HashSet::from([op.object_id]));
+        local_payloads.upload_reads.lock().insert(
+            op.object_id,
+            Some(Bytes::from_static(b"rebased stale payload")),
+        );
+        *meta.reattach_epoch.lock() = Some(rebased_epoch);
+        *remote.remove_overlay_after_upload.lock() = Some((meta.clone(), op.ino, op.object_id));
+
+        let outcome = processor.process_upload(op.clone()).await;
+
+        assert_eq!(outcome, UploadOutcome::Completed);
+        assert_eq!(coordinator.completed.lock().as_slice(), &[77]);
+        assert_eq!(
+            meta.reattached_uploads.lock().as_slice(),
+            &[(
+                op.ino,
+                op.content_epoch,
+                op.object_id,
+                op.offset,
+                "rebased stale payload".len() as u64,
+                4096
+            )],
+            "post-PUT stale payloads should be offered for same/newer-epoch rebase before deletion"
+        );
+        assert!(
+            meta.pending_deletions.lock().is_empty(),
+            "rebased payload must not be queued for deletion"
+        );
+        assert_eq!(local_payloads.uploaded.lock().as_slice(), &[77]);
+        assert!(
+            local_payloads.removed.lock().is_empty(),
+            "rebased payload must remain available locally"
+        );
+        assert_eq!(shutdown.canceled_stale_after_put.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            *policy.finalized_upload_epochs.lock(),
+            vec![(op.ino, rebased_epoch)]
         );
     }
 
