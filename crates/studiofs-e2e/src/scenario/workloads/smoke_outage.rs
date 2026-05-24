@@ -909,11 +909,10 @@ pub(in crate::scenario) fn perform_postgres_writer_outage_operation(
         .append(true)
         .open(context.scenario_dir.join("operations.ndjson"))?;
     let mounted_path = client.mount_point.join(relative);
-    let write_result = bounded_mounted_write(
+    let write_result = write_mounted_file_without_barrier_with_readback(
         mounted_path.clone(),
-        payload.to_vec(),
-        format!("postgres outage writer write {}", mounted_path.display()),
-        MOUNTED_WRITE_READBACK_TIMEOUT,
+        payload,
+        "postgres outage writer write",
     );
     let error = write_result.err().map(|err| err.to_string());
     let operation_accepted = error.is_none();

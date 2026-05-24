@@ -105,10 +105,7 @@ impl<'a> StartupReplayCoordinator<'a> {
             self.classify_pending_uploads_for_attr(attr, graph_objects.as_slice());
         }
 
-        if has_pending_uploads
-            && graph_objects.is_empty()
-            && Self::is_lost_unpublished_regular_upload(attr)
-        {
+        if graph_objects.is_empty() && Self::is_lost_unpublished_regular_upload(attr) {
             self.lost_unpublished_upload_inodes.insert(ino);
             return;
         }

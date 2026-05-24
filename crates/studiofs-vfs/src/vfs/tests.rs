@@ -693,6 +693,61 @@ fn startup_replay_removes_lost_unpublished_upload_inode_without_payload_graph() 
 }
 
 #[test]
+fn startup_replay_removes_lost_unpublished_upload_inode_after_orphan_payload_cleanup() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "startup-lost-unpublished-orphan");
+
+    let created = vfs
+        .create(1, b"startup-lost-unpublished-orphan.bin", 0, 0, 0o644)
+        .expect("create test file");
+    let ino = created.ino;
+    let orphan_object_id = 7_002;
+    let mut attr = meta.get_attr(ino).expect("load test attr");
+    attr.size = 48;
+    attr.committed_size = 0;
+    attr.content_epoch = 1;
+    attr.committed_content_epoch = 0;
+    attr.upload_state = MetaUploadState::Uploading;
+    meta.set_attr(&attr).expect("persist staged attr");
+
+    vfs.local_payload_backend()
+        .put(orphan_object_id, b"lost-unpublished-payload", false)
+        .expect("persist orphan dirty payload");
+    vfs.local_payload_backend()
+        .sync_data()
+        .expect("sync orphan dirty payload");
+
+    assert!(
+        vfs.cached_store().snapshot_pending_uploads().is_empty(),
+        "test setup should mirror a crash where pending upload catalog was lost"
+    );
+    assert!(
+        vfs.local_payload_backend()
+            .dirty_object_ids()
+            .contains(&orphan_object_id),
+        "test setup should expose the unreferenced payload as dirty before replay"
+    );
+
+    vfs.replay_dirty_uploads_from_local_backend(&[], std::slice::from_ref(&attr));
+
+    assert!(
+        matches!(
+            meta.lookup(1, b"startup-lost-unpublished-orphan.bin"),
+            Err(MetaError::EntryNotFound { .. })
+        ),
+        "startup replay must remove the dentry after the payload was reduced to an orphan"
+    );
+    assert!(
+        matches!(meta.get_attr(ino), Err(MetaError::InodeNotFound(_))),
+        "startup replay should remove a lost unpublished inode even when no pending upload survived"
+    );
+    assert!(
+        !vfs.local_payload_backend().contains(orphan_object_id),
+        "startup replay should still remove the orphan dirty payload"
+    );
+}
+
+#[test]
 fn upload_pipeline_runtime_events_only_emit_active_samples_and_transitions() {
     assert_eq!(
         StudioVfs::upload_pipeline_runtime_event(true, false, true),
