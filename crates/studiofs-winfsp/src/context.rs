@@ -50,6 +50,9 @@ use crate::{ensure_winfsp_runtime_loaded, ensure_winfsp_runtime_loaded_or_panic}
 const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0010;
 const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x0020;
+const FILE_ATTRIBUTE_READONLY: u32 = 0x0001;
+const FILE_ATTRIBUTE_HIDDEN: u32 = 0x0002;
+const FILE_ATTRIBUTE_SYSTEM: u32 = 0x0004;
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x0080;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
 const FILE_DIRECTORY_FILE_OPTION: u32 = 0x0000_0001;
@@ -86,13 +89,53 @@ const STATUS_ACCESS_DENIED: NTSTATUS = NTSTATUS(0xC000_0022_u32 as i32);
 const STATUS_NOT_A_REPARSE_POINT: NTSTATUS = NTSTATUS(0xC000_0275_u32 as i32);
 const STATUS_EA_TOO_LARGE: NTSTATUS = NTSTATUS(0xC000_0050_u32 as i32);
 const MAX_WINDOWS_COMPONENT_UTF16_UNITS: usize = 255;
+const VIRTUAL_ROOT_FILE_BASE_INO: Ino = Ino::MAX - 16;
+const VIRTUAL_ROOT_FILE_TIME: u64 = 116_444_736_000_000_000;
+const AUTORUN_INF_NAME: &str = "autorun.inf";
+const DRIVE_ICON_NAME: &str = "studiofs-drive.ico";
+const AUTORUN_INF_BYTES: &[u8] = b"[autorun]\r\nicon=studiofs-drive.ico\r\n";
+const DRIVE_ICON_ICO_BYTES: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../docs/branding/studiofs-logo-final/win/studiofs-drive.ico"
+));
 
 // ─── File Handle ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VirtualRootFile {
+    AutorunInf,
+    DriveIcon,
+}
+
+impl VirtualRootFile {
+    fn name(self) -> &'static str {
+        match self {
+            Self::AutorunInf => AUTORUN_INF_NAME,
+            Self::DriveIcon => DRIVE_ICON_NAME,
+        }
+    }
+
+    fn bytes(self) -> &'static [u8] {
+        match self {
+            Self::AutorunInf => AUTORUN_INF_BYTES,
+            Self::DriveIcon => DRIVE_ICON_ICO_BYTES,
+        }
+    }
+
+    fn ino(self) -> Ino {
+        VIRTUAL_ROOT_FILE_BASE_INO
+            + match self {
+                Self::AutorunInf => 1,
+                Self::DriveIcon => 2,
+            }
+    }
+}
 
 /// Per-open-file context.
 pub struct StudioFileHandle {
     ino: Ino,
     is_dir: bool,
+    virtual_root_file: Option<VirtualRootFile>,
     /// VFS file handle (0 for directories).
     fh: u64,
     /// Open flags derived from WinFSP `CreateOptions`.
@@ -126,9 +169,23 @@ impl StudioFileHandle {
         Self {
             ino,
             is_dir,
+            virtual_root_file: None,
             fh,
             open_flags,
             write_local_sync_policy,
+            dir_buffer: DirBuffer::new(),
+        }
+    }
+
+    fn new_virtual_root_file(virtual_root_file: VirtualRootFile, open_flags: OpenFlags) -> Self {
+        ensure_winfsp_runtime_loaded_or_panic();
+        Self {
+            ino: virtual_root_file.ino(),
+            is_dir: false,
+            virtual_root_file: Some(virtual_root_file),
+            fh: 0,
+            open_flags,
+            write_local_sync_policy: LocalSyncPolicy::Opportunistic,
             dir_buffer: DirBuffer::new(),
         }
     }
@@ -412,6 +469,61 @@ fn attr_to_file_info(attr: &InodeAttr) -> FileInfo {
     info.hard_links = if attr.nlink > 0 { attr.nlink } else { 1 };
 
     info
+}
+
+fn virtual_root_file_to_file_info(file: VirtualRootFile) -> FileInfo {
+    FileInfo {
+        file_size: file.bytes().len() as u64,
+        allocation_size: (file.bytes().len() as u64 + 4095) & !4095,
+        file_attributes: FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM,
+        creation_time: VIRTUAL_ROOT_FILE_TIME,
+        last_access_time: VIRTUAL_ROOT_FILE_TIME,
+        last_write_time: VIRTUAL_ROOT_FILE_TIME,
+        change_time: VIRTUAL_ROOT_FILE_TIME,
+        index_number: file.ino(),
+        hard_links: 1,
+        ..Default::default()
+    }
+}
+
+fn path_virtual_root_file(path: &U16CStr) -> Option<VirtualRootFile> {
+    let display_path = path.to_string_lossy();
+    let trimmed = display_path.trim_start_matches(['\\', '/']);
+    if trimmed.is_empty() || trimmed.contains(['\\', '/']) {
+        return None;
+    }
+
+    let normalized = trimmed.trim_end_matches([' ', '.']);
+    if normalized.eq_ignore_ascii_case(AUTORUN_INF_NAME) {
+        Some(VirtualRootFile::AutorunInf)
+    } else if normalized.eq_ignore_ascii_case(DRIVE_ICON_NAME) {
+        Some(VirtualRootFile::DriveIcon)
+    } else {
+        None
+    }
+}
+
+fn root_entry_virtual_root_file(name: &[u8]) -> Option<VirtualRootFile> {
+    if name.eq_ignore_ascii_case(AUTORUN_INF_NAME.as_bytes()) {
+        Some(VirtualRootFile::AutorunInf)
+    } else if name.eq_ignore_ascii_case(DRIVE_ICON_NAME.as_bytes()) {
+        Some(VirtualRootFile::DriveIcon)
+    } else {
+        None
+    }
+}
+
+fn copy_virtual_root_file(file: VirtualRootFile, offset: u64, buffer: &mut [u8]) -> u32 {
+    let bytes = file.bytes();
+    let offset = usize::try_from(offset).unwrap_or(usize::MAX);
+    if offset >= bytes.len() {
+        return 0;
+    }
+
+    let src = &bytes[offset..];
+    let len = src.len().min(buffer.len());
+    buffer[..len].copy_from_slice(&src[..len]);
+    len as u32
 }
 
 /// Convert Unix timestamp (nanoseconds since epoch) to Windows FILETIME (100ns since 1601-01-01).
@@ -1093,6 +1205,14 @@ impl FileSystemContext for StudioFsContext {
         security_descriptor: Option<&mut [c_void]>,
         resolve_reparse_points: impl FnOnce(&U16CStr) -> Option<FileSecurity>,
     ) -> winfsp::Result<FileSecurity> {
+        if let Some(file) = path_virtual_root_file(file_name) {
+            let sd_len = self.copy_sd_to_buffer(security_descriptor);
+            return Ok(FileSecurity {
+                reparse: false,
+                sz_security_descriptor: sd_len,
+                attributes: virtual_root_file_to_file_info(file).file_attributes,
+            });
+        }
         if maybe_hide_non_macos_root_path(&self.vfs, file_name)? {
             return Err(winfsp::FspError::from(STATUS_OBJECT_NAME_NOT_FOUND));
         }
@@ -1126,6 +1246,15 @@ impl FileSystemContext for StudioFsContext {
         granted_access: FILE_ACCESS_RIGHTS,
         file_info: &mut OpenFileInfo,
     ) -> winfsp::Result<Self::FileContext> {
+        if let Some(file) = path_virtual_root_file(file_name) {
+            let open_flags = open_flags_from_access(granted_access, create_options);
+            if open_flags_allow_write(open_flags) {
+                return Err(winfsp::FspError::from(STATUS_ACCESS_DENIED));
+            }
+            *file_info.as_mut() = virtual_root_file_to_file_info(file);
+            set_current_winfsp_open_disable_cache(false);
+            return Ok(StudioFileHandle::new_virtual_root_file(file, open_flags));
+        }
         if maybe_hide_non_macos_root_path(&self.vfs, file_name)? {
             return Err(winfsp::FspError::from(STATUS_OBJECT_NAME_NOT_FOUND));
         }
@@ -1155,6 +1284,9 @@ impl FileSystemContext for StudioFsContext {
     }
 
     fn close(&self, context: Self::FileContext) {
+        if context.virtual_root_file.is_some() {
+            return;
+        }
         debug!(ino = context.ino, fh = context.fh, "close");
         self.run_close_callback(context.ino, context.fh);
         drop(context);
@@ -1172,6 +1304,9 @@ impl FileSystemContext for StudioFsContext {
         extra_buffer_is_reparse_point: bool,
         file_info: &mut OpenFileInfo,
     ) -> winfsp::Result<Self::FileContext> {
+        if path_virtual_root_file(file_name).is_some() {
+            return Err(winfsp::FspError::from(STATUS_ACCESS_DENIED));
+        }
         if maybe_hide_non_macos_root_path(&self.vfs, file_name)? {
             return Err(winfsp::FspError::from(STATUS_OBJECT_NAME_NOT_FOUND));
         }
@@ -1203,6 +1338,10 @@ impl FileSystemContext for StudioFsContext {
         context: &Self::FileContext,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
+        if let Some(file) = context.virtual_root_file {
+            *file_info = virtual_root_file_to_file_info(file);
+            return Ok(());
+        }
         let attr = self
             .vfs
             .peek_dirty_attr(context.ino)
@@ -1220,6 +1359,9 @@ impl FileSystemContext for StudioFsContext {
         buffer: &mut [u8],
         offset: u64,
     ) -> winfsp::Result<u32> {
+        if let Some(file) = context.virtual_root_file {
+            return Ok(copy_virtual_root_file(file, offset, buffer));
+        }
         // Spawn the async read on a tokio worker thread so the WinFSP
         // dispatch thread doesn't participate in IO polling.
         let ino = context.ino;
@@ -1263,6 +1405,9 @@ impl FileSystemContext for StudioFsContext {
         constrained_io: bool,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<u32> {
+        if context.virtual_root_file.is_some() {
+            return Err(winfsp::FspError::from(STATUS_ACCESS_DENIED));
+        }
         self.vfs.note_winfsp_write_callback();
         let callback_started = Instant::now();
         // Resolve actual write offset.  Prefer the in-memory dirty attr (free)
@@ -1381,12 +1526,27 @@ impl FileSystemContext for StudioFsContext {
                 }
             }
 
+            // Add virtual root metadata files for Explorer drive-icon discovery.
+            if context.ino == ROOT_INO {
+                for file in [VirtualRootFile::AutorunInf, VirtualRootFile::DriveIcon] {
+                    let mut dir_info = DirInfo::<MAX_WINDOWS_COMPONENT_UTF16_UNITS>::new();
+                    let name_u16 = file.name().encode_utf16().collect::<Vec<_>>();
+                    if dir_info.set_name_raw(name_u16.as_slice()).is_ok() {
+                        *dir_info.file_info_mut() = virtual_root_file_to_file_info(file);
+                        let _ = lock.write(&mut dir_info);
+                    }
+                }
+            }
+
             // Add all directory entries
             let entries = self.vfs.readdir(context.ino).map_err(vfs_to_winfsp_err)?;
             debug!(ino = context.ino, count = entries.len(), "read_directory");
             let mut name_u16 = Vec::<u16>::new();
 
             for entry in &entries {
+                if context.ino == ROOT_INO && root_entry_virtual_root_file(&entry.name).is_some() {
+                    continue;
+                }
                 if maybe_hide_non_macos_root_entry(&self.vfs, context.ino, &entry.name)? {
                     continue;
                 }
@@ -1444,6 +1604,9 @@ impl FileSystemContext for StudioFsContext {
         _file_name: &U16CStr,
         delete_file: bool,
     ) -> winfsp::Result<()> {
+        if context.virtual_root_file.is_some() && delete_file {
+            return Err(winfsp::FspError::from(STATUS_ACCESS_DENIED));
+        }
         if delete_file && context.is_dir {
             let healed_orphans = self.heal_directory_orphans_for_delete(context.ino)?;
             let entries = self.vfs.readdir(context.ino).map_err(vfs_to_winfsp_err)?;
@@ -1461,6 +1624,9 @@ impl FileSystemContext for StudioFsContext {
     }
 
     fn cleanup(&self, context: &Self::FileContext, file_name: Option<&U16CStr>, flags: u32) {
+        if context.virtual_root_file.is_some() {
+            return;
+        }
         // Current dirty-handle ordering is:
         //   write/overwrite -> optional flush -> cleanup(non-delete) -> close -> release_fh
         //
@@ -1480,6 +1646,9 @@ impl FileSystemContext for StudioFsContext {
         _extra_buffer: Option<&[u8]>,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
+        if context.virtual_root_file.is_some() {
+            return Err(winfsp::FspError::from(STATUS_ACCESS_DENIED));
+        }
         self.vfs.note_winfsp_overwrite_callback();
         // `Overwrite` is an immediate EOF transition, not a backgroundable
         // flush barrier. Later reads/writes in the same open sequence depend on
@@ -1502,6 +1671,9 @@ impl FileSystemContext for StudioFsContext {
         _last_change_time: u64,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
+        if context.virtual_root_file.is_some() {
+            return Err(winfsp::FspError::from(STATUS_ACCESS_DENIED));
+        }
         self.execute_basic_info_callback(
             context.ino,
             build_basic_info_setattr_args(
@@ -1521,6 +1693,9 @@ impl FileSystemContext for StudioFsContext {
         set_allocation_size: bool,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
+        if context.virtual_root_file.is_some() {
+            return Err(winfsp::FspError::from(STATUS_ACCESS_DENIED));
+        }
         // WinFSP can call this with set_allocation_size=true to reserve
         // capacity without changing logical EOF. Rust's Windows stdlib also
         // uses a zero allocation-size request as the first truncation step for
@@ -1660,6 +1835,10 @@ impl FileSystemContext for StudioFsContext {
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
         if let Some(ctx) = context {
+            if let Some(file) = ctx.virtual_root_file {
+                *file_info = virtual_root_file_to_file_info(file);
+                return Ok(());
+            }
             self.run_flush_callback(ctx.ino, ctx.fh)
                 .map_err(vfs_to_winfsp_err)?;
 
@@ -1699,12 +1878,16 @@ impl AsyncFileSystemContext for StudioFsContext {
         buffer: &mut [u8],
         offset: u64,
     ) -> impl std::future::Future<Output = winfsp::Result<u32>> + Send {
+        let virtual_root_file = context.virtual_root_file;
         let ino = context.ino;
         let fh = context.fh;
         let open_flags = context.open_flags;
         let vfs = self.vfs.clone();
 
         async move {
+            if let Some(file) = virtual_root_file {
+                return Ok(copy_virtual_root_file(file, offset, buffer));
+            }
             match vfs.read_into_fh(fh, ino, offset, buffer).await {
                 Ok(n) => {
                     trace!(ino, fh, offset, n, open_flags = open_flags.bits(), "read");
@@ -1726,6 +1909,7 @@ impl AsyncFileSystemContext for StudioFsContext {
     ) -> impl std::future::Future<Output = winfsp::Result<u32>> + Send {
         self.vfs.note_winfsp_write_callback();
         let callback_started = Instant::now();
+        let virtual_root_file = context.virtual_root_file;
         let ino = context.ino;
         let fh = context.fh;
         let open_flags = context.open_flags;
@@ -1733,6 +1917,9 @@ impl AsyncFileSystemContext for StudioFsContext {
         let vfs = self.vfs.clone();
 
         async move {
+            if virtual_root_file.is_some() {
+                return Err(winfsp::FspError::from(STATUS_ACCESS_DENIED));
+            }
             let pre_write_size =
                 pre_write_size_for_winfsp_write(&vfs, ino, write_to_eof, constrained_io)?;
             let actual_offset = if write_to_eof {
@@ -1822,9 +2009,11 @@ mod tests {
         StudioFsContext, WinfspKernelInvalidator, attr_to_file_info, build_basic_info_setattr_args,
         build_notify_info, encode_symlink_reparse, hidden_non_macos_root_path_component,
         ino_to_windows_path, maybe_hide_non_macos_root_entry, notify_filter_for_kind,
-        open_flags_from_access, resolve_create_callback_kind, resolve_file_size_callback_action,
+        open_flags_from_access, path_virtual_root_file, resolve_create_callback_kind,
+        resolve_file_size_callback_action, root_entry_virtual_root_file,
         should_disable_winfsp_file_cache, should_truncate_existing_file_on_open,
-        unix_nanos_to_filetime, vfs_to_winfsp_err, write_local_sync_policy_from_create_options,
+        unix_nanos_to_filetime, vfs_to_winfsp_err, virtual_root_file_to_file_info,
+        write_local_sync_policy_from_create_options,
     };
     use parking_lot::Mutex;
     use std::collections::BTreeSet;
@@ -1858,6 +2047,47 @@ mod tests {
     fn callback_plan_helpers_live_in_focused_module() {
         assert!(std::mem::size_of::<super::plans::CreateCallbackPlan>() > 0);
         assert!(std::mem::size_of::<super::plans::RenameCallbackPlan>() > 0);
+    }
+
+    #[test]
+    fn virtual_root_files_match_only_root_entries() {
+        assert_eq!(
+            path_virtual_root_file(&U16CString::from_str(r"\autorun.inf").unwrap()),
+            Some(super::VirtualRootFile::AutorunInf)
+        );
+        assert_eq!(
+            path_virtual_root_file(&U16CString::from_str(r"\STUDIOFS-DRIVE.ICO").unwrap()),
+            Some(super::VirtualRootFile::DriveIcon)
+        );
+        assert_eq!(
+            path_virtual_root_file(&U16CString::from_str(r"\docs\autorun.inf").unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn virtual_root_entries_shadow_real_root_names() {
+        assert_eq!(
+            root_entry_virtual_root_file(b"Autorun.Inf"),
+            Some(super::VirtualRootFile::AutorunInf)
+        );
+        assert_eq!(root_entry_virtual_root_file(b"docs"), None);
+    }
+
+    #[test]
+    fn virtual_root_file_info_is_hidden_readonly_system_file() {
+        let info = virtual_root_file_to_file_info(super::VirtualRootFile::AutorunInf);
+
+        assert_eq!(info.file_size, super::AUTORUN_INF_BYTES.len() as u64);
+        assert_eq!(
+            info.file_attributes
+                & (super::FILE_ATTRIBUTE_READONLY
+                    | super::FILE_ATTRIBUTE_HIDDEN
+                    | super::FILE_ATTRIBUTE_SYSTEM),
+            super::FILE_ATTRIBUTE_READONLY
+                | super::FILE_ATTRIBUTE_HIDDEN
+                | super::FILE_ATTRIBUTE_SYSTEM
+        );
     }
 
     #[test]
