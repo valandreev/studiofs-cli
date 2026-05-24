@@ -1984,6 +1984,7 @@ mod tests {
     }
 
     type UploadedOverlayObjectRecord = (Ino, u64, u64);
+    type ReattachedUploadRecord = (Ino, u64, u64, u64, u64, u32);
 
     #[derive(Clone)]
     struct FakeMeta {
@@ -1991,7 +1992,7 @@ mod tests {
         overlay_objects: Arc<Mutex<HashMap<Ino, HashSet<u64>>>>,
         pending_deletions: Arc<Mutex<Vec<u64>>>,
         uploaded_overlay_objects: Arc<Mutex<Vec<UploadedOverlayObjectRecord>>>,
-        reattached_uploads: Arc<Mutex<Vec<(Ino, u64, u64, u64, u64, u32)>>>,
+        reattached_uploads: Arc<Mutex<Vec<ReattachedUploadRecord>>>,
         reattach_epoch: Arc<Mutex<Option<u64>>>,
         reattach_epoch_sequence: Arc<Mutex<Vec<Option<u64>>>>,
     }
