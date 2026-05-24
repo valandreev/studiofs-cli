@@ -3922,6 +3922,81 @@ fn handle_backed_extend_keeps_writer_stack_buffered_without_strict_sync() {
 }
 
 #[test]
+fn handle_backed_extend_with_dirty_writer_and_pending_upload_does_not_cancel_active_uploads() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "handle-extend-active-upload");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"handle-extend-active-upload.bin", 0, 0, 0o644)
+            .expect("create test file");
+        let ino = attr.ino;
+        let flushed_payload = vec![0x38u8; 8192];
+
+        vfs.write(ino, 0, &flushed_payload)
+            .await
+            .expect("write payload");
+        vfs.flush(ino).await.expect("flush first unpublished epoch");
+        let pending_before = vfs.pending_uploads_for_inode(ino);
+        assert!(
+            !pending_before.is_empty(),
+            "setup should leave an upload queued for the first epoch"
+        );
+        let pending_epoch = meta.get_attr(ino).expect("load flushed attr").content_epoch;
+        let active_upload_token = vfs.uploader_cancel_token_for_inode(ino);
+
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open writable handle");
+        vfs.write_fh_with_local_sync_policy(
+            fh,
+            ino,
+            flushed_payload.len() as u64,
+            b"active-writer-payload",
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .expect("buffer active writer payload");
+        assert!(vfs.state.writer_stack.has_dirty_writers(ino));
+
+        let sync_calls_before = vfs
+            .state
+            .metrics
+            .payload_store_sync_data_calls
+            .load(Ordering::Relaxed);
+
+        let extended = vfs
+            .setattr_with_handle(Some(fh), ino, SetattrArgs::size_only(32 * 1024))
+            .expect("handle-backed logical-size growth");
+
+        let sync_calls_after = vfs
+            .state
+            .metrics
+            .payload_store_sync_data_calls
+            .load(Ordering::Relaxed);
+        assert_eq!(
+            sync_calls_after, sync_calls_before,
+            "active handle growth must not force strict payload-store sync"
+        );
+        assert!(
+            !active_upload_token.is_cancelled(),
+            "active handle growth must not cancel in-flight uploads for an older queued epoch"
+        );
+        assert!(vfs.state.writer_stack.has_dirty_writers(ino));
+        assert_eq!(extended.size, 32 * 1024);
+        assert!(
+            vfs.pending_uploads_for_inode(ino)
+                .iter()
+                .any(|(_, _, content_epoch)| *content_epoch == pending_epoch),
+            "old queued uploads should remain queued instead of being requeued by EOF growth"
+        );
+
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
 fn explicit_flush_after_clean_handle_extend_queues_metadata_only_publish() {
     let tmp = TempDir::new().expect("tempdir");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "clean-handle-extend-flush-publish");

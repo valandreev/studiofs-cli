@@ -171,11 +171,16 @@ impl StudioVfs {
             };
             let defer_strict_flush_for_growth =
                 candidate_old_attr.as_ref().is_some_and(|old_attr| {
+                    let has_active_dirty_writer = self.state.writer_stack.has_dirty_writers(ino);
                     args.size.is_some_and(|new_size| new_size > old_attr.size)
                         && setattr_args_are_size_only(&args)
-                        && !Self::needs_epoch_finalization(old_attr)
-                        && !self.inode_has_materialized_publish_work(ino, old_attr.content_epoch)
-                        && !self.inode_has_unmaterialized_overlay_for_finalize(ino)
+                        && (has_active_dirty_writer
+                            || (!Self::needs_epoch_finalization(old_attr)
+                                && !self.inode_has_materialized_publish_work(
+                                    ino,
+                                    old_attr.content_epoch,
+                                )
+                                && !self.inode_has_unmaterialized_overlay_for_finalize(ino)))
                 });
             let old_attr = if defer_strict_flush_for_growth {
                 candidate_old_attr.expect("candidate attr present for deferred growth")
@@ -196,6 +201,8 @@ impl StudioVfs {
 
                 self.getattr_async(ino).await?
             };
+            let defer_growth_for_active_dirty_writer =
+                defer_strict_flush_for_growth && self.state.writer_stack.has_dirty_writers(ino);
             let mut attr = old_attr.clone();
             let mut truncate_mutation = None;
             let mut requeue_retained_uploads = false;
@@ -215,7 +222,9 @@ impl StudioVfs {
                 } else {
                     let has_publish_work_for_current_epoch = Self::needs_epoch_finalization(&attr)
                         || self.inode_has_materialized_publish_work(ino, attr.content_epoch);
-                    if has_publish_work_for_current_epoch {
+                    if defer_growth_for_active_dirty_writer {
+                        self.begin_pending_incarnation(ino, &mut attr);
+                    } else if has_publish_work_for_current_epoch {
                         self.begin_size_change_incarnation(ino, &mut attr);
                         requeue_retained_uploads = true;
                     } else {
