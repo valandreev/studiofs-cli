@@ -5,8 +5,11 @@ use windows::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
 use windows::Win32::System::Threading::{
     GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
 };
+use windows::Win32::UI::Shell::{
+    SHCNE_ASSOCCHANGED, SHCNE_UPDATEDIR, SHCNF_IDLIST, SHCNF_PATHW, SHChangeNotify,
+};
 use winreg::RegKey;
-use winreg::enums::{HKEY_CURRENT_USER, KEY_ALL_ACCESS};
+use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_ALL_ACCESS};
 
 const DRIVE_ICON_ICO: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -50,35 +53,38 @@ pub(crate) fn mount_point_drive_icon(mount_point: &str) -> std::io::Result<Mount
 }
 
 fn set_drive_icon(letter: char, icon_path: &Path) -> std::io::Result<MountedDriveIcon> {
-    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
     let key_path = format!(r"{DRIVE_ICON_KEY_ROOT}\{letter}\DefaultIcon");
-    let previous = hkcu
+    let previous = hklm
         .open_subkey(&key_path)
         .ok()
         .and_then(|key| key.get_value::<String, _>("").ok());
-    let (icon_key, _) = hkcu.create_subkey(&key_path)?;
-    icon_key.set_value("", &icon_path.to_string_lossy().to_string())?;
+    let (icon_key, _) = hklm.create_subkey(&key_path)?;
+    let icon_value = format!("{},0", icon_path.to_string_lossy());
+    icon_key.set_value("", &icon_value)?;
     icon_key.set_value(DRIVE_ICON_METADATA_PID, &process::id())?;
     icon_key.set_value(DRIVE_ICON_METADATA_SOURCE, &DRIVE_ICON_METADATA_MARKER)?;
+    notify_shell_drive_icon_changed(letter);
     Ok(MountedDriveIcon { letter, previous })
 }
 
 fn restore_drive_icon(letter: char, previous: Option<String>) -> std::io::Result<()> {
-    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
     let key_path = format!(r"{DRIVE_ICON_KEY_ROOT}\{letter}\DefaultIcon");
 
     match previous {
         Some(value) => {
-            let icon_key = hkcu.open_subkey_with_flags(&key_path, KEY_ALL_ACCESS)?;
+            let icon_key = hklm.open_subkey_with_flags(&key_path, KEY_ALL_ACCESS)?;
             icon_key.set_value("", &value)?;
             let _ = icon_key.delete_value(DRIVE_ICON_METADATA_SOURCE);
             let _ = icon_key.delete_value(DRIVE_ICON_METADATA_PID);
         }
         None => {
-            let _ = hkcu.delete_subkey_all(&key_path);
+            delete_default_icon_and_empty_parent(&hklm, letter);
         }
     }
 
+    notify_shell_drive_icon_changed(letter);
     Ok(())
 }
 
@@ -92,9 +98,7 @@ fn ensure_embedded_drive_icon_path() -> std::io::Result<PathBuf> {
     std::fs::create_dir_all(&icon_dir)?;
 
     let icon_path = icon_dir.join(DRIVE_ICON_NAME);
-    if !std::fs::metadata(&icon_path).is_ok_and(|meta| meta.len() == DRIVE_ICON_ICO.len() as u64)
-        || std::fs::read(&icon_path).ok().as_deref() != Some(DRIVE_ICON_ICO)
-    {
+    if !std::fs::read(&icon_path).is_ok_and(|bytes| bytes == DRIVE_ICON_ICO) {
         std::fs::write(&icon_path, DRIVE_ICON_ICO)?;
     }
 
@@ -103,12 +107,32 @@ fn ensure_embedded_drive_icon_path() -> std::io::Result<PathBuf> {
 
 fn cleanup_orphaned_drive_icons(icon_path: &Path) {
     let expected_icon_path = icon_path.to_string_lossy().to_string();
-    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let expected_icon_value = format!("{expected_icon_path},0");
     let self_pid = process::id();
 
+    cleanup_orphaned_drive_icons_in_root(
+        &RegKey::predef(HKEY_LOCAL_MACHINE),
+        &expected_icon_path,
+        &expected_icon_value,
+        self_pid,
+    );
+    cleanup_orphaned_drive_icons_in_root(
+        &RegKey::predef(HKEY_CURRENT_USER),
+        &expected_icon_path,
+        &expected_icon_value,
+        self_pid,
+    );
+}
+
+fn cleanup_orphaned_drive_icons_in_root(
+    root: &RegKey,
+    expected_icon_path: &str,
+    expected_icon_value: &str,
+    self_pid: u32,
+) {
     for letter in 'A'..='Z' {
         let key_path = format!(r"{DRIVE_ICON_KEY_ROOT}\{letter}\DefaultIcon");
-        let key = match hkcu.open_subkey(&key_path) {
+        let key = match root.open_subkey(&key_path) {
             Ok(key) => key,
             Err(_) => continue,
         };
@@ -123,14 +147,42 @@ fn cleanup_orphaned_drive_icons(icon_path: &Path) {
         };
         let owning_pid = key.get_value::<u32, _>(DRIVE_ICON_METADATA_PID).ok();
 
-        if source != DRIVE_ICON_METADATA_MARKER || current_value != expected_icon_path {
+        if source != DRIVE_ICON_METADATA_MARKER
+            || (current_value != expected_icon_path && current_value != expected_icon_value)
+        {
             continue;
         }
 
         if owning_pid.is_none_or(|pid| !is_process_alive(pid, self_pid)) {
             drop(key);
-            let _ = hkcu.delete_subkey_all(&key_path);
+            delete_default_icon_and_empty_parent(root, letter);
         }
+    }
+}
+
+fn delete_default_icon_and_empty_parent(root: &RegKey, letter: char) {
+    let default_icon_path = format!(r"{DRIVE_ICON_KEY_ROOT}\{letter}\DefaultIcon");
+    let parent_path = format!(r"{DRIVE_ICON_KEY_ROOT}\{letter}");
+
+    let _ = root.delete_subkey_all(&default_icon_path);
+    let _ = root.delete_subkey(&parent_path);
+}
+
+fn notify_shell_drive_icon_changed(letter: char) {
+    let drive_root = format!("{letter}:\\");
+    let wide_drive_root = drive_root
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+
+    unsafe {
+        SHChangeNotify(
+            SHCNE_UPDATEDIR,
+            SHCNF_PATHW,
+            Some(wide_drive_root.as_ptr().cast()),
+            None,
+        );
+        SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None);
     }
 }
 
