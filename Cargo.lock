@@ -4782,6 +4782,7 @@ dependencies = [
  "windows 0.62.2",
  "winfsp",
  "winfsp-sys",
+ "winreg",
 ]
 
 [[package]]

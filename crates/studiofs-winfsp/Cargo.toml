@@ -25,6 +25,7 @@ dotenvy.workspace = true
 winfsp = { version = "0.12", features = ["windows-62", "notify", "async-io"] }
 winfsp-sys = "0.12"
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Threading"] }
+winreg = "0.55"
 
 [target.'cfg(windows)'.build-dependencies]
 winfsp = { workspace = true }

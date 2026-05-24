@@ -6,6 +6,7 @@
 #![cfg(windows)]
 
 mod context;
+mod drive_icon;
 
 use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
@@ -753,6 +754,17 @@ pub fn mount_and_serve(request: WinfspMountRequest) -> std::io::Result<()> {
         context,
     )
     .map_err(|err| std::io::Error::other(format!("failed to initialize WinFSP host: {err}")))?;
+
+    // Keep this guard alive for the mount lifetime so the registry override is reverted
+    // when WinFSP unmount path exits (normal shutdown or error unwind).
+    let _mounted_drive_icon = match drive_icon::mount_point_drive_icon(&mount_point) {
+        Ok(guard) => Some(guard),
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to apply StudioFS drive icon to mounted volume");
+            None
+        }
+    };
+
     let mount_manager_path =
         mount_manager_mount_point(&mount_point).map_err(invalid_input_io_error)?;
     host.mount(&mount_manager_path).map_err(|err| {
