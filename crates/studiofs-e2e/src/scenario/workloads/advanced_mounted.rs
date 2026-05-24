@@ -2082,7 +2082,7 @@ pub(in crate::scenario) fn timed_hotspot_helper_fs_op_with_helper(
             path,
             Ok(()),
         )),
-        Err(error @ ScenarioError::NamespaceCollisionOperationTimeout { .. }) => Err(error),
+        Err(error) if hotspot_helper_error_is_fatal(&error) => Err(error),
         Err(error) => Ok(record_advanced_operation(
             started,
             order,
@@ -2126,7 +2126,7 @@ pub(in crate::scenario) fn timed_hotspot_mount_fs_op(
             path,
             Ok(()),
         )),
-        Err(error @ ScenarioError::NamespaceCollisionOperationTimeout { .. }) => Err(error),
+        Err(error) if hotspot_helper_error_is_fatal(&error) => Err(error),
         Err(error) => Ok(record_advanced_operation(
             started,
             order,
@@ -2136,6 +2136,14 @@ pub(in crate::scenario) fn timed_hotspot_mount_fs_op(
             Err(error.to_string()),
         )),
     }
+}
+
+pub(in crate::scenario) fn hotspot_helper_error_is_fatal(error: &ScenarioError) -> bool {
+    matches!(
+        error,
+        ScenarioError::NamespaceCollisionOperationTimeout { .. }
+            | ScenarioError::NamespaceCollisionUnmountAfterFailure { .. }
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

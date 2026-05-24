@@ -5014,6 +5014,26 @@ fn release_fh_clears_per_stream_read_tracking() {
 }
 
 #[test]
+fn active_open_overlay_tracks_only_mutating_handles() {
+    assert!(!StudioVfs::active_open_overlay_required(
+        OpenFlags::RDONLY,
+        false
+    ));
+    assert!(StudioVfs::active_open_overlay_required(
+        OpenFlags::RDONLY,
+        true
+    ));
+    assert!(StudioVfs::active_open_overlay_required(
+        OpenFlags::WRONLY,
+        false
+    ));
+    assert!(StudioVfs::active_open_overlay_required(
+        OpenFlags::RDWR,
+        false
+    ));
+}
+
+#[test]
 fn fallback_read_access_tracking_does_not_increment_active_handle_counts() {
     let tmp = TempDir::new().expect("tempdir");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "fallback-access-tracking");

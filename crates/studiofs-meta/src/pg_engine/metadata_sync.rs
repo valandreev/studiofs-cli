@@ -9,14 +9,27 @@ use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 
 impl PgMetaEngine {
+    fn active_open_inode_overlay(&self) -> OverlayConflictSets {
+        let mut overlay = OverlayConflictSets::default();
+        let Ok(active) = self.active_open_inodes.lock() else {
+            return overlay;
+        };
+        overlay.remove_attr_inodes.extend(active.keys().copied());
+        overlay
+    }
+
     pub(super) fn local_overlay_conflicts(&self) -> MetaResult<OverlayConflictSets> {
+        let active_open_overlay = self.active_open_inode_overlay();
         let start = self.flushed_event_seq.load(Ordering::SeqCst);
         let end = self.local.get_counter("nextEventSeq")?;
         if end <= start {
-            return Ok(OverlayConflictSets::default());
+            return Ok(active_open_overlay);
         }
 
-        RemoteApplyCoordinator::overlay_conflicts_for_local_range(&self.local, start, end)
+        Ok(RemoteApplyCoordinator::merge_overlay_conflicts(
+            &RemoteApplyCoordinator::overlay_conflicts_for_local_range(&self.local, start, end)?,
+            &active_open_overlay,
+        ))
     }
 
     pub(super) fn reconcile_imported_snapshot_regular_files(&self) -> MetaResult<()> {

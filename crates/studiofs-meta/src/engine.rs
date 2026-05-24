@@ -767,6 +767,13 @@ pub trait MetaReplication: Send + Sync {
     /// Force metadata synchronization from remote source (if applicable).
     fn sync_metadata(&self) -> MetaResult<()>;
 
+    /// Record a VFS-local open handle that should keep its inode binding alive
+    /// while remote metadata is applied.
+    fn note_active_open_inode(&self, _ino: Ino) {}
+
+    /// Release a previously recorded VFS-local open handle.
+    fn note_inactive_open_inode(&self, _ino: Ino) {}
+
     /// Force metadata synchronization from the periodic invalidation fallback poll.
     fn sync_metadata_for_invalidation_poll(&self) -> MetaResult<()> {
         self.sync_metadata()

@@ -6209,6 +6209,10 @@ impl StudioVfs {
         trunc || flags.contains(OpenFlags::WRONLY) || flags.contains(OpenFlags::RDWR)
     }
 
+    fn active_open_overlay_required(flags: OpenFlags, trunc: bool) -> bool {
+        Self::write_access_requested(flags, trunc)
+    }
+
     fn open_flags_allow_write(flags: OpenFlags) -> bool {
         flags.contains(OpenFlags::WRONLY) || flags.contains(OpenFlags::RDWR)
     }
@@ -7353,8 +7357,12 @@ impl StudioVfs {
             self.enforce_no_known_foreign_hard_lock(ino)?;
         }
         if self.ignored_entry_attr(ino).is_some() {
-            let open_file = self.handle_table.open(ino, flags);
+            let active_open_overlay = Self::active_open_overlay_required(flags, trunc);
+            let open_file = self.handle_table.open(ino, flags, active_open_overlay);
             let fh = open_file.fh;
+            if active_open_overlay {
+                self.sync_meta().note_active_open_inode(ino);
+            }
             self.state.file_session.note_open_handle(ino);
             self.state
                 .read
@@ -7380,8 +7388,12 @@ impl StudioVfs {
             self.setattr(ino, SetattrArgs::size_only(0))?;
         }
 
-        let open_file = self.handle_table.open(ino, flags);
+        let active_open_overlay = Self::active_open_overlay_required(flags, trunc);
+        let open_file = self.handle_table.open(ino, flags, active_open_overlay);
         let fh = open_file.fh;
+        if active_open_overlay {
+            self.sync_meta().note_active_open_inode(ino);
+        }
         self.state.file_session.note_open_handle(ino);
         self.state
             .read

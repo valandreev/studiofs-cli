@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 pub(super) struct OverlayConflictSets {
     pub(super) block_inodes: HashSet<Ino>,
     pub(super) attr_inodes: HashSet<Ino>,
+    pub(super) remove_attr_inodes: HashSet<Ino>,
     pub(super) dentry_keys: HashSet<Vec<u8>>,
     pub(super) symlink_inodes: HashSet<Ino>,
     pub(super) xattr_inodes: HashSet<Ino>,
@@ -308,6 +309,9 @@ impl<'a> RemoteApplyCoordinator<'a> {
             .block_inodes
             .extend(extra.block_inodes.iter().copied());
         merged.attr_inodes.extend(extra.attr_inodes.iter().copied());
+        merged
+            .remove_attr_inodes
+            .extend(extra.remove_attr_inodes.iter().copied());
         merged.dentry_keys.extend(extra.dentry_keys.iter().cloned());
         merged
             .symlink_inodes
@@ -364,6 +368,9 @@ impl<'a> RemoteApplyCoordinator<'a> {
     ) -> bool {
         match event {
             MetaEvent::RemoveAttr { ino } => {
+                if overlay.remove_attr_inodes.contains(ino) {
+                    return true;
+                }
                 if overlay.block_inodes.contains(ino) {
                     return true;
                 }
@@ -423,6 +430,9 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 overlay.block_inodes.contains(&attr.ino) || overlay.attr_inodes.contains(&attr.ino)
             }
             MetaEvent::RemoveAttr { ino } => {
+                if overlay.remove_attr_inodes.contains(ino) {
+                    return true;
+                }
                 if overlay.block_inodes.contains(ino) {
                     return true;
                 }

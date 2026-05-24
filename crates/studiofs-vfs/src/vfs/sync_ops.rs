@@ -588,6 +588,9 @@ impl StudioVfs {
         };
         let ino = open_file.ino;
         let stream_id = open_file.stream_id();
+        if open_file.active_open_overlay {
+            self.sync_meta().note_inactive_open_inode(ino);
+        }
         self.state
             .read
             .decrement_active_access_class(open_file.current_access_class());

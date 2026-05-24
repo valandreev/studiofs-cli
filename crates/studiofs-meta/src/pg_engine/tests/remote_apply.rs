@@ -487,6 +487,98 @@ fn foreign_unlink_during_local_append_removes_serving_dentry() {
 }
 
 #[test]
+fn foreign_unlink_during_active_open_handle_preserves_inode_binding() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+
+    let file = create_published_small_file(&pg, ROOT_INO, b"open-target.txt", 77_210);
+    let setup_end = pg.local.get_counter("nextEventSeq").expect("setup end");
+    pg.persist_flushed_event_seq(setup_end)
+        .expect("ack published setup");
+    pg.note_active_open_inode(file.ino);
+
+    let overlay = pg.local_overlay_conflicts().expect("overlay conflicts");
+    assert!(overlay.remove_attr_inodes.contains(&file.ino));
+    assert!(!overlay.attr_inodes.contains(&file.ino));
+    assert!(!overlay.block_inodes.contains(&file.ino));
+    assert!(pg.lookup(ROOT_INO, b"open-target.txt").is_ok());
+
+    let batch = [
+        MetaEvent::RemoveEntry {
+            parent: ROOT_INO,
+            name: b"open-target.txt".to_vec(),
+        },
+        MetaEvent::RemoveAttr { ino: file.ino },
+    ];
+
+    apply_foreign_batch(&pg, &batch, &overlay, &HashSet::new()).expect("apply foreign unlink");
+
+    assert!(
+        matches!(
+            pg.lookup(ROOT_INO, b"open-target.txt"),
+            Err(MetaError::EntryNotFound { .. })
+        ),
+        "foreign unlink must remove namespace visibility for new opens"
+    );
+    assert!(
+        pg.get_attr(file.ino).is_ok(),
+        "active open handles must keep their inode binding alive by ino"
+    );
+
+    pg.note_inactive_open_inode(file.ino);
+    let overlay = pg.local_overlay_conflicts().expect("overlay after close");
+    assert!(!overlay.remove_attr_inodes.contains(&file.ino));
+    assert!(!overlay.attr_inodes.contains(&file.ino));
+    assert!(!overlay.block_inodes.contains(&file.ino));
+}
+
+#[test]
+fn active_open_handle_does_not_hide_foreign_content_publish() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+
+    let file = create_published_small_file(&pg, ROOT_INO, b"publish-target.txt", 77_211);
+    let setup_end = pg.local.get_counter("nextEventSeq").expect("setup end");
+    pg.persist_flushed_event_seq(setup_end)
+        .expect("ack published setup");
+    pg.note_active_open_inode(file.ino);
+
+    let mut remote_attr = pg.get_attr(file.ino).expect("load local attr");
+    remote_attr.size = 512;
+    remote_attr.committed_size = 512;
+    remote_attr.content_epoch = remote_attr.content_epoch.saturating_add(1);
+    remote_attr.committed_content_epoch = remote_attr.content_epoch;
+    remote_attr.mtime = remote_attr.mtime.saturating_add(1);
+    remote_attr.ctime = remote_attr.ctime.saturating_add(1);
+
+    let remote_payload = PayloadRef::new_partial(77_212, 512);
+    let remote_publish = MetaEvent::PublishRegularFileBaseSlices {
+        ino: file.ino,
+        chunk_slices: vec![(
+            ChunkId(0),
+            vec![SliceRecord {
+                slice_id: SliceId(0),
+                order: SliceOrder(0),
+                range: SliceRange::new(0, 512).expect("remote publish range"),
+                payload: Some(remote_payload),
+                payload_state: PayloadRefState::Published,
+            }],
+        )],
+    };
+
+    let overlay = pg.local_overlay_conflicts().expect("overlay conflicts");
+    apply_foreign_batch(
+        &pg,
+        &[MetaEvent::SetAttr { attr: remote_attr }, remote_publish],
+        &overlay,
+        &HashSet::new(),
+    )
+    .expect("apply foreign publish");
+
+    let applied = pg.get_attr(file.ino).expect("load applied attr");
+    assert_eq!(applied.size, 512);
+    assert_eq!(applied.committed_size, 512);
+}
+
+#[test]
 fn foreign_rename_replace_during_local_append_removes_source_dentry() {
     let (_dir, pg) = temp_pg_engine_for_unit();
 

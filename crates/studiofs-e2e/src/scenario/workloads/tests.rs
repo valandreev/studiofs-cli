@@ -2332,6 +2332,20 @@ fn hotspot_helper_io_failure_is_recorded_as_rejected_operation() {
 }
 
 #[test]
+fn hotspot_unmount_after_timeout_is_fatal_not_rejected_operation() {
+    let error = ScenarioError::NamespaceCollisionUnmountAfterFailure {
+        primary: namespace_collision_operation_timeout(
+            Duration::from_millis(20),
+            vec![(1, "client-a rename hotspot/slot-0.txt".to_string())],
+        )
+        .to_string(),
+        cleanup: "taskkill failed".to_string(),
+    };
+
+    assert!(hotspot_helper_error_is_fatal(&error));
+}
+
+#[test]
 fn required_hotspot_churn_operation_is_logged_before_failing() {
     let temp = tempdir().unwrap();
     let sandbox = temp.path().join("run-required-helper-reject");

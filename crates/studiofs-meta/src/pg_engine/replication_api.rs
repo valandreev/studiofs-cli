@@ -3,6 +3,7 @@ use crate::engine::{
     MetaError, MetaFormat, MetaReplication, MetaResult, MetadataAuthorityStatus,
     MetadataInvalidationDiagnostics, MetadataReplicationBacklog,
 };
+use crate::types::Ino;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -30,6 +31,23 @@ impl MetaReplication for PgMetaEngine {
     fn sync_metadata(&self) -> MetaResult<()> {
         let _ = self.sync_metadata_with_source(MetadataSyncSource::Manual)?;
         Ok(())
+    }
+
+    fn note_active_open_inode(&self, ino: Ino) {
+        if let Ok(mut active) = self.active_open_inodes.lock() {
+            *active.entry(ino).or_insert(0) += 1;
+        }
+    }
+
+    fn note_inactive_open_inode(&self, ino: Ino) {
+        if let Ok(mut active) = self.active_open_inodes.lock()
+            && let Some(count) = active.get_mut(&ino)
+        {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                active.remove(&ino);
+            }
+        }
     }
 
     fn sync_metadata_for_invalidation_poll(&self) -> MetaResult<()> {
