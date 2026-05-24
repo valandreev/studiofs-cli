@@ -1930,7 +1930,7 @@ pub(in crate::scenario) fn run_hotspot_churn_operations_with_timeout(
     )?;
     for round in 0..10 {
         let slot = isolation.path(&format!("slot-{}.txt", round % 6));
-        let renamed = isolation.path(&format!("slot-{}-renamed.txt", round % 6));
+        let renamed = hotspot_churn_rename_target(isolation, round);
         let write_path = slot.clone();
         let write_payload = isolation.payload(
             "overwrite",
@@ -2002,6 +2002,13 @@ pub(in crate::scenario) fn run_hotspot_churn_operations_with_timeout(
         record_sparse_operation(context, &mut operations, operation)?;
     }
     Ok(operations)
+}
+
+pub(in crate::scenario) fn hotspot_churn_rename_target(
+    isolation: &ScenarioIsolation,
+    round: usize,
+) -> String {
+    isolation.path(&format!("slot-{}-round-{round}-renamed.txt", round % 6))
 }
 
 pub(in crate::scenario) fn wait_for_hotspot_initial_tree(

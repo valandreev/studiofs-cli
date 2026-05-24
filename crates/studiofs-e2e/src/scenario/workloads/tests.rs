@@ -2261,6 +2261,20 @@ fn hotspot_churn_operation_timeout_bounds_pending_workers() {
 }
 
 #[test]
+fn hotspot_churn_rename_targets_are_unique_per_round() {
+    let isolation = test_isolation("hotspot");
+    let mut targets = std::collections::BTreeSet::new();
+
+    for round in 0..10 {
+        let target = hotspot_churn_rename_target(&isolation, round);
+        assert!(
+            targets.insert(target.clone()),
+            "hotspot churn must not reuse rename target {target}"
+        );
+    }
+}
+
+#[test]
 fn hotspot_churn_completed_operations_release_worker_before_next_operation() {
     let active_workers = Arc::new(AtomicUsize::new(0));
 
