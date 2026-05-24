@@ -223,6 +223,9 @@ impl StudioVfs {
                 } else {
                     let has_publish_work_for_current_epoch = Self::needs_epoch_finalization(&attr)
                         || self.inode_has_materialized_publish_work(ino, attr.content_epoch);
+                    // Active dirty writers keep the current epoch open, so size-only
+                    // handle-backed growth can merge into that pending incarnation
+                    // instead of forcing strict syncs and upload requeues.
                     if has_publish_work_for_current_epoch && !defer_growth_for_active_dirty_writer {
                         self.begin_size_change_incarnation(ino, &mut attr);
                         requeue_retained_uploads = true;

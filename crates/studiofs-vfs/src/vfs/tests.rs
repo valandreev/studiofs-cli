@@ -4077,6 +4077,89 @@ fn handle_backed_extend_with_mtime_and_dirty_writer_forces_strict_sync() {
 }
 
 #[test]
+fn handle_backed_shrink_with_dirty_writer_forces_strict_sync() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "handle-shrink-dirty-writer-strict-sync");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(
+                1,
+                b"handle-shrink-dirty-writer-strict-sync.bin",
+                0,
+                0,
+                0o644,
+            )
+            .expect("create test file");
+        let ino = attr.ino;
+        let flushed_payload = vec![0x53u8; 8192];
+
+        vfs.write(ino, 0, &flushed_payload)
+            .await
+            .expect("write payload");
+        vfs.flush(ino).await.expect("flush first unpublished epoch");
+        assert!(
+            !vfs.pending_uploads_for_inode(ino).is_empty(),
+            "setup should leave an upload queued for the first epoch"
+        );
+        let pending_epoch = meta.get_attr(ino).expect("load flushed attr").content_epoch;
+
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open writable handle");
+        vfs.write_fh_with_local_sync_policy(
+            fh,
+            ino,
+            flushed_payload.len() as u64,
+            b"dirty-tail-before-shrink",
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .expect("buffer dirty writer payload");
+        assert!(vfs.state.writer_stack.has_dirty_writers(ino));
+
+        let sync_calls_before = vfs
+            .state
+            .metrics
+            .payload_store_sync_data_calls
+            .load(Ordering::Relaxed);
+        let shrink_size = 4096u64;
+
+        let shrunk = vfs
+            .setattr_with_handle(Some(fh), ino, SetattrArgs::size_only(shrink_size))
+            .expect("handle-backed shrink");
+
+        let sync_calls_after = vfs
+            .state
+            .metrics
+            .payload_store_sync_data_calls
+            .load(Ordering::Relaxed);
+        assert!(
+            sync_calls_after > sync_calls_before,
+            "shrink must not use the growth-only strict-sync deferral"
+        );
+        assert!(
+            !vfs.state.writer_stack.has_dirty_writers(ino),
+            "strict sync should materialize or discard active writer-stack data before shrink"
+        );
+        assert_eq!(shrunk.size, shrink_size);
+        assert!(
+            shrunk.content_epoch > pending_epoch,
+            "shrink with pending publish work should advance the incarnation"
+        );
+        assert!(
+            vfs.pending_uploads_for_inode(ino)
+                .iter()
+                .all(|(_, _, content_epoch)| *content_epoch == shrunk.content_epoch),
+            "retained uploads after shrink should be requeued for the new epoch"
+        );
+
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
 fn explicit_flush_after_clean_handle_extend_queues_metadata_only_publish() {
     let tmp = TempDir::new().expect("tempdir");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "clean-handle-extend-flush-publish");
