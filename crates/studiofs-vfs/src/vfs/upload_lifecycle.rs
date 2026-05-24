@@ -56,6 +56,12 @@ impl StudioVfs {
             .clone()
     }
 
+    pub(super) fn cancel_upload_token_for_inode(&self, ino: Ino) {
+        if let Some(token) = self.state.upload.upload_cancel_tokens.lock().remove(&ino) {
+            token.cancel();
+        }
+    }
+
     pub(super) fn mark_inode_deleted_for_uploads(&self, ino: Ino) {
         // Soft upload cancellation marker: stops background uploads for this inode.
         // Data for still-open unlinked files must remain locally readable until

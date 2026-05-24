@@ -3536,6 +3536,16 @@ fn write_through_sparse_extend_requeues_all_retained_overlay_uploads() {
             2,
             "setup should retain both sparse payload ranges before set_len"
         );
+        let pending_offsets_before_extend = vfs
+            .pending_uploads_for_inode(ino)
+            .iter()
+            .map(|(offset, _, _)| *offset)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            pending_offsets_before_extend,
+            BTreeSet::from([0, tail_offset]),
+            "sparse write-through uploads must retain their file offsets"
+        );
 
         let payload_epoch = meta.get_attr(ino).expect("load payload attr").content_epoch;
         let grow_fh = vfs
@@ -3809,6 +3819,46 @@ fn nonzero_extend_requeues_retained_overlay_uploads_when_publish_work_is_in_flig
                 .iter()
                 .all(|(_, _, content_epoch)| *content_epoch > pending_before[0].2),
             "retained overlay uploads must move to the new size-change epoch"
+        );
+    });
+}
+
+#[test]
+fn size_change_requeue_cancels_superseded_upload_token_and_rotates_for_retained_uploads() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "extend-rotates-upload-token");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"extend-rotates-upload-token.bin", 0, 0, 0o644)
+            .expect("create test file");
+        let ino = attr.ino;
+        let payload = vec![0x47u8; 8192];
+
+        vfs.write(ino, 0, &payload).await.expect("write payload");
+        vfs.flush(ino).await.expect("flush first unpublished epoch");
+        assert!(
+            !vfs.pending_uploads_for_inode(ino).is_empty(),
+            "setup should queue an upload before the logical-size extension"
+        );
+
+        let superseded_token = vfs.uploader_cancel_token_for_inode(ino);
+        assert!(
+            !superseded_token.is_cancelled(),
+            "setup token should represent an active upload"
+        );
+
+        vfs.setattr(ino, SetattrArgs::size_only(16 * 1024))
+            .expect("extend while retaining existing overlay payloads");
+
+        assert!(
+            superseded_token.is_cancelled(),
+            "size-change requeue must cancel already-active uploads for the old epoch"
+        );
+        assert!(
+            !vfs.uploader_cancel_token_for_inode(ino).is_cancelled(),
+            "retained uploads queued for the new epoch need a fresh live token"
         );
     });
 }

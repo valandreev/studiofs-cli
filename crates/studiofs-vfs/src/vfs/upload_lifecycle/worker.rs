@@ -17,8 +17,8 @@ use studiofs_data::object::{
     CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, create_object_buffer, format_object_fragment_keys,
 };
 use studiofs_meta::schema::{
-    ChunkId, FileType, PayloadRef, PayloadRefState, ResolvedSliceSpan, SliceId, SliceOrder,
-    SliceRange, SliceRecord,
+    ChunkId, FileType, PayloadRef, PayloadRefState, ResolvedSliceSource, ResolvedSliceSpan,
+    SliceId, SliceOrder, SliceRange, SliceRecord,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
@@ -114,6 +114,15 @@ enum SingleUploadOutcome {
     Shutdown,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct UploadedObjectReconcile {
+    keep_local_object: bool,
+    finalize_content_epoch: u64,
+}
+
+const POST_PUT_STALE_RECONCILE_ATTEMPTS: usize = 16;
+const POST_PUT_STALE_RECONCILE_DELAY_MS: u64 = 5;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RemoteVisibility {
     Visible,
@@ -173,10 +182,11 @@ fn foreground_upload_reread_pacing_delay(foreground_active: bool, reread_bytes: 
     Duration::from_nanos(nanos)
 }
 
-fn spans_leave_range_uncovered(
+fn spans_allow_uploaded_object_reattach(
     spans: &[ResolvedSliceSpan],
     expected_chunk: ChunkId,
     expected_range: SliceRange,
+    object_id: u64,
 ) -> bool {
     let mut covered_until = expected_range.start;
     for span in spans {
@@ -186,7 +196,15 @@ fn spans_leave_range_uncovered(
         let Some(intersection) = span.range.intersection(expected_range) else {
             continue;
         };
-        if intersection.start > covered_until || span.payload.is_some() {
+        let safe_span = match span.source {
+            ResolvedSliceSource::Hole => span.payload.is_none(),
+            ResolvedSliceSource::Overlay | ResolvedSliceSource::Base => span
+                .payload
+                .as_ref()
+                .is_some_and(|payload| payload.object_id == object_id),
+            ResolvedSliceSource::OverlayTombstone | ResolvedSliceSource::BaseTombstone => false,
+        };
+        if intersection.start > covered_until || !safe_span {
             return false;
         }
         covered_until = covered_until.max(intersection.end);
@@ -610,66 +628,57 @@ where
             );
             return Ok(SingleUploadOutcome::CancelledDeleted);
         }
+        if upload_cancel_token.is_cancelled() {
+            debug!(
+                object_id = op.object_id,
+                ino = op.ino,
+                "process_upload canceled: upload token canceled after remote put"
+            );
+            return Ok(SingleUploadOutcome::Shutdown);
+        }
 
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_secs() as i64)
             .unwrap_or(0);
-        let mut finalize_content_epoch = op.content_epoch;
-        let keep_local_object = if self
-            .meta
-            .has_regular_file_overlay_object_if_matches(op.ino, op.content_epoch, op.object_id)
-            .await?
-        {
-            self.meta
-                .mark_regular_file_overlay_object_uploaded_if_matches(
-                    op.ino,
-                    op.content_epoch,
-                    op.object_id,
-                )
-                .await?
-        } else {
-            let latest_attr = self.meta.get_attr(op.ino).await?;
-            if let Some(latest_attr) = latest_attr
-                && latest_attr.content_epoch != op.content_epoch
-                && self
-                    .meta
-                    .has_regular_file_overlay_object_if_matches(
-                        op.ino,
-                        latest_attr.content_epoch,
-                        op.object_id,
-                    )
-                    .await?
-            {
-                finalize_content_epoch = latest_attr.content_epoch;
-                self.meta
-                    .mark_regular_file_overlay_object_uploaded_if_matches(
-                        op.ino,
-                        latest_attr.content_epoch,
-                        op.object_id,
-                    )
-                    .await?
-            } else if let Some(rebased_epoch) = self
-                .meta
-                .reattach_uploaded_object_if_uncovered(
-                    op.ino,
-                    op.content_epoch,
-                    op.object_id,
-                    op.offset,
-                    payload_len,
-                    self.block_size,
-                )
-                .await?
-            {
-                finalize_content_epoch = rebased_epoch;
-                true
-            } else {
-                self.shutdown.record_canceled_stale_after_put(payload_len);
-                self.meta
-                    .add_pending_deletion(op.object_id, timestamp)
+        let mut reconcile = self
+            .reconcile_uploaded_object_metadata(op, payload_len)
+            .await?;
+        if reconcile.is_none() && !self.shutdown.uploader_shutdown_requested() {
+            for _ in 0..POST_PUT_STALE_RECONCILE_ATTEMPTS {
+                let shutdown_token = self.shutdown.shutdown_token();
+                tokio::select! {
+                    _ = shutdown_token.cancelled() => break,
+                    _ = tokio::time::sleep(Duration::from_millis(POST_PUT_STALE_RECONCILE_DELAY_MS)) => {}
+                }
+                if self.cancel_upload_if_inode_deleted(op).await? {
+                    debug!(
+                        object_id = op.object_id,
+                        ino = op.ino,
+                        "process_upload canceled: inode deleted during post-PUT metadata reconciliation"
+                    );
+                    return Ok(SingleUploadOutcome::CancelledDeleted);
+                }
+                reconcile = self
+                    .reconcile_uploaded_object_metadata(op, payload_len)
                     .await?;
-                false
+                if reconcile.is_some() {
+                    break;
+                }
             }
+        }
+
+        let (keep_local_object, finalize_content_epoch) = if let Some(reconcile) = reconcile {
+            (
+                reconcile.keep_local_object,
+                reconcile.finalize_content_epoch,
+            )
+        } else {
+            self.shutdown.record_canceled_stale_after_put(payload_len);
+            self.meta
+                .add_pending_deletion(op.object_id, timestamp)
+                .await?;
+            (false, op.content_epoch)
         };
         self.coordinator.complete_upload(op);
 
@@ -699,6 +708,76 @@ where
             "background upload complete"
         );
         Ok(SingleUploadOutcome::Completed)
+    }
+
+    async fn reconcile_uploaded_object_metadata(
+        &self,
+        op: &PendingUpload,
+        payload_len: u64,
+    ) -> VfsResult<Option<UploadedObjectReconcile>> {
+        if self
+            .meta
+            .has_regular_file_overlay_object_if_matches(op.ino, op.content_epoch, op.object_id)
+            .await?
+            && self
+                .meta
+                .mark_regular_file_overlay_object_uploaded_if_matches(
+                    op.ino,
+                    op.content_epoch,
+                    op.object_id,
+                )
+                .await?
+        {
+            return Ok(Some(UploadedObjectReconcile {
+                keep_local_object: true,
+                finalize_content_epoch: op.content_epoch,
+            }));
+        }
+
+        if let Some(latest_attr) = self.meta.get_attr(op.ino).await?
+            && latest_attr.content_epoch != op.content_epoch
+            && self
+                .meta
+                .has_regular_file_overlay_object_if_matches(
+                    op.ino,
+                    latest_attr.content_epoch,
+                    op.object_id,
+                )
+                .await?
+            && self
+                .meta
+                .mark_regular_file_overlay_object_uploaded_if_matches(
+                    op.ino,
+                    latest_attr.content_epoch,
+                    op.object_id,
+                )
+                .await?
+        {
+            return Ok(Some(UploadedObjectReconcile {
+                keep_local_object: true,
+                finalize_content_epoch: latest_attr.content_epoch,
+            }));
+        }
+
+        if let Some(rebased_epoch) = self
+            .meta
+            .reattach_uploaded_object_if_uncovered(
+                op.ino,
+                op.content_epoch,
+                op.object_id,
+                op.offset,
+                payload_len,
+                self.block_size,
+            )
+            .await?
+        {
+            return Ok(Some(UploadedObjectReconcile {
+                keep_local_object: true,
+                finalize_content_epoch: rebased_epoch,
+            }));
+        }
+
+        Ok(None)
     }
 
     async fn cancel_upload_if_inode_deleted(&self, op: &PendingUpload) -> VfsResult<bool> {
@@ -1147,7 +1226,7 @@ impl UploadMetaPort for VfsUploadMetaPort {
             }
 
             let spans = engine.lookup_regular_file_slices(ino, offset, payload_len)?;
-            if !spans_leave_range_uncovered(&spans, chunk_id, range) {
+            if !spans_allow_uploaded_object_reattach(&spans, chunk_id, range, object_id) {
                 return Ok(None);
             }
 
@@ -1795,7 +1874,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use studiofs_data::DataStoreConfig;
     use studiofs_meta::schema::{CURRENT_FORMAT_VERSION, FormatInfo, MetadataConfig, UploadState};
-    use studiofs_meta::{MetaFormat, MetaInodes, MetaPayloadObjects, RedbMetaEngine};
+    use studiofs_meta::{MetaEngine, MetaFormat, MetaInodes, MetaPayloadObjects, RedbMetaEngine};
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
 
@@ -1914,6 +1993,7 @@ mod tests {
         uploaded_overlay_objects: Arc<Mutex<Vec<UploadedOverlayObjectRecord>>>,
         reattached_uploads: Arc<Mutex<Vec<(Ino, u64, u64, u64, u64, u32)>>>,
         reattach_epoch: Arc<Mutex<Option<u64>>>,
+        reattach_epoch_sequence: Arc<Mutex<Vec<Option<u64>>>>,
     }
 
     impl Default for FakeMeta {
@@ -1925,6 +2005,7 @@ mod tests {
                 uploaded_overlay_objects: Arc::new(Mutex::new(Vec::new())),
                 reattached_uploads: Arc::new(Mutex::new(Vec::new())),
                 reattach_epoch: Arc::new(Mutex::new(None)),
+                reattach_epoch_sequence: Arc::new(Mutex::new(Vec::new())),
             }
         }
     }
@@ -2000,6 +2081,10 @@ mod tests {
                 payload_len,
                 block_size,
             ));
+            let mut sequence = self.reattach_epoch_sequence.lock();
+            if !sequence.is_empty() {
+                return Ok(sequence.remove(0));
+            }
             Ok(*self.reattach_epoch.lock())
         }
 
@@ -2017,6 +2102,7 @@ mod tests {
         remove_overlay_after_upload: Arc<Mutex<Option<(FakeMeta, Ino, u64)>>>,
         advance_epoch_after_upload: Arc<Mutex<Option<(FakeMeta, Ino, u64)>>>,
         mark_deleted_after_upload: Arc<Mutex<Option<(FakeShutdown, Ino)>>>,
+        cancel_token_after_upload: Arc<AtomicBool>,
     }
 
     impl Default for FakeRemote {
@@ -2028,6 +2114,7 @@ mod tests {
                 remove_overlay_after_upload: Arc::new(Mutex::new(None)),
                 advance_epoch_after_upload: Arc::new(Mutex::new(None)),
                 mark_deleted_after_upload: Arc::new(Mutex::new(None)),
+                cancel_token_after_upload: Arc::new(AtomicBool::new(false)),
             }
         }
     }
@@ -2056,13 +2143,20 @@ mod tests {
             _block_index: u32,
             _raw_payload: Bytes,
             _fragment_keys: &[String],
-            _cancel_token: &CancellationToken,
+            cancel_token: &CancellationToken,
         ) -> UploadPutOutcome {
             let outcome = self
                 .upload_result
                 .lock()
                 .take()
                 .unwrap_or(UploadPutOutcome::Uploaded);
+            if matches!(outcome, UploadPutOutcome::Uploaded)
+                && self
+                    .cancel_token_after_upload
+                    .swap(false, Ordering::Relaxed)
+            {
+                cancel_token.cancel();
+            }
             if matches!(outcome, UploadPutOutcome::Uploaded)
                 && let Some((meta, ino, object_id)) = self.remove_overlay_after_upload.lock().take()
                 && let Some(objects) = meta.overlay_objects.lock().get_mut(&ino)
@@ -2304,6 +2398,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn vfs_upload_meta_reattaches_newer_stale_upload_when_same_object_is_still_overlay() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "reattach-retained-stale-upload");
+        let created = vfs
+            .create(1, b"reattach-retained-stale-upload.bin", 0, 0, 0o644)
+            .expect("create sparse file");
+        let mut updating_attr = created;
+        updating_attr.size = 1_048_831;
+        updating_attr.committed_size = 233;
+        updating_attr.content_epoch = 2;
+        updating_attr.committed_content_epoch = 1;
+        updating_attr.upload_state = UploadState::Updating;
+
+        let mut slice = SliceRecord::new(
+            SliceId(0),
+            SliceOrder(0),
+            SliceRange::new(1_048_569, 1_048_831).expect("boundary range"),
+            PayloadRef::new_partial(6, 262),
+        );
+        slice.payload_state = PayloadRefState::LocalOnly;
+        meta.flush_regular_file_overlay_slices_with_attr(
+            updating_attr.ino,
+            &[(ChunkId(0), vec![slice])],
+            Some(&updating_attr),
+        )
+        .expect("seed retained local overlay");
+
+        let port = VfsUploadMetaPort { vfs: vfs.clone() };
+        let rebased_epoch = rt
+            .block_on(port.reattach_uploaded_object_if_uncovered(
+                updating_attr.ino,
+                3,
+                6,
+                1_048_569,
+                262,
+                vfs.block_size,
+            ))
+            .expect("reattach uploaded payload");
+
+        assert_eq!(
+            rebased_epoch,
+            Some(3),
+            "a same-object LocalOnly span should not block post-PUT reattach"
+        );
+        let attr = meta.get_attr(updating_attr.ino).expect("load rebased attr");
+        assert_eq!(attr.content_epoch, 3);
+        assert_eq!(attr.committed_content_epoch, 1);
+        assert!(
+            meta.has_regular_file_overlay_object_if_matches(updating_attr.ino, 3, 6)
+                .expect("rebased overlay object present"),
+            "retained stale upload must become Uploaded in the current overlay epoch"
+        );
+    }
+
     fn processor_fixture() -> (
         FakeProcessor,
         FakeCoordinator,
@@ -2437,6 +2586,39 @@ mod tests {
         );
         assert_eq!(shutdown.canceled_deleted.load(Ordering::Relaxed), 1);
         assert_eq!(shutdown.released_tokens.lock().as_slice(), &[11]);
+    }
+
+    #[tokio::test]
+    async fn process_upload_honors_supersede_cancel_after_remote_put_before_stale_cleanup() {
+        let (processor, coordinator, local_payloads, meta, remote, shutdown, policy) =
+            processor_fixture();
+        let op = make_pending_upload();
+        coordinator.pending_inodes.lock().insert(op.ino);
+        meta.attrs
+            .lock()
+            .insert(op.ino, Some(make_attr(op.ino, op.content_epoch)));
+        meta.overlay_objects
+            .lock()
+            .insert(op.ino, HashSet::from([op.object_id]));
+        remote
+            .cancel_token_after_upload
+            .store(true, Ordering::Relaxed);
+        let upload_cancel_token = CancellationToken::new();
+
+        let outcome = processor
+            .process_single_upload(&op, 0, &upload_cancel_token)
+            .await
+            .expect("process upload");
+
+        assert_eq!(outcome, SingleUploadOutcome::Shutdown);
+        assert!(upload_cancel_token.is_cancelled());
+        assert!(coordinator.completed.lock().is_empty());
+        assert!(meta.uploaded_overlay_objects.lock().is_empty());
+        assert!(meta.pending_deletions.lock().is_empty());
+        assert!(local_payloads.uploaded.lock().is_empty());
+        assert!(local_payloads.removed.lock().is_empty());
+        assert_eq!(shutdown.canceled_stale.load(Ordering::Relaxed), 0);
+        assert!(policy.finalized_upload_epochs.lock().is_empty());
     }
 
     #[tokio::test]
@@ -2621,7 +2803,10 @@ mod tests {
     async fn process_upload_counts_stale_discovered_after_remote_put() {
         let (processor, coordinator, local_payloads, meta, remote, shutdown, policy) =
             processor_fixture();
-        let op = make_pending_upload();
+        let op = PendingUpload {
+            retry_count: 1,
+            ..make_pending_upload()
+        };
         coordinator.pending_inodes.lock().insert(op.ino);
         meta.attrs
             .lock()
@@ -2655,6 +2840,43 @@ mod tests {
                 .load(Ordering::Relaxed),
             "remote stale payload".len() as u64
         );
+    }
+
+    #[tokio::test]
+    async fn process_upload_recovers_post_put_stale_after_transient_metadata_gap() {
+        let (processor, coordinator, local_payloads, meta, remote, shutdown, policy) =
+            processor_fixture();
+        let op = make_pending_upload();
+        coordinator.pending_inodes.lock().insert(op.ino);
+        meta.attrs
+            .lock()
+            .insert(op.ino, Some(make_attr(op.ino, op.content_epoch)));
+        meta.overlay_objects
+            .lock()
+            .insert(op.ino, HashSet::from([op.object_id]));
+        local_payloads
+            .upload_reads
+            .lock()
+            .insert(op.object_id, Some(Bytes::from_static(b"transient")));
+        *remote.remove_overlay_after_upload.lock() = Some((meta.clone(), op.ino, op.object_id));
+        *meta.reattach_epoch_sequence.lock() = vec![None, Some(op.content_epoch + 1)];
+
+        let outcome = processor.process_upload(op.clone()).await;
+
+        assert_eq!(outcome, UploadOutcome::Completed);
+        assert_eq!(coordinator.completed.lock().as_slice(), &[op.object_id]);
+        assert!(meta.pending_deletions.lock().is_empty());
+        assert!(local_payloads.removed.lock().is_empty());
+        assert_eq!(local_payloads.uploaded.lock().as_slice(), &[op.object_id]);
+        assert_eq!(
+            policy.finalized_upload_epochs.lock().as_slice(),
+            &[(op.ino, op.content_epoch + 1)]
+        );
+        assert_eq!(meta.reattached_uploads.lock().len(), 2);
+        assert_eq!(shutdown.requeues.load(Ordering::Relaxed), 0);
+        assert!(coordinator.requeued.lock().is_empty());
+        assert_eq!(shutdown.canceled_stale.load(Ordering::Relaxed), 0);
+        assert_eq!(shutdown.canceled_stale_after_put.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

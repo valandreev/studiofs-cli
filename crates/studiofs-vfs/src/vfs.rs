@@ -4735,7 +4735,11 @@ impl StudioVfs {
         }
 
         let mut deleted_cancel_count = 0;
+        let mut canceled_tokens = HashSet::new();
         for (op, deleted) in &pending_uploads {
+            if canceled_tokens.insert(op.ino) {
+                self.cancel_upload_token_for_inode(op.ino);
+            }
             if *deleted {
                 deleted_cancel_count += 1;
             }
