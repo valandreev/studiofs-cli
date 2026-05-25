@@ -823,21 +823,6 @@ impl CrashRestartDriver for RecordingCrashRestartDriver {
                 }
             }
         }
-        if self.corrupt_converged_payload_after_remount {
-            let clients = self.clients.clone();
-            thread::spawn(move || {
-                thread::sleep(Duration::from_millis(20));
-                for client in clients {
-                    std::fs::write(
-                        client
-                            .mount_point
-                            .join(CRASH_RESTART_LOCAL_DURABLE_FILE_NAME),
-                        b"wrong converged payload after restart\n",
-                    )
-                    .unwrap();
-                }
-            });
-        }
         if self.publish_current_file_on_remount {
             let crashed = self
                 .clients
@@ -864,6 +849,14 @@ impl CrashRestartDriver for RecordingCrashRestartDriver {
         client: &str,
         relative_path: &str,
     ) -> Result<(), ScenarioError> {
+        if self.corrupt_converged_payload_after_remount {
+            for client in &self.clients {
+                std::fs::write(
+                    client.mount_point.join(relative_path),
+                    b"wrong converged payload after restart\n",
+                )?;
+            }
+        }
         if self.publish_current_file_before_convergence {
             let crashed = self
                 .clients
