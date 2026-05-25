@@ -8,6 +8,7 @@
 //! - Local overlay and remote-visible base views are modeled explicitly
 //! - All metadata lives in redb, S3 stores only raw payload objects
 
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
@@ -26,7 +27,13 @@ pub const DEFAULT_BLOCK_SIZE: u32 = 4 * 1024 * 1024;
 /// migration/versioning is introduced.
 pub const DEFAULT_CHUNK_SIZE: u32 = 64 * 1024 * 1024;
 /// Current on-disk metadata format version.
-pub const CURRENT_FORMAT_VERSION: u16 = 3;
+pub const CURRENT_FORMAT_VERSION: u16 = 4;
+/// Supported encryption format version for remote payload envelopes.
+pub const CURRENT_ENCRYPTION_FORMAT_VERSION: u16 = 1;
+/// Initial active key identifier for formatted encrypted volumes.
+pub const CURRENT_ENCRYPTION_KEY_ID: u32 = 1;
+/// XChaCha20-Poly1305 key length in bytes.
+pub const ENCRYPTION_KEY_LENGTH: usize = 32;
 
 /// Root inode number.
 pub const ROOT_INO: Ino = 1;
@@ -1461,8 +1468,90 @@ pub struct FormatInfo {
     /// Metadata backend configuration.
     #[serde(default)]
     pub metadata: MetadataConfig,
+    /// Transparent remote-object encryption settings.
+    pub encryption: EncryptionConfig,
     /// Block size in bytes (configurable at init, default 16MB).
     pub block_size: u32,
+}
+
+/// Supported transparent remote-object encryption algorithm.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum EncryptionAlgorithm {
+    /// XChaCha20-Poly1305 envelope format v1.
+    #[serde(rename = "xchacha20poly1305-v1")]
+    XChaCha20Poly1305V1,
+}
+
+/// Persisted encryption configuration for a formatted volume.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EncryptionConfig {
+    /// Remote-object encryption algorithm.
+    pub algorithm: EncryptionAlgorithm,
+    /// Active key identifier used by the initial implementation.
+    pub active_key_id: u32,
+    /// Encryption envelope format version.
+    pub format_version: u16,
+    /// Automatically generated 256-bit volume key material.
+    pub volume_master_key: [u8; ENCRYPTION_KEY_LENGTH],
+    /// Whether transparent encryption is enabled for the volume.
+    pub enabled: bool,
+}
+
+impl fmt::Debug for EncryptionConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EncryptionConfig")
+            .field("algorithm", &self.algorithm)
+            .field("active_key_id", &self.active_key_id)
+            .field("format_version", &self.format_version)
+            .field("volume_master_key", &"***")
+            .field("enabled", &self.enabled)
+            .finish()
+    }
+}
+
+impl EncryptionConfig {
+    /// Build the current supported encryption configuration from key material.
+    pub fn new(volume_master_key: [u8; ENCRYPTION_KEY_LENGTH]) -> Self {
+        Self {
+            algorithm: EncryptionAlgorithm::XChaCha20Poly1305V1,
+            active_key_id: CURRENT_ENCRYPTION_KEY_ID,
+            format_version: CURRENT_ENCRYPTION_FORMAT_VERSION,
+            volume_master_key,
+            enabled: true,
+        }
+    }
+
+    /// Generate a current encryption configuration with random volume key material.
+    pub fn generate() -> Self {
+        let mut volume_master_key = [0u8; ENCRYPTION_KEY_LENGTH];
+        rand::rng().fill(&mut volume_master_key);
+        Self::new(volume_master_key)
+    }
+
+    /// Validate that this config matches the only supported encryption contract.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Err("encryption must be enabled".to_string());
+        }
+        if self.algorithm != EncryptionAlgorithm::XChaCha20Poly1305V1 {
+            return Err("unsupported encryption algorithm".to_string());
+        }
+        if self.active_key_id != CURRENT_ENCRYPTION_KEY_ID {
+            return Err(format!(
+                "unsupported encryption key id: found {}, expected {}",
+                self.active_key_id, CURRENT_ENCRYPTION_KEY_ID
+            ));
+        }
+        if self.format_version != CURRENT_ENCRYPTION_FORMAT_VERSION {
+            return Err(format!(
+                "unsupported encryption format version: found {}, expected {}",
+                self.format_version, CURRENT_ENCRYPTION_FORMAT_VERSION
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// S3-style data-store settings used when constructing new [`FormatInfo`] values.
@@ -1571,8 +1660,14 @@ impl FormatInfo {
             region: data_store.region,
             data_prefix: String::new(),
             metadata: MetadataConfig::default(),
+            encryption: EncryptionConfig::generate(),
             block_size: block_size_mb * 1024 * 1024, // Convert MB to bytes
         }
+    }
+
+    /// Validate metadata format contracts enforced at mount/open boundaries.
+    pub fn validate_format_contract(&self) -> Result<(), String> {
+        self.encryption.validate()
     }
 
     /// Get block size in megabytes (for display purposes).

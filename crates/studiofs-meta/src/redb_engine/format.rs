@@ -26,7 +26,11 @@ impl RedbMetaEngine {
             .get("format")
             .map_err(|e| MetaError::Storage(e.to_string()))?
             .ok_or(MetaError::NotFormatted)?;
-        serde_json::from_slice(entry.value()).map_err(|e| MetaError::Serialization(e.to_string()))
+        let info: FormatInfo = serde_json::from_slice(entry.value())
+            .map_err(|e| MetaError::Serialization(e.to_string()))?;
+        info.validate_format_contract()
+            .map_err(MetaError::InvalidFormatConfig)?;
+        Ok(info)
     }
 
     #[cfg(test)]
@@ -41,12 +45,18 @@ impl RedbMetaEngine {
             .get("format")
             .map_err(|e| MetaError::Storage(e.to_string()))?
             .ok_or(MetaError::NotFormatted)?;
-        serde_json::from_slice(entry.value()).map_err(|e| MetaError::Serialization(e.to_string()))
+        let info: FormatInfo = serde_json::from_slice(entry.value())
+            .map_err(|e| MetaError::Serialization(e.to_string()))?;
+        info.validate_format_contract()
+            .map_err(MetaError::InvalidFormatConfig)?;
+        Ok(info)
     }
 }
 
 impl MetaFormat for RedbMetaEngine {
     fn set_format_info(&self, info: &FormatInfo) -> MetaResult<()> {
+        info.validate_format_contract()
+            .map_err(MetaError::InvalidFormatConfig)?;
         let json = serde_json::to_vec(info).map_err(|e| MetaError::Serialization(e.to_string()))?;
         let txn = self
             .db
@@ -79,6 +89,8 @@ impl MetaFormat for RedbMetaEngine {
             .ok_or(MetaError::NotFormatted)?;
         let info: FormatInfo = serde_json::from_slice(entry.value())
             .map_err(|e| MetaError::Serialization(e.to_string()))?;
+        info.validate_format_contract()
+            .map_err(MetaError::InvalidFormatConfig)?;
         Ok(info)
     }
 }

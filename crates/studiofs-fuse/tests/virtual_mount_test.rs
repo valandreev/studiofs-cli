@@ -116,6 +116,9 @@ fn test_macos_logic_smoke_virtual() {
         region: "us-east-1".into(),
         data_prefix: format!("{volume_name}/objects/"),
         metadata: MetadataConfig::default(),
+        encryption: studiofs_meta::EncryptionConfig::new(
+            [0xA5; studiofs_meta::ENCRYPTION_KEY_LENGTH],
+        ),
         block_size: 4 * 1024 * 1024,
     };
     meta.set_format_info(&format_info).expect("set format info");

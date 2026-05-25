@@ -10,9 +10,9 @@ use std::io::Write;
 use std::path::PathBuf;
 use studiofs_data::{DataStore, DataStoreConfig};
 use studiofs_meta::{
-    CURRENT_FORMAT_VERSION, DEFAULT_BLOCK_SIZE, FormatInfo, MetaFormat, MetaOpenOptions,
-    MetadataBackend, MetadataConfig, PostgresConfig, RedbMetaEngine, ensure_studiofs_database,
-    open_meta_engine_with_options,
+    CURRENT_FORMAT_VERSION, DEFAULT_BLOCK_SIZE, EncryptionConfig, FormatInfo, MetaFormat,
+    MetaOpenOptions, MetadataBackend, MetadataConfig, PostgresConfig, RedbMetaEngine,
+    ensure_studiofs_database, open_meta_engine_with_options,
 };
 use tracing::info;
 use uuid::Uuid;
@@ -541,6 +541,7 @@ fn run(request: InitRunRequest) -> anyhow::Result<()> {
                 volume_id: postgres_volume_id,
             }),
         },
+        encryption: EncryptionConfig::generate(),
         block_size: actual_block_size,
     };
     engine.set_format_info(&format_info)?;

@@ -257,6 +257,9 @@ fn create_local_metadata(
                 volume_id: pg_volume_id,
             }),
         },
+        encryption: studiofs_meta::EncryptionConfig::new(
+            [0xA5; studiofs_meta::ENCRYPTION_KEY_LENGTH],
+        ),
         block_size: DEFAULT_BLOCK_SIZE,
     };
     meta.set_format_info(&format_info).expect("set format info");
@@ -292,6 +295,9 @@ fn create_local_metadata_with_bad_s3_secret(
                 volume_id: pg_volume_id,
             }),
         },
+        encryption: studiofs_meta::EncryptionConfig::new(
+            [0xA5; studiofs_meta::ENCRYPTION_KEY_LENGTH],
+        ),
         block_size: DEFAULT_BLOCK_SIZE,
     };
     meta.set_format_info(&format_info).expect("set format info");

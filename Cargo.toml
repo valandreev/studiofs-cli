@@ -84,6 +84,7 @@ url = "2"
 unicode-normalization = "0.1"
 sysinfo = "0.37"
 smallvec = "1"
+rand = "0.9"
 
 # Internal crates
 studiofs-meta = { path = "crates/studiofs-meta" }
