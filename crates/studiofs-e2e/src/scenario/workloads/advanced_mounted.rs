@@ -1797,18 +1797,18 @@ pub(in crate::scenario) fn wait_for_mounted_payload_readback(
     let mut last_readback = None;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
+        let Some(probe_timeout) = mounted_payload_readback_probe_timeout(remaining) else {
             return last_readback.ok_or_else(|| {
                 ScenarioError::Io(io::Error::new(
                     io::ErrorKind::NotFound,
                     format!("mounted payload readback did not find {}", path.display()),
                 ))
             });
-        }
+        };
         match bounded_mounted_read(
             path.to_path_buf(),
             format!("readback {}", path.display()),
-            remaining.min(MOUNTED_WRITE_READBACK_TIMEOUT),
+            probe_timeout,
         ) {
             Ok(readback) if readback == payload => return Ok(readback),
             Ok(readback) => last_readback = Some(readback),
@@ -1825,6 +1825,15 @@ pub(in crate::scenario) fn wait_for_mounted_payload_readback(
         }
         thread::sleep(poll_interval.max(Duration::from_millis(1)));
     }
+}
+
+pub(in crate::scenario) fn mounted_payload_readback_probe_timeout(
+    remaining: Duration,
+) -> Option<Duration> {
+    if remaining < Duration::from_millis(1) {
+        return None;
+    }
+    Some(remaining.min(MOUNTED_WRITE_READBACK_TIMEOUT))
 }
 
 pub(in crate::scenario) fn mounted_write_barrier_open_options() -> OpenOptions {
