@@ -1,6 +1,7 @@
 //! SFEC envelope parser and framing contract tests.
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
+use opendal::Buffer;
 use std::sync::mpsc;
 use std::time::Duration;
 use studiofs_data::envelope::{
@@ -92,6 +93,35 @@ fn sfec_envelope_exposes_serialized_header_bytes_for_aad() {
 }
 
 #[test]
+fn sfec_envelope_buffer_serialization_reuses_ciphertext_bytes() {
+    let header = header_for_len(17);
+    let ciphertext = ciphertext_for(&header);
+    let ciphertext_ptr = ciphertext.as_ptr();
+    let header_bytes = header
+        .serialized_header()
+        .expect("serialize SFEC header for AAD");
+
+    let mut object =
+        SfecEnvelope::serialize_buffer(&header, ciphertext.clone()).expect("serialize buffer");
+
+    assert_eq!(
+        Buffer::count(&object),
+        2,
+        "expected header + ciphertext chunks"
+    );
+    assert_eq!(object.current(), header_bytes.as_ref());
+
+    object.advance(header_bytes.len());
+    let ciphertext_chunk = object.current();
+    assert_eq!(ciphertext_chunk, ciphertext.as_ref());
+    assert_eq!(
+        ciphertext_chunk.as_ptr(),
+        ciphertext_ptr,
+        "ciphertext chunk should reuse original Bytes allocation"
+    );
+}
+
+#[test]
 fn sfec_parser_rejects_malformed_headers() {
     let valid = envelope_for_len(17);
 
@@ -124,6 +154,13 @@ fn sfec_parser_rejects_malformed_headers() {
     assert_eq!(
         SfecEnvelope::parse(Bytes::from(invalid_frame_size)).unwrap_err(),
         SfecError::InvalidFrameSize(0)
+    );
+
+    let mut unsupported_flags = valid.clone();
+    unsupported_flags[12..14].copy_from_slice(&1u16.to_le_bytes());
+    assert_eq!(
+        SfecEnvelope::parse(Bytes::from(unsupported_flags)).unwrap_err(),
+        SfecError::UnsupportedFlags(1)
     );
 
     let mut rotated_key_id = valid.clone();
@@ -258,4 +295,12 @@ fn sfec_envelope_validates_empty_small_exact_and_partial_final_frames() {
         assert_eq!(parsed.header().frame_count(), expected_frames);
         assert_eq!(parsed.ciphertext().len(), expected_ciphertext_len);
     }
+}
+
+#[test]
+fn sfec_algorithm_reports_current_frame_tag_length() {
+    assert_eq!(
+        SfecAlgorithm::XChaCha20Poly1305V1.tag_len(),
+        SFEC_FRAME_TAG_LEN
+    );
 }

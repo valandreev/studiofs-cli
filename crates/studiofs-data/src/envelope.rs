@@ -5,7 +5,7 @@
 //! to the follow-up encryption/decryption layer.
 
 use bytes::{Buf, BufMut, Bytes};
-use std::io::Cursor;
+use opendal::Buffer;
 use thiserror::Error;
 
 /// Magic bytes for the encrypted StudioFS object envelope ("SFEC").
@@ -21,6 +21,7 @@ pub const DEFAULT_SFEC_FRAME_SIZE: usize = 1024 * 1024;
 pub const SFEC_FRAME_TAG_LEN: usize = 16;
 
 const SFEC_HEADER_FIXED_LEN: usize = 40;
+const SUPPORTED_SFEC_FLAGS: u16 = 0;
 const XCHACHA20_POLY1305_V1_ID: u16 = 1;
 
 /// Supported SFEC encryption algorithm.
@@ -31,6 +32,13 @@ pub enum SfecAlgorithm {
 }
 
 impl SfecAlgorithm {
+    /// Authentication tag length appended to each encrypted frame.
+    pub fn tag_len(self) -> usize {
+        match self {
+            Self::XChaCha20Poly1305V1 => SFEC_FRAME_TAG_LEN,
+        }
+    }
+
     fn wire_id(self) -> u16 {
         match self {
             Self::XChaCha20Poly1305V1 => XCHACHA20_POLY1305_V1_ID,
@@ -63,6 +71,9 @@ pub enum SfecError {
     /// The active key identifier is invalid.
     #[error("invalid SFEC key id: {0}")]
     InvalidKeyId(u32),
+    /// The serialized envelope uses unsupported flags.
+    #[error("unsupported SFEC flags: {0:#06x}")]
+    UnsupportedFlags(u16),
     /// A variable-length header field is too large for the SFEC v1 wire format.
     #[error("SFEC field too large: {0}")]
     FieldTooLarge(&'static str),
@@ -158,18 +169,18 @@ impl SfecHeader {
     }
 
     /// Wrapped data-encryption-key nonce bytes.
-    pub fn wrap_nonce(&self) -> &Bytes {
-        &self.wrap_nonce
+    pub fn wrap_nonce(&self) -> &[u8] {
+        self.wrap_nonce.as_ref()
     }
 
     /// Data frame nonce prefix bytes.
-    pub fn data_nonce_prefix(&self) -> &Bytes {
-        &self.data_nonce_prefix
+    pub fn data_nonce_prefix(&self) -> &[u8] {
+        self.data_nonce_prefix.as_ref()
     }
 
     /// Wrapped data-encryption key bytes.
-    pub fn wrapped_dek(&self) -> &Bytes {
-        &self.wrapped_dek
+    pub fn wrapped_dek(&self) -> &[u8] {
+        self.wrapped_dek.as_ref()
     }
 
     /// Serialize the exact SFEC header bytes.
@@ -191,7 +202,7 @@ impl SfecHeader {
         let plaintext_frame_len = remaining.min(full_frame_size);
         usize::try_from(plaintext_frame_len)
             .ok()?
-            .checked_add(SFEC_FRAME_TAG_LEN)
+            .checked_add(self.algorithm.tag_len())
     }
 
     fn header_len(&self) -> Result<usize, SfecError> {
@@ -210,7 +221,7 @@ impl SfecHeader {
         let full_frames = self.frame_count - 1;
         let full_frame_cipher_len = usize::try_from(self.frame_size)
             .ok()
-            .and_then(|frame_size| frame_size.checked_add(SFEC_FRAME_TAG_LEN))
+            .and_then(|frame_size| frame_size.checked_add(self.algorithm.tag_len()))
             .ok_or(SfecError::ObjectLengthOverflow)?;
         let full_frames_len = usize::try_from(full_frames)
             .map_err(|_| SfecError::ObjectLengthOverflow)?
@@ -228,6 +239,9 @@ impl SfecHeader {
     fn validate_shape(&self) -> Result<(), SfecError> {
         if self.key_id == 0 {
             return Err(SfecError::InvalidKeyId(self.key_id));
+        }
+        if self.flags & !SUPPORTED_SFEC_FLAGS != 0 {
+            return Err(SfecError::UnsupportedFlags(self.flags));
         }
         if self.frame_size == 0 {
             return Err(SfecError::InvalidFrameSize(self.frame_size));
@@ -253,15 +267,20 @@ pub struct SfecEnvelope {
 impl SfecEnvelope {
     /// Serialize a validated SFEC header followed by encrypted frames.
     pub fn serialize(header: &SfecHeader, ciphertext: &[u8]) -> Result<Bytes, SfecError> {
-        header.validate_shape()?;
-        validate_ciphertext_len(header, ciphertext.len())?;
-
         let header_bytes = serialize_header(header)?;
+        validate_ciphertext_len(header, ciphertext.len())?;
         let header_len = header_bytes.len();
         let mut bytes = Vec::with_capacity(header_len + ciphertext.len());
         bytes.put_slice(&header_bytes);
         bytes.put_slice(ciphertext);
         Ok(Bytes::from(bytes))
+    }
+
+    /// Serialize as header and ciphertext chunks without copying ciphertext bytes.
+    pub fn serialize_buffer(header: &SfecHeader, ciphertext: Bytes) -> Result<Buffer, SfecError> {
+        let header_bytes = serialize_header(header)?;
+        validate_ciphertext_len(header, ciphertext.len())?;
+        Ok(Buffer::from(vec![header_bytes, ciphertext]))
     }
 
     /// Parse and strictly validate a complete SFEC envelope.
@@ -270,7 +289,7 @@ impl SfecEnvelope {
             return Err(SfecError::TruncatedHeader);
         }
 
-        let mut fixed = Cursor::new(&data[..SFEC_HEADER_FIXED_LEN]);
+        let mut fixed = &data[..SFEC_HEADER_FIXED_LEN];
         let mut magic = [0u8; 4];
         fixed.copy_to_slice(&mut magic);
         if &magic != SFEC_MAGIC {

@@ -59,11 +59,15 @@ The raw serialized header bytes are part of the cryptographic boundary: the
 encryption layer must authenticate them as AEAD associated data when wrapping
 or unwrapping the data encryption key.
 
+Writers that already hold encrypted frame bytes as `Bytes` should use the
+chunked SFEC serializer so the object-store upload buffer can prepend the
+header without copying the full ciphertext payload.
+
 The default plaintext frame size is 1 MiB. The v1 parser validates the declared
-header length, non-zero key id, frame size, derived frame count, ciphertext
-length, and rejects malformed trailing data instead of falling back to plaintext
-object parsing. Key resolution for non-zero historical key ids belongs to the
-decryption layer rather than the wire-format parser.
+header length, zero flags, non-zero key id, frame size, derived frame count,
+ciphertext length, and rejects malformed trailing data instead of falling back
+to plaintext object parsing. Key resolution for non-zero historical key ids
+belongs to the decryption layer rather than the wire-format parser.
 
 In the active mounted runtime, `CachedStore` owns local cache hits, local
 payload staging, upload rereads, and runtime queueing. `DataStore` is the
