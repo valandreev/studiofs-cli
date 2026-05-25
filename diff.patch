@@ -1,0 +1,256 @@
+﻿diff --git a/crates/studiofs/tests/architecture_vocabulary_test.rs b/crates/studiofs/tests/architecture_vocabulary_test.rs
+index b0cffd76..da131a7a 100644
+--- a/crates/studiofs/tests/architecture_vocabulary_test.rs
++++ b/crates/studiofs/tests/architecture_vocabulary_test.rs
+@@ -668,6 +668,47 @@ fn e2e_runner_contract_covers_required_sfs341_surfaces() {
+     );
+ }
+ 
++#[test]
++fn encryption_at_rest_contract_covers_required_sfs346_boundaries() {
++    let doc = read_workspace_file("docs/encryption-at-rest-contract.md");
++    let normalized_doc = normalize_doc_whitespace(&doc);
++    let required_terms = [
++        "# Encryption-At-Rest Contract",
++        "XChaCha20-Poly1305 is the only supported algorithm",
++        "remote payload fragment",
++        "4 MiB",
++        "local payload cache stays plaintext",
++        "object storage stores only ciphertext",
++        "there is no legacy plaintext volume mode",
++        "all current and newly formatted volumes are encrypted at rest by default",
++        "protects against object storage and bucket compromise",
++        "does not encrypt filenames",
++        "does not encrypt file sizes",
++        "does not encrypt inode metadata",
++        "does not encrypt ACL metadata",
++        "does not encrypt PostgreSQL metadata",
++        "does not encrypt client process memory",
++        "does not protect against an attacker who can read PostgreSQL or local metadata",
++        "AES-256-GCM",
++        "RSA wrapping",
++        "user-facing encryption flags",
++        "passphrase prompts",
++        "KMS configuration",
++    ];
++
++    let missing: Vec<_> = required_terms
++        .iter()
++        .copied()
++        .filter(|term| !contains_doc_term(&doc, &normalized_doc, term))
++        .collect();
++
++    assert!(
++        missing.is_empty(),
++        "SFS-346 encryption-at-rest contract is missing required boundaries:\n{}",
++        missing.join("\n")
++    );
++}
++
+ #[test]
+ fn local_first_e2e_baseline_audit_covers_sfs402_surfaces() {
+     let doc = read_workspace_file("docs/local-first-e2e-baseline-audit.md");
+diff --git a/docs/architecture.md b/docs/architecture.md
+index 22a25bac..97559bda 100644
+--- a/docs/architecture.md
++++ b/docs/architecture.md
+@@ -15,6 +15,10 @@ Core principles:
+ - PostgreSQL is the bootstrap source, ordered replication bus, checkpoint
+   store, and shared-lock authority when cross-client file locks are enabled.
+ - File payloads live in immutable payload objects addressed by chunk-relative slices.
++- Encryption-at-rest is a remote object-store boundary contract documented in
++  [encryption-at-rest-contract.md](./encryption-at-rest-contract.md): local
++  cache/runtime payloads stay plaintext, while remote payload fragments are
++  encrypted before S3-compatible storage upload.
+ - Runtime visibility is split into writer state, the local metadata view, and
+   asynchronously replicated shared state.
+ - The UUID-scoped cache root itself is the runtime boundary of the current
+diff --git a/docs/data-layer.md b/docs/data-layer.md
+index 8bf0aedd..25ba3184 100644
+--- a/docs/data-layer.md
++++ b/docs/data-layer.md
+@@ -4,6 +4,8 @@
+ 
+ This document follows the canonical chunk/slice/payload-object vocabulary from
+ [juicefs-local-first-rust-contract.md](./juicefs-local-first-rust-contract.md).
++The transparent remote-object encryption boundary is defined in
++[encryption-at-rest-contract.md](./encryption-at-rest-contract.md).
+ 
+ ## Responsibilities
+ 
+@@ -13,6 +15,8 @@ This document follows the canonical chunk/slice/payload-object vocabulary from
+ - Read/write connection profile separation (`IoProfile`).
+ - Serve as the remote object-store boundary behind the VFS `CachedStore` pipeline.
+ - Hybrid cloud layout for chunks: one 16 MiB chunk is stored as four 4 MiB payload objects.
++- Encrypting each remote payload fragment before S3-compatible storage upload
++  once the encryption-at-rest contract is implemented.
+ 
+ ## S3 Key Layout
+ 
+@@ -33,6 +37,10 @@ Remote storage uses a 4x4 hybrid scheme:
+ - `block_index`: `0..3`
+ - Each fragment stores an independent STFS object payload (typically up to 4 MiB raw payload + 30-byte header).
+ - Fragment writes/retries are independent, so network failures only retry the affected piece.
++- Under the encryption-at-rest contract, each fragment remains the independent
++  encryption unit. Object storage receives ciphertext for the complete STFS
++  fragment object, and fetch decrypts before STFS header decode and checksum
++  validation.
+ 
+ In the active mounted runtime, `CachedStore` owns local cache hits, local
+ payload staging, upload rereads, and runtime queueing. `DataStore` is the
+diff --git a/docs/encryption-at-rest-contract.md b/docs/encryption-at-rest-contract.md
+new file mode 100644
+index 00000000..bb1e2654
+--- /dev/null
++++ b/docs/encryption-at-rest-contract.md
+@@ -0,0 +1,150 @@
++# Encryption-At-Rest Contract
++
++## Status
++
++This document is the implementation contract for transparent StudioFS
++encryption-at-rest of remote payload objects. It defines the required behavior
++for the encryption work tracked by SFS-346 and its implementation follow-ups;
++it is not a claim that older builds already encrypted remote objects.
++
++The mounted IO contract in
++[juicefs-local-first-rust-contract.md](./juicefs-local-first-rust-contract.md)
++remains the source of truth for foreground writeback behavior. Encryption must
++fit that shape instead of changing foreground visibility, flush, fetch,
++publication, or peer-convergence semantics.
++
++## Data Flow
++
++StudioFS encryption-at-rest is a remote object-store boundary feature:
++
++1. Foreground writes accept plaintext into writer state, RAM buffers, upload hot
++   buffers, slice-writer pages, upload stage files, and the local payload cache.
++2. The cached-store upload path builds the existing StudioFS object payload for
++   a single remote payload fragment.
++3. Before S3-compatible object storage upload, StudioFS encrypts the complete
++   StudioFS remote object for that fragment.
++4. Object storage stores only ciphertext.
++5. On remote fetch, StudioFS decrypts the object before passing plaintext bytes
++   to the existing object decoder and checksum validator.
++6. VFS, FUSE, WinFSP, writer stack, local cache, fetch scheduler, upload
++   scheduler, and file streaming semantics remain transparent to callers.
++
++The encryption unit is the current StudioFS remote payload fragment, not a
++whole user file. Current remote storage uses STFS fragment objects under
++`<volume>/objects/<ab>/<cd>/<object_id>/<block_index>` where each fragment is
++typically up to 4 MiB of raw payload plus the StudioFS object header. Each
++remote payload fragment is encrypted independently.
++
++## Plaintext And Ciphertext Boundaries
++
++Plaintext remains inside trusted local runtime boundaries:
++
++- mounted VFS read and write buffers;
++- FUSE and WinFSP callback buffers;
++- writer dirty state and slice-writer pages;
++- upload hot buffers and upload helpers;
++- local upload stage files;
++- local payload cache;
++- object decoder output and checksum validation input.
++
++The local payload cache stays plaintext. StudioFS does not encrypt local cache
++files, local metadata files, local upload-stage files, process memory, or bridge
++buffers as part of this contract.
++
++Ciphertext begins only at the remote object-store edge. The bytes submitted to
++S3-compatible storage for encrypted payload fragments are ciphertext, and
++object storage stores only ciphertext.
++
++## Algorithm Contract
++
++XChaCha20-Poly1305 is the only supported algorithm for the initial
++implementation. The implementation must not add algorithm negotiation or user
++selection.
++
++Out of scope:
++
++- AES-256-GCM;
++- ChaCha20-Poly1305 without extended nonce;
++- RSA wrapping;
++- SM2 or SM4;
++- configurable algorithm selection.
++
++## Volume Compatibility
++
++For this implementation contract, there is no legacy plaintext volume mode.
++Existing legacy plaintext StudioFS
++volumes do not need to remain readable through the encrypted-object
++implementation, and implementation work must not add plaintext fallback
++complexity for old StudioFS object layouts.
++
++The implementation target is that all current and newly formatted volumes are
++encrypted at rest by default. There are no user-facing encryption flags, no
++prompts, no passphrase prompts, no environment variables, no KMS configuration,
++and no additional runtime status signals required to enable encryption.
++
++The volume key is generated and stored automatically in StudioFS metadata so
++encryption remains transparent to users. That storage choice is part of the
++security boundary, not a hidden user-controlled secret feature.
++
++## Security Boundary
++
++This contract protects against object storage and bucket compromise. It protects
++remote payload object confidentiality and integrity for encrypted payload
++fragments.
++
++AEAD associated data must bind the ciphertext to the StudioFS remote-object
++identity. At minimum, associated data must cover the volume identity, remote
++object key, object ID, fragment index, object-format version, and encryption
++format version. This detects ciphertext tampering and object-key swapping: a
++ciphertext copied to a different remote object key or fragment identity must
++fail authentication before plaintext reaches the object decoder.
++
++The boundary does not include every StudioFS datum. StudioFS explicitly does
++not encrypt filenames, does not encrypt file sizes, does not encrypt inode
++metadata, does not encrypt ACL metadata, does not encrypt PostgreSQL metadata,
++and does not encrypt client process memory.
++
++StudioFS also does not protect against an attacker who can read PostgreSQL or
++local metadata where the automatically generated volume key is stored. This
++tradeoff is intentional because encryption must be completely transparent to
++users and must not introduce passphrases, KMS setup, or operator-managed key
++material.
++
++## Non-Goals
++
++This contract does not require:
++
++- encrypting the local payload cache;
++- encrypting local metadata, PostgreSQL metadata, filenames, sizes, inode
++  attributes, ACLs, xattrs, snapshots, or process memory;
++- encrypting whole user files as a single object;
++- supporting old plaintext remote object layouts;
++- supporting mixed encrypted/plaintext volumes;
++- adding user-facing options, prompts, environment variables, KMS
++  configuration, or passphrase flows;
++- adding AES, RSA, SM2/SM4, or configurable crypto agility;
++- changing foreground writeback, flush, fsync, close, publication, fetch, or
++  peer-convergence semantics.
++
++## Implementation Guardrails
++
++Encryption belongs at the remote object-store edge in `studiofs-data` and the
++upload/fetch paths that already own StudioFS object encode/decode boundaries.
++It must not create a second local payload authority or bypass `CachedStore`.
++
++Upload order:
++
++1. Build the STFS remote payload object for one fragment.
++2. Encrypt the full object bytes with XChaCha20-Poly1305.
++3. PUT ciphertext to object storage.
++4. Preserve the existing upload-completion and metadata-publication boundary.
++
++Fetch order:
++
++1. GET ciphertext from object storage.
++2. Authenticate and decrypt with XChaCha20-Poly1305 and associated data.
++3. Pass plaintext to the existing STFS object decoder.
++4. Run the existing checksum validator on decoded plaintext payload bytes.
++
++Authentication failure is a remote payload integrity failure. It must not fall
++back to plaintext decode or silently treat ciphertext as legacy object bytes.
