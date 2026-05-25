@@ -66,6 +66,10 @@ pub enum MetaError {
     #[error("serialization error: {0}")]
     Serialization(String),
 
+    /// Persisted format metadata is structurally valid but violates the current format contract.
+    #[error("invalid format config: {0}")]
+    InvalidFormatConfig(#[from] EncryptionContractError),
+
     /// The metadata store has not been initialized yet.
     #[error("format info not found — run `studiofs init` first")]
     NotFormatted,

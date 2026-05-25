@@ -775,6 +775,7 @@ mod tests {
             },
             u32::from(CURRENT_FORMAT_VERSION),
         )
+        .expect("generate format info")
     }
 
     #[test]

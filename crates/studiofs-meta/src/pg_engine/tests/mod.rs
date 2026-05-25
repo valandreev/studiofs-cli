@@ -779,6 +779,7 @@ fn format_info(name: &str, uuid: &str, dsn: &str, volume_id: i64) -> FormatInfo 
                 volume_id,
             }),
         },
+        encryption: EncryptionConfig::new([0xA5; ENCRYPTION_KEY_LENGTH]),
         block_size: DEFAULT_BLOCK_SIZE,
     }
 }

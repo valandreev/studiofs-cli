@@ -57,13 +57,14 @@ impl Default for MetaOpenOptions {
 }
 
 fn ensure_supported_format_version(info: &FormatInfo) -> MetaResult<()> {
-    if info.format_version == CURRENT_FORMAT_VERSION {
-        return Ok(());
+    if info.format_version != CURRENT_FORMAT_VERSION {
+        return Err(MetaError::UnsupportedFormatVersion {
+            found: info.format_version,
+            expected: CURRENT_FORMAT_VERSION,
+        });
     }
-    Err(MetaError::UnsupportedFormatVersion {
-        found: info.format_version,
-        expected: CURRENT_FORMAT_VERSION,
-    })
+    info.validate_format_contract()?;
+    Ok(())
 }
 
 /// Open metadata engine based on format settings.

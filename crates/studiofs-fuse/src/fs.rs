@@ -1684,6 +1684,9 @@ mod tests {
             region: "us-east-1".into(),
             data_prefix: format!("{volume_name}/objects/"),
             metadata: MetadataConfig::default(),
+            encryption: studiofs_meta::EncryptionConfig::new(
+                [0xA5; studiofs_meta::ENCRYPTION_KEY_LENGTH],
+            ),
             block_size: 4 * 1024 * 1024,
         }
     }

@@ -335,6 +335,9 @@ fn make_format_info(volume_suffix: &str) -> FormatInfo {
         region: "us-east-1".into(),
         data_prefix: format!("{volume_name}/objects/"),
         metadata: MetadataConfig::default(),
+        encryption: studiofs_meta::EncryptionConfig::new(
+            [0xA5; studiofs_meta::ENCRYPTION_KEY_LENGTH],
+        ),
         block_size: 4 * 1024 * 1024, // 4 MiB
     }
 }
@@ -1145,6 +1148,9 @@ fn pg_format_info(name: &str, uuid: &str, dsn: &str, volume_id: i64) -> FormatIn
                 volume_id,
             }),
         },
+        encryption: studiofs_meta::EncryptionConfig::new(
+            [0xA5; studiofs_meta::ENCRYPTION_KEY_LENGTH],
+        ),
         block_size: 4 * 1024 * 1024,
     }
 }
@@ -2060,7 +2066,7 @@ async fn test_background_janitor_cleans_simulated_crash_orphan() {
 
     // 3) Janitor should eventually detect object as orphan and delete it.
     assert!(
-        wait_until_object_absent(&ds, &info.data_prefix, object_id, Duration::from_secs(25)).await,
+        wait_until_object_absent(&ds, &info.data_prefix, object_id, online_publish_timeout()).await,
         "background janitor should clean orphan object from simulated crash"
     );
 }

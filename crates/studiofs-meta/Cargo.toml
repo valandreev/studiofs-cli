@@ -21,6 +21,8 @@ url.workspace = true
 uuid.workspace = true
 bitflags = { version = "2.4", features = ["serde"] }
 tempfile.workspace = true
+rand.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 dotenvy.workspace = true

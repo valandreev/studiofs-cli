@@ -3,8 +3,9 @@
 use crate::engine::DeferredDeleteRecord;
 use crate::engine::MetaGc;
 use crate::schema::{
-    CURRENT_FORMAT_VERSION, FileType, FormatInfo, InodeAttr, InodeLifecycleRecord,
-    InodeLifecycleState, MetadataConfig, ROOT_INO, RenameAtomicResult,
+    CURRENT_FORMAT_VERSION, ENCRYPTION_KEY_LENGTH, EncryptionConfig, FileType, FormatInfo,
+    InodeAttr, InodeLifecycleRecord, InodeLifecycleState, MetadataConfig, ROOT_INO,
+    RenameAtomicResult,
 };
 use crate::{
     MetaError, MetaFormat, MetaFsOps, MetaInodes, MetaNamespace, MetaPayloadObjects, MetaRecovery,
@@ -835,6 +836,7 @@ pub fn contract_format_info(label: &str) -> FormatInfo {
         region: "us-east-1".to_string(),
         data_prefix: format!("{name}/objects/"),
         metadata: MetadataConfig::default(),
+        encryption: EncryptionConfig::new([0xA5; ENCRYPTION_KEY_LENGTH]),
         block_size: crate::schema::DEFAULT_BLOCK_SIZE,
     }
 }

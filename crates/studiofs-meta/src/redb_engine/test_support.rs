@@ -12,6 +12,7 @@ pub(super) fn test_format_info(name: &str) -> FormatInfo {
         region: "".into(),
         data_prefix: format!("{name}/objects/"),
         metadata: MetadataConfig::default(),
+        encryption: EncryptionConfig::new([0xA5; ENCRYPTION_KEY_LENGTH]),
         block_size: DEFAULT_BLOCK_SIZE,
     }
 }

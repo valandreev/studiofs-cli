@@ -1394,6 +1394,23 @@ fn mounted_payload_readback_distinguishes_missing_path_from_empty_file() {
 }
 
 #[test]
+fn mounted_payload_readback_does_not_start_zero_millisecond_probe() {
+    assert_eq!(
+        mounted_payload_readback_probe_timeout(Duration::from_micros(500)),
+        None,
+        "sub-millisecond deadline remainder would report timeout_ms=0"
+    );
+    assert_eq!(
+        mounted_payload_readback_probe_timeout(Duration::from_millis(1)),
+        Some(Duration::from_millis(1))
+    );
+    assert_eq!(
+        mounted_payload_readback_probe_timeout(MOUNTED_WRITE_READBACK_TIMEOUT * 2),
+        Some(MOUNTED_WRITE_READBACK_TIMEOUT)
+    );
+}
+
+#[test]
 fn bounded_mounted_io_times_out_blocked_operation() {
     let pool = BoundedMountedIoPool::new(1);
 

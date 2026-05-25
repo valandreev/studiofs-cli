@@ -97,7 +97,7 @@ impl RedbMetaEngine {
         let _ = engine.recover_undo_logs()?;
 
         match engine.get_format_info() {
-            Ok(format_info) if format_info.format_version >= CURRENT_FORMAT_VERSION => {
+            Ok(format_info) if format_info.format_version == CURRENT_FORMAT_VERSION => {
                 engine.ensure_inode_lifecycle_table()?;
                 debug!(
                     "format version {} is up to date",
