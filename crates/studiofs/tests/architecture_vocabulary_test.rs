@@ -694,11 +694,15 @@ fn encryption_at_rest_contract_covers_required_sfs346_boundaries() {
         "user-facing encryption flags",
         "passphrase prompts",
         "KMS configuration",
+        "cryptographically secure random 256-bit volume key",
+        "cryptographically secure random 192-bit nonce",
+        "24-byte nonce",
+        "nonce prefix",
+        "replay of an older valid ciphertext for the same remote-object identity",
     ];
 
     let missing: Vec<_> = required_terms
-        .iter()
-        .copied()
+        .into_iter()
         .filter(|term| !contains_doc_term(&doc, &normalized_doc, term))
         .collect();
 
