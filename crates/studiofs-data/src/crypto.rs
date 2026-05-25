@@ -92,7 +92,7 @@ pub fn encrypt_object(
     let wrapping_key = derive_wrapping_key(master_key, context)?;
     let plaintext_len =
         u64::try_from(plaintext.len()).map_err(|_| CryptoError::FrameLayoutOverflow)?;
-    let wrap_aad = wrap_aad(context, plaintext_len, &data_nonce_prefix)?;
+    let wrap_aad = wrap_aad(context.key_id, context, plaintext_len, &data_nonce_prefix)?;
     let wrapped_dek = encrypt_with_key(&wrapping_key, &wrap_nonce, &wrap_aad, dek.as_ref())?;
 
     let header = SfecHeader::new(
@@ -105,7 +105,14 @@ pub fn encrypt_object(
         Bytes::from(wrapped_dek),
     )?;
     let header_bytes = header.serialized_header()?;
-    let ciphertext = encrypt_frames(plaintext, &dek, &data_nonce_prefix, &header_bytes, context)?;
+    let ciphertext = encrypt_frames(
+        plaintext,
+        &dek,
+        &data_nonce_prefix,
+        &header_bytes,
+        context.key_id,
+        context,
+    )?;
 
     SfecEnvelope::serialize_buffer(&header, Bytes::from(ciphertext)).map_err(CryptoError::from)
 }
@@ -118,15 +125,16 @@ pub fn decrypt_object(
 ) -> Result<Bytes, CryptoError> {
     let envelope = SfecEnvelope::parse(envelope)?;
     let header = envelope.header();
-    if header.key_id() != context.key_id {
-        return Err(CryptoError::AuthenticationFailed);
-    }
-
     let wrap_nonce = fixed_slice::<XNONCE_LEN>("wrap_nonce", header.wrap_nonce())?;
     let data_nonce_prefix =
         fixed_slice::<DATA_NONCE_PREFIX_LEN>("data_nonce_prefix", header.data_nonce_prefix())?;
     let wrapping_key = derive_wrapping_key(master_key, context)?;
-    let wrap_aad = wrap_aad(context, header.plaintext_len(), &data_nonce_prefix)?;
+    let wrap_aad = wrap_aad(
+        header.key_id(),
+        context,
+        header.plaintext_len(),
+        &data_nonce_prefix,
+    )?;
     let dek = decrypt_with_key(&wrapping_key, &wrap_nonce, &wrap_aad, header.wrapped_dek())?;
     let dek_bytes: &[u8; KEY_LEN] = dek
         .as_slice()
@@ -138,6 +146,7 @@ pub fn decrypt_object(
         dek_bytes,
         &data_nonce_prefix,
         envelope.header_bytes(),
+        header.key_id(),
         context,
         header,
     )
@@ -168,10 +177,11 @@ fn encrypt_frames(
     dek: &[u8; KEY_LEN],
     data_nonce_prefix: &[u8; DATA_NONCE_PREFIX_LEN],
     header_bytes: &[u8],
+    key_id: u32,
     context: ObjectEncryptionContext<'_>,
 ) -> Result<Vec<u8>, CryptoError> {
     let cipher = XChaCha20Poly1305::new(Key::from_slice(dek));
-    let frame_count = plaintext.chunks(DEFAULT_ENCRYPTION_FRAME_SIZE).count();
+    let frame_count = plaintext.len().div_ceil(DEFAULT_ENCRYPTION_FRAME_SIZE);
     let output_len = plaintext
         .len()
         .checked_add(
@@ -181,7 +191,7 @@ fn encrypt_frames(
         )
         .ok_or(CryptoError::FrameLayoutOverflow)?;
     let mut output = Vec::with_capacity(output_len);
-    let mut aad = frame_aad_base(context, header_bytes)?;
+    let mut aad = frame_aad_base(key_id, context, header_bytes)?;
     let aad_base_len = aad.len();
 
     for (frame_index, frame) in plaintext.chunks(DEFAULT_ENCRYPTION_FRAME_SIZE).enumerate() {
@@ -206,6 +216,7 @@ fn decrypt_frames(
     dek: &[u8; KEY_LEN],
     data_nonce_prefix: &[u8; DATA_NONCE_PREFIX_LEN],
     header_bytes: &[u8],
+    key_id: u32,
     context: ObjectEncryptionContext<'_>,
     header: &SfecHeader,
 ) -> Result<Bytes, CryptoError> {
@@ -214,7 +225,7 @@ fn decrypt_frames(
         usize::try_from(header.plaintext_len()).map_err(|_| CryptoError::FrameLayoutOverflow)?;
     let mut plaintext = Vec::with_capacity(plaintext_len);
     let mut offset = 0usize;
-    let mut aad = frame_aad_base(context, header_bytes)?;
+    let mut aad = frame_aad_base(key_id, context, header_bytes)?;
     let aad_base_len = aad.len();
 
     for frame_index in 0..header.frame_count() {
@@ -293,12 +304,13 @@ fn decrypt_with_key(
 }
 
 fn wrap_aad(
+    key_id: u32,
     context: ObjectEncryptionContext<'_>,
     plaintext_len: u64,
     data_nonce_prefix: &[u8; DATA_NONCE_PREFIX_LEN],
 ) -> Result<Vec<u8>, CryptoError> {
     let mut aad = Vec::with_capacity(256);
-    put_common_aad(&mut aad, context)?;
+    put_common_aad(&mut aad, key_id, context)?;
     aad.put_u64_le(plaintext_len);
     aad.put_u32_le(DEFAULT_ENCRYPTION_FRAME_SIZE as u32);
     aad.put_slice(data_nonce_prefix);
@@ -306,11 +318,12 @@ fn wrap_aad(
 }
 
 fn frame_aad_base(
+    key_id: u32,
     context: ObjectEncryptionContext<'_>,
     header_bytes: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
     let mut aad = Vec::with_capacity(header_bytes.len() + 256);
-    put_common_aad(&mut aad, context)?;
+    put_common_aad(&mut aad, key_id, context)?;
     aad.put_slice(header_bytes);
     Ok(aad)
 }
@@ -322,13 +335,14 @@ fn set_frame_aad(aad: &mut Vec<u8>, base_len: usize, frame_index: u32) {
 
 fn put_common_aad(
     aad: &mut Vec<u8>,
+    key_id: u32,
     context: ObjectEncryptionContext<'_>,
 ) -> Result<(), CryptoError> {
     aad.put_slice(b"studiofs-sfec-aad-v1");
     aad.put_u16_le(SFEC_VERSION);
     aad.put_slice(b"xchacha20poly1305-v1");
     aad.put_u16_le(SfecAlgorithm::XChaCha20Poly1305V1.tag_len() as u16);
-    aad.put_u32_le(context.key_id);
+    aad.put_u32_le(key_id);
     aad.put_u32_le(
         u32::try_from(context.volume_uuid.len()).map_err(|_| CryptoError::AadLengthOverflow)?,
     );
@@ -438,13 +452,20 @@ mod tests {
             decrypt_object(ciphertext, &MASTER_KEY, wrong_volume),
             Err(CryptoError::AuthenticationFailed)
         ));
+    }
 
-        let wrong_key_id = ObjectEncryptionContext { key_id: 8, ..ctx };
-        let ciphertext = encrypt_object_bytes(b"bound key id", &MASTER_KEY, ctx);
-        assert!(matches!(
-            decrypt_object(ciphertext, &MASTER_KEY, wrong_key_id),
-            Err(CryptoError::AuthenticationFailed)
-        ));
+    #[test]
+    fn decrypt_accepts_historical_key_id_from_envelope() {
+        let old_key_context = context("vol/objects/0000/0000000000000004/0");
+        let current_key_context = ObjectEncryptionContext {
+            key_id: 8,
+            ..old_key_context
+        };
+        let ciphertext = encrypt_object_bytes(b"historical key id", &MASTER_KEY, old_key_context);
+
+        let decrypted = decrypt_object(ciphertext, &MASTER_KEY, current_key_context).unwrap();
+
+        assert_eq!(decrypted.as_ref(), b"historical key id");
     }
 
     #[test]
