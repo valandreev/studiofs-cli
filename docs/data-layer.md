@@ -4,6 +4,8 @@
 
 This document follows the canonical chunk/slice/payload-object vocabulary from
 [juicefs-local-first-rust-contract.md](./juicefs-local-first-rust-contract.md).
+The transparent remote-object encryption boundary is defined in
+[encryption-at-rest-contract.md](./encryption-at-rest-contract.md).
 
 ## Responsibilities
 
@@ -13,6 +15,8 @@ This document follows the canonical chunk/slice/payload-object vocabulary from
 - Read/write connection profile separation (`IoProfile`).
 - Serve as the remote object-store boundary behind the VFS `CachedStore` pipeline.
 - Hybrid cloud layout for chunks: one 16 MiB chunk is stored as four 4 MiB payload objects.
+- Encrypting each remote payload fragment before S3-compatible storage upload
+  once the encryption-at-rest contract is implemented.
 
 ## S3 Key Layout
 
@@ -33,6 +37,10 @@ Remote storage uses a 4x4 hybrid scheme:
 - `block_index`: `0..3`
 - Each fragment stores an independent STFS object payload (typically up to 4 MiB raw payload + 30-byte header).
 - Fragment writes/retries are independent, so network failures only retry the affected piece.
+- Under the encryption-at-rest contract, each fragment remains the independent
+  encryption unit. Object storage receives ciphertext for the complete STFS
+  fragment object, and fetch decrypts before STFS header decode and checksum
+  validation.
 
 In the active mounted runtime, `CachedStore` owns local cache hits, local
 payload staging, upload rereads, and runtime queueing. `DataStore` is the
