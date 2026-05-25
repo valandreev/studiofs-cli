@@ -15,6 +15,10 @@ Core principles:
 - PostgreSQL is the bootstrap source, ordered replication bus, checkpoint
   store, and shared-lock authority when cross-client file locks are enabled.
 - File payloads live in immutable payload objects addressed by chunk-relative slices.
+- Encryption-at-rest is a remote object-store boundary contract documented in
+  [encryption-at-rest-contract.md](./encryption-at-rest-contract.md): local
+  cache/runtime payloads stay plaintext, while remote payload fragments are
+  encrypted before S3-compatible storage upload.
 - Runtime visibility is split into writer state, the local metadata view, and
   asynchronously replicated shared state.
 - The UUID-scoped cache root itself is the runtime boundary of the current

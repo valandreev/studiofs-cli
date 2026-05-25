@@ -669,6 +669,47 @@ fn e2e_runner_contract_covers_required_sfs341_surfaces() {
 }
 
 #[test]
+fn encryption_at_rest_contract_covers_required_sfs346_boundaries() {
+    let doc = read_workspace_file("docs/encryption-at-rest-contract.md");
+    let normalized_doc = normalize_doc_whitespace(&doc);
+    let required_terms = [
+        "# Encryption-At-Rest Contract",
+        "XChaCha20-Poly1305 is the only supported algorithm",
+        "remote payload fragment",
+        "4 MiB",
+        "local payload cache stays plaintext",
+        "object storage stores only ciphertext",
+        "there is no legacy plaintext volume mode",
+        "all current and newly formatted volumes are encrypted at rest by default",
+        "protects against object storage and bucket compromise",
+        "does not encrypt filenames",
+        "does not encrypt file sizes",
+        "does not encrypt inode metadata",
+        "does not encrypt ACL metadata",
+        "does not encrypt PostgreSQL metadata",
+        "does not encrypt client process memory",
+        "does not protect against an attacker who can read PostgreSQL or local metadata",
+        "AES-256-GCM",
+        "RSA wrapping",
+        "user-facing encryption flags",
+        "passphrase prompts",
+        "KMS configuration",
+    ];
+
+    let missing: Vec<_> = required_terms
+        .iter()
+        .copied()
+        .filter(|term| !contains_doc_term(&doc, &normalized_doc, term))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "SFS-346 encryption-at-rest contract is missing required boundaries:\n{}",
+        missing.join("\n")
+    );
+}
+
+#[test]
 fn local_first_e2e_baseline_audit_covers_sfs402_surfaces() {
     let doc = read_workspace_file("docs/local-first-e2e-baseline-audit.md");
     let required_terms = [
