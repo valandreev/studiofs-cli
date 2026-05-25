@@ -2066,7 +2066,7 @@ async fn test_background_janitor_cleans_simulated_crash_orphan() {
 
     // 3) Janitor should eventually detect object as orphan and delete it.
     assert!(
-        wait_until_object_absent(&ds, &info.data_prefix, object_id, Duration::from_secs(25)).await,
+        wait_until_object_absent(&ds, &info.data_prefix, object_id, online_publish_timeout()).await,
         "background janitor should clean orphan object from simulated crash"
     );
 }
