@@ -177,6 +177,14 @@ impl SfecHeader {
         &self.wrapped_dek
     }
 
+    /// Serialize the exact SFEC header bytes.
+    ///
+    /// The encryption layer must authenticate these bytes as AEAD associated
+    /// data when wrapping or unwrapping the data encryption key.
+    pub fn serialized_header(&self) -> Result<Bytes, SfecError> {
+        serialize_header(self)
+    }
+
     /// Encrypted frame length including AEAD tag for a frame index.
     pub fn encrypted_frame_len(&self, frame_index: u32) -> Option<usize> {
         if frame_index >= self.frame_count {
@@ -243,35 +251,21 @@ impl SfecHeader {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SfecEnvelope {
     header: SfecHeader,
+    header_bytes: Bytes,
     ciphertext: Bytes,
 }
 
 impl SfecEnvelope {
     /// Serialize a validated SFEC header followed by encrypted frames.
-    pub fn serialize(header: SfecHeader, ciphertext: Bytes) -> Result<Bytes, SfecError> {
+    pub fn serialize(header: &SfecHeader, ciphertext: &[u8]) -> Result<Bytes, SfecError> {
         header.validate_shape()?;
-        validate_ciphertext_len(&header, ciphertext.len())?;
+        validate_ciphertext_len(header, ciphertext.len())?;
 
-        let header_len = header.header_len()?;
-        let header_len_u32 =
-            u32::try_from(header_len).map_err(|_| SfecError::ObjectLengthOverflow)?;
+        let header_bytes = serialize_header(header)?;
+        let header_len = header_bytes.len();
         let mut bytes = Vec::with_capacity(header_len + ciphertext.len());
-        bytes.put_slice(SFEC_MAGIC);
-        bytes.put_u16_le(SFEC_VERSION);
-        bytes.put_u32_le(header_len_u32);
-        bytes.put_u16_le(header.algorithm.wire_id());
-        bytes.put_u16_le(header.flags);
-        bytes.put_u32_le(header.key_id);
-        bytes.put_u64_le(header.plaintext_len);
-        bytes.put_u32_le(header.frame_size);
-        bytes.put_u32_le(header.frame_count);
-        bytes.put_u16_le(header.wrap_nonce.len() as u16);
-        bytes.put_u16_le(header.data_nonce_prefix.len() as u16);
-        bytes.put_u16_le(header.wrapped_dek.len() as u16);
-        bytes.put_slice(&header.wrap_nonce);
-        bytes.put_slice(&header.data_nonce_prefix);
-        bytes.put_slice(&header.wrapped_dek);
-        bytes.put_slice(&ciphertext);
+        bytes.put_slice(&header_bytes);
+        bytes.put_slice(ciphertext);
         Ok(Bytes::from(bytes))
     }
 
@@ -340,15 +334,25 @@ impl SfecEnvelope {
         };
         header.validate_shape()?;
 
+        let header_bytes = data.slice(..ciphertext_start);
         let ciphertext = data.slice(ciphertext_start..);
         validate_ciphertext_len(&header, ciphertext.len())?;
 
-        Ok(Self { header, ciphertext })
+        Ok(Self {
+            header,
+            header_bytes,
+            ciphertext,
+        })
     }
 
     /// Parsed SFEC header.
     pub fn header(&self) -> &SfecHeader {
         &self.header
+    }
+
+    /// Exact serialized header bytes to authenticate as AEAD associated data.
+    pub fn header_bytes(&self) -> &Bytes {
+        &self.header_bytes
     }
 
     /// Encrypted frame bytes following the header.
@@ -357,10 +361,41 @@ impl SfecEnvelope {
     }
 }
 
+fn serialize_header(header: &SfecHeader) -> Result<Bytes, SfecError> {
+    header.validate_shape()?;
+
+    let header_len = header.header_len()?;
+    let header_len_u32 = u32::try_from(header_len).map_err(|_| SfecError::ObjectLengthOverflow)?;
+    let wrap_nonce_len = checked_u16_len("wrap_nonce", header.wrap_nonce.len())?;
+    let data_nonce_prefix_len =
+        checked_u16_len("data_nonce_prefix", header.data_nonce_prefix.len())?;
+    let wrapped_dek_len = checked_u16_len("wrapped_dek", header.wrapped_dek.len())?;
+
+    let mut bytes = Vec::with_capacity(header_len);
+    bytes.put_slice(SFEC_MAGIC);
+    bytes.put_u16_le(SFEC_VERSION);
+    bytes.put_u32_le(header_len_u32);
+    bytes.put_u16_le(header.algorithm.wire_id());
+    bytes.put_u16_le(header.flags);
+    bytes.put_u32_le(header.key_id);
+    bytes.put_u64_le(header.plaintext_len);
+    bytes.put_u32_le(header.frame_size);
+    bytes.put_u32_le(header.frame_count);
+    bytes.put_u16_le(wrap_nonce_len);
+    bytes.put_u16_le(data_nonce_prefix_len);
+    bytes.put_u16_le(wrapped_dek_len);
+    bytes.put_slice(&header.wrap_nonce);
+    bytes.put_slice(&header.data_nonce_prefix);
+    bytes.put_slice(&header.wrapped_dek);
+    Ok(Bytes::from(bytes))
+}
+
+fn checked_u16_len(field: &'static str, len: usize) -> Result<u16, SfecError> {
+    u16::try_from(len).map_err(|_| SfecError::FieldTooLarge(field))
+}
+
 fn validate_variable_len(field: &'static str, len: usize) -> Result<(), SfecError> {
-    u16::try_from(len)
-        .map(|_| ())
-        .map_err(|_| SfecError::FieldTooLarge(field))
+    checked_u16_len(field, len).map(|_| ())
 }
 
 fn expected_frame_count(plaintext_len: u64, frame_size: u32) -> Result<u32, SfecError> {
@@ -371,7 +406,7 @@ fn expected_frame_count(plaintext_len: u64, frame_size: u32) -> Result<u32, Sfec
         return Ok(0);
     }
     let frame_size = u64::from(frame_size);
-    let frames = (plaintext_len - 1) / frame_size + 1;
+    let frames = plaintext_len.div_ceil(frame_size);
     u32::try_from(frames).map_err(|_| SfecError::ObjectLengthOverflow)
 }
 

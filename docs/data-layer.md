@@ -55,6 +55,10 @@ plaintext length, frame size, frame count, wrap nonce length, data nonce prefix
 length, wrapped DEK length, then the variable wrap nonce, data nonce prefix,
 and wrapped DEK bytes. Encrypted frames follow the header.
 
+The raw serialized header bytes are part of the cryptographic boundary: the
+encryption layer must authenticate them as AEAD associated data when wrapping
+or unwrapping the data encryption key.
+
 The default plaintext frame size is 1 MiB. The v1 parser validates the declared
 header length, non-zero key id, frame size, derived frame count, ciphertext
 length, and rejects malformed trailing data instead of falling back to plaintext

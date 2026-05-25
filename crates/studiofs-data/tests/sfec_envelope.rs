@@ -37,7 +37,8 @@ fn ciphertext_for(header: &SfecHeader) -> Bytes {
 
 fn envelope_for_len(plaintext_len: u64) -> Vec<u8> {
     let header = header_for_len(plaintext_len);
-    SfecEnvelope::serialize(header.clone(), ciphertext_for(&header))
+    let ciphertext = ciphertext_for(&header);
+    SfecEnvelope::serialize(&header, &ciphertext)
         .expect("serialize SFEC envelope")
         .to_vec()
 }
@@ -45,8 +46,8 @@ fn envelope_for_len(plaintext_len: u64) -> Vec<u8> {
 #[test]
 fn sfec_header_roundtrip_preserves_encryption_metadata() {
     let header = header_for_len((DEFAULT_SFEC_FRAME_SIZE as u64) + 17);
-    let bytes = SfecEnvelope::serialize(header.clone(), ciphertext_for(&header))
-        .expect("serialize SFEC envelope");
+    let ciphertext = ciphertext_for(&header);
+    let bytes = SfecEnvelope::serialize(&header, &ciphertext).expect("serialize SFEC envelope");
 
     let parsed = SfecEnvelope::parse(bytes).expect("parse SFEC envelope");
 
@@ -55,6 +56,23 @@ fn sfec_header_roundtrip_preserves_encryption_metadata() {
         parsed.ciphertext().len(),
         DEFAULT_SFEC_FRAME_SIZE + SFEC_FRAME_TAG_LEN + 17 + SFEC_FRAME_TAG_LEN
     );
+}
+
+#[test]
+fn sfec_envelope_exposes_serialized_header_bytes_for_aad() {
+    let header = header_for_len(17);
+    let ciphertext = ciphertext_for(&header);
+    let header_bytes = header
+        .serialized_header()
+        .expect("serialize SFEC header for AAD");
+    let envelope = SfecEnvelope::serialize(&header, ciphertext.as_ref())
+        .expect("serialize SFEC envelope from borrowed ciphertext");
+
+    assert_eq!(&envelope[..header_bytes.len()], header_bytes.as_ref());
+
+    let parsed = SfecEnvelope::parse(envelope).expect("parse SFEC envelope");
+    assert_eq!(parsed.header(), &header);
+    assert_eq!(parsed.header_bytes(), &header_bytes);
 }
 
 #[test]
