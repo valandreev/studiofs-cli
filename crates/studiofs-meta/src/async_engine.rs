@@ -60,7 +60,8 @@ mod tests {
                 region: String::new(),
             },
             16,
-        );
+        )
+        .expect("generate format info");
         engine.set_format_info(&info).expect("set format info");
         (temp, engine)
     }

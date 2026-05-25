@@ -1557,8 +1557,8 @@ impl EncryptionConfig {
     }
 
     /// Generate a current encryption configuration with random volume key material.
-    pub fn generate() -> Self {
-        Self::try_generate().expect("operating-system randomness must be available")
+    pub fn generate() -> Result<Self, EncryptionContractError> {
+        Self::try_generate()
     }
 
     /// Generate a current encryption configuration with random volume key material.
@@ -1688,8 +1688,8 @@ impl FormatInfo {
         uuid: String,
         data_store: FormatInfoDataStore,
         block_size_mb: u32,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, EncryptionContractError> {
+        Ok(Self {
             format_version: CURRENT_FORMAT_VERSION,
             name,
             uuid,
@@ -1700,9 +1700,9 @@ impl FormatInfo {
             region: data_store.region,
             data_prefix: String::new(),
             metadata: MetadataConfig::default(),
-            encryption: EncryptionConfig::generate(),
+            encryption: EncryptionConfig::generate()?,
             block_size: block_size_mb * 1024 * 1024, // Convert MB to bytes
-        }
+        })
     }
 
     /// Validate metadata format contracts enforced at mount/open boundaries.

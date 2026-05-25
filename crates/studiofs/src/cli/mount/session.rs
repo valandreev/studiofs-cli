@@ -1848,7 +1848,8 @@ mod tests {
                 region: String::new(),
             },
             4,
-        );
+        )
+        .expect("generate format info");
         engine
             .set_format_info(&format_info)
             .expect("set format info");
@@ -1980,7 +1981,8 @@ mod tests {
                 region: String::new(),
             },
             4,
-        );
+        )
+        .expect("generate format info");
         let vfs_config = VfsConfigRaw {
             janitor_interval_secs: Some(1800),
             janitor_skip_newer_secs: Some(900),

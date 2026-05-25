@@ -129,6 +129,30 @@ fn encryption_config_validation_rejects_disabled_or_unsupported_values() {
 }
 
 #[test]
+fn generated_encryption_config_and_format_info_use_fallible_contract() {
+    let encryption = EncryptionConfig::generate().expect("generate encryption config");
+    encryption.validate().expect("generated config is valid");
+
+    let info = FormatInfo::new(
+        "generated-vol".into(),
+        "generated-uuid".into(),
+        FormatInfoDataStore {
+            endpoint: "http://localhost:9000".into(),
+            bucket: "generated-bucket".into(),
+            access_key: "studiofs".into(),
+            secret_key: "studiofs123".into(),
+            region: String::new(),
+        },
+        16,
+    )
+    .expect("generate format info");
+
+    info.validate_format_contract()
+        .expect("generated format info is valid");
+    assert_ne!(info.encryption.volume_master_key, [0; ENCRYPTION_KEY_LENGTH]);
+}
+
+#[test]
 fn encryption_config_deserialization_rejects_malformed_or_unsupported_json() {
     let short_key = serde_json::json!({
         "algorithm": "xchacha20poly1305-v1",
