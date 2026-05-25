@@ -10,14 +10,15 @@ use std::io::Write;
 use std::path::PathBuf;
 use studiofs_data::{DataStore, DataStoreConfig};
 use studiofs_meta::{
-    CURRENT_FORMAT_VERSION, DEFAULT_BLOCK_SIZE, EncryptionConfig, FormatInfo, MetaFormat,
-    MetaOpenOptions, MetadataBackend, MetadataConfig, PostgresConfig, RedbMetaEngine,
+    CURRENT_FORMAT_VERSION, DEFAULT_BLOCK_SIZE, EncryptionAlgorithm, EncryptionConfig, FormatInfo,
+    MetaFormat, MetaOpenOptions, MetadataBackend, MetadataConfig, PostgresConfig, RedbMetaEngine,
     ensure_studiofs_database, open_meta_engine_with_options,
 };
 use tracing::info;
 use uuid::Uuid;
 
 const INITIAL_METADATA_STATE_VERSION: i64 = 0;
+const ACTIVE_CRYPTO_KEY_STATE: &str = "active";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -282,42 +283,57 @@ fn volume_name_exists(rt: &tokio::runtime::Runtime, dsn: &str, name: &str) -> an
     })
 }
 
-fn init_pg_schema_and_volume(
-    rt: &tokio::runtime::Runtime,
-    dsn: &str,
-    name: &str,
-    uuid: &str,
-    block_size: u32,
-) -> anyhow::Result<i64> {
-    rt.block_on(async {
-        let block_size_i32 = i32::try_from(block_size).map_err(|_| {
-            anyhow::anyhow!("block size {block_size} exceeds PostgreSQL INTEGER range")
-        })?;
-        let (mut client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
-            .await
-            .map_err(|e| anyhow::anyhow!("cannot connect to postgres: {e}"))?;
+struct ActiveCryptoKeyRow {
+    key_id: u32,
+    algorithm: &'static str,
+    key_material: Vec<u8>,
+    state: &'static str,
+}
 
-        let conn_task = tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                tracing::warn!("postgres connection task ended: {e}");
-            }
-        });
+impl ActiveCryptoKeyRow {
+    fn from_encryption(encryption: &EncryptionConfig) -> Self {
+        let algorithm = match encryption.algorithm {
+            EncryptionAlgorithm::XChaCha20Poly1305V1 => "xchacha20poly1305-v1",
+        };
 
-        let tx = client.transaction().await?;
+        Self {
+            key_id: encryption.active_key_id,
+            algorithm,
+            key_material: encryption.volume_master_key.to_vec(),
+            state: ACTIVE_CRYPTO_KEY_STATE,
+        }
+    }
+}
 
-        // Serialize DDL across concurrent initializers to avoid sequence-name races.
-        tx.execute("SELECT pg_advisory_xact_lock($1)", &[&902_202_603_i64])
-            .await?;
-
-        // Phase 1 schema (MVP): enough to register volume and counters.
-        tx.batch_execute(
-            r#"
+fn init_pg_schema_sql() -> &'static str {
+    r#"
             CREATE TABLE IF NOT EXISTS volumes (
                 vol BIGSERIAL PRIMARY KEY,
                 name TEXT NOT NULL,
                 uuid TEXT NOT NULL UNIQUE,
                 block_size INTEGER NOT NULL,
+                encryption_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                encryption_format_version SMALLINT NOT NULL DEFAULT 1,
+                active_crypto_key_id INTEGER NOT NULL DEFAULT 1,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+
+            ALTER TABLE volumes
+                ADD COLUMN IF NOT EXISTS encryption_enabled BOOLEAN NOT NULL DEFAULT TRUE;
+            ALTER TABLE volumes
+                ADD COLUMN IF NOT EXISTS encryption_format_version SMALLINT NOT NULL DEFAULT 1;
+            ALTER TABLE volumes
+                ADD COLUMN IF NOT EXISTS active_crypto_key_id INTEGER NOT NULL DEFAULT 1;
+
+            CREATE TABLE IF NOT EXISTS volume_crypto_keys (
+                vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
+                key_id INTEGER NOT NULL,
+                algorithm TEXT NOT NULL,
+                key_material BYTEA NOT NULL,
+                state TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                PRIMARY KEY (vol, key_id)
             );
 
             CREATE TABLE IF NOT EXISTS counters (
@@ -378,24 +394,109 @@ fn init_pg_schema_and_volume(
                 ON event_log(vol, seq_id);
             CREATE INDEX IF NOT EXISTS idx_event_log_vol_batch_seq
                 ON event_log(vol, batch_version, seq_id);
-            "#,
-        )
-        .await?;
+            "#
+}
+
+fn init_pg_schema_and_volume(
+    rt: &tokio::runtime::Runtime,
+    dsn: &str,
+    name: &str,
+    uuid: &str,
+    block_size: u32,
+    encryption: &EncryptionConfig,
+) -> anyhow::Result<i64> {
+    rt.block_on(async {
+        let block_size_i32 = i32::try_from(block_size).map_err(|_| {
+            anyhow::anyhow!("block size {block_size} exceeds PostgreSQL INTEGER range")
+        })?;
+        let active_key_id_i32 = i32::try_from(encryption.active_key_id).map_err(|_| {
+            anyhow::anyhow!(
+                "active encryption key id {} exceeds PostgreSQL INTEGER range",
+                encryption.active_key_id
+            )
+        })?;
+        let encryption_format_version_i16 =
+            i16::try_from(encryption.format_version).map_err(|_| {
+                anyhow::anyhow!(
+                    "encryption format version {} exceeds PostgreSQL SMALLINT range",
+                    encryption.format_version
+                )
+            })?;
+        let active_key = ActiveCryptoKeyRow::from_encryption(encryption);
+        let active_key_row_id_i32 = i32::try_from(active_key.key_id).map_err(|_| {
+            anyhow::anyhow!(
+                "active encryption key row id {} exceeds PostgreSQL INTEGER range",
+                active_key.key_id
+            )
+        })?;
+        let (mut client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+            .await
+            .map_err(|e| anyhow::anyhow!("cannot connect to postgres: {e}"))?;
+
+        let conn_task = tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                tracing::warn!("postgres connection task ended: {e}");
+            }
+        });
+
+        let tx = client.transaction().await?;
+
+        // Serialize DDL across concurrent initializers to avoid sequence-name races.
+        tx.execute("SELECT pg_advisory_xact_lock($1)", &[&902_202_603_i64])
+            .await?;
+
+        tx.batch_execute(init_pg_schema_sql()).await?;
 
         let row = tx
             .query_one(
                 r#"
-                INSERT INTO volumes (name, uuid, block_size)
-                VALUES ($1, $2, $3)
+                INSERT INTO volumes (
+                    name,
+                    uuid,
+                    block_size,
+                    encryption_enabled,
+                    encryption_format_version,
+                    active_crypto_key_id
+                )
+                VALUES ($1, $2, $3, TRUE, $4, $5)
                 ON CONFLICT (uuid) DO UPDATE
                 SET name = EXCLUDED.name,
-                    block_size = EXCLUDED.block_size
+                    block_size = EXCLUDED.block_size,
+                    encryption_enabled = EXCLUDED.encryption_enabled,
+                    encryption_format_version = EXCLUDED.encryption_format_version,
+                    active_crypto_key_id = EXCLUDED.active_crypto_key_id
                 RETURNING vol
                 "#,
-                &[&name, &uuid, &block_size_i32],
+                &[
+                    &name,
+                    &uuid,
+                    &block_size_i32,
+                    &encryption_format_version_i16,
+                    &active_key_id_i32,
+                ],
             )
             .await?;
         let volume_id: i64 = row.get(0);
+
+        tx.execute(
+            r#"
+            INSERT INTO volume_crypto_keys (vol, key_id, algorithm, key_material, state)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (vol, key_id) DO UPDATE
+            SET algorithm = EXCLUDED.algorithm,
+                key_material = EXCLUDED.key_material,
+                state = EXCLUDED.state,
+                updated_at = now()
+            "#,
+            &[
+                &volume_id,
+                &active_key_row_id_i32,
+                &active_key.algorithm,
+                &active_key.key_material,
+                &active_key.state,
+            ],
+        )
+        .await?;
 
         tx.execute(
             r#"
@@ -519,8 +620,15 @@ fn run(request: InitRunRequest) -> anyhow::Result<()> {
     let volume_uuid = Uuid::new_v4().to_string();
 
     let data_prefix = format!("{name}/objects/");
-    let postgres_volume_id =
-        init_pg_schema_and_volume(&rt, &postgres_dsn, &name, &volume_uuid, actual_block_size)?;
+    let encryption = EncryptionConfig::try_generate()?;
+    let postgres_volume_id = init_pg_schema_and_volume(
+        &rt,
+        &postgres_dsn,
+        &name,
+        &volume_uuid,
+        actual_block_size,
+        &encryption,
+    )?;
 
     // ── 6. Persist format info ────────────────────────────────────────────────
     let format_info = FormatInfo {
@@ -541,7 +649,7 @@ fn run(request: InitRunRequest) -> anyhow::Result<()> {
                 volume_id: postgres_volume_id,
             }),
         },
-        encryption: EncryptionConfig::try_generate()?,
+        encryption,
         block_size: actual_block_size,
     };
     engine.set_format_info(&format_info)?;
@@ -659,5 +767,30 @@ mod tests {
             INITIAL_METADATA_STATE_VERSION, 0,
             "init publishes a snapshot before any event_log batch exists, so the initial PG head must not advertise a missing batch"
         );
+    }
+
+    #[test]
+    fn init_pg_schema_provisions_volume_encryption_metadata() {
+        let ddl = init_pg_schema_sql();
+
+        assert!(ddl.contains("CREATE TABLE IF NOT EXISTS volume_crypto_keys"));
+        assert!(ddl.contains("encryption_enabled BOOLEAN NOT NULL DEFAULT TRUE"));
+        assert!(ddl.contains("encryption_format_version SMALLINT NOT NULL DEFAULT 1"));
+        assert!(ddl.contains("active_crypto_key_id INTEGER NOT NULL DEFAULT 1"));
+        assert!(ddl.contains("PRIMARY KEY (vol, key_id)"));
+    }
+
+    #[test]
+    fn active_crypto_key_row_uses_format_encryption_config() {
+        let encryption = EncryptionConfig::new([0xC7; studiofs_meta::ENCRYPTION_KEY_LENGTH]);
+        let row = ActiveCryptoKeyRow::from_encryption(&encryption);
+
+        assert_eq!(row.key_id, 1);
+        assert_eq!(row.algorithm, "xchacha20poly1305-v1");
+        assert_eq!(
+            row.key_material,
+            vec![0xC7; studiofs_meta::ENCRYPTION_KEY_LENGTH]
+        );
+        assert_eq!(row.state, "active");
     }
 }
