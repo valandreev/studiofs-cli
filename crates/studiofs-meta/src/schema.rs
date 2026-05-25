@@ -1487,7 +1487,7 @@ pub enum EncryptionAlgorithm {
 
 impl EncryptionAlgorithm {
     /// Stable metadata string stored for persisted key records.
-    pub fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             Self::XChaCha20Poly1305V1 => "xchacha20poly1305-v1",
         }
