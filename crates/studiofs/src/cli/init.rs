@@ -391,6 +391,27 @@ fn init_pg_schema_sql() -> &'static str {
             "#
 }
 
+fn init_pg_volume_upsert_sql() -> &'static str {
+    r#"
+                INSERT INTO volumes (
+                    name,
+                    uuid,
+                    block_size,
+                    encryption_enabled,
+                    encryption_format_version,
+                    active_crypto_key_id
+                )
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (uuid) DO UPDATE
+                SET name = EXCLUDED.name,
+                    block_size = EXCLUDED.block_size,
+                    encryption_enabled = EXCLUDED.encryption_enabled,
+                    encryption_format_version = EXCLUDED.encryption_format_version,
+                    active_crypto_key_id = EXCLUDED.active_crypto_key_id
+                RETURNING vol
+                "#
+}
+
 fn init_pg_schema_and_volume(
     rt: &tokio::runtime::Runtime,
     dsn: &str,
@@ -437,28 +458,12 @@ fn init_pg_schema_and_volume(
 
         let row = tx
             .query_one(
-                r#"
-                INSERT INTO volumes (
-                    name,
-                    uuid,
-                    block_size,
-                    encryption_enabled,
-                    encryption_format_version,
-                    active_crypto_key_id
-                )
-                VALUES ($1, $2, $3, TRUE, $4, $5)
-                ON CONFLICT (uuid) DO UPDATE
-                SET name = EXCLUDED.name,
-                    block_size = EXCLUDED.block_size,
-                    encryption_enabled = EXCLUDED.encryption_enabled,
-                    encryption_format_version = EXCLUDED.encryption_format_version,
-                    active_crypto_key_id = EXCLUDED.active_crypto_key_id
-                RETURNING vol
-                "#,
+                init_pg_volume_upsert_sql(),
                 &[
                     &name,
                     &uuid,
                     &block_size_i32,
+                    &encryption.enabled,
                     &encryption_format_version_i16,
                     &active_key_id_i32,
                 ],
@@ -766,6 +771,14 @@ mod tests {
         assert!(ddl.contains("encryption_format_version SMALLINT NOT NULL DEFAULT 1"));
         assert!(ddl.contains("active_crypto_key_id INTEGER NOT NULL DEFAULT 1"));
         assert!(ddl.contains("PRIMARY KEY (vol, key_id)"));
+    }
+
+    #[test]
+    fn volume_upsert_sql_parameterizes_encryption_enabled() {
+        let sql = init_pg_volume_upsert_sql();
+
+        assert!(sql.contains("VALUES ($1, $2, $3, $4, $5, $6)"));
+        assert!(!sql.contains("VALUES ($1, $2, $3, TRUE, $4, $5)"));
     }
 
     #[test]
