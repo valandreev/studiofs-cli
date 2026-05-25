@@ -5,6 +5,7 @@
 //! The command validates basic storage connectivity and PostgreSQL availability
 //! before writing local metadata state.
 
+use anyhow::Context;
 use clap::Args;
 use std::io::Write;
 use std::path::PathBuf;
@@ -412,6 +413,14 @@ fn init_pg_volume_upsert_sql() -> &'static str {
                 "#
 }
 
+fn init_pg_crypto_key_insert_sql() -> &'static str {
+    r#"
+            INSERT INTO volume_crypto_keys (vol, key_id, algorithm, key_material, state)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (vol, key_id) DO NOTHING
+            "#
+}
+
 fn init_pg_schema_and_volume(
     rt: &tokio::runtime::Runtime,
     dsn: &str,
@@ -440,7 +449,7 @@ fn init_pg_schema_and_volume(
         let active_key = ActiveCryptoKeyRow::from_encryption(encryption);
         let (mut client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
             .await
-            .map_err(|e| anyhow::anyhow!("cannot connect to postgres: {e}"))?;
+            .context("cannot connect to postgres")?;
 
         let conn_task = tokio::spawn(async move {
             if let Err(e) = connection.await {
@@ -472,15 +481,7 @@ fn init_pg_schema_and_volume(
         let volume_id: i64 = row.get(0);
 
         tx.execute(
-            r#"
-            INSERT INTO volume_crypto_keys (vol, key_id, algorithm, key_material, state)
-            VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT (vol, key_id) DO UPDATE
-            SET algorithm = EXCLUDED.algorithm,
-                key_material = EXCLUDED.key_material,
-                state = EXCLUDED.state,
-                updated_at = now()
-            "#,
+            init_pg_crypto_key_insert_sql(),
             &[
                 &volume_id,
                 &active_key_id_i32,
@@ -779,6 +780,14 @@ mod tests {
 
         assert!(sql.contains("VALUES ($1, $2, $3, $4, $5, $6)"));
         assert!(!sql.contains("VALUES ($1, $2, $3, TRUE, $4, $5)"));
+    }
+
+    #[test]
+    fn crypto_key_insert_sql_never_overwrites_existing_key_material() {
+        let sql = init_pg_crypto_key_insert_sql();
+
+        assert!(sql.contains("ON CONFLICT (vol, key_id) DO NOTHING"));
+        assert!(!sql.contains("key_material = EXCLUDED.key_material"));
     }
 
     #[test]
