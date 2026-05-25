@@ -10,8 +10,8 @@ use std::io::Write;
 use std::path::PathBuf;
 use studiofs_data::{DataStore, DataStoreConfig};
 use studiofs_meta::{
-    CURRENT_FORMAT_VERSION, DEFAULT_BLOCK_SIZE, EncryptionAlgorithm, EncryptionConfig, FormatInfo,
-    MetaFormat, MetaOpenOptions, MetadataBackend, MetadataConfig, PostgresConfig, RedbMetaEngine,
+    CURRENT_FORMAT_VERSION, DEFAULT_BLOCK_SIZE, EncryptionConfig, FormatInfo, MetaFormat,
+    MetaOpenOptions, MetadataBackend, MetadataConfig, PostgresConfig, RedbMetaEngine,
     ensure_studiofs_database, open_meta_engine_with_options,
 };
 use tracing::info;
@@ -283,23 +283,17 @@ fn volume_name_exists(rt: &tokio::runtime::Runtime, dsn: &str, name: &str) -> an
     })
 }
 
-struct ActiveCryptoKeyRow {
-    key_id: u32,
+struct ActiveCryptoKeyRow<'a> {
     algorithm: &'static str,
-    key_material: Vec<u8>,
+    key_material: &'a [u8],
     state: &'static str,
 }
 
-impl ActiveCryptoKeyRow {
-    fn from_encryption(encryption: &EncryptionConfig) -> Self {
-        let algorithm = match encryption.algorithm {
-            EncryptionAlgorithm::XChaCha20Poly1305V1 => "xchacha20poly1305-v1",
-        };
-
+impl<'a> ActiveCryptoKeyRow<'a> {
+    fn from_encryption(encryption: &'a EncryptionConfig) -> Self {
         Self {
-            key_id: encryption.active_key_id,
-            algorithm,
-            key_material: encryption.volume_master_key.to_vec(),
+            algorithm: encryption.algorithm.as_str(),
+            key_material: &encryption.volume_master_key,
             state: ACTIVE_CRYPTO_KEY_STATE,
         }
     }
@@ -423,12 +417,6 @@ fn init_pg_schema_and_volume(
                 )
             })?;
         let active_key = ActiveCryptoKeyRow::from_encryption(encryption);
-        let active_key_row_id_i32 = i32::try_from(active_key.key_id).map_err(|_| {
-            anyhow::anyhow!(
-                "active encryption key row id {} exceeds PostgreSQL INTEGER range",
-                active_key.key_id
-            )
-        })?;
         let (mut client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
             .await
             .map_err(|e| anyhow::anyhow!("cannot connect to postgres: {e}"))?;
@@ -490,7 +478,7 @@ fn init_pg_schema_and_volume(
             "#,
             &[
                 &volume_id,
-                &active_key_row_id_i32,
+                &active_key_id_i32,
                 &active_key.algorithm,
                 &active_key.key_material,
                 &active_key.state,
@@ -785,11 +773,10 @@ mod tests {
         let encryption = EncryptionConfig::new([0xC7; studiofs_meta::ENCRYPTION_KEY_LENGTH]);
         let row = ActiveCryptoKeyRow::from_encryption(&encryption);
 
-        assert_eq!(row.key_id, 1);
         assert_eq!(row.algorithm, "xchacha20poly1305-v1");
         assert_eq!(
             row.key_material,
-            vec![0xC7; studiofs_meta::ENCRYPTION_KEY_LENGTH]
+            [0xC7; studiofs_meta::ENCRYPTION_KEY_LENGTH]
         );
         assert_eq!(row.state, "active");
     }
