@@ -1485,6 +1485,15 @@ pub enum EncryptionAlgorithm {
     XChaCha20Poly1305V1,
 }
 
+impl EncryptionAlgorithm {
+    /// Stable metadata string stored for persisted key records.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::XChaCha20Poly1305V1 => "xchacha20poly1305-v1",
+        }
+    }
+}
+
 /// Encryption format validation failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum EncryptionContractError {
