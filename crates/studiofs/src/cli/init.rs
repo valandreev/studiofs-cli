@@ -541,7 +541,7 @@ fn run(request: InitRunRequest) -> anyhow::Result<()> {
                 volume_id: postgres_volume_id,
             }),
         },
-        encryption: EncryptionConfig::generate(),
+        encryption: EncryptionConfig::try_generate()?,
         block_size: actual_block_size,
     };
     engine.set_format_info(&format_info)?;

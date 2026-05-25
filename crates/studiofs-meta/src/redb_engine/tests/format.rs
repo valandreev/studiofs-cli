@@ -74,18 +74,58 @@ fn format_info_deserialization_rejects_missing_encryption_config() {
 }
 
 #[test]
+fn format_info_decode_reports_unsupported_version_before_missing_encryption() {
+    let legacy = serde_json::json!({
+        "format_version": CURRENT_FORMAT_VERSION - 1,
+        "name": "legacy-plaintext",
+        "uuid": "legacy-uuid",
+        "endpoint": "http://localhost:9000",
+        "bucket": "legacy-bucket",
+        "access_key": "studiofs",
+        "secret_key": "studiofs123",
+        "region": "",
+        "data_prefix": "legacy-volume/objects/",
+        "metadata": {},
+        "block_size": DEFAULT_BLOCK_SIZE
+    });
+
+    let err =
+        super::format::decode_format_info(serde_json::to_vec(&legacy).unwrap().as_slice())
+            .unwrap_err();
+
+    assert!(matches!(
+        err,
+        MetaError::UnsupportedFormatVersion {
+            found,
+            expected
+        } if found == CURRENT_FORMAT_VERSION - 1 && expected == CURRENT_FORMAT_VERSION
+    ));
+}
+
+#[test]
 fn encryption_config_validation_rejects_disabled_or_unsupported_values() {
     let mut disabled = EncryptionConfig::new([0x11; ENCRYPTION_KEY_LENGTH]);
     disabled.enabled = false;
-    assert!(disabled.validate().is_err());
+    assert!(matches!(
+        disabled.validate(),
+        Err(EncryptionContractError::Disabled)
+    ));
 
     let mut unsupported_key = EncryptionConfig::new([0x22; ENCRYPTION_KEY_LENGTH]);
     unsupported_key.active_key_id = 2;
-    assert!(unsupported_key.validate().is_err());
+    assert!(matches!(
+        unsupported_key.validate(),
+        Err(EncryptionContractError::UnsupportedKeyId { found, expected })
+            if found == 2 && expected == CURRENT_ENCRYPTION_KEY_ID
+    ));
 
     let mut unsupported_format = EncryptionConfig::new([0x33; ENCRYPTION_KEY_LENGTH]);
     unsupported_format.format_version = 2;
-    assert!(unsupported_format.validate().is_err());
+    assert!(matches!(
+        unsupported_format.validate(),
+        Err(EncryptionContractError::UnsupportedFormatVersion { found, expected })
+            if found == 2 && expected == CURRENT_ENCRYPTION_FORMAT_VERSION
+    ));
 }
 
 #[test]

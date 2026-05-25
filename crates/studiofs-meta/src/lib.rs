@@ -63,8 +63,8 @@ fn ensure_supported_format_version(info: &FormatInfo) -> MetaResult<()> {
             expected: CURRENT_FORMAT_VERSION,
         });
     }
-    info.validate_format_contract()
-        .map_err(MetaError::InvalidFormatConfig)
+    info.validate_format_contract()?;
+    Ok(())
 }
 
 /// Open metadata engine based on format settings.

@@ -8,12 +8,14 @@
 //! - Local overlay and remote-visible base views are modeled explicitly
 //! - All metadata lives in redb, S3 stores only raw payload objects
 
-use rand::Rng;
+use rand::TryRngCore;
+use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::time::SystemTime;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 // =============================================================================
 // Constants
@@ -1483,11 +1485,42 @@ pub enum EncryptionAlgorithm {
     XChaCha20Poly1305V1,
 }
 
+/// Encryption format validation failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum EncryptionContractError {
+    /// Encryption was disabled in persisted volume metadata.
+    #[error("encryption must be enabled")]
+    Disabled,
+    /// The persisted encryption algorithm is not supported by this binary.
+    #[error("unsupported encryption algorithm")]
+    UnsupportedAlgorithm,
+    /// The persisted active key id is not supported by this binary.
+    #[error("unsupported encryption key id: found {found}, expected {expected}")]
+    UnsupportedKeyId {
+        /// Key id stored in metadata.
+        found: u32,
+        /// Key id expected by this binary.
+        expected: u32,
+    },
+    /// The persisted encryption format version is not supported by this binary.
+    #[error("unsupported encryption format version: found {found}, expected {expected}")]
+    UnsupportedFormatVersion {
+        /// Encryption format version stored in metadata.
+        found: u16,
+        /// Encryption format version expected by this binary.
+        expected: u16,
+    },
+    /// Operating-system randomness was unavailable while generating volume key material.
+    #[error("operating-system randomness unavailable")]
+    OsRandomUnavailable,
+}
+
 /// Persisted encryption configuration for a formatted volume.
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 #[serde(deny_unknown_fields)]
 pub struct EncryptionConfig {
     /// Remote-object encryption algorithm.
+    #[zeroize(skip)]
     pub algorithm: EncryptionAlgorithm,
     /// Active key identifier used by the initial implementation.
     pub active_key_id: u32,
@@ -1525,30 +1558,37 @@ impl EncryptionConfig {
 
     /// Generate a current encryption configuration with random volume key material.
     pub fn generate() -> Self {
+        Self::try_generate().expect("operating-system randomness must be available")
+    }
+
+    /// Generate a current encryption configuration with random volume key material.
+    pub fn try_generate() -> Result<Self, EncryptionContractError> {
         let mut volume_master_key = [0u8; ENCRYPTION_KEY_LENGTH];
-        rand::rng().fill(&mut volume_master_key);
-        Self::new(volume_master_key)
+        OsRng
+            .try_fill_bytes(&mut volume_master_key)
+            .map_err(|_| EncryptionContractError::OsRandomUnavailable)?;
+        Ok(Self::new(volume_master_key))
     }
 
     /// Validate that this config matches the only supported encryption contract.
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), EncryptionContractError> {
         if !self.enabled {
-            return Err("encryption must be enabled".to_string());
+            return Err(EncryptionContractError::Disabled);
         }
         if self.algorithm != EncryptionAlgorithm::XChaCha20Poly1305V1 {
-            return Err("unsupported encryption algorithm".to_string());
+            return Err(EncryptionContractError::UnsupportedAlgorithm);
         }
         if self.active_key_id != CURRENT_ENCRYPTION_KEY_ID {
-            return Err(format!(
-                "unsupported encryption key id: found {}, expected {}",
-                self.active_key_id, CURRENT_ENCRYPTION_KEY_ID
-            ));
+            return Err(EncryptionContractError::UnsupportedKeyId {
+                found: self.active_key_id,
+                expected: CURRENT_ENCRYPTION_KEY_ID,
+            });
         }
         if self.format_version != CURRENT_ENCRYPTION_FORMAT_VERSION {
-            return Err(format!(
-                "unsupported encryption format version: found {}, expected {}",
-                self.format_version, CURRENT_ENCRYPTION_FORMAT_VERSION
-            ));
+            return Err(EncryptionContractError::UnsupportedFormatVersion {
+                found: self.format_version,
+                expected: CURRENT_ENCRYPTION_FORMAT_VERSION,
+            });
         }
         Ok(())
     }
@@ -1666,7 +1706,7 @@ impl FormatInfo {
     }
 
     /// Validate metadata format contracts enforced at mount/open boundaries.
-    pub fn validate_format_contract(&self) -> Result<(), String> {
+    pub fn validate_format_contract(&self) -> Result<(), EncryptionContractError> {
         self.encryption.validate()
     }
 
