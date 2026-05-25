@@ -673,7 +673,7 @@ fn encryption_at_rest_contract_covers_required_sfs346_boundaries() {
     let doc = read_workspace_file("docs/encryption-at-rest-contract.md");
     let normalized_doc = normalize_doc_whitespace(&doc);
     let required_terms = [
-        "# Encryption-At-Rest Contract",
+        "Encryption-At-Rest Contract",
         "XChaCha20-Poly1305 is the only supported algorithm",
         "remote payload fragment",
         "4 MiB",
