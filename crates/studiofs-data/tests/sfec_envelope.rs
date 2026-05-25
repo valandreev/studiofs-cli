@@ -59,6 +59,22 @@ fn sfec_header_roundtrip_preserves_encryption_metadata() {
 }
 
 #[test]
+fn sfec_header_builder_accepts_nonzero_historical_key_ids() {
+    let header = SfecHeader::new(
+        SfecAlgorithm::XChaCha20Poly1305V1,
+        2,
+        17,
+        DEFAULT_SFEC_FRAME_SIZE,
+        Bytes::from_static(WRAP_NONCE),
+        Bytes::from_static(DATA_NONCE_PREFIX),
+        Bytes::from_static(WRAPPED_DEK),
+    )
+    .expect("wire-format builder should accept any non-zero key id");
+
+    assert_eq!(header.key_id(), 2);
+}
+
+#[test]
 fn sfec_envelope_exposes_serialized_header_bytes_for_aad() {
     let header = header_for_len(17);
     let ciphertext = ciphertext_for(&header);

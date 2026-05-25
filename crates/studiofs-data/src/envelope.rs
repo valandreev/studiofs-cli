@@ -6,7 +6,6 @@
 
 use bytes::{Buf, BufMut, Bytes};
 use std::io::Cursor;
-use studiofs_meta::CURRENT_ENCRYPTION_KEY_ID;
 use thiserror::Error;
 
 /// Magic bytes for the encrypted StudioFS object envelope ("SFEC").
@@ -112,19 +111,13 @@ impl SfecHeader {
         data_nonce_prefix: Bytes,
         wrapped_dek: Bytes,
     ) -> Result<Self, SfecError> {
-        if key_id != CURRENT_ENCRYPTION_KEY_ID {
-            return Err(SfecError::InvalidKeyId(key_id));
-        }
         let frame_size = u32::try_from(frame_size).map_err(|_| SfecError::ObjectLengthOverflow)?;
-        if frame_size == 0 {
-            return Err(SfecError::InvalidFrameSize(frame_size));
-        }
         validate_variable_len("wrap_nonce", wrap_nonce.len())?;
         validate_variable_len("data_nonce_prefix", data_nonce_prefix.len())?;
         validate_variable_len("wrapped_dek", wrapped_dek.len())?;
 
         let frame_count = expected_frame_count(plaintext_len, frame_size)?;
-        Ok(Self {
+        let header = Self {
             algorithm,
             flags: 0,
             key_id,
@@ -134,7 +127,9 @@ impl SfecHeader {
             wrap_nonce,
             data_nonce_prefix,
             wrapped_dek,
-        })
+        };
+        header.validate_shape()?;
+        Ok(header)
     }
 
     /// Encryption algorithm declared by the envelope.
