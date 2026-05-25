@@ -836,6 +836,15 @@ fn make_vfs_with_config(
     vfs
 }
 
+fn fast_janitor_vfs_config() -> VfsConfigValidated {
+    let mut config = test_vfs_config_from_env().into_inner();
+    config.janitor_interval_secs = 2;
+    config.janitor_skip_newer_secs = 0;
+    config.janitor_max_deletes = 50;
+    config.janitor_lease_ttl_secs = 10;
+    VfsConfigValidated::try_from(config).expect("valid fast janitor test config")
+}
+
 #[allow(dead_code)]
 fn make_vfs_from_meta(
     meta: Arc<dyn MetaEngine>,
@@ -1956,20 +1965,8 @@ async fn test_pending_deletions_gc() {
 async fn test_background_janitor_removes_orphan_object() {
     ensure_bucket().await;
 
-    type EnvRestore = ScopedEnvVar;
-
-    // Speed up janitor cycle for this test only.
-    let _restore_interval = EnvRestore::capture("STUDIOFS_JANITOR_INTERVAL_SECS");
-    let _restore_skip = EnvRestore::capture("STUDIOFS_JANITOR_SKIP_NEWER_SECS");
-    let _restore_max = EnvRestore::capture("STUDIOFS_JANITOR_MAX_DELETES");
-    let _restore_lease_ttl = EnvRestore::capture("STUDIOFS_JANITOR_LEASE_TTL_SECS");
-    set_test_env("STUDIOFS_JANITOR_INTERVAL_SECS", "2");
-    set_test_env("STUDIOFS_JANITOR_SKIP_NEWER_SECS", "0");
-    set_test_env("STUDIOFS_JANITOR_MAX_DELETES", "50");
-    set_test_env("STUDIOFS_JANITOR_LEASE_TTL_SECS", "10");
-
     let tmp = tempfile::tempdir().unwrap();
-    let vfs = make_vfs(&tmp, "janitor_orphan");
+    let vfs = make_vfs_with_config(&tmp, "janitor_orphan", fast_janitor_vfs_config());
     let info = vfs.meta().get_format_info().unwrap();
     let ds = DataStore::new(&DataStoreConfig::from(&info)).unwrap();
 
@@ -2008,20 +2005,8 @@ async fn test_background_janitor_removes_orphan_object() {
 async fn test_background_janitor_cleans_simulated_crash_orphan() {
     ensure_bucket().await;
 
-    type EnvRestore = ScopedEnvVar;
-
-    // Fast janitor cycle for test.
-    let _restore_interval = EnvRestore::capture("STUDIOFS_JANITOR_INTERVAL_SECS");
-    let _restore_skip = EnvRestore::capture("STUDIOFS_JANITOR_SKIP_NEWER_SECS");
-    let _restore_max = EnvRestore::capture("STUDIOFS_JANITOR_MAX_DELETES");
-    let _restore_lease_ttl = EnvRestore::capture("STUDIOFS_JANITOR_LEASE_TTL_SECS");
-    set_test_env("STUDIOFS_JANITOR_INTERVAL_SECS", "2");
-    set_test_env("STUDIOFS_JANITOR_SKIP_NEWER_SECS", "0");
-    set_test_env("STUDIOFS_JANITOR_MAX_DELETES", "50");
-    set_test_env("STUDIOFS_JANITOR_LEASE_TTL_SECS", "10");
-
     let tmp = tempfile::tempdir().unwrap();
-    let vfs = make_vfs(&tmp, "janitor_crash_orphan");
+    let vfs = make_vfs_with_config(&tmp, "janitor_crash_orphan", fast_janitor_vfs_config());
     let info = vfs.meta().get_format_info().unwrap();
     let ds = DataStore::new(&DataStoreConfig::from(&info)).unwrap();
 
@@ -2032,8 +2017,24 @@ async fn test_background_janitor_cleans_simulated_crash_orphan() {
     vfs.write(ino, 0, &payload).await.unwrap();
     vfs.flush(ino).await.unwrap();
 
-    let blocks = wait_until_payload_slices(&vfs, ino, Duration::from_secs(15))
-        .expect("expected at least one payload slice after flush");
+    assert!(
+        wait_until(online_publish_timeout(), || {
+            let attr = vfs.meta().get_attr(ino).unwrap();
+            attr.upload_state == UploadState::Ready
+                && attr.committed_content_epoch == attr.content_epoch
+                && attr.committed_size == attr.size
+                && vfs
+                    .meta()
+                    .lookup_payload_slices(ino)
+                    .is_ok_and(|blocks| !blocks.is_empty())
+        })
+        .await,
+        "simulated crash setup should wait for upload publication to settle"
+    );
+    let blocks = vfs
+        .meta()
+        .lookup_payload_slices(ino)
+        .expect("expected at least one payload slice after upload publication");
     let object_id = blocks[0].1.object_id;
     if let Err(err) = put_fragmented_object(
         &ds,
@@ -2076,19 +2077,8 @@ async fn test_background_janitor_cleans_simulated_crash_orphan() {
 async fn test_background_janitor_does_not_heal_dangling_dentry_without_foreground_access() {
     ensure_bucket().await;
 
-    type EnvRestore = ScopedEnvVar;
-
-    let _restore_interval = EnvRestore::capture("STUDIOFS_JANITOR_INTERVAL_SECS");
-    let _restore_skip = EnvRestore::capture("STUDIOFS_JANITOR_SKIP_NEWER_SECS");
-    let _restore_max = EnvRestore::capture("STUDIOFS_JANITOR_MAX_DELETES");
-    let _restore_lease_ttl = EnvRestore::capture("STUDIOFS_JANITOR_LEASE_TTL_SECS");
-    set_test_env("STUDIOFS_JANITOR_INTERVAL_SECS", "2");
-    set_test_env("STUDIOFS_JANITOR_SKIP_NEWER_SECS", "0");
-    set_test_env("STUDIOFS_JANITOR_MAX_DELETES", "50");
-    set_test_env("STUDIOFS_JANITOR_LEASE_TTL_SECS", "10");
-
     let tmp = tempfile::tempdir().unwrap();
-    let vfs = make_vfs(&tmp, "janitor_dangling_dentry");
+    let vfs = make_vfs_with_config(&tmp, "janitor_dangling_dentry", fast_janitor_vfs_config());
 
     let dangling = vfs.create(1, b"janitor-dangling.txt", 0, 0, 0o644).unwrap();
     vfs.meta().remove_attr(dangling.ino).unwrap();
@@ -2109,19 +2099,12 @@ async fn test_background_janitor_does_not_heal_dangling_dentry_without_foregroun
 async fn test_background_janitor_recovers_pending_create_intent_runtime() {
     ensure_bucket().await;
 
-    type EnvRestore = ScopedEnvVar;
-
-    let _restore_interval = EnvRestore::capture("STUDIOFS_JANITOR_INTERVAL_SECS");
-    let _restore_skip = EnvRestore::capture("STUDIOFS_JANITOR_SKIP_NEWER_SECS");
-    let _restore_max = EnvRestore::capture("STUDIOFS_JANITOR_MAX_DELETES");
-    let _restore_lease_ttl = EnvRestore::capture("STUDIOFS_JANITOR_LEASE_TTL_SECS");
-    set_test_env("STUDIOFS_JANITOR_INTERVAL_SECS", "2");
-    set_test_env("STUDIOFS_JANITOR_SKIP_NEWER_SECS", "0");
-    set_test_env("STUDIOFS_JANITOR_MAX_DELETES", "50");
-    set_test_env("STUDIOFS_JANITOR_LEASE_TTL_SECS", "10");
-
     let tmp = tempfile::tempdir().unwrap();
-    let vfs = make_vfs(&tmp, "janitor_pending_create_runtime");
+    let vfs = make_vfs_with_config(
+        &tmp,
+        "janitor_pending_create_runtime",
+        fast_janitor_vfs_config(),
+    );
 
     let ino = vfs.meta().next_inode().unwrap();
     let intent = PendingCreateRecord {
@@ -2179,19 +2162,12 @@ async fn test_background_janitor_recovers_pending_create_intent_runtime() {
 async fn test_background_janitor_does_not_recover_deferred_delete_undo_runtime() {
     ensure_bucket().await;
 
-    type EnvRestore = ScopedEnvVar;
-
-    let _restore_interval = EnvRestore::capture("STUDIOFS_JANITOR_INTERVAL_SECS");
-    let _restore_skip = EnvRestore::capture("STUDIOFS_JANITOR_SKIP_NEWER_SECS");
-    let _restore_max = EnvRestore::capture("STUDIOFS_JANITOR_MAX_DELETES");
-    let _restore_lease_ttl = EnvRestore::capture("STUDIOFS_JANITOR_LEASE_TTL_SECS");
-    set_test_env("STUDIOFS_JANITOR_INTERVAL_SECS", "2");
-    set_test_env("STUDIOFS_JANITOR_SKIP_NEWER_SECS", "0");
-    set_test_env("STUDIOFS_JANITOR_MAX_DELETES", "50");
-    set_test_env("STUDIOFS_JANITOR_LEASE_TTL_SECS", "10");
-
     let tmp = tempfile::tempdir().unwrap();
-    let vfs = make_vfs(&tmp, "janitor_deferred_undo_runtime");
+    let vfs = make_vfs_with_config(
+        &tmp,
+        "janitor_deferred_undo_runtime",
+        fast_janitor_vfs_config(),
+    );
 
     let attr = vfs
         .create(ROOT_INO, b"janitor-deferred-undo.txt", 0, 0, 0o644)
@@ -2247,19 +2223,12 @@ async fn test_background_janitor_does_not_recover_deferred_delete_undo_runtime()
 async fn test_background_janitor_recovers_only_pending_create_in_mixed_runtime() {
     ensure_bucket().await;
 
-    type EnvRestore = ScopedEnvVar;
-
-    let _restore_interval = EnvRestore::capture("STUDIOFS_JANITOR_INTERVAL_SECS");
-    let _restore_skip = EnvRestore::capture("STUDIOFS_JANITOR_SKIP_NEWER_SECS");
-    let _restore_max = EnvRestore::capture("STUDIOFS_JANITOR_MAX_DELETES");
-    let _restore_lease_ttl = EnvRestore::capture("STUDIOFS_JANITOR_LEASE_TTL_SECS");
-    set_test_env("STUDIOFS_JANITOR_INTERVAL_SECS", "2");
-    set_test_env("STUDIOFS_JANITOR_SKIP_NEWER_SECS", "0");
-    set_test_env("STUDIOFS_JANITOR_MAX_DELETES", "50");
-    set_test_env("STUDIOFS_JANITOR_LEASE_TTL_SECS", "10");
-
     let tmp = tempfile::tempdir().unwrap();
-    let vfs = make_vfs(&tmp, "janitor_mixed_undo_runtime");
+    let vfs = make_vfs_with_config(
+        &tmp,
+        "janitor_mixed_undo_runtime",
+        fast_janitor_vfs_config(),
+    );
 
     let pending_ino = vfs.meta().next_inode().unwrap();
     let pending_name = b"janitor-mixed-pending.txt";
