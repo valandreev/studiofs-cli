@@ -42,6 +42,25 @@ Remote storage uses a 4x4 hybrid scheme:
   fragment object, and fetch decrypts before STFS header decode and checksum
   validation.
 
+## Encrypted Object Envelope (SFEC v1)
+
+Encrypted remote payload fragments use an outer `SFEC` envelope around the
+unchanged inner `STFS` object bytes. Upload code still builds the normal STFS
+buffer first; the encryption layer wraps those bytes before object-store PUT,
+and fetch unwraps/decrypts before calling the existing STFS decoder.
+
+The `SFEC` header uses fixed little-endian fields: magic `SFEC`, version `1`,
+header length, algorithm id for `xchacha20poly1305-v1`, flags, active key id,
+plaintext length, frame size, frame count, wrap nonce length, data nonce prefix
+length, wrapped DEK length, then the variable wrap nonce, data nonce prefix,
+and wrapped DEK bytes. Encrypted frames follow the header.
+
+The default plaintext frame size is 1 MiB. The v1 parser validates the declared
+header length, non-zero key id, frame size, derived frame count, ciphertext
+length, and rejects malformed trailing data instead of falling back to plaintext
+object parsing. Key resolution for non-zero historical key ids belongs to the
+decryption layer rather than the wire-format parser.
+
 In the active mounted runtime, `CachedStore` owns local cache hits, local
 payload staging, upload rereads, and runtime queueing. `DataStore` is the
 remote object-store edge that `CachedStore`/VFS call for object download,
