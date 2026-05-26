@@ -1583,6 +1583,26 @@ fn wait_until_n_payload_slices(
     }
 }
 
+async fn wait_until_n_payload_slices_async(
+    vfs: &Arc<StudioVfs>,
+    ino: u64,
+    expected: usize,
+    timeout: Duration,
+) -> Option<Vec<(u32, PayloadRef)>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(blocks) = vfs.meta().lookup_payload_slices(ino)
+            && blocks.len() >= expected
+        {
+            return Some(blocks);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 // =============================================================================
 // Basic Operations Tests
 // =============================================================================
@@ -1629,31 +1649,31 @@ async fn encrypted_remote_object_storage_keeps_remote_ciphertext_and_local_plain
     let writer_tmp = tempfile::tempdir().unwrap();
     let writer_db = writer_tmp.path().join("writer.redb");
     let writer_cache = writer_tmp.path().join("writer-cache");
-    let writer_cache_str = writer_cache.to_str().unwrap().to_string();
+    let writer_cache_str = writer_cache.to_str().unwrap();
     let reader_tmp = tempfile::tempdir().unwrap();
     let reader_db = reader_tmp.path().join("reader.redb");
     let reader_cache = reader_tmp.path().join("reader-cache");
-    let reader_cache_str = reader_cache.to_str().unwrap().to_string();
+    let reader_cache_str = reader_cache.to_str().unwrap();
     let volume_suffix = format!("sfs355-encrypted-e2e-{}", Uuid::new_v4().simple());
     let format_info = make_format_info(&volume_suffix);
     let data_store = DataStore::new(&DataStoreConfig::from(&format_info)).unwrap();
     let writer_meta = Arc::new(RedbMetaEngine::open(&writer_db).unwrap());
     writer_meta.init_root(0, 0).unwrap();
-    writer_meta.set_format_info(&format_info).unwrap();
 
-    let payload =
-        b"SFS-355 local plaintext marker should never appear in remote ciphertext".to_vec();
-    let swapped_payload = b"SFS-355 second object used for storage-key AAD mismatch".to_vec();
+    let payload: &[u8] = b"SFS-355 local plaintext marker should never appear in remote ciphertext";
+    let swapped_payload: &[u8] = b"SFS-355 second object used for storage-key AAD mismatch";
 
-    let writer_vfs = make_vfs_with_meta(writer_meta.clone(), &format_info, &writer_cache_str);
+    let writer_vfs = make_vfs_with_meta(writer_meta.clone(), &format_info, writer_cache_str);
     let attr = writer_vfs
         .create(1, b"encrypted-e2e.txt", 0, 0, 0o644)
         .unwrap();
-    writer_vfs.write(attr.ino, 0, &payload).await.unwrap();
+    writer_vfs.write(attr.ino, 0, payload).await.unwrap();
     writer_vfs.flush(attr.ino).await.unwrap();
 
-    let blocks = wait_until_n_payload_slices(&writer_vfs, attr.ino, 1, online_publish_timeout())
-        .expect("encrypted E2E write should materialize a payload slice");
+    let blocks =
+        wait_until_n_payload_slices_async(&writer_vfs, attr.ino, 1, online_publish_timeout())
+            .await
+            .expect("encrypted E2E write should materialize a payload slice");
     let object_id = blocks[0].1.object_id;
     let remote_key = format_object_fragment_key(&format_info.data_prefix, object_id, 0);
 
@@ -1687,7 +1707,7 @@ async fn encrypted_remote_object_storage_keeps_remote_ciphertext_and_local_plain
     assert!(remote_ciphertext.starts_with(SFEC_MAGIC));
     assert!(!remote_ciphertext.starts_with(STFS_MAGIC));
     assert!(
-        !bytes_contain(remote_ciphertext.as_ref(), &payload),
+        !bytes_contain(remote_ciphertext.as_ref(), payload),
         "remote encrypted object must not contain obvious plaintext payload"
     );
 
@@ -1695,7 +1715,7 @@ async fn encrypted_remote_object_storage_keeps_remote_ciphertext_and_local_plain
         .local_payload_backend()
         .get(object_id)
         .expect("writer local payload cache should retain plaintext bytes");
-    assert_eq!(local_plaintext.as_ref(), payload.as_slice());
+    assert_eq!(local_plaintext.as_ref(), payload);
 
     writer_vfs.local_payload_backend().remove(object_id);
     assert!(
@@ -1706,14 +1726,14 @@ async fn encrypted_remote_object_storage_keeps_remote_ciphertext_and_local_plain
         .read(attr.ino, 0, payload.len() as u32)
         .await
         .unwrap();
-    assert_eq!(refetched.as_ref(), payload.as_slice());
+    assert_eq!(refetched.as_ref(), payload);
     assert_eq!(
         writer_vfs
             .local_payload_backend()
             .get(object_id)
             .expect("remote fetch should repopulate plaintext local cache")
             .as_ref(),
-        payload.as_slice()
+        payload
     );
 
     let mut tampered = remote_ciphertext.to_vec();
@@ -1747,19 +1767,20 @@ async fn encrypted_remote_object_storage_keeps_remote_ciphertext_and_local_plain
             .await
             .unwrap()
             .as_ref(),
-        payload.as_slice()
+        payload
     );
 
     let swap_attr = writer_vfs
         .create(1, b"encrypted-e2e-swap-source.txt", 0, 0, 0o644)
         .unwrap();
     writer_vfs
-        .write(swap_attr.ino, 0, &swapped_payload)
+        .write(swap_attr.ino, 0, swapped_payload)
         .await
         .unwrap();
     writer_vfs.flush(swap_attr.ino).await.unwrap();
     let swap_blocks =
-        wait_until_n_payload_slices(&writer_vfs, swap_attr.ino, 1, online_publish_timeout())
+        wait_until_n_payload_slices_async(&writer_vfs, swap_attr.ino, 1, online_publish_timeout())
+            .await
             .expect("swap source should materialize a payload slice");
     let swap_object_id = swap_blocks[0].1.object_id;
     let swap_key = format_object_fragment_key(&format_info.data_prefix, swap_object_id, 0);
@@ -1803,14 +1824,16 @@ async fn encrypted_remote_object_storage_keeps_remote_ciphertext_and_local_plain
     let reader_meta = Arc::new(RedbMetaEngine::open(&reader_db).unwrap());
     reader_meta.init_root(0, 0).unwrap();
     import_remote_snapshot(writer_meta.as_ref(), reader_meta.as_ref(), &format_info);
-    let reader_vfs = make_vfs_with_meta(reader_meta, &format_info, &reader_cache_str);
+    let reader_vfs = make_vfs_with_meta(reader_meta, &format_info, reader_cache_str);
     let reader_attr = reader_vfs.lookup(1, b"encrypted-e2e.txt").unwrap();
     let reader_bytes = reader_vfs
         .read(reader_attr.ino, 0, payload.len() as u32)
         .await
         .unwrap();
-    assert_eq!(reader_bytes.as_ref(), payload.as_slice());
+    assert_eq!(reader_bytes.as_ref(), payload);
 
+    reader_vfs.shutdown(Duration::from_secs(15)).await;
+    writer_vfs.shutdown(Duration::from_secs(15)).await;
     data_store.delete_volume_data().await.unwrap();
 }
 
