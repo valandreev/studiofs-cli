@@ -1282,6 +1282,7 @@ impl Drop for InFlightCleanup<'_> {
 mod tests {
     use super::*;
     use crate::{StudioVfs, VfsConfig};
+    use bytes::Buf;
     use opendal::{Operator, services::Memory};
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
@@ -1413,7 +1414,7 @@ mod tests {
         payload: Bytes,
     ) -> Bytes {
         let stfs = create_object_buffer(payload).expect("create STFS object");
-        assert!(stfs.to_bytes().starts_with(STFS_MAGIC));
+        assert!(stfs.chunk().starts_with(STFS_MAGIC));
 
         scheduler
             .data_store
