@@ -350,8 +350,9 @@ impl DataStore {
         })
     }
 
-    #[cfg(test)]
-    fn with_operator_for_test(config: &DataStoreConfig, op: Operator) -> DataResult<Self> {
+    /// Create a DataStore around an already-built operator for focused tests.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn with_operator_for_test(config: &DataStoreConfig, op: Operator) -> DataResult<Self> {
         Ok(Self {
             op,
             volume_name: config.volume_name.clone(),
