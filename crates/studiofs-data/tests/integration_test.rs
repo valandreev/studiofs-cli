@@ -9,7 +9,7 @@
 use bytes::Bytes;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use studiofs_data::store::{DataStore, DataStoreConfig};
+use studiofs_data::store::{DataStore, DataStoreConfig, DataStoreCryptoConfig};
 
 /// Atomic counter to generate unique object IDs per test run.
 static OBJECT_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -60,6 +60,10 @@ fn test_config() -> DataStoreConfig {
         secret_key: test_env_var("STUDIOFS_S3_SECRET_KEY", "studiofs123"),
         region: "us-east-1".into(),
         volume_name: "integration-test".into(),
+        volume_uuid: "d34f3c2a-c3a4-4b01-b626-fb46de61118a".into(),
+        crypto: DataStoreCryptoConfig::from(studiofs_meta::EncryptionConfig::new(
+            [0x42; studiofs_meta::ENCRYPTION_KEY_LENGTH],
+        )),
     }
 }
 
