@@ -716,14 +716,16 @@ fn encryption_at_rest_contract_covers_required_sfs346_boundaries() {
 #[test]
 fn local_first_validation_matrix_covers_sfs356_encrypted_regression_gates() {
     let doc = read_workspace_file("docs/local-first-validation-matrix.md");
-    let normalized_doc = normalize_doc_whitespace(&doc);
     let required_terms = [
         "SFS-356",
         "Encrypted remote object regression gate",
         "encrypted_remote_object_storage_keeps_remote_ciphertext_and_local_plaintext_cache",
         "cache_hit_read_does_not_touch_encrypted_remote_object",
+        "foreground_fetch_decrypts_one_remote_object_and_caches_plaintext_payload",
         "prefetch_uses_same_decrypt_path_and_caches_plaintext_payload",
         "random_block_fetch_only_decrypts_requested_remote_object",
+        "corrupt_or_swapped_encrypted_objects_fail_before_cache_population",
+        "crypto_fetch_failures_are_observed_without_retrying",
         "successful_fetch_records_encrypted_remote_read_counters",
         "test_write_read_large_file",
         "foreground_read_baseline_during_and_post_upload_are_comparable",
@@ -738,7 +740,7 @@ fn local_first_validation_matrix_covers_sfs356_encrypted_regression_gates() {
 
     let missing: Vec<_> = required_terms
         .into_iter()
-        .filter(|term| !contains_doc_term(&doc, &normalized_doc, term))
+        .filter(|term| !doc.contains(term))
         .collect();
 
     assert!(

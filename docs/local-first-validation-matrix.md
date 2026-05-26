@@ -107,8 +107,11 @@ live S3 service:
 
 ```bash
 cargo test -p studiofs-vfs cache_hit_read_does_not_touch_encrypted_remote_object -- --nocapture
+cargo test -p studiofs-vfs foreground_fetch_decrypts_one_remote_object_and_caches_plaintext_payload -- --nocapture
 cargo test -p studiofs-vfs prefetch_uses_same_decrypt_path_and_caches_plaintext_payload -- --nocapture
 cargo test -p studiofs-vfs random_block_fetch_only_decrypts_requested_remote_object -- --nocapture
+cargo test -p studiofs-vfs corrupt_or_swapped_encrypted_objects_fail_before_cache_population -- --nocapture
+cargo test -p studiofs-vfs crypto_fetch_failures_are_observed_without_retrying -- --nocapture
 cargo test -p studiofs-vfs successful_fetch_records_encrypted_remote_read_counters -- --nocapture
 ```
 
