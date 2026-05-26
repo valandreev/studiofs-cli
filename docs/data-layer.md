@@ -15,8 +15,7 @@ The transparent remote-object encryption boundary is defined in
 - Read/write connection profile separation (`IoProfile`).
 - Serve as the remote object-store boundary behind the VFS `CachedStore` pipeline.
 - Hybrid cloud layout for chunks: one 16 MiB chunk is stored as four 4 MiB payload objects.
-- Encrypting each remote payload fragment before S3-compatible storage upload
-  once the encryption-at-rest contract is implemented.
+- Encrypting each remote payload fragment before S3-compatible storage upload.
 
 ## S3 Key Layout
 

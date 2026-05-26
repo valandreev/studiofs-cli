@@ -16,6 +16,11 @@ That document is the focused `SFS-270` entrypoint and splits fast/local,
 offline/replay, infra-backed, and bridge checks before you jump to the broader
 workspace commands below.
 
+For final encryption-at-rest acceptance, use the
+[SFS-357 final encrypted-at-rest acceptance gate](local-first-validation-matrix.md#sfs-357-final-encrypted-at-rest-acceptance-gate).
+It collects the encrypted-object unit, integration, E2E, platform smoke, and
+performance checks that should be recorded before closing the feature.
+
 ---
 
 ## Test Layers

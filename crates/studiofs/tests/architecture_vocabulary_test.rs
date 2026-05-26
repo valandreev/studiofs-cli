@@ -752,6 +752,54 @@ fn local_first_validation_matrix_covers_sfs356_encrypted_regression_gates() {
 }
 
 #[test]
+fn docs_cover_sfs357_final_encryption_acceptance_gate() {
+    let contract = read_workspace_file("docs/encryption-at-rest-contract.md");
+    let config = read_workspace_file("docs/configuration.md");
+    let matrix = read_workspace_file("docs/local-first-validation-matrix.md");
+    let tests = read_workspace_file("docs/tests.md");
+    let combined = format!("{contract}\n{config}\n{matrix}\n{tests}");
+    let normalized_doc = normalize_doc_whitespace(&combined);
+    let required_terms = [
+        "SFS-357",
+        "Final encrypted-at-rest acceptance gate",
+        "encrypts remote payload objects before object-storage upload",
+        "users do not configure encryption",
+        "local cache remains plaintext intentionally for performance",
+        "object storage contains encrypted `SFEC` objects, not plaintext `STFS` objects",
+        "only XChaCha20-Poly1305 is supported",
+        "no AES-256-GCM",
+        "RSA",
+        "user passphrase",
+        "KMS",
+        "legacy plaintext volume compatibility",
+        "object storage and bucket compromise",
+        "payload confidentiality in remote object storage",
+        "remote payload tampering detection",
+        "object-key or object-fragment swap detection",
+        "local payload cache files",
+        "process memory",
+        "PostgreSQL metadata",
+        "attackers who can read both metadata/key material",
+        "encrypted_remote_object_storage_keeps_remote_ciphertext_and_local_plaintext_cache",
+        "cargo test --workspace --all-targets -- --nocapture",
+        "no user-facing encryption CLI or mount options were added",
+        "no legacy plaintext fallback branch was added",
+        "no AES/RSA implementation was added",
+    ];
+
+    let missing: Vec<_> = required_terms
+        .into_iter()
+        .filter(|term| !contains_doc_term(&combined, &normalized_doc, term))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "SFS-357 final encrypted-at-rest acceptance docs are missing required terms:\n{}",
+        missing.join("\n")
+    );
+}
+
+#[test]
 fn local_first_e2e_baseline_audit_covers_sfs402_surfaces() {
     let doc = read_workspace_file("docs/local-first-e2e-baseline-audit.md");
     let required_terms = [

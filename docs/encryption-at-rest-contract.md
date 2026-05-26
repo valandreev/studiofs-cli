@@ -2,10 +2,15 @@
 
 ## Status
 
-This document is the implementation contract for transparent StudioFS
-encryption-at-rest of remote payload objects. It defines the required behavior
-for the encryption work tracked by SFS-346 and its implementation follow-ups;
-it is not a claim that older builds already encrypted remote objects.
+This document is the implementation contract and operator reference for
+transparent StudioFS encryption-at-rest of remote payload objects. Current
+formatted volumes carry encryption metadata, `DataStore` encrypts payload
+objects before object-storage upload, and fetch decrypts those objects before
+the existing STFS decoder sees them.
+
+This is not a compatibility promise for older plaintext StudioFS builds or
+older plaintext remote volumes. The current contract has no legacy plaintext
+remote-object fallback.
 
 The mounted IO contract in
 [juicefs-local-first-rust-contract.md](./juicefs-local-first-rust-contract.md)
@@ -23,7 +28,8 @@ StudioFS encryption-at-rest is a remote object-store boundary feature:
    a single remote payload fragment.
 3. Before S3-compatible object storage upload, StudioFS encrypts the complete
    StudioFS remote object for that fragment.
-4. Object storage stores only ciphertext.
+4. Object storage stores encrypted `SFEC` envelopes, not plaintext `STFS`
+   objects.
 5. On remote fetch, StudioFS decrypts the object before passing plaintext bytes
    to the existing object decoder and checksum validator.
 6. VFS, FUSE, WinFSP, writer stack, local cache, fetch scheduler, upload
@@ -47,13 +53,13 @@ Plaintext remains inside trusted local runtime boundaries:
 - local payload cache;
 - object decoder output and checksum validation input.
 
-The local payload cache stays plaintext. StudioFS does not encrypt local cache
-files, local metadata files, local upload-stage files, process memory, or bridge
-buffers as part of this contract.
+The local payload cache stays plaintext intentionally for performance.
+StudioFS does not encrypt local cache files, local metadata files, local
+upload-stage files, process memory, or bridge buffers as part of this contract.
 
 Ciphertext begins only at the remote object-store edge. The bytes submitted to
-S3-compatible storage for encrypted payload fragments are ciphertext, and
-object storage stores only ciphertext.
+S3-compatible storage for encrypted payload fragments are encrypted `SFEC`
+envelopes, and object storage stores only ciphertext.
 
 ## Algorithm Contract
 
@@ -101,11 +107,17 @@ The volume key is generated and stored automatically in StudioFS metadata so
 encryption remains transparent to users. That storage choice is part of the
 security boundary, not a hidden user-controlled secret feature.
 
+Users do not need to configure encryption. StudioFS does not expose
+encryption-related `init`, `discover`, `mount`, or `settings` options, and the
+current implementation has no user passphrase, no KMS integration, no
+AES-256-GCM mode, and no RSA wrapping mode.
+
 ## Security Boundary
 
 This contract protects against object storage and bucket compromise. It protects
 remote payload object confidentiality and integrity for encrypted payload
-fragments.
+fragments, and it detects payload tampering or object-key/object-fragment swaps
+before plaintext reaches the STFS decoder.
 
 AEAD associated data must bind the ciphertext to the StudioFS remote-object
 identity. At minimum, associated data must cover the volume identity, remote
@@ -121,6 +133,24 @@ same-identity plaintext rewrites. AEAD associated data does not by itself
 detect replay of an older valid ciphertext for the same remote-object identity;
 that case is bounded by the metadata/publication model, object immutability, and
 snapshot/janitor retention rules rather than by the cipher alone.
+
+Protected:
+
+- object storage and bucket compromise;
+- payload confidentiality in remote object storage;
+- remote payload tampering detection;
+- object-key or object-fragment swap detection through authenticated context.
+
+Not protected:
+
+- local payload cache files;
+- local upload-stage files;
+- local metadata files;
+- process memory and bridge buffers;
+- filenames, file sizes, inode metadata, ACL metadata, xattrs, and snapshots;
+- PostgreSQL metadata;
+- attackers who can read both metadata/key material and encrypted remote
+  payloads.
 
 The boundary does not include every StudioFS datum. StudioFS explicitly does
 not encrypt filenames, does not encrypt file sizes, does not encrypt inode

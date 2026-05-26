@@ -141,6 +141,79 @@ validating mounted encrypted read/write behavior: run the
 `winfsp_mount_write_read_unmount_smoke` rows from the Platform Bridge Matrix
 above instead of copying those commands into this section.
 
+## SFS-357 Final encrypted-at-rest acceptance gate
+
+Use this as the final closure checklist for the encryption-at-rest milestone.
+Agents should run the focused checks they can run locally and ask an operator to
+run the full workspace, ignored integration, cross-platform mount, and mounted
+performance sweeps.
+
+Required evidence:
+
+- documentation states that StudioFS encrypts remote payload objects before
+  object-storage upload;
+- documentation states that users do not configure encryption;
+- documentation states that local cache remains plaintext intentionally for
+  performance;
+- documentation states that object storage contains encrypted `SFEC` objects,
+  not plaintext `STFS` objects;
+- documentation states that only XChaCha20-Poly1305 is supported;
+- documentation states that no AES-256-GCM, RSA, user passphrase, KMS, or
+  legacy plaintext volume compatibility path exists;
+- documentation states the protected and not protected boundaries, including
+  object-storage compromise, tamper/swap detection, local cache, process memory,
+  metadata, filenames, file sizes, PostgreSQL metadata, and metadata/key access.
+
+Focused local checks:
+
+```bash
+cargo test -p studiofs --test architecture_vocabulary_test encryption_at_rest_contract_covers_required_sfs346_boundaries -- --exact
+cargo test -p studiofs --test architecture_vocabulary_test local_first_validation_matrix_covers_sfs356_encrypted_regression_gates -- --exact
+cargo test -p studiofs-data --lib crypto::tests -- --nocapture
+cargo test -p studiofs-data --test sfec_envelope -- --nocapture
+cargo test -p studiofs-data --test integration_test put_and_get_by_key -- --nocapture
+cargo test -p studiofs-vfs cache_hit_read_does_not_touch_encrypted_remote_object -- --nocapture
+cargo test -p studiofs-vfs foreground_fetch_decrypts_one_remote_object_and_caches_plaintext_payload -- --nocapture
+cargo test -p studiofs-vfs prefetch_uses_same_decrypt_path_and_caches_plaintext_payload -- --nocapture
+cargo test -p studiofs-vfs random_block_fetch_only_decrypts_requested_remote_object -- --nocapture
+cargo test -p studiofs-vfs corrupt_or_swapped_encrypted_objects_fail_before_cache_population -- --nocapture
+cargo test -p studiofs-vfs crypto_fetch_failures_are_observed_without_retrying -- --nocapture
+cargo test -p studiofs-vfs successful_fetch_records_encrypted_remote_read_counters -- --nocapture
+```
+
+Operator acceptance commands:
+
+```bash
+cargo test --workspace --all-targets -- --nocapture
+cargo test --workspace --all-targets -- --ignored --nocapture --test-threads=1
+cargo test -p studiofs-vfs --test vfs_test encrypted_remote_object_storage_keeps_remote_ciphertext_and_local_plaintext_cache -- --ignored --nocapture --test-threads=1
+```
+
+Platform smoke checks:
+
+```bash
+STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1 cargo test -p studiofs-fuse --test mount_sanity fuse_mount_write_read_unmount_smoke -- --ignored --nocapture --test-threads=1
+```
+
+```powershell
+$env:STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS='1'
+$env:STUDIOFS_WINFSP_TEST_MOUNT_POINT='Z:'
+cargo test -p studiofs-winfsp --test mount_sanity winfsp_mount_write_read_unmount_smoke -- --ignored --nocapture --test-threads=1
+```
+
+Performance regression checks:
+
+```bash
+cargo test -p studiofs-vfs --test vfs_test test_write_read_large_file -- --ignored --nocapture --test-threads=1
+cargo test -p studiofs-vfs --test vfs_test warm_cache_sequential_read_bounded_latency_after_write -- --nocapture
+cargo test -p studiofs-vfs --test vfs_test foreground_read_baseline_during_and_post_upload_are_comparable -- --ignored --nocapture --test-threads=1
+```
+
+The gate passes when remote objects are `SFEC` ciphertext, no plaintext payload
+objects are written remotely, local cache remains plaintext, no user-facing
+encryption CLI or mount options were added, no legacy plaintext fallback branch
+was added, and no AES/RSA implementation was added.
+
 ## Focused Benchmark Recipes
 
 These are supplemental benchmark surfaces for the canonical contract. They are

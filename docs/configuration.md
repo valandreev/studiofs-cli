@@ -76,6 +76,18 @@ Important:
 - The current CLI does not expose a public block-size flag on `init`; newly
   initialized volumes report the canonical 4 MiB block size.
 
+### Transparent encryption at rest
+
+StudioFS encrypts remote payload objects automatically. Operators do not enable
+or configure encryption through `init`, `discover`, `mount`, or `settings`.
+
+The remote object-store boundary receives encrypted `SFEC` objects. The local
+payload cache, upload stage, local metadata, PostgreSQL metadata, filenames,
+file sizes, process memory, and bridge buffers remain plaintext by design. The
+current implementation supports only XChaCha20-Poly1305 and does not provide
+AES-256-GCM, RSA wrapping, user passphrases, KMS integration, or legacy
+plaintext remote-volume compatibility.
+
 ### `discover`
 
 Attaches another client to an existing PG-backed volume.
