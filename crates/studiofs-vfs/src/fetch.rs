@@ -115,7 +115,7 @@ pub struct FetchMetrics {
     pub bytes_downloaded: AtomicU64,
     /// Number of encrypted remote objects successfully read and decrypted.
     pub encrypted_objects_read: AtomicU64,
-    /// Number of encrypted remote bytes successfully read.
+    /// Number of encrypted remote bytes successfully read and decrypted.
     pub encrypted_bytes_read: AtomicU64,
     /// Number of encrypted remote read failures from deterministic crypto validation.
     pub encrypted_object_read_failures: AtomicU64,

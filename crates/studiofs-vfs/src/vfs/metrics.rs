@@ -490,6 +490,7 @@ pub struct VfsWritePathTuningStats {
 
 /// Fetch metrics for read path operations.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct VfsFetchStats {
     /// Cache hits in fetch flow.
     pub cache_hits: u64,
@@ -504,16 +505,12 @@ pub struct VfsFetchStats {
     /// Total bytes downloaded.
     pub bytes_downloaded: u64,
     /// Number of encrypted remote objects successfully read and decrypted.
-    #[serde(default)]
     pub encrypted_objects_read: u64,
-    /// Number of encrypted remote bytes read.
-    #[serde(default)]
+    /// Number of encrypted remote bytes successfully read and decrypted.
     pub encrypted_bytes_read: u64,
     /// Number of deterministic encrypted object read failures.
-    #[serde(default)]
     pub encrypted_object_read_failures: u64,
     /// Number of malformed or unsupported encrypted objects.
-    #[serde(default)]
     pub malformed_encrypted_objects: u64,
     /// Prefetch skips count.
     pub prefetch_skips: u64,
@@ -1130,5 +1127,21 @@ mod tests {
 
         assert!(serialized["dirty_slice_count"].is_number());
         assert!(serialized["frozen_slice_count"].is_number());
+    }
+
+    #[test]
+    fn fetch_stats_deserializes_missing_future_fields_as_defaults() {
+        let stats: VfsFetchStats = serde_json::from_value(serde_json::json!({
+            "cache_hits": 7,
+            "s3_fetches": 3
+        }))
+        .expect("deserialize fetch stats with omitted fields");
+
+        assert_eq!(stats.cache_hits, 7);
+        assert_eq!(stats.s3_fetches, 3);
+        assert_eq!(stats.encrypted_objects_read, 0);
+        assert_eq!(stats.encrypted_bytes_read, 0);
+        assert_eq!(stats.encrypted_object_read_failures, 0);
+        assert_eq!(stats.malformed_encrypted_objects, 0);
     }
 }
