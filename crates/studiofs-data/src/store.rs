@@ -392,8 +392,14 @@ impl DataStore {
     /// buffers internally if vectored writes are unsupported.
     pub async fn put_by_key(&self, key: &str, data: impl Into<Buffer>) -> DataResult<()> {
         let data: Buffer = data.into();
-        debug!("uploading by key: {key} ({} bytes)", data.len());
+        let plaintext_len = data.len();
         let encrypted = self.encrypt_payload(key, data)?;
+        debug!(
+            key,
+            plaintext_bytes = plaintext_len,
+            remote_bytes = encrypted.len(),
+            "uploading encrypted object"
+        );
         self.op.write(key, encrypted).await?;
         Ok(())
     }
@@ -464,6 +470,8 @@ impl DataStore {
     }
 
     fn encrypt_payload(&self, key: &str, plaintext: Buffer) -> DataResult<Buffer> {
+        // SFS-351 wires the complete-object crypto boundary; chunked encryption
+        // belongs to the follow-up serializer path once the crypto API supports it.
         let plaintext = plaintext.to_bytes();
         crypto::encrypt_object(
             plaintext.as_ref(),
@@ -540,6 +548,22 @@ mod tests {
         assert!(should_log_path_style_endpoint(
             &mut seen,
             "http://192.168.1.51:9000"
+        ));
+    }
+
+    #[test]
+    fn disabled_crypto_config_is_rejected_without_plaintext_passthrough() {
+        let mut config = encrypted_test_config();
+        config.crypto.encryption.enabled = false;
+        let raw = Operator::new(Memory::default()).unwrap().finish();
+
+        let result = DataStore::with_operator_for_test(&config, raw);
+
+        assert!(matches!(
+            result,
+            Err(DataError::InvalidCryptoConfig(
+                studiofs_meta::EncryptionContractError::Disabled
+            ))
         ));
     }
 
