@@ -184,6 +184,7 @@ tasks:
   - key: e2e-full
     use: [linux-e2e-packages, e2e-preflight, build-studiofs]
     docker: true
+    timeout: 30m
     run: |
       set -euo pipefail
 
