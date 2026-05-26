@@ -2320,10 +2320,7 @@ impl ProgressHeartbeat {
                 clear_progress_heartbeat(tick);
             })
         });
-        Self {
-            stop,
-            handle,
-        }
+        Self { stop, handle }
     }
 
     fn stop(mut self) {

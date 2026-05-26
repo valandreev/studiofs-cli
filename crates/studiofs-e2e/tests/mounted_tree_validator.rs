@@ -302,11 +302,15 @@ fn snapshot_rejects_non_utf8_relative_paths_instead_of_lossy_encoding() {
     let temp = tempdir().unwrap();
     let mount = temp.path().join("client-a");
     fs::create_dir_all(&mount).unwrap();
-    fs::write(
-        mount.join(OsString::from_vec(vec![b'f', 0x80, b'e'])),
-        b"data",
-    )
-    .unwrap();
+    let non_utf8_path = mount.join(OsString::from_vec(vec![b'f', 0x80, b'e']));
+    if let Err(error) = fs::write(&non_utf8_path, b"data") {
+        // APFS rejects invalid UTF-8 names before the snapshotter can observe them.
+        assert!(
+            cfg!(target_os = "macos") && error.raw_os_error() == Some(92),
+            "failed to create non-UTF-8 test path {non_utf8_path:?}: {error}"
+        );
+        return;
+    }
 
     let err = snapshot_client_tree("client-a", &mount).unwrap_err();
 
