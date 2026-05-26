@@ -500,22 +500,15 @@ mod tests {
     }
 
     impl UploadObjectStore for RetryOnceUploadStore {
-        #[allow(clippy::manual_async_fn)]
-        fn put_by_key<'a>(
-            &'a self,
-            key: &'a str,
-            data: Buffer,
-        ) -> impl Future<Output = Result<(), DataError>> + Send + 'a {
-            async move {
-                self.payloads
-                    .lock()
-                    .push((key.to_string(), data.to_bytes()));
-                let attempt = self.attempts.fetch_add(1, Ordering::Relaxed);
-                if attempt == 0 {
-                    return Err(DataError::Storage("temporary encrypted put failure".into()));
-                }
-                Ok(())
+        async fn put_by_key(&self, key: &str, data: Buffer) -> Result<(), DataError> {
+            self.payloads
+                .lock()
+                .push((key.to_string(), data.to_bytes()));
+            let attempt = self.attempts.fetch_add(1, Ordering::Relaxed);
+            if attempt == 0 {
+                return Err(DataError::Storage("temporary encrypted put failure".into()));
             }
+            Ok(())
         }
     }
 
