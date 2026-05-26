@@ -223,7 +223,7 @@ impl ReadAheadTracker {
 
     /// Record read coverage for a specific stream key under an explicit policy.
     ///
-    /// Returns the same upcoming blocks as [`record_read`], but allows multiple
+    /// Returns the same upcoming blocks as [`Self::record_read`], but allows multiple
     /// independent streams per inode.
     pub fn record_read_for_stream(
         &self,

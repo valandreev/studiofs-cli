@@ -40,8 +40,8 @@ pub enum LocalPayloadStartupReconcileMode {
 impl LocalPayloadStartupReconcileMode {
     /// Read the startup reconciliation mode from environment variables.
     ///
-    /// Prefers [`STARTUP_RECONCILE_MODE_ENV`], falling back to
-    /// [`LEGACY_STARTUP_RECONCILE_MODE_ENV`] for compatibility. Any value other
+    /// Prefers `STARTUP_RECONCILE_MODE_ENV`, falling back to
+    /// `LEGACY_STARTUP_RECONCILE_MODE_ENV` for compatibility. Any value other
     /// than `"full"` (case-insensitive) selects [`LocalPayloadStartupReconcileMode::Lightweight`].
     pub fn from_env() -> Self {
         let configured = std::env::var(STARTUP_RECONCILE_MODE_ENV)
