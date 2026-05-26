@@ -9,4 +9,4 @@ pub mod envelope;
 pub mod object;
 pub mod store;
 
-pub use store::{DataStore, DataStoreConfig, IoProfile};
+pub use store::{DataStore, DataStoreConfig, DataStoreCryptoConfig, IoProfile};

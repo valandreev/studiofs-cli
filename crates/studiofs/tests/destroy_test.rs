@@ -12,10 +12,11 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
-use studiofs_data::{DataStore, DataStoreConfig};
+use studiofs_data::{DataStore, DataStoreConfig, DataStoreCryptoConfig};
 use studiofs_meta::{
-    CURRENT_FORMAT_VERSION, DEFAULT_BLOCK_SIZE, FormatInfo, MetaFormat, MetadataBackend,
-    MetadataConfig, PostgresConfig, RedbMetaEngine, ensure_studiofs_database,
+    CURRENT_FORMAT_VERSION, DEFAULT_BLOCK_SIZE, ENCRYPTION_KEY_LENGTH, EncryptionConfig,
+    FormatInfo, MetaFormat, MetadataBackend, MetadataConfig, PostgresConfig, RedbMetaEngine,
+    ensure_studiofs_database,
 };
 use uuid::Uuid;
 
@@ -218,6 +219,10 @@ fn make_datastore(env: &TestEnv, name: &str) -> DataStore {
         secret_key: env.s3_secret_key.clone(),
         region: env.s3_region.clone(),
         volume_name: name.to_string(),
+        volume_uuid: Uuid::new_v4().to_string(),
+        crypto: DataStoreCryptoConfig::from_encryption(&EncryptionConfig::new(
+            [0xA5; ENCRYPTION_KEY_LENGTH],
+        )),
     };
     DataStore::new(&cfg).expect("create datastore")
 }

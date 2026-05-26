@@ -9,11 +9,11 @@ use anyhow::Context;
 use clap::Args;
 use std::io::Write;
 use std::path::PathBuf;
-use studiofs_data::{DataStore, DataStoreConfig};
+use studiofs_data::{DataStore, DataStoreConfig, DataStoreCryptoConfig};
 use studiofs_meta::{
-    CURRENT_FORMAT_VERSION, DEFAULT_BLOCK_SIZE, EncryptionConfig, FormatInfo, MetaFormat,
-    MetaOpenOptions, MetadataBackend, MetadataConfig, PostgresConfig, RedbMetaEngine,
-    ensure_studiofs_database, open_meta_engine_with_options,
+    CURRENT_FORMAT_VERSION, DEFAULT_BLOCK_SIZE, ENCRYPTION_KEY_LENGTH, EncryptionConfig,
+    FormatInfo, MetaFormat, MetaOpenOptions, MetadataBackend, MetadataConfig, PostgresConfig,
+    RedbMetaEngine, ensure_studiofs_database, open_meta_engine_with_options,
 };
 use tracing::info;
 use uuid::Uuid;
@@ -78,6 +78,10 @@ impl InitRunRequest {
                 secret_key: args.secret_key,
                 region,
                 volume_name: String::new(),
+                volume_uuid: "init-storage-probe".into(),
+                crypto: DataStoreCryptoConfig::from_encryption(&EncryptionConfig::new(
+                    [0; ENCRYPTION_KEY_LENGTH],
+                )),
             },
             postgres_dsn: args.meta,
             deprecated_metadata: DeprecatedMetadataArgs {

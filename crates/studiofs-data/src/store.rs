@@ -1,12 +1,13 @@
 //! DataStore — S3 storage abstraction via OpenDAL.
 
+use crate::crypto::{self, ObjectEncryptionContext, VolumeMasterKey};
 use opendal::layers::{ConcurrentLimitLayer, RetryLayer, TimeoutLayer};
 use opendal::{Buffer, Operator, services::S3};
 use std::collections::HashSet;
 use std::fmt;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
-use studiofs_meta::FormatInfo;
+use studiofs_meta::{EncryptionConfig, FormatInfo};
 use thiserror::Error;
 use tracing::{debug, info};
 
@@ -20,6 +21,14 @@ pub enum DataError {
     /// OpenDAL reported an underlying storage-layer failure.
     #[error("opendal error: {0}")]
     OpenDal(#[from] opendal::Error),
+
+    /// Persisted encryption configuration is not supported by this binary.
+    #[error("invalid data encryption config: {0}")]
+    InvalidCryptoConfig(#[from] studiofs_meta::EncryptionContractError),
+
+    /// Object encryption or authentication failed.
+    #[error("crypto error: {0}")]
+    Crypto(#[from] crypto::CryptoError),
 }
 
 /// Result type for all datastore operations.
@@ -41,6 +50,49 @@ pub struct DataStoreConfig {
     pub region: String,
     /// Stable namespace used as the object key prefix (often a volume name).
     pub volume_name: String,
+    /// Immutable volume UUID authenticated into every encrypted remote payload.
+    pub volume_uuid: String,
+    /// Transparent remote-object encryption settings.
+    pub crypto: DataStoreCryptoConfig,
+}
+
+/// Encryption settings used by [`DataStore`] for remote payload objects.
+#[derive(Clone)]
+pub struct DataStoreCryptoConfig {
+    /// Persisted volume encryption contract and active key material.
+    pub encryption: EncryptionConfig,
+}
+
+impl DataStoreCryptoConfig {
+    /// Build datastore crypto settings from persisted volume metadata.
+    pub fn from_encryption(encryption: &EncryptionConfig) -> Self {
+        Self {
+            encryption: encryption.clone(),
+        }
+    }
+}
+
+impl fmt::Debug for DataStoreCryptoConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DataStoreCryptoConfig")
+            .field("encryption", &self.encryption)
+            .finish()
+    }
+}
+
+struct DataStoreCryptoRuntime {
+    master_key: VolumeMasterKey,
+    key_id: u32,
+}
+
+impl DataStoreCryptoRuntime {
+    fn from_config(config: &DataStoreCryptoConfig) -> DataResult<Self> {
+        config.encryption.validate()?;
+        Ok(Self {
+            master_key: VolumeMasterKey::from_bytes(config.encryption.volume_master_key),
+            key_id: config.encryption.active_key_id,
+        })
+    }
 }
 
 impl fmt::Debug for DataStoreConfig {
@@ -52,6 +104,8 @@ impl fmt::Debug for DataStoreConfig {
             .field("secret_key", &"<redacted>")
             .field("region", &self.region)
             .field("volume_name", &self.volume_name)
+            .field("volume_uuid", &self.volume_uuid)
+            .field("crypto", &self.crypto)
             .finish()
     }
 }
@@ -81,6 +135,8 @@ impl From<&FormatInfo> for DataStoreConfig {
             secret_key: info.secret_key.clone(),
             region: info.region.clone(),
             volume_name: info.name.clone(),
+            volume_uuid: info.uuid.clone(),
+            crypto: DataStoreCryptoConfig::from_encryption(&info.encryption),
         }
     }
 }
@@ -89,6 +145,8 @@ impl From<&FormatInfo> for DataStoreConfig {
 pub struct DataStore {
     op: Operator,
     volume_name: String,
+    volume_uuid: String,
+    crypto: DataStoreCryptoRuntime,
     config: DataStoreConfig,
     profile: IoProfile,
 }
@@ -147,6 +205,7 @@ impl DataStore {
 
     /// Create a DataStore with a specific I/O profile.
     pub fn with_profile(config: &DataStoreConfig, profile: IoProfile) -> DataResult<Self> {
+        let crypto = DataStoreCryptoRuntime::from_config(&config.crypto)?;
         let mut builder = S3::default()
             .endpoint(&config.endpoint)
             .bucket(&config.bucket)
@@ -265,8 +324,22 @@ impl DataStore {
         Ok(Self {
             op,
             volume_name: config.volume_name.clone(),
+            volume_uuid: config.volume_uuid.clone(),
+            crypto,
             config: config.clone(),
             profile,
+        })
+    }
+
+    #[cfg(test)]
+    fn with_operator_for_test(config: &DataStoreConfig, op: Operator) -> DataResult<Self> {
+        Ok(Self {
+            op,
+            volume_name: config.volume_name.clone(),
+            volume_uuid: config.volume_uuid.clone(),
+            crypto: DataStoreCryptoRuntime::from_config(&config.crypto)?,
+            config: config.clone(),
+            profile: IoProfile::Default,
         })
     }
 
@@ -309,8 +382,7 @@ impl DataStore {
         let data: Buffer = data.into();
         let key = self.object_key(object_id);
         debug!("uploading object: {key} ({} bytes)", data.len());
-        self.op.write(&key, data).await?;
-        Ok(())
+        self.put_by_key(&key, data).await
     }
 
     /// Upload bytes to an already-formatted storage key.
@@ -321,7 +393,8 @@ impl DataStore {
     pub async fn put_by_key(&self, key: &str, data: impl Into<Buffer>) -> DataResult<()> {
         let data: Buffer = data.into();
         debug!("uploading by key: {key} ({} bytes)", data.len());
-        self.op.write(key, data).await?;
+        let encrypted = self.encrypt_payload(key, data)?;
+        self.op.write(key, encrypted).await?;
         Ok(())
     }
 
@@ -329,15 +402,14 @@ impl DataStore {
     pub async fn get_object(&self, object_id: &str) -> DataResult<Buffer> {
         let key = self.object_key(object_id);
         debug!("downloading object: {key}");
-        let data = self.op.read(&key).await?;
-        Ok(data)
+        self.get_by_key(&key).await
     }
 
     /// Download bytes from an already-formatted storage key.
     pub async fn get_by_key(&self, key: &str) -> DataResult<Buffer> {
         debug!("downloading by key: {key}");
         let data = self.op.read(key).await?;
-        Ok(data)
+        self.decrypt_payload(key, data)
     }
 
     /// Delete a generic object from S3.
@@ -382,11 +454,56 @@ impl DataStore {
     pub fn operator(&self) -> &Operator {
         &self.op
     }
+
+    fn crypto_context<'a>(&'a self, key: &'a str) -> ObjectEncryptionContext<'a> {
+        ObjectEncryptionContext {
+            volume_uuid: &self.volume_uuid,
+            storage_key: key,
+            key_id: self.crypto.key_id,
+        }
+    }
+
+    fn encrypt_payload(&self, key: &str, plaintext: Buffer) -> DataResult<Buffer> {
+        let plaintext = plaintext.to_bytes();
+        crypto::encrypt_object(
+            plaintext.as_ref(),
+            &self.crypto.master_key,
+            self.crypto_context(key),
+        )
+        .map_err(DataError::from)
+    }
+
+    fn decrypt_payload(&self, key: &str, ciphertext: Buffer) -> DataResult<Buffer> {
+        let plaintext = crypto::decrypt_object(
+            ciphertext.to_bytes(),
+            &self.crypto.master_key,
+            self.crypto_context(key),
+        )?;
+        Ok(Buffer::from(plaintext))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::envelope::SFEC_MAGIC;
+    use crate::object::{MAGIC as STFS_MAGIC, create_object_buffer, read_object};
+    use bytes::Bytes;
+    use opendal::services::Memory;
+    use studiofs_meta::EncryptionConfig;
+
+    fn encrypted_test_config() -> DataStoreConfig {
+        DataStoreConfig {
+            endpoint: "memory://".into(),
+            bucket: "unit-test".into(),
+            access_key: "access".into(),
+            secret_key: "secret".into(),
+            region: "us-east-1".into(),
+            volume_name: "unit-volume".into(),
+            volume_uuid: "1a4c0fe2-8550-4892-952c-5ec26c0e0d8d".into(),
+            crypto: DataStoreCryptoConfig::from_encryption(&EncryptionConfig::new([0x42; 32])),
+        }
+    }
 
     #[test]
     fn test_is_ip_endpoint_ipv4() {
@@ -424,5 +541,51 @@ mod tests {
             &mut seen,
             "http://192.168.1.51:9000"
         ));
+    }
+
+    #[tokio::test]
+    async fn key_and_object_paths_store_sfec_remotely_and_return_stfs_plaintext() {
+        let raw = Operator::new(Memory::default()).unwrap().finish();
+        let store =
+            DataStore::with_operator_for_test(&encrypted_test_config(), raw.clone()).unwrap();
+
+        let key = "unit-volume/objects/aa/bb/key-path-object";
+        let key_plaintext = create_object_buffer(Bytes::from_static(b"key path secret"))
+            .unwrap()
+            .to_bytes();
+
+        store.put_by_key(key, key_plaintext.clone()).await.unwrap();
+
+        let remote_key_bytes = raw.read(key).await.unwrap().to_bytes();
+        assert!(remote_key_bytes.starts_with(SFEC_MAGIC));
+        assert!(!remote_key_bytes.starts_with(STFS_MAGIC));
+
+        let downloaded_key_bytes = store.get_by_key(key).await.unwrap().to_bytes();
+        assert_eq!(downloaded_key_bytes, key_plaintext);
+        assert_eq!(
+            read_object(Bytes::clone(&downloaded_key_bytes)).unwrap(),
+            Bytes::from_static(b"key path secret")
+        );
+
+        let object_id = "0011223344556677";
+        let object_plaintext = create_object_buffer(Bytes::from_static(b"object path secret"))
+            .unwrap()
+            .to_bytes();
+        store
+            .put_object(object_id, object_plaintext.clone())
+            .await
+            .unwrap();
+
+        let object_key = store.object_key(object_id);
+        let remote_object_bytes = raw.read(&object_key).await.unwrap().to_bytes();
+        assert!(remote_object_bytes.starts_with(SFEC_MAGIC));
+        assert!(!remote_object_bytes.starts_with(STFS_MAGIC));
+
+        let downloaded_object_bytes = store.get_object(object_id).await.unwrap().to_bytes();
+        assert_eq!(downloaded_object_bytes, object_plaintext);
+        assert_eq!(
+            read_object(downloaded_object_bytes).unwrap(),
+            Bytes::from_static(b"object path secret")
+        );
     }
 }

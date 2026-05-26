@@ -348,6 +348,7 @@ fn is_retryable(err: &DataError) -> bool {
                 || oe.is_temporary()
         }
         DataError::Storage(_) => true,
+        DataError::InvalidCryptoConfig(_) | DataError::Crypto(_) => false,
     }
 }
 
@@ -380,12 +381,24 @@ fn classify_data_error(metrics: &UploadMetrics, err: &DataError) {
 
 #[cfg(test)]
 mod tests {
-    use super::upload_log_is_idle;
+    use super::{is_retryable, upload_log_is_idle};
+    use studiofs_data::{crypto::CryptoError, store::DataError};
+    use studiofs_meta::EncryptionContractError;
 
     #[test]
     fn idle_upload_info_log_is_compact() {
         assert!(upload_log_is_idle(0, 0));
         assert!(!upload_log_is_idle(1, 0));
         assert!(!upload_log_is_idle(0, 1));
+    }
+
+    #[test]
+    fn crypto_failures_are_not_upload_retryable() {
+        assert!(!is_retryable(&DataError::InvalidCryptoConfig(
+            EncryptionContractError::Disabled
+        )));
+        assert!(!is_retryable(&DataError::Crypto(
+            CryptoError::AuthenticationFailed
+        )));
     }
 }
