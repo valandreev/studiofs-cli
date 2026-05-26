@@ -1356,7 +1356,7 @@ mod tests {
         Arc<CachedStore>,
         DataStoreConfig,
     ) {
-        let volume_name = format!("fetch-encrypted-{volume_suffix}-{}", std::process::id());
+        let volume_name = format!("fetch-encrypted-{volume_suffix}");
         let config = DataStoreConfig {
             endpoint: "memory://".into(),
             bucket: "unit-test".into(),
@@ -1546,8 +1546,9 @@ mod tests {
         )
         .await
         .to_vec();
-        let last = corrupt_remote.len() - 1;
-        corrupt_remote[last] ^= 0x55;
+        if let Some(last_byte) = corrupt_remote.last_mut() {
+            *last_byte ^= 0x55;
+        }
         raw.write(&corrupt_key, Bytes::from(corrupt_remote))
             .await
             .expect("write corrupted ciphertext");
