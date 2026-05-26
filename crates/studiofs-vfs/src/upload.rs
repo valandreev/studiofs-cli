@@ -7,6 +7,7 @@ use crate::runtime::{TimeoutOrCancel, run_with_timeout_or_cancel, sleep_or_cance
 use crate::vfs::VfsConfig;
 use opendal::{Buffer, ErrorKind};
 use std::convert::TryFrom;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -90,10 +91,34 @@ pub enum UploadError {
     Cancelled,
 }
 
+/// Remote object write port used by the upload scheduler.
+pub trait UploadObjectStore: Send + Sync + 'static {
+    /// Upload already-serialized STFS object bytes to a remote storage key.
+    fn put_by_key<'a>(
+        &'a self,
+        key: &'a str,
+        payload: Buffer,
+    ) -> impl Future<Output = Result<(), DataError>> + Send + 'a;
+}
+
+impl UploadObjectStore for DataStore {
+    #[allow(clippy::manual_async_fn)]
+    fn put_by_key<'a>(
+        &'a self,
+        key: &'a str,
+        payload: Buffer,
+    ) -> impl Future<Output = Result<(), DataError>> + Send + 'a {
+        async move { DataStore::put_by_key(self, key, payload).await }
+    }
+}
+
 /// Adaptive uploader with AIMD concurrency and per-request retry.
-pub struct UploadScheduler {
+pub struct UploadScheduler<S = DataStore>
+where
+    S: UploadObjectStore,
+{
     aimd: AimdController,
-    data_store: Arc<DataStore>,
+    data_store: Arc<S>,
     max_concurrency_hint: usize,
     max_attempts: u32,
     request_timeout: Duration,
@@ -104,9 +129,12 @@ pub struct UploadScheduler {
     pub metrics: UploadMetrics,
 }
 
-impl UploadScheduler {
+impl<S> UploadScheduler<S>
+where
+    S: UploadObjectStore,
+{
     /// Creates a new scheduler bound to the supplied data store and configuration.
-    pub fn new(data_store: Arc<DataStore>, aimd_config: AimdConfig, config: &VfsConfig) -> Self {
+    pub fn new(data_store: Arc<S>, aimd_config: AimdConfig, config: &VfsConfig) -> Self {
         let max_attempts = config.upload_max_attempts.max(1);
         let request_timeout_s = config.upload_request_timeout_secs.max(1);
         let retry_base_ms = config.upload_retry_base_ms.max(1);
@@ -381,9 +409,45 @@ fn classify_data_error(metrics: &UploadMetrics, err: &DataError) {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_retryable, upload_log_is_idle};
-    use studiofs_data::{crypto::CryptoError, store::DataError};
-    use studiofs_meta::EncryptionContractError;
+    use super::{UploadObjectStore, UploadScheduler, is_retryable, upload_log_is_idle};
+    use crate::AimdConfig;
+    use crate::vfs::VfsConfig;
+    use bytes::Bytes;
+    use opendal::{Buffer, Operator, services::Memory};
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use studiofs_data::envelope::SFEC_MAGIC;
+    use studiofs_data::object::{MAGIC as STFS_MAGIC, create_object_buffer};
+    use studiofs_data::{
+        crypto::CryptoError,
+        store::{DataError, DataStore, DataStoreConfig, DataStoreCryptoConfig},
+    };
+    use studiofs_meta::{EncryptionConfig, EncryptionContractError};
+    use tokio_util::sync::CancellationToken;
+
+    fn encrypted_test_config() -> DataStoreConfig {
+        DataStoreConfig {
+            endpoint: "memory://".into(),
+            bucket: "unit-test".into(),
+            access_key: "access".into(),
+            secret_key: "secret".into(),
+            region: "us-east-1".into(),
+            volume_name: "unit-volume".into(),
+            volume_uuid: "scheduler-upload-test-volume".into(),
+            crypto: DataStoreCryptoConfig::from(EncryptionConfig::new([0x51; 32])),
+        }
+    }
+
+    fn upload_test_config() -> VfsConfig {
+        VfsConfig {
+            upload_max_attempts: 2,
+            upload_retry_base_ms: 1,
+            upload_retry_max_ms: 1,
+            upload_request_timeout_secs: 5,
+            ..VfsConfig::default()
+        }
+    }
 
     #[test]
     fn idle_upload_info_log_is_compact() {
@@ -400,5 +464,99 @@ mod tests {
         assert!(!is_retryable(&DataError::Crypto(
             CryptoError::AuthenticationFailed
         )));
+    }
+
+    #[tokio::test]
+    async fn scheduler_writes_sfec_remote_object_from_plaintext_stfs_payload() {
+        let raw = Operator::new(Memory::default()).unwrap().finish();
+        let store = Arc::new(
+            DataStore::with_operator_for_test(&encrypted_test_config(), raw.clone()).unwrap(),
+        );
+        let scheduler = UploadScheduler::new(
+            store.clone(),
+            AimdConfig::upload_default(),
+            &upload_test_config(),
+        );
+        let plaintext_object =
+            create_object_buffer(Bytes::from_static(b"upload plaintext")).unwrap();
+        assert!(plaintext_object.to_bytes().starts_with(STFS_MAGIC));
+
+        let key = "unit-volume/objects/aa/bb/scheduler-upload";
+        scheduler
+            .put(key, plaintext_object.clone(), &CancellationToken::new())
+            .await
+            .unwrap();
+
+        let remote_bytes = raw.read(key).await.unwrap().to_bytes();
+        assert!(remote_bytes.starts_with(SFEC_MAGIC));
+        assert!(!remote_bytes.starts_with(STFS_MAGIC));
+        assert!(remote_bytes.len() > plaintext_object.len());
+        assert_eq!(
+            store.get_by_key(key).await.unwrap().to_bytes(),
+            plaintext_object.to_bytes()
+        );
+    }
+
+    #[derive(Default)]
+    struct RetryOnceUploadStore {
+        attempts: AtomicU64,
+        payloads: Mutex<Vec<(String, Bytes)>>,
+    }
+
+    impl UploadObjectStore for RetryOnceUploadStore {
+        #[allow(clippy::manual_async_fn)]
+        fn put_by_key<'a>(
+            &'a self,
+            key: &'a str,
+            data: Buffer,
+        ) -> impl Future<Output = Result<(), DataError>> + Send + 'a {
+            async move {
+                self.payloads
+                    .lock()
+                    .push((key.to_string(), data.to_bytes()));
+                let attempt = self.attempts.fetch_add(1, Ordering::Relaxed);
+                if attempt == 0 {
+                    return Err(DataError::Storage("temporary encrypted put failure".into()));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduler_retries_after_retryable_encrypted_put_failure() {
+        let store = Arc::new(RetryOnceUploadStore::default());
+        let scheduler = UploadScheduler::new(
+            store.clone(),
+            AimdConfig::upload_default(),
+            &upload_test_config(),
+        );
+        let plaintext_object =
+            create_object_buffer(Bytes::from_static(b"retry plaintext")).unwrap();
+
+        scheduler
+            .put(
+                "unit-volume/objects/aa/bb/retry-upload",
+                plaintext_object.clone(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(store.attempts.load(Ordering::Relaxed), 2);
+        let payloads = store.payloads.lock();
+        assert_eq!(payloads.len(), 2);
+        assert!(
+            payloads
+                .iter()
+                .all(|(_, bytes)| bytes.starts_with(STFS_MAGIC))
+        );
+        assert!(
+            payloads
+                .iter()
+                .all(|(_, bytes)| bytes == &plaintext_object.to_bytes())
+        );
+        assert_eq!(scheduler.metrics.retries.load(Ordering::Relaxed), 1);
+        assert_eq!(scheduler.metrics.uploads_ok.load(Ordering::Relaxed), 1);
     }
 }

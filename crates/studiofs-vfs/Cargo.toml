@@ -28,6 +28,7 @@ tempfile.workspace = true
 smallvec.workspace = true
 
 [dev-dependencies]
+studiofs-data = { workspace = true, features = ["test-utils"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 bytes.workspace = true
 aws-sdk-s3 = { version = "1", default-features = false, features = ["http-1x", "rt-tokio"] }
