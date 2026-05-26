@@ -94,6 +94,53 @@ real mounted I/O behavior.
 | Windows WinFSP | mounted create/write/read/readdir/delete/unmount lifecycle | `winfsp_mount_write_read_unmount_smoke` | `$env:STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS='1'; $env:STUDIOFS_WINFSP_TEST_MOUNT_POINT='Z:'; cargo test -p studiofs-winfsp --test mount_sanity winfsp_mount_write_read_unmount_smoke -- --ignored --nocapture --test-threads=1` |
 | Windows WinFSP sequential writer | AJA-style large sequential writer must use WinFSP cleanup flush/purge while keeping StudioFS non-delete cleanup callback handling observational | `winfsp_mount_aja_style_sequential_writer_validation_smoke` | `$env:STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS='1'; $env:STUDIOFS_WINFSP_TEST_MOUNT_POINT='Z:'; cargo test -p studiofs-winfsp --test mount_sanity winfsp_mount_aja_style_sequential_writer_validation_smoke -- --ignored --nocapture --test-threads=1` |
 
+## SFS-356 Encrypted remote object regression gate
+
+Run this gate when encryption-at-rest, `DataStore`, fetch, cache, prefetch,
+upload scheduling, or mounted bridge changes could affect encrypted remote
+objects. The goal is to catch platform regressions and catastrophic performance
+regressions such as whole-file decrypt, crypto work on warm cache hits, or a
+foreground read while background upload is active blocking behind writeback.
+
+The fast encrypted-fetch checks prove the shared remote-object path without a
+live S3 service:
+
+```bash
+cargo test -p studiofs-vfs cache_hit_read_does_not_touch_encrypted_remote_object -- --nocapture
+cargo test -p studiofs-vfs foreground_fetch_decrypts_one_remote_object_and_caches_plaintext_payload -- --nocapture
+cargo test -p studiofs-vfs prefetch_uses_same_decrypt_path_and_caches_plaintext_payload -- --nocapture
+cargo test -p studiofs-vfs random_block_fetch_only_decrypts_requested_remote_object -- --nocapture
+cargo test -p studiofs-vfs corrupt_or_swapped_encrypted_objects_fail_before_cache_population -- --nocapture
+cargo test -p studiofs-vfs crypto_fetch_failures_are_observed_without_retrying -- --nocapture
+cargo test -p studiofs-vfs successful_fetch_records_encrypted_remote_read_counters -- --nocapture
+```
+
+The live S3 encrypted-object check verifies the outer SFEC envelope, plaintext
+local cache behavior, deterministic tamper failure, and a cold reader using the
+same published encrypted remote object:
+
+```bash
+cargo test -p studiofs-vfs --test vfs_test encrypted_remote_object_storage_keeps_remote_ciphertext_and_local_plaintext_cache -- --ignored --nocapture --test-threads=1
+```
+
+Use the existing focused VFS performance checks for large sequential file
+write/read, warm cache hits, and foreground read while background upload is
+active. `make_format_info` provisions encrypted-at-rest volumes by default, so
+these commands exercise encrypted remote-object configuration when they reach
+remote storage:
+
+```bash
+cargo test -p studiofs-vfs --test vfs_test test_write_read_large_file -- --ignored --nocapture --test-threads=1
+cargo test -p studiofs-vfs --test vfs_test warm_cache_sequential_read_bounded_latency_after_write -- --nocapture
+cargo test -p studiofs-vfs --test vfs_test foreground_read_baseline_during_and_post_upload_are_comparable -- --ignored --nocapture --test-threads=1
+```
+
+Pair those data-plane checks with the platform bridge smoke rows above when
+validating mounted encrypted read/write behavior: run the
+`fuse_mount_write_read_unmount_smoke` and
+`winfsp_mount_write_read_unmount_smoke` rows from the Platform Bridge Matrix
+above instead of copying those commands into this section.
+
 ## Focused Benchmark Recipes
 
 These are supplemental benchmark surfaces for the canonical contract. They are
