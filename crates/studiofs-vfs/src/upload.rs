@@ -102,21 +102,17 @@ pub trait UploadObjectStore: Send + Sync + 'static {
 }
 
 impl UploadObjectStore for DataStore {
-    #[allow(clippy::manual_async_fn)]
     fn put_by_key<'a>(
         &'a self,
         key: &'a str,
         payload: Buffer,
     ) -> impl Future<Output = Result<(), DataError>> + Send + 'a {
-        async move { DataStore::put_by_key(self, key, payload).await }
+        DataStore::put_by_key(self, key, payload)
     }
 }
 
 /// Adaptive uploader with AIMD concurrency and per-request retry.
-pub struct UploadScheduler<S = DataStore>
-where
-    S: UploadObjectStore,
-{
+pub struct UploadScheduler<S = DataStore> {
     aimd: AimdController,
     data_store: Arc<S>,
     max_concurrency_hint: usize,
