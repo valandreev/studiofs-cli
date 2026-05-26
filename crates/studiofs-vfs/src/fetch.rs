@@ -113,6 +113,14 @@ pub struct FetchMetrics {
     pub retries: AtomicU64,
     /// Total bytes downloaded from remote and validated payloads.
     pub bytes_downloaded: AtomicU64,
+    /// Number of encrypted remote objects successfully read and decrypted.
+    pub encrypted_objects_read: AtomicU64,
+    /// Number of encrypted remote bytes successfully read and decrypted.
+    pub encrypted_bytes_read: AtomicU64,
+    /// Number of encrypted remote read failures from deterministic crypto validation.
+    pub encrypted_object_read_failures: AtomicU64,
+    /// Number of encrypted objects rejected as malformed or unsupported before AEAD success.
+    pub malformed_encrypted_objects: AtomicU64,
     /// Number of prefetches skipped because admission was closed.
     pub prefetch_skips: AtomicU64,
     /// Total count of local cache I/O calls.
@@ -166,6 +174,10 @@ impl FetchMetrics {
             singleflight_joins: AtomicU64::new(0),
             retries: AtomicU64::new(0),
             bytes_downloaded: AtomicU64::new(0),
+            encrypted_objects_read: AtomicU64::new(0),
+            encrypted_bytes_read: AtomicU64::new(0),
+            encrypted_object_read_failures: AtomicU64::new(0),
+            malformed_encrypted_objects: AtomicU64::new(0),
             prefetch_skips: AtomicU64::new(0),
             local_cache_io_calls: AtomicU64::new(0),
             local_cache_io_handoff_total_ns: AtomicU64::new(0),
@@ -195,13 +207,17 @@ impl std::fmt::Display for FetchMetrics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "cache_hits={} s3={} errors={} singleflight={} retries={} bytes={} prefetch_skips={} local_cache_io_calls={} local_cache_handoff_max_ms={:.3} local_cache_backend_max_ms={:.3} s3_get_max_ms={:.3} decode_max_ms={:.3} assemble_copy_max_ms={:.3} local_cache_put_max_ms={:.3} fetch_total_max_ms={:.3}",
+            "cache_hits={} s3={} errors={} singleflight={} retries={} bytes={} encrypted_objects={} encrypted_bytes={} crypto_read_failures={} malformed_encrypted_objects={} prefetch_skips={} local_cache_io_calls={} local_cache_handoff_max_ms={:.3} local_cache_backend_max_ms={:.3} s3_get_max_ms={:.3} decode_max_ms={:.3} assemble_copy_max_ms={:.3} local_cache_put_max_ms={:.3} fetch_total_max_ms={:.3}",
             self.cache_hits.load(Ordering::Relaxed),
             self.s3_fetches.load(Ordering::Relaxed),
             self.s3_errors.load(Ordering::Relaxed),
             self.singleflight_joins.load(Ordering::Relaxed),
             self.retries.load(Ordering::Relaxed),
             self.bytes_downloaded.load(Ordering::Relaxed),
+            self.encrypted_objects_read.load(Ordering::Relaxed),
+            self.encrypted_bytes_read.load(Ordering::Relaxed),
+            self.encrypted_object_read_failures.load(Ordering::Relaxed),
+            self.malformed_encrypted_objects.load(Ordering::Relaxed),
             self.prefetch_skips.load(Ordering::Relaxed),
             self.local_cache_io_calls.load(Ordering::Relaxed),
             self.local_cache_io_handoff_max_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0,
@@ -864,8 +880,10 @@ impl FetchScheduler {
             FetchClass::Foreground => self.max_fetch_attempts,
             FetchClass::Prefetch => self.prefetch_max_fetch_attempts.max(1),
         };
+        let mut attempts_made = 0;
 
         for attempt in 0..max_attempts {
+            attempts_made = attempt + 1;
             // Acquire an AIMD permit — blocks until the concurrency window
             // allows another in-flight request.
             let wait_start = Instant::now();
@@ -911,19 +929,28 @@ impl FetchScheduler {
             // Hard timeout per request — prevents runaway waits from
             // blocking WinFSP/FUSE dispatch threads indefinitely.
             let req_start = Instant::now();
-            let get_result =
-                tokio::time::timeout(self.request_timeout, self.data_store.get_by_key(key)).await;
+            let get_result = tokio::time::timeout(
+                self.request_timeout,
+                self.data_store.get_by_key_with_stats(key),
+            )
+            .await;
             let req_elapsed = req_start.elapsed();
             let req_ms = duration_to_millis_u64(req_elapsed);
 
             match get_result {
-                Ok(Ok(compressed)) => {
+                Ok(Ok((compressed, read_stats))) => {
                     self.record_s3_get(req_elapsed);
                     permit.success();
                     self.metrics.s3_fetches.fetch_add(1, Ordering::Relaxed);
                     self.metrics
                         .bytes_downloaded
                         .fetch_add(compressed.len() as u64, Ordering::Relaxed);
+                    self.metrics
+                        .encrypted_objects_read
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.metrics
+                        .encrypted_bytes_read
+                        .fetch_add(read_stats.encrypted_bytes, Ordering::Relaxed);
 
                     debug!(
                         object_id,
@@ -983,8 +1010,12 @@ impl FetchScheduler {
                     }
 
                     self.metrics.s3_errors.fetch_add(1, Ordering::Relaxed);
+                    let retryable = e.is_retryable();
+                    if !retryable {
+                        record_crypto_read_failure(&self.metrics, &e);
+                    }
 
-                    if attempt + 1 < max_attempts {
+                    if retryable && attempt + 1 < max_attempts {
                         let retry_base = if is_send_error {
                             self.retry_base_delay.max(Duration::from_millis(200))
                         } else {
@@ -1024,7 +1055,7 @@ impl FetchScheduler {
                         }
                         drop(_fetch_qos);
                         tokio::time::sleep(delay).await;
-                    } else {
+                    } else if retryable {
                         if matches!(class, FetchClass::Prefetch) {
                             debug!(
                                 attempts = max_attempts,
@@ -1046,9 +1077,32 @@ impl FetchScheduler {
                                 "fetch exhausted all retries"
                             );
                         }
+                    } else if matches!(class, FetchClass::Prefetch) {
+                        debug!(
+                            attempts = attempts_made,
+                            key,
+                            fragment_index,
+                            req_ms,
+                            total_ms = duration_to_millis_u64(overall_start.elapsed()),
+                            error = %e,
+                            "prefetch failed with non-retryable crypto error"
+                        );
+                    } else {
+                        error!(
+                            attempts = attempts_made,
+                            key,
+                            fragment_index,
+                            req_ms,
+                            total_ms = duration_to_millis_u64(overall_start.elapsed()),
+                            error = %e,
+                            "fetch failed with non-retryable crypto error"
+                        );
                     }
 
                     last_err = Some(e);
+                    if !retryable {
+                        break;
+                    }
                 }
                 Err(_elapsed) => {
                     self.record_s3_get(req_elapsed);
@@ -1118,7 +1172,7 @@ impl FetchScheduler {
         }
 
         Err(FetchError::Exhausted {
-            attempts: max_attempts,
+            attempts: attempts_made,
             source: last_err.expect("at least one error"),
         })
     }
@@ -1201,6 +1255,41 @@ fn is_send_request_error(err: &DataError) -> bool {
         }
         _ => false,
     }
+}
+
+fn record_crypto_read_failure(metrics: &FetchMetrics, err: &DataError) {
+    match err {
+        DataError::Crypto(crypto_error) => {
+            metrics
+                .encrypted_object_read_failures
+                .fetch_add(1, Ordering::Relaxed);
+            if is_malformed_encrypted_object(crypto_error) {
+                metrics
+                    .malformed_encrypted_objects
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        DataError::InvalidCryptoConfig(_) => {
+            metrics
+                .encrypted_object_read_failures
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+}
+
+fn is_malformed_encrypted_object(err: &studiofs_data::crypto::CryptoError) -> bool {
+    matches!(
+        err,
+        studiofs_data::crypto::CryptoError::MalformedEnvelope(_)
+            | studiofs_data::crypto::CryptoError::UnsupportedVersion(_)
+            | studiofs_data::crypto::CryptoError::UnsupportedAlgorithm(_)
+            | studiofs_data::crypto::CryptoError::UnknownKeyId(_)
+            | studiofs_data::crypto::CryptoError::InvalidNonceLength { .. }
+            | studiofs_data::crypto::CryptoError::InvalidDataKeyLength(_)
+            | studiofs_data::crypto::CryptoError::FrameLayoutOverflow
+            | studiofs_data::crypto::CryptoError::ObjectLengthOverflow
+    )
 }
 
 fn jittered_delay(base: Duration, object_id: u64, attempt: u32) -> Duration {
@@ -1356,6 +1445,19 @@ mod tests {
         Arc<CachedStore>,
         DataStoreConfig,
     ) {
+        make_encrypted_fetch_scheduler_with_attempts(tmp, volume_suffix, 1)
+    }
+
+    fn make_encrypted_fetch_scheduler_with_attempts(
+        tmp: &TempDir,
+        volume_suffix: &str,
+        fetch_max_attempts: u32,
+    ) -> (
+        Arc<FetchScheduler>,
+        Operator,
+        Arc<CachedStore>,
+        DataStoreConfig,
+    ) {
         let volume_name = format!("fetch-encrypted-{volume_suffix}");
         let config = DataStoreConfig {
             endpoint: "memory://".into(),
@@ -1378,7 +1480,7 @@ mod tests {
             CachedStore::open(CachedStoreConfig::new(&cache_root), opened.backend)
                 .expect("open cached store");
         let fetch_config = VfsConfig {
-            fetch_max_attempts: 1,
+            fetch_max_attempts,
             prefetch_fetch_max_attempts: 1,
             fetch_request_timeout_secs: 5,
             fetch_retry_base_ms: 1,
@@ -1593,6 +1695,92 @@ mod tests {
             }
         ));
         assert!(cached_store.get(target_object_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn crypto_fetch_failures_are_observed_without_retrying() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (scheduler, raw, cached_store, config) =
+            make_encrypted_fetch_scheduler_with_attempts(&tmp, "crypto-non-retry", 3);
+        let object_id = 0x3540;
+        let key = fragment_key(&config, object_id, 0);
+        let mut corrupt_remote = put_encrypted_fragment(
+            &scheduler,
+            &raw,
+            &key,
+            Bytes::from_static(b"deterministic decrypt failure"),
+        )
+        .await
+        .to_vec();
+        corrupt_remote[4] = 99;
+        raw.write(&key, Bytes::from(corrupt_remote))
+            .await
+            .expect("replace remote with unsupported SFEC version");
+
+        let err = scheduler
+            .fetch_block(object_id, std::slice::from_ref(&key))
+            .await
+            .expect_err("unsupported SFEC version should fail deterministically");
+
+        assert!(matches!(
+            err,
+            FetchError::Exhausted {
+                attempts: 1,
+                source: DataError::Crypto(studiofs_data::crypto::CryptoError::UnsupportedVersion(
+                    99
+                )),
+            }
+        ));
+        assert_eq!(scheduler.metrics.s3_fetches.load(Ordering::Relaxed), 0);
+        assert_eq!(scheduler.metrics.s3_errors.load(Ordering::Relaxed), 1);
+        assert_eq!(scheduler.metrics.retries.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            scheduler
+                .metrics
+                .encrypted_object_read_failures
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            scheduler
+                .metrics
+                .malformed_encrypted_objects
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert!(cached_store.get(object_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn successful_fetch_records_encrypted_remote_read_counters() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (scheduler, raw, _cached_store, config) =
+            make_encrypted_fetch_scheduler(&tmp, "encrypted-counters");
+        let object_id = 0x3541;
+        let key = fragment_key(&config, object_id, 0);
+        let expected = Bytes::from_static(b"read counter plaintext");
+        let remote = put_encrypted_fragment(&scheduler, &raw, &key, expected.clone()).await;
+
+        let fetched = scheduler
+            .fetch_block(object_id, std::slice::from_ref(&key))
+            .await
+            .expect("fetch should decrypt");
+
+        assert_eq!(fetched, expected);
+        assert_eq!(
+            scheduler
+                .metrics
+                .encrypted_objects_read
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            scheduler
+                .metrics
+                .encrypted_bytes_read
+                .load(Ordering::Relaxed),
+            remote.len() as u64
+        );
     }
 
     #[test]

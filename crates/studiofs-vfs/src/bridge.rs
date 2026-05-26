@@ -1,5 +1,6 @@
 use std::io::ErrorKind;
 
+use studiofs_data::store::DataError;
 use studiofs_meta::{InodeAttr, MetaError};
 
 use crate::{VfsError, fetch::FetchError};
@@ -96,7 +97,12 @@ fn classify_meta_error(error: &MetaError) -> BridgeVfsErrorKind {
 fn classify_fetch_error(error: &FetchError) -> BridgeVfsErrorKind {
     match error {
         FetchError::NotFound { .. } => BridgeVfsErrorKind::NotFound,
-        FetchError::Exhausted { .. } => BridgeVfsErrorKind::TimedOut,
+        FetchError::Exhausted { source, .. } => match source {
+            DataError::Crypto(_) | DataError::InvalidCryptoConfig(_) => {
+                BridgeVfsErrorKind::DataCorruption
+            }
+            _ => BridgeVfsErrorKind::TimedOut,
+        },
         FetchError::PrefetchSkipped => BridgeVfsErrorKind::Retryable,
         FetchError::CorruptFragment { .. } | FetchError::Decode(_) | FetchError::CacheAccess(_) => {
             BridgeVfsErrorKind::DataCorruption
@@ -129,9 +135,8 @@ mod tests {
     };
 
     use super::{BridgeAttrTimes, BridgeVfsErrorKind, classify_vfs_error, normalize_attr_times};
-    use studiofs_data::object::ObjectError;
-    use studiofs_data::store::DataError;
-    use studiofs_meta::{AccessLevel, InodeAttr, MetaError};
+    use studiofs_data::{crypto::CryptoError, object::ObjectError, store::DataError};
+    use studiofs_meta::{AccessLevel, EncryptionContractError, InodeAttr, MetaError};
 
     fn panic_hook_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -203,6 +208,24 @@ mod tests {
             source: DataError::Storage("timeout".into()),
         });
         assert_eq!(classify_vfs_error(&exhausted), BridgeVfsErrorKind::TimedOut);
+
+        let crypto_exhausted = crate::VfsError::Fetch(crate::fetch::FetchError::Exhausted {
+            attempts: 1,
+            source: DataError::Crypto(CryptoError::AuthenticationFailed),
+        });
+        assert_eq!(
+            classify_vfs_error(&crypto_exhausted),
+            BridgeVfsErrorKind::DataCorruption
+        );
+
+        let config_exhausted = crate::VfsError::Fetch(crate::fetch::FetchError::Exhausted {
+            attempts: 1,
+            source: DataError::InvalidCryptoConfig(EncryptionContractError::Disabled),
+        });
+        assert_eq!(
+            classify_vfs_error(&config_exhausted),
+            BridgeVfsErrorKind::DataCorruption
+        );
 
         let skipped = crate::VfsError::Fetch(crate::fetch::FetchError::PrefetchSkipped);
         assert_eq!(classify_vfs_error(&skipped), BridgeVfsErrorKind::Retryable);

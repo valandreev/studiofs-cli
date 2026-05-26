@@ -490,6 +490,7 @@ pub struct VfsWritePathTuningStats {
 
 /// Fetch metrics for read path operations.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct VfsFetchStats {
     /// Cache hits in fetch flow.
     pub cache_hits: u64,
@@ -503,6 +504,14 @@ pub struct VfsFetchStats {
     pub retries: u64,
     /// Total bytes downloaded.
     pub bytes_downloaded: u64,
+    /// Number of encrypted remote objects successfully read and decrypted.
+    pub encrypted_objects_read: u64,
+    /// Number of encrypted remote bytes successfully read and decrypted.
+    pub encrypted_bytes_read: u64,
+    /// Number of deterministic encrypted object read failures.
+    pub encrypted_object_read_failures: u64,
+    /// Number of malformed or unsupported encrypted objects.
+    pub malformed_encrypted_objects: u64,
     /// Prefetch skips count.
     pub prefetch_skips: u64,
     /// Local cache I/O calls count.
@@ -721,6 +730,12 @@ pub struct VfsUploadStats {
     pub completed_uploads_per_sec: f64,
     /// Completed upload throughput in bytes per second.
     pub completed_upload_bytes_per_sec: f64,
+    /// Number of encrypted remote objects successfully written.
+    pub encrypted_objects_written: u64,
+    /// Number of encrypted remote bytes written.
+    pub encrypted_bytes_written: u64,
+    /// Number of encryption/config failures before remote write.
+    pub encrypted_object_write_failures: u64,
     /// Number of upload requeue operations.
     pub upload_requeues: u64,
     /// Uploads canceled because underlying file was deleted.
@@ -1112,5 +1127,21 @@ mod tests {
 
         assert!(serialized["dirty_slice_count"].is_number());
         assert!(serialized["frozen_slice_count"].is_number());
+    }
+
+    #[test]
+    fn fetch_stats_deserializes_missing_future_fields_as_defaults() {
+        let stats: VfsFetchStats = serde_json::from_value(serde_json::json!({
+            "cache_hits": 7,
+            "s3_fetches": 3
+        }))
+        .expect("deserialize fetch stats with omitted fields");
+
+        assert_eq!(stats.cache_hits, 7);
+        assert_eq!(stats.s3_fetches, 3);
+        assert_eq!(stats.encrypted_objects_read, 0);
+        assert_eq!(stats.encrypted_bytes_read, 0);
+        assert_eq!(stats.encrypted_object_read_failures, 0);
+        assert_eq!(stats.malformed_encrypted_objects, 0);
     }
 }

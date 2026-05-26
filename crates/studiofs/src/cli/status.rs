@@ -720,6 +720,19 @@ pub fn run(
                 snapshot.fetch.prefetch_skips
             );
             println!(
+                "  crypto read objects/bytes/failures/malformed: {}/{}/{}/{}",
+                snapshot.fetch.encrypted_objects_read,
+                format_bytes(snapshot.fetch.encrypted_bytes_read),
+                snapshot.fetch.encrypted_object_read_failures,
+                snapshot.fetch.malformed_encrypted_objects
+            );
+            println!(
+                "  crypto write objects/bytes/failures: {}/{}/{}",
+                snapshot.upload.encrypted_objects_written,
+                format_bytes(snapshot.upload.encrypted_bytes_written),
+                snapshot.upload.encrypted_object_write_failures
+            );
+            println!(
                 "  fetch stages avg/max ms s3_get {}/{} decode {}/{} assemble_copy {}/{} cache_put {}/{} total {}/{}",
                 format_ms(snapshot.fetch.s3_get_avg_ms),
                 format_ms(snapshot.fetch.s3_get_max_ms),

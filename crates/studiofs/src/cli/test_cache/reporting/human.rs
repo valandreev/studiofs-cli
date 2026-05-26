@@ -125,6 +125,13 @@ fn render_mounted_observability(out: &mut String, observability: &MountedObserva
                 format_bytes(upload.raw.canceled_stale_after_put_bytes),
             );
         }
+        let _ = writeln!(
+            out,
+            "Upload crypto: encrypted objects {}, encrypted bytes {}, failures {}",
+            upload.raw.encrypted_objects_written,
+            format_bytes(upload.raw.encrypted_bytes_written),
+            upload.raw.encrypted_object_write_failures,
+        );
     }
     if let Some(fetch) = &observability.fetch {
         let _ = writeln!(
@@ -135,6 +142,14 @@ fn render_mounted_observability(out: &mut String, observability: &MountedObserva
             format_bytes(fetch.bytes_downloaded),
             fetch.singleflight_joins,
             fetch.prefetch_skips,
+        );
+        let _ = writeln!(
+            out,
+            "Fetch crypto: encrypted objects {}, encrypted bytes {}, failures {}, malformed {}",
+            fetch.raw.encrypted_objects_read,
+            format_bytes(fetch.raw.encrypted_bytes_read),
+            fetch.raw.encrypted_object_read_failures,
+            fetch.raw.malformed_encrypted_objects,
         );
         let _ = writeln!(
             out,
