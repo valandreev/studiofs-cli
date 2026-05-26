@@ -64,7 +64,7 @@ pub struct DataStoreCryptoConfig {
 }
 
 impl DataStoreCryptoConfig {
-    fn into_runtime(&self) -> DataResult<DataStoreCryptoRuntime> {
+    fn to_runtime(&self) -> DataResult<DataStoreCryptoRuntime> {
         DataStoreCryptoRuntime::try_from(self)
     }
 }
@@ -217,7 +217,7 @@ impl DataStore {
 
     /// Create a DataStore with a specific I/O profile.
     pub fn with_profile(config: &DataStoreConfig, profile: IoProfile) -> DataResult<Self> {
-        Self::with_profile_and_crypto(config, profile, config.crypto.into_runtime()?)
+        Self::with_profile_and_crypto(config, profile, config.crypto.to_runtime()?)
     }
 
     fn with_profile_and_crypto(
@@ -356,7 +356,7 @@ impl DataStore {
             op,
             volume_name: config.volume_name.clone(),
             volume_uuid: config.volume_uuid.clone(),
-            crypto: config.crypto.into_runtime()?,
+            crypto: config.crypto.to_runtime()?,
             config: config.clone(),
             profile: IoProfile::Default,
         })
