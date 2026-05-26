@@ -64,29 +64,41 @@ pub struct DataStoreCryptoConfig {
 }
 
 impl DataStoreCryptoConfig {
-    /// Build datastore crypto settings from persisted volume metadata.
-    pub fn from_encryption(encryption: &EncryptionConfig) -> Self {
-        Self {
-            encryption: encryption.clone(),
-        }
+    fn into_runtime(&self) -> DataResult<DataStoreCryptoRuntime> {
+        DataStoreCryptoRuntime::try_from(self)
+    }
+}
+
+impl From<EncryptionConfig> for DataStoreCryptoConfig {
+    fn from(encryption: EncryptionConfig) -> Self {
+        Self { encryption }
+    }
+}
+
+impl From<&EncryptionConfig> for DataStoreCryptoConfig {
+    fn from(encryption: &EncryptionConfig) -> Self {
+        encryption.clone().into()
     }
 }
 
 impl fmt::Debug for DataStoreCryptoConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DataStoreCryptoConfig")
-            .field("encryption", &self.encryption)
+            .field("encryption", &"<redacted>")
             .finish()
     }
 }
 
+#[derive(Clone)]
 struct DataStoreCryptoRuntime {
     master_key: VolumeMasterKey,
     key_id: u32,
 }
 
-impl DataStoreCryptoRuntime {
-    fn from_config(config: &DataStoreCryptoConfig) -> DataResult<Self> {
+impl TryFrom<&DataStoreCryptoConfig> for DataStoreCryptoRuntime {
+    type Error = DataError;
+
+    fn try_from(config: &DataStoreCryptoConfig) -> Result<Self, Self::Error> {
         config.encryption.validate()?;
         Ok(Self {
             master_key: VolumeMasterKey::from_bytes(config.encryption.volume_master_key),
@@ -136,7 +148,7 @@ impl From<&FormatInfo> for DataStoreConfig {
             region: info.region.clone(),
             volume_name: info.name.clone(),
             volume_uuid: info.uuid.clone(),
-            crypto: DataStoreCryptoConfig::from_encryption(&info.encryption),
+            crypto: DataStoreCryptoConfig::from(&info.encryption),
         }
     }
 }
@@ -205,7 +217,14 @@ impl DataStore {
 
     /// Create a DataStore with a specific I/O profile.
     pub fn with_profile(config: &DataStoreConfig, profile: IoProfile) -> DataResult<Self> {
-        let crypto = DataStoreCryptoRuntime::from_config(&config.crypto)?;
+        Self::with_profile_and_crypto(config, profile, config.crypto.into_runtime()?)
+    }
+
+    fn with_profile_and_crypto(
+        config: &DataStoreConfig,
+        profile: IoProfile,
+        crypto: DataStoreCryptoRuntime,
+    ) -> DataResult<Self> {
         let mut builder = S3::default()
             .endpoint(&config.endpoint)
             .bucket(&config.bucket)
@@ -337,7 +356,7 @@ impl DataStore {
             op,
             volume_name: config.volume_name.clone(),
             volume_uuid: config.volume_uuid.clone(),
-            crypto: DataStoreCryptoRuntime::from_config(&config.crypto)?,
+            crypto: config.crypto.into_runtime()?,
             config: config.clone(),
             profile: IoProfile::Default,
         })
@@ -349,12 +368,12 @@ impl DataStore {
     /// timeouts and a dedicated concurrency limit so that background uploads
     /// can never starve read requests.
     pub fn clone_for_reads(&self) -> DataResult<Self> {
-        Self::with_profile(&self.config, IoProfile::Read)
+        Self::with_profile_and_crypto(&self.config, IoProfile::Read, self.crypto.clone())
     }
 
     /// Create a write-optimised clone with its own connection pool.
     pub fn clone_for_writes(&self) -> DataResult<Self> {
-        Self::with_profile(&self.config, IoProfile::Write)
+        Self::with_profile_and_crypto(&self.config, IoProfile::Write, self.crypto.clone())
     }
 
     /// The I/O profile this store was created with.
@@ -509,7 +528,7 @@ mod tests {
             region: "us-east-1".into(),
             volume_name: "unit-volume".into(),
             volume_uuid: "1a4c0fe2-8550-4892-952c-5ec26c0e0d8d".into(),
-            crypto: DataStoreCryptoConfig::from_encryption(&EncryptionConfig::new([0x42; 32])),
+            crypto: DataStoreCryptoConfig::from(EncryptionConfig::new([0x42; 32])),
         }
     }
 
@@ -549,6 +568,16 @@ mod tests {
             &mut seen,
             "http://192.168.1.51:9000"
         ));
+    }
+
+    #[test]
+    fn datastore_config_debug_redacts_crypto_key_material() {
+        let rendered = format!("{:?}", encrypted_test_config());
+
+        assert!(rendered.contains("crypto"));
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains("volume_master_key"));
+        assert!(!rendered.contains("42"));
     }
 
     #[test]

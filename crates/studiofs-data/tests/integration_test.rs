@@ -61,7 +61,7 @@ fn test_config() -> DataStoreConfig {
         region: "us-east-1".into(),
         volume_name: "integration-test".into(),
         volume_uuid: "d34f3c2a-c3a4-4b01-b626-fb46de61118a".into(),
-        crypto: DataStoreCryptoConfig::from_encryption(&studiofs_meta::EncryptionConfig::new(
+        crypto: DataStoreCryptoConfig::from(studiofs_meta::EncryptionConfig::new(
             [0x42; studiofs_meta::ENCRYPTION_KEY_LENGTH],
         )),
     }

@@ -220,9 +220,7 @@ fn make_datastore(env: &TestEnv, name: &str) -> DataStore {
         region: env.s3_region.clone(),
         volume_name: name.to_string(),
         volume_uuid: Uuid::new_v4().to_string(),
-        crypto: DataStoreCryptoConfig::from_encryption(&EncryptionConfig::new(
-            [0xA5; ENCRYPTION_KEY_LENGTH],
-        )),
+        crypto: DataStoreCryptoConfig::from(EncryptionConfig::new([0xA5; ENCRYPTION_KEY_LENGTH])),
     };
     DataStore::new(&cfg).expect("create datastore")
 }
