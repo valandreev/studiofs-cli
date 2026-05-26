@@ -197,11 +197,13 @@ where
     ) -> Result<(), UploadError> {
         let mut last_err: Option<DataError> = None;
         let overall_start = Instant::now();
+        let mut attempts_made = 0;
 
         for attempt in 0..self.max_attempts {
             if cancel_token.is_cancelled() {
                 return Err(UploadError::Cancelled);
             }
+            attempts_made = attempt + 1;
             self.metrics.attempts.fetch_add(1, Ordering::Relaxed);
             let permit = self.aimd.acquire().await;
             let req_start = Instant::now();
@@ -338,7 +340,7 @@ where
             DataError::Storage("upload exhausted without any captured error".to_string())
         });
         Err(UploadError::Exhausted {
-            attempts: self.max_attempts,
+            attempts: attempts_made,
             source,
         })
     }
@@ -419,7 +421,7 @@ fn classify_data_error(metrics: &UploadMetrics, err: &DataError) {
 
 #[cfg(test)]
 mod tests {
-    use super::{UploadObjectStore, UploadScheduler, upload_log_is_idle};
+    use super::{UploadError, UploadObjectStore, UploadScheduler, upload_log_is_idle};
     use crate::AimdConfig;
     use crate::vfs::VfsConfig;
     use bytes::Bytes;
@@ -551,6 +553,57 @@ mod tests {
                 encrypted_bytes: plaintext_bytes + 16,
             })
         }
+    }
+
+    struct NonRetryableUploadStore {
+        attempts: AtomicU64,
+    }
+
+    impl UploadObjectStore for NonRetryableUploadStore {
+        async fn put_by_key(
+            &self,
+            _key: &str,
+            _data: Buffer,
+        ) -> Result<RemoteObjectWriteStats, DataError> {
+            self.attempts.fetch_add(1, Ordering::Relaxed);
+            Err(DataError::Crypto(CryptoError::AuthenticationFailed))
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduler_reports_actual_attempts_for_non_retryable_upload_failure() {
+        let store = Arc::new(NonRetryableUploadStore {
+            attempts: AtomicU64::new(0),
+        });
+        let scheduler = UploadScheduler::new(
+            store.clone(),
+            AimdConfig::upload_default(),
+            &upload_test_config(),
+        );
+        let plaintext_object =
+            create_object_buffer(Bytes::from_static(b"non retryable plaintext")).unwrap();
+
+        let err = scheduler
+            .put(
+                "unit-volume/objects/aa/bb/non-retryable-upload",
+                plaintext_object,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("non-retryable upload failure should be reported");
+
+        match err {
+            UploadError::Exhausted { attempts, source } => {
+                assert_eq!(attempts, 1);
+                assert!(matches!(
+                    source,
+                    DataError::Crypto(CryptoError::AuthenticationFailed)
+                ));
+            }
+            other => panic!("expected exhausted upload error, got {other:?}"),
+        }
+        assert_eq!(store.attempts.load(Ordering::Relaxed), 1);
+        assert_eq!(scheduler.metrics.retries.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
