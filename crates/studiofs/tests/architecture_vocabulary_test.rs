@@ -758,14 +758,15 @@ fn docs_cover_sfs357_final_encryption_acceptance_gate() {
     let matrix = read_workspace_file("docs/local-first-validation-matrix.md");
     let tests = read_workspace_file("docs/tests.md");
     let combined = format!("{contract}\n{config}\n{matrix}\n{tests}");
-    let normalized_doc = normalize_doc_whitespace(&combined);
+    let combined_clean = combined.replace('`', "");
+    let normalized_doc = normalize_doc_whitespace(&combined_clean);
     let required_terms = [
         "SFS-357",
         "Final encrypted-at-rest acceptance gate",
         "encrypts remote payload objects before object-storage upload",
         "users do not configure encryption",
         "local cache remains plaintext intentionally for performance",
-        "object storage contains encrypted `SFEC` objects, not plaintext `STFS` objects",
+        "object storage contains encrypted SFEC objects, not plaintext STFS objects",
         "only XChaCha20-Poly1305 is supported",
         "no AES-256-GCM",
         "RSA",
@@ -789,7 +790,7 @@ fn docs_cover_sfs357_final_encryption_acceptance_gate() {
 
     let missing: Vec<_> = required_terms
         .into_iter()
-        .filter(|term| !contains_doc_term(&combined, &normalized_doc, term))
+        .filter(|term| !contains_doc_term(&combined_clean, &normalized_doc, term))
         .collect();
 
     assert!(
