@@ -1398,6 +1398,42 @@ fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
             .any(|window| window == needle)
 }
 
+struct RemoteVolumeCleanup {
+    config: DataStoreConfig,
+}
+
+impl RemoteVolumeCleanup {
+    fn new(config: &DataStoreConfig) -> Self {
+        Self {
+            config: config.clone(),
+        }
+    }
+}
+
+impl Drop for RemoteVolumeCleanup {
+    fn drop(&mut self) {
+        let config = self.config.clone();
+        if let Ok(handle) = thread::Builder::new()
+            .name("studiofs-test-remote-cleanup".to_string())
+            .spawn(move || {
+                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    return;
+                };
+                runtime.block_on(async move {
+                    if let Ok(store) = DataStore::new(&config) {
+                        let _ = store.delete_volume_data().await;
+                    }
+                });
+            })
+        {
+            let _ = handle.join();
+        }
+    }
+}
+
 async fn put_fragmented_object(
     ds: &DataStore,
     data_prefix: &str,
@@ -1656,7 +1692,9 @@ async fn encrypted_remote_object_storage_keeps_remote_ciphertext_and_local_plain
     let reader_cache_str = reader_cache.to_str().unwrap();
     let volume_suffix = format!("sfs355-encrypted-e2e-{}", Uuid::new_v4().simple());
     let format_info = make_format_info(&volume_suffix);
-    let data_store = DataStore::new(&DataStoreConfig::from(&format_info)).unwrap();
+    let data_config = DataStoreConfig::from(&format_info);
+    let data_store = DataStore::new(&data_config).unwrap();
+    let _remote_cleanup = RemoteVolumeCleanup::new(&data_config);
     let writer_meta = Arc::new(RedbMetaEngine::open(&writer_db).unwrap());
     writer_meta.init_root(0, 0).unwrap();
 
@@ -1834,7 +1872,6 @@ async fn encrypted_remote_object_storage_keeps_remote_ciphertext_and_local_plain
 
     reader_vfs.shutdown(Duration::from_secs(15)).await;
     writer_vfs.shutdown(Duration::from_secs(15)).await;
-    data_store.delete_volume_data().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
