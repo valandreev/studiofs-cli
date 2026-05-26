@@ -11,7 +11,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use studiofs_data::store::{DataError, DataStore};
+use studiofs_data::store::{DataError, DataStore, RemoteObjectWriteStats};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error};
 
@@ -37,6 +37,12 @@ pub struct UploadMetrics {
     pub network_err: AtomicU64,
     /// Total number of bytes successfully uploaded.
     pub bytes_uploaded: AtomicU64,
+    /// Number of encrypted remote objects successfully written.
+    pub encrypted_objects_written: AtomicU64,
+    /// Number of encrypted remote bytes successfully written.
+    pub encrypted_bytes_written: AtomicU64,
+    /// Number of encryption/config failures observed before remote write.
+    pub encrypted_object_write_failures: AtomicU64,
 }
 
 impl UploadMetrics {
@@ -52,6 +58,9 @@ impl UploadMetrics {
             status_5xx_err: AtomicU64::new(0),
             network_err: AtomicU64::new(0),
             bytes_uploaded: AtomicU64::new(0),
+            encrypted_objects_written: AtomicU64::new(0),
+            encrypted_bytes_written: AtomicU64::new(0),
+            encrypted_object_write_failures: AtomicU64::new(0),
         }
     }
 }
@@ -60,7 +69,7 @@ impl std::fmt::Display for UploadMetrics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "attempts={} ok={} err={} retries={} exhausted={} timeout={} temporary={} http_5xx={} network={} bytes={}",
+            "attempts={} ok={} err={} retries={} exhausted={} timeout={} temporary={} http_5xx={} network={} bytes={} encrypted_objects={} encrypted_bytes={} crypto_write_failures={}",
             self.attempts.load(Ordering::Relaxed),
             self.uploads_ok.load(Ordering::Relaxed),
             self.uploads_err.load(Ordering::Relaxed),
@@ -71,6 +80,9 @@ impl std::fmt::Display for UploadMetrics {
             self.status_5xx_err.load(Ordering::Relaxed),
             self.network_err.load(Ordering::Relaxed),
             self.bytes_uploaded.load(Ordering::Relaxed),
+            self.encrypted_objects_written.load(Ordering::Relaxed),
+            self.encrypted_bytes_written.load(Ordering::Relaxed),
+            self.encrypted_object_write_failures.load(Ordering::Relaxed),
         )
     }
 }
@@ -98,7 +110,7 @@ pub trait UploadObjectStore: Send + Sync + 'static {
         &'a self,
         key: &'a str,
         payload: Buffer,
-    ) -> impl Future<Output = Result<(), DataError>> + Send + 'a;
+    ) -> impl Future<Output = Result<RemoteObjectWriteStats, DataError>> + Send + 'a;
 }
 
 impl UploadObjectStore for DataStore {
@@ -106,8 +118,8 @@ impl UploadObjectStore for DataStore {
         &'a self,
         key: &'a str,
         payload: Buffer,
-    ) -> impl Future<Output = Result<(), DataError>> + Send + 'a {
-        DataStore::put_by_key(self, key, payload)
+    ) -> impl Future<Output = Result<RemoteObjectWriteStats, DataError>> + Send + 'a {
+        DataStore::put_by_key_with_stats(self, key, payload)
     }
 }
 
@@ -202,12 +214,18 @@ where
             let req_ms = req_start.elapsed().as_millis();
 
             match put_result {
-                TimeoutOrCancel::Completed(Ok(())) => {
+                TimeoutOrCancel::Completed(Ok(stats)) => {
                     permit.success();
                     self.metrics.uploads_ok.fetch_add(1, Ordering::Relaxed);
                     self.metrics
                         .bytes_uploaded
-                        .fetch_add(payload.len() as u64, Ordering::Relaxed);
+                        .fetch_add(stats.plaintext_bytes, Ordering::Relaxed);
+                    self.metrics
+                        .encrypted_objects_written
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.metrics
+                        .encrypted_bytes_written
+                        .fetch_add(stats.encrypted_bytes, Ordering::Relaxed);
                     debug!(
                         key,
                         bytes = payload.len(),
@@ -221,7 +239,7 @@ where
                 TimeoutOrCancel::Completed(Err(e)) => {
                     self.metrics.uploads_err.fetch_add(1, Ordering::Relaxed);
                     classify_data_error(&self.metrics, &e);
-                    let retryable = is_retryable(&e);
+                    let retryable = e.is_retryable();
 
                     if retryable {
                         permit.failure();
@@ -364,19 +382,15 @@ pub(crate) fn upload_log_is_idle(pending: usize, inflight: usize) -> bool {
     pending == 0 && inflight == 0
 }
 
-fn is_retryable(err: &DataError) -> bool {
-    match err {
-        DataError::OpenDal(oe) => {
-            oe.kind() == ErrorKind::RateLimited
-                || oe.kind() == ErrorKind::Unexpected
-                || oe.is_temporary()
-        }
-        DataError::Storage(_) => true,
-        DataError::InvalidCryptoConfig(_) | DataError::Crypto(_) => false,
-    }
-}
-
 fn classify_data_error(metrics: &UploadMetrics, err: &DataError) {
+    if matches!(
+        err,
+        DataError::InvalidCryptoConfig(_) | DataError::Crypto(_)
+    ) {
+        metrics
+            .encrypted_object_write_failures
+            .fetch_add(1, Ordering::Relaxed);
+    }
     if let DataError::OpenDal(oe) = err {
         if oe.is_temporary() {
             metrics.temporary_err.fetch_add(1, Ordering::Relaxed);
@@ -405,7 +419,7 @@ fn classify_data_error(metrics: &UploadMetrics, err: &DataError) {
 
 #[cfg(test)]
 mod tests {
-    use super::{UploadObjectStore, UploadScheduler, is_retryable, upload_log_is_idle};
+    use super::{UploadObjectStore, UploadScheduler, upload_log_is_idle};
     use crate::AimdConfig;
     use crate::vfs::VfsConfig;
     use bytes::Bytes;
@@ -417,7 +431,9 @@ mod tests {
     use studiofs_data::object::{MAGIC as STFS_MAGIC, create_object_buffer};
     use studiofs_data::{
         crypto::CryptoError,
-        store::{DataError, DataStore, DataStoreConfig, DataStoreCryptoConfig},
+        store::{
+            DataError, DataStore, DataStoreConfig, DataStoreCryptoConfig, RemoteObjectWriteStats,
+        },
     };
     use studiofs_meta::{EncryptionConfig, EncryptionContractError};
     use tokio_util::sync::CancellationToken;
@@ -454,12 +470,8 @@ mod tests {
 
     #[test]
     fn crypto_failures_are_not_upload_retryable() {
-        assert!(!is_retryable(&DataError::InvalidCryptoConfig(
-            EncryptionContractError::Disabled
-        )));
-        assert!(!is_retryable(&DataError::Crypto(
-            CryptoError::AuthenticationFailed
-        )));
+        assert!(!DataError::InvalidCryptoConfig(EncryptionContractError::Disabled).is_retryable());
+        assert!(!DataError::Crypto(CryptoError::AuthenticationFailed).is_retryable());
     }
 
     #[tokio::test]
@@ -491,6 +503,27 @@ mod tests {
             store.get_by_key(key).await.unwrap().to_bytes(),
             plaintext_object.to_bytes()
         );
+        assert_eq!(
+            scheduler
+                .metrics
+                .encrypted_objects_written
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            scheduler
+                .metrics
+                .encrypted_bytes_written
+                .load(Ordering::Relaxed),
+            remote_bytes.len() as u64
+        );
+        assert!(
+            scheduler
+                .metrics
+                .encrypted_bytes_written
+                .load(Ordering::Relaxed)
+                > scheduler.metrics.bytes_uploaded.load(Ordering::Relaxed)
+        );
     }
 
     #[derive(Default)]
@@ -500,7 +533,12 @@ mod tests {
     }
 
     impl UploadObjectStore for RetryOnceUploadStore {
-        async fn put_by_key(&self, key: &str, data: Buffer) -> Result<(), DataError> {
+        async fn put_by_key(
+            &self,
+            key: &str,
+            data: Buffer,
+        ) -> Result<RemoteObjectWriteStats, DataError> {
+            let plaintext_bytes = data.len() as u64;
             self.payloads
                 .lock()
                 .push((key.to_string(), data.to_bytes()));
@@ -508,7 +546,10 @@ mod tests {
             if attempt == 0 {
                 return Err(DataError::Storage("temporary encrypted put failure".into()));
             }
-            Ok(())
+            Ok(RemoteObjectWriteStats {
+                plaintext_bytes,
+                encrypted_bytes: plaintext_bytes + 16,
+            })
         }
     }
 

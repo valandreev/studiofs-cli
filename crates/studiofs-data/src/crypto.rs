@@ -52,9 +52,18 @@ pub struct ObjectEncryptionContext<'a> {
 /// Errors returned by object encryption/decryption.
 #[derive(Debug, Error)]
 pub enum CryptoError {
-    /// The SFEC envelope is malformed or unsupported.
-    #[error("invalid SFEC envelope: {0}")]
-    Envelope(#[from] SfecError),
+    /// The SFEC envelope is malformed.
+    #[error("malformed SFEC envelope: {0}")]
+    MalformedEnvelope(SfecError),
+    /// The SFEC envelope declares an unsupported format version.
+    #[error("unsupported SFEC version: {0}")]
+    UnsupportedVersion(u16),
+    /// The SFEC envelope declares an unsupported encryption algorithm.
+    #[error("unsupported SFEC algorithm: {0}")]
+    UnsupportedAlgorithm(u16),
+    /// The SFEC envelope references a key id this runtime cannot use.
+    #[error("unknown SFEC key id: {0}")]
+    UnknownKeyId(u32),
     /// The key derivation operation failed.
     #[error("key derivation failed")]
     KeyDerivation,
@@ -75,9 +84,33 @@ pub enum CryptoError {
     /// The frame layout cannot be represented safely.
     #[error("encrypted frame layout overflow")]
     FrameLayoutOverflow,
+    /// The declared encrypted object length cannot be represented safely.
+    #[error("encrypted object length overflow")]
+    ObjectLengthOverflow,
     /// The authenticated context cannot be encoded safely.
     #[error("authenticated context length overflow")]
     AadLengthOverflow,
+}
+
+impl From<SfecError> for CryptoError {
+    fn from(value: SfecError) -> Self {
+        match value {
+            SfecError::UnsupportedVersion(version) => Self::UnsupportedVersion(version),
+            SfecError::UnsupportedAlgorithm(algorithm) => Self::UnsupportedAlgorithm(algorithm),
+            SfecError::InvalidKeyId(key_id) => Self::UnknownKeyId(key_id),
+            SfecError::FrameCountOverflow | SfecError::ObjectLengthOverflow => {
+                Self::ObjectLengthOverflow
+            }
+            SfecError::InvalidMagic
+            | SfecError::InvalidHeaderLength(_)
+            | SfecError::UnsupportedFlags(_)
+            | SfecError::FieldTooLarge(_)
+            | SfecError::InvalidFrameSize(_)
+            | SfecError::TruncatedHeader
+            | SfecError::TruncatedCiphertext
+            | SfecError::TrailingMalformedData => Self::MalformedEnvelope(value),
+        }
+    }
 }
 
 /// Encrypt one complete STFS object into an SFEC envelope.
@@ -518,5 +551,59 @@ mod tests {
             decrypt_object(Bytes::from(truncated), &MASTER_KEY, ctx),
             Err(CryptoError::AuthenticationFailed)
         ));
+    }
+
+    #[test]
+    fn sfec_parse_failures_map_to_specific_safe_crypto_errors() {
+        assert!(matches!(
+            CryptoError::from(SfecError::UnsupportedVersion(99)),
+            CryptoError::UnsupportedVersion(99)
+        ));
+        assert!(matches!(
+            CryptoError::from(SfecError::UnsupportedAlgorithm(24)),
+            CryptoError::UnsupportedAlgorithm(24)
+        ));
+        assert!(matches!(
+            CryptoError::from(SfecError::InvalidKeyId(0)),
+            CryptoError::UnknownKeyId(0)
+        ));
+        assert!(matches!(
+            CryptoError::from(SfecError::ObjectLengthOverflow),
+            CryptoError::ObjectLengthOverflow
+        ));
+        assert!(matches!(
+            CryptoError::from(SfecError::TruncatedHeader),
+            CryptoError::MalformedEnvelope(SfecError::TruncatedHeader)
+        ));
+    }
+
+    #[test]
+    fn crypto_error_display_does_not_include_sensitive_material() {
+        let sensitive = [
+            "plaintext-secret",
+            "wrapped-dek-secret",
+            "4242424242424242",
+            "vol/objects/aa/bb/secret-object",
+        ];
+        let errors = [
+            CryptoError::AuthenticationFailed,
+            CryptoError::InvalidDataKeyLength(17),
+            CryptoError::InvalidNonceLength {
+                field: "wrap_nonce",
+                actual: 7,
+            },
+            CryptoError::UnsupportedAlgorithm(99),
+            CryptoError::UnknownKeyId(42),
+        ];
+
+        for err in errors {
+            let rendered = err.to_string();
+            for needle in sensitive {
+                assert!(
+                    !rendered.contains(needle),
+                    "{rendered:?} leaked sensitive marker {needle:?}"
+                );
+            }
+        }
     }
 }

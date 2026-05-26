@@ -222,6 +222,19 @@ pub(crate) fn render_write_path_summary(bytes: &[u8]) -> Result<String> {
         snapshot.fetch.prefetch_skips
     ));
     out.push_str(&format!(
+        "fetch_crypto: encrypted_objects={} encrypted_bytes={} crypto_failures={} malformed={}\n",
+        snapshot.fetch.encrypted_objects_read,
+        format_bytes(snapshot.fetch.encrypted_bytes_read),
+        snapshot.fetch.encrypted_object_read_failures,
+        snapshot.fetch.malformed_encrypted_objects
+    ));
+    out.push_str(&format!(
+        "upload_crypto: encrypted_objects={} encrypted_bytes={} crypto_failures={}\n",
+        snapshot.upload.encrypted_objects_written,
+        format_bytes(snapshot.upload.encrypted_bytes_written),
+        snapshot.upload.encrypted_object_write_failures
+    ));
+    out.push_str(&format!(
         "fetch_stages_ms: s3_get_avg={:.2} s3_get_max={:.2} decode_avg={:.2} decode_max={:.2} assemble_copy_avg={:.2} assemble_copy_max={:.2} local_cache_put_avg={:.2} local_cache_put_max={:.2} total_avg={:.2} total_max={:.2}\n",
         snapshot.fetch.s3_get_avg_ms,
         snapshot.fetch.s3_get_max_ms,
@@ -357,6 +370,9 @@ mod tests {
                 canceled_stale_before_put: 4,
                 canceled_stale_after_put: 3,
                 canceled_stale_after_put_bytes: 12 * 1024 * 1024,
+                encrypted_objects_written: 6,
+                encrypted_bytes_written: 1024,
+                encrypted_object_write_failures: 2,
                 ..Default::default()
             },
             fetch: VfsFetchStats {
@@ -367,6 +383,10 @@ mod tests {
                 retries: 1,
                 bytes_downloaded: 20 * 1024 * 1024,
                 prefetch_skips: 9,
+                encrypted_objects_read: 4,
+                encrypted_bytes_read: 1536,
+                encrypted_object_read_failures: 3,
+                malformed_encrypted_objects: 1,
                 ..Default::default()
             },
             ..Default::default()
@@ -381,6 +401,12 @@ mod tests {
         );
         assert!(summary.contains(
             "fetch: cache_hits=11 s3_fetches=5 s3_errors=1 singleflight=2 retries=1 bytes_downloaded=20.0MiB prefetch_skips=9"
+        ));
+        assert!(summary.contains(
+            "fetch_crypto: encrypted_objects=4 encrypted_bytes=1.5KiB crypto_failures=3 malformed=1"
+        ));
+        assert!(summary.contains(
+            "upload_crypto: encrypted_objects=6 encrypted_bytes=1.0KiB crypto_failures=2"
         ));
     }
 

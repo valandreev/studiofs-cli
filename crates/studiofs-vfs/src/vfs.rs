@@ -5277,6 +5277,7 @@ impl StudioVfs {
         let elapsed = self.write_path_started_at.elapsed();
         let completed_uploads_per_sec = Self::per_second(completed_uploads, elapsed);
         let completed_upload_bytes_per_sec = Self::per_second(completed_upload_bytes, elapsed);
+        let upload_metrics = &self.upload_scheduler.metrics;
 
         VfsUploadStats {
             pending_uploads: pending_uploads.len(),
@@ -5289,6 +5290,15 @@ impl StudioVfs {
             completed_upload_bytes,
             completed_uploads_per_sec,
             completed_upload_bytes_per_sec,
+            encrypted_objects_written: upload_metrics
+                .encrypted_objects_written
+                .load(Ordering::Relaxed),
+            encrypted_bytes_written: upload_metrics
+                .encrypted_bytes_written
+                .load(Ordering::Relaxed),
+            encrypted_object_write_failures: upload_metrics
+                .encrypted_object_write_failures
+                .load(Ordering::Relaxed),
             upload_requeues: self.state.upload.upload_requeues.load(Ordering::Relaxed),
             canceled_deleted: self
                 .state
@@ -6727,6 +6737,15 @@ impl StudioVfs {
         let fetch_singleflight_joins = fetch_metrics.singleflight_joins.load(Ordering::Relaxed);
         let fetch_retries = fetch_metrics.retries.load(Ordering::Relaxed);
         let fetch_bytes_downloaded = fetch_metrics.bytes_downloaded.load(Ordering::Relaxed);
+        let fetch_encrypted_objects_read =
+            fetch_metrics.encrypted_objects_read.load(Ordering::Relaxed);
+        let fetch_encrypted_bytes_read = fetch_metrics.encrypted_bytes_read.load(Ordering::Relaxed);
+        let fetch_encrypted_object_read_failures = fetch_metrics
+            .encrypted_object_read_failures
+            .load(Ordering::Relaxed);
+        let fetch_malformed_encrypted_objects = fetch_metrics
+            .malformed_encrypted_objects
+            .load(Ordering::Relaxed);
         let fetch_prefetch_skips = fetch_metrics.prefetch_skips.load(Ordering::Relaxed);
         let fetch_local_cache_io_calls = fetch_metrics.local_cache_io_calls.load(Ordering::Relaxed);
         let fetch_local_cache_handoff_total_ns = fetch_metrics
@@ -7186,6 +7205,10 @@ impl StudioVfs {
                 singleflight_joins: fetch_singleflight_joins,
                 retries: fetch_retries,
                 bytes_downloaded: fetch_bytes_downloaded,
+                encrypted_objects_read: fetch_encrypted_objects_read,
+                encrypted_bytes_read: fetch_encrypted_bytes_read,
+                encrypted_object_read_failures: fetch_encrypted_object_read_failures,
+                malformed_encrypted_objects: fetch_malformed_encrypted_objects,
                 prefetch_skips: fetch_prefetch_skips,
                 local_cache_io_calls: fetch_local_cache_io_calls,
                 local_cache_handoff_total_ms: fetch_local_cache_handoff_total_ns as f64

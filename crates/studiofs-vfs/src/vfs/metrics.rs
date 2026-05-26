@@ -503,6 +503,18 @@ pub struct VfsFetchStats {
     pub retries: u64,
     /// Total bytes downloaded.
     pub bytes_downloaded: u64,
+    /// Number of encrypted remote objects successfully read and decrypted.
+    #[serde(default)]
+    pub encrypted_objects_read: u64,
+    /// Number of encrypted remote bytes read.
+    #[serde(default)]
+    pub encrypted_bytes_read: u64,
+    /// Number of deterministic encrypted object read failures.
+    #[serde(default)]
+    pub encrypted_object_read_failures: u64,
+    /// Number of malformed or unsupported encrypted objects.
+    #[serde(default)]
+    pub malformed_encrypted_objects: u64,
     /// Prefetch skips count.
     pub prefetch_skips: u64,
     /// Local cache I/O calls count.
@@ -721,6 +733,12 @@ pub struct VfsUploadStats {
     pub completed_uploads_per_sec: f64,
     /// Completed upload throughput in bytes per second.
     pub completed_upload_bytes_per_sec: f64,
+    /// Number of encrypted remote objects successfully written.
+    pub encrypted_objects_written: u64,
+    /// Number of encrypted remote bytes written.
+    pub encrypted_bytes_written: u64,
+    /// Number of encryption/config failures before remote write.
+    pub encrypted_object_write_failures: u64,
     /// Number of upload requeue operations.
     pub upload_requeues: u64,
     /// Uploads canceled because underlying file was deleted.

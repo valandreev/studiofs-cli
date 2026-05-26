@@ -31,8 +31,41 @@ pub enum DataError {
     Crypto(#[from] crypto::CryptoError),
 }
 
+impl DataError {
+    /// Return whether this error may be resolved by retrying the same remote operation.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::OpenDal(oe) => {
+                oe.kind() == opendal::ErrorKind::RateLimited
+                    || oe.kind() == opendal::ErrorKind::Unexpected
+                    || oe.is_temporary()
+            }
+            Self::Storage(_) => true,
+            Self::InvalidCryptoConfig(_) | Self::Crypto(_) => false,
+        }
+    }
+}
+
 /// Result type for all datastore operations.
 pub type DataResult<T> = Result<T, DataError>;
+
+/// Byte accounting for an encrypted remote write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoteObjectWriteStats {
+    /// Plaintext STFS object bytes accepted at the DataStore boundary.
+    pub plaintext_bytes: u64,
+    /// Ciphertext SFEC bytes written to the remote object store.
+    pub encrypted_bytes: u64,
+}
+
+/// Byte accounting for an encrypted remote read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoteObjectReadStats {
+    /// Ciphertext SFEC bytes read from the remote object store.
+    pub encrypted_bytes: u64,
+    /// Plaintext STFS object bytes returned at the DataStore boundary.
+    pub plaintext_bytes: u64,
+}
 
 /// Configuration for the data store.
 #[derive(Clone)]
@@ -411,17 +444,30 @@ impl DataStore {
     /// Note: some service implementations may still materialize into contiguous
     /// buffers internally if vectored writes are unsupported.
     pub async fn put_by_key(&self, key: &str, data: impl Into<Buffer>) -> DataResult<()> {
+        self.put_by_key_with_stats(key, data).await.map(|_| ())
+    }
+
+    /// Upload bytes to an already-formatted storage key and return crypto-safe byte counters.
+    pub async fn put_by_key_with_stats(
+        &self,
+        key: &str,
+        data: impl Into<Buffer>,
+    ) -> DataResult<RemoteObjectWriteStats> {
         let data: Buffer = data.into();
         let plaintext_len = data.len();
         let encrypted = self.encrypt_payload(key, data)?;
+        let encrypted_len = encrypted.len();
         debug!(
             key,
             plaintext_bytes = plaintext_len,
-            remote_bytes = encrypted.len(),
+            remote_bytes = encrypted_len,
             "uploading encrypted object"
         );
         self.op.write(key, encrypted).await?;
-        Ok(())
+        Ok(RemoteObjectWriteStats {
+            plaintext_bytes: plaintext_len as u64,
+            encrypted_bytes: encrypted_len as u64,
+        })
     }
 
     /// Download a generic object from S3.
@@ -433,9 +479,26 @@ impl DataStore {
 
     /// Download bytes from an already-formatted storage key.
     pub async fn get_by_key(&self, key: &str) -> DataResult<Buffer> {
+        self.get_by_key_with_stats(key).await.map(|(data, _)| data)
+    }
+
+    /// Download bytes from an already-formatted storage key and return crypto-safe byte counters.
+    pub async fn get_by_key_with_stats(
+        &self,
+        key: &str,
+    ) -> DataResult<(Buffer, RemoteObjectReadStats)> {
         debug!("downloading by key: {key}");
         let data = self.op.read(key).await?;
-        self.decrypt_payload(key, data)
+        let encrypted_len = data.len();
+        let plaintext = self.decrypt_payload(key, data)?;
+        let plaintext_len = plaintext.len();
+        Ok((
+            plaintext,
+            RemoteObjectReadStats {
+                encrypted_bytes: encrypted_len as u64,
+                plaintext_bytes: plaintext_len as u64,
+            },
+        ))
     }
 
     /// Delete a generic object from S3.
