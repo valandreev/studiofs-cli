@@ -22,9 +22,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use studiofs_cache::runtime::LocalPayloadLayout;
 use studiofs_cache::{PersistentLocalPayloadBackend, open_local_payload_backend};
+use studiofs_data::envelope::SFEC_MAGIC;
 use studiofs_data::object::{
-    CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, create_object_buffer, format_object_fragment_key,
-    format_object_fragment_keys, format_object_key, read_object,
+    CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, MAGIC as STFS_MAGIC, create_object_buffer,
+    format_object_fragment_key, format_object_fragment_keys, format_object_key, read_object,
 };
 use studiofs_data::store::{DataStore, DataStoreConfig};
 use studiofs_meta::engine::{MetaFsOps, PendingCreateRecord, UndoLogKind};
@@ -1390,6 +1391,49 @@ async fn wait_until_object_absent(
     }
 }
 
+fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+}
+
+struct RemoteVolumeCleanup {
+    config: DataStoreConfig,
+}
+
+impl RemoteVolumeCleanup {
+    fn new(config: &DataStoreConfig) -> Self {
+        Self {
+            config: config.clone(),
+        }
+    }
+}
+
+impl Drop for RemoteVolumeCleanup {
+    fn drop(&mut self) {
+        let config = self.config.clone();
+        if let Ok(handle) = thread::Builder::new()
+            .name("studiofs-test-remote-cleanup".to_string())
+            .spawn(move || {
+                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    return;
+                };
+                runtime.block_on(async move {
+                    if let Ok(store) = DataStore::new(&config) {
+                        let _ = store.delete_volume_data().await;
+                    }
+                });
+            })
+        {
+            let _ = handle.join();
+        }
+    }
+}
+
 async fn put_fragmented_object(
     ds: &DataStore,
     data_prefix: &str,
@@ -1563,15 +1607,35 @@ fn wait_until_n_payload_slices(
 ) -> Option<Vec<(u32, PayloadRef)>> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Ok(blocks) = vfs.meta().lookup_payload_slices(ino)
-            && blocks.len() >= expected
-        {
-            return Some(blocks);
+        if let Ok(blocks) = vfs.meta().lookup_payload_slices(ino) {
+            if blocks.len() >= expected {
+                return Some(blocks);
+            }
         }
         if Instant::now() >= deadline {
             return None;
         }
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+async fn wait_until_n_payload_slices_async(
+    vfs: &Arc<StudioVfs>,
+    ino: u64,
+    expected: usize,
+    timeout: Duration,
+) -> Option<Vec<(u32, PayloadRef)>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(blocks) = vfs.meta().lookup_payload_slices(ino) {
+            if blocks.len() >= expected {
+                return Some(blocks);
+            }
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -1606,6 +1670,208 @@ async fn test_create_write_read_file() {
     // Verify file size via getattr
     let attr = vfs.getattr(ino).unwrap();
     assert_eq!(attr.size, payload.len() as u64);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
+async fn encrypted_remote_object_storage_keeps_remote_ciphertext_and_local_plaintext_cache() {
+    if !ensure_bucket_ready().await {
+        eprintln!(
+            "skip encrypted_remote_object_storage_keeps_remote_ciphertext_and_local_plaintext_cache: live S3 test bucket is unavailable"
+        );
+        return;
+    }
+
+    let writer_tmp = tempfile::tempdir().unwrap();
+    let writer_db = writer_tmp.path().join("writer.redb");
+    let writer_cache = writer_tmp.path().join("writer-cache");
+    let writer_cache_str = writer_cache.to_str().unwrap();
+    let reader_tmp = tempfile::tempdir().unwrap();
+    let reader_db = reader_tmp.path().join("reader.redb");
+    let reader_cache = reader_tmp.path().join("reader-cache");
+    let reader_cache_str = reader_cache.to_str().unwrap();
+    let volume_suffix = format!("sfs355-encrypted-e2e-{}", Uuid::new_v4().simple());
+    let format_info = make_format_info(&volume_suffix);
+    let data_config = DataStoreConfig::from(&format_info);
+    let data_store = DataStore::new(&data_config).unwrap();
+    let _remote_cleanup = RemoteVolumeCleanup::new(&data_config);
+    let writer_meta = Arc::new(RedbMetaEngine::open(&writer_db).unwrap());
+    writer_meta.init_root(0, 0).unwrap();
+
+    let payload: &[u8] = b"SFS-355 local plaintext marker should never appear in remote ciphertext";
+    let swapped_payload: &[u8] = b"SFS-355 second object used for storage-key AAD mismatch";
+
+    let writer_vfs = make_vfs_with_meta(writer_meta.clone(), &format_info, writer_cache_str);
+    let attr = writer_vfs
+        .create(1, b"encrypted-e2e.txt", 0, 0, 0o644)
+        .unwrap();
+    writer_vfs.write(attr.ino, 0, payload).await.unwrap();
+    writer_vfs.flush(attr.ino).await.unwrap();
+
+    let blocks =
+        wait_until_n_payload_slices_async(&writer_vfs, attr.ino, 1, online_publish_timeout())
+            .await
+            .expect("encrypted E2E write should materialize a payload slice");
+    let object_id = blocks[0].1.object_id;
+    let remote_key = format_object_fragment_key(&format_info.data_prefix, object_id, 0);
+
+    assert!(
+        wait_until_object_exists(
+            &data_store,
+            &format_info.data_prefix,
+            object_id,
+            online_publish_timeout(),
+        )
+        .await,
+        "encrypted E2E write should upload remote object {object_id}"
+    );
+    assert!(
+        wait_until(online_publish_timeout(), || {
+            let attr = writer_vfs.meta().get_attr(attr.ino).unwrap();
+            attr.upload_state == UploadState::Ready
+                && attr.committed_content_epoch == attr.content_epoch
+                && attr.committed_size == attr.size
+        })
+        .await,
+        "encrypted E2E write should publish before remote inspection"
+    );
+
+    let remote_ciphertext = data_store
+        .operator()
+        .read(&remote_key)
+        .await
+        .unwrap()
+        .to_bytes();
+    assert!(remote_ciphertext.starts_with(SFEC_MAGIC));
+    assert!(!remote_ciphertext.starts_with(STFS_MAGIC));
+    assert!(
+        !bytes_contain(remote_ciphertext.as_ref(), payload),
+        "remote encrypted object must not contain obvious plaintext payload"
+    );
+
+    let local_plaintext = writer_vfs
+        .local_payload_backend()
+        .get(object_id)
+        .expect("writer local payload cache should retain plaintext bytes");
+    assert_eq!(local_plaintext.as_ref(), payload);
+
+    writer_vfs.local_payload_backend().remove(object_id);
+    assert!(
+        !writer_vfs.local_payload_backend().contains(object_id),
+        "test setup should clear local plaintext cache before remote fetch"
+    );
+    let refetched = writer_vfs
+        .read(attr.ino, 0, payload.len() as u32)
+        .await
+        .unwrap();
+    assert_eq!(refetched.as_ref(), payload);
+    assert_eq!(
+        writer_vfs
+            .local_payload_backend()
+            .get(object_id)
+            .expect("remote fetch should repopulate plaintext local cache")
+            .as_ref(),
+        payload
+    );
+
+    let mut tampered = remote_ciphertext.to_vec();
+    let last = tampered
+        .last_mut()
+        .expect("SFEC ciphertext should not be empty");
+    *last ^= 0x01;
+    data_store
+        .operator()
+        .write(&remote_key, Bytes::from(tampered))
+        .await
+        .unwrap();
+    writer_vfs.local_payload_backend().remove(object_id);
+    assert!(
+        writer_vfs
+            .read(attr.ino, 0, payload.len() as u32)
+            .await
+            .is_err(),
+        "tampered encrypted remote bytes must not read as valid plaintext"
+    );
+
+    data_store
+        .operator()
+        .write(&remote_key, remote_ciphertext.clone())
+        .await
+        .unwrap();
+    writer_vfs.local_payload_backend().remove(object_id);
+    assert_eq!(
+        writer_vfs
+            .read(attr.ino, 0, payload.len() as u32)
+            .await
+            .unwrap()
+            .as_ref(),
+        payload
+    );
+
+    let swap_attr = writer_vfs
+        .create(1, b"encrypted-e2e-swap-source.txt", 0, 0, 0o644)
+        .unwrap();
+    writer_vfs
+        .write(swap_attr.ino, 0, swapped_payload)
+        .await
+        .unwrap();
+    writer_vfs.flush(swap_attr.ino).await.unwrap();
+    let swap_blocks =
+        wait_until_n_payload_slices_async(&writer_vfs, swap_attr.ino, 1, online_publish_timeout())
+            .await
+            .expect("swap source should materialize a payload slice");
+    let swap_object_id = swap_blocks[0].1.object_id;
+    let swap_key = format_object_fragment_key(&format_info.data_prefix, swap_object_id, 0);
+    assert!(
+        wait_until_object_exists(
+            &data_store,
+            &format_info.data_prefix,
+            swap_object_id,
+            online_publish_timeout(),
+        )
+        .await,
+        "swap source should upload remote object {swap_object_id}"
+    );
+    let swapped_ciphertext = data_store
+        .operator()
+        .read(&swap_key)
+        .await
+        .unwrap()
+        .to_bytes();
+    data_store
+        .operator()
+        .write(&remote_key, swapped_ciphertext)
+        .await
+        .unwrap();
+    writer_vfs.local_payload_backend().remove(object_id);
+    assert!(
+        writer_vfs
+            .read(attr.ino, 0, payload.len() as u32)
+            .await
+            .is_err(),
+        "ciphertext copied to the wrong object key must fail storage-key AAD validation"
+    );
+
+    data_store
+        .operator()
+        .write(&remote_key, remote_ciphertext)
+        .await
+        .unwrap();
+    writer_vfs.local_payload_backend().remove(object_id);
+
+    let reader_meta = Arc::new(RedbMetaEngine::open(&reader_db).unwrap());
+    reader_meta.init_root(0, 0).unwrap();
+    import_remote_snapshot(writer_meta.as_ref(), reader_meta.as_ref(), &format_info);
+    let reader_vfs = make_vfs_with_meta(reader_meta, &format_info, reader_cache_str);
+    let reader_attr = reader_vfs.lookup(1, b"encrypted-e2e.txt").unwrap();
+    let reader_bytes = reader_vfs
+        .read(reader_attr.ino, 0, payload.len() as u32)
+        .await
+        .unwrap();
+    assert_eq!(reader_bytes.as_ref(), payload);
+
+    reader_vfs.shutdown(Duration::from_secs(15)).await;
+    writer_vfs.shutdown(Duration::from_secs(15)).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
