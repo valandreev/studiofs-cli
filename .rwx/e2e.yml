@@ -180,3 +180,85 @@ tasks:
       artifacts:
         - key: e2e-run
           path: target/e2e-runs
+
+  - key: e2e-full
+    use: [linux-e2e-packages, e2e-preflight, build-studiofs]
+    docker: true
+    run: |
+      set -euo pipefail
+
+      case "${RWX_RUN_ID:-}" in
+        ""|*[!A-Za-z0-9_-]*)
+          echo "e2e full failed: RWX_RUN_ID must use only ASCII letters, digits, underscores, or hyphens"
+          exit 2
+          ;;
+      esac
+
+      RUN_ID="rwx-full-${RWX_RUN_ID}"
+      RUN_ROOT="target/e2e-runs"
+      ARTIFACT_DIR="${RUN_ROOT}/${RUN_ID}"
+
+      echo "Starting StudioFS full real E2E run"
+      echo "scenario_selector=1-23"
+      echo "run_id=${RUN_ID}"
+      echo "artifact_path=${ARTIFACT_DIR}"
+
+      set +e
+      cargo run -p studiofs-e2e -- run \
+        --scenario 1-23 \
+        --studiofs-bin target/debug/studiofs \
+        --root "${RUN_ROOT}" \
+        --run-id "${RUN_ID}" \
+        --platform linux-fuse \
+        --infra compose \
+        --retain always
+      STATUS=$?
+      set -e
+
+      python3 - "${ARTIFACT_DIR}" "${STATUS}" <<'PY'
+      import json
+      import pathlib
+      import sys
+
+      artifact_dir = pathlib.Path(sys.argv[1])
+      status = int(sys.argv[2])
+      report_path = artifact_dir / "report.json"
+
+      print(f"artifact_path={artifact_dir}")
+      if not report_path.exists():
+          print(f"report_missing={report_path}")
+          sys.exit(status)
+
+      report = json.loads(report_path.read_text(encoding="utf-8"))
+      print(f"run_id={report.get('run_id')}")
+      print(f"status={report.get('status')}")
+      print(f"report={report_path}")
+
+      for scenario in report.get("scenarios", []):
+          name = scenario.get("name")
+          scenario_status = scenario.get("status")
+          print(f"scenario={name} status={scenario_status}")
+          error = scenario.get("error")
+          if error:
+              print(f"failed_invariant={error}")
+          for artifact in scenario.get("artifacts", []):
+              print(f"scenario_artifact={artifact}")
+
+      preflight = report.get("preflight", {})
+      if preflight.get("status") != "passed":
+          for check in preflight.get("checks", []):
+              if check.get("status") != "passed":
+                  print(
+                      "preflight_failed="
+                      f"{check.get('name')}: {check.get('detail')}"
+                  )
+
+      sys.exit(status)
+      PY
+    env:
+      RUSTFLAGS: "-Dwarnings"
+      RUST_BACKTRACE: "1"
+    outputs:
+      artifacts:
+        - key: e2e-full-run
+          path: target/e2e-runs

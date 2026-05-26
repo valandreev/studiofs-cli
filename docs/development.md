@@ -100,7 +100,7 @@ RWX workflow definitions live in `.rwx/`:
 
 - `.rwx/ci.yml` — Ubuntu quality gates and Ubuntu Linux tests.
 - `.rwx/rocky.yml` — Rocky Linux tests.
-- `.rwx/e2e.yml` — manual-only hosted Linux real mounted E2E smoke.
+- `.rwx/e2e.yml` — manual-only hosted Linux real mounted E2E smoke and full scenario run.
 
 When diagnosing RWX failures locally, keep the RWX CLI binary under
 `.rwx/bin/`. That directory is ignored by Git and is only a local tool cache;
@@ -127,10 +127,16 @@ Run the hosted real mounted E2E smoke manually through RWX:
 rwx run .rwx/e2e.yml --target e2e-smoke --wait --open
 ```
 
+Run the full hosted real mounted E2E scenario set manually through RWX:
+
+```powershell
+rwx run .rwx/e2e.yml --target e2e-full --wait --open
+```
+
 The workflow is Linux-only and uses RWX Docker support plus `/dev/fuse`. It
 builds `studiofs`, runs `studiofs-e2e` with Docker Compose infrastructure from
 `docker/compose.e2e.yml`, and uploads `target/e2e-runs/<run-id>/` as the
-`e2e-run` artifact. The run output prints the scenario name, run ID, report
+`e2e-run` or `e2e-full-run` artifact. The run output prints the scenario name, run ID, report
 path, failed invariant when the runner reports one, and the artifact path to
 inspect.
 

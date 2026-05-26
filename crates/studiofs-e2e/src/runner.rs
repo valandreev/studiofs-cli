@@ -2289,6 +2289,10 @@ fn emit_progress_heartbeat(tick: usize) {
     let _ = stderr.flush();
 }
 
+fn should_emit_progress_heartbeat(stderr_is_terminal: bool) -> bool {
+    stderr_is_terminal
+}
+
 fn clear_progress_heartbeat(width: usize) {
     if width == 0 {
         return;
@@ -2306,17 +2310,19 @@ struct ProgressHeartbeat {
 impl ProgressHeartbeat {
     fn start() -> Self {
         let (stop, stop_rx) = mpsc::channel();
-        let handle = thread::spawn(move || {
-            let mut tick = 0usize;
-            while stop_rx.recv_timeout(PROGRESS_HEARTBEAT_INTERVAL).is_err() {
-                tick = tick.saturating_add(1);
-                emit_progress_heartbeat(tick);
-            }
-            clear_progress_heartbeat(tick);
+        let handle = should_emit_progress_heartbeat(std::io::stderr().is_terminal()).then(|| {
+            thread::spawn(move || {
+                let mut tick = 0usize;
+                while stop_rx.recv_timeout(PROGRESS_HEARTBEAT_INTERVAL).is_err() {
+                    tick = tick.saturating_add(1);
+                    emit_progress_heartbeat(tick);
+                }
+                clear_progress_heartbeat(tick);
+            })
         });
         Self {
             stop,
-            handle: Some(handle),
+            handle,
         }
     }
 
@@ -2898,6 +2904,12 @@ plain child stderr\n",
 timestamp=2026-05-13T08:26:41.107Z studiofs-e2e run_id=run task=scenario phase=scenario_child status=\x1b[32mpassed\x1b[0m\n\
 plain child stderr\n",
         );
+    }
+
+    #[test]
+    fn progress_heartbeat_is_tty_only() {
+        assert!(should_emit_progress_heartbeat(true));
+        assert!(!should_emit_progress_heartbeat(false));
     }
 
     #[test]

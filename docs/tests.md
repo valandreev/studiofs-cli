@@ -254,14 +254,16 @@ Hosted Linux real mounted E2E is available as a manual RWX workflow:
 
 ```powershell
 rwx run .rwx/e2e.yml --target e2e-smoke --wait --open
+rwx run .rwx/e2e.yml --target e2e-full --wait --open
 ```
 
-The first RWX target runs `basic-multi-client-smoke` only. It requires RWX
-Docker support, `/dev/fuse`, `fusermount3`, and readable FUSE configuration on
-the hosted Linux task. It does not add a GitHub Actions workflow, PR trigger, or
-schedule. RWX uploads `target/e2e-runs/<run-id>/` as the `e2e-run` artifact so
-`report.json`, `preflight.json`, Docker diagnostics, scenario artifacts, and
-client logs remain available on failure.
+The smoke target runs `basic-multi-client-smoke` only. The full target runs
+the `1-23` scenario selector. Both require RWX Docker support, `/dev/fuse`,
+`fusermount3`, and readable FUSE configuration on the hosted Linux task. They
+do not add a GitHub Actions workflow, PR trigger, or schedule. RWX uploads
+`target/e2e-runs/<run-id>/` as an artifact so `report.json`, `preflight.json`,
+Docker diagnostics, scenario artifacts, and client logs remain available on
+failure.
 
 Focused runner skeleton check:
 

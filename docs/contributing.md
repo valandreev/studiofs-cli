@@ -37,7 +37,7 @@ workflows are manual-only while Windows work is primarily validated locally.
 | Platform bridge smoke tests (mount/unmount) | Require `/dev/fuse` or WinFSP kernel driver; marked `#[ignore]`. See [smoke workflow](#smoke-test-workflow) |
 | S3 / PostgreSQL integration tests | Require live RustFS + PostgreSQL; all marked `#[ignore]` |
 | Cross-client convergence tests | Require multi-process infra setup; all marked `#[ignore]` |
-| Real mounted E2E smoke | Manual RWX only via `.rwx/e2e.yml`; requires Docker plus `/dev/fuse` and uploads runner artifacts |
+| Real mounted E2E smoke/full run | Manual RWX only via `.rwx/e2e.yml`; requires Docker plus `/dev/fuse` and uploads runner artifacts |
 
 <a name="footnote-audit"></a>
 ¹ `cargo audit` reads the single workspace `Cargo.lock` and reports
