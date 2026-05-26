@@ -136,15 +136,10 @@ cargo test -p studiofs-vfs --test vfs_test foreground_read_baseline_during_and_p
 ```
 
 Pair those data-plane checks with the platform bridge smoke rows above when
-validating mounted encrypted read/write behavior:
-
-```bash
-STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1 cargo test -p studiofs-fuse --test mount_sanity fuse_mount_write_read_unmount_smoke -- --ignored --nocapture --test-threads=1
-```
-
-```powershell
-$env:STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS='1'; $env:STUDIOFS_WINFSP_TEST_MOUNT_POINT='Z:'; cargo test -p studiofs-winfsp --test mount_sanity winfsp_mount_write_read_unmount_smoke -- --ignored --nocapture --test-threads=1
-```
+validating mounted encrypted read/write behavior: run the
+`fuse_mount_write_read_unmount_smoke` and
+`winfsp_mount_write_read_unmount_smoke` rows from the Platform Bridge Matrix
+above instead of copying those commands into this section.
 
 ## Focused Benchmark Recipes
 

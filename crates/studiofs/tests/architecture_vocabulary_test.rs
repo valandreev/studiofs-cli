@@ -716,6 +716,7 @@ fn encryption_at_rest_contract_covers_required_sfs346_boundaries() {
 #[test]
 fn local_first_validation_matrix_covers_sfs356_encrypted_regression_gates() {
     let doc = read_workspace_file("docs/local-first-validation-matrix.md");
+    let normalized_doc = normalize_doc_whitespace(&doc);
     let required_terms = [
         "SFS-356",
         "Encrypted remote object regression gate",
@@ -740,7 +741,7 @@ fn local_first_validation_matrix_covers_sfs356_encrypted_regression_gates() {
 
     let missing: Vec<_> = required_terms
         .into_iter()
-        .filter(|term| !doc.contains(term))
+        .filter(|term| !contains_doc_term(&doc, &normalized_doc, term))
         .collect();
 
     assert!(
