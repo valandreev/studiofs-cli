@@ -1282,11 +1282,19 @@ impl Drop for InFlightCleanup<'_> {
 mod tests {
     use super::*;
     use crate::{StudioVfs, VfsConfig};
+    use bytes::Buf;
+    use opendal::{Operator, services::Memory};
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
+    use studiofs_cache::{CachedStoreConfig, open_local_payload_backend};
+    use studiofs_data::envelope::SFEC_MAGIC;
+    use studiofs_data::object::{
+        MAGIC as STFS_MAGIC, create_object_buffer, format_object_fragment_key,
+    };
+    use studiofs_data::store::{DataStoreConfig, DataStoreCryptoConfig};
     use studiofs_meta::schema::{CURRENT_FORMAT_VERSION, FormatInfo, MetadataConfig};
-    use studiofs_meta::{MetaFormat, RedbMetaEngine};
+    use studiofs_meta::{EncryptionConfig, MetaFormat, RedbMetaEngine};
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
 
@@ -1337,6 +1345,254 @@ mod tests {
         )
         .expect("create vfs");
         (rt, vfs, meta)
+    }
+
+    fn make_encrypted_fetch_scheduler(
+        tmp: &TempDir,
+        volume_suffix: &str,
+    ) -> (
+        Arc<FetchScheduler>,
+        Operator,
+        Arc<CachedStore>,
+        DataStoreConfig,
+    ) {
+        let volume_name = format!("fetch-encrypted-{volume_suffix}");
+        let config = DataStoreConfig {
+            endpoint: "memory://".into(),
+            bucket: "unit-test".into(),
+            access_key: "access".into(),
+            secret_key: "secret".into(),
+            region: "us-east-1".into(),
+            volume_name: volume_name.clone(),
+            volume_uuid: format!("fetch-encrypted-uuid-{volume_suffix}"),
+            crypto: DataStoreCryptoConfig::from(EncryptionConfig::new([0x35; 32])),
+        };
+        let raw = Operator::new(Memory::default()).unwrap().finish();
+        let data_store = Arc::new(
+            DataStore::with_operator_for_test(&config, raw.clone()).expect("test data store"),
+        );
+        let cache_root = tmp.path().join("fetch-cache");
+        let opened = open_local_payload_backend(&cache_root, &config.volume_uuid)
+            .expect("open local payload backend");
+        let (cached_store, _upload_rx) =
+            CachedStore::open(CachedStoreConfig::new(&cache_root), opened.backend)
+                .expect("open cached store");
+        let fetch_config = VfsConfig {
+            fetch_max_attempts: 1,
+            prefetch_fetch_max_attempts: 1,
+            fetch_request_timeout_secs: 5,
+            fetch_retry_base_ms: 1,
+            fetch_retry_max_ms: 1,
+            fetch_prefetch_reserve: 0,
+            fetch_prefetch_acquire_wait_ms: 50,
+            ..VfsConfig::default()
+        };
+        let scheduler = Arc::new(FetchScheduler::new(
+            data_store,
+            cached_store.clone(),
+            AimdConfig::fetch_default(),
+            0,
+            Arc::new(QosController::from_config(&fetch_config)),
+            TransitMemoryBudget::new(64 * 1024 * 1024),
+            &fetch_config,
+        ));
+        (scheduler, raw, cached_store, config)
+    }
+
+    fn fragment_key(config: &DataStoreConfig, object_id: u64, fragment_index: u8) -> String {
+        format_object_fragment_key(
+            &format!("{}/objects", config.volume_name),
+            object_id,
+            fragment_index,
+        )
+    }
+
+    async fn put_encrypted_fragment(
+        scheduler: &FetchScheduler,
+        raw: &Operator,
+        key: &str,
+        payload: Bytes,
+    ) -> Bytes {
+        let stfs = create_object_buffer(payload).expect("create STFS object");
+        assert!(stfs.chunk().starts_with(STFS_MAGIC));
+
+        scheduler
+            .data_store
+            .put_by_key(key, stfs.clone())
+            .await
+            .expect("put encrypted fragment");
+        let remote = raw.read(key).await.expect("read raw remote").to_bytes();
+        assert!(remote.starts_with(SFEC_MAGIC));
+        assert!(!remote.starts_with(STFS_MAGIC));
+        remote
+    }
+
+    #[tokio::test]
+    async fn foreground_fetch_decrypts_one_remote_object_and_caches_plaintext_payload() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (scheduler, raw, cached_store, config) =
+            make_encrypted_fetch_scheduler(&tmp, "foreground");
+        let object_id = 0x3531;
+        let key = fragment_key(&config, object_id, 0);
+        let expected = Bytes::from_static(b"foreground plaintext payload");
+        let remote = put_encrypted_fragment(&scheduler, &raw, &key, expected.clone()).await;
+
+        let fetched = scheduler
+            .fetch_block(object_id, std::slice::from_ref(&key))
+            .await
+            .expect("foreground fetch should decrypt through DataStore");
+
+        assert_eq!(fetched, expected);
+        assert_ne!(remote.as_ref(), expected.as_ref());
+        assert_eq!(
+            cached_store.get(object_id).expect("cache entry"),
+            expected,
+            "fetch cache should hold plaintext payload bytes, not the SFEC object"
+        );
+        assert_eq!(scheduler.metrics.s3_fetches.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn cache_hit_read_does_not_touch_encrypted_remote_object() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (scheduler, raw, cached_store, config) = make_encrypted_fetch_scheduler(&tmp, "cache");
+        let object_id = 0x3532;
+        let key = fragment_key(&config, object_id, 0);
+        let cached = Bytes::from_static(b"warm plaintext payload");
+        cached_store
+            .put(object_id, cached.as_ref(), true)
+            .expect("seed plaintext cache");
+        raw.write(&key, Bytes::from_static(b"not an encrypted object"))
+            .await
+            .expect("seed corrupt remote object");
+
+        let fetched = scheduler
+            .fetch_block(object_id, std::slice::from_ref(&key))
+            .await
+            .expect("warm cache read should bypass remote decrypt");
+
+        assert_eq!(fetched, cached);
+        assert_eq!(scheduler.metrics.cache_hits.load(Ordering::Relaxed), 1);
+        assert_eq!(scheduler.metrics.s3_fetches.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn prefetch_uses_same_decrypt_path_and_caches_plaintext_payload() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (scheduler, raw, cached_store, config) =
+            make_encrypted_fetch_scheduler(&tmp, "prefetch");
+        let object_id = 0x3533;
+        let key = fragment_key(&config, object_id, 0);
+        let expected = Bytes::from_static(b"prefetch plaintext payload");
+        put_encrypted_fragment(&scheduler, &raw, &key, expected.clone()).await;
+
+        let fetched = scheduler
+            .fetch_block_prefetch(object_id, std::slice::from_ref(&key))
+            .await
+            .expect("prefetch should decrypt through DataStore");
+
+        assert_eq!(fetched, expected);
+        assert_eq!(
+            cached_store.get(object_id).expect("prefetch cache entry"),
+            expected
+        );
+        assert_eq!(scheduler.metrics.s3_fetches.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn random_block_fetch_only_decrypts_requested_remote_object() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (scheduler, raw, cached_store, config) = make_encrypted_fetch_scheduler(&tmp, "random");
+        let object_id = 0x3534;
+        let requested_key = fragment_key(&config, object_id, 0);
+        let unrelated_object_id = object_id + 1;
+        let unrelated_key = fragment_key(&config, unrelated_object_id, 0);
+        let expected = Bytes::from_static(b"random block plaintext payload");
+        put_encrypted_fragment(&scheduler, &raw, &requested_key, expected.clone()).await;
+        raw.write(
+            &unrelated_key,
+            Bytes::from_static(b"corrupt sibling ciphertext"),
+        )
+        .await
+        .expect("seed corrupt adjacent block");
+
+        let fetched = scheduler
+            .fetch_block_after_local_miss(object_id, std::slice::from_ref(&requested_key))
+            .await
+            .expect("random read should fetch only the requested block object");
+
+        assert_eq!(fetched, expected);
+        assert_eq!(
+            cached_store
+                .get(object_id)
+                .expect("random read cache entry"),
+            expected
+        );
+        assert_eq!(scheduler.metrics.s3_fetches.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn corrupt_or_swapped_encrypted_objects_fail_before_cache_population() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (scheduler, raw, cached_store, config) =
+            make_encrypted_fetch_scheduler(&tmp, "integrity");
+        let corrupt_object_id = 0x3535;
+        let corrupt_key = fragment_key(&config, corrupt_object_id, 0);
+        let mut corrupt_remote = put_encrypted_fragment(
+            &scheduler,
+            &raw,
+            &corrupt_key,
+            Bytes::from_static(b"corrupt me"),
+        )
+        .await
+        .to_vec();
+        if let Some(last_byte) = corrupt_remote.last_mut() {
+            *last_byte ^= 0x55;
+        }
+        raw.write(&corrupt_key, Bytes::from(corrupt_remote))
+            .await
+            .expect("write corrupted ciphertext");
+
+        let corrupt_error = scheduler
+            .fetch_block(corrupt_object_id, std::slice::from_ref(&corrupt_key))
+            .await
+            .expect_err("corrupted encrypted object should fail");
+        assert!(matches!(
+            corrupt_error,
+            FetchError::Exhausted {
+                source: DataError::Crypto(_),
+                ..
+            }
+        ));
+        assert!(cached_store.get(corrupt_object_id).is_none());
+
+        let source_object_id = 0x3536;
+        let target_object_id = 0x3537;
+        let source_key = fragment_key(&config, source_object_id, 0);
+        let target_key = fragment_key(&config, target_object_id, 0);
+        let swapped_ciphertext = put_encrypted_fragment(
+            &scheduler,
+            &raw,
+            &source_key,
+            Bytes::from_static(b"source plaintext"),
+        )
+        .await;
+        raw.write(&target_key, swapped_ciphertext)
+            .await
+            .expect("swap ciphertext to wrong key");
+
+        let swap_error = scheduler
+            .fetch_block(target_object_id, std::slice::from_ref(&target_key))
+            .await
+            .expect_err("storage-key AAD should reject swapped ciphertext");
+        assert!(matches!(
+            swap_error,
+            FetchError::Exhausted {
+                source: DataError::Crypto(_),
+                ..
+            }
+        ));
+        assert!(cached_store.get(target_object_id).is_none());
     }
 
     #[test]
