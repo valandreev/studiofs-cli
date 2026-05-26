@@ -714,6 +714,41 @@ fn encryption_at_rest_contract_covers_required_sfs346_boundaries() {
 }
 
 #[test]
+fn local_first_validation_matrix_covers_sfs356_encrypted_regression_gates() {
+    let doc = read_workspace_file("docs/local-first-validation-matrix.md");
+    let normalized_doc = normalize_doc_whitespace(&doc);
+    let required_terms = [
+        "SFS-356",
+        "Encrypted remote object regression gate",
+        "encrypted_remote_object_storage_keeps_remote_ciphertext_and_local_plaintext_cache",
+        "cache_hit_read_does_not_touch_encrypted_remote_object",
+        "prefetch_uses_same_decrypt_path_and_caches_plaintext_payload",
+        "random_block_fetch_only_decrypts_requested_remote_object",
+        "successful_fetch_records_encrypted_remote_read_counters",
+        "test_write_read_large_file",
+        "foreground_read_baseline_during_and_post_upload_are_comparable",
+        "warm_cache_sequential_read_bounded_latency_after_write",
+        "fuse_mount_write_read_unmount_smoke",
+        "winfsp_mount_write_read_unmount_smoke",
+        "SFEC",
+        "whole-file decrypt",
+        "warm cache hits",
+        "foreground read while background upload is active",
+    ];
+
+    let missing: Vec<_> = required_terms
+        .into_iter()
+        .filter(|term| !contains_doc_term(&doc, &normalized_doc, term))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "SFS-356 encrypted remote regression matrix is missing required gates:\n{}",
+        missing.join("\n")
+    );
+}
+
+#[test]
 fn local_first_e2e_baseline_audit_covers_sfs402_surfaces() {
     let doc = read_workspace_file("docs/local-first-e2e-baseline-audit.md");
     let required_terms = [
