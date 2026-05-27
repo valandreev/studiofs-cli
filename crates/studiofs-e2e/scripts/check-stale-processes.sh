@@ -10,15 +10,24 @@ if [ -z "$runner_root" ]; then
     exit 1
 fi
 
-ps -eo pid=,comm=,args= |
-    awk -v self_pid="$self_pid" -v runner_root="$runner_root" '
-        $1 != self_pid &&
-        ($2 == "studiofs" || $2 == "studiofs-e2e" || $2 == "studiofs-e2e-hotspot-helper" || $2 == "studiofs.exe" || $2 == "studiofs-e2e.exe" || $2 == "studiofs-e2e-hotspot-helper.exe") &&
-        (index($0, runner_root) || index($0, "__mounted-chaos-op")) {
-            print $1 "\t" $0
-        }
-    ' |
-    while IFS="$(printf '\t')" read -r pid detail; do
+for proc in /proc/[0-9]*; do
+    [ -d "$proc" ] || continue
+    pid="${proc##*/}"
+    [ "$pid" != "$self_pid" ] || continue
+
+    comm="$(cat "$proc/comm" 2>/dev/null || true)"
+    case "$comm" in
+        studiofs|studiofs-e2e|studiofs-e2e-hotspot-helper|studiofs.exe|studiofs-e2e.exe|studiofs-e2e-hotspot-helper.exe) ;;
+        *) continue ;;
+    esac
+
+    cmdline="$(tr '\0' ' ' < "$proc/cmdline" 2>/dev/null || true)"
+    case "$cmdline" in
+        *"$runner_root"*|*"__mounted-chaos-op"*) ;;
+        *) continue ;;
+    esac
+
+    detail="$pid $comm $cmdline"
         if [ "$clean_stale" = "1" ]; then
             if kill -TERM "$pid" 2>/dev/null; then
                 sleep 1
@@ -37,4 +46,4 @@ ps -eo pid=,comm=,args= |
         else
             echo "$detail"
         fi
-    done
+done

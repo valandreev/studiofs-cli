@@ -2013,6 +2013,38 @@ fn namespace_collision_timeout_does_not_wait_for_blocked_mount_force_kill() {
 }
 
 #[test]
+fn namespace_collision_mounted_io_timeout_uses_emergency_cleanup() {
+    let temp = tempdir().unwrap();
+    let sandbox = temp.path().join("run-collision-mounted-io-timeout");
+    let clients = COLLISION_CLIENT_NAMES
+        .iter()
+        .copied()
+        .map(|name| {
+            let mount = temp.path().join("mounts").join(name);
+            std::fs::create_dir_all(&mount).unwrap();
+            client_spec_for(&sandbox, "projectfs", name, mount)
+        })
+        .collect::<Vec<_>>();
+    let mut driver = RecordingNamespaceCollisionDriver::new(clients);
+    let primary = ScenarioError::MountedIoTimeout {
+        label: "namespace collision initial tree: write shared/file.txt".to_string(),
+        timeout_ms: 5_000,
+        cancel_detail: "thread cancellation is not available on this platform".to_string(),
+    };
+
+    let err =
+        handle_namespace_collision_timeout_error::<NamespaceCollisionSummary>(primary, &mut driver)
+            .unwrap_err();
+
+    assert!(matches!(err, ScenarioError::MountedIoTimeout { .. }));
+    assert_eq!(
+        driver.actions.borrow().as_slice(),
+        ["emergency_kill_all_no_wait"],
+        "mounted I/O timeout should not attempt graceful unmount while a FUSE callback may be blocked"
+    );
+}
+
+#[test]
 fn namespace_collision_collect_timeout_allows_helper_cleanup_grace() {
     let temp = tempdir().unwrap();
     let sandbox = temp.path().join("run-collision-helper-grace");

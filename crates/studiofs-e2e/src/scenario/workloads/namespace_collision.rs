@@ -345,15 +345,21 @@ pub(in crate::scenario) fn run_namespace_collision_with_driver(
 ) -> Result<NamespaceCollisionSummary, ScenarioError> {
     let result =
         run_namespace_collision_body(context, kind, driver, convergence_timeout, poll_interval);
-    let unmount_result = driver.unmount_all();
-    match (result, unmount_result) {
-        (Ok(summary), Ok(())) => Ok(summary),
-        (Err(primary), Err(cleanup)) => Err(ScenarioError::NamespaceCollisionUnmountAfterFailure {
-            primary: primary.to_string(),
-            cleanup: cleanup.to_string(),
-        }),
-        (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
+    match result {
+        Ok(summary) => match driver.unmount_all() {
+            Ok(()) => Ok(summary),
+            Err(error) => Err(error),
+        },
+        Err(error) if namespace_collision_error_requires_emergency_cleanup(&error) => {
+            handle_namespace_collision_timeout_error(error, driver)
+        }
+        Err(error) => match driver.unmount_all() {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(ScenarioError::NamespaceCollisionUnmountAfterFailure {
+                primary: error.to_string(),
+                cleanup: cleanup.to_string(),
+            }),
+        },
     }
 }
 
@@ -444,7 +450,25 @@ pub(in crate::scenario) fn handle_namespace_collision_operation_timeout<T>(
     error: ScenarioError,
     driver: &mut dyn NamespaceCollisionDriver,
 ) -> Result<T, ScenarioError> {
-    match driver.emergency_kill_all_no_wait("namespace collision operation timeout") {
+    handle_namespace_collision_timeout_error(error, driver)
+}
+
+pub(in crate::scenario) fn namespace_collision_error_requires_emergency_cleanup(
+    error: &ScenarioError,
+) -> bool {
+    matches!(
+        error,
+        ScenarioError::NamespaceCollisionOperationTimeout { .. }
+            | ScenarioError::MountedIoTimeout { .. }
+            | ScenarioError::MountedIoWorkerLimit { .. }
+    )
+}
+
+pub(in crate::scenario) fn handle_namespace_collision_timeout_error<T>(
+    error: ScenarioError,
+    driver: &mut dyn NamespaceCollisionDriver,
+) -> Result<T, ScenarioError> {
+    match driver.emergency_kill_all_no_wait("namespace collision timeout") {
         Ok(()) => Err(error),
         Err(cleanup) => Err(ScenarioError::NamespaceCollisionUnmountAfterFailure {
             primary: error.to_string(),

@@ -3582,6 +3582,8 @@ plain child stderr\n",
         assert!(windows_script.contains("'studiofs-e2e-hotspot-helper'"));
         assert!(unix_script.contains("studiofs-e2e-hotspot-helper"));
         assert!(unix_script.contains("studiofs-e2e-hotspot-helper.exe"));
+        assert!(unix_script.contains("/proc/[0-9]*"));
+        assert!(!unix_script.contains("ps -eo"));
     }
 
     #[test]
