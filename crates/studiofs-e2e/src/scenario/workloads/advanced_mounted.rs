@@ -4814,7 +4814,7 @@ pub(in crate::scenario) fn run_symlink_attribute_operations(
             )?);
             (true, None)
         }
-        Err(error) if hotspot_helper_error_is_supported_symlink_skip(&error) => {
+        Err(error) if hotspot_helper_error_is_supported_readonly_skip(&error) => {
             operations.push(required_op(
                 started,
                 operations.len() + 1,
@@ -4874,6 +4874,15 @@ pub(in crate::scenario) fn run_symlink_attribute_operations(
 }
 
 pub(in crate::scenario) fn hotspot_helper_error_is_supported_symlink_skip(
+    error: &ScenarioError,
+) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    hotspot_helper_error_is_supported_readonly_skip(error)
+        || message.contains("os error 31")
+        || message.contains("device attached to the system is not functioning")
+}
+
+pub(in crate::scenario) fn hotspot_helper_error_is_supported_readonly_skip(
     error: &ScenarioError,
 ) -> bool {
     let message = error.to_string().to_ascii_lowercase();

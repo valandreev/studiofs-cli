@@ -270,6 +270,30 @@ fn hotspot_helper_ops_cover_metadata_attribute_and_symlink_ops() {
 }
 
 #[test]
+fn symlink_helper_skip_accepts_windows_error_gen_failure() {
+    let error = ScenarioError::Io(io::Error::other(
+        "hotspot helper failed for client-a symlink create: status=exit code: 1; stderr=A device attached to the system is not functioning. (os error 31)",
+    ));
+
+    assert!(
+        hotspot_helper_error_is_supported_symlink_skip(&error),
+        "WinFSP may report unsupported symlink creation as ERROR_GEN_FAILURE"
+    );
+}
+
+#[test]
+fn readonly_helper_skip_does_not_accept_windows_error_gen_failure() {
+    let error = ScenarioError::Io(io::Error::other(
+        "hotspot helper failed for client-c readonly attribute set: status=exit code: 1; stderr=A device attached to the system is not functioning. (os error 31)",
+    ));
+
+    assert!(
+        !hotspot_helper_error_is_supported_readonly_skip(&error),
+        "ERROR_GEN_FAILURE is only a supported symlink-create skip, not a generic metadata-attribute skip"
+    );
+}
+
+#[test]
 fn sparse_wait_timeout_writes_diagnostics_artifacts() {
     let temp = tempdir().unwrap();
     let sandbox = temp.path().join("run-1");
