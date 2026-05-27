@@ -88,6 +88,15 @@ current implementation supports only XChaCha20-Poly1305 and does not provide
 AES-256-GCM, RSA wrapping, user passphrases, KMS integration, or legacy
 plaintext remote-volume compatibility.
 
+### Transport encryption
+
+StudioFS' transport policy is defined in
+[transport-encryption-contract.md](./transport-encryption-contract.md). In
+short, non-local S3-compatible object storage endpoints require HTTPS and
+non-local PostgreSQL DSNs require TLS. Plain HTTP object storage and
+`sslmode=disable` PostgreSQL are allowed only for explicit local/test loopback
+hosts such as `localhost`, `127.0.0.0/8`, and `::1`.
+
 ### `discover`
 
 Attaches another client to an existing PG-backed volume.

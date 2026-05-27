@@ -71,7 +71,30 @@ fn normalize_doc_whitespace(text: &str) -> String {
 }
 
 fn contains_doc_term(doc: &str, normalized_doc: &str, term: &str) -> bool {
-    doc.contains(term) || normalized_doc.contains(&normalize_doc_whitespace(term))
+    if doc.contains(term) {
+        return true;
+    }
+    if is_normalized_doc_term(term) {
+        return normalized_doc.contains(term);
+    }
+
+    normalized_doc.contains(&normalize_doc_whitespace(term))
+}
+
+fn is_normalized_doc_term(term: &str) -> bool {
+    let mut previous_was_space = true;
+    for ch in term.chars() {
+        let is_space = ch == ' ';
+        if ch.is_whitespace() && !is_space {
+            return false;
+        }
+        if is_space && previous_was_space {
+            return false;
+        }
+        previous_was_space = is_space;
+    }
+
+    !previous_was_space
 }
 
 fn collect_term_hits(path: &str, terms: &[&str]) -> Vec<String> {
@@ -709,6 +732,57 @@ fn encryption_at_rest_contract_covers_required_sfs346_boundaries() {
     assert!(
         missing.is_empty(),
         "SFS-346 encryption-at-rest contract is missing required boundaries:\n{}",
+        missing.join("\n")
+    );
+}
+
+#[test]
+fn transport_encryption_contract_covers_required_sfs448_boundaries() {
+    let contract = read_workspace_file("docs/transport-encryption-contract.md");
+    let normalized_contract = normalize_doc_whitespace(&contract);
+    let required_terms = [
+        "SFS-448",
+        "Transport Encryption Contract",
+        "transport-only",
+        "must not reopen at-rest SFEC implementation decisions",
+        "HTTPS is required for non-local S3-compatible object storage endpoints",
+        "Plain HTTP is allowed only for explicit local/test loopback endpoints",
+        "localhost",
+        "127.0.0.0/8",
+        "::1",
+        "IPv4-mapped IPv6 loopback addresses",
+        "IPv4-compatible IPv6 loopback",
+        "must be normalized",
+        "memory:// remains a test-only operator path",
+        "init/configuration layer rejects memory:// for production user-supplied endpoints",
+        "TLS is required for non-local PostgreSQL DSNs",
+        "sslmode=disable is allowed only for explicit local/test loopback DSNs",
+        "If sslmode is omitted for a non-local DSN",
+        "downgrade-capable mode such as prefer",
+        "without cleartext fallback",
+        "Unix domain sockets",
+        "no silent downgrade",
+        "PostgreSQL carries metadata and active volume key material",
+        "volume_crypto_keys.key_material",
+        "reject insecure non-local transports early",
+        "sanitize DSNs and endpoints",
+        "without logging credentials or key material",
+        "Existing local development and CI setups",
+        "loopback RustFS/PostgreSQL",
+        "remain supported",
+        "SFS-449",
+        "SFS-450",
+        "SFS-452",
+    ];
+
+    let missing: Vec<_> = required_terms
+        .into_iter()
+        .filter(|term| !contains_doc_term(&contract, &normalized_contract, term))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "SFS-448 transport encryption contract is missing required boundaries:\n{}",
         missing.join("\n")
     );
 }

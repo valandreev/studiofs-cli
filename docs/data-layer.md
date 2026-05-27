@@ -6,6 +6,9 @@ This document follows the canonical chunk/slice/payload-object vocabulary from
 [juicefs-local-first-rust-contract.md](./juicefs-local-first-rust-contract.md).
 The transparent remote-object encryption boundary is defined in
 [encryption-at-rest-contract.md](./encryption-at-rest-contract.md).
+Transport requirements for S3-compatible object storage and PostgreSQL are
+defined in
+[transport-encryption-contract.md](./transport-encryption-contract.md).
 
 ## Responsibilities
 
