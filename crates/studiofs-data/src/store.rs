@@ -237,8 +237,7 @@ fn parse_s3_endpoint(endpoint: &str) -> DataResult<ParsedEndpoint> {
 fn is_loopback_host(host: url::Host<&str>) -> bool {
     match host {
         url::Host::Domain(domain) => {
-            domain.eq_ignore_ascii_case("localhost")
-                || domain.to_ascii_lowercase().ends_with(".localhost")
+            domain.eq_ignore_ascii_case("localhost") || domain.ends_with(".localhost")
         }
         url::Host::Ipv4(addr) => addr.is_loopback(),
         url::Host::Ipv6(addr) => addr.is_loopback(),
@@ -732,6 +731,7 @@ mod tests {
             "https://s3.amazonaws.com",
             "http://localhost:9000",
             "http://my-bucket.localhost:9000",
+            "http://My-Bucket.LOCALHOST:9000",
             "http://127.0.0.1:9000",
             "http://127.1.2.3:9000",
             "http://[::1]:9000",
