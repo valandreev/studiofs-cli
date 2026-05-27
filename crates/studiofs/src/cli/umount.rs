@@ -64,7 +64,7 @@ fn run_with(
     unmount_windows(mount_point, pid)?;
 
     #[cfg(unix)]
-    unmount_unix(pid)?;
+    unmount_unix(mount_point, pid, is_mount_active)?;
 
     // Clean up the persisted mount record.
     let _ = remove_pid_file(mount_point);
@@ -154,32 +154,70 @@ fn unmount_windows(mount_point: &str, pid: u32) -> Result<()> {
 // ─── Unix ────────────────────────────────────────────────────────────────────
 
 #[cfg(unix)]
-fn unmount_unix(pid: u32) -> Result<()> {
-    use std::time::{Duration, Instant};
+type UnixSignalFn = fn(u32, libc::c_int) -> std::io::Result<()>;
+
+#[cfg(unix)]
+fn send_unix_signal(pid: u32, signal: libc::c_int) -> std::io::Result<()> {
+    // SAFETY: `kill` is called with a concrete PID and signal supplied by the
+    // caller. Signal 0 is the standard existence probe and has no side effects.
+    if unsafe { libc::kill(pid as i32, signal) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+fn unmount_unix(mount_point: &str, pid: u32, is_mount_active: IsMountActiveFn) -> Result<()> {
+    use std::time::Duration;
+
+    unmount_unix_with(
+        mount_point,
+        pid,
+        is_mount_active,
+        send_unix_signal,
+        Duration::from_secs(15),
+        Duration::from_millis(200),
+    )
+}
+
+#[cfg(unix)]
+fn unmount_unix_with(
+    mount_point: &str,
+    pid: u32,
+    is_mount_active: IsMountActiveFn,
+    signal: UnixSignalFn,
+    timeout: std::time::Duration,
+    poll_interval: std::time::Duration,
+) -> Result<()> {
+    use std::time::Instant;
 
     // Send SIGTERM (the FUSE signal-watcher thread will handle it)
-    // SAFETY: `kill` is called with a concrete PID and signal to request termination.
-    let ret = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-    if ret != 0 {
-        let err = std::io::Error::last_os_error();
+    if let Err(err) = signal(pid, libc::SIGTERM) {
         if err.raw_os_error() == Some(libc::ESRCH) {
             return Ok(()); // already gone
         }
         return Err(anyhow!("failed to send SIGTERM to PID {}: {}", pid, err));
     }
 
-    // Poll until the process exits, hard-kill after 15 s
-    let deadline = Instant::now() + Duration::from_secs(15);
+    // A successfully exited child can remain visible to kill(pid, 0) as a
+    // zombie until its parent reaps it. The mountpoint state is the contract
+    // this command owns, so stop once it is no longer active.
+    let deadline = Instant::now() + timeout;
     loop {
-        std::thread::sleep(Duration::from_millis(200));
-        // SAFETY: A zero-signal kill performs an existence check without side effects.
-        if unsafe { libc::kill(pid as i32, 0) } != 0 {
+        std::thread::sleep(poll_interval);
+        if !is_mount_active(mount_point)? {
+            break;
+        }
+        if let Err(err) = signal(pid, 0) {
+            if err.raw_os_error() == Some(libc::ESRCH) {
+                break; // gone
+            }
             break; // gone
         }
         if Instant::now() > deadline {
             tracing::warn!("mount process did not exit within 15 s — sending SIGKILL");
-            // SAFETY: SIGKILL is used as a forced termination fallback after timeout.
-            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+            let _ = signal(pid, libc::SIGKILL);
             break;
         }
     }
@@ -200,6 +238,8 @@ mod tests {
     }
 
     static TEST_PID_STATE: OnceLock<Mutex<TestPidState>> = OnceLock::new();
+    #[cfg(unix)]
+    static TEST_UNIX_SIGNALS: OnceLock<Mutex<Vec<libc::c_int>>> = OnceLock::new();
 
     fn pid_state() -> &'static Mutex<TestPidState> {
         TEST_PID_STATE.get_or_init(|| Mutex::new(TestPidState::default()))
@@ -226,6 +266,17 @@ mod tests {
 
     fn test_mount_not_active(_mount_point: &str) -> Result<bool> {
         Ok(false)
+    }
+
+    #[cfg(unix)]
+    fn unix_signal_log() -> &'static Mutex<Vec<libc::c_int>> {
+        TEST_UNIX_SIGNALS.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    #[cfg(unix)]
+    fn record_unix_signal(_pid: u32, signal: libc::c_int) -> std::io::Result<()> {
+        unix_signal_log().lock().unwrap().push(signal);
+        Ok(())
     }
 
     /// `umount` on a mount point with no persisted mount record should return an error.
@@ -296,5 +347,32 @@ mod tests {
         let state = pid_state().lock().unwrap();
         assert!(state.removed, "PID file should have been removed");
         assert!(state.value.is_none(), "PID state should be cleared");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_unmount_returns_once_mountpoint_is_inactive() {
+        use std::time::Duration;
+
+        unix_signal_log().lock().unwrap().clear();
+
+        let result = unmount_unix_with(
+            "/mnt/studiofs-test",
+            12345,
+            test_mount_not_active,
+            record_unix_signal,
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+
+        assert!(
+            result.is_ok(),
+            "inactive mountpoint should finish graceful unix unmount: {result:?}"
+        );
+        assert_eq!(
+            *unix_signal_log().lock().unwrap(),
+            vec![libc::SIGTERM],
+            "inactive mountpoint should not wait for kill(pid, 0) or send SIGKILL"
+        );
     }
 }
