@@ -38,6 +38,9 @@ pub enum Commands {
     /// Execute one bounded mounted hotspot filesystem operation.
     #[command(hide = true)]
     HotspotOp(HotspotOpArgs),
+    /// Execute one bounded mounted sparse filesystem operation.
+    #[command(hide = true)]
+    SparseOp(SparseOpArgs),
     /// Execute the mounted open-handle mutation sequence in a bounded helper.
     #[command(hide = true)]
     OpenHandleOp(OpenHandleOpArgs),
@@ -161,6 +164,46 @@ pub struct HotspotOpArgs {
     pub progress: Option<PathBuf>,
 
     /// Internal operation timeout so the helper can cancel mounted I/O before parent kill.
+    #[arg(long, hide = true)]
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Args, Debug)]
+/// Hidden helper arguments for one mounted sparse filesystem operation.
+pub struct SparseOpArgs {
+    /// Operation name: write-range, truncate, read-range-exact, read-range-zero, or read-all-exact.
+    #[arg(long)]
+    pub operation: String,
+
+    /// Mounted root for the client that executes the operation.
+    #[arg(long)]
+    pub mount_point: PathBuf,
+
+    /// Relative path under the mount point.
+    #[arg(long)]
+    pub path: String,
+
+    /// Byte offset for ranged sparse operations.
+    #[arg(long)]
+    pub offset: Option<u64>,
+
+    /// Length for truncate or zero-range validation operations.
+    #[arg(long)]
+    pub len: Option<u64>,
+
+    /// Payload file for write-range, read-range-exact, and read-all-exact.
+    #[arg(long)]
+    pub payload: Option<PathBuf>,
+
+    /// Parent sandbox path used only so stale-process cleanup can identify helpers.
+    #[arg(long, hide = true)]
+    pub sandbox: Option<PathBuf>,
+
+    /// Per-operation progress JSONL path used to diagnose bounded helper timeouts.
+    #[arg(long, hide = true)]
+    pub progress: Option<PathBuf>,
+
+    /// Internal operation timeout accepted for symmetry with hotspot-op.
     #[arg(long, hide = true)]
     pub timeout_ms: Option<u64>,
 }
@@ -424,6 +467,25 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             // filesystem call.  Once the call has returned successfully, exit
             // without running any remaining process teardown that can wedge while
             // WinFSP is under churn.
+            match result {
+                Ok(()) => std::process::exit(0),
+                Err(error) => {
+                    eprintln!("{error:#}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::SparseOp(args) => {
+            let result = scenario::run_sparse_op_helper_with_timeout(
+                &args.operation,
+                args.mount_point,
+                &args.path,
+                args.offset,
+                args.len,
+                args.payload.as_deref(),
+                args.progress.as_deref(),
+                args.timeout_ms.map(std::time::Duration::from_millis),
+            );
             match result {
                 Ok(()) => std::process::exit(0),
                 Err(error) => {

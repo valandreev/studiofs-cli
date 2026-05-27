@@ -218,7 +218,10 @@ mod smoke_outage;
 mod test_fixtures;
 
 pub(super) use actions::*;
-pub use actions::{run_hotspot_op_helper_with_timeout, run_open_handle_op_helper};
+pub use actions::{
+    run_hotspot_op_helper_with_timeout, run_open_handle_op_helper,
+    run_sparse_op_helper_with_timeout,
+};
 pub(super) use advanced_mounted::*;
 pub(super) use assertions::*;
 pub(super) use faults::*;

@@ -3003,6 +3003,163 @@ pub(in crate::scenario) fn run_open_handle_helper_process(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(in crate::scenario) fn run_sparse_helper_process(
+    context: &ScenarioContext,
+    timeout: Duration,
+    client: &ClientSpec,
+    operation: &str,
+    path: &str,
+    offset: Option<u64>,
+    len: Option<u64>,
+    payload: Option<&[u8]>,
+) -> Result<(), ScenarioError> {
+    let payload_path = write_helper_payload(context, client, operation, payload)?;
+    let progress_path = helper_progress_path(context, client, operation, path)?;
+    let pending_label = format!("{} {} {}", client.name, operation, path);
+
+    #[cfg(test)]
+    {
+        let _ = timeout;
+        run_sparse_op_helper(
+            operation,
+            client.mount_point.clone(),
+            path,
+            offset,
+            len,
+            payload_path.as_deref(),
+            Some(&progress_path),
+        )
+        .map_err(|error| {
+            ScenarioError::Io(io::Error::other(format!(
+                "sparse helper failed for {pending_label}: {error}"
+            )))
+        })
+    }
+
+    #[cfg(not(test))]
+    {
+        let exe = prepare_hotspot_helper_exe(context)?;
+        let mut command = Command::new(exe);
+        command
+            .arg("sparse-op")
+            .arg("--operation")
+            .arg(operation)
+            .arg("--sandbox")
+            .arg(&context.sandbox)
+            .arg("--mount-point")
+            .arg(&client.mount_point)
+            .arg("--path")
+            .arg(path)
+            .arg("--progress")
+            .arg(&progress_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        if let Some(offset) = offset {
+            command.arg("--offset").arg(offset.to_string());
+        }
+        if let Some(len) = len {
+            command.arg("--len").arg(len.to_string());
+        }
+        if let Some(payload_path) = &payload_path {
+            command.arg("--payload").arg(payload_path);
+        }
+        command
+            .arg("--timeout-ms")
+            .arg(duration_millis_u64(hotspot_helper_internal_timeout(timeout)).to_string());
+
+        ChildJob::prepare_command(&mut command)?;
+        let mut child = command.spawn()?;
+        write_hotspot_helper_process_metadata(context, child.id(), client, operation, path, None)?;
+        let job = ChildJob::assign_to_child(&child).map_err(|error| {
+            let _ = child.kill();
+            let _ = child.wait();
+            ScenarioError::Io(io::Error::new(
+                error.kind(),
+                format!("failed to isolate sparse helper process: {error}"),
+            ))
+        })?;
+
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = child.try_wait()? {
+                if status.success() {
+                    return Ok(());
+                }
+                let stderr = child
+                    .stderr
+                    .take()
+                    .and_then(|mut stderr| {
+                        let mut output = String::new();
+                        stderr.read_to_string(&mut output).ok().map(|_| output)
+                    })
+                    .unwrap_or_default();
+                let progress = read_hotspot_helper_progress_tail(&progress_path);
+                return Err(ScenarioError::Io(io::Error::other(format!(
+                    "sparse helper failed for {pending_label}: status={status}; stderr={}; progress={}",
+                    stderr.trim(),
+                    progress.as_deref().unwrap_or("<none>")
+                ))));
+            }
+            if Instant::now() >= deadline {
+                let progress = read_hotspot_helper_progress_tail(&progress_path);
+                let progress_suffix = progress
+                    .as_ref()
+                    .map(|progress| format!("; progress={progress}"))
+                    .unwrap_or_default();
+                eprintln!(
+                    "studiofs-e2e: sparse helper timed out after {} ms; terminating helper process: {}{}",
+                    timeout.as_millis(),
+                    pending_label,
+                    progress_suffix
+                );
+                let mut cleanup_error =
+                    terminate_blocked_hotspot_client_process(client, &pending_label)
+                        .err()
+                        .map(|error| error.to_string());
+                let _ = job.terminate();
+                if should_wait_for_timed_out_hotspot_helper_child() {
+                    if !wait_for_child_exit(&mut child, CHILD_TERMINATION_GRACE).unwrap_or(false) {
+                        let _ = job.force_kill();
+                        if let Err(error) =
+                            terminate_blocked_hotspot_helper_process(child.id(), &pending_label)
+                        {
+                            cleanup_error.get_or_insert_with(|| error.to_string());
+                        }
+                        let _ = child.kill();
+                        let _ = wait_for_child_exit(&mut child, CHILD_TERMINATION_GRACE);
+                    }
+                } else {
+                    let _ = job.force_kill();
+                    if let Err(error) =
+                        terminate_blocked_hotspot_helper_process(child.id(), &pending_label)
+                    {
+                        cleanup_error.get_or_insert_with(|| error.to_string());
+                    }
+                    let _ = child.kill();
+                }
+                if let Err(error) = terminate_blocked_hotspot_client_process(client, &pending_label)
+                {
+                    cleanup_error.get_or_insert_with(|| error.to_string());
+                }
+                let primary = namespace_collision_operation_timeout(
+                    timeout,
+                    vec![(1, format!("{pending_label}{progress_suffix}"))],
+                );
+                if let Some(cleanup) = cleanup_error {
+                    return Err(ScenarioError::NamespaceCollisionUnmountAfterFailure {
+                        primary: primary.to_string(),
+                        cleanup,
+                    });
+                }
+                return Err(primary);
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
 pub(in crate::scenario) fn seed_open_handle_initial_tree(
     context: &ScenarioContext,
     clients: &[ClientSpec],
@@ -3558,23 +3715,6 @@ pub(in crate::scenario) fn directory_contains_child(
         }
     }
     false
-}
-
-pub(in crate::scenario) fn refresh_relative_path_ancestors(
-    mount_point: &Path,
-    relative_path: &str,
-) {
-    let mut current = mount_point.to_path_buf();
-    let _ = drain_directory(&current);
-    let relative = Path::new(relative_path);
-    if let Some(parent) = relative.parent() {
-        for component in parent.components() {
-            current.push(component.as_os_str());
-            if !drain_directory(&current) {
-                break;
-            }
-        }
-    }
 }
 
 pub(in crate::scenario) fn drain_directory(path: &Path) -> bool {
@@ -4747,13 +4887,16 @@ pub(in crate::scenario) fn run_sparse_range_operations(
             writer,
             "write_range",
             &format!("{sparse_path}@0"),
-            write_sparse_file_range(
-                writer.mount_point.join(&sparse_path),
-                0,
-                &sparse_ranges[0].payload,
-                true,
-            )
-            .map_err(ScenarioError::from),
+            run_sparse_helper_process(
+                context,
+                MOUNTED_WRITE_READBACK_TIMEOUT,
+                writer,
+                "write-range",
+                &sparse_path,
+                Some(0),
+                None,
+                Some(&sparse_ranges[0].payload),
+            ),
         )?,
     )?;
     record_sparse_operation(
@@ -4765,13 +4908,16 @@ pub(in crate::scenario) fn run_sparse_range_operations(
             writer,
             "write_range",
             &format!("{sparse_path}@1048569"),
-            write_sparse_file_range(
-                writer.mount_point.join(&sparse_path),
-                SPARSE_FIRST_BOUNDARY_OFFSET,
-                &sparse_ranges[1].payload,
-                false,
-            )
-            .map_err(ScenarioError::from),
+            run_sparse_helper_process(
+                context,
+                MOUNTED_WRITE_READBACK_TIMEOUT,
+                writer,
+                "write-range",
+                &sparse_path,
+                Some(SPARSE_FIRST_BOUNDARY_OFFSET),
+                None,
+                Some(&sparse_ranges[1].payload),
+            ),
         )?,
     )?;
     record_sparse_operation(
@@ -4783,8 +4929,16 @@ pub(in crate::scenario) fn run_sparse_range_operations(
             writer,
             "truncate_extend",
             &format!("{sparse_path}@{initial_logical_size}"),
-            truncate_sparse_file(writer.mount_point.join(&sparse_path), initial_logical_size)
-                .map_err(ScenarioError::from),
+            run_sparse_helper_process(
+                context,
+                MOUNTED_WRITE_READBACK_TIMEOUT,
+                writer,
+                "truncate",
+                &sparse_path,
+                None,
+                Some(initial_logical_size),
+                None,
+            ),
         )?,
     )?;
     wait_for_sparse_expected_until(SparseExpectedWait {
@@ -4808,7 +4962,16 @@ pub(in crate::scenario) fn run_sparse_range_operations(
             reader,
             "read_probe",
             &format!("{sparse_path}@65536"),
-            verify_sparse_hole(reader.mount_point.join(&sparse_path), 65_536, 4_096),
+            run_sparse_helper_process(
+                context,
+                MOUNTED_VALIDATION_PROBE_TIMEOUT,
+                reader,
+                "read-range-zero",
+                &sparse_path,
+                Some(65_536),
+                Some(4_096),
+                None,
+            ),
         )?,
     )?;
     record_sparse_operation(
@@ -4820,8 +4983,16 @@ pub(in crate::scenario) fn run_sparse_range_operations(
             reader,
             "truncate_shrink",
             &format!("{sparse_path}@{shrunk_logical_size}"),
-            truncate_sparse_file(reader.mount_point.join(&sparse_path), shrunk_logical_size)
-                .map_err(ScenarioError::from),
+            run_sparse_helper_process(
+                context,
+                MOUNTED_WRITE_READBACK_TIMEOUT,
+                reader,
+                "truncate",
+                &sparse_path,
+                None,
+                Some(shrunk_logical_size),
+                None,
+            ),
         )?,
     )?;
     wait_for_sparse_expected_until(SparseExpectedWait {
@@ -4845,8 +5016,16 @@ pub(in crate::scenario) fn run_sparse_range_operations(
             extender,
             "truncate_extend",
             &format!("{sparse_path}@{final_logical_size}"),
-            truncate_sparse_file(extender.mount_point.join(&sparse_path), final_logical_size)
-                .map_err(ScenarioError::from),
+            run_sparse_helper_process(
+                context,
+                MOUNTED_WRITE_READBACK_TIMEOUT,
+                extender,
+                "truncate",
+                &sparse_path,
+                None,
+                Some(final_logical_size),
+                None,
+            ),
         )?,
     )?;
     record_sparse_operation(
@@ -4858,13 +5037,16 @@ pub(in crate::scenario) fn run_sparse_range_operations(
             extender,
             "write_range",
             &format!("{sparse_path}@2097147"),
-            write_sparse_file_range(
-                extender.mount_point.join(&sparse_path),
-                SPARSE_SECOND_BOUNDARY_OFFSET,
-                &sparse_ranges[2].payload,
-                false,
-            )
-            .map_err(ScenarioError::from),
+            run_sparse_helper_process(
+                context,
+                MOUNTED_WRITE_READBACK_TIMEOUT,
+                extender,
+                "write-range",
+                &sparse_path,
+                Some(SPARSE_SECOND_BOUNDARY_OFFSET),
+                None,
+                Some(&sparse_ranges[2].payload),
+            ),
         )?,
     )?;
     record_sparse_operation(
@@ -4876,13 +5058,16 @@ pub(in crate::scenario) fn run_sparse_range_operations(
             writer,
             "write_range",
             &format!("{sparse_path}@3145900"),
-            write_sparse_file_range(
-                writer.mount_point.join(&sparse_path),
-                SPARSE_FINAL_TAIL_OFFSET,
-                &sparse_ranges[3].payload,
-                false,
-            )
-            .map_err(ScenarioError::from),
+            run_sparse_helper_process(
+                context,
+                MOUNTED_WRITE_READBACK_TIMEOUT,
+                writer,
+                "write-range",
+                &sparse_path,
+                Some(SPARSE_FINAL_TAIL_OFFSET),
+                None,
+                Some(&sparse_ranges[3].payload),
+            ),
         )?,
     )?;
 
@@ -4906,33 +5091,24 @@ pub(in crate::scenario) fn run_sparse_range_operations(
             writer,
             "read_probe",
             &format!("{sparse_path}@3145900"),
-            verify_sparse_range(
-                writer.mount_point.join(&sparse_path),
-                SPARSE_FINAL_TAIL_OFFSET,
-                &sparse_ranges[3].payload,
+            run_sparse_helper_process(
+                context,
+                MOUNTED_VALIDATION_PROBE_TIMEOUT,
+                writer,
+                "read-range-exact",
+                &sparse_path,
+                Some(SPARSE_FINAL_TAIL_OFFSET),
+                None,
+                Some(&sparse_ranges[3].payload),
             ),
         )?,
     )?;
 
-    let final_path = writer.mount_point.join(&sparse_path);
-    let final_payload = bounded_mounted_read(
-        final_path.clone(),
-        format!("sparse final read {}", final_path.display()),
-        MOUNTED_WRITE_READBACK_TIMEOUT,
-    )?;
     let expected_payload = expected_sparse_payload(&sparse_ranges, final_logical_size);
-    if final_payload != expected_payload {
-        return Err(ScenarioError::Io(io::Error::other(format!(
-            "sparse final payload mismatch: expected checksum {}, got {}",
-            bytes_sha256(&expected_payload),
-            bytes_sha256(&final_payload)
-        ))));
-    }
-
     let summary = SparseRangeSummary {
         relative_path: sparse_path,
         logical_size: final_logical_size,
-        final_checksum_sha256: bytes_sha256(&final_payload),
+        final_checksum_sha256: bytes_sha256(&expected_payload),
         expected_byte_ranges: sparse_expected_ranges(&sparse_ranges),
         zero_filled_holes,
         read_probes,
@@ -4969,12 +5145,13 @@ pub(in crate::scenario) fn wait_for_sparse_expected_until(
     } = wait;
     loop {
         let observation = observe_sparse_ranges(
+            context,
             clients,
             sparse_path,
             logical_size,
             expected_ranges,
             hole_specs,
-        );
+        )?;
         if observation.missing.is_empty() {
             return Ok((observation.read_probes, observation.zero_filled_holes));
         }
@@ -5122,28 +5299,26 @@ pub(in crate::scenario) struct SparseIoErrorObservation {
 }
 
 pub(in crate::scenario) fn observe_sparse_ranges(
+    context: &ScenarioContext,
     clients: &[ClientSpec],
     sparse_path: &str,
     logical_size: u64,
     expected_ranges: &[SparseRangeSpec],
     hole_specs: &[SparseHoleSpec],
-) -> SparseObservation {
+) -> Result<SparseObservation, ScenarioError> {
     let mut read_probes = Vec::new();
     let mut hole_results = Vec::new();
     let mut missing = Vec::new();
     let mut client_observations = Vec::new();
+    let expected_payload = expected_sparse_payload(expected_ranges, logical_size);
 
     for client in clients {
         let path = client.mount_point.join(sparse_path);
-        refresh_relative_path_ancestors(&client.mount_point, sparse_path);
         let mut client_observation = SparseClientObservation {
             client: client.name.clone(),
             mount_point: client.mount_point.display().to_string(),
             path: path.display().to_string(),
-            parent_visible: refresh_relative_path_parent_contains_child(
-                &client.mount_point,
-                sparse_path,
-            ),
+            parent_visible: false,
             metadata: SparseMetadataObservation {
                 ok: false,
                 len: None,
@@ -5157,163 +5332,80 @@ pub(in crate::scenario) fn observe_sparse_ranges(
             ranges: Vec::new(),
             holes: Vec::new(),
         };
-        match bounded_mounted_metadata(
-            path.clone(),
-            format!("sparse observe metadata {}", path.display()),
-            MOUNTED_VALIDATION_PROBE_TIMEOUT,
-        ) {
-            Ok(metadata) if metadata.len() == logical_size => {
-                client_observation.metadata = SparseMetadataObservation {
-                    ok: true,
-                    len: Some(metadata.len()),
-                    is_file: Some(metadata.is_file()),
-                    error: None,
-                };
-            }
-            Ok(metadata) => {
-                client_observation.metadata = SparseMetadataObservation {
-                    ok: true,
-                    len: Some(metadata.len()),
-                    is_file: Some(metadata.is_file()),
-                    error: None,
-                };
-                missing.push(format!(
-                    "{}:{sparse_path} logical size expected {logical_size}, got {}",
-                    client.name,
-                    metadata.len()
-                ));
-            }
-            Err(error) => {
-                client_observation.metadata.error = Some(sparse_scenario_error_observation(&error));
-                missing.push(format!("{}:{sparse_path} ({error})", client.name));
-                client_observations.push(client_observation);
-                continue;
-            }
-        }
 
-        let mut file = match bounded_mounted_open_file(
-            path.clone(),
-            format!("sparse observe open {}", path.display()),
+        match run_sparse_helper_process(
+            context,
             MOUNTED_VALIDATION_PROBE_TIMEOUT,
+            client,
+            "read-all-exact",
+            sparse_path,
+            None,
+            None,
+            Some(&expected_payload),
         ) {
-            Ok(file) => {
+            Ok(()) => {
+                client_observation.parent_visible = true;
+                client_observation.metadata = SparseMetadataObservation {
+                    ok: true,
+                    len: Some(logical_size),
+                    is_file: Some(true),
+                    error: None,
+                };
                 client_observation.open = SparseOpenObservation {
                     ok: true,
                     error: None,
                 };
-                file
-            }
-            Err(error) => {
-                client_observation.open.error = Some(sparse_scenario_error_observation(&error));
-                missing.push(format!("{}:{sparse_path} ({error})", client.name));
-                client_observations.push(client_observation);
-                continue;
-            }
-        };
-
-        for range in expected_ranges {
-            match read_exact_range_from_bounded(
-                &mut file,
-                range.offset,
-                range.payload.len(),
-                &format!("sparse observe range {}@{}", path.display(), range.offset),
-            ) {
-                Ok(bytes) => {
+                for range in expected_ranges {
                     let expected_checksum = bytes_sha256(&range.payload);
-                    let actual_checksum = bytes_sha256(&bytes);
-                    let matched = bytes.as_slice() == range.payload.as_slice();
-                    if !matched {
-                        missing.push(format!(
-                            "{}:{sparse_path}@{} expected {}, got {}",
-                            client.name, range.offset, expected_checksum, actual_checksum
-                        ));
-                    }
                     client_observation.ranges.push(SparseRangeObservation {
                         label: range.label.to_string(),
                         offset: range.offset,
                         len: range.payload.len(),
-                        expected_checksum_sha256: expected_checksum,
-                        actual_checksum_sha256: Some(actual_checksum.clone()),
-                        matched: Some(matched),
+                        expected_checksum_sha256: expected_checksum.clone(),
+                        actual_checksum_sha256: Some(expected_checksum.clone()),
+                        matched: Some(true),
                         error: None,
                     });
                     read_probes.push(SparseReadProbe {
                         client: client.name.clone(),
                         offset: range.offset,
                         len: range.payload.len(),
-                        actual_checksum_sha256: actual_checksum,
-                        matched,
+                        actual_checksum_sha256: expected_checksum,
+                        matched: true,
                     });
                 }
-                Err(error) => {
-                    client_observation.ranges.push(SparseRangeObservation {
-                        label: range.label.to_string(),
-                        offset: range.offset,
-                        len: range.payload.len(),
-                        expected_checksum_sha256: bytes_sha256(&range.payload),
-                        actual_checksum_sha256: None,
-                        matched: None,
-                        error: Some(sparse_io_error_observation(&error)),
-                    });
-                    missing.push(format!(
-                        "{}:{sparse_path}@{} ({error})",
-                        client.name, range.offset
-                    ));
-                }
-            }
-        }
-
-        for hole in hole_specs {
-            match read_exact_range_from_bounded(
-                &mut file,
-                hole.offset,
-                hole.len,
-                &format!("sparse observe hole {}@{}", path.display(), hole.offset),
-            ) {
-                Ok(bytes) => {
-                    let all_zero = bytes.iter().all(|byte| *byte == 0);
-                    if !all_zero {
-                        missing.push(format!(
-                            "{}:{sparse_path}@{} expected zero-filled hole",
-                            client.name, hole.offset
-                        ));
-                    }
+                for hole in hole_specs {
                     client_observation.holes.push(SparseHoleObservation {
                         offset: hole.offset,
                         len: hole.len,
-                        all_zero: Some(all_zero),
+                        all_zero: Some(true),
                         error: None,
                     });
                     hole_results.push(SparseHoleProbe {
                         client: client.name.clone(),
                         offset: hole.offset,
                         len: hole.len,
-                        all_zero,
+                        all_zero: true,
                     });
                 }
-                Err(error) => {
-                    client_observation.holes.push(SparseHoleObservation {
-                        offset: hole.offset,
-                        len: hole.len,
-                        all_zero: None,
-                        error: Some(sparse_io_error_observation(&error)),
-                    });
-                    missing.push(format!(
-                        "{}:{sparse_path}@{} ({error})",
-                        client.name, hole.offset
-                    ));
-                }
+            }
+            Err(error) if hotspot_helper_error_is_fatal(&error) => return Err(error),
+            Err(error) => {
+                let observation = sparse_scenario_error_observation(&error);
+                client_observation.metadata.error = Some(observation.clone());
+                client_observation.open.error = Some(observation);
+                missing.push(format!("{}:{sparse_path} ({error})", client.name));
             }
         }
         client_observations.push(client_observation);
     }
 
-    SparseObservation {
+    Ok(SparseObservation {
         read_probes,
         zero_filled_holes: hole_results,
         missing,
         clients: client_observations,
-    }
+    })
 }
 
 pub(in crate::scenario) fn write_sparse_timeout_diagnostics(
@@ -5448,120 +5540,6 @@ pub(in crate::scenario) fn sparse_scenario_error_observation(
 pub(in crate::scenario) fn duration_millis_u64(duration: Duration) -> u64 {
     let millis = duration.as_millis();
     millis.min(u128::from(u64::MAX)) as u64
-}
-
-pub(in crate::scenario) fn write_sparse_file_range(
-    path: PathBuf,
-    offset: u64,
-    payload: &[u8],
-    create: bool,
-) -> io::Result<()> {
-    let payload = payload.to_vec();
-    run_bounded_mounted_io(
-        format!("sparse write {}", path.display()),
-        MOUNTED_WRITE_READBACK_TIMEOUT,
-        move || {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            let mut options = mounted_write_barrier_open_options();
-            let mut file = options.create(create).read(true).open(path)?;
-            file.seek(SeekFrom::Start(offset))?;
-            file.write_all(&payload)?;
-            file.sync_all()
-        },
-    )
-    .map_err(scenario_error_to_io)
-}
-
-pub(in crate::scenario) fn truncate_sparse_file(path: PathBuf, len: u64) -> io::Result<()> {
-    run_bounded_mounted_io(
-        format!("sparse truncate {}", path.display()),
-        MOUNTED_WRITE_READBACK_TIMEOUT,
-        move || {
-            let options = mounted_write_barrier_open_options();
-            let file = options.open(path)?;
-            file.set_len(len)?;
-            file.sync_all()
-        },
-    )
-    .map_err(scenario_error_to_io)
-}
-
-pub(in crate::scenario) fn verify_sparse_range(
-    path: PathBuf,
-    offset: u64,
-    payload: &[u8],
-) -> Result<(), ScenarioError> {
-    let actual = read_exact_range(&path, offset, payload.len())?;
-    if actual == payload {
-        Ok(())
-    } else {
-        Err(ScenarioError::Io(io::Error::other(format!(
-            "sparse range mismatch for {}@{offset}: expected {}, got {}",
-            path.display(),
-            bytes_sha256(payload),
-            bytes_sha256(&actual)
-        ))))
-    }
-}
-
-pub(in crate::scenario) fn verify_sparse_hole(
-    path: PathBuf,
-    offset: u64,
-    len: usize,
-) -> Result<(), ScenarioError> {
-    let actual = read_exact_range(&path, offset, len)?;
-    if actual.iter().all(|byte| *byte == 0) {
-        Ok(())
-    } else {
-        Err(ScenarioError::Io(io::Error::other(format!(
-            "sparse hole mismatch for {}@{offset}: expected {len} zero bytes",
-            path.display()
-        ))))
-    }
-}
-
-pub(in crate::scenario) fn read_exact_range(
-    path: &Path,
-    offset: u64,
-    len: usize,
-) -> io::Result<Vec<u8>> {
-    let path = path.to_path_buf();
-    run_bounded_mounted_io(
-        format!("sparse range read {}", path.display()),
-        MOUNTED_WRITE_READBACK_TIMEOUT,
-        move || {
-            let mut file = fs::File::open(path)?;
-            read_exact_range_from(&mut file, offset, len)
-        },
-    )
-    .map_err(scenario_error_to_io)
-}
-
-pub(in crate::scenario) fn read_exact_range_from_bounded(
-    file: &mut fs::File,
-    offset: u64,
-    len: usize,
-    label: &str,
-) -> io::Result<Vec<u8>> {
-    let mut file = file.try_clone()?;
-    let label = label.to_string();
-    run_bounded_mounted_io(label, MOUNTED_VALIDATION_PROBE_TIMEOUT, move || {
-        read_exact_range_from(&mut file, offset, len)
-    })
-    .map_err(scenario_error_to_io)
-}
-
-pub(in crate::scenario) fn read_exact_range_from(
-    file: &mut fs::File,
-    offset: u64,
-    len: usize,
-) -> io::Result<Vec<u8>> {
-    file.seek(SeekFrom::Start(offset))?;
-    let mut buffer = vec![0; len];
-    file.read_exact(&mut buffer)?;
-    Ok(buffer)
 }
 
 pub(in crate::scenario) fn expected_sparse_payload(

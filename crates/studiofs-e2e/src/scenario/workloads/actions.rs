@@ -173,15 +173,6 @@ pub(in crate::scenario) fn bounded_mounted_read_dir_names(
     })
 }
 
-pub(in crate::scenario) fn bounded_mounted_open_file(
-    path: PathBuf,
-    label: impl Into<String>,
-    timeout: Duration,
-) -> Result<fs::File, ScenarioError> {
-    let label = label.into();
-    run_bounded_mounted_io(label, timeout, move || fs::File::open(path))
-}
-
 fn join_bounded_mounted_io_worker(worker: thread::JoinHandle<()>) -> Result<(), ScenarioError> {
     worker
         .join()
@@ -459,6 +450,21 @@ pub fn run_hotspot_op_helper_with_timeout(
 
     let _ = timeout;
     run_hotspot_op_helper(operation, mount_point, path, target, payload, progress)
+}
+
+/// Executes one mounted sparse filesystem operation in a helper process.
+pub fn run_sparse_op_helper_with_timeout(
+    operation: &str,
+    mount_point: PathBuf,
+    path: &str,
+    offset: Option<u64>,
+    len: Option<u64>,
+    payload: Option<&Path>,
+    progress: Option<&Path>,
+    timeout: Option<Duration>,
+) -> Result<(), anyhow::Error> {
+    let _ = timeout;
+    run_sparse_op_helper(operation, mount_point, path, offset, len, payload, progress)
 }
 
 #[cfg(windows)]
@@ -853,6 +859,162 @@ pub fn run_hotspot_op_helper(
         other => anyhow::bail!("unsupported hotspot operation: {other}"),
     }
     record_hotspot_helper_progress(progress, "completed", operation, &path, target, None)?;
+    Ok(())
+}
+
+/// Executes one mounted sparse filesystem operation without an internal timeout guard.
+pub fn run_sparse_op_helper(
+    operation: &str,
+    mount_point: PathBuf,
+    path: &str,
+    offset: Option<u64>,
+    len: Option<u64>,
+    payload: Option<&Path>,
+    progress: Option<&Path>,
+) -> Result<(), anyhow::Error> {
+    let path = mount_point.join(path);
+    record_hotspot_helper_progress(
+        progress,
+        "started",
+        operation,
+        &path,
+        None,
+        len.map(|v| v as usize),
+    )?;
+    match operation {
+        "write-range" => {
+            let offset = offset.ok_or_else(|| anyhow::anyhow!("missing offset"))?;
+            let payload_path = payload.ok_or_else(|| anyhow::anyhow!("missing payload"))?;
+            record_hotspot_helper_progress(
+                progress,
+                "before_read_payload",
+                operation,
+                &path,
+                None,
+                None,
+            )?;
+            let payload = fs::read(payload_path)?;
+            record_hotspot_helper_progress(
+                progress,
+                "after_read_payload",
+                operation,
+                &path,
+                None,
+                Some(payload.len()),
+            )?;
+            write_sparse_range_with_progress(&path, offset, &payload, progress, operation)?;
+        }
+        "truncate" => {
+            let len = len.ok_or_else(|| anyhow::anyhow!("missing len"))?;
+            truncate_sparse_with_progress(&path, len, progress, operation)?;
+        }
+        "read-range-exact" => {
+            let offset = offset.ok_or_else(|| anyhow::anyhow!("missing offset"))?;
+            let payload_path = payload.ok_or_else(|| anyhow::anyhow!("missing payload"))?;
+            record_hotspot_helper_progress(
+                progress,
+                "before_read_expected_payload",
+                operation,
+                &path,
+                None,
+                None,
+            )?;
+            let expected = fs::read(payload_path)?;
+            record_hotspot_helper_progress(
+                progress,
+                "after_read_expected_payload",
+                operation,
+                &path,
+                None,
+                Some(expected.len()),
+            )?;
+            let actual = read_sparse_range_with_progress(
+                &path,
+                offset,
+                expected.len(),
+                progress,
+                operation,
+            )?;
+            if actual != expected {
+                anyhow::bail!(
+                    "read-range-exact mismatch for {}@{}: expected {} bytes, read {} bytes",
+                    path.display(),
+                    offset,
+                    expected.len(),
+                    actual.len()
+                );
+            }
+        }
+        "read-range-zero" => {
+            let offset = offset.ok_or_else(|| anyhow::anyhow!("missing offset"))?;
+            let len = len.ok_or_else(|| anyhow::anyhow!("missing len"))?;
+            let len = usize::try_from(len)
+                .map_err(|_| anyhow::anyhow!("sparse read length is too large"))?;
+            let actual = read_sparse_range_with_progress(&path, offset, len, progress, operation)?;
+            if !actual.iter().all(|byte| *byte == 0) {
+                anyhow::bail!(
+                    "read-range-zero mismatch for {}@{}: expected {} zero bytes",
+                    path.display(),
+                    offset,
+                    len
+                );
+            }
+        }
+        "read-all-exact" => {
+            let payload_path = payload.ok_or_else(|| anyhow::anyhow!("missing payload"))?;
+            record_hotspot_helper_progress(
+                progress,
+                "before_read_expected_payload",
+                operation,
+                &path,
+                None,
+                None,
+            )?;
+            let expected = fs::read(payload_path)?;
+            record_hotspot_helper_progress(
+                progress,
+                "after_read_expected_payload",
+                operation,
+                &path,
+                None,
+                Some(expected.len()),
+            )?;
+            record_hotspot_helper_progress(
+                progress,
+                "before_read_all",
+                operation,
+                &path,
+                None,
+                None,
+            )?;
+            let actual = fs::read(&path)?;
+            record_hotspot_helper_progress(
+                progress,
+                "after_read_all",
+                operation,
+                &path,
+                None,
+                Some(actual.len()),
+            )?;
+            if actual != expected {
+                anyhow::bail!(
+                    "read-all-exact mismatch for {}: expected {} bytes, read {} bytes",
+                    path.display(),
+                    expected.len(),
+                    actual.len()
+                );
+            }
+        }
+        other => anyhow::bail!("unsupported sparse operation: {other}"),
+    }
+    record_hotspot_helper_progress(
+        progress,
+        "completed",
+        operation,
+        &path,
+        None,
+        len.map(|v| v as usize),
+    )?;
     Ok(())
 }
 
@@ -1261,6 +1423,169 @@ pub(in crate::scenario) fn append_payload_with_progress(
     record_hotspot_helper_progress(progress, "before_sync_all", operation, path, target, None)?;
     file.sync_all()?;
     record_hotspot_helper_progress(progress, "after_sync_all", operation, path, target, None)
+}
+
+pub(in crate::scenario) fn write_sparse_range_with_progress(
+    path: &Path,
+    offset: u64,
+    payload: &[u8],
+    progress: Option<&Path>,
+    operation: &str,
+) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        record_hotspot_helper_progress(
+            progress,
+            "before_create_parent",
+            operation,
+            path,
+            None,
+            None,
+        )?;
+        fs::create_dir_all(parent)?;
+        record_hotspot_helper_progress(
+            progress,
+            "after_create_parent",
+            operation,
+            path,
+            None,
+            None,
+        )?;
+    }
+    record_hotspot_helper_progress(
+        progress,
+        "before_open_sparse_write",
+        operation,
+        path,
+        None,
+        Some(payload.len()),
+    )?;
+    let mut options = mounted_write_barrier_open_options();
+    let mut file = options.create(true).read(true).open(path)?;
+    record_hotspot_helper_progress(
+        progress,
+        "after_open_sparse_write",
+        operation,
+        path,
+        None,
+        Some(payload.len()),
+    )?;
+    record_hotspot_helper_progress(progress, "before_seek", operation, path, None, None)?;
+    file.seek(SeekFrom::Start(offset))?;
+    record_hotspot_helper_progress(progress, "after_seek", operation, path, None, None)?;
+    record_hotspot_helper_progress(
+        progress,
+        "before_write_all",
+        operation,
+        path,
+        None,
+        Some(payload.len()),
+    )?;
+    file.write_all(payload)?;
+    record_hotspot_helper_progress(
+        progress,
+        "after_write_all",
+        operation,
+        path,
+        None,
+        Some(payload.len()),
+    )?;
+    record_hotspot_helper_progress(progress, "before_sync_all", operation, path, None, None)?;
+    file.sync_all()?;
+    record_hotspot_helper_progress(progress, "after_sync_all", operation, path, None, None)
+}
+
+pub(in crate::scenario) fn truncate_sparse_with_progress(
+    path: &Path,
+    len: u64,
+    progress: Option<&Path>,
+    operation: &str,
+) -> io::Result<()> {
+    record_hotspot_helper_progress(
+        progress,
+        "before_open_sparse_truncate",
+        operation,
+        path,
+        None,
+        None,
+    )?;
+    let options = mounted_write_barrier_open_options();
+    let file = options.open(path)?;
+    record_hotspot_helper_progress(
+        progress,
+        "after_open_sparse_truncate",
+        operation,
+        path,
+        None,
+        None,
+    )?;
+    record_hotspot_helper_progress(
+        progress,
+        "before_set_len",
+        operation,
+        path,
+        None,
+        Some(len as usize),
+    )?;
+    file.set_len(len)?;
+    record_hotspot_helper_progress(
+        progress,
+        "after_set_len",
+        operation,
+        path,
+        None,
+        Some(len as usize),
+    )?;
+    record_hotspot_helper_progress(progress, "before_sync_all", operation, path, None, None)?;
+    file.sync_all()?;
+    record_hotspot_helper_progress(progress, "after_sync_all", operation, path, None, None)
+}
+
+pub(in crate::scenario) fn read_sparse_range_with_progress(
+    path: &Path,
+    offset: u64,
+    len: usize,
+    progress: Option<&Path>,
+    operation: &str,
+) -> io::Result<Vec<u8>> {
+    record_hotspot_helper_progress(
+        progress,
+        "before_open_sparse_read",
+        operation,
+        path,
+        None,
+        Some(len),
+    )?;
+    let mut file = fs::File::open(path)?;
+    record_hotspot_helper_progress(
+        progress,
+        "after_open_sparse_read",
+        operation,
+        path,
+        None,
+        Some(len),
+    )?;
+    record_hotspot_helper_progress(progress, "before_seek", operation, path, None, None)?;
+    file.seek(SeekFrom::Start(offset))?;
+    record_hotspot_helper_progress(progress, "after_seek", operation, path, None, None)?;
+    record_hotspot_helper_progress(
+        progress,
+        "before_read_exact",
+        operation,
+        path,
+        None,
+        Some(len),
+    )?;
+    let mut buffer = vec![0; len];
+    file.read_exact(&mut buffer)?;
+    record_hotspot_helper_progress(
+        progress,
+        "after_read_exact",
+        operation,
+        path,
+        None,
+        Some(len),
+    )?;
+    Ok(buffer)
 }
 
 pub(in crate::scenario) fn record_hotspot_helper_progress(

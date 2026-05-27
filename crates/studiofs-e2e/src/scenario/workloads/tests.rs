@@ -151,6 +151,66 @@ fn isolated_sparse_ranges_fit_each_phase_logical_size() {
 }
 
 #[test]
+fn sparse_helper_ops_cover_range_write_truncate_and_probes() {
+    let temp = tempdir().unwrap();
+    let mount = temp.path().join("mount");
+    std::fs::create_dir_all(&mount).unwrap();
+    let progress = temp.path().join("sparse-progress.jsonl");
+    let payload_path = temp.path().join("payload.bin");
+    std::fs::write(&payload_path, b"boundary").unwrap();
+
+    run_sparse_op_helper(
+        "write-range",
+        mount.clone(),
+        "sparse/shared.bin",
+        Some(1024),
+        None,
+        Some(&payload_path),
+        Some(&progress),
+    )
+    .unwrap();
+    run_sparse_op_helper(
+        "truncate",
+        mount.clone(),
+        "sparse/shared.bin",
+        None,
+        Some(4096),
+        None,
+        Some(&progress),
+    )
+    .unwrap();
+    run_sparse_op_helper(
+        "read-range-zero",
+        mount.clone(),
+        "sparse/shared.bin",
+        Some(0),
+        Some(512),
+        None,
+        Some(&progress),
+    )
+    .unwrap();
+    run_sparse_op_helper(
+        "read-range-exact",
+        mount,
+        "sparse/shared.bin",
+        Some(1024),
+        None,
+        Some(&payload_path),
+        Some(&progress),
+    )
+    .unwrap();
+
+    let bytes = std::fs::read(temp.path().join("mount/sparse/shared.bin")).unwrap();
+    assert_eq!(bytes.len(), 4096);
+    assert_eq!(&bytes[1024..1032], b"boundary");
+    let progress = std::fs::read_to_string(progress).unwrap();
+    assert!(progress.contains("\"operation\":\"write-range\""));
+    assert!(progress.contains("\"operation\":\"truncate\""));
+    assert!(progress.contains("\"operation\":\"read-range-zero\""));
+    assert!(progress.contains("\"operation\":\"read-range-exact\""));
+}
+
+#[test]
 fn sparse_wait_timeout_writes_diagnostics_artifacts() {
     let temp = tempdir().unwrap();
     let sandbox = temp.path().join("run-1");
@@ -212,7 +272,13 @@ fn sparse_wait_timeout_writes_diagnostics_artifacts() {
     assert_eq!(diagnostics["clients"][0]["parent_visible"], false);
     assert_eq!(
         diagnostics["clients"][0]["metadata"]["error"]["kind"],
-        "NotFound"
+        "Other"
+    );
+    assert!(
+        diagnostics["clients"][0]["metadata"]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("read-all-exact")
     );
 
     let operations_log =
