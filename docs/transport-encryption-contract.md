@@ -27,8 +27,14 @@ Plain HTTP is allowed only for explicit local/test loopback endpoints:
 - IPv4 loopback in `127.0.0.0/8`;
 - IPv6 loopback `::1`.
 
+IPv4-mapped IPv6 loopback addresses must be normalized to their embedded IPv4
+address before classification. For example, `::ffff:127.0.0.1` is a loopback
+endpoint, while `::ffff:192.168.1.50` is not.
+
 memory:// remains a test-only operator path and is not a production transport
-exception.
+exception. The init/configuration layer rejects memory:// for production
+user-supplied endpoints; explicit test utilities may still construct an
+in-memory operator directly.
 
 Examples:
 
@@ -56,7 +62,13 @@ Accepted local/test loopback DSNs are limited to hosts classified as:
 
 - `localhost`;
 - IPv4 loopback in `127.0.0.0/8`;
-- IPv6 loopback `::1`.
+- IPv6 loopback `::1`;
+- Unix domain sockets, such as keyword DSN `host=/var/run/postgresql` on Unix
+  systems or an implicit socket-based default where the PostgreSQL driver
+  resolves the connection locally.
+
+IPv4-mapped IPv6 loopback addresses must be normalized to their embedded IPv4
+address before classification for PostgreSQL DSNs as well.
 
 There must be no silent downgrade for remote hosts. A PostgreSQL connection
 layer must not fall back from TLS to cleartext for non-local DSNs if TLS setup
@@ -73,6 +85,7 @@ Examples:
 | `host=127.0.0.1 user=studiofs sslmode=disable` | local/test loopback cleartext | accepted |
 | `host=127.42.0.7 user=studiofs sslmode=disable` | local/test loopback cleartext | accepted |
 | `host=::1 user=studiofs sslmode=disable` | local/test loopback cleartext | accepted |
+| `host=/var/run/postgresql user=studiofs sslmode=disable` | local Unix domain socket | accepted on Unix |
 
 PostgreSQL is sensitive even though StudioFS does not encrypt PostgreSQL
 metadata at rest. PostgreSQL stores shared namespace metadata and active volume
@@ -88,7 +101,8 @@ Actionable errors must identify:
 - whether the rejected transport is S3-compatible object storage or PostgreSQL;
 - the endpoint or DSN host;
 - the rejected insecure mode, such as plain HTTP or `sslmode=disable`;
-- the accepted local exception: `localhost`, `127.0.0.0/8`, or `::1`.
+- the accepted local exception: `localhost`, `127.0.0.0/8`, `::1`, normalized
+  IPv4-mapped IPv6 loopback addresses, or Unix domain sockets for PostgreSQL.
 
 Errors must reject insecure links without logging credentials or key material.
 They must not log DSN passwords, access keys, secret keys, volume keys, or raw
