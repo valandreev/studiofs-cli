@@ -1,5 +1,6 @@
 use super::PgMetaEngine;
 use crate::engine::{MetaEngineCore, MetaError, MetaResult};
+use crate::pg_transport::connect_studiofs_postgres;
 use crate::types::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
@@ -121,19 +122,13 @@ impl PgMetaEngine {
                                 _ = cancel_for_task.cancelled() => return Ok(()),
                                 r = tokio::time::timeout(
                                     connect_timeout,
-                                    tokio_postgres::connect(&postgres_url, tokio_postgres::NoTls),
+                                    connect_studiofs_postgres(&postgres_url),
                                 ) => r,
                             };
                             let (client, mut connection) = connect_result
                                 .map_err(|_| {
                                     Self::pg_timeout_error("lock notify connect", connect_timeout)
-                                })?
-                                .map_err(|e| {
-                                    MetaError::Storage(format!(
-                                        "postgres lock notify connect failed: {}",
-                                        Self::format_pg_error(e)
-                                    ))
-                                })?;
+                                })??;
 
                             let Some(engine_arc) = weak_engine.upgrade() else {
                                 return Ok(());

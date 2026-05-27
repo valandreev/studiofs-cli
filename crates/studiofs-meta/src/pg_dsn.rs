@@ -1,4 +1,4 @@
-use crate::{MetaError, MetaResult};
+use crate::{MetaError, MetaResult, connect_studiofs_postgres};
 use std::str::FromStr;
 
 /// Canonical PostgreSQL database name used for StudioFS metadata.
@@ -44,9 +44,7 @@ pub fn resolve_studiofs_pg_dsns(input: &str) -> MetaResult<StudioPgDsns> {
 /// Ensure the `studiofs` PostgreSQL database exists and return both DSNs.
 pub async fn ensure_studiofs_database(input: &str) -> MetaResult<StudioPgDsns> {
     let dsns = resolve_studiofs_pg_dsns(input)?;
-    let (client, connection) = tokio_postgres::connect(&dsns.admin_dsn, tokio_postgres::NoTls)
-        .await
-        .map_err(|e| MetaError::Storage(format!("postgres connect failed: {e}")))?;
+    let (client, connection) = connect_studiofs_postgres(&dsns.admin_dsn).await?;
     let conn_task = tokio::spawn(async move {
         let _ = connection.await;
     });
@@ -168,6 +166,24 @@ mod tests {
         .expect("resolve keyword dsn");
         assert!(dsns.admin_dsn.contains("dbname=postgres"));
         assert!(dsns.metadata_dsn.contains("dbname=studiofs"));
+        assert!(dsns.admin_dsn.contains("sslmode=disable"));
+        assert!(dsns.metadata_dsn.contains("sslmode=disable"));
+    }
+
+    #[test]
+    fn test_resolve_url_dsn_preserves_transport_query_options() {
+        let dsns = resolve_studiofs_pg_dsns(
+            "postgres://u:p@db.example.com:5432/original?sslmode=require&application_name=studiofs",
+        )
+        .expect("resolve url dsn");
+        assert_eq!(
+            dsns.admin_dsn,
+            "postgres://u:p@db.example.com:5432/postgres?sslmode=require&application_name=studiofs"
+        );
+        assert_eq!(
+            dsns.metadata_dsn,
+            "postgres://u:p@db.example.com:5432/studiofs?sslmode=require&application_name=studiofs"
+        );
     }
 
     #[test]

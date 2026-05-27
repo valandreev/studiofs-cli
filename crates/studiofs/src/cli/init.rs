@@ -13,7 +13,8 @@ use studiofs_data::{DataStore, DataStoreConfig, DataStoreCryptoConfig};
 use studiofs_meta::{
     CURRENT_FORMAT_VERSION, DEFAULT_BLOCK_SIZE, ENCRYPTION_KEY_LENGTH, EncryptionConfig,
     FormatInfo, MetaFormat, MetaOpenOptions, MetadataBackend, MetadataConfig, PostgresConfig,
-    RedbMetaEngine, ensure_studiofs_database, open_meta_engine_with_options,
+    RedbMetaEngine, connect_studiofs_postgres, ensure_studiofs_database,
+    open_meta_engine_with_options,
 };
 use tracing::info;
 use uuid::Uuid;
@@ -236,7 +237,7 @@ fn ensure_bucket_accessible(
 
 fn check_postgres_accessible(rt: &tokio::runtime::Runtime, dsn: &str) -> anyhow::Result<()> {
     rt.block_on(async {
-        let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+        let (client, connection) = connect_studiofs_postgres(dsn)
             .await
             .map_err(|e| anyhow::anyhow!("cannot connect to postgres: {e}"))?;
 
@@ -258,7 +259,7 @@ fn check_postgres_accessible(rt: &tokio::runtime::Runtime, dsn: &str) -> anyhow:
 
 fn volume_name_exists(rt: &tokio::runtime::Runtime, dsn: &str, name: &str) -> anyhow::Result<bool> {
     rt.block_on(async {
-        let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+        let (client, connection) = connect_studiofs_postgres(dsn)
             .await
             .map_err(|e| anyhow::anyhow!("cannot connect to postgres: {e}"))?;
 
@@ -451,7 +452,7 @@ fn init_pg_schema_and_volume(
                 )
             })?;
         let active_key = ActiveCryptoKeyRow::from_encryption(encryption);
-        let (mut client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+        let (mut client, connection) = connect_studiofs_postgres(dsn)
             .await
             .context("cannot connect to postgres")?;
 
@@ -523,7 +524,7 @@ fn seed_pg_metadata_state(
     snapshot_json: &[u8],
 ) -> anyhow::Result<()> {
     rt.block_on(async {
-        let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+        let (client, connection) = connect_studiofs_postgres(dsn)
             .await
             .map_err(|e| anyhow::anyhow!("cannot connect to postgres: {e}"))?;
         let conn_task = tokio::spawn(async move {

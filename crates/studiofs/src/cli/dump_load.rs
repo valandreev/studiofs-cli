@@ -4,7 +4,9 @@ use clap::Args;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use studiofs_meta::{MetaError, ensure_studiofs_database, open_meta_engine};
+use studiofs_meta::{
+    MetaError, connect_studiofs_postgres, ensure_studiofs_database, open_meta_engine,
+};
 use thiserror::Error;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,7 +190,7 @@ fn load_remote_dump(meta_dsn: &str, volume_id: i64) -> DumpLoadResult<MetadataDu
             .await
             .map_err(|e| DumpLoadError::Message(e.to_string()))?
             .metadata_dsn;
-        let (client, connection) = tokio_postgres::connect(&metadata_dsn, tokio_postgres::NoTls)
+        let (client, connection) = connect_studiofs_postgres(&metadata_dsn)
             .await
             .map_err(|e| DumpLoadError::Message(format!("cannot connect to postgres: {e}")))?;
         let connection_task = tokio::spawn(connection);
@@ -345,10 +347,9 @@ fn apply_dump(postgres_address: &str, dump: MetadataDump) -> DumpLoadResult<i64>
             .await
             .map_err(|e| DumpLoadError::Message(e.to_string()))?
             .metadata_dsn;
-        let (mut client, connection) =
-            tokio_postgres::connect(&metadata_dsn, tokio_postgres::NoTls)
-                .await
-                .map_err(|e| DumpLoadError::Message(format!("cannot connect to postgres: {e}")))?;
+        let (mut client, connection) = connect_studiofs_postgres(&metadata_dsn)
+            .await
+            .map_err(|e| DumpLoadError::Message(format!("cannot connect to postgres: {e}")))?;
         let connection_task = tokio::spawn(connection);
 
         let result = async {

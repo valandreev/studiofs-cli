@@ -6,6 +6,7 @@ use std::io::{self, Write};
 use std::path::Path;
 use studiofs_cache::runtime::{LocalPayloadRuntimeDetection, detect_cache_backends};
 use studiofs_data::{DataStore, DataStoreConfig, store::DataError};
+use studiofs_meta::connect_studiofs_postgres;
 use studiofs_meta::engine::MetaError;
 use thiserror::Error;
 use tracing::warn;
@@ -271,7 +272,7 @@ async fn delete_remote_state(format_info: &studiofs_meta::FormatInfo) -> Destroy
 }
 
 async fn delete_postgres_metadata(pg_url: &str, volume_id: i64) -> DestroyResult<()> {
-    let (client, connection) = tokio_postgres::connect(pg_url, tokio_postgres::NoTls).await?;
+    let (client, connection) = connect_studiofs_postgres(pg_url).await?;
 
     let connection = tokio::spawn(async move { connection.await.map_err(DestroyError::Postgres) });
 
