@@ -826,6 +826,7 @@ fn docs_cover_sfs452_final_transport_acceptance_gate() {
         read_workspace_file("docs/data-layer.md"),
         read_workspace_file("docs/encryption-at-rest-contract.md"),
         read_workspace_file("docs/tests.md"),
+        read_workspace_file("docs/examples.md"),
     ];
     let searchable_docs: Vec<_> = docs
         .iter()
