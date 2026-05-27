@@ -8,7 +8,9 @@
 use clap::Args;
 use std::io::Write;
 use std::path::PathBuf;
-use studiofs_data::{DataStore, DataStoreConfig, DataStoreCryptoConfig};
+use studiofs_data::{
+    DataStore, DataStoreConfig, DataStoreCryptoConfig, normalize_s3_endpoint_transport,
+};
 use studiofs_meta::{
     CURRENT_FORMAT_VERSION, DEFAULT_BLOCK_SIZE, ENCRYPTION_KEY_LENGTH, EncryptionConfig,
     FormatInfo, MetaFormat, MetaOpenOptions, MetadataBackend, MetadataConfig, PostgresConfig,
@@ -63,6 +65,8 @@ struct InitRunRequest {
 impl InitRunRequest {
     fn from_args(args: InitArgs) -> anyhow::Result<Self> {
         let meta_dir = super::utils::get_default_meta_dir(&args.name)?;
+        let endpoint = normalize_s3_endpoint_transport(&args.endpoint)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         let region = if args.region.is_empty() {
             "us-east-1".to_string()
         } else {
@@ -72,7 +76,7 @@ impl InitRunRequest {
         Ok(Self {
             name: args.name,
             object_store: DataStoreConfig {
-                endpoint: args.endpoint,
+                endpoint,
                 bucket: args.bucket,
                 access_key: args.access_key,
                 secret_key: args.secret_key,
@@ -136,7 +140,8 @@ pub(crate) struct InitArgs {
     /// Disk name (used in object paths like `<name>/objects`)
     name: String,
 
-    /// S3 endpoint URL (e.g. <https://s3.amazonaws.com>, <http://127.0.0.1:9000>)
+    /// S3 endpoint URL. Non-local endpoints require HTTPS; HTTP is loopback-only.
+    /// Examples: <https://s3.amazonaws.com>, <http://127.0.0.1:9000>.
     #[arg(long)]
     endpoint: String,
 
@@ -749,6 +754,37 @@ mod tests {
             Err(err) => err,
         };
         assert_eq!(err.kind(), ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn init_request_rejects_non_loopback_http_endpoint_before_bucket_access() {
+        let cli = crate::cli::parse_for_test(&[
+            "init",
+            "vol",
+            "--endpoint",
+            "http://192.168.1.50:9000",
+            "--bucket",
+            "bucket",
+            "--access-key",
+            "access-key",
+            "--secret-key",
+            "secret-key",
+            "--meta",
+            "postgres://u:p@127.0.0.1:5432",
+        ])
+        .unwrap();
+
+        let crate::cli::Commands::Init(args) = cli.command else {
+            panic!("expected init command");
+        };
+        let err = match InitRunRequest::from_args(args) {
+            Ok(_) => panic!("non-loopback HTTP endpoint should fail before bucket access"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("HTTPS"));
+        assert!(!err.to_string().contains("access-key"));
+        assert!(!err.to_string().contains("secret-key"));
     }
 
     #[test]

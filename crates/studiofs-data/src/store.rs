@@ -22,6 +22,10 @@ pub enum DataError {
     #[error("opendal error: {0}")]
     OpenDal(#[from] opendal::Error),
 
+    /// Configured S3 endpoint violates the transport policy.
+    #[error("invalid S3 endpoint: {0}")]
+    InvalidEndpoint(String),
+
     /// Persisted encryption configuration is not supported by this binary.
     #[error("invalid data encryption config: {0}")]
     InvalidCryptoConfig(#[from] studiofs_meta::EncryptionContractError),
@@ -41,7 +45,7 @@ impl DataError {
                     || oe.is_temporary()
             }
             Self::Storage(_) => true,
-            Self::InvalidCryptoConfig(_) | Self::Crypto(_) => false,
+            Self::InvalidEndpoint(_) | Self::InvalidCryptoConfig(_) | Self::Crypto(_) => false,
         }
     }
 }
@@ -186,6 +190,91 @@ impl From<&FormatInfo> for DataStoreConfig {
     }
 }
 
+struct ParsedEndpoint {
+    url: url::Url,
+    normalized: String,
+}
+
+fn invalid_endpoint(message: impl Into<String>) -> DataError {
+    DataError::InvalidEndpoint(message.into())
+}
+
+fn parse_s3_endpoint(endpoint: &str) -> DataResult<ParsedEndpoint> {
+    let trimmed = endpoint.trim();
+    if trimmed.is_empty() {
+        return Err(invalid_endpoint("endpoint URL must not be empty"));
+    }
+
+    if let Ok(url) = url::Url::parse(trimmed) {
+        if url.scheme() == "memory" {
+            return Err(invalid_endpoint(
+                "`memory://` is reserved for in-memory test stores and cannot be used as a runtime S3 endpoint",
+            ));
+        }
+        if url.host().is_some() {
+            return Ok(ParsedEndpoint {
+                url,
+                normalized: trimmed.to_string(),
+            });
+        }
+    }
+
+    let normalized = format!("http://{trimmed}");
+    let url = url::Url::parse(&normalized).map_err(|_| {
+        invalid_endpoint(
+            "must be an HTTP(S) URL with a host, for example https://s3.amazonaws.com or http://127.0.0.1:9000",
+        )
+    })?;
+    if url.host().is_none() {
+        return Err(invalid_endpoint(
+            "must be an HTTP(S) URL with a host, for example https://s3.amazonaws.com or http://127.0.0.1:9000",
+        ));
+    }
+
+    Ok(ParsedEndpoint { url, normalized })
+}
+
+fn is_loopback_host(host: url::Host<&str>) -> bool {
+    match host {
+        url::Host::Domain(domain) => domain.eq_ignore_ascii_case("localhost"),
+        url::Host::Ipv4(addr) => addr.is_loopback(),
+        url::Host::Ipv6(addr) => addr.is_loopback(),
+    }
+}
+
+/// Validate and normalize an S3-compatible endpoint according to StudioFS'
+/// transport policy.
+///
+/// Non-local endpoints must use HTTPS. Plain HTTP is accepted only for explicit
+/// loopback development/test hosts.
+pub fn normalize_s3_endpoint_transport(endpoint: &str) -> DataResult<String> {
+    let parsed = parse_s3_endpoint(endpoint)?;
+    if !parsed.url.username().is_empty() || parsed.url.password().is_some() {
+        return Err(invalid_endpoint(
+            "endpoint URLs must not include credentials; pass S3 credentials separately",
+        ));
+    }
+
+    match parsed.url.scheme() {
+        "https" => Ok(parsed.normalized),
+        "http" => {
+            if parsed.url.host().is_some_and(is_loopback_host) {
+                Ok(parsed.normalized)
+            } else {
+                Err(invalid_endpoint(
+                    "HTTPS is required for non-local S3 endpoints; plain HTTP is allowed only for localhost, 127.0.0.0/8, or [::1]",
+                ))
+            }
+        }
+        _ => Err(invalid_endpoint("must use http:// or https://")),
+    }
+}
+
+/// Validate an S3-compatible endpoint according to StudioFS' transport policy.
+pub fn validate_s3_endpoint_transport(endpoint: &str) -> DataResult<()> {
+    normalize_s3_endpoint_transport(endpoint).map(|_| ())
+}
+
 /// DataStore — manages payload-object I/O to S3-compatible storage.
 pub struct DataStore {
     op: Operator,
@@ -258,6 +347,8 @@ impl DataStore {
         profile: IoProfile,
         crypto: DataStoreCryptoRuntime,
     ) -> DataResult<Self> {
+        validate_s3_endpoint_transport(&config.endpoint)?;
+
         let mut builder = S3::default()
             .endpoint(&config.endpoint)
             .bucket(&config.bucket)
@@ -614,6 +705,48 @@ mod tests {
         assert!(!is_ip_endpoint("http://minio.local:9000"));
         assert!(!is_ip_endpoint("https://s3.amazonaws.com"));
         assert!(!is_ip_endpoint("minio.local:9000"));
+    }
+
+    #[test]
+    fn datastore_rejects_non_loopback_http_endpoint_before_building_client() {
+        let mut config = encrypted_test_config();
+        config.endpoint = "http://192.168.1.50:9000".to_string();
+
+        let err = match DataStore::new(&config) {
+            Ok(_) => panic!("non-loopback HTTP must be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("HTTPS"));
+        assert!(!err.to_string().contains("access"));
+        assert!(!err.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn datastore_accepts_https_and_loopback_http_endpoints() {
+        for endpoint in [
+            "https://s3.amazonaws.com",
+            "http://localhost:9000",
+            "http://127.0.0.1:9000",
+            "http://127.1.2.3:9000",
+            "http://[::1]:9000",
+        ] {
+            let mut config = encrypted_test_config();
+            config.endpoint = endpoint.to_string();
+
+            DataStore::new(&config)
+                .unwrap_or_else(|err| panic!("endpoint {endpoint} should be accepted, got {err}"));
+        }
+    }
+
+    #[test]
+    fn datastore_rejects_memory_endpoint_for_runtime_client() {
+        let err = match DataStore::new(&encrypted_test_config()) {
+            Ok(_) => panic!("memory endpoint is test-only"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("test"));
     }
 
     #[test]
