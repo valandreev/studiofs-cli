@@ -23,7 +23,7 @@ use studiofs_cache::runtime::LocalPayloadLayout;
 use studiofs_cache::{
     DEFAULT_MEMORY_CACHE_SIZE, PreparedLocalPayloadRuntime, prepare_local_payload_runtime,
 };
-use studiofs_data::DataStoreConfig;
+use studiofs_data::{DataStoreConfig, normalize_s3_endpoint_transport};
 use studiofs_meta::{
     FormatInfo, MetaEngine, MetaFormat, MetaOpenOptions, MetaReplication, MetaSnapshots,
     MetadataBackend, RedbMetaEngine, open_meta_engine, open_meta_engine_with_options,
@@ -318,25 +318,7 @@ fn validate_endpoint_override(endpoint: Option<&str>) -> anyhow::Result<()> {
         return Ok(());
     };
 
-    let parsed = url::Url::parse(ep)
-        .ok()
-        .or_else(|| url::Url::parse(&format!("http://{ep}")).ok());
-
-    let valid = parsed
-        .map(|url| {
-            let scheme = url.scheme();
-            let has_host = url.host().is_some();
-            matches!(scheme, "http" | "https") && has_host
-        })
-        .unwrap_or(false);
-
-    if !valid {
-        anyhow::bail!(
-            "invalid S3 endpoint '{}': must be an HTTP(S) URL with a host (e.g., http://192.168.1.50:9000)",
-            ep
-        );
-    }
-
+    normalize_s3_endpoint_transport(ep)?;
     Ok(())
 }
 
@@ -1529,16 +1511,19 @@ fn materialize_snapshot_mount_meta<M: ?Sized + SnapshotSourceMeta>(
 fn apply_mount_endpoint_override(
     mut format_info: FormatInfo,
     endpoint: Option<&str>,
-) -> FormatInfo {
+) -> anyhow::Result<FormatInfo> {
     if let Some(endpoint) = endpoint {
+        let endpoint = normalize_s3_endpoint_transport(endpoint)?;
         info!(
             original_endpoint = %format_info.endpoint,
             override_endpoint = %endpoint,
             "overriding S3 endpoint for this mount session"
         );
-        format_info.endpoint = endpoint.to_string();
+        format_info.endpoint = endpoint;
+    } else {
+        format_info.endpoint = normalize_s3_endpoint_transport(&format_info.endpoint)?;
     }
-    format_info
+    Ok(format_info)
 }
 
 fn resolve_mount_meta_session(
@@ -1563,7 +1548,7 @@ fn resolve_mount_meta_session(
         }
     };
 
-    session.format_info = apply_mount_endpoint_override(session.format_info, endpoint);
+    session.format_info = apply_mount_endpoint_override(session.format_info, endpoint)?;
 
     debug!(
         "mounting volume '{}' (storage: endpoint={}, bucket={})",
@@ -1953,18 +1938,27 @@ mod tests {
     }
 
     #[test]
-    fn validate_endpoint_override_accepts_http_urls_and_bare_host_port() {
+    fn validate_endpoint_override_accepts_https_and_loopback_http() {
+        validate_endpoint_override(Some("https://s3.example.com")).expect("https url");
         validate_endpoint_override(Some("http://127.0.0.1:9000")).expect("full url");
-        validate_endpoint_override(Some("127.0.0.1:9000")).expect("host:port");
+        validate_endpoint_override(Some("http://[::1]:9000")).expect("ipv6 loopback");
+        validate_endpoint_override(Some("127.0.0.1:9000")).expect("bare loopback");
         validate_endpoint_override(None).expect("none");
     }
 
     #[test]
-    fn validate_endpoint_override_rejects_invalid_urls() {
-        for endpoint in ["ftp://127.0.0.1:9000", "://missing-scheme"] {
+    fn validate_endpoint_override_rejects_invalid_and_non_loopback_http_urls() {
+        for endpoint in [
+            "ftp://127.0.0.1:9000",
+            "://missing-scheme",
+            "http://192.168.1.50:9000",
+            "192.168.1.50:9000",
+        ] {
             let err =
                 validate_endpoint_override(Some(endpoint)).expect_err("invalid endpoint rejected");
             assert!(err.to_string().contains("invalid S3 endpoint"));
+            assert!(!err.to_string().contains("access-key"));
+            assert!(!err.to_string().contains("secret-key"));
         }
     }
 
@@ -2213,6 +2207,30 @@ mod tests {
     }
 
     #[test]
+    fn mount_plan_rejects_non_loopback_http_endpoint() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let meta_dir = temp.path().join("meta");
+        std::fs::create_dir_all(&meta_dir).expect("create meta dir");
+        let mount_point = startup_mount_point(&temp);
+        let mut command = mount_command(
+            "projectfs",
+            &meta_dir,
+            Some(mount_point.clone()),
+            None,
+            None,
+        );
+        command.endpoint = Some("http://192.168.1.50:9000".to_string());
+
+        let err = MountPlan::resolve(MountRequest {
+            command,
+            settings_config: startup_settings_config(mount_point, None, Some("64GB")),
+        })
+        .expect_err("non-loopback HTTP endpoint should fail");
+
+        assert!(err.to_string().contains("HTTPS"));
+    }
+
+    #[test]
     fn mount_plan_marks_snapshot_mount_read_only() {
         let temp = tempfile::tempdir().expect("tempdir");
         let meta_dir = temp.path().join("meta");
@@ -2333,6 +2351,24 @@ mod tests {
                 .expect("resolve with endpoint override");
 
         assert_eq!(session.format_info.endpoint, "http://127.0.0.1:9000");
+    }
+
+    #[test]
+    fn mount_meta_session_rejects_persisted_non_loopback_http_endpoint() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (meta_dir, engine, mut format_info) = seed_mount_meta_db(&temp, "demo");
+        format_info.endpoint = "http://192.168.1.50:9000".to_string();
+        engine
+            .set_format_info(&format_info)
+            .expect("set insecure endpoint");
+        drop(engine);
+
+        let err = match resolve_mount_meta_session("demo", &meta_dir, None, None) {
+            Ok(_) => panic!("persisted non-loopback HTTP endpoint should fail"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("HTTPS"));
     }
 
     #[test]

@@ -9,4 +9,7 @@ pub mod envelope;
 pub mod object;
 pub mod store;
 
-pub use store::{DataStore, DataStoreConfig, DataStoreCryptoConfig, IoProfile};
+pub use store::{
+    DataStore, DataStoreConfig, DataStoreCryptoConfig, IoProfile, normalize_s3_endpoint_transport,
+    validate_s3_endpoint_transport,
+};

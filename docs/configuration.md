@@ -95,7 +95,7 @@ StudioFS' transport policy is defined in
 short, non-local S3-compatible object storage endpoints require HTTPS and
 non-local PostgreSQL DSNs require TLS. Plain HTTP object storage and
 `sslmode=disable` PostgreSQL are allowed only for explicit local/test loopback
-hosts such as `localhost`, `127.0.0.0/8`, and `::1`.
+hosts such as `localhost`, `*.localhost`, `127.0.0.0/8`, and `::1`.
 
 ### `discover`
 
@@ -166,7 +166,9 @@ Notes:
 - When no endpoint is configured, StudioFS still writes a gzipped pprof artifact under `<cache-dir>/<uuid>/profiles/`.
 - `--snapshot-id` mounts the selected snapshot as a read-only historical view.
 - `--endpoint <URL>` overrides the S3 endpoint URL for the current mount session.
-  - Useful for mounting via a local IP address (e.g. `http://192.168.1.50:9000`) instead of the public endpoint configured during `studiofs init`.
+  - Non-local endpoints must use HTTPS.
+  - Plain HTTP is accepted only for explicit loopback development/test endpoints such as `http://localhost:9000`, `http://my-bucket.localhost:9000`, `http://127.0.0.1:9000`, and `http://[::1]:9000`.
+  - Bare loopback host-port overrides such as `127.0.0.1:9000` are normalized to `http://127.0.0.1:9000`; non-loopback bare host-port values are rejected.
   - This override only applies to the current process and is NOT saved to the configuration file.
   - When the endpoint is an IP address, StudioFS automatically uses path-style addressing (required for IP-based S3-compatible services like MinIO).
 

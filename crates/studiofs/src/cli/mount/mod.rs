@@ -153,8 +153,8 @@ pub(crate) struct MountArgs {
 
     /// Override the S3 endpoint URL for this mount session.
     ///
-    /// Useful for mounting via a local IP address (e.g. http://192.168.1.50:9000)
-    /// instead of the public endpoint configured during `studiofs init`.
+    /// Non-local endpoints must use HTTPS. Plain HTTP is accepted only for
+    /// explicit loopback development endpoints such as http://127.0.0.1:9000.
     /// This override only applies to the current process and is NOT saved.
     #[arg(long)]
     endpoint: Option<String>,
