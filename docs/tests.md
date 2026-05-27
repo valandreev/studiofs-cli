@@ -104,6 +104,33 @@ $env:STUDIOFS_S3_HTTPS_ENDPOINT='https://s3-compatible.example'
 cargo test -p studiofs-data --test integration_test https_endpoint_fixture_put_get_when_configured -- --ignored --nocapture
 ```
 
+### SFS-452 Final Transport Acceptance Gate
+
+SFS-452 is the final docs and search gate for the transport track. Use focused
+checks instead of the full workspace suite:
+
+```powershell
+cargo test -p studiofs --test architecture_vocabulary_test docs_cover_sfs452_final_transport_acceptance_gate -- --nocapture
+cargo check -p studiofs-meta -p studiofs-data -p studiofs
+rg -n -F "tokio_postgres::connect(" crates docs
+rg -n "tokio_postgres::NoTls|sslmode=disable|http://" crates docs -S
+```
+
+Expected search result shape:
+
+- production PostgreSQL call sites use `connect_studiofs_postgres` instead of
+  `tokio_postgres::NoTls`;
+- remaining `tokio_postgres::NoTls` call sites are local fixture setup;
+- non-local S3-compatible endpoints require HTTPS;
+- plain HTTP S3 is accepted only for explicit local/test loopback endpoints;
+- policy-invalid non-local S3 transports are rejected before init, persisted
+  mount, or endpoint override;
+- `sslmode=disable` cleartext choices must be logged at info level for
+  non-local hosts.
+
+Local loopback examples remain available only as loopback-only development/test
+examples.
+
 ## Command Matrix
 
 | Scope | Command |

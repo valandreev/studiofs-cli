@@ -746,7 +746,7 @@ fn transport_encryption_contract_covers_required_sfs448_boundaries() {
         "transport-only",
         "must not reopen at-rest SFEC implementation decisions",
         "HTTPS is required for non-local S3-compatible object storage endpoints",
-        "Plain HTTP is allowed only for explicit local/test loopback endpoints",
+        "Plain HTTP S3 is allowed only for explicit local/test loopback endpoints",
         "localhost",
         "127.0.0.0/8",
         "::1",
@@ -762,10 +762,10 @@ fn transport_encryption_contract_covers_required_sfs448_boundaries() {
         "info level, not warning level",
         "sslmode=require",
         "TLS setup failures remain fatal",
-        "`sslmode=disable` is accepted as a cleartext operator choice",
+        "`sslmode=disable` is accepted as an explicit cleartext operator choice",
         "Unix domain sockets",
         "no noisy downgrade warning",
-        "PostgreSQL carries metadata and active volume key material",
+        "PostgreSQL carries shared metadata and active volume key material",
         "volume_crypto_keys.key_material",
         "reject policy-invalid non-local transports early",
         "sanitize DSNs and endpoints",
@@ -813,6 +813,65 @@ fn tests_guide_covers_sfs451_transport_tls_fixtures() {
     assert!(
         missing.is_empty(),
         "SFS-451 transport TLS fixture docs are missing required surfaces:\n{}",
+        missing.join("\n")
+    );
+}
+
+#[test]
+fn docs_cover_sfs452_final_transport_acceptance_gate() {
+    let docs = [
+        read_workspace_file("docs/transport-encryption-contract.md"),
+        read_workspace_file("docs/configuration.md"),
+        read_workspace_file("docs/architecture.md"),
+        read_workspace_file("docs/data-layer.md"),
+        read_workspace_file("docs/encryption-at-rest-contract.md"),
+        read_workspace_file("docs/tests.md"),
+        read_workspace_file("docs/examples.md"),
+    ];
+    let searchable_docs: Vec<_> = docs
+        .iter()
+        .map(|doc| {
+            let clean_doc = doc.replace('`', "");
+            let normalized_doc = normalize_doc_whitespace(&clean_doc);
+            (clean_doc, normalized_doc)
+        })
+        .collect();
+    let required_terms = [
+        "SFS-452",
+        "final transport encryption acceptance gate",
+        "HTTPS is required for non-local S3-compatible object storage endpoints",
+        "Plain HTTP S3 is allowed only for explicit local/test loopback endpoints",
+        "non-local PostgreSQL DSNs use TLS-preferred or TLS-required transport",
+        "sslmode=disable is accepted as an explicit cleartext operator choice",
+        "must also be logged at info level for non-local hosts",
+        "PostgreSQL carries shared metadata and active volume key material",
+        "SFEC protects remote payload confidentiality and integrity at rest",
+        "TLS protects credentials, metadata/key-material links, and network transport",
+        "TLS does not replace SFEC and SFEC does not replace TLS",
+        "policy-invalid non-local S3 transports are rejected before init, persisted mount, or endpoint override",
+        "production PostgreSQL call sites use connect_studiofs_postgres instead of tokio_postgres::NoTls",
+        "remaining tokio_postgres::NoTls call sites are local fixture setup",
+        "Local loopback examples remain available only as loopback-only development/test examples",
+        "https://s3.example.com",
+        "postgresql://user:pass@db.example.com/studiofs?sslmode=require",
+        "http://127.0.0.1:9000",
+        "sslmode=disable",
+        "no user passphrases, KMS, S3 SSE/KMS, AES/RSA modes, legacy plaintext fallback, or local-cache encryption",
+    ];
+
+    let missing: Vec<_> = required_terms
+        .into_iter()
+        .filter(|term| {
+            let normalized_term = normalize_doc_whitespace(term);
+            !searchable_docs.iter().any(|(doc, normalized_doc)| {
+                doc.contains(term) || normalized_doc.contains(&normalized_term)
+            })
+        })
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "SFS-452 final transport acceptance docs are missing required terms:\n{}",
         missing.join("\n")
     );
 }

@@ -14,14 +14,18 @@ StudioFS already encrypts remote payload objects at rest. Transport encryption
 protects links to services that now carry sensitive data:
 
 - S3-compatible object storage carries encrypted `SFEC` payload fragments.
-- PostgreSQL carries metadata and active volume key material, including
+- PostgreSQL carries shared metadata and active volume key material, including
   `volume_crypto_keys.key_material`.
+
+SFEC protects remote payload confidentiality and integrity at rest. TLS protects
+credentials, metadata/key-material links, and network transport. TLS does not
+replace SFEC and SFEC does not replace TLS.
 
 ## S3-Compatible Object Storage Transport
 
 HTTPS is required for non-local S3-compatible object storage endpoints.
 
-Plain HTTP is allowed only for explicit local/test loopback endpoints:
+Plain HTTP S3 is allowed only for explicit local/test loopback endpoints:
 
 - `localhost`;
 - IPv4 loopback in `127.0.0.0/8`;
@@ -62,10 +66,11 @@ attempt TLS first, then fall back to cleartext when the server does not support
 TLS. The fallback is allowed for operator compatibility and must be logged at
 info level, not warning level.
 
+Non-local PostgreSQL DSNs use TLS-preferred or TLS-required transport.
 Operators who require strict transport encryption can set `sslmode=require`.
 In that mode TLS setup failures remain fatal and there is no cleartext
-fallback. `sslmode=disable` is accepted as a cleartext operator choice
-and must also be logged at info level for non-local hosts.
+fallback. `sslmode=disable` is accepted as an explicit cleartext operator
+choice and must also be logged at info level for non-local hosts.
 
 Accepted local/test loopback DSNs are limited to hosts classified as:
 
@@ -109,6 +114,8 @@ StudioFS must reject policy-invalid non-local transports early, before creating
 or mounting a volume through that transport. PostgreSQL cleartext fallback is
 not policy-invalid when it follows the TLS-preferred compatibility behavior
 above.
+For the S3 side, policy-invalid non-local S3 transports are rejected before
+init, persisted mount, or endpoint override.
 
 Actionable errors must identify:
 
@@ -141,6 +148,9 @@ operator override.
 SFS-449 implements the PostgreSQL connection layer and replaces production
 `tokio_postgres::NoTls` call sites with TLS-aware behavior that follows this
 contract.
+Production PostgreSQL call sites use `connect_studiofs_postgres` instead of
+`tokio_postgres::NoTls`; remaining `tokio_postgres::NoTls` call sites are local
+fixture setup.
 
 SFS-450 enforces S3 endpoint transport policy in `DataStore`, `init`, and mount
 endpoint overrides.
@@ -148,3 +158,30 @@ endpoint overrides.
 SFS-452 can reference this contract for operator-facing diagnostics and
 documentation, but must keep the remaining work transport-only and must not
 reopen at-rest SFEC implementation decisions.
+
+## SFS-452 Final Acceptance Gate
+
+SFS-452 is the final transport encryption acceptance gate. It freezes the
+operator-facing relationship between S3 transport, PostgreSQL transport, and
+SFEC at-rest protection:
+
+- non-local S3-compatible endpoints require HTTPS;
+- Plain HTTP S3 is allowed only for explicit local/test loopback endpoints;
+- non-local PostgreSQL DSNs use TLS-preferred or TLS-required transport by
+  default, while `sslmode=disable` is accepted as an explicit cleartext operator
+  choice and logged at info level;
+- PostgreSQL carries shared metadata and active volume key material, so its
+  transport remains security-sensitive even though PostgreSQL metadata is not
+  encrypted at rest by SFEC;
+- SFEC protects remote payload confidentiality and integrity at rest;
+- TLS protects credentials, metadata/key-material links, and network transport;
+- TLS does not replace SFEC and SFEC does not replace TLS;
+- policy-invalid non-local S3 transports are rejected before init, persisted
+  mount, or endpoint override;
+- production PostgreSQL call sites use `connect_studiofs_postgres` instead of
+  `tokio_postgres::NoTls`;
+- remaining `tokio_postgres::NoTls` call sites are local fixture setup.
+
+Local loopback examples remain available only as loopback-only development/test
+examples. This final transport gate adds no user passphrases, KMS, S3 SSE/KMS,
+AES/RSA modes, legacy plaintext fallback, or local-cache encryption.
