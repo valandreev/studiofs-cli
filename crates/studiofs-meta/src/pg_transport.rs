@@ -478,5 +478,6 @@ mod tests {
             .await
             .expect("TLS PostgreSQL fixture query");
         connection_task.abort();
+        let _ = connection_task.await;
     }
 }

@@ -237,13 +237,19 @@ async fn https_endpoint_fixture_put_get_when_configured() {
     let key = format!("integration-test/https/{}", unique_object_id());
     let payload = Bytes::from_static(b"studiofs https transport fixture");
 
-    store.put_by_key(&key, payload.clone()).await.unwrap();
-    let got = store.get_by_key(&key).await.unwrap().to_bytes();
-    let payload_matches = got == payload;
+    let put_res = store.put_by_key(&key, payload.clone()).await;
+    let get_res = if put_res.is_ok() {
+        Some(store.get_by_key(&key).await)
+    } else {
+        None
+    };
+    let delete_res = store.delete_by_key(&key).await;
 
-    store.delete_by_key(&key).await.unwrap();
-    assert!(
-        payload_matches,
-        "downloaded object must match uploaded data"
-    );
+    put_res.expect("failed to upload object");
+    let got = get_res
+        .expect("download skipped because upload failed")
+        .expect("failed to download object")
+        .to_bytes();
+    delete_res.expect("failed to delete object");
+    assert_eq!(got, payload, "downloaded object must match uploaded data");
 }
