@@ -318,9 +318,8 @@ fn validate_endpoint_override(endpoint: Option<&str>) -> anyhow::Result<()> {
         return Ok(());
     };
 
-    normalize_s3_endpoint_transport(ep)
-        .map(|_| ())
-        .map_err(|err| anyhow::anyhow!(err.to_string()))
+    normalize_s3_endpoint_transport(ep)?;
+    Ok(())
 }
 
 fn build_mount_config_from_raw(
@@ -1514,17 +1513,16 @@ fn apply_mount_endpoint_override(
     endpoint: Option<&str>,
 ) -> anyhow::Result<FormatInfo> {
     if let Some(endpoint) = endpoint {
-        let endpoint = normalize_s3_endpoint_transport(endpoint)
-            .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+        let endpoint = normalize_s3_endpoint_transport(endpoint)?;
         info!(
             original_endpoint = %format_info.endpoint,
             override_endpoint = %endpoint,
             "overriding S3 endpoint for this mount session"
         );
         format_info.endpoint = endpoint;
+    } else {
+        format_info.endpoint = normalize_s3_endpoint_transport(&format_info.endpoint)?;
     }
-    format_info.endpoint = normalize_s3_endpoint_transport(&format_info.endpoint)
-        .map_err(|err| anyhow::anyhow!(err.to_string()))?;
     Ok(format_info)
 }
 

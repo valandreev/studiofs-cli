@@ -65,8 +65,7 @@ struct InitRunRequest {
 impl InitRunRequest {
     fn from_args(args: InitArgs) -> anyhow::Result<Self> {
         let meta_dir = super::utils::get_default_meta_dir(&args.name)?;
-        let endpoint = normalize_s3_endpoint_transport(&args.endpoint)
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let endpoint = normalize_s3_endpoint_transport(&args.endpoint)?;
         let region = if args.region.is_empty() {
             "us-east-1".to_string()
         } else {
