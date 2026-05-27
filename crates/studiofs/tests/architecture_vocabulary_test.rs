@@ -714,6 +714,46 @@ fn encryption_at_rest_contract_covers_required_sfs346_boundaries() {
 }
 
 #[test]
+fn transport_encryption_contract_covers_required_sfs448_boundaries() {
+    let contract = read_workspace_file("docs/transport-encryption-contract.md");
+    let normalized_contract = normalize_doc_whitespace(&contract);
+    let required_terms = [
+        "SFS-448",
+        "Transport Encryption Contract",
+        "transport-only",
+        "must not reopen at-rest SFEC implementation decisions",
+        "HTTPS is required for non-local S3-compatible object storage endpoints",
+        "Plain HTTP is allowed only for explicit local/test loopback endpoints",
+        "localhost",
+        "127.0.0.0/8",
+        "::1",
+        "memory:// remains a test-only operator path",
+        "TLS is required for non-local PostgreSQL DSNs",
+        "sslmode=disable is allowed only for explicit local/test loopback DSNs",
+        "no silent downgrade",
+        "PostgreSQL carries metadata and active volume key material",
+        "volume_crypto_keys.key_material",
+        "reject insecure non-local transports early",
+        "without logging credentials or key material",
+        "existing local development and CI setups using loopback RustFS/PostgreSQL remain supported",
+        "SFS-449",
+        "SFS-450",
+        "SFS-452",
+    ];
+
+    let missing: Vec<_> = required_terms
+        .into_iter()
+        .filter(|term| !contains_doc_term(&contract, &normalized_contract, term))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "SFS-448 transport encryption contract is missing required boundaries:\n{}",
+        missing.join("\n")
+    );
+}
+
+#[test]
 fn local_first_validation_matrix_covers_sfs356_encrypted_regression_gates() {
     let doc = read_workspace_file("docs/local-first-validation-matrix.md");
     let normalized_doc = normalize_doc_whitespace(&doc);
