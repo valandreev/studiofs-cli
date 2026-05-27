@@ -92,10 +92,24 @@ plaintext remote-volume compatibility.
 
 StudioFS' transport policy is defined in
 [transport-encryption-contract.md](./transport-encryption-contract.md). In
-short, non-local S3-compatible object storage endpoints require HTTPS and
-non-local PostgreSQL DSNs require TLS. Plain HTTP object storage and
-`sslmode=disable` PostgreSQL are allowed only for explicit local/test loopback
-hosts such as `localhost`, `*.localhost`, `127.0.0.0/8`, and `::1`.
+short, non-local S3-compatible endpoints require HTTPS and plain HTTP S3 is
+accepted only for explicit local/test loopback endpoints. Non-local PostgreSQL
+DSNs use TLS-preferred or TLS-required transport unless the operator explicitly
+sets `sslmode=disable`; that cleartext operator choice is accepted and logged at
+info level. Local loopback PostgreSQL DSNs may also use `sslmode=disable` for
+development/test fixtures.
+
+Production example:
+
+```bash
+studiofs init projectfs --endpoint https://s3.example.com --bucket studiofs-prod --access-key YOUR_ACCESS_KEY --secret-key YOUR_SECRET_KEY --meta postgresql://user:pass@db.example.com/studiofs?sslmode=require
+```
+
+Loopback-only development/test example:
+
+```bash
+studiofs init projectfs --endpoint http://127.0.0.1:9000 --bucket studiofs-test --access-key studiofs --secret-key studiofs123 --meta "host=127.0.0.1 port=5432 user=studiofs password=studiofs sslmode=disable"
+```
 
 ### `discover`
 
@@ -419,15 +433,18 @@ Behavior:
 
 ## Multi-Client Workflow
 
+Production snippets should use HTTPS S3 endpoints and TLS-capable PostgreSQL
+DSNs. The following workflow is a loopback-only development/test example.
+
 Client A:
 ```bash
-studiofs init projectfs --endpoint http://127.0.0.1:9000 --bucket studiofs-test --access-key studiofs --secret-key studiofs123 --meta postgres://studiofs:studiofs@127.0.0.1:5432
+studiofs init projectfs --endpoint http://127.0.0.1:9000 --bucket studiofs-test --access-key studiofs --secret-key studiofs123 --meta "host=127.0.0.1 port=5432 user=studiofs password=studiofs sslmode=disable"
 studiofs mount projectfs /mnt/studio/projectfs
 ```
 
 Client B:
 ```bash
-studiofs discover projectfs --meta postgres://studiofs:studiofs@127.0.0.1:5432
+studiofs discover projectfs --meta "host=127.0.0.1 port=5432 user=studiofs password=studiofs sslmode=disable"
 studiofs mount projectfs /mnt/studio/projectfs-b
 ```
 

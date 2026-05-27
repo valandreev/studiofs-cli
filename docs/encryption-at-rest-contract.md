@@ -118,6 +118,10 @@ This contract protects against object storage and bucket compromise. It protects
 remote payload object confidentiality and integrity for encrypted payload
 fragments, and it detects payload tampering or object-key/object-fragment swaps
 before plaintext reaches the STFS decoder.
+Transport encryption is a separate SFS-452 contract: SFEC protects remote
+payload confidentiality and integrity at rest, while TLS protects credentials,
+metadata/key-material links, and network transport. TLS does not replace SFEC
+and SFEC does not replace TLS.
 
 AEAD associated data must bind the ciphertext to the StudioFS remote-object
 identity. At minimum, associated data must cover the volume identity, remote
@@ -178,6 +182,9 @@ This contract does not require:
 - adding AES, RSA, SM2/SM4, or configurable crypto agility;
 - changing foreground writeback, flush, fsync, close, publication, fetch, or
   peer-convergence semantics.
+
+The final transport gate adds no user passphrases, KMS, S3 SSE/KMS, AES/RSA
+modes, legacy plaintext fallback, or local-cache encryption.
 
 ## Implementation Guardrails
 

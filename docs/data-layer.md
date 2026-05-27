@@ -9,6 +9,9 @@ The transparent remote-object encryption boundary is defined in
 Transport requirements for S3-compatible object storage and PostgreSQL are
 defined in
 [transport-encryption-contract.md](./transport-encryption-contract.md).
+SFEC protects remote payload confidentiality and integrity at rest; TLS protects
+credentials, metadata/key-material links, and network transport. TLS does not
+replace SFEC and SFEC does not replace TLS.
 
 ## Responsibilities
 

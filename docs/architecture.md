@@ -19,6 +19,11 @@ Core principles:
   [encryption-at-rest-contract.md](./encryption-at-rest-contract.md): local
   cache/runtime payloads stay plaintext, while remote payload fragments are
   encrypted before S3-compatible storage upload.
+- Transport encryption is a separate link contract documented in
+  [transport-encryption-contract.md](./transport-encryption-contract.md):
+  non-local S3-compatible endpoints require HTTPS, PostgreSQL carries shared
+  metadata and active volume key material, and PostgreSQL transport follows the
+  shared `connect_studiofs_postgres` policy.
 - Runtime visibility is split into writer state, the local metadata view, and
   asynchronously replicated shared state.
 - The UUID-scoped cache root itself is the runtime boundary of the current

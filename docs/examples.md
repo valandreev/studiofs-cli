@@ -2,7 +2,8 @@
 
 ## 1. Create a New Virtual Volume (Init)
 
-Initialize a volume using local RustFS and PostgreSQL for metadata:
+Initialize a volume using loopback-only local RustFS and PostgreSQL for
+metadata:
 
 ```bash
 studiofs init myvolume \
@@ -10,7 +11,19 @@ studiofs init myvolume \
   --bucket mybucket \
   --access-key studiofs \
   --secret-key studiofs123 \
-  --meta postgres://studiofs:studiofs@127.0.0.1:5432
+  --meta "host=127.0.0.1 port=5432 user=studiofs password=studiofs sslmode=disable"
+```
+
+Production endpoints should use HTTPS S3 transport and TLS-capable PostgreSQL
+DSNs:
+
+```bash
+studiofs init myvolume \
+  --endpoint https://s3.example.com \
+  --bucket mybucket \
+  --access-key YOUR_ACCESS_KEY \
+  --secret-key YOUR_SECRET_KEY \
+  --meta postgresql://studiofs:secret@db.example.com/studiofs?sslmode=require
 ```
 
 ## 2. Mount a Volume
@@ -63,10 +76,17 @@ broader `STUDIOFS_*` runtime matrix is still accepted only as
 developer/transitional compatibility, and metadata-cache internals remain on
 strong built-in defaults.
 
-Mount with a local S3 endpoint (for low-latency access in hybrid networks):
+Mount with a non-local S3 endpoint:
 
 ```bash
-studiofs mount myvolume Z: --endpoint http://192.168.1.50:9000
+studiofs mount myvolume Z: --endpoint https://minio.internal.example:9000
+```
+
+Plain HTTP endpoint overrides are limited to loopback-only development/test
+targets:
+
+```bash
+studiofs mount myvolume Z: --endpoint http://127.0.0.1:9000
 ```
 
 To unmount a volume running in the background:
@@ -81,7 +101,7 @@ If a volume has already been initialized on another machine, you do not need to 
 
 ```bash
 studiofs discover myvolume \
-  --meta postgres://studiofs:studiofs@127.0.0.1:5432
+  --meta "host=127.0.0.1 port=5432 user=studiofs password=studiofs sslmode=disable"
 ```
 After that, you can mount the volume:
 ```bash
