@@ -82,13 +82,13 @@ fn contains_doc_term(doc: &str, normalized_doc: &str, term: &str) -> bool {
 }
 
 fn is_normalized_doc_term(term: &str) -> bool {
-    let mut previous_was_space = false;
-    for (index, ch) in term.char_indices() {
+    let mut previous_was_space = true;
+    for ch in term.chars() {
         let is_space = ch == ' ';
         if ch.is_whitespace() && !is_space {
             return false;
         }
-        if is_space && (index == 0 || previous_was_space) {
+        if is_space && previous_was_space {
             return false;
         }
         previous_was_space = is_space;
@@ -750,16 +750,22 @@ fn transport_encryption_contract_covers_required_sfs448_boundaries() {
         "localhost",
         "127.0.0.0/8",
         "::1",
-        "IPv4-mapped IPv6 loopback addresses must be normalized",
+        "IPv4-mapped IPv6 loopback addresses",
+        "IPv4-compatible IPv6 loopback",
+        "must be normalized",
         "memory:// remains a test-only operator path",
         "init/configuration layer rejects memory:// for production user-supplied endpoints",
         "TLS is required for non-local PostgreSQL DSNs",
         "sslmode=disable is allowed only for explicit local/test loopback DSNs",
+        "If sslmode is omitted for a non-local DSN",
+        "downgrade-capable mode such as prefer",
+        "without cleartext fallback",
         "Unix domain sockets",
         "no silent downgrade",
         "PostgreSQL carries metadata and active volume key material",
         "volume_crypto_keys.key_material",
         "reject insecure non-local transports early",
+        "sanitize DSNs and endpoints",
         "without logging credentials or key material",
         "Existing local development and CI setups",
         "loopback RustFS/PostgreSQL",

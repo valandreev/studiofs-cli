@@ -27,9 +27,10 @@ Plain HTTP is allowed only for explicit local/test loopback endpoints:
 - IPv4 loopback in `127.0.0.0/8`;
 - IPv6 loopback `::1`.
 
-IPv4-mapped IPv6 loopback addresses must be normalized to their embedded IPv4
-address before classification. For example, `::ffff:127.0.0.1` is a loopback
-endpoint, while `::ffff:192.168.1.50` is not.
+IPv4-mapped IPv6 loopback addresses and IPv4-compatible IPv6 loopback
+addresses must be normalized to their embedded IPv4 address before
+classification. For example, `::ffff:127.0.0.1` and `::127.0.0.1` are loopback
+endpoints, while `::ffff:192.168.1.50` and `::192.168.1.50` are not.
 
 memory:// remains a test-only operator path and is not a production transport
 exception. The init/configuration layer rejects memory:// for production
@@ -56,7 +57,10 @@ safe.
 ## PostgreSQL Metadata Transport
 
 TLS is required for non-local PostgreSQL DSNs. sslmode=disable is allowed only
-for explicit local/test loopback DSNs.
+for explicit local/test loopback DSNs. If sslmode is omitted for a non-local
+DSN, or if the DSN requests a downgrade-capable mode such as prefer, the
+connection must be rejected or normalized to a TLS-required mode without
+cleartext fallback.
 
 Accepted local/test loopback DSNs are limited to hosts classified as:
 
@@ -67,8 +71,9 @@ Accepted local/test loopback DSNs are limited to hosts classified as:
   systems or an implicit socket-based default where the PostgreSQL driver
   resolves the connection locally.
 
-IPv4-mapped IPv6 loopback addresses must be normalized to their embedded IPv4
-address before classification for PostgreSQL DSNs as well.
+IPv4-mapped IPv6 loopback addresses and IPv4-compatible IPv6 loopback
+addresses must be normalized to their embedded IPv4 address before
+classification for PostgreSQL DSNs as well.
 
 There must be no silent downgrade for remote hosts. A PostgreSQL connection
 layer must not fall back from TLS to cleartext for non-local DSNs if TLS setup
@@ -105,7 +110,9 @@ Actionable errors must identify:
   IPv4-mapped IPv6 loopback addresses, or Unix domain sockets for PostgreSQL.
 
 Errors must reject insecure links without logging credentials or key material.
-They must not log DSN passwords, access keys, secret keys, volume keys, or raw
+They must sanitize DSNs and endpoints before formatting them into errors or
+logs. Sanitization must strip or mask DSN passwords, access keys, secret keys,
+secret-bearing query parameters, volume keys, and raw
 `volume_crypto_keys.key_material`.
 
 ## Local Development And CI
