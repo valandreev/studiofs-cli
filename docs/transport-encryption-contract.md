@@ -110,7 +110,7 @@ They must not log DSN passwords, access keys, secret keys, volume keys, or raw
 
 ## Local Development And CI
 
-existing local development and CI setups using loopback RustFS/PostgreSQL remain
+Existing local development and CI setups using loopback RustFS/PostgreSQL remain
 supported. The allowed insecure cases are intentionally narrow so Windows,
 Linux, and macOS local test environments can keep using loopback HTTP RustFS
 and loopback PostgreSQL without weakening production defaults.
