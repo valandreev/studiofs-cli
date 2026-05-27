@@ -1,5 +1,6 @@
 use super::PgMetaEngine;
 use crate::engine::{MetaError, MetaResult};
+use crate::pg_transport::connect_studiofs_postgres;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -217,16 +218,10 @@ impl PgConnectionPool {
     }
 
     async fn connect(&self) -> MetaResult<IdlePgConnection> {
-        let connect = tokio_postgres::connect(&self.postgres_url, tokio_postgres::NoTls);
+        let connect = connect_studiofs_postgres(&self.postgres_url);
         let (client, connection) = tokio::time::timeout(self.connect_timeout, connect)
             .await
-            .map_err(|_| PgMetaEngine::pg_timeout_error("connect", self.connect_timeout))?
-            .map_err(|e| {
-                MetaError::Storage(format!(
-                    "postgres connect failed: {}",
-                    PgMetaEngine::format_pg_error(e)
-                ))
-            })?;
+            .map_err(|_| PgMetaEngine::pg_timeout_error("connect", self.connect_timeout))??;
         self.connection_creations.fetch_add(1, Ordering::Relaxed);
         let task = tokio::spawn(async move {
             let _ = connection.await;
@@ -420,16 +415,12 @@ impl PgMetaEngine {
         F: FnOnce(tokio_postgres::Client) -> Fut,
         Fut: Future<Output = MetaResult<T>>,
     {
-        let connect = tokio_postgres::connect(&postgres_url, tokio_postgres::NoTls);
+        let connect = connect_studiofs_postgres(&postgres_url);
         let (client, connection) = tokio::time::timeout(connect_timeout, connect)
             .await
-            .map_err(|_| Self::pg_timeout_error(&format!("{context} connect"), connect_timeout))?
-            .map_err(|e| {
-                MetaError::Storage(format!(
-                    "postgres connect failed: {}",
-                    Self::format_pg_error(e)
-                ))
-            })?;
+            .map_err(|_| {
+                Self::pg_timeout_error(&format!("{context} connect"), connect_timeout)
+            })??;
 
         let conn_task = tokio::spawn(async move {
             let _ = connection.await;

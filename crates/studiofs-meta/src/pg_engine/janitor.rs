@@ -1,5 +1,6 @@
 use super::{PG_JANITOR_LOCK_SALT, PgMetaEngine};
 use crate::engine::{MetaError, MetaResult};
+use crate::pg_transport::connect_studiofs_postgres;
 use std::collections::HashSet;
 
 pub(super) struct PgJanitorLock {
@@ -28,16 +29,10 @@ impl PgMetaEngine {
             .enable_all()
             .build()
             .map_err(|e| MetaError::Storage(format!("failed to build tokio runtime: {e}")))?;
-        let connect = tokio_postgres::connect(&self.postgres_url, tokio_postgres::NoTls);
+        let connect = connect_studiofs_postgres(&self.postgres_url);
         let (client, connection) = runtime
             .block_on(async { tokio::time::timeout(self.connect_timeout, connect).await })
-            .map_err(|_| Self::pg_timeout_error("janitor lock connect", self.connect_timeout))?
-            .map_err(|e| {
-                MetaError::Storage(format!(
-                    "postgres connect failed: {}",
-                    Self::format_pg_error(e)
-                ))
-            })?;
+            .map_err(|_| Self::pg_timeout_error("janitor lock connect", self.connect_timeout))??;
 
         let connection_task = runtime.spawn(async move {
             let _ = connection.await;

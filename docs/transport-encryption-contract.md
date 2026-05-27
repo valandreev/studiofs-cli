@@ -56,11 +56,16 @@ safe.
 
 ## PostgreSQL Metadata Transport
 
-TLS is required for non-local PostgreSQL DSNs. sslmode=disable is allowed only
-for explicit local/test loopback DSNs. If sslmode is omitted for a non-local
-DSN, or if the DSN requests a downgrade-capable mode such as prefer, the
-connection must be rejected or normalized to a TLS-required mode without
-cleartext fallback.
+TLS is preferred for non-local PostgreSQL DSNs. If sslmode is omitted for a
+non-local DSN, StudioFS uses the PostgreSQL driver's TLS-preferred behavior:
+attempt TLS first, then fall back to cleartext when the server does not support
+TLS. The fallback is allowed for operator compatibility and must be logged at
+info level, not warning level.
+
+Operators who require strict transport encryption can set `sslmode=require`.
+In that mode TLS setup failures remain fatal and there is no cleartext
+fallback. `sslmode=disable` is accepted as a cleartext operator choice
+and must also be logged at info level for non-local hosts.
 
 Accepted local/test loopback DSNs are limited to hosts classified as:
 
@@ -75,17 +80,19 @@ IPv4-mapped IPv6 loopback addresses and IPv4-compatible IPv6 loopback
 addresses must be normalized to their embedded IPv4 address before
 classification for PostgreSQL DSNs as well.
 
-There must be no silent downgrade for remote hosts. A PostgreSQL connection
-layer must not fall back from TLS to cleartext for non-local DSNs if TLS setup
-or validation fails.
+There must be no noisy downgrade warning for remote PostgreSQL hosts. A
+PostgreSQL connection layer should make the default TLS attempt visible through
+info-level diagnostics while keeping cleartext fallback non-fatal when the
+server lacks TLS support.
 
 Examples:
 
 | DSN shape | Classification | Policy |
 |---|---|---|
-| `postgresql://user:pass@db.example.com/studiofs` with TLS enabled | non-local TLS remote | accepted |
-| `postgresql://user:pass@db.example.com/studiofs?sslmode=disable` | non-local cleartext remote | rejected |
-| `host=db.example.com user=studiofs sslmode=disable` | non-local cleartext remote | rejected |
+| `postgresql://user:pass@db.example.com/studiofs` | non-local TLS-preferred remote | accepted; fallback to cleartext if server lacks TLS |
+| `postgresql://user:pass@db.example.com/studiofs?sslmode=require` | non-local TLS-required remote | accepted; TLS failure is fatal |
+| `postgresql://user:pass@db.example.com/studiofs?sslmode=disable` | non-local explicit cleartext remote | accepted with info log |
+| `host=db.example.com user=studiofs sslmode=disable` | non-local explicit cleartext remote | accepted with info log |
 | `postgresql://user:pass@localhost/studiofs?sslmode=disable` | local/test loopback cleartext | accepted |
 | `host=127.0.0.1 user=studiofs sslmode=disable` | local/test loopback cleartext | accepted |
 | `host=127.42.0.7 user=studiofs sslmode=disable` | local/test loopback cleartext | accepted |
@@ -98,21 +105,23 @@ key material, so non-local PostgreSQL links must be treated as carrying secrets.
 
 ## Error Behavior
 
-StudioFS must reject insecure non-local transports early, before creating or
-mounting a volume through that transport.
+StudioFS must reject policy-invalid non-local transports early, before creating
+or mounting a volume through that transport. PostgreSQL cleartext fallback is
+not policy-invalid when it follows the TLS-preferred compatibility behavior
+above.
 
 Actionable errors must identify:
 
 - whether the rejected transport is S3-compatible object storage or PostgreSQL;
 - the endpoint or DSN host;
-- the rejected insecure mode, such as plain HTTP or `sslmode=disable`;
+- the rejected insecure mode, such as plain HTTP;
 - the accepted local exception: `localhost`, `127.0.0.0/8`, `::1`, normalized
   IPv4-mapped IPv6 loopback addresses, or Unix domain sockets for PostgreSQL.
 
-Errors must reject insecure links without logging credentials or key material.
-They must sanitize DSNs and endpoints before formatting them into errors or
-logs. Sanitization must strip or mask DSN passwords, access keys, secret keys,
-secret-bearing query parameters, volume keys, and raw
+Errors and info-level PostgreSQL transport diagnostics must not log credentials
+or key material. They must sanitize DSNs and endpoints before formatting them
+into errors or logs. Sanitization must strip or mask DSN passwords, access keys,
+secret keys, secret-bearing query parameters, volume keys, and raw
 `volume_crypto_keys.key_material`.
 
 ## Local Development And CI

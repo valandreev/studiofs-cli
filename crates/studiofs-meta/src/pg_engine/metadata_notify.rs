@@ -1,5 +1,6 @@
 use super::{MetadataSyncSource, PgMetaEngine};
 use crate::engine::{MetaError, MetaResult};
+use crate::pg_transport::connect_studiofs_postgres;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -79,7 +80,7 @@ impl PgMetaEngine {
                                 _ = cancel_for_task.cancelled() => return Ok(()),
                                 r = tokio::time::timeout(
                                     connect_timeout,
-                                    tokio_postgres::connect(&postgres_url, tokio_postgres::NoTls),
+                                    connect_studiofs_postgres(&postgres_url),
                                 ) => r,
                             };
                             let (client, mut connection) = connect_result
@@ -88,13 +89,7 @@ impl PgMetaEngine {
                                         "metadata notify connect",
                                         connect_timeout,
                                     )
-                                })?
-                                .map_err(|e| {
-                                    MetaError::Storage(format!(
-                                        "postgres metadata notify connect failed: {}",
-                                        Self::format_pg_error(e)
-                                    ))
-                                })?;
+                                })??;
 
                             let listen_cmd = format!("LISTEN {channel}");
                             let listen = client.batch_execute(&listen_cmd);

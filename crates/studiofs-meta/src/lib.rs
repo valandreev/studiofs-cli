@@ -17,6 +17,8 @@ pub mod events;
 pub mod pg_dsn;
 /// PostgreSQL-backed metadata engine implementation.
 pub mod pg_engine;
+/// TLS-aware PostgreSQL transport helpers.
+pub mod pg_transport;
 /// redb-backed metadata engine implementation.
 pub mod redb_engine;
 /// Internal on-disk metadata schema and replication model types.
@@ -38,6 +40,7 @@ pub use pg_dsn::{
     STUDIOFS_METADATA_DB, StudioPgDsns, ensure_studiofs_database, resolve_studiofs_pg_dsns,
 };
 pub use pg_engine::{PgMetaEngine, PgOpenOptions};
+pub use pg_transport::connect_studiofs_postgres;
 pub use redb_engine::RedbMetaEngine;
 pub use types::*;
 
