@@ -158,7 +158,8 @@ where
 
 /// Validate the StudioFS PostgreSQL transport policy without opening a socket.
 pub fn validate_postgres_transport_policy(dsn: &str) -> MetaResult<()> {
-    inspect_postgres_transport_policy(dsn)?;
+    let config = parse_postgres_config(dsn)?;
+    inspect_postgres_transport_policy(&config);
     Ok(())
 }
 
@@ -166,16 +167,20 @@ pub fn validate_postgres_transport_policy(dsn: &str) -> MetaResult<()> {
 pub async fn connect_studiofs_postgres(
     dsn: &str,
 ) -> MetaResult<(tokio_postgres::Client, StudioPgConnection)> {
-    let policy = inspect_postgres_transport_policy(dsn)?;
+    let config = parse_postgres_config(dsn)?;
+    let policy = inspect_postgres_transport_policy(&config);
     log_postgres_transport_policy(&policy);
-    let config = tokio_postgres::Config::from_str(dsn)
-        .map_err(|error| MetaError::Storage(format!("invalid postgres DSN: {error}")))?;
     config.connect(StudioPgTls::new()?).await.map_err(|error| {
         MetaError::Storage(format!(
             "postgres connect failed: {}",
             format_pg_error(error)
         ))
     })
+}
+
+fn parse_postgres_config(dsn: &str) -> MetaResult<tokio_postgres::Config> {
+    tokio_postgres::Config::from_str(dsn)
+        .map_err(|error| MetaError::Storage(format!("invalid postgres DSN: {error}")))
 }
 
 fn log_postgres_transport_policy(policy: &PgTransportPolicy) {
@@ -216,10 +221,8 @@ fn logged_transport_policies() -> &'static Mutex<HashSet<String>> {
     LOGGED_POLICIES.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-fn inspect_postgres_transport_policy(dsn: &str) -> MetaResult<PgTransportPolicy> {
-    let config = tokio_postgres::Config::from_str(dsn)
-        .map_err(|error| MetaError::Storage(format!("invalid postgres DSN: {error}")))?;
-    let targets = classify_targets(&config);
+fn inspect_postgres_transport_policy(config: &tokio_postgres::Config) -> PgTransportPolicy {
+    let targets = classify_targets(config);
     let target_class = if targets
         .iter()
         .all(|target| target.0 == PgTargetClass::Local)
@@ -235,11 +238,11 @@ fn inspect_postgres_transport_policy(dsn: &str) -> MetaResult<PgTransportPolicy>
         .map(|target| target.1.clone())
         .unwrap_or_else(|| "implicit local PostgreSQL socket".to_string());
 
-    Ok(PgTransportPolicy {
+    PgTransportPolicy {
         target_class,
         display_host,
         sslmode: config.get_ssl_mode(),
-    })
+    }
 }
 
 fn classify_targets(config: &tokio_postgres::Config) -> Vec<(PgTargetClass, String)> {
@@ -315,7 +318,7 @@ fn format_pg_error(error: tokio_postgres::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        PgTargetClass, classify_host, inspect_postgres_transport_policy,
+        PgTargetClass, classify_host, inspect_postgres_transport_policy, parse_postgres_config,
         validate_postgres_transport_policy,
     };
     use tokio_postgres::config::SslMode;
@@ -344,10 +347,11 @@ mod tests {
 
     #[test]
     fn transport_policy_uses_driver_parsed_sslmode() {
-        let policy = inspect_postgres_transport_policy(
+        let config = parse_postgres_config(
             "host=db.example.com user=studiofs sslmode=prefer sslmode=require",
         )
-        .expect("inspect transport policy");
+        .expect("parse postgres config");
+        let policy = inspect_postgres_transport_policy(&config);
 
         assert_eq!(policy.sslmode, SslMode::Require);
     }
