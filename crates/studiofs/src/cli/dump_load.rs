@@ -192,7 +192,7 @@ fn load_remote_dump(meta_dsn: &str, volume_id: i64) -> DumpLoadResult<MetadataDu
             .metadata_dsn;
         let (client, connection) = connect_studiofs_postgres(&metadata_dsn)
             .await
-            .map_err(|e| DumpLoadError::Message(format!("cannot connect to postgres: {e}")))?;
+            .map_err(|e| DumpLoadError::Message(e.to_string()))?;
         let connection_task = tokio::spawn(connection);
 
         let dump = async {
@@ -349,7 +349,7 @@ fn apply_dump(postgres_address: &str, dump: MetadataDump) -> DumpLoadResult<i64>
             .metadata_dsn;
         let (mut client, connection) = connect_studiofs_postgres(&metadata_dsn)
             .await
-            .map_err(|e| DumpLoadError::Message(format!("cannot connect to postgres: {e}")))?;
+            .map_err(|e| DumpLoadError::Message(e.to_string()))?;
         let connection_task = tokio::spawn(connection);
 
         let result = async {

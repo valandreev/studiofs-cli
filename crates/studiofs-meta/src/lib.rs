@@ -40,7 +40,7 @@ pub use pg_dsn::{
     STUDIOFS_METADATA_DB, StudioPgDsns, ensure_studiofs_database, resolve_studiofs_pg_dsns,
 };
 pub use pg_engine::{PgMetaEngine, PgOpenOptions};
-pub use pg_transport::{connect_studiofs_postgres, validate_postgres_transport_policy};
+pub use pg_transport::connect_studiofs_postgres;
 pub use redb_engine::RedbMetaEngine;
 pub use types::*;
 

@@ -134,7 +134,7 @@ fn load_remote_discovery_state(name: &str, meta_dsn: &str) -> DiscoveryResult<Di
 async fn fetch_remote_snapshot(name: &str, postgres_dsn: &str) -> DiscoveryResult<(i64, Vec<u8>)> {
     let (client, connection) = connect_studiofs_postgres(postgres_dsn)
         .await
-        .map_err(|e| DiscoveryError::Message(format!("cannot connect to postgres: {e}")))?;
+        .map_err(|e| DiscoveryError::Message(e.to_string()))?;
     let conn_task = tokio::spawn(connection);
 
     let result = async {

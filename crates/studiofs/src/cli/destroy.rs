@@ -37,6 +37,9 @@ pub enum DestroyError {
     #[error("postgres operation failed: {0}")]
     Postgres(#[from] tokio_postgres::Error),
 
+    #[error(transparent)]
+    PostgresConnection(MetaError),
+
     #[error("object store operation failed: {0}")]
     ObjectStore(#[from] opendal::Error),
 
@@ -272,7 +275,9 @@ async fn delete_remote_state(format_info: &studiofs_meta::FormatInfo) -> Destroy
 }
 
 async fn delete_postgres_metadata(pg_url: &str, volume_id: i64) -> DestroyResult<()> {
-    let (client, connection) = connect_studiofs_postgres(pg_url).await?;
+    let (client, connection) = connect_studiofs_postgres(pg_url)
+        .await
+        .map_err(DestroyError::PostgresConnection)?;
 
     let connection = tokio::spawn(async move { connection.await.map_err(DestroyError::Postgres) });
 

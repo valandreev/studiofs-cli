@@ -5,7 +5,6 @@
 //! The command validates basic storage connectivity and PostgreSQL availability
 //! before writing local metadata state.
 
-use anyhow::Context;
 use clap::Args;
 use std::io::Write;
 use std::path::PathBuf;
@@ -237,9 +236,7 @@ fn ensure_bucket_accessible(
 
 fn check_postgres_accessible(rt: &tokio::runtime::Runtime, dsn: &str) -> anyhow::Result<()> {
     rt.block_on(async {
-        let (client, connection) = connect_studiofs_postgres(dsn)
-            .await
-            .map_err(|e| anyhow::anyhow!("cannot connect to postgres: {e}"))?;
+        let (client, connection) = connect_studiofs_postgres(dsn).await?;
 
         let conn_task = tokio::spawn(async move {
             if let Err(e) = connection.await {
@@ -259,9 +256,7 @@ fn check_postgres_accessible(rt: &tokio::runtime::Runtime, dsn: &str) -> anyhow:
 
 fn volume_name_exists(rt: &tokio::runtime::Runtime, dsn: &str, name: &str) -> anyhow::Result<bool> {
     rt.block_on(async {
-        let (client, connection) = connect_studiofs_postgres(dsn)
-            .await
-            .map_err(|e| anyhow::anyhow!("cannot connect to postgres: {e}"))?;
+        let (client, connection) = connect_studiofs_postgres(dsn).await?;
 
         let conn_task = tokio::spawn(async move {
             if let Err(e) = connection.await {
@@ -452,9 +447,7 @@ fn init_pg_schema_and_volume(
                 )
             })?;
         let active_key = ActiveCryptoKeyRow::from_encryption(encryption);
-        let (mut client, connection) = connect_studiofs_postgres(dsn)
-            .await
-            .context("cannot connect to postgres")?;
+        let (mut client, connection) = connect_studiofs_postgres(dsn).await?;
 
         let conn_task = tokio::spawn(async move {
             if let Err(e) = connection.await {
@@ -524,9 +517,7 @@ fn seed_pg_metadata_state(
     snapshot_json: &[u8],
 ) -> anyhow::Result<()> {
     rt.block_on(async {
-        let (client, connection) = connect_studiofs_postgres(dsn)
-            .await
-            .map_err(|e| anyhow::anyhow!("cannot connect to postgres: {e}"))?;
+        let (client, connection) = connect_studiofs_postgres(dsn).await?;
         let conn_task = tokio::spawn(async move {
             if let Err(e) = connection.await {
                 tracing::warn!("postgres connection task ended: {e}");

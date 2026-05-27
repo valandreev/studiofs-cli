@@ -156,13 +156,6 @@ where
     }
 }
 
-/// Validate the StudioFS PostgreSQL transport policy without opening a socket.
-pub fn validate_postgres_transport_policy(dsn: &str) -> MetaResult<()> {
-    let config = parse_postgres_config(dsn)?;
-    inspect_postgres_transport_policy(&config);
-    Ok(())
-}
-
 /// Open a PostgreSQL connection using the StudioFS transport policy.
 pub async fn connect_studiofs_postgres(
     dsn: &str,
@@ -248,12 +241,14 @@ fn inspect_postgres_transport_policy(config: &tokio_postgres::Config) -> PgTrans
 fn classify_targets(config: &tokio_postgres::Config) -> Vec<(PgTargetClass, String)> {
     let hostaddrs = config.get_hostaddrs();
     if !hostaddrs.is_empty() {
+        let hosts = config.get_hosts();
         return hostaddrs
             .iter()
-            .map(|addr| {
+            .enumerate()
+            .map(|(index, addr)| {
                 (
                     classify_ip(*addr),
-                    normalize_host_display(&addr.to_string()),
+                    display_host_for_hostaddr(hosts, index).unwrap_or_else(|| addr.to_string()),
                 )
             })
             .collect();
@@ -275,6 +270,15 @@ fn classify_targets(config: &tokio_postgres::Config) -> Vec<(PgTargetClass, Stri
             Host::Unix(path) => (PgTargetClass::Local, path.display().to_string()),
         })
         .collect()
+}
+
+fn display_host_for_hostaddr(hosts: &[Host], index: usize) -> Option<String> {
+    match hosts.get(index) {
+        Some(Host::Tcp(host)) => Some(normalize_host_display(host)),
+        #[cfg(unix)]
+        Some(Host::Unix(path)) => Some(path.display().to_string()),
+        None => None,
+    }
 }
 
 fn classify_host(host: &str) -> PgTargetClass {
@@ -318,31 +322,40 @@ fn format_pg_error(error: tokio_postgres::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        PgTargetClass, classify_host, inspect_postgres_transport_policy, parse_postgres_config,
-        validate_postgres_transport_policy,
+        PgTargetClass, PgTransportPolicy, classify_host, inspect_postgres_transport_policy,
+        parse_postgres_config,
     };
     use tokio_postgres::config::SslMode;
 
+    fn policy_for_dsn(dsn: &str) -> PgTransportPolicy {
+        let config = parse_postgres_config(dsn).expect("parse postgres config");
+        inspect_postgres_transport_policy(&config)
+    }
+
     #[test]
     fn remote_url_without_sslmode_is_accepted_as_tls_preferred() {
-        validate_postgres_transport_policy("postgres://user:secret@db.example.com/studiofs")
-            .expect("remote DSN without sslmode should use TLS-preferred behavior");
+        let policy = policy_for_dsn("postgres://user:secret@db.example.com/studiofs");
+
+        assert_eq!(policy.target_class, PgTargetClass::Remote);
+        assert_eq!(policy.sslmode, SslMode::Prefer);
     }
 
     #[test]
     fn remote_keyword_dsn_with_disable_is_accepted_as_explicit_cleartext() {
-        validate_postgres_transport_policy(
-            "host=db.example.com user=studiofs password=secret sslmode=disable",
-        )
-        .expect("explicit cleartext DSN should be accepted with informational logging");
+        let policy =
+            policy_for_dsn("host=db.example.com user=studiofs password=secret sslmode=disable");
+
+        assert_eq!(policy.target_class, PgTargetClass::Remote);
+        assert_eq!(policy.sslmode, SslMode::Disable);
     }
 
     #[test]
     fn remote_dsn_with_require_is_accepted() {
-        validate_postgres_transport_policy(
-            "postgres://user:secret@db.example.com/studiofs?sslmode=require",
-        )
-        .expect("remote sslmode=require should be accepted");
+        let policy =
+            policy_for_dsn("postgres://user:secret@db.example.com/studiofs?sslmode=require");
+
+        assert_eq!(policy.target_class, PgTargetClass::Remote);
+        assert_eq!(policy.sslmode, SslMode::Require);
     }
 
     #[test]
@@ -358,27 +371,38 @@ mod tests {
 
     #[test]
     fn loopback_dsn_with_disable_is_accepted() {
-        validate_postgres_transport_policy(
-            "postgres://user:secret@127.42.0.7:5432/studiofs?sslmode=disable",
-        )
-        .expect("IPv4 loopback sslmode=disable should be accepted");
+        let ipv4_policy =
+            policy_for_dsn("postgres://user:secret@127.42.0.7:5432/studiofs?sslmode=disable");
+        assert_eq!(ipv4_policy.target_class, PgTargetClass::Local);
+        assert_eq!(ipv4_policy.sslmode, SslMode::Disable);
 
-        validate_postgres_transport_policy(
-            "host=::1 port=5432 user=studiofs password=secret sslmode=disable",
-        )
-        .expect("IPv6 loopback sslmode=disable should be accepted");
+        let ipv6_policy =
+            policy_for_dsn("host=::1 port=5432 user=studiofs password=secret sslmode=disable");
+        assert_eq!(ipv6_policy.target_class, PgTargetClass::Local);
+        assert_eq!(ipv6_policy.sslmode, SslMode::Disable);
     }
 
     #[test]
     fn ipv4_mapped_loopback_dsn_with_disable_is_accepted() {
-        validate_postgres_transport_policy(
+        let policy = policy_for_dsn(
             "postgres://user:secret@[::ffff:127.0.0.1]:5432/studiofs?sslmode=disable",
-        )
-        .expect("IPv4-mapped loopback sslmode=disable should be accepted");
+        );
+
+        assert_eq!(policy.target_class, PgTargetClass::Local);
+        assert_eq!(policy.sslmode, SslMode::Disable);
     }
 
     #[test]
     fn ipv4_compatible_loopback_host_is_local() {
         assert_eq!(classify_host("::127.0.0.1"), PgTargetClass::Local);
+    }
+
+    #[test]
+    fn hostaddr_classifies_by_address_but_displays_host_name() {
+        let policy =
+            policy_for_dsn("host=db.example.com hostaddr=10.1.2.3 user=studiofs sslmode=disable");
+
+        assert_eq!(policy.target_class, PgTargetClass::Remote);
+        assert_eq!(policy.display_host, "db.example.com");
     }
 }
