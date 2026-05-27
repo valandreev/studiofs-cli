@@ -236,7 +236,10 @@ fn parse_s3_endpoint(endpoint: &str) -> DataResult<ParsedEndpoint> {
 
 fn is_loopback_host(host: url::Host<&str>) -> bool {
     match host {
-        url::Host::Domain(domain) => domain.eq_ignore_ascii_case("localhost"),
+        url::Host::Domain(domain) => {
+            domain.eq_ignore_ascii_case("localhost")
+                || domain.to_ascii_lowercase().ends_with(".localhost")
+        }
         url::Host::Ipv4(addr) => addr.is_loopback(),
         url::Host::Ipv6(addr) => addr.is_loopback(),
     }
@@ -262,7 +265,7 @@ pub fn normalize_s3_endpoint_transport(endpoint: &str) -> DataResult<String> {
                 Ok(parsed.normalized)
             } else {
                 Err(invalid_endpoint(
-                    "HTTPS is required for non-local S3 endpoints; plain HTTP is allowed only for localhost, 127.0.0.0/8, or [::1]",
+                    "HTTPS is required for non-local S3 endpoints; plain HTTP is allowed only for localhost, *.localhost, 127.0.0.0/8, or [::1]",
                 ))
             }
         }
@@ -728,6 +731,7 @@ mod tests {
         for endpoint in [
             "https://s3.amazonaws.com",
             "http://localhost:9000",
+            "http://my-bucket.localhost:9000",
             "http://127.0.0.1:9000",
             "http://127.1.2.3:9000",
             "http://[::1]:9000",
