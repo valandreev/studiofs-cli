@@ -322,14 +322,38 @@ fn format_pg_error(error: tokio_postgres::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        PgTargetClass, PgTransportPolicy, classify_host, inspect_postgres_transport_policy,
-        parse_postgres_config,
+        PgTargetClass, PgTransportPolicy, classify_host, connect_studiofs_postgres,
+        inspect_postgres_transport_policy, parse_postgres_config,
     };
+    use crate::resolve_studiofs_pg_dsns;
+    use std::sync::OnceLock;
     use tokio_postgres::config::SslMode;
 
     fn policy_for_dsn(dsn: &str) -> PgTransportPolicy {
         let config = parse_postgres_config(dsn).expect("parse postgres config");
         inspect_postgres_transport_policy(&config)
+    }
+
+    fn workspace_env_path() -> std::path::PathBuf {
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        manifest_dir
+            .parent()
+            .and_then(|path| path.parent())
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or(manifest_dir)
+            .join(".env")
+    }
+
+    fn load_test_env() {
+        static ONCE: OnceLock<()> = OnceLock::new();
+        let _ = ONCE.get_or_init(|| {
+            let env_path = workspace_env_path();
+            if env_path.is_file() {
+                let _ = dotenvy::from_path(&env_path);
+            } else {
+                let _ = dotenvy::dotenv();
+            }
+        });
     }
 
     #[test]
@@ -404,5 +428,55 @@ mod tests {
 
         assert_eq!(policy.target_class, PgTargetClass::Remote);
         assert_eq!(policy.display_host, "db.example.com");
+    }
+
+    #[test]
+    fn rewritten_pg_dsns_preserve_interpretable_transport_options() {
+        let url_dsns = resolve_studiofs_pg_dsns(
+            "postgres://user:secret@db.example.com/original?sslmode=require",
+        )
+        .expect("resolve url dsn");
+        let keyword_dsns = resolve_studiofs_pg_dsns(
+            "host=127.0.0.1 user=studiofs password=secret dbname=original sslmode=disable",
+        )
+        .expect("resolve keyword dsn");
+
+        for dsn in [&url_dsns.admin_dsn, &url_dsns.metadata_dsn] {
+            let policy = policy_for_dsn(dsn);
+            assert_eq!(policy.target_class, PgTargetClass::Remote);
+            assert_eq!(policy.sslmode, SslMode::Require);
+        }
+        for dsn in [&keyword_dsns.admin_dsn, &keyword_dsns.metadata_dsn] {
+            let policy = policy_for_dsn(dsn);
+            assert_eq!(policy.target_class, PgTargetClass::Local);
+            assert_eq!(policy.sslmode, SslMode::Disable);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires TLS PostgreSQL backend (set STUDIOFS_TEST_PG_TLS_DSN or .env)"]
+    async fn tls_postgres_fixture_connects_when_configured() {
+        load_test_env();
+        let Ok(dsn) = std::env::var("STUDIOFS_TEST_PG_TLS_DSN") else {
+            eprintln!("skipping TLS PostgreSQL fixture: STUDIOFS_TEST_PG_TLS_DSN is not set");
+            return;
+        };
+        if dsn.trim().is_empty() {
+            eprintln!("skipping TLS PostgreSQL fixture: STUDIOFS_TEST_PG_TLS_DSN is empty");
+            return;
+        }
+
+        let (client, connection) = connect_studiofs_postgres(&dsn)
+            .await
+            .expect("connect to TLS PostgreSQL fixture");
+        let connection_task = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        client
+            .simple_query("SELECT 1")
+            .await
+            .expect("TLS PostgreSQL fixture query");
+        connection_task.abort();
     }
 }

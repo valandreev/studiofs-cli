@@ -5,6 +5,7 @@ use opendal::layers::{ConcurrentLimitLayer, RetryLayer, TimeoutLayer};
 use opendal::{Buffer, Operator, services::S3};
 use std::collections::HashSet;
 use std::fmt;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use studiofs_meta::{EncryptionConfig, FormatInfo};
@@ -240,7 +241,32 @@ fn is_loopback_host(host: url::Host<&str>) -> bool {
             domain.eq_ignore_ascii_case("localhost") || domain.ends_with(".localhost")
         }
         url::Host::Ipv4(addr) => addr.is_loopback(),
-        url::Host::Ipv6(addr) => addr.is_loopback(),
+        url::Host::Ipv6(addr) => is_loopback_ipv6(addr),
+    }
+}
+
+fn is_loopback_ipv6(addr: Ipv6Addr) -> bool {
+    if addr.is_loopback() {
+        return true;
+    }
+
+    embedded_ipv4_loopback(addr)
+        .map(|ipv4| ipv4.is_loopback())
+        .unwrap_or(false)
+}
+
+fn embedded_ipv4_loopback(addr: Ipv6Addr) -> Option<Ipv4Addr> {
+    let octets = addr.octets();
+    let is_mapped =
+        octets[..10].iter().all(|byte| *byte == 0) && octets[10] == 0xff && octets[11] == 0xff;
+    let is_compatible = octets[..12].iter().all(|byte| *byte == 0);
+
+    if is_mapped || is_compatible {
+        Some(Ipv4Addr::new(
+            octets[12], octets[13], octets[14], octets[15],
+        ))
+    } else {
+        None
     }
 }
 
@@ -264,7 +290,7 @@ pub fn normalize_s3_endpoint_transport(endpoint: &str) -> DataResult<String> {
                 Ok(parsed.normalized)
             } else {
                 Err(invalid_endpoint(
-                    "HTTPS is required for non-local S3 endpoints; plain HTTP is allowed only for localhost, *.localhost, 127.0.0.0/8, or [::1]",
+                    "HTTPS is required for non-local S3 endpoints; plain HTTP is allowed only for localhost, *.localhost, 127.0.0.0/8, [::1], or IPv4-mapped/compatible IPv6 loopback",
                 ))
             }
         }
@@ -735,6 +761,8 @@ mod tests {
             "http://127.0.0.1:9000",
             "http://127.1.2.3:9000",
             "http://[::1]:9000",
+            "http://[::ffff:127.0.0.1]:9000",
+            "http://[::127.0.0.1]:9000",
         ] {
             let mut config = encrypted_test_config();
             config.endpoint = endpoint.to_string();
@@ -742,6 +770,23 @@ mod tests {
             DataStore::new(&config)
                 .unwrap_or_else(|err| panic!("endpoint {endpoint} should be accepted, got {err}"));
         }
+    }
+
+    #[test]
+    fn s3_endpoint_policy_rejects_credentials_without_leaking_them() {
+        let mut config = encrypted_test_config();
+        config.endpoint = "https://AKIA_TEST:super-secret@s3.example.com".to_string();
+
+        let err = match DataStore::new(&config) {
+            Ok(_) => panic!("endpoint credentials must be rejected"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(err.contains("credentials"));
+        assert!(!err.contains("AKIA_TEST"));
+        assert!(!err.contains("super-secret"));
+        assert!(!err.contains("secret"));
+        assert!(!err.contains("access"));
     }
 
     #[test]

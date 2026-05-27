@@ -187,6 +187,21 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_keyword_dsn_preserves_tls_required_transport_options() {
+        let dsns = resolve_studiofs_pg_dsns(
+            "host=db.example.com port=5432 user=studiofs password=secret sslmode=require application_name=studiofs",
+        )
+        .expect("resolve keyword dsn");
+
+        assert!(dsns.admin_dsn.contains("dbname=postgres"));
+        assert!(dsns.metadata_dsn.contains("dbname=studiofs"));
+        assert!(dsns.admin_dsn.contains("sslmode=require"));
+        assert!(dsns.metadata_dsn.contains("sslmode=require"));
+        assert!(dsns.admin_dsn.contains("application_name=studiofs"));
+        assert!(dsns.metadata_dsn.contains("application_name=studiofs"));
+    }
+
+    #[test]
     fn test_override_existing_dbname() {
         let dsns = resolve_studiofs_pg_dsns(
             "host=127.0.0.1 port=5432 user=studiofs password=studiofs dbname=otherdb",

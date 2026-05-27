@@ -50,6 +50,12 @@ fn test_env_var(key: &str, default: &str) -> String {
         .unwrap_or_else(|| default.into())
 }
 
+fn optional_test_env_var(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
 /// Default S3-compatible test credentials and endpoint.
 fn test_config() -> DataStoreConfig {
     load_test_env();
@@ -72,12 +78,16 @@ fn make_store() -> DataStore {
 }
 
 async fn ensure_bucket() {
+    let cfg = test_config();
+    ensure_bucket_for(&cfg).await;
+}
+
+async fn ensure_bucket_for(cfg: &DataStoreConfig) {
     use aws_sdk_s3::Client as S3Client;
     use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
     use aws_smithy_http_client::Builder as SmithyHttpClientBuilder;
     use opendal::{Operator, services::S3};
 
-    let cfg = test_config();
     let builder = S3::default()
         .endpoint(&cfg.endpoint)
         .bucket(&cfg.bucket)
@@ -208,4 +218,28 @@ async fn large_multi_object_write() {
     for object_id in object_ids {
         store.delete_object(&object_id).await.unwrap();
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires live HTTPS S3-compatible backend (set STUDIOFS_S3_HTTPS_ENDPOINT or .env)"]
+async fn https_endpoint_fixture_put_get_when_configured() {
+    load_test_env();
+    let Some(endpoint) = optional_test_env_var("STUDIOFS_S3_HTTPS_ENDPOINT") else {
+        eprintln!("skipping HTTPS S3 fixture: STUDIOFS_S3_HTTPS_ENDPOINT is not set");
+        return;
+    };
+
+    let mut cfg = test_config();
+    cfg.endpoint = endpoint;
+    ensure_bucket_for(&cfg).await;
+    let store = DataStore::new(&cfg).expect("HTTPS S3 endpoint should build");
+
+    let key = format!("integration-test/https/{}", unique_object_id());
+    let payload = Bytes::from_static(b"studiofs https transport fixture");
+
+    store.put_by_key(&key, payload.clone()).await.unwrap();
+    let got = store.get_by_key(&key).await.unwrap().to_bytes();
+
+    assert_eq!(got, payload);
+    store.delete_by_key(&key).await.unwrap();
 }
