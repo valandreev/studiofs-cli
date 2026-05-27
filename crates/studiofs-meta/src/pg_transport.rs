@@ -1,11 +1,12 @@
 use crate::{MetaError, MetaResult};
 use rustls::pki_types::ServerName;
+use std::collections::HashSet;
 use std::future::Future;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_postgres::config::{Host, SslMode};
@@ -42,29 +43,37 @@ enum PgTargetClass {
 struct PgTransportPolicy {
     target_class: PgTargetClass,
     display_host: String,
-    sslmode: Option<String>,
+    sslmode: SslMode,
 }
 
 impl StudioPgTls {
     fn new() -> MetaResult<Self> {
-        let root_store = rustls::RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-        };
-        let provider = rustls::crypto::ring::default_provider();
-        let config = rustls::ClientConfig::builder_with_provider(provider.into())
-            .with_safe_default_protocol_versions()
-            .map_err(|error| {
-                MetaError::Storage(format!(
-                    "failed to configure postgres TLS versions: {error}"
-                ))
-            })?
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-
         Ok(Self {
-            config: Arc::new(config),
+            config: shared_client_config()?,
         })
     }
+}
+
+fn shared_client_config() -> MetaResult<Arc<rustls::ClientConfig>> {
+    static CLIENT_CONFIG: OnceLock<Result<Arc<rustls::ClientConfig>, String>> = OnceLock::new();
+
+    CLIENT_CONFIG
+        .get_or_init(|| {
+            let root_store = rustls::RootCertStore {
+                roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+            };
+            let provider = rustls::crypto::ring::default_provider();
+            let config = rustls::ClientConfig::builder_with_provider(provider.into())
+                .with_safe_default_protocol_versions()
+                .map_err(|error| format!("failed to configure postgres TLS versions: {error}"))?
+                .with_root_certificates(root_store)
+                .with_no_client_auth();
+
+            Ok(Arc::new(config))
+        })
+        .as_ref()
+        .map(Arc::clone)
+        .map_err(|error| MetaError::Storage(error.clone()))
 }
 
 impl MakeTlsConnect<tokio_postgres::Socket> for StudioPgTls {
@@ -174,32 +183,42 @@ fn log_postgres_transport_policy(policy: &PgTransportPolicy) {
         return;
     }
 
-    match policy
-        .sslmode
-        .as_deref()
-        .map(str::to_ascii_lowercase)
-        .as_deref()
+    let key = format!("{:?}:{}", policy.sslmode, policy.display_host);
+    let logged_policies = logged_transport_policies();
+    if !logged_policies
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(key)
     {
-        Some("require") => {}
-        Some("disable") => {
+        return;
+    }
+
+    match policy.sslmode {
+        SslMode::Require => {}
+        SslMode::Disable => {
             info!(
                 host = %policy.display_host,
                 "PostgreSQL TLS is disabled by DSN; using cleartext transport"
             );
         }
-        _ => {
+        SslMode::Prefer => {
             info!(
                 host = %policy.display_host,
                 "PostgreSQL TLS is preferred; falling back to cleartext if the server does not support TLS"
             );
         }
+        _ => {}
     }
+}
+
+fn logged_transport_policies() -> &'static Mutex<HashSet<String>> {
+    static LOGGED_POLICIES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    LOGGED_POLICIES.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
 fn inspect_postgres_transport_policy(dsn: &str) -> MetaResult<PgTransportPolicy> {
     let config = tokio_postgres::Config::from_str(dsn)
         .map_err(|error| MetaError::Storage(format!("invalid postgres DSN: {error}")))?;
-    let sslmode = explicit_sslmode(dsn);
     let targets = classify_targets(&config);
     let target_class = if targets
         .iter()
@@ -219,12 +238,7 @@ fn inspect_postgres_transport_policy(dsn: &str) -> MetaResult<PgTransportPolicy>
     Ok(PgTransportPolicy {
         target_class,
         display_host,
-        sslmode: sslmode.or_else(|| match config.get_ssl_mode() {
-            SslMode::Disable => Some("disable".to_string()),
-            SslMode::Require => Some("require".to_string()),
-            SslMode::Prefer => None,
-            _ => None,
-        }),
+        sslmode: config.get_ssl_mode(),
     })
 }
 
@@ -275,7 +289,7 @@ fn classify_ip(addr: IpAddr) -> PgTargetClass {
     match addr {
         IpAddr::V4(addr) if addr.is_loopback() => PgTargetClass::Local,
         IpAddr::V6(addr) if addr.is_loopback() => PgTargetClass::Local,
-        IpAddr::V6(addr) => embedded_ipv4(addr).map_or(PgTargetClass::Remote, |ipv4| {
+        IpAddr::V6(addr) => addr.to_ipv4().map_or(PgTargetClass::Remote, |ipv4| {
             if ipv4.is_loopback() {
                 PgTargetClass::Local
             } else {
@@ -286,101 +300,8 @@ fn classify_ip(addr: IpAddr) -> PgTargetClass {
     }
 }
 
-fn embedded_ipv4(addr: Ipv6Addr) -> Option<Ipv4Addr> {
-    if let Some(ipv4) = addr.to_ipv4_mapped() {
-        return Some(ipv4);
-    }
-
-    let segments = addr.segments();
-    if segments[..6] == [0, 0, 0, 0, 0, 0] && (segments[6] != 0 || segments[7] != 0) {
-        let octets = [
-            (segments[6] >> 8) as u8,
-            segments[6] as u8,
-            (segments[7] >> 8) as u8,
-            segments[7] as u8,
-        ];
-        return Some(Ipv4Addr::from(octets));
-    }
-
-    None
-}
-
-fn explicit_sslmode(dsn: &str) -> Option<String> {
-    if dsn.contains("://") {
-        return url::Url::parse(dsn).ok().and_then(|url| {
-            url.query_pairs()
-                .find(|(key, _)| key.eq_ignore_ascii_case("sslmode"))
-                .map(|(_, value)| value.into_owned())
-        });
-    }
-
-    split_keyword_dsn(dsn).into_iter().find_map(|token| {
-        let (key, value) = token.split_once('=')?;
-        if key.eq_ignore_ascii_case("sslmode") {
-            Some(unquote_keyword_value(value).to_string())
-        } else {
-            None
-        }
-    })
-}
-
 fn normalize_host_display(host: &str) -> String {
     host.trim_matches(['[', ']']).to_string()
-}
-
-fn split_keyword_dsn(input: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut quote: Option<char> = None;
-    let mut escaped = false;
-
-    for ch in input.chars() {
-        if escaped {
-            current.push(ch);
-            escaped = false;
-            continue;
-        }
-
-        match quote {
-            Some(_) if ch == '\\' => {
-                current.push(ch);
-                escaped = true;
-            }
-            Some(q) if ch == q => {
-                quote = None;
-                current.push(ch);
-            }
-            Some(_) => current.push(ch),
-            None if ch == '\'' || ch == '"' => {
-                quote = Some(ch);
-                current.push(ch);
-            }
-            None if ch.is_whitespace() => {
-                if !current.is_empty() {
-                    tokens.push(std::mem::take(&mut current));
-                }
-            }
-            None => current.push(ch),
-        }
-    }
-
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-
-    tokens
-}
-
-fn unquote_keyword_value(value: &str) -> &str {
-    value
-        .strip_prefix('\'')
-        .and_then(|value| value.strip_suffix('\''))
-        .or_else(|| {
-            value
-                .strip_prefix('"')
-                .and_then(|value| value.strip_suffix('"'))
-        })
-        .unwrap_or(value)
 }
 
 fn format_pg_error(error: tokio_postgres::Error) -> String {
@@ -393,7 +314,11 @@ fn format_pg_error(error: tokio_postgres::Error) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_postgres_transport_policy;
+    use super::{
+        PgTargetClass, classify_host, inspect_postgres_transport_policy,
+        validate_postgres_transport_policy,
+    };
+    use tokio_postgres::config::SslMode;
 
     #[test]
     fn remote_url_without_sslmode_is_accepted_as_tls_preferred() {
@@ -418,6 +343,16 @@ mod tests {
     }
 
     #[test]
+    fn transport_policy_uses_driver_parsed_sslmode() {
+        let policy = inspect_postgres_transport_policy(
+            "host=db.example.com user=studiofs sslmode=prefer sslmode=require",
+        )
+        .expect("inspect transport policy");
+
+        assert_eq!(policy.sslmode, SslMode::Require);
+    }
+
+    #[test]
     fn loopback_dsn_with_disable_is_accepted() {
         validate_postgres_transport_policy(
             "postgres://user:secret@127.42.0.7:5432/studiofs?sslmode=disable",
@@ -436,5 +371,10 @@ mod tests {
             "postgres://user:secret@[::ffff:127.0.0.1]:5432/studiofs?sslmode=disable",
         )
         .expect("IPv4-mapped loopback sslmode=disable should be accepted");
+    }
+
+    #[test]
+    fn ipv4_compatible_loopback_host_is_local() {
+        assert_eq!(classify_host("::127.0.0.1"), PgTargetClass::Local);
     }
 }
