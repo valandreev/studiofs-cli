@@ -10,6 +10,7 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_postgres::config::{Host, SslMode};
 use tokio_postgres::tls::{ChannelBinding, MakeTlsConnect, TlsConnect, TlsStream};
+use tracing::info;
 
 /// TLS stream type used by StudioFS PostgreSQL connections.
 pub struct StudioPgTlsStream<S>(tokio_rustls::client::TlsStream<S>);
@@ -148,27 +149,7 @@ where
 
 /// Validate the StudioFS PostgreSQL transport policy without opening a socket.
 pub fn validate_postgres_transport_policy(dsn: &str) -> MetaResult<()> {
-    let policy = inspect_postgres_transport_policy(dsn)?;
-    if policy.target_class == PgTargetClass::Remote
-        && policy
-            .sslmode
-            .as_deref()
-            .map(str::to_ascii_lowercase)
-            .as_deref()
-            != Some("require")
-    {
-        let rejected_mode = match policy.sslmode.as_deref() {
-            Some(value) if !value.is_empty() => format!("sslmode={value}"),
-            _ => "sslmode omitted".to_string(),
-        };
-        return Err(MetaError::Storage(format!(
-            "PostgreSQL transport policy rejected host '{}' with {rejected_mode}; \
-             TLS is required for non-local DSNs. Use sslmode=require for remote PostgreSQL, \
-             or sslmode=disable only with localhost, 127.0.0.0/8, ::1, normalized IPv4-mapped \
-             IPv6 loopback, or Unix domain socket test DSNs.",
-            policy.display_host
-        )));
-    }
+    inspect_postgres_transport_policy(dsn)?;
     Ok(())
 }
 
@@ -176,7 +157,8 @@ pub fn validate_postgres_transport_policy(dsn: &str) -> MetaResult<()> {
 pub async fn connect_studiofs_postgres(
     dsn: &str,
 ) -> MetaResult<(tokio_postgres::Client, StudioPgConnection)> {
-    validate_postgres_transport_policy(dsn)?;
+    let policy = inspect_postgres_transport_policy(dsn)?;
+    log_postgres_transport_policy(&policy);
     let config = tokio_postgres::Config::from_str(dsn)
         .map_err(|error| MetaError::Storage(format!("invalid postgres DSN: {error}")))?;
     config.connect(StudioPgTls::new()?).await.map_err(|error| {
@@ -185,6 +167,33 @@ pub async fn connect_studiofs_postgres(
             format_pg_error(error)
         ))
     })
+}
+
+fn log_postgres_transport_policy(policy: &PgTransportPolicy) {
+    if policy.target_class != PgTargetClass::Remote {
+        return;
+    }
+
+    match policy
+        .sslmode
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("require") => {}
+        Some("disable") => {
+            info!(
+                host = %policy.display_host,
+                "PostgreSQL TLS is disabled by DSN; using cleartext transport"
+            );
+        }
+        _ => {
+            info!(
+                host = %policy.display_host,
+                "PostgreSQL TLS is preferred; falling back to cleartext if the server does not support TLS"
+            );
+        }
+    }
 }
 
 fn inspect_postgres_transport_policy(dsn: &str) -> MetaResult<PgTransportPolicy> {
@@ -387,30 +396,17 @@ mod tests {
     use super::validate_postgres_transport_policy;
 
     #[test]
-    fn remote_url_without_sslmode_is_rejected_without_leaking_password() {
-        let err =
-            validate_postgres_transport_policy("postgres://user:secret@db.example.com/studiofs")
-                .expect_err("remote DSN without sslmode=require must be rejected");
-        let message = err.to_string();
-
-        assert!(message.contains("PostgreSQL transport policy rejected"));
-        assert!(message.contains("db.example.com"));
-        assert!(message.contains("sslmode omitted"));
-        assert!(!message.contains("secret"));
-        assert!(!message.contains("user:secret"));
+    fn remote_url_without_sslmode_is_accepted_as_tls_preferred() {
+        validate_postgres_transport_policy("postgres://user:secret@db.example.com/studiofs")
+            .expect("remote DSN without sslmode should use TLS-preferred behavior");
     }
 
     #[test]
-    fn remote_keyword_dsn_with_disable_is_rejected() {
-        let err = validate_postgres_transport_policy(
+    fn remote_keyword_dsn_with_disable_is_accepted_as_explicit_cleartext() {
+        validate_postgres_transport_policy(
             "host=db.example.com user=studiofs password=secret sslmode=disable",
         )
-        .expect_err("remote sslmode=disable must be rejected");
-
-        let message = err.to_string();
-        assert!(message.contains("db.example.com"));
-        assert!(message.contains("sslmode=disable"));
-        assert!(!message.contains("secret"));
+        .expect("explicit cleartext DSN should be accepted with informational logging");
     }
 
     #[test]
