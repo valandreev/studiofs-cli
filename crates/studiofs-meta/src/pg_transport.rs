@@ -469,15 +469,16 @@ mod tests {
         let (client, connection) = connect_studiofs_postgres(&dsn)
             .await
             .expect("connect to TLS PostgreSQL fixture");
-        let connection_task = tokio::spawn(async move {
-            let _ = connection.await;
-        });
+        let connection_task = tokio::spawn(connection);
 
         client
             .simple_query("SELECT 1")
             .await
             .expect("TLS PostgreSQL fixture query");
-        connection_task.abort();
-        let _ = connection_task.await;
+        drop(client);
+        connection_task
+            .await
+            .expect("TLS PostgreSQL connection task should join")
+            .expect("TLS PostgreSQL connection should close cleanly");
     }
 }
