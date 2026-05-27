@@ -5,7 +5,7 @@ use opendal::layers::{ConcurrentLimitLayer, RetryLayer, TimeoutLayer};
 use opendal::{Buffer, Operator, services::S3};
 use std::collections::HashSet;
 use std::fmt;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::Ipv6Addr;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use studiofs_meta::{EncryptionConfig, FormatInfo};
@@ -246,28 +246,7 @@ fn is_loopback_host(host: url::Host<&str>) -> bool {
 }
 
 fn is_loopback_ipv6(addr: Ipv6Addr) -> bool {
-    if addr.is_loopback() {
-        return true;
-    }
-
-    embedded_ipv4_loopback(addr)
-        .map(|ipv4| ipv4.is_loopback())
-        .unwrap_or(false)
-}
-
-fn embedded_ipv4_loopback(addr: Ipv6Addr) -> Option<Ipv4Addr> {
-    let octets = addr.octets();
-    let is_mapped =
-        octets[..10].iter().all(|byte| *byte == 0) && octets[10] == 0xff && octets[11] == 0xff;
-    let is_compatible = octets[..12].iter().all(|byte| *byte == 0);
-
-    if is_mapped || is_compatible {
-        Some(Ipv4Addr::new(
-            octets[12], octets[13], octets[14], octets[15],
-        ))
-    } else {
-        None
-    }
+    addr.is_loopback() || addr.to_ipv4().is_some_and(|ipv4| ipv4.is_loopback())
 }
 
 /// Validate and normalize an S3-compatible endpoint according to StudioFS'
@@ -777,10 +756,10 @@ mod tests {
         let mut config = encrypted_test_config();
         config.endpoint = "https://AKIA_TEST:super-secret@s3.example.com".to_string();
 
-        let err = match DataStore::new(&config) {
-            Ok(_) => panic!("endpoint credentials must be rejected"),
-            Err(err) => err.to_string(),
-        };
+        let err = DataStore::new(&config)
+            .err()
+            .expect("endpoint credentials must be rejected")
+            .to_string();
 
         assert!(err.contains("credentials"));
         assert!(!err.contains("AKIA_TEST"));

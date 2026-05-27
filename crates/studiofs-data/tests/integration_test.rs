@@ -239,7 +239,11 @@ async fn https_endpoint_fixture_put_get_when_configured() {
 
     store.put_by_key(&key, payload.clone()).await.unwrap();
     let got = store.get_by_key(&key).await.unwrap().to_bytes();
+    let payload_matches = got == payload;
 
-    assert_eq!(got, payload);
     store.delete_by_key(&key).await.unwrap();
+    assert!(
+        payload_matches,
+        "downloaded object must match uploaded data"
+    );
 }
