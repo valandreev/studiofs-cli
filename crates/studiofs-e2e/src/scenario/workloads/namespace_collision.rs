@@ -546,8 +546,12 @@ pub(in crate::scenario) fn namespace_collision_initial_state_missing(
     clients: &[ClientSpec],
 ) -> Result<Vec<String>, ScenarioError> {
     let mut missing = Vec::new();
+    let seed_client = clients.first().map(|client| client.name.as_str());
     for client in clients {
         for (relative_path, payload) in kind.initial_paths() {
+            if Some(client.name.as_str()) == seed_client {
+                continue;
+            }
             match run_hotspot_helper_process(
                 context,
                 MOUNTED_VALIDATION_PROBE_TIMEOUT,

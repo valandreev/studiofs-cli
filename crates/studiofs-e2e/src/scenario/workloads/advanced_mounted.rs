@@ -817,6 +817,7 @@ pub(in crate::scenario) fn execute_advanced_mounted_operations(
         }
         AdvancedMountedKind::SymlinkAttribute => {
             let (operations, summary) = run_symlink_attribute_operations(
+                context,
                 clients,
                 isolation,
                 ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT,
@@ -4409,17 +4410,31 @@ pub(in crate::scenario) fn run_invalidation_dropout_fallback_operations(
     let final_payload = isolation.payload("writer_overwrite", &target_path, "fallback final");
     let delete_payload = isolation.payload("writer_delete", &delete_path, "delete before fallback");
 
-    write_mounted_file_with_readback(
-        writer_a.mount_point.join(&baseline_path),
-        &baseline_payload,
-        "invalidation dropout baseline",
-        true,
+    run_hotspot_helper_process(
+        context,
+        MOUNTED_WRITE_READBACK_TIMEOUT,
+        writer_a,
+        "create",
+        &baseline_path,
+        None,
+        Some(&baseline_payload),
+        format!(
+            "{} invalidation dropout baseline {}",
+            writer_a.name, baseline_path
+        ),
     )?;
-    write_mounted_file_with_readback(
-        writer_a.mount_point.join(&delete_path),
-        &delete_payload,
-        "invalidation dropout delete baseline",
-        true,
+    run_hotspot_helper_process(
+        context,
+        MOUNTED_WRITE_READBACK_TIMEOUT,
+        writer_a,
+        "create",
+        &delete_path,
+        None,
+        Some(&delete_payload),
+        format!(
+            "{} invalidation dropout delete baseline {}",
+            writer_a.name, delete_path
+        ),
     )?;
     wait_for_mounted_initial_payloads_until(
         clients,
@@ -4446,11 +4461,18 @@ pub(in crate::scenario) fn run_invalidation_dropout_fallback_operations(
         writer_a,
         "writer_create",
         &target_path,
-        write_mounted_file_with_readback(
-            writer_a.mount_point.join(&target_path),
-            &create_payload,
-            "invalidation dropout writer create",
-            true,
+        run_hotspot_helper_process(
+            context,
+            MOUNTED_WRITE_READBACK_TIMEOUT,
+            writer_a,
+            "create",
+            &target_path,
+            None,
+            Some(&create_payload),
+            format!(
+                "{} invalidation dropout writer create {}",
+                writer_a.name, target_path
+            ),
         ),
     )?);
     wait_for_mounted_initial_payloads_until(
@@ -4466,11 +4488,18 @@ pub(in crate::scenario) fn run_invalidation_dropout_fallback_operations(
         writer_b,
         "writer_overwrite",
         &target_path,
-        write_mounted_file_with_readback(
-            writer_b.mount_point.join(&target_path),
-            &final_payload,
-            "invalidation dropout writer overwrite",
-            false,
+        run_hotspot_helper_process(
+            context,
+            MOUNTED_WRITE_READBACK_TIMEOUT,
+            writer_b,
+            "overwrite-barrier",
+            &target_path,
+            None,
+            Some(&final_payload),
+            format!(
+                "{} invalidation dropout writer overwrite {}",
+                writer_b.name, target_path
+            ),
         ),
     )?);
     operations.push(required_op(
@@ -4479,7 +4508,19 @@ pub(in crate::scenario) fn run_invalidation_dropout_fallback_operations(
         writer_a,
         "writer_delete",
         &delete_path,
-        remove_mounted_file(writer_a.mount_point.join(&delete_path)),
+        run_hotspot_helper_process(
+            context,
+            MOUNTED_WRITE_READBACK_TIMEOUT,
+            writer_a,
+            "unlink",
+            &delete_path,
+            None,
+            None,
+            format!(
+                "{} invalidation dropout writer delete {}",
+                writer_a.name, delete_path
+            ),
+        ),
     )?);
 
     let stale_window_observed = assert_observer_stays_stale_for_window(
@@ -4569,6 +4610,7 @@ pub(in crate::scenario) fn advanced_client_by_name<'a>(
 }
 
 pub(in crate::scenario) fn run_symlink_attribute_operations(
+    context: &ScenarioContext,
     clients: &[ClientSpec],
     isolation: &ScenarioIsolation,
     timeout: Duration,
@@ -4598,15 +4640,31 @@ pub(in crate::scenario) fn run_symlink_attribute_operations(
         writer,
         "symlink_target_write",
         &target_v1,
-        write_mounted_file_without_barrier_with_readback(
-            writer.mount_point.join(&target_v1),
-            &target_v1_payload,
-            "symlink target v1",
+        run_hotspot_helper_process(
+            context,
+            MOUNTED_WRITE_READBACK_TIMEOUT,
+            writer,
+            "create",
+            &target_v1,
+            None,
+            Some(&target_v1_payload),
+            format!("{} symlink target v1 {}", writer.name, target_v1),
         ),
     )?);
 
-    let link_result =
-        create_mounted_file_symlink(writer.mount_point.join(&link), SYMLINK_ATTRIBUTE_TARGET_V1);
+    let link_result = run_hotspot_helper_process(
+        context,
+        MOUNTED_WRITE_READBACK_TIMEOUT,
+        writer,
+        "symlink-create",
+        &link,
+        Some(SYMLINK_ATTRIBUTE_TARGET_V1),
+        None,
+        format!(
+            "{} symlink create {} -> {}",
+            writer.name, link, SYMLINK_ATTRIBUTE_TARGET_V1
+        ),
+    );
     let (symlink_supported, symlink_skip_reason) = match link_result {
         Ok(()) => {
             operations.push(required_op(
@@ -4630,17 +4688,19 @@ pub(in crate::scenario) fn run_symlink_attribute_operations(
                 renamer,
                 "symlink_rename",
                 &format!("{link} -> {renamed_link}"),
-                retry_mounted_io(
-                    || {
-                        fs::rename(
-                            renamer.mount_point.join(&link),
-                            renamer.mount_point.join(&renamed_link),
-                        )
-                    },
+                run_hotspot_helper_process(
+                    context,
                     MOUNTED_WRITE_READBACK_TIMEOUT,
-                    MOUNTED_WRITE_READBACK_POLL_INTERVAL,
-                )
-                .map_err(ScenarioError::from),
+                    renamer,
+                    "rename",
+                    &link,
+                    Some(&renamed_link),
+                    None,
+                    format!(
+                        "{} symlink rename {} -> {}",
+                        renamer.name, link, renamed_link
+                    ),
+                ),
             )?);
             wait_for_symlink_target_until(
                 clients,
@@ -4655,10 +4715,15 @@ pub(in crate::scenario) fn run_symlink_attribute_operations(
                 renamer,
                 "symlink_target_replacement_write",
                 &target_v2,
-                write_mounted_file_without_barrier_with_readback(
-                    renamer.mount_point.join(&target_v2),
-                    &target_v2_payload,
-                    "symlink target v2",
+                run_hotspot_helper_process(
+                    context,
+                    MOUNTED_WRITE_READBACK_TIMEOUT,
+                    renamer,
+                    "create",
+                    &target_v2,
+                    None,
+                    Some(&target_v2_payload),
+                    format!("{} symlink target v2 {}", renamer.name, target_v2),
                 ),
             )?);
             operations.push(required_op(
@@ -4667,9 +4732,18 @@ pub(in crate::scenario) fn run_symlink_attribute_operations(
                 renamer,
                 "symlink_target_update",
                 &format!("{renamed_link} -> {}", SYMLINK_ATTRIBUTE_TARGET_V2),
-                replace_mounted_file_symlink(
-                    renamer.mount_point.join(&renamed_link),
-                    SYMLINK_ATTRIBUTE_TARGET_V2,
+                run_hotspot_helper_process(
+                    context,
+                    MOUNTED_WRITE_READBACK_TIMEOUT,
+                    renamer,
+                    "symlink-replace",
+                    &renamed_link,
+                    Some(SYMLINK_ATTRIBUTE_TARGET_V2),
+                    None,
+                    format!(
+                        "{} symlink target update {} -> {}",
+                        renamer.name, renamed_link, SYMLINK_ATTRIBUTE_TARGET_V2
+                    ),
                 ),
             )?);
             wait_for_symlink_target_until(
@@ -4681,7 +4755,7 @@ pub(in crate::scenario) fn run_symlink_attribute_operations(
             )?;
             (true, None)
         }
-        Err(error) if is_supported_symlink_skip_error(&error) => {
+        Err(error) if hotspot_helper_error_is_supported_symlink_skip(&error) => {
             operations.push(required_op(
                 started,
                 operations.len() + 1,
@@ -4692,7 +4766,7 @@ pub(in crate::scenario) fn run_symlink_attribute_operations(
             )?);
             (false, Some(error.to_string()))
         }
-        Err(error) => return Err(ScenarioError::Io(error)),
+        Err(error) => return Err(error),
     };
 
     operations.push(required_op(
@@ -4701,13 +4775,33 @@ pub(in crate::scenario) fn run_symlink_attribute_operations(
         attr_writer,
         "readonly_attribute_target_write",
         &readonly_path,
-        write_mounted_file_without_barrier_with_readback(
-            attr_writer.mount_point.join(&readonly_path),
-            &readonly_payload,
-            "readonly attribute target",
+        run_hotspot_helper_process(
+            context,
+            MOUNTED_WRITE_READBACK_TIMEOUT,
+            attr_writer,
+            "create",
+            &readonly_path,
+            None,
+            Some(&readonly_payload),
+            format!(
+                "{} readonly attribute target {}",
+                attr_writer.name, readonly_path
+            ),
         ),
     )?);
-    let readonly_result = set_mounted_readonly(attr_writer.mount_point.join(&readonly_path));
+    let readonly_result = run_hotspot_helper_process(
+        context,
+        MOUNTED_WRITE_READBACK_TIMEOUT,
+        attr_writer,
+        "set-readonly",
+        &readonly_path,
+        None,
+        None,
+        format!(
+            "{} readonly attribute set {}",
+            attr_writer.name, readonly_path
+        ),
+    );
     let (readonly_attribute_supported, readonly_attribute_skip_reason) = match readonly_result {
         Ok(()) => {
             operations.push(required_op(
@@ -4720,12 +4814,7 @@ pub(in crate::scenario) fn run_symlink_attribute_operations(
             )?);
             (true, None)
         }
-        Err(error)
-            if matches!(
-                error.kind(),
-                io::ErrorKind::PermissionDenied | io::ErrorKind::Unsupported
-            ) =>
-        {
+        Err(error) if hotspot_helper_error_is_supported_symlink_skip(&error) => {
             operations.push(required_op(
                 started,
                 operations.len() + 1,
@@ -4736,7 +4825,7 @@ pub(in crate::scenario) fn run_symlink_attribute_operations(
             )?);
             (false, Some(error.to_string()))
         }
-        Err(error) => return Err(ScenarioError::Io(error)),
+        Err(error) => return Err(error),
     };
 
     operations.push(required_op(
@@ -4745,10 +4834,15 @@ pub(in crate::scenario) fn run_symlink_attribute_operations(
         writer,
         "near_symlink_write",
         &nearby_path,
-        write_mounted_file_without_barrier_with_readback(
-            writer.mount_point.join(&nearby_path),
-            &nearby_payload,
-            "near symlink write",
+        run_hotspot_helper_process(
+            context,
+            MOUNTED_WRITE_READBACK_TIMEOUT,
+            writer,
+            "create",
+            &nearby_path,
+            None,
+            Some(&nearby_payload),
+            format!("{} near symlink write {}", writer.name, nearby_path),
         ),
     )?);
 
@@ -4777,6 +4871,16 @@ pub(in crate::scenario) fn run_symlink_attribute_operations(
             final_validation_result: "mounted_tree_convergence".to_string(),
         },
     ))
+}
+
+pub(in crate::scenario) fn hotspot_helper_error_is_supported_symlink_skip(
+    error: &ScenarioError,
+) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("permission denied")
+        || message.contains("unsupported")
+        || message.contains("privilege")
+        || message.contains("operation not permitted")
 }
 
 pub(in crate::scenario) fn sparse_expected_range_specs(

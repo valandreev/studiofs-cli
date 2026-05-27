@@ -211,6 +211,65 @@ fn sparse_helper_ops_cover_range_write_truncate_and_probes() {
 }
 
 #[test]
+fn hotspot_helper_ops_cover_metadata_attribute_and_symlink_ops() {
+    let temp = tempdir().unwrap();
+    let mount = temp.path().join("mount");
+    std::fs::create_dir_all(&mount).unwrap();
+    let progress = temp.path().join("hotspot-progress.jsonl");
+    let payload_path = temp.path().join("payload.txt");
+    std::fs::write(&payload_path, b"target body").unwrap();
+
+    run_hotspot_op_helper(
+        "create",
+        mount.clone(),
+        "target.txt",
+        None,
+        Some(&payload_path),
+        Some(&progress),
+    )
+    .unwrap();
+    run_hotspot_op_helper(
+        "set-readonly",
+        mount.clone(),
+        "target.txt",
+        None,
+        None,
+        Some(&progress),
+    )
+    .unwrap();
+
+    assert!(
+        std::fs::metadata(mount.join("target.txt"))
+            .unwrap()
+            .permissions()
+            .readonly()
+    );
+
+    #[cfg(unix)]
+    {
+        run_hotspot_op_helper(
+            "symlink-create",
+            mount.clone(),
+            "link.txt",
+            Some("target.txt"),
+            None,
+            Some(&progress),
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_link(mount.join("link.txt")).unwrap(),
+            PathBuf::from("target.txt")
+        );
+    }
+
+    let progress = std::fs::read_to_string(progress).unwrap();
+    assert!(progress.contains("\"operation\":\"set-readonly\""));
+    #[cfg(unix)]
+    assert!(progress.contains("\"operation\":\"symlink-create\""));
+}
+
+#[test]
 fn sparse_wait_timeout_writes_diagnostics_artifacts() {
     let temp = tempdir().unwrap();
     let sandbox = temp.path().join("run-1");
@@ -2757,6 +2816,51 @@ fn overwrite_vs_read_collision_records_repeated_read_loop() {
         .find(|operation| operation.operation == "read_loop")
         .expect("overwrite/read scenario should record repeated reads");
     assert_eq!(read_loop.result, "accepted");
+}
+
+#[test]
+fn namespace_collision_initial_validation_skips_seed_writer_payload_probe() {
+    let temp = tempdir().unwrap();
+    let sandbox = temp.path().join("run-initial-skip");
+    let scenario_dir = sandbox
+        .join("artifacts")
+        .join("scenarios")
+        .join(COLLISION_OVERWRITE_VS_READ);
+    std::fs::create_dir_all(&scenario_dir).unwrap();
+    let clients = COLLISION_CLIENT_NAMES
+        .iter()
+        .copied()
+        .map(|name| {
+            let mount = temp.path().join("mounts").join(name);
+            std::fs::create_dir_all(&mount).unwrap();
+            client_spec_for(&sandbox, "projectfs", name, mount)
+        })
+        .collect::<Vec<_>>();
+    let context = ScenarioContext {
+        run_id: "run-initial-skip".to_string(),
+        seed: 328,
+        sandbox,
+        scenario_dir,
+        client_controller_config: None,
+    };
+
+    for client in clients.iter().skip(1) {
+        let path = client.mount_point.join("shared/data.txt");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, COLLISION_OLD_COMMITTED_PAYLOAD).unwrap();
+    }
+
+    let missing = namespace_collision_initial_state_missing(
+        &context,
+        NamespaceCollisionKind::OverwriteVsRead,
+        &clients,
+    )
+    .unwrap();
+
+    assert!(
+        missing.is_empty(),
+        "seed writer was already read back by the seed helper and should not be probed again: {missing:?}"
+    );
 }
 
 #[test]

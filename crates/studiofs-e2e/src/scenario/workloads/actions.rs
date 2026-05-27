@@ -309,44 +309,6 @@ pub(in crate::scenario) fn write_mounted_file_without_barrier_with_readback(
     Ok(())
 }
 
-pub(in crate::scenario) fn remove_mounted_file(path: PathBuf) -> Result<(), ScenarioError> {
-    run_bounded_mounted_io(
-        format!("remove {}", path.display()),
-        MOUNTED_WRITE_READBACK_TIMEOUT,
-        move || fs::remove_file(path),
-    )?;
-    Ok(())
-}
-
-pub(in crate::scenario) fn replace_mounted_file_symlink(
-    path: PathBuf,
-    target: &str,
-) -> Result<(), ScenarioError> {
-    retry_mounted_io(
-        || fs::remove_file(&path),
-        MOUNTED_WRITE_READBACK_TIMEOUT,
-        MOUNTED_WRITE_READBACK_POLL_INTERVAL,
-    )?;
-    create_mounted_file_symlink(path, target)?;
-    Ok(())
-}
-
-pub(in crate::scenario) fn create_mounted_file_symlink(
-    path: PathBuf,
-    target: &str,
-) -> io::Result<()> {
-    retry_mounted_io(
-        || {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            create_platform_file_symlink(Path::new(target), &path)
-        },
-        MOUNTED_WRITE_READBACK_TIMEOUT,
-        MOUNTED_WRITE_READBACK_POLL_INTERVAL,
-    )
-}
-
 #[cfg(windows)]
 pub(in crate::scenario) fn create_platform_file_symlink(
     target: &Path,
@@ -361,55 +323,6 @@ pub(in crate::scenario) fn create_platform_file_symlink(
     link: &Path,
 ) -> io::Result<()> {
     std::os::unix::fs::symlink(target, link)
-}
-
-pub(in crate::scenario) fn set_mounted_readonly(path: PathBuf) -> io::Result<()> {
-    retry_mounted_io(
-        || {
-            let mut permissions = fs::metadata(&path)?.permissions();
-            permissions.set_readonly(true);
-            fs::set_permissions(&path, permissions)
-        },
-        MOUNTED_WRITE_READBACK_TIMEOUT,
-        MOUNTED_WRITE_READBACK_POLL_INTERVAL,
-    )
-}
-
-pub(in crate::scenario) fn retry_mounted_io(
-    mut action: impl FnMut() -> io::Result<()>,
-    timeout: Duration,
-    poll_interval: Duration,
-) -> io::Result<()> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        match action() {
-            Ok(()) => return Ok(()),
-            Err(error) if is_transient_mounted_io_error(&error) && Instant::now() < deadline => {
-                thread::sleep(poll_interval);
-            }
-            Err(error) => return Err(error),
-        }
-    }
-}
-
-pub(in crate::scenario) fn is_transient_mounted_io_error(error: &io::Error) -> bool {
-    #[cfg(windows)]
-    {
-        const ERROR_GEN_FAILURE: i32 = 31;
-        error.raw_os_error() == Some(ERROR_GEN_FAILURE)
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = error;
-        false
-    }
-}
-
-pub(in crate::scenario) fn is_supported_symlink_skip_error(error: &io::Error) -> bool {
-    matches!(
-        error.kind(),
-        io::ErrorKind::PermissionDenied | io::ErrorKind::Unsupported
-    ) || is_transient_mounted_io_error(error)
 }
 
 pub(in crate::scenario) fn write_parented(path: PathBuf, payload: &[u8]) -> io::Result<()> {
@@ -770,6 +683,119 @@ pub fn run_hotspot_op_helper(
                 operation,
                 &path,
                 Some(target),
+                None,
+            )?;
+        }
+        "symlink-create" => {
+            let target = target.ok_or_else(|| anyhow::anyhow!("missing symlink target"))?;
+            if let Some(parent) = path.parent() {
+                record_hotspot_helper_progress(
+                    progress,
+                    "before_create_parent",
+                    operation,
+                    &path,
+                    Some(target),
+                    None,
+                )?;
+                fs::create_dir_all(parent)?;
+                record_hotspot_helper_progress(
+                    progress,
+                    "after_create_parent",
+                    operation,
+                    &path,
+                    Some(target),
+                    None,
+                )?;
+            }
+            record_hotspot_helper_progress(
+                progress,
+                "before_symlink_create",
+                operation,
+                &path,
+                Some(target),
+                None,
+            )?;
+            create_platform_file_symlink(Path::new(target), &path)?;
+            record_hotspot_helper_progress(
+                progress,
+                "after_symlink_create",
+                operation,
+                &path,
+                Some(target),
+                None,
+            )?;
+        }
+        "symlink-replace" => {
+            let target = target.ok_or_else(|| anyhow::anyhow!("missing symlink target"))?;
+            record_hotspot_helper_progress(
+                progress,
+                "before_symlink_remove",
+                operation,
+                &path,
+                Some(target),
+                None,
+            )?;
+            fs::remove_file(&path)?;
+            record_hotspot_helper_progress(
+                progress,
+                "after_symlink_remove",
+                operation,
+                &path,
+                Some(target),
+                None,
+            )?;
+            record_hotspot_helper_progress(
+                progress,
+                "before_symlink_create",
+                operation,
+                &path,
+                Some(target),
+                None,
+            )?;
+            create_platform_file_symlink(Path::new(target), &path)?;
+            record_hotspot_helper_progress(
+                progress,
+                "after_symlink_create",
+                operation,
+                &path,
+                Some(target),
+                None,
+            )?;
+        }
+        "set-readonly" => {
+            record_hotspot_helper_progress(
+                progress,
+                "before_metadata",
+                operation,
+                &path,
+                target,
+                None,
+            )?;
+            let mut permissions = fs::metadata(&path)?.permissions();
+            record_hotspot_helper_progress(
+                progress,
+                "after_metadata",
+                operation,
+                &path,
+                target,
+                None,
+            )?;
+            permissions.set_readonly(true);
+            record_hotspot_helper_progress(
+                progress,
+                "before_set_permissions",
+                operation,
+                &path,
+                target,
+                None,
+            )?;
+            fs::set_permissions(&path, permissions)?;
+            record_hotspot_helper_progress(
+                progress,
+                "after_set_permissions",
+                operation,
+                &path,
+                target,
                 None,
             )?;
         }
