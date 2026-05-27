@@ -72,6 +72,38 @@ StudioFS will use PostgreSQL database `studiofs` automatically.
 Local development and infra validation should target RustFS on the
 S3-compatible side unless a test explicitly checks another provider.
 
+### SFS-451 Transport TLS Fixtures
+
+SFS-451 adds focused transport validation without replacing the loopback
+RustFS/PostgreSQL fixtures. The optional external TLS fixtures skip cleanly when
+unset and are intended for operator-provided services:
+
+- `STUDIOFS_TEST_PG_TLS_DSN=host=... port=5432 user=... password=... sslmode=require`
+- `STUDIOFS_S3_HTTPS_ENDPOINT=https://s3-compatible.example`
+
+Loopback RustFS/PostgreSQL fixtures remain valid for local development and
+CI-style ignored tests that intentionally use `http://127.0.0.1:9000` and
+`sslmode=disable`.
+
+Focused transport policy checks:
+
+```powershell
+cargo test -p studiofs-meta pg_dsn -- --nocapture
+cargo test -p studiofs-meta pg_transport -- --nocapture
+cargo test -p studiofs-data endpoint -- --nocapture
+cargo test -p studiofs --test architecture_vocabulary_test tests_guide_covers_sfs451_transport_tls_fixtures -- --nocapture
+```
+
+Optional TLS fixture probes:
+
+```powershell
+$env:STUDIOFS_TEST_PG_TLS_DSN='host=... port=5432 user=... password=... sslmode=require'
+cargo test -p studiofs-meta tls_postgres_fixture_connects_when_configured -- --ignored --nocapture
+
+$env:STUDIOFS_S3_HTTPS_ENDPOINT='https://s3-compatible.example'
+cargo test -p studiofs-data --test integration_test https_endpoint_fixture_put_get_when_configured -- --ignored --nocapture
+```
+
 ## Command Matrix
 
 | Scope | Command |

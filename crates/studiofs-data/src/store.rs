@@ -5,6 +5,7 @@ use opendal::layers::{ConcurrentLimitLayer, RetryLayer, TimeoutLayer};
 use opendal::{Buffer, Operator, services::S3};
 use std::collections::HashSet;
 use std::fmt;
+use std::net::Ipv6Addr;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use studiofs_meta::{EncryptionConfig, FormatInfo};
@@ -240,8 +241,12 @@ fn is_loopback_host(host: url::Host<&str>) -> bool {
             domain.eq_ignore_ascii_case("localhost") || domain.ends_with(".localhost")
         }
         url::Host::Ipv4(addr) => addr.is_loopback(),
-        url::Host::Ipv6(addr) => addr.is_loopback(),
+        url::Host::Ipv6(addr) => is_loopback_ipv6(addr),
     }
+}
+
+fn is_loopback_ipv6(addr: Ipv6Addr) -> bool {
+    addr.is_loopback() || addr.to_ipv4().is_some_and(|ipv4| ipv4.is_loopback())
 }
 
 /// Validate and normalize an S3-compatible endpoint according to StudioFS'
@@ -264,7 +269,7 @@ pub fn normalize_s3_endpoint_transport(endpoint: &str) -> DataResult<String> {
                 Ok(parsed.normalized)
             } else {
                 Err(invalid_endpoint(
-                    "HTTPS is required for non-local S3 endpoints; plain HTTP is allowed only for localhost, *.localhost, 127.0.0.0/8, or [::1]",
+                    "HTTPS is required for non-local S3 endpoints; plain HTTP is allowed only for localhost, *.localhost, 127.0.0.0/8, [::1], or IPv4-mapped/compatible IPv6 loopback",
                 ))
             }
         }
@@ -735,6 +740,8 @@ mod tests {
             "http://127.0.0.1:9000",
             "http://127.1.2.3:9000",
             "http://[::1]:9000",
+            "http://[::ffff:127.0.0.1]:9000",
+            "http://[::127.0.0.1]:9000",
         ] {
             let mut config = encrypted_test_config();
             config.endpoint = endpoint.to_string();
@@ -742,6 +749,23 @@ mod tests {
             DataStore::new(&config)
                 .unwrap_or_else(|err| panic!("endpoint {endpoint} should be accepted, got {err}"));
         }
+    }
+
+    #[test]
+    fn s3_endpoint_policy_rejects_credentials_without_leaking_them() {
+        let mut config = encrypted_test_config();
+        config.endpoint = "https://AKIA_TEST:super-secret@s3.example.com".to_string();
+
+        let err = DataStore::new(&config)
+            .err()
+            .expect("endpoint credentials must be rejected")
+            .to_string();
+
+        assert!(err.contains("credentials"));
+        assert!(!err.contains("AKIA_TEST"));
+        assert!(!err.contains("super-secret"));
+        assert!(!err.contains("secret"));
+        assert!(!err.contains("access"));
     }
 
     #[test]

@@ -791,6 +791,33 @@ fn transport_encryption_contract_covers_required_sfs448_boundaries() {
 }
 
 #[test]
+fn tests_guide_covers_sfs451_transport_tls_fixtures() {
+    let doc = read_workspace_file("docs/tests.md");
+    let normalized_doc = normalize_doc_whitespace(&doc);
+    let required_terms = [
+        "SFS-451",
+        "STUDIOFS_TEST_PG_TLS_DSN",
+        "STUDIOFS_S3_HTTPS_ENDPOINT",
+        "optional external TLS fixtures",
+        "skip cleanly when unset",
+        "Loopback RustFS/PostgreSQL fixtures remain valid",
+        "cargo test -p studiofs-meta pg_dsn -- --nocapture",
+        "cargo test -p studiofs-data endpoint -- --nocapture",
+    ];
+
+    let missing: Vec<_> = required_terms
+        .into_iter()
+        .filter(|term| !contains_doc_term(&doc, &normalized_doc, term))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "SFS-451 transport TLS fixture docs are missing required surfaces:\n{}",
+        missing.join("\n")
+    );
+}
+
+#[test]
 fn local_first_validation_matrix_covers_sfs356_encrypted_regression_gates() {
     let doc = read_workspace_file("docs/local-first-validation-matrix.md");
     let normalized_doc = normalize_doc_whitespace(&doc);
