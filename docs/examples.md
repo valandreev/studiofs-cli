@@ -11,7 +11,7 @@ studiofs init myvolume \
   --bucket mybucket \
   --access-key studiofs \
   --secret-key studiofs123 \
-  --meta "host=127.0.0.1 port=5432 user=studiofs password=studiofs sslmode=disable"
+  --meta "postgres://studiofs:studiofs@127.0.0.1:5432?sslmode=disable"
 ```
 
 Production endpoints should use HTTPS S3 transport and TLS-capable PostgreSQL
@@ -23,7 +23,7 @@ studiofs init myvolume \
   --bucket mybucket \
   --access-key YOUR_ACCESS_KEY \
   --secret-key YOUR_SECRET_KEY \
-  --meta postgresql://studiofs:secret@db.example.com/studiofs?sslmode=require
+  --meta "postgresql://studiofs:secret@db.example.com/studiofs?sslmode=require"
 ```
 
 ## 2. Mount a Volume
@@ -101,7 +101,7 @@ If a volume has already been initialized on another machine, you do not need to 
 
 ```bash
 studiofs discover myvolume \
-  --meta "host=127.0.0.1 port=5432 user=studiofs password=studiofs sslmode=disable"
+  --meta "postgres://studiofs:studiofs@127.0.0.1:5432?sslmode=disable"
 ```
 After that, you can mount the volume:
 ```bash

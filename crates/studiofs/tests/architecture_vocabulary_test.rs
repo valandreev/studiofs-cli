@@ -746,7 +746,7 @@ fn transport_encryption_contract_covers_required_sfs448_boundaries() {
         "transport-only",
         "must not reopen at-rest SFEC implementation decisions",
         "HTTPS is required for non-local S3-compatible object storage endpoints",
-        "Plain HTTP is allowed only for explicit local/test loopback endpoints",
+        "Plain HTTP S3 is allowed only for explicit local/test loopback endpoints",
         "localhost",
         "127.0.0.0/8",
         "::1",
@@ -762,10 +762,10 @@ fn transport_encryption_contract_covers_required_sfs448_boundaries() {
         "info level, not warning level",
         "sslmode=require",
         "TLS setup failures remain fatal",
-        "`sslmode=disable` is accepted as a cleartext operator choice",
+        "`sslmode=disable` is accepted as an explicit cleartext operator choice",
         "Unix domain sockets",
         "no noisy downgrade warning",
-        "PostgreSQL carries metadata and active volume key material",
+        "PostgreSQL carries shared metadata and active volume key material",
         "volume_crypto_keys.key_material",
         "reject policy-invalid non-local transports early",
         "sanitize DSNs and endpoints",
@@ -838,11 +838,11 @@ fn docs_cover_sfs452_final_transport_acceptance_gate() {
     let required_terms = [
         "SFS-452",
         "final transport encryption acceptance gate",
-        "non-local S3-compatible endpoints require HTTPS",
-        "Plain HTTP S3 is accepted only for explicit local/test loopback endpoints",
+        "HTTPS is required for non-local S3-compatible object storage endpoints",
+        "Plain HTTP S3 is allowed only for explicit local/test loopback endpoints",
         "non-local PostgreSQL DSNs use TLS-preferred or TLS-required transport",
         "sslmode=disable is accepted as an explicit cleartext operator choice",
-        "PostgreSQL cleartext operator choices are logged at info level",
+        "must also be logged at info level for non-local hosts",
         "PostgreSQL carries shared metadata and active volume key material",
         "SFEC protects remote payload confidentiality and integrity at rest",
         "TLS protects credentials, metadata/key-material links, and network transport",
@@ -861,9 +861,10 @@ fn docs_cover_sfs452_final_transport_acceptance_gate() {
     let missing: Vec<_> = required_terms
         .into_iter()
         .filter(|term| {
-            !searchable_docs
-                .iter()
-                .any(|(doc, normalized_doc)| contains_doc_term(doc, normalized_doc, term))
+            let normalized_term = normalize_doc_whitespace(term);
+            !searchable_docs.iter().any(|(doc, normalized_doc)| {
+                doc.contains(term) || normalized_doc.contains(&normalized_term)
+            })
         })
         .collect();
 

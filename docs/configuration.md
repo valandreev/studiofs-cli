@@ -102,13 +102,13 @@ development/test fixtures.
 Production example:
 
 ```bash
-studiofs init projectfs --endpoint https://s3.example.com --bucket studiofs-prod --access-key YOUR_ACCESS_KEY --secret-key YOUR_SECRET_KEY --meta postgresql://user:pass@db.example.com/studiofs?sslmode=require
+studiofs init projectfs --endpoint https://s3.example.com --bucket studiofs-prod --access-key YOUR_ACCESS_KEY --secret-key YOUR_SECRET_KEY --meta "postgresql://user:pass@db.example.com/studiofs?sslmode=require"
 ```
 
 Loopback-only development/test example:
 
 ```bash
-studiofs init projectfs --endpoint http://127.0.0.1:9000 --bucket studiofs-test --access-key studiofs --secret-key studiofs123 --meta "host=127.0.0.1 port=5432 user=studiofs password=studiofs sslmode=disable"
+studiofs init projectfs --endpoint http://127.0.0.1:9000 --bucket studiofs-test --access-key studiofs --secret-key studiofs123 --meta "postgres://studiofs:studiofs@127.0.0.1:5432?sslmode=disable"
 ```
 
 ### `discover`
@@ -438,13 +438,13 @@ DSNs. The following workflow is a loopback-only development/test example.
 
 Client A:
 ```bash
-studiofs init projectfs --endpoint http://127.0.0.1:9000 --bucket studiofs-test --access-key studiofs --secret-key studiofs123 --meta "host=127.0.0.1 port=5432 user=studiofs password=studiofs sslmode=disable"
+studiofs init projectfs --endpoint http://127.0.0.1:9000 --bucket studiofs-test --access-key studiofs --secret-key studiofs123 --meta "postgres://studiofs:studiofs@127.0.0.1:5432?sslmode=disable"
 studiofs mount projectfs /mnt/studio/projectfs
 ```
 
 Client B:
 ```bash
-studiofs discover projectfs --meta "host=127.0.0.1 port=5432 user=studiofs password=studiofs sslmode=disable"
+studiofs discover projectfs --meta "postgres://studiofs:studiofs@127.0.0.1:5432?sslmode=disable"
 studiofs mount projectfs /mnt/studio/projectfs-b
 ```
 

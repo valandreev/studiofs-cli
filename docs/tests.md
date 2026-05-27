@@ -112,7 +112,8 @@ checks instead of the full workspace suite:
 ```powershell
 cargo test -p studiofs --test architecture_vocabulary_test docs_cover_sfs452_final_transport_acceptance_gate -- --nocapture
 cargo check -p studiofs-meta -p studiofs-data -p studiofs
-rg -n "tokio_postgres::connect\(|tokio_postgres::NoTls|sslmode=disable|http://" crates docs -S
+rg -n -F "tokio_postgres::connect(" crates docs
+rg -n "tokio_postgres::NoTls|sslmode=disable|http://" crates docs -S
 ```
 
 Expected search result shape:
@@ -124,7 +125,8 @@ Expected search result shape:
 - plain HTTP S3 is accepted only for explicit local/test loopback endpoints;
 - policy-invalid non-local S3 transports are rejected before init, persisted
   mount, or endpoint override;
-- PostgreSQL cleartext operator choices are logged at info level.
+- `sslmode=disable` cleartext choices must be logged at info level for
+  non-local hosts.
 
 Local loopback examples remain available only as loopback-only development/test
 examples.
