@@ -998,11 +998,16 @@ impl Filesystem for StudioFuseFs {
         }
     }
 
-    fn fsync(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, datasync: bool, reply: ReplyEmpty) {
-        match self.rt.block_on(self.vfs.fsync(ino, datasync)) {
+    fn fsync(&mut self, _req: &Request<'_>, ino: u64, fh: u64, datasync: bool, reply: ReplyEmpty) {
+        let result = if fh == 0 {
+            self.rt.block_on(self.vfs.fsync(ino, datasync))
+        } else {
+            self.rt.block_on(self.vfs.flush_fh(fh))
+        };
+        match result {
             Ok(()) => reply.ok(),
             Err(e) => {
-                error!("fsync({ino}) -> {e}");
+                error!("fsync({ino}, fh={fh}) -> {e}");
                 reply.error(vfs_err_to_errno(&e));
             }
         }

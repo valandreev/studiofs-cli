@@ -6305,6 +6305,26 @@ impl StudioVfs {
         Err(denied())
     }
 
+    pub(super) fn is_inode_not_found_error(error: &VfsError, ino: Ino) -> bool {
+        matches!(error, VfsError::Meta(MetaError::InodeNotFound(missing)) if *missing == ino)
+    }
+
+    /// Verify a mutating handle can still write even if a foreign unlink removed
+    /// namespace metadata after the handle was opened.
+    pub(super) fn enforce_write_access_for_handle(&self, fh: u64, ino: Ino) -> VfsResult<OpenFile> {
+        let open_file = self.enforce_mutating_handle_access(fh, ino)?;
+        match self.enforce_access(ino, AccessLevel::ReadWrite) {
+            Ok(()) => Ok(open_file),
+            Err(error)
+                if open_file.active_open_overlay && Self::is_inode_not_found_error(&error, ino) =>
+            {
+                self.handle_table.mark_orphan(ino);
+                Ok(open_file)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Test-only override for known file lock lease.
     #[doc(hidden)]
     pub fn set_known_file_lock_for_test(&self, ino: Ino, lease: Option<FileLockLease>) {
@@ -7383,9 +7403,11 @@ impl StudioVfs {
         if Self::write_access_requested(flags, trunc) {
             self.enforce_no_known_foreign_hard_lock(ino)?;
         }
-        if self.ignored_entry_attr(ino).is_some() {
+        if let Some(ignored_attr) = self.ignored_entry_attr(ino) {
             let active_open_overlay = Self::active_open_overlay_required(flags, trunc);
-            let open_file = self.handle_table.open(ino, flags, active_open_overlay);
+            let open_file =
+                self.handle_table
+                    .open(ino, flags, Some(ignored_attr), active_open_overlay);
             let fh = open_file.fh;
             if active_open_overlay {
                 self.sync_meta().note_active_open_inode(ino);
@@ -7416,7 +7438,12 @@ impl StudioVfs {
         }
 
         let active_open_overlay = Self::active_open_overlay_required(flags, trunc);
-        let open_file = self.handle_table.open(ino, flags, active_open_overlay);
+        let open_file = self.handle_table.open(
+            ino,
+            flags,
+            Some(read_context.attr.clone()),
+            active_open_overlay,
+        );
         let fh = open_file.fh;
         if active_open_overlay {
             self.sync_meta().note_active_open_inode(ino);

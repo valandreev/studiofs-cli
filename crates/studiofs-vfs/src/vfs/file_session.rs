@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Instant;
-use studiofs_meta::types::Ino;
+use studiofs_meta::types::{Ino, InodeAttr};
 use tracing::debug;
 
 use crate::utils::now_unix_millis;
@@ -87,16 +87,24 @@ pub struct OpenFile {
     pub ino: Ino,
     /// Open flags applied to this handle.
     pub flags: OpenFlags,
+    pub(super) open_attr: Option<InodeAttr>,
     pub(super) active_open_overlay: bool,
     access_state: Arc<Mutex<HandleAccessState>>,
 }
 
 impl OpenFile {
-    pub(super) fn new(fh: u64, ino: Ino, flags: OpenFlags, active_open_overlay: bool) -> Self {
+    pub(super) fn new(
+        fh: u64,
+        ino: Ino,
+        flags: OpenFlags,
+        open_attr: Option<InodeAttr>,
+        active_open_overlay: bool,
+    ) -> Self {
         Self {
             fh,
             ino,
             flags,
+            open_attr,
             active_open_overlay,
             access_state: Arc::new(Mutex::new(HandleAccessState::new(fh, flags))),
         }

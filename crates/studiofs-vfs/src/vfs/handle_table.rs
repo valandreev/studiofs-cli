@@ -2,7 +2,7 @@ use crate::access::AccessClass;
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use studiofs_meta::types::Ino;
+use studiofs_meta::types::{Ino, InodeAttr};
 
 use super::{OpenFile, OpenFlags};
 
@@ -29,9 +29,15 @@ impl HandleTable {
     }
 
     /// Allocate a new file handle and register it.
-    pub(super) fn open(&self, ino: Ino, flags: OpenFlags, active_open_overlay: bool) -> OpenFile {
+    pub(super) fn open(
+        &self,
+        ino: Ino,
+        flags: OpenFlags,
+        open_attr: Option<InodeAttr>,
+        active_open_overlay: bool,
+    ) -> OpenFile {
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
-        let open_file = OpenFile::new(fh, ino, flags, active_open_overlay);
+        let open_file = OpenFile::new(fh, ino, flags, open_attr, active_open_overlay);
         self.handles.write().insert(fh, open_file.clone());
         *self.open_counts.lock().entry(ino).or_insert(0) += 1;
         open_file
@@ -91,9 +97,9 @@ mod tests {
     #[test]
     fn test_handle_table_open_close() {
         let ht = HandleTable::new();
-        let fh1 = ht.open(10, OpenFlags::RDONLY, false);
-        let fh2 = ht.open(10, OpenFlags::RDWR, true);
-        let fh3 = ht.open(20, OpenFlags::WRONLY, true);
+        let fh1 = ht.open(10, OpenFlags::RDONLY, None, false);
+        let fh2 = ht.open(10, OpenFlags::RDWR, None, true);
+        let fh3 = ht.open(20, OpenFlags::WRONLY, None, true);
 
         assert_ne!(fh1.fh, fh2.fh);
         assert_ne!(fh2.fh, fh3.fh);
@@ -127,7 +133,7 @@ mod tests {
     #[test]
     fn test_handle_table_orphans() {
         let ht = HandleTable::new();
-        let _fh = ht.open(42, OpenFlags::RDWR, true);
+        let _fh = ht.open(42, OpenFlags::RDWR, None, true);
 
         assert!(!ht.take_orphan(42));
 

@@ -805,6 +805,51 @@ pub fn run_hotspot_op_helper(
                 None,
             )?;
         }
+        "read-exact" => {
+            let payload_path = payload.ok_or_else(|| anyhow::anyhow!("missing payload"))?;
+            record_hotspot_helper_progress(
+                progress,
+                "before_read_expected_payload",
+                operation,
+                &path,
+                target,
+                None,
+            )?;
+            let expected = fs::read(payload_path)?;
+            record_hotspot_helper_progress(
+                progress,
+                "after_read_expected_payload",
+                operation,
+                &path,
+                target,
+                Some(expected.len()),
+            )?;
+            record_hotspot_helper_progress(
+                progress,
+                "before_read_mounted_payload",
+                operation,
+                &path,
+                target,
+                None,
+            )?;
+            let actual = fs::read(&path)?;
+            record_hotspot_helper_progress(
+                progress,
+                "after_read_mounted_payload",
+                operation,
+                &path,
+                target,
+                Some(actual.len()),
+            )?;
+            if actual != expected {
+                anyhow::bail!(
+                    "read-exact mismatch for {}: expected {} bytes, read {} bytes",
+                    path.display(),
+                    expected.len(),
+                    actual.len()
+                );
+            }
+        }
         other => anyhow::bail!("unsupported hotspot operation: {other}"),
     }
     record_hotspot_helper_progress(progress, "completed", operation, &path, target, None)?;

@@ -1695,7 +1695,13 @@ fn debug_log_process_job_error(context: &str, error: &impl std::fmt::Display) {
 #[cfg(not(debug_assertions))]
 fn debug_log_process_job_error(_context: &str, _error: &impl std::fmt::Display) {}
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
+fn mount_point_is_active(path: &Path) -> io::Result<bool> {
+    let mountinfo = fs::read("/proc/self/mountinfo")?;
+    Ok(mountinfo_contains_mount_point(&mountinfo, path))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
 fn mount_point_is_active(path: &Path) -> io::Result<bool> {
     use std::os::unix::fs::MetadataExt as _;
 
@@ -1711,16 +1717,7 @@ fn mount_point_is_active(path: &Path) -> io::Result<bool> {
     if metadata.dev() != parent.dev() {
         return Ok(true);
     }
-
-    #[cfg(target_os = "linux")]
-    {
-        let mountinfo = fs::read("/proc/self/mountinfo")?;
-        Ok(mountinfo_contains_mount_point(&mountinfo, path))
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        Ok(false)
-    }
+    Ok(false)
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -2050,6 +2047,21 @@ mod tests {
 88 42 0:77 / /var/mint-workspace/target/e2e-runs/run/mount/ rw,nosuid,nodev - fuse.studiofs studiofs rw\n";
 
         assert!(mountinfo_contains_mount_point(mountinfo.as_bytes(), path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_mountinfo_detection_does_not_require_existing_mount_point_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("missing-mount");
+        let mountinfo = format!(
+            "42 31 0:49 / / rw,relatime - overlay overlay rw\n\
+88 42 0:77 / {} rw,nosuid,nodev - fuse.studiofs studiofs rw\n",
+            path.display()
+        );
+
+        assert!(!path.exists());
+        assert!(mountinfo_contains_mount_point(mountinfo.as_bytes(), &path));
     }
 
     #[cfg(unix)]

@@ -2339,7 +2339,18 @@ pub(in crate::scenario) fn run_hotspot_helper_process(
                         .err()
                         .map(|error| error.to_string());
                 let _ = job.terminate();
-                if !wait_for_child_exit(&mut child, CHILD_TERMINATION_GRACE).unwrap_or(false) {
+                if should_wait_for_timed_out_hotspot_helper_child() {
+                    if !wait_for_child_exit(&mut child, CHILD_TERMINATION_GRACE).unwrap_or(false) {
+                        let _ = job.force_kill();
+                        if let Err(error) =
+                            terminate_blocked_hotspot_helper_process(child.id(), &pending_label)
+                        {
+                            cleanup_error.get_or_insert_with(|| error.to_string());
+                        }
+                        let _ = child.kill();
+                        let _ = wait_for_child_exit(&mut child, CHILD_TERMINATION_GRACE);
+                    }
+                } else {
                     let _ = job.force_kill();
                     if let Err(error) =
                         terminate_blocked_hotspot_helper_process(child.id(), &pending_label)
@@ -2347,7 +2358,6 @@ pub(in crate::scenario) fn run_hotspot_helper_process(
                         cleanup_error.get_or_insert_with(|| error.to_string());
                     }
                     let _ = child.kill();
-                    let _ = wait_for_child_exit(&mut child, CHILD_TERMINATION_GRACE);
                 }
                 if let Err(error) = terminate_blocked_hotspot_client_process(client, &pending_label)
                 {
@@ -2368,6 +2378,10 @@ pub(in crate::scenario) fn run_hotspot_helper_process(
             thread::sleep(Duration::from_millis(50));
         }
     }
+}
+
+pub(in crate::scenario) fn should_wait_for_timed_out_hotspot_helper_child() -> bool {
+    cfg!(windows)
 }
 
 pub(in crate::scenario) fn hotspot_helper_internal_timeout(parent_timeout: Duration) -> Duration {
@@ -2783,67 +2797,210 @@ pub(in crate::scenario) fn run_open_handle_operations(
         &unlink_target,
         "append through old handle\n",
     );
-    let handle_path = clients[0].mount_point.join(&unlink_target);
-    let mut handle = run_bounded_mounted_io(
-        format!("open handle append open {}", handle_path.display()),
+    run_open_handle_helper_process(
+        context,
         OPEN_HANDLE_OPERATION_TIMEOUT,
-        move || OpenOptions::new().append(true).open(handle_path),
+        &clients[0],
+        &clients[1],
+        &unlink_target,
+        &rename_source,
+        &rename_dest,
+        &append_payload,
     )?;
-    operations.push(fs_op(
+    operations.push(record_advanced_operation(
         started,
         1,
-        &clients[1],
-        "unlink",
+        &clients[0],
+        "open",
         &unlink_target,
-        || {
-            let path = clients[1].mount_point.join(&unlink_target);
-            run_bounded_mounted_io(
-                format!("open handle unlink {}", path.display()),
-                OPEN_HANDLE_OPERATION_TIMEOUT,
-                move || fs::remove_file(path),
-            )
-            .map_err(scenario_error_to_io)
-        },
+        Ok(()),
     ));
-    operations.push(fs_op(
+    operations.push(record_advanced_operation(
         started,
         2,
         &clients[1],
-        "rename",
-        &rename_source,
-        || {
-            let source = clients[1].mount_point.join(&rename_source);
-            let dest = clients[1].mount_point.join(&rename_dest);
-            run_bounded_mounted_io(
-                format!(
-                    "open handle rename {} to {}",
-                    source.display(),
-                    dest.display()
-                ),
-                OPEN_HANDLE_OPERATION_TIMEOUT,
-                move || fs::rename(source, dest),
-            )
-            .map_err(scenario_error_to_io)
-        },
+        "unlink",
+        &unlink_target,
+        Ok(()),
     ));
-    operations.push(required_record(record_advanced_operation(
+    operations.push(record_advanced_operation(
         started,
         3,
+        &clients[1],
+        "rename",
+        &rename_source,
+        Ok(()),
+    ));
+    operations.push(record_advanced_operation(
+        started,
+        4,
         &clients[0],
         "append_old_handle",
         &unlink_target,
-        run_bounded_mounted_io(
-            format!("open handle append {}", clients[0].mount_point.display()),
-            OPEN_HANDLE_OPERATION_TIMEOUT,
-            move || {
-                handle
-                    .write_all(&append_payload)
-                    .and_then(|()| handle.sync_all())
-            },
-        )
-        .map_err(|error| error.to_string()),
-    ))?);
+        Ok(()),
+    ));
     Ok(operations)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(in crate::scenario) fn run_open_handle_helper_process(
+    context: &ScenarioContext,
+    timeout: Duration,
+    client_a: &ClientSpec,
+    client_b: &ClientSpec,
+    unlink_path: &str,
+    rename_source: &str,
+    rename_dest: &str,
+    append_payload: &[u8],
+) -> Result<(), ScenarioError> {
+    let payload_path =
+        write_helper_payload(context, client_a, "open-handle", Some(append_payload))?
+            .ok_or_else(|| ScenarioError::Io(io::Error::other("missing open handle payload")))?;
+    let progress_path = helper_progress_path(context, client_a, "open-handle", unlink_path)?;
+    let pending_label = format!("{} open-handle {}", client_a.name, unlink_path);
+
+    #[cfg(test)]
+    {
+        let _ = timeout;
+        run_open_handle_op_helper(
+            client_a.mount_point.clone(),
+            client_b.mount_point.clone(),
+            unlink_path,
+            rename_source,
+            rename_dest,
+            &payload_path,
+            Some(&progress_path),
+        )
+        .map_err(|error| {
+            ScenarioError::Io(io::Error::other(format!(
+                "open handle helper failed for {pending_label}: {error}"
+            )))
+        })
+    }
+
+    #[cfg(not(test))]
+    {
+        let exe = prepare_hotspot_helper_exe(context)?;
+        let mut command = Command::new(exe);
+        command
+            .arg("open-handle-op")
+            .arg("--sandbox")
+            .arg(&context.sandbox)
+            .arg("--client-a-mount")
+            .arg(&client_a.mount_point)
+            .arg("--client-b-mount")
+            .arg(&client_b.mount_point)
+            .arg("--unlink-path")
+            .arg(unlink_path)
+            .arg("--rename-source")
+            .arg(rename_source)
+            .arg("--rename-dest")
+            .arg(rename_dest)
+            .arg("--append-payload")
+            .arg(&payload_path)
+            .arg("--progress")
+            .arg(&progress_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+
+        ChildJob::prepare_command(&mut command)?;
+        let mut child = command.spawn()?;
+        write_hotspot_helper_process_metadata(
+            context,
+            child.id(),
+            client_a,
+            "open-handle",
+            unlink_path,
+            Some(rename_dest),
+        )?;
+        let job = ChildJob::assign_to_child(&child).map_err(|error| {
+            let _ = child.kill();
+            let _ = child.wait();
+            ScenarioError::Io(io::Error::new(
+                error.kind(),
+                format!("failed to isolate open handle helper process: {error}"),
+            ))
+        })?;
+
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = child.try_wait()? {
+                if status.success() {
+                    return Ok(());
+                }
+                let stderr = child
+                    .stderr
+                    .take()
+                    .and_then(|mut stderr| {
+                        let mut output = String::new();
+                        stderr.read_to_string(&mut output).ok().map(|_| output)
+                    })
+                    .unwrap_or_default();
+                let progress = read_hotspot_helper_progress_tail(&progress_path);
+                return Err(ScenarioError::Io(io::Error::other(format!(
+                    "open handle helper failed for {pending_label}: status={status}; stderr={}; progress={}",
+                    stderr.trim(),
+                    progress.as_deref().unwrap_or("<none>")
+                ))));
+            }
+            if Instant::now() >= deadline {
+                let progress = read_hotspot_helper_progress_tail(&progress_path);
+                let progress_suffix = progress
+                    .as_ref()
+                    .map(|progress| format!("; progress={progress}"))
+                    .unwrap_or_default();
+                eprintln!(
+                    "studiofs-e2e: open handle helper timed out after {} ms; terminating helper process: {}{}",
+                    timeout.as_millis(),
+                    pending_label,
+                    progress_suffix
+                );
+                let mut cleanup_error =
+                    terminate_blocked_hotspot_client_process(client_a, &pending_label)
+                        .err()
+                        .map(|error| error.to_string());
+                let _ = job.terminate();
+                if should_wait_for_timed_out_hotspot_helper_child() {
+                    if !wait_for_child_exit(&mut child, CHILD_TERMINATION_GRACE).unwrap_or(false) {
+                        let _ = job.force_kill();
+                        if let Err(error) =
+                            terminate_blocked_hotspot_helper_process(child.id(), &pending_label)
+                        {
+                            cleanup_error.get_or_insert_with(|| error.to_string());
+                        }
+                        let _ = child.kill();
+                        let _ = wait_for_child_exit(&mut child, CHILD_TERMINATION_GRACE);
+                    }
+                } else {
+                    let _ = job.force_kill();
+                    if let Err(error) =
+                        terminate_blocked_hotspot_helper_process(child.id(), &pending_label)
+                    {
+                        cleanup_error.get_or_insert_with(|| error.to_string());
+                    }
+                    let _ = child.kill();
+                }
+                if let Err(error) =
+                    terminate_blocked_hotspot_client_process(client_a, &pending_label)
+                {
+                    cleanup_error.get_or_insert_with(|| error.to_string());
+                }
+                let primary = namespace_collision_operation_timeout(
+                    timeout,
+                    vec![(1, format!("{pending_label}{progress_suffix}"))],
+                );
+                if let Some(cleanup) = cleanup_error {
+                    return Err(ScenarioError::NamespaceCollisionUnmountAfterFailure {
+                        primary: primary.to_string(),
+                        cleanup,
+                    });
+                }
+                return Err(primary);
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
 }
 
 pub(in crate::scenario) fn seed_open_handle_initial_tree(
@@ -2898,49 +3055,107 @@ pub(in crate::scenario) fn wait_for_open_handle_initial_tree(
     poll_interval: Duration,
 ) -> Result<ConvergenceOutcome, ScenarioError> {
     let deadline = Instant::now() + timeout;
+    let started = Instant::now();
+    let mut attempts = 0;
+    let required_payloads = open_handle_initial_payloads(isolation);
+    loop {
+        attempts += 1;
+        let missing = open_handle_initial_state_missing(context, clients, &required_payloads)?;
+        if missing.is_empty() {
+            return Ok(open_handle_initial_tree_outcome(clients, started, attempts));
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(ScenarioError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "open handle initial tree did not become visible before timeout; missing: {}",
+                    missing.join(", ")
+                ),
+            )));
+        }
+        thread::sleep(poll_interval.min(deadline.saturating_duration_since(now)));
+    }
+}
+
+pub(in crate::scenario) fn open_handle_initial_payloads(
+    isolation: &ScenarioIsolation,
+) -> Vec<(String, Vec<u8>)> {
     let unlink_target = open_handle_isolated_path(isolation, OPEN_HANDLE_UNLINK_TARGET);
     let rename_source = open_handle_isolated_path(isolation, OPEN_HANDLE_RENAME_SOURCE);
-    let required_payloads = [
+    vec![
         (
-            unlink_target,
+            unlink_target.clone(),
             isolation.payload(
                 "initial_unlink_target",
-                &open_handle_isolated_path(isolation, OPEN_HANDLE_UNLINK_TARGET),
+                &unlink_target,
                 &String::from_utf8_lossy(OPEN_HANDLE_UNLINK_TARGET_PAYLOAD),
             ),
         ),
         (
-            rename_source,
+            rename_source.clone(),
             isolation.payload(
                 "initial_rename_source",
-                &open_handle_isolated_path(isolation, OPEN_HANDLE_RENAME_SOURCE),
+                &rename_source,
                 &String::from_utf8_lossy(OPEN_HANDLE_RENAME_SOURCE_PAYLOAD),
             ),
         ),
-    ];
-    let required_payloads = required_payloads
+    ]
+}
+
+pub(in crate::scenario) fn open_handle_initial_state_missing(
+    context: &ScenarioContext,
+    clients: &[ClientSpec],
+    required_payloads: &[(String, Vec<u8>)],
+) -> Result<Vec<String>, ScenarioError> {
+    let mut missing = Vec::new();
+    for client in clients {
+        for (relative_path, payload) in required_payloads {
+            match run_hotspot_helper_process(
+                context,
+                MOUNTED_VALIDATION_PROBE_TIMEOUT,
+                client,
+                "read-exact",
+                relative_path,
+                None,
+                Some(payload),
+                format!(
+                    "{} validate open handle initial {}",
+                    client.name, relative_path
+                ),
+            ) {
+                Ok(()) => {}
+                Err(error) if hotspot_helper_error_is_fatal(&error) => return Err(error),
+                Err(error) => {
+                    missing.push(format!("{}:{} ({})", client.name, relative_path, error))
+                }
+            }
+        }
+    }
+    Ok(missing)
+}
+
+pub(in crate::scenario) fn open_handle_initial_tree_outcome(
+    clients: &[ClientSpec],
+    started: Instant,
+    attempts: usize,
+) -> ConvergenceOutcome {
+    let compared_clients = clients
         .iter()
-        .map(|(path, payload)| (path.as_str(), payload.as_slice()))
+        .map(|client| client.name.clone())
         .collect::<Vec<_>>();
-    wait_for_mounted_initial_payloads_until(
-        clients,
-        &required_payloads,
-        deadline,
-        poll_interval,
-        "open handle initial tree",
-    )?;
-    let remaining = remaining_initial_validation_timeout(deadline, "open handle initial tree")?;
-    let mounts = clients
-        .iter()
-        .map(|client| ClientMount::new(client.name.clone(), client.mount_point.clone()))
-        .collect::<Vec<_>>();
-    wait_for_convergence(
-        &mounts,
-        context.scenario_dir.join("validation-initial-open-handle"),
-        remaining,
-        poll_interval,
-    )
-    .map_err(ScenarioError::from)
+    ConvergenceOutcome {
+        attempts,
+        elapsed_ms: started.elapsed().as_millis(),
+        snapshots: Vec::new(),
+        comparison: TreeComparison {
+            converged: true,
+            reference_client: compared_clients.first().cloned(),
+            compared_clients,
+            differences: Vec::new(),
+        },
+    }
 }
 
 pub(in crate::scenario) fn open_handle_isolated_path(

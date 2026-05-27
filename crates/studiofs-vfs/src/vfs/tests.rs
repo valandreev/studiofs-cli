@@ -7298,6 +7298,50 @@ fn test_release_fh_with_outcome_orphan_cleanup_does_not_report_flush_barrier() {
 }
 
 #[test]
+fn test_open_unlink_handle_accepts_followup_write_until_release() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "open-unlink-followup-write");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let name = b"open-unlink-followup-write.txt";
+        let attr = vfs.create(1, name, 0, 0, 0o644).unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+
+        vfs.write_fh_with_deferred_materialize(
+            fh,
+            ino,
+            0,
+            b"initial",
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+        vfs.flush_fh(fh).await.unwrap();
+        meta.unlink(1, name)
+            .expect("simulate foreign unlink while handle stays open");
+
+        let written = vfs
+            .write_fh_with_deferred_materialize(
+                fh,
+                ino,
+                7,
+                b"-after-unlink",
+                LocalSyncPolicy::Opportunistic,
+            )
+            .await
+            .expect("write through open unlinked handle");
+
+        assert_eq!(written, 13);
+        vfs.flush_fh(fh)
+            .await
+            .expect("flush through open unlinked handle");
+        vfs.release_fh(fh).await.unwrap();
+        assert!(vfs.getattr(ino).is_err());
+    });
+}
+
+#[test]
 fn test_release_fh_orphan_cleanup_clears_live_extents() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "release-orphan-live-extents");

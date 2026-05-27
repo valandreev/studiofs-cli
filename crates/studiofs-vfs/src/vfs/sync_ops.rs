@@ -1069,14 +1069,25 @@ impl StudioVfs {
         // ino-level flush_with_outcome) so that a background upload hiccup
         // does not surface as a flush error to the application.
         let result: VfsResult<ExplicitFlushOutcome> = async {
-            let outcome = self
+            let outcome = match self
                 .local_sync_barrier_with_outcome(
                     open_file.ino,
                     self.local_sync_policy_for_barrier(open_file.ino),
                     StickyErrorPolicy::Ignore,
                     DirtyAttrPersistPolicy::PersistIfPresent,
                 )
-                .await?;
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(error)
+                    if open_file.active_open_overlay
+                        && Self::is_inode_not_found_error(&error, open_file.ino) =>
+                {
+                    self.handle_table.mark_orphan(open_file.ino);
+                    return Ok(ExplicitFlushOutcome::default());
+                }
+                Err(error) => return Err(error),
+            };
             Ok(ExplicitFlushOutcome {
                 flushed_local_dirty_state: outcome.had_local_dirty_state,
             })
@@ -1208,8 +1219,7 @@ impl StudioVfs {
             self.access_tracker,
         );
         let result = async {
-            self.enforce_access(ino, AccessLevel::ReadWrite)?;
-            self.enforce_mutating_handle_access(fh, ino)?;
+            self.enforce_write_access_for_handle(fh, ino)?;
             if data.is_empty() {
                 return Ok(0);
             }
@@ -1364,8 +1374,7 @@ impl StudioVfs {
         }
         // ── Buffer phase (fast: ~0.1 ms) ────────────────────────────────
         let result = async {
-            self.enforce_access(ino, AccessLevel::ReadWrite)?;
-            self.enforce_mutating_handle_access(fh, ino)?;
+            self.enforce_write_access_for_handle(fh, ino)?;
             if data.is_empty() {
                 return Ok(0);
             }
@@ -1460,7 +1469,27 @@ impl StudioVfs {
         if let Some(attr) = self.state.namespace.dirty_attrs.lock().get(&ino).cloned() {
             base_attr = attr;
         } else {
-            base_attr = self.getattr_async(ino).await?;
+            base_attr = match self.getattr_async(ino).await {
+                Ok(attr) => attr,
+                Err(error)
+                    if Self::is_inode_not_found_error(&error, ino)
+                        && self
+                            .handle_table
+                            .get(fh)
+                            .is_some_and(|open_file| open_file.active_open_overlay) =>
+                {
+                    let open_file = self
+                        .handle_table
+                        .get(fh)
+                        .ok_or_else(|| VfsError::Meta(MetaError::InodeNotFound(ino)))?;
+                    self.handle_table.mark_orphan(ino);
+                    open_file
+                        .open_attr
+                        .clone()
+                        .ok_or_else(|| VfsError::Meta(MetaError::InodeNotFound(ino)))?
+                }
+                Err(error) => return Err(error),
+            };
             self.refresh_inode_incarnation_state_from_attr(ino, &base_attr);
             self.begin_pending_incarnation(ino, &mut base_attr);
         }

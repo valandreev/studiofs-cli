@@ -18,6 +18,21 @@ fn test_isolation(root: &str) -> ScenarioIsolation {
     }
 }
 
+fn read_helper_progress(scenario_dir: &Path) -> String {
+    let progress_dir = scenario_dir.join("hotspot-helper-progress");
+    if !progress_dir.exists() {
+        return String::new();
+    }
+    let mut progress = String::new();
+    for entry in std::fs::read_dir(progress_dir).unwrap() {
+        let entry = entry.unwrap();
+        if entry.path().extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+            progress.push_str(&std::fs::read_to_string(entry.path()).unwrap());
+        }
+    }
+    progress
+}
+
 #[test]
 fn advanced_mounted_isolation_uses_volume_specific_roots_and_payloads() {
     let context = ScenarioContext {
@@ -1759,6 +1774,11 @@ fn open_handle_initial_barrier_accepts_replicated_initial_tree() {
 
     assert!(convergence.comparison.converged);
     assert_eq!(convergence.comparison.differences, Vec::new());
+    let helper_progress = read_helper_progress(&context.scenario_dir);
+    assert!(
+        helper_progress.contains("\"operation\":\"read-exact\""),
+        "open handle initial barrier must use helper-isolated read-exact probes"
+    );
 }
 
 #[test]
@@ -2080,9 +2100,18 @@ fn namespace_collision_initial_tree_writes_directly() {
     let mount = temp.path().join("mounts").join("client-a");
     std::fs::create_dir_all(&mount).unwrap();
     let sandbox = temp.path().join("run-collision-seed-direct");
+    let scenario_dir = sandbox.join("artifacts").join("collision-seed-direct");
+    let context = ScenarioContext {
+        run_id: "run-collision-seed-direct".to_string(),
+        seed: 0,
+        sandbox: sandbox.clone(),
+        scenario_dir,
+        client_controller_config: None,
+    };
     let client = client_spec_for(&sandbox, "projectfs", "client-a", mount);
 
-    establish_collision_initial_tree(NamespaceCollisionKind::RenameVsUnlink, &client).unwrap();
+    establish_collision_initial_tree(&context, NamespaceCollisionKind::RenameVsUnlink, &client)
+        .unwrap();
 
     let payload = std::fs::read(client.mount_point.join("shared/file.txt")).unwrap();
     assert_eq!(payload, b"initial namespace payload\n");
@@ -2348,6 +2377,20 @@ fn hotspot_helper_internal_timeout_leaves_parent_kill_reserve() {
         hotspot_helper_internal_timeout(Duration::from_secs(1)),
         Duration::from_secs(1),
         "short operation timeouts should not underflow"
+    );
+}
+
+#[test]
+fn timed_out_hotspot_helper_child_wait_policy_matches_platform() {
+    #[cfg(windows)]
+    assert!(
+        should_wait_for_timed_out_hotspot_helper_child(),
+        "Windows job cleanup can wait for the helper process after force-kill"
+    );
+    #[cfg(unix)]
+    assert!(
+        !should_wait_for_timed_out_hotspot_helper_child(),
+        "Unix cleanup must not waitpid a FUSE helper that may be stuck in D-state"
     );
 }
 

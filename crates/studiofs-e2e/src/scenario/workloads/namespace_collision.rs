@@ -391,39 +391,14 @@ pub(in crate::scenario) fn run_namespace_collision_body(
         .take(COLLISION_CLIENT_NAMES.len())
         .collect::<Vec<_>>();
 
-    establish_collision_initial_tree(kind, &clients[0])?;
+    establish_collision_initial_tree(context, kind, &clients[0])?;
     driver.after_conflicting_operations(kind, &clients)?;
     let initial_validation_deadline = Instant::now() + convergence_timeout;
-    let initial_paths = kind.initial_paths();
-    wait_for_mounted_initial_payloads_until(
+    wait_for_namespace_collision_initial_state_until(
+        context,
+        kind,
         &clients,
-        &initial_paths,
         initial_validation_deadline,
-        poll_interval,
-        "namespace collision initial tree",
-    )?;
-    let required_initial_paths = collision_required_initial_paths(kind);
-    if !required_initial_paths.is_empty() {
-        wait_for_required_paths_visible_until(
-            &clients,
-            &required_initial_paths,
-            initial_validation_deadline,
-            poll_interval,
-            "namespace collision initial tree",
-        )?;
-    }
-    let initial_validation_timeout = remaining_initial_validation_timeout(
-        initial_validation_deadline,
-        "namespace collision initial tree",
-    )?;
-    let initial_mounts = clients
-        .iter()
-        .map(|client| ClientMount::new(client.name.clone(), client.mount_point.clone()))
-        .collect::<Vec<_>>();
-    wait_for_convergence(
-        &initial_mounts,
-        context.scenario_dir.join("initial-validation"),
-        initial_validation_timeout,
         poll_interval,
     )?;
     let operations = match perform_namespace_collision_operations(context, kind, &clients) {
@@ -507,25 +482,113 @@ pub(in crate::scenario) fn write_namespace_collision_plan_artifacts(
 }
 
 pub(in crate::scenario) fn establish_collision_initial_tree(
+    context: &ScenarioContext,
     kind: NamespaceCollisionKind,
     client: &ClientSpec,
 ) -> Result<(), ScenarioError> {
     if kind == NamespaceCollisionKind::MkdirRmdirVsCreate {
-        let race_dir = client.mount_point.join("race");
-        run_bounded_mounted_io(
-            format!("namespace collision mkdir {}", race_dir.display()),
+        run_hotspot_helper_process(
+            context,
             COLLISION_OPERATION_TIMEOUT,
-            move || fs::create_dir_all(race_dir),
+            client,
+            "mkdir",
+            "race",
+            None,
+            None,
+            format!("{} seed mkdir race", client.name),
         )?;
     }
     for (relative_path, payload) in kind.initial_paths() {
-        write_mounted_initial_file(
-            client.mount_point.join(relative_path),
-            payload,
-            "namespace collision initial tree",
+        run_hotspot_helper_process(
+            context,
+            COLLISION_OPERATION_TIMEOUT,
+            client,
+            "create",
+            relative_path,
+            None,
+            Some(payload),
+            format!("{} seed create {}", client.name, relative_path),
         )?;
     }
     Ok(())
+}
+
+pub(in crate::scenario) fn wait_for_namespace_collision_initial_state_until(
+    context: &ScenarioContext,
+    kind: NamespaceCollisionKind,
+    clients: &[ClientSpec],
+    deadline: Instant,
+    poll_interval: Duration,
+) -> Result<(), ScenarioError> {
+    loop {
+        let missing = namespace_collision_initial_state_missing(context, kind, clients)?;
+        if missing.is_empty() {
+            return Ok(());
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(ScenarioError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "namespace collision initial tree did not become visible before timeout; missing: {}",
+                    missing.join(", ")
+                ),
+            )));
+        }
+        thread::sleep(poll_interval.min(deadline.saturating_duration_since(now)));
+    }
+}
+
+pub(in crate::scenario) fn namespace_collision_initial_state_missing(
+    context: &ScenarioContext,
+    kind: NamespaceCollisionKind,
+    clients: &[ClientSpec],
+) -> Result<Vec<String>, ScenarioError> {
+    let mut missing = Vec::new();
+    for client in clients {
+        for (relative_path, payload) in kind.initial_paths() {
+            match run_hotspot_helper_process(
+                context,
+                MOUNTED_VALIDATION_PROBE_TIMEOUT,
+                client,
+                "read-exact",
+                relative_path,
+                None,
+                Some(payload),
+                format!("{} validate initial payload {}", client.name, relative_path),
+            ) {
+                Ok(()) => {}
+                Err(error) if namespace_collision_error_requires_emergency_cleanup(&error) => {
+                    return Err(error);
+                }
+                Err(error) => {
+                    missing.push(format!("{}:{} ({})", client.name, relative_path, error))
+                }
+            }
+        }
+        for relative_path in collision_required_initial_paths(kind) {
+            match run_hotspot_helper_process(
+                context,
+                MOUNTED_VALIDATION_PROBE_TIMEOUT,
+                client,
+                "stat",
+                relative_path,
+                None,
+                None,
+                format!("{} validate initial path {}", client.name, relative_path),
+            ) {
+                Ok(()) => {}
+                Err(error) if namespace_collision_error_requires_emergency_cleanup(&error) => {
+                    return Err(error);
+                }
+                Err(error) => {
+                    missing.push(format!("{}:{} ({})", client.name, relative_path, error))
+                }
+            }
+        }
+    }
+    Ok(missing)
 }
 
 pub(in crate::scenario) fn collision_required_initial_paths(
@@ -712,9 +775,18 @@ pub(in crate::scenario) fn perform_namespace_collision_operations(
         NamespaceCollisionKind::ReaddirStatDuringMutation => run_concurrent_namespace_operations(
             started,
             vec![
-                NamespaceCollisionTask::new(1, clients[1].clone(), "readdir", "scan", |client| {
-                    fs::read_dir(client.mount_point.join("scan")).map(|_| ())
-                }),
+                namespace_collision_helper_task(
+                    context,
+                    NamespaceCollisionHelperSpec {
+                        order: 1,
+                        client: clients[1].clone(),
+                        operation: "readdir",
+                        helper_operation: "readdir",
+                        path: "scan",
+                        target: None,
+                        payload: None,
+                    },
+                ),
                 namespace_collision_helper_task(
                     context,
                     NamespaceCollisionHelperSpec {
@@ -727,12 +799,17 @@ pub(in crate::scenario) fn perform_namespace_collision_operations(
                         payload: None,
                     },
                 ),
-                NamespaceCollisionTask::new(
-                    3,
-                    clients[2].clone(),
-                    "stat",
-                    "scan/b.txt",
-                    |client| fs::metadata(client.mount_point.join("scan/b.txt")).map(|_| ()),
+                namespace_collision_helper_task(
+                    context,
+                    NamespaceCollisionHelperSpec {
+                        order: 3,
+                        client: clients[2].clone(),
+                        operation: "stat",
+                        helper_operation: "stat",
+                        path: "scan/b.txt",
+                        target: None,
+                        payload: None,
+                    },
                 ),
             ],
             COLLISION_OPERATION_TIMEOUT,
