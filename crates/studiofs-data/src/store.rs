@@ -347,7 +347,8 @@ impl DataStore {
         profile: IoProfile,
         crypto: DataStoreCryptoRuntime,
     ) -> DataResult<Self> {
-        validate_s3_endpoint_transport(&config.endpoint)?;
+        let mut config = config.clone();
+        config.endpoint = normalize_s3_endpoint_transport(&config.endpoint)?;
 
         let mut builder = S3::default()
             .endpoint(&config.endpoint)
@@ -469,7 +470,7 @@ impl DataStore {
             volume_name: config.volume_name.clone(),
             volume_uuid: config.volume_uuid.clone(),
             crypto,
-            config: config.clone(),
+            config,
             profile,
         })
     }
@@ -737,6 +738,16 @@ mod tests {
             DataStore::new(&config)
                 .unwrap_or_else(|err| panic!("endpoint {endpoint} should be accepted, got {err}"));
         }
+    }
+
+    #[test]
+    fn datastore_normalizes_bare_loopback_endpoint_before_building_client() {
+        let mut config = encrypted_test_config();
+        config.endpoint = "127.0.0.1:9000".to_string();
+
+        let store = DataStore::new(&config).expect("bare loopback endpoint should build");
+
+        assert_eq!(store.config.endpoint, "http://127.0.0.1:9000");
     }
 
     #[test]
