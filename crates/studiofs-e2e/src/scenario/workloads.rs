@@ -228,7 +228,7 @@ mod test_fixtures;
 
 pub(super) use actions::*;
 pub use actions::{
-    run_hotspot_op_helper_with_timeout, run_open_handle_op_helper,
+    SparseOpHelperRequest, run_hotspot_op_helper_with_timeout, run_open_handle_op_helper,
     run_sparse_op_helper_with_timeout,
 };
 pub(super) use advanced_mounted::*;

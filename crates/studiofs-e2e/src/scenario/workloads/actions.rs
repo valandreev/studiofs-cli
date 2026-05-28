@@ -365,17 +365,68 @@ pub fn run_hotspot_op_helper_with_timeout(
     run_hotspot_op_helper(operation, mount_point, path, target, payload, progress)
 }
 
+/// Request passed from the sparse-file scenario driver to the isolated helper process.
+///
+/// The helper performs exactly one filesystem call sequence against `mount_point`, then exits so
+/// the parent runner can bound and diagnose mounted I/O that may block inside the platform bridge.
+#[derive(Debug)]
+pub struct SparseOpHelperRequest<'a> {
+    /// Sparse helper operation to execute.
+    ///
+    /// Supported values are `write-range`, `truncate`, `read-range-exact`, `read-range-zero`, and
+    /// `read-all-exact`.
+    pub operation: &'a str,
+    /// Client mount root where the operation is executed.
+    ///
+    /// The helper joins this root with `path` before touching the filesystem.
+    pub mount_point: PathBuf,
+    /// Scenario-relative file path under `mount_point`.
+    ///
+    /// This must not be an absolute path; callers use it to address the sparse test file inside the
+    /// mounted namespace.
+    pub path: &'a str,
+    /// Byte offset for ranged sparse operations.
+    ///
+    /// Required by `write-range`, `read-range-exact`, and `read-range-zero`; ignored by whole-file
+    /// and truncate operations.
+    pub offset: Option<u64>,
+    /// Length or target file size, depending on `operation`.
+    ///
+    /// Required by `truncate` as the target file size and by `read-range-zero` as the number of
+    /// bytes to validate.
+    pub len: Option<u64>,
+    /// Host-side payload file used as input or expected data.
+    ///
+    /// Required by `write-range`, `read-range-exact`, and `read-all-exact`; the helper reads this
+    /// file outside the mounted namespace before comparing or writing bytes.
+    pub payload: Option<&'a Path>,
+    /// Optional progress JSONL file for diagnosing where a mounted operation blocked.
+    ///
+    /// Progress events are written before and after potentially blocking reads, writes, truncates,
+    /// and validation probes.
+    pub progress: Option<&'a Path>,
+    /// Optional in-helper timeout supplied by the parent runner.
+    ///
+    /// The sparse helper currently accepts this for CLI symmetry with hotspot helpers; timeout
+    /// enforcement is handled by the parent process on platforms that do not support an internal
+    /// sparse-operation guard.
+    pub timeout: Option<Duration>,
+}
+
 /// Executes one mounted sparse filesystem operation in a helper process.
 pub fn run_sparse_op_helper_with_timeout(
-    operation: &str,
-    mount_point: PathBuf,
-    path: &str,
-    offset: Option<u64>,
-    len: Option<u64>,
-    payload: Option<&Path>,
-    progress: Option<&Path>,
-    timeout: Option<Duration>,
+    request: SparseOpHelperRequest<'_>,
 ) -> Result<(), anyhow::Error> {
+    let SparseOpHelperRequest {
+        operation,
+        mount_point,
+        path,
+        offset,
+        len,
+        payload,
+        progress,
+        timeout,
+    } = request;
     let _ = timeout;
     run_sparse_op_helper(operation, mount_point, path, offset, len, payload, progress)
 }
