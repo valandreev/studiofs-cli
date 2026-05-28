@@ -15,8 +15,8 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::client::{
-    ClientControllerConfig, ClientControllerError, DEFAULT_CLIENT_NAMES, client_cache_dir,
-    client_mount_point, client_root_dir,
+    ClientControllerConfig, ClientControllerError, DEFAULT_CLIENT_NAMES,
+    cleanup_stale_mount_before_remount, client_cache_dir, client_mount_point, client_root_dir,
 };
 use crate::infra::{
     COMPOSE_PROJECT_PREFIX, CommandExecutor, CommandSpec, ComposeConfig, ComposeServiceControl,
@@ -1941,8 +1941,49 @@ fn clean_entry(entry: fs::DirEntry, root: &Path) -> Result<Option<PathBuf>, Runn
         )));
     }
     let name = entry.file_name();
+    cleanup_runner_owned_mount_points_before_removal(&path)?;
     fs::remove_dir_all(&path)?;
     Ok(Some(PathBuf::from(name)))
+}
+
+#[derive(Debug, Deserialize)]
+struct RunnerClientMountMetadata {
+    mount_point: PathBuf,
+}
+
+fn cleanup_runner_owned_mount_points_before_removal(sandbox: &Path) -> Result<(), RunnerError> {
+    for mount_point in runner_owned_mount_points_from_metadata(sandbox)? {
+        cleanup_stale_mount_before_remount(&mount_point)?;
+    }
+    Ok(())
+}
+
+fn runner_owned_mount_points_from_metadata(sandbox: &Path) -> Result<Vec<PathBuf>, RunnerError> {
+    let clients_dir = sandbox.join("artifacts/clients");
+    if !clients_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut mount_points = Vec::new();
+    for entry in fs::read_dir(clients_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let metadata_path = entry.path().join("mount/mount-point.json");
+        let bytes = match fs::read(&metadata_path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err.into()),
+        };
+        let metadata: RunnerClientMountMetadata = serde_json::from_slice(&bytes)?;
+        if metadata.mount_point.starts_with(sandbox) {
+            mount_points.push(metadata.mount_point);
+        }
+    }
+    mount_points.sort();
+    mount_points.dedup();
+    Ok(mount_points)
 }
 
 fn resolve_scenarios(names: &[String]) -> Result<Vec<ResolvedScenario>, RunnerError> {
@@ -3320,6 +3361,40 @@ plain child stderr\n",
                 .all(|call| call.timeout == Some(DEFAULT_SCENARIO_CHILD_TIMEOUT)),
             "supervised children must always be bounded by the parent runner"
         );
+    }
+
+    #[test]
+    fn clean_discovers_recorded_client_mount_points_before_removal() {
+        let temp = tempfile::tempdir().unwrap();
+        let sandbox = temp.path().join("e2e-runs").join("dead-mount-run");
+        let mount_a = sandbox.join("artifacts/clients/client-a/mount/projectfs");
+        let mount_b = sandbox.join("artifacts/clients/client-b/mount/projectfs");
+        fs::create_dir_all(mount_a.parent().unwrap()).unwrap();
+        fs::create_dir_all(mount_b.parent().unwrap()).unwrap();
+        fs::write(
+            mount_a.parent().unwrap().join("mount-point.json"),
+            serde_json::json!({
+                "client": "client-a",
+                "mount_point": mount_a,
+                "process_id": 101
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            mount_b.parent().unwrap().join("mount-point.json"),
+            serde_json::json!({
+                "client": "client-b",
+                "mount_point": mount_b,
+                "process_id": 102
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mount_points = runner_owned_mount_points_from_metadata(&sandbox).unwrap();
+
+        assert_eq!(mount_points, vec![mount_a, mount_b]);
     }
 
     #[test]

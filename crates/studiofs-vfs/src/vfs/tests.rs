@@ -3787,6 +3787,45 @@ fn nonzero_truncate_requeues_retained_overlay_uploads_with_new_epoch() {
 }
 
 #[test]
+fn handle_backed_nonzero_truncate_clears_drained_dirty_attr_before_fsync() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "handle-truncate-clears-drained-attr");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"handle-truncate-clears-drained-attr.bin", 0, 0, 0o644)
+            .expect("create test file");
+        let ino = attr.ino;
+        let payload = vec![0x5Au8; 8192];
+
+        vfs.write(ino, 0, &payload).await.expect("write payload");
+        vfs.flush(ino).await.expect("flush first unpublished epoch");
+
+        let old_epoch = meta.get_attr(ino).expect("load flushed attr").content_epoch;
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open truncate handle");
+        vfs.setattr_with_handle(Some(fh), ino, SetattrArgs::size_only(4096))
+            .expect("truncate while retaining the first overlay payload");
+
+        let truncated_attr = meta.get_attr(ino).expect("load truncated attr");
+        assert!(truncated_attr.content_epoch > old_epoch);
+        assert!(
+            !vfs.state.namespace.dirty_attrs.lock().contains_key(&ino),
+            "handle-backed shrink should not leave already-drained dirty attrs for fsync"
+        );
+
+        let flush = vfs.flush_fh_with_outcome(fh).await.expect("flush handle");
+        assert!(
+            !flush.flushed_local_dirty_state,
+            "post-truncate fsync/flush should see no extra foreground dirty state"
+        );
+        vfs.release_fh(fh).await.expect("release handle");
+    });
+}
+
+#[test]
 fn nonzero_extend_requeues_retained_overlay_uploads_when_publish_work_is_in_flight() {
     let tmp = TempDir::new().expect("tempdir");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "extend-keeps-retained");
@@ -5876,6 +5915,86 @@ fn test_release_fh_with_outcome_reports_clean_skip_after_explicit_flush() {
             vfs.open_count(ino),
             0,
             "release should still close the handle"
+        );
+    });
+}
+
+#[test]
+fn test_release_fh_clean_skip_does_not_reenter_sticky_error_barrier() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "release-outcome-clean-sticky-skip");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"release-outcome-clean-sticky-skip.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+
+        vfs.write(ino, 0, b"payload").await.unwrap();
+        let flush = vfs.flush_fh_with_outcome(fh).await.unwrap();
+        assert!(
+            flush.flushed_local_dirty_state,
+            "explicit flush should drain the local dirty state"
+        );
+        assert!(
+            !vfs.inode_has_local_dirty_state(ino),
+            "release precondition should be a clean inode"
+        );
+
+        vfs.mark_upload_sticky_error(ino, &VfsError::Other("simulated upload failure".into()));
+        let outcome = vfs.release_fh_with_outcome(fh).await.unwrap();
+
+        assert!(
+            outcome.closed_last_handle,
+            "the only handle should still be reported as the last-handle close"
+        );
+        assert!(
+            !outcome.flushed_local_dirty_state,
+            "clean release should not report another local dirty-state drain"
+        );
+        assert_eq!(
+            vfs.open_count(ino),
+            0,
+            "release should still close the handle"
+        );
+    });
+}
+
+#[test]
+fn test_release_fh_clean_skip_does_not_wait_for_file_session_gate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "release-outcome-clean-session-skip");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"release-outcome-clean-session-skip.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        assert!(
+            !vfs.inode_has_local_dirty_state(ino),
+            "test expects a clean inode before release"
+        );
+
+        let _read_session = vfs
+            .state
+            .file_session
+            .enter_op(ino, FileSessionOperation::Read)
+            .await;
+        let release =
+            tokio::time::timeout(Duration::from_millis(100), vfs.release_fh_with_outcome(fh))
+                .await
+                .expect("clean release should not wait behind the file-session gate")
+                .expect("clean release should succeed");
+
+        assert!(
+            release.closed_last_handle,
+            "the only handle should still be reported as the last-handle close"
+        );
+        assert!(
+            !release.flushed_local_dirty_state,
+            "clean release should not report local dirty-state flushing"
         );
     });
 }

@@ -651,6 +651,10 @@ impl StudioVfs {
             return LastHandleReleaseAction::OrphanCleanup;
         }
 
+        if !self.inode_has_local_dirty_state(ino) {
+            return LastHandleReleaseAction::Clean;
+        }
+
         let sticky_error_policy = if context.open_file.flags.contains(OpenFlags::WRONLY)
             || context.open_file.flags.contains(OpenFlags::RDWR)
         {
@@ -670,6 +674,10 @@ impl StudioVfs {
     ) -> VfsResult<ReleaseFhOutcome> {
         match action {
             LastHandleReleaseAction::IgnoredEntry => Ok(ReleaseFhOutcome {
+                closed_last_handle: true,
+                flushed_local_dirty_state: false,
+            }),
+            LastHandleReleaseAction::Clean => Ok(ReleaseFhOutcome {
                 closed_last_handle: true,
                 flushed_local_dirty_state: false,
             }),
@@ -714,13 +722,20 @@ impl StudioVfs {
             return Ok(ReleaseFhOutcome::default());
         };
         let ino = context.ino;
+        let action = self.take_last_handle_release_action(&context);
+        if matches!(
+            action,
+            LastHandleReleaseAction::IgnoredEntry | LastHandleReleaseAction::Clean
+        ) {
+            return self.execute_last_handle_release_action(ino, action).await;
+        }
 
         let session = self
             .state
             .file_session
             .enter_op(ino, FileSessionOperation::Release)
             .await;
-        let result = self.release_last_handle_with_outcome(context).await;
+        let result = self.execute_last_handle_release_action(ino, action).await;
         drop(session);
         self.state.file_session.gc_if_idle(ino);
         result

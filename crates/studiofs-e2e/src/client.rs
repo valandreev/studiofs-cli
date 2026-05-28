@@ -1794,7 +1794,7 @@ fn is_windows_drive_mount_point(_path: &Path) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn cleanup_stale_mount_before_remount(path: &Path) -> io::Result<()> {
+pub(crate) fn cleanup_stale_mount_before_remount(path: &Path) -> io::Result<()> {
     match mount_point_is_active(path) {
         Ok(false) => Ok(()),
         Ok(true) => lazy_unmount_stale_mount(path, None),
@@ -1803,7 +1803,7 @@ fn cleanup_stale_mount_before_remount(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn cleanup_stale_mount_before_remount(path: &Path) -> io::Result<()> {
+pub(crate) fn cleanup_stale_mount_before_remount(path: &Path) -> io::Result<()> {
     match mount_point_is_active(path) {
         Ok(false) => Ok(()),
         Ok(true) => force_unmount_stale_windows_mount(path, None),
@@ -1811,9 +1811,91 @@ fn cleanup_stale_mount_before_remount(path: &Path) -> io::Result<()> {
     }
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
-fn cleanup_stale_mount_before_remount(_path: &Path) -> io::Result<()> {
+#[cfg(target_os = "macos")]
+pub(crate) fn cleanup_stale_mount_before_remount(path: &Path) -> io::Result<()> {
+    match mount_point_is_active(path) {
+        Ok(false) => Ok(()),
+        Ok(true) => force_unmount_stale_macos_mount(path, None),
+        Err(err) => force_unmount_stale_macos_mount(path, Some(err)),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+pub(crate) fn cleanup_stale_mount_before_remount(_path: &Path) -> io::Result<()> {
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_stale_unmount_attempts() -> &'static [(&'static str, &'static [&'static str])] {
+    &[
+        ("diskutil", &["unmount", "force"]),
+        ("umount", &["-f"]),
+        ("umount", &[]),
+    ]
+}
+
+#[cfg(target_os = "macos")]
+fn force_unmount_stale_macos_mount(
+    path: &Path,
+    readiness_error: Option<io::Error>,
+) -> io::Result<()> {
+    let mut diagnostics = Vec::new();
+    for (program, args) in macos_stale_unmount_attempts() {
+        match Command::new(program).args(*args).arg(path).output() {
+            Ok(output) if output.status.success() => match mount_point_is_active(path) {
+                Ok(false) => return Ok(()),
+                Ok(true) => diagnostics.push(format!(
+                    "{} {} {} exited successfully but the mount is still active",
+                    program,
+                    args.join(" "),
+                    path.display()
+                )),
+                Err(err) => diagnostics.push(format!(
+                    "{} {} {} exited successfully but readiness probe failed after cleanup: {}",
+                    program,
+                    args.join(" "),
+                    path.display(),
+                    err
+                )),
+            },
+            Ok(output) => diagnostics.push(format!(
+                "{} {} {} exited with {}; stderr: {}; stdout: {}",
+                program,
+                args.join(" "),
+                path.display(),
+                output.status.code().unwrap_or(-1),
+                diagnostic_excerpt(&String::from_utf8_lossy(&output.stderr)),
+                diagnostic_excerpt(&String::from_utf8_lossy(&output.stdout))
+            )),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => diagnostics.push(format!(
+                "{} was not found while cleaning stale macOS mount {}",
+                program,
+                path.display()
+            )),
+            Err(err) => diagnostics.push(format!(
+                "{} failed while cleaning stale macOS mount {}: {}",
+                program,
+                path.display(),
+                err
+            )),
+        }
+    }
+
+    let readiness = readiness_error
+        .map(|err| format!("; mount readiness check failed before cleanup: {err}"))
+        .unwrap_or_default();
+    let final_probe = match mount_point_is_active(path) {
+        Ok(false) => return Ok(()),
+        Ok(true) => String::new(),
+        Err(err) => format!("; final mount readiness check failed after cleanup: {err}"),
+    };
+    Err(io::Error::other(format!(
+        "failed to force-unmount stale macOS mount point {}{}{}; attempts: {}",
+        path.display(),
+        readiness,
+        final_probe,
+        diagnostics.join(" | ")
+    )))
 }
 
 #[cfg(windows)]
@@ -2011,6 +2093,25 @@ mod tests {
         ));
         assert!(message.contains("client-a"));
         assert!(message.contains(&path.display().to_string()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_stale_mount_cleanup_uses_force_unmount_attempts() {
+        let attempts = macos_stale_unmount_attempts();
+
+        assert!(
+            attempts
+                .iter()
+                .any(|(program, args)| *program == "diskutil" && *args == ["unmount", "force"]),
+            "macOS stale mount cleanup should try diskutil force unmount"
+        );
+        assert!(
+            attempts
+                .iter()
+                .any(|(program, args)| *program == "umount" && *args == ["-f"]),
+            "macOS stale mount cleanup should fall back to forced umount"
+        );
     }
 
     #[test]

@@ -167,9 +167,12 @@ pub(super) struct DeletedInodeCleanup {
 }
 
 /// Action selected after the last handle is released.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum LastHandleReleaseAction {
     /// Do not take any action.
     IgnoredEntry,
+    /// The inode has no foreground local dirty state left to drain.
+    Clean,
     /// Clean up orphaned state.
     OrphanCleanup,
     /// Run local sync using sticky-error policy.

@@ -288,6 +288,9 @@ impl StudioVfs {
                     )?;
                     return Err(error);
                 }
+                if truncate_mutation.is_some() {
+                    self.clear_matching_dirty_attr_if_committed(ino, &attr);
+                }
             }
 
             if requeue_retained_uploads {
