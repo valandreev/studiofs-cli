@@ -1,7 +1,7 @@
 //! Multi-client process controller for mounted E2E scenarios.
 
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write as _};
+use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -1837,25 +1837,59 @@ fn macos_stale_unmount_attempts() -> &'static [(&'static str, &'static [&'static
 }
 
 #[cfg(target_os = "macos")]
+fn create_macos_unmount_output_file(label: &str) -> io::Result<(PathBuf, fs::File)> {
+    let dir = PathBuf::from("target").join("studiofs-e2e-unmount-output");
+    fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{label}-{}.log", uuid::Uuid::new_v4()));
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    Ok((path, file))
+}
+
+#[cfg(target_os = "macos")]
+fn read_macos_unmount_output_file(file: &mut fs::File) -> io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    file.seek(SeekFrom::Start(0))?;
+    file.read_to_end(&mut output)?;
+    Ok(output)
+}
+
+#[cfg(target_os = "macos")]
 fn run_macos_unmount_attempt_with_timeout(
     program: &str,
     args: &[&str],
     path: &Path,
     timeout: Duration,
 ) -> io::Result<std::process::Output> {
+    let (stdout_path, mut stdout_file) = create_macos_unmount_output_file("stdout")?;
+    let (stderr_path, mut stderr_file) = create_macos_unmount_output_file("stderr")?;
     let mut child = Command::new(program)
         .args(args)
         .arg(path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::from(stdout_file.try_clone()?))
+        .stderr(Stdio::from(stderr_file.try_clone()?))
         .spawn()?;
     let started = Instant::now();
     loop {
-        if child.try_wait()?.is_some() {
-            return child.wait_with_output();
+        if let Some(status) = child.try_wait()? {
+            let stdout = read_macos_unmount_output_file(&mut stdout_file)?;
+            let stderr = read_macos_unmount_output_file(&mut stderr_file)?;
+            let _ = fs::remove_file(&stdout_path);
+            let _ = fs::remove_file(&stderr_path);
+            return Ok(std::process::Output {
+                status,
+                stdout,
+                stderr,
+            });
         }
         if started.elapsed() >= timeout {
             let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_file(&stdout_path);
+            let _ = fs::remove_file(&stderr_path);
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!(
@@ -2174,6 +2208,22 @@ mod tests {
             started.elapsed() < Duration::from_secs(2),
             "cleanup timeout should bound a stuck unmount helper"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_stale_mount_cleanup_attempts_drain_large_output() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let output = run_macos_unmount_attempt_with_timeout(
+            "sh",
+            &["-c", "yes studiofs-unmount-output | head -c 200000"],
+            temp.path(),
+            Duration::from_secs(2),
+        )
+        .expect("large-output cleanup command should not block on full pipes");
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), 200_000);
     }
 
     #[test]

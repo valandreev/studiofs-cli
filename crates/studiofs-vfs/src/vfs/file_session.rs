@@ -40,9 +40,9 @@ pub(super) struct FileSessionDebugSnapshot {
     pub(super) open_handles: u32,
     pub(super) queued_ops: u64,
     pub(super) active_readers: u32,
-    pub(super) active_writer: Option<String>,
+    pub(super) active_writer: Option<&'static str>,
     pub(super) last_transition_unix_ms: u64,
-    pub(super) last_transition_label: String,
+    pub(super) last_transition_label: (&'static str, &'static str),
 }
 
 /// Flags associated with an open file descriptor.
@@ -236,9 +236,9 @@ pub(super) struct FileSessionEntry {
     wait_ms: AtomicU64,
     transitions: AtomicU64,
     active_readers: AtomicU32,
-    active_writer: Mutex<Option<String>>,
+    active_writer: Mutex<Option<&'static str>>,
     last_transition_unix_ms: AtomicU64,
-    last_transition_label: Mutex<String>,
+    last_transition_label: Mutex<(&'static str, &'static str)>,
 }
 
 impl FileSessionEntry {
@@ -255,7 +255,7 @@ impl FileSessionEntry {
             active_readers: AtomicU32::new(0),
             active_writer: Mutex::new(None),
             last_transition_unix_ms: AtomicU64::new(0),
-            last_transition_label: Mutex::new(String::new()),
+            last_transition_label: Mutex::new(("", "")),
         }
     }
 
@@ -263,7 +263,7 @@ impl FileSessionEntry {
         self.transitions.fetch_add(1, Ordering::Relaxed);
         self.last_transition_unix_ms
             .store(now_unix_millis(), Ordering::Relaxed);
-        *self.last_transition_label.lock() = format!("{}:{phase}", op.as_str());
+        *self.last_transition_label.lock() = (op.as_str(), phase);
     }
 
     fn update_max_queue_depth(&self, candidate: u64) {
@@ -278,7 +278,7 @@ impl FileSessionEntry {
         if op.read_lock() {
             self.active_readers.fetch_add(1, Ordering::Relaxed);
         } else {
-            *self.active_writer.lock() = Some(op.as_str().to_string());
+            *self.active_writer.lock() = Some(op.as_str());
         }
     }
 
@@ -532,9 +532,9 @@ impl FileSessionState {
             open_handles: session.open_handles.load(Ordering::Relaxed),
             queued_ops: session.queued_ops.load(Ordering::Relaxed),
             active_readers: session.active_readers.load(Ordering::Relaxed),
-            active_writer: session.active_writer.lock().clone(),
+            active_writer: *session.active_writer.lock(),
             last_transition_unix_ms: session.last_transition_unix_ms.load(Ordering::Relaxed),
-            last_transition_label: session.last_transition_label.lock().clone(),
+            last_transition_label: *session.last_transition_label.lock(),
         })
     }
 }

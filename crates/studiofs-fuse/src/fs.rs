@@ -52,11 +52,9 @@ fn fuse_open_reply_flags(_open_flags: OpenFlags) -> u32 {
     let mut flags = 0;
     #[cfg(target_os = "macos")]
     {
-        let open_flags = _open_flags;
         // Same family of fix as the WinFSP cache bypass, but stricter for
         // macFUSE: stale kernel EOF can survive sparse size changes even on
         // read-only handles.
-        let _ = open_flags;
         flags |= fuser::consts::FOPEN_DIRECT_IO;
     }
     flags

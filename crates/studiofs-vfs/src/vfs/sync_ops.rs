@@ -1207,12 +1207,13 @@ impl StudioVfs {
                 session_open_handles = session.as_ref().map(|snapshot| snapshot.open_handles),
                 session_queued_ops = session.as_ref().map(|snapshot| snapshot.queued_ops),
                 session_active_readers = session.as_ref().map(|snapshot| snapshot.active_readers),
-                session_active_writer = session
+                session_active_writer = session.as_ref().and_then(|snapshot| snapshot.active_writer),
+                session_last_transition_op = session
                     .as_ref()
-                    .and_then(|snapshot| snapshot.active_writer.as_deref()),
-                session_last_transition = session
+                    .map(|snapshot| snapshot.last_transition_label.0),
+                session_last_transition_phase = session
                     .as_ref()
-                    .map(|snapshot| snapshot.last_transition_label.as_str()),
+                    .map(|snapshot| snapshot.last_transition_label.1),
                 session_last_transition_unix_ms = session
                     .as_ref()
                     .map(|snapshot| snapshot.last_transition_unix_ms),
