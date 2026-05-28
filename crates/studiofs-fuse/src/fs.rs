@@ -2,6 +2,8 @@
 
 mod handle_drain;
 
+#[cfg(target_os = "macos")]
+use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::Arc;
@@ -189,6 +191,14 @@ fn macos_truncated_rename_suffix_is_safe(old_name: &[u8]) -> bool {
 }
 
 #[cfg(target_os = "macos")]
+fn macos_visible_readdir_names(entries: &[DirEntry]) -> impl Iterator<Item = &[u8]> {
+    entries
+        .iter()
+        .map(|entry| entry.name.as_slice())
+        .filter(|name| !matches!(*name, b"." | b".."))
+}
+
+#[cfg(target_os = "macos")]
 fn recover_macos_truncated_rename_source(old_name: &[u8], entries: &[DirEntry]) -> Option<Vec<u8>> {
     // macFUSE can deliver FUSE_RENAME with an empty old-name payload or a
     // payload missing an observed variable-length prefix. Only recover when
@@ -196,7 +206,7 @@ fn recover_macos_truncated_rename_source(old_name: &[u8], entries: &[DirEntry]) 
     // suffixes must start at a visible boundary; otherwise a normal failed
     // rename of "a.txt" could incorrectly target "prefix-a.txt".
     if old_name.is_empty() {
-        let mut candidates = entries.iter().map(|entry| entry.name.as_slice());
+        let mut candidates = macos_visible_readdir_names(entries);
         let recovered = candidates.next()?;
         if candidates.next().is_some() {
             return None;
@@ -211,6 +221,7 @@ fn recover_macos_truncated_rename_source(old_name: &[u8], entries: &[DirEntry]) 
     let mut candidates = entries
         .iter()
         .map(|entry| entry.name.as_slice())
+        .filter(|candidate| !matches!(*candidate, b"." | b".."))
         .filter(|candidate| candidate.len() > old_name.len() && candidate.ends_with(old_name));
 
     let recovered = candidates.next()?;
@@ -228,6 +239,9 @@ fn recover_macos_normalized_name(name: &[u8], entries: &[DirEntry]) -> Option<Ve
     let key_nfd = key_str.nfd().collect::<String>();
     let mut canonical_match: Option<&[u8]> = None;
     for entry in entries {
+        if matches!(entry.name.as_slice(), b"." | b"..") {
+            continue;
+        }
         if entry.name.as_slice() == name {
             return None;
         }
@@ -246,42 +260,67 @@ fn recover_macos_normalized_name(name: &[u8], entries: &[DirEntry]) -> Option<Ve
 }
 
 #[cfg(target_os = "macos")]
-fn resolve_macos_namespace_name(name: &[u8], entries: &[DirEntry]) -> Vec<u8> {
-    recover_macos_normalized_name(name, entries).unwrap_or_else(|| name.to_vec())
+fn resolve_macos_namespace_name<'a>(name: &'a [u8], entries: &[DirEntry]) -> Cow<'a, [u8]> {
+    recover_macos_normalized_name(name, entries)
+        .map(Cow::Owned)
+        .unwrap_or(Cow::Borrowed(name))
 }
 
 #[cfg(target_os = "macos")]
-fn resolve_macos_existing_mutation_source(
+fn lookup_macos_normalized_forms<'a>(
     vfs: &StudioVfs,
     parent: u64,
-    requested_name: &[u8],
-) -> Vec<u8> {
+    requested_name: &'a [u8],
+) -> Option<Cow<'a, [u8]>> {
+    let requested = std::str::from_utf8(requested_name).ok()?;
+    let nfc = requested.nfc().collect::<String>();
+    if nfc.as_bytes() != requested_name && vfs.lookup(parent, nfc.as_bytes()).is_ok() {
+        return Some(Cow::Owned(nfc.into_bytes()));
+    }
+    let nfd = requested.nfd().collect::<String>();
+    if nfd.as_bytes() != requested_name && vfs.lookup(parent, nfd.as_bytes()).is_ok() {
+        return Some(Cow::Owned(nfd.into_bytes()));
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_macos_existing_mutation_source<'a>(
+    vfs: &StudioVfs,
+    parent: u64,
+    requested_name: &'a [u8],
+) -> Cow<'a, [u8]> {
     if vfs.lookup(parent, requested_name).is_ok() {
-        return requested_name.to_vec();
+        return Cow::Borrowed(requested_name);
     }
     let Ok(entries) = vfs.readdir(parent) else {
-        return requested_name.to_vec();
+        return Cow::Borrowed(requested_name);
     };
     let normalized_name = resolve_macos_namespace_name(requested_name, &entries);
-    if normalized_name != requested_name {
+    if normalized_name.as_ref() != requested_name {
         return normalized_name;
     }
     recover_macos_truncated_rename_source(requested_name, &entries)
-        .unwrap_or_else(|| requested_name.to_vec())
+        .map(Cow::Owned)
+        .unwrap_or(Cow::Borrowed(requested_name))
 }
 
 #[cfg(target_os = "macos")]
-fn resolve_macos_mutation_target_name(
+fn resolve_macos_mutation_target_name<'a>(
     vfs: &StudioVfs,
     parent: u64,
-    requested_name: &[u8],
-) -> Vec<u8> {
-    if vfs.lookup(parent, requested_name).is_ok() || requested_name.is_ascii() {
-        return requested_name.to_vec();
+    requested_name: &'a [u8],
+) -> Cow<'a, [u8]> {
+    match vfs.lookup(parent, requested_name) {
+        Ok(_) => return Cow::Borrowed(requested_name),
+        Err(VfsError::Meta(studiofs_meta::MetaError::EntryNotFound { .. })) => {}
+        Err(_) => return Cow::Borrowed(requested_name),
     }
-    vfs.readdir(parent)
-        .map(|entries| resolve_macos_namespace_name(requested_name, &entries))
-        .unwrap_or_else(|_| requested_name.to_vec())
+    if requested_name.is_ascii() {
+        return Cow::Borrowed(requested_name);
+    }
+    lookup_macos_normalized_forms(vfs, parent, requested_name)
+        .unwrap_or(Cow::Borrowed(requested_name))
 }
 
 #[cfg(target_os = "macos")]
@@ -504,8 +543,8 @@ impl Filesystem for StudioFuseFs {
             }
             if let Ok(entries) = self.vfs.readdir(parent) {
                 let resolved = resolve_macos_namespace_name(&name_bytes, &entries);
-                if resolved != name_bytes {
-                    return self.vfs.lookup(parent, &resolved);
+                if resolved.as_ref() != name_bytes.as_slice() {
+                    return self.vfs.lookup(parent, resolved.as_ref());
                 }
             }
             Err(err)
@@ -1771,7 +1810,8 @@ mod tests {
     use super::{
         macos_exchange_or_rename, merge_xattr_write, normalize_macos_readdir_name,
         normalize_macos_xattr_flags, recover_macos_normalized_name,
-        recover_macos_truncated_rename_source, resolve_macos_namespace_name,
+        recover_macos_truncated_rename_source, resolve_macos_mutation_target_name,
+        resolve_macos_namespace_name,
     };
     use std::sync::Arc;
     use studiofs_data::store::DataStoreConfig;
@@ -2117,6 +2157,32 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn recover_macos_rename_source_ignores_dot_entries_for_empty_source() {
+        let entries = vec![
+            DirEntry {
+                name: b".".to_vec(),
+                ino: 1,
+                kind: studiofs_meta::FileType::Directory,
+            },
+            DirEntry {
+                name: b"..".to_vec(),
+                ino: 2,
+                kind: studiofs_meta::FileType::Directory,
+            },
+            DirEntry {
+                name: b"file.txt".to_vec(),
+                ino: 3,
+                kind: studiofs_meta::FileType::RegularFile,
+            },
+        ];
+
+        let recovered = recover_macos_truncated_rename_source(b"", &entries);
+
+        assert_eq!(recovered, Some(b"file.txt".to_vec()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn macos_exchange_falls_back_to_rename_when_target_is_missing() {
         let (_tmp, _rt, vfs, _fs) = make_test_fuse_fs("macos-exchange-rename");
         let parent = vfs
@@ -2140,6 +2206,41 @@ mod tests {
             .lookup(parent.ino, b"c.txt")
             .expect("target dentry should exist");
         assert_eq!(renamed.ino, source.ino);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn resolve_macos_mutation_target_name_uses_direct_normalized_lookup() {
+        let (_tmp, _rt, vfs, _fs) = make_test_fuse_fs("macos-target-normalized-lookup");
+        let parent = vfs
+            .mkdir(studiofs_meta::ROOT_INO, b"scan", 0, 0, 0o755)
+            .expect("create scan dir");
+        let latin_nfc = "café";
+        let latin_nfd = latin_nfc.nfd().collect::<String>();
+        vfs.create(parent.ino, latin_nfc.as_bytes(), 0, 0, 0o644)
+            .expect("create NFC target");
+
+        let resolved = resolve_macos_mutation_target_name(&vfs, parent.ino, latin_nfd.as_bytes());
+
+        assert_eq!(resolved.as_ref(), latin_nfc.as_bytes());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn resolve_macos_mutation_target_name_borrows_missing_non_ascii_target() {
+        let (_tmp, _rt, vfs, _fs) = make_test_fuse_fs("macos-target-missing-borrowed");
+        let parent = vfs
+            .mkdir(studiofs_meta::ROOT_INO, b"scan", 0, 0, 0o755)
+            .expect("create scan dir");
+        let missing = "новый".as_bytes();
+
+        let resolved = resolve_macos_mutation_target_name(&vfs, parent.ino, missing);
+
+        assert!(
+            matches!(resolved, std::borrow::Cow::Borrowed(_)),
+            "missing target should avoid an owned recovery path"
+        );
+        assert_eq!(resolved.as_ref(), missing);
     }
 
     #[cfg(target_os = "macos")]
