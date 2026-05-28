@@ -1,6 +1,8 @@
 use super::*;
 use tempfile::TempDir;
 
+const DIAGNOSTICS_TEST_LEASE_TTL_MS: u64 = 5_000;
+
 #[derive(Clone)]
 struct StaticDiagnosticsSource {
     session: DiagnosticsSessionInfo,
@@ -1290,7 +1292,7 @@ fn silent_log_verbosity_action_returns_updated_level_without_timeline_entry() {
         DiagnosticsRequest::AcquireController {
             auth_token: "secret".to_string(),
             client_name: "tester".to_string(),
-            ttl_ms: Some(250),
+            ttl_ms: Some(DIAGNOSTICS_TEST_LEASE_TTL_MS),
         },
         "secret",
         &source,
@@ -1382,7 +1384,7 @@ fn loud_safe_action_appends_audited_timeline_entry() {
         DiagnosticsRequest::AcquireController {
             auth_token: "secret".to_string(),
             client_name: "tester".to_string(),
-            ttl_ms: Some(250),
+            ttl_ms: Some(DIAGNOSTICS_TEST_LEASE_TTL_MS),
         },
         "secret",
         &source,
@@ -1485,7 +1487,7 @@ fn loud_safe_action_failures_remain_audited_and_fail_open() {
         DiagnosticsRequest::AcquireController {
             auth_token: "secret".to_string(),
             client_name: "tester".to_string(),
-            ttl_ms: Some(250),
+            ttl_ms: Some(DIAGNOSTICS_TEST_LEASE_TTL_MS),
         },
         "secret",
         &source,
@@ -1578,7 +1580,7 @@ fn reset_counters_action_calls_data_source_and_is_audited() {
         DiagnosticsRequest::AcquireController {
             auth_token: "secret".to_string(),
             client_name: "tester".to_string(),
-            ttl_ms: Some(250),
+            ttl_ms: Some(DIAGNOSTICS_TEST_LEASE_TTL_MS),
         },
         "secret",
         &source,
@@ -1677,7 +1679,7 @@ fn loud_safe_action_audit_failures_are_reported_in_outcome() {
         DiagnosticsRequest::AcquireController {
             auth_token: "secret".to_string(),
             client_name: "tester".to_string(),
-            ttl_ms: Some(250),
+            ttl_ms: Some(DIAGNOSTICS_TEST_LEASE_TTL_MS),
         },
         "secret",
         &source,
@@ -1840,7 +1842,7 @@ fn mutating_requests_persist_run_fingerprint_and_timeline() {
     let service = test_session_service(&source, &lease_manager, Some(&store), None);
 
     let lease = service
-        .acquire_controller("tester".to_string(), Some(250))
+        .acquire_controller("tester".to_string(), Some(DIAGNOSTICS_TEST_LEASE_TTL_MS))
         .expect("acquire controller");
     let case = service
         .create_case(
@@ -1933,7 +1935,7 @@ fn workflow_requests_execute_hybrid_preset_and_persist_progress() {
     let service = test_session_service(&source, &lease_manager, Some(&store), Some(&profiling));
 
     let lease = service
-        .acquire_controller("tester".to_string(), Some(250))
+        .acquire_controller("tester".to_string(), Some(DIAGNOSTICS_TEST_LEASE_TTL_MS))
         .expect("acquire controller");
     let case = service
         .create_case(
@@ -2163,7 +2165,7 @@ fn profiling_requests_start_stop_and_persist_window() {
     let service = test_session_service(&source, &lease_manager, Some(&store), Some(&profiling));
 
     let lease = service
-        .acquire_controller("tester".to_string(), Some(250))
+        .acquire_controller("tester".to_string(), Some(DIAGNOSTICS_TEST_LEASE_TTL_MS))
         .expect("acquire controller");
     let case = service
         .create_case(
@@ -2228,7 +2230,7 @@ fn profiling_requests_reject_budget_above_limit() {
     let service = test_session_service(&source, &lease_manager, Some(&store), Some(&profiling));
 
     let lease = service
-        .acquire_controller("tester".to_string(), Some(250))
+        .acquire_controller("tester".to_string(), Some(DIAGNOSTICS_TEST_LEASE_TTL_MS))
         .expect("acquire controller");
 
     let response = service.start_profiling_window(

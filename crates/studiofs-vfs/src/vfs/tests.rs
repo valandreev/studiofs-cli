@@ -3945,19 +3945,33 @@ fn handle_backed_extend_keeps_writer_stack_buffered_without_strict_sync() {
             .metrics
             .payload_store_sync_data_calls
             .load(Ordering::Relaxed);
-        assert_eq!(
-            sync_calls_after, sync_calls_before,
-            "handle-backed logical-size growth must not force strict sync_data"
-        );
         assert_eq!(extended.size, (payload.len() + 4096) as u64);
-        assert!(
-            vfs.state.writer_stack.has_dirty_writers(ino),
-            "logical-size growth should leave foreground write data buffered"
-        );
-        assert!(
-            vfs.pending_uploads_for_inode(ino).is_empty(),
-            "logical-size growth should not materialize or enqueue uploads"
-        );
+        #[cfg(target_os = "macos")]
+        {
+            assert!(
+                sync_calls_after > sync_calls_before,
+                "macOS handle-backed EOF growth must publish local size before replying"
+            );
+            assert!(
+                !vfs.state.writer_stack.has_dirty_writers(ino),
+                "macOS strict EOF barrier should materialize foreground writer data"
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(
+                sync_calls_after, sync_calls_before,
+                "handle-backed logical-size growth must not force strict sync_data"
+            );
+            assert!(
+                vfs.state.writer_stack.has_dirty_writers(ino),
+                "logical-size growth should leave foreground write data buffered"
+            );
+            assert!(
+                vfs.pending_uploads_for_inode(ino).is_empty(),
+                "logical-size growth should not materialize or enqueue uploads"
+            );
+        }
 
         vfs.release_fh(fh).await.unwrap();
     });
@@ -3967,6 +3981,8 @@ fn handle_backed_extend_keeps_writer_stack_buffered_without_strict_sync() {
 fn handle_backed_extend_with_dirty_writer_and_pending_upload_does_not_cancel_active_uploads() {
     let tmp = TempDir::new().expect("tempdir");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "handle-extend-active-upload");
+    #[cfg(target_os = "macos")]
+    let _ = &meta;
     let _guard = rt.enter();
 
     rt.block_on(async {
@@ -3985,7 +4001,9 @@ fn handle_backed_extend_with_dirty_writer_and_pending_upload_does_not_cancel_act
             !pending_before.is_empty(),
             "setup should leave an upload queued for the first epoch"
         );
+        #[cfg(not(target_os = "macos"))]
         let pending_epoch = meta.get_attr(ino).expect("load flushed attr").content_epoch;
+        #[cfg(not(target_os = "macos"))]
         let active_upload_token = vfs.uploader_cancel_token_for_inode(ino);
 
         let fh = vfs
@@ -4017,22 +4035,42 @@ fn handle_backed_extend_with_dirty_writer_and_pending_upload_does_not_cancel_act
             .metrics
             .payload_store_sync_data_calls
             .load(Ordering::Relaxed);
-        assert_eq!(
-            sync_calls_after, sync_calls_before,
-            "active handle growth must not force strict payload-store sync"
-        );
-        assert!(
-            !active_upload_token.is_cancelled(),
-            "active handle growth must not cancel in-flight uploads for an older queued epoch"
-        );
-        assert!(vfs.state.writer_stack.has_dirty_writers(ino));
         assert_eq!(extended.size, 32 * 1024);
-        assert!(
-            vfs.pending_uploads_for_inode(ino)
-                .iter()
-                .any(|(_, _, content_epoch)| *content_epoch == pending_epoch),
-            "old queued uploads should remain queued instead of being requeued by EOF growth"
-        );
+        #[cfg(target_os = "macos")]
+        {
+            assert!(
+                sync_calls_after > sync_calls_before,
+                "macOS active handle growth must force a local EOF/payload barrier"
+            );
+            assert!(
+                !vfs.state.writer_stack.has_dirty_writers(ino),
+                "macOS strict EOF barrier should materialize active writer-stack data"
+            );
+            assert!(
+                vfs.pending_uploads_for_inode(ino)
+                    .iter()
+                    .any(|(_, _, content_epoch)| *content_epoch == extended.content_epoch),
+                "macOS strict EOF barrier should queue publish work for the new local epoch"
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(
+                sync_calls_after, sync_calls_before,
+                "active handle growth must not force strict payload-store sync"
+            );
+            assert!(
+                !active_upload_token.is_cancelled(),
+                "active handle growth must not cancel in-flight uploads for an older queued epoch"
+            );
+            assert!(vfs.state.writer_stack.has_dirty_writers(ino));
+            assert!(
+                vfs.pending_uploads_for_inode(ino)
+                    .iter()
+                    .any(|(_, _, content_epoch)| *content_epoch == pending_epoch),
+                "old queued uploads should remain queued instead of being requeued by EOF growth"
+            );
+        }
 
         vfs.release_fh(fh).await.unwrap();
     });

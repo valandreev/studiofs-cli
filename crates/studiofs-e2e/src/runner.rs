@@ -1,6 +1,7 @@
 //! Runner orchestration, sandbox creation, reports, and cleanup.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::io::{IsTerminal as _, Write as _};
 use std::path::{Component, Path, PathBuf};
@@ -1980,11 +1981,22 @@ fn runner_owned_mount_points_from_metadata(sandbox: &Path) -> Result<Vec<PathBuf
         if !entry.file_type()?.is_dir() {
             continue;
         }
-        let metadata_path = entry.path().join("mount/mount-point.json");
+        let client_dir = entry.path();
+        let mount_metadata_dir = client_dir.join("mount");
+        let metadata_path = mount_metadata_dir.join("mount-point.json");
+        add_layout_inferred_runner_mount_points(sandbox, &mount_metadata_dir, &mut mount_points);
         let bytes = match fs::read(&metadata_path) {
             Ok(bytes) => bytes,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => return Err(err.into()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                continue;
+            }
+            Err(err) => {
+                eprintln!(
+                    "studiofs-e2e: skipping unreadable client mount metadata {}: {err}",
+                    metadata_path.display()
+                );
+                continue;
+            }
         };
         let metadata: RunnerClientMountMetadata = match serde_json::from_slice(&bytes) {
             Ok(metadata) => metadata,
@@ -2001,6 +2013,28 @@ fn runner_owned_mount_points_from_metadata(sandbox: &Path) -> Result<Vec<PathBuf
         }
     }
     Ok(mount_points.into_iter().collect())
+}
+
+fn add_layout_inferred_runner_mount_points(
+    sandbox: &Path,
+    mount_metadata_dir: &Path,
+    mount_points: &mut BTreeSet<PathBuf>,
+) {
+    let Ok(entries) = fs::read_dir(mount_metadata_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.file_name() == Some(OsStr::new("mount-point.json")) {
+            continue;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() && path.starts_with(sandbox) {
+            mount_points.insert(path);
+        }
+    }
 }
 
 fn resolve_scenarios(names: &[String]) -> Result<Vec<ResolvedScenario>, RunnerError> {
@@ -3485,6 +3519,20 @@ plain child stderr\n",
         )
         .unwrap();
         fs::write(client_b_mount_dir.join("mount-point.json"), b"{").unwrap();
+
+        let mount_points = runner_owned_mount_points_from_metadata(&sandbox).unwrap();
+
+        assert_eq!(mount_points, vec![mount_a]);
+    }
+
+    #[test]
+    fn clean_infers_layout_mount_points_when_client_mount_metadata_is_unreadable() {
+        let temp = tempfile::tempdir().unwrap();
+        let sandbox = temp.path().join("e2e-runs").join("unreadable-metadata-run");
+        let mount_a = sandbox.join("artifacts/clients/client-a/mount/projectfs");
+        let client_a_mount_dir = mount_a.parent().unwrap();
+        fs::create_dir_all(&mount_a).unwrap();
+        fs::create_dir_all(client_a_mount_dir.join("mount-point.json")).unwrap();
 
         let mount_points = runner_owned_mount_points_from_metadata(&sandbox).unwrap();
 
