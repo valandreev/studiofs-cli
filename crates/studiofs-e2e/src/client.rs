@@ -1864,8 +1864,18 @@ fn run_macos_unmount_attempt_with_timeout(
     path: &Path,
     timeout: Duration,
 ) -> io::Result<std::process::Output> {
+    struct DeleteOnDrop(PathBuf);
+
+    impl Drop for DeleteOnDrop {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
     let (stdout_path, mut stdout_file) = create_macos_unmount_output_file("stdout")?;
+    let _stdout_guard = DeleteOnDrop(stdout_path);
     let (stderr_path, mut stderr_file) = create_macos_unmount_output_file("stderr")?;
+    let _stderr_guard = DeleteOnDrop(stderr_path);
     let mut child = Command::new(program)
         .args(args)
         .arg(path)
@@ -1877,8 +1887,6 @@ fn run_macos_unmount_attempt_with_timeout(
         if let Some(status) = child.try_wait()? {
             let stdout = read_macos_unmount_output_file(&mut stdout_file)?;
             let stderr = read_macos_unmount_output_file(&mut stderr_file)?;
-            let _ = fs::remove_file(&stdout_path);
-            let _ = fs::remove_file(&stderr_path);
             return Ok(std::process::Output {
                 status,
                 stdout,
@@ -1888,8 +1896,6 @@ fn run_macos_unmount_attempt_with_timeout(
         if started.elapsed() >= timeout {
             let _ = child.kill();
             let _ = child.wait();
-            let _ = fs::remove_file(&stdout_path);
-            let _ = fs::remove_file(&stderr_path);
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!(
