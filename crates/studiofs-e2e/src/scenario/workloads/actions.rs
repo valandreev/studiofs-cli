@@ -3,9 +3,8 @@
 use super::*;
 
 static BOUNDED_MOUNTED_IO_POOL: OnceLock<BoundedMountedIoPool> = OnceLock::new();
-
-#[cfg(windows)]
-static HOTSPOT_HELPER_TIMED_IO_ACTIVE_WORKERS: AtomicUsize = AtomicUsize::new(0);
+pub(in crate::scenario) static HOTSPOT_HELPER_TIMED_IO_ACTIVE_WORKERS: AtomicUsize =
+    AtomicUsize::new(0);
 
 #[derive(Debug, Clone)]
 pub(in crate::scenario) struct BoundedMountedIoPool {
@@ -201,12 +200,10 @@ fn cancel_bounded_mounted_io_worker(_worker: &thread::JoinHandle<()>) -> String 
     "thread cancellation is not available on this platform".to_string()
 }
 
-#[cfg(windows)]
 struct HotspotHelperTimedIoPermit {
     active_workers: &'static AtomicUsize,
 }
 
-#[cfg(windows)]
 impl HotspotHelperTimedIoPermit {
     fn try_acquire(pending_label: &str, timeout: Duration) -> Result<Self, anyhow::Error> {
         let active_workers = &HOTSPOT_HELPER_TIMED_IO_ACTIVE_WORKERS;
@@ -231,7 +228,6 @@ impl HotspotHelperTimedIoPermit {
     }
 }
 
-#[cfg(windows)]
 impl Drop for HotspotHelperTimedIoPermit {
     fn drop(&mut self) {
         self.active_workers.fetch_sub(1, Ordering::AcqRel);
@@ -348,9 +344,8 @@ pub fn run_hotspot_op_helper_with_timeout(
     progress: Option<&Path>,
     timeout: Option<Duration>,
 ) -> Result<(), anyhow::Error> {
-    #[cfg(windows)]
     if let Some(timeout) = timeout {
-        return run_hotspot_op_helper_with_windows_timeout(
+        return run_hotspot_op_helper_with_internal_timeout(
             operation,
             mount_point,
             path,
@@ -361,7 +356,6 @@ pub fn run_hotspot_op_helper_with_timeout(
         );
     }
 
-    let _ = timeout;
     run_hotspot_op_helper(operation, mount_point, path, target, payload, progress)
 }
 
@@ -379,7 +373,7 @@ pub struct SparseOpHelperRequest<'a> {
     /// Client mount root where the operation is executed.
     ///
     /// The helper joins this root with `path` before touching the filesystem.
-    pub mount_point: PathBuf,
+    pub mount_point: &'a Path,
     /// Scenario-relative file path under `mount_point`.
     ///
     /// This must not be an absolute path; callers use it to address the sparse test file inside the
@@ -431,8 +425,7 @@ pub fn run_sparse_op_helper_with_timeout(
     run_sparse_op_helper(operation, mount_point, path, offset, len, payload, progress)
 }
 
-#[cfg(windows)]
-pub(in crate::scenario) fn run_hotspot_op_helper_with_windows_timeout(
+pub(in crate::scenario) fn run_hotspot_op_helper_with_internal_timeout(
     operation: &str,
     mount_point: PathBuf,
     path: &str,
@@ -522,7 +515,6 @@ pub(in crate::scenario) fn run_hotspot_op_helper_with_windows_timeout(
     }
 }
 
-#[cfg(windows)]
 pub(in crate::scenario) fn join_hotspot_helper_worker(
     worker: thread::JoinHandle<()>,
 ) -> Result<(), anyhow::Error> {
@@ -548,6 +540,16 @@ pub(in crate::scenario) fn cancel_hotspot_helper_worker_io(
     } else {
         Ok(())
     }
+}
+
+#[cfg(not(windows))]
+pub(in crate::scenario) fn cancel_hotspot_helper_worker_io(
+    _worker: &thread::JoinHandle<()>,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "thread cancellation is not available on this platform",
+    ))
 }
 
 /// Executes one mounted hotspot filesystem operation without an internal timeout guard.
@@ -942,7 +944,7 @@ pub fn run_hotspot_op_helper(
 /// Executes one mounted sparse filesystem operation without an internal timeout guard.
 pub fn run_sparse_op_helper(
     operation: &str,
-    mount_point: PathBuf,
+    mount_point: &Path,
     path: &str,
     offset: Option<u64>,
     len: Option<u64>,

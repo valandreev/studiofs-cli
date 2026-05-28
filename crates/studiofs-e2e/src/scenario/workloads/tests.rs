@@ -161,7 +161,7 @@ fn sparse_helper_ops_cover_range_write_truncate_and_probes() {
 
     run_sparse_op_helper(
         "write-range",
-        mount.clone(),
+        &mount,
         "sparse/shared.bin",
         Some(1024),
         None,
@@ -171,7 +171,7 @@ fn sparse_helper_ops_cover_range_write_truncate_and_probes() {
     .unwrap();
     run_sparse_op_helper(
         "truncate",
-        mount.clone(),
+        &mount,
         "sparse/shared.bin",
         None,
         Some(4096),
@@ -181,7 +181,7 @@ fn sparse_helper_ops_cover_range_write_truncate_and_probes() {
     .unwrap();
     run_sparse_op_helper(
         "read-range-zero",
-        mount.clone(),
+        &mount,
         "sparse/shared.bin",
         Some(0),
         Some(512),
@@ -191,7 +191,7 @@ fn sparse_helper_ops_cover_range_write_truncate_and_probes() {
     .unwrap();
     run_sparse_op_helper(
         "read-range-exact",
-        mount,
+        &mount,
         "sparse/shared.bin",
         Some(1024),
         None,
@@ -2705,6 +2705,52 @@ fn hotspot_helper_stat_records_exact_metadata_probe() {
     assert!(progress_log.contains("\"phase\":\"before_metadata\""));
     assert!(progress_log.contains("\"phase\":\"after_metadata\""));
     assert!(progress_log.contains("\"phase\":\"completed\""));
+}
+
+#[cfg(unix)]
+#[test]
+fn hotspot_helper_timeout_is_enforced_before_parent_kill_on_unix() {
+    let temp = tempdir().unwrap();
+    let mount = temp.path().join("mount");
+    let payload = temp.path().join("blocked-payload.fifo");
+    let progress = temp.path().join("progress.jsonl");
+    std::fs::create_dir_all(&mount).unwrap();
+    let status = std::process::Command::new("mkfifo")
+        .arg(&payload)
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let err = run_hotspot_op_helper_with_timeout(
+        "create",
+        mount.clone(),
+        "blocked.txt",
+        None,
+        Some(&payload),
+        Some(&progress),
+        Some(Duration::from_millis(20)),
+    )
+    .unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains(HOTSPOT_HELPER_INTERNAL_TIMEOUT_MARKER),
+        "helper should convert blocked mounted I/O into its internal timeout marker before the parent process timeout"
+    );
+    let progress_log = std::fs::read_to_string(&progress).unwrap();
+    assert!(progress_log.contains("\"phase\":\"timeout_cancel_requested\""));
+
+    std::fs::write(&payload, b"payload").unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while HOTSPOT_HELPER_TIMED_IO_ACTIVE_WORKERS.load(Ordering::Acquire) != 0
+        && std::time::Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        HOTSPOT_HELPER_TIMED_IO_ACTIVE_WORKERS.load(Ordering::Acquire),
+        0
+    );
 }
 
 #[test]

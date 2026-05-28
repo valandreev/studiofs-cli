@@ -4284,6 +4284,62 @@ fn explicit_flush_after_clean_handle_extend_queues_metadata_only_publish() {
 }
 
 #[test]
+fn handle_backed_clean_growth_persistence_matches_platform_policy() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "handle-growth-platform-policy");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"handle-growth-platform-policy.bin", 0, 0, 0o644)
+            .expect("create test file");
+        let ino = attr.ino;
+
+        vfs.write(ino, 0, b"published-head")
+            .await
+            .expect("write seed payload");
+        vfs.flush(ino).await.expect("flush seed payload");
+        let (content_epoch, blocks) = mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+        publish_current_file_graph(&meta, ino, content_epoch, &blocks);
+
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open clean writable handle");
+        let logical_size = 8192u64;
+        vfs.setattr_with_handle(Some(fh), ino, SetattrArgs::size_only(logical_size))
+            .expect("extend clean handle");
+
+        #[cfg(target_os = "macos")]
+        {
+            let extended_attr = meta.get_attr(ino).expect("load strict macOS attr");
+            assert_eq!(extended_attr.size, logical_size);
+            assert!(
+                vfs.state
+                    .upload
+                    .pending_epoch_finalizations
+                    .lock()
+                    .contains(&(ino, extended_attr.content_epoch)),
+                "macOS handle-backed growth should queue metadata-only publication before reply"
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let dirty_attr = vfs
+                .state
+                .namespace
+                .dirty_attrs
+                .lock()
+                .get(&ino)
+                .cloned()
+                .expect("non-macOS handle-backed growth should defer strict persistence");
+            assert_eq!(dirty_attr.size, logical_size);
+        }
+
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
 fn handle_backed_sparse_extend_publishes_logical_size_without_tail_payload() {
     let tmp = TempDir::new().expect("tempdir");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "handle-sparse-extend-publish-size");
@@ -7464,6 +7520,37 @@ fn test_open_unlink_handle_accepts_followup_write_until_release() {
 }
 
 #[test]
+fn kernel_invalidation_skips_unresolved_active_open_overlay() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "active-open-unlinked-kernel-inval");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let name = b"active-open-unlinked-kernel-inval.txt";
+        let attr = vfs.create(ROOT_INO, name, 0, 0, 0o644).expect("create");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open writable handle");
+        meta.unlink(ROOT_INO, name)
+            .expect("simulate foreign unlink while handle stays open");
+        assert!(
+            vfs.best_effort_path_for_inode(attr.ino).is_none(),
+            "test setup needs the inode to be unresolvable like WinFSP's notify filter"
+        );
+
+        let invalidator = Arc::new(RecordingKernelInvalidator::default());
+        vfs.set_kernel_invalidator(invalidator.clone());
+        vfs.invalidate_kernel_inodes([attr.ino]);
+
+        assert!(
+            invalidator.snapshot().is_empty(),
+            "kernel invalidation must not evict an unlinked inode that still has an active writable handle"
+        );
+        vfs.release_fh(fh).await.expect("release handle");
+    });
+}
+
+#[test]
 fn test_release_fh_orphan_cleanup_clears_live_extents() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "release-orphan-live-extents");
@@ -7902,6 +7989,58 @@ fn test_flush_fh_with_outcome_materializes_pending_inode_dirty_state() {
             "flush_fh_with_outcome should preserve the write-committed file size"
         );
 
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn test_flush_fh_clean_skip_waits_for_deferred_release_but_not_file_session_gate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "flush-clean-waits-release");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"flush-clean-waits-release.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        assert!(
+            !vfs.inode_has_local_dirty_state(ino),
+            "test expects a clean inode before flush"
+        );
+
+        let _read_session = vfs
+            .state
+            .file_session
+            .enter_op(ino, FileSessionOperation::Read)
+            .await;
+        let task_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let guard = task_lock.clone().lock_owned().await;
+        vfs.state
+            .deferred_release_inflight
+            .lock()
+            .insert(ino, task_lock);
+
+        let flushing_vfs = Arc::clone(&vfs);
+        let flush = tokio::spawn(async move { flushing_vfs.flush_fh_with_outcome(fh).await });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !flush.is_finished(),
+            "clean handle flush must still wait for an in-flight deferred release barrier"
+        );
+
+        drop(guard);
+        vfs.state.deferred_release_inflight.lock().remove(&ino);
+        let outcome = tokio::time::timeout(Duration::from_millis(100), flush)
+            .await
+            .expect("clean flush should not wait behind the file-session gate")
+            .expect("flush task should not panic")
+            .expect("flush should complete after deferred release barrier drains");
+        assert!(
+            !outcome.flushed_local_dirty_state,
+            "clean handle flush should report a clean skip"
+        );
         vfs.release_fh(fh).await.unwrap();
     });
 }

@@ -52,8 +52,6 @@ impl CommitCoordinator {
         if vfs.inode_has_unmaterialized_overlay_for_finalize(ino) {
             return Ok(EpochFinalizeStatus::Deferred);
         }
-        let publication_changes_visible_size = attr.committed_size != attr.size;
-
         let meta = run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
             let has_persisted_overlay = engine.has_local_regular_file_overlay(ino)?;
             let lifecycle = engine.get_inode_lifecycle(ino)?;
@@ -111,6 +109,53 @@ impl CommitCoordinator {
             .file_session
             .enter_op(ino, FileSessionOperation::Finalize)
             .await;
+        let latest_attr = match run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+            engine.get_attr(ino)
+        })
+        .await
+        {
+            Ok(attr) => attr,
+            Err(VfsError::Meta(MetaError::InodeNotFound(_))) => {
+                vfs.clear_inode_incarnation(ino);
+                drop(finalize_session);
+                vfs.state.file_session.gc_if_idle(ino);
+                return Ok(EpochFinalizeStatus::Skipped);
+            }
+            Err(err) => {
+                drop(finalize_session);
+                vfs.state.file_session.gc_if_idle(ino);
+                return Err(err);
+            }
+        };
+        if latest_attr.content_epoch != content_epoch
+            || latest_attr.upload_state == MetaUploadState::Ready
+            || !StudioVfs::needs_epoch_finalization(&latest_attr)
+        {
+            tracing::debug!(
+                ino,
+                queued_content_epoch = content_epoch,
+                latest_content_epoch = latest_attr.content_epoch,
+                upload_state = ?latest_attr.upload_state,
+                "skipping stale epoch publication attempt after finalization gate"
+            );
+            drop(finalize_session);
+            vfs.state.file_session.gc_if_idle(ino);
+            return Ok(EpochFinalizeStatus::Skipped);
+        }
+        if latest_attr.size == 0
+            && latest_attr.committed_size > 0
+            && vfs.handle_table.open_count(ino) > 0
+        {
+            drop(finalize_session);
+            vfs.state.file_session.gc_if_idle(ino);
+            return Ok(EpochFinalizeStatus::Deferred);
+        }
+        if vfs.inode_has_unmaterialized_overlay_for_finalize(ino) {
+            drop(finalize_session);
+            vfs.state.file_session.gc_if_idle(ino);
+            return Ok(EpochFinalizeStatus::Deferred);
+        }
+        let publication_changes_visible_size = latest_attr.committed_size != latest_attr.size;
         let published = match run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
             engine.publish_regular_file_overlay_to_base_if_matches(ino, content_epoch)
         })
@@ -211,15 +256,15 @@ impl CommitCoordinator {
         // `getattr` can expose pending attrs from dirty_attrs without populating
         // attr_read_cache. A newer dirty attr must be preserved, but its presence
         // still means the kernel may hold stale attrs for the epoch just published.
-        if was_dirty_visible
+        let should_invalidate_kernel = was_dirty_visible
             || removed_cached_attr
             || publication_changes_visible_size
-            || meta.has_persisted_overlay
-        {
-            vfs.invalidate_kernel_inodes([ino]);
-        }
+            || meta.has_persisted_overlay;
         drop(finalize_session);
         vfs.state.file_session.gc_if_idle(ino);
+        if should_invalidate_kernel {
+            vfs.invalidate_kernel_inodes([ino]);
+        }
 
         Ok(EpochFinalizeStatus::Published)
     }

@@ -24,6 +24,8 @@ const DEFAULT_WINDOWS_MOUNT_LETTERS: &[char] = &[
     'Z', 'Y', 'X', 'W', 'V', 'U', 'T', 'S', 'R', 'Q', 'P', 'O', 'N', 'M', 'L', 'K',
 ];
 const MAX_COMMAND_OUTPUT_CHARS: usize = 4096;
+#[cfg(target_os = "macos")]
+const MACOS_STALE_UNMOUNT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(windows)]
 const TASKKILL_FALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
 const S3_BUCKET_NAME_MAX_CHARS: usize = 63;
@@ -1835,13 +1837,53 @@ fn macos_stale_unmount_attempts() -> &'static [(&'static str, &'static [&'static
 }
 
 #[cfg(target_os = "macos")]
+fn run_macos_unmount_attempt_with_timeout(
+    program: &str,
+    args: &[&str],
+    path: &Path,
+    timeout: Duration,
+) -> io::Result<std::process::Output> {
+    let mut child = Command::new(program)
+        .args(args)
+        .arg(path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let started = Instant::now();
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output();
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "{} {} {} timed out after {} ms",
+                    program,
+                    args.join(" "),
+                    path.display(),
+                    timeout.as_millis()
+                ),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn force_unmount_stale_macos_mount(
     path: &Path,
     readiness_error: Option<io::Error>,
 ) -> io::Result<()> {
     let mut diagnostics = Vec::new();
     for (program, args) in macos_stale_unmount_attempts() {
-        match Command::new(program).args(*args).arg(path).output() {
+        match run_macos_unmount_attempt_with_timeout(
+            program,
+            args,
+            path,
+            MACOS_STALE_UNMOUNT_ATTEMPT_TIMEOUT,
+        ) {
             Ok(output) if output.status.success() => match mount_point_is_active(path) {
                 Ok(false) => return Ok(()),
                 Ok(true) => diagnostics.push(format!(
@@ -2111,6 +2153,26 @@ mod tests {
                 .iter()
                 .any(|(program, args)| *program == "umount" && *args == ["-f"]),
             "macOS stale mount cleanup should fall back to forced umount"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_stale_mount_cleanup_attempts_are_timeout_bounded() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let started = Instant::now();
+        let err = run_macos_unmount_attempt_with_timeout(
+            "sh",
+            &["-c", "while :; do :; done"],
+            temp.path(),
+            Duration::from_millis(50),
+        )
+        .expect_err("blocking cleanup command should time out");
+
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "cleanup timeout should bound a stuck unmount helper"
         );
     }
 

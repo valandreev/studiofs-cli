@@ -107,6 +107,17 @@ impl StudioVfs {
         offset: u64,
         buffer: &mut [u8],
     ) -> VfsResult<u32> {
+        let debug_path = self.debug_pending_target_path(ino);
+        if let Some(path) = &debug_path {
+            tracing::info!(
+                ino,
+                fh = fh.unwrap_or_default(),
+                path = %path,
+                offset,
+                requested_len = buffer.len(),
+                "debug target read_into_impl started"
+            );
+        }
         self.enforce_access_async(ino, AccessLevel::ReadOnly)
             .await?;
         if let Some(attr) = self.ignored_entry_attr(ino) {
@@ -120,6 +131,17 @@ impl StudioVfs {
         let prepared = self
             .prepare_foreground_read(ino, offset, buffer.len())
             .await?;
+        if let Some(path) = &debug_path {
+            tracing::info!(
+                ino,
+                fh = fh.unwrap_or_default(),
+                path = %path,
+                offset,
+                requested_len = buffer.len(),
+                read_len = prepared.read_len,
+                "debug target read_into_impl prepared foreground read"
+            );
+        }
         if prepared.context.placeholder_visible(self, ino) {
             return Err(VfsError::RemoteContentPending);
         }
@@ -148,6 +170,17 @@ impl StudioVfs {
         let written = self
             .execute_prepared_foreground_read(fh, ino, offset, buffer, &prepared)
             .await?;
+        if let Some(path) = &debug_path {
+            tracing::info!(
+                ino,
+                fh = fh.unwrap_or_default(),
+                path = %path,
+                offset,
+                requested_len = buffer.len(),
+                written,
+                "debug target read_into_impl executed foreground read"
+            );
+        }
         Ok(written as u32)
     }
 

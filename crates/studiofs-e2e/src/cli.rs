@@ -479,7 +479,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             let result =
                 scenario::run_sparse_op_helper_with_timeout(scenario::SparseOpHelperRequest {
                     operation: &args.operation,
-                    mount_point: args.mount_point,
+                    mount_point: &args.mount_point,
                     path: &args.path,
                     offset: args.offset,
                     len: args.len,

@@ -3024,7 +3024,7 @@ pub(in crate::scenario) fn run_sparse_helper_process(
         let _ = timeout;
         run_sparse_op_helper(
             operation,
-            client.mount_point.clone(),
+            &client.mount_point,
             path,
             offset,
             len,

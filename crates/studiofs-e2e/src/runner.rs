@@ -1974,7 +1974,7 @@ fn runner_owned_mount_points_from_metadata(sandbox: &Path) -> Result<Vec<PathBuf
         return Ok(Vec::new());
     }
 
-    let mut mount_points = Vec::new();
+    let mut mount_points = BTreeSet::new();
     for entry in fs::read_dir(clients_dir)? {
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
@@ -1997,12 +1997,10 @@ fn runner_owned_mount_points_from_metadata(sandbox: &Path) -> Result<Vec<PathBuf
             }
         };
         if metadata.mount_point.starts_with(sandbox) {
-            mount_points.push(metadata.mount_point);
+            mount_points.insert(metadata.mount_point);
         }
     }
-    mount_points.sort();
-    mount_points.dedup();
-    Ok(mount_points)
+    Ok(mount_points.into_iter().collect())
 }
 
 fn resolve_scenarios(names: &[String]) -> Result<Vec<ResolvedScenario>, RunnerError> {
@@ -2529,12 +2527,18 @@ fn collect_existing_artifacts(
     artifacts: &mut Vec<ArtifactReport>,
     seen: &mut BTreeSet<String>,
 ) -> Result<(), RunnerError> {
+    if is_client_mount_artifact_tree(sandbox, dir) {
+        return Ok(());
+    }
     if !dir.exists() {
         return Ok(());
     }
     for entry_result in fs::read_dir(dir)? {
         let entry = entry_result?;
         let path = entry.path();
+        if is_client_mount_artifact_tree(sandbox, &path) {
+            continue;
+        }
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
             collect_existing_artifacts(sandbox, &path, artifacts, seen)?;
@@ -2552,6 +2556,27 @@ fn collect_existing_artifacts(
         }
     }
     Ok(())
+}
+
+fn is_client_mount_artifact_tree(sandbox: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(sandbox) else {
+        return false;
+    };
+    let mut components = relative.components();
+    matches!(
+        (
+            components.next(),
+            components.next(),
+            components.next(),
+            components.next()
+        ),
+        (
+            Some(Component::Normal(artifacts)),
+            Some(Component::Normal(clients)),
+            Some(Component::Normal(_client)),
+            Some(Component::Normal(mount)),
+        ) if artifacts == "artifacts" && clients == "clients" && mount == "mount"
+    )
 }
 
 fn add_artifact(
@@ -3069,6 +3094,31 @@ plain child stderr\n",
             artifacts
                 .iter()
                 .any(|artifact| artifact.path == "artifacts/scenarios/smoke/linked-target.txt")
+        );
+    }
+
+    #[test]
+    fn report_artifact_discovery_skips_client_mount_trees() {
+        let temp = tempfile::tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let mount_dir = sandbox.join("artifacts/clients/client-a/mount/volume");
+        let log_dir = sandbox.join("artifacts/clients/client-a");
+        std::fs::create_dir_all(&mount_dir).unwrap();
+        std::fs::write(log_dir.join("studiofs.stdout.log"), "mounted").unwrap();
+        std::fs::write(mount_dir.join("mounted-file.txt"), "not an artifact").unwrap();
+
+        let artifacts = collect_report_artifacts(&sandbox, &[]).unwrap();
+
+        assert!(
+            artifacts
+                .iter()
+                .any(|artifact| artifact.path == "artifacts/clients/client-a/studiofs.stdout.log")
+        );
+        assert!(
+            !artifacts
+                .iter()
+                .any(|artifact| artifact.path.contains("/mount/")),
+            "mounted filesystem contents should not be reported as runner artifacts"
         );
     }
 

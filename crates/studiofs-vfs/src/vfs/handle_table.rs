@@ -66,6 +66,15 @@ impl HandleTable {
         self.open_counts.lock().get(&ino).copied().unwrap_or(0)
     }
 
+    /// Returns true when an inode still has a mutating handle whose local view
+    /// must survive namespace removal until the handle is released.
+    pub(super) fn has_active_open_overlay(&self, ino: Ino) -> bool {
+        self.handles
+            .read()
+            .values()
+            .any(|open_file| open_file.ino == ino && open_file.active_open_overlay)
+    }
+
     /// Mark an inode as orphan (unlinked while open).
     pub(super) fn mark_orphan(&self, ino: Ino) {
         self.orphans.lock().insert(ino);
@@ -107,6 +116,9 @@ mod tests {
         assert_eq!(ht.open_count(10), 2);
         assert_eq!(ht.open_count(20), 1);
         assert_eq!(ht.open_count(99), 0);
+        assert!(ht.has_active_open_overlay(10));
+        assert!(ht.has_active_open_overlay(20));
+        assert!(!ht.has_active_open_overlay(99));
 
         let of1 = ht.get(fh1.fh).unwrap();
         assert_eq!(of1.ino, 10);
@@ -126,6 +138,7 @@ mod tests {
         assert_eq!(closed2.ino, 10);
         assert_eq!(remaining, 0);
         assert_eq!(ht.open_count(10), 0);
+        assert!(!ht.has_active_open_overlay(10));
 
         assert!(ht.close(fh1.fh).is_none());
     }
