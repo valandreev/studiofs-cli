@@ -28,5 +28,10 @@ test*.txt
 .worktrees/
 deslop*.txt
 .rwx/bin/
+<<<<<<< HEAD
 .codebase-memory/
 .antigravitycli/
+=======
+.antigravitycli/
+.codebase-memory/
+>>>>>>> 3ede17f90f8100ed20b12ac3c8fd788dba632417

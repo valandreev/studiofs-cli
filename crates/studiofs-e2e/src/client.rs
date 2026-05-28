@@ -1,7 +1,9 @@
 //! Multi-client process controller for mounted E2E scenarios.
 
 use std::fs::{self, OpenOptions};
-use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
+use std::io::{self, Write as _};
+#[cfg(target_os = "macos")]
+use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
