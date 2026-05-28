@@ -1,6 +1,7 @@
 //! Runner orchestration, sandbox creation, reports, and cleanup.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::io::{IsTerminal as _, Write as _};
 use std::path::{Component, Path, PathBuf};
@@ -15,8 +16,8 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::client::{
-    ClientControllerConfig, ClientControllerError, DEFAULT_CLIENT_NAMES, client_cache_dir,
-    client_mount_point, client_root_dir,
+    ClientControllerConfig, ClientControllerError, DEFAULT_CLIENT_NAMES,
+    cleanup_stale_mount_before_remount, client_cache_dir, client_mount_point, client_root_dir,
 };
 use crate::infra::{
     COMPOSE_PROJECT_PREFIX, CommandExecutor, CommandSpec, ComposeConfig, ComposeServiceControl,
@@ -1941,8 +1942,99 @@ fn clean_entry(entry: fs::DirEntry, root: &Path) -> Result<Option<PathBuf>, Runn
         )));
     }
     let name = entry.file_name();
+    cleanup_runner_owned_mount_points_before_removal(&path)?;
     fs::remove_dir_all(&path)?;
     Ok(Some(PathBuf::from(name)))
+}
+
+#[derive(Debug, Deserialize)]
+struct RunnerClientMountMetadata {
+    mount_point: PathBuf,
+}
+
+fn cleanup_runner_owned_mount_points_before_removal(sandbox: &Path) -> Result<(), RunnerError> {
+    let mut last_error = None;
+    for mount_point in runner_owned_mount_points_from_metadata(sandbox)? {
+        if let Err(error) = cleanup_stale_mount_before_remount(&mount_point) {
+            eprintln!(
+                "studiofs-e2e: failed to unmount stale runner-owned mount point {}: {error}",
+                mount_point.display()
+            );
+            last_error = Some(error);
+        }
+    }
+    if let Some(error) = last_error {
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+fn runner_owned_mount_points_from_metadata(sandbox: &Path) -> Result<Vec<PathBuf>, RunnerError> {
+    let clients_dir = sandbox.join("artifacts/clients");
+    if !clients_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut mount_points = BTreeSet::new();
+    for entry in fs::read_dir(clients_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let client_dir = entry.path();
+        let mount_metadata_dir = client_dir.join("mount");
+        let metadata_path = mount_metadata_dir.join("mount-point.json");
+        add_layout_inferred_runner_mount_points(sandbox, &mount_metadata_dir, &mut mount_points);
+        let bytes = match fs::read(&metadata_path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                continue;
+            }
+            Err(err) => {
+                eprintln!(
+                    "studiofs-e2e: skipping unreadable client mount metadata {}: {err}",
+                    metadata_path.display()
+                );
+                continue;
+            }
+        };
+        let metadata: RunnerClientMountMetadata = match serde_json::from_slice(&bytes) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                eprintln!(
+                    "studiofs-e2e: skipping corrupt client mount metadata {}: {error}",
+                    metadata_path.display()
+                );
+                continue;
+            }
+        };
+        if metadata.mount_point.starts_with(sandbox) {
+            mount_points.insert(metadata.mount_point);
+        }
+    }
+    Ok(mount_points.into_iter().collect())
+}
+
+fn add_layout_inferred_runner_mount_points(
+    sandbox: &Path,
+    mount_metadata_dir: &Path,
+    mount_points: &mut BTreeSet<PathBuf>,
+) {
+    let Ok(entries) = fs::read_dir(mount_metadata_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.file_name() == Some(OsStr::new("mount-point.json")) {
+            continue;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() && path.starts_with(sandbox) {
+            mount_points.insert(path);
+        }
+    }
 }
 
 fn resolve_scenarios(names: &[String]) -> Result<Vec<ResolvedScenario>, RunnerError> {
@@ -2469,12 +2561,18 @@ fn collect_existing_artifacts(
     artifacts: &mut Vec<ArtifactReport>,
     seen: &mut BTreeSet<String>,
 ) -> Result<(), RunnerError> {
+    if is_client_mount_artifact_tree(sandbox, dir) {
+        return Ok(());
+    }
     if !dir.exists() {
         return Ok(());
     }
     for entry_result in fs::read_dir(dir)? {
         let entry = entry_result?;
         let path = entry.path();
+        if is_client_mount_artifact_tree(sandbox, &path) {
+            continue;
+        }
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
             collect_existing_artifacts(sandbox, &path, artifacts, seen)?;
@@ -2492,6 +2590,27 @@ fn collect_existing_artifacts(
         }
     }
     Ok(())
+}
+
+fn is_client_mount_artifact_tree(sandbox: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(sandbox) else {
+        return false;
+    };
+    let mut components = relative.components();
+    matches!(
+        (
+            components.next(),
+            components.next(),
+            components.next(),
+            components.next()
+        ),
+        (
+            Some(Component::Normal(artifacts)),
+            Some(Component::Normal(clients)),
+            Some(Component::Normal(_client)),
+            Some(Component::Normal(mount)),
+        ) if artifacts == "artifacts" && clients == "clients" && mount == "mount"
+    )
 }
 
 fn add_artifact(
@@ -3013,6 +3132,31 @@ plain child stderr\n",
     }
 
     #[test]
+    fn report_artifact_discovery_skips_client_mount_trees() {
+        let temp = tempfile::tempdir().unwrap();
+        let sandbox = temp.path().join("run-1");
+        let mount_dir = sandbox.join("artifacts/clients/client-a/mount/volume");
+        let log_dir = sandbox.join("artifacts/clients/client-a");
+        std::fs::create_dir_all(&mount_dir).unwrap();
+        std::fs::write(log_dir.join("studiofs.stdout.log"), "mounted").unwrap();
+        std::fs::write(mount_dir.join("mounted-file.txt"), "not an artifact").unwrap();
+
+        let artifacts = collect_report_artifacts(&sandbox, &[]).unwrap();
+
+        assert!(
+            artifacts
+                .iter()
+                .any(|artifact| artifact.path == "artifacts/clients/client-a/studiofs.stdout.log")
+        );
+        assert!(
+            !artifacts
+                .iter()
+                .any(|artifact| artifact.path.contains("/mount/")),
+            "mounted filesystem contents should not be reported as runner artifacts"
+        );
+    }
+
+    #[test]
     fn run_writes_report_when_scenario_fails() {
         let temp = tempfile::tempdir().unwrap();
         let outcome = run(RunRequest {
@@ -3320,6 +3464,79 @@ plain child stderr\n",
                 .all(|call| call.timeout == Some(DEFAULT_SCENARIO_CHILD_TIMEOUT)),
             "supervised children must always be bounded by the parent runner"
         );
+    }
+
+    #[test]
+    fn clean_discovers_recorded_client_mount_points_before_removal() {
+        let temp = tempfile::tempdir().unwrap();
+        let sandbox = temp.path().join("e2e-runs").join("dead-mount-run");
+        let mount_a = sandbox.join("artifacts/clients/client-a/mount/projectfs");
+        let mount_b = sandbox.join("artifacts/clients/client-b/mount/projectfs");
+        fs::create_dir_all(mount_a.parent().unwrap()).unwrap();
+        fs::create_dir_all(mount_b.parent().unwrap()).unwrap();
+        fs::write(
+            mount_a.parent().unwrap().join("mount-point.json"),
+            serde_json::json!({
+                "client": "client-a",
+                "mount_point": mount_a,
+                "process_id": 101
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            mount_b.parent().unwrap().join("mount-point.json"),
+            serde_json::json!({
+                "client": "client-b",
+                "mount_point": mount_b,
+                "process_id": 102
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mount_points = runner_owned_mount_points_from_metadata(&sandbox).unwrap();
+
+        assert_eq!(mount_points, vec![mount_a, mount_b]);
+    }
+
+    #[test]
+    fn clean_skips_corrupt_client_mount_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let sandbox = temp.path().join("e2e-runs").join("corrupt-metadata-run");
+        let mount_a = sandbox.join("artifacts/clients/client-a/mount/projectfs");
+        let client_b_mount_dir = sandbox.join("artifacts/clients/client-b/mount");
+        fs::create_dir_all(mount_a.parent().unwrap()).unwrap();
+        fs::create_dir_all(&client_b_mount_dir).unwrap();
+        fs::write(
+            mount_a.parent().unwrap().join("mount-point.json"),
+            serde_json::json!({
+                "client": "client-a",
+                "mount_point": mount_a,
+                "process_id": 101
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(client_b_mount_dir.join("mount-point.json"), b"{").unwrap();
+
+        let mount_points = runner_owned_mount_points_from_metadata(&sandbox).unwrap();
+
+        assert_eq!(mount_points, vec![mount_a]);
+    }
+
+    #[test]
+    fn clean_infers_layout_mount_points_when_client_mount_metadata_is_unreadable() {
+        let temp = tempfile::tempdir().unwrap();
+        let sandbox = temp.path().join("e2e-runs").join("unreadable-metadata-run");
+        let mount_a = sandbox.join("artifacts/clients/client-a/mount/projectfs");
+        let client_a_mount_dir = mount_a.parent().unwrap();
+        fs::create_dir_all(&mount_a).unwrap();
+        fs::create_dir_all(client_a_mount_dir.join("mount-point.json")).unwrap();
+
+        let mount_points = runner_owned_mount_points_from_metadata(&sandbox).unwrap();
+
+        assert_eq!(mount_points, vec![mount_a]);
     }
 
     #[test]

@@ -35,6 +35,16 @@ pub struct VfsFileSessionStats {
     pub wait_reasons: Vec<(String, u64)>,
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct FileSessionDebugSnapshot {
+    pub(super) open_handles: u32,
+    pub(super) queued_ops: u64,
+    pub(super) active_readers: u32,
+    pub(super) active_writer: Option<&'static str>,
+    pub(super) last_transition_unix_ms: u64,
+    pub(super) last_transition_label: (&'static str, &'static str),
+}
+
 /// Flags associated with an open file descriptor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenFlags(u32);
@@ -225,8 +235,10 @@ pub(super) struct FileSessionEntry {
     wait_events: AtomicU64,
     wait_ms: AtomicU64,
     transitions: AtomicU64,
+    active_readers: AtomicU32,
+    active_writer: Mutex<Option<&'static str>>,
     last_transition_unix_ms: AtomicU64,
-    last_transition_label: Mutex<String>,
+    last_transition_label: Mutex<(&'static str, &'static str)>,
 }
 
 impl FileSessionEntry {
@@ -240,8 +252,10 @@ impl FileSessionEntry {
             wait_events: AtomicU64::new(0),
             wait_ms: AtomicU64::new(0),
             transitions: AtomicU64::new(0),
+            active_readers: AtomicU32::new(0),
+            active_writer: Mutex::new(None),
             last_transition_unix_ms: AtomicU64::new(0),
-            last_transition_label: Mutex::new(String::new()),
+            last_transition_label: Mutex::new(("", "")),
         }
     }
 
@@ -249,7 +263,7 @@ impl FileSessionEntry {
         self.transitions.fetch_add(1, Ordering::Relaxed);
         self.last_transition_unix_ms
             .store(now_unix_millis(), Ordering::Relaxed);
-        *self.last_transition_label.lock() = format!("{}:{phase}", op.as_str());
+        *self.last_transition_label.lock() = (op.as_str(), phase);
     }
 
     fn update_max_queue_depth(&self, candidate: u64) {
@@ -258,6 +272,26 @@ impl FileSessionEntry {
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                     (candidate > current).then_some(candidate)
                 });
+    }
+
+    fn note_active_start(&self, op: FileSessionOperation) {
+        if op.read_lock() {
+            self.active_readers.fetch_add(1, Ordering::Relaxed);
+        } else {
+            *self.active_writer.lock() = Some(op.as_str());
+        }
+    }
+
+    fn note_active_finish(&self, op: FileSessionOperation) {
+        if op.read_lock() {
+            self.active_readers
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(1))
+                })
+                .ok();
+        } else {
+            *self.active_writer.lock() = None;
+        }
     }
 }
 
@@ -282,6 +316,7 @@ impl Drop for FileSessionPermit {
         // observe lower tail latency on contended inodes.
         drop(self._read_gate.take());
         drop(self._write_gate.take());
+        self.session.note_active_finish(self.op);
         self.counters.transitions.fetch_add(1, Ordering::Relaxed);
         self.session.record_transition(self.op, "finish");
     }
@@ -414,6 +449,7 @@ impl FileSessionState {
         }
 
         counters.note_transition();
+        session.note_active_start(op);
         session.record_transition(op, "start");
         FileSessionPermit {
             _read_gate: read_guard,
@@ -488,6 +524,18 @@ impl FileSessionState {
             stats.wait_reasons.push((op.as_str().to_string(), count));
         }
         stats
+    }
+
+    pub(super) fn debug_snapshot(&self, ino: Ino) -> Option<FileSessionDebugSnapshot> {
+        let session = self.sessions.lock().get(&ino).and_then(Weak::upgrade)?;
+        Some(FileSessionDebugSnapshot {
+            open_handles: session.open_handles.load(Ordering::Relaxed),
+            queued_ops: session.queued_ops.load(Ordering::Relaxed),
+            active_readers: session.active_readers.load(Ordering::Relaxed),
+            active_writer: *session.active_writer.lock(),
+            last_transition_unix_ms: session.last_transition_unix_ms.load(Ordering::Relaxed),
+            last_transition_label: *session.last_transition_label.lock(),
+        })
     }
 }
 

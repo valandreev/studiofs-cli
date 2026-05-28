@@ -3787,6 +3787,45 @@ fn nonzero_truncate_requeues_retained_overlay_uploads_with_new_epoch() {
 }
 
 #[test]
+fn handle_backed_nonzero_truncate_clears_drained_dirty_attr_before_fsync() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "handle-truncate-clears-drained-attr");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"handle-truncate-clears-drained-attr.bin", 0, 0, 0o644)
+            .expect("create test file");
+        let ino = attr.ino;
+        let payload = vec![0x5Au8; 8192];
+
+        vfs.write(ino, 0, &payload).await.expect("write payload");
+        vfs.flush(ino).await.expect("flush first unpublished epoch");
+
+        let old_epoch = meta.get_attr(ino).expect("load flushed attr").content_epoch;
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open truncate handle");
+        vfs.setattr_with_handle(Some(fh), ino, SetattrArgs::size_only(4096))
+            .expect("truncate while retaining the first overlay payload");
+
+        let truncated_attr = meta.get_attr(ino).expect("load truncated attr");
+        assert!(truncated_attr.content_epoch > old_epoch);
+        assert!(
+            !vfs.state.namespace.dirty_attrs.lock().contains_key(&ino),
+            "handle-backed shrink should not leave already-drained dirty attrs for fsync"
+        );
+
+        let flush = vfs.flush_fh_with_outcome(fh).await.expect("flush handle");
+        assert!(
+            !flush.flushed_local_dirty_state,
+            "post-truncate fsync/flush should see no extra foreground dirty state"
+        );
+        vfs.release_fh(fh).await.expect("release handle");
+    });
+}
+
+#[test]
 fn nonzero_extend_requeues_retained_overlay_uploads_when_publish_work_is_in_flight() {
     let tmp = TempDir::new().expect("tempdir");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "extend-keeps-retained");
@@ -3906,19 +3945,33 @@ fn handle_backed_extend_keeps_writer_stack_buffered_without_strict_sync() {
             .metrics
             .payload_store_sync_data_calls
             .load(Ordering::Relaxed);
-        assert_eq!(
-            sync_calls_after, sync_calls_before,
-            "handle-backed logical-size growth must not force strict sync_data"
-        );
         assert_eq!(extended.size, (payload.len() + 4096) as u64);
-        assert!(
-            vfs.state.writer_stack.has_dirty_writers(ino),
-            "logical-size growth should leave foreground write data buffered"
-        );
-        assert!(
-            vfs.pending_uploads_for_inode(ino).is_empty(),
-            "logical-size growth should not materialize or enqueue uploads"
-        );
+        #[cfg(target_os = "macos")]
+        {
+            assert!(
+                sync_calls_after > sync_calls_before,
+                "macOS handle-backed EOF growth must publish local size before replying"
+            );
+            assert!(
+                !vfs.state.writer_stack.has_dirty_writers(ino),
+                "macOS strict EOF barrier should materialize foreground writer data"
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(
+                sync_calls_after, sync_calls_before,
+                "handle-backed logical-size growth must not force strict sync_data"
+            );
+            assert!(
+                vfs.state.writer_stack.has_dirty_writers(ino),
+                "logical-size growth should leave foreground write data buffered"
+            );
+            assert!(
+                vfs.pending_uploads_for_inode(ino).is_empty(),
+                "logical-size growth should not materialize or enqueue uploads"
+            );
+        }
 
         vfs.release_fh(fh).await.unwrap();
     });
@@ -3928,6 +3981,8 @@ fn handle_backed_extend_keeps_writer_stack_buffered_without_strict_sync() {
 fn handle_backed_extend_with_dirty_writer_and_pending_upload_does_not_cancel_active_uploads() {
     let tmp = TempDir::new().expect("tempdir");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "handle-extend-active-upload");
+    #[cfg(target_os = "macos")]
+    let _ = &meta;
     let _guard = rt.enter();
 
     rt.block_on(async {
@@ -3946,7 +4001,9 @@ fn handle_backed_extend_with_dirty_writer_and_pending_upload_does_not_cancel_act
             !pending_before.is_empty(),
             "setup should leave an upload queued for the first epoch"
         );
+        #[cfg(not(target_os = "macos"))]
         let pending_epoch = meta.get_attr(ino).expect("load flushed attr").content_epoch;
+        #[cfg(not(target_os = "macos"))]
         let active_upload_token = vfs.uploader_cancel_token_for_inode(ino);
 
         let fh = vfs
@@ -3978,22 +4035,42 @@ fn handle_backed_extend_with_dirty_writer_and_pending_upload_does_not_cancel_act
             .metrics
             .payload_store_sync_data_calls
             .load(Ordering::Relaxed);
-        assert_eq!(
-            sync_calls_after, sync_calls_before,
-            "active handle growth must not force strict payload-store sync"
-        );
-        assert!(
-            !active_upload_token.is_cancelled(),
-            "active handle growth must not cancel in-flight uploads for an older queued epoch"
-        );
-        assert!(vfs.state.writer_stack.has_dirty_writers(ino));
         assert_eq!(extended.size, 32 * 1024);
-        assert!(
-            vfs.pending_uploads_for_inode(ino)
-                .iter()
-                .any(|(_, _, content_epoch)| *content_epoch == pending_epoch),
-            "old queued uploads should remain queued instead of being requeued by EOF growth"
-        );
+        #[cfg(target_os = "macos")]
+        {
+            assert!(
+                sync_calls_after > sync_calls_before,
+                "macOS active handle growth must force a local EOF/payload barrier"
+            );
+            assert!(
+                !vfs.state.writer_stack.has_dirty_writers(ino),
+                "macOS strict EOF barrier should materialize active writer-stack data"
+            );
+            assert!(
+                vfs.pending_uploads_for_inode(ino)
+                    .iter()
+                    .any(|(_, _, content_epoch)| *content_epoch == extended.content_epoch),
+                "macOS strict EOF barrier should queue publish work for the new local epoch"
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(
+                sync_calls_after, sync_calls_before,
+                "active handle growth must not force strict payload-store sync"
+            );
+            assert!(
+                !active_upload_token.is_cancelled(),
+                "active handle growth must not cancel in-flight uploads for an older queued epoch"
+            );
+            assert!(vfs.state.writer_stack.has_dirty_writers(ino));
+            assert!(
+                vfs.pending_uploads_for_inode(ino)
+                    .iter()
+                    .any(|(_, _, content_epoch)| *content_epoch == pending_epoch),
+                "old queued uploads should remain queued instead of being requeued by EOF growth"
+            );
+        }
 
         vfs.release_fh(fh).await.unwrap();
     });
@@ -4245,6 +4322,62 @@ fn explicit_flush_after_clean_handle_extend_queues_metadata_only_publish() {
 }
 
 #[test]
+fn handle_backed_clean_growth_persistence_matches_platform_policy() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "handle-growth-platform-policy");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"handle-growth-platform-policy.bin", 0, 0, 0o644)
+            .expect("create test file");
+        let ino = attr.ino;
+
+        vfs.write(ino, 0, b"published-head")
+            .await
+            .expect("write seed payload");
+        vfs.flush(ino).await.expect("flush seed payload");
+        let (content_epoch, blocks) = mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+        publish_current_file_graph(&meta, ino, content_epoch, &blocks);
+
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open clean writable handle");
+        let logical_size = 8192u64;
+        vfs.setattr_with_handle(Some(fh), ino, SetattrArgs::size_only(logical_size))
+            .expect("extend clean handle");
+
+        #[cfg(target_os = "macos")]
+        {
+            let extended_attr = meta.get_attr(ino).expect("load strict macOS attr");
+            assert_eq!(extended_attr.size, logical_size);
+            assert!(
+                vfs.state
+                    .upload
+                    .pending_epoch_finalizations
+                    .lock()
+                    .contains(&(ino, extended_attr.content_epoch)),
+                "macOS handle-backed growth should queue metadata-only publication before reply"
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let dirty_attr = vfs
+                .state
+                .namespace
+                .dirty_attrs
+                .lock()
+                .get(&ino)
+                .cloned()
+                .expect("non-macOS handle-backed growth should defer strict persistence");
+            assert_eq!(dirty_attr.size, logical_size);
+        }
+
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
 fn handle_backed_sparse_extend_publishes_logical_size_without_tail_payload() {
     let tmp = TempDir::new().expect("tempdir");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "handle-sparse-extend-publish-size");
@@ -4334,7 +4467,10 @@ fn handle_backed_sparse_extend_publishes_logical_size_without_tail_payload() {
             .await
             .expect("release shrink handle");
         assert!(outcome.closed_last_handle);
-        assert!(outcome.flushed_local_dirty_state);
+        assert!(
+            !outcome.flushed_local_dirty_state,
+            "handle-backed shrink is strictly persisted by setattr before last close"
+        );
 
         let shrink_attr = meta.get_attr(ino).expect("load shrink candidate attr");
         assert_eq!(shrink_attr.size, shrink_size);
@@ -5881,6 +6017,86 @@ fn test_release_fh_with_outcome_reports_clean_skip_after_explicit_flush() {
 }
 
 #[test]
+fn test_release_fh_clean_skip_does_not_reenter_sticky_error_barrier() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "release-outcome-clean-sticky-skip");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"release-outcome-clean-sticky-skip.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+
+        vfs.write(ino, 0, b"payload").await.unwrap();
+        let flush = vfs.flush_fh_with_outcome(fh).await.unwrap();
+        assert!(
+            flush.flushed_local_dirty_state,
+            "explicit flush should drain the local dirty state"
+        );
+        assert!(
+            !vfs.inode_has_local_dirty_state(ino),
+            "release precondition should be a clean inode"
+        );
+
+        vfs.mark_upload_sticky_error(ino, &VfsError::Other("simulated upload failure".into()));
+        let outcome = vfs.release_fh_with_outcome(fh).await.unwrap();
+
+        assert!(
+            outcome.closed_last_handle,
+            "the only handle should still be reported as the last-handle close"
+        );
+        assert!(
+            !outcome.flushed_local_dirty_state,
+            "clean release should not report another local dirty-state drain"
+        );
+        assert_eq!(
+            vfs.open_count(ino),
+            0,
+            "release should still close the handle"
+        );
+    });
+}
+
+#[test]
+fn test_release_fh_clean_skip_does_not_wait_for_file_session_gate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "release-outcome-clean-session-skip");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"release-outcome-clean-session-skip.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        assert!(
+            !vfs.inode_has_local_dirty_state(ino),
+            "test expects a clean inode before release"
+        );
+
+        let _read_session = vfs
+            .state
+            .file_session
+            .enter_op(ino, FileSessionOperation::Read)
+            .await;
+        let release =
+            tokio::time::timeout(Duration::from_millis(100), vfs.release_fh_with_outcome(fh))
+                .await
+                .expect("clean release should not wait behind the file-session gate")
+                .expect("clean release should succeed");
+
+        assert!(
+            release.closed_last_handle,
+            "the only handle should still be reported as the last-handle close"
+        );
+        assert!(
+            !release.flushed_local_dirty_state,
+            "clean release should not report local dirty-state flushing"
+        );
+    });
+}
+
+#[test]
 fn flush_then_release_keeps_written_bytes_visible_to_reopened_reader() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "flush-release-reopen-read");
@@ -7342,6 +7558,37 @@ fn test_open_unlink_handle_accepts_followup_write_until_release() {
 }
 
 #[test]
+fn kernel_invalidation_skips_unresolved_active_open_overlay() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "active-open-unlinked-kernel-inval");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let name = b"active-open-unlinked-kernel-inval.txt";
+        let attr = vfs.create(ROOT_INO, name, 0, 0, 0o644).expect("create");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open writable handle");
+        meta.unlink(ROOT_INO, name)
+            .expect("simulate foreign unlink while handle stays open");
+        assert!(
+            vfs.best_effort_path_for_inode(attr.ino).is_none(),
+            "test setup needs the inode to be unresolvable like WinFSP's notify filter"
+        );
+
+        let invalidator = Arc::new(RecordingKernelInvalidator::default());
+        vfs.set_kernel_invalidator(invalidator.clone());
+        vfs.invalidate_kernel_inodes([attr.ino]);
+
+        assert!(
+            invalidator.snapshot().is_empty(),
+            "kernel invalidation must not evict an unlinked inode that still has an active writable handle"
+        );
+        vfs.release_fh(fh).await.expect("release handle");
+    });
+}
+
+#[test]
 fn test_release_fh_orphan_cleanup_clears_live_extents() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "release-orphan-live-extents");
@@ -7780,6 +8027,58 @@ fn test_flush_fh_with_outcome_materializes_pending_inode_dirty_state() {
             "flush_fh_with_outcome should preserve the write-committed file size"
         );
 
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn test_flush_fh_clean_skip_waits_for_deferred_release_but_not_file_session_gate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "flush-clean-waits-release");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"flush-clean-waits-release.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        assert!(
+            !vfs.inode_has_local_dirty_state(ino),
+            "test expects a clean inode before flush"
+        );
+
+        let _read_session = vfs
+            .state
+            .file_session
+            .enter_op(ino, FileSessionOperation::Read)
+            .await;
+        let task_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let guard = task_lock.clone().lock_owned().await;
+        vfs.state
+            .deferred_release_inflight
+            .lock()
+            .insert(ino, task_lock);
+
+        let flushing_vfs = Arc::clone(&vfs);
+        let flush = tokio::spawn(async move { flushing_vfs.flush_fh_with_outcome(fh).await });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !flush.is_finished(),
+            "clean handle flush must still wait for an in-flight deferred release barrier"
+        );
+
+        drop(guard);
+        vfs.state.deferred_release_inflight.lock().remove(&ino);
+        let outcome = tokio::time::timeout(Duration::from_millis(100), flush)
+            .await
+            .expect("clean flush should not wait behind the file-session gate")
+            .expect("flush task should not panic")
+            .expect("flush should complete after deferred release barrier drains");
+        assert!(
+            !outcome.flushed_local_dirty_state,
+            "clean handle flush should report a clean skip"
+        );
         vfs.release_fh(fh).await.unwrap();
     });
 }

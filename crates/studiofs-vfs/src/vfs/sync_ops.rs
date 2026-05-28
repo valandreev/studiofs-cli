@@ -6,7 +6,7 @@ use super::{
 };
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::runtime::run_meta;
 use crate::utils::now_unix_millis;
@@ -651,6 +651,10 @@ impl StudioVfs {
             return LastHandleReleaseAction::OrphanCleanup;
         }
 
+        if !self.inode_has_local_dirty_state(ino) {
+            return LastHandleReleaseAction::Clean;
+        }
+
         let sticky_error_policy = if context.open_file.flags.contains(OpenFlags::WRONLY)
             || context.open_file.flags.contains(OpenFlags::RDWR)
         {
@@ -670,6 +674,10 @@ impl StudioVfs {
     ) -> VfsResult<ReleaseFhOutcome> {
         match action {
             LastHandleReleaseAction::IgnoredEntry => Ok(ReleaseFhOutcome {
+                closed_last_handle: true,
+                flushed_local_dirty_state: false,
+            }),
+            LastHandleReleaseAction::Clean => Ok(ReleaseFhOutcome {
                 closed_last_handle: true,
                 flushed_local_dirty_state: false,
             }),
@@ -714,13 +722,22 @@ impl StudioVfs {
             return Ok(ReleaseFhOutcome::default());
         };
         let ino = context.ino;
+        let action = self.take_last_handle_release_action(&context);
+        if matches!(
+            action,
+            LastHandleReleaseAction::IgnoredEntry | LastHandleReleaseAction::Clean
+        ) {
+            let result = self.execute_last_handle_release_action(ino, action).await;
+            self.state.file_session.gc_if_idle(ino);
+            return result;
+        }
 
         let session = self
             .state
             .file_session
             .enter_op(ino, FileSessionOperation::Release)
             .await;
-        let result = self.release_last_handle_with_outcome(context).await;
+        let result = self.execute_last_handle_release_action(ino, action).await;
         drop(session);
         self.state.file_session.gc_if_idle(ino);
         result
@@ -1056,6 +1073,12 @@ impl StudioVfs {
             return Ok(ExplicitFlushOutcome::default());
         };
         self.wait_for_deferred_release_inflight(open_file.ino).await;
+        if !self.inode_has_local_dirty_state(open_file.ino)
+            && !self.state.writer_stack.has_dirty_writers(open_file.ino)
+        {
+            self.state.file_session.gc_if_idle(open_file.ino);
+            return Ok(ExplicitFlushOutcome::default());
+        }
         let session = self
             .state
             .file_session
@@ -1172,12 +1195,57 @@ impl StudioVfs {
         offset: u64,
         buffer: &mut [u8],
     ) -> VfsResult<u32> {
+        let debug_path = self.debug_pending_target_path(ino);
+        if let Some(path) = &debug_path {
+            let session = self.state.file_session.debug_snapshot(ino);
+            info!(
+                ino,
+                fh,
+                path = %path,
+                offset,
+                requested_len = buffer.len(),
+                session_open_handles = session.as_ref().map(|snapshot| snapshot.open_handles),
+                session_queued_ops = session.as_ref().map(|snapshot| snapshot.queued_ops),
+                session_active_readers = session.as_ref().map(|snapshot| snapshot.active_readers),
+                session_active_writer = session.as_ref().and_then(|snapshot| snapshot.active_writer),
+                session_last_transition_op = session
+                    .as_ref()
+                    .map(|snapshot| snapshot.last_transition_label.0),
+                session_last_transition_phase = session
+                    .as_ref()
+                    .map(|snapshot| snapshot.last_transition_label.1),
+                session_last_transition_unix_ms = session
+                    .as_ref()
+                    .map(|snapshot| snapshot.last_transition_unix_ms),
+                "debug target read_into_fh before file-session gate"
+            );
+        }
         let session = self
             .state
             .file_session
             .enter_op(ino, FileSessionOperation::Read)
             .await;
+        if let Some(path) = &debug_path {
+            info!(
+                ino,
+                fh,
+                path = %path,
+                offset,
+                requested_len = buffer.len(),
+                "debug target read_into_fh entered file-session gate"
+            );
+        }
         let result = self.read_into_impl(Some(fh), ino, offset, buffer).await;
+        if let Some(path) = &debug_path {
+            info!(
+                ino,
+                fh,
+                path = %path,
+                offset,
+                result = ?result.as_ref().map(|n| *n),
+                "debug target read_into_fh completed read_into_impl"
+            );
+        }
         drop(session);
         self.state.file_session.gc_if_idle(ino);
         result

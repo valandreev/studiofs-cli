@@ -78,6 +78,13 @@ fn build_mount_options_with_allow_other(
         options.push(fuser::MountOption::CUSTOM(format!("volname={volume_name}")));
         // Tell macFUSE to treat this as a local drive, which enables native Trash.
         options.push(fuser::MountOption::CUSTOM("local".into()));
+        // Match the WinFSP bridge cache contract on macFUSE: avoid local
+        // vnode/UBC state hiding freshly returned sizes after sparse extends.
+        options.push(fuser::MountOption::CUSTOM("direct_io".into()));
+        options.push(fuser::MountOption::CUSTOM("nolocalcaches".into()));
+        options.push(fuser::MountOption::CUSTOM("sparse".into()));
+        // Re-check cached data if macFUSE still keeps any attribute-derived state.
+        options.push(fuser::MountOption::CUSTOM("auto_cache".into()));
     }
     #[cfg(target_os = "macos")]
     if foreground {
@@ -619,6 +626,50 @@ mod tests {
             options
                 .iter()
                 .any(|opt| matches!(opt, fuser::MountOption::CUSTOM(custom) if custom == "local"))
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn build_mount_options_sets_macos_auto_cache_flag() {
+        let options = build_mount_options_with_allow_other("studiofs-mac", false, false, false)
+            .expect("options");
+        assert!(options.iter().any(
+            |opt| matches!(opt, fuser::MountOption::CUSTOM(custom) if custom == "auto_cache")
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn build_mount_options_sets_macos_direct_io_flag() {
+        let options = build_mount_options_with_allow_other("studiofs-mac", false, false, false)
+            .expect("options");
+        assert!(
+            options.iter().any(
+                |opt| matches!(opt, fuser::MountOption::CUSTOM(custom) if custom == "direct_io")
+            )
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn build_mount_options_sets_macos_no_local_caches_flag() {
+        let options = build_mount_options_with_allow_other("studiofs-mac", false, false, false)
+            .expect("options");
+        assert!(options.iter().any(
+            |opt| matches!(opt, fuser::MountOption::CUSTOM(custom) if custom == "nolocalcaches")
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn build_mount_options_sets_macos_sparse_flag() {
+        let options = build_mount_options_with_allow_other("studiofs-mac", false, false, false)
+            .expect("options");
+        assert!(
+            options
+                .iter()
+                .any(|opt| matches!(opt, fuser::MountOption::CUSTOM(custom) if custom == "sparse"))
         );
     }
 }

@@ -86,7 +86,10 @@ impl NamespaceCollisionKind {
             }
             Self::MkdirRmdirVsCreate => Vec::new(),
             Self::ReaddirStatDuringMutation => {
-                vec![("scan/a.txt", b"a\n"), ("scan/b.txt", b"b\n")]
+                vec![
+                    ("scan/source-alpha.data", b"a\n"),
+                    ("scan/source-b.txt", b"b\n"),
+                ]
             }
         }
     }
@@ -98,7 +101,7 @@ impl NamespaceCollisionKind {
             Self::UnlinkVsAppend => &[],
             Self::OverwriteVsRead => &[],
             Self::MkdirRmdirVsCreate => &[],
-            Self::ReaddirStatDuringMutation => &["scan/a.txt"],
+            Self::ReaddirStatDuringMutation => &["scan/source-alpha.data"],
         }
     }
 }
@@ -798,8 +801,8 @@ pub(in crate::scenario) fn perform_namespace_collision_operations(
                         client: clients[0].clone(),
                         operation: "rename",
                         helper_operation: "rename",
-                        path: "scan/a.txt",
-                        target: Some("scan/c.txt"),
+                        path: "scan/source-alpha.data",
+                        target: Some("scan/renamed-alpha.data"),
                         payload: None,
                     },
                 ),
@@ -810,7 +813,7 @@ pub(in crate::scenario) fn perform_namespace_collision_operations(
                         client: clients[2].clone(),
                         operation: "stat",
                         helper_operation: "stat",
-                        path: "scan/b.txt",
+                        path: "scan/source-b.txt",
                         target: None,
                         payload: None,
                     },
@@ -980,8 +983,12 @@ pub(in crate::scenario) fn planned_namespace_collision_operations(
         ],
         NamespaceCollisionKind::ReaddirStatDuringMutation => vec![
             ("client-b", "readdir", "scan"),
-            ("client-a", "rename", "scan/a.txt -> scan/c.txt"),
-            ("client-c", "stat", "scan/b.txt"),
+            (
+                "client-a",
+                "rename",
+                "scan/source-alpha.data -> scan/renamed-alpha.data",
+            ),
+            ("client-c", "stat", "scan/source-b.txt"),
         ],
     };
     spec.into_iter()

@@ -18,7 +18,7 @@ pub use workloads::{
     MOUNTED_OPEN_HANDLE_CONVERGENCE, MOUNTED_SPARSE_FILE_RANGE_CONVERGENCE,
     MOUNTED_STALE_REMOUNT_COLD_DISCOVER_CATCHUP_CONVERGENCE, MOUNTED_SYMLINK_ATTRIBUTE_CONVERGENCE,
     POSTGRES_OUTAGE_MULTI_CLIENT_RECOVERY, RUSTFS_OUTAGE_MULTI_CLIENT_RECOVERY,
-    run_hotspot_op_helper_with_timeout, run_open_handle_op_helper,
+    SparseOpHelperRequest, run_hotspot_op_helper_with_timeout, run_open_handle_op_helper,
     run_sparse_op_helper_with_timeout,
 };
 #[cfg(test)]

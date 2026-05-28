@@ -476,16 +476,17 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             }
         }
         Commands::SparseOp(args) => {
-            let result = scenario::run_sparse_op_helper_with_timeout(
-                &args.operation,
-                args.mount_point,
-                &args.path,
-                args.offset,
-                args.len,
-                args.payload.as_deref(),
-                args.progress.as_deref(),
-                args.timeout_ms.map(std::time::Duration::from_millis),
-            );
+            let result =
+                scenario::run_sparse_op_helper_with_timeout(scenario::SparseOpHelperRequest {
+                    operation: &args.operation,
+                    mount_point: &args.mount_point,
+                    path: &args.path,
+                    offset: args.offset,
+                    len: args.len,
+                    payload: args.payload.as_deref(),
+                    progress: args.progress.as_deref(),
+                    timeout: args.timeout_ms.map(std::time::Duration::from_millis),
+                });
             match result {
                 Ok(()) => std::process::exit(0),
                 Err(error) => {

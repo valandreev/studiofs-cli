@@ -19,6 +19,7 @@ struct TruncateMutation {
 type ChunkSliceBatch = Vec<(ChunkId, Vec<SliceRecord>)>;
 type RemovedObjectList = Vec<(u32, u64)>;
 
+#[cfg(not(target_os = "macos"))]
 fn setattr_args_are_size_only(args: &SetattrArgs) -> bool {
     args.size.is_some()
         && args.mode.is_none()
@@ -28,6 +29,26 @@ fn setattr_args_are_size_only(args: &SetattrArgs) -> bool {
         && args.mtime.resolve().is_none()
         && args.crtime.resolve().is_none()
         && args.win_attrs.is_none()
+}
+
+fn handle_backed_growth_may_defer_strict_flush(
+    fh: Option<u64>,
+    new_size: u64,
+    old_size: u64,
+    args: &SetattrArgs,
+) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (fh, new_size, old_size, args);
+        // WinFSP returns fresh FileInfo from the size callback and bounds its
+        // file-info cache. macFUSE can keep a stale vnode EOF after sparse
+        // growth, so publish metadata-only size changes before replying.
+        false
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        fh.is_some() && new_size > old_size && setattr_args_are_size_only(args)
+    }
 }
 
 impl StudioVfs {
@@ -92,7 +113,7 @@ impl StudioVfs {
                 self.enforce_no_known_foreign_hard_lock(ino)?;
             }
             let defer_handle_growth_flush =
-                fh.is_some() && new_size > attr.size && setattr_args_are_size_only(&args);
+                handle_backed_growth_may_defer_strict_flush(fh, new_size, attr.size, &args);
             return Self::run_sync_future(self.setattr_with_size_change(
                 ino,
                 args.clone(),
@@ -287,6 +308,9 @@ impl StudioVfs {
                         truncate_mutation.as_ref(),
                     )?;
                     return Err(error);
+                }
+                if truncate_mutation.is_some() {
+                    self.clear_matching_dirty_attr_if_committed(ino, &attr);
                 }
             }
 

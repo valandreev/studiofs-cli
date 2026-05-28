@@ -18,6 +18,9 @@ impl<'a> FuseHandleDrainFacade<'a> {
     }
 
     pub(super) fn flush(&self, ino: Ino, fh: u64) -> studiofs_vfs::VfsResult<()> {
+        if fh != 0 {
+            return self.fs.rt.block_on(self.fs.vfs.flush_fh(fh));
+        }
         self.barrier().on_flush(HandleDrainRequest { ino, fh })
     }
 

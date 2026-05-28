@@ -4941,6 +4941,79 @@ fn sparse_ready_foreign_publish_sets_serving_size_when_payload_graph_is_partial(
 }
 
 #[test]
+fn metadata_only_sparse_extend_replay_advances_peer_logical_size() {
+    let (_writer_dir, writer) = temp_pg_engine_for_unit();
+    let (_remote_dir, remote) = temp_pg_engine_for_unit();
+    let block_size = u64::from(DEFAULT_BLOCK_SIZE);
+
+    let seed_start = writer
+        .local
+        .get_counter("nextEventSeq")
+        .expect("seed start");
+    let file = writer
+        .create_file(ROOT_INO, b"sparse-metadata-only-extend.bin", 0, 0, 0o644)
+        .expect("create sparse file");
+    let old_size = block_size + 64;
+    set_file_state(&writer, file.ino, old_size, 1);
+    let head = PayloadRef::new_full(77_090, DEFAULT_BLOCK_SIZE);
+    let tail = PayloadRef::new_partial(77_091, 64);
+    writer
+        .stage_payload_slice(file.ino, 0, &head)
+        .expect("stage head");
+    writer
+        .stage_payload_slice(file.ino, 1, &tail)
+        .expect("stage tail");
+    mark_overlay_objects_uploaded(&writer, file.ino, 1, &[head.object_id, tail.object_id]);
+    assert!(
+        writer
+            .publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
+            .expect("publish initial sparse file"),
+        "initial sparse publish should succeed"
+    );
+    let seed_end = writer.local.get_counter("nextEventSeq").expect("seed end");
+    apply_projected_remote_range(&writer, &remote, seed_start, seed_end);
+
+    let remote_file = remote
+        .lookup(ROOT_INO, b"sparse-metadata-only-extend.bin")
+        .expect("lookup seeded file");
+    assert_eq!(
+        remote.get_attr(remote_file.ino).expect("seeded attr").size,
+        old_size
+    );
+
+    let extend_start = seed_end;
+    let logical_size = (2 * block_size) + 123;
+    set_file_state(&writer, file.ino, logical_size, 2);
+    assert!(
+        writer
+            .publish_regular_file_overlay_to_base_if_matches(file.ino, 2)
+            .expect("publish metadata-only sparse extend"),
+        "metadata-only sparse extend should publish"
+    );
+    let extend_end = writer
+        .local
+        .get_counter("nextEventSeq")
+        .expect("extend end");
+
+    apply_projected_remote_range(&writer, &remote, extend_start, extend_end);
+
+    let remote_attr = remote.get_attr(remote_file.ino).expect("extended attr");
+    assert_eq!(
+        remote_attr.size, logical_size,
+        "metadata-only sparse extend must advance peer serving size"
+    );
+    assert_eq!(
+        remote_attr.committed_size, logical_size,
+        "metadata-only sparse extend must advance peer committed EOF"
+    );
+    assert_eq!(
+        lookup_object_ids(&remote, remote_file.ino, logical_size)
+            .expect("lookup sparse graph after metadata-only extend"),
+        vec![head.object_id, tail.object_id]
+    );
+}
+
+#[test]
 fn ready_complete_publish_preserved_base_ranges_sets_remote_serving_size() {
     let (_dir, pg) = temp_pg_engine_for_unit();
 
