@@ -1399,7 +1399,7 @@ impl StudioVfs {
         let rename_started = Instant::now();
         let name_display = String::from_utf8_lossy(name);
         let new_name_display = String::from_utf8_lossy(new_name);
-        info!(
+        debug!(
             parent,
             name = %name_display,
             new_parent,
@@ -1411,7 +1411,7 @@ impl StudioVfs {
         self.enforce_access(parent, AccessLevel::ReadWrite)?;
         self.enforce_access(new_parent, AccessLevel::ReadWrite)?;
         if parent == new_parent && name == new_name {
-            info!(
+            debug!(
                 parent,
                 name = %name_display,
                 new_parent,
@@ -1444,7 +1444,7 @@ impl StudioVfs {
             if target_is_ignored_trash {
                 self.dentry_cache_insert_negative(new_parent, new_name);
             }
-            info!(
+            debug!(
                 parent,
                 name = %name_display,
                 new_parent,
@@ -1456,7 +1456,7 @@ impl StudioVfs {
         }
         if target_is_ignored {
             let source_entry = meta.lookup(parent, name)?;
-            info!(
+            debug!(
                 parent,
                 name = %name_display,
                 source_ino = source_entry.ino,
@@ -1481,7 +1481,7 @@ impl StudioVfs {
             self.bump_namespace_for_parents([new_parent]);
             let result = self.unlink_inner(parent, name).await;
             match &result {
-                Ok(()) => info!(
+                Ok(()) => debug!(
                     parent,
                     name = %name_display,
                     source_ino = source_entry.ino,
@@ -1503,7 +1503,7 @@ impl StudioVfs {
             }
             return result;
         }
-        info!(
+        debug!(
             parent,
             name = %name_display,
             new_parent,
@@ -1512,7 +1512,7 @@ impl StudioVfs {
             "VFS rename looking up source"
         );
         let source_entry = meta.lookup(parent, name)?;
-        info!(
+        debug!(
             parent,
             name = %name_display,
             source_ino = source_entry.ino,
@@ -1525,7 +1525,7 @@ impl StudioVfs {
         let source_attr = meta.get_attr(source_entry.ino)?;
         let target_is_trash = self.directory_has_probable_trash_ancestor(new_parent)?;
         if target_is_trash {
-            info!(
+            debug!(
                 parent,
                 name = %name_display,
                 source_ino = source_entry.ino,
@@ -1547,7 +1547,7 @@ impl StudioVfs {
         if let Ok(target_entry) = meta.lookup(new_parent, new_name)
             && target_entry.ino != source_entry.ino
         {
-            info!(
+            debug!(
                 parent,
                 name = %name_display,
                 source_ino = source_entry.ino,
@@ -1559,7 +1559,7 @@ impl StudioVfs {
             );
             self.enforce_no_known_foreign_hard_lock(target_entry.ino)?;
         }
-        info!(
+        debug!(
             parent,
             name = %name_display,
             source_ino = source_entry.ino,
@@ -1569,7 +1569,7 @@ impl StudioVfs {
             "VFS rename calling metadata rename_atomic"
         );
         let rename_result = meta.rename_atomic(parent, name, new_parent, new_name)?;
-        info!(
+        debug!(
             parent,
             name = %name_display,
             source_ino = source_entry.ino,
@@ -1590,7 +1590,7 @@ impl StudioVfs {
         self.bump_acl_namespace_epoch();
 
         if let Some(ino) = rename_result.displaced_ino {
-            info!(
+            debug!(
                 parent,
                 name = %name_display,
                 new_parent,
@@ -1608,7 +1608,7 @@ impl StudioVfs {
                 .map(|(object_id, _)| object_id)
                 .collect();
 
-            info!(
+            debug!(
                 parent,
                 name = %name_display,
                 new_parent,
@@ -1630,7 +1630,7 @@ impl StudioVfs {
         }
 
         meta.request_eager_flush();
-        info!(
+        debug!(
             parent,
             name = %name_display,
             new_parent,
