@@ -4373,7 +4373,10 @@ fn handle_backed_sparse_extend_publishes_logical_size_without_tail_payload() {
             .await
             .expect("release shrink handle");
         assert!(outcome.closed_last_handle);
-        assert!(outcome.flushed_local_dirty_state);
+        assert!(
+            !outcome.flushed_local_dirty_state,
+            "handle-backed shrink is strictly persisted by setattr before last close"
+        );
 
         let shrink_attr = meta.get_attr(ino).expect("load shrink candidate attr");
         assert_eq!(shrink_attr.size, shrink_size);

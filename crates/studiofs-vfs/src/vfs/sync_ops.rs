@@ -727,7 +727,9 @@ impl StudioVfs {
             action,
             LastHandleReleaseAction::IgnoredEntry | LastHandleReleaseAction::Clean
         ) {
-            return self.execute_last_handle_release_action(ino, action).await;
+            let result = self.execute_last_handle_release_action(ino, action).await;
+            self.state.file_session.gc_if_idle(ino);
+            return result;
         }
 
         let session = self

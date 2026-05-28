@@ -1952,8 +1952,18 @@ struct RunnerClientMountMetadata {
 }
 
 fn cleanup_runner_owned_mount_points_before_removal(sandbox: &Path) -> Result<(), RunnerError> {
+    let mut last_error = None;
     for mount_point in runner_owned_mount_points_from_metadata(sandbox)? {
-        cleanup_stale_mount_before_remount(&mount_point)?;
+        if let Err(error) = cleanup_stale_mount_before_remount(&mount_point) {
+            eprintln!(
+                "studiofs-e2e: failed to unmount stale runner-owned mount point {}: {error}",
+                mount_point.display()
+            );
+            last_error = Some(error);
+        }
+    }
+    if let Some(error) = last_error {
+        return Err(error.into());
     }
     Ok(())
 }
@@ -1976,7 +1986,16 @@ fn runner_owned_mount_points_from_metadata(sandbox: &Path) -> Result<Vec<PathBuf
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
             Err(err) => return Err(err.into()),
         };
-        let metadata: RunnerClientMountMetadata = serde_json::from_slice(&bytes)?;
+        let metadata: RunnerClientMountMetadata = match serde_json::from_slice(&bytes) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                eprintln!(
+                    "studiofs-e2e: skipping corrupt client mount metadata {}: {error}",
+                    metadata_path.display()
+                );
+                continue;
+            }
+        };
         if metadata.mount_point.starts_with(sandbox) {
             mount_points.push(metadata.mount_point);
         }
@@ -3395,6 +3414,31 @@ plain child stderr\n",
         let mount_points = runner_owned_mount_points_from_metadata(&sandbox).unwrap();
 
         assert_eq!(mount_points, vec![mount_a, mount_b]);
+    }
+
+    #[test]
+    fn clean_skips_corrupt_client_mount_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let sandbox = temp.path().join("e2e-runs").join("corrupt-metadata-run");
+        let mount_a = sandbox.join("artifacts/clients/client-a/mount/projectfs");
+        let client_b_mount_dir = sandbox.join("artifacts/clients/client-b/mount");
+        fs::create_dir_all(mount_a.parent().unwrap()).unwrap();
+        fs::create_dir_all(&client_b_mount_dir).unwrap();
+        fs::write(
+            mount_a.parent().unwrap().join("mount-point.json"),
+            serde_json::json!({
+                "client": "client-a",
+                "mount_point": mount_a,
+                "process_id": 101
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(client_b_mount_dir.join("mount-point.json"), b"{").unwrap();
+
+        let mount_points = runner_owned_mount_points_from_metadata(&sandbox).unwrap();
+
+        assert_eq!(mount_points, vec![mount_a]);
     }
 
     #[test]

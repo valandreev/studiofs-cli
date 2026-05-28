@@ -179,10 +179,22 @@ fn system_time_to_timespec(time: SystemTime) -> TimeSpec {
 }
 
 #[cfg(target_os = "macos")]
+fn macos_truncated_rename_suffix_is_safe(old_name: &[u8]) -> bool {
+    const MIN_TRUNCATED_SUFFIX_LEN: usize = 3;
+
+    old_name.len() >= MIN_TRUNCATED_SUFFIX_LEN
+        && old_name
+            .first()
+            .is_some_and(|byte| !byte.is_ascii_alphanumeric())
+}
+
+#[cfg(target_os = "macos")]
 fn recover_macos_truncated_rename_source(old_name: &[u8], entries: &[DirEntry]) -> Option<Vec<u8>> {
     // macFUSE can deliver FUSE_RENAME with an empty old-name payload or a
     // payload missing an observed variable-length prefix. Only recover when
-    // the remaining suffix identifies exactly one existing entry.
+    // the remaining suffix identifies exactly one existing entry. Non-empty
+    // suffixes must start at a visible boundary; otherwise a normal failed
+    // rename of "a.txt" could incorrectly target "prefix-a.txt".
     if old_name.is_empty() {
         let mut candidates = entries.iter().map(|entry| entry.name.as_slice());
         let recovered = candidates.next()?;
@@ -190,6 +202,10 @@ fn recover_macos_truncated_rename_source(old_name: &[u8], entries: &[DirEntry]) 
             return None;
         }
         return Some(recovered.to_vec());
+    }
+
+    if !macos_truncated_rename_suffix_is_safe(old_name) {
+        return None;
     }
 
     let mut candidates = entries
@@ -278,6 +294,10 @@ fn macos_exchange_or_rename(
 ) -> studiofs_vfs::VfsResult<()> {
     let old_name = resolve_macos_existing_mutation_source(vfs, parent, name);
     let new_name = resolve_macos_mutation_target_name(vfs, newparent, newname);
+    // macFUSE reports some ordinary Finder renames as RENAME_EXCHANGE even when
+    // the destination is absent. We must probe first to preserve real exchange
+    // failures for existing targets; this fallback is therefore not atomic if a
+    // concurrent writer creates the target between lookup and rename.
     match vfs.lookup(newparent, &new_name) {
         Ok(_) => Err(VfsError::Io(std::io::Error::from_raw_os_error(
             libc::ENOSYS,
@@ -1074,6 +1094,11 @@ impl Filesystem for StudioFuseFs {
         debug!(ino, fh, datasync, "fsync started");
         let result = if fh != 0 {
             if self.vfs.inode_has_local_dirty_state(ino) {
+                // Handle-backed FUSE fsync follows the same local-durability
+                // contract as flush_fh: it persists dirty state locally and
+                // leaves asynchronous upload sticky errors isolated from this
+                // callback. Inode-only fsync below is the explicit sticky-error
+                // reporting path used when no file handle is available.
                 self.rt.block_on(self.vfs.flush_fh(fh))
             } else {
                 Ok(())
@@ -2021,6 +2046,22 @@ mod tests {
 
         let recovered = recover_macos_truncated_rename_source(b".data", &entries);
         assert_eq!(recovered, Some(b"source-alpha.data".to_vec()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn recover_macos_rename_source_rejects_short_or_mid_token_suffixes() {
+        let entries = vec![DirEntry {
+            name: b"prefix-a.txt".to_vec(),
+            ino: 1,
+            kind: studiofs_meta::FileType::RegularFile,
+        }];
+
+        assert_eq!(recover_macos_truncated_rename_source(b"a", &entries), None);
+        assert_eq!(
+            recover_macos_truncated_rename_source(b"a.txt", &entries),
+            None
+        );
     }
 
     #[cfg(target_os = "macos")]
