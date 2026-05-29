@@ -177,12 +177,30 @@ Current signature includes additional policy controls:
 | `allow_other` | macOS: yes. Linux: opt-in via `STUDIOFS_FUSE_ALLOW_OTHER=1` |
 | Kernel `max_write` | `16777216` bytes by default. Override: `STUDIOFS_FUSE_MAX_WRITE_BYTES` in `Filesystem::init()` |
 | Kernel `max_readahead` | `16777216` bytes on Linux, `1048576` bytes on macOS by default. Override: `STUDIOFS_FUSE_MAX_READAHEAD_BYTES` in `Filesystem::init()` |
+| Linux: `async_dio` capability | Disabled by default. Opt in with `STUDIOFS_FUSE_ASYNC_DIO=1`; requested only when the kernel advertises `FUSE_ASYNC_DIO` |
 | macOS: `volname` | `"StudioFS"` |
 | macOS: `local` | Yes |
 
 `STUDIOFS_FUSE_MAX_WRITE_BYTES` and `STUDIOFS_FUSE_MAX_READAHEAD_BYTES` are the primary FUSE bridge throughput controls for local payload I/O.
 On Linux, `allow_other` also requires `user_allow_other` to be enabled in
 `/etc/fuse.conf`; otherwise `fusermount` rejects the mount request.
+
+### Linux cache and I/O policy
+
+Linux FUSE keeps buffered I/O as the default. Regular read-only opens return
+`FOPEN_KEEP_CACHE` so safe reopen and sequential-read paths can reuse the
+kernel page cache. Write-capable opens do not request `FOPEN_KEEP_CACHE` and do
+not request `FOPEN_DIRECT_IO`, which keeps write coherence explicit without
+globally disabling buffered reads.
+
+The VFS invalidator remains responsible for dropping kernel pages after unsafe
+transitions such as local writes, truncation, sparse size changes, and remote
+metadata invalidation. POSIX `O_SYNC` / `O_DSYNC` write handles map to
+`LocalSyncPolicy::WriteThrough`; ordinary writes remain opportunistic.
+
+`STUDIOFS_FUSE_ASYNC_DIO=1` is a Linux-only benchmark/control knob. It requests
+`FUSE_ASYNC_DIO` during FUSE init when supported by the kernel, but it does not
+turn on global direct I/O and does not change the buffered read cache policy.
 
 On macOS, StudioFS handles `getxattr` / `setxattr` / `listxattr` /
 `removexattr` natively (including `com.apple.ResourceFork`) so Finder metadata

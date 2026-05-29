@@ -47,15 +47,29 @@ const DEFAULT_FUSE_MAX_READAHEAD_BYTES: u32 = 16 * 1024 * 1024;
 const FUSE_AUTO_INVAL_DATA_FLAG: u64 = 1 << 12;
 
 fn fuse_open_reply_flags(_open_flags: OpenFlags) -> u32 {
-    let mut flags = 0;
+    #[cfg(not(target_os = "macos"))]
+    {
+        if !_open_flags.contains(OpenFlags::WRONLY) && !_open_flags.contains(OpenFlags::RDWR) {
+            fuser::consts::FOPEN_KEEP_CACHE
+        } else {
+            0
+        }
+    }
+
     #[cfg(target_os = "macos")]
     {
         // Same family of fix as the WinFSP cache bypass, but stricter for
         // macFUSE: stale kernel EOF can survive sparse size changes even on
         // read-only handles.
-        flags |= fuser::consts::FOPEN_DIRECT_IO;
+        fuser::consts::FOPEN_DIRECT_IO
     }
-    flags
+}
+
+fn fuse_write_local_sync_policy(flags: i32) -> LocalSyncPolicy {
+    if flags & (libc::O_SYNC | libc::O_DSYNC) != 0 {
+        return LocalSyncPolicy::WriteThrough;
+    }
+    LocalSyncPolicy::Opportunistic
 }
 
 fn parse_bridge_u32_env(key: &str, default: u32) -> u32 {
@@ -87,6 +101,24 @@ fn parse_bridge_u32_env(key: &str, default: u32) -> u32 {
         }
         Err(_) => default,
     }
+}
+
+fn parse_bridge_bool_env_value(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    trimmed == "1"
+        || trimmed.eq_ignore_ascii_case("true")
+        || trimmed.eq_ignore_ascii_case("yes")
+        || trimmed.eq_ignore_ascii_case("on")
+}
+
+#[cfg(target_os = "linux")]
+fn parse_bridge_bool_env(key: &str) -> bool {
+    std::env::var(key).is_ok_and(|raw| parse_bridge_bool_env_value(&raw))
+}
+
+#[cfg(target_os = "linux")]
+fn should_request_fuse_async_dio() -> bool {
+    parse_bridge_bool_env("STUDIOFS_FUSE_ASYNC_DIO")
 }
 
 fn os_str_bytes(name: &OsStr) -> &[u8] {
@@ -602,6 +634,16 @@ impl Filesystem for StudioFuseFs {
                 unsupported,
                 "macFUSE did not advertise FUSE_AUTO_INVAL_DATA; direct I/O remains enabled"
             );
+        }
+
+        #[cfg(target_os = "linux")]
+        if should_request_fuse_async_dio() {
+            if let Err(unsupported) = config.add_capabilities(fuser::consts::FUSE_ASYNC_DIO) {
+                warn!(
+                    ?unsupported,
+                    "Linux FUSE kernel did not advertise FUSE_ASYNC_DIO; continuing without async direct I/O"
+                );
+            }
         }
 
         Ok(())
@@ -1130,7 +1172,7 @@ impl Filesystem for StudioFuseFs {
         offset: i64,
         data: &[u8],
         _write_flags: u32,
-        _flags: i32,
+        flags: i32,
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
@@ -1148,7 +1190,7 @@ impl Filesystem for StudioFuseFs {
                 ino,
                 offset,
                 data,
-                LocalSyncPolicy::Opportunistic,
+                fuse_write_local_sync_policy(flags),
             )) {
             Ok(written) => reply.written(written),
             Err(e) => {
@@ -1886,11 +1928,12 @@ impl KernelInvalidator for FuseKernelInvalidator {
 
 #[cfg(test)]
 mod tests {
+    use super::parse_bridge_bool_env_value;
     use super::{
         DEFAULT_FUSE_MAX_READAHEAD_BYTES, StudioFuseFs, TTL, fuse_open_reply_flags,
-        is_expected_macos_trashes_mkdir_exists, is_missing_xattr_error, missing_xattr_errno,
-        normalize_unix_mode, posix_flags_to_open_flags, should_log_invalidation_error,
-        to_fuse_attr, vfs_err_to_errno,
+        fuse_write_local_sync_policy, is_expected_macos_trashes_mkdir_exists,
+        is_missing_xattr_error, missing_xattr_errno, normalize_unix_mode,
+        posix_flags_to_open_flags, should_log_invalidation_error, to_fuse_attr, vfs_err_to_errno,
     };
     #[cfg(target_os = "macos")]
     use studiofs_meta::engine::{XATTR_CREATE_FLAG, XATTR_REPLACE_FLAG};
@@ -1910,7 +1953,7 @@ mod tests {
     use studiofs_meta::schema::DirEntry;
     use studiofs_meta::schema::{CURRENT_FORMAT_VERSION, FormatInfo, MetadataConfig};
     use studiofs_meta::{MetaFormat, RedbMetaEngine};
-    use studiofs_vfs::{OpenFlags, StudioVfs, VfsConfig, VfsError};
+    use studiofs_vfs::{LocalSyncPolicy, OpenFlags, StudioVfs, VfsConfig, VfsError};
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
     #[cfg(target_os = "macos")]
@@ -2009,9 +2052,43 @@ mod tests {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            assert_eq!(fuse_open_reply_flags(OpenFlags::RDONLY), 0);
+            assert_eq!(
+                fuse_open_reply_flags(OpenFlags::RDONLY),
+                fuser::consts::FOPEN_KEEP_CACHE
+            );
+            assert_eq!(
+                fuse_open_reply_flags(OpenFlags::RDONLY | OpenFlags::APPEND),
+                fuser::consts::FOPEN_KEEP_CACHE
+            );
             assert_eq!(fuse_open_reply_flags(OpenFlags::WRONLY), 0);
             assert_eq!(fuse_open_reply_flags(OpenFlags::RDWR), 0);
+        }
+    }
+
+    #[test]
+    fn fuse_write_sync_flags_select_write_through_policy() {
+        assert_eq!(
+            fuse_write_local_sync_policy(libc::O_SYNC),
+            LocalSyncPolicy::WriteThrough
+        );
+        assert_eq!(
+            fuse_write_local_sync_policy(libc::O_DSYNC),
+            LocalSyncPolicy::WriteThrough
+        );
+        assert_eq!(
+            fuse_write_local_sync_policy(0),
+            LocalSyncPolicy::Opportunistic
+        );
+    }
+
+    #[test]
+    fn fuse_async_dio_env_is_opt_in_only() {
+        for false_value in ["0", "false", "off", ""] {
+            assert!(!parse_bridge_bool_env_value(false_value));
+        }
+
+        for true_value in ["1", "true", "True", "TRUE", "yes", "Yes", "on", "On"] {
+            assert!(parse_bridge_bool_env_value(true_value));
         }
     }
 
@@ -2071,7 +2148,7 @@ mod tests {
             parent: studiofs_meta::ROOT_INO,
             name: ".Trashes".into(),
         });
-        let missing = VfsError::Meta(MetaError::EntryNotFound {
+        let _missing = VfsError::Meta(MetaError::EntryNotFound {
             parent: studiofs_meta::ROOT_INO,
             name: ".Trashes".into(),
         });
@@ -2091,7 +2168,7 @@ mod tests {
             assert!(!is_expected_macos_trashes_mkdir_exists(
                 studiofs_meta::ROOT_INO,
                 b".Trashes",
-                &missing
+                &_missing
             ));
         }
 
