@@ -460,12 +460,13 @@ fn append_sample(
             .map(|path| path.display().to_string()),
         "snapshot": snapshot,
     });
+    let mut record_bytes = serde_json::to_vec(&record)?;
+    record_bytes.push(b'\n');
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(samples_path)?;
-    serde_json::to_writer(&mut file, &record)?;
-    file.write_all(b"\n")?;
+    file.write_all(&record_bytes)?;
     Ok(())
 }
 

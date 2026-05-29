@@ -106,6 +106,18 @@ fn fuse_write_local_sync_policy(flags: i32) -> LocalSyncPolicy {
     LocalSyncPolicy::Opportunistic
 }
 
+fn fuse_reply_flags_purge_ubc(reply_flags: u32) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        reply_flags & fuser::consts::FOPEN_PURGE_UBC != 0
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = reply_flags;
+        false
+    }
+}
+
 fn parse_bridge_u32_env(key: &str, default: u32) -> u32 {
     match std::env::var(key) {
         Ok(raw) => {
@@ -1150,7 +1162,7 @@ impl Filesystem for StudioFuseFs {
                     trunc,
                     reply_flags,
                     direct_io = reply_flags & fuser::consts::FOPEN_DIRECT_IO != 0,
-                    purge_ubc = reply_flags & fuser::consts::FOPEN_PURGE_UBC != 0,
+                    purge_ubc = fuse_reply_flags_purge_ubc(reply_flags),
                     keep_cache = reply_flags & fuser::consts::FOPEN_KEEP_CACHE != 0,
                     "selected FUSE open cache policy"
                 );
