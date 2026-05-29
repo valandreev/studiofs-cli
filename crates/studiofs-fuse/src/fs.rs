@@ -48,10 +48,10 @@ const DEFAULT_FUSE_MAX_READAHEAD_BYTES: u32 = 16 * 1024 * 1024;
 #[cfg(target_os = "macos")]
 const FUSE_AUTO_INVAL_DATA_FLAG: u64 = 1 << 12;
 
-fn fuse_open_reply_flags(open_flags: OpenFlags) -> u32 {
+fn fuse_open_reply_flags(_open_flags: OpenFlags) -> u32 {
     #[cfg(not(target_os = "macos"))]
     {
-        if !open_flags.contains(OpenFlags::WRONLY) && !open_flags.contains(OpenFlags::RDWR) {
+        if !_open_flags.contains(OpenFlags::WRONLY) && !_open_flags.contains(OpenFlags::RDWR) {
             fuser::consts::FOPEN_KEEP_CACHE
         } else {
             0
@@ -116,10 +116,7 @@ fn parse_bridge_bool_env_value(raw: &str) -> bool {
 
 #[cfg(target_os = "linux")]
 fn parse_bridge_bool_env(key: &str) -> bool {
-    std::env::var(key)
-        .ok()
-        .map(|raw| parse_bridge_bool_env_value(&raw))
-        .unwrap_or(false)
+    std::env::var(key).is_ok_and(|raw| parse_bridge_bool_env_value(&raw))
 }
 
 #[cfg(target_os = "linux")]
@@ -631,7 +628,7 @@ impl Filesystem for StudioFuseFs {
         if should_request_fuse_async_dio() {
             if let Err(unsupported) = config.add_capabilities(fuser::consts::FUSE_ASYNC_DIO) {
                 warn!(
-                    unsupported,
+                    ?unsupported,
                     "Linux FUSE kernel did not advertise FUSE_ASYNC_DIO; continuing without async direct I/O"
                 );
             }
