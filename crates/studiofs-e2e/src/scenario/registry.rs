@@ -41,6 +41,7 @@ pub fn available_scenarios() -> &'static [ScenarioDefinition] {
             AdvancedMountedScenario::new(AdvancedMountedKind::InvalidationDropoutFallback)
                 .definition(),
             AdvancedMountedScenario::new(AdvancedMountedKind::SymlinkAttribute).definition(),
+            MountedPerformanceProbe.definition(),
         ]
     })
 }
@@ -131,6 +132,9 @@ pub(crate) fn resolve_scenario(name: &str) -> Option<Box<dyn Scenario>> {
             Some(Box::new(AdvancedMountedScenario::new(
                 AdvancedMountedKind::SymlinkAttribute,
             )))
+        }
+        MOUNTED_PERFORMANCE_PROBE | "performance-probe" | "99" => {
+            Some(Box::new(MountedPerformanceProbe))
         }
         #[cfg(test)]
         TEST_FAILING_VALIDATE => Some(Box::new(TestFailingScenario {

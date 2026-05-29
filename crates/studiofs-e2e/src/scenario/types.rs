@@ -116,6 +116,14 @@ pub enum ScenarioError {
         /// Unmount and cleanup failure while tearing down.
         cleanup: String,
     },
+    /// Performance probe failed and unmount also failed.
+    #[error("mounted performance probe failed: {primary}; unmount also failed: {cleanup}")]
+    PerformanceProbeUnmountAfterFailure {
+        /// Primary scenario failure.
+        primary: String,
+        /// Unmount and cleanup failure while tearing down.
+        cleanup: String,
+    },
     /// Mounted tree validation error.
     #[error("mounted tree validation failed: {0}")]
     MountedTree(

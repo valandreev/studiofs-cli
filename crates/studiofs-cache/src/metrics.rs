@@ -183,6 +183,8 @@ pub struct UploadQueueStatsSnapshot {
     pub requeued: u64,
     /// Number of uploads canceled before completion.
     pub canceled: u64,
+    /// Number of full pending-upload snapshots requested.
+    pub snapshot_pending_calls: u64,
 }
 
 /// Thread-safe counters for upload queue activity in the cache pipeline.
@@ -194,6 +196,7 @@ pub struct UploadQueueStats {
     completed_bytes: AtomicU64,
     requeued: AtomicU64,
     canceled: AtomicU64,
+    snapshot_pending_calls: AtomicU64,
 }
 
 impl UploadQueueStats {
@@ -219,6 +222,11 @@ impl UploadQueueStats {
         self.canceled.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Increase the count of full pending-upload snapshots.
+    pub fn record_snapshot_pending(&self) {
+        self.snapshot_pending_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Return a point-in-time queue snapshot for diagnostics.
     pub fn snapshot(&self, pending_depth: usize) -> UploadQueueStatsSnapshot {
         UploadQueueStatsSnapshot {
@@ -229,6 +237,7 @@ impl UploadQueueStats {
             completed_bytes: self.completed_bytes.load(Ordering::Relaxed),
             requeued: self.requeued.load(Ordering::Relaxed),
             canceled: self.canceled.load(Ordering::Relaxed),
+            snapshot_pending_calls: self.snapshot_pending_calls.load(Ordering::Relaxed),
         }
     }
 
@@ -240,6 +249,7 @@ impl UploadQueueStats {
         self.completed_bytes.store(0, Ordering::Relaxed);
         self.requeued.store(0, Ordering::Relaxed);
         self.canceled.store(0, Ordering::Relaxed);
+        self.snapshot_pending_calls.store(0, Ordering::Relaxed);
     }
 }
 

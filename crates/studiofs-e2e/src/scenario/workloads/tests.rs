@@ -3018,6 +3018,20 @@ fn registry_exposes_mounted_client_crash_restart_recovery_scenario() {
 }
 
 #[test]
+fn registry_exposes_mounted_performance_probe_scenario_99_alias() {
+    let scenarios = available_scenarios();
+
+    assert!(scenarios.iter().any(|scenario| {
+        scenario.name == MOUNTED_PERFORMANCE_PROBE
+            && scenario.requires_studiofs_bin
+            && scenario.description.contains("4GiB")
+    }));
+    assert!(resolve_scenario(MOUNTED_PERFORMANCE_PROBE).is_some());
+    assert!(resolve_scenario("performance-probe").is_some());
+    assert!(resolve_scenario("99").is_some());
+}
+
+#[test]
 fn crash_restart_recovery_runs_both_modes_reuses_client_root_and_converges() {
     let temp = tempdir().unwrap();
     let sandbox = temp.path().join("run-1");

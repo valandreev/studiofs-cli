@@ -357,7 +357,7 @@ pub fn run_with_executor(
         request.scenarios
     };
     let scenarios = resolve_scenarios(&scenario_names)?;
-    if request.infra == InfraMode::Compose && request.studiofs_bin.is_none() {
+    if request.infra != InfraMode::Disabled && request.studiofs_bin.is_none() {
         if let Some(definition) = scenarios
             .iter()
             .map(|resolved| resolved.definition)
@@ -373,6 +373,7 @@ pub fn run_with_executor(
     let infra_mode = request.infra;
     let compose_stack = match infra_mode {
         InfraMode::Disabled => None,
+        InfraMode::Env => None,
         InfraMode::Compose => Some(DockerComposeStack::new(ComposeConfig::for_run(
             &run_id,
             &sandbox,
@@ -420,6 +421,7 @@ pub fn run_with_executor(
         &root,
         &sandbox,
         request.platform,
+        infra_mode,
         compose_stack.as_ref(),
         executor,
     )?;
@@ -573,6 +575,15 @@ pub fn run_with_executor(
                         request.seed,
                         definition.name,
                         &allocated_ports,
+                    )?)
+                }
+                (InfraMode::Env, Some(studiofs_bin)) => {
+                    Some(ClientControllerConfig::from_external_env_for_scenario(
+                        studiofs_bin.clone(),
+                        sandbox.clone(),
+                        &run_id,
+                        request.seed,
+                        definition.name,
                     )?)
                 }
                 _ => None,
@@ -821,6 +832,15 @@ pub fn run_one(request: RunOneRequest) -> Result<RunOneOutcome, RunnerError> {
                     manifest.seed,
                     definition.name,
                     &manifest.allocated_ports,
+                )?)
+            }
+            (InfraMode::Env, Some(studiofs_bin)) => {
+                Some(ClientControllerConfig::from_external_env_for_scenario(
+                    PathBuf::from(studiofs_bin),
+                    sandbox.clone(),
+                    &request.run_id,
+                    manifest.seed,
+                    definition.name,
                 )?)
             }
             _ => None,
@@ -1174,6 +1194,9 @@ fn build_environment_report(input: EnvironmentInput<'_>) -> EnvironmentReport {
         client_root_ownership: ownership.client_roots,
         mount_root_ownership: ownership.mount_roots,
         winfsp_version: probe_host_environment.then(detect_winfsp_version).flatten(),
+        macfuse_version: probe_host_environment
+            .then(detect_macfuse_version)
+            .flatten(),
     }
 }
 
@@ -1248,6 +1271,50 @@ fn detect_winfsp_version_from_host() -> Option<String> {
 
 #[cfg(not(windows))]
 fn detect_winfsp_version_from_host() -> Option<String> {
+    None
+}
+
+fn detect_macfuse_version() -> Option<String> {
+    if let Some(version) = std::env::var("STUDIOFS_E2E_MACFUSE_VERSION")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return Some(version);
+    }
+    detect_macfuse_version_from_host()
+}
+
+#[cfg(target_os = "macos")]
+fn detect_macfuse_version_from_host() -> Option<String> {
+    const MACFUSE_VERSION_PLIST: &str = "/Library/Filesystems/macfuse.fs/Contents/version.plist";
+
+    let output = std::process::Command::new("/usr/bin/plutil")
+        .args([
+            "-extract",
+            "CFBundleShortVersionString",
+            "raw",
+            "-o",
+            "-",
+            MACFUSE_VERSION_PLIST,
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn detect_macfuse_version_from_host() -> Option<String> {
     None
 }
 
@@ -1405,6 +1472,7 @@ fn prepare_preflight(
     root: &Path,
     sandbox: &Path,
     platform: PlatformSelection,
+    infra_mode: InfraMode,
     compose_stack: Option<&DockerComposeStack>,
     executor: &dyn CommandExecutor,
 ) -> Result<PreparedPreflight, RunnerError> {
@@ -1417,7 +1485,14 @@ fn prepare_preflight(
         runner_checks.push(PreflightCheckReport {
             name: "runner-skeleton".to_string(),
             status: RunStatus::Passed,
-            detail: "external infrastructure disabled for this run".to_string(),
+            detail: match infra_mode {
+                InfraMode::Disabled => "external infrastructure disabled for this run".to_string(),
+                InfraMode::Env => {
+                    "external infrastructure provided by repository .env / process environment"
+                        .to_string()
+                }
+                InfraMode::Compose => "docker compose infrastructure selected".to_string(),
+            },
         });
         let status = if runner_checks
             .iter()

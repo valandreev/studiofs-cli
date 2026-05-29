@@ -142,6 +142,8 @@ pub struct EnvironmentReport {
     pub mount_root_ownership: Vec<PathOwnershipReport>,
     /// Optional WinFSP version string.
     pub winfsp_version: Option<String>,
+    /// Optional macFUSE version string.
+    pub macfuse_version: Option<String>,
 }
 
 /// Single docker-compose service image entry.
@@ -299,6 +301,7 @@ mod tests {
                 client_root_ownership: Vec::new(),
                 mount_root_ownership: Vec::new(),
                 winfsp_version: None,
+                macfuse_version: None,
             },
             preflight: PreflightReport {
                 status: RunStatus::Passed,

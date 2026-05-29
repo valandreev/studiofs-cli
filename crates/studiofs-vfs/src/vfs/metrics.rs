@@ -218,6 +218,49 @@ pub struct VfsWritePathVfsWriteStats {
     pub materialize_for_limits: VfsWritePathStageLatencyStats,
 }
 
+/// FUSE callback latency and byte counters.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VfsFuseCallbackStats {
+    /// FUSE read callback metrics.
+    #[serde(default)]
+    pub read: VfsFuseIoStats,
+    /// FUSE write callback metrics.
+    #[serde(default)]
+    pub write: VfsFuseIoStats,
+}
+
+/// FUSE I/O callback metrics for one direction.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VfsFuseIoStats {
+    /// Total callback count.
+    pub calls: u64,
+    /// Total requested bytes observed at the FUSE boundary.
+    pub bytes: u64,
+    /// Average request size in bytes.
+    pub avg_bytes: f64,
+    /// Callback errors.
+    pub errors: u64,
+    /// Total callback wall time in milliseconds.
+    pub total_ms: f64,
+    /// Average callback wall time in milliseconds.
+    pub avg_ms: f64,
+    /// Maximum callback wall time in milliseconds.
+    pub max_ms: f64,
+    /// Requested MiB per second over process uptime.
+    pub requested_mib_per_sec: f64,
+}
+
+/// VFS read callback counters.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VfsReadPathStats {
+    /// Total VFS read calls.
+    pub calls: u64,
+    /// Total bytes requested through VFS reads.
+    pub requested_bytes: u64,
+    /// Average read request size in bytes.
+    pub avg_requested_bytes: f64,
+}
+
 /// Landing-zone statistics for accepted writes and sync points.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VfsWritePathLandingZoneStats {
@@ -641,6 +684,12 @@ pub struct VfsWritePathObservabilitySnapshot {
     /// VFS write-stage metrics.
     #[serde(default)]
     pub vfs_write_path: VfsWritePathVfsWriteStats,
+    /// VFS read-stage metrics.
+    #[serde(default)]
+    pub vfs_read_path: VfsReadPathStats,
+    /// FUSE callback metrics.
+    #[serde(default)]
+    pub fuse_callbacks: VfsFuseCallbackStats,
     /// Landing-zone metrics.
     #[serde(default)]
     pub landing_zone: VfsWritePathLandingZoneStats,
@@ -748,6 +797,8 @@ pub struct VfsUploadStats {
     pub canceled_stale_after_put: u64,
     /// Bytes in stale uploads canceled after PUT.
     pub canceled_stale_after_put_bytes: u64,
+    /// Full pending-upload snapshots requested by hot paths and diagnostics.
+    pub pending_upload_snapshot_calls: u64,
 }
 
 /// Zero-IO cache byte accounting snapshot.

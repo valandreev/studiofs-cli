@@ -900,6 +900,8 @@ mod tests {
             winfsp_callbacks: Default::default(),
             winfsp_write_path: Default::default(),
             vfs_write_path: Default::default(),
+            vfs_read_path: Default::default(),
+            fuse_callbacks: Default::default(),
             landing_zone: Default::default(),
             drain_lag: Default::default(),
             winfsp_foreground_flushes: Default::default(),

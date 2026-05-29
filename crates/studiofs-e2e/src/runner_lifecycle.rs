@@ -168,6 +168,7 @@ fn infra_cli_value(infra: InfraMode) -> &'static str {
     match infra {
         InfraMode::Disabled => "disabled",
         InfraMode::Compose => "compose",
+        InfraMode::Env => "env",
     }
 }
 

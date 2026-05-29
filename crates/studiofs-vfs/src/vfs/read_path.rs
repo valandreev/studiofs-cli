@@ -356,7 +356,7 @@ impl<'a> DataReader<'a> {
                 "read range overflow: ino={ino}, offset={offset}, length={length}"
             ))
         })?;
-        let pending_upload_index = vfs.snapshot_pending_upload_index();
+        let mut pending_upload_index = None;
 
         for claim in writer_stack_claims {
             if planner.is_complete() {
@@ -443,14 +443,25 @@ impl<'a> DataReader<'a> {
                 if planner.is_complete() {
                     break;
                 }
-                let Some(source) = vfs.pending_overlay_block_source(
+                let mut source = vfs.pending_overlay_block_source(
                     ino,
                     block_index,
                     pending_content_epoch,
-                    Some(&pending_upload_index),
-                ) else {
-                    continue;
-                };
+                    pending_upload_index.as_ref(),
+                );
+                if source.is_none()
+                    && pending_upload_index.is_none()
+                    && vfs.cached_store.has_pending_uploads_for_ino(ino)
+                {
+                    pending_upload_index = Some(vfs.snapshot_pending_upload_index());
+                    source = vfs.pending_overlay_block_source(
+                        ino,
+                        block_index,
+                        pending_content_epoch,
+                        pending_upload_index.as_ref(),
+                    );
+                }
+                let Some(source) = source else { continue };
                 if matches!(
                     &source,
                     PendingOverlayBlockSource::Extent(object_id)
@@ -3356,6 +3367,122 @@ mod tests {
             counting_backend.read_into_calls() > 0,
             "materialized pending local reads should use direct partial read_into()"
         );
+    }
+
+    #[test]
+    fn materialized_pending_local_read_uses_live_extent_records_without_queue_snapshot() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "pending-local-read-no-snapshot");
+
+        rt.block_on(async {
+            let created = vfs
+                .create(ROOT_INO, b"pending-local-read-no-snapshot.bin", 1000, 1000, 0o644)
+                .expect("create file");
+            let payload = vec![0x6Bu8; 512 * 1024];
+
+            vfs.write(created.ino, 0, &payload)
+                .await
+                .expect("write payload");
+            vfs.flush(created.ino)
+                .await
+                .expect("materialize pending local state");
+
+            assert!(
+                vfs.cached_store().pending_upload_count() > 0,
+                "unstarted VFS should retain uploads in the runtime queue"
+            );
+            assert!(
+                !vfs.live_extent_records_for_inode(created.ino).is_empty(),
+                "flush should record live extents for the pending incarnation"
+            );
+
+            let snapshot_calls_before = vfs
+                .cached_store()
+                .cache_pipeline_metrics()
+                .upload_queue
+                .snapshot_pending_calls;
+
+            let read = vfs
+                .read(created.ino, 0, payload.len() as u32)
+                .await
+                .expect("read payload");
+            assert_eq!(read.as_ref(), payload.as_slice());
+
+            let snapshot_calls_after = vfs
+                .cached_store()
+                .cache_pipeline_metrics()
+                .upload_queue
+                .snapshot_pending_calls;
+            assert_eq!(
+                snapshot_calls_after, snapshot_calls_before,
+                "hot foreground reads backed by live extent records must not clone the pending upload queue"
+            );
+        });
+    }
+
+    #[test]
+    fn published_read_clears_stale_live_extents_without_queue_snapshot() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "published-read-no-snapshot");
+
+        rt.block_on(async {
+            let created = vfs
+                .create(
+                    ROOT_INO,
+                    b"published-read-no-snapshot.bin",
+                    1000,
+                    1000,
+                    0o644,
+                )
+                .expect("create file");
+            let payload = vec![0xC3u8; 256 * 1024];
+
+            vfs.write(created.ino, 0, &payload)
+                .await
+                .expect("write payload");
+            vfs.flush(created.ino)
+                .await
+                .expect("materialize pending local state");
+
+            for op in vfs.pending_uploads_snapshot() {
+                vfs.cached_store().complete_upload(&op);
+            }
+            let (published_epoch, published_blocks) =
+                mark_all_overlay_objects_uploaded(&vfs, &meta, created.ino);
+            publish_current_file_graph(&meta, created.ino, published_epoch, &published_blocks);
+
+            assert_eq!(vfs.cached_store().pending_upload_count(), 0);
+            assert!(
+                !vfs.live_extent_records_for_inode(created.ino).is_empty(),
+                "test needs stale live extents to exercise ready-attr cleanup"
+            );
+
+            let snapshot_calls_before = vfs
+                .cached_store()
+                .cache_pipeline_metrics()
+                .upload_queue
+                .snapshot_pending_calls;
+
+            let read = vfs
+                .read(created.ino, 0, payload.len() as u32)
+                .await
+                .expect("read published payload");
+            assert_eq!(read.as_ref(), payload.as_slice());
+
+            let snapshot_calls_after = vfs
+                .cached_store()
+                .cache_pipeline_metrics()
+                .upload_queue
+                .snapshot_pending_calls;
+            assert_eq!(
+                snapshot_calls_after, snapshot_calls_before,
+                "published foreground reads must not clone an empty pending upload queue"
+            );
+            assert!(
+                vfs.live_extent_records_for_inode(created.ino).is_empty(),
+                "ready metadata should clear stale live extents after upload completion"
+            );
+        });
     }
 
     #[test]

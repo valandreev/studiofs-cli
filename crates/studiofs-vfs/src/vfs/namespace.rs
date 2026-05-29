@@ -871,8 +871,13 @@ impl<'a> NamespaceMutationOps<'a> {
 
 /// Abstraction for backends that can invalidate inode-specific kernel cache entries.
 pub trait KernelInvalidator: Send + Sync {
-    /// Invalidate kernel cache state associated with the given inode.
+    /// Invalidate the full kernel cache state for the inode, including attributes and data.
     fn inval_inode(&self, ino: u64);
+
+    /// Invalidate only kernel attribute cache state associated with the given inode.
+    fn inval_inode_attrs(&self, ino: u64) {
+        self.inval_inode(ino);
+    }
 }
 
 /// Holds namespace-scoped caches and generation counters used for coherence.

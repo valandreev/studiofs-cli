@@ -162,9 +162,13 @@ fn upload_disk_reread_defer_delay(
     (!wait.is_zero()).then_some(wait)
 }
 
-fn foreground_upload_reread_slot_cost(foreground_active: bool, max_slots: u32) -> u32 {
+fn foreground_upload_reread_slot_cost(
+    foreground_active: bool,
+    foreground_cost: u32,
+    max_slots: u32,
+) -> u32 {
     if foreground_active {
-        max_slots.max(1)
+        foreground_cost.clamp(1, max_slots.max(1))
     } else {
         1
     }
@@ -905,7 +909,7 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
             Ok(()) if self.vfs.upload_stage_contains_async(object_id).await? => {
                 self.vfs.debug_write_probe(
                     "H5",
-                    "crates/studiofs-vfs/src/vfs/upload_lifecycle/worker.rs:746",
+                    concat!(file!(), ":", line!()),
                     "upload stage hardlink restored before local-priority reread fallback",
                     serde_json::json!({
                         "object_id": object_id,
@@ -917,7 +921,7 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
             Err(error) => {
                 self.vfs.debug_write_probe(
                     "H5",
-                    "crates/studiofs-vfs/src/vfs/upload_lifecycle/worker.rs:754",
+                    concat!(file!(), ":", line!()),
                     "upload stage hardlink restore failed; falling back to bounded reread",
                     serde_json::json!({
                         "object_id": object_id,
@@ -941,7 +945,7 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
             // #region debug log
             self.vfs.debug_write_probe(
                 "H5",
-                "crates/studiofs-vfs/src/vfs/upload_lifecycle/worker.rs:769",
+                concat!(file!(), ":", line!()),
                 "upload stage unavailable; skipping local-priority defer and using bounded reread",
                 serde_json::json!({
                     "object_id": object_id,
@@ -969,7 +973,7 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
                 .fetch_add(hot_payload.len() as u64, Ordering::Relaxed);
             self.vfs.debug_write_probe(
                 "H5",
-                "crates/studiofs-vfs/src/vfs/upload_lifecycle/worker.rs:741",
+                concat!(file!(), ":", line!()),
                 "upload read served from hot upload buffer",
                 serde_json::json!({
                     "object_id": object_id,
@@ -978,35 +982,20 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
             );
             return Ok(Some(hot_payload));
         }
-        if let Some(staged_payload) = self.vfs.upload_stage_get_async(object_id).await? {
-            self.vfs
-                .state
-                .upload
-                .upload_local_payload_reads
-                .fetch_add(1, Ordering::Relaxed);
-            self.vfs
-                .state
-                .upload
-                .upload_local_payload_read_bytes
-                .fetch_add(staged_payload.len() as u64, Ordering::Relaxed);
-            self.vfs.debug_write_probe(
-                "H5",
-                "crates/studiofs-vfs/src/vfs/upload_lifecycle/worker.rs:752",
-                "upload read served from upload hardlink",
-                serde_json::json!({
-                    "object_id": object_id,
-                    "buffer_bytes": staged_payload.len(),
-                }),
-            );
-            return Ok(Some(staged_payload));
-        }
         let foreground_active = self
             .vfs
             .state
             .read
             .foreground_read_active(now_unix_millis(), self.vfs.upload_user_idle_grace);
+        let foreground_cost = self
+            .vfs
+            .state
+            .upload
+            .upload_cache_io_foreground_cost
+            .load(Ordering::Relaxed);
         let upload_io_cost = foreground_upload_reread_slot_cost(
             foreground_active,
+            foreground_cost,
             self.vfs.upload_cache_io_slots_max,
         );
         let wait_started = Instant::now();
@@ -1022,6 +1011,46 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
                 message: error.to_string(),
             })?;
         let wait_ns = wait_started.elapsed().as_nanos().clamp(0, u64::MAX as u128) as u64;
+        let staged_payload = self.vfs.upload_stage_get_async(object_id).await?;
+        if let Some(staged_payload) = staged_payload {
+            let pacing_delay =
+                foreground_upload_reread_pacing_delay(foreground_active, staged_payload.len());
+            if !pacing_delay.is_zero() {
+                self.vfs.debug_write_probe(
+                    "H5",
+                    concat!(file!(), ":", line!()),
+                    "upload staged read paced under foreground reads",
+                    serde_json::json!({
+                        "object_id": object_id,
+                        "staged_bytes": staged_payload.len(),
+                        "pacing_delay_ms": pacing_delay.as_millis().min(u128::from(u64::MAX)) as u64,
+                        "slot_cost": upload_io_cost,
+                    }),
+                );
+                tokio::time::sleep(pacing_delay).await;
+            }
+            drop(upload_io_permit);
+            self.vfs
+                .state
+                .upload
+                .upload_local_payload_reads
+                .fetch_add(1, Ordering::Relaxed);
+            self.vfs
+                .state
+                .upload
+                .upload_local_payload_read_bytes
+                .fetch_add(staged_payload.len() as u64, Ordering::Relaxed);
+            self.vfs.debug_write_probe(
+                "H5",
+                concat!(file!(), ":", line!()),
+                "upload read served from upload hardlink",
+                serde_json::json!({
+                    "object_id": object_id,
+                    "buffer_bytes": staged_payload.len(),
+                }),
+            );
+            return Ok(Some(staged_payload));
+        }
         let read_started = Instant::now();
         let read_result = self
             .vfs
@@ -1035,7 +1064,7 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
         if !pacing_delay.is_zero() {
             self.vfs.debug_write_probe(
                 "H5",
-                "crates/studiofs-vfs/src/vfs/upload_lifecycle/worker.rs:744",
+                concat!(file!(), ":", line!()),
                 "upload reread paced under foreground reads",
                 serde_json::json!({
                     "object_id": object_id,
@@ -3133,10 +3162,15 @@ mod tests {
     }
 
     #[test]
-    fn foreground_upload_reread_slot_cost_collapses_to_single_lane() {
-        assert_eq!(foreground_upload_reread_slot_cost(false, 32), 1);
-        assert_eq!(foreground_upload_reread_slot_cost(true, 32), 32);
-        assert_eq!(foreground_upload_reread_slot_cost(true, 1), 1);
+    fn foreground_upload_reread_slot_cost_uses_adaptive_foreground_cost() {
+        assert_eq!(foreground_upload_reread_slot_cost(false, 8, 32), 1);
+        assert_eq!(foreground_upload_reread_slot_cost(true, 3, 8), 3);
+        assert_eq!(
+            foreground_upload_reread_slot_cost(true, 64, 8),
+            8,
+            "adaptive foreground cost must stay bounded by available upload I/O slots"
+        );
+        assert_eq!(foreground_upload_reread_slot_cost(true, 0, 8), 1);
     }
 
     #[test]

@@ -204,6 +204,15 @@ impl UploadQueue {
         self.pending_state.lock().ino_counts.contains_key(&ino)
     }
 
+    /// Check whether any pending upload for `ino` belongs to a newer content epoch.
+    pub fn has_pending_for_ino_newer_than(&self, ino: Ino, content_epoch: u64) -> bool {
+        let state = self.pending_state.lock();
+        state
+            .by_object
+            .values()
+            .any(|op| op.ino == ino && op.content_epoch > content_epoch)
+    }
+
     /// O(1) check whether a specific object id is currently pending upload.
     pub fn has_pending_object(&self, object_id: u64) -> bool {
         self.pending_state.lock().by_object.contains_key(&object_id)

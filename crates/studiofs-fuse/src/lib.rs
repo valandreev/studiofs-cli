@@ -33,6 +33,26 @@ enum MountOptionError {
     VolumeNameContainsNul,
 }
 
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MacosFuseCachePolicy {
+    Direct,
+    Winfsp,
+}
+
+#[cfg(target_os = "macos")]
+const MACOS_FUSE_IOSIZE_BYTES: u32 = 64 * 1024;
+
+#[cfg(target_os = "macos")]
+impl MacosFuseCachePolicy {
+    fn from_env() -> Self {
+        match std::env::var("STUDIOFS_MACOS_FUSE_CACHE_POLICY") {
+            Ok(raw) if raw.trim().eq_ignore_ascii_case("direct") => Self::Direct,
+            _ => Self::Winfsp,
+        }
+    }
+}
+
 fn validate_volume_name(volume_name: &str) -> Result<(), MountOptionError> {
     if volume_name.trim().is_empty() {
         return Err(MountOptionError::EmptyVolumeName);
@@ -62,6 +82,47 @@ fn build_mount_options_with_allow_other(
     read_only: bool,
     allow_other_env: bool,
 ) -> Result<Vec<fuser::MountOption>, MountOptionError> {
+    #[cfg(target_os = "macos")]
+    {
+        build_mount_options_with_allow_other_and_macos_cache_policy(
+            volume_name,
+            foreground,
+            read_only,
+            allow_other_env,
+            MacosFuseCachePolicy::from_env(),
+        )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        build_mount_options_inner(volume_name, foreground, read_only, allow_other_env)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn build_mount_options_with_allow_other_and_macos_cache_policy(
+    volume_name: &str,
+    foreground: bool,
+    read_only: bool,
+    allow_other_env: bool,
+    macos_cache_policy: MacosFuseCachePolicy,
+) -> Result<Vec<fuser::MountOption>, MountOptionError> {
+    build_mount_options_inner(
+        volume_name,
+        foreground,
+        read_only,
+        allow_other_env,
+        macos_cache_policy,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn build_mount_options_inner(
+    volume_name: &str,
+    foreground: bool,
+    read_only: bool,
+    allow_other_env: bool,
+    macos_cache_policy: MacosFuseCachePolicy,
+) -> Result<Vec<fuser::MountOption>, MountOptionError> {
     validate_volume_name(volume_name)?;
     let mut options = vec![fuser::MountOption::FSName(volume_name.into())];
     // On Linux, fuser's auto_unmount helper can leave CLI SIGTERM shutdowns
@@ -78,17 +139,48 @@ fn build_mount_options_with_allow_other(
         options.push(fuser::MountOption::CUSTOM(format!("volname={volume_name}")));
         // Tell macFUSE to treat this as a local drive, which enables native Trash.
         options.push(fuser::MountOption::CUSTOM("local".into()));
-        // Match the WinFSP bridge cache contract on macFUSE: avoid local
-        // vnode/UBC state hiding freshly returned sizes after sparse extends.
-        options.push(fuser::MountOption::CUSTOM("direct_io".into()));
-        options.push(fuser::MountOption::CUSTOM("nolocalcaches".into()));
+        if macos_cache_policy == MacosFuseCachePolicy::Direct {
+            // Strict rollback mode preserves the historical macFUSE posture for
+            // correctness A/B runs while target mode relies on explicit invalidation.
+            options.push(fuser::MountOption::CUSTOM("direct_io".into()));
+            options.push(fuser::MountOption::CUSTOM("nolocalcaches".into()));
+            options.push(fuser::MountOption::CUSTOM("auto_cache".into()));
+        } else {
+            options.push(fuser::MountOption::CUSTOM("novncache".into()));
+            options.push(fuser::MountOption::CUSTOM("daemon_timeout=60".into()));
+            options.push(fuser::MountOption::CUSTOM(format!(
+                "iosize={MACOS_FUSE_IOSIZE_BYTES}"
+            )));
+        }
         options.push(fuser::MountOption::CUSTOM("sparse".into()));
-        // Re-check cached data if macFUSE still keeps any attribute-derived state.
-        options.push(fuser::MountOption::CUSTOM("auto_cache".into()));
     }
     #[cfg(target_os = "macos")]
     if foreground {
         options.push(fuser::MountOption::CUSTOM("foreground".into()));
+    }
+    if read_only {
+        options.push(fuser::MountOption::RO);
+    }
+    Ok(options)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn build_mount_options_inner(
+    volume_name: &str,
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] foreground: bool,
+    read_only: bool,
+    allow_other_env: bool,
+) -> Result<Vec<fuser::MountOption>, MountOptionError> {
+    validate_volume_name(volume_name)?;
+    let mut options = vec![fuser::MountOption::FSName(volume_name.into())];
+    // On Linux, fuser's auto_unmount helper can leave CLI SIGTERM shutdowns
+    // attached until the external watchdog sends SIGKILL. Let Mount::drop use
+    // the explicit lazy fusermount/umount path instead.
+    if !cfg!(target_os = "linux") {
+        options.push(fuser::MountOption::AutoUnmount);
+    }
+    if allow_other_env || cfg!(target_os = "macos") {
+        options.push(fuser::MountOption::AllowOther);
     }
     if read_only {
         options.push(fuser::MountOption::RO);
@@ -410,6 +502,10 @@ mod tests {
         FuseUnmountSignal, MountOptionError, SignalHandling, build_mount_options_with_allow_other,
         validate_volume_name,
     };
+    #[cfg(target_os = "macos")]
+    use super::{
+        MacosFuseCachePolicy, build_mount_options_with_allow_other_and_macos_cache_policy,
+    };
 
     static SIGNAL_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -631,33 +727,57 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn build_mount_options_sets_macos_auto_cache_flag() {
-        let options = build_mount_options_with_allow_other("studiofs-mac", false, false, false)
-            .expect("options");
+    fn build_mount_options_target_macos_policy_uses_winfsp_style_cache_options() {
+        let options = build_mount_options_with_allow_other_and_macos_cache_policy(
+            "studiofs-mac",
+            false,
+            false,
+            false,
+            MacosFuseCachePolicy::Winfsp,
+        )
+        .expect("options");
+        assert!(
+            !options.iter().any(
+                |opt| matches!(opt, fuser::MountOption::CUSTOM(custom) if custom == "direct_io")
+            )
+        );
+        assert!(!options.iter().any(
+            |opt| matches!(opt, fuser::MountOption::CUSTOM(custom) if custom == "nolocalcaches")
+        ));
+        assert!(
+            options.iter().any(
+                |opt| matches!(opt, fuser::MountOption::CUSTOM(custom) if custom == "novncache")
+            )
+        );
         assert!(options.iter().any(
-            |opt| matches!(opt, fuser::MountOption::CUSTOM(custom) if custom == "auto_cache")
+            |opt| matches!(opt, fuser::MountOption::CUSTOM(custom) if custom == "daemon_timeout=60")
+        ));
+        assert!(options.iter().any(
+            |opt| matches!(opt, fuser::MountOption::CUSTOM(custom) if custom == "iosize=65536")
         ));
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn build_mount_options_sets_macos_direct_io_flag() {
-        let options = build_mount_options_with_allow_other("studiofs-mac", false, false, false)
-            .expect("options");
+    fn build_mount_options_direct_macos_policy_keeps_strict_rollback_options() {
+        let options = build_mount_options_with_allow_other_and_macos_cache_policy(
+            "studiofs-mac",
+            false,
+            false,
+            false,
+            MacosFuseCachePolicy::Direct,
+        )
+        .expect("options");
         assert!(
             options.iter().any(
                 |opt| matches!(opt, fuser::MountOption::CUSTOM(custom) if custom == "direct_io")
             )
         );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn build_mount_options_sets_macos_no_local_caches_flag() {
-        let options = build_mount_options_with_allow_other("studiofs-mac", false, false, false)
-            .expect("options");
         assert!(options.iter().any(
             |opt| matches!(opt, fuser::MountOption::CUSTOM(custom) if custom == "nolocalcaches")
+        ));
+        assert!(options.iter().any(
+            |opt| matches!(opt, fuser::MountOption::CUSTOM(custom) if custom == "auto_cache")
         ));
     }
 

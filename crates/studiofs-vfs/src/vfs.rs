@@ -70,15 +70,16 @@ pub use locking::LockKind;
 /// Re-exported VFS observability snapshot and metrics types.
 pub use metrics::{
     StatFs, VfsAttrReadCacheSnapshot, VfsCacheStateSnapshot, VfsFetchStats,
-    VfsForegroundReadProtectionStats, VfsIngressLane, VfsIngressPressure, VfsIngressStats,
-    VfsLatencyHistogramSnapshot, VfsNamespaceCacheSnapshot, VfsPortableAllocatorStats,
-    VfsRuntimeEvent, VfsSynchronizationStateSnapshot, VfsTransitMemorySnapshot, VfsUploadStats,
-    VfsWritePathBackpressureStats, VfsWritePathBurstStats, VfsWritePathCadenceStats,
-    VfsWritePathDirtyPressureStats, VfsWritePathDrainLagStats, VfsWritePathEagerFlushStats,
-    VfsWritePathLandingZoneStats, VfsWritePathLatencyQuantilesMs,
-    VfsWritePathLatencyQuantilesSaturated, VfsWritePathLocalCacheIoStats,
-    VfsWritePathObservabilitySnapshot, VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats,
-    VfsWritePathTuningStats, VfsWritePathVfsWriteStats, VfsWritePathWinfspCallbackStats,
+    VfsForegroundReadProtectionStats, VfsFuseCallbackStats, VfsFuseIoStats, VfsIngressLane,
+    VfsIngressPressure, VfsIngressStats, VfsLatencyHistogramSnapshot, VfsNamespaceCacheSnapshot,
+    VfsPortableAllocatorStats, VfsReadPathStats, VfsRuntimeEvent, VfsSynchronizationStateSnapshot,
+    VfsTransitMemorySnapshot, VfsUploadStats, VfsWritePathBackpressureStats,
+    VfsWritePathBurstStats, VfsWritePathCadenceStats, VfsWritePathDirtyPressureStats,
+    VfsWritePathDrainLagStats, VfsWritePathEagerFlushStats, VfsWritePathLandingZoneStats,
+    VfsWritePathLatencyQuantilesMs, VfsWritePathLatencyQuantilesSaturated,
+    VfsWritePathLocalCacheIoStats, VfsWritePathObservabilitySnapshot,
+    VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats, VfsWritePathTuningStats,
+    VfsWritePathVfsWriteStats, VfsWritePathWinfspCallbackStats,
     VfsWritePathWinfspForegroundFlushStats, VfsWritePathWinfspWritePathStats,
     VfsZeroIoCacheBytesSnapshot, VfsZeroIoDrilldownEntry, VfsZeroIoHealthSignal,
     VfsZeroIoRuntimeSnapshot, VfsZeroIoShutdownSnapshot, VfsZeroIoStartupReplaySnapshot,
@@ -2131,6 +2132,8 @@ struct MetricsState {
     drain_lag_pacing_max_ms: AtomicU64,
     dirty_pressure_peak_bytes: AtomicU64,
     staged_pressure_peak_bytes: AtomicU64,
+    vfs_read_calls: AtomicU64,
+    vfs_read_requested_bytes: AtomicU64,
     vfs_write_calls: AtomicU64,
     vfs_write_bytes: AtomicU64,
     vfs_write_record_writer_stack_state_calls: AtomicU64,
@@ -2177,6 +2180,16 @@ struct MetricsState {
     winfsp_cleanup_barrier_skipped_clean: AtomicU64,
     winfsp_flush_barrier_skipped_clean: AtomicU64,
     winfsp_close_barrier_skipped_clean: AtomicU64,
+    fuse_read_callbacks: AtomicU64,
+    fuse_read_callback_bytes: AtomicU64,
+    fuse_read_callback_errors: AtomicU64,
+    fuse_read_callback_total_ns: AtomicU64,
+    fuse_read_callback_max_ns: AtomicU64,
+    fuse_write_callbacks: AtomicU64,
+    fuse_write_callback_bytes: AtomicU64,
+    fuse_write_callback_errors: AtomicU64,
+    fuse_write_callback_total_ns: AtomicU64,
+    fuse_write_callback_max_ns: AtomicU64,
     zeroio_replay_failures: AtomicU64,
     zeroio_publish_failures: AtomicU64,
     runtime_event_sequence: AtomicU64,
@@ -2243,6 +2256,8 @@ impl MetricsState {
             drain_lag_pacing_max_ms: AtomicU64::new(0),
             dirty_pressure_peak_bytes: AtomicU64::new(0),
             staged_pressure_peak_bytes: AtomicU64::new(0),
+            vfs_read_calls: AtomicU64::new(0),
+            vfs_read_requested_bytes: AtomicU64::new(0),
             vfs_write_calls: AtomicU64::new(0),
             vfs_write_bytes: AtomicU64::new(0),
             vfs_write_record_writer_stack_state_calls: AtomicU64::new(0),
@@ -2289,6 +2304,16 @@ impl MetricsState {
             winfsp_cleanup_barrier_skipped_clean: AtomicU64::new(0),
             winfsp_flush_barrier_skipped_clean: AtomicU64::new(0),
             winfsp_close_barrier_skipped_clean: AtomicU64::new(0),
+            fuse_read_callbacks: AtomicU64::new(0),
+            fuse_read_callback_bytes: AtomicU64::new(0),
+            fuse_read_callback_errors: AtomicU64::new(0),
+            fuse_read_callback_total_ns: AtomicU64::new(0),
+            fuse_read_callback_max_ns: AtomicU64::new(0),
+            fuse_write_callbacks: AtomicU64::new(0),
+            fuse_write_callback_bytes: AtomicU64::new(0),
+            fuse_write_callback_errors: AtomicU64::new(0),
+            fuse_write_callback_total_ns: AtomicU64::new(0),
+            fuse_write_callback_max_ns: AtomicU64::new(0),
             zeroio_replay_failures: AtomicU64::new(0),
             zeroio_publish_failures: AtomicU64::new(0),
             runtime_event_sequence: AtomicU64::new(0),
@@ -2352,6 +2377,8 @@ impl MetricsState {
             drain_lag_pacing_max_ms,
             dirty_pressure_peak_bytes,
             staged_pressure_peak_bytes,
+            vfs_read_calls,
+            vfs_read_requested_bytes,
             vfs_write_calls,
             vfs_write_bytes,
             vfs_write_record_writer_stack_state_calls,
@@ -2391,6 +2418,16 @@ impl MetricsState {
             winfsp_cleanup_barrier_skipped_clean,
             winfsp_flush_barrier_skipped_clean,
             winfsp_close_barrier_skipped_clean,
+            fuse_read_callbacks,
+            fuse_read_callback_bytes,
+            fuse_read_callback_errors,
+            fuse_read_callback_total_ns,
+            fuse_read_callback_max_ns,
+            fuse_write_callbacks,
+            fuse_write_callback_bytes,
+            fuse_write_callback_errors,
+            fuse_write_callback_total_ns,
+            fuse_write_callback_max_ns,
             zeroio_replay_failures,
             zeroio_publish_failures,
             runtime_event_sequence
@@ -4094,6 +4131,11 @@ impl StudioVfs {
         self.cached_store.has_pending_uploads_for_ino(ino)
     }
 
+    fn inode_has_pending_uploads_newer_than(&self, ino: Ino, content_epoch: u64) -> bool {
+        self.cached_store
+            .has_pending_uploads_for_ino_newer_than(ino, content_epoch)
+    }
+
     async fn wait_for_pending_uploads_idle(&self, timeout: Duration) -> bool {
         self.cached_store.wait_for_uploads_idle(timeout).await
             && self.upload_scheduler.in_flight() == 0
@@ -4408,14 +4450,21 @@ impl StudioVfs {
             .get(&ino)
             .and_then(|state| state.pending_incarnation.as_ref())
             .is_some_and(|pending| pending.content_epoch > committed_epoch);
-        let pending_uploads = self.pending_uploads_for_inode(ino);
-        let has_newer_pending_upload = pending_uploads
-            .iter()
-            .any(|(_, _, content_epoch)| *content_epoch > committed_epoch);
+        let has_pending_uploads = self.inode_has_pending_uploads(ino);
+        let has_newer_pending_upload =
+            has_pending_uploads && self.inode_has_pending_uploads_newer_than(ino, committed_epoch);
+        let has_same_epoch_pending_upload = has_pending_uploads
+            && self
+                .pending_uploads_for_inode(ino)
+                .iter()
+                .any(|(_, _, content_epoch)| *content_epoch == committed_epoch);
         if has_newer_pending_upload {
             return false;
         }
         let live_extents = self.live_extent_records_for_inode(ino);
+        let has_newer_live_extent = live_extents
+            .iter()
+            .any(|(_, _, content_epoch)| *content_epoch > committed_epoch);
         let (has_pending_epoch_finalization, has_newer_pending_epoch_finalization) = {
             let pending_epoch_finalizations = self.state.upload.pending_epoch_finalizations.lock();
             (
@@ -4435,6 +4484,9 @@ impl StudioVfs {
         if has_dirty_writers {
             return false;
         }
+        if !dirty_attr_present && !has_pending_local_payloads && has_same_epoch_pending_upload {
+            return false;
+        }
         let local_state_is_newer_than_ready_attr =
             dirty_attr_epoch.is_none_or(|content_epoch| content_epoch > committed_epoch);
         if has_pending_local_payloads && local_state_is_newer_than_ready_attr {
@@ -4444,17 +4496,17 @@ impl StudioVfs {
             return false;
         }
         if !dirty_attr_present
-            && (!pending_uploads.is_empty()
+            && (has_newer_pending_upload
                 || pending_incarnation_newer_than_committed
-                || !live_extents.is_empty()
-                || has_pending_epoch_finalization)
+                || has_newer_live_extent
+                || has_newer_pending_epoch_finalization)
         {
             return false;
         }
         has_pending_local_payloads
             || dirty_attr_present
             || has_dirty_writers
-            || !pending_uploads.is_empty()
+            || has_pending_uploads
             || !live_extents.is_empty()
             || has_pending_epoch_finalization
     }
@@ -4709,6 +4761,9 @@ impl StudioVfs {
     }
 
     fn cancel_pending_uploads_for_inode(&self, ino: Ino) {
+        if !self.inode_has_pending_uploads(ino) {
+            return;
+        }
         let mut quarantined = HashSet::new();
         quarantined.insert(ino);
         self.cancel_pending_uploads_for_inodes(&quarantined);
@@ -5325,6 +5380,7 @@ impl StudioVfs {
                 .upload
                 .upload_canceled_stale_after_put_bytes
                 .load(Ordering::Relaxed),
+            pending_upload_snapshot_calls: cache_metrics.upload_queue.snapshot_pending_calls,
         }
     }
 
@@ -5988,6 +6044,34 @@ impl StudioVfs {
         histogram.observe_ns(elapsed_ns);
     }
 
+    fn build_fuse_io_stats(
+        calls: u64,
+        bytes: u64,
+        errors: u64,
+        total_ns: u64,
+        max_ns: u64,
+        elapsed: Duration,
+    ) -> VfsFuseIoStats {
+        VfsFuseIoStats {
+            calls,
+            bytes,
+            avg_bytes: if calls == 0 {
+                0.0
+            } else {
+                bytes as f64 / calls as f64
+            },
+            errors,
+            total_ms: total_ns as f64 / 1_000_000.0,
+            avg_ms: if calls == 0 {
+                0.0
+            } else {
+                (total_ns as f64 / calls as f64) / 1_000_000.0
+            },
+            max_ms: max_ns as f64 / 1_000_000.0,
+            requested_mib_per_sec: Self::per_second(bytes, elapsed) / (1024.0 * 1024.0),
+        }
+    }
+
     fn build_stage_latency_stats(
         calls: u64,
         total_ns: u64,
@@ -6433,6 +6517,70 @@ impl StudioVfs {
             .fetch_add(write_bytes as u64, Ordering::Relaxed);
     }
 
+    /// Record VFS read call counters and requested byte totals.
+    pub(super) fn note_vfs_read_call(&self, requested_bytes: usize) {
+        self.state
+            .metrics
+            .vfs_read_calls
+            .fetch_add(1, Ordering::Relaxed);
+        self.state
+            .metrics
+            .vfs_read_requested_bytes
+            .fetch_add(requested_bytes as u64, Ordering::Relaxed);
+    }
+
+    /// Record FUSE read callback observability.
+    pub fn record_fuse_read_callback(
+        &self,
+        requested_bytes: usize,
+        callback_elapsed: Duration,
+        errored: bool,
+    ) {
+        let metrics = &self.state.metrics;
+        metrics.fuse_read_callbacks.fetch_add(1, Ordering::Relaxed);
+        metrics
+            .fuse_read_callback_bytes
+            .fetch_add(requested_bytes as u64, Ordering::Relaxed);
+        if errored {
+            metrics
+                .fuse_read_callback_errors
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        let elapsed_ns = Self::duration_ns_u64(callback_elapsed);
+        metrics
+            .fuse_read_callback_total_ns
+            .fetch_add(elapsed_ns, Ordering::Relaxed);
+        metrics
+            .fuse_read_callback_max_ns
+            .fetch_max(elapsed_ns, Ordering::Relaxed);
+    }
+
+    /// Record FUSE write callback observability.
+    pub fn record_fuse_write_callback(
+        &self,
+        requested_bytes: usize,
+        callback_elapsed: Duration,
+        errored: bool,
+    ) {
+        let metrics = &self.state.metrics;
+        metrics.fuse_write_callbacks.fetch_add(1, Ordering::Relaxed);
+        metrics
+            .fuse_write_callback_bytes
+            .fetch_add(requested_bytes as u64, Ordering::Relaxed);
+        if errored {
+            metrics
+                .fuse_write_callback_errors
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        let elapsed_ns = Self::duration_ns_u64(callback_elapsed);
+        metrics
+            .fuse_write_callback_total_ns
+            .fetch_add(elapsed_ns, Ordering::Relaxed);
+        metrics
+            .fuse_write_callback_max_ns
+            .fetch_max(elapsed_ns, Ordering::Relaxed);
+    }
+
     /// Record write-path stage latency for recording writer stack state.
     pub(super) fn record_vfs_write_record_writer_stack_state(&self, elapsed: Duration) {
         let metrics = &self.state.metrics;
@@ -6588,6 +6736,8 @@ impl StudioVfs {
             local_cache_handoff_max_ns: local_cache_io_handoff_max_ns,
             local_cache_backend_total_ns: local_cache_io_backend_total_ns,
             local_cache_backend_max_ns: local_cache_io_backend_max_ns,
+            vfs_read_calls: vfs_read_calls,
+            vfs_read_requested_bytes: vfs_read_requested_bytes,
             vfs_write_calls: vfs_write_calls,
             vfs_write_bytes: vfs_write_bytes,
             vfs_write_record_writer_stack_state_calls: vfs_write_record_writer_stack_state_calls,
@@ -6609,6 +6759,16 @@ impl StudioVfs {
             winfsp_write_callback_vfs_max_ns: winfsp_write_callback_vfs_max_ns,
             winfsp_write_callback_getattr_total_ns: winfsp_write_callback_getattr_total_ns,
             winfsp_write_callback_getattr_max_ns: winfsp_write_callback_getattr_max_ns,
+            fuse_read_callbacks: fuse_read_callbacks,
+            fuse_read_callback_bytes: fuse_read_callback_bytes,
+            fuse_read_callback_errors: fuse_read_callback_errors,
+            fuse_read_callback_total_ns: fuse_read_callback_total_ns,
+            fuse_read_callback_max_ns: fuse_read_callback_max_ns,
+            fuse_write_callbacks: fuse_write_callbacks,
+            fuse_write_callback_bytes: fuse_write_callback_bytes,
+            fuse_write_callback_errors: fuse_write_callback_errors,
+            fuse_write_callback_total_ns: fuse_write_callback_total_ns,
+            fuse_write_callback_max_ns: fuse_write_callback_max_ns,
             sync_calls: payload_store_sync_data_calls,
             sync_deferred_calls: payload_store_sync_data_deferred_calls,
             sync_bytes: payload_store_sync_data_synced_bytes,
@@ -7088,6 +7248,33 @@ impl StudioVfs {
                     vfs_write_materialize_for_limits_total_ns,
                     vfs_write_materialize_for_limits_max_ns,
                     vfs_write_materialize_for_limits_histogram,
+                    elapsed,
+                ),
+            },
+            vfs_read_path: VfsReadPathStats {
+                calls: vfs_read_calls,
+                requested_bytes: vfs_read_requested_bytes,
+                avg_requested_bytes: if vfs_read_calls == 0 {
+                    0.0
+                } else {
+                    vfs_read_requested_bytes as f64 / vfs_read_calls as f64
+                },
+            },
+            fuse_callbacks: VfsFuseCallbackStats {
+                read: Self::build_fuse_io_stats(
+                    fuse_read_callbacks,
+                    fuse_read_callback_bytes,
+                    fuse_read_callback_errors,
+                    fuse_read_callback_total_ns,
+                    fuse_read_callback_max_ns,
+                    elapsed,
+                ),
+                write: Self::build_fuse_io_stats(
+                    fuse_write_callbacks,
+                    fuse_write_callback_bytes,
+                    fuse_write_callback_errors,
+                    fuse_write_callback_total_ns,
+                    fuse_write_callback_max_ns,
                     elapsed,
                 ),
             },
