@@ -17,14 +17,12 @@ use fuser::{
     Request,
 };
 use handle_drain::FuseHandleDrainFacade;
-use studiofs_meta::FileType;
-#[cfg(not(target_os = "macos"))]
-use studiofs_meta::ROOT_INO;
 #[cfg(target_os = "macos")]
 use studiofs_meta::engine::{XATTR_CREATE_FLAG, XATTR_REPLACE_FLAG};
 #[cfg(target_os = "macos")]
 use studiofs_meta::schema::DirEntry;
 use studiofs_meta::types::{SetattrArgs, TimeSpec};
+use studiofs_meta::{FileType, ROOT_INO};
 #[cfg(not(target_os = "macos"))]
 use studiofs_vfs::is_hidden_non_macos_root_metadata_name;
 use studiofs_vfs::{
@@ -153,6 +151,21 @@ fn heal_hidden_non_macos_root_metadata_entry(vfs: &StudioVfs, parent: u64, name:
             "failed to heal hidden non-macOS root metadata entry: {error}"
         );
     }
+}
+
+#[cfg(target_os = "macos")]
+fn is_expected_macos_trashes_mkdir_exists(parent: u64, name: &[u8], err: &VfsError) -> bool {
+    parent == ROOT_INO
+        && name == b".Trashes"
+        && matches!(
+            err,
+            VfsError::Meta(studiofs_meta::MetaError::EntryExists { .. })
+        )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_expected_macos_trashes_mkdir_exists(_parent: u64, _name: &[u8], _err: &VfsError) -> bool {
+    false
 }
 
 fn is_missing_xattr_error(err: &VfsError) -> bool {
@@ -714,16 +727,29 @@ impl Filesystem for StudioFuseFs {
                 0,
             ),
             Err(e) => {
-                error!(
-                    parent,
-                    uid = req.uid(),
-                    gid = req.gid(),
-                    mode,
-                    umask = _umask,
-                    name = %debug_name(&name_bytes),
-                    name_bytes = ?name_bytes,
-                    "mkdir -> {e}"
-                );
+                if is_expected_macos_trashes_mkdir_exists(parent, &name_bytes, &e) {
+                    debug!(
+                        parent,
+                        uid = req.uid(),
+                        gid = req.gid(),
+                        mode,
+                        umask = _umask,
+                        name = %debug_name(&name_bytes),
+                        name_bytes = ?name_bytes,
+                        "mkdir -> {e}"
+                    );
+                } else {
+                    error!(
+                        parent,
+                        uid = req.uid(),
+                        gid = req.gid(),
+                        mode,
+                        umask = _umask,
+                        name = %debug_name(&name_bytes),
+                        name_bytes = ?name_bytes,
+                        "mkdir -> {e}"
+                    );
+                }
                 reply.error(vfs_err_to_errno(&e));
             }
         }
@@ -1905,9 +1931,9 @@ mod tests {
     use super::parse_bridge_bool_env_value;
     use super::{
         DEFAULT_FUSE_MAX_READAHEAD_BYTES, StudioFuseFs, TTL, fuse_open_reply_flags,
-        fuse_write_local_sync_policy, is_missing_xattr_error, missing_xattr_errno,
-        normalize_unix_mode, posix_flags_to_open_flags, should_log_invalidation_error,
-        to_fuse_attr, vfs_err_to_errno,
+        fuse_write_local_sync_policy, is_expected_macos_trashes_mkdir_exists,
+        is_missing_xattr_error, missing_xattr_errno, normalize_unix_mode,
+        posix_flags_to_open_flags, should_log_invalidation_error, to_fuse_attr, vfs_err_to_errno,
     };
     #[cfg(target_os = "macos")]
     use studiofs_meta::engine::{XATTR_CREATE_FLAG, XATTR_REPLACE_FLAG};
@@ -2114,6 +2140,44 @@ mod tests {
             source: studiofs_data::store::DataError::Storage("timeout".into()),
         });
         assert_eq!(vfs_err_to_errno(&exhausted), libc::ETIMEDOUT);
+    }
+
+    #[test]
+    fn expected_macos_trashes_mkdir_exists_is_scoped() {
+        let exists = VfsError::Meta(MetaError::EntryExists {
+            parent: studiofs_meta::ROOT_INO,
+            name: ".Trashes".into(),
+        });
+        let _missing = VfsError::Meta(MetaError::EntryNotFound {
+            parent: studiofs_meta::ROOT_INO,
+            name: ".Trashes".into(),
+        });
+
+        #[cfg(target_os = "macos")]
+        {
+            assert!(is_expected_macos_trashes_mkdir_exists(
+                studiofs_meta::ROOT_INO,
+                b".Trashes",
+                &exists
+            ));
+            assert!(!is_expected_macos_trashes_mkdir_exists(
+                studiofs_meta::ROOT_INO,
+                b"normal",
+                &exists
+            ));
+            assert!(!is_expected_macos_trashes_mkdir_exists(
+                studiofs_meta::ROOT_INO,
+                b".Trashes",
+                &_missing
+            ));
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        assert!(!is_expected_macos_trashes_mkdir_exists(
+            studiofs_meta::ROOT_INO,
+            b".Trashes",
+            &exists
+        ));
     }
 
     #[test]
