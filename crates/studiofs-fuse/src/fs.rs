@@ -52,9 +52,10 @@ fn fuse_open_reply_flags(open_flags: OpenFlags) -> u32 {
     #[cfg(not(target_os = "macos"))]
     {
         if !open_flags.contains(OpenFlags::WRONLY) && !open_flags.contains(OpenFlags::RDWR) {
-            return fuser::consts::FOPEN_KEEP_CACHE;
+            fuser::consts::FOPEN_KEEP_CACHE
+        } else {
+            0
         }
-        0
     }
 
     #[cfg(target_os = "macos")]
@@ -105,15 +106,19 @@ fn parse_bridge_u32_env(key: &str, default: u32) -> u32 {
 }
 
 #[cfg(target_os = "linux")]
+fn parse_bridge_bool_env_value(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    trimmed == "1"
+        || trimmed.eq_ignore_ascii_case("true")
+        || trimmed.eq_ignore_ascii_case("yes")
+        || trimmed.eq_ignore_ascii_case("on")
+}
+
+#[cfg(target_os = "linux")]
 fn parse_bridge_bool_env(key: &str) -> bool {
     std::env::var(key)
         .ok()
-        .map(|raw| {
-            matches!(
-                raw.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
+        .map(|raw| parse_bridge_bool_env_value(&raw))
         .unwrap_or(false)
 }
 
@@ -1902,7 +1907,7 @@ impl KernelInvalidator for FuseKernelInvalidator {
 #[cfg(test)]
 mod tests {
     #[cfg(target_os = "linux")]
-    use super::parse_bridge_bool_env;
+    use super::parse_bridge_bool_env_value;
     use super::{
         DEFAULT_FUSE_MAX_READAHEAD_BYTES, StudioFuseFs, TTL, fuse_open_reply_flags,
         fuse_write_local_sync_policy, is_missing_xattr_error, missing_xattr_errno,
@@ -2058,33 +2063,12 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn fuse_async_dio_env_is_opt_in_only() {
-        const KEY: &str = "STUDIOFS_TEST_FUSE_ASYNC_DIO_BOOL";
-        // SAFETY: This unit test owns a unique env var name and restores it
-        // before returning; production code never relies on this key.
-        unsafe {
-            std::env::remove_var(KEY);
-        }
-        assert!(!parse_bridge_bool_env(KEY));
-
         for false_value in ["0", "false", "off", ""] {
-            // SAFETY: See the safety note above; this key is test-local.
-            unsafe {
-                std::env::set_var(KEY, false_value);
-            }
-            assert!(!parse_bridge_bool_env(KEY));
+            assert!(!parse_bridge_bool_env_value(false_value));
         }
 
         for true_value in ["1", "true", "True", "TRUE", "yes", "Yes", "on", "On"] {
-            // SAFETY: See the safety note above; this key is test-local.
-            unsafe {
-                std::env::set_var(KEY, true_value);
-            }
-            assert!(parse_bridge_bool_env(KEY));
-        }
-
-        // SAFETY: See the safety note above; this restores the test-local key.
-        unsafe {
-            std::env::remove_var(KEY);
+            assert!(parse_bridge_bool_env_value(true_value));
         }
     }
 
