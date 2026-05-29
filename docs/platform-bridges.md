@@ -217,10 +217,12 @@ small callbacks even when the mount-level `iosize` is larger.
 
 Regular read-only file opens return `FOPEN_KEEP_CACHE` so safe media and
 sequential-read workloads can use the kernel cache/readahead path. Write-capable
-or truncating opens return `FOPEN_DIRECT_IO`, matching WinFSP's per-handle cache
-opt-out for writes. Correctness depends on explicit invalidation through
-`FuseKernelInvalidator::inval_inode(ino, 0, -1)` when publication, sparse graph,
-size, or remote metadata transitions make cached pages unsafe.
+or truncating opens return macFUSE `FOPEN_PURGE_UBC`, which drops stale readonly
+UBC pages without disabling buffered I/O for the descriptor. Correctness depends
+on scoped explicit invalidation through `FuseKernelInvalidator`: data invalidation
+uses `inval_inode(ino, 0, -1)` when cached pages are unsafe, while same-mount
+publication of already accepted local bytes uses attribute-only invalidation so
+macOS does not evict freshly written UBC pages after upload completion.
 
 `STUDIOFS_MACOS_FUSE_CACHE_POLICY=direct` preserves the older strict rollback
 mode: mount options include `direct_io`, `nolocalcaches`, and `auto_cache`, and

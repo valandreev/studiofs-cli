@@ -87,12 +87,13 @@ fn fuse_open_reply_flags_with_macos_cache_policy(
     trunc: bool,
     macos_cache_policy: super::MacosFuseCachePolicy,
 ) -> u32 {
-    if macos_cache_policy == super::MacosFuseCachePolicy::Direct
-        || open_flags.contains(OpenFlags::WRONLY)
+    if macos_cache_policy == super::MacosFuseCachePolicy::Direct {
+        fuser::consts::FOPEN_DIRECT_IO
+    } else if open_flags.contains(OpenFlags::WRONLY)
         || open_flags.contains(OpenFlags::RDWR)
         || trunc
     {
-        fuser::consts::FOPEN_DIRECT_IO
+        fuser::consts::FOPEN_PURGE_UBC
     } else {
         fuser::consts::FOPEN_KEEP_CACHE
     }
@@ -1149,6 +1150,7 @@ impl Filesystem for StudioFuseFs {
                     trunc,
                     reply_flags,
                     direct_io = reply_flags & fuser::consts::FOPEN_DIRECT_IO != 0,
+                    purge_ubc = reply_flags & fuser::consts::FOPEN_PURGE_UBC != 0,
                     keep_cache = reply_flags & fuser::consts::FOPEN_KEEP_CACHE != 0,
                     "selected FUSE open cache policy"
                 );
@@ -1991,12 +1993,21 @@ fn should_log_invalidation_error(err: &std::io::Error) -> bool {
 
 impl KernelInvalidator for FuseKernelInvalidator {
     fn inval_inode(&self, ino: u64) {
-        // offset=0, len=-1 invalidates the entire inode (attributes + all
-        // cached page data / directory listing).
-        if let Err(e) = self.notifier.inval_inode(ino, 0, -1) {
+        self.inval_inode_range(ino, 0, -1, "data");
+    }
+
+    fn inval_inode_attrs(&self, ino: u64) {
+        // libfuse documents a negative offset as attribute-only invalidation.
+        self.inval_inode_range(ino, -1, 0, "attrs");
+    }
+}
+
+impl FuseKernelInvalidator {
+    fn inval_inode_range(&self, ino: u64, offset: i64, len: i64, scope: &'static str) {
+        if let Err(e) = self.notifier.inval_inode(ino, offset, len) {
             // ENOENT is harmless (kernel already evicted the entry).
             if should_log_invalidation_error(&e) {
-                warn!(ino, error = %e, "FUSE notify_inval_inode failed");
+                warn!(ino, offset, len, scope, error = %e, "FUSE notify_inval_inode failed");
             }
         }
     }
@@ -2137,7 +2148,7 @@ mod tests {
                     false,
                     crate::MacosFuseCachePolicy::Winfsp,
                 ),
-                fuser::consts::FOPEN_DIRECT_IO
+                fuser::consts::FOPEN_PURGE_UBC
             );
             assert_eq!(
                 fuse_open_reply_flags_with_macos_cache_policy(
@@ -2145,7 +2156,7 @@ mod tests {
                     false,
                     crate::MacosFuseCachePolicy::Winfsp,
                 ),
-                fuser::consts::FOPEN_DIRECT_IO
+                fuser::consts::FOPEN_PURGE_UBC
             );
             assert_eq!(
                 fuse_open_reply_flags_with_macos_cache_policy(
@@ -2153,7 +2164,7 @@ mod tests {
                     true,
                     crate::MacosFuseCachePolicy::Winfsp,
                 ),
-                fuser::consts::FOPEN_DIRECT_IO
+                fuser::consts::FOPEN_PURGE_UBC
             );
             assert_eq!(
                 fuse_open_reply_flags_with_macos_cache_policy(

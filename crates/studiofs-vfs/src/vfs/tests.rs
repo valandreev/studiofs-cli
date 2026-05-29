@@ -19,18 +19,27 @@ use tokio::runtime::Runtime;
 
 #[derive(Default)]
 struct RecordingKernelInvalidator {
-    seen: parking_lot::Mutex<Vec<Ino>>,
+    data_seen: parking_lot::Mutex<Vec<Ino>>,
+    attr_seen: parking_lot::Mutex<Vec<Ino>>,
 }
 
 impl RecordingKernelInvalidator {
     fn snapshot(&self) -> Vec<Ino> {
-        self.seen.lock().clone()
+        self.data_seen.lock().clone()
+    }
+
+    fn attr_snapshot(&self) -> Vec<Ino> {
+        self.attr_seen.lock().clone()
     }
 }
 
 impl KernelInvalidator for RecordingKernelInvalidator {
     fn inval_inode(&self, ino: Ino) {
-        self.seen.lock().push(ino);
+        self.data_seen.lock().push(ino);
+    }
+
+    fn inval_inode_attrs(&self, ino: Ino) {
+        self.attr_seen.lock().push(ino);
     }
 }
 
@@ -2345,6 +2354,71 @@ fn epoch_finalizer_invalidates_kernel_when_publication_shrinks_visible_size() {
         let published = meta.get_attr(attr.ino).expect("load published shrink attr");
         assert_eq!(published.size, 4096);
         assert_eq!(published.committed_size, published.size);
+    });
+}
+
+#[test]
+fn epoch_finalizer_keeps_data_cache_for_own_local_write_publication() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "graph-finalizer-local-write-attr-only");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"graph-finalizer-local-write-attr-only.bin", 0, 0, 0o644)
+            .expect("create test file");
+        let baseline_attr = meta.get_attr(attr.ino).expect("load baseline attr");
+        let mut staged_attr = baseline_attr.clone();
+        staged_attr.size = 4096;
+        staged_attr.content_epoch = staged_attr.content_epoch.saturating_add(1);
+        staged_attr.upload_state = MetaUploadState::Updating;
+        meta.set_attr(&staged_attr)
+            .expect("stage local sparse publication");
+        meta.remove_regular_file_graph(attr.ino)
+            .expect("stage sparse graph for local publication");
+        vfs.state.namespace.dirty_attrs.lock().remove(&attr.ino);
+        vfs.state.namespace.attr_read_cache.lock().remove(attr.ino);
+
+        let (content_epoch, uploaded_blocks) =
+            mark_all_overlay_objects_uploaded(&vfs, &meta, attr.ino);
+        assert!(
+            uploaded_blocks.is_empty(),
+            "regression setup should avoid remote object visibility waits"
+        );
+        vfs.state.incarnation.live_extent_records.lock().insert(
+            (attr.ino, 0),
+            ExtentRecordId {
+                object_id: 0xABCD,
+                content_epoch,
+            },
+        );
+        assert!(
+            vfs.live_extent_records_for_inode(attr.ino)
+                .iter()
+                .any(|(_, _, epoch)| *epoch == content_epoch),
+            "local write publication should retain live extent records until finalization"
+        );
+        let invalidator = Arc::new(RecordingKernelInvalidator::default());
+        vfs.set_kernel_invalidator(invalidator.clone());
+
+        let status =
+            super::commit::CommitCoordinator::finalize_inode_epoch(&vfs, attr.ino, content_epoch)
+                .await
+                .expect("finalize local write publication");
+        assert!(matches!(
+            status,
+            super::commit::EpochFinalizeStatus::Published
+        ));
+        assert_eq!(
+            invalidator.snapshot(),
+            Vec::<Ino>::new(),
+            "publishing bytes already accepted by this mount must not purge the kernel data cache"
+        );
+        assert_eq!(
+            invalidator.attr_snapshot(),
+            vec![attr.ino],
+            "local write publication should still refresh kernel attributes"
+        );
     });
 }
 

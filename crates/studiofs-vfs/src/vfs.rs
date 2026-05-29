@@ -4453,6 +4453,11 @@ impl StudioVfs {
         let has_pending_uploads = self.inode_has_pending_uploads(ino);
         let has_newer_pending_upload =
             has_pending_uploads && self.inode_has_pending_uploads_newer_than(ino, committed_epoch);
+        let has_same_epoch_pending_upload = has_pending_uploads
+            && self
+                .pending_uploads_for_inode(ino)
+                .iter()
+                .any(|(_, _, content_epoch)| *content_epoch == committed_epoch);
         if has_newer_pending_upload {
             return false;
         }
@@ -4477,6 +4482,9 @@ impl StudioVfs {
         let has_pending_local_payloads = self.has_pending_local_dirty_payloads_for_inode(ino);
         let has_dirty_writers = self.state.writer_stack.has_dirty_writers(ino);
         if has_dirty_writers {
+            return false;
+        }
+        if !dirty_attr_present && !has_pending_local_payloads && has_same_epoch_pending_upload {
             return false;
         }
         let local_state_is_newer_than_ready_attr =

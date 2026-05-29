@@ -199,6 +199,10 @@ impl CommitCoordinator {
             return Ok(EpochFinalizeStatus::Deferred);
         }
 
+        let had_live_extents_for_epoch = vfs
+            .live_extent_records_for_inode(ino)
+            .iter()
+            .any(|(_, _, epoch)| *epoch == content_epoch);
         vfs.remove_live_extents_for_inode_epoch(ino, content_epoch);
 
         // Clear any stale dirty_attr that was snapshotted before this epoch was
@@ -218,20 +222,20 @@ impl CommitCoordinator {
         // finalize session serializes publish+cleanup for this inode so a stale
         // older finalizer cannot restore a dirty_attr after a newer finalizer has
         // already published and removed it.
-        let (was_dirty_visible, newer_dirty_attr) = {
+        let (was_dirty_visible, removed_matching_dirty_attr, newer_dirty_attr) = {
             let mut dirty_attrs = vfs.state.namespace.dirty_attrs.lock();
             let present = dirty_attrs.contains_key(&ino);
             let newer = dirty_attrs
                 .get(&ino)
                 .filter(|attr| attr.content_epoch > content_epoch)
                 .cloned();
-            if dirty_attrs
+            let removed_matching = dirty_attrs
                 .get(&ino)
-                .is_some_and(|attr| attr.content_epoch == content_epoch)
-            {
+                .is_some_and(|attr| attr.content_epoch == content_epoch);
+            if removed_matching {
                 dirty_attrs.remove(&ino);
             }
-            (present, newer)
+            (present, removed_matching, newer)
         };
 
         if let Ok(attr) = run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
@@ -243,6 +247,7 @@ impl CommitCoordinator {
         } else {
             vfs.clear_inode_incarnation(ino);
         }
+        let restored_newer_dirty_attr = newer_dirty_attr.is_some();
         if let Some(newer_dirty_attr) = newer_dirty_attr {
             let mut dirty_attrs = vfs.state.namespace.dirty_attrs.lock();
             let should_restore = dirty_attrs
@@ -256,14 +261,28 @@ impl CommitCoordinator {
         // `getattr` can expose pending attrs from dirty_attrs without populating
         // attr_read_cache. A newer dirty attr must be preserved, but its presence
         // still means the kernel may hold stale attrs for the epoch just published.
-        let should_invalidate_kernel = was_dirty_visible
+        let local_matching_dirty_publication = (removed_matching_dirty_attr
+            || had_live_extents_for_epoch)
+            && !restored_newer_dirty_attr;
+        let publication_shrinks_visible_size = latest_attr.committed_size > latest_attr.size;
+        let should_invalidate_kernel_data = if local_matching_dirty_publication {
+            publication_shrinks_visible_size
+        } else {
+            was_dirty_visible
+                || removed_cached_attr
+                || publication_changes_visible_size
+                || meta.has_persisted_overlay
+        };
+        let should_invalidate_kernel_attrs = was_dirty_visible
             || removed_cached_attr
             || publication_changes_visible_size
             || meta.has_persisted_overlay;
         drop(finalize_session);
         vfs.state.file_session.gc_if_idle(ino);
-        if should_invalidate_kernel {
+        if should_invalidate_kernel_data {
             vfs.invalidate_kernel_inodes([ino]);
+        } else if should_invalidate_kernel_attrs {
+            vfs.invalidate_kernel_inode_attrs([ino]);
         }
 
         Ok(EpochFinalizeStatus::Published)

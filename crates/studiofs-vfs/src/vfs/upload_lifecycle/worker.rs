@@ -162,9 +162,13 @@ fn upload_disk_reread_defer_delay(
     (!wait.is_zero()).then_some(wait)
 }
 
-fn foreground_upload_reread_slot_cost(foreground_active: bool, max_slots: u32) -> u32 {
+fn foreground_upload_reread_slot_cost(
+    foreground_active: bool,
+    foreground_cost: u32,
+    max_slots: u32,
+) -> u32 {
     if foreground_active {
-        max_slots.max(1)
+        foreground_cost.clamp(1, max_slots.max(1))
     } else {
         1
     }
@@ -983,8 +987,15 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
             .state
             .read
             .foreground_read_active(now_unix_millis(), self.vfs.upload_user_idle_grace);
+        let foreground_cost = self
+            .vfs
+            .state
+            .upload
+            .upload_cache_io_foreground_cost
+            .load(Ordering::Relaxed);
         let upload_io_cost = foreground_upload_reread_slot_cost(
             foreground_active,
+            foreground_cost,
             self.vfs.upload_cache_io_slots_max,
         );
         let wait_started = Instant::now();
@@ -3151,10 +3162,15 @@ mod tests {
     }
 
     #[test]
-    fn foreground_upload_reread_slot_cost_collapses_to_single_lane() {
-        assert_eq!(foreground_upload_reread_slot_cost(false, 32), 1);
-        assert_eq!(foreground_upload_reread_slot_cost(true, 32), 32);
-        assert_eq!(foreground_upload_reread_slot_cost(true, 1), 1);
+    fn foreground_upload_reread_slot_cost_uses_adaptive_foreground_cost() {
+        assert_eq!(foreground_upload_reread_slot_cost(false, 8, 32), 1);
+        assert_eq!(foreground_upload_reread_slot_cost(true, 3, 8), 3);
+        assert_eq!(
+            foreground_upload_reread_slot_cost(true, 64, 8),
+            8,
+            "adaptive foreground cost must stay bounded by available upload I/O slots"
+        );
+        assert_eq!(foreground_upload_reread_slot_cost(true, 0, 8), 1);
     }
 
     #[test]
