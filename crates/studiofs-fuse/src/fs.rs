@@ -38,6 +38,9 @@ use unicode_normalization::UnicodeNormalization;
 const TTL: Duration = Duration::from_secs(0);
 #[cfg(not(target_os = "macos"))]
 const TTL: Duration = Duration::from_secs(1);
+#[cfg(target_os = "macos")]
+const DEFAULT_FUSE_MAX_WRITE_BYTES: u32 = 128 * 1024;
+#[cfg(not(target_os = "macos"))]
 const DEFAULT_FUSE_MAX_WRITE_BYTES: u32 = 16 * 1024 * 1024;
 #[cfg(target_os = "macos")]
 const DEFAULT_FUSE_MAX_READAHEAD_BYTES: u32 = 1024 * 1024;
@@ -45,6 +48,18 @@ const DEFAULT_FUSE_MAX_READAHEAD_BYTES: u32 = 1024 * 1024;
 const DEFAULT_FUSE_MAX_READAHEAD_BYTES: u32 = 16 * 1024 * 1024;
 #[cfg(target_os = "macos")]
 const FUSE_AUTO_INVAL_DATA_FLAG: u64 = 1 << 12;
+
+#[cfg(target_os = "macos")]
+fn fuse_attr_blksize() -> u32 {
+    // macFUSE 5.2.0 uses this as the vnode preferred I/O size; keep it aligned
+    // with the mount-level iosize so the kernel does not fall back to tiny I/O.
+    super::MACOS_FUSE_IOSIZE_BYTES
+}
+
+#[cfg(not(target_os = "macos"))]
+fn fuse_attr_blksize() -> u32 {
+    512
+}
 
 fn fuse_open_reply_flags(open_flags: OpenFlags, trunc: bool) -> u32 {
     #[cfg(target_os = "macos")]
@@ -557,7 +572,7 @@ fn to_fuse_attr(attr: &studiofs_meta::InodeAttr, mount_uid: u32, mount_gid: u32)
         uid,
         gid,
         rdev: 0,
-        blksize: 512,
+        blksize: fuse_attr_blksize(),
         flags: 0,
     }
 }
@@ -652,7 +667,7 @@ impl Filesystem for StudioFuseFs {
             max_write = requested_max_write,
             max_readahead = requested_readahead,
             macos_cache_policy = ?super::MacosFuseCachePolicy::from_env(),
-            macos_iosize = DEFAULT_FUSE_MAX_READAHEAD_BYTES,
+            macos_iosize = super::MACOS_FUSE_IOSIZE_BYTES,
             "configured FUSE bridge I/O policy"
         );
         #[cfg(not(target_os = "macos"))]
@@ -664,7 +679,7 @@ impl Filesystem for StudioFuseFs {
 
         #[cfg(target_os = "macos")]
         if let Err(unsupported) = config.add_capabilities(FUSE_AUTO_INVAL_DATA_FLAG) {
-            warn!(
+            debug!(
                 unsupported,
                 "macFUSE did not advertise FUSE_AUTO_INVAL_DATA; using explicit invalidation fallback"
             );
@@ -1191,10 +1206,16 @@ impl Filesystem for StudioFuseFs {
         // fuser's ReplyData API accepts an immutable reply slice instead of
         // exposing a mutable kernel buffer, so FUSE needs this boundary buffer.
         let mut out = vec![0u8; clamped_size];
-        match self
+        let callback_started = Instant::now();
+        let result = self
             .rt
-            .block_on(self.vfs.read_into_fh(fh, ino, offset, &mut out))
-        {
+            .block_on(self.vfs.read_into_fh(fh, ino, offset, &mut out));
+        self.vfs.record_fuse_read_callback(
+            clamped_size,
+            callback_started.elapsed(),
+            result.is_err(),
+        );
+        match result {
             Ok(n) => {
                 let n = match usize::try_from(n) {
                     Ok(n) => n,
@@ -1231,7 +1252,8 @@ impl Filesystem for StudioFuseFs {
                 return;
             }
         };
-        match self
+        let callback_started = Instant::now();
+        let result = self
             .rt
             .block_on(self.vfs.write_fh_with_deferred_materialize(
                 fh,
@@ -1239,7 +1261,13 @@ impl Filesystem for StudioFuseFs {
                 offset,
                 data,
                 fuse_write_local_sync_policy(flags),
-            )) {
+            ));
+        self.vfs.record_fuse_write_callback(
+            data.len(),
+            callback_started.elapsed(),
+            result.is_err(),
+        );
+        match result {
             Ok(written) => reply.written(written),
             Err(e) => {
                 error!("write({ino}, off={offset}) -> {e}");
@@ -1980,10 +2008,10 @@ mod tests {
     use super::fuse_open_reply_flags;
     use super::parse_bridge_bool_env_value;
     use super::{
-        DEFAULT_FUSE_MAX_READAHEAD_BYTES, StudioFuseFs, TTL, fuse_write_local_sync_policy,
-        is_expected_macos_trashes_mkdir_exists, is_missing_xattr_error, missing_xattr_errno,
-        normalize_unix_mode, posix_flags_to_open_flags, should_log_invalidation_error,
-        to_fuse_attr, vfs_err_to_errno,
+        DEFAULT_FUSE_MAX_READAHEAD_BYTES, DEFAULT_FUSE_MAX_WRITE_BYTES, StudioFuseFs, TTL,
+        fuse_write_local_sync_policy, is_expected_macos_trashes_mkdir_exists,
+        is_missing_xattr_error, missing_xattr_errno, normalize_unix_mode,
+        posix_flags_to_open_flags, should_log_invalidation_error, to_fuse_attr, vfs_err_to_errno,
     };
     #[cfg(target_os = "macos")]
     use studiofs_meta::engine::{XATTR_CREATE_FLAG, XATTR_REPLACE_FLAG};
@@ -2073,6 +2101,14 @@ mod tests {
         assert_eq!(DEFAULT_FUSE_MAX_READAHEAD_BYTES, 1024 * 1024);
         #[cfg(not(target_os = "macos"))]
         assert_eq!(DEFAULT_FUSE_MAX_READAHEAD_BYTES, 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn default_fuse_max_write_matches_platform_expectation() {
+        #[cfg(target_os = "macos")]
+        assert_eq!(DEFAULT_FUSE_MAX_WRITE_BYTES, 128 * 1024);
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(DEFAULT_FUSE_MAX_WRITE_BYTES, 16 * 1024 * 1024);
     }
 
     #[test]
@@ -2275,6 +2311,16 @@ mod tests {
         assert_eq!(file_attr.gid, 20);
         assert_eq!(file_attr.blocks, 2);
         assert_eq!(file_attr.perm, 0o640);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn to_fuse_attr_reports_macos_iosize_as_preferred_io_size() {
+        let attr = InodeAttr::new_file(9, 1, 501, 20, 0o640);
+
+        let file_attr = to_fuse_attr(&attr, 501, 20);
+
+        assert_eq!(file_attr.blksize, crate::MACOS_FUSE_IOSIZE_BYTES);
     }
 
     #[test]

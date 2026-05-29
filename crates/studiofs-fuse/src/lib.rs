@@ -41,6 +41,9 @@ enum MacosFuseCachePolicy {
 }
 
 #[cfg(target_os = "macos")]
+const MACOS_FUSE_IOSIZE_BYTES: u32 = 64 * 1024;
+
+#[cfg(target_os = "macos")]
 impl MacosFuseCachePolicy {
     fn from_env() -> Self {
         match std::env::var("STUDIOFS_MACOS_FUSE_CACHE_POLICY") {
@@ -145,7 +148,9 @@ fn build_mount_options_inner(
         } else {
             options.push(fuser::MountOption::CUSTOM("novncache".into()));
             options.push(fuser::MountOption::CUSTOM("daemon_timeout=60".into()));
-            options.push(fuser::MountOption::CUSTOM("iosize=1048576".into()));
+            options.push(fuser::MountOption::CUSTOM(format!(
+                "iosize={MACOS_FUSE_IOSIZE_BYTES}"
+            )));
         }
         options.push(fuser::MountOption::CUSTOM("sparse".into()));
     }
@@ -748,7 +753,7 @@ mod tests {
             |opt| matches!(opt, fuser::MountOption::CUSTOM(custom) if custom == "daemon_timeout=60")
         ));
         assert!(options.iter().any(
-            |opt| matches!(opt, fuser::MountOption::CUSTOM(custom) if custom == "iosize=1048576")
+            |opt| matches!(opt, fuser::MountOption::CUSTOM(custom) if custom == "iosize=65536")
         ));
     }
 

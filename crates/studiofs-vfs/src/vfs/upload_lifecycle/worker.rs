@@ -978,28 +978,6 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
             );
             return Ok(Some(hot_payload));
         }
-        if let Some(staged_payload) = self.vfs.upload_stage_get_async(object_id).await? {
-            self.vfs
-                .state
-                .upload
-                .upload_local_payload_reads
-                .fetch_add(1, Ordering::Relaxed);
-            self.vfs
-                .state
-                .upload
-                .upload_local_payload_read_bytes
-                .fetch_add(staged_payload.len() as u64, Ordering::Relaxed);
-            self.vfs.debug_write_probe(
-                "H5",
-                "crates/studiofs-vfs/src/vfs/upload_lifecycle/worker.rs:752",
-                "upload read served from upload hardlink",
-                serde_json::json!({
-                    "object_id": object_id,
-                    "buffer_bytes": staged_payload.len(),
-                }),
-            );
-            return Ok(Some(staged_payload));
-        }
         let foreground_active = self
             .vfs
             .state
@@ -1022,6 +1000,46 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
                 message: error.to_string(),
             })?;
         let wait_ns = wait_started.elapsed().as_nanos().clamp(0, u64::MAX as u128) as u64;
+        let staged_payload = self.vfs.upload_stage_get_async(object_id).await?;
+        if let Some(staged_payload) = staged_payload {
+            let pacing_delay =
+                foreground_upload_reread_pacing_delay(foreground_active, staged_payload.len());
+            if !pacing_delay.is_zero() {
+                self.vfs.debug_write_probe(
+                    "H5",
+                    "crates/studiofs-vfs/src/vfs/upload_lifecycle/worker.rs:752",
+                    "upload staged read paced under foreground reads",
+                    serde_json::json!({
+                        "object_id": object_id,
+                        "staged_bytes": staged_payload.len(),
+                        "pacing_delay_ms": pacing_delay.as_millis().min(u128::from(u64::MAX)) as u64,
+                        "slot_cost": upload_io_cost,
+                    }),
+                );
+                tokio::time::sleep(pacing_delay).await;
+            }
+            drop(upload_io_permit);
+            self.vfs
+                .state
+                .upload
+                .upload_local_payload_reads
+                .fetch_add(1, Ordering::Relaxed);
+            self.vfs
+                .state
+                .upload
+                .upload_local_payload_read_bytes
+                .fetch_add(staged_payload.len() as u64, Ordering::Relaxed);
+            self.vfs.debug_write_probe(
+                "H5",
+                "crates/studiofs-vfs/src/vfs/upload_lifecycle/worker.rs:752",
+                "upload read served from upload hardlink",
+                serde_json::json!({
+                    "object_id": object_id,
+                    "buffer_bytes": staged_payload.len(),
+                }),
+            );
+            return Ok(Some(staged_payload));
+        }
         let read_started = Instant::now();
         let read_result = self
             .vfs

@@ -204,7 +204,11 @@ impl StudioVfs {
             pending_content_epoch,
             pending_upload_index,
         )?;
-        if !self.pending_live_extent_matches_current_slice_graph(ino, block_index, extent) {
+        let live_pending_upload = pending_content_epoch == Some(extent.content_epoch)
+            && self.inode_has_pending_uploads(ino);
+        if !live_pending_upload
+            && !self.pending_live_extent_matches_current_slice_graph(ino, block_index, extent)
+        {
             return None;
         }
         Some(PendingOverlayBlockSource::Extent(extent.object_id))

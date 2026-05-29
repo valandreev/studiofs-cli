@@ -84,6 +84,8 @@ pub enum InfraMode {
     Disabled,
     /// Infra stack is managed via `docker compose`.
     Compose,
+    /// Infra stack is provided by repository `.env` / process environment.
+    Env,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

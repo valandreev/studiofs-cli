@@ -175,12 +175,13 @@ Current signature includes additional policy controls:
 | `fsname` | `"studiofs"` |
 | `auto_unmount` | Yes |
 | `allow_other` | macOS: yes. Linux: opt-in via `STUDIOFS_FUSE_ALLOW_OTHER=1` |
-| Kernel `max_write` | `16777216` bytes by default. Override: `STUDIOFS_FUSE_MAX_WRITE_BYTES` in `Filesystem::init()` |
+| Kernel `max_write` | `131072` bytes on macOS, `16777216` bytes on Linux by default. Override: `STUDIOFS_FUSE_MAX_WRITE_BYTES` in `Filesystem::init()` |
 | Kernel `max_readahead` | `16777216` bytes on Linux, `1048576` bytes on macOS by default. Override: `STUDIOFS_FUSE_MAX_READAHEAD_BYTES` in `Filesystem::init()` |
 | Linux: `async_dio` capability | Disabled by default. Opt in with `STUDIOFS_FUSE_ASYNC_DIO=1`; requested only when the kernel advertises `FUSE_ASYNC_DIO` |
 | macOS: `volname` | `"StudioFS"` |
 | macOS: `local` | Yes |
 | macOS: cache policy | `winfsp` target policy by default. Set `STUDIOFS_MACOS_FUSE_CACHE_POLICY=direct` for strict rollback mode |
+| macOS: validated macFUSE | 5.2.0 |
 
 `STUDIOFS_FUSE_MAX_WRITE_BYTES` and `STUDIOFS_FUSE_MAX_READAHEAD_BYTES` are the primary FUSE bridge throughput controls for local payload I/O.
 On Linux, `allow_other` also requires `user_allow_other` to be enabled in
@@ -207,8 +208,12 @@ turn on global direct I/O and does not change the buffered read cache policy.
 
 macOS FUSE defaults to the WinFSP/JuiceFS-style cache policy. The mount keeps
 `local`, `sparse`, and `volname`, adds `novncache`, `daemon_timeout=60`, and an
-`iosize` matching the default macOS readahead size, and does not globally mount
+`iosize=65536` matching JuiceFS's Darwin mount profile, and does not globally mount
 with `direct_io` or `nolocalcaches`.
+For macFUSE 5.2.0, regular file attributes must report the same preferred I/O
+size (`st_blksize` / FUSE `blksize`) as the mount `iosize`; advertising the old
+512-byte value causes macFUSE to split large sequential reads and writes into
+small callbacks even when the mount-level `iosize` is larger.
 
 Regular read-only file opens return `FOPEN_KEEP_CACHE` so safe media and
 sequential-read workloads can use the kernel cache/readahead path. Write-capable

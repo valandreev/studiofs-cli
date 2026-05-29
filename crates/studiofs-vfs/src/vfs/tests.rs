@@ -10297,6 +10297,31 @@ fn write_path_observability_reports_fetch_counters() {
 }
 
 #[test]
+fn write_path_observability_reports_fuse_callback_and_vfs_read_counters() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "write-path-observability-fuse-callbacks");
+
+    vfs.note_vfs_read_call(4 * 1024);
+    vfs.record_fuse_read_callback(4 * 1024, Duration::from_millis(3), false);
+    vfs.record_fuse_write_callback(128 * 1024, Duration::from_millis(5), true);
+
+    let snapshot = vfs.write_path_observability_snapshot();
+
+    assert_eq!(snapshot.vfs_read_path.calls, 1);
+    assert_eq!(snapshot.vfs_read_path.requested_bytes, 4 * 1024);
+    assert_eq!(snapshot.fuse_callbacks.read.calls, 1);
+    assert_eq!(snapshot.fuse_callbacks.read.bytes, 4 * 1024);
+    assert_eq!(snapshot.fuse_callbacks.read.errors, 0);
+    assert_eq!(snapshot.fuse_callbacks.write.calls, 1);
+    assert_eq!(snapshot.fuse_callbacks.write.bytes, 128 * 1024);
+    assert_eq!(snapshot.fuse_callbacks.write.errors, 1);
+    assert!(
+        snapshot.fuse_callbacks.write.avg_ms >= snapshot.fuse_callbacks.read.avg_ms,
+        "write callback latency should reflect the longer recorded duration"
+    );
+}
+
+#[test]
 fn write_path_observability_reports_winfsp_write_callback_breakdown() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "write-path-observability-winfsp-breakdown");

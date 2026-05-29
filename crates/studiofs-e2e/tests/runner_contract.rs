@@ -448,6 +448,18 @@ fn scenario_list_appends_symlink_attribute_after_invalidation_dropout() {
 }
 
 #[test]
+fn scenario_list_appends_performance_probe_after_symlink_attribute() {
+    let scenarios = studiofs_e2e::scenario::available_scenarios();
+    let names = scenarios
+        .iter()
+        .map(|scenario| scenario.name)
+        .collect::<Vec<_>>();
+
+    assert_eq!(names[22], "mounted-symlink-attribute-convergence");
+    assert_eq!(names[23], "mounted-performance-probe");
+}
+
+#[test]
 fn symlink_attribute_disabled_run_writes_reproducible_artifacts() {
     let temp = tempdir().unwrap();
     let request = RunRequest {
@@ -965,6 +977,7 @@ fn run_creates_per_run_sandbox_manifest_report_and_validation_artifact() {
     assert_eq!(report["environment"]["run_id"], "runner-contract-run");
     assert!(report["environment"]["studiofs_bin"].is_null());
     assert!(report["environment"]["compose_project"].is_null());
+    assert!(report["environment"]["macfuse_version"].is_null());
     assert_eq!(
         report["environment"]["client_roots"]
             .as_array()

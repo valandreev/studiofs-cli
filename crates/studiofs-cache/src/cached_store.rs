@@ -813,12 +813,19 @@ impl CachedStore {
 
     /// Returns a snapshot of currently pending uploads.
     pub fn snapshot_pending_uploads(&self) -> Vec<PendingUpload> {
+        self.metrics.upload_queue.record_snapshot_pending();
         self.upload_queue.snapshot_pending()
     }
 
     /// Returns whether the upload queue has any pending uploads for `ino`.
     pub fn has_pending_uploads_for_ino(&self, ino: u64) -> bool {
         self.upload_queue.has_pending_for_ino(ino)
+    }
+
+    /// Returns whether the upload queue has a newer pending upload for `ino`.
+    pub fn has_pending_uploads_for_ino_newer_than(&self, ino: u64, content_epoch: u64) -> bool {
+        self.upload_queue
+            .has_pending_for_ino_newer_than(ino, content_epoch)
     }
 
     /// Flushes the upload queue journal to disk.

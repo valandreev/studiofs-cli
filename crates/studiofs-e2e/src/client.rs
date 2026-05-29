@@ -1,5 +1,6 @@
 //! Multi-client process controller for mounted E2E scenarios.
 
+use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write as _};
 #[cfg(target_os = "macos")]
@@ -88,6 +89,43 @@ impl ClientControllerConfig {
             Some(scenario_name),
             ports,
         )
+    }
+
+    /// Build a controller configuration from repository `.env` / process environment.
+    pub fn from_external_env_for_scenario(
+        studiofs_bin: PathBuf,
+        sandbox: PathBuf,
+        run_id: &str,
+        seed: u64,
+        scenario_name: &str,
+    ) -> Result<Self, ClientControllerError> {
+        let env_file = load_dotenv_values()?;
+        let sanitized_run_id = sanitize_dns_label(run_id);
+        let scenario = sanitize_dns_label(scenario_name);
+        let volume_stem = prefixed_dns_name(
+            E2E_VOLUME_PREFIX,
+            &format!("{sanitized_run_id}-{seed}-{scenario}"),
+            S3_BUCKET_NAME_MAX_CHARS,
+        );
+        Ok(Self {
+            studiofs_bin,
+            sandbox,
+            volume_name: volume_stem,
+            meta_dsn: required_external_env(&env_file, "STUDIOFS_TEST_PG_DSN")?,
+            s3: S3Config {
+                endpoint: required_external_env(&env_file, "STUDIOFS_S3_ENDPOINT")?,
+                bucket: required_external_env(&env_file, "STUDIOFS_S3_BUCKET")?,
+                access_key: required_external_env(&env_file, "STUDIOFS_S3_ACCESS_KEY")?,
+                secret_key: required_external_env(&env_file, "STUDIOFS_S3_SECRET_KEY")?,
+                region: optional_external_env(&env_file, "STUDIOFS_S3_REGION")
+                    .unwrap_or_else(|| "us-east-1".to_string()),
+            },
+            mount_ready_timeout: Duration::from_secs(30),
+            mount_exit_timeout: Duration::from_secs(60),
+            poll_interval: Duration::from_millis(100),
+            mount_points: Vec::new(),
+            client_env_overrides: BTreeMap::new(),
+        })
     }
 
     fn from_compose_services_inner(
@@ -548,6 +586,12 @@ pub enum ClientControllerError {
     #[error("Docker compose service port is missing for {0}")]
     MissingServicePort(
         /// Service name without an available port binding.
+        String,
+    ),
+    /// Required environment-backed infrastructure value is missing.
+    #[error("required external E2E env var is missing or empty: {0}")]
+    MissingExternalEnvVar(
+        /// Environment variable key.
         String,
     ),
     /// Spawned command failed with non-zero status.
@@ -1333,6 +1377,97 @@ fn ensure_success(
             stderr: diagnostic_excerpt(&output.stderr),
         })
     }
+}
+
+fn load_dotenv_values() -> Result<BTreeMap<String, String>, ClientControllerError> {
+    let Some(path) = find_dotenv_path()? else {
+        return Ok(BTreeMap::new());
+    };
+    let text = fs::read_to_string(path)?;
+    let mut values = BTreeMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        values.insert(key.to_string(), normalize_external_env_value(value));
+    }
+    Ok(values)
+}
+
+fn find_dotenv_path() -> Result<Option<PathBuf>, ClientControllerError> {
+    let mut current = env::current_dir()?;
+    loop {
+        let candidate = current.join(".env");
+        if candidate.exists() {
+            return Ok(Some(candidate));
+        }
+        if !current.pop() {
+            return Ok(None);
+        }
+    }
+}
+
+fn strip_dotenv_quotes(value: &str) -> &str {
+    if value.len() >= 2 {
+        let bytes = value.as_bytes();
+        if (bytes[0] == b'"' && bytes[value.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[value.len() - 1] == b'\'')
+        {
+            return &value[1..value.len() - 1];
+        }
+    }
+    value
+}
+
+fn normalize_external_env_value(value: &str) -> String {
+    let value = strip_dotenv_quotes(value.trim());
+    if value.starts_with('<') && value.ends_with('>') && !value.contains(' ') {
+        return value[1..value.len() - 1].to_string();
+    }
+    value
+        .split_whitespace()
+        .map(|token| {
+            if let Some((key, inner)) = token
+                .split_once("=<")
+                .and_then(|(key, rest)| rest.strip_suffix('>').map(|inner| (key, inner)))
+            {
+                format!("{key}={inner}")
+            } else {
+                token.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn optional_external_env(values: &BTreeMap<String, String>, key: &str) -> Option<String> {
+    env::var(key)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| normalize_external_env_value(&value))
+        .or_else(|| {
+            values
+                .get(key)
+                .filter(|value| !value.trim().is_empty())
+                .cloned()
+        })
+}
+
+fn required_external_env(
+    values: &BTreeMap<String, String>,
+    key: &str,
+) -> Result<String, ClientControllerError> {
+    optional_external_env(values, key)
+        .ok_or_else(|| ClientControllerError::MissingExternalEnvVar(key.to_string()))
 }
 
 /// Returns the base artifact directory for a client.
@@ -2248,6 +2383,18 @@ mod tests {
         assert!(env.iter().any(|(key, value)| {
             key == "STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS" && value == "1000"
         }));
+    }
+
+    #[test]
+    fn external_env_normalization_strips_angle_wrapped_dotenv_values() {
+        assert_eq!(
+            normalize_external_env_value("host=<100.123.245.11> port=5432 user=<studiofs>"),
+            "host=100.123.245.11 port=5432 user=studiofs"
+        );
+        assert_eq!(
+            normalize_external_env_value("\"<https://s3.example.test>\""),
+            "https://s3.example.test"
+        );
     }
 
     #[test]

@@ -118,6 +118,7 @@ impl StudioVfs {
                 "debug target read_into_impl started"
             );
         }
+        self.note_vfs_read_call(buffer.len());
         self.enforce_access_async(ino, AccessLevel::ReadOnly)
             .await?;
         if let Some(attr) = self.ignored_entry_attr(ino) {
