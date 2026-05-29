@@ -51,7 +51,7 @@ const FUSE_AUTO_INVAL_DATA_FLAG: u64 = 1 << 12;
 fn fuse_open_reply_flags(open_flags: OpenFlags) -> u32 {
     #[cfg(not(target_os = "macos"))]
     {
-        if matches!(open_flags, OpenFlags::RDONLY) {
+        if !open_flags.contains(OpenFlags::WRONLY) && !open_flags.contains(OpenFlags::RDWR) {
             return fuser::consts::FOPEN_KEEP_CACHE;
         }
         0
@@ -105,16 +105,21 @@ fn parse_bridge_u32_env(key: &str, default: u32) -> u32 {
 }
 
 #[cfg(target_os = "linux")]
-fn parse_bridge_bool_env(raw: Option<&str>) -> bool {
-    matches!(
-        raw.map(str::trim),
-        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
-    )
+fn parse_bridge_bool_env(key: &str) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|raw| {
+            matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 #[cfg(target_os = "linux")]
 fn should_request_fuse_async_dio() -> bool {
-    parse_bridge_bool_env(std::env::var("STUDIOFS_FUSE_ASYNC_DIO").ok().as_deref())
+    parse_bridge_bool_env("STUDIOFS_FUSE_ASYNC_DIO")
 }
 
 fn os_str_bytes(name: &OsStr) -> &[u8] {
@@ -2025,6 +2030,10 @@ mod tests {
                 fuse_open_reply_flags(OpenFlags::RDONLY),
                 fuser::consts::FOPEN_KEEP_CACHE
             );
+            assert_eq!(
+                fuse_open_reply_flags(OpenFlags::RDONLY | OpenFlags::APPEND),
+                fuser::consts::FOPEN_KEEP_CACHE
+            );
             assert_eq!(fuse_open_reply_flags(OpenFlags::WRONLY), 0);
             assert_eq!(fuse_open_reply_flags(OpenFlags::RDWR), 0);
         }
@@ -2049,13 +2058,34 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn fuse_async_dio_env_is_opt_in_only() {
-        assert!(!parse_bridge_bool_env(None));
-        assert!(!parse_bridge_bool_env(Some("0")));
-        assert!(!parse_bridge_bool_env(Some("false")));
-        assert!(parse_bridge_bool_env(Some("1")));
-        assert!(parse_bridge_bool_env(Some("true")));
-        assert!(parse_bridge_bool_env(Some("yes")));
-        assert!(parse_bridge_bool_env(Some("on")));
+        const KEY: &str = "STUDIOFS_TEST_FUSE_ASYNC_DIO_BOOL";
+        // SAFETY: This unit test owns a unique env var name and restores it
+        // before returning; production code never relies on this key.
+        unsafe {
+            std::env::remove_var(KEY);
+        }
+        assert!(!parse_bridge_bool_env(KEY));
+
+        for false_value in ["0", "false", "off", ""] {
+            // SAFETY: See the safety note above; this key is test-local.
+            unsafe {
+                std::env::set_var(KEY, false_value);
+            }
+            assert!(!parse_bridge_bool_env(KEY));
+        }
+
+        for true_value in ["1", "true", "True", "TRUE", "yes", "Yes", "on", "On"] {
+            // SAFETY: See the safety note above; this key is test-local.
+            unsafe {
+                std::env::set_var(KEY, true_value);
+            }
+            assert!(parse_bridge_bool_env(KEY));
+        }
+
+        // SAFETY: See the safety note above; this restores the test-local key.
+        unsafe {
+            std::env::remove_var(KEY);
+        }
     }
 
     #[test]
