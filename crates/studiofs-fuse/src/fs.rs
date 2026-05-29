@@ -105,7 +105,6 @@ fn parse_bridge_u32_env(key: &str, default: u32) -> u32 {
     }
 }
 
-#[cfg(target_os = "linux")]
 fn parse_bridge_bool_env_value(raw: &str) -> bool {
     let trimmed = raw.trim();
     trimmed == "1"
@@ -1903,7 +1902,6 @@ impl KernelInvalidator for FuseKernelInvalidator {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(target_os = "linux")]
     use super::parse_bridge_bool_env_value;
     use super::{
         DEFAULT_FUSE_MAX_READAHEAD_BYTES, StudioFuseFs, TTL, fuse_open_reply_flags,
@@ -2057,7 +2055,6 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn fuse_async_dio_env_is_opt_in_only() {
         for false_value in ["0", "false", "off", ""] {
