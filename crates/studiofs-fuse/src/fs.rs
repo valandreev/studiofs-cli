@@ -46,22 +46,40 @@ const DEFAULT_FUSE_MAX_READAHEAD_BYTES: u32 = 16 * 1024 * 1024;
 #[cfg(target_os = "macos")]
 const FUSE_AUTO_INVAL_DATA_FLAG: u64 = 1 << 12;
 
-fn fuse_open_reply_flags(_open_flags: OpenFlags) -> u32 {
+fn fuse_open_reply_flags(open_flags: OpenFlags, trunc: bool) -> u32 {
+    #[cfg(target_os = "macos")]
+    {
+        fuse_open_reply_flags_with_macos_cache_policy(
+            open_flags,
+            trunc,
+            super::MacosFuseCachePolicy::from_env(),
+        )
+    }
+
     #[cfg(not(target_os = "macos"))]
     {
-        if !_open_flags.contains(OpenFlags::WRONLY) && !_open_flags.contains(OpenFlags::RDWR) {
+        if !open_flags.contains(OpenFlags::WRONLY) && !open_flags.contains(OpenFlags::RDWR) {
             fuser::consts::FOPEN_KEEP_CACHE
         } else {
             0
         }
     }
+}
 
-    #[cfg(target_os = "macos")]
+#[cfg(target_os = "macos")]
+fn fuse_open_reply_flags_with_macos_cache_policy(
+    open_flags: OpenFlags,
+    trunc: bool,
+    macos_cache_policy: super::MacosFuseCachePolicy,
+) -> u32 {
+    if macos_cache_policy == super::MacosFuseCachePolicy::Direct
+        || open_flags.contains(OpenFlags::WRONLY)
+        || open_flags.contains(OpenFlags::RDWR)
+        || trunc
     {
-        // Same family of fix as the WinFSP cache bypass, but stricter for
-        // macFUSE: stale kernel EOF can survive sparse size changes even on
-        // read-only handles.
         fuser::consts::FOPEN_DIRECT_IO
+    } else {
+        fuser::consts::FOPEN_KEEP_CACHE
     }
 }
 
@@ -103,6 +121,7 @@ fn parse_bridge_u32_env(key: &str, default: u32) -> u32 {
     }
 }
 
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn parse_bridge_bool_env_value(raw: &str) -> bool {
     let trimmed = raw.trim();
     trimmed == "1"
@@ -629,10 +648,25 @@ impl Filesystem for StudioFuseFs {
         }
 
         #[cfg(target_os = "macos")]
+        debug!(
+            max_write = requested_max_write,
+            max_readahead = requested_readahead,
+            macos_cache_policy = ?super::MacosFuseCachePolicy::from_env(),
+            macos_iosize = DEFAULT_FUSE_MAX_READAHEAD_BYTES,
+            "configured FUSE bridge I/O policy"
+        );
+        #[cfg(not(target_os = "macos"))]
+        debug!(
+            max_write = requested_max_write,
+            max_readahead = requested_readahead,
+            "configured FUSE bridge I/O policy"
+        );
+
+        #[cfg(target_os = "macos")]
         if let Err(unsupported) = config.add_capabilities(FUSE_AUTO_INVAL_DATA_FLAG) {
             warn!(
                 unsupported,
-                "macFUSE did not advertise FUSE_AUTO_INVAL_DATA; direct I/O remains enabled"
+                "macFUSE did not advertise FUSE_AUTO_INVAL_DATA; using explicit invalidation fallback"
             );
         }
 
@@ -823,7 +857,7 @@ impl Filesystem for StudioFuseFs {
                             &to_fuse_attr(&attr, self.mount_uid, self.mount_gid),
                             0,
                             fh,
-                            fuse_open_reply_flags(open_flags),
+                            fuse_open_reply_flags(open_flags, false),
                         );
                     }
                     Err(e) => {
@@ -1090,7 +1124,21 @@ impl Filesystem for StudioFuseFs {
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
         let (open_flags, trunc) = posix_flags_to_open_flags(flags);
         match self.vfs.open_file(ino, open_flags, trunc) {
-            Ok(fh) => reply.opened(fh, fuse_open_reply_flags(open_flags)),
+            Ok(fh) => {
+                let reply_flags = fuse_open_reply_flags(open_flags, trunc);
+                debug!(
+                    ino,
+                    fh,
+                    posix_flags = flags,
+                    ?open_flags,
+                    trunc,
+                    reply_flags,
+                    direct_io = reply_flags & fuser::consts::FOPEN_DIRECT_IO != 0,
+                    keep_cache = reply_flags & fuser::consts::FOPEN_KEEP_CACHE != 0,
+                    "selected FUSE open cache policy"
+                );
+                reply.opened(fh, reply_flags);
+            }
             Err(e) => {
                 if matches!(e, VfsError::WouldBlock | VfsError::RemoteContentPending) {
                     debug!("open({ino}) -> {e}");
@@ -1928,20 +1976,22 @@ impl KernelInvalidator for FuseKernelInvalidator {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(target_os = "macos"))]
+    use super::fuse_open_reply_flags;
     use super::parse_bridge_bool_env_value;
     use super::{
-        DEFAULT_FUSE_MAX_READAHEAD_BYTES, StudioFuseFs, TTL, fuse_open_reply_flags,
-        fuse_write_local_sync_policy, is_expected_macos_trashes_mkdir_exists,
-        is_missing_xattr_error, missing_xattr_errno, normalize_unix_mode,
-        posix_flags_to_open_flags, should_log_invalidation_error, to_fuse_attr, vfs_err_to_errno,
+        DEFAULT_FUSE_MAX_READAHEAD_BYTES, StudioFuseFs, TTL, fuse_write_local_sync_policy,
+        is_expected_macos_trashes_mkdir_exists, is_missing_xattr_error, missing_xattr_errno,
+        normalize_unix_mode, posix_flags_to_open_flags, should_log_invalidation_error,
+        to_fuse_attr, vfs_err_to_errno,
     };
     #[cfg(target_os = "macos")]
     use studiofs_meta::engine::{XATTR_CREATE_FLAG, XATTR_REPLACE_FLAG};
 
     #[cfg(target_os = "macos")]
     use super::{
-        macos_exchange_or_rename, merge_xattr_write, normalize_macos_readdir_name,
-        normalize_macos_xattr_flags, recover_macos_normalized_name,
+        fuse_open_reply_flags_with_macos_cache_policy, macos_exchange_or_rename, merge_xattr_write,
+        normalize_macos_readdir_name, normalize_macos_xattr_flags, recover_macos_normalized_name,
         recover_macos_truncated_rename_source, resolve_macos_mutation_target_name,
         resolve_macos_namespace_name,
     };
@@ -2038,30 +2088,58 @@ mod tests {
         #[cfg(target_os = "macos")]
         {
             assert_eq!(
-                fuse_open_reply_flags(OpenFlags::RDONLY),
+                fuse_open_reply_flags_with_macos_cache_policy(
+                    OpenFlags::RDONLY,
+                    false,
+                    crate::MacosFuseCachePolicy::Winfsp,
+                ),
+                fuser::consts::FOPEN_KEEP_CACHE
+            );
+            assert_eq!(
+                fuse_open_reply_flags_with_macos_cache_policy(
+                    OpenFlags::WRONLY,
+                    false,
+                    crate::MacosFuseCachePolicy::Winfsp,
+                ),
                 fuser::consts::FOPEN_DIRECT_IO
             );
             assert_eq!(
-                fuse_open_reply_flags(OpenFlags::WRONLY),
+                fuse_open_reply_flags_with_macos_cache_policy(
+                    OpenFlags::RDWR,
+                    false,
+                    crate::MacosFuseCachePolicy::Winfsp,
+                ),
                 fuser::consts::FOPEN_DIRECT_IO
             );
             assert_eq!(
-                fuse_open_reply_flags(OpenFlags::RDWR),
+                fuse_open_reply_flags_with_macos_cache_policy(
+                    OpenFlags::RDONLY,
+                    true,
+                    crate::MacosFuseCachePolicy::Winfsp,
+                ),
+                fuser::consts::FOPEN_DIRECT_IO
+            );
+            assert_eq!(
+                fuse_open_reply_flags_with_macos_cache_policy(
+                    OpenFlags::RDONLY,
+                    false,
+                    crate::MacosFuseCachePolicy::Direct,
+                ),
                 fuser::consts::FOPEN_DIRECT_IO
             );
         }
         #[cfg(not(target_os = "macos"))]
         {
             assert_eq!(
-                fuse_open_reply_flags(OpenFlags::RDONLY),
+                fuse_open_reply_flags(OpenFlags::RDONLY, false),
                 fuser::consts::FOPEN_KEEP_CACHE
             );
             assert_eq!(
-                fuse_open_reply_flags(OpenFlags::RDONLY | OpenFlags::APPEND),
+                fuse_open_reply_flags(OpenFlags::RDONLY | OpenFlags::APPEND, false),
                 fuser::consts::FOPEN_KEEP_CACHE
             );
-            assert_eq!(fuse_open_reply_flags(OpenFlags::WRONLY), 0);
-            assert_eq!(fuse_open_reply_flags(OpenFlags::RDWR), 0);
+            assert_eq!(fuse_open_reply_flags(OpenFlags::WRONLY, false), 0);
+            assert_eq!(fuse_open_reply_flags(OpenFlags::RDWR, false), 0);
         }
     }
 
