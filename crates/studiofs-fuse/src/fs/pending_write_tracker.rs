@@ -146,13 +146,30 @@ impl PendingWriteTracker {
     }
 
     pub(super) fn handle_barrier(&self, ino: Ino, fh: FileHandle) -> PendingWriteBarrier {
-        self.barrier_for_targets(smallvec![self.last_registered_target((ino, fh))])
+        let shard_index = SharedTracker::shard_index(ino);
+        let shard = &self.shared.shards[shard_index];
+        let mut state = shard.state.lock().expect("pending write tracker poisoned");
+        let (sequence, generation) = state
+            .inodes
+            .get(&ino)
+            .and_then(|handles| handles.get(&fh))
+            .map_or((0, state.current_generation(ino)), |handle| {
+                (handle.next_sequence.saturating_sub(1), handle.generation)
+            });
+        state.increment_barrier_count(ino, generation);
+        drop(state);
+        PendingWriteBarrier {
+            shared: Arc::clone(&self.shared),
+            shard_index,
+            targets: smallvec![((ino, fh), sequence, generation)],
+        }
     }
 
     pub(super) fn inode_barrier(&self, ino: Ino) -> PendingWriteBarrier {
-        let shard = self.shared.shard_for_inode(ino);
-        let state = shard.state.lock().expect("pending write tracker poisoned");
-        let targets = state
+        let shard_index = SharedTracker::shard_index(ino);
+        let shard = &self.shared.shards[shard_index];
+        let mut state = shard.state.lock().expect("pending write tracker poisoned");
+        let targets: SmallVec<[BarrierTarget; 1]> = state
             .inodes
             .get(&ino)
             .into_iter()
@@ -166,8 +183,15 @@ impl PendingWriteTracker {
                 })
             })
             .collect();
+        for (key, _, generation) in &targets {
+            state.increment_barrier_count(key.0, *generation);
+        }
         drop(state);
-        self.barrier_for_targets(targets)
+        PendingWriteBarrier {
+            shared: Arc::clone(&self.shared),
+            shard_index,
+            targets,
+        }
     }
 
     pub(super) fn begin_close(
@@ -175,19 +199,27 @@ impl PendingWriteTracker {
         ino: Ino,
         fh: FileHandle,
     ) -> Result<PendingWriteBarrier, WriteRegistrationError> {
-        let shard = self.shared.shard_for_inode(ino);
+        let shard_index = SharedTracker::shard_index(ino);
+        let shard = &self.shared.shards[shard_index];
         let mut state = shard.state.lock().expect("pending write tracker poisoned");
         let generation = state.inode_generation(ino);
-        let handle = state.inodes.entry(ino).or_default().entry(fh).or_default();
-        handle.generation = generation;
-        match handle.lifecycle {
-            HandleLifecycle::Open => handle.lifecycle = HandleLifecycle::Closing,
-            HandleLifecycle::Closing => return Err(WriteRegistrationError::HandleClosing),
-            HandleLifecycle::Closed => return Err(WriteRegistrationError::HandleClosed),
-        }
-        let target = handle.next_sequence.saturating_sub(1);
+        let target = {
+            let handle = state.inodes.entry(ino).or_default().entry(fh).or_default();
+            handle.generation = generation;
+            match handle.lifecycle {
+                HandleLifecycle::Open => handle.lifecycle = HandleLifecycle::Closing,
+                HandleLifecycle::Closing => return Err(WriteRegistrationError::HandleClosing),
+                HandleLifecycle::Closed => return Err(WriteRegistrationError::HandleClosed),
+            }
+            handle.next_sequence.saturating_sub(1)
+        };
+        state.increment_barrier_count(ino, generation);
         drop(state);
-        Ok(self.barrier_for_targets(smallvec![((ino, fh), target, generation)]))
+        Ok(PendingWriteBarrier {
+            shared: Arc::clone(&self.shared),
+            shard_index,
+            targets: smallvec![((ino, fh), target, generation)],
+        })
     }
 
     pub(super) fn finish_close(&self, ino: Ino, fh: FileHandle) {
@@ -206,37 +238,6 @@ impl PendingWriteTracker {
         }
         state.remove_empty_inode(ino);
         shard.writes_changed.notify_all();
-    }
-
-    fn last_registered_target(&self, key: HandleKey) -> BarrierTarget {
-        let shard = self.shared.shard_for_inode(key.0);
-        let state = shard.state.lock().expect("pending write tracker poisoned");
-        let (sequence, generation) = state
-            .inodes
-            .get(&key.0)
-            .and_then(|handles| handles.get(&key.1))
-            .map_or((0, state.current_generation(key.0)), |handle| {
-                (handle.next_sequence.saturating_sub(1), handle.generation)
-            });
-        (key, sequence, generation)
-    }
-
-    fn barrier_for_targets(&self, targets: SmallVec<[BarrierTarget; 1]>) -> PendingWriteBarrier {
-        let shard_index = targets
-            .first()
-            .map_or(0, |(key, _, _)| SharedTracker::shard_index(key.0));
-        {
-            let shard = &self.shared.shards[shard_index];
-            let mut state = shard.state.lock().expect("pending write tracker poisoned");
-            for (key, _, generation) in &targets {
-                state.increment_barrier_count(key.0, *generation);
-            }
-        }
-        PendingWriteBarrier {
-            shared: Arc::clone(&self.shared),
-            shard_index,
-            targets,
-        }
     }
 }
 
@@ -367,8 +368,7 @@ impl TrackerState {
     }
 
     fn inode_generation(&mut self, ino: Ino) -> InodeGeneration {
-        self.inode_generations.entry(ino).or_insert(0);
-        self.current_generation(ino)
+        *self.inode_generations.entry(ino).or_insert(0)
     }
 
     fn remove_handle(&mut self, key: HandleKey) {
@@ -426,17 +426,26 @@ impl TrackerState {
     }
 
     fn decrement_barrier_count(&mut self, ino: Ino, generation: InodeGeneration) {
-        if let Some(counts) = self.barrier_counts.get_mut(&ino)
-            && let Some(count) = counts.get_mut(&generation)
-        {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                counts.remove(&generation);
-                if counts.is_empty() {
-                    self.barrier_counts.remove(&ino);
+        let remove_ino = match self.barrier_counts.get_mut(&ino) {
+            Some(counts) => match counts.get_mut(&generation) {
+                Some(count) => {
+                    let mut remove_ino = false;
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        counts.remove(&generation);
+                        remove_ino = counts.is_empty();
+                    }
+                    Some(remove_ino)
                 }
-                self.remove_retired_inode_error((ino, generation));
-            }
+                None => None,
+            },
+            None => None,
+        };
+        if remove_ino.unwrap_or(false) {
+            self.barrier_counts.remove(&ino);
+        }
+        if remove_ino.is_some() {
+            self.remove_retired_inode_error((ino, generation));
         }
     }
 
