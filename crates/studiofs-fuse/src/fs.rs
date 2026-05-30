@@ -280,6 +280,36 @@ trait FuseWriteReply {
     fn error(self, errno: i32);
 }
 
+struct FuseWriteReplyGuard<R: FuseWriteReply> {
+    reply: Option<R>,
+}
+
+impl<R: FuseWriteReply> FuseWriteReplyGuard<R> {
+    fn new(reply: R) -> Self {
+        Self { reply: Some(reply) }
+    }
+
+    fn written(mut self, size: u32) {
+        if let Some(reply) = self.reply.take() {
+            reply.written(size);
+        }
+    }
+
+    fn error(mut self, errno: i32) {
+        if let Some(reply) = self.reply.take() {
+            reply.error(errno);
+        }
+    }
+}
+
+impl<R: FuseWriteReply> Drop for FuseWriteReplyGuard<R> {
+    fn drop(&mut self) {
+        if let Some(reply) = self.reply.take() {
+            reply.error(libc::EIO);
+        }
+    }
+}
+
 impl FuseWriteReply for ReplyWrite {
     fn written(self, size: u32) {
         self.written(size);
@@ -291,7 +321,7 @@ impl FuseWriteReply for ReplyWrite {
 }
 
 fn complete_fuse_write_reply<R>(
-    reply: R,
+    reply: FuseWriteReplyGuard<R>,
     result: Result<u32, VfsError>,
     registration: &PendingWriteRegistration,
     ino: u64,
@@ -1486,13 +1516,10 @@ impl Filesystem for StudioFuseFs {
             };
             let vfs = Arc::clone(&self.vfs);
             let local_sync_policy = fuse_write_local_sync_policy(flags);
+            let reply = FuseWriteReplyGuard::new(reply);
             self.rt.spawn(async move {
                 let turn = registration.turn_waiter();
-                if let Err(e) = tokio::task::spawn_blocking(move || turn.wait()).await {
-                    error!("async FUSE write turn wait task failed: {e}");
-                    registration.complete(PendingWriteCompletion::TaskFailed);
-                    return;
-                }
+                turn.wait().await;
                 let result = vfs
                     .write_fh_with_deferred_materialize(fh, ino, offset, &data, local_sync_policy)
                     .await;
@@ -1542,6 +1569,12 @@ impl Filesystem for StudioFuseFs {
         let pending_result = self.wait_pending_writes_for_handle(ino, fh);
         let result = self.handle_drain().flush(ino, fh);
         match (pending_result, result) {
+            (Err(errno), Err(e)) => {
+                error!(
+                    "flush({ino}, fh={fh}) observed pending write error: {errno}; local flush error: {e}"
+                );
+                reply.error(errno);
+            }
             (Err(errno), _) => {
                 error!("flush({ino}, fh={fh}) observed pending write error: {errno}");
                 reply.error(errno);
@@ -1591,6 +1624,12 @@ impl Filesystem for StudioFuseFs {
             self.pending_writes.finish_close(ino, fh);
         }
         match (pending_result, release_result) {
+            (Err(errno), Err(e)) => {
+                error!(
+                    "release({ino}, fh={fh}) observed pending write error: {errno}; local release error: {e}"
+                );
+                reply.error(errno);
+            }
             (Ok(()), Ok(())) => {
                 debug!(
                     ino,
@@ -1627,6 +1666,12 @@ impl Filesystem for StudioFuseFs {
             self.rt.block_on(self.vfs.fsync(ino, datasync))
         };
         match (pending_result, result) {
+            (Err(errno), Err(e)) => {
+                error!(
+                    "fsync({ino}, fh={fh}) observed pending write error: {errno}; local fsync error: {e}"
+                );
+                reply.error(errno);
+            }
             (Err(errno), _) => {
                 error!("fsync({ino}, fh={fh}) observed pending write error: {errno}");
                 reply.error(errno);
@@ -2297,11 +2342,11 @@ mod tests {
     use super::parse_bridge_bool_env_value;
     use super::{
         DEFAULT_FUSE_MAX_READAHEAD_BYTES, DEFAULT_FUSE_MAX_WRITE_BYTES, FuseBackgroundQueuePolicy,
-        StudioFuseFs, TTL, complete_fuse_write_reply, fuse_write_local_sync_policy,
-        is_expected_macos_trashes_mkdir_exists, is_missing_xattr_error, missing_xattr_errno,
-        normalize_unix_mode, posix_flags_to_open_flags,
-        should_enable_async_fuse_write_from_env_value, should_log_invalidation_error, to_fuse_attr,
-        vfs_err_to_errno,
+        FuseWriteReplyGuard, StudioFuseFs, TTL, complete_fuse_write_reply,
+        fuse_write_local_sync_policy, is_expected_macos_trashes_mkdir_exists,
+        is_missing_xattr_error, missing_xattr_errno, normalize_unix_mode,
+        posix_flags_to_open_flags, should_enable_async_fuse_write_from_env_value,
+        should_log_invalidation_error, to_fuse_attr, vfs_err_to_errno,
     };
     use crate::fs::pending_write_tracker::PendingWriteTracker;
     use std::cell::Cell;
@@ -2638,7 +2683,13 @@ mod tests {
         let barrier = tracker.handle_barrier(42, 7);
         let mut reply = RecordingWriteReply::default();
 
-        complete_fuse_write_reply(&mut reply, Ok(5), &registration, 42, 0);
+        complete_fuse_write_reply(
+            FuseWriteReplyGuard::new(&mut reply),
+            Ok(5),
+            &registration,
+            42,
+            0,
+        );
 
         reply.assert_written_once(5);
         assert!(barrier.is_ready());
@@ -2652,7 +2703,13 @@ mod tests {
         let barrier = tracker.handle_barrier(42, 7);
         let mut reply = RecordingWriteReply::default();
 
-        complete_fuse_write_reply(&mut reply, Err(VfsError::WouldBlock), &registration, 42, 0);
+        complete_fuse_write_reply(
+            FuseWriteReplyGuard::new(&mut reply),
+            Err(VfsError::WouldBlock),
+            &registration,
+            42,
+            0,
+        );
 
         assert!(reply.written.is_empty());
         assert_eq!(reply.errors, [libc::EAGAIN]);
@@ -2671,7 +2728,7 @@ mod tests {
             saw_barrier_pending_on_reply: &saw_barrier_pending_on_reply,
         };
 
-        complete_fuse_write_reply(reply, Ok(5), &registration, 42, 0);
+        complete_fuse_write_reply(FuseWriteReplyGuard::new(reply), Ok(5), &registration, 42, 0);
 
         assert!(
             saw_barrier_pending_on_reply.get(),

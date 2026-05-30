@@ -6,6 +6,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use smallvec::{SmallVec, smallvec};
+use tokio::sync::Notify;
 
 type Ino = u64;
 type FileHandle = u64;
@@ -78,6 +79,7 @@ struct SharedTracker {
 struct TrackerShard {
     state: Mutex<TrackerState>,
     writes_changed: Condvar,
+    async_writes_changed: Notify,
 }
 
 #[derive(Debug)]
@@ -233,7 +235,6 @@ impl PendingWriteTracker {
     pub(super) fn finish_close(&self, ino: Ino, fh: FileHandle) {
         let shard = self.shared.shard_for_inode(ino);
         let mut state = shard.state.lock().expect("pending write tracker poisoned");
-        let has_waiters = state.has_barrier_count_for_inode(ino);
         if let Some(handles) = state.inodes.get_mut(&ino) {
             match handles.get_mut(&fh) {
                 Some(handle) if handle.pending.is_empty() => {
@@ -246,9 +247,6 @@ impl PendingWriteTracker {
             }
         }
         state.remove_empty_inode(ino);
-        if has_waiters {
-            shard.writes_changed.notify_all();
-        }
     }
 }
 
@@ -268,14 +266,17 @@ impl PendingWriteRegistration {
 }
 
 impl PendingWriteTurn {
-    pub(super) fn wait(&self) {
+    pub(super) async fn wait(&self) {
         let shard = &self.shared.shards[self.shard_index];
-        let mut state = shard.state.lock().expect("pending write tracker poisoned");
-        while !state.is_registration_turn(self.key, self.sequence) {
-            state = shard
-                .writes_changed
-                .wait(state)
-                .expect("pending write tracker poisoned");
+        loop {
+            let notified = shard.async_writes_changed.notified();
+            {
+                let state = shard.state.lock().expect("pending write tracker poisoned");
+                if state.is_registration_turn(self.key, self.sequence) {
+                    return;
+                }
+            }
+            notified.await;
         }
     }
 }
@@ -327,8 +328,11 @@ impl PendingWriteRegistration {
         if should_remove_closed_handle {
             state.remove_handle(self.key);
         }
-        if has_waiters || should_wake_next_write {
+        if has_waiters {
             shard.writes_changed.notify_all();
+        }
+        if should_wake_next_write {
+            shard.async_writes_changed.notify_waiters();
         }
     }
 }
@@ -791,10 +795,12 @@ mod tests {
             .register(INO, FIRST_FH)
             .expect("register second write");
 
-        first.turn_waiter().wait();
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(first.turn_waiter().wait());
 
         let waiter = std::thread::spawn(move || {
-            second.turn_waiter().wait();
+            let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+            rt.block_on(second.turn_waiter().wait());
             second.complete(PendingWriteCompletion::Success);
         });
 
