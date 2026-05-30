@@ -44,7 +44,6 @@ struct HandleState {
     next_sequence: Sequence,
     lifecycle: HandleLifecycle,
     pending: BTreeSet<Sequence>,
-    pending_bytes: HashMap<Sequence, usize>,
     total_pending_bytes: usize,
     turn_waiters: HashMap<Sequence, oneshot::Sender<()>>,
     sticky_error: Option<i32>,
@@ -57,7 +56,6 @@ impl Default for HandleState {
             next_sequence: 1,
             lifecycle: HandleLifecycle::Open,
             pending: BTreeSet::new(),
-            pending_bytes: HashMap::new(),
             total_pending_bytes: 0,
             turn_waiters: HashMap::new(),
             sticky_error: None,
@@ -95,6 +93,8 @@ pub(super) struct PendingWriteTracker {
 #[derive(Debug)]
 struct SharedTracker {
     shards: [TrackerShard; TRACKER_SHARDS],
+    // Global caps need Condvar-compatible locking. If this shows up in
+    // profiles, add an atomic fast path for clearly-under-budget writes.
     admission: Mutex<GlobalAdmissionState>,
     admission_changed: Condvar,
 }
@@ -184,6 +184,8 @@ impl PendingWriteTracker {
         bytes: usize,
         limits: PendingWriteAdmissionLimits,
     ) -> Result<PendingWriteRegistration, WriteRegistrationError> {
+        let wait_started = Instant::now();
+        let mut total_waited = false;
         loop {
             let mut admission = self
                 .shared
@@ -192,12 +194,10 @@ impl PendingWriteTracker {
                 .expect("pending write admission poisoned");
             let shard_index = SharedTracker::shard_index(ino);
             let shard = &self.shared.shards[shard_index];
-            let wait_started = Instant::now();
-            let mut waited = false;
             while admission.global_error(bytes, limits)
                 == Some(WriteRegistrationError::AdmissionLimitExceeded)
             {
-                waited = true;
+                total_waited = true;
                 admission = self
                     .shared
                     .admission_changed
@@ -209,15 +209,15 @@ impl PendingWriteTracker {
                 == Some(WriteRegistrationError::AdmissionLimitExceeded)
             {
                 drop(admission);
-                let mut state = shard
+                total_waited = true;
+                let state = shard
                     .writes_changed
                     .wait(state)
                     .expect("pending write tracker poisoned");
-                state.record_admission_wait(wait_started.elapsed());
                 drop(state);
                 continue;
             }
-            if waited {
+            if total_waited {
                 state.record_admission_wait(wait_started.elapsed());
             }
             return self.register_pending_write_locked(
@@ -297,7 +297,6 @@ impl PendingWriteTracker {
         let sequence = handle.next_sequence;
         handle.next_sequence += 1;
         handle.pending.insert(sequence);
-        handle.pending_bytes.insert(sequence, bytes);
         handle.total_pending_bytes = handle.total_pending_bytes.saturating_add(bytes);
         admission.total_pending_bytes = admission.total_pending_bytes.saturating_add(bytes);
         admission.total_pending_writes = admission.total_pending_writes.saturating_add(1);
@@ -467,8 +466,7 @@ impl PendingWriteRegistration {
         {
             generation = Some(handle.generation);
             handle.pending.remove(&self.sequence);
-            let released_bytes = handle.pending_bytes.remove(&self.sequence).unwrap_or(0);
-            handle.total_pending_bytes = handle.total_pending_bytes.saturating_sub(released_bytes);
+            handle.total_pending_bytes = handle.total_pending_bytes.saturating_sub(self.bytes);
             handle.turn_waiters.remove(&self.sequence);
             match completion {
                 PendingWriteCompletion::Success => {}
@@ -985,6 +983,56 @@ mod tests {
             ),
             "waiter should not be admitted before pending bytes are released",
         );
+        first.complete(PendingWriteCompletion::Success);
+        let waited = admitted_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("waiter should be admitted after release");
+        waited.complete(PendingWriteCompletion::Success);
+        waiter.join().expect("waiter should finish");
+
+        let metrics = tracker.admission_metrics();
+        assert_eq!(metrics.waits, 1);
+        assert!(metrics.wait_ns > 0);
+    }
+
+    #[test]
+    fn repeated_per_handle_wakeups_record_one_wait_metric() {
+        let tracker = PendingWriteTracker::default();
+        let limits = super::PendingWriteAdmissionLimits {
+            max_pending_bytes: None,
+            max_pending_writes: None,
+            per_handle_pending_bytes: Some(8),
+        };
+        let first = tracker
+            .register_with_admission(INO, FIRST_FH, 8, limits)
+            .expect("first write fills handle cap");
+        let waiting_tracker = PendingWriteTracker {
+            shared: std::sync::Arc::clone(&tracker.shared),
+        };
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (admitted_tx, admitted_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            started_tx.send(()).expect("send waiter started");
+            let registration = waiting_tracker
+                .register_with_admission(INO, FIRST_FH, 1, limits)
+                .expect("waited write should be admitted after release");
+            admitted_tx
+                .send(registration)
+                .expect("send admitted registration");
+        });
+
+        started_rx.recv().expect("waiter should start");
+        let shard = tracker.shared.shard_for_inode(INO);
+        shard.writes_changed.notify_all();
+        shard.writes_changed.notify_all();
+        assert!(
+            matches!(
+                admitted_rx.recv_timeout(std::time::Duration::from_millis(25)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "spurious wakeups must not admit the waiter while pressure remains",
+        );
+
         first.complete(PendingWriteCompletion::Success);
         let waited = admitted_rx
             .recv_timeout(std::time::Duration::from_secs(1))
