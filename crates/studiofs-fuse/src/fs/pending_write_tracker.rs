@@ -184,8 +184,7 @@ impl PendingWriteTracker {
         bytes: usize,
         limits: PendingWriteAdmissionLimits,
     ) -> Result<PendingWriteRegistration, WriteRegistrationError> {
-        let wait_started = Instant::now();
-        let mut total_waited = false;
+        let mut wait_started = None;
         loop {
             let mut admission = self
                 .shared
@@ -197,7 +196,9 @@ impl PendingWriteTracker {
             while admission.global_error(bytes, limits)
                 == Some(WriteRegistrationError::AdmissionLimitExceeded)
             {
-                total_waited = true;
+                if wait_started.is_none() {
+                    wait_started = Some(Instant::now());
+                }
                 admission = self
                     .shared
                     .admission_changed
@@ -209,7 +210,9 @@ impl PendingWriteTracker {
                 == Some(WriteRegistrationError::AdmissionLimitExceeded)
             {
                 drop(admission);
-                total_waited = true;
+                if wait_started.is_none() {
+                    wait_started = Some(Instant::now());
+                }
                 let state = shard
                     .writes_changed
                     .wait(state)
@@ -217,8 +220,8 @@ impl PendingWriteTracker {
                 drop(state);
                 continue;
             }
-            if total_waited {
-                state.record_admission_wait(wait_started.elapsed());
+            if let Some(started) = wait_started {
+                state.record_admission_wait(started.elapsed());
             }
             return self.register_pending_write_locked(
                 ino,
