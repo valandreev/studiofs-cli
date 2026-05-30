@@ -549,6 +549,9 @@ impl PendingWriteBarrier {
     }
 
     pub(super) async fn wait_async(self) -> Result<(), i32> {
+        if self.targets.is_empty() {
+            return Ok(());
+        }
         let shard = &self.shared.shards[self.shard_index];
         loop {
             let notified = {
@@ -566,6 +569,9 @@ impl PendingWriteBarrier {
 
 impl Drop for PendingWriteBarrier {
     fn drop(&mut self) {
+        if self.targets.is_empty() {
+            return;
+        }
         let shard = &self.shared.shards[self.shard_index];
         let mut state = shard.state.lock().expect("pending write tracker poisoned");
         for (key, _, generation) in &self.targets {
@@ -1188,6 +1194,23 @@ mod tests {
 
         pending.complete(PendingWriteCompletion::Success);
         assert_eq!(waiter.await.expect("waiter task should finish"), Ok(()));
+
+        let state = shard.state.lock().expect("pending write tracker poisoned");
+        assert!(!state.async_write_notifiers.contains_key(&INO));
+    }
+
+    #[tokio::test]
+    async fn async_empty_inode_barrier_returns_without_notifier() {
+        let tracker = PendingWriteTracker::default();
+        let barrier = tracker.inode_barrier(INO);
+        let shard = tracker.shared.shard_for_inode(INO);
+        let state = shard.state.lock().expect("pending write tracker poisoned");
+
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), barrier.wait_async()).await,
+            Ok(Ok(()))
+        );
+        drop(state);
 
         let state = shard.state.lock().expect("pending write tracker poisoned");
         assert!(!state.async_write_notifiers.contains_key(&INO));

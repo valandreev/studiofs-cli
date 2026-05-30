@@ -1842,11 +1842,11 @@ impl Filesystem for StudioFuseFs {
                 }
             };
             let vfs = Arc::clone(&self.vfs);
-            let close_guard = PendingFuseCloseGuard::new(self.pending_writes.clone(), ino, fh);
+            let mut close_guard = PendingFuseCloseGuard::new(self.pending_writes.clone(), ino, fh);
             self.rt.spawn(async move {
-                let _close_guard = close_guard;
                 let pending_result = barrier.wait_async().await;
                 let release_result = vfs.release_fh(fh).await;
+                close_guard.finish();
                 if pending_result.is_ok() && release_result.is_ok() {
                     debug!(
                         ino,
