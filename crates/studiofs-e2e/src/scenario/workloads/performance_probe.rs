@@ -65,6 +65,7 @@ impl Scenario for MountedPerformanceProbe {
     }
 }
 
+/// SFS-469 mounted FUSE write baseline scenario backed by the shared performance probe.
 #[derive(Debug, Clone, Copy)]
 pub(in crate::scenario) struct MountedFuseWriteBaseline;
 

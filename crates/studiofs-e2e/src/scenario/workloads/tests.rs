@@ -3036,7 +3036,7 @@ fn registry_exposes_mounted_fuse_write_baseline_sfs469_scenario() {
     let scenarios = available_scenarios();
     let scenario = scenarios
         .iter()
-        .find(|scenario| scenario.name == "mounted-fuse-write-baseline")
+        .find(|scenario| scenario.name == MOUNTED_FUSE_WRITE_BASELINE)
         .expect("SFS-469 FUSE write baseline scenario should be registered");
 
     assert!(scenario.requires_studiofs_bin);
@@ -3046,7 +3046,7 @@ fn registry_exposes_mounted_fuse_write_baseline_sfs469_scenario() {
             .description
             .contains("macOS/Linux FUSE write baseline")
     );
-    assert!(resolve_scenario("mounted-fuse-write-baseline").is_some());
+    assert!(resolve_scenario(MOUNTED_FUSE_WRITE_BASELINE).is_some());
     assert!(resolve_scenario("fuse-write-baseline").is_some());
     assert!(resolve_scenario("sfs-469").is_some());
     assert!(resolve_scenario("98").is_some());
