@@ -460,6 +460,15 @@ fn scenario_list_appends_performance_probe_after_symlink_attribute() {
 }
 
 #[test]
+fn sfs469_fuse_write_baseline_uses_reserved_98_selector() {
+    let cli = Cli::try_parse_from(["studiofs-e2e", "run", "--scenario", "98"]).unwrap();
+    let Commands::Run(args) = cli.command else {
+        panic!("expected run command");
+    };
+    assert_eq!(args.scenario_names(), ["98"]);
+}
+
+#[test]
 fn symlink_attribute_disabled_run_writes_reproducible_artifacts() {
     let temp = tempdir().unwrap();
     let request = RunRequest {

@@ -17,6 +17,8 @@ use crate::scenario::{Scenario, ScenarioContext, ScenarioDefinition, ScenarioErr
 
 /// Mounted performance probe scenario identifier.
 pub const MOUNTED_PERFORMANCE_PROBE: &str = "mounted-performance-probe";
+/// Mounted FUSE write baseline scenario identifier for SFS-469.
+pub const MOUNTED_FUSE_WRITE_BASELINE: &str = "mounted-fuse-write-baseline";
 
 const PERFORMANCE_PROBE_CLIENT: &str = "client-a";
 const PERFORMANCE_PROBE_FILE: &str = "performance-probe/probe-4g.bin";
@@ -51,84 +53,11 @@ impl Scenario for MountedPerformanceProbe {
     }
 
     fn run(&self, context: &ScenarioContext) -> Result<(), ScenarioError> {
-        let Some(config) = &context.client_controller_config else {
-            return Err(ScenarioError::MissingComposeInfrastructure);
-        };
-        let mut controller =
-            MultiClientController::new(config.clone(), SystemClientProcessExecutor);
-        controller.bootstrap_volume(VolumeBootstrapOptions {
-            client_names: vec![PERFORMANCE_PROBE_CLIENT.to_string()],
-            clean_existing_local_metadata: true,
-        })?;
-        controller.mount(PERFORMANCE_PROBE_CLIENT)?;
-        let client = controller.client_at(0)?.clone();
-
-        let run_result = run_mounted_performance_probe(context, &client);
-        let cleanup_result = controller.unmount_all();
-        match (run_result, cleanup_result) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(primary), Ok(())) => Err(primary),
-            (Ok(()), Err(cleanup)) => Err(ScenarioError::Client(cleanup)),
-            (Err(primary), Err(cleanup)) => {
-                Err(ScenarioError::PerformanceProbeUnmountAfterFailure {
-                    primary: primary.to_string(),
-                    cleanup: cleanup.to_string(),
-                })
-            }
-        }
+        run_mounted_performance_probe_scenario(context, MOUNTED_PERFORMANCE_PROBE)
     }
 
     fn validate(&self, context: &ScenarioContext) -> Result<Vec<String>, ScenarioError> {
-        let summary_path = context.scenario_dir.join(PERFORMANCE_PROBE_SUMMARY_FILE);
-        let summary: PerformanceProbeSummary = serde_json::from_slice(&fs::read(&summary_path)?)?;
-        if summary.status != "passed" {
-            return Err(ScenarioError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("performance probe status is {}", summary.status),
-            )));
-        }
-
-        let read_phases = summary
-            .phases
-            .iter()
-            .filter(|phase| phase.kind == "read")
-            .count();
-        if read_phases != summary.config.read_passes as usize {
-            return Err(ScenarioError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "performance probe recorded {read_phases} read phases, expected {}",
-                    summary.config.read_passes
-                ),
-            )));
-        }
-
-        let validation = json!({
-            "scenario": MOUNTED_PERFORMANCE_PROBE,
-            "run_id": context.run_id,
-            "seed": context.seed,
-            "status": "passed",
-            "file_bytes": summary.config.file_bytes,
-            "read_passes": summary.config.read_passes,
-            "read_observations": summary.read_observations,
-            "write_observations": summary.write_observations,
-            "upload_drain": summary.upload_drain,
-        });
-        fs::write(
-            context.scenario_dir.join(PERFORMANCE_PROBE_VALIDATION_FILE),
-            serde_json::to_vec_pretty(&validation)?,
-        )?;
-        Ok(vec![
-            format!(
-                "artifacts/scenarios/{MOUNTED_PERFORMANCE_PROBE}/{PERFORMANCE_PROBE_SUMMARY_FILE}"
-            ),
-            format!(
-                "artifacts/scenarios/{MOUNTED_PERFORMANCE_PROBE}/{PERFORMANCE_PROBE_SAMPLES_FILE}"
-            ),
-            format!(
-                "artifacts/scenarios/{MOUNTED_PERFORMANCE_PROBE}/{PERFORMANCE_PROBE_VALIDATION_FILE}"
-            ),
-        ])
+        validate_mounted_performance_probe(context, MOUNTED_PERFORMANCE_PROBE)
     }
 
     fn cleanup(&self, _context: &ScenarioContext) -> Result<(), ScenarioError> {
@@ -136,9 +65,125 @@ impl Scenario for MountedPerformanceProbe {
     }
 }
 
+/// SFS-469 mounted FUSE write baseline scenario backed by the shared performance probe.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::scenario) struct MountedFuseWriteBaseline;
+
+impl Scenario for MountedFuseWriteBaseline {
+    fn definition(&self) -> ScenarioDefinition {
+        ScenarioDefinition {
+            name: MOUNTED_FUSE_WRITE_BASELINE,
+            description: "SFS-469 macOS/Linux FUSE write baseline using the mounted performance probe",
+            requires_studiofs_bin: true,
+        }
+    }
+
+    fn setup(&self, context: &ScenarioContext) -> Result<(), ScenarioError> {
+        fs::create_dir_all(&context.scenario_dir)?;
+        Ok(())
+    }
+
+    fn run(&self, context: &ScenarioContext) -> Result<(), ScenarioError> {
+        run_mounted_performance_probe_scenario(context, MOUNTED_FUSE_WRITE_BASELINE)
+    }
+
+    fn validate(&self, context: &ScenarioContext) -> Result<Vec<String>, ScenarioError> {
+        validate_mounted_performance_probe(context, MOUNTED_FUSE_WRITE_BASELINE)
+    }
+
+    fn cleanup(&self, _context: &ScenarioContext) -> Result<(), ScenarioError> {
+        Ok(())
+    }
+}
+
+fn run_mounted_performance_probe_scenario(
+    context: &ScenarioContext,
+    scenario_name: &'static str,
+) -> Result<(), ScenarioError> {
+    let Some(config) = &context.client_controller_config else {
+        return Err(ScenarioError::MissingComposeInfrastructure);
+    };
+    let mut controller = MultiClientController::new(config.clone(), SystemClientProcessExecutor);
+    controller.bootstrap_volume(VolumeBootstrapOptions {
+        client_names: vec![PERFORMANCE_PROBE_CLIENT.to_string()],
+        clean_existing_local_metadata: true,
+    })?;
+    controller.mount(PERFORMANCE_PROBE_CLIENT)?;
+    let client = controller.client_at(0)?;
+
+    let run_result = run_mounted_performance_probe(context, client, scenario_name);
+    let cleanup_result = controller.unmount_all();
+    match (run_result, cleanup_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(()), Err(cleanup)) => Err(ScenarioError::Client(cleanup)),
+        (Err(primary), Err(cleanup)) => Err(ScenarioError::PerformanceProbeUnmountAfterFailure {
+            primary: primary.to_string(),
+            cleanup: cleanup.to_string(),
+        }),
+    }
+}
+
+fn validate_mounted_performance_probe(
+    context: &ScenarioContext,
+    scenario_name: &'static str,
+) -> Result<Vec<String>, ScenarioError> {
+    let summary_path = context.scenario_dir.join(PERFORMANCE_PROBE_SUMMARY_FILE);
+    let summary: PerformanceProbeSummary = serde_json::from_slice(&fs::read(&summary_path)?)?;
+    if summary.status != "passed" {
+        return Err(ScenarioError::PerformanceProbeValidationFailed {
+            detail: format!("performance probe status is {}", summary.status),
+        });
+    }
+    if summary.scenario != scenario_name {
+        return Err(ScenarioError::PerformanceProbeValidationFailed {
+            detail: format!(
+                "performance probe summary scenario is {}, expected {scenario_name}",
+                summary.scenario
+            ),
+        });
+    }
+
+    let read_phases = summary
+        .phases
+        .iter()
+        .filter(|phase| phase.kind == "read")
+        .count();
+    if read_phases != summary.config.read_passes as usize {
+        return Err(ScenarioError::PerformanceProbeValidationFailed {
+            detail: format!(
+                "performance probe recorded {read_phases} read phases, expected {}",
+                summary.config.read_passes
+            ),
+        });
+    }
+
+    let validation = json!({
+        "scenario": scenario_name,
+        "run_id": context.run_id,
+        "seed": context.seed,
+        "status": "passed",
+        "file_bytes": summary.config.file_bytes,
+        "read_passes": summary.config.read_passes,
+        "read_observations": summary.read_observations,
+        "write_observations": summary.write_observations,
+        "upload_drain": summary.upload_drain,
+    });
+    fs::write(
+        context.scenario_dir.join(PERFORMANCE_PROBE_VALIDATION_FILE),
+        serde_json::to_vec_pretty(&validation)?,
+    )?;
+    Ok(vec![
+        format!("artifacts/scenarios/{scenario_name}/{PERFORMANCE_PROBE_SUMMARY_FILE}"),
+        format!("artifacts/scenarios/{scenario_name}/{PERFORMANCE_PROBE_SAMPLES_FILE}"),
+        format!("artifacts/scenarios/{scenario_name}/{PERFORMANCE_PROBE_VALIDATION_FILE}"),
+    ])
+}
+
 fn run_mounted_performance_probe(
     context: &ScenarioContext,
     client: &ClientSpec,
+    scenario_name: &'static str,
 ) -> Result<(), ScenarioError> {
     let config = PerformanceProbeConfig::from_env()?;
     let samples_path = context.scenario_dir.join(PERFORMANCE_PROBE_SAMPLES_FILE);
@@ -234,7 +279,7 @@ fn run_mounted_performance_probe(
     };
 
     let summary = PerformanceProbeSummary {
-        scenario: MOUNTED_PERFORMANCE_PROBE.to_string(),
+        scenario: scenario_name.to_string(),
         run_id: context.run_id.clone(),
         seed: context.seed,
         status: "passed".to_string(),
