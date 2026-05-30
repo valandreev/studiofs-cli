@@ -261,6 +261,15 @@ fn async_mounted_test_matrix_covers_correctness_and_platform_opt_in_scenarios() 
     }
 }
 
+#[test]
+fn runtime_options_from_env_is_public_for_embedder_overrides() {
+    let mut options = StudioFuseRuntimeOptions::from_env();
+
+    options.async_write_enabled = true;
+
+    assert!(options.async_write_enabled);
+}
+
 fn workspace_root() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -402,11 +411,11 @@ fn finish_mounted_fuse_test(
 ) {
     match test_result {
         Ok(()) => {
-            unmount_result.expect("FUSE unmount should succeed");
             match join_result {
                 Ok(run_result) => run_result.expect("FUSE session should run until unmount"),
                 Err(panic) => std::panic::resume_unwind(panic),
             }
+            unmount_result.expect("FUSE unmount should succeed");
         }
         Err(panic) => {
             if let Err(error) = unmount_result {
@@ -443,6 +452,24 @@ fn mounted_fuse_cleanup_preserves_original_scenario_panic() {
         observed.downcast_ref::<&str>(),
         Some(&"scenario failed"),
         "cleanup errors must not replace the original scenario panic"
+    );
+}
+
+#[test]
+fn mounted_fuse_cleanup_reports_session_panic_before_unmount_error() {
+    let observed = std::panic::catch_unwind(|| {
+        finish_mounted_fuse_test(
+            Ok(()),
+            Err(io::Error::other("unmount failed")),
+            Err(Box::new("session crashed") as Box<dyn std::any::Any + Send>),
+        );
+    })
+    .expect_err("session panic should be reported before unmount failure");
+
+    assert_eq!(
+        observed.downcast_ref::<&str>(),
+        Some(&"session crashed"),
+        "session thread panic must not be masked by a later unmount error"
     );
 }
 

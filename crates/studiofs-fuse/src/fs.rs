@@ -1071,7 +1071,8 @@ impl From<PendingWriteAdmissionLimits> for StudioFuseAsyncWriteAdmissionLimits {
 }
 
 impl StudioFuseRuntimeOptions {
-    fn from_env() -> Self {
+    /// Read FUSE runtime options from the current process environment.
+    pub fn from_env() -> Self {
         Self {
             async_write_enabled: should_enable_async_fuse_write_from_env(),
             linux_async_dio_enabled: should_request_fuse_async_dio_from_env(),
