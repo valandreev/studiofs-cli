@@ -1,6 +1,7 @@
 //! fuser::Filesystem implementation — bridges FUSE kernel calls to StudioVfs.
 
 mod handle_drain;
+mod pending_write_tracker;
 
 #[cfg(target_os = "macos")]
 use std::borrow::Cow;
