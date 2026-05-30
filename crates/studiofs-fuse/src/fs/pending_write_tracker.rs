@@ -6,7 +6,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use smallvec::{SmallVec, smallvec};
-use tokio::sync::Notify;
+use tokio::sync::oneshot;
 
 type Ino = u64;
 type FileHandle = u64;
@@ -42,6 +42,7 @@ struct HandleState {
     next_sequence: Sequence,
     lifecycle: HandleLifecycle,
     pending: BTreeSet<Sequence>,
+    turn_waiters: HashMap<Sequence, oneshot::Sender<()>>,
     sticky_error: Option<i32>,
 }
 
@@ -52,6 +53,7 @@ impl Default for HandleState {
             next_sequence: 1,
             lifecycle: HandleLifecycle::Open,
             pending: BTreeSet::new(),
+            turn_waiters: HashMap::new(),
             sticky_error: None,
         }
     }
@@ -79,7 +81,6 @@ struct SharedTracker {
 struct TrackerShard {
     state: Mutex<TrackerState>,
     writes_changed: Condvar,
-    async_writes_changed: Notify,
 }
 
 #[derive(Debug)]
@@ -89,6 +90,7 @@ pub(super) struct PendingWriteRegistration {
     key: HandleKey,
     sequence: Sequence,
     completion: OnceLock<PendingWriteCompletion>,
+    turn_receiver: Mutex<Option<oneshot::Receiver<()>>>,
 }
 
 #[derive(Debug)]
@@ -97,6 +99,7 @@ pub(super) struct PendingWriteTurn {
     shard_index: usize,
     key: HandleKey,
     sequence: Sequence,
+    turn_receiver: Option<oneshot::Receiver<()>>,
 }
 
 #[derive(Debug)]
@@ -145,6 +148,8 @@ impl PendingWriteTracker {
         let sequence = handle.next_sequence;
         handle.next_sequence += 1;
         handle.pending.insert(sequence);
+        let (turn_sender, turn_receiver) = oneshot::channel();
+        handle.turn_waiters.insert(sequence, turn_sender);
 
         Ok(PendingWriteRegistration {
             shared: Arc::clone(&self.shared),
@@ -152,6 +157,7 @@ impl PendingWriteTracker {
             key: (ino, fh),
             sequence,
             completion: OnceLock::new(),
+            turn_receiver: Mutex::new(Some(turn_receiver)),
         })
     }
 
@@ -256,27 +262,32 @@ impl PendingWriteRegistration {
     }
 
     pub(super) fn turn_waiter(&self) -> PendingWriteTurn {
+        let turn_receiver = self
+            .turn_receiver
+            .lock()
+            .expect("pending write turn receiver poisoned")
+            .take();
         PendingWriteTurn {
             shared: Arc::clone(&self.shared),
             shard_index: self.shard_index,
             key: self.key,
             sequence: self.sequence,
+            turn_receiver,
         }
     }
 }
 
 impl PendingWriteTurn {
-    pub(super) async fn wait(&self) {
+    pub(super) async fn wait(mut self) {
         let shard = &self.shared.shards[self.shard_index];
-        loop {
-            let notified = shard.async_writes_changed.notified();
-            {
-                let state = shard.state.lock().expect("pending write tracker poisoned");
-                if state.is_registration_turn(self.key, self.sequence) {
-                    return;
-                }
+        {
+            let state = shard.state.lock().expect("pending write tracker poisoned");
+            if state.is_registration_turn(self.key, self.sequence) {
+                return;
             }
-            notified.await;
+        }
+        if let Some(receiver) = self.turn_receiver.take() {
+            let _ = receiver.await;
         }
     }
 }
@@ -290,7 +301,7 @@ impl PendingWriteRegistration {
         let shard = &self.shared.shards[self.shard_index];
         let mut state = shard.state.lock().expect("pending write tracker poisoned");
         let mut should_remove_closed_handle = false;
-        let mut should_wake_next_write = false;
+        let mut next_turn = None;
         let mut inode_sticky_error = None;
         let mut generation = None;
         if let Some(handle) = state
@@ -300,6 +311,7 @@ impl PendingWriteRegistration {
         {
             generation = Some(handle.generation);
             handle.pending.remove(&self.sequence);
+            handle.turn_waiters.remove(&self.sequence);
             match completion {
                 PendingWriteCompletion::Success => {}
                 PendingWriteCompletion::Error(errno) => {
@@ -313,7 +325,10 @@ impl PendingWriteRegistration {
             }
             should_remove_closed_handle =
                 handle.lifecycle == HandleLifecycle::Closed && handle.pending.is_empty();
-            should_wake_next_write = handle.pending.first().is_some();
+            next_turn = handle
+                .pending
+                .first()
+                .and_then(|sequence| handle.turn_waiters.remove(sequence));
         }
         if let Some(errno) = inode_sticky_error {
             let generation = generation.unwrap_or_else(|| state.current_generation(self.key.0));
@@ -331,8 +346,8 @@ impl PendingWriteRegistration {
         if has_waiters {
             shard.writes_changed.notify_all();
         }
-        if should_wake_next_write {
-            shard.async_writes_changed.notify_waiters();
+        if let Some(next_turn) = next_turn {
+            let _ = next_turn.send(());
         }
     }
 }
@@ -798,19 +813,27 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         rt.block_on(first.turn_waiter().wait());
 
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
         let waiter = std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+            started_tx.send(()).expect("send waiter started");
             rt.block_on(second.turn_waiter().wait());
+            done_tx.send(()).expect("send waiter done");
             second.complete(PendingWriteCompletion::Success);
         });
 
-        std::thread::sleep(std::time::Duration::from_millis(25));
-        assert!(
-            !waiter.is_finished(),
-            "later writes on the same handle must wait for prior sequence completion"
+        started_rx.recv().expect("waiter should start");
+        assert_eq!(
+            done_rx.recv_timeout(std::time::Duration::from_millis(25)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+            "later writes on the same handle must wait for prior sequence completion",
         );
 
         first.complete(PendingWriteCompletion::Success);
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("waiter should finish after first write");
         waiter
             .join()
             .expect("waiter should finish after first write");
