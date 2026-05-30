@@ -18,6 +18,9 @@ use fuser::{
     Request,
 };
 use handle_drain::FuseHandleDrainFacade;
+use pending_write_tracker::{
+    PendingWriteCompletion, PendingWriteRegistration, PendingWriteTracker, WriteRegistrationError,
+};
 #[cfg(target_os = "macos")]
 use studiofs_meta::engine::{XATTR_CREATE_FLAG, XATTR_REPLACE_FLAG};
 #[cfg(target_os = "macos")]
@@ -51,6 +54,7 @@ const DEFAULT_FUSE_MAX_READAHEAD_BYTES: u32 = 16 * 1024 * 1024;
 const FUSE_AUTO_INVAL_DATA_FLAG: u64 = 1 << 12;
 const STUDIOFS_FUSE_MAX_BACKGROUND_ENV: &str = "STUDIOFS_FUSE_MAX_BACKGROUND";
 const STUDIOFS_FUSE_CONGESTION_THRESHOLD_ENV: &str = "STUDIOFS_FUSE_CONGESTION_THRESHOLD";
+const STUDIOFS_FUSE_ASYNC_WRITE_ENV: &str = "STUDIOFS_FUSE_ASYNC_WRITE";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FuseBackgroundQueuePolicy {
@@ -260,6 +264,90 @@ fn parse_bridge_bool_env(key: &str) -> bool {
 #[cfg(target_os = "linux")]
 fn should_request_fuse_async_dio() -> bool {
     parse_bridge_bool_env("STUDIOFS_FUSE_ASYNC_DIO")
+}
+
+fn should_enable_async_fuse_write_from_env_value(raw: &str) -> bool {
+    parse_bridge_bool_env_value(raw)
+}
+
+fn should_enable_async_fuse_write_from_env() -> bool {
+    std::env::var(STUDIOFS_FUSE_ASYNC_WRITE_ENV)
+        .is_ok_and(|raw| should_enable_async_fuse_write_from_env_value(&raw))
+}
+
+trait FuseWriteReply {
+    fn written(self, size: u32);
+    fn error(self, errno: i32);
+}
+
+struct FuseWriteReplyGuard<R: FuseWriteReply> {
+    reply: Option<R>,
+}
+
+impl<R: FuseWriteReply> FuseWriteReplyGuard<R> {
+    fn new(reply: R) -> Self {
+        Self { reply: Some(reply) }
+    }
+
+    fn written(mut self, size: u32) {
+        if let Some(reply) = self.reply.take() {
+            reply.written(size);
+        }
+    }
+
+    fn error(mut self, errno: i32) {
+        if let Some(reply) = self.reply.take() {
+            reply.error(errno);
+        }
+    }
+}
+
+impl<R: FuseWriteReply> Drop for FuseWriteReplyGuard<R> {
+    fn drop(&mut self) {
+        if let Some(reply) = self.reply.take() {
+            reply.error(libc::EIO);
+        }
+    }
+}
+
+impl FuseWriteReply for ReplyWrite {
+    fn written(self, size: u32) {
+        self.written(size);
+    }
+
+    fn error(self, errno: i32) {
+        self.error(errno);
+    }
+}
+
+fn complete_fuse_write_reply<R>(
+    reply: FuseWriteReplyGuard<R>,
+    result: Result<u32, VfsError>,
+    registration: &PendingWriteRegistration,
+    ino: u64,
+    offset: u64,
+) where
+    R: FuseWriteReply,
+{
+    match result {
+        Ok(written) => {
+            reply.written(written);
+            registration.complete(PendingWriteCompletion::Success);
+        }
+        Err(e) => {
+            error!("write({ino}, off={offset}) -> {e}");
+            let errno = vfs_err_to_errno(&e);
+            reply.error(errno);
+            registration.complete(PendingWriteCompletion::Error(errno));
+        }
+    }
+}
+
+fn write_registration_error_to_errno(error: WriteRegistrationError) -> i32 {
+    match error {
+        WriteRegistrationError::HandleClosing => libc::EAGAIN,
+        WriteRegistrationError::HandleClosed => libc::EIO,
+    }
 }
 
 fn os_str_bytes(name: &OsStr) -> &[u8] {
@@ -706,6 +794,8 @@ fn fuse_file_type(kind: FileType) -> FuseFileType {
 pub struct StudioFuseFs {
     vfs: Arc<StudioVfs>,
     rt: Handle,
+    pending_writes: PendingWriteTracker,
+    async_write_enabled: bool,
     /// UID of the user that mounted the filesystem. Inodes owned by uid=0 in
     /// the DB are remapped to this so macOS permission checks don't block writes.
     mount_uid: u32,
@@ -724,6 +814,8 @@ impl StudioFuseFs {
         Self {
             vfs,
             rt,
+            pending_writes: PendingWriteTracker::default(),
+            async_write_enabled: should_enable_async_fuse_write_from_env(),
             mount_uid,
             mount_gid,
         }
@@ -731,6 +823,20 @@ impl StudioFuseFs {
 
     fn handle_drain(&self) -> FuseHandleDrainFacade<'_> {
         FuseHandleDrainFacade::new(self)
+    }
+
+    fn wait_pending_writes_for_handle(&self, ino: u64, fh: u64) -> Result<(), i32> {
+        if self.async_write_enabled && fh != 0 {
+            return self.pending_writes.handle_barrier(ino, fh).wait();
+        }
+        Ok(())
+    }
+
+    fn wait_pending_writes_for_fsync(&self, ino: u64, _fh: u64) -> Result<(), i32> {
+        if !self.async_write_enabled {
+            return Ok(());
+        }
+        self.pending_writes.inode_barrier(ino).wait()
     }
 }
 
@@ -1391,6 +1497,38 @@ impl Filesystem for StudioFuseFs {
             }
         };
         let callback_started = Instant::now();
+        if self.async_write_enabled {
+            // TODO(SFS-465): Async writes must own the FUSE callback buffer.
+            // If this path graduates from experimental, replace per-write Vec
+            // allocation with a reusable buffer pool to reduce allocator churn.
+            let data = data.to_vec();
+            let data_len = data.len();
+            let registration = match self.pending_writes.register(ino, fh) {
+                Ok(registration) => registration,
+                Err(e) => {
+                    reply.error(write_registration_error_to_errno(e));
+                    return;
+                }
+            };
+            let vfs = Arc::clone(&self.vfs);
+            let local_sync_policy = fuse_write_local_sync_policy(flags);
+            let reply = FuseWriteReplyGuard::new(reply);
+            self.rt.spawn(async move {
+                let turn = registration.turn_waiter();
+                turn.wait().await;
+                let result = vfs
+                    .write_fh_with_deferred_materialize(fh, ino, offset, &data, local_sync_policy)
+                    .await;
+                vfs.record_fuse_write_callback(
+                    data_len,
+                    callback_started.elapsed(),
+                    result.is_err(),
+                );
+                complete_fuse_write_reply(reply, result, &registration, ino, offset);
+            });
+            return;
+        }
+
         let result = self
             .rt
             .block_on(self.vfs.write_fh_with_deferred_materialize(
@@ -1424,9 +1562,20 @@ impl Filesystem for StudioFuseFs {
     ) {
         let started = Instant::now();
         debug!(ino, fh, "flush started");
+        let pending_result = self.wait_pending_writes_for_handle(ino, fh);
         let result = self.handle_drain().flush(ino, fh);
-        match result {
-            Ok(()) => {
+        match (pending_result, result) {
+            (Err(errno), Err(e)) => {
+                error!(
+                    "flush({ino}, fh={fh}) observed pending write error: {errno}; local flush error: {e}"
+                );
+                reply.error(errno);
+            }
+            (Err(errno), _) => {
+                error!("flush({ino}, fh={fh}) observed pending write error: {errno}");
+                reply.error(errno);
+            }
+            (Ok(()), Ok(())) => {
                 debug!(
                     ino,
                     fh,
@@ -1435,7 +1584,7 @@ impl Filesystem for StudioFuseFs {
                 );
                 reply.ok();
             }
-            Err(e) => {
+            (Ok(()), Err(e)) => {
                 if fh != 0 {
                     error!("flush_fh({fh}) -> {e}");
                 } else {
@@ -1458,8 +1607,26 @@ impl Filesystem for StudioFuseFs {
     ) {
         let started = Instant::now();
         debug!(ino, fh, "release started");
-        match self.handle_drain().release(ino, fh) {
-            Ok(()) => {
+        let pending_result = if self.async_write_enabled {
+            match self.pending_writes.begin_close(ino, fh) {
+                Ok(barrier) => barrier.wait(),
+                Err(e) => Err(write_registration_error_to_errno(e)),
+            }
+        } else {
+            Ok(())
+        };
+        let release_result = self.handle_drain().release(ino, fh);
+        if self.async_write_enabled {
+            self.pending_writes.finish_close(ino, fh);
+        }
+        match (pending_result, release_result) {
+            (Err(errno), Err(e)) => {
+                error!(
+                    "release({ino}, fh={fh}) observed pending write error: {errno}; local release error: {e}"
+                );
+                reply.error(errno);
+            }
+            (Ok(()), Ok(())) => {
                 debug!(
                     ino,
                     fh,
@@ -1468,7 +1635,11 @@ impl Filesystem for StudioFuseFs {
                 );
                 reply.ok();
             }
-            Err(e) => {
+            (Err(errno), Ok(())) => {
+                error!("release({ino}, fh={fh}) observed pending write error: {errno}");
+                reply.error(errno);
+            }
+            (_, Err(e)) => {
                 error!("release({ino}, fh={fh}) -> {e}");
                 reply.error(vfs_err_to_errno(&e));
             }
@@ -1478,6 +1649,7 @@ impl Filesystem for StudioFuseFs {
     fn fsync(&mut self, _req: &Request<'_>, ino: u64, fh: u64, datasync: bool, reply: ReplyEmpty) {
         let started = Instant::now();
         debug!(ino, fh, datasync, "fsync started");
+        let pending_result = self.wait_pending_writes_for_fsync(ino, fh);
         let result = if fh != 0 {
             // Handle-backed FUSE fsync follows the same local-durability
             // contract as flush_fh: it persists dirty state locally, waits for
@@ -1489,8 +1661,18 @@ impl Filesystem for StudioFuseFs {
         } else {
             self.rt.block_on(self.vfs.fsync(ino, datasync))
         };
-        match result {
-            Ok(()) => {
+        match (pending_result, result) {
+            (Err(errno), Err(e)) => {
+                error!(
+                    "fsync({ino}, fh={fh}) observed pending write error: {errno}; local fsync error: {e}"
+                );
+                reply.error(errno);
+            }
+            (Err(errno), _) => {
+                error!("fsync({ino}, fh={fh}) observed pending write error: {errno}");
+                reply.error(errno);
+            }
+            (Ok(()), Ok(())) => {
                 debug!(
                     ino,
                     fh,
@@ -1500,7 +1682,7 @@ impl Filesystem for StudioFuseFs {
                 );
                 reply.ok();
             }
-            Err(e) => {
+            (Ok(()), Err(e)) => {
                 error!("fsync({ino}, fh={fh}) -> {e}");
                 reply.error(vfs_err_to_errno(&e));
             }
@@ -2156,10 +2338,14 @@ mod tests {
     use super::parse_bridge_bool_env_value;
     use super::{
         DEFAULT_FUSE_MAX_READAHEAD_BYTES, DEFAULT_FUSE_MAX_WRITE_BYTES, FuseBackgroundQueuePolicy,
-        StudioFuseFs, TTL, fuse_write_local_sync_policy, is_expected_macos_trashes_mkdir_exists,
+        FuseWriteReplyGuard, StudioFuseFs, TTL, complete_fuse_write_reply,
+        fuse_write_local_sync_policy, is_expected_macos_trashes_mkdir_exists,
         is_missing_xattr_error, missing_xattr_errno, normalize_unix_mode,
-        posix_flags_to_open_flags, should_log_invalidation_error, to_fuse_attr, vfs_err_to_errno,
+        posix_flags_to_open_flags, should_enable_async_fuse_write_from_env_value,
+        should_log_invalidation_error, to_fuse_attr, vfs_err_to_errno,
     };
+    use crate::fs::pending_write_tracker::PendingWriteTracker;
+    use std::cell::Cell;
     #[cfg(target_os = "macos")]
     use studiofs_meta::engine::{XATTR_CREATE_FLAG, XATTR_REPLACE_FLAG};
 
@@ -2433,6 +2619,149 @@ mod tests {
         for true_value in ["1", "true", "True", "TRUE", "yes", "Yes", "on", "On"] {
             assert!(parse_bridge_bool_env_value(true_value));
         }
+    }
+
+    #[test]
+    fn fuse_async_write_env_is_opt_in_only() {
+        for false_value in ["0", "false", "off", ""] {
+            assert!(!should_enable_async_fuse_write_from_env_value(false_value));
+        }
+
+        for true_value in ["1", "true", "True", "TRUE", "yes", "Yes", "on", "On"] {
+            assert!(should_enable_async_fuse_write_from_env_value(true_value));
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingWriteReply {
+        written: Vec<u32>,
+        errors: Vec<i32>,
+    }
+
+    impl RecordingWriteReply {
+        fn assert_written_once(&self, size: u32) {
+            assert_eq!(self.written, [size]);
+            assert!(self.errors.is_empty());
+        }
+    }
+
+    impl super::FuseWriteReply for &mut RecordingWriteReply {
+        fn written(self, size: u32) {
+            self.written.push(size);
+        }
+
+        fn error(self, errno: i32) {
+            self.errors.push(errno);
+        }
+    }
+
+    struct BarrierCheckingWriteReply<'a> {
+        barrier: &'a super::pending_write_tracker::PendingWriteBarrier,
+        saw_barrier_pending_on_reply: &'a Cell<bool>,
+    }
+
+    impl super::FuseWriteReply for BarrierCheckingWriteReply<'_> {
+        fn written(self, _size: u32) {
+            self.saw_barrier_pending_on_reply
+                .set(!self.barrier.is_ready());
+        }
+
+        fn error(self, _errno: i32) {
+            self.saw_barrier_pending_on_reply
+                .set(!self.barrier.is_ready());
+        }
+    }
+
+    #[test]
+    fn async_write_completion_replies_once_and_marks_success_complete() {
+        let tracker = PendingWriteTracker::default();
+        let registration = tracker.register(42, 7).expect("register write");
+        let barrier = tracker.handle_barrier(42, 7);
+        let mut reply = RecordingWriteReply::default();
+
+        complete_fuse_write_reply(
+            FuseWriteReplyGuard::new(&mut reply),
+            Ok(5),
+            &registration,
+            42,
+            0,
+        );
+
+        reply.assert_written_once(5);
+        assert!(barrier.is_ready());
+        assert_eq!(barrier.wait(), Ok(()));
+    }
+
+    #[test]
+    fn async_write_completion_replies_once_and_marks_error_complete() {
+        let tracker = PendingWriteTracker::default();
+        let registration = tracker.register(42, 7).expect("register write");
+        let barrier = tracker.handle_barrier(42, 7);
+        let mut reply = RecordingWriteReply::default();
+
+        complete_fuse_write_reply(
+            FuseWriteReplyGuard::new(&mut reply),
+            Err(VfsError::WouldBlock),
+            &registration,
+            42,
+            0,
+        );
+
+        assert!(reply.written.is_empty());
+        assert_eq!(reply.errors, [libc::EAGAIN]);
+        assert!(barrier.is_ready());
+        assert_eq!(barrier.wait(), Err(libc::EAGAIN));
+    }
+
+    #[test]
+    fn async_write_completion_replies_before_unblocking_barriers() {
+        let tracker = PendingWriteTracker::default();
+        let registration = tracker.register(42, 7).expect("register write");
+        let barrier = tracker.handle_barrier(42, 7);
+        let saw_barrier_pending_on_reply = Cell::new(false);
+        let reply = BarrierCheckingWriteReply {
+            barrier: &barrier,
+            saw_barrier_pending_on_reply: &saw_barrier_pending_on_reply,
+        };
+
+        complete_fuse_write_reply(FuseWriteReplyGuard::new(reply), Ok(5), &registration, 42, 0);
+
+        assert!(
+            saw_barrier_pending_on_reply.get(),
+            "write reply must be sent before the pending write barrier is unblocked"
+        );
+        assert!(barrier.is_ready());
+    }
+
+    #[test]
+    fn async_write_handle_barrier_surfaces_pending_error() {
+        let (_tmp, _rt, _vfs, mut fs) = make_test_fuse_fs("async-write-handle-barrier");
+        fs.async_write_enabled = true;
+        let pending = fs
+            .pending_writes
+            .register(42, 7)
+            .expect("register pending write");
+        pending.complete(super::PendingWriteCompletion::Error(libc::EIO));
+
+        assert_eq!(fs.wait_pending_writes_for_handle(42, 7), Err(libc::EIO));
+    }
+
+    #[test]
+    fn async_write_fsync_inode_barrier_waits_across_handles() {
+        let (_tmp, _rt, _vfs, mut fs) = make_test_fuse_fs("async-write-inode-barrier");
+        fs.async_write_enabled = true;
+        let first = fs
+            .pending_writes
+            .register(42, 7)
+            .expect("register first pending write");
+        let second = fs
+            .pending_writes
+            .register(42, 8)
+            .expect("register second pending write");
+        first.complete(super::PendingWriteCompletion::Success);
+        second.complete(super::PendingWriteCompletion::Error(libc::EIO));
+
+        assert_eq!(fs.wait_pending_writes_for_fsync(42, 0), Err(libc::EIO));
     }
 
     #[test]

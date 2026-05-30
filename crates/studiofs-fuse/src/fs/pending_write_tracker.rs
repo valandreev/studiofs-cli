@@ -6,6 +6,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use smallvec::{SmallVec, smallvec};
+use tokio::sync::oneshot;
 
 type Ino = u64;
 type FileHandle = u64;
@@ -41,6 +42,7 @@ struct HandleState {
     next_sequence: Sequence,
     lifecycle: HandleLifecycle,
     pending: BTreeSet<Sequence>,
+    turn_waiters: HashMap<Sequence, oneshot::Sender<()>>,
     sticky_error: Option<i32>,
 }
 
@@ -51,6 +53,7 @@ impl Default for HandleState {
             next_sequence: 1,
             lifecycle: HandleLifecycle::Open,
             pending: BTreeSet::new(),
+            turn_waiters: HashMap::new(),
             sticky_error: None,
         }
     }
@@ -87,6 +90,16 @@ pub(super) struct PendingWriteRegistration {
     key: HandleKey,
     sequence: Sequence,
     completion: OnceLock<PendingWriteCompletion>,
+    turn_receiver: Mutex<Option<oneshot::Receiver<()>>>,
+}
+
+#[derive(Debug)]
+pub(super) struct PendingWriteTurn {
+    shared: Arc<SharedTracker>,
+    shard_index: usize,
+    key: HandleKey,
+    sequence: Sequence,
+    turn_receiver: Option<oneshot::Receiver<()>>,
 }
 
 #[derive(Debug)]
@@ -135,6 +148,8 @@ impl PendingWriteTracker {
         let sequence = handle.next_sequence;
         handle.next_sequence += 1;
         handle.pending.insert(sequence);
+        let (turn_sender, turn_receiver) = oneshot::channel();
+        handle.turn_waiters.insert(sequence, turn_sender);
 
         Ok(PendingWriteRegistration {
             shared: Arc::clone(&self.shared),
@@ -142,6 +157,7 @@ impl PendingWriteTracker {
             key: (ino, fh),
             sequence,
             completion: OnceLock::new(),
+            turn_receiver: Mutex::new(Some(turn_receiver)),
         })
     }
 
@@ -237,7 +253,6 @@ impl PendingWriteTracker {
             }
         }
         state.remove_empty_inode(ino);
-        shard.writes_changed.notify_all();
     }
 }
 
@@ -246,6 +261,38 @@ impl PendingWriteRegistration {
         self.sequence
     }
 
+    pub(super) fn turn_waiter(&self) -> PendingWriteTurn {
+        let turn_receiver = self
+            .turn_receiver
+            .lock()
+            .expect("pending write turn receiver poisoned")
+            .take();
+        PendingWriteTurn {
+            shared: Arc::clone(&self.shared),
+            shard_index: self.shard_index,
+            key: self.key,
+            sequence: self.sequence,
+            turn_receiver,
+        }
+    }
+}
+
+impl PendingWriteTurn {
+    pub(super) async fn wait(mut self) {
+        let shard = &self.shared.shards[self.shard_index];
+        {
+            let state = shard.state.lock().expect("pending write tracker poisoned");
+            if state.is_registration_turn(self.key, self.sequence) {
+                return;
+            }
+        }
+        if let Some(receiver) = self.turn_receiver.take() {
+            let _ = receiver.await;
+        }
+    }
+}
+
+impl PendingWriteRegistration {
     pub(super) fn complete(&self, completion: PendingWriteCompletion) {
         if self.completion.set(completion).is_err() {
             return;
@@ -254,6 +301,7 @@ impl PendingWriteRegistration {
         let shard = &self.shared.shards[self.shard_index];
         let mut state = shard.state.lock().expect("pending write tracker poisoned");
         let mut should_remove_closed_handle = false;
+        let mut next_turn = None;
         let mut inode_sticky_error = None;
         let mut generation = None;
         if let Some(handle) = state
@@ -263,6 +311,7 @@ impl PendingWriteRegistration {
         {
             generation = Some(handle.generation);
             handle.pending.remove(&self.sequence);
+            handle.turn_waiters.remove(&self.sequence);
             match completion {
                 PendingWriteCompletion::Success => {}
                 PendingWriteCompletion::Error(errno) => {
@@ -276,6 +325,10 @@ impl PendingWriteRegistration {
             }
             should_remove_closed_handle =
                 handle.lifecycle == HandleLifecycle::Closed && handle.pending.is_empty();
+            next_turn = handle
+                .pending
+                .first()
+                .and_then(|sequence| handle.turn_waiters.remove(sequence));
         }
         if let Some(errno) = inode_sticky_error {
             let generation = generation.unwrap_or_else(|| state.current_generation(self.key.0));
@@ -286,10 +339,17 @@ impl PendingWriteRegistration {
                 .entry(generation)
                 .or_insert(errno);
         }
+        let has_waiters = state.has_barrier_count_for_inode(self.key.0);
         if should_remove_closed_handle {
             state.remove_handle(self.key);
         }
-        shard.writes_changed.notify_all();
+        drop(state);
+        if has_waiters {
+            shard.writes_changed.notify_all();
+        }
+        if let Some(next_turn) = next_turn {
+            let _ = next_turn.send(());
+        }
     }
 }
 
@@ -333,11 +393,17 @@ impl Drop for PendingWriteBarrier {
 
 fn barrier_ready(state: &TrackerState, targets: &[BarrierTarget]) -> bool {
     targets.iter().all(|(key, target, _)| {
-        state
+        match state
             .inodes
             .get(&key.0)
             .and_then(|handles| handles.get(&key.1))
-            .is_none_or(|handle| handle.pending.first().is_none_or(|first| first > target))
+        {
+            Some(handle) => match handle.pending.first() {
+                Some(first) => first > target,
+                None => true,
+            },
+            None => true,
+        }
     })
 }
 
@@ -358,6 +424,20 @@ fn barrier_error(state: &TrackerState, targets: &[BarrierTarget]) -> Option<i32>
 }
 
 impl TrackerState {
+    fn is_registration_turn(&self, key: HandleKey, sequence: Sequence) -> bool {
+        match self
+            .inodes
+            .get(&key.0)
+            .and_then(|handles| handles.get(&key.1))
+        {
+            Some(handle) => match handle.pending.first() {
+                Some(first) => *first >= sequence,
+                None => true,
+            },
+            None => true,
+        }
+    }
+
     fn current_generation(&self, ino: Ino) -> InodeGeneration {
         self.inode_generations.get(&ino).copied().unwrap_or(0)
     }
@@ -448,6 +528,12 @@ impl TrackerState {
         self.barrier_counts
             .get(&ino)
             .is_some_and(|counts| counts.contains_key(&generation))
+    }
+
+    fn has_barrier_count_for_inode(&self, ino: Ino) -> bool {
+        self.barrier_counts
+            .get(&ino)
+            .is_some_and(|counts| !counts.is_empty())
     }
 
     fn has_sticky_error(&self, ino: Ino, generation: InodeGeneration) -> bool {
@@ -721,5 +807,44 @@ mod tests {
 
         assert!(barrier.is_ready());
         assert_eq!(barrier.wait(), Err(libc::EIO));
+    }
+
+    #[test]
+    fn write_turn_waits_for_prior_sequence_on_same_handle() {
+        let tracker = PendingWriteTracker::default();
+        let first = tracker
+            .register(INO, FIRST_FH)
+            .expect("register first write");
+        let second = tracker
+            .register(INO, FIRST_FH)
+            .expect("register second write");
+
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(first.turn_waiter().wait());
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+            started_tx.send(()).expect("send waiter started");
+            rt.block_on(second.turn_waiter().wait());
+            done_tx.send(()).expect("send waiter done");
+            second.complete(PendingWriteCompletion::Success);
+        });
+
+        started_rx.recv().expect("waiter should start");
+        assert_eq!(
+            done_rx.recv_timeout(std::time::Duration::from_millis(25)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+            "later writes on the same handle must wait for prior sequence completion",
+        );
+
+        first.complete(PendingWriteCompletion::Success);
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("waiter should finish after first write");
+        waiter
+            .join()
+            .expect("waiter should finish after first write");
     }
 }
