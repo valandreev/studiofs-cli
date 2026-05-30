@@ -225,6 +225,7 @@ impl PendingWriteTracker {
     pub(super) fn finish_close(&self, ino: Ino, fh: FileHandle) {
         let shard = self.shared.shard_for_inode(ino);
         let mut state = shard.state.lock().expect("pending write tracker poisoned");
+        let has_waiters = state.has_barrier_count_for_inode(ino);
         if let Some(handles) = state.inodes.get_mut(&ino) {
             match handles.get_mut(&fh) {
                 Some(handle) if handle.pending.is_empty() => {
@@ -237,13 +238,26 @@ impl PendingWriteTracker {
             }
         }
         state.remove_empty_inode(ino);
-        shard.writes_changed.notify_all();
+        if has_waiters {
+            shard.writes_changed.notify_all();
+        }
     }
 }
 
 impl PendingWriteRegistration {
     pub(super) fn sequence(&self) -> Sequence {
         self.sequence
+    }
+
+    pub(super) fn wait_for_turn(&self) {
+        let shard = &self.shared.shards[self.shard_index];
+        let mut state = shard.state.lock().expect("pending write tracker poisoned");
+        while !state.is_registration_turn(self.key, self.sequence) {
+            state = shard
+                .writes_changed
+                .wait(state)
+                .expect("pending write tracker poisoned");
+        }
     }
 
     pub(super) fn complete(&self, completion: PendingWriteCompletion) {
@@ -254,6 +268,7 @@ impl PendingWriteRegistration {
         let shard = &self.shared.shards[self.shard_index];
         let mut state = shard.state.lock().expect("pending write tracker poisoned");
         let mut should_remove_closed_handle = false;
+        let mut should_wake_next_write = false;
         let mut inode_sticky_error = None;
         let mut generation = None;
         if let Some(handle) = state
@@ -276,6 +291,7 @@ impl PendingWriteRegistration {
             }
             should_remove_closed_handle =
                 handle.lifecycle == HandleLifecycle::Closed && handle.pending.is_empty();
+            should_wake_next_write = handle.pending.first().is_some();
         }
         if let Some(errno) = inode_sticky_error {
             let generation = generation.unwrap_or_else(|| state.current_generation(self.key.0));
@@ -286,10 +302,13 @@ impl PendingWriteRegistration {
                 .entry(generation)
                 .or_insert(errno);
         }
+        let has_waiters = state.has_barrier_count_for_inode(self.key.0);
         if should_remove_closed_handle {
             state.remove_handle(self.key);
         }
-        shard.writes_changed.notify_all();
+        if has_waiters || should_wake_next_write {
+            shard.writes_changed.notify_all();
+        }
     }
 }
 
@@ -358,6 +377,18 @@ fn barrier_error(state: &TrackerState, targets: &[BarrierTarget]) -> Option<i32>
 }
 
 impl TrackerState {
+    fn is_registration_turn(&self, key: HandleKey, sequence: Sequence) -> bool {
+        self.inodes
+            .get(&key.0)
+            .and_then(|handles| handles.get(&key.1))
+            .is_none_or(|handle| {
+                handle
+                    .pending
+                    .first()
+                    .is_none_or(|first| *first >= sequence)
+            })
+    }
+
     fn current_generation(&self, ino: Ino) -> InodeGeneration {
         self.inode_generations.get(&ino).copied().unwrap_or(0)
     }
@@ -448,6 +479,12 @@ impl TrackerState {
         self.barrier_counts
             .get(&ino)
             .is_some_and(|counts| counts.contains_key(&generation))
+    }
+
+    fn has_barrier_count_for_inode(&self, ino: Ino) -> bool {
+        self.barrier_counts
+            .get(&ino)
+            .is_some_and(|counts| !counts.is_empty())
     }
 
     fn has_sticky_error(&self, ino: Ino, generation: InodeGeneration) -> bool {
@@ -721,5 +758,34 @@ mod tests {
 
         assert!(barrier.is_ready());
         assert_eq!(barrier.wait(), Err(libc::EIO));
+    }
+
+    #[test]
+    fn write_turn_waits_for_prior_sequence_on_same_handle() {
+        let tracker = PendingWriteTracker::default();
+        let first = tracker
+            .register(INO, FIRST_FH)
+            .expect("register first write");
+        let second = tracker
+            .register(INO, FIRST_FH)
+            .expect("register second write");
+
+        first.wait_for_turn();
+
+        let waiter = std::thread::spawn(move || {
+            second.wait_for_turn();
+            second.complete(PendingWriteCompletion::Success);
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        assert!(
+            !waiter.is_finished(),
+            "later writes on the same handle must wait for prior sequence completion"
+        );
+
+        first.complete(PendingWriteCompletion::Success);
+        waiter
+            .join()
+            .expect("waiter should finish after first write");
     }
 }

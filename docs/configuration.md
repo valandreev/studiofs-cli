@@ -167,6 +167,7 @@ Notes:
 - Local data-cache backend provisioning is automatic for the per-volume root under `<cache-dir>/<volume-uuid>` and is owned by `studiofs-cache`; the CLI only resolves cache location and budget inputs.
 - Internal runtime thresholds (dirty headroom, upload local-I/O slots, transit headroom) are derived automatically from cache budget.
 - On Windows and macOS, StudioFS uses the standard Local-First runtime path for every mount. Foreground `flush()` / `close()` confirm local acceptance and surface sticky upload errors deterministically, while upload and file-version publication continue asynchronously.
+- `STUDIOFS_FUSE_ASYNC_WRITE=1` enables the experimental FUSE async write-reply path on Unix FUSE mounts. It copies each FUSE write buffer into owned memory, admits writes on Tokio tasks, serializes writes per file handle before entering the VFS, and keeps `flush`, `fsync`, and `release` behind pending-write barriers. Leave it unset unless validating async FUSE throughput and correctness.
 - Read access is tracked per handle in core VFS, so sequential media readers keep prefetch/L1 promotion behavior even when another handle on the same inode is doing random seeks.
 - `--principal` overrides `STUDIOFS_PRINCIPAL` for this mount process.
 - `--profile` enables optional Pyroscope profiling for the mount runtime.
