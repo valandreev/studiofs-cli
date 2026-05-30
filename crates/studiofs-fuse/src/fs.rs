@@ -338,7 +338,15 @@ fn parse_bridge_optional_usize_env_value(
     }
     match trimmed.parse::<usize>() {
         Ok(value) if value > 0 => Some(value),
-        Ok(_) => None,
+        Ok(_) => {
+            warn!(
+                env_key = key,
+                env_value = trimmed,
+                fallback_value = ?default,
+                "bridge tuning override must be > 0; using default"
+            );
+            default
+        }
         Err(error) => {
             warn!(
                 env_key = key,
@@ -2773,6 +2781,15 @@ mod tests {
                 per_handle_pending_bytes: None,
             }
         );
+    }
+
+    #[test]
+    fn fuse_async_write_admission_policy_zero_env_values_fall_back_to_defaults() {
+        let policy =
+            FuseAsyncWriteAdmissionPolicy::from_env_values(Some("0"), Some("0"), Some("0"));
+        let expected = FuseAsyncWriteAdmissionPolicy::platform_default();
+
+        assert_eq!(policy, expected);
     }
 
     #[derive(Debug, Default)]

@@ -85,8 +85,6 @@ struct TrackerState {
     inode_generations: HashMap<Ino, InodeGeneration>,
     inode_sticky_errors: HashMap<Ino, HashMap<InodeGeneration, i32>>,
     barrier_counts: HashMap<Ino, HashMap<InodeGeneration, usize>>,
-    total_pending_bytes: usize,
-    total_pending_writes: usize,
     admission_metrics: PendingWriteAdmissionMetrics,
 }
 
@@ -98,6 +96,14 @@ pub(super) struct PendingWriteTracker {
 #[derive(Debug)]
 struct SharedTracker {
     shards: [TrackerShard; TRACKER_SHARDS],
+    admission: Mutex<GlobalAdmissionState>,
+    admission_changed: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct GlobalAdmissionState {
+    total_pending_bytes: usize,
+    total_pending_writes: usize,
 }
 
 #[derive(Debug, Default)]
@@ -112,6 +118,7 @@ pub(super) struct PendingWriteRegistration {
     shard_index: usize,
     key: HandleKey,
     sequence: Sequence,
+    bytes: usize,
     completion: OnceLock<PendingWriteCompletion>,
     turn_receiver: Mutex<Option<oneshot::Receiver<()>>>,
 }
@@ -136,6 +143,8 @@ impl Default for SharedTracker {
     fn default() -> Self {
         Self {
             shards: std::array::from_fn(|_| TrackerShard::default()),
+            admission: Mutex::new(GlobalAdmissionState::default()),
+            admission_changed: Condvar::new(),
         }
     }
 }
@@ -177,28 +186,51 @@ impl PendingWriteTracker {
         limits: PendingWriteAdmissionLimits,
     ) -> Result<PendingWriteRegistration, WriteRegistrationError> {
         loop {
+            let mut admission = self
+                .shared
+                .admission
+                .lock()
+                .expect("pending write admission poisoned");
             let shard_index = SharedTracker::shard_index(ino);
             let shard = &self.shared.shards[shard_index];
-            let mut state = shard.state.lock().expect("pending write tracker poisoned");
             let wait_started = Instant::now();
             let mut waited = false;
-            while state.admission_error((ino, fh), bytes, limits)
+            while admission.global_error(bytes, limits)
                 == Some(WriteRegistrationError::AdmissionLimitExceeded)
             {
                 waited = true;
-                state = shard
+                admission = self
+                    .shared
+                    .admission_changed
+                    .wait(admission)
+                    .expect("pending write admission poisoned");
+            }
+            let mut state = shard.state.lock().expect("pending write tracker poisoned");
+            if state.per_handle_admission_error((ino, fh), bytes, limits)
+                == Some(WriteRegistrationError::AdmissionLimitExceeded)
+            {
+                drop(state);
+                drop(admission);
+                let state = shard.state.lock().expect("pending write tracker poisoned");
+                let state = shard
                     .writes_changed
                     .wait(state)
                     .expect("pending write tracker poisoned");
+                drop(state);
+                self.record_admission_wait(shard_index, wait_started.elapsed());
+                continue;
             }
             if waited {
                 state.record_admission_wait(wait_started.elapsed());
             }
-            drop(state);
-            match self.register_pending_write(ino, fh, bytes, limits) {
-                Err(WriteRegistrationError::AdmissionLimitExceeded) => continue,
-                result => return result,
-            }
+            return self.register_pending_write_locked(
+                ino,
+                fh,
+                bytes,
+                shard_index,
+                &mut state,
+                &mut admission,
+            );
         }
     }
 
@@ -233,12 +265,32 @@ impl PendingWriteTracker {
         bytes: usize,
         limits: PendingWriteAdmissionLimits,
     ) -> Result<PendingWriteRegistration, WriteRegistrationError> {
+        let mut admission = self
+            .shared
+            .admission
+            .lock()
+            .expect("pending write admission poisoned");
+        if let Some(error) = admission.global_error(bytes, limits) {
+            return Err(error);
+        }
         let shard_index = SharedTracker::shard_index(ino);
         let shard = &self.shared.shards[shard_index];
         let mut state = shard.state.lock().expect("pending write tracker poisoned");
-        if let Some(error) = state.admission_error((ino, fh), bytes, limits) {
+        if let Some(error) = state.per_handle_admission_error((ino, fh), bytes, limits) {
             return Err(error);
         }
+        self.register_pending_write_locked(ino, fh, bytes, shard_index, &mut state, &mut admission)
+    }
+
+    fn register_pending_write_locked(
+        &self,
+        ino: Ino,
+        fh: FileHandle,
+        bytes: usize,
+        shard_index: usize,
+        state: &mut TrackerState,
+        admission: &mut GlobalAdmissionState,
+    ) -> Result<PendingWriteRegistration, WriteRegistrationError> {
         let generation = state.inode_generation(ino);
         let handle = state.inodes.entry(ino).or_default().entry(fh).or_default();
         handle.generation = generation;
@@ -253,8 +305,8 @@ impl PendingWriteTracker {
         handle.pending.insert(sequence);
         handle.pending_bytes.insert(sequence, bytes);
         handle.total_pending_bytes = handle.total_pending_bytes.saturating_add(bytes);
-        state.total_pending_bytes = state.total_pending_bytes.saturating_add(bytes);
-        state.total_pending_writes = state.total_pending_writes.saturating_add(1);
+        admission.total_pending_bytes = admission.total_pending_bytes.saturating_add(bytes);
+        admission.total_pending_writes = admission.total_pending_writes.saturating_add(1);
         let (turn_sender, turn_receiver) = oneshot::channel();
         state
             .inodes
@@ -269,9 +321,18 @@ impl PendingWriteTracker {
             shard_index,
             key: (ino, fh),
             sequence,
+            bytes,
             completion: OnceLock::new(),
             turn_receiver: Mutex::new(Some(turn_receiver)),
         })
+    }
+
+    fn record_admission_wait(&self, shard_index: usize, elapsed: std::time::Duration) {
+        self.shared.shards[shard_index]
+            .state
+            .lock()
+            .expect("pending write tracker poisoned")
+            .record_admission_wait(elapsed);
     }
 
     pub(super) fn handle_barrier(&self, ino: Ino, fh: FileHandle) -> PendingWriteBarrier {
@@ -417,7 +478,6 @@ impl PendingWriteRegistration {
         let mut next_turn = None;
         let mut inode_sticky_error = None;
         let mut generation = None;
-        let mut released_bytes = 0;
         if let Some(handle) = state
             .inodes
             .get_mut(&self.key.0)
@@ -425,7 +485,7 @@ impl PendingWriteRegistration {
         {
             generation = Some(handle.generation);
             handle.pending.remove(&self.sequence);
-            released_bytes = handle.pending_bytes.remove(&self.sequence).unwrap_or(0);
+            let released_bytes = handle.pending_bytes.remove(&self.sequence).unwrap_or(0);
             handle.total_pending_bytes = handle.total_pending_bytes.saturating_sub(released_bytes);
             handle.turn_waiters.remove(&self.sequence);
             match completion {
@@ -446,10 +506,6 @@ impl PendingWriteRegistration {
                 .first()
                 .and_then(|sequence| handle.turn_waiters.remove(sequence));
         }
-        if released_bytes > 0 || generation.is_some() {
-            state.total_pending_bytes = state.total_pending_bytes.saturating_sub(released_bytes);
-            state.total_pending_writes = state.total_pending_writes.saturating_sub(1);
-        }
         if let Some(errno) = inode_sticky_error {
             let generation = generation.unwrap_or_else(|| state.current_generation(self.key.0));
             state
@@ -459,14 +515,19 @@ impl PendingWriteRegistration {
                 .entry(generation)
                 .or_insert(errno);
         }
-        let has_waiters = state.has_barrier_count_for_inode(self.key.0);
         if should_remove_closed_handle {
             state.remove_handle(self.key);
         }
         drop(state);
-        if has_waiters {
-            shard.writes_changed.notify_all();
-        }
+        let mut admission = self
+            .shared
+            .admission
+            .lock()
+            .expect("pending write admission poisoned");
+        admission.total_pending_bytes = admission.total_pending_bytes.saturating_sub(self.bytes);
+        admission.total_pending_writes = admission.total_pending_writes.saturating_sub(1);
+        drop(admission);
+        self.shared.admission_changed.notify_all();
         shard.writes_changed.notify_all();
         if let Some(next_turn) = next_turn {
             let _ = next_turn.send(());
@@ -551,21 +612,12 @@ impl TrackerState {
         self.admission_metrics.wait_ns = self.admission_metrics.wait_ns.saturating_add(wait_ns);
     }
 
-    fn admission_error(
+    fn per_handle_admission_error(
         &self,
         key: HandleKey,
         bytes: usize,
         limits: PendingWriteAdmissionLimits,
     ) -> Option<WriteRegistrationError> {
-        if limits
-            .max_pending_bytes
-            .is_some_and(|cap| self.total_pending_bytes.saturating_add(bytes) > cap)
-            || limits
-                .max_pending_writes
-                .is_some_and(|cap| self.total_pending_writes.saturating_add(1) > cap)
-        {
-            return Some(WriteRegistrationError::AdmissionLimitExceeded);
-        }
         let handle_pending_bytes = self
             .inodes
             .get(&key.0)
@@ -708,6 +760,25 @@ impl TrackerState {
     }
 }
 
+impl GlobalAdmissionState {
+    fn global_error(
+        &self,
+        bytes: usize,
+        limits: PendingWriteAdmissionLimits,
+    ) -> Option<WriteRegistrationError> {
+        if limits
+            .max_pending_bytes
+            .is_some_and(|cap| self.total_pending_bytes.saturating_add(bytes) > cap)
+            || limits
+                .max_pending_writes
+                .is_some_and(|cap| self.total_pending_writes.saturating_add(1) > cap)
+        {
+            return Some(WriteRegistrationError::AdmissionLimitExceeded);
+        }
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{PendingWriteCompletion, PendingWriteTracker, WriteRegistrationError};
@@ -740,6 +811,65 @@ mod tests {
         tracker
             .register_with_admission(INO, SECOND_FH, 3, limits)
             .expect("released bytes should admit the next write");
+    }
+
+    #[test]
+    fn admission_total_pending_bytes_cap_applies_across_shards() {
+        let tracker = PendingWriteTracker::default();
+        let limits = super::PendingWriteAdmissionLimits {
+            max_pending_bytes: Some(8),
+            max_pending_writes: None,
+            per_handle_pending_bytes: None,
+        };
+        let other_shard_ino = INO + 1;
+        assert_ne!(
+            super::SharedTracker::shard_index(INO),
+            super::SharedTracker::shard_index(other_shard_ino),
+            "test setup must use different tracker shards",
+        );
+        let first = tracker
+            .register_with_admission(INO, FIRST_FH, 6, limits)
+            .expect("first write fits under global byte cap");
+
+        let blocked = tracker
+            .try_register_with_admission(other_shard_ino, FIRST_FH, 3, limits)
+            .expect_err("second shard should still be bound by global byte cap");
+        assert_eq!(
+            blocked,
+            super::WriteRegistrationError::AdmissionLimitExceeded
+        );
+
+        first.complete(PendingWriteCompletion::Success);
+        tracker
+            .register_with_admission(other_shard_ino, FIRST_FH, 3, limits)
+            .expect("released global bytes should admit write on another shard");
+    }
+
+    #[test]
+    fn admission_total_pending_writes_cap_applies_across_shards() {
+        let tracker = PendingWriteTracker::default();
+        let limits = super::PendingWriteAdmissionLimits {
+            max_pending_bytes: None,
+            max_pending_writes: Some(1),
+            per_handle_pending_bytes: None,
+        };
+        let other_shard_ino = INO + 1;
+        let first = tracker
+            .register_with_admission(INO, FIRST_FH, 1, limits)
+            .expect("first write fits under global request cap");
+
+        let blocked = tracker
+            .try_register_with_admission(other_shard_ino, FIRST_FH, 1, limits)
+            .expect_err("second shard should still be bound by global request cap");
+        assert_eq!(
+            blocked,
+            super::WriteRegistrationError::AdmissionLimitExceeded
+        );
+
+        first.complete(PendingWriteCompletion::Success);
+        tracker
+            .register_with_admission(other_shard_ino, FIRST_FH, 1, limits)
+            .expect("released global request slot should admit write on another shard");
     }
 
     #[test]
