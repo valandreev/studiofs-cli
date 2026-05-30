@@ -319,14 +319,14 @@ pub fn validate_namespace_invariants(
             });
         }
 
-        if let Some(parent) = parent_path(&entry.path) {
-            if !directory_paths.contains(parent) {
-                violations.push(NamespaceInvariantViolation {
-                    client: snapshot.client.clone(),
-                    path: entry.path.clone(),
-                    message: "missing parent directory".to_string(),
-                });
-            }
+        if let Some(parent) = parent_path(&entry.path)
+            && !directory_paths.contains(parent)
+        {
+            violations.push(NamespaceInvariantViolation {
+                client: snapshot.client.clone(),
+                path: entry.path.clone(),
+                message: "missing parent directory".to_string(),
+            });
         }
     }
 

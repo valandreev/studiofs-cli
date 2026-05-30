@@ -161,16 +161,16 @@ impl FilePayloadStore {
             }
         };
         let mut payload = vec![0_u8; len];
-        if len > 0 {
-            if let Err(error) = platform::pread_exact(file.as_ref(), &mut payload, 0) {
-                warn!(
-                    object_id,
-                    path = %path.display(),
-                    error = ?error,
-                    "local payload runtime payload get failed"
-                );
-                return None;
-            }
+        if len > 0
+            && let Err(error) = platform::pread_exact(file.as_ref(), &mut payload, 0)
+        {
+            warn!(
+                object_id,
+                path = %path.display(),
+                error = ?error,
+                "local payload runtime payload get failed"
+            );
+            return None;
         }
         Some(Bytes::from(payload))
     }

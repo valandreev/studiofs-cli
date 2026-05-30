@@ -527,10 +527,10 @@ mod imp {
         fn wait_for_pid_file(path: &std::path::Path, timeout: Duration) -> Option<libc::pid_t> {
             let deadline = Instant::now() + timeout;
             loop {
-                if let Ok(contents) = fs::read_to_string(path) {
-                    if let Ok(pid) = contents.trim().parse() {
-                        return Some(pid);
-                    }
+                if let Ok(contents) = fs::read_to_string(path)
+                    && let Ok(pid) = contents.trim().parse()
+                {
+                    return Some(pid);
                 }
                 if Instant::now() >= deadline {
                     return None;

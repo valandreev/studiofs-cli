@@ -153,10 +153,9 @@ impl StudioVfs {
             .lock()
             .get(&(ino, block_index))
             .copied()
+            && pending_content_epoch.is_none_or(|epoch| extent.content_epoch == epoch)
         {
-            if pending_content_epoch.is_none_or(|epoch| extent.content_epoch == epoch) {
-                return Some(extent);
-            }
+            return Some(extent);
         }
 
         let block_offset = (block_index as u64).saturating_mul(self.block_size as u64);

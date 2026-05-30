@@ -968,15 +968,15 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
     pub fn force_kill_all(&mut self) -> Result<(), ClientControllerError> {
         let mut kill_error = None;
         for index in 0..self.clients.len() {
-            if let Some(process) = self.clients[index].process.as_mut() {
-                if let Err(err) = force_kill_process_and_wait(
+            if let Some(process) = self.clients[index].process.as_mut()
+                && let Err(err) = force_kill_process_and_wait(
                     process.as_mut(),
                     "force_kill_all",
                     self.config.mount_exit_timeout,
                     self.config.poll_interval,
-                ) {
-                    kill_error.get_or_insert(err);
-                }
+                )
+            {
+                kill_error.get_or_insert(err);
             }
             self.clients[index].process = None;
             self.clients[index].spec.process_id = None;
@@ -998,10 +998,10 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
     ) -> Result<(), ClientControllerError> {
         let mut kill_error = None;
         for index in 0..self.clients.len() {
-            if let Some(process) = self.clients[index].process.as_mut() {
-                if let Err(err) = process.kill_process_tree(context) {
-                    kill_error.get_or_insert(ClientControllerError::Io(err));
-                }
+            if let Some(process) = self.clients[index].process.as_mut()
+                && let Err(err) = process.kill_process_tree(context)
+            {
+                kill_error.get_or_insert(ClientControllerError::Io(err));
             }
             self.clients[index].process = None;
             self.clients[index].spec.process_id = None;
@@ -1127,32 +1127,32 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         let command = self.unmount_command(index)?;
         let output = self.executor.run(&command)?;
         ensure_success(&command, output)?;
-        if let Some(process) = self.clients[index].process.as_mut() {
-            if let Err(primary) = wait_for_process_exit(
+        if let Some(process) = self.clients[index].process.as_mut()
+            && let Err(primary) = wait_for_process_exit(
                 process.as_mut(),
                 self.config.mount_exit_timeout,
                 self.config.poll_interval,
+            )
+        {
+            match force_kill_process_and_wait(
+                process.as_mut(),
+                "graceful unmount timeout",
+                self.config.mount_exit_timeout,
+                self.config.poll_interval,
             ) {
-                match force_kill_process_and_wait(
-                    process.as_mut(),
-                    "graceful unmount timeout",
-                    self.config.mount_exit_timeout,
-                    self.config.poll_interval,
-                ) {
-                    Ok(()) => {}
-                    Err(error) => {
-                        debug_log_kill_error(
-                            &self.clients[index].spec.name,
-                            "graceful unmount timeout",
-                            &error,
-                        );
-                    }
+                Ok(()) => {}
+                Err(error) => {
+                    debug_log_kill_error(
+                        &self.clients[index].spec.name,
+                        "graceful unmount timeout",
+                        &error,
+                    );
                 }
-                self.clients[index].process = None;
-                self.clients[index].spec.process_id = None;
-                self.clients[index].spec.state = ClientLifecycleState::Killed;
-                return Err(primary);
             }
+            self.clients[index].process = None;
+            self.clients[index].spec.process_id = None;
+            self.clients[index].spec.state = ClientLifecycleState::Killed;
+            return Err(primary);
         }
         self.clients[index].process = None;
         self.clients[index].spec.process_id = None;
@@ -1343,15 +1343,15 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
 impl<E> Drop for MultiClientController<E> {
     fn drop(&mut self) {
         for runtime in &mut self.clients {
-            if let Some(process) = runtime.process.as_mut() {
-                if let Err(error) = force_kill_process_and_wait(
+            if let Some(process) = runtime.process.as_mut()
+                && let Err(error) = force_kill_process_and_wait(
                     process.as_mut(),
                     "controller drop",
                     self.config.mount_exit_timeout,
                     self.config.poll_interval,
-                ) {
-                    debug_log_kill_error(&runtime.spec.name, "controller drop", &error);
-                }
+                )
+            {
+                debug_log_kill_error(&runtime.spec.name, "controller drop", &error);
             }
         }
     }

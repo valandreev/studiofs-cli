@@ -357,15 +357,15 @@ impl StudioVfs {
                 "evict_inode: upload stage batch removal failed"
             );
         }
-        if !object_ids.is_empty() {
-            if let Err(error) = self.payload_store_remove_batch_async(object_ids).await {
-                warn!(
-                    ino,
-                    error = %error,
-                    evicted_blocks = object_ids.len(),
-                    "evict_inode: local backend batch removal failed"
-                );
-            }
+        if !object_ids.is_empty()
+            && let Err(error) = self.payload_store_remove_batch_async(object_ids).await
+        {
+            warn!(
+                ino,
+                error = %error,
+                evicted_blocks = object_ids.len(),
+                "evict_inode: local backend batch removal failed"
+            );
         }
         debug!(
             "evict_inode: ino={} evicted {} blocks, forced_pinned={}",

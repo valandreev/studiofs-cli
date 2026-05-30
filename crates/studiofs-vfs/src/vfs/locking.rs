@@ -178,10 +178,9 @@ impl StudioVfs {
                         if let Err(error) = self
                             .acquire_distributed_flock(cfg, ino, LockKind::Unlock)
                             .await
+                            && first_error.is_none()
                         {
-                            if first_error.is_none() {
-                                first_error = Some(error);
-                            }
+                            first_error = Some(error);
                         }
                         if let Some(error) = first_error {
                             self.state.file_lock.lock_notify.notify_waiters();

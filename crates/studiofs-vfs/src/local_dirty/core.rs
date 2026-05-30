@@ -437,17 +437,16 @@ where
             });
         }
 
-        if !persisted_blocks.is_empty() {
-            if let Err(error) = self
+        if !persisted_blocks.is_empty()
+            && let Err(error) = self
                 .local_payloads
                 .persist_payload(&persisted_blocks, persist_config)
                 .await
-            {
-                self.local_payloads
-                    .cleanup_uncommitted(ino, &persisted_blocks, "payload-persist")
-                    .await;
-                return Err(error);
-            }
+        {
+            self.local_payloads
+                .cleanup_uncommitted(ino, &persisted_blocks, "payload-persist")
+                .await;
+            return Err(error);
         }
 
         let chunk_slices =
