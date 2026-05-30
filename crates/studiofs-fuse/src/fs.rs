@@ -1617,7 +1617,6 @@ impl Filesystem for StudioFuseFs {
             // TODO(SFS-465): Async writes must own the FUSE callback buffer.
             // If this path graduates from experimental, replace per-write Vec
             // allocation with a reusable buffer pool to reduce allocator churn.
-            let data = data.to_vec();
             let data_len = data.len();
             let registration = match self.pending_writes.register_with_admission(
                 ino,
@@ -1631,10 +1630,12 @@ impl Filesystem for StudioFuseFs {
                     return;
                 }
             };
+            let data = data.to_vec();
             let vfs = Arc::clone(&self.vfs);
             let local_sync_policy = fuse_write_local_sync_policy(flags);
             let reply = FuseWriteReplyGuard::new(reply);
             self.rt.spawn(async move {
+                let mut registration = registration;
                 let turn = registration.turn_waiter();
                 turn.wait().await;
                 let result = vfs
