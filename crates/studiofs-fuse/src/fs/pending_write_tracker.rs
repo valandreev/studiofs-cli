@@ -3,11 +3,12 @@
 // intentionally unit-tested in isolation before the bridge starts using it.
 
 use std::collections::{BTreeSet, HashMap};
+use std::pin::Pin;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Instant;
 
 use smallvec::{SmallVec, smallvec};
-use tokio::sync::{Notify, oneshot};
+use tokio::sync::{Notify, futures::OwnedNotified, oneshot};
 
 type Ino = u64;
 type FileHandle = u64;
@@ -552,22 +553,51 @@ impl PendingWriteBarrier {
         if self.targets.is_empty() {
             return Ok(());
         }
-        let shard = &self.shared.shards[self.shard_index];
+        let mut notified = match self.new_enabled_async_notification() {
+            AsyncBarrierWait::Ready(result) => return result,
+            AsyncBarrierWait::Pending(notified) => notified,
+        };
         loop {
-            let mut notified = {
-                let mut state = shard.state.lock().expect("pending write tracker poisoned");
-                if barrier_ready(&state, &self.targets) {
-                    return barrier_error(&state, &self.targets, self.include_inode_errors)
-                        .map_or(Ok(()), Err);
-                }
-                let mut notified =
-                    Box::pin(state.async_write_notifier(&self.targets).notified_owned());
-                notified.as_mut().enable();
-                notified
-            };
-            (&mut notified).await;
+            notified.as_mut().await;
+            if let Some(result) = self.reset_enabled_async_notification(notified.as_mut()) {
+                return result;
+            }
         }
     }
+
+    fn new_enabled_async_notification(&self) -> AsyncBarrierWait {
+        let shard = &self.shared.shards[self.shard_index];
+        let mut state = shard.state.lock().expect("pending write tracker poisoned");
+        if barrier_ready(&state, &self.targets) {
+            return AsyncBarrierWait::Ready(
+                barrier_error(&state, &self.targets, self.include_inode_errors).map_or(Ok(()), Err),
+            );
+        }
+        let mut notified = Box::pin(state.async_write_notifier(&self.targets).notified_owned());
+        notified.as_mut().enable();
+        AsyncBarrierWait::Pending(notified)
+    }
+
+    fn reset_enabled_async_notification(
+        &self,
+        mut notified: Pin<&mut OwnedNotified>,
+    ) -> Option<Result<(), i32>> {
+        let shard = &self.shared.shards[self.shard_index];
+        let mut state = shard.state.lock().expect("pending write tracker poisoned");
+        if barrier_ready(&state, &self.targets) {
+            return Some(
+                barrier_error(&state, &self.targets, self.include_inode_errors).map_or(Ok(()), Err),
+            );
+        }
+        notified.set(state.async_write_notifier(&self.targets).notified_owned());
+        notified.as_mut().enable();
+        None
+    }
+}
+
+enum AsyncBarrierWait {
+    Ready(Result<(), i32>),
+    Pending(Pin<Box<OwnedNotified>>),
 }
 
 impl Drop for PendingWriteBarrier {
