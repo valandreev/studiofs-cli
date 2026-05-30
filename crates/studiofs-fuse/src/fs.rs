@@ -1026,12 +1026,9 @@ impl StudioFuseFs {
         Ok(())
     }
 
-    fn wait_pending_writes_for_fsync(&self, ino: u64, fh: u64) -> Result<(), i32> {
+    fn wait_pending_writes_for_fsync(&self, ino: u64, _fh: u64) -> Result<(), i32> {
         if !self.async_write_enabled {
             return Ok(());
-        }
-        if fh != 0 {
-            return self.pending_writes.handle_barrier(ino, fh).wait();
         }
         self.pending_writes.inode_barrier(ino).wait()
     }
@@ -1845,11 +1842,11 @@ impl Filesystem for StudioFuseFs {
                 }
             };
             let vfs = Arc::clone(&self.vfs);
-            let mut close_guard = PendingFuseCloseGuard::new(self.pending_writes.clone(), ino, fh);
+            let close_guard = PendingFuseCloseGuard::new(self.pending_writes.clone(), ino, fh);
             self.rt.spawn(async move {
+                let _close_guard = close_guard;
                 let pending_result = barrier.wait_async().await;
                 let release_result = vfs.release_fh(fh).await;
-                close_guard.finish();
                 if pending_result.is_ok() && release_result.is_ok() {
                     debug!(
                         ino,
@@ -1912,11 +1909,7 @@ impl Filesystem for StudioFuseFs {
         let started = Instant::now();
         debug!(ino, fh, datasync, "fsync started");
         if self.async_write_enabled {
-            let barrier = if fh != 0 {
-                self.pending_writes.handle_barrier(ino, fh)
-            } else {
-                self.pending_writes.inode_barrier(ino)
-            };
+            let barrier = self.pending_writes.inode_barrier(ino);
             let vfs = Arc::clone(&self.vfs);
             self.rt.spawn(async move {
                 let pending_result = barrier.wait_async().await;
@@ -3093,7 +3086,7 @@ mod tests {
     }
 
     #[test]
-    fn async_write_fsync_handle_barrier_does_not_wait_for_other_handles() {
+    fn async_write_fsync_handle_barrier_waits_across_handles() {
         let (_tmp, _rt, _vfs, mut fs) = make_test_fuse_fs("async-write-handle-fsync-barrier");
         fs.async_write_enabled = true;
         let first = fs
@@ -3107,7 +3100,7 @@ mod tests {
         first.complete(super::PendingWriteCompletion::Success);
         second.complete(super::PendingWriteCompletion::Error(libc::EIO));
 
-        assert_eq!(fs.wait_pending_writes_for_fsync(42, 7), Ok(()));
+        assert_eq!(fs.wait_pending_writes_for_fsync(42, 7), Err(libc::EIO));
     }
 
     #[test]

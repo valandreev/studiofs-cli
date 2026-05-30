@@ -82,6 +82,7 @@ struct TrackerState {
     inode_generations: HashMap<Ino, InodeGeneration>,
     inode_sticky_errors: HashMap<Ino, HashMap<InodeGeneration, i32>>,
     barrier_counts: HashMap<Ino, HashMap<InodeGeneration, usize>>,
+    async_write_notifiers: HashMap<Ino, Arc<Notify>>,
     admission_metrics: PendingWriteAdmissionMetrics,
 }
 
@@ -109,7 +110,6 @@ struct GlobalAdmissionState {
 struct TrackerShard {
     state: Mutex<TrackerState>,
     writes_changed: Condvar,
-    async_writes_changed: Notify,
 }
 
 #[derive(Debug)]
@@ -497,6 +497,7 @@ impl PendingWriteRegistration {
                 .entry(generation)
                 .or_insert(errno);
         }
+        let async_notifier = state.async_write_notifiers.get(&self.key.0).cloned();
         if should_remove_closed_handle {
             state.remove_handle(self.key);
         }
@@ -511,7 +512,9 @@ impl PendingWriteRegistration {
         drop(admission);
         self.shared.admission_changed.notify_all();
         shard.writes_changed.notify_all();
-        shard.async_writes_changed.notify_waiters();
+        if let Some(notifier) = async_notifier {
+            notifier.notify_waiters();
+        }
         if let Some(next_turn) = next_turn {
             let _ = next_turn.send(());
         }
@@ -549,12 +552,12 @@ impl PendingWriteBarrier {
         let shard = &self.shared.shards[self.shard_index];
         loop {
             let notified = {
-                let state = shard.state.lock().expect("pending write tracker poisoned");
+                let mut state = shard.state.lock().expect("pending write tracker poisoned");
                 if barrier_ready(&state, &self.targets) {
                     return barrier_error(&state, &self.targets, self.include_inode_errors)
                         .map_or(Ok(()), Err);
                 }
-                shard.async_writes_changed.notified()
+                state.async_write_notifier(&self.targets).notified_owned()
             };
             notified.await;
         }
@@ -567,6 +570,7 @@ impl Drop for PendingWriteBarrier {
         let mut state = shard.state.lock().expect("pending write tracker poisoned");
         for (key, _, generation) in &self.targets {
             state.decrement_barrier_count(key.0, *generation);
+            state.remove_async_write_notifier_if_unused(key.0);
         }
     }
 }
@@ -760,6 +764,24 @@ impl TrackerState {
             if errors.is_empty() {
                 self.inode_sticky_errors.remove(&ino);
             }
+        }
+    }
+
+    fn async_write_notifier(&mut self, targets: &[BarrierTarget]) -> Arc<Notify> {
+        let ino = targets
+            .first()
+            .map(|(key, _, _)| key.0)
+            .expect("pending write barrier targets must not be empty while waiting");
+        Arc::clone(
+            self.async_write_notifiers
+                .entry(ino)
+                .or_insert_with(|| Arc::new(Notify::new())),
+        )
+    }
+
+    fn remove_async_write_notifier_if_unused(&mut self, ino: Ino) {
+        if !self.has_barrier_count_for_inode(ino) {
+            self.async_write_notifiers.remove(&ino);
         }
     }
 }
@@ -1142,6 +1164,33 @@ mod tests {
         pending.complete(PendingWriteCompletion::Success);
 
         assert_eq!(waiter.await.expect("waiter task should finish"), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn async_barrier_wait_registers_inode_scoped_notifier() {
+        let tracker = PendingWriteTracker::default();
+        let pending = tracker.register(INO, FIRST_FH).expect("register write");
+        let barrier = tracker.handle_barrier(INO, FIRST_FH);
+
+        let waiter = tokio::spawn(async move { barrier.wait_async().await });
+        tokio::task::yield_now().await;
+
+        let shard = tracker.shared.shard_for_inode(INO);
+        {
+            let state = shard.state.lock().expect("pending write tracker poisoned");
+            assert!(state.async_write_notifiers.contains_key(&INO));
+            assert!(
+                !state
+                    .async_write_notifiers
+                    .contains_key(&(INO + super::TRACKER_SHARDS as u64))
+            );
+        }
+
+        pending.complete(PendingWriteCompletion::Success);
+        assert_eq!(waiter.await.expect("waiter task should finish"), Ok(()));
+
+        let state = shard.state.lock().expect("pending write tracker poisoned");
+        assert!(!state.async_write_notifiers.contains_key(&INO));
     }
 
     #[test]
