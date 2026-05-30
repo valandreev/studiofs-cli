@@ -10396,6 +10396,51 @@ fn write_path_observability_reports_fuse_callback_and_vfs_read_counters() {
 }
 
 #[test]
+fn write_path_observability_reports_fuse_async_write_snapshot() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "write-path-observability-fuse-async-write");
+
+    vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
+        enabled: true,
+        platform_policy: "linux".to_string(),
+        max_pending_bytes: Some(128 * 1024 * 1024),
+        max_pending_writes: Some(1024),
+        per_handle_pending_bytes: Some(32 * 1024 * 1024),
+        pending_writes: 3,
+        pending_bytes: 256 * 1024,
+        peak_pending_bytes: 512 * 1024,
+        completed_writes: 17,
+        failed_writes: 2,
+        task_failed_writes: 1,
+        sync_fallbacks: 4,
+        admission_waits: 5,
+        admission_wait_total_ms: 6.5,
+        barrier_waits: 7,
+        barrier_wait_total_ms: 8.5,
+    });
+
+    let snapshot = vfs.write_path_observability_snapshot();
+
+    assert!(snapshot.fuse_async_write.enabled);
+    assert_eq!(snapshot.fuse_async_write.platform_policy, "linux");
+    assert_eq!(
+        snapshot.fuse_async_write.max_pending_bytes,
+        Some(128 * 1024 * 1024)
+    );
+    assert_eq!(snapshot.fuse_async_write.pending_writes, 3);
+    assert_eq!(snapshot.fuse_async_write.pending_bytes, 256 * 1024);
+    assert_eq!(snapshot.fuse_async_write.peak_pending_bytes, 512 * 1024);
+    assert_eq!(snapshot.fuse_async_write.completed_writes, 17);
+    assert_eq!(snapshot.fuse_async_write.failed_writes, 2);
+    assert_eq!(snapshot.fuse_async_write.task_failed_writes, 1);
+    assert_eq!(snapshot.fuse_async_write.sync_fallbacks, 4);
+    assert_eq!(snapshot.fuse_async_write.admission_waits, 5);
+    assert_eq!(snapshot.fuse_async_write.admission_wait_total_ms, 6.5);
+    assert_eq!(snapshot.fuse_async_write.barrier_waits, 7);
+    assert_eq!(snapshot.fuse_async_write.barrier_wait_total_ms, 8.5);
+}
+
+#[test]
 fn write_path_observability_reports_winfsp_write_callback_breakdown() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "write-path-observability-winfsp-breakdown");

@@ -70,16 +70,16 @@ pub use locking::LockKind;
 /// Re-exported VFS observability snapshot and metrics types.
 pub use metrics::{
     StatFs, VfsAttrReadCacheSnapshot, VfsCacheStateSnapshot, VfsFetchStats,
-    VfsForegroundReadProtectionStats, VfsFuseCallbackStats, VfsFuseIoStats, VfsIngressLane,
-    VfsIngressPressure, VfsIngressStats, VfsLatencyHistogramSnapshot, VfsNamespaceCacheSnapshot,
-    VfsPortableAllocatorStats, VfsReadPathStats, VfsRuntimeEvent, VfsSynchronizationStateSnapshot,
-    VfsTransitMemorySnapshot, VfsUploadStats, VfsWritePathBackpressureStats,
-    VfsWritePathBurstStats, VfsWritePathCadenceStats, VfsWritePathDirtyPressureStats,
-    VfsWritePathDrainLagStats, VfsWritePathEagerFlushStats, VfsWritePathLandingZoneStats,
-    VfsWritePathLatencyQuantilesMs, VfsWritePathLatencyQuantilesSaturated,
-    VfsWritePathLocalCacheIoStats, VfsWritePathObservabilitySnapshot,
-    VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats, VfsWritePathTuningStats,
-    VfsWritePathVfsWriteStats, VfsWritePathWinfspCallbackStats,
+    VfsForegroundReadProtectionStats, VfsFuseAsyncWriteSnapshot, VfsFuseCallbackStats,
+    VfsFuseIoStats, VfsIngressLane, VfsIngressPressure, VfsIngressStats,
+    VfsLatencyHistogramSnapshot, VfsNamespaceCacheSnapshot, VfsPortableAllocatorStats,
+    VfsReadPathStats, VfsRuntimeEvent, VfsSynchronizationStateSnapshot, VfsTransitMemorySnapshot,
+    VfsUploadStats, VfsWritePathBackpressureStats, VfsWritePathBurstStats,
+    VfsWritePathCadenceStats, VfsWritePathDirtyPressureStats, VfsWritePathDrainLagStats,
+    VfsWritePathEagerFlushStats, VfsWritePathLandingZoneStats, VfsWritePathLatencyQuantilesMs,
+    VfsWritePathLatencyQuantilesSaturated, VfsWritePathLocalCacheIoStats,
+    VfsWritePathObservabilitySnapshot, VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats,
+    VfsWritePathTuningStats, VfsWritePathVfsWriteStats, VfsWritePathWinfspCallbackStats,
     VfsWritePathWinfspForegroundFlushStats, VfsWritePathWinfspWritePathStats,
     VfsZeroIoCacheBytesSnapshot, VfsZeroIoDrilldownEntry, VfsZeroIoHealthSignal,
     VfsZeroIoRuntimeSnapshot, VfsZeroIoShutdownSnapshot, VfsZeroIoStartupReplaySnapshot,
@@ -2491,6 +2491,7 @@ impl VfsState {
             file_lock: FileLockState::new(),
             shutdown: ShutdownState::new(),
             metrics: MetricsState::new(),
+            fuse_async_write_snapshot: Mutex::new(VfsFuseAsyncWriteSnapshot::default()),
             write_admission_governor: Mutex::new(WriteAdmissionGovernor::default()),
             sustained_write_streams: Mutex::new(HashMap::new()),
             deferred_materialize_inflight: Mutex::new(HashMap::new()),
@@ -2512,6 +2513,7 @@ struct VfsState {
     file_lock: FileLockState,
     shutdown: ShutdownState,
     metrics: MetricsState,
+    fuse_async_write_snapshot: Mutex<VfsFuseAsyncWriteSnapshot>,
     write_admission_governor: Mutex<WriteAdmissionGovernor>,
     sustained_write_streams: Mutex<HashMap<Ino, SustainedWriteState>>,
     /// Tracks inodes that currently have a deferred materialization task
@@ -6581,6 +6583,11 @@ impl StudioVfs {
             .fetch_max(elapsed_ns, Ordering::Relaxed);
     }
 
+    /// Replace the latest async FUSE write bridge diagnostics snapshot.
+    pub fn record_fuse_async_write_snapshot(&self, snapshot: VfsFuseAsyncWriteSnapshot) {
+        *self.state.fuse_async_write_snapshot.lock() = snapshot;
+    }
+
     /// Record write-path stage latency for recording writer stack state.
     pub(super) fn record_vfs_write_record_writer_stack_state(&self, elapsed: Duration) {
         let metrics = &self.state.metrics;
@@ -7278,6 +7285,7 @@ impl StudioVfs {
                     elapsed,
                 ),
             },
+            fuse_async_write: self.state.fuse_async_write_snapshot.lock().clone(),
             landing_zone: VfsWritePathLandingZoneStats {
                 accepted_writes: landing_zone_stats.accepted_writes,
                 accepted_bytes: landing_zone_stats.accepted_bytes,

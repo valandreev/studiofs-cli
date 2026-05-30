@@ -10,7 +10,7 @@ use studiofs_cache::runtime::{
 };
 use studiofs_cache::{OpenLocalPayloadBackendError, open_local_payload_backend};
 use studiofs_meta::counters;
-use studiofs_vfs::VfsWritePathObservabilitySnapshot;
+use studiofs_vfs::{VfsFuseAsyncWriteSnapshot, VfsWritePathObservabilitySnapshot};
 #[cfg(test)]
 use uuid::Uuid;
 
@@ -117,6 +117,58 @@ fn format_staged_upload_cache_pressure_line(
         format_bytes(snapshot.dirty_pressure.pending_upload_bytes as u64),
         format_bytes(snapshot.dirty_pressure.cache_pressure_bytes as u64)
     )
+}
+
+fn format_optional_bytes(value: Option<usize>) -> String {
+    value
+        .map(|bytes| format_bytes(bytes as u64))
+        .unwrap_or_else(|| "unbounded".to_string())
+}
+
+fn format_optional_count(value: Option<usize>) -> String {
+    value
+        .map(|count| count.to_string())
+        .unwrap_or_else(|| "unbounded".to_string())
+}
+
+fn format_fuse_async_write_diagnostics(snapshot: &VfsFuseAsyncWriteSnapshot) -> [String; 5] {
+    let mode = if snapshot.enabled {
+        "enabled"
+    } else {
+        "disabled"
+    };
+    [
+        format!(
+            "  FUSE async writes:        {mode} (policy: {})",
+            snapshot.platform_policy
+        ),
+        format!(
+            "  FUSE async pending:       {} writes, {} current, {} peak",
+            snapshot.pending_writes,
+            format_bytes(snapshot.pending_bytes as u64),
+            format_bytes(snapshot.peak_pending_bytes as u64)
+        ),
+        format!(
+            "  FUSE async caps:          max {}, max writes {}, per-handle {}",
+            format_optional_bytes(snapshot.max_pending_bytes),
+            format_optional_count(snapshot.max_pending_writes),
+            format_optional_bytes(snapshot.per_handle_pending_bytes)
+        ),
+        format!(
+            "  FUSE async completions:   {} ok, {} errors, {} task failures, {} sync fallbacks",
+            snapshot.completed_writes,
+            snapshot.failed_writes,
+            snapshot.task_failed_writes,
+            snapshot.sync_fallbacks
+        ),
+        format!(
+            "  FUSE async waits:         admission {}/{}, barriers {}/{}",
+            snapshot.admission_waits,
+            format_ms(snapshot.admission_wait_total_ms),
+            snapshot.barrier_waits,
+            format_ms(snapshot.barrier_wait_total_ms)
+        ),
+    ]
 }
 
 fn read_write_path_observability(
@@ -248,6 +300,9 @@ fn print_mounted_write_path_fallback(
         format_ms(snapshot.metadata_commit.avg_ms),
         format_ms(snapshot.metadata_commit.max_ms)
     );
+    for line in format_fuse_async_write_diagnostics(&snapshot.fuse_async_write) {
+        println!("{line}");
+    }
 }
 
 fn map_cache_backend_error(
@@ -902,6 +957,7 @@ mod tests {
             vfs_write_path: Default::default(),
             vfs_read_path: Default::default(),
             fuse_callbacks: Default::default(),
+            fuse_async_write: Default::default(),
             landing_zone: Default::default(),
             drain_lag: Default::default(),
             winfsp_foreground_flushes: Default::default(),
@@ -936,6 +992,41 @@ mod tests {
         assert_eq!(
             format_staged_upload_cache_pressure_line(&snapshot),
             "  Staged current/peak/upload/cache pressure: 512B/1.0KiB/2.0KiB/4.0KiB"
+        );
+    }
+
+    #[test]
+    fn mounted_status_formats_fuse_async_write_diagnostics() {
+        let snapshot = studiofs_vfs::VfsFuseAsyncWriteSnapshot {
+            enabled: true,
+            platform_policy: "linux".to_string(),
+            max_pending_bytes: Some(128 * 1024 * 1024),
+            max_pending_writes: Some(1024),
+            per_handle_pending_bytes: Some(32 * 1024 * 1024),
+            pending_writes: 3,
+            pending_bytes: 256 * 1024,
+            peak_pending_bytes: 512 * 1024,
+            completed_writes: 17,
+            failed_writes: 2,
+            task_failed_writes: 1,
+            sync_fallbacks: 4,
+            admission_waits: 5,
+            admission_wait_total_ms: 6.5,
+            barrier_waits: 7,
+            barrier_wait_total_ms: 8.5,
+        };
+
+        let lines = format_fuse_async_write_diagnostics(&snapshot);
+
+        assert_eq!(
+            lines,
+            [
+                "  FUSE async writes:        enabled (policy: linux)",
+                "  FUSE async pending:       3 writes, 256.0KiB current, 512.0KiB peak",
+                "  FUSE async caps:          max 128.0MiB, max writes 1024, per-handle 32.0MiB",
+                "  FUSE async completions:   17 ok, 2 errors, 1 task failures, 4 sync fallbacks",
+                "  FUSE async waits:         admission 5/6.500ms, barriers 7/8.500ms",
+            ]
         );
     }
 

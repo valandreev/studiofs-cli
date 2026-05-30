@@ -77,6 +77,26 @@ pub(super) struct PendingWriteAdmissionMetrics {
     pub(super) wait_ns: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PendingWriteBarrierMetrics {
+    waits: u64,
+    wait_ns: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct PendingWriteTrackerSnapshot {
+    pub(super) pending_writes: usize,
+    pub(super) pending_bytes: usize,
+    pub(super) peak_pending_bytes: usize,
+    pub(super) completed_writes: u64,
+    pub(super) failed_writes: u64,
+    pub(super) task_failed_writes: u64,
+    pub(super) admission_waits: u64,
+    pub(super) admission_wait_ns: u64,
+    pub(super) barrier_waits: u64,
+    pub(super) barrier_wait_ns: u64,
+}
+
 #[derive(Debug, Default)]
 struct TrackerState {
     inodes: HashMap<Ino, HashMap<FileHandle, HandleState>>,
@@ -85,6 +105,7 @@ struct TrackerState {
     barrier_counts: HashMap<Ino, HashMap<InodeGeneration, usize>>,
     async_write_notifiers: HashMap<Ino, Arc<Notify>>,
     admission_metrics: PendingWriteAdmissionMetrics,
+    barrier_metrics: PendingWriteBarrierMetrics,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -105,6 +126,10 @@ struct SharedTracker {
 struct GlobalAdmissionState {
     total_pending_bytes: usize,
     total_pending_writes: usize,
+    peak_pending_bytes: usize,
+    completed_writes: u64,
+    failed_writes: u64,
+    task_failed_writes: u64,
 }
 
 #[derive(Debug, Default)]
@@ -258,6 +283,49 @@ impl PendingWriteTracker {
             )
     }
 
+    pub(super) fn snapshot(&self) -> PendingWriteTrackerSnapshot {
+        let admission_metrics = self.admission_metrics();
+        let barrier_metrics = self.barrier_metrics();
+        let admission = self
+            .shared
+            .admission
+            .lock()
+            .expect("pending write admission poisoned");
+        PendingWriteTrackerSnapshot {
+            pending_writes: admission.total_pending_writes,
+            pending_bytes: admission.total_pending_bytes,
+            peak_pending_bytes: admission.peak_pending_bytes,
+            completed_writes: admission.completed_writes,
+            failed_writes: admission.failed_writes,
+            task_failed_writes: admission.task_failed_writes,
+            admission_waits: admission_metrics.waits,
+            admission_wait_ns: admission_metrics.wait_ns,
+            barrier_waits: barrier_metrics.waits,
+            barrier_wait_ns: barrier_metrics.wait_ns,
+        }
+    }
+
+    fn barrier_metrics(&self) -> PendingWriteBarrierMetrics {
+        self.shared
+            .shards
+            .iter()
+            .map(|shard| {
+                shard
+                    .state
+                    .lock()
+                    .expect("pending write tracker poisoned")
+                    .barrier_metrics
+            })
+            .fold(
+                PendingWriteBarrierMetrics::default(),
+                |mut total, metrics| {
+                    total.waits = total.waits.saturating_add(metrics.waits);
+                    total.wait_ns = total.wait_ns.saturating_add(metrics.wait_ns);
+                    total
+                },
+            )
+    }
+
     fn register_pending_write(
         &self,
         ino: Ino,
@@ -306,6 +374,9 @@ impl PendingWriteTracker {
         handle.total_pending_bytes = handle.total_pending_bytes.saturating_add(bytes);
         admission.total_pending_bytes = admission.total_pending_bytes.saturating_add(bytes);
         admission.total_pending_writes = admission.total_pending_writes.saturating_add(1);
+        admission.peak_pending_bytes = admission
+            .peak_pending_bytes
+            .max(admission.total_pending_bytes);
         let (turn_sender, turn_receiver) = oneshot::channel();
         handle.turn_waiters.insert(sequence, turn_sender);
 
@@ -510,6 +581,17 @@ impl PendingWriteRegistration {
             .expect("pending write admission poisoned");
         admission.total_pending_bytes = admission.total_pending_bytes.saturating_sub(self.bytes);
         admission.total_pending_writes = admission.total_pending_writes.saturating_sub(1);
+        match completion {
+            PendingWriteCompletion::Success => {
+                admission.completed_writes = admission.completed_writes.saturating_add(1);
+            }
+            PendingWriteCompletion::Error(_) => {
+                admission.failed_writes = admission.failed_writes.saturating_add(1);
+            }
+            PendingWriteCompletion::TaskFailed => {
+                admission.task_failed_writes = admission.task_failed_writes.saturating_add(1);
+            }
+        }
         drop(admission);
         self.shared.admission_changed.notify_all();
         shard.writes_changed.notify_all();
@@ -540,11 +622,16 @@ impl PendingWriteBarrier {
     pub(super) fn wait(&self) -> Result<(), i32> {
         let shard = &self.shared.shards[self.shard_index];
         let mut state = shard.state.lock().expect("pending write tracker poisoned");
+        let mut waited_since = None;
         while !barrier_ready(&state, &self.targets) {
+            waited_since.get_or_insert_with(Instant::now);
             state = shard
                 .writes_changed
                 .wait(state)
                 .expect("pending write tracker poisoned");
+        }
+        if let Some(started) = waited_since {
+            state.record_barrier_wait(started.elapsed());
         }
         barrier_error(&state, &self.targets, self.include_inode_errors).map_or(Ok(()), Err)
     }
@@ -557,12 +644,20 @@ impl PendingWriteBarrier {
             AsyncBarrierWait::Ready(result) => return result,
             AsyncBarrierWait::Pending(notified) => notified,
         };
+        let waited_since = Instant::now();
         loop {
             notified.as_mut().await;
             if let Some(result) = self.reset_enabled_async_notification(notified.as_mut()) {
+                self.record_barrier_wait(waited_since.elapsed());
                 return result;
             }
         }
+    }
+
+    fn record_barrier_wait(&self, elapsed: std::time::Duration) {
+        let shard = &self.shared.shards[self.shard_index];
+        let mut state = shard.state.lock().expect("pending write tracker poisoned");
+        state.record_barrier_wait(elapsed);
     }
 
     fn new_enabled_async_notification(&self) -> AsyncBarrierWait {
@@ -658,6 +753,12 @@ impl TrackerState {
         self.admission_metrics.waits = self.admission_metrics.waits.saturating_add(1);
         let wait_ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
         self.admission_metrics.wait_ns = self.admission_metrics.wait_ns.saturating_add(wait_ns);
+    }
+
+    fn record_barrier_wait(&mut self, elapsed: std::time::Duration) {
+        self.barrier_metrics.waits = self.barrier_metrics.waits.saturating_add(1);
+        let wait_ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        self.barrier_metrics.wait_ns = self.barrier_metrics.wait_ns.saturating_add(wait_ns);
     }
 
     fn per_handle_admission_error(
@@ -1129,6 +1230,101 @@ mod tests {
         let metrics = tracker.admission_metrics();
         assert_eq!(metrics.waits, 1);
         assert!(metrics.wait_ns > 0);
+    }
+
+    #[test]
+    fn snapshot_reports_pending_peak_completion_and_admission_waits() {
+        let tracker = PendingWriteTracker::default();
+        let limits = super::PendingWriteAdmissionLimits {
+            max_pending_bytes: Some(10),
+            max_pending_writes: Some(2),
+            per_handle_pending_bytes: None,
+        };
+        let first = tracker
+            .register_with_admission(INO, FIRST_FH, 6, limits)
+            .expect("first write should be admitted");
+        let second = tracker
+            .register_with_admission(INO, SECOND_FH, 4, limits)
+            .expect("second write should be admitted");
+
+        let pending = tracker.snapshot();
+        assert_eq!(pending.pending_writes, 2);
+        assert_eq!(pending.pending_bytes, 10);
+        assert_eq!(pending.peak_pending_bytes, 10);
+        assert_eq!(pending.completed_writes, 0);
+        assert_eq!(pending.failed_writes, 0);
+
+        let waiting_tracker = PendingWriteTracker {
+            shared: std::sync::Arc::clone(&tracker.shared),
+        };
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (admitted_tx, admitted_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            started_tx.send(()).expect("send waiter started");
+            let registration = waiting_tracker
+                .register_with_admission(INO, FIRST_FH, 1, limits)
+                .expect("waited write should be admitted");
+            admitted_tx.send(registration).expect("send registration");
+        });
+
+        started_rx.recv().expect("waiter should start");
+        assert!(
+            matches!(
+                admitted_rx.recv_timeout(std::time::Duration::from_millis(25)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "waiter should block until admission pressure drops",
+        );
+        first.complete(PendingWriteCompletion::Success);
+        let waited = admitted_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("waiter should be admitted after release");
+        second.complete(PendingWriteCompletion::Error(libc::EIO));
+        waited.complete(PendingWriteCompletion::Success);
+        waiter.join().expect("waiter should finish");
+
+        let completed = tracker.snapshot();
+        assert_eq!(completed.pending_writes, 0);
+        assert_eq!(completed.pending_bytes, 0);
+        assert_eq!(completed.peak_pending_bytes, 10);
+        assert_eq!(completed.completed_writes, 2);
+        assert_eq!(completed.failed_writes, 1);
+        assert_eq!(completed.admission_waits, 1);
+        assert!(completed.admission_wait_ns > 0);
+    }
+
+    #[test]
+    fn snapshot_records_blocking_barrier_wait_totals() {
+        let tracker = PendingWriteTracker::default();
+        let pending = tracker.register(INO, FIRST_FH).expect("register write");
+        let barrier = tracker.handle_barrier(INO, FIRST_FH);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            started_tx.send(()).expect("send waiter started");
+            result_tx.send(barrier.wait()).expect("send barrier result");
+        });
+
+        started_rx.recv().expect("waiter should start");
+        assert!(
+            matches!(
+                result_rx.recv_timeout(std::time::Duration::from_millis(25)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "barrier should wait while prior write is pending",
+        );
+        pending.complete(PendingWriteCompletion::Success);
+        assert_eq!(
+            result_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("barrier should resolve"),
+            Ok(())
+        );
+        waiter.join().expect("waiter should finish");
+
+        let snapshot = tracker.snapshot();
+        assert_eq!(snapshot.barrier_waits, 1);
+        assert!(snapshot.barrier_wait_ns > 0);
     }
 
     #[test]

@@ -32,7 +32,7 @@ use studiofs_meta::{FileType, ROOT_INO};
 use studiofs_vfs::is_hidden_non_macos_root_metadata_name;
 use studiofs_vfs::{
     BridgeVfsErrorKind, KernelInvalidator, LocalSyncPolicy, LockKind, OpenFlags, StudioVfs,
-    VfsError, classify_vfs_error, normalize_attr_times,
+    VfsError, VfsFuseAsyncWriteSnapshot, classify_vfs_error, normalize_attr_times,
 };
 use tokio::runtime::Handle;
 use tracing::{debug, error, warn};
@@ -522,12 +522,26 @@ fn complete_fuse_write_reply<R>(
 {
     match result {
         Ok(written) => {
+            debug!(
+                ino,
+                offset,
+                sequence = registration.sequence(),
+                written,
+                "async FUSE write completed"
+            );
             reply.written(written);
             registration.complete(PendingWriteCompletion::Success);
         }
         Err(e) => {
             error!("write({ino}, off={offset}) -> {e}");
             let errno = vfs_err_to_errno(&e);
+            debug!(
+                ino,
+                offset,
+                sequence = registration.sequence(),
+                errno,
+                "async FUSE write failed"
+            );
             reply.error(errno);
             registration.complete(PendingWriteCompletion::Error(errno));
         }
@@ -1106,7 +1120,7 @@ impl StudioFuseFs {
             .async_write_admission_limits
             .map(PendingWriteAdmissionLimits::from)
             .unwrap_or_else(|| FuseAsyncWriteAdmissionPolicy::platform_default().limits);
-        Self {
+        let fs = Self {
             vfs,
             rt,
             pending_writes: PendingWriteTracker::default(),
@@ -1118,7 +1132,17 @@ impl StudioFuseFs {
             },
             mount_uid,
             mount_gid,
-        }
+        };
+        fs.publish_async_write_diagnostics();
+        debug!(
+            async_write_enabled = fs.async_write_enabled,
+            platform_policy = fs.async_write_platform_policy_label(),
+            max_pending_bytes = ?fs.async_write_admission_policy.limits.max_pending_bytes,
+            max_pending_writes = ?fs.async_write_admission_policy.limits.max_pending_writes,
+            per_handle_pending_bytes = ?fs.async_write_admission_policy.limits.per_handle_pending_bytes,
+            "async FUSE write policy selected"
+        );
+        fs
     }
 
     fn handle_drain(&self) -> FuseHandleDrainFacade<'_> {
@@ -1129,17 +1153,77 @@ impl StudioFuseFs {
         if !self.async_write_enabled {
             return Ok(());
         }
-        if fh != 0 {
-            return self.pending_writes.handle_barrier(ino, fh).wait();
-        }
-        self.pending_writes.inode_barrier(ino).wait()
+        let result = if fh != 0 {
+            self.pending_writes.handle_barrier(ino, fh).wait()
+        } else {
+            self.pending_writes.inode_barrier(ino).wait()
+        };
+        self.publish_async_write_diagnostics();
+        result
     }
 
     fn wait_pending_writes_for_fsync(&self, ino: u64, _fh: u64) -> Result<(), i32> {
         if !self.async_write_enabled {
             return Ok(());
         }
-        self.pending_writes.inode_barrier(ino).wait()
+        let result = self.pending_writes.inode_barrier(ino).wait();
+        self.publish_async_write_diagnostics();
+        result
+    }
+
+    fn async_write_platform_policy_label(&self) -> &'static str {
+        #[cfg(target_os = "macos")]
+        {
+            "macos"
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            "linux"
+        }
+
+        #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+        {
+            "unix"
+        }
+    }
+
+    fn publish_async_write_diagnostics(&self) {
+        Self::publish_async_write_diagnostics_snapshot(
+            &self.vfs,
+            self.async_write_enabled,
+            self.async_write_platform_policy_label(),
+            self.async_write_admission_policy.limits,
+            &self.pending_writes,
+        );
+    }
+
+    fn publish_async_write_diagnostics_snapshot(
+        vfs: &StudioVfs,
+        enabled: bool,
+        platform_policy: &'static str,
+        limits: PendingWriteAdmissionLimits,
+        pending_writes: &PendingWriteTracker,
+    ) {
+        let tracker = pending_writes.snapshot();
+        vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
+            enabled,
+            platform_policy: platform_policy.to_string(),
+            max_pending_bytes: limits.max_pending_bytes,
+            max_pending_writes: limits.max_pending_writes,
+            per_handle_pending_bytes: limits.per_handle_pending_bytes,
+            pending_writes: tracker.pending_writes,
+            pending_bytes: tracker.pending_bytes,
+            peak_pending_bytes: tracker.peak_pending_bytes,
+            completed_writes: tracker.completed_writes,
+            failed_writes: tracker.failed_writes,
+            task_failed_writes: tracker.task_failed_writes,
+            sync_fallbacks: 0,
+            admission_waits: tracker.admission_waits,
+            admission_wait_total_ms: tracker.admission_wait_ns as f64 / 1_000_000.0,
+            barrier_waits: tracker.barrier_waits,
+            barrier_wait_total_ms: tracker.barrier_wait_ns as f64 / 1_000_000.0,
+        });
     }
 }
 
@@ -1813,12 +1897,32 @@ impl Filesystem for StudioFuseFs {
             ) {
                 Ok(registration) => registration,
                 Err(e) => {
+                    debug!(
+                        ino,
+                        fh,
+                        offset,
+                        bytes = data_len,
+                        error = ?e,
+                        "async FUSE write admission rejected"
+                    );
                     reply.error(write_registration_error_to_errno(e));
                     return;
                 }
             };
+            self.publish_async_write_diagnostics();
+            debug!(
+                ino,
+                fh,
+                offset,
+                bytes = data_len,
+                sequence = registration.sequence(),
+                "async FUSE write scheduled"
+            );
             let data = data.to_vec();
             let vfs = Arc::clone(&self.vfs);
+            let pending_writes = self.pending_writes.clone();
+            let admission_limits = self.async_write_admission_policy.limits;
+            let platform_policy = self.async_write_platform_policy_label();
             let local_sync_policy = fuse_write_local_sync_policy(flags);
             let reply = FuseWriteReplyGuard::new(reply);
             self.rt.spawn(async move {
@@ -1834,6 +1938,13 @@ impl Filesystem for StudioFuseFs {
                     result.is_err(),
                 );
                 complete_fuse_write_reply(reply, result, &registration, ino, offset);
+                StudioFuseFs::publish_async_write_diagnostics_snapshot(
+                    &vfs,
+                    true,
+                    platform_policy,
+                    admission_limits,
+                    &pending_writes,
+                );
             });
             return;
         }
@@ -1878,9 +1989,25 @@ impl Filesystem for StudioFuseFs {
                 self.pending_writes.inode_barrier(ino)
             };
             let vfs = Arc::clone(&self.vfs);
+            let pending_writes = self.pending_writes.clone();
+            let admission_limits = self.async_write_admission_policy.limits;
+            let platform_policy = self.async_write_platform_policy_label();
             let reply = FuseEmptyReplyGuard::new(reply);
             self.rt.spawn(async move {
                 let pending_result = barrier.wait_async().await;
+                debug!(
+                    ino,
+                    fh,
+                    pending_error = ?pending_result.as_ref().err(),
+                    "async FUSE flush barrier wait completed"
+                );
+                StudioFuseFs::publish_async_write_diagnostics_snapshot(
+                    &vfs,
+                    true,
+                    platform_policy,
+                    admission_limits,
+                    &pending_writes,
+                );
                 let result = if fh != 0 {
                     vfs.flush_fh(fh).await
                 } else {
@@ -1952,10 +2079,26 @@ impl Filesystem for StudioFuseFs {
                 }
             };
             let vfs = Arc::clone(&self.vfs);
+            let pending_writes = self.pending_writes.clone();
+            let admission_limits = self.async_write_admission_policy.limits;
+            let platform_policy = self.async_write_platform_policy_label();
             let mut close_guard = PendingFuseCloseGuard::new(self.pending_writes.clone(), ino, fh);
             let reply = FuseEmptyReplyGuard::new(reply);
             self.rt.spawn(async move {
                 let pending_result = barrier.wait_async().await;
+                debug!(
+                    ino,
+                    fh,
+                    pending_error = ?pending_result.as_ref().err(),
+                    "async FUSE release barrier wait completed"
+                );
+                StudioFuseFs::publish_async_write_diagnostics_snapshot(
+                    &vfs,
+                    true,
+                    platform_policy,
+                    admission_limits,
+                    &pending_writes,
+                );
                 let release_result = vfs.release_fh(fh).await;
                 close_guard.finish();
                 if pending_result.is_ok() && release_result.is_ok() {
@@ -2022,9 +2165,26 @@ impl Filesystem for StudioFuseFs {
         if self.async_write_enabled {
             let barrier = self.pending_writes.inode_barrier(ino);
             let vfs = Arc::clone(&self.vfs);
+            let pending_writes = self.pending_writes.clone();
+            let admission_limits = self.async_write_admission_policy.limits;
+            let platform_policy = self.async_write_platform_policy_label();
             let reply = FuseEmptyReplyGuard::new(reply);
             self.rt.spawn(async move {
                 let pending_result = barrier.wait_async().await;
+                debug!(
+                    ino,
+                    fh,
+                    datasync,
+                    pending_error = ?pending_result.as_ref().err(),
+                    "async FUSE fsync barrier wait completed"
+                );
+                StudioFuseFs::publish_async_write_diagnostics_snapshot(
+                    &vfs,
+                    true,
+                    platform_policy,
+                    admission_limits,
+                    &pending_writes,
+                );
                 let result = if fh != 0 {
                     vfs.flush_fh(fh).await
                 } else {
@@ -2845,6 +3005,53 @@ mod tests {
     }
 
     #[test]
+    fn async_write_diagnostics_publish_policy_and_tracker_state() {
+        let (_tmp, rt, vfs, _env_fs) = make_test_fuse_fs("async-write-diagnostics");
+        let fs = StudioFuseFs::new_with_runtime_options(
+            vfs.clone(),
+            rt.handle().clone(),
+            super::StudioFuseRuntimeOptions {
+                async_write_enabled: true,
+                linux_async_dio_enabled: false,
+                async_write_admission_limits: Some(super::StudioFuseAsyncWriteAdmissionLimits {
+                    max_pending_bytes: Some(4096),
+                    max_pending_writes: Some(7),
+                    per_handle_pending_bytes: Some(1024),
+                }),
+            },
+        );
+        let first = fs
+            .pending_writes
+            .register_with_admission(42, 7, 512, fs.async_write_admission_policy.limits)
+            .expect("register pending async write");
+        let second = fs
+            .pending_writes
+            .register_with_admission(42, 8, 256, fs.async_write_admission_policy.limits)
+            .expect("register second async write");
+        first.complete(super::PendingWriteCompletion::Success);
+
+        fs.publish_async_write_diagnostics();
+        let snapshot = vfs.write_path_observability_snapshot().fuse_async_write;
+
+        assert!(snapshot.enabled);
+        assert_eq!(
+            snapshot.platform_policy,
+            fs.async_write_platform_policy_label()
+        );
+        assert_eq!(snapshot.max_pending_bytes, Some(4096));
+        assert_eq!(snapshot.max_pending_writes, Some(7));
+        assert_eq!(snapshot.per_handle_pending_bytes, Some(1024));
+        assert_eq!(snapshot.pending_writes, 1);
+        assert_eq!(snapshot.pending_bytes, 256);
+        assert_eq!(snapshot.peak_pending_bytes, 768);
+        assert_eq!(snapshot.completed_writes, 1);
+        assert_eq!(snapshot.failed_writes, 0);
+        assert_eq!(snapshot.task_failed_writes, 0);
+
+        second.complete(super::PendingWriteCompletion::Error(libc::EIO));
+    }
+
+    #[test]
     fn normalize_unix_mode_strips_file_type_bits() {
         assert_eq!(normalize_unix_mode(0o40755), 0o755);
         assert_eq!(normalize_unix_mode(0o100644), 0o644);
@@ -3234,6 +3441,30 @@ mod tests {
         pending.complete(super::PendingWriteCompletion::Error(libc::EIO));
 
         assert_eq!(fs.wait_pending_writes_for_handle(42, 7), Err(libc::EIO));
+    }
+
+    #[test]
+    fn async_write_handle_barrier_wait_publishes_wait_totals() {
+        let (_tmp, _rt, vfs, mut fs) = make_test_fuse_fs("async-handle-barrier-wait-metrics");
+        fs.async_write_enabled = true;
+        let pending = fs
+            .pending_writes
+            .register(42, 7)
+            .expect("register pending write");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            started_tx.send(()).expect("send waiter started");
+            fs.wait_pending_writes_for_handle(42, 7)
+        });
+
+        started_rx.recv().expect("waiter should start");
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        pending.complete(super::PendingWriteCompletion::Success);
+        assert_eq!(waiter.join().expect("waiter should finish"), Ok(()));
+
+        let snapshot = vfs.write_path_observability_snapshot().fuse_async_write;
+        assert_eq!(snapshot.barrier_waits, 1);
+        assert!(snapshot.barrier_wait_total_ms > 0.0);
     }
 
     #[test]
