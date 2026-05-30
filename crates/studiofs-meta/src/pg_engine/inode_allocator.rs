@@ -267,10 +267,10 @@ impl PgMetaEngine {
         if let Some(state) = Self::load_valid_persisted_inode_allocator_state(local)? {
             return Ok(Some((state, false)));
         }
-        if let Some(slot) = slot {
-            if let Some(state) = Self::load_legacy_persisted_inode_allocator_state(local, slot)? {
-                return Ok(Some((state, true)));
-            }
+        if let Some(slot) = slot
+            && let Some(state) = Self::load_legacy_persisted_inode_allocator_state(local, slot)?
+        {
+            return Ok(Some((state, true)));
         }
         Ok(None)
     }
@@ -666,19 +666,18 @@ impl PgMetaEngine {
                         "postgres inode/object window refill unavailable after exhausting current window"
                     );
                 }
-            } else if needs_prefetch {
-                if let Err(error) = self
+            } else if needs_prefetch
+                && let Err(error) = self
                     .reserve_inode_window_if_needed(slot, InodeWindowReservationReason::Prefetch)
-                {
-                    warn!(
-                        error = %error,
-                        volume_id = self.volume_id,
-                        current_start = state.current.start,
-                        current_next = state.current.next,
-                        current_end = state.current.end,
-                        "postgres inode/object window prefetch failed; continuing with current local window"
-                    );
-                }
+            {
+                warn!(
+                    error = %error,
+                    volume_id = self.volume_id,
+                    current_start = state.current.start,
+                    current_next = state.current.next,
+                    current_end = state.current.end,
+                    "postgres inode/object window prefetch failed; continuing with current local window"
+                );
             }
 
             return Ok((first..first + count).collect());

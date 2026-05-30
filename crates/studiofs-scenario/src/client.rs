@@ -458,10 +458,10 @@ impl SimulatedRuntime {
             });
         }
         let object_id = entry.object.as_ref().map(|object| object.object_id.clone());
-        if let Some(object_id) = object_id {
-            if !object_id.is_empty() {
-                self.object_store.mark_deleted(&object_id);
-            }
+        if let Some(object_id) = object_id
+            && !object_id.is_empty()
+        {
+            self.object_store.mark_deleted(&object_id);
         }
         self.client_mut(client)?.entries.remove(path);
         self.client_mut(client)?.durable_entries.remove(path);
@@ -952,13 +952,13 @@ impl SimulatedRuntime {
     ) -> Result<Option<u64>, ClientRuntimeError> {
         self.ensure_client(client)?;
         let batch_id = self.metadata_bus.peek_pending_id(client);
-        if let Some(batch_id) = batch_id {
-            if !self.metadata_bus.drop_hint_for(client, batch_id) {
-                return Err(ClientRuntimeError::MissingPendingMetadataHint {
-                    client: client.to_string(),
-                    batch_id,
-                });
-            }
+        if let Some(batch_id) = batch_id
+            && !self.metadata_bus.drop_hint_for(client, batch_id)
+        {
+            return Err(ClientRuntimeError::MissingPendingMetadataHint {
+                client: client.to_string(),
+                batch_id,
+            });
         }
         self.record_with_metadata(
             client,
@@ -981,13 +981,13 @@ impl SimulatedRuntime {
     ) -> Result<Option<u64>, ClientRuntimeError> {
         self.ensure_client(client)?;
         let batch_id = self.metadata_bus.peek_pending_id(client);
-        if let Some(batch_id) = batch_id {
-            if !self.metadata_bus.delay_for(client, batch_id) {
-                return Err(ClientRuntimeError::MissingPendingMetadataHint {
-                    client: client.to_string(),
-                    batch_id,
-                });
-            }
+        if let Some(batch_id) = batch_id
+            && !self.metadata_bus.delay_for(client, batch_id)
+        {
+            return Err(ClientRuntimeError::MissingPendingMetadataHint {
+                client: client.to_string(),
+                batch_id,
+            });
         }
         self.record_with_metadata(
             client,

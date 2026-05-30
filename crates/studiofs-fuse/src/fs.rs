@@ -1,6 +1,7 @@
 //! fuser::Filesystem implementation — bridges FUSE kernel calls to StudioVfs.
 
 mod handle_drain;
+mod pending_write_tracker;
 
 #[cfg(target_os = "macos")]
 use std::borrow::Cow;
@@ -769,28 +770,28 @@ impl Filesystem for StudioFuseFs {
         }
 
         let background_queue_policy = FuseBackgroundQueuePolicy::from_env();
-        if let Some(max_background) = background_queue_policy.max_background {
-            if let Err(supported_limit) = config.set_max_background(max_background) {
-                warn!(
-                    requested = max_background,
-                    supported_limit,
-                    "requested FUSE max_background is outside kernel/libfuse limits; clamping"
-                );
-                if config.set_max_background(supported_limit).is_err() {
-                    return Err(libc::EINVAL);
-                }
+        if let Some(max_background) = background_queue_policy.max_background
+            && let Err(supported_limit) = config.set_max_background(max_background)
+        {
+            warn!(
+                requested = max_background,
+                supported_limit,
+                "requested FUSE max_background is outside kernel/libfuse limits; clamping"
+            );
+            if config.set_max_background(supported_limit).is_err() {
+                return Err(libc::EINVAL);
             }
         }
-        if let Some(congestion_threshold) = background_queue_policy.congestion_threshold {
-            if let Err(supported_limit) = config.set_congestion_threshold(congestion_threshold) {
-                warn!(
-                    requested = congestion_threshold,
-                    supported_limit,
-                    "requested FUSE congestion_threshold is outside kernel/libfuse limits; clamping"
-                );
-                if config.set_congestion_threshold(supported_limit).is_err() {
-                    return Err(libc::EINVAL);
-                }
+        if let Some(congestion_threshold) = background_queue_policy.congestion_threshold
+            && let Err(supported_limit) = config.set_congestion_threshold(congestion_threshold)
+        {
+            warn!(
+                requested = congestion_threshold,
+                supported_limit,
+                "requested FUSE congestion_threshold is outside kernel/libfuse limits; clamping"
+            );
+            if config.set_congestion_threshold(supported_limit).is_err() {
+                return Err(libc::EINVAL);
             }
         }
 

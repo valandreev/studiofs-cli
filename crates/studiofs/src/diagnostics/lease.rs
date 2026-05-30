@@ -82,10 +82,8 @@ impl ControllerLeaseManager {
     }
 
     pub(super) fn expire_if_needed(state: &mut Option<ActiveControllerLease>, now: Instant) {
-        if let Some(lease) = state.as_ref() {
-            if lease.expires_at <= now {
-                *state = None;
-            }
+        if state.as_ref().is_some_and(|lease| lease.expires_at <= now) {
+            *state = None;
         }
     }
 }

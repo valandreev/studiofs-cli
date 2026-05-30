@@ -440,10 +440,8 @@ mod supported {
     }
 
     fn join_optional_thread(name: &str, handle: Option<JoinHandle<()>>) {
-        if let Some(handle) = handle {
-            if handle.join().is_err() {
-                tracing::warn!(thread = name, "background tray helper thread panicked");
-            }
+        if handle.is_some_and(|handle| handle.join().is_err()) {
+            tracing::warn!(thread = name, "background tray helper thread panicked");
         }
     }
 

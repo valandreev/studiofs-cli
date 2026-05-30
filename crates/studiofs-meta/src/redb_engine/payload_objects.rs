@@ -721,10 +721,10 @@ impl RedbMetaEngine {
                 }
 
                 for id in fully_covered {
-                    if let Some(removed) = state.slices.remove(&id) {
-                        if let Some(block) = &removed.payload {
-                            space_delta -= block.length as i64;
-                        }
+                    if let Some(removed) = state.slices.remove(&id)
+                        && let Some(block) = &removed.payload
+                    {
+                        space_delta -= block.length as i64;
                     }
                 }
 

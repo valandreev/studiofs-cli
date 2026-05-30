@@ -1607,10 +1607,10 @@ fn wait_until_n_payload_slices(
 ) -> Option<Vec<(u32, PayloadRef)>> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Ok(blocks) = vfs.meta().lookup_payload_slices(ino) {
-            if blocks.len() >= expected {
-                return Some(blocks);
-            }
+        if let Ok(blocks) = vfs.meta().lookup_payload_slices(ino)
+            && blocks.len() >= expected
+        {
+            return Some(blocks);
         }
         if Instant::now() >= deadline {
             return None;
@@ -1627,10 +1627,10 @@ async fn wait_until_n_payload_slices_async(
 ) -> Option<Vec<(u32, PayloadRef)>> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Ok(blocks) = vfs.meta().lookup_payload_slices(ino) {
-            if blocks.len() >= expected {
-                return Some(blocks);
-            }
+        if let Ok(blocks) = vfs.meta().lookup_payload_slices(ino)
+            && blocks.len() >= expected
+        {
+            return Some(blocks);
         }
         if Instant::now() >= deadline {
             return None;

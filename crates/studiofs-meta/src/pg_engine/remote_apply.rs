@@ -1018,21 +1018,20 @@ impl<'a> RemoteApplyCoordinator<'a> {
         let serving_events: Vec<MetaEvent> = batch_events
             .iter()
             .filter(|event| {
-                if let MetaEvent::SetAttr { attr } = event {
-                    if attr.kind == FileType::RegularFile
-                        && protected_regular_file_inodes.contains(&attr.ino)
-                        && !base_range_preserve_inodes.contains(&attr.ino)
-                        && attr.upload_state == UploadState::Ready
-                        && attr.content_epoch == attr.committed_content_epoch
-                        && attr.size == attr.committed_size
-                        && Self::batch_publish_covers_committed_extent(
-                            &batch_events,
-                            attr.ino,
-                            attr.committed_size,
-                        )
-                    {
-                        return true;
-                    }
+                if let MetaEvent::SetAttr { attr } = event
+                    && attr.kind == FileType::RegularFile
+                    && protected_regular_file_inodes.contains(&attr.ino)
+                    && !base_range_preserve_inodes.contains(&attr.ino)
+                    && attr.upload_state == UploadState::Ready
+                    && attr.content_epoch == attr.committed_content_epoch
+                    && attr.size == attr.committed_size
+                    && Self::batch_publish_covers_committed_extent(
+                        &batch_events,
+                        attr.ino,
+                        attr.committed_size,
+                    )
+                {
+                    return true;
                 }
                 matches!(
                     event,
@@ -1217,10 +1216,10 @@ impl<'a> RemoteApplyCoordinator<'a> {
         recent_flush: Option<&RecentFlush>,
         batch_version: i64,
     ) -> OverlayConflictSets {
-        if let Some(recent_flush) = recent_flush {
-            if batch_version < recent_flush.batch_version {
-                return Self::merge_overlay_conflicts(overlay, &recent_flush.overlay);
-            }
+        if let Some(recent_flush) = recent_flush
+            && batch_version < recent_flush.batch_version
+        {
+            return Self::merge_overlay_conflicts(overlay, &recent_flush.overlay);
         }
         overlay.clone()
     }

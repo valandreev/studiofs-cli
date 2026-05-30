@@ -3780,19 +3780,19 @@ fn test_pg_concurrent_file_vs_dir_same_name_single_winner() {
             );
             a.flush_metadata().expect("flush winner on a");
         }
-    } else if let Ok(entry) = b.lookup(ROOT_INO, b"victim") {
-        if b.get_attr(entry.ino).map(|attr| attr.kind).ok() == Some(FileType::RegularFile) {
-            set_file_state(&b, entry.ino, 64, 1);
-            let block = PayloadRef::new_partial(50_321, 64);
-            b.stage_payload_slice(entry.ino, 0, &block)
-                .expect("set winner block on b");
-            mark_overlay_objects_uploaded(&b, entry.ino, 1, &[block.object_id]);
-            assert!(
-                b.publish_regular_file_overlay_to_base_if_matches(entry.ino, 1)
-                    .expect("publish winner on b")
-            );
-            b.flush_metadata().expect("flush winner on b");
-        }
+    } else if let Ok(entry) = b.lookup(ROOT_INO, b"victim")
+        && b.get_attr(entry.ino).map(|attr| attr.kind).ok() == Some(FileType::RegularFile)
+    {
+        set_file_state(&b, entry.ino, 64, 1);
+        let block = PayloadRef::new_partial(50_321, 64);
+        b.stage_payload_slice(entry.ino, 0, &block)
+            .expect("set winner block on b");
+        mark_overlay_objects_uploaded(&b, entry.ino, 1, &[block.object_id]);
+        assert!(
+            b.publish_regular_file_overlay_to_base_if_matches(entry.ino, 1)
+                .expect("publish winner on b")
+        );
+        b.flush_metadata().expect("flush winner on b");
     }
 
     assert!(wait_until(Duration::from_secs(12), || {
@@ -3875,19 +3875,19 @@ fn test_pg_reopen_after_file_dir_race_recovers_without_discover() {
             );
             a.flush_metadata().expect("flush winner on a");
         }
-    } else if let Ok(entry) = b.lookup(ROOT_INO, b"victim") {
-        if b.get_attr(entry.ino).map(|attr| attr.kind).ok() == Some(FileType::RegularFile) {
-            set_file_state(&b, entry.ino, 64, 1);
-            let block = PayloadRef::new_partial(50_323, 64);
-            b.stage_payload_slice(entry.ino, 0, &block)
-                .expect("set winner block on b");
-            mark_overlay_objects_uploaded(&b, entry.ino, 1, &[block.object_id]);
-            assert!(
-                b.publish_regular_file_overlay_to_base_if_matches(entry.ino, 1)
-                    .expect("publish winner on b")
-            );
-            b.flush_metadata().expect("flush winner on b");
-        }
+    } else if let Ok(entry) = b.lookup(ROOT_INO, b"victim")
+        && b.get_attr(entry.ino).map(|attr| attr.kind).ok() == Some(FileType::RegularFile)
+    {
+        set_file_state(&b, entry.ino, 64, 1);
+        let block = PayloadRef::new_partial(50_323, 64);
+        b.stage_payload_slice(entry.ino, 0, &block)
+            .expect("set winner block on b");
+        mark_overlay_objects_uploaded(&b, entry.ino, 1, &[block.object_id]);
+        assert!(
+            b.publish_regular_file_overlay_to_base_if_matches(entry.ino, 1)
+                .expect("publish winner on b")
+        );
+        b.flush_metadata().expect("flush winner on b");
     }
 
     assert!(wait_until(Duration::from_secs(12), || {

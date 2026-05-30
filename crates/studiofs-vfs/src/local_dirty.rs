@@ -1984,10 +1984,10 @@ impl StudioVfs {
             std::cmp::Ordering::Less => self.subtract_pending_local_dirty_bytes(old_len - new_len),
             std::cmp::Ordering::Equal => {}
         }
-        if let Some(old) = replaced {
-            if let Some(buffer) = old.recycle_buffer() {
-                self.recycle_write_buffer(buffer);
-            }
+        if let Some(old) = replaced
+            && let Some(buffer) = old.recycle_buffer()
+        {
+            self.recycle_write_buffer(buffer);
         }
     }
 
@@ -2183,12 +2183,12 @@ impl StudioVfs {
         let mut pending = self.state.local_dirty.pending_payloads.lock();
         let mut indexes = self.state.local_dirty.pending_payload_indexes.lock();
         let removed = pending.remove(&(ino, block_index));
-        if removed.is_some() {
-            if let Some(inode_indexes) = indexes.get_mut(&ino) {
-                inode_indexes.remove(&block_index);
-                if inode_indexes.is_empty() {
-                    indexes.remove(&ino);
-                }
+        if removed.is_some()
+            && let Some(inode_indexes) = indexes.get_mut(&ino)
+        {
+            inode_indexes.remove(&block_index);
+            if inode_indexes.is_empty() {
+                indexes.remove(&ino);
             }
         }
         drop(indexes);

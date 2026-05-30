@@ -3688,19 +3688,19 @@ impl StudioVfs {
         snapshot.cache_bytes.unclassified_non_evictable_bytes =
             backend_non_evictable_bytes.saturating_sub(classified_non_evictable);
 
-        if let Some(shutdown) = &snapshot.last_graceful_shutdown {
-            if !shutdown.recoverable_on_restart {
-                health_signals.push(VfsZeroIoHealthSignal {
-                    severity: "error".to_string(),
-                    code: "shutdown_not_recoverable".to_string(),
-                    summary:
-                        "last graceful shutdown did not fully flush accepted writes into recoverable local durable state"
-                            .to_string(),
-                    ino: None,
-                    content_epoch: None,
-                    path: None,
-                });
-            }
+        if let Some(shutdown) = &snapshot.last_graceful_shutdown
+            && !shutdown.recoverable_on_restart
+        {
+            health_signals.push(VfsZeroIoHealthSignal {
+                severity: "error".to_string(),
+                code: "shutdown_not_recoverable".to_string(),
+                summary:
+                    "last graceful shutdown did not fully flush accepted writes into recoverable local durable state"
+                        .to_string(),
+                ino: None,
+                content_epoch: None,
+                path: None,
+            });
         }
 
         health_signals.sort_by(|left, right| {

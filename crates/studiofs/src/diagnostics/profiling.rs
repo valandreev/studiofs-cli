@@ -458,14 +458,14 @@ pub(super) fn validate_profiling_request(
             max_duration_ms: MAX_PROFILE_WINDOW_DURATION_MS,
         });
     }
-    if let Some(sample_rate_hz) = request.budget.sample_rate_hz {
-        if !(MIN_PROFILE_SAMPLE_RATE_HZ..=MAX_PROFILE_SAMPLE_RATE_HZ).contains(&sample_rate_hz) {
-            return Err(ProfilingBudgetValidationError::InvalidSampleRate {
-                requested_hz: sample_rate_hz,
-                min_hz: MIN_PROFILE_SAMPLE_RATE_HZ,
-                max_hz: MAX_PROFILE_SAMPLE_RATE_HZ,
-            });
-        }
+    if let Some(sample_rate_hz) = request.budget.sample_rate_hz
+        && !(MIN_PROFILE_SAMPLE_RATE_HZ..=MAX_PROFILE_SAMPLE_RATE_HZ).contains(&sample_rate_hz)
+    {
+        return Err(ProfilingBudgetValidationError::InvalidSampleRate {
+            requested_hz: sample_rate_hz,
+            min_hz: MIN_PROFILE_SAMPLE_RATE_HZ,
+            max_hz: MAX_PROFILE_SAMPLE_RATE_HZ,
+        });
     }
     Ok(())
 }

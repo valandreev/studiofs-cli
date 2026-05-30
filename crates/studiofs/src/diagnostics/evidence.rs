@@ -96,10 +96,10 @@ pub(super) fn object_identity_matches_fields(
     fields: &serde_json::Value,
     identity: &DiagnosticsObjectIdentity,
 ) -> bool {
-    if let Some(inode) = identity.inode {
-        if !json_contains_u64(fields, &["ino", "inode"], inode) {
-            return false;
-        }
+    if let Some(inode) = identity.inode
+        && !json_contains_u64(fields, &["ino", "inode"], inode)
+    {
+        return false;
     }
     match &identity.path {
         Some(path) if !json_contains_string(fields, &["path"], path) => return false,
@@ -133,12 +133,11 @@ pub(super) fn event_matches_scope(
         }
         _ => {}
     }
-    if let Some(marker_span) = marker_span {
-        if event.generated_unix_ms < marker_span.start_unix_ms
-            || event.generated_unix_ms > marker_span.end_unix_ms
-        {
-            return false;
-        }
+    if let Some(marker_span) = marker_span
+        && (event.generated_unix_ms < marker_span.start_unix_ms
+            || event.generated_unix_ms > marker_span.end_unix_ms)
+    {
+        return false;
     }
     true
 }
@@ -327,15 +326,15 @@ pub(super) fn derive_queue_growth_episodes(
         }
     }
 
-    if let Some((start_event, start_pending, end_event, end_pending)) = current {
-        if end_pending > start_pending {
-            episodes.push(queue_growth_episode(
-                start_event,
-                start_pending,
-                end_event,
-                end_pending,
-            ));
-        }
+    if let Some((start_event, start_pending, end_event, end_pending)) = current
+        && end_pending > start_pending
+    {
+        episodes.push(queue_growth_episode(
+            start_event,
+            start_pending,
+            end_event,
+            end_pending,
+        ));
     }
 
     truncate_to_limit(episodes, limit)
@@ -477,58 +476,58 @@ pub(super) fn derive_blocking_intervals(
     limit: usize,
 ) -> (Vec<DiagnosticsBlockingInterval>, bool) {
     let mut intervals = Vec::new();
-    if scope.object_identity.is_none() {
-        if let Some(snapshot) = snapshot {
-            push_blocking_interval(
-                &mut intervals,
-                scope,
-                SUBSYSTEM_WRITE_PATH,
-                OPERATION_SYNC_DATA_QUEUE_WAIT,
-                snapshot
-                    .write_path
-                    .payload_store_sync_data
-                    .queue_wait_total_ms,
-                snapshot
-                    .write_path
-                    .payload_store_sync_data
-                    .queue_wait_max_ms,
-                vec![runtime_snapshot_reference(
-                    "write_path.payload_store_sync_data.queue_wait_total_ms",
-                )],
-            );
-            push_blocking_interval(
-                &mut intervals,
-                scope,
-                SUBSYSTEM_WRITE_PATH,
-                OPERATION_WRITE_BACKPRESSURE,
-                snapshot.write_path.write_backpressure.wait_total_ms as f64,
-                snapshot.write_path.write_backpressure.stall_max_ms as f64,
-                vec![runtime_snapshot_reference(
-                    "write_path.write_backpressure.wait_total_ms",
-                )],
-            );
-            push_blocking_interval(
-                &mut intervals,
-                scope,
-                SUBSYSTEM_SYNCHRONIZATION,
-                OPERATION_UPLOAD_FALLBACK_WAIT,
-                snapshot
-                    .synchronization
-                    .state
-                    .foreground_reads
-                    .upload_fallback_wait_ns as f64
-                    / 1_000_000.0,
-                snapshot
-                    .synchronization
-                    .state
-                    .foreground_reads
-                    .upload_fallback_wait_max_ns as f64
-                    / 1_000_000.0,
-                vec![runtime_snapshot_reference(
-                    "synchronization.state.foreground_reads.upload_fallback_wait_ns",
-                )],
-            );
-        }
+    if scope.object_identity.is_none()
+        && let Some(snapshot) = snapshot
+    {
+        push_blocking_interval(
+            &mut intervals,
+            scope,
+            SUBSYSTEM_WRITE_PATH,
+            OPERATION_SYNC_DATA_QUEUE_WAIT,
+            snapshot
+                .write_path
+                .payload_store_sync_data
+                .queue_wait_total_ms,
+            snapshot
+                .write_path
+                .payload_store_sync_data
+                .queue_wait_max_ms,
+            vec![runtime_snapshot_reference(
+                "write_path.payload_store_sync_data.queue_wait_total_ms",
+            )],
+        );
+        push_blocking_interval(
+            &mut intervals,
+            scope,
+            SUBSYSTEM_WRITE_PATH,
+            OPERATION_WRITE_BACKPRESSURE,
+            snapshot.write_path.write_backpressure.wait_total_ms as f64,
+            snapshot.write_path.write_backpressure.stall_max_ms as f64,
+            vec![runtime_snapshot_reference(
+                "write_path.write_backpressure.wait_total_ms",
+            )],
+        );
+        push_blocking_interval(
+            &mut intervals,
+            scope,
+            SUBSYSTEM_SYNCHRONIZATION,
+            OPERATION_UPLOAD_FALLBACK_WAIT,
+            snapshot
+                .synchronization
+                .state
+                .foreground_reads
+                .upload_fallback_wait_ns as f64
+                / 1_000_000.0,
+            snapshot
+                .synchronization
+                .state
+                .foreground_reads
+                .upload_fallback_wait_max_ns as f64
+                / 1_000_000.0,
+            vec![runtime_snapshot_reference(
+                "synchronization.state.foreground_reads.upload_fallback_wait_ns",
+            )],
+        );
     }
 
     for (window, artifact) in profiling_windows {
@@ -648,65 +647,65 @@ pub(super) fn derive_hotspots(
     limit: usize,
 ) -> (Vec<DiagnosticsHotspotSummary>, bool) {
     let mut hotspots = Vec::new();
-    if scope.object_identity.is_none() {
-        if let Some(snapshot) = snapshot {
-            push_hotspot(
-                &mut hotspots,
-                scope,
-                SUBSYSTEM_UPLOAD_PIPELINE,
-                OPERATION_QUEUE_GROWTH,
-                "pending_uploads",
-                snapshot.upload.pending_uploads as f64,
-                vec![runtime_snapshot_reference("upload.pending_uploads")],
-            );
-            push_hotspot(
-                &mut hotspots,
-                scope,
-                SUBSYSTEM_WRITE_PATH,
-                OPERATION_SYNC_DATA_QUEUE_WAIT,
-                "payload_store_sync_data.queue_wait_total_ms",
-                snapshot
-                    .write_path
-                    .payload_store_sync_data
-                    .queue_wait_total_ms,
-                vec![runtime_snapshot_reference(
-                    "write_path.payload_store_sync_data.queue_wait_total_ms",
-                )],
-            );
-            push_hotspot(
-                &mut hotspots,
-                scope,
-                SUBSYSTEM_WRITE_PATH,
-                OPERATION_WRITE_BACKPRESSURE,
-                "write_backpressure.wait_total_ms",
-                snapshot.write_path.write_backpressure.wait_total_ms as f64,
-                vec![runtime_snapshot_reference(
-                    "write_path.write_backpressure.wait_total_ms",
-                )],
-            );
-            push_hotspot(
-                &mut hotspots,
-                scope,
-                SUBSYSTEM_CACHE,
-                OPERATION_PREFETCH_QUEUE,
-                "prefetch_queue_depth",
-                snapshot.cache.state.prefetch_queue_depth as f64,
-                vec![runtime_snapshot_reference(
-                    "cache.state.prefetch_queue_depth",
-                )],
-            );
-            push_hotspot(
-                &mut hotspots,
-                scope,
-                SUBSYSTEM_SYNCHRONIZATION,
-                OPERATION_METADATA_BACKLOG,
-                "pending_metadata_ops",
-                snapshot.synchronization.state.pending_metadata_ops as f64,
-                vec![runtime_snapshot_reference(
-                    "synchronization.state.pending_metadata_ops",
-                )],
-            );
-        }
+    if scope.object_identity.is_none()
+        && let Some(snapshot) = snapshot
+    {
+        push_hotspot(
+            &mut hotspots,
+            scope,
+            SUBSYSTEM_UPLOAD_PIPELINE,
+            OPERATION_QUEUE_GROWTH,
+            "pending_uploads",
+            snapshot.upload.pending_uploads as f64,
+            vec![runtime_snapshot_reference("upload.pending_uploads")],
+        );
+        push_hotspot(
+            &mut hotspots,
+            scope,
+            SUBSYSTEM_WRITE_PATH,
+            OPERATION_SYNC_DATA_QUEUE_WAIT,
+            "payload_store_sync_data.queue_wait_total_ms",
+            snapshot
+                .write_path
+                .payload_store_sync_data
+                .queue_wait_total_ms,
+            vec![runtime_snapshot_reference(
+                "write_path.payload_store_sync_data.queue_wait_total_ms",
+            )],
+        );
+        push_hotspot(
+            &mut hotspots,
+            scope,
+            SUBSYSTEM_WRITE_PATH,
+            OPERATION_WRITE_BACKPRESSURE,
+            "write_backpressure.wait_total_ms",
+            snapshot.write_path.write_backpressure.wait_total_ms as f64,
+            vec![runtime_snapshot_reference(
+                "write_path.write_backpressure.wait_total_ms",
+            )],
+        );
+        push_hotspot(
+            &mut hotspots,
+            scope,
+            SUBSYSTEM_CACHE,
+            OPERATION_PREFETCH_QUEUE,
+            "prefetch_queue_depth",
+            snapshot.cache.state.prefetch_queue_depth as f64,
+            vec![runtime_snapshot_reference(
+                "cache.state.prefetch_queue_depth",
+            )],
+        );
+        push_hotspot(
+            &mut hotspots,
+            scope,
+            SUBSYSTEM_SYNCHRONIZATION,
+            OPERATION_METADATA_BACKLOG,
+            "pending_metadata_ops",
+            snapshot.synchronization.state.pending_metadata_ops as f64,
+            vec![runtime_snapshot_reference(
+                "synchronization.state.pending_metadata_ops",
+            )],
+        );
     }
 
     for (window, artifact) in profiling_windows {

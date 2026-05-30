@@ -157,15 +157,15 @@ pub fn prepare_local_payload_runtime(
     let cache_root_display = cache_root.display().to_string();
     let retired_runtime_root = cache_root.join(RETIRED_LOCAL_PAYLOAD_SUBTREE);
 
-    if let Ok(metadata) = std::fs::symlink_metadata(&retired_runtime_root) {
-        if is_recognized_retired_runtime_root(&retired_runtime_root, &metadata) {
-            std::fs::remove_dir_all(&retired_runtime_root).map_err(|source| {
-                PrepareLocalPayloadRuntimeError::ProvisionLocalPayloadLayout {
-                    cache_root: cache_root_display.clone(),
-                    source,
-                }
-            })?;
-        }
+    if let Ok(metadata) = std::fs::symlink_metadata(&retired_runtime_root)
+        && is_recognized_retired_runtime_root(&retired_runtime_root, &metadata)
+    {
+        std::fs::remove_dir_all(&retired_runtime_root).map_err(|source| {
+            PrepareLocalPayloadRuntimeError::ProvisionLocalPayloadLayout {
+                cache_root: cache_root_display.clone(),
+                source,
+            }
+        })?;
     }
 
     let mut detection = runtime::detect_cache_backends(cache_root).map_err(|source| {

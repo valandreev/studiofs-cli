@@ -473,11 +473,11 @@ impl FetchScheduler {
         local_cache_hint: LocalCacheHint,
     ) -> Result<Bytes, FetchError> {
         // ── Fast path: cache ────────────────────────────────────────
-        if matches!(local_cache_hint, LocalCacheHint::CheckFastPath) {
-            if let Some(cached) = self.payload_store_get_async(object_id).await? {
-                self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
-                return Ok(cached);
-            }
+        if matches!(local_cache_hint, LocalCacheHint::CheckFastPath)
+            && let Some(cached) = self.payload_store_get_async(object_id).await?
+        {
+            self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(cached);
         }
 
         if matches!(class, FetchClass::Prefetch) && !self.prefetch_admission_open() {

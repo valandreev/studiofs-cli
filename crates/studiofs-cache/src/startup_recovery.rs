@@ -212,10 +212,10 @@ fn read_batch_payload_intent(
             intent.phase = phase.to_string();
             continue;
         }
-        if let Some(row) = line.strip_prefix("object=") {
-            if let Some(object) = parse_batch_payload_intent_object(layout, row) {
-                intent.objects.push(object);
-            }
+        if let Some(row) = line.strip_prefix("object=")
+            && let Some(object) = parse_batch_payload_intent_object(layout, row)
+        {
+            intent.objects.push(object);
         }
     }
     if !saw_version {

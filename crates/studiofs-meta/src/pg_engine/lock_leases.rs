@@ -32,10 +32,10 @@ impl PgMetaEngine {
     }
 
     pub(super) fn cache_file_lock_lease(&self, snapshot: Option<FileLockLease>) {
-        if let Ok(mut cache) = self.file_lock_cache.lock() {
-            if let Some(snapshot) = snapshot {
-                cache.insert(snapshot.ino, snapshot);
-            }
+        if let Ok(mut cache) = self.file_lock_cache.lock()
+            && let Some(snapshot) = snapshot
+        {
+            cache.insert(snapshot.ino, snapshot);
         }
     }
 
