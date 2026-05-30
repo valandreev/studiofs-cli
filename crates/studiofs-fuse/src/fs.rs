@@ -339,6 +339,9 @@ fn parse_bridge_optional_usize_env_value(
     match trimmed.parse::<usize>() {
         Ok(value) if value > 0 => Some(value),
         Ok(_) => {
+            // Empty string explicitly disables admission caps; numeric zero falls
+            // back to the safe platform default so hard caps are not removed by
+            // accident.
             warn!(
                 env_key = key,
                 env_value = trimmed,

@@ -301,13 +301,7 @@ impl PendingWriteTracker {
         admission.total_pending_bytes = admission.total_pending_bytes.saturating_add(bytes);
         admission.total_pending_writes = admission.total_pending_writes.saturating_add(1);
         let (turn_sender, turn_receiver) = oneshot::channel();
-        state
-            .inodes
-            .get_mut(&ino)
-            .and_then(|handles| handles.get_mut(&fh))
-            .expect("registered handle state should exist")
-            .turn_waiters
-            .insert(sequence, turn_sender);
+        handle.turn_waiters.insert(sequence, turn_sender);
 
         Ok(PendingWriteRegistration {
             shared: Arc::clone(&self.shared),
