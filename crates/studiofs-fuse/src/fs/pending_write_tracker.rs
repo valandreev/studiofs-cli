@@ -5,10 +5,14 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
+use smallvec::{SmallVec, smallvec};
+
 type Ino = u64;
 type FileHandle = u64;
 type Sequence = u64;
 type HandleKey = (Ino, FileHandle);
+type InodeGeneration = u64;
+type BarrierTarget = (HandleKey, Sequence, InodeGeneration);
 const TRACKER_SHARDS: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +37,7 @@ enum HandleLifecycle {
 
 #[derive(Debug)]
 struct HandleState {
+    generation: InodeGeneration,
     next_sequence: Sequence,
     lifecycle: HandleLifecycle,
     pending: BTreeSet<Sequence>,
@@ -42,6 +47,7 @@ struct HandleState {
 impl Default for HandleState {
     fn default() -> Self {
         Self {
+            generation: 0,
             next_sequence: 1,
             lifecycle: HandleLifecycle::Open,
             pending: BTreeSet::new(),
@@ -53,7 +59,9 @@ impl Default for HandleState {
 #[derive(Debug, Default)]
 struct TrackerState {
     inodes: HashMap<Ino, HashMap<FileHandle, HandleState>>,
-    inode_sticky_errors: HashMap<Ino, i32>,
+    inode_generations: HashMap<Ino, InodeGeneration>,
+    inode_sticky_errors: HashMap<(Ino, InodeGeneration), i32>,
+    barrier_counts: HashMap<(Ino, InodeGeneration), usize>,
 }
 
 #[derive(Debug, Default)]
@@ -63,7 +71,7 @@ pub(super) struct PendingWriteTracker {
 
 #[derive(Debug)]
 struct SharedTracker {
-    shards: Box<[TrackerShard]>,
+    shards: [TrackerShard; TRACKER_SHARDS],
 }
 
 #[derive(Debug, Default)]
@@ -85,15 +93,14 @@ pub(super) struct PendingWriteRegistration {
 pub(super) struct PendingWriteBarrier {
     shared: Arc<SharedTracker>,
     shard_index: usize,
-    targets: Vec<(HandleKey, Sequence)>,
+    targets: SmallVec<[BarrierTarget; 1]>,
 }
 
 impl Default for SharedTracker {
     fn default() -> Self {
-        let shards = (0..TRACKER_SHARDS)
-            .map(|_| TrackerShard::default())
-            .collect();
-        Self { shards }
+        Self {
+            shards: std::array::from_fn(|_| TrackerShard::default()),
+        }
     }
 }
 
@@ -116,7 +123,9 @@ impl PendingWriteTracker {
         let shard_index = SharedTracker::shard_index(ino);
         let shard = &self.shared.shards[shard_index];
         let mut state = shard.state.lock().expect("pending write tracker poisoned");
+        let generation = state.inode_generation(ino);
         let handle = state.inodes.entry(ino).or_default().entry(fh).or_default();
+        handle.generation = generation;
         match handle.lifecycle {
             HandleLifecycle::Open => {}
             HandleLifecycle::Closing => return Err(WriteRegistrationError::HandleClosing),
@@ -137,7 +146,7 @@ impl PendingWriteTracker {
     }
 
     pub(super) fn handle_barrier(&self, ino: Ino, fh: FileHandle) -> PendingWriteBarrier {
-        self.barrier_for_targets(vec![((ino, fh), self.last_registered_sequence((ino, fh)))])
+        self.barrier_for_targets(smallvec![self.last_registered_target((ino, fh))])
     }
 
     pub(super) fn inode_barrier(&self, ino: Ino) -> PendingWriteBarrier {
@@ -148,9 +157,13 @@ impl PendingWriteTracker {
             .get(&ino)
             .into_iter()
             .flat_map(|handles| {
-                handles
-                    .iter()
-                    .map(move |(&fh, handle)| ((ino, fh), handle.next_sequence.saturating_sub(1)))
+                handles.iter().map(move |(&fh, handle)| {
+                    (
+                        (ino, fh),
+                        handle.next_sequence.saturating_sub(1),
+                        handle.generation,
+                    )
+                })
             })
             .collect();
         drop(state);
@@ -164,7 +177,9 @@ impl PendingWriteTracker {
     ) -> Result<PendingWriteBarrier, WriteRegistrationError> {
         let shard = self.shared.shard_for_inode(ino);
         let mut state = shard.state.lock().expect("pending write tracker poisoned");
+        let generation = state.inode_generation(ino);
         let handle = state.inodes.entry(ino).or_default().entry(fh).or_default();
+        handle.generation = generation;
         match handle.lifecycle {
             HandleLifecycle::Open => handle.lifecycle = HandleLifecycle::Closing,
             HandleLifecycle::Closing => return Err(WriteRegistrationError::HandleClosing),
@@ -172,7 +187,7 @@ impl PendingWriteTracker {
         }
         let target = handle.next_sequence.saturating_sub(1);
         drop(state);
-        Ok(self.barrier_for_targets(vec![((ino, fh), target)]))
+        Ok(self.barrier_for_targets(smallvec![((ino, fh), target, generation)]))
     }
 
     pub(super) fn finish_close(&self, ino: Ino, fh: FileHandle) {
@@ -193,20 +208,33 @@ impl PendingWriteTracker {
         shard.writes_changed.notify_all();
     }
 
-    fn last_registered_sequence(&self, key: HandleKey) -> Sequence {
+    fn last_registered_target(&self, key: HandleKey) -> BarrierTarget {
         let shard = self.shared.shard_for_inode(key.0);
         let state = shard.state.lock().expect("pending write tracker poisoned");
-        state
+        let (sequence, generation) = state
             .inodes
             .get(&key.0)
             .and_then(|handles| handles.get(&key.1))
-            .map_or(0, |handle| handle.next_sequence.saturating_sub(1))
+            .map_or((0, state.current_generation(key.0)), |handle| {
+                (handle.next_sequence.saturating_sub(1), handle.generation)
+            });
+        (key, sequence, generation)
     }
 
-    fn barrier_for_targets(&self, targets: Vec<(HandleKey, Sequence)>) -> PendingWriteBarrier {
+    fn barrier_for_targets(&self, targets: SmallVec<[BarrierTarget; 1]>) -> PendingWriteBarrier {
         let shard_index = targets
             .first()
-            .map_or(0, |(key, _)| SharedTracker::shard_index(key.0));
+            .map_or(0, |(key, _, _)| SharedTracker::shard_index(key.0));
+        {
+            let shard = &self.shared.shards[shard_index];
+            let mut state = shard.state.lock().expect("pending write tracker poisoned");
+            for (key, _, generation) in &targets {
+                *state
+                    .barrier_counts
+                    .entry((key.0, *generation))
+                    .or_insert(0) += 1;
+            }
+        }
         PendingWriteBarrier {
             shared: Arc::clone(&self.shared),
             shard_index,
@@ -250,7 +278,18 @@ impl PendingWriteRegistration {
                 handle.lifecycle == HandleLifecycle::Closed && handle.pending.is_empty();
         }
         if let Some(errno) = inode_sticky_error {
-            state.inode_sticky_errors.entry(self.key.0).or_insert(errno);
+            let generation = state
+                .inodes
+                .get(&self.key.0)
+                .and_then(|handles| handles.get(&self.key.1))
+                .map_or_else(
+                    || state.current_generation(self.key.0),
+                    |handle| handle.generation,
+                );
+            state
+                .inode_sticky_errors
+                .entry((self.key.0, generation))
+                .or_insert(errno);
         }
         if should_remove_closed_handle {
             state.remove_handle(self.key);
@@ -287,8 +326,25 @@ impl PendingWriteBarrier {
     }
 }
 
-fn barrier_ready(state: &TrackerState, targets: &[(HandleKey, Sequence)]) -> bool {
-    targets.iter().all(|(key, target)| {
+impl Drop for PendingWriteBarrier {
+    fn drop(&mut self) {
+        let shard = &self.shared.shards[self.shard_index];
+        let mut state = shard.state.lock().expect("pending write tracker poisoned");
+        for (key, _, generation) in &self.targets {
+            let count_key = (key.0, *generation);
+            if let Some(count) = state.barrier_counts.get_mut(&count_key) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    state.barrier_counts.remove(&count_key);
+                    state.remove_retired_inode_error(count_key);
+                }
+            }
+        }
+    }
+}
+
+fn barrier_ready(state: &TrackerState, targets: &[BarrierTarget]) -> bool {
+    targets.iter().all(|(key, target, _)| {
         state
             .inodes
             .get(&key.0)
@@ -297,17 +353,31 @@ fn barrier_ready(state: &TrackerState, targets: &[(HandleKey, Sequence)]) -> boo
     })
 }
 
-fn barrier_error(state: &TrackerState, targets: &[(HandleKey, Sequence)]) -> Option<i32> {
-    targets.iter().find_map(|(key, _)| {
+fn barrier_error(state: &TrackerState, targets: &[BarrierTarget]) -> Option<i32> {
+    targets.iter().find_map(|(key, _, generation)| {
         state
             .inodes
             .get(&key.0)
             .and_then(|handles| handles.get(&key.1).and_then(|handle| handle.sticky_error))
-            .or_else(|| state.inode_sticky_errors.get(&key.0).copied())
+            .or_else(|| {
+                state
+                    .inode_sticky_errors
+                    .get(&(key.0, *generation))
+                    .copied()
+            })
     })
 }
 
 impl TrackerState {
+    fn current_generation(&self, ino: Ino) -> InodeGeneration {
+        self.inode_generations.get(&ino).copied().unwrap_or(0)
+    }
+
+    fn inode_generation(&mut self, ino: Ino) -> InodeGeneration {
+        self.inode_generations.entry(ino).or_insert(0);
+        self.current_generation(ino)
+    }
+
     fn remove_handle(&mut self, key: HandleKey) {
         if let Some(handles) = self.inodes.get_mut(&key.0) {
             handles.remove(&key.1);
@@ -318,6 +388,40 @@ impl TrackerState {
     fn remove_empty_inode(&mut self, ino: Ino) {
         if self.inodes.get(&ino).is_some_and(HashMap::is_empty) {
             self.inodes.remove(&ino);
+            let generation = self.current_generation(ino);
+            if self.barrier_counts.contains_key(&(ino, generation))
+                || self.inode_sticky_errors.contains_key(&(ino, generation))
+            {
+                self.inode_generations
+                    .insert(ino, generation.saturating_add(1));
+            } else {
+                self.inode_generations.remove(&ino);
+            }
+            self.remove_retired_inode_error((ino, generation));
+        }
+    }
+
+    fn remove_retired_inode_error(&mut self, key: (Ino, InodeGeneration)) {
+        if !self.barrier_counts.contains_key(&key) {
+            self.inode_sticky_errors.remove(&key);
+        }
+        self.remove_unused_inode_generation(key.0);
+    }
+
+    fn remove_unused_inode_generation(&mut self, ino: Ino) {
+        if self.inodes.contains_key(&ino) {
+            return;
+        }
+        let has_barriers = self
+            .barrier_counts
+            .keys()
+            .any(|(barrier_ino, _)| *barrier_ino == ino);
+        let has_errors = self
+            .inode_sticky_errors
+            .keys()
+            .any(|(error_ino, _)| *error_ino == ino);
+        if !has_barriers && !has_errors {
+            self.inode_generations.remove(&ino);
         }
     }
 }
@@ -466,6 +570,62 @@ mod tests {
             barrier.wait(),
             Err(libc::EIO),
             "closed handle cleanup must not hide writeback failures from inode barriers"
+        );
+    }
+
+    #[test]
+    fn closed_inode_error_does_not_poison_reopened_generation() {
+        let tracker = PendingWriteTracker::default();
+        let pending = tracker.register(INO, FIRST_FH).expect("register write");
+        let failed_barrier = tracker.inode_barrier(INO);
+
+        tracker.finish_close(INO, FIRST_FH);
+        pending.complete(PendingWriteCompletion::Error(libc::EIO));
+        assert_eq!(failed_barrier.wait(), Err(libc::EIO));
+
+        let reopened = tracker
+            .register(INO, FIRST_FH)
+            .expect("reopen should start a new inode generation");
+        let reopened_barrier = tracker.handle_barrier(INO, FIRST_FH);
+        reopened.complete(PendingWriteCompletion::Success);
+
+        assert_eq!(
+            reopened_barrier.wait(),
+            Ok(()),
+            "old inode writeback error must not poison a reopened generation"
+        );
+    }
+
+    #[test]
+    fn retired_inode_error_is_removed_after_last_barrier_drops() {
+        let tracker = PendingWriteTracker::default();
+        let pending = tracker.register(INO, FIRST_FH).expect("register write");
+        let barrier = tracker.inode_barrier(INO);
+
+        tracker.finish_close(INO, FIRST_FH);
+        pending.complete(PendingWriteCompletion::Error(libc::EIO));
+        assert_eq!(barrier.wait(), Err(libc::EIO));
+
+        {
+            let shard = tracker.shared.shard_for_inode(INO);
+            let state = shard.state.lock().expect("pending write tracker poisoned");
+            assert!(
+                state.inode_sticky_errors.contains_key(&(INO, 0)),
+                "active barriers keep retired inode errors observable"
+            );
+        }
+
+        drop(barrier);
+
+        let shard = tracker.shared.shard_for_inode(INO);
+        let state = shard.state.lock().expect("pending write tracker poisoned");
+        assert!(
+            !state.inode_sticky_errors.contains_key(&(INO, 0)),
+            "retired inode errors should be removed once no barrier can observe them"
+        );
+        assert!(
+            !state.inode_generations.contains_key(&INO),
+            "closed inodes without barriers or errors should not leak generation state"
         );
     }
 

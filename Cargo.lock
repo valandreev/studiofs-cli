@@ -4783,6 +4783,7 @@ dependencies = [
  "dotenvy",
  "fuser",
  "libc",
+ "smallvec",
  "studiofs-data",
  "studiofs-meta",
  "studiofs-vfs",

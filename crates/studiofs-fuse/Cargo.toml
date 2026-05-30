@@ -22,6 +22,7 @@ unicode-normalization.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+smallvec.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
