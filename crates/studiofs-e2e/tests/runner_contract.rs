@@ -460,6 +460,26 @@ fn scenario_list_appends_performance_probe_after_symlink_attribute() {
 }
 
 #[test]
+fn sfs469_fuse_write_baseline_uses_reserved_98_selector_not_24() {
+    let cli = Cli::try_parse_from(["studiofs-e2e", "run", "--scenario", "98"]).unwrap();
+    let Commands::Run(args) = cli.command else {
+        panic!("expected run command");
+    };
+    assert_eq!(args.scenario_names(), ["98"]);
+
+    let scenarios = studiofs_e2e::scenario::available_scenarios();
+    let names = scenarios
+        .iter()
+        .map(|scenario| scenario.name)
+        .collect::<Vec<_>>();
+    assert_eq!(names[23], "mounted-performance-probe");
+    assert_ne!(
+        scenario_names_by_index(&[24]),
+        ["mounted-fuse-write-baseline"]
+    );
+}
+
+#[test]
 fn symlink_attribute_disabled_run_writes_reproducible_artifacts() {
     let temp = tempdir().unwrap();
     let request = RunRequest {

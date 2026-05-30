@@ -236,8 +236,8 @@ pub(super) use advanced_mounted::*;
 pub(super) use assertions::*;
 pub(super) use faults::*;
 pub(super) use namespace_collision::*;
-pub use performance_probe::MOUNTED_PERFORMANCE_PROBE;
-pub(super) use performance_probe::MountedPerformanceProbe;
+pub use performance_probe::{MOUNTED_FUSE_WRITE_BASELINE, MOUNTED_PERFORMANCE_PROBE};
+pub(super) use performance_probe::{MountedFuseWriteBaseline, MountedPerformanceProbe};
 pub(super) use smoke_outage::*;
 #[cfg(test)]
 pub(super) use test_fixtures::*;
