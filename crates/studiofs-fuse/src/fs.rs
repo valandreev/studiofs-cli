@@ -19,7 +19,8 @@ use fuser::{
 };
 use handle_drain::FuseHandleDrainFacade;
 use pending_write_tracker::{
-    PendingWriteCompletion, PendingWriteRegistration, PendingWriteTracker, WriteRegistrationError,
+    PendingWriteAdmissionLimits, PendingWriteCompletion, PendingWriteRegistration,
+    PendingWriteTracker, WriteRegistrationError,
 };
 #[cfg(target_os = "macos")]
 use studiofs_meta::engine::{XATTR_CREATE_FLAG, XATTR_REPLACE_FLAG};
@@ -55,6 +56,10 @@ const FUSE_AUTO_INVAL_DATA_FLAG: u64 = 1 << 12;
 const STUDIOFS_FUSE_MAX_BACKGROUND_ENV: &str = "STUDIOFS_FUSE_MAX_BACKGROUND";
 const STUDIOFS_FUSE_CONGESTION_THRESHOLD_ENV: &str = "STUDIOFS_FUSE_CONGESTION_THRESHOLD";
 const STUDIOFS_FUSE_ASYNC_WRITE_ENV: &str = "STUDIOFS_FUSE_ASYNC_WRITE";
+const STUDIOFS_FUSE_ASYNC_MAX_PENDING_BYTES_ENV: &str = "STUDIOFS_FUSE_ASYNC_MAX_PENDING_BYTES";
+const STUDIOFS_FUSE_ASYNC_MAX_PENDING_WRITES_ENV: &str = "STUDIOFS_FUSE_ASYNC_MAX_PENDING_WRITES";
+const STUDIOFS_FUSE_ASYNC_PER_HANDLE_PENDING_BYTES_ENV: &str =
+    "STUDIOFS_FUSE_ASYNC_PER_HANDLE_PENDING_BYTES";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FuseBackgroundQueuePolicy {
@@ -115,6 +120,78 @@ impl FuseBackgroundQueuePolicy {
         Self {
             max_background,
             congestion_threshold,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FuseAsyncWriteAdmissionPolicy {
+    limits: PendingWriteAdmissionLimits,
+}
+
+impl FuseAsyncWriteAdmissionPolicy {
+    fn platform_default() -> Self {
+        #[cfg(target_os = "macos")]
+        {
+            Self {
+                limits: PendingWriteAdmissionLimits {
+                    max_pending_bytes: Some(32 * 1024 * 1024),
+                    max_pending_writes: Some(256),
+                    per_handle_pending_bytes: Some(8 * 1024 * 1024),
+                },
+            }
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            Self {
+                limits: PendingWriteAdmissionLimits {
+                    max_pending_bytes: Some(128 * 1024 * 1024),
+                    max_pending_writes: Some(1024),
+                    per_handle_pending_bytes: Some(32 * 1024 * 1024),
+                },
+            }
+        }
+    }
+
+    fn from_env() -> Self {
+        Self::from_env_values(
+            std::env::var(STUDIOFS_FUSE_ASYNC_MAX_PENDING_BYTES_ENV)
+                .ok()
+                .as_deref(),
+            std::env::var(STUDIOFS_FUSE_ASYNC_MAX_PENDING_WRITES_ENV)
+                .ok()
+                .as_deref(),
+            std::env::var(STUDIOFS_FUSE_ASYNC_PER_HANDLE_PENDING_BYTES_ENV)
+                .ok()
+                .as_deref(),
+        )
+    }
+
+    fn from_env_values(
+        max_pending_bytes: Option<&str>,
+        max_pending_writes: Option<&str>,
+        per_handle_pending_bytes: Option<&str>,
+    ) -> Self {
+        let defaults = Self::platform_default().limits;
+        Self {
+            limits: PendingWriteAdmissionLimits {
+                max_pending_bytes: parse_bridge_optional_usize_env_value(
+                    STUDIOFS_FUSE_ASYNC_MAX_PENDING_BYTES_ENV,
+                    max_pending_bytes,
+                    defaults.max_pending_bytes,
+                ),
+                max_pending_writes: parse_bridge_optional_usize_env_value(
+                    STUDIOFS_FUSE_ASYNC_MAX_PENDING_WRITES_ENV,
+                    max_pending_writes,
+                    defaults.max_pending_writes,
+                ),
+                per_handle_pending_bytes: parse_bridge_optional_usize_env_value(
+                    STUDIOFS_FUSE_ASYNC_PER_HANDLE_PENDING_BYTES_ENV,
+                    per_handle_pending_bytes,
+                    defaults.per_handle_pending_bytes,
+                ),
+            },
         }
     }
 }
@@ -247,6 +324,34 @@ fn parse_bridge_optional_u16_env_value(
     }
 }
 
+fn parse_bridge_optional_usize_env_value(
+    key: &str,
+    raw: Option<&str>,
+    default: Option<usize>,
+) -> Option<usize> {
+    let Some(raw) = raw else {
+        return default;
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match trimmed.parse::<usize>() {
+        Ok(value) if value > 0 => Some(value),
+        Ok(_) => None,
+        Err(error) => {
+            warn!(
+                env_key = key,
+                env_value = trimmed,
+                fallback_value = ?default,
+                error = %error,
+                "invalid bridge tuning override; using default"
+            );
+            default
+        }
+    }
+}
+
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 fn parse_bridge_bool_env_value(raw: &str) -> bool {
     let trimmed = raw.trim();
@@ -347,6 +452,7 @@ fn write_registration_error_to_errno(error: WriteRegistrationError) -> i32 {
     match error {
         WriteRegistrationError::HandleClosing => libc::EAGAIN,
         WriteRegistrationError::HandleClosed => libc::EIO,
+        WriteRegistrationError::AdmissionLimitExceeded => libc::EAGAIN,
     }
 }
 
@@ -796,6 +902,7 @@ pub struct StudioFuseFs {
     rt: Handle,
     pending_writes: PendingWriteTracker,
     async_write_enabled: bool,
+    async_write_admission_policy: FuseAsyncWriteAdmissionPolicy,
     /// UID of the user that mounted the filesystem. Inodes owned by uid=0 in
     /// the DB are remapped to this so macOS permission checks don't block writes.
     mount_uid: u32,
@@ -816,6 +923,7 @@ impl StudioFuseFs {
             rt,
             pending_writes: PendingWriteTracker::default(),
             async_write_enabled: should_enable_async_fuse_write_from_env(),
+            async_write_admission_policy: FuseAsyncWriteAdmissionPolicy::from_env(),
             mount_uid,
             mount_gid,
         }
@@ -1503,7 +1611,12 @@ impl Filesystem for StudioFuseFs {
             // allocation with a reusable buffer pool to reduce allocator churn.
             let data = data.to_vec();
             let data_len = data.len();
-            let registration = match self.pending_writes.register(ino, fh) {
+            let registration = match self.pending_writes.register_with_admission(
+                ino,
+                fh,
+                data_len,
+                self.async_write_admission_policy.limits,
+            ) {
                 Ok(registration) => registration,
                 Err(e) => {
                     reply.error(write_registration_error_to_errno(e));
@@ -2337,14 +2450,15 @@ mod tests {
     use super::fuse_open_reply_flags;
     use super::parse_bridge_bool_env_value;
     use super::{
-        DEFAULT_FUSE_MAX_READAHEAD_BYTES, DEFAULT_FUSE_MAX_WRITE_BYTES, FuseBackgroundQueuePolicy,
-        FuseWriteReplyGuard, StudioFuseFs, TTL, complete_fuse_write_reply,
-        fuse_write_local_sync_policy, is_expected_macos_trashes_mkdir_exists,
-        is_missing_xattr_error, missing_xattr_errno, normalize_unix_mode,
-        posix_flags_to_open_flags, should_enable_async_fuse_write_from_env_value,
-        should_log_invalidation_error, to_fuse_attr, vfs_err_to_errno,
+        DEFAULT_FUSE_MAX_READAHEAD_BYTES, DEFAULT_FUSE_MAX_WRITE_BYTES,
+        FuseAsyncWriteAdmissionPolicy, FuseBackgroundQueuePolicy, FuseWriteReplyGuard,
+        StudioFuseFs, TTL, complete_fuse_write_reply, fuse_write_local_sync_policy,
+        is_expected_macos_trashes_mkdir_exists, is_missing_xattr_error, missing_xattr_errno,
+        normalize_unix_mode, posix_flags_to_open_flags,
+        should_enable_async_fuse_write_from_env_value, should_log_invalidation_error, to_fuse_attr,
+        vfs_err_to_errno,
     };
-    use crate::fs::pending_write_tracker::PendingWriteTracker;
+    use crate::fs::pending_write_tracker::{PendingWriteAdmissionLimits, PendingWriteTracker};
     use std::cell::Cell;
     #[cfg(target_os = "macos")]
     use studiofs_meta::engine::{XATTR_CREATE_FLAG, XATTR_REPLACE_FLAG};
@@ -2630,6 +2744,35 @@ mod tests {
         for true_value in ["1", "true", "True", "TRUE", "yes", "Yes", "on", "On"] {
             assert!(should_enable_async_fuse_write_from_env_value(true_value));
         }
+    }
+
+    #[test]
+    fn fuse_async_write_admission_policy_env_overrides_defaults() {
+        let policy =
+            FuseAsyncWriteAdmissionPolicy::from_env_values(Some("4096"), Some("9"), Some("1024"));
+
+        assert_eq!(
+            policy.limits,
+            PendingWriteAdmissionLimits {
+                max_pending_bytes: Some(4096),
+                max_pending_writes: Some(9),
+                per_handle_pending_bytes: Some(1024),
+            }
+        );
+    }
+
+    #[test]
+    fn fuse_async_write_admission_policy_empty_env_values_disable_limits() {
+        let policy = FuseAsyncWriteAdmissionPolicy::from_env_values(Some(""), Some(" "), Some(""));
+
+        assert_eq!(
+            policy.limits,
+            PendingWriteAdmissionLimits {
+                max_pending_bytes: None,
+                max_pending_writes: None,
+                per_handle_pending_bytes: None,
+            }
+        );
     }
 
     #[derive(Debug, Default)]
