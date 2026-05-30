@@ -255,11 +255,13 @@ impl PendingWriteRegistration {
         let mut state = shard.state.lock().expect("pending write tracker poisoned");
         let mut should_remove_closed_handle = false;
         let mut inode_sticky_error = None;
+        let mut generation = None;
         if let Some(handle) = state
             .inodes
             .get_mut(&self.key.0)
             .and_then(|handles| handles.get_mut(&self.key.1))
         {
+            generation = Some(handle.generation);
             handle.pending.remove(&self.sequence);
             match completion {
                 PendingWriteCompletion::Success => {}
@@ -276,14 +278,7 @@ impl PendingWriteRegistration {
                 handle.lifecycle == HandleLifecycle::Closed && handle.pending.is_empty();
         }
         if let Some(errno) = inode_sticky_error {
-            let generation = state
-                .inodes
-                .get(&self.key.0)
-                .and_then(|handles| handles.get(&self.key.1))
-                .map_or_else(
-                    || state.current_generation(self.key.0),
-                    |handle| handle.generation,
-                );
+            let generation = generation.unwrap_or_else(|| state.current_generation(self.key.0));
             state
                 .inode_sticky_errors
                 .entry(self.key.0)
