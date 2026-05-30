@@ -343,6 +343,7 @@ impl PendingWriteRegistration {
         if should_remove_closed_handle {
             state.remove_handle(self.key);
         }
+        drop(state);
         if has_waiters {
             shard.writes_changed.notify_all();
         }

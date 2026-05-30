@@ -832,15 +832,11 @@ impl StudioFuseFs {
         Ok(())
     }
 
-    fn wait_pending_writes_for_fsync(&self, ino: u64, fh: u64) -> Result<(), i32> {
+    fn wait_pending_writes_for_fsync(&self, ino: u64, _fh: u64) -> Result<(), i32> {
         if !self.async_write_enabled {
             return Ok(());
         }
-        if fh != 0 {
-            self.pending_writes.handle_barrier(ino, fh).wait()
-        } else {
-            self.pending_writes.inode_barrier(ino).wait()
-        }
+        self.pending_writes.inode_barrier(ino).wait()
     }
 }
 
