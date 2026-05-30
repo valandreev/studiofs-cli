@@ -139,12 +139,6 @@ fn format_optional_count(value: Option<usize>) -> String {
         .unwrap_or_else(|| "unbounded".to_string())
 }
 
-fn format_optional_sync_fallbacks(value: Option<u64>) -> String {
-    value
-        .map(|fallbacks| format!("{fallbacks} sync fallbacks"))
-        .unwrap_or_else(|| "sync fallbacks unavailable".to_string())
-}
-
 fn format_fuse_async_write_diagnostics(snapshot: &VfsFuseAsyncWriteSnapshot) -> [String; 5] {
     let mode = if snapshot.enabled {
         "enabled"
@@ -169,11 +163,8 @@ fn format_fuse_async_write_diagnostics(snapshot: &VfsFuseAsyncWriteSnapshot) -> 
             format_optional_bytes(snapshot.per_handle_pending_bytes)
         ),
         format!(
-            "  FUSE async completions:   {} ok, {} errors, {} task failures, {}",
-            snapshot.completed_writes,
-            snapshot.failed_writes,
-            snapshot.task_failed_writes,
-            format_optional_sync_fallbacks(snapshot.sync_fallbacks)
+            "  FUSE async completions:   {} ok, {} errors, {} task failures",
+            snapshot.completed_writes, snapshot.failed_writes, snapshot.task_failed_writes
         ),
         format!(
             "  FUSE async waits:         admission {}/{}, barriers {}/{}",
@@ -183,6 +174,23 @@ fn format_fuse_async_write_diagnostics(snapshot: &VfsFuseAsyncWriteSnapshot) -> 
             format_finite_ms(snapshot.barrier_wait_total_ms)
         ),
     ]
+}
+
+fn snapshot_freshness(snapshot_age_ms: u64) -> &'static str {
+    if snapshot_age_ms > WRITE_PATH_STALE_WARN_MS {
+        "stale"
+    } else {
+        "fresh"
+    }
+}
+
+fn stale_snapshot_warning(snapshot_age_ms: u64) -> Option<&'static str> {
+    (snapshot_age_ms > WRITE_PATH_STALE_WARN_MS)
+        .then_some("mounted metrics are stale; publisher may be stopped")
+}
+
+fn metrics_volume_path(metrics_path: &Path) -> Option<&Path> {
+    metrics_path.parent()
 }
 
 fn read_write_path_observability(
@@ -265,7 +273,17 @@ fn print_mounted_write_path_fallback(
     let snapshot_age_ms = now_ms.saturating_sub(snapshot.generated_unix_ms);
 
     println!("  Metrics file:              {}", metrics_path.display());
+    if let Some(volume_path) = metrics_volume_path(&metrics_path) {
+        println!("  Metrics volume:            {}", volume_path.display());
+    }
     println!("  Snapshot age:              {}ms", snapshot_age_ms);
+    println!(
+        "  Snapshot freshness:        {}",
+        snapshot_freshness(snapshot_age_ms)
+    );
+    if let Some(warning) = stale_snapshot_warning(snapshot_age_ms) {
+        println!("  Warning:                   {warning}");
+    }
     println!("  Backend tag:               {}", snapshot.backend_tag);
     println!("  Uptime:                    {:.1}s", snapshot.uptime_secs);
     println!(
@@ -593,16 +611,10 @@ pub fn run(
             println!("  Snapshot age:              {}ms", snapshot_age_ms);
             println!(
                 "  Snapshot freshness:        {}",
-                if snapshot_age_ms > WRITE_PATH_STALE_WARN_MS {
-                    "stale"
-                } else {
-                    "fresh"
-                }
+                snapshot_freshness(snapshot_age_ms)
             );
-            if snapshot_age_ms > WRITE_PATH_STALE_WARN_MS {
-                println!(
-                    "  Warning:                   mounted metrics are stale; publisher may be stopped"
-                );
+            if let Some(warning) = stale_snapshot_warning(snapshot_age_ms) {
+                println!("  Warning:                   {warning}");
             }
             println!("  Backend tag:               {}", snapshot.backend_tag);
             println!("  Uptime:                    {:.1}s", snapshot.uptime_secs);
@@ -1024,7 +1036,6 @@ mod tests {
             completed_writes: 17,
             failed_writes: 2,
             task_failed_writes: 1,
-            sync_fallbacks: Some(4),
             admission_waits: 5,
             admission_wait_total_ms: 6.5,
             barrier_waits: 7,
@@ -1039,7 +1050,7 @@ mod tests {
                 "  FUSE async writes:        enabled (policy: linux)",
                 "  FUSE async pending:       3 writes, 256.0KiB current, 512.0KiB peak",
                 "  FUSE async caps:          max 128.0MiB, max writes 1024, per-handle 32.0MiB",
-                "  FUSE async completions:   17 ok, 2 errors, 1 task failures, 4 sync fallbacks",
+                "  FUSE async completions:   17 ok, 2 errors, 1 task failures",
                 "  FUSE async waits:         admission 5/6.500ms, barriers 7/8.500ms",
             ]
         );
@@ -1062,7 +1073,30 @@ mod tests {
         );
         assert_eq!(
             lines[3],
-            "  FUSE async completions:   0 ok, 0 errors, 0 task failures, sync fallbacks unavailable"
+            "  FUSE async completions:   0 ok, 0 errors, 0 task failures"
+        );
+    }
+
+    #[test]
+    fn mounted_status_freshness_warns_after_threshold() {
+        assert_eq!(snapshot_freshness(WRITE_PATH_STALE_WARN_MS), "fresh");
+        assert!(stale_snapshot_warning(WRITE_PATH_STALE_WARN_MS).is_none());
+
+        assert_eq!(snapshot_freshness(WRITE_PATH_STALE_WARN_MS + 1), "stale");
+        assert_eq!(
+            stale_snapshot_warning(WRITE_PATH_STALE_WARN_MS + 1),
+            Some("mounted metrics are stale; publisher may be stopped")
+        );
+    }
+
+    #[test]
+    fn mounted_status_derives_metrics_volume_path() {
+        let metrics_path =
+            PathBuf::from("/cache-root/volume-uuid").join(WRITE_PATH_OBSERVABILITY_FILE);
+
+        assert_eq!(
+            metrics_volume_path(&metrics_path),
+            Some(Path::new("/cache-root/volume-uuid"))
         );
     }
 

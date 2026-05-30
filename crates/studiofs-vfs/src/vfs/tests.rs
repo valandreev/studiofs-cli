@@ -10413,7 +10413,6 @@ fn write_path_observability_reports_fuse_async_write_snapshot() {
         completed_writes: 17,
         failed_writes: 2,
         task_failed_writes: 1,
-        sync_fallbacks: Some(4),
         admission_waits: 5,
         admission_wait_total_ms: 6.5,
         barrier_waits: 7,
@@ -10434,7 +10433,6 @@ fn write_path_observability_reports_fuse_async_write_snapshot() {
     assert_eq!(snapshot.fuse_async_write.completed_writes, 17);
     assert_eq!(snapshot.fuse_async_write.failed_writes, 2);
     assert_eq!(snapshot.fuse_async_write.task_failed_writes, 1);
-    assert_eq!(snapshot.fuse_async_write.sync_fallbacks, Some(4));
     assert_eq!(snapshot.fuse_async_write.admission_waits, 5);
     assert_eq!(snapshot.fuse_async_write.admission_wait_total_ms, 6.5);
     assert_eq!(snapshot.fuse_async_write.barrier_waits, 7);
@@ -10597,6 +10595,49 @@ fn reset_diagnostics_observability_clears_winfsp_write_policy_breakdown() {
     assert_eq!(after.winfsp_write_path.write_through_bytes, 0);
     assert_eq!(after.winfsp_write_path.opportunistic_calls, 0);
     assert_eq!(after.winfsp_write_path.opportunistic_bytes, 0);
+}
+
+#[test]
+fn reset_diagnostics_observability_clears_fuse_async_write_snapshot() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "reset-fuse-async-write-snapshot");
+
+    vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
+        snapshot_generation: 7,
+        enabled: true,
+        platform_policy: "linux".into(),
+        pending_writes: 3,
+        pending_bytes: 4096,
+        peak_pending_bytes: 8192,
+        completed_writes: 11,
+        failed_writes: 2,
+        task_failed_writes: 1,
+        admission_waits: 4,
+        admission_wait_total_ms: 5.0,
+        barrier_waits: 6,
+        barrier_wait_total_ms: 7.0,
+        ..Default::default()
+    });
+
+    assert!(
+        vfs.write_path_observability_snapshot()
+            .fuse_async_write
+            .enabled
+    );
+
+    vfs.reset_diagnostics_observability();
+
+    let after = vfs.write_path_observability_snapshot().fuse_async_write;
+    assert_eq!(after.snapshot_generation, 0);
+    assert!(!after.enabled);
+    assert_eq!(after.pending_writes, 0);
+    assert_eq!(after.pending_bytes, 0);
+    assert_eq!(after.peak_pending_bytes, 0);
+    assert_eq!(after.completed_writes, 0);
+    assert_eq!(after.failed_writes, 0);
+    assert_eq!(after.task_failed_writes, 0);
+    assert_eq!(after.admission_waits, 0);
+    assert_eq!(after.barrier_waits, 0);
 }
 
 #[test]

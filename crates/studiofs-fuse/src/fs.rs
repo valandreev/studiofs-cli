@@ -36,6 +36,7 @@ use studiofs_vfs::{
     VfsError, VfsFuseAsyncWriteSnapshot, classify_vfs_error, normalize_attr_times,
 };
 use tokio::runtime::Handle;
+use tokio::task::JoinHandle;
 use tracing::{debug, error, trace, warn};
 #[cfg(target_os = "macos")]
 use unicode_normalization::UnicodeNormalization;
@@ -1041,6 +1042,7 @@ pub struct StudioFuseFs {
     /// GID of the user that mounted the filesystem.
     mount_gid: u32,
     async_write_diagnostics_stop: Arc<AtomicBool>,
+    async_write_diagnostics_task: Option<JoinHandle<()>>,
 }
 
 /// Runtime options for constructing a FUSE adapter without mutating process-wide
@@ -1122,7 +1124,7 @@ impl StudioFuseFs {
             .async_write_admission_limits
             .map(PendingWriteAdmissionLimits::from)
             .unwrap_or_else(|| FuseAsyncWriteAdmissionPolicy::platform_default().limits);
-        let fs = Self {
+        let mut fs = Self {
             vfs,
             rt,
             pending_writes: PendingWriteTracker::default(),
@@ -1135,10 +1137,11 @@ impl StudioFuseFs {
             mount_uid,
             mount_gid,
             async_write_diagnostics_stop: Arc::new(AtomicBool::new(false)),
+            async_write_diagnostics_task: None,
         };
         fs.publish_async_write_diagnostics();
         if fs.async_write_enabled {
-            fs.spawn_async_write_diagnostics_publisher();
+            fs.async_write_diagnostics_task = Some(fs.spawn_async_write_diagnostics_publisher());
         }
         debug!(
             async_write_enabled = fs.async_write_enabled,
@@ -1204,7 +1207,7 @@ impl StudioFuseFs {
         );
     }
 
-    fn spawn_async_write_diagnostics_publisher(&self) {
+    fn spawn_async_write_diagnostics_publisher(&self) -> JoinHandle<()> {
         let vfs = Arc::clone(&self.vfs);
         let pending_writes = self.pending_writes.clone();
         let enabled = self.async_write_enabled;
@@ -1226,7 +1229,7 @@ impl StudioFuseFs {
                     &pending_writes,
                 );
             }
-        });
+        })
     }
 
     fn publish_async_write_diagnostics_snapshot(
@@ -1250,7 +1253,6 @@ impl StudioFuseFs {
             completed_writes: tracker.completed_writes,
             failed_writes: tracker.failed_writes,
             task_failed_writes: tracker.task_failed_writes,
-            sync_fallbacks: None,
             admission_waits: tracker.admission_waits,
             admission_wait_total_ms: tracker.admission_wait_ns as f64 / 1_000_000.0,
             barrier_waits: tracker.barrier_waits,
@@ -1263,6 +1265,9 @@ impl Drop for StudioFuseFs {
     fn drop(&mut self) {
         self.async_write_diagnostics_stop
             .store(true, Ordering::Release);
+        if let Some(task) = &self.async_write_diagnostics_task {
+            task.abort();
+        }
     }
 }
 

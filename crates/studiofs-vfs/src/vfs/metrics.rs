@@ -258,8 +258,6 @@ pub struct VfsFuseAsyncWriteSnapshot {
     pub failed_writes: u64,
     /// Async write tasks dropped before explicit completion.
     pub task_failed_writes: u64,
-    /// Synchronous fallback count, when supplied by the bridge.
-    pub sync_fallbacks: Option<u64>,
     /// Admission waits caused by pending-write caps.
     pub admission_waits: u64,
     /// Total admission wait time in milliseconds.

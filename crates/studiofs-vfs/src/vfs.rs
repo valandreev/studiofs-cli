@@ -3769,6 +3769,7 @@ impl StudioVfs {
             .local_dirty
             .hard_backpressure_events
             .store(0, Ordering::Relaxed);
+        *self.state.fuse_async_write_snapshot.lock() = VfsFuseAsyncWriteSnapshot::default();
         self.state.upload.startup_replay_counts.lock().clear();
         self.cached_store.reset_diagnostics_metrics();
     }
@@ -6600,10 +6601,6 @@ impl StudioVfs {
         current.completed_writes = current.completed_writes.max(snapshot.completed_writes);
         current.failed_writes = current.failed_writes.max(snapshot.failed_writes);
         current.task_failed_writes = current.task_failed_writes.max(snapshot.task_failed_writes);
-        if let Some(sync_fallbacks) = snapshot.sync_fallbacks {
-            let current_sync_fallbacks = current.sync_fallbacks.unwrap_or_default();
-            current.sync_fallbacks = Some(current_sync_fallbacks.max(sync_fallbacks));
-        }
         current.admission_waits = current.admission_waits.max(snapshot.admission_waits);
         current.admission_wait_total_ms = current
             .admission_wait_total_ms
