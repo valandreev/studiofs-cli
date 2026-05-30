@@ -2,15 +2,334 @@
 
 #![cfg(unix)]
 
+use std::collections::BTreeSet;
+use std::ffi::OsString;
+use std::io;
+use std::io::Write;
+#[cfg(target_os = "macos")]
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+use std::process::Command;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use studiofs_data::store::DataStoreConfig;
-use studiofs_fuse::StudioFuseFs;
+use studiofs_fuse::{StudioFuseFs, StudioFuseRuntimeOptions};
 use studiofs_meta::{
     CURRENT_FORMAT_VERSION, FormatInfo, MetaFormat, MetadataConfig, RedbMetaEngine,
 };
 use studiofs_vfs::{StudioVfs, VfsConfig};
+
+const MOUNT_TESTS_ENV: &str = "STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS";
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MountedFuseMode {
+    Sync,
+    AsyncWrite,
+    AsyncWriteDio,
+}
+
+impl MountedFuseMode {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Sync => "sync",
+            Self::AsyncWrite => "async-write",
+            Self::AsyncWriteDio => "async-write+dio",
+        }
+    }
+
+    fn async_write_enabled(self) -> bool {
+        matches!(self, Self::AsyncWrite | Self::AsyncWriteDio)
+    }
+
+    fn async_dio_enabled(self) -> bool {
+        matches!(self, Self::AsyncWriteDio)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MountedScenarioPlatform {
+    AnyUnix,
+    Linux,
+    Macos,
+}
+
+impl MountedScenarioPlatform {
+    fn matches_current(self) -> bool {
+        match self {
+            Self::AnyUnix => true,
+            Self::Linux => cfg!(target_os = "linux"),
+            Self::Macos => cfg!(target_os = "macos"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MountedScenarioOperation {
+    SequentialWriteReadback,
+    WriteFlushReadback,
+    WriteFsyncReadback,
+    CloseReopenReadback,
+    MultipleWriters,
+    SameHandleAppends,
+    Dd,
+    FioMultiJob,
+    FsyncHeavy,
+    MultipleFileCopy,
+    WriteOnlyUntilUnmount,
+    FinderStyleCopy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MountedAsyncScenario {
+    name: &'static str,
+    mode: MountedFuseMode,
+    platform: MountedScenarioPlatform,
+    operation: MountedScenarioOperation,
+}
+
+#[derive(Default)]
+struct MountedOperationGuard {
+    _open_files: Vec<std::fs::File>,
+}
+
+macro_rules! declare_mounted_scenarios {
+    (
+        $(
+            $test_name:ident => {
+                name: $name:literal,
+                mode: $mode:expr,
+                platform: $platform:expr,
+                operation: $operation:expr
+            }
+        ),+ $(,)?
+    ) => {
+        fn mounted_async_scenarios() -> &'static [MountedAsyncScenario] {
+            &[
+                $(
+                    MountedAsyncScenario {
+                        name: $name,
+                        mode: $mode,
+                        platform: $platform,
+                        operation: $operation,
+                    },
+                )+
+            ]
+        }
+
+        $(
+            #[test]
+            #[ignore = "requires /dev/fuse or macFUSE and STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
+            fn $test_name() {
+                run_mounted_scenario(MountedAsyncScenario {
+                    name: $name,
+                    mode: $mode,
+                    platform: $platform,
+                    operation: $operation,
+                });
+            }
+        )+
+    };
+}
+
+declare_mounted_scenarios! {
+    async_mounted_sequential_write_readback => {
+        name: "sequential-write-readback",
+        mode: MountedFuseMode::AsyncWrite,
+        platform: MountedScenarioPlatform::AnyUnix,
+        operation: MountedScenarioOperation::SequentialWriteReadback
+    },
+    async_mounted_write_flush_readback => {
+        name: "write-flush-readback",
+        mode: MountedFuseMode::AsyncWrite,
+        platform: MountedScenarioPlatform::AnyUnix,
+        operation: MountedScenarioOperation::WriteFlushReadback
+    },
+    async_mounted_write_fsync_readback => {
+        name: "write-fsync-readback",
+        mode: MountedFuseMode::AsyncWrite,
+        platform: MountedScenarioPlatform::AnyUnix,
+        operation: MountedScenarioOperation::WriteFsyncReadback
+    },
+    async_mounted_close_reopen_readback => {
+        name: "close-reopen-readback",
+        mode: MountedFuseMode::AsyncWrite,
+        platform: MountedScenarioPlatform::AnyUnix,
+        operation: MountedScenarioOperation::CloseReopenReadback
+    },
+    async_mounted_multiple_writers => {
+        name: "multiple-writers",
+        mode: MountedFuseMode::AsyncWrite,
+        platform: MountedScenarioPlatform::AnyUnix,
+        operation: MountedScenarioOperation::MultipleWriters
+    },
+    async_mounted_same_handle_appends => {
+        name: "same-handle-appends",
+        mode: MountedFuseMode::AsyncWrite,
+        platform: MountedScenarioPlatform::AnyUnix,
+        operation: MountedScenarioOperation::SameHandleAppends
+    },
+    async_mounted_unmount_after_async_write => {
+        name: "unmount-after-async-write",
+        mode: MountedFuseMode::AsyncWrite,
+        platform: MountedScenarioPlatform::AnyUnix,
+        operation: MountedScenarioOperation::WriteOnlyUntilUnmount
+    },
+    linux_async_mounted_default_sync => {
+        name: "linux-default-sync",
+        mode: MountedFuseMode::Sync,
+        platform: MountedScenarioPlatform::Linux,
+        operation: MountedScenarioOperation::SequentialWriteReadback
+    },
+    linux_async_mounted_async_opt_in => {
+        name: "linux-async-opt-in",
+        mode: MountedFuseMode::AsyncWrite,
+        platform: MountedScenarioPlatform::Linux,
+        operation: MountedScenarioOperation::SequentialWriteReadback
+    },
+    linux_async_mounted_async_dio_opt_in => {
+        name: "linux-async-dio-opt-in",
+        mode: MountedFuseMode::AsyncWriteDio,
+        platform: MountedScenarioPlatform::Linux,
+        operation: MountedScenarioOperation::SequentialWriteReadback
+    },
+    linux_async_mounted_fio_multi_job => {
+        name: "linux-fio-multi-job",
+        mode: MountedFuseMode::AsyncWrite,
+        platform: MountedScenarioPlatform::Linux,
+        operation: MountedScenarioOperation::FioMultiJob
+    },
+    macos_async_mounted_dd => {
+        name: "macos-dd",
+        mode: MountedFuseMode::AsyncWrite,
+        platform: MountedScenarioPlatform::Macos,
+        operation: MountedScenarioOperation::Dd
+    },
+    macos_async_mounted_fio => {
+        name: "macos-fio",
+        mode: MountedFuseMode::AsyncWrite,
+        platform: MountedScenarioPlatform::Macos,
+        operation: MountedScenarioOperation::FioMultiJob
+    },
+    macos_async_mounted_fsync_heavy => {
+        name: "macos-fsync-heavy",
+        mode: MountedFuseMode::AsyncWrite,
+        platform: MountedScenarioPlatform::Macos,
+        operation: MountedScenarioOperation::FsyncHeavy
+    },
+    macos_async_mounted_multiple_file_copy => {
+        name: "macos-multiple-file-copy",
+        mode: MountedFuseMode::AsyncWrite,
+        platform: MountedScenarioPlatform::Macos,
+        operation: MountedScenarioOperation::MultipleFileCopy
+    },
+    macos_async_mounted_finder_style_copy => {
+        name: "macos-finder-style-copy",
+        mode: MountedFuseMode::AsyncWrite,
+        platform: MountedScenarioPlatform::Macos,
+        operation: MountedScenarioOperation::FinderStyleCopy
+    },
+}
+
+#[test]
+fn async_mounted_test_matrix_covers_correctness_and_platform_opt_in_scenarios() {
+    let scenarios = mounted_async_scenarios();
+    let names: BTreeSet<_> = scenarios.iter().map(|scenario| scenario.name).collect();
+    let modes: BTreeSet<_> = scenarios
+        .iter()
+        .map(|scenario| scenario.mode.name())
+        .collect();
+
+    for expected in [
+        "sequential-write-readback",
+        "write-flush-readback",
+        "write-fsync-readback",
+        "close-reopen-readback",
+        "multiple-writers",
+        "same-handle-appends",
+        "linux-default-sync",
+        "linux-async-opt-in",
+        "linux-async-dio-opt-in",
+        "linux-fio-multi-job",
+        "macos-dd",
+        "macos-fio",
+        "macos-fsync-heavy",
+        "macos-multiple-file-copy",
+        "macos-finder-style-copy",
+        "unmount-after-async-write",
+    ] {
+        assert!(
+            names.contains(expected),
+            "mounted async FUSE scenario matrix is missing {expected}"
+        );
+    }
+
+    for expected in ["sync", "async-write", "async-write+dio"] {
+        assert!(
+            modes.contains(expected),
+            "mounted async FUSE scenario matrix is missing mode {expected}"
+        );
+    }
+}
+
+#[test]
+fn runtime_options_from_env_is_public_for_embedder_overrides() {
+    let mut options = StudioFuseRuntimeOptions::from_env();
+
+    options.async_write_enabled = true;
+
+    assert!(options.async_write_enabled);
+}
+
+#[test]
+fn async_mounted_matrix_uses_distinct_unmount_and_finder_style_operations() {
+    let scenarios = mounted_async_scenarios();
+    let unmount = scenarios
+        .iter()
+        .find(|scenario| scenario.name == "unmount-after-async-write")
+        .expect("unmount-after-async-write scenario should be present");
+    let finder = scenarios
+        .iter()
+        .find(|scenario| scenario.name == "macos-finder-style-copy")
+        .expect("macos-finder-style-copy scenario should be present");
+    let regular_copy = scenarios
+        .iter()
+        .find(|scenario| scenario.name == "macos-multiple-file-copy")
+        .expect("macos-multiple-file-copy scenario should be present");
+
+    assert_eq!(
+        unmount.operation,
+        MountedScenarioOperation::WriteOnlyUntilUnmount,
+        "unmount-after-async-write must leave write teardown to unmount"
+    );
+    assert_eq!(
+        finder.operation,
+        MountedScenarioOperation::FinderStyleCopy,
+        "Finder-style copy should exercise Finder metadata behavior"
+    );
+    assert_ne!(
+        finder.operation, regular_copy.operation,
+        "Finder-style copy must not duplicate the plain multi-file copy operation"
+    );
+}
+
+#[test]
+fn command_path_is_available_only_when_executable() {
+    let tmp = target_tempdir("command-availability-");
+    let command_path = tmp.path().join("fio");
+    std::fs::write(&command_path, b"not executable").expect("write fake command");
+
+    std::fs::set_permissions(&command_path, std::fs::Permissions::from_mode(0o644))
+        .expect("set non-executable permissions");
+    assert!(
+        !command_path_is_executable(&command_path),
+        "plain files in PATH must not be treated as executable commands"
+    );
+
+    std::fs::set_permissions(&command_path, std::fs::Permissions::from_mode(0o755))
+        .expect("set executable permissions");
+    assert!(command_path_is_executable(&command_path));
+}
 
 fn workspace_root() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -18,6 +337,17 @@ fn workspace_root() -> std::path::PathBuf {
         .and_then(|path| path.parent())
         .expect("workspace root")
         .to_path_buf()
+}
+
+fn target_tempdir(prefix: &str) -> tempfile::TempDir {
+    let temp_root = workspace_root()
+        .join("target")
+        .join("studiofs-fuse-mount-tests");
+    std::fs::create_dir_all(&temp_root).expect("create target-backed test temp root");
+    tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir_in(temp_root)
+        .expect("target-backed tempdir")
 }
 
 fn workspace_env_path() -> std::path::PathBuf {
@@ -131,6 +461,522 @@ fn make_test_vfs(
     vfs
 }
 
+fn mounted_tests_enabled() -> bool {
+    std::env::var(MOUNT_TESTS_ENV).as_deref() == Ok("1")
+}
+
+fn finish_mounted_fuse_test(
+    test_result: std::thread::Result<MountedOperationGuard>,
+    unmount_result: io::Result<()>,
+    join_result: Option<std::thread::Result<io::Result<()>>>,
+) {
+    match test_result {
+        Ok(_guard) => {
+            if let Some(join_result) = join_result {
+                match join_result {
+                    Ok(run_result) => run_result.expect("FUSE session should run until unmount"),
+                    Err(panic) => std::panic::resume_unwind(panic),
+                }
+            }
+            unmount_result.expect("FUSE unmount should succeed");
+        }
+        Err(panic) => {
+            if let Err(error) = unmount_result {
+                eprintln!("FUSE unmount failed after scenario panic: {error}");
+            }
+            if let Some(join_result) = join_result {
+                match join_result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        eprintln!("FUSE session failed after scenario panic: {error}");
+                    }
+                    Err(_) => {
+                        eprintln!("FUSE session thread panicked after scenario panic");
+                    }
+                }
+            }
+            std::panic::resume_unwind(panic);
+        }
+    }
+}
+
+fn should_join_mounted_fuse_session(
+    test_result: &std::thread::Result<MountedOperationGuard>,
+    unmount_result: &io::Result<()>,
+) -> bool {
+    test_result.is_ok() && unmount_result.is_ok()
+}
+
+#[test]
+fn mounted_fuse_cleanup_preserves_original_scenario_panic() {
+    let scenario_panic: std::thread::Result<MountedOperationGuard> =
+        Err(Box::new("scenario failed") as Box<dyn std::any::Any + Send>);
+    let observed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        finish_mounted_fuse_test(
+            scenario_panic,
+            Err(io::Error::other("unmount failed")),
+            None,
+        );
+    }))
+    .expect_err("cleanup should resume the original scenario panic");
+
+    assert_eq!(
+        observed.downcast_ref::<&str>(),
+        Some(&"scenario failed"),
+        "cleanup errors must not replace the original scenario panic"
+    );
+}
+
+#[test]
+fn mounted_fuse_cleanup_reports_joined_session_panic() {
+    let observed = std::panic::catch_unwind(|| {
+        finish_mounted_fuse_test(
+            Ok(MountedOperationGuard::default()),
+            Ok(()),
+            Some(Err(
+                Box::new("session crashed") as Box<dyn std::any::Any + Send>
+            )),
+        );
+    })
+    .expect_err("session panic should be reported before unmount failure");
+
+    assert_eq!(
+        observed.downcast_ref::<&str>(),
+        Some(&"session crashed"),
+        "joined session thread panic must be reported"
+    );
+}
+
+#[test]
+fn mounted_fuse_cleanup_allows_skipping_join_after_cleanup_failure() {
+    let observed = std::panic::catch_unwind(|| {
+        finish_mounted_fuse_test(
+            Ok(MountedOperationGuard::default()),
+            Err(io::Error::other("unmount failed")),
+            None,
+        );
+    })
+    .expect_err("unmount failure should still be reported when join is skipped");
+
+    let message = observed
+        .downcast_ref::<String>()
+        .expect("unmount failure panic should carry a string message");
+    assert!(message.contains("FUSE unmount should succeed"));
+    assert!(message.contains("unmount failed"));
+}
+
+#[test]
+fn mounted_fuse_cleanup_skips_join_when_scenario_panicked_or_unmount_failed() {
+    let scenario_panic: std::thread::Result<MountedOperationGuard> =
+        Err(Box::new("scenario failed") as Box<dyn std::any::Any + Send>);
+    let scenario_ok = Ok(MountedOperationGuard::default());
+    let unmount_ok = Ok(());
+
+    assert!(!should_join_mounted_fuse_session(
+        &scenario_panic,
+        &unmount_ok
+    ));
+    assert!(!should_join_mounted_fuse_session(
+        &scenario_ok,
+        &Err(io::Error::other("unmount failed"))
+    ));
+    assert!(should_join_mounted_fuse_session(&scenario_ok, &unmount_ok));
+}
+
+fn with_mounted_fuse(
+    mode: MountedFuseMode,
+    suffix: &str,
+    test_fn: impl FnOnce(&Path) -> MountedOperationGuard,
+) {
+    if !mounted_tests_enabled() {
+        return;
+    }
+
+    let tmp = target_tempdir("vfs-");
+    let mount_dir = target_tempdir("mount-");
+    let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
+    let vfs = make_test_vfs(&tmp, suffix, &rt);
+    let fs = StudioFuseFs::new_with_runtime_options(
+        vfs,
+        rt.handle().clone(),
+        StudioFuseRuntimeOptions {
+            async_write_enabled: mode.async_write_enabled(),
+            linux_async_dio_enabled: mode.async_dio_enabled(),
+            ..StudioFuseRuntimeOptions::default()
+        },
+    );
+
+    let mut options = vec![fuser::MountOption::FSName(format!("studiofs-{suffix}"))];
+    if !cfg!(target_os = "linux") {
+        options.push(fuser::MountOption::AutoUnmount);
+    }
+    if cfg!(target_os = "macos") {
+        options.push(fuser::MountOption::CUSTOM("foreground".into()));
+    }
+
+    let mount_path = mount_dir.path().to_path_buf();
+    use std::os::unix::fs::MetadataExt;
+    let pre_dev = std::fs::metadata(&mount_path)
+        .expect("mount dir should exist before session creation")
+        .dev();
+
+    let mut session = fuser::Session::new(fs, &mount_path, &options).expect("create FUSE session");
+    let mut unmount = session.unmount_callable();
+    let session_handle = std::thread::spawn(move || session.run());
+
+    let test_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if std::fs::metadata(&mount_path)
+                .map(|m| m.dev() != pre_dev)
+                .unwrap_or(false)
+            {
+                break;
+            }
+            assert!(
+                !session_handle.is_finished(),
+                "FUSE session thread exited early before mount became available"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "FUSE mount did not become available within 10 s"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+
+        test_fn(&mount_path)
+    }));
+    let unmount_result = unmount.unmount();
+    let join_result = if should_join_mounted_fuse_session(&test_result, &unmount_result) {
+        Some(session_handle.join())
+    } else {
+        None
+    };
+
+    finish_mounted_fuse_test(test_result, unmount_result, join_result);
+}
+
+fn run_mounted_scenario(scenario: MountedAsyncScenario) {
+    if !scenario.platform.matches_current() {
+        eprintln!(
+            "skipping {} on this platform; scenario target is {:?}",
+            scenario.name, scenario.platform
+        );
+        return;
+    }
+    with_mounted_fuse(scenario.mode, scenario.name, |mount_path| {
+        run_mounted_operation(mount_path, scenario.operation)
+    });
+}
+
+fn run_mounted_operation(
+    mount_path: &Path,
+    operation: MountedScenarioOperation,
+) -> MountedOperationGuard {
+    match operation {
+        MountedScenarioOperation::SequentialWriteReadback => {
+            let test_file = mount_path.join("sequential.txt");
+            let payload = b"StudioFS async FUSE sequential payload";
+            std::fs::write(&test_file, payload).expect("write through FUSE mount");
+            let readback = std::fs::read(&test_file).expect("read through FUSE mount");
+            assert_eq!(readback, payload);
+            MountedOperationGuard::default()
+        }
+        MountedScenarioOperation::WriteFlushReadback => {
+            let test_file = mount_path.join("flush.txt");
+            let payload = b"StudioFS async FUSE flush payload";
+            {
+                let mut file = std::fs::File::create(&test_file).expect("create file");
+                file.write_all(payload).expect("write payload");
+                file.flush().expect("flush file handle");
+            }
+            let readback = std::fs::read(&test_file).expect("read after flush and close");
+            assert_eq!(readback, payload);
+            MountedOperationGuard::default()
+        }
+        MountedScenarioOperation::WriteFsyncReadback => {
+            let test_file = mount_path.join("fsync.txt");
+            let payload = b"StudioFS async FUSE fsync payload";
+            let mut file = std::fs::File::create(&test_file).expect("create file");
+            file.write_all(payload).expect("write payload");
+            file.sync_all().expect("fsync file");
+            drop(file);
+            let readback = std::fs::read(&test_file).expect("read after fsync");
+            assert_eq!(readback, payload);
+            MountedOperationGuard::default()
+        }
+        MountedScenarioOperation::CloseReopenReadback => {
+            let test_file = mount_path.join("close-reopen.txt");
+            let payload = b"StudioFS async FUSE close/reopen payload";
+            {
+                let mut file = std::fs::File::create(&test_file).expect("create file");
+                file.write_all(payload).expect("write payload");
+            }
+            let readback = std::fs::read(&test_file).expect("read reopened file");
+            assert_eq!(readback, payload);
+            MountedOperationGuard::default()
+        }
+        MountedScenarioOperation::MultipleWriters => {
+            let test_file = mount_path.join("multiple-writers.txt");
+            let mut first = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&test_file)
+                .expect("open first writer");
+            let mut second = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&test_file)
+                .expect("open second writer");
+            first.write_all(b"writer-one\n").expect("write first chunk");
+            second
+                .write_all(b"writer-two\n")
+                .expect("write second chunk");
+            first.sync_all().expect("sync first writer");
+            drop(first);
+            drop(second);
+            let readback = std::fs::read_to_string(&test_file).expect("read combined writes");
+            assert!(readback.contains("writer-one"));
+            assert!(readback.contains("writer-two"));
+            MountedOperationGuard::default()
+        }
+        MountedScenarioOperation::SameHandleAppends => {
+            let test_file = mount_path.join("same-handle.txt");
+            let mut file = std::fs::File::create(&test_file).expect("create file");
+            file.write_all(b"first\n").expect("write first chunk");
+            file.write_all(b"second\n").expect("write second chunk");
+            file.sync_all().expect("sync appended chunks");
+            drop(file);
+            let readback = std::fs::read_to_string(&test_file).expect("read appended file");
+            assert_eq!(readback, "first\nsecond\n");
+            MountedOperationGuard::default()
+        }
+        MountedScenarioOperation::WriteOnlyUntilUnmount => {
+            let test_file = mount_path.join("write-only-until-unmount.bin");
+            let mut file = std::fs::File::create(&test_file).expect("create write-only file");
+            for chunk in 0..64u8 {
+                file.write_all(&[chunk; 16 * 1024])
+                    .expect("write chunk that should drain during unmount");
+            }
+            MountedOperationGuard {
+                _open_files: vec![file],
+            }
+        }
+        MountedScenarioOperation::FinderStyleCopy => {
+            run_finder_style_copy_workload(mount_path);
+            MountedOperationGuard::default()
+        }
+        MountedScenarioOperation::Dd => {
+            run_dd_workload(mount_path);
+            MountedOperationGuard::default()
+        }
+        MountedScenarioOperation::FioMultiJob => {
+            run_fio_workload_if_available(mount_path);
+            MountedOperationGuard::default()
+        }
+        MountedScenarioOperation::FsyncHeavy => {
+            run_fsync_heavy_workload(mount_path);
+            MountedOperationGuard::default()
+        }
+        MountedScenarioOperation::MultipleFileCopy => {
+            run_multiple_file_copy_workload(mount_path);
+            MountedOperationGuard::default()
+        }
+    }
+}
+
+fn run_dd_workload(mount_path: &Path) {
+    let output = mount_path.join("dd.bin");
+    let mut output_arg = OsString::from("of=");
+    output_arg.push(&output);
+    let status = Command::new("dd")
+        .arg("if=/dev/zero")
+        .arg(output_arg)
+        .arg("bs=64k")
+        .arg("count=8")
+        .arg("conv=fsync")
+        .status()
+        .expect("run dd workload");
+    assert!(status.success(), "dd workload should exit successfully");
+    let len = std::fs::metadata(output).expect("dd output metadata").len();
+    assert_eq!(len, 512 * 1024);
+}
+
+fn command_path_is_executable(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+fn command_available(command: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|path| command_path_is_executable(&path.join(command)))
+    })
+}
+
+fn run_fio_workload_if_available(mount_path: &Path) {
+    if !command_available("fio") {
+        eprintln!("skipping fio mounted workload because fio is not installed");
+        return;
+    }
+
+    let mut directory_arg = OsString::from("--directory=");
+    directory_arg.push(mount_path);
+    let status = Command::new("fio")
+        .arg("--name=studiofs-fuse-async")
+        .arg(directory_arg)
+        .arg("--filename=fio.bin")
+        .arg("--rw=write")
+        .arg("--bs=64k")
+        .arg("--size=1m")
+        .arg("--numjobs=2")
+        .arg("--ioengine=sync")
+        .arg("--fsync=1")
+        .arg("--group_reporting")
+        .status()
+        .expect("run fio workload");
+    assert!(status.success(), "fio workload should exit successfully");
+}
+
+fn run_fsync_heavy_workload(mount_path: &Path) {
+    let test_file = mount_path.join("fsync-heavy.bin");
+    let mut file = std::fs::File::create(&test_file).expect("create fsync-heavy file");
+    for chunk in 0..16u8 {
+        file.write_all(&[chunk; 4096])
+            .expect("write fsync-heavy chunk");
+        file.sync_data().expect("sync fsync-heavy chunk");
+    }
+    drop(file);
+    let len = std::fs::metadata(test_file)
+        .expect("fsync-heavy output metadata")
+        .len();
+    assert_eq!(len, 16 * 4096);
+}
+
+fn run_multiple_file_copy_workload(mount_path: &Path) {
+    let source_dir = mount_path.join("copy-source");
+    let target_dir = mount_path.join("copy-target");
+    std::fs::create_dir(&source_dir).expect("create copy source dir");
+    std::fs::create_dir(&target_dir).expect("create copy target dir");
+    for index in 0..4 {
+        let source = source_dir.join(format!("file-{index}.txt"));
+        let target = target_dir.join(format!("file-{index}.txt"));
+        let payload = format!("StudioFS copy payload {index}\n");
+        std::fs::write(&source, &payload).expect("write copy source");
+        std::fs::copy(&source, &target).expect("copy file through mounted FUSE");
+        let readback = std::fs::read_to_string(&target).expect("read copied file");
+        assert_eq!(readback, payload);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn run_finder_style_copy_workload(mount_path: &Path) {
+    let source_dir = mount_path.join("finder-source");
+    let target_dir = mount_path.join("finder-target");
+    std::fs::create_dir(&source_dir).expect("create Finder-style source dir");
+    std::fs::create_dir(&target_dir).expect("create Finder-style target dir");
+
+    let ds_store = target_dir.join(".DS_Store");
+    std::fs::write(&ds_store, b"StudioFS Finder metadata cache\n").expect("write .DS_Store");
+
+    let source = source_dir.join("Finder copy document.txt");
+    let target = target_dir.join("Finder copy document.txt");
+    let payload = b"StudioFS Finder-style copy payload\n";
+    std::fs::write(&source, payload).expect("write Finder-style source");
+    std::fs::copy(&source, &target).expect("copy Finder-style file through mounted FUSE");
+    assert_eq!(
+        std::fs::read(&target).expect("read Finder-style copied file"),
+        payload
+    );
+
+    let mut finder_info = [0; 32];
+    finder_info[..4].copy_from_slice(b"FIND");
+    let resource_fork = b"StudioFS resource fork payload";
+    set_macos_xattr(&target, "com.apple.FinderInfo", &finder_info);
+    set_macos_xattr(&target, "com.apple.ResourceFork", resource_fork);
+
+    assert_eq!(
+        get_macos_xattr(&target, "com.apple.FinderInfo"),
+        finder_info
+    );
+    assert_eq!(
+        get_macos_xattr(&target, "com.apple.ResourceFork"),
+        resource_fork
+    );
+}
+
+#[cfg(not(target_os = "macos"))]
+fn run_finder_style_copy_workload(_mount_path: &Path) {
+    unreachable!("Finder-style copy scenario is macOS-only");
+}
+
+#[cfg(target_os = "macos")]
+fn set_macos_xattr(path: &Path, name: &str, value: &[u8]) {
+    let path = path_to_c_string(path);
+    let name = std::ffi::CString::new(name).expect("xattr name should not contain NUL");
+    // SAFETY: `path` and `name` are live NUL-terminated C strings, and `value`
+    // points to `value.len()` initialized bytes for the duration of the call.
+    let result = unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+            0,
+        )
+    };
+    assert_eq!(
+        result,
+        0,
+        "setxattr should succeed: {}",
+        io::Error::last_os_error()
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn get_macos_xattr(path: &Path, name: &str) -> Vec<u8> {
+    let path = path_to_c_string(path);
+    let name = std::ffi::CString::new(name).expect("xattr name should not contain NUL");
+    // SAFETY: `path` and `name` are live NUL-terminated C strings. A null value
+    // pointer with size 0 is the documented macOS size-query form.
+    let size =
+        unsafe { libc::getxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0, 0, 0) };
+    assert!(
+        size >= 0,
+        "getxattr size query should succeed: {}",
+        io::Error::last_os_error()
+    );
+    let len = usize::try_from(size).expect("xattr size should fit usize");
+    let mut value = vec![0; len];
+    // SAFETY: `path` and `name` are live NUL-terminated C strings, and `value`
+    // provides `value.len()` writable bytes for libc to fill.
+    let read = unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            value.as_mut_ptr().cast(),
+            value.len(),
+            0,
+            0,
+        )
+    };
+    assert!(
+        read >= 0,
+        "getxattr read should succeed: {}",
+        io::Error::last_os_error()
+    );
+    assert_eq!(
+        usize::try_from(read).expect("xattr read size should fit usize"),
+        len
+    );
+    value
+}
+
+#[cfg(target_os = "macos")]
+fn path_to_c_string(path: &Path) -> std::ffi::CString {
+    std::ffi::CString::new(path.as_os_str().as_bytes()).expect("path should not contain NUL")
+}
+
 /// Verifies that creating and dropping a FUSE session does not panic or leak.
 ///
 /// This test is intentionally ignored unless `STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1`
@@ -138,12 +984,12 @@ fn make_test_vfs(
 #[test]
 #[ignore = "requires /dev/fuse or macFUSE and STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
 fn fuse_session_mount_and_drop_smoke() {
-    if std::env::var("STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS").as_deref() != Ok("1") {
+    if !mounted_tests_enabled() {
         return;
     }
 
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let mount_dir = tempfile::tempdir().expect("mount tempdir");
+    let tmp = target_tempdir("vfs-");
+    let mount_dir = target_tempdir("mount-");
     let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
     let vfs = make_test_vfs(&tmp, "mount_sanity", &rt);
     let fs = StudioFuseFs::new(vfs, rt.handle().clone());
@@ -170,7 +1016,7 @@ fn fuse_session_mount_and_drop_smoke() {
 #[cfg(target_os = "macos")]
 #[test]
 fn macos_resource_fork_roundtrip_uses_native_xattr_store() {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    let tmp = target_tempdir("vfs-");
     let rt = tokio::runtime::Runtime::new().expect("runtime");
     let vfs = make_test_vfs(&tmp, "macos_resource_fork_xattr", &rt);
 
@@ -214,12 +1060,12 @@ fn macos_resource_fork_roundtrip_uses_native_xattr_store() {
 #[test]
 #[ignore = "requires /dev/fuse or macFUSE and STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
 fn fuse_mount_write_read_unmount_smoke() {
-    if std::env::var("STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS").as_deref() != Ok("1") {
+    if !mounted_tests_enabled() {
         return;
     }
 
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let mount_dir = tempfile::tempdir().expect("mount tempdir");
+    let tmp = target_tempdir("vfs-");
+    let mount_dir = target_tempdir("mount-");
     let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
     let vfs = make_test_vfs(&tmp, "write_read_smoke", &rt);
     let fs = StudioFuseFs::new(vfs, rt.handle().clone());
