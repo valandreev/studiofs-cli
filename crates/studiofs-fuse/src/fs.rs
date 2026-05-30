@@ -372,13 +372,11 @@ fn parse_bridge_bool_env_value(raw: &str) -> bool {
         || trimmed.eq_ignore_ascii_case("on")
 }
 
-#[cfg(target_os = "linux")]
 fn parse_bridge_bool_env(key: &str) -> bool {
     std::env::var(key).is_ok_and(|raw| parse_bridge_bool_env_value(&raw))
 }
 
-#[cfg(target_os = "linux")]
-fn should_request_fuse_async_dio() -> bool {
+fn should_request_fuse_async_dio_from_env() -> bool {
     parse_bridge_bool_env("STUDIOFS_FUSE_ASYNC_DIO")
 }
 
@@ -1018,6 +1016,8 @@ pub struct StudioFuseFs {
     rt: Handle,
     pending_writes: PendingWriteTracker,
     async_write_enabled: bool,
+    #[cfg(target_os = "linux")]
+    linux_async_dio_enabled: bool,
     async_write_admission_policy: FuseAsyncWriteAdmissionPolicy,
     /// UID of the user that mounted the filesystem. Inodes owned by uid=0 in
     /// the DB are remapped to this so macOS permission checks don't block writes.
@@ -1026,20 +1026,93 @@ pub struct StudioFuseFs {
     mount_gid: u32,
 }
 
+/// Runtime options for constructing a FUSE adapter without mutating process-wide
+/// environment during tests or embedded use.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct StudioFuseRuntimeOptions {
+    /// Enable the experimental async FUSE write-reply path.
+    pub async_write_enabled: bool,
+    /// Request Linux `FUSE_ASYNC_DIO` during FUSE init when supported.
+    pub linux_async_dio_enabled: bool,
+    /// Optional custom limits for async write admission control. When omitted,
+    /// explicit-runtime construction uses the safe platform defaults.
+    pub async_write_admission_limits: Option<StudioFuseAsyncWriteAdmissionLimits>,
+}
+
+/// Public async write admission limit overrides for `StudioFuseRuntimeOptions`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StudioFuseAsyncWriteAdmissionLimits {
+    /// Maximum async write bytes admitted across the mounted FUSE adapter.
+    pub max_pending_bytes: Option<usize>,
+    /// Maximum async write requests admitted across the mounted FUSE adapter.
+    pub max_pending_writes: Option<usize>,
+    /// Maximum async write bytes admitted for a single file handle.
+    pub per_handle_pending_bytes: Option<usize>,
+}
+
+impl From<StudioFuseAsyncWriteAdmissionLimits> for PendingWriteAdmissionLimits {
+    fn from(limits: StudioFuseAsyncWriteAdmissionLimits) -> Self {
+        Self {
+            max_pending_bytes: limits.max_pending_bytes,
+            max_pending_writes: limits.max_pending_writes,
+            per_handle_pending_bytes: limits.per_handle_pending_bytes,
+        }
+    }
+}
+
+impl From<PendingWriteAdmissionLimits> for StudioFuseAsyncWriteAdmissionLimits {
+    fn from(limits: PendingWriteAdmissionLimits) -> Self {
+        Self {
+            max_pending_bytes: limits.max_pending_bytes,
+            max_pending_writes: limits.max_pending_writes,
+            per_handle_pending_bytes: limits.per_handle_pending_bytes,
+        }
+    }
+}
+
+impl StudioFuseRuntimeOptions {
+    fn from_env() -> Self {
+        Self {
+            async_write_enabled: should_enable_async_fuse_write_from_env(),
+            linux_async_dio_enabled: should_request_fuse_async_dio_from_env(),
+            async_write_admission_limits: Some(
+                FuseAsyncWriteAdmissionPolicy::from_env().limits.into(),
+            ),
+        }
+    }
+}
+
 impl StudioFuseFs {
     /// Create a FUSE adapter backed by a shared VFS and Tokio runtime handle.
     pub fn new(vfs: Arc<StudioVfs>, rt: Handle) -> Self {
+        Self::new_with_runtime_options(vfs, rt, StudioFuseRuntimeOptions::from_env())
+    }
+
+    /// Create a FUSE adapter with explicit runtime options.
+    pub fn new_with_runtime_options(
+        vfs: Arc<StudioVfs>,
+        rt: Handle,
+        options: StudioFuseRuntimeOptions,
+    ) -> Self {
         // SAFETY: getuid/getgid read process-wide credential values from libc and are
         // side-effect-free.
         let mount_uid = unsafe { libc::getuid() };
         // SAFETY: same safety rationale as getuid.
         let mount_gid = unsafe { libc::getgid() };
+        let async_write_admission_limits = options
+            .async_write_admission_limits
+            .map(PendingWriteAdmissionLimits::from)
+            .unwrap_or_else(|| FuseAsyncWriteAdmissionPolicy::platform_default().limits);
         Self {
             vfs,
             rt,
             pending_writes: PendingWriteTracker::default(),
-            async_write_enabled: should_enable_async_fuse_write_from_env(),
-            async_write_admission_policy: FuseAsyncWriteAdmissionPolicy::from_env(),
+            async_write_enabled: options.async_write_enabled,
+            #[cfg(target_os = "linux")]
+            linux_async_dio_enabled: options.linux_async_dio_enabled,
+            async_write_admission_policy: FuseAsyncWriteAdmissionPolicy {
+                limits: async_write_admission_limits,
+            },
             mount_uid,
             mount_gid,
         }
@@ -1156,7 +1229,7 @@ impl Filesystem for StudioFuseFs {
         }
 
         #[cfg(target_os = "linux")]
-        if should_request_fuse_async_dio() {
+        if self.linux_async_dio_enabled {
             if let Err(unsupported) = config.add_capabilities(fuser::consts::FUSE_ASYNC_DIO) {
                 warn!(
                     ?unsupported,
@@ -2738,6 +2811,34 @@ mod tests {
         vfs.start().expect("start vfs background workers");
         let fs = StudioFuseFs::new(vfs.clone(), rt.handle().clone());
         (tmp, rt, vfs, fs)
+    }
+
+    #[test]
+    fn runtime_options_override_async_write_admission_limits() {
+        let (_tmp, rt, vfs, _env_fs) = make_test_fuse_fs("runtime-options-admission");
+        let fs = StudioFuseFs::new_with_runtime_options(
+            vfs,
+            rt.handle().clone(),
+            super::StudioFuseRuntimeOptions {
+                async_write_enabled: true,
+                linux_async_dio_enabled: true,
+                async_write_admission_limits: Some(super::StudioFuseAsyncWriteAdmissionLimits {
+                    max_pending_bytes: Some(4096),
+                    max_pending_writes: Some(7),
+                    per_handle_pending_bytes: Some(1024),
+                }),
+            },
+        );
+
+        assert!(fs.async_write_enabled);
+        assert_eq!(
+            fs.async_write_admission_policy.limits,
+            PendingWriteAdmissionLimits {
+                max_pending_bytes: Some(4096),
+                max_pending_writes: Some(7),
+                per_handle_pending_bytes: Some(1024),
+            }
+        );
     }
 
     #[test]

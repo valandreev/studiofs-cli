@@ -22,7 +22,7 @@ use std::sync::{
 pub use fs::FuseKernelInvalidator;
 /// The `fuser::Filesystem` implementation that bridges StudioFS VFS operations
 /// into FUSE callbacks.
-pub use fs::StudioFuseFs;
+pub use fs::{StudioFuseAsyncWriteAdmissionLimits, StudioFuseFs, StudioFuseRuntimeOptions};
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq, Eq)]
