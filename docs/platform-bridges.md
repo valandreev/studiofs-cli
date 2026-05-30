@@ -177,13 +177,24 @@ Current signature includes additional policy controls:
 | `allow_other` | macOS: yes. Linux: opt-in via `STUDIOFS_FUSE_ALLOW_OTHER=1` |
 | Kernel `max_write` | `131072` bytes on macOS, `16777216` bytes on Linux by default. Override: `STUDIOFS_FUSE_MAX_WRITE_BYTES` in `Filesystem::init()` |
 | Kernel `max_readahead` | `16777216` bytes on Linux, `1048576` bytes on macOS by default. Override: `STUDIOFS_FUSE_MAX_READAHEAD_BYTES` in `Filesystem::init()` |
+| Kernel `max_background` | macOS: `50` by default. Linux: kernel/fuser default unless explicitly set. Override: `STUDIOFS_FUSE_MAX_BACKGROUND` in `Filesystem::init()` |
+| Kernel `congestion_threshold` | macOS: `40` by default. Linux: kernel/fuser default unless explicitly set. Override: `STUDIOFS_FUSE_CONGESTION_THRESHOLD` in `Filesystem::init()` |
 | Linux: `async_dio` capability | Disabled by default. Opt in with `STUDIOFS_FUSE_ASYNC_DIO=1`; requested only when the kernel advertises `FUSE_ASYNC_DIO` |
 | macOS: `volname` | `"StudioFS"` |
 | macOS: `local` | Yes |
 | macOS: cache policy | `winfsp` target policy by default. Set `STUDIOFS_MACOS_FUSE_CACHE_POLICY=direct` for strict rollback mode |
 | macOS: validated macFUSE | 5.2.0 |
 
-`STUDIOFS_FUSE_MAX_WRITE_BYTES` and `STUDIOFS_FUSE_MAX_READAHEAD_BYTES` are the primary FUSE bridge throughput controls for local payload I/O.
+`STUDIOFS_FUSE_MAX_WRITE_BYTES`, `STUDIOFS_FUSE_MAX_READAHEAD_BYTES`,
+`STUDIOFS_FUSE_MAX_BACKGROUND`, and `STUDIOFS_FUSE_CONGESTION_THRESHOLD` are
+the primary FUSE bridge throughput controls for local payload I/O. Linux keeps
+the kernel/fuser background queue defaults unless the background queue env vars
+are explicitly set. macOS defaults to the current candidate `50/40` background
+queue policy. Set either background queue env var to an empty string to leave
+that value at the kernel/fuser default. StudioFS clamps congestion thresholds
+above an explicitly configured `max_background`; when only
+`STUDIOFS_FUSE_CONGESTION_THRESHOLD` is set, fuser may still clamp it against
+its own default `max_background` during the FUSE init reply.
 On Linux, `allow_other` also requires `user_allow_other` to be enabled in
 `/etc/fuse.conf`; otherwise `fusermount` rejects the mount request.
 
@@ -357,7 +368,7 @@ FUSE data-buffer behavior:
 mount_and_serve(vfs, rt, mount_point, volume_name, foreground, read_only)
   │
   ├─ Build mount options
-  ├─ Configure kernel `max_write` / `max_readahead` in `Filesystem::init()`
+  ├─ Configure kernel `max_write` / `max_readahead` and optional background queue policy in `Filesystem::init()`
   ├─ `fuser::Session::new(...).run()` — blocks until unmount
   │
   └─ Shutdown:

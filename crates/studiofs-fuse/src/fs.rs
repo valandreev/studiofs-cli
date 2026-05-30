@@ -48,6 +48,75 @@ const DEFAULT_FUSE_MAX_READAHEAD_BYTES: u32 = 1024 * 1024;
 const DEFAULT_FUSE_MAX_READAHEAD_BYTES: u32 = 16 * 1024 * 1024;
 #[cfg(target_os = "macos")]
 const FUSE_AUTO_INVAL_DATA_FLAG: u64 = 1 << 12;
+const STUDIOFS_FUSE_MAX_BACKGROUND_ENV: &str = "STUDIOFS_FUSE_MAX_BACKGROUND";
+const STUDIOFS_FUSE_CONGESTION_THRESHOLD_ENV: &str = "STUDIOFS_FUSE_CONGESTION_THRESHOLD";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FuseBackgroundQueuePolicy {
+    max_background: Option<u16>,
+    congestion_threshold: Option<u16>,
+}
+
+impl FuseBackgroundQueuePolicy {
+    fn platform_default() -> Self {
+        #[cfg(target_os = "macos")]
+        {
+            Self {
+                max_background: Some(50),
+                congestion_threshold: Some(40),
+            }
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            Self {
+                max_background: None,
+                congestion_threshold: None,
+            }
+        }
+    }
+
+    fn from_env() -> Self {
+        Self::from_env_values(
+            std::env::var(STUDIOFS_FUSE_MAX_BACKGROUND_ENV)
+                .ok()
+                .as_deref(),
+            std::env::var(STUDIOFS_FUSE_CONGESTION_THRESHOLD_ENV)
+                .ok()
+                .as_deref(),
+        )
+    }
+
+    fn from_env_values(max_background: Option<&str>, congestion_threshold: Option<&str>) -> Self {
+        let defaults = Self::platform_default();
+        let max_background = parse_bridge_optional_u16_env_value(
+            STUDIOFS_FUSE_MAX_BACKGROUND_ENV,
+            max_background,
+            defaults.max_background,
+        );
+        let mut congestion_threshold = parse_bridge_optional_u16_env_value(
+            STUDIOFS_FUSE_CONGESTION_THRESHOLD_ENV,
+            congestion_threshold,
+            defaults.congestion_threshold,
+        );
+
+        if let (Some(max_background), Some(threshold)) = (max_background, congestion_threshold)
+            && threshold > max_background
+        {
+            warn!(
+                requested = threshold,
+                max_background,
+                "requested FUSE congestion_threshold exceeds max_background; clamping"
+            );
+            congestion_threshold = Some(max_background);
+        }
+
+        Self {
+            max_background,
+            congestion_threshold,
+        }
+    }
+}
 
 #[cfg(target_os = "macos")]
 fn fuse_attr_blksize() -> u32 {
@@ -146,6 +215,42 @@ fn parse_bridge_u32_env(key: &str, default: u32) -> u32 {
             }
         }
         Err(_) => default,
+    }
+}
+
+fn parse_bridge_optional_u16_env_value(
+    key: &'static str,
+    raw: Option<&str>,
+    default: Option<u16>,
+) -> Option<u16> {
+    let Some(raw) = raw else {
+        return default;
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match trimmed.parse::<u16>() {
+        Ok(value) if value > 0 => Some(value),
+        Ok(_) => {
+            warn!(
+                env_key = key,
+                env_value = trimmed,
+                fallback_value = ?default,
+                "bridge tuning override must be > 0; using default"
+            );
+            default
+        }
+        Err(error) => {
+            warn!(
+                env_key = key,
+                env_value = trimmed,
+                fallback_value = ?default,
+                error = %error,
+                "invalid bridge tuning override; using default"
+            );
+            default
+        }
     }
 }
 
@@ -675,10 +780,38 @@ impl Filesystem for StudioFuseFs {
             }
         }
 
+        let background_queue_policy = FuseBackgroundQueuePolicy::from_env();
+        if let Some(max_background) = background_queue_policy.max_background {
+            if let Err(supported_limit) = config.set_max_background(max_background) {
+                warn!(
+                    requested = max_background,
+                    supported_limit,
+                    "requested FUSE max_background is outside kernel/libfuse limits; clamping"
+                );
+                if config.set_max_background(supported_limit).is_err() {
+                    return Err(libc::EINVAL);
+                }
+            }
+        }
+        if let Some(congestion_threshold) = background_queue_policy.congestion_threshold {
+            if let Err(supported_limit) = config.set_congestion_threshold(congestion_threshold) {
+                warn!(
+                    requested = congestion_threshold,
+                    supported_limit,
+                    "requested FUSE congestion_threshold is outside kernel/libfuse limits; clamping"
+                );
+                if config.set_congestion_threshold(supported_limit).is_err() {
+                    return Err(libc::EINVAL);
+                }
+            }
+        }
+
         #[cfg(target_os = "macos")]
         debug!(
             max_write = requested_max_write,
             max_readahead = requested_readahead,
+            max_background = ?background_queue_policy.max_background,
+            congestion_threshold = ?background_queue_policy.congestion_threshold,
             macos_cache_policy = ?super::MacosFuseCachePolicy::from_env(),
             macos_iosize = super::MACOS_FUSE_IOSIZE_BYTES,
             "configured FUSE bridge I/O policy"
@@ -687,6 +820,8 @@ impl Filesystem for StudioFuseFs {
         debug!(
             max_write = requested_max_write,
             max_readahead = requested_readahead,
+            max_background = ?background_queue_policy.max_background,
+            congestion_threshold = ?background_queue_policy.congestion_threshold,
             "configured FUSE bridge I/O policy"
         );
 
@@ -2031,8 +2166,8 @@ mod tests {
     use super::fuse_open_reply_flags;
     use super::parse_bridge_bool_env_value;
     use super::{
-        DEFAULT_FUSE_MAX_READAHEAD_BYTES, DEFAULT_FUSE_MAX_WRITE_BYTES, StudioFuseFs, TTL,
-        fuse_write_local_sync_policy, is_expected_macos_trashes_mkdir_exists,
+        DEFAULT_FUSE_MAX_READAHEAD_BYTES, DEFAULT_FUSE_MAX_WRITE_BYTES, FuseBackgroundQueuePolicy,
+        StudioFuseFs, TTL, fuse_write_local_sync_policy, is_expected_macos_trashes_mkdir_exists,
         is_missing_xattr_error, missing_xattr_errno, normalize_unix_mode,
         posix_flags_to_open_flags, should_log_invalidation_error, to_fuse_attr, vfs_err_to_errno,
     };
@@ -2132,6 +2267,75 @@ mod tests {
         assert_eq!(DEFAULT_FUSE_MAX_WRITE_BYTES, 128 * 1024);
         #[cfg(not(target_os = "macos"))]
         assert_eq!(DEFAULT_FUSE_MAX_WRITE_BYTES, 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn default_fuse_background_queue_policy_matches_platform_expectation() {
+        let policy = FuseBackgroundQueuePolicy::platform_default();
+
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            policy,
+            FuseBackgroundQueuePolicy {
+                max_background: Some(50),
+                congestion_threshold: Some(40),
+            }
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            policy,
+            FuseBackgroundQueuePolicy {
+                max_background: None,
+                congestion_threshold: None,
+            }
+        );
+    }
+
+    #[test]
+    fn fuse_background_queue_policy_env_overrides_defaults() {
+        let policy = FuseBackgroundQueuePolicy::from_env_values(Some("64"), Some("48"));
+
+        assert_eq!(
+            policy,
+            FuseBackgroundQueuePolicy {
+                max_background: Some(64),
+                congestion_threshold: Some(48),
+            }
+        );
+    }
+
+    #[test]
+    fn fuse_background_queue_policy_env_invalid_values_fall_back_to_defaults() {
+        let policy = FuseBackgroundQueuePolicy::from_env_values(Some("0"), Some("nope"));
+        let expected = FuseBackgroundQueuePolicy::platform_default();
+
+        assert_eq!(policy, expected);
+    }
+
+    #[test]
+    fn fuse_background_queue_policy_empty_env_values_disable_overrides() {
+        let policy = FuseBackgroundQueuePolicy::from_env_values(Some(" "), Some(""));
+
+        assert_eq!(
+            policy,
+            FuseBackgroundQueuePolicy {
+                max_background: None,
+                congestion_threshold: None,
+            }
+        );
+    }
+
+    #[test]
+    fn fuse_background_queue_policy_clamps_congestion_to_max_background() {
+        let policy = FuseBackgroundQueuePolicy::from_env_values(Some("32"), Some("64"));
+
+        assert_eq!(
+            policy,
+            FuseBackgroundQueuePolicy {
+                max_background: Some(32),
+                congestion_threshold: Some(32),
+            }
+        );
     }
 
     #[test]
