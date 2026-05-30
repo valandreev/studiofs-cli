@@ -1,5 +1,6 @@
 use super::file_session::VfsFileSessionStats;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use studiofs_meta::schema::{InodeLifecycleState, PayloadRetentionClass};
 
 /// Filesystem statistics returned by `statfs()`.
@@ -233,10 +234,12 @@ pub struct VfsFuseCallbackStats {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct VfsFuseAsyncWriteSnapshot {
+    /// Monotonic generation of the FUSE tracker state used to reject stale gauge updates.
+    pub generation: u64,
     /// Whether async write replies are enabled for this FUSE mount.
     pub enabled: bool,
     /// Selected platform policy label.
-    pub platform_policy: String,
+    pub platform_policy: Cow<'static, str>,
     /// Maximum pending bytes admitted across the adapter.
     pub max_pending_bytes: Option<usize>,
     /// Maximum pending write requests admitted across the adapter.

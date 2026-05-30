@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -85,6 +86,7 @@ struct PendingWriteBarrierMetrics {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct PendingWriteTrackerSnapshot {
+    pub(super) generation: u64,
     pub(super) pending_writes: usize,
     pub(super) pending_bytes: usize,
     pub(super) peak_pending_bytes: usize,
@@ -104,8 +106,6 @@ struct TrackerState {
     inode_sticky_errors: HashMap<Ino, HashMap<InodeGeneration, i32>>,
     barrier_counts: HashMap<Ino, HashMap<InodeGeneration, usize>>,
     async_write_notifiers: HashMap<Ino, Arc<Notify>>,
-    admission_metrics: PendingWriteAdmissionMetrics,
-    barrier_metrics: PendingWriteBarrierMetrics,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -120,6 +120,11 @@ struct SharedTracker {
     // profiles, add an atomic fast path for clearly-under-budget writes.
     admission: Mutex<GlobalAdmissionState>,
     admission_changed: Condvar,
+    mutation_generation: AtomicU64,
+    admission_waits: AtomicU64,
+    admission_wait_ns: AtomicU64,
+    barrier_waits: AtomicU64,
+    barrier_wait_ns: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -172,6 +177,11 @@ impl Default for SharedTracker {
             shards: std::array::from_fn(|_| TrackerShard::default()),
             admission: Mutex::new(GlobalAdmissionState::default()),
             admission_changed: Condvar::new(),
+            mutation_generation: AtomicU64::new(0),
+            admission_waits: AtomicU64::new(0),
+            admission_wait_ns: AtomicU64::new(0),
+            barrier_waits: AtomicU64::new(0),
+            barrier_wait_ns: AtomicU64::new(0),
         }
     }
 }
@@ -183,6 +193,28 @@ impl SharedTracker {
 
     fn shard_for_inode(&self, ino: Ino) -> &TrackerShard {
         &self.shards[Self::shard_index(ino)]
+    }
+
+    fn mark_mutated(&self) {
+        self.mutation_generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn current_generation(&self) -> u64 {
+        self.mutation_generation.load(Ordering::Relaxed)
+    }
+
+    fn record_admission_wait(&self, elapsed: std::time::Duration) {
+        self.admission_waits.fetch_add(1, Ordering::Relaxed);
+        let wait_ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        self.admission_wait_ns.fetch_add(wait_ns, Ordering::Relaxed);
+        self.mark_mutated();
+    }
+
+    fn record_barrier_wait(&self, elapsed: std::time::Duration) {
+        self.barrier_waits.fetch_add(1, Ordering::Relaxed);
+        let wait_ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        self.barrier_wait_ns.fetch_add(wait_ns, Ordering::Relaxed);
+        self.mark_mutated();
     }
 }
 
@@ -249,7 +281,7 @@ impl PendingWriteTracker {
                 continue;
             }
             if let Some(started) = wait_started {
-                state.record_admission_wait(started.elapsed());
+                self.shared.record_admission_wait(started.elapsed());
             }
             return self.register_pending_write_locked(
                 ino,
@@ -263,24 +295,10 @@ impl PendingWriteTracker {
     }
 
     pub(super) fn admission_metrics(&self) -> PendingWriteAdmissionMetrics {
-        self.shared
-            .shards
-            .iter()
-            .map(|shard| {
-                shard
-                    .state
-                    .lock()
-                    .expect("pending write tracker poisoned")
-                    .admission_metrics
-            })
-            .fold(
-                PendingWriteAdmissionMetrics::default(),
-                |mut total, metrics| {
-                    total.waits = total.waits.saturating_add(metrics.waits);
-                    total.wait_ns = total.wait_ns.saturating_add(metrics.wait_ns);
-                    total
-                },
-            )
+        PendingWriteAdmissionMetrics {
+            waits: self.shared.admission_waits.load(Ordering::Relaxed),
+            wait_ns: self.shared.admission_wait_ns.load(Ordering::Relaxed),
+        }
     }
 
     pub(super) fn snapshot(&self) -> PendingWriteTrackerSnapshot {
@@ -292,6 +310,7 @@ impl PendingWriteTracker {
             .lock()
             .expect("pending write admission poisoned");
         PendingWriteTrackerSnapshot {
+            generation: self.shared.current_generation(),
             pending_writes: admission.total_pending_writes,
             pending_bytes: admission.total_pending_bytes,
             peak_pending_bytes: admission.peak_pending_bytes,
@@ -306,24 +325,10 @@ impl PendingWriteTracker {
     }
 
     fn barrier_metrics(&self) -> PendingWriteBarrierMetrics {
-        self.shared
-            .shards
-            .iter()
-            .map(|shard| {
-                shard
-                    .state
-                    .lock()
-                    .expect("pending write tracker poisoned")
-                    .barrier_metrics
-            })
-            .fold(
-                PendingWriteBarrierMetrics::default(),
-                |mut total, metrics| {
-                    total.waits = total.waits.saturating_add(metrics.waits);
-                    total.wait_ns = total.wait_ns.saturating_add(metrics.wait_ns);
-                    total
-                },
-            )
+        PendingWriteBarrierMetrics {
+            waits: self.shared.barrier_waits.load(Ordering::Relaxed),
+            wait_ns: self.shared.barrier_wait_ns.load(Ordering::Relaxed),
+        }
     }
 
     fn register_pending_write(
@@ -377,6 +382,7 @@ impl PendingWriteTracker {
         admission.peak_pending_bytes = admission
             .peak_pending_bytes
             .max(admission.total_pending_bytes);
+        self.shared.mark_mutated();
         let (turn_sender, turn_receiver) = oneshot::channel();
         handle.turn_waiters.insert(sequence, turn_sender);
 
@@ -592,6 +598,7 @@ impl PendingWriteRegistration {
                 admission.task_failed_writes = admission.task_failed_writes.saturating_add(1);
             }
         }
+        self.shared.mark_mutated();
         drop(admission);
         self.shared.admission_changed.notify_all();
         shard.writes_changed.notify_all();
@@ -631,7 +638,7 @@ impl PendingWriteBarrier {
                 .expect("pending write tracker poisoned");
         }
         if let Some(started) = waited_since {
-            state.record_barrier_wait(started.elapsed());
+            self.shared.record_barrier_wait(started.elapsed());
         }
         barrier_error(&state, &self.targets, self.include_inode_errors).map_or(Ok(()), Err)
     }
@@ -655,9 +662,7 @@ impl PendingWriteBarrier {
     }
 
     fn record_barrier_wait(&self, elapsed: std::time::Duration) {
-        let shard = &self.shared.shards[self.shard_index];
-        let mut state = shard.state.lock().expect("pending write tracker poisoned");
-        state.record_barrier_wait(elapsed);
+        self.shared.record_barrier_wait(elapsed);
     }
 
     fn new_enabled_async_notification(&self) -> AsyncBarrierWait {
@@ -749,18 +754,6 @@ fn barrier_error(
 }
 
 impl TrackerState {
-    fn record_admission_wait(&mut self, elapsed: std::time::Duration) {
-        self.admission_metrics.waits = self.admission_metrics.waits.saturating_add(1);
-        let wait_ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
-        self.admission_metrics.wait_ns = self.admission_metrics.wait_ns.saturating_add(wait_ns);
-    }
-
-    fn record_barrier_wait(&mut self, elapsed: std::time::Duration) {
-        self.barrier_metrics.waits = self.barrier_metrics.waits.saturating_add(1);
-        let wait_ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
-        self.barrier_metrics.wait_ns = self.barrier_metrics.wait_ns.saturating_add(wait_ns);
-    }
-
     fn per_handle_admission_error(
         &self,
         key: HandleKey,

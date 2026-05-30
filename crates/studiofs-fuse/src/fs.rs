@@ -8,6 +8,7 @@ use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(target_os = "macos")]
@@ -1039,6 +1040,7 @@ pub struct StudioFuseFs {
     mount_uid: u32,
     /// GID of the user that mounted the filesystem.
     mount_gid: u32,
+    async_write_diagnostics_stop: Arc<AtomicBool>,
 }
 
 /// Runtime options for constructing a FUSE adapter without mutating process-wide
@@ -1132,8 +1134,10 @@ impl StudioFuseFs {
             },
             mount_uid,
             mount_gid,
+            async_write_diagnostics_stop: Arc::new(AtomicBool::new(false)),
         };
         fs.publish_async_write_diagnostics();
+        fs.spawn_async_write_diagnostics_publisher();
         debug!(
             async_write_enabled = fs.async_write_enabled,
             platform_policy = fs.async_write_platform_policy_label(),
@@ -1198,6 +1202,31 @@ impl StudioFuseFs {
         );
     }
 
+    fn spawn_async_write_diagnostics_publisher(&self) {
+        let vfs = Arc::clone(&self.vfs);
+        let pending_writes = self.pending_writes.clone();
+        let enabled = self.async_write_enabled;
+        let platform_policy = self.async_write_platform_policy_label();
+        let limits = self.async_write_admission_policy.limits;
+        let stop = Arc::clone(&self.async_write_diagnostics_stop);
+        self.rt.spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(500));
+            loop {
+                interval.tick().await;
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
+                StudioFuseFs::publish_async_write_diagnostics_snapshot(
+                    &vfs,
+                    enabled,
+                    platform_policy,
+                    limits,
+                    &pending_writes,
+                );
+            }
+        });
+    }
+
     fn publish_async_write_diagnostics_snapshot(
         vfs: &StudioVfs,
         enabled: bool,
@@ -1207,8 +1236,9 @@ impl StudioFuseFs {
     ) {
         let tracker = pending_writes.snapshot();
         vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
+            generation: tracker.generation,
             enabled,
-            platform_policy: platform_policy.to_string(),
+            platform_policy: platform_policy.into(),
             max_pending_bytes: limits.max_pending_bytes,
             max_pending_writes: limits.max_pending_writes,
             per_handle_pending_bytes: limits.per_handle_pending_bytes,
@@ -1224,6 +1254,13 @@ impl StudioFuseFs {
             barrier_waits: tracker.barrier_waits,
             barrier_wait_total_ms: tracker.barrier_wait_ns as f64 / 1_000_000.0,
         });
+    }
+}
+
+impl Drop for StudioFuseFs {
+    fn drop(&mut self) {
+        self.async_write_diagnostics_stop
+            .store(true, Ordering::Release);
     }
 }
 
@@ -3465,6 +3502,33 @@ mod tests {
         let snapshot = vfs.write_path_observability_snapshot().fuse_async_write;
         assert_eq!(snapshot.barrier_waits, 1);
         assert!(snapshot.barrier_wait_total_ms > 0.0);
+    }
+
+    #[test]
+    fn periodic_async_write_diagnostics_publish_task_failed_registration() {
+        let (_tmp, rt, vfs, _env_fs) = make_test_fuse_fs("async-write-periodic-diagnostics");
+        let fs = StudioFuseFs::new_with_runtime_options(
+            vfs.clone(),
+            rt.handle().clone(),
+            super::StudioFuseRuntimeOptions {
+                async_write_enabled: true,
+                linux_async_dio_enabled: false,
+                async_write_admission_limits: None,
+            },
+        );
+        let pending = fs
+            .pending_writes
+            .register(42, 7)
+            .expect("register pending write");
+
+        drop(pending);
+        rt.block_on(async {
+            tokio::time::sleep(std::time::Duration::from_millis(550)).await;
+        });
+
+        let snapshot = vfs.write_path_observability_snapshot().fuse_async_write;
+        assert_eq!(snapshot.pending_writes, 0);
+        assert_eq!(snapshot.task_failed_writes, 1);
     }
 
     #[test]

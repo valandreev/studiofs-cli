@@ -6585,7 +6585,30 @@ impl StudioVfs {
 
     /// Replace the latest async FUSE write bridge diagnostics snapshot.
     pub fn record_fuse_async_write_snapshot(&self, snapshot: VfsFuseAsyncWriteSnapshot) {
-        *self.state.fuse_async_write_snapshot.lock() = snapshot;
+        let mut current = self.state.fuse_async_write_snapshot.lock();
+        if snapshot.generation >= current.generation {
+            current.generation = snapshot.generation;
+            current.enabled = snapshot.enabled;
+            current.platform_policy = snapshot.platform_policy;
+            current.max_pending_bytes = snapshot.max_pending_bytes;
+            current.max_pending_writes = snapshot.max_pending_writes;
+            current.per_handle_pending_bytes = snapshot.per_handle_pending_bytes;
+            current.pending_writes = snapshot.pending_writes;
+            current.pending_bytes = snapshot.pending_bytes;
+        }
+        current.peak_pending_bytes = current.peak_pending_bytes.max(snapshot.peak_pending_bytes);
+        current.completed_writes = current.completed_writes.max(snapshot.completed_writes);
+        current.failed_writes = current.failed_writes.max(snapshot.failed_writes);
+        current.task_failed_writes = current.task_failed_writes.max(snapshot.task_failed_writes);
+        current.sync_fallbacks = current.sync_fallbacks.max(snapshot.sync_fallbacks);
+        current.admission_waits = current.admission_waits.max(snapshot.admission_waits);
+        current.admission_wait_total_ms = current
+            .admission_wait_total_ms
+            .max(snapshot.admission_wait_total_ms);
+        current.barrier_waits = current.barrier_waits.max(snapshot.barrier_waits);
+        current.barrier_wait_total_ms = current
+            .barrier_wait_total_ms
+            .max(snapshot.barrier_wait_total_ms);
     }
 
     /// Record write-path stage latency for recording writer stack state.

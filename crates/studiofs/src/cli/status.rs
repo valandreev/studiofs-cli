@@ -99,6 +99,14 @@ fn format_ms(value: f64) -> String {
     format!("{value:.3}ms")
 }
 
+fn format_finite_ms(value: f64) -> String {
+    if value.is_finite() {
+        format_ms(value)
+    } else {
+        "unavailable".to_string()
+    }
+}
+
 fn format_quantile_ms(value: f64, saturated: bool) -> String {
     if saturated {
         format!("{}+ (saturated)", format_ms(value))
@@ -164,9 +172,9 @@ fn format_fuse_async_write_diagnostics(snapshot: &VfsFuseAsyncWriteSnapshot) -> 
         format!(
             "  FUSE async waits:         admission {}/{}, barriers {}/{}",
             snapshot.admission_waits,
-            format_ms(snapshot.admission_wait_total_ms),
+            format_finite_ms(snapshot.admission_wait_total_ms),
             snapshot.barrier_waits,
-            format_ms(snapshot.barrier_wait_total_ms)
+            format_finite_ms(snapshot.barrier_wait_total_ms)
         ),
     ]
 }
@@ -998,8 +1006,9 @@ mod tests {
     #[test]
     fn mounted_status_formats_fuse_async_write_diagnostics() {
         let snapshot = studiofs_vfs::VfsFuseAsyncWriteSnapshot {
+            generation: 1,
             enabled: true,
-            platform_policy: "linux".to_string(),
+            platform_policy: "linux".into(),
             max_pending_bytes: Some(128 * 1024 * 1024),
             max_pending_writes: Some(1024),
             per_handle_pending_bytes: Some(32 * 1024 * 1024),
@@ -1027,6 +1036,23 @@ mod tests {
                 "  FUSE async completions:   17 ok, 2 errors, 1 task failures, 4 sync fallbacks",
                 "  FUSE async waits:         admission 5/6.500ms, barriers 7/8.500ms",
             ]
+        );
+    }
+
+    #[test]
+    fn mounted_status_formats_non_finite_fuse_async_waits_as_unavailable() {
+        let snapshot = studiofs_vfs::VfsFuseAsyncWriteSnapshot {
+            platform_policy: "linux".into(),
+            admission_wait_total_ms: f64::NAN,
+            barrier_wait_total_ms: f64::INFINITY,
+            ..Default::default()
+        };
+
+        let lines = format_fuse_async_write_diagnostics(&snapshot);
+
+        assert_eq!(
+            lines[4],
+            "  FUSE async waits:         admission 0/unavailable, barriers 0/unavailable"
         );
     }
 
