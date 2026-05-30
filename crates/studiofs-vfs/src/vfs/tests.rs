@@ -10401,7 +10401,7 @@ fn write_path_observability_reports_fuse_async_write_snapshot() {
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "write-path-observability-fuse-async-write");
 
     vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
-        generation: 1,
+        snapshot_generation: 1,
         enabled: true,
         platform_policy: "linux".into(),
         max_pending_bytes: Some(128 * 1024 * 1024),
@@ -10413,7 +10413,7 @@ fn write_path_observability_reports_fuse_async_write_snapshot() {
         completed_writes: 17,
         failed_writes: 2,
         task_failed_writes: 1,
-        sync_fallbacks: 4,
+        sync_fallbacks: Some(4),
         admission_waits: 5,
         admission_wait_total_ms: 6.5,
         barrier_waits: 7,
@@ -10434,7 +10434,7 @@ fn write_path_observability_reports_fuse_async_write_snapshot() {
     assert_eq!(snapshot.fuse_async_write.completed_writes, 17);
     assert_eq!(snapshot.fuse_async_write.failed_writes, 2);
     assert_eq!(snapshot.fuse_async_write.task_failed_writes, 1);
-    assert_eq!(snapshot.fuse_async_write.sync_fallbacks, 4);
+    assert_eq!(snapshot.fuse_async_write.sync_fallbacks, Some(4));
     assert_eq!(snapshot.fuse_async_write.admission_waits, 5);
     assert_eq!(snapshot.fuse_async_write.admission_wait_total_ms, 6.5);
     assert_eq!(snapshot.fuse_async_write.barrier_waits, 7);
@@ -10447,7 +10447,7 @@ fn fuse_async_write_snapshot_rejects_stale_gauges_and_keeps_monotonic_counters()
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "fuse-async-write-stale-snapshot");
 
     vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
-        generation: 2,
+        snapshot_generation: 2,
         enabled: true,
         platform_policy: "linux".into(),
         pending_writes: 0,
@@ -10463,7 +10463,7 @@ fn fuse_async_write_snapshot_rejects_stale_gauges_and_keeps_monotonic_counters()
         ..Default::default()
     });
     vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
-        generation: 1,
+        snapshot_generation: 1,
         enabled: true,
         platform_policy: "linux".into(),
         pending_writes: 7,
@@ -10480,7 +10480,7 @@ fn fuse_async_write_snapshot_rejects_stale_gauges_and_keeps_monotonic_counters()
     });
 
     let snapshot = vfs.write_path_observability_snapshot().fuse_async_write;
-    assert_eq!(snapshot.generation, 2);
+    assert_eq!(snapshot.snapshot_generation, 2);
     assert_eq!(snapshot.pending_writes, 0);
     assert_eq!(snapshot.pending_bytes, 0);
     assert_eq!(snapshot.peak_pending_bytes, 1024);

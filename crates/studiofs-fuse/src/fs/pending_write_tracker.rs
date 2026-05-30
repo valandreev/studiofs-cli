@@ -86,7 +86,7 @@ struct PendingWriteBarrierMetrics {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct PendingWriteTrackerSnapshot {
-    pub(super) generation: u64,
+    pub(super) mutation_generation: u64,
     pub(super) pending_writes: usize,
     pub(super) pending_bytes: usize,
     pub(super) peak_pending_bytes: usize,
@@ -310,7 +310,7 @@ impl PendingWriteTracker {
             .lock()
             .expect("pending write admission poisoned");
         PendingWriteTrackerSnapshot {
-            generation: self.shared.current_generation(),
+            mutation_generation: self.shared.current_generation(),
             pending_writes: admission.total_pending_writes,
             pending_bytes: admission.total_pending_bytes,
             peak_pending_bytes: admission.peak_pending_bytes,

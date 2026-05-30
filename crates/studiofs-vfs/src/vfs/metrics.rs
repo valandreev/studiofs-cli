@@ -234,8 +234,8 @@ pub struct VfsFuseCallbackStats {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct VfsFuseAsyncWriteSnapshot {
-    /// Monotonic generation of the FUSE tracker state used to reject stale gauge updates.
-    pub generation: u64,
+    /// Monotonic generation of the FUSE tracker snapshot used to reject stale gauge updates.
+    pub snapshot_generation: u64,
     /// Whether async write replies are enabled for this FUSE mount.
     pub enabled: bool,
     /// Selected platform policy label.
@@ -258,8 +258,8 @@ pub struct VfsFuseAsyncWriteSnapshot {
     pub failed_writes: u64,
     /// Async write tasks dropped before explicit completion.
     pub task_failed_writes: u64,
-    /// Synchronous fallback count.
-    pub sync_fallbacks: u64,
+    /// Synchronous fallback count, when supplied by the bridge.
+    pub sync_fallbacks: Option<u64>,
     /// Admission waits caused by pending-write caps.
     pub admission_waits: u64,
     /// Total admission wait time in milliseconds.

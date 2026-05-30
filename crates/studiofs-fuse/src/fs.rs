@@ -36,7 +36,7 @@ use studiofs_vfs::{
     VfsError, VfsFuseAsyncWriteSnapshot, classify_vfs_error, normalize_attr_times,
 };
 use tokio::runtime::Handle;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, trace, warn};
 #[cfg(target_os = "macos")]
 use unicode_normalization::UnicodeNormalization;
 
@@ -523,7 +523,7 @@ fn complete_fuse_write_reply<R>(
 {
     match result {
         Ok(written) => {
-            debug!(
+            trace!(
                 ino,
                 offset,
                 sequence = registration.sequence(),
@@ -536,7 +536,7 @@ fn complete_fuse_write_reply<R>(
         Err(e) => {
             error!("write({ino}, off={offset}) -> {e}");
             let errno = vfs_err_to_errno(&e);
-            debug!(
+            trace!(
                 ino,
                 offset,
                 sequence = registration.sequence(),
@@ -1137,7 +1137,9 @@ impl StudioFuseFs {
             async_write_diagnostics_stop: Arc::new(AtomicBool::new(false)),
         };
         fs.publish_async_write_diagnostics();
-        fs.spawn_async_write_diagnostics_publisher();
+        if fs.async_write_enabled {
+            fs.spawn_async_write_diagnostics_publisher();
+        }
         debug!(
             async_write_enabled = fs.async_write_enabled,
             platform_policy = fs.async_write_platform_policy_label(),
@@ -1236,7 +1238,7 @@ impl StudioFuseFs {
     ) {
         let tracker = pending_writes.snapshot();
         vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
-            generation: tracker.generation,
+            snapshot_generation: tracker.mutation_generation,
             enabled,
             platform_policy: platform_policy.into(),
             max_pending_bytes: limits.max_pending_bytes,
@@ -1248,7 +1250,7 @@ impl StudioFuseFs {
             completed_writes: tracker.completed_writes,
             failed_writes: tracker.failed_writes,
             task_failed_writes: tracker.task_failed_writes,
-            sync_fallbacks: 0,
+            sync_fallbacks: None,
             admission_waits: tracker.admission_waits,
             admission_wait_total_ms: tracker.admission_wait_ns as f64 / 1_000_000.0,
             barrier_waits: tracker.barrier_waits,
@@ -1946,8 +1948,7 @@ impl Filesystem for StudioFuseFs {
                     return;
                 }
             };
-            self.publish_async_write_diagnostics();
-            debug!(
+            trace!(
                 ino,
                 fh,
                 offset,
@@ -1957,9 +1958,6 @@ impl Filesystem for StudioFuseFs {
             );
             let data = data.to_vec();
             let vfs = Arc::clone(&self.vfs);
-            let pending_writes = self.pending_writes.clone();
-            let admission_limits = self.async_write_admission_policy.limits;
-            let platform_policy = self.async_write_platform_policy_label();
             let local_sync_policy = fuse_write_local_sync_policy(flags);
             let reply = FuseWriteReplyGuard::new(reply);
             self.rt.spawn(async move {
@@ -1975,13 +1973,6 @@ impl Filesystem for StudioFuseFs {
                     result.is_err(),
                 );
                 complete_fuse_write_reply(reply, result, &registration, ino, offset);
-                StudioFuseFs::publish_async_write_diagnostics_snapshot(
-                    &vfs,
-                    true,
-                    platform_policy,
-                    admission_limits,
-                    &pending_writes,
-                );
             });
             return;
         }
@@ -3086,6 +3077,35 @@ mod tests {
         assert_eq!(snapshot.task_failed_writes, 0);
 
         second.complete(super::PendingWriteCompletion::Error(libc::EIO));
+    }
+
+    #[test]
+    fn disabled_async_write_diagnostics_publish_once_without_periodic_task() {
+        let (_tmp, rt, vfs, _env_fs) =
+            make_test_fuse_fs("disabled-async-write-diagnostics-publisher");
+        let _fs = StudioFuseFs::new_with_runtime_options(
+            vfs.clone(),
+            rt.handle().clone(),
+            super::StudioFuseRuntimeOptions {
+                async_write_enabled: false,
+                linux_async_dio_enabled: false,
+                async_write_admission_limits: None,
+            },
+        );
+
+        vfs.record_fuse_async_write_snapshot(studiofs_vfs::VfsFuseAsyncWriteSnapshot {
+            snapshot_generation: 0,
+            enabled: true,
+            platform_policy: "sentinel".into(),
+            ..Default::default()
+        });
+        rt.block_on(async {
+            tokio::time::sleep(std::time::Duration::from_millis(550)).await;
+        });
+
+        let snapshot = vfs.write_path_observability_snapshot().fuse_async_write;
+        assert!(snapshot.enabled);
+        assert_eq!(snapshot.platform_policy, "sentinel");
     }
 
     #[test]

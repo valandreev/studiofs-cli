@@ -139,6 +139,12 @@ fn format_optional_count(value: Option<usize>) -> String {
         .unwrap_or_else(|| "unbounded".to_string())
 }
 
+fn format_optional_sync_fallbacks(value: Option<u64>) -> String {
+    value
+        .map(|fallbacks| format!("{fallbacks} sync fallbacks"))
+        .unwrap_or_else(|| "sync fallbacks unavailable".to_string())
+}
+
 fn format_fuse_async_write_diagnostics(snapshot: &VfsFuseAsyncWriteSnapshot) -> [String; 5] {
     let mode = if snapshot.enabled {
         "enabled"
@@ -163,11 +169,11 @@ fn format_fuse_async_write_diagnostics(snapshot: &VfsFuseAsyncWriteSnapshot) -> 
             format_optional_bytes(snapshot.per_handle_pending_bytes)
         ),
         format!(
-            "  FUSE async completions:   {} ok, {} errors, {} task failures, {} sync fallbacks",
+            "  FUSE async completions:   {} ok, {} errors, {} task failures, {}",
             snapshot.completed_writes,
             snapshot.failed_writes,
             snapshot.task_failed_writes,
-            snapshot.sync_fallbacks
+            format_optional_sync_fallbacks(snapshot.sync_fallbacks)
         ),
         format!(
             "  FUSE async waits:         admission {}/{}, barriers {}/{}",
@@ -1006,7 +1012,7 @@ mod tests {
     #[test]
     fn mounted_status_formats_fuse_async_write_diagnostics() {
         let snapshot = studiofs_vfs::VfsFuseAsyncWriteSnapshot {
-            generation: 1,
+            snapshot_generation: 1,
             enabled: true,
             platform_policy: "linux".into(),
             max_pending_bytes: Some(128 * 1024 * 1024),
@@ -1018,7 +1024,7 @@ mod tests {
             completed_writes: 17,
             failed_writes: 2,
             task_failed_writes: 1,
-            sync_fallbacks: 4,
+            sync_fallbacks: Some(4),
             admission_waits: 5,
             admission_wait_total_ms: 6.5,
             barrier_waits: 7,
@@ -1053,6 +1059,10 @@ mod tests {
         assert_eq!(
             lines[4],
             "  FUSE async waits:         admission 0/unavailable, barriers 0/unavailable"
+        );
+        assert_eq!(
+            lines[3],
+            "  FUSE async completions:   0 ok, 0 errors, 0 task failures, sync fallbacks unavailable"
         );
     }
 

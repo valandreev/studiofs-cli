@@ -6586,8 +6586,8 @@ impl StudioVfs {
     /// Replace the latest async FUSE write bridge diagnostics snapshot.
     pub fn record_fuse_async_write_snapshot(&self, snapshot: VfsFuseAsyncWriteSnapshot) {
         let mut current = self.state.fuse_async_write_snapshot.lock();
-        if snapshot.generation >= current.generation {
-            current.generation = snapshot.generation;
+        if snapshot.snapshot_generation >= current.snapshot_generation {
+            current.snapshot_generation = snapshot.snapshot_generation;
             current.enabled = snapshot.enabled;
             current.platform_policy = snapshot.platform_policy;
             current.max_pending_bytes = snapshot.max_pending_bytes;
@@ -6600,7 +6600,10 @@ impl StudioVfs {
         current.completed_writes = current.completed_writes.max(snapshot.completed_writes);
         current.failed_writes = current.failed_writes.max(snapshot.failed_writes);
         current.task_failed_writes = current.task_failed_writes.max(snapshot.task_failed_writes);
-        current.sync_fallbacks = current.sync_fallbacks.max(snapshot.sync_fallbacks);
+        if let Some(sync_fallbacks) = snapshot.sync_fallbacks {
+            let current_sync_fallbacks = current.sync_fallbacks.unwrap_or_default();
+            current.sync_fallbacks = Some(current_sync_fallbacks.max(sync_fallbacks));
+        }
         current.admission_waits = current.admission_waits.max(snapshot.admission_waits);
         current.admission_wait_total_ms = current
             .admission_wait_total_ms
