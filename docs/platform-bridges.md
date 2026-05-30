@@ -191,8 +191,9 @@ the primary FUSE bridge throughput controls for local payload I/O. Linux keeps
 the kernel/fuser background queue defaults unless the background queue env vars
 are explicitly set. macOS defaults to the current candidate `50/40` background
 queue policy. Set either background queue env var to an empty string to leave
-that value at the kernel/fuser default. StudioFS clamps congestion thresholds
-above an explicitly configured `max_background`; when only
+that value at the kernel/fuser default; `0` has the same opt-out meaning for
+these two background queue controls. StudioFS clamps congestion thresholds above
+an explicitly configured `max_background`; when only
 `STUDIOFS_FUSE_CONGESTION_THRESHOLD` is set, fuser may still clamp it against
 its own default `max_background` during the FUSE init reply.
 On Linux, `allow_other` also requires `user_allow_other` to be enabled in

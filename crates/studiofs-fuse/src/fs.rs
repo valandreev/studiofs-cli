@@ -77,14 +77,10 @@ impl FuseBackgroundQueuePolicy {
     }
 
     fn from_env() -> Self {
-        Self::from_env_values(
-            std::env::var(STUDIOFS_FUSE_MAX_BACKGROUND_ENV)
-                .ok()
-                .as_deref(),
-            std::env::var(STUDIOFS_FUSE_CONGESTION_THRESHOLD_ENV)
-                .ok()
-                .as_deref(),
-        )
+        let max_background = std::env::var(STUDIOFS_FUSE_MAX_BACKGROUND_ENV).ok();
+        let congestion_threshold = std::env::var(STUDIOFS_FUSE_CONGESTION_THRESHOLD_ENV).ok();
+
+        Self::from_env_values(max_background.as_deref(), congestion_threshold.as_deref())
     }
 
     fn from_env_values(max_background: Option<&str>, congestion_threshold: Option<&str>) -> Self {
@@ -100,15 +96,15 @@ impl FuseBackgroundQueuePolicy {
             defaults.congestion_threshold,
         );
 
-        if let (Some(max_background), Some(threshold)) = (max_background, congestion_threshold)
-            && threshold > max_background
+        if let (Some(max_bg), Some(threshold)) = (max_background, congestion_threshold)
+            && threshold > max_bg
         {
             warn!(
-                requested = threshold,
-                max_background,
-                "requested FUSE congestion_threshold exceeds max_background; clamping"
+                configured = threshold,
+                max_background = max_bg,
+                "configured FUSE congestion_threshold exceeds max_background; clamping"
             );
-            congestion_threshold = Some(max_background);
+            congestion_threshold = Some(max_bg);
         }
 
         Self {
@@ -219,7 +215,7 @@ fn parse_bridge_u32_env(key: &str, default: u32) -> u32 {
 }
 
 fn parse_bridge_optional_u16_env_value(
-    key: &'static str,
+    key: &str,
     raw: Option<&str>,
     default: Option<u16>,
 ) -> Option<u16> {
@@ -232,15 +228,7 @@ fn parse_bridge_optional_u16_env_value(
     }
     match trimmed.parse::<u16>() {
         Ok(value) if value > 0 => Some(value),
-        Ok(_) => {
-            warn!(
-                env_key = key,
-                env_value = trimmed,
-                fallback_value = ?default,
-                "bridge tuning override must be > 0; using default"
-            );
-            default
-        }
+        Ok(_) => None,
         Err(error) => {
             warn!(
                 env_key = key,
@@ -2281,7 +2269,7 @@ mod tests {
                 congestion_threshold: Some(40),
             }
         );
-        #[cfg(target_os = "linux")]
+        #[cfg(not(target_os = "macos"))]
         assert_eq!(
             policy,
             FuseBackgroundQueuePolicy {
@@ -2306,7 +2294,7 @@ mod tests {
 
     #[test]
     fn fuse_background_queue_policy_env_invalid_values_fall_back_to_defaults() {
-        let policy = FuseBackgroundQueuePolicy::from_env_values(Some("0"), Some("nope"));
+        let policy = FuseBackgroundQueuePolicy::from_env_values(Some("zero"), Some("nope"));
         let expected = FuseBackgroundQueuePolicy::platform_default();
 
         assert_eq!(policy, expected);
@@ -2315,6 +2303,19 @@ mod tests {
     #[test]
     fn fuse_background_queue_policy_empty_env_values_disable_overrides() {
         let policy = FuseBackgroundQueuePolicy::from_env_values(Some(" "), Some(""));
+
+        assert_eq!(
+            policy,
+            FuseBackgroundQueuePolicy {
+                max_background: None,
+                congestion_threshold: None,
+            }
+        );
+    }
+
+    #[test]
+    fn fuse_background_queue_policy_zero_env_values_disable_overrides() {
+        let policy = FuseBackgroundQueuePolicy::from_env_values(Some("0"), Some("0"));
 
         assert_eq!(
             policy,
