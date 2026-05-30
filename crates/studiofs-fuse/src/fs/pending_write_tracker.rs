@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::Instant;
 
 use smallvec::{SmallVec, smallvec};
 use tokio::sync::oneshot;
@@ -20,6 +21,7 @@ const TRACKER_SHARDS: usize = 64;
 pub(super) enum WriteRegistrationError {
     HandleClosing,
     HandleClosed,
+    AdmissionLimitExceeded,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +44,7 @@ struct HandleState {
     next_sequence: Sequence,
     lifecycle: HandleLifecycle,
     pending: BTreeSet<Sequence>,
+    total_pending_bytes: usize,
     turn_waiters: HashMap<Sequence, oneshot::Sender<()>>,
     sticky_error: Option<i32>,
 }
@@ -53,10 +56,24 @@ impl Default for HandleState {
             next_sequence: 1,
             lifecycle: HandleLifecycle::Open,
             pending: BTreeSet::new(),
+            total_pending_bytes: 0,
             turn_waiters: HashMap::new(),
             sticky_error: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct PendingWriteAdmissionLimits {
+    pub(super) max_pending_bytes: Option<usize>,
+    pub(super) max_pending_writes: Option<usize>,
+    pub(super) per_handle_pending_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct PendingWriteAdmissionMetrics {
+    pub(super) waits: u64,
+    pub(super) wait_ns: u64,
 }
 
 #[derive(Debug, Default)]
@@ -65,6 +82,7 @@ struct TrackerState {
     inode_generations: HashMap<Ino, InodeGeneration>,
     inode_sticky_errors: HashMap<Ino, HashMap<InodeGeneration, i32>>,
     barrier_counts: HashMap<Ino, HashMap<InodeGeneration, usize>>,
+    admission_metrics: PendingWriteAdmissionMetrics,
 }
 
 #[derive(Debug, Default)]
@@ -75,6 +93,16 @@ pub(super) struct PendingWriteTracker {
 #[derive(Debug)]
 struct SharedTracker {
     shards: [TrackerShard; TRACKER_SHARDS],
+    // Global caps need Condvar-compatible locking. If this shows up in
+    // profiles, add an atomic fast path for clearly-under-budget writes.
+    admission: Mutex<GlobalAdmissionState>,
+    admission_changed: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct GlobalAdmissionState {
+    total_pending_bytes: usize,
+    total_pending_writes: usize,
 }
 
 #[derive(Debug, Default)]
@@ -89,8 +117,9 @@ pub(super) struct PendingWriteRegistration {
     shard_index: usize,
     key: HandleKey,
     sequence: Sequence,
+    bytes: usize,
     completion: OnceLock<PendingWriteCompletion>,
-    turn_receiver: Mutex<Option<oneshot::Receiver<()>>>,
+    turn_receiver: Option<oneshot::Receiver<()>>,
 }
 
 #[derive(Debug)]
@@ -113,6 +142,8 @@ impl Default for SharedTracker {
     fn default() -> Self {
         Self {
             shards: std::array::from_fn(|_| TrackerShard::default()),
+            admission: Mutex::new(GlobalAdmissionState::default()),
+            admission_changed: Condvar::new(),
         }
     }
 }
@@ -133,9 +164,130 @@ impl PendingWriteTracker {
         ino: Ino,
         fh: FileHandle,
     ) -> Result<PendingWriteRegistration, WriteRegistrationError> {
+        self.register_pending_write(ino, fh, 0, PendingWriteAdmissionLimits::default())
+    }
+
+    pub(super) fn try_register_with_admission(
+        &self,
+        ino: Ino,
+        fh: FileHandle,
+        bytes: usize,
+        limits: PendingWriteAdmissionLimits,
+    ) -> Result<PendingWriteRegistration, WriteRegistrationError> {
+        self.register_pending_write(ino, fh, bytes, limits)
+    }
+
+    pub(super) fn register_with_admission(
+        &self,
+        ino: Ino,
+        fh: FileHandle,
+        bytes: usize,
+        limits: PendingWriteAdmissionLimits,
+    ) -> Result<PendingWriteRegistration, WriteRegistrationError> {
+        let mut wait_started = None;
+        loop {
+            let mut admission = self
+                .shared
+                .admission
+                .lock()
+                .expect("pending write admission poisoned");
+            let shard_index = SharedTracker::shard_index(ino);
+            let shard = &self.shared.shards[shard_index];
+            while admission.global_error(bytes, limits)
+                == Some(WriteRegistrationError::AdmissionLimitExceeded)
+            {
+                if wait_started.is_none() {
+                    wait_started = Some(Instant::now());
+                }
+                admission = self
+                    .shared
+                    .admission_changed
+                    .wait(admission)
+                    .expect("pending write admission poisoned");
+            }
+            let mut state = shard.state.lock().expect("pending write tracker poisoned");
+            if state.per_handle_admission_error((ino, fh), bytes, limits)
+                == Some(WriteRegistrationError::AdmissionLimitExceeded)
+            {
+                drop(admission);
+                if wait_started.is_none() {
+                    wait_started = Some(Instant::now());
+                }
+                let state = shard
+                    .writes_changed
+                    .wait(state)
+                    .expect("pending write tracker poisoned");
+                drop(state);
+                continue;
+            }
+            if let Some(started) = wait_started {
+                state.record_admission_wait(started.elapsed());
+            }
+            return self.register_pending_write_locked(
+                ino,
+                fh,
+                bytes,
+                shard_index,
+                &mut state,
+                &mut admission,
+            );
+        }
+    }
+
+    pub(super) fn admission_metrics(&self) -> PendingWriteAdmissionMetrics {
+        self.shared
+            .shards
+            .iter()
+            .map(|shard| {
+                shard
+                    .state
+                    .lock()
+                    .expect("pending write tracker poisoned")
+                    .admission_metrics
+            })
+            .fold(
+                PendingWriteAdmissionMetrics::default(),
+                |mut total, metrics| {
+                    total.waits = total.waits.saturating_add(metrics.waits);
+                    total.wait_ns = total.wait_ns.saturating_add(metrics.wait_ns);
+                    total
+                },
+            )
+    }
+
+    fn register_pending_write(
+        &self,
+        ino: Ino,
+        fh: FileHandle,
+        bytes: usize,
+        limits: PendingWriteAdmissionLimits,
+    ) -> Result<PendingWriteRegistration, WriteRegistrationError> {
+        let mut admission = self
+            .shared
+            .admission
+            .lock()
+            .expect("pending write admission poisoned");
+        if let Some(error) = admission.global_error(bytes, limits) {
+            return Err(error);
+        }
         let shard_index = SharedTracker::shard_index(ino);
         let shard = &self.shared.shards[shard_index];
         let mut state = shard.state.lock().expect("pending write tracker poisoned");
+        if let Some(error) = state.per_handle_admission_error((ino, fh), bytes, limits) {
+            return Err(error);
+        }
+        self.register_pending_write_locked(ino, fh, bytes, shard_index, &mut state, &mut admission)
+    }
+
+    fn register_pending_write_locked(
+        &self,
+        ino: Ino,
+        fh: FileHandle,
+        bytes: usize,
+        shard_index: usize,
+        state: &mut TrackerState,
+        admission: &mut GlobalAdmissionState,
+    ) -> Result<PendingWriteRegistration, WriteRegistrationError> {
         let generation = state.inode_generation(ino);
         let handle = state.inodes.entry(ino).or_default().entry(fh).or_default();
         handle.generation = generation;
@@ -148,6 +300,9 @@ impl PendingWriteTracker {
         let sequence = handle.next_sequence;
         handle.next_sequence += 1;
         handle.pending.insert(sequence);
+        handle.total_pending_bytes = handle.total_pending_bytes.saturating_add(bytes);
+        admission.total_pending_bytes = admission.total_pending_bytes.saturating_add(bytes);
+        admission.total_pending_writes = admission.total_pending_writes.saturating_add(1);
         let (turn_sender, turn_receiver) = oneshot::channel();
         handle.turn_waiters.insert(sequence, turn_sender);
 
@@ -156,8 +311,9 @@ impl PendingWriteTracker {
             shard_index,
             key: (ino, fh),
             sequence,
+            bytes,
             completion: OnceLock::new(),
-            turn_receiver: Mutex::new(Some(turn_receiver)),
+            turn_receiver: Some(turn_receiver),
         })
     }
 
@@ -261,12 +417,8 @@ impl PendingWriteRegistration {
         self.sequence
     }
 
-    pub(super) fn turn_waiter(&self) -> PendingWriteTurn {
-        let turn_receiver = self
-            .turn_receiver
-            .lock()
-            .expect("pending write turn receiver poisoned")
-            .take();
+    pub(super) fn turn_waiter(&mut self) -> PendingWriteTurn {
+        let turn_receiver = self.turn_receiver.take();
         PendingWriteTurn {
             shared: Arc::clone(&self.shared),
             shard_index: self.shard_index,
@@ -311,6 +463,7 @@ impl PendingWriteRegistration {
         {
             generation = Some(handle.generation);
             handle.pending.remove(&self.sequence);
+            handle.total_pending_bytes = handle.total_pending_bytes.saturating_sub(self.bytes);
             handle.turn_waiters.remove(&self.sequence);
             match completion {
                 PendingWriteCompletion::Success => {}
@@ -339,14 +492,20 @@ impl PendingWriteRegistration {
                 .entry(generation)
                 .or_insert(errno);
         }
-        let has_waiters = state.has_barrier_count_for_inode(self.key.0);
         if should_remove_closed_handle {
             state.remove_handle(self.key);
         }
         drop(state);
-        if has_waiters {
-            shard.writes_changed.notify_all();
-        }
+        let mut admission = self
+            .shared
+            .admission
+            .lock()
+            .expect("pending write admission poisoned");
+        admission.total_pending_bytes = admission.total_pending_bytes.saturating_sub(self.bytes);
+        admission.total_pending_writes = admission.total_pending_writes.saturating_sub(1);
+        drop(admission);
+        self.shared.admission_changed.notify_all();
+        shard.writes_changed.notify_all();
         if let Some(next_turn) = next_turn {
             let _ = next_turn.send(());
         }
@@ -424,6 +583,31 @@ fn barrier_error(state: &TrackerState, targets: &[BarrierTarget]) -> Option<i32>
 }
 
 impl TrackerState {
+    fn record_admission_wait(&mut self, elapsed: std::time::Duration) {
+        self.admission_metrics.waits = self.admission_metrics.waits.saturating_add(1);
+        let wait_ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        self.admission_metrics.wait_ns = self.admission_metrics.wait_ns.saturating_add(wait_ns);
+    }
+
+    fn per_handle_admission_error(
+        &self,
+        key: HandleKey,
+        bytes: usize,
+        limits: PendingWriteAdmissionLimits,
+    ) -> Option<WriteRegistrationError> {
+        let handle_pending_bytes = self
+            .inodes
+            .get(&key.0)
+            .and_then(|handles| handles.get(&key.1))
+            .map_or(0, |handle| handle.total_pending_bytes);
+        if limits.per_handle_pending_bytes.is_some_and(|cap| {
+            handle_pending_bytes > 0 && handle_pending_bytes.saturating_add(bytes) > cap
+        }) {
+            return Some(WriteRegistrationError::AdmissionLimitExceeded);
+        }
+        None
+    }
+
     fn is_registration_turn(&self, key: HandleKey, sequence: Sequence) -> bool {
         match self
             .inodes
@@ -552,6 +736,23 @@ impl TrackerState {
     }
 }
 
+impl GlobalAdmissionState {
+    fn global_error(
+        &self,
+        bytes: usize,
+        limits: PendingWriteAdmissionLimits,
+    ) -> Option<WriteRegistrationError> {
+        if limits.max_pending_bytes.is_some_and(|cap| {
+            self.total_pending_bytes > 0 && self.total_pending_bytes.saturating_add(bytes) > cap
+        }) || limits.max_pending_writes.is_some_and(|cap| {
+            self.total_pending_writes > 0 && self.total_pending_writes.saturating_add(1) > cap
+        }) {
+            return Some(WriteRegistrationError::AdmissionLimitExceeded);
+        }
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{PendingWriteCompletion, PendingWriteTracker, WriteRegistrationError};
@@ -559,6 +760,287 @@ mod tests {
     const INO: u64 = 42;
     const FIRST_FH: u64 = 7;
     const SECOND_FH: u64 = 8;
+
+    #[test]
+    fn admission_rejects_total_pending_bytes_over_hard_cap_until_released() {
+        let tracker = PendingWriteTracker::default();
+        let limits = super::PendingWriteAdmissionLimits {
+            max_pending_bytes: Some(8),
+            max_pending_writes: None,
+            per_handle_pending_bytes: None,
+        };
+        let first = tracker
+            .register_with_admission(INO, FIRST_FH, 6, limits)
+            .expect("first write fits under total byte cap");
+
+        let blocked = tracker
+            .try_register_with_admission(INO, SECOND_FH, 3, limits)
+            .expect_err("second write should exceed total byte cap");
+        assert_eq!(
+            blocked,
+            super::WriteRegistrationError::AdmissionLimitExceeded
+        );
+
+        first.complete(PendingWriteCompletion::Success);
+        tracker
+            .register_with_admission(INO, SECOND_FH, 3, limits)
+            .expect("released bytes should admit the next write");
+    }
+
+    #[test]
+    fn admission_allows_single_write_larger_than_global_byte_cap() {
+        let tracker = PendingWriteTracker::default();
+        let limits = super::PendingWriteAdmissionLimits {
+            max_pending_bytes: Some(8),
+            max_pending_writes: None,
+            per_handle_pending_bytes: None,
+        };
+        let first = tracker
+            .register_with_admission(INO, FIRST_FH, 16, limits)
+            .expect("single oversized write must not wait forever when no writes are pending");
+
+        let blocked = tracker
+            .try_register_with_admission(INO, SECOND_FH, 1, limits)
+            .expect_err("other writes must still wait behind the oversized write");
+        assert_eq!(
+            blocked,
+            super::WriteRegistrationError::AdmissionLimitExceeded
+        );
+
+        first.complete(PendingWriteCompletion::Success);
+        tracker
+            .register_with_admission(INO, SECOND_FH, 1, limits)
+            .expect("released oversized write should admit follow-up write");
+    }
+
+    #[test]
+    fn admission_total_pending_bytes_cap_applies_across_shards() {
+        let tracker = PendingWriteTracker::default();
+        let limits = super::PendingWriteAdmissionLimits {
+            max_pending_bytes: Some(8),
+            max_pending_writes: None,
+            per_handle_pending_bytes: None,
+        };
+        let other_shard_ino = INO + 1;
+        assert_ne!(
+            super::SharedTracker::shard_index(INO),
+            super::SharedTracker::shard_index(other_shard_ino),
+            "test setup must use different tracker shards",
+        );
+        let first = tracker
+            .register_with_admission(INO, FIRST_FH, 6, limits)
+            .expect("first write fits under global byte cap");
+
+        let blocked = tracker
+            .try_register_with_admission(other_shard_ino, FIRST_FH, 3, limits)
+            .expect_err("second shard should still be bound by global byte cap");
+        assert_eq!(
+            blocked,
+            super::WriteRegistrationError::AdmissionLimitExceeded
+        );
+
+        first.complete(PendingWriteCompletion::Success);
+        tracker
+            .register_with_admission(other_shard_ino, FIRST_FH, 3, limits)
+            .expect("released global bytes should admit write on another shard");
+    }
+
+    #[test]
+    fn admission_total_pending_writes_cap_applies_across_shards() {
+        let tracker = PendingWriteTracker::default();
+        let limits = super::PendingWriteAdmissionLimits {
+            max_pending_bytes: None,
+            max_pending_writes: Some(1),
+            per_handle_pending_bytes: None,
+        };
+        let other_shard_ino = INO + 1;
+        let first = tracker
+            .register_with_admission(INO, FIRST_FH, 1, limits)
+            .expect("first write fits under global request cap");
+
+        let blocked = tracker
+            .try_register_with_admission(other_shard_ino, FIRST_FH, 1, limits)
+            .expect_err("second shard should still be bound by global request cap");
+        assert_eq!(
+            blocked,
+            super::WriteRegistrationError::AdmissionLimitExceeded
+        );
+
+        first.complete(PendingWriteCompletion::Success);
+        tracker
+            .register_with_admission(other_shard_ino, FIRST_FH, 1, limits)
+            .expect("released global request slot should admit write on another shard");
+    }
+
+    #[test]
+    fn admission_rejects_per_handle_pending_bytes_but_allows_other_handles() {
+        let tracker = PendingWriteTracker::default();
+        let limits = super::PendingWriteAdmissionLimits {
+            max_pending_bytes: Some(16),
+            max_pending_writes: None,
+            per_handle_pending_bytes: Some(8),
+        };
+        let first = tracker
+            .register_with_admission(INO, FIRST_FH, 6, limits)
+            .expect("first handle write fits under per-handle cap");
+
+        let blocked = tracker
+            .try_register_with_admission(INO, FIRST_FH, 3, limits)
+            .expect_err("same handle should exceed per-handle byte cap");
+        assert_eq!(
+            blocked,
+            super::WriteRegistrationError::AdmissionLimitExceeded
+        );
+
+        tracker
+            .register_with_admission(INO, SECOND_FH, 3, limits)
+            .expect("other handle should still be admitted under total cap");
+        first.complete(PendingWriteCompletion::Error(libc::EIO));
+        tracker
+            .register_with_admission(INO, FIRST_FH, 3, limits)
+            .expect("error completion should release per-handle bytes");
+    }
+
+    #[test]
+    fn admission_allows_single_write_larger_than_per_handle_byte_cap() {
+        let tracker = PendingWriteTracker::default();
+        let limits = super::PendingWriteAdmissionLimits {
+            max_pending_bytes: None,
+            max_pending_writes: None,
+            per_handle_pending_bytes: Some(8),
+        };
+        let first = tracker
+            .register_with_admission(INO, FIRST_FH, 16, limits)
+            .expect("single oversized write must not wait forever on an empty handle");
+
+        let blocked = tracker
+            .try_register_with_admission(INO, FIRST_FH, 1, limits)
+            .expect_err("same handle must still wait behind the oversized write");
+        assert_eq!(
+            blocked,
+            super::WriteRegistrationError::AdmissionLimitExceeded
+        );
+
+        first.complete(PendingWriteCompletion::Success);
+        tracker
+            .register_with_admission(INO, FIRST_FH, 1, limits)
+            .expect("released oversized write should admit follow-up handle write");
+    }
+
+    #[test]
+    fn dropped_registration_releases_admission_bytes() {
+        let tracker = PendingWriteTracker::default();
+        let limits = super::PendingWriteAdmissionLimits {
+            max_pending_bytes: Some(8),
+            max_pending_writes: Some(1),
+            per_handle_pending_bytes: Some(8),
+        };
+        let pending = tracker
+            .register_with_admission(INO, FIRST_FH, 8, limits)
+            .expect("first write fills all caps");
+
+        drop(pending);
+
+        tracker
+            .register_with_admission(INO, FIRST_FH, 8, limits)
+            .expect("task failure drop should release bytes and request slot");
+    }
+
+    #[test]
+    fn blocking_admission_records_wait_metric() {
+        let tracker = PendingWriteTracker::default();
+        let limits = super::PendingWriteAdmissionLimits {
+            max_pending_bytes: Some(8),
+            max_pending_writes: None,
+            per_handle_pending_bytes: None,
+        };
+        let first = tracker
+            .register_with_admission(INO, FIRST_FH, 8, limits)
+            .expect("first write fills cap");
+        let waiting_tracker = PendingWriteTracker {
+            shared: std::sync::Arc::clone(&tracker.shared),
+        };
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (admitted_tx, admitted_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            started_tx.send(()).expect("send waiter started");
+            let registration = waiting_tracker
+                .register_with_admission(INO, SECOND_FH, 1, limits)
+                .expect("waited write should be admitted after release");
+            admitted_tx
+                .send(registration)
+                .expect("send admitted registration");
+        });
+
+        started_rx.recv().expect("waiter should start");
+        assert!(
+            matches!(
+                admitted_rx.recv_timeout(std::time::Duration::from_millis(25)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "waiter should not be admitted before pending bytes are released",
+        );
+        first.complete(PendingWriteCompletion::Success);
+        let waited = admitted_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("waiter should be admitted after release");
+        waited.complete(PendingWriteCompletion::Success);
+        waiter.join().expect("waiter should finish");
+
+        let metrics = tracker.admission_metrics();
+        assert_eq!(metrics.waits, 1);
+        assert!(metrics.wait_ns > 0);
+    }
+
+    #[test]
+    fn repeated_per_handle_wakeups_record_one_wait_metric() {
+        let tracker = PendingWriteTracker::default();
+        let limits = super::PendingWriteAdmissionLimits {
+            max_pending_bytes: None,
+            max_pending_writes: None,
+            per_handle_pending_bytes: Some(8),
+        };
+        let first = tracker
+            .register_with_admission(INO, FIRST_FH, 8, limits)
+            .expect("first write fills handle cap");
+        let waiting_tracker = PendingWriteTracker {
+            shared: std::sync::Arc::clone(&tracker.shared),
+        };
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (admitted_tx, admitted_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            started_tx.send(()).expect("send waiter started");
+            let registration = waiting_tracker
+                .register_with_admission(INO, FIRST_FH, 1, limits)
+                .expect("waited write should be admitted after release");
+            admitted_tx
+                .send(registration)
+                .expect("send admitted registration");
+        });
+
+        started_rx.recv().expect("waiter should start");
+        let shard = tracker.shared.shard_for_inode(INO);
+        shard.writes_changed.notify_all();
+        shard.writes_changed.notify_all();
+        assert!(
+            matches!(
+                admitted_rx.recv_timeout(std::time::Duration::from_millis(25)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "spurious wakeups must not admit the waiter while pressure remains",
+        );
+
+        first.complete(PendingWriteCompletion::Success);
+        let waited = admitted_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("waiter should be admitted after release");
+        waited.complete(PendingWriteCompletion::Success);
+        waiter.join().expect("waiter should finish");
+
+        let metrics = tracker.admission_metrics();
+        assert_eq!(metrics.waits, 1);
+        assert!(metrics.wait_ns > 0);
+    }
 
     #[test]
     fn registrations_return_monotonic_sequences_per_handle() {
@@ -812,7 +1294,7 @@ mod tests {
     #[test]
     fn write_turn_waits_for_prior_sequence_on_same_handle() {
         let tracker = PendingWriteTracker::default();
-        let first = tracker
+        let mut first = tracker
             .register(INO, FIRST_FH)
             .expect("register first write");
         let second = tracker
@@ -825,6 +1307,7 @@ mod tests {
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let waiter = std::thread::spawn(move || {
+            let mut second = second;
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             started_tx.send(()).expect("send waiter started");
             rt.block_on(second.turn_waiter().wait());
