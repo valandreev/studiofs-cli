@@ -372,12 +372,13 @@ fn parse_bridge_bool_env_value(raw: &str) -> bool {
         || trimmed.eq_ignore_ascii_case("on")
 }
 
-fn parse_bridge_bool_env(key: &str) -> bool {
-    std::env::var(key).is_ok_and(|raw| parse_bridge_bool_env_value(&raw))
+fn should_request_fuse_async_dio_from_env_value(raw: &str) -> bool {
+    cfg!(target_os = "linux") && parse_bridge_bool_env_value(raw)
 }
 
 fn should_request_fuse_async_dio_from_env() -> bool {
-    parse_bridge_bool_env("STUDIOFS_FUSE_ASYNC_DIO")
+    std::env::var("STUDIOFS_FUSE_ASYNC_DIO")
+        .is_ok_and(|raw| should_request_fuse_async_dio_from_env_value(&raw))
 }
 
 fn should_enable_async_fuse_write_from_env_value(raw: &str) -> bool {
@@ -1033,6 +1034,7 @@ pub struct StudioFuseRuntimeOptions {
     /// Enable the experimental async FUSE write-reply path.
     pub async_write_enabled: bool,
     /// Request Linux `FUSE_ASYNC_DIO` during FUSE init when supported.
+    /// Ignored on non-Linux platforms.
     pub linux_async_dio_enabled: bool,
     /// Optional custom limits for async write admission control. When omitted,
     /// explicit-runtime construction uses the safe platform defaults.
@@ -2727,7 +2729,6 @@ impl FuseKernelInvalidator {
 mod tests {
     #[cfg(not(target_os = "macos"))]
     use super::fuse_open_reply_flags;
-    use super::parse_bridge_bool_env_value;
     use super::{
         DEFAULT_FUSE_MAX_READAHEAD_BYTES, DEFAULT_FUSE_MAX_WRITE_BYTES,
         FuseAsyncWriteAdmissionPolicy, FuseBackgroundQueuePolicy, FuseEmptyReplyGuard,
@@ -2735,7 +2736,8 @@ mod tests {
         fuse_write_local_sync_policy, is_expected_macos_trashes_mkdir_exists,
         is_missing_xattr_error, missing_xattr_errno, normalize_unix_mode,
         posix_flags_to_open_flags, should_enable_async_fuse_write_from_env_value,
-        should_log_invalidation_error, to_fuse_attr, vfs_err_to_errno,
+        should_log_invalidation_error, should_request_fuse_async_dio_from_env_value, to_fuse_attr,
+        vfs_err_to_errno,
     };
     use crate::fs::pending_write_tracker::{PendingWriteAdmissionLimits, PendingWriteTracker};
     use std::cell::Cell;
@@ -3034,11 +3036,14 @@ mod tests {
     #[test]
     fn fuse_async_dio_env_is_opt_in_only() {
         for false_value in ["0", "false", "off", ""] {
-            assert!(!parse_bridge_bool_env_value(false_value));
+            assert!(!should_request_fuse_async_dio_from_env_value(false_value));
         }
 
         for true_value in ["1", "true", "True", "TRUE", "yes", "Yes", "on", "On"] {
-            assert!(parse_bridge_bool_env_value(true_value));
+            assert_eq!(
+                should_request_fuse_async_dio_from_env_value(true_value),
+                cfg!(target_os = "linux")
+            );
         }
     }
 
