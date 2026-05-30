@@ -60,8 +60,8 @@ impl Default for HandleState {
 struct TrackerState {
     inodes: HashMap<Ino, HashMap<FileHandle, HandleState>>,
     inode_generations: HashMap<Ino, InodeGeneration>,
-    inode_sticky_errors: HashMap<(Ino, InodeGeneration), i32>,
-    barrier_counts: HashMap<(Ino, InodeGeneration), usize>,
+    inode_sticky_errors: HashMap<Ino, HashMap<InodeGeneration, i32>>,
+    barrier_counts: HashMap<Ino, HashMap<InodeGeneration, usize>>,
 }
 
 #[derive(Debug, Default)]
@@ -229,10 +229,7 @@ impl PendingWriteTracker {
             let shard = &self.shared.shards[shard_index];
             let mut state = shard.state.lock().expect("pending write tracker poisoned");
             for (key, _, generation) in &targets {
-                *state
-                    .barrier_counts
-                    .entry((key.0, *generation))
-                    .or_insert(0) += 1;
+                state.increment_barrier_count(key.0, *generation);
             }
         }
         PendingWriteBarrier {
@@ -288,7 +285,9 @@ impl PendingWriteRegistration {
                 );
             state
                 .inode_sticky_errors
-                .entry((self.key.0, generation))
+                .entry(self.key.0)
+                .or_default()
+                .entry(generation)
                 .or_insert(errno);
         }
         if should_remove_closed_handle {
@@ -331,14 +330,7 @@ impl Drop for PendingWriteBarrier {
         let shard = &self.shared.shards[self.shard_index];
         let mut state = shard.state.lock().expect("pending write tracker poisoned");
         for (key, _, generation) in &self.targets {
-            let count_key = (key.0, *generation);
-            if let Some(count) = state.barrier_counts.get_mut(&count_key) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    state.barrier_counts.remove(&count_key);
-                    state.remove_retired_inode_error(count_key);
-                }
-            }
+            state.decrement_barrier_count(key.0, *generation);
         }
     }
 }
@@ -362,7 +354,8 @@ fn barrier_error(state: &TrackerState, targets: &[BarrierTarget]) -> Option<i32>
             .or_else(|| {
                 state
                     .inode_sticky_errors
-                    .get(&(key.0, *generation))
+                    .get(&key.0)
+                    .and_then(|errors| errors.get(generation))
                     .copied()
             })
     })
@@ -389,9 +382,7 @@ impl TrackerState {
         if self.inodes.get(&ino).is_some_and(HashMap::is_empty) {
             self.inodes.remove(&ino);
             let generation = self.current_generation(ino);
-            if self.barrier_counts.contains_key(&(ino, generation))
-                || self.inode_sticky_errors.contains_key(&(ino, generation))
-            {
+            if self.has_barrier_count(ino, generation) || self.has_sticky_error(ino, generation) {
                 self.inode_generations
                     .insert(ino, generation.saturating_add(1));
             } else {
@@ -402,8 +393,8 @@ impl TrackerState {
     }
 
     fn remove_retired_inode_error(&mut self, key: (Ino, InodeGeneration)) {
-        if !self.barrier_counts.contains_key(&key) {
-            self.inode_sticky_errors.remove(&key);
+        if !self.has_barrier_count(key.0, key.1) {
+            self.remove_sticky_error(key.0, key.1);
         }
         self.remove_unused_inode_generation(key.0);
     }
@@ -414,14 +405,59 @@ impl TrackerState {
         }
         let has_barriers = self
             .barrier_counts
-            .keys()
-            .any(|(barrier_ino, _)| *barrier_ino == ino);
+            .get(&ino)
+            .is_some_and(|counts| !counts.is_empty());
         let has_errors = self
             .inode_sticky_errors
-            .keys()
-            .any(|(error_ino, _)| *error_ino == ino);
+            .get(&ino)
+            .is_some_and(|errors| !errors.is_empty());
         if !has_barriers && !has_errors {
             self.inode_generations.remove(&ino);
+        }
+    }
+
+    fn increment_barrier_count(&mut self, ino: Ino, generation: InodeGeneration) {
+        *self
+            .barrier_counts
+            .entry(ino)
+            .or_default()
+            .entry(generation)
+            .or_insert(0) += 1;
+    }
+
+    fn decrement_barrier_count(&mut self, ino: Ino, generation: InodeGeneration) {
+        if let Some(counts) = self.barrier_counts.get_mut(&ino)
+            && let Some(count) = counts.get_mut(&generation)
+        {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&generation);
+                if counts.is_empty() {
+                    self.barrier_counts.remove(&ino);
+                }
+                self.remove_retired_inode_error((ino, generation));
+            }
+        }
+    }
+
+    fn has_barrier_count(&self, ino: Ino, generation: InodeGeneration) -> bool {
+        self.barrier_counts
+            .get(&ino)
+            .is_some_and(|counts| counts.contains_key(&generation))
+    }
+
+    fn has_sticky_error(&self, ino: Ino, generation: InodeGeneration) -> bool {
+        self.inode_sticky_errors
+            .get(&ino)
+            .is_some_and(|errors| errors.contains_key(&generation))
+    }
+
+    fn remove_sticky_error(&mut self, ino: Ino, generation: InodeGeneration) {
+        if let Some(errors) = self.inode_sticky_errors.get_mut(&ino) {
+            errors.remove(&generation);
+            if errors.is_empty() {
+                self.inode_sticky_errors.remove(&ino);
+            }
         }
     }
 }
@@ -610,7 +646,10 @@ mod tests {
             let shard = tracker.shared.shard_for_inode(INO);
             let state = shard.state.lock().expect("pending write tracker poisoned");
             assert!(
-                state.inode_sticky_errors.contains_key(&(INO, 0)),
+                state
+                    .inode_sticky_errors
+                    .get(&INO)
+                    .is_some_and(|errors| errors.contains_key(&0)),
                 "active barriers keep retired inode errors observable"
             );
         }
@@ -620,7 +659,10 @@ mod tests {
         let shard = tracker.shared.shard_for_inode(INO);
         let state = shard.state.lock().expect("pending write tracker poisoned");
         assert!(
-            !state.inode_sticky_errors.contains_key(&(INO, 0)),
+            !state
+                .inode_sticky_errors
+                .get(&INO)
+                .is_some_and(|errors| errors.contains_key(&0)),
             "retired inode errors should be removed once no barrier can observe them"
         );
         assert!(
