@@ -554,15 +554,18 @@ impl PendingWriteBarrier {
         }
         let shard = &self.shared.shards[self.shard_index];
         loop {
-            let notified = {
+            let mut notified = {
                 let mut state = shard.state.lock().expect("pending write tracker poisoned");
                 if barrier_ready(&state, &self.targets) {
                     return barrier_error(&state, &self.targets, self.include_inode_errors)
                         .map_or(Ok(()), Err);
                 }
-                state.async_write_notifier(&self.targets).notified_owned()
+                let mut notified =
+                    Box::pin(state.async_write_notifier(&self.targets).notified_owned());
+                notified.as_mut().enable();
+                notified
             };
-            notified.await;
+            (&mut notified).await;
         }
     }
 }
@@ -1204,13 +1207,15 @@ mod tests {
         let tracker = PendingWriteTracker::default();
         let barrier = tracker.inode_barrier(INO);
         let shard = tracker.shared.shard_for_inode(INO);
-        let state = shard.state.lock().expect("pending write tracker poisoned");
+        {
+            let state = shard.state.lock().expect("pending write tracker poisoned");
+            assert!(!state.async_write_notifiers.contains_key(&INO));
+        }
 
         assert_eq!(
             tokio::time::timeout(std::time::Duration::from_millis(25), barrier.wait_async()).await,
             Ok(Ok(()))
         );
-        drop(state);
 
         let state = shard.state.lock().expect("pending write tracker poisoned");
         assert!(!state.async_write_notifiers.contains_key(&INO));
