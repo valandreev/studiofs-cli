@@ -393,11 +393,17 @@ impl Drop for PendingWriteBarrier {
 
 fn barrier_ready(state: &TrackerState, targets: &[BarrierTarget]) -> bool {
     targets.iter().all(|(key, target, _)| {
-        state
+        match state
             .inodes
             .get(&key.0)
             .and_then(|handles| handles.get(&key.1))
-            .is_none_or(|handle| handle.pending.first().is_none_or(|first| first > target))
+        {
+            Some(handle) => match handle.pending.first() {
+                Some(first) => first > target,
+                None => true,
+            },
+            None => true,
+        }
     })
 }
 
@@ -419,15 +425,17 @@ fn barrier_error(state: &TrackerState, targets: &[BarrierTarget]) -> Option<i32>
 
 impl TrackerState {
     fn is_registration_turn(&self, key: HandleKey, sequence: Sequence) -> bool {
-        self.inodes
+        match self
+            .inodes
             .get(&key.0)
             .and_then(|handles| handles.get(&key.1))
-            .is_none_or(|handle| {
-                handle
-                    .pending
-                    .first()
-                    .is_none_or(|first| *first >= sequence)
-            })
+        {
+            Some(handle) => match handle.pending.first() {
+                Some(first) => *first >= sequence,
+                None => true,
+            },
+            None => true,
+        }
     }
 
     fn current_generation(&self, ino: Ino) -> InodeGeneration {
