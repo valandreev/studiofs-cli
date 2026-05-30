@@ -1487,7 +1487,12 @@ impl Filesystem for StudioFuseFs {
             let vfs = Arc::clone(&self.vfs);
             let local_sync_policy = fuse_write_local_sync_policy(flags);
             self.rt.spawn(async move {
-                registration.wait_for_turn();
+                let turn = registration.turn_waiter();
+                if let Err(e) = tokio::task::spawn_blocking(move || turn.wait()).await {
+                    error!("async FUSE write turn wait task failed: {e}");
+                    registration.complete(PendingWriteCompletion::TaskFailed);
+                    return;
+                }
                 let result = vfs
                     .write_fh_with_deferred_materialize(fh, ino, offset, &data, local_sync_policy)
                     .await;
@@ -1534,13 +1539,14 @@ impl Filesystem for StudioFuseFs {
     ) {
         let started = Instant::now();
         debug!(ino, fh, "flush started");
-        if let Err(errno) = self.wait_pending_writes_for_handle(ino, fh) {
-            reply.error(errno);
-            return;
-        }
+        let pending_result = self.wait_pending_writes_for_handle(ino, fh);
         let result = self.handle_drain().flush(ino, fh);
-        match result {
-            Ok(()) => {
+        match (pending_result, result) {
+            (Err(errno), _) => {
+                error!("flush({ino}, fh={fh}) observed pending write error: {errno}");
+                reply.error(errno);
+            }
+            (Ok(()), Ok(())) => {
                 debug!(
                     ino,
                     fh,
@@ -1549,7 +1555,7 @@ impl Filesystem for StudioFuseFs {
                 );
                 reply.ok();
             }
-            Err(e) => {
+            (Ok(()), Err(e)) => {
                 if fh != 0 {
                     error!("flush_fh({fh}) -> {e}");
                 } else {
@@ -1608,10 +1614,7 @@ impl Filesystem for StudioFuseFs {
     fn fsync(&mut self, _req: &Request<'_>, ino: u64, fh: u64, datasync: bool, reply: ReplyEmpty) {
         let started = Instant::now();
         debug!(ino, fh, datasync, "fsync started");
-        if let Err(errno) = self.wait_pending_writes_for_fsync(ino, fh) {
-            reply.error(errno);
-            return;
-        }
+        let pending_result = self.wait_pending_writes_for_fsync(ino, fh);
         let result = if fh != 0 {
             // Handle-backed FUSE fsync follows the same local-durability
             // contract as flush_fh: it persists dirty state locally, waits for
@@ -1623,8 +1626,12 @@ impl Filesystem for StudioFuseFs {
         } else {
             self.rt.block_on(self.vfs.fsync(ino, datasync))
         };
-        match result {
-            Ok(()) => {
+        match (pending_result, result) {
+            (Err(errno), _) => {
+                error!("fsync({ino}, fh={fh}) observed pending write error: {errno}");
+                reply.error(errno);
+            }
+            (Ok(()), Ok(())) => {
                 debug!(
                     ino,
                     fh,
@@ -1634,7 +1641,7 @@ impl Filesystem for StudioFuseFs {
                 );
                 reply.ok();
             }
-            Err(e) => {
+            (Ok(()), Err(e)) => {
                 error!("fsync({ino}, fh={fh}) -> {e}");
                 reply.error(vfs_err_to_errno(&e));
             }

@@ -90,6 +90,14 @@ pub(super) struct PendingWriteRegistration {
 }
 
 #[derive(Debug)]
+pub(super) struct PendingWriteTurn {
+    shared: Arc<SharedTracker>,
+    shard_index: usize,
+    key: HandleKey,
+    sequence: Sequence,
+}
+
+#[derive(Debug)]
 pub(super) struct PendingWriteBarrier {
     shared: Arc<SharedTracker>,
     shard_index: usize,
@@ -249,7 +257,18 @@ impl PendingWriteRegistration {
         self.sequence
     }
 
-    pub(super) fn wait_for_turn(&self) {
+    pub(super) fn turn_waiter(&self) -> PendingWriteTurn {
+        PendingWriteTurn {
+            shared: Arc::clone(&self.shared),
+            shard_index: self.shard_index,
+            key: self.key,
+            sequence: self.sequence,
+        }
+    }
+}
+
+impl PendingWriteTurn {
+    pub(super) fn wait(&self) {
         let shard = &self.shared.shards[self.shard_index];
         let mut state = shard.state.lock().expect("pending write tracker poisoned");
         while !state.is_registration_turn(self.key, self.sequence) {
@@ -259,7 +278,9 @@ impl PendingWriteRegistration {
                 .expect("pending write tracker poisoned");
         }
     }
+}
 
+impl PendingWriteRegistration {
     pub(super) fn complete(&self, completion: PendingWriteCompletion) {
         if self.completion.set(completion).is_err() {
             return;
@@ -770,10 +791,10 @@ mod tests {
             .register(INO, FIRST_FH)
             .expect("register second write");
 
-        first.wait_for_turn();
+        first.turn_waiter().wait();
 
         let waiter = std::thread::spawn(move || {
-            second.wait_for_turn();
+            second.turn_waiter().wait();
             second.complete(PendingWriteCompletion::Success);
         });
 
