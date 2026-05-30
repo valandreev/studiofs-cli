@@ -468,13 +468,15 @@ fn mounted_tests_enabled() -> bool {
 fn finish_mounted_fuse_test(
     test_result: std::thread::Result<MountedOperationGuard>,
     unmount_result: io::Result<()>,
-    join_result: std::thread::Result<io::Result<()>>,
+    join_result: Option<std::thread::Result<io::Result<()>>>,
 ) {
     match test_result {
         Ok(_guard) => {
-            match join_result {
-                Ok(run_result) => run_result.expect("FUSE session should run until unmount"),
-                Err(panic) => std::panic::resume_unwind(panic),
+            if let Some(join_result) = join_result {
+                match join_result {
+                    Ok(run_result) => run_result.expect("FUSE session should run until unmount"),
+                    Err(panic) => std::panic::resume_unwind(panic),
+                }
             }
             unmount_result.expect("FUSE unmount should succeed");
         }
@@ -482,18 +484,27 @@ fn finish_mounted_fuse_test(
             if let Err(error) = unmount_result {
                 eprintln!("FUSE unmount failed after scenario panic: {error}");
             }
-            match join_result {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    eprintln!("FUSE session failed after scenario panic: {error}");
-                }
-                Err(_) => {
-                    eprintln!("FUSE session thread panicked after scenario panic");
+            if let Some(join_result) = join_result {
+                match join_result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        eprintln!("FUSE session failed after scenario panic: {error}");
+                    }
+                    Err(_) => {
+                        eprintln!("FUSE session thread panicked after scenario panic");
+                    }
                 }
             }
             std::panic::resume_unwind(panic);
         }
     }
+}
+
+fn should_join_mounted_fuse_session(
+    test_result: &std::thread::Result<MountedOperationGuard>,
+    unmount_result: &io::Result<()>,
+) -> bool {
+    test_result.is_ok() && unmount_result.is_ok()
 }
 
 #[test]
@@ -504,7 +515,7 @@ fn mounted_fuse_cleanup_preserves_original_scenario_panic() {
         finish_mounted_fuse_test(
             scenario_panic,
             Err(io::Error::other("unmount failed")),
-            Ok(Err(io::Error::other("session failed"))),
+            None,
         );
     }))
     .expect_err("cleanup should resume the original scenario panic");
@@ -517,12 +528,14 @@ fn mounted_fuse_cleanup_preserves_original_scenario_panic() {
 }
 
 #[test]
-fn mounted_fuse_cleanup_reports_session_panic_before_unmount_error() {
+fn mounted_fuse_cleanup_reports_joined_session_panic() {
     let observed = std::panic::catch_unwind(|| {
         finish_mounted_fuse_test(
             Ok(MountedOperationGuard::default()),
-            Err(io::Error::other("unmount failed")),
-            Err(Box::new("session crashed") as Box<dyn std::any::Any + Send>),
+            Ok(()),
+            Some(Err(
+                Box::new("session crashed") as Box<dyn std::any::Any + Send>
+            )),
         );
     })
     .expect_err("session panic should be reported before unmount failure");
@@ -530,8 +543,44 @@ fn mounted_fuse_cleanup_reports_session_panic_before_unmount_error() {
     assert_eq!(
         observed.downcast_ref::<&str>(),
         Some(&"session crashed"),
-        "session thread panic must not be masked by a later unmount error"
+        "joined session thread panic must be reported"
     );
+}
+
+#[test]
+fn mounted_fuse_cleanup_allows_skipping_join_after_cleanup_failure() {
+    let observed = std::panic::catch_unwind(|| {
+        finish_mounted_fuse_test(
+            Ok(MountedOperationGuard::default()),
+            Err(io::Error::other("unmount failed")),
+            None,
+        );
+    })
+    .expect_err("unmount failure should still be reported when join is skipped");
+
+    let message = observed
+        .downcast_ref::<String>()
+        .expect("unmount failure panic should carry a string message");
+    assert!(message.contains("FUSE unmount should succeed"));
+    assert!(message.contains("unmount failed"));
+}
+
+#[test]
+fn mounted_fuse_cleanup_skips_join_when_scenario_panicked_or_unmount_failed() {
+    let scenario_panic: std::thread::Result<MountedOperationGuard> =
+        Err(Box::new("scenario failed") as Box<dyn std::any::Any + Send>);
+    let scenario_ok = Ok(MountedOperationGuard::default());
+    let unmount_ok = Ok(());
+
+    assert!(!should_join_mounted_fuse_session(
+        &scenario_panic,
+        &unmount_ok
+    ));
+    assert!(!should_join_mounted_fuse_session(
+        &scenario_ok,
+        &Err(io::Error::other("unmount failed"))
+    ));
+    assert!(should_join_mounted_fuse_session(&scenario_ok, &unmount_ok));
 }
 
 fn with_mounted_fuse(
@@ -598,7 +647,11 @@ fn with_mounted_fuse(
         test_fn(&mount_path)
     }));
     let unmount_result = unmount.unmount();
-    let join_result = session_handle.join();
+    let join_result = if should_join_mounted_fuse_session(&test_result, &unmount_result) {
+        Some(session_handle.join())
+    } else {
+        None
+    };
 
     finish_mounted_fuse_test(test_result, unmount_result, join_result);
 }
