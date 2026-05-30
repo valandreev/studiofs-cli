@@ -3,8 +3,12 @@
 #![cfg(unix)]
 
 use std::collections::BTreeSet;
+use std::ffi::OsString;
 use std::io;
 use std::io::Write;
+#[cfg(target_os = "macos")]
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, OnceLock};
@@ -72,6 +76,8 @@ enum MountedScenarioOperation {
     FioMultiJob,
     FsyncHeavy,
     MultipleFileCopy,
+    WriteOnlyUntilUnmount,
+    FinderStyleCopy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +86,11 @@ struct MountedAsyncScenario {
     mode: MountedFuseMode,
     platform: MountedScenarioPlatform,
     operation: MountedScenarioOperation,
+}
+
+#[derive(Default)]
+struct MountedOperationGuard {
+    _open_files: Vec<std::fs::File>,
 }
 
 macro_rules! declare_mounted_scenarios {
@@ -162,7 +173,7 @@ declare_mounted_scenarios! {
         name: "unmount-after-async-write",
         mode: MountedFuseMode::AsyncWrite,
         platform: MountedScenarioPlatform::AnyUnix,
-        operation: MountedScenarioOperation::CloseReopenReadback
+        operation: MountedScenarioOperation::WriteOnlyUntilUnmount
     },
     linux_async_mounted_default_sync => {
         name: "linux-default-sync",
@@ -216,7 +227,7 @@ declare_mounted_scenarios! {
         name: "macos-finder-style-copy",
         mode: MountedFuseMode::AsyncWrite,
         platform: MountedScenarioPlatform::Macos,
-        operation: MountedScenarioOperation::MultipleFileCopy
+        operation: MountedScenarioOperation::FinderStyleCopy
     },
 }
 
@@ -268,6 +279,56 @@ fn runtime_options_from_env_is_public_for_embedder_overrides() {
     options.async_write_enabled = true;
 
     assert!(options.async_write_enabled);
+}
+
+#[test]
+fn async_mounted_matrix_uses_distinct_unmount_and_finder_style_operations() {
+    let scenarios = mounted_async_scenarios();
+    let unmount = scenarios
+        .iter()
+        .find(|scenario| scenario.name == "unmount-after-async-write")
+        .expect("unmount-after-async-write scenario should be present");
+    let finder = scenarios
+        .iter()
+        .find(|scenario| scenario.name == "macos-finder-style-copy")
+        .expect("macos-finder-style-copy scenario should be present");
+    let regular_copy = scenarios
+        .iter()
+        .find(|scenario| scenario.name == "macos-multiple-file-copy")
+        .expect("macos-multiple-file-copy scenario should be present");
+
+    assert_eq!(
+        unmount.operation,
+        MountedScenarioOperation::WriteOnlyUntilUnmount,
+        "unmount-after-async-write must leave write teardown to unmount"
+    );
+    assert_eq!(
+        finder.operation,
+        MountedScenarioOperation::FinderStyleCopy,
+        "Finder-style copy should exercise Finder metadata behavior"
+    );
+    assert_ne!(
+        finder.operation, regular_copy.operation,
+        "Finder-style copy must not duplicate the plain multi-file copy operation"
+    );
+}
+
+#[test]
+fn command_path_is_available_only_when_executable() {
+    let tmp = target_tempdir("command-availability-");
+    let command_path = tmp.path().join("fio");
+    std::fs::write(&command_path, b"not executable").expect("write fake command");
+
+    std::fs::set_permissions(&command_path, std::fs::Permissions::from_mode(0o644))
+        .expect("set non-executable permissions");
+    assert!(
+        !command_path_is_executable(&command_path),
+        "plain files in PATH must not be treated as executable commands"
+    );
+
+    std::fs::set_permissions(&command_path, std::fs::Permissions::from_mode(0o755))
+        .expect("set executable permissions");
+    assert!(command_path_is_executable(&command_path));
 }
 
 fn workspace_root() -> std::path::PathBuf {
@@ -405,12 +466,12 @@ fn mounted_tests_enabled() -> bool {
 }
 
 fn finish_mounted_fuse_test(
-    test_result: std::thread::Result<()>,
+    test_result: std::thread::Result<MountedOperationGuard>,
     unmount_result: io::Result<()>,
     join_result: std::thread::Result<io::Result<()>>,
 ) {
     match test_result {
-        Ok(()) => {
+        Ok(_guard) => {
             match join_result {
                 Ok(run_result) => run_result.expect("FUSE session should run until unmount"),
                 Err(panic) => std::panic::resume_unwind(panic),
@@ -437,7 +498,7 @@ fn finish_mounted_fuse_test(
 
 #[test]
 fn mounted_fuse_cleanup_preserves_original_scenario_panic() {
-    let scenario_panic: std::thread::Result<()> =
+    let scenario_panic: std::thread::Result<MountedOperationGuard> =
         Err(Box::new("scenario failed") as Box<dyn std::any::Any + Send>);
     let observed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         finish_mounted_fuse_test(
@@ -459,7 +520,7 @@ fn mounted_fuse_cleanup_preserves_original_scenario_panic() {
 fn mounted_fuse_cleanup_reports_session_panic_before_unmount_error() {
     let observed = std::panic::catch_unwind(|| {
         finish_mounted_fuse_test(
-            Ok(()),
+            Ok(MountedOperationGuard::default()),
             Err(io::Error::other("unmount failed")),
             Err(Box::new("session crashed") as Box<dyn std::any::Any + Send>),
         );
@@ -473,7 +534,11 @@ fn mounted_fuse_cleanup_reports_session_panic_before_unmount_error() {
     );
 }
 
-fn with_mounted_fuse(mode: MountedFuseMode, suffix: &str, test_fn: impl FnOnce(&Path)) {
+fn with_mounted_fuse(
+    mode: MountedFuseMode,
+    suffix: &str,
+    test_fn: impl FnOnce(&Path) -> MountedOperationGuard,
+) {
     if !mounted_tests_enabled() {
         return;
     }
@@ -510,29 +575,27 @@ fn with_mounted_fuse(mode: MountedFuseMode, suffix: &str, test_fn: impl FnOnce(&
     let mut unmount = session.unmount_callable();
     let session_handle = std::thread::spawn(move || session.run());
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        if std::fs::metadata(&mount_path)
-            .map(|m| m.dev() != pre_dev)
-            .unwrap_or(false)
-        {
-            break;
-        }
-        if session_handle.is_finished() {
-            let unmount_result = unmount.unmount();
-            let join_result = session_handle.join();
-            finish_mounted_fuse_test(Ok(()), unmount_result, join_result);
-            panic!("FUSE session thread exited early before mount became available");
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "FUSE mount did not become available within 10 s"
-        );
-        std::thread::sleep(Duration::from_millis(200));
-    }
-
     let test_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        test_fn(&mount_path);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if std::fs::metadata(&mount_path)
+                .map(|m| m.dev() != pre_dev)
+                .unwrap_or(false)
+            {
+                break;
+            }
+            assert!(
+                !session_handle.is_finished(),
+                "FUSE session thread exited early before mount became available"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "FUSE mount did not become available within 10 s"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+
+        test_fn(&mount_path)
     }));
     let unmount_result = unmount.unmount();
     let join_result = session_handle.join();
@@ -549,11 +612,14 @@ fn run_mounted_scenario(scenario: MountedAsyncScenario) {
         return;
     }
     with_mounted_fuse(scenario.mode, scenario.name, |mount_path| {
-        run_mounted_operation(mount_path, scenario.operation);
+        run_mounted_operation(mount_path, scenario.operation)
     });
 }
 
-fn run_mounted_operation(mount_path: &Path, operation: MountedScenarioOperation) {
+fn run_mounted_operation(
+    mount_path: &Path,
+    operation: MountedScenarioOperation,
+) -> MountedOperationGuard {
     match operation {
         MountedScenarioOperation::SequentialWriteReadback => {
             let test_file = mount_path.join("sequential.txt");
@@ -561,6 +627,7 @@ fn run_mounted_operation(mount_path: &Path, operation: MountedScenarioOperation)
             std::fs::write(&test_file, payload).expect("write through FUSE mount");
             let readback = std::fs::read(&test_file).expect("read through FUSE mount");
             assert_eq!(readback, payload);
+            MountedOperationGuard::default()
         }
         MountedScenarioOperation::WriteFlushReadback => {
             let test_file = mount_path.join("flush.txt");
@@ -572,6 +639,7 @@ fn run_mounted_operation(mount_path: &Path, operation: MountedScenarioOperation)
             }
             let readback = std::fs::read(&test_file).expect("read after flush and close");
             assert_eq!(readback, payload);
+            MountedOperationGuard::default()
         }
         MountedScenarioOperation::WriteFsyncReadback => {
             let test_file = mount_path.join("fsync.txt");
@@ -582,6 +650,7 @@ fn run_mounted_operation(mount_path: &Path, operation: MountedScenarioOperation)
             drop(file);
             let readback = std::fs::read(&test_file).expect("read after fsync");
             assert_eq!(readback, payload);
+            MountedOperationGuard::default()
         }
         MountedScenarioOperation::CloseReopenReadback => {
             let test_file = mount_path.join("close-reopen.txt");
@@ -592,6 +661,7 @@ fn run_mounted_operation(mount_path: &Path, operation: MountedScenarioOperation)
             }
             let readback = std::fs::read(&test_file).expect("read reopened file");
             assert_eq!(readback, payload);
+            MountedOperationGuard::default()
         }
         MountedScenarioOperation::MultipleWriters => {
             let test_file = mount_path.join("multiple-writers.txt");
@@ -614,6 +684,7 @@ fn run_mounted_operation(mount_path: &Path, operation: MountedScenarioOperation)
             let readback = std::fs::read_to_string(&test_file).expect("read combined writes");
             assert!(readback.contains("writer-one"));
             assert!(readback.contains("writer-two"));
+            MountedOperationGuard::default()
         }
         MountedScenarioOperation::SameHandleAppends => {
             let test_file = mount_path.join("same-handle.txt");
@@ -624,19 +695,49 @@ fn run_mounted_operation(mount_path: &Path, operation: MountedScenarioOperation)
             drop(file);
             let readback = std::fs::read_to_string(&test_file).expect("read appended file");
             assert_eq!(readback, "first\nsecond\n");
+            MountedOperationGuard::default()
         }
-        MountedScenarioOperation::Dd => run_dd_workload(mount_path),
-        MountedScenarioOperation::FioMultiJob => run_fio_workload_if_available(mount_path),
-        MountedScenarioOperation::FsyncHeavy => run_fsync_heavy_workload(mount_path),
-        MountedScenarioOperation::MultipleFileCopy => run_multiple_file_copy_workload(mount_path),
+        MountedScenarioOperation::WriteOnlyUntilUnmount => {
+            let test_file = mount_path.join("write-only-until-unmount.bin");
+            let mut file = std::fs::File::create(&test_file).expect("create write-only file");
+            for chunk in 0..64u8 {
+                file.write_all(&[chunk; 16 * 1024])
+                    .expect("write chunk that should drain during unmount");
+            }
+            MountedOperationGuard {
+                _open_files: vec![file],
+            }
+        }
+        MountedScenarioOperation::FinderStyleCopy => {
+            run_finder_style_copy_workload(mount_path);
+            MountedOperationGuard::default()
+        }
+        MountedScenarioOperation::Dd => {
+            run_dd_workload(mount_path);
+            MountedOperationGuard::default()
+        }
+        MountedScenarioOperation::FioMultiJob => {
+            run_fio_workload_if_available(mount_path);
+            MountedOperationGuard::default()
+        }
+        MountedScenarioOperation::FsyncHeavy => {
+            run_fsync_heavy_workload(mount_path);
+            MountedOperationGuard::default()
+        }
+        MountedScenarioOperation::MultipleFileCopy => {
+            run_multiple_file_copy_workload(mount_path);
+            MountedOperationGuard::default()
+        }
     }
 }
 
 fn run_dd_workload(mount_path: &Path) {
     let output = mount_path.join("dd.bin");
+    let mut output_arg = OsString::from("of=");
+    output_arg.push(&output);
     let status = Command::new("dd")
         .arg("if=/dev/zero")
-        .arg(format!("of={}", output.display()))
+        .arg(output_arg)
         .arg("bs=64k")
         .arg("count=8")
         .arg("conv=fsync")
@@ -647,9 +748,16 @@ fn run_dd_workload(mount_path: &Path) {
     assert_eq!(len, 512 * 1024);
 }
 
+fn command_path_is_executable(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
 fn command_available(command: &str) -> bool {
-    std::env::var_os("PATH")
-        .is_some_and(|paths| std::env::split_paths(&paths).any(|path| path.join(command).is_file()))
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|path| command_path_is_executable(&path.join(command)))
+    })
 }
 
 fn run_fio_workload_if_available(mount_path: &Path) {
@@ -658,9 +766,11 @@ fn run_fio_workload_if_available(mount_path: &Path) {
         return;
     }
 
+    let mut directory_arg = OsString::from("--directory=");
+    directory_arg.push(mount_path);
     let status = Command::new("fio")
         .arg("--name=studiofs-fuse-async")
-        .arg(format!("--directory={}", mount_path.display()))
+        .arg(directory_arg)
         .arg("--filename=fio.bin")
         .arg("--rw=write")
         .arg("--bs=64k")
@@ -703,6 +813,115 @@ fn run_multiple_file_copy_workload(mount_path: &Path) {
         let readback = std::fs::read_to_string(&target).expect("read copied file");
         assert_eq!(readback, payload);
     }
+}
+
+#[cfg(target_os = "macos")]
+fn run_finder_style_copy_workload(mount_path: &Path) {
+    let source_dir = mount_path.join("finder-source");
+    let target_dir = mount_path.join("finder-target");
+    std::fs::create_dir(&source_dir).expect("create Finder-style source dir");
+    std::fs::create_dir(&target_dir).expect("create Finder-style target dir");
+
+    let ds_store = target_dir.join(".DS_Store");
+    std::fs::write(&ds_store, b"StudioFS Finder metadata cache\n").expect("write .DS_Store");
+
+    let source = source_dir.join("Finder copy document.txt");
+    let target = target_dir.join("Finder copy document.txt");
+    let payload = b"StudioFS Finder-style copy payload\n";
+    std::fs::write(&source, payload).expect("write Finder-style source");
+    std::fs::copy(&source, &target).expect("copy Finder-style file through mounted FUSE");
+    assert_eq!(
+        std::fs::read(&target).expect("read Finder-style copied file"),
+        payload
+    );
+
+    let mut finder_info = [0; 32];
+    finder_info[..4].copy_from_slice(b"FIND");
+    let resource_fork = b"StudioFS resource fork payload";
+    set_macos_xattr(&target, "com.apple.FinderInfo", &finder_info);
+    set_macos_xattr(&target, "com.apple.ResourceFork", resource_fork);
+
+    assert_eq!(
+        get_macos_xattr(&target, "com.apple.FinderInfo"),
+        finder_info
+    );
+    assert_eq!(
+        get_macos_xattr(&target, "com.apple.ResourceFork"),
+        resource_fork
+    );
+}
+
+#[cfg(not(target_os = "macos"))]
+fn run_finder_style_copy_workload(_mount_path: &Path) {
+    unreachable!("Finder-style copy scenario is macOS-only");
+}
+
+#[cfg(target_os = "macos")]
+fn set_macos_xattr(path: &Path, name: &str, value: &[u8]) {
+    let path = path_to_c_string(path);
+    let name = std::ffi::CString::new(name).expect("xattr name should not contain NUL");
+    // SAFETY: `path` and `name` are live NUL-terminated C strings, and `value`
+    // points to `value.len()` initialized bytes for the duration of the call.
+    let result = unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+            0,
+        )
+    };
+    assert_eq!(
+        result,
+        0,
+        "setxattr should succeed: {}",
+        io::Error::last_os_error()
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn get_macos_xattr(path: &Path, name: &str) -> Vec<u8> {
+    let path = path_to_c_string(path);
+    let name = std::ffi::CString::new(name).expect("xattr name should not contain NUL");
+    // SAFETY: `path` and `name` are live NUL-terminated C strings. A null value
+    // pointer with size 0 is the documented macOS size-query form.
+    let size =
+        unsafe { libc::getxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0, 0, 0) };
+    assert!(
+        size >= 0,
+        "getxattr size query should succeed: {}",
+        io::Error::last_os_error()
+    );
+    let len = usize::try_from(size).expect("xattr size should fit usize");
+    let mut value = vec![0; len];
+    // SAFETY: `path` and `name` are live NUL-terminated C strings, and `value`
+    // provides `value.len()` writable bytes for libc to fill.
+    let read = unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            value.as_mut_ptr().cast(),
+            value.len(),
+            0,
+            0,
+        )
+    };
+    assert!(
+        read >= 0,
+        "getxattr read should succeed: {}",
+        io::Error::last_os_error()
+    );
+    assert_eq!(
+        usize::try_from(read).expect("xattr read size should fit usize"),
+        len
+    );
+    value
+}
+
+#[cfg(target_os = "macos")]
+fn path_to_c_string(path: &Path) -> std::ffi::CString {
+    std::ffi::CString::new(path.as_os_str().as_bytes()).expect("path should not contain NUL")
 }
 
 /// Verifies that creating and dropping a FUSE session does not panic or leak.
