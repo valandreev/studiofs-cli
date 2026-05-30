@@ -124,6 +124,12 @@ pub enum ScenarioError {
         /// Unmount and cleanup failure while tearing down.
         cleanup: String,
     },
+    /// Performance probe validation failed.
+    #[error("mounted performance probe validation failed: {detail}")]
+    PerformanceProbeValidationFailed {
+        /// Validation failure details.
+        detail: String,
+    },
     /// Mounted tree validation error.
     #[error("mounted tree validation failed: {0}")]
     MountedTree(

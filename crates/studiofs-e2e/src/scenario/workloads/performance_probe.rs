@@ -79,7 +79,8 @@ impl Scenario for MountedFuseWriteBaseline {
     }
 
     fn setup(&self, context: &ScenarioContext) -> Result<(), ScenarioError> {
-        MountedPerformanceProbe.setup(context)
+        fs::create_dir_all(&context.scenario_dir)?;
+        Ok(())
     }
 
     fn run(&self, context: &ScenarioContext) -> Result<(), ScenarioError> {
@@ -90,8 +91,8 @@ impl Scenario for MountedFuseWriteBaseline {
         validate_mounted_performance_probe(context, MOUNTED_FUSE_WRITE_BASELINE)
     }
 
-    fn cleanup(&self, context: &ScenarioContext) -> Result<(), ScenarioError> {
-        MountedPerformanceProbe.cleanup(context)
+    fn cleanup(&self, _context: &ScenarioContext) -> Result<(), ScenarioError> {
+        Ok(())
     }
 }
 
@@ -108,9 +109,9 @@ fn run_mounted_performance_probe_scenario(
         clean_existing_local_metadata: true,
     })?;
     controller.mount(PERFORMANCE_PROBE_CLIENT)?;
-    let client = controller.client_at(0)?.clone();
+    let client = controller.client_at(0)?;
 
-    let run_result = run_mounted_performance_probe(context, &client, scenario_name);
+    let run_result = run_mounted_performance_probe(context, client, scenario_name);
     let cleanup_result = controller.unmount_all();
     match (run_result, cleanup_result) {
         (Ok(()), Ok(())) => Ok(()),
@@ -130,19 +131,17 @@ fn validate_mounted_performance_probe(
     let summary_path = context.scenario_dir.join(PERFORMANCE_PROBE_SUMMARY_FILE);
     let summary: PerformanceProbeSummary = serde_json::from_slice(&fs::read(&summary_path)?)?;
     if summary.status != "passed" {
-        return Err(ScenarioError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("performance probe status is {}", summary.status),
-        )));
+        return Err(ScenarioError::PerformanceProbeValidationFailed {
+            detail: format!("performance probe status is {}", summary.status),
+        });
     }
     if summary.scenario != scenario_name {
-        return Err(ScenarioError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
+        return Err(ScenarioError::PerformanceProbeValidationFailed {
+            detail: format!(
                 "performance probe summary scenario is {}, expected {scenario_name}",
                 summary.scenario
             ),
-        )));
+        });
     }
 
     let read_phases = summary
@@ -151,13 +150,12 @@ fn validate_mounted_performance_probe(
         .filter(|phase| phase.kind == "read")
         .count();
     if read_phases != summary.config.read_passes as usize {
-        return Err(ScenarioError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
+        return Err(ScenarioError::PerformanceProbeValidationFailed {
+            detail: format!(
                 "performance probe recorded {read_phases} read phases, expected {}",
                 summary.config.read_passes
             ),
-        )));
+        });
     }
 
     let validation = json!({

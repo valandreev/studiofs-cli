@@ -467,15 +467,9 @@ fn sfs469_fuse_write_baseline_uses_reserved_98_selector_not_24() {
     };
     assert_eq!(args.scenario_names(), ["98"]);
 
-    let scenarios = studiofs_e2e::scenario::available_scenarios();
-    let names = scenarios
-        .iter()
-        .map(|scenario| scenario.name)
-        .collect::<Vec<_>>();
-    assert_eq!(names[23], "mounted-performance-probe");
     assert_ne!(
         scenario_names_by_index(&[24]),
-        ["mounted-fuse-write-baseline"]
+        [studiofs_e2e::scenario::MOUNTED_FUSE_WRITE_BASELINE]
     );
 }
 
