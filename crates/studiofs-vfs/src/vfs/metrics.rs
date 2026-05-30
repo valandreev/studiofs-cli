@@ -1,5 +1,6 @@
 use super::file_session::VfsFileSessionStats;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use studiofs_meta::schema::{InodeLifecycleState, PayloadRetentionClass};
 
 /// Filesystem statistics returned by `statfs()`.
@@ -227,6 +228,44 @@ pub struct VfsFuseCallbackStats {
     /// FUSE write callback metrics.
     #[serde(default)]
     pub write: VfsFuseIoStats,
+}
+
+/// Async FUSE write bridge diagnostics supplied by the FUSE adapter.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct VfsFuseAsyncWriteSnapshot {
+    /// Monotonic generation of the FUSE tracker snapshot used to reject stale gauge updates.
+    pub snapshot_generation: u64,
+    /// Whether async write replies are enabled for this FUSE mount.
+    pub enabled: bool,
+    /// Selected platform policy label.
+    pub platform_policy: Cow<'static, str>,
+    /// Maximum pending bytes admitted across the adapter.
+    pub max_pending_bytes: Option<usize>,
+    /// Maximum pending write requests admitted across the adapter.
+    pub max_pending_writes: Option<usize>,
+    /// Maximum pending bytes admitted per file handle.
+    pub per_handle_pending_bytes: Option<usize>,
+    /// Current pending async write requests.
+    pub pending_writes: usize,
+    /// Current pending async write bytes.
+    pub pending_bytes: usize,
+    /// Peak pending async write bytes.
+    pub peak_pending_bytes: usize,
+    /// Completed async writes.
+    pub completed_writes: u64,
+    /// Async writes completed with a VFS error.
+    pub failed_writes: u64,
+    /// Async write tasks dropped before explicit completion.
+    pub task_failed_writes: u64,
+    /// Admission waits caused by pending-write caps.
+    pub admission_waits: u64,
+    /// Total admission wait time in milliseconds.
+    pub admission_wait_total_ms: f64,
+    /// Barrier waits for flush/fsync/release callbacks.
+    pub barrier_waits: u64,
+    /// Total barrier wait time in milliseconds.
+    pub barrier_wait_total_ms: f64,
 }
 
 /// FUSE I/O callback metrics for one direction.
@@ -690,6 +729,9 @@ pub struct VfsWritePathObservabilitySnapshot {
     /// FUSE callback metrics.
     #[serde(default)]
     pub fuse_callbacks: VfsFuseCallbackStats,
+    /// Async FUSE write diagnostics.
+    #[serde(default)]
+    pub fuse_async_write: VfsFuseAsyncWriteSnapshot,
     /// Landing-zone metrics.
     #[serde(default)]
     pub landing_zone: VfsWritePathLandingZoneStats,

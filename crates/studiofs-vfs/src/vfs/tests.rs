@@ -10396,6 +10396,102 @@ fn write_path_observability_reports_fuse_callback_and_vfs_read_counters() {
 }
 
 #[test]
+fn write_path_observability_reports_fuse_async_write_snapshot() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "write-path-observability-fuse-async-write");
+
+    vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
+        snapshot_generation: 1,
+        enabled: true,
+        platform_policy: "linux".into(),
+        max_pending_bytes: Some(128 * 1024 * 1024),
+        max_pending_writes: Some(1024),
+        per_handle_pending_bytes: Some(32 * 1024 * 1024),
+        pending_writes: 3,
+        pending_bytes: 256 * 1024,
+        peak_pending_bytes: 512 * 1024,
+        completed_writes: 17,
+        failed_writes: 2,
+        task_failed_writes: 1,
+        admission_waits: 5,
+        admission_wait_total_ms: 6.5,
+        barrier_waits: 7,
+        barrier_wait_total_ms: 8.5,
+    });
+
+    let snapshot = vfs.write_path_observability_snapshot();
+
+    assert!(snapshot.fuse_async_write.enabled);
+    assert_eq!(snapshot.fuse_async_write.platform_policy, "linux");
+    assert_eq!(
+        snapshot.fuse_async_write.max_pending_bytes,
+        Some(128 * 1024 * 1024)
+    );
+    assert_eq!(snapshot.fuse_async_write.pending_writes, 3);
+    assert_eq!(snapshot.fuse_async_write.pending_bytes, 256 * 1024);
+    assert_eq!(snapshot.fuse_async_write.peak_pending_bytes, 512 * 1024);
+    assert_eq!(snapshot.fuse_async_write.completed_writes, 17);
+    assert_eq!(snapshot.fuse_async_write.failed_writes, 2);
+    assert_eq!(snapshot.fuse_async_write.task_failed_writes, 1);
+    assert_eq!(snapshot.fuse_async_write.admission_waits, 5);
+    assert_eq!(snapshot.fuse_async_write.admission_wait_total_ms, 6.5);
+    assert_eq!(snapshot.fuse_async_write.barrier_waits, 7);
+    assert_eq!(snapshot.fuse_async_write.barrier_wait_total_ms, 8.5);
+}
+
+#[test]
+fn fuse_async_write_snapshot_rejects_stale_gauges_and_keeps_monotonic_counters() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "fuse-async-write-stale-snapshot");
+
+    vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
+        snapshot_generation: 2,
+        enabled: true,
+        platform_policy: "linux".into(),
+        pending_writes: 0,
+        pending_bytes: 0,
+        peak_pending_bytes: 1024,
+        completed_writes: 2,
+        failed_writes: 1,
+        task_failed_writes: 1,
+        admission_waits: 3,
+        admission_wait_total_ms: 4.0,
+        barrier_waits: 5,
+        barrier_wait_total_ms: 6.0,
+        ..Default::default()
+    });
+    vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
+        snapshot_generation: 1,
+        enabled: true,
+        platform_policy: "linux".into(),
+        pending_writes: 7,
+        pending_bytes: 8 * 1024,
+        peak_pending_bytes: 2048,
+        completed_writes: 3,
+        failed_writes: 2,
+        task_failed_writes: 2,
+        admission_waits: 6,
+        admission_wait_total_ms: 7.0,
+        barrier_waits: 8,
+        barrier_wait_total_ms: 9.0,
+        ..Default::default()
+    });
+
+    let snapshot = vfs.write_path_observability_snapshot().fuse_async_write;
+    assert_eq!(snapshot.snapshot_generation, 2);
+    assert_eq!(snapshot.pending_writes, 0);
+    assert_eq!(snapshot.pending_bytes, 0);
+    assert_eq!(snapshot.peak_pending_bytes, 1024);
+    assert_eq!(snapshot.completed_writes, 2);
+    assert_eq!(snapshot.failed_writes, 1);
+    assert_eq!(snapshot.task_failed_writes, 1);
+    assert_eq!(snapshot.admission_waits, 3);
+    assert_eq!(snapshot.admission_wait_total_ms, 4.0);
+    assert_eq!(snapshot.barrier_waits, 5);
+    assert_eq!(snapshot.barrier_wait_total_ms, 6.0);
+}
+
+#[test]
 fn write_path_observability_reports_winfsp_write_callback_breakdown() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "write-path-observability-winfsp-breakdown");
@@ -10499,6 +10595,128 @@ fn reset_diagnostics_observability_clears_winfsp_write_policy_breakdown() {
     assert_eq!(after.winfsp_write_path.write_through_bytes, 0);
     assert_eq!(after.winfsp_write_path.opportunistic_calls, 0);
     assert_eq!(after.winfsp_write_path.opportunistic_bytes, 0);
+}
+
+#[test]
+fn reset_diagnostics_observability_clears_fuse_async_write_snapshot() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "reset-fuse-async-write-snapshot");
+
+    vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
+        snapshot_generation: 7,
+        enabled: true,
+        platform_policy: "linux".into(),
+        pending_writes: 3,
+        pending_bytes: 4096,
+        peak_pending_bytes: 8192,
+        completed_writes: 11,
+        failed_writes: 2,
+        task_failed_writes: 1,
+        admission_waits: 4,
+        admission_wait_total_ms: 5.0,
+        barrier_waits: 6,
+        barrier_wait_total_ms: 7.0,
+        ..Default::default()
+    });
+
+    assert!(
+        vfs.write_path_observability_snapshot()
+            .fuse_async_write
+            .enabled
+    );
+
+    vfs.reset_diagnostics_observability();
+
+    let after = vfs.write_path_observability_snapshot().fuse_async_write;
+    assert_eq!(after.snapshot_generation, 0);
+    assert!(!after.enabled);
+    assert_eq!(after.pending_writes, 0);
+    assert_eq!(after.pending_bytes, 0);
+    assert_eq!(after.peak_pending_bytes, 0);
+    assert_eq!(after.completed_writes, 0);
+    assert_eq!(after.failed_writes, 0);
+    assert_eq!(after.task_failed_writes, 0);
+    assert_eq!(after.admission_waits, 0);
+    assert_eq!(after.barrier_waits, 0);
+}
+
+#[test]
+fn fuse_async_write_snapshot_reports_values_relative_to_reset_baseline() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "reset-fuse-async-write-baseline");
+
+    vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
+        snapshot_generation: 7,
+        enabled: true,
+        platform_policy: "linux".into(),
+        pending_writes: 0,
+        pending_bytes: 0,
+        peak_pending_bytes: 8192,
+        completed_writes: 11,
+        failed_writes: 2,
+        task_failed_writes: 1,
+        admission_waits: 4,
+        admission_wait_total_ms: 5.0,
+        barrier_waits: 6,
+        barrier_wait_total_ms: 7.0,
+        ..Default::default()
+    });
+    vfs.reset_diagnostics_observability();
+
+    vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
+        snapshot_generation: 7,
+        enabled: true,
+        platform_policy: "linux".into(),
+        peak_pending_bytes: 8192,
+        completed_writes: 11,
+        failed_writes: 2,
+        task_failed_writes: 1,
+        admission_waits: 4,
+        admission_wait_total_ms: 5.0,
+        barrier_waits: 6,
+        barrier_wait_total_ms: 7.0,
+        ..Default::default()
+    });
+    let baseline = vfs.write_path_observability_snapshot().fuse_async_write;
+    assert_eq!(baseline.snapshot_generation, 7);
+    assert!(baseline.enabled);
+    assert_eq!(baseline.peak_pending_bytes, 0);
+    assert_eq!(baseline.completed_writes, 0);
+    assert_eq!(baseline.failed_writes, 0);
+    assert_eq!(baseline.task_failed_writes, 0);
+    assert_eq!(baseline.admission_waits, 0);
+    assert_eq!(baseline.barrier_waits, 0);
+
+    vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
+        snapshot_generation: 8,
+        enabled: true,
+        platform_policy: "linux".into(),
+        pending_writes: 2,
+        pending_bytes: 4096,
+        peak_pending_bytes: 8192,
+        completed_writes: 13,
+        failed_writes: 3,
+        task_failed_writes: 1,
+        admission_waits: 5,
+        admission_wait_total_ms: 6.5,
+        barrier_waits: 9,
+        barrier_wait_total_ms: 11.0,
+        ..Default::default()
+    });
+
+    let after = vfs.write_path_observability_snapshot().fuse_async_write;
+    assert_eq!(after.snapshot_generation, 8);
+    assert!(after.enabled);
+    assert_eq!(after.pending_writes, 2);
+    assert_eq!(after.pending_bytes, 4096);
+    assert_eq!(after.peak_pending_bytes, 4096);
+    assert_eq!(after.completed_writes, 2);
+    assert_eq!(after.failed_writes, 1);
+    assert_eq!(after.task_failed_writes, 0);
+    assert_eq!(after.admission_waits, 1);
+    assert_eq!(after.admission_wait_total_ms, 1.5);
+    assert_eq!(after.barrier_waits, 3);
+    assert_eq!(after.barrier_wait_total_ms, 4.0);
 }
 
 #[test]
