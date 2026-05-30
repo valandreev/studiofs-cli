@@ -1215,7 +1215,10 @@ impl StudioFuseFs {
         let limits = self.async_write_admission_policy.limits;
         let stop = Arc::clone(&self.async_write_diagnostics_stop);
         self.rt.spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(500));
+            let mut interval = tokio::time::interval_at(
+                tokio::time::Instant::now() + Duration::from_millis(500),
+                Duration::from_millis(500),
+            );
             loop {
                 interval.tick().await;
                 if stop.load(Ordering::Acquire) {

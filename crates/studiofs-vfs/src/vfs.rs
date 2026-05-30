@@ -2492,6 +2492,8 @@ impl VfsState {
             shutdown: ShutdownState::new(),
             metrics: MetricsState::new(),
             fuse_async_write_snapshot: Mutex::new(VfsFuseAsyncWriteSnapshot::default()),
+            fuse_async_write_raw_snapshot: Mutex::new(VfsFuseAsyncWriteSnapshot::default()),
+            fuse_async_write_reset_baseline: Mutex::new(VfsFuseAsyncWriteSnapshot::default()),
             write_admission_governor: Mutex::new(WriteAdmissionGovernor::default()),
             sustained_write_streams: Mutex::new(HashMap::new()),
             deferred_materialize_inflight: Mutex::new(HashMap::new()),
@@ -2514,6 +2516,8 @@ struct VfsState {
     shutdown: ShutdownState,
     metrics: MetricsState,
     fuse_async_write_snapshot: Mutex<VfsFuseAsyncWriteSnapshot>,
+    fuse_async_write_raw_snapshot: Mutex<VfsFuseAsyncWriteSnapshot>,
+    fuse_async_write_reset_baseline: Mutex<VfsFuseAsyncWriteSnapshot>,
     write_admission_governor: Mutex<WriteAdmissionGovernor>,
     sustained_write_streams: Mutex<HashMap<Ino, SustainedWriteState>>,
     /// Tracks inodes that currently have a deferred materialization task
@@ -3769,6 +3773,9 @@ impl StudioVfs {
             .local_dirty
             .hard_backpressure_events
             .store(0, Ordering::Relaxed);
+        let fuse_async_write_reset_baseline =
+            self.state.fuse_async_write_raw_snapshot.lock().clone();
+        *self.state.fuse_async_write_reset_baseline.lock() = fuse_async_write_reset_baseline;
         *self.state.fuse_async_write_snapshot.lock() = VfsFuseAsyncWriteSnapshot::default();
         self.state.upload.startup_replay_counts.lock().clear();
         self.cached_store.reset_diagnostics_metrics();
@@ -6586,6 +6593,15 @@ impl StudioVfs {
 
     /// Replace the latest async FUSE write bridge diagnostics snapshot.
     pub fn record_fuse_async_write_snapshot(&self, snapshot: VfsFuseAsyncWriteSnapshot) {
+        let mut raw = self.state.fuse_async_write_raw_snapshot.lock();
+        if snapshot.snapshot_generation < raw.snapshot_generation {
+            return;
+        }
+        *raw = snapshot.clone();
+        drop(raw);
+
+        let baseline = self.state.fuse_async_write_reset_baseline.lock().clone();
+        let snapshot = Self::apply_fuse_async_write_reset_baseline(snapshot, &baseline);
         let mut current = self.state.fuse_async_write_snapshot.lock();
         if snapshot.snapshot_generation >= current.snapshot_generation {
             current.snapshot_generation = snapshot.snapshot_generation;
@@ -6596,19 +6612,60 @@ impl StudioVfs {
             current.per_handle_pending_bytes = snapshot.per_handle_pending_bytes;
             current.pending_writes = snapshot.pending_writes;
             current.pending_bytes = snapshot.pending_bytes;
+            current.peak_pending_bytes = snapshot.peak_pending_bytes;
+            current.completed_writes = snapshot.completed_writes;
+            current.failed_writes = snapshot.failed_writes;
+            current.task_failed_writes = snapshot.task_failed_writes;
+            current.admission_waits = snapshot.admission_waits;
+            current.admission_wait_total_ms = snapshot.admission_wait_total_ms;
+            current.barrier_waits = snapshot.barrier_waits;
+            current.barrier_wait_total_ms = snapshot.barrier_wait_total_ms;
         }
-        current.peak_pending_bytes = current.peak_pending_bytes.max(snapshot.peak_pending_bytes);
-        current.completed_writes = current.completed_writes.max(snapshot.completed_writes);
-        current.failed_writes = current.failed_writes.max(snapshot.failed_writes);
-        current.task_failed_writes = current.task_failed_writes.max(snapshot.task_failed_writes);
-        current.admission_waits = current.admission_waits.max(snapshot.admission_waits);
-        current.admission_wait_total_ms = current
-            .admission_wait_total_ms
-            .max(snapshot.admission_wait_total_ms);
-        current.barrier_waits = current.barrier_waits.max(snapshot.barrier_waits);
-        current.barrier_wait_total_ms = current
-            .barrier_wait_total_ms
-            .max(snapshot.barrier_wait_total_ms);
+    }
+
+    fn apply_fuse_async_write_reset_baseline(
+        mut snapshot: VfsFuseAsyncWriteSnapshot,
+        baseline: &VfsFuseAsyncWriteSnapshot,
+    ) -> VfsFuseAsyncWriteSnapshot {
+        if snapshot.snapshot_generation < baseline.snapshot_generation {
+            return snapshot;
+        }
+        snapshot.peak_pending_bytes = snapshot
+            .peak_pending_bytes
+            .saturating_sub(baseline.peak_pending_bytes)
+            .max(snapshot.pending_bytes);
+        snapshot.completed_writes = snapshot
+            .completed_writes
+            .saturating_sub(baseline.completed_writes);
+        snapshot.failed_writes = snapshot
+            .failed_writes
+            .saturating_sub(baseline.failed_writes);
+        snapshot.task_failed_writes = snapshot
+            .task_failed_writes
+            .saturating_sub(baseline.task_failed_writes);
+        snapshot.admission_waits = snapshot
+            .admission_waits
+            .saturating_sub(baseline.admission_waits);
+        snapshot.admission_wait_total_ms = Self::subtract_fuse_async_write_baseline_ms(
+            snapshot.admission_wait_total_ms,
+            baseline.admission_wait_total_ms,
+        );
+        snapshot.barrier_waits = snapshot
+            .barrier_waits
+            .saturating_sub(baseline.barrier_waits);
+        snapshot.barrier_wait_total_ms = Self::subtract_fuse_async_write_baseline_ms(
+            snapshot.barrier_wait_total_ms,
+            baseline.barrier_wait_total_ms,
+        );
+        snapshot
+    }
+
+    fn subtract_fuse_async_write_baseline_ms(value: f64, baseline: f64) -> f64 {
+        if value.is_finite() && baseline.is_finite() {
+            (value - baseline).max(0.0)
+        } else {
+            value
+        }
     }
 
     /// Record write-path stage latency for recording writer stack state.

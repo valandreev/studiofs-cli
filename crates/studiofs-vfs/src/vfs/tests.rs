@@ -10466,14 +10466,14 @@ fn fuse_async_write_snapshot_rejects_stale_gauges_and_keeps_monotonic_counters()
         platform_policy: "linux".into(),
         pending_writes: 7,
         pending_bytes: 8 * 1024,
-        peak_pending_bytes: 512,
-        completed_writes: 1,
-        failed_writes: 0,
-        task_failed_writes: 0,
-        admission_waits: 2,
-        admission_wait_total_ms: 3.0,
-        barrier_waits: 4,
-        barrier_wait_total_ms: 5.0,
+        peak_pending_bytes: 2048,
+        completed_writes: 3,
+        failed_writes: 2,
+        task_failed_writes: 2,
+        admission_waits: 6,
+        admission_wait_total_ms: 7.0,
+        barrier_waits: 8,
+        barrier_wait_total_ms: 9.0,
         ..Default::default()
     });
 
@@ -10638,6 +10638,85 @@ fn reset_diagnostics_observability_clears_fuse_async_write_snapshot() {
     assert_eq!(after.task_failed_writes, 0);
     assert_eq!(after.admission_waits, 0);
     assert_eq!(after.barrier_waits, 0);
+}
+
+#[test]
+fn fuse_async_write_snapshot_reports_values_relative_to_reset_baseline() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "reset-fuse-async-write-baseline");
+
+    vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
+        snapshot_generation: 7,
+        enabled: true,
+        platform_policy: "linux".into(),
+        pending_writes: 0,
+        pending_bytes: 0,
+        peak_pending_bytes: 8192,
+        completed_writes: 11,
+        failed_writes: 2,
+        task_failed_writes: 1,
+        admission_waits: 4,
+        admission_wait_total_ms: 5.0,
+        barrier_waits: 6,
+        barrier_wait_total_ms: 7.0,
+        ..Default::default()
+    });
+    vfs.reset_diagnostics_observability();
+
+    vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
+        snapshot_generation: 7,
+        enabled: true,
+        platform_policy: "linux".into(),
+        peak_pending_bytes: 8192,
+        completed_writes: 11,
+        failed_writes: 2,
+        task_failed_writes: 1,
+        admission_waits: 4,
+        admission_wait_total_ms: 5.0,
+        barrier_waits: 6,
+        barrier_wait_total_ms: 7.0,
+        ..Default::default()
+    });
+    let baseline = vfs.write_path_observability_snapshot().fuse_async_write;
+    assert_eq!(baseline.snapshot_generation, 7);
+    assert!(baseline.enabled);
+    assert_eq!(baseline.peak_pending_bytes, 0);
+    assert_eq!(baseline.completed_writes, 0);
+    assert_eq!(baseline.failed_writes, 0);
+    assert_eq!(baseline.task_failed_writes, 0);
+    assert_eq!(baseline.admission_waits, 0);
+    assert_eq!(baseline.barrier_waits, 0);
+
+    vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
+        snapshot_generation: 8,
+        enabled: true,
+        platform_policy: "linux".into(),
+        pending_writes: 2,
+        pending_bytes: 4096,
+        peak_pending_bytes: 8192,
+        completed_writes: 13,
+        failed_writes: 3,
+        task_failed_writes: 1,
+        admission_waits: 5,
+        admission_wait_total_ms: 6.5,
+        barrier_waits: 9,
+        barrier_wait_total_ms: 11.0,
+        ..Default::default()
+    });
+
+    let after = vfs.write_path_observability_snapshot().fuse_async_write;
+    assert_eq!(after.snapshot_generation, 8);
+    assert!(after.enabled);
+    assert_eq!(after.pending_writes, 2);
+    assert_eq!(after.pending_bytes, 4096);
+    assert_eq!(after.peak_pending_bytes, 4096);
+    assert_eq!(after.completed_writes, 2);
+    assert_eq!(after.failed_writes, 1);
+    assert_eq!(after.task_failed_writes, 0);
+    assert_eq!(after.admission_waits, 1);
+    assert_eq!(after.admission_wait_total_ms, 1.5);
+    assert_eq!(after.barrier_waits, 3);
+    assert_eq!(after.barrier_wait_total_ms, 4.0);
 }
 
 #[test]
