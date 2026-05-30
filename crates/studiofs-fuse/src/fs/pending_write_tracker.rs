@@ -7,7 +7,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Instant;
 
 use smallvec::{SmallVec, smallvec};
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, oneshot};
 
 type Ino = u64;
 type FileHandle = u64;
@@ -85,7 +85,7 @@ struct TrackerState {
     admission_metrics: PendingWriteAdmissionMetrics,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub(super) struct PendingWriteTracker {
     shared: Arc<SharedTracker>,
 }
@@ -109,6 +109,7 @@ struct GlobalAdmissionState {
 struct TrackerShard {
     state: Mutex<TrackerState>,
     writes_changed: Condvar,
+    async_writes_changed: Notify,
 }
 
 #[derive(Debug)]
@@ -136,6 +137,7 @@ pub(super) struct PendingWriteBarrier {
     shared: Arc<SharedTracker>,
     shard_index: usize,
     targets: SmallVec<[BarrierTarget; 1]>,
+    include_inode_errors: bool,
 }
 
 impl Default for SharedTracker {
@@ -334,6 +336,7 @@ impl PendingWriteTracker {
             shared: Arc::clone(&self.shared),
             shard_index,
             targets: smallvec![((ino, fh), sequence, generation)],
+            include_inode_errors: false,
         }
     }
 
@@ -363,6 +366,7 @@ impl PendingWriteTracker {
             shared: Arc::clone(&self.shared),
             shard_index,
             targets,
+            include_inode_errors: true,
         }
     }
 
@@ -391,6 +395,7 @@ impl PendingWriteTracker {
             shared: Arc::clone(&self.shared),
             shard_index,
             targets: smallvec![((ino, fh), target, generation)],
+            include_inode_errors: false,
         })
     }
 
@@ -506,6 +511,7 @@ impl PendingWriteRegistration {
         drop(admission);
         self.shared.admission_changed.notify_all();
         shard.writes_changed.notify_all();
+        shard.async_writes_changed.notify_waiters();
         if let Some(next_turn) = next_turn {
             let _ = next_turn.send(());
         }
@@ -536,7 +542,22 @@ impl PendingWriteBarrier {
                 .wait(state)
                 .expect("pending write tracker poisoned");
         }
-        barrier_error(&state, &self.targets).map_or(Ok(()), Err)
+        barrier_error(&state, &self.targets, self.include_inode_errors).map_or(Ok(()), Err)
+    }
+
+    pub(super) async fn wait_async(self) -> Result<(), i32> {
+        let shard = &self.shared.shards[self.shard_index];
+        loop {
+            let notified = {
+                let state = shard.state.lock().expect("pending write tracker poisoned");
+                if barrier_ready(&state, &self.targets) {
+                    return barrier_error(&state, &self.targets, self.include_inode_errors)
+                        .map_or(Ok(()), Err);
+                }
+                shard.async_writes_changed.notified()
+            };
+            notified.await;
+        }
     }
 }
 
@@ -566,13 +587,20 @@ fn barrier_ready(state: &TrackerState, targets: &[BarrierTarget]) -> bool {
     })
 }
 
-fn barrier_error(state: &TrackerState, targets: &[BarrierTarget]) -> Option<i32> {
+fn barrier_error(
+    state: &TrackerState,
+    targets: &[BarrierTarget],
+    include_inode_errors: bool,
+) -> Option<i32> {
     targets.iter().find_map(|(key, _, generation)| {
         state
             .inodes
             .get(&key.0)
             .and_then(|handles| handles.get(&key.1).and_then(|handle| handle.sticky_error))
             .or_else(|| {
+                if !include_inode_errors {
+                    return None;
+                }
                 state
                     .inode_sticky_errors
                     .get(&key.0)
@@ -1099,6 +1127,21 @@ mod tests {
         first.complete(PendingWriteCompletion::Success);
 
         assert!(barrier.is_ready());
+    }
+
+    #[tokio::test]
+    async fn async_barrier_wait_resolves_after_prior_writes_complete() {
+        let tracker = PendingWriteTracker::default();
+        let pending = tracker.register(INO, FIRST_FH).expect("register write");
+        let barrier = tracker.handle_barrier(INO, FIRST_FH);
+
+        let waiter = tokio::spawn(async move { barrier.wait_async().await });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        pending.complete(PendingWriteCompletion::Success);
+
+        assert_eq!(waiter.await.expect("waiter task should finish"), Ok(()));
     }
 
     #[test]

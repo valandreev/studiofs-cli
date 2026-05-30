@@ -396,6 +396,11 @@ trait FuseWriteReply {
     fn error(self, errno: i32);
 }
 
+trait FuseEmptyReply {
+    fn ok(self);
+    fn error(self, errno: i32);
+}
+
 struct FuseWriteReplyGuard<R: FuseWriteReply> {
     reply: Option<R>,
 }
@@ -436,6 +441,47 @@ impl FuseWriteReply for ReplyWrite {
     }
 }
 
+impl FuseEmptyReply for ReplyEmpty {
+    fn ok(self) {
+        self.ok();
+    }
+
+    fn error(self, errno: i32) {
+        self.error(errno);
+    }
+}
+
+struct PendingFuseCloseGuard {
+    pending_writes: PendingWriteTracker,
+    ino: u64,
+    fh: u64,
+    armed: bool,
+}
+
+impl PendingFuseCloseGuard {
+    fn new(pending_writes: PendingWriteTracker, ino: u64, fh: u64) -> Self {
+        Self {
+            pending_writes,
+            ino,
+            fh,
+            armed: true,
+        }
+    }
+
+    fn finish(&mut self) {
+        if self.armed {
+            self.pending_writes.finish_close(self.ino, self.fh);
+            self.armed = false;
+        }
+    }
+}
+
+impl Drop for PendingFuseCloseGuard {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
 fn complete_fuse_write_reply<R>(
     reply: FuseWriteReplyGuard<R>,
     result: Result<u32, VfsError>,
@@ -455,6 +501,35 @@ fn complete_fuse_write_reply<R>(
             let errno = vfs_err_to_errno(&e);
             reply.error(errno);
             registration.complete(PendingWriteCompletion::Error(errno));
+        }
+    }
+}
+
+fn complete_fuse_empty_reply<R>(
+    reply: R,
+    pending_result: Result<(), i32>,
+    result: Result<(), VfsError>,
+    op: &str,
+    ino: u64,
+    fh: u64,
+) where
+    R: FuseEmptyReply,
+{
+    match (pending_result, result) {
+        (Err(errno), Err(e)) => {
+            error!(
+                "{op}({ino}, fh={fh}) observed pending write error: {errno}; local {op} error: {e}"
+            );
+            reply.error(errno);
+        }
+        (Err(errno), _) => {
+            error!("{op}({ino}, fh={fh}) observed pending write error: {errno}");
+            reply.error(errno);
+        }
+        (Ok(()), Ok(())) => reply.ok(),
+        (Ok(()), Err(e)) => {
+            error!("{op}({ino}, fh={fh}) -> {e}");
+            reply.error(vfs_err_to_errno(&e));
         }
     }
 }
@@ -951,9 +1026,12 @@ impl StudioFuseFs {
         Ok(())
     }
 
-    fn wait_pending_writes_for_fsync(&self, ino: u64, _fh: u64) -> Result<(), i32> {
+    fn wait_pending_writes_for_fsync(&self, ino: u64, fh: u64) -> Result<(), i32> {
         if !self.async_write_enabled {
             return Ok(());
+        }
+        if fh != 0 {
+            return self.pending_writes.handle_barrier(ino, fh).wait();
         }
         self.pending_writes.inode_barrier(ino).wait()
     }
@@ -1687,6 +1765,32 @@ impl Filesystem for StudioFuseFs {
     ) {
         let started = Instant::now();
         debug!(ino, fh, "flush started");
+        if self.async_write_enabled {
+            let barrier = if fh != 0 {
+                self.pending_writes.handle_barrier(ino, fh)
+            } else {
+                self.pending_writes.inode_barrier(ino)
+            };
+            let vfs = Arc::clone(&self.vfs);
+            self.rt.spawn(async move {
+                let pending_result = barrier.wait_async().await;
+                let result = if fh != 0 {
+                    vfs.flush_fh(fh).await
+                } else {
+                    vfs.flush(ino).await
+                };
+                if pending_result.is_ok() && result.is_ok() {
+                    debug!(
+                        ino,
+                        fh,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "flush completed"
+                    );
+                }
+                complete_fuse_empty_reply(reply, pending_result, result, "flush", ino, fh);
+            });
+            return;
+        }
         let pending_result = self.wait_pending_writes_for_handle(ino, fh);
         let result = self.handle_drain().flush(ino, fh);
         match (pending_result, result) {
@@ -1732,6 +1836,39 @@ impl Filesystem for StudioFuseFs {
     ) {
         let started = Instant::now();
         debug!(ino, fh, "release started");
+        if self.async_write_enabled {
+            let barrier = match self.pending_writes.begin_close(ino, fh) {
+                Ok(barrier) => barrier,
+                Err(e) => {
+                    reply.error(write_registration_error_to_errno(e));
+                    return;
+                }
+            };
+            let vfs = Arc::clone(&self.vfs);
+            let mut close_guard = PendingFuseCloseGuard::new(self.pending_writes.clone(), ino, fh);
+            self.rt.spawn(async move {
+                let pending_result = barrier.wait_async().await;
+                let release_result = vfs.release_fh(fh).await;
+                close_guard.finish();
+                if pending_result.is_ok() && release_result.is_ok() {
+                    debug!(
+                        ino,
+                        fh,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "release completed"
+                    );
+                }
+                complete_fuse_empty_reply(
+                    reply,
+                    pending_result,
+                    release_result,
+                    "release",
+                    ino,
+                    fh,
+                );
+            });
+            return;
+        }
         let pending_result = if self.async_write_enabled {
             match self.pending_writes.begin_close(ino, fh) {
                 Ok(barrier) => barrier.wait(),
@@ -1774,6 +1911,33 @@ impl Filesystem for StudioFuseFs {
     fn fsync(&mut self, _req: &Request<'_>, ino: u64, fh: u64, datasync: bool, reply: ReplyEmpty) {
         let started = Instant::now();
         debug!(ino, fh, datasync, "fsync started");
+        if self.async_write_enabled {
+            let barrier = if fh != 0 {
+                self.pending_writes.handle_barrier(ino, fh)
+            } else {
+                self.pending_writes.inode_barrier(ino)
+            };
+            let vfs = Arc::clone(&self.vfs);
+            self.rt.spawn(async move {
+                let pending_result = barrier.wait_async().await;
+                let result = if fh != 0 {
+                    vfs.flush_fh(fh).await
+                } else {
+                    vfs.fsync(ino, datasync).await
+                };
+                if pending_result.is_ok() && result.is_ok() {
+                    debug!(
+                        ino,
+                        fh,
+                        datasync,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "fsync completed"
+                    );
+                }
+                complete_fuse_empty_reply(reply, pending_result, result, "fsync", ino, fh);
+            });
+            return;
+        }
         let pending_result = self.wait_pending_writes_for_fsync(ino, fh);
         let result = if fh != 0 {
             // Handle-backed FUSE fsync follows the same local-durability
@@ -2464,11 +2628,11 @@ mod tests {
     use super::{
         DEFAULT_FUSE_MAX_READAHEAD_BYTES, DEFAULT_FUSE_MAX_WRITE_BYTES,
         FuseAsyncWriteAdmissionPolicy, FuseBackgroundQueuePolicy, FuseWriteReplyGuard,
-        StudioFuseFs, TTL, complete_fuse_write_reply, fuse_write_local_sync_policy,
-        is_expected_macos_trashes_mkdir_exists, is_missing_xattr_error, missing_xattr_errno,
-        normalize_unix_mode, posix_flags_to_open_flags,
-        should_enable_async_fuse_write_from_env_value, should_log_invalidation_error, to_fuse_attr,
-        vfs_err_to_errno,
+        PendingFuseCloseGuard, StudioFuseFs, TTL, complete_fuse_write_reply,
+        fuse_write_local_sync_policy, is_expected_macos_trashes_mkdir_exists,
+        is_missing_xattr_error, missing_xattr_errno, normalize_unix_mode,
+        posix_flags_to_open_flags, should_enable_async_fuse_write_from_env_value,
+        should_log_invalidation_error, to_fuse_attr, vfs_err_to_errno,
     };
     use crate::fs::pending_write_tracker::{PendingWriteAdmissionLimits, PendingWriteTracker};
     use std::cell::Cell;
@@ -2926,6 +3090,38 @@ mod tests {
         second.complete(super::PendingWriteCompletion::Error(libc::EIO));
 
         assert_eq!(fs.wait_pending_writes_for_fsync(42, 0), Err(libc::EIO));
+    }
+
+    #[test]
+    fn async_write_fsync_handle_barrier_does_not_wait_for_other_handles() {
+        let (_tmp, _rt, _vfs, mut fs) = make_test_fuse_fs("async-write-handle-fsync-barrier");
+        fs.async_write_enabled = true;
+        let first = fs
+            .pending_writes
+            .register(42, 7)
+            .expect("register first pending write");
+        let second = fs
+            .pending_writes
+            .register(42, 8)
+            .expect("register second pending write");
+        first.complete(super::PendingWriteCompletion::Success);
+        second.complete(super::PendingWriteCompletion::Error(libc::EIO));
+
+        assert_eq!(fs.wait_pending_writes_for_fsync(42, 7), Ok(()));
+    }
+
+    #[test]
+    fn pending_fuse_close_guard_finishes_close_on_drop() {
+        let tracker = PendingWriteTracker::default();
+        let barrier = tracker.begin_close(42, 7).expect("begin close");
+        assert_eq!(barrier.wait(), Ok(()));
+
+        drop(PendingFuseCloseGuard::new(tracker.clone(), 42, 7));
+
+        let reopened = tracker
+            .register(42, 7)
+            .expect("dropped close guard should finish close");
+        assert_eq!(reopened.sequence(), 1);
     }
 
     #[test]
