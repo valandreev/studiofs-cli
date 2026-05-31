@@ -851,6 +851,86 @@ fn winfsp_mount_write_read_unmount_smoke() {
     });
 }
 
+fn winfsp_fio_command() -> Option<std::path::PathBuf> {
+    if let Some(path) = std::env::var_os("STUDIOFS_WINFSP_FIO_PATH") {
+        let path = std::path::PathBuf::from(path);
+        assert!(
+            path.is_file(),
+            "STUDIOFS_WINFSP_FIO_PATH is set but is not a valid file: {}",
+            path.display()
+        );
+        return Some(path);
+    }
+
+    if let Some(paths) = std::env::var_os("PATH") {
+        for path in std::env::split_paths(&paths) {
+            let candidate = path.join("fio.exe");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    let candidate = std::path::PathBuf::from(r"C:\Program Files\fio\fio.exe");
+    candidate.is_file().then_some(candidate)
+}
+
+#[test]
+#[ignore = "requires WinFSP runtime + STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
+fn winfsp_mount_fio_multi_job_smoke() {
+    if std::env::var("STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS").as_deref() != Ok("1") {
+        return;
+    }
+    let Some(fio) = winfsp_fio_command() else {
+        eprintln!(
+            "Skipping WinFSP fio mounted workload because fio.exe is not installed or STUDIOFS_WINFSP_FIO_PATH is not set"
+        );
+        return;
+    };
+    let mount_point = match std::env::var("STUDIOFS_WINFSP_TEST_MOUNT_POINT") {
+        Ok(value) if !value.trim().is_empty() => value.trim().to_string(),
+        _ => {
+            eprintln!(
+                "Skipping WinFSP fio mounted workload: \
+                 set STUDIOFS_WINFSP_TEST_MOUNT_POINT to a free drive letter (for example `Z:`)."
+            );
+            return;
+        }
+    };
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
+    let vfs = make_test_vfs(&tmp, "fio_multi_job_smoke", &rt);
+    let event_name = format!("Local\\StudioFsWinfspFioSmoke-{}", std::process::id());
+
+    with_winfsp_mount(vfs, rt, mount_point, event_name, |drive_root| {
+        let status = std::process::Command::new(&fio)
+            .current_dir(drive_root)
+            .arg("--name=studiofs-winfsp-fio")
+            .arg("--filename=fio.bin")
+            .arg("--rw=write")
+            .arg("--bs=64k")
+            .arg("--size=1m")
+            .arg("--numjobs=2")
+            .arg("--offset_increment=1m")
+            .arg("--ioengine=sync")
+            .arg("--fsync=1")
+            .arg("--group_reporting")
+            .status()
+            .expect("run fio workload through WinFSP mount");
+        assert!(status.success(), "fio workload failed with status: {status}");
+
+        let fio_file = std::path::Path::new(drive_root).join("fio.bin");
+        assert_eq!(
+            std::fs::metadata(&fio_file)
+                .expect("fio output metadata through WinFSP mount")
+                .len(),
+            2 * 1024 * 1024,
+            "fio output file should contain disjoint 1 MiB regions for both jobs"
+        );
+    });
+}
+
 #[test]
 #[ignore = "requires WinFSP runtime + STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
 fn winfsp_mount_regular_file_attributes_do_not_materialize_directories() {
