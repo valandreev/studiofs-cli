@@ -795,13 +795,9 @@ fn normalize_vfs_config(
 }
 
 fn normalize_writer_page_size(size: usize) -> usize {
-    let size = size.max(MIN_WRITER_PAGE_SIZE_BYTES);
-    if size.is_power_of_two() {
-        size
-    } else {
-        size.checked_next_power_of_two()
-            .unwrap_or(1usize << (usize::BITS - 1))
-    }
+    size.max(MIN_WRITER_PAGE_SIZE_BYTES)
+        .checked_next_power_of_two()
+        .unwrap_or(1usize << (usize::BITS - 1))
 }
 
 impl From<VfsConfig> for VfsConfigRaw {
@@ -1061,7 +1057,7 @@ mod tests {
     }
 
     #[test]
-    fn vfs_config_raw_normalizes_writer_page_size_to_safe_power_of_two_floor() {
+    fn vfs_config_raw_normalizes_writer_page_size_to_safe_power_of_two_ceiling() {
         let small = VfsConfigRaw {
             writer_page_size: Some(1),
             ..Default::default()
