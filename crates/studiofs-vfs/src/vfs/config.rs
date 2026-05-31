@@ -64,6 +64,7 @@ pub(super) const CACHE_RUNTIME_SMALL_BUDGET_BYTES: u64 = 128 * 1024 * 1024 * 102
 pub(super) const CACHE_RUNTIME_LARGE_BUDGET_BYTES: u64 = 512 * 1024 * 1024 * 1024;
 /// Huge cache runtime budget (bytes).
 pub(super) const CACHE_RUNTIME_HUGE_BUDGET_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
+const MIN_WRITER_PAGE_SIZE_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Policy for local sync behavior.
@@ -741,7 +742,7 @@ fn normalize_vfs_config(
     cfg.lock_retry_max_ms = cfg.lock_retry_max_ms.max(cfg.lock_retry_base_ms);
     cfg.max_dirty_bytes = cfg.max_dirty_bytes.max(1);
     cfg.write_eager_flush_batch_bytes = cfg.write_eager_flush_batch_bytes.max(1);
-    cfg.writer_page_size = cfg.writer_page_size.map(|size| size.max(1));
+    cfg.writer_page_size = cfg.writer_page_size.map(normalize_writer_page_size);
     cfg.max_xattr_bytes = cfg.max_xattr_bytes.max(1);
     cfg.dentry_cache_capacity = cfg.dentry_cache_capacity.max(1);
     cfg.dentry_cache_bytes = cfg.dentry_cache_bytes.max(1);
@@ -791,6 +792,16 @@ fn normalize_vfs_config(
         config: cfg,
         cache_runtime_overrides,
     })
+}
+
+fn normalize_writer_page_size(size: usize) -> usize {
+    let size = size.max(MIN_WRITER_PAGE_SIZE_BYTES);
+    if size.is_power_of_two() {
+        size
+    } else {
+        size.checked_next_power_of_two()
+            .unwrap_or(1usize << (usize::BITS - 1))
+    }
 }
 
 impl From<VfsConfig> for VfsConfigRaw {
@@ -1047,6 +1058,25 @@ mod tests {
         let roundtrip = VfsConfigRaw::from(config.into_inner());
 
         assert_eq!(roundtrip.writer_page_size, Some(128 * 1024));
+    }
+
+    #[test]
+    fn vfs_config_raw_normalizes_writer_page_size_to_safe_power_of_two_floor() {
+        let small = VfsConfigRaw {
+            writer_page_size: Some(1),
+            ..Default::default()
+        }
+        .validate()
+        .expect("validate small writer page size");
+        let unaligned = VfsConfigRaw {
+            writer_page_size: Some(4097),
+            ..Default::default()
+        }
+        .validate()
+        .expect("validate unaligned writer page size");
+
+        assert_eq!(small.writer_page_size, Some(4096));
+        assert_eq!(unaligned.writer_page_size, Some(8192));
     }
 
     #[test]

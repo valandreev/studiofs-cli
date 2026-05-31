@@ -7492,6 +7492,19 @@ fn writer_page_size_override_is_capped_to_block_size() {
 }
 
 #[test]
+fn writer_page_size_override_falls_back_to_block_size_when_not_divisor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = VfsConfig {
+        writer_page_size: Some(3 * 1024 * 1024),
+        ..VfsConfig::default()
+    };
+    let (_rt, vfs, _meta) =
+        make_unstarted_test_vfs_with_config(&tmp, "sfs-471-writer-page-size-divisor", cfg);
+
+    assert_eq!(vfs.state.writer_stack.page_size(), vfs.block_size as usize);
+}
+
+#[test]
 fn small_writer_pages_preserve_sparse_read_flush_and_accounting() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = VfsConfig {
