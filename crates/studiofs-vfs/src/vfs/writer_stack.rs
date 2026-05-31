@@ -218,6 +218,10 @@ impl MountedWriterStack {
         }
     }
 
+    pub(super) fn page_size(&self) -> usize {
+        self.config.page_size
+    }
+
     pub(super) fn write_bytes<D>(
         &self,
         spec: WriterWriteSpec,

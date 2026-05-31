@@ -2481,7 +2481,7 @@ impl VfsState {
                 WriterStackConfig {
                     block_size,
                     chunk_size: DEFAULT_CHUNK_SIZE,
-                    page_size: block_size as usize,
+                    page_size: resolve_writer_page_size(block_size, cfg.writer_page_size),
                     dirty_byte_limit: Some(cfg.max_dirty_bytes),
                     max_buffer_bytes: Some(cfg.max_dirty_bytes),
                 },
@@ -2501,6 +2501,14 @@ impl VfsState {
             deferred_release_inflight: Mutex::new(HashMap::new()),
         }
     }
+}
+
+fn resolve_writer_page_size(block_size: u32, writer_page_size: Option<usize>) -> usize {
+    let block_size = block_size.max(1) as usize;
+    writer_page_size
+        .map(|size| size.min(block_size))
+        .filter(|size| *size > 0 && block_size.is_multiple_of(*size))
+        .unwrap_or(block_size)
 }
 
 struct VfsState {

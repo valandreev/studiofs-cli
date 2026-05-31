@@ -725,6 +725,7 @@ where
     set_u64!("STUDIOFS_LOCK_TTL_SECS", lock_ttl_secs);
     set_u64!("STUDIOFS_LOCK_RETRY_BASE_MS", lock_retry_base_ms);
     set_u64!("STUDIOFS_LOCK_RETRY_MAX_MS", lock_retry_max_ms);
+    set_size!("STUDIOFS_WRITER_PAGE_SIZE_BYTES", writer_page_size);
     set_size!("STUDIOFS_XATTR_MAX_BYTES", max_xattr_bytes);
     set_usize!("STUDIOFS_DENTRY_CACHE_CAPACITY", dentry_cache_capacity);
     set_size!("STUDIOFS_DENTRY_CACHE_BYTES", dentry_cache_bytes);
@@ -2164,6 +2165,16 @@ mod tests {
         });
 
         assert_eq!(resolved.upload_delay_ms, None);
+    }
+
+    #[test]
+    fn overlay_vfs_env_applies_writer_page_size_override() {
+        let resolved = overlay_vfs_env_with(VfsConfigRaw::default(), |key| match key {
+            "STUDIOFS_WRITER_PAGE_SIZE_BYTES" => Ok("64KB".to_string()),
+            _ => Err(std::env::VarError::NotPresent),
+        });
+
+        assert_eq!(resolved.writer_page_size, Some(64 * 1024));
     }
 
     #[test]
