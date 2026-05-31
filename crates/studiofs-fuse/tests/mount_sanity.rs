@@ -11,6 +11,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
+use std::process::ExitStatus;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -507,6 +508,165 @@ fn should_join_mounted_fuse_session(
     test_result.is_ok() && unmount_result.is_ok()
 }
 
+fn join_mounted_fuse_session_until(
+    session_handle: std::thread::JoinHandle<io::Result<()>>,
+    timeout: Duration,
+) -> Option<std::thread::Result<io::Result<()>>> {
+    let deadline = std::time::Instant::now() + timeout;
+    while !session_handle.is_finished() {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            eprintln!("FUSE session thread did not exit within {timeout:?}; skipping join");
+            return None;
+        }
+        std::thread::sleep(join_poll_sleep_duration(deadline.duration_since(now)));
+    }
+    Some(session_handle.join())
+}
+
+fn join_poll_sleep_duration(remaining: Duration) -> Duration {
+    remaining.min(Duration::from_millis(25))
+}
+
+fn fuse_mount_path_cleared(mount_path: &Path, pre_dev: u64) -> bool {
+    std::fs::metadata(mount_path)
+        .map(|metadata| {
+            use std::os::unix::fs::MetadataExt;
+            metadata.dev() == pre_dev
+        })
+        .unwrap_or_else(fuse_mount_metadata_error_is_cleared)
+}
+
+fn fuse_mount_metadata_error_is_cleared(error: io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound
+}
+
+fn wait_for_fuse_mount_path_to_clear(mount_path: &Path, pre_dev: u64, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while !fuse_mount_path_cleared(mount_path, pre_dev) {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    true
+}
+
+fn force_unmount_fuse_mount_path(mount_path: &Path) -> io::Result<()> {
+    force_unmount_fuse_mount_path_with(
+        mount_path,
+        |mount_path| umount_fuse_mount_path_command(mount_path).status(),
+        |mount_path| diskutil_unmount_fuse_mount_path_command(mount_path).status(),
+    )
+}
+
+fn umount_fuse_mount_path_command(mount_path: &Path) -> Command {
+    let (program, args) = forced_fuse_unmount_command_parts(std::env::consts::OS);
+    let mut command = Command::new(program);
+    command.args(args).arg(mount_path);
+    command
+}
+
+fn forced_fuse_unmount_command_parts(target_os: &str) -> (&'static str, &'static [&'static str]) {
+    if target_os == "linux" {
+        ("fusermount3", &["-u", "-z"])
+    } else {
+        ("umount", &["-f"])
+    }
+}
+
+fn diskutil_unmount_fuse_mount_path_command(mount_path: &Path) -> Command {
+    let mut command = Command::new("diskutil");
+    command.arg("unmount").arg("force").arg(mount_path);
+    command
+}
+
+fn force_unmount_fuse_mount_path_with(
+    mount_path: &Path,
+    run_umount: impl FnOnce(&Path) -> io::Result<ExitStatus>,
+    run_diskutil: impl FnOnce(&Path) -> io::Result<ExitStatus>,
+) -> io::Result<()> {
+    let umount_failure = match run_umount(mount_path) {
+        Ok(status) if status.success() => return Ok(()),
+        Ok(status) => format!("system umount exited with status {status}"),
+        Err(error) => format!("system umount failed to execute: {error}"),
+    };
+
+    {
+        #[cfg(target_os = "macos")]
+        {
+            let diskutil_status = run_diskutil(mount_path).map_err(|error| {
+                io::Error::other(format!(
+                    "{umount_failure}; diskutil failed to execute: {error}"
+                ))
+            })?;
+            if diskutil_status.success() {
+                Ok(())
+            } else {
+                Err(io::Error::other(format!(
+                    "{umount_failure}; diskutil unmount exited with status {diskutil_status}"
+                )))
+            }
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = run_diskutil;
+            Err(io::Error::other(umount_failure))
+        }
+    }
+}
+
+fn reconcile_fuse_unmount_result(
+    unmount_result: io::Result<()>,
+    force_unmount: impl FnOnce() -> io::Result<()>,
+    wait_for_clear: impl FnOnce() -> bool,
+) -> io::Result<()> {
+    if unmount_result.is_ok() {
+        return force_unmount().and_then(|()| {
+            if wait_for_clear() {
+                Ok(())
+            } else {
+                Err(io::Error::other(
+                    "FUSE mount remained active after system umount",
+                ))
+            }
+        });
+    }
+
+    match force_unmount() {
+        Ok(()) => {
+            if let Some(message) = forced_unmount_clearance_warning(wait_for_clear()) {
+                eprintln!("{message}");
+            }
+        }
+        Err(error) => {
+            eprintln!("system umount also failed after fuser unmount failure: {error}");
+        }
+    }
+    unmount_result
+}
+
+fn forced_unmount_clearance_warning(cleared: bool) -> Option<&'static str> {
+    if cleared {
+        None
+    } else {
+        Some("FUSE mount remained active after forced system unmount reported success")
+    }
+}
+
+#[cfg(test)]
+fn success_exit_status() -> ExitStatus {
+    use std::os::unix::process::ExitStatusExt;
+    ExitStatus::from_raw(0)
+}
+
+#[cfg(test)]
+fn failure_exit_status() -> ExitStatus {
+    use std::os::unix::process::ExitStatusExt;
+    ExitStatus::from_raw(1 << 8)
+}
+
 #[test]
 fn mounted_fuse_cleanup_preserves_original_scenario_panic() {
     let scenario_panic: std::thread::Result<MountedOperationGuard> =
@@ -583,6 +743,162 @@ fn mounted_fuse_cleanup_skips_join_when_scenario_panicked_or_unmount_failed() {
     assert!(should_join_mounted_fuse_session(&scenario_ok, &unmount_ok));
 }
 
+#[test]
+fn mounted_fuse_cleanup_bounds_session_join_wait() {
+    let session_handle = std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_millis(250));
+        Ok(())
+    });
+    let started = std::time::Instant::now();
+
+    let join_result = join_mounted_fuse_session_until(session_handle, Duration::from_millis(10));
+
+    assert!(join_result.is_none());
+    assert!(started.elapsed() < Duration::from_millis(200));
+}
+
+#[test]
+fn mounted_fuse_cleanup_caps_join_poll_sleep_to_remaining_timeout() {
+    assert_eq!(
+        join_poll_sleep_duration(Duration::from_millis(40)),
+        Duration::from_millis(25)
+    );
+    assert_eq!(
+        join_poll_sleep_duration(Duration::from_millis(10)),
+        Duration::from_millis(10)
+    );
+}
+
+#[test]
+fn mounted_fuse_cleanup_detects_mount_path_device_restoration() {
+    let mount_dir = target_tempdir("mount-detection-");
+    use std::os::unix::fs::MetadataExt;
+    let original_dev = std::fs::metadata(mount_dir.path())
+        .expect("mount detection tempdir metadata")
+        .dev();
+
+    assert!(fuse_mount_path_cleared(mount_dir.path(), original_dev));
+    assert!(!fuse_mount_path_cleared(
+        mount_dir.path(),
+        original_dev.wrapping_add(1)
+    ));
+}
+
+#[test]
+fn mounted_fuse_cleanup_treats_only_not_found_metadata_errors_as_cleared() {
+    assert!(fuse_mount_metadata_error_is_cleared(io::Error::new(
+        io::ErrorKind::NotFound,
+        "mount directory removed",
+    )));
+    assert!(!fuse_mount_metadata_error_is_cleared(io::Error::other(
+        "transport endpoint is not connected",
+    )));
+}
+
+#[test]
+fn mounted_fuse_cleanup_uses_forced_system_unmount_commands() {
+    let mount_path = Path::new("/tmp/studiofs-test-mount");
+    let (expected_program, expected_args) = forced_fuse_unmount_command_parts(std::env::consts::OS);
+    let umount_command = umount_fuse_mount_path_command(mount_path);
+    let umount_args = umount_command
+        .get_args()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+
+    let expected_args = expected_args
+        .iter()
+        .map(OsString::from)
+        .chain(std::iter::once(mount_path.as_os_str().to_os_string()))
+        .collect::<Vec<_>>();
+
+    assert_eq!(umount_command.get_program(), expected_program);
+    assert_eq!(umount_args, expected_args);
+
+    let diskutil_command = diskutil_unmount_fuse_mount_path_command(mount_path);
+    let diskutil_args = diskutil_command
+        .get_args()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+
+    assert_eq!(diskutil_command.get_program(), "diskutil");
+    assert_eq!(
+        diskutil_args,
+        vec![
+            OsString::from("unmount"),
+            OsString::from("force"),
+            mount_path.as_os_str().to_os_string()
+        ]
+    );
+}
+
+#[test]
+fn mounted_fuse_cleanup_uses_unprivileged_linux_fuse_unmount_command() {
+    let (program, args) = forced_fuse_unmount_command_parts("linux");
+
+    assert_eq!(program, "fusermount3");
+    assert_eq!(args, &["-u", "-z"]);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn mounted_fuse_cleanup_tries_diskutil_when_umount_spawn_fails() {
+    let diskutil_called = std::cell::Cell::new(false);
+
+    force_unmount_fuse_mount_path_with(
+        Path::new("/tmp/studiofs-test-mount"),
+        |_| Err(io::Error::new(io::ErrorKind::NotFound, "umount missing")),
+        |_| {
+            diskutil_called.set(true);
+            Ok(success_exit_status())
+        },
+    )
+    .expect("diskutil fallback should allow cleanup");
+
+    assert!(diskutil_called.get());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn mounted_fuse_cleanup_preserves_umount_context_when_diskutil_spawn_fails() {
+    let error = force_unmount_fuse_mount_path_with(
+        Path::new("/tmp/studiofs-test-mount"),
+        |_| Ok(failure_exit_status()),
+        |_| Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied")),
+    )
+    .expect_err("diskutil spawn failure should report both unmount attempts");
+    let message = error.to_string();
+
+    assert!(message.contains("system umount exited with status"));
+    assert!(message.contains("diskutil failed to execute"));
+    assert!(message.contains("denied"));
+}
+
+#[test]
+fn mounted_fuse_cleanup_waits_after_forced_unmount_on_failed_primary_unmount() {
+    let waited = std::cell::Cell::new(false);
+
+    let result = reconcile_fuse_unmount_result(
+        Err(io::Error::other("primary unmount failed")),
+        || Ok(()),
+        || {
+            waited.set(true);
+            true
+        },
+    );
+
+    assert!(result.is_err());
+    assert!(waited.get());
+}
+
+#[test]
+fn mounted_fuse_cleanup_warns_when_forced_unmount_reports_success_but_mount_remains() {
+    assert_eq!(forced_unmount_clearance_warning(true), None);
+    assert_eq!(
+        forced_unmount_clearance_warning(false),
+        Some("FUSE mount remained active after forced system unmount reported success")
+    );
+}
+
 fn with_mounted_fuse(
     mode: MountedFuseMode,
     suffix: &str,
@@ -647,8 +963,22 @@ fn with_mounted_fuse(
         test_fn(&mount_path)
     }));
     let unmount_result = unmount.unmount();
+    // The unmount call above must happen while scenario guards are still alive;
+    // after that, release them so fallback cleanup is not blocked by test files.
+    let test_result = test_result.map(|_guard| MountedOperationGuard::default());
+    let unmount_result =
+        if wait_for_fuse_mount_path_to_clear(&mount_path, pre_dev, Duration::from_secs(2)) {
+            unmount_result
+        } else {
+            eprintln!("FUSE mount remained active after fuser unmount; trying system umount");
+            reconcile_fuse_unmount_result(
+                unmount_result,
+                || force_unmount_fuse_mount_path(&mount_path),
+                || wait_for_fuse_mount_path_to_clear(&mount_path, pre_dev, Duration::from_secs(2)),
+            )
+        };
     let join_result = if should_join_mounted_fuse_session(&test_result, &unmount_result) {
-        Some(session_handle.join())
+        join_mounted_fuse_session_until(session_handle, Duration::from_secs(5))
     } else {
         None
     };
