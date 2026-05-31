@@ -92,11 +92,12 @@ plaintext remote-volume compatibility.
 
 StudioFS' transport policy is defined in
 [transport-encryption-contract.md](./transport-encryption-contract.md). In
-short, non-local S3-compatible endpoints require HTTPS and plain HTTP S3 is
-accepted only for explicit local/test loopback endpoints. Non-local PostgreSQL
-DSNs use TLS-preferred or TLS-required transport unless the operator explicitly
-sets `sslmode=disable`; that cleartext operator choice is accepted and logged at
-info level. Local loopback PostgreSQL DSNs may also use `sslmode=disable` for
+short, S3-compatible endpoints honor the operator-selected `https://` or
+`http://` scheme; bare host-port S3 endpoints without a scheme are accepted only
+for loopback development/test endpoints. Non-local PostgreSQL DSNs use
+TLS-preferred or TLS-required transport unless the operator explicitly sets
+`sslmode=disable`; that cleartext operator choice is accepted and logged at info
+level. Local loopback PostgreSQL DSNs may also use `sslmode=disable` for
 development/test fixtures.
 
 Production example:
@@ -181,9 +182,9 @@ Notes:
 - When no endpoint is configured, StudioFS still writes a gzipped pprof artifact under `<cache-dir>/<uuid>/profiles/`.
 - `--snapshot-id` mounts the selected snapshot as a read-only historical view.
 - `--endpoint <URL>` overrides the S3 endpoint URL for the current mount session.
-  - Non-local endpoints must use HTTPS.
-  - Plain HTTP is accepted only for explicit loopback development/test endpoints such as `http://localhost:9000`, `http://my-bucket.localhost:9000`, `http://127.0.0.1:9000`, and `http://[::1]:9000`.
-  - Bare loopback host-port overrides such as `127.0.0.1:9000` are normalized to `http://127.0.0.1:9000`; non-loopback bare host-port values are rejected.
+  - Use `https://` for TLS or `http://` to explicitly select plain HTTP transport.
+  - Plain HTTP is accepted for explicit `http://` endpoint URLs, including non-loopback private-network endpoints such as `http://192.168.1.20:10000`.
+  - Bare loopback host-port overrides such as `127.0.0.1:9000` are normalized to `http://127.0.0.1:9000`; non-loopback bare host-port values are rejected unless the operator writes the `http://` scheme explicitly.
   - This override only applies to the current process and is NOT saved to the configuration file.
   - When the endpoint is an IP address, StudioFS automatically uses path-style addressing (required for IP-based S3-compatible services like MinIO).
 

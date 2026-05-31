@@ -1939,8 +1939,9 @@ mod tests {
     }
 
     #[test]
-    fn validate_endpoint_override_accepts_https_and_loopback_http() {
+    fn validate_endpoint_override_accepts_http_urls_and_bare_host_port() {
         validate_endpoint_override(Some("https://s3.example.com")).expect("https url");
+        validate_endpoint_override(Some("http://192.168.1.20:10000")).expect("explicit http url");
         validate_endpoint_override(Some("http://127.0.0.1:9000")).expect("full url");
         validate_endpoint_override(Some("http://[::1]:9000")).expect("ipv6 loopback");
         validate_endpoint_override(Some("127.0.0.1:9000")).expect("bare loopback");
@@ -1948,12 +1949,11 @@ mod tests {
     }
 
     #[test]
-    fn validate_endpoint_override_rejects_invalid_and_non_loopback_http_urls() {
+    fn validate_endpoint_override_rejects_invalid_urls() {
         for endpoint in [
             "ftp://127.0.0.1:9000",
             "://missing-scheme",
-            "http://192.168.1.50:9000",
-            "192.168.1.50:9000",
+            "192.168.1.20:10000",
         ] {
             let err =
                 validate_endpoint_override(Some(endpoint)).expect_err("invalid endpoint rejected");
@@ -2218,7 +2218,7 @@ mod tests {
     }
 
     #[test]
-    fn mount_plan_rejects_non_loopback_http_endpoint() {
+    fn mount_plan_accepts_explicit_http_endpoint_override() {
         let temp = tempfile::tempdir().expect("tempdir");
         let meta_dir = temp.path().join("meta");
         std::fs::create_dir_all(&meta_dir).expect("create meta dir");
@@ -2230,15 +2230,13 @@ mod tests {
             None,
             None,
         );
-        command.endpoint = Some("http://192.168.1.50:9000".to_string());
+        command.endpoint = Some("http://192.168.1.20:10000".to_string());
 
-        let err = MountPlan::resolve(MountRequest {
+        MountPlan::resolve(MountRequest {
             command,
             settings_config: startup_settings_config(mount_point, None, Some("64GB")),
         })
-        .expect_err("non-loopback HTTP endpoint should fail");
-
-        assert!(err.to_string().contains("HTTPS"));
+        .expect("explicit http endpoint should be accepted");
     }
 
     #[test]
@@ -2365,21 +2363,19 @@ mod tests {
     }
 
     #[test]
-    fn mount_meta_session_rejects_persisted_non_loopback_http_endpoint() {
+    fn mount_meta_session_accepts_persisted_explicit_http_endpoint() {
         let temp = tempfile::tempdir().expect("tempdir");
         let (meta_dir, engine, mut format_info) = seed_mount_meta_db(&temp, "demo");
-        format_info.endpoint = "http://192.168.1.50:9000".to_string();
+        format_info.endpoint = "http://192.168.1.20:10000".to_string();
         engine
             .set_format_info(&format_info)
-            .expect("set insecure endpoint");
+            .expect("set explicit http endpoint");
         drop(engine);
 
-        let err = match resolve_mount_meta_session("demo", &meta_dir, None, None) {
-            Ok(_) => panic!("persisted non-loopback HTTP endpoint should fail"),
-            Err(err) => err,
-        };
+        let session = resolve_mount_meta_session("demo", &meta_dir, None, None)
+            .expect("persisted explicit http endpoint should be accepted");
 
-        assert!(err.to_string().contains("HTTPS"));
+        assert_eq!(session.format_info.endpoint, "http://192.168.1.20:10000");
     }
 
     #[test]

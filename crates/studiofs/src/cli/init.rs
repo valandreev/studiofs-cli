@@ -139,7 +139,8 @@ pub(crate) struct InitArgs {
     /// Disk name (used in object paths like `<name>/objects`)
     name: String,
 
-    /// S3 endpoint URL. Non-local endpoints require HTTPS; HTTP is loopback-only.
+    /// S3 endpoint URL. Use https:// for TLS or http:// to explicitly select
+    /// plain HTTP transport.
     /// Examples: <https://s3.amazonaws.com>, <http://127.0.0.1:9000>.
     #[arg(long)]
     endpoint: String,
@@ -756,12 +757,12 @@ mod tests {
     }
 
     #[test]
-    fn init_request_rejects_non_loopback_http_endpoint_before_bucket_access() {
+    fn init_request_accepts_explicit_http_endpoint() {
         let cli = crate::cli::parse_for_test(&[
             "init",
             "vol",
             "--endpoint",
-            "http://192.168.1.50:9000",
+            "http://192.168.1.20:10000",
             "--bucket",
             "bucket",
             "--access-key",
@@ -776,14 +777,10 @@ mod tests {
         let crate::cli::Commands::Init(args) = cli.command else {
             panic!("expected init command");
         };
-        let err = match InitRunRequest::from_args(args) {
-            Ok(_) => panic!("non-loopback HTTP endpoint should fail before bucket access"),
-            Err(err) => err,
-        };
+        let request =
+            InitRunRequest::from_args(args).expect("explicit http endpoint should be accepted");
 
-        assert!(err.to_string().contains("HTTPS"));
-        assert!(!err.to_string().contains("access-key"));
-        assert!(!err.to_string().contains("secret-key"));
+        assert_eq!(request.object_store.endpoint, "http://192.168.1.20:10000");
     }
 
     #[test]

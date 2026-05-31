@@ -121,15 +121,17 @@ Expected search result shape:
 - production PostgreSQL call sites use `connect_studiofs_postgres` instead of
   `tokio_postgres::NoTls`;
 - remaining `tokio_postgres::NoTls` call sites are local fixture setup;
-- non-local S3-compatible endpoints require HTTPS;
-- plain HTTP S3 is accepted only for explicit local/test loopback endpoints;
-- policy-invalid non-local S3 transports are rejected before init, persisted
-  mount, or endpoint override;
+- S3-compatible endpoints honor the operator-selected `https://` or `http://`
+  scheme;
+- plain HTTP S3 is accepted for explicit `http://` endpoint URLs and for bare
+  loopback host-port development/test endpoints;
+- malformed, credential-bearing, `memory://`, unsupported-scheme, and bare
+  non-loopback S3 endpoints are rejected before init, persisted mount, or
+  endpoint override;
 - `sslmode=disable` cleartext choices must be logged at info level for
   non-local hosts.
 
-Local loopback examples remain available only as loopback-only development/test
-examples.
+Local loopback examples remain available as development/test examples.
 
 ## Command Matrix
 

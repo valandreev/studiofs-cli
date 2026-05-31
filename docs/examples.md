@@ -82,11 +82,11 @@ Mount with a non-local S3 endpoint:
 studiofs mount myvolume Z: --endpoint https://minio.internal.example:9000
 ```
 
-Plain HTTP endpoint overrides are limited to loopback-only development/test
-targets:
+Plain HTTP endpoint overrides are allowed when the operator explicitly writes
+the `http://` scheme:
 
 ```bash
-studiofs mount myvolume Z: --endpoint http://127.0.0.1:9000
+studiofs mount myvolume Z: --endpoint http://192.168.1.20:10000
 ```
 
 To unmount a volume running in the background:

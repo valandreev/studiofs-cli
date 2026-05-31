@@ -153,8 +153,8 @@ pub(crate) struct MountArgs {
 
     /// Override the S3 endpoint URL for this mount session.
     ///
-    /// Non-local endpoints must use HTTPS. Plain HTTP is accepted only for
-    /// explicit loopback development endpoints such as http://127.0.0.1:9000.
+    /// Use https:// for TLS or http:// to explicitly select plain HTTP
+    /// transport.
     /// This override only applies to the current process and is NOT saved.
     #[arg(long)]
     endpoint: Option<String>,

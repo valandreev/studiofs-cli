@@ -194,6 +194,7 @@ impl From<&FormatInfo> for DataStoreConfig {
 struct ParsedEndpoint {
     url: url::Url,
     normalized: String,
+    explicit_scheme: bool,
 }
 
 fn invalid_endpoint(message: impl Into<String>) -> DataError {
@@ -216,6 +217,7 @@ fn parse_s3_endpoint(endpoint: &str) -> DataResult<ParsedEndpoint> {
             return Ok(ParsedEndpoint {
                 url,
                 normalized: trimmed.to_string(),
+                explicit_scheme: true,
             });
         }
     }
@@ -232,7 +234,11 @@ fn parse_s3_endpoint(endpoint: &str) -> DataResult<ParsedEndpoint> {
         ));
     }
 
-    Ok(ParsedEndpoint { url, normalized })
+    Ok(ParsedEndpoint {
+        url,
+        normalized,
+        explicit_scheme: false,
+    })
 }
 
 fn is_loopback_host(host: url::Host<&str>) -> bool {
@@ -252,8 +258,9 @@ fn is_loopback_ipv6(addr: Ipv6Addr) -> bool {
 /// Validate and normalize an S3-compatible endpoint according to StudioFS'
 /// transport policy.
 ///
-/// Non-local endpoints must use HTTPS. Plain HTTP is accepted only for explicit
-/// loopback development/test hosts.
+/// Explicit `http://` endpoints are accepted as an operator-selected cleartext
+/// transport. Bare host-port endpoints are accepted only for loopback
+/// development/test hosts and are normalized to `http://`.
 pub fn normalize_s3_endpoint_transport(endpoint: &str) -> DataResult<String> {
     let parsed = parse_s3_endpoint(endpoint)?;
     if !parsed.url.username().is_empty() || parsed.url.password().is_some() {
@@ -265,11 +272,11 @@ pub fn normalize_s3_endpoint_transport(endpoint: &str) -> DataResult<String> {
     match parsed.url.scheme() {
         "https" => Ok(parsed.normalized),
         "http" => {
-            if parsed.url.host().is_some_and(is_loopback_host) {
+            if parsed.explicit_scheme || parsed.url.host().is_some_and(is_loopback_host) {
                 Ok(parsed.normalized)
             } else {
                 Err(invalid_endpoint(
-                    "HTTPS is required for non-local S3 endpoints; plain HTTP is allowed only for localhost, *.localhost, 127.0.0.0/8, [::1], or IPv4-mapped/compatible IPv6 loopback",
+                    "bare host-port S3 endpoints without a scheme are accepted only for localhost, *.localhost, 127.0.0.0/8, [::1], or IPv4-mapped/compatible IPv6 loopback; use http:// explicitly to select plain HTTP for other hosts",
                 ))
             }
         }
@@ -716,24 +723,21 @@ mod tests {
     }
 
     #[test]
-    fn datastore_rejects_non_loopback_http_endpoint_before_building_client() {
+    fn datastore_accepts_user_selected_plain_http_endpoint() {
         let mut config = encrypted_test_config();
-        config.endpoint = "http://192.168.1.50:9000".to_string();
+        config.endpoint = "http://192.168.1.20:10000".to_string();
 
-        let err = match DataStore::new(&config) {
-            Ok(_) => panic!("non-loopback HTTP must be rejected"),
-            Err(err) => err,
-        };
+        let store = DataStore::new(&config)
+            .expect("explicit http:// endpoint should honor the operator transport choice");
 
-        assert!(err.to_string().contains("HTTPS"));
-        assert!(!err.to_string().contains("access"));
-        assert!(!err.to_string().contains("secret"));
+        assert_eq!(store.config.endpoint, "http://192.168.1.20:10000");
     }
 
     #[test]
-    fn datastore_accepts_https_and_loopback_http_endpoints() {
+    fn datastore_accepts_https_and_http_endpoints() {
         for endpoint in [
             "https://s3.amazonaws.com",
+            "http://s3.example.com",
             "http://localhost:9000",
             "http://my-bucket.localhost:9000",
             "http://My-Bucket.LOCALHOST:9000",
@@ -742,6 +746,7 @@ mod tests {
             "http://[::1]:9000",
             "http://[::ffff:127.0.0.1]:9000",
             "http://[::127.0.0.1]:9000",
+            "http://192.168.1.20:10000",
         ] {
             let mut config = encrypted_test_config();
             config.endpoint = endpoint.to_string();

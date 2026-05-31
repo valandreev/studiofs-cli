@@ -23,9 +23,14 @@ replace SFEC and SFEC does not replace TLS.
 
 ## S3-Compatible Object Storage Transport
 
-HTTPS is required for non-local S3-compatible object storage endpoints.
+S3-compatible object storage endpoints honor the operator-selected URL scheme.
+Use `https://` for TLS. Use `http://` only when the operator intentionally
+selects plain HTTP transport for that endpoint.
 
-Plain HTTP S3 is allowed only for explicit local/test loopback endpoints:
+Plain HTTP S3 is accepted when the endpoint URL explicitly uses the `http://`
+scheme. Bare host-port S3 endpoint overrides without a scheme remain a
+development/test convenience and are accepted only for explicit local/test
+loopback endpoints:
 
 - `localhost`;
 - IPv4 loopback in `127.0.0.0/8`;
@@ -45,13 +50,14 @@ Examples:
 
 | Endpoint | Classification | Policy |
 |---|---|---|
-| `https://s3.example.com` | non-local HTTPS remote | accepted |
-| `http://s3.example.com` | non-local plain HTTP remote | rejected |
+| `https://s3.example.com` | operator-selected HTTPS remote | accepted |
+| `http://s3.example.com` | operator-selected plain HTTP remote | accepted |
 | `http://localhost:9000` | local/test loopback HTTP | accepted |
 | `http://127.0.0.1:9000` | local/test loopback HTTP | accepted |
 | `http://127.42.0.7:9000` | local/test loopback HTTP | accepted |
 | `http://[::1]:9000` | local/test loopback HTTP | accepted |
-| `http://192.168.1.50:9000` | non-local plain HTTP remote | rejected |
+| `http://192.168.1.50:9000` | operator-selected plain HTTP remote | accepted |
+| `192.168.1.50:9000` | bare non-loopback host-port | rejected; use `http://192.168.1.50:9000` to select plain HTTP |
 | `memory://` | test-only in-memory operator | accepted only in tests or explicit test utilities |
 
 Path-style endpoint helpers such as `is_ip_endpoint` are addressing decisions,
@@ -110,20 +116,22 @@ key material, so non-local PostgreSQL links must be treated as carrying secrets.
 
 ## Error Behavior
 
-StudioFS must reject policy-invalid non-local transports early, before creating
-or mounting a volume through that transport. PostgreSQL cleartext fallback is
-not policy-invalid when it follows the TLS-preferred compatibility behavior
-above.
-For the S3 side, policy-invalid non-local S3 transports are rejected before
-init, persisted mount, or endpoint override.
+StudioFS must reject policy-invalid transports early, before creating or
+mounting a volume through that transport. PostgreSQL cleartext fallback is not
+policy-invalid when it follows the TLS-preferred compatibility behavior above.
+For the S3 side, malformed endpoints, unsupported schemes, credentials embedded
+in endpoint URLs, `memory://` runtime endpoints, and bare non-loopback host-port
+values are rejected before init, persisted mount, or endpoint override.
 
 Actionable errors must identify:
 
 - whether the rejected transport is S3-compatible object storage or PostgreSQL;
 - the endpoint or DSN host;
-- the rejected insecure mode, such as plain HTTP;
-- the accepted local exception: `localhost`, `127.0.0.0/8`, `::1`, normalized
-  IPv4-mapped IPv6 loopback addresses, or Unix domain sockets for PostgreSQL.
+- the rejected mode, such as an unsupported scheme or an implicit bare
+  non-loopback host-port value;
+- the accepted local exception for implicit S3 HTTP and PostgreSQL cleartext:
+  `localhost`, `127.0.0.0/8`, `::1`, normalized IPv4-mapped IPv6 loopback
+  addresses, or Unix domain sockets for PostgreSQL.
 
 Errors and info-level PostgreSQL transport diagnostics must not log credentials
 or key material. They must sanitize DSNs and endpoints before formatting them
@@ -134,14 +142,13 @@ secret keys, secret-bearing query parameters, volume keys, and raw
 ## Local Development And CI
 
 Existing local development and CI setups using loopback RustFS/PostgreSQL remain
-supported. The allowed insecure cases are intentionally narrow so Windows,
+supported. Bare loopback S3 endpoints remain a narrow convenience so Windows,
 Linux, and macOS local test environments can keep using loopback HTTP RustFS
-and loopback PostgreSQL without weakening production defaults.
+without requiring a URL scheme.
 
-Non-loopback private networks are not local exceptions. Addresses such as
-`10.0.0.5`, `172.16.0.5`, `192.168.1.50`, and non-loopback IPv6 addresses are
-remote for this policy unless a future issue adds an explicit, reviewed
-operator override.
+Non-loopback private networks are not implicit local exceptions. Addresses such
+as `10.0.0.5`, `172.16.0.5`, `192.168.1.50`, and non-loopback IPv6 addresses
+require an explicit `http://` or `https://` scheme.
 
 ## Follow-Up Boundary
 
@@ -165,8 +172,10 @@ SFS-452 is the final transport encryption acceptance gate. It freezes the
 operator-facing relationship between S3 transport, PostgreSQL transport, and
 SFEC at-rest protection:
 
-- non-local S3-compatible endpoints require HTTPS;
-- Plain HTTP S3 is allowed only for explicit local/test loopback endpoints;
+- S3-compatible endpoints honor the operator-selected `https://` or `http://`
+  scheme;
+- Plain HTTP S3 is accepted when the endpoint explicitly uses `http://`, or as
+  the existing bare-host loopback development/test convenience;
 - non-local PostgreSQL DSNs use TLS-preferred or TLS-required transport by
   default, while `sslmode=disable` is accepted as an explicit cleartext operator
   choice and logged at info level;
@@ -176,12 +185,15 @@ SFEC at-rest protection:
 - SFEC protects remote payload confidentiality and integrity at rest;
 - TLS protects credentials, metadata/key-material links, and network transport;
 - TLS does not replace SFEC and SFEC does not replace TLS;
-- policy-invalid non-local S3 transports are rejected before init, persisted
-  mount, or endpoint override;
+- malformed, credential-bearing, `memory://`, unsupported-scheme, and bare
+  non-loopback S3 endpoints are rejected before init, persisted mount, or
+  endpoint override;
 - production PostgreSQL call sites use `connect_studiofs_postgres` instead of
   `tokio_postgres::NoTls`;
 - remaining `tokio_postgres::NoTls` call sites are local fixture setup.
 
-Local loopback examples remain available only as loopback-only development/test
-examples. This final transport gate adds no user passphrases, KMS, S3 SSE/KMS,
-AES/RSA modes, legacy plaintext fallback, or local-cache encryption.
+Local loopback examples remain available as development/test examples. Non-local
+S3-compatible examples should prefer HTTPS unless the operator intentionally
+selects explicit HTTP. This final transport gate adds no user passphrases, KMS,
+S3 SSE/KMS, AES/RSA modes, legacy plaintext fallback, or local-cache
+encryption.
