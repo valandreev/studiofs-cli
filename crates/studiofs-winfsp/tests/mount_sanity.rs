@@ -854,9 +854,12 @@ fn winfsp_mount_write_read_unmount_smoke() {
 fn winfsp_fio_command() -> Option<std::path::PathBuf> {
     if let Some(path) = std::env::var_os("STUDIOFS_WINFSP_FIO_PATH") {
         let path = std::path::PathBuf::from(path);
-        if path.is_file() {
-            return Some(path);
-        }
+        assert!(
+            path.is_file(),
+            "STUDIOFS_WINFSP_FIO_PATH is set but is not a valid file: {}",
+            path.display()
+        );
+        return Some(path);
     }
 
     if let Some(paths) = std::env::var_os("PATH") {
@@ -909,6 +912,7 @@ fn winfsp_mount_fio_multi_job_smoke() {
             .arg("--bs=64k")
             .arg("--size=1m")
             .arg("--numjobs=2")
+            .arg("--offset_increment=1m")
             .arg("--ioengine=sync")
             .arg("--fsync=1")
             .arg("--group_reporting")
@@ -921,8 +925,8 @@ fn winfsp_mount_fio_multi_job_smoke() {
             std::fs::metadata(&fio_file)
                 .expect("fio output metadata through WinFSP mount")
                 .len(),
-            1024 * 1024,
-            "fio output file should match the per-job size"
+            2 * 1024 * 1024,
+            "fio output file should contain disjoint 1 MiB regions for both jobs"
         );
     });
 }
