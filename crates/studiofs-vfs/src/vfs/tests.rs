@@ -7479,6 +7479,19 @@ fn writer_page_size_override_reaches_mounted_writer_stack() {
 }
 
 #[test]
+fn writer_page_size_override_is_capped_to_block_size() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = VfsConfig {
+        writer_page_size: Some(8 * 1024 * 1024),
+        ..VfsConfig::default()
+    };
+    let (_rt, vfs, _meta) =
+        make_unstarted_test_vfs_with_config(&tmp, "sfs-471-writer-page-size-capped", cfg);
+
+    assert_eq!(vfs.state.writer_stack.page_size(), vfs.block_size as usize);
+}
+
+#[test]
 fn small_writer_pages_preserve_sparse_read_flush_and_accounting() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = VfsConfig {
@@ -7553,8 +7566,9 @@ fn small_writer_pages_materialize_completed_block_once() {
         let page_size = 64 * 1024;
         let block_size = vfs.block_size as usize;
 
+        let mut payload = vec![0u8; page_size];
         for page_index in 0..block_size / page_size {
-            let payload = vec![page_index as u8; page_size];
+            payload.fill(page_index as u8);
             vfs.write_fh(fh, ino, (page_index * page_size) as u64, &payload)
                 .await
                 .unwrap();

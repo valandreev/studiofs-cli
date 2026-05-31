@@ -741,9 +741,7 @@ fn normalize_vfs_config(
     cfg.lock_retry_max_ms = cfg.lock_retry_max_ms.max(cfg.lock_retry_base_ms);
     cfg.max_dirty_bytes = cfg.max_dirty_bytes.max(1);
     cfg.write_eager_flush_batch_bytes = cfg.write_eager_flush_batch_bytes.max(1);
-    if let Some(writer_page_size) = cfg.writer_page_size {
-        cfg.writer_page_size = Some(writer_page_size.max(1));
-    }
+    cfg.writer_page_size = cfg.writer_page_size.map(|size| size.max(1));
     cfg.max_xattr_bytes = cfg.max_xattr_bytes.max(1);
     cfg.dentry_cache_capacity = cfg.dentry_cache_capacity.max(1);
     cfg.dentry_cache_bytes = cfg.dentry_cache_bytes.max(1);
