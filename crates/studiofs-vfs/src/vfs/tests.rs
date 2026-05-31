@@ -7466,6 +7466,123 @@ fn write_fh_sub_block_callbacks_batch_completed_blocks_until_flush() {
 }
 
 #[test]
+fn writer_page_size_override_reaches_mounted_writer_stack() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = VfsConfig {
+        writer_page_size: Some(64 * 1024),
+        ..VfsConfig::default()
+    };
+    let (_rt, vfs, _meta) =
+        make_unstarted_test_vfs_with_config(&tmp, "sfs-471-writer-page-size-config", cfg);
+
+    assert_eq!(vfs.state.writer_stack.page_size(), 64 * 1024);
+}
+
+#[test]
+fn small_writer_pages_preserve_sparse_read_flush_and_accounting() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = VfsConfig {
+        writer_page_size: Some(64 * 1024),
+        ..VfsConfig::default()
+    };
+    let (rt, vfs, meta) = make_test_vfs_with_config(&tmp, "sfs-471-small-writer-pages-sparse", cfg);
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-471-small-writer-pages-sparse.bin", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let page_size = 64 * 1024;
+        let block_size = vfs.block_size as usize;
+        let head = vec![0xA1; page_size];
+        let tail = vec![0xB2; page_size];
+
+        vfs.write_fh(fh, ino, 0, &head).await.unwrap();
+        vfs.write_fh(fh, ino, (block_size - page_size) as u64, &tail)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            vfs.state.writer_stack.dirty_bytes_for_inode(ino),
+            page_size * 2,
+            "sparse page writes should account written bytes without charging the zero-filled gap"
+        );
+
+        let visible = vfs.read(ino, 0, block_size as u32).await.unwrap();
+        assert_eq!(&visible[..page_size], head.as_slice());
+        assert!(
+            visible[page_size..block_size - page_size]
+                .iter()
+                .all(|byte| *byte == 0),
+            "sparse gap should read as zeroes before materialization"
+        );
+        assert_eq!(&visible[block_size - page_size..], tail.as_slice());
+
+        vfs.flush_fh(fh).await.unwrap();
+
+        assert_eq!(vfs.state.writer_stack.dirty_bytes_for_inode(ino), 0);
+        let spans = meta
+            .lookup_regular_file_slices(ino, 0, block_size as u64)
+            .unwrap();
+        assert_eq!(
+            spans.iter().filter(|span| span.payload.is_some()).count(),
+            2,
+            "flush should materialize only the sparse written pages"
+        );
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn small_writer_pages_materialize_completed_block_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = VfsConfig {
+        writer_page_size: Some(64 * 1024),
+        ..VfsConfig::default()
+    };
+    let (rt, vfs, meta) =
+        make_test_vfs_with_config(&tmp, "sfs-471-small-writer-pages-completed", cfg);
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-471-small-writer-pages-completed.bin", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let page_size = 64 * 1024;
+        let block_size = vfs.block_size as usize;
+
+        for page_index in 0..block_size / page_size {
+            let payload = vec![page_index as u8; page_size];
+            vfs.write_fh(fh, ino, (page_index * page_size) as u64, &payload)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(vfs.state.writer_stack.dirty_bytes_for_inode(ino), block_size);
+        assert_eq!(
+            vfs.state
+                .writer_stack
+                .completed_block_count_for_inode(ino)
+                .unwrap(),
+            1,
+            "a full logical block assembled from 64KB callbacks should be eligible for completed-block materialization"
+        );
+
+        vfs.flush_fh(fh).await.unwrap();
+
+        assert_eq!(vfs.state.writer_stack.dirty_bytes_for_inode(ino), 0);
+        assert_eq!(
+            meta.lookup_payload_slices(ino).unwrap().len(),
+            1,
+            "flush should publish the completed logical block as one materialized payload slice"
+        );
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
 fn inode_write_overwrite_updates_current_slice_graph_over_published_base() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs-245-inode-write-overwrite");

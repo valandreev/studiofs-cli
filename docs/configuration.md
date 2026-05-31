@@ -495,6 +495,12 @@ and hard safety threshold from that single dirty budget. Upload backlog bytes ar
 reported separately and do not by themselves stall ordinary writes while local
 cache headroom remains available.
 
+`STUDIOFS_WRITER_PAGE_SIZE_BYTES` is an expert-only mount/runtime override for
+the mounted writer stack's internal page geometry. Leave it unset to preserve
+the existing logical-block-sized default on all platforms. Use values such as
+`64KB` only for focused FUSE write-geometry validation and benchmark runs before
+changing platform defaults.
+
 ### Expert overrides
 
 The code accepts additional `STUDIOFS_*` runtime overrides through the
@@ -523,7 +529,8 @@ Important families supported in code:
   `STUDIOFS_EFFECTIVE_ACL_CACHE_CAPACITY`,
   `STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS`
 - read/upload/fetch internals: `STUDIOFS_FETCH_*`, `STUDIOFS_UPLOAD_*`,
-  `STUDIOFS_QOS_*`, `STUDIOFS_PREFETCH_*`
+  `STUDIOFS_QOS_*`, `STUDIOFS_PREFETCH_*`,
+  `STUDIOFS_WRITER_PAGE_SIZE_BYTES`
 - janitor/admin policy: `STUDIOFS_JANITOR_*`, `STUDIOFS_PG_*`
 - bridge-specific knobs: `STUDIOFS_FUSE_*`, `STUDIOFS_WINFSP_*`
 

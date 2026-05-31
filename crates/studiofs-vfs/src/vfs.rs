@@ -2481,7 +2481,7 @@ impl VfsState {
                 WriterStackConfig {
                     block_size,
                     chunk_size: DEFAULT_CHUNK_SIZE,
-                    page_size: block_size as usize,
+                    page_size: cfg.writer_page_size.unwrap_or(block_size as usize),
                     dirty_byte_limit: Some(cfg.max_dirty_bytes),
                     max_buffer_bytes: Some(cfg.max_dirty_bytes),
                 },

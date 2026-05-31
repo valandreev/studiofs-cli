@@ -265,6 +265,11 @@ pub struct VfsConfig {
     /// either more dirty data arrives or an explicit flush barrier runs.
     /// Parsed from env via `parse_size_bytes` (for example `32MB`).
     pub write_eager_flush_batch_bytes: usize,
+    /// Optional writer-page size used inside the mounted writer stack.
+    ///
+    /// `None` preserves the existing logical-block-sized pages.
+    /// Parsed from env via `parse_size_bytes` (for example `64KB`).
+    pub writer_page_size: Option<usize>,
     /// Maximum bytes allowed for a single xattr value.
     /// Parsed from env via `parse_size_bytes` (for example `64KB`).
     pub max_xattr_bytes: usize,
@@ -432,6 +437,8 @@ pub struct VfsConfigRaw {
     /// Optional override for eager write flush batch bytes. The eager persist
     /// path starts only after dirty full-block data exceeds this value.
     pub write_eager_flush_batch_bytes: Option<usize>,
+    /// Optional override for writer-page size used inside the mounted writer stack.
+    pub writer_page_size: Option<usize>,
     /// Optional override for max xattr bytes.
     pub max_xattr_bytes: Option<usize>,
     /// Optional override for dentry cache capacity.
@@ -696,6 +703,7 @@ impl VfsConfigRaw {
             qos_fetch_slots,
             foreground_read_speedometer_shards,
         );
+        cfg.writer_page_size = self.writer_page_size;
 
         (cfg, overrides)
     }
@@ -733,6 +741,9 @@ fn normalize_vfs_config(
     cfg.lock_retry_max_ms = cfg.lock_retry_max_ms.max(cfg.lock_retry_base_ms);
     cfg.max_dirty_bytes = cfg.max_dirty_bytes.max(1);
     cfg.write_eager_flush_batch_bytes = cfg.write_eager_flush_batch_bytes.max(1);
+    if let Some(writer_page_size) = cfg.writer_page_size {
+        cfg.writer_page_size = Some(writer_page_size.max(1));
+    }
     cfg.max_xattr_bytes = cfg.max_xattr_bytes.max(1);
     cfg.dentry_cache_capacity = cfg.dentry_cache_capacity.max(1);
     cfg.dentry_cache_bytes = cfg.dentry_cache_bytes.max(1);
@@ -811,6 +822,7 @@ impl From<VfsConfig> for VfsConfigRaw {
             lock_retry_max_ms: Some(cfg.lock_retry_max_ms),
             max_dirty_bytes: Some(cfg.max_dirty_bytes),
             write_eager_flush_batch_bytes: Some(cfg.write_eager_flush_batch_bytes),
+            writer_page_size: cfg.writer_page_size,
             max_xattr_bytes: Some(cfg.max_xattr_bytes),
             dentry_cache_capacity: Some(cfg.dentry_cache_capacity),
             dentry_cache_bytes: Some(cfg.dentry_cache_bytes),
@@ -894,6 +906,7 @@ impl Default for VfsConfig {
             lock_retry_max_ms: DEFAULT_LOCK_RETRY_MAX_MS,
             max_dirty_bytes: DEFAULT_MAX_DIRTY_BYTES,
             write_eager_flush_batch_bytes: DEFAULT_WRITE_EAGER_FLUSH_BATCH_BYTES,
+            writer_page_size: None,
             max_xattr_bytes: DEFAULT_XATTR_MAX_BYTES,
             dentry_cache_capacity: DEFAULT_DENTRY_CACHE_CAPACITY,
             dentry_cache_bytes: DEFAULT_DENTRY_CACHE_BYTES,
@@ -971,6 +984,7 @@ mod tests {
             validated.write_eager_flush_batch_bytes,
             defaults.write_eager_flush_batch_bytes
         );
+        assert_eq!(validated.writer_page_size, None);
         assert_eq!(validated.qos_fetch_slots, defaults.qos_fetch_slots);
         assert_eq!(
             validated.upload_worker_count, 20,
@@ -1012,6 +1026,7 @@ mod tests {
         let validated = VfsConfigRaw {
             read_buffer_mb: Some(8192),
             upload_cache_io_slots: Some(11),
+            writer_page_size: Some(64 * 1024),
             principal: Some("dev-user".to_string()),
             ..Default::default()
         }
@@ -1020,7 +1035,20 @@ mod tests {
 
         assert_eq!(validated.read_buffer_mb, 8192);
         assert_eq!(validated.upload_cache_io_slots, 11);
+        assert_eq!(validated.writer_page_size, Some(64 * 1024));
         assert_eq!(validated.principal, "dev-user");
+    }
+
+    #[test]
+    fn vfs_config_raw_roundtrip_preserves_writer_page_size() {
+        let raw = VfsConfigRaw {
+            writer_page_size: Some(128 * 1024),
+            ..Default::default()
+        };
+        let config = raw.validate().expect("validate writer page size");
+        let roundtrip = VfsConfigRaw::from(config.into_inner());
+
+        assert_eq!(roundtrip.writer_page_size, Some(128 * 1024));
     }
 
     #[test]
