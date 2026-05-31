@@ -322,6 +322,17 @@ fn command_path_is_available_only_when_executable() {
 
     std::fs::set_permissions(&command_path, std::fs::Permissions::from_mode(0o644))
         .expect("set non-executable permissions");
+    let mode = std::fs::metadata(&command_path)
+        .expect("fake command metadata")
+        .permissions()
+        .mode();
+    if mode & 0o111 != 0 {
+        eprintln!(
+            "skipping command executable-bit check because the test filesystem reports mode {mode:o} after chmod 644"
+        );
+        return;
+    }
+
     assert!(
         !command_path_is_executable(&command_path),
         "plain files in PATH must not be treated as executable commands"
