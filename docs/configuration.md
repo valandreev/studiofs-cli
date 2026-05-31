@@ -500,8 +500,10 @@ the mounted writer stack's internal page geometry. Leave it unset to preserve
 the existing logical-block-sized default on all platforms. Use values such as
 `64KB` only for focused FUSE write-geometry validation and benchmark runs before
 changing platform defaults. The override is normalized to at least `4KB`, rounded
-up to a power of two, capped at the volume block size, and ignored for the mount
-if it does not divide the block size cleanly.
+up to a power of two, and capped at the volume block size. For the canonical
+4 MiB block size this produces clean divisors; non-standard block sizes fall
+back to block-sized writer pages when the normalized override does not divide
+the block size cleanly.
 
 ### Expert overrides
 

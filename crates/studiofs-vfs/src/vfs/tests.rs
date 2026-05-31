@@ -7493,15 +7493,20 @@ fn writer_page_size_override_is_capped_to_block_size() {
 
 #[test]
 fn writer_page_size_override_falls_back_to_block_size_when_not_divisor() {
-    let tmp = tempfile::tempdir().unwrap();
-    let cfg = VfsConfig {
-        writer_page_size: Some(3 * 1024 * 1024),
-        ..VfsConfig::default()
-    };
-    let (_rt, vfs, _meta) =
-        make_unstarted_test_vfs_with_config(&tmp, "sfs-471-writer-page-size-divisor", cfg);
+    let block_size = 12 * 1024 * 1024;
+    let non_divisor = Some(8 * 1024 * 1024);
+    let divisor = Some(4 * 1024 * 1024);
 
-    assert_eq!(vfs.state.writer_stack.page_size(), vfs.block_size as usize);
+    assert_eq!(
+        resolve_writer_page_size(block_size, non_divisor),
+        block_size as usize,
+        "non-divisor page size should fall back to the logical block size"
+    );
+    assert_eq!(
+        resolve_writer_page_size(block_size, divisor),
+        4 * 1024 * 1024,
+        "divisor page size should be preserved"
+    );
 }
 
 #[test]
