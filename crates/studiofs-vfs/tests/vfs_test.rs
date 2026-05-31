@@ -7313,6 +7313,7 @@ fn upload_completion_batching_does_not_change_visibility_contract() {
                 .await
                 .unwrap();
             assert_eq!(read.as_ref(), replacement_payload.as_slice());
+            vfs.shutdown(Duration::from_secs(10)).await;
         });
         rt.shutdown_background();
     }
@@ -7409,6 +7410,7 @@ fn upload_completion_batching_does_not_change_visibility_contract() {
                 .await
                 .unwrap();
             assert_eq!(final_read.as_ref(), replacement_payload.as_slice());
+            vfs.shutdown(Duration::from_secs(10)).await;
         });
         rt.shutdown_background();
     }
