@@ -172,10 +172,10 @@ The `mount_sanity` integration tests in each bridge crate contain two tiers:
 |------|---------|----------|
 | `fuse_session_mount_and_drop_smoke` | FUSE | Session creation and immediate drop (minimal lifecycle) |
 | `fuse_mount_write_read_unmount_smoke` | FUSE | Full lifecycle: mount → write → read → readdir → delete → unmount |
-| `async_mounted_test_matrix_covers_correctness_and_platform_opt_in_scenarios` | FUSE | Fast, non-mounted guard that keeps the async FUSE mounted scenario matrix aligned with SFS-468 acceptance |
+| `async_mounted_test_matrix_covers_correctness_and_platform_opt_in_scenarios` | FUSE | Fast, non-mounted guard that keeps the async FUSE mounted scenario matrix aligned with SFS-468/SFS-472 acceptance |
 | `async_mounted_*` | FUSE | Individual opt-in mounted async write scenarios for sequential readback, flush, fsync, release/reopen, multiple writers, same-handle appends, and unmount-after-write |
 | `linux_async_mounted_*` | FUSE/Linux | Individual opt-in mounted checks for Linux default sync mode, injected async write mode, injected async DIO mode, and optional `fio` multi-job writes |
-| `macos_async_mounted_*` | FUSE/macOS | Individual opt-in mounted macOS workloads for `dd`, optional `fio`, fsync-heavy writes, and Finder-style multi-file copy |
+| `macos_async_mounted_*` | FUSE/macOS | Individual mounted macOS asyncFUSE profile workloads for `dd`, optional `fio`, fsync-heavy writes, and Finder-style multi-file copy |
 | `winfsp_mount_unmount_smoke` | WinFSP | Mount startup and named-event shutdown (minimal lifecycle) |
 | `winfsp_mount_write_read_unmount_smoke` | WinFSP | Full lifecycle: mount → write → read → readdir → delete → unmount |
 | `macos_resource_fork_roundtrip_uses_native_xattr_store` | FUSE (macOS) | Resource fork xattr round-trip (no mount required) |

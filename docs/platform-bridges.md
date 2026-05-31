@@ -179,6 +179,7 @@ Current signature includes additional policy controls:
 | Kernel `max_readahead` | `16777216` bytes on Linux, `1048576` bytes on macOS by default. Override: `STUDIOFS_FUSE_MAX_READAHEAD_BYTES` in `Filesystem::init()` |
 | Kernel `max_background` | macOS: `50` by default. Linux: kernel/fuser default unless explicitly set. Override: `STUDIOFS_FUSE_MAX_BACKGROUND` in `Filesystem::init()` |
 | Kernel `congestion_threshold` | macOS: `40` by default. Linux: kernel/fuser default unless explicitly set. Override: `STUDIOFS_FUSE_CONGESTION_THRESHOLD` in `Filesystem::init()` |
+| FUSE async write replies | macOS: enabled by default. Linux: disabled by default. Override: `STUDIOFS_FUSE_ASYNC_WRITE=1` to enable or `0` / `false` / `off` to disable |
 | Linux: `async_dio` capability | Disabled by default. Opt in with `STUDIOFS_FUSE_ASYNC_DIO=1`; requested only when the kernel advertises `FUSE_ASYNC_DIO` |
 | macOS: `volname` | `"StudioFS"` |
 | macOS: `local` | Yes |
@@ -222,6 +223,12 @@ macOS FUSE defaults to the WinFSP/JuiceFS-style cache policy. The mount keeps
 `local`, `sparse`, and `volname`, adds `novncache`, `daemon_timeout=60`, and an
 `iosize=65536` matching JuiceFS's Darwin mount profile, and does not globally mount
 with `direct_io` or `nolocalcaches`.
+The default macOS asyncFUSE profile also enables async write replies, applies
+the `50/40` background queue policy, keeps `max_write=131072`, and reports the
+matching `65536` preferred I/O size through regular file attributes. Set
+`STUDIOFS_FUSE_ASYNC_WRITE=0` to restore synchronous write callbacks without
+changing the cache policy, or set `STUDIOFS_MACOS_FUSE_CACHE_POLICY=direct` for
+the strict direct-I/O rollback profile.
 For macFUSE 5.2.0, regular file attributes must report the same preferred I/O
 size (`st_blksize` / FUSE `blksize`) as the mount `iosize`; advertising the old
 512-byte value causes macFUSE to split large sequential reads and writes into

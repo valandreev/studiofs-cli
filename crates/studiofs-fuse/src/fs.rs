@@ -387,9 +387,16 @@ fn should_enable_async_fuse_write_from_env_value(raw: &str) -> bool {
     parse_bridge_bool_env_value(raw)
 }
 
+fn resolve_async_fuse_write_enabled(raw: Option<&str>) -> bool {
+    raw.map_or(
+        cfg!(target_os = "macos"),
+        should_enable_async_fuse_write_from_env_value,
+    )
+}
+
 fn should_enable_async_fuse_write_from_env() -> bool {
-    std::env::var(STUDIOFS_FUSE_ASYNC_WRITE_ENV)
-        .is_ok_and(|raw| should_enable_async_fuse_write_from_env_value(&raw))
+    let raw = std::env::var(STUDIOFS_FUSE_ASYNC_WRITE_ENV).ok();
+    resolve_async_fuse_write_enabled(raw.as_deref())
 }
 
 trait FuseWriteReply {
@@ -1049,7 +1056,7 @@ pub struct StudioFuseFs {
 /// environment during tests or embedded use.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct StudioFuseRuntimeOptions {
-    /// Enable the experimental async FUSE write-reply path.
+    /// Enable the async FUSE write-reply path.
     pub async_write_enabled: bool,
     /// Request Linux `FUSE_ASYNC_DIO` during FUSE init when supported.
     /// Ignored on non-Linux platforms.
@@ -2931,9 +2938,9 @@ mod tests {
         FuseWriteReplyGuard, PendingFuseCloseGuard, StudioFuseFs, TTL, complete_fuse_write_reply,
         fuse_write_local_sync_policy, is_expected_macos_trashes_mkdir_exists,
         is_missing_xattr_error, missing_xattr_errno, normalize_unix_mode,
-        posix_flags_to_open_flags, should_enable_async_fuse_write_from_env_value,
-        should_log_invalidation_error, should_request_fuse_async_dio_from_env_value, to_fuse_attr,
-        vfs_err_to_errno,
+        posix_flags_to_open_flags, resolve_async_fuse_write_enabled,
+        should_enable_async_fuse_write_from_env_value, should_log_invalidation_error,
+        should_request_fuse_async_dio_from_env_value, to_fuse_attr, vfs_err_to_errno,
     };
     use crate::fs::pending_write_tracker::{PendingWriteAdmissionLimits, PendingWriteTracker};
     use std::cell::Cell;
@@ -3089,8 +3096,9 @@ mod tests {
 
     #[test]
     fn disabled_async_write_diagnostics_publish_once_without_periodic_task() {
-        let (_tmp, rt, vfs, _env_fs) =
+        let (_tmp, rt, vfs, env_fs) =
             make_test_fuse_fs("disabled-async-write-diagnostics-publisher");
+        drop(env_fs);
         let _fs = StudioFuseFs::new_with_runtime_options(
             vfs.clone(),
             rt.handle().clone(),
@@ -3320,13 +3328,32 @@ mod tests {
     }
 
     #[test]
-    fn fuse_async_write_env_is_opt_in_only() {
+    fn fuse_async_write_env_values_parse_as_boolean_overrides() {
         for false_value in ["0", "false", "off", ""] {
             assert!(!should_enable_async_fuse_write_from_env_value(false_value));
         }
 
         for true_value in ["1", "true", "True", "TRUE", "yes", "Yes", "on", "On"] {
             assert!(should_enable_async_fuse_write_from_env_value(true_value));
+        }
+    }
+
+    #[test]
+    fn async_fuse_write_default_profile_uses_macos_default_when_env_unset() {
+        assert_eq!(
+            resolve_async_fuse_write_enabled(None),
+            cfg!(target_os = "macos")
+        );
+    }
+
+    #[test]
+    fn async_fuse_write_env_overrides_default_profile() {
+        for false_value in ["0", "false", "off", ""] {
+            assert!(!resolve_async_fuse_write_enabled(Some(false_value)));
+        }
+
+        for true_value in ["1", "true", "True", "TRUE", "yes", "Yes", "on", "On"] {
+            assert!(resolve_async_fuse_write_enabled(Some(true_value)));
         }
     }
 
