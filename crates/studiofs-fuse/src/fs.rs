@@ -211,6 +211,9 @@ fn fuse_attr_blksize() -> u32 {
 }
 
 fn fuse_open_reply_flags(open_flags: OpenFlags, trunc: bool) -> u32 {
+    #[cfg(not(target_os = "macos"))]
+    let _ = trunc;
+
     #[cfg(target_os = "macos")]
     {
         fuse_open_reply_flags_with_macos_cache_policy(
@@ -1370,13 +1373,13 @@ impl Filesystem for StudioFuseFs {
         }
 
         #[cfg(target_os = "linux")]
-        if self.linux_async_dio_enabled {
-            if let Err(unsupported) = config.add_capabilities(fuser::consts::FUSE_ASYNC_DIO) {
-                warn!(
-                    ?unsupported,
-                    "Linux FUSE kernel did not advertise FUSE_ASYNC_DIO; continuing without async direct I/O"
-                );
-            }
+        if self.linux_async_dio_enabled
+            && let Err(unsupported) = config.add_capabilities(fuser::consts::FUSE_ASYNC_DIO)
+        {
+            warn!(
+                ?unsupported,
+                "Linux FUSE kernel did not advertise FUSE_ASYNC_DIO; continuing without async direct I/O"
+            );
         }
 
         Ok(())

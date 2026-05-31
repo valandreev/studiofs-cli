@@ -918,7 +918,10 @@ fn winfsp_mount_fio_multi_job_smoke() {
             .arg("--group_reporting")
             .status()
             .expect("run fio workload through WinFSP mount");
-        assert!(status.success(), "fio workload failed with status: {status}");
+        assert!(
+            status.success(),
+            "fio workload failed with status: {status}"
+        );
 
         let fio_file = std::path::Path::new(drive_root).join("fio.bin");
         assert_eq!(

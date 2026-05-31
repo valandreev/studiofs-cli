@@ -655,13 +655,13 @@ fn forced_unmount_clearance_warning(cleared: bool) -> Option<&'static str> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 fn success_exit_status() -> ExitStatus {
     use std::os::unix::process::ExitStatusExt;
     ExitStatus::from_raw(0)
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 fn failure_exit_status() -> ExitStatus {
     use std::os::unix::process::ExitStatusExt;
     ExitStatus::from_raw(1 << 8)
