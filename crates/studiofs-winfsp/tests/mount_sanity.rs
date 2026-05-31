@@ -920,12 +920,7 @@ fn winfsp_mount_fio_multi_job_smoke() {
             .expect("run fio workload through WinFSP mount");
         assert!(status.success(), "fio workload failed with status: {status}");
 
-        let fio_file_root = if drive_root.ends_with('\\') || drive_root.ends_with('/') {
-            drive_root.to_owned()
-        } else {
-            format!("{drive_root}\\")
-        };
-        let fio_file = std::path::PathBuf::from(fio_file_root).join("fio.bin");
+        let fio_file = std::path::Path::new(drive_root).join("fio.bin");
         assert_eq!(
             std::fs::metadata(&fio_file)
                 .expect("fio output metadata through WinFSP mount")
