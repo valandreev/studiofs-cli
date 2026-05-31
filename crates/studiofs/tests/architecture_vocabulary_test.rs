@@ -1019,11 +1019,15 @@ fn linux_async_fuse_benchmark_report_covers_sfs473_decision() {
         "memory",
         "pending async write bytes",
         "barrier-heavy workloads",
+        "Windows WinFSP fio comparison",
+        "winfsp_mount_fio_multi_job_smoke",
+        "fio-3.42",
         "Linux remains synchronous by default",
         "cargo test -p studiofs-fuse --test mount_sanity linux_async_mounted_default_sync -- --ignored --exact --nocapture",
         "cargo test -p studiofs-fuse --test mount_sanity linux_async_mounted_async_opt_in -- --ignored --exact --nocapture",
         "cargo test -p studiofs-fuse --test mount_sanity linux_async_mounted_async_dio_opt_in -- --ignored --exact --nocapture",
         "cargo test -p studiofs-fuse --test mount_sanity linux_async_mounted_fio_multi_job -- --ignored --exact --nocapture",
+        "cargo test -p studiofs-winfsp --test mount_sanity winfsp_mount_fio_multi_job_smoke -- --ignored --exact --nocapture",
     ];
 
     let missing: Vec<_> = required_terms

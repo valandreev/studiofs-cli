@@ -13,6 +13,13 @@ Host:
   `fusermount3` rejects mounts over `/mnt/e` drvfs with filesystem type
   `0x01021997`.
 
+Windows comparison host:
+
+- Same Windows 11 host.
+- Bridge: WinFSP through `crates/studiofs-winfsp` mounted smoke harness.
+- fio: `fio-3.42` at `C:\Program Files\fio\fio.exe`.
+- Mount point used for the focused run: `Z:`.
+
 ## Decision
 
 Linux remains synchronous by default.
@@ -38,6 +45,11 @@ cargo test -p studiofs-fuse --test mount_sanity linux_async_mounted_default_sync
 cargo test -p studiofs-fuse --test mount_sanity linux_async_mounted_async_opt_in -- --ignored --exact --nocapture
 cargo test -p studiofs-fuse --test mount_sanity linux_async_mounted_async_dio_opt_in -- --ignored --exact --nocapture
 cargo test -p studiofs-fuse --test mount_sanity linux_async_mounted_fio_multi_job -- --ignored --exact --nocapture
+
+$env:STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS='1'
+$env:STUDIOFS_WINFSP_TEST_MOUNT_POINT='Z:'
+$env:STUDIOFS_WINFSP_FIO_PATH='C:\Program Files\fio\fio.exe'
+cargo test -p studiofs-winfsp --test mount_sanity winfsp_mount_fio_multi_job_smoke -- --ignored --exact --nocapture
 
 STUDIOFS_FUSE_MAX_BACKGROUND=50 \
 STUDIOFS_FUSE_CONGESTION_THRESHOLD=40 \
@@ -74,6 +86,7 @@ The repeated timing wrapper was:
 | fsync-heavy workload | async write opt-in, write plus `fsync` barrier | pass | 0.15 s | 95.0-95.6 MiB |
 | dirty-pressure workload | async write opt-in, write-only-until-unmount drain | pass | 0.26 s | 95.0-95.4 MiB |
 | multi-job write | `linux_async_mounted_fio_multi_job`, fio 2 jobs, 64 KiB writes, 2 MiB total, `fsync=1` | pass | 1.78 s mounted test time | 95.2-95.4 MiB |
+| Windows WinFSP fio comparison | `winfsp_mount_fio_multi_job_smoke`, fio 2 jobs, 64 KiB writes, 2 MiB total, `fsync=1` | pass | 4.82 s mounted test time | not captured |
 
 ## fio results
 
@@ -86,6 +99,25 @@ The Linux fio mounted smoke used `fio-3.36` through
 | 2 | 1494 KiB/s | 1371 ms | 80.37 ms | 1.93 s | 95.4 MiB |
 | 3 | 1504 KiB/s | 1362 ms | 77.65 ms | 1.93 s | 95.2 MiB |
 
+## Windows WinFSP fio comparison
+
+The Windows comparison used `fio-3.42` through
+`winfsp_mount_fio_multi_job_smoke`. The test originally failed when fio was
+passed `--directory=Z:\` or `--directory=Z:/`, because this Windows fio build
+parses drive-letter paths as `Z`. The committed WinFSP smoke avoids that by
+setting the child process current directory to the mounted drive root and using
+relative `--filename=fio.bin`.
+
+| Run | fio write bandwidth | fio runtime | fsync average | mounted test time | harness elapsed |
+|---|---:|---:|---:|---:|---:|
+| 1 | 991 KiB/s | 2066 ms | 96.61 ms | 2.93 s | 3.43 s |
+| 2 | 1054 KiB/s | 1943 ms | 94.96 ms | 4.82 s | 5.34 s |
+| 3 | 1059 KiB/s | 1934 ms | 94.84 ms | 4.86 s | 5.38 s |
+
+The Windows fio output also reports that process-shared mutexes are unavailable
+on this platform and therefore fio starts threads. This is expected for this
+fio build and does not indicate a StudioFS write failure.
+
 ## Observations
 
 - The default synchronous mode and async write opt-in mode both pass mounted
@@ -96,6 +128,9 @@ The Linux fio mounted smoke used `fio-3.36` through
   benchmark/control knob.
 - The fio multi-job write workload ran for real with `fio-3.36`, wrote 2 MiB
   through two jobs, and completed without writeback or barrier failures.
+- The Windows WinFSP fio comparison ran for real with `fio-3.42`, wrote 2 MiB
+  through two jobs on the mounted `Z:` drive, and completed without WinFSP or
+  VFS writeback failures.
 - Barrier-heavy workloads passed through flush, fsync, close/reopen, and
   unmount-after-write checks, so no correctness regressions appeared in
   barrier-heavy workloads.
