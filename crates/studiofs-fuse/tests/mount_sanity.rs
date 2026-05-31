@@ -514,13 +514,18 @@ fn join_mounted_fuse_session_until(
 ) -> Option<std::thread::Result<io::Result<()>>> {
     let deadline = std::time::Instant::now() + timeout;
     while !session_handle.is_finished() {
-        if std::time::Instant::now() >= deadline {
+        let now = std::time::Instant::now();
+        if now >= deadline {
             eprintln!("FUSE session thread did not exit within {timeout:?}; skipping join");
             return None;
         }
-        std::thread::sleep(Duration::from_millis(25));
+        std::thread::sleep(join_poll_sleep_duration(deadline.duration_since(now)));
     }
     Some(session_handle.join())
+}
+
+fn join_poll_sleep_duration(remaining: Duration) -> Duration {
+    remaining.min(Duration::from_millis(25))
 }
 
 fn fuse_mount_path_cleared(mount_path: &Path, pre_dev: u64) -> bool {
@@ -556,9 +561,18 @@ fn force_unmount_fuse_mount_path(mount_path: &Path) -> io::Result<()> {
 }
 
 fn umount_fuse_mount_path_command(mount_path: &Path) -> Command {
-    let mut command = Command::new("umount");
-    command.arg("-f").arg(mount_path);
+    let (program, args) = forced_fuse_unmount_command_parts(std::env::consts::OS);
+    let mut command = Command::new(program);
+    command.args(args).arg(mount_path);
     command
+}
+
+fn forced_fuse_unmount_command_parts(target_os: &str) -> (&'static str, &'static [&'static str]) {
+    if target_os == "linux" {
+        ("fusermount3", &["-u", "-z"])
+    } else {
+        ("umount", &["-f"])
+    }
 }
 
 fn diskutil_unmount_fuse_mount_path_command(mount_path: &Path) -> Command {
@@ -744,6 +758,18 @@ fn mounted_fuse_cleanup_bounds_session_join_wait() {
 }
 
 #[test]
+fn mounted_fuse_cleanup_caps_join_poll_sleep_to_remaining_timeout() {
+    assert_eq!(
+        join_poll_sleep_duration(Duration::from_millis(40)),
+        Duration::from_millis(25)
+    );
+    assert_eq!(
+        join_poll_sleep_duration(Duration::from_millis(10)),
+        Duration::from_millis(10)
+    );
+}
+
+#[test]
 fn mounted_fuse_cleanup_detects_mount_path_device_restoration() {
     let mount_dir = target_tempdir("mount-detection-");
     use std::os::unix::fs::MetadataExt;
@@ -772,17 +798,21 @@ fn mounted_fuse_cleanup_treats_only_not_found_metadata_errors_as_cleared() {
 #[test]
 fn mounted_fuse_cleanup_uses_forced_system_unmount_commands() {
     let mount_path = Path::new("/tmp/studiofs-test-mount");
+    let (expected_program, expected_args) = forced_fuse_unmount_command_parts(std::env::consts::OS);
     let umount_command = umount_fuse_mount_path_command(mount_path);
     let umount_args = umount_command
         .get_args()
         .map(OsString::from)
         .collect::<Vec<_>>();
 
-    assert_eq!(umount_command.get_program(), "umount");
-    assert_eq!(
-        umount_args,
-        vec![OsString::from("-f"), mount_path.as_os_str().to_os_string()]
-    );
+    let expected_args = expected_args
+        .iter()
+        .map(OsString::from)
+        .chain(std::iter::once(mount_path.as_os_str().to_os_string()))
+        .collect::<Vec<_>>();
+
+    assert_eq!(umount_command.get_program(), expected_program);
+    assert_eq!(umount_args, expected_args);
 
     let diskutil_command = diskutil_unmount_fuse_mount_path_command(mount_path);
     let diskutil_args = diskutil_command
@@ -799,6 +829,14 @@ fn mounted_fuse_cleanup_uses_forced_system_unmount_commands() {
             mount_path.as_os_str().to_os_string()
         ]
     );
+}
+
+#[test]
+fn mounted_fuse_cleanup_uses_unprivileged_linux_fuse_unmount_command() {
+    let (program, args) = forced_fuse_unmount_command_parts("linux");
+
+    assert_eq!(program, "fusermount3");
+    assert_eq!(args, &["-u", "-z"]);
 }
 
 #[cfg(target_os = "macos")]
