@@ -1000,6 +1000,46 @@ fn local_first_e2e_baseline_audit_covers_sfs402_surfaces() {
 }
 
 #[test]
+fn linux_async_fuse_benchmark_report_covers_sfs473_decision() {
+    let doc = read_workspace_file("docs/perf/sfs-473-linux-async-fuse-benchmark.md");
+    let normalized_doc = normalize_doc_whitespace(&doc);
+    let required_terms = [
+        "SFS-473",
+        "Linux async FUSE opt-in benchmark",
+        "default synchronous mode",
+        "async write opt-in",
+        "async write plus background tuning",
+        "64 KiB writer pages",
+        "STUDIOFS_FUSE_ASYNC_DIO=1",
+        "sequential write",
+        "multi-job write",
+        "dirty-pressure workload",
+        "fsync-heavy workload",
+        "CPU",
+        "memory",
+        "pending async write bytes",
+        "barrier-heavy workloads",
+        "Linux remains synchronous by default",
+        "cargo test -p studiofs-fuse --test mount_sanity linux_async_mounted_default_sync -- --ignored --exact --nocapture",
+        "cargo test -p studiofs-fuse --test mount_sanity linux_async_mounted_async_opt_in -- --ignored --exact --nocapture",
+        "cargo test -p studiofs-fuse --test mount_sanity linux_async_mounted_async_dio_opt_in -- --ignored --exact --nocapture",
+        "cargo test -p studiofs-fuse --test mount_sanity linux_async_mounted_fio_multi_job -- --ignored --exact --nocapture",
+    ];
+
+    let missing: Vec<_> = required_terms
+        .iter()
+        .copied()
+        .filter(|term| !contains_doc_term(&doc, &normalized_doc, term))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "SFS-473 Linux async FUSE benchmark report is missing required evidence:\n{}",
+        missing.join("\n")
+    );
+}
+
+#[test]
 fn deterministic_simulation_architecture_covers_required_sfs330_surfaces() {
     let doc = read_workspace_file("docs/deterministic-simulation-architecture.md");
     let required_terms = [
