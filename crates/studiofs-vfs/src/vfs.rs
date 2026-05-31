@@ -2507,7 +2507,7 @@ fn resolve_writer_page_size(block_size: u32, writer_page_size: Option<usize>) ->
     let block_size = block_size.max(1) as usize;
     writer_page_size
         .map(|size| size.min(block_size))
-        .filter(|size| *size > 0 && block_size % *size == 0)
+        .filter(|size| *size > 0 && block_size.is_multiple_of(*size))
         .unwrap_or(block_size)
 }
 
