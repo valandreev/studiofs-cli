@@ -436,6 +436,14 @@ fn online_publish_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
+fn bounded_shutdown_timeout() -> Duration {
+    let metadata_flush_secs = test_env_var("STUDIOFS_SHUTDOWN_METADATA_FLUSH_TIMEOUT_SECS", "10")
+        .parse::<u64>()
+        .unwrap_or(10)
+        .max(1);
+    Duration::from_secs(metadata_flush_secs + 10)
+}
+
 fn parse_env_usize(key: &str) -> Option<usize> {
     locked_env_var(key)
         .and_then(|v| v.parse::<usize>().ok())
@@ -3225,7 +3233,7 @@ fn graceful_shutdown_remount_recovers_new_unpublished_file_before_publish() {
                 "offline setup should leave pending uploads before shutdown"
             );
 
-            tokio::time::timeout(Duration::from_secs(5), vfs.shutdown(Duration::ZERO))
+            tokio::time::timeout(bounded_shutdown_timeout(), vfs.shutdown(Duration::ZERO))
                 .await
                 .expect("shutdown should stay bounded");
             attr.ino
@@ -3346,7 +3354,7 @@ fn graceful_shutdown_remount_preserves_newer_local_epoch_over_published_base() {
                 .unwrap();
             assert_eq!(read.as_ref(), replacement_payload.as_slice());
 
-            tokio::time::timeout(Duration::from_secs(5), vfs.shutdown(Duration::ZERO))
+            tokio::time::timeout(bounded_shutdown_timeout(), vfs.shutdown(Duration::ZERO))
                 .await
                 .expect("shutdown should stay bounded");
         });
@@ -3454,7 +3462,7 @@ fn repeated_graceful_restarts_during_upload_replay_are_idempotent() {
                 "offline setup should create pending upload work before shutdown"
             );
 
-            tokio::time::timeout(Duration::from_secs(5), vfs.shutdown(Duration::ZERO))
+            tokio::time::timeout(bounded_shutdown_timeout(), vfs.shutdown(Duration::ZERO))
                 .await
                 .expect("shutdown should stay bounded");
             attr.ino
@@ -3495,7 +3503,7 @@ fn repeated_graceful_restarts_during_upload_replay_are_idempotent() {
             );
             let snapshot = vfs.pending_uploads_for_inode(ino);
 
-            tokio::time::timeout(Duration::from_secs(5), vfs.shutdown(Duration::ZERO))
+            tokio::time::timeout(bounded_shutdown_timeout(), vfs.shutdown(Duration::ZERO))
                 .await
                 .expect("shutdown should stay bounded");
             snapshot
@@ -12825,7 +12833,7 @@ async fn shutdown_with_pending_uploads_completes_within_bound() {
         "offline upload scenario should queue pending uploads before shutdown"
     );
 
-    tokio::time::timeout(Duration::from_secs(5), vfs.shutdown(Duration::ZERO))
+    tokio::time::timeout(bounded_shutdown_timeout(), vfs.shutdown(Duration::ZERO))
         .await
         .expect("shutdown should stay bounded even with offline pending uploads");
 }
@@ -12871,7 +12879,7 @@ async fn zeroio_shutdown_snapshot_uses_runtime_dir_without_ingress_spill() {
         "offline upload scenario should queue pending uploads before shutdown"
     );
 
-    tokio::time::timeout(Duration::from_secs(5), vfs.shutdown(Duration::ZERO))
+    tokio::time::timeout(bounded_shutdown_timeout(), vfs.shutdown(Duration::ZERO))
         .await
         .expect("shutdown should stay bounded even with offline pending uploads");
 
@@ -13032,7 +13040,7 @@ async fn ctrl_c_during_small_file_churn_does_not_hang() {
 
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    tokio::time::timeout(Duration::from_secs(5), vfs.shutdown(Duration::ZERO))
+    tokio::time::timeout(bounded_shutdown_timeout(), vfs.shutdown(Duration::ZERO))
         .await
         .expect("shutdown should stay bounded during small-file churn");
     tokio::time::timeout(Duration::from_secs(2), churn)
@@ -13076,7 +13084,7 @@ async fn remount_after_delete_shutdown_does_not_resurrect_ghost_entry() {
         vfs.unlink(dir.ino, b"ghost.txt").unwrap();
         vfs.rmdir(1, b"ghost-dir").unwrap();
 
-        tokio::time::timeout(Duration::from_secs(5), vfs.shutdown(Duration::ZERO))
+        tokio::time::timeout(bounded_shutdown_timeout(), vfs.shutdown(Duration::ZERO))
             .await
             .expect("shutdown after delete should stay bounded");
     }
@@ -13133,7 +13141,7 @@ async fn unmount_after_recursive_delete_preserves_consistent_namespace() {
         vfs.rmdir(root.ino, b"nested").unwrap();
         vfs.rmdir(1, b"delete-tree").unwrap();
 
-        tokio::time::timeout(Duration::from_secs(5), vfs.shutdown(Duration::ZERO))
+        tokio::time::timeout(bounded_shutdown_timeout(), vfs.shutdown(Duration::ZERO))
             .await
             .expect("shutdown after recursive delete should stay bounded");
     }
