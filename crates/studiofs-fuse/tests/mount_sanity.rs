@@ -550,14 +550,21 @@ fn wait_for_fuse_mount_path_to_clear(mount_path: &Path, pre_dev: u64, timeout: D
 fn force_unmount_fuse_mount_path(mount_path: &Path) -> io::Result<()> {
     force_unmount_fuse_mount_path_with(
         mount_path,
-        |mount_path| Command::new("umount").arg(mount_path).status(),
-        |mount_path| {
-            Command::new("diskutil")
-                .arg("unmount")
-                .arg(mount_path)
-                .status()
-        },
+        |mount_path| umount_fuse_mount_path_command(mount_path).status(),
+        |mount_path| diskutil_unmount_fuse_mount_path_command(mount_path).status(),
     )
+}
+
+fn umount_fuse_mount_path_command(mount_path: &Path) -> Command {
+    let mut command = Command::new("umount");
+    command.arg("-f").arg(mount_path);
+    command
+}
+
+fn diskutil_unmount_fuse_mount_path_command(mount_path: &Path) -> Command {
+    let mut command = Command::new("diskutil");
+    command.arg("unmount").arg("force").arg(mount_path);
+    command
 }
 
 fn force_unmount_fuse_mount_path_with(
@@ -574,7 +581,11 @@ fn force_unmount_fuse_mount_path_with(
     {
         #[cfg(target_os = "macos")]
         {
-            let diskutil_status = run_diskutil(mount_path)?;
+            let diskutil_status = run_diskutil(mount_path).map_err(|error| {
+                io::Error::other(format!(
+                    "{umount_failure}; diskutil failed to execute: {error}"
+                ))
+            })?;
             if diskutil_status.success() {
                 Ok(())
             } else {
@@ -611,7 +622,9 @@ fn reconcile_fuse_unmount_result(
 
     match force_unmount() {
         Ok(()) => {
-            let _cleared = wait_for_clear();
+            if let Some(message) = forced_unmount_clearance_warning(wait_for_clear()) {
+                eprintln!("{message}");
+            }
         }
         Err(error) => {
             eprintln!("system umount also failed after fuser unmount failure: {error}");
@@ -620,10 +633,24 @@ fn reconcile_fuse_unmount_result(
     unmount_result
 }
 
+fn forced_unmount_clearance_warning(cleared: bool) -> Option<&'static str> {
+    if cleared {
+        None
+    } else {
+        Some("FUSE mount remained active after forced system unmount reported success")
+    }
+}
+
 #[cfg(test)]
 fn success_exit_status() -> ExitStatus {
     use std::os::unix::process::ExitStatusExt;
     ExitStatus::from_raw(0)
+}
+
+#[cfg(test)]
+fn failure_exit_status() -> ExitStatus {
+    use std::os::unix::process::ExitStatusExt;
+    ExitStatus::from_raw(1 << 8)
 }
 
 #[test]
@@ -742,6 +769,38 @@ fn mounted_fuse_cleanup_treats_only_not_found_metadata_errors_as_cleared() {
     )));
 }
 
+#[test]
+fn mounted_fuse_cleanup_uses_forced_system_unmount_commands() {
+    let mount_path = Path::new("/tmp/studiofs-test-mount");
+    let umount_command = umount_fuse_mount_path_command(mount_path);
+    let umount_args = umount_command
+        .get_args()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+
+    assert_eq!(umount_command.get_program(), "umount");
+    assert_eq!(
+        umount_args,
+        vec![OsString::from("-f"), mount_path.as_os_str().to_os_string()]
+    );
+
+    let diskutil_command = diskutil_unmount_fuse_mount_path_command(mount_path);
+    let diskutil_args = diskutil_command
+        .get_args()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+
+    assert_eq!(diskutil_command.get_program(), "diskutil");
+    assert_eq!(
+        diskutil_args,
+        vec![
+            OsString::from("unmount"),
+            OsString::from("force"),
+            mount_path.as_os_str().to_os_string()
+        ]
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn mounted_fuse_cleanup_tries_diskutil_when_umount_spawn_fails() {
@@ -760,6 +819,22 @@ fn mounted_fuse_cleanup_tries_diskutil_when_umount_spawn_fails() {
     assert!(diskutil_called.get());
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn mounted_fuse_cleanup_preserves_umount_context_when_diskutil_spawn_fails() {
+    let error = force_unmount_fuse_mount_path_with(
+        Path::new("/tmp/studiofs-test-mount"),
+        |_| Ok(failure_exit_status()),
+        |_| Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied")),
+    )
+    .expect_err("diskutil spawn failure should report both unmount attempts");
+    let message = error.to_string();
+
+    assert!(message.contains("system umount exited with status"));
+    assert!(message.contains("diskutil failed to execute"));
+    assert!(message.contains("denied"));
+}
+
 #[test]
 fn mounted_fuse_cleanup_waits_after_forced_unmount_on_failed_primary_unmount() {
     let waited = std::cell::Cell::new(false);
@@ -775,6 +850,15 @@ fn mounted_fuse_cleanup_waits_after_forced_unmount_on_failed_primary_unmount() {
 
     assert!(result.is_err());
     assert!(waited.get());
+}
+
+#[test]
+fn mounted_fuse_cleanup_warns_when_forced_unmount_reports_success_but_mount_remains() {
+    assert_eq!(forced_unmount_clearance_warning(true), None);
+    assert_eq!(
+        forced_unmount_clearance_warning(false),
+        Some("FUSE mount remained active after forced system unmount reported success")
+    );
 }
 
 fn with_mounted_fuse(
