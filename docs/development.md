@@ -6,7 +6,7 @@
 - Metadata: local `redb` + PostgreSQL background sync (`PgMetaEngine`)
 - Data I/O: OpenDAL (S3-compatible)
 - Cache: RAM + disk + runtime upload queue
-- Bridges: WinFSP (Windows), FUSE (Linux)
+- Bridges: WinFSP (Windows), FUSE (Linux), macFUSE stub (macOS opt-in)
 
 ## Project Structure
 
@@ -19,6 +19,7 @@ studiofs-cli/
   │   ├── studiofs-cache/     # L1/L2 cache
   │   ├── studiofs-vfs/       # filesystem core
   │   ├── studiofs-fuse/      # Linux FUSE bridge
+  │   ├── studiofs-macfuse/   # macOS native bridge stub
   │   ├── studiofs-winfsp/    # Windows bridge
   │   └── studiofs-e2e/       # real mounted E2E runner
   └── docs/
@@ -85,10 +86,21 @@ not currently provide, and those workflows are also manual-only.
 | **Windows** | `windows-latest` | Clippy + tests — explicit `studiofs-winfsp` unit step (exercises `cfg(windows)` code paths) |
 
 Each platform job includes a named step for the backend-specific crate so
-regressions in `studiofs-fuse` (Linux paths) or `studiofs-winfsp`
+regressions in `studiofs-fuse` (Linux paths), `studiofs-macfuse` (macOS paths),
+or `studiofs-winfsp`
 are immediately attributable in the CI job log rather than buried inside the
 broad workspace run. Failures that originate from platform-specific code
 should call out the backend step name directly.
+
+The macOS CLI keeps the native bridge behind an explicit development selector
+until the low-level macFUSE session is production-ready:
+
+```bash
+STUDIOFS_MOUNT_BACKEND=macfuse studiofs mount myvolume /mnt/studio
+```
+
+Without that selector, macOS fails through the explicit unsupported backend
+instead of silently falling back to Linux FUSE behavior.
 
 The GitHub-hosted macOS and Windows jobs are independent from RWX. Start the
 RWX Linux gate manually when Linux signal is needed; hosted macOS and Windows

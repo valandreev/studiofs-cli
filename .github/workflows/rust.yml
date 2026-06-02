@@ -9,7 +9,7 @@ env:
 
 # ─── Jobs ──────────────────────────────────────────────────────────────
 #
-#  macos     — clippy + tests on macOS; explicit studiofs-fuse macOS unit step
+#  macos     — clippy + tests on macOS; explicit studiofs-fuse and studiofs-macfuse unit steps
 #  windows   — clippy + tests on Windows; explicit studiofs-winfsp unit step
 #
 # Linux verification, fmt, docs, audit, and Ubuntu/Rocky coverage run in RWX
@@ -50,10 +50,10 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: cargo test
-        # Exclude studiofs-fuse so the workspace run does not duplicate the
-        # work performed by the explicit named step below. The explicit step
-        # is the sole source of signal for this backend on macOS.
-        run: cargo test --workspace --all-targets --exclude studiofs-fuse -- --nocapture
+        # Exclude platform bridge crates so the workspace run does not duplicate
+        # the work performed by the explicit named steps below. Those steps are
+        # the sole source of signal for backend-owned macOS paths.
+        run: cargo test --workspace --all-targets --exclude studiofs-fuse --exclude studiofs-macfuse -- --nocapture
 
       - name: cargo test (studiofs-fuse — macOS paths)
         # Sole runner for studiofs-fuse on macOS. Runs lib (unit) tests and
@@ -61,6 +61,11 @@ jobs:
         # cfg(target_os="macos") tests (volname, local, foreground, resource
         # fork/xattr behavior) are exercised here and nowhere else.
         run: cargo test -p studiofs-fuse --lib --tests -- --nocapture
+
+      - name: cargo test (studiofs-macfuse — macOS paths)
+        # Sole runner for the macOS native bridge stub while it remains
+        # opt-in and separate from the Linux FUSE bridge.
+        run: cargo test -p studiofs-macfuse --lib -- --nocapture
 
   # ─── Windows Verification ──────────────────────────────────────────
   windows:

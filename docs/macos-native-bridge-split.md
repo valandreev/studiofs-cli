@@ -91,6 +91,11 @@ The first routing change should be compile-time gated with `cfg(target_os =
 arguments should keep their current public CLI shape until the macOS bridge has
 its own validated options.
 
+The initial CLI routing keeps the macOS native bridge behind
+`STUDIOFS_MOUNT_BACKEND=macfuse`. Without that selector, macOS uses the explicit
+unsupported backend so the incomplete native bridge does not become the
+unconditional default.
+
 ## Fallback Behavior
 
 Before `studiofs-macfuse` is production-ready, macOS should not silently fall
