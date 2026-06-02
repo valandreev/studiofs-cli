@@ -293,13 +293,12 @@ impl SessionConfig {
 
     /// Build owned argv strings for libfuse.
     pub fn argv_strings(&self) -> Vec<String> {
-        let mut args = vec!["studiofs-macfuse".to_owned()];
-        if self.read_only {
-            args.push("-oro".to_owned());
-        }
+        let args = vec!["studiofs-macfuse".to_owned()];
+        let _ = self.read_only;
         // `run_in_foreground` is runner policy. The macFUSE 2.x low-level
-        // session constructor rejects `-f`, so daemonization must stay outside
-        // the argument vector passed to `fuse_lowlevel_new`.
+        // session constructor rejects `-f`. macFUSE 5.2.0 also rejects `ro`
+        // for low-level sessions, so read-only behavior is enforced by the
+        // StudioFS callback adapter rather than a kernel mount option.
         args
     }
 

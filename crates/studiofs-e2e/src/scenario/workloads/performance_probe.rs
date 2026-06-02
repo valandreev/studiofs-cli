@@ -4,6 +4,7 @@ use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -14,6 +15,9 @@ use crate::client::{
     ClientSpec, MultiClientController, SystemClientProcessExecutor, VolumeBootstrapOptions,
 };
 use crate::scenario::{Scenario, ScenarioContext, ScenarioDefinition, ScenarioError};
+use studiofs_data::DataStoreConfig;
+use studiofs_meta::{MetaFormat as _, PgMetaEngine, ROOT_INO};
+use studiofs_vfs::{StudioVfs, VfsConfigRaw};
 
 /// Mounted performance probe scenario identifier.
 pub const MOUNTED_PERFORMANCE_PROBE: &str = "mounted-performance-probe";
@@ -108,10 +112,19 @@ fn run_mounted_performance_probe_scenario(
         client_names: vec![PERFORMANCE_PROBE_CLIENT.to_string()],
         clean_existing_local_metadata: true,
     })?;
+    let config = PerformanceProbeConfig::from_env()?;
+    if config.seed_mode == PerformanceProbeSeedMode::ReadOnlySeeded {
+        let client = controller.client_at(0)?;
+        seed_performance_probe_payload(client, &config)?;
+        controller.set_client_env_overrides(
+            PERFORMANCE_PROBE_CLIENT,
+            read_only_bridge_mount_overrides(),
+        )?;
+    }
     controller.mount(PERFORMANCE_PROBE_CLIENT)?;
     let client = controller.client_at(0)?;
 
-    let run_result = run_mounted_performance_probe(context, client, scenario_name);
+    let run_result = run_mounted_performance_probe(context, client, scenario_name, config);
     let cleanup_result = controller.unmount_all();
     match (run_result, cleanup_result) {
         (Ok(()), Ok(())) => Ok(()),
@@ -184,37 +197,45 @@ fn run_mounted_performance_probe(
     context: &ScenarioContext,
     client: &ClientSpec,
     scenario_name: &'static str,
+    config: PerformanceProbeConfig,
 ) -> Result<(), ScenarioError> {
-    let config = PerformanceProbeConfig::from_env()?;
     let samples_path = context.scenario_dir.join(PERFORMANCE_PROBE_SAMPLES_FILE);
     let metrics_path = client.cache_dir.join(WRITE_PATH_OBSERVABILITY_FILE);
     let probe_path = client.mount_point.join(PERFORMANCE_PROBE_FILE);
     let mut phases = Vec::with_capacity(config.read_passes as usize + 2);
 
-    let before_write = sample_metrics(&metrics_path)?;
-    append_sample(
-        &samples_path,
-        "before-write",
-        before_write.as_ref(),
-        &metrics_path,
-    )?;
-    let write_io = write_probe_file(&probe_path, config.file_bytes, config.chunk_bytes)?;
-    let after_write = sample_metrics_after_delay(&metrics_path, config.sample_delay)?;
-    append_sample(
-        &samples_path,
-        "after-write",
-        after_write.as_ref(),
-        &metrics_path,
-    )?;
-    let expected_checksum = write_io.checksum;
-    phases.push(PerformanceProbePhase::new(
-        "write".to_string(),
-        "write".to_string(),
-        None,
-        write_io,
-        &before_write,
-        &after_write,
-    ));
+    let expected_checksum = match config.seed_mode {
+        PerformanceProbeSeedMode::MountedWrite => {
+            let before_write = sample_metrics(&metrics_path)?;
+            append_sample(
+                &samples_path,
+                "before-write",
+                before_write.as_ref(),
+                &metrics_path,
+            )?;
+            let write_io = write_probe_file(&probe_path, config.file_bytes, config.chunk_bytes)?;
+            let after_write = sample_metrics_after_delay(&metrics_path, config.sample_delay)?;
+            append_sample(
+                &samples_path,
+                "after-write",
+                after_write.as_ref(),
+                &metrics_path,
+            )?;
+            let expected_checksum = write_io.checksum;
+            phases.push(PerformanceProbePhase::new(
+                "write".to_string(),
+                "write".to_string(),
+                None,
+                write_io,
+                &before_write,
+                &after_write,
+            ));
+            expected_checksum
+        }
+        PerformanceProbeSeedMode::ReadOnlySeeded => {
+            expected_probe_checksum(config.file_bytes, config.chunk_bytes)
+        }
+    };
 
     for pass in 1..=config.read_passes {
         let before = sample_metrics(&metrics_path)?;
@@ -303,6 +324,67 @@ fn run_mounted_performance_probe(
     Ok(())
 }
 
+fn seed_performance_probe_payload(
+    client: &ClientSpec,
+    config: &PerformanceProbeConfig,
+) -> Result<(), ScenarioError> {
+    let runtime = tokio::runtime::Runtime::new()?;
+    let _guard = runtime.enter();
+    let meta = PgMetaEngine::open(&client.local_metadata_db)
+        .map_err(|error| ScenarioError::Io(std::io::Error::other(error)))?;
+    let format_info = meta
+        .get_format_info()
+        .map_err(|error| ScenarioError::Io(std::io::Error::other(error)))?;
+    let data_config = DataStoreConfig::from(&format_info);
+    let cache_dir = client.cache_dir.to_string_lossy().into_owned();
+    let vfs = StudioVfs::new(
+        Arc::clone(&meta) as Arc<dyn studiofs_meta::MetaEngine>,
+        &data_config,
+        &cache_dir,
+        64 * 1024 * 1024,
+        32 * 1024 * 1024,
+        VfsConfigRaw::default()
+            .validate()
+            .map_err(|error| ScenarioError::Io(std::io::Error::other(error)))?,
+    )
+    .map_err(|error| ScenarioError::Io(std::io::Error::other(error)))?;
+    vfs.start()
+        .map_err(|error| ScenarioError::Io(std::io::Error::other(error)))?;
+
+    let dir_attr = match vfs.mkdir(ROOT_INO, b"performance-probe", 0, 0, 0o755) {
+        Ok(attr) => attr,
+        Err(studiofs_vfs::VfsError::Meta(studiofs_meta::MetaError::EntryExists { .. })) => vfs
+            .lookup(ROOT_INO, b"performance-probe")
+            .map_err(|error| ScenarioError::Io(std::io::Error::other(error)))?,
+        Err(error) => return Err(ScenarioError::Io(std::io::Error::other(error))),
+    };
+    let file_attr = match vfs.create(dir_attr.ino, b"probe-4g.bin", 0, 0, 0o644) {
+        Ok(attr) => attr,
+        Err(studiofs_vfs::VfsError::Meta(studiofs_meta::MetaError::EntryExists { .. })) => vfs
+            .lookup(dir_attr.ino, b"probe-4g.bin")
+            .map_err(|error| ScenarioError::Io(std::io::Error::other(error)))?,
+        Err(error) => return Err(ScenarioError::Io(std::io::Error::other(error))),
+    };
+
+    let mut buffer = vec![0u8; config.chunk_bytes];
+    fill_probe_buffer(&mut buffer);
+    let mut remaining = config.file_bytes;
+    let mut offset = 0u64;
+    while remaining > 0 {
+        let len = remaining.min(buffer.len() as u64) as usize;
+        runtime
+            .block_on(vfs.write(file_attr.ino, offset, &buffer[..len]))
+            .map_err(|error| ScenarioError::Io(std::io::Error::other(error)))?;
+        offset = offset.saturating_add(len as u64);
+        remaining -= len as u64;
+    }
+    runtime
+        .block_on(vfs.flush(file_attr.ino))
+        .map_err(|error| ScenarioError::Io(std::io::Error::other(error)))?;
+    runtime.block_on(vfs.shutdown(Duration::from_secs(30)));
+    Ok(())
+}
+
 fn write_probe_file(
     path: &Path,
     file_bytes: u64,
@@ -386,6 +468,21 @@ fn verify_probe_checksum(pass: u32, actual: u64, expected: u64) -> Result<(), Sc
         std::io::ErrorKind::InvalidData,
         format!("read pass {pass} checksum {actual} did not match write checksum {expected}"),
     )))
+}
+
+fn expected_probe_checksum(file_bytes: u64, chunk_bytes: usize) -> u64 {
+    let mut buffer = vec![0u8; chunk_bytes];
+    fill_probe_buffer(&mut buffer);
+    let mut remaining = file_bytes;
+    let mut written = 0u64;
+    let mut checksum = 0u64;
+    while remaining > 0 {
+        let len = remaining.min(buffer.len() as u64) as usize;
+        checksum = update_probe_checksum(checksum, &buffer[..len], written);
+        written = written.saturating_add(len as u64);
+        remaining -= len as u64;
+    }
+    checksum
 }
 
 fn sample_metrics_after_delay(
@@ -524,14 +621,15 @@ fn unix_millis() -> u64 {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct PerformanceProbeConfig {
-    file_bytes: u64,
-    chunk_bytes: usize,
-    read_passes: u32,
-    sample_delay: Duration,
-    wait_for_upload_drain: bool,
-    upload_drain_timeout: Duration,
-    upload_drain_poll: Duration,
+pub(crate) struct PerformanceProbeConfig {
+    pub(crate) file_bytes: u64,
+    pub(crate) chunk_bytes: usize,
+    pub(crate) read_passes: u32,
+    pub(crate) sample_delay: Duration,
+    pub(crate) wait_for_upload_drain: bool,
+    pub(crate) upload_drain_timeout: Duration,
+    pub(crate) upload_drain_poll: Duration,
+    pub(crate) seed_mode: PerformanceProbeSeedMode,
 }
 
 impl PerformanceProbeConfig {
@@ -553,8 +651,62 @@ impl PerformanceProbeConfig {
                 "STUDIOFS_E2E_PERF_UPLOAD_DRAIN_POLL_MS",
                 DEFAULT_UPLOAD_DRAIN_POLL_MS,
             )?),
+            seed_mode: PerformanceProbeSeedMode::from_env()?,
         })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PerformanceProbeSeedMode {
+    MountedWrite,
+    ReadOnlySeeded,
+}
+
+impl PerformanceProbeSeedMode {
+    fn from_env() -> Result<Self, ScenarioError> {
+        match env::var("STUDIOFS_E2E_PERF_SEED_MODE") {
+            Ok(value) if !value.trim().is_empty() => Self::parse(&value),
+            _ => Ok(Self::platform_default()),
+        }
+    }
+
+    fn platform_default() -> Self {
+        if cfg!(target_os = "macos") {
+            Self::ReadOnlySeeded
+        } else {
+            Self::MountedWrite
+        }
+    }
+
+    fn parse(raw: &str) -> Result<Self, ScenarioError> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "mounted-write" | "mounted_write" | "write" => Ok(Self::MountedWrite),
+            "read-only-seeded" | "read_only_seeded" | "macfuse-read-only" | "macfuse" => {
+                Ok(Self::ReadOnlySeeded)
+            }
+            other => Err(ScenarioError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("STUDIOFS_E2E_PERF_SEED_MODE has unsupported value {other:?}"),
+            ))),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::MountedWrite => "mounted_write",
+            Self::ReadOnlySeeded => "read_only_seeded",
+        }
+    }
+}
+
+fn read_only_bridge_mount_overrides() -> Vec<(String, String)> {
+    let mut overrides = Vec::new();
+    push_read_only_bridge_mount_overrides(&mut overrides);
+    overrides
+}
+
+pub(crate) fn push_read_only_bridge_mount_overrides(overrides: &mut Vec<(String, String)>) {
+    overrides.push(("STUDIOFS_MOUNT_BACKEND".to_string(), "macfuse".to_string()));
 }
 
 fn env_bool(key: &str, default: bool) -> Result<bool, ScenarioError> {
@@ -630,15 +782,16 @@ impl PerformanceProbeSummary {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-struct PerformanceProbeConfigSummary {
-    file_bytes: u64,
-    chunk_bytes: usize,
-    read_passes: u32,
-    sample_after_phase_ms: u64,
-    wait_for_upload_drain: bool,
-    upload_drain_timeout_ms: u64,
-    upload_drain_poll_ms: u64,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct PerformanceProbeConfigSummary {
+    pub(crate) file_bytes: u64,
+    pub(crate) chunk_bytes: usize,
+    pub(crate) read_passes: u32,
+    pub(crate) sample_after_phase_ms: u64,
+    pub(crate) wait_for_upload_drain: bool,
+    pub(crate) upload_drain_timeout_ms: u64,
+    pub(crate) upload_drain_poll_ms: u64,
+    pub(crate) seed_mode: String,
 }
 
 impl From<PerformanceProbeConfig> for PerformanceProbeConfigSummary {
@@ -654,6 +807,7 @@ impl From<PerformanceProbeConfig> for PerformanceProbeConfigSummary {
                 .as_millis()
                 .min(u64::MAX as u128) as u64,
             upload_drain_poll_ms: config.upload_drain_poll.as_millis().min(u64::MAX as u128) as u64,
+            seed_mode: config.seed_mode.as_str().to_string(),
         }
     }
 }

@@ -4779,9 +4779,13 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2",
+ "studiofs-data",
+ "studiofs-meta",
+ "studiofs-vfs",
  "syn 2.0.116",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
  "uuid",
 ]
 

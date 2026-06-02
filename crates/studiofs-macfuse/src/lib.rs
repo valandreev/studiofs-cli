@@ -148,7 +148,7 @@ mod tests {
     }
 
     #[test]
-    fn session_config_builds_owned_mount_arguments() {
+    fn session_config_builds_low_level_mount_arguments_without_kernel_read_only_option() {
         let config = super::low_level::SessionConfig::new("/Volumes/Studio FS", "StudioFS Native")
             .with_read_only(true)
             .with_run_in_foreground(true);
@@ -163,7 +163,8 @@ mod tests {
         assert!(config.run_in_foreground());
         assert!(args.iter().any(|arg| arg == "studiofs-macfuse"));
         assert!(!args.iter().any(|arg| arg == "-f"));
-        assert!(args.iter().any(|arg| arg == "-oro"));
+        assert!(!args.iter().any(|arg| arg == "-oro"));
+        assert!(!args.iter().any(|arg| arg == "ro"));
         assert!(!args.iter().any(|arg| arg.contains("StudioFS Native")));
     }
 
