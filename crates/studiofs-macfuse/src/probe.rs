@@ -167,21 +167,30 @@ impl ProbeReport {
             .map(|mode| mode.read_passes.len() as u32)
             .min()
             .unwrap_or(0);
-        let has_inconclusive_mode = modes.iter().any(|mode| {
-            mode.kernel_cache_interpretation == KernelCacheInterpretation::Inconclusive
-        });
-        let has_memory = modes.iter().any(|mode| mode.mode == ProbeMode::Memory);
-        let has_local_file = modes.iter().any(|mode| mode.mode == ProbeMode::LocalFile);
-        let go_no_go =
-            if min_read_passes < 3 || !has_memory || !has_local_file || has_inconclusive_mode {
-                GoNoGoGuidance::Inconclusive
-            } else if modes.iter().all(|mode| {
-                mode.kernel_cache_interpretation == KernelCacheInterpretation::KernelCacheHit
-            }) {
-                GoNoGoGuidance::Go
-            } else {
-                GoNoGoGuidance::NoGo
-            };
+        let mut memory_count = 0;
+        let mut local_file_count = 0;
+        let mut has_inconclusive_mode = false;
+        for mode in &modes {
+            match mode.mode {
+                ProbeMode::Memory => memory_count += 1,
+                ProbeMode::LocalFile => local_file_count += 1,
+            }
+            has_inconclusive_mode |=
+                mode.kernel_cache_interpretation == KernelCacheInterpretation::Inconclusive;
+        }
+        let go_no_go = if min_read_passes < 3
+            || memory_count != 1
+            || local_file_count != 1
+            || has_inconclusive_mode
+        {
+            GoNoGoGuidance::Inconclusive
+        } else if modes.iter().all(|mode| {
+            mode.kernel_cache_interpretation == KernelCacheInterpretation::KernelCacheHit
+        }) {
+            GoNoGoGuidance::Go
+        } else {
+            GoNoGoGuidance::NoGo
+        };
         let kernel_cache_summary = kernel_cache_summary(&modes);
 
         Self {
@@ -197,8 +206,9 @@ impl ProbeReport {
 pub fn summarize_mode(
     mode: ProbeMode,
     notify_store_supported: bool,
-    observations: Vec<ReadPassObservation>,
+    mut observations: Vec<ReadPassObservation>,
 ) -> ProbeModeReport {
+    observations.sort_by_key(|observation| observation.pass);
     let mut total_callback_count = 0;
     let mut total_callback_bytes = 0;
     let mut combined_distribution = BTreeMap::new();
@@ -393,6 +403,67 @@ mod tests {
         let report = ProbeReport::new(vec![cached_memory(), cached_memory()]);
 
         assert_eq!(report.go_no_go, GoNoGoGuidance::Inconclusive);
+    }
+
+    #[test]
+    fn probe_report_rejects_duplicate_mode_even_when_required_modes_exist() {
+        let cached_memory = summarize_mode(
+            ProbeMode::Memory,
+            false,
+            vec![
+                observation(1, 3, 3 * 1024 * 1024),
+                observation(2, 0, 0),
+                observation(3, 0, 0),
+            ],
+        );
+        let cached_local_file = summarize_mode(
+            ProbeMode::LocalFile,
+            false,
+            vec![
+                observation(1, 3, 3 * 1024 * 1024),
+                observation(2, 0, 0),
+                observation(3, 0, 0),
+            ],
+        );
+        let duplicate_memory = summarize_mode(
+            ProbeMode::Memory,
+            false,
+            vec![
+                observation(1, 3, 3 * 1024 * 1024),
+                observation(2, 0, 0),
+                observation(3, 0, 0),
+            ],
+        );
+
+        let report = ProbeReport::new(vec![cached_memory, cached_local_file, duplicate_memory]);
+
+        assert_eq!(report.go_no_go, GoNoGoGuidance::Inconclusive);
+    }
+
+    #[test]
+    fn summarize_mode_sorts_observations_by_pass_before_interpreting_cache() {
+        let report = summarize_mode(
+            ProbeMode::Memory,
+            false,
+            vec![
+                observation(2, 0, 0),
+                observation(3, 0, 0),
+                observation(1, 3, 3 * 1024 * 1024),
+            ],
+        );
+
+        assert_eq!(
+            report.kernel_cache_interpretation,
+            KernelCacheInterpretation::KernelCacheHit
+        );
+        assert_eq!(
+            report
+                .read_passes
+                .iter()
+                .map(|pass| pass.pass)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
     }
 
     #[test]
