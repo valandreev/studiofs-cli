@@ -4807,6 +4807,8 @@ dependencies = [
 name = "studiofs-macfuse"
 version = "0.1.1"
 dependencies = [
+ "serde",
+ "serde_json",
  "studiofs-vfs",
  "tokio",
 ]
