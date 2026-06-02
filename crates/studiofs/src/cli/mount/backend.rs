@@ -88,7 +88,7 @@ impl MountBackend for MacFuseMountBackend {
             launch.mount_point,
             launch.volume_name,
         )
-        .with_read_only(launch.read_only)
+        .with_read_only(true)
         .with_run_in_foreground(launch.run_in_foreground);
         studiofs_macfuse::mount_with_request(request)
     }
@@ -100,7 +100,7 @@ struct UnsupportedUnixMountBackend;
 #[cfg(all(unix, not(target_os = "linux")))]
 fn unsupported_unix_backend_error_message() -> &'static str {
     if cfg!(target_os = "macos") {
-        "StudioFS FUSE backend is Linux-only; set STUDIOFS_MOUNT_BACKEND=macfuse on macOS to try the native bridge stub; the rejected fuser notifier-store path is tracked by SFS-474"
+        "StudioFS FUSE backend is Linux-only; set STUDIOFS_MOUNT_BACKEND=macfuse on macOS to try the read-only native bridge MVP; the rejected fuser notifier-store path is tracked by SFS-474"
     } else {
         "StudioFS FUSE backend is Linux-only; macOS and Windows are supported via their respective native bridges"
     }
@@ -146,7 +146,7 @@ impl MountBackend for WinfspMountBackend {
 mod tests {
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_native_selector_routes_to_macfuse_stub() {
+    fn macos_native_selector_routes_to_macfuse_read_only_mvp() {
         let backend = super::mount_backend_for_selector(Some("macfuse"));
 
         assert_eq!(backend.name(), "macFUSE");
@@ -164,7 +164,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_unsupported_backend_error_mentions_native_stub_selector() {
+    fn macos_unsupported_backend_error_mentions_native_mvp_selector() {
         let message = super::unsupported_unix_backend_error_message();
 
         assert!(message.contains(super::MOUNT_BACKEND_ENV));

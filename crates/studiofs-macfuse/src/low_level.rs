@@ -12,7 +12,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 
-use libc::{off_t, size_t, stat};
+use libc::{off_t, size_t, stat, statvfs};
 use thiserror::Error;
 
 pub(crate) mod raw {
@@ -136,8 +136,14 @@ pub(crate) mod raw {
         pub fn fuse_reply_open(req: *mut FuseReq, fi: *const FuseFileInfo) -> c_int;
         /// Reply with a read or directory buffer.
         pub fn fuse_reply_buf(req: *mut FuseReq, buf: *const c_char, size: size_t) -> c_int;
+        /// Reply with a symlink target.
+        pub fn fuse_reply_readlink(req: *mut FuseReq, link: *const c_char) -> c_int;
         /// Reply with the number of written bytes.
         pub fn fuse_reply_write(req: *mut FuseReq, count: size_t) -> c_int;
+        /// Reply with filesystem statistics.
+        pub fn fuse_reply_statfs(req: *mut FuseReq, stat: *const statvfs) -> c_int;
+        /// Return session user data associated with a request.
+        pub fn fuse_req_userdata(req: *mut FuseReq) -> *mut c_void;
         /// Append or size a directory entry.
         pub fn fuse_add_direntry(
             req: *mut FuseReq,
@@ -164,6 +170,8 @@ pub(crate) mod raw {
         pub fn fuse_session_destroy(session: *mut FuseSession);
         /// Ask a session loop to exit.
         pub fn fuse_session_exit(session: *mut FuseSession);
+        /// Run a low-level session loop on the current thread.
+        pub fn fuse_session_loop(session: *mut FuseSession) -> c_int;
         /// Unmount a FUSE mount point and release its channel.
         pub fn fuse_unmount(mountpoint: *const c_char, channel: *mut FuseChan);
         /// Free arguments allocated by libfuse option parsing.
@@ -173,6 +181,7 @@ pub(crate) mod raw {
 
 unsafe extern "C" {
     fn studiofs_macfuse_empty_low_level_ops() -> *const raw::FuseLowLevelOps;
+    fn studiofs_macfuse_read_only_low_level_ops() -> *const raw::FuseLowLevelOps;
     fn studiofs_macfuse_low_level_ops_size() -> size_t;
     fn studiofs_macfuse_file_info_init(
         info: *mut raw::FuseFileInfo,
@@ -200,6 +209,19 @@ impl LowLevelOperations {
         unsafe {
             Self {
                 raw: studiofs_macfuse_empty_low_level_ops(),
+                size: studiofs_macfuse_low_level_ops_size(),
+            }
+        }
+    }
+
+    /// Read-only StudioVfs callback operation table.
+    pub fn read_only_studio_vfs() -> Self {
+        // SAFETY: The C shim returns a pointer to a static table and its exact
+        // header-derived size. Callback function pointers are Rust `extern "C"`
+        // functions with signatures matching the same macFUSE header.
+        unsafe {
+            Self {
+                raw: studiofs_macfuse_read_only_low_level_ops(),
                 size: studiofs_macfuse_low_level_ops_size(),
             }
         }
@@ -273,13 +295,12 @@ impl SessionConfig {
 
     /// Build owned argv strings for libfuse.
     pub fn argv_strings(&self) -> Vec<String> {
-        let mut args = vec!["studiofs-macfuse".to_owned()];
-        if self.read_only {
-            args.push("-oro".to_owned());
-        }
+        let args = vec!["studiofs-macfuse".to_owned()];
+        let _ = self.read_only;
         // `run_in_foreground` is runner policy. The macFUSE 2.x low-level
-        // session constructor rejects `-f`, so daemonization must stay outside
-        // the argument vector passed to `fuse_lowlevel_new`.
+        // session constructor rejects `-f`. macFUSE 5.2.0 also rejects `ro`
+        // for low-level sessions, so read-only behavior is enforced by the
+        // StudioFS callback adapter rather than a kernel mount option.
         args
     }
 
@@ -413,6 +434,18 @@ impl Session {
         // SAFETY: `self.raw` is owned by this wrapper and remains live until Drop.
         unsafe { raw::fuse_session_exit(self.raw.as_ptr()) };
     }
+
+    /// Run the low-level session loop on the current thread.
+    pub fn run(self) -> io::Result<()> {
+        // SAFETY: `self.raw` is a live session owned by this wrapper for the
+        // duration of the blocking loop call.
+        let result = unsafe { raw::fuse_session_loop(self.raw.as_ptr()) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(result.abs()))
+        }
+    }
 }
 
 impl Drop for Session {
@@ -496,6 +529,11 @@ impl OpenReply {
     pub fn with_keep_cache(mut self, keep_cache: bool) -> Self {
         self.keep_cache = keep_cache;
         self
+    }
+
+    /// File handle returned to macFUSE.
+    pub fn file_handle(self) -> u64 {
+        self.file_handle
     }
 }
 
@@ -605,6 +643,14 @@ impl Reply {
         })
     }
 
+    /// Reply with a symbolic link target.
+    pub fn readlink(mut self, target: &std::ffi::CStr) -> io::Result<()> {
+        let request = self.request.take_raw();
+        // SAFETY: `target` is NUL-terminated and valid for the duration of the
+        // call; macFUSE copies/sends it synchronously and `self` is consumed.
+        reply_result(unsafe { raw::fuse_reply_readlink(request.as_ptr(), target.as_ptr()) })
+    }
+
     /// Reply with a write byte count.
     pub fn write_count(mut self, count: usize) -> io::Result<()> {
         let request = self.request.take_raw();
@@ -615,6 +661,14 @@ impl Reply {
     /// Reply with owned directory entries.
     pub fn directory_entries(self, entries: &DirectoryEntryBuffer) -> io::Result<()> {
         self.read_buffer(entries.as_slice())
+    }
+
+    /// Reply with filesystem statistics.
+    pub fn statfs(mut self, stat: &statvfs) -> io::Result<()> {
+        let request = self.request.take_raw();
+        // SAFETY: `stat` is initialized and borrowed for the duration of the
+        // call; `self` consumes the single request reply.
+        reply_result(unsafe { raw::fuse_reply_statfs(request.as_ptr(), stat) })
     }
 }
 

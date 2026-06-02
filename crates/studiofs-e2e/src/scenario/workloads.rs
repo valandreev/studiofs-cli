@@ -238,6 +238,11 @@ pub(super) use faults::*;
 pub(super) use namespace_collision::*;
 pub use performance_probe::{MOUNTED_FUSE_WRITE_BASELINE, MOUNTED_PERFORMANCE_PROBE};
 pub(super) use performance_probe::{MountedFuseWriteBaseline, MountedPerformanceProbe};
+#[cfg(test)]
+pub(super) use performance_probe::{
+    PerformanceProbeConfig, PerformanceProbeConfigSummary, PerformanceProbeSeedMode,
+    push_read_only_bridge_mount_overrides,
+};
 pub(super) use smoke_outage::*;
 #[cfg(test)]
 pub(super) use test_fixtures::*;

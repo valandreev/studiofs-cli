@@ -19,6 +19,8 @@ pub mod probe;
 /// Isolated low-level macFUSE session and reply boundary.
 pub mod low_level;
 
+mod adapter;
+
 /// Request used by the CLI backend router to launch the macOS bridge.
 pub struct MacFuseMountRequest {
     vfs: Arc<StudioVfs>,
@@ -65,17 +67,38 @@ impl MacFuseMountRequest {
 /// Real macFUSE callbacks are tracked by the follow-up macOS bridge issues.
 pub fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()> {
     let MacFuseMountRequest {
-        vfs: _vfs,
-        runtime_handle: _runtime_handle,
-        mount_point: _mount_point,
-        volume_name: _volume_name,
-        read_only: _read_only,
-        run_in_foreground: _run_in_foreground,
+        vfs,
+        runtime_handle,
+        mount_point,
+        volume_name,
+        read_only,
+        run_in_foreground,
     } = request;
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "studiofs-macfuse is an opt-in stub; native macFUSE callbacks are tracked by SFS-479/SFS-480",
-    ))
+    if !read_only {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "studiofs-macfuse currently supports only explicit read-only mounts",
+        ));
+    }
+
+    let config = low_level::SessionConfig::new(mount_point, volume_name)
+        .with_read_only(true)
+        .with_run_in_foreground(run_in_foreground);
+    let mut callback_state = Box::new(adapter::CallbackState::new(vfs, runtime_handle));
+    let userdata =
+        (&mut *callback_state) as *mut adapter::CallbackState as *mut std::os::raw::c_void;
+    // SAFETY: `callback_state` remains boxed and live until after `session.run`
+    // returns. The read-only callback table handles this exact userdata type.
+    let session = unsafe {
+        low_level::Session::mount_with_ops(
+            &config,
+            low_level::LowLevelOperations::read_only_studio_vfs(),
+            userdata,
+        )
+    }?;
+    let result = session.run();
+    drop(callback_state);
+    result
 }
 
 #[cfg(test)]
@@ -125,7 +148,7 @@ mod tests {
     }
 
     #[test]
-    fn session_config_builds_owned_mount_arguments() {
+    fn session_config_builds_low_level_mount_arguments_without_kernel_read_only_option() {
         let config = super::low_level::SessionConfig::new("/Volumes/Studio FS", "StudioFS Native")
             .with_read_only(true)
             .with_run_in_foreground(true);
@@ -140,13 +163,22 @@ mod tests {
         assert!(config.run_in_foreground());
         assert!(args.iter().any(|arg| arg == "studiofs-macfuse"));
         assert!(!args.iter().any(|arg| arg == "-f"));
-        assert!(args.iter().any(|arg| arg == "-oro"));
+        assert!(!args.iter().any(|arg| arg == "-oro"));
+        assert!(!args.iter().any(|arg| arg == "ro"));
         assert!(!args.iter().any(|arg| arg.contains("StudioFS Native")));
     }
 
     #[test]
     fn empty_low_level_ops_come_from_c_header_layout() {
         let ops = super::low_level::LowLevelOperations::empty();
+
+        assert!(ops.size() > 0);
+        assert!(!ops.as_ptr().is_null());
+    }
+
+    #[test]
+    fn read_only_low_level_ops_come_from_c_header_layout() {
+        let ops = super::low_level::LowLevelOperations::read_only_studio_vfs();
 
         assert!(ops.size() > 0);
         assert!(!ops.as_ptr().is_null());
@@ -198,5 +230,239 @@ mod tests {
         session.request_exit();
         drop(session);
         std::fs::remove_dir(mount_point).expect("remove macFUSE smoke mount point");
+    }
+
+    #[test]
+    fn read_only_adapter_reads_existing_vfs_payload_and_records_diagnostics() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-read-only-adapter-read",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"hello.txt",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        fixture
+            .runtime()
+            .block_on(vfs.write(attr.ino, 0, b"hello from macFUSE"))
+            .expect("seed payload");
+        vfs.reset_diagnostics_observability();
+
+        let adapter = super::adapter::ReadOnlyStudioVfsAdapter::new(
+            vfs.clone(),
+            fixture.runtime().handle().clone(),
+        );
+        let opened = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open read-only");
+        let bytes = adapter
+            .read(attr.ino, opened.file_handle(), 6, 4)
+            .expect("read payload through adapter");
+        adapter
+            .release(attr.ino, opened.file_handle())
+            .expect("release read handle");
+
+        assert_eq!(&bytes[..], b"from");
+        let metrics = vfs.write_path_observability_snapshot();
+        assert_eq!(metrics.fuse_callbacks.read.calls, 1);
+        assert_eq!(metrics.fuse_callbacks.read.bytes, 4);
+        assert_eq!(metrics.fuse_callbacks.read.errors, 0);
+        assert_eq!(metrics.vfs_read_path.calls, 1);
+    }
+
+    #[test]
+    fn read_only_adapter_read_lets_vfs_handle_eof_without_pre_clamp_getattr() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-read-eof-no-preclamp")
+                .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"short.txt",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        fixture
+            .runtime()
+            .block_on(vfs.write(attr.ino, 0, b"short"))
+            .expect("seed payload");
+        let adapter = super::adapter::ReadOnlyStudioVfsAdapter::new(
+            vfs.clone(),
+            fixture.runtime().handle().clone(),
+        );
+        let opened = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open read-only");
+
+        let bytes = adapter
+            .read(attr.ino, opened.file_handle(), 1024, 4096)
+            .expect("read past EOF through adapter");
+
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn read_only_adapter_rejects_write_or_truncate_open_flags() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-read-only-adapter-open-flags",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"hello.txt",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        let adapter =
+            super::adapter::ReadOnlyStudioVfsAdapter::new(vfs, fixture.runtime().handle().clone());
+
+        assert_eq!(
+            adapter.open(attr.ino, libc::O_WRONLY).unwrap_err(),
+            libc::EROFS
+        );
+        assert_eq!(
+            adapter
+                .open(attr.ino, libc::O_RDONLY | libc::O_TRUNC)
+                .unwrap_err(),
+            libc::EROFS
+        );
+    }
+
+    #[test]
+    fn read_only_adapter_readdir_stops_successfully_when_reply_buffer_is_full() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-readdir-buffer-full")
+                .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let root = studiofs_vfs::contract_harness::CONTRACT_ROOT_INO;
+        vfs.create(root, b"alpha.txt", 501, 20, 0o644)
+            .expect("create first file");
+        vfs.create(root, b"beta.txt", 501, 20, 0o644)
+            .expect("create second file");
+        let adapter = super::adapter::ReadOnlyStudioVfsAdapter::new(
+            vfs.clone(),
+            fixture.runtime().handle().clone(),
+        );
+
+        let buffer = adapter
+            .readdir_for_test(root, 2, 32)
+            .expect("full readdir buffer should return a partial success");
+
+        assert!(!buffer.is_empty());
+    }
+
+    #[test]
+    fn read_only_adapter_readdir_reuses_cached_entries_for_chunked_offsets() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-readdir-entry-cache")
+                .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let root = studiofs_vfs::contract_harness::CONTRACT_ROOT_INO;
+        vfs.create(root, b"alpha.txt", 501, 20, 0o644)
+            .expect("create first file");
+        vfs.create(root, b"beta.txt", 501, 20, 0o644)
+            .expect("create second file");
+        let adapter = super::adapter::ReadOnlyStudioVfsAdapter::new(
+            vfs.clone(),
+            fixture.runtime().handle().clone(),
+        );
+
+        adapter
+            .readdir_for_test(root, 2, 32)
+            .expect("first readdir chunk");
+        adapter
+            .readdir_for_test(root, 3, 32)
+            .expect("second readdir chunk");
+
+        assert_eq!(adapter.readdir_cache_entry_count_for_test(), 1);
+    }
+
+    #[test]
+    fn read_only_adapter_readdir_prunes_expired_cache_entries_on_refresh() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-readdir-cache-prune")
+                .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let root = studiofs_vfs::contract_harness::CONTRACT_ROOT_INO;
+        vfs.create(root, b"alpha.txt", 501, 20, 0o644)
+            .expect("create first file");
+        let adapter = super::adapter::ReadOnlyStudioVfsAdapter::new(
+            vfs.clone(),
+            fixture.runtime().handle().clone(),
+        );
+        adapter.fill_expired_readdir_cache_entries_for_test();
+
+        adapter
+            .readdir_for_test(root, 2, 32)
+            .expect("refresh readdir cache");
+
+        assert_eq!(adapter.readdir_cache_entry_count_for_test(), 1);
+    }
+
+    #[test]
+    fn read_only_adapter_readdir_refresh_records_fresh_cache_timestamp() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-readdir-cache-fresh-timestamp",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let root = studiofs_vfs::contract_harness::CONTRACT_ROOT_INO;
+        vfs.create(root, b"alpha.txt", 501, 20, 0o644)
+            .expect("create first file");
+        let adapter = super::adapter::ReadOnlyStudioVfsAdapter::new(
+            vfs.clone(),
+            fixture.runtime().handle().clone(),
+        );
+        adapter
+            .readdir_for_test(root, 2, 32)
+            .expect("populate readdir cache");
+        let expired = std::time::Instant::now() - std::time::Duration::from_secs(30);
+        adapter.set_ready_readdir_cache_loaded_at_for_test(root, expired);
+
+        adapter
+            .readdir_for_test(root, 2, 32)
+            .expect("refresh expired readdir cache");
+
+        let refreshed = adapter
+            .readdir_cache_loaded_at_for_test(root)
+            .expect("ready readdir cache entry should exist");
+        assert!(refreshed > expired);
+    }
+
+    #[test]
+    fn read_only_adapter_reads_symlink_targets() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-read-only-adapter-readlink",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .symlink(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"link.txt",
+                b"target.txt",
+                501,
+                20,
+            )
+            .expect("create symlink");
+        let adapter =
+            super::adapter::ReadOnlyStudioVfsAdapter::new(vfs, fixture.runtime().handle().clone());
+
+        let target = adapter.readlink(attr.ino).expect("read symlink target");
+
+        assert_eq!(target, b"target.txt");
     }
 }

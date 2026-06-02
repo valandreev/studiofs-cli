@@ -3053,6 +3053,37 @@ fn registry_exposes_mounted_fuse_write_baseline_sfs469_scenario() {
 }
 
 #[test]
+fn performance_probe_seed_mode_summary_records_read_only_seeded_backend() {
+    let config = PerformanceProbeConfig {
+        file_bytes: 1024,
+        chunk_bytes: 256,
+        read_passes: 3,
+        sample_delay: Duration::from_millis(10),
+        wait_for_upload_drain: false,
+        upload_drain_timeout: Duration::from_secs(1),
+        upload_drain_poll: Duration::from_millis(25),
+        seed_mode: PerformanceProbeSeedMode::ReadOnlySeeded,
+    };
+
+    let summary = PerformanceProbeConfigSummary::from(config);
+
+    assert_eq!(summary.seed_mode, "read_only_seeded");
+}
+
+#[test]
+fn performance_probe_macos_read_only_mount_uses_macfuse_backend_override() {
+    let mut overrides = Vec::new();
+
+    push_read_only_bridge_mount_overrides(&mut overrides);
+
+    assert!(
+        overrides
+            .iter()
+            .any(|(key, value)| key == "STUDIOFS_MOUNT_BACKEND" && value == "macfuse")
+    );
+}
+
+#[test]
 fn crash_restart_recovery_runs_both_modes_reuses_client_root_and_converges() {
     let temp = tempdir().unwrap();
     let sandbox = temp.path().join("run-1");

@@ -19,7 +19,11 @@ serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 sha2 = "0.10"
+studiofs-data.workspace = true
+studiofs-meta.workspace = true
+studiofs-vfs.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 uuid.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 ctrlc = { version = "3", features = ["termination"] }
