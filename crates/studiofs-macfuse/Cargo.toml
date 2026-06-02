@@ -12,4 +12,5 @@ workspace = true
 serde.workspace = true
 serde_json.workspace = true
 studiofs-vfs.workspace = true
+thiserror.workspace = true
 tokio.workspace = true

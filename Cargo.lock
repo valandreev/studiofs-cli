@@ -4810,6 +4810,7 @@ dependencies = [
  "serde",
  "serde_json",
  "studiofs-vfs",
+ "thiserror 2.0.18",
  "tokio",
 ]
 

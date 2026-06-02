@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 /// Probe input mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,11 +50,13 @@ impl ProbeConfig {
 }
 
 /// Probe configuration validation error.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ProbeConfigError {
     /// Required probe mode is missing.
+    #[error("missing required probe mode: {0:?}")]
     MissingRequiredMode(ProbeMode),
     /// Repeated-read passes are below the SFS-479 minimum.
+    #[error("read passes ({actual}) below minimum required ({minimum})")]
     ReadPassesBelowMinimum {
         /// Configured pass count.
         actual: u32,
@@ -70,7 +73,7 @@ pub struct ReadPassObservation {
     /// Bytes delivered to the reader.
     pub bytes_read: u64,
     /// Elapsed wall-clock time in nanoseconds.
-    pub elapsed_ns: u128,
+    pub elapsed_ns: u64,
     /// Number of FUSE read callbacks that re-entered userspace.
     pub callback_count: u64,
     /// Bytes returned through FUSE read callbacks.
@@ -87,7 +90,7 @@ pub struct ProbeReadPassReport {
     /// Bytes delivered to the reader.
     pub bytes_read: u64,
     /// Elapsed wall-clock time in nanoseconds.
-    pub elapsed_ns: u128,
+    pub elapsed_ns: u64,
     /// Throughput in MiB/s.
     pub throughput_mib_s: f64,
     /// Number of FUSE read callbacks that re-entered userspace.
@@ -164,7 +167,10 @@ impl ProbeReport {
             .map(|mode| mode.read_passes.len() as u32)
             .min()
             .unwrap_or(0);
-        let go_no_go = if min_read_passes < 3 || modes.len() < 2 {
+        let has_inconclusive_mode = modes.iter().any(|mode| {
+            mode.kernel_cache_interpretation == KernelCacheInterpretation::Inconclusive
+        });
+        let go_no_go = if min_read_passes < 3 || modes.len() < 2 || has_inconclusive_mode {
             GoNoGoGuidance::Inconclusive
         } else if modes.iter().all(|mode| {
             mode.kernel_cache_interpretation == KernelCacheInterpretation::KernelCacheHit
@@ -226,30 +232,30 @@ pub fn summarize_mode(
 }
 
 fn kernel_cache_summary(modes: &[ProbeModeReport]) -> String {
-    modes
-        .iter()
-        .map(|mode| {
-            let mode_name = match mode.mode {
-                ProbeMode::Memory => "memory",
-                ProbeMode::LocalFile => "local-file",
-            };
-            match mode.kernel_cache_interpretation {
-                KernelCacheInterpretation::KernelCacheHit => {
-                    format!("{mode_name} repeated reads avoided userspace callbacks")
-                }
-                KernelCacheInterpretation::ReenteredUserspace => {
-                    format!("{mode_name} repeated reads re-entered userspace")
-                }
-                KernelCacheInterpretation::Inconclusive => {
-                    format!("{mode_name} repeated reads were inconclusive")
-                }
+    let mut summary = String::new();
+    for mode in modes {
+        if !summary.is_empty() {
+            summary.push_str("; ");
+        }
+        let mode_name = match mode.mode {
+            ProbeMode::Memory => "memory",
+            ProbeMode::LocalFile => "local-file",
+        };
+        let interpretation = match mode.kernel_cache_interpretation {
+            KernelCacheInterpretation::KernelCacheHit => {
+                "repeated reads avoided userspace callbacks"
             }
-        })
-        .collect::<Vec<_>>()
-        .join("; ")
+            KernelCacheInterpretation::ReenteredUserspace => "repeated reads re-entered userspace",
+            KernelCacheInterpretation::Inconclusive => "repeated reads were inconclusive",
+        };
+        summary.push_str(mode_name);
+        summary.push(' ');
+        summary.push_str(interpretation);
+    }
+    summary
 }
 
-fn throughput_mib_s(bytes_read: u64, elapsed_ns: u128) -> f64 {
+fn throughput_mib_s(bytes_read: u64, elapsed_ns: u64) -> f64 {
     if elapsed_ns == 0 {
         return 0.0;
     }
@@ -339,6 +345,46 @@ mod tests {
     }
 
     #[test]
+    fn probe_report_preserves_inconclusive_mode_in_go_no_go_guidance() {
+        let inconclusive_memory = summarize_mode(
+            ProbeMode::Memory,
+            false,
+            vec![
+                observation(1, 0, 0),
+                observation(2, 0, 0),
+                observation(3, 0, 0),
+            ],
+        );
+        let cached_local_file = summarize_mode(
+            ProbeMode::LocalFile,
+            false,
+            vec![
+                observation(1, 3, 3 * 1024 * 1024),
+                observation(2, 0, 0),
+                observation(3, 0, 0),
+            ],
+        );
+
+        let report = ProbeReport::new(vec![inconclusive_memory, cached_local_file]);
+
+        assert_eq!(report.go_no_go, GoNoGoGuidance::Inconclusive);
+    }
+
+    #[test]
+    fn probe_config_error_supports_standard_error_formatting() {
+        let error = ProbeConfigError::ReadPassesBelowMinimum {
+            actual: 2,
+            minimum: 3,
+        };
+
+        assert_standard_error(&error);
+        assert_eq!(
+            error.to_string(),
+            "read passes (2) below minimum required (3)"
+        );
+    }
+
+    #[test]
     fn probe_config_validates_required_modes_and_three_read_passes() {
         let config = ProbeConfig {
             file_bytes: 1024 * 1024,
@@ -370,6 +416,10 @@ mod tests {
                 minimum: 3
             }
         );
+    }
+
+    fn assert_standard_error(error: &dyn std::error::Error) {
+        assert!(error.source().is_none());
     }
 
     fn observation(pass: u32, callback_count: u64, callback_bytes: u64) -> ReadPassObservation {
