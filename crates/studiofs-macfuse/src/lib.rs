@@ -391,6 +391,28 @@ mod tests {
     }
 
     #[test]
+    fn read_only_adapter_readdir_prunes_expired_cache_entries_on_refresh() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-readdir-cache-prune")
+                .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let root = studiofs_vfs::contract_harness::CONTRACT_ROOT_INO;
+        vfs.create(root, b"alpha.txt", 501, 20, 0o644)
+            .expect("create first file");
+        let adapter = super::adapter::ReadOnlyStudioVfsAdapter::new(
+            vfs.clone(),
+            fixture.runtime().handle().clone(),
+        );
+        adapter.insert_expired_readdir_cache_entry_for_test(root + 1000);
+
+        adapter
+            .readdir_for_test(root, 2, 32)
+            .expect("refresh readdir cache");
+
+        assert_eq!(adapter.readdir_cache_entry_count_for_test(), 1);
+    }
+
+    #[test]
     fn read_only_adapter_reads_symlink_targets() {
         let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
             "macfuse-read-only-adapter-readlink",

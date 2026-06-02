@@ -230,6 +230,7 @@ impl ReadOnlyStudioVfsAdapter {
                 .map_err(|error| vfs_err_to_errno(&error))?,
         );
         let mut cache = self.readdir_cache.lock().map_err(|_| libc::EIO)?;
+        cache.retain(|_, entry| now.duration_since(entry.loaded_at) <= READDIR_CACHE_TTL);
         cache.insert(
             ino,
             ReaddirCacheEntry {
@@ -246,6 +247,20 @@ impl ReadOnlyStudioVfsAdapter {
             .lock()
             .expect("readdir cache lock should not be poisoned")
             .len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_expired_readdir_cache_entry_for_test(&self, ino: u64) {
+        self.readdir_cache
+            .lock()
+            .expect("readdir cache lock should not be poisoned")
+            .insert(
+                ino,
+                ReaddirCacheEntry {
+                    loaded_at: Instant::now() - READDIR_CACHE_TTL - Duration::from_secs(1),
+                    entries: Arc::new(Vec::new()),
+                },
+            );
     }
 }
 
