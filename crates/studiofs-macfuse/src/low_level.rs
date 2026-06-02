@@ -7,7 +7,8 @@
 use std::ffi::{CString, OsStr};
 use std::io;
 use std::marker::PhantomData;
-use std::os::raw::{c_char, c_double, c_int, c_uint, c_ulong, c_void};
+use std::mem::MaybeUninit;
+use std::os::raw::{c_char, c_double, c_int, c_ulong, c_void};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
@@ -66,7 +67,7 @@ pub(crate) mod raw {
         pub fh_old: c_ulong,
         /// Writepage marker.
         pub writepage: c_int,
-        bitfield: c_uint,
+        bitfield: c_int,
         /// File handle.
         pub fh: u64,
         /// Lock owner.
@@ -77,58 +78,48 @@ pub(crate) mod raw {
         /// Construct test-only callback data with the fields used by wrappers.
         #[cfg(test)]
         pub fn for_test(flags: c_int, fh: u64, direct_io: bool, keep_cache: bool) -> Self {
-            let mut bitfield = 0;
-            if direct_io {
-                bitfield |= 1;
-            }
-            if keep_cache {
-                bitfield |= 1 << 1;
-            }
-            Self {
-                flags,
-                fh_old: 0,
-                writepage: 0,
-                bitfield,
-                fh,
-                lock_owner: 0,
-            }
+            Self::from_fields(flags, fh, direct_io, keep_cache)
         }
 
         /// Mutate test-only cache flag bits.
         #[cfg(test)]
         pub fn set_cache_flags_for_test(&mut self, direct_io: bool, keep_cache: bool) {
-            self.bitfield = 0;
-            if direct_io {
-                self.bitfield |= 1;
-            }
-            if keep_cache {
-                self.bitfield |= 1 << 1;
-            }
+            *self = Self::from_fields(self.flags, self.fh, direct_io, keep_cache);
         }
 
         pub(super) fn direct_io(self) -> bool {
-            self.bitfield & 1 != 0
+            // SAFETY: `self` is an initialized C-compatible `fuse_file_info`.
+            unsafe { super::studiofs_macfuse_file_info_direct_io(&self) != 0 }
         }
 
         pub(super) fn keep_cache(self) -> bool {
-            self.bitfield & (1 << 1) != 0
+            // SAFETY: `self` is an initialized C-compatible `fuse_file_info`.
+            unsafe { super::studiofs_macfuse_file_info_keep_cache(&self) != 0 }
         }
 
         pub(super) fn from_open_reply(reply: OpenReply) -> Self {
-            let mut bitfield = 0;
-            if reply.direct_io {
-                bitfield |= 1;
-            }
-            if reply.keep_cache {
-                bitfield |= 1 << 1;
-            }
-            Self {
-                flags: reply.flags,
-                fh_old: 0,
-                writepage: 0,
-                bitfield,
-                fh: reply.file_handle,
-                lock_owner: 0,
+            Self::from_fields(
+                reply.flags,
+                reply.file_handle,
+                reply.direct_io,
+                reply.keep_cache,
+            )
+        }
+
+        fn from_fields(flags: c_int, file_handle: u64, direct_io: bool, keep_cache: bool) -> Self {
+            let mut info = MaybeUninit::<Self>::uninit();
+            // SAFETY: The C shim initializes the entire `fuse_file_info`,
+            // including implementation-defined bitfields, using the same
+            // headers/compiler as libfuse.
+            unsafe {
+                super::studiofs_macfuse_file_info_init(
+                    info.as_mut_ptr(),
+                    flags,
+                    file_handle,
+                    c_int::from(direct_io),
+                    c_int::from(keep_cache),
+                );
+                info.assume_init()
             }
         }
     }
@@ -189,6 +180,15 @@ pub(crate) mod raw {
 unsafe extern "C" {
     fn studiofs_macfuse_empty_low_level_ops() -> *const raw::FuseLowLevelOps;
     fn studiofs_macfuse_low_level_ops_size() -> size_t;
+    fn studiofs_macfuse_file_info_init(
+        info: *mut raw::FuseFileInfo,
+        flags: c_int,
+        file_handle: u64,
+        direct_io: c_int,
+        keep_cache: c_int,
+    );
+    fn studiofs_macfuse_file_info_direct_io(info: *const raw::FuseFileInfo) -> c_int;
+    fn studiofs_macfuse_file_info_keep_cache(info: *const raw::FuseFileInfo) -> c_int;
 }
 
 /// Low-level callback operation table provided by macFUSE headers.
@@ -359,6 +359,14 @@ pub struct Session {
     mount_point: CString,
 }
 
+// SAFETY: macFUSE session handles support cross-thread exit signaling, and this
+// wrapper only exposes shared access for `request_exit`. Teardown still requires
+// owning `Session`, so `Drop` cannot race active shared borrows in safe Rust.
+unsafe impl Send for Session {}
+// SAFETY: See the `Send` impl above; shared references expose only
+// `fuse_session_exit`, which is the intended cross-thread wakeup path.
+unsafe impl Sync for Session {}
+
 impl Session {
     /// Create and mount a low-level macFUSE session.
     ///
@@ -519,11 +527,17 @@ impl Request {
     }
 
     fn as_ptr(&self) -> *mut raw::FuseReq {
-        self.raw.expect("macFUSE request already replied").as_ptr()
+        match self.raw {
+            Some(raw) => raw.as_ptr(),
+            None => unreachable!("type-state invariant: macFUSE request was already replied"),
+        }
     }
 
     fn take_raw(&mut self) -> NonNull<raw::FuseReq> {
-        self.raw.take().expect("macFUSE request already replied")
+        match self.raw.take() {
+            Some(raw) => raw,
+            None => unreachable!("type-state invariant: macFUSE request was already replied"),
+        }
     }
 }
 
@@ -638,6 +652,7 @@ impl Entry {
 /// Owned readdir reply buffer.
 pub struct DirectoryEntryBuffer {
     bytes: Vec<u8>,
+    scratch_name: Vec<u8>,
     capacity: usize,
 }
 
@@ -646,6 +661,7 @@ impl DirectoryEntryBuffer {
     pub fn new(capacity: usize) -> Self {
         Self {
             bytes: Vec::with_capacity(capacity),
+            scratch_name: Vec::new(),
             capacity,
         }
     }
@@ -673,16 +689,23 @@ impl DirectoryEntryBuffer {
         attr: &stat,
         next_offset: off_t,
     ) -> Result<(), DirectoryEntryError> {
-        let name = CString::new(name.as_bytes()).map_err(|_| DirectoryEntryError::InteriorNul)?;
+        let name_bytes = name.as_bytes();
+        if name_bytes.contains(&0) {
+            return Err(DirectoryEntryError::InteriorNul);
+        }
+        self.scratch_name.clear();
+        self.scratch_name.extend_from_slice(name_bytes);
+        self.scratch_name.push(0);
         let available = self.capacity.saturating_sub(self.bytes.len());
         // SAFETY: Passing a null buffer with zero size asks macFUSE for the
-        // required entry size. `name` and `attr` remain valid for the call.
+        // required entry size. `scratch_name` and `attr` remain valid for the
+        // call.
         let required = unsafe {
             raw::fuse_add_direntry(
                 request.as_ptr(),
                 std::ptr::null_mut(),
                 0,
-                name.as_ptr(),
+                self.scratch_name.as_ptr().cast::<c_char>(),
                 attr,
                 next_offset,
             )
@@ -695,18 +718,20 @@ impl DirectoryEntryBuffer {
         }
 
         let start = self.bytes.len();
-        self.bytes.resize(start + required, 0);
-        // SAFETY: The resized vector exposes `required` initialized bytes at
-        // `start`, and macFUSE writes at most the provided remaining capacity.
+        self.bytes.reserve(required);
+        // SAFETY: `reserve` ensures enough spare capacity for `required` bytes.
+        // `fuse_add_direntry` writes at most the provided buffer length, after
+        // which `set_len` marks the initialized bytes.
         unsafe {
             raw::fuse_add_direntry(
                 request.as_ptr(),
-                self.bytes[start..].as_mut_ptr().cast::<c_char>(),
+                self.bytes.as_mut_ptr().add(start).cast::<c_char>(),
                 required,
-                name.as_ptr(),
+                self.scratch_name.as_ptr().cast::<c_char>(),
                 attr,
                 next_offset,
             );
+            self.bytes.set_len(start + required);
         }
         Ok(())
     }

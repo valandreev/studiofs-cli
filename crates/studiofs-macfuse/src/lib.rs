@@ -153,6 +153,13 @@ mod tests {
     }
 
     #[test]
+    fn low_level_session_can_be_signaled_across_threads() {
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send_sync::<super::low_level::Session>();
+    }
+
+    #[test]
     fn low_level_session_mount_unmount_smoke_is_gated() {
         if std::env::var("STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS").as_deref() != Ok("1") {
             return;
