@@ -47,21 +47,6 @@ impl MountedFuseMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MountedScenarioPlatform {
-    AnyUnix,
-    Linux,
-}
-
-impl MountedScenarioPlatform {
-    fn matches_current(self) -> bool {
-        match self {
-            Self::AnyUnix => true,
-            Self::Linux => true,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MountedScenarioOperation {
     SequentialWriteReadback,
     WriteFlushReadback,
@@ -77,7 +62,6 @@ enum MountedScenarioOperation {
 struct MountedAsyncScenario {
     name: &'static str,
     mode: MountedFuseMode,
-    platform: MountedScenarioPlatform,
     operation: MountedScenarioOperation,
 }
 
@@ -92,7 +76,6 @@ macro_rules! declare_mounted_scenarios {
             $test_name:ident => {
                 name: $name:literal,
                 mode: $mode:expr,
-                platform: $platform:expr,
                 operation: $operation:expr
             }
         ),+ $(,)?
@@ -103,7 +86,6 @@ macro_rules! declare_mounted_scenarios {
                     MountedAsyncScenario {
                         name: $name,
                         mode: $mode,
-                        platform: $platform,
                         operation: $operation,
                     },
                 )+
@@ -117,7 +99,6 @@ macro_rules! declare_mounted_scenarios {
                 run_mounted_scenario(MountedAsyncScenario {
                     name: $name,
                     mode: $mode,
-                    platform: $platform,
                     operation: $operation,
                 });
             }
@@ -129,67 +110,56 @@ declare_mounted_scenarios! {
     async_mounted_sequential_write_readback => {
         name: "sequential-write-readback",
         mode: MountedFuseMode::AsyncWrite,
-        platform: MountedScenarioPlatform::AnyUnix,
         operation: MountedScenarioOperation::SequentialWriteReadback
     },
     async_mounted_write_flush_readback => {
         name: "write-flush-readback",
         mode: MountedFuseMode::AsyncWrite,
-        platform: MountedScenarioPlatform::AnyUnix,
         operation: MountedScenarioOperation::WriteFlushReadback
     },
     async_mounted_write_fsync_readback => {
         name: "write-fsync-readback",
         mode: MountedFuseMode::AsyncWrite,
-        platform: MountedScenarioPlatform::AnyUnix,
         operation: MountedScenarioOperation::WriteFsyncReadback
     },
     async_mounted_close_reopen_readback => {
         name: "close-reopen-readback",
         mode: MountedFuseMode::AsyncWrite,
-        platform: MountedScenarioPlatform::AnyUnix,
         operation: MountedScenarioOperation::CloseReopenReadback
     },
     async_mounted_multiple_writers => {
         name: "multiple-writers",
         mode: MountedFuseMode::AsyncWrite,
-        platform: MountedScenarioPlatform::AnyUnix,
         operation: MountedScenarioOperation::MultipleWriters
     },
     async_mounted_same_handle_appends => {
         name: "same-handle-appends",
         mode: MountedFuseMode::AsyncWrite,
-        platform: MountedScenarioPlatform::AnyUnix,
         operation: MountedScenarioOperation::SameHandleAppends
     },
     async_mounted_unmount_after_async_write => {
         name: "unmount-after-async-write",
         mode: MountedFuseMode::AsyncWrite,
-        platform: MountedScenarioPlatform::AnyUnix,
         operation: MountedScenarioOperation::WriteOnlyUntilUnmount
     },
     linux_async_mounted_default_sync => {
         name: "linux-default-sync",
         mode: MountedFuseMode::Sync,
-        platform: MountedScenarioPlatform::Linux,
         operation: MountedScenarioOperation::SequentialWriteReadback
     },
     linux_async_mounted_async_opt_in => {
         name: "linux-async-opt-in",
         mode: MountedFuseMode::AsyncWrite,
-        platform: MountedScenarioPlatform::Linux,
         operation: MountedScenarioOperation::SequentialWriteReadback
     },
     linux_async_mounted_async_dio_opt_in => {
         name: "linux-async-dio-opt-in",
         mode: MountedFuseMode::AsyncWriteDio,
-        platform: MountedScenarioPlatform::Linux,
         operation: MountedScenarioOperation::SequentialWriteReadback
     },
     linux_async_mounted_fio_multi_job => {
         name: "linux-fio-multi-job",
         mode: MountedFuseMode::AsyncWrite,
-        platform: MountedScenarioPlatform::Linux,
         operation: MountedScenarioOperation::FioMultiJob
     },
 }
@@ -839,13 +809,6 @@ fn with_mounted_fuse(
 }
 
 fn run_mounted_scenario(scenario: MountedAsyncScenario) {
-    if !scenario.platform.matches_current() {
-        eprintln!(
-            "skipping {} on this platform; scenario target is {:?}",
-            scenario.name, scenario.platform
-        );
-        return;
-    }
     with_mounted_fuse(scenario.mode, scenario.name, |mount_path| {
         run_mounted_operation(mount_path, scenario.operation)
     });
