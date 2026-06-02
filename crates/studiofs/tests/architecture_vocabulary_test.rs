@@ -1044,6 +1044,41 @@ fn linux_async_fuse_benchmark_report_covers_sfs473_decision() {
 }
 
 #[test]
+fn macos_native_bridge_split_note_covers_sfs475_boundary() {
+    let doc = read_workspace_file("docs/macos-native-bridge-split.md");
+    let normalized_doc = normalize_doc_whitespace(&doc);
+    let required_terms = [
+        "SFS-475",
+        "https://linear.app/valandreev/issue/SFS-475/define-macos-native-bridge-split-from-main",
+        "SFS-474",
+        "https://linear.app/valandreev/issue/SFS-474/probe-fuser-notifierstore-for-macos-repeated-read-cache-behavior",
+        "fuser::Notifier::store",
+        "EINVAL",
+        "did not produce macOS kernel-cache hits",
+        "studiofs-fuse becomes Linux-only",
+        "studiofs-macfuse",
+        "pub async fn mount_and_serve",
+        "StudioVfs",
+        "CLI/backend routing",
+        "fallback behavior",
+        "validation sequence",
+        "first implementation issues",
+    ];
+
+    let missing: Vec<_> = required_terms
+        .iter()
+        .copied()
+        .filter(|term| !contains_doc_term(&doc, &normalized_doc, term))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "SFS-475 macOS native bridge split note is missing required surfaces:\n{}",
+        missing.join("\n")
+    );
+}
+
+#[test]
 fn deterministic_simulation_architecture_covers_required_sfs330_surfaces() {
     let doc = read_workspace_file("docs/deterministic-simulation-architecture.md");
     let required_terms = [
