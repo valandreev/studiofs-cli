@@ -52,6 +52,9 @@ fs2 = "0.4"
 [target.'cfg(target_os = "linux")'.dependencies]
 studiofs-fuse.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+studiofs-macfuse.workspace = true
+
 [target.'cfg(unix)'.dependencies]
 pyroscope = { version = "2", default-features = false, features = ["backend-jemalloc", "backend-pprof-rs"] }
 

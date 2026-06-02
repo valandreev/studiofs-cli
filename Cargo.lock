@@ -4696,6 +4696,7 @@ dependencies = [
  "studiofs-cache",
  "studiofs-data",
  "studiofs-fuse",
+ "studiofs-macfuse",
  "studiofs-meta",
  "studiofs-vfs",
  "studiofs-winfsp",
@@ -4800,6 +4801,14 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "studiofs-macfuse"
+version = "0.1.1"
+dependencies = [
+ "studiofs-vfs",
+ "tokio",
 ]
 
 [[package]]
