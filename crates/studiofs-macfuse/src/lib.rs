@@ -87,9 +87,10 @@ pub fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()> {
     let mut callback_state = Box::new(adapter::CallbackState::new(vfs, runtime_handle));
     let userdata =
         (&mut *callback_state) as *mut adapter::CallbackState as *mut std::os::raw::c_void;
-    // SAFETY: `callback_state` remains boxed and live until after `session.run`
-    // returns. The read-only callback table handles this exact userdata type.
-    let session = unsafe {
+    // SAFETY: `callback_state` remains boxed and live until after the mounted
+    // session is dropped. The read-only callback table handles this exact
+    // userdata type.
+    let mut session = unsafe {
         low_level::Session::mount_with_ops(
             &config,
             low_level::LowLevelOperations::read_only_studio_vfs(),
@@ -97,6 +98,7 @@ pub fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()> {
         )
     }?;
     let result = session.run();
+    drop(session);
     drop(callback_state);
     result
 }
@@ -410,6 +412,38 @@ mod tests {
             .expect("refresh readdir cache");
 
         assert_eq!(adapter.readdir_cache_entry_count_for_test(), 1);
+    }
+
+    #[test]
+    fn read_only_adapter_readdir_rate_limits_fresh_cache_pruning() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-readdir-cache-prune-rate-limit",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let root = studiofs_vfs::contract_harness::CONTRACT_ROOT_INO;
+        let first_dir = vfs
+            .mkdir(root, b"first", 501, 20, 0o755)
+            .expect("create first directory");
+        let second_dir = vfs
+            .mkdir(root, b"second", 501, 20, 0o755)
+            .expect("create second directory");
+        let adapter = super::adapter::ReadOnlyStudioVfsAdapter::new(
+            vfs.clone(),
+            fixture.runtime().handle().clone(),
+        );
+        adapter.fill_fresh_readdir_cache_entries_for_test();
+
+        adapter
+            .readdir_for_test(first_dir.ino, 2, 32)
+            .expect("populate first readdir cache");
+        let first_miss_count = adapter.readdir_cache_entry_count_for_test();
+        adapter
+            .readdir_for_test(second_dir.ino, 2, 32)
+            .expect("populate second missing readdir cache");
+
+        assert_eq!(first_miss_count, 1025);
+        assert_eq!(adapter.readdir_cache_entry_count_for_test(), 1026);
     }
 
     #[test]

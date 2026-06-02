@@ -188,6 +188,35 @@ fn mount_env_overrides_are_scoped_to_the_named_client() {
 }
 
 #[test]
+fn mount_arg_overrides_are_scoped_to_the_named_client() {
+    let temp = tempdir().unwrap();
+    let executor = RecordingExecutor::new();
+    let calls = Rc::clone(&executor.calls);
+    let mut controller = MultiClientController::new(test_config(temp.path()), executor);
+
+    controller.create_clients(["client-a", "client-b"]).unwrap();
+    controller.init_first_client().unwrap();
+    controller.discover_additional_clients().unwrap();
+    controller
+        .set_client_mount_arg_overrides("client-b", ["--read-only"])
+        .unwrap();
+    controller.mount_all().unwrap();
+
+    let calls = calls.borrow();
+    let mount_a = calls
+        .iter()
+        .find(|call| call.action == "mount" && call.client == "client-a")
+        .unwrap();
+    let mount_b = calls
+        .iter()
+        .find(|call| call.action == "mount" && call.client == "client-b")
+        .unwrap();
+
+    assert!(!mount_a.args.iter().any(|arg| arg == "--read-only"));
+    assert!(mount_b.args.iter().any(|arg| arg == "--read-only"));
+}
+
+#[test]
 fn mount_metadata_records_process_id_after_successful_mount() {
     let temp = tempdir().unwrap();
     let executor = RecordingExecutor::new();
@@ -1047,6 +1076,7 @@ fn test_config(root: &Path) -> ClientControllerConfig {
         poll_interval: Duration::from_millis(20),
         mount_points: Vec::new(),
         client_env_overrides: std::collections::BTreeMap::new(),
+        mount_arg_overrides: std::collections::BTreeMap::new(),
     }
 }
 

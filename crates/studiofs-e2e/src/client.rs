@@ -58,6 +58,8 @@ pub struct ClientControllerConfig {
     pub mount_points: Vec<PathBuf>,
     /// Per-client environment variable overrides.
     pub client_env_overrides: BTreeMap<String, Vec<(String, String)>>,
+    /// Per-client extra arguments appended to `studiofs mount`.
+    pub mount_arg_overrides: BTreeMap<String, Vec<String>>,
 }
 
 impl ClientControllerConfig {
@@ -125,6 +127,7 @@ impl ClientControllerConfig {
             poll_interval: Duration::from_millis(100),
             mount_points: Vec::new(),
             client_env_overrides: BTreeMap::new(),
+            mount_arg_overrides: BTreeMap::new(),
         })
     }
 
@@ -174,6 +177,7 @@ impl ClientControllerConfig {
             poll_interval: Duration::from_millis(100),
             mount_points: Vec::new(),
             client_env_overrides: BTreeMap::new(),
+            mount_arg_overrides: BTreeMap::new(),
         })
     }
 }
@@ -735,6 +739,24 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         Ok(())
     }
 
+    /// Sets extra `studiofs mount` arguments for a named client.
+    pub fn set_client_mount_arg_overrides<I, V>(
+        &mut self,
+        client: &str,
+        overrides: I,
+    ) -> Result<(), ClientControllerError>
+    where
+        I: IntoIterator<Item = V>,
+        V: Into<String>,
+    {
+        self.client_index(client)?;
+        let overrides = overrides.into_iter().map(Into::into).collect::<Vec<_>>();
+        self.config
+            .mount_arg_overrides
+            .insert(client.to_string(), overrides);
+        Ok(())
+    }
+
     /// Initializes the first client (`client-0`) and marks it as initialized.
     pub fn init_first_client(&mut self) -> Result<(), ClientControllerError> {
         if self.clients.is_empty() {
@@ -1247,7 +1269,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
 
     fn mount_command(&self, index: usize) -> Result<ClientCommand, ClientControllerError> {
         let client = self.client(index)?;
-        let args = vec![
+        let mut args = vec![
             "mount".to_string(),
             client.volume_name.clone(),
             client.mount_point.display().to_string(),
@@ -1255,6 +1277,9 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
             client.cache_dir.display().to_string(),
             "--foreground".to_string(),
         ];
+        if let Some(overrides) = self.config.mount_arg_overrides.get(client.name.as_str()) {
+            args.extend(overrides.iter().cloned());
+        }
         self.command(index, "mount", args)
     }
 

@@ -20,6 +20,7 @@ const TTL_SECONDS: f64 = 1.0;
 const MACFUSE_ATTR_BLOCK_SIZE: u32 = 512;
 const READDIR_CACHE_TTL: Duration = Duration::from_secs(1);
 const READDIR_CACHE_PRUNE_THRESHOLD: usize = 1024;
+const READDIR_CACHE_PRUNE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Read-only operation adapter shared by macFUSE callbacks and fast tests.
 pub(crate) struct ReadOnlyStudioVfsAdapter {
@@ -28,6 +29,7 @@ pub(crate) struct ReadOnlyStudioVfsAdapter {
     mount_uid: u32,
     mount_gid: u32,
     readdir_cache: Mutex<HashMap<u64, ReaddirCacheEntry>>,
+    readdir_cache_last_pruned: Mutex<Option<Instant>>,
     readdir_cache_ready: Condvar,
 }
 
@@ -40,6 +42,7 @@ impl ReadOnlyStudioVfsAdapter {
             mount_uid: current_uid(),
             mount_gid: current_gid(),
             readdir_cache: Mutex::new(HashMap::new()),
+            readdir_cache_last_pruned: Mutex::new(None),
             readdir_cache_ready: Condvar::new(),
         }
     }
@@ -219,7 +222,7 @@ impl ReadOnlyStudioVfsAdapter {
             let now = Instant::now();
             match cache.get(&ino) {
                 Some(ReaddirCacheEntry::Ready { loaded_at, entries })
-                    if now.duration_since(*loaded_at) <= READDIR_CACHE_TTL =>
+                    if now.saturating_duration_since(*loaded_at) <= READDIR_CACHE_TTL =>
                 {
                     return Ok(Arc::clone(entries));
                 }
@@ -230,10 +233,12 @@ impl ReadOnlyStudioVfsAdapter {
                         .map_err(|_| libc::EIO)?;
                 }
                 _ => {
-                    if cache.len() >= READDIR_CACHE_PRUNE_THRESHOLD {
+                    if cache.len() >= READDIR_CACHE_PRUNE_THRESHOLD
+                        && self.should_prune_readdir_cache(now)?
+                    {
                         cache.retain(|_, entry| match entry {
                             ReaddirCacheEntry::Ready { loaded_at, .. } => {
-                                now.duration_since(*loaded_at) <= READDIR_CACHE_TTL
+                                now.saturating_duration_since(*loaded_at) <= READDIR_CACHE_TTL
                             }
                             ReaddirCacheEntry::Loading => true,
                         });
@@ -271,6 +276,20 @@ impl ReadOnlyStudioVfsAdapter {
         }
     }
 
+    fn should_prune_readdir_cache(&self, now: Instant) -> Result<bool, i32> {
+        let mut last_pruned = self
+            .readdir_cache_last_pruned
+            .lock()
+            .map_err(|_| libc::EIO)?;
+        if last_pruned
+            .is_some_and(|last| now.saturating_duration_since(last) < READDIR_CACHE_PRUNE_INTERVAL)
+        {
+            return Ok(false);
+        }
+        *last_pruned = Some(now);
+        Ok(true)
+    }
+
     #[cfg(test)]
     pub(crate) fn readdir_cache_entry_count_for_test(&self) -> usize {
         self.readdir_cache
@@ -287,6 +306,24 @@ impl ReadOnlyStudioVfsAdapter {
             .expect("readdir cache lock should not be poisoned");
         let loaded_at = Instant::now() - READDIR_CACHE_TTL - Duration::from_secs(1);
         for ino in 10_000..(10_000 + READDIR_CACHE_PRUNE_THRESHOLD as u64) {
+            cache.insert(
+                ino,
+                ReaddirCacheEntry::Ready {
+                    loaded_at,
+                    entries: Arc::new(Vec::new()),
+                },
+            );
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fill_fresh_readdir_cache_entries_for_test(&self) {
+        let mut cache = self
+            .readdir_cache
+            .lock()
+            .expect("readdir cache lock should not be poisoned");
+        let loaded_at = Instant::now();
+        for ino in 20_000..(20_000 + READDIR_CACHE_PRUNE_THRESHOLD as u64) {
             cache.insert(
                 ino,
                 ReaddirCacheEntry::Ready {

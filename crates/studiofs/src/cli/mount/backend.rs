@@ -88,7 +88,7 @@ impl MountBackend for MacFuseMountBackend {
             launch.mount_point,
             launch.volume_name,
         )
-        .with_read_only(true)
+        .with_read_only(launch.read_only)
         .with_run_in_foreground(launch.run_in_foreground);
         studiofs_macfuse::mount_with_request(request)
     }

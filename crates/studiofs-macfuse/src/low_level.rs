@@ -436,7 +436,7 @@ impl Session {
     }
 
     /// Run the low-level session loop on the current thread.
-    pub fn run(self) -> io::Result<()> {
+    pub fn run(&mut self) -> io::Result<()> {
         // SAFETY: `self.raw` is a live session owned by this wrapper for the
         // duration of the blocking loop call.
         let result = unsafe { raw::fuse_session_loop(self.raw.as_ptr()) };
