@@ -277,6 +277,40 @@ mod tests {
     }
 
     #[test]
+    fn read_only_adapter_read_lets_vfs_handle_eof_without_pre_clamp_getattr() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-read-eof-no-preclamp")
+                .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"short.txt",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        fixture
+            .runtime()
+            .block_on(vfs.write(attr.ino, 0, b"short"))
+            .expect("seed payload");
+        let adapter = super::adapter::ReadOnlyStudioVfsAdapter::new(
+            vfs.clone(),
+            fixture.runtime().handle().clone(),
+        );
+        let opened = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open read-only");
+
+        let bytes = adapter
+            .read(attr.ino, opened.file_handle(), 1024, 4096)
+            .expect("read past EOF through adapter");
+
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
     fn read_only_adapter_rejects_write_or_truncate_open_flags() {
         let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
             "macfuse-read-only-adapter-open-flags",
@@ -328,6 +362,32 @@ mod tests {
             .expect("full readdir buffer should return a partial success");
 
         assert!(!buffer.is_empty());
+    }
+
+    #[test]
+    fn read_only_adapter_readdir_reuses_cached_entries_for_chunked_offsets() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-readdir-entry-cache")
+                .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let root = studiofs_vfs::contract_harness::CONTRACT_ROOT_INO;
+        vfs.create(root, b"alpha.txt", 501, 20, 0o644)
+            .expect("create first file");
+        vfs.create(root, b"beta.txt", 501, 20, 0o644)
+            .expect("create second file");
+        let adapter = super::adapter::ReadOnlyStudioVfsAdapter::new(
+            vfs.clone(),
+            fixture.runtime().handle().clone(),
+        );
+
+        adapter
+            .readdir_for_test(root, 2, 32)
+            .expect("first readdir chunk");
+        adapter
+            .readdir_for_test(root, 3, 32)
+            .expect("second readdir chunk");
+
+        assert_eq!(adapter.readdir_cache_entry_count_for_test(), 1);
     }
 
     #[test]

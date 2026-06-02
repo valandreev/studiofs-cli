@@ -1,9 +1,10 @@
+use std::collections::HashMap;
 use std::ffi::{CStr, CString, OsStr};
 use std::mem::MaybeUninit;
 use std::os::raw::c_char;
 use std::os::unix::ffi::OsStrExt;
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use libc::{off_t, size_t, stat, statvfs};
 use studiofs_bridge::posix::{
@@ -17,6 +18,7 @@ use crate::low_level::{DirectoryEntryBuffer, Entry, OpenReply, Reply, Request, r
 
 const TTL_SECONDS: f64 = 1.0;
 const MACFUSE_ATTR_BLOCK_SIZE: u32 = 512;
+const READDIR_CACHE_TTL: Duration = Duration::from_secs(1);
 
 /// Read-only operation adapter shared by macFUSE callbacks and fast tests.
 pub(crate) struct ReadOnlyStudioVfsAdapter {
@@ -24,6 +26,7 @@ pub(crate) struct ReadOnlyStudioVfsAdapter {
     runtime_handle: Handle,
     mount_uid: u32,
     mount_gid: u32,
+    readdir_cache: Mutex<HashMap<u64, ReaddirCacheEntry>>,
 }
 
 impl ReadOnlyStudioVfsAdapter {
@@ -34,6 +37,7 @@ impl ReadOnlyStudioVfsAdapter {
             runtime_handle,
             mount_uid: current_uid(),
             mount_gid: current_gid(),
+            readdir_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -73,23 +77,18 @@ impl ReadOnlyStudioVfsAdapter {
         size: u32,
     ) -> Result<Vec<u8>, i32> {
         let offset = u64::try_from(offset).map_err(|_| libc::EINVAL)?;
-        let attr = self
-            .vfs
-            .getattr(ino)
-            .map_err(|error| vfs_err_to_errno(&error))?;
-        let clamped_size = attr.size.saturating_sub(offset).min(u64::from(size));
-        let clamped_size = usize::try_from(clamped_size).map_err(|_| libc::EOVERFLOW)?;
-        if clamped_size == 0 {
+        let size_usize = usize::try_from(size).map_err(|_| libc::EOVERFLOW)?;
+        if size_usize == 0 {
             return Ok(Vec::new());
         }
 
-        let mut out = vec![0u8; clamped_size];
+        let mut out = vec![0u8; size_usize];
         let started = Instant::now();
         let result =
             self.runtime_handle
                 .block_on(self.vfs.read_into_fh(file_handle, ino, offset, &mut out));
         self.vfs
-            .record_fuse_read_callback(clamped_size, started.elapsed(), result.is_err());
+            .record_fuse_read_callback(size_usize, started.elapsed(), result.is_err());
         match result {
             Ok(written) => {
                 out.truncate(written as usize);
@@ -144,7 +143,7 @@ impl ReadOnlyStudioVfsAdapter {
     ) -> Result<DirectoryEntryBuffer, i32> {
         let mut buffer = DirectoryEntryBuffer::new(size);
         let mut idx = usize::try_from(offset).map_err(|_| libc::EINVAL)?;
-        let dir_attr = self.getattr(ino)?;
+        let dir_attr = minimal_dir_stat(ino);
         if idx == 0 {
             if !push_or_finish(&mut buffer, OsStr::new("."), &dir_attr, 1, &mut push)? {
                 return Ok(buffer);
@@ -158,11 +157,8 @@ impl ReadOnlyStudioVfsAdapter {
             idx = 2;
         }
 
-        let entries = self
-            .vfs
-            .readdir(ino)
-            .map_err(|error| vfs_err_to_errno(&error))?;
-        for (i, entry) in entries.iter().enumerate() {
+        let entries = self.cached_readdir_entries(ino)?;
+        for (i, entry) in entries.iter().enumerate().skip(idx.saturating_sub(2)) {
             let entry_idx = i + 2;
             if entry_idx < idx {
                 continue;
@@ -207,10 +203,7 @@ impl ReadOnlyStudioVfsAdapter {
     }
 
     fn dir_entry_to_stat(&self, entry: &DirEntry) -> stat {
-        let out = MaybeUninit::<stat>::zeroed();
-        // SAFETY: A zeroed `stat` is a valid C value for integer/time fields.
-        // readdir only needs inode and mode bits for directory entry packing.
-        let mut out = unsafe { out.assume_init() };
+        let mut out = minimal_stat(entry.ino);
         out.st_ino = entry.ino;
         out.st_mode = match entry.kind {
             FileType::RegularFile => libc::S_IFREG,
@@ -219,6 +212,46 @@ impl ReadOnlyStudioVfsAdapter {
         };
         out
     }
+
+    fn cached_readdir_entries(&self, ino: u64) -> Result<Arc<Vec<DirEntry>>, i32> {
+        let now = Instant::now();
+        {
+            let cache = self.readdir_cache.lock().map_err(|_| libc::EIO)?;
+            if let Some(entry) = cache.get(&ino)
+                && now.duration_since(entry.loaded_at) <= READDIR_CACHE_TTL
+            {
+                return Ok(Arc::clone(&entry.entries));
+            }
+        }
+
+        let entries = Arc::new(
+            self.vfs
+                .readdir(ino)
+                .map_err(|error| vfs_err_to_errno(&error))?,
+        );
+        let mut cache = self.readdir_cache.lock().map_err(|_| libc::EIO)?;
+        cache.insert(
+            ino,
+            ReaddirCacheEntry {
+                loaded_at: now,
+                entries: Arc::clone(&entries),
+            },
+        );
+        Ok(entries)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn readdir_cache_entry_count_for_test(&self) -> usize {
+        self.readdir_cache
+            .lock()
+            .expect("readdir cache lock should not be poisoned")
+            .len()
+    }
+}
+
+struct ReaddirCacheEntry {
+    loaded_at: Instant,
+    entries: Arc<Vec<DirEntry>>,
 }
 
 pub(crate) struct CallbackState {
@@ -265,6 +298,21 @@ fn directory_entry_errno(error: crate::low_level::DirectoryEntryError) -> i32 {
         crate::low_level::DirectoryEntryError::InsufficientCapacity { .. } => libc::ERANGE,
         crate::low_level::DirectoryEntryError::InteriorNul => libc::EINVAL,
     }
+}
+
+fn minimal_dir_stat(ino: u64) -> stat {
+    let mut out = minimal_stat(ino);
+    out.st_mode = libc::S_IFDIR;
+    out
+}
+
+fn minimal_stat(ino: u64) -> stat {
+    let out = MaybeUninit::<stat>::zeroed();
+    // SAFETY: A zeroed `stat` is a valid C value for integer/time fields.
+    // readdir only needs inode and mode bits for directory entry packing.
+    let mut out = unsafe { out.assume_init() };
+    out.st_ino = ino;
+    out
 }
 
 fn push_or_finish(

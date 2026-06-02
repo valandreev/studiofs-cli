@@ -350,6 +350,8 @@ fn seed_performance_probe_payload(
     .map_err(|error| ScenarioError::Io(std::io::Error::other(error)))?;
     vfs.start()
         .map_err(|error| ScenarioError::Io(std::io::Error::other(error)))?;
+    let mut vfs_guard = SeedVfsShutdownGuard::new(&runtime, vfs);
+    let vfs = vfs_guard.vfs();
 
     let dir_attr = match vfs.mkdir(ROOT_INO, b"performance-probe", 0, 0, 0o755) {
         Ok(attr) => attr,
@@ -381,8 +383,40 @@ fn seed_performance_probe_payload(
     runtime
         .block_on(vfs.flush(file_attr.ino))
         .map_err(|error| ScenarioError::Io(std::io::Error::other(error)))?;
-    runtime.block_on(vfs.shutdown(Duration::from_secs(30)));
+    vfs_guard.shutdown();
     Ok(())
+}
+
+struct SeedVfsShutdownGuard<'a> {
+    runtime: &'a tokio::runtime::Runtime,
+    vfs: Option<Arc<StudioVfs>>,
+}
+
+impl<'a> SeedVfsShutdownGuard<'a> {
+    fn new(runtime: &'a tokio::runtime::Runtime, vfs: Arc<StudioVfs>) -> Self {
+        Self {
+            runtime,
+            vfs: Some(vfs),
+        }
+    }
+
+    fn vfs(&self) -> &StudioVfs {
+        self.vfs
+            .as_deref()
+            .expect("seed VFS guard should hold a VFS before shutdown")
+    }
+
+    fn shutdown(&mut self) {
+        if let Some(vfs) = self.vfs.take() {
+            self.runtime.block_on(vfs.shutdown(Duration::from_secs(30)));
+        }
+    }
+}
+
+impl Drop for SeedVfsShutdownGuard<'_> {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
 }
 
 fn write_probe_file(
