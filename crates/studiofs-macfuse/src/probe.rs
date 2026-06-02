@@ -170,15 +170,18 @@ impl ProbeReport {
         let has_inconclusive_mode = modes.iter().any(|mode| {
             mode.kernel_cache_interpretation == KernelCacheInterpretation::Inconclusive
         });
-        let go_no_go = if min_read_passes < 3 || modes.len() < 2 || has_inconclusive_mode {
-            GoNoGoGuidance::Inconclusive
-        } else if modes.iter().all(|mode| {
-            mode.kernel_cache_interpretation == KernelCacheInterpretation::KernelCacheHit
-        }) {
-            GoNoGoGuidance::Go
-        } else {
-            GoNoGoGuidance::NoGo
-        };
+        let has_memory = modes.iter().any(|mode| mode.mode == ProbeMode::Memory);
+        let has_local_file = modes.iter().any(|mode| mode.mode == ProbeMode::LocalFile);
+        let go_no_go =
+            if min_read_passes < 3 || !has_memory || !has_local_file || has_inconclusive_mode {
+                GoNoGoGuidance::Inconclusive
+            } else if modes.iter().all(|mode| {
+                mode.kernel_cache_interpretation == KernelCacheInterpretation::KernelCacheHit
+            }) {
+                GoNoGoGuidance::Go
+            } else {
+                GoNoGoGuidance::NoGo
+            };
         let kernel_cache_summary = kernel_cache_summary(&modes);
 
         Self {
@@ -205,7 +208,7 @@ pub fn summarize_mode(
         total_callback_count += observation.callback_count;
         total_callback_bytes += observation.callback_bytes;
         for (size, count) in &observation.callback_size_distribution {
-            *combined_distribution.entry(*size).or_insert(0) += *count;
+            *combined_distribution.entry(*size).or_default() += *count;
         }
         read_passes.push(ProbeReadPassReport {
             pass: observation.pass,
@@ -259,8 +262,11 @@ fn throughput_mib_s(bytes_read: u64, elapsed_ns: u64) -> f64 {
     if elapsed_ns == 0 {
         return 0.0;
     }
-    let mib = bytes_read as f64 / 1_048_576.0;
-    let seconds = elapsed_ns as f64 / 1_000_000_000.0;
+    const BYTES_PER_MIB: f64 = 1_048_576.0;
+    const NS_PER_SEC: f64 = 1_000_000_000.0;
+
+    let mib = bytes_read as f64 / BYTES_PER_MIB;
+    let seconds = elapsed_ns as f64 / NS_PER_SEC;
     mib / seconds
 }
 
@@ -366,6 +372,25 @@ mod tests {
         );
 
         let report = ProbeReport::new(vec![inconclusive_memory, cached_local_file]);
+
+        assert_eq!(report.go_no_go, GoNoGoGuidance::Inconclusive);
+    }
+
+    #[test]
+    fn probe_report_requires_distinct_required_modes_for_go_guidance() {
+        let cached_memory = || {
+            summarize_mode(
+                ProbeMode::Memory,
+                false,
+                vec![
+                    observation(1, 3, 3 * 1024 * 1024),
+                    observation(2, 0, 0),
+                    observation(3, 0, 0),
+                ],
+            )
+        };
+
+        let report = ProbeReport::new(vec![cached_memory(), cached_memory()]);
 
         assert_eq!(report.go_no_go, GoNoGoGuidance::Inconclusive);
     }
