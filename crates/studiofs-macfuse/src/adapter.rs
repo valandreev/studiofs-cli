@@ -214,9 +214,9 @@ impl ReadOnlyStudioVfsAdapter {
     }
 
     fn cached_readdir_entries(&self, ino: u64) -> Result<Arc<Vec<DirEntry>>, i32> {
-        let now = Instant::now();
         let mut cache = self.readdir_cache.lock().map_err(|_| libc::EIO)?;
         loop {
+            let now = Instant::now();
             match cache.get(&ino) {
                 Some(ReaddirCacheEntry::Ready { loaded_at, entries })
                     if now.duration_since(*loaded_at) <= READDIR_CACHE_TTL =>
@@ -256,7 +256,7 @@ impl ReadOnlyStudioVfsAdapter {
                 cache.insert(
                     ino,
                     ReaddirCacheEntry::Ready {
-                        loaded_at: now,
+                        loaded_at: Instant::now(),
                         entries: Arc::clone(&entries),
                     },
                 );
@@ -295,6 +295,31 @@ impl ReadOnlyStudioVfsAdapter {
                 },
             );
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_ready_readdir_cache_loaded_at_for_test(&self, ino: u64, loaded_at: Instant) {
+        let mut cache = self
+            .readdir_cache
+            .lock()
+            .expect("readdir cache lock should not be poisoned");
+        let entries = match cache.remove(&ino) {
+            Some(ReaddirCacheEntry::Ready { entries, .. }) => entries,
+            _ => Arc::new(Vec::new()),
+        };
+        cache.insert(ino, ReaddirCacheEntry::Ready { loaded_at, entries });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn readdir_cache_loaded_at_for_test(&self, ino: u64) -> Option<Instant> {
+        self.readdir_cache
+            .lock()
+            .expect("readdir cache lock should not be poisoned")
+            .get(&ino)
+            .and_then(|entry| match entry {
+                ReaddirCacheEntry::Ready { loaded_at, .. } => Some(*loaded_at),
+                ReaddirCacheEntry::Loading => None,
+            })
     }
 }
 
