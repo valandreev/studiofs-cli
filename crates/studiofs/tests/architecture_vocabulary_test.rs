@@ -1058,11 +1058,13 @@ fn macos_native_bridge_split_note_covers_sfs475_boundary() {
         "studiofs-fuse becomes Linux-only",
         "studiofs-macfuse",
         "pub async fn mount_and_serve",
+        "Result<(), MacFuseMountError>",
+        "thiserror",
         "StudioVfs",
-        "CLI/backend routing",
-        "fallback behavior",
-        "validation sequence",
-        "first implementation issues",
+        "CLI/Backend Routing",
+        "Fallback Behavior",
+        "Validation Sequence",
+        "First Implementation Issues",
     ];
 
     let missing: Vec<_> = required_terms
