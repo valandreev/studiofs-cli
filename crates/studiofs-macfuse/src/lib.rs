@@ -160,6 +160,20 @@ mod tests {
     }
 
     #[test]
+    fn low_level_request_can_move_to_worker_thread() {
+        fn assert_send<T: Send>() {}
+
+        assert_send::<super::low_level::Request>();
+    }
+
+    #[test]
+    fn directory_entry_buffer_storage_is_eight_byte_aligned() {
+        let buffer = super::low_level::DirectoryEntryBuffer::new(512);
+
+        assert_eq!(buffer.as_slice().as_ptr().align_offset(8), 0);
+    }
+
+    #[test]
     fn low_level_session_mount_unmount_smoke_is_gated() {
         if std::env::var("STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS").as_deref() != Ok("1") {
             return;

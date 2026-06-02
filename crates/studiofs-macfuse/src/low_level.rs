@@ -6,7 +6,6 @@
 
 use std::ffi::{CString, OsStr};
 use std::io;
-use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::os::raw::{c_char, c_double, c_int, c_ulong, c_void};
 use std::os::unix::ffi::OsStrExt;
@@ -508,8 +507,12 @@ impl OpenReply {
 /// Owned low-level request token.
 pub struct Request {
     raw: Option<NonNull<raw::FuseReq>>,
-    _not_send_sync: PhantomData<*mut ()>,
 }
+
+// SAFETY: macFUSE low-level requests may be handed off to worker threads and
+// replied from there. `Request` still enforces single-reply ownership through
+// `Option::take` and its fallback `Drop` reply.
+unsafe impl Send for Request {}
 
 impl Request {
     /// Wrap a callback-provided request pointer.
@@ -520,10 +523,7 @@ impl Request {
     /// been replied to. The returned wrapper must be consumed by exactly one
     /// reply method.
     pub unsafe fn from_raw(raw: *mut raw::FuseReq) -> Option<Self> {
-        NonNull::new(raw).map(|raw| Self {
-            raw: Some(raw),
-            _not_send_sync: PhantomData,
-        })
+        NonNull::new(raw).map(|raw| Self { raw: Some(raw) })
     }
 
     fn as_ptr(&self) -> *mut raw::FuseReq {
@@ -651,7 +651,8 @@ impl Entry {
 
 /// Owned readdir reply buffer.
 pub struct DirectoryEntryBuffer {
-    bytes: Vec<u8>,
+    words: Vec<MaybeUninit<u64>>,
+    len: usize,
     scratch_name: Vec<u8>,
     capacity: usize,
 }
@@ -660,25 +661,28 @@ impl DirectoryEntryBuffer {
     /// Create a directory entry buffer with a fixed maximum size.
     pub fn new(capacity: usize) -> Self {
         Self {
-            bytes: Vec::with_capacity(capacity),
-            scratch_name: Vec::new(),
+            words: Vec::with_capacity(capacity.div_ceil(std::mem::size_of::<u64>())),
+            len: 0,
+            scratch_name: Vec::with_capacity(256),
             capacity,
         }
     }
 
     /// Current buffer length.
     pub fn len(&self) -> usize {
-        self.bytes.len()
+        self.len
     }
 
     /// Whether the buffer is empty.
     pub fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
+        self.len == 0
     }
 
     /// Borrow the initialized directory entry bytes.
     pub fn as_slice(&self) -> &[u8] {
-        &self.bytes
+        // SAFETY: `self.len` bytes from `words.as_ptr()` have been initialized
+        // by `push`, `push_for_test`, or are zero bytes for an empty buffer.
+        unsafe { std::slice::from_raw_parts(self.words.as_ptr().cast::<u8>(), self.len) }
     }
 
     /// Append an entry using macFUSE's layout helper.
@@ -696,7 +700,7 @@ impl DirectoryEntryBuffer {
         self.scratch_name.clear();
         self.scratch_name.extend_from_slice(name_bytes);
         self.scratch_name.push(0);
-        let available = self.capacity.saturating_sub(self.bytes.len());
+        let available = self.capacity.saturating_sub(self.len);
         // SAFETY: Passing a null buffer with zero size asks macFUSE for the
         // required entry size. `scratch_name` and `attr` remain valid for the
         // call.
@@ -717,21 +721,30 @@ impl DirectoryEntryBuffer {
             });
         }
 
-        let start = self.bytes.len();
-        self.bytes.reserve(required);
-        // SAFETY: `reserve` ensures enough spare capacity for `required` bytes.
+        let start = self.len;
+        let new_len = start + required;
+        let required_words = new_len.div_ceil(std::mem::size_of::<u64>());
+        self.words
+            .reserve(required_words.saturating_sub(self.words.len()));
+        // SAFETY: `reserve` ensures enough spare capacity for `required` bytes
+        // in the 8-byte-aligned word buffer.
         // `fuse_add_direntry` writes at most the provided buffer length, after
         // which `set_len` marks the initialized bytes.
         unsafe {
             raw::fuse_add_direntry(
                 request.as_ptr(),
-                self.bytes.as_mut_ptr().add(start).cast::<c_char>(),
+                self.words
+                    .as_mut_ptr()
+                    .cast::<u8>()
+                    .add(start)
+                    .cast::<c_char>(),
                 required,
                 self.scratch_name.as_ptr().cast::<c_char>(),
                 attr,
                 next_offset,
             );
-            self.bytes.set_len(start + required);
+            self.words.set_len(required_words);
+            self.len = new_len;
         }
         Ok(())
     }
@@ -751,17 +764,37 @@ impl DirectoryEntryBuffer {
         let name = CString::new(name.as_bytes()).map_err(|_| DirectoryEntryError::InteriorNul)?;
         let bytes = name.as_bytes_with_nul();
         let required = std::mem::size_of::<u64>() + std::mem::size_of::<off_t>() + bytes.len();
-        let available = self.capacity.saturating_sub(self.bytes.len());
+        let available = self.capacity.saturating_sub(self.len);
         if required > available {
             return Err(DirectoryEntryError::InsufficientCapacity {
                 required,
                 available,
             });
         }
-        self.bytes.extend_from_slice(&ino.to_ne_bytes());
-        self.bytes.extend_from_slice(&next_offset.to_ne_bytes());
-        self.bytes.extend_from_slice(bytes);
+        self.extend_for_test(&ino.to_ne_bytes());
+        self.extend_for_test(&next_offset.to_ne_bytes());
+        self.extend_for_test(bytes);
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn extend_for_test(&mut self, bytes: &[u8]) {
+        let start = self.len;
+        let new_len = start + bytes.len();
+        let required_words = new_len.div_ceil(std::mem::size_of::<u64>());
+        if required_words > self.words.len() {
+            self.words.resize_with(required_words, MaybeUninit::uninit);
+        }
+        // SAFETY: The word buffer has enough 8-byte-aligned storage and the
+        // copied range is initialized immediately.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                self.words.as_mut_ptr().cast::<u8>().add(start),
+                bytes.len(),
+            );
+        }
+        self.len = new_len;
     }
 }
 

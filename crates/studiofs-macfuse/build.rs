@@ -2,6 +2,11 @@
 
 use std::process::Command;
 
+const MACFUSE_FALLBACK_INCLUDE_DIRS: &[&str] = &[
+    "/opt/homebrew/include/osxfuse",
+    "/usr/local/include/osxfuse",
+];
+
 fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;
@@ -17,6 +22,7 @@ fn main() {
         .args(["--cflags", "--libs-only-L", "fuse"])
         .output()
     else {
+        add_macfuse_fallback_include_dirs(&mut build);
         build.compile("studiofs_macfuse_low_level_ops");
         return;
     };
@@ -29,6 +35,29 @@ fn main() {
                 build.include(path);
             }
         }
+    } else {
+        add_macfuse_fallback_include_dirs(&mut build);
     }
     build.compile("studiofs_macfuse_low_level_ops");
+}
+
+fn add_macfuse_fallback_include_dirs(build: &mut cc::Build) {
+    for path in macfuse_fallback_include_dirs() {
+        build.include(path);
+    }
+}
+
+fn macfuse_fallback_include_dirs() -> &'static [&'static str] {
+    MACFUSE_FALLBACK_INCLUDE_DIRS
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn macfuse_fallback_include_dirs_cover_homebrew_prefixes() {
+        let dirs = super::macfuse_fallback_include_dirs();
+
+        assert!(dirs.contains(&"/opt/homebrew/include/osxfuse"));
+        assert!(dirs.contains(&"/usr/local/include/osxfuse"));
+    }
 }
