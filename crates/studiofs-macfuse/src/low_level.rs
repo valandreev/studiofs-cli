@@ -97,12 +97,7 @@ pub(crate) mod raw {
         }
 
         pub(super) fn from_open_reply(reply: OpenReply) -> Self {
-            Self::from_fields(
-                reply.flags,
-                reply.file_handle,
-                reply.direct_io,
-                reply.keep_cache,
-            )
+            Self::from_fields(0, reply.file_handle, reply.direct_io, reply.keep_cache)
         }
 
         fn from_fields(flags: c_int, file_handle: u64, direct_io: bool, keep_cache: bool) -> Self {
@@ -371,8 +366,10 @@ impl Session {
     ///
     /// # Safety
     ///
-    /// `ops` must contain a valid `fuse_lowlevel_ops` table whose callback
-    /// function pointers remain valid for the returned session lifetime.
+    /// `ops` must point to a valid `fuse_lowlevel_ops` table for the duration
+    /// of this call. libfuse copies the table during session creation, but
+    /// callback function pointers stored in the table must remain valid for the
+    /// returned session lifetime.
     /// `userdata` must remain valid until the session is destroyed, unless the
     /// callback table intentionally handles a null user-data pointer.
     pub unsafe fn mount_with_ops(
@@ -474,7 +471,6 @@ impl FileInfoSnapshot {
 /// Open reply parameters owned by Rust.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenReply {
-    flags: c_int,
     file_handle: u64,
     direct_io: bool,
     keep_cache: bool,
@@ -482,9 +478,8 @@ pub struct OpenReply {
 
 impl OpenReply {
     /// Create an open reply.
-    pub fn new(flags: c_int, file_handle: u64) -> Self {
+    pub fn new(file_handle: u64) -> Self {
         Self {
-            flags,
             file_handle,
             direct_io: false,
             keep_cache: false,
@@ -724,10 +719,9 @@ impl DirectoryEntryBuffer {
         let start = self.len;
         let new_len = start + required;
         let required_words = new_len.div_ceil(std::mem::size_of::<u64>());
-        self.words
-            .reserve(required_words.saturating_sub(self.words.len()));
-        // SAFETY: `reserve` ensures enough spare capacity for `required` bytes
-        // in the 8-byte-aligned word buffer.
+        debug_assert!(required_words <= self.words.capacity());
+        // SAFETY: the capacity check above ensures enough spare capacity for
+        // `required` bytes in the 8-byte-aligned word buffer.
         // `fuse_add_direntry` writes at most the provided buffer length, after
         // which `set_len` marks the initialized bytes.
         unsafe {
