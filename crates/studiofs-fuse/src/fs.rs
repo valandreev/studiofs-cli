@@ -944,13 +944,13 @@ impl Filesystem for StudioFuseFs {
     }
 
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        let name_bytes = os_str_bytes(name).to_vec();
-        if should_hide_linux_root_metadata_entry(parent, &name_bytes) {
-            heal_hidden_linux_root_metadata_entry(&self.vfs, parent, &name_bytes);
+        let name_bytes = os_str_bytes(name);
+        if should_hide_linux_root_metadata_entry(parent, name_bytes) {
+            heal_hidden_linux_root_metadata_entry(&self.vfs, parent, name_bytes);
             reply.error(libc::ENOENT);
             return;
         }
-        let attr_result = self.vfs.lookup(parent, &name_bytes);
+        let attr_result = self.vfs.lookup(parent, name_bytes);
 
         match attr_result {
             Ok(attr) => reply.entry(
@@ -1228,36 +1228,33 @@ impl Filesystem for StudioFuseFs {
         _flags: u32,
         reply: ReplyEmpty,
     ) {
-        let requested_old_name = os_str_bytes(name).to_vec();
-        let requested_new_name = os_str_bytes(newname).to_vec();
-        if should_hide_linux_root_metadata_entry(parent, &requested_old_name) {
-            heal_hidden_linux_root_metadata_entry(&self.vfs, parent, &requested_old_name);
+        let requested_old_name = os_str_bytes(name);
+        let requested_new_name = os_str_bytes(newname);
+        if should_hide_linux_root_metadata_entry(parent, requested_old_name) {
+            heal_hidden_linux_root_metadata_entry(&self.vfs, parent, requested_old_name);
             reply.error(libc::ENOENT);
             return;
         }
-        if should_hide_linux_root_metadata_entry(newparent, &requested_new_name) {
-            heal_hidden_linux_root_metadata_entry(&self.vfs, newparent, &requested_new_name);
+        if should_hide_linux_root_metadata_entry(newparent, requested_new_name) {
+            heal_hidden_linux_root_metadata_entry(&self.vfs, newparent, requested_new_name);
             reply.error(libc::ENOENT);
             return;
         }
-        let old_name = requested_old_name.clone();
-        let new_name = requested_new_name.clone();
 
-        match self.vfs.rename(parent, &old_name, newparent, &new_name) {
+        match self
+            .vfs
+            .rename(parent, requested_old_name, newparent, requested_new_name)
+        {
             Ok(()) => reply.ok(),
             Err(e) => {
                 error!(
                     parent,
                     newparent,
                     flags = _flags,
-                    requested_old_name = %debug_name(&requested_old_name),
-                    requested_new_name = %debug_name(&requested_new_name),
-                    old_name = %debug_name(&old_name),
-                    new_name = %debug_name(&new_name),
+                    requested_old_name = %debug_name(requested_old_name),
+                    requested_new_name = %debug_name(requested_new_name),
                     requested_old_name_bytes = ?requested_old_name,
                     requested_new_name_bytes = ?requested_new_name,
-                    old_name_bytes = ?old_name,
-                    new_name_bytes = ?new_name,
                     "rename -> {e}"
                 );
                 reply.error(vfs_err_to_errno(&e));
@@ -1781,7 +1778,7 @@ impl Filesystem for StudioFuseFs {
                 continue;
             }
             let ft = fuse_file_type(entry.kind);
-            let entry_name = entry.name.clone();
+            let entry_name = &entry.name;
             let next_offset = match i64::try_from(entry_idx + 1) {
                 Ok(next_offset) => next_offset,
                 Err(_) => {
@@ -1875,7 +1872,7 @@ impl Filesystem for StudioFuseFs {
                 Ok(a) => to_fuse_attr(&a, self.mount_uid, self.mount_gid),
                 Err(_) => continue, // skip entries we can't stat
             };
-            let entry_name = entry.name.clone();
+            let entry_name = &entry.name;
             if reply.add(
                 entry.ino,
                 next_offset,
