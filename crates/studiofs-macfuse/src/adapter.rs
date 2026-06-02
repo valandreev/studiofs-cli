@@ -3,7 +3,7 @@ use std::ffi::{CStr, CString, OsStr};
 use std::mem::MaybeUninit;
 use std::os::raw::c_char;
 use std::os::unix::ffi::OsStrExt;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use libc::{off_t, size_t, stat, statvfs};
@@ -28,6 +28,7 @@ pub(crate) struct ReadOnlyStudioVfsAdapter {
     mount_uid: u32,
     mount_gid: u32,
     readdir_cache: Mutex<HashMap<u64, ReaddirCacheEntry>>,
+    readdir_cache_ready: Condvar,
 }
 
 impl ReadOnlyStudioVfsAdapter {
@@ -39,6 +40,7 @@ impl ReadOnlyStudioVfsAdapter {
             mount_uid: current_uid(),
             mount_gid: current_gid(),
             readdir_cache: Mutex::new(HashMap::new()),
+            readdir_cache_ready: Condvar::new(),
         }
     }
 
@@ -161,9 +163,6 @@ impl ReadOnlyStudioVfsAdapter {
         let entries = self.cached_readdir_entries(ino)?;
         for (i, entry) in entries.iter().enumerate().skip(idx.saturating_sub(2)) {
             let entry_idx = i + 2;
-            if entry_idx < idx {
-                continue;
-            }
             let attr = self.dir_entry_to_stat(entry);
             let next_offset = off_t::try_from(entry_idx + 1).map_err(|_| libc::EOVERFLOW)?;
             if !push_or_finish(
@@ -216,32 +215,60 @@ impl ReadOnlyStudioVfsAdapter {
 
     fn cached_readdir_entries(&self, ino: u64) -> Result<Arc<Vec<DirEntry>>, i32> {
         let now = Instant::now();
-        {
-            let cache = self.readdir_cache.lock().map_err(|_| libc::EIO)?;
-            if let Some(entry) = cache.get(&ino)
-                && now.duration_since(entry.loaded_at) <= READDIR_CACHE_TTL
-            {
-                return Ok(Arc::clone(&entry.entries));
+        let mut cache = self.readdir_cache.lock().map_err(|_| libc::EIO)?;
+        loop {
+            match cache.get(&ino) {
+                Some(ReaddirCacheEntry::Ready { loaded_at, entries })
+                    if now.duration_since(*loaded_at) <= READDIR_CACHE_TTL =>
+                {
+                    return Ok(Arc::clone(entries));
+                }
+                Some(ReaddirCacheEntry::Loading) => {
+                    cache = self
+                        .readdir_cache_ready
+                        .wait(cache)
+                        .map_err(|_| libc::EIO)?;
+                }
+                _ => {
+                    if cache.len() >= READDIR_CACHE_PRUNE_THRESHOLD {
+                        cache.retain(|_, entry| match entry {
+                            ReaddirCacheEntry::Ready { loaded_at, .. } => {
+                                now.duration_since(*loaded_at) <= READDIR_CACHE_TTL
+                            }
+                            ReaddirCacheEntry::Loading => true,
+                        });
+                    }
+                    cache.insert(ino, ReaddirCacheEntry::Loading);
+                    break;
+                }
             }
         }
+        drop(cache);
 
-        let entries = Arc::new(
-            self.vfs
-                .readdir(ino)
-                .map_err(|error| vfs_err_to_errno(&error))?,
-        );
+        let entries_result = self
+            .vfs
+            .readdir(ino)
+            .map(Arc::new)
+            .map_err(|error| vfs_err_to_errno(&error));
         let mut cache = self.readdir_cache.lock().map_err(|_| libc::EIO)?;
-        if cache.len() >= READDIR_CACHE_PRUNE_THRESHOLD {
-            cache.retain(|_, entry| now.duration_since(entry.loaded_at) <= READDIR_CACHE_TTL);
+        match entries_result {
+            Ok(entries) => {
+                cache.insert(
+                    ino,
+                    ReaddirCacheEntry::Ready {
+                        loaded_at: now,
+                        entries: Arc::clone(&entries),
+                    },
+                );
+                self.readdir_cache_ready.notify_all();
+                Ok(entries)
+            }
+            Err(errno) => {
+                cache.remove(&ino);
+                self.readdir_cache_ready.notify_all();
+                Err(errno)
+            }
         }
-        cache.insert(
-            ino,
-            ReaddirCacheEntry {
-                loaded_at: now,
-                entries: Arc::clone(&entries),
-            },
-        );
-        Ok(entries)
     }
 
     #[cfg(test)]
@@ -262,7 +289,7 @@ impl ReadOnlyStudioVfsAdapter {
         for ino in 10_000..(10_000 + READDIR_CACHE_PRUNE_THRESHOLD as u64) {
             cache.insert(
                 ino,
-                ReaddirCacheEntry {
+                ReaddirCacheEntry::Ready {
                     loaded_at,
                     entries: Arc::new(Vec::new()),
                 },
@@ -271,9 +298,12 @@ impl ReadOnlyStudioVfsAdapter {
     }
 }
 
-struct ReaddirCacheEntry {
-    loaded_at: Instant,
-    entries: Arc<Vec<DirEntry>>,
+enum ReaddirCacheEntry {
+    Ready {
+        loaded_at: Instant,
+        entries: Arc<Vec<DirEntry>>,
+    },
+    Loading,
 }
 
 pub(crate) struct CallbackState {
