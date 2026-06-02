@@ -1,0 +1,817 @@
+//! Safe wrappers around the macFUSE low-level C API.
+//!
+//! This module is the only place in `studiofs-macfuse` that declares raw
+//! low-level macFUSE FFI. Public types copy callback-owned values before they
+//! can cross async boundaries and keep request/reply ownership explicit.
+
+use std::ffi::{CString, OsStr};
+use std::io;
+use std::mem::MaybeUninit;
+use std::os::raw::{c_char, c_double, c_int, c_ulong, c_void};
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
+use std::ptr::NonNull;
+
+use libc::{off_t, size_t, stat};
+use thiserror::Error;
+
+pub(crate) mod raw {
+    use super::*;
+
+    /// Low-level FUSE inode number.
+    pub type FuseIno = u64;
+
+    /// Opaque low-level FUSE request handle.
+    pub enum FuseReq {}
+
+    /// Opaque low-level FUSE session handle.
+    pub enum FuseSession {}
+
+    /// Opaque low-level FUSE channel handle.
+    pub enum FuseChan {}
+
+    /// Opaque low-level FUSE argument vector.
+    #[repr(C)]
+    pub struct FuseArgs {
+        /// Argument count.
+        pub argc: c_int,
+        /// Argument vector.
+        pub argv: *mut *mut c_char,
+        /// Whether libfuse owns `argv`.
+        pub allocated: c_int,
+    }
+
+    /// macFUSE low-level entry parameters.
+    #[repr(C)]
+    pub struct FuseEntryParam {
+        /// Unique inode number.
+        pub ino: FuseIno,
+        /// Generation number for this entry.
+        pub generation: c_ulong,
+        /// Inode attributes.
+        pub attr: stat,
+        /// Attribute validity timeout in seconds.
+        pub attr_timeout: c_double,
+        /// Name validity timeout in seconds.
+        pub entry_timeout: c_double,
+    }
+
+    /// macFUSE low-level file-open information.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct FuseFileInfo {
+        /// Open flags.
+        pub flags: c_int,
+        /// Legacy file handle slot.
+        pub fh_old: c_ulong,
+        /// Writepage marker.
+        pub writepage: c_int,
+        bitfield: c_int,
+        /// File handle.
+        pub fh: u64,
+        /// Lock owner.
+        pub lock_owner: u64,
+    }
+
+    impl FuseFileInfo {
+        /// Construct test-only callback data with the fields used by wrappers.
+        #[cfg(test)]
+        pub fn for_test(flags: c_int, fh: u64, direct_io: bool, keep_cache: bool) -> Self {
+            Self::from_fields(flags, fh, direct_io, keep_cache)
+        }
+
+        /// Mutate test-only cache flag bits.
+        #[cfg(test)]
+        pub fn set_cache_flags_for_test(&mut self, direct_io: bool, keep_cache: bool) {
+            *self = Self::from_fields(self.flags, self.fh, direct_io, keep_cache);
+        }
+
+        pub(super) fn direct_io(self) -> bool {
+            // SAFETY: `self` is an initialized C-compatible `fuse_file_info`.
+            unsafe { super::studiofs_macfuse_file_info_direct_io(&self) != 0 }
+        }
+
+        pub(super) fn keep_cache(self) -> bool {
+            // SAFETY: `self` is an initialized C-compatible `fuse_file_info`.
+            unsafe { super::studiofs_macfuse_file_info_keep_cache(&self) != 0 }
+        }
+
+        pub(super) fn from_open_reply(reply: OpenReply) -> Self {
+            Self::from_fields(0, reply.file_handle, reply.direct_io, reply.keep_cache)
+        }
+
+        fn from_fields(flags: c_int, file_handle: u64, direct_io: bool, keep_cache: bool) -> Self {
+            let mut info = MaybeUninit::<Self>::uninit();
+            // SAFETY: The C shim initializes the entire `fuse_file_info`,
+            // including implementation-defined bitfields, using the same
+            // headers/compiler as libfuse.
+            unsafe {
+                super::studiofs_macfuse_file_info_init(
+                    info.as_mut_ptr(),
+                    flags,
+                    file_handle,
+                    c_int::from(direct_io),
+                    c_int::from(keep_cache),
+                );
+                info.assume_init()
+            }
+        }
+    }
+
+    /// macFUSE low-level callback table.
+    #[repr(C)]
+    pub struct FuseLowLevelOps {
+        _private: [u8; 0],
+    }
+
+    #[link(name = "fuse")]
+    unsafe extern "C" {
+        /// Reply with a POSIX errno.
+        pub fn fuse_reply_err(req: *mut FuseReq, err: c_int) -> c_int;
+        /// Reply with an entry.
+        pub fn fuse_reply_entry(req: *mut FuseReq, entry: *const FuseEntryParam) -> c_int;
+        /// Reply with attributes.
+        pub fn fuse_reply_attr(req: *mut FuseReq, attr: *const stat, timeout: c_double) -> c_int;
+        /// Reply with open parameters.
+        pub fn fuse_reply_open(req: *mut FuseReq, fi: *const FuseFileInfo) -> c_int;
+        /// Reply with a read or directory buffer.
+        pub fn fuse_reply_buf(req: *mut FuseReq, buf: *const c_char, size: size_t) -> c_int;
+        /// Reply with the number of written bytes.
+        pub fn fuse_reply_write(req: *mut FuseReq, count: size_t) -> c_int;
+        /// Append or size a directory entry.
+        pub fn fuse_add_direntry(
+            req: *mut FuseReq,
+            buf: *mut c_char,
+            bufsize: size_t,
+            name: *const c_char,
+            stbuf: *const stat,
+            off: off_t,
+        ) -> size_t;
+        /// Create a low-level session from callback operations.
+        pub fn fuse_lowlevel_new(
+            args: *mut FuseArgs,
+            op: *const FuseLowLevelOps,
+            op_size: size_t,
+            userdata: *mut c_void,
+        ) -> *mut FuseSession;
+        /// Mount a FUSE channel at a mount point.
+        pub fn fuse_mount(mountpoint: *const c_char, args: *mut FuseArgs) -> *mut FuseChan;
+        /// Attach a channel to a session.
+        pub fn fuse_session_add_chan(session: *mut FuseSession, channel: *mut FuseChan);
+        /// Remove a channel from its session.
+        pub fn fuse_session_remove_chan(channel: *mut FuseChan);
+        /// Destroy a low-level session and its attached channel.
+        pub fn fuse_session_destroy(session: *mut FuseSession);
+        /// Ask a session loop to exit.
+        pub fn fuse_session_exit(session: *mut FuseSession);
+        /// Unmount a FUSE mount point and release its channel.
+        pub fn fuse_unmount(mountpoint: *const c_char, channel: *mut FuseChan);
+        /// Free arguments allocated by libfuse option parsing.
+        pub fn fuse_opt_free_args(args: *mut FuseArgs);
+    }
+}
+
+unsafe extern "C" {
+    fn studiofs_macfuse_empty_low_level_ops() -> *const raw::FuseLowLevelOps;
+    fn studiofs_macfuse_low_level_ops_size() -> size_t;
+    fn studiofs_macfuse_file_info_init(
+        info: *mut raw::FuseFileInfo,
+        flags: c_int,
+        file_handle: u64,
+        direct_io: c_int,
+        keep_cache: c_int,
+    );
+    fn studiofs_macfuse_file_info_direct_io(info: *const raw::FuseFileInfo) -> c_int;
+    fn studiofs_macfuse_file_info_keep_cache(info: *const raw::FuseFileInfo) -> c_int;
+}
+
+/// Low-level callback operation table provided by macFUSE headers.
+#[derive(Debug, Clone, Copy)]
+pub struct LowLevelOperations {
+    raw: *const raw::FuseLowLevelOps,
+    size: size_t,
+}
+
+impl LowLevelOperations {
+    /// Empty operation table for lifecycle smoke tests.
+    pub fn empty() -> Self {
+        // SAFETY: The C shim returns a pointer to a static table and its exact
+        // header-derived size.
+        unsafe {
+            Self {
+                raw: studiofs_macfuse_empty_low_level_ops(),
+                size: studiofs_macfuse_low_level_ops_size(),
+            }
+        }
+    }
+
+    pub(crate) fn as_ptr(self) -> *const raw::FuseLowLevelOps {
+        self.raw
+    }
+
+    /// Header-derived callback table size.
+    pub fn size(self) -> size_t {
+        self.size
+    }
+}
+
+/// Owned copy of callback-scoped `fuse_file_info` data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileInfoSnapshot {
+    flags: c_int,
+    file_handle: u64,
+    direct_io: bool,
+    keep_cache: bool,
+}
+
+/// Owned mount/session configuration for low-level macFUSE.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionConfig {
+    mount_point: PathBuf,
+    volume_name: String,
+    read_only: bool,
+    run_in_foreground: bool,
+}
+
+impl SessionConfig {
+    /// Build a low-level session configuration.
+    pub fn new(mount_point: impl Into<PathBuf>, volume_name: impl Into<String>) -> Self {
+        Self {
+            mount_point: mount_point.into(),
+            volume_name: volume_name.into(),
+            read_only: false,
+            run_in_foreground: false,
+        }
+    }
+
+    /// Set whether the filesystem is mounted read-only.
+    pub fn with_read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
+    }
+
+    /// Set whether the session stays in the foreground.
+    pub fn with_run_in_foreground(mut self, run_in_foreground: bool) -> Self {
+        self.run_in_foreground = run_in_foreground;
+        self
+    }
+
+    /// Mount point for this session.
+    pub fn mount_point(&self) -> &Path {
+        &self.mount_point
+    }
+
+    /// Requested volume name retained for higher-level macOS integration.
+    pub fn volume_name(&self) -> &str {
+        &self.volume_name
+    }
+
+    /// Whether the eventual session runner should stay in the foreground.
+    pub fn run_in_foreground(&self) -> bool {
+        self.run_in_foreground
+    }
+
+    /// Build owned argv strings for libfuse.
+    pub fn argv_strings(&self) -> Vec<String> {
+        let mut args = vec!["studiofs-macfuse".to_owned()];
+        if self.read_only {
+            args.push("-oro".to_owned());
+        }
+        // `run_in_foreground` is runner policy. The macFUSE 2.x low-level
+        // session constructor rejects `-f`, so daemonization must stay outside
+        // the argument vector passed to `fuse_lowlevel_new`.
+        args
+    }
+
+    fn mount_point_cstring(&self) -> io::Result<CString> {
+        CString::new(self.mount_point.as_os_str().as_bytes()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "macFUSE mount point contains an interior NUL byte",
+            )
+        })
+    }
+}
+
+struct OwnedFuseArgs {
+    _strings: Vec<CString>,
+    _argv: Vec<*mut c_char>,
+    raw: raw::FuseArgs,
+}
+
+impl OwnedFuseArgs {
+    fn new(config: &SessionConfig) -> io::Result<Self> {
+        let strings = config
+            .argv_strings()
+            .into_iter()
+            .map(|arg| {
+                CString::new(arg).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "macFUSE option contains an interior NUL byte",
+                    )
+                })
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        let mut argv = strings
+            .iter()
+            .map(|arg| arg.as_ptr().cast_mut())
+            .collect::<Vec<_>>();
+        let raw = raw::FuseArgs {
+            argc: argv.len().try_into().map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "too many macFUSE arguments")
+            })?,
+            argv: argv.as_mut_ptr(),
+            allocated: 0,
+        };
+        Ok(Self {
+            _strings: strings,
+            _argv: argv,
+            raw,
+        })
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut raw::FuseArgs {
+        &mut self.raw
+    }
+}
+
+impl Drop for OwnedFuseArgs {
+    fn drop(&mut self) {
+        // SAFETY: `self.raw` is the same `fuse_args` structure passed to
+        // libfuse. If libfuse allocated a replacement argv during option
+        // parsing, `fuse_opt_free_args` releases it; otherwise it is a no-op for
+        // our stack-owned Rust argv (`allocated == 0`).
+        unsafe { raw::fuse_opt_free_args(&mut self.raw) };
+    }
+}
+
+/// Mounted low-level macFUSE session.
+pub struct Session {
+    raw: NonNull<raw::FuseSession>,
+    channel: NonNull<raw::FuseChan>,
+    mount_point: CString,
+}
+
+// SAFETY: macFUSE session handles support cross-thread exit signaling, and this
+// wrapper only exposes shared access for `request_exit`. Teardown still requires
+// owning `Session`, so `Drop` cannot race active shared borrows in safe Rust.
+unsafe impl Send for Session {}
+// SAFETY: See the `Send` impl above; shared references expose only
+// `fuse_session_exit`, which is the intended cross-thread wakeup path.
+unsafe impl Sync for Session {}
+
+impl Session {
+    /// Create and mount a low-level macFUSE session.
+    ///
+    /// # Safety
+    ///
+    /// `ops` must point to a valid `fuse_lowlevel_ops` table for the duration
+    /// of this call. libfuse copies the table during session creation, but
+    /// callback function pointers stored in the table must remain valid for the
+    /// returned session lifetime.
+    /// `userdata` must remain valid until the session is destroyed, unless the
+    /// callback table intentionally handles a null user-data pointer.
+    pub unsafe fn mount_with_ops(
+        config: &SessionConfig,
+        ops: LowLevelOperations,
+        userdata: *mut c_void,
+    ) -> io::Result<Self> {
+        let mut args = OwnedFuseArgs::new(config)?;
+        let mount_point = config.mount_point_cstring()?;
+        // SAFETY: `args`, `ops`, and `userdata` satisfy the caller contract for
+        // `fuse_lowlevel_new`; `args` and callback table live through the call.
+        let session = NonNull::new(unsafe {
+            raw::fuse_lowlevel_new(args.as_mut_ptr(), ops.as_ptr(), ops.size(), userdata)
+        })
+        .ok_or_else(|| io::Error::other("macFUSE failed to create low-level session"))?;
+        // SAFETY: `mount_point` and `args` are valid for this call.
+        let channel =
+            NonNull::new(unsafe { raw::fuse_mount(mount_point.as_ptr(), args.as_mut_ptr()) });
+        match channel {
+            Some(channel) => {
+                // SAFETY: Both pointers were returned by macFUSE and are live.
+                unsafe { raw::fuse_session_add_chan(session.as_ptr(), channel.as_ptr()) };
+                Ok(Self {
+                    raw: session,
+                    channel,
+                    mount_point,
+                })
+            }
+            None => {
+                // SAFETY: `session` is live and has not been returned.
+                unsafe { raw::fuse_session_destroy(session.as_ptr()) };
+                Err(io::Error::other(
+                    "macFUSE failed to mount low-level channel",
+                ))
+            }
+        }
+    }
+
+    /// Request session loop shutdown.
+    pub fn request_exit(&self) {
+        // SAFETY: `self.raw` is owned by this wrapper and remains live until Drop.
+        unsafe { raw::fuse_session_exit(self.raw.as_ptr()) };
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        // SAFETY: `self.channel` was attached to `self.raw`; removing it before
+        // unmount avoids leaving the session with a stale channel pointer.
+        unsafe { raw::fuse_session_remove_chan(self.channel.as_ptr()) };
+        // SAFETY: `self.mount_point` is the same NUL-terminated path passed to
+        // `fuse_mount`, and `self.channel` is still the live channel for it.
+        unsafe { raw::fuse_unmount(self.mount_point.as_ptr(), self.channel.as_ptr()) };
+        // SAFETY: `self.raw` is owned by this wrapper and destroyed exactly once
+        // after its channel has been detached and unmounted.
+        unsafe { raw::fuse_session_destroy(self.raw.as_ptr()) };
+    }
+}
+
+impl FileInfoSnapshot {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "called by low-level callbacks added after this boundary"
+        )
+    )]
+    pub(crate) fn copy_from_callback(info: &raw::FuseFileInfo) -> Self {
+        let copied = *info;
+        Self {
+            flags: copied.flags,
+            file_handle: copied.fh,
+            direct_io: copied.direct_io(),
+            keep_cache: copied.keep_cache(),
+        }
+    }
+
+    /// Open flags from the callback.
+    pub fn flags(self) -> c_int {
+        self.flags
+    }
+
+    /// File handle carried by the callback.
+    pub fn file_handle(self) -> u64 {
+        self.file_handle
+    }
+
+    /// Whether direct I/O was requested.
+    pub fn direct_io(self) -> bool {
+        self.direct_io
+    }
+
+    /// Whether kernel cache should be kept.
+    pub fn keep_cache(self) -> bool {
+        self.keep_cache
+    }
+}
+
+/// Open reply parameters owned by Rust.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenReply {
+    file_handle: u64,
+    direct_io: bool,
+    keep_cache: bool,
+}
+
+impl OpenReply {
+    /// Create an open reply.
+    pub fn new(file_handle: u64) -> Self {
+        Self {
+            file_handle,
+            direct_io: false,
+            keep_cache: false,
+        }
+    }
+
+    /// Set whether direct I/O should be requested.
+    pub fn with_direct_io(mut self, direct_io: bool) -> Self {
+        self.direct_io = direct_io;
+        self
+    }
+
+    /// Set whether the kernel should keep cached data.
+    pub fn with_keep_cache(mut self, keep_cache: bool) -> Self {
+        self.keep_cache = keep_cache;
+        self
+    }
+}
+
+/// Owned low-level request token.
+pub struct Request {
+    raw: Option<NonNull<raw::FuseReq>>,
+}
+
+// SAFETY: macFUSE low-level requests may be handed off to worker threads and
+// replied from there. `Request` still enforces single-reply ownership through
+// `Option::take` and its fallback `Drop` reply.
+unsafe impl Send for Request {}
+
+impl Request {
+    /// Wrap a callback-provided request pointer.
+    ///
+    /// # Safety
+    ///
+    /// `raw` must be a live macFUSE request pointer for a callback that has not
+    /// been replied to. The returned wrapper must be consumed by exactly one
+    /// reply method.
+    pub unsafe fn from_raw(raw: *mut raw::FuseReq) -> Option<Self> {
+        NonNull::new(raw).map(|raw| Self { raw: Some(raw) })
+    }
+
+    fn as_ptr(&self) -> *mut raw::FuseReq {
+        match self.raw {
+            Some(raw) => raw.as_ptr(),
+            None => unreachable!("type-state invariant: macFUSE request was already replied"),
+        }
+    }
+
+    fn take_raw(&mut self) -> NonNull<raw::FuseReq> {
+        match self.raw.take() {
+            Some(raw) => raw,
+            None => unreachable!("type-state invariant: macFUSE request was already replied"),
+        }
+    }
+}
+
+impl Drop for Request {
+    fn drop(&mut self) {
+        if let Some(raw) = self.raw.take() {
+            // SAFETY: `Request` owns a live, unreplied callback request by
+            // construction. Dropping without a reply must fail the request so
+            // the kernel is not left waiting indefinitely.
+            unsafe { raw::fuse_reply_err(raw.as_ptr(), libc::EIO) };
+        }
+    }
+}
+
+/// Low-level reply sender that consumes request ownership.
+pub struct Reply {
+    request: Request,
+}
+
+impl Reply {
+    /// Create a reply sender for an owned request token.
+    pub fn new(request: Request) -> Self {
+        Self { request }
+    }
+
+    /// Reply with a POSIX errno.
+    pub fn error(mut self, errno: c_int) -> io::Result<()> {
+        let request = self.request.take_raw();
+        // SAFETY: `Request` guarantees a live, unreplied low-level request and
+        // this method consumes it, so macFUSE sees at most one reply.
+        reply_result(unsafe { raw::fuse_reply_err(request.as_ptr(), errno) })
+    }
+
+    /// Reply with an entry.
+    pub fn entry(mut self, entry: &Entry) -> io::Result<()> {
+        let request = self.request.take_raw();
+        // SAFETY: `entry.raw` points to initialized C-compatible data for the
+        // duration of the call; `self` consumes the single request reply.
+        reply_result(unsafe { raw::fuse_reply_entry(request.as_ptr(), &entry.raw) })
+    }
+
+    /// Reply with attributes.
+    pub fn attr(mut self, attr: &stat, timeout: f64) -> io::Result<()> {
+        let request = self.request.take_raw();
+        // SAFETY: `attr` is initialized and borrowed for the duration of the
+        // call; `self` consumes the single request reply.
+        reply_result(unsafe { raw::fuse_reply_attr(request.as_ptr(), attr, timeout) })
+    }
+
+    /// Reply with open parameters.
+    pub fn open(mut self, open: OpenReply) -> io::Result<()> {
+        let request = self.request.take_raw();
+        let file_info = raw::FuseFileInfo::from_open_reply(open);
+        // SAFETY: `file_info` is initialized and borrowed for the duration of
+        // the call; `self` consumes the single request reply.
+        reply_result(unsafe { raw::fuse_reply_open(request.as_ptr(), &file_info) })
+    }
+
+    /// Reply with a read buffer.
+    pub fn read_buffer(mut self, bytes: &[u8]) -> io::Result<()> {
+        let request = self.request.take_raw();
+        // SAFETY: `bytes` is valid for the duration of the call and macFUSE
+        // copies/sends it synchronously; `self` consumes the single reply.
+        reply_result(unsafe {
+            raw::fuse_reply_buf(
+                request.as_ptr(),
+                bytes.as_ptr().cast::<c_char>(),
+                bytes.len(),
+            )
+        })
+    }
+
+    /// Reply with a write byte count.
+    pub fn write_count(mut self, count: usize) -> io::Result<()> {
+        let request = self.request.take_raw();
+        // SAFETY: `self` owns a live, unreplied request and is consumed here.
+        reply_result(unsafe { raw::fuse_reply_write(request.as_ptr(), count) })
+    }
+
+    /// Reply with owned directory entries.
+    pub fn directory_entries(self, entries: &DirectoryEntryBuffer) -> io::Result<()> {
+        self.read_buffer(entries.as_slice())
+    }
+}
+
+/// Owned low-level entry reply data.
+pub struct Entry {
+    raw: raw::FuseEntryParam,
+}
+
+impl Entry {
+    /// Create entry reply data.
+    pub fn new(
+        ino: u64,
+        generation: c_ulong,
+        attr: stat,
+        attr_timeout: f64,
+        entry_timeout: f64,
+    ) -> Self {
+        Self {
+            raw: raw::FuseEntryParam {
+                ino,
+                generation,
+                attr,
+                attr_timeout,
+                entry_timeout,
+            },
+        }
+    }
+}
+
+/// Owned readdir reply buffer.
+pub struct DirectoryEntryBuffer {
+    words: Vec<MaybeUninit<u64>>,
+    len: usize,
+    scratch_name: Vec<u8>,
+    capacity: usize,
+}
+
+impl DirectoryEntryBuffer {
+    /// Create a directory entry buffer with a fixed maximum size.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            words: Vec::with_capacity(capacity.div_ceil(std::mem::size_of::<u64>())),
+            len: 0,
+            scratch_name: Vec::with_capacity(256),
+            capacity,
+        }
+    }
+
+    /// Current buffer length.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the buffer is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Borrow the initialized directory entry bytes.
+    pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: `self.len` bytes from `words.as_ptr()` have been initialized
+        // by `push`, `push_for_test`, or are zero bytes for an empty buffer.
+        unsafe { std::slice::from_raw_parts(self.words.as_ptr().cast::<u8>(), self.len) }
+    }
+
+    /// Append an entry using macFUSE's layout helper.
+    pub fn push(
+        &mut self,
+        request: &Request,
+        name: &OsStr,
+        attr: &stat,
+        next_offset: off_t,
+    ) -> Result<(), DirectoryEntryError> {
+        let name_bytes = name.as_bytes();
+        if name_bytes.contains(&0) {
+            return Err(DirectoryEntryError::InteriorNul);
+        }
+        self.scratch_name.clear();
+        self.scratch_name.extend_from_slice(name_bytes);
+        self.scratch_name.push(0);
+        let available = self.capacity.saturating_sub(self.len);
+        // SAFETY: Passing a null buffer with zero size asks macFUSE for the
+        // required entry size. `scratch_name` and `attr` remain valid for the
+        // call.
+        let required = unsafe {
+            raw::fuse_add_direntry(
+                request.as_ptr(),
+                std::ptr::null_mut(),
+                0,
+                self.scratch_name.as_ptr().cast::<c_char>(),
+                attr,
+                next_offset,
+            )
+        };
+        if required > available {
+            return Err(DirectoryEntryError::InsufficientCapacity {
+                required,
+                available,
+            });
+        }
+
+        let start = self.len;
+        let new_len = start + required;
+        let required_words = new_len.div_ceil(std::mem::size_of::<u64>());
+        debug_assert!(required_words <= self.words.capacity());
+        // SAFETY: the capacity check above ensures enough spare capacity for
+        // `required` bytes in the 8-byte-aligned word buffer.
+        // `fuse_add_direntry` writes at most the provided buffer length, after
+        // which `set_len` marks the initialized bytes.
+        unsafe {
+            raw::fuse_add_direntry(
+                request.as_ptr(),
+                self.words
+                    .as_mut_ptr()
+                    .cast::<u8>()
+                    .add(start)
+                    .cast::<c_char>(),
+                required,
+                self.scratch_name.as_ptr().cast::<c_char>(),
+                attr,
+                next_offset,
+            );
+            self.words.set_len(required_words);
+            self.len = new_len;
+        }
+        Ok(())
+    }
+
+    /// Test-only append that preserves owned names without a live request.
+    ///
+    /// This does not produce a valid `fuse_dirent` binary layout. It exists only
+    /// to exercise owned-buffer capacity checks and name retention without a
+    /// live macFUSE request handle.
+    #[cfg(test)]
+    pub fn push_for_test(
+        &mut self,
+        ino: u64,
+        name: &OsStr,
+        next_offset: off_t,
+    ) -> Result<(), DirectoryEntryError> {
+        let name = CString::new(name.as_bytes()).map_err(|_| DirectoryEntryError::InteriorNul)?;
+        let bytes = name.as_bytes_with_nul();
+        let required = std::mem::size_of::<u64>() + std::mem::size_of::<off_t>() + bytes.len();
+        let available = self.capacity.saturating_sub(self.len);
+        if required > available {
+            return Err(DirectoryEntryError::InsufficientCapacity {
+                required,
+                available,
+            });
+        }
+        self.extend_for_test(&ino.to_ne_bytes());
+        self.extend_for_test(&next_offset.to_ne_bytes());
+        self.extend_for_test(bytes);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn extend_for_test(&mut self, bytes: &[u8]) {
+        let start = self.len;
+        let new_len = start + bytes.len();
+        let required_words = new_len.div_ceil(std::mem::size_of::<u64>());
+        if required_words > self.words.len() {
+            self.words.resize_with(required_words, MaybeUninit::uninit);
+        }
+        // SAFETY: The word buffer has enough 8-byte-aligned storage and the
+        // copied range is initialized immediately.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                self.words.as_mut_ptr().cast::<u8>().add(start),
+                bytes.len(),
+            );
+        }
+        self.len = new_len;
+    }
+}
+
+/// Directory-entry buffer construction error.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum DirectoryEntryError {
+    /// Entry name contains an interior NUL byte.
+    #[error("directory entry name contains an interior NUL byte")]
+    InteriorNul,
+    /// Entry does not fit in the remaining reply buffer.
+    #[error("directory entry requires {required} bytes, but only {available} remain")]
+    InsufficientCapacity {
+        /// Required entry bytes.
+        required: usize,
+        /// Remaining buffer bytes.
+        available: usize,
+    },
+}
+
+fn reply_result(result: c_int) -> io::Result<()> {
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(-result))
+    }
+}
