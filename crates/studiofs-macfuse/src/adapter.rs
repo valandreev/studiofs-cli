@@ -1,4 +1,4 @@
-use std::ffi::{CStr, OsStr};
+use std::ffi::{CStr, CString, OsStr};
 use std::mem::MaybeUninit;
 use std::os::raw::c_char;
 use std::os::unix::ffi::OsStrExt;
@@ -9,7 +9,7 @@ use libc::{off_t, size_t, stat, statvfs};
 use studiofs_bridge::posix::{
     BridgeFileAttr, BridgeFileType, posix_flags_to_open_flags, to_bridge_attr, vfs_err_to_errno,
 };
-use studiofs_meta::InodeAttr;
+use studiofs_meta::{DirEntry, FileType, InodeAttr};
 use studiofs_vfs::{OpenFlags, StatFs, StudioVfs};
 use tokio::runtime::Handle;
 
@@ -114,19 +114,47 @@ impl ReadOnlyStudioVfsAdapter {
         offset: i64,
         size: usize,
     ) -> Result<DirectoryEntryBuffer, i32> {
+        self.readdir_with_push(ino, offset, size, |buffer, name, attr, next_offset| {
+            buffer
+                .push(request, name, attr, next_offset)
+                .map_err(directory_entry_errno)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn readdir_for_test(
+        &self,
+        ino: u64,
+        offset: i64,
+        size: usize,
+    ) -> Result<DirectoryEntryBuffer, i32> {
+        self.readdir_with_push(ino, offset, size, |buffer, name, _attr, next_offset| {
+            buffer
+                .push_for_test(0, name, next_offset)
+                .map_err(directory_entry_errno)
+        })
+    }
+
+    fn readdir_with_push(
+        &self,
+        ino: u64,
+        offset: i64,
+        size: usize,
+        mut push: impl FnMut(&mut DirectoryEntryBuffer, &OsStr, &stat, off_t) -> Result<(), i32>,
+    ) -> Result<DirectoryEntryBuffer, i32> {
         let mut buffer = DirectoryEntryBuffer::new(size);
         let mut idx = usize::try_from(offset).map_err(|_| libc::EINVAL)?;
         let dir_attr = self.getattr(ino)?;
         if idx == 0 {
-            buffer
-                .push(request, OsStr::new("."), &dir_attr, 1)
-                .map_err(directory_entry_errno)?;
+            if !push_or_finish(&mut buffer, OsStr::new("."), &dir_attr, 1, &mut push)? {
+                return Ok(buffer);
+            }
             idx = 1;
         }
         if idx == 1 {
-            buffer
-                .push(request, OsStr::new(".."), &dir_attr, 2)
-                .map_err(directory_entry_errno)?;
+            if !push_or_finish(&mut buffer, OsStr::new(".."), &dir_attr, 2, &mut push)? {
+                return Ok(buffer);
+            }
             idx = 2;
         }
 
@@ -139,17 +167,26 @@ impl ReadOnlyStudioVfsAdapter {
             if entry_idx < idx {
                 continue;
             }
-            let attr = self
-                .vfs
-                .getattr(entry.ino)
-                .map(|attr| self.attr_to_stat(&attr))
-                .map_err(|error| vfs_err_to_errno(&error))?;
+            let attr = self.dir_entry_to_stat(entry);
             let next_offset = off_t::try_from(entry_idx + 1).map_err(|_| libc::EOVERFLOW)?;
-            buffer
-                .push(request, OsStr::from_bytes(&entry.name), &attr, next_offset)
-                .map_err(directory_entry_errno)?;
+            if !push_or_finish(
+                &mut buffer,
+                OsStr::from_bytes(&entry.name),
+                &attr,
+                next_offset,
+                &mut push,
+            )? {
+                break;
+            }
         }
         Ok(buffer)
+    }
+
+    /// Read the target for a symlink inode.
+    pub(crate) fn readlink(&self, ino: u64) -> Result<Vec<u8>, i32> {
+        self.vfs
+            .readlink(ino)
+            .map_err(|error| vfs_err_to_errno(&error))
     }
 
     /// Get filesystem statistics.
@@ -167,6 +204,20 @@ impl ReadOnlyStudioVfsAdapter {
             self.mount_gid,
             MACFUSE_ATTR_BLOCK_SIZE,
         ))
+    }
+
+    fn dir_entry_to_stat(&self, entry: &DirEntry) -> stat {
+        let out = MaybeUninit::<stat>::zeroed();
+        // SAFETY: A zeroed `stat` is a valid C value for integer/time fields.
+        // readdir only needs inode and mode bits for directory entry packing.
+        let mut out = unsafe { out.assume_init() };
+        out.st_ino = entry.ino;
+        out.st_mode = match entry.kind {
+            FileType::RegularFile => libc::S_IFREG,
+            FileType::Directory => libc::S_IFDIR,
+            FileType::Symlink => libc::S_IFLNK,
+        };
+        out
     }
 }
 
@@ -213,6 +264,20 @@ fn directory_entry_errno(error: crate::low_level::DirectoryEntryError) -> i32 {
     match error {
         crate::low_level::DirectoryEntryError::InsufficientCapacity { .. } => libc::ERANGE,
         crate::low_level::DirectoryEntryError::InteriorNul => libc::EINVAL,
+    }
+}
+
+fn push_or_finish(
+    buffer: &mut DirectoryEntryBuffer,
+    name: &OsStr,
+    attr: &stat,
+    next_offset: off_t,
+    push: &mut impl FnMut(&mut DirectoryEntryBuffer, &OsStr, &stat, off_t) -> Result<(), i32>,
+) -> Result<bool, i32> {
+    match push(buffer, name, attr, next_offset) {
+        Ok(()) => Ok(true),
+        Err(libc::ERANGE) => Ok(false),
+        Err(errno) => Err(errno),
     }
 }
 
@@ -466,6 +531,26 @@ pub extern "C" fn studiofs_macfuse_readdir(
         Err(errno) => {
             let _ = Reply::new(request).error(errno);
         }
+    }
+}
+
+/// macFUSE readlink callback for the read-only StudioVfs bridge.
+#[unsafe(no_mangle)]
+pub extern "C" fn studiofs_macfuse_readlink(req: *mut raw::FuseReq, ino: raw::FuseIno) {
+    let Some(state) = callback_state(req) else {
+        reply_error(req, libc::EIO);
+        return;
+    };
+    match state.adapter.readlink(ino) {
+        Ok(target) => match CString::new(target) {
+            Ok(target) => {
+                if let Some(request) = owned_request(req) {
+                    let _ = Reply::new(request).readlink(&target);
+                }
+            }
+            Err(_) => reply_error(req, libc::EINVAL),
+        },
+        Err(errno) => reply_error(req, errno),
     }
 }
 

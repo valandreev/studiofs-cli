@@ -306,4 +306,51 @@ mod tests {
             libc::EROFS
         );
     }
+
+    #[test]
+    fn read_only_adapter_readdir_stops_successfully_when_reply_buffer_is_full() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-readdir-buffer-full")
+                .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let root = studiofs_vfs::contract_harness::CONTRACT_ROOT_INO;
+        vfs.create(root, b"alpha.txt", 501, 20, 0o644)
+            .expect("create first file");
+        vfs.create(root, b"beta.txt", 501, 20, 0o644)
+            .expect("create second file");
+        let adapter = super::adapter::ReadOnlyStudioVfsAdapter::new(
+            vfs.clone(),
+            fixture.runtime().handle().clone(),
+        );
+
+        let buffer = adapter
+            .readdir_for_test(root, 2, 32)
+            .expect("full readdir buffer should return a partial success");
+
+        assert!(!buffer.is_empty());
+    }
+
+    #[test]
+    fn read_only_adapter_reads_symlink_targets() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-read-only-adapter-readlink",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .symlink(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"link.txt",
+                b"target.txt",
+                501,
+                20,
+            )
+            .expect("create symlink");
+        let adapter =
+            super::adapter::ReadOnlyStudioVfsAdapter::new(vfs, fixture.runtime().handle().clone());
+
+        let target = adapter.readlink(attr.ino).expect("read symlink target");
+
+        assert_eq!(target, b"target.txt");
+    }
 }

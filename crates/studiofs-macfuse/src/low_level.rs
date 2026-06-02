@@ -136,6 +136,8 @@ pub(crate) mod raw {
         pub fn fuse_reply_open(req: *mut FuseReq, fi: *const FuseFileInfo) -> c_int;
         /// Reply with a read or directory buffer.
         pub fn fuse_reply_buf(req: *mut FuseReq, buf: *const c_char, size: size_t) -> c_int;
+        /// Reply with a symlink target.
+        pub fn fuse_reply_readlink(req: *mut FuseReq, link: *const c_char) -> c_int;
         /// Reply with the number of written bytes.
         pub fn fuse_reply_write(req: *mut FuseReq, count: size_t) -> c_int;
         /// Reply with filesystem statistics.
@@ -639,6 +641,14 @@ impl Reply {
                 bytes.len(),
             )
         })
+    }
+
+    /// Reply with a symbolic link target.
+    pub fn readlink(mut self, target: &std::ffi::CStr) -> io::Result<()> {
+        let request = self.request.take_raw();
+        // SAFETY: `target` is NUL-terminated and valid for the duration of the
+        // call; macFUSE copies/sends it synchronously and `self` is consumed.
+        reply_result(unsafe { raw::fuse_reply_readlink(request.as_ptr(), target.as_ptr()) })
     }
 
     /// Reply with a write byte count.

@@ -18,6 +18,7 @@ extern void studiofs_macfuse_readdir(fuse_req_t req,
                                      size_t size,
                                      off_t off,
                                      struct fuse_file_info *fi);
+extern void studiofs_macfuse_readlink(fuse_req_t req, fuse_ino_t ino);
 extern void studiofs_macfuse_statfs(fuse_req_t req, fuse_ino_t ino);
 
 static const struct fuse_lowlevel_ops STUDIOFS_READ_ONLY_LOW_LEVEL_OPS = {
@@ -27,6 +28,7 @@ static const struct fuse_lowlevel_ops STUDIOFS_READ_ONLY_LOW_LEVEL_OPS = {
     .read = studiofs_macfuse_read,
     .release = studiofs_macfuse_release,
     .readdir = studiofs_macfuse_readdir,
+    .readlink = studiofs_macfuse_readlink,
     .statfs = studiofs_macfuse_statfs,
 };
 
