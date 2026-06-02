@@ -13,6 +13,9 @@ use std::sync::Arc;
 use studiofs_vfs::StudioVfs;
 use tokio::runtime::Handle;
 
+/// Low-level macFUSE repeated-read probe support.
+pub mod probe;
+
 /// Request used by the CLI backend router to launch the macOS bridge.
 pub struct MacFuseMountRequest {
     vfs: Arc<StudioVfs>,

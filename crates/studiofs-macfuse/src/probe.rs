@@ -1,0 +1,535 @@
+//! Low-level macFUSE repeated-read probe report model.
+
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+/// Probe input mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProbeMode {
+    /// Synthetic in-memory file exposed by the probe filesystem.
+    Memory,
+    /// Local file exposed through passthrough reads.
+    LocalFile,
+}
+
+/// Low-level probe configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeConfig {
+    /// File size exposed by each probe mode.
+    pub file_bytes: u64,
+    /// Read buffer size used by the client side measurement loop.
+    pub chunk_bytes: usize,
+    /// Number of repeated-read passes to run for each mode.
+    pub read_passes: u32,
+    /// Probe modes to execute.
+    pub modes: Vec<ProbeMode>,
+    /// Whether to run the notify/store experiment when supported by the API.
+    pub notify_store_experiment: bool,
+}
+
+impl ProbeConfig {
+    /// Validate SFS-479 completion gates that can be checked before mounting.
+    pub fn validate(&self) -> Result<(), ProbeConfigError> {
+        const MIN_READ_PASSES: u32 = 3;
+        if self.read_passes < MIN_READ_PASSES {
+            return Err(ProbeConfigError::ReadPassesBelowMinimum {
+                actual: self.read_passes,
+                minimum: MIN_READ_PASSES,
+            });
+        }
+        for required in [ProbeMode::Memory, ProbeMode::LocalFile] {
+            if !self.modes.contains(&required) {
+                return Err(ProbeConfigError::MissingRequiredMode(required));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Probe configuration validation error.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ProbeConfigError {
+    /// Required probe mode is missing.
+    #[error("missing required probe mode: {0:?}")]
+    MissingRequiredMode(ProbeMode),
+    /// Repeated-read passes are below the SFS-479 minimum.
+    #[error("read passes ({actual}) below minimum required ({minimum})")]
+    ReadPassesBelowMinimum {
+        /// Configured pass count.
+        actual: u32,
+        /// Required minimum pass count.
+        minimum: u32,
+    },
+}
+
+/// Raw measurements collected for one repeated-read pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadPassObservation {
+    /// One-based read pass number.
+    pub pass: u32,
+    /// Bytes delivered to the reader.
+    pub bytes_read: u64,
+    /// Elapsed wall-clock time in nanoseconds.
+    pub elapsed_ns: u64,
+    /// Number of FUSE read callbacks that re-entered userspace.
+    pub callback_count: u64,
+    /// Bytes returned through FUSE read callbacks.
+    pub callback_bytes: u64,
+    /// Distribution of read callback response sizes.
+    pub callback_size_distribution: BTreeMap<u64, u64>,
+}
+
+/// Serializable per-pass report.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProbeReadPassReport {
+    /// One-based read pass number.
+    pub pass: u32,
+    /// Bytes delivered to the reader.
+    pub bytes_read: u64,
+    /// Elapsed wall-clock time in nanoseconds.
+    pub elapsed_ns: u64,
+    /// Throughput in MiB/s.
+    pub throughput_mib_s: f64,
+    /// Number of FUSE read callbacks that re-entered userspace.
+    pub callback_count: u64,
+    /// Bytes returned through FUSE read callbacks.
+    pub callback_bytes: u64,
+    /// Distribution of read callback response sizes.
+    pub callback_size_distribution: BTreeMap<u64, u64>,
+    /// Whether this pass re-entered userspace for file data.
+    pub reentered_userspace: bool,
+}
+
+/// Cache behavior inferred from repeated-read callback observations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum KernelCacheInterpretation {
+    /// Later passes avoided FUSE read callbacks after the first pass populated cache.
+    KernelCacheHit,
+    /// Later passes still re-entered FUSE for file data.
+    ReenteredUserspace,
+    /// The observations are incomplete or internally inconsistent.
+    Inconclusive,
+}
+
+/// Serializable report for one probe mode.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProbeModeReport {
+    /// Probe input mode.
+    pub mode: ProbeMode,
+    /// Per-pass repeated-read measurements.
+    pub read_passes: Vec<ProbeReadPassReport>,
+    /// Total number of read callbacks across all passes.
+    pub total_callback_count: u64,
+    /// Total callback bytes across all passes.
+    pub total_callback_bytes: u64,
+    /// Combined read callback response-size distribution.
+    pub callback_size_distribution: BTreeMap<u64, u64>,
+    /// Whether macFUSE exposes notify/store for this probe path.
+    pub notify_store_supported: bool,
+    /// Kernel-cache interpretation for this mode.
+    pub kernel_cache_interpretation: KernelCacheInterpretation,
+}
+
+/// Go/no-go guidance for investing in a full low-level macFUSE bridge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GoNoGoGuidance {
+    /// Low-level macFUSE avoided repeated userspace reads in every required mode.
+    Go,
+    /// At least one required mode still re-entered userspace on repeated reads.
+    NoGo,
+    /// The probe did not collect enough data to decide.
+    Inconclusive,
+}
+
+/// Complete SFS-479 low-level probe report.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProbeReport {
+    /// Per-mode reports.
+    pub modes: Vec<ProbeModeReport>,
+    /// Minimum repeated-read passes observed for any mode.
+    pub min_read_passes: u32,
+    /// Human-readable kernel-cache summary.
+    pub kernel_cache_summary: String,
+    /// Go/no-go guidance for full bridge implementation.
+    pub go_no_go: GoNoGoGuidance,
+}
+
+impl ProbeReport {
+    /// Build a complete probe report from per-mode results.
+    pub fn new(modes: Vec<ProbeModeReport>) -> Self {
+        let min_read_passes = modes
+            .iter()
+            .map(|mode| mode.read_passes.len() as u32)
+            .min()
+            .unwrap_or(0);
+        let mut memory_count = 0;
+        let mut local_file_count = 0;
+        let mut has_inconclusive_mode = false;
+        for mode in &modes {
+            match mode.mode {
+                ProbeMode::Memory => memory_count += 1,
+                ProbeMode::LocalFile => local_file_count += 1,
+            }
+            has_inconclusive_mode |=
+                mode.kernel_cache_interpretation == KernelCacheInterpretation::Inconclusive;
+        }
+        let go_no_go = if min_read_passes < 3
+            || memory_count != 1
+            || local_file_count != 1
+            || has_inconclusive_mode
+        {
+            GoNoGoGuidance::Inconclusive
+        } else if modes.iter().all(|mode| {
+            mode.kernel_cache_interpretation == KernelCacheInterpretation::KernelCacheHit
+        }) {
+            GoNoGoGuidance::Go
+        } else {
+            GoNoGoGuidance::NoGo
+        };
+        let kernel_cache_summary = kernel_cache_summary(&modes);
+
+        Self {
+            modes,
+            min_read_passes,
+            kernel_cache_summary,
+            go_no_go,
+        }
+    }
+}
+
+/// Build a serializable report from raw repeated-read observations.
+pub fn summarize_mode(
+    mode: ProbeMode,
+    notify_store_supported: bool,
+    mut observations: Vec<ReadPassObservation>,
+) -> ProbeModeReport {
+    observations.sort_by_key(|observation| observation.pass);
+    let mut total_callback_count = 0;
+    let mut total_callback_bytes = 0;
+    let mut combined_distribution = BTreeMap::new();
+    let mut read_passes = Vec::with_capacity(observations.len());
+
+    for observation in observations {
+        total_callback_count += observation.callback_count;
+        total_callback_bytes += observation.callback_bytes;
+        for (size, count) in &observation.callback_size_distribution {
+            *combined_distribution.entry(*size).or_default() += *count;
+        }
+        read_passes.push(ProbeReadPassReport {
+            pass: observation.pass,
+            bytes_read: observation.bytes_read,
+            elapsed_ns: observation.elapsed_ns,
+            throughput_mib_s: throughput_mib_s(observation.bytes_read, observation.elapsed_ns),
+            callback_count: observation.callback_count,
+            callback_bytes: observation.callback_bytes,
+            callback_size_distribution: observation.callback_size_distribution,
+            reentered_userspace: observation.callback_count > 0,
+        });
+    }
+
+    let kernel_cache_interpretation = interpret_kernel_cache(&read_passes);
+    ProbeModeReport {
+        mode,
+        read_passes,
+        total_callback_count,
+        total_callback_bytes,
+        callback_size_distribution: combined_distribution,
+        notify_store_supported,
+        kernel_cache_interpretation,
+    }
+}
+
+fn kernel_cache_summary(modes: &[ProbeModeReport]) -> String {
+    let mut summary = String::new();
+    for mode in modes {
+        if !summary.is_empty() {
+            summary.push_str("; ");
+        }
+        let mode_name = match mode.mode {
+            ProbeMode::Memory => "memory",
+            ProbeMode::LocalFile => "local-file",
+        };
+        let interpretation = match mode.kernel_cache_interpretation {
+            KernelCacheInterpretation::KernelCacheHit => {
+                "repeated reads avoided userspace callbacks"
+            }
+            KernelCacheInterpretation::ReenteredUserspace => "repeated reads re-entered userspace",
+            KernelCacheInterpretation::Inconclusive => "repeated reads were inconclusive",
+        };
+        summary.push_str(mode_name);
+        summary.push(' ');
+        summary.push_str(interpretation);
+    }
+    summary
+}
+
+fn throughput_mib_s(bytes_read: u64, elapsed_ns: u64) -> f64 {
+    if elapsed_ns == 0 {
+        return 0.0;
+    }
+    const BYTES_PER_MIB: f64 = 1_048_576.0;
+    const NS_PER_SEC: f64 = 1_000_000_000.0;
+
+    let mib = bytes_read as f64 / BYTES_PER_MIB;
+    let seconds = elapsed_ns as f64 / NS_PER_SEC;
+    mib / seconds
+}
+
+fn interpret_kernel_cache(read_passes: &[ProbeReadPassReport]) -> KernelCacheInterpretation {
+    let Some((first, rest)) = read_passes.split_first() else {
+        return KernelCacheInterpretation::Inconclusive;
+    };
+    if read_passes.len() < 3 || first.callback_count == 0 {
+        return KernelCacheInterpretation::Inconclusive;
+    }
+    if rest.iter().all(|pass| pass.callback_count == 0) {
+        KernelCacheInterpretation::KernelCacheHit
+    } else {
+        KernelCacheInterpretation::ReenteredUserspace
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repeated_read_report_records_callback_distribution_and_cache_interpretation() {
+        let report = summarize_mode(
+            ProbeMode::Memory,
+            false,
+            vec![
+                observation(1, 3, 3 * 1024 * 1024),
+                observation(2, 0, 0),
+                observation(3, 0, 0),
+            ],
+        );
+
+        assert_eq!(report.mode, ProbeMode::Memory);
+        assert!(!report.notify_store_supported);
+        assert_eq!(
+            report.kernel_cache_interpretation,
+            KernelCacheInterpretation::KernelCacheHit
+        );
+        assert_eq!(report.total_callback_count, 3);
+        assert_eq!(report.total_callback_bytes, 3 * 1024 * 1024);
+        assert_eq!(
+            report.callback_size_distribution.get(&(1024 * 1024)),
+            Some(&3)
+        );
+        assert!(report.read_passes[0].reentered_userspace);
+        assert!(!report.read_passes[1].reentered_userspace);
+        assert_eq!(report.read_passes[0].throughput_mib_s, 30.0);
+    }
+
+    #[test]
+    fn probe_report_requires_memory_and_local_file_results_before_go_guidance() {
+        let memory = summarize_mode(
+            ProbeMode::Memory,
+            false,
+            vec![
+                observation(1, 3, 3 * 1024 * 1024),
+                observation(2, 0, 0),
+                observation(3, 0, 0),
+            ],
+        );
+        let local_file = summarize_mode(
+            ProbeMode::LocalFile,
+            false,
+            vec![
+                observation(1, 3, 3 * 1024 * 1024),
+                observation(2, 3, 3 * 1024 * 1024),
+                observation(3, 3, 3 * 1024 * 1024),
+            ],
+        );
+
+        let report = ProbeReport::new(vec![memory, local_file]);
+
+        assert_eq!(report.modes.len(), 2);
+        assert_eq!(report.min_read_passes, 3);
+        assert_eq!(report.go_no_go, GoNoGoGuidance::NoGo);
+        assert!(
+            report
+                .kernel_cache_summary
+                .contains("local-file repeated reads re-entered userspace")
+        );
+    }
+
+    #[test]
+    fn probe_report_preserves_inconclusive_mode_in_go_no_go_guidance() {
+        let inconclusive_memory = summarize_mode(
+            ProbeMode::Memory,
+            false,
+            vec![
+                observation(1, 0, 0),
+                observation(2, 0, 0),
+                observation(3, 0, 0),
+            ],
+        );
+        let cached_local_file = summarize_mode(
+            ProbeMode::LocalFile,
+            false,
+            vec![
+                observation(1, 3, 3 * 1024 * 1024),
+                observation(2, 0, 0),
+                observation(3, 0, 0),
+            ],
+        );
+
+        let report = ProbeReport::new(vec![inconclusive_memory, cached_local_file]);
+
+        assert_eq!(report.go_no_go, GoNoGoGuidance::Inconclusive);
+    }
+
+    #[test]
+    fn probe_report_requires_distinct_required_modes_for_go_guidance() {
+        let cached_memory = || {
+            summarize_mode(
+                ProbeMode::Memory,
+                false,
+                vec![
+                    observation(1, 3, 3 * 1024 * 1024),
+                    observation(2, 0, 0),
+                    observation(3, 0, 0),
+                ],
+            )
+        };
+
+        let report = ProbeReport::new(vec![cached_memory(), cached_memory()]);
+
+        assert_eq!(report.go_no_go, GoNoGoGuidance::Inconclusive);
+    }
+
+    #[test]
+    fn probe_report_rejects_duplicate_mode_even_when_required_modes_exist() {
+        let cached_memory = summarize_mode(
+            ProbeMode::Memory,
+            false,
+            vec![
+                observation(1, 3, 3 * 1024 * 1024),
+                observation(2, 0, 0),
+                observation(3, 0, 0),
+            ],
+        );
+        let cached_local_file = summarize_mode(
+            ProbeMode::LocalFile,
+            false,
+            vec![
+                observation(1, 3, 3 * 1024 * 1024),
+                observation(2, 0, 0),
+                observation(3, 0, 0),
+            ],
+        );
+        let duplicate_memory = summarize_mode(
+            ProbeMode::Memory,
+            false,
+            vec![
+                observation(1, 3, 3 * 1024 * 1024),
+                observation(2, 0, 0),
+                observation(3, 0, 0),
+            ],
+        );
+
+        let report = ProbeReport::new(vec![cached_memory, cached_local_file, duplicate_memory]);
+
+        assert_eq!(report.go_no_go, GoNoGoGuidance::Inconclusive);
+    }
+
+    #[test]
+    fn summarize_mode_sorts_observations_by_pass_before_interpreting_cache() {
+        let report = summarize_mode(
+            ProbeMode::Memory,
+            false,
+            vec![
+                observation(2, 0, 0),
+                observation(3, 0, 0),
+                observation(1, 3, 3 * 1024 * 1024),
+            ],
+        );
+
+        assert_eq!(
+            report.kernel_cache_interpretation,
+            KernelCacheInterpretation::KernelCacheHit
+        );
+        assert_eq!(
+            report
+                .read_passes
+                .iter()
+                .map(|pass| pass.pass)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn probe_config_error_supports_standard_error_formatting() {
+        let error = ProbeConfigError::ReadPassesBelowMinimum {
+            actual: 2,
+            minimum: 3,
+        };
+
+        assert_standard_error(&error);
+        assert_eq!(
+            error.to_string(),
+            "read passes (2) below minimum required (3)"
+        );
+    }
+
+    #[test]
+    fn probe_config_validates_required_modes_and_three_read_passes() {
+        let config = ProbeConfig {
+            file_bytes: 1024 * 1024,
+            chunk_bytes: 128 * 1024,
+            read_passes: 3,
+            modes: vec![ProbeMode::Memory, ProbeMode::LocalFile],
+            notify_store_experiment: true,
+        };
+
+        config.validate().unwrap();
+
+        let missing_local_file = ProbeConfig {
+            modes: vec![ProbeMode::Memory],
+            ..config.clone()
+        };
+        assert_eq!(
+            missing_local_file.validate().unwrap_err(),
+            ProbeConfigError::MissingRequiredMode(ProbeMode::LocalFile)
+        );
+
+        let too_few_passes = ProbeConfig {
+            read_passes: 2,
+            ..config
+        };
+        assert_eq!(
+            too_few_passes.validate().unwrap_err(),
+            ProbeConfigError::ReadPassesBelowMinimum {
+                actual: 2,
+                minimum: 3
+            }
+        );
+    }
+
+    fn assert_standard_error(error: &dyn std::error::Error) {
+        assert!(error.source().is_none());
+    }
+
+    fn observation(pass: u32, callback_count: u64, callback_bytes: u64) -> ReadPassObservation {
+        let mut callback_size_distribution = BTreeMap::new();
+        if callback_count > 0 {
+            callback_size_distribution.insert(1024 * 1024, callback_count);
+        }
+        ReadPassObservation {
+            pass,
+            bytes_read: 3 * 1024 * 1024,
+            elapsed_ns: 100_000_000,
+            callback_count,
+            callback_bytes,
+            callback_size_distribution,
+        }
+    }
+}
