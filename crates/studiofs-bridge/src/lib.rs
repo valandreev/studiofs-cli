@@ -6,4 +6,5 @@
 //! concrete bridge crates.
 
 #[cfg(unix)]
+/// POSIX bridge conversions shared by Unix bridge adapters.
 pub mod posix;

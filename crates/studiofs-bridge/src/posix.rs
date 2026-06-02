@@ -1,3 +1,9 @@
+//! POSIX conversions that are independent of a concrete filesystem bridge.
+//!
+//! The helpers in this module translate between StudioFS VFS/meta types and
+//! POSIX-shaped bridge data. They intentionally avoid Linux FUSE, macFUSE, and
+//! platform-specific Finder/xattr/cache-policy behavior.
+
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use studiofs_meta::FileType;
@@ -5,29 +11,49 @@ use studiofs_vfs::{
     BridgeVfsErrorKind, OpenFlags, VfsError, classify_vfs_error, normalize_attr_times,
 };
 
+/// Platform-neutral file kind used by bridge attribute conversion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BridgeFileType {
+    /// Regular file.
     RegularFile,
+    /// Directory.
     Directory,
+    /// Symbolic link.
     Symlink,
 }
 
+/// Platform-neutral file attributes produced from StudioFS metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BridgeFileAttr {
+    /// StudioFS inode number.
     pub ino: u64,
+    /// File size in bytes.
     pub size: u64,
+    /// Number of 512-byte blocks occupied by the file.
     pub blocks: u64,
+    /// Last access time.
     pub atime: SystemTime,
+    /// Last modification time.
     pub mtime: SystemTime,
+    /// Last metadata change time.
     pub ctime: SystemTime,
+    /// Creation time.
     pub crtime: SystemTime,
+    /// File kind.
     pub kind: BridgeFileType,
+    /// POSIX permission bits.
     pub perm: u16,
+    /// Link count.
     pub nlink: u32,
+    /// Owner user ID.
     pub uid: u32,
+    /// Owner group ID.
     pub gid: u32,
+    /// Device ID for special files.
     pub rdev: u32,
+    /// Preferred block size for bridge I/O.
     pub blksize: u32,
+    /// Bridge-specific attribute flags.
     pub flags: u32,
 }
 
