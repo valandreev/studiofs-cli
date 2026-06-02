@@ -23,6 +23,10 @@ use pending_write_tracker::{
     PendingWriteAdmissionLimits, PendingWriteCompletion, PendingWriteRegistration,
     PendingWriteTracker, WriteRegistrationError,
 };
+use studiofs_bridge::posix::{
+    BridgeFileAttr, BridgeFileType, posix_flags_to_open_flags, to_bridge_attr,
+    vfs_err_to_errno as bridge_vfs_err_to_errno,
+};
 #[cfg(target_os = "macos")]
 use studiofs_meta::engine::{XATTR_CREATE_FLAG, XATTR_REPLACE_FLAG};
 #[cfg(target_os = "macos")]
@@ -947,44 +951,12 @@ fn normalize_macos_readdir_name(name: &[u8]) -> Vec<u8> {
     normalized
 }
 
-/// Convert POSIX O_* flags to our OpenFlags.
-fn posix_flags_to_open_flags(flags: i32) -> (OpenFlags, bool) {
-    let access = flags & libc::O_ACCMODE;
-    let mut f = match access {
-        libc::O_RDONLY => OpenFlags::RDONLY,
-        libc::O_WRONLY => OpenFlags::WRONLY,
-        libc::O_RDWR => OpenFlags::RDWR,
-        _ => OpenFlags::RDONLY,
-    };
-    if flags & libc::O_APPEND != 0 {
-        f = f | OpenFlags::APPEND;
-    }
-    let trunc = flags & libc::O_TRUNC != 0;
-    (f, trunc)
-}
-
 // ─── Error Mapping ───────────────────────────────────────────────────────────
 
 /// Map VfsError to the correct libc errno for FUSE replies.
 fn vfs_err_to_errno(e: &VfsError) -> i32 {
     note_critical_vfs_error(e);
-    match classify_vfs_error(e) {
-        BridgeVfsErrorKind::NotFound => libc::ENOENT,
-        BridgeVfsErrorKind::AlreadyExists => libc::EEXIST,
-        BridgeVfsErrorKind::NotDirectory => libc::ENOTDIR,
-        BridgeVfsErrorKind::IsDirectory => libc::EISDIR,
-        BridgeVfsErrorKind::DirectoryNotEmpty => libc::ENOTEMPTY,
-        BridgeVfsErrorKind::UnrecognizedVolume => libc::ENODEV,
-        BridgeVfsErrorKind::XattrValueTooLarge => libc::E2BIG,
-        BridgeVfsErrorKind::InvalidInput => libc::EINVAL,
-        BridgeVfsErrorKind::PermissionDenied => libc::EACCES,
-        BridgeVfsErrorKind::Retryable => libc::EAGAIN,
-        BridgeVfsErrorKind::TimedOut => libc::ETIMEDOUT,
-        BridgeVfsErrorKind::InsufficientResources => libc::ENOMEM,
-        BridgeVfsErrorKind::DataCorruption
-        | BridgeVfsErrorKind::CriticalRuntimeFailure
-        | BridgeVfsErrorKind::GenericFailure => libc::EIO,
-    }
+    bridge_vfs_err_to_errno(e)
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -993,29 +965,35 @@ fn vfs_err_to_errno(e: &VfsError) -> i32 {
 /// `mount_uid`/`mount_gid` are used to remap inodes that were created with
 /// uid=0/gid=0 (the old default) so that the mounting user owns them.
 fn to_fuse_attr(attr: &studiofs_meta::InodeAttr, mount_uid: u32, mount_gid: u32) -> FileAttr {
-    let times = normalize_attr_times(attr);
-    let uid = if attr.uid == 0 { mount_uid } else { attr.uid };
-    let gid = if attr.gid == 0 { mount_gid } else { attr.gid };
+    bridge_attr_to_fuse_attr(to_bridge_attr(
+        attr,
+        mount_uid,
+        mount_gid,
+        fuse_attr_blksize(),
+    ))
+}
+
+fn bridge_attr_to_fuse_attr(attr: BridgeFileAttr) -> FileAttr {
     FileAttr {
         ino: attr.ino,
         size: attr.size,
-        blocks: attr.size.div_ceil(512),
-        atime: UNIX_EPOCH + Duration::from_nanos(times.atime_unix_nanos),
-        mtime: UNIX_EPOCH + Duration::from_nanos(times.mtime_unix_nanos),
-        ctime: UNIX_EPOCH + Duration::from_nanos(times.ctime_unix_nanos),
-        crtime: UNIX_EPOCH + Duration::from_nanos(times.creation_time_unix_nanos),
+        blocks: attr.blocks,
+        atime: attr.atime,
+        mtime: attr.mtime,
+        ctime: attr.ctime,
+        crtime: attr.crtime,
         kind: match attr.kind {
-            FileType::RegularFile => FuseFileType::RegularFile,
-            FileType::Directory => FuseFileType::Directory,
-            FileType::Symlink => FuseFileType::Symlink,
+            BridgeFileType::RegularFile => FuseFileType::RegularFile,
+            BridgeFileType::Directory => FuseFileType::Directory,
+            BridgeFileType::Symlink => FuseFileType::Symlink,
         },
-        perm: attr.mode & 0o7777,
+        perm: attr.perm,
         nlink: attr.nlink,
-        uid,
-        gid,
-        rdev: 0,
-        blksize: fuse_attr_blksize(),
-        flags: 0,
+        uid: attr.uid,
+        gid: attr.gid,
+        rdev: attr.rdev,
+        blksize: attr.blksize,
+        flags: attr.flags,
     }
 }
 

@@ -4720,6 +4720,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "studiofs-bridge"
+version = "0.1.1"
+dependencies = [
+ "libc",
+ "studiofs-meta",
+ "studiofs-vfs",
+]
+
+[[package]]
 name = "studiofs-cache"
 version = "0.1.1"
 dependencies = [
@@ -4784,6 +4793,7 @@ dependencies = [
  "fuser",
  "libc",
  "smallvec",
+ "studiofs-bridge",
  "studiofs-data",
  "studiofs-meta",
  "studiofs-vfs",
