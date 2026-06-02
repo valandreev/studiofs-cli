@@ -177,10 +177,8 @@ The `mount_sanity` integration tests in each bridge crate contain two tiers:
 | `async_mounted_test_matrix_covers_correctness_and_platform_opt_in_scenarios` | FUSE | Fast, non-mounted guard that keeps the async FUSE mounted scenario matrix aligned with SFS-468/SFS-472 acceptance |
 | `async_mounted_*` | FUSE | Individual opt-in mounted async write scenarios for sequential readback, flush, fsync, release/reopen, multiple writers, same-handle appends, and unmount-after-write |
 | `linux_async_mounted_*` | FUSE/Linux | Individual opt-in mounted checks for Linux default sync mode, injected async write mode, injected async DIO mode, and optional `fio` multi-job writes |
-| `macos_async_mounted_*` | FUSE/macOS | Individual mounted macOS asyncFUSE profile workloads for `dd`, optional `fio`, fsync-heavy writes, and Finder-style multi-file copy |
 | `winfsp_mount_unmount_smoke` | WinFSP | Mount startup and named-event shutdown (minimal lifecycle) |
 | `winfsp_mount_write_read_unmount_smoke` | WinFSP | Full lifecycle: mount → write → read → readdir → delete → unmount |
-| `macos_resource_fork_roundtrip_uses_native_xattr_store` | FUSE (macOS) | Resource fork xattr round-trip (no mount required) |
 
 The full-lifecycle tests (`*_write_read_unmount_smoke`) are the primary smoke
 tests for SFS-133. They exercise file I/O through the real OS filesystem layer,
@@ -345,8 +343,9 @@ cargo test -p studiofs-e2e --test client_controller force_kill_then_remount_reus
 ## Platform-Gated Unit Tests
 
 `studiofs-fuse` and `studiofs-winfsp` contain unit tests that are only
-meaningful on the OS they target. These tests must be run on the correct
-host — cross-compilation or a Linux-only CI pass does not count.
+meaningful on the OS they target. `studiofs-fuse` targets Linux only; macOS
+bridge tests belong to the future macOS bridge crate. These tests must be run
+on the correct host — cross-compilation does not count.
 
 ### Rules for writing platform-gated unit tests
 
@@ -355,8 +354,6 @@ host — cross-compilation or a Linux-only CI pass does not count.
      Prefer this over `#[cfg(not(target_os = "macos"))]` — the latter would also fire on
      FreeBSD and other Unix variants where `fusermount3` is not present and the
      behavior would be undefined.
-   - Tests that validate macOS-specific mount options (`volname`, `local`,
-     `foreground`): `#[cfg(target_os = "macos")]`
    - Tests that validate WinFSP behavior (drive letters, timeout parsing):
      no extra `cfg` needed — the crate root already has `#![cfg(windows)]`
 
@@ -364,10 +361,6 @@ host — cross-compilation or a Linux-only CI pass does not count.
    Platform-gated tests that would be useless on other OSes must use `cfg`
    guards, not `#[ignore]`. CI command details per platform:
    - Linux: `cargo test -p studiofs-fuse --lib` (unit tests only).
-   - macOS: `cargo test -p studiofs-fuse --lib --tests` (unit tests +
-     integration tests). The `--tests` flag is required so that
-     non-mount platform tests placed in `tests/` (e.g.
-     `macos_resource_fork_roundtrip_uses_native_xattr_store`) are also executed.
    - Windows: `cargo test -p studiofs-winfsp --lib` (unit tests only)
    Only the relevant runner runs each step; the other platforms skip it entirely
      `macos_resource_fork_roundtrip_uses_native_xattr_store`) are also executed.
@@ -396,7 +389,6 @@ host — cross-compilation or a Linux-only CI pass does not count.
 | Crate | CI step | Runner |
 |-------|---------|--------|
 | `studiofs-fuse` (Linux paths) | `cargo-test-studiofs-fuse-linux` / `cargo-test-studiofs-fuse-rocky` | RWX `ubuntu:24.04` + `rockylinux:9` |
-| `studiofs-fuse` (macOS paths) | `cargo test (studiofs-fuse — macOS paths)` | `macos-latest` |
 | `studiofs-winfsp` | `cargo test (studiofs-winfsp)` | `windows-latest` |
 
 Each step is separate from the workspace run so a failure directly identifies
@@ -517,8 +509,8 @@ Smoke tests also run in the separate `.github/workflows/smoke.yml` workflow:
 | `workflow_dispatch` | Manual run — all platforms |
 
 The workflow runs independently of the main `rust.yml` pipeline and never
-starts automatically. macOS smoke tests use `continue-on-error: true` because
-the macFUSE system extension may not load on hosted runners without a reboot.
+starts automatically. macOS smoke coverage belongs to the future macOS bridge
+track and must not be treated as `studiofs-fuse` coverage.
 
 See [docs/smoke-test-strategy.md](smoke-test-strategy.md) for the full
 strategy document covering hosted vs self-hosted responsibilities.

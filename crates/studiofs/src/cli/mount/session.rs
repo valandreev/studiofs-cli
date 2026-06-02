@@ -2381,8 +2381,10 @@ mod tests {
     #[test]
     fn default_mount_backend_matches_platform() {
         let backend = default_mount_backend();
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         assert_eq!(backend.name(), "FUSE");
+        #[cfg(all(unix, not(target_os = "linux")))]
+        assert_eq!(backend.name(), "unsupported-unix");
         #[cfg(windows)]
         assert_eq!(backend.name(), "WinFSP");
     }

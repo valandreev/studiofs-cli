@@ -1978,11 +1978,11 @@ mod tests {
     }
 
     #[test]
-    fn hidden_non_macos_root_metadata_name_matches_trashes_only() {
-        assert!(is_hidden_non_macos_root_metadata_name(b".Trashes"));
-        assert!(!is_hidden_non_macos_root_metadata_name(b".Trash"));
-        assert!(!is_hidden_non_macos_root_metadata_name(b".Spotlight-V100"));
-        assert!(!is_hidden_non_macos_root_metadata_name(b"visible"));
+    fn hidden_platform_root_metadata_name_matches_trashes_only() {
+        assert!(is_hidden_platform_root_metadata_name(b".Trashes"));
+        assert!(!is_hidden_platform_root_metadata_name(b".Trash"));
+        assert!(!is_hidden_platform_root_metadata_name(b".Spotlight-V100"));
+        assert!(!is_hidden_platform_root_metadata_name(b"visible"));
     }
 
     #[test]

@@ -1,13 +1,13 @@
 # Platform Bridges
 
-StudioFS supports two platforms through thin bridge crates that translate OS-specific filesystem callbacks into `StudioVfs` method calls.
+StudioFS currently has Linux and Windows bridge crates that translate OS-specific filesystem callbacks into `StudioVfs` method calls. macOS bridge work is tracked separately and is no longer owned by `studiofs-fuse`.
 
 ## Overview
 
 ```
 ┌──────────────────────┐     ┌──────────────────────┐
 │   studiofs-winfsp    │     │   studiofs-fuse       │
-│   (Windows only)     │     │   (Linux / macOS)     │
+│   (Windows only)     │     │   (Linux only)        │
 ├──────────────────────┤     ├──────────────────────┤
 │  winfsp crate (0.12) │     │  fuser crate (0.16)  │
 │  FileSystemContext    │     │  Filesystem trait     │
@@ -161,37 +161,31 @@ Current signature includes additional policy controls:
 - `shutdown_event_name` allows external graceful shutdown signal integration.
 - WinFSP forwards caller buffers into the shared buffered VFS read/write paths; there is no Windows-specific alternate data path.
 
-## FUSE Bridge (`studiofs-fuse`)
+## Linux FUSE Bridge (`studiofs-fuse`)
 
 ### Requirements
 
 - Linux: `libfuse3-dev` (or `fuse3`)
-- macOS: [macFUSE](https://osxfuse.github.io/) or [FUSE-T](https://www.fuse-t.org/)
 
 ### Mount Options
 
 | Option | Value |
 |--------|-------|
 | `fsname` | `"studiofs"` |
-| `auto_unmount` | Yes |
-| `allow_other` | macOS: yes. Linux: opt-in via `STUDIOFS_FUSE_ALLOW_OTHER=1` |
-| Kernel `max_write` | `131072` bytes on macOS, `16777216` bytes on Linux by default. Override: `STUDIOFS_FUSE_MAX_WRITE_BYTES` in `Filesystem::init()` |
-| Kernel `max_readahead` | `16777216` bytes on Linux, `1048576` bytes on macOS by default. Override: `STUDIOFS_FUSE_MAX_READAHEAD_BYTES` in `Filesystem::init()` |
-| Kernel `max_background` | macOS: `50` by default. Linux: kernel/fuser default unless explicitly set. Override: `STUDIOFS_FUSE_MAX_BACKGROUND` in `Filesystem::init()` |
-| Kernel `congestion_threshold` | macOS: `40` by default. Linux: kernel/fuser default unless explicitly set. Override: `STUDIOFS_FUSE_CONGESTION_THRESHOLD` in `Filesystem::init()` |
-| FUSE async write replies | macOS: enabled by default. Linux: disabled by default. Override: `STUDIOFS_FUSE_ASYNC_WRITE=1` to enable or `0` / `false` / `off` to disable |
-| Linux: `async_dio` capability | Disabled by default. Opt in with `STUDIOFS_FUSE_ASYNC_DIO=1`; requested only when the kernel advertises `FUSE_ASYNC_DIO` |
-| macOS: `volname` | `"StudioFS"` |
-| macOS: `local` | Yes |
-| macOS: cache policy | `winfsp` target policy by default. Set `STUDIOFS_MACOS_FUSE_CACHE_POLICY=direct` for strict rollback mode |
-| macOS: validated macFUSE | 5.2.0 |
+| `auto_unmount` | Not requested by default; the CLI owns explicit unmount cleanup |
+| `allow_other` | Opt-in via `STUDIOFS_FUSE_ALLOW_OTHER=1` |
+| Kernel `max_write` | `16777216` bytes by default. Override: `STUDIOFS_FUSE_MAX_WRITE_BYTES` in `Filesystem::init()` |
+| Kernel `max_readahead` | `16777216` bytes by default. Override: `STUDIOFS_FUSE_MAX_READAHEAD_BYTES` in `Filesystem::init()` |
+| Kernel `max_background` | Kernel/fuser default unless explicitly set. Override: `STUDIOFS_FUSE_MAX_BACKGROUND` in `Filesystem::init()` |
+| Kernel `congestion_threshold` | Kernel/fuser default unless explicitly set. Override: `STUDIOFS_FUSE_CONGESTION_THRESHOLD` in `Filesystem::init()` |
+| FUSE async write replies | Disabled by default. Override: `STUDIOFS_FUSE_ASYNC_WRITE=1` to enable or `0` / `false` / `off` to disable |
+| `async_dio` capability | Disabled by default. Opt in with `STUDIOFS_FUSE_ASYNC_DIO=1`; requested only when the kernel advertises `FUSE_ASYNC_DIO` |
 
 `STUDIOFS_FUSE_MAX_WRITE_BYTES`, `STUDIOFS_FUSE_MAX_READAHEAD_BYTES`,
 `STUDIOFS_FUSE_MAX_BACKGROUND`, and `STUDIOFS_FUSE_CONGESTION_THRESHOLD` are
 the primary FUSE bridge throughput controls for local payload I/O. Linux keeps
 the kernel/fuser background queue defaults unless the background queue env vars
-are explicitly set. macOS defaults to the current candidate `50/40` background
-queue policy. Set either background queue env var to an empty string to leave
+are explicitly set. Set either background queue env var to an empty string to leave
 that value at the kernel/fuser default; `0` has the same opt-out meaning for
 these two background queue controls. StudioFS clamps congestion thresholds above
 an explicitly configured `max_background`; when only
@@ -200,7 +194,7 @@ its own default `max_background` during the FUSE init reply.
 On Linux, `allow_other` also requires `user_allow_other` to be enabled in
 `/etc/fuse.conf`; otherwise `fusermount` rejects the mount request.
 
-### Linux cache and I/O policy
+### Cache and I/O policy
 
 Linux FUSE keeps buffered I/O as the default. Regular read-only opens return
 `FOPEN_KEEP_CACHE` so safe reopen and sequential-read paths can reuse the
@@ -217,40 +211,12 @@ metadata invalidation. POSIX `O_SYNC` / `O_DSYNC` write handles map to
 `FUSE_ASYNC_DIO` during FUSE init when supported by the kernel, but it does not
 turn on global direct I/O and does not change the buffered read cache policy.
 
-### macOS cache and I/O policy
+### macOS bridge track
 
-macOS FUSE defaults to the WinFSP/JuiceFS-style cache policy. The mount keeps
-`local`, `sparse`, and `volname`, adds `novncache`, `daemon_timeout=60`, and an
-`iosize=65536` matching JuiceFS's Darwin mount profile, and does not globally mount
-with `direct_io` or `nolocalcaches`.
-The default macOS asyncFUSE profile also enables async write replies, applies
-the `50/40` background queue policy, keeps `max_write=131072`, and reports the
-matching `65536` preferred I/O size through regular file attributes. Set
-`STUDIOFS_FUSE_ASYNC_WRITE=0` to restore synchronous write callbacks without
-changing the cache policy, or set `STUDIOFS_MACOS_FUSE_CACHE_POLICY=direct` for
-the strict direct-I/O rollback profile.
-For macFUSE 5.2.0, regular file attributes must report the same preferred I/O
-size (`st_blksize` / FUSE `blksize`) as the mount `iosize`; advertising the old
-512-byte value causes macFUSE to split large sequential reads and writes into
-small callbacks even when the mount-level `iosize` is larger.
-
-Regular read-only file opens return `FOPEN_KEEP_CACHE` so safe media and
-sequential-read workloads can use the kernel cache/readahead path. Write-capable
-or truncating opens return macFUSE `FOPEN_PURGE_UBC`, which drops stale readonly
-UBC pages without disabling buffered I/O for the descriptor. Correctness depends
-on scoped explicit invalidation through `FuseKernelInvalidator`: data invalidation
-uses `inval_inode(ino, 0, -1)` when cached pages are unsafe, while same-mount
-publication of already accepted local bytes uses attribute-only invalidation so
-macOS does not evict freshly written UBC pages after upload completion.
-
-`STUDIOFS_MACOS_FUSE_CACHE_POLICY=direct` preserves the older strict rollback
-mode: mount options include `direct_io`, `nolocalcaches`, and `auto_cache`, and
-all opens use direct I/O.
-
-On macOS, StudioFS handles `getxattr` / `setxattr` / `listxattr` /
-`removexattr` natively (including `com.apple.ResourceFork`) so Finder metadata
-and resource-fork writes stay in xattrs rather than relying on AppleDouble
-fallback.
+macOS-specific mount options, UBC policy, Finder metadata behavior, Unicode
+normalization, and native resource-fork handling are not implemented in
+`studiofs-fuse`. They belong to the future macOS bridge track and should be
+tested in that bridge once it exists.
 
 ### Trash and recycle-bin behavior
 
@@ -266,14 +232,14 @@ is retained, and local payload cache cleanup follows normal unlink behavior.
 Existing trash-like roots are hidden from root directory listings so they are
 not exposed as user-visible folders in mounted trees.
 
-### macOS metadata file filtering
+### Metadata file filtering
 
-Finder and related macOS services may also try to create metadata sidecar files
-such as `.DS_Store`, AppleDouble `._*`, and root-level system metadata names like
-`.Spotlight-V100`, and `.fseventsd`.
+Desktop services may try to create metadata sidecar files such as `.DS_Store`,
+AppleDouble `._*`, and root-level system metadata names like `.Spotlight-V100`,
+and `.fseventsd`.
 
 StudioFS drops these names at the VFS layer:
-- `create` / `open` flows succeed locally so Finder does not surface errors
+- `create` / `open` flows succeed locally so desktop clients do not surface errors
 - ignored files stay ephemeral to the mounting client only
 - root metadata names are absorbed into ephemeral ignored entries; `mkdir`
   yields an ephemeral directory inode and file/symlink-style creates are also
@@ -283,40 +249,14 @@ StudioFS drops these names at the VFS layer:
 - these root metadata directories are filtered from `readdir`
 
 StudioFS also enforces a size limit on xattr values to avoid unbounded metadata
-in-memory pressure from very large native `com.apple.*` writes:
-- `com.apple.ResourceFork` and all xattrs are validated against `STUDIOFS_XATTR_MAX_BYTES`
+in-memory pressure from very large native xattr writes:
+- all xattrs are validated against `STUDIOFS_XATTR_MAX_BYTES`
 - writes larger than the configured limit fail predictably (`xattr` set error) without partial persistence
 - default limit is `4MB`; raise or lower it with environment configuration if needed
-- `com.apple.ResourceFork` values are stored with a resource-fork-aware metadata codec:
-  compress-on-benefit (RLE + frame), otherwise plain bytes
 - callers still observe plain bytes on `getxattr`; existing plain persisted values remain readable
 
-This keeps shared directories free of macOS-only garbage while preserving normal
-Finder interaction.
-
-### macOS unsupported ioctls
-
-During mount/unmount lifecycle macOS may probe some filesystem control operations
-that are not implemented by StudioFS. These `ioctl` requests are answered with
-`ENOTTY` and do not indicate filesystem corruption; they are handled as explicit,
-expected no-op control-plane responses.
-
-### macOS Unicode normalization (NFC/NFD)
-
-StudioFS keeps namespace bytes unchanged in the shared VFS/metadata layers, but
-applies Unicode normalization handling at the macOS FUSE boundary to match
-Finder/macFUSE expectations.
-
-Current policy:
-- `readdir` / `readdirplus` return names in decomposed form (NFD) for Finder compatibility
-- `lookup` and `rename` resolve names by canonical Unicode equivalence (NFD key),
-  so NFC/NFD variants of the same visible name map to the same directory entry when unique
-- when multiple byte-distinct entries would normalize to the same key, StudioFS
-  does not guess; it falls back to byte-exact behavior
-- Linux and Windows behavior is unchanged
-
-This scope keeps macOS interoperability predictable without broad
-cross-platform name-semantics changes.
+This keeps shared directories free of host metadata noise while preserving normal
+Linux FUSE behavior.
 
 ### Implementation: `StudioFuseFs`
 
@@ -401,7 +341,7 @@ and explicit unmount requests into `fuser::SessionUnmounter`.
 
 ## Platform Differences
 
-| Feature | Windows (WinFSP) | Linux/macOS (FUSE) |
+| Feature | Windows (WinFSP) | Linux (FUSE) |
 |---------|-------------------|---------------------|
 | Mount point | Drive letter (`Z:`) only | Directory |
 | Case sensitivity | Configurable (default: sensitive) | Always sensitive |

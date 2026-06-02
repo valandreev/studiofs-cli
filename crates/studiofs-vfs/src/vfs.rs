@@ -661,7 +661,7 @@ fn is_probable_trash_component(name: &[u8]) -> bool {
 }
 
 /// Returns true when a root metadata entry should be hidden for non-macOS platforms.
-pub fn is_hidden_non_macos_root_metadata_name(name: &[u8]) -> bool {
+pub fn is_hidden_platform_root_metadata_name(name: &[u8]) -> bool {
     name == b".Trashes"
 }
 

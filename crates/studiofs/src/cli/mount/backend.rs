@@ -4,6 +4,7 @@ use std::sync::Arc;
 use studiofs_vfs::StudioVfs;
 use tokio::runtime::Handle;
 
+#[cfg_attr(all(unix, not(target_os = "linux")), allow(dead_code))]
 pub(crate) struct BackendLaunch {
     pub(crate) vfs: Arc<StudioVfs>,
     pub(crate) runtime_handle: Handle,
@@ -19,9 +20,14 @@ pub(crate) trait MountBackend: Send + Sync {
     fn serve(&self, launch: BackendLaunch) -> io::Result<()>;
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub(crate) fn default_mount_backend() -> Box<dyn MountBackend> {
     Box::new(FuseMountBackend)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+pub(crate) fn default_mount_backend() -> Box<dyn MountBackend> {
+    Box::new(UnsupportedUnixMountBackend)
 }
 
 #[cfg(windows)]
@@ -29,10 +35,10 @@ pub(crate) fn default_mount_backend() -> Box<dyn MountBackend> {
     Box::new(WinfspMountBackend)
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 struct FuseMountBackend;
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 impl MountBackend for FuseMountBackend {
     fn name(&self) -> &'static str {
         "FUSE"
@@ -49,6 +55,23 @@ impl MountBackend for FuseMountBackend {
         request.read_only = launch.read_only;
         request.signal_handling = studiofs_fuse::SignalHandling::InstallForCli;
         studiofs_fuse::mount_with_request(request)
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+struct UnsupportedUnixMountBackend;
+
+#[cfg(all(unix, not(target_os = "linux")))]
+impl MountBackend for UnsupportedUnixMountBackend {
+    fn name(&self) -> &'static str {
+        "unsupported-unix"
+    }
+
+    fn serve(&self, _launch: BackendLaunch) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "StudioFS FUSE backend is Linux-only; macOS bridge support is tracked separately",
+        ))
     }
 }
 
@@ -71,5 +94,16 @@ impl MountBackend for WinfspMountBackend {
             read_only: launch.read_only,
             shutdown_event_name: Some(shutdown_event_name),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[test]
+    fn non_linux_unix_default_backend_is_explicitly_unsupported() {
+        let backend = super::default_mount_backend();
+
+        assert_eq!(backend.name(), "unsupported-unix");
     }
 }
