@@ -1,12 +1,21 @@
 //! Build script for the macOS low-level macFUSE bridge boundary.
 
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
+#[cfg(target_os = "macos")]
 const MACFUSE_FALLBACK_INCLUDE_DIRS: &[&str] = &[
     "/opt/homebrew/include/osxfuse",
     "/usr/local/include/osxfuse",
 ];
 
+#[cfg(target_os = "macos")]
+const MACFUSE_FALLBACK_LIB_DIRS: &[&str] = &["/opt/homebrew/lib", "/usr/local/lib"];
+
+#[cfg(not(target_os = "macos"))]
+fn main() {}
+
+#[cfg(target_os = "macos")]
 fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;
@@ -23,6 +32,7 @@ fn main() {
         .output()
     else {
         add_macfuse_fallback_include_dirs(&mut build);
+        add_macfuse_fallback_link_search_dirs();
         build.compile("studiofs_macfuse_low_level_ops");
         return;
     };
@@ -37,21 +47,36 @@ fn main() {
         }
     } else {
         add_macfuse_fallback_include_dirs(&mut build);
+        add_macfuse_fallback_link_search_dirs();
     }
     build.compile("studiofs_macfuse_low_level_ops");
 }
 
+#[cfg(target_os = "macos")]
 fn add_macfuse_fallback_include_dirs(build: &mut cc::Build) {
     for path in macfuse_fallback_include_dirs() {
         build.include(path);
     }
 }
 
+#[cfg(target_os = "macos")]
+fn add_macfuse_fallback_link_search_dirs() {
+    for path in macfuse_fallback_lib_dirs() {
+        println!("cargo:rustc-link-search=native={path}");
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn macfuse_fallback_include_dirs() -> &'static [&'static str] {
     MACFUSE_FALLBACK_INCLUDE_DIRS
 }
 
-#[cfg(test)]
+#[cfg(target_os = "macos")]
+fn macfuse_fallback_lib_dirs() -> &'static [&'static str] {
+    MACFUSE_FALLBACK_LIB_DIRS
+}
+
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     #[test]
     fn macfuse_fallback_include_dirs_cover_homebrew_prefixes() {
@@ -59,5 +84,13 @@ mod tests {
 
         assert!(dirs.contains(&"/opt/homebrew/include/osxfuse"));
         assert!(dirs.contains(&"/usr/local/include/osxfuse"));
+    }
+
+    #[test]
+    fn macfuse_fallback_lib_dirs_cover_homebrew_prefixes() {
+        let dirs = super::macfuse_fallback_lib_dirs();
+
+        assert!(dirs.contains(&"/opt/homebrew/lib"));
+        assert!(dirs.contains(&"/usr/local/lib"));
     }
 }
