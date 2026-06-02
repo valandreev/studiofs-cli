@@ -285,7 +285,7 @@ fn parse_bridge_bool_env_value(raw: &str) -> bool {
 }
 
 fn should_request_fuse_async_dio_from_env_value(raw: &str) -> bool {
-    cfg!(target_os = "linux") && parse_bridge_bool_env_value(raw)
+    parse_bridge_bool_env_value(raw)
 }
 
 fn should_request_fuse_async_dio_from_env() -> bool {
@@ -527,10 +527,6 @@ fn heal_hidden_linux_root_metadata_entry(vfs: &StudioVfs, parent: u64, name: &[u
     }
 }
 
-fn is_expected_trashes_mkdir_exists(_parent: u64, _name: &[u8], _err: &VfsError) -> bool {
-    false
-}
-
 fn is_missing_xattr_error(err: &VfsError) -> bool {
     matches!(
         err,
@@ -640,7 +636,6 @@ pub struct StudioFuseFs {
     rt: Handle,
     pending_writes: PendingWriteTracker,
     async_write_enabled: bool,
-    #[cfg(target_os = "linux")]
     linux_async_dio_enabled: bool,
     async_write_admission_policy: FuseAsyncWriteAdmissionPolicy,
     /// UID of the user that mounted the filesystem. Inodes owned by uid=0 in
@@ -736,7 +731,6 @@ impl StudioFuseFs {
             rt,
             pending_writes: PendingWriteTracker::default(),
             async_write_enabled: options.async_write_enabled,
-            #[cfg(target_os = "linux")]
             linux_async_dio_enabled: options.linux_async_dio_enabled,
             async_write_admission_policy: FuseAsyncWriteAdmissionPolicy {
                 limits: async_write_admission_limits,
@@ -937,7 +931,6 @@ impl Filesystem for StudioFuseFs {
             "configured FUSE bridge I/O policy"
         );
 
-        #[cfg(target_os = "linux")]
         if self.linux_async_dio_enabled
             && let Err(unsupported) = config.add_capabilities(fuser::consts::FUSE_ASYNC_DIO)
         {
@@ -1010,29 +1003,16 @@ impl Filesystem for StudioFuseFs {
                 0,
             ),
             Err(e) => {
-                if is_expected_trashes_mkdir_exists(parent, &name_bytes, &e) {
-                    debug!(
-                        parent,
-                        uid = req.uid(),
-                        gid = req.gid(),
-                        mode,
-                        umask = _umask,
-                        name = %debug_name(&name_bytes),
-                        name_bytes = ?name_bytes,
-                        "mkdir -> {e}"
-                    );
-                } else {
-                    error!(
-                        parent,
-                        uid = req.uid(),
-                        gid = req.gid(),
-                        mode,
-                        umask = _umask,
-                        name = %debug_name(&name_bytes),
-                        name_bytes = ?name_bytes,
-                        "mkdir -> {e}"
-                    );
-                }
+                error!(
+                    parent,
+                    uid = req.uid(),
+                    gid = req.gid(),
+                    mode,
+                    umask = _umask,
+                    name = %debug_name(&name_bytes),
+                    name_bytes = ?name_bytes,
+                    "mkdir -> {e}"
+                );
                 reply.error(vfs_err_to_errno(&e));
             }
         }
@@ -2321,11 +2301,10 @@ mod tests {
         DEFAULT_FUSE_MAX_READAHEAD_BYTES, DEFAULT_FUSE_MAX_WRITE_BYTES,
         FuseAsyncWriteAdmissionPolicy, FuseBackgroundQueuePolicy, FuseEmptyReplyGuard,
         FuseWriteReplyGuard, PendingFuseCloseGuard, StudioFuseFs, TTL, complete_fuse_write_reply,
-        fuse_write_local_sync_policy, is_expected_trashes_mkdir_exists, is_missing_xattr_error,
-        missing_xattr_errno, normalize_unix_mode, posix_flags_to_open_flags,
-        resolve_async_fuse_write_enabled, should_enable_async_fuse_write_from_env_value,
-        should_log_invalidation_error, should_request_fuse_async_dio_from_env_value, to_fuse_attr,
-        vfs_err_to_errno,
+        fuse_write_local_sync_policy, is_missing_xattr_error, missing_xattr_errno,
+        normalize_unix_mode, posix_flags_to_open_flags, resolve_async_fuse_write_enabled,
+        should_enable_async_fuse_write_from_env_value, should_log_invalidation_error,
+        should_request_fuse_async_dio_from_env_value, to_fuse_attr, vfs_err_to_errno,
     };
     use crate::fs::pending_write_tracker::{PendingWriteAdmissionLimits, PendingWriteTracker};
     use std::cell::Cell;
@@ -2630,10 +2609,7 @@ mod tests {
         }
 
         for true_value in ["1", "true", "True", "TRUE", "yes", "Yes", "on", "On"] {
-            assert_eq!(
-                should_request_fuse_async_dio_from_env_value(true_value),
-                cfg!(target_os = "linux")
-            );
+            assert!(should_request_fuse_async_dio_from_env_value(true_value));
         }
     }
 
@@ -3004,24 +2980,6 @@ mod tests {
             source: studiofs_data::store::DataError::Storage("timeout".into()),
         });
         assert_eq!(vfs_err_to_errno(&exhausted), libc::ETIMEDOUT);
-    }
-
-    #[test]
-    fn expected_trashes_mkdir_exists_is_scoped() {
-        let exists = VfsError::Meta(MetaError::EntryExists {
-            parent: studiofs_meta::ROOT_INO,
-            name: ".Trashes".into(),
-        });
-        let _missing = VfsError::Meta(MetaError::EntryNotFound {
-            parent: studiofs_meta::ROOT_INO,
-            name: ".Trashes".into(),
-        });
-
-        assert!(!is_expected_trashes_mkdir_exists(
-            studiofs_meta::ROOT_INO,
-            b".Trashes",
-            &exists
-        ));
     }
 
     #[test]

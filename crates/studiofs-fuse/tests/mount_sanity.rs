@@ -56,7 +56,7 @@ impl MountedScenarioPlatform {
     fn matches_current(self) -> bool {
         match self {
             Self::AnyUnix => true,
-            Self::Linux => cfg!(target_os = "linux"),
+            Self::Linux => true,
         }
     }
 }

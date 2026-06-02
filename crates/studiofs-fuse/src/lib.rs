@@ -68,12 +68,6 @@ fn build_mount_options_inner(
 ) -> Result<Vec<fuser::MountOption>, MountOptionError> {
     validate_volume_name(volume_name)?;
     let mut options = vec![fuser::MountOption::FSName(volume_name.into())];
-    // On Linux, fuser's auto_unmount helper can leave CLI SIGTERM shutdowns
-    // attached until the external watchdog sends SIGKILL. Let Mount::drop use
-    // the explicit lazy fusermount/umount path instead.
-    if !cfg!(target_os = "linux") {
-        options.push(fuser::MountOption::AutoUnmount);
-    }
     if allow_other_env {
         options.push(fuser::MountOption::AllowOther);
     }
@@ -443,19 +437,11 @@ mod tests {
                 .iter()
                 .any(|opt| matches!(opt, fuser::MountOption::FSName(name) if name == "studiofs"))
         );
-        #[cfg(target_os = "linux")]
         assert!(
             !options
                 .iter()
                 .any(|opt| matches!(opt, fuser::MountOption::AutoUnmount))
         );
-        #[cfg(not(target_os = "linux"))]
-        assert!(
-            options
-                .iter()
-                .any(|opt| matches!(opt, fuser::MountOption::AutoUnmount))
-        );
-        #[cfg(target_os = "linux")]
         assert!(!mount_options_include_allow_other(&options));
         assert!(!options.iter().any(
             |opt| matches!(opt, fuser::MountOption::CUSTOM(custom) if custom == "foreground")
@@ -547,7 +533,6 @@ mod tests {
         drop(first);
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn build_mount_options_adds_allow_other_when_opted_in_on_linux() {
         let options =

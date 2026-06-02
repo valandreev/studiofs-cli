@@ -660,7 +660,7 @@ fn is_probable_trash_component(name: &[u8]) -> bool {
     is_unix_trash_component(name) || is_windows_recycle_bin_component(name)
 }
 
-/// Returns true when a root metadata entry should be hidden for non-macOS platforms.
+/// Returns true when a root metadata entry should be hidden on platforms where it is not native.
 pub fn is_hidden_platform_root_metadata_name(name: &[u8]) -> bool {
     name == b".Trashes"
 }
