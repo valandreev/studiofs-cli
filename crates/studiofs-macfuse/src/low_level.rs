@@ -173,10 +173,16 @@ pub(crate) mod raw {
         pub fn fuse_mount(mountpoint: *const c_char, args: *mut FuseArgs) -> *mut FuseChan;
         /// Attach a channel to a session.
         pub fn fuse_session_add_chan(session: *mut FuseSession, channel: *mut FuseChan);
+        /// Remove a channel from its session.
+        pub fn fuse_session_remove_chan(channel: *mut FuseChan);
         /// Destroy a low-level session and its attached channel.
         pub fn fuse_session_destroy(session: *mut FuseSession);
         /// Ask a session loop to exit.
         pub fn fuse_session_exit(session: *mut FuseSession);
+        /// Unmount a FUSE mount point and release its channel.
+        pub fn fuse_unmount(mountpoint: *const c_char, channel: *mut FuseChan);
+        /// Free arguments allocated by libfuse option parsing.
+        pub fn fuse_opt_free_args(args: *mut FuseArgs);
     }
 }
 
@@ -277,6 +283,9 @@ impl SessionConfig {
         if self.read_only {
             args.push("-oro".to_owned());
         }
+        // `run_in_foreground` is runner policy. The macFUSE 2.x low-level
+        // session constructor rejects `-f`, so daemonization must stay outside
+        // the argument vector passed to `fuse_lowlevel_new`.
         args
     }
 
@@ -333,9 +342,21 @@ impl OwnedFuseArgs {
     }
 }
 
+impl Drop for OwnedFuseArgs {
+    fn drop(&mut self) {
+        // SAFETY: `self.raw` is the same `fuse_args` structure passed to
+        // libfuse. If libfuse allocated a replacement argv during option
+        // parsing, `fuse_opt_free_args` releases it; otherwise it is a no-op for
+        // our stack-owned Rust argv (`allocated == 0`).
+        unsafe { raw::fuse_opt_free_args(&mut self.raw) };
+    }
+}
+
 /// Mounted low-level macFUSE session.
 pub struct Session {
     raw: NonNull<raw::FuseSession>,
+    channel: NonNull<raw::FuseChan>,
+    mount_point: CString,
 }
 
 impl Session {
@@ -367,7 +388,11 @@ impl Session {
             Some(channel) => {
                 // SAFETY: Both pointers were returned by macFUSE and are live.
                 unsafe { raw::fuse_session_add_chan(session.as_ptr(), channel.as_ptr()) };
-                Ok(Self { raw: session })
+                Ok(Self {
+                    raw: session,
+                    channel,
+                    mount_point,
+                })
             }
             None => {
                 // SAFETY: `session` is live and has not been returned.
@@ -388,7 +413,14 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        // SAFETY: `self.raw` is owned by this wrapper and destroyed exactly once.
+        // SAFETY: `self.channel` was attached to `self.raw`; removing it before
+        // unmount avoids leaving the session with a stale channel pointer.
+        unsafe { raw::fuse_session_remove_chan(self.channel.as_ptr()) };
+        // SAFETY: `self.mount_point` is the same NUL-terminated path passed to
+        // `fuse_mount`, and `self.channel` is still the live channel for it.
+        unsafe { raw::fuse_unmount(self.mount_point.as_ptr(), self.channel.as_ptr()) };
+        // SAFETY: `self.raw` is owned by this wrapper and destroyed exactly once
+        // after its channel has been detached and unmounted.
         unsafe { raw::fuse_session_destroy(self.raw.as_ptr()) };
     }
 }
@@ -467,7 +499,7 @@ impl OpenReply {
 
 /// Owned low-level request token.
 pub struct Request {
-    raw: NonNull<raw::FuseReq>,
+    raw: Option<NonNull<raw::FuseReq>>,
     _not_send_sync: PhantomData<*mut ()>,
 }
 
@@ -481,13 +513,28 @@ impl Request {
     /// reply method.
     pub unsafe fn from_raw(raw: *mut raw::FuseReq) -> Option<Self> {
         NonNull::new(raw).map(|raw| Self {
-            raw,
+            raw: Some(raw),
             _not_send_sync: PhantomData,
         })
     }
 
     fn as_ptr(&self) -> *mut raw::FuseReq {
-        self.raw.as_ptr()
+        self.raw.expect("macFUSE request already replied").as_ptr()
+    }
+
+    fn take_raw(&mut self) -> NonNull<raw::FuseReq> {
+        self.raw.take().expect("macFUSE request already replied")
+    }
+}
+
+impl Drop for Request {
+    fn drop(&mut self) {
+        if let Some(raw) = self.raw.take() {
+            // SAFETY: `Request` owns a live, unreplied callback request by
+            // construction. Dropping without a reply must fail the request so
+            // the kernel is not left waiting indefinitely.
+            unsafe { raw::fuse_reply_err(raw.as_ptr(), libc::EIO) };
+        }
     }
 }
 
@@ -503,41 +550,46 @@ impl Reply {
     }
 
     /// Reply with a POSIX errno.
-    pub fn error(self, errno: c_int) -> io::Result<()> {
+    pub fn error(mut self, errno: c_int) -> io::Result<()> {
+        let request = self.request.take_raw();
         // SAFETY: `Request` guarantees a live, unreplied low-level request and
         // this method consumes it, so macFUSE sees at most one reply.
-        reply_result(unsafe { raw::fuse_reply_err(self.request.as_ptr(), errno) })
+        reply_result(unsafe { raw::fuse_reply_err(request.as_ptr(), errno) })
     }
 
     /// Reply with an entry.
-    pub fn entry(self, entry: &Entry) -> io::Result<()> {
+    pub fn entry(mut self, entry: &Entry) -> io::Result<()> {
+        let request = self.request.take_raw();
         // SAFETY: `entry.raw` points to initialized C-compatible data for the
         // duration of the call; `self` consumes the single request reply.
-        reply_result(unsafe { raw::fuse_reply_entry(self.request.as_ptr(), &entry.raw) })
+        reply_result(unsafe { raw::fuse_reply_entry(request.as_ptr(), &entry.raw) })
     }
 
     /// Reply with attributes.
-    pub fn attr(self, attr: &stat, timeout: f64) -> io::Result<()> {
+    pub fn attr(mut self, attr: &stat, timeout: f64) -> io::Result<()> {
+        let request = self.request.take_raw();
         // SAFETY: `attr` is initialized and borrowed for the duration of the
         // call; `self` consumes the single request reply.
-        reply_result(unsafe { raw::fuse_reply_attr(self.request.as_ptr(), attr, timeout) })
+        reply_result(unsafe { raw::fuse_reply_attr(request.as_ptr(), attr, timeout) })
     }
 
     /// Reply with open parameters.
-    pub fn open(self, open: OpenReply) -> io::Result<()> {
+    pub fn open(mut self, open: OpenReply) -> io::Result<()> {
+        let request = self.request.take_raw();
         let file_info = raw::FuseFileInfo::from_open_reply(open);
         // SAFETY: `file_info` is initialized and borrowed for the duration of
         // the call; `self` consumes the single request reply.
-        reply_result(unsafe { raw::fuse_reply_open(self.request.as_ptr(), &file_info) })
+        reply_result(unsafe { raw::fuse_reply_open(request.as_ptr(), &file_info) })
     }
 
     /// Reply with a read buffer.
-    pub fn read_buffer(self, bytes: &[u8]) -> io::Result<()> {
+    pub fn read_buffer(mut self, bytes: &[u8]) -> io::Result<()> {
+        let request = self.request.take_raw();
         // SAFETY: `bytes` is valid for the duration of the call and macFUSE
         // copies/sends it synchronously; `self` consumes the single reply.
         reply_result(unsafe {
             raw::fuse_reply_buf(
-                self.request.as_ptr(),
+                request.as_ptr(),
                 bytes.as_ptr().cast::<c_char>(),
                 bytes.len(),
             )
@@ -545,9 +597,10 @@ impl Reply {
     }
 
     /// Reply with a write byte count.
-    pub fn write_count(self, count: usize) -> io::Result<()> {
+    pub fn write_count(mut self, count: usize) -> io::Result<()> {
+        let request = self.request.take_raw();
         // SAFETY: `self` owns a live, unreplied request and is consumed here.
-        reply_result(unsafe { raw::fuse_reply_write(self.request.as_ptr(), count) })
+        reply_result(unsafe { raw::fuse_reply_write(request.as_ptr(), count) })
     }
 
     /// Reply with owned directory entries.
@@ -659,6 +712,10 @@ impl DirectoryEntryBuffer {
     }
 
     /// Test-only append that preserves owned names without a live request.
+    ///
+    /// This does not produce a valid `fuse_dirent` binary layout. It exists only
+    /// to exercise owned-buffer capacity checks and name retention without a
+    /// live macFUSE request handle.
     #[cfg(test)]
     pub fn push_for_test(
         &mut self,
