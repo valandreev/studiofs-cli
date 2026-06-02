@@ -27,7 +27,7 @@ use studiofs_meta::types::{SetattrArgs, TimeSpec};
 use studiofs_meta::{FileType, Ino, InodeAttr, MetaError, ROOT_INO};
 use studiofs_vfs::{
     BridgeVfsErrorKind, LocalSyncPolicy, NamespacePathStyle, OpenFlags, StudioVfs, VfsError,
-    classify_vfs_error, is_hidden_non_macos_root_metadata_name, normalize_attr_times,
+    classify_vfs_error, is_hidden_platform_root_metadata_name, normalize_attr_times,
 };
 use tokio::runtime::Handle;
 use tracing::{debug, error, trace, warn};
@@ -447,22 +447,22 @@ fn resolve_parent(vfs: &StudioVfs, path: &U16CStr) -> winfsp::Result<(Ino, Vec<u
     Ok((parent.parent, parent.name))
 }
 
-fn hidden_non_macos_root_path_component(path: &str) -> Option<&'static [u8]> {
+fn hidden_platform_root_path_component(path: &str) -> Option<&'static [u8]> {
     let trimmed = path.trim_start_matches(['\\', '/']);
     let first = trimmed
         .split(['\\', '/'])
         .find(|component| !component.is_empty())?;
     let normalized = first.trim_end_matches([' ', '.']);
-    if !normalized.is_empty() && is_hidden_non_macos_root_metadata_name(normalized.as_bytes()) {
+    if !normalized.is_empty() && is_hidden_platform_root_metadata_name(normalized.as_bytes()) {
         Some(b".Trashes")
     } else {
         None
     }
 }
 
-fn maybe_hide_non_macos_root_path(vfs: &StudioVfs, path: &U16CStr) -> winfsp::Result<bool> {
+fn maybe_hide_platform_root_path(vfs: &StudioVfs, path: &U16CStr) -> winfsp::Result<bool> {
     let display_path = path.to_string_lossy();
-    let Some(name) = hidden_non_macos_root_path_component(&display_path) else {
+    let Some(name) = hidden_platform_root_path_component(&display_path) else {
         return Ok(false);
     };
     vfs.heal_dangling_entry_if_inode_missing(ROOT_INO, name)
@@ -470,12 +470,12 @@ fn maybe_hide_non_macos_root_path(vfs: &StudioVfs, path: &U16CStr) -> winfsp::Re
     Ok(true)
 }
 
-fn maybe_hide_non_macos_root_entry(
+fn maybe_hide_platform_root_entry(
     vfs: &StudioVfs,
     parent: Ino,
     name: &[u8],
 ) -> winfsp::Result<bool> {
-    if parent != ROOT_INO || !is_hidden_non_macos_root_metadata_name(name) {
+    if parent != ROOT_INO || !is_hidden_platform_root_metadata_name(name) {
         return Ok(false);
     }
     vfs.heal_dangling_entry_if_inode_missing(parent, name)
@@ -1093,7 +1093,7 @@ impl FileSystemContext for StudioFsContext {
         security_descriptor: Option<&mut [c_void]>,
         resolve_reparse_points: impl FnOnce(&U16CStr) -> Option<FileSecurity>,
     ) -> winfsp::Result<FileSecurity> {
-        if maybe_hide_non_macos_root_path(&self.vfs, file_name)? {
+        if maybe_hide_platform_root_path(&self.vfs, file_name)? {
             return Err(winfsp::FspError::from(STATUS_OBJECT_NAME_NOT_FOUND));
         }
         if let Some(security) = resolve_reparse_points(file_name) {
@@ -1126,7 +1126,7 @@ impl FileSystemContext for StudioFsContext {
         granted_access: FILE_ACCESS_RIGHTS,
         file_info: &mut OpenFileInfo,
     ) -> winfsp::Result<Self::FileContext> {
-        if maybe_hide_non_macos_root_path(&self.vfs, file_name)? {
+        if maybe_hide_platform_root_path(&self.vfs, file_name)? {
             return Err(winfsp::FspError::from(STATUS_OBJECT_NAME_NOT_FOUND));
         }
         let attr = resolve_path(&self.vfs, file_name)?;
@@ -1172,7 +1172,7 @@ impl FileSystemContext for StudioFsContext {
         extra_buffer_is_reparse_point: bool,
         file_info: &mut OpenFileInfo,
     ) -> winfsp::Result<Self::FileContext> {
-        if maybe_hide_non_macos_root_path(&self.vfs, file_name)? {
+        if maybe_hide_platform_root_path(&self.vfs, file_name)? {
             return Err(winfsp::FspError::from(STATUS_OBJECT_NAME_NOT_FOUND));
         }
         let plan = self.resolve_create_callback_plan(
@@ -1387,7 +1387,7 @@ impl FileSystemContext for StudioFsContext {
             let mut name_u16 = Vec::<u16>::new();
 
             for entry in &entries {
-                if maybe_hide_non_macos_root_entry(&self.vfs, context.ino, &entry.name)? {
+                if maybe_hide_platform_root_entry(&self.vfs, context.ino, &entry.name)? {
                     continue;
                 }
                 let had_invalid_utf8 = encode_entry_name_utf16_lossy(&entry.name, &mut name_u16);
@@ -1596,8 +1596,8 @@ impl FileSystemContext for StudioFsContext {
             thread_id = ?thread_id,
             "WinFSP rename callback started"
         );
-        if maybe_hide_non_macos_root_path(&self.vfs, file_name)?
-            || maybe_hide_non_macos_root_path(&self.vfs, new_file_name)?
+        if maybe_hide_platform_root_path(&self.vfs, file_name)?
+            || maybe_hide_platform_root_path(&self.vfs, new_file_name)?
         {
             tracing::info!(
                 old_path = %old_path,
@@ -1820,8 +1820,8 @@ mod tests {
         STATUS_ACCESS_DENIED, STATUS_DATA_ERROR, STATUS_EA_TOO_LARGE, STATUS_INVALID_PARAMETER,
         STATUS_IO_TIMEOUT, STATUS_OBJECT_NAME_NOT_FOUND, SYNCHRONIZE_ACCESS, StudioFileHandle,
         StudioFsContext, WinfspKernelInvalidator, attr_to_file_info, build_basic_info_setattr_args,
-        build_notify_info, encode_symlink_reparse, hidden_non_macos_root_path_component,
-        ino_to_windows_path, maybe_hide_non_macos_root_entry, notify_filter_for_kind,
+        build_notify_info, encode_symlink_reparse, hidden_platform_root_path_component,
+        ino_to_windows_path, maybe_hide_platform_root_entry, notify_filter_for_kind,
         open_flags_from_access, resolve_create_callback_kind, resolve_file_size_callback_action,
         should_disable_winfsp_file_cache, should_truncate_existing_file_on_open,
         unix_nanos_to_filetime, vfs_to_winfsp_err, write_local_sync_policy_from_create_options,
@@ -2533,24 +2533,21 @@ mod tests {
     }
 
     #[test]
-    fn hidden_non_macos_root_path_component_matches_trashes_root_prefix() {
+    fn hidden_platform_root_path_component_matches_trashes_root_prefix() {
         assert_eq!(
-            hidden_non_macos_root_path_component(r"\.Trashes"),
+            hidden_platform_root_path_component(r"\.Trashes"),
             Some(b".Trashes".as_slice())
         );
         assert_eq!(
-            hidden_non_macos_root_path_component(r"\.Trashes\501"),
+            hidden_platform_root_path_component(r"\.Trashes\501"),
             Some(b".Trashes".as_slice())
         );
         assert_eq!(
-            hidden_non_macos_root_path_component(r"\.Trashes.  "),
+            hidden_platform_root_path_component(r"\.Trashes.  "),
             Some(b".Trashes".as_slice())
         );
-        assert_eq!(hidden_non_macos_root_path_component(r"\visible"), None);
-        assert_eq!(
-            hidden_non_macos_root_path_component(r"\docs\.Trashes"),
-            None
-        );
+        assert_eq!(hidden_platform_root_path_component(r"\visible"), None);
+        assert_eq!(hidden_platform_root_path_component(r"\docs\.Trashes"), None);
     }
 
     #[test]
@@ -2565,7 +2562,7 @@ mod tests {
             .expect("remove .Trashes attr to simulate stale entry");
 
         assert!(
-            maybe_hide_non_macos_root_entry(&vfs, ROOT_INO, b".Trashes")
+            maybe_hide_platform_root_entry(&vfs, ROOT_INO, b".Trashes")
                 .expect("hide stale .Trashes"),
             "hidden root metadata helper should match .Trashes"
         );
@@ -2581,7 +2578,7 @@ mod tests {
             .expect("seed .Trashes");
 
         assert!(
-            maybe_hide_non_macos_root_entry(&vfs, ROOT_INO, b".Trashes")
+            maybe_hide_platform_root_entry(&vfs, ROOT_INO, b".Trashes")
                 .expect("hide healthy .Trashes"),
             "hidden root metadata helper should still hide healthy .Trashes"
         );

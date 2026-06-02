@@ -6,7 +6,7 @@
 - Metadata: local `redb` + PostgreSQL background sync (`PgMetaEngine`)
 - Data I/O: OpenDAL (S3-compatible)
 - Cache: RAM + disk + runtime upload queue
-- Bridges: WinFSP (Windows), FUSE (Linux/macOS)
+- Bridges: WinFSP (Windows), FUSE (Linux)
 
 ## Project Structure
 
@@ -18,7 +18,7 @@ studiofs-cli/
   │   ├── studiofs-data/      # S3 object I/O
   │   ├── studiofs-cache/     # L1/L2 cache
   │   ├── studiofs-vfs/       # filesystem core
-  │   ├── studiofs-fuse/      # Unix bridge
+  │   ├── studiofs-fuse/      # Linux FUSE bridge
   │   ├── studiofs-winfsp/    # Windows bridge
   │   └── studiofs-e2e/       # real mounted E2E runner
   └── docs/
@@ -81,11 +81,11 @@ not currently provide, and those workflows are also manual-only.
 | **Quality Gates** | RWX `ubuntu:24.04` | `cargo fmt`, clippy (workspace + all-features), `cargo doc`, `cargo audit` |
 | **Ubuntu Linux** | RWX `ubuntu:24.04` | Workspace tests, local-first VFS fast checks, explicit `studiofs-fuse` Linux unit step |
 | **Rocky Linux** | RWX `rockylinux:9` | Workspace tests, explicit `studiofs-fuse` Linux unit step, `mount_sanity` compile check |
-| **macOS** | `macos-latest` | Clippy + tests — explicit `studiofs-fuse` macOS unit step (exercises `cfg(target_os="macos")` branches) |
+| **macOS** | `macos-latest` | Clippy + tests for macOS-owned crates; `studiofs-fuse` is Linux-only |
 | **Windows** | `windows-latest` | Clippy + tests — explicit `studiofs-winfsp` unit step (exercises `cfg(windows)` code paths) |
 
 Each platform job includes a named step for the backend-specific crate so
-regressions in `studiofs-fuse` (Linux or macOS paths) or `studiofs-winfsp`
+regressions in `studiofs-fuse` (Linux paths) or `studiofs-winfsp`
 are immediately attributable in the CI job log rather than buried inside the
 broad workspace run. Failures that originate from platform-specific code
 should call out the backend step name directly.

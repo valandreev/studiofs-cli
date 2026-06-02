@@ -27,7 +27,6 @@ workflows are manual-only while Windows work is primarily validated locally.
 | Local-first VFS fast checks | Auto (explicit Ubuntu step; covered by Rocky workspace run) | — | — |
 | `studiofs-fuse` Linux unit tests | Auto (Ubuntu + Rocky) | — | — |
 | `studiofs-fuse` Linux mount-smoke compile check | Auto (Rocky) | — | — |
-| `studiofs-fuse` macOS unit + non-mount integration tests | — | Manual GitHub Action | — |
 | `studiofs-winfsp` unit tests | — | — | Manual GitHub Action |
 
 ### What is NOT verified automatically (manual / self-hosted only)
@@ -50,7 +49,7 @@ advisory on a `windows-sys` crate) are surfaced in the same audit run.
 
 - **Portable compile + clippy** — `cargo clippy` runs automatically in the RWX Ubuntu quality gate. Hosted macOS and Windows clippy runs are available as manual GitHub Actions. Linux compile coverage comes from RWX Ubuntu and Rocky workspace `cargo test` runs.
 - **Portable unit tests** — the workspace `cargo test` run on each platform. Covers all crates except the platform-specific backend crate, which has a dedicated step.
-- **Platform unit tests** — the named backend step in each platform lane (`studiofs-fuse` on RWX Ubuntu/Rocky and manual macOS, `studiofs-winfsp` on manual Windows). This is the primary signal for platform-specific code paths.
+- **Platform unit tests** — the named backend step in each platform lane (`studiofs-fuse` on RWX Ubuntu/Rocky, `studiofs-winfsp` on manual Windows). This is the primary signal for platform-specific code paths.
 - **Platform smoke tests** — `mount_sanity` integration tests marked `#[ignore]`. These include both minimal lifecycle tests (session create/drop) and full I/O tests (mount → write → read → readdir → delete → unmount). Run via the `smoke.yml` workflow or manually on self-hosted runners with the full kernel driver available. Not a PR gate.
 - **Infra integration tests** — all `#[ignore]` tests requiring live S3 + PostgreSQL. Not a PR gate.
 
@@ -114,9 +113,6 @@ for the local CLI location and `.rwx/downloads/` log layout.
 - **Linux failed, platform step** → a regression in a `cfg(target_os = "linux")` path
   inside `studiofs-fuse`. The named RWX `cargo-test-studiofs-fuse-*` step will
   identify whether the failure is Ubuntu-only, Rocky-only, or shared.
-- **Manual macOS failed, platform step** → a regression in a `cfg(target_os = "macos")` path
-  inside `studiofs-fuse`. The named step
-  `cargo test (studiofs-fuse — macOS paths)` will identify it.
 - **Manual Windows failed, platform step** → a regression in `studiofs-winfsp` (the entire
   crate is `#![cfg(windows)]`). The named step `cargo test (studiofs-winfsp)` will
   identify it.
@@ -296,4 +292,3 @@ Types: `feat`, `fix`, `docs`, `refactor`, `test`, `perf`, `ci`
 - [Tests Guide](tests.md) — full test command matrix, platform-gated test rules, CI coverage table
 - [Architecture Overview](architecture.md)
 - [Configuration Reference](configuration.md)
-

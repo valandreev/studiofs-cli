@@ -1,10 +1,9 @@
 //! Integration tests for `studiofs-fuse` virtual mount and VFS behavior.
 //!
 //! These tests exercise core filesystem paths directly through `StudioVfs` and
-//! `StudioFuseFs` on Unix targets, including macOS-specific checks for xattrs and
-//! compatibility-specific metadata logic.
+//! `StudioFuseFs` on Unix targets.
 
-#![cfg(unix)]
+#![cfg(target_os = "linux")]
 
 use std::sync::{Arc, OnceLock};
 use studiofs_data::store::DataStoreConfig;
@@ -74,11 +73,11 @@ fn test_online_env_var(primary: &str, legacy: &str, default: &str) -> String {
 }
 
 // NOTE: Testing StudioFuseFs directly is hard because fuser::Request is not public.
-// We test the VFS logic directly to ensure platform-specific code paths pass.
+// We test the VFS logic directly because fuser::Request is not public.
 
-/// Smoke test for macOS-compatible virtual mount behavior through the VFS layer.
+/// Smoke test for virtual mount behavior through the VFS layer.
 #[test]
-fn test_macos_logic_smoke_virtual() {
+fn test_virtual_mount_vfs_smoke() {
     let tmp = tempdir().expect("tempdir");
     let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
     load_test_env();
@@ -143,35 +142,19 @@ fn test_macos_logic_smoke_virtual() {
 
     let _fs = StudioFuseFs::new(vfs.clone(), rt.handle().clone());
 
-    // 2. Simulate logic check directly on VFS
-    // (Since we can't easily mock Request in fuser v0.16)
-    println!("Verifying core VFS logic for macOS compatibility...");
-    println!("FUSE Handshake (INIT) successful.");
+    let file = vfs
+        .create(1, b"test.txt", 0, 0, 0o644)
+        .expect("create file");
+    let payload = b"studiofs virtual mount smoke";
+    let fh = vfs
+        .open_file(file.ino, studiofs_vfs::OpenFlags::WRONLY, false)
+        .expect("open file for write");
+    rt.block_on(vfs.write_fh(fh, file.ino, 0, payload))
+        .expect("write payload");
+    vfs.release_fh(fh).expect("release write handle");
 
-    // 3. Simulate LOOKUP of root directory (inode 1)
-    // Note: Since we can't easily construct a Request, we might need a wrapper or
-    // to just test components. But StudioFuseFs methods are public-ish?
-    // No, they are trait implementations.
-
-    // Actually, we can test the VFS logic on macOS directly in this test
-    // to ensure XAttrs and other platform-specific code paths pass.
-
-    #[cfg(target_os = "macos")]
-    {
-        println!("Verifying macOS-specific logic (XAttr, etc.)...");
-        // Test resource fork handling in VFS directly since that's what the bridge uses.
-        let file = vfs
-            .create(1, b"test.txt", 0, 0, 0o644)
-            .expect("create file");
-        let fork_name = b"com.apple.ResourceFork";
-        let fork_data = b"RSRC_DATA";
-
-        vfs.set_xattr(file.ino, fork_name, fork_data, 0)
-            .expect("set xattr");
-        let got = vfs.get_xattr(file.ino, fork_name).expect("get xattr");
-        assert_eq!(got, Some(fork_data.to_vec()));
-        println!("macOS ResourceFork xattr handling confirmed.");
-    }
-
-    println!("Virtual Smoke Test PASSED.");
+    let readback = rt
+        .block_on(vfs.read(file.ino, 0, payload.len() as u32))
+        .expect("read payload");
+    assert_eq!(readback, payload);
 }

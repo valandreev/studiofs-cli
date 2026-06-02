@@ -3,16 +3,12 @@
 mod handle_drain;
 mod pending_write_tracker;
 
-#[cfg(target_os = "macos")]
-use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-#[cfg(target_os = "macos")]
-use fuser::ReplyIoctl;
 use fuser::{
     FileAttr, FileType as FuseFileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData,
     ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, ReplyXattr,
@@ -27,14 +23,9 @@ use studiofs_bridge::posix::{
     BridgeFileAttr, BridgeFileType, posix_flags_to_open_flags, to_bridge_attr,
     vfs_err_to_errno as bridge_vfs_err_to_errno,
 };
-#[cfg(target_os = "macos")]
-use studiofs_meta::engine::{XATTR_CREATE_FLAG, XATTR_REPLACE_FLAG};
-#[cfg(target_os = "macos")]
-use studiofs_meta::schema::DirEntry;
 use studiofs_meta::types::{SetattrArgs, TimeSpec};
 use studiofs_meta::{FileType, ROOT_INO};
-#[cfg(not(target_os = "macos"))]
-use studiofs_vfs::is_hidden_non_macos_root_metadata_name;
+use studiofs_vfs::is_hidden_platform_root_metadata_name;
 use studiofs_vfs::{
     BridgeVfsErrorKind, KernelInvalidator, LocalSyncPolicy, LockKind, OpenFlags, StudioVfs,
     VfsError, VfsFuseAsyncWriteSnapshot, classify_vfs_error, normalize_attr_times,
@@ -42,23 +33,10 @@ use studiofs_vfs::{
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, trace, warn};
-#[cfg(target_os = "macos")]
-use unicode_normalization::UnicodeNormalization;
 
-#[cfg(target_os = "macos")]
-const TTL: Duration = Duration::from_secs(0);
-#[cfg(not(target_os = "macos"))]
 const TTL: Duration = Duration::from_secs(1);
-#[cfg(target_os = "macos")]
-const DEFAULT_FUSE_MAX_WRITE_BYTES: u32 = 128 * 1024;
-#[cfg(not(target_os = "macos"))]
 const DEFAULT_FUSE_MAX_WRITE_BYTES: u32 = 16 * 1024 * 1024;
-#[cfg(target_os = "macos")]
-const DEFAULT_FUSE_MAX_READAHEAD_BYTES: u32 = 1024 * 1024;
-#[cfg(not(target_os = "macos"))]
 const DEFAULT_FUSE_MAX_READAHEAD_BYTES: u32 = 16 * 1024 * 1024;
-#[cfg(target_os = "macos")]
-const FUSE_AUTO_INVAL_DATA_FLAG: u64 = 1 << 12;
 const STUDIOFS_FUSE_MAX_BACKGROUND_ENV: &str = "STUDIOFS_FUSE_MAX_BACKGROUND";
 const STUDIOFS_FUSE_CONGESTION_THRESHOLD_ENV: &str = "STUDIOFS_FUSE_CONGESTION_THRESHOLD";
 const STUDIOFS_FUSE_ASYNC_WRITE_ENV: &str = "STUDIOFS_FUSE_ASYNC_WRITE";
@@ -75,15 +53,6 @@ struct FuseBackgroundQueuePolicy {
 
 impl FuseBackgroundQueuePolicy {
     fn platform_default() -> Self {
-        #[cfg(target_os = "macos")]
-        {
-            Self {
-                max_background: Some(50),
-                congestion_threshold: Some(40),
-            }
-        }
-
-        #[cfg(not(target_os = "macos"))]
         {
             Self {
                 max_background: None,
@@ -137,18 +106,6 @@ struct FuseAsyncWriteAdmissionPolicy {
 
 impl FuseAsyncWriteAdmissionPolicy {
     fn platform_default() -> Self {
-        #[cfg(target_os = "macos")]
-        {
-            Self {
-                limits: PendingWriteAdmissionLimits {
-                    max_pending_bytes: Some(32 * 1024 * 1024),
-                    max_pending_writes: Some(256),
-                    per_handle_pending_bytes: Some(8 * 1024 * 1024),
-                },
-            }
-        }
-
-        #[cfg(not(target_os = "macos"))]
         {
             Self {
                 limits: PendingWriteAdmissionLimits {
@@ -202,56 +159,15 @@ impl FuseAsyncWriteAdmissionPolicy {
     }
 }
 
-#[cfg(target_os = "macos")]
-fn fuse_attr_blksize() -> u32 {
-    // macFUSE 5.2.0 uses this as the vnode preferred I/O size; keep it aligned
-    // with the mount-level iosize so the kernel does not fall back to tiny I/O.
-    super::MACOS_FUSE_IOSIZE_BYTES
-}
-
-#[cfg(not(target_os = "macos"))]
 fn fuse_attr_blksize() -> u32 {
     512
 }
 
-fn fuse_open_reply_flags(open_flags: OpenFlags, trunc: bool) -> u32 {
-    #[cfg(not(target_os = "macos"))]
-    let _ = trunc;
-
-    #[cfg(target_os = "macos")]
-    {
-        fuse_open_reply_flags_with_macos_cache_policy(
-            open_flags,
-            trunc,
-            super::MacosFuseCachePolicy::from_env(),
-        )
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        if !open_flags.contains(OpenFlags::WRONLY) && !open_flags.contains(OpenFlags::RDWR) {
-            fuser::consts::FOPEN_KEEP_CACHE
-        } else {
-            0
-        }
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn fuse_open_reply_flags_with_macos_cache_policy(
-    open_flags: OpenFlags,
-    trunc: bool,
-    macos_cache_policy: super::MacosFuseCachePolicy,
-) -> u32 {
-    if macos_cache_policy == super::MacosFuseCachePolicy::Direct {
-        fuser::consts::FOPEN_DIRECT_IO
-    } else if open_flags.contains(OpenFlags::WRONLY)
-        || open_flags.contains(OpenFlags::RDWR)
-        || trunc
-    {
-        fuser::consts::FOPEN_PURGE_UBC
-    } else {
+fn fuse_open_reply_flags(open_flags: OpenFlags) -> u32 {
+    if !open_flags.contains(OpenFlags::WRONLY) && !open_flags.contains(OpenFlags::RDWR) {
         fuser::consts::FOPEN_KEEP_CACHE
+    } else {
+        0
     }
 }
 
@@ -260,18 +176,6 @@ fn fuse_write_local_sync_policy(flags: i32) -> LocalSyncPolicy {
         return LocalSyncPolicy::WriteThrough;
     }
     LocalSyncPolicy::Opportunistic
-}
-
-fn fuse_reply_flags_purge_ubc(reply_flags: u32) -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        reply_flags & fuser::consts::FOPEN_PURGE_UBC != 0
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = reply_flags;
-        false
-    }
 }
 
 fn parse_bridge_u32_env(key: &str, default: u32) -> u32 {
@@ -372,7 +276,6 @@ fn parse_bridge_optional_usize_env_value(
     }
 }
 
-#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn parse_bridge_bool_env_value(raw: &str) -> bool {
     let trimmed = raw.trim();
     trimmed == "1"
@@ -382,7 +285,7 @@ fn parse_bridge_bool_env_value(raw: &str) -> bool {
 }
 
 fn should_request_fuse_async_dio_from_env_value(raw: &str) -> bool {
-    cfg!(target_os = "linux") && parse_bridge_bool_env_value(raw)
+    parse_bridge_bool_env_value(raw)
 }
 
 fn should_request_fuse_async_dio_from_env() -> bool {
@@ -395,10 +298,7 @@ fn should_enable_async_fuse_write_from_env_value(raw: &str) -> bool {
 }
 
 fn resolve_async_fuse_write_enabled(raw: Option<&str>) -> bool {
-    raw.map_or(
-        cfg!(target_os = "macos"),
-        should_enable_async_fuse_write_from_env_value,
-    )
+    raw.is_some_and(should_enable_async_fuse_write_from_env_value)
 }
 
 fn should_enable_async_fuse_write_from_env() -> bool {
@@ -609,18 +509,12 @@ fn debug_name(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
-#[cfg(not(target_os = "macos"))]
-fn should_hide_non_macos_root_metadata_entry(parent: u64, name: &[u8]) -> bool {
-    parent == ROOT_INO && is_hidden_non_macos_root_metadata_name(name)
+fn should_hide_linux_root_metadata_entry(parent: u64, name: &[u8]) -> bool {
+    parent == ROOT_INO && is_hidden_platform_root_metadata_name(name)
 }
 
-#[cfg(target_os = "macos")]
-fn should_hide_non_macos_root_metadata_entry(_parent: u64, _name: &[u8]) -> bool {
-    false
-}
-
-fn heal_hidden_non_macos_root_metadata_entry(vfs: &StudioVfs, parent: u64, name: &[u8]) {
-    if !should_hide_non_macos_root_metadata_entry(parent, name) {
+fn heal_hidden_linux_root_metadata_entry(vfs: &StudioVfs, parent: u64, name: &[u8]) {
+    if !should_hide_linux_root_metadata_entry(parent, name) {
         return;
     }
 
@@ -628,24 +522,9 @@ fn heal_hidden_non_macos_root_metadata_entry(vfs: &StudioVfs, parent: u64, name:
         debug!(
             parent,
             name = %debug_name(name),
-            "failed to heal hidden non-macOS root metadata entry: {error}"
+            "failed to heal hidden Linux root metadata entry: {error}"
         );
     }
-}
-
-#[cfg(target_os = "macos")]
-fn is_expected_macos_trashes_mkdir_exists(parent: u64, name: &[u8], err: &VfsError) -> bool {
-    parent == ROOT_INO
-        && name == b".Trashes"
-        && matches!(
-            err,
-            VfsError::Meta(studiofs_meta::MetaError::EntryExists { .. })
-        )
-}
-
-#[cfg(not(target_os = "macos"))]
-fn is_expected_macos_trashes_mkdir_exists(_parent: u64, _name: &[u8], _err: &VfsError) -> bool {
-    false
 }
 
 fn is_missing_xattr_error(err: &VfsError) -> bool {
@@ -656,14 +535,7 @@ fn is_missing_xattr_error(err: &VfsError) -> bool {
 }
 
 fn missing_xattr_errno() -> i32 {
-    #[cfg(target_os = "macos")]
-    {
-        libc::ENOATTR
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        libc::ENODATA
-    }
+    libc::ENODATA
 }
 
 fn note_critical_vfs_error(e: &VfsError) {
@@ -680,34 +552,6 @@ fn note_critical_vfs_error(e: &VfsError) {
     }
 }
 
-#[cfg(target_os = "macos")]
-fn merge_xattr_write(existing: Option<Vec<u8>>, position: u32, value: &[u8]) -> Vec<u8> {
-    let offset = position as usize;
-    let existing_len = existing.as_ref().map_or(0, Vec::len);
-    let new_len = existing_len.max(offset.saturating_add(value.len()));
-    let mut merged = vec![0; new_len];
-
-    if let Some(existing) = existing {
-        merged[..existing.len()].copy_from_slice(&existing);
-    }
-    merged[offset..offset + value.len()].copy_from_slice(value);
-    merged
-}
-
-#[cfg(target_os = "macos")]
-fn normalize_macos_xattr_flags(flags: i32) -> u32 {
-    const MACOS_XATTR_CREATE: i32 = 0x0002;
-    const MACOS_XATTR_REPLACE: i32 = 0x0004;
-    let mut normalized = 0;
-    if flags & MACOS_XATTR_CREATE != 0 {
-        normalized |= XATTR_CREATE_FLAG;
-    }
-    if flags & MACOS_XATTR_REPLACE != 0 {
-        normalized |= XATTR_REPLACE_FLAG;
-    }
-    normalized
-}
-
 fn normalize_unix_mode(mode: u32) -> u16 {
     // VFS stores only Unix permission bits; file type is tracked separately.
     u16::try_from(mode & 0o7777).unwrap_or(0)
@@ -720,235 +564,6 @@ fn system_time_to_timespec(time: SystemTime) -> TimeSpec {
         .and_then(|d| i64::try_from(d.as_nanos()).ok())
         .unwrap_or(i64::MAX);
     TimeSpec::Set(secs)
-}
-
-#[cfg(target_os = "macos")]
-fn macos_truncated_rename_suffix_is_safe(candidate: &[u8], old_name: &[u8]) -> bool {
-    const MIN_BOUNDARY_SUFFIX_LEN: usize = 3;
-    const MIN_BOUNDARY_ALNUM_SUFFIX_LEN: usize = 6;
-    const MIN_ALNUM_SUFFIX_LEN: usize = 9;
-
-    if candidate.len() <= old_name.len() || !candidate.ends_with(old_name) {
-        return false;
-    }
-    let Some(first_suffix_byte) = old_name.first() else {
-        return false;
-    };
-    if !first_suffix_byte.is_ascii_alphanumeric() {
-        return old_name.len() >= MIN_BOUNDARY_SUFFIX_LEN;
-    }
-
-    let prefix_len = candidate.len() - old_name.len();
-    if candidate
-        .get(prefix_len.saturating_sub(1))
-        .is_some_and(|byte| !byte.is_ascii_alphanumeric())
-    {
-        return old_name.len() >= MIN_BOUNDARY_ALNUM_SUFFIX_LEN;
-    }
-
-    old_name.len() >= MIN_ALNUM_SUFFIX_LEN
-        && old_name.iter().any(|byte| !byte.is_ascii_alphanumeric())
-}
-
-#[cfg(target_os = "macos")]
-fn macos_visible_readdir_names(entries: &[DirEntry]) -> impl Iterator<Item = &[u8]> {
-    entries
-        .iter()
-        .map(|entry| entry.name.as_slice())
-        .filter(|name| !matches!(*name, b"." | b".."))
-}
-
-#[cfg(target_os = "macos")]
-fn recover_macos_truncated_rename_source(old_name: &[u8], entries: &[DirEntry]) -> Option<Vec<u8>> {
-    // macFUSE can deliver FUSE_RENAME with an empty old-name payload or a
-    // payload missing an observed variable-length prefix. Only recover when
-    // the remaining suffix identifies exactly one existing entry. Non-empty
-    // suffixes must either include enough separator structure or start after
-    // a separator in the visible entry; otherwise a normal failed rename of
-    // "a.txt" could incorrectly target "prefix-a.txt".
-    if old_name.is_empty() {
-        let mut candidates = macos_visible_readdir_names(entries);
-        let recovered = candidates.next()?;
-        if candidates.next().is_some() {
-            return None;
-        }
-        return Some(recovered.to_vec());
-    }
-
-    let mut candidates = entries
-        .iter()
-        .map(|entry| entry.name.as_slice())
-        .filter(|candidate| !matches!(*candidate, b"." | b".."))
-        .filter(|candidate| macos_truncated_rename_suffix_is_safe(candidate, old_name));
-
-    let recovered = candidates.next()?;
-    if candidates.next().is_some() {
-        return None;
-    }
-    Some(recovered.to_vec())
-}
-
-#[cfg(target_os = "macos")]
-fn recover_macos_normalized_name(name: &[u8], entries: &[DirEntry]) -> Option<Vec<u8>> {
-    // Policy: keep the VFS namespace byte-exact, but at the macOS FUSE boundary
-    // resolve name lookup/rename by canonical Unicode equivalence (NFD key).
-    let key_str = std::str::from_utf8(name).ok()?;
-    let key_nfd = key_str.nfd().collect::<String>();
-    let mut canonical_match: Option<&[u8]> = None;
-    for entry in entries {
-        if matches!(entry.name.as_slice(), b"." | b"..") {
-            continue;
-        }
-        if entry.name.as_slice() == name {
-            return None;
-        }
-        let Ok(entry_str) = std::str::from_utf8(&entry.name) else {
-            continue;
-        };
-        if !entry_str.nfd().eq(key_nfd.chars()) {
-            continue;
-        }
-        if canonical_match.is_some() {
-            return None;
-        }
-        canonical_match = Some(entry.name.as_slice());
-    }
-    canonical_match.map(ToOwned::to_owned)
-}
-
-#[cfg(target_os = "macos")]
-fn resolve_macos_namespace_name<'a>(name: &'a [u8], entries: &[DirEntry]) -> Cow<'a, [u8]> {
-    recover_macos_normalized_name(name, entries)
-        .map(Cow::Owned)
-        .unwrap_or(Cow::Borrowed(name))
-}
-
-#[cfg(target_os = "macos")]
-fn lookup_macos_normalized_forms<'a>(
-    vfs: &StudioVfs,
-    parent: u64,
-    requested_name: &'a [u8],
-) -> Option<Cow<'a, [u8]>> {
-    let requested = std::str::from_utf8(requested_name).ok()?;
-    let nfc = requested.nfc().collect::<String>();
-    if nfc.as_bytes() != requested_name && vfs.lookup(parent, nfc.as_bytes()).is_ok() {
-        return Some(Cow::Owned(nfc.into_bytes()));
-    }
-    let nfd = requested.nfd().collect::<String>();
-    if nfd.as_bytes() != requested_name && vfs.lookup(parent, nfd.as_bytes()).is_ok() {
-        return Some(Cow::Owned(nfd.into_bytes()));
-    }
-    None
-}
-
-#[cfg(target_os = "macos")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MacosMutationTargetState {
-    Exists,
-    Missing,
-}
-
-#[cfg(target_os = "macos")]
-fn resolve_macos_existing_mutation_source<'a>(
-    vfs: &StudioVfs,
-    parent: u64,
-    requested_name: &'a [u8],
-) -> Cow<'a, [u8]> {
-    if vfs.lookup(parent, requested_name).is_ok() {
-        return Cow::Borrowed(requested_name);
-    }
-    let Ok(entries) = vfs.readdir(parent) else {
-        return Cow::Borrowed(requested_name);
-    };
-    let normalized_name = resolve_macos_namespace_name(requested_name, &entries);
-    if normalized_name.as_ref() != requested_name {
-        return normalized_name;
-    }
-    recover_macos_truncated_rename_source(requested_name, &entries)
-        .map(Cow::Owned)
-        .unwrap_or(Cow::Borrowed(requested_name))
-}
-
-#[cfg(target_os = "macos")]
-fn resolve_macos_mutation_target_name_with_state<'a>(
-    vfs: &StudioVfs,
-    parent: u64,
-    requested_name: &'a [u8],
-) -> studiofs_vfs::VfsResult<(Cow<'a, [u8]>, MacosMutationTargetState)> {
-    match vfs.lookup(parent, requested_name) {
-        Ok(_) => {
-            return Ok((
-                Cow::Borrowed(requested_name),
-                MacosMutationTargetState::Exists,
-            ));
-        }
-        Err(VfsError::Meta(studiofs_meta::MetaError::EntryNotFound { .. })) => {}
-        Err(error) => return Err(error),
-    }
-    if requested_name.is_ascii() {
-        return Ok((
-            Cow::Borrowed(requested_name),
-            MacosMutationTargetState::Missing,
-        ));
-    }
-    if let Some(name) = lookup_macos_normalized_forms(vfs, parent, requested_name) {
-        return Ok((name, MacosMutationTargetState::Exists));
-    }
-    Ok((
-        Cow::Borrowed(requested_name),
-        MacosMutationTargetState::Missing,
-    ))
-}
-
-#[cfg(target_os = "macos")]
-fn resolve_macos_mutation_target_name<'a>(
-    vfs: &StudioVfs,
-    parent: u64,
-    requested_name: &'a [u8],
-) -> Cow<'a, [u8]> {
-    resolve_macos_mutation_target_name_with_state(vfs, parent, requested_name)
-        .map(|(name, _state)| name)
-        .unwrap_or(Cow::Borrowed(requested_name))
-}
-
-#[cfg(target_os = "macos")]
-fn macos_exchange_or_rename(
-    vfs: &StudioVfs,
-    parent: u64,
-    name: &[u8],
-    newparent: u64,
-    newname: &[u8],
-) -> studiofs_vfs::VfsResult<()> {
-    let old_name = resolve_macos_existing_mutation_source(vfs, parent, name);
-    let (new_name, target_state) =
-        resolve_macos_mutation_target_name_with_state(vfs, newparent, newname)?;
-    // macFUSE reports some ordinary Finder renames as RENAME_EXCHANGE even when
-    // the destination is absent. We must probe first to preserve real exchange
-    // failures for existing targets; this fallback is therefore not atomic if a
-    // concurrent writer creates the target between lookup and rename.
-    match target_state {
-        MacosMutationTargetState::Exists => Err(VfsError::Io(std::io::Error::from_raw_os_error(
-            libc::ENOSYS,
-        ))),
-        MacosMutationTargetState::Missing => vfs.rename(parent, &old_name, newparent, &new_name),
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn normalize_macos_readdir_name(name: &[u8]) -> Vec<u8> {
-    // Finder/macFUSE expect decomposed (NFD) names in directory listings.
-    let Some(name) = std::str::from_utf8(name).ok() else {
-        return name.to_vec();
-    };
-    if name.nfd().eq(name.chars()) {
-        return name.as_bytes().to_vec();
-    }
-    let mut normalized = Vec::with_capacity(name.len());
-    for ch in name.nfd() {
-        let mut utf8 = [0_u8; 4];
-        normalized.extend_from_slice(ch.encode_utf8(&mut utf8).as_bytes());
-    }
-    normalized
 }
 
 // ─── Error Mapping ───────────────────────────────────────────────────────────
@@ -1021,7 +636,6 @@ pub struct StudioFuseFs {
     rt: Handle,
     pending_writes: PendingWriteTracker,
     async_write_enabled: bool,
-    #[cfg(target_os = "linux")]
     linux_async_dio_enabled: bool,
     async_write_admission_policy: FuseAsyncWriteAdmissionPolicy,
     /// UID of the user that mounted the filesystem. Inodes owned by uid=0 in
@@ -1117,7 +731,6 @@ impl StudioFuseFs {
             rt,
             pending_writes: PendingWriteTracker::default(),
             async_write_enabled: options.async_write_enabled,
-            #[cfg(target_os = "linux")]
             linux_async_dio_enabled: options.linux_async_dio_enabled,
             async_write_admission_policy: FuseAsyncWriteAdmissionPolicy {
                 limits: async_write_admission_limits,
@@ -1169,20 +782,7 @@ impl StudioFuseFs {
     }
 
     fn async_write_platform_policy_label(&self) -> &'static str {
-        #[cfg(target_os = "macos")]
-        {
-            "macos"
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            "linux"
-        }
-
-        #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
-        {
-            "unix"
-        }
+        "linux"
     }
 
     fn publish_async_write_diagnostics(&self) {
@@ -1275,7 +875,7 @@ impl Filesystem for StudioFuseFs {
         if let Err(max_supported) = config.set_max_write(requested_max_write) {
             warn!(
                 requested = requested_max_write,
-                max_supported, "requested FUSE max_write exceeds kernel/libfuse limit; clamping"
+                max_supported, "requested FUSE max_write exceeds kernel-supported limit; clamping"
             );
             if config.set_max_write(max_supported).is_err() {
                 return Err(libc::EINVAL);
@@ -1290,7 +890,7 @@ impl Filesystem for StudioFuseFs {
             warn!(
                 requested = requested_readahead,
                 max_supported,
-                "requested FUSE max_readahead exceeds kernel/libfuse limit; clamping"
+                "requested FUSE max_readahead exceeds kernel-supported limit; clamping"
             );
             if config.set_max_readahead(max_supported).is_err() {
                 return Err(libc::EINVAL);
@@ -1304,7 +904,7 @@ impl Filesystem for StudioFuseFs {
             warn!(
                 requested = max_background,
                 supported_limit,
-                "requested FUSE max_background is outside kernel/libfuse limits; clamping"
+                "requested FUSE max_background is outside kernel-supported limits; clamping"
             );
             if config.set_max_background(supported_limit).is_err() {
                 return Err(libc::EINVAL);
@@ -1316,24 +916,13 @@ impl Filesystem for StudioFuseFs {
             warn!(
                 requested = congestion_threshold,
                 supported_limit,
-                "requested FUSE congestion_threshold is outside kernel/libfuse limits; clamping"
+                "requested FUSE congestion_threshold is outside kernel-supported limits; clamping"
             );
             if config.set_congestion_threshold(supported_limit).is_err() {
                 return Err(libc::EINVAL);
             }
         }
 
-        #[cfg(target_os = "macos")]
-        debug!(
-            max_write = requested_max_write,
-            max_readahead = requested_readahead,
-            max_background = ?background_queue_policy.max_background,
-            congestion_threshold = ?background_queue_policy.congestion_threshold,
-            macos_cache_policy = ?super::MacosFuseCachePolicy::from_env(),
-            macos_iosize = super::MACOS_FUSE_IOSIZE_BYTES,
-            "configured FUSE bridge I/O policy"
-        );
-        #[cfg(not(target_os = "macos"))]
         debug!(
             max_write = requested_max_write,
             max_readahead = requested_readahead,
@@ -1342,15 +931,6 @@ impl Filesystem for StudioFuseFs {
             "configured FUSE bridge I/O policy"
         );
 
-        #[cfg(target_os = "macos")]
-        if let Err(unsupported) = config.add_capabilities(FUSE_AUTO_INVAL_DATA_FLAG) {
-            debug!(
-                unsupported,
-                "macFUSE did not advertise FUSE_AUTO_INVAL_DATA; using explicit invalidation fallback"
-            );
-        }
-
-        #[cfg(target_os = "linux")]
         if self.linux_async_dio_enabled
             && let Err(unsupported) = config.add_capabilities(fuser::consts::FUSE_ASYNC_DIO)
         {
@@ -1364,31 +944,13 @@ impl Filesystem for StudioFuseFs {
     }
 
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        let name_bytes = os_str_bytes(name).to_vec();
-        if should_hide_non_macos_root_metadata_entry(parent, &name_bytes) {
-            heal_hidden_non_macos_root_metadata_entry(&self.vfs, parent, &name_bytes);
+        let name_bytes = os_str_bytes(name);
+        if should_hide_linux_root_metadata_entry(parent, name_bytes) {
+            heal_hidden_linux_root_metadata_entry(&self.vfs, parent, name_bytes);
             reply.error(libc::ENOENT);
             return;
         }
-        #[cfg(target_os = "macos")]
-        let attr_result = self.vfs.lookup(parent, &name_bytes).or_else(|err| {
-            if !matches!(
-                err,
-                VfsError::Meta(studiofs_meta::MetaError::EntryNotFound { .. })
-            ) || name_bytes.is_ascii()
-            {
-                return Err(err);
-            }
-            if let Ok(entries) = self.vfs.readdir(parent) {
-                let resolved = resolve_macos_namespace_name(&name_bytes, &entries);
-                if resolved.as_ref() != name_bytes.as_slice() {
-                    return self.vfs.lookup(parent, resolved.as_ref());
-                }
-            }
-            Err(err)
-        });
-        #[cfg(not(target_os = "macos"))]
-        let attr_result = self.vfs.lookup(parent, &name_bytes);
+        let attr_result = self.vfs.lookup(parent, name_bytes);
 
         match attr_result {
             Ok(attr) => reply.entry(
@@ -1423,8 +985,8 @@ impl Filesystem for StudioFuseFs {
         reply: ReplyEntry,
     ) {
         let name_bytes = os_str_bytes(name).to_vec();
-        if should_hide_non_macos_root_metadata_entry(parent, &name_bytes) {
-            heal_hidden_non_macos_root_metadata_entry(&self.vfs, parent, &name_bytes);
+        if should_hide_linux_root_metadata_entry(parent, &name_bytes) {
+            heal_hidden_linux_root_metadata_entry(&self.vfs, parent, &name_bytes);
             reply.error(libc::ENOENT);
             return;
         }
@@ -1441,29 +1003,16 @@ impl Filesystem for StudioFuseFs {
                 0,
             ),
             Err(e) => {
-                if is_expected_macos_trashes_mkdir_exists(parent, &name_bytes, &e) {
-                    debug!(
-                        parent,
-                        uid = req.uid(),
-                        gid = req.gid(),
-                        mode,
-                        umask = _umask,
-                        name = %debug_name(&name_bytes),
-                        name_bytes = ?name_bytes,
-                        "mkdir -> {e}"
-                    );
-                } else {
-                    error!(
-                        parent,
-                        uid = req.uid(),
-                        gid = req.gid(),
-                        mode,
-                        umask = _umask,
-                        name = %debug_name(&name_bytes),
-                        name_bytes = ?name_bytes,
-                        "mkdir -> {e}"
-                    );
-                }
+                error!(
+                    parent,
+                    uid = req.uid(),
+                    gid = req.gid(),
+                    mode,
+                    umask = _umask,
+                    name = %debug_name(&name_bytes),
+                    name_bytes = ?name_bytes,
+                    "mkdir -> {e}"
+                );
                 reply.error(vfs_err_to_errno(&e));
             }
         }
@@ -1480,8 +1029,8 @@ impl Filesystem for StudioFuseFs {
         reply: ReplyEntry,
     ) {
         let name_bytes = os_str_bytes(name).to_vec();
-        if should_hide_non_macos_root_metadata_entry(parent, &name_bytes) {
-            heal_hidden_non_macos_root_metadata_entry(&self.vfs, parent, &name_bytes);
+        if should_hide_linux_root_metadata_entry(parent, &name_bytes) {
+            heal_hidden_linux_root_metadata_entry(&self.vfs, parent, &name_bytes);
             reply.error(libc::ENOENT);
             return;
         }
@@ -1515,8 +1064,8 @@ impl Filesystem for StudioFuseFs {
         reply: ReplyCreate,
     ) {
         let name_bytes = os_str_bytes(name).to_vec();
-        if should_hide_non_macos_root_metadata_entry(parent, &name_bytes) {
-            heal_hidden_non_macos_root_metadata_entry(&self.vfs, parent, &name_bytes);
+        if should_hide_linux_root_metadata_entry(parent, &name_bytes) {
+            heal_hidden_linux_root_metadata_entry(&self.vfs, parent, &name_bytes);
             reply.error(libc::ENOENT);
             return;
         }
@@ -1537,7 +1086,7 @@ impl Filesystem for StudioFuseFs {
                             &to_fuse_attr(&attr, self.mount_uid, self.mount_gid),
                             0,
                             fh,
-                            fuse_open_reply_flags(open_flags, false),
+                            fuse_open_reply_flags(open_flags),
                         );
                     }
                     Err(e) => {
@@ -1565,8 +1114,8 @@ impl Filesystem for StudioFuseFs {
 
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let name_bytes = os_str_bytes(name).to_vec();
-        if should_hide_non_macos_root_metadata_entry(parent, &name_bytes) {
-            heal_hidden_non_macos_root_metadata_entry(&self.vfs, parent, &name_bytes);
+        if should_hide_linux_root_metadata_entry(parent, &name_bytes) {
+            heal_hidden_linux_root_metadata_entry(&self.vfs, parent, &name_bytes);
             reply.error(libc::ENOENT);
             return;
         }
@@ -1586,8 +1135,8 @@ impl Filesystem for StudioFuseFs {
 
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let name_bytes = os_str_bytes(name).to_vec();
-        if should_hide_non_macos_root_metadata_entry(parent, &name_bytes) {
-            heal_hidden_non_macos_root_metadata_entry(&self.vfs, parent, &name_bytes);
+        if should_hide_linux_root_metadata_entry(parent, &name_bytes) {
+            heal_hidden_linux_root_metadata_entry(&self.vfs, parent, &name_bytes);
             reply.error(libc::ENOENT);
             return;
         }
@@ -1614,8 +1163,8 @@ impl Filesystem for StudioFuseFs {
         reply: ReplyEntry,
     ) {
         let name = os_str_bytes(link_name).to_vec();
-        if should_hide_non_macos_root_metadata_entry(parent, &name) {
-            heal_hidden_non_macos_root_metadata_entry(&self.vfs, parent, &name);
+        if should_hide_linux_root_metadata_entry(parent, &name) {
+            heal_hidden_linux_root_metadata_entry(&self.vfs, parent, &name);
             reply.error(libc::ENOENT);
             return;
         }
@@ -1652,8 +1201,8 @@ impl Filesystem for StudioFuseFs {
         reply: ReplyEntry,
     ) {
         let name = os_str_bytes(newname).to_vec();
-        if should_hide_non_macos_root_metadata_entry(newparent, &name) {
-            heal_hidden_non_macos_root_metadata_entry(&self.vfs, newparent, &name);
+        if should_hide_linux_root_metadata_entry(newparent, &name) {
+            heal_hidden_linux_root_metadata_entry(&self.vfs, newparent, &name);
             reply.error(libc::ENOENT);
             return;
         }
@@ -1679,124 +1228,36 @@ impl Filesystem for StudioFuseFs {
         _flags: u32,
         reply: ReplyEmpty,
     ) {
-        let requested_old_name = os_str_bytes(name).to_vec();
-        let requested_new_name = os_str_bytes(newname).to_vec();
-        if should_hide_non_macos_root_metadata_entry(parent, &requested_old_name) {
-            heal_hidden_non_macos_root_metadata_entry(&self.vfs, parent, &requested_old_name);
+        let requested_old_name = os_str_bytes(name);
+        let requested_new_name = os_str_bytes(newname);
+        if should_hide_linux_root_metadata_entry(parent, requested_old_name) {
+            heal_hidden_linux_root_metadata_entry(&self.vfs, parent, requested_old_name);
             reply.error(libc::ENOENT);
             return;
         }
-        if should_hide_non_macos_root_metadata_entry(newparent, &requested_new_name) {
-            heal_hidden_non_macos_root_metadata_entry(&self.vfs, newparent, &requested_new_name);
+        if should_hide_linux_root_metadata_entry(newparent, requested_new_name) {
+            heal_hidden_linux_root_metadata_entry(&self.vfs, newparent, requested_new_name);
             reply.error(libc::ENOENT);
             return;
         }
-        #[cfg(target_os = "macos")]
-        let old_name =
-            resolve_macos_existing_mutation_source(&self.vfs, parent, &requested_old_name);
-        #[cfg(not(target_os = "macos"))]
-        let old_name = requested_old_name.clone();
-        #[cfg(target_os = "macos")]
-        let new_name =
-            resolve_macos_mutation_target_name(&self.vfs, newparent, &requested_new_name);
-        #[cfg(not(target_os = "macos"))]
-        let new_name = requested_new_name.clone();
 
-        match self.vfs.rename(parent, &old_name, newparent, &new_name) {
+        match self
+            .vfs
+            .rename(parent, requested_old_name, newparent, requested_new_name)
+        {
             Ok(()) => reply.ok(),
             Err(e) => {
-                #[cfg(target_os = "macos")]
-                if matches!(
-                    e,
-                    VfsError::Meta(studiofs_meta::MetaError::EntryNotFound { .. })
-                ) && let Ok(entries) = self.vfs.readdir(parent)
-                    && let Some(recovered_old_name) =
-                        recover_macos_truncated_rename_source(&old_name, &entries)
-                {
-                    debug!(
-                        parent,
-                        newparent,
-                        flags = _flags,
-                        old_name = %debug_name(&old_name),
-                        recovered_old_name = %debug_name(&recovered_old_name),
-                        new_name = %debug_name(&new_name),
-                        old_name_bytes = ?old_name,
-                        recovered_old_name_bytes = ?recovered_old_name,
-                        new_name_bytes = ?new_name,
-                        "rename retry with recovered macOS source name"
-                    );
-                    match self
-                        .vfs
-                        .rename(parent, &recovered_old_name, newparent, &new_name)
-                    {
-                        Ok(()) => {
-                            reply.ok();
-                            return;
-                        }
-                        Err(retry_err) => {
-                            error!(
-                                parent,
-                                newparent,
-                                flags = _flags,
-                                old_name = %debug_name(&old_name),
-                                recovered_old_name = %debug_name(&recovered_old_name),
-                                new_name = %debug_name(&new_name),
-                                old_name_bytes = ?old_name,
-                                recovered_old_name_bytes = ?recovered_old_name,
-                                new_name_bytes = ?new_name,
-                                "rename retry -> {retry_err}"
-                            );
-                            reply.error(vfs_err_to_errno(&retry_err));
-                            return;
-                        }
-                    }
-                }
                 error!(
                     parent,
                     newparent,
                     flags = _flags,
-                    requested_old_name = %debug_name(&requested_old_name),
-                    requested_new_name = %debug_name(&requested_new_name),
-                    old_name = %debug_name(&old_name),
-                    new_name = %debug_name(&new_name),
+                    requested_old_name = %debug_name(requested_old_name),
+                    requested_new_name = %debug_name(requested_new_name),
                     requested_old_name_bytes = ?requested_old_name,
                     requested_new_name_bytes = ?requested_new_name,
-                    old_name_bytes = ?old_name,
-                    new_name_bytes = ?new_name,
                     "rename -> {e}"
                 );
                 reply.error(vfs_err_to_errno(&e));
-            }
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    fn exchange(
-        &mut self,
-        _req: &Request<'_>,
-        parent: u64,
-        name: &OsStr,
-        newparent: u64,
-        newname: &OsStr,
-        options: u64,
-        reply: ReplyEmpty,
-    ) {
-        let old_name = os_str_bytes(name).to_vec();
-        let new_name = os_str_bytes(newname).to_vec();
-        match macos_exchange_or_rename(&self.vfs, parent, &old_name, newparent, &new_name) {
-            Ok(()) => reply.ok(),
-            Err(error) => {
-                warn!(
-                    parent,
-                    newparent,
-                    options,
-                    old_name = %debug_name(&old_name),
-                    new_name = %debug_name(&new_name),
-                    old_name_bytes = ?old_name,
-                    new_name_bytes = ?new_name,
-                    "macOS exchange fallback -> {error}"
-                );
-                reply.error(vfs_err_to_errno(&error));
             }
         }
     }
@@ -1805,7 +1266,7 @@ impl Filesystem for StudioFuseFs {
         let (open_flags, trunc) = posix_flags_to_open_flags(flags);
         match self.vfs.open_file(ino, open_flags, trunc) {
             Ok(fh) => {
-                let reply_flags = fuse_open_reply_flags(open_flags, trunc);
+                let reply_flags = fuse_open_reply_flags(open_flags);
                 debug!(
                     ino,
                     fh,
@@ -1814,7 +1275,6 @@ impl Filesystem for StudioFuseFs {
                     trunc,
                     reply_flags,
                     direct_io = reply_flags & fuser::consts::FOPEN_DIRECT_IO != 0,
-                    purge_ubc = fuse_reply_flags_purge_ubc(reply_flags),
                     keep_cache = reply_flags & fuser::consts::FOPEN_KEEP_CACHE != 0,
                     "selected FUSE open cache policy"
                 );
@@ -2309,8 +1769,8 @@ impl Filesystem for StudioFuseFs {
         }
 
         for (i, entry) in entries.iter().enumerate() {
-            if should_hide_non_macos_root_metadata_entry(ino, &entry.name) {
-                heal_hidden_non_macos_root_metadata_entry(&self.vfs, ino, &entry.name);
+            if should_hide_linux_root_metadata_entry(ino, &entry.name) {
+                heal_hidden_linux_root_metadata_entry(&self.vfs, ino, &entry.name);
                 continue;
             }
             let entry_idx = i + 2;
@@ -2318,10 +1778,7 @@ impl Filesystem for StudioFuseFs {
                 continue;
             }
             let ft = fuse_file_type(entry.kind);
-            #[cfg(target_os = "macos")]
-            let entry_name = normalize_macos_readdir_name(&entry.name);
-            #[cfg(not(target_os = "macos"))]
-            let entry_name = entry.name.clone();
+            let entry_name = &entry.name;
             let next_offset = match i64::try_from(entry_idx + 1) {
                 Ok(next_offset) => next_offset,
                 Err(_) => {
@@ -2396,8 +1853,8 @@ impl Filesystem for StudioFuseFs {
 
         // Regular entries with full attributes
         for (i, entry) in entries.iter().enumerate() {
-            if should_hide_non_macos_root_metadata_entry(ino, &entry.name) {
-                heal_hidden_non_macos_root_metadata_entry(&self.vfs, ino, &entry.name);
+            if should_hide_linux_root_metadata_entry(ino, &entry.name) {
+                heal_hidden_linux_root_metadata_entry(&self.vfs, ino, &entry.name);
                 continue;
             }
             let entry_idx = i + 2;
@@ -2415,10 +1872,7 @@ impl Filesystem for StudioFuseFs {
                 Ok(a) => to_fuse_attr(&a, self.mount_uid, self.mount_gid),
                 Err(_) => continue, // skip entries we can't stat
             };
-            #[cfg(target_os = "macos")]
-            let entry_name = normalize_macos_readdir_name(&entry.name);
-            #[cfg(not(target_os = "macos"))]
-            let entry_name = entry.name.clone();
+            let entry_name = &entry.name;
             if reply.add(
                 entry.ino,
                 next_offset,
@@ -2517,55 +1971,9 @@ impl Filesystem for StudioFuseFs {
         }
     }
 
-    #[cfg(target_os = "macos")]
-    fn getxtimes(&mut self, _req: &Request<'_>, ino: u64, reply: fuser::ReplyXTimes) {
-        match self.vfs.getattr(ino) {
-            Ok(attr) => {
-                let times = normalize_attr_times(&attr);
-                let crtime = UNIX_EPOCH + Duration::from_nanos(times.creation_time_unix_nanos);
-                let bkuptime = UNIX_EPOCH + Duration::from_nanos(times.mtime_unix_nanos);
-                reply.xtimes(bkuptime, crtime);
-            }
-            Err(e) => {
-                error!(ino, "getxtimes -> {e}");
-                reply.error(vfs_err_to_errno(&e));
-            }
-        }
-    }
-
-    // macOS calls access() to determine if writing is allowed.
-    // With DefaultPermissions set the kernel already checked mode bits,
-    // so we just say OK here.
+    // With DefaultPermissions set the kernel already checked mode bits.
     fn access(&mut self, _req: &Request<'_>, _ino: u64, _mask: i32, reply: ReplyEmpty) {
         reply.ok();
-    }
-
-    #[cfg(target_os = "macos")]
-    fn ioctl(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        fh: u64,
-        flags: u32,
-        cmd: u32,
-        in_data: &[u8],
-        out_size: u32,
-        reply: ReplyIoctl,
-    ) {
-        // macFUSE issues control-plane ioctls on root/unmount paths during mount-cycle
-        // events. We don't currently need custom behavior for them, but we reply with
-        // ENOTTY instead of the default warn/error spam so kernel probes do not look
-        // like errors in logs.
-        debug!(
-            ino,
-            fh,
-            flags,
-            cmd,
-            in_len = in_data.len(),
-            out_size,
-            "ioctl not implemented in StudioFS FUSE backend"
-        );
-        reply.error(libc::ENOTTY);
     }
 
     fn getxattr(
@@ -2623,9 +2031,6 @@ impl Filesystem for StudioFuseFs {
     ) {
         let key = name.as_encoded_bytes();
 
-        #[cfg(target_os = "macos")]
-        let normalized_flags = normalize_macos_xattr_flags(flags);
-        #[cfg(not(target_os = "macos"))]
         let normalized_flags = match u32::try_from(flags) {
             Ok(normalized_flags) => normalized_flags,
             Err(_) => {
@@ -2634,29 +2039,6 @@ impl Filesystem for StudioFuseFs {
             }
         };
 
-        #[cfg(target_os = "macos")]
-        let value_buf = if _position > 0 {
-            match self.vfs.get_xattr(ino, key) {
-                Ok(existing) => merge_xattr_write(existing, _position, value),
-                Err(e) => {
-                    error!(
-                        ino,
-                        key = %debug_name(key),
-                        key_bytes = ?key,
-                        position = _position,
-                        value_len = value.len(),
-                        flags,
-                        "setxattr preload -> {e}"
-                    );
-                    reply.error(vfs_err_to_errno(&e));
-                    return;
-                }
-            }
-        } else {
-            value.to_vec()
-        };
-
-        #[cfg(not(target_os = "macos"))]
         let value_buf = value.to_vec();
 
         match self.vfs.set_xattr(ino, key, &value_buf, normalized_flags) {
@@ -2893,7 +2275,7 @@ impl KernelInvalidator for FuseKernelInvalidator {
     }
 
     fn inval_inode_attrs(&self, ino: u64) {
-        // libfuse documents a negative offset as attribute-only invalidation.
+        // fuser uses a negative offset as attribute-only invalidation.
         self.inval_inode_range(ino, -1, 0, "attrs");
     }
 }
@@ -2911,43 +2293,28 @@ impl FuseKernelInvalidator {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(not(target_os = "macos"))]
     use super::fuse_open_reply_flags;
     use super::{
         DEFAULT_FUSE_MAX_READAHEAD_BYTES, DEFAULT_FUSE_MAX_WRITE_BYTES,
         FuseAsyncWriteAdmissionPolicy, FuseBackgroundQueuePolicy, FuseEmptyReplyGuard,
         FuseWriteReplyGuard, PendingFuseCloseGuard, StudioFuseFs, TTL, complete_fuse_write_reply,
-        fuse_write_local_sync_policy, is_expected_macos_trashes_mkdir_exists,
-        is_missing_xattr_error, missing_xattr_errno, normalize_unix_mode,
-        posix_flags_to_open_flags, resolve_async_fuse_write_enabled,
+        fuse_write_local_sync_policy, is_missing_xattr_error, missing_xattr_errno,
+        normalize_unix_mode, posix_flags_to_open_flags, resolve_async_fuse_write_enabled,
         should_enable_async_fuse_write_from_env_value, should_log_invalidation_error,
         should_request_fuse_async_dio_from_env_value, to_fuse_attr, vfs_err_to_errno,
     };
     use crate::fs::pending_write_tracker::{PendingWriteAdmissionLimits, PendingWriteTracker};
     use std::cell::Cell;
-    #[cfg(target_os = "macos")]
-    use studiofs_meta::engine::{XATTR_CREATE_FLAG, XATTR_REPLACE_FLAG};
 
-    #[cfg(target_os = "macos")]
-    use super::{
-        fuse_open_reply_flags_with_macos_cache_policy, macos_exchange_or_rename, merge_xattr_write,
-        normalize_macos_readdir_name, normalize_macos_xattr_flags, recover_macos_normalized_name,
-        recover_macos_truncated_rename_source, resolve_macos_mutation_target_name,
-        resolve_macos_namespace_name,
-    };
     use std::sync::Arc;
     use studiofs_data::store::DataStoreConfig;
     use studiofs_meta::InodeAttr;
     use studiofs_meta::MetaError;
-    #[cfg(target_os = "macos")]
-    use studiofs_meta::schema::DirEntry;
     use studiofs_meta::schema::{CURRENT_FORMAT_VERSION, FormatInfo, MetadataConfig};
     use studiofs_meta::{MetaFormat, RedbMetaEngine};
     use studiofs_vfs::{LocalSyncPolicy, OpenFlags, StudioVfs, VfsConfig, VfsError};
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
-    #[cfg(target_os = "macos")]
-    use unicode_normalization::UnicodeNormalization;
 
     fn test_format_info(volume_suffix: &str) -> FormatInfo {
         let volume_name = format!("fuse-barrier-{volume_suffix}-{}", std::process::id());
@@ -3114,17 +2481,11 @@ mod tests {
 
     #[test]
     fn default_fuse_max_readahead_matches_platform_expectation() {
-        #[cfg(target_os = "macos")]
-        assert_eq!(DEFAULT_FUSE_MAX_READAHEAD_BYTES, 1024 * 1024);
-        #[cfg(not(target_os = "macos"))]
         assert_eq!(DEFAULT_FUSE_MAX_READAHEAD_BYTES, 16 * 1024 * 1024);
     }
 
     #[test]
     fn default_fuse_max_write_matches_platform_expectation() {
-        #[cfg(target_os = "macos")]
-        assert_eq!(DEFAULT_FUSE_MAX_WRITE_BYTES, 128 * 1024);
-        #[cfg(not(target_os = "macos"))]
         assert_eq!(DEFAULT_FUSE_MAX_WRITE_BYTES, 16 * 1024 * 1024);
     }
 
@@ -3132,15 +2493,6 @@ mod tests {
     fn default_fuse_background_queue_policy_matches_platform_expectation() {
         let policy = FuseBackgroundQueuePolicy::platform_default();
 
-        #[cfg(target_os = "macos")]
-        assert_eq!(
-            policy,
-            FuseBackgroundQueuePolicy {
-                max_background: Some(50),
-                congestion_threshold: Some(40),
-            }
-        );
-        #[cfg(not(target_os = "macos"))]
         assert_eq!(
             policy,
             FuseBackgroundQueuePolicy {
@@ -3212,69 +2564,22 @@ mod tests {
 
     #[test]
     fn fuse_kernel_cache_ttl_matches_platform_policy() {
-        #[cfg(target_os = "macos")]
-        assert_eq!(TTL, std::time::Duration::from_secs(0));
-        #[cfg(not(target_os = "macos"))]
         assert_eq!(TTL, std::time::Duration::from_secs(1));
     }
 
     #[test]
     fn fuse_open_reply_flags_match_platform_cache_policy() {
-        #[cfg(target_os = "macos")]
         {
             assert_eq!(
-                fuse_open_reply_flags_with_macos_cache_policy(
-                    OpenFlags::RDONLY,
-                    false,
-                    crate::MacosFuseCachePolicy::Winfsp,
-                ),
+                fuse_open_reply_flags(OpenFlags::RDONLY),
                 fuser::consts::FOPEN_KEEP_CACHE
             );
             assert_eq!(
-                fuse_open_reply_flags_with_macos_cache_policy(
-                    OpenFlags::WRONLY,
-                    false,
-                    crate::MacosFuseCachePolicy::Winfsp,
-                ),
-                fuser::consts::FOPEN_PURGE_UBC
-            );
-            assert_eq!(
-                fuse_open_reply_flags_with_macos_cache_policy(
-                    OpenFlags::RDWR,
-                    false,
-                    crate::MacosFuseCachePolicy::Winfsp,
-                ),
-                fuser::consts::FOPEN_PURGE_UBC
-            );
-            assert_eq!(
-                fuse_open_reply_flags_with_macos_cache_policy(
-                    OpenFlags::RDONLY,
-                    true,
-                    crate::MacosFuseCachePolicy::Winfsp,
-                ),
-                fuser::consts::FOPEN_PURGE_UBC
-            );
-            assert_eq!(
-                fuse_open_reply_flags_with_macos_cache_policy(
-                    OpenFlags::RDONLY,
-                    false,
-                    crate::MacosFuseCachePolicy::Direct,
-                ),
-                fuser::consts::FOPEN_DIRECT_IO
-            );
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            assert_eq!(
-                fuse_open_reply_flags(OpenFlags::RDONLY, false),
+                fuse_open_reply_flags(OpenFlags::RDONLY | OpenFlags::APPEND),
                 fuser::consts::FOPEN_KEEP_CACHE
             );
-            assert_eq!(
-                fuse_open_reply_flags(OpenFlags::RDONLY | OpenFlags::APPEND, false),
-                fuser::consts::FOPEN_KEEP_CACHE
-            );
-            assert_eq!(fuse_open_reply_flags(OpenFlags::WRONLY, false), 0);
-            assert_eq!(fuse_open_reply_flags(OpenFlags::RDWR, false), 0);
+            assert_eq!(fuse_open_reply_flags(OpenFlags::WRONLY), 0);
+            assert_eq!(fuse_open_reply_flags(OpenFlags::RDWR), 0);
         }
     }
 
@@ -3301,10 +2606,7 @@ mod tests {
         }
 
         for true_value in ["1", "true", "True", "TRUE", "yes", "Yes", "on", "On"] {
-            assert_eq!(
-                should_request_fuse_async_dio_from_env_value(true_value),
-                cfg!(target_os = "linux")
-            );
+            assert!(should_request_fuse_async_dio_from_env_value(true_value));
         }
     }
 
@@ -3320,11 +2622,8 @@ mod tests {
     }
 
     #[test]
-    fn async_fuse_write_default_profile_uses_macos_default_when_env_unset() {
-        assert_eq!(
-            resolve_async_fuse_write_enabled(None),
-            cfg!(target_os = "macos")
-        );
+    fn async_fuse_write_default_profile_is_disabled_when_env_unset() {
+        assert!(!resolve_async_fuse_write_enabled(None));
     }
 
     #[test]
@@ -3681,44 +2980,6 @@ mod tests {
     }
 
     #[test]
-    fn expected_macos_trashes_mkdir_exists_is_scoped() {
-        let exists = VfsError::Meta(MetaError::EntryExists {
-            parent: studiofs_meta::ROOT_INO,
-            name: ".Trashes".into(),
-        });
-        let _missing = VfsError::Meta(MetaError::EntryNotFound {
-            parent: studiofs_meta::ROOT_INO,
-            name: ".Trashes".into(),
-        });
-
-        #[cfg(target_os = "macos")]
-        {
-            assert!(is_expected_macos_trashes_mkdir_exists(
-                studiofs_meta::ROOT_INO,
-                b".Trashes",
-                &exists
-            ));
-            assert!(!is_expected_macos_trashes_mkdir_exists(
-                studiofs_meta::ROOT_INO,
-                b"normal",
-                &exists
-            ));
-            assert!(!is_expected_macos_trashes_mkdir_exists(
-                studiofs_meta::ROOT_INO,
-                b".Trashes",
-                &_missing
-            ));
-        }
-
-        #[cfg(not(target_os = "macos"))]
-        assert!(!is_expected_macos_trashes_mkdir_exists(
-            studiofs_meta::ROOT_INO,
-            b".Trashes",
-            &exists
-        ));
-    }
-
-    #[test]
     fn io_permission_denied_maps_to_eacces() {
         let err = VfsError::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
         assert_eq!(vfs_err_to_errno(&err), libc::EACCES);
@@ -3737,16 +2998,6 @@ mod tests {
         assert_eq!(file_attr.perm, 0o640);
     }
 
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn to_fuse_attr_reports_macos_iosize_as_preferred_io_size() {
-        let attr = InodeAttr::new_file(9, 1, 501, 20, 0o640);
-
-        let file_attr = to_fuse_attr(&attr, 501, 20);
-
-        assert_eq!(file_attr.blksize, crate::MACOS_FUSE_IOSIZE_BYTES);
-    }
-
     #[test]
     fn posix_open_flags_translate_access_and_truncate_bits() {
         let (rdonly, trunc) = posix_flags_to_open_flags(libc::O_RDONLY);
@@ -3763,40 +3014,11 @@ mod tests {
         assert!(trunc);
     }
 
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn merge_xattr_write_overwrites_from_offset() {
-        let merged = merge_xattr_write(Some(b"abcdef".to_vec()), 2, b"ZZ");
-        assert_eq!(merged, b"abZZef");
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn merge_xattr_write_zero_fills_gap() {
-        let merged = merge_xattr_write(None, 3, b"xy");
-        assert_eq!(merged, vec![0, 0, 0, b'x', b'y']);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn normalize_macos_xattr_flags_maps_create_and_replace_bits() {
-        // macOS passes XATTR_CREATE=0x0002 and XATTR_REPLACE=0x0004.
-        // StudioVfs expects CREATE=1 and REPLACE=2.
-        assert_eq!(normalize_macos_xattr_flags(0), 0);
-        assert_eq!(normalize_macos_xattr_flags(0x0002), XATTR_CREATE_FLAG);
-        assert_eq!(normalize_macos_xattr_flags(0x0004), XATTR_REPLACE_FLAG);
-        assert_eq!(
-            normalize_macos_xattr_flags(0x0002 | 0x0004),
-            XATTR_CREATE_FLAG | XATTR_REPLACE_FLAG
-        );
-        assert_eq!(normalize_macos_xattr_flags(0x0010), 0);
-    }
-
     #[test]
     fn detects_missing_xattr_errors() {
         let missing = VfsError::Meta(MetaError::EntryNotFound {
             parent: 1,
-            name: "com.apple.FinderInfo".into(),
+            name: "user.test".into(),
         });
         assert!(is_missing_xattr_error(&missing));
 
@@ -3806,399 +3028,26 @@ mod tests {
 
     #[test]
     fn missing_xattr_errno_matches_platform() {
-        #[cfg(target_os = "macos")]
-        assert_eq!(missing_xattr_errno(), libc::ENOATTR);
-        #[cfg(not(target_os = "macos"))]
         assert_eq!(missing_xattr_errno(), libc::ENODATA);
     }
 
-    #[cfg(not(target_os = "macos"))]
     #[test]
-    fn hidden_non_macos_root_metadata_entry_matches_trashes_only() {
-        assert!(super::should_hide_non_macos_root_metadata_entry(
+    fn hidden_linux_root_metadata_entry_matches_trashes_only() {
+        assert!(super::should_hide_linux_root_metadata_entry(
             studiofs_meta::ROOT_INO,
             b".Trashes"
         ));
-        assert!(!super::should_hide_non_macos_root_metadata_entry(
+        assert!(!super::should_hide_linux_root_metadata_entry(
             studiofs_meta::ROOT_INO,
             b".Trash"
         ));
-        assert!(!super::should_hide_non_macos_root_metadata_entry(
+        assert!(!super::should_hide_linux_root_metadata_entry(
             studiofs_meta::ROOT_INO + 1,
             b".Trashes"
         ));
-        assert!(!super::should_hide_non_macos_root_metadata_entry(
+        assert!(!super::should_hide_linux_root_metadata_entry(
             studiofs_meta::ROOT_INO,
             b"visible"
         ));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn recover_macos_rename_source_with_unique_suffix_match() {
-        let entries = vec![
-            DirEntry {
-                name: b"Untitled folder".to_vec(),
-                ino: 1,
-                kind: studiofs_meta::FileType::Directory,
-            },
-            DirEntry {
-                name: b"other".to_vec(),
-                ino: 2,
-                kind: studiofs_meta::FileType::Directory,
-            },
-        ];
-
-        let recovered = recover_macos_truncated_rename_source(b" folder", &entries);
-        assert_eq!(recovered, Some(b"Untitled folder".to_vec()));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn recover_macos_rename_source_with_unique_short_suffix_match() {
-        let entries = vec![
-            DirEntry {
-                name: b"source-alpha.data".to_vec(),
-                ino: 1,
-                kind: studiofs_meta::FileType::RegularFile,
-            },
-            DirEntry {
-                name: b"source-beta.txt".to_vec(),
-                ino: 2,
-                kind: studiofs_meta::FileType::RegularFile,
-            },
-        ];
-
-        let recovered = recover_macos_truncated_rename_source(b".data", &entries);
-        assert_eq!(recovered, Some(b"source-alpha.data".to_vec()));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn recover_macos_rename_source_allows_long_suffix_after_name_boundary() {
-        let entries = vec![
-            DirEntry {
-                name: b"source-alpha.data".to_vec(),
-                ino: 1,
-                kind: studiofs_meta::FileType::RegularFile,
-            },
-            DirEntry {
-                name: b"source-beta.txt".to_vec(),
-                ino: 2,
-                kind: studiofs_meta::FileType::RegularFile,
-            },
-        ];
-
-        let recovered = recover_macos_truncated_rename_source(b"alpha.data", &entries);
-        assert_eq!(recovered, Some(b"source-alpha.data".to_vec()));
-
-        let recovered = recover_macos_truncated_rename_source(b"lpha.data", &entries);
-        assert_eq!(recovered, Some(b"source-alpha.data".to_vec()));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn recover_macos_rename_source_allows_boundary_alnum_suffix() {
-        let entries = vec![
-            DirEntry {
-                name: b"link-to-target".to_vec(),
-                ino: 1,
-                kind: studiofs_meta::FileType::Symlink,
-            },
-            DirEntry {
-                name: b"target-v1.txt".to_vec(),
-                ino: 2,
-                kind: studiofs_meta::FileType::RegularFile,
-            },
-        ];
-
-        let recovered = recover_macos_truncated_rename_source(b"target", &entries);
-        assert_eq!(recovered, Some(b"link-to-target".to_vec()));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn recover_macos_rename_source_rejects_short_or_mid_token_suffixes() {
-        let entries = vec![DirEntry {
-            name: b"prefix-a.txt".to_vec(),
-            ino: 1,
-            kind: studiofs_meta::FileType::RegularFile,
-        }];
-
-        assert_eq!(recover_macos_truncated_rename_source(b"a", &entries), None);
-        assert_eq!(
-            recover_macos_truncated_rename_source(b"a.txt", &entries),
-            None
-        );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn recover_macos_rename_source_returns_none_when_ambiguous() {
-        let entries = vec![
-            DirEntry {
-                name: b"Untitled folder".to_vec(),
-                ino: 1,
-                kind: studiofs_meta::FileType::Directory,
-            },
-            DirEntry {
-                name: b"Whatever folder".to_vec(),
-                ino: 2,
-                kind: studiofs_meta::FileType::Directory,
-            },
-        ];
-
-        assert_eq!(
-            recover_macos_truncated_rename_source(b" folder", &entries),
-            None
-        );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn recover_macos_rename_source_returns_none_without_match() {
-        let entries = vec![DirEntry {
-            name: b"plain".to_vec(),
-            ino: 1,
-            kind: studiofs_meta::FileType::Directory,
-        }];
-
-        assert_eq!(
-            recover_macos_truncated_rename_source(b" folder", &entries),
-            None
-        );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn recover_macos_rename_source_recovers_empty_source_from_single_parent_entry() {
-        let entries = vec![DirEntry {
-            name: b"file.txt".to_vec(),
-            ino: 1,
-            kind: studiofs_meta::FileType::RegularFile,
-        }];
-
-        let recovered = recover_macos_truncated_rename_source(b"", &entries);
-
-        assert_eq!(recovered, Some(b"file.txt".to_vec()));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn recover_macos_rename_source_ignores_dot_entries_for_empty_source() {
-        let entries = vec![
-            DirEntry {
-                name: b".".to_vec(),
-                ino: 1,
-                kind: studiofs_meta::FileType::Directory,
-            },
-            DirEntry {
-                name: b"..".to_vec(),
-                ino: 2,
-                kind: studiofs_meta::FileType::Directory,
-            },
-            DirEntry {
-                name: b"file.txt".to_vec(),
-                ino: 3,
-                kind: studiofs_meta::FileType::RegularFile,
-            },
-        ];
-
-        let recovered = recover_macos_truncated_rename_source(b"", &entries);
-
-        assert_eq!(recovered, Some(b"file.txt".to_vec()));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_exchange_falls_back_to_rename_when_target_is_missing() {
-        let (_tmp, _rt, vfs, _fs) = make_test_fuse_fs("macos-exchange-rename");
-        let parent = vfs
-            .mkdir(studiofs_meta::ROOT_INO, b"scan", 0, 0, 0o755)
-            .expect("create scan dir");
-        let source = vfs
-            .create(parent.ino, b"a.txt", 0, 0, 0o644)
-            .expect("create exchange source");
-
-        macos_exchange_or_rename(&vfs, parent.ino, b"a.txt", parent.ino, b"c.txt")
-            .expect("macOS exchange with a missing target should behave like rename");
-
-        assert!(
-            matches!(
-                vfs.lookup(parent.ino, b"a.txt"),
-                Err(VfsError::Meta(MetaError::EntryNotFound { .. }))
-            ),
-            "source dentry must be removed"
-        );
-        let renamed = vfs
-            .lookup(parent.ino, b"c.txt")
-            .expect("target dentry should exist");
-        assert_eq!(renamed.ino, source.ino);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_exchange_reports_unsupported_when_target_exists() {
-        let (_tmp, _rt, vfs, _fs) = make_test_fuse_fs("macos-exchange-existing-target");
-        let parent = vfs
-            .mkdir(studiofs_meta::ROOT_INO, b"scan", 0, 0, 0o755)
-            .expect("create scan dir");
-        let source = vfs
-            .create(parent.ino, b"a.txt", 0, 0, 0o644)
-            .expect("create exchange source");
-        let target = vfs
-            .create(parent.ino, b"c.txt", 0, 0, 0o644)
-            .expect("create exchange target");
-
-        let error = macos_exchange_or_rename(&vfs, parent.ino, b"a.txt", parent.ino, b"c.txt")
-            .expect_err("macOS exchange with an existing target should stay unsupported");
-
-        match error {
-            VfsError::Io(error) => assert_eq!(error.raw_os_error(), Some(libc::ENOSYS)),
-            other => panic!("expected raw ENOSYS I/O error, got {other:?}"),
-        }
-        assert_eq!(vfs.lookup(parent.ino, b"a.txt").unwrap().ino, source.ino);
-        assert_eq!(vfs.lookup(parent.ino, b"c.txt").unwrap().ino, target.ino);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn resolve_macos_mutation_target_name_uses_direct_normalized_lookup() {
-        let (_tmp, _rt, vfs, _fs) = make_test_fuse_fs("macos-target-normalized-lookup");
-        let parent = vfs
-            .mkdir(studiofs_meta::ROOT_INO, b"scan", 0, 0, 0o755)
-            .expect("create scan dir");
-        let latin_nfc = "café";
-        let latin_nfd = latin_nfc.nfd().collect::<String>();
-        vfs.create(parent.ino, latin_nfc.as_bytes(), 0, 0, 0o644)
-            .expect("create NFC target");
-
-        let resolved = resolve_macos_mutation_target_name(&vfs, parent.ino, latin_nfd.as_bytes());
-
-        assert_eq!(resolved.as_ref(), latin_nfc.as_bytes());
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn resolve_macos_mutation_target_name_borrows_missing_non_ascii_target() {
-        let (_tmp, _rt, vfs, _fs) = make_test_fuse_fs("macos-target-missing-borrowed");
-        let parent = vfs
-            .mkdir(studiofs_meta::ROOT_INO, b"scan", 0, 0, 0o755)
-            .expect("create scan dir");
-        let missing = "новый".as_bytes();
-
-        let resolved = resolve_macos_mutation_target_name(&vfs, parent.ino, missing);
-
-        assert!(
-            matches!(resolved, std::borrow::Cow::Borrowed(_)),
-            "missing target should avoid an owned recovery path"
-        );
-        assert_eq!(resolved.as_ref(), missing);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn recover_macos_normalized_name_maps_nfd_lookup_to_nfc_entry() {
-        let latin_nfc = "café";
-        let latin_nfd = latin_nfc.nfd().collect::<String>();
-        let entries = vec![DirEntry {
-            name: latin_nfc.as_bytes().to_vec(),
-            ino: 10,
-            kind: studiofs_meta::FileType::RegularFile,
-        }];
-
-        let recovered = recover_macos_normalized_name(latin_nfd.as_bytes(), &entries);
-        assert_eq!(recovered, Some(latin_nfc.as_bytes().to_vec()));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn recover_macos_normalized_name_maps_nfc_lookup_to_nfd_entry() {
-        let cyrillic_nfc = "Йога";
-        let cyrillic_nfd = cyrillic_nfc.nfd().collect::<String>();
-        let entries = vec![DirEntry {
-            name: cyrillic_nfd.as_bytes().to_vec(),
-            ino: 11,
-            kind: studiofs_meta::FileType::Directory,
-        }];
-
-        let recovered = recover_macos_normalized_name(cyrillic_nfc.as_bytes(), &entries);
-        assert_eq!(recovered, Some(cyrillic_nfd.as_bytes().to_vec()));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn normalize_macos_readdir_name_returns_nfd_for_finder_compatibility() {
-        let latin_nfc = "café";
-        let cyrillic_nfc = "Йога";
-        let latin_nfd = latin_nfc.nfd().collect::<String>();
-        let cyrillic_nfd = cyrillic_nfc.nfd().collect::<String>();
-
-        assert_eq!(
-            normalize_macos_readdir_name(latin_nfc.as_bytes()),
-            latin_nfd.as_bytes()
-        );
-        assert_eq!(
-            normalize_macos_readdir_name(cyrillic_nfc.as_bytes()),
-            cyrillic_nfd.as_bytes()
-        );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn resolve_macos_namespace_name_supports_top_level_rename_nfc_nfd_roundtrip() {
-        let latin_nfc = "café";
-        let latin_nfd = latin_nfc.nfd().collect::<String>();
-
-        let source_entries = vec![DirEntry {
-            name: latin_nfc.as_bytes().to_vec(),
-            ino: 100,
-            kind: studiofs_meta::FileType::RegularFile,
-        }];
-        let target_entries = vec![DirEntry {
-            name: latin_nfd.as_bytes().to_vec(),
-            ino: 101,
-            kind: studiofs_meta::FileType::RegularFile,
-        }];
-
-        let old_for_nfd_request =
-            resolve_macos_namespace_name(latin_nfd.as_bytes(), &source_entries);
-        let new_for_nfc_request =
-            resolve_macos_namespace_name(latin_nfc.as_bytes(), &target_entries);
-        assert_eq!(old_for_nfd_request, latin_nfc.as_bytes());
-        assert_eq!(new_for_nfc_request, latin_nfd.as_bytes());
-
-        let old_for_nfc_request =
-            resolve_macos_namespace_name(latin_nfc.as_bytes(), &target_entries);
-        let new_for_nfd_request =
-            resolve_macos_namespace_name(latin_nfd.as_bytes(), &source_entries);
-        assert_eq!(old_for_nfc_request, latin_nfd.as_bytes());
-        assert_eq!(new_for_nfd_request, latin_nfc.as_bytes());
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn resolve_macos_namespace_name_supports_nested_directory_rename_with_cyrillic() {
-        let cyrillic_nfc = "Йога";
-        let cyrillic_nfd = cyrillic_nfc.nfd().collect::<String>();
-
-        let nested_parent_entries = vec![DirEntry {
-            name: cyrillic_nfd.as_bytes().to_vec(),
-            ino: 201,
-            kind: studiofs_meta::FileType::Directory,
-        }];
-        let nested_target_entries = vec![DirEntry {
-            name: cyrillic_nfc.as_bytes().to_vec(),
-            ino: 202,
-            kind: studiofs_meta::FileType::Directory,
-        }];
-
-        let old_for_nfc_request =
-            resolve_macos_namespace_name(cyrillic_nfc.as_bytes(), &nested_parent_entries);
-        let new_for_nfd_request =
-            resolve_macos_namespace_name(cyrillic_nfd.as_bytes(), &nested_target_entries);
-
-        assert_eq!(old_for_nfc_request, cyrillic_nfd.as_bytes());
-        assert_eq!(new_for_nfd_request, cyrillic_nfc.as_bytes());
     }
 }
