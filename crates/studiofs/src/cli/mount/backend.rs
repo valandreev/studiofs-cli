@@ -82,14 +82,15 @@ impl MountBackend for MacFuseMountBackend {
     }
 
     fn serve(&self, launch: BackendLaunch) -> io::Result<()> {
-        studiofs_macfuse::mount_with_request(studiofs_macfuse::MacFuseMountRequest {
-            vfs: launch.vfs,
-            runtime_handle: launch.runtime_handle,
-            mount_point: launch.mount_point,
-            volume_name: launch.volume_name,
-            read_only: launch.read_only,
-            run_in_foreground: launch.run_in_foreground,
-        })
+        let request = studiofs_macfuse::MacFuseMountRequest::new(
+            launch.vfs,
+            launch.runtime_handle,
+            launch.mount_point,
+            launch.volume_name,
+        )
+        .with_read_only(launch.read_only)
+        .with_run_in_foreground(launch.run_in_foreground);
+        studiofs_macfuse::mount_with_request(request)
     }
 }
 
@@ -140,6 +141,16 @@ mod tests {
         let backend = super::mount_backend_for_selector(Some("macfuse"));
 
         assert_eq!(backend.name(), "macFUSE");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_selector_falls_back_without_native_opt_in() {
+        for selector in [None, Some("other"), Some("")] {
+            let backend = super::mount_backend_for_selector(selector);
+
+            assert_eq!(backend.name(), "unsupported-unix");
+        }
     }
 
     #[cfg(all(unix, not(target_os = "linux")))]
