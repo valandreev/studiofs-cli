@@ -25,13 +25,15 @@ pub const MOUNTED_PERFORMANCE_PROBE: &str = "mounted-performance-probe";
 pub const MOUNTED_FUSE_WRITE_BASELINE: &str = "mounted-fuse-write-baseline";
 
 const PERFORMANCE_PROBE_CLIENT: &str = "client-a";
-const PERFORMANCE_PROBE_FILE: &str = "performance-probe/probe-4g.bin";
+const PERFORMANCE_PROBE_FILE: &str = "performance-probe/probe-data.bin";
 const PERFORMANCE_PROBE_SUMMARY_FILE: &str = "performance-probe-summary.json";
 const PERFORMANCE_PROBE_VALIDATION_FILE: &str = "performance-probe-validation.json";
 const PERFORMANCE_PROBE_SAMPLES_FILE: &str = "performance-probe-samples.ndjson";
 const WRITE_PATH_OBSERVABILITY_FILE: &str = "write_path_observability.json";
 const DEFAULT_FILE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const DEFAULT_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+const SEEDED_VFS_MEMORY_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+const SEEDED_VFS_DIRTY_LIMIT_BYTES: u64 = 32 * 1024 * 1024;
 const DEFAULT_READ_PASSES: u32 = 10;
 const DEFAULT_SAMPLE_DELAY_MS: u64 = 1_200;
 const DEFAULT_UPLOAD_DRAIN_TIMEOUT_SECS: u64 = 600;
@@ -341,8 +343,8 @@ fn seed_performance_probe_payload(
         Arc::clone(&meta) as Arc<dyn studiofs_meta::MetaEngine>,
         &data_config,
         &cache_dir,
-        64 * 1024 * 1024,
-        32 * 1024 * 1024,
+        SEEDED_VFS_MEMORY_CACHE_BYTES,
+        SEEDED_VFS_DIRTY_LIMIT_BYTES,
         VfsConfigRaw::default()
             .validate()
             .map_err(|error| ScenarioError::Io(std::io::Error::other(error)))?,
@@ -360,10 +362,10 @@ fn seed_performance_probe_payload(
             .map_err(|error| ScenarioError::Io(std::io::Error::other(error)))?,
         Err(error) => return Err(ScenarioError::Io(std::io::Error::other(error))),
     };
-    let file_attr = match vfs.create(dir_attr.ino, b"probe-4g.bin", 0, 0, 0o644) {
+    let file_attr = match vfs.create(dir_attr.ino, b"probe-data.bin", 0, 0, 0o644) {
         Ok(attr) => attr,
         Err(studiofs_vfs::VfsError::Meta(studiofs_meta::MetaError::EntryExists { .. })) => vfs
-            .lookup(dir_attr.ino, b"probe-4g.bin")
+            .lookup(dir_attr.ino, b"probe-data.bin")
             .map_err(|error| ScenarioError::Io(std::io::Error::other(error)))?,
         Err(error) => return Err(ScenarioError::Io(std::io::Error::other(error))),
     };

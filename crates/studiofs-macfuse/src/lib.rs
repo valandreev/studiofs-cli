@@ -403,7 +403,7 @@ mod tests {
             vfs.clone(),
             fixture.runtime().handle().clone(),
         );
-        adapter.insert_expired_readdir_cache_entry_for_test(root + 1000);
+        adapter.fill_expired_readdir_cache_entries_for_test();
 
         adapter
             .readdir_for_test(root, 2, 32)

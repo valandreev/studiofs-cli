@@ -19,6 +19,7 @@ use crate::low_level::{DirectoryEntryBuffer, Entry, OpenReply, Reply, Request, r
 const TTL_SECONDS: f64 = 1.0;
 const MACFUSE_ATTR_BLOCK_SIZE: u32 = 512;
 const READDIR_CACHE_TTL: Duration = Duration::from_secs(1);
+const READDIR_CACHE_PRUNE_THRESHOLD: usize = 1024;
 
 /// Read-only operation adapter shared by macFUSE callbacks and fast tests.
 pub(crate) struct ReadOnlyStudioVfsAdapter {
@@ -77,7 +78,7 @@ impl ReadOnlyStudioVfsAdapter {
         size: u32,
     ) -> Result<Vec<u8>, i32> {
         let offset = u64::try_from(offset).map_err(|_| libc::EINVAL)?;
-        let size_usize = usize::try_from(size).map_err(|_| libc::EOVERFLOW)?;
+        let size_usize = size as usize;
         if size_usize == 0 {
             return Ok(Vec::new());
         }
@@ -230,7 +231,9 @@ impl ReadOnlyStudioVfsAdapter {
                 .map_err(|error| vfs_err_to_errno(&error))?,
         );
         let mut cache = self.readdir_cache.lock().map_err(|_| libc::EIO)?;
-        cache.retain(|_, entry| now.duration_since(entry.loaded_at) <= READDIR_CACHE_TTL);
+        if cache.len() >= READDIR_CACHE_PRUNE_THRESHOLD {
+            cache.retain(|_, entry| now.duration_since(entry.loaded_at) <= READDIR_CACHE_TTL);
+        }
         cache.insert(
             ino,
             ReaddirCacheEntry {
@@ -250,17 +253,21 @@ impl ReadOnlyStudioVfsAdapter {
     }
 
     #[cfg(test)]
-    pub(crate) fn insert_expired_readdir_cache_entry_for_test(&self, ino: u64) {
-        self.readdir_cache
+    pub(crate) fn fill_expired_readdir_cache_entries_for_test(&self) {
+        let mut cache = self
+            .readdir_cache
             .lock()
-            .expect("readdir cache lock should not be poisoned")
-            .insert(
+            .expect("readdir cache lock should not be poisoned");
+        let loaded_at = Instant::now() - READDIR_CACHE_TTL - Duration::from_secs(1);
+        for ino in 10_000..(10_000 + READDIR_CACHE_PRUNE_THRESHOLD as u64) {
+            cache.insert(
                 ino,
                 ReaddirCacheEntry {
-                    loaded_at: Instant::now() - READDIR_CACHE_TTL - Duration::from_secs(1),
+                    loaded_at,
                     entries: Arc::new(Vec::new()),
                 },
             );
+        }
     }
 }
 
@@ -281,7 +288,7 @@ impl CallbackState {
     }
 }
 
-fn callback_state(req: *mut raw::FuseReq) -> Option<&'static CallbackState> {
+fn callback_state<'a>(req: *mut raw::FuseReq) -> Option<&'a CallbackState> {
     if req.is_null() {
         return None;
     }
