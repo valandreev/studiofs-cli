@@ -4811,6 +4811,8 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "studiofs-bridge",
+ "studiofs-meta",
  "studiofs-vfs",
  "thiserror 2.0.18",
  "tokio",
