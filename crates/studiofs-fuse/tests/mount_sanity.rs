@@ -504,11 +504,9 @@ fn wait_for_fuse_mount_path_to_clear(mount_path: &Path, pre_dev: u64, timeout: D
 }
 
 fn force_unmount_fuse_mount_path(mount_path: &Path) -> io::Result<()> {
-    force_unmount_fuse_mount_path_with(
-        mount_path,
-        |mount_path| umount_fuse_mount_path_command(mount_path).status(),
-        |_| Err(io::Error::other("no fallback unmount command configured")),
-    )
+    force_unmount_fuse_mount_path_with(mount_path, |mount_path| {
+        umount_fuse_mount_path_command(mount_path).status()
+    })
 }
 
 fn umount_fuse_mount_path_command(mount_path: &Path) -> Command {
@@ -529,7 +527,6 @@ fn forced_fuse_unmount_command_parts(target_os: &str) -> (&'static str, &'static
 fn force_unmount_fuse_mount_path_with(
     mount_path: &Path,
     run_umount: impl FnOnce(&Path) -> io::Result<ExitStatus>,
-    _run_diskutil: impl FnOnce(&Path) -> io::Result<ExitStatus>,
 ) -> io::Result<()> {
     let umount_failure = match run_umount(mount_path) {
         Ok(status) if status.success() => return Ok(()),

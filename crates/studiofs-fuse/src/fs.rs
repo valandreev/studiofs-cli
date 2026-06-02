@@ -163,15 +163,11 @@ fn fuse_attr_blksize() -> u32 {
     512
 }
 
-fn fuse_open_reply_flags(open_flags: OpenFlags, trunc: bool) -> u32 {
-    let _ = trunc;
-
-    {
-        if !open_flags.contains(OpenFlags::WRONLY) && !open_flags.contains(OpenFlags::RDWR) {
-            fuser::consts::FOPEN_KEEP_CACHE
-        } else {
-            0
-        }
+fn fuse_open_reply_flags(open_flags: OpenFlags) -> u32 {
+    if !open_flags.contains(OpenFlags::WRONLY) && !open_flags.contains(OpenFlags::RDWR) {
+        fuser::consts::FOPEN_KEEP_CACHE
+    } else {
+        0
     }
 }
 
@@ -180,13 +176,6 @@ fn fuse_write_local_sync_policy(flags: i32) -> LocalSyncPolicy {
         return LocalSyncPolicy::WriteThrough;
     }
     LocalSyncPolicy::Opportunistic
-}
-
-fn fuse_reply_flags_purge_ubc(reply_flags: u32) -> bool {
-    {
-        let _ = reply_flags;
-        false
-    }
 }
 
 fn parse_bridge_u32_env(key: &str, default: u32) -> u32 {
@@ -550,7 +539,7 @@ fn is_missing_xattr_error(err: &VfsError) -> bool {
 }
 
 fn missing_xattr_errno() -> i32 {
-    { libc::ENODATA }
+    libc::ENODATA
 }
 
 fn note_critical_vfs_error(e: &VfsError) {
@@ -1117,7 +1106,7 @@ impl Filesystem for StudioFuseFs {
                             &to_fuse_attr(&attr, self.mount_uid, self.mount_gid),
                             0,
                             fh,
-                            fuse_open_reply_flags(open_flags, false),
+                            fuse_open_reply_flags(open_flags),
                         );
                     }
                     Err(e) => {
@@ -1300,7 +1289,7 @@ impl Filesystem for StudioFuseFs {
         let (open_flags, trunc) = posix_flags_to_open_flags(flags);
         match self.vfs.open_file(ino, open_flags, trunc) {
             Ok(fh) => {
-                let reply_flags = fuse_open_reply_flags(open_flags, trunc);
+                let reply_flags = fuse_open_reply_flags(open_flags);
                 debug!(
                     ino,
                     fh,
@@ -1309,7 +1298,6 @@ impl Filesystem for StudioFuseFs {
                     trunc,
                     reply_flags,
                     direct_io = reply_flags & fuser::consts::FOPEN_DIRECT_IO != 0,
-                    purge_ubc = fuse_reply_flags_purge_ubc(reply_flags),
                     keep_cache = reply_flags & fuser::consts::FOPEN_KEEP_CACHE != 0,
                     "selected FUSE open cache policy"
                 );
@@ -2607,15 +2595,15 @@ mod tests {
     fn fuse_open_reply_flags_match_platform_cache_policy() {
         {
             assert_eq!(
-                fuse_open_reply_flags(OpenFlags::RDONLY, false),
+                fuse_open_reply_flags(OpenFlags::RDONLY),
                 fuser::consts::FOPEN_KEEP_CACHE
             );
             assert_eq!(
-                fuse_open_reply_flags(OpenFlags::RDONLY | OpenFlags::APPEND, false),
+                fuse_open_reply_flags(OpenFlags::RDONLY | OpenFlags::APPEND),
                 fuser::consts::FOPEN_KEEP_CACHE
             );
-            assert_eq!(fuse_open_reply_flags(OpenFlags::WRONLY, false), 0);
-            assert_eq!(fuse_open_reply_flags(OpenFlags::RDWR, false), 0);
+            assert_eq!(fuse_open_reply_flags(OpenFlags::WRONLY), 0);
+            assert_eq!(fuse_open_reply_flags(OpenFlags::RDWR), 0);
         }
     }
 

@@ -51,7 +51,6 @@ impl MountBackend for FuseMountBackend {
             launch.mount_point,
             launch.volume_name,
         );
-        request.foreground = launch.run_in_foreground;
         request.read_only = launch.read_only;
         request.signal_handling = studiofs_fuse::SignalHandling::InstallForCli;
         studiofs_fuse::mount_with_request(request)

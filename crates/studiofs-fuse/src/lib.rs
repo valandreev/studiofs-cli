@@ -44,12 +44,10 @@ fn validate_volume_name(volume_name: &str) -> Result<(), MountOptionError> {
 
 fn build_mount_options(
     volume_name: &str,
-    foreground: bool,
     read_only: bool,
 ) -> Result<Vec<fuser::MountOption>, MountOptionError> {
     build_mount_options_with_allow_other(
         volume_name,
-        foreground,
         read_only,
         std::env::var("STUDIOFS_FUSE_ALLOW_OTHER").as_deref() == Ok("1"),
     )
@@ -57,20 +55,17 @@ fn build_mount_options(
 
 fn build_mount_options_with_allow_other(
     volume_name: &str,
-    foreground: bool,
     read_only: bool,
     allow_other_env: bool,
 ) -> Result<Vec<fuser::MountOption>, MountOptionError> {
-    build_mount_options_inner(volume_name, foreground, read_only, allow_other_env)
+    build_mount_options_inner(volume_name, read_only, allow_other_env)
 }
 
 fn build_mount_options_inner(
     volume_name: &str,
-    foreground: bool,
     read_only: bool,
     allow_other_env: bool,
 ) -> Result<Vec<fuser::MountOption>, MountOptionError> {
-    let _ = foreground;
     validate_volume_name(volume_name)?;
     let mut options = vec![fuser::MountOption::FSName(volume_name.into())];
     // On Linux, fuser's auto_unmount helper can leave CLI SIGTERM shutdowns
@@ -122,8 +117,6 @@ pub struct FuseMountRequest {
     pub mount_point: String,
     /// Volume name passed to the FUSE mount options.
     pub volume_name: String,
-    /// Whether to request foreground mode where supported by the platform.
-    pub foreground: bool,
     /// Whether the mounted filesystem should reject mutating operations.
     pub read_only: bool,
     /// Process signal ownership policy for this mount.
@@ -145,7 +138,6 @@ impl FuseMountRequest {
             runtime_handle,
             mount_point: mount_point.into(),
             volume_name: volume_name.into(),
-            foreground: false,
             read_only: false,
             signal_handling: SignalHandling::default(),
             unmount_signal: None,
@@ -312,11 +304,9 @@ pub fn mount_and_serve(
     runtime_handle: tokio::runtime::Handle,
     mount_point: &str,
     volume_name: &str,
-    foreground: bool,
     read_only: bool,
 ) -> std::io::Result<()> {
     let mut request = FuseMountRequest::new(vfs, runtime_handle, mount_point, volume_name);
-    request.foreground = foreground;
     request.read_only = read_only;
     mount_with_request(request)
 }
@@ -328,7 +318,6 @@ pub fn mount_with_request(request: FuseMountRequest) -> std::io::Result<()> {
         runtime_handle,
         mount_point,
         volume_name,
-        foreground,
         read_only,
         signal_handling,
         unmount_signal,
@@ -340,7 +329,7 @@ pub fn mount_with_request(request: FuseMountRequest) -> std::io::Result<()> {
     // root inode stored with uid=0/gid=0 (historic default), so the kernel
     // would see the mounting user as "other" (r-x only) and block writes.
     // Instead we implement access() -> ok() so the FUSE daemon decides.
-    let options = build_mount_options(&volume_name, foreground, read_only)
+    let options = build_mount_options(&volume_name, read_only)
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
     let shutdown_hint = match signal_handling {
         SignalHandling::Disabled => "unmount through the host lifecycle",
@@ -448,7 +437,7 @@ mod tests {
     #[test]
     fn build_mount_options_sets_core_fuse_flags() {
         let options =
-            build_mount_options_with_allow_other("studiofs", false, false, false).expect("options");
+            build_mount_options_with_allow_other("studiofs", false, false).expect("options");
         assert!(
             options
                 .iter()
@@ -562,19 +551,7 @@ mod tests {
     #[test]
     fn build_mount_options_adds_allow_other_when_opted_in_on_linux() {
         let options =
-            build_mount_options_with_allow_other("studiofs", false, false, true).expect("options");
+            build_mount_options_with_allow_other("studiofs", false, true).expect("options");
         assert!(mount_options_include_allow_other(&options));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn build_mount_options_foreground_not_added_on_linux() {
-        // On Linux, fusermount3 does not accept 'foreground' as a mount option.
-        // fuser keeps the process in the foreground via session.run() itself.
-        let options =
-            build_mount_options_with_allow_other("studiofs", true, false, false).expect("options");
-        assert!(!options.iter().any(
-            |opt| matches!(opt, fuser::MountOption::CUSTOM(custom) if custom == "foreground")
-        ));
     }
 }
