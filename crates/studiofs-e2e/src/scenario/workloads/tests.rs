@@ -3084,6 +3084,15 @@ fn performance_probe_macos_read_only_mount_uses_macfuse_backend_override() {
 }
 
 #[test]
+fn performance_probe_macos_read_only_mount_uses_read_only_mount_arg_override() {
+    let mut overrides = Vec::new();
+
+    push_read_only_bridge_mount_arg_overrides(&mut overrides);
+
+    assert!(overrides.iter().any(|value| value == "--read-only"));
+}
+
+#[test]
 fn crash_restart_recovery_runs_both_modes_reuses_client_root_and_converges() {
     let temp = tempdir().unwrap();
     let sandbox = temp.path().join("run-1");
@@ -4153,5 +4162,6 @@ fn _test_config(root: &Path) -> ClientControllerConfig {
         poll_interval: Duration::from_millis(10),
         mount_points: Vec::new(),
         client_env_overrides: std::collections::BTreeMap::new(),
+        mount_arg_overrides: std::collections::BTreeMap::new(),
     }
 }

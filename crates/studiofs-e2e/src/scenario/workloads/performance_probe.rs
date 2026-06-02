@@ -122,6 +122,10 @@ fn run_mounted_performance_probe_scenario(
             PERFORMANCE_PROBE_CLIENT,
             read_only_bridge_mount_overrides(),
         )?;
+        controller.set_client_mount_arg_overrides(
+            PERFORMANCE_PROBE_CLIENT,
+            read_only_bridge_mount_arg_overrides(),
+        )?;
     }
     controller.mount(PERFORMANCE_PROBE_CLIENT)?;
     let client = controller.client_at(0)?;
@@ -739,6 +743,16 @@ fn read_only_bridge_mount_overrides() -> Vec<(String, String)> {
     let mut overrides = Vec::new();
     push_read_only_bridge_mount_overrides(&mut overrides);
     overrides
+}
+
+fn read_only_bridge_mount_arg_overrides() -> Vec<String> {
+    let mut overrides = Vec::new();
+    push_read_only_bridge_mount_arg_overrides(&mut overrides);
+    overrides
+}
+
+pub(crate) fn push_read_only_bridge_mount_arg_overrides(overrides: &mut Vec<String>) {
+    overrides.push("--read-only".to_string());
 }
 
 pub(crate) fn push_read_only_bridge_mount_overrides(overrides: &mut Vec<(String, String)>) {

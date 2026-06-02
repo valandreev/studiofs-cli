@@ -477,7 +477,7 @@ impl MountPlan {
             vfs_config,
             run_in_foreground: resolve_run_in_foreground(command.foreground, command.detach),
             launch_mode: resolve_mount_launch_mode(command.detach),
-            read_only_mount: command.snapshot_id.is_some(),
+            read_only_mount: command.read_only || command.snapshot_id.is_some(),
             command,
         })
     }
@@ -1037,6 +1037,7 @@ impl MountPlan {
             &self.command.meta_dir,
             self.command.snapshot_id.as_deref(),
             self.command.endpoint.as_deref(),
+            self.command.read_only,
         )?;
         debug_assert_eq!(self.read_only_mount, read_only_mount);
 
@@ -1532,6 +1533,7 @@ fn resolve_mount_meta_session(
     meta_dir: &Path,
     snapshot_id: Option<&str>,
     endpoint: Option<&str>,
+    read_only: bool,
 ) -> anyhow::Result<MountMetaSession<dyn VfsMeta>> {
     let OpenedLiveMountMeta {
         source_meta,
@@ -1544,7 +1546,7 @@ fn resolve_mount_meta_session(
         MountMetaSession {
             meta: runtime_meta,
             format_info,
-            read_only_mount: false,
+            read_only_mount: read_only,
             snapshot_db_path: None,
         }
     };
@@ -1919,6 +1921,7 @@ mod tests {
             detach: false,
             profile: None,
             snapshot_id: None,
+            read_only: false,
             endpoint: None,
             runtime_tuning: PublicRuntimeTuningArgs::default(),
         }
@@ -2264,13 +2267,37 @@ mod tests {
     }
 
     #[test]
+    fn mount_plan_marks_explicit_live_mount_read_only() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let meta_dir = temp.path().join("meta");
+        std::fs::create_dir_all(&meta_dir).expect("create meta dir");
+        let mount_point = startup_mount_point(&temp);
+        let mut command = mount_command(
+            "projectfs",
+            &meta_dir,
+            Some(mount_point.clone()),
+            None,
+            Some("64GB"),
+        );
+        command.read_only = true;
+
+        let plan = MountPlan::resolve(MountRequest {
+            command,
+            settings_config: startup_settings_config(mount_point, None, Some("64GB")),
+        })
+        .expect("mount plan resolved");
+
+        assert!(plan.read_only_mount);
+    }
+
+    #[test]
     fn mount_meta_session_uses_live_metadata_when_snapshot_id_is_none() {
         let temp = tempfile::tempdir().expect("tempdir");
         let (meta_dir, engine, format_info) = seed_mount_meta_db(&temp, "demo");
         drop(engine);
 
-        let session =
-            resolve_mount_meta_session("demo", &meta_dir, None, None).expect("resolve live meta");
+        let session = resolve_mount_meta_session("demo", &meta_dir, None, None, false)
+            .expect("resolve live meta");
 
         assert!(!session.read_only_mount);
         assert_eq!(session.format_info.uuid, format_info.uuid);
@@ -2330,8 +2357,9 @@ mod tests {
         let snapshot = engine.create_snapshot(ROOT_INO).expect("create snapshot");
         drop(engine);
 
-        let session = resolve_mount_meta_session("demo", &meta_dir, Some(&snapshot.id), None)
-            .expect("resolve snapshot meta");
+        let session =
+            resolve_mount_meta_session("demo", &meta_dir, Some(&snapshot.id), None, false)
+                .expect("resolve snapshot meta");
 
         assert!(session.read_only_mount);
         assert_eq!(
@@ -2355,9 +2383,14 @@ mod tests {
         let (meta_dir, engine, _) = seed_mount_meta_db(&temp, "demo");
         drop(engine);
 
-        let session =
-            resolve_mount_meta_session("demo", &meta_dir, None, Some("http://127.0.0.1:9000"))
-                .expect("resolve with endpoint override");
+        let session = resolve_mount_meta_session(
+            "demo",
+            &meta_dir,
+            None,
+            Some("http://127.0.0.1:9000"),
+            false,
+        )
+        .expect("resolve with endpoint override");
 
         assert_eq!(session.format_info.endpoint, "http://127.0.0.1:9000");
     }
@@ -2372,7 +2405,7 @@ mod tests {
             .expect("set explicit http endpoint");
         drop(engine);
 
-        let session = resolve_mount_meta_session("demo", &meta_dir, None, None)
+        let session = resolve_mount_meta_session("demo", &meta_dir, None, None, false)
             .expect("persisted explicit http endpoint should be accepted");
 
         assert_eq!(session.format_info.endpoint, "http://192.168.1.20:10000");

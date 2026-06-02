@@ -22,6 +22,7 @@ pub(crate) struct MountCommand {
     pub(crate) detach: bool,
     pub(crate) profile: Option<super::mount_profile_types::MountProfileMode>,
     pub(crate) snapshot_id: Option<String>,
+    pub(crate) read_only: bool,
     pub(crate) endpoint: Option<String>,
     pub(crate) runtime_tuning: PublicRuntimeTuningArgs,
 }
@@ -40,6 +41,7 @@ impl MountCommand {
             detach: args.detach,
             profile: args.profile,
             snapshot_id: args.snapshot_id,
+            read_only: args.read_only,
             endpoint: args.endpoint,
             runtime_tuning: args.runtime_tuning,
         })
@@ -150,6 +152,10 @@ pub(crate) struct MountArgs {
     /// Mount a historical snapshot id as read-only.
     #[arg(long)]
     snapshot_id: Option<String>,
+
+    /// Mount the live volume read-only.
+    #[arg(long)]
+    read_only: bool,
 
     /// Override the S3 endpoint URL for this mount session.
     ///
