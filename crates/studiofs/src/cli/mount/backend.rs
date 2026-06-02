@@ -98,6 +98,15 @@ impl MountBackend for MacFuseMountBackend {
 struct UnsupportedUnixMountBackend;
 
 #[cfg(all(unix, not(target_os = "linux")))]
+fn unsupported_unix_backend_error_message() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "StudioFS FUSE backend is Linux-only; set STUDIOFS_MOUNT_BACKEND=macfuse on macOS to try the native bridge stub; the rejected fuser notifier-store path is tracked by SFS-474"
+    } else {
+        "StudioFS FUSE backend is Linux-only; macOS and Windows are supported via their respective native bridges"
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
 impl MountBackend for UnsupportedUnixMountBackend {
     fn name(&self) -> &'static str {
         "unsupported-unix"
@@ -106,7 +115,7 @@ impl MountBackend for UnsupportedUnixMountBackend {
     fn serve(&self, _launch: BackendLaunch) -> io::Result<()> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "StudioFS FUSE backend is Linux-only; set STUDIOFS_MOUNT_BACKEND=macfuse on macOS to try the native bridge stub; the rejected fuser notifier-store path is tracked by SFS-474",
+            unsupported_unix_backend_error_message(),
         ))
     }
 }
@@ -151,6 +160,15 @@ mod tests {
 
             assert_eq!(backend.name(), "unsupported-unix");
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_unsupported_backend_error_mentions_native_stub_selector() {
+        let message = super::unsupported_unix_backend_error_message();
+
+        assert!(message.contains(super::MOUNT_BACKEND_ENV));
+        assert!(message.contains("SFS-474"));
     }
 
     #[cfg(all(unix, not(target_os = "linux")))]
