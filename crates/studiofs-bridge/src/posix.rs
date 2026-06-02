@@ -11,6 +11,8 @@ use studiofs_vfs::{
     BridgeVfsErrorKind, OpenFlags, VfsError, classify_vfs_error, normalize_attr_times,
 };
 
+const POSIX_STAT_BLOCK_SIZE: u64 = 512;
+
 /// Platform-neutral file kind used by bridge attribute conversion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BridgeFileType {
@@ -67,7 +69,7 @@ pub fn posix_flags_to_open_flags(flags: i32) -> (OpenFlags, bool) {
         _ => OpenFlags::RDONLY,
     };
     if flags & libc::O_APPEND != 0 {
-        open_flags = open_flags | OpenFlags::APPEND;
+        open_flags |= OpenFlags::APPEND;
     }
     let trunc = flags & libc::O_TRUNC != 0;
     (open_flags, trunc)
@@ -110,7 +112,7 @@ pub fn to_bridge_attr(
     BridgeFileAttr {
         ino: attr.ino,
         size: attr.size,
-        blocks: attr.size.div_ceil(512),
+        blocks: attr.size.div_ceil(POSIX_STAT_BLOCK_SIZE),
         atime: UNIX_EPOCH + Duration::from_nanos(times.atime_unix_nanos),
         mtime: UNIX_EPOCH + Duration::from_nanos(times.mtime_unix_nanos),
         ctime: UNIX_EPOCH + Duration::from_nanos(times.ctime_unix_nanos),

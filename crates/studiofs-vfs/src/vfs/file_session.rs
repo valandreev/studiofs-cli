@@ -88,6 +88,13 @@ impl std::ops::BitOr for OpenFlags {
     }
 }
 
+impl std::ops::BitOrAssign for OpenFlags {
+    /// Adds flags from `rhs` to this flag set.
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
+}
+
 /// Information about a single open file descriptor.
 #[derive(Clone, Debug)]
 pub struct OpenFile {
@@ -552,5 +559,10 @@ mod tests {
 
         let f2 = f.union(OpenFlags::WRONLY);
         assert!(f2.contains(OpenFlags::WRONLY));
+
+        let mut f3 = OpenFlags::RDONLY;
+        f3 |= OpenFlags::APPEND;
+        assert!(f3.contains(OpenFlags::RDONLY));
+        assert!(f3.contains(OpenFlags::APPEND));
     }
 }
