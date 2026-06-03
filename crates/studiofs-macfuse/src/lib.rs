@@ -505,6 +505,38 @@ mod tests {
     }
 
     #[test]
+    fn adapter_reports_native_resource_fork_xattr_decoded_size() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-adapter-xattr-size")
+                .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"fork-size.txt",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let fork_name = b"com.apple.ResourceFork";
+        let fork_bytes = vec![0x66; 64 * 1024];
+
+        adapter
+            .set_xattr(attr.ino, fork_name, &fork_bytes, 0)
+            .expect("set resource fork through macFUSE adapter");
+
+        assert_eq!(
+            adapter
+                .get_xattr_size(attr.ino, fork_name)
+                .expect("get resource fork size through macFUSE adapter"),
+            Some(fork_bytes.len())
+        );
+    }
+
+    #[test]
     fn read_only_adapter_readdir_stops_successfully_when_reply_buffer_is_full() {
         let fixture =
             studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-readdir-buffer-full")

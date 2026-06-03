@@ -346,6 +346,10 @@ impl MetaXattr for PgMetaEngine {
         self.local.get_xattr(ino, name)
     }
 
+    fn get_xattr_size(&self, ino: Ino, name: &[u8]) -> MetaResult<Option<usize>> {
+        self.local.get_xattr_size(ino, name)
+    }
+
     fn set_xattr(&self, ino: Ino, name: &[u8], value: &[u8], flags: u32) -> MetaResult<()> {
         self.mutate(|local| local.set_xattr(ino, name, value, flags))
     }

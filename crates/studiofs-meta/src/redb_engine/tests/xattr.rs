@@ -77,6 +77,40 @@ fn test_resource_fork_xattr_compresses_when_beneficial() {
 }
 
 #[test]
+fn test_resource_fork_xattr_size_reports_decoded_length() {
+    let engine = temp_engine();
+    let attr = engine
+        .create_file(ROOT_INO, b"resource-fork-size.bin", 0, 0, 0o644)
+        .unwrap();
+
+    let value = vec![0x52; 64 * 1024];
+    engine
+        .set_xattr(attr.ino, RESOURCE_FORK_XATTR_NAME, value.as_slice(), 0)
+        .unwrap();
+    let key = encode_xattr_key(attr.ino, RESOURCE_FORK_XATTR_NAME);
+    let txn = engine.db.begin_read().unwrap();
+    let table = txn.open_table(XATTRS_TABLE).unwrap();
+    let stored_len = table
+        .get(key.as_slice())
+        .unwrap()
+        .expect("stored resource fork xattr")
+        .value()
+        .len();
+
+    assert!(stored_len < value.len());
+    assert_eq!(
+        engine
+            .get_xattr_size(attr.ino, RESOURCE_FORK_XATTR_NAME)
+            .unwrap(),
+        Some(value.len())
+    );
+    assert_eq!(
+        engine.get_xattr_size(attr.ino, b"user.missing").unwrap(),
+        None
+    );
+}
+
+#[test]
 fn test_resource_fork_xattr_keeps_plain_when_not_compressible() {
     let engine = temp_engine();
     let attr = engine

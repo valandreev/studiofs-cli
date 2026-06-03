@@ -277,6 +277,13 @@ impl StudioVfsAdapter {
             .map_err(|error| vfs_err_to_errno(&error))
     }
 
+    /// Get a native extended attribute value size without returning the value bytes.
+    pub(crate) fn get_xattr_size(&self, ino: u64, name: &[u8]) -> Result<Option<usize>, i32> {
+        self.vfs
+            .get_xattr_size(ino, name)
+            .map_err(|error| vfs_err_to_errno(&error))
+    }
+
     /// Set a native extended attribute value.
     pub(crate) fn set_xattr(
         &self,
@@ -1135,10 +1142,14 @@ pub extern "C" fn studiofs_macfuse_setxattr(
         reply_error(req, libc::EIO);
         return;
     };
-    let Some(name) = xattr_name_from_callback(req, name) else {
+    // SAFETY: The returned slice is used only within this callback while the
+    // macFUSE-provided request arguments are live.
+    let Some(name) = (unsafe { xattr_name_from_callback(req, name) }) else {
         return;
     };
-    let Some(value) = xattr_value_from_callback(req, value, size) else {
+    // SAFETY: The returned slice is used only within this callback while the
+    // macFUSE-provided request arguments are live.
+    let Some(value) = (unsafe { xattr_value_from_callback(req, value, size) }) else {
         return;
     };
     if position != 0 {
@@ -1171,11 +1182,21 @@ pub extern "C" fn studiofs_macfuse_getxattr(
         reply_error(req, libc::EIO);
         return;
     };
-    let Some(name) = xattr_name_from_callback(req, name) else {
+    // SAFETY: The returned slice is used only within this callback while the
+    // macFUSE-provided request arguments are live.
+    let Some(name) = (unsafe { xattr_name_from_callback(req, name) }) else {
         return;
     };
     if position != 0 {
         reply_error(req, libc::ENOTSUP);
+        return;
+    }
+    if size == 0 {
+        match state.adapter.get_xattr_size(ino, name) {
+            Ok(Some(value_size)) => reply_xattr_size(req, value_size),
+            Ok(None) => reply_error(req, xattr_not_found_errno()),
+            Err(errno) => reply_error(req, errno),
+        }
         return;
     }
     match state.adapter.get_xattr(ino, name) {
@@ -1197,6 +1218,7 @@ pub extern "C" fn studiofs_macfuse_listxattr(
         return;
     };
     match state.adapter.list_xattrs(ino) {
+        Ok(names) if size == 0 => reply_xattr_size(req, xattr_name_list_len(&names)),
         Ok(names) => reply_xattr_value(req, size, &format_xattr_name_list(&names)),
         Err(errno) => reply_error(req, errno),
     }
@@ -1213,7 +1235,9 @@ pub extern "C" fn studiofs_macfuse_removexattr(
         reply_error(req, libc::EIO);
         return;
     };
-    let Some(name) = xattr_name_from_callback(req, name) else {
+    // SAFETY: The returned slice is used only within this callback while the
+    // macFUSE-provided request arguments are live.
+    let Some(name) = (unsafe { xattr_name_from_callback(req, name) }) else {
         return;
     };
     match state.adapter.remove_xattr(ino, name) {
@@ -1222,16 +1246,18 @@ pub extern "C" fn studiofs_macfuse_removexattr(
     }
 }
 
-fn xattr_name_from_callback<'a>(req: *mut raw::FuseReq, name: *const c_char) -> Option<&'a [u8]> {
+unsafe fn xattr_name_from_callback<'a>(
+    req: *mut raw::FuseReq,
+    name: *const c_char,
+) -> Option<&'a [u8]> {
     if name.is_null() {
         reply_error(req, libc::EINVAL);
         return None;
     }
-    // SAFETY: macFUSE passes a NUL-terminated xattr name for xattr callbacks.
     Some(unsafe { CStr::from_ptr(name) }.to_bytes())
 }
 
-fn xattr_value_from_callback<'a>(
+unsafe fn xattr_value_from_callback<'a>(
     req: *mut raw::FuseReq,
     value: *const c_char,
     size: size_t,
@@ -1243,9 +1269,14 @@ fn xattr_value_from_callback<'a>(
         reply_error(req, libc::EINVAL);
         return None;
     }
-    // SAFETY: macFUSE passes a valid buffer of `size` bytes for non-empty
-    // setxattr callbacks, and the slice is used only within this callback.
     Some(unsafe { std::slice::from_raw_parts(value.cast::<u8>(), size) })
+}
+
+fn reply_xattr_size(req: *mut raw::FuseReq, value_len: usize) {
+    let Some(request) = owned_request(req) else {
+        return;
+    };
+    let _ = Reply::new(request).xattr_size(value_len);
 }
 
 fn reply_xattr_value(req: *mut raw::FuseReq, size: size_t, value: &[u8]) {
@@ -1262,13 +1293,17 @@ fn reply_xattr_value(req: *mut raw::FuseReq, size: size_t, value: &[u8]) {
 }
 
 fn format_xattr_name_list(names: &[Vec<u8>]) -> Vec<u8> {
-    let total_len = names.iter().map(|name| name.len() + 1).sum();
+    let total_len = xattr_name_list_len(names);
     let mut out = Vec::with_capacity(total_len);
     for name in names {
         out.extend_from_slice(name);
         out.push(0);
     }
     out
+}
+
+fn xattr_name_list_len(names: &[Vec<u8>]) -> usize {
+    names.iter().map(|name| name.len() + 1).sum()
 }
 
 fn xattr_not_found_errno() -> i32 {
@@ -1328,5 +1363,19 @@ mod tests {
         };
 
         assert!(!setattr_mask_has_unknown(mask));
+    }
+
+    #[test]
+    fn xattr_name_list_len_counts_nul_separated_wire_bytes() {
+        let names = vec![b"user.alpha".to_vec(), b"com.apple.ResourceFork".to_vec()];
+
+        assert_eq!(
+            xattr_name_list_len(&names),
+            "user.alpha\0com.apple.ResourceFork\0".len()
+        );
+        assert_eq!(
+            format_xattr_name_list(&names),
+            b"user.alpha\0com.apple.ResourceFork\0"
+        );
     }
 }
