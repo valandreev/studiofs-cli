@@ -425,47 +425,7 @@ pub(super) fn decoded_resource_fork_value_size_from_storage(stored: &[u8]) -> us
     {
         return stored.len();
     }
-    let expected_len = u32::from_le_bytes([stored[6], stored[7], stored[8], stored[9]]) as usize;
-    let expected_checksum = u32::from_le_bytes([stored[10], stored[11], stored[12], stored[13]]);
-    let payload = &stored[header_len..];
-    if rle_decompressed_checksum(payload, expected_len)
-        .is_some_and(|checksum| checksum == expected_checksum)
-    {
-        expected_len
-    } else {
-        stored.len()
-    }
-}
-
-fn rle_decompressed_checksum(input: &[u8], expected_len: usize) -> Option<u32> {
-    let mut hash = 0x811c_9dc5u32;
-    let mut decoded_len = 0usize;
-    let mut i = 0usize;
-    while i < input.len() {
-        let token = input[i];
-        i += 1;
-        let len = ((token & 0x7f) as usize) + 1;
-        decoded_len = decoded_len.checked_add(len)?;
-        if decoded_len > expected_len {
-            return None;
-        }
-        if token & 0x80 != 0 {
-            let value = *input.get(i)?;
-            i += 1;
-            for _ in 0..len {
-                hash ^= value as u32;
-                hash = hash.wrapping_mul(0x0100_0193);
-            }
-        } else {
-            let end = i.checked_add(len)?;
-            for byte in input.get(i..end)? {
-                hash ^= *byte as u32;
-                hash = hash.wrapping_mul(0x0100_0193);
-            }
-            i = end;
-        }
-    }
-    (decoded_len == expected_len).then_some(hash)
+    u32::from_le_bytes([stored[6], stored[7], stored[8], stored[9]]) as usize
 }
 
 pub(super) fn decoded_xattr_value_size_from_storage(name: &[u8], stored: &[u8]) -> usize {
