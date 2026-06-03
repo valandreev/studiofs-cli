@@ -193,12 +193,16 @@ unsafe extern "C" {
     );
     fn studiofs_macfuse_file_info_direct_io(info: *const raw::FuseFileInfo) -> c_int;
     fn studiofs_macfuse_file_info_keep_cache(info: *const raw::FuseFileInfo) -> c_int;
-    #[cfg(test)]
     pub(crate) fn studiofs_macfuse_setattr_size_mask() -> c_int;
     pub(crate) fn studiofs_macfuse_setattr_fh_mask() -> c_int;
-    #[cfg(test)]
     pub(crate) fn studiofs_macfuse_setattr_mode_mask() -> c_int;
-    pub(crate) fn studiofs_macfuse_setattr_to_set_has_size(to_set: c_int) -> c_int;
+    pub(crate) fn studiofs_macfuse_setattr_uid_mask() -> c_int;
+    pub(crate) fn studiofs_macfuse_setattr_gid_mask() -> c_int;
+    pub(crate) fn studiofs_macfuse_setattr_atime_mask() -> c_int;
+    pub(crate) fn studiofs_macfuse_setattr_mtime_mask() -> c_int;
+    pub(crate) fn studiofs_macfuse_setattr_atime_now_mask() -> c_int;
+    pub(crate) fn studiofs_macfuse_setattr_mtime_now_mask() -> c_int;
+    pub(crate) fn studiofs_macfuse_setattr_crtime_mask() -> c_int;
 }
 
 /// Low-level callback operation table provided by macFUSE headers.

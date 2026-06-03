@@ -102,10 +102,6 @@ int studiofs_macfuse_file_info_keep_cache(const struct fuse_file_info *info) {
     return info->keep_cache != 0;
 }
 
-int studiofs_macfuse_setattr_to_set_has_size(int to_set) {
-    return (to_set & FUSE_SET_ATTR_SIZE) != 0;
-}
-
 int studiofs_macfuse_setattr_size_mask(void) {
     return FUSE_SET_ATTR_SIZE;
 }
@@ -120,4 +116,36 @@ int studiofs_macfuse_setattr_fh_mask(void) {
 
 int studiofs_macfuse_setattr_mode_mask(void) {
     return FUSE_SET_ATTR_MODE;
+}
+
+int studiofs_macfuse_setattr_uid_mask(void) {
+    return FUSE_SET_ATTR_UID;
+}
+
+int studiofs_macfuse_setattr_gid_mask(void) {
+    return FUSE_SET_ATTR_GID;
+}
+
+int studiofs_macfuse_setattr_atime_mask(void) {
+    return FUSE_SET_ATTR_ATIME;
+}
+
+int studiofs_macfuse_setattr_mtime_mask(void) {
+    return FUSE_SET_ATTR_MTIME;
+}
+
+int studiofs_macfuse_setattr_atime_now_mask(void) {
+    return FUSE_SET_ATTR_ATIME_NOW;
+}
+
+int studiofs_macfuse_setattr_mtime_now_mask(void) {
+    return FUSE_SET_ATTR_MTIME_NOW;
+}
+
+int studiofs_macfuse_setattr_crtime_mask(void) {
+#ifdef FUSE_SET_ATTR_CRTIME
+    return FUSE_SET_ATTR_CRTIME;
+#else
+    return 0;
+#endif
 }

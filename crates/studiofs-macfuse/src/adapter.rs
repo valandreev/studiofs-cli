@@ -10,7 +10,7 @@ use libc::{off_t, size_t, stat, statvfs};
 use studiofs_bridge::posix::{
     BridgeFileAttr, BridgeFileType, posix_flags_to_open_flags, to_bridge_attr, vfs_err_to_errno,
 };
-use studiofs_meta::{DirEntry, FileType, InodeAttr, SetattrArgs};
+use studiofs_meta::{DirEntry, FileType, InodeAttr, SetattrArgs, TimeSpec};
 use studiofs_vfs::{StatFs, StudioVfs};
 use tokio::runtime::Handle;
 
@@ -148,6 +148,7 @@ impl StudioVfsAdapter {
     }
 
     /// Change a file length through the VFS setattr path.
+    #[cfg(test)]
     pub(crate) fn set_len(
         &self,
         file_handle: Option<u64>,
@@ -159,6 +160,21 @@ impl StudioVfsAdapter {
         }
         self.vfs
             .setattr_with_handle(file_handle, ino, SetattrArgs::size_only(size))
+            .map_err(|error| vfs_err_to_errno(&error))
+    }
+
+    /// Change file attributes through the VFS setattr path.
+    pub(crate) fn setattr(
+        &self,
+        file_handle: Option<u64>,
+        ino: u64,
+        args: SetattrArgs,
+    ) -> Result<InodeAttr, i32> {
+        if self.read_only {
+            return Err(libc::EROFS);
+        }
+        self.vfs
+            .setattr_with_handle(file_handle, ino, args)
             .map_err(|error| vfs_err_to_errno(&error))
     }
 
@@ -812,19 +828,17 @@ pub extern "C" fn studiofs_macfuse_setattr(
         reply_error(req, libc::EINVAL);
         return;
     }
-    if !setattr_mask_has_size(to_set) {
-        reply_error(req, libc::ENOTSUP);
-        return;
-    }
-    // SAFETY: macFUSE passes an initialized `stat` pointer when setattr runs.
-    let size = unsafe { (*attr).st_size };
-    let size = match u64::try_from(size) {
-        Ok(size) => size,
-        Err(_) => {
-            reply_error(req, libc::EINVAL);
+    let args = match setattr_args_from_callback(attr, to_set) {
+        Ok(args) => args,
+        Err(errno) => {
+            reply_error(req, errno);
             return;
         }
     };
+    if setattr_args_are_empty(&args) {
+        reply_error(req, libc::ENOTSUP);
+        return;
+    }
     let file_handle = if fi.is_null() || !setattr_mask_has_fh(to_set) {
         None
     } else {
@@ -832,7 +846,7 @@ pub extern "C" fn studiofs_macfuse_setattr(
         // callback mask includes the header-defined file-handle bit.
         Some(unsafe { (*fi).fh })
     };
-    match state.adapter.set_len(file_handle, ino, size) {
+    match state.adapter.setattr(file_handle, ino, args) {
         Ok(attr) => {
             let stat = state.adapter.attr_to_stat(&attr);
             if let Some(request) = owned_request(req) {
@@ -843,16 +857,138 @@ pub extern "C" fn studiofs_macfuse_setattr(
     }
 }
 
+fn setattr_args_from_callback(attr: *const stat, to_set: libc::c_int) -> Result<SetattrArgs, i32> {
+    if setattr_mask_has_unknown(to_set) {
+        return Err(libc::ENOTSUP);
+    }
+    // SAFETY: The caller checked `attr` for null and macFUSE passes an
+    // initialized `stat` for setattr callbacks.
+    let attr = unsafe { &*attr };
+    let mut args = SetattrArgs::default();
+    if setattr_mask_has_size(to_set) {
+        args.size = Some(u64::try_from(attr.st_size).map_err(|_| libc::EINVAL)?);
+    }
+    if setattr_mask_has_mode(to_set) {
+        args.mode = Some((attr.st_mode & 0o7777) as u16);
+    }
+    if setattr_mask_has_uid(to_set) {
+        args.uid = Some(attr.st_uid);
+    }
+    if setattr_mask_has_gid(to_set) {
+        args.gid = Some(attr.st_gid);
+    }
+    if setattr_mask_has_atime_now(to_set) {
+        args.atime = TimeSpec::Now;
+    } else if setattr_mask_has_atime(to_set) {
+        args.atime = TimeSpec::Set(stat_time_to_nanos(attr.st_atime, attr.st_atime_nsec)?);
+    }
+    if setattr_mask_has_mtime_now(to_set) {
+        args.mtime = TimeSpec::Now;
+    } else if setattr_mask_has_mtime(to_set) {
+        args.mtime = TimeSpec::Set(stat_time_to_nanos(attr.st_mtime, attr.st_mtime_nsec)?);
+    }
+    if setattr_mask_has_crtime(to_set) {
+        args.crtime = TimeSpec::Set(stat_time_to_nanos(
+            attr.st_birthtime,
+            attr.st_birthtime_nsec,
+        )?);
+    }
+    Ok(args)
+}
+
+fn setattr_args_are_empty(args: &SetattrArgs) -> bool {
+    args.size.is_none()
+        && args.mode.is_none()
+        && args.uid.is_none()
+        && args.gid.is_none()
+        && args.atime.resolve().is_none()
+        && args.mtime.resolve().is_none()
+        && args.crtime.resolve().is_none()
+        && args.win_attrs.is_none()
+}
+
+fn stat_time_to_nanos(seconds: libc::time_t, nanos: libc::c_long) -> Result<i64, i32> {
+    if !(0..1_000_000_000).contains(&nanos) {
+        return Err(libc::EINVAL);
+    }
+    let total = i128::from(seconds)
+        .checked_mul(1_000_000_000)
+        .and_then(|value| value.checked_add(i128::from(nanos)))
+        .ok_or(libc::EOVERFLOW)?;
+    i64::try_from(total).map_err(|_| libc::EOVERFLOW)
+}
+
 fn setattr_mask_has_size(to_set: libc::c_int) -> bool {
-    // SAFETY: The C shim uses the same macFUSE headers and checks the callback
-    // mask for the header-defined `FUSE_SET_ATTR_SIZE` bit.
-    unsafe { crate::low_level::studiofs_macfuse_setattr_to_set_has_size(to_set) != 0 }
+    // SAFETY: The C shim returns the header-defined SIZE bit.
+    unsafe { to_set & crate::low_level::studiofs_macfuse_setattr_size_mask() != 0 }
 }
 
 fn setattr_mask_has_fh(to_set: libc::c_int) -> bool {
     // SAFETY: The C shim uses the same macFUSE headers and returns either the
     // header-defined FH bit or zero when this FUSE version has no FH bit.
     unsafe { to_set & crate::low_level::studiofs_macfuse_setattr_fh_mask() != 0 }
+}
+
+fn setattr_mask_has_mode(to_set: libc::c_int) -> bool {
+    // SAFETY: The C shim returns the header-defined MODE bit.
+    unsafe { to_set & crate::low_level::studiofs_macfuse_setattr_mode_mask() != 0 }
+}
+
+fn setattr_mask_has_uid(to_set: libc::c_int) -> bool {
+    // SAFETY: The C shim returns the header-defined UID bit.
+    unsafe { to_set & crate::low_level::studiofs_macfuse_setattr_uid_mask() != 0 }
+}
+
+fn setattr_mask_has_gid(to_set: libc::c_int) -> bool {
+    // SAFETY: The C shim returns the header-defined GID bit.
+    unsafe { to_set & crate::low_level::studiofs_macfuse_setattr_gid_mask() != 0 }
+}
+
+fn setattr_mask_has_atime(to_set: libc::c_int) -> bool {
+    // SAFETY: The C shim returns the header-defined ATIME bit.
+    unsafe { to_set & crate::low_level::studiofs_macfuse_setattr_atime_mask() != 0 }
+}
+
+fn setattr_mask_has_mtime(to_set: libc::c_int) -> bool {
+    // SAFETY: The C shim returns the header-defined MTIME bit.
+    unsafe { to_set & crate::low_level::studiofs_macfuse_setattr_mtime_mask() != 0 }
+}
+
+fn setattr_mask_has_atime_now(to_set: libc::c_int) -> bool {
+    // SAFETY: The C shim returns the header-defined ATIME_NOW bit.
+    unsafe { to_set & crate::low_level::studiofs_macfuse_setattr_atime_now_mask() != 0 }
+}
+
+fn setattr_mask_has_mtime_now(to_set: libc::c_int) -> bool {
+    // SAFETY: The C shim returns the header-defined MTIME_NOW bit.
+    unsafe { to_set & crate::low_level::studiofs_macfuse_setattr_mtime_now_mask() != 0 }
+}
+
+fn setattr_mask_has_crtime(to_set: libc::c_int) -> bool {
+    // SAFETY: The C shim returns the header-defined CRTIME bit, or zero when
+    // this FUSE version does not define it.
+    unsafe { to_set & crate::low_level::studiofs_macfuse_setattr_crtime_mask() != 0 }
+}
+
+fn setattr_mask_has_unknown(to_set: libc::c_int) -> bool {
+    to_set & !setattr_supported_mask() != 0
+}
+
+fn setattr_supported_mask() -> libc::c_int {
+    // SAFETY: Each C shim returns one header-defined bit for this build, or zero
+    // for optional bits not present in the active FUSE headers.
+    unsafe {
+        crate::low_level::studiofs_macfuse_setattr_size_mask()
+            | crate::low_level::studiofs_macfuse_setattr_fh_mask()
+            | crate::low_level::studiofs_macfuse_setattr_mode_mask()
+            | crate::low_level::studiofs_macfuse_setattr_uid_mask()
+            | crate::low_level::studiofs_macfuse_setattr_gid_mask()
+            | crate::low_level::studiofs_macfuse_setattr_atime_mask()
+            | crate::low_level::studiofs_macfuse_setattr_mtime_mask()
+            | crate::low_level::studiofs_macfuse_setattr_atime_now_mask()
+            | crate::low_level::studiofs_macfuse_setattr_mtime_now_mask()
+            | crate::low_level::studiofs_macfuse_setattr_crtime_mask()
+    }
 }
 
 /// macFUSE release callback for the StudioVfs bridge.
@@ -959,5 +1095,26 @@ mod tests {
         assert!(!setattr_mask_has_size(0));
         assert_eq!(setattr_mask_has_fh(size_mask), false);
         assert_eq!(setattr_mask_has_fh(size_mask | fh_mask), fh_mask != 0);
+    }
+
+    #[test]
+    fn setattr_args_preserve_bundled_size_mode_and_mtime() {
+        // SAFETY: The C shim returns platform header values for this build.
+        let mask = unsafe {
+            crate::low_level::studiofs_macfuse_setattr_size_mask()
+                | crate::low_level::studiofs_macfuse_setattr_mode_mask()
+                | crate::low_level::studiofs_macfuse_setattr_mtime_mask()
+        };
+        let mut attr = minimal_stat(0);
+        attr.st_size = 42;
+        attr.st_mode = libc::S_IFREG | 0o640;
+        attr.st_mtime = 123;
+        attr.st_mtime_nsec = 456;
+
+        let args = setattr_args_from_callback(&attr, mask).expect("build setattr args");
+
+        assert_eq!(args.size, Some(42));
+        assert_eq!(args.mode, Some(0o640));
+        assert!(matches!(args.mtime, TimeSpec::Set(123_000_000_456)));
     }
 }
