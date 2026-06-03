@@ -1250,6 +1250,8 @@ unsafe fn xattr_name_from_callback<'a>(
     req: *mut raw::FuseReq,
     name: *const c_char,
 ) -> Option<&'a [u8]> {
+    // SAFETY CONTRACT: the returned slice is borrowed from callback-owned
+    // macFUSE memory and must not escape the current callback invocation.
     if name.is_null() {
         reply_error(req, libc::EINVAL);
         return None;
@@ -1262,6 +1264,8 @@ unsafe fn xattr_value_from_callback<'a>(
     value: *const c_char,
     size: size_t,
 ) -> Option<&'a [u8]> {
+    // SAFETY CONTRACT: the returned slice is borrowed from callback-owned
+    // macFUSE memory and must not escape the current callback invocation.
     if size == 0 {
         return Some(&[]);
     }
@@ -1283,9 +1287,7 @@ fn reply_xattr_value(req: *mut raw::FuseReq, size: size_t, value: &[u8]) {
     let Some(request) = owned_request(req) else {
         return;
     };
-    if size == 0 {
-        let _ = Reply::new(request).xattr_size(value.len());
-    } else if size < value.len() {
+    if size < value.len() {
         let _ = Reply::new(request).error(libc::ERANGE);
     } else {
         let _ = Reply::new(request).read_buffer(value);

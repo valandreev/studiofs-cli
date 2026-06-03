@@ -103,13 +103,13 @@ size_t studiofs_macfuse_low_level_ops_size(void) {
 }
 
 int studiofs_macfuse_low_level_ops_has_xattr_callbacks(const struct fuse_lowlevel_ops *ops) {
-    return ops != 0 && ops->getxattr != 0 && ops->listxattr != 0 &&
-           ops->setxattr != 0 && ops->removexattr != 0;
+    return ops != NULL && ops->getxattr != NULL && ops->listxattr != NULL &&
+           ops->setxattr != NULL && ops->removexattr != NULL;
 }
 
 int studiofs_macfuse_low_level_ops_has_read_only_xattr_callbacks(const struct fuse_lowlevel_ops *ops) {
-    return ops != 0 && ops->getxattr != 0 && ops->listxattr != 0 &&
-           ops->setxattr == 0 && ops->removexattr == 0;
+    return ops != NULL && ops->getxattr != NULL && ops->listxattr != NULL &&
+           ops->setxattr == NULL && ops->removexattr == NULL;
 }
 
 void studiofs_macfuse_file_info_init(struct fuse_file_info *info,

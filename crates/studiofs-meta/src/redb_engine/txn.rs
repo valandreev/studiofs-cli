@@ -950,16 +950,27 @@ impl RedbMetaEngine {
         if Self::has_slice_marker(txn, XATTR_TOMBSTONES_TABLE, key.as_slice())? {
             return Ok(None);
         }
-        if let Some(value) = Self::get_bytes_from_table_slice(txn, XATTRS_TABLE, key.as_slice())? {
+        let xattrs = txn
+            .open_table(XATTRS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        if let Some(value) = xattrs
+            .get(key.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
             return Ok(Some(decoded_xattr_value_size_from_storage(
                 name,
-                value.as_slice(),
+                value.value(),
             )));
         }
-        Ok(
-            Self::get_bytes_from_table_slice(txn, BASE_XATTRS_TABLE, key.as_slice())?
-                .map(|value| decoded_xattr_value_size_from_storage(name, value.as_slice())),
-        )
+        drop(xattrs);
+
+        let base_xattrs = txn
+            .open_table(BASE_XATTRS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(base_xattrs
+            .get(key.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .map(|value| decoded_xattr_value_size_from_storage(name, value.value())))
     }
 
     pub(super) fn set_xattr_value_in_table_in_txn(
