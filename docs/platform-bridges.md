@@ -238,6 +238,12 @@ and throughput. A throughput improvement is not enough to enable the bridge by
 default unless later passes avoid userspace read callbacks and unsafe
 invalidation paths remain correct.
 
+SFS-485 owns the readiness decision for macOS native bridge default rollout.
+Until that issue records `default`, `opt-in`, or `reject`, the CLI and
+configuration docs must continue to describe the bridge as
+`STUDIOFS_MOUNT_BACKEND=macfuse` opt-in. The focused validation checklist lives
+in [SFS-485 macOS Native Bridge Readiness](./perf/sfs-485-macos-native-bridge-readiness.md).
+
 ### Trash and recycle-bin behavior
 
 Desktop delete may arrive at the filesystem as a rename into a trash directory
