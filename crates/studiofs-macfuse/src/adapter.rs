@@ -869,7 +869,7 @@ fn setattr_args_from_callback(attr: *const stat, to_set: libc::c_int) -> Result<
         args.size = Some(u64::try_from(attr.st_size).map_err(|_| libc::EINVAL)?);
     }
     if setattr_mask_has_mode(to_set) {
-        args.mode = Some((attr.st_mode & 0o7777) as u16);
+        args.mode = Some(attr.st_mode & 0o7777);
     }
     if setattr_mask_has_uid(to_set) {
         args.uid = Some(attr.st_uid);
@@ -1096,7 +1096,7 @@ mod tests {
         assert!(setattr_mask_has_size(size_mask));
         assert!(setattr_mask_has_size(size_mask | mode_mask));
         assert!(!setattr_mask_has_size(0));
-        assert_eq!(setattr_mask_has_fh(size_mask), false);
+        assert!(!setattr_mask_has_fh(size_mask));
         assert_eq!(setattr_mask_has_fh(size_mask | fh_mask), fh_mask != 0);
     }
 
