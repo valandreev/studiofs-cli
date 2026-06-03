@@ -1187,20 +1187,21 @@ pub extern "C" fn studiofs_macfuse_getxattr(
     let Some(name) = (unsafe { xattr_name_from_callback(req, name) }) else {
         return;
     };
-    if position != 0 {
-        reply_error(req, libc::ENOTSUP);
-        return;
-    }
+    let position = position as usize;
     if size == 0 {
         match state.adapter.get_xattr_size(ino, name) {
-            Ok(Some(value_size)) => reply_xattr_size(req, value_size),
+            Ok(Some(value_size)) => {
+                reply_xattr_size(req, xattr_size_from_position(value_size, position))
+            }
             Ok(None) => reply_error(req, xattr_not_found_errno()),
             Err(errno) => reply_error(req, errno),
         }
         return;
     }
     match state.adapter.get_xattr(ino, name) {
-        Ok(Some(value)) => reply_xattr_value(req, size, &value),
+        Ok(Some(value)) => {
+            reply_xattr_value(req, size, xattr_value_from_position(&value, position))
+        }
         Ok(None) => reply_error(req, xattr_not_found_errno()),
         Err(errno) => reply_error(req, errno),
     }
@@ -1281,6 +1282,14 @@ fn reply_xattr_size(req: *mut raw::FuseReq, value_len: usize) {
         return;
     };
     let _ = Reply::new(request).xattr_size(value_len);
+}
+
+fn xattr_size_from_position(value_len: usize, position: usize) -> usize {
+    value_len.saturating_sub(position)
+}
+
+fn xattr_value_from_position(value: &[u8], position: usize) -> &[u8] {
+    value.get(position..).unwrap_or(&[])
 }
 
 fn reply_xattr_value(req: *mut raw::FuseReq, size: size_t, value: &[u8]) {
@@ -1379,5 +1388,15 @@ mod tests {
             format_xattr_name_list(&names),
             b"user.alpha\0com.apple.ResourceFork\0"
         );
+    }
+
+    #[test]
+    fn xattr_position_offsets_size_probes_and_value_reads() {
+        let value = b"resource-fork-payload";
+
+        assert_eq!(xattr_size_from_position(value.len(), 9), 12);
+        assert_eq!(xattr_size_from_position(value.len(), value.len() + 8), 0);
+        assert_eq!(xattr_value_from_position(value, 9), b"fork-payload");
+        assert_eq!(xattr_value_from_position(value, value.len() + 8), b"");
     }
 }
