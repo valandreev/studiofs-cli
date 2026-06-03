@@ -731,12 +731,16 @@ pub extern "C" fn studiofs_macfuse_write(
         reply_error(req, libc::EINVAL);
         return;
     }
-    let data = match callback_write_buffer(buf, size) {
-        Ok(data) => data,
-        Err(errno) => {
-            reply_error(req, errno);
+    let data = if size == 0 {
+        &[]
+    } else {
+        if buf.is_null() {
+            reply_error(req, libc::EINVAL);
             return;
         }
+        // SAFETY: macFUSE passes a valid buffer of `size` bytes for non-empty
+        // writes, and the borrowed slice is used only within this callback.
+        unsafe { std::slice::from_raw_parts(buf.cast::<u8>(), size) }
     };
     // SAFETY: macFUSE passes a valid `fuse_file_info` pointer for write.
     let file_handle = unsafe { (*fi).fh };
@@ -821,10 +825,11 @@ pub extern "C" fn studiofs_macfuse_setattr(
             return;
         }
     };
-    let file_handle = if fi.is_null() {
+    let file_handle = if fi.is_null() || !setattr_mask_has_fh(to_set) {
         None
     } else {
-        // SAFETY: Non-null `fi` was supplied by macFUSE for handle-backed setattr.
+        // SAFETY: macFUSE guarantees a valid file handle pointer when the
+        // callback mask includes the header-defined file-handle bit.
         Some(unsafe { (*fi).fh })
     };
     match state.adapter.set_len(file_handle, ino, size) {
@@ -838,21 +843,16 @@ pub extern "C" fn studiofs_macfuse_setattr(
     }
 }
 
-fn callback_write_buffer<'a>(buf: *const c_char, size: size_t) -> Result<&'a [u8], i32> {
-    if size == 0 {
-        return Ok(&[]);
-    }
-    if buf.is_null() {
-        return Err(libc::EINVAL);
-    }
-    // SAFETY: macFUSE passes a valid buffer of `size` bytes for non-empty writes.
-    Ok(unsafe { std::slice::from_raw_parts(buf.cast::<u8>(), size) })
-}
-
 fn setattr_mask_has_size(to_set: libc::c_int) -> bool {
     // SAFETY: The C shim uses the same macFUSE headers and checks the callback
     // mask for the header-defined `FUSE_SET_ATTR_SIZE` bit.
     unsafe { crate::low_level::studiofs_macfuse_setattr_to_set_has_size(to_set) != 0 }
+}
+
+fn setattr_mask_has_fh(to_set: libc::c_int) -> bool {
+    // SAFETY: The C shim uses the same macFUSE headers and returns either the
+    // header-defined FH bit or zero when this FUSE version has no FH bit.
+    unsafe { to_set & crate::low_level::studiofs_macfuse_setattr_fh_mask() != 0 }
 }
 
 /// macFUSE release callback for the StudioVfs bridge.
@@ -946,28 +946,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn callback_write_buffer_accepts_null_only_for_empty_write() {
-        let empty = callback_write_buffer(std::ptr::null(), 0).expect("empty null write is valid");
-        assert!(empty.is_empty());
-
-        assert_eq!(
-            callback_write_buffer(std::ptr::null(), 1).unwrap_err(),
-            libc::EINVAL
-        );
-
-        let bytes = b"abc";
-        let data = callback_write_buffer(bytes.as_ptr().cast::<c_char>(), bytes.len())
-            .expect("non-empty write buffer");
-        assert_eq!(data, bytes);
-    }
-
-    #[test]
-    fn setattr_mask_accepts_size_bit_with_extra_timestamp_flags() {
+    fn setattr_mask_accepts_bundled_size_changes_and_gates_file_handle() {
         // SAFETY: The C shim returns the platform header value for this build.
         let size_mask = unsafe { crate::low_level::studiofs_macfuse_setattr_size_mask() };
+        // SAFETY: The C shim returns the platform header value for this build.
+        let fh_mask = unsafe { crate::low_level::studiofs_macfuse_setattr_fh_mask() };
+        // SAFETY: The C shim returns the platform header value for this build.
+        let mode_mask = unsafe { crate::low_level::studiofs_macfuse_setattr_mode_mask() };
 
         assert!(setattr_mask_has_size(size_mask));
-        assert!(setattr_mask_has_size(size_mask | (size_mask << 1)));
+        assert!(setattr_mask_has_size(size_mask | mode_mask));
         assert!(!setattr_mask_has_size(0));
+        assert_eq!(setattr_mask_has_fh(size_mask), false);
+        assert_eq!(setattr_mask_has_fh(size_mask | fh_mask), fh_mask != 0);
     }
 }

@@ -109,3 +109,15 @@ int studiofs_macfuse_setattr_to_set_has_size(int to_set) {
 int studiofs_macfuse_setattr_size_mask(void) {
     return FUSE_SET_ATTR_SIZE;
 }
+
+int studiofs_macfuse_setattr_fh_mask(void) {
+#ifdef FUSE_SET_ATTR_FH
+    return FUSE_SET_ATTR_FH;
+#else
+    return 0;
+#endif
+}
+
+int studiofs_macfuse_setattr_mode_mask(void) {
+    return FUSE_SET_ATTR_MODE;
+}

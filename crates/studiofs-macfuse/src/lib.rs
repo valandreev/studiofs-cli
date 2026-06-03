@@ -81,12 +81,11 @@ pub fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()> {
     let userdata =
         (&mut *callback_state) as *mut adapter::CallbackState as *mut std::os::raw::c_void;
     // SAFETY: `callback_state` remains boxed and live until after the mounted
-    // session is dropped. The read-only callback table handles this exact
-    // userdata type.
+    // session is dropped. Both callback tables handle this exact userdata type.
     let mut session = unsafe {
         low_level::Session::mount_with_ops(
             &config,
-            low_level::LowLevelOperations::studio_vfs(),
+            studio_vfs_ops_for_read_only(read_only),
             userdata,
         )
     }?;
@@ -94,6 +93,14 @@ pub fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()> {
     drop(session);
     drop(callback_state);
     result
+}
+
+fn studio_vfs_ops_for_read_only(read_only: bool) -> low_level::LowLevelOperations {
+    if read_only {
+        low_level::LowLevelOperations::read_only_studio_vfs()
+    } else {
+        low_level::LowLevelOperations::studio_vfs()
+    }
 }
 
 #[cfg(test)]
@@ -185,6 +192,22 @@ mod tests {
 
         assert!(ops.size() > 0);
         assert!(!ops.as_ptr().is_null());
+    }
+
+    #[test]
+    fn read_only_mount_uses_restricted_low_level_ops() {
+        let read_only_ops = super::studio_vfs_ops_for_read_only(true);
+        let writable_ops = super::studio_vfs_ops_for_read_only(false);
+
+        assert_eq!(
+            read_only_ops.as_ptr(),
+            super::low_level::LowLevelOperations::read_only_studio_vfs().as_ptr()
+        );
+        assert_eq!(
+            writable_ops.as_ptr(),
+            super::low_level::LowLevelOperations::studio_vfs().as_ptr()
+        );
+        assert_ne!(read_only_ops.as_ptr(), writable_ops.as_ptr());
     }
 
     #[test]

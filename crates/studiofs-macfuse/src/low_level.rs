@@ -195,6 +195,9 @@ unsafe extern "C" {
     fn studiofs_macfuse_file_info_keep_cache(info: *const raw::FuseFileInfo) -> c_int;
     #[cfg(test)]
     pub(crate) fn studiofs_macfuse_setattr_size_mask() -> c_int;
+    pub(crate) fn studiofs_macfuse_setattr_fh_mask() -> c_int;
+    #[cfg(test)]
+    pub(crate) fn studiofs_macfuse_setattr_mode_mask() -> c_int;
     pub(crate) fn studiofs_macfuse_setattr_to_set_has_size(to_set: c_int) -> c_int;
 }
 
