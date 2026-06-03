@@ -1081,6 +1081,46 @@ fn macos_native_bridge_split_note_covers_sfs475_boundary() {
 }
 
 #[test]
+fn macos_native_bridge_readiness_report_covers_sfs485_decision_gate() {
+    let doc = read_workspace_file("docs/perf/sfs-485-macos-native-bridge-readiness.md");
+    let normalized_doc = normalize_doc_whitespace(&doc);
+    let required_terms = [
+        "SFS-485",
+        "macOS native bridge readiness and default rollout",
+        "STUDIOFS_MOUNT_BACKEND=macfuse",
+        "Do not make the native bridge default before this issue reaches a decision",
+        "read/write/truncate/xattr/Finder-focused scenarios",
+        "current fuser baseline",
+        "callback count",
+        "throughput",
+        "Linux FUSE and Windows WinFSP focused validations show no regression",
+        "default",
+        "opt-in",
+        "reject",
+        "operator should run, but the agent should not run locally",
+        "cargo test -p studiofs --test architecture_vocabulary_test macos_native_bridge_readiness_report_covers_sfs485_decision_gate -- --nocapture",
+        "cargo test -p studiofs-macfuse",
+        "cargo test -p studiofs-fuse --test mount_sanity",
+        "cargo test -p studiofs-winfsp --test mount_sanity",
+        "studiofs test-cache --mounted",
+        "docs/configuration.md",
+        "docs/platform-bridges.md",
+    ];
+
+    let missing: Vec<_> = required_terms
+        .iter()
+        .copied()
+        .filter(|term| !contains_doc_term(&doc, &normalized_doc, term))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "SFS-485 macOS native bridge readiness report is missing required decision-gate surfaces:\n{}",
+        missing.join("\n")
+    );
+}
+
+#[test]
 fn deterministic_simulation_architecture_covers_required_sfs330_surfaces() {
     let doc = read_workspace_file("docs/deterministic-simulation-architecture.md");
     let required_terms = [
