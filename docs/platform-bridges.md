@@ -214,9 +214,29 @@ turn on global direct I/O and does not change the buffered read cache policy.
 ### macOS bridge track
 
 macOS-specific mount options, UBC policy, Finder metadata behavior, Unicode
-normalization, and native resource-fork handling are not implemented in
-`studiofs-fuse`. They belong to the future macOS bridge track and should be
-tested in that bridge once it exists.
+normalization, and native resource-fork handling are owned by
+`studiofs-macfuse`, not `studiofs-fuse`.
+
+Current macFUSE cache policy is intentionally conservative and remains behind
+explicit `STUDIOFS_MOUNT_BACKEND=macfuse` opt-in until mounted benchmarks prove
+the policy is ready to become the default:
+
+| Case | Policy |
+|------|--------|
+| Read-only open | Return `keep_cache` and do not request direct I/O. |
+| Write-capable open (`O_WRONLY`, `O_RDWR`, `O_APPEND`) | Do not return `keep_cache`; keep buffered I/O enabled. |
+| Truncate/overwrite open (`O_TRUNC`) | Do not return `keep_cache`; the changed EOF or payload must not reuse stale cached pages. |
+| Upload completion for same-mount writes | Must preserve hot local payload visibility through VFS; upload completion alone must not make same-mount reads cold. |
+| Same-mount write, truncate, or overwrite | Must invalidate unsafe file-data cache before a later read can rely on cached pages. |
+| Remote content invalidation | Must invalidate unsafe file-data cache; attr-only refresh is not enough when content may have changed. |
+| Attr-only invalidation | May refresh metadata without dropping clean file data when the content generation is unchanged. |
+| Entry invalidation | Must invalidate directory/name cache for the affected parent/name without implying unrelated file-data invalidation. |
+
+Repeated-read macFUSE reports must include kernel-cache interpretation, callback
+count, callback bytes, VFS read count, S3 GET count, local payload read bytes,
+and throughput. A throughput improvement is not enough to enable the bridge by
+default unless later passes avoid userspace read callbacks and unsafe
+invalidation paths remain correct.
 
 ### Trash and recycle-bin behavior
 
