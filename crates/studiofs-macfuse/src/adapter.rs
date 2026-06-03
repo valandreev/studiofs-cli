@@ -10,8 +10,8 @@ use libc::{off_t, size_t, stat, statvfs};
 use studiofs_bridge::posix::{
     BridgeFileAttr, BridgeFileType, posix_flags_to_open_flags, to_bridge_attr, vfs_err_to_errno,
 };
-use studiofs_meta::{DirEntry, FileType, InodeAttr};
-use studiofs_vfs::{OpenFlags, StatFs, StudioVfs};
+use studiofs_meta::{DirEntry, FileType, InodeAttr, SetattrArgs};
+use studiofs_vfs::{StatFs, StudioVfs};
 use tokio::runtime::Handle;
 
 use crate::low_level::{DirectoryEntryBuffer, Entry, OpenReply, Reply, Request, raw};
@@ -22,10 +22,11 @@ const READDIR_CACHE_TTL: Duration = Duration::from_secs(1);
 const READDIR_CACHE_PRUNE_THRESHOLD: usize = 1024;
 const READDIR_CACHE_PRUNE_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Read-only operation adapter shared by macFUSE callbacks and fast tests.
+/// Operation adapter shared by macFUSE callbacks and fast tests.
 pub(crate) struct ReadOnlyStudioVfsAdapter {
     vfs: Arc<StudioVfs>,
     runtime_handle: Handle,
+    read_only: bool,
     mount_uid: u32,
     mount_gid: u32,
     readdir_cache: Mutex<HashMap<u64, ReaddirCacheEntry>>,
@@ -34,11 +35,22 @@ pub(crate) struct ReadOnlyStudioVfsAdapter {
 }
 
 impl ReadOnlyStudioVfsAdapter {
-    /// Create a read-only macFUSE adapter over a StudioVfs instance.
+    /// Create a macFUSE adapter over a StudioVfs instance.
+    #[cfg(test)]
     pub(crate) fn new(vfs: Arc<StudioVfs>, runtime_handle: Handle) -> Self {
+        Self::new_with_read_only(vfs, runtime_handle, false)
+    }
+
+    /// Create a macFUSE adapter over a StudioVfs instance with explicit write policy.
+    pub(crate) fn new_with_read_only(
+        vfs: Arc<StudioVfs>,
+        runtime_handle: Handle,
+        read_only: bool,
+    ) -> Self {
         Self {
             vfs,
             runtime_handle,
+            read_only,
             mount_uid: current_uid(),
             mount_gid: current_gid(),
             readdir_cache: Mutex::new(HashMap::new()),
@@ -62,14 +74,14 @@ impl ReadOnlyStudioVfsAdapter {
             .map_err(|error| vfs_err_to_errno(&error))
     }
 
-    /// Open an existing file for reading.
+    /// Open an existing file.
     pub(crate) fn open(&self, ino: u64, flags: i32) -> Result<OpenReply, i32> {
         let (open_flags, trunc) = posix_flags_to_open_flags(flags);
-        if trunc || open_flags.contains(OpenFlags::WRONLY) || open_flags.contains(OpenFlags::RDWR) {
+        if self.read_only && posix_open_requests_write(flags, trunc) {
             return Err(libc::EROFS);
         }
         self.vfs
-            .open_file(ino, OpenFlags::RDONLY, false)
+            .open_file(ino, open_flags, trunc)
             .map(|fh| OpenReply::new(fh).with_keep_cache(true))
             .map_err(|error| vfs_err_to_errno(&error))
     }
@@ -102,6 +114,52 @@ impl ReadOnlyStudioVfsAdapter {
             }
             Err(error) => Err(vfs_err_to_errno(&error)),
         }
+    }
+
+    /// Write file data through a VFS file handle.
+    pub(crate) fn write(
+        &self,
+        ino: u64,
+        file_handle: u64,
+        offset: i64,
+        data: &[u8],
+    ) -> Result<u32, i32> {
+        if self.read_only {
+            return Err(libc::EROFS);
+        }
+        let offset = u64::try_from(offset).map_err(|_| libc::EINVAL)?;
+        self.runtime_handle
+            .block_on(self.vfs.write_fh(file_handle, ino, offset, data))
+            .map_err(|error| vfs_err_to_errno(&error))
+    }
+
+    /// Flush file data through a VFS file handle.
+    pub(crate) fn flush(&self, _ino: u64, file_handle: u64) -> Result<(), i32> {
+        self.runtime_handle
+            .block_on(self.vfs.flush_fh(file_handle))
+            .map_err(|error| vfs_err_to_errno(&error))
+    }
+
+    /// Synchronize file data for an inode.
+    pub(crate) fn fsync(&self, ino: u64, datasync: bool) -> Result<(), i32> {
+        self.runtime_handle
+            .block_on(self.vfs.fsync(ino, datasync))
+            .map_err(|error| vfs_err_to_errno(&error))
+    }
+
+    /// Change a file length through the VFS setattr path.
+    pub(crate) fn set_len(
+        &self,
+        file_handle: Option<u64>,
+        ino: u64,
+        size: u64,
+    ) -> Result<InodeAttr, i32> {
+        if self.read_only {
+            return Err(libc::EROFS);
+        }
+        self.vfs
+            .setattr_with_handle(file_handle, ino, SetattrArgs::size_only(size))
+            .map_err(|error| vfs_err_to_errno(&error))
     }
 
     /// Release a file handle opened through this adapter.
@@ -373,9 +431,9 @@ pub(crate) struct CallbackState {
 }
 
 impl CallbackState {
-    pub(crate) fn new(vfs: Arc<StudioVfs>, runtime_handle: Handle) -> Self {
+    pub(crate) fn new(vfs: Arc<StudioVfs>, runtime_handle: Handle, read_only: bool) -> Self {
         Self {
-            adapter: ReadOnlyStudioVfsAdapter::new(vfs, runtime_handle),
+            adapter: ReadOnlyStudioVfsAdapter::new_with_read_only(vfs, runtime_handle, read_only),
         }
     }
 }
@@ -441,6 +499,14 @@ fn push_or_finish(
         Err(libc::ERANGE) => Ok(false),
         Err(errno) => Err(errno),
     }
+}
+
+fn posix_open_requests_write(flags: i32, trunc: bool) -> bool {
+    let access_mode = flags & libc::O_ACCMODE;
+    trunc
+        || access_mode == libc::O_WRONLY
+        || access_mode == libc::O_RDWR
+        || flags & libc::O_APPEND != 0
 }
 
 fn current_uid() -> u32 {
@@ -534,7 +600,7 @@ fn statfs_to_statvfs(stats: StatFs) -> statvfs {
     out
 }
 
-/// macFUSE lookup callback for the read-only StudioVfs bridge.
+/// macFUSE lookup callback for the StudioVfs bridge.
 #[unsafe(no_mangle)]
 pub extern "C" fn studiofs_macfuse_lookup(
     req: *mut raw::FuseReq,
@@ -563,7 +629,7 @@ pub extern "C" fn studiofs_macfuse_lookup(
     }
 }
 
-/// macFUSE getattr callback for the read-only StudioVfs bridge.
+/// macFUSE getattr callback for the StudioVfs bridge.
 #[unsafe(no_mangle)]
 pub extern "C" fn studiofs_macfuse_getattr(
     req: *mut raw::FuseReq,
@@ -584,7 +650,7 @@ pub extern "C" fn studiofs_macfuse_getattr(
     }
 }
 
-/// macFUSE open callback for the read-only StudioVfs bridge.
+/// macFUSE open callback for the StudioVfs bridge.
 #[unsafe(no_mangle)]
 pub extern "C" fn studiofs_macfuse_open(
     req: *mut raw::FuseReq,
@@ -611,7 +677,7 @@ pub extern "C" fn studiofs_macfuse_open(
     }
 }
 
-/// macFUSE read callback for the read-only StudioVfs bridge.
+/// macFUSE read callback for the StudioVfs bridge.
 #[unsafe(no_mangle)]
 pub extern "C" fn studiofs_macfuse_read(
     req: *mut raw::FuseReq,
@@ -647,7 +713,132 @@ pub extern "C" fn studiofs_macfuse_read(
     }
 }
 
-/// macFUSE release callback for the read-only StudioVfs bridge.
+/// macFUSE write callback for the StudioVfs bridge.
+#[unsafe(no_mangle)]
+pub extern "C" fn studiofs_macfuse_write(
+    req: *mut raw::FuseReq,
+    ino: raw::FuseIno,
+    buf: *const c_char,
+    size: size_t,
+    off: off_t,
+    fi: *mut raw::FuseFileInfo,
+) {
+    let Some(state) = callback_state(req) else {
+        reply_error(req, libc::EIO);
+        return;
+    };
+    if fi.is_null() || (buf.is_null() && size != 0) {
+        reply_error(req, libc::EINVAL);
+        return;
+    }
+    // SAFETY: macFUSE passes a valid buffer of `size` bytes for write. A null
+    // buffer is accepted only for an empty write above.
+    let data = unsafe { std::slice::from_raw_parts(buf.cast::<u8>(), size) };
+    // SAFETY: macFUSE passes a valid `fuse_file_info` pointer for write.
+    let file_handle = unsafe { (*fi).fh };
+    match state.adapter.write(ino, file_handle, off, data) {
+        Ok(count) => {
+            if let Some(request) = owned_request(req) {
+                let _ = Reply::new(request).write_count(count as usize);
+            }
+        }
+        Err(errno) => reply_error(req, errno),
+    }
+}
+
+/// macFUSE flush callback for the StudioVfs bridge.
+#[unsafe(no_mangle)]
+pub extern "C" fn studiofs_macfuse_flush(
+    req: *mut raw::FuseReq,
+    ino: raw::FuseIno,
+    fi: *mut raw::FuseFileInfo,
+) {
+    let Some(state) = callback_state(req) else {
+        reply_error(req, libc::EIO);
+        return;
+    };
+    if fi.is_null() {
+        reply_error(req, libc::EINVAL);
+        return;
+    }
+    // SAFETY: macFUSE passes a valid `fuse_file_info` pointer for flush.
+    let file_handle = unsafe { (*fi).fh };
+    match state.adapter.flush(ino, file_handle) {
+        Ok(()) => reply_error(req, 0),
+        Err(errno) => reply_error(req, errno),
+    }
+}
+
+/// macFUSE fsync callback for the StudioVfs bridge.
+#[unsafe(no_mangle)]
+pub extern "C" fn studiofs_macfuse_fsync(
+    req: *mut raw::FuseReq,
+    ino: raw::FuseIno,
+    datasync: libc::c_int,
+    _fi: *mut raw::FuseFileInfo,
+) {
+    let Some(state) = callback_state(req) else {
+        reply_error(req, libc::EIO);
+        return;
+    };
+    match state.adapter.fsync(ino, datasync != 0) {
+        Ok(()) => reply_error(req, 0),
+        Err(errno) => reply_error(req, errno),
+    }
+}
+
+/// macFUSE setattr callback for size-changing truncate/extend operations.
+#[unsafe(no_mangle)]
+pub extern "C" fn studiofs_macfuse_setattr(
+    req: *mut raw::FuseReq,
+    ino: raw::FuseIno,
+    attr: *mut stat,
+    to_set: libc::c_int,
+    fi: *mut raw::FuseFileInfo,
+) {
+    let Some(state) = callback_state(req) else {
+        reply_error(req, libc::EIO);
+        return;
+    };
+    if attr.is_null() {
+        reply_error(req, libc::EINVAL);
+        return;
+    }
+    // SAFETY: The C shim uses the same macFUSE headers and checks the
+    // header-defined `FUSE_SET_ATTR_SIZE` bit for this callback mask.
+    let has_size =
+        unsafe { crate::low_level::studiofs_macfuse_setattr_to_set_has_size(to_set) != 0 };
+    if !has_size {
+        reply_error(req, libc::ENOTSUP);
+        return;
+    }
+    // SAFETY: macFUSE passes an initialized `stat` pointer when setattr runs.
+    let size = unsafe { (*attr).st_size };
+    let size = match u64::try_from(size) {
+        Ok(size) => size,
+        Err(_) => {
+            reply_error(req, libc::EINVAL);
+            return;
+        }
+    };
+    let file_handle = if fi.is_null() {
+        None
+    } else {
+        // SAFETY: Non-null `fi` was supplied by macFUSE for handle-backed setattr.
+        Some(unsafe { (*fi).fh })
+    };
+    match state.adapter.set_len(file_handle, ino, size) {
+        Ok(attr) => {
+            let stat = state.adapter.attr_to_stat(&attr);
+            if let Some(request) = owned_request(req) {
+                let _ = Reply::new(request).attr(&stat, TTL_SECONDS);
+            }
+        }
+        Err(errno) => reply_error(req, errno),
+    }
+}
+
+/// macFUSE release callback for the StudioVfs bridge.
 #[unsafe(no_mangle)]
 pub extern "C" fn studiofs_macfuse_release(
     req: *mut raw::FuseReq,
@@ -670,7 +861,7 @@ pub extern "C" fn studiofs_macfuse_release(
     }
 }
 
-/// macFUSE readdir callback for the read-only StudioVfs bridge.
+/// macFUSE readdir callback for the StudioVfs bridge.
 #[unsafe(no_mangle)]
 pub extern "C" fn studiofs_macfuse_readdir(
     req: *mut raw::FuseReq,
@@ -696,7 +887,7 @@ pub extern "C" fn studiofs_macfuse_readdir(
     }
 }
 
-/// macFUSE readlink callback for the read-only StudioVfs bridge.
+/// macFUSE readlink callback for the StudioVfs bridge.
 #[unsafe(no_mangle)]
 pub extern "C" fn studiofs_macfuse_readlink(req: *mut raw::FuseReq, ino: raw::FuseIno) {
     let Some(state) = callback_state(req) else {
@@ -716,7 +907,7 @@ pub extern "C" fn studiofs_macfuse_readlink(req: *mut raw::FuseReq, ino: raw::Fu
     }
 }
 
-/// macFUSE statfs callback for the read-only StudioVfs bridge.
+/// macFUSE statfs callback for the StudioVfs bridge.
 #[unsafe(no_mangle)]
 pub extern "C" fn studiofs_macfuse_statfs(req: *mut raw::FuseReq, _ino: raw::FuseIno) {
     let Some(state) = callback_state(req) else {

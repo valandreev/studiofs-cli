@@ -181,6 +181,7 @@ pub(crate) mod raw {
 
 unsafe extern "C" {
     fn studiofs_macfuse_empty_low_level_ops() -> *const raw::FuseLowLevelOps;
+    fn studiofs_macfuse_low_level_ops() -> *const raw::FuseLowLevelOps;
     fn studiofs_macfuse_read_only_low_level_ops() -> *const raw::FuseLowLevelOps;
     fn studiofs_macfuse_low_level_ops_size() -> size_t;
     fn studiofs_macfuse_file_info_init(
@@ -192,6 +193,7 @@ unsafe extern "C" {
     );
     fn studiofs_macfuse_file_info_direct_io(info: *const raw::FuseFileInfo) -> c_int;
     fn studiofs_macfuse_file_info_keep_cache(info: *const raw::FuseFileInfo) -> c_int;
+    pub(crate) fn studiofs_macfuse_setattr_to_set_has_size(to_set: c_int) -> c_int;
 }
 
 /// Low-level callback operation table provided by macFUSE headers.
@@ -222,6 +224,19 @@ impl LowLevelOperations {
         unsafe {
             Self {
                 raw: studiofs_macfuse_read_only_low_level_ops(),
+                size: studiofs_macfuse_low_level_ops_size(),
+            }
+        }
+    }
+
+    /// StudioVfs callback operation table.
+    pub fn studio_vfs() -> Self {
+        // SAFETY: The C shim returns a pointer to a static table and its exact
+        // header-derived size. Callback function pointers are Rust `extern "C"`
+        // functions with signatures matching the same macFUSE header.
+        unsafe {
+            Self {
+                raw: studiofs_macfuse_low_level_ops(),
                 size: studiofs_macfuse_low_level_ops_size(),
             }
         }

@@ -74,17 +74,10 @@ pub fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()> {
         read_only,
         run_in_foreground,
     } = request;
-    if !read_only {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "studiofs-macfuse currently supports only explicit read-only mounts",
-        ));
-    }
-
     let config = low_level::SessionConfig::new(mount_point, volume_name)
-        .with_read_only(true)
+        .with_read_only(read_only)
         .with_run_in_foreground(run_in_foreground);
-    let mut callback_state = Box::new(adapter::CallbackState::new(vfs, runtime_handle));
+    let mut callback_state = Box::new(adapter::CallbackState::new(vfs, runtime_handle, read_only));
     let userdata =
         (&mut *callback_state) as *mut adapter::CallbackState as *mut std::os::raw::c_void;
     // SAFETY: `callback_state` remains boxed and live until after the mounted
@@ -93,7 +86,7 @@ pub fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()> {
     let mut session = unsafe {
         low_level::Session::mount_with_ops(
             &config,
-            low_level::LowLevelOperations::read_only_studio_vfs(),
+            low_level::LowLevelOperations::studio_vfs(),
             userdata,
         )
     }?;
@@ -173,6 +166,14 @@ mod tests {
     #[test]
     fn empty_low_level_ops_come_from_c_header_layout() {
         let ops = super::low_level::LowLevelOperations::empty();
+
+        assert!(ops.size() > 0);
+        assert!(!ops.as_ptr().is_null());
+    }
+
+    #[test]
+    fn studio_vfs_low_level_ops_come_from_c_header_layout() {
+        let ops = super::low_level::LowLevelOperations::studio_vfs();
 
         assert!(ops.size() > 0);
         assert!(!ops.as_ptr().is_null());
@@ -313,7 +314,95 @@ mod tests {
     }
 
     #[test]
-    fn read_only_adapter_rejects_write_or_truncate_open_flags() {
+    fn adapter_write_keeps_accepted_bytes_visible_to_same_mount_reader() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-adapter-write-read-after-write",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"hello.txt",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        let adapter = super::adapter::ReadOnlyStudioVfsAdapter::new(
+            vfs.clone(),
+            fixture.runtime().handle().clone(),
+        );
+
+        let writer = adapter
+            .open(attr.ino, libc::O_WRONLY)
+            .expect("open writer through macFUSE adapter");
+        let accepted = adapter
+            .write(attr.ino, writer.file_handle(), 0, b"hello from macFUSE")
+            .expect("write payload through macFUSE adapter");
+        let reader = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open reader through macFUSE adapter");
+        let bytes = adapter
+            .read(attr.ino, reader.file_handle(), 0, 18)
+            .expect("read accepted local bytes through same adapter");
+
+        assert_eq!(accepted, 18);
+        assert_eq!(&bytes[..], b"hello from macFUSE");
+    }
+
+    #[test]
+    fn adapter_flush_fsync_release_and_truncate_preserve_local_first_bytes() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-adapter-write-flush-fsync-release-truncate",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"hello.txt",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        let adapter = super::adapter::ReadOnlyStudioVfsAdapter::new(
+            vfs.clone(),
+            fixture.runtime().handle().clone(),
+        );
+        let writer = adapter
+            .open(attr.ino, libc::O_RDWR)
+            .expect("open writable handle through macFUSE adapter");
+
+        adapter
+            .write(attr.ino, writer.file_handle(), 0, b"hello from macFUSE")
+            .expect("write payload through macFUSE adapter");
+        adapter
+            .flush(attr.ino, writer.file_handle())
+            .expect("flush writable handle through macFUSE adapter");
+        adapter
+            .fsync(attr.ino, false)
+            .expect("fsync inode through macFUSE adapter");
+        let truncated = adapter
+            .set_len(Some(writer.file_handle()), attr.ino, 5)
+            .expect("truncate through macFUSE adapter");
+        adapter
+            .release(attr.ino, writer.file_handle())
+            .expect("release writable handle through macFUSE adapter");
+        let reader = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("reopen reader through macFUSE adapter");
+        let bytes = adapter
+            .read(attr.ino, reader.file_handle(), 0, 32)
+            .expect("read truncated accepted local bytes");
+
+        assert_eq!(truncated.size, 5);
+        assert_eq!(&bytes[..], b"hello");
+    }
+
+    #[test]
+    fn read_only_adapter_still_rejects_write_or_truncate_open_flags() {
         let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
             "macfuse-read-only-adapter-open-flags",
         )
@@ -328,8 +417,11 @@ mod tests {
                 0o644,
             )
             .expect("create file");
-        let adapter =
-            super::adapter::ReadOnlyStudioVfsAdapter::new(vfs, fixture.runtime().handle().clone());
+        let adapter = super::adapter::ReadOnlyStudioVfsAdapter::new_with_read_only(
+            vfs,
+            fixture.runtime().handle().clone(),
+            true,
+        );
 
         assert_eq!(
             adapter.open(attr.ino, libc::O_WRONLY).unwrap_err(),

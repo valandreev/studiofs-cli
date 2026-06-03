@@ -12,6 +12,22 @@ extern void studiofs_macfuse_read(fuse_req_t req,
                                   size_t size,
                                   off_t off,
                                   struct fuse_file_info *fi);
+extern void studiofs_macfuse_write(fuse_req_t req,
+                                   fuse_ino_t ino,
+                                   const char *buf,
+                                   size_t size,
+                                   off_t off,
+                                   struct fuse_file_info *fi);
+extern void studiofs_macfuse_flush(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi);
+extern void studiofs_macfuse_fsync(fuse_req_t req,
+                                   fuse_ino_t ino,
+                                   int datasync,
+                                   struct fuse_file_info *fi);
+extern void studiofs_macfuse_setattr(fuse_req_t req,
+                                     fuse_ino_t ino,
+                                     struct stat *attr,
+                                     int to_set,
+                                     struct fuse_file_info *fi);
 extern void studiofs_macfuse_release(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi);
 extern void studiofs_macfuse_readdir(fuse_req_t req,
                                      fuse_ino_t ino,
@@ -32,12 +48,31 @@ static const struct fuse_lowlevel_ops STUDIOFS_READ_ONLY_LOW_LEVEL_OPS = {
     .statfs = studiofs_macfuse_statfs,
 };
 
+static const struct fuse_lowlevel_ops STUDIOFS_LOW_LEVEL_OPS = {
+    .lookup = studiofs_macfuse_lookup,
+    .getattr = studiofs_macfuse_getattr,
+    .setattr = studiofs_macfuse_setattr,
+    .open = studiofs_macfuse_open,
+    .read = studiofs_macfuse_read,
+    .write = studiofs_macfuse_write,
+    .flush = studiofs_macfuse_flush,
+    .fsync = studiofs_macfuse_fsync,
+    .release = studiofs_macfuse_release,
+    .readdir = studiofs_macfuse_readdir,
+    .readlink = studiofs_macfuse_readlink,
+    .statfs = studiofs_macfuse_statfs,
+};
+
 const struct fuse_lowlevel_ops *studiofs_macfuse_empty_low_level_ops(void) {
     return &STUDIOFS_EMPTY_LOW_LEVEL_OPS;
 }
 
 const struct fuse_lowlevel_ops *studiofs_macfuse_read_only_low_level_ops(void) {
     return &STUDIOFS_READ_ONLY_LOW_LEVEL_OPS;
+}
+
+const struct fuse_lowlevel_ops *studiofs_macfuse_low_level_ops(void) {
+    return &STUDIOFS_LOW_LEVEL_OPS;
 }
 
 size_t studiofs_macfuse_low_level_ops_size(void) {
@@ -62,4 +97,8 @@ int studiofs_macfuse_file_info_direct_io(const struct fuse_file_info *info) {
 
 int studiofs_macfuse_file_info_keep_cache(const struct fuse_file_info *info) {
     return info->keep_cache != 0;
+}
+
+int studiofs_macfuse_setattr_to_set_has_size(int to_set) {
+    return (to_set & FUSE_SET_ATTR_SIZE) != 0;
 }
