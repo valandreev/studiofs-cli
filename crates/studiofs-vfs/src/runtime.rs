@@ -388,6 +388,9 @@ impl<M: ?Sized + MetaXattr> MetaXattr for RuntimeMetaHandle<M> {
         fn get_xattr(&self, ino: Ino, name: &[u8]) -> MetaResult<Option<Vec<u8>>>
     );
     forward_method!(
+        fn get_xattr_size(&self, ino: Ino, name: &[u8]) -> MetaResult<Option<usize>>
+    );
+    forward_method!(
         fn set_xattr(&self, ino: Ino, name: &[u8], value: &[u8], flags: u32) -> MetaResult<()>
     );
     forward_method!(fn remove_xattr(&self, ino: Ino, name: &[u8]) -> MetaResult<()>);

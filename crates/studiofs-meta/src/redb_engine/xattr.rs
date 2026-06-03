@@ -9,6 +9,14 @@ impl MetaXattr for RedbMetaEngine {
         self.merged_xattr_value(&txn, ino, name)
     }
 
+    fn get_xattr_size(&self, ino: Ino, name: &[u8]) -> MetaResult<Option<usize>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        self.merged_xattr_value_size(&txn, ino, name)
+    }
+
     fn set_xattr(&self, ino: Ino, name: &[u8], value: &[u8], flags: u32) -> MetaResult<()> {
         let current = self.get_xattr(ino, name)?;
         let txn = self

@@ -723,6 +723,9 @@ pub trait MetaXattr: Send + Sync {
     /// Get an extended attribute value.
     fn get_xattr(&self, ino: Ino, name: &[u8]) -> MetaResult<Option<Vec<u8>>>;
 
+    /// Get an extended attribute value size without returning the value bytes.
+    fn get_xattr_size(&self, ino: Ino, name: &[u8]) -> MetaResult<Option<usize>>;
+
     /// Set an extended attribute.
     /// Flags:
     /// - `XATTR_CREATE_FLAG`: fail if key exists

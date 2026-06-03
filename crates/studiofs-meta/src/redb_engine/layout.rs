@@ -413,6 +413,29 @@ pub(super) fn decode_resource_fork_value_from_storage(stored: &[u8]) -> Vec<u8> 
     }
 }
 
+pub(super) fn decoded_resource_fork_value_size_from_storage(stored: &[u8]) -> usize {
+    let header_len = 4 + 1 + 1 + 4 + 4;
+    if stored.len() < header_len {
+        return stored.len();
+    }
+    if &stored[..4] != RESOURCE_FORK_ENCODING_MAGIC {
+        return stored.len();
+    }
+    if stored[4] != RESOURCE_FORK_ENCODING_VERSION || stored[5] != RESOURCE_FORK_ENCODING_SCHEME_RLE
+    {
+        return stored.len();
+    }
+    u32::from_le_bytes([stored[6], stored[7], stored[8], stored[9]]) as usize
+}
+
+pub(super) fn decoded_xattr_value_size_from_storage(name: &[u8], stored: &[u8]) -> usize {
+    if name == RESOURCE_FORK_XATTR_NAME {
+        decoded_resource_fork_value_size_from_storage(stored)
+    } else {
+        stored.len()
+    }
+}
+
 pub(super) fn encode_xattr_value_for_storage<'a>(name: &[u8], value: &'a [u8]) -> Cow<'a, [u8]> {
     if name == RESOURCE_FORK_XATTR_NAME {
         Cow::Owned(encode_resource_fork_value_for_storage(value))

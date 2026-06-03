@@ -195,6 +195,12 @@ mod tests {
     }
 
     #[test]
+    fn studio_vfs_low_level_ops_include_native_xattr_callbacks() {
+        assert!(super::low_level::LowLevelOperations::studio_vfs().has_xattr_callbacks());
+        assert!(super::low_level::LowLevelOperations::read_only_studio_vfs().has_xattr_callbacks());
+    }
+
+    #[test]
     fn read_only_mount_uses_restricted_low_level_ops() {
         let read_only_ops = super::studio_vfs_ops_for_read_only(true);
         let writable_ops = super::studio_vfs_ops_for_read_only(false);
@@ -447,6 +453,86 @@ mod tests {
                 .open(attr.ino, libc::O_RDONLY | libc::O_TRUNC)
                 .unwrap_err(),
             libc::EROFS
+        );
+    }
+
+    #[test]
+    fn adapter_roundtrips_native_resource_fork_xattr_bytes() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-adapter-resource-fork-xattr",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"forked.txt",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let fork_name = b"com.apple.ResourceFork";
+        let fork_bytes = b"native resource fork bytes";
+
+        adapter
+            .set_xattr(attr.ino, fork_name, fork_bytes, 0)
+            .expect("set resource fork through macFUSE adapter");
+
+        assert_eq!(
+            adapter
+                .get_xattr(attr.ino, fork_name)
+                .expect("get resource fork through macFUSE adapter"),
+            Some(fork_bytes.to_vec())
+        );
+        assert_eq!(
+            adapter
+                .list_xattrs(attr.ino)
+                .expect("list xattrs through macFUSE adapter"),
+            vec![fork_name.to_vec()]
+        );
+        adapter
+            .remove_xattr(attr.ino, fork_name)
+            .expect("remove resource fork through macFUSE adapter");
+        assert_eq!(
+            adapter
+                .get_xattr(attr.ino, fork_name)
+                .expect("get removed resource fork through macFUSE adapter"),
+            None
+        );
+    }
+
+    #[test]
+    fn adapter_reports_native_resource_fork_xattr_decoded_size() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-adapter-xattr-size")
+                .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"fork-size.txt",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let fork_name = b"com.apple.ResourceFork";
+        let fork_bytes = vec![0x66; 64 * 1024];
+
+        adapter
+            .set_xattr(attr.ino, fork_name, &fork_bytes, 0)
+            .expect("set resource fork through macFUSE adapter");
+
+        assert_eq!(
+            adapter
+                .get_xattr_size(attr.ino, fork_name)
+                .expect("get resource fork size through macFUSE adapter"),
+            Some(fork_bytes.len())
         );
     }
 

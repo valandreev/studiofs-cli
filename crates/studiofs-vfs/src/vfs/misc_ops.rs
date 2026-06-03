@@ -18,6 +18,20 @@ impl StudioVfs {
         Ok(self.sync_meta().get_xattr(ino, name)?)
     }
 
+    /// Get an extended attribute value size without returning the value bytes.
+    pub fn get_xattr_size(&self, ino: Ino, name: &[u8]) -> VfsResult<Option<usize>> {
+        if let Err(err) = self.enforce_access(ino, AccessLevel::ReadOnly) {
+            if matches!(err, VfsError::Meta(MetaError::InodeNotFound(_))) {
+                return Ok(None);
+            }
+            return Err(err);
+        }
+        if self.ignored_entry_attr(ino).is_some() {
+            return Ok(None);
+        }
+        Ok(self.sync_meta().get_xattr_size(ino, name)?)
+    }
+
     /// Set an extended attribute.
     pub fn set_xattr(&self, ino: Ino, name: &[u8], value: &[u8], flags: u32) -> VfsResult<()> {
         self.enforce_access(ino, AccessLevel::ReadWrite)?;
