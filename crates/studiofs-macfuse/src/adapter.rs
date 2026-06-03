@@ -22,6 +22,15 @@ const READDIR_CACHE_TTL: Duration = Duration::from_secs(1);
 const READDIR_CACHE_PRUNE_THRESHOLD: usize = 1024;
 const READDIR_CACHE_PRUNE_INTERVAL: Duration = Duration::from_secs(1);
 
+/// macFUSE open-cache flags chosen for one file handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MacFuseOpenCachePolicy {
+    /// Whether this handle should bypass kernel page cache.
+    pub(crate) direct_io: bool,
+    /// Whether macFUSE should keep existing cached pages for this handle.
+    pub(crate) keep_cache: bool,
+}
+
 /// Operation adapter shared by macFUSE callbacks and fast tests.
 pub(crate) struct StudioVfsAdapter {
     vfs: Arc<StudioVfs>,
@@ -82,7 +91,12 @@ impl StudioVfsAdapter {
         }
         self.vfs
             .open_file(ino, open_flags, trunc)
-            .map(|fh| OpenReply::new(fh).with_keep_cache(true))
+            .map(|fh| {
+                let policy = macfuse_open_cache_policy(flags, trunc);
+                OpenReply::new(fh)
+                    .with_direct_io(policy.direct_io)
+                    .with_keep_cache(policy.keep_cache)
+            })
             .map_err(|error| vfs_err_to_errno(&error))
     }
 
@@ -570,6 +584,14 @@ fn posix_open_requests_write(flags: i32, trunc: bool) -> bool {
         || access_mode == libc::O_WRONLY
         || access_mode == libc::O_RDWR
         || flags & libc::O_APPEND != 0
+}
+
+pub(crate) fn macfuse_open_cache_policy(flags: i32, trunc: bool) -> MacFuseOpenCachePolicy {
+    let write_capable = posix_open_requests_write(flags, trunc);
+    MacFuseOpenCachePolicy {
+        direct_io: false,
+        keep_cache: !write_capable,
+    }
 }
 
 fn current_uid() -> u32 {
