@@ -104,10 +104,13 @@ pub struct ProbeReadPassReport {
     /// Bytes returned through FUSE read callbacks.
     pub callback_bytes: u64,
     /// Number of VFS read operations served while handling this pass.
+    #[serde(default)]
     pub vfs_read_count: u64,
     /// Number of remote S3 GET operations served while handling this pass.
+    #[serde(default)]
     pub s3_get_count: u64,
     /// Local payload bytes read while handling this pass.
+    #[serde(default)]
     pub local_payload_read_bytes: u64,
     /// Distribution of read callback response sizes.
     pub callback_size_distribution: BTreeMap<u64, u64>,
@@ -139,10 +142,13 @@ pub struct ProbeModeReport {
     /// Total callback bytes across all passes.
     pub total_callback_bytes: u64,
     /// Total VFS read operations across all passes.
+    #[serde(default)]
     pub total_vfs_read_count: u64,
     /// Total remote S3 GET operations across all passes.
+    #[serde(default)]
     pub total_s3_get_count: u64,
     /// Total local payload bytes read across all passes.
+    #[serde(default)]
     pub total_local_payload_read_bytes: u64,
     /// Combined read callback response-size distribution.
     pub callback_size_distribution: BTreeMap<u64, u64>,
@@ -358,6 +364,38 @@ mod tests {
         assert_eq!(report.total_vfs_read_count, 3);
         assert_eq!(report.total_s3_get_count, 0);
         assert_eq!(report.total_local_payload_read_bytes, 3 * 1024 * 1024);
+    }
+
+    #[test]
+    fn probe_mode_report_deserializes_legacy_json_without_new_io_counters() {
+        let report: ProbeModeReport = serde_json::from_str(
+            r#"{
+                "mode": "memory",
+                "read_passes": [{
+                    "pass": 1,
+                    "bytes_read": 3145728,
+                    "elapsed_ns": 100000000,
+                    "throughput_mib_s": 30.0,
+                    "callback_count": 3,
+                    "callback_bytes": 3145728,
+                    "callback_size_distribution": {"1048576": 3},
+                    "reentered_userspace": true
+                }],
+                "total_callback_count": 3,
+                "total_callback_bytes": 3145728,
+                "callback_size_distribution": {"1048576": 3},
+                "notify_store_supported": false,
+                "kernel_cache_interpretation": "reentered-userspace"
+            }"#,
+        )
+        .expect("deserialize legacy probe mode report");
+
+        assert_eq!(report.total_vfs_read_count, 0);
+        assert_eq!(report.total_s3_get_count, 0);
+        assert_eq!(report.total_local_payload_read_bytes, 0);
+        assert_eq!(report.read_passes[0].vfs_read_count, 0);
+        assert_eq!(report.read_passes[0].s3_get_count, 0);
+        assert_eq!(report.read_passes[0].local_payload_read_bytes, 0);
     }
 
     #[test]
