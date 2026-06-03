@@ -48,6 +48,9 @@ static const struct fuse_lowlevel_ops STUDIOFS_READ_ONLY_LOW_LEVEL_OPS = {
     .statfs = studiofs_macfuse_statfs,
 };
 
+// SFS-482 intentionally enables existing-file writeback only. Namespace
+// mutation callbacks (create, mkdir, unlink, rmdir, rename) remain out of this
+// table until the follow-up bridge phase wires those semantics explicitly.
 static const struct fuse_lowlevel_ops STUDIOFS_LOW_LEVEL_OPS = {
     .lookup = studiofs_macfuse_lookup,
     .getattr = studiofs_macfuse_getattr,
@@ -99,8 +102,8 @@ int studiofs_macfuse_file_info_keep_cache(const struct fuse_file_info *info) {
     return info->keep_cache != 0;
 }
 
-int studiofs_macfuse_setattr_to_set_is_size_only(int to_set) {
-    return to_set == FUSE_SET_ATTR_SIZE;
+int studiofs_macfuse_setattr_to_set_has_size(int to_set) {
+    return (to_set & FUSE_SET_ATTR_SIZE) != 0;
 }
 
 int studiofs_macfuse_setattr_size_mask(void) {

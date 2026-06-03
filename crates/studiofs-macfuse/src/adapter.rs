@@ -808,7 +808,7 @@ pub extern "C" fn studiofs_macfuse_setattr(
         reply_error(req, libc::EINVAL);
         return;
     }
-    if !setattr_mask_is_size_only(to_set) {
+    if !setattr_mask_has_size(to_set) {
         reply_error(req, libc::ENOTSUP);
         return;
     }
@@ -849,10 +849,10 @@ fn callback_write_buffer<'a>(buf: *const c_char, size: size_t) -> Result<&'a [u8
     Ok(unsafe { std::slice::from_raw_parts(buf.cast::<u8>(), size) })
 }
 
-fn setattr_mask_is_size_only(to_set: libc::c_int) -> bool {
-    // SAFETY: The C shim uses the same macFUSE headers and compares the callback
-    // mask against the header-defined `FUSE_SET_ATTR_SIZE` bit.
-    unsafe { crate::low_level::studiofs_macfuse_setattr_to_set_is_size_only(to_set) != 0 }
+fn setattr_mask_has_size(to_set: libc::c_int) -> bool {
+    // SAFETY: The C shim uses the same macFUSE headers and checks the callback
+    // mask for the header-defined `FUSE_SET_ATTR_SIZE` bit.
+    unsafe { crate::low_level::studiofs_macfuse_setattr_to_set_has_size(to_set) != 0 }
 }
 
 /// macFUSE release callback for the StudioVfs bridge.
@@ -962,12 +962,12 @@ mod tests {
     }
 
     #[test]
-    fn setattr_mask_accepts_only_pure_size_change() {
+    fn setattr_mask_accepts_size_bit_with_extra_timestamp_flags() {
         // SAFETY: The C shim returns the platform header value for this build.
         let size_mask = unsafe { crate::low_level::studiofs_macfuse_setattr_size_mask() };
 
-        assert!(setattr_mask_is_size_only(size_mask));
-        assert!(!setattr_mask_is_size_only(0));
-        assert!(!setattr_mask_is_size_only(size_mask | (size_mask << 1)));
+        assert!(setattr_mask_has_size(size_mask));
+        assert!(setattr_mask_has_size(size_mask | (size_mask << 1)));
+        assert!(!setattr_mask_has_size(0));
     }
 }
