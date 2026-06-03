@@ -23,7 +23,7 @@ const READDIR_CACHE_PRUNE_THRESHOLD: usize = 1024;
 const READDIR_CACHE_PRUNE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Operation adapter shared by macFUSE callbacks and fast tests.
-pub(crate) struct ReadOnlyStudioVfsAdapter {
+pub(crate) struct StudioVfsAdapter {
     vfs: Arc<StudioVfs>,
     runtime_handle: Handle,
     read_only: bool,
@@ -34,7 +34,7 @@ pub(crate) struct ReadOnlyStudioVfsAdapter {
     readdir_cache_ready: Condvar,
 }
 
-impl ReadOnlyStudioVfsAdapter {
+impl StudioVfsAdapter {
     /// Create a macFUSE adapter over a StudioVfs instance.
     #[cfg(test)]
     pub(crate) fn new(vfs: Arc<StudioVfs>, runtime_handle: Handle) -> Self {
@@ -427,13 +427,13 @@ enum ReaddirCacheEntry {
 }
 
 pub(crate) struct CallbackState {
-    adapter: ReadOnlyStudioVfsAdapter,
+    adapter: StudioVfsAdapter,
 }
 
 impl CallbackState {
     pub(crate) fn new(vfs: Arc<StudioVfs>, runtime_handle: Handle, read_only: bool) -> Self {
         Self {
-            adapter: ReadOnlyStudioVfsAdapter::new_with_read_only(vfs, runtime_handle, read_only),
+            adapter: StudioVfsAdapter::new_with_read_only(vfs, runtime_handle, read_only),
         }
     }
 }
@@ -727,13 +727,17 @@ pub extern "C" fn studiofs_macfuse_write(
         reply_error(req, libc::EIO);
         return;
     };
-    if fi.is_null() || (buf.is_null() && size != 0) {
+    if fi.is_null() {
         reply_error(req, libc::EINVAL);
         return;
     }
-    // SAFETY: macFUSE passes a valid buffer of `size` bytes for write. A null
-    // buffer is accepted only for an empty write above.
-    let data = unsafe { std::slice::from_raw_parts(buf.cast::<u8>(), size) };
+    let data = match callback_write_buffer(buf, size) {
+        Ok(data) => data,
+        Err(errno) => {
+            reply_error(req, errno);
+            return;
+        }
+    };
     // SAFETY: macFUSE passes a valid `fuse_file_info` pointer for write.
     let file_handle = unsafe { (*fi).fh };
     match state.adapter.write(ino, file_handle, off, data) {
@@ -804,11 +808,7 @@ pub extern "C" fn studiofs_macfuse_setattr(
         reply_error(req, libc::EINVAL);
         return;
     }
-    // SAFETY: The C shim uses the same macFUSE headers and checks the
-    // header-defined `FUSE_SET_ATTR_SIZE` bit for this callback mask.
-    let has_size =
-        unsafe { crate::low_level::studiofs_macfuse_setattr_to_set_has_size(to_set) != 0 };
-    if !has_size {
+    if !setattr_mask_is_size_only(to_set) {
         reply_error(req, libc::ENOTSUP);
         return;
     }
@@ -836,6 +836,23 @@ pub extern "C" fn studiofs_macfuse_setattr(
         }
         Err(errno) => reply_error(req, errno),
     }
+}
+
+fn callback_write_buffer<'a>(buf: *const c_char, size: size_t) -> Result<&'a [u8], i32> {
+    if size == 0 {
+        return Ok(&[]);
+    }
+    if buf.is_null() {
+        return Err(libc::EINVAL);
+    }
+    // SAFETY: macFUSE passes a valid buffer of `size` bytes for non-empty writes.
+    Ok(unsafe { std::slice::from_raw_parts(buf.cast::<u8>(), size) })
+}
+
+fn setattr_mask_is_size_only(to_set: libc::c_int) -> bool {
+    // SAFETY: The C shim uses the same macFUSE headers and compares the callback
+    // mask against the header-defined `FUSE_SET_ATTR_SIZE` bit.
+    unsafe { crate::low_level::studiofs_macfuse_setattr_to_set_is_size_only(to_set) != 0 }
 }
 
 /// macFUSE release callback for the StudioVfs bridge.
@@ -921,5 +938,36 @@ pub extern "C" fn studiofs_macfuse_statfs(req: *mut raw::FuseReq, _ino: raw::Fus
             }
         }
         Err(errno) => reply_error(req, errno),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn callback_write_buffer_accepts_null_only_for_empty_write() {
+        let empty = callback_write_buffer(std::ptr::null(), 0).expect("empty null write is valid");
+        assert!(empty.is_empty());
+
+        assert_eq!(
+            callback_write_buffer(std::ptr::null(), 1).unwrap_err(),
+            libc::EINVAL
+        );
+
+        let bytes = b"abc";
+        let data = callback_write_buffer(bytes.as_ptr().cast::<c_char>(), bytes.len())
+            .expect("non-empty write buffer");
+        assert_eq!(data, bytes);
+    }
+
+    #[test]
+    fn setattr_mask_accepts_only_pure_size_change() {
+        // SAFETY: The C shim returns the platform header value for this build.
+        let size_mask = unsafe { crate::low_level::studiofs_macfuse_setattr_size_mask() };
+
+        assert!(setattr_mask_is_size_only(size_mask));
+        assert!(!setattr_mask_is_size_only(0));
+        assert!(!setattr_mask_is_size_only(size_mask | (size_mask << 1)));
     }
 }

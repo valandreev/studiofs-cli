@@ -257,10 +257,8 @@ mod tests {
             .expect("seed payload");
         vfs.reset_diagnostics_observability();
 
-        let adapter = super::adapter::ReadOnlyStudioVfsAdapter::new(
-            vfs.clone(),
-            fixture.runtime().handle().clone(),
-        );
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
         let opened = adapter
             .open(attr.ino, libc::O_RDONLY)
             .expect("open read-only");
@@ -298,10 +296,8 @@ mod tests {
             .runtime()
             .block_on(vfs.write(attr.ino, 0, b"short"))
             .expect("seed payload");
-        let adapter = super::adapter::ReadOnlyStudioVfsAdapter::new(
-            vfs.clone(),
-            fixture.runtime().handle().clone(),
-        );
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
         let opened = adapter
             .open(attr.ino, libc::O_RDONLY)
             .expect("open read-only");
@@ -329,10 +325,8 @@ mod tests {
                 0o644,
             )
             .expect("create file");
-        let adapter = super::adapter::ReadOnlyStudioVfsAdapter::new(
-            vfs.clone(),
-            fixture.runtime().handle().clone(),
-        );
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
 
         let writer = adapter
             .open(attr.ino, libc::O_WRONLY)
@@ -367,10 +361,8 @@ mod tests {
                 0o644,
             )
             .expect("create file");
-        let adapter = super::adapter::ReadOnlyStudioVfsAdapter::new(
-            vfs.clone(),
-            fixture.runtime().handle().clone(),
-        );
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
         let writer = adapter
             .open(attr.ino, libc::O_RDWR)
             .expect("open writable handle through macFUSE adapter");
@@ -417,7 +409,7 @@ mod tests {
                 0o644,
             )
             .expect("create file");
-        let adapter = super::adapter::ReadOnlyStudioVfsAdapter::new_with_read_only(
+        let adapter = super::adapter::StudioVfsAdapter::new_with_read_only(
             vfs,
             fixture.runtime().handle().clone(),
             true,
@@ -446,10 +438,8 @@ mod tests {
             .expect("create first file");
         vfs.create(root, b"beta.txt", 501, 20, 0o644)
             .expect("create second file");
-        let adapter = super::adapter::ReadOnlyStudioVfsAdapter::new(
-            vfs.clone(),
-            fixture.runtime().handle().clone(),
-        );
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
 
         let buffer = adapter
             .readdir_for_test(root, 2, 32)
@@ -469,10 +459,8 @@ mod tests {
             .expect("create first file");
         vfs.create(root, b"beta.txt", 501, 20, 0o644)
             .expect("create second file");
-        let adapter = super::adapter::ReadOnlyStudioVfsAdapter::new(
-            vfs.clone(),
-            fixture.runtime().handle().clone(),
-        );
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
 
         adapter
             .readdir_for_test(root, 2, 32)
@@ -493,10 +481,8 @@ mod tests {
         let root = studiofs_vfs::contract_harness::CONTRACT_ROOT_INO;
         vfs.create(root, b"alpha.txt", 501, 20, 0o644)
             .expect("create first file");
-        let adapter = super::adapter::ReadOnlyStudioVfsAdapter::new(
-            vfs.clone(),
-            fixture.runtime().handle().clone(),
-        );
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
         adapter.fill_expired_readdir_cache_entries_for_test();
 
         adapter
@@ -520,10 +506,8 @@ mod tests {
         let second_dir = vfs
             .mkdir(root, b"second", 501, 20, 0o755)
             .expect("create second directory");
-        let adapter = super::adapter::ReadOnlyStudioVfsAdapter::new(
-            vfs.clone(),
-            fixture.runtime().handle().clone(),
-        );
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
         adapter.fill_fresh_readdir_cache_entries_for_test();
 
         adapter
@@ -548,10 +532,8 @@ mod tests {
         let root = studiofs_vfs::contract_harness::CONTRACT_ROOT_INO;
         vfs.create(root, b"alpha.txt", 501, 20, 0o644)
             .expect("create first file");
-        let adapter = super::adapter::ReadOnlyStudioVfsAdapter::new(
-            vfs.clone(),
-            fixture.runtime().handle().clone(),
-        );
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
         adapter
             .readdir_for_test(root, 2, 32)
             .expect("populate readdir cache");
@@ -585,7 +567,7 @@ mod tests {
             )
             .expect("create symlink");
         let adapter =
-            super::adapter::ReadOnlyStudioVfsAdapter::new(vfs, fixture.runtime().handle().clone());
+            super::adapter::StudioVfsAdapter::new(vfs, fixture.runtime().handle().clone());
 
         let target = adapter.readlink(attr.ino).expect("read symlink target");
 

@@ -193,7 +193,9 @@ unsafe extern "C" {
     );
     fn studiofs_macfuse_file_info_direct_io(info: *const raw::FuseFileInfo) -> c_int;
     fn studiofs_macfuse_file_info_keep_cache(info: *const raw::FuseFileInfo) -> c_int;
-    pub(crate) fn studiofs_macfuse_setattr_to_set_has_size(to_set: c_int) -> c_int;
+    #[cfg(test)]
+    pub(crate) fn studiofs_macfuse_setattr_size_mask() -> c_int;
+    pub(crate) fn studiofs_macfuse_setattr_to_set_is_size_only(to_set: c_int) -> c_int;
 }
 
 /// Low-level callback operation table provided by macFUSE headers.
