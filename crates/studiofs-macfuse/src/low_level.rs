@@ -203,6 +203,9 @@ unsafe extern "C" {
     pub(crate) fn studiofs_macfuse_setattr_atime_now_mask() -> c_int;
     pub(crate) fn studiofs_macfuse_setattr_mtime_now_mask() -> c_int;
     pub(crate) fn studiofs_macfuse_setattr_crtime_mask() -> c_int;
+    pub(crate) fn studiofs_macfuse_setattr_chgtime_mask() -> c_int;
+    pub(crate) fn studiofs_macfuse_setattr_bkuptime_mask() -> c_int;
+    pub(crate) fn studiofs_macfuse_setattr_flags_mask() -> c_int;
 }
 
 /// Low-level callback operation table provided by macFUSE headers.

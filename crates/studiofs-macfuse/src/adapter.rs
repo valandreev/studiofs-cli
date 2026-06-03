@@ -988,6 +988,9 @@ fn setattr_supported_mask() -> libc::c_int {
             | crate::low_level::studiofs_macfuse_setattr_atime_now_mask()
             | crate::low_level::studiofs_macfuse_setattr_mtime_now_mask()
             | crate::low_level::studiofs_macfuse_setattr_crtime_mask()
+            | crate::low_level::studiofs_macfuse_setattr_chgtime_mask()
+            | crate::low_level::studiofs_macfuse_setattr_bkuptime_mask()
+            | crate::low_level::studiofs_macfuse_setattr_flags_mask()
     }
 }
 
@@ -1116,5 +1119,19 @@ mod tests {
         assert_eq!(args.size, Some(42));
         assert_eq!(args.mode, Some(0o640));
         assert!(matches!(args.mtime, TimeSpec::Set(123_000_000_456)));
+    }
+
+    #[test]
+    fn setattr_supported_mask_accepts_macos_metadata_bits() {
+        // SAFETY: The C shim returns platform header values for this build, or
+        // zero for optional bits absent from the active FUSE headers.
+        let mask = unsafe {
+            crate::low_level::studiofs_macfuse_setattr_size_mask()
+                | crate::low_level::studiofs_macfuse_setattr_chgtime_mask()
+                | crate::low_level::studiofs_macfuse_setattr_bkuptime_mask()
+                | crate::low_level::studiofs_macfuse_setattr_flags_mask()
+        };
+
+        assert!(!setattr_mask_has_unknown(mask));
     }
 }

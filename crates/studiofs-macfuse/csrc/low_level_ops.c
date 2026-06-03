@@ -149,3 +149,29 @@ int studiofs_macfuse_setattr_crtime_mask(void) {
     return 0;
 #endif
 }
+
+int studiofs_macfuse_setattr_chgtime_mask(void) {
+#ifdef FUSE_SET_ATTR_CHGTIME
+    return FUSE_SET_ATTR_CHGTIME;
+#elif defined(FUSE_SET_ATTR_CTIME)
+    return FUSE_SET_ATTR_CTIME;
+#else
+    return 0;
+#endif
+}
+
+int studiofs_macfuse_setattr_bkuptime_mask(void) {
+#ifdef FUSE_SET_ATTR_BKUPTIME
+    return FUSE_SET_ATTR_BKUPTIME;
+#else
+    return 0;
+#endif
+}
+
+int studiofs_macfuse_setattr_flags_mask(void) {
+#ifdef FUSE_SET_ATTR_FLAGS
+    return FUSE_SET_ATTR_FLAGS;
+#else
+    return 0;
+#endif
+}
