@@ -1108,8 +1108,7 @@ fn macos_native_bridge_readiness_report_covers_sfs485_decision_gate() {
     ];
 
     let missing: Vec<_> = required_terms
-        .iter()
-        .copied()
+        .into_iter()
         .filter(|term| !contains_doc_term(&doc, &normalized_doc, term))
         .collect();
 

@@ -48,7 +48,7 @@ locally as a full-suite substitute:
 
 ```bash
 cargo test -p studiofs --test architecture_vocabulary_test macos_native_bridge_readiness_report_covers_sfs485_decision_gate -- --nocapture
-cargo test -p studiofs-macfuse
+cargo test -p studiofs-macfuse -- --nocapture
 STUDIOFS_MOUNT_BACKEND=macfuse cargo test -p studiofs-macfuse --test mount_sanity macos_native_mounted_smoke -- --ignored --exact --nocapture
 studiofs test-cache --mounted --profile mounted --output target/sfs-485/macfuse-report.json
 studiofs test-cache --mounted --profile mounted --output target/sfs-485/fuser-baseline-report.json
@@ -58,4 +58,3 @@ cargo test -p studiofs-winfsp --test mount_sanity winfsp_mount_fio_multi_job_smo
 
 The full workspace suite remains an operator choice outside the local agent
 loop for SFS-485.
-
