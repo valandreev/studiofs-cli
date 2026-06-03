@@ -586,6 +586,7 @@ fn posix_open_requests_write(flags: i32, trunc: bool) -> bool {
         || flags & libc::O_APPEND != 0
 }
 
+/// Translate POSIX/macFUSE open flags into the per-handle cache-retention policy.
 pub(crate) fn macfuse_open_cache_policy(flags: i32, trunc: bool) -> MacFuseOpenCachePolicy {
     let write_capable = posix_open_requests_write(flags, trunc);
     MacFuseOpenCachePolicy {
