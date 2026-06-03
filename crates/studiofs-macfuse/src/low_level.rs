@@ -142,6 +142,8 @@ pub(crate) mod raw {
         pub fn fuse_reply_write(req: *mut FuseReq, count: size_t) -> c_int;
         /// Reply with filesystem statistics.
         pub fn fuse_reply_statfs(req: *mut FuseReq, stat: *const statvfs) -> c_int;
+        /// Reply with the required xattr buffer size.
+        pub fn fuse_reply_xattr(req: *mut FuseReq, count: size_t) -> c_int;
         /// Return session user data associated with a request.
         pub fn fuse_req_userdata(req: *mut FuseReq) -> *mut c_void;
         /// Append or size a directory entry.
@@ -184,6 +186,14 @@ unsafe extern "C" {
     fn studiofs_macfuse_low_level_ops() -> *const raw::FuseLowLevelOps;
     fn studiofs_macfuse_read_only_low_level_ops() -> *const raw::FuseLowLevelOps;
     fn studiofs_macfuse_low_level_ops_size() -> size_t;
+    #[cfg(test)]
+    fn studiofs_macfuse_low_level_ops_has_xattr_callbacks(
+        ops: *const raw::FuseLowLevelOps,
+    ) -> c_int;
+    #[cfg(test)]
+    fn studiofs_macfuse_low_level_ops_has_read_only_xattr_callbacks(
+        ops: *const raw::FuseLowLevelOps,
+    ) -> c_int;
     fn studiofs_macfuse_file_info_init(
         info: *mut raw::FuseFileInfo,
         flags: c_int,
@@ -261,6 +271,15 @@ impl LowLevelOperations {
     /// Header-derived callback table size.
     pub fn size(self) -> size_t {
         self.size
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_xattr_callbacks(self) -> bool {
+        // SAFETY: The C shim only inspects callback pointers in a static table.
+        unsafe {
+            studiofs_macfuse_low_level_ops_has_xattr_callbacks(self.raw) != 0
+                || studiofs_macfuse_low_level_ops_has_read_only_xattr_callbacks(self.raw) != 0
+        }
     }
 }
 
@@ -696,6 +715,13 @@ impl Reply {
         // SAFETY: `stat` is initialized and borrowed for the duration of the
         // call; `self` consumes the single request reply.
         reply_result(unsafe { raw::fuse_reply_statfs(request.as_ptr(), stat) })
+    }
+
+    /// Reply with the required xattr value/list buffer size.
+    pub fn xattr_size(mut self, count: usize) -> io::Result<()> {
+        let request = self.request.take_raw();
+        // SAFETY: `self` owns a live, unreplied request and is consumed here.
+        reply_result(unsafe { raw::fuse_reply_xattr(request.as_ptr(), count) })
     }
 }
 

@@ -36,6 +36,20 @@ extern void studiofs_macfuse_readdir(fuse_req_t req,
                                      struct fuse_file_info *fi);
 extern void studiofs_macfuse_readlink(fuse_req_t req, fuse_ino_t ino);
 extern void studiofs_macfuse_statfs(fuse_req_t req, fuse_ino_t ino);
+extern void studiofs_macfuse_setxattr(fuse_req_t req,
+                                      fuse_ino_t ino,
+                                      const char *name,
+                                      const char *value,
+                                      size_t size,
+                                      int flags,
+                                      uint32_t position);
+extern void studiofs_macfuse_getxattr(fuse_req_t req,
+                                      fuse_ino_t ino,
+                                      const char *name,
+                                      size_t size,
+                                      uint32_t position);
+extern void studiofs_macfuse_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size);
+extern void studiofs_macfuse_removexattr(fuse_req_t req, fuse_ino_t ino, const char *name);
 
 static const struct fuse_lowlevel_ops STUDIOFS_READ_ONLY_LOW_LEVEL_OPS = {
     .lookup = studiofs_macfuse_lookup,
@@ -46,6 +60,8 @@ static const struct fuse_lowlevel_ops STUDIOFS_READ_ONLY_LOW_LEVEL_OPS = {
     .readdir = studiofs_macfuse_readdir,
     .readlink = studiofs_macfuse_readlink,
     .statfs = studiofs_macfuse_statfs,
+    .getxattr = studiofs_macfuse_getxattr,
+    .listxattr = studiofs_macfuse_listxattr,
 };
 
 // SFS-482 intentionally enables existing-file writeback only. Namespace
@@ -64,6 +80,10 @@ static const struct fuse_lowlevel_ops STUDIOFS_LOW_LEVEL_OPS = {
     .readdir = studiofs_macfuse_readdir,
     .readlink = studiofs_macfuse_readlink,
     .statfs = studiofs_macfuse_statfs,
+    .setxattr = studiofs_macfuse_setxattr,
+    .getxattr = studiofs_macfuse_getxattr,
+    .listxattr = studiofs_macfuse_listxattr,
+    .removexattr = studiofs_macfuse_removexattr,
 };
 
 const struct fuse_lowlevel_ops *studiofs_macfuse_empty_low_level_ops(void) {
@@ -80,6 +100,16 @@ const struct fuse_lowlevel_ops *studiofs_macfuse_low_level_ops(void) {
 
 size_t studiofs_macfuse_low_level_ops_size(void) {
     return sizeof(struct fuse_lowlevel_ops);
+}
+
+int studiofs_macfuse_low_level_ops_has_xattr_callbacks(const struct fuse_lowlevel_ops *ops) {
+    return ops != 0 && ops->getxattr != 0 && ops->listxattr != 0 &&
+           ops->setxattr != 0 && ops->removexattr != 0;
+}
+
+int studiofs_macfuse_low_level_ops_has_read_only_xattr_callbacks(const struct fuse_lowlevel_ops *ops) {
+    return ops != 0 && ops->getxattr != 0 && ops->listxattr != 0 &&
+           ops->setxattr == 0 && ops->removexattr == 0;
 }
 
 void studiofs_macfuse_file_info_init(struct fuse_file_info *info,

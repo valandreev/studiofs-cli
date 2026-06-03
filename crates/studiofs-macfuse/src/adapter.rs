@@ -270,6 +270,46 @@ impl StudioVfsAdapter {
             .map_err(|error| vfs_err_to_errno(&error))
     }
 
+    /// Get a native extended attribute value.
+    pub(crate) fn get_xattr(&self, ino: u64, name: &[u8]) -> Result<Option<Vec<u8>>, i32> {
+        self.vfs
+            .get_xattr(ino, name)
+            .map_err(|error| vfs_err_to_errno(&error))
+    }
+
+    /// Set a native extended attribute value.
+    pub(crate) fn set_xattr(
+        &self,
+        ino: u64,
+        name: &[u8],
+        value: &[u8],
+        flags: u32,
+    ) -> Result<(), i32> {
+        if self.read_only {
+            return Err(libc::EROFS);
+        }
+        self.vfs
+            .set_xattr(ino, name, value, flags)
+            .map_err(|error| vfs_err_to_errno(&error))
+    }
+
+    /// Remove a native extended attribute value.
+    pub(crate) fn remove_xattr(&self, ino: u64, name: &[u8]) -> Result<(), i32> {
+        if self.read_only {
+            return Err(libc::EROFS);
+        }
+        self.vfs
+            .remove_xattr(ino, name)
+            .map_err(|error| vfs_err_to_errno(&error))
+    }
+
+    /// List native extended attribute names.
+    pub(crate) fn list_xattrs(&self, ino: u64) -> Result<Vec<Vec<u8>>, i32> {
+        self.vfs
+            .list_xattrs(ino)
+            .map_err(|error| vfs_err_to_errno(&error))
+    }
+
     fn attr_to_stat(&self, attr: &InodeAttr) -> stat {
         bridge_attr_to_stat(&to_bridge_attr(
             attr,
@@ -1078,6 +1118,161 @@ pub extern "C" fn studiofs_macfuse_statfs(req: *mut raw::FuseReq, _ino: raw::Fus
         }
         Err(errno) => reply_error(req, errno),
     }
+}
+
+/// macFUSE setxattr callback for the StudioVfs bridge.
+#[unsafe(no_mangle)]
+pub extern "C" fn studiofs_macfuse_setxattr(
+    req: *mut raw::FuseReq,
+    ino: raw::FuseIno,
+    name: *const c_char,
+    value: *const c_char,
+    size: size_t,
+    flags: libc::c_int,
+    position: u32,
+) {
+    let Some(state) = callback_state(req) else {
+        reply_error(req, libc::EIO);
+        return;
+    };
+    let Some(name) = xattr_name_from_callback(req, name) else {
+        return;
+    };
+    let Some(value) = xattr_value_from_callback(req, value, size) else {
+        return;
+    };
+    if position != 0 {
+        reply_error(req, libc::ENOTSUP);
+        return;
+    }
+    let flags = match u32::try_from(flags) {
+        Ok(flags) => flags,
+        Err(_) => {
+            reply_error(req, libc::EINVAL);
+            return;
+        }
+    };
+    match state.adapter.set_xattr(ino, name, value, flags) {
+        Ok(()) => reply_error(req, 0),
+        Err(errno) => reply_error(req, errno),
+    }
+}
+
+/// macFUSE getxattr callback for the StudioVfs bridge.
+#[unsafe(no_mangle)]
+pub extern "C" fn studiofs_macfuse_getxattr(
+    req: *mut raw::FuseReq,
+    ino: raw::FuseIno,
+    name: *const c_char,
+    size: size_t,
+    position: u32,
+) {
+    let Some(state) = callback_state(req) else {
+        reply_error(req, libc::EIO);
+        return;
+    };
+    let Some(name) = xattr_name_from_callback(req, name) else {
+        return;
+    };
+    if position != 0 {
+        reply_error(req, libc::ENOTSUP);
+        return;
+    }
+    match state.adapter.get_xattr(ino, name) {
+        Ok(Some(value)) => reply_xattr_value(req, size, &value),
+        Ok(None) => reply_error(req, xattr_not_found_errno()),
+        Err(errno) => reply_error(req, errno),
+    }
+}
+
+/// macFUSE listxattr callback for the StudioVfs bridge.
+#[unsafe(no_mangle)]
+pub extern "C" fn studiofs_macfuse_listxattr(
+    req: *mut raw::FuseReq,
+    ino: raw::FuseIno,
+    size: size_t,
+) {
+    let Some(state) = callback_state(req) else {
+        reply_error(req, libc::EIO);
+        return;
+    };
+    match state.adapter.list_xattrs(ino) {
+        Ok(names) => reply_xattr_value(req, size, &format_xattr_name_list(&names)),
+        Err(errno) => reply_error(req, errno),
+    }
+}
+
+/// macFUSE removexattr callback for the StudioVfs bridge.
+#[unsafe(no_mangle)]
+pub extern "C" fn studiofs_macfuse_removexattr(
+    req: *mut raw::FuseReq,
+    ino: raw::FuseIno,
+    name: *const c_char,
+) {
+    let Some(state) = callback_state(req) else {
+        reply_error(req, libc::EIO);
+        return;
+    };
+    let Some(name) = xattr_name_from_callback(req, name) else {
+        return;
+    };
+    match state.adapter.remove_xattr(ino, name) {
+        Ok(()) => reply_error(req, 0),
+        Err(errno) => reply_error(req, errno),
+    }
+}
+
+fn xattr_name_from_callback<'a>(req: *mut raw::FuseReq, name: *const c_char) -> Option<&'a [u8]> {
+    if name.is_null() {
+        reply_error(req, libc::EINVAL);
+        return None;
+    }
+    // SAFETY: macFUSE passes a NUL-terminated xattr name for xattr callbacks.
+    Some(unsafe { CStr::from_ptr(name) }.to_bytes())
+}
+
+fn xattr_value_from_callback<'a>(
+    req: *mut raw::FuseReq,
+    value: *const c_char,
+    size: size_t,
+) -> Option<&'a [u8]> {
+    if size == 0 {
+        return Some(&[]);
+    }
+    if value.is_null() {
+        reply_error(req, libc::EINVAL);
+        return None;
+    }
+    // SAFETY: macFUSE passes a valid buffer of `size` bytes for non-empty
+    // setxattr callbacks, and the slice is used only within this callback.
+    Some(unsafe { std::slice::from_raw_parts(value.cast::<u8>(), size) })
+}
+
+fn reply_xattr_value(req: *mut raw::FuseReq, size: size_t, value: &[u8]) {
+    let Some(request) = owned_request(req) else {
+        return;
+    };
+    if size == 0 {
+        let _ = Reply::new(request).xattr_size(value.len());
+    } else if size < value.len() {
+        let _ = Reply::new(request).error(libc::ERANGE);
+    } else {
+        let _ = Reply::new(request).read_buffer(value);
+    }
+}
+
+fn format_xattr_name_list(names: &[Vec<u8>]) -> Vec<u8> {
+    let total_len = names.iter().map(|name| name.len() + 1).sum();
+    let mut out = Vec::with_capacity(total_len);
+    for name in names {
+        out.extend_from_slice(name);
+        out.push(0);
+    }
+    out
+}
+
+fn xattr_not_found_errno() -> i32 {
+    libc::ENOATTR
 }
 
 #[cfg(test)]
