@@ -212,7 +212,11 @@ fn invalid_endpoint(message: impl Into<String>) -> DataError {
 async fn run_crypto_blocking<T: Send + 'static>(
     operation: impl FnOnce() -> DataResult<T> + Send + 'static,
 ) -> DataResult<T> {
-    task::spawn_blocking(operation).await?
+    match task::spawn_blocking(operation).await {
+        Ok(result) => result,
+        Err(err) if err.is_panic() => std::panic::resume_unwind(err.into_panic()),
+        Err(err) => Err(DataError::from(err)),
+    }
 }
 
 fn parse_s3_endpoint(endpoint: &str) -> DataResult<ParsedEndpoint> {
@@ -873,6 +877,12 @@ mod tests {
             .unwrap();
 
         assert_ne!(crypto_thread, async_worker_thread);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "crypto worker panic")]
+    async fn crypto_blocking_helper_resumes_worker_panics() {
+        let _ = run_crypto_blocking::<()>(|| panic!("crypto worker panic")).await;
     }
 
     #[tokio::test]
