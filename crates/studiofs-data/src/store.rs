@@ -212,6 +212,10 @@ fn invalid_endpoint(message: impl Into<String>) -> DataError {
 async fn run_crypto_blocking<T: Send + 'static>(
     operation: impl FnOnce() -> DataResult<T> + Send + 'static,
 ) -> DataResult<T> {
+    // `spawn_blocking` tasks cannot be aborted once running. A timeout around
+    // this join handle would only stop waiting while leaving the crypto worker
+    // occupied, so any future cap on CPU pressure should be a bounded admission
+    // policy rather than a per-task timeout.
     match task::spawn_blocking(operation).await {
         Ok(result) => result,
         Err(err) if err.is_panic() => std::panic::resume_unwind(err.into_panic()),
@@ -526,12 +530,18 @@ impl DataStore {
     /// timeouts and a dedicated concurrency limit so that background uploads
     /// can never starve read requests.
     pub fn clone_for_reads(&self) -> DataResult<Self> {
-        Self::with_profile_and_crypto(&self.config, IoProfile::Read, self.crypto.clone())
+        let mut store =
+            Self::with_profile_and_crypto(&self.config, IoProfile::Read, self.crypto.clone())?;
+        store.volume_uuid = self.volume_uuid.clone();
+        Ok(store)
     }
 
     /// Create a write-optimised clone with its own connection pool.
     pub fn clone_for_writes(&self) -> DataResult<Self> {
-        Self::with_profile_and_crypto(&self.config, IoProfile::Write, self.crypto.clone())
+        let mut store =
+            Self::with_profile_and_crypto(&self.config, IoProfile::Write, self.crypto.clone())?;
+        store.volume_uuid = self.volume_uuid.clone();
+        Ok(store)
     }
 
     /// The I/O profile this store was created with.
@@ -733,6 +743,13 @@ mod tests {
         }
     }
 
+    fn assert_send<T: Send>() {}
+
+    #[test]
+    fn opendal_buffer_is_send_for_blocking_crypto_handoff() {
+        assert_send::<Buffer>();
+    }
+
     #[test]
     fn test_is_ip_endpoint_ipv4() {
         assert!(is_ip_endpoint("http://192.168.1.50:9000"));
@@ -883,6 +900,20 @@ mod tests {
     #[should_panic(expected = "crypto worker panic")]
     async fn crypto_blocking_helper_resumes_worker_panics() {
         let _ = run_crypto_blocking::<()>(|| panic!("crypto worker panic")).await;
+    }
+
+    #[test]
+    fn profile_clones_share_volume_uuid_allocation() {
+        let mut config = encrypted_test_config();
+        config.endpoint = "http://127.0.0.1:9000".to_string();
+        let raw = Operator::new(Memory::default()).unwrap().finish();
+        let store = DataStore::with_operator_for_test(&config, raw.clone()).unwrap();
+
+        let read_store = store.clone_for_reads().unwrap();
+        let write_store = store.clone_for_writes().unwrap();
+
+        assert!(Arc::ptr_eq(&store.volume_uuid, &read_store.volume_uuid));
+        assert!(Arc::ptr_eq(&store.volume_uuid, &write_store.volume_uuid));
     }
 
     #[tokio::test]
