@@ -6,7 +6,7 @@ use opendal::{Buffer, Operator, services::S3};
 use std::collections::HashSet;
 use std::fmt;
 use std::net::Ipv6Addr;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use studiofs_meta::{EncryptionConfig, FormatInfo};
 use thiserror::Error;
@@ -307,7 +307,7 @@ pub fn validate_s3_endpoint_transport(endpoint: &str) -> DataResult<()> {
 pub struct DataStore {
     op: Operator,
     volume_name: String,
-    volume_uuid: String,
+    volume_uuid: Arc<str>,
     crypto: DataStoreCryptoRuntime,
     config: DataStoreConfig,
     profile: IoProfile,
@@ -496,7 +496,7 @@ impl DataStore {
         Ok(Self {
             op,
             volume_name: config.volume_name.clone(),
-            volume_uuid: config.volume_uuid.clone(),
+            volume_uuid: Arc::from(config.volume_uuid.as_str()),
             crypto,
             config,
             profile,
@@ -509,7 +509,7 @@ impl DataStore {
         Ok(Self {
             op,
             volume_name: config.volume_name.clone(),
-            volume_uuid: config.volume_uuid.clone(),
+            volume_uuid: Arc::from(config.volume_uuid.as_str()),
             crypto: config.crypto.to_runtime()?,
             config: config.clone(),
             profile: IoProfile::Default,
