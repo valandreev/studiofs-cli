@@ -10,6 +10,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use studiofs_meta::{EncryptionConfig, FormatInfo};
 use thiserror::Error;
+use tokio::task;
 use tracing::{debug, info};
 
 /// Errors returned by the data store layer during storage operations.
@@ -34,6 +35,10 @@ pub enum DataError {
     /// Object encryption or authentication failed.
     #[error("crypto error: {0}")]
     Crypto(#[from] crypto::CryptoError),
+
+    /// Dedicated crypto worker failed before returning an encryption result.
+    #[error("crypto worker join error: {0}")]
+    CryptoWorkerJoin(#[from] task::JoinError),
 }
 
 impl DataError {
@@ -46,7 +51,10 @@ impl DataError {
                     || oe.is_temporary()
             }
             Self::Storage(_) => true,
-            Self::InvalidEndpoint(_) | Self::InvalidCryptoConfig(_) | Self::Crypto(_) => false,
+            Self::InvalidEndpoint(_)
+            | Self::InvalidCryptoConfig(_)
+            | Self::Crypto(_)
+            | Self::CryptoWorkerJoin(_) => false,
         }
     }
 }
@@ -199,6 +207,12 @@ struct ParsedEndpoint {
 
 fn invalid_endpoint(message: impl Into<String>) -> DataError {
     DataError::InvalidEndpoint(message.into())
+}
+
+async fn run_crypto_blocking<T: Send + 'static>(
+    operation: impl FnOnce() -> DataResult<T> + Send + 'static,
+) -> DataResult<T> {
+    task::spawn_blocking(operation).await?
 }
 
 fn parse_s3_endpoint(endpoint: &str) -> DataResult<ParsedEndpoint> {
@@ -561,7 +575,7 @@ impl DataStore {
     ) -> DataResult<RemoteObjectWriteStats> {
         let data: Buffer = data.into();
         let plaintext_len = data.len();
-        let encrypted = self.encrypt_payload(key, data)?;
+        let encrypted = self.encrypt_payload(key, data).await?;
         let encrypted_len = encrypted.len();
         debug!(
             key,
@@ -596,7 +610,7 @@ impl DataStore {
         debug!("downloading by key: {key}");
         let data = self.op.read(key).await?;
         let encrypted_len = data.len();
-        let plaintext = self.decrypt_payload(key, data)?;
+        let plaintext = self.decrypt_payload(key, data).await?;
         let plaintext_len = plaintext.len();
         Ok((
             plaintext,
@@ -650,33 +664,45 @@ impl DataStore {
         &self.op
     }
 
-    fn crypto_context<'a>(&'a self, key: &'a str) -> ObjectEncryptionContext<'a> {
-        ObjectEncryptionContext {
-            volume_uuid: &self.volume_uuid,
-            storage_key: key,
-            key_id: self.crypto.key_id,
-        }
-    }
-
-    fn encrypt_payload(&self, key: &str, plaintext: Buffer) -> DataResult<Buffer> {
+    async fn encrypt_payload(&self, key: &str, plaintext: Buffer) -> DataResult<Buffer> {
         // SFS-351 wires the complete-object crypto boundary; chunked encryption
         // belongs to the follow-up serializer path once the crypto API supports it.
-        let plaintext = plaintext.to_bytes();
-        crypto::encrypt_object(
-            plaintext.as_ref(),
-            &self.crypto.master_key,
-            self.crypto_context(key),
-        )
-        .map_err(DataError::from)
+        let key = key.to_string();
+        let volume_uuid = self.volume_uuid.clone();
+        let crypto = self.crypto.clone();
+        run_crypto_blocking(move || {
+            let plaintext = plaintext.to_bytes();
+            crypto::encrypt_object(
+                plaintext.as_ref(),
+                &crypto.master_key,
+                ObjectEncryptionContext {
+                    volume_uuid: &volume_uuid,
+                    storage_key: &key,
+                    key_id: crypto.key_id,
+                },
+            )
+            .map_err(DataError::from)
+        })
+        .await
     }
 
-    fn decrypt_payload(&self, key: &str, ciphertext: Buffer) -> DataResult<Buffer> {
-        let plaintext = crypto::decrypt_object(
-            ciphertext.to_bytes(),
-            &self.crypto.master_key,
-            self.crypto_context(key),
-        )?;
-        Ok(Buffer::from(plaintext))
+    async fn decrypt_payload(&self, key: &str, ciphertext: Buffer) -> DataResult<Buffer> {
+        let key = key.to_string();
+        let volume_uuid = self.volume_uuid.clone();
+        let crypto = self.crypto.clone();
+        run_crypto_blocking(move || {
+            let plaintext = crypto::decrypt_object(
+                ciphertext.to_bytes(),
+                &crypto.master_key,
+                ObjectEncryptionContext {
+                    volume_uuid: &volume_uuid,
+                    storage_key: &key,
+                    key_id: crypto.key_id,
+                },
+            )?;
+            Ok(Buffer::from(plaintext))
+        })
+        .await
     }
 }
 
@@ -687,6 +713,7 @@ mod tests {
     use crate::object::{MAGIC as STFS_MAGIC, create_object_buffer, read_object};
     use bytes::Bytes;
     use opendal::services::Memory;
+    use std::thread;
     use studiofs_meta::EncryptionConfig;
 
     fn encrypted_test_config() -> DataStoreConfig {
@@ -837,6 +864,17 @@ mod tests {
         ));
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn crypto_blocking_helper_runs_work_off_async_worker_thread() {
+        let async_worker_thread = thread::current().id();
+
+        let crypto_thread = run_crypto_blocking(|| Ok(thread::current().id()))
+            .await
+            .unwrap();
+
+        assert_ne!(crypto_thread, async_worker_thread);
+    }
+
     #[tokio::test]
     async fn key_and_object_paths_store_sfec_remotely_and_return_stfs_plaintext() {
         let raw = Operator::new(Memory::default()).unwrap().finish();
@@ -881,5 +919,31 @@ mod tests {
             read_object(downloaded_object_bytes).unwrap(),
             Bytes::from_static(b"object path secret")
         );
+    }
+
+    #[tokio::test]
+    async fn key_path_stats_preserve_plaintext_and_encrypted_byte_counts() {
+        let raw = Operator::new(Memory::default()).unwrap().finish();
+        let store =
+            DataStore::with_operator_for_test(&encrypted_test_config(), raw.clone()).unwrap();
+        let key = "unit-volume/objects/aa/bb/stats-object";
+        let plaintext = create_object_buffer(Bytes::from_static(b"stats secret"))
+            .unwrap()
+            .to_bytes();
+
+        let write_stats = store
+            .put_by_key_with_stats(key, plaintext.clone())
+            .await
+            .unwrap();
+
+        let remote_bytes = raw.read(key).await.unwrap().to_bytes();
+        assert_eq!(write_stats.plaintext_bytes, plaintext.len() as u64);
+        assert_eq!(write_stats.encrypted_bytes, remote_bytes.len() as u64);
+
+        let (downloaded, read_stats) = store.get_by_key_with_stats(key).await.unwrap();
+
+        assert_eq!(downloaded.to_bytes(), plaintext);
+        assert_eq!(read_stats.encrypted_bytes, remote_bytes.len() as u64);
+        assert_eq!(read_stats.plaintext_bytes, write_stats.plaintext_bytes);
     }
 }
