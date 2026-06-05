@@ -1376,10 +1376,6 @@ struct UploadState {
     upload_fallback_wait_max_ns: AtomicU64,
     upload_fallback_read_ns: AtomicU64,
     upload_fallback_read_max_ns: AtomicU64,
-    foreground_local_payload_reads: AtomicU64,
-    foreground_local_payload_read_bytes: AtomicU64,
-    foreground_local_payload_read_io_ns: AtomicU64,
-    foreground_local_payload_read_io_max_ns: AtomicU64,
     /// Dynamic slot cost adjusted from foreground-read pressure on the Local-First path.
     upload_cache_io_foreground_cost: AtomicU32,
 }
@@ -1601,10 +1597,6 @@ impl UploadState {
             upload_fallback_wait_max_ns: AtomicU64::new(0),
             upload_fallback_read_ns: AtomicU64::new(0),
             upload_fallback_read_max_ns: AtomicU64::new(0),
-            foreground_local_payload_reads: AtomicU64::new(0),
-            foreground_local_payload_read_bytes: AtomicU64::new(0),
-            foreground_local_payload_read_io_ns: AtomicU64::new(0),
-            foreground_local_payload_read_io_max_ns: AtomicU64::new(0),
             upload_cache_io_foreground_cost: AtomicU32::new(upload_cache_io_foreground_cost),
         }
     }
@@ -1700,6 +1692,10 @@ struct ReadState {
     published_read_plan_cache: Mutex<HashMap<Ino, PublishedReadPlanCacheEntry>>,
     active_access_classes: [AtomicU64; AccessClass::COUNT],
     access_class_transitions: [AtomicU64; AccessClass::COUNT],
+    foreground_local_payload_reads: AtomicU64,
+    foreground_local_payload_read_bytes: AtomicU64,
+    foreground_local_payload_read_io_ns: AtomicU64,
+    foreground_local_payload_read_io_max_ns: AtomicU64,
 }
 
 impl ReadState {
@@ -1720,6 +1716,10 @@ impl ReadState {
             published_read_plan_cache: Mutex::new(HashMap::new()),
             active_access_classes: std::array::from_fn(|_| AtomicU64::new(0)),
             access_class_transitions: std::array::from_fn(|_| AtomicU64::new(0)),
+            foreground_local_payload_reads: AtomicU64::new(0),
+            foreground_local_payload_read_bytes: AtomicU64::new(0),
+            foreground_local_payload_read_io_ns: AtomicU64::new(0),
+            foreground_local_payload_read_io_max_ns: AtomicU64::new(0),
         }
     }
 
@@ -5537,22 +5537,22 @@ impl StudioVfs {
                 .load(Ordering::Relaxed),
             foreground_local_payload_reads: self
                 .state
-                .upload
+                .read
                 .foreground_local_payload_reads
                 .load(Ordering::Relaxed),
             foreground_local_payload_read_bytes: self
                 .state
-                .upload
+                .read
                 .foreground_local_payload_read_bytes
                 .load(Ordering::Relaxed),
             foreground_local_payload_read_io_ns: self
                 .state
-                .upload
+                .read
                 .foreground_local_payload_read_io_ns
                 .load(Ordering::Relaxed),
             foreground_local_payload_read_io_max_ns: self
                 .state
-                .upload
+                .read
                 .foreground_local_payload_read_io_max_ns
                 .load(Ordering::Relaxed),
             upload_cache_io_foreground_cost: self
@@ -6379,27 +6379,28 @@ impl StudioVfs {
             .observe_ns(timing.backend_io_ns);
     }
 
+    #[inline]
     fn record_foreground_local_payload_read(&self, bytes: u64, backend_io_ns: u64) {
         self.state
-            .upload
+            .read
             .foreground_local_payload_reads
             .fetch_add(1, Ordering::Relaxed);
         self.state
-            .upload
+            .read
             .foreground_local_payload_read_bytes
             .fetch_add(bytes, Ordering::Relaxed);
         self.state
-            .upload
+            .read
             .foreground_local_payload_read_io_ns
             .fetch_add(backend_io_ns, Ordering::Relaxed);
         let current_max = self
             .state
-            .upload
+            .read
             .foreground_local_payload_read_io_max_ns
             .load(Ordering::Relaxed);
         if backend_io_ns > current_max {
             self.state
-                .upload
+                .read
                 .foreground_local_payload_read_io_max_ns
                 .fetch_max(backend_io_ns, Ordering::Relaxed);
         }

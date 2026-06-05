@@ -11991,6 +11991,8 @@ fn foreground_read_baseline_during_and_post_upload_are_comparable() {
     const PHASE_RESET_DELAY: Duration = Duration::from_millis(1700);
     const MIN_DURING_UPLOAD_THROUGHPUT_MIB_S: f64 = 4.0;
     const MIN_DURING_UPLOAD_BASELINE_RATIO: f64 = 0.25;
+    const MIN_POST_UPLOAD_THROUGHPUT_MIB_S: f64 = 4.0;
+    const MIN_POST_UPLOAD_BASELINE_RATIO: f64 = 0.80;
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -12154,8 +12156,11 @@ fn foreground_read_baseline_during_and_post_upload_are_comparable() {
             during_stats.upload_fallback_read_ns / 1_000_000,
         );
         assert!(
-            post_throughput_mib_s >= 4.0 || post_throughput_mib_s >= baseline_throughput_mib_s * 0.8,
-            "post-upload throughput too low: need >= 4.0 MiB/s or recovery to >= 80% of baseline; baseline={baseline_throughput_mib_s:.2} MiB/s, during={during_throughput_mib_s:.2} MiB/s, post={post_throughput_mib_s:.2} MiB/s"
+            post_throughput_mib_s >= MIN_POST_UPLOAD_THROUGHPUT_MIB_S
+                || post_throughput_mib_s
+                    >= baseline_throughput_mib_s * MIN_POST_UPLOAD_BASELINE_RATIO,
+            "post-upload throughput too low: need >= {MIN_POST_UPLOAD_THROUGHPUT_MIB_S:.2} MiB/s or recovery to >= {:.0}% of baseline; baseline={baseline_throughput_mib_s:.2} MiB/s, during={during_throughput_mib_s:.2} MiB/s, post={post_throughput_mib_s:.2} MiB/s",
+            MIN_POST_UPLOAD_BASELINE_RATIO * 100.0
         );
     });
     rt.shutdown_background();
