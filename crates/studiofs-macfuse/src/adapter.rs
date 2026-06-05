@@ -158,6 +158,17 @@ impl StudioVfsAdapter {
             .map_err(|error| vfs_err_to_errno(&error))
     }
 
+    /// Remove an empty directory entry.
+    pub(crate) fn rmdir(&self, parent: u64, name: &[u8]) -> Result<(), i32> {
+        if self.read_only {
+            return Err(libc::EROFS);
+        }
+        self.vfs
+            .rmdir(parent, name)
+            .inspect(|_| self.invalidate_readdir_cache(parent))
+            .map_err(|error| vfs_err_to_errno(&error))
+    }
+
     /// Rename a namespace entry.
     pub(crate) fn rename(
         &self,
@@ -943,6 +954,29 @@ pub extern "C" fn studiofs_macfuse_unlink(
     // SAFETY: macFUSE passes a NUL-terminated entry name for unlink callbacks.
     let name = unsafe { CStr::from_ptr(name) }.to_bytes();
     match state.adapter.unlink(parent, name) {
+        Ok(()) => reply_error(req, 0),
+        Err(errno) => reply_error(req, errno),
+    }
+}
+
+/// macFUSE rmdir callback for the StudioVfs bridge.
+#[unsafe(no_mangle)]
+pub extern "C" fn studiofs_macfuse_rmdir(
+    req: *mut raw::FuseReq,
+    parent: raw::FuseIno,
+    name: *const c_char,
+) {
+    let Some(state) = callback_state(req) else {
+        reply_error(req, libc::EIO);
+        return;
+    };
+    if name.is_null() {
+        reply_error(req, libc::EINVAL);
+        return;
+    }
+    // SAFETY: macFUSE passes a NUL-terminated entry name for rmdir callbacks.
+    let name = unsafe { CStr::from_ptr(name) }.to_bytes();
+    match state.adapter.rmdir(parent, name) {
         Ok(()) => reply_error(req, 0),
         Err(errno) => reply_error(req, errno),
     }

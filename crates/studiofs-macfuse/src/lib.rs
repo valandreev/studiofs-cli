@@ -420,6 +420,12 @@ mod tests {
     }
 
     #[test]
+    fn writable_studio_vfs_low_level_ops_install_rmdir_callback() {
+        assert!(super::low_level::LowLevelOperations::studio_vfs().has_rmdir_callback());
+        assert!(!super::low_level::LowLevelOperations::read_only_studio_vfs().has_rmdir_callback());
+    }
+
+    #[test]
     fn read_only_mount_uses_restricted_low_level_ops() {
         let read_only_ops = super::studio_vfs_ops_for_read_only(true);
         let writable_ops = super::studio_vfs_ops_for_read_only(false);
@@ -690,6 +696,52 @@ mod tests {
         adapter
             .fsync(Some(writer.file_handle()), attr.ino, false)
             .expect("handle-backed fsync should not depend on removed namespace entry");
+    }
+
+    #[test]
+    fn adapter_rmdir_removes_empty_directory_and_respects_read_only() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-adapter-rmdir")
+                .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let read_only_adapter = super::adapter::StudioVfsAdapter::new_with_read_only(
+            vfs.clone(),
+            fixture.runtime().handle().clone(),
+            true,
+        );
+
+        adapter
+            .mkdir(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"empty-dir",
+                0o755,
+            )
+            .expect("create directory through macFUSE adapter");
+        assert_eq!(
+            read_only_adapter
+                .rmdir(
+                    studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                    b"empty-dir",
+                )
+                .unwrap_err(),
+            libc::EROFS
+        );
+        adapter
+            .rmdir(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"empty-dir",
+            )
+            .expect("remove empty directory through macFUSE adapter");
+
+        assert!(
+            vfs.lookup(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"empty-dir",
+            )
+            .is_err()
+        );
     }
 
     #[test]

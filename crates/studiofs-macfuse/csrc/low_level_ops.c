@@ -17,6 +17,7 @@ extern void studiofs_macfuse_create(fuse_req_t req,
                                     mode_t mode,
                                     struct fuse_file_info *fi);
 extern void studiofs_macfuse_unlink(fuse_req_t req, fuse_ino_t parent, const char *name);
+extern void studiofs_macfuse_rmdir(fuse_req_t req, fuse_ino_t parent, const char *name);
 extern void studiofs_macfuse_rename(fuse_req_t req,
                                     fuse_ino_t parent,
                                     const char *name,
@@ -90,6 +91,7 @@ static const struct fuse_lowlevel_ops STUDIOFS_LOW_LEVEL_OPS = {
     .symlink = studiofs_macfuse_symlink,
     .create = studiofs_macfuse_create,
     .unlink = studiofs_macfuse_unlink,
+    .rmdir = studiofs_macfuse_rmdir,
     .rename = studiofs_macfuse_rename,
     .setattr = studiofs_macfuse_setattr,
     .open = studiofs_macfuse_open,
@@ -135,6 +137,10 @@ int studiofs_macfuse_low_level_ops_has_read_only_xattr_callbacks(const struct fu
 
 int studiofs_macfuse_low_level_ops_has_init_callback(const struct fuse_lowlevel_ops *ops) {
     return ops != NULL && ops->init != NULL;
+}
+
+int studiofs_macfuse_low_level_ops_has_rmdir_callback(const struct fuse_lowlevel_ops *ops) {
+    return ops != NULL && ops->rmdir != NULL;
 }
 
 void studiofs_macfuse_conn_info_configure(struct fuse_conn_info *conn,
