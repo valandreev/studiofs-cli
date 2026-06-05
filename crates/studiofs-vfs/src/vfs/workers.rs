@@ -984,6 +984,22 @@ impl StudioVfs {
                         foreground_read_protection.upload_fallback_read_ns / 1_000_000,
                     upload_fallback_read_max_ms =
                         foreground_read_protection.upload_fallback_read_max_ns / 1_000_000,
+                    foreground_local_payload_reads =
+                        foreground_read_protection.foreground_local_payload_reads,
+                    foreground_local_payload_read_bytes =
+                        foreground_read_protection.foreground_local_payload_read_bytes,
+                    foreground_local_payload_read_io_ms =
+                        foreground_read_protection.foreground_local_payload_read_io_ns / 1_000_000,
+                    foreground_local_payload_read_io_max_ms = foreground_read_protection
+                        .foreground_local_payload_read_io_max_ns
+                        / 1_000_000,
+                    upload_hot_payload_reads = foreground_read_protection.upload_hot_payload_reads,
+                    upload_hot_payload_read_bytes =
+                        foreground_read_protection.upload_hot_payload_read_bytes,
+                    upload_staged_payload_reads =
+                        foreground_read_protection.upload_staged_payload_reads,
+                    upload_staged_payload_read_bytes =
+                        foreground_read_protection.upload_staged_payload_read_bytes,
                     "upload pipeline local reread path"
                 );
                 debug!(

@@ -219,13 +219,14 @@ turn on global direct I/O and does not change the buffered read cache policy.
 
 ### macOS cache and I/O policy
 
-macOS FUSE defaults to the WinFSP/JuiceFS-style cache policy. The mount keeps
-`local`, `sparse`, and `volname`, adds `novncache`, `daemon_timeout=60`, and an
-`iosize=65536` matching JuiceFS's Darwin mount profile, and does not globally mount
-with `direct_io` or `nolocalcaches`.
+macOS FUSE defaults to the WinFSP-style cache policy. The mount keeps `local`,
+`sparse`, and `volname`, adds `novncache`, `daemon_timeout=60`, and an
+`iosize=1048576` matching StudioFS's WinFSP allocation-unit geometry, and does
+not globally mount with `direct_io` or `nolocalcaches`.
 The default macOS asyncFUSE profile also enables async write replies, applies
-the `50/40` background queue policy, keeps `max_write=131072`, and reports the
-matching `65536` preferred I/O size through regular file attributes. Set
+the `50/40` background queue policy, keeps macFUSE-safe `max_write=131072`, and
+reports the matching `1048576` preferred I/O size through regular file
+attributes. Set
 `STUDIOFS_FUSE_ASYNC_WRITE=0` to restore synchronous write callbacks without
 changing the cache policy, or set `STUDIOFS_MACOS_FUSE_CACHE_POLICY=direct` for
 the strict direct-I/O rollback profile.

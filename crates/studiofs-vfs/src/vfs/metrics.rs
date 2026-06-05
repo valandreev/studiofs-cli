@@ -1066,6 +1066,14 @@ pub struct VfsForegroundReadProtectionStats {
     pub upload_local_payload_reads: u64,
     /// Upload local payload read bytes.
     pub upload_local_payload_read_bytes: u64,
+    /// Upload reads served from the hot in-memory payload buffer.
+    pub upload_hot_payload_reads: u64,
+    /// Upload bytes served from the hot in-memory payload buffer.
+    pub upload_hot_payload_read_bytes: u64,
+    /// Upload reads served from staged payload hardlinks.
+    pub upload_staged_payload_reads: u64,
+    /// Upload bytes served from staged payload hardlinks.
+    pub upload_staged_payload_read_bytes: u64,
     /// Upload fallback deferrals count.
     pub upload_fallback_deferrals: u64,
     /// Upload fallback rereads count.
@@ -1082,6 +1090,14 @@ pub struct VfsForegroundReadProtectionStats {
     pub upload_fallback_read_ns: u64,
     /// Maximum upload fallback read time in nanoseconds.
     pub upload_fallback_read_max_ns: u64,
+    /// Foreground local payload reads count.
+    pub foreground_local_payload_reads: u64,
+    /// Foreground local payload read bytes.
+    pub foreground_local_payload_read_bytes: u64,
+    /// Foreground local payload backend I/O time in nanoseconds.
+    pub foreground_local_payload_read_io_ns: u64,
+    /// Maximum foreground local payload backend I/O time in nanoseconds.
+    pub foreground_local_payload_read_io_max_ns: u64,
     /// Foreground cache I/O cost metric.
     pub upload_cache_io_foreground_cost: u32,
     /// Scheduler penalty for upload in milliseconds.
