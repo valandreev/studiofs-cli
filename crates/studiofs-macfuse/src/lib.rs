@@ -1,5 +1,6 @@
 #![cfg(target_os = "macos")]
 #![cfg_attr(target_os = "macos", deny(missing_docs))]
+#![cfg_attr(not(target_os = "macos"), allow(missing_docs))]
 
 //! macOS native bridge boundary for StudioFS.
 //!
