@@ -1364,6 +1364,10 @@ struct UploadState {
     upload_canceled_stale_after_put_bytes: AtomicU64,
     upload_local_payload_reads: AtomicU64,
     upload_local_payload_read_bytes: AtomicU64,
+    upload_hot_payload_reads: AtomicU64,
+    upload_hot_payload_read_bytes: AtomicU64,
+    upload_staged_payload_reads: AtomicU64,
+    upload_staged_payload_read_bytes: AtomicU64,
     upload_fallback_deferrals: AtomicU64,
     upload_fallback_rereads: AtomicU64,
     upload_fallback_reread_bytes: AtomicU64,
@@ -1581,6 +1585,10 @@ impl UploadState {
             upload_canceled_stale_after_put_bytes: AtomicU64::new(0),
             upload_local_payload_reads: AtomicU64::new(0),
             upload_local_payload_read_bytes: AtomicU64::new(0),
+            upload_hot_payload_reads: AtomicU64::new(0),
+            upload_hot_payload_read_bytes: AtomicU64::new(0),
+            upload_staged_payload_reads: AtomicU64::new(0),
+            upload_staged_payload_read_bytes: AtomicU64::new(0),
             upload_fallback_deferrals: AtomicU64::new(0),
             upload_fallback_rereads: AtomicU64::new(0),
             upload_fallback_reread_bytes: AtomicU64::new(0),
@@ -1684,6 +1692,10 @@ struct ReadState {
     published_read_plan_cache: Mutex<HashMap<Ino, PublishedReadPlanCacheEntry>>,
     active_access_classes: [AtomicU64; AccessClass::COUNT],
     access_class_transitions: [AtomicU64; AccessClass::COUNT],
+    foreground_local_payload_reads: AtomicU64,
+    foreground_local_payload_read_bytes: AtomicU64,
+    foreground_local_payload_read_io_ns: AtomicU64,
+    foreground_local_payload_read_io_max_ns: AtomicU64,
 }
 
 impl ReadState {
@@ -1704,6 +1716,10 @@ impl ReadState {
             published_read_plan_cache: Mutex::new(HashMap::new()),
             active_access_classes: std::array::from_fn(|_| AtomicU64::new(0)),
             access_class_transitions: std::array::from_fn(|_| AtomicU64::new(0)),
+            foreground_local_payload_reads: AtomicU64::new(0),
+            foreground_local_payload_read_bytes: AtomicU64::new(0),
+            foreground_local_payload_read_io_ns: AtomicU64::new(0),
+            foreground_local_payload_read_io_max_ns: AtomicU64::new(0),
         }
     }
 
@@ -5006,6 +5022,7 @@ impl StudioVfs {
             let available = payload.len() - data_offset;
             let read = available.min(out.len());
             out[..read].copy_from_slice(&payload[data_offset..data_offset + read]);
+            self.record_foreground_local_payload_read(read as u64, 0);
             return Ok(Some(read));
         }
         let (result, timing) = run_local_cache_io(|| {
@@ -5020,6 +5037,7 @@ impl StudioVfs {
                     out.len()
                 )));
             }
+            self.record_foreground_local_payload_read(read as u64, timing.backend_io_ns);
             Ok(Some(read))
         } else {
             Ok(None)
@@ -5457,6 +5475,26 @@ impl StudioVfs {
                 .upload
                 .upload_local_payload_read_bytes
                 .load(Ordering::Relaxed),
+            upload_hot_payload_reads: self
+                .state
+                .upload
+                .upload_hot_payload_reads
+                .load(Ordering::Relaxed),
+            upload_hot_payload_read_bytes: self
+                .state
+                .upload
+                .upload_hot_payload_read_bytes
+                .load(Ordering::Relaxed),
+            upload_staged_payload_reads: self
+                .state
+                .upload
+                .upload_staged_payload_reads
+                .load(Ordering::Relaxed),
+            upload_staged_payload_read_bytes: self
+                .state
+                .upload
+                .upload_staged_payload_read_bytes
+                .load(Ordering::Relaxed),
             upload_fallback_deferrals: self
                 .state
                 .upload
@@ -5496,6 +5534,26 @@ impl StudioVfs {
                 .state
                 .upload
                 .upload_fallback_read_max_ns
+                .load(Ordering::Relaxed),
+            foreground_local_payload_reads: self
+                .state
+                .read
+                .foreground_local_payload_reads
+                .load(Ordering::Relaxed),
+            foreground_local_payload_read_bytes: self
+                .state
+                .read
+                .foreground_local_payload_read_bytes
+                .load(Ordering::Relaxed),
+            foreground_local_payload_read_io_ns: self
+                .state
+                .read
+                .foreground_local_payload_read_io_ns
+                .load(Ordering::Relaxed),
+            foreground_local_payload_read_io_max_ns: self
+                .state
+                .read
+                .foreground_local_payload_read_io_max_ns
                 .load(Ordering::Relaxed),
             upload_cache_io_foreground_cost: self
                 .state
@@ -6319,6 +6377,26 @@ impl StudioVfs {
             .metrics
             .local_cache_io_backend_histogram
             .observe_ns(timing.backend_io_ns);
+    }
+
+    #[inline]
+    fn record_foreground_local_payload_read(&self, bytes: u64, backend_io_ns: u64) {
+        self.state
+            .read
+            .foreground_local_payload_reads
+            .fetch_add(1, Ordering::Relaxed);
+        self.state
+            .read
+            .foreground_local_payload_read_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+        self.state
+            .read
+            .foreground_local_payload_read_io_ns
+            .fetch_add(backend_io_ns, Ordering::Relaxed);
+        self.state
+            .read
+            .foreground_local_payload_read_io_max_ns
+            .fetch_max(backend_io_ns, Ordering::Relaxed);
     }
 
     fn write_access_requested(flags: OpenFlags, trunc: bool) -> bool {

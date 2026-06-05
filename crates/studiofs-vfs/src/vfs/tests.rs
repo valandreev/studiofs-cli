@@ -5049,6 +5049,18 @@ fn cache_runtime_tuning_defaults_match_juicefs_sized_windows() {
 }
 
 #[test]
+fn upload_hot_buffer_budget_does_not_collapse_with_tiny_dirty_limit() {
+    assert_eq!(
+        bootstrap::derive_upload_hot_buffer_bytes(1, 64 * 1024 * 1024, 16 * 1024 * 1024),
+        64 * 1024 * 1024
+    );
+    assert_eq!(
+        bootstrap::derive_upload_hot_buffer_bytes(1, 0, 16 * 1024 * 1024),
+        16 * 1024 * 1024
+    );
+}
+
+#[test]
 fn fast_mode_sync_group_defaults_to_drain_chunk_window() {
     assert_eq!(
         derive_fast_mode_sync_group_min_bytes(64 * 1024 * 1024, 32 * 1024 * 1024),

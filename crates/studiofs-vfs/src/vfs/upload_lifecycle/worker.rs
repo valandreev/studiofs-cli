@@ -971,6 +971,16 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
                 .upload
                 .upload_local_payload_read_bytes
                 .fetch_add(hot_payload.len() as u64, Ordering::Relaxed);
+            self.vfs
+                .state
+                .upload
+                .upload_hot_payload_reads
+                .fetch_add(1, Ordering::Relaxed);
+            self.vfs
+                .state
+                .upload
+                .upload_hot_payload_read_bytes
+                .fetch_add(hot_payload.len() as u64, Ordering::Relaxed);
             self.vfs.debug_write_probe(
                 "H5",
                 concat!(file!(), ":", line!()),
@@ -1039,6 +1049,16 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
                 .state
                 .upload
                 .upload_local_payload_read_bytes
+                .fetch_add(staged_payload.len() as u64, Ordering::Relaxed);
+            self.vfs
+                .state
+                .upload
+                .upload_staged_payload_reads
+                .fetch_add(1, Ordering::Relaxed);
+            self.vfs
+                .state
+                .upload
+                .upload_staged_payload_read_bytes
                 .fetch_add(staged_payload.len() as u64, Ordering::Relaxed);
             self.vfs.debug_write_probe(
                 "H5",
