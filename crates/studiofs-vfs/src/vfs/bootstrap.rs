@@ -3,6 +3,17 @@ use studiofs_cache::{LocalPayloadSyncMode, LocalPayloadWriteMode};
 
 const UPLOAD_HOT_BUFFER_CAP_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
+pub(super) fn derive_upload_hot_buffer_bytes(
+    max_dirty_bytes: usize,
+    transit_memory_budget_bytes: usize,
+    block_size: u32,
+) -> usize {
+    max_dirty_bytes
+        .max(transit_memory_budget_bytes)
+        .max(block_size.max(1) as usize)
+        .min(UPLOAD_HOT_BUFFER_CAP_BYTES)
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct VfsBootstrapPlan {
     format_info: FormatInfo,
@@ -303,7 +314,11 @@ impl VfsBootstrapResources {
             );
         }
         let local_payload_backend = opened_local_backend.backend;
-        let upload_hot_bytes = plan.max_dirty_bytes.min(UPLOAD_HOT_BUFFER_CAP_BYTES);
+        let upload_hot_bytes = derive_upload_hot_buffer_bytes(
+            plan.max_dirty_bytes,
+            plan.cache_runtime_tuning.transit_memory_budget_bytes,
+            plan.block_size(),
+        );
 
         let (cached_store, upload_rx) = CachedStore::open(
             CachedStoreConfig::new(cache_dir).with_upload_hot_bytes(upload_hot_bytes),

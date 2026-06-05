@@ -11989,6 +11989,8 @@ fn foreground_read_baseline_during_and_post_upload_are_comparable() {
     const READ_PASSES: usize = 8;
     const MAX_SWEEP_DURATION: Duration = Duration::from_secs(10);
     const PHASE_RESET_DELAY: Duration = Duration::from_millis(1700);
+    const MIN_DURING_UPLOAD_THROUGHPUT_MIB_S: f64 = 200.0;
+    const MIN_DURING_UPLOAD_BASELINE_RATIO: f64 = 0.80;
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -12088,6 +12090,32 @@ fn foreground_read_baseline_during_and_post_upload_are_comparable() {
             post_stats.speedometer_samples > 0,
             "post-upload foreground protection stats must contain samples"
         );
+        eprintln!(
+            "foreground read phase throughput: baseline={baseline_throughput_mib_s:.2} MiB/s ({baseline_elapsed:?}), during={during_throughput_mib_s:.2} MiB/s ({during_elapsed:?}), post={post_throughput_mib_s:.2} MiB/s ({post_elapsed:?})"
+        );
+        eprintln!(
+            "during-upload local read metrics: foreground_reads={}, foreground_bytes={}, foreground_io_ms={}, foreground_io_max_ms={}, upload_reads={}, upload_bytes={}, upload_hot_reads={}, upload_hot_bytes={}, upload_staged_reads={}, upload_staged_bytes={}, upload_fallback_rereads={}, upload_fallback_bytes={}, upload_fallback_wait_ms={}, upload_fallback_read_ms={}, p90_ms={}, penalty_ms={}, slot_cost={}",
+            during_stats.foreground_local_payload_reads,
+            during_stats.foreground_local_payload_read_bytes,
+            during_stats.foreground_local_payload_read_io_ns / 1_000_000,
+            during_stats.foreground_local_payload_read_io_max_ns / 1_000_000,
+            during_stats.upload_local_payload_reads,
+            during_stats.upload_local_payload_read_bytes,
+            during_stats.upload_hot_payload_reads,
+            during_stats.upload_hot_payload_read_bytes,
+            during_stats.upload_staged_payload_reads,
+            during_stats.upload_staged_payload_read_bytes,
+            during_stats.upload_fallback_rereads,
+            during_stats.upload_fallback_reread_bytes,
+            during_stats.upload_fallback_wait_ns / 1_000_000,
+            during_stats.upload_fallback_read_ns / 1_000_000,
+            during_stats
+                .p90_latency_ns
+                .map(|ns| ns / 1_000_000)
+                .unwrap_or(0),
+            during_stats.upload_scheduler_penalty_ms,
+            during_stats.upload_cache_io_foreground_cost,
+        );
         assert!(
             during_elapsed <= MAX_SWEEP_DURATION,
             "during-upload sweep exceeded {MAX_SWEEP_DURATION:?}: baseline={baseline_elapsed:?}, during={during_elapsed:?}, post={post_elapsed:?}"
@@ -12096,19 +12124,32 @@ fn foreground_read_baseline_during_and_post_upload_are_comparable() {
             post_elapsed <= MAX_SWEEP_DURATION,
             "post-upload sweep exceeded {MAX_SWEEP_DURATION:?}: baseline={baseline_elapsed:?}, during={during_elapsed:?}, post={post_elapsed:?}"
         );
-        // Keep the post-upload gate tolerant: on CI and slower Windows/macOS
-        // hosts, either an absolute floor or recovery toward baseline is a
-        // sufficient pass condition.
         assert!(
-            during_throughput_mib_s >= 4.0
-                || during_throughput_mib_s >= baseline_throughput_mib_s * 0.25,
-            "foreground read degraded too far during upload: baseline={baseline_throughput_mib_s:.2} MiB/s, during={during_throughput_mib_s:.2} MiB/s, post={post_throughput_mib_s:.2} MiB/s, during_p90_ms={}, during_penalty_ms={}, during_cost={}",
+            during_throughput_mib_s >= MIN_DURING_UPLOAD_THROUGHPUT_MIB_S
+                || during_throughput_mib_s
+                    >= baseline_throughput_mib_s * MIN_DURING_UPLOAD_BASELINE_RATIO,
+            "foreground read degraded too far during upload: baseline={baseline_throughput_mib_s:.2} MiB/s, during={during_throughput_mib_s:.2} MiB/s, post={post_throughput_mib_s:.2} MiB/s, need during >= {MIN_DURING_UPLOAD_THROUGHPUT_MIB_S:.2} MiB/s or >= {:.0}% of baseline, during_p90_ms={}, during_penalty_ms={}, during_cost={}, foreground_local_reads={}, foreground_local_read_bytes={}, foreground_local_read_io_ms={}, foreground_local_read_io_max_ms={}, upload_local_reads={}, upload_local_read_bytes={}, upload_hot_reads={}, upload_hot_bytes={}, upload_staged_reads={}, upload_staged_bytes={}, upload_fallback_rereads={}, upload_fallback_reread_bytes={}, upload_fallback_wait_ms={}, upload_fallback_read_ms={}",
+            MIN_DURING_UPLOAD_BASELINE_RATIO * 100.0,
             during_stats
                 .p90_latency_ns
                 .map(|ns| ns / 1_000_000)
                 .unwrap_or(0),
             during_stats.upload_scheduler_penalty_ms,
             during_stats.upload_cache_io_foreground_cost,
+            during_stats.foreground_local_payload_reads,
+            during_stats.foreground_local_payload_read_bytes,
+            during_stats.foreground_local_payload_read_io_ns / 1_000_000,
+            during_stats.foreground_local_payload_read_io_max_ns / 1_000_000,
+            during_stats.upload_local_payload_reads,
+            during_stats.upload_local_payload_read_bytes,
+            during_stats.upload_hot_payload_reads,
+            during_stats.upload_hot_payload_read_bytes,
+            during_stats.upload_staged_payload_reads,
+            during_stats.upload_staged_payload_read_bytes,
+            during_stats.upload_fallback_rereads,
+            during_stats.upload_fallback_reread_bytes,
+            during_stats.upload_fallback_wait_ns / 1_000_000,
+            during_stats.upload_fallback_read_ns / 1_000_000,
         );
         assert!(
             post_throughput_mib_s >= 4.0 || post_throughput_mib_s >= baseline_throughput_mib_s * 0.8,
@@ -12261,6 +12302,16 @@ fn warm_cache_sequential_read_bounded_latency_after_write() {
                  warm cache path regressed vs cold"
             );
         }
+
+        let stats = vfs.foreground_read_protection_stats();
+        assert!(
+            stats.foreground_local_payload_reads > 0,
+            "foreground read metrics should count local payload reads; stats={stats:?}"
+        );
+        assert!(
+            stats.foreground_local_payload_read_bytes >= full_size as u64,
+            "foreground read metrics should count local payload bytes; stats={stats:?}"
+        );
     });
     rt.shutdown_background();
 }
