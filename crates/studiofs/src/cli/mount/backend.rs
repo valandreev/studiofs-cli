@@ -4,6 +4,7 @@ use std::sync::Arc;
 use studiofs_vfs::StudioVfs;
 use tokio::runtime::Handle;
 
+#[cfg(all(unix, not(target_os = "linux")))]
 pub(crate) const MOUNT_BACKEND_ENV: &str = "STUDIOFS_MOUNT_BACKEND";
 
 #[cfg_attr(all(unix, not(target_os = "linux")), allow(dead_code))]
