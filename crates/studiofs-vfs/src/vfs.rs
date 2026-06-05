@@ -6392,10 +6392,17 @@ impl StudioVfs {
             .upload
             .foreground_local_payload_read_io_ns
             .fetch_add(backend_io_ns, Ordering::Relaxed);
-        self.state
+        let current_max = self
+            .state
             .upload
             .foreground_local_payload_read_io_max_ns
-            .fetch_max(backend_io_ns, Ordering::Relaxed);
+            .load(Ordering::Relaxed);
+        if backend_io_ns > current_max {
+            self.state
+                .upload
+                .foreground_local_payload_read_io_max_ns
+                .fetch_max(backend_io_ns, Ordering::Relaxed);
+        }
     }
 
     fn write_access_requested(flags: OpenFlags, trunc: bool) -> bool {
