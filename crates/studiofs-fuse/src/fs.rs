@@ -46,7 +46,7 @@ const TTL: Duration = Duration::from_secs(0);
 #[cfg(not(target_os = "macos"))]
 const TTL: Duration = Duration::from_secs(1);
 #[cfg(target_os = "macos")]
-const DEFAULT_FUSE_MAX_WRITE_BYTES: u32 = 1024 * 1024;
+const DEFAULT_FUSE_MAX_WRITE_BYTES: u32 = 128 * 1024;
 #[cfg(not(target_os = "macos"))]
 const DEFAULT_FUSE_MAX_WRITE_BYTES: u32 = 16 * 1024 * 1024;
 #[cfg(target_os = "macos")]
@@ -3145,7 +3145,7 @@ mod tests {
     #[test]
     fn default_fuse_max_write_matches_platform_expectation() {
         #[cfg(target_os = "macos")]
-        assert_eq!(DEFAULT_FUSE_MAX_WRITE_BYTES, 1024 * 1024);
+        assert_eq!(DEFAULT_FUSE_MAX_WRITE_BYTES, 128 * 1024);
         #[cfg(not(target_os = "macos"))]
         assert_eq!(DEFAULT_FUSE_MAX_WRITE_BYTES, 16 * 1024 * 1024);
     }

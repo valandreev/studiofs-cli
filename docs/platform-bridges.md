@@ -224,8 +224,9 @@ macOS FUSE defaults to the WinFSP-style cache policy. The mount keeps `local`,
 `iosize=1048576` matching StudioFS's WinFSP allocation-unit geometry, and does
 not globally mount with `direct_io` or `nolocalcaches`.
 The default macOS asyncFUSE profile also enables async write replies, applies
-the `50/40` background queue policy, keeps `max_write=1048576`, and reports the
-matching `1048576` preferred I/O size through regular file attributes. Set
+the `50/40` background queue policy, keeps macFUSE-safe `max_write=131072`, and
+reports the matching `1048576` preferred I/O size through regular file
+attributes. Set
 `STUDIOFS_FUSE_ASYNC_WRITE=0` to restore synchronous write callbacks without
 changing the cache policy, or set `STUDIOFS_MACOS_FUSE_CACHE_POLICY=direct` for
 the strict direct-I/O rollback profile.
