@@ -78,7 +78,11 @@ pub fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()> {
     let config = low_level::SessionConfig::new(mount_point, volume_name)
         .with_read_only(read_only)
         .with_run_in_foreground(run_in_foreground);
-    let mut callback_state = Box::new(adapter::CallbackState::new(vfs, runtime_handle, read_only));
+    let mut callback_state = Box::new(adapter::CallbackState::new(
+        Arc::clone(&vfs),
+        runtime_handle,
+        read_only,
+    ));
     let userdata =
         (&mut *callback_state) as *mut adapter::CallbackState as *mut std::os::raw::c_void;
     // SAFETY: `callback_state` remains boxed and live until after the mounted
@@ -90,7 +94,9 @@ pub fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()> {
             userdata,
         )
     }?;
+    vfs.set_kernel_invalidator(session.kernel_invalidator());
     let result = session.run();
+    vfs.clear_kernel_invalidator();
     drop(session);
     drop(callback_state);
     result
@@ -108,6 +114,8 @@ fn studio_vfs_ops_for_read_only(read_only: bool) -> low_level::LowLevelOperation
 mod tests {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
+
+    use studiofs_meta::MetaFsOps;
 
     #[test]
     fn callback_file_info_snapshot_is_independent_from_callback_pointer() {
@@ -445,14 +453,29 @@ mod tests {
             .open(attr.ino, libc::O_RDWR)
             .expect("open writable handle through macFUSE adapter");
 
+        let initial = b"open handle payload";
         adapter
-            .write(attr.ino, writer.file_handle(), 0, b"open handle payload")
-            .expect("write payload through macFUSE adapter");
-        vfs.unlink(
-            studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
-            b"open-unlink.txt",
-        )
-        .expect("unlink file while handle is open");
+            .write(attr.ino, writer.file_handle(), 0, initial)
+            .expect("write initial payload through macFUSE adapter");
+        adapter
+            .fsync(Some(writer.file_handle()), attr.ino, false)
+            .expect("seed fsync should persist initial payload");
+        fixture
+            .meta()
+            .unlink(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"open-unlink.txt",
+            )
+            .expect("unlink file while handle is open");
+
+        adapter
+            .write(
+                attr.ino,
+                writer.file_handle(),
+                initial.len() as i64,
+                b" after unlink",
+            )
+            .expect("write through open handle after foreign unlink");
 
         adapter
             .fsync(Some(writer.file_handle()), attr.ino, false)

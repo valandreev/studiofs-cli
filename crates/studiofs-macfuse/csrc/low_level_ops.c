@@ -6,6 +6,22 @@ static const struct fuse_lowlevel_ops STUDIOFS_EMPTY_LOW_LEVEL_OPS = {0};
 
 extern void studiofs_macfuse_lookup(fuse_req_t req, fuse_ino_t parent, const char *name);
 extern void studiofs_macfuse_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi);
+extern void studiofs_macfuse_mkdir(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode);
+extern void studiofs_macfuse_symlink(fuse_req_t req,
+                                     const char *target,
+                                     fuse_ino_t parent,
+                                     const char *name);
+extern void studiofs_macfuse_create(fuse_req_t req,
+                                    fuse_ino_t parent,
+                                    const char *name,
+                                    mode_t mode,
+                                    struct fuse_file_info *fi);
+extern void studiofs_macfuse_unlink(fuse_req_t req, fuse_ino_t parent, const char *name);
+extern void studiofs_macfuse_rename(fuse_req_t req,
+                                    fuse_ino_t parent,
+                                    const char *name,
+                                    fuse_ino_t newparent,
+                                    const char *newname);
 extern void studiofs_macfuse_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi);
 extern void studiofs_macfuse_read(fuse_req_t req,
                                   fuse_ino_t ino,
@@ -64,12 +80,14 @@ static const struct fuse_lowlevel_ops STUDIOFS_READ_ONLY_LOW_LEVEL_OPS = {
     .listxattr = studiofs_macfuse_listxattr,
 };
 
-// SFS-482 intentionally enables existing-file writeback only. Namespace
-// mutation callbacks (create, mkdir, unlink, rmdir, rename) remain out of this
-// table until the follow-up bridge phase wires those semantics explicitly.
 static const struct fuse_lowlevel_ops STUDIOFS_LOW_LEVEL_OPS = {
     .lookup = studiofs_macfuse_lookup,
     .getattr = studiofs_macfuse_getattr,
+    .mkdir = studiofs_macfuse_mkdir,
+    .symlink = studiofs_macfuse_symlink,
+    .create = studiofs_macfuse_create,
+    .unlink = studiofs_macfuse_unlink,
+    .rename = studiofs_macfuse_rename,
     .setattr = studiofs_macfuse_setattr,
     .open = studiofs_macfuse_open,
     .read = studiofs_macfuse_read,

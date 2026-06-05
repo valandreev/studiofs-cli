@@ -11,8 +11,10 @@ use std::os::raw::{c_char, c_double, c_int, c_ulong, c_void};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
+use std::sync::Arc;
 
 use libc::{off_t, size_t, stat, statvfs};
+use studiofs_vfs::KernelInvalidator;
 use thiserror::Error;
 
 pub(crate) mod raw {
@@ -134,6 +136,12 @@ pub(crate) mod raw {
         pub fn fuse_reply_attr(req: *mut FuseReq, attr: *const stat, timeout: c_double) -> c_int;
         /// Reply with open parameters.
         pub fn fuse_reply_open(req: *mut FuseReq, fi: *const FuseFileInfo) -> c_int;
+        /// Reply with a newly created entry and its open parameters.
+        pub fn fuse_reply_create(
+            req: *mut FuseReq,
+            entry: *const FuseEntryParam,
+            fi: *const FuseFileInfo,
+        ) -> c_int;
         /// Reply with a read or directory buffer.
         pub fn fuse_reply_buf(req: *mut FuseReq, buf: *const c_char, size: size_t) -> c_int;
         /// Reply with a symlink target.
@@ -174,6 +182,13 @@ pub(crate) mod raw {
         pub fn fuse_session_exit(session: *mut FuseSession);
         /// Run a low-level session loop on the current thread.
         pub fn fuse_session_loop(session: *mut FuseSession) -> c_int;
+        /// Notify the kernel to invalidate inode cache state.
+        pub fn fuse_lowlevel_notify_inval_inode(
+            channel: *mut FuseChan,
+            ino: FuseIno,
+            off: off_t,
+            len: off_t,
+        ) -> c_int;
         /// Unmount a FUSE mount point and release its channel.
         pub fn fuse_unmount(mountpoint: *const c_char, channel: *mut FuseChan);
         /// Free arguments allocated by libfuse option parsing.
@@ -481,6 +496,13 @@ impl Session {
         unsafe { raw::fuse_session_exit(self.raw.as_ptr()) };
     }
 
+    /// Build a VFS kernel invalidator for this mounted session.
+    pub fn kernel_invalidator(&self) -> Arc<dyn KernelInvalidator> {
+        Arc::new(MacFuseKernelInvalidator {
+            channel: self.channel.as_ptr() as usize,
+        })
+    }
+
     /// Run the low-level session loop on the current thread.
     pub fn run(&mut self) -> io::Result<()> {
         // SAFETY: `self.raw` is a live session owned by this wrapper for the
@@ -491,6 +513,35 @@ impl Session {
         } else {
             Err(io::Error::from_raw_os_error(result.abs()))
         }
+    }
+}
+
+struct MacFuseKernelInvalidator {
+    channel: usize,
+}
+
+impl KernelInvalidator for MacFuseKernelInvalidator {
+    fn inval_inode(&self, ino: u64) {
+        self.inval_inode_range(ino, 0, -1);
+    }
+
+    fn inval_inode_attrs(&self, ino: u64) {
+        self.inval_inode_range(ino, -1, 0);
+    }
+}
+
+impl MacFuseKernelInvalidator {
+    fn inval_inode_range(&self, ino: u64, offset: off_t, len: off_t) {
+        // SAFETY: `channel` comes from a mounted macFUSE session. The invalidator
+        // is installed only while that session is live and cleared before drop.
+        let _ = unsafe {
+            raw::fuse_lowlevel_notify_inval_inode(
+                self.channel as *mut raw::FuseChan,
+                ino,
+                offset,
+                len,
+            )
+        };
     }
 }
 
@@ -673,6 +724,15 @@ impl Reply {
         // SAFETY: `file_info` is initialized and borrowed for the duration of
         // the call; `self` consumes the single request reply.
         reply_result(unsafe { raw::fuse_reply_open(request.as_ptr(), &file_info) })
+    }
+
+    /// Reply with a newly created entry and open parameters.
+    pub fn create(mut self, entry: &Entry, open: OpenReply) -> io::Result<()> {
+        let request = self.request.take_raw();
+        let file_info = raw::FuseFileInfo::from_open_reply(open);
+        // SAFETY: `entry` and `file_info` are initialized and borrowed for the
+        // duration of the call; `self` consumes the single request reply.
+        reply_result(unsafe { raw::fuse_reply_create(request.as_ptr(), &entry.raw, &file_info) })
     }
 
     /// Reply with a read buffer.

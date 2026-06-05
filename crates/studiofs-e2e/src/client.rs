@@ -951,6 +951,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
                 self.config.poll_interval,
             )?;
         }
+        self.cleanup_stale_mount_after_force_kill(index)?;
         self.clients[index].process = None;
         self.clients[index].spec.process_id = None;
         self.clients[index].spec.state = ClientLifecycleState::Killed;
@@ -1000,6 +1001,11 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
             {
                 kill_error.get_or_insert(err);
             }
+            if kill_error.is_none()
+                && let Err(err) = self.cleanup_stale_mount_after_force_kill(index)
+            {
+                kill_error.get_or_insert(err);
+            }
             self.clients[index].process = None;
             self.clients[index].spec.process_id = None;
             self.clients[index].spec.state = ClientLifecycleState::Killed;
@@ -1009,6 +1015,25 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         } else {
             Ok(())
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn cleanup_stale_mount_after_force_kill(
+        &self,
+        index: usize,
+    ) -> Result<(), ClientControllerError> {
+        let command = self.mount_command(index)?;
+        self.executor
+            .cleanup_stale_mount_before_remount(&command)
+            .map_err(ClientControllerError::Io)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn cleanup_stale_mount_after_force_kill(
+        &self,
+        _index: usize,
+    ) -> Result<(), ClientControllerError> {
+        Ok(())
     }
 
     /// Sends best-effort termination to all tracked client processes without
@@ -1142,6 +1167,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
 
     fn unmount_index(&mut self, index: usize) -> Result<(), ClientControllerError> {
         if self.clients[index].process.is_none() {
+            self.cleanup_stale_mount_after_process_exit(index)?;
             self.clients[index].spec.process_id = None;
             self.clients[index].spec.state = ClientLifecycleState::Unmounted;
             return Ok(());
@@ -1176,9 +1202,29 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
             self.clients[index].spec.state = ClientLifecycleState::Killed;
             return Err(primary);
         }
+        self.cleanup_stale_mount_after_process_exit(index)?;
         self.clients[index].process = None;
         self.clients[index].spec.process_id = None;
         self.clients[index].spec.state = ClientLifecycleState::Unmounted;
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn cleanup_stale_mount_after_process_exit(
+        &self,
+        index: usize,
+    ) -> Result<(), ClientControllerError> {
+        let command = self.mount_command(index)?;
+        self.executor
+            .cleanup_stale_mount_before_remount(&command)
+            .map_err(ClientControllerError::Io)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn cleanup_stale_mount_after_process_exit(
+        &self,
+        _index: usize,
+    ) -> Result<(), ClientControllerError> {
         Ok(())
     }
 

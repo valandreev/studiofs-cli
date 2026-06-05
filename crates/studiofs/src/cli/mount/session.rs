@@ -40,7 +40,6 @@ use tracing::{debug, info, warn};
 const WRITE_PATH_OBSERVABILITY_INTERVAL: Duration = Duration::from_secs(1);
 const DAEMON_RECORD_PUBLISH_TIMEOUT: Duration = Duration::from_secs(15);
 const DAEMON_RECORD_PUBLISH_POLL_INTERVAL: Duration = Duration::from_millis(50);
-#[cfg(any(debug_assertions, test))]
 const E2E_DISABLE_METADATA_BACKGROUND_POLL_ENV: &str =
     "STUDIOFS_E2E_DISABLE_METADATA_BACKGROUND_POLL";
 type MountProfileFinish = Box<dyn FnMut()>;
@@ -1451,25 +1450,16 @@ fn metadata_background_poll_enabled_with<F>(read_var: F) -> bool
 where
     F: Fn(&str) -> Result<String, std::env::VarError>,
 {
-    #[cfg(debug_assertions)]
-    {
-        !read_var(E2E_DISABLE_METADATA_BACKGROUND_POLL_ENV)
-            .ok()
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|value| {
-                value == "1"
-                    || value.eq_ignore_ascii_case("true")
-                    || value.eq_ignore_ascii_case("yes")
-                    || value.eq_ignore_ascii_case("on")
-            })
-    }
-
-    #[cfg(not(debug_assertions))]
-    {
-        let _ = read_var;
-        true
-    }
+    !read_var(E2E_DISABLE_METADATA_BACKGROUND_POLL_ENV)
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| {
+            value == "1"
+                || value.eq_ignore_ascii_case("true")
+                || value.eq_ignore_ascii_case("yes")
+                || value.eq_ignore_ascii_case("on")
+        })
 }
 
 fn materialize_snapshot_mount_meta<M: ?Sized + SnapshotSourceMeta>(
@@ -2190,10 +2180,7 @@ mod tests {
         });
 
         assert!(enabled);
-        #[cfg(debug_assertions)]
         assert!(!disabled);
-        #[cfg(not(debug_assertions))]
-        assert!(disabled);
     }
 
     #[test]

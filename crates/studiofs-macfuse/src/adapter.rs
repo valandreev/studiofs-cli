@@ -6,7 +6,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use libc::{off_t, size_t, stat, statvfs};
+use libc::{mode_t, off_t, size_t, stat, statvfs};
 use studiofs_bridge::posix::{
     BridgeFileAttr, BridgeFileType, posix_flags_to_open_flags, to_bridge_attr, vfs_err_to_errno,
 };
@@ -83,6 +83,53 @@ impl StudioVfsAdapter {
             .map_err(|error| vfs_err_to_errno(&error))
     }
 
+    /// Create a directory.
+    pub(crate) fn mkdir(&self, parent: u64, name: &[u8], mode: mode_t) -> Result<InodeAttr, i32> {
+        if self.read_only {
+            return Err(libc::EROFS);
+        }
+        self.vfs
+            .mkdir(parent, name, self.mount_uid, self.mount_gid, mode & 0o7777)
+            .inspect(|_| self.invalidate_readdir_cache(parent))
+            .map_err(|error| vfs_err_to_errno(&error))
+    }
+
+    /// Create a symbolic link.
+    pub(crate) fn symlink(
+        &self,
+        parent: u64,
+        name: &[u8],
+        target: &[u8],
+    ) -> Result<InodeAttr, i32> {
+        if self.read_only {
+            return Err(libc::EROFS);
+        }
+        self.vfs
+            .symlink(parent, name, target, self.mount_uid, self.mount_gid)
+            .inspect(|_| self.invalidate_readdir_cache(parent))
+            .map_err(|error| vfs_err_to_errno(&error))
+    }
+
+    /// Create and open a regular file.
+    pub(crate) fn create(
+        &self,
+        parent: u64,
+        name: &[u8],
+        mode: mode_t,
+        flags: i32,
+    ) -> Result<(InodeAttr, OpenReply), i32> {
+        if self.read_only {
+            return Err(libc::EROFS);
+        }
+        let attr = self
+            .vfs
+            .create(parent, name, self.mount_uid, self.mount_gid, mode & 0o7777)
+            .map_err(|error| vfs_err_to_errno(&error))?;
+        self.invalidate_readdir_cache(parent);
+        let open = self.open(attr.ino, flags)?;
+        Ok((attr, open))
+    }
+
     /// Open an existing file.
     pub(crate) fn open(&self, ino: u64, flags: i32) -> Result<OpenReply, i32> {
         let (open_flags, trunc) = posix_flags_to_open_flags(flags);
@@ -96,6 +143,39 @@ impl StudioVfsAdapter {
                 OpenReply::new(fh)
                     .with_direct_io(policy.direct_io)
                     .with_keep_cache(policy.keep_cache)
+            })
+            .map_err(|error| vfs_err_to_errno(&error))
+    }
+
+    /// Remove a file entry.
+    pub(crate) fn unlink(&self, parent: u64, name: &[u8]) -> Result<(), i32> {
+        if self.read_only {
+            return Err(libc::EROFS);
+        }
+        self.vfs
+            .unlink(parent, name)
+            .inspect(|_| self.invalidate_readdir_cache(parent))
+            .map_err(|error| vfs_err_to_errno(&error))
+    }
+
+    /// Rename a namespace entry.
+    pub(crate) fn rename(
+        &self,
+        parent: u64,
+        name: &[u8],
+        newparent: u64,
+        newname: &[u8],
+    ) -> Result<(), i32> {
+        if self.read_only {
+            return Err(libc::EROFS);
+        }
+        self.vfs
+            .rename(parent, name, newparent, newname)
+            .inspect(|_| {
+                self.invalidate_readdir_cache(parent);
+                if newparent != parent {
+                    self.invalidate_readdir_cache(newparent);
+                }
             })
             .map_err(|error| vfs_err_to_errno(&error))
     }
@@ -416,6 +496,12 @@ impl StudioVfsAdapter {
                 self.readdir_cache_ready.notify_all();
                 Err(errno)
             }
+        }
+    }
+
+    fn invalidate_readdir_cache(&self, ino: u64) {
+        if let Ok(mut cache) = self.readdir_cache.lock() {
+            cache.remove(&ino);
         }
     }
 
@@ -740,6 +826,151 @@ pub extern "C" fn studiofs_macfuse_getattr(
                 let _ = Reply::new(request).attr(&attr, TTL_SECONDS);
             }
         }
+        Err(errno) => reply_error(req, errno),
+    }
+}
+
+/// macFUSE mkdir callback for the StudioVfs bridge.
+#[unsafe(no_mangle)]
+pub extern "C" fn studiofs_macfuse_mkdir(
+    req: *mut raw::FuseReq,
+    parent: raw::FuseIno,
+    name: *const c_char,
+    mode: mode_t,
+) {
+    let Some(state) = callback_state(req) else {
+        reply_error(req, libc::EIO);
+        return;
+    };
+    if name.is_null() {
+        reply_error(req, libc::EINVAL);
+        return;
+    }
+    // SAFETY: macFUSE passes a NUL-terminated entry name for mkdir callbacks.
+    let name = unsafe { CStr::from_ptr(name) }.to_bytes();
+    match state.adapter.mkdir(parent, name, mode) {
+        Ok(attr) => {
+            let stat = state.adapter.attr_to_stat(&attr);
+            if let Some(request) = owned_request(req) {
+                let entry = Entry::new(attr.ino, 0, stat, TTL_SECONDS, TTL_SECONDS);
+                let _ = Reply::new(request).entry(&entry);
+            }
+        }
+        Err(errno) => reply_error(req, errno),
+    }
+}
+
+/// macFUSE symlink callback for the StudioVfs bridge.
+#[unsafe(no_mangle)]
+pub extern "C" fn studiofs_macfuse_symlink(
+    req: *mut raw::FuseReq,
+    target: *const c_char,
+    parent: raw::FuseIno,
+    name: *const c_char,
+) {
+    let Some(state) = callback_state(req) else {
+        reply_error(req, libc::EIO);
+        return;
+    };
+    if target.is_null() || name.is_null() {
+        reply_error(req, libc::EINVAL);
+        return;
+    }
+    // SAFETY: macFUSE passes NUL-terminated symlink target and entry name strings.
+    let target = unsafe { CStr::from_ptr(target) }.to_bytes();
+    // SAFETY: macFUSE passes NUL-terminated symlink target and entry name strings.
+    let name = unsafe { CStr::from_ptr(name) }.to_bytes();
+    match state.adapter.symlink(parent, name, target) {
+        Ok(attr) => {
+            let stat = state.adapter.attr_to_stat(&attr);
+            if let Some(request) = owned_request(req) {
+                let entry = Entry::new(attr.ino, 0, stat, TTL_SECONDS, TTL_SECONDS);
+                let _ = Reply::new(request).entry(&entry);
+            }
+        }
+        Err(errno) => reply_error(req, errno),
+    }
+}
+
+/// macFUSE create callback for the StudioVfs bridge.
+#[unsafe(no_mangle)]
+pub extern "C" fn studiofs_macfuse_create(
+    req: *mut raw::FuseReq,
+    parent: raw::FuseIno,
+    name: *const c_char,
+    mode: mode_t,
+    fi: *mut raw::FuseFileInfo,
+) {
+    let Some(state) = callback_state(req) else {
+        reply_error(req, libc::EIO);
+        return;
+    };
+    if name.is_null() || fi.is_null() {
+        reply_error(req, libc::EINVAL);
+        return;
+    }
+    // SAFETY: macFUSE passes a NUL-terminated entry name for create callbacks.
+    let name = unsafe { CStr::from_ptr(name) }.to_bytes();
+    // SAFETY: macFUSE passes initialized file info for create callbacks.
+    let flags = unsafe { (*fi).flags };
+    match state.adapter.create(parent, name, mode, flags) {
+        Ok((attr, open)) => {
+            let stat = state.adapter.attr_to_stat(&attr);
+            if let Some(request) = owned_request(req) {
+                let entry = Entry::new(attr.ino, 0, stat, TTL_SECONDS, TTL_SECONDS);
+                let _ = Reply::new(request).create(&entry, open);
+            }
+        }
+        Err(errno) => reply_error(req, errno),
+    }
+}
+
+/// macFUSE unlink callback for the StudioVfs bridge.
+#[unsafe(no_mangle)]
+pub extern "C" fn studiofs_macfuse_unlink(
+    req: *mut raw::FuseReq,
+    parent: raw::FuseIno,
+    name: *const c_char,
+) {
+    let Some(state) = callback_state(req) else {
+        reply_error(req, libc::EIO);
+        return;
+    };
+    if name.is_null() {
+        reply_error(req, libc::EINVAL);
+        return;
+    }
+    // SAFETY: macFUSE passes a NUL-terminated entry name for unlink callbacks.
+    let name = unsafe { CStr::from_ptr(name) }.to_bytes();
+    match state.adapter.unlink(parent, name) {
+        Ok(()) => reply_error(req, 0),
+        Err(errno) => reply_error(req, errno),
+    }
+}
+
+/// macFUSE rename callback for the StudioVfs bridge.
+#[unsafe(no_mangle)]
+pub extern "C" fn studiofs_macfuse_rename(
+    req: *mut raw::FuseReq,
+    parent: raw::FuseIno,
+    name: *const c_char,
+    newparent: raw::FuseIno,
+    newname: *const c_char,
+) {
+    let Some(state) = callback_state(req) else {
+        reply_error(req, libc::EIO);
+        return;
+    };
+    if name.is_null() || newname.is_null() {
+        reply_error(req, libc::EINVAL);
+        return;
+    }
+    // SAFETY: macFUSE passes NUL-terminated entry names for rename callbacks.
+    let name = unsafe { CStr::from_ptr(name) }.to_bytes();
+    // SAFETY: macFUSE passes NUL-terminated entry names for rename callbacks.
+    let newname = unsafe { CStr::from_ptr(newname) }.to_bytes();
+    match state.adapter.rename(parent, name, newparent, newname) {
+        Ok(()) => reply_error(req, 0),
         Err(errno) => reply_error(req, errno),
     }
 }
