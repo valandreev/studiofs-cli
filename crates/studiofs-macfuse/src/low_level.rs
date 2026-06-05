@@ -365,6 +365,15 @@ impl SessionConfig {
         args
     }
 
+    /// Build owned argv strings for the macFUSE mount channel.
+    pub fn mount_argv_strings(&self) -> Vec<String> {
+        vec![
+            "studiofs-macfuse".to_owned(),
+            format!("-ovolname={}", self.volume_name),
+            "-olocal".to_owned(),
+        ]
+    }
+
     fn mount_point_cstring(&self) -> io::Result<CString> {
         CString::new(self.mount_point.as_os_str().as_bytes()).map_err(|_| {
             io::Error::new(
@@ -382,9 +391,8 @@ struct OwnedFuseArgs {
 }
 
 impl OwnedFuseArgs {
-    fn new(config: &SessionConfig) -> io::Result<Self> {
-        let strings = config
-            .argv_strings()
+    fn new(argv_strings: Vec<String>) -> io::Result<Self> {
+        let strings = argv_strings
             .into_iter()
             .map(|arg| {
                 CString::new(arg).map_err(|_| {
@@ -459,17 +467,23 @@ impl Session {
         ops: LowLevelOperations,
         userdata: *mut c_void,
     ) -> io::Result<Self> {
-        let mut args = OwnedFuseArgs::new(config)?;
+        let mut session_args = OwnedFuseArgs::new(config.argv_strings())?;
+        let mut mount_args = OwnedFuseArgs::new(config.mount_argv_strings())?;
         let mount_point = config.mount_point_cstring()?;
         // SAFETY: `args`, `ops`, and `userdata` satisfy the caller contract for
         // `fuse_lowlevel_new`; `args` and callback table live through the call.
         let session = NonNull::new(unsafe {
-            raw::fuse_lowlevel_new(args.as_mut_ptr(), ops.as_ptr(), ops.size(), userdata)
+            raw::fuse_lowlevel_new(
+                session_args.as_mut_ptr(),
+                ops.as_ptr(),
+                ops.size(),
+                userdata,
+            )
         })
         .ok_or_else(|| io::Error::other("macFUSE failed to create low-level session"))?;
         // SAFETY: `mount_point` and `args` are valid for this call.
         let channel =
-            NonNull::new(unsafe { raw::fuse_mount(mount_point.as_ptr(), args.as_mut_ptr()) });
+            NonNull::new(unsafe { raw::fuse_mount(mount_point.as_ptr(), mount_args.as_mut_ptr()) });
         match channel {
             Some(channel) => {
                 // SAFETY: Both pointers were returned by macFUSE and are live.
@@ -496,6 +510,13 @@ impl Session {
         unsafe { raw::fuse_session_exit(self.raw.as_ptr()) };
     }
 
+    /// Build a thread-safe handle that can request session loop shutdown.
+    pub fn exit_handle(&self) -> SessionExitHandle {
+        SessionExitHandle {
+            raw: self.raw.as_ptr() as usize,
+        }
+    }
+
     /// Build a VFS kernel invalidator for this mounted session.
     pub fn kernel_invalidator(&self) -> Arc<dyn KernelInvalidator> {
         Arc::new(MacFuseKernelInvalidator {
@@ -513,6 +534,21 @@ impl Session {
         } else {
             Err(io::Error::from_raw_os_error(result.abs()))
         }
+    }
+}
+
+/// Thread-safe handle used to request low-level session shutdown.
+#[derive(Clone, Copy, Debug)]
+pub struct SessionExitHandle {
+    raw: usize,
+}
+
+impl SessionExitHandle {
+    /// Ask the session loop to exit.
+    pub fn request_exit(self) {
+        // SAFETY: the handle is created from a live `Session` and used only by
+        // watchers that are joined before that session is dropped.
+        unsafe { raw::fuse_session_exit(self.raw as *mut raw::FuseSession) };
     }
 }
 

@@ -9,7 +9,10 @@
 
 use std::io;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 use studiofs_vfs::StudioVfs;
 use tokio::runtime::Handle;
@@ -30,6 +33,8 @@ pub struct MacFuseMountRequest {
     volume_name: String,
     read_only: bool,
     run_in_foreground: bool,
+    signal_handling: SignalHandling,
+    unmount_signal: Option<MacFuseUnmountSignal>,
 }
 
 impl MacFuseMountRequest {
@@ -47,6 +52,8 @@ impl MacFuseMountRequest {
             volume_name: volume_name.into(),
             read_only: false,
             run_in_foreground: false,
+            signal_handling: SignalHandling::default(),
+            unmount_signal: None,
         }
     }
 
@@ -61,6 +68,166 @@ impl MacFuseMountRequest {
         self.run_in_foreground = run_in_foreground;
         self
     }
+
+    /// Set process signal ownership policy.
+    pub fn with_signal_handling(mut self, signal_handling: SignalHandling) -> Self {
+        self.signal_handling = signal_handling;
+        self
+    }
+}
+
+/// Controls whether StudioFS owns process-global macFUSE shutdown signals.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum SignalHandling {
+    /// Do not install SIGINT/SIGTERM handlers.
+    #[default]
+    Disabled,
+    /// Install temporary SIGINT/SIGTERM handlers for the StudioFS CLI.
+    InstallForCli,
+}
+
+/// Caller-owned handle for requesting graceful macFUSE unmount.
+#[derive(Clone, Debug, Default)]
+pub struct MacFuseUnmountSignal {
+    requested: Arc<AtomicBool>,
+}
+
+impl MacFuseUnmountSignal {
+    /// Create a new unmount signal.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Request the mount session to unmount.
+    pub fn request_unmount(&self) {
+        self.requested.store(true, Ordering::Release);
+    }
+
+    /// Return whether unmount has been requested.
+    pub fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::Acquire)
+    }
+}
+
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+static CLI_SIGNAL_HANDLERS_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn shutdown_signal_handler(_sig: libc::c_int) {
+    SHUTDOWN_REQUESTED.store(true, Ordering::Release);
+}
+
+struct CliSignalHandlers {
+    previous_sigint: libc::sighandler_t,
+    previous_sigterm: libc::sighandler_t,
+}
+
+impl CliSignalHandlers {
+    fn install() -> io::Result<Self> {
+        CLI_SIGNAL_HANDLERS_INSTALLED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "macFUSE CLI signal handlers are already installed",
+                )
+            })?;
+        // SAFETY: this explicitly mutates process-global CLI signal disposition
+        // and restores the previous handlers in Drop.
+        unsafe {
+            let previous_sigint = libc::signal(
+                libc::SIGINT,
+                shutdown_signal_handler as *const () as libc::sighandler_t,
+            );
+            if previous_sigint == libc::SIG_ERR {
+                CLI_SIGNAL_HANDLERS_INSTALLED.store(false, Ordering::Release);
+                return Err(io::Error::last_os_error());
+            }
+            let previous_sigterm = libc::signal(
+                libc::SIGTERM,
+                shutdown_signal_handler as *const () as libc::sighandler_t,
+            );
+            if previous_sigterm == libc::SIG_ERR {
+                let _ = libc::signal(libc::SIGINT, previous_sigint);
+                CLI_SIGNAL_HANDLERS_INSTALLED.store(false, Ordering::Release);
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Self {
+                previous_sigint,
+                previous_sigterm,
+            })
+        }
+    }
+}
+
+impl Drop for CliSignalHandlers {
+    fn drop(&mut self) {
+        // SAFETY: these values came from successful `libc::signal` calls.
+        unsafe {
+            libc::signal(libc::SIGINT, self.previous_sigint);
+            libc::signal(libc::SIGTERM, self.previous_sigterm);
+        }
+        CLI_SIGNAL_HANDLERS_INSTALLED.store(false, Ordering::Release);
+    }
+}
+
+fn signal_handlers_for_policy(
+    signal_handling: SignalHandling,
+) -> io::Result<Option<CliSignalHandlers>> {
+    match signal_handling {
+        SignalHandling::Disabled => Ok(None),
+        SignalHandling::InstallForCli => CliSignalHandlers::install().map(Some),
+    }
+}
+
+struct SignalWatcher {
+    stop: Arc<AtomicBool>,
+    handlers: Arc<Mutex<Option<CliSignalHandlers>>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for SignalWatcher {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        let _ = self.handlers.lock().expect("signal handler lock").take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn spawn_signal_watcher(
+    _mount_point: String,
+    exit_handle: low_level::SessionExitHandle,
+    signal_handling: SignalHandling,
+    unmount_signal: Option<MacFuseUnmountSignal>,
+) -> io::Result<SignalWatcher> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let handlers = Arc::new(Mutex::new(signal_handlers_for_policy(signal_handling)?));
+    let watcher_stop = Arc::clone(&stop);
+    let watcher_handlers = Arc::clone(&handlers);
+    let thread = std::thread::Builder::new()
+        .name("macfuse-signal-watcher".into())
+        .spawn(move || {
+            while !watcher_stop.load(Ordering::Acquire)
+                && !SHUTDOWN_REQUESTED.load(Ordering::Acquire)
+                && !unmount_signal
+                    .as_ref()
+                    .is_some_and(MacFuseUnmountSignal::is_requested)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            if watcher_stop.load(Ordering::Acquire) {
+                return;
+            }
+            SHUTDOWN_REQUESTED.store(true, Ordering::Release);
+            let _ = watcher_handlers.lock().expect("signal handler lock").take();
+            exit_handle.request_exit();
+        })?;
+    Ok(SignalWatcher {
+        stop,
+        handlers,
+        thread: Some(thread),
+    })
 }
 
 /// Start serving the macOS native bridge.
@@ -74,6 +241,8 @@ pub fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()> {
         volume_name,
         read_only,
         run_in_foreground,
+        signal_handling,
+        unmount_signal,
     } = request;
     let config = low_level::SessionConfig::new(mount_point, volume_name)
         .with_read_only(read_only)
@@ -94,6 +263,13 @@ pub fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()> {
             userdata,
         )
     }?;
+    SHUTDOWN_REQUESTED.store(false, Ordering::Release);
+    let _signal_watcher = spawn_signal_watcher(
+        config.mount_point().to_string_lossy().into_owned(),
+        session.exit_handle(),
+        signal_handling,
+        unmount_signal,
+    )?;
     vfs.set_kernel_invalidator(session.kernel_invalidator());
     let result = session.run();
     vfs.clear_kernel_invalidator();
@@ -165,6 +341,7 @@ mod tests {
             .with_run_in_foreground(true);
 
         let args = config.argv_strings();
+        let mount_args = config.mount_argv_strings();
 
         assert_eq!(
             config.mount_point().as_os_str(),
@@ -173,6 +350,12 @@ mod tests {
         assert_eq!(config.volume_name(), "StudioFS Native");
         assert!(config.run_in_foreground());
         assert!(args.iter().any(|arg| arg == "studiofs-macfuse"));
+        assert!(
+            mount_args
+                .iter()
+                .any(|arg| arg == "-ovolname=StudioFS Native")
+        );
+        assert!(mount_args.iter().any(|arg| arg == "-olocal"));
         assert!(!args.iter().any(|arg| arg == "-f"));
         assert!(!args.iter().any(|arg| arg == "-oro"));
         assert!(!args.iter().any(|arg| arg == "ro"));
