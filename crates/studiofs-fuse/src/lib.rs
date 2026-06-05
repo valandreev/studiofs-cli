@@ -8,7 +8,7 @@
 //! `AllowOther` mount option on Linux. On macOS, `AllowOther` is enabled
 //! unconditionally (per the macFUSE behavior expected by StudioFS).
 
-#![cfg(unix)]
+#![cfg(target_os = "linux")]
 
 mod fs;
 
