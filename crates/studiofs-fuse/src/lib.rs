@@ -41,7 +41,7 @@ enum MacosFuseCachePolicy {
 }
 
 #[cfg(target_os = "macos")]
-const MACOS_FUSE_IOSIZE_BYTES: u32 = 64 * 1024;
+const MACOS_FUSE_IOSIZE_BYTES: u32 = 1024 * 1024;
 
 #[cfg(target_os = "macos")]
 impl MacosFuseCachePolicy {
@@ -753,7 +753,7 @@ mod tests {
             |opt| matches!(opt, fuser::MountOption::CUSTOM(custom) if custom == "daemon_timeout=60")
         ));
         assert!(options.iter().any(
-            |opt| matches!(opt, fuser::MountOption::CUSTOM(custom) if custom == "iosize=65536")
+            |opt| matches!(opt, fuser::MountOption::CUSTOM(custom) if custom == "iosize=1048576")
         ));
     }
 
