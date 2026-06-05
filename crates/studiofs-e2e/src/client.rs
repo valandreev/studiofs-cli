@@ -951,6 +951,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
                 self.config.poll_interval,
             )?;
         }
+        self.cleanup_stale_mount(index)?;
         self.clients[index].process = None;
         self.clients[index].spec.process_id = None;
         self.clients[index].spec.state = ClientLifecycleState::Killed;
@@ -998,6 +999,9 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
                     self.config.poll_interval,
                 )
             {
+                kill_error.get_or_insert(err);
+            }
+            if kill_error.is_none() && let Err(err) = self.cleanup_stale_mount(index) {
                 kill_error.get_or_insert(err);
             }
             self.clients[index].process = None;
@@ -1142,6 +1146,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
 
     fn unmount_index(&mut self, index: usize) -> Result<(), ClientControllerError> {
         if self.clients[index].process.is_none() {
+            self.cleanup_stale_mount(index)?;
             self.clients[index].spec.process_id = None;
             self.clients[index].spec.state = ClientLifecycleState::Unmounted;
             return Ok(());
@@ -1176,9 +1181,23 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
             self.clients[index].spec.state = ClientLifecycleState::Killed;
             return Err(primary);
         }
+        self.cleanup_stale_mount(index)?;
         self.clients[index].process = None;
         self.clients[index].spec.process_id = None;
         self.clients[index].spec.state = ClientLifecycleState::Unmounted;
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn cleanup_stale_mount(&self, index: usize) -> Result<(), ClientControllerError> {
+        let command = self.mount_command(index)?;
+        self.executor
+            .cleanup_stale_mount_before_remount(&command)
+            .map_err(ClientControllerError::Io)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn cleanup_stale_mount(&self, _index: usize) -> Result<(), ClientControllerError> {
         Ok(())
     }
 

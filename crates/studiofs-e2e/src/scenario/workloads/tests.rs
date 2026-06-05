@@ -3071,6 +3071,23 @@ fn performance_probe_seed_mode_summary_records_read_only_seeded_backend() {
 }
 
 #[test]
+fn performance_probe_read_only_seed_cache_budget_keeps_headroom_above_payload() {
+    let file_bytes = 4 * 1024 * 1024 * 1024;
+
+    let cache_budget_bytes = seeded_vfs_cache_budget_bytes(file_bytes);
+
+    assert!(
+        cache_budget_bytes > file_bytes,
+        "seeded read-only probe cache budget must leave room beyond the payload"
+    );
+    assert_eq!(
+        cache_budget_bytes - file_bytes,
+        96 * 1024 * 1024,
+        "seeded read-only probe should include dirty-limit and eviction headroom"
+    );
+}
+
+#[test]
 fn performance_probe_macos_read_only_mount_uses_macfuse_backend_override() {
     let mut overrides = Vec::new();
 

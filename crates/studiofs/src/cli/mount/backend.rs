@@ -41,6 +41,7 @@ pub(crate) fn default_mount_backend() -> Box<dyn MountBackend> {
 #[cfg(target_os = "macos")]
 pub(crate) fn mount_backend_for_selector(selector: Option<&str>) -> Box<dyn MountBackend> {
     match selector.map(str::trim).filter(|value| !value.is_empty()) {
+        None => Box::new(MacFuseMountBackend),
         Some(value) if value.eq_ignore_ascii_case("macfuse") => Box::new(MacFuseMountBackend),
         _ => Box::new(UnsupportedUnixMountBackend),
     }
@@ -90,7 +91,8 @@ impl MountBackend for MacFuseMountBackend {
             launch.volume_name,
         )
         .with_read_only(launch.read_only)
-        .with_run_in_foreground(launch.run_in_foreground);
+        .with_run_in_foreground(launch.run_in_foreground)
+        .with_signal_handling(studiofs_macfuse::SignalHandling::InstallForCli);
         studiofs_macfuse::mount_with_request(request)
     }
 }
@@ -101,7 +103,7 @@ struct UnsupportedUnixMountBackend;
 #[cfg(all(unix, not(target_os = "linux")))]
 fn unsupported_unix_backend_error_message() -> &'static str {
     if cfg!(target_os = "macos") {
-        "StudioFS FUSE backend is Linux-only; set STUDIOFS_MOUNT_BACKEND=macfuse on macOS to try the read-only native bridge MVP; the rejected fuser notifier-store path is tracked by SFS-474"
+        "StudioFS FUSE backend is Linux-only; macOS uses the native macFUSE bridge by default; clear or set STUDIOFS_MOUNT_BACKEND=macfuse to use it"
     } else {
         "StudioFS FUSE backend is Linux-only; macOS and Windows are supported via their respective native bridges"
     }
@@ -155,24 +157,32 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_selector_falls_back_without_native_opt_in() {
-        for selector in [None, Some("other"), Some("")] {
+    fn macos_default_selector_routes_to_macfuse() {
+        for selector in [None, Some("")] {
             let backend = super::mount_backend_for_selector(selector);
 
-            assert_eq!(backend.name(), "unsupported-unix");
+            assert_eq!(backend.name(), "macFUSE");
         }
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_unsupported_backend_error_mentions_native_mvp_selector() {
+    fn macos_unknown_selector_is_explicitly_unsupported() {
+        let backend = super::mount_backend_for_selector(Some("other"));
+
+        assert_eq!(backend.name(), "unsupported-unix");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_unsupported_backend_error_mentions_default_native_bridge() {
         let message = super::unsupported_unix_backend_error_message();
 
         assert!(message.contains(super::MOUNT_BACKEND_ENV));
-        assert!(message.contains("SFS-474"));
+        assert!(message.contains("macFUSE"));
     }
 
-    #[cfg(all(unix, not(target_os = "linux")))]
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
     #[test]
     fn non_linux_unix_default_backend_is_explicitly_unsupported() {
         let backend = super::mount_backend_for_selector(None);

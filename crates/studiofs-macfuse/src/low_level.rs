@@ -7,13 +7,35 @@
 use std::ffi::{CString, OsStr};
 use std::io;
 use std::mem::MaybeUninit;
-use std::os::raw::{c_char, c_double, c_int, c_ulong, c_void};
+use std::os::raw::{c_char, c_double, c_int, c_uint, c_ulong, c_void};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
+use std::sync::Arc;
 
 use libc::{off_t, size_t, stat, statvfs};
+use studiofs_vfs::KernelInvalidator;
 use thiserror::Error;
+use tracing::debug;
+
+const DEFAULT_FUSE_MAX_WRITE_BYTES: u32 = 16 * 1024 * 1024;
+const DEFAULT_FUSE_MAX_READAHEAD_BYTES: u32 = 16 * 1024 * 1024;
+const MACOS_FUSE_IOSIZE_BYTES: u32 = 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MacosFuseCachePolicy {
+    Direct,
+    Winfsp,
+}
+
+impl MacosFuseCachePolicy {
+    fn from_env() -> Self {
+        match std::env::var("STUDIOFS_MACOS_FUSE_CACHE_POLICY") {
+            Ok(raw) if raw.trim().eq_ignore_ascii_case("direct") => Self::Direct,
+            _ => Self::Winfsp,
+        }
+    }
+}
 
 pub(crate) mod raw {
     use super::*;
@@ -29,6 +51,9 @@ pub(crate) mod raw {
 
     /// Opaque low-level FUSE channel handle.
     pub enum FuseChan {}
+
+    /// Opaque low-level FUSE connection information handle.
+    pub enum FuseConnInfo {}
 
     /// Opaque low-level FUSE argument vector.
     #[repr(C)]
@@ -134,6 +159,12 @@ pub(crate) mod raw {
         pub fn fuse_reply_attr(req: *mut FuseReq, attr: *const stat, timeout: c_double) -> c_int;
         /// Reply with open parameters.
         pub fn fuse_reply_open(req: *mut FuseReq, fi: *const FuseFileInfo) -> c_int;
+        /// Reply with a newly created entry and its open parameters.
+        pub fn fuse_reply_create(
+            req: *mut FuseReq,
+            entry: *const FuseEntryParam,
+            fi: *const FuseFileInfo,
+        ) -> c_int;
         /// Reply with a read or directory buffer.
         pub fn fuse_reply_buf(req: *mut FuseReq, buf: *const c_char, size: size_t) -> c_int;
         /// Reply with a symlink target.
@@ -174,6 +205,13 @@ pub(crate) mod raw {
         pub fn fuse_session_exit(session: *mut FuseSession);
         /// Run a low-level session loop on the current thread.
         pub fn fuse_session_loop(session: *mut FuseSession) -> c_int;
+        /// Notify the kernel to invalidate inode cache state.
+        pub fn fuse_lowlevel_notify_inval_inode(
+            channel: *mut FuseChan,
+            ino: FuseIno,
+            off: off_t,
+            len: off_t,
+        ) -> c_int;
         /// Unmount a FUSE mount point and release its channel.
         pub fn fuse_unmount(mountpoint: *const c_char, channel: *mut FuseChan);
         /// Free arguments allocated by libfuse option parsing.
@@ -194,6 +232,16 @@ unsafe extern "C" {
     fn studiofs_macfuse_low_level_ops_has_read_only_xattr_callbacks(
         ops: *const raw::FuseLowLevelOps,
     ) -> c_int;
+    #[cfg(test)]
+    fn studiofs_macfuse_low_level_ops_has_init_callback(ops: *const raw::FuseLowLevelOps) -> c_int;
+    #[cfg(test)]
+    fn studiofs_macfuse_low_level_ops_has_rmdir_callback(ops: *const raw::FuseLowLevelOps)
+    -> c_int;
+    fn studiofs_macfuse_conn_info_configure(
+        conn: *mut raw::FuseConnInfo,
+        max_write: c_uint,
+        max_readahead: c_uint,
+    );
     fn studiofs_macfuse_file_info_init(
         info: *mut raw::FuseFileInfo,
         flags: c_int,
@@ -216,6 +264,20 @@ unsafe extern "C" {
     pub(crate) fn studiofs_macfuse_setattr_chgtime_mask() -> c_int;
     pub(crate) fn studiofs_macfuse_setattr_bkuptime_mask() -> c_int;
     pub(crate) fn studiofs_macfuse_setattr_flags_mask() -> c_int;
+}
+
+/// Configure macFUSE connection-level I/O sizing for the low-level bridge.
+#[unsafe(no_mangle)]
+pub extern "C" fn studiofs_macfuse_init(_userdata: *mut c_void, conn: *mut raw::FuseConnInfo) {
+    // SAFETY: macFUSE passes a live `fuse_conn_info` pointer for this callback;
+    // the C shim writes only documented connection size fields.
+    unsafe {
+        studiofs_macfuse_conn_info_configure(
+            conn,
+            DEFAULT_FUSE_MAX_WRITE_BYTES,
+            DEFAULT_FUSE_MAX_READAHEAD_BYTES,
+        );
+    }
 }
 
 /// Low-level callback operation table provided by macFUSE headers.
@@ -280,6 +342,18 @@ impl LowLevelOperations {
             studiofs_macfuse_low_level_ops_has_xattr_callbacks(self.raw) != 0
                 || studiofs_macfuse_low_level_ops_has_read_only_xattr_callbacks(self.raw) != 0
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_init_callback(self) -> bool {
+        // SAFETY: The C shim only inspects callback pointers in a static table.
+        unsafe { studiofs_macfuse_low_level_ops_has_init_callback(self.raw) != 0 }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_rmdir_callback(self) -> bool {
+        // SAFETY: The C shim only inspects callback pointers in a static table.
+        unsafe { studiofs_macfuse_low_level_ops_has_rmdir_callback(self.raw) != 0 }
     }
 }
 
@@ -350,6 +424,36 @@ impl SessionConfig {
         args
     }
 
+    /// Build owned argv strings for the macFUSE mount channel.
+    pub fn mount_argv_strings(&self) -> Vec<String> {
+        self.mount_argv_strings_with_cache_policy(MacosFuseCachePolicy::from_env())
+    }
+
+    pub(super) fn mount_argv_strings_with_cache_policy(
+        &self,
+        cache_policy: MacosFuseCachePolicy,
+    ) -> Vec<String> {
+        let mut args = vec![
+            "studiofs-macfuse".to_owned(),
+            format!("-ovolname={}", self.volume_name),
+            "-olocal".to_owned(),
+        ];
+        match cache_policy {
+            MacosFuseCachePolicy::Direct => {
+                args.push("-odirect_io".to_owned());
+                args.push("-onolocalcaches".to_owned());
+                args.push("-oauto_cache".to_owned());
+            }
+            MacosFuseCachePolicy::Winfsp => {
+                args.push("-onovncache".to_owned());
+                args.push("-odaemon_timeout=60".to_owned());
+                args.push(format!("-oiosize={MACOS_FUSE_IOSIZE_BYTES}"));
+            }
+        }
+        args.push("-osparse".to_owned());
+        args
+    }
+
     fn mount_point_cstring(&self) -> io::Result<CString> {
         CString::new(self.mount_point.as_os_str().as_bytes()).map_err(|_| {
             io::Error::new(
@@ -367,9 +471,8 @@ struct OwnedFuseArgs {
 }
 
 impl OwnedFuseArgs {
-    fn new(config: &SessionConfig) -> io::Result<Self> {
-        let strings = config
-            .argv_strings()
+    fn new(argv_strings: Vec<String>) -> io::Result<Self> {
+        let strings = argv_strings
             .into_iter()
             .map(|arg| {
                 CString::new(arg).map_err(|_| {
@@ -444,17 +547,23 @@ impl Session {
         ops: LowLevelOperations,
         userdata: *mut c_void,
     ) -> io::Result<Self> {
-        let mut args = OwnedFuseArgs::new(config)?;
+        let mut session_args = OwnedFuseArgs::new(config.argv_strings())?;
+        let mut mount_args = OwnedFuseArgs::new(config.mount_argv_strings())?;
         let mount_point = config.mount_point_cstring()?;
         // SAFETY: `args`, `ops`, and `userdata` satisfy the caller contract for
         // `fuse_lowlevel_new`; `args` and callback table live through the call.
         let session = NonNull::new(unsafe {
-            raw::fuse_lowlevel_new(args.as_mut_ptr(), ops.as_ptr(), ops.size(), userdata)
+            raw::fuse_lowlevel_new(
+                session_args.as_mut_ptr(),
+                ops.as_ptr(),
+                ops.size(),
+                userdata,
+            )
         })
         .ok_or_else(|| io::Error::other("macFUSE failed to create low-level session"))?;
         // SAFETY: `mount_point` and `args` are valid for this call.
         let channel =
-            NonNull::new(unsafe { raw::fuse_mount(mount_point.as_ptr(), args.as_mut_ptr()) });
+            NonNull::new(unsafe { raw::fuse_mount(mount_point.as_ptr(), mount_args.as_mut_ptr()) });
         match channel {
             Some(channel) => {
                 // SAFETY: Both pointers were returned by macFUSE and are live.
@@ -481,6 +590,18 @@ impl Session {
         unsafe { raw::fuse_session_exit(self.raw.as_ptr()) };
     }
 
+    /// Build a thread-safe handle that can request session loop shutdown.
+    pub fn exit_handle(&self) -> SessionExitHandle {
+        SessionExitHandle { raw: self.raw }
+    }
+
+    /// Build a VFS kernel invalidator for this mounted session.
+    pub fn kernel_invalidator(&self) -> Arc<dyn KernelInvalidator> {
+        Arc::new(MacFuseKernelInvalidator {
+            channel: self.channel,
+        })
+    }
+
     /// Run the low-level session loop on the current thread.
     pub fn run(&mut self) -> io::Result<()> {
         // SAFETY: `self.raw` is a live session owned by this wrapper for the
@@ -490,6 +611,65 @@ impl Session {
             Ok(())
         } else {
             Err(io::Error::from_raw_os_error(result.abs()))
+        }
+    }
+}
+
+/// Thread-safe handle used to request low-level session shutdown.
+#[derive(Clone, Copy, Debug)]
+pub struct SessionExitHandle {
+    raw: NonNull<raw::FuseSession>,
+}
+
+// SAFETY: `SessionExitHandle` is created only from a live `Session` and is used
+// by watcher threads that are joined before the session is dropped. The handle
+// exposes only `fuse_session_exit`, macFUSE's cross-thread shutdown request.
+unsafe impl Send for SessionExitHandle {}
+// SAFETY: Shared access cannot mutate Rust-owned state; see `Send` invariant.
+unsafe impl Sync for SessionExitHandle {}
+
+impl SessionExitHandle {
+    /// Ask the session loop to exit.
+    pub fn request_exit(self) {
+        // SAFETY: the handle is created from a live `Session` and used only by
+        // watchers that are joined before that session is dropped.
+        unsafe { raw::fuse_session_exit(self.raw.as_ptr()) };
+    }
+}
+
+struct MacFuseKernelInvalidator {
+    channel: NonNull<raw::FuseChan>,
+}
+
+// SAFETY: The invalidator is installed only while its owning `Session` is live
+// and is cleared before session drop. It only calls macFUSE notification APIs.
+unsafe impl Send for MacFuseKernelInvalidator {}
+// SAFETY: Concurrent invalidation calls go through macFUSE's channel API and do
+// not touch Rust-owned mutable state.
+unsafe impl Sync for MacFuseKernelInvalidator {}
+
+impl KernelInvalidator for MacFuseKernelInvalidator {
+    fn inval_inode(&self, ino: u64) {
+        self.inval_inode_range(ino, 0, -1);
+    }
+
+    fn inval_inode_attrs(&self, ino: u64) {
+        self.inval_inode_range(ino, -1, 0);
+    }
+}
+
+impl MacFuseKernelInvalidator {
+    fn inval_inode_range(&self, ino: u64, offset: off_t, len: off_t) {
+        // SAFETY: `channel` comes from a mounted macFUSE session. The invalidator
+        // is installed only while that session is live and cleared before drop.
+        let result = unsafe {
+            raw::fuse_lowlevel_notify_inval_inode(self.channel.as_ptr(), ino, offset, len)
+        };
+        if result != 0 && result != -libc::ENOENT {
+            debug!(
+                ino,
+                offset, len, result, "macFUSE inode invalidation failed"
+            );
         }
     }
 }
@@ -673,6 +853,15 @@ impl Reply {
         // SAFETY: `file_info` is initialized and borrowed for the duration of
         // the call; `self` consumes the single request reply.
         reply_result(unsafe { raw::fuse_reply_open(request.as_ptr(), &file_info) })
+    }
+
+    /// Reply with a newly created entry and open parameters.
+    pub fn create(mut self, entry: &Entry, open: OpenReply) -> io::Result<()> {
+        let request = self.request.take_raw();
+        let file_info = raw::FuseFileInfo::from_open_reply(open);
+        // SAFETY: `entry` and `file_info` are initialized and borrowed for the
+        // duration of the call; `self` consumes the single request reply.
+        reply_result(unsafe { raw::fuse_reply_create(request.as_ptr(), &entry.raw, &file_info) })
     }
 
     /// Reply with a read buffer.

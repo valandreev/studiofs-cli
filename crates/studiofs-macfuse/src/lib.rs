@@ -9,7 +9,10 @@
 
 use std::io;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 use studiofs_vfs::StudioVfs;
 use tokio::runtime::Handle;
@@ -30,6 +33,8 @@ pub struct MacFuseMountRequest {
     volume_name: String,
     read_only: bool,
     run_in_foreground: bool,
+    signal_handling: SignalHandling,
+    unmount_signal: Option<MacFuseUnmountSignal>,
 }
 
 impl MacFuseMountRequest {
@@ -47,6 +52,8 @@ impl MacFuseMountRequest {
             volume_name: volume_name.into(),
             read_only: false,
             run_in_foreground: false,
+            signal_handling: SignalHandling::default(),
+            unmount_signal: None,
         }
     }
 
@@ -61,6 +68,170 @@ impl MacFuseMountRequest {
         self.run_in_foreground = run_in_foreground;
         self
     }
+
+    /// Set process signal ownership policy.
+    pub fn with_signal_handling(mut self, signal_handling: SignalHandling) -> Self {
+        self.signal_handling = signal_handling;
+        self
+    }
+}
+
+/// Controls whether StudioFS owns process-global macFUSE shutdown signals.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum SignalHandling {
+    /// Do not install SIGINT/SIGTERM handlers.
+    #[default]
+    Disabled,
+    /// Install temporary SIGINT/SIGTERM handlers for the StudioFS CLI.
+    InstallForCli,
+}
+
+/// Caller-owned handle for requesting graceful macFUSE unmount.
+#[derive(Clone, Debug, Default)]
+pub struct MacFuseUnmountSignal {
+    requested: Arc<AtomicBool>,
+}
+
+impl MacFuseUnmountSignal {
+    /// Create a new unmount signal.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Request the mount session to unmount.
+    pub fn request_unmount(&self) {
+        self.requested.store(true, Ordering::Release);
+    }
+
+    /// Return whether unmount has been requested.
+    pub fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::Acquire)
+    }
+}
+
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+static CLI_SIGNAL_HANDLERS_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn shutdown_signal_handler(_sig: libc::c_int) {
+    SHUTDOWN_REQUESTED.store(true, Ordering::Release);
+}
+
+struct CliSignalHandlers {
+    previous_sigint: libc::sighandler_t,
+    previous_sigterm: libc::sighandler_t,
+}
+
+impl CliSignalHandlers {
+    fn install() -> io::Result<Self> {
+        CLI_SIGNAL_HANDLERS_INSTALLED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "macFUSE CLI signal handlers are already installed",
+                )
+            })?;
+        // SAFETY: this explicitly mutates process-global CLI signal disposition
+        // and restores the previous handlers in Drop.
+        unsafe {
+            let previous_sigint = libc::signal(
+                libc::SIGINT,
+                shutdown_signal_handler as *const () as libc::sighandler_t,
+            );
+            if previous_sigint == libc::SIG_ERR {
+                CLI_SIGNAL_HANDLERS_INSTALLED.store(false, Ordering::Release);
+                return Err(io::Error::last_os_error());
+            }
+            let previous_sigterm = libc::signal(
+                libc::SIGTERM,
+                shutdown_signal_handler as *const () as libc::sighandler_t,
+            );
+            if previous_sigterm == libc::SIG_ERR {
+                let _ = libc::signal(libc::SIGINT, previous_sigint);
+                CLI_SIGNAL_HANDLERS_INSTALLED.store(false, Ordering::Release);
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Self {
+                previous_sigint,
+                previous_sigterm,
+            })
+        }
+    }
+}
+
+impl Drop for CliSignalHandlers {
+    fn drop(&mut self) {
+        // SAFETY: these values came from successful `libc::signal` calls.
+        unsafe {
+            libc::signal(libc::SIGINT, self.previous_sigint);
+            libc::signal(libc::SIGTERM, self.previous_sigterm);
+        }
+        CLI_SIGNAL_HANDLERS_INSTALLED.store(false, Ordering::Release);
+    }
+}
+
+fn signal_handlers_for_policy(
+    signal_handling: SignalHandling,
+) -> io::Result<Option<CliSignalHandlers>> {
+    match signal_handling {
+        SignalHandling::Disabled => Ok(None),
+        SignalHandling::InstallForCli => CliSignalHandlers::install().map(Some),
+    }
+}
+
+struct SignalWatcher {
+    stop: Arc<AtomicBool>,
+    handlers: Arc<Mutex<Option<CliSignalHandlers>>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for SignalWatcher {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Ok(mut handlers) = self.handlers.lock() {
+            let _ = handlers.take();
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn spawn_signal_watcher(
+    exit_handle: low_level::SessionExitHandle,
+    signal_handling: SignalHandling,
+    unmount_signal: Option<MacFuseUnmountSignal>,
+) -> io::Result<SignalWatcher> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let handlers = Arc::new(Mutex::new(signal_handlers_for_policy(signal_handling)?));
+    let watcher_stop = Arc::clone(&stop);
+    let watcher_handlers = Arc::clone(&handlers);
+    let thread = std::thread::Builder::new()
+        .name("macfuse-signal-watcher".into())
+        .spawn(move || {
+            while !watcher_stop.load(Ordering::Acquire)
+                && !SHUTDOWN_REQUESTED.load(Ordering::Acquire)
+                && !unmount_signal
+                    .as_ref()
+                    .is_some_and(MacFuseUnmountSignal::is_requested)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            if watcher_stop.load(Ordering::Acquire) {
+                return;
+            }
+            if SHUTDOWN_REQUESTED.load(Ordering::Acquire)
+                && let Ok(mut handlers) = watcher_handlers.lock()
+            {
+                let _ = handlers.take();
+            }
+            exit_handle.request_exit();
+        })?;
+    Ok(SignalWatcher {
+        stop,
+        handlers,
+        thread: Some(thread),
+    })
 }
 
 /// Start serving the macOS native bridge.
@@ -74,11 +245,17 @@ pub fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()> {
         volume_name,
         read_only,
         run_in_foreground,
+        signal_handling,
+        unmount_signal,
     } = request;
     let config = low_level::SessionConfig::new(mount_point, volume_name)
         .with_read_only(read_only)
         .with_run_in_foreground(run_in_foreground);
-    let mut callback_state = Box::new(adapter::CallbackState::new(vfs, runtime_handle, read_only));
+    let mut callback_state = Box::new(adapter::CallbackState::new(
+        Arc::clone(&vfs),
+        runtime_handle,
+        read_only,
+    ));
     let userdata =
         (&mut *callback_state) as *mut adapter::CallbackState as *mut std::os::raw::c_void;
     // SAFETY: `callback_state` remains boxed and live until after the mounted
@@ -90,7 +267,12 @@ pub fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()> {
             userdata,
         )
     }?;
+    SHUTDOWN_REQUESTED.store(false, Ordering::Release);
+    let _signal_watcher =
+        spawn_signal_watcher(session.exit_handle(), signal_handling, unmount_signal)?;
+    vfs.set_kernel_invalidator(session.kernel_invalidator());
     let result = session.run();
+    vfs.clear_kernel_invalidator();
     drop(session);
     drop(callback_state);
     result
@@ -108,6 +290,8 @@ fn studio_vfs_ops_for_read_only(read_only: bool) -> low_level::LowLevelOperation
 mod tests {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
+
+    use studiofs_meta::MetaFsOps;
 
     #[test]
     fn callback_file_info_snapshot_is_independent_from_callback_pointer() {
@@ -157,6 +341,7 @@ mod tests {
             .with_run_in_foreground(true);
 
         let args = config.argv_strings();
+        let mount_args = config.mount_argv_strings();
 
         assert_eq!(
             config.mount_point().as_os_str(),
@@ -165,10 +350,37 @@ mod tests {
         assert_eq!(config.volume_name(), "StudioFS Native");
         assert!(config.run_in_foreground());
         assert!(args.iter().any(|arg| arg == "studiofs-macfuse"));
+        assert!(
+            mount_args
+                .iter()
+                .any(|arg| arg == "-ovolname=StudioFS Native")
+        );
+        assert!(mount_args.iter().any(|arg| arg == "-olocal"));
+        assert!(mount_args.iter().any(|arg| arg == "-onovncache"));
+        assert!(mount_args.iter().any(|arg| arg == "-odaemon_timeout=60"));
+        assert!(mount_args.iter().any(|arg| arg == "-oiosize=1048576"));
+        assert!(mount_args.iter().any(|arg| arg == "-osparse"));
+        assert!(!mount_args.iter().any(|arg| arg == "-odirect_io"));
+        assert!(!mount_args.iter().any(|arg| arg == "-onolocalcaches"));
         assert!(!args.iter().any(|arg| arg == "-f"));
         assert!(!args.iter().any(|arg| arg == "-oro"));
         assert!(!args.iter().any(|arg| arg == "ro"));
         assert!(!args.iter().any(|arg| arg.contains("StudioFS Native")));
+    }
+
+    #[test]
+    fn session_config_builds_direct_cache_policy_mount_arguments_for_rollback_runs() {
+        let config = super::low_level::SessionConfig::new("/Volumes/Studio FS", "StudioFS Native");
+
+        let mount_args = config
+            .mount_argv_strings_with_cache_policy(super::low_level::MacosFuseCachePolicy::Direct);
+
+        assert!(mount_args.iter().any(|arg| arg == "-odirect_io"));
+        assert!(mount_args.iter().any(|arg| arg == "-onolocalcaches"));
+        assert!(mount_args.iter().any(|arg| arg == "-oauto_cache"));
+        assert!(mount_args.iter().any(|arg| arg == "-osparse"));
+        assert!(!mount_args.iter().any(|arg| arg == "-onovncache"));
+        assert!(!mount_args.iter().any(|arg| arg == "-oiosize=1048576"));
     }
 
     #[test]
@@ -199,6 +411,18 @@ mod tests {
     fn studio_vfs_low_level_ops_include_native_xattr_callbacks() {
         assert!(super::low_level::LowLevelOperations::studio_vfs().has_xattr_callbacks());
         assert!(super::low_level::LowLevelOperations::read_only_studio_vfs().has_xattr_callbacks());
+    }
+
+    #[test]
+    fn studio_vfs_low_level_ops_install_connection_init_callback() {
+        assert!(super::low_level::LowLevelOperations::studio_vfs().has_init_callback());
+        assert!(super::low_level::LowLevelOperations::read_only_studio_vfs().has_init_callback());
+    }
+
+    #[test]
+    fn writable_studio_vfs_low_level_ops_install_rmdir_callback() {
+        assert!(super::low_level::LowLevelOperations::studio_vfs().has_rmdir_callback());
+        assert!(!super::low_level::LowLevelOperations::read_only_studio_vfs().has_rmdir_callback());
     }
 
     #[test]
@@ -404,7 +628,7 @@ mod tests {
             .flush(attr.ino, writer.file_handle())
             .expect("flush writable handle through macFUSE adapter");
         adapter
-            .fsync(attr.ino, false)
+            .fsync(Some(writer.file_handle()), attr.ino, false)
             .expect("fsync inode through macFUSE adapter");
         let truncated = adapter
             .set_len(Some(writer.file_handle()), attr.ino, 5)
@@ -421,6 +645,103 @@ mod tests {
 
         assert_eq!(truncated.size, 5);
         assert_eq!(&bytes[..], b"hello");
+    }
+
+    #[test]
+    fn adapter_handle_backed_fsync_survives_unlink_of_open_file() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-adapter-open-unlink-fsync",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"open-unlink.txt",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let writer = adapter
+            .open(attr.ino, libc::O_RDWR)
+            .expect("open writable handle through macFUSE adapter");
+
+        let initial = b"open handle payload";
+        adapter
+            .write(attr.ino, writer.file_handle(), 0, initial)
+            .expect("write initial payload through macFUSE adapter");
+        adapter
+            .fsync(Some(writer.file_handle()), attr.ino, false)
+            .expect("seed fsync should persist initial payload");
+        fixture
+            .meta()
+            .unlink(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"open-unlink.txt",
+            )
+            .expect("unlink file while handle is open");
+
+        adapter
+            .write(
+                attr.ino,
+                writer.file_handle(),
+                initial.len() as i64,
+                b" after unlink",
+            )
+            .expect("write through open handle after foreign unlink");
+
+        adapter
+            .fsync(Some(writer.file_handle()), attr.ino, false)
+            .expect("handle-backed fsync should not depend on removed namespace entry");
+    }
+
+    #[test]
+    fn adapter_rmdir_removes_empty_directory_and_respects_read_only() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-adapter-rmdir")
+                .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let read_only_adapter = super::adapter::StudioVfsAdapter::new_with_read_only(
+            vfs.clone(),
+            fixture.runtime().handle().clone(),
+            true,
+        );
+
+        adapter
+            .mkdir(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"empty-dir",
+                0o755,
+            )
+            .expect("create directory through macFUSE adapter");
+        assert_eq!(
+            read_only_adapter
+                .rmdir(
+                    studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                    b"empty-dir",
+                )
+                .unwrap_err(),
+            libc::EROFS
+        );
+        adapter
+            .rmdir(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"empty-dir",
+            )
+            .expect("remove empty directory through macFUSE adapter");
+
+        assert!(
+            vfs.lookup(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"empty-dir",
+            )
+            .is_err()
+        );
     }
 
     #[test]

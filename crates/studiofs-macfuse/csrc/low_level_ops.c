@@ -6,6 +6,23 @@ static const struct fuse_lowlevel_ops STUDIOFS_EMPTY_LOW_LEVEL_OPS = {0};
 
 extern void studiofs_macfuse_lookup(fuse_req_t req, fuse_ino_t parent, const char *name);
 extern void studiofs_macfuse_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi);
+extern void studiofs_macfuse_mkdir(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode);
+extern void studiofs_macfuse_symlink(fuse_req_t req,
+                                     const char *target,
+                                     fuse_ino_t parent,
+                                     const char *name);
+extern void studiofs_macfuse_create(fuse_req_t req,
+                                    fuse_ino_t parent,
+                                    const char *name,
+                                    mode_t mode,
+                                    struct fuse_file_info *fi);
+extern void studiofs_macfuse_unlink(fuse_req_t req, fuse_ino_t parent, const char *name);
+extern void studiofs_macfuse_rmdir(fuse_req_t req, fuse_ino_t parent, const char *name);
+extern void studiofs_macfuse_rename(fuse_req_t req,
+                                    fuse_ino_t parent,
+                                    const char *name,
+                                    fuse_ino_t newparent,
+                                    const char *newname);
 extern void studiofs_macfuse_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi);
 extern void studiofs_macfuse_read(fuse_req_t req,
                                   fuse_ino_t ino,
@@ -50,8 +67,10 @@ extern void studiofs_macfuse_getxattr(fuse_req_t req,
                                       uint32_t position);
 extern void studiofs_macfuse_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size);
 extern void studiofs_macfuse_removexattr(fuse_req_t req, fuse_ino_t ino, const char *name);
+extern void studiofs_macfuse_init(void *userdata, struct fuse_conn_info *conn);
 
 static const struct fuse_lowlevel_ops STUDIOFS_READ_ONLY_LOW_LEVEL_OPS = {
+    .init = studiofs_macfuse_init,
     .lookup = studiofs_macfuse_lookup,
     .getattr = studiofs_macfuse_getattr,
     .open = studiofs_macfuse_open,
@@ -64,12 +83,16 @@ static const struct fuse_lowlevel_ops STUDIOFS_READ_ONLY_LOW_LEVEL_OPS = {
     .listxattr = studiofs_macfuse_listxattr,
 };
 
-// SFS-482 intentionally enables existing-file writeback only. Namespace
-// mutation callbacks (create, mkdir, unlink, rmdir, rename) remain out of this
-// table until the follow-up bridge phase wires those semantics explicitly.
 static const struct fuse_lowlevel_ops STUDIOFS_LOW_LEVEL_OPS = {
+    .init = studiofs_macfuse_init,
     .lookup = studiofs_macfuse_lookup,
     .getattr = studiofs_macfuse_getattr,
+    .mkdir = studiofs_macfuse_mkdir,
+    .symlink = studiofs_macfuse_symlink,
+    .create = studiofs_macfuse_create,
+    .unlink = studiofs_macfuse_unlink,
+    .rmdir = studiofs_macfuse_rmdir,
+    .rename = studiofs_macfuse_rename,
     .setattr = studiofs_macfuse_setattr,
     .open = studiofs_macfuse_open,
     .read = studiofs_macfuse_read,
@@ -110,6 +133,29 @@ int studiofs_macfuse_low_level_ops_has_xattr_callbacks(const struct fuse_lowleve
 int studiofs_macfuse_low_level_ops_has_read_only_xattr_callbacks(const struct fuse_lowlevel_ops *ops) {
     return ops != NULL && ops->getxattr != NULL && ops->listxattr != NULL &&
            ops->setxattr == NULL && ops->removexattr == NULL;
+}
+
+int studiofs_macfuse_low_level_ops_has_init_callback(const struct fuse_lowlevel_ops *ops) {
+    return ops != NULL && ops->init != NULL;
+}
+
+int studiofs_macfuse_low_level_ops_has_rmdir_callback(const struct fuse_lowlevel_ops *ops) {
+    return ops != NULL && ops->rmdir != NULL;
+}
+
+void studiofs_macfuse_conn_info_configure(struct fuse_conn_info *conn,
+                                          unsigned max_write,
+                                          unsigned max_readahead) {
+    if (conn == NULL) {
+        return;
+    }
+    /* A zero argument means "leave the macFUSE-provided value unchanged". */
+    if (max_write > 0) {
+        conn->max_write = max_write;
+    }
+    if (max_readahead > 0) {
+        conn->max_readahead = max_readahead;
+    }
 }
 
 void studiofs_macfuse_file_info_init(struct fuse_file_info *info,
