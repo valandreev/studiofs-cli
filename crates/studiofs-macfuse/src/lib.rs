@@ -404,7 +404,7 @@ mod tests {
             .flush(attr.ino, writer.file_handle())
             .expect("flush writable handle through macFUSE adapter");
         adapter
-            .fsync(attr.ino, false)
+            .fsync(Some(writer.file_handle()), attr.ino, false)
             .expect("fsync inode through macFUSE adapter");
         let truncated = adapter
             .set_len(Some(writer.file_handle()), attr.ino, 5)
@@ -421,6 +421,42 @@ mod tests {
 
         assert_eq!(truncated.size, 5);
         assert_eq!(&bytes[..], b"hello");
+    }
+
+    #[test]
+    fn adapter_handle_backed_fsync_survives_unlink_of_open_file() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-adapter-open-unlink-fsync",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"open-unlink.txt",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let writer = adapter
+            .open(attr.ino, libc::O_RDWR)
+            .expect("open writable handle through macFUSE adapter");
+
+        adapter
+            .write(attr.ino, writer.file_handle(), 0, b"open handle payload")
+            .expect("write payload through macFUSE adapter");
+        vfs.unlink(
+            studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+            b"open-unlink.txt",
+        )
+        .expect("unlink file while handle is open");
+
+        adapter
+            .fsync(Some(writer.file_handle()), attr.ino, false)
+            .expect("handle-backed fsync should not depend on removed namespace entry");
     }
 
     #[test]

@@ -154,11 +154,19 @@ impl StudioVfsAdapter {
             .map_err(|error| vfs_err_to_errno(&error))
     }
 
-    /// Synchronize file data for an inode.
-    pub(crate) fn fsync(&self, ino: u64, datasync: bool) -> Result<(), i32> {
-        self.runtime_handle
-            .block_on(self.vfs.fsync(ino, datasync))
-            .map_err(|error| vfs_err_to_errno(&error))
+    /// Synchronize file data for a handle when available, otherwise for an inode.
+    pub(crate) fn fsync(
+        &self,
+        file_handle: Option<u64>,
+        ino: u64,
+        datasync: bool,
+    ) -> Result<(), i32> {
+        let result = if let Some(file_handle) = file_handle.filter(|handle| *handle != 0) {
+            self.runtime_handle.block_on(self.vfs.flush_fh(file_handle))
+        } else {
+            self.runtime_handle.block_on(self.vfs.fsync(ino, datasync))
+        };
+        result.map_err(|error| vfs_err_to_errno(&error))
     }
 
     /// Change a file length through the VFS setattr path.
@@ -869,13 +877,19 @@ pub extern "C" fn studiofs_macfuse_fsync(
     req: *mut raw::FuseReq,
     ino: raw::FuseIno,
     datasync: libc::c_int,
-    _fi: *mut raw::FuseFileInfo,
+    fi: *mut raw::FuseFileInfo,
 ) {
     let Some(state) = callback_state(req) else {
         reply_error(req, libc::EIO);
         return;
     };
-    match state.adapter.fsync(ino, datasync != 0) {
+    let file_handle = if fi.is_null() {
+        None
+    } else {
+        // SAFETY: macFUSE passes a valid `fuse_file_info` pointer for handle-backed fsync.
+        Some(unsafe { (*fi).fh })
+    };
+    match state.adapter.fsync(file_handle, ino, datasync != 0) {
         Ok(()) => reply_error(req, 0),
         Err(errno) => reply_error(req, errno),
     }
