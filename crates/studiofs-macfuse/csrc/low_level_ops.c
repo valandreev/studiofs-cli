@@ -149,6 +149,7 @@ void studiofs_macfuse_conn_info_configure(struct fuse_conn_info *conn,
     if (conn == NULL) {
         return;
     }
+    /* A zero argument means "leave the macFUSE-provided value unchanged". */
     if (max_write > 0) {
         conn->max_write = max_write;
     }

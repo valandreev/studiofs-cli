@@ -44,12 +44,11 @@ fn validate_volume_name(volume_name: &str) -> Result<(), MountOptionError> {
 
 fn build_mount_options(
     volume_name: &str,
-    foreground: bool,
+    _foreground: bool,
     read_only: bool,
 ) -> Result<Vec<fuser::MountOption>, MountOptionError> {
     build_mount_options_with_allow_other(
         volume_name,
-        foreground,
         read_only,
         std::env::var("STUDIOFS_FUSE_ALLOW_OTHER").as_deref() == Ok("1"),
     )
@@ -57,7 +56,6 @@ fn build_mount_options(
 
 fn build_mount_options_with_allow_other(
     volume_name: &str,
-    _foreground: bool,
     read_only: bool,
     allow_other_env: bool,
 ) -> Result<Vec<fuser::MountOption>, MountOptionError> {
@@ -438,7 +436,7 @@ mod tests {
     #[test]
     fn build_mount_options_sets_core_fuse_flags() {
         let options =
-            build_mount_options_with_allow_other("studiofs", false, false, false).expect("options");
+            build_mount_options_with_allow_other("studiofs", false, false).expect("options");
         assert!(
             options
                 .iter()
@@ -543,7 +541,7 @@ mod tests {
     #[test]
     fn build_mount_options_adds_allow_other_when_opted_in() {
         let options =
-            build_mount_options_with_allow_other("studiofs", false, false, true).expect("options");
+            build_mount_options_with_allow_other("studiofs", false, true).expect("options");
         assert!(mount_options_include_allow_other(&options));
     }
 
@@ -551,8 +549,7 @@ mod tests {
     fn build_mount_options_foreground_not_added() {
         // On Linux, fusermount3 does not accept 'foreground' as a mount option.
         // fuser keeps the process in the foreground via session.run() itself.
-        let options =
-            build_mount_options_with_allow_other("studiofs", true, false, false).expect("options");
+        let options = build_mount_options("studiofs", true, false).expect("options");
         assert!(!options.iter().any(
             |opt| matches!(opt, fuser::MountOption::CUSTOM(custom) if custom == "foreground")
         ));

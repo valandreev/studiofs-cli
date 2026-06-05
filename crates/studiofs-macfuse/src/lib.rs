@@ -188,7 +188,9 @@ struct SignalWatcher {
 impl Drop for SignalWatcher {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
-        let _ = self.handlers.lock().expect("signal handler lock").take();
+        if let Ok(mut handlers) = self.handlers.lock() {
+            let _ = handlers.take();
+        }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -196,7 +198,6 @@ impl Drop for SignalWatcher {
 }
 
 fn spawn_signal_watcher(
-    _mount_point: String,
     exit_handle: low_level::SessionExitHandle,
     signal_handling: SignalHandling,
     unmount_signal: Option<MacFuseUnmountSignal>,
@@ -220,7 +221,9 @@ fn spawn_signal_watcher(
                 return;
             }
             SHUTDOWN_REQUESTED.store(true, Ordering::Release);
-            let _ = watcher_handlers.lock().expect("signal handler lock").take();
+            if let Ok(mut handlers) = watcher_handlers.lock() {
+                let _ = handlers.take();
+            }
             exit_handle.request_exit();
         })?;
     Ok(SignalWatcher {
@@ -264,12 +267,8 @@ pub fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()> {
         )
     }?;
     SHUTDOWN_REQUESTED.store(false, Ordering::Release);
-    let _signal_watcher = spawn_signal_watcher(
-        config.mount_point().to_string_lossy().into_owned(),
-        session.exit_handle(),
-        signal_handling,
-        unmount_signal,
-    )?;
+    let _signal_watcher =
+        spawn_signal_watcher(session.exit_handle(), signal_handling, unmount_signal)?;
     vfs.set_kernel_invalidator(session.kernel_invalidator());
     let result = session.run();
     vfs.clear_kernel_invalidator();

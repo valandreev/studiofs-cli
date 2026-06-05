@@ -143,6 +143,7 @@ pub struct PgMetaEngine {
     inode_id_headroom_available: AtomicBool,
     janitor_lock: Mutex<Option<PgJanitorLock>>,
     file_lock_schema_ensured: AtomicBool,
+    file_lock_schema_ensure_lock: Mutex<()>,
     file_lock_cache: Mutex<HashMap<Ino, FileLockLease>>,
     held_file_locks: Mutex<HashMap<Ino, HeldFileLockLease>>,
     active_open_inodes: Mutex<HashMap<Ino, u32>>,
@@ -382,6 +383,16 @@ impl PgMetaEngine {
             return Ok(());
         }
 
+        let _guard = self.file_lock_schema_ensure_lock.lock().map_err(|_| {
+            MetaError::Storage("postgres file lock lease schema ensure lock poisoned".to_string())
+        })?;
+        if self
+            .file_lock_schema_ensured
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(());
+        }
+
         Self::ensure_file_lock_lease_schema(
             &self.postgres_url,
             self.connect_timeout,
@@ -494,6 +505,7 @@ impl PgMetaEngine {
             inode_id_headroom_available: AtomicBool::new(true),
             janitor_lock: Mutex::new(None),
             file_lock_schema_ensured: AtomicBool::new(false),
+            file_lock_schema_ensure_lock: Mutex::new(()),
             file_lock_cache: Mutex::new(HashMap::new()),
             held_file_locks: Mutex::new(HashMap::new()),
             active_open_inodes: Mutex::new(HashMap::new()),

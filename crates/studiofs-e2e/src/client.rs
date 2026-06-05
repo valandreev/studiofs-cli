@@ -1017,23 +1017,11 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         }
     }
 
-    #[cfg(target_os = "macos")]
     fn cleanup_stale_mount_after_force_kill(
         &self,
         index: usize,
     ) -> Result<(), ClientControllerError> {
-        let command = self.mount_command(index)?;
-        self.executor
-            .cleanup_stale_mount_before_remount(&command)
-            .map_err(ClientControllerError::Io)
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    fn cleanup_stale_mount_after_force_kill(
-        &self,
-        _index: usize,
-    ) -> Result<(), ClientControllerError> {
-        Ok(())
+        self.cleanup_stale_mount(index)
     }
 
     /// Sends best-effort termination to all tracked client processes without
@@ -1209,11 +1197,15 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         Ok(())
     }
 
-    #[cfg(target_os = "macos")]
     fn cleanup_stale_mount_after_process_exit(
         &self,
         index: usize,
     ) -> Result<(), ClientControllerError> {
+        self.cleanup_stale_mount(index)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn cleanup_stale_mount(&self, index: usize) -> Result<(), ClientControllerError> {
         let command = self.mount_command(index)?;
         self.executor
             .cleanup_stale_mount_before_remount(&command)
@@ -1221,10 +1213,7 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
     }
 
     #[cfg(not(target_os = "macos"))]
-    fn cleanup_stale_mount_after_process_exit(
-        &self,
-        _index: usize,
-    ) -> Result<(), ClientControllerError> {
+    fn cleanup_stale_mount(&self, _index: usize) -> Result<(), ClientControllerError> {
         Ok(())
     }
 

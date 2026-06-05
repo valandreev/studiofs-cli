@@ -16,6 +16,7 @@ use std::sync::Arc;
 use libc::{off_t, size_t, stat, statvfs};
 use studiofs_vfs::KernelInvalidator;
 use thiserror::Error;
+use tracing::debug;
 
 const DEFAULT_FUSE_MAX_WRITE_BYTES: u32 = 16 * 1024 * 1024;
 const DEFAULT_FUSE_MAX_READAHEAD_BYTES: u32 = 16 * 1024 * 1024;
@@ -591,15 +592,13 @@ impl Session {
 
     /// Build a thread-safe handle that can request session loop shutdown.
     pub fn exit_handle(&self) -> SessionExitHandle {
-        SessionExitHandle {
-            raw: self.raw.as_ptr() as usize,
-        }
+        SessionExitHandle { raw: self.raw }
     }
 
     /// Build a VFS kernel invalidator for this mounted session.
     pub fn kernel_invalidator(&self) -> Arc<dyn KernelInvalidator> {
         Arc::new(MacFuseKernelInvalidator {
-            channel: self.channel.as_ptr() as usize,
+            channel: self.channel,
         })
     }
 
@@ -619,21 +618,35 @@ impl Session {
 /// Thread-safe handle used to request low-level session shutdown.
 #[derive(Clone, Copy, Debug)]
 pub struct SessionExitHandle {
-    raw: usize,
+    raw: NonNull<raw::FuseSession>,
 }
+
+// SAFETY: `SessionExitHandle` is created only from a live `Session` and is used
+// by watcher threads that are joined before the session is dropped. The handle
+// exposes only `fuse_session_exit`, macFUSE's cross-thread shutdown request.
+unsafe impl Send for SessionExitHandle {}
+// SAFETY: Shared access cannot mutate Rust-owned state; see `Send` invariant.
+unsafe impl Sync for SessionExitHandle {}
 
 impl SessionExitHandle {
     /// Ask the session loop to exit.
     pub fn request_exit(self) {
         // SAFETY: the handle is created from a live `Session` and used only by
         // watchers that are joined before that session is dropped.
-        unsafe { raw::fuse_session_exit(self.raw as *mut raw::FuseSession) };
+        unsafe { raw::fuse_session_exit(self.raw.as_ptr()) };
     }
 }
 
 struct MacFuseKernelInvalidator {
-    channel: usize,
+    channel: NonNull<raw::FuseChan>,
 }
+
+// SAFETY: The invalidator is installed only while its owning `Session` is live
+// and is cleared before session drop. It only calls macFUSE notification APIs.
+unsafe impl Send for MacFuseKernelInvalidator {}
+// SAFETY: Concurrent invalidation calls go through macFUSE's channel API and do
+// not touch Rust-owned mutable state.
+unsafe impl Sync for MacFuseKernelInvalidator {}
 
 impl KernelInvalidator for MacFuseKernelInvalidator {
     fn inval_inode(&self, ino: u64) {
@@ -649,14 +662,15 @@ impl MacFuseKernelInvalidator {
     fn inval_inode_range(&self, ino: u64, offset: off_t, len: off_t) {
         // SAFETY: `channel` comes from a mounted macFUSE session. The invalidator
         // is installed only while that session is live and cleared before drop.
-        let _ = unsafe {
-            raw::fuse_lowlevel_notify_inval_inode(
-                self.channel as *mut raw::FuseChan,
-                ino,
-                offset,
-                len,
-            )
+        let result = unsafe {
+            raw::fuse_lowlevel_notify_inval_inode(self.channel.as_ptr(), ino, offset, len)
         };
+        if result != 0 && result != -libc::ENOENT {
+            debug!(
+                ino,
+                offset, len, result, "macFUSE inode invalidation failed"
+            );
+        }
     }
 }
 
