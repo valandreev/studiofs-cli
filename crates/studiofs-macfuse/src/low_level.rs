@@ -7,7 +7,7 @@
 use std::ffi::{CString, OsStr};
 use std::io;
 use std::mem::MaybeUninit;
-use std::os::raw::{c_char, c_double, c_int, c_ulong, c_void};
+use std::os::raw::{c_char, c_double, c_int, c_uint, c_ulong, c_void};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
@@ -17,6 +17,8 @@ use libc::{off_t, size_t, stat, statvfs};
 use studiofs_vfs::KernelInvalidator;
 use thiserror::Error;
 
+const DEFAULT_FUSE_MAX_WRITE_BYTES: u32 = 16 * 1024 * 1024;
+const DEFAULT_FUSE_MAX_READAHEAD_BYTES: u32 = 16 * 1024 * 1024;
 const MACOS_FUSE_IOSIZE_BYTES: u32 = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +50,9 @@ pub(crate) mod raw {
 
     /// Opaque low-level FUSE channel handle.
     pub enum FuseChan {}
+
+    /// Opaque low-level FUSE connection information handle.
+    pub enum FuseConnInfo {}
 
     /// Opaque low-level FUSE argument vector.
     #[repr(C)]
@@ -226,6 +231,13 @@ unsafe extern "C" {
     fn studiofs_macfuse_low_level_ops_has_read_only_xattr_callbacks(
         ops: *const raw::FuseLowLevelOps,
     ) -> c_int;
+    #[cfg(test)]
+    fn studiofs_macfuse_low_level_ops_has_init_callback(ops: *const raw::FuseLowLevelOps) -> c_int;
+    fn studiofs_macfuse_conn_info_configure(
+        conn: *mut raw::FuseConnInfo,
+        max_write: c_uint,
+        max_readahead: c_uint,
+    );
     fn studiofs_macfuse_file_info_init(
         info: *mut raw::FuseFileInfo,
         flags: c_int,
@@ -248,6 +260,20 @@ unsafe extern "C" {
     pub(crate) fn studiofs_macfuse_setattr_chgtime_mask() -> c_int;
     pub(crate) fn studiofs_macfuse_setattr_bkuptime_mask() -> c_int;
     pub(crate) fn studiofs_macfuse_setattr_flags_mask() -> c_int;
+}
+
+/// Configure macFUSE connection-level I/O sizing for the low-level bridge.
+#[unsafe(no_mangle)]
+pub extern "C" fn studiofs_macfuse_init(_userdata: *mut c_void, conn: *mut raw::FuseConnInfo) {
+    // SAFETY: macFUSE passes a live `fuse_conn_info` pointer for this callback;
+    // the C shim writes only documented connection size fields.
+    unsafe {
+        studiofs_macfuse_conn_info_configure(
+            conn,
+            DEFAULT_FUSE_MAX_WRITE_BYTES,
+            DEFAULT_FUSE_MAX_READAHEAD_BYTES,
+        );
+    }
 }
 
 /// Low-level callback operation table provided by macFUSE headers.
@@ -312,6 +338,12 @@ impl LowLevelOperations {
             studiofs_macfuse_low_level_ops_has_xattr_callbacks(self.raw) != 0
                 || studiofs_macfuse_low_level_ops_has_read_only_xattr_callbacks(self.raw) != 0
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_init_callback(self) -> bool {
+        // SAFETY: The C shim only inspects callback pointers in a static table.
+        unsafe { studiofs_macfuse_low_level_ops_has_init_callback(self.raw) != 0 }
     }
 }
 

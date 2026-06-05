@@ -242,6 +242,7 @@ pub(super) use performance_probe::{MountedFuseWriteBaseline, MountedPerformanceP
 pub(super) use performance_probe::{
     PerformanceProbeConfig, PerformanceProbeConfigSummary, PerformanceProbeSeedMode,
     push_read_only_bridge_mount_arg_overrides, push_read_only_bridge_mount_overrides,
+    seeded_vfs_cache_budget_bytes,
 };
 pub(super) use smoke_outage::*;
 #[cfg(test)]

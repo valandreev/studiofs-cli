@@ -66,8 +66,10 @@ extern void studiofs_macfuse_getxattr(fuse_req_t req,
                                       uint32_t position);
 extern void studiofs_macfuse_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size);
 extern void studiofs_macfuse_removexattr(fuse_req_t req, fuse_ino_t ino, const char *name);
+extern void studiofs_macfuse_init(void *userdata, struct fuse_conn_info *conn);
 
 static const struct fuse_lowlevel_ops STUDIOFS_READ_ONLY_LOW_LEVEL_OPS = {
+    .init = studiofs_macfuse_init,
     .lookup = studiofs_macfuse_lookup,
     .getattr = studiofs_macfuse_getattr,
     .open = studiofs_macfuse_open,
@@ -81,6 +83,7 @@ static const struct fuse_lowlevel_ops STUDIOFS_READ_ONLY_LOW_LEVEL_OPS = {
 };
 
 static const struct fuse_lowlevel_ops STUDIOFS_LOW_LEVEL_OPS = {
+    .init = studiofs_macfuse_init,
     .lookup = studiofs_macfuse_lookup,
     .getattr = studiofs_macfuse_getattr,
     .mkdir = studiofs_macfuse_mkdir,
@@ -128,6 +131,24 @@ int studiofs_macfuse_low_level_ops_has_xattr_callbacks(const struct fuse_lowleve
 int studiofs_macfuse_low_level_ops_has_read_only_xattr_callbacks(const struct fuse_lowlevel_ops *ops) {
     return ops != NULL && ops->getxattr != NULL && ops->listxattr != NULL &&
            ops->setxattr == NULL && ops->removexattr == NULL;
+}
+
+int studiofs_macfuse_low_level_ops_has_init_callback(const struct fuse_lowlevel_ops *ops) {
+    return ops != NULL && ops->init != NULL;
+}
+
+void studiofs_macfuse_conn_info_configure(struct fuse_conn_info *conn,
+                                          unsigned max_write,
+                                          unsigned max_readahead) {
+    if (conn == NULL) {
+        return;
+    }
+    if (max_write > 0) {
+        conn->max_write = max_write;
+    }
+    if (max_readahead > 0) {
+        conn->max_readahead = max_readahead;
+    }
 }
 
 void studiofs_macfuse_file_info_init(struct fuse_file_info *info,

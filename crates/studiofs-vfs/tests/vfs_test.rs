@@ -12132,7 +12132,8 @@ fn foreground_read_baseline_during_and_post_upload_are_comparable() {
             during_throughput_mib_s >= MIN_DURING_UPLOAD_THROUGHPUT_MIB_S
                 || during_throughput_mib_s
                     >= baseline_throughput_mib_s * MIN_DURING_UPLOAD_BASELINE_RATIO,
-            "foreground read degraded too far during upload: baseline={baseline_throughput_mib_s:.2} MiB/s, during={during_throughput_mib_s:.2} MiB/s, post={post_throughput_mib_s:.2} MiB/s, need during >= {MIN_DURING_UPLOAD_THROUGHPUT_MIB_S:.2} MiB/s or >= {:.0}% of baseline, during_p90_ms={}, during_penalty_ms={}, during_cost={}, foreground_local_reads={}, foreground_local_read_bytes={}, foreground_local_read_io_ms={}, foreground_local_read_io_max_ms={}, upload_local_reads={}, upload_local_read_bytes={}, upload_hot_reads={}, upload_hot_bytes={}, upload_staged_reads={}, upload_staged_bytes={}, upload_fallback_rereads={}, upload_fallback_reread_bytes={}, upload_fallback_wait_ms={}, upload_fallback_read_ms={}",
+            "foreground read degraded too far during upload: baseline={baseline_throughput_mib_s:.2} MiB/s, during={during_throughput_mib_s:.2} MiB/s, post={post_throughput_mib_s:.2} MiB/s, need during >= {:.2} MiB/s or >= {:.0}% of baseline, during_p90_ms={}, during_penalty_ms={}, during_cost={}, foreground_local_reads={}, foreground_local_read_bytes={}, foreground_local_read_io_ms={}, foreground_local_read_io_max_ms={}, upload_local_reads={}, upload_local_read_bytes={}, upload_hot_reads={}, upload_hot_bytes={}, upload_staged_reads={}, upload_staged_bytes={}, upload_fallback_rereads={}, upload_fallback_reread_bytes={}, upload_fallback_wait_ms={}, upload_fallback_read_ms={}",
+            MIN_DURING_UPLOAD_THROUGHPUT_MIB_S,
             MIN_DURING_UPLOAD_BASELINE_RATIO * 100.0,
             during_stats
                 .p90_latency_ns
@@ -12159,7 +12160,8 @@ fn foreground_read_baseline_during_and_post_upload_are_comparable() {
             post_throughput_mib_s >= MIN_POST_UPLOAD_THROUGHPUT_MIB_S
                 || post_throughput_mib_s
                     >= baseline_throughput_mib_s * MIN_POST_UPLOAD_BASELINE_RATIO,
-            "post-upload throughput too low: need >= {MIN_POST_UPLOAD_THROUGHPUT_MIB_S:.2} MiB/s or recovery to >= {:.0}% of baseline; baseline={baseline_throughput_mib_s:.2} MiB/s, during={during_throughput_mib_s:.2} MiB/s, post={post_throughput_mib_s:.2} MiB/s",
+            "post-upload throughput too low: need >= {:.2} MiB/s or recovery to >= {:.0}% of baseline; baseline={baseline_throughput_mib_s:.2} MiB/s, during={during_throughput_mib_s:.2} MiB/s, post={post_throughput_mib_s:.2} MiB/s",
+            MIN_POST_UPLOAD_THROUGHPUT_MIB_S,
             MIN_POST_UPLOAD_BASELINE_RATIO * 100.0
         );
     });

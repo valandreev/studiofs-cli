@@ -414,6 +414,12 @@ mod tests {
     }
 
     #[test]
+    fn studio_vfs_low_level_ops_install_connection_init_callback() {
+        assert!(super::low_level::LowLevelOperations::studio_vfs().has_init_callback());
+        assert!(super::low_level::LowLevelOperations::read_only_studio_vfs().has_init_callback());
+    }
+
+    #[test]
     fn read_only_mount_uses_restricted_low_level_ops() {
         let read_only_ops = super::studio_vfs_ops_for_read_only(true);
         let writable_ops = super::studio_vfs_ops_for_read_only(false);

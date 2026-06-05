@@ -32,8 +32,8 @@ const PERFORMANCE_PROBE_SAMPLES_FILE: &str = "performance-probe-samples.ndjson";
 const WRITE_PATH_OBSERVABILITY_FILE: &str = "write_path_observability.json";
 const DEFAULT_FILE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const DEFAULT_CHUNK_BYTES: usize = 8 * 1024 * 1024;
-const SEEDED_VFS_MEMORY_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 const SEEDED_VFS_DIRTY_LIMIT_BYTES: u64 = 32 * 1024 * 1024;
+const SEEDED_VFS_CACHE_HEADROOM_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_READ_PASSES: u32 = 10;
 const DEFAULT_SAMPLE_DELAY_MS: u64 = 1_200;
 const DEFAULT_UPLOAD_DRAIN_TIMEOUT_SECS: u64 = 600;
@@ -343,11 +343,12 @@ fn seed_performance_probe_payload(
         .map_err(|error| ScenarioError::Io(std::io::Error::other(error)))?;
     let data_config = DataStoreConfig::from(&format_info);
     let cache_dir = client.cache_dir.to_string_lossy().into_owned();
+    let cache_budget_bytes = seeded_vfs_cache_budget_bytes(config.file_bytes);
     let vfs = StudioVfs::new(
         Arc::clone(&meta) as Arc<dyn studiofs_meta::MetaEngine>,
         &data_config,
         &cache_dir,
-        SEEDED_VFS_MEMORY_CACHE_BYTES,
+        cache_budget_bytes,
         SEEDED_VFS_DIRTY_LIMIT_BYTES,
         VfsConfigRaw::default()
             .validate()
@@ -391,6 +392,12 @@ fn seed_performance_probe_payload(
         .map_err(|error| ScenarioError::Io(std::io::Error::other(error)))?;
     vfs_guard.shutdown();
     Ok(())
+}
+
+pub(crate) fn seeded_vfs_cache_budget_bytes(file_bytes: u64) -> u64 {
+    file_bytes
+        .saturating_add(SEEDED_VFS_DIRTY_LIMIT_BYTES)
+        .saturating_add(SEEDED_VFS_CACHE_HEADROOM_BYTES)
 }
 
 struct SeedVfsShutdownGuard<'a> {
