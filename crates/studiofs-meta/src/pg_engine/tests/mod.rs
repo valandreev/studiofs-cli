@@ -507,6 +507,7 @@ pub(crate) fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
         janitor_lock: Mutex::new(None),
         file_lock_schema_ensured: AtomicBool::new(false),
         file_lock_schema_ensure_lock: Mutex::new(()),
+        file_lock_schema_last_failure: Mutex::new(None),
         file_lock_cache: Mutex::new(HashMap::new()),
         held_file_locks: Mutex::new(HashMap::new()),
         active_open_inodes: Mutex::new(HashMap::new()),

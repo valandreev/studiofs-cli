@@ -376,6 +376,37 @@ fn open_with_persisted_ranges_does_not_require_file_lock_schema() {
 }
 
 #[test]
+fn file_lock_schema_failure_uses_backoff_before_retrying() {
+    let _schema_error = set_schema_ensure_test_override(
+        "postgres file lock lease schema ensure failed: permission denied (sqlstate=42501)",
+    );
+    let (_dir, pg) = temp_pg_engine_for_unit();
+
+    let first = pg
+        .current_file_lock_lease(ROOT_INO)
+        .expect_err("first lock operation should report schema ensure failure");
+    assert!(
+        first
+            .to_string()
+            .contains("postgres file lock lease schema ensure failed: permission denied"),
+        "first failure should include original schema error, got: {first}"
+    );
+
+    let second = pg
+        .current_file_lock_lease(ROOT_INO)
+        .expect_err("second lock operation should use cached schema ensure failure");
+    let second = second.to_string();
+    assert!(
+        second.contains("recently failed"),
+        "second failure should use backoff fast path, got: {second}"
+    );
+    assert!(
+        second.contains("permission denied"),
+        "cached failure should preserve original error context, got: {second}"
+    );
+}
+
+#[test]
 fn next_inode_switches_to_prefetched_window_without_pg_roundtrip() {
     let (_dir, pg) = temp_pg_engine_for_unit();
 

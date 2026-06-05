@@ -1450,7 +1450,7 @@ fn metadata_background_poll_enabled_with<F>(read_var: F) -> bool
 where
     F: Fn(&str) -> Result<String, std::env::VarError>,
 {
-    !read_var(E2E_DISABLE_METADATA_BACKGROUND_POLL_ENV)
+    let disabled = read_var(E2E_DISABLE_METADATA_BACKGROUND_POLL_ENV)
         .ok()
         .as_deref()
         .map(str::trim)
@@ -1459,7 +1459,14 @@ where
                 || value.eq_ignore_ascii_case("true")
                 || value.eq_ignore_ascii_case("yes")
                 || value.eq_ignore_ascii_case("on")
-        })
+        });
+    if disabled && !cfg!(debug_assertions) {
+        warn!(
+            env = E2E_DISABLE_METADATA_BACKGROUND_POLL_ENV,
+            "metadata background polling disabled by environment"
+        );
+    }
+    !disabled
 }
 
 fn materialize_snapshot_mount_meta<M: ?Sized + SnapshotSourceMeta>(

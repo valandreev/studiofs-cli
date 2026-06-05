@@ -220,8 +220,9 @@ fn spawn_signal_watcher(
             if watcher_stop.load(Ordering::Acquire) {
                 return;
             }
-            SHUTDOWN_REQUESTED.store(true, Ordering::Release);
-            if let Ok(mut handlers) = watcher_handlers.lock() {
+            if SHUTDOWN_REQUESTED.load(Ordering::Acquire)
+                && let Ok(mut handlers) = watcher_handlers.lock()
+            {
                 let _ = handlers.take();
             }
             exit_handle.request_exit();
