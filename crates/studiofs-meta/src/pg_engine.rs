@@ -142,6 +142,7 @@ pub struct PgMetaEngine {
     inode_window_reservation_lock: Mutex<()>,
     inode_id_headroom_available: AtomicBool,
     janitor_lock: Mutex<Option<PgJanitorLock>>,
+    file_lock_schema_ensured: AtomicBool,
     file_lock_cache: Mutex<HashMap<Ino, FileLockLease>>,
     held_file_locks: Mutex<HashMap<Ino, HeldFileLockLease>>,
     active_open_inodes: Mutex<HashMap<Ino, u32>>,
@@ -373,17 +374,22 @@ impl PgMetaEngine {
         })
     }
 
-    fn is_transient_pg_schema_unavailability(error: &MetaError) -> bool {
-        match error {
-            MetaError::Storage(message) => {
-                !message.contains("sqlstate=")
-                    && (message.contains("postgres connect failed:")
-                        || message.contains("postgres ensure file lock lease schema timed out")
-                        || message.contains("postgres file lock lease schema")
-                            && message.contains("timed out"))
-            }
-            _ => false,
+    fn ensure_file_lock_lease_schema_ready(&self) -> MetaResult<()> {
+        if self
+            .file_lock_schema_ensured
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(());
         }
+
+        Self::ensure_file_lock_lease_schema(
+            &self.postgres_url,
+            self.connect_timeout,
+            self.command_timeout,
+        )?;
+        self.file_lock_schema_ensured
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
     }
 
     /// Open the PostgreSQL-backed metadata engine using default startup options.
@@ -437,21 +443,6 @@ impl PgMetaEngine {
         let connect_timeout = Self::default_connect_timeout();
         let command_timeout = Self::default_command_timeout();
         let persisted_client_slot = Self::load_persisted_client_slot(&local)?;
-        if let Err(error) =
-            Self::ensure_file_lock_lease_schema(&pg.url, connect_timeout, command_timeout)
-        {
-            let can_reopen_offline =
-                Self::has_persisted_inode_allocator_state(&local, persisted_client_slot)?
-                    && Self::is_transient_pg_schema_unavailability(&error);
-            if can_reopen_offline {
-                warn!(
-                    error = %error,
-                    "postgres lock schema unavailable during reopen; continuing from persisted local allocator state"
-                );
-            } else {
-                return Err(error);
-            }
-        }
 
         let client_slot = match persisted_client_slot {
             Some(slot) => slot,
@@ -502,6 +493,7 @@ impl PgMetaEngine {
             // `prime_local_id_ranges` failed silently (via `let _ = ...`).
             inode_id_headroom_available: AtomicBool::new(true),
             janitor_lock: Mutex::new(None),
+            file_lock_schema_ensured: AtomicBool::new(false),
             file_lock_cache: Mutex::new(HashMap::new()),
             held_file_locks: Mutex::new(HashMap::new()),
             active_open_inodes: Mutex::new(HashMap::new()),

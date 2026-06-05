@@ -505,6 +505,7 @@ pub(crate) fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
         inode_window_reservation_lock: Mutex::new(()),
         inode_id_headroom_available: AtomicBool::new(false),
         janitor_lock: Mutex::new(None),
+        file_lock_schema_ensured: AtomicBool::new(false),
         file_lock_cache: Mutex::new(HashMap::new()),
         held_file_locks: Mutex::new(HashMap::new()),
         active_open_inodes: Mutex::new(HashMap::new()),

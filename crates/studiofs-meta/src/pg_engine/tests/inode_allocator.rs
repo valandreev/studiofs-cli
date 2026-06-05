@@ -325,7 +325,7 @@ fn open_with_persisted_slot_without_ranges_still_requires_pg() {
 }
 
 #[test]
-fn open_with_persisted_ranges_does_not_mask_non_transient_schema_errors() {
+fn open_with_persisted_ranges_does_not_require_file_lock_schema() {
     let _schema_error = set_schema_ensure_test_override(
         "postgres file lock lease schema ensure failed: permission denied (sqlstate=42501)",
     );
@@ -361,10 +361,17 @@ fn open_with_persisted_ranges_does_not_mask_non_transient_schema_errors() {
         PgOpenOptions {
             background_poll: false,
         },
-    );
+    )
+    .expect("open must not require file-lock schema while no lock operation is requested");
+
+    let lock_error = reopened
+        .current_file_lock_lease(ROOT_INO)
+        .expect_err("file-lock operations must still initialize and validate their own schema");
     assert!(
-        reopened.is_err(),
-        "non-transient schema/bootstrap failures must not be silently treated as offline-mode reopens"
+        lock_error
+            .to_string()
+            .contains("postgres file lock lease schema ensure failed: permission denied"),
+        "lock schema failure should be reported at first lock use, got: {lock_error}"
     );
 }
 

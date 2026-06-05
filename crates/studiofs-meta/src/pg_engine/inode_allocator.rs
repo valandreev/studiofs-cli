@@ -275,13 +275,6 @@ impl PgMetaEngine {
         Ok(None)
     }
 
-    pub(super) fn has_persisted_inode_allocator_state(
-        local: &RedbMetaEngine,
-        slot: Option<u64>,
-    ) -> MetaResult<bool> {
-        Ok(Self::load_compatible_persisted_inode_allocator_state(local, slot)?.is_some())
-    }
-
     pub(super) fn persist_inode_allocator_state_locked(
         counters: &crate::redb_engine::CounterWriteTransaction<'_>,
         state: InodeAllocatorState,
