@@ -17,6 +17,23 @@ use libc::{off_t, size_t, stat, statvfs};
 use studiofs_vfs::KernelInvalidator;
 use thiserror::Error;
 
+const MACOS_FUSE_IOSIZE_BYTES: u32 = 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MacosFuseCachePolicy {
+    Direct,
+    Winfsp,
+}
+
+impl MacosFuseCachePolicy {
+    fn from_env() -> Self {
+        match std::env::var("STUDIOFS_MACOS_FUSE_CACHE_POLICY") {
+            Ok(raw) if raw.trim().eq_ignore_ascii_case("direct") => Self::Direct,
+            _ => Self::Winfsp,
+        }
+    }
+}
+
 pub(crate) mod raw {
     use super::*;
 
@@ -367,11 +384,32 @@ impl SessionConfig {
 
     /// Build owned argv strings for the macFUSE mount channel.
     pub fn mount_argv_strings(&self) -> Vec<String> {
-        vec![
+        self.mount_argv_strings_with_cache_policy(MacosFuseCachePolicy::from_env())
+    }
+
+    pub(super) fn mount_argv_strings_with_cache_policy(
+        &self,
+        cache_policy: MacosFuseCachePolicy,
+    ) -> Vec<String> {
+        let mut args = vec![
             "studiofs-macfuse".to_owned(),
             format!("-ovolname={}", self.volume_name),
             "-olocal".to_owned(),
-        ]
+        ];
+        match cache_policy {
+            MacosFuseCachePolicy::Direct => {
+                args.push("-odirect_io".to_owned());
+                args.push("-onolocalcaches".to_owned());
+                args.push("-oauto_cache".to_owned());
+            }
+            MacosFuseCachePolicy::Winfsp => {
+                args.push("-onovncache".to_owned());
+                args.push("-odaemon_timeout=60".to_owned());
+                args.push(format!("-oiosize={MACOS_FUSE_IOSIZE_BYTES}"));
+            }
+        }
+        args.push("-osparse".to_owned());
+        args
     }
 
     fn mount_point_cstring(&self) -> io::Result<CString> {
