@@ -653,27 +653,33 @@ mod tests {
         let reader = adapter
             .open(attr.ino, libc::O_RDONLY)
             .expect("open reader through macFUSE adapter");
-        let pending = adapter
-            .queue_read_for_test(attr.ino, reader.file_handle(), 0, 7)
-            .expect("first read should enter the bounded queue");
+        vfs.reset_diagnostics_observability();
+        let held_capacity = adapter.hold_read_capacity_for_test(7);
 
         let delayed = adapter
             .queue_read_for_test(attr.ino, reader.file_handle(), 7, 7)
-            .expect("second read should wait for bounded queue capacity");
+            .expect("read should wait for bounded queue capacity");
 
         assert!(
             !delayed.is_finished(),
-            "second read should wait instead of returning EAGAIN while queue is full"
+            "read should wait instead of returning EAGAIN while queue is full"
         );
 
+        std::thread::sleep(std::time::Duration::from_millis(125));
+        drop(held_capacity);
         adapter
             .release(attr.ino, writer.file_handle())
             .expect("release writer gate");
-        let bytes = pending.wait().expect("pending read should complete");
         let delayed_bytes = delayed.wait().expect("delayed read should complete");
 
-        assert_eq!(&bytes[..], b"bounded");
         assert_eq!(&delayed_bytes[..], b" macFUS");
+        let metrics = vfs.write_path_observability_snapshot();
+        assert_eq!(metrics.fuse_callbacks.read.calls, 1);
+        assert!(
+            metrics.fuse_callbacks.read.max_ms >= 100.0,
+            "read callback latency should include admission wait, got {:?}",
+            metrics.fuse_callbacks.read
+        );
     }
 
     #[test]
@@ -729,6 +735,45 @@ mod tests {
         assert_eq!(metrics.fuse_callbacks.read.calls, 1);
         assert_eq!(metrics.fuse_callbacks.read.bytes, 5);
         assert_eq!(metrics.fuse_callbacks.read.errors, 0);
+    }
+
+    #[test]
+    fn read_only_adapter_zero_byte_read_uses_vfs_and_records_metrics() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-async-read-zero")
+                .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"zero.txt",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        fixture
+            .runtime()
+            .block_on(vfs.write(attr.ino, 0, b"payload"))
+            .expect("seed payload");
+        vfs.reset_diagnostics_observability();
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let reader = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open reader through macFUSE adapter");
+
+        let queued = adapter
+            .queue_read_for_test(attr.ino, reader.file_handle(), 0, 0)
+            .expect("queue zero-byte read");
+        let bytes = queued.wait().expect("zero-byte read should complete");
+
+        assert!(bytes.is_empty());
+        let metrics = vfs.write_path_observability_snapshot();
+        assert_eq!(metrics.fuse_callbacks.read.calls, 1);
+        assert_eq!(metrics.fuse_callbacks.read.bytes, 0);
+        assert_eq!(metrics.fuse_callbacks.read.errors, 0);
+        assert_eq!(metrics.vfs_read_path.calls, 1);
     }
 
     #[test]

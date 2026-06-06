@@ -129,6 +129,16 @@ impl StudioVfsAdapter {
         self.read_queue_byte_limit
     }
 
+    #[cfg(test)]
+    pub(crate) fn hold_read_capacity_for_test(
+        &self,
+        bytes: u32,
+    ) -> tokio::sync::OwnedSemaphorePermit {
+        self.runtime_handle
+            .block_on(self.read_admission.clone().acquire_many_owned(bytes))
+            .expect("test read capacity should be available")
+    }
+
     /// Look up a child inode.
     pub(crate) fn lookup(&self, parent: u64, name: &[u8]) -> Result<InodeAttr, i32> {
         self.vfs
@@ -263,9 +273,6 @@ impl StudioVfsAdapter {
     ) -> Result<Vec<u8>, i32> {
         let offset = u64::try_from(offset).map_err(|_| libc::EINVAL)?;
         let size_usize = size as usize;
-        if size_usize == 0 {
-            return Ok(Vec::new());
-        }
 
         // TODO(SFS-489): switch to a MaybeUninit/ReadBuf-style VFS read API or a buffer pool
         // once `StudioVfs::read_into_fh` can safely accept non-zeroed storage.
@@ -295,16 +302,13 @@ impl StudioVfsAdapter {
         file_handle: u64,
         offset: u64,
         size: u32,
+        started: Instant,
     ) -> Result<Vec<u8>, i32> {
         let size_usize = size as usize;
-        if size_usize == 0 {
-            return Ok(Vec::new());
-        }
 
         // TODO(SFS-489): switch to a MaybeUninit/ReadBuf-style VFS read API or a buffer pool
         // once `StudioVfs::read_into_fh` can safely accept non-zeroed storage.
         let mut out = vec![0u8; size_usize];
-        let started = Instant::now();
         let result = vfs.read_into_fh(file_handle, ino, offset, &mut out).await;
         match result {
             Ok(written) => {
@@ -334,6 +338,9 @@ impl StudioVfsAdapter {
         let admission = Arc::clone(&self.read_admission);
         let vfs = Arc::clone(&self.vfs);
         let size = size.min(self.read_queue_byte_limit);
+        let started = Instant::now();
+        // TODO(SFS-489): wire macFUSE INTERRUPT notifications into this task
+        // so queued reads can abort before spending VFS/cache I/O on canceled requests.
         self.runtime_handle.spawn(async move {
             let Ok(_permit) = admission.acquire_many_owned(size).await else {
                 let _ = Reply::new(request).error(libc::EIO);
@@ -341,7 +348,7 @@ impl StudioVfsAdapter {
             };
             // Keep the permit until after the reply consumes `bytes`, so queued read
             // memory remains bounded for the whole kernel-reply handoff.
-            match Self::perform_read(vfs, ino, file_handle, offset, size).await {
+            match Self::perform_read(vfs, ino, file_handle, offset, size, started).await {
                 Ok(bytes) => {
                     let _ = Reply::new(request).read_buffer(&bytes);
                 }
@@ -364,6 +371,7 @@ impl StudioVfsAdapter {
         let admission = Arc::clone(&self.read_admission);
         let vfs = Arc::clone(&self.vfs);
         let size = size.min(self.read_queue_byte_limit);
+        let started = Instant::now();
         Ok(QueuedReadForTest {
             runtime_handle: self.runtime_handle.clone(),
             handle: self.runtime_handle.spawn(async move {
@@ -371,7 +379,7 @@ impl StudioVfsAdapter {
                     .acquire_many_owned(size)
                     .await
                     .map_err(|_| libc::EIO)?;
-                Self::perform_read(vfs, ino, file_handle, offset, size).await
+                Self::perform_read(vfs, ino, file_handle, offset, size, started).await
             }),
         })
     }
