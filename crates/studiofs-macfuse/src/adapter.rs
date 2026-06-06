@@ -7,6 +7,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use libc::{mode_t, off_t, size_t, stat, statvfs};
+use parking_lot::Mutex as ParkingMutex;
 use studiofs_bridge::posix::{
     BridgeFileAttr, BridgeFileType, posix_flags_to_open_flags, to_bridge_attr, vfs_err_to_errno,
 };
@@ -55,17 +56,14 @@ pub(crate) struct StudioVfsAdapter {
 
 #[derive(Debug, Default)]
 struct ReadBufferPool {
-    buffers: Mutex<Vec<Vec<u8>>>,
+    buffers: ParkingMutex<Vec<Vec<u8>>>,
 }
 
 impl ReadBufferPool {
     fn acquire(self: &Arc<Self>, size: usize) -> PooledReadBuffer {
-        let mut buffer = self
-            .buffers
-            .lock()
-            .expect("macFUSE read buffer pool mutex should not be poisoned")
-            .pop()
-            .unwrap_or_default();
+        let mut buffer = self.buffers.lock().pop().unwrap_or_default();
+        // TODO(SFS-489): avoid this per-read zero-fill once the VFS read path accepts
+        // MaybeUninit/ReadBuf-style storage instead of initialized `&mut [u8]`.
         buffer.resize(size, 0);
         PooledReadBuffer {
             pool: Arc::clone(self),
@@ -78,10 +76,7 @@ impl ReadBufferPool {
             return;
         }
         buffer.clear();
-        let mut buffers = self
-            .buffers
-            .lock()
-            .expect("macFUSE read buffer pool mutex should not be poisoned");
+        let mut buffers = self.buffers.lock();
         if buffers.len() < MACFUSE_READ_BUFFER_POOL_MAX_BUFFERS {
             buffers.push(buffer);
         }
@@ -89,19 +84,12 @@ impl ReadBufferPool {
 
     #[cfg(test)]
     fn available_count(&self) -> usize {
-        self.buffers
-            .lock()
-            .expect("macFUSE read buffer pool mutex should not be poisoned")
-            .len()
+        self.buffers.lock().len()
     }
 
     #[cfg(test)]
     fn available_capacity(&self) -> Option<usize> {
-        self.buffers
-            .lock()
-            .expect("macFUSE read buffer pool mutex should not be poisoned")
-            .last()
-            .map(Vec::capacity)
+        self.buffers.lock().last().map(Vec::capacity)
     }
 }
 
@@ -152,6 +140,11 @@ impl Drop for PooledReadBuffer {
 #[cfg(test)]
 pub(crate) fn max_reusable_read_buffer_capacity_for_test() -> usize {
     MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY
+}
+
+fn clamp_reusable_read_size(size: u32, read_queue_byte_limit: u32) -> u32 {
+    size.min(read_queue_byte_limit)
+        .min(MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY as u32)
 }
 
 #[cfg(test)]
@@ -459,7 +452,7 @@ impl StudioVfsAdapter {
         let admission = Arc::clone(&self.read_admission);
         let vfs = Arc::clone(&self.vfs);
         let read_buffers = Arc::clone(&self.read_buffers);
-        let size = size.min(self.read_queue_byte_limit);
+        let size = clamp_reusable_read_size(size, self.read_queue_byte_limit);
         let started = Instant::now();
         // TODO(SFS-489): wire macFUSE INTERRUPT notifications into this task
         // so queued reads can abort before spending VFS/cache I/O on canceled requests.
@@ -495,7 +488,7 @@ impl StudioVfsAdapter {
         let admission = Arc::clone(&self.read_admission);
         let vfs = Arc::clone(&self.vfs);
         let read_buffers = Arc::clone(&self.read_buffers);
-        let size = size.min(self.read_queue_byte_limit);
+        let size = clamp_reusable_read_size(size, self.read_queue_byte_limit);
         let started = Instant::now();
         Ok(QueuedReadForTest {
             runtime_handle: self.runtime_handle.clone(),

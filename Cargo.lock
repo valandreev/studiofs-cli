@@ -4813,6 +4813,7 @@ version = "0.1.1"
 dependencies = [
  "cc",
  "libc",
+ "parking_lot",
  "serde",
  "serde_json",
  "studiofs-bridge",

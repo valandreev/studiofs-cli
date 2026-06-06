@@ -784,7 +784,7 @@ mod tests {
     }
 
     #[test]
-    fn read_only_adapter_does_not_retain_oversized_reusable_read_buffer() {
+    fn read_only_adapter_clamps_oversized_read_to_reusable_buffer_capacity() {
         let fixture =
             studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-async-read-cap-drop")
                 .expect("create VFS fixture");
@@ -817,8 +817,11 @@ mod tests {
             &queued.wait().expect("oversized read should complete")[..],
             b"small payload"
         );
-        assert_eq!(adapter.reusable_read_buffer_count_for_test(), 0);
-        assert_eq!(adapter.reusable_read_buffer_capacity_for_test(), None);
+        assert_eq!(adapter.reusable_read_buffer_count_for_test(), 1);
+        assert_eq!(
+            adapter.reusable_read_buffer_capacity_for_test(),
+            Some(super::adapter::max_reusable_read_buffer_capacity_for_test())
+        );
     }
 
     #[test]
