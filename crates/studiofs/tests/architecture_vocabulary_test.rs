@@ -1120,6 +1120,49 @@ fn macos_native_bridge_readiness_report_covers_sfs485_decision_gate() {
 }
 
 #[test]
+fn fuse3_macos_candidate_report_covers_sfs487_proof_gate() {
+    let doc = read_workspace_file("docs/perf/sfs-487-fuse3-macos-candidate.md");
+    let normalized_doc = normalize_doc_whitespace(&doc);
+    let required_terms = [
+        "SFS-487",
+        "Sherlock-Holo/fuse3",
+        "https://github.com/Sherlock-Holo/fuse3/pull/108",
+        "https://github.com/Sherlock-Holo/fuse3/pull/109",
+        "target/sfs-487-fuse3-proof",
+        "custom_options(...)",
+        "mount_options.rs",
+        "viable migration candidate",
+        "reference only",
+        "rejected for StudioFS macOS",
+        "current decision: reference only",
+        "crates/studiofs/src/cli/mount/backend.rs",
+        "crates/studiofs-macfuse/src/lib.rs",
+        "crates/studiofs-macfuse/src/low_level.rs",
+        "crates/studiofs-macfuse/src/adapter.rs",
+        "crates/studiofs-fuse/Cargo.toml",
+        "low-level reply ownership",
+        "xattr",
+        "setattr",
+        "kernel invalidation",
+        "large read",
+        "No production dependency or routing change is allowed by this proof",
+        "cargo test -p studiofs --test architecture_vocabulary_test fuse3_macos_candidate_report_covers_sfs487_proof_gate -- --nocapture",
+        "cargo test -p studiofs-macfuse",
+    ];
+
+    let missing: Vec<_> = required_terms
+        .into_iter()
+        .filter(|term| !contains_doc_term(&doc, &normalized_doc, term))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "SFS-487 fuse3 macOS candidate report is missing required proof-gate surfaces:\n{}",
+        missing.join("\n")
+    );
+}
+
+#[test]
 fn deterministic_simulation_architecture_covers_required_sfs330_surfaces() {
     let doc = read_workspace_file("docs/deterministic-simulation-architecture.md");
     let required_terms = [
