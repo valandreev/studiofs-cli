@@ -738,6 +738,52 @@ mod tests {
     }
 
     #[test]
+    fn read_only_adapter_reuses_queued_read_buffer_after_reply_completion() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-async-read-reuse")
+                .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"reuse.txt",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        fixture
+            .runtime()
+            .block_on(vfs.write(attr.ino, 0, b"reusable macFUSE buffer"))
+            .expect("seed payload");
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let reader = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open reader through macFUSE adapter");
+
+        let first = adapter
+            .queue_read_for_test(attr.ino, reader.file_handle(), 0, 8)
+            .expect("queue first read");
+        assert_eq!(
+            &first.wait().expect("first read should complete")[..],
+            b"reusable"
+        );
+        assert_eq!(adapter.reusable_read_buffer_count_for_test(), 1);
+        assert_eq!(adapter.reusable_read_buffer_capacity_for_test(), Some(8));
+
+        let second = adapter
+            .queue_read_for_test(attr.ino, reader.file_handle(), 9, 7)
+            .expect("queue second read");
+        assert_eq!(
+            &second.wait().expect("second read should complete")[..],
+            b"macFUSE"
+        );
+        assert_eq!(adapter.reusable_read_buffer_count_for_test(), 1);
+        assert_eq!(adapter.reusable_read_buffer_capacity_for_test(), Some(8));
+    }
+
+    #[test]
     fn read_only_adapter_zero_byte_read_uses_vfs_and_records_metrics() {
         let fixture =
             studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-async-read-zero")

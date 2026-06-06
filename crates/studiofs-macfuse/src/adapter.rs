@@ -26,6 +26,7 @@ const READDIR_CACHE_TTL: Duration = Duration::from_secs(1);
 const READDIR_CACHE_PRUNE_THRESHOLD: usize = 1024;
 const READDIR_CACHE_PRUNE_INTERVAL: Duration = Duration::from_secs(1);
 const MACFUSE_READ_MAX_PENDING_BYTES: usize = 64 * 1024 * 1024;
+const MACFUSE_READ_BUFFER_POOL_MAX_BUFFERS: usize = 32;
 
 /// macFUSE open-cache flags chosen for one file handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,13 +49,110 @@ pub(crate) struct StudioVfsAdapter {
     readdir_cache_ready: Condvar,
     read_admission: Arc<Semaphore>,
     read_queue_byte_limit: u32,
+    read_buffers: Arc<ReadBufferPool>,
+}
+
+#[derive(Debug, Default)]
+struct ReadBufferPool {
+    buffers: Mutex<Vec<Vec<u8>>>,
+}
+
+impl ReadBufferPool {
+    fn acquire(self: &Arc<Self>, size: usize) -> PooledReadBuffer {
+        let mut buffer = self
+            .buffers
+            .lock()
+            .expect("macFUSE read buffer pool mutex should not be poisoned")
+            .pop()
+            .unwrap_or_default();
+        buffer.resize(size, 0);
+        PooledReadBuffer {
+            pool: Arc::clone(self),
+            buffer: Some(buffer),
+            len: size,
+        }
+    }
+
+    fn recycle(&self, mut buffer: Vec<u8>) {
+        buffer.clear();
+        let mut buffers = self
+            .buffers
+            .lock()
+            .expect("macFUSE read buffer pool mutex should not be poisoned");
+        if buffers.len() < MACFUSE_READ_BUFFER_POOL_MAX_BUFFERS {
+            buffers.push(buffer);
+        }
+    }
+
+    #[cfg(test)]
+    fn available_count(&self) -> usize {
+        self.buffers
+            .lock()
+            .expect("macFUSE read buffer pool mutex should not be poisoned")
+            .len()
+    }
+
+    #[cfg(test)]
+    fn available_capacity(&self) -> Option<usize> {
+        self.buffers
+            .lock()
+            .expect("macFUSE read buffer pool mutex should not be poisoned")
+            .last()
+            .map(Vec::capacity)
+    }
+}
+
+#[derive(Debug)]
+struct PooledReadBuffer {
+    pool: Arc<ReadBufferPool>,
+    buffer: Option<Vec<u8>>,
+    len: usize,
+}
+
+impl PooledReadBuffer {
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        self.buffer
+            .as_mut()
+            .expect("pooled read buffer should be present")
+            .as_mut_slice()
+    }
+
+    fn truncate(&mut self, len: usize) {
+        self.len = len;
+        self.buffer
+            .as_mut()
+            .expect("pooled read buffer should be present")
+            .truncate(len);
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self
+            .buffer
+            .as_ref()
+            .expect("pooled read buffer should be present")[..self.len]
+    }
+
+    #[cfg(test)]
+    fn into_vec(mut self) -> Vec<u8> {
+        self.buffer
+            .take()
+            .expect("pooled read buffer should be present")
+    }
+}
+
+impl Drop for PooledReadBuffer {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            self.pool.recycle(buffer);
+        }
+    }
 }
 
 #[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct QueuedReadForTest {
     runtime_handle: Handle,
-    handle: JoinHandle<Result<Vec<u8>, i32>>,
+    handle: JoinHandle<Result<PooledReadBuffer, i32>>,
 }
 
 #[cfg(test)]
@@ -64,9 +162,13 @@ impl QueuedReadForTest {
     }
 
     pub(crate) fn wait(self) -> Result<Vec<u8>, i32> {
-        self.runtime_handle
+        let buffer = self
+            .runtime_handle
             .block_on(self.handle)
-            .expect("queued macFUSE read worker should not panic")
+            .expect("queued macFUSE read worker should not panic")?;
+        let bytes = buffer.as_slice().to_vec();
+        drop(buffer);
+        Ok(bytes)
     }
 }
 
@@ -112,6 +214,7 @@ impl StudioVfsAdapter {
             readdir_cache_ready: Condvar::new(),
             read_admission: Arc::new(Semaphore::new(read_queue_byte_limit as usize)),
             read_queue_byte_limit,
+            read_buffers: Arc::new(ReadBufferPool::default()),
         }
     }
 
@@ -137,6 +240,16 @@ impl StudioVfsAdapter {
         self.runtime_handle
             .block_on(self.read_admission.clone().acquire_many_owned(bytes))
             .expect("test read capacity should be available")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reusable_read_buffer_count_for_test(&self) -> usize {
+        self.read_buffers.available_count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reusable_read_buffer_capacity_for_test(&self) -> Option<usize> {
+        self.read_buffers.available_capacity()
     }
 
     /// Look up a child inode.
@@ -274,19 +387,20 @@ impl StudioVfsAdapter {
         let offset = u64::try_from(offset).map_err(|_| libc::EINVAL)?;
         let size_usize = size as usize;
 
-        // TODO(SFS-489): switch to a MaybeUninit/ReadBuf-style VFS read API or a buffer pool
-        // once `StudioVfs::read_into_fh` can safely accept non-zeroed storage.
-        let mut out = vec![0u8; size_usize];
+        let mut out = self.read_buffers.acquire(size_usize);
         let started = Instant::now();
-        let result =
-            self.runtime_handle
-                .block_on(self.vfs.read_into_fh(file_handle, ino, offset, &mut out));
+        let result = self.runtime_handle.block_on(self.vfs.read_into_fh(
+            file_handle,
+            ino,
+            offset,
+            out.as_mut_slice(),
+        ));
         match result {
             Ok(written) => {
                 self.vfs
                     .record_fuse_read_callback(written as usize, started.elapsed(), false);
                 out.truncate(written as usize);
-                Ok(out)
+                Ok(out.into_vec())
             }
             Err(error) => {
                 self.vfs
@@ -303,13 +417,14 @@ impl StudioVfsAdapter {
         offset: u64,
         size: u32,
         started: Instant,
-    ) -> Result<Vec<u8>, i32> {
+        read_buffers: Arc<ReadBufferPool>,
+    ) -> Result<PooledReadBuffer, i32> {
         let size_usize = size as usize;
 
-        // TODO(SFS-489): switch to a MaybeUninit/ReadBuf-style VFS read API or a buffer pool
-        // once `StudioVfs::read_into_fh` can safely accept non-zeroed storage.
-        let mut out = vec![0u8; size_usize];
-        let result = vfs.read_into_fh(file_handle, ino, offset, &mut out).await;
+        let mut out = read_buffers.acquire(size_usize);
+        let result = vfs
+            .read_into_fh(file_handle, ino, offset, out.as_mut_slice())
+            .await;
         match result {
             Ok(written) => {
                 vfs.record_fuse_read_callback(written as usize, started.elapsed(), false);
@@ -337,6 +452,7 @@ impl StudioVfsAdapter {
         };
         let admission = Arc::clone(&self.read_admission);
         let vfs = Arc::clone(&self.vfs);
+        let read_buffers = Arc::clone(&self.read_buffers);
         let size = size.min(self.read_queue_byte_limit);
         let started = Instant::now();
         // TODO(SFS-489): wire macFUSE INTERRUPT notifications into this task
@@ -348,9 +464,11 @@ impl StudioVfsAdapter {
             };
             // Keep the permit until after the reply consumes `bytes`, so queued read
             // memory remains bounded for the whole kernel-reply handoff.
-            match Self::perform_read(vfs, ino, file_handle, offset, size, started).await {
+            match Self::perform_read(vfs, ino, file_handle, offset, size, started, read_buffers)
+                .await
+            {
                 Ok(bytes) => {
-                    let _ = Reply::new(request).read_buffer(&bytes);
+                    let _ = Reply::new(request).read_buffer(bytes.as_slice());
                 }
                 Err(errno) => {
                     let _ = Reply::new(request).error(errno);
@@ -370,6 +488,7 @@ impl StudioVfsAdapter {
         let offset = u64::try_from(offset).map_err(|_| libc::EINVAL)?;
         let admission = Arc::clone(&self.read_admission);
         let vfs = Arc::clone(&self.vfs);
+        let read_buffers = Arc::clone(&self.read_buffers);
         let size = size.min(self.read_queue_byte_limit);
         let started = Instant::now();
         Ok(QueuedReadForTest {
@@ -379,7 +498,7 @@ impl StudioVfsAdapter {
                     .acquire_many_owned(size)
                     .await
                     .map_err(|_| libc::EIO)?;
-                Self::perform_read(vfs, ino, file_handle, offset, size, started).await
+                Self::perform_read(vfs, ino, file_handle, offset, size, started, read_buffers).await
             }),
         })
     }
