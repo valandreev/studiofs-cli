@@ -642,10 +642,10 @@ mod tests {
             .runtime()
             .block_on(vfs.write(attr.ino, 0, b"bounded macFUSE read"))
             .expect("seed payload");
-        let adapter = super::adapter::StudioVfsAdapter::new_with_read_queue_limit_for_test(
+        let adapter = super::adapter::StudioVfsAdapter::new_with_read_queue_byte_limit_for_test(
             vfs.clone(),
             fixture.runtime().handle().clone(),
-            1,
+            7,
         );
         let writer = adapter
             .open(attr.ino, libc::O_WRONLY)
@@ -691,6 +691,44 @@ mod tests {
             .expect_err("negative offsets should fail before queueing");
 
         assert_eq!(rejected, libc::EINVAL);
+    }
+
+    #[test]
+    fn read_only_adapter_records_actual_async_read_bytes_at_eof() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-async-read-eof-bytes")
+                .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"eof.txt",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        fixture
+            .runtime()
+            .block_on(vfs.write(attr.ino, 0, b"short"))
+            .expect("seed payload");
+        vfs.reset_diagnostics_observability();
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let reader = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open reader through macFUSE adapter");
+
+        let queued = adapter
+            .queue_read_for_test(attr.ino, reader.file_handle(), 0, 4096)
+            .expect("queue EOF-sized read");
+        let bytes = queued.wait().expect("queued read should complete");
+
+        assert_eq!(&bytes[..], b"short");
+        let metrics = vfs.write_path_observability_snapshot();
+        assert_eq!(metrics.fuse_callbacks.read.calls, 1);
+        assert_eq!(metrics.fuse_callbacks.read.bytes, 5);
+        assert_eq!(metrics.fuse_callbacks.read.errors, 0);
     }
 
     #[test]

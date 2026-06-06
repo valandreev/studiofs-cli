@@ -24,7 +24,7 @@ const MACFUSE_ATTR_BLOCK_SIZE: u32 = 512;
 const READDIR_CACHE_TTL: Duration = Duration::from_secs(1);
 const READDIR_CACHE_PRUNE_THRESHOLD: usize = 1024;
 const READDIR_CACHE_PRUNE_INTERVAL: Duration = Duration::from_secs(1);
-const MACFUSE_READ_MAX_PENDING_REQUESTS: usize = 1024;
+const MACFUSE_READ_MAX_PENDING_BYTES: usize = 64 * 1024 * 1024;
 
 /// macFUSE open-cache flags chosen for one file handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,19 +81,19 @@ impl StudioVfsAdapter {
         runtime_handle: Handle,
         read_only: bool,
     ) -> Self {
-        Self::new_with_read_queue_limit(
+        Self::new_with_read_queue_byte_limit(
             vfs,
             runtime_handle,
             read_only,
-            MACFUSE_READ_MAX_PENDING_REQUESTS,
+            MACFUSE_READ_MAX_PENDING_BYTES,
         )
     }
 
-    fn new_with_read_queue_limit(
+    fn new_with_read_queue_byte_limit(
         vfs: Arc<StudioVfs>,
         runtime_handle: Handle,
         read_only: bool,
-        read_queue_limit: usize,
+        read_queue_byte_limit: usize,
     ) -> Self {
         Self {
             vfs,
@@ -104,17 +104,17 @@ impl StudioVfsAdapter {
             readdir_cache: Mutex::new(HashMap::new()),
             readdir_cache_last_pruned: Mutex::new(None),
             readdir_cache_ready: Condvar::new(),
-            read_admission: Arc::new(Semaphore::new(read_queue_limit)),
+            read_admission: Arc::new(Semaphore::new(read_queue_byte_limit)),
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn new_with_read_queue_limit_for_test(
+    pub(crate) fn new_with_read_queue_byte_limit_for_test(
         vfs: Arc<StudioVfs>,
         runtime_handle: Handle,
-        read_queue_limit: usize,
+        read_queue_byte_limit: usize,
     ) -> Self {
-        Self::new_with_read_queue_limit(vfs, runtime_handle, false, read_queue_limit)
+        Self::new_with_read_queue_byte_limit(vfs, runtime_handle, false, read_queue_byte_limit)
     }
 
     /// Look up a child inode.
@@ -260,14 +260,18 @@ impl StudioVfsAdapter {
         let result =
             self.runtime_handle
                 .block_on(self.vfs.read_into_fh(file_handle, ino, offset, &mut out));
-        self.vfs
-            .record_fuse_read_callback(size_usize, started.elapsed(), result.is_err());
         match result {
             Ok(written) => {
+                self.vfs
+                    .record_fuse_read_callback(written as usize, started.elapsed(), false);
                 out.truncate(written as usize);
                 Ok(out)
             }
-            Err(error) => Err(vfs_err_to_errno(&error)),
+            Err(error) => {
+                self.vfs
+                    .record_fuse_read_callback(size_usize, started.elapsed(), true);
+                Err(vfs_err_to_errno(&error))
+            }
         }
     }
 
@@ -286,13 +290,16 @@ impl StudioVfsAdapter {
         let mut out = vec![0u8; size_usize];
         let started = Instant::now();
         let result = vfs.read_into_fh(file_handle, ino, offset, &mut out).await;
-        vfs.record_fuse_read_callback(size_usize, started.elapsed(), result.is_err());
         match result {
             Ok(written) => {
+                vfs.record_fuse_read_callback(written as usize, started.elapsed(), false);
                 out.truncate(written as usize);
                 Ok(out)
             }
-            Err(error) => Err(vfs_err_to_errno(&error)),
+            Err(error) => {
+                vfs.record_fuse_read_callback(size_usize, started.elapsed(), true);
+                Err(vfs_err_to_errno(&error))
+            }
         }
     }
 
@@ -314,7 +321,7 @@ impl StudioVfsAdapter {
         let admission = Arc::clone(&self.read_admission);
         let vfs = Arc::clone(&self.vfs);
         self.runtime_handle.spawn(async move {
-            let _permit = match admission.acquire_owned().await {
+            let _permit = match admission.acquire_many_owned(size).await {
                 Ok(permit) => permit,
                 Err(_) => {
                     let _ = Reply::new(request).error(libc::EIO);
@@ -346,7 +353,10 @@ impl StudioVfsAdapter {
         Ok(QueuedReadForTest {
             runtime_handle: self.runtime_handle.clone(),
             handle: self.runtime_handle.spawn(async move {
-                let _permit = admission.acquire_owned().await.map_err(|_| libc::EIO)?;
+                let _permit = admission
+                    .acquire_many_owned(size)
+                    .await
+                    .map_err(|_| libc::EIO)?;
                 Self::perform_read(vfs, ino, file_handle, offset, size).await
             }),
         })
