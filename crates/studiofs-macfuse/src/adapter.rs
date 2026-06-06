@@ -121,22 +121,17 @@ impl ReadWindowStore {
             return None;
         }
         let generation = self.invalidation_generation(ino);
-        let (window_offset, next_offset, bytes) = {
-            let window = self.windows.get(&file_handle)?;
-            if window.ino != ino || !window.contains(offset, out.len()) {
-                return None;
-            }
-            (
-                window.offset,
-                Arc::clone(&window.next_offset),
-                Arc::clone(&window.bytes),
-            )
-        };
-        let copied = copy_window_bytes(window_offset, bytes.as_ref().as_ref(), offset, out);
+        let window = self.windows.get(&file_handle)?;
+        if window.ino != ino || !window.contains(offset, out.len()) {
+            return None;
+        }
+        let copied = copy_window_bytes(window.offset, window.bytes.as_ref(), offset, out);
         if copied == 0 || self.invalidation_generation(ino) != generation {
             return None;
         }
-        next_offset.store(offset.saturating_add(copied as u64), Ordering::Release);
+        window
+            .next_offset
+            .store(offset.saturating_add(copied as u64), Ordering::Release);
         Some(copied)
     }
 
@@ -161,8 +156,8 @@ impl ReadWindowStore {
             ReadWindow {
                 ino,
                 offset,
-                next_offset: Arc::new(AtomicU64::new(next_offset)),
-                bytes: Arc::new(bytes),
+                next_offset: AtomicU64::new(next_offset),
+                bytes,
             },
         ) {
             if previous.ino != ino {
@@ -196,7 +191,8 @@ impl ReadWindowStore {
             return;
         };
         for file_handle in handles {
-            self.windows.remove(&file_handle);
+            self.windows
+                .remove_if(&file_handle, |_, window| window.ino == ino);
         }
     }
 
@@ -230,8 +226,8 @@ impl ReadWindowStore {
 struct ReadWindow {
     ino: u64,
     offset: u64,
-    next_offset: Arc<AtomicU64>,
-    bytes: Arc<PooledReadBuffer>,
+    next_offset: AtomicU64,
+    bytes: PooledReadBuffer,
 }
 
 impl ReadWindow {
@@ -628,7 +624,6 @@ impl StudioVfsAdapter {
                     let remainder_len = written - reply_len;
                     let mut remainder = state.read_buffers.clone().acquire(remainder_len);
                     remainder.copy_from_slice(&out[reply_len..written]);
-                    out.truncate(written);
                     state.read_windows.remember_if_current(
                         file_handle,
                         ino,
