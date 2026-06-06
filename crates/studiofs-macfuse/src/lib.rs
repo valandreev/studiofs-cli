@@ -768,6 +768,32 @@ mod tests {
     }
 
     #[test]
+    fn read_only_adapter_read_queue_limit_is_clamped_for_tokio_semaphore() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-async-read-limit-clamp",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+
+        let zero = super::adapter::StudioVfsAdapter::new_with_read_queue_byte_limit_for_test(
+            vfs.clone(),
+            fixture.runtime().handle().clone(),
+            0,
+        );
+        let oversized = super::adapter::StudioVfsAdapter::new_with_read_queue_byte_limit_for_test(
+            vfs.clone(),
+            fixture.runtime().handle().clone(),
+            usize::MAX,
+        );
+
+        assert_eq!(zero.read_queue_byte_limit_for_test(), 1);
+        assert_eq!(
+            oversized.read_queue_byte_limit_for_test() as usize,
+            tokio::sync::Semaphore::MAX_PERMITS.min(u32::MAX as usize)
+        );
+    }
+
+    #[test]
     fn adapter_write_keeps_accepted_bytes_visible_to_same_mount_reader() {
         let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
             "macfuse-adapter-write-read-after-write",

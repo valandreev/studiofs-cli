@@ -97,7 +97,10 @@ impl StudioVfsAdapter {
         read_only: bool,
         read_queue_byte_limit: usize,
     ) -> Self {
-        let read_queue_byte_limit = read_queue_byte_limit.max(1).min(u32::MAX as usize) as u32;
+        let read_queue_byte_limit = read_queue_byte_limit
+            .max(1)
+            .min(u32::MAX as usize)
+            .min(Semaphore::MAX_PERMITS) as u32;
         Self {
             vfs,
             runtime_handle,
@@ -119,6 +122,11 @@ impl StudioVfsAdapter {
         read_queue_byte_limit: usize,
     ) -> Self {
         Self::new_with_read_queue_byte_limit(vfs, runtime_handle, false, read_queue_byte_limit)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_queue_byte_limit_for_test(&self) -> u32 {
+        self.read_queue_byte_limit
     }
 
     /// Look up a child inode.
@@ -259,6 +267,8 @@ impl StudioVfsAdapter {
             return Ok(Vec::new());
         }
 
+        // TODO(SFS-489): switch to a MaybeUninit/ReadBuf-style VFS read API or a buffer pool
+        // once `StudioVfs::read_into_fh` can safely accept non-zeroed storage.
         let mut out = vec![0u8; size_usize];
         let started = Instant::now();
         let result =
@@ -291,6 +301,8 @@ impl StudioVfsAdapter {
             return Ok(Vec::new());
         }
 
+        // TODO(SFS-489): switch to a MaybeUninit/ReadBuf-style VFS read API or a buffer pool
+        // once `StudioVfs::read_into_fh` can safely accept non-zeroed storage.
         let mut out = vec![0u8; size_usize];
         let started = Instant::now();
         let result = vfs.read_into_fh(file_handle, ino, offset, &mut out).await;
@@ -315,24 +327,20 @@ impl StudioVfsAdapter {
         size: u32,
         request: Request,
     ) {
-        let offset = match u64::try_from(offset) {
-            Ok(offset) => offset,
-            Err(_) => {
-                let _ = Reply::new(request).error(libc::EINVAL);
-                return;
-            }
+        let Ok(offset) = u64::try_from(offset) else {
+            let _ = Reply::new(request).error(libc::EINVAL);
+            return;
         };
         let admission = Arc::clone(&self.read_admission);
         let vfs = Arc::clone(&self.vfs);
         let size = size.min(self.read_queue_byte_limit);
         self.runtime_handle.spawn(async move {
-            let _permit = match admission.acquire_many_owned(size).await {
-                Ok(permit) => permit,
-                Err(_) => {
-                    let _ = Reply::new(request).error(libc::EIO);
-                    return;
-                }
+            let Ok(_permit) = admission.acquire_many_owned(size).await else {
+                let _ = Reply::new(request).error(libc::EIO);
+                return;
             };
+            // Keep the permit until after the reply consumes `bytes`, so queued read
+            // memory remains bounded for the whole kernel-reply handoff.
             match Self::perform_read(vfs, ino, file_handle, offset, size).await {
                 Ok(bytes) => {
                     let _ = Reply::new(request).read_buffer(&bytes);
