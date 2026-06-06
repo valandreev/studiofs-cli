@@ -120,13 +120,6 @@ impl PooledReadBuffer {
             .expect("pooled read buffer should be present")
             .as_slice()
     }
-
-    #[cfg(test)]
-    fn into_vec(mut self) -> Vec<u8> {
-        self.buffer
-            .take()
-            .expect("pooled read buffer should be present")
-    }
 }
 
 impl Drop for PooledReadBuffer {
@@ -386,20 +379,17 @@ impl StudioVfsAdapter {
         let offset = u64::try_from(offset).map_err(|_| libc::EINVAL)?;
         let size_usize = size as usize;
 
-        let mut out = self.read_buffers.acquire(size_usize);
+        let mut out = vec![0u8; size_usize];
         let started = Instant::now();
-        let result = self.runtime_handle.block_on(self.vfs.read_into_fh(
-            file_handle,
-            ino,
-            offset,
-            out.as_mut_slice(),
-        ));
+        let result =
+            self.runtime_handle
+                .block_on(self.vfs.read_into_fh(file_handle, ino, offset, &mut out));
         match result {
             Ok(written) => {
                 self.vfs
                     .record_fuse_read_callback(written as usize, started.elapsed(), false);
                 out.truncate(written as usize);
-                Ok(out.into_vec())
+                Ok(out)
             }
             Err(error) => {
                 self.vfs

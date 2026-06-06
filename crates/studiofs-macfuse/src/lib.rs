@@ -784,6 +784,100 @@ mod tests {
     }
 
     #[test]
+    fn read_only_adapter_reuses_queued_read_buffer_for_larger_followup_read() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-async-read-grow")
+                .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"grow.txt",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        fixture
+            .runtime()
+            .block_on(vfs.write(attr.ino, 0, b"small then larger read"))
+            .expect("seed payload");
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let reader = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open reader through macFUSE adapter");
+
+        let first = adapter
+            .queue_read_for_test(attr.ino, reader.file_handle(), 0, 5)
+            .expect("queue first read");
+        assert_eq!(
+            &first.wait().expect("first read should complete")[..],
+            b"small"
+        );
+        assert_eq!(adapter.reusable_read_buffer_count_for_test(), 1);
+        let first_capacity = adapter
+            .reusable_read_buffer_capacity_for_test()
+            .expect("first queued read should recycle one buffer");
+        assert!(first_capacity >= 5);
+
+        let second = adapter
+            .queue_read_for_test(attr.ino, reader.file_handle(), 0, 22)
+            .expect("queue larger followup read");
+        assert_eq!(
+            &second.wait().expect("second read should complete")[..],
+            b"small then larger read"
+        );
+        assert_eq!(adapter.reusable_read_buffer_count_for_test(), 1);
+        let second_capacity = adapter
+            .reusable_read_buffer_capacity_for_test()
+            .expect("second queued read should recycle one buffer");
+        assert!(second_capacity >= 22);
+        assert!(second_capacity >= first_capacity);
+    }
+
+    #[test]
+    fn synchronous_adapter_read_does_not_take_buffer_from_queued_read_pool() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-sync-read-no-pool")
+                .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"sync.txt",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        fixture
+            .runtime()
+            .block_on(vfs.write(attr.ino, 0, b"sync read payload"))
+            .expect("seed payload");
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let reader = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open reader through macFUSE adapter");
+        let queued = adapter
+            .queue_read_for_test(attr.ino, reader.file_handle(), 0, 4)
+            .expect("queue read to seed reusable pool");
+        assert_eq!(
+            &queued.wait().expect("queued read should complete")[..],
+            b"sync"
+        );
+        assert_eq!(adapter.reusable_read_buffer_count_for_test(), 1);
+
+        let bytes = adapter
+            .read(attr.ino, reader.file_handle(), 0, 4)
+            .expect("sync read should complete");
+
+        assert_eq!(&bytes[..], b"sync");
+        assert_eq!(adapter.reusable_read_buffer_count_for_test(), 1);
+    }
+
+    #[test]
     fn read_only_adapter_clamps_oversized_read_to_reusable_buffer_capacity() {
         let fixture =
             studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-async-read-cap-drop")
