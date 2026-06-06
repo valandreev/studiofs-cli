@@ -784,6 +784,44 @@ mod tests {
     }
 
     #[test]
+    fn read_only_adapter_does_not_retain_oversized_reusable_read_buffer() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-async-read-cap-drop")
+                .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"large-read.txt",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        fixture
+            .runtime()
+            .block_on(vfs.write(attr.ino, 0, b"small payload"))
+            .expect("seed payload");
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let reader = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open reader through macFUSE adapter");
+        let oversized_request = super::adapter::max_reusable_read_buffer_capacity_for_test() + 1;
+
+        let queued = adapter
+            .queue_read_for_test(attr.ino, reader.file_handle(), 0, oversized_request as u32)
+            .expect("queue oversized read");
+
+        assert_eq!(
+            &queued.wait().expect("oversized read should complete")[..],
+            b"small payload"
+        );
+        assert_eq!(adapter.reusable_read_buffer_count_for_test(), 0);
+        assert_eq!(adapter.reusable_read_buffer_capacity_for_test(), None);
+    }
+
+    #[test]
     fn read_only_adapter_zero_byte_read_uses_vfs_and_records_metrics() {
         let fixture =
             studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-async-read-zero")

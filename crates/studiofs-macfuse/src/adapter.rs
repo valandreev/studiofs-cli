@@ -27,6 +27,7 @@ const READDIR_CACHE_PRUNE_THRESHOLD: usize = 1024;
 const READDIR_CACHE_PRUNE_INTERVAL: Duration = Duration::from_secs(1);
 const MACFUSE_READ_MAX_PENDING_BYTES: usize = 64 * 1024 * 1024;
 const MACFUSE_READ_BUFFER_POOL_MAX_BUFFERS: usize = 32;
+const MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY: usize = 1024 * 1024;
 
 /// macFUSE open-cache flags chosen for one file handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,11 +70,13 @@ impl ReadBufferPool {
         PooledReadBuffer {
             pool: Arc::clone(self),
             buffer: Some(buffer),
-            len: size,
         }
     }
 
     fn recycle(&self, mut buffer: Vec<u8>) {
+        if buffer.capacity() > MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY {
+            return;
+        }
         buffer.clear();
         let mut buffers = self
             .buffers
@@ -106,7 +109,6 @@ impl ReadBufferPool {
 struct PooledReadBuffer {
     pool: Arc<ReadBufferPool>,
     buffer: Option<Vec<u8>>,
-    len: usize,
 }
 
 impl PooledReadBuffer {
@@ -118,7 +120,6 @@ impl PooledReadBuffer {
     }
 
     fn truncate(&mut self, len: usize) {
-        self.len = len;
         self.buffer
             .as_mut()
             .expect("pooled read buffer should be present")
@@ -126,10 +127,10 @@ impl PooledReadBuffer {
     }
 
     fn as_slice(&self) -> &[u8] {
-        &self
-            .buffer
+        self.buffer
             .as_ref()
-            .expect("pooled read buffer should be present")[..self.len]
+            .expect("pooled read buffer should be present")
+            .as_slice()
     }
 
     #[cfg(test)]
@@ -146,6 +147,11 @@ impl Drop for PooledReadBuffer {
             self.pool.recycle(buffer);
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn max_reusable_read_buffer_capacity_for_test() -> usize {
+    MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY
 }
 
 #[cfg(test)]
