@@ -581,7 +581,7 @@ impl PgMetaEngine {
             );
         }
         let _ = engine.restore_pending_state_from_local_log();
-        let _ = engine.prime_local_id_ranges(client_slot);
+        engine.prime_local_id_ranges(client_slot)?;
         if options.background_poll {
             engine.ensure_metadata_notify_listener_started()?;
             let handle = Self::start_background_poll(

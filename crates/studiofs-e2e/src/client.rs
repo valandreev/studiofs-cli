@@ -1001,7 +1001,9 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
             {
                 kill_error.get_or_insert(err);
             }
-            if kill_error.is_none() && let Err(err) = self.cleanup_stale_mount(index) {
+            if kill_error.is_none()
+                && let Err(err) = self.cleanup_stale_mount(index)
+            {
                 kill_error.get_or_insert(err);
             }
             self.clients[index].process = None;
