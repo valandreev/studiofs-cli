@@ -112,6 +112,7 @@ impl ReadBufferPool {
 struct ReadWindowStore {
     windows: DashMap<u64, ReadWindow>,
     handles_by_inode: DashMap<u64, HashSet<u64>>,
+    invalidation_generations: DashMap<u64, AtomicU64>,
 }
 
 impl ReadWindowStore {
@@ -119,43 +120,68 @@ impl ReadWindowStore {
         if out.is_empty() {
             return None;
         }
-        let window = self.windows.get(&file_handle)?;
-        if window.ino != ino || !window.contains(offset, out.len()) {
+        let generation = self.invalidation_generation(ino);
+        let (window_offset, next_offset, bytes) = {
+            let window = self.windows.get(&file_handle)?;
+            if window.ino != ino || !window.contains(offset, out.len()) {
+                return None;
+            }
+            (
+                window.offset,
+                Arc::clone(&window.next_offset),
+                Arc::clone(&window.bytes),
+            )
+        };
+        let copied = copy_window_bytes(window_offset, bytes.as_ref().as_ref(), offset, out);
+        if copied == 0 || self.invalidation_generation(ino) != generation {
             return None;
         }
-        let copied = window.copy_into(offset, out);
-        window
-            .next_offset
-            .store(offset.saturating_add(copied as u64), Ordering::Relaxed);
+        next_offset.store(offset.saturating_add(copied as u64), Ordering::Relaxed);
         Some(copied)
     }
 
-    fn remember(
+    fn remember_if_current(
         &self,
         file_handle: u64,
         ino: u64,
         offset: u64,
         next_offset: u64,
         bytes: PooledReadBuffer,
-    ) {
-        if bytes.is_empty() {
-            return;
+        generation: u64,
+    ) -> bool {
+        if self.invalidation_generation(ino) != generation {
+            return false;
         }
+        if bytes.is_empty() {
+            return false;
+        }
+        let mut needs_insert = true;
         if let Some(previous) = self.windows.insert(
             file_handle,
             ReadWindow {
                 ino,
                 offset,
-                next_offset: AtomicU64::new(next_offset),
-                bytes,
+                next_offset: Arc::new(AtomicU64::new(next_offset)),
+                bytes: Arc::new(bytes),
             },
         ) {
-            self.remove_inode_handle(previous.ino, file_handle);
+            if previous.ino != ino {
+                self.remove_inode_handle(previous.ino, file_handle);
+            } else {
+                needs_insert = false;
+            }
         }
-        self.handles_by_inode
-            .entry(ino)
-            .or_default()
-            .insert(file_handle);
+        if self.invalidation_generation(ino) != generation {
+            self.invalidate_handle(file_handle);
+            return false;
+        }
+        if needs_insert {
+            self.handles_by_inode
+                .entry(ino)
+                .or_default()
+                .insert(file_handle);
+        }
+        true
     }
 
     fn invalidate_handle(&self, file_handle: u64) {
@@ -165,15 +191,12 @@ impl ReadWindowStore {
     }
 
     fn invalidate_inode(&self, ino: u64) {
-        let Some(handles) = self
-            .handles_by_inode
-            .get(&ino)
-            .map(|handles| handles.clone())
-        else {
+        self.bump_inode_generation(ino);
+        let Some((_, handles)) = self.handles_by_inode.remove(&ino) else {
             return;
         };
         for file_handle in handles {
-            self.invalidate_handle(file_handle);
+            self.windows.remove(&file_handle);
         }
     }
 
@@ -188,14 +211,27 @@ impl ReadWindowStore {
                 .remove_if(&ino, |_, handles| handles.is_empty());
         }
     }
+
+    fn invalidation_generation(&self, ino: u64) -> u64 {
+        self.invalidation_generations
+            .get(&ino)
+            .map_or(0, |generation| generation.load(Ordering::Relaxed))
+    }
+
+    fn bump_inode_generation(&self, ino: u64) {
+        self.invalidation_generations
+            .entry(ino)
+            .or_default()
+            .fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 #[derive(Debug)]
 struct ReadWindow {
     ino: u64,
     offset: u64,
-    next_offset: AtomicU64,
-    bytes: PooledReadBuffer,
+    next_offset: Arc<AtomicU64>,
+    bytes: Arc<PooledReadBuffer>,
 }
 
 impl ReadWindow {
@@ -208,15 +244,15 @@ impl ReadWindow {
         };
         relative < self.bytes.len() as u64
     }
+}
 
-    fn copy_into(&self, offset: u64, out: &mut [u8]) -> usize {
-        let relative = (offset - self.offset) as usize;
-        let available = self.bytes.len().saturating_sub(relative);
-        let copy_len = available.min(out.len());
-        let end = relative + copy_len;
-        out[..copy_len].copy_from_slice(&self.bytes[relative..end]);
-        copy_len
-    }
+fn copy_window_bytes(window_offset: u64, bytes: &[u8], offset: u64, out: &mut [u8]) -> usize {
+    let relative = (offset - window_offset) as usize;
+    let available = bytes.len().saturating_sub(relative);
+    let copy_len = available.min(out.len());
+    let end = relative + copy_len;
+    out[..copy_len].copy_from_slice(&bytes[relative..end]);
+    copy_len
 }
 
 #[derive(Clone)]
@@ -576,6 +612,7 @@ impl StudioVfsAdapter {
         if read_len > size_usize {
             out.buffer.resize(read_len, 0);
         }
+        let generation = state.read_windows.invalidation_generation(ino);
         let result = state
             .vfs
             .read_into_fh(file_handle, ino, offset, &mut out)
@@ -588,17 +625,20 @@ impl StudioVfsAdapter {
                     .vfs
                     .record_fuse_read_callback(reply_len, started.elapsed(), false);
                 if written > size_usize {
-                    let mut reply = state.read_buffers.clone().acquire(reply_len);
-                    reply.copy_from_slice(&out[..reply_len]);
+                    let remainder_len = written - reply_len;
+                    let mut remainder = state.read_buffers.clone().acquire(remainder_len);
+                    remainder.copy_from_slice(&out[reply_len..written]);
                     out.truncate(written);
-                    state.read_windows.remember(
+                    state.read_windows.remember_if_current(
                         file_handle,
                         ino,
-                        offset,
                         offset.saturating_add(reply_len as u64),
-                        out,
+                        offset.saturating_add(reply_len as u64),
+                        remainder,
+                        generation,
                     );
-                    return Ok(reply);
+                    out.truncate(reply_len);
+                    return Ok(out);
                 } else {
                     state.read_windows.invalidate_handle(file_handle);
                 }
@@ -2137,6 +2177,30 @@ mod tests {
         assert_eq!(
             readahead_window_len(MACFUSE_READ_WINDOW_MAX_BYTES),
             MACFUSE_READ_WINDOW_MAX_BYTES
+        );
+    }
+
+    #[test]
+    fn read_window_store_rejects_stale_cache_fill_after_invalidation() {
+        let store = ReadWindowStore::default();
+        let pool = Arc::new(ReadBufferPool::default());
+        let generation = store.invalidation_generation(42);
+        let mut stale = Arc::clone(&pool).acquire(5);
+        stale.copy_from_slice(b"stale");
+
+        store.invalidate_inode(42);
+
+        assert!(
+            !store.remember_if_current(7, 42, 0, 0, stale, generation),
+            "window fill must be rejected after an intervening inode invalidation"
+        );
+        let mut out = [0_u8; 5];
+        assert_eq!(store.try_read(7, 42, 0, &mut out), None);
+        assert_eq!(pool.available_count(), 1);
+        assert!(
+            pool.last_available_capacity()
+                .is_some_and(|capacity| capacity >= 5),
+            "rejected stale cache buffer should be returned to the reusable pool"
         );
     }
 
