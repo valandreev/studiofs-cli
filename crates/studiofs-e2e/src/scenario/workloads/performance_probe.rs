@@ -1014,6 +1014,8 @@ struct PerformanceProbeMetricDelta {
     fetch_bytes_downloaded: u64,
     fetch_local_cache_io_calls: u64,
     fetch_total_calls: u64,
+    foreground_local_payload_reads: u64,
+    foreground_local_payload_read_bytes: u64,
     upload_completed_uploads: u64,
     upload_completed_upload_bytes: u64,
     upload_pending_snapshot_calls: u64,
@@ -1054,6 +1056,16 @@ impl PerformanceProbeMetricDelta {
                 &["fetch", "local_cache_io_calls"],
             ),
             fetch_total_calls: metric_delta(before, after, &["fetch", "fetch_total_calls"]),
+            foreground_local_payload_reads: metric_delta(
+                before,
+                after,
+                &["vfs_read_path", "foreground_local_payload_reads"],
+            ),
+            foreground_local_payload_read_bytes: metric_delta(
+                before,
+                after,
+                &["vfs_read_path", "foreground_local_payload_read_bytes"],
+            ),
             upload_completed_uploads: metric_delta(before, after, &["upload", "completed_uploads"]),
             upload_completed_upload_bytes: metric_delta(
                 before,
@@ -1180,6 +1192,12 @@ struct PerformanceProbeReadObservations {
     avg_read_mib_per_sec: f64,
     avg_read_mib_per_sec_while_upload_backlog: f64,
     avg_read_mib_per_sec_after_upload_drained: f64,
+    fuse_read_calls: u64,
+    fuse_read_bytes: u64,
+    avg_fuse_read_bytes: f64,
+    foreground_local_payload_reads: u64,
+    foreground_local_payload_read_bytes: u64,
+    avg_foreground_local_payload_read_bytes: f64,
     post_drain_read_mib_per_sec: Option<f64>,
     post_drain_read_interpretation: Option<String>,
 }
@@ -1196,6 +1214,18 @@ impl PerformanceProbeReadObservations {
         for phase in phases.iter().filter(|phase| phase.kind == "read") {
             read_total += phase.mib_per_sec;
             read_count += 1;
+            observations.fuse_read_calls = observations
+                .fuse_read_calls
+                .saturating_add(phase.delta.fuse_read_calls);
+            observations.fuse_read_bytes = observations
+                .fuse_read_bytes
+                .saturating_add(phase.delta.fuse_read_bytes);
+            observations.foreground_local_payload_reads = observations
+                .foreground_local_payload_reads
+                .saturating_add(phase.delta.foreground_local_payload_reads);
+            observations.foreground_local_payload_read_bytes = observations
+                .foreground_local_payload_read_bytes
+                .saturating_add(phase.delta.foreground_local_payload_read_bytes);
             let upload_backlog_active = phase.delta.upload_pending_bytes_before > 0
                 || phase.delta.upload_pending_bytes_after > 0
                 || phase.delta.dirty_total_bytes_before > 0
@@ -1228,6 +1258,12 @@ impl PerformanceProbeReadObservations {
             average(backlog_total, backlog_count);
         observations.avg_read_mib_per_sec_after_upload_drained =
             average(drained_total, drained_count);
+        observations.avg_fuse_read_bytes =
+            average_u64(observations.fuse_read_bytes, observations.fuse_read_calls);
+        observations.avg_foreground_local_payload_read_bytes = average_u64(
+            observations.foreground_local_payload_read_bytes,
+            observations.foreground_local_payload_reads,
+        );
         if let Some(post_drain) = phases.iter().find(|phase| phase.kind == "post-drain-read") {
             observations.post_drain_read_mib_per_sec = Some(post_drain.mib_per_sec);
             observations.post_drain_read_interpretation = Some(post_drain.interpretation.clone());
@@ -1241,5 +1277,94 @@ fn average(total: f64, count: u32) -> f64 {
         0.0
     } else {
         total / f64::from(count)
+    }
+}
+
+fn average_u64(total: u64, count: u64) -> f64 {
+    if count == 0 {
+        0.0
+    } else {
+        total as f64 / count as f64
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_observations_record_read_geometry_and_local_payload_io() {
+        let phases = vec![
+            PerformanceProbePhase::new(
+                "read-pass-1".to_string(),
+                "read".to_string(),
+                Some(1),
+                PhaseIoResult::new(2 * 1024 * 1024, Duration::from_millis(100), 17),
+                &Some(json!({
+                    "fuse_callbacks": { "read": { "calls": 0, "bytes": 0 } },
+                    "vfs_read_path": {
+                        "calls": 0,
+                        "requested_bytes": 0,
+                        "foreground_local_payload_reads": 0,
+                        "foreground_local_payload_read_bytes": 0
+                    }
+                })),
+                &Some(json!({
+                    "fuse_callbacks": { "read": { "calls": 2, "bytes": 2 * 1024 * 1024 } },
+                    "vfs_read_path": {
+                        "calls": 2,
+                        "requested_bytes": 2 * 1024 * 1024,
+                        "foreground_local_payload_reads": 2,
+                        "foreground_local_payload_read_bytes": 2 * 1024 * 1024
+                    }
+                })),
+            ),
+            PerformanceProbePhase::new(
+                "read-pass-2".to_string(),
+                "read".to_string(),
+                Some(2),
+                PhaseIoResult::new(2 * 1024 * 1024, Duration::from_millis(100), 17),
+                &Some(json!({
+                    "fuse_callbacks": { "read": { "calls": 2, "bytes": 2 * 1024 * 1024 } },
+                    "vfs_read_path": {
+                        "calls": 2,
+                        "requested_bytes": 2 * 1024 * 1024,
+                        "foreground_local_payload_reads": 2,
+                        "foreground_local_payload_read_bytes": 2 * 1024 * 1024
+                    }
+                })),
+                &Some(json!({
+                    "fuse_callbacks": { "read": { "calls": 3, "bytes": 3 * 1024 * 1024 } },
+                    "vfs_read_path": {
+                        "calls": 3,
+                        "requested_bytes": 3 * 1024 * 1024,
+                        "foreground_local_payload_reads": 3,
+                        "foreground_local_payload_read_bytes": 3 * 1024 * 1024
+                    }
+                })),
+            ),
+        ];
+
+        let observations = PerformanceProbeReadObservations::from_phases(&phases);
+
+        assert_eq!(observations.fuse_read_calls, 3);
+        assert_eq!(observations.fuse_read_bytes, 3 * 1024 * 1024);
+        assert_f64_eq(observations.avg_fuse_read_bytes, 1024.0 * 1024.0);
+        assert_eq!(observations.foreground_local_payload_reads, 3);
+        assert_eq!(
+            observations.foreground_local_payload_read_bytes,
+            3 * 1024 * 1024
+        );
+        assert_f64_eq(
+            observations.avg_foreground_local_payload_read_bytes,
+            1024.0 * 1024.0,
+        );
+    }
+
+    fn assert_f64_eq(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() <= f64::EPSILON,
+            "expected {actual} to equal {expected}"
+        );
     }
 }

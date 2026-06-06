@@ -240,6 +240,15 @@ For macFUSE 5.2.0, regular file attributes must report the same preferred I/O
 size (`st_blksize` / FUSE `blksize`) as the mount `iosize`; advertising the old
 512-byte value causes macFUSE to split large sequential reads and writes into
 small callbacks even when the mount-level `iosize` is larger.
+The mounted performance probe records SFS-491 read-geometry evidence in
+`performance-probe-summary.json`: `read_observations.fuse_read_calls`,
+`read_observations.fuse_read_bytes`, and `read_observations.avg_fuse_read_bytes`
+capture observed macFUSE callback sizing, while
+`read_observations.foreground_local_payload_reads`,
+`read_observations.foreground_local_payload_read_bytes`, and
+`read_observations.avg_foreground_local_payload_read_bytes` show whether those
+callbacks caused matching local payload reads or extra local read amplification.
+Use that report before adding any daemon-side hot read window.
 
 Regular read-only file opens return `FOPEN_KEEP_CACHE` so safe media and
 sequential-read workloads can use the kernel cache/readahead path. Write-capable
