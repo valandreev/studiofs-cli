@@ -13,7 +13,8 @@ use studiofs_bridge::posix::{
 use studiofs_meta::{DirEntry, FileType, InodeAttr, SetattrArgs, TimeSpec};
 use studiofs_vfs::{StatFs, StudioVfs};
 use tokio::runtime::Handle;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::Semaphore;
+#[cfg(test)]
 use tokio::task::JoinHandle;
 
 use crate::low_level::{DirectoryEntryBuffer, Entry, OpenReply, Reply, Request, raw};
@@ -270,42 +271,29 @@ impl StudioVfsAdapter {
         }
     }
 
-    fn try_admit_read(&self) -> Result<OwnedSemaphorePermit, i32> {
-        self.read_admission
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| libc::EAGAIN)
-    }
-
-    fn spawn_read_worker(
-        &self,
+    async fn perform_read(
+        vfs: Arc<StudioVfs>,
         ino: u64,
         file_handle: u64,
-        offset: i64,
+        offset: u64,
         size: u32,
-        permit: OwnedSemaphorePermit,
-    ) -> JoinHandle<Result<Vec<u8>, i32>> {
-        let vfs = Arc::clone(&self.vfs);
-        self.runtime_handle.spawn(async move {
-            let _permit = permit;
-            let offset = u64::try_from(offset).map_err(|_| libc::EINVAL)?;
-            let size_usize = size as usize;
-            if size_usize == 0 {
-                return Ok(Vec::new());
-            }
+    ) -> Result<Vec<u8>, i32> {
+        let size_usize = size as usize;
+        if size_usize == 0 {
+            return Ok(Vec::new());
+        }
 
-            let mut out = vec![0u8; size_usize];
-            let started = Instant::now();
-            let result = vfs.read_into_fh(file_handle, ino, offset, &mut out).await;
-            vfs.record_fuse_read_callback(size_usize, started.elapsed(), result.is_err());
-            match result {
-                Ok(written) => {
-                    out.truncate(written as usize);
-                    Ok(out)
-                }
-                Err(error) => Err(vfs_err_to_errno(&error)),
+        let mut out = vec![0u8; size_usize];
+        let started = Instant::now();
+        let result = vfs.read_into_fh(file_handle, ino, offset, &mut out).await;
+        vfs.record_fuse_read_callback(size_usize, started.elapsed(), result.is_err());
+        match result {
+            Ok(written) => {
+                out.truncate(written as usize);
+                Ok(out)
             }
-        })
+            Err(error) => Err(vfs_err_to_errno(&error)),
+        }
     }
 
     pub(crate) fn queue_read_reply(
@@ -316,24 +304,29 @@ impl StudioVfsAdapter {
         size: u32,
         request: Request,
     ) {
-        let permit = match self.try_admit_read() {
-            Ok(permit) => permit,
-            Err(errno) => {
-                let _ = Reply::new(request).error(errno);
+        let offset = match u64::try_from(offset) {
+            Ok(offset) => offset,
+            Err(_) => {
+                let _ = Reply::new(request).error(libc::EINVAL);
                 return;
             }
         };
-        let handle = self.spawn_read_worker(ino, file_handle, offset, size, permit);
+        let admission = Arc::clone(&self.read_admission);
+        let vfs = Arc::clone(&self.vfs);
         self.runtime_handle.spawn(async move {
-            match handle.await {
-                Ok(Ok(bytes)) => {
-                    let _ = Reply::new(request).read_buffer(&bytes);
-                }
-                Ok(Err(errno)) => {
-                    let _ = Reply::new(request).error(errno);
-                }
+            let _permit = match admission.acquire_owned().await {
+                Ok(permit) => permit,
                 Err(_) => {
                     let _ = Reply::new(request).error(libc::EIO);
+                    return;
+                }
+            };
+            match Self::perform_read(vfs, ino, file_handle, offset, size).await {
+                Ok(bytes) => {
+                    let _ = Reply::new(request).read_buffer(&bytes);
+                }
+                Err(errno) => {
+                    let _ = Reply::new(request).error(errno);
                 }
             }
         });
@@ -347,10 +340,15 @@ impl StudioVfsAdapter {
         offset: i64,
         size: u32,
     ) -> Result<QueuedReadForTest, i32> {
-        let permit = self.try_admit_read()?;
+        let offset = u64::try_from(offset).map_err(|_| libc::EINVAL)?;
+        let admission = Arc::clone(&self.read_admission);
+        let vfs = Arc::clone(&self.vfs);
         Ok(QueuedReadForTest {
             runtime_handle: self.runtime_handle.clone(),
-            handle: self.spawn_read_worker(ino, file_handle, offset, size, permit),
+            handle: self.runtime_handle.spawn(async move {
+                let _permit = admission.acquire_owned().await.map_err(|_| libc::EIO)?;
+                Self::perform_read(vfs, ino, file_handle, offset, size).await
+            }),
         })
     }
 

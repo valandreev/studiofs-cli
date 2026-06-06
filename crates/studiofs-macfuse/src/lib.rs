@@ -624,7 +624,7 @@ mod tests {
     }
 
     #[test]
-    fn read_only_adapter_rejects_read_when_async_queue_is_full() {
+    fn read_only_adapter_delays_read_when_async_queue_is_full() {
         let fixture =
             studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-async-read-full")
                 .expect("create VFS fixture");
@@ -657,18 +657,40 @@ mod tests {
             .queue_read_for_test(attr.ino, reader.file_handle(), 0, 7)
             .expect("first read should enter the bounded queue");
 
-        let rejected = adapter
+        let delayed = adapter
             .queue_read_for_test(attr.ino, reader.file_handle(), 7, 7)
-            .expect_err("second read should be rejected while queue is full");
+            .expect("second read should wait for bounded queue capacity");
 
-        assert_eq!(rejected, libc::EAGAIN);
+        assert!(
+            !delayed.is_finished(),
+            "second read should wait instead of returning EAGAIN while queue is full"
+        );
 
         adapter
             .release(attr.ino, writer.file_handle())
             .expect("release writer gate");
         let bytes = pending.wait().expect("pending read should complete");
+        let delayed_bytes = delayed.wait().expect("delayed read should complete");
 
         assert_eq!(&bytes[..], b"bounded");
+        assert_eq!(&delayed_bytes[..], b" macFUS");
+    }
+
+    #[test]
+    fn read_only_adapter_rejects_negative_read_offset_before_queueing() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-async-read-negative-offset",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+
+        let rejected = adapter
+            .queue_read_for_test(1, 1, -1, 1)
+            .expect_err("negative offsets should fail before queueing");
+
+        assert_eq!(rejected, libc::EINVAL);
     }
 
     #[test]
