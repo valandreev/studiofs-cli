@@ -448,6 +448,9 @@ impl SessionConfig {
                 args.push("-onovncache".to_owned());
                 args.push("-odaemon_timeout=60".to_owned());
                 args.push(format!("-oiosize={MACOS_FUSE_IOSIZE_BYTES}"));
+                args.push(format!("-omax_read={MACOS_FUSE_IOSIZE_BYTES}"));
+                args.push("-onoappledouble".to_owned());
+                args.push("-odefer_permissions".to_owned());
             }
         }
         args.push("-osparse".to_owned());

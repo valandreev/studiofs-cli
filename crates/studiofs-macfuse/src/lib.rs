@@ -359,6 +359,9 @@ mod tests {
         assert!(mount_args.iter().any(|arg| arg == "-onovncache"));
         assert!(mount_args.iter().any(|arg| arg == "-odaemon_timeout=60"));
         assert!(mount_args.iter().any(|arg| arg == "-oiosize=1048576"));
+        assert!(mount_args.iter().any(|arg| arg == "-omax_read=1048576"));
+        assert!(mount_args.iter().any(|arg| arg == "-onoappledouble"));
+        assert!(mount_args.iter().any(|arg| arg == "-odefer_permissions"));
         assert!(mount_args.iter().any(|arg| arg == "-osparse"));
         assert!(!mount_args.iter().any(|arg| arg == "-odirect_io"));
         assert!(!mount_args.iter().any(|arg| arg == "-onolocalcaches"));
