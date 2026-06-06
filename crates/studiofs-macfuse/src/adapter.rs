@@ -112,6 +112,8 @@ impl ReadBufferPool {
 struct ReadWindowStore {
     windows: DashMap<u64, ReadWindow>,
     handles_by_inode: DashMap<u64, HashSet<u64>>,
+    // Keep invalidated inode generations for the mount lifetime: dropping them
+    // while async reads are still in flight can make an old fill look current.
     invalidation_generations: DashMap<u64, AtomicU64>,
 }
 
@@ -232,6 +234,8 @@ struct ReadWindow {
 
 impl ReadWindow {
     fn contains(&self, offset: u64, len: usize) -> bool {
+        // Read windows are sequential readahead only; random-access reads should
+        // fall back to VFS instead of advancing this per-handle window.
         if len == 0 || offset != self.next_offset.load(Ordering::Acquire) {
             return false;
         }
