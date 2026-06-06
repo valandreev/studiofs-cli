@@ -10,7 +10,7 @@ members = [
     "crates/studiofs-macfuse",
     "crates/studiofs-winfsp",
     "crates/studiofs-e2e",
-    "crates/studiofs-scenario", "target/tokio_test",
+    "crates/studiofs-scenario",
 ]
 resolver = "3"
 
