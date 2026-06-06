@@ -7434,6 +7434,16 @@ impl StudioVfs {
                 } else {
                     vfs_read_requested_bytes as f64 / vfs_read_calls as f64
                 },
+                foreground_local_payload_reads: self
+                    .state
+                    .read
+                    .foreground_local_payload_reads
+                    .load(Ordering::Relaxed),
+                foreground_local_payload_read_bytes: self
+                    .state
+                    .read
+                    .foreground_local_payload_read_bytes
+                    .load(Ordering::Relaxed),
             },
             fuse_callbacks: VfsFuseCallbackStats {
                 read: Self::build_fuse_io_stats(

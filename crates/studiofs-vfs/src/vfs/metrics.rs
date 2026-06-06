@@ -298,6 +298,10 @@ pub struct VfsReadPathStats {
     pub requested_bytes: u64,
     /// Average read request size in bytes.
     pub avg_requested_bytes: f64,
+    /// Foreground local payload reads served for VFS reads.
+    pub foreground_local_payload_reads: u64,
+    /// Foreground local payload bytes served for VFS reads.
+    pub foreground_local_payload_read_bytes: u64,
 }
 
 /// Landing-zone statistics for accepted writes and sync points.
