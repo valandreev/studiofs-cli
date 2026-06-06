@@ -33,6 +33,7 @@ const MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY: usize = 1024 * 1024;
 // Keep allocator-rounded buffers that grew slightly beyond the reusable read
 // cap, while dropping genuinely oversized requests instead of pinning them.
 const MACFUSE_READ_BUFFER_POOL_RETAINED_CAPACITY: usize = MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY * 2;
+const MACFUSE_READ_WINDOW_MAX_BYTES: usize = 1024 * 1024;
 
 /// macFUSE open-cache flags chosen for one file handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +57,7 @@ pub(crate) struct StudioVfsAdapter {
     read_admission: Arc<Semaphore>,
     read_queue_byte_limit: u32,
     read_buffers: Arc<ReadBufferPool>,
+    read_windows: Arc<ReadWindowStore>,
 }
 
 #[derive(Debug, Default)]
@@ -99,6 +101,88 @@ impl ReadBufferPool {
     fn last_available_len(&self) -> Option<usize> {
         self.buffers.lock().last().map(Vec::len)
     }
+}
+
+#[derive(Debug, Default)]
+struct ReadWindowStore {
+    windows: ParkingMutex<HashMap<u64, ReadWindow>>,
+}
+
+impl ReadWindowStore {
+    fn try_read(&self, file_handle: u64, ino: u64, offset: u64, out: &mut [u8]) -> Option<usize> {
+        if out.is_empty() {
+            return None;
+        }
+        let mut windows = self.windows.lock();
+        let window = windows.get_mut(&file_handle)?;
+        if window.ino != ino || !window.contains(offset, out.len()) {
+            return None;
+        }
+        let copied = window.copy_into(offset, out);
+        window.next_offset = offset.saturating_add(copied as u64);
+        Some(copied)
+    }
+
+    fn remember(&self, file_handle: u64, ino: u64, offset: u64, next_offset: u64, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let mut windows = self.windows.lock();
+        windows.insert(
+            file_handle,
+            ReadWindow {
+                ino,
+                offset,
+                next_offset,
+                bytes: bytes.to_vec(),
+            },
+        );
+    }
+
+    fn invalidate_handle(&self, file_handle: u64) {
+        self.windows.lock().remove(&file_handle);
+    }
+
+    fn invalidate_inode(&self, ino: u64) {
+        self.windows.lock().retain(|_, window| window.ino != ino);
+    }
+}
+
+#[derive(Debug)]
+struct ReadWindow {
+    ino: u64,
+    offset: u64,
+    next_offset: u64,
+    bytes: Vec<u8>,
+}
+
+impl ReadWindow {
+    fn contains(&self, offset: u64, len: usize) -> bool {
+        if offset != self.next_offset {
+            return false;
+        }
+        let Some(relative) = offset.checked_sub(self.offset) else {
+            return false;
+        };
+        let relative = relative as usize;
+        relative
+            .checked_add(len)
+            .is_some_and(|end| end <= self.bytes.len())
+    }
+
+    fn copy_into(&self, offset: u64, out: &mut [u8]) -> usize {
+        let relative = (offset - self.offset) as usize;
+        let end = relative + out.len();
+        out.copy_from_slice(&self.bytes[relative..end]);
+        out.len()
+    }
+}
+
+#[derive(Clone)]
+struct ReadExecutionState {
+    vfs: Arc<StudioVfs>,
+    read_buffers: Arc<ReadBufferPool>,
+    read_windows: Arc<ReadWindowStore>,
 }
 
 #[derive(Debug)]
@@ -152,6 +236,13 @@ pub(crate) fn max_retained_read_buffer_capacity_for_test() -> usize {
 fn clamp_reusable_read_size(size: u32, read_queue_byte_limit: u32) -> u32 {
     size.min(read_queue_byte_limit)
         .min(MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY as u32)
+}
+
+fn readahead_window_len(size: usize) -> usize {
+    if size == 0 {
+        return 0;
+    }
+    size.saturating_mul(2).min(MACFUSE_READ_WINDOW_MAX_BYTES)
 }
 
 #[cfg(test)]
@@ -221,6 +312,7 @@ impl StudioVfsAdapter {
             read_admission: Arc::new(Semaphore::new(read_queue_byte_limit as usize)),
             read_queue_byte_limit,
             read_buffers: Arc::new(ReadBufferPool::default()),
+            read_windows: Arc::new(ReadWindowStore::default()),
         }
     }
 
@@ -416,27 +508,62 @@ impl StudioVfsAdapter {
     }
 
     async fn perform_read(
-        vfs: Arc<StudioVfs>,
+        state: ReadExecutionState,
         ino: u64,
         file_handle: u64,
         offset: u64,
         size: u32,
         started: Instant,
-        read_buffers: Arc<ReadBufferPool>,
     ) -> Result<PooledReadBuffer, i32> {
         let size = clamp_reusable_read_size(size, MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY as u32);
         let size_usize = size as usize;
 
-        let mut out = read_buffers.acquire(size_usize);
-        let result = vfs.read_into_fh(file_handle, ino, offset, &mut out).await;
+        let mut out = state.read_buffers.acquire(size_usize);
+        if state
+            .read_windows
+            .try_read(file_handle, ino, offset, &mut out)
+            .is_some()
+        {
+            state
+                .vfs
+                .record_fuse_read_callback(size_usize, started.elapsed(), false);
+            return Ok(out);
+        }
+
+        let read_len = readahead_window_len(size_usize);
+        if read_len > size_usize {
+            out.buffer.resize(read_len, 0);
+        }
+        let result = state
+            .vfs
+            .read_into_fh(file_handle, ino, offset, &mut out)
+            .await;
         match result {
             Ok(written) => {
-                vfs.record_fuse_read_callback(written as usize, started.elapsed(), false);
-                out.truncate(written as usize);
+                let written = written as usize;
+                let reply_len = written.min(size_usize);
+                state
+                    .vfs
+                    .record_fuse_read_callback(reply_len, started.elapsed(), false);
+                if written > size_usize {
+                    state.read_windows.remember(
+                        file_handle,
+                        ino,
+                        offset,
+                        offset.saturating_add(reply_len as u64),
+                        &out[..written],
+                    );
+                } else {
+                    state.read_windows.invalidate_handle(file_handle);
+                }
+                out.truncate(reply_len);
                 Ok(out)
             }
             Err(error) => {
-                vfs.record_fuse_read_callback(size_usize, started.elapsed(), true);
+                state
+                    .vfs
+                    .record_fuse_read_callback(size_usize, started.elapsed(), true);
+                state.read_windows.invalidate_handle(file_handle);
                 Err(vfs_err_to_errno(&error))
             }
         }
@@ -455,8 +582,11 @@ impl StudioVfsAdapter {
             return;
         };
         let admission = Arc::clone(&self.read_admission);
-        let vfs = Arc::clone(&self.vfs);
-        let read_buffers = Arc::clone(&self.read_buffers);
+        let state = ReadExecutionState {
+            vfs: Arc::clone(&self.vfs),
+            read_buffers: Arc::clone(&self.read_buffers),
+            read_windows: Arc::clone(&self.read_windows),
+        };
         let size = clamp_reusable_read_size(size, self.read_queue_byte_limit);
         let started = Instant::now();
         // TODO(SFS-489): wire macFUSE INTERRUPT notifications into this task
@@ -468,9 +598,7 @@ impl StudioVfsAdapter {
             };
             // Keep the permit until after the reply consumes `bytes`, so queued read
             // memory remains bounded for the whole kernel-reply handoff.
-            match Self::perform_read(vfs, ino, file_handle, offset, size, started, read_buffers)
-                .await
-            {
+            match Self::perform_read(state, ino, file_handle, offset, size, started).await {
                 Ok(bytes) => {
                     let _ = Reply::new(request).read_buffer(&bytes);
                 }
@@ -491,8 +619,11 @@ impl StudioVfsAdapter {
     ) -> Result<QueuedReadForTest, i32> {
         let offset = u64::try_from(offset).map_err(|_| libc::EINVAL)?;
         let admission = Arc::clone(&self.read_admission);
-        let vfs = Arc::clone(&self.vfs);
-        let read_buffers = Arc::clone(&self.read_buffers);
+        let state = ReadExecutionState {
+            vfs: Arc::clone(&self.vfs),
+            read_buffers: Arc::clone(&self.read_buffers),
+            read_windows: Arc::clone(&self.read_windows),
+        };
         let size = clamp_reusable_read_size(size, self.read_queue_byte_limit);
         let started = Instant::now();
         Ok(QueuedReadForTest {
@@ -502,7 +633,7 @@ impl StudioVfsAdapter {
                     .acquire_many_owned(size)
                     .await
                     .map_err(|_| libc::EIO)?;
-                Self::perform_read(vfs, ino, file_handle, offset, size, started, read_buffers).await
+                Self::perform_read(state, ino, file_handle, offset, size, started).await
             }),
         })
     }
@@ -519,9 +650,12 @@ impl StudioVfsAdapter {
             return Err(libc::EROFS);
         }
         let offset = u64::try_from(offset).map_err(|_| libc::EINVAL)?;
-        self.runtime_handle
+        let written = self
+            .runtime_handle
             .block_on(self.vfs.write_fh(file_handle, ino, offset, data))
-            .map_err(|error| vfs_err_to_errno(&error))
+            .map_err(|error| vfs_err_to_errno(&error))?;
+        self.read_windows.invalidate_inode(ino);
+        Ok(written)
     }
 
     /// Flush file data through a VFS file handle.
@@ -560,9 +694,12 @@ impl StudioVfsAdapter {
         if self.read_only {
             return Err(libc::EROFS);
         }
-        self.vfs
+        let attr = self
+            .vfs
             .setattr_with_handle(file_handle, ino, SetattrArgs::size_only(size))
-            .map_err(|error| vfs_err_to_errno(&error))
+            .map_err(|error| vfs_err_to_errno(&error))?;
+        self.read_windows.invalidate_inode(ino);
+        Ok(attr)
     }
 
     /// Change file attributes through the VFS setattr path.
@@ -575,16 +712,22 @@ impl StudioVfsAdapter {
         if self.read_only {
             return Err(libc::EROFS);
         }
-        self.vfs
+        let attr = self
+            .vfs
             .setattr_with_handle(file_handle, ino, args)
-            .map_err(|error| vfs_err_to_errno(&error))
+            .map_err(|error| vfs_err_to_errno(&error))?;
+        self.read_windows.invalidate_inode(ino);
+        Ok(attr)
     }
 
     /// Release a file handle opened through this adapter.
     pub(crate) fn release(&self, _ino: u64, file_handle: u64) -> Result<(), i32> {
-        self.runtime_handle
+        let result = self
+            .runtime_handle
             .block_on(self.vfs.release_fh(file_handle))
-            .map_err(|error| vfs_err_to_errno(&error))
+            .map_err(|error| vfs_err_to_errno(&error));
+        self.read_windows.invalidate_handle(file_handle);
+        result
     }
 
     /// Read directory entries from VFS.

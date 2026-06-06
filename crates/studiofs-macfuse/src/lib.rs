@@ -845,6 +845,110 @@ mod tests {
     }
 
     #[test]
+    fn queued_adjacent_reads_reuse_per_handle_window_without_second_vfs_read() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-read-window-hit")
+                .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"window.bin",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        let payload = b"0123456789abcdef";
+        fixture
+            .runtime()
+            .block_on(vfs.write(attr.ino, 0, payload))
+            .expect("seed payload");
+        vfs.reset_diagnostics_observability();
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let reader = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open reader through macFUSE adapter");
+
+        let first = adapter
+            .queue_read_for_test(attr.ino, reader.file_handle(), 0, 8)
+            .expect("queue first read");
+        assert_eq!(
+            &first.wait().expect("first read should complete")[..],
+            b"01234567"
+        );
+        let after_first = vfs.write_path_observability_snapshot();
+        assert_eq!(after_first.vfs_read_path.calls, 1);
+
+        let second = adapter
+            .queue_read_for_test(attr.ino, reader.file_handle(), 8, 8)
+            .expect("queue adjacent read");
+        assert_eq!(
+            &second.wait().expect("second read should complete")[..],
+            b"89abcdef"
+        );
+
+        let after_second = vfs.write_path_observability_snapshot();
+        assert_eq!(after_second.fuse_callbacks.read.calls, 2);
+        assert_eq!(
+            after_second.vfs_read_path.calls, 1,
+            "adjacent read should be served from the macFUSE per-handle window"
+        );
+    }
+
+    #[test]
+    fn queued_non_adjacent_read_falls_back_to_vfs_instead_of_reusing_window() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-read-window-random")
+                .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"random.bin",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        let payload = b"0123456789abcdef";
+        fixture
+            .runtime()
+            .block_on(vfs.write(attr.ino, 0, payload))
+            .expect("seed payload");
+        vfs.reset_diagnostics_observability();
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let reader = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open reader through macFUSE adapter");
+
+        let first = adapter
+            .queue_read_for_test(attr.ino, reader.file_handle(), 0, 8)
+            .expect("queue first read");
+        assert_eq!(
+            &first.wait().expect("first read should complete")[..],
+            b"01234567"
+        );
+
+        let random = adapter
+            .queue_read_for_test(attr.ino, reader.file_handle(), 4, 4)
+            .expect("queue non-adjacent read");
+        assert_eq!(
+            &random.wait().expect("random read should complete")[..],
+            b"4567"
+        );
+
+        let metrics = vfs.write_path_observability_snapshot();
+        assert_eq!(metrics.fuse_callbacks.read.calls, 2);
+        assert_eq!(
+            metrics.vfs_read_path.calls, 2,
+            "non-adjacent reads should fall back to VFS instead of using sequential window"
+        );
+    }
+
+    #[test]
     fn synchronous_adapter_read_does_not_take_buffer_from_queued_read_pool() {
         let fixture =
             studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-sync-read-no-pool")
