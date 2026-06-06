@@ -136,7 +136,7 @@ impl ReadWindowStore {
         if copied == 0 || self.invalidation_generation(ino) != generation {
             return None;
         }
-        next_offset.store(offset.saturating_add(copied as u64), Ordering::Relaxed);
+        next_offset.store(offset.saturating_add(copied as u64), Ordering::Release);
         Some(copied)
     }
 
@@ -215,14 +215,14 @@ impl ReadWindowStore {
     fn invalidation_generation(&self, ino: u64) -> u64 {
         self.invalidation_generations
             .get(&ino)
-            .map_or(0, |generation| generation.load(Ordering::Relaxed))
+            .map_or(0, |generation| generation.load(Ordering::Acquire))
     }
 
     fn bump_inode_generation(&self, ino: u64) {
         self.invalidation_generations
             .entry(ino)
             .or_default()
-            .fetch_add(1, Ordering::Relaxed);
+            .fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -236,7 +236,7 @@ struct ReadWindow {
 
 impl ReadWindow {
     fn contains(&self, offset: u64, len: usize) -> bool {
-        if len == 0 || offset != self.next_offset.load(Ordering::Relaxed) {
+        if len == 0 || offset != self.next_offset.load(Ordering::Acquire) {
             return false;
         }
         let Some(relative) = offset.checked_sub(self.offset) else {
