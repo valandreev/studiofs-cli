@@ -16,6 +16,7 @@ use tokio::runtime::Handle;
 use tokio::sync::Semaphore;
 #[cfg(test)]
 use tokio::task::JoinHandle;
+use tracing::debug;
 
 use crate::low_level::{DirectoryEntryBuffer, Entry, OpenReply, Reply, Request, raw};
 
@@ -46,6 +47,7 @@ pub(crate) struct StudioVfsAdapter {
     readdir_cache_last_pruned: Mutex<Option<Instant>>,
     readdir_cache_ready: Condvar,
     read_admission: Arc<Semaphore>,
+    read_queue_byte_limit: u32,
 }
 
 #[cfg(test)]
@@ -95,6 +97,7 @@ impl StudioVfsAdapter {
         read_only: bool,
         read_queue_byte_limit: usize,
     ) -> Self {
+        let read_queue_byte_limit = read_queue_byte_limit.max(1).min(u32::MAX as usize) as u32;
         Self {
             vfs,
             runtime_handle,
@@ -104,7 +107,8 @@ impl StudioVfsAdapter {
             readdir_cache: Mutex::new(HashMap::new()),
             readdir_cache_last_pruned: Mutex::new(None),
             readdir_cache_ready: Condvar::new(),
-            read_admission: Arc::new(Semaphore::new(read_queue_byte_limit)),
+            read_admission: Arc::new(Semaphore::new(read_queue_byte_limit as usize)),
+            read_queue_byte_limit,
         }
     }
 
@@ -320,6 +324,7 @@ impl StudioVfsAdapter {
         };
         let admission = Arc::clone(&self.read_admission);
         let vfs = Arc::clone(&self.vfs);
+        let size = size.min(self.read_queue_byte_limit);
         self.runtime_handle.spawn(async move {
             let _permit = match admission.acquire_many_owned(size).await {
                 Ok(permit) => permit,
@@ -350,6 +355,7 @@ impl StudioVfsAdapter {
         let offset = u64::try_from(offset).map_err(|_| libc::EINVAL)?;
         let admission = Arc::clone(&self.read_admission);
         let vfs = Arc::clone(&self.vfs);
+        let size = size.min(self.read_queue_byte_limit);
         Ok(QueuedReadForTest {
             runtime_handle: self.runtime_handle.clone(),
             handle: self.runtime_handle.spawn(async move {
@@ -1207,6 +1213,13 @@ pub extern "C" fn studiofs_macfuse_read(
     // SAFETY: macFUSE passes a valid `fuse_file_info` pointer for read.
     let file_handle = unsafe { (*fi).fh };
     let Some(request) = owned_request(req) else {
+        debug!(
+            ino,
+            file_handle,
+            offset = off,
+            size,
+            "macFUSE read request ownership unavailable"
+        );
         return;
     };
     state

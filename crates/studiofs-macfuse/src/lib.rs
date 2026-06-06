@@ -732,6 +732,42 @@ mod tests {
     }
 
     #[test]
+    fn read_only_adapter_caps_oversized_read_to_queue_byte_limit() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-async-read-cap")
+                .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"cap.txt",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        fixture
+            .runtime()
+            .block_on(vfs.write(attr.ino, 0, b"capped"))
+            .expect("seed payload");
+        let adapter = super::adapter::StudioVfsAdapter::new_with_read_queue_byte_limit_for_test(
+            vfs.clone(),
+            fixture.runtime().handle().clone(),
+            4,
+        );
+        let reader = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open reader through macFUSE adapter");
+
+        let queued = adapter
+            .queue_read_for_test(attr.ino, reader.file_handle(), 0, 6)
+            .expect("queue oversized read");
+        let bytes = queued.wait().expect("oversized read should complete");
+
+        assert_eq!(&bytes[..], b"capp");
+    }
+
+    #[test]
     fn adapter_write_keeps_accepted_bytes_visible_to_same_mount_reader() {
         let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
             "macfuse-adapter-write-read-after-write",
