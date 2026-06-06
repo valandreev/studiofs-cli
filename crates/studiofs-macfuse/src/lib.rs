@@ -769,7 +769,10 @@ mod tests {
             &first.wait().expect("first read should complete")[..],
             b"reusable"
         );
-        assert_eq!(adapter.reusable_read_buffer_count_for_test(), 1);
+        assert!(
+            adapter.reusable_read_buffer_count_for_test() >= 1,
+            "reply and replaced read-window buffers should remain reusable"
+        );
         assert!(
             adapter
                 .reusable_read_buffer_capacity_for_test()
@@ -783,7 +786,10 @@ mod tests {
             &second.wait().expect("second read should complete")[..],
             b"macFUSE"
         );
-        assert_eq!(adapter.reusable_read_buffer_count_for_test(), 1);
+        assert!(
+            adapter.reusable_read_buffer_count_for_test() >= 1,
+            "reply and replaced read-window buffers should remain reusable"
+        );
         assert!(
             adapter
                 .reusable_read_buffer_capacity_for_test()
@@ -823,7 +829,10 @@ mod tests {
             &first.wait().expect("first read should complete")[..],
             b"small"
         );
-        assert_eq!(adapter.reusable_read_buffer_count_for_test(), 1);
+        assert!(
+            adapter.reusable_read_buffer_count_for_test() >= 1,
+            "reply and replaced read-window buffers should remain reusable"
+        );
         let first_capacity = adapter
             .reusable_read_buffer_capacity_for_test()
             .expect("first queued read should recycle one buffer");
@@ -836,7 +845,10 @@ mod tests {
             &second.wait().expect("second read should complete")[..],
             b"small then larger read"
         );
-        assert_eq!(adapter.reusable_read_buffer_count_for_test(), 1);
+        assert!(
+            adapter.reusable_read_buffer_count_for_test() >= 1,
+            "reply and replaced read-window buffers should remain reusable"
+        );
         let second_capacity = adapter
             .reusable_read_buffer_capacity_for_test()
             .expect("second queued read should recycle one buffer");
@@ -945,6 +957,58 @@ mod tests {
         assert_eq!(
             metrics.vfs_read_path.calls, 2,
             "non-adjacent reads should fall back to VFS instead of using sequential window"
+        );
+    }
+
+    #[test]
+    fn queued_adjacent_eof_read_returns_partial_window_bytes_without_vfs_fallback() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-read-window-eof")
+                .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"window-eof.bin",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        let payload = b"0123456789abcdef";
+        fixture
+            .runtime()
+            .block_on(vfs.write(attr.ino, 0, payload))
+            .expect("seed payload");
+        vfs.reset_diagnostics_observability();
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let reader = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open reader through macFUSE adapter");
+
+        let first = adapter
+            .queue_read_for_test(attr.ino, reader.file_handle(), 0, 8)
+            .expect("queue first read");
+        assert_eq!(
+            &first.wait().expect("first read should complete")[..],
+            b"01234567"
+        );
+
+        let eof = adapter
+            .queue_read_for_test(attr.ino, reader.file_handle(), 8, 32)
+            .expect("queue EOF-spanning adjacent read");
+        assert_eq!(
+            &eof.wait().expect("EOF read should complete")[..],
+            b"89abcdef"
+        );
+
+        let metrics = vfs.write_path_observability_snapshot();
+        assert_eq!(metrics.fuse_callbacks.read.calls, 2);
+        assert_eq!(metrics.fuse_callbacks.read.bytes, payload.len() as u64);
+        assert_eq!(
+            metrics.vfs_read_path.calls, 1,
+            "EOF-spanning adjacent read should be served from the partial macFUSE window"
         );
     }
 

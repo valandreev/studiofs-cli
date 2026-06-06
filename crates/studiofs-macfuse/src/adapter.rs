@@ -4,7 +4,10 @@ use std::mem::{self, MaybeUninit};
 use std::ops::{Deref, DerefMut};
 use std::os::raw::c_char;
 use std::os::unix::ffi::OsStrExt;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{
+    Arc, Condvar, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -116,16 +119,25 @@ impl ReadWindowStore {
         if out.is_empty() {
             return None;
         }
-        let mut window = self.windows.get_mut(&file_handle)?;
+        let window = self.windows.get(&file_handle)?;
         if window.ino != ino || !window.contains(offset, out.len()) {
             return None;
         }
         let copied = window.copy_into(offset, out);
-        window.next_offset = offset.saturating_add(copied as u64);
+        window
+            .next_offset
+            .store(offset.saturating_add(copied as u64), Ordering::Relaxed);
         Some(copied)
     }
 
-    fn remember(&self, file_handle: u64, ino: u64, offset: u64, next_offset: u64, bytes: Vec<u8>) {
+    fn remember(
+        &self,
+        file_handle: u64,
+        ino: u64,
+        offset: u64,
+        next_offset: u64,
+        bytes: PooledReadBuffer,
+    ) {
         if bytes.is_empty() {
             return;
         }
@@ -134,7 +146,7 @@ impl ReadWindowStore {
             ReadWindow {
                 ino,
                 offset,
-                next_offset,
+                next_offset: AtomicU64::new(next_offset),
                 bytes,
             },
         ) {
@@ -153,16 +165,15 @@ impl ReadWindowStore {
     }
 
     fn invalidate_inode(&self, ino: u64) {
-        let Some((_, handles)) = self.handles_by_inode.remove(&ino) else {
+        let Some(handles) = self
+            .handles_by_inode
+            .get(&ino)
+            .map(|handles| handles.clone())
+        else {
             return;
         };
         for file_handle in handles {
-            if let Some(window) = self.windows.get(&file_handle)
-                && window.ino != ino
-            {
-                continue;
-            }
-            self.windows.remove(&file_handle);
+            self.invalidate_handle(file_handle);
         }
     }
 
@@ -183,29 +194,28 @@ impl ReadWindowStore {
 struct ReadWindow {
     ino: u64,
     offset: u64,
-    next_offset: u64,
-    bytes: Vec<u8>,
+    next_offset: AtomicU64,
+    bytes: PooledReadBuffer,
 }
 
 impl ReadWindow {
     fn contains(&self, offset: u64, len: usize) -> bool {
-        if offset != self.next_offset {
+        if len == 0 || offset != self.next_offset.load(Ordering::Relaxed) {
             return false;
         }
         let Some(relative) = offset.checked_sub(self.offset) else {
             return false;
         };
-        let relative = relative as usize;
-        relative
-            .checked_add(len)
-            .is_some_and(|end| end <= self.bytes.len())
+        relative < self.bytes.len() as u64
     }
 
     fn copy_into(&self, offset: u64, out: &mut [u8]) -> usize {
         let relative = (offset - self.offset) as usize;
-        let end = relative + out.len();
-        out.copy_from_slice(&self.bytes[relative..end]);
-        out.len()
+        let available = self.bytes.len().saturating_sub(relative);
+        let copy_len = available.min(out.len());
+        let end = relative + copy_len;
+        out[..copy_len].copy_from_slice(&self.bytes[relative..end]);
+        copy_len
     }
 }
 
@@ -551,14 +561,14 @@ impl StudioVfsAdapter {
         let size_usize = size as usize;
 
         let mut out = state.read_buffers.clone().acquire(size_usize);
-        if state
+        if let Some(copied) = state
             .read_windows
             .try_read(file_handle, ino, offset, &mut out)
-            .is_some()
         {
+            out.truncate(copied);
             state
                 .vfs
-                .record_fuse_read_callback(size_usize, started.elapsed(), false);
+                .record_fuse_read_callback(copied, started.elapsed(), false);
             return Ok(out);
         }
 
@@ -578,16 +588,15 @@ impl StudioVfsAdapter {
                     .vfs
                     .record_fuse_read_callback(reply_len, started.elapsed(), false);
                 if written > size_usize {
-                    let mut window_bytes = mem::take(&mut out.buffer);
-                    window_bytes.truncate(written);
                     let mut reply = state.read_buffers.clone().acquire(reply_len);
-                    reply.copy_from_slice(&window_bytes[..reply_len]);
+                    reply.copy_from_slice(&out[..reply_len]);
+                    out.truncate(written);
                     state.read_windows.remember(
                         file_handle,
                         ino,
                         offset,
                         offset.saturating_add(reply_len as u64),
-                        window_bytes,
+                        out,
                     );
                     return Ok(reply);
                 } else {
