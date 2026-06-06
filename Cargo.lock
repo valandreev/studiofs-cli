@@ -4814,6 +4814,7 @@ dependencies = [
  "cc",
  "dashmap",
  "libc",
+ "lru",
  "parking_lot",
  "serde",
  "serde_json",

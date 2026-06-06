@@ -1251,15 +1251,21 @@ impl StudioVfs {
 
     /// Unlink the entry `name` from directory `parent`.
     pub fn unlink(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
+        Self::run_sync_future(self.unlink_inner(parent, name)).map(|_| ())
+    }
+
+    /// Unlink the entry `name` and return the removed inode attributes when
+    /// the entry came from durable metadata.
+    pub fn unlink_with_attr(&self, parent: Ino, name: &[u8]) -> VfsResult<Option<InodeAttr>> {
         Self::run_sync_future(self.unlink_inner(parent, name))
     }
 
-    async fn unlink_inner(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
+    async fn unlink_inner(&self, parent: Ino, name: &[u8]) -> VfsResult<Option<InodeAttr>> {
         let namespace_mutations = self.namespace_mutations();
         self.enforce_access(parent, AccessLevel::ReadWrite)?;
         if self.unlink_ignored_entry(parent, name) || self.ignored_dir_attr(parent).is_some() {
             namespace_mutations.record_removal(parent, name, std::iter::empty());
-            return Ok(());
+            return Ok(None);
         }
 
         let meta = self.sync_meta();
@@ -1279,20 +1285,20 @@ impl StudioVfs {
                 self.unlink_without_open_handles(&meta, parent, name, unlink_target)
                     .await?
             }) else {
-                return Ok(());
+                return Ok(None);
             };
 
             namespace_mutations.record_removal(parent, name, [unlinked_attr.ino]);
             if unlinked_attr.nlink > 0 {
                 self.state.namespace.attr_read_cache.lock().put(
                     unlinked_attr.ino,
-                    unlinked_attr,
+                    unlinked_attr.clone(),
                     ATTR_CACHE_TTL,
                     Instant::now(),
                 );
             }
             meta.request_eager_flush();
-            Ok(())
+            Ok(Some(unlinked_attr))
         }
         .await;
         drop(delete_session);
@@ -1481,7 +1487,7 @@ impl StudioVfs {
             self.bump_namespace_for_parents([new_parent]);
             let result = self.unlink_inner(parent, name).await;
             match &result {
-                Ok(()) => debug!(
+                Ok(_) => debug!(
                     parent,
                     name = %name_display,
                     source_ino = source_entry.ino,
@@ -1501,7 +1507,7 @@ impl StudioVfs {
                     "VFS rename failed during ignored target unlink"
                 ),
             }
-            return result;
+            return result.map(|_| ());
         }
         debug!(
             parent,

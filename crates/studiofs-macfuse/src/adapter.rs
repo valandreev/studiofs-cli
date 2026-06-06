@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, OsStr};
 use std::mem::{self, MaybeUninit};
+use std::num::NonZeroUsize;
 use std::ops::{Deref, DerefMut};
 use std::os::raw::c_char;
 use std::os::unix::ffi::OsStrExt;
@@ -12,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use libc::{mode_t, off_t, size_t, stat, statvfs};
+use lru::LruCache;
 use parking_lot::Mutex as ParkingMutex;
 use studiofs_bridge::posix::{
     BridgeFileAttr, BridgeFileType, posix_flags_to_open_flags, to_bridge_attr, vfs_err_to_errno,
@@ -63,7 +65,7 @@ pub(crate) struct StudioVfsAdapter {
     readdir_cache: Mutex<HashMap<u64, ReaddirCacheEntry>>,
     readdir_cache_last_pruned: Mutex<Option<Instant>>,
     readdir_cache_ready: Condvar,
-    open_cache_snapshots: DashMap<u64, MacFuseOpenCacheSnapshot>,
+    open_cache_snapshots: ParkingMutex<LruCache<u64, MacFuseOpenCacheSnapshot>>,
     read_admission: Arc<Semaphore>,
     read_queue_byte_limit: u32,
     read_buffers: Arc<ReadBufferPool>,
@@ -354,6 +356,10 @@ fn readahead_window_len(size: usize) -> usize {
         .clamp(MACFUSE_READ_WINDOW_MIN_BYTES, MACFUSE_READ_WINDOW_MAX_BYTES)
 }
 
+fn open_cache_snapshot_capacity() -> NonZeroUsize {
+    NonZeroUsize::new(MACFUSE_OPEN_CACHE_SNAPSHOT_LIMIT).unwrap_or(NonZeroUsize::MIN)
+}
+
 #[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct QueuedReadForTest {
@@ -418,7 +424,7 @@ impl StudioVfsAdapter {
             readdir_cache: Mutex::new(HashMap::new()),
             readdir_cache_last_pruned: Mutex::new(None),
             readdir_cache_ready: Condvar::new(),
-            open_cache_snapshots: DashMap::new(),
+            open_cache_snapshots: ParkingMutex::new(LruCache::new(open_cache_snapshot_capacity())),
             read_admission: Arc::new(Semaphore::new(read_queue_byte_limit as usize)),
             read_queue_byte_limit,
             read_buffers: Arc::new(ReadBufferPool::default()),
@@ -462,12 +468,12 @@ impl StudioVfsAdapter {
 
     #[cfg(test)]
     pub(crate) fn has_open_cache_snapshot_for_test(&self, ino: u64) -> bool {
-        self.open_cache_snapshots.contains_key(&ino)
+        self.open_cache_snapshots.lock().contains(&ino)
     }
 
     #[cfg(test)]
     pub(crate) fn open_cache_snapshot_count_for_test(&self) -> usize {
-        self.open_cache_snapshots.len()
+        self.open_cache_snapshots.lock().len()
     }
 
     #[cfg(test)]
@@ -561,7 +567,7 @@ impl StudioVfsAdapter {
     }
 
     fn clear_open_cache_snapshot(&self, ino: u64, reason: &'static str) {
-        self.open_cache_snapshots.remove(&ino);
+        self.open_cache_snapshots.lock().pop(&ino);
         debug!(ino, reason, "macFUSE open invalidates kernel cache");
     }
 
@@ -579,8 +585,8 @@ impl StudioVfsAdapter {
             return false;
         }
 
-        if self
-            .open_cache_snapshots
+        let mut snapshots = self.open_cache_snapshots.lock();
+        if snapshots
             .get(&ino)
             .is_some_and(|previous| *previous == snapshot)
         {
@@ -597,11 +603,9 @@ impl StudioVfsAdapter {
             return true;
         }
 
-        let keep_cache = self
-            .open_cache_snapshots
-            .insert(ino, snapshot)
+        let keep_cache = snapshots
+            .put(ino, snapshot)
             .is_some_and(|previous| previous == snapshot);
-        self.prune_open_cache_snapshots(ino);
         debug!(
             ino,
             keep_cache,
@@ -619,41 +623,20 @@ impl StudioVfsAdapter {
         keep_cache
     }
 
-    fn prune_open_cache_snapshots(&self, protected_ino: u64) {
-        let snapshot_count = self.open_cache_snapshots.len();
-        if snapshot_count <= MACFUSE_OPEN_CACHE_SNAPSHOT_LIMIT {
-            return;
-        }
-
-        let remove_count = snapshot_count.saturating_sub(MACFUSE_OPEN_CACHE_SNAPSHOT_LIMIT);
-        let victims: Vec<u64> = self
-            .open_cache_snapshots
-            .iter()
-            .filter_map(|entry| {
-                let ino = *entry.key();
-                (ino != protected_ino).then_some(ino)
-            })
-            .take(remove_count)
-            .collect();
-        for ino in victims {
-            self.clear_open_cache_snapshot(ino, "cache_limit");
-        }
-    }
-
     /// Remove a file entry.
     pub(crate) fn unlink(&self, parent: u64, name: &[u8]) -> Result<(), i32> {
         if self.read_only {
             return Err(libc::EROFS);
         }
-        let unlinked_ino = self.vfs.lookup(parent, name).ok().map(|attr| attr.ino);
         self.vfs
-            .unlink(parent, name)
-            .inspect(|_| {
-                if let Some(ino) = unlinked_ino {
-                    self.clear_open_cache_snapshot(ino, "unlink");
+            .unlink_with_attr(parent, name)
+            .inspect(|unlinked_attr| {
+                if let Some(attr) = unlinked_attr {
+                    self.clear_open_cache_snapshot(attr.ino, "unlink");
                 }
                 self.invalidate_readdir_cache(parent);
             })
+            .map(|_| ())
             .map_err(|error| vfs_err_to_errno(&error))
     }
 
