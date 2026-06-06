@@ -772,6 +772,16 @@ impl OpenReply {
     pub fn file_handle(self) -> u64 {
         self.file_handle
     }
+
+    /// Whether direct I/O should be requested.
+    pub fn direct_io(self) -> bool {
+        self.direct_io
+    }
+
+    /// Whether kernel cache should be kept.
+    pub fn keep_cache(self) -> bool {
+        self.keep_cache
+    }
 }
 
 /// Owned low-level request token.

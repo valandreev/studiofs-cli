@@ -16,7 +16,7 @@ use parking_lot::Mutex as ParkingMutex;
 use studiofs_bridge::posix::{
     BridgeFileAttr, BridgeFileType, posix_flags_to_open_flags, to_bridge_attr, vfs_err_to_errno,
 };
-use studiofs_meta::{DirEntry, FileType, InodeAttr, SetattrArgs, TimeSpec};
+use studiofs_meta::{DirEntry, FileType, InodeAttr, SetattrArgs, TimeSpec, UploadState};
 use studiofs_vfs::{StatFs, StudioVfs};
 use tokio::runtime::Handle;
 use tokio::sync::Semaphore;
@@ -59,10 +59,37 @@ pub(crate) struct StudioVfsAdapter {
     readdir_cache: Mutex<HashMap<u64, ReaddirCacheEntry>>,
     readdir_cache_last_pruned: Mutex<Option<Instant>>,
     readdir_cache_ready: Condvar,
+    open_cache_snapshots: Mutex<HashMap<u64, MacFuseOpenCacheSnapshot>>,
     read_admission: Arc<Semaphore>,
     read_queue_byte_limit: u32,
     read_buffers: Arc<ReadBufferPool>,
     read_windows: Arc<ReadWindowStore>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MacFuseOpenCacheSnapshot {
+    content_epoch: u64,
+    committed_content_epoch: u64,
+    size: u64,
+    committed_size: u64,
+}
+
+impl MacFuseOpenCacheSnapshot {
+    fn from_attr(attr: &InodeAttr) -> Option<Self> {
+        if attr.kind != FileType::RegularFile
+            || attr.upload_state != UploadState::Ready
+            || attr.content_epoch != attr.committed_content_epoch
+            || attr.size != attr.committed_size
+        {
+            return None;
+        }
+        Some(Self {
+            content_epoch: attr.content_epoch,
+            committed_content_epoch: attr.committed_content_epoch,
+            size: attr.size,
+            committed_size: attr.committed_size,
+        })
+    }
 }
 
 #[derive(Debug, Default)]
@@ -387,6 +414,7 @@ impl StudioVfsAdapter {
             readdir_cache: Mutex::new(HashMap::new()),
             readdir_cache_last_pruned: Mutex::new(None),
             readdir_cache_ready: Condvar::new(),
+            open_cache_snapshots: Mutex::new(HashMap::new()),
             read_admission: Arc::new(Semaphore::new(read_queue_byte_limit as usize)),
             read_queue_byte_limit,
             read_buffers: Arc::new(ReadBufferPool::default()),
@@ -496,15 +524,68 @@ impl StudioVfsAdapter {
         if self.read_only && posix_open_requests_write(flags, trunc) {
             return Err(libc::EROFS);
         }
+        let flag_policy = macfuse_open_cache_policy(flags, trunc);
         self.vfs
             .open_file(ino, open_flags, trunc)
             .map(|fh| {
-                let policy = macfuse_open_cache_policy(flags, trunc);
+                let keep_cache = if flag_policy.keep_cache {
+                    self.keep_cache_for_current_generation(ino)
+                } else {
+                    self.clear_open_cache_snapshot(ino, "write_capable");
+                    false
+                };
                 OpenReply::new(fh)
-                    .with_direct_io(policy.direct_io)
-                    .with_keep_cache(policy.keep_cache)
+                    .with_direct_io(flag_policy.direct_io)
+                    .with_keep_cache(keep_cache)
             })
             .map_err(|error| vfs_err_to_errno(&error))
+    }
+
+    fn clear_open_cache_snapshot(&self, ino: u64, reason: &'static str) {
+        self.open_cache_snapshots
+            .lock()
+            .expect("open cache snapshot mutex poisoned")
+            .remove(&ino);
+        debug!(ino, reason, "macFUSE open invalidates kernel cache");
+    }
+
+    fn keep_cache_for_current_generation(&self, ino: u64) -> bool {
+        let Ok(attr) = self.vfs.getattr(ino) else {
+            self.clear_open_cache_snapshot(ino, "unknown_state");
+            return false;
+        };
+        let Some(snapshot) = MacFuseOpenCacheSnapshot::from_attr(&attr) else {
+            self.clear_open_cache_snapshot(ino, "not_fully_committed");
+            return false;
+        };
+        if self.vfs.inode_has_local_dirty_state(ino) {
+            self.clear_open_cache_snapshot(ino, "local_dirty_state");
+            return false;
+        }
+
+        let mut snapshots = self
+            .open_cache_snapshots
+            .lock()
+            .expect("open cache snapshot mutex poisoned");
+        let keep_cache = snapshots
+            .get(&ino)
+            .is_some_and(|previous| *previous == snapshot);
+        snapshots.insert(ino, snapshot);
+        debug!(
+            ino,
+            keep_cache,
+            content_epoch = snapshot.content_epoch,
+            committed_content_epoch = snapshot.committed_content_epoch,
+            size = snapshot.size,
+            committed_size = snapshot.committed_size,
+            reason = if keep_cache {
+                "read_only_safe"
+            } else {
+                "generation_changed"
+            },
+            "macFUSE open cache decision"
+        );
+        keep_cache
     }
 
     /// Remove a file entry.
