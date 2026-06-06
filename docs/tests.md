@@ -151,6 +151,7 @@ Local loopback examples remain available as development/test examples.
 | Dump/Load recovery integration suite | `cargo test -p studiofs --test dump_load_test -- --ignored --nocapture --test-threads=1` |
 | FUSE bridge unit + smoke | `cargo test -p studiofs-fuse -- --nocapture` and `STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1 cargo test -p studiofs-fuse --test mount_sanity -- --ignored --nocapture --test-threads=1` |
 | FUSE async write mounted matrix | `cargo test -p studiofs-fuse --test mount_sanity async_mounted_test_matrix_covers_correctness_and_platform_opt_in_scenarios -- --exact --nocapture` and `STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1 cargo test -p studiofs-fuse --test mount_sanity async_mounted -- --ignored --nocapture --test-threads=1` |
+| macFUSE read geometry report fields | `cargo test -p studiofs-e2e read_observations_record_read_geometry_and_local_payload_io -- --nocapture` |
 | WinFSP bridge unit + smoke | `cargo test -p studiofs-winfsp -- --nocapture` and `$env:STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS='1'; $env:STUDIOFS_WINFSP_TEST_MOUNT_POINT='Z:'; cargo test -p studiofs-winfsp --test mount_sanity -- --ignored --nocapture --test-threads=1` |
 
 ### Local-first VFS fast checks (no S3)

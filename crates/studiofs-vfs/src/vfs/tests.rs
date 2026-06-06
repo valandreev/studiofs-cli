@@ -10534,18 +10534,34 @@ fn write_path_observability_reports_fetch_counters() {
 #[test]
 fn write_path_observability_reports_fuse_callback_and_vfs_read_counters() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "write-path-observability-fuse-callbacks");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "write-path-observability-fuse-callbacks");
 
-    vfs.note_vfs_read_call(4 * 1024);
-    vfs.record_fuse_read_callback(4 * 1024, Duration::from_millis(3), false);
+    rt.block_on(async {
+        vfs.payload_store_put_async(0xF5E491, Bytes::from_static(&[7; 8192]), false)
+            .await
+            .expect("payload store put");
+        let mut out = [0_u8; 4096];
+        let read = vfs
+            .payload_store_read_into_async(0xF5E491, 0, &mut out)
+            .await
+            .expect("payload store read_into");
+        assert_eq!(read, Some(4096));
+    });
+    vfs.note_vfs_read_call(4096);
+    vfs.record_fuse_read_callback(4096, Duration::from_millis(3), false);
     vfs.record_fuse_write_callback(128 * 1024, Duration::from_millis(5), true);
 
     let snapshot = vfs.write_path_observability_snapshot();
 
     assert_eq!(snapshot.vfs_read_path.calls, 1);
-    assert_eq!(snapshot.vfs_read_path.requested_bytes, 4 * 1024);
+    assert_eq!(snapshot.vfs_read_path.requested_bytes, 4096);
+    assert_eq!(snapshot.vfs_read_path.foreground_local_payload_reads, 1);
+    assert_eq!(
+        snapshot.vfs_read_path.foreground_local_payload_read_bytes,
+        4096
+    );
     assert_eq!(snapshot.fuse_callbacks.read.calls, 1);
-    assert_eq!(snapshot.fuse_callbacks.read.bytes, 4 * 1024);
+    assert_eq!(snapshot.fuse_callbacks.read.bytes, 4096);
     assert_eq!(snapshot.fuse_callbacks.read.errors, 0);
     assert_eq!(snapshot.fuse_callbacks.write.calls, 1);
     assert_eq!(snapshot.fuse_callbacks.write.bytes, 128 * 1024);
