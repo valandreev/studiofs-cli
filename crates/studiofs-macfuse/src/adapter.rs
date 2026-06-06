@@ -75,9 +75,7 @@ pub(crate) struct StudioVfsAdapter {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MacFuseOpenCacheSnapshot {
     content_epoch: u64,
-    committed_content_epoch: u64,
     size: u64,
-    committed_size: u64,
 }
 
 impl MacFuseOpenCacheSnapshot {
@@ -91,9 +89,7 @@ impl MacFuseOpenCacheSnapshot {
         }
         Some(Self {
             content_epoch: attr.content_epoch,
-            committed_content_epoch: attr.committed_content_epoch,
             size: attr.size,
-            committed_size: attr.committed_size,
         })
     }
 }
@@ -594,33 +590,23 @@ impl StudioVfsAdapter {
                 ino,
                 keep_cache = true,
                 content_epoch = snapshot.content_epoch,
-                committed_content_epoch = snapshot.committed_content_epoch,
                 size = snapshot.size,
-                committed_size = snapshot.committed_size,
                 reason = "read_only_safe",
                 "macFUSE open cache decision"
             );
             return true;
         }
 
-        let keep_cache = snapshots
-            .put(ino, snapshot)
-            .is_some_and(|previous| previous == snapshot);
+        snapshots.put(ino, snapshot);
         debug!(
             ino,
-            keep_cache,
+            keep_cache = false,
             content_epoch = snapshot.content_epoch,
-            committed_content_epoch = snapshot.committed_content_epoch,
             size = snapshot.size,
-            committed_size = snapshot.committed_size,
-            reason = if keep_cache {
-                "read_only_safe"
-            } else {
-                "generation_changed"
-            },
+            reason = "generation_changed",
             "macFUSE open cache decision"
         );
-        keep_cache
+        false
     }
 
     /// Remove a file entry.
@@ -631,7 +617,9 @@ impl StudioVfsAdapter {
         self.vfs
             .unlink_with_attr(parent, name)
             .inspect(|unlinked_attr| {
-                if let Some(attr) = unlinked_attr {
+                if let Some(attr) = unlinked_attr
+                    && attr.nlink == 0
+                {
                     self.clear_open_cache_snapshot(attr.ino, "unlink");
                 }
                 self.invalidate_readdir_cache(parent);
