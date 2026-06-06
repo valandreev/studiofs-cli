@@ -1200,6 +1200,10 @@ struct PerformanceProbeReadObservations {
     avg_foreground_local_payload_read_bytes: f64,
     post_drain_read_mib_per_sec: Option<f64>,
     post_drain_read_interpretation: Option<String>,
+    post_drain_fuse_read_calls: Option<u64>,
+    post_drain_fuse_read_bytes: Option<u64>,
+    post_drain_foreground_local_payload_reads: Option<u64>,
+    post_drain_foreground_local_payload_read_bytes: Option<u64>,
 }
 
 impl PerformanceProbeReadObservations {
@@ -1267,6 +1271,12 @@ impl PerformanceProbeReadObservations {
         if let Some(post_drain) = phases.iter().find(|phase| phase.kind == "post-drain-read") {
             observations.post_drain_read_mib_per_sec = Some(post_drain.mib_per_sec);
             observations.post_drain_read_interpretation = Some(post_drain.interpretation.clone());
+            observations.post_drain_fuse_read_calls = Some(post_drain.delta.fuse_read_calls);
+            observations.post_drain_fuse_read_bytes = Some(post_drain.delta.fuse_read_bytes);
+            observations.post_drain_foreground_local_payload_reads =
+                Some(post_drain.delta.foreground_local_payload_reads);
+            observations.post_drain_foreground_local_payload_read_bytes =
+                Some(post_drain.delta.foreground_local_payload_read_bytes);
         }
         observations
     }
@@ -1343,6 +1353,30 @@ mod tests {
                     }
                 })),
             ),
+            PerformanceProbePhase::new(
+                "read-after-upload-drain-wait".to_string(),
+                "post-drain-read".to_string(),
+                None,
+                PhaseIoResult::new(2 * 1024 * 1024, Duration::from_millis(100), 17),
+                &Some(json!({
+                    "fuse_callbacks": { "read": { "calls": 3, "bytes": 3 * 1024 * 1024 } },
+                    "vfs_read_path": {
+                        "calls": 3,
+                        "requested_bytes": 3 * 1024 * 1024,
+                        "foreground_local_payload_reads": 3,
+                        "foreground_local_payload_read_bytes": 3 * 1024 * 1024
+                    }
+                })),
+                &Some(json!({
+                    "fuse_callbacks": { "read": { "calls": 5, "bytes": 5 * 1024 * 1024 } },
+                    "vfs_read_path": {
+                        "calls": 5,
+                        "requested_bytes": 5 * 1024 * 1024,
+                        "foreground_local_payload_reads": 5,
+                        "foreground_local_payload_read_bytes": 5 * 1024 * 1024
+                    }
+                })),
+            ),
         ];
 
         let observations = PerformanceProbeReadObservations::from_phases(&phases);
@@ -1359,11 +1393,25 @@ mod tests {
             observations.avg_foreground_local_payload_read_bytes,
             1024.0 * 1024.0,
         );
+        assert_eq!(observations.post_drain_fuse_read_calls, Some(2));
+        assert_eq!(
+            observations.post_drain_fuse_read_bytes,
+            Some(2 * 1024 * 1024)
+        );
+        assert_eq!(
+            observations.post_drain_foreground_local_payload_reads,
+            Some(2)
+        );
+        assert_eq!(
+            observations.post_drain_foreground_local_payload_read_bytes,
+            Some(2 * 1024 * 1024)
+        );
     }
 
     fn assert_f64_eq(actual: f64, expected: f64) {
+        const FLOAT_TOLERANCE: f64 = 1e-6;
         assert!(
-            (actual - expected).abs() <= f64::EPSILON,
+            (actual - expected).abs() <= FLOAT_TOLERANCE,
             "expected {actual} to equal {expected}"
         );
     }

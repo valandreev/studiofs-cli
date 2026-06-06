@@ -248,6 +248,10 @@ capture observed macFUSE callback sizing, while
 `read_observations.foreground_local_payload_read_bytes`, and
 `read_observations.avg_foreground_local_payload_read_bytes` show whether those
 callbacks caused matching local payload reads or extra local read amplification.
+When the probe waits for upload drain, the matching
+`read_observations.post_drain_fuse_read_*` and
+`read_observations.post_drain_foreground_local_payload_read_*` fields record the
+same geometry for the post-drain verification read.
 Use that report before adding any daemon-side hot read window.
 
 Regular read-only file opens return `FOPEN_KEEP_CACHE` so safe media and
