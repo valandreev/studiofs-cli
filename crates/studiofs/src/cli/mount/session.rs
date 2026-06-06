@@ -2410,7 +2410,9 @@ mod tests {
         let backend = default_mount_backend();
         #[cfg(target_os = "linux")]
         assert_eq!(backend.name(), "FUSE");
-        #[cfg(all(unix, not(target_os = "linux")))]
+        #[cfg(target_os = "macos")]
+        assert_eq!(backend.name(), "macFUSE");
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
         assert_eq!(backend.name(), "unsupported-unix");
         #[cfg(windows)]
         assert_eq!(backend.name(), "WinFSP");

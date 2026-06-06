@@ -358,7 +358,19 @@ mod tests {
         assert!(mount_args.iter().any(|arg| arg == "-olocal"));
         assert!(mount_args.iter().any(|arg| arg == "-onovncache"));
         assert!(mount_args.iter().any(|arg| arg == "-odaemon_timeout=60"));
-        assert!(mount_args.iter().any(|arg| arg == "-oiosize=1048576"));
+        let expected_geometry = super::low_level::MACOS_FUSE_IOSIZE_BYTES;
+        assert!(
+            mount_args
+                .iter()
+                .any(|arg| arg == &format!("-oiosize={expected_geometry}"))
+        );
+        assert!(
+            mount_args
+                .iter()
+                .any(|arg| arg == &format!("-omax_read={expected_geometry}"))
+        );
+        assert!(mount_args.iter().any(|arg| arg == "-onoappledouble"));
+        assert!(mount_args.iter().any(|arg| arg == "-odefer_permissions"));
         assert!(mount_args.iter().any(|arg| arg == "-osparse"));
         assert!(!mount_args.iter().any(|arg| arg == "-odirect_io"));
         assert!(!mount_args.iter().any(|arg| arg == "-onolocalcaches"));
@@ -381,6 +393,9 @@ mod tests {
         assert!(mount_args.iter().any(|arg| arg == "-osparse"));
         assert!(!mount_args.iter().any(|arg| arg == "-onovncache"));
         assert!(!mount_args.iter().any(|arg| arg == "-oiosize=1048576"));
+        assert!(!mount_args.iter().any(|arg| arg == "-omax_read=1048576"));
+        assert!(!mount_args.iter().any(|arg| arg == "-onoappledouble"));
+        assert!(!mount_args.iter().any(|arg| arg == "-odefer_permissions"));
     }
 
     #[test]
