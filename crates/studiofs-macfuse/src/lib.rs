@@ -1584,6 +1584,41 @@ mod tests {
     }
 
     #[test]
+    fn adapter_open_cache_observations_are_bounded() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-adapter-cache-bounded",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let root = studiofs_vfs::contract_harness::CONTRACT_ROOT_INO;
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let limit = adapter.open_cache_snapshot_limit_for_test();
+
+        for index in 0..(limit + 3) {
+            let name = format!("bounded-{index}.txt");
+            let attr = vfs
+                .create(root, name.as_bytes(), 501, 20, 0o644)
+                .expect("create file");
+            let first_open = adapter
+                .open(attr.ino, libc::O_RDONLY)
+                .expect("open first read-only handle");
+            adapter
+                .release(attr.ino, first_open.file_handle())
+                .expect("release first handle");
+            let repeated_open = adapter
+                .open(attr.ino, libc::O_RDONLY)
+                .expect("open repeated read-only handle");
+            assert!(repeated_open.keep_cache());
+            adapter
+                .release(attr.ino, repeated_open.file_handle())
+                .expect("release repeated handle");
+        }
+
+        assert!(adapter.open_cache_snapshot_count_for_test() <= limit);
+    }
+
+    #[test]
     fn adapter_roundtrips_native_resource_fork_xattr_bytes() {
         let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
             "macfuse-adapter-resource-fork-xattr",

@@ -39,6 +39,10 @@ const MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY: usize = 1024 * 1024;
 const MACFUSE_READ_BUFFER_POOL_RETAINED_CAPACITY: usize = MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY * 2;
 const MACFUSE_READ_WINDOW_MAX_BYTES: usize = 1024 * 1024;
 const MACFUSE_READ_WINDOW_MIN_BYTES: usize = 128 * 1024;
+#[cfg(not(test))]
+const MACFUSE_OPEN_CACHE_SNAPSHOT_LIMIT: usize = 8192;
+#[cfg(test)]
+const MACFUSE_OPEN_CACHE_SNAPSHOT_LIMIT: usize = 8;
 
 /// macFUSE open-cache flags chosen for one file handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -461,6 +465,16 @@ impl StudioVfsAdapter {
         self.open_cache_snapshots.contains_key(&ino)
     }
 
+    #[cfg(test)]
+    pub(crate) fn open_cache_snapshot_count_for_test(&self) -> usize {
+        self.open_cache_snapshots.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_cache_snapshot_limit_for_test(&self) -> usize {
+        MACFUSE_OPEN_CACHE_SNAPSHOT_LIMIT
+    }
+
     /// Look up a child inode.
     pub(crate) fn lookup(&self, parent: u64, name: &[u8]) -> Result<InodeAttr, i32> {
         self.vfs
@@ -565,10 +579,29 @@ impl StudioVfsAdapter {
             return false;
         }
 
+        if self
+            .open_cache_snapshots
+            .get(&ino)
+            .is_some_and(|previous| *previous == snapshot)
+        {
+            debug!(
+                ino,
+                keep_cache = true,
+                content_epoch = snapshot.content_epoch,
+                committed_content_epoch = snapshot.committed_content_epoch,
+                size = snapshot.size,
+                committed_size = snapshot.committed_size,
+                reason = "read_only_safe",
+                "macFUSE open cache decision"
+            );
+            return true;
+        }
+
         let keep_cache = self
             .open_cache_snapshots
             .insert(ino, snapshot)
             .is_some_and(|previous| previous == snapshot);
+        self.prune_open_cache_snapshots(ino);
         debug!(
             ino,
             keep_cache,
@@ -584,6 +617,27 @@ impl StudioVfsAdapter {
             "macFUSE open cache decision"
         );
         keep_cache
+    }
+
+    fn prune_open_cache_snapshots(&self, protected_ino: u64) {
+        let snapshot_count = self.open_cache_snapshots.len();
+        if snapshot_count <= MACFUSE_OPEN_CACHE_SNAPSHOT_LIMIT {
+            return;
+        }
+
+        let remove_count = snapshot_count.saturating_sub(MACFUSE_OPEN_CACHE_SNAPSHOT_LIMIT);
+        let victims: Vec<u64> = self
+            .open_cache_snapshots
+            .iter()
+            .filter_map(|entry| {
+                let ino = *entry.key();
+                (ino != protected_ino).then_some(ino)
+            })
+            .take(remove_count)
+            .collect();
+        for ino in victims {
+            self.clear_open_cache_snapshot(ino, "cache_limit");
+        }
     }
 
     /// Remove a file entry.
