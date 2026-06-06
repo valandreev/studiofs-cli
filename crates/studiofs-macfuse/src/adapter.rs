@@ -59,7 +59,7 @@ pub(crate) struct StudioVfsAdapter {
     readdir_cache: Mutex<HashMap<u64, ReaddirCacheEntry>>,
     readdir_cache_last_pruned: Mutex<Option<Instant>>,
     readdir_cache_ready: Condvar,
-    open_cache_snapshots: Mutex<HashMap<u64, MacFuseOpenCacheSnapshot>>,
+    open_cache_snapshots: DashMap<u64, MacFuseOpenCacheSnapshot>,
     read_admission: Arc<Semaphore>,
     read_queue_byte_limit: u32,
     read_buffers: Arc<ReadBufferPool>,
@@ -414,7 +414,7 @@ impl StudioVfsAdapter {
             readdir_cache: Mutex::new(HashMap::new()),
             readdir_cache_last_pruned: Mutex::new(None),
             readdir_cache_ready: Condvar::new(),
-            open_cache_snapshots: Mutex::new(HashMap::new()),
+            open_cache_snapshots: DashMap::new(),
             read_admission: Arc::new(Semaphore::new(read_queue_byte_limit as usize)),
             read_queue_byte_limit,
             read_buffers: Arc::new(ReadBufferPool::default()),
@@ -454,6 +454,11 @@ impl StudioVfsAdapter {
     #[cfg(test)]
     pub(crate) fn reusable_read_buffer_capacity_for_test(&self) -> Option<usize> {
         self.read_buffers.last_available_capacity()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_open_cache_snapshot_for_test(&self, ino: u64) -> bool {
+        self.open_cache_snapshots.contains_key(&ino)
     }
 
     /// Look up a child inode.
@@ -542,10 +547,7 @@ impl StudioVfsAdapter {
     }
 
     fn clear_open_cache_snapshot(&self, ino: u64, reason: &'static str) {
-        self.open_cache_snapshots
-            .lock()
-            .expect("open cache snapshot mutex poisoned")
-            .remove(&ino);
+        self.open_cache_snapshots.remove(&ino);
         debug!(ino, reason, "macFUSE open invalidates kernel cache");
     }
 
@@ -563,14 +565,10 @@ impl StudioVfsAdapter {
             return false;
         }
 
-        let mut snapshots = self
+        let keep_cache = self
             .open_cache_snapshots
-            .lock()
-            .expect("open cache snapshot mutex poisoned");
-        let keep_cache = snapshots
-            .get(&ino)
-            .is_some_and(|previous| *previous == snapshot);
-        snapshots.insert(ino, snapshot);
+            .insert(ino, snapshot)
+            .is_some_and(|previous| previous == snapshot);
         debug!(
             ino,
             keep_cache,
@@ -593,9 +591,15 @@ impl StudioVfsAdapter {
         if self.read_only {
             return Err(libc::EROFS);
         }
+        let unlinked_ino = self.vfs.lookup(parent, name).ok().map(|attr| attr.ino);
         self.vfs
             .unlink(parent, name)
-            .inspect(|_| self.invalidate_readdir_cache(parent))
+            .inspect(|_| {
+                if let Some(ino) = unlinked_ino {
+                    self.clear_open_cache_snapshot(ino, "unlink");
+                }
+                self.invalidate_readdir_cache(parent);
+            })
             .map_err(|error| vfs_err_to_errno(&error))
     }
 
