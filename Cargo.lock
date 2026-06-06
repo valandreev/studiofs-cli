@@ -4812,6 +4812,7 @@ name = "studiofs-macfuse"
 version = "0.1.1"
 dependencies = [
  "cc",
+ "dashmap",
  "libc",
  "parking_lot",
  "serde",
