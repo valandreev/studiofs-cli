@@ -20,7 +20,7 @@ use tracing::debug;
 
 const DEFAULT_FUSE_MAX_WRITE_BYTES: u32 = 16 * 1024 * 1024;
 const DEFAULT_FUSE_MAX_READAHEAD_BYTES: u32 = 16 * 1024 * 1024;
-const MACOS_FUSE_IOSIZE_BYTES: u32 = 1024 * 1024;
+pub(crate) const MACOS_FUSE_IOSIZE_BYTES: u32 = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MacosFuseCachePolicy {
@@ -267,8 +267,16 @@ unsafe extern "C" {
 }
 
 /// Configure macFUSE connection-level I/O sizing for the low-level bridge.
+///
+/// # Safety
+///
+/// `conn` must be a valid macFUSE-provided `fuse_conn_info` pointer for the
+/// duration of this callback, or null. macFUSE owns the pointed-to storage.
 #[unsafe(no_mangle)]
-pub extern "C" fn studiofs_macfuse_init(_userdata: *mut c_void, conn: *mut raw::FuseConnInfo) {
+pub unsafe extern "C" fn studiofs_macfuse_init(
+    _userdata: *mut c_void,
+    conn: *mut raw::FuseConnInfo,
+) {
     // SAFETY: macFUSE passes a live `fuse_conn_info` pointer for this callback;
     // the C shim writes only documented connection size fields.
     unsafe {
