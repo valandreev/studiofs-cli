@@ -770,7 +770,11 @@ mod tests {
             b"reusable"
         );
         assert_eq!(adapter.reusable_read_buffer_count_for_test(), 1);
-        assert_eq!(adapter.reusable_read_buffer_capacity_for_test(), Some(8));
+        assert!(
+            adapter
+                .reusable_read_buffer_capacity_for_test()
+                .is_some_and(|capacity| capacity >= 8)
+        );
 
         let second = adapter
             .queue_read_for_test(attr.ino, reader.file_handle(), 9, 7)
@@ -780,7 +784,11 @@ mod tests {
             b"macFUSE"
         );
         assert_eq!(adapter.reusable_read_buffer_count_for_test(), 1);
-        assert_eq!(adapter.reusable_read_buffer_capacity_for_test(), Some(8));
+        assert!(
+            adapter
+                .reusable_read_buffer_capacity_for_test()
+                .is_some_and(|capacity| capacity >= 8)
+        );
     }
 
     #[test]
@@ -912,10 +920,11 @@ mod tests {
             b"small payload"
         );
         assert_eq!(adapter.reusable_read_buffer_count_for_test(), 1);
-        assert_eq!(
-            adapter.reusable_read_buffer_capacity_for_test(),
-            Some(super::adapter::max_reusable_read_buffer_capacity_for_test())
-        );
+        let recycled_capacity = adapter
+            .reusable_read_buffer_capacity_for_test()
+            .expect("clamped read should recycle one buffer");
+        assert!(recycled_capacity >= super::adapter::max_reusable_read_buffer_capacity_for_test());
+        assert!(recycled_capacity <= super::adapter::max_retained_read_buffer_capacity_for_test());
     }
 
     #[test]

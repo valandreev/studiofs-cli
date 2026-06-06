@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, OsStr};
 use std::mem::MaybeUninit;
+use std::ops::{Deref, DerefMut};
 use std::os::raw::c_char;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::{Arc, Condvar, Mutex};
@@ -29,6 +30,7 @@ const READDIR_CACHE_PRUNE_INTERVAL: Duration = Duration::from_secs(1);
 const MACFUSE_READ_MAX_PENDING_BYTES: usize = 64 * 1024 * 1024;
 const MACFUSE_READ_BUFFER_POOL_MAX_BUFFERS: usize = 32;
 const MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY: usize = 1024 * 1024;
+const MACFUSE_READ_BUFFER_POOL_RETAINED_CAPACITY: usize = MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY * 2;
 
 /// macFUSE open-cache flags chosen for one file handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,19 +62,19 @@ struct ReadBufferPool {
 }
 
 impl ReadBufferPool {
-    fn acquire(self: &Arc<Self>, size: usize) -> PooledReadBuffer {
+    fn acquire(self: Arc<Self>, size: usize) -> PooledReadBuffer {
         let mut buffer = self.buffers.lock().pop().unwrap_or_default();
         // TODO(SFS-489): avoid this per-read zero-fill once the VFS read path accepts
         // MaybeUninit/ReadBuf-style storage instead of initialized `&mut [u8]`.
         buffer.resize(size, 0);
         PooledReadBuffer {
-            pool: Arc::clone(self),
+            pool: self,
             buffer: Some(buffer),
         }
     }
 
     fn recycle(&self, mut buffer: Vec<u8>) {
-        if buffer.capacity() > MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY {
+        if buffer.capacity() > MACFUSE_READ_BUFFER_POOL_RETAINED_CAPACITY {
             return;
         }
         buffer.clear();
@@ -100,25 +102,37 @@ struct PooledReadBuffer {
 }
 
 impl PooledReadBuffer {
-    fn as_mut_slice(&mut self) -> &mut [u8] {
-        self.buffer
-            .as_mut()
-            .expect("pooled read buffer should be present")
-            .as_mut_slice()
-    }
-
     fn truncate(&mut self, len: usize) {
         self.buffer
             .as_mut()
             .expect("pooled read buffer should be present")
             .truncate(len);
     }
+}
 
-    fn as_slice(&self) -> &[u8] {
+impl Deref for PooledReadBuffer {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
         self.buffer
             .as_ref()
             .expect("pooled read buffer should be present")
             .as_slice()
+    }
+}
+
+impl DerefMut for PooledReadBuffer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.buffer
+            .as_mut()
+            .expect("pooled read buffer should be present")
+            .as_mut_slice()
+    }
+}
+
+impl AsRef<[u8]> for PooledReadBuffer {
+    fn as_ref(&self) -> &[u8] {
+        self.deref()
     }
 }
 
@@ -133,6 +147,11 @@ impl Drop for PooledReadBuffer {
 #[cfg(test)]
 pub(crate) fn max_reusable_read_buffer_capacity_for_test() -> usize {
     MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY
+}
+
+#[cfg(test)]
+pub(crate) fn max_retained_read_buffer_capacity_for_test() -> usize {
+    MACFUSE_READ_BUFFER_POOL_RETAINED_CAPACITY
 }
 
 fn clamp_reusable_read_size(size: u32, read_queue_byte_limit: u32) -> u32 {
@@ -158,7 +177,7 @@ impl QueuedReadForTest {
             .runtime_handle
             .block_on(self.handle)
             .expect("queued macFUSE read worker should not panic")?;
-        let bytes = buffer.as_slice().to_vec();
+        let bytes = buffer.to_vec();
         drop(buffer);
         Ok(bytes)
     }
@@ -411,9 +430,7 @@ impl StudioVfsAdapter {
         let size_usize = size as usize;
 
         let mut out = read_buffers.acquire(size_usize);
-        let result = vfs
-            .read_into_fh(file_handle, ino, offset, out.as_mut_slice())
-            .await;
+        let result = vfs.read_into_fh(file_handle, ino, offset, &mut out).await;
         match result {
             Ok(written) => {
                 vfs.record_fuse_read_callback(written as usize, started.elapsed(), false);
@@ -457,7 +474,7 @@ impl StudioVfsAdapter {
                 .await
             {
                 Ok(bytes) => {
-                    let _ = Reply::new(request).read_buffer(bytes.as_slice());
+                    let _ = Reply::new(request).read_buffer(&bytes);
                 }
                 Err(errno) => {
                     let _ = Reply::new(request).error(errno);
