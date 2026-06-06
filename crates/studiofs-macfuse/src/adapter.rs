@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, OsStr};
-use std::mem::MaybeUninit;
+use std::mem::{self, MaybeUninit};
+use std::ops::{Deref, DerefMut};
 use std::os::raw::c_char;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use libc::{mode_t, off_t, size_t, stat, statvfs};
+use parking_lot::Mutex as ParkingMutex;
 use studiofs_bridge::posix::{
     BridgeFileAttr, BridgeFileType, posix_flags_to_open_flags, to_bridge_attr, vfs_err_to_errno,
 };
@@ -26,6 +28,11 @@ const READDIR_CACHE_TTL: Duration = Duration::from_secs(1);
 const READDIR_CACHE_PRUNE_THRESHOLD: usize = 1024;
 const READDIR_CACHE_PRUNE_INTERVAL: Duration = Duration::from_secs(1);
 const MACFUSE_READ_MAX_PENDING_BYTES: usize = 64 * 1024 * 1024;
+const MACFUSE_READ_BUFFER_POOL_MAX_BUFFERS: usize = 32;
+const MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY: usize = 1024 * 1024;
+// Keep allocator-rounded buffers that grew slightly beyond the reusable read
+// cap, while dropping genuinely oversized requests instead of pinning them.
+const MACFUSE_READ_BUFFER_POOL_RETAINED_CAPACITY: usize = MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY * 2;
 
 /// macFUSE open-cache flags chosen for one file handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,13 +55,110 @@ pub(crate) struct StudioVfsAdapter {
     readdir_cache_ready: Condvar,
     read_admission: Arc<Semaphore>,
     read_queue_byte_limit: u32,
+    read_buffers: Arc<ReadBufferPool>,
+}
+
+#[derive(Debug, Default)]
+struct ReadBufferPool {
+    buffers: ParkingMutex<Vec<Vec<u8>>>,
+}
+
+impl ReadBufferPool {
+    fn acquire(self: Arc<Self>, size: usize) -> PooledReadBuffer {
+        let mut buffer = self.buffers.lock().pop().unwrap_or_default();
+        // TODO(SFS-489): avoid this per-read zero-fill once the VFS read path accepts
+        // MaybeUninit/ReadBuf-style storage instead of initialized `&mut [u8]`.
+        buffer.resize(size, 0);
+        PooledReadBuffer { pool: self, buffer }
+    }
+
+    fn recycle(&self, buffer: Vec<u8>) {
+        // `mem::take` during `Drop` leaves a zero-capacity placeholder; recycling
+        // it would only occupy a pool slot without avoiding a future allocation.
+        if buffer.capacity() == 0 || buffer.capacity() > MACFUSE_READ_BUFFER_POOL_RETAINED_CAPACITY
+        {
+            return;
+        }
+        let mut buffers = self.buffers.lock();
+        if buffers.len() < MACFUSE_READ_BUFFER_POOL_MAX_BUFFERS {
+            buffers.push(buffer);
+        }
+    }
+
+    #[cfg(test)]
+    fn available_count(&self) -> usize {
+        self.buffers.lock().len()
+    }
+
+    #[cfg(test)]
+    fn last_available_capacity(&self) -> Option<usize> {
+        self.buffers.lock().last().map(Vec::capacity)
+    }
+
+    #[cfg(test)]
+    fn last_available_len(&self) -> Option<usize> {
+        self.buffers.lock().last().map(Vec::len)
+    }
+}
+
+#[derive(Debug)]
+struct PooledReadBuffer {
+    pool: Arc<ReadBufferPool>,
+    buffer: Vec<u8>,
+}
+
+impl PooledReadBuffer {
+    fn truncate(&mut self, len: usize) {
+        self.buffer.truncate(len);
+    }
+}
+
+impl Deref for PooledReadBuffer {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.buffer.as_slice()
+    }
+}
+
+impl DerefMut for PooledReadBuffer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.buffer.as_mut_slice()
+    }
+}
+
+impl AsRef<[u8]> for PooledReadBuffer {
+    fn as_ref(&self) -> &[u8] {
+        self.deref()
+    }
+}
+
+impl Drop for PooledReadBuffer {
+    fn drop(&mut self) {
+        self.pool.recycle(mem::take(&mut self.buffer));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn max_reusable_read_buffer_capacity_for_test() -> usize {
+    MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY
+}
+
+#[cfg(test)]
+pub(crate) fn max_retained_read_buffer_capacity_for_test() -> usize {
+    MACFUSE_READ_BUFFER_POOL_RETAINED_CAPACITY
+}
+
+fn clamp_reusable_read_size(size: u32, read_queue_byte_limit: u32) -> u32 {
+    size.min(read_queue_byte_limit)
+        .min(MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY as u32)
 }
 
 #[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct QueuedReadForTest {
     runtime_handle: Handle,
-    handle: JoinHandle<Result<Vec<u8>, i32>>,
+    handle: JoinHandle<Result<PooledReadBuffer, i32>>,
 }
 
 #[cfg(test)]
@@ -64,9 +168,13 @@ impl QueuedReadForTest {
     }
 
     pub(crate) fn wait(self) -> Result<Vec<u8>, i32> {
-        self.runtime_handle
+        let buffer = self
+            .runtime_handle
             .block_on(self.handle)
-            .expect("queued macFUSE read worker should not panic")
+            .expect("queued macFUSE read worker should not panic")?;
+        let bytes = buffer.to_vec();
+        drop(buffer);
+        Ok(bytes)
     }
 }
 
@@ -112,6 +220,7 @@ impl StudioVfsAdapter {
             readdir_cache_ready: Condvar::new(),
             read_admission: Arc::new(Semaphore::new(read_queue_byte_limit as usize)),
             read_queue_byte_limit,
+            read_buffers: Arc::new(ReadBufferPool::default()),
         }
     }
 
@@ -137,6 +246,16 @@ impl StudioVfsAdapter {
         self.runtime_handle
             .block_on(self.read_admission.clone().acquire_many_owned(bytes))
             .expect("test read capacity should be available")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reusable_read_buffer_count_for_test(&self) -> usize {
+        self.read_buffers.available_count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reusable_read_buffer_capacity_for_test(&self) -> Option<usize> {
+        self.read_buffers.last_available_capacity()
     }
 
     /// Look up a child inode.
@@ -274,8 +393,8 @@ impl StudioVfsAdapter {
         let offset = u64::try_from(offset).map_err(|_| libc::EINVAL)?;
         let size_usize = size as usize;
 
-        // TODO(SFS-489): switch to a MaybeUninit/ReadBuf-style VFS read API or a buffer pool
-        // once `StudioVfs::read_into_fh` can safely accept non-zeroed storage.
+        // Test-only synchronous reads return an owned Vec, so keep them off the
+        // queued-read pool; otherwise this helper would consume pooled buffers.
         let mut out = vec![0u8; size_usize];
         let started = Instant::now();
         let result =
@@ -303,12 +422,12 @@ impl StudioVfsAdapter {
         offset: u64,
         size: u32,
         started: Instant,
-    ) -> Result<Vec<u8>, i32> {
+        read_buffers: Arc<ReadBufferPool>,
+    ) -> Result<PooledReadBuffer, i32> {
+        let size = clamp_reusable_read_size(size, MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY as u32);
         let size_usize = size as usize;
 
-        // TODO(SFS-489): switch to a MaybeUninit/ReadBuf-style VFS read API or a buffer pool
-        // once `StudioVfs::read_into_fh` can safely accept non-zeroed storage.
-        let mut out = vec![0u8; size_usize];
+        let mut out = read_buffers.acquire(size_usize);
         let result = vfs.read_into_fh(file_handle, ino, offset, &mut out).await;
         match result {
             Ok(written) => {
@@ -337,7 +456,8 @@ impl StudioVfsAdapter {
         };
         let admission = Arc::clone(&self.read_admission);
         let vfs = Arc::clone(&self.vfs);
-        let size = size.min(self.read_queue_byte_limit);
+        let read_buffers = Arc::clone(&self.read_buffers);
+        let size = clamp_reusable_read_size(size, self.read_queue_byte_limit);
         let started = Instant::now();
         // TODO(SFS-489): wire macFUSE INTERRUPT notifications into this task
         // so queued reads can abort before spending VFS/cache I/O on canceled requests.
@@ -348,7 +468,9 @@ impl StudioVfsAdapter {
             };
             // Keep the permit until after the reply consumes `bytes`, so queued read
             // memory remains bounded for the whole kernel-reply handoff.
-            match Self::perform_read(vfs, ino, file_handle, offset, size, started).await {
+            match Self::perform_read(vfs, ino, file_handle, offset, size, started, read_buffers)
+                .await
+            {
                 Ok(bytes) => {
                     let _ = Reply::new(request).read_buffer(&bytes);
                 }
@@ -370,7 +492,8 @@ impl StudioVfsAdapter {
         let offset = u64::try_from(offset).map_err(|_| libc::EINVAL)?;
         let admission = Arc::clone(&self.read_admission);
         let vfs = Arc::clone(&self.vfs);
-        let size = size.min(self.read_queue_byte_limit);
+        let read_buffers = Arc::clone(&self.read_buffers);
+        let size = clamp_reusable_read_size(size, self.read_queue_byte_limit);
         let started = Instant::now();
         Ok(QueuedReadForTest {
             runtime_handle: self.runtime_handle.clone(),
@@ -379,7 +502,7 @@ impl StudioVfsAdapter {
                     .acquire_many_owned(size)
                     .await
                     .map_err(|_| libc::EIO)?;
-                Self::perform_read(vfs, ino, file_handle, offset, size, started).await
+                Self::perform_read(vfs, ino, file_handle, offset, size, started, read_buffers).await
             }),
         })
     }
@@ -1797,6 +1920,23 @@ fn xattr_not_found_errno() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_buffer_pool_keeps_recycled_initialized_prefix_len() {
+        let pool = Arc::new(ReadBufferPool::default());
+        let mut buffer = Arc::clone(&pool).acquire(16);
+        buffer.truncate(5);
+
+        drop(buffer);
+
+        assert_eq!(pool.available_count(), 1);
+        assert_eq!(pool.last_available_len(), Some(5));
+        assert!(
+            pool.last_available_capacity()
+                .expect("recycled buffer should retain capacity")
+                >= 16
+        );
+    }
 
     #[test]
     fn setattr_mask_accepts_bundled_size_changes_and_gates_file_handle() {
