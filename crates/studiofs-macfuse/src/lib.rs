@@ -579,6 +579,266 @@ mod tests {
     }
 
     #[test]
+    fn read_only_adapter_queues_read_without_waiting_for_vfs_completion() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-async-read-queues")
+                .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"queued.txt",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        fixture
+            .runtime()
+            .block_on(vfs.write(attr.ino, 0, b"queued macFUSE read"))
+            .expect("seed payload");
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let writer = adapter
+            .open(attr.ino, libc::O_WRONLY)
+            .expect("open writer to hold read gate");
+        let reader = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open reader through macFUSE adapter");
+
+        let queued = adapter
+            .queue_read_for_test(attr.ino, reader.file_handle(), 0, 6)
+            .expect("queue read without waiting for VFS completion");
+
+        assert!(
+            !queued.is_finished(),
+            "queued read should still be pending while the writer gate is held"
+        );
+
+        adapter
+            .release(attr.ino, writer.file_handle())
+            .expect("release writer gate");
+        let bytes = queued.wait().expect("queued read should complete");
+
+        assert_eq!(&bytes[..], b"queued");
+    }
+
+    #[test]
+    fn read_only_adapter_delays_read_when_async_queue_is_full() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-async-read-full")
+                .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"full.txt",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        fixture
+            .runtime()
+            .block_on(vfs.write(attr.ino, 0, b"bounded macFUSE read"))
+            .expect("seed payload");
+        let adapter = super::adapter::StudioVfsAdapter::new_with_read_queue_byte_limit_for_test(
+            vfs.clone(),
+            fixture.runtime().handle().clone(),
+            7,
+        );
+        let writer = adapter
+            .open(attr.ino, libc::O_WRONLY)
+            .expect("open writer to hold read gate");
+        let reader = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open reader through macFUSE adapter");
+        vfs.reset_diagnostics_observability();
+        let held_capacity = adapter.hold_read_capacity_for_test(7);
+
+        let delayed = adapter
+            .queue_read_for_test(attr.ino, reader.file_handle(), 7, 7)
+            .expect("read should wait for bounded queue capacity");
+
+        assert!(
+            !delayed.is_finished(),
+            "read should wait instead of returning EAGAIN while queue is full"
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(125));
+        drop(held_capacity);
+        adapter
+            .release(attr.ino, writer.file_handle())
+            .expect("release writer gate");
+        let delayed_bytes = delayed.wait().expect("delayed read should complete");
+
+        assert_eq!(&delayed_bytes[..], b" macFUS");
+        let metrics = vfs.write_path_observability_snapshot();
+        assert_eq!(metrics.fuse_callbacks.read.calls, 1);
+        assert!(
+            metrics.fuse_callbacks.read.max_ms >= 100.0,
+            "read callback latency should include admission wait, got {:?}",
+            metrics.fuse_callbacks.read
+        );
+    }
+
+    #[test]
+    fn read_only_adapter_rejects_negative_read_offset_before_queueing() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-async-read-negative-offset",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+
+        let rejected = adapter
+            .queue_read_for_test(1, 1, -1, 1)
+            .expect_err("negative offsets should fail before queueing");
+
+        assert_eq!(rejected, libc::EINVAL);
+    }
+
+    #[test]
+    fn read_only_adapter_records_actual_async_read_bytes_at_eof() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-async-read-eof-bytes")
+                .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"eof.txt",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        fixture
+            .runtime()
+            .block_on(vfs.write(attr.ino, 0, b"short"))
+            .expect("seed payload");
+        vfs.reset_diagnostics_observability();
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let reader = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open reader through macFUSE adapter");
+
+        let queued = adapter
+            .queue_read_for_test(attr.ino, reader.file_handle(), 0, 4096)
+            .expect("queue EOF-sized read");
+        let bytes = queued.wait().expect("queued read should complete");
+
+        assert_eq!(&bytes[..], b"short");
+        let metrics = vfs.write_path_observability_snapshot();
+        assert_eq!(metrics.fuse_callbacks.read.calls, 1);
+        assert_eq!(metrics.fuse_callbacks.read.bytes, 5);
+        assert_eq!(metrics.fuse_callbacks.read.errors, 0);
+    }
+
+    #[test]
+    fn read_only_adapter_zero_byte_read_uses_vfs_and_records_metrics() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-async-read-zero")
+                .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"zero.txt",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        fixture
+            .runtime()
+            .block_on(vfs.write(attr.ino, 0, b"payload"))
+            .expect("seed payload");
+        vfs.reset_diagnostics_observability();
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let reader = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open reader through macFUSE adapter");
+
+        let queued = adapter
+            .queue_read_for_test(attr.ino, reader.file_handle(), 0, 0)
+            .expect("queue zero-byte read");
+        let bytes = queued.wait().expect("zero-byte read should complete");
+
+        assert!(bytes.is_empty());
+        let metrics = vfs.write_path_observability_snapshot();
+        assert_eq!(metrics.fuse_callbacks.read.calls, 1);
+        assert_eq!(metrics.fuse_callbacks.read.bytes, 0);
+        assert_eq!(metrics.fuse_callbacks.read.errors, 0);
+        assert_eq!(metrics.vfs_read_path.calls, 1);
+    }
+
+    #[test]
+    fn read_only_adapter_caps_oversized_read_to_queue_byte_limit() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-async-read-cap")
+                .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"cap.txt",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        fixture
+            .runtime()
+            .block_on(vfs.write(attr.ino, 0, b"capped"))
+            .expect("seed payload");
+        let adapter = super::adapter::StudioVfsAdapter::new_with_read_queue_byte_limit_for_test(
+            vfs.clone(),
+            fixture.runtime().handle().clone(),
+            4,
+        );
+        let reader = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open reader through macFUSE adapter");
+
+        let queued = adapter
+            .queue_read_for_test(attr.ino, reader.file_handle(), 0, 6)
+            .expect("queue oversized read");
+        let bytes = queued.wait().expect("oversized read should complete");
+
+        assert_eq!(&bytes[..], b"capp");
+    }
+
+    #[test]
+    fn read_only_adapter_read_queue_limit_is_clamped_for_tokio_semaphore() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-async-read-limit-clamp",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+
+        let zero = super::adapter::StudioVfsAdapter::new_with_read_queue_byte_limit_for_test(
+            vfs.clone(),
+            fixture.runtime().handle().clone(),
+            0,
+        );
+        let oversized = super::adapter::StudioVfsAdapter::new_with_read_queue_byte_limit_for_test(
+            vfs.clone(),
+            fixture.runtime().handle().clone(),
+            usize::MAX,
+        );
+
+        assert_eq!(zero.read_queue_byte_limit_for_test(), 1);
+        assert_eq!(
+            oversized.read_queue_byte_limit_for_test() as usize,
+            tokio::sync::Semaphore::MAX_PERMITS.min(u32::MAX as usize)
+        );
+    }
+
+    #[test]
     fn adapter_write_keeps_accepted_bytes_visible_to_same_mount_reader() {
         let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
             "macfuse-adapter-write-read-after-write",

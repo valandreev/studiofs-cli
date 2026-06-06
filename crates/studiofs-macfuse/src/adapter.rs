@@ -13,6 +13,10 @@ use studiofs_bridge::posix::{
 use studiofs_meta::{DirEntry, FileType, InodeAttr, SetattrArgs, TimeSpec};
 use studiofs_vfs::{StatFs, StudioVfs};
 use tokio::runtime::Handle;
+use tokio::sync::Semaphore;
+#[cfg(test)]
+use tokio::task::JoinHandle;
+use tracing::debug;
 
 use crate::low_level::{DirectoryEntryBuffer, Entry, OpenReply, Reply, Request, raw};
 
@@ -21,6 +25,7 @@ const MACFUSE_ATTR_BLOCK_SIZE: u32 = 512;
 const READDIR_CACHE_TTL: Duration = Duration::from_secs(1);
 const READDIR_CACHE_PRUNE_THRESHOLD: usize = 1024;
 const READDIR_CACHE_PRUNE_INTERVAL: Duration = Duration::from_secs(1);
+const MACFUSE_READ_MAX_PENDING_BYTES: usize = 64 * 1024 * 1024;
 
 /// macFUSE open-cache flags chosen for one file handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +46,28 @@ pub(crate) struct StudioVfsAdapter {
     readdir_cache: Mutex<HashMap<u64, ReaddirCacheEntry>>,
     readdir_cache_last_pruned: Mutex<Option<Instant>>,
     readdir_cache_ready: Condvar,
+    read_admission: Arc<Semaphore>,
+    read_queue_byte_limit: u32,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct QueuedReadForTest {
+    runtime_handle: Handle,
+    handle: JoinHandle<Result<Vec<u8>, i32>>,
+}
+
+#[cfg(test)]
+impl QueuedReadForTest {
+    pub(crate) fn is_finished(&self) -> bool {
+        self.handle.is_finished()
+    }
+
+    pub(crate) fn wait(self) -> Result<Vec<u8>, i32> {
+        self.runtime_handle
+            .block_on(self.handle)
+            .expect("queued macFUSE read worker should not panic")
+    }
 }
 
 impl StudioVfsAdapter {
@@ -56,6 +83,24 @@ impl StudioVfsAdapter {
         runtime_handle: Handle,
         read_only: bool,
     ) -> Self {
+        Self::new_with_read_queue_byte_limit(
+            vfs,
+            runtime_handle,
+            read_only,
+            MACFUSE_READ_MAX_PENDING_BYTES,
+        )
+    }
+
+    fn new_with_read_queue_byte_limit(
+        vfs: Arc<StudioVfs>,
+        runtime_handle: Handle,
+        read_only: bool,
+        read_queue_byte_limit: usize,
+    ) -> Self {
+        let read_queue_byte_limit = read_queue_byte_limit
+            .max(1)
+            .min(u32::MAX as usize)
+            .min(Semaphore::MAX_PERMITS) as u32;
         Self {
             vfs,
             runtime_handle,
@@ -65,7 +110,33 @@ impl StudioVfsAdapter {
             readdir_cache: Mutex::new(HashMap::new()),
             readdir_cache_last_pruned: Mutex::new(None),
             readdir_cache_ready: Condvar::new(),
+            read_admission: Arc::new(Semaphore::new(read_queue_byte_limit as usize)),
+            read_queue_byte_limit,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_read_queue_byte_limit_for_test(
+        vfs: Arc<StudioVfs>,
+        runtime_handle: Handle,
+        read_queue_byte_limit: usize,
+    ) -> Self {
+        Self::new_with_read_queue_byte_limit(vfs, runtime_handle, false, read_queue_byte_limit)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_queue_byte_limit_for_test(&self) -> u32 {
+        self.read_queue_byte_limit
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_read_capacity_for_test(
+        &self,
+        bytes: u32,
+    ) -> tokio::sync::OwnedSemaphorePermit {
+        self.runtime_handle
+            .block_on(self.read_admission.clone().acquire_many_owned(bytes))
+            .expect("test read capacity should be available")
     }
 
     /// Look up a child inode.
@@ -192,6 +263,7 @@ impl StudioVfsAdapter {
     }
 
     /// Read file data through a VFS file handle and record FUSE read diagnostics.
+    #[cfg(test)]
     pub(crate) fn read(
         &self,
         ino: u64,
@@ -201,24 +273,115 @@ impl StudioVfsAdapter {
     ) -> Result<Vec<u8>, i32> {
         let offset = u64::try_from(offset).map_err(|_| libc::EINVAL)?;
         let size_usize = size as usize;
-        if size_usize == 0 {
-            return Ok(Vec::new());
-        }
 
+        // TODO(SFS-489): switch to a MaybeUninit/ReadBuf-style VFS read API or a buffer pool
+        // once `StudioVfs::read_into_fh` can safely accept non-zeroed storage.
         let mut out = vec![0u8; size_usize];
         let started = Instant::now();
         let result =
             self.runtime_handle
                 .block_on(self.vfs.read_into_fh(file_handle, ino, offset, &mut out));
-        self.vfs
-            .record_fuse_read_callback(size_usize, started.elapsed(), result.is_err());
         match result {
             Ok(written) => {
+                self.vfs
+                    .record_fuse_read_callback(written as usize, started.elapsed(), false);
                 out.truncate(written as usize);
                 Ok(out)
             }
-            Err(error) => Err(vfs_err_to_errno(&error)),
+            Err(error) => {
+                self.vfs
+                    .record_fuse_read_callback(size_usize, started.elapsed(), true);
+                Err(vfs_err_to_errno(&error))
+            }
         }
+    }
+
+    async fn perform_read(
+        vfs: Arc<StudioVfs>,
+        ino: u64,
+        file_handle: u64,
+        offset: u64,
+        size: u32,
+        started: Instant,
+    ) -> Result<Vec<u8>, i32> {
+        let size_usize = size as usize;
+
+        // TODO(SFS-489): switch to a MaybeUninit/ReadBuf-style VFS read API or a buffer pool
+        // once `StudioVfs::read_into_fh` can safely accept non-zeroed storage.
+        let mut out = vec![0u8; size_usize];
+        let result = vfs.read_into_fh(file_handle, ino, offset, &mut out).await;
+        match result {
+            Ok(written) => {
+                vfs.record_fuse_read_callback(written as usize, started.elapsed(), false);
+                out.truncate(written as usize);
+                Ok(out)
+            }
+            Err(error) => {
+                vfs.record_fuse_read_callback(size_usize, started.elapsed(), true);
+                Err(vfs_err_to_errno(&error))
+            }
+        }
+    }
+
+    pub(crate) fn queue_read_reply(
+        &self,
+        ino: u64,
+        file_handle: u64,
+        offset: i64,
+        size: u32,
+        request: Request,
+    ) {
+        let Ok(offset) = u64::try_from(offset) else {
+            let _ = Reply::new(request).error(libc::EINVAL);
+            return;
+        };
+        let admission = Arc::clone(&self.read_admission);
+        let vfs = Arc::clone(&self.vfs);
+        let size = size.min(self.read_queue_byte_limit);
+        let started = Instant::now();
+        // TODO(SFS-489): wire macFUSE INTERRUPT notifications into this task
+        // so queued reads can abort before spending VFS/cache I/O on canceled requests.
+        self.runtime_handle.spawn(async move {
+            let Ok(_permit) = admission.acquire_many_owned(size).await else {
+                let _ = Reply::new(request).error(libc::EIO);
+                return;
+            };
+            // Keep the permit until after the reply consumes `bytes`, so queued read
+            // memory remains bounded for the whole kernel-reply handoff.
+            match Self::perform_read(vfs, ino, file_handle, offset, size, started).await {
+                Ok(bytes) => {
+                    let _ = Reply::new(request).read_buffer(&bytes);
+                }
+                Err(errno) => {
+                    let _ = Reply::new(request).error(errno);
+                }
+            }
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn queue_read_for_test(
+        &self,
+        ino: u64,
+        file_handle: u64,
+        offset: i64,
+        size: u32,
+    ) -> Result<QueuedReadForTest, i32> {
+        let offset = u64::try_from(offset).map_err(|_| libc::EINVAL)?;
+        let admission = Arc::clone(&self.read_admission);
+        let vfs = Arc::clone(&self.vfs);
+        let size = size.min(self.read_queue_byte_limit);
+        let started = Instant::now();
+        Ok(QueuedReadForTest {
+            runtime_handle: self.runtime_handle.clone(),
+            handle: self.runtime_handle.spawn(async move {
+                let _permit = admission
+                    .acquire_many_owned(size)
+                    .await
+                    .map_err(|_| libc::EIO)?;
+                Self::perform_read(vfs, ino, file_handle, offset, size, started).await
+            }),
+        })
     }
 
     /// Write file data through a VFS file handle.
@@ -1065,14 +1228,19 @@ pub extern "C" fn studiofs_macfuse_read(
     };
     // SAFETY: macFUSE passes a valid `fuse_file_info` pointer for read.
     let file_handle = unsafe { (*fi).fh };
-    match state.adapter.read(ino, file_handle, off, size) {
-        Ok(bytes) => {
-            if let Some(request) = owned_request(req) {
-                let _ = Reply::new(request).read_buffer(&bytes);
-            }
-        }
-        Err(errno) => reply_error(req, errno),
-    }
+    let Some(request) = owned_request(req) else {
+        debug!(
+            ino,
+            file_handle,
+            offset = off,
+            size,
+            "macFUSE read request ownership unavailable"
+        );
+        return;
+    };
+    state
+        .adapter
+        .queue_read_reply(ino, file_handle, off, size, request);
 }
 
 /// macFUSE write callback for the StudioVfs bridge.
