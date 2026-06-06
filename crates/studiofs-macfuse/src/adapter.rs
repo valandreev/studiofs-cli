@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, OsStr};
 use std::mem::{self, MaybeUninit};
 use std::ops::{Deref, DerefMut};
@@ -7,6 +7,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use dashmap::DashMap;
 use libc::{mode_t, off_t, size_t, stat, statvfs};
 use parking_lot::Mutex as ParkingMutex;
 use studiofs_bridge::posix::{
@@ -34,6 +35,7 @@ const MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY: usize = 1024 * 1024;
 // cap, while dropping genuinely oversized requests instead of pinning them.
 const MACFUSE_READ_BUFFER_POOL_RETAINED_CAPACITY: usize = MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY * 2;
 const MACFUSE_READ_WINDOW_MAX_BYTES: usize = 1024 * 1024;
+const MACFUSE_READ_WINDOW_MIN_BYTES: usize = 128 * 1024;
 
 /// macFUSE open-cache flags chosen for one file handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,7 +107,8 @@ impl ReadBufferPool {
 
 #[derive(Debug, Default)]
 struct ReadWindowStore {
-    windows: ParkingMutex<HashMap<u64, ReadWindow>>,
+    windows: DashMap<u64, ReadWindow>,
+    handles_by_inode: DashMap<u64, HashSet<u64>>,
 }
 
 impl ReadWindowStore {
@@ -113,8 +116,7 @@ impl ReadWindowStore {
         if out.is_empty() {
             return None;
         }
-        let mut windows = self.windows.lock();
-        let window = windows.get_mut(&file_handle)?;
+        let mut window = self.windows.get_mut(&file_handle)?;
         if window.ino != ino || !window.contains(offset, out.len()) {
             return None;
         }
@@ -123,28 +125,57 @@ impl ReadWindowStore {
         Some(copied)
     }
 
-    fn remember(&self, file_handle: u64, ino: u64, offset: u64, next_offset: u64, bytes: &[u8]) {
+    fn remember(&self, file_handle: u64, ino: u64, offset: u64, next_offset: u64, bytes: Vec<u8>) {
         if bytes.is_empty() {
             return;
         }
-        let mut windows = self.windows.lock();
-        windows.insert(
+        if let Some(previous) = self.windows.insert(
             file_handle,
             ReadWindow {
                 ino,
                 offset,
                 next_offset,
-                bytes: bytes.to_vec(),
+                bytes,
             },
-        );
+        ) {
+            self.remove_inode_handle(previous.ino, file_handle);
+        }
+        self.handles_by_inode
+            .entry(ino)
+            .or_default()
+            .insert(file_handle);
     }
 
     fn invalidate_handle(&self, file_handle: u64) {
-        self.windows.lock().remove(&file_handle);
+        if let Some((_, window)) = self.windows.remove(&file_handle) {
+            self.remove_inode_handle(window.ino, file_handle);
+        }
     }
 
     fn invalidate_inode(&self, ino: u64) {
-        self.windows.lock().retain(|_, window| window.ino != ino);
+        let Some((_, handles)) = self.handles_by_inode.remove(&ino) else {
+            return;
+        };
+        for file_handle in handles {
+            if let Some(window) = self.windows.get(&file_handle)
+                && window.ino != ino
+            {
+                continue;
+            }
+            self.windows.remove(&file_handle);
+        }
+    }
+
+    fn remove_inode_handle(&self, ino: u64, file_handle: u64) {
+        let Some(mut handles) = self.handles_by_inode.get_mut(&ino) else {
+            return;
+        };
+        handles.remove(&file_handle);
+        if handles.is_empty() {
+            drop(handles);
+            self.handles_by_inode
+                .remove_if(&ino, |_, handles| handles.is_empty());
+        }
     }
 }
 
@@ -242,7 +273,8 @@ fn readahead_window_len(size: usize) -> usize {
     if size == 0 {
         return 0;
     }
-    size.saturating_mul(2).min(MACFUSE_READ_WINDOW_MAX_BYTES)
+    size.saturating_mul(2)
+        .clamp(MACFUSE_READ_WINDOW_MIN_BYTES, MACFUSE_READ_WINDOW_MAX_BYTES)
 }
 
 #[cfg(test)]
@@ -518,7 +550,7 @@ impl StudioVfsAdapter {
         let size = clamp_reusable_read_size(size, MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY as u32);
         let size_usize = size as usize;
 
-        let mut out = state.read_buffers.acquire(size_usize);
+        let mut out = state.read_buffers.clone().acquire(size_usize);
         if state
             .read_windows
             .try_read(file_handle, ino, offset, &mut out)
@@ -546,13 +578,18 @@ impl StudioVfsAdapter {
                     .vfs
                     .record_fuse_read_callback(reply_len, started.elapsed(), false);
                 if written > size_usize {
+                    let mut window_bytes = mem::take(&mut out.buffer);
+                    window_bytes.truncate(written);
+                    let mut reply = state.read_buffers.clone().acquire(reply_len);
+                    reply.copy_from_slice(&window_bytes[..reply_len]);
                     state.read_windows.remember(
                         file_handle,
                         ino,
                         offset,
                         offset.saturating_add(reply_len as u64),
-                        &out[..written],
+                        window_bytes,
                     );
+                    return Ok(reply);
                 } else {
                     state.read_windows.invalidate_handle(file_handle);
                 }
@@ -2078,6 +2115,19 @@ mod tests {
             pool.last_available_capacity()
                 .expect("recycled buffer should retain capacity")
                 >= 16
+        );
+    }
+
+    #[test]
+    fn readahead_window_len_uses_floor_for_small_reads() {
+        assert_eq!(readahead_window_len(0), 0);
+        assert_eq!(
+            readahead_window_len(4 * 1024),
+            MACFUSE_READ_WINDOW_MIN_BYTES
+        );
+        assert_eq!(
+            readahead_window_len(MACFUSE_READ_WINDOW_MAX_BYTES),
+            MACFUSE_READ_WINDOW_MAX_BYTES
         );
     }
 
