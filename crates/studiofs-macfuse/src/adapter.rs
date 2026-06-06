@@ -70,12 +70,11 @@ impl ReadBufferPool {
         PooledReadBuffer { pool: self, buffer }
     }
 
-    fn recycle(&self, mut buffer: Vec<u8>) {
+    fn recycle(&self, buffer: Vec<u8>) {
         if buffer.capacity() == 0 || buffer.capacity() > MACFUSE_READ_BUFFER_POOL_RETAINED_CAPACITY
         {
             return;
         }
-        buffer.clear();
         let mut buffers = self.buffers.lock();
         if buffers.len() < MACFUSE_READ_BUFFER_POOL_MAX_BUFFERS {
             buffers.push(buffer);
@@ -90,6 +89,11 @@ impl ReadBufferPool {
     #[cfg(test)]
     fn available_capacity(&self) -> Option<usize> {
         self.buffers.lock().last().map(Vec::capacity)
+    }
+
+    #[cfg(test)]
+    fn available_len(&self) -> Option<usize> {
+        self.buffers.lock().last().map(Vec::len)
     }
 }
 
@@ -1911,6 +1915,23 @@ fn xattr_not_found_errno() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_buffer_pool_keeps_recycled_initialized_prefix_len() {
+        let pool = Arc::new(ReadBufferPool::default());
+        let mut buffer = Arc::clone(&pool).acquire(16);
+        buffer.truncate(5);
+
+        drop(buffer);
+
+        assert_eq!(pool.available_count(), 1);
+        assert_eq!(pool.available_len(), Some(5));
+        assert!(
+            pool.available_capacity()
+                .expect("recycled buffer should retain capacity")
+                >= 16
+        );
+    }
 
     #[test]
     fn setattr_mask_accepts_bundled_size_changes_and_gates_file_handle() {
