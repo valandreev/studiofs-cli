@@ -353,7 +353,8 @@ fn readahead_window_len(size: usize) -> usize {
 }
 
 fn open_cache_snapshot_capacity() -> NonZeroUsize {
-    NonZeroUsize::new(MACFUSE_OPEN_CACHE_SNAPSHOT_LIMIT).unwrap_or(NonZeroUsize::MIN)
+    NonZeroUsize::new(MACFUSE_OPEN_CACHE_SNAPSHOT_LIMIT)
+        .expect("MACFUSE_OPEN_CACHE_SNAPSHOT_LIMIT must be greater than 0")
 }
 
 #[cfg(test)]
