@@ -30,6 +30,8 @@ const READDIR_CACHE_PRUNE_INTERVAL: Duration = Duration::from_secs(1);
 const MACFUSE_READ_MAX_PENDING_BYTES: usize = 64 * 1024 * 1024;
 const MACFUSE_READ_BUFFER_POOL_MAX_BUFFERS: usize = 32;
 const MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY: usize = 1024 * 1024;
+// Keep allocator-rounded buffers that grew slightly beyond the reusable read
+// cap, while dropping genuinely oversized requests instead of pinning them.
 const MACFUSE_READ_BUFFER_POOL_RETAINED_CAPACITY: usize = MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY * 2;
 
 /// macFUSE open-cache flags chosen for one file handle.
@@ -71,6 +73,8 @@ impl ReadBufferPool {
     }
 
     fn recycle(&self, buffer: Vec<u8>) {
+        // `mem::take` during `Drop` leaves a zero-capacity placeholder; recycling
+        // it would only occupy a pool slot without avoiding a future allocation.
         if buffer.capacity() == 0 || buffer.capacity() > MACFUSE_READ_BUFFER_POOL_RETAINED_CAPACITY
         {
             return;
@@ -87,12 +91,12 @@ impl ReadBufferPool {
     }
 
     #[cfg(test)]
-    fn available_capacity(&self) -> Option<usize> {
+    fn last_available_capacity(&self) -> Option<usize> {
         self.buffers.lock().last().map(Vec::capacity)
     }
 
     #[cfg(test)]
-    fn available_len(&self) -> Option<usize> {
+    fn last_available_len(&self) -> Option<usize> {
         self.buffers.lock().last().map(Vec::len)
     }
 }
@@ -251,7 +255,7 @@ impl StudioVfsAdapter {
 
     #[cfg(test)]
     pub(crate) fn reusable_read_buffer_capacity_for_test(&self) -> Option<usize> {
-        self.read_buffers.available_capacity()
+        self.read_buffers.last_available_capacity()
     }
 
     /// Look up a child inode.
@@ -420,6 +424,7 @@ impl StudioVfsAdapter {
         started: Instant,
         read_buffers: Arc<ReadBufferPool>,
     ) -> Result<PooledReadBuffer, i32> {
+        let size = clamp_reusable_read_size(size, MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY as u32);
         let size_usize = size as usize;
 
         let mut out = read_buffers.acquire(size_usize);
@@ -1925,9 +1930,9 @@ mod tests {
         drop(buffer);
 
         assert_eq!(pool.available_count(), 1);
-        assert_eq!(pool.available_len(), Some(5));
+        assert_eq!(pool.last_available_len(), Some(5));
         assert!(
-            pool.available_capacity()
+            pool.last_available_capacity()
                 .expect("recycled buffer should retain capacity")
                 >= 16
         );

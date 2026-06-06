@@ -959,6 +959,8 @@ mod tests {
         let bytes = queued.wait().expect("zero-byte read should complete");
 
         assert!(bytes.is_empty());
+        // Zero-byte reads still exercise VFS/metrics, but their zero-capacity
+        // buffers must not occupy reusable pool slots.
         assert_eq!(adapter.reusable_read_buffer_count_for_test(), 0);
         assert_eq!(adapter.reusable_read_buffer_capacity_for_test(), None);
         let metrics = vfs.write_path_observability_snapshot();
