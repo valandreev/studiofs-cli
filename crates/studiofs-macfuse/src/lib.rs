@@ -959,6 +959,8 @@ mod tests {
         let bytes = queued.wait().expect("zero-byte read should complete");
 
         assert!(bytes.is_empty());
+        assert_eq!(adapter.reusable_read_buffer_count_for_test(), 0);
+        assert_eq!(adapter.reusable_read_buffer_capacity_for_test(), None);
         let metrics = vfs.write_path_observability_snapshot();
         assert_eq!(metrics.fuse_callbacks.read.calls, 1);
         assert_eq!(metrics.fuse_callbacks.read.bytes, 0);

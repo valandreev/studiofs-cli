@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, OsStr};
-use std::mem::MaybeUninit;
+use std::mem::{self, MaybeUninit};
 use std::ops::{Deref, DerefMut};
 use std::os::raw::c_char;
 use std::os::unix::ffi::OsStrExt;
@@ -67,14 +67,12 @@ impl ReadBufferPool {
         // TODO(SFS-489): avoid this per-read zero-fill once the VFS read path accepts
         // MaybeUninit/ReadBuf-style storage instead of initialized `&mut [u8]`.
         buffer.resize(size, 0);
-        PooledReadBuffer {
-            pool: self,
-            buffer: Some(buffer),
-        }
+        PooledReadBuffer { pool: self, buffer }
     }
 
     fn recycle(&self, mut buffer: Vec<u8>) {
-        if buffer.capacity() > MACFUSE_READ_BUFFER_POOL_RETAINED_CAPACITY {
+        if buffer.capacity() == 0 || buffer.capacity() > MACFUSE_READ_BUFFER_POOL_RETAINED_CAPACITY
+        {
             return;
         }
         buffer.clear();
@@ -98,15 +96,12 @@ impl ReadBufferPool {
 #[derive(Debug)]
 struct PooledReadBuffer {
     pool: Arc<ReadBufferPool>,
-    buffer: Option<Vec<u8>>,
+    buffer: Vec<u8>,
 }
 
 impl PooledReadBuffer {
     fn truncate(&mut self, len: usize) {
-        self.buffer
-            .as_mut()
-            .expect("pooled read buffer should be present")
-            .truncate(len);
+        self.buffer.truncate(len);
     }
 }
 
@@ -114,19 +109,13 @@ impl Deref for PooledReadBuffer {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
-        self.buffer
-            .as_ref()
-            .expect("pooled read buffer should be present")
-            .as_slice()
+        self.buffer.as_slice()
     }
 }
 
 impl DerefMut for PooledReadBuffer {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.buffer
-            .as_mut()
-            .expect("pooled read buffer should be present")
-            .as_mut_slice()
+        self.buffer.as_mut_slice()
     }
 }
 
@@ -138,9 +127,7 @@ impl AsRef<[u8]> for PooledReadBuffer {
 
 impl Drop for PooledReadBuffer {
     fn drop(&mut self) {
-        if let Some(buffer) = self.buffer.take() {
-            self.pool.recycle(buffer);
-        }
+        self.pool.recycle(mem::take(&mut self.buffer));
     }
 }
 
@@ -398,6 +385,8 @@ impl StudioVfsAdapter {
         let offset = u64::try_from(offset).map_err(|_| libc::EINVAL)?;
         let size_usize = size as usize;
 
+        // Test-only synchronous reads return an owned Vec, so keep them off the
+        // queued-read pool; otherwise this helper would consume pooled buffers.
         let mut out = vec![0u8; size_usize];
         let started = Instant::now();
         let result =
