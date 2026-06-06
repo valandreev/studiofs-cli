@@ -1440,6 +1440,229 @@ mod tests {
     }
 
     #[test]
+    fn adapter_keeps_kernel_cache_only_for_unchanged_read_only_generation() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-adapter-cache-generation",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"cached.txt",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+
+        let first_open = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open first read-only handle");
+        assert!(
+            !first_open.keep_cache(),
+            "first open must invalidate unknown kernel pages: {first_open:?}"
+        );
+        adapter
+            .release(attr.ino, first_open.file_handle())
+            .expect("release first handle");
+
+        let repeated_open = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open repeated read-only handle");
+        assert!(
+            repeated_open.keep_cache(),
+            "unchanged repeated open may keep kernel pages: {repeated_open:?}"
+        );
+        adapter
+            .release(attr.ino, repeated_open.file_handle())
+            .expect("release repeated handle");
+
+        vfs.setattr(attr.ino, studiofs_meta::SetattrArgs::size_only(1))
+            .expect("advance visible file generation");
+
+        let changed_open = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open after visible generation changed");
+        assert!(
+            !changed_open.keep_cache(),
+            "changed generation must invalidate kernel pages: {changed_open:?}"
+        );
+    }
+
+    #[test]
+    fn adapter_write_capable_open_clears_previous_kernel_cache_observation() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-adapter-cache-write-open",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"write-open.txt",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+
+        let first_open = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open first read-only handle");
+        adapter
+            .release(attr.ino, first_open.file_handle())
+            .expect("release first handle");
+        let repeated_open = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open repeated read-only handle");
+        assert!(
+            repeated_open.keep_cache(),
+            "unchanged repeated open should establish a cacheable observation: {repeated_open:?}"
+        );
+        adapter
+            .release(attr.ino, repeated_open.file_handle())
+            .expect("release repeated handle");
+
+        let write_open = adapter
+            .open(attr.ino, libc::O_WRONLY)
+            .expect("open write-capable handle");
+        assert!(
+            !write_open.keep_cache(),
+            "write-capable open must not keep cache: {write_open:?}"
+        );
+        adapter
+            .release(attr.ino, write_open.file_handle())
+            .expect("release write-capable handle");
+
+        let read_after_write_open = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open read-only handle after write-capable open");
+        assert!(
+            !read_after_write_open.keep_cache(),
+            "write-capable open must clear previous cache observation: {read_after_write_open:?}"
+        );
+    }
+
+    #[test]
+    fn adapter_unlink_clears_kernel_cache_observation_for_removed_inode() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-adapter-cache-unlink")
+                .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let root = studiofs_vfs::contract_harness::CONTRACT_ROOT_INO;
+        let attr = vfs
+            .create(root, b"unlink-cache.txt", 501, 20, 0o644)
+            .expect("create file");
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+
+        let first_open = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open first read-only handle");
+        adapter
+            .release(attr.ino, first_open.file_handle())
+            .expect("release first handle");
+        let repeated_open = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open repeated read-only handle");
+        assert!(repeated_open.keep_cache());
+        adapter
+            .release(attr.ino, repeated_open.file_handle())
+            .expect("release repeated handle");
+        assert!(adapter.has_open_cache_snapshot_for_test(attr.ino));
+
+        adapter
+            .unlink(root, b"unlink-cache.txt")
+            .expect("unlink through macFUSE adapter");
+
+        assert!(!adapter.has_open_cache_snapshot_for_test(attr.ino));
+    }
+
+    #[test]
+    fn adapter_unlink_keeps_kernel_cache_observation_for_remaining_hardlink() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-adapter-cache-hardlink",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let root = studiofs_vfs::contract_harness::CONTRACT_ROOT_INO;
+        let attr = vfs
+            .create(root, b"hardlink-source.txt", 501, 20, 0o644)
+            .expect("create file");
+        vfs.link(attr.ino, root, b"hardlink-remaining.txt")
+            .expect("create hardlink");
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+
+        let first_open = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open first read-only handle");
+        adapter
+            .release(attr.ino, first_open.file_handle())
+            .expect("release first handle");
+        let repeated_open = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open repeated read-only handle");
+        assert!(repeated_open.keep_cache());
+        adapter
+            .release(attr.ino, repeated_open.file_handle())
+            .expect("release repeated handle");
+        assert!(adapter.has_open_cache_snapshot_for_test(attr.ino));
+
+        adapter
+            .unlink(root, b"hardlink-source.txt")
+            .expect("unlink one hardlink through macFUSE adapter");
+
+        assert!(adapter.has_open_cache_snapshot_for_test(attr.ino));
+        assert_eq!(
+            vfs.lookup(root, b"hardlink-remaining.txt")
+                .expect("remaining hardlink should still resolve")
+                .ino,
+            attr.ino
+        );
+    }
+
+    #[test]
+    fn adapter_open_cache_observations_are_bounded() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-adapter-cache-bounded",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let root = studiofs_vfs::contract_harness::CONTRACT_ROOT_INO;
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let limit = adapter.open_cache_snapshot_limit_for_test();
+
+        for index in 0..(limit + 3) {
+            let name = format!("bounded-{index}.txt");
+            let attr = vfs
+                .create(root, name.as_bytes(), 501, 20, 0o644)
+                .expect("create file");
+            let first_open = adapter
+                .open(attr.ino, libc::O_RDONLY)
+                .expect("open first read-only handle");
+            adapter
+                .release(attr.ino, first_open.file_handle())
+                .expect("release first handle");
+            let repeated_open = adapter
+                .open(attr.ino, libc::O_RDONLY)
+                .expect("open repeated read-only handle");
+            assert!(repeated_open.keep_cache());
+            adapter
+                .release(attr.ino, repeated_open.file_handle())
+                .expect("release repeated handle");
+        }
+
+        assert!(adapter.open_cache_snapshot_count_for_test() <= limit);
+    }
+
+    #[test]
     fn adapter_roundtrips_native_resource_fork_xattr_bytes() {
         let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
             "macfuse-adapter-resource-fork-xattr",

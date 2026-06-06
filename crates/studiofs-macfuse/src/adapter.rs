@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, OsStr};
 use std::mem::{self, MaybeUninit};
+use std::num::NonZeroUsize;
 use std::ops::{Deref, DerefMut};
 use std::os::raw::c_char;
 use std::os::unix::ffi::OsStrExt;
@@ -12,11 +13,12 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use libc::{mode_t, off_t, size_t, stat, statvfs};
+use lru::LruCache;
 use parking_lot::Mutex as ParkingMutex;
 use studiofs_bridge::posix::{
     BridgeFileAttr, BridgeFileType, posix_flags_to_open_flags, to_bridge_attr, vfs_err_to_errno,
 };
-use studiofs_meta::{DirEntry, FileType, InodeAttr, SetattrArgs, TimeSpec};
+use studiofs_meta::{DirEntry, FileType, InodeAttr, SetattrArgs, TimeSpec, UploadState};
 use studiofs_vfs::{StatFs, StudioVfs};
 use tokio::runtime::Handle;
 use tokio::sync::Semaphore;
@@ -39,6 +41,10 @@ const MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY: usize = 1024 * 1024;
 const MACFUSE_READ_BUFFER_POOL_RETAINED_CAPACITY: usize = MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY * 2;
 const MACFUSE_READ_WINDOW_MAX_BYTES: usize = 1024 * 1024;
 const MACFUSE_READ_WINDOW_MIN_BYTES: usize = 128 * 1024;
+#[cfg(not(test))]
+const MACFUSE_OPEN_CACHE_SNAPSHOT_LIMIT: usize = 8192;
+#[cfg(test)]
+const MACFUSE_OPEN_CACHE_SNAPSHOT_LIMIT: usize = 8;
 
 /// macFUSE open-cache flags chosen for one file handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,10 +65,33 @@ pub(crate) struct StudioVfsAdapter {
     readdir_cache: Mutex<HashMap<u64, ReaddirCacheEntry>>,
     readdir_cache_last_pruned: Mutex<Option<Instant>>,
     readdir_cache_ready: Condvar,
+    open_cache_snapshots: ParkingMutex<LruCache<u64, MacFuseOpenCacheSnapshot>>,
     read_admission: Arc<Semaphore>,
     read_queue_byte_limit: u32,
     read_buffers: Arc<ReadBufferPool>,
     read_windows: Arc<ReadWindowStore>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MacFuseOpenCacheSnapshot {
+    content_epoch: u64,
+    size: u64,
+}
+
+impl MacFuseOpenCacheSnapshot {
+    fn from_attr(attr: &InodeAttr) -> Option<Self> {
+        if attr.kind != FileType::RegularFile
+            || attr.upload_state != UploadState::Ready
+            || attr.content_epoch != attr.committed_content_epoch
+            || attr.size != attr.committed_size
+        {
+            return None;
+        }
+        Some(Self {
+            content_epoch: attr.content_epoch,
+            size: attr.size,
+        })
+    }
 }
 
 #[derive(Debug, Default)]
@@ -323,6 +352,11 @@ fn readahead_window_len(size: usize) -> usize {
         .clamp(MACFUSE_READ_WINDOW_MIN_BYTES, MACFUSE_READ_WINDOW_MAX_BYTES)
 }
 
+fn open_cache_snapshot_capacity() -> NonZeroUsize {
+    NonZeroUsize::new(MACFUSE_OPEN_CACHE_SNAPSHOT_LIMIT)
+        .expect("MACFUSE_OPEN_CACHE_SNAPSHOT_LIMIT must be greater than 0")
+}
+
 #[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct QueuedReadForTest {
@@ -387,6 +421,7 @@ impl StudioVfsAdapter {
             readdir_cache: Mutex::new(HashMap::new()),
             readdir_cache_last_pruned: Mutex::new(None),
             readdir_cache_ready: Condvar::new(),
+            open_cache_snapshots: ParkingMutex::new(LruCache::new(open_cache_snapshot_capacity())),
             read_admission: Arc::new(Semaphore::new(read_queue_byte_limit as usize)),
             read_queue_byte_limit,
             read_buffers: Arc::new(ReadBufferPool::default()),
@@ -426,6 +461,21 @@ impl StudioVfsAdapter {
     #[cfg(test)]
     pub(crate) fn reusable_read_buffer_capacity_for_test(&self) -> Option<usize> {
         self.read_buffers.last_available_capacity()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_open_cache_snapshot_for_test(&self, ino: u64) -> bool {
+        self.open_cache_snapshots.lock().contains(&ino)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_cache_snapshot_count_for_test(&self) -> usize {
+        self.open_cache_snapshots.lock().len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_cache_snapshot_limit_for_test(&self) -> usize {
+        MACFUSE_OPEN_CACHE_SNAPSHOT_LIMIT
     }
 
     /// Look up a child inode.
@@ -496,15 +546,68 @@ impl StudioVfsAdapter {
         if self.read_only && posix_open_requests_write(flags, trunc) {
             return Err(libc::EROFS);
         }
+        let flag_policy = macfuse_open_cache_policy(flags, trunc);
         self.vfs
             .open_file(ino, open_flags, trunc)
             .map(|fh| {
-                let policy = macfuse_open_cache_policy(flags, trunc);
+                let keep_cache = if flag_policy.keep_cache {
+                    self.keep_cache_for_current_generation(ino)
+                } else {
+                    self.clear_open_cache_snapshot(ino, "write_capable");
+                    false
+                };
                 OpenReply::new(fh)
-                    .with_direct_io(policy.direct_io)
-                    .with_keep_cache(policy.keep_cache)
+                    .with_direct_io(flag_policy.direct_io)
+                    .with_keep_cache(keep_cache)
             })
             .map_err(|error| vfs_err_to_errno(&error))
+    }
+
+    fn clear_open_cache_snapshot(&self, ino: u64, reason: &'static str) {
+        self.open_cache_snapshots.lock().pop(&ino);
+        debug!(ino, reason, "macFUSE open invalidates kernel cache");
+    }
+
+    fn keep_cache_for_current_generation(&self, ino: u64) -> bool {
+        let Ok(attr) = self.vfs.getattr(ino) else {
+            self.clear_open_cache_snapshot(ino, "unknown_state");
+            return false;
+        };
+        let Some(snapshot) = MacFuseOpenCacheSnapshot::from_attr(&attr) else {
+            self.clear_open_cache_snapshot(ino, "not_fully_committed");
+            return false;
+        };
+        if self.vfs.inode_has_local_dirty_state(ino) {
+            self.clear_open_cache_snapshot(ino, "local_dirty_state");
+            return false;
+        }
+
+        let mut snapshots = self.open_cache_snapshots.lock();
+        if snapshots
+            .get(&ino)
+            .is_some_and(|previous| *previous == snapshot)
+        {
+            debug!(
+                ino,
+                keep_cache = true,
+                content_epoch = snapshot.content_epoch,
+                size = snapshot.size,
+                reason = "read_only_safe",
+                "macFUSE open cache decision"
+            );
+            return true;
+        }
+
+        snapshots.put(ino, snapshot);
+        debug!(
+            ino,
+            keep_cache = false,
+            content_epoch = snapshot.content_epoch,
+            size = snapshot.size,
+            reason = "generation_changed",
+            "macFUSE open cache decision"
+        );
+        false
     }
 
     /// Remove a file entry.
@@ -513,8 +616,16 @@ impl StudioVfsAdapter {
             return Err(libc::EROFS);
         }
         self.vfs
-            .unlink(parent, name)
-            .inspect(|_| self.invalidate_readdir_cache(parent))
+            .unlink_with_attr(parent, name)
+            .inspect(|unlinked_attr| {
+                if let Some(attr) = unlinked_attr
+                    && attr.nlink == 0
+                {
+                    self.clear_open_cache_snapshot(attr.ino, "unlink");
+                }
+                self.invalidate_readdir_cache(parent);
+            })
+            .map(|_| ())
             .map_err(|error| vfs_err_to_errno(&error))
     }
 
