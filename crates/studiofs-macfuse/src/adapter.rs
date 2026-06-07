@@ -19,7 +19,7 @@ use studiofs_bridge::posix::{
     BridgeFileAttr, BridgeFileType, posix_flags_to_open_flags, to_bridge_attr, vfs_err_to_errno,
 };
 use studiofs_meta::{DirEntry, FileType, InodeAttr, SetattrArgs, TimeSpec, UploadState};
-use studiofs_vfs::{StatFs, StudioVfs, VfsFuseAsyncReadSnapshot};
+use studiofs_vfs::{StatFs, StudioVfs, VfsFuseAsyncReadSnapshot, VfsMacFuseOpenCacheDecision};
 use tokio::runtime::Handle;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 #[cfg(test)]
@@ -36,11 +36,11 @@ const READDIR_CACHE_PRUNE_THRESHOLD: usize = 1024;
 const READDIR_CACHE_PRUNE_INTERVAL: Duration = Duration::from_secs(1);
 const MACFUSE_READ_MAX_PENDING_BYTES: usize = 64 * 1024 * 1024;
 const MACFUSE_READ_BUFFER_POOL_MAX_BUFFERS: usize = 32;
-const MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY: usize = 8 * 1024 * 1024;
+const MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY: usize = 1024 * 1024;
 // Keep allocator-rounded buffers that grew slightly beyond the reusable read
 // cap, while dropping genuinely oversized requests instead of pinning them.
 const MACFUSE_READ_BUFFER_POOL_RETAINED_CAPACITY: usize = MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY * 2;
-const MACFUSE_READ_WINDOW_MAX_BYTES: usize = 8 * 1024 * 1024;
+const MACFUSE_READ_WINDOW_MAX_BYTES: usize = 1024 * 1024;
 const MACFUSE_READ_WINDOW_MIN_BYTES: usize = 128 * 1024;
 const MACFUSE_ASYNC_READ_SNAPSHOT_INTERVAL: Duration = Duration::from_millis(500);
 const MACFUSE_READ_INTERRUPTED_ERRNO: i32 = libc::EINTR;
@@ -295,15 +295,6 @@ struct ReadExecutionState {
     read_windows: Arc<ReadWindowStore>,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct ReadExecutionRequest {
-    ino: u64,
-    file_handle: u64,
-    offset: u64,
-    size: u32,
-    max_read_len: u32,
-}
-
 #[derive(Debug)]
 struct PooledReadBuffer {
     pool: Arc<ReadBufferPool>,
@@ -361,15 +352,8 @@ fn readahead_window_len(size: usize) -> usize {
     if size == 0 {
         return 0;
     }
-    size.saturating_mul(8)
+    size.saturating_mul(2)
         .clamp(MACFUSE_READ_WINDOW_MIN_BYTES, MACFUSE_READ_WINDOW_MAX_BYTES)
-}
-
-fn queued_read_admission_bytes(size: u32, read_queue_byte_limit: u32) -> u32 {
-    readahead_window_len(size as usize)
-        .min(MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY)
-        .min(read_queue_byte_limit as usize)
-        .min(u32::MAX as usize) as u32
 }
 
 fn open_cache_snapshot_capacity() -> NonZeroUsize {
@@ -788,6 +772,9 @@ impl StudioVfsAdapter {
                     self.keep_cache_for_current_generation(ino)
                 } else {
                     self.clear_open_cache_snapshot(ino, "write_capable");
+                    self.vfs.record_macfuse_open_cache_decision(
+                        VfsMacFuseOpenCacheDecision::WriteCapable,
+                    );
                     false
                 };
                 OpenReply::new(fh)
@@ -805,14 +792,23 @@ impl StudioVfsAdapter {
     fn keep_cache_for_current_generation(&self, ino: u64) -> bool {
         let Ok(attr) = self.vfs.getattr(ino) else {
             self.clear_open_cache_snapshot(ino, "unknown_state");
+            self.vfs.record_macfuse_open_cache_decision(
+                VfsMacFuseOpenCacheDecision::ReadOnlyUnknownState,
+            );
             return false;
         };
         let Some(snapshot) = MacFuseOpenCacheSnapshot::from_attr(&attr) else {
             self.clear_open_cache_snapshot(ino, "not_fully_committed");
+            self.vfs.record_macfuse_open_cache_decision(
+                VfsMacFuseOpenCacheDecision::ReadOnlyNotFullyCommitted,
+            );
             return false;
         };
         if self.vfs.inode_has_local_dirty_state(ino) {
             self.clear_open_cache_snapshot(ino, "local_dirty_state");
+            self.vfs.record_macfuse_open_cache_decision(
+                VfsMacFuseOpenCacheDecision::ReadOnlyLocalDirtyState,
+            );
             return false;
         }
 
@@ -829,6 +825,8 @@ impl StudioVfsAdapter {
                 reason = "read_only_safe",
                 "macFUSE open cache decision"
             );
+            self.vfs
+                .record_macfuse_open_cache_decision(VfsMacFuseOpenCacheDecision::ReadOnlyKeep);
             return true;
         }
 
@@ -840,6 +838,9 @@ impl StudioVfsAdapter {
             size = snapshot.size,
             reason = "generation_changed",
             "macFUSE open cache decision"
+        );
+        self.vfs.record_macfuse_open_cache_decision(
+            VfsMacFuseOpenCacheDecision::ReadOnlyGenerationChanged,
         );
         false
     }
@@ -932,25 +933,26 @@ impl StudioVfsAdapter {
 
     async fn perform_read(
         state: ReadExecutionState,
-        request: ReadExecutionRequest,
+        ino: u64,
+        file_handle: u64,
+        offset: u64,
+        size: u32,
         started: Instant,
         cancellation: ReadCancellationToken,
     ) -> Result<PooledReadBuffer, i32> {
         if cancellation.is_cancelled() {
             return Err(MACFUSE_READ_INTERRUPTED_ERRNO);
         }
-        let size =
-            clamp_reusable_read_size(request.size, MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY as u32);
+        let size = clamp_reusable_read_size(size, MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY as u32);
         let size_usize = size as usize;
 
         let mut out = state.read_buffers.clone().acquire(size_usize);
         if cancellation.is_cancelled() {
             return Err(MACFUSE_READ_INTERRUPTED_ERRNO);
         }
-        if let Some(copied) =
-            state
-                .read_windows
-                .try_read(request.file_handle, request.ino, request.offset, &mut out)
+        if let Some(copied) = state
+            .read_windows
+            .try_read(file_handle, ino, offset, &mut out)
         {
             out.truncate(copied);
             state
@@ -959,16 +961,16 @@ impl StudioVfsAdapter {
             return Ok(out);
         }
 
-        let read_len = readahead_window_len(size_usize).min(request.max_read_len as usize);
+        let read_len = readahead_window_len(size_usize);
         if read_len > size_usize {
             out.buffer.resize(read_len, 0);
         }
         if cancellation.is_cancelled() {
             return Err(MACFUSE_READ_INTERRUPTED_ERRNO);
         }
-        let generation = state.read_windows.invalidation_generation(request.ino);
+        let generation = state.read_windows.invalidation_generation(ino);
         let result = tokio::select! {
-            result = state.vfs.read_into_fh(request.file_handle, request.ino, request.offset, &mut out) => result,
+            result = state.vfs.read_into_fh(file_handle, ino, offset, &mut out) => result,
             () = cancellation.cancelled() => return Err(MACFUSE_READ_INTERRUPTED_ERRNO),
         };
         match result {
@@ -983,17 +985,17 @@ impl StudioVfsAdapter {
                     let mut remainder = state.read_buffers.clone().acquire(remainder_len);
                     remainder.copy_from_slice(&out[reply_len..written]);
                     state.read_windows.remember_if_current(
-                        request.file_handle,
-                        request.ino,
-                        request.offset.saturating_add(reply_len as u64),
-                        request.offset.saturating_add(reply_len as u64),
+                        file_handle,
+                        ino,
+                        offset.saturating_add(reply_len as u64),
+                        offset.saturating_add(reply_len as u64),
                         remainder,
                         generation,
                     );
                     out.truncate(reply_len);
                     return Ok(out);
                 } else {
-                    state.read_windows.invalidate_handle(request.file_handle);
+                    state.read_windows.invalidate_handle(file_handle);
                 }
                 out.truncate(reply_len);
                 Ok(out)
@@ -1002,7 +1004,7 @@ impl StudioVfsAdapter {
                 state
                     .vfs
                     .record_fuse_read_callback(size_usize, started.elapsed(), true);
-                state.read_windows.invalidate_handle(request.file_handle);
+                state.read_windows.invalidate_handle(file_handle);
                 Err(vfs_err_to_errno(&error))
             }
         }
@@ -1027,16 +1029,13 @@ impl StudioVfsAdapter {
             read_windows: Arc::clone(&self.read_windows),
         };
         let size = clamp_reusable_read_size(size, self.read_queue_byte_limit);
-        let read_queue_byte_limit = self.read_queue_byte_limit;
         let started = Instant::now();
         let cancellation = ReadCancellationToken::default();
         let diagnostics = Arc::clone(&self.read_diagnostics);
         let mut request = request;
         request.register_interrupt_token(cancellation.fuse_token());
         self.runtime_handle.spawn(async move {
-            let admission_bytes = queued_read_admission_bytes(size, read_queue_byte_limit);
-            let mut read_guard =
-                AsyncReadTaskGuard::new(admission_bytes, diagnostics, Arc::clone(&state.vfs));
+            let mut read_guard = AsyncReadTaskGuard::new(size, diagnostics, Arc::clone(&state.vfs));
             if cancellation.is_cancelled() {
                 read_guard.finish_with(AsyncReadOutcome::Canceled);
                 let _ = Reply::new(request).error(MACFUSE_READ_INTERRUPTED_ERRNO);
@@ -1044,7 +1043,7 @@ impl StudioVfsAdapter {
             }
             let _permit = match acquire_read_admission(
                 admission,
-                admission_bytes,
+                size,
                 &read_guard.diagnostics,
                 &cancellation,
             )
@@ -1064,19 +1063,8 @@ impl StudioVfsAdapter {
             };
             // Keep the permit until after the reply consumes `bytes`, so queued read
             // memory remains bounded for the whole kernel-reply handoff.
-            match Self::perform_read(
-                state,
-                ReadExecutionRequest {
-                    ino,
-                    file_handle,
-                    offset,
-                    size,
-                    max_read_len: admission_bytes,
-                },
-                started,
-                cancellation,
-            )
-            .await
+            match Self::perform_read(state, ino, file_handle, offset, size, started, cancellation)
+                .await
             {
                 Ok(bytes) => {
                     read_guard.finish_with(AsyncReadOutcome::Completed);
@@ -1111,44 +1099,35 @@ impl StudioVfsAdapter {
             read_windows: Arc::clone(&self.read_windows),
         };
         let size = clamp_reusable_read_size(size, self.read_queue_byte_limit);
-        let read_queue_byte_limit = self.read_queue_byte_limit;
         let started = Instant::now();
         let cancellation = ReadCancellationToken::default();
         let diagnostics = Arc::clone(&self.read_diagnostics);
         Ok(QueuedReadForTest {
             runtime_handle: self.runtime_handle.clone(),
             handle: self.runtime_handle.spawn(async move {
-                let admission_bytes = queued_read_admission_bytes(size, read_queue_byte_limit);
                 let mut read_guard =
-                    AsyncReadTaskGuard::new(admission_bytes, diagnostics, Arc::clone(&state.vfs));
+                    AsyncReadTaskGuard::new(size, diagnostics, Arc::clone(&state.vfs));
                 if cancellation.is_cancelled() {
                     read_guard.finish_with(AsyncReadOutcome::Canceled);
                     return Err(MACFUSE_READ_INTERRUPTED_ERRNO);
                 }
-                let _permit = acquire_read_admission(
-                    admission,
-                    admission_bytes,
-                    &read_guard.diagnostics,
-                    &cancellation,
-                )
-                .await
-                .inspect_err(|errno| {
-                    let outcome = if *errno == MACFUSE_READ_INTERRUPTED_ERRNO {
-                        AsyncReadOutcome::Canceled
-                    } else {
-                        AsyncReadOutcome::Failed
-                    };
-                    read_guard.finish_with(outcome);
-                })?;
+                let _permit =
+                    acquire_read_admission(admission, size, &read_guard.diagnostics, &cancellation)
+                        .await
+                        .inspect_err(|errno| {
+                            let outcome = if *errno == MACFUSE_READ_INTERRUPTED_ERRNO {
+                                AsyncReadOutcome::Canceled
+                            } else {
+                                AsyncReadOutcome::Failed
+                            };
+                            read_guard.finish_with(outcome);
+                        })?;
                 let result = Self::perform_read(
                     state,
-                    ReadExecutionRequest {
-                        ino,
-                        file_handle,
-                        offset,
-                        size,
-                        max_read_len: admission_bytes,
-                    },
+                    ino,
+                    file_handle,
+                    offset,
+                    size,
                     started,
                     cancellation,
                 )
@@ -1181,7 +1160,6 @@ impl StudioVfsAdapter {
             read_windows: Arc::clone(&self.read_windows),
         };
         let size = clamp_reusable_read_size(size, self.read_queue_byte_limit);
-        let read_queue_byte_limit = self.read_queue_byte_limit;
         let started = Instant::now();
         let cancellation = ReadCancellationToken::default();
         let worker_cancellation = cancellation.clone();
@@ -1191,19 +1169,15 @@ impl StudioVfsAdapter {
             queued: QueuedReadForTest {
                 runtime_handle: self.runtime_handle.clone(),
                 handle: self.runtime_handle.spawn(async move {
-                    let admission_bytes = queued_read_admission_bytes(size, read_queue_byte_limit);
-                    let mut read_guard = AsyncReadTaskGuard::new(
-                        admission_bytes,
-                        diagnostics,
-                        Arc::clone(&state.vfs),
-                    );
+                    let mut read_guard =
+                        AsyncReadTaskGuard::new(size, diagnostics, Arc::clone(&state.vfs));
                     if worker_cancellation.is_cancelled() {
                         read_guard.finish_with(AsyncReadOutcome::Canceled);
                         return Err(MACFUSE_READ_INTERRUPTED_ERRNO);
                     }
                     let _permit = acquire_read_admission(
                         admission,
-                        admission_bytes,
+                        size,
                         &read_guard.diagnostics,
                         &worker_cancellation,
                     )
@@ -1218,13 +1192,10 @@ impl StudioVfsAdapter {
                     })?;
                     let result = Self::perform_read(
                         state,
-                        ReadExecutionRequest {
-                            ino,
-                            file_handle,
-                            offset,
-                            size,
-                            max_read_len: admission_bytes,
-                        },
+                        ino,
+                        file_handle,
+                        offset,
+                        size,
                         started,
                         worker_cancellation,
                     )

@@ -706,8 +706,10 @@ mod tests {
 
 /// State for a directory whose children are being accessed.
 struct DirPrefetchState {
-    /// All regular-file child inodes from readdir.
+    /// All known regular-file child inodes.
     children: Vec<Ino>,
+    /// Known regular-file children with names for frame-sequence indexing.
+    named_children: Vec<DirAccessRecord>,
     /// How many children we've seen accessed (open/read).
     seen: usize,
     /// Which children have been observed through a real foreground access.
@@ -724,6 +726,14 @@ struct DirPrefetchState {
     last_touch: u64,
 }
 
+impl DirPrefetchState {
+    fn rebuild_sequence_index(&mut self) {
+        let sequence_index = build_sequence_index_from_records(&self.named_children);
+        self.sequences = sequence_index.sequences;
+        self.sequence_positions = sequence_index.positions;
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// A directory entry being tracked for sequence-aware prefetching.
 pub struct DirAccessEntry<'a> {
@@ -737,6 +747,25 @@ impl<'a> DirAccessEntry<'a> {
     /// Create a tracked directory child entry from an inode and raw name bytes.
     pub fn new(ino: Ino, name: &'a [u8]) -> Self {
         Self { ino, name }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirAccessRecord {
+    ino: Ino,
+    name: Vec<u8>,
+}
+
+impl DirAccessRecord {
+    fn from_entry(entry: &DirAccessEntry<'_>) -> Self {
+        Self {
+            ino: entry.ino,
+            name: entry.name.to_vec(),
+        }
+    }
+
+    fn as_entry(&self) -> DirAccessEntry<'_> {
+        DirAccessEntry::new(self.ino, &self.name)
     }
 }
 
@@ -845,6 +874,11 @@ fn build_sequence_index(entries: &[DirAccessEntry<'_>]) -> FrameSequenceIndex {
     index
 }
 
+fn build_sequence_index_from_records(records: &[DirAccessRecord]) -> FrameSequenceIndex {
+    let entries: Vec<DirAccessEntry<'_>> = records.iter().map(DirAccessRecord::as_entry).collect();
+    build_sequence_index(&entries)
+}
+
 /// Tracks directory-level access patterns.
 ///
 /// When a user browses a directory (readdir) and then starts opening/reading
@@ -941,11 +975,14 @@ impl DirAccessTracker {
             }
         }
         let children: Vec<Ino> = entries.iter().map(|entry| entry.ino).collect();
-        let sequence_index = build_sequence_index(&entries);
+        let named_children: Vec<DirAccessRecord> =
+            entries.iter().map(DirAccessRecord::from_entry).collect();
+        let sequence_index = build_sequence_index_from_records(&named_children);
         self.dirs.insert(
             dir_ino,
             DirPrefetchState {
                 children: children.clone(),
+                named_children,
                 seen: 0,
                 accessed: HashSet::new(),
                 prefetched: HashSet::new(),
@@ -958,6 +995,58 @@ impl DirAccessTracker {
         // Register reverse mappings for the latest child set.
         for &child in &children {
             self.child_to_dir.insert(child, (dir_ino, touch));
+        }
+        self.evict_lru_if_needed();
+    }
+
+    /// Called after a successful regular-file lookup.
+    pub fn on_lookup_entry(&self, dir_ino: Ino, entry: DirAccessEntry<'_>) {
+        if entry.name.is_empty() {
+            return;
+        }
+
+        let touch = self.next_touch();
+        if let Some(mut state) = self.dirs.get_mut(&dir_ino) {
+            state.last_touch = touch;
+            if !state.children.contains(&entry.ino) {
+                state.children.push(entry.ino);
+            }
+            match state
+                .named_children
+                .iter_mut()
+                .find(|known| known.ino == entry.ino)
+            {
+                Some(known) if known.name == entry.name => {}
+                Some(known) => {
+                    known.name = entry.name.to_vec();
+                    state.rebuild_sequence_index();
+                }
+                None => {
+                    state
+                        .named_children
+                        .push(DirAccessRecord::from_entry(&entry));
+                    state.rebuild_sequence_index();
+                }
+            }
+            self.child_to_dir
+                .insert(entry.ino, (dir_ino, state.readdir_touch));
+        } else {
+            let named_children = vec![DirAccessRecord::from_entry(&entry)];
+            self.dirs.insert(
+                dir_ino,
+                DirPrefetchState {
+                    children: vec![entry.ino],
+                    named_children,
+                    seen: 0,
+                    accessed: HashSet::new(),
+                    prefetched: HashSet::new(),
+                    sequences: Vec::new(),
+                    sequence_positions: HashMap::new(),
+                    readdir_touch: touch,
+                    last_touch: touch,
+                },
+            );
+            self.child_to_dir.insert(entry.ino, (dir_ino, touch));
         }
         self.evict_lru_if_needed();
     }
@@ -1195,6 +1284,21 @@ mod dir_prefetch_tests {
             p,
             vec![11, 12],
             "first frame read should prefer the tight numeric sequence window"
+        );
+    }
+
+    #[test]
+    fn test_frame_sequence_prefetches_lookup_discovered_successors_without_readdir() {
+        let tracker = DirAccessTracker::new_with_capacity(2, 8);
+        tracker.on_lookup_entry(100, DirAccessEntry::new(10, b"plate_0100.exr"));
+        tracker.on_lookup_entry(100, DirAccessEntry::new(11, b"plate_0101.exr"));
+
+        let p = tracker.on_child_read_limited(10, 2);
+
+        assert_eq!(
+            p,
+            vec![11],
+            "lookup-discovered frame names should arm sequence prefetch without requiring readdir"
         );
     }
 

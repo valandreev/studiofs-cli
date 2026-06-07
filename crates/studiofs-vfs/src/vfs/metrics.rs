@@ -230,6 +230,44 @@ pub struct VfsFuseCallbackStats {
     pub write: VfsFuseIoStats,
 }
 
+/// macFUSE read-open kernel-cache decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VfsMacFuseOpenCacheDecision {
+    /// Read-only open kept kernel data cache for this handle.
+    ReadOnlyKeep,
+    /// Read-only open dropped cache because the inode state could not be read.
+    ReadOnlyUnknownState,
+    /// Read-only open dropped cache because the inode is not fully committed.
+    ReadOnlyNotFullyCommitted,
+    /// Read-only open dropped cache because the inode still has local dirty state.
+    ReadOnlyLocalDirtyState,
+    /// Read-only open dropped cache because this generation was not observed before.
+    ReadOnlyGenerationChanged,
+    /// Write-capable open intentionally disabled read-only cache retention.
+    WriteCapable,
+}
+
+/// macFUSE open-cache decision counters.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VfsMacFuseOpenCacheStats {
+    /// Total macFUSE opens observed by the cache policy.
+    pub total: u64,
+    /// Read-only opens that returned keep-cache.
+    pub read_only_keep: u64,
+    /// Read-only opens that returned no keep-cache.
+    pub read_only_drop: u64,
+    /// Drops because the inode state could not be read.
+    pub read_only_unknown_state: u64,
+    /// Drops because the inode is not fully committed.
+    pub read_only_not_fully_committed: u64,
+    /// Drops because local dirty state is still present.
+    pub read_only_local_dirty_state: u64,
+    /// Drops because the current generation was not previously observed.
+    pub read_only_generation_changed: u64,
+    /// Write-capable opens that intentionally disabled keep-cache.
+    pub write_capable: u64,
+}
+
 /// Async FUSE write bridge diagnostics supplied by the FUSE adapter.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -759,6 +797,9 @@ pub struct VfsWritePathObservabilitySnapshot {
     /// FUSE callback metrics.
     #[serde(default)]
     pub fuse_callbacks: VfsFuseCallbackStats,
+    /// macFUSE open-cache decisions.
+    #[serde(default)]
+    pub macfuse_open_cache: VfsMacFuseOpenCacheStats,
     /// Async FUSE write diagnostics.
     #[serde(default)]
     pub fuse_async_write: VfsFuseAsyncWriteSnapshot,
