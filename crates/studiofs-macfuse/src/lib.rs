@@ -1576,58 +1576,7 @@ mod tests {
         let cache_decisions = vfs.write_path_observability_snapshot().macfuse_open_cache;
         assert_eq!(cache_decisions.read_only_keep, 2);
         assert_eq!(cache_decisions.read_only_drop, 1);
-        assert_eq!(cache_decisions.read_only_local_dirty_state, 1);
-        assert_eq!(cache_decisions.read_only_generation_changed, 0);
-        assert_eq!(cache_decisions.read_only_not_fully_committed, 0);
-    }
-
-    #[test]
-    fn adapter_keeps_kernel_cache_for_locally_stable_unpublished_generation() {
-        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
-            "macfuse-adapter-cache-local-stable",
-        )
-        .expect("create VFS fixture");
-        let vfs = fixture.vfs();
-        let attr = vfs
-            .create(
-                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
-                b"local-stable.txt",
-                501,
-                20,
-                0o644,
-            )
-            .expect("create file");
-        fixture
-            .runtime()
-            .block_on(vfs.write(attr.ino, 0, b"locally durable"))
-            .expect("write local bytes");
-        fixture
-            .runtime()
-            .block_on(vfs.flush(attr.ino))
-            .expect("flush local bytes");
-        let pending_attr = vfs.getattr(attr.ino).expect("load pending attr");
-        assert!(
-            pending_attr.content_epoch > pending_attr.committed_content_epoch,
-            "setup should leave the local view ahead of global publication"
-        );
-        assert!(
-            !vfs.inode_has_local_dirty_state(attr.ino),
-            "flushed local bytes should be stable for this mount"
-        );
-        let adapter =
-            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
-
-        let opened = adapter
-            .open(attr.ino, libc::O_RDONLY)
-            .expect("open locally stable read-only handle");
-
-        assert!(
-            opened.keep_cache(),
-            "local-first reads should keep kernel pages once local dirty state has drained"
-        );
-        let cache_decisions = vfs.write_path_observability_snapshot().macfuse_open_cache;
-        assert_eq!(cache_decisions.read_only_keep, 1);
-        assert_eq!(cache_decisions.read_only_not_fully_committed, 0);
+        assert_eq!(cache_decisions.read_only_not_fully_committed, 1);
     }
 
     #[test]

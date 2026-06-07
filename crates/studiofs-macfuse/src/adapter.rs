@@ -18,7 +18,7 @@ use parking_lot::Mutex as ParkingMutex;
 use studiofs_bridge::posix::{
     BridgeFileAttr, BridgeFileType, posix_flags_to_open_flags, to_bridge_attr, vfs_err_to_errno,
 };
-use studiofs_meta::{DirEntry, FileType, InodeAttr, SetattrArgs, TimeSpec};
+use studiofs_meta::{DirEntry, FileType, InodeAttr, SetattrArgs, TimeSpec, UploadState};
 use studiofs_vfs::{StatFs, StudioVfs, VfsFuseAsyncReadSnapshot, VfsMacFuseOpenCacheDecision};
 use tokio::runtime::Handle;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -84,7 +84,11 @@ struct MacFuseOpenCacheSnapshot {
 
 impl MacFuseOpenCacheSnapshot {
     fn from_attr(attr: &InodeAttr) -> Option<Self> {
-        if attr.kind != FileType::RegularFile {
+        if attr.kind != FileType::RegularFile
+            || attr.upload_state != UploadState::Ready
+            || attr.content_epoch != attr.committed_content_epoch
+            || attr.size != attr.committed_size
+        {
             return None;
         }
         Some(Self {
