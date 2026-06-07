@@ -56,11 +56,10 @@ impl MacfuseJuicefsParityGateOutcome {
 
     /// Returns a conventional process exit code for the aggregate outcome.
     pub fn exit_code(&self) -> i32 {
-        if self.status() == RunStatus::Passed {
-            0
-        } else {
-            1
-        }
+        self.runs
+            .iter()
+            .find(|run| run.status != RunStatus::Passed)
+            .map_or(0, |run| run.exit_code)
     }
 }
 
@@ -77,6 +76,12 @@ pub fn run_with_executor(
 ) -> Result<MacfuseJuicefsParityGateOutcome> {
     if request.iterations == 0 {
         bail!("macFUSE JuiceFS parity gate iterations must be greater than zero");
+    }
+    if !matches!(
+        request.platform,
+        PlatformSelection::Auto | PlatformSelection::MacosFuse
+    ) {
+        bail!("macFUSE JuiceFS parity gate requires the macos-fuse platform");
     }
 
     let scenarios = MACFUSE_JUICEFS_PARITY_SCENARIOS
@@ -112,4 +117,72 @@ pub fn run_with_executor(
     }
 
     Ok(MacfuseJuicefsParityGateOutcome { runs })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::infra::{CommandOutput, CommandSpec};
+
+    struct PanicExecutor;
+
+    impl CommandExecutor for PanicExecutor {
+        fn run(&self, _command: &CommandSpec) -> std::io::Result<CommandOutput> {
+            panic!("invalid parity gate platform should fail before command execution");
+        }
+    }
+
+    #[test]
+    fn parity_gate_rejects_non_macos_platform_before_running() {
+        let error = run_with_executor(
+            request_with_platform(PlatformSelection::LinuxFuse),
+            &PanicExecutor,
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("macFUSE JuiceFS parity gate requires the macos-fuse platform")
+        );
+    }
+
+    #[test]
+    fn parity_gate_exit_code_preserves_first_failing_runner_code() {
+        let outcome = MacfuseJuicefsParityGateOutcome {
+            runs: vec![
+                run_outcome("preflight-failed", RunStatus::PreflightFailed, 2),
+                run_outcome("cleanup-failed", RunStatus::CleanupFailed, 4),
+            ],
+        };
+
+        assert_eq!(outcome.exit_code(), 2);
+    }
+
+    fn request_with_platform(platform: PlatformSelection) -> MacfuseJuicefsParityGateRequest {
+        MacfuseJuicefsParityGateRequest {
+            root: PathBuf::from("target/e2e-runs"),
+            run_id_prefix: "sfs495-test".to_string(),
+            iterations: 1,
+            seed: 495,
+            studiofs_bin: PathBuf::from("target/debug/studiofs"),
+            platform,
+            retention: RetentionPolicy::OnFailure,
+            port_range: None,
+            timeout: None,
+        }
+    }
+
+    fn run_outcome(run_id: &str, status: RunStatus, exit_code: i32) -> RunOutcome {
+        RunOutcome {
+            run_id: run_id.to_string(),
+            status,
+            exit_code,
+            sandbox: PathBuf::from("target/e2e-runs").join(run_id),
+            report_path: PathBuf::from("target/e2e-runs")
+                .join(run_id)
+                .join("report.json"),
+            scenarios: Vec::new(),
+        }
+    }
 }
