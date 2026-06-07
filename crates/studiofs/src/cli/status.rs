@@ -983,6 +983,7 @@ mod tests {
             vfs_write_path: Default::default(),
             vfs_read_path: Default::default(),
             fuse_callbacks: Default::default(),
+            macfuse_open_cache: Default::default(),
             fuse_async_write: Default::default(),
             fuse_async_read: Default::default(),
             landing_zone: Default::default(),
