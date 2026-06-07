@@ -198,8 +198,8 @@ impl FileSessionOperation {
         }
     }
 
-    fn read_lock(self) -> bool {
-        matches!(self, Self::Read)
+    fn shared_lock(self) -> bool {
+        matches!(self, Self::Read | Self::Finalize)
     }
 
     fn index(self) -> usize {
@@ -282,7 +282,7 @@ impl FileSessionEntry {
     }
 
     fn note_active_start(&self, op: FileSessionOperation) {
-        if op.read_lock() {
+        if op.shared_lock() {
             self.active_readers.fetch_add(1, Ordering::Relaxed);
         } else {
             *self.active_writer.lock() = Some(op.as_str());
@@ -290,7 +290,7 @@ impl FileSessionEntry {
     }
 
     fn note_active_finish(&self, op: FileSessionOperation) {
-        if op.read_lock() {
+        if op.shared_lock() {
             self.active_readers
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                     Some(v.saturating_sub(1))
@@ -433,7 +433,7 @@ impl FileSessionState {
         );
 
         let wait_started = Instant::now();
-        let (read_guard, write_guard) = if op.read_lock() {
+        let (read_guard, write_guard) = if op.shared_lock() {
             (Some(session.gate.clone().read_owned().await), None)
         } else {
             (None, Some(session.gate.clone().write_owned().await))

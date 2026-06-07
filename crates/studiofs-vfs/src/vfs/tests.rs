@@ -8769,6 +8769,75 @@ fn test_file_session_read_lock_allows_parallel_readers() {
 }
 
 #[test]
+fn test_file_session_finalize_allows_parallel_readers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "file-session-finalize-read-parallel");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"session-finalize-read-parallel.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+
+        let finalize_guard = vfs
+            .state
+            .file_session
+            .enter_op(ino, FileSessionOperation::Finalize)
+            .await;
+        let vfs_clone = vfs.clone();
+        let reader = tokio::spawn(async move {
+            let _reader = vfs_clone
+                .state
+                .file_session
+                .enter_op(ino, FileSessionOperation::Read)
+                .await;
+        });
+
+        tokio::time::timeout(Duration::from_millis(150), reader)
+            .await
+            .expect("foreground reads must not wait for background upload finalization")
+            .unwrap();
+        drop(finalize_guard);
+    });
+}
+
+#[test]
+fn test_file_session_finalize_still_blocks_writers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "file-session-finalize-write-gate");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"session-finalize-write-gate.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+
+        let finalize_guard = vfs
+            .state
+            .file_session
+            .enter_op(ino, FileSessionOperation::Finalize)
+            .await;
+        let vfs_clone = vfs.clone();
+        let mut writer = Box::pin(tokio::spawn(async move {
+            let _writer = vfs_clone
+                .state
+                .file_session
+                .enter_op(ino, FileSessionOperation::Write)
+                .await;
+        }));
+
+        tokio::time::timeout(Duration::from_millis(50), &mut writer)
+            .await
+            .expect_err("writes must still wait for background upload finalization");
+        drop(finalize_guard);
+        tokio::time::timeout(Duration::from_millis(150), writer)
+            .await
+            .expect("writer should pass after finalization finishes")
+            .unwrap();
+    });
+}
+
+#[test]
 fn test_file_session_open_handle_stats_track_release_lifecycle() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "file-session-open-handle-stats");
