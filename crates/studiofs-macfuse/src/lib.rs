@@ -727,7 +727,7 @@ mod tests {
             .expect_err("canceled read should finish without VFS work");
         drop(held_capacity);
 
-        assert_eq!(errno, libc::ECANCELED);
+        assert_eq!(errno, libc::EINTR);
         let metrics = vfs.write_path_observability_snapshot();
         assert_eq!(metrics.vfs_read_path.calls, 0);
         assert_eq!(metrics.fuse_callbacks.read.calls, 0);

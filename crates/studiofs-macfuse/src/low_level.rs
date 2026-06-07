@@ -184,8 +184,6 @@ pub(crate) mod raw {
             func: Option<unsafe extern "C" fn(*mut FuseReq, *mut c_void)>,
             data: *mut c_void,
         );
-        /// Check whether a request has already been interrupted.
-        pub fn fuse_req_interrupted(req: *mut FuseReq) -> c_int;
         /// Append or size a directory entry.
         pub fn fuse_add_direntry(
             req: *mut FuseReq,
@@ -824,8 +822,8 @@ impl Request {
             return;
         };
         self.clear_interrupt_token();
-        let token = Box::new(token);
-        let token_ptr = NonNull::from(Box::leak(token));
+        let token_ptr =
+            NonNull::new(Box::into_raw(Box::new(token))).expect("Box::into_raw never returns null");
         self.interrupt_token = Some(token_ptr);
         // SAFETY: `raw` is a live low-level request and `token_ptr` remains valid
         // until `clear_interrupt_token` unregisters the callback and drops it.
@@ -835,9 +833,6 @@ impl Request {
                 Some(request_interrupted),
                 token_ptr.as_ptr().cast(),
             );
-            if raw::fuse_req_interrupted(raw.as_ptr()) != 0 {
-                request_interrupted(raw.as_ptr(), token_ptr.as_ptr().cast());
-            }
         }
     }
 
@@ -852,7 +847,7 @@ impl Request {
                 raw::fuse_req_interrupt_func(raw.as_ptr(), None, std::ptr::null_mut());
             }
         }
-        // SAFETY: `token_ptr` came from `Box::leak` in `register_interrupt_token`
+        // SAFETY: `token_ptr` came from `Box::into_raw` in `register_interrupt_token`
         // and is dropped exactly once here.
         unsafe {
             drop(Box::from_raw(token_ptr.as_ptr()));

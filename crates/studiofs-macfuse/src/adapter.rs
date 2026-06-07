@@ -43,6 +43,7 @@ const MACFUSE_READ_BUFFER_POOL_RETAINED_CAPACITY: usize = MACFUSE_READ_BUFFER_PO
 const MACFUSE_READ_WINDOW_MAX_BYTES: usize = 1024 * 1024;
 const MACFUSE_READ_WINDOW_MIN_BYTES: usize = 128 * 1024;
 const MACFUSE_ASYNC_READ_SNAPSHOT_INTERVAL: Duration = Duration::from_millis(500);
+const MACFUSE_READ_INTERRUPTED_ERRNO: i32 = libc::EINTR;
 #[cfg(not(test))]
 const MACFUSE_OPEN_CACHE_SNAPSHOT_LIMIT: usize = 8192;
 #[cfg(test)]
@@ -378,7 +379,7 @@ impl ReadCancellationToken {
         self.token.cancel();
     }
 
-    fn is_canceled(&self) -> bool {
+    fn is_cancelled(&self) -> bool {
         self.token.is_cancelled()
     }
 
@@ -922,15 +923,15 @@ impl StudioVfsAdapter {
         started: Instant,
         cancellation: ReadCancellationToken,
     ) -> Result<PooledReadBuffer, i32> {
-        if cancellation.is_canceled() {
-            return Err(libc::ECANCELED);
+        if cancellation.is_cancelled() {
+            return Err(MACFUSE_READ_INTERRUPTED_ERRNO);
         }
         let size = clamp_reusable_read_size(size, MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY as u32);
         let size_usize = size as usize;
 
         let mut out = state.read_buffers.clone().acquire(size_usize);
-        if cancellation.is_canceled() {
-            return Err(libc::ECANCELED);
+        if cancellation.is_cancelled() {
+            return Err(MACFUSE_READ_INTERRUPTED_ERRNO);
         }
         if let Some(copied) = state
             .read_windows
@@ -947,13 +948,13 @@ impl StudioVfsAdapter {
         if read_len > size_usize {
             out.buffer.resize(read_len, 0);
         }
-        if cancellation.is_canceled() {
-            return Err(libc::ECANCELED);
+        if cancellation.is_cancelled() {
+            return Err(MACFUSE_READ_INTERRUPTED_ERRNO);
         }
         let generation = state.read_windows.invalidation_generation(ino);
         let result = tokio::select! {
             result = state.vfs.read_into_fh(file_handle, ino, offset, &mut out) => result,
-            () = cancellation.cancelled() => return Err(libc::ECANCELED),
+            () = cancellation.cancelled() => return Err(MACFUSE_READ_INTERRUPTED_ERRNO),
         };
         match result {
             Ok(written) => {
@@ -1018,9 +1019,9 @@ impl StudioVfsAdapter {
         request.register_interrupt_token(cancellation.fuse_token());
         self.runtime_handle.spawn(async move {
             let mut read_guard = AsyncReadTaskGuard::new(size, diagnostics, Arc::clone(&state.vfs));
-            if cancellation.is_canceled() {
+            if cancellation.is_cancelled() {
                 read_guard.finish_with(AsyncReadOutcome::Canceled);
-                let _ = Reply::new(request).error(libc::ECANCELED);
+                let _ = Reply::new(request).error(MACFUSE_READ_INTERRUPTED_ERRNO);
                 return;
             }
             let _permit = match acquire_read_admission(
@@ -1033,7 +1034,7 @@ impl StudioVfsAdapter {
             {
                 Ok(permit) => permit,
                 Err(errno) => {
-                    let outcome = if errno == libc::ECANCELED {
+                    let outcome = if errno == MACFUSE_READ_INTERRUPTED_ERRNO {
                         AsyncReadOutcome::Canceled
                     } else {
                         AsyncReadOutcome::Failed
@@ -1053,7 +1054,7 @@ impl StudioVfsAdapter {
                     let _ = Reply::new(request).read_buffer(&bytes);
                 }
                 Err(errno) => {
-                    let outcome = if errno == libc::ECANCELED {
+                    let outcome = if errno == MACFUSE_READ_INTERRUPTED_ERRNO {
                         AsyncReadOutcome::Canceled
                     } else {
                         AsyncReadOutcome::Failed
@@ -1089,15 +1090,15 @@ impl StudioVfsAdapter {
             handle: self.runtime_handle.spawn(async move {
                 let mut read_guard =
                     AsyncReadTaskGuard::new(size, diagnostics, Arc::clone(&state.vfs));
-                if cancellation.is_canceled() {
+                if cancellation.is_cancelled() {
                     read_guard.finish_with(AsyncReadOutcome::Canceled);
-                    return Err(libc::ECANCELED);
+                    return Err(MACFUSE_READ_INTERRUPTED_ERRNO);
                 }
                 let _permit =
                     acquire_read_admission(admission, size, &read_guard.diagnostics, &cancellation)
                         .await
                         .inspect_err(|errno| {
-                            let outcome = if *errno == libc::ECANCELED {
+                            let outcome = if *errno == MACFUSE_READ_INTERRUPTED_ERRNO {
                                 AsyncReadOutcome::Canceled
                             } else {
                                 AsyncReadOutcome::Failed
@@ -1116,7 +1117,7 @@ impl StudioVfsAdapter {
                 .await;
                 match &result {
                     Ok(_) => read_guard.finish_with(AsyncReadOutcome::Completed),
-                    Err(errno) if *errno == libc::ECANCELED => {
+                    Err(errno) if *errno == MACFUSE_READ_INTERRUPTED_ERRNO => {
                         read_guard.finish_with(AsyncReadOutcome::Canceled);
                     }
                     Err(_) => read_guard.finish_with(AsyncReadOutcome::Failed),
@@ -1153,9 +1154,9 @@ impl StudioVfsAdapter {
                 handle: self.runtime_handle.spawn(async move {
                     let mut read_guard =
                         AsyncReadTaskGuard::new(size, diagnostics, Arc::clone(&state.vfs));
-                    if worker_cancellation.is_canceled() {
+                    if worker_cancellation.is_cancelled() {
                         read_guard.finish_with(AsyncReadOutcome::Canceled);
-                        return Err(libc::ECANCELED);
+                        return Err(MACFUSE_READ_INTERRUPTED_ERRNO);
                     }
                     let _permit = acquire_read_admission(
                         admission,
@@ -1165,7 +1166,7 @@ impl StudioVfsAdapter {
                     )
                     .await
                     .inspect_err(|errno| {
-                        let outcome = if *errno == libc::ECANCELED {
+                        let outcome = if *errno == MACFUSE_READ_INTERRUPTED_ERRNO {
                             AsyncReadOutcome::Canceled
                         } else {
                             AsyncReadOutcome::Failed
@@ -1184,7 +1185,7 @@ impl StudioVfsAdapter {
                     .await;
                     match &result {
                         Ok(_) => read_guard.finish_with(AsyncReadOutcome::Completed),
-                        Err(errno) if *errno == libc::ECANCELED => {
+                        Err(errno) if *errno == MACFUSE_READ_INTERRUPTED_ERRNO => {
                             read_guard.finish_with(AsyncReadOutcome::Canceled);
                         }
                         Err(_) => read_guard.finish_with(AsyncReadOutcome::Failed),
@@ -2636,7 +2637,7 @@ async fn acquire_read_admission(
             diagnostics.on_admitted(admission_started.elapsed());
             Ok(permit)
         }
-        () = cancellation.cancelled() => Err(libc::ECANCELED),
+        () = cancellation.cancelled() => Err(MACFUSE_READ_INTERRUPTED_ERRNO),
     }
 }
 
