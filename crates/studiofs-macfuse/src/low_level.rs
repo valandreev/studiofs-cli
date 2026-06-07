@@ -4,6 +4,7 @@
 //! low-level macFUSE FFI. Public types copy callback-owned values before they
 //! can cross async boundaries and keep request/reply ownership explicit.
 
+use std::collections::HashMap;
 use std::ffi::{CString, OsStr};
 use std::io;
 use std::mem::MaybeUninit;
@@ -11,9 +12,13 @@ use std::os::raw::{c_char, c_double, c_int, c_uint, c_ulong, c_void};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::{
+    Arc, OnceLock,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use libc::{off_t, size_t, stat, statvfs};
+use parking_lot::Mutex as ParkingMutex;
 use studiofs_vfs::KernelInvalidator;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -22,6 +27,21 @@ use tracing::debug;
 const DEFAULT_FUSE_MAX_WRITE_BYTES: u32 = 16 * 1024 * 1024;
 const DEFAULT_FUSE_MAX_READAHEAD_BYTES: u32 = 16 * 1024 * 1024;
 pub(crate) const MACOS_FUSE_IOSIZE_BYTES: u32 = 1024 * 1024;
+static NEXT_INTERRUPT_KEY: AtomicUsize = AtomicUsize::new(1);
+// Interrupt callbacks can race with request reply/drop after macFUSE has
+// copied callback data out of its session lock. This registry keeps callback
+// data as an opaque key instead of a Rust pointer; the mutex serializes cancel
+// lookup/removal at the cost of lower throughput under heavy interrupt load.
+static INTERRUPT_REGISTRY: OnceLock<ParkingMutex<HashMap<usize, CancellationToken>>> =
+    OnceLock::new();
+
+fn interrupt_registry() -> &'static ParkingMutex<HashMap<usize, CancellationToken>> {
+    INTERRUPT_REGISTRY.get_or_init(|| ParkingMutex::new(HashMap::new()))
+}
+
+fn next_interrupt_key() -> usize {
+    NEXT_INTERRUPT_KEY.fetch_add(1, Ordering::Relaxed)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MacosFuseCachePolicy {
@@ -794,7 +814,7 @@ impl OpenReply {
 /// Owned low-level request token.
 pub struct Request {
     raw: Option<NonNull<raw::FuseReq>>,
-    interrupt_token: Option<NonNull<CancellationToken>>,
+    interrupt_key: Option<usize>,
 }
 
 // SAFETY: macFUSE low-level requests may be handed off to worker threads and
@@ -813,7 +833,7 @@ impl Request {
     pub unsafe fn from_raw(raw: *mut raw::FuseReq) -> Option<Self> {
         NonNull::new(raw).map(|raw| Self {
             raw: Some(raw),
-            interrupt_token: None,
+            interrupt_key: None,
         })
     }
 
@@ -822,22 +842,22 @@ impl Request {
             return;
         };
         self.clear_interrupt_token();
-        let token_ptr =
-            NonNull::new(Box::into_raw(Box::new(token))).expect("Box::into_raw never returns null");
-        self.interrupt_token = Some(token_ptr);
-        // SAFETY: `raw` is a live low-level request and `token_ptr` remains valid
-        // until `clear_interrupt_token` unregisters the callback and drops it.
+        let key = next_interrupt_key();
+        interrupt_registry().lock().insert(key, token);
+        self.interrupt_key = Some(key);
+        // SAFETY: `raw` is a live low-level request. The callback data is an
+        // opaque integer key, never a dereferenced pointer.
         unsafe {
             raw::fuse_req_interrupt_func(
                 raw.as_ptr(),
                 Some(request_interrupted),
-                token_ptr.as_ptr().cast(),
+                key as *mut c_void,
             );
         }
     }
 
     fn clear_interrupt_token(&mut self) {
-        let Some(token_ptr) = self.interrupt_token.take() else {
+        let Some(key) = self.interrupt_key.take() else {
             return;
         };
         if let Some(raw) = self.raw {
@@ -847,11 +867,7 @@ impl Request {
                 raw::fuse_req_interrupt_func(raw.as_ptr(), None, std::ptr::null_mut());
             }
         }
-        // SAFETY: `token_ptr` came from `Box::into_raw` in `register_interrupt_token`
-        // and is dropped exactly once here.
-        unsafe {
-            drop(Box::from_raw(token_ptr.as_ptr()));
-        }
+        interrupt_registry().lock().remove(&key);
     }
 
     fn as_ptr(&self) -> *mut raw::FuseReq {
@@ -883,13 +899,12 @@ impl Drop for Request {
 }
 
 unsafe extern "C" fn request_interrupted(_req: *mut raw::FuseReq, data: *mut c_void) {
-    let Some(token_ptr) = NonNull::new(data.cast::<CancellationToken>()) else {
+    if data.is_null() {
         return;
-    };
-    // SAFETY: `data` is registered from `register_interrupt_token` and remains
-    // valid until the callback is unregistered on the owning request.
-    unsafe {
-        token_ptr.as_ref().cancel();
+    }
+    let key = data as usize;
+    if let Some(token) = interrupt_registry().lock().get(&key) {
+        token.cancel();
     }
 }
 
