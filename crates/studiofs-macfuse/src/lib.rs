@@ -1545,8 +1545,8 @@ mod tests {
             .open(attr.ino, libc::O_RDONLY)
             .expect("open first read-only handle");
         assert!(
-            first_open.keep_cache(),
-            "first clean read-only open should keep kernel pages and rely on explicit invalidation: {first_open:?}"
+            !first_open.keep_cache(),
+            "first open must invalidate unknown kernel pages: {first_open:?}"
         );
         adapter
             .release(attr.ino, first_open.file_handle())
@@ -1574,9 +1574,9 @@ mod tests {
             "changed generation must invalidate kernel pages: {changed_open:?}"
         );
         let cache_decisions = vfs.write_path_observability_snapshot().macfuse_open_cache;
-        assert_eq!(cache_decisions.read_only_keep, 2);
-        assert_eq!(cache_decisions.read_only_drop, 1);
-        assert_eq!(cache_decisions.read_only_not_fully_committed, 1);
+        assert_eq!(cache_decisions.read_only_keep, 1);
+        assert_eq!(cache_decisions.read_only_drop, 2);
+        assert_eq!(cache_decisions.read_only_generation_changed, 1);
     }
 
     #[test]
@@ -1630,8 +1630,8 @@ mod tests {
             .open(attr.ino, libc::O_RDONLY)
             .expect("open read-only handle after write-capable open");
         assert!(
-            read_after_write_open.keep_cache(),
-            "clean read-only open after a non-mutating write-capable handle should rely on explicit invalidation: {read_after_write_open:?}"
+            !read_after_write_open.keep_cache(),
+            "write-capable open must clear previous cache observation: {read_after_write_open:?}"
         );
     }
 
