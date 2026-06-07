@@ -236,6 +236,8 @@ impl FileSessionOperation {
 pub(super) struct FileSessionEntry {
     /// Gate that serializes conflicting operations for this inode.
     gate: Arc<tokio::sync::RwLock<()>>,
+    /// Gate that serializes background finalization while allowing readers.
+    finalize_gate: Arc<tokio::sync::Mutex<()>>,
     open_handles: AtomicU32,
     queued_ops: AtomicU64,
     max_queue_depth: AtomicU64,
@@ -253,6 +255,7 @@ impl FileSessionEntry {
     fn new() -> Self {
         Self {
             gate: Arc::new(tokio::sync::RwLock::new(())),
+            finalize_gate: Arc::new(tokio::sync::Mutex::new(())),
             open_handles: AtomicU32::new(0),
             queued_ops: AtomicU64::new(0),
             max_queue_depth: AtomicU64::new(0),
@@ -304,6 +307,8 @@ impl FileSessionEntry {
 
 #[derive(Debug)]
 pub(super) struct FileSessionPermit {
+    /// Finalize-only guard held before the shared read gate.
+    _finalize_gate: Option<tokio::sync::OwnedMutexGuard<()>>,
     /// Read side lock guard held while the operation is active.
     _read_gate: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
     /// Write side lock guard held while the operation is active.
@@ -323,6 +328,7 @@ impl Drop for FileSessionPermit {
         // observe lower tail latency on contended inodes.
         drop(self._read_gate.take());
         drop(self._write_gate.take());
+        drop(self._finalize_gate.take());
         self.session.note_active_finish(self.op);
         self.counters.transitions.fetch_add(1, Ordering::Relaxed);
         self.session.record_transition(self.op, "finish");
@@ -433,6 +439,11 @@ impl FileSessionState {
         );
 
         let wait_started = Instant::now();
+        let finalize_guard = if op == FileSessionOperation::Finalize {
+            Some(session.finalize_gate.clone().lock_owned().await)
+        } else {
+            None
+        };
         let (read_guard, write_guard) = if op.shared_lock() {
             (Some(session.gate.clone().read_owned().await), None)
         } else {
@@ -459,6 +470,7 @@ impl FileSessionState {
         session.note_active_start(op);
         session.record_transition(op, "start");
         FileSessionPermit {
+            _finalize_gate: finalize_guard,
             _read_gate: read_guard,
             _write_gate: write_guard,
             counters,

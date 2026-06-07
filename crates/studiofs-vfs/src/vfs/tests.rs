@@ -8847,6 +8847,47 @@ fn test_file_session_finalize_still_blocks_writers() {
 }
 
 #[test]
+fn test_file_session_finalize_serializes_other_finalizers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "file-session-finalize-finalize-gate");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"session-finalize-finalize-gate.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+
+        let finalize_guard = vfs
+            .state
+            .file_session
+            .enter_op(ino, FileSessionOperation::Finalize)
+            .await;
+        let vfs_clone = vfs.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let mut second_finalize = Box::pin(tokio::spawn(async move {
+            let _ = started_tx.send(());
+            let _finalize = vfs_clone
+                .state
+                .file_session
+                .enter_op(ino, FileSessionOperation::Finalize)
+                .await;
+        }));
+
+        started_rx
+            .await
+            .expect("second finalizer task should start before blocked-finalizer assertion");
+        tokio::time::timeout(Duration::from_millis(50), &mut second_finalize)
+            .await
+            .expect_err("background finalizers for one inode must serialize");
+        drop(finalize_guard);
+        tokio::time::timeout(Duration::from_millis(150), second_finalize)
+            .await
+            .expect("second finalizer should pass after first finalizer finishes")
+            .unwrap();
+    });
+}
+
+#[test]
 fn test_file_session_open_handle_stats_track_release_lifecycle() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "file-session-open-handle-stats");

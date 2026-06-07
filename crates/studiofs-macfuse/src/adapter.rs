@@ -366,6 +366,13 @@ fn clamp_reusable_read_size(size: u32, read_queue_byte_limit: u32) -> u32 {
         .min(MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY as u32)
 }
 
+fn read_execution_size(size: u32, read_queue_byte_limit: u32) -> u32 {
+    clamp_reusable_read_size(
+        size,
+        read_queue_byte_limit.min(MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY as u32),
+    )
+}
+
 fn readahead_window_len(size: usize) -> usize {
     if size == 0 {
         return 0;
@@ -964,7 +971,7 @@ impl StudioVfsAdapter {
         }
         let size =
             clamp_reusable_read_size(request.size, MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY as u32);
-        let size_usize = size as usize;
+        let size_usize = (size as usize).min(request.max_read_len as usize);
         let read_len = readahead_window_len(size_usize).min(request.max_read_len as usize);
 
         let mut out = state
@@ -1055,7 +1062,7 @@ impl StudioVfsAdapter {
             read_buffers: Arc::clone(&self.read_buffers),
             read_windows: Arc::clone(&self.read_windows),
         };
-        let size = clamp_reusable_read_size(size, self.read_queue_byte_limit);
+        let size = read_execution_size(size, self.read_queue_byte_limit);
         let read_queue_byte_limit = self.read_queue_byte_limit;
         let started = Instant::now();
         let cancellation = ReadCancellationToken::default();
@@ -1139,7 +1146,7 @@ impl StudioVfsAdapter {
             read_buffers: Arc::clone(&self.read_buffers),
             read_windows: Arc::clone(&self.read_windows),
         };
-        let size = clamp_reusable_read_size(size, self.read_queue_byte_limit);
+        let size = read_execution_size(size, self.read_queue_byte_limit);
         let read_queue_byte_limit = self.read_queue_byte_limit;
         let started = Instant::now();
         let cancellation = ReadCancellationToken::default();
@@ -1209,7 +1216,7 @@ impl StudioVfsAdapter {
             read_buffers: Arc::clone(&self.read_buffers),
             read_windows: Arc::clone(&self.read_windows),
         };
-        let size = clamp_reusable_read_size(size, self.read_queue_byte_limit);
+        let size = read_execution_size(size, self.read_queue_byte_limit);
         let read_queue_byte_limit = self.read_queue_byte_limit;
         let started = Instant::now();
         let cancellation = ReadCancellationToken::default();
@@ -2747,6 +2754,15 @@ mod tests {
         assert_eq!(
             readahead_window_len(MACFUSE_READ_WINDOW_MAX_BYTES),
             MACFUSE_READ_WINDOW_MAX_BYTES
+        );
+    }
+
+    #[test]
+    fn queued_read_execution_size_stays_within_reusable_pool_capacity() {
+        let oversized_queue_limit = u32::MAX;
+        assert_eq!(
+            read_execution_size(u32::MAX, oversized_queue_limit),
+            MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY as u32
         );
     }
 
