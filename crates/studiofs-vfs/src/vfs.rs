@@ -517,7 +517,9 @@ fn sustained_write_effective_buffer_bytes(
         .saturating_div(SUSTAINED_WRITE_DECAY_STEP_MS)
         .saturating_add(1)
         .min(usize::BITS as u64 - 1);
-    let divisor = 1usize.checked_shl(steps as u32).unwrap_or(usize::MAX);
+    let divisor = 1usize
+        .checked_shl(steps as u32)
+        .expect("shift count is clamped below usize bit width");
     base_buffer_bytes.saturating_div(divisor).max(floor)
 }
 

@@ -105,10 +105,18 @@ struct ReadBufferPool {
 
 impl ReadBufferPool {
     fn acquire(self: Arc<Self>, size: usize) -> PooledReadBuffer {
+        self.acquire_with_capacity(size, size)
+    }
+
+    fn acquire_with_capacity(self: Arc<Self>, len: usize, capacity: usize) -> PooledReadBuffer {
         let mut buffer = self.buffers.lock().pop().unwrap_or_default();
+        let capacity = capacity.max(len);
+        if buffer.capacity() < capacity {
+            buffer.reserve_exact(capacity - buffer.capacity());
+        }
         // TODO(SFS-489): avoid this per-read zero-fill once the VFS read path accepts
         // MaybeUninit/ReadBuf-style storage instead of initialized `&mut [u8]`.
-        buffer.resize(size, 0);
+        buffer.resize(len, 0);
         PooledReadBuffer { pool: self, buffer }
     }
 
@@ -366,10 +374,7 @@ fn readahead_window_len(size: usize) -> usize {
 }
 
 fn queued_read_admission_bytes(size: u32, read_queue_byte_limit: u32) -> u32 {
-    readahead_window_len(size as usize)
-        .min(MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY)
-        .min(read_queue_byte_limit as usize)
-        .min(u32::MAX as usize) as u32
+    readahead_window_len(size as usize).min(read_queue_byte_limit as usize) as u32
 }
 
 fn open_cache_snapshot_capacity() -> NonZeroUsize {
@@ -959,8 +964,12 @@ impl StudioVfsAdapter {
         let size =
             clamp_reusable_read_size(request.size, MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY as u32);
         let size_usize = size as usize;
+        let read_len = readahead_window_len(size_usize).min(request.max_read_len as usize);
 
-        let mut out = state.read_buffers.clone().acquire(size_usize);
+        let mut out = state
+            .read_buffers
+            .clone()
+            .acquire_with_capacity(size_usize, read_len);
         if cancellation.is_cancelled() {
             return Err(MACFUSE_READ_INTERRUPTED_ERRNO);
         }
@@ -976,7 +985,6 @@ impl StudioVfsAdapter {
             return Ok(out);
         }
 
-        let read_len = readahead_window_len(size_usize).min(request.max_read_len as usize);
         if read_len > size_usize {
             out.buffer.resize(read_len, 0);
         }
