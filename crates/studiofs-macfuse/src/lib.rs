@@ -683,6 +683,56 @@ mod tests {
     }
 
     #[test]
+    fn read_only_adapter_canceled_queued_read_skips_vfs_work() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-async-read-canceled-before-vfs",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"cancel.txt",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        fixture
+            .runtime()
+            .block_on(vfs.write(attr.ino, 0, b"cancelable macFUSE read"))
+            .expect("seed payload");
+        let adapter = super::adapter::StudioVfsAdapter::new_with_read_queue_byte_limit_for_test(
+            vfs.clone(),
+            fixture.runtime().handle().clone(),
+            7,
+        );
+        let reader = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open reader through macFUSE adapter");
+        vfs.reset_diagnostics_observability();
+        let held_capacity = adapter.hold_read_capacity_for_test(7);
+
+        let canceled = adapter
+            .queue_cancelable_read_for_test(attr.ino, reader.file_handle(), 0, 7)
+            .expect("queue cancelable read");
+        canceled.cancel();
+        drop(held_capacity);
+        let errno = canceled
+            .wait()
+            .expect_err("canceled read should finish without VFS work");
+
+        assert_eq!(errno, libc::ECANCELED);
+        let metrics = vfs.write_path_observability_snapshot();
+        assert_eq!(metrics.vfs_read_path.calls, 0);
+        assert_eq!(metrics.fuse_callbacks.read.calls, 0);
+        assert_eq!(metrics.fuse_async_read.pending_reads, 0);
+        assert_eq!(metrics.fuse_async_read.peak_pending_reads, 1);
+        assert_eq!(metrics.fuse_async_read.canceled_reads, 1);
+        assert_eq!(metrics.fuse_async_read.completed_reads, 0);
+    }
+
+    #[test]
     fn read_only_adapter_rejects_negative_read_offset_before_queueing() {
         let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
             "macfuse-async-read-negative-offset",

@@ -268,6 +268,32 @@ pub struct VfsFuseAsyncWriteSnapshot {
     pub barrier_wait_total_ms: f64,
 }
 
+/// Async FUSE read bridge diagnostics supplied by the FUSE adapter.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct VfsFuseAsyncReadSnapshot {
+    /// Maximum pending read bytes admitted across the adapter.
+    pub max_pending_bytes: Option<usize>,
+    /// Current pending async read requests.
+    pub pending_reads: usize,
+    /// Current pending async read bytes.
+    pub pending_bytes: usize,
+    /// Peak pending async read requests.
+    pub peak_pending_reads: usize,
+    /// Peak pending async read bytes.
+    pub peak_pending_bytes: usize,
+    /// Completed async reads.
+    pub completed_reads: u64,
+    /// Async reads completed with a VFS error.
+    pub failed_reads: u64,
+    /// Async reads canceled before reply completion.
+    pub canceled_reads: u64,
+    /// Admission waits caused by pending-read byte caps.
+    pub admission_waits: u64,
+    /// Total admission wait time in milliseconds.
+    pub admission_wait_total_ms: f64,
+}
+
 /// FUSE I/O callback metrics for one direction.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VfsFuseIoStats {
@@ -736,6 +762,9 @@ pub struct VfsWritePathObservabilitySnapshot {
     /// Async FUSE write diagnostics.
     #[serde(default)]
     pub fuse_async_write: VfsFuseAsyncWriteSnapshot,
+    /// Async FUSE read diagnostics.
+    #[serde(default)]
+    pub fuse_async_read: VfsFuseAsyncReadSnapshot,
     /// Landing-zone metrics.
     #[serde(default)]
     pub landing_zone: VfsWritePathLandingZoneStats,

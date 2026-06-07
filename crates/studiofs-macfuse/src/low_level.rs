@@ -11,7 +11,10 @@ use std::os::raw::{c_char, c_double, c_int, c_uint, c_ulong, c_void};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use libc::{off_t, size_t, stat, statvfs};
 use studiofs_vfs::KernelInvalidator;
@@ -177,6 +180,14 @@ pub(crate) mod raw {
         pub fn fuse_reply_xattr(req: *mut FuseReq, count: size_t) -> c_int;
         /// Return session user data associated with a request.
         pub fn fuse_req_userdata(req: *mut FuseReq) -> *mut c_void;
+        /// Register or unregister a request interruption callback.
+        pub fn fuse_req_interrupt_func(
+            req: *mut FuseReq,
+            func: Option<unsafe extern "C" fn(*mut FuseReq, *mut c_void)>,
+            data: *mut c_void,
+        );
+        /// Check whether a request has already been interrupted.
+        pub fn fuse_req_interrupted(req: *mut FuseReq) -> c_int;
         /// Append or size a directory entry.
         pub fn fuse_add_direntry(
             req: *mut FuseReq,
@@ -787,6 +798,7 @@ impl OpenReply {
 /// Owned low-level request token.
 pub struct Request {
     raw: Option<NonNull<raw::FuseReq>>,
+    interrupt_flag: Option<NonNull<Arc<AtomicBool>>>,
 }
 
 // SAFETY: macFUSE low-level requests may be handed off to worker threads and
@@ -803,7 +815,51 @@ impl Request {
     /// been replied to. The returned wrapper must be consumed by exactly one
     /// reply method.
     pub unsafe fn from_raw(raw: *mut raw::FuseReq) -> Option<Self> {
-        NonNull::new(raw).map(|raw| Self { raw: Some(raw) })
+        NonNull::new(raw).map(|raw| Self {
+            raw: Some(raw),
+            interrupt_flag: None,
+        })
+    }
+
+    pub(crate) fn register_interrupt_flag(&mut self, flag: Arc<AtomicBool>) {
+        let Some(raw) = self.raw else {
+            return;
+        };
+        self.clear_interrupt_flag();
+        flag.store(false, Ordering::Release);
+        let flag = Box::new(flag);
+        let flag_ptr = NonNull::from(Box::leak(flag));
+        self.interrupt_flag = Some(flag_ptr);
+        // SAFETY: `raw` is a live low-level request and `flag_ptr` remains valid
+        // until `clear_interrupt_flag` unregisters the callback and drops it.
+        unsafe {
+            raw::fuse_req_interrupt_func(
+                raw.as_ptr(),
+                Some(request_interrupted),
+                flag_ptr.as_ptr().cast(),
+            );
+            if raw::fuse_req_interrupted(raw.as_ptr()) != 0 {
+                request_interrupted(raw.as_ptr(), flag_ptr.as_ptr().cast());
+            }
+        }
+    }
+
+    fn clear_interrupt_flag(&mut self) {
+        let Some(flag_ptr) = self.interrupt_flag.take() else {
+            return;
+        };
+        if let Some(raw) = self.raw {
+            // SAFETY: `raw` is still owned by this request; unregister before
+            // freeing callback data so macFUSE cannot call into dangling state.
+            unsafe {
+                raw::fuse_req_interrupt_func(raw.as_ptr(), None, std::ptr::null_mut());
+            }
+        }
+        // SAFETY: `flag_ptr` came from `Box::leak` in `register_interrupt_flag`
+        // and is dropped exactly once here.
+        unsafe {
+            drop(Box::from_raw(flag_ptr.as_ptr()));
+        }
     }
 
     fn as_ptr(&self) -> *mut raw::FuseReq {
@@ -814,6 +870,7 @@ impl Request {
     }
 
     fn take_raw(&mut self) -> NonNull<raw::FuseReq> {
+        self.clear_interrupt_flag();
         match self.raw.take() {
             Some(raw) => raw,
             None => unreachable!("type-state invariant: macFUSE request was already replied"),
@@ -823,12 +880,24 @@ impl Request {
 
 impl Drop for Request {
     fn drop(&mut self) {
+        self.clear_interrupt_flag();
         if let Some(raw) = self.raw.take() {
             // SAFETY: `Request` owns a live, unreplied callback request by
             // construction. Dropping without a reply must fail the request so
             // the kernel is not left waiting indefinitely.
             unsafe { raw::fuse_reply_err(raw.as_ptr(), libc::EIO) };
         }
+    }
+}
+
+unsafe extern "C" fn request_interrupted(_req: *mut raw::FuseReq, data: *mut c_void) {
+    let Some(flag_ptr) = NonNull::new(data.cast::<Arc<AtomicBool>>()) else {
+        return;
+    };
+    // SAFETY: `data` is registered from `register_interrupt_flag` and remains
+    // valid until the callback is unregistered on the owning request.
+    unsafe {
+        flag_ptr.as_ref().store(true, Ordering::Release);
     }
 }
 

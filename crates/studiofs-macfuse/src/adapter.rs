@@ -7,7 +7,7 @@ use std::os::raw::c_char;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::{
     Arc, Condvar, Mutex,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
 
@@ -19,7 +19,7 @@ use studiofs_bridge::posix::{
     BridgeFileAttr, BridgeFileType, posix_flags_to_open_flags, to_bridge_attr, vfs_err_to_errno,
 };
 use studiofs_meta::{DirEntry, FileType, InodeAttr, SetattrArgs, TimeSpec, UploadState};
-use studiofs_vfs::{StatFs, StudioVfs};
+use studiofs_vfs::{StatFs, StudioVfs, VfsFuseAsyncReadSnapshot};
 use tokio::runtime::Handle;
 use tokio::sync::Semaphore;
 #[cfg(test)]
@@ -70,6 +70,7 @@ pub(crate) struct StudioVfsAdapter {
     read_queue_byte_limit: u32,
     read_buffers: Arc<ReadBufferPool>,
     read_windows: Arc<ReadWindowStore>,
+    read_diagnostics: Arc<AsyncReadDiagnostics>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -364,6 +365,118 @@ pub(crate) struct QueuedReadForTest {
     handle: JoinHandle<Result<PooledReadBuffer, i32>>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct ReadCancellationToken {
+    canceled: Arc<AtomicBool>,
+}
+
+impl ReadCancellationToken {
+    #[cfg(test)]
+    fn cancel(&self) {
+        self.canceled.store(true, Ordering::Release);
+    }
+
+    fn is_canceled(&self) -> bool {
+        self.canceled.load(Ordering::Acquire)
+    }
+
+    fn flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.canceled)
+    }
+}
+
+#[derive(Debug)]
+struct AsyncReadDiagnostics {
+    max_pending_bytes: usize,
+    pending_reads: AtomicUsize,
+    pending_bytes: AtomicUsize,
+    peak_pending_reads: AtomicUsize,
+    peak_pending_bytes: AtomicUsize,
+    completed_reads: AtomicU64,
+    failed_reads: AtomicU64,
+    canceled_reads: AtomicU64,
+    admission_waits: AtomicU64,
+    admission_wait_total_ns: AtomicU64,
+}
+
+impl AsyncReadDiagnostics {
+    fn new(max_pending_bytes: usize) -> Self {
+        Self {
+            max_pending_bytes,
+            pending_reads: AtomicUsize::new(0),
+            pending_bytes: AtomicUsize::new(0),
+            peak_pending_reads: AtomicUsize::new(0),
+            peak_pending_bytes: AtomicUsize::new(0),
+            completed_reads: AtomicU64::new(0),
+            failed_reads: AtomicU64::new(0),
+            canceled_reads: AtomicU64::new(0),
+            admission_waits: AtomicU64::new(0),
+            admission_wait_total_ns: AtomicU64::new(0),
+        }
+    }
+
+    fn on_queued(&self, bytes: u32) {
+        let bytes = bytes as usize;
+        let pending_reads = self.pending_reads.fetch_add(1, Ordering::Relaxed) + 1;
+        let pending_bytes = self.pending_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        self.peak_pending_reads
+            .fetch_max(pending_reads, Ordering::Relaxed);
+        self.peak_pending_bytes
+            .fetch_max(pending_bytes, Ordering::Relaxed);
+    }
+
+    fn on_admitted(&self, waited: Duration) {
+        if waited.is_zero() {
+            return;
+        }
+        self.admission_waits.fetch_add(1, Ordering::Relaxed);
+        self.admission_wait_total_ns.fetch_add(
+            waited.as_nanos().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
+    }
+
+    fn on_finished(&self, bytes: u32, outcome: AsyncReadOutcome) {
+        self.pending_reads.fetch_sub(1, Ordering::Relaxed);
+        self.pending_bytes
+            .fetch_sub(bytes as usize, Ordering::Relaxed);
+        match outcome {
+            AsyncReadOutcome::Completed => {
+                self.completed_reads.fetch_add(1, Ordering::Relaxed);
+            }
+            AsyncReadOutcome::Failed => {
+                self.failed_reads.fetch_add(1, Ordering::Relaxed);
+            }
+            AsyncReadOutcome::Canceled => {
+                self.canceled_reads.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn snapshot(&self) -> VfsFuseAsyncReadSnapshot {
+        VfsFuseAsyncReadSnapshot {
+            max_pending_bytes: Some(self.max_pending_bytes),
+            pending_reads: self.pending_reads.load(Ordering::Relaxed),
+            pending_bytes: self.pending_bytes.load(Ordering::Relaxed),
+            peak_pending_reads: self.peak_pending_reads.load(Ordering::Relaxed),
+            peak_pending_bytes: self.peak_pending_bytes.load(Ordering::Relaxed),
+            completed_reads: self.completed_reads.load(Ordering::Relaxed),
+            failed_reads: self.failed_reads.load(Ordering::Relaxed),
+            canceled_reads: self.canceled_reads.load(Ordering::Relaxed),
+            admission_waits: self.admission_waits.load(Ordering::Relaxed),
+            admission_wait_total_ms: self.admission_wait_total_ns.load(Ordering::Relaxed) as f64
+                / 1_000_000.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AsyncReadOutcome {
+    Completed,
+    Failed,
+    Canceled,
+}
+
 #[cfg(test)]
 impl QueuedReadForTest {
     pub(crate) fn is_finished(&self) -> bool {
@@ -378,6 +491,24 @@ impl QueuedReadForTest {
         let bytes = buffer.to_vec();
         drop(buffer);
         Ok(bytes)
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct CancelableQueuedReadForTest {
+    queued: QueuedReadForTest,
+    cancellation: ReadCancellationToken,
+}
+
+#[cfg(test)]
+impl CancelableQueuedReadForTest {
+    pub(crate) fn cancel(&self) {
+        self.cancellation.cancel();
+    }
+
+    pub(crate) fn wait(self) -> Result<Vec<u8>, i32> {
+        self.queued.wait()
     }
 }
 
@@ -426,6 +557,7 @@ impl StudioVfsAdapter {
             read_queue_byte_limit,
             read_buffers: Arc::new(ReadBufferPool::default()),
             read_windows: Arc::new(ReadWindowStore::default()),
+            read_diagnostics: Arc::new(AsyncReadDiagnostics::new(read_queue_byte_limit as usize)),
         }
     }
 
@@ -703,11 +835,18 @@ impl StudioVfsAdapter {
         offset: u64,
         size: u32,
         started: Instant,
+        cancellation: ReadCancellationToken,
     ) -> Result<PooledReadBuffer, i32> {
+        if cancellation.is_canceled() {
+            return Err(libc::ECANCELED);
+        }
         let size = clamp_reusable_read_size(size, MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY as u32);
         let size_usize = size as usize;
 
         let mut out = state.read_buffers.clone().acquire(size_usize);
+        if cancellation.is_canceled() {
+            return Err(libc::ECANCELED);
+        }
         if let Some(copied) = state
             .read_windows
             .try_read(file_handle, ino, offset, &mut out)
@@ -722,6 +861,9 @@ impl StudioVfsAdapter {
         let read_len = readahead_window_len(size_usize);
         if read_len > size_usize {
             out.buffer.resize(read_len, 0);
+        }
+        if cancellation.is_canceled() {
+            return Err(libc::ECANCELED);
         }
         let generation = state.read_windows.invalidation_generation(ino);
         let result = state
@@ -785,20 +927,59 @@ impl StudioVfsAdapter {
         };
         let size = clamp_reusable_read_size(size, self.read_queue_byte_limit);
         let started = Instant::now();
-        // TODO(SFS-489): wire macFUSE INTERRUPT notifications into this task
-        // so queued reads can abort before spending VFS/cache I/O on canceled requests.
+        let cancellation = ReadCancellationToken::default();
+        let diagnostics = Arc::clone(&self.read_diagnostics);
+        diagnostics.on_queued(size);
+        self.vfs
+            .record_fuse_async_read_snapshot(diagnostics.snapshot());
+        let mut request = request;
+        request.register_interrupt_flag(cancellation.flag());
         self.runtime_handle.spawn(async move {
+            if cancellation.is_canceled() {
+                diagnostics.on_finished(size, AsyncReadOutcome::Canceled);
+                state
+                    .vfs
+                    .record_fuse_async_read_snapshot(diagnostics.snapshot());
+                let _ = Reply::new(request).error(libc::ECANCELED);
+                return;
+            }
+            let admission_started = Instant::now();
             let Ok(_permit) = admission.acquire_many_owned(size).await else {
+                diagnostics.on_finished(size, AsyncReadOutcome::Failed);
+                state
+                    .vfs
+                    .record_fuse_async_read_snapshot(diagnostics.snapshot());
                 let _ = Reply::new(request).error(libc::EIO);
                 return;
             };
+            diagnostics.on_admitted(admission_started.elapsed());
+            if cancellation.is_canceled() {
+                diagnostics.on_finished(size, AsyncReadOutcome::Canceled);
+                state
+                    .vfs
+                    .record_fuse_async_read_snapshot(diagnostics.snapshot());
+                let _ = Reply::new(request).error(libc::ECANCELED);
+                return;
+            }
             // Keep the permit until after the reply consumes `bytes`, so queued read
             // memory remains bounded for the whole kernel-reply handoff.
-            match Self::perform_read(state, ino, file_handle, offset, size, started).await {
+            let vfs = Arc::clone(&state.vfs);
+            match Self::perform_read(state, ino, file_handle, offset, size, started, cancellation)
+                .await
+            {
                 Ok(bytes) => {
+                    diagnostics.on_finished(size, AsyncReadOutcome::Completed);
+                    vfs.record_fuse_async_read_snapshot(diagnostics.snapshot());
                     let _ = Reply::new(request).read_buffer(&bytes);
                 }
                 Err(errno) => {
+                    let outcome = if errno == libc::ECANCELED {
+                        AsyncReadOutcome::Canceled
+                    } else {
+                        AsyncReadOutcome::Failed
+                    };
+                    diagnostics.on_finished(size, outcome);
+                    vfs.record_fuse_async_read_snapshot(diagnostics.snapshot());
                     let _ = Reply::new(request).error(errno);
                 }
             }
@@ -822,15 +1003,128 @@ impl StudioVfsAdapter {
         };
         let size = clamp_reusable_read_size(size, self.read_queue_byte_limit);
         let started = Instant::now();
+        let cancellation = ReadCancellationToken::default();
+        let diagnostics = Arc::clone(&self.read_diagnostics);
+        diagnostics.on_queued(size);
+        self.vfs
+            .record_fuse_async_read_snapshot(diagnostics.snapshot());
         Ok(QueuedReadForTest {
             runtime_handle: self.runtime_handle.clone(),
             handle: self.runtime_handle.spawn(async move {
+                if cancellation.is_canceled() {
+                    diagnostics.on_finished(size, AsyncReadOutcome::Canceled);
+                    state
+                        .vfs
+                        .record_fuse_async_read_snapshot(diagnostics.snapshot());
+                    return Err(libc::ECANCELED);
+                }
+                let admission_started = Instant::now();
                 let _permit = admission
                     .acquire_many_owned(size)
                     .await
                     .map_err(|_| libc::EIO)?;
-                Self::perform_read(state, ino, file_handle, offset, size, started).await
+                diagnostics.on_admitted(admission_started.elapsed());
+                if cancellation.is_canceled() {
+                    diagnostics.on_finished(size, AsyncReadOutcome::Canceled);
+                    state
+                        .vfs
+                        .record_fuse_async_read_snapshot(diagnostics.snapshot());
+                    return Err(libc::ECANCELED);
+                }
+                let vfs = Arc::clone(&state.vfs);
+                let result = Self::perform_read(
+                    state,
+                    ino,
+                    file_handle,
+                    offset,
+                    size,
+                    started,
+                    cancellation,
+                )
+                .await;
+                match &result {
+                    Ok(_) => diagnostics.on_finished(size, AsyncReadOutcome::Completed),
+                    Err(errno) if *errno == libc::ECANCELED => {
+                        diagnostics.on_finished(size, AsyncReadOutcome::Canceled);
+                    }
+                    Err(_) => diagnostics.on_finished(size, AsyncReadOutcome::Failed),
+                }
+                vfs.record_fuse_async_read_snapshot(diagnostics.snapshot());
+                result
             }),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn queue_cancelable_read_for_test(
+        &self,
+        ino: u64,
+        file_handle: u64,
+        offset: i64,
+        size: u32,
+    ) -> Result<CancelableQueuedReadForTest, i32> {
+        let offset = u64::try_from(offset).map_err(|_| libc::EINVAL)?;
+        let admission = Arc::clone(&self.read_admission);
+        let state = ReadExecutionState {
+            vfs: Arc::clone(&self.vfs),
+            read_buffers: Arc::clone(&self.read_buffers),
+            read_windows: Arc::clone(&self.read_windows),
+        };
+        let size = clamp_reusable_read_size(size, self.read_queue_byte_limit);
+        let started = Instant::now();
+        let cancellation = ReadCancellationToken::default();
+        let worker_cancellation = cancellation.clone();
+        let diagnostics = Arc::clone(&self.read_diagnostics);
+        diagnostics.on_queued(size);
+        self.vfs
+            .record_fuse_async_read_snapshot(diagnostics.snapshot());
+        Ok(CancelableQueuedReadForTest {
+            cancellation,
+            queued: QueuedReadForTest {
+                runtime_handle: self.runtime_handle.clone(),
+                handle: self.runtime_handle.spawn(async move {
+                    if worker_cancellation.is_canceled() {
+                        diagnostics.on_finished(size, AsyncReadOutcome::Canceled);
+                        state
+                            .vfs
+                            .record_fuse_async_read_snapshot(diagnostics.snapshot());
+                        return Err(libc::ECANCELED);
+                    }
+                    let admission_started = Instant::now();
+                    let _permit = admission
+                        .acquire_many_owned(size)
+                        .await
+                        .map_err(|_| libc::EIO)?;
+                    diagnostics.on_admitted(admission_started.elapsed());
+                    if worker_cancellation.is_canceled() {
+                        diagnostics.on_finished(size, AsyncReadOutcome::Canceled);
+                        state
+                            .vfs
+                            .record_fuse_async_read_snapshot(diagnostics.snapshot());
+                        return Err(libc::ECANCELED);
+                    }
+                    let vfs = Arc::clone(&state.vfs);
+                    let result = Self::perform_read(
+                        state,
+                        ino,
+                        file_handle,
+                        offset,
+                        size,
+                        started,
+                        worker_cancellation,
+                    )
+                    .await;
+                    match &result {
+                        Ok(_) => diagnostics.on_finished(size, AsyncReadOutcome::Completed),
+                        Err(errno) if *errno == libc::ECANCELED => {
+                            diagnostics.on_finished(size, AsyncReadOutcome::Canceled);
+                        }
+                        Err(_) => diagnostics.on_finished(size, AsyncReadOutcome::Failed),
+                    }
+                    vfs.record_fuse_async_read_snapshot(diagnostics.snapshot());
+                    result
+                }),
+            },
         })
     }
 
