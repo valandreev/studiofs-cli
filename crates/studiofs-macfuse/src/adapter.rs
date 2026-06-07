@@ -30,7 +30,7 @@ use tracing::debug;
 use crate::low_level::{DirectoryEntryBuffer, Entry, OpenReply, Reply, Request, raw};
 
 const TTL_SECONDS: f64 = 1.0;
-const MACFUSE_ATTR_BLOCK_SIZE: u32 = 512;
+const MACFUSE_ATTR_BLOCK_SIZE: u32 = crate::low_level::MACOS_FUSE_IOSIZE_BYTES;
 const READDIR_CACHE_TTL: Duration = Duration::from_secs(1);
 const READDIR_CACHE_PRUNE_THRESHOLD: usize = 1024;
 const READDIR_CACHE_PRUNE_INTERVAL: Duration = Duration::from_secs(1);
