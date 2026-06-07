@@ -79,6 +79,11 @@ pub fn run_with_executor(
         bail!("macFUSE JuiceFS parity gate iterations must be greater than zero");
     }
 
+    let scenarios = MACFUSE_JUICEFS_PARITY_SCENARIOS
+        .iter()
+        .map(|scenario| (*scenario).to_string())
+        .collect::<Vec<_>>();
+
     let mut runs = Vec::with_capacity(request.iterations);
     for index in 0..request.iterations {
         let run_id = if request.iterations == 1 {
@@ -90,10 +95,7 @@ pub fn run_with_executor(
             RunRequest {
                 root: request.root.clone(),
                 run_id: Some(run_id),
-                scenarios: MACFUSE_JUICEFS_PARITY_SCENARIOS
-                    .iter()
-                    .map(|scenario| (*scenario).to_string())
-                    .collect(),
+                scenarios: scenarios.clone(),
                 seed: request.seed,
                 studiofs_bin: Some(request.studiofs_bin.clone()),
                 platform: request.platform,

@@ -457,19 +457,18 @@ impl BaselineGateArgs {
     }
 }
 
-impl MacfuseJuicefsParityGateArgs {
-    /// Builds a `MacfuseJuicefsParityGateRequest` consumed by the parity gate runner.
-    pub fn into_request(self) -> MacfuseJuicefsParityGateRequest {
+impl From<MacfuseJuicefsParityGateArgs> for MacfuseJuicefsParityGateRequest {
+    fn from(args: MacfuseJuicefsParityGateArgs) -> Self {
         MacfuseJuicefsParityGateRequest {
-            root: self.root,
-            run_id_prefix: self.run_id_prefix,
-            iterations: self.iterations,
-            seed: self.seed,
-            studiofs_bin: self.studiofs_bin,
-            platform: self.platform,
-            retention: self.retain,
-            port_range: self.port_range,
-            timeout: self.timeout,
+            root: args.root,
+            run_id_prefix: args.run_id_prefix,
+            iterations: args.iterations,
+            seed: args.seed,
+            studiofs_bin: args.studiofs_bin,
+            platform: args.platform,
+            retention: args.retain,
+            port_range: args.port_range,
+            timeout: args.timeout,
         }
     }
 }
@@ -597,7 +596,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             Ok(outcome.exit_code())
         }
         Commands::MacfuseJuicefsParityGate(args) => {
-            let outcome = parity_gate::run(args.into_request())?;
+            let outcome = parity_gate::run(args.into())?;
             for run in &outcome.runs {
                 println!(
                     "timestamp={} run_id={} status={:?} report={}",
