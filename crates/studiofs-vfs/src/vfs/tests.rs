@@ -5041,11 +5041,11 @@ fn cache_runtime_tuning_defaults_match_juicefs_sized_windows() {
     let derived =
         derive_cache_runtime_tuning(100 * 1024 * 1024 * 1024, 16 * 1024 * 1024, 64 * 1024 * 1024);
 
-    assert_eq!(DEFAULT_MAX_DIRTY_BYTES, 300 * 1024 * 1024);
+    assert_eq!(DEFAULT_MAX_DIRTY_BYTES, 800 * 1024 * 1024);
     assert_eq!(DEFAULT_WRITE_EAGER_FLUSH_BATCH_BYTES, 64 * 1024 * 1024);
-    assert_eq!(derived.max_dirty_bytes, 300 * 1024 * 1024);
+    assert_eq!(derived.max_dirty_bytes, 800 * 1024 * 1024);
     assert_eq!(derived.write_eager_flush_batch_bytes, 64 * 1024 * 1024);
-    assert_eq!(derived.transit_memory_budget_bytes, 300 * 1024 * 1024);
+    assert_eq!(derived.transit_memory_budget_bytes, 800 * 1024 * 1024);
 }
 
 #[test]
@@ -5130,11 +5130,11 @@ fn write_admission_pressure_samples_cached_store_pending_upload_bytes() {
 fn write_buffer_admission_paces_like_juicefs_memory_window() {
     assert_eq!(write_buffer_admission_delay_ms(300, 300), None);
     assert_eq!(
-        write_buffer_admission_delay_ms(300 * 1024 * 1024 + 1, 300 * 1024 * 1024),
+        write_buffer_admission_delay_ms(800 * 1024 * 1024 + 1, 800 * 1024 * 1024),
         Some(WRITE_ADMISSION_BUFFER_DELAY_MS)
     );
     assert_eq!(
-        write_buffer_admission_delay_ms(600 * 1024 * 1024 + 1, 300 * 1024 * 1024),
+        write_buffer_admission_delay_ms(1600 * 1024 * 1024 + 1, 800 * 1024 * 1024),
         Some(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS)
     );
 }
@@ -5187,7 +5187,7 @@ fn write_admission_waits_until_writer_stack_pressure_drops_below_hard_window() {
 
 #[test]
 fn sustained_write_window_decays_to_drain_chunk_for_long_streams() {
-    let base = 300 * 1024 * 1024;
+    let base = 800 * 1024 * 1024;
     let drain = 32 * 1024 * 1024;
     let mut state = SustainedWriteState::default();
 
@@ -5207,14 +5207,18 @@ fn sustained_write_window_decays_to_drain_chunk_for_long_streams() {
     assert_eq!(eighth.effective_buffer_bytes, base / 8);
     assert!(eighth.pre_drain);
 
-    let floor = state.observe(7_000, 16, 4, base, drain, base);
+    let sixteenth = state.observe(7_000, 16, 4, base, drain, base);
+    assert_eq!(sixteenth.effective_buffer_bytes, base / 16);
+    assert!(sixteenth.pre_drain);
+
+    let floor = state.observe(8_500, 20, 4, base, drain, base);
     assert_eq!(floor.effective_buffer_bytes, drain);
     assert!(floor.pre_drain);
 }
 
 #[test]
 fn sustained_write_window_resets_after_idle_or_seek() {
-    let base = 300 * 1024 * 1024;
+    let base = 800 * 1024 * 1024;
     let drain = 32 * 1024 * 1024;
     let mut state = SustainedWriteState::default();
 
