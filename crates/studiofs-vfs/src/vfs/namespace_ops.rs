@@ -52,13 +52,6 @@ fn handle_backed_growth_may_defer_strict_flush(
 }
 
 impl StudioVfs {
-    fn record_lookup_prefetch_child(&self, parent: Ino, name: &[u8], attr: &InodeAttr) {
-        if attr.kind == FileType::RegularFile {
-            self.dir_prefetch
-                .on_lookup_entry(parent, DirAccessEntry::new(attr.ino, name));
-        }
-    }
-
     /// Update inode metadata fields without an open-file handle context.
     ///
     /// This is the handle-free entry point for setattr operations and delegates to
@@ -819,7 +812,6 @@ impl StudioVfs {
                     match self.getattr_unchecked(child_ino) {
                         Ok(attr) => {
                             self.enforce_access(child_ino, AccessLevel::ReadOnly)?;
-                            self.record_lookup_prefetch_child(parent, name, &attr);
                             return Ok(attr);
                         }
                         Err(VfsError::Meta(MetaError::InodeNotFound(_))) => {
@@ -853,10 +845,7 @@ impl StudioVfs {
             return Err(err);
         }
         match self.getattr_unchecked(entry.ino) {
-            Ok(attr) => {
-                self.record_lookup_prefetch_child(parent, name, &attr);
-                Ok(attr)
-            }
+            Ok(attr) => Ok(attr),
             Err(VfsError::Meta(MetaError::InodeNotFound(_))) => {
                 self.heal_orphaned_dentry(parent, name, Some(entry.ino));
                 Err(Self::ignored_entry_not_found(parent, name))

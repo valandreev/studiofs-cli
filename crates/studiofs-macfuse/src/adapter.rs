@@ -813,36 +813,39 @@ impl StudioVfsAdapter {
         }
 
         let mut snapshots = self.open_cache_snapshots.lock();
-        if snapshots
-            .get(&ino)
-            .is_some_and(|previous| *previous == snapshot)
-        {
-            debug!(
-                ino,
-                keep_cache = true,
-                content_epoch = snapshot.content_epoch,
-                size = snapshot.size,
-                reason = "read_only_safe",
-                "macFUSE open cache decision"
-            );
-            self.vfs
-                .record_macfuse_open_cache_decision(VfsMacFuseOpenCacheDecision::ReadOnlyKeep);
-            return true;
+        match snapshots.get(&ino) {
+            Some(previous) if *previous != snapshot => {
+                snapshots.put(ino, snapshot);
+                debug!(
+                    ino,
+                    keep_cache = false,
+                    content_epoch = snapshot.content_epoch,
+                    size = snapshot.size,
+                    reason = "generation_changed",
+                    "macFUSE open cache decision"
+                );
+                self.vfs.record_macfuse_open_cache_decision(
+                    VfsMacFuseOpenCacheDecision::ReadOnlyGenerationChanged,
+                );
+                return false;
+            }
+            Some(_) => {}
+            None => {
+                snapshots.put(ino, snapshot);
+            }
         }
 
-        snapshots.put(ino, snapshot);
         debug!(
             ino,
-            keep_cache = false,
+            keep_cache = true,
             content_epoch = snapshot.content_epoch,
             size = snapshot.size,
-            reason = "generation_changed",
+            reason = "read_only_safe",
             "macFUSE open cache decision"
         );
-        self.vfs.record_macfuse_open_cache_decision(
-            VfsMacFuseOpenCacheDecision::ReadOnlyGenerationChanged,
-        );
-        false
+        self.vfs
+            .record_macfuse_open_cache_decision(VfsMacFuseOpenCacheDecision::ReadOnlyKeep);
+        true
     }
 
     /// Remove a file entry.

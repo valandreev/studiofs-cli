@@ -694,41 +694,4 @@ mod tests {
         );
         assert_eq!(planned[0].block_indices, vec![0]);
     }
-
-    #[test]
-    fn plan_prefetch_batches_from_hint_yields_frame_sequence_batch_after_lookups_without_readdir() {
-        let tmp = TempDir::new().expect("tempdir");
-        let (_rt, vfs, _meta) =
-            make_unstarted_test_vfs(&tmp, "prefetch-frame-sequence-lookup-batch");
-
-        let first = vfs
-            .create(ROOT_INO, b"plate_0100.exr", 1000, 1000, 0o644)
-            .expect("create first frame");
-        let second = vfs
-            .create(ROOT_INO, b"plate_0101.exr", 1000, 1000, 0o644)
-            .expect("create second frame");
-        let _notes = vfs
-            .create(ROOT_INO, b"notes.txt", 1000, 1000, 0o644)
-            .expect("create unrelated file");
-
-        let looked_up_first = vfs
-            .lookup(ROOT_INO, b"plate_0100.exr")
-            .expect("lookup first frame");
-        let looked_up_second = vfs
-            .lookup(ROOT_INO, b"plate_0101.exr")
-            .expect("lookup second frame");
-        assert_eq!(looked_up_first.ino, first.ino);
-        assert_eq!(looked_up_second.ino, second.ino);
-
-        let stream_id = 457;
-        let policy = AccessPolicy::from_class(AccessClass::SequentialMediaRead, vfs.access_tracker);
-        let planned = vfs.plan_prefetch_batches_from_hint(first.ino, stream_id, 0, 0, policy);
-
-        assert_eq!(planned.len(), 1);
-        assert_eq!(
-            planned[0].ino, second.ino,
-            "frame sequence reads should schedule the next frame after lookup-only discovery"
-        );
-        assert_eq!(planned[0].block_indices, vec![0]);
-    }
 }
