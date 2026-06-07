@@ -8822,7 +8822,9 @@ fn test_file_session_finalize_still_blocks_writers() {
             .enter_op(ino, FileSessionOperation::Finalize)
             .await;
         let vfs_clone = vfs.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let mut writer = Box::pin(tokio::spawn(async move {
+            let _ = started_tx.send(());
             let _writer = vfs_clone
                 .state
                 .file_session
@@ -8830,6 +8832,9 @@ fn test_file_session_finalize_still_blocks_writers() {
                 .await;
         }));
 
+        started_rx
+            .await
+            .expect("writer task should start before blocked-writer assertion");
         tokio::time::timeout(Duration::from_millis(50), &mut writer)
             .await
             .expect_err("writes must still wait for background upload finalization");

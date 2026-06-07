@@ -39,7 +39,7 @@ const MACFUSE_READ_BUFFER_POOL_MAX_BUFFERS: usize = 32;
 const MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY: usize = 8 * 1024 * 1024;
 // Keep allocator-rounded buffers that grew slightly beyond the reusable read
 // cap, while dropping genuinely oversized requests instead of pinning them.
-const MACFUSE_READ_BUFFER_POOL_RETAINED_CAPACITY: usize = MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY * 2;
+const MACFUSE_READ_BUFFER_POOL_RETAINED_CAPACITY: usize = MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY;
 const MACFUSE_READ_WINDOW_MAX_BYTES: usize = 8 * 1024 * 1024;
 const MACFUSE_READ_WINDOW_MIN_BYTES: usize = 128 * 1024;
 const MACFUSE_ASYNC_READ_SNAPSHOT_INTERVAL: Duration = Duration::from_millis(500);
@@ -104,6 +104,7 @@ struct ReadBufferPool {
 }
 
 impl ReadBufferPool {
+    #[cfg(test)]
     fn acquire(self: Arc<Self>, size: usize) -> PooledReadBuffer {
         self.acquire_with_capacity(size, size)
     }
@@ -112,7 +113,7 @@ impl ReadBufferPool {
         let mut buffer = self.buffers.lock().pop().unwrap_or_default();
         let capacity = capacity.max(len);
         if buffer.capacity() < capacity {
-            buffer.reserve_exact(capacity - buffer.capacity());
+            buffer.reserve_exact(capacity - buffer.len());
         }
         // TODO(SFS-489): avoid this per-read zero-fill once the VFS read path accepts
         // MaybeUninit/ReadBuf-style storage instead of initialized `&mut [u8]`.
@@ -1005,8 +1006,11 @@ impl StudioVfsAdapter {
                     .record_fuse_read_callback(reply_len, started.elapsed(), false);
                 if written > size_usize {
                     let remainder_len = written - reply_len;
-                    let mut remainder = state.read_buffers.clone().acquire(remainder_len);
-                    remainder.copy_from_slice(&out[reply_len..written]);
+                    let mut remainder = state
+                        .read_buffers
+                        .clone()
+                        .acquire_with_capacity(0, remainder_len);
+                    remainder.buffer.extend_from_slice(&out[reply_len..written]);
                     state.read_windows.remember_if_current(
                         request.file_handle,
                         request.ino,
