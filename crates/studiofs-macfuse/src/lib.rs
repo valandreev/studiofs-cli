@@ -551,6 +551,34 @@ mod tests {
     }
 
     #[test]
+    fn adapter_reports_iosize_backed_file_block_geometry() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-adapter-file-io-geometry",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"geometry.bin",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+
+        let stat = adapter.getattr(attr.ino).expect("get file stat");
+
+        assert_eq!(
+            stat.st_blksize as u32,
+            super::low_level::MACOS_FUSE_IOSIZE_BYTES,
+            "macOS uses st_blksize as part of read clustering; keep it aligned with the mounted iosize"
+        );
+    }
+
+    #[test]
     fn read_only_adapter_read_lets_vfs_handle_eof_without_pre_clamp_getattr() {
         let fixture =
             studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-read-eof-no-preclamp")
@@ -1545,6 +1573,10 @@ mod tests {
             !changed_open.keep_cache(),
             "changed generation must invalidate kernel pages: {changed_open:?}"
         );
+        let cache_decisions = vfs.write_path_observability_snapshot().macfuse_open_cache;
+        assert_eq!(cache_decisions.read_only_keep, 1);
+        assert_eq!(cache_decisions.read_only_drop, 2);
+        assert_eq!(cache_decisions.read_only_generation_changed, 1);
     }
 
     #[test]

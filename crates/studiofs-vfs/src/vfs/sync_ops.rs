@@ -1206,7 +1206,8 @@ impl StudioVfs {
                 requested_len = buffer.len(),
                 session_open_handles = session.as_ref().map(|snapshot| snapshot.open_handles),
                 session_queued_ops = session.as_ref().map(|snapshot| snapshot.queued_ops),
-                session_active_readers = session.as_ref().map(|snapshot| snapshot.active_readers),
+                session_active_shared_locks =
+                    session.as_ref().map(|snapshot| snapshot.active_shared_locks),
                 session_active_writer = session.as_ref().and_then(|snapshot| snapshot.active_writer),
                 session_last_transition_op = session
                     .as_ref()

@@ -72,11 +72,12 @@ pub use metrics::{
     StatFs, VfsAttrReadCacheSnapshot, VfsCacheStateSnapshot, VfsFetchStats,
     VfsForegroundReadProtectionStats, VfsFuseAsyncReadSnapshot, VfsFuseAsyncWriteSnapshot,
     VfsFuseCallbackStats, VfsFuseIoStats, VfsIngressLane, VfsIngressPressure, VfsIngressStats,
-    VfsLatencyHistogramSnapshot, VfsNamespaceCacheSnapshot, VfsPortableAllocatorStats,
-    VfsReadPathStats, VfsRuntimeEvent, VfsSynchronizationStateSnapshot, VfsTransitMemorySnapshot,
-    VfsUploadStats, VfsWritePathBackpressureStats, VfsWritePathBurstStats,
-    VfsWritePathCadenceStats, VfsWritePathDirtyPressureStats, VfsWritePathDrainLagStats,
-    VfsWritePathEagerFlushStats, VfsWritePathLandingZoneStats, VfsWritePathLatencyQuantilesMs,
+    VfsLatencyHistogramSnapshot, VfsMacFuseOpenCacheDecision, VfsMacFuseOpenCacheStats,
+    VfsNamespaceCacheSnapshot, VfsPortableAllocatorStats, VfsReadPathStats, VfsRuntimeEvent,
+    VfsSynchronizationStateSnapshot, VfsTransitMemorySnapshot, VfsUploadStats,
+    VfsWritePathBackpressureStats, VfsWritePathBurstStats, VfsWritePathCadenceStats,
+    VfsWritePathDirtyPressureStats, VfsWritePathDrainLagStats, VfsWritePathEagerFlushStats,
+    VfsWritePathLandingZoneStats, VfsWritePathLatencyQuantilesMs,
     VfsWritePathLatencyQuantilesSaturated, VfsWritePathLocalCacheIoStats,
     VfsWritePathObservabilitySnapshot, VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats,
     VfsWritePathTuningStats, VfsWritePathVfsWriteStats, VfsWritePathWinfspCallbackStats,
@@ -515,8 +516,10 @@ fn sustained_write_effective_buffer_bytes(
         .saturating_sub(SUSTAINED_WRITE_DECAY_START_MS)
         .saturating_div(SUSTAINED_WRITE_DECAY_STEP_MS)
         .saturating_add(1)
-        .min(4);
-    let divisor = 1usize.checked_shl(steps as u32).unwrap_or(usize::MAX);
+        .min(usize::BITS as u64 - 1);
+    let divisor = 1usize
+        .checked_shl(steps as u32)
+        .expect("shift count is clamped below usize bit width");
     base_buffer_bytes.saturating_div(divisor).max(floor)
 }
 
@@ -713,7 +716,7 @@ const DEFAULT_UPLOAD_USER_IDLE_GRACE_MS: u64 = 500;
 const DEFAULT_UPLOAD_FG_READ_LATENCY_TARGET_MS: u64 = 35;
 const DEFAULT_UPLOAD_FG_READ_LATENCY_WINDOW_MS: u64 = 1_500;
 const DEFAULT_UPLOAD_FG_READ_LATENCY_STICKY_WINDOWS: u64 = 2;
-const DEFAULT_MAX_DIRTY_BYTES: usize = 300 * 1024 * 1024;
+const DEFAULT_MAX_DIRTY_BYTES: usize = 800 * 1024 * 1024;
 const DEFAULT_WRITE_EAGER_FLUSH_BATCH_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_FETCH_INITIAL_WINDOW: f64 = 0.0;
 const DEFAULT_FETCH_MIN_WINDOW: f64 = 1.0;
@@ -775,8 +778,8 @@ const DEFAULT_METADATA_INVALIDATION_SYNC_INTERVAL_MS: u64 = 5 * 60 * 1000;
 const DEFAULT_LOCK_LEASE_TTL: Duration = Duration::from_secs(120);
 const DEFAULT_LOCK_RETRY_BASE_MS: u64 = 25;
 const DEFAULT_LOCK_RETRY_MAX_MS: u64 = 500;
-const CACHE_RUNTIME_MIN_DIRTY_BYTES: usize = 300 * 1024 * 1024;
-const CACHE_RUNTIME_MAX_DIRTY_BYTES_BASE: usize = 300 * 1024 * 1024;
+const CACHE_RUNTIME_MIN_DIRTY_BYTES: usize = 800 * 1024 * 1024;
+const CACHE_RUNTIME_MAX_DIRTY_BYTES_BASE: usize = 800 * 1024 * 1024;
 const DEBUG_PENDING_PATH_SUFFIX_ENV: &str = "STUDIOFS_DEBUG_PENDING_PATH_SUFFIX";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TwoTierSegment {
@@ -2206,6 +2209,12 @@ struct MetricsState {
     fuse_write_callback_errors: AtomicU64,
     fuse_write_callback_total_ns: AtomicU64,
     fuse_write_callback_max_ns: AtomicU64,
+    macfuse_open_cache_read_only_keep: AtomicU64,
+    macfuse_open_cache_read_only_unknown_state: AtomicU64,
+    macfuse_open_cache_read_only_not_fully_committed: AtomicU64,
+    macfuse_open_cache_read_only_local_dirty_state: AtomicU64,
+    macfuse_open_cache_read_only_generation_changed: AtomicU64,
+    macfuse_open_cache_write_capable: AtomicU64,
     zeroio_replay_failures: AtomicU64,
     zeroio_publish_failures: AtomicU64,
     runtime_event_sequence: AtomicU64,
@@ -2330,6 +2339,12 @@ impl MetricsState {
             fuse_write_callback_errors: AtomicU64::new(0),
             fuse_write_callback_total_ns: AtomicU64::new(0),
             fuse_write_callback_max_ns: AtomicU64::new(0),
+            macfuse_open_cache_read_only_keep: AtomicU64::new(0),
+            macfuse_open_cache_read_only_unknown_state: AtomicU64::new(0),
+            macfuse_open_cache_read_only_not_fully_committed: AtomicU64::new(0),
+            macfuse_open_cache_read_only_local_dirty_state: AtomicU64::new(0),
+            macfuse_open_cache_read_only_generation_changed: AtomicU64::new(0),
+            macfuse_open_cache_write_capable: AtomicU64::new(0),
             zeroio_replay_failures: AtomicU64::new(0),
             zeroio_publish_failures: AtomicU64::new(0),
             runtime_event_sequence: AtomicU64::new(0),
@@ -2444,6 +2459,12 @@ impl MetricsState {
             fuse_write_callback_errors,
             fuse_write_callback_total_ns,
             fuse_write_callback_max_ns,
+            macfuse_open_cache_read_only_keep,
+            macfuse_open_cache_read_only_unknown_state,
+            macfuse_open_cache_read_only_not_fully_committed,
+            macfuse_open_cache_read_only_local_dirty_state,
+            macfuse_open_cache_read_only_generation_changed,
+            macfuse_open_cache_write_capable,
             zeroio_replay_failures,
             zeroio_publish_failures,
             runtime_event_sequence
@@ -6655,6 +6676,43 @@ impl StudioVfs {
             .fetch_max(elapsed_ns, Ordering::Relaxed);
     }
 
+    /// Record a macFUSE open-cache decision for mounted diagnostics.
+    pub fn record_macfuse_open_cache_decision(&self, decision: VfsMacFuseOpenCacheDecision) {
+        let metric = match decision {
+            VfsMacFuseOpenCacheDecision::ReadOnlyKeep => {
+                &self.state.metrics.macfuse_open_cache_read_only_keep
+            }
+            VfsMacFuseOpenCacheDecision::ReadOnlyUnknownState => {
+                &self
+                    .state
+                    .metrics
+                    .macfuse_open_cache_read_only_unknown_state
+            }
+            VfsMacFuseOpenCacheDecision::ReadOnlyNotFullyCommitted => {
+                &self
+                    .state
+                    .metrics
+                    .macfuse_open_cache_read_only_not_fully_committed
+            }
+            VfsMacFuseOpenCacheDecision::ReadOnlyLocalDirtyState => {
+                &self
+                    .state
+                    .metrics
+                    .macfuse_open_cache_read_only_local_dirty_state
+            }
+            VfsMacFuseOpenCacheDecision::ReadOnlyGenerationChanged => {
+                &self
+                    .state
+                    .metrics
+                    .macfuse_open_cache_read_only_generation_changed
+            }
+            VfsMacFuseOpenCacheDecision::WriteCapable => {
+                &self.state.metrics.macfuse_open_cache_write_capable
+            }
+        };
+        metric.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Record FUSE write callback observability.
     pub fn record_fuse_write_callback(
         &self,
@@ -6951,6 +7009,12 @@ impl StudioVfs {
             fuse_write_callback_errors: fuse_write_callback_errors,
             fuse_write_callback_total_ns: fuse_write_callback_total_ns,
             fuse_write_callback_max_ns: fuse_write_callback_max_ns,
+            macfuse_open_cache_read_only_keep: macfuse_open_cache_read_only_keep,
+            macfuse_open_cache_read_only_unknown_state: macfuse_open_cache_read_only_unknown_state,
+            macfuse_open_cache_read_only_not_fully_committed: macfuse_open_cache_read_only_not_fully_committed,
+            macfuse_open_cache_read_only_local_dirty_state: macfuse_open_cache_read_only_local_dirty_state,
+            macfuse_open_cache_read_only_generation_changed: macfuse_open_cache_read_only_generation_changed,
+            macfuse_open_cache_write_capable: macfuse_open_cache_write_capable,
             sync_calls: payload_store_sync_data_calls,
             sync_deferred_calls: payload_store_sync_data_deferred_calls,
             sync_bytes: payload_store_sync_data_synced_bytes,
@@ -7469,6 +7533,24 @@ impl StudioVfs {
                     fuse_write_callback_max_ns,
                     elapsed,
                 ),
+            },
+            macfuse_open_cache: {
+                let read_only_drop = macfuse_open_cache_read_only_unknown_state
+                    .saturating_add(macfuse_open_cache_read_only_not_fully_committed)
+                    .saturating_add(macfuse_open_cache_read_only_local_dirty_state)
+                    .saturating_add(macfuse_open_cache_read_only_generation_changed);
+                VfsMacFuseOpenCacheStats {
+                    total: macfuse_open_cache_read_only_keep
+                        .saturating_add(read_only_drop)
+                        .saturating_add(macfuse_open_cache_write_capable),
+                    read_only_keep: macfuse_open_cache_read_only_keep,
+                    read_only_drop,
+                    read_only_unknown_state: macfuse_open_cache_read_only_unknown_state,
+                    read_only_not_fully_committed: macfuse_open_cache_read_only_not_fully_committed,
+                    read_only_local_dirty_state: macfuse_open_cache_read_only_local_dirty_state,
+                    read_only_generation_changed: macfuse_open_cache_read_only_generation_changed,
+                    write_capable: macfuse_open_cache_write_capable,
+                }
             },
             fuse_async_write: self.state.fuse_async_write_snapshot.lock().clone(),
             fuse_async_read: self.state.fuse_async_read_snapshot.lock().clone(),

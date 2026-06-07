@@ -39,7 +39,7 @@ pub struct VfsFileSessionStats {
 pub(super) struct FileSessionDebugSnapshot {
     pub(super) open_handles: u32,
     pub(super) queued_ops: u64,
-    pub(super) active_readers: u32,
+    pub(super) active_shared_locks: u32,
     pub(super) active_writer: Option<&'static str>,
     pub(super) last_transition_unix_ms: u64,
     pub(super) last_transition_label: (&'static str, &'static str),
@@ -198,8 +198,8 @@ impl FileSessionOperation {
         }
     }
 
-    fn read_lock(self) -> bool {
-        matches!(self, Self::Read)
+    fn shared_lock(self) -> bool {
+        matches!(self, Self::Read | Self::Finalize)
     }
 
     fn index(self) -> usize {
@@ -236,13 +236,15 @@ impl FileSessionOperation {
 pub(super) struct FileSessionEntry {
     /// Gate that serializes conflicting operations for this inode.
     gate: Arc<tokio::sync::RwLock<()>>,
+    /// Gate that serializes background finalization while allowing readers.
+    finalize_gate: Arc<tokio::sync::Mutex<()>>,
     open_handles: AtomicU32,
     queued_ops: AtomicU64,
     max_queue_depth: AtomicU64,
     wait_events: AtomicU64,
     wait_ms: AtomicU64,
     transitions: AtomicU64,
-    active_readers: AtomicU32,
+    active_shared_locks: AtomicU32,
     active_writer: Mutex<Option<&'static str>>,
     last_transition_unix_ms: AtomicU64,
     last_transition_label: Mutex<(&'static str, &'static str)>,
@@ -253,13 +255,14 @@ impl FileSessionEntry {
     fn new() -> Self {
         Self {
             gate: Arc::new(tokio::sync::RwLock::new(())),
+            finalize_gate: Arc::new(tokio::sync::Mutex::new(())),
             open_handles: AtomicU32::new(0),
             queued_ops: AtomicU64::new(0),
             max_queue_depth: AtomicU64::new(0),
             wait_events: AtomicU64::new(0),
             wait_ms: AtomicU64::new(0),
             transitions: AtomicU64::new(0),
-            active_readers: AtomicU32::new(0),
+            active_shared_locks: AtomicU32::new(0),
             active_writer: Mutex::new(None),
             last_transition_unix_ms: AtomicU64::new(0),
             last_transition_label: Mutex::new(("", "")),
@@ -282,16 +285,16 @@ impl FileSessionEntry {
     }
 
     fn note_active_start(&self, op: FileSessionOperation) {
-        if op.read_lock() {
-            self.active_readers.fetch_add(1, Ordering::Relaxed);
+        if op.shared_lock() {
+            self.active_shared_locks.fetch_add(1, Ordering::Relaxed);
         } else {
             *self.active_writer.lock() = Some(op.as_str());
         }
     }
 
     fn note_active_finish(&self, op: FileSessionOperation) {
-        if op.read_lock() {
-            self.active_readers
+        if op.shared_lock() {
+            self.active_shared_locks
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                     Some(v.saturating_sub(1))
                 })
@@ -304,6 +307,8 @@ impl FileSessionEntry {
 
 #[derive(Debug)]
 pub(super) struct FileSessionPermit {
+    /// Finalize-only guard held before the shared read gate.
+    _finalize_gate: Option<tokio::sync::OwnedMutexGuard<()>>,
     /// Read side lock guard held while the operation is active.
     _read_gate: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
     /// Write side lock guard held while the operation is active.
@@ -323,6 +328,7 @@ impl Drop for FileSessionPermit {
         // observe lower tail latency on contended inodes.
         drop(self._read_gate.take());
         drop(self._write_gate.take());
+        drop(self._finalize_gate.take());
         self.session.note_active_finish(self.op);
         self.counters.transitions.fetch_add(1, Ordering::Relaxed);
         self.session.record_transition(self.op, "finish");
@@ -433,7 +439,12 @@ impl FileSessionState {
         );
 
         let wait_started = Instant::now();
-        let (read_guard, write_guard) = if op.read_lock() {
+        let finalize_guard = if op == FileSessionOperation::Finalize {
+            Some(session.finalize_gate.clone().lock_owned().await)
+        } else {
+            None
+        };
+        let (read_guard, write_guard) = if op.shared_lock() {
             (Some(session.gate.clone().read_owned().await), None)
         } else {
             (None, Some(session.gate.clone().write_owned().await))
@@ -459,6 +470,7 @@ impl FileSessionState {
         session.note_active_start(op);
         session.record_transition(op, "start");
         FileSessionPermit {
+            _finalize_gate: finalize_guard,
             _read_gate: read_guard,
             _write_gate: write_guard,
             counters,
@@ -538,7 +550,7 @@ impl FileSessionState {
         Some(FileSessionDebugSnapshot {
             open_handles: session.open_handles.load(Ordering::Relaxed),
             queued_ops: session.queued_ops.load(Ordering::Relaxed),
-            active_readers: session.active_readers.load(Ordering::Relaxed),
+            active_shared_locks: session.active_shared_locks.load(Ordering::Relaxed),
             active_writer: *session.active_writer.lock(),
             last_transition_unix_ms: session.last_transition_unix_ms.load(Ordering::Relaxed),
             last_transition_label: *session.last_transition_label.lock(),

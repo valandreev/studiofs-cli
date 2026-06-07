@@ -37,9 +37,9 @@ use crate::vfs::{
 use super::{OpenFile, VfsError, VfsResult};
 
 /// Maximum runtime dirty budget for large cache classes.
-pub(super) const CACHE_RUNTIME_MAX_DIRTY_BYTES_LARGE: usize = 300 * 1024 * 1024;
+pub(super) const CACHE_RUNTIME_MAX_DIRTY_BYTES_LARGE: usize = 800 * 1024 * 1024;
 /// Maximum runtime dirty budget for huge cache classes.
-pub(super) const CACHE_RUNTIME_MAX_DIRTY_BYTES_HUGE: usize = 300 * 1024 * 1024;
+pub(super) const CACHE_RUNTIME_MAX_DIRTY_BYTES_HUGE: usize = 800 * 1024 * 1024;
 /// Minimum eager write flush batch size for cache runtime tuning.
 pub(super) const CACHE_RUNTIME_MIN_WRITE_EAGER_BATCH_BYTES: usize = 64 * 1024 * 1024;
 /// Maximum eager write flush batch size for cache runtime tuning.
@@ -57,7 +57,7 @@ pub(super) const FAST_MODE_SYNC_GROUP_MIN_BYTES_CEIL: u64 = 256 * 1024 * 1024;
 /// Minimum transit-memory budget for runtime tuning.
 pub(super) const CACHE_RUNTIME_MIN_TRANSIT_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 /// Maximum transit-memory budget for runtime tuning.
-pub(super) const CACHE_RUNTIME_MAX_TRANSIT_BUDGET_BYTES: usize = 300 * 1024 * 1024;
+pub(super) const CACHE_RUNTIME_MAX_TRANSIT_BUDGET_BYTES: usize = 800 * 1024 * 1024;
 /// Small cache runtime budget (bytes).
 pub(super) const CACHE_RUNTIME_SMALL_BUDGET_BYTES: u64 = 128 * 1024 * 1024 * 1024;
 /// Large cache runtime budget (bytes).

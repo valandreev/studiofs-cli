@@ -5041,11 +5041,11 @@ fn cache_runtime_tuning_defaults_match_juicefs_sized_windows() {
     let derived =
         derive_cache_runtime_tuning(100 * 1024 * 1024 * 1024, 16 * 1024 * 1024, 64 * 1024 * 1024);
 
-    assert_eq!(DEFAULT_MAX_DIRTY_BYTES, 300 * 1024 * 1024);
+    assert_eq!(DEFAULT_MAX_DIRTY_BYTES, 800 * 1024 * 1024);
     assert_eq!(DEFAULT_WRITE_EAGER_FLUSH_BATCH_BYTES, 64 * 1024 * 1024);
-    assert_eq!(derived.max_dirty_bytes, 300 * 1024 * 1024);
+    assert_eq!(derived.max_dirty_bytes, 800 * 1024 * 1024);
     assert_eq!(derived.write_eager_flush_batch_bytes, 64 * 1024 * 1024);
-    assert_eq!(derived.transit_memory_budget_bytes, 300 * 1024 * 1024);
+    assert_eq!(derived.transit_memory_budget_bytes, 800 * 1024 * 1024);
 }
 
 #[test]
@@ -5130,11 +5130,11 @@ fn write_admission_pressure_samples_cached_store_pending_upload_bytes() {
 fn write_buffer_admission_paces_like_juicefs_memory_window() {
     assert_eq!(write_buffer_admission_delay_ms(300, 300), None);
     assert_eq!(
-        write_buffer_admission_delay_ms(300 * 1024 * 1024 + 1, 300 * 1024 * 1024),
+        write_buffer_admission_delay_ms(800 * 1024 * 1024 + 1, 800 * 1024 * 1024),
         Some(WRITE_ADMISSION_BUFFER_DELAY_MS)
     );
     assert_eq!(
-        write_buffer_admission_delay_ms(600 * 1024 * 1024 + 1, 300 * 1024 * 1024),
+        write_buffer_admission_delay_ms(1600 * 1024 * 1024 + 1, 800 * 1024 * 1024),
         Some(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS)
     );
 }
@@ -5187,7 +5187,7 @@ fn write_admission_waits_until_writer_stack_pressure_drops_below_hard_window() {
 
 #[test]
 fn sustained_write_window_decays_to_drain_chunk_for_long_streams() {
-    let base = 300 * 1024 * 1024;
+    let base = 800 * 1024 * 1024;
     let drain = 32 * 1024 * 1024;
     let mut state = SustainedWriteState::default();
 
@@ -5207,14 +5207,18 @@ fn sustained_write_window_decays_to_drain_chunk_for_long_streams() {
     assert_eq!(eighth.effective_buffer_bytes, base / 8);
     assert!(eighth.pre_drain);
 
-    let floor = state.observe(7_000, 16, 4, base, drain, base);
+    let sixteenth = state.observe(7_000, 16, 4, base, drain, base);
+    assert_eq!(sixteenth.effective_buffer_bytes, base / 16);
+    assert!(sixteenth.pre_drain);
+
+    let floor = state.observe(8_500, 20, 4, base, drain, base);
     assert_eq!(floor.effective_buffer_bytes, drain);
     assert!(floor.pre_drain);
 }
 
 #[test]
 fn sustained_write_window_resets_after_idle_or_seek() {
-    let base = 300 * 1024 * 1024;
+    let base = 800 * 1024 * 1024;
     let drain = 32 * 1024 * 1024;
     let mut state = SustainedWriteState::default();
 
@@ -8765,6 +8769,121 @@ fn test_file_session_read_lock_allows_parallel_readers() {
             .expect("parallel read lock acquisition should not block")
             .unwrap();
         drop(read_guard);
+    });
+}
+
+#[test]
+fn test_file_session_finalize_allows_parallel_readers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "file-session-finalize-read-parallel");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"session-finalize-read-parallel.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+
+        let finalize_guard = vfs
+            .state
+            .file_session
+            .enter_op(ino, FileSessionOperation::Finalize)
+            .await;
+        let vfs_clone = vfs.clone();
+        let reader = tokio::spawn(async move {
+            let _reader = vfs_clone
+                .state
+                .file_session
+                .enter_op(ino, FileSessionOperation::Read)
+                .await;
+        });
+
+        tokio::time::timeout(Duration::from_millis(150), reader)
+            .await
+            .expect("foreground reads must not wait for background upload finalization")
+            .unwrap();
+        drop(finalize_guard);
+    });
+}
+
+#[test]
+fn test_file_session_finalize_still_blocks_writers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "file-session-finalize-write-gate");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"session-finalize-write-gate.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+
+        let finalize_guard = vfs
+            .state
+            .file_session
+            .enter_op(ino, FileSessionOperation::Finalize)
+            .await;
+        let vfs_clone = vfs.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let mut writer = Box::pin(tokio::spawn(async move {
+            let _ = started_tx.send(());
+            let _writer = vfs_clone
+                .state
+                .file_session
+                .enter_op(ino, FileSessionOperation::Write)
+                .await;
+        }));
+
+        started_rx
+            .await
+            .expect("writer task should start before blocked-writer assertion");
+        tokio::time::timeout(Duration::from_millis(50), &mut writer)
+            .await
+            .expect_err("writes must still wait for background upload finalization");
+        drop(finalize_guard);
+        tokio::time::timeout(Duration::from_millis(150), writer)
+            .await
+            .expect("writer should pass after finalization finishes")
+            .unwrap();
+    });
+}
+
+#[test]
+fn test_file_session_finalize_serializes_other_finalizers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "file-session-finalize-finalize-gate");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"session-finalize-finalize-gate.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+
+        let finalize_guard = vfs
+            .state
+            .file_session
+            .enter_op(ino, FileSessionOperation::Finalize)
+            .await;
+        let vfs_clone = vfs.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let mut second_finalize = Box::pin(tokio::spawn(async move {
+            let _ = started_tx.send(());
+            let _finalize = vfs_clone
+                .state
+                .file_session
+                .enter_op(ino, FileSessionOperation::Finalize)
+                .await;
+        }));
+
+        started_rx
+            .await
+            .expect("second finalizer task should start before blocked-finalizer assertion");
+        tokio::time::timeout(Duration::from_millis(50), &mut second_finalize)
+            .await
+            .expect_err("background finalizers for one inode must serialize");
+        drop(finalize_guard);
+        tokio::time::timeout(Duration::from_millis(150), second_finalize)
+            .await
+            .expect("second finalizer should pass after first finalizer finishes")
+            .unwrap();
     });
 }
 
