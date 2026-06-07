@@ -984,6 +984,7 @@ mod tests {
             vfs_read_path: Default::default(),
             fuse_callbacks: Default::default(),
             fuse_async_write: Default::default(),
+            fuse_async_read: Default::default(),
             landing_zone: Default::default(),
             drain_lag: Default::default(),
             winfsp_foreground_flushes: Default::default(),
