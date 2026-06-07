@@ -77,10 +77,7 @@ pub fn run_with_executor(
     if request.iterations == 0 {
         bail!("macFUSE JuiceFS parity gate iterations must be greater than zero");
     }
-    if !matches!(
-        request.platform,
-        PlatformSelection::Auto | PlatformSelection::MacosFuse
-    ) {
+    if !platform_resolves_to_macos_fuse(request.platform) {
         bail!("macFUSE JuiceFS parity gate requires the macos-fuse platform");
     }
 
@@ -119,6 +116,14 @@ pub fn run_with_executor(
     Ok(MacfuseJuicefsParityGateOutcome { runs })
 }
 
+fn platform_resolves_to_macos_fuse(platform: PlatformSelection) -> bool {
+    match platform {
+        PlatformSelection::MacosFuse => true,
+        PlatformSelection::Auto => cfg!(target_os = "macos"),
+        PlatformSelection::LinuxFuse | PlatformSelection::WindowsWinfsp => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,6 +149,14 @@ mod tests {
             error
                 .to_string()
                 .contains("macFUSE JuiceFS parity gate requires the macos-fuse platform")
+        );
+    }
+
+    #[test]
+    fn parity_gate_auto_platform_only_resolves_on_macos() {
+        assert_eq!(
+            platform_resolves_to_macos_fuse(PlatformSelection::Auto),
+            cfg!(target_os = "macos")
         );
     }
 
