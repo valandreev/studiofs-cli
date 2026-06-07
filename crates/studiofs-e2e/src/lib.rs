@@ -5,6 +5,7 @@ pub mod cli;
 pub mod client;
 pub mod infra;
 pub mod mounted_tree;
+pub mod parity_gate;
 mod process_diagnostics;
 mod process_job;
 pub mod report;
