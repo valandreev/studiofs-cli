@@ -11,14 +11,12 @@ use std::os::raw::{c_char, c_double, c_int, c_uint, c_ulong, c_void};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::Arc;
 
 use libc::{off_t, size_t, stat, statvfs};
 use studiofs_vfs::KernelInvalidator;
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 const DEFAULT_FUSE_MAX_WRITE_BYTES: u32 = 16 * 1024 * 1024;
@@ -798,7 +796,7 @@ impl OpenReply {
 /// Owned low-level request token.
 pub struct Request {
     raw: Option<NonNull<raw::FuseReq>>,
-    interrupt_flag: Option<NonNull<Arc<AtomicBool>>>,
+    interrupt_token: Option<NonNull<CancellationToken>>,
 }
 
 // SAFETY: macFUSE low-level requests may be handed off to worker threads and
@@ -817,35 +815,34 @@ impl Request {
     pub unsafe fn from_raw(raw: *mut raw::FuseReq) -> Option<Self> {
         NonNull::new(raw).map(|raw| Self {
             raw: Some(raw),
-            interrupt_flag: None,
+            interrupt_token: None,
         })
     }
 
-    pub(crate) fn register_interrupt_flag(&mut self, flag: Arc<AtomicBool>) {
+    pub(crate) fn register_interrupt_token(&mut self, token: CancellationToken) {
         let Some(raw) = self.raw else {
             return;
         };
-        self.clear_interrupt_flag();
-        flag.store(false, Ordering::Release);
-        let flag = Box::new(flag);
-        let flag_ptr = NonNull::from(Box::leak(flag));
-        self.interrupt_flag = Some(flag_ptr);
-        // SAFETY: `raw` is a live low-level request and `flag_ptr` remains valid
-        // until `clear_interrupt_flag` unregisters the callback and drops it.
+        self.clear_interrupt_token();
+        let token = Box::new(token);
+        let token_ptr = NonNull::from(Box::leak(token));
+        self.interrupt_token = Some(token_ptr);
+        // SAFETY: `raw` is a live low-level request and `token_ptr` remains valid
+        // until `clear_interrupt_token` unregisters the callback and drops it.
         unsafe {
             raw::fuse_req_interrupt_func(
                 raw.as_ptr(),
                 Some(request_interrupted),
-                flag_ptr.as_ptr().cast(),
+                token_ptr.as_ptr().cast(),
             );
             if raw::fuse_req_interrupted(raw.as_ptr()) != 0 {
-                request_interrupted(raw.as_ptr(), flag_ptr.as_ptr().cast());
+                request_interrupted(raw.as_ptr(), token_ptr.as_ptr().cast());
             }
         }
     }
 
-    fn clear_interrupt_flag(&mut self) {
-        let Some(flag_ptr) = self.interrupt_flag.take() else {
+    fn clear_interrupt_token(&mut self) {
+        let Some(token_ptr) = self.interrupt_token.take() else {
             return;
         };
         if let Some(raw) = self.raw {
@@ -855,10 +852,10 @@ impl Request {
                 raw::fuse_req_interrupt_func(raw.as_ptr(), None, std::ptr::null_mut());
             }
         }
-        // SAFETY: `flag_ptr` came from `Box::leak` in `register_interrupt_flag`
+        // SAFETY: `token_ptr` came from `Box::leak` in `register_interrupt_token`
         // and is dropped exactly once here.
         unsafe {
-            drop(Box::from_raw(flag_ptr.as_ptr()));
+            drop(Box::from_raw(token_ptr.as_ptr()));
         }
     }
 
@@ -870,7 +867,7 @@ impl Request {
     }
 
     fn take_raw(&mut self) -> NonNull<raw::FuseReq> {
-        self.clear_interrupt_flag();
+        self.clear_interrupt_token();
         match self.raw.take() {
             Some(raw) => raw,
             None => unreachable!("type-state invariant: macFUSE request was already replied"),
@@ -880,7 +877,7 @@ impl Request {
 
 impl Drop for Request {
     fn drop(&mut self) {
-        self.clear_interrupt_flag();
+        self.clear_interrupt_token();
         if let Some(raw) = self.raw.take() {
             // SAFETY: `Request` owns a live, unreplied callback request by
             // construction. Dropping without a reply must fail the request so
@@ -891,13 +888,13 @@ impl Drop for Request {
 }
 
 unsafe extern "C" fn request_interrupted(_req: *mut raw::FuseReq, data: *mut c_void) {
-    let Some(flag_ptr) = NonNull::new(data.cast::<Arc<AtomicBool>>()) else {
+    let Some(token_ptr) = NonNull::new(data.cast::<CancellationToken>()) else {
         return;
     };
-    // SAFETY: `data` is registered from `register_interrupt_flag` and remains
+    // SAFETY: `data` is registered from `register_interrupt_token` and remains
     // valid until the callback is unregistered on the owning request.
     unsafe {
-        flag_ptr.as_ref().store(true, Ordering::Release);
+        token_ptr.as_ref().cancel();
     }
 }
 

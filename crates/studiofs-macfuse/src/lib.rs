@@ -717,10 +717,11 @@ mod tests {
             .queue_cancelable_read_for_test(attr.ino, reader.file_handle(), 0, 7)
             .expect("queue cancelable read");
         canceled.cancel();
-        drop(held_capacity);
         let errno = canceled
-            .wait()
+            .wait_timeout(std::time::Duration::from_secs(1))
+            .expect("canceled read should finish while admission capacity is still held")
             .expect_err("canceled read should finish without VFS work");
+        drop(held_capacity);
 
         assert_eq!(errno, libc::ECANCELED);
         let metrics = vfs.write_path_observability_snapshot();
