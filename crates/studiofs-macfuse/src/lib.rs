@@ -544,6 +544,10 @@ mod tests {
         assert_eq!(metrics.fuse_callbacks.read.bytes, 4);
         assert_eq!(metrics.fuse_callbacks.read.errors, 0);
         assert_eq!(metrics.vfs_read_path.calls, 1);
+        assert_eq!(
+            metrics.fuse_async_read.admission_waits, 0,
+            "uncontended async read admission should use the no-wait fast path"
+        );
     }
 
     #[test]
