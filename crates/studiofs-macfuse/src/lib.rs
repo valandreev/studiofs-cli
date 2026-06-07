@@ -965,6 +965,57 @@ mod tests {
     }
 
     #[test]
+    fn queued_sequential_large_reads_reuse_expanded_window() {
+        const MIB: usize = 1024 * 1024;
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-read-window-large-sequential",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"large-window.bin",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        let payload = vec![0x5A; 4 * MIB];
+        fixture
+            .runtime()
+            .block_on(vfs.write(attr.ino, 0, &payload))
+            .expect("seed payload");
+        vfs.reset_diagnostics_observability();
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let reader = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open reader through macFUSE adapter");
+
+        for chunk in 0..4 {
+            let read = adapter
+                .queue_read_for_test(
+                    attr.ino,
+                    reader.file_handle(),
+                    (chunk * MIB) as i64,
+                    MIB as u32,
+                )
+                .expect("queue sequential read");
+            let bytes = read.wait().expect("sequential read should complete");
+            assert_eq!(bytes.len(), MIB);
+            assert!(bytes.iter().all(|byte| *byte == 0x5A));
+        }
+
+        let metrics = vfs.write_path_observability_snapshot();
+        assert_eq!(metrics.fuse_callbacks.read.calls, 4);
+        assert_eq!(
+            metrics.vfs_read_path.calls, 1,
+            "expanded read window should smooth sequential playback by avoiding per-MiB VFS refills"
+        );
+    }
+
+    #[test]
     fn queued_non_adjacent_read_falls_back_to_vfs_instead_of_reusing_window() {
         let fixture =
             studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-read-window-random")
