@@ -121,6 +121,8 @@ struct UploadedObjectReconcile {
 
 const POST_PUT_STALE_RECONCILE_ATTEMPTS: usize = 16;
 const POST_PUT_STALE_RECONCILE_DELAY_MS: u64 = 5;
+const POST_PUT_VISIBILITY_ATTEMPTS: usize = 16;
+const POST_PUT_VISIBILITY_DELAY_MS: u64 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RemoteVisibility {
@@ -671,6 +673,28 @@ where
                 }
                 UploadPutOutcome::Failed(error) => return Err(error),
             }
+            match self
+                .wait_for_uploaded_fragments_visible(op, &fragment_keys, upload_cancel_token)
+                .await
+            {
+                RemoteVisibility::Visible => {}
+                RemoteVisibility::Cancelled => {
+                    return if self.cancel_upload_if_inode_deleted(op).await? {
+                        Ok(SingleUploadOutcome::CancelledDeleted)
+                    } else {
+                        Ok(SingleUploadOutcome::Shutdown)
+                    };
+                }
+                RemoteVisibility::NotVisible => {
+                    if self.cancel_upload_if_inode_deleted(op).await? {
+                        return Ok(SingleUploadOutcome::CancelledDeleted);
+                    }
+                    return Err(VfsError::Other(format!(
+                        "uploaded object {} fragments were not visible after remote put",
+                        op.object_id
+                    )));
+                }
+            }
         }
 
         if self.cancel_upload_if_inode_deleted(op).await? {
@@ -831,6 +855,38 @@ where
         }
 
         Ok(None)
+    }
+
+    async fn wait_for_uploaded_fragments_visible(
+        &self,
+        op: &PendingUpload,
+        fragment_keys: &[String],
+        upload_cancel_token: &CancellationToken,
+    ) -> RemoteVisibility {
+        for attempt in 0..POST_PUT_VISIBILITY_ATTEMPTS {
+            match self
+                .remote
+                .all_fragments_visible(op, fragment_keys, upload_cancel_token)
+                .await
+            {
+                RemoteVisibility::Visible => return RemoteVisibility::Visible,
+                RemoteVisibility::Cancelled => return RemoteVisibility::Cancelled,
+                RemoteVisibility::NotVisible => {}
+            }
+
+            if attempt + 1 == POST_PUT_VISIBILITY_ATTEMPTS {
+                break;
+            }
+
+            let shutdown_token = self.shutdown.shutdown_token();
+            tokio::select! {
+                _ = shutdown_token.cancelled() => return RemoteVisibility::Cancelled,
+                _ = upload_cancel_token.cancelled() => return RemoteVisibility::Cancelled,
+                _ = tokio::time::sleep(Duration::from_millis(POST_PUT_VISIBILITY_DELAY_MS)) => {}
+            }
+        }
+
+        RemoteVisibility::NotVisible
     }
 
     async fn cancel_upload_if_inode_deleted(&self, op: &PendingUpload) -> VfsResult<bool> {
@@ -2173,6 +2229,7 @@ mod tests {
     struct FakeRemote {
         adaptive_penalty_ms: u64,
         visibility: Arc<Mutex<RemoteVisibility>>,
+        visibility_after_upload: Arc<Mutex<Option<RemoteVisibility>>>,
         upload_result: Arc<Mutex<Option<UploadPutOutcome>>>,
         remove_overlay_after_upload: Arc<Mutex<Option<(FakeMeta, Ino, u64)>>>,
         advance_epoch_after_upload: Arc<Mutex<Option<(FakeMeta, Ino, u64)>>>,
@@ -2185,6 +2242,7 @@ mod tests {
             Self {
                 adaptive_penalty_ms: 0,
                 visibility: Arc::new(Mutex::new(RemoteVisibility::NotVisible)),
+                visibility_after_upload: Arc::new(Mutex::new(Some(RemoteVisibility::Visible))),
                 upload_result: Arc::new(Mutex::new(Some(UploadPutOutcome::Uploaded))),
                 remove_overlay_after_upload: Arc::new(Mutex::new(None)),
                 advance_epoch_after_upload: Arc::new(Mutex::new(None)),
@@ -2225,6 +2283,11 @@ mod tests {
                 .lock()
                 .take()
                 .unwrap_or(UploadPutOutcome::Uploaded);
+            if matches!(outcome, UploadPutOutcome::Uploaded)
+                && let Some(visibility) = self.visibility_after_upload.lock().take()
+            {
+                *self.visibility.lock() = visibility;
+            }
             if matches!(outcome, UploadPutOutcome::Uploaded)
                 && self
                     .cancel_token_after_upload
@@ -2727,6 +2790,39 @@ mod tests {
         assert_eq!(requeued[0].retry_count, 1);
         assert!(requeued[0].not_before_unix_ms >= before_retry.saturating_add(40));
         assert!(shutdown.released_tokens.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn process_upload_requeues_when_uploaded_fragments_are_not_visible() {
+        let (processor, coordinator, local_payloads, meta, remote, shutdown, policy) =
+            processor_fixture();
+        let op = make_pending_upload();
+        coordinator.pending_inodes.lock().insert(op.ino);
+        meta.attrs
+            .lock()
+            .insert(op.ino, Some(make_attr(op.ino, op.content_epoch)));
+        meta.overlay_objects
+            .lock()
+            .insert(op.ino, HashSet::from([op.object_id]));
+        *remote.visibility_after_upload.lock() = Some(RemoteVisibility::NotVisible);
+
+        let outcome = processor.process_upload(op.clone()).await;
+
+        assert_eq!(outcome, UploadOutcome::Requeued);
+        assert!(
+            meta.uploaded_overlay_objects.lock().is_empty(),
+            "metadata must not reference a remote payload before all fragments are visible"
+        );
+        assert!(coordinator.completed.lock().is_empty());
+        assert_eq!(coordinator.requeued.lock().len(), 1);
+        assert_eq!(coordinator.requeued.lock()[0].object_id, op.object_id);
+        assert_eq!(local_payloads.failed.lock().as_slice(), &[op.object_id]);
+        assert!(local_payloads.uploaded.lock().is_empty());
+        assert!(local_payloads.removed.lock().is_empty());
+        assert_eq!(shutdown.requeues.load(Ordering::Relaxed), 1);
+        assert_eq!(shutdown.canceled_stale_after_put.load(Ordering::Relaxed), 0);
+        assert_eq!(policy.sticky_errors.lock().len(), 1);
+        assert!(policy.finalized_upload_epochs.lock().is_empty());
     }
 
     #[tokio::test]
