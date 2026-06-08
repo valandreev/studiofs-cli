@@ -410,8 +410,10 @@ impl FileSessionState {
             && session.queued_ops.load(Ordering::Relaxed) == 0
             && session.active_shared_locks.load(Ordering::Relaxed) == 0
             && session.active_writer.lock().is_none()
-            // One strong ref is held by the map and one by this local check.
-            && Arc::strong_count(session) <= 2
+            // The map must hold the only strong ref. `gc_if_idle` runs while
+            // holding the session map lock, so no new `session()` caller can
+            // clone this entry between the count check and removal.
+            && Arc::strong_count(session) == 1
     }
 
     /// Removes an idle session entry when no handles remain.
@@ -525,10 +527,12 @@ impl FileSessionState {
         phase: &'static str,
     ) {
         self.counters.note_transition();
-        let Some(session) = self.live_session(ino) else {
-            return;
-        };
-        session.record_transition(op, phase);
+        {
+            let Some(session) = self.live_session(ino) else {
+                return;
+            };
+            session.record_transition(op, phase);
+        }
         if matches!(phase, "complete" | "published" | "recovered" | "skipped") {
             self.gc_if_idle(ino);
         }
@@ -588,5 +592,17 @@ mod tests {
         f3 |= OpenFlags::APPEND;
         assert!(f3.contains(OpenFlags::RDONLY));
         assert!(f3.contains(OpenFlags::APPEND));
+    }
+
+    #[test]
+    fn file_session_gc_keeps_session_with_external_reference() {
+        let sessions = FileSessionState::new();
+        let session = sessions.session(42);
+
+        assert!(!sessions.gc_if_idle(42));
+        assert!(Arc::ptr_eq(&sessions.session(42), &session));
+
+        drop(session);
+        assert!(sessions.gc_if_idle(42));
     }
 }

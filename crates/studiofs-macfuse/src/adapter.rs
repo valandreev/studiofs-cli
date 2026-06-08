@@ -76,7 +76,7 @@ pub(crate) struct StudioVfsAdapter {
     readdir_cache_last_pruned: Mutex<Option<Instant>>,
     readdir_cache_ready: Condvar,
     open_cache_snapshots: Arc<ParkingMutex<LruCache<u64, MacFuseOpenCacheSnapshot>>>,
-    file_flags: Mutex<HashMap<u64, u32>>,
+    file_flags: ParkingMutex<HashMap<u64, u32>>,
     read_admission: Arc<Semaphore>,
     read_queue_byte_limit: u32,
     read_buffers: Arc<ReadBufferPool>,
@@ -727,7 +727,7 @@ impl StudioVfsAdapter {
             open_cache_snapshots: Arc::new(ParkingMutex::new(LruCache::new(
                 open_cache_snapshot_capacity(),
             ))),
-            file_flags: Mutex::new(HashMap::new()),
+            file_flags: ParkingMutex::new(HashMap::new()),
             read_admission: Arc::new(Semaphore::new(read_queue_byte_limit as usize)),
             read_queue_byte_limit,
             read_buffers: Arc::new(ReadBufferPool::default()),
@@ -1037,6 +1037,7 @@ impl StudioVfsAdapter {
                     && attr.nlink == 0
                 {
                     self.clear_open_cache_snapshot(attr.ino, "unlink");
+                    self.clear_file_flags(attr.ino);
                 }
                 self.invalidate_readdir_cache(parent);
             })
@@ -1049,9 +1050,15 @@ impl StudioVfsAdapter {
         if self.read_only {
             return Err(libc::EROFS);
         }
+        let existing = self.vfs.lookup(parent, name).ok();
         self.vfs
             .rmdir(parent, name)
-            .inspect(|_| self.invalidate_readdir_cache(parent))
+            .inspect(|_| {
+                if let Some(attr) = &existing {
+                    self.clear_file_flags(attr.ino);
+                }
+                self.invalidate_readdir_cache(parent);
+            })
             .map_err(|error| vfs_err_to_errno(&error))
     }
 
@@ -1066,9 +1073,13 @@ impl StudioVfsAdapter {
         if self.read_only {
             return Err(libc::EROFS);
         }
+        let overwritten = self.vfs.lookup(newparent, newname).ok();
         self.vfs
             .rename(parent, name, newparent, newname)
             .inspect(|_| {
+                if let Some(attr) = &overwritten {
+                    self.clear_file_flags(attr.ino);
+                }
                 self.invalidate_readdir_cache(parent);
                 if newparent != parent {
                     self.invalidate_readdir_cache(newparent);
@@ -1685,7 +1696,7 @@ impl StudioVfsAdapter {
             self.mount_gid,
             MACFUSE_ATTR_BLOCK_SIZE,
         ));
-        if let Some(flags) = self.file_flags.lock().unwrap().get(&attr.ino).copied() {
+        if let Some(flags) = self.file_flags.lock().get(&attr.ino).copied() {
             assign_stat_flags(&mut stat, flags);
             if flags & MACOS_UF_HIDDEN != 0 {
                 assign_hidden_file_stat_times(&mut stat);
@@ -1698,15 +1709,23 @@ impl StudioVfsAdapter {
         if to_set == 0 || setattr_mask_has_flags(to_set) {
             self.file_flags
                 .lock()
-                .unwrap()
                 .insert(ino, callback_stat_flags(attr));
         }
     }
 
     fn remember_named_file_flags(&self, ino: u64, name: &[u8]) {
         if name == MACOS_DS_STORE_NAME {
-            self.file_flags.lock().unwrap().insert(ino, MACOS_UF_HIDDEN);
+            self.file_flags.lock().insert(ino, MACOS_UF_HIDDEN);
         }
+    }
+
+    fn clear_file_flags(&self, ino: u64) {
+        self.file_flags.lock().remove(&ino);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn file_flags_contains_for_test(&self, ino: u64) -> bool {
+        self.file_flags.lock().contains_key(&ino)
     }
 
     fn dir_entry_to_stat(&self, entry: &DirEntry) -> stat {
@@ -2072,8 +2091,13 @@ fn assign_hidden_file_stat_times(_out: &mut stat) {}
 
 #[cfg(target_os = "macos")]
 fn callback_stat_flags(attr: *const stat) -> u32 {
-    // SAFETY: The setattr callback already checked the pointer for null.
-    unsafe { (*attr).st_flags }
+    if attr.is_null() {
+        0
+    } else {
+        // SAFETY: The pointer was checked for null above and macFUSE owns it
+        // for the duration of the callback.
+        unsafe { (*attr).st_flags }
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -2784,7 +2808,7 @@ pub extern "C" fn studiofs_macfuse_setattr_x(
     }
     let flags = unsafe { (*attr).flags };
     if setattr_mask_has_flags(to_set) {
-        state.adapter.file_flags.lock().unwrap().insert(ino, flags);
+        state.adapter.file_flags.lock().insert(ino, flags);
     }
     let args = match setattr_x_args_from_callback(attr, to_set) {
         Ok(args) => args,

@@ -3,12 +3,20 @@ use super::{
     is_blocked_root_macos_metadata, is_ignored_macos_metadata, is_probable_trash_component,
 };
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
+
+const DETACHED_IGNORED_ENTRY_RETENTION: Duration = Duration::from_secs(30);
+#[cfg(not(test))]
+const MAX_DETACHED_IGNORED_ENTRIES: usize = 4096;
+#[cfg(test)]
+const MAX_DETACHED_IGNORED_ENTRIES: usize = 4;
 
 #[derive(Debug, Clone)]
 pub(super) struct IgnoredEntry {
     pub(super) attr: InodeAttr,
     pub(super) parent: Ino,
     pub(super) name: Vec<u8>,
+    detached_at: Option<Instant>,
 }
 
 #[derive(Debug, Default)]
@@ -24,6 +32,38 @@ fn remove_parent_child_link(registry: &mut IgnoredEntryRegistry, parent: Ino, ch
         if children.is_empty() {
             registry.children_by_parent.remove(&parent);
         }
+    }
+}
+
+fn prune_detached_entries(registry: &mut IgnoredEntryRegistry) {
+    let now = Instant::now();
+    let mut detached: Vec<(Ino, Instant)> = registry
+        .by_ino
+        .iter()
+        .filter_map(|(ino, ignored)| ignored.detached_at.map(|detached_at| (*ino, detached_at)))
+        .collect();
+
+    let mut to_remove: HashSet<Ino> = detached
+        .iter()
+        .filter_map(|(ino, detached_at)| {
+            (now.duration_since(*detached_at) >= DETACHED_IGNORED_ENTRY_RETENTION).then_some(*ino)
+        })
+        .collect();
+
+    if detached.len() > MAX_DETACHED_IGNORED_ENTRIES {
+        detached.sort_by_key(|(_, detached_at)| *detached_at);
+        let overflow = detached.len() - MAX_DETACHED_IGNORED_ENTRIES;
+        to_remove.extend(
+            detached
+                .into_iter()
+                .take(overflow)
+                .map(|(ino, _detached_at)| ino),
+        );
+    }
+
+    for ino in to_remove {
+        registry.by_ino.remove(&ino);
+        registry.children_by_parent.remove(&ino);
     }
 }
 
@@ -70,6 +110,7 @@ impl StudioVfs {
         kind: FileType,
     ) -> InodeAttr {
         let mut registry = self.state.metrics.ignored_entries.lock();
+        prune_detached_entries(&mut registry);
         let key = (parent, name.to_vec());
         if let Some(ino) = registry.by_name.get(&key).copied()
             && let Some(existing) = registry.by_ino.get(&ino)
@@ -91,6 +132,7 @@ impl StudioVfs {
             attr: attr.clone(),
             parent,
             name: key.1.clone(),
+            detached_at: None,
         };
         registry.by_name.insert(key, ino);
         registry
@@ -179,6 +221,10 @@ impl StudioVfs {
         };
         registry.by_name.remove(&(ignored.parent, ignored.name));
         remove_parent_child_link(&mut registry, ignored.parent, ino);
+        if let Some(ignored) = registry.by_ino.get_mut(&ino) {
+            ignored.detached_at = Some(Instant::now());
+        }
+        prune_detached_entries(&mut registry);
         true
     }
 
@@ -444,5 +490,38 @@ mod tests {
         assert!(vfs.ignored_entry(user.ino).is_none());
         assert!(vfs.ignored_entry(nested.ino).is_none());
         assert!(vfs.ignored_entry(file.ino).is_none());
+    }
+
+    #[test]
+    fn detached_ignored_entries_keep_inode_temporarily_but_prune_overflow() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "ignored-detached-overflow");
+        let first = vfs.create_ignored_entry(
+            ROOT_INO,
+            b"._first",
+            1000,
+            1000,
+            0o644,
+            FileType::RegularFile,
+        );
+
+        assert!(vfs.detach_ignored_entry_name(first.ino));
+        assert!(vfs.lookup(ROOT_INO, b"._first").is_err());
+        assert!(vfs.ignored_entry_attr(first.ino).is_some());
+
+        for index in 0..MAX_DETACHED_IGNORED_ENTRIES {
+            let name = format!("._overflow-{index}");
+            let attr = vfs.create_ignored_entry(
+                ROOT_INO,
+                name.as_bytes(),
+                1000,
+                1000,
+                0o644,
+                FileType::RegularFile,
+            );
+            assert!(vfs.detach_ignored_entry_name(attr.ino));
+        }
+
+        assert!(vfs.ignored_entry_attr(first.ino).is_none());
     }
 }
