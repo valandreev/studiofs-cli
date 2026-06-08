@@ -411,10 +411,12 @@ impl FileSessionState {
     }
 
     /// Removes an idle session entry when no handles remain.
-    pub(super) fn gc_if_idle(&self, ino: Ino) {
+    pub(super) fn gc_if_idle(&self, ino: Ino) -> bool {
         let mut sessions = self.sessions.lock();
         if sessions.get(&ino).and_then(Weak::upgrade).is_none() {
-            sessions.remove(&ino);
+            if sessions.remove(&ino).is_none() {
+                return false;
+            }
             self.counters
                 .active_sessions
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
@@ -422,7 +424,9 @@ impl FileSessionState {
                 })
                 .ok();
             debug!(ino, "file session gc removed idle session");
+            return true;
         }
+        false
     }
 
     /// Enters the operation gate for `ino` and returns a session permit.

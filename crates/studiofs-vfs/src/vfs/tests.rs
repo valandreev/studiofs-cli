@@ -9272,6 +9272,31 @@ fn test_file_session_gc_removes_idle_read_only_session() {
 }
 
 #[test]
+fn test_file_session_gc_reports_only_real_removals() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "file-session-gc-idempotent");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"session-gc-idempotent.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+
+        let pin = vfs.state.file_session.session(ino);
+        drop(pin);
+
+        assert!(
+            vfs.state.file_session.gc_if_idle(ino),
+            "first idle gc should remove the expired session entry"
+        );
+        assert!(
+            !vfs.state.file_session.gc_if_idle(ino),
+            "second idle gc should not report a removal after the entry is gone"
+        );
+    });
+}
+
+#[test]
 fn test_validate_name_valid() {
     assert!(validate_name(b"hello.txt").is_ok());
     assert!(validate_name(b"a").is_ok());
