@@ -28,7 +28,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 #[cfg(test)]
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::low_level::{DirectoryEntryBuffer, Entry, OpenReply, Reply, Request, raw};
 
@@ -1201,6 +1201,7 @@ impl StudioVfsAdapter {
                 AsyncReadTaskGuard::new(admission_bytes, diagnostics, Arc::clone(&state.vfs));
             if cancellation.is_cancelled() {
                 read_guard.finish_with(AsyncReadOutcome::Canceled);
+                log_callback_error("read", MACFUSE_READ_INTERRUPTED_ERRNO);
                 let _ = Reply::new(request).error(MACFUSE_READ_INTERRUPTED_ERRNO);
                 return;
             }
@@ -1220,6 +1221,16 @@ impl StudioVfsAdapter {
                         AsyncReadOutcome::Failed
                     };
                     read_guard.finish_with(outcome);
+                    if callback_error_log_level("read", errno).is_some() {
+                        warn!(
+                            ino,
+                            file_handle,
+                            offset,
+                            size,
+                            errno,
+                            "macFUSE read admission returned error"
+                        );
+                    }
                     let _ = Reply::new(request).error(errno);
                     return;
                 }
@@ -1251,6 +1262,16 @@ impl StudioVfsAdapter {
                         AsyncReadOutcome::Failed
                     };
                     read_guard.finish_with(outcome);
+                    if callback_error_log_level("read", errno).is_some() {
+                        warn!(
+                            ino,
+                            file_handle,
+                            offset,
+                            size,
+                            errno,
+                            "macFUSE read callback returned error"
+                        );
+                    }
                     let _ = Reply::new(request).error(errno);
                 }
             }
@@ -1847,6 +1868,38 @@ fn reply_error(req: *mut raw::FuseReq, errno: i32) {
     }
 }
 
+fn reply_callback_error(req: *mut raw::FuseReq, operation: &'static str, errno: i32) {
+    log_callback_error(operation, errno);
+    reply_error(req, errno);
+}
+
+fn log_callback_error(operation: &'static str, errno: i32) {
+    match callback_error_log_level(operation, errno) {
+        Some(CallbackErrorLogLevel::Warn) => {
+            warn!(operation, errno, "macFUSE callback returned error");
+        }
+        None => {}
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CallbackErrorLogLevel {
+    Warn,
+}
+
+fn callback_error_log_level(operation: &'static str, errno: i32) -> Option<CallbackErrorLogLevel> {
+    if errno == 0 {
+        return None;
+    }
+    if operation == "getxattr" && errno == xattr_not_found_errno() {
+        return None;
+    }
+    if operation == "read" && errno == MACFUSE_READ_INTERRUPTED_ERRNO {
+        return None;
+    }
+    Some(CallbackErrorLogLevel::Warn)
+}
+
 fn owned_request(req: *mut raw::FuseReq) -> Option<Request> {
     // SAFETY: Each low-level callback receives a live unreplied request pointer.
     unsafe { Request::from_raw(req) }
@@ -2021,7 +2074,15 @@ pub extern "C" fn studiofs_macfuse_lookup(
                 let _ = Reply::new(request).entry(&entry);
             }
         }
-        Err(errno) => reply_error(req, errno),
+        Err(errno) => {
+            warn!(
+                parent,
+                name = %String::from_utf8_lossy(name),
+                errno,
+                "macFUSE lookup callback returned error"
+            );
+            reply_error(req, errno);
+        }
     }
 }
 
@@ -2042,7 +2103,10 @@ pub extern "C" fn studiofs_macfuse_getattr(
                 let _ = Reply::new(request).attr(&attr, TTL_SECONDS);
             }
         }
-        Err(errno) => reply_error(req, errno),
+        Err(errno) => {
+            warn!(ino, errno, "macFUSE getattr callback returned error");
+            reply_error(req, errno);
+        }
     }
 }
 
@@ -2072,7 +2136,15 @@ pub extern "C" fn studiofs_macfuse_mkdir(
                 let _ = Reply::new(request).entry(&entry);
             }
         }
-        Err(errno) => reply_error(req, errno),
+        Err(errno) => {
+            warn!(
+                parent,
+                name = %String::from_utf8_lossy(name),
+                errno,
+                "macFUSE mkdir callback returned error"
+            );
+            reply_error(req, errno);
+        }
     }
 }
 
@@ -2104,7 +2176,16 @@ pub extern "C" fn studiofs_macfuse_symlink(
                 let _ = Reply::new(request).entry(&entry);
             }
         }
-        Err(errno) => reply_error(req, errno),
+        Err(errno) => {
+            warn!(
+                parent,
+                name = %String::from_utf8_lossy(name),
+                target = %String::from_utf8_lossy(target),
+                errno,
+                "macFUSE symlink callback returned error"
+            );
+            reply_error(req, errno);
+        }
     }
 }
 
@@ -2137,7 +2218,17 @@ pub extern "C" fn studiofs_macfuse_create(
                 let _ = Reply::new(request).create(&entry, open);
             }
         }
-        Err(errno) => reply_error(req, errno),
+        Err(errno) => {
+            warn!(
+                parent,
+                name = %String::from_utf8_lossy(name),
+                mode,
+                flags,
+                errno,
+                "macFUSE create callback returned error"
+            );
+            reply_error(req, errno);
+        }
     }
 }
 
@@ -2160,7 +2251,15 @@ pub extern "C" fn studiofs_macfuse_unlink(
     let name = unsafe { CStr::from_ptr(name) }.to_bytes();
     match state.adapter.unlink(parent, name) {
         Ok(()) => reply_error(req, 0),
-        Err(errno) => reply_error(req, errno),
+        Err(errno) => {
+            warn!(
+                parent,
+                name = %String::from_utf8_lossy(name),
+                errno,
+                "macFUSE unlink callback returned error"
+            );
+            reply_error(req, errno);
+        }
     }
 }
 
@@ -2183,7 +2282,15 @@ pub extern "C" fn studiofs_macfuse_rmdir(
     let name = unsafe { CStr::from_ptr(name) }.to_bytes();
     match state.adapter.rmdir(parent, name) {
         Ok(()) => reply_error(req, 0),
-        Err(errno) => reply_error(req, errno),
+        Err(errno) => {
+            warn!(
+                parent,
+                name = %String::from_utf8_lossy(name),
+                errno,
+                "macFUSE rmdir callback returned error"
+            );
+            reply_error(req, errno);
+        }
     }
 }
 
@@ -2210,7 +2317,17 @@ pub extern "C" fn studiofs_macfuse_rename(
     let newname = unsafe { CStr::from_ptr(newname) }.to_bytes();
     match state.adapter.rename(parent, name, newparent, newname) {
         Ok(()) => reply_error(req, 0),
-        Err(errno) => reply_error(req, errno),
+        Err(errno) => {
+            warn!(
+                parent,
+                name = %String::from_utf8_lossy(name),
+                newparent,
+                newname = %String::from_utf8_lossy(newname),
+                errno,
+                "macFUSE rename callback returned error"
+            );
+            reply_error(req, errno);
+        }
     }
 }
 
@@ -2237,7 +2354,10 @@ pub extern "C" fn studiofs_macfuse_open(
                 let _ = Reply::new(request).open(open);
             }
         }
-        Err(errno) => reply_error(req, errno),
+        Err(errno) => {
+            warn!(ino, flags, errno, "macFUSE open callback returned error");
+            reply_error(req, errno);
+        }
     }
 }
 
@@ -2319,7 +2439,17 @@ pub extern "C" fn studiofs_macfuse_write(
                 let _ = Reply::new(request).write_count(count as usize);
             }
         }
-        Err(errno) => reply_error(req, errno),
+        Err(errno) => {
+            warn!(
+                ino,
+                file_handle,
+                offset = off,
+                size,
+                errno,
+                "macFUSE write callback returned error"
+            );
+            reply_error(req, errno);
+        }
     }
 }
 
@@ -2342,7 +2472,13 @@ pub extern "C" fn studiofs_macfuse_flush(
     let file_handle = unsafe { (*fi).fh };
     match state.adapter.flush(ino, file_handle) {
         Ok(()) => reply_error(req, 0),
-        Err(errno) => reply_error(req, errno),
+        Err(errno) => {
+            warn!(
+                ino,
+                file_handle, errno, "macFUSE flush callback returned error"
+            );
+            reply_error(req, errno);
+        }
     }
 }
 
@@ -2366,7 +2502,16 @@ pub extern "C" fn studiofs_macfuse_fsync(
     };
     match state.adapter.fsync(file_handle, ino, datasync != 0) {
         Ok(()) => reply_error(req, 0),
-        Err(errno) => reply_error(req, errno),
+        Err(errno) => {
+            warn!(
+                ino,
+                file_handle,
+                datasync = datasync != 0,
+                errno,
+                "macFUSE fsync callback returned error"
+            );
+            reply_error(req, errno);
+        }
     }
 }
 
@@ -2390,11 +2535,21 @@ pub extern "C" fn studiofs_macfuse_setattr(
     let args = match setattr_args_from_callback(attr, to_set) {
         Ok(args) => args,
         Err(errno) => {
+            warn!(
+                ino,
+                to_set, errno, "macFUSE setattr callback rejected arguments"
+            );
             reply_error(req, errno);
             return;
         }
     };
     if setattr_args_are_empty(&args) {
+        warn!(
+            ino,
+            to_set,
+            errno = libc::ENOTSUP,
+            "macFUSE setattr callback received no supported attributes"
+        );
         reply_error(req, libc::ENOTSUP);
         return;
     }
@@ -2412,7 +2567,13 @@ pub extern "C" fn studiofs_macfuse_setattr(
                 let _ = Reply::new(request).attr(&stat, TTL_SECONDS);
             }
         }
-        Err(errno) => reply_error(req, errno),
+        Err(errno) => {
+            warn!(
+                ino,
+                file_handle, to_set, errno, "macFUSE setattr callback returned error"
+            );
+            reply_error(req, errno);
+        }
     }
 }
 
@@ -2572,7 +2733,13 @@ pub extern "C" fn studiofs_macfuse_release(
     let file_handle = unsafe { (*fi).fh };
     match state.adapter.release(ino, file_handle) {
         Ok(()) => reply_error(req, 0),
-        Err(errno) => reply_error(req, errno),
+        Err(errno) => {
+            warn!(
+                ino,
+                file_handle, errno, "macFUSE release callback returned error"
+            );
+            reply_error(req, errno);
+        }
     }
 }
 
@@ -2597,6 +2764,7 @@ pub extern "C" fn studiofs_macfuse_readdir(
             let _ = Reply::new(request).directory_entries(&entries);
         }
         Err(errno) => {
+            log_callback_error("readdir", errno);
             let _ = Reply::new(request).error(errno);
         }
     }
@@ -2618,7 +2786,7 @@ pub extern "C" fn studiofs_macfuse_readlink(req: *mut raw::FuseReq, ino: raw::Fu
             }
             Err(_) => reply_error(req, libc::EINVAL),
         },
-        Err(errno) => reply_error(req, errno),
+        Err(errno) => reply_callback_error(req, "readlink", errno),
     }
 }
 
@@ -2635,7 +2803,7 @@ pub extern "C" fn studiofs_macfuse_statfs(req: *mut raw::FuseReq, _ino: raw::Fus
                 let _ = Reply::new(request).statfs(&stats);
             }
         }
-        Err(errno) => reply_error(req, errno),
+        Err(errno) => reply_callback_error(req, "statfs", errno),
     }
 }
 
@@ -2677,7 +2845,7 @@ pub extern "C" fn studiofs_macfuse_setxattr(
     };
     match state.adapter.set_xattr(ino, name, value, flags) {
         Ok(()) => reply_error(req, 0),
-        Err(errno) => reply_error(req, errno),
+        Err(errno) => reply_callback_error(req, "setxattr", errno),
     }
 }
 
@@ -2705,8 +2873,8 @@ pub extern "C" fn studiofs_macfuse_getxattr(
             Ok(Some(value_size)) => {
                 reply_xattr_size(req, xattr_size_from_position(value_size, position))
             }
-            Ok(None) => reply_error(req, xattr_not_found_errno()),
-            Err(errno) => reply_error(req, errno),
+            Ok(None) => reply_callback_error(req, "getxattr", xattr_not_found_errno()),
+            Err(errno) => reply_callback_error(req, "getxattr", errno),
         }
         return;
     }
@@ -2714,8 +2882,8 @@ pub extern "C" fn studiofs_macfuse_getxattr(
         Ok(Some(value)) => {
             reply_xattr_value(req, size, xattr_value_from_position(&value, position))
         }
-        Ok(None) => reply_error(req, xattr_not_found_errno()),
-        Err(errno) => reply_error(req, errno),
+        Ok(None) => reply_callback_error(req, "getxattr", xattr_not_found_errno()),
+        Err(errno) => reply_callback_error(req, "getxattr", errno),
     }
 }
 
@@ -2733,7 +2901,7 @@ pub extern "C" fn studiofs_macfuse_listxattr(
     match state.adapter.list_xattrs(ino) {
         Ok(names) if size == 0 => reply_xattr_size(req, xattr_name_list_len(&names)),
         Ok(names) => reply_xattr_value(req, size, &format_xattr_name_list(&names)),
-        Err(errno) => reply_error(req, errno),
+        Err(errno) => reply_callback_error(req, "listxattr", errno),
     }
 }
 
@@ -2755,7 +2923,7 @@ pub extern "C" fn studiofs_macfuse_removexattr(
     };
     match state.adapter.remove_xattr(ino, name) {
         Ok(()) => reply_error(req, 0),
-        Err(errno) => reply_error(req, errno),
+        Err(errno) => reply_callback_error(req, "removexattr", errno),
     }
 }
 
@@ -2972,6 +3140,35 @@ mod tests {
         };
 
         assert!(!setattr_mask_has_unknown(mask));
+    }
+
+    #[test]
+    fn callback_error_log_level_ignores_success_and_expected_xattr_misses() {
+        assert_eq!(callback_error_log_level("write", 0), None);
+        assert_eq!(
+            callback_error_log_level("getxattr", xattr_not_found_errno()),
+            None
+        );
+        assert_eq!(
+            callback_error_log_level("read", MACFUSE_READ_INTERRUPTED_ERRNO),
+            None
+        );
+    }
+
+    #[test]
+    fn callback_error_log_level_warns_for_write_and_metadata_errors() {
+        assert_eq!(
+            callback_error_log_level("write", libc::ENOENT),
+            Some(CallbackErrorLogLevel::Warn)
+        );
+        assert_eq!(
+            callback_error_log_level("lookup", libc::ENOENT),
+            Some(CallbackErrorLogLevel::Warn)
+        );
+        assert_eq!(
+            callback_error_log_level("getxattr", libc::EIO),
+            Some(CallbackErrorLogLevel::Warn)
+        );
     }
 
     #[test]
