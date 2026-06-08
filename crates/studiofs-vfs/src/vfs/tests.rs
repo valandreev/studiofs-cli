@@ -9222,6 +9222,35 @@ fn test_file_session_open_handle_stats_track_release_lifecycle() {
 }
 
 #[test]
+fn test_file_session_gc_keeps_session_while_handle_is_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "file-session-open-handle-gc");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"session-open-handle-gc.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+
+        assert!(
+            !vfs.state.file_session.gc_if_idle(ino),
+            "gc must not collect a file session while a handle is open"
+        );
+        assert!(
+            vfs.state.file_session.debug_snapshot(ino).is_some(),
+            "open handles must keep their file session observable"
+        );
+
+        vfs.release_fh(fh).await.unwrap();
+        assert!(
+            vfs.state.file_session.debug_snapshot(ino).is_none(),
+            "last-handle release should collect the now-idle file session"
+        );
+    });
+}
+
+#[test]
 fn test_file_session_background_complete_gc_removes_idle_session() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "file-session-background-gc");
