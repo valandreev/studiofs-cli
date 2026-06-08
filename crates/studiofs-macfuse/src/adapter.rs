@@ -1948,7 +1948,10 @@ fn callback_error_log_level(operation: &'static str, errno: i32) -> Option<Callb
     if operation == "lookup" && errno == libc::ENOENT {
         return None;
     }
-    if operation == "removexattr" && errno == libc::ENOENT {
+    if operation == "getattr" && errno == libc::ENOENT {
+        return None;
+    }
+    if operation == "removexattr" && (errno == libc::ENOENT || errno == xattr_not_found_errno()) {
         return None;
     }
     if operation == "read" && errno == MACFUSE_READ_INTERRUPTED_ERRNO {
@@ -3526,6 +3529,11 @@ mod tests {
         );
         assert_eq!(callback_error_log_level("lookup", libc::ENOENT), None);
         assert_eq!(callback_error_log_level("removexattr", libc::ENOENT), None);
+        assert_eq!(
+            callback_error_log_level("removexattr", xattr_not_found_errno()),
+            None
+        );
+        assert_eq!(callback_error_log_level("getattr", libc::ENOENT), None);
         assert_eq!(
             callback_error_log_level("read", MACFUSE_READ_INTERRUPTED_ERRNO),
             None
