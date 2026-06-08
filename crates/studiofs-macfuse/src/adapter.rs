@@ -1658,7 +1658,7 @@ impl StudioVfsAdapter {
         let flags = macfuse_set_xattr_flags(name, flags);
         self.vfs
             .set_xattr(ino, name, value, flags)
-            .map_err(|error| vfs_err_to_errno(&error))
+            .map_err(|error| xattr_mutation_err_to_errno(&error))
     }
 
     /// Remove a native extended attribute value.
@@ -1668,7 +1668,7 @@ impl StudioVfsAdapter {
         }
         self.vfs
             .remove_xattr(ino, name)
-            .map_err(|error| vfs_err_to_errno(&error))
+            .map_err(|error| xattr_mutation_err_to_errno(&error))
     }
 
     /// List native extended attribute names.
@@ -3321,6 +3321,21 @@ fn xattr_not_found_errno() -> i32 {
     libc::ENOATTR
 }
 
+fn is_missing_xattr_error(err: &studiofs_vfs::VfsError) -> bool {
+    matches!(
+        err,
+        studiofs_vfs::VfsError::Meta(studiofs_meta::MetaError::EntryNotFound { .. })
+    )
+}
+
+fn xattr_mutation_err_to_errno(err: &studiofs_vfs::VfsError) -> i32 {
+    if is_missing_xattr_error(err) {
+        xattr_not_found_errno()
+    } else {
+        vfs_err_to_errno(err)
+    }
+}
+
 fn macfuse_set_xattr_flags(name: &[u8], flags: u32) -> u32 {
     if name == MACOS_PROVENANCE_XATTR {
         flags & !XATTR_CREATE_FLAG
@@ -3545,6 +3560,23 @@ mod tests {
             macfuse_set_xattr_flags(b"com.apple.FinderInfo", flags),
             flags
         );
+    }
+
+    #[test]
+    fn missing_xattr_mutation_maps_to_macos_xattr_not_found_errno() {
+        let error = studiofs_vfs::VfsError::Meta(studiofs_meta::MetaError::EntryNotFound {
+            parent: 42,
+            name: "com.apple.FinderInfo".into(),
+        });
+
+        assert_eq!(xattr_mutation_err_to_errno(&error), xattr_not_found_errno());
+    }
+
+    #[test]
+    fn non_xattr_not_found_still_maps_to_no_entry() {
+        let error = studiofs_vfs::VfsError::Meta(studiofs_meta::MetaError::InodeNotFound(42));
+
+        assert_eq!(xattr_mutation_err_to_errno(&error), libc::ENOENT);
     }
 
     #[test]

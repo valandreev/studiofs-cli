@@ -296,6 +296,7 @@ mod tests {
     };
 
     use studiofs_meta::MetaFsOps;
+    use studiofs_meta::engine::XATTR_REPLACE_FLAG;
 
     #[test]
     fn callback_file_info_snapshot_is_independent_from_callback_pointer() {
@@ -1888,6 +1889,63 @@ mod tests {
                 .expect("get removed resource fork through macFUSE adapter"),
             None
         );
+    }
+
+    #[test]
+    fn adapter_maps_missing_xattr_replace_to_macos_no_attribute_errno() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-adapter-missing-xattr-replace",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"replace-missing-xattr.txt",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+
+        let error = adapter
+            .set_xattr(
+                attr.ino,
+                b"com.apple.FinderInfo",
+                b"finder-info",
+                XATTR_REPLACE_FLAG,
+            )
+            .expect_err("replace missing xattr should fail");
+
+        assert_eq!(error, libc::ENOATTR);
+    }
+
+    #[test]
+    fn adapter_maps_missing_xattr_remove_to_macos_no_attribute_errno() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-adapter-missing-xattr-remove",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"remove-missing-xattr.txt",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+
+        let error = adapter
+            .remove_xattr(attr.ino, b"com.apple.FinderInfo")
+            .expect_err("remove missing xattr should fail");
+
+        assert_eq!(error, libc::ENOATTR);
     }
 
     #[test]
