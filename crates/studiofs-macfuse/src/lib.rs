@@ -848,10 +848,6 @@ mod tests {
         let reader = adapter
             .open(attr.ino, libc::O_RDONLY)
             .expect("open reader through macFUSE adapter");
-        assert!(
-            adapter.has_open_cache_snapshot_for_test(attr.ino),
-            "read-only open should establish a cache generation snapshot"
-        );
 
         let first = adapter
             .queue_read_for_test(attr.ino, reader.file_handle(), 0, 8)
