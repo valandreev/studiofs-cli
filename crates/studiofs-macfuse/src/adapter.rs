@@ -2140,6 +2140,13 @@ pub extern "C" fn studiofs_macfuse_mkdir(
     let name = unsafe { CStr::from_ptr(name) }.to_bytes();
     match state.adapter.mkdir(parent, name, mode) {
         Ok(attr) => {
+            debug!(
+                parent,
+                name = %String::from_utf8_lossy(name),
+                ino = attr.ino,
+                mode,
+                "macFUSE mkdir callback created entry"
+            );
             let stat = state.adapter.attr_to_stat(&attr);
             if let Some(request) = owned_request(req) {
                 let entry = Entry::new(attr.ino, 0, stat, TTL_SECONDS, TTL_SECONDS);
@@ -2180,6 +2187,13 @@ pub extern "C" fn studiofs_macfuse_symlink(
     let name = unsafe { CStr::from_ptr(name) }.to_bytes();
     match state.adapter.symlink(parent, name, target) {
         Ok(attr) => {
+            debug!(
+                parent,
+                name = %String::from_utf8_lossy(name),
+                target = %String::from_utf8_lossy(target),
+                ino = attr.ino,
+                "macFUSE symlink callback created entry"
+            );
             let stat = state.adapter.attr_to_stat(&attr);
             if let Some(request) = owned_request(req) {
                 let entry = Entry::new(attr.ino, 0, stat, TTL_SECONDS, TTL_SECONDS);
@@ -2222,6 +2236,15 @@ pub extern "C" fn studiofs_macfuse_create(
     let flags = unsafe { (*fi).flags };
     match state.adapter.create(parent, name, mode, flags) {
         Ok((attr, open)) => {
+            debug!(
+                parent,
+                name = %String::from_utf8_lossy(name),
+                ino = attr.ino,
+                mode,
+                flags,
+                file_handle = open.file_handle(),
+                "macFUSE create callback created entry"
+            );
             let stat = state.adapter.attr_to_stat(&attr);
             if let Some(request) = owned_request(req) {
                 let entry = Entry::new(attr.ino, 0, stat, TTL_SECONDS, TTL_SECONDS);

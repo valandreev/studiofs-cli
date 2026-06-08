@@ -9297,6 +9297,36 @@ fn test_file_session_gc_reports_only_real_removals() {
 }
 
 #[test]
+fn test_file_session_background_transition_does_not_recreate_collected_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "file-session-background-transition-gc");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"session-background-transition-gc.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+
+        let pin = vfs.state.file_session.session(ino);
+        drop(pin);
+
+        assert!(
+            vfs.state.file_session.gc_if_idle(ino),
+            "setup should remove the expired session entry"
+        );
+        vfs.state.file_session.note_background_transition(
+            ino,
+            FileSessionOperation::Upload,
+            "uploaded",
+        );
+        assert!(
+            !vfs.state.file_session.gc_if_idle(ino),
+            "background transition should not recreate a collected idle session"
+        );
+    });
+}
+
+#[test]
 fn test_validate_name_valid() {
     assert!(validate_name(b"hello.txt").is_ok());
     assert!(validate_name(b"a").is_ok());

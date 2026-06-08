@@ -410,6 +410,22 @@ impl FileSessionState {
         session
     }
 
+    fn live_session(&self, ino: Ino) -> Option<Arc<FileSessionEntry>> {
+        let mut sessions = self.sessions.lock();
+        if let Some(existing) = sessions.get(&ino).and_then(Weak::upgrade) {
+            return Some(existing);
+        }
+        if sessions.remove(&ino).is_some() {
+            self.counters
+                .active_sessions
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(1))
+                })
+                .ok();
+        }
+        None
+    }
+
     /// Removes an idle session entry when no handles remain.
     pub(super) fn gc_if_idle(&self, ino: Ino) -> bool {
         let mut sessions = self.sessions.lock();
@@ -520,7 +536,10 @@ impl FileSessionState {
         phase: &'static str,
     ) {
         self.counters.note_transition();
-        self.session(ino).record_transition(op, phase);
+        let Some(session) = self.live_session(ino) else {
+            return;
+        };
+        session.record_transition(op, phase);
         if matches!(phase, "complete" | "published" | "recovered" | "skipped") {
             self.gc_if_idle(ino);
         }
