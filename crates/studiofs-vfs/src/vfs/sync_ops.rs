@@ -642,11 +642,13 @@ impl StudioVfs {
         context: &HandleReleaseContext,
     ) -> LastHandleReleaseAction {
         let ino = context.ino;
-        let is_ignored_entry = self.ignored_entry_attr(ino).is_some();
+        let ignored_entry_attr = self.ignored_entry_attr(ino);
         let is_orphan = self.handle_table.take_orphan(ino);
-        if is_ignored_entry {
+        if let Some(attr) = ignored_entry_attr {
             if is_orphan {
                 self.release_ignored_entry(ino);
+            } else if attr.kind == FileType::RegularFile {
+                self.detach_ignored_entry_name(ino);
             }
             return LastHandleReleaseAction::IgnoredEntry;
         }

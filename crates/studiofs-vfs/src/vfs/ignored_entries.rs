@@ -172,6 +172,16 @@ impl StudioVfs {
         true
     }
 
+    pub(super) fn detach_ignored_entry_name(&self, ino: Ino) -> bool {
+        let mut registry = self.state.metrics.ignored_entries.lock();
+        let Some(ignored) = registry.by_ino.get(&ino).cloned() else {
+            return false;
+        };
+        registry.by_name.remove(&(ignored.parent, ignored.name));
+        remove_parent_child_link(&mut registry, ignored.parent, ino);
+        true
+    }
+
     pub(super) fn ignored_entry_not_found(parent: Ino, name: &[u8]) -> VfsError {
         VfsError::Meta(MetaError::EntryNotFound {
             parent,
