@@ -381,14 +381,6 @@ impl<'a> LocalDirtyFlushSession<'a> {
             .unwrap_or(0)
     }
 
-    fn pending_slice_commit_is_stale(&self, content_epoch: u64) -> VfsResult<bool> {
-        match self.vfs.sync_meta().get_attr(self.ino) {
-            Ok(attr) => Ok(attr.content_epoch > content_epoch),
-            Err(studiofs_meta::MetaError::InodeNotFound(_)) => Ok(true),
-            Err(error) => Err(VfsError::Meta(error)),
-        }
-    }
-
     fn pending_slice_object_ids(
         pending_slices: &std::collections::BTreeMap<u64, Vec<PendingDirtySlice>>,
     ) -> Vec<u64> {
@@ -481,12 +473,31 @@ impl<'a> LocalDirtyFlushSession<'a> {
             return Ok(());
         }
 
-        if self.pending_slice_commit_is_stale(content_epoch)? {
-            self.cleanup_stale_pending_slice_objects(&pending_slices, "metadata-precheck")
-                .await;
-            self.vfs
-                .commit_pending_local_dirty_slices(self.ino, &pending_slices);
-            return Ok(());
+        let mut content_epoch = content_epoch;
+        let mut attr_to_persist = attr_to_persist;
+        match self.vfs.sync_meta().get_attr(self.ino) {
+            Ok(current_attr) if current_attr.content_epoch > content_epoch => {
+                let visible_end = Self::pending_slices_visible_end(&pending_slices);
+                if visible_end > 0 && current_attr.size >= visible_end {
+                    content_epoch = current_attr.content_epoch;
+                    attr_to_persist = Some(current_attr);
+                } else {
+                    self.cleanup_stale_pending_slice_objects(&pending_slices, "metadata-precheck")
+                        .await;
+                    self.vfs
+                        .commit_pending_local_dirty_slices(self.ino, &pending_slices);
+                    return Ok(());
+                }
+            }
+            Ok(_) => {}
+            Err(studiofs_meta::MetaError::InodeNotFound(_)) => {
+                self.cleanup_stale_pending_slice_objects(&pending_slices, "metadata-precheck")
+                    .await;
+                self.vfs
+                    .commit_pending_local_dirty_slices(self.ino, &pending_slices);
+                return Ok(());
+            }
+            Err(error) => return Err(VfsError::Meta(error)),
         }
 
         let chunk_slices = self.drain.build_overlay_slice_records(
@@ -536,12 +547,6 @@ impl<'a> LocalDirtyFlushSession<'a> {
                     let Some(object_id) = slice.object_id else {
                         continue;
                     };
-                    if slice.block_offset != 0
-                        || slice.object_offset != 0
-                        || slice.len() != self.vfs.block_size as usize
-                    {
-                        continue;
-                    }
                     latest_live_extents
                         .entry(slice.block_index)
                         .and_modify(|(current_object_id, current_seq)| {

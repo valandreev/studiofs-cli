@@ -270,7 +270,7 @@ pub fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()> {
     SHUTDOWN_REQUESTED.store(false, Ordering::Release);
     let _signal_watcher =
         spawn_signal_watcher(session.exit_handle(), signal_handling, unmount_signal)?;
-    vfs.set_kernel_invalidator(session.kernel_invalidator());
+    vfs.set_kernel_invalidator(callback_state.kernel_invalidator(session.kernel_invalidator()));
     let result = session.run();
     vfs.clear_kernel_invalidator();
     drop(session);
@@ -290,6 +290,10 @@ fn studio_vfs_ops_for_read_only(read_only: bool) -> low_level::LowLevelOperation
 mod tests {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
 
     use studiofs_meta::MetaFsOps;
 
@@ -990,6 +994,89 @@ mod tests {
             after_second.vfs_read_path.calls, 1,
             "adjacent read should be served from the macFUSE per-handle window"
         );
+    }
+
+    #[test]
+    fn kernel_data_invalidation_clears_adapter_read_window() {
+        #[derive(Default)]
+        struct RecordingInvalidator {
+            data: AtomicBool,
+            attrs: AtomicBool,
+        }
+
+        impl studiofs_vfs::KernelInvalidator for RecordingInvalidator {
+            fn inval_inode(&self, _ino: u64) {
+                self.data.store(true, Ordering::Release);
+            }
+
+            fn inval_inode_attrs(&self, _ino: u64) {
+                self.attrs.store(true, Ordering::Release);
+            }
+        }
+
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-read-window-invalidation",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"window-invalidation.bin",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        fixture
+            .runtime()
+            .block_on(vfs.write(attr.ino, 0, b"0123456789abcdef"))
+            .expect("seed payload");
+        vfs.reset_diagnostics_observability();
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let reader = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open reader through macFUSE adapter");
+
+        let first = adapter
+            .queue_read_for_test(attr.ino, reader.file_handle(), 0, 8)
+            .expect("queue first read");
+        assert_eq!(
+            &first.wait().expect("first read should complete")[..],
+            b"01234567"
+        );
+
+        let inner = Arc::new(RecordingInvalidator::default());
+        let invalidator = adapter.kernel_invalidator_for_test(inner.clone());
+        invalidator.inval_inode_attrs(attr.ino);
+
+        invalidator.inval_inode(attr.ino);
+        assert!(
+            !adapter.has_open_cache_snapshot_for_test(attr.ino),
+            "data invalidation must force the next open to drop cached pages"
+        );
+
+        fixture
+            .runtime()
+            .block_on(vfs.write(attr.ino, 8, b"ABCDEFGH"))
+            .expect("replace adjacent payload");
+
+        let second = adapter
+            .queue_read_for_test(attr.ino, reader.file_handle(), 8, 8)
+            .expect("queue adjacent read after invalidation");
+        assert_eq!(
+            &second.wait().expect("second read should complete")[..],
+            b"ABCDEFGH"
+        );
+
+        let metrics = vfs.write_path_observability_snapshot();
+        assert_eq!(
+            metrics.vfs_read_path.calls, 2,
+            "invalidation must force the adjacent read back through VFS"
+        );
+        assert!(inner.data.load(Ordering::Acquire));
+        assert!(inner.attrs.load(Ordering::Acquire));
     }
 
     #[test]

@@ -18,8 +18,11 @@ use parking_lot::Mutex as ParkingMutex;
 use studiofs_bridge::posix::{
     BridgeFileAttr, BridgeFileType, posix_flags_to_open_flags, to_bridge_attr, vfs_err_to_errno,
 };
+use studiofs_meta::schema::ResolvedSliceSource;
 use studiofs_meta::{DirEntry, FileType, InodeAttr, SetattrArgs, TimeSpec, UploadState};
-use studiofs_vfs::{StatFs, StudioVfs, VfsFuseAsyncReadSnapshot, VfsMacFuseOpenCacheDecision};
+use studiofs_vfs::{
+    KernelInvalidator, StatFs, StudioVfs, VfsFuseAsyncReadSnapshot, VfsMacFuseOpenCacheDecision,
+};
 use tokio::runtime::Handle;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 #[cfg(test)]
@@ -68,7 +71,7 @@ pub(crate) struct StudioVfsAdapter {
     readdir_cache: Mutex<HashMap<u64, ReaddirCacheEntry>>,
     readdir_cache_last_pruned: Mutex<Option<Instant>>,
     readdir_cache_ready: Condvar,
-    open_cache_snapshots: ParkingMutex<LruCache<u64, MacFuseOpenCacheSnapshot>>,
+    open_cache_snapshots: Arc<ParkingMutex<LruCache<u64, MacFuseOpenCacheSnapshot>>>,
     read_admission: Arc<Semaphore>,
     read_queue_byte_limit: u32,
     read_buffers: Arc<ReadBufferPool>,
@@ -76,14 +79,15 @@ pub(crate) struct StudioVfsAdapter {
     read_diagnostics: Arc<AsyncReadDiagnostics>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct MacFuseOpenCacheSnapshot {
     content_epoch: u64,
     size: u64,
+    graph: Vec<MacFuseOpenCacheGraphSpan>,
 }
 
 impl MacFuseOpenCacheSnapshot {
-    fn from_attr(attr: &InodeAttr) -> Option<Self> {
+    fn from_attr(attr: &InodeAttr, graph: Vec<MacFuseOpenCacheGraphSpan>) -> Option<Self> {
         if attr.kind != FileType::RegularFile
             || attr.upload_state != UploadState::Ready
             || attr.content_epoch != attr.committed_content_epoch
@@ -94,7 +98,37 @@ impl MacFuseOpenCacheSnapshot {
         Some(Self {
             content_epoch: attr.content_epoch,
             size: attr.size,
+            graph,
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MacFuseOpenCacheGraphSpan {
+    chunk_id: u64,
+    range_start: u32,
+    range_end: u32,
+    source: u8,
+    slice_id: Option<u64>,
+    slice_order: Option<u64>,
+    payload: Option<MacFuseOpenCachePayload>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MacFuseOpenCachePayload {
+    object_id: u64,
+    offset: u32,
+    length: u32,
+    flags: u8,
+}
+
+fn open_cache_source_tag(source: ResolvedSliceSource) -> u8 {
+    match source {
+        ResolvedSliceSource::Overlay => 1,
+        ResolvedSliceSource::Base => 2,
+        ResolvedSliceSource::OverlayTombstone => 3,
+        ResolvedSliceSource::BaseTombstone => 4,
+        ResolvedSliceSource::Hole => 5,
     }
 }
 
@@ -263,6 +297,24 @@ impl ReadWindowStore {
             .entry(ino)
             .or_default()
             .fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+struct ReadWindowKernelInvalidator {
+    read_windows: Arc<ReadWindowStore>,
+    open_cache_snapshots: Arc<ParkingMutex<LruCache<u64, MacFuseOpenCacheSnapshot>>>,
+    inner: Arc<dyn KernelInvalidator>,
+}
+
+impl KernelInvalidator for ReadWindowKernelInvalidator {
+    fn inval_inode(&self, ino: u64) {
+        self.read_windows.invalidate_inode(ino);
+        self.open_cache_snapshots.lock().pop(&ino);
+        self.inner.inval_inode(ino);
+    }
+
+    fn inval_inode_attrs(&self, ino: u64) {
+        self.inner.inval_inode_attrs(ino);
     }
 }
 
@@ -667,7 +719,9 @@ impl StudioVfsAdapter {
             readdir_cache: Mutex::new(HashMap::new()),
             readdir_cache_last_pruned: Mutex::new(None),
             readdir_cache_ready: Condvar::new(),
-            open_cache_snapshots: ParkingMutex::new(LruCache::new(open_cache_snapshot_capacity())),
+            open_cache_snapshots: Arc::new(ParkingMutex::new(LruCache::new(
+                open_cache_snapshot_capacity(),
+            ))),
             read_admission: Arc::new(Semaphore::new(read_queue_byte_limit as usize)),
             read_queue_byte_limit,
             read_buffers: Arc::new(ReadBufferPool::default()),
@@ -711,6 +765,14 @@ impl StudioVfsAdapter {
     }
 
     #[cfg(test)]
+    pub(crate) fn kernel_invalidator_for_test(
+        &self,
+        inner: Arc<dyn KernelInvalidator>,
+    ) -> Arc<dyn KernelInvalidator> {
+        self.kernel_invalidator(inner)
+    }
+
+    #[cfg(test)]
     pub(crate) fn has_open_cache_snapshot_for_test(&self, ino: u64) -> bool {
         self.open_cache_snapshots.lock().contains(&ino)
     }
@@ -718,6 +780,17 @@ impl StudioVfsAdapter {
     #[cfg(test)]
     pub(crate) fn open_cache_snapshot_count_for_test(&self) -> usize {
         self.open_cache_snapshots.lock().len()
+    }
+
+    pub(crate) fn kernel_invalidator(
+        &self,
+        inner: Arc<dyn KernelInvalidator>,
+    ) -> Arc<dyn KernelInvalidator> {
+        Arc::new(ReadWindowKernelInvalidator {
+            read_windows: Arc::clone(&self.read_windows),
+            open_cache_snapshots: Arc::clone(&self.open_cache_snapshots),
+            inner,
+        })
     }
 
     #[cfg(test)]
@@ -826,7 +899,33 @@ impl StudioVfsAdapter {
             );
             return false;
         };
-        let Some(snapshot) = MacFuseOpenCacheSnapshot::from_attr(&attr) else {
+        if attr.kind != FileType::RegularFile
+            || attr.upload_state != UploadState::Ready
+            || attr.content_epoch != attr.committed_content_epoch
+            || attr.size != attr.committed_size
+        {
+            self.clear_open_cache_snapshot(ino, "not_fully_committed");
+            self.vfs.record_macfuse_open_cache_decision(
+                VfsMacFuseOpenCacheDecision::ReadOnlyNotFullyCommitted,
+            );
+            return false;
+        };
+        let graph = match self.open_cache_graph_signature(ino, attr.size) {
+            Ok(graph) => graph,
+            Err(error) => {
+                debug!(
+                    ino,
+                    ?error,
+                    "macFUSE open cache could not read file graph signature"
+                );
+                self.clear_open_cache_snapshot(ino, "unknown_state");
+                self.vfs.record_macfuse_open_cache_decision(
+                    VfsMacFuseOpenCacheDecision::ReadOnlyUnknownState,
+                );
+                return false;
+            }
+        };
+        let Some(snapshot) = MacFuseOpenCacheSnapshot::from_attr(&attr, graph) else {
             self.clear_open_cache_snapshot(ino, "not_fully_committed");
             self.vfs.record_macfuse_open_cache_decision(
                 VfsMacFuseOpenCacheDecision::ReadOnlyNotFullyCommitted,
@@ -859,12 +958,14 @@ impl StudioVfsAdapter {
             return true;
         }
 
+        let content_epoch = snapshot.content_epoch;
+        let size = snapshot.size;
         snapshots.put(ino, snapshot);
         debug!(
             ino,
             keep_cache = false,
-            content_epoch = snapshot.content_epoch,
-            size = snapshot.size,
+            content_epoch,
+            size,
             reason = "generation_changed",
             "macFUSE open cache decision"
         );
@@ -872,6 +973,31 @@ impl StudioVfsAdapter {
             VfsMacFuseOpenCacheDecision::ReadOnlyGenerationChanged,
         );
         false
+    }
+
+    fn open_cache_graph_signature(
+        &self,
+        ino: u64,
+        size: u64,
+    ) -> Result<Vec<MacFuseOpenCacheGraphSpan>, studiofs_meta::MetaError> {
+        let spans = self.vfs.meta().lookup_regular_file_slices(ino, 0, size)?;
+        Ok(spans
+            .into_iter()
+            .map(|span| MacFuseOpenCacheGraphSpan {
+                chunk_id: span.chunk_id.0,
+                range_start: span.range.start,
+                range_end: span.range.end,
+                source: open_cache_source_tag(span.source),
+                slice_id: span.slice_id.map(|slice_id| slice_id.0),
+                slice_order: span.slice_order.map(|slice_order| slice_order.0),
+                payload: span.payload.map(|payload| MacFuseOpenCachePayload {
+                    object_id: payload.object_id,
+                    offset: payload.offset,
+                    length: payload.length,
+                    flags: payload.flags.bits(),
+                }),
+            })
+            .collect())
     }
 
     /// Remove a file entry.
@@ -1689,6 +1815,13 @@ impl CallbackState {
         Self {
             adapter: StudioVfsAdapter::new_with_read_only(vfs, runtime_handle, read_only),
         }
+    }
+
+    pub(crate) fn kernel_invalidator(
+        &self,
+        inner: Arc<dyn KernelInvalidator>,
+    ) -> Arc<dyn KernelInvalidator> {
+        self.adapter.kernel_invalidator(inner)
     }
 }
 

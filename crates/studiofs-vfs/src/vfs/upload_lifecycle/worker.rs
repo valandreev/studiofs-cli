@@ -1,6 +1,4 @@
-use super::super::{
-    FileSessionOperation, Ino, InodeAttr, StudioVfs, VfsError, VfsResult, block_index_from_offset,
-};
+use super::super::{FileSessionOperation, Ino, InodeAttr, StudioVfs, VfsError, VfsResult};
 use crate::VfsMeta;
 use crate::runtime::{TimeoutOrCancel, run_meta, run_with_timeout_or_cancel};
 use crate::utils::now_unix_millis;
@@ -17,8 +15,9 @@ use studiofs_data::object::{
     CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, create_object_buffer, format_object_fragment_keys,
 };
 use studiofs_meta::schema::{
-    ChunkId, FileType, PayloadRef, PayloadRefState, ResolvedSliceSource, ResolvedSliceSpan,
-    SliceId, SliceOrder, SliceRange, SliceRecord,
+    ChunkId, DEFAULT_CHUNK_SIZE, FileType, PayloadRef, PayloadRefState, ResolvedSliceSource,
+    ResolvedSliceSpan, SliceId, SliceOrder, SliceRange, SliceRecord, block_index_from_offset,
+    chunk_id_from_offset, chunk_start_offset,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
@@ -122,6 +121,18 @@ struct UploadedObjectReconcile {
 
 const POST_PUT_STALE_RECONCILE_ATTEMPTS: usize = 16;
 const POST_PUT_STALE_RECONCILE_DELAY_MS: u64 = 5;
+const POST_PUT_VISIBILITY_ATTEMPTS: usize = 8;
+const POST_PUT_VISIBILITY_INITIAL_DELAY_MS: u64 = 25;
+const POST_PUT_VISIBILITY_MAX_DELAY_MS: u64 = 1_000;
+
+fn post_put_visibility_delay(attempt: usize) -> Duration {
+    let multiplier = 1u64.checked_shl(attempt.min(20) as u32).unwrap_or(u64::MAX);
+    Duration::from_millis(
+        POST_PUT_VISIBILITY_INITIAL_DELAY_MS
+            .saturating_mul(multiplier)
+            .min(POST_PUT_VISIBILITY_MAX_DELAY_MS),
+    )
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RemoteVisibility {
@@ -186,37 +197,87 @@ fn foreground_upload_reread_pacing_delay(foreground_active: bool, reread_bytes: 
     Duration::from_nanos(nanos)
 }
 
-fn spans_allow_uploaded_object_reattach(
+fn uploaded_object_reattach_slices(
     spans: &[ResolvedSliceSpan],
-    expected_chunk: ChunkId,
-    expected_range: SliceRange,
     object_id: u64,
-) -> bool {
-    let mut covered_until = expected_range.start;
+    offset: u64,
+    payload_len: u64,
+    block_size: u32,
+) -> Option<Vec<(ChunkId, Vec<SliceRecord>)>> {
+    let request_end = offset.checked_add(payload_len)?;
+    let mut chunk_slices: BTreeMap<ChunkId, Vec<SliceRecord>> = BTreeMap::new();
+
     for span in spans {
-        if span.chunk_id != expected_chunk {
+        let span_start = chunk_start_offset(span.chunk_id, DEFAULT_CHUNK_SIZE)
+            .checked_add(u64::from(span.range.start))?;
+        let span_end = chunk_start_offset(span.chunk_id, DEFAULT_CHUNK_SIZE)
+            .checked_add(u64::from(span.range.end))?;
+        let start = span_start.max(offset);
+        let end = span_end.min(request_end);
+        if start >= end {
             continue;
         }
-        let Some(intersection) = span.range.intersection(expected_range) else {
-            continue;
-        };
-        let safe_span = match span.source {
+
+        let should_reattach = match span.source {
             ResolvedSliceSource::Hole => span.payload.is_none(),
             ResolvedSliceSource::Overlay | ResolvedSliceSource::Base => span
                 .payload
                 .as_ref()
                 .is_some_and(|payload| payload.object_id == object_id),
-            ResolvedSliceSource::OverlayTombstone | ResolvedSliceSource::BaseTombstone => false,
+            ResolvedSliceSource::OverlayTombstone | ResolvedSliceSource::BaseTombstone => {
+                return None;
+            }
         };
-        if intersection.start > covered_until || !safe_span {
-            return false;
-        }
-        covered_until = covered_until.max(intersection.end);
-        if covered_until >= expected_range.end {
-            return true;
+
+        if should_reattach {
+            append_uploaded_object_reattach_slices(
+                &mut chunk_slices,
+                object_id,
+                offset,
+                start,
+                end,
+                block_size,
+            )?;
         }
     }
-    false
+
+    if chunk_slices.is_empty() {
+        return None;
+    }
+    Some(chunk_slices.into_iter().collect())
+}
+
+fn append_uploaded_object_reattach_slices(
+    chunk_slices: &mut BTreeMap<ChunkId, Vec<SliceRecord>>,
+    object_id: u64,
+    object_file_offset: u64,
+    start: u64,
+    end: u64,
+    block_size: u32,
+) -> Option<()> {
+    let mut cursor = start;
+    while cursor < end {
+        let chunk_id = chunk_id_from_offset(cursor, DEFAULT_CHUNK_SIZE);
+        let chunk_start = chunk_start_offset(chunk_id, DEFAULT_CHUNK_SIZE);
+        let chunk_end = chunk_start.checked_add(u64::from(DEFAULT_CHUNK_SIZE))?;
+        let part_end = end.min(chunk_end);
+        let chunk_offset = u32::try_from(cursor.checked_sub(chunk_start)?).ok()?;
+        let part_len = u32::try_from(part_end.checked_sub(cursor)?).ok()?;
+        let object_offset = u32::try_from(cursor.checked_sub(object_file_offset)?).ok()?;
+        let range = SliceRange::new(chunk_offset, chunk_offset.checked_add(part_len)?)?;
+        let mut payload = if part_len == block_size {
+            PayloadRef::new_full(object_id, part_len)
+        } else {
+            PayloadRef::new_partial(object_id, part_len)
+        };
+        payload.offset = object_offset;
+
+        let mut slice = SliceRecord::new(SliceId(0), SliceOrder(0), range, payload);
+        slice.payload_state = PayloadRefState::Uploaded;
+        chunk_slices.entry(chunk_id).or_default().push(slice);
+        cursor = part_end;
+    }
+    Some(())
 }
 
 trait CachedStorePort: Clone + Send + Sync + 'static {
@@ -622,6 +683,28 @@ where
                 }
                 UploadPutOutcome::Failed(error) => return Err(error),
             }
+            match self
+                .wait_for_uploaded_fragments_visible(op, &fragment_keys, upload_cancel_token)
+                .await
+            {
+                RemoteVisibility::Visible => {}
+                RemoteVisibility::Cancelled => {
+                    return if self.cancel_upload_if_inode_deleted(op).await? {
+                        Ok(SingleUploadOutcome::CancelledDeleted)
+                    } else {
+                        Ok(SingleUploadOutcome::Shutdown)
+                    };
+                }
+                RemoteVisibility::NotVisible => {
+                    if self.cancel_upload_if_inode_deleted(op).await? {
+                        return Ok(SingleUploadOutcome::CancelledDeleted);
+                    }
+                    return Err(VfsError::Other(format!(
+                        "uploaded object {} fragments were not visible after remote put",
+                        op.object_id
+                    )));
+                }
+            }
         }
 
         if self.cancel_upload_if_inode_deleted(op).await? {
@@ -782,6 +865,38 @@ where
         }
 
         Ok(None)
+    }
+
+    async fn wait_for_uploaded_fragments_visible(
+        &self,
+        op: &PendingUpload,
+        fragment_keys: &[String],
+        upload_cancel_token: &CancellationToken,
+    ) -> RemoteVisibility {
+        for attempt in 0..POST_PUT_VISIBILITY_ATTEMPTS {
+            match self
+                .remote
+                .all_fragments_visible(op, fragment_keys, upload_cancel_token)
+                .await
+            {
+                RemoteVisibility::Visible => return RemoteVisibility::Visible,
+                RemoteVisibility::Cancelled => return RemoteVisibility::Cancelled,
+                RemoteVisibility::NotVisible => {}
+            }
+
+            if attempt + 1 == POST_PUT_VISIBILITY_ATTEMPTS {
+                break;
+            }
+
+            let shutdown_token = self.shutdown.shutdown_token();
+            tokio::select! {
+                _ = shutdown_token.cancelled() => return RemoteVisibility::Cancelled,
+                _ = upload_cancel_token.cancelled() => return RemoteVisibility::Cancelled,
+                _ = tokio::time::sleep(post_put_visibility_delay(attempt)) => {}
+            }
+        }
+
+        RemoteVisibility::NotVisible
     }
 
     async fn cancel_upload_if_inode_deleted(&self, op: &PendingUpload) -> VfsResult<bool> {
@@ -1241,28 +1356,9 @@ impl UploadMetaPort for VfsUploadMetaPort {
         if payload_len == 0 {
             return Ok(None);
         }
-        let block_size_u64 = u64::from(block_size);
         let Some(end_offset) = offset.checked_add(payload_len) else {
             return Ok(None);
         };
-        let chunk_index = block_index_from_offset(offset, block_size);
-        let chunk_start = offset % block_size_u64;
-        let Some(chunk_end) = chunk_start.checked_add(payload_len) else {
-            return Ok(None);
-        };
-        let Ok(chunk_start) = u32::try_from(chunk_start) else {
-            return Ok(None);
-        };
-        let Ok(chunk_end) = u32::try_from(chunk_end) else {
-            return Ok(None);
-        };
-        let Some(range) = SliceRange::new(chunk_start, chunk_end) else {
-            return Ok(None);
-        };
-        let Ok(payload_len_u32) = u32::try_from(payload_len) else {
-            return Ok(None);
-        };
-        let chunk_id = ChunkId(u64::from(chunk_index));
         let meta = self.vfs.meta.clone();
         run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
             let latest_attr = match engine.get_attr(ino) {
@@ -1275,9 +1371,11 @@ impl UploadMetaPort for VfsUploadMetaPort {
             }
 
             let spans = engine.lookup_regular_file_slices(ino, offset, payload_len)?;
-            if !spans_allow_uploaded_object_reattach(&spans, chunk_id, range, object_id) {
+            let Some(chunk_slices) =
+                uploaded_object_reattach_slices(&spans, object_id, offset, payload_len, block_size)
+            else {
                 return Ok(None);
-            }
+            };
 
             let mut rebased_attr = latest_attr;
             let rebased_epoch = if content_epoch > rebased_attr.content_epoch {
@@ -1291,16 +1389,9 @@ impl UploadMetaPort for VfsUploadMetaPort {
             rebased_attr.content_epoch = rebased_epoch;
             rebased_attr.touch_mtime();
 
-            let payload = if payload_len_u32 == block_size {
-                PayloadRef::new_full(object_id, payload_len_u32)
-            } else {
-                PayloadRef::new_partial(object_id, payload_len_u32)
-            };
-            let mut slice = SliceRecord::new(SliceId(0), SliceOrder(0), range, payload);
-            slice.payload_state = PayloadRefState::Uploaded;
             let applied = engine.flush_regular_file_overlay_slices_with_attr(
                 ino,
-                &[(chunk_id, vec![slice])],
+                &chunk_slices,
                 Some(&rebased_attr),
             )?;
             Ok(applied.map(|attr| attr.content_epoch))
@@ -1937,6 +2028,50 @@ mod tests {
         FakePolicy,
     >;
 
+    #[test]
+    fn post_put_visibility_delay_uses_bounded_exponential_backoff() {
+        assert_eq!(post_put_visibility_delay(0), Duration::from_millis(25));
+        assert_eq!(post_put_visibility_delay(1), Duration::from_millis(50));
+        assert_eq!(post_put_visibility_delay(2), Duration::from_millis(100));
+        assert_eq!(post_put_visibility_delay(6), Duration::from_millis(1_000));
+        assert_eq!(post_put_visibility_delay(32), Duration::from_millis(1_000));
+    }
+
+    #[test]
+    fn reattach_uploaded_object_marks_full_block_at_nonzero_object_offset_as_full() {
+        let block_size = 4096;
+        let object_id = 42;
+        let spans = vec![ResolvedSliceSpan {
+            chunk_id: ChunkId(0),
+            range: SliceRange::new(block_size, block_size * 2).expect("hole range"),
+            source: ResolvedSliceSource::Hole,
+            slice_id: None,
+            slice_order: None,
+            payload: None,
+        }];
+
+        let reattached = uploaded_object_reattach_slices(
+            &spans,
+            object_id,
+            0,
+            u64::from(block_size * 2),
+            block_size,
+        )
+        .expect("full block should reattach over a hole");
+        let payload = reattached[0].1[0]
+            .payload
+            .as_ref()
+            .expect("reattached slice should carry payload");
+
+        assert_eq!(payload.object_id, object_id);
+        assert_eq!(payload.offset, block_size);
+        assert_eq!(payload.length, block_size);
+        assert!(
+            !payload.is_partial(),
+            "logical full blocks remain full even when their object offset is non-zero"
+        );
+    }
+
     #[derive(Clone, Default)]
     struct FakeCoordinator {
         completed: Arc<Mutex<Vec<u64>>>,
@@ -2148,6 +2283,7 @@ mod tests {
     struct FakeRemote {
         adaptive_penalty_ms: u64,
         visibility: Arc<Mutex<RemoteVisibility>>,
+        visibility_after_upload: Arc<Mutex<Option<RemoteVisibility>>>,
         upload_result: Arc<Mutex<Option<UploadPutOutcome>>>,
         remove_overlay_after_upload: Arc<Mutex<Option<(FakeMeta, Ino, u64)>>>,
         advance_epoch_after_upload: Arc<Mutex<Option<(FakeMeta, Ino, u64)>>>,
@@ -2160,6 +2296,7 @@ mod tests {
             Self {
                 adaptive_penalty_ms: 0,
                 visibility: Arc::new(Mutex::new(RemoteVisibility::NotVisible)),
+                visibility_after_upload: Arc::new(Mutex::new(Some(RemoteVisibility::Visible))),
                 upload_result: Arc::new(Mutex::new(Some(UploadPutOutcome::Uploaded))),
                 remove_overlay_after_upload: Arc::new(Mutex::new(None)),
                 advance_epoch_after_upload: Arc::new(Mutex::new(None)),
@@ -2200,6 +2337,11 @@ mod tests {
                 .lock()
                 .take()
                 .unwrap_or(UploadPutOutcome::Uploaded);
+            if matches!(outcome, UploadPutOutcome::Uploaded)
+                && let Some(visibility) = self.visibility_after_upload.lock().take()
+            {
+                *self.visibility.lock() = visibility;
+            }
             if matches!(outcome, UploadPutOutcome::Uploaded)
                 && self
                     .cancel_token_after_upload
@@ -2452,6 +2594,116 @@ mod tests {
     }
 
     #[test]
+    fn vfs_upload_meta_reattaches_materialized_sparse_upload_over_uncovered_tail() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "reattach-materialized-sparse-upload");
+        let created = vfs
+            .create(1, b"reattach-materialized-sparse-upload.bin", 0, 0, 0o644)
+            .expect("create sparse file");
+        let prefix_len = 233u32;
+        let materialized_len = 1_048_831u64;
+        let published_prefix_object = 4;
+        let materialized_upload_object = 6;
+
+        let mut published_attr = created;
+        published_attr.size = u64::from(prefix_len);
+        published_attr.committed_size = published_attr.size;
+        published_attr.content_epoch = 1;
+        published_attr.committed_content_epoch = 1;
+        published_attr.upload_state = UploadState::Updating;
+        meta.set_attr(&published_attr)
+            .expect("seed prefix attr before publish");
+        let prefix_slice = SliceRecord::new(
+            SliceId(0),
+            SliceOrder(0),
+            SliceRange::new(0, prefix_len).expect("prefix range"),
+            PayloadRef::new_partial(published_prefix_object, prefix_len),
+        );
+        meta.flush_regular_file_overlay_slices_with_attr(
+            published_attr.ino,
+            &[(ChunkId(0), vec![prefix_slice])],
+            Some(&published_attr),
+        )
+        .expect("stage published prefix object");
+        assert!(
+            meta.mark_regular_file_overlay_object_uploaded_if_matches(
+                published_attr.ino,
+                1,
+                published_prefix_object,
+            )
+            .expect("mark prefix uploaded")
+        );
+        assert!(
+            meta.publish_regular_file_overlay_to_base_if_matches(published_attr.ino, 1)
+                .expect("publish prefix to base")
+        );
+
+        let mut ready_attr = meta
+            .get_attr(published_attr.ino)
+            .expect("load published attr");
+        ready_attr.size = 2_097_275;
+        ready_attr.committed_size = ready_attr.size;
+        ready_attr.content_epoch = 2;
+        ready_attr.committed_content_epoch = 2;
+        ready_attr.upload_state = UploadState::Ready;
+        meta.set_attr(&ready_attr)
+            .expect("seed sparse ready attr with published prefix");
+
+        let port = VfsUploadMetaPort { vfs: vfs.clone() };
+        let rebased_epoch = rt
+            .block_on(port.reattach_uploaded_object_if_uncovered(
+                ready_attr.ino,
+                3,
+                materialized_upload_object,
+                0,
+                materialized_len,
+                vfs.block_size,
+            ))
+            .expect("reattach materialized sparse upload");
+
+        assert_eq!(
+            rebased_epoch,
+            Some(3),
+            "a materialized sparse stale upload should be restored over holes without replacing existing base data"
+        );
+        let spans = meta
+            .lookup_regular_file_slices(ready_attr.ino, 0, materialized_len)
+            .expect("load rebased sparse graph");
+        assert!(
+            spans.iter().any(|span| {
+                span.source == ResolvedSliceSource::Base
+                    && span.range == SliceRange::new(0, prefix_len).expect("prefix range")
+                    && span
+                        .payload
+                        .as_ref()
+                        .is_some_and(|payload| payload.object_id == published_prefix_object)
+            }),
+            "the already-published prefix must stay backed by the original base object"
+        );
+
+        let rebased_payloads = spans
+            .iter()
+            .filter_map(|span| {
+                let payload = span.payload.as_ref()?;
+                (payload.object_id == materialized_upload_object).then_some((span, payload))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rebased_payloads.len(), 1);
+        let (span, payload) = rebased_payloads[0];
+        assert_eq!(span.source, ResolvedSliceSource::Overlay);
+        assert_eq!(
+            span.range,
+            SliceRange::new(prefix_len, u32::try_from(materialized_len).unwrap())
+                .expect("tail range")
+        );
+        assert_eq!(payload.offset, prefix_len);
+        assert_eq!(
+            payload.length,
+            u32::try_from(materialized_len - u64::from(prefix_len)).unwrap()
+        );
+    }
+
+    #[test]
     fn vfs_upload_meta_reattaches_newer_stale_upload_when_same_object_is_still_overlay() {
         let tmp = TempDir::new().expect("tempdir");
         let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "reattach-retained-stale-upload");
@@ -2592,6 +2844,39 @@ mod tests {
         assert_eq!(requeued[0].retry_count, 1);
         assert!(requeued[0].not_before_unix_ms >= before_retry.saturating_add(40));
         assert!(shutdown.released_tokens.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn process_upload_requeues_when_uploaded_fragments_are_not_visible() {
+        let (processor, coordinator, local_payloads, meta, remote, shutdown, policy) =
+            processor_fixture();
+        let op = make_pending_upload();
+        coordinator.pending_inodes.lock().insert(op.ino);
+        meta.attrs
+            .lock()
+            .insert(op.ino, Some(make_attr(op.ino, op.content_epoch)));
+        meta.overlay_objects
+            .lock()
+            .insert(op.ino, HashSet::from([op.object_id]));
+        *remote.visibility_after_upload.lock() = Some(RemoteVisibility::NotVisible);
+
+        let outcome = processor.process_upload(op.clone()).await;
+
+        assert_eq!(outcome, UploadOutcome::Requeued);
+        assert!(
+            meta.uploaded_overlay_objects.lock().is_empty(),
+            "metadata must not reference a remote payload before all fragments are visible"
+        );
+        assert!(coordinator.completed.lock().is_empty());
+        assert_eq!(coordinator.requeued.lock().len(), 1);
+        assert_eq!(coordinator.requeued.lock()[0].object_id, op.object_id);
+        assert_eq!(local_payloads.failed.lock().as_slice(), &[op.object_id]);
+        assert!(local_payloads.uploaded.lock().is_empty());
+        assert!(local_payloads.removed.lock().is_empty());
+        assert_eq!(shutdown.requeues.load(Ordering::Relaxed), 1);
+        assert_eq!(shutdown.canceled_stale_after_put.load(Ordering::Relaxed), 0);
+        assert_eq!(policy.sticky_errors.lock().len(), 1);
+        assert!(policy.finalized_upload_epochs.lock().is_empty());
     }
 
     #[tokio::test]

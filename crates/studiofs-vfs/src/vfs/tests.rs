@@ -3679,6 +3679,287 @@ fn write_through_sparse_extend_requeues_all_retained_overlay_uploads() {
 }
 
 #[test]
+fn explicit_flush_sparse_extend_requeues_all_retained_overlay_uploads() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "explicit-flush-sparse-extend-retains");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"explicit-flush-sparse-extend-retains.bin", 0, 0, 0o644)
+            .expect("create sparse file");
+        let ino = attr.ino;
+        let head = b"sparse-head";
+        let tail = vec![b't'; 258];
+        let tail_offset = 1_048_569u64;
+        let logical_size = 2_097_275u64;
+
+        let head_fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open head writer");
+        vfs.write_fh(head_fh, ino, 0, head)
+            .await
+            .expect("write sparse head");
+        vfs.flush_fh(head_fh)
+            .await
+            .expect("explicitly flush sparse head");
+        vfs.release_fh(head_fh).await.expect("release head writer");
+
+        let tail_fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open tail writer");
+        vfs.write_fh(tail_fh, ino, tail_offset, &tail)
+            .await
+            .expect("write sparse tail");
+        vfs.flush_fh(tail_fh)
+            .await
+            .expect("explicitly flush sparse tail");
+        vfs.release_fh(tail_fh).await.expect("release tail writer");
+
+        let pending_before_extend = vfs
+            .pending_uploads_for_inode(ino)
+            .into_iter()
+            .map(|(offset, _, _)| offset)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            pending_before_extend,
+            BTreeSet::from([0, tail_offset]),
+            "explicit fsync-style flushes must queue both sparse ranges before set_len"
+        );
+
+        let grow_fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open grow writer");
+        vfs.setattr_with_handle(Some(grow_fh), ino, SetattrArgs::size_only(logical_size))
+            .expect("extend logical EOF");
+
+        let pending_after_extend = vfs
+            .pending_uploads_for_inode(ino)
+            .into_iter()
+            .map(|(offset, _, _)| offset)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            pending_after_extend,
+            BTreeSet::from([0, tail_offset]),
+            "set_len must retain both explicitly flushed sparse ranges"
+        );
+
+        vfs.release_fh(grow_fh).await.expect("release grow writer");
+    });
+}
+
+#[test]
+fn explicit_flush_sparse_extend_retains_tail_after_head_publication() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "explicit-flush-sparse-after-head-publish");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(
+                1,
+                b"explicit-flush-sparse-after-head-publish.bin",
+                0,
+                0,
+                0o644,
+            )
+            .expect("create sparse file");
+        let ino = attr.ino;
+        let head = b"sparse-head";
+        let tail = vec![b't'; 258];
+        let tail_offset = 1_048_569u64;
+        let logical_size = 2_097_275u64;
+
+        let head_fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open head writer");
+        vfs.write_fh(head_fh, ino, 0, head)
+            .await
+            .expect("write sparse head");
+        vfs.flush_fh(head_fh)
+            .await
+            .expect("explicitly flush sparse head");
+        vfs.release_fh(head_fh).await.expect("release head writer");
+
+        let (head_epoch, head_blocks) = mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+        publish_current_file_graph(&meta, ino, head_epoch, &head_blocks);
+        assert!(
+            vfs.pending_uploads_for_inode(ino).is_empty(),
+            "setup should model head publication before the sparse tail write"
+        );
+
+        let tail_fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open tail writer");
+        vfs.write_fh(tail_fh, ino, tail_offset, &tail)
+            .await
+            .expect("write sparse tail");
+        vfs.flush_fh(tail_fh)
+            .await
+            .expect("explicitly flush sparse tail");
+        vfs.release_fh(tail_fh).await.expect("release tail writer");
+
+        let pending_before_extend = vfs
+            .pending_uploads_for_inode(ino)
+            .into_iter()
+            .map(|(offset, _, _)| offset)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            pending_before_extend,
+            BTreeSet::from([tail_offset]),
+            "tail flush after head publication must queue the tail upload"
+        );
+        assert!(
+            !vfs.live_extent_records_for_inode(ino).is_empty(),
+            "tail flush after head publication must retain a live extent guard"
+        );
+
+        let grow_fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open grow writer");
+        vfs.setattr_with_handle(Some(grow_fh), ino, SetattrArgs::size_only(logical_size))
+            .expect("extend logical EOF");
+
+        let pending_after_extend = vfs
+            .pending_uploads_for_inode(ino)
+            .into_iter()
+            .map(|(offset, _, _)| offset)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            pending_after_extend,
+            BTreeSet::from([tail_offset]),
+            "set_len after head publication must retain the sparse tail upload"
+        );
+
+        vfs.release_fh(grow_fh).await.expect("release grow writer");
+    });
+}
+
+#[test]
+fn pending_sparse_slice_commit_rebases_when_size_growth_overtakes_flush() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sparse-tail-rebases-after-size-growth");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sparse-tail-rebases-after-size-growth.bin", 0, 0, 0o644)
+            .expect("create sparse file");
+        let ino = attr.ino;
+        let tail = vec![b't'; 258];
+        let tail_offset = 1_048_569u64;
+        let logical_size = 2_097_275u64;
+
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open tail writer");
+        vfs.write_fh(fh, ino, tail_offset, &tail)
+            .await
+            .expect("write sparse tail");
+        vfs.materialize_writer_stack_for_inode(ino)
+            .await
+            .expect("materialize sparse tail before size growth");
+
+        let stale_dirty_attr = vfs
+            .state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .get(&ino)
+            .cloned()
+            .expect("tail write should leave dirty attr");
+        let mut grown_attr = stale_dirty_attr.clone();
+        grown_attr.size = logical_size;
+        grown_attr.content_epoch = grown_attr.content_epoch.saturating_add(1);
+        grown_attr.upload_state = MetaUploadState::Updating;
+        meta.set_attr(&grown_attr)
+            .expect("simulate size growth committing before tail flush");
+
+        vfs.flush_fh(fh)
+            .await
+            .expect("flush should rebase sparse tail to size-growth epoch");
+
+        let pending = vfs.pending_uploads_for_inode(ino);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0, tail_offset);
+        assert_eq!(
+            pending[0].2, grown_attr.content_epoch,
+            "overtaken sparse tail must upload under the size-growth epoch"
+        );
+
+        vfs.release_fh(fh).await.expect("release tail writer");
+    });
+}
+
+#[test]
+fn explicit_flush_sparse_extend_retains_kernel_zero_filled_tail_write() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "explicit-flush-sparse-zero-filled-tail");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(
+                1,
+                b"explicit-flush-sparse-zero-filled-tail.bin",
+                0,
+                0,
+                0o644,
+            )
+            .expect("create sparse file");
+        let ino = attr.ino;
+        let head = b"sparse-head";
+        let tail = vec![b't'; 258];
+        let tail_offset = 1_048_569u64;
+        let logical_size = 2_097_275u64;
+
+        let head_fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open head writer");
+        vfs.write_fh(head_fh, ino, 0, head)
+            .await
+            .expect("write sparse head");
+        vfs.flush_fh(head_fh)
+            .await
+            .expect("explicitly flush sparse head");
+        vfs.release_fh(head_fh).await.expect("release head writer");
+
+        let (head_epoch, head_blocks) = mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+        publish_current_file_graph(&meta, ino, head_epoch, &head_blocks);
+
+        let mut zero_filled_tail = vec![0; tail_offset as usize];
+        zero_filled_tail.extend_from_slice(&tail);
+        let tail_fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open tail writer");
+        vfs.write_fh(tail_fh, ino, 0, &zero_filled_tail)
+            .await
+            .expect("write kernel zero-filled sparse tail");
+        vfs.flush_fh(tail_fh)
+            .await
+            .expect("explicitly flush zero-filled sparse tail");
+        vfs.release_fh(tail_fh).await.expect("release tail writer");
+
+        assert!(
+            !vfs.pending_uploads_for_inode(ino).is_empty(),
+            "zero-filled sparse tail write must leave upload work queued before set_len"
+        );
+
+        let grow_fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open grow writer");
+        vfs.setattr_with_handle(Some(grow_fh), ino, SetattrArgs::size_only(logical_size))
+            .expect("extend logical EOF");
+        assert!(
+            !vfs.pending_uploads_for_inode(ino).is_empty(),
+            "set_len must not drop upload work for a zero-filled sparse tail write"
+        );
+
+        vfs.release_fh(grow_fh).await.expect("release grow writer");
+    });
+}
+
+#[test]
 fn sparse_extend_requeues_retained_overlay_when_runtime_upload_queue_is_empty() {
     let tmp = TempDir::new().expect("tempdir");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sparse-extend-retains-metadata-overlay");
@@ -10171,6 +10452,16 @@ fn release_fh_drains_tail_after_deferred_completed_block_materialization() {
         assert!(
             spans.iter().any(|span| span.payload.is_some()),
             "release should commit materialized payload slices"
+        );
+        let pending_offsets = vfs
+            .pending_uploads_for_inode(ino)
+            .into_iter()
+            .map(|(offset, _, _)| offset)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            pending_offsets,
+            BTreeSet::from([0, vfs.block_size as u64]),
+            "release should queue every committed sparse writer-stack slice for upload"
         );
     });
 }
