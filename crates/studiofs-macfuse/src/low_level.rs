@@ -18,7 +18,7 @@ use std::sync::{
 };
 
 use libc::{off_t, size_t, stat, statvfs};
-use parking_lot::Mutex as ParkingMutex;
+use parking_lot::{Mutex as ParkingMutex, RwLock};
 use studiofs_vfs::KernelInvalidator;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -685,23 +685,23 @@ struct MacFuseKernelInvalidator {
 
 #[derive(Debug)]
 struct SessionInvalidationState {
-    active: ParkingMutex<bool>,
+    active: RwLock<bool>,
 }
 
 impl SessionInvalidationState {
     fn new() -> Self {
         Self {
-            active: ParkingMutex::new(true),
+            active: RwLock::new(true),
         }
     }
 
-    fn begin_invalidation(&self) -> Option<parking_lot::MutexGuard<'_, bool>> {
-        let guard = self.active.lock();
+    fn begin_invalidation(&self) -> Option<parking_lot::RwLockReadGuard<'_, bool>> {
+        let guard = self.active.read();
         (*guard).then_some(guard)
     }
 
-    fn begin_shutdown(&self) -> parking_lot::MutexGuard<'_, bool> {
-        let mut guard = self.active.lock();
+    fn begin_shutdown(&self) -> parking_lot::RwLockWriteGuard<'_, bool> {
+        let mut guard = self.active.write();
         *guard = false;
         guard
     }
@@ -1272,6 +1272,9 @@ mod tests {
         let active = state
             .begin_invalidation()
             .expect("invalidation should start while session is active");
+        let concurrent_active = state
+            .begin_invalidation()
+            .expect("concurrent invalidations should share the active session gate");
         let (started_tx, started_rx) = mpsc::channel();
         let (closed_tx, closed_rx) = mpsc::channel();
         let shutdown_state = Arc::clone(&state);
@@ -1289,6 +1292,11 @@ mod tests {
         );
 
         drop(active);
+        assert!(
+            closed_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "shutdown must wait for every in-flight invalidation guard"
+        );
+        drop(concurrent_active);
         closed_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("shutdown should close after active invalidation releases");

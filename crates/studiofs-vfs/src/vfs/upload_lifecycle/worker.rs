@@ -121,8 +121,18 @@ struct UploadedObjectReconcile {
 
 const POST_PUT_STALE_RECONCILE_ATTEMPTS: usize = 16;
 const POST_PUT_STALE_RECONCILE_DELAY_MS: u64 = 5;
-const POST_PUT_VISIBILITY_ATTEMPTS: usize = 16;
-const POST_PUT_VISIBILITY_DELAY_MS: u64 = 5;
+const POST_PUT_VISIBILITY_ATTEMPTS: usize = 8;
+const POST_PUT_VISIBILITY_INITIAL_DELAY_MS: u64 = 25;
+const POST_PUT_VISIBILITY_MAX_DELAY_MS: u64 = 1_000;
+
+fn post_put_visibility_delay(attempt: usize) -> Duration {
+    let multiplier = 1u64.checked_shl(attempt.min(20) as u32).unwrap_or(u64::MAX);
+    Duration::from_millis(
+        POST_PUT_VISIBILITY_INITIAL_DELAY_MS
+            .saturating_mul(multiplier)
+            .min(POST_PUT_VISIBILITY_MAX_DELAY_MS),
+    )
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RemoteVisibility {
@@ -255,7 +265,7 @@ fn append_uploaded_object_reattach_slices(
         let part_len = u32::try_from(part_end.checked_sub(cursor)?).ok()?;
         let object_offset = u32::try_from(cursor.checked_sub(object_file_offset)?).ok()?;
         let range = SliceRange::new(chunk_offset, chunk_offset.checked_add(part_len)?)?;
-        let mut payload = if part_len == block_size && object_offset == 0 {
+        let mut payload = if part_len == block_size {
             PayloadRef::new_full(object_id, part_len)
         } else {
             PayloadRef::new_partial(object_id, part_len)
@@ -882,7 +892,7 @@ where
             tokio::select! {
                 _ = shutdown_token.cancelled() => return RemoteVisibility::Cancelled,
                 _ = upload_cancel_token.cancelled() => return RemoteVisibility::Cancelled,
-                _ = tokio::time::sleep(Duration::from_millis(POST_PUT_VISIBILITY_DELAY_MS)) => {}
+                _ = tokio::time::sleep(post_put_visibility_delay(attempt)) => {}
             }
         }
 
@@ -2017,6 +2027,50 @@ mod tests {
         FakeShutdown,
         FakePolicy,
     >;
+
+    #[test]
+    fn post_put_visibility_delay_uses_bounded_exponential_backoff() {
+        assert_eq!(post_put_visibility_delay(0), Duration::from_millis(25));
+        assert_eq!(post_put_visibility_delay(1), Duration::from_millis(50));
+        assert_eq!(post_put_visibility_delay(2), Duration::from_millis(100));
+        assert_eq!(post_put_visibility_delay(6), Duration::from_millis(1_000));
+        assert_eq!(post_put_visibility_delay(32), Duration::from_millis(1_000));
+    }
+
+    #[test]
+    fn reattach_uploaded_object_marks_full_block_at_nonzero_object_offset_as_full() {
+        let block_size = 4096;
+        let object_id = 42;
+        let spans = vec![ResolvedSliceSpan {
+            chunk_id: ChunkId(0),
+            range: SliceRange::new(block_size, block_size * 2).expect("hole range"),
+            source: ResolvedSliceSource::Hole,
+            slice_id: None,
+            slice_order: None,
+            payload: None,
+        }];
+
+        let reattached = uploaded_object_reattach_slices(
+            &spans,
+            object_id,
+            0,
+            u64::from(block_size * 2),
+            block_size,
+        )
+        .expect("full block should reattach over a hole");
+        let payload = reattached[0].1[0]
+            .payload
+            .as_ref()
+            .expect("reattached slice should carry payload");
+
+        assert_eq!(payload.object_id, object_id);
+        assert_eq!(payload.offset, block_size);
+        assert_eq!(payload.length, block_size);
+        assert!(
+            !payload.is_partial(),
+            "logical full blocks remain full even when their object offset is non-zero"
+        );
+    }
 
     #[derive(Clone, Default)]
     struct FakeCoordinator {
