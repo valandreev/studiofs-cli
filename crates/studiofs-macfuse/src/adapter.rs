@@ -2577,6 +2577,27 @@ pub extern "C" fn studiofs_macfuse_setattr(
         }
     };
     if setattr_args_are_empty(&args) {
+        if setattr_mask_is_accepted_noop(to_set) {
+            debug!(
+                ino,
+                to_set, "macFUSE setattr callback accepted unsupported metadata bits as no-op"
+            );
+            match state.adapter.getattr(ino) {
+                Ok(stat) => {
+                    if let Some(request) = owned_request(req) {
+                        let _ = Reply::new(request).attr(&stat, TTL_SECONDS);
+                    }
+                }
+                Err(errno) => {
+                    warn!(
+                        ino,
+                        to_set, errno, "macFUSE setattr no-op getattr returned error"
+                    );
+                    reply_error(req, errno);
+                }
+            }
+            return;
+        }
         warn!(
             ino,
             to_set,
@@ -2725,6 +2746,24 @@ fn setattr_mask_has_crtime(to_set: libc::c_int) -> bool {
 
 fn setattr_mask_has_unknown(to_set: libc::c_int) -> bool {
     to_set & !setattr_supported_mask() != 0
+}
+
+fn setattr_mask_is_accepted_noop(to_set: libc::c_int) -> bool {
+    let ignored = setattr_accepted_noop_mask();
+    // SAFETY: The C shim returns the header-defined FH bit, or zero when this
+    // FUSE version has no FH bit.
+    let fh = unsafe { crate::low_level::studiofs_macfuse_setattr_fh_mask() };
+    to_set & ignored != 0 && to_set & !(ignored | fh) == 0
+}
+
+fn setattr_accepted_noop_mask() -> libc::c_int {
+    // SAFETY: Each C shim returns one header-defined bit for this build, or zero
+    // for optional bits not present in the active FUSE headers.
+    unsafe {
+        crate::low_level::studiofs_macfuse_setattr_chgtime_mask()
+            | crate::low_level::studiofs_macfuse_setattr_bkuptime_mask()
+            | crate::low_level::studiofs_macfuse_setattr_flags_mask()
+    }
 }
 
 fn setattr_supported_mask() -> libc::c_int {
@@ -3173,6 +3212,33 @@ mod tests {
         };
 
         assert!(!setattr_mask_has_unknown(mask));
+    }
+
+    #[test]
+    fn setattr_macos_metadata_bits_are_accepted_noops() {
+        // SAFETY: The C shim returns platform header values for this build, or
+        // zero for optional bits absent from the active FUSE headers.
+        let (flags, chgtime, bkuptime, fh) = unsafe {
+            (
+                crate::low_level::studiofs_macfuse_setattr_flags_mask(),
+                crate::low_level::studiofs_macfuse_setattr_chgtime_mask(),
+                crate::low_level::studiofs_macfuse_setattr_bkuptime_mask(),
+                crate::low_level::studiofs_macfuse_setattr_fh_mask(),
+            )
+        };
+        let ignored = flags | chgtime | bkuptime;
+
+        assert_eq!(
+            setattr_mask_is_accepted_noop(ignored),
+            ignored != 0,
+            "at least one optional no-op mask should be accepted when present"
+        );
+        if flags != 0 {
+            assert!(setattr_mask_is_accepted_noop(flags | fh));
+        }
+        if fh != 0 {
+            assert!(!setattr_mask_is_accepted_noop(fh));
+        }
     }
 
     #[test]
