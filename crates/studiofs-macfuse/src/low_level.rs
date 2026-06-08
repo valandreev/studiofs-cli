@@ -17,7 +17,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-use libc::{off_t, size_t, stat, statvfs};
+use libc::{mode_t, off_t, size_t, stat, statvfs};
 use parking_lot::{Mutex as ParkingMutex, RwLock};
 use studiofs_vfs::KernelInvalidator;
 use thiserror::Error;
@@ -117,6 +117,22 @@ pub(crate) mod raw {
         pub fh: u64,
         /// Lock owner.
         pub lock_owner: u64,
+    }
+
+    /// Darwin-specific setattr extension payload used by macFUSE.
+    #[repr(C)]
+    pub struct FuseSetattrX {
+        pub valid: i32,
+        pub mode: mode_t,
+        pub uid: libc::uid_t,
+        pub gid: libc::gid_t,
+        pub size: off_t,
+        pub acctime: libc::timespec,
+        pub modtime: libc::timespec,
+        pub crtime: libc::timespec,
+        pub chgtime: libc::timespec,
+        pub bkuptime: libc::timespec,
+        pub flags: u32,
     }
 
     impl FuseFileInfo {
@@ -264,6 +280,9 @@ unsafe extern "C" {
     #[cfg(test)]
     fn studiofs_macfuse_low_level_ops_has_rmdir_callback(ops: *const raw::FuseLowLevelOps)
     -> c_int;
+    #[cfg(test)]
+    fn studiofs_macfuse_low_level_ops_has_mknod_callback(ops: *const raw::FuseLowLevelOps)
+    -> c_int;
     fn studiofs_macfuse_conn_info_configure(
         conn: *mut raw::FuseConnInfo,
         max_write: c_uint,
@@ -390,6 +409,12 @@ impl LowLevelOperations {
         // SAFETY: The C shim only inspects callback pointers in a static table.
         unsafe { studiofs_macfuse_low_level_ops_has_rmdir_callback(self.raw) != 0 }
     }
+
+    #[cfg(test)]
+    pub(crate) fn has_mknod_callback(self) -> bool {
+        // SAFETY: The C shim only inspects callback pointers in a static table.
+        unsafe { studiofs_macfuse_low_level_ops_has_mknod_callback(self.raw) != 0 }
+    }
 }
 
 /// Owned copy of callback-scoped `fuse_file_info` data.
@@ -484,7 +509,6 @@ impl SessionConfig {
                 args.push("-odaemon_timeout=60".to_owned());
                 args.push(format!("-oiosize={MACOS_FUSE_IOSIZE_BYTES}"));
                 args.push(format!("-omax_read={MACOS_FUSE_IOSIZE_BYTES}"));
-                args.push("-onoappledouble".to_owned());
                 args.push("-odefer_permissions".to_owned());
             }
         }

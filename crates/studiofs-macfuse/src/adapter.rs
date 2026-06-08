@@ -18,6 +18,7 @@ use parking_lot::Mutex as ParkingMutex;
 use studiofs_bridge::posix::{
     BridgeFileAttr, BridgeFileType, posix_flags_to_open_flags, to_bridge_attr, vfs_err_to_errno,
 };
+use studiofs_meta::engine::XATTR_CREATE_FLAG;
 use studiofs_meta::schema::ResolvedSliceSource;
 use studiofs_meta::{DirEntry, FileType, InodeAttr, SetattrArgs, TimeSpec, UploadState};
 use studiofs_vfs::{
@@ -47,6 +48,9 @@ const MACFUSE_READ_WINDOW_MAX_BYTES: usize = 8 * 1024 * 1024;
 const MACFUSE_READ_WINDOW_MIN_BYTES: usize = 128 * 1024;
 const MACFUSE_ASYNC_READ_SNAPSHOT_INTERVAL: Duration = Duration::from_millis(500);
 const MACFUSE_READ_INTERRUPTED_ERRNO: i32 = libc::EINTR;
+const MACOS_PROVENANCE_XATTR: &[u8] = b"com.apple.provenance";
+const MACOS_DS_STORE_NAME: &[u8] = b".DS_Store";
+const MACOS_UF_HIDDEN: u32 = 0x0000_8000;
 #[cfg(not(test))]
 const MACFUSE_OPEN_CACHE_SNAPSHOT_LIMIT: usize = 8192;
 #[cfg(test)]
@@ -72,6 +76,7 @@ pub(crate) struct StudioVfsAdapter {
     readdir_cache_last_pruned: Mutex<Option<Instant>>,
     readdir_cache_ready: Condvar,
     open_cache_snapshots: Arc<ParkingMutex<LruCache<u64, MacFuseOpenCacheSnapshot>>>,
+    file_flags: Mutex<HashMap<u64, u32>>,
     read_admission: Arc<Semaphore>,
     read_queue_byte_limit: u32,
     read_buffers: Arc<ReadBufferPool>,
@@ -722,6 +727,7 @@ impl StudioVfsAdapter {
             open_cache_snapshots: Arc::new(ParkingMutex::new(LruCache::new(
                 open_cache_snapshot_capacity(),
             ))),
+            file_flags: Mutex::new(HashMap::new()),
             read_admission: Arc::new(Semaphore::new(read_queue_byte_limit as usize)),
             read_queue_byte_limit,
             read_buffers: Arc::new(ReadBufferPool::default()),
@@ -855,9 +861,28 @@ impl StudioVfsAdapter {
             .vfs
             .create(parent, name, self.mount_uid, self.mount_gid, mode & 0o7777)
             .map_err(|error| vfs_err_to_errno(&error))?;
+        self.remember_named_file_flags(attr.ino, name);
         self.invalidate_readdir_cache(parent);
         let open = self.open(attr.ino, flags)?;
         Ok((attr, open))
+    }
+
+    /// Create a regular file through the macFUSE mknod callback.
+    pub(crate) fn mknod(&self, parent: u64, name: &[u8], mode: mode_t) -> Result<InodeAttr, i32> {
+        if self.read_only {
+            return Err(libc::EROFS);
+        }
+        let file_type = mode & libc::S_IFMT as mode_t;
+        if file_type != 0 && file_type != libc::S_IFREG as mode_t {
+            return Err(libc::ENOTSUP);
+        }
+        self.vfs
+            .create(parent, name, self.mount_uid, self.mount_gid, mode & 0o7777)
+            .inspect(|attr| {
+                self.remember_named_file_flags(attr.ino, name);
+                self.invalidate_readdir_cache(parent);
+            })
+            .map_err(|error| vfs_err_to_errno(&error))
     }
 
     /// Open an existing file.
@@ -1047,6 +1072,9 @@ impl StudioVfsAdapter {
                 self.invalidate_readdir_cache(parent);
                 if newparent != parent {
                     self.invalidate_readdir_cache(newparent);
+                }
+                if let Ok(attr) = self.vfs.lookup(newparent, newname) {
+                    self.remember_named_file_flags(attr.ino, newname);
                 }
             })
             .map_err(|error| vfs_err_to_errno(&error))
@@ -1627,6 +1655,7 @@ impl StudioVfsAdapter {
         if self.read_only {
             return Err(libc::EROFS);
         }
+        let flags = macfuse_set_xattr_flags(name, flags);
         self.vfs
             .set_xattr(ino, name, value, flags)
             .map_err(|error| vfs_err_to_errno(&error))
@@ -1650,12 +1679,34 @@ impl StudioVfsAdapter {
     }
 
     fn attr_to_stat(&self, attr: &InodeAttr) -> stat {
-        bridge_attr_to_stat(&to_bridge_attr(
+        let mut stat = bridge_attr_to_stat(&to_bridge_attr(
             attr,
             self.mount_uid,
             self.mount_gid,
             MACFUSE_ATTR_BLOCK_SIZE,
-        ))
+        ));
+        if let Some(flags) = self.file_flags.lock().unwrap().get(&attr.ino).copied() {
+            assign_stat_flags(&mut stat, flags);
+            if flags & MACOS_UF_HIDDEN != 0 {
+                assign_hidden_file_stat_times(&mut stat);
+            }
+        }
+        stat
+    }
+
+    fn remember_callback_file_flags(&self, ino: u64, attr: *const stat, to_set: libc::c_int) {
+        if to_set == 0 || setattr_mask_has_flags(to_set) {
+            self.file_flags
+                .lock()
+                .unwrap()
+                .insert(ino, callback_stat_flags(attr));
+        }
+    }
+
+    fn remember_named_file_flags(&self, ino: u64, name: &[u8]) {
+        if name == MACOS_DS_STORE_NAME {
+            self.file_flags.lock().unwrap().insert(ino, MACOS_UF_HIDDEN);
+        }
     }
 
     fn dir_entry_to_stat(&self, entry: &DirEntry) -> stat {
@@ -1997,6 +2048,36 @@ fn bridge_attr_to_stat(attr: &BridgeFileAttr) -> stat {
     out
 }
 
+#[cfg(target_os = "macos")]
+fn assign_stat_flags(out: &mut stat, flags: u32) {
+    out.st_flags = flags;
+}
+
+#[cfg(not(target_os = "macos"))]
+fn assign_stat_flags(_out: &mut stat, _flags: u32) {}
+
+#[cfg(target_os = "macos")]
+fn assign_hidden_file_stat_times(out: &mut stat) {
+    out.st_birthtime = out.st_mtime;
+    out.st_birthtime_nsec = out.st_mtime_nsec;
+    out.st_ctime = out.st_mtime;
+    out.st_ctime_nsec = out.st_mtime_nsec;
+}
+
+#[cfg(not(target_os = "macos"))]
+fn assign_hidden_file_stat_times(_out: &mut stat) {}
+
+#[cfg(target_os = "macos")]
+fn callback_stat_flags(attr: *const stat) -> u32 {
+    // SAFETY: The setattr callback already checked the pointer for null.
+    unsafe { (*attr).st_flags }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn callback_stat_flags(_attr: *const stat) -> u32 {
+    0
+}
+
 fn mode_bits(attr: &BridgeFileAttr) -> libc::mode_t {
     let kind = match attr.kind {
         BridgeFileType::RegularFile => libc::S_IFREG,
@@ -2207,6 +2288,53 @@ pub extern "C" fn studiofs_macfuse_symlink(
                 target = %String::from_utf8_lossy(target),
                 errno,
                 "macFUSE symlink callback returned error"
+            );
+            reply_error(req, errno);
+        }
+    }
+}
+
+/// macFUSE mknod callback for regular-file creation paths that do not use create.
+#[unsafe(no_mangle)]
+pub extern "C" fn studiofs_macfuse_mknod(
+    req: *mut raw::FuseReq,
+    parent: raw::FuseIno,
+    name: *const c_char,
+    mode: mode_t,
+    _rdev: libc::dev_t,
+) {
+    let Some(state) = callback_state(req) else {
+        reply_error(req, libc::EIO);
+        return;
+    };
+    if name.is_null() {
+        reply_error(req, libc::EINVAL);
+        return;
+    }
+    // SAFETY: macFUSE passes a NUL-terminated entry name for mknod callbacks.
+    let name = unsafe { CStr::from_ptr(name) }.to_bytes();
+    match state.adapter.mknod(parent, name, mode) {
+        Ok(attr) => {
+            debug!(
+                parent,
+                name = %String::from_utf8_lossy(name),
+                ino = attr.ino,
+                mode,
+                "macFUSE mknod callback created entry"
+            );
+            let stat = state.adapter.attr_to_stat(&attr);
+            if let Some(request) = owned_request(req) {
+                let entry = Entry::new(attr.ino, 0, stat, TTL_SECONDS, TTL_SECONDS);
+                let _ = Reply::new(request).entry(&entry);
+            }
+        }
+        Err(errno) => {
+            warn!(
+                parent,
+                name = %String::from_utf8_lossy(name),
+                mode,
+                errno,
+                "macFUSE mknod callback returned error"
             );
             reply_error(req, errno);
         }
@@ -2578,6 +2706,9 @@ pub extern "C" fn studiofs_macfuse_setattr(
     };
     if setattr_args_are_empty(&args) {
         if setattr_mask_is_accepted_noop(to_set) {
+            state
+                .adapter
+                .remember_callback_file_flags(ino, attr, to_set);
             debug!(
                 ino,
                 to_set, "macFUSE setattr callback accepted unsupported metadata bits as no-op"
@@ -2629,6 +2760,114 @@ pub extern "C" fn studiofs_macfuse_setattr(
             reply_error(req, errno);
         }
     }
+}
+
+/// macFUSE Darwin setattr extension callback for file flags and extra times.
+#[unsafe(no_mangle)]
+pub extern "C" fn studiofs_macfuse_setattr_x(
+    req: *mut raw::FuseReq,
+    ino: raw::FuseIno,
+    attr: *mut raw::FuseSetattrX,
+    to_set: libc::c_int,
+    _fi: *mut raw::FuseFileInfo,
+) {
+    let Some(state) = callback_state(req) else {
+        reply_error(req, libc::EIO);
+        return;
+    };
+    if attr.is_null() {
+        reply_error(req, libc::EINVAL);
+        return;
+    }
+    let flags = unsafe { (*attr).flags };
+    if setattr_mask_has_flags(to_set) {
+        state.adapter.file_flags.lock().unwrap().insert(ino, flags);
+    }
+    let args = match setattr_x_args_from_callback(attr, to_set) {
+        Ok(args) => args,
+        Err(errno) => {
+            warn!(
+                ino,
+                to_set, errno, "macFUSE setattr_x callback rejected arguments"
+            );
+            reply_error(req, errno);
+            return;
+        }
+    };
+    debug!(
+        ino,
+        to_set, flags, "macFUSE setattr_x callback accepted Darwin metadata as overlay"
+    );
+    if !setattr_args_are_empty(&args) {
+        match state.adapter.setattr(None, ino, args) {
+            Ok(attr) => {
+                let stat = state.adapter.attr_to_stat(&attr);
+                if let Some(request) = owned_request(req) {
+                    let _ = Reply::new(request).attr(&stat, TTL_SECONDS);
+                }
+            }
+            Err(errno) => {
+                warn!(
+                    ino,
+                    to_set, errno, "macFUSE setattr_x callback returned error"
+                );
+                reply_error(req, errno);
+            }
+        }
+        return;
+    }
+    match state.adapter.getattr(ino) {
+        Ok(stat) => {
+            if let Some(request) = owned_request(req) {
+                let _ = Reply::new(request).attr(&stat, TTL_SECONDS);
+            }
+        }
+        Err(errno) => {
+            warn!(
+                ino,
+                to_set, errno, "macFUSE setattr_x getattr returned error"
+            );
+            reply_error(req, errno);
+        }
+    }
+}
+
+fn setattr_x_args_from_callback(
+    attr: *const raw::FuseSetattrX,
+    to_set: libc::c_int,
+) -> Result<SetattrArgs, i32> {
+    // SAFETY: The caller checked `attr` for null and macFUSE passes an
+    // initialized Darwin setattr payload for setattr_x callbacks.
+    let attr = unsafe { &*attr };
+    let mut args = SetattrArgs::default();
+    if setattr_mask_has_size(to_set) {
+        args.size = Some(u64::try_from(attr.size).map_err(|_| libc::EINVAL)?);
+    }
+    if setattr_mask_has_mode(to_set) {
+        args.mode = Some(attr.mode & 0o7777);
+    }
+    if setattr_mask_has_uid(to_set) {
+        args.uid = Some(attr.uid);
+    }
+    if setattr_mask_has_gid(to_set) {
+        args.gid = Some(attr.gid);
+    }
+    if setattr_mask_has_atime(to_set) {
+        args.atime = TimeSpec::Set(stat_time_to_nanos(
+            attr.acctime.tv_sec,
+            attr.acctime.tv_nsec,
+        )?);
+    }
+    if setattr_mask_has_mtime(to_set) {
+        args.mtime = TimeSpec::Set(stat_time_to_nanos(
+            attr.modtime.tv_sec,
+            attr.modtime.tv_nsec,
+        )?);
+    }
+    if setattr_mask_has_crtime(to_set) {
+        args.crtime = TimeSpec::Set(stat_time_to_nanos(attr.crtime.tv_sec, attr.crtime.tv_nsec)?);
+    }
+    Ok(args)
 }
 
 fn setattr_args_from_callback(attr: *const stat, to_set: libc::c_int) -> Result<SetattrArgs, i32> {
@@ -2744,11 +2983,20 @@ fn setattr_mask_has_crtime(to_set: libc::c_int) -> bool {
     unsafe { to_set & crate::low_level::studiofs_macfuse_setattr_crtime_mask() != 0 }
 }
 
+fn setattr_mask_has_flags(to_set: libc::c_int) -> bool {
+    // SAFETY: The C shim returns the header-defined FLAGS bit, or zero when
+    // this FUSE version does not define it.
+    unsafe { to_set & crate::low_level::studiofs_macfuse_setattr_flags_mask() != 0 }
+}
+
 fn setattr_mask_has_unknown(to_set: libc::c_int) -> bool {
     to_set & !setattr_supported_mask() != 0
 }
 
 fn setattr_mask_is_accepted_noop(to_set: libc::c_int) -> bool {
+    if to_set == 0 {
+        return true;
+    }
     let ignored = setattr_accepted_noop_mask();
     // SAFETY: The C shim returns the header-defined FH bit, or zero when this
     // FUSE version has no FH bit.
@@ -3073,6 +3321,14 @@ fn xattr_not_found_errno() -> i32 {
     libc::ENOATTR
 }
 
+fn macfuse_set_xattr_flags(name: &[u8], flags: u32) -> u32 {
+    if name == MACOS_PROVENANCE_XATTR {
+        flags & !XATTR_CREATE_FLAG
+    } else {
+        flags
+    }
+}
+
 async fn acquire_read_admission(
     admission: Arc<Semaphore>,
     size: u32,
@@ -3099,6 +3355,7 @@ async fn acquire_read_admission(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use studiofs_meta::engine::XATTR_REPLACE_FLAG;
 
     #[test]
     fn read_buffer_pool_keeps_recycled_initialized_prefix_len() {
@@ -3228,6 +3485,10 @@ mod tests {
         };
         let ignored = flags | chgtime | bkuptime;
 
+        assert!(
+            setattr_mask_is_accepted_noop(0),
+            "macFUSE can report chflags with an empty setattr mask"
+        );
         assert_eq!(
             setattr_mask_is_accepted_noop(ignored),
             ignored != 0,
@@ -3269,6 +3530,20 @@ mod tests {
         assert_eq!(
             callback_error_log_level("getxattr", libc::EIO),
             Some(CallbackErrorLogLevel::Warn)
+        );
+    }
+
+    #[test]
+    fn provenance_xattr_create_flag_is_idempotent_for_macos_copyfile() {
+        let flags = XATTR_CREATE_FLAG | XATTR_REPLACE_FLAG;
+
+        assert_eq!(
+            macfuse_set_xattr_flags(MACOS_PROVENANCE_XATTR, flags),
+            XATTR_REPLACE_FLAG
+        );
+        assert_eq!(
+            macfuse_set_xattr_flags(b"com.apple.FinderInfo", flags),
+            flags
         );
     }
 

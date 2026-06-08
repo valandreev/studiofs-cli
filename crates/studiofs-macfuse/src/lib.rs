@@ -373,7 +373,7 @@ mod tests {
                 .iter()
                 .any(|arg| arg == &format!("-omax_read={expected_geometry}"))
         );
-        assert!(mount_args.iter().any(|arg| arg == "-onoappledouble"));
+        assert!(!mount_args.iter().any(|arg| arg == "-onoappledouble"));
         assert!(mount_args.iter().any(|arg| arg == "-odefer_permissions"));
         assert!(mount_args.iter().any(|arg| arg == "-osparse"));
         assert!(!mount_args.iter().any(|arg| arg == "-odirect_io"));
@@ -442,6 +442,12 @@ mod tests {
     fn writable_studio_vfs_low_level_ops_install_rmdir_callback() {
         assert!(super::low_level::LowLevelOperations::studio_vfs().has_rmdir_callback());
         assert!(!super::low_level::LowLevelOperations::read_only_studio_vfs().has_rmdir_callback());
+    }
+
+    #[test]
+    fn writable_studio_vfs_low_level_ops_install_mknod_callback() {
+        assert!(super::low_level::LowLevelOperations::studio_vfs().has_mknod_callback());
+        assert!(!super::low_level::LowLevelOperations::read_only_studio_vfs().has_mknod_callback());
     }
 
     #[test]

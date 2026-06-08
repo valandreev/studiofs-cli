@@ -6502,7 +6502,7 @@ fn ignored_entry_writes_preserve_synthetic_attr_size() {
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "ignored-entry-write-size");
     let _guard = rt.enter();
     rt.block_on(async {
-        let inode_attr = vfs.create(1, b".DS_Store", 0, 0, 0o644).unwrap();
+        let inode_attr = vfs.create(1, b"._DS_Store", 0, 0, 0o644).unwrap();
         let inode_payload = b"synthetic-inode";
         vfs.write_with_local_sync_policy(
             inode_attr.ino,
@@ -6558,6 +6558,12 @@ fn ignored_entry_writes_preserve_synthetic_attr_size() {
             "ignored-entry handle writes should remain readable at the new synthetic length"
         );
         vfs.release_fh(fh).await.unwrap();
+        let handle_after_release = vfs.getattr(handle_attr.ino).unwrap();
+        assert_eq!(
+            handle_after_release.size,
+            handle_payload.len() as u64,
+            "ignored-entry close must not remove the synthetic inode before copyfile metadata completes"
+        );
     });
 }
 

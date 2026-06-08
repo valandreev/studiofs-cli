@@ -642,12 +642,16 @@ impl StudioVfs {
         context: &HandleReleaseContext,
     ) -> LastHandleReleaseAction {
         let ino = context.ino;
-        if self.release_ignored_entry(ino) {
-            let _ = self.handle_table.take_orphan(ino);
+        let is_ignored_entry = self.ignored_entry_attr(ino).is_some();
+        let is_orphan = self.handle_table.take_orphan(ino);
+        if is_ignored_entry {
+            if is_orphan {
+                self.release_ignored_entry(ino);
+            }
             return LastHandleReleaseAction::IgnoredEntry;
         }
 
-        if self.handle_table.take_orphan(ino) {
+        if is_orphan {
             return LastHandleReleaseAction::OrphanCleanup;
         }
 
