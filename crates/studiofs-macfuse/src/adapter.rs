@@ -1894,6 +1894,12 @@ fn callback_error_log_level(operation: &'static str, errno: i32) -> Option<Callb
     if operation == "getxattr" && errno == xattr_not_found_errno() {
         return None;
     }
+    if operation == "lookup" && errno == libc::ENOENT {
+        return None;
+    }
+    if operation == "removexattr" && errno == libc::ENOENT {
+        return None;
+    }
     if operation == "read" && errno == MACFUSE_READ_INTERRUPTED_ERRNO {
         return None;
     }
@@ -2075,12 +2081,14 @@ pub extern "C" fn studiofs_macfuse_lookup(
             }
         }
         Err(errno) => {
-            warn!(
-                parent,
-                name = %String::from_utf8_lossy(name),
-                errno,
-                "macFUSE lookup callback returned error"
-            );
+            if callback_error_log_level("lookup", errno).is_some() {
+                warn!(
+                    parent,
+                    name = %String::from_utf8_lossy(name),
+                    errno,
+                    "macFUSE lookup callback returned error"
+                );
+            }
             reply_error(req, errno);
         }
     }
@@ -2104,7 +2112,9 @@ pub extern "C" fn studiofs_macfuse_getattr(
             }
         }
         Err(errno) => {
-            warn!(ino, errno, "macFUSE getattr callback returned error");
+            if callback_error_log_level("getattr", errno).is_some() {
+                warn!(ino, errno, "macFUSE getattr callback returned error");
+            }
             reply_error(req, errno);
         }
     }
@@ -3143,12 +3153,14 @@ mod tests {
     }
 
     #[test]
-    fn callback_error_log_level_ignores_success_and_expected_xattr_misses() {
+    fn callback_error_log_level_ignores_success_and_expected_macos_probes() {
         assert_eq!(callback_error_log_level("write", 0), None);
         assert_eq!(
             callback_error_log_level("getxattr", xattr_not_found_errno()),
             None
         );
+        assert_eq!(callback_error_log_level("lookup", libc::ENOENT), None);
+        assert_eq!(callback_error_log_level("removexattr", libc::ENOENT), None);
         assert_eq!(
             callback_error_log_level("read", MACFUSE_READ_INTERRUPTED_ERRNO),
             None
@@ -3162,7 +3174,7 @@ mod tests {
             Some(CallbackErrorLogLevel::Warn)
         );
         assert_eq!(
-            callback_error_log_level("lookup", libc::ENOENT),
+            callback_error_log_level("lookup", libc::EIO),
             Some(CallbackErrorLogLevel::Warn)
         );
         assert_eq!(
