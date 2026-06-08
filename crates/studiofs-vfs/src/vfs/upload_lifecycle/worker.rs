@@ -1,6 +1,4 @@
-use super::super::{
-    FileSessionOperation, Ino, InodeAttr, StudioVfs, VfsError, VfsResult, block_index_from_offset,
-};
+use super::super::{FileSessionOperation, Ino, InodeAttr, StudioVfs, VfsError, VfsResult};
 use crate::VfsMeta;
 use crate::runtime::{TimeoutOrCancel, run_meta, run_with_timeout_or_cancel};
 use crate::utils::now_unix_millis;
@@ -17,8 +15,9 @@ use studiofs_data::object::{
     CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, create_object_buffer, format_object_fragment_keys,
 };
 use studiofs_meta::schema::{
-    ChunkId, FileType, PayloadRef, PayloadRefState, ResolvedSliceSource, ResolvedSliceSpan,
-    SliceId, SliceOrder, SliceRange, SliceRecord,
+    ChunkId, DEFAULT_CHUNK_SIZE, FileType, PayloadRef, PayloadRefState, ResolvedSliceSource,
+    ResolvedSliceSpan, SliceId, SliceOrder, SliceRange, SliceRecord, block_index_from_offset,
+    chunk_id_from_offset, chunk_start_offset,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
@@ -186,37 +185,87 @@ fn foreground_upload_reread_pacing_delay(foreground_active: bool, reread_bytes: 
     Duration::from_nanos(nanos)
 }
 
-fn spans_allow_uploaded_object_reattach(
+fn uploaded_object_reattach_slices(
     spans: &[ResolvedSliceSpan],
-    expected_chunk: ChunkId,
-    expected_range: SliceRange,
     object_id: u64,
-) -> bool {
-    let mut covered_until = expected_range.start;
+    offset: u64,
+    payload_len: u64,
+    block_size: u32,
+) -> Option<Vec<(ChunkId, Vec<SliceRecord>)>> {
+    let request_end = offset.checked_add(payload_len)?;
+    let mut chunk_slices: BTreeMap<ChunkId, Vec<SliceRecord>> = BTreeMap::new();
+
     for span in spans {
-        if span.chunk_id != expected_chunk {
+        let span_start = chunk_start_offset(span.chunk_id, DEFAULT_CHUNK_SIZE)
+            .checked_add(u64::from(span.range.start))?;
+        let span_end = chunk_start_offset(span.chunk_id, DEFAULT_CHUNK_SIZE)
+            .checked_add(u64::from(span.range.end))?;
+        let start = span_start.max(offset);
+        let end = span_end.min(request_end);
+        if start >= end {
             continue;
         }
-        let Some(intersection) = span.range.intersection(expected_range) else {
-            continue;
-        };
-        let safe_span = match span.source {
+
+        let should_reattach = match span.source {
             ResolvedSliceSource::Hole => span.payload.is_none(),
             ResolvedSliceSource::Overlay | ResolvedSliceSource::Base => span
                 .payload
                 .as_ref()
                 .is_some_and(|payload| payload.object_id == object_id),
-            ResolvedSliceSource::OverlayTombstone | ResolvedSliceSource::BaseTombstone => false,
+            ResolvedSliceSource::OverlayTombstone | ResolvedSliceSource::BaseTombstone => {
+                return None;
+            }
         };
-        if intersection.start > covered_until || !safe_span {
-            return false;
-        }
-        covered_until = covered_until.max(intersection.end);
-        if covered_until >= expected_range.end {
-            return true;
+
+        if should_reattach {
+            append_uploaded_object_reattach_slices(
+                &mut chunk_slices,
+                object_id,
+                offset,
+                start,
+                end,
+                block_size,
+            )?;
         }
     }
-    false
+
+    if chunk_slices.is_empty() {
+        return None;
+    }
+    Some(chunk_slices.into_iter().collect())
+}
+
+fn append_uploaded_object_reattach_slices(
+    chunk_slices: &mut BTreeMap<ChunkId, Vec<SliceRecord>>,
+    object_id: u64,
+    object_file_offset: u64,
+    start: u64,
+    end: u64,
+    block_size: u32,
+) -> Option<()> {
+    let mut cursor = start;
+    while cursor < end {
+        let chunk_id = chunk_id_from_offset(cursor, DEFAULT_CHUNK_SIZE);
+        let chunk_start = chunk_start_offset(chunk_id, DEFAULT_CHUNK_SIZE);
+        let chunk_end = chunk_start.checked_add(u64::from(DEFAULT_CHUNK_SIZE))?;
+        let part_end = end.min(chunk_end);
+        let chunk_offset = u32::try_from(cursor.checked_sub(chunk_start)?).ok()?;
+        let part_len = u32::try_from(part_end.checked_sub(cursor)?).ok()?;
+        let object_offset = u32::try_from(cursor.checked_sub(object_file_offset)?).ok()?;
+        let range = SliceRange::new(chunk_offset, chunk_offset.checked_add(part_len)?)?;
+        let mut payload = if part_len == block_size && object_offset == 0 {
+            PayloadRef::new_full(object_id, part_len)
+        } else {
+            PayloadRef::new_partial(object_id, part_len)
+        };
+        payload.offset = object_offset;
+
+        let mut slice = SliceRecord::new(SliceId(0), SliceOrder(0), range, payload);
+        slice.payload_state = PayloadRefState::Uploaded;
+        chunk_slices.entry(chunk_id).or_default().push(slice);
+        cursor = part_end;
+    }
+    Some(())
 }
 
 trait CachedStorePort: Clone + Send + Sync + 'static {
@@ -1241,28 +1290,9 @@ impl UploadMetaPort for VfsUploadMetaPort {
         if payload_len == 0 {
             return Ok(None);
         }
-        let block_size_u64 = u64::from(block_size);
         let Some(end_offset) = offset.checked_add(payload_len) else {
             return Ok(None);
         };
-        let chunk_index = block_index_from_offset(offset, block_size);
-        let chunk_start = offset % block_size_u64;
-        let Some(chunk_end) = chunk_start.checked_add(payload_len) else {
-            return Ok(None);
-        };
-        let Ok(chunk_start) = u32::try_from(chunk_start) else {
-            return Ok(None);
-        };
-        let Ok(chunk_end) = u32::try_from(chunk_end) else {
-            return Ok(None);
-        };
-        let Some(range) = SliceRange::new(chunk_start, chunk_end) else {
-            return Ok(None);
-        };
-        let Ok(payload_len_u32) = u32::try_from(payload_len) else {
-            return Ok(None);
-        };
-        let chunk_id = ChunkId(u64::from(chunk_index));
         let meta = self.vfs.meta.clone();
         run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
             let latest_attr = match engine.get_attr(ino) {
@@ -1275,9 +1305,11 @@ impl UploadMetaPort for VfsUploadMetaPort {
             }
 
             let spans = engine.lookup_regular_file_slices(ino, offset, payload_len)?;
-            if !spans_allow_uploaded_object_reattach(&spans, chunk_id, range, object_id) {
+            let Some(chunk_slices) =
+                uploaded_object_reattach_slices(&spans, object_id, offset, payload_len, block_size)
+            else {
                 return Ok(None);
-            }
+            };
 
             let mut rebased_attr = latest_attr;
             let rebased_epoch = if content_epoch > rebased_attr.content_epoch {
@@ -1291,16 +1323,9 @@ impl UploadMetaPort for VfsUploadMetaPort {
             rebased_attr.content_epoch = rebased_epoch;
             rebased_attr.touch_mtime();
 
-            let payload = if payload_len_u32 == block_size {
-                PayloadRef::new_full(object_id, payload_len_u32)
-            } else {
-                PayloadRef::new_partial(object_id, payload_len_u32)
-            };
-            let mut slice = SliceRecord::new(SliceId(0), SliceOrder(0), range, payload);
-            slice.payload_state = PayloadRefState::Uploaded;
             let applied = engine.flush_regular_file_overlay_slices_with_attr(
                 ino,
-                &[(chunk_id, vec![slice])],
+                &chunk_slices,
                 Some(&rebased_attr),
             )?;
             Ok(applied.map(|attr| attr.content_epoch))
@@ -2448,6 +2473,116 @@ mod tests {
             meta.has_regular_file_overlay_object_if_matches(ready_attr.ino, 3, 6)
                 .expect("rebased overlay object present"),
             "rebased upload must become the current overlay object"
+        );
+    }
+
+    #[test]
+    fn vfs_upload_meta_reattaches_materialized_sparse_upload_over_uncovered_tail() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "reattach-materialized-sparse-upload");
+        let created = vfs
+            .create(1, b"reattach-materialized-sparse-upload.bin", 0, 0, 0o644)
+            .expect("create sparse file");
+        let prefix_len = 233u32;
+        let materialized_len = 1_048_831u64;
+        let published_prefix_object = 4;
+        let materialized_upload_object = 6;
+
+        let mut published_attr = created;
+        published_attr.size = u64::from(prefix_len);
+        published_attr.committed_size = published_attr.size;
+        published_attr.content_epoch = 1;
+        published_attr.committed_content_epoch = 1;
+        published_attr.upload_state = UploadState::Updating;
+        meta.set_attr(&published_attr)
+            .expect("seed prefix attr before publish");
+        let prefix_slice = SliceRecord::new(
+            SliceId(0),
+            SliceOrder(0),
+            SliceRange::new(0, prefix_len).expect("prefix range"),
+            PayloadRef::new_partial(published_prefix_object, prefix_len),
+        );
+        meta.flush_regular_file_overlay_slices_with_attr(
+            published_attr.ino,
+            &[(ChunkId(0), vec![prefix_slice])],
+            Some(&published_attr),
+        )
+        .expect("stage published prefix object");
+        assert!(
+            meta.mark_regular_file_overlay_object_uploaded_if_matches(
+                published_attr.ino,
+                1,
+                published_prefix_object,
+            )
+            .expect("mark prefix uploaded")
+        );
+        assert!(
+            meta.publish_regular_file_overlay_to_base_if_matches(published_attr.ino, 1)
+                .expect("publish prefix to base")
+        );
+
+        let mut ready_attr = meta
+            .get_attr(published_attr.ino)
+            .expect("load published attr");
+        ready_attr.size = 2_097_275;
+        ready_attr.committed_size = ready_attr.size;
+        ready_attr.content_epoch = 2;
+        ready_attr.committed_content_epoch = 2;
+        ready_attr.upload_state = UploadState::Ready;
+        meta.set_attr(&ready_attr)
+            .expect("seed sparse ready attr with published prefix");
+
+        let port = VfsUploadMetaPort { vfs: vfs.clone() };
+        let rebased_epoch = rt
+            .block_on(port.reattach_uploaded_object_if_uncovered(
+                ready_attr.ino,
+                3,
+                materialized_upload_object,
+                0,
+                materialized_len,
+                vfs.block_size,
+            ))
+            .expect("reattach materialized sparse upload");
+
+        assert_eq!(
+            rebased_epoch,
+            Some(3),
+            "a materialized sparse stale upload should be restored over holes without replacing existing base data"
+        );
+        let spans = meta
+            .lookup_regular_file_slices(ready_attr.ino, 0, materialized_len)
+            .expect("load rebased sparse graph");
+        assert!(
+            spans.iter().any(|span| {
+                span.source == ResolvedSliceSource::Base
+                    && span.range == SliceRange::new(0, prefix_len).expect("prefix range")
+                    && span
+                        .payload
+                        .as_ref()
+                        .is_some_and(|payload| payload.object_id == published_prefix_object)
+            }),
+            "the already-published prefix must stay backed by the original base object"
+        );
+
+        let rebased_payloads = spans
+            .iter()
+            .filter_map(|span| {
+                let payload = span.payload.as_ref()?;
+                (payload.object_id == materialized_upload_object).then_some((span, payload))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rebased_payloads.len(), 1);
+        let (span, payload) = rebased_payloads[0];
+        assert_eq!(span.source, ResolvedSliceSource::Overlay);
+        assert_eq!(
+            span.range,
+            SliceRange::new(prefix_len, u32::try_from(materialized_len).unwrap())
+                .expect("tail range")
+        );
+        assert_eq!(payload.offset, prefix_len);
+        assert_eq!(
+            payload.length,
+            u32::try_from(materialized_len - u64::from(prefix_len)).unwrap()
         );
     }
 
