@@ -11,6 +11,11 @@ extern void studiofs_macfuse_symlink(fuse_req_t req,
                                      const char *target,
                                      fuse_ino_t parent,
                                      const char *name);
+extern void studiofs_macfuse_mknod(fuse_req_t req,
+                                   fuse_ino_t parent,
+                                   const char *name,
+                                   mode_t mode,
+                                   dev_t rdev);
 extern void studiofs_macfuse_create(fuse_req_t req,
                                     fuse_ino_t parent,
                                     const char *name,
@@ -45,6 +50,11 @@ extern void studiofs_macfuse_setattr(fuse_req_t req,
                                      struct stat *attr,
                                      int to_set,
                                      struct fuse_file_info *fi);
+extern void studiofs_macfuse_setattr_x(fuse_req_t req,
+                                       fuse_ino_t ino,
+                                       struct setattr_x *attr,
+                                       int to_set,
+                                       struct fuse_file_info *fi);
 extern void studiofs_macfuse_release(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi);
 extern void studiofs_macfuse_readdir(fuse_req_t req,
                                      fuse_ino_t ino,
@@ -89,11 +99,13 @@ static const struct fuse_lowlevel_ops STUDIOFS_LOW_LEVEL_OPS = {
     .getattr = studiofs_macfuse_getattr,
     .mkdir = studiofs_macfuse_mkdir,
     .symlink = studiofs_macfuse_symlink,
+    .mknod = studiofs_macfuse_mknod,
     .create = studiofs_macfuse_create,
     .unlink = studiofs_macfuse_unlink,
     .rmdir = studiofs_macfuse_rmdir,
     .rename = studiofs_macfuse_rename,
     .setattr = studiofs_macfuse_setattr,
+    .setattr_x = studiofs_macfuse_setattr_x,
     .open = studiofs_macfuse_open,
     .read = studiofs_macfuse_read,
     .write = studiofs_macfuse_write,
@@ -141,6 +153,10 @@ int studiofs_macfuse_low_level_ops_has_init_callback(const struct fuse_lowlevel_
 
 int studiofs_macfuse_low_level_ops_has_rmdir_callback(const struct fuse_lowlevel_ops *ops) {
     return ops != NULL && ops->rmdir != NULL;
+}
+
+int studiofs_macfuse_low_level_ops_has_mknod_callback(const struct fuse_lowlevel_ops *ops) {
+    return ops != NULL && ops->mknod != NULL;
 }
 
 void studiofs_macfuse_conn_info_configure(struct fuse_conn_info *conn,

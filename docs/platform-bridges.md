@@ -223,12 +223,14 @@ macOS FUSE defaults to the WinFSP-style cache policy. The mount keeps `local`,
 `sparse`, and `volname`, adds `novncache`, `daemon_timeout=60`, and an
 `iosize=1048576` matching StudioFS's WinFSP allocation-unit geometry, and does
 not globally mount with `direct_io` or `nolocalcaches`. The measured
-high-throughput read profile also passes `max_read=1048576`, `noappledouble`,
-and `defer_permissions` to macFUSE so sequential media reads can request the
-same 1 MiB callback geometry while Finder metadata fallback traffic and
-permission-path work are reduced. Kernel cache behavior is not set as a global
-mount option: read-only and write-capable handles continue to choose cache
-behavior through the per-open macFUSE policy below.
+high-throughput read profile also passes `max_read=1048576` and
+`defer_permissions` to macFUSE so sequential media reads can request the same
+1 MiB callback geometry while permission-path work is reduced. StudioFS does
+not pass `noappledouble`: macFUSE handles that option before userspace and can
+hide `.DS_Store`, which Finder/copyfile requires for folder copies. Kernel
+cache behavior is not set as a global mount option: read-only and
+write-capable handles continue to choose cache behavior through the per-open
+macFUSE policy below.
 The default macOS asyncFUSE profile also enables async write replies, applies
 the `50/40` background queue policy, keeps macFUSE-safe `max_write=131072`, and
 reports the matching `1048576` preferred I/O size through regular file
@@ -289,8 +291,10 @@ not exposed as user-visible folders in mounted trees.
 ### macOS metadata file filtering
 
 Finder and related macOS services may also try to create metadata sidecar files
-such as `.DS_Store`, AppleDouble `._*`, and root-level system metadata names like
-`.Spotlight-V100`, and `.fseventsd`.
+such as AppleDouble `._*` and root-level system metadata names like
+`.Spotlight-V100`, and `.fseventsd`. StudioFS stores `.DS_Store` as an ordinary
+small file because Finder and `copyfile` require it to survive post-close
+metadata operations during folder copies.
 
 StudioFS drops these names at the VFS layer:
 - `create` / `open` flows succeed locally so Finder does not surface errors

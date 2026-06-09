@@ -1427,6 +1427,57 @@ fn test_publish_regular_file_overlay_to_base_if_matches_promotes_base_rows() {
 }
 
 #[test]
+fn publish_regular_file_overlay_recovers_visible_size_from_payload_graph() {
+    let engine = temp_engine();
+    let file = engine
+        .create_file(ROOT_INO, b"publish-recovers-size.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let mut attr = engine.get_attr(file.ino).unwrap();
+    attr.content_epoch = 1;
+    attr.size = 0;
+    engine.set_attr(&attr).unwrap();
+
+    let tail_start = u64::from(DEFAULT_CHUNK_SIZE);
+    let tail_len = 611_410;
+    let mut head_chunk = RegularFileChunkState::default();
+    head_chunk.insert_slice(SliceRecord::new(
+        SliceId(1),
+        SliceOrder(1),
+        SliceRange::new(0, DEFAULT_CHUNK_SIZE).expect("valid full block"),
+        PayloadRef::new_partial(57_431_701, DEFAULT_CHUNK_SIZE),
+    ));
+    let mut tail_chunk = RegularFileChunkState::default();
+    tail_chunk.insert_slice(SliceRecord::new(
+        SliceId(1),
+        SliceOrder(1),
+        SliceRange::new(0, tail_len).expect("valid tail block"),
+        PayloadRef::new_partial(57_431_702, tail_len),
+    ));
+    set_regular_file_chunk_rows(
+        &engine,
+        file.ino,
+        &[
+            (ChunkId(0), head_chunk),
+            (ChunkId(1), tail_chunk),
+        ],
+        &[],
+    );
+    mark_overlay_objects_uploaded(&engine, file.ino, 1, &[57_431_701, 57_431_702]);
+
+    assert!(
+        engine
+            .publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
+            .unwrap()
+    );
+
+    let published_attr = engine.get_attr(file.ino).unwrap();
+    let expected_size = tail_start + u64::from(tail_len);
+    assert_eq!(published_attr.size, expected_size);
+    assert_eq!(published_attr.committed_size, expected_size);
+    assert_eq!(published_attr.upload_state, UploadState::Ready);
+}
+
+#[test]
 fn publish_regular_file_overlay_to_base_appends_dentry_only_on_first_visibility() {
     let engine = temp_engine();
     let file = engine

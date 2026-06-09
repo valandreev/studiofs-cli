@@ -669,7 +669,7 @@ pub fn is_hidden_platform_root_metadata_name(name: &[u8]) -> bool {
 }
 
 fn is_ignored_macos_metadata(name: &[u8]) -> bool {
-    name == b".DS_Store" || (name.len() > 2 && name.starts_with(b"._"))
+    name.len() > 2 && name.starts_with(b"._")
 }
 
 fn is_blocked_root_macos_metadata(name: &[u8]) -> bool {

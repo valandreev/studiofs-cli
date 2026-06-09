@@ -18,6 +18,7 @@ use parking_lot::Mutex as ParkingMutex;
 use studiofs_bridge::posix::{
     BridgeFileAttr, BridgeFileType, posix_flags_to_open_flags, to_bridge_attr, vfs_err_to_errno,
 };
+use studiofs_meta::engine::XATTR_CREATE_FLAG;
 use studiofs_meta::schema::ResolvedSliceSource;
 use studiofs_meta::{DirEntry, FileType, InodeAttr, SetattrArgs, TimeSpec, UploadState};
 use studiofs_vfs::{
@@ -28,7 +29,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 #[cfg(test)]
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::low_level::{DirectoryEntryBuffer, Entry, OpenReply, Reply, Request, raw};
 
@@ -47,6 +48,9 @@ const MACFUSE_READ_WINDOW_MAX_BYTES: usize = 8 * 1024 * 1024;
 const MACFUSE_READ_WINDOW_MIN_BYTES: usize = 128 * 1024;
 const MACFUSE_ASYNC_READ_SNAPSHOT_INTERVAL: Duration = Duration::from_millis(500);
 const MACFUSE_READ_INTERRUPTED_ERRNO: i32 = libc::EINTR;
+const MACOS_PROVENANCE_XATTR: &[u8] = b"com.apple.provenance";
+const MACOS_DS_STORE_NAME: &[u8] = b".DS_Store";
+const MACOS_UF_HIDDEN: u32 = 0x0000_8000;
 #[cfg(not(test))]
 const MACFUSE_OPEN_CACHE_SNAPSHOT_LIMIT: usize = 8192;
 #[cfg(test)]
@@ -72,6 +76,7 @@ pub(crate) struct StudioVfsAdapter {
     readdir_cache_last_pruned: Mutex<Option<Instant>>,
     readdir_cache_ready: Condvar,
     open_cache_snapshots: Arc<ParkingMutex<LruCache<u64, MacFuseOpenCacheSnapshot>>>,
+    file_flags: ParkingMutex<HashMap<u64, u32>>,
     read_admission: Arc<Semaphore>,
     read_queue_byte_limit: u32,
     read_buffers: Arc<ReadBufferPool>,
@@ -722,6 +727,7 @@ impl StudioVfsAdapter {
             open_cache_snapshots: Arc::new(ParkingMutex::new(LruCache::new(
                 open_cache_snapshot_capacity(),
             ))),
+            file_flags: ParkingMutex::new(HashMap::new()),
             read_admission: Arc::new(Semaphore::new(read_queue_byte_limit as usize)),
             read_queue_byte_limit,
             read_buffers: Arc::new(ReadBufferPool::default()),
@@ -855,9 +861,28 @@ impl StudioVfsAdapter {
             .vfs
             .create(parent, name, self.mount_uid, self.mount_gid, mode & 0o7777)
             .map_err(|error| vfs_err_to_errno(&error))?;
+        self.remember_named_file_flags(attr.ino, name);
         self.invalidate_readdir_cache(parent);
         let open = self.open(attr.ino, flags)?;
         Ok((attr, open))
+    }
+
+    /// Create a regular file through the macFUSE mknod callback.
+    pub(crate) fn mknod(&self, parent: u64, name: &[u8], mode: mode_t) -> Result<InodeAttr, i32> {
+        if self.read_only {
+            return Err(libc::EROFS);
+        }
+        let file_type = mode & libc::S_IFMT as mode_t;
+        if file_type != 0 && file_type != libc::S_IFREG as mode_t {
+            return Err(libc::ENOTSUP);
+        }
+        self.vfs
+            .create(parent, name, self.mount_uid, self.mount_gid, mode & 0o7777)
+            .inspect(|attr| {
+                self.remember_named_file_flags(attr.ino, name);
+                self.invalidate_readdir_cache(parent);
+            })
+            .map_err(|error| vfs_err_to_errno(&error))
     }
 
     /// Open an existing file.
@@ -1012,6 +1037,7 @@ impl StudioVfsAdapter {
                     && attr.nlink == 0
                 {
                     self.clear_open_cache_snapshot(attr.ino, "unlink");
+                    self.clear_file_flags(attr.ino);
                 }
                 self.invalidate_readdir_cache(parent);
             })
@@ -1024,9 +1050,15 @@ impl StudioVfsAdapter {
         if self.read_only {
             return Err(libc::EROFS);
         }
+        let existing = self.vfs.lookup(parent, name).ok();
         self.vfs
             .rmdir(parent, name)
-            .inspect(|_| self.invalidate_readdir_cache(parent))
+            .inspect(|_| {
+                if let Some(attr) = &existing {
+                    self.clear_file_flags(attr.ino);
+                }
+                self.invalidate_readdir_cache(parent);
+            })
             .map_err(|error| vfs_err_to_errno(&error))
     }
 
@@ -1041,12 +1073,19 @@ impl StudioVfsAdapter {
         if self.read_only {
             return Err(libc::EROFS);
         }
+        let overwritten = self.vfs.lookup(newparent, newname).ok();
         self.vfs
             .rename(parent, name, newparent, newname)
             .inspect(|_| {
+                if let Some(attr) = &overwritten {
+                    self.clear_file_flags(attr.ino);
+                }
                 self.invalidate_readdir_cache(parent);
                 if newparent != parent {
                     self.invalidate_readdir_cache(newparent);
+                }
+                if let Ok(attr) = self.vfs.lookup(newparent, newname) {
+                    self.remember_named_file_flags(attr.ino, newname);
                 }
             })
             .map_err(|error| vfs_err_to_errno(&error))
@@ -1201,6 +1240,7 @@ impl StudioVfsAdapter {
                 AsyncReadTaskGuard::new(admission_bytes, diagnostics, Arc::clone(&state.vfs));
             if cancellation.is_cancelled() {
                 read_guard.finish_with(AsyncReadOutcome::Canceled);
+                log_callback_error("read", MACFUSE_READ_INTERRUPTED_ERRNO);
                 let _ = Reply::new(request).error(MACFUSE_READ_INTERRUPTED_ERRNO);
                 return;
             }
@@ -1220,6 +1260,16 @@ impl StudioVfsAdapter {
                         AsyncReadOutcome::Failed
                     };
                     read_guard.finish_with(outcome);
+                    if callback_error_log_level("read", errno).is_some() {
+                        warn!(
+                            ino,
+                            file_handle,
+                            offset,
+                            size,
+                            errno,
+                            "macFUSE read admission returned error"
+                        );
+                    }
                     let _ = Reply::new(request).error(errno);
                     return;
                 }
@@ -1251,6 +1301,16 @@ impl StudioVfsAdapter {
                         AsyncReadOutcome::Failed
                     };
                     read_guard.finish_with(outcome);
+                    if callback_error_log_level("read", errno).is_some() {
+                        warn!(
+                            ino,
+                            file_handle,
+                            offset,
+                            size,
+                            errno,
+                            "macFUSE read callback returned error"
+                        );
+                    }
                     let _ = Reply::new(request).error(errno);
                 }
             }
@@ -1606,9 +1666,10 @@ impl StudioVfsAdapter {
         if self.read_only {
             return Err(libc::EROFS);
         }
+        let flags = macfuse_set_xattr_flags(name, flags);
         self.vfs
             .set_xattr(ino, name, value, flags)
-            .map_err(|error| vfs_err_to_errno(&error))
+            .map_err(|error| xattr_mutation_err_to_errno(&error))
     }
 
     /// Remove a native extended attribute value.
@@ -1618,7 +1679,7 @@ impl StudioVfsAdapter {
         }
         self.vfs
             .remove_xattr(ino, name)
-            .map_err(|error| vfs_err_to_errno(&error))
+            .map_err(|error| xattr_mutation_err_to_errno(&error))
     }
 
     /// List native extended attribute names.
@@ -1629,12 +1690,42 @@ impl StudioVfsAdapter {
     }
 
     fn attr_to_stat(&self, attr: &InodeAttr) -> stat {
-        bridge_attr_to_stat(&to_bridge_attr(
+        let mut stat = bridge_attr_to_stat(&to_bridge_attr(
             attr,
             self.mount_uid,
             self.mount_gid,
             MACFUSE_ATTR_BLOCK_SIZE,
-        ))
+        ));
+        if let Some(flags) = self.file_flags.lock().get(&attr.ino).copied() {
+            assign_stat_flags(&mut stat, flags);
+            if flags & MACOS_UF_HIDDEN != 0 {
+                assign_hidden_file_stat_times(&mut stat);
+            }
+        }
+        stat
+    }
+
+    fn remember_callback_file_flags(&self, ino: u64, attr: *const stat, to_set: libc::c_int) {
+        if to_set == 0 || setattr_mask_has_flags(to_set) {
+            self.file_flags
+                .lock()
+                .insert(ino, callback_stat_flags(attr));
+        }
+    }
+
+    fn remember_named_file_flags(&self, ino: u64, name: &[u8]) {
+        if name == MACOS_DS_STORE_NAME {
+            self.file_flags.lock().insert(ino, MACOS_UF_HIDDEN);
+        }
+    }
+
+    fn clear_file_flags(&self, ino: u64) {
+        self.file_flags.lock().remove(&ino);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn file_flags_contains_for_test(&self, ino: u64) -> bool {
+        self.file_flags.lock().contains_key(&ino)
     }
 
     fn dir_entry_to_stat(&self, entry: &DirEntry) -> stat {
@@ -1847,6 +1938,47 @@ fn reply_error(req: *mut raw::FuseReq, errno: i32) {
     }
 }
 
+fn reply_callback_error(req: *mut raw::FuseReq, operation: &'static str, errno: i32) {
+    log_callback_error(operation, errno);
+    reply_error(req, errno);
+}
+
+fn log_callback_error(operation: &'static str, errno: i32) {
+    match callback_error_log_level(operation, errno) {
+        Some(CallbackErrorLogLevel::Warn) => {
+            warn!(operation, errno, "macFUSE callback returned error");
+        }
+        None => {}
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CallbackErrorLogLevel {
+    Warn,
+}
+
+fn callback_error_log_level(operation: &'static str, errno: i32) -> Option<CallbackErrorLogLevel> {
+    if errno == 0 {
+        return None;
+    }
+    if operation == "getxattr" && errno == xattr_not_found_errno() {
+        return None;
+    }
+    if operation == "lookup" && errno == libc::ENOENT {
+        return None;
+    }
+    if operation == "getattr" && errno == libc::ENOENT {
+        return None;
+    }
+    if operation == "removexattr" && (errno == libc::ENOENT || errno == xattr_not_found_errno()) {
+        return None;
+    }
+    if operation == "read" && errno == MACFUSE_READ_INTERRUPTED_ERRNO {
+        return None;
+    }
+    Some(CallbackErrorLogLevel::Warn)
+}
+
 fn owned_request(req: *mut raw::FuseReq) -> Option<Request> {
     // SAFETY: Each low-level callback receives a live unreplied request pointer.
     unsafe { Request::from_raw(req) }
@@ -1938,6 +2070,41 @@ fn bridge_attr_to_stat(attr: &BridgeFileAttr) -> stat {
     out
 }
 
+#[cfg(target_os = "macos")]
+fn assign_stat_flags(out: &mut stat, flags: u32) {
+    out.st_flags = flags;
+}
+
+#[cfg(not(target_os = "macos"))]
+fn assign_stat_flags(_out: &mut stat, _flags: u32) {}
+
+#[cfg(target_os = "macos")]
+fn assign_hidden_file_stat_times(out: &mut stat) {
+    out.st_birthtime = out.st_mtime;
+    out.st_birthtime_nsec = out.st_mtime_nsec;
+    out.st_ctime = out.st_mtime;
+    out.st_ctime_nsec = out.st_mtime_nsec;
+}
+
+#[cfg(not(target_os = "macos"))]
+fn assign_hidden_file_stat_times(_out: &mut stat) {}
+
+#[cfg(target_os = "macos")]
+fn callback_stat_flags(attr: *const stat) -> u32 {
+    if attr.is_null() {
+        0
+    } else {
+        // SAFETY: The pointer was checked for null above and macFUSE owns it
+        // for the duration of the callback.
+        unsafe { (*attr).st_flags }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn callback_stat_flags(_attr: *const stat) -> u32 {
+    0
+}
+
 fn mode_bits(attr: &BridgeFileAttr) -> libc::mode_t {
     let kind = match attr.kind {
         BridgeFileType::RegularFile => libc::S_IFREG,
@@ -2021,7 +2188,17 @@ pub extern "C" fn studiofs_macfuse_lookup(
                 let _ = Reply::new(request).entry(&entry);
             }
         }
-        Err(errno) => reply_error(req, errno),
+        Err(errno) => {
+            if callback_error_log_level("lookup", errno).is_some() {
+                warn!(
+                    parent,
+                    name = %String::from_utf8_lossy(name),
+                    errno,
+                    "macFUSE lookup callback returned error"
+                );
+            }
+            reply_error(req, errno);
+        }
     }
 }
 
@@ -2042,7 +2219,12 @@ pub extern "C" fn studiofs_macfuse_getattr(
                 let _ = Reply::new(request).attr(&attr, TTL_SECONDS);
             }
         }
-        Err(errno) => reply_error(req, errno),
+        Err(errno) => {
+            if callback_error_log_level("getattr", errno).is_some() {
+                warn!(ino, errno, "macFUSE getattr callback returned error");
+            }
+            reply_error(req, errno);
+        }
     }
 }
 
@@ -2066,13 +2248,28 @@ pub extern "C" fn studiofs_macfuse_mkdir(
     let name = unsafe { CStr::from_ptr(name) }.to_bytes();
     match state.adapter.mkdir(parent, name, mode) {
         Ok(attr) => {
+            debug!(
+                parent,
+                name = %String::from_utf8_lossy(name),
+                ino = attr.ino,
+                mode,
+                "macFUSE mkdir callback created entry"
+            );
             let stat = state.adapter.attr_to_stat(&attr);
             if let Some(request) = owned_request(req) {
                 let entry = Entry::new(attr.ino, 0, stat, TTL_SECONDS, TTL_SECONDS);
                 let _ = Reply::new(request).entry(&entry);
             }
         }
-        Err(errno) => reply_error(req, errno),
+        Err(errno) => {
+            warn!(
+                parent,
+                name = %String::from_utf8_lossy(name),
+                errno,
+                "macFUSE mkdir callback returned error"
+            );
+            reply_error(req, errno);
+        }
     }
 }
 
@@ -2098,13 +2295,76 @@ pub extern "C" fn studiofs_macfuse_symlink(
     let name = unsafe { CStr::from_ptr(name) }.to_bytes();
     match state.adapter.symlink(parent, name, target) {
         Ok(attr) => {
+            debug!(
+                parent,
+                name = %String::from_utf8_lossy(name),
+                target = %String::from_utf8_lossy(target),
+                ino = attr.ino,
+                "macFUSE symlink callback created entry"
+            );
             let stat = state.adapter.attr_to_stat(&attr);
             if let Some(request) = owned_request(req) {
                 let entry = Entry::new(attr.ino, 0, stat, TTL_SECONDS, TTL_SECONDS);
                 let _ = Reply::new(request).entry(&entry);
             }
         }
-        Err(errno) => reply_error(req, errno),
+        Err(errno) => {
+            warn!(
+                parent,
+                name = %String::from_utf8_lossy(name),
+                target = %String::from_utf8_lossy(target),
+                errno,
+                "macFUSE symlink callback returned error"
+            );
+            reply_error(req, errno);
+        }
+    }
+}
+
+/// macFUSE mknod callback for regular-file creation paths that do not use create.
+#[unsafe(no_mangle)]
+pub extern "C" fn studiofs_macfuse_mknod(
+    req: *mut raw::FuseReq,
+    parent: raw::FuseIno,
+    name: *const c_char,
+    mode: mode_t,
+    _rdev: libc::dev_t,
+) {
+    let Some(state) = callback_state(req) else {
+        reply_error(req, libc::EIO);
+        return;
+    };
+    if name.is_null() {
+        reply_error(req, libc::EINVAL);
+        return;
+    }
+    // SAFETY: macFUSE passes a NUL-terminated entry name for mknod callbacks.
+    let name = unsafe { CStr::from_ptr(name) }.to_bytes();
+    match state.adapter.mknod(parent, name, mode) {
+        Ok(attr) => {
+            debug!(
+                parent,
+                name = %String::from_utf8_lossy(name),
+                ino = attr.ino,
+                mode,
+                "macFUSE mknod callback created entry"
+            );
+            let stat = state.adapter.attr_to_stat(&attr);
+            if let Some(request) = owned_request(req) {
+                let entry = Entry::new(attr.ino, 0, stat, TTL_SECONDS, TTL_SECONDS);
+                let _ = Reply::new(request).entry(&entry);
+            }
+        }
+        Err(errno) => {
+            warn!(
+                parent,
+                name = %String::from_utf8_lossy(name),
+                mode,
+                errno,
+                "macFUSE mknod callback returned error"
+            );
+            reply_error(req, errno);
+        }
     }
 }
 
@@ -2131,13 +2391,32 @@ pub extern "C" fn studiofs_macfuse_create(
     let flags = unsafe { (*fi).flags };
     match state.adapter.create(parent, name, mode, flags) {
         Ok((attr, open)) => {
+            debug!(
+                parent,
+                name = %String::from_utf8_lossy(name),
+                ino = attr.ino,
+                mode,
+                flags,
+                file_handle = open.file_handle(),
+                "macFUSE create callback created entry"
+            );
             let stat = state.adapter.attr_to_stat(&attr);
             if let Some(request) = owned_request(req) {
                 let entry = Entry::new(attr.ino, 0, stat, TTL_SECONDS, TTL_SECONDS);
                 let _ = Reply::new(request).create(&entry, open);
             }
         }
-        Err(errno) => reply_error(req, errno),
+        Err(errno) => {
+            warn!(
+                parent,
+                name = %String::from_utf8_lossy(name),
+                mode,
+                flags,
+                errno,
+                "macFUSE create callback returned error"
+            );
+            reply_error(req, errno);
+        }
     }
 }
 
@@ -2160,7 +2439,15 @@ pub extern "C" fn studiofs_macfuse_unlink(
     let name = unsafe { CStr::from_ptr(name) }.to_bytes();
     match state.adapter.unlink(parent, name) {
         Ok(()) => reply_error(req, 0),
-        Err(errno) => reply_error(req, errno),
+        Err(errno) => {
+            warn!(
+                parent,
+                name = %String::from_utf8_lossy(name),
+                errno,
+                "macFUSE unlink callback returned error"
+            );
+            reply_error(req, errno);
+        }
     }
 }
 
@@ -2183,7 +2470,15 @@ pub extern "C" fn studiofs_macfuse_rmdir(
     let name = unsafe { CStr::from_ptr(name) }.to_bytes();
     match state.adapter.rmdir(parent, name) {
         Ok(()) => reply_error(req, 0),
-        Err(errno) => reply_error(req, errno),
+        Err(errno) => {
+            warn!(
+                parent,
+                name = %String::from_utf8_lossy(name),
+                errno,
+                "macFUSE rmdir callback returned error"
+            );
+            reply_error(req, errno);
+        }
     }
 }
 
@@ -2210,7 +2505,17 @@ pub extern "C" fn studiofs_macfuse_rename(
     let newname = unsafe { CStr::from_ptr(newname) }.to_bytes();
     match state.adapter.rename(parent, name, newparent, newname) {
         Ok(()) => reply_error(req, 0),
-        Err(errno) => reply_error(req, errno),
+        Err(errno) => {
+            warn!(
+                parent,
+                name = %String::from_utf8_lossy(name),
+                newparent,
+                newname = %String::from_utf8_lossy(newname),
+                errno,
+                "macFUSE rename callback returned error"
+            );
+            reply_error(req, errno);
+        }
     }
 }
 
@@ -2237,7 +2542,10 @@ pub extern "C" fn studiofs_macfuse_open(
                 let _ = Reply::new(request).open(open);
             }
         }
-        Err(errno) => reply_error(req, errno),
+        Err(errno) => {
+            warn!(ino, flags, errno, "macFUSE open callback returned error");
+            reply_error(req, errno);
+        }
     }
 }
 
@@ -2319,7 +2627,17 @@ pub extern "C" fn studiofs_macfuse_write(
                 let _ = Reply::new(request).write_count(count as usize);
             }
         }
-        Err(errno) => reply_error(req, errno),
+        Err(errno) => {
+            warn!(
+                ino,
+                file_handle,
+                offset = off,
+                size,
+                errno,
+                "macFUSE write callback returned error"
+            );
+            reply_error(req, errno);
+        }
     }
 }
 
@@ -2342,7 +2660,13 @@ pub extern "C" fn studiofs_macfuse_flush(
     let file_handle = unsafe { (*fi).fh };
     match state.adapter.flush(ino, file_handle) {
         Ok(()) => reply_error(req, 0),
-        Err(errno) => reply_error(req, errno),
+        Err(errno) => {
+            warn!(
+                ino,
+                file_handle, errno, "macFUSE flush callback returned error"
+            );
+            reply_error(req, errno);
+        }
     }
 }
 
@@ -2366,7 +2690,16 @@ pub extern "C" fn studiofs_macfuse_fsync(
     };
     match state.adapter.fsync(file_handle, ino, datasync != 0) {
         Ok(()) => reply_error(req, 0),
-        Err(errno) => reply_error(req, errno),
+        Err(errno) => {
+            warn!(
+                ino,
+                file_handle,
+                datasync = datasync != 0,
+                errno,
+                "macFUSE fsync callback returned error"
+            );
+            reply_error(req, errno);
+        }
     }
 }
 
@@ -2390,11 +2723,45 @@ pub extern "C" fn studiofs_macfuse_setattr(
     let args = match setattr_args_from_callback(attr, to_set) {
         Ok(args) => args,
         Err(errno) => {
+            warn!(
+                ino,
+                to_set, errno, "macFUSE setattr callback rejected arguments"
+            );
             reply_error(req, errno);
             return;
         }
     };
     if setattr_args_are_empty(&args) {
+        if setattr_mask_is_accepted_noop(to_set) {
+            state
+                .adapter
+                .remember_callback_file_flags(ino, attr, to_set);
+            debug!(
+                ino,
+                to_set, "macFUSE setattr callback accepted unsupported metadata bits as no-op"
+            );
+            match state.adapter.getattr(ino) {
+                Ok(stat) => {
+                    if let Some(request) = owned_request(req) {
+                        let _ = Reply::new(request).attr(&stat, TTL_SECONDS);
+                    }
+                }
+                Err(errno) => {
+                    warn!(
+                        ino,
+                        to_set, errno, "macFUSE setattr no-op getattr returned error"
+                    );
+                    reply_error(req, errno);
+                }
+            }
+            return;
+        }
+        warn!(
+            ino,
+            to_set,
+            errno = libc::ENOTSUP,
+            "macFUSE setattr callback received no supported attributes"
+        );
         reply_error(req, libc::ENOTSUP);
         return;
     }
@@ -2412,8 +2779,122 @@ pub extern "C" fn studiofs_macfuse_setattr(
                 let _ = Reply::new(request).attr(&stat, TTL_SECONDS);
             }
         }
-        Err(errno) => reply_error(req, errno),
+        Err(errno) => {
+            warn!(
+                ino,
+                file_handle, to_set, errno, "macFUSE setattr callback returned error"
+            );
+            reply_error(req, errno);
+        }
     }
+}
+
+/// macFUSE Darwin setattr extension callback for file flags and extra times.
+#[unsafe(no_mangle)]
+pub extern "C" fn studiofs_macfuse_setattr_x(
+    req: *mut raw::FuseReq,
+    ino: raw::FuseIno,
+    attr: *mut raw::FuseSetattrX,
+    to_set: libc::c_int,
+    _fi: *mut raw::FuseFileInfo,
+) {
+    let Some(state) = callback_state(req) else {
+        reply_error(req, libc::EIO);
+        return;
+    };
+    if attr.is_null() {
+        reply_error(req, libc::EINVAL);
+        return;
+    }
+    let flags = unsafe { (*attr).flags };
+    if setattr_mask_has_flags(to_set) {
+        state.adapter.file_flags.lock().insert(ino, flags);
+    }
+    let args = match setattr_x_args_from_callback(attr, to_set) {
+        Ok(args) => args,
+        Err(errno) => {
+            warn!(
+                ino,
+                to_set, errno, "macFUSE setattr_x callback rejected arguments"
+            );
+            reply_error(req, errno);
+            return;
+        }
+    };
+    debug!(
+        ino,
+        to_set, flags, "macFUSE setattr_x callback accepted Darwin metadata as overlay"
+    );
+    if !setattr_args_are_empty(&args) {
+        match state.adapter.setattr(None, ino, args) {
+            Ok(attr) => {
+                let stat = state.adapter.attr_to_stat(&attr);
+                if let Some(request) = owned_request(req) {
+                    let _ = Reply::new(request).attr(&stat, TTL_SECONDS);
+                }
+            }
+            Err(errno) => {
+                warn!(
+                    ino,
+                    to_set, errno, "macFUSE setattr_x callback returned error"
+                );
+                reply_error(req, errno);
+            }
+        }
+        return;
+    }
+    match state.adapter.getattr(ino) {
+        Ok(stat) => {
+            if let Some(request) = owned_request(req) {
+                let _ = Reply::new(request).attr(&stat, TTL_SECONDS);
+            }
+        }
+        Err(errno) => {
+            warn!(
+                ino,
+                to_set, errno, "macFUSE setattr_x getattr returned error"
+            );
+            reply_error(req, errno);
+        }
+    }
+}
+
+fn setattr_x_args_from_callback(
+    attr: *const raw::FuseSetattrX,
+    to_set: libc::c_int,
+) -> Result<SetattrArgs, i32> {
+    // SAFETY: The caller checked `attr` for null and macFUSE passes an
+    // initialized Darwin setattr payload for setattr_x callbacks.
+    let attr = unsafe { &*attr };
+    let mut args = SetattrArgs::default();
+    if setattr_mask_has_size(to_set) {
+        args.size = Some(u64::try_from(attr.size).map_err(|_| libc::EINVAL)?);
+    }
+    if setattr_mask_has_mode(to_set) {
+        args.mode = Some(attr.mode & 0o7777);
+    }
+    if setattr_mask_has_uid(to_set) {
+        args.uid = Some(attr.uid);
+    }
+    if setattr_mask_has_gid(to_set) {
+        args.gid = Some(attr.gid);
+    }
+    if setattr_mask_has_atime(to_set) {
+        args.atime = TimeSpec::Set(stat_time_to_nanos(
+            attr.acctime.tv_sec,
+            attr.acctime.tv_nsec,
+        )?);
+    }
+    if setattr_mask_has_mtime(to_set) {
+        args.mtime = TimeSpec::Set(stat_time_to_nanos(
+            attr.modtime.tv_sec,
+            attr.modtime.tv_nsec,
+        )?);
+    }
+    if setattr_mask_has_crtime(to_set) {
+        args.crtime = TimeSpec::Set(stat_time_to_nanos(attr.crtime.tv_sec, attr.crtime.tv_nsec)?);
+    }
+    Ok(args)
 }
 
 fn setattr_args_from_callback(attr: *const stat, to_set: libc::c_int) -> Result<SetattrArgs, i32> {
@@ -2529,8 +3010,35 @@ fn setattr_mask_has_crtime(to_set: libc::c_int) -> bool {
     unsafe { to_set & crate::low_level::studiofs_macfuse_setattr_crtime_mask() != 0 }
 }
 
+fn setattr_mask_has_flags(to_set: libc::c_int) -> bool {
+    // SAFETY: The C shim returns the header-defined FLAGS bit, or zero when
+    // this FUSE version does not define it.
+    unsafe { to_set & crate::low_level::studiofs_macfuse_setattr_flags_mask() != 0 }
+}
+
 fn setattr_mask_has_unknown(to_set: libc::c_int) -> bool {
     to_set & !setattr_supported_mask() != 0
+}
+
+fn setattr_mask_is_accepted_noop(to_set: libc::c_int) -> bool {
+    if to_set == 0 {
+        return true;
+    }
+    let ignored = setattr_accepted_noop_mask();
+    // SAFETY: The C shim returns the header-defined FH bit, or zero when this
+    // FUSE version has no FH bit.
+    let fh = unsafe { crate::low_level::studiofs_macfuse_setattr_fh_mask() };
+    to_set & ignored != 0 && to_set & !(ignored | fh) == 0
+}
+
+fn setattr_accepted_noop_mask() -> libc::c_int {
+    // SAFETY: Each C shim returns one header-defined bit for this build, or zero
+    // for optional bits not present in the active FUSE headers.
+    unsafe {
+        crate::low_level::studiofs_macfuse_setattr_chgtime_mask()
+            | crate::low_level::studiofs_macfuse_setattr_bkuptime_mask()
+            | crate::low_level::studiofs_macfuse_setattr_flags_mask()
+    }
 }
 
 fn setattr_supported_mask() -> libc::c_int {
@@ -2572,7 +3080,13 @@ pub extern "C" fn studiofs_macfuse_release(
     let file_handle = unsafe { (*fi).fh };
     match state.adapter.release(ino, file_handle) {
         Ok(()) => reply_error(req, 0),
-        Err(errno) => reply_error(req, errno),
+        Err(errno) => {
+            warn!(
+                ino,
+                file_handle, errno, "macFUSE release callback returned error"
+            );
+            reply_error(req, errno);
+        }
     }
 }
 
@@ -2597,6 +3111,7 @@ pub extern "C" fn studiofs_macfuse_readdir(
             let _ = Reply::new(request).directory_entries(&entries);
         }
         Err(errno) => {
+            log_callback_error("readdir", errno);
             let _ = Reply::new(request).error(errno);
         }
     }
@@ -2618,7 +3133,7 @@ pub extern "C" fn studiofs_macfuse_readlink(req: *mut raw::FuseReq, ino: raw::Fu
             }
             Err(_) => reply_error(req, libc::EINVAL),
         },
-        Err(errno) => reply_error(req, errno),
+        Err(errno) => reply_callback_error(req, "readlink", errno),
     }
 }
 
@@ -2635,7 +3150,7 @@ pub extern "C" fn studiofs_macfuse_statfs(req: *mut raw::FuseReq, _ino: raw::Fus
                 let _ = Reply::new(request).statfs(&stats);
             }
         }
-        Err(errno) => reply_error(req, errno),
+        Err(errno) => reply_callback_error(req, "statfs", errno),
     }
 }
 
@@ -2677,7 +3192,7 @@ pub extern "C" fn studiofs_macfuse_setxattr(
     };
     match state.adapter.set_xattr(ino, name, value, flags) {
         Ok(()) => reply_error(req, 0),
-        Err(errno) => reply_error(req, errno),
+        Err(errno) => reply_callback_error(req, "setxattr", errno),
     }
 }
 
@@ -2705,8 +3220,8 @@ pub extern "C" fn studiofs_macfuse_getxattr(
             Ok(Some(value_size)) => {
                 reply_xattr_size(req, xattr_size_from_position(value_size, position))
             }
-            Ok(None) => reply_error(req, xattr_not_found_errno()),
-            Err(errno) => reply_error(req, errno),
+            Ok(None) => reply_callback_error(req, "getxattr", xattr_not_found_errno()),
+            Err(errno) => reply_callback_error(req, "getxattr", errno),
         }
         return;
     }
@@ -2714,8 +3229,8 @@ pub extern "C" fn studiofs_macfuse_getxattr(
         Ok(Some(value)) => {
             reply_xattr_value(req, size, xattr_value_from_position(&value, position))
         }
-        Ok(None) => reply_error(req, xattr_not_found_errno()),
-        Err(errno) => reply_error(req, errno),
+        Ok(None) => reply_callback_error(req, "getxattr", xattr_not_found_errno()),
+        Err(errno) => reply_callback_error(req, "getxattr", errno),
     }
 }
 
@@ -2733,7 +3248,7 @@ pub extern "C" fn studiofs_macfuse_listxattr(
     match state.adapter.list_xattrs(ino) {
         Ok(names) if size == 0 => reply_xattr_size(req, xattr_name_list_len(&names)),
         Ok(names) => reply_xattr_value(req, size, &format_xattr_name_list(&names)),
-        Err(errno) => reply_error(req, errno),
+        Err(errno) => reply_callback_error(req, "listxattr", errno),
     }
 }
 
@@ -2755,7 +3270,7 @@ pub extern "C" fn studiofs_macfuse_removexattr(
     };
     match state.adapter.remove_xattr(ino, name) {
         Ok(()) => reply_error(req, 0),
-        Err(errno) => reply_error(req, errno),
+        Err(errno) => reply_callback_error(req, "removexattr", errno),
     }
 }
 
@@ -2833,6 +3348,29 @@ fn xattr_not_found_errno() -> i32 {
     libc::ENOATTR
 }
 
+fn is_missing_xattr_error(err: &studiofs_vfs::VfsError) -> bool {
+    matches!(
+        err,
+        studiofs_vfs::VfsError::Meta(studiofs_meta::MetaError::EntryNotFound { .. })
+    )
+}
+
+fn xattr_mutation_err_to_errno(err: &studiofs_vfs::VfsError) -> i32 {
+    if is_missing_xattr_error(err) {
+        xattr_not_found_errno()
+    } else {
+        vfs_err_to_errno(err)
+    }
+}
+
+fn macfuse_set_xattr_flags(name: &[u8], flags: u32) -> u32 {
+    if name == MACOS_PROVENANCE_XATTR {
+        flags & !XATTR_CREATE_FLAG
+    } else {
+        flags
+    }
+}
+
 async fn acquire_read_admission(
     admission: Arc<Semaphore>,
     size: u32,
@@ -2859,6 +3397,7 @@ async fn acquire_read_admission(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use studiofs_meta::engine::XATTR_REPLACE_FLAG;
 
     #[test]
     fn read_buffer_pool_keeps_recycled_initialized_prefix_len() {
@@ -2972,6 +3511,104 @@ mod tests {
         };
 
         assert!(!setattr_mask_has_unknown(mask));
+    }
+
+    #[test]
+    fn setattr_macos_metadata_bits_are_accepted_noops() {
+        // SAFETY: The C shim returns platform header values for this build, or
+        // zero for optional bits absent from the active FUSE headers.
+        let (flags, chgtime, bkuptime, fh) = unsafe {
+            (
+                crate::low_level::studiofs_macfuse_setattr_flags_mask(),
+                crate::low_level::studiofs_macfuse_setattr_chgtime_mask(),
+                crate::low_level::studiofs_macfuse_setattr_bkuptime_mask(),
+                crate::low_level::studiofs_macfuse_setattr_fh_mask(),
+            )
+        };
+        let ignored = flags | chgtime | bkuptime;
+
+        assert!(
+            setattr_mask_is_accepted_noop(0),
+            "macFUSE can report chflags with an empty setattr mask"
+        );
+        assert_eq!(
+            setattr_mask_is_accepted_noop(ignored),
+            ignored != 0,
+            "at least one optional no-op mask should be accepted when present"
+        );
+        if flags != 0 {
+            assert!(setattr_mask_is_accepted_noop(flags | fh));
+        }
+        if fh != 0 {
+            assert!(!setattr_mask_is_accepted_noop(fh));
+        }
+    }
+
+    #[test]
+    fn callback_error_log_level_ignores_success_and_expected_macos_probes() {
+        assert_eq!(callback_error_log_level("write", 0), None);
+        assert_eq!(
+            callback_error_log_level("getxattr", xattr_not_found_errno()),
+            None
+        );
+        assert_eq!(callback_error_log_level("lookup", libc::ENOENT), None);
+        assert_eq!(callback_error_log_level("removexattr", libc::ENOENT), None);
+        assert_eq!(
+            callback_error_log_level("removexattr", xattr_not_found_errno()),
+            None
+        );
+        assert_eq!(callback_error_log_level("getattr", libc::ENOENT), None);
+        assert_eq!(
+            callback_error_log_level("read", MACFUSE_READ_INTERRUPTED_ERRNO),
+            None
+        );
+    }
+
+    #[test]
+    fn callback_error_log_level_warns_for_write_and_metadata_errors() {
+        assert_eq!(
+            callback_error_log_level("write", libc::ENOENT),
+            Some(CallbackErrorLogLevel::Warn)
+        );
+        assert_eq!(
+            callback_error_log_level("lookup", libc::EIO),
+            Some(CallbackErrorLogLevel::Warn)
+        );
+        assert_eq!(
+            callback_error_log_level("getxattr", libc::EIO),
+            Some(CallbackErrorLogLevel::Warn)
+        );
+    }
+
+    #[test]
+    fn provenance_xattr_create_flag_is_idempotent_for_macos_copyfile() {
+        let flags = XATTR_CREATE_FLAG | XATTR_REPLACE_FLAG;
+
+        assert_eq!(
+            macfuse_set_xattr_flags(MACOS_PROVENANCE_XATTR, flags),
+            XATTR_REPLACE_FLAG
+        );
+        assert_eq!(
+            macfuse_set_xattr_flags(b"com.apple.FinderInfo", flags),
+            flags
+        );
+    }
+
+    #[test]
+    fn missing_xattr_mutation_maps_to_macos_xattr_not_found_errno() {
+        let error = studiofs_vfs::VfsError::Meta(studiofs_meta::MetaError::EntryNotFound {
+            parent: 42,
+            name: "com.apple.FinderInfo".into(),
+        });
+
+        assert_eq!(xattr_mutation_err_to_errno(&error), xattr_not_found_errno());
+    }
+
+    #[test]
+    fn non_xattr_not_found_still_maps_to_no_entry() {
+        let error = studiofs_vfs::VfsError::Meta(studiofs_meta::MetaError::InodeNotFound(42));
+
+        assert_eq!(xattr_mutation_err_to_errno(&error), libc::ENOENT);
     }
 
     #[test]

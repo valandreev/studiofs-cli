@@ -2,8 +2,8 @@ use crate::access::{AccessClass, AccessDecision, AccessTrackerConfig, HandleAcce
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
 use std::time::Instant;
 use studiofs_meta::types::{Ino, InodeAttr};
 use tracing::debug;
@@ -373,7 +373,7 @@ impl FileSessionCounters {
 #[derive(Debug)]
 pub(super) struct FileSessionState {
     /// Active sessions tracked by inode.
-    sessions: Mutex<HashMap<Ino, Weak<FileSessionEntry>>>,
+    sessions: Mutex<HashMap<Ino, Arc<FileSessionEntry>>>,
     counters: Arc<FileSessionCounters>,
 }
 
@@ -389,40 +389,51 @@ impl FileSessionState {
     /// Gets (or creates) the session entry for `ino`.
     pub(super) fn session(&self, ino: Ino) -> Arc<FileSessionEntry> {
         let mut sessions = self.sessions.lock();
-        if let Some(existing) = sessions.get(&ino).and_then(Weak::upgrade) {
-            return existing;
-        }
-        if sessions.get(&ino).is_some() {
-            sessions.remove(&ino);
-            self.counters
-                .active_sessions
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                    Some(v.saturating_sub(1))
-                })
-                .ok();
+        if let Some(existing) = sessions.get(&ino) {
+            return Arc::clone(existing);
         }
 
         let session = Arc::new(FileSessionEntry::new());
-        sessions.insert(ino, Arc::downgrade(&session));
+        sessions.insert(ino, Arc::clone(&session));
         self.counters
             .active_sessions
             .fetch_add(1, Ordering::Relaxed);
         session
     }
 
+    fn live_session(&self, ino: Ino) -> Option<Arc<FileSessionEntry>> {
+        self.sessions.lock().get(&ino).cloned()
+    }
+
+    fn session_is_idle(session: &Arc<FileSessionEntry>) -> bool {
+        session.open_handles.load(Ordering::Relaxed) == 0
+            && session.queued_ops.load(Ordering::Relaxed) == 0
+            && session.active_shared_locks.load(Ordering::Relaxed) == 0
+            && session.active_writer.lock().is_none()
+            // The map must hold the only strong ref. `gc_if_idle` runs while
+            // holding the session map lock, so no new `session()` caller can
+            // clone this entry between the count check and removal.
+            && Arc::strong_count(session) == 1
+    }
+
     /// Removes an idle session entry when no handles remain.
-    pub(super) fn gc_if_idle(&self, ino: Ino) {
+    pub(super) fn gc_if_idle(&self, ino: Ino) -> bool {
         let mut sessions = self.sessions.lock();
-        if sessions.get(&ino).and_then(Weak::upgrade).is_none() {
-            sessions.remove(&ino);
-            self.counters
-                .active_sessions
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                    Some(v.saturating_sub(1))
-                })
-                .ok();
-            debug!(ino, "file session gc removed idle session");
+        let Some(session) = sessions.get(&ino) else {
+            return false;
+        };
+        if !Self::session_is_idle(session) {
+            return false;
         }
+        sessions.remove(&ino);
+        self.counters
+            .active_sessions
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            })
+            .ok();
+        debug!(ino, "file session gc removed idle session");
+        true
     }
 
     /// Enters the operation gate for `ino` and returns a session permit.
@@ -516,7 +527,12 @@ impl FileSessionState {
         phase: &'static str,
     ) {
         self.counters.note_transition();
-        self.session(ino).record_transition(op, phase);
+        {
+            let Some(session) = self.live_session(ino) else {
+                return;
+            };
+            session.record_transition(op, phase);
+        }
         if matches!(phase, "complete" | "published" | "recovered" | "skipped") {
             self.gc_if_idle(ino);
         }
@@ -546,7 +562,7 @@ impl FileSessionState {
     }
 
     pub(super) fn debug_snapshot(&self, ino: Ino) -> Option<FileSessionDebugSnapshot> {
-        let session = self.sessions.lock().get(&ino).and_then(Weak::upgrade)?;
+        let session = self.sessions.lock().get(&ino).cloned()?;
         Some(FileSessionDebugSnapshot {
             open_handles: session.open_handles.load(Ordering::Relaxed),
             queued_ops: session.queued_ops.load(Ordering::Relaxed),
@@ -576,5 +592,17 @@ mod tests {
         f3 |= OpenFlags::APPEND;
         assert!(f3.contains(OpenFlags::RDONLY));
         assert!(f3.contains(OpenFlags::APPEND));
+    }
+
+    #[test]
+    fn file_session_gc_keeps_session_with_external_reference() {
+        let sessions = FileSessionState::new();
+        let session = sessions.session(42);
+
+        assert!(!sessions.gc_if_idle(42));
+        assert!(Arc::ptr_eq(&sessions.session(42), &session));
+
+        drop(session);
+        assert!(sessions.gc_if_idle(42));
     }
 }

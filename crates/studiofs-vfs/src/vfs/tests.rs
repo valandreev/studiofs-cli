@@ -6502,7 +6502,7 @@ fn ignored_entry_writes_preserve_synthetic_attr_size() {
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "ignored-entry-write-size");
     let _guard = rt.enter();
     rt.block_on(async {
-        let inode_attr = vfs.create(1, b".DS_Store", 0, 0, 0o644).unwrap();
+        let inode_attr = vfs.create(1, b"._DS_Store", 0, 0, 0o644).unwrap();
         let inode_payload = b"synthetic-inode";
         vfs.write_with_local_sync_policy(
             inode_attr.ino,
@@ -6558,6 +6558,12 @@ fn ignored_entry_writes_preserve_synthetic_attr_size() {
             "ignored-entry handle writes should remain readable at the new synthetic length"
         );
         vfs.release_fh(fh).await.unwrap();
+        let handle_after_release = vfs.getattr(handle_attr.ino).unwrap();
+        assert_eq!(
+            handle_after_release.size,
+            handle_payload.len() as u64,
+            "ignored-entry close must not remove the synthetic inode before copyfile metadata completes"
+        );
     });
 }
 
@@ -9222,6 +9228,35 @@ fn test_file_session_open_handle_stats_track_release_lifecycle() {
 }
 
 #[test]
+fn test_file_session_gc_keeps_session_while_handle_is_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "file-session-open-handle-gc");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"session-open-handle-gc.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+
+        assert!(
+            !vfs.state.file_session.gc_if_idle(ino),
+            "gc must not collect a file session while a handle is open"
+        );
+        assert!(
+            vfs.state.file_session.debug_snapshot(ino).is_some(),
+            "open handles must keep their file session observable"
+        );
+
+        vfs.release_fh(fh).await.unwrap();
+        assert!(
+            vfs.state.file_session.debug_snapshot(ino).is_none(),
+            "last-handle release should collect the now-idle file session"
+        );
+    });
+}
+
+#[test]
 fn test_file_session_background_complete_gc_removes_idle_session() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "file-session-background-gc");
@@ -9267,6 +9302,61 @@ fn test_file_session_gc_removes_idle_read_only_session() {
         assert_eq!(
             stats.active_sessions, 0,
             "idle read-only session should be collected"
+        );
+    });
+}
+
+#[test]
+fn test_file_session_gc_reports_only_real_removals() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "file-session-gc-idempotent");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"session-gc-idempotent.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+
+        let pin = vfs.state.file_session.session(ino);
+        drop(pin);
+
+        assert!(
+            vfs.state.file_session.gc_if_idle(ino),
+            "first idle gc should remove the expired session entry"
+        );
+        assert!(
+            !vfs.state.file_session.gc_if_idle(ino),
+            "second idle gc should not report a removal after the entry is gone"
+        );
+    });
+}
+
+#[test]
+fn test_file_session_background_transition_does_not_recreate_collected_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "file-session-background-transition-gc");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"session-background-transition-gc.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+
+        let pin = vfs.state.file_session.session(ino);
+        drop(pin);
+
+        assert!(
+            vfs.state.file_session.gc_if_idle(ino),
+            "setup should remove the expired session entry"
+        );
+        vfs.state.file_session.note_background_transition(
+            ino,
+            FileSessionOperation::Upload,
+            "uploaded",
+        );
+        assert!(
+            !vfs.state.file_session.gc_if_idle(ino),
+            "background transition should not recreate a collected idle session"
         );
     });
 }
