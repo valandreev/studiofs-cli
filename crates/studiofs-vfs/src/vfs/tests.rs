@@ -6430,7 +6430,7 @@ fn test_release_fh_clean_skip_does_not_reenter_sticky_error_barrier() {
 }
 
 #[test]
-fn test_release_fh_clean_skip_does_not_wait_for_file_session_gate() {
+fn test_release_fh_clean_waits_for_file_session_gate() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "release-outcome-clean-session-skip");
     let _guard = rt.enter();
@@ -6450,11 +6450,26 @@ fn test_release_fh_clean_skip_does_not_wait_for_file_session_gate() {
             .file_session
             .enter_op(ino, FileSessionOperation::Read)
             .await;
-        let release =
-            tokio::time::timeout(Duration::from_millis(100), vfs.release_fh_with_outcome(fh))
-                .await
-                .expect("clean release should not wait behind the file-session gate")
-                .expect("clean release should succeed");
+        let release_vfs = Arc::clone(&vfs);
+        let release_task =
+            tokio::spawn(async move { release_vfs.release_fh_with_outcome(fh).await });
+
+        tokio::time::timeout(Duration::from_millis(100), async {
+            loop {
+                if vfs.file_session_stats().queued_ops >= 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("clean release should wait behind the file-session gate while read is active");
+
+        drop(_read_session);
+        let release = release_task
+            .await
+            .expect("clean release task should not panic")
+            .expect("clean release should succeed");
 
         assert!(
             release.closed_last_handle,
@@ -8594,8 +8609,8 @@ fn test_flush_fh_clean_skip_waits_for_deferred_release_but_not_file_session_gate
             "clean handle flush must still wait for an in-flight deferred release barrier"
         );
 
-        drop(guard);
         vfs.state.deferred_release_inflight.lock().remove(&ino);
+        drop(guard);
         let outcome = tokio::time::timeout(Duration::from_millis(100), flush)
             .await
             .expect("clean flush should not wait behind the file-session gate")
@@ -8605,6 +8620,7 @@ fn test_flush_fh_clean_skip_waits_for_deferred_release_but_not_file_session_gate
             !outcome.flushed_local_dirty_state,
             "clean handle flush should report a clean skip"
         );
+        drop(_read_session);
         vfs.release_fh(fh).await.unwrap();
     });
 }
@@ -10798,6 +10814,30 @@ fn deferred_release_barrier_replaces_older_inflight_marker() {
                 .lock()
                 .contains_key(&ino),
             "dropping the current barrier guard must remove its marker"
+        );
+    });
+}
+
+#[test]
+fn deferred_release_ignored_entry_skips_release_barrier() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "ignored-release-skips-barrier");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs.create(1, b"._DS_Store", 0, 0, 0o644).unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+
+        let outcome = vfs
+            .release_fh_with_deferred_last_handle_barrier(fh, &tokio::runtime::Handle::current());
+        assert!(outcome.closed_last_handle);
+        assert!(!outcome.flushed_local_dirty_state);
+        assert!(
+            !vfs.state
+                .deferred_release_inflight
+                .lock()
+                .contains_key(&ino),
+            "ignored entries should not register a deferred release barrier"
         );
     });
 }
