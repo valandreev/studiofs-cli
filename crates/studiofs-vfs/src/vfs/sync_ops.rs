@@ -574,8 +574,9 @@ impl StudioVfs {
     /// inode. In durable mode this remains a strict local-durability barrier;
     /// in fast mode it only guarantees that local unpublished state is
     /// materialized, not that payload bytes have crossed a crash-safe sync
-    /// boundary. Clean last-handle closes still short-circuit without
-    /// inventing extra work on the foreground path.
+    /// boundary. Clean last-handle closes still enter the file-session gate so
+    /// release cannot report close completion while another operation is still
+    /// active for the inode.
     pub async fn release_fh(&self, fh: u64) -> VfsResult<()> {
         self.release_fh_with_outcome(fh).await.map(|_| ())
     }
@@ -642,18 +643,11 @@ impl StudioVfs {
         context: &HandleReleaseContext,
     ) -> LastHandleReleaseAction {
         let ino = context.ino;
-        let ignored_entry_attr = self.ignored_entry_attr(ino);
-        let is_orphan = self.handle_table.take_orphan(ino);
-        if let Some(attr) = ignored_entry_attr {
-            if is_orphan {
-                self.release_ignored_entry(ino);
-            } else if attr.kind == FileType::RegularFile {
-                self.detach_ignored_entry_name(ino);
-            }
-            return LastHandleReleaseAction::IgnoredEntry;
+        if let Some(action) = self.take_ignored_entry_release_action(ino) {
+            return action;
         }
 
-        if is_orphan {
+        if self.handle_table.take_orphan(ino) {
             return LastHandleReleaseAction::OrphanCleanup;
         }
 
@@ -671,6 +665,17 @@ impl StudioVfs {
         LastHandleReleaseAction::LocalSync {
             sticky_error_policy,
         }
+    }
+
+    fn take_ignored_entry_release_action(&self, ino: Ino) -> Option<LastHandleReleaseAction> {
+        let attr = self.ignored_entry_attr(ino)?;
+        let is_orphan = self.handle_table.take_orphan(ino);
+        if is_orphan {
+            self.release_ignored_entry(ino);
+        } else if attr.kind == FileType::RegularFile {
+            self.detach_ignored_entry_name(ino);
+        }
+        Some(LastHandleReleaseAction::IgnoredEntry)
     }
 
     async fn execute_last_handle_release_action(
@@ -728,11 +733,7 @@ impl StudioVfs {
             return Ok(ReleaseFhOutcome::default());
         };
         let ino = context.ino;
-        let action = self.take_last_handle_release_action(&context);
-        if matches!(
-            action,
-            LastHandleReleaseAction::IgnoredEntry | LastHandleReleaseAction::Clean
-        ) {
+        if let Some(action) = self.take_ignored_entry_release_action(ino) {
             let result = self.execute_last_handle_release_action(ino, action).await;
             self.state.file_session.gc_if_idle(ino);
             return result;
@@ -743,7 +744,7 @@ impl StudioVfs {
             .file_session
             .enter_op(ino, FileSessionOperation::Release)
             .await;
-        let result = self.execute_last_handle_release_action(ino, action).await;
+        let result = self.release_last_handle_with_outcome(context).await;
         drop(session);
         self.state.file_session.gc_if_idle(ino);
         result
@@ -764,6 +765,13 @@ impl StudioVfs {
         };
         let ino = context.ino;
         let flushed_local_dirty_state = self.inode_has_local_dirty_state(ino);
+        if self.take_ignored_entry_release_action(ino).is_some() {
+            self.state.file_session.gc_if_idle(ino);
+            return ReleaseFhOutcome {
+                closed_last_handle: true,
+                flushed_local_dirty_state: false,
+            };
+        }
         let vfs = Arc::clone(self);
         let (barrier, guard) = self.register_deferred_release_barrier(ino);
         self.track_background_task(runtime.spawn(async move {
