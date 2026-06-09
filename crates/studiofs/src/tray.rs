@@ -178,6 +178,8 @@ mod supported {
         pending_upload_bytes: Option<u64>,
         #[cfg(target_os = "macos")]
         tooltip: MacTrayTooltip,
+        #[cfg(target_os = "macos")]
+        last_tray_rect: Option<tray_icon::Rect>,
         is_hovered: bool,
     }
 
@@ -193,6 +195,8 @@ mod supported {
                 pending_upload_bytes: None,
                 #[cfg(target_os = "macos")]
                 tooltip: MacTrayTooltip::new(),
+                #[cfg(target_os = "macos")]
+                last_tray_rect: None,
                 is_hovered: false,
             }
         }
@@ -284,6 +288,9 @@ mod supported {
                 self.tooltip
                     .set_text(&self.tooltip_for(self.mode, self.pending_upload_bytes));
                 self.tooltip.resize_to_text();
+                if let Some(tray_rect) = self.last_tray_rect {
+                    self.tooltip.reposition(tray_rect);
+                }
             }
         }
 
@@ -315,6 +322,7 @@ mod supported {
 
         #[cfg(target_os = "macos")]
         fn set_hovered(&mut self, tray_rect: Option<tray_icon::Rect>) {
+            self.last_tray_rect = tray_rect;
             let hovered = tray_rect.is_some();
             if self.is_hovered == hovered {
                 if let Some(tray_rect) = tray_rect {
@@ -403,11 +411,37 @@ mod supported {
             let Some(mtm) = MainThreadMarker::new() else {
                 return;
             };
-            let Some(screen) = NSScreen::mainScreen(mtm) else {
+            let screens = NSScreen::screens(mtm);
+            let Some(primary_screen) = screens.firstObject() else {
                 return;
             };
+            let primary_height = primary_screen.frame().size.height;
+            let tray_center_x = tray_rect.position.x + f64::from(tray_rect.size.width) / 2.0;
+            let tray_center_y = tray_rect.position.y + f64::from(tray_rect.size.height) / 2.0;
+            let mut active_screen = primary_screen.clone();
+
+            for index in 0..screens.len() {
+                let screen = screens.objectAtIndex(index);
+                let scale_factor = screen.backingScaleFactor();
+                let frame = screen.frame();
+                let physical_left = frame.origin.x * scale_factor;
+                let physical_top =
+                    (primary_height - frame.origin.y - frame.size.height) * scale_factor;
+                let physical_width = frame.size.width * scale_factor;
+                let physical_height = frame.size.height * scale_factor;
+
+                if tray_center_x >= physical_left
+                    && tray_center_x <= physical_left + physical_width
+                    && tray_center_y >= physical_top
+                    && tray_center_y <= physical_top + physical_height
+                {
+                    active_screen = screen;
+                    break;
+                }
+            }
+
+            let screen = active_screen;
             let scale_factor = screen.backingScaleFactor();
-            let screen_frame = screen.frame();
             let tray_x = tray_rect.position.x / scale_factor;
             let tray_y_top = tray_rect.position.y / scale_factor;
             let tray_width = f64::from(tray_rect.size.width) / scale_factor;
@@ -415,7 +449,7 @@ mod supported {
             let panel_width = panel.frame().size.width;
             let x = tray_x + (tray_width - panel_width) / 2.0;
             let y =
-                screen_frame.size.height - tray_y_top - tray_height - TOOLTIP_HEIGHT - TOOLTIP_GAP;
+                primary_height - tray_y_top - tray_height - TOOLTIP_HEIGHT - TOOLTIP_GAP;
             panel.setFrame_display(
                 NSRect::new(NSPoint::new(x, y), NSSize::new(panel_width, TOOLTIP_HEIGHT)),
                 true,
