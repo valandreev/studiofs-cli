@@ -9,15 +9,44 @@ mod supported {
     };
     use image::imageops::FilterType;
     use image::{GrayImage, ImageFormat};
+    #[cfg(target_os = "macos")]
+    use objc2::MainThreadMarker;
+    #[cfg(target_os = "macos")]
+    use objc2::rc::Retained;
+    #[cfg(target_os = "macos")]
+    use objc2_app_kit::{
+        NSBackingStoreType, NSColor, NSFont, NSPanel, NSPopUpMenuWindowLevel, NSScreen,
+        NSTextField, NSView, NSWindowCollectionBehavior, NSWindowStyleMask,
+    };
+    #[cfg(target_os = "macos")]
+    use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
     use std::f32::consts::PI;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread::JoinHandle;
     use std::time::{Duration, Instant};
+    #[cfg(target_os = "macos")]
+    use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
+    #[cfg(not(target_os = "macos"))]
     use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
     use winit::application::ApplicationHandler;
     use winit::event::StartCause;
     use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+
+    #[cfg(target_os = "macos")]
+    const TOOLTIP_MIN_WIDTH: f64 = 180.0;
+    #[cfg(target_os = "macos")]
+    const TOOLTIP_MAX_WIDTH: f64 = 520.0;
+    #[cfg(target_os = "macos")]
+    const TOOLTIP_INITIAL_WIDTH: f64 = TOOLTIP_MIN_WIDTH;
+    #[cfg(target_os = "macos")]
+    const TOOLTIP_HEIGHT: f64 = 34.0;
+    #[cfg(target_os = "macos")]
+    const TOOLTIP_PADDING_X: f64 = 10.0;
+    #[cfg(target_os = "macos")]
+    const TOOLTIP_PADDING_Y: f64 = 7.0;
+    #[cfg(target_os = "macos")]
+    const TOOLTIP_GAP: f64 = 8.0;
 
     const TRAY_ICON_PNG: &[u8] = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -53,6 +82,8 @@ mod supported {
         Tick,
         Activity(TrayActivity),
         MountFinished,
+        #[cfg(target_os = "macos")]
+        HoverChanged(Option<tray_icon::Rect>),
     }
 
     #[derive(Debug, Clone)]
@@ -145,6 +176,9 @@ mod supported {
         mode_started_at: Instant,
         last_color: Option<[u8; 3]>,
         pending_upload_bytes: Option<u64>,
+        #[cfg(target_os = "macos")]
+        tooltip: MacTrayTooltip,
+        is_hovered: bool,
     }
 
     impl TrayApp {
@@ -157,6 +191,9 @@ mod supported {
                 mode_started_at: Instant::now(),
                 last_color: None,
                 pending_upload_bytes: None,
+                #[cfg(target_os = "macos")]
+                tooltip: MacTrayTooltip::new(),
+                is_hovered: false,
             }
         }
 
@@ -242,6 +279,12 @@ mod supported {
                     tracing::debug!(error = %error, "failed to update tray tooltip");
                 }
             }
+            #[cfg(target_os = "macos")]
+            if self.is_hovered {
+                self.tooltip
+                    .set_text(&self.tooltip_for(self.mode, self.pending_upload_bytes));
+                self.tooltip.resize_to_text();
+            }
         }
 
         fn render_frame(&mut self) {
@@ -269,6 +312,175 @@ mod supported {
 
             self.last_color = Some(color);
         }
+
+        #[cfg(target_os = "macos")]
+        fn set_hovered(&mut self, tray_rect: Option<tray_icon::Rect>) {
+            let hovered = tray_rect.is_some();
+            if self.is_hovered == hovered {
+                if let Some(tray_rect) = tray_rect {
+                    self.tooltip.reposition(tray_rect);
+                }
+                return;
+            }
+            self.is_hovered = hovered;
+            if !hovered {
+                self.tooltip.hide();
+                self.render_frame();
+                return;
+            }
+
+            if let Some(tray_rect) = tray_rect {
+                self.tooltip
+                    .show(tray_rect, &self.tooltip_for(self.mode, self.pending_upload_bytes));
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    struct MacTrayTooltip {
+        panel: Option<Retained<NSPanel>>,
+        label: Option<Retained<NSTextField>>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl MacTrayTooltip {
+        fn new() -> Self {
+            Self {
+                panel: None,
+                label: None,
+            }
+        }
+
+        fn show(&mut self, tray_rect: tray_icon::Rect, text: &str) {
+            self.ensure_panel();
+            self.set_text(text);
+            self.resize_to_text();
+            self.reposition(tray_rect);
+            if let Some(panel) = self.panel.as_ref() {
+                panel.orderFrontRegardless();
+            }
+        }
+
+        fn hide(&self) {
+            if let Some(panel) = self.panel.as_ref() {
+                panel.orderOut(None);
+            }
+        }
+
+        fn set_text(&self, text: &str) {
+            if let Some(label) = self.label.as_ref() {
+                label.setStringValue(&NSString::from_str(text));
+            }
+        }
+
+        fn resize_to_text(&self) {
+            let (Some(panel), Some(label)) = (self.panel.as_ref(), self.label.as_ref()) else {
+                return;
+            };
+            label.sizeToFit();
+            let panel_width = (label.frame().size.width + TOOLTIP_PADDING_X * 2.0)
+                .clamp(TOOLTIP_MIN_WIDTH, TOOLTIP_MAX_WIDTH);
+            label.setFrame(NSRect::new(
+                NSPoint::new(TOOLTIP_PADDING_X, TOOLTIP_PADDING_Y),
+                NSSize::new(
+                    panel_width - TOOLTIP_PADDING_X * 2.0,
+                    TOOLTIP_HEIGHT - TOOLTIP_PADDING_Y * 2.0,
+                ),
+            ));
+            panel.setFrame_display(
+                NSRect::new(
+                    panel.frame().origin,
+                    NSSize::new(panel_width, TOOLTIP_HEIGHT),
+                ),
+                true,
+            );
+        }
+
+        fn reposition(&self, tray_rect: tray_icon::Rect) {
+            let Some(panel) = self.panel.as_ref() else {
+                return;
+            };
+            let Some(mtm) = MainThreadMarker::new() else {
+                return;
+            };
+            let Some(screen) = NSScreen::mainScreen(mtm) else {
+                return;
+            };
+            let scale_factor = screen.backingScaleFactor();
+            let screen_frame = screen.frame();
+            let tray_x = tray_rect.position.x / scale_factor;
+            let tray_y_top = tray_rect.position.y / scale_factor;
+            let tray_width = f64::from(tray_rect.size.width) / scale_factor;
+            let tray_height = f64::from(tray_rect.size.height) / scale_factor;
+            let panel_width = panel.frame().size.width;
+            let x = tray_x + (tray_width - panel_width) / 2.0;
+            let y =
+                screen_frame.size.height - tray_y_top - tray_height - TOOLTIP_HEIGHT - TOOLTIP_GAP;
+            panel.setFrame_display(
+                NSRect::new(NSPoint::new(x, y), NSSize::new(panel_width, TOOLTIP_HEIGHT)),
+                true,
+            );
+        }
+
+        fn ensure_panel(&mut self) {
+            if self.panel.is_some() {
+                return;
+            }
+            let Some(mtm) = MainThreadMarker::new() else {
+                return;
+            };
+            let panel = NSPanel::initWithContentRect_styleMask_backing_defer(
+                mtm.alloc(),
+                NSRect::new(
+                    NSPoint::new(0.0, 0.0),
+                    NSSize::new(TOOLTIP_INITIAL_WIDTH, TOOLTIP_HEIGHT),
+                ),
+                NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel,
+                NSBackingStoreType::Buffered,
+                false,
+            );
+            panel.setFloatingPanel(true);
+            panel.setWorksWhenModal(true);
+            panel.setLevel(NSPopUpMenuWindowLevel);
+            panel.setOpaque(false);
+            panel.setHasShadow(true);
+            panel.setIgnoresMouseEvents(true);
+            panel.setCollectionBehavior(
+                NSWindowCollectionBehavior::CanJoinAllSpaces
+                    | NSWindowCollectionBehavior::Transient,
+            );
+            panel.setBackgroundColor(Some(
+                &NSColor::colorWithSRGBRed_green_blue_alpha(0.08, 0.08, 0.08, 0.92),
+            ));
+
+            let label = NSTextField::labelWithString(&NSString::new(), mtm);
+            label.setFrame(NSRect::new(
+                NSPoint::new(TOOLTIP_PADDING_X, TOOLTIP_PADDING_Y),
+                NSSize::new(
+                    TOOLTIP_INITIAL_WIDTH - TOOLTIP_PADDING_X * 2.0,
+                    TOOLTIP_HEIGHT - TOOLTIP_PADDING_Y * 2.0,
+                ),
+            ));
+            label.setFont(Some(&NSFont::systemFontOfSize(12.0)));
+            label.setTextColor(Some(&NSColor::whiteColor()));
+            label.setDrawsBackground(false);
+            label.setBezeled(false);
+            label.setEditable(false);
+            label.setSelectable(false);
+
+            let content_view = NSView::initWithFrame(
+                mtm.alloc(),
+                NSRect::new(
+                    NSPoint::new(0.0, 0.0),
+                    NSSize::new(TOOLTIP_INITIAL_WIDTH, TOOLTIP_HEIGHT),
+                ),
+            );
+            content_view.addSubview(&label);
+            panel.setContentView(Some(&content_view));
+
+            self.panel = Some(panel);
+            self.label = Some(label);
+        }
     }
 
     impl ApplicationHandler<TrayUserEvent> for TrayApp {
@@ -287,6 +499,8 @@ mod supported {
                     self.set_activity(activity);
                     self.render_frame();
                 }
+                #[cfg(target_os = "macos")]
+                TrayUserEvent::HoverChanged(tray_rect) => self.set_hovered(tray_rect),
                 TrayUserEvent::MountFinished => event_loop.exit(),
             }
         }
@@ -354,6 +568,22 @@ mod supported {
         let ticker = spawn_ticker_thread(stop.clone(), proxy.clone());
         let monitor = spawn_activity_monitor(stop.clone(), proxy.clone(), process_id, volume_name);
         let mut app = TrayApp::new(icon_mask, args.volume_name().to_string());
+        #[cfg(target_os = "macos")]
+        TrayIconEvent::set_event_handler(Some(Box::new({
+            let proxy = proxy.clone();
+            move |event| {
+                let Some(event) = (match event {
+                    TrayIconEvent::Enter { rect, .. } | TrayIconEvent::Move { rect, .. } => {
+                        Some(TrayUserEvent::HoverChanged(Some(rect)))
+                    }
+                    TrayIconEvent::Leave { .. } => Some(TrayUserEvent::HoverChanged(None)),
+                    _ => None,
+                }) else {
+                    return;
+                };
+                let _ = proxy.send_event(event);
+            }
+        })));
 
         if let Err(error) = event_loop.run_app(&mut app) {
             tracing::warn!(
@@ -361,6 +591,8 @@ mod supported {
                 "tray event loop failed; continuing without tray"
             );
         }
+        #[cfg(target_os = "macos")]
+        TrayIconEvent::set_event_handler::<fn(TrayIconEvent)>(None);
 
         stop.store(true, Ordering::Release);
         join_optional_thread("tray ticker", ticker);
