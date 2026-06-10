@@ -32,6 +32,8 @@ mod supported {
     use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
     use winit::application::ApplicationHandler;
     use winit::event::StartCause;
+    #[cfg(target_os = "macos")]
+    use winit::event_loop::EventLoopBuilder;
     use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
     #[cfg(target_os = "macos")]
     use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
@@ -554,6 +556,29 @@ mod supported {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct MacosTrayEventLoopConfig {
+        activation_policy: ActivationPolicy,
+        activate_ignoring_other_apps: bool,
+    }
+
+    #[cfg(target_os = "macos")]
+    fn macos_tray_event_loop_config() -> MacosTrayEventLoopConfig {
+        MacosTrayEventLoopConfig {
+            activation_policy: ActivationPolicy::Accessory,
+            activate_ignoring_other_apps: false,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn configure_macos_tray_event_loop_builder<T>(builder: &mut EventLoopBuilder<T>) {
+        let config = macos_tray_event_loop_config();
+        builder
+            .with_activation_policy(config.activation_policy)
+            .with_activate_ignoring_other_apps(config.activate_ignoring_other_apps);
+    }
+
     pub(crate) fn dispatch_mount_with_auto_tray(args: MountArgs) -> anyhow::Result<()> {
         if args.should_detach() {
             return args.dispatch();
@@ -572,7 +597,7 @@ mod supported {
 
         let mut event_loop_builder = EventLoop::<TrayUserEvent>::with_user_event();
         #[cfg(target_os = "macos")]
-        event_loop_builder.with_activation_policy(ActivationPolicy::Accessory);
+        configure_macos_tray_event_loop_builder(&mut event_loop_builder);
 
         let event_loop = match event_loop_builder.build() {
             Ok(event_loop) => event_loop,
@@ -944,6 +969,15 @@ mod supported {
             let activity = activity_status(&snapshot);
             assert_eq!(activity.mode, TrayPulseMode::Idle);
             assert_eq!(activity.pending_upload_bytes, None);
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn macos_tray_event_loop_config_keeps_existing_active_app_focused() {
+            let config = macos_tray_event_loop_config();
+
+            assert_eq!(config.activation_policy, ActivationPolicy::Accessory);
+            assert!(!config.activate_ignoring_other_apps);
         }
 
         #[test]
