@@ -2214,6 +2214,7 @@ struct MetricsState {
     macfuse_open_cache_read_only_unknown_state: AtomicU64,
     macfuse_open_cache_read_only_not_regular_file: AtomicU64,
     macfuse_open_cache_read_only_local_dirty_state: AtomicU64,
+    macfuse_open_cache_read_only_active_writer: AtomicU64,
     macfuse_open_cache_read_only_generation_changed: AtomicU64,
     macfuse_open_cache_read_only_local_stable_generation_changed: AtomicU64,
     macfuse_open_cache_write_capable: AtomicU64,
@@ -2348,6 +2349,7 @@ impl MetricsState {
             macfuse_open_cache_read_only_unknown_state: AtomicU64::new(0),
             macfuse_open_cache_read_only_not_regular_file: AtomicU64::new(0),
             macfuse_open_cache_read_only_local_dirty_state: AtomicU64::new(0),
+            macfuse_open_cache_read_only_active_writer: AtomicU64::new(0),
             macfuse_open_cache_read_only_generation_changed: AtomicU64::new(0),
             macfuse_open_cache_read_only_local_stable_generation_changed: AtomicU64::new(0),
             macfuse_open_cache_write_capable: AtomicU64::new(0),
@@ -2472,6 +2474,7 @@ impl MetricsState {
             macfuse_open_cache_read_only_unknown_state,
             macfuse_open_cache_read_only_not_regular_file,
             macfuse_open_cache_read_only_local_dirty_state,
+            macfuse_open_cache_read_only_active_writer,
             macfuse_open_cache_read_only_generation_changed,
             macfuse_open_cache_read_only_local_stable_generation_changed,
             macfuse_open_cache_write_capable,
@@ -6723,6 +6726,11 @@ impl StudioVfs {
                     .macfuse_open_cache_read_only_local_dirty_state
                     .fetch_add(1, Ordering::Relaxed);
             }
+            VfsMacFuseOpenCacheDecision::ReadOnlyActiveWriter => {
+                metrics
+                    .macfuse_open_cache_read_only_active_writer
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             VfsMacFuseOpenCacheDecision::ReadOnlyGenerationChanged => {
                 metrics
                     .macfuse_open_cache_read_only_generation_changed
@@ -7059,6 +7067,8 @@ impl StudioVfs {
             macfuse_open_cache_read_only_unknown_state: macfuse_open_cache_read_only_unknown_state,
             macfuse_open_cache_read_only_not_regular_file: macfuse_open_cache_read_only_not_regular_file,
             macfuse_open_cache_read_only_local_dirty_state: macfuse_open_cache_read_only_local_dirty_state,
+            macfuse_open_cache_read_only_active_writer:
+                macfuse_open_cache_read_only_active_writer,
             macfuse_open_cache_read_only_generation_changed: macfuse_open_cache_read_only_generation_changed,
             macfuse_open_cache_read_only_local_stable_generation_changed:
                 macfuse_open_cache_read_only_local_stable_generation_changed,
@@ -7590,6 +7600,7 @@ impl StudioVfs {
                 let read_only_drop = macfuse_open_cache_read_only_unknown_state
                     .saturating_add(macfuse_open_cache_read_only_not_regular_file)
                     .saturating_add(macfuse_open_cache_read_only_local_dirty_state)
+                    .saturating_add(macfuse_open_cache_read_only_active_writer)
                     .saturating_add(macfuse_open_cache_read_only_generation_changed);
                 VfsMacFuseOpenCacheStats {
                     total: macfuse_open_cache_read_only_keep
@@ -7600,7 +7611,9 @@ impl StudioVfs {
                     read_only_drop,
                     read_only_unknown_state: macfuse_open_cache_read_only_unknown_state,
                     read_only_not_regular_file: macfuse_open_cache_read_only_not_regular_file,
+                    read_only_not_fully_committed: 0,
                     read_only_local_dirty_state: macfuse_open_cache_read_only_local_dirty_state,
+                    read_only_active_writer: macfuse_open_cache_read_only_active_writer,
                     read_only_generation_changed: macfuse_open_cache_read_only_generation_changed,
                     read_only_local_stable_generation_changed:
                         macfuse_open_cache_read_only_local_stable_generation_changed,

@@ -1888,6 +1888,7 @@ mod tests {
             .expect("release read-only handle");
         let cache_decisions = vfs.write_path_observability_snapshot().macfuse_open_cache;
         assert_eq!(cache_decisions.clean_write_release_seeded, 0);
+        assert_eq!(cache_decisions.read_only_local_dirty_state, 1);
 
         adapter
             .release(attr.ino, second_writer.file_handle())
@@ -1896,6 +1897,48 @@ mod tests {
             adapter.has_open_cache_snapshot_for_test(attr.ino),
             "final write-capable release should seed after dirty state is drained"
         );
+    }
+
+    #[test]
+    fn adapter_clean_active_writer_records_active_writer_cache_drop() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-adapter-cache-clean-active-writer",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"clean-active-writer.txt",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+
+        let writer = adapter
+            .open(attr.ino, libc::O_WRONLY)
+            .expect("open write-capable handle without writing");
+        let reader = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open read-only handle while clean writer remains active");
+
+        assert!(
+            !reader.keep_cache(),
+            "read-only open while a clean writer remains active must drop cache: {reader:?}"
+        );
+        let cache_decisions = vfs.write_path_observability_snapshot().macfuse_open_cache;
+        assert_eq!(cache_decisions.read_only_active_writer, 1);
+        assert_eq!(cache_decisions.read_only_local_dirty_state, 0);
+
+        adapter
+            .release(attr.ino, reader.file_handle())
+            .expect("release read-only handle");
+        adapter
+            .release(attr.ino, writer.file_handle())
+            .expect("release clean write-capable handle");
     }
 
     #[test]

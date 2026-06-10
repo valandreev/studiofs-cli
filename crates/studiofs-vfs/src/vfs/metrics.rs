@@ -243,6 +243,8 @@ pub enum VfsMacFuseOpenCacheDecision {
     ReadOnlyNotRegularFile,
     /// Read-only open dropped cache because the inode still has local dirty state.
     ReadOnlyLocalDirtyState,
+    /// Read-only open dropped cache because a write-capable handle is still active.
+    ReadOnlyActiveWriter,
     /// Read-only open dropped cache because this generation was not observed before.
     ReadOnlyGenerationChanged,
     /// Read-only open dropped a locally stable unpublished generation that was not observed before.
@@ -270,14 +272,16 @@ pub struct VfsMacFuseOpenCacheStats {
     /// Drops because the inode state could not be read.
     pub read_only_unknown_state: u64,
     /// Drops because the inode is not a regular file.
-    #[serde(
-        default,
-        rename = "read_only_not_fully_committed",
-        alias = "read_only_not_regular_file"
-    )]
+    #[serde(default)]
     pub read_only_not_regular_file: u64,
+    /// Deprecated legacy key kept at zero; locally stable unpublished files are cacheable now.
+    #[serde(default)]
+    pub read_only_not_fully_committed: u64,
     /// Drops because local dirty state is still present.
     pub read_only_local_dirty_state: u64,
+    /// Drops because a write-capable handle is still active.
+    #[serde(default)]
+    pub read_only_active_writer: u64,
     /// Drops because the current generation was not previously observed.
     pub read_only_generation_changed: u64,
     /// Drops because the locally stable unpublished generation was not previously observed.
@@ -1354,7 +1358,7 @@ mod tests {
     }
 
     #[test]
-    fn macfuse_open_cache_stats_serializes_legacy_not_fully_committed_key() {
+    fn macfuse_open_cache_stats_serializes_new_not_regular_file_key_and_zero_legacy_key() {
         let stats = VfsMacFuseOpenCacheStats {
             read_only_not_regular_file: 5,
             ..Default::default()
@@ -1362,22 +1366,17 @@ mod tests {
 
         let serialized = serde_json::to_value(stats).expect("serialize macFUSE open-cache stats");
 
-        assert_eq!(serialized["read_only_not_fully_committed"], 5);
-        assert!(serialized.get("read_only_not_regular_file").is_none());
+        assert_eq!(serialized["read_only_not_regular_file"], 5);
+        assert_eq!(serialized["read_only_not_fully_committed"], 0);
     }
 
     #[test]
     fn macfuse_open_cache_stats_deserializes_new_not_regular_file_key() {
-        let mut serialized =
-            serde_json::to_value(VfsMacFuseOpenCacheStats::default()).expect("serialize defaults");
-        let object = serialized
-            .as_object_mut()
-            .expect("serialized stats should be a JSON object");
-        object.remove("read_only_not_fully_committed");
-        object.insert(
-            "read_only_not_regular_file".to_string(),
-            serde_json::json!(7),
-        );
+        let serialized = serde_json::to_value(VfsMacFuseOpenCacheStats {
+            read_only_not_regular_file: 7,
+            ..Default::default()
+        })
+        .expect("serialize macFUSE open-cache stats");
 
         let stats: VfsMacFuseOpenCacheStats = serde_json::from_value(serialized)
             .expect("deserialize macFUSE open-cache stats with renamed field");
