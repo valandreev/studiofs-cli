@@ -179,15 +179,17 @@ fn write_capable_shard_index(key: u64) -> usize {
 struct MacFuseOpenCacheSnapshot {
     content_epoch: u64,
     size: u64,
+    kind: MacFuseOpenCacheSnapshotKind,
     graph: Vec<MacFuseOpenCacheGraphSpan>,
 }
 
 impl MacFuseOpenCacheSnapshot {
-    fn from_locally_stable_attr(attr: &InodeAttr, graph: Vec<MacFuseOpenCacheGraphSpan>) -> Self {
+    fn from_attr(attr: &InodeAttr, graph: Vec<MacFuseOpenCacheGraphSpan>) -> Self {
         debug_assert_eq!(attr.kind, FileType::RegularFile);
         Self {
             content_epoch: attr.content_epoch,
             size: attr.size,
+            kind: MacFuseOpenCacheSnapshotKind::from_attr(attr),
             graph,
         }
     }
@@ -1067,8 +1069,8 @@ impl StudioVfsAdapter {
                 return None;
             }
         };
-        let kind = MacFuseOpenCacheSnapshotKind::from_attr(&attr);
-        let snapshot = MacFuseOpenCacheSnapshot::from_locally_stable_attr(&attr, graph);
+        let snapshot = MacFuseOpenCacheSnapshot::from_attr(&attr, graph);
+        let kind = snapshot.kind;
         Some((snapshot, kind))
     }
 
@@ -1116,8 +1118,8 @@ impl StudioVfsAdapter {
                 return false;
             }
         };
-        let kind = MacFuseOpenCacheSnapshotKind::from_attr(&attr);
-        let snapshot = MacFuseOpenCacheSnapshot::from_locally_stable_attr(&attr, graph);
+        let snapshot = MacFuseOpenCacheSnapshot::from_attr(&attr, graph);
+        let kind = snapshot.kind;
 
         let mut snapshots = self.open_cache_snapshots.lock();
         if snapshots
@@ -2255,6 +2257,49 @@ fn current_gid() -> u32 {
     // SAFETY: `getegid` is thread-safe, takes no pointers, and has no Rust-side
     // invariants beyond the platform libc contract.
     unsafe { libc::getegid() }
+}
+
+#[cfg(test)]
+mod open_cache_snapshot_tests {
+    use super::{
+        MacFuseOpenCacheGraphSpan, MacFuseOpenCacheSnapshot, MacFuseOpenCacheSnapshotKind,
+    };
+    use studiofs_meta::{InodeAttr, UploadState};
+
+    #[test]
+    fn open_cache_snapshot_identity_includes_publication_state() {
+        let mut attr = InodeAttr::new_file(42, 1, 501, 20, 0o644);
+        attr.size = 4096;
+        attr.content_epoch = 7;
+        attr.committed_size = 0;
+        attr.committed_content_epoch = 6;
+        attr.upload_state = UploadState::Updating;
+        let graph = vec![MacFuseOpenCacheGraphSpan {
+            chunk_id: 0,
+            range_start: 0,
+            range_end: 128,
+            source: 1,
+            slice_id: Some(10),
+            slice_order: Some(0),
+            payload: None,
+        }];
+
+        let local_stable = MacFuseOpenCacheSnapshot::from_attr(&attr, graph.clone());
+        assert_eq!(
+            local_stable.kind,
+            MacFuseOpenCacheSnapshotKind::LocalStableUnpublished
+        );
+        attr.committed_size = attr.size;
+        attr.committed_content_epoch = attr.content_epoch;
+        attr.upload_state = UploadState::Ready;
+        let remote_ready = MacFuseOpenCacheSnapshot::from_attr(&attr, graph);
+        assert_eq!(remote_ready.kind, MacFuseOpenCacheSnapshotKind::RemoteReady);
+
+        assert_ne!(
+            local_stable, remote_ready,
+            "publication transitions with unchanged graph must still drop kernel pages once"
+        );
+    }
 }
 
 fn bridge_attr_to_stat(attr: &BridgeFileAttr) -> stat {
