@@ -2210,12 +2210,15 @@ struct MetricsState {
     fuse_write_callback_total_ns: AtomicU64,
     fuse_write_callback_max_ns: AtomicU64,
     macfuse_open_cache_read_only_keep: AtomicU64,
+    macfuse_open_cache_read_only_local_stable_keep: AtomicU64,
     macfuse_open_cache_read_only_unknown_state: AtomicU64,
     macfuse_open_cache_read_only_not_fully_committed: AtomicU64,
     macfuse_open_cache_read_only_local_dirty_state: AtomicU64,
     macfuse_open_cache_read_only_generation_changed: AtomicU64,
+    macfuse_open_cache_read_only_local_stable_generation_changed: AtomicU64,
     macfuse_open_cache_write_capable: AtomicU64,
     macfuse_open_cache_clean_write_release_seeded: AtomicU64,
+    macfuse_open_cache_local_stable_write_release_seeded: AtomicU64,
     zeroio_replay_failures: AtomicU64,
     zeroio_publish_failures: AtomicU64,
     runtime_event_sequence: AtomicU64,
@@ -2341,12 +2344,15 @@ impl MetricsState {
             fuse_write_callback_total_ns: AtomicU64::new(0),
             fuse_write_callback_max_ns: AtomicU64::new(0),
             macfuse_open_cache_read_only_keep: AtomicU64::new(0),
+            macfuse_open_cache_read_only_local_stable_keep: AtomicU64::new(0),
             macfuse_open_cache_read_only_unknown_state: AtomicU64::new(0),
             macfuse_open_cache_read_only_not_fully_committed: AtomicU64::new(0),
             macfuse_open_cache_read_only_local_dirty_state: AtomicU64::new(0),
             macfuse_open_cache_read_only_generation_changed: AtomicU64::new(0),
+            macfuse_open_cache_read_only_local_stable_generation_changed: AtomicU64::new(0),
             macfuse_open_cache_write_capable: AtomicU64::new(0),
             macfuse_open_cache_clean_write_release_seeded: AtomicU64::new(0),
+            macfuse_open_cache_local_stable_write_release_seeded: AtomicU64::new(0),
             zeroio_replay_failures: AtomicU64::new(0),
             zeroio_publish_failures: AtomicU64::new(0),
             runtime_event_sequence: AtomicU64::new(0),
@@ -2462,12 +2468,15 @@ impl MetricsState {
             fuse_write_callback_total_ns,
             fuse_write_callback_max_ns,
             macfuse_open_cache_read_only_keep,
+            macfuse_open_cache_read_only_local_stable_keep,
             macfuse_open_cache_read_only_unknown_state,
             macfuse_open_cache_read_only_not_fully_committed,
             macfuse_open_cache_read_only_local_dirty_state,
             macfuse_open_cache_read_only_generation_changed,
+            macfuse_open_cache_read_only_local_stable_generation_changed,
             macfuse_open_cache_write_capable,
             macfuse_open_cache_clean_write_release_seeded,
+            macfuse_open_cache_local_stable_write_release_seeded,
             zeroio_replay_failures,
             zeroio_publish_failures,
             runtime_event_sequence
@@ -6681,45 +6690,68 @@ impl StudioVfs {
 
     /// Record a macFUSE open-cache decision for mounted diagnostics.
     pub fn record_macfuse_open_cache_decision(&self, decision: VfsMacFuseOpenCacheDecision) {
-        let metric = match decision {
+        let metrics = &self.state.metrics;
+        match decision {
             VfsMacFuseOpenCacheDecision::ReadOnlyKeep => {
-                &self.state.metrics.macfuse_open_cache_read_only_keep
+                metrics
+                    .macfuse_open_cache_read_only_keep
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            VfsMacFuseOpenCacheDecision::ReadOnlyLocalStableKeep => {
+                metrics
+                    .macfuse_open_cache_read_only_keep
+                    .fetch_add(1, Ordering::Relaxed);
+                metrics
+                    .macfuse_open_cache_read_only_local_stable_keep
+                    .fetch_add(1, Ordering::Relaxed);
             }
             VfsMacFuseOpenCacheDecision::ReadOnlyUnknownState => {
-                &self
-                    .state
-                    .metrics
+                metrics
                     .macfuse_open_cache_read_only_unknown_state
+                    .fetch_add(1, Ordering::Relaxed);
             }
             VfsMacFuseOpenCacheDecision::ReadOnlyNotFullyCommitted => {
-                &self
-                    .state
-                    .metrics
+                metrics
                     .macfuse_open_cache_read_only_not_fully_committed
+                    .fetch_add(1, Ordering::Relaxed);
             }
             VfsMacFuseOpenCacheDecision::ReadOnlyLocalDirtyState => {
-                &self
-                    .state
-                    .metrics
+                metrics
                     .macfuse_open_cache_read_only_local_dirty_state
+                    .fetch_add(1, Ordering::Relaxed);
             }
             VfsMacFuseOpenCacheDecision::ReadOnlyGenerationChanged => {
-                &self
-                    .state
-                    .metrics
+                metrics
                     .macfuse_open_cache_read_only_generation_changed
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            VfsMacFuseOpenCacheDecision::ReadOnlyLocalStableGenerationChanged => {
+                metrics
+                    .macfuse_open_cache_read_only_generation_changed
+                    .fetch_add(1, Ordering::Relaxed);
+                metrics
+                    .macfuse_open_cache_read_only_local_stable_generation_changed
+                    .fetch_add(1, Ordering::Relaxed);
             }
             VfsMacFuseOpenCacheDecision::WriteCapable => {
-                &self.state.metrics.macfuse_open_cache_write_capable
+                metrics
+                    .macfuse_open_cache_write_capable
+                    .fetch_add(1, Ordering::Relaxed);
             }
             VfsMacFuseOpenCacheDecision::CleanWriteReleaseSeeded => {
-                &self
-                    .state
-                    .metrics
+                metrics
                     .macfuse_open_cache_clean_write_release_seeded
+                    .fetch_add(1, Ordering::Relaxed);
             }
-        };
-        metric.fetch_add(1, Ordering::Relaxed);
+            VfsMacFuseOpenCacheDecision::LocalStableWriteReleaseSeeded => {
+                metrics
+                    .macfuse_open_cache_clean_write_release_seeded
+                    .fetch_add(1, Ordering::Relaxed);
+                metrics
+                    .macfuse_open_cache_local_stable_write_release_seeded
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 
     /// Record FUSE write callback observability.
@@ -7019,13 +7051,19 @@ impl StudioVfs {
             fuse_write_callback_total_ns: fuse_write_callback_total_ns,
             fuse_write_callback_max_ns: fuse_write_callback_max_ns,
             macfuse_open_cache_read_only_keep: macfuse_open_cache_read_only_keep,
+            macfuse_open_cache_read_only_local_stable_keep:
+                macfuse_open_cache_read_only_local_stable_keep,
             macfuse_open_cache_read_only_unknown_state: macfuse_open_cache_read_only_unknown_state,
             macfuse_open_cache_read_only_not_fully_committed: macfuse_open_cache_read_only_not_fully_committed,
             macfuse_open_cache_read_only_local_dirty_state: macfuse_open_cache_read_only_local_dirty_state,
             macfuse_open_cache_read_only_generation_changed: macfuse_open_cache_read_only_generation_changed,
+            macfuse_open_cache_read_only_local_stable_generation_changed:
+                macfuse_open_cache_read_only_local_stable_generation_changed,
             macfuse_open_cache_write_capable: macfuse_open_cache_write_capable,
             macfuse_open_cache_clean_write_release_seeded:
                 macfuse_open_cache_clean_write_release_seeded,
+            macfuse_open_cache_local_stable_write_release_seeded:
+                macfuse_open_cache_local_stable_write_release_seeded,
             sync_calls: payload_store_sync_data_calls,
             sync_deferred_calls: payload_store_sync_data_deferred_calls,
             sync_bytes: payload_store_sync_data_synced_bytes,
@@ -7555,13 +7593,18 @@ impl StudioVfs {
                         .saturating_add(read_only_drop)
                         .saturating_add(macfuse_open_cache_write_capable),
                     read_only_keep: macfuse_open_cache_read_only_keep,
+                    read_only_local_stable_keep: macfuse_open_cache_read_only_local_stable_keep,
                     read_only_drop,
                     read_only_unknown_state: macfuse_open_cache_read_only_unknown_state,
                     read_only_not_fully_committed: macfuse_open_cache_read_only_not_fully_committed,
                     read_only_local_dirty_state: macfuse_open_cache_read_only_local_dirty_state,
                     read_only_generation_changed: macfuse_open_cache_read_only_generation_changed,
+                    read_only_local_stable_generation_changed:
+                        macfuse_open_cache_read_only_local_stable_generation_changed,
                     write_capable: macfuse_open_cache_write_capable,
                     clean_write_release_seeded: macfuse_open_cache_clean_write_release_seeded,
+                    local_stable_write_release_seeded:
+                        macfuse_open_cache_local_stable_write_release_seeded,
                 }
             },
             fuse_async_write: self.state.fuse_async_write_snapshot.lock().clone(),

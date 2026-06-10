@@ -127,12 +127,11 @@ struct MacFuseOpenCacheSnapshot {
 }
 
 impl MacFuseOpenCacheSnapshot {
-    fn from_attr(attr: &InodeAttr, graph: Vec<MacFuseOpenCacheGraphSpan>) -> Option<Self> {
-        if attr.kind != FileType::RegularFile
-            || attr.upload_state != UploadState::Ready
-            || attr.content_epoch != attr.committed_content_epoch
-            || attr.size != attr.committed_size
-        {
+    fn from_locally_stable_attr(
+        attr: &InodeAttr,
+        graph: Vec<MacFuseOpenCacheGraphSpan>,
+    ) -> Option<Self> {
+        if attr.kind != FileType::RegularFile {
             return None;
         }
         Some(Self {
@@ -140,6 +139,25 @@ impl MacFuseOpenCacheSnapshot {
             size: attr.size,
             graph,
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MacFuseOpenCacheSnapshotKind {
+    RemoteReady,
+    LocalStableUnpublished,
+}
+
+impl MacFuseOpenCacheSnapshotKind {
+    fn from_attr(attr: &InodeAttr) -> Self {
+        if attr.upload_state == UploadState::Ready
+            && attr.content_epoch == attr.committed_content_epoch
+            && attr.size == attr.committed_size
+        {
+            Self::RemoteReady
+        } else {
+            Self::LocalStableUnpublished
+        }
     }
 }
 
@@ -965,18 +983,20 @@ impl StudioVfsAdapter {
         );
     }
 
-    fn safe_open_cache_snapshot(&self, ino: u64) -> Option<MacFuseOpenCacheSnapshot> {
+    fn safe_open_cache_snapshot(
+        &self,
+        ino: u64,
+    ) -> Option<(MacFuseOpenCacheSnapshot, MacFuseOpenCacheSnapshotKind)> {
         let Ok(attr) = self.vfs.getattr(ino) else {
             return None;
         };
-        if attr.kind != FileType::RegularFile
-            || attr.upload_state != UploadState::Ready
-            || attr.content_epoch != attr.committed_content_epoch
-            || attr.size != attr.committed_size
-        {
+        if attr.kind != FileType::RegularFile {
             return None;
         }
         if self.vfs.inode_has_local_dirty_state(ino) {
+            return None;
+        }
+        if self.write_capable_state.lock().active_count(ino) > 0 {
             return None;
         }
         let graph = match self.open_cache_graph_signature(ino, attr.size) {
@@ -990,8 +1010,9 @@ impl StudioVfsAdapter {
                 return None;
             }
         };
-        let snapshot = MacFuseOpenCacheSnapshot::from_attr(&attr, graph)?;
-        Some(snapshot)
+        let kind = MacFuseOpenCacheSnapshotKind::from_attr(&attr);
+        let snapshot = MacFuseOpenCacheSnapshot::from_locally_stable_attr(&attr, graph)?;
+        Some((snapshot, kind))
     }
 
     fn keep_cache_for_current_generation(&self, ino: u64) -> bool {
@@ -1002,17 +1023,22 @@ impl StudioVfsAdapter {
             );
             return false;
         };
-        if attr.kind != FileType::RegularFile
-            || attr.upload_state != UploadState::Ready
-            || attr.content_epoch != attr.committed_content_epoch
-            || attr.size != attr.committed_size
-        {
+        if attr.kind != FileType::RegularFile {
             self.clear_open_cache_snapshot(ino, "not_fully_committed");
             self.vfs.record_macfuse_open_cache_decision(
                 VfsMacFuseOpenCacheDecision::ReadOnlyNotFullyCommitted,
             );
             return false;
         };
+        if self.vfs.inode_has_local_dirty_state(ino)
+            || self.write_capable_state.lock().active_count(ino) > 0
+        {
+            self.clear_open_cache_snapshot(ino, "local_dirty_state");
+            self.vfs.record_macfuse_open_cache_decision(
+                VfsMacFuseOpenCacheDecision::ReadOnlyLocalDirtyState,
+            );
+            return false;
+        }
         let graph = match self.open_cache_graph_signature(ino, attr.size) {
             Ok(graph) => graph,
             Err(error) => {
@@ -1028,20 +1054,15 @@ impl StudioVfsAdapter {
                 return false;
             }
         };
-        let Some(snapshot) = MacFuseOpenCacheSnapshot::from_attr(&attr, graph) else {
+        let kind = MacFuseOpenCacheSnapshotKind::from_attr(&attr);
+        let Some(snapshot) = MacFuseOpenCacheSnapshot::from_locally_stable_attr(&attr, graph)
+        else {
             self.clear_open_cache_snapshot(ino, "not_fully_committed");
             self.vfs.record_macfuse_open_cache_decision(
                 VfsMacFuseOpenCacheDecision::ReadOnlyNotFullyCommitted,
             );
             return false;
         };
-        if self.vfs.inode_has_local_dirty_state(ino) {
-            self.clear_open_cache_snapshot(ino, "local_dirty_state");
-            self.vfs.record_macfuse_open_cache_decision(
-                VfsMacFuseOpenCacheDecision::ReadOnlyLocalDirtyState,
-            );
-            return false;
-        }
 
         let mut snapshots = self.open_cache_snapshots.lock();
         if snapshots
@@ -1056,8 +1077,15 @@ impl StudioVfsAdapter {
                 reason = "read_only_safe",
                 "macFUSE open cache decision"
             );
-            self.vfs
-                .record_macfuse_open_cache_decision(VfsMacFuseOpenCacheDecision::ReadOnlyKeep);
+            let decision = match kind {
+                MacFuseOpenCacheSnapshotKind::RemoteReady => {
+                    VfsMacFuseOpenCacheDecision::ReadOnlyKeep
+                }
+                MacFuseOpenCacheSnapshotKind::LocalStableUnpublished => {
+                    VfsMacFuseOpenCacheDecision::ReadOnlyLocalStableKeep
+                }
+            };
+            self.vfs.record_macfuse_open_cache_decision(decision);
             return true;
         }
 
@@ -1072,14 +1100,20 @@ impl StudioVfsAdapter {
             reason = "generation_changed",
             "macFUSE open cache decision"
         );
-        self.vfs.record_macfuse_open_cache_decision(
-            VfsMacFuseOpenCacheDecision::ReadOnlyGenerationChanged,
-        );
+        let decision = match kind {
+            MacFuseOpenCacheSnapshotKind::RemoteReady => {
+                VfsMacFuseOpenCacheDecision::ReadOnlyGenerationChanged
+            }
+            MacFuseOpenCacheSnapshotKind::LocalStableUnpublished => {
+                VfsMacFuseOpenCacheDecision::ReadOnlyLocalStableGenerationChanged
+            }
+        };
+        self.vfs.record_macfuse_open_cache_decision(decision);
         false
     }
 
     fn seed_open_cache_snapshot_after_clean_release(&self, ino: u64) {
-        let Some(snapshot) = self.safe_open_cache_snapshot(ino) else {
+        let Some((snapshot, kind)) = self.safe_open_cache_snapshot(ino) else {
             self.clear_open_cache_snapshot(ino, "clean_release_not_cacheable");
             return;
         };
@@ -1097,9 +1131,15 @@ impl StudioVfsAdapter {
             return;
         }
         snapshots.put(ino, snapshot);
-        self.vfs.record_macfuse_open_cache_decision(
-            VfsMacFuseOpenCacheDecision::CleanWriteReleaseSeeded,
-        );
+        let decision = match kind {
+            MacFuseOpenCacheSnapshotKind::RemoteReady => {
+                VfsMacFuseOpenCacheDecision::CleanWriteReleaseSeeded
+            }
+            MacFuseOpenCacheSnapshotKind::LocalStableUnpublished => {
+                VfsMacFuseOpenCacheDecision::LocalStableWriteReleaseSeeded
+            }
+        };
+        self.vfs.record_macfuse_open_cache_decision(decision);
         debug!(
             ino,
             content_epoch,
@@ -1664,10 +1704,8 @@ impl StudioVfsAdapter {
             .block_on(self.vfs.release_fh_with_outcome(file_handle))
             .map_err(|error| vfs_err_to_errno(&error));
         self.read_windows.invalidate_handle(file_handle);
-        if result.is_ok() {
-            if let Some(write_ino) = seed_ino_after_last_write_handle {
-                self.seed_open_cache_snapshot_after_clean_release(write_ino);
-            }
+        if let (true, Some(write_ino)) = (result.is_ok(), seed_ino_after_last_write_handle) {
+            self.seed_open_cache_snapshot_after_clean_release(write_ino);
         }
         result.map(|_| ())
     }

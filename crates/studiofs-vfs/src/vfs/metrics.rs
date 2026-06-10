@@ -235,6 +235,8 @@ pub struct VfsFuseCallbackStats {
 pub enum VfsMacFuseOpenCacheDecision {
     /// Read-only open kept kernel data cache for this handle.
     ReadOnlyKeep,
+    /// Read-only open kept kernel data cache for a locally stable unpublished generation.
+    ReadOnlyLocalStableKeep,
     /// Read-only open dropped cache because the inode state could not be read.
     ReadOnlyUnknownState,
     /// Read-only open dropped cache because the inode is not fully committed.
@@ -243,10 +245,14 @@ pub enum VfsMacFuseOpenCacheDecision {
     ReadOnlyLocalDirtyState,
     /// Read-only open dropped cache because this generation was not observed before.
     ReadOnlyGenerationChanged,
+    /// Read-only open dropped a locally stable unpublished generation that was not observed before.
+    ReadOnlyLocalStableGenerationChanged,
     /// Write-capable open intentionally disabled read-only cache retention.
     WriteCapable,
     /// Clean final write-capable release seeded a cacheable generation snapshot.
     CleanWriteReleaseSeeded,
+    /// Final write-capable release seeded a locally stable unpublished generation snapshot.
+    LocalStableWriteReleaseSeeded,
 }
 
 /// macFUSE open-cache decision counters.
@@ -256,6 +262,9 @@ pub struct VfsMacFuseOpenCacheStats {
     pub total: u64,
     /// Read-only opens that returned keep-cache.
     pub read_only_keep: u64,
+    /// Read-only opens that kept a locally stable unpublished generation.
+    #[serde(default)]
+    pub read_only_local_stable_keep: u64,
     /// Read-only opens that returned no keep-cache.
     pub read_only_drop: u64,
     /// Drops because the inode state could not be read.
@@ -266,11 +275,17 @@ pub struct VfsMacFuseOpenCacheStats {
     pub read_only_local_dirty_state: u64,
     /// Drops because the current generation was not previously observed.
     pub read_only_generation_changed: u64,
+    /// Drops because the locally stable unpublished generation was not previously observed.
+    #[serde(default)]
+    pub read_only_local_stable_generation_changed: u64,
     /// Write-capable opens that intentionally disabled keep-cache.
     pub write_capable: u64,
     /// Clean final write-capable releases that seeded a cacheable generation snapshot.
     #[serde(default)]
     pub clean_write_release_seeded: u64,
+    /// Final write-capable releases that seeded a locally stable unpublished generation.
+    #[serde(default)]
+    pub local_stable_write_release_seeded: u64,
 }
 
 /// Async FUSE write bridge diagnostics supplied by the FUSE adapter.
