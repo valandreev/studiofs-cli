@@ -2215,6 +2215,7 @@ struct MetricsState {
     macfuse_open_cache_read_only_local_dirty_state: AtomicU64,
     macfuse_open_cache_read_only_generation_changed: AtomicU64,
     macfuse_open_cache_write_capable: AtomicU64,
+    macfuse_open_cache_clean_write_release_seeded: AtomicU64,
     zeroio_replay_failures: AtomicU64,
     zeroio_publish_failures: AtomicU64,
     runtime_event_sequence: AtomicU64,
@@ -2345,6 +2346,7 @@ impl MetricsState {
             macfuse_open_cache_read_only_local_dirty_state: AtomicU64::new(0),
             macfuse_open_cache_read_only_generation_changed: AtomicU64::new(0),
             macfuse_open_cache_write_capable: AtomicU64::new(0),
+            macfuse_open_cache_clean_write_release_seeded: AtomicU64::new(0),
             zeroio_replay_failures: AtomicU64::new(0),
             zeroio_publish_failures: AtomicU64::new(0),
             runtime_event_sequence: AtomicU64::new(0),
@@ -2465,6 +2467,7 @@ impl MetricsState {
             macfuse_open_cache_read_only_local_dirty_state,
             macfuse_open_cache_read_only_generation_changed,
             macfuse_open_cache_write_capable,
+            macfuse_open_cache_clean_write_release_seeded,
             zeroio_replay_failures,
             zeroio_publish_failures,
             runtime_event_sequence
@@ -6709,6 +6712,12 @@ impl StudioVfs {
             VfsMacFuseOpenCacheDecision::WriteCapable => {
                 &self.state.metrics.macfuse_open_cache_write_capable
             }
+            VfsMacFuseOpenCacheDecision::CleanWriteReleaseSeeded => {
+                &self
+                    .state
+                    .metrics
+                    .macfuse_open_cache_clean_write_release_seeded
+            }
         };
         metric.fetch_add(1, Ordering::Relaxed);
     }
@@ -7015,6 +7024,8 @@ impl StudioVfs {
             macfuse_open_cache_read_only_local_dirty_state: macfuse_open_cache_read_only_local_dirty_state,
             macfuse_open_cache_read_only_generation_changed: macfuse_open_cache_read_only_generation_changed,
             macfuse_open_cache_write_capable: macfuse_open_cache_write_capable,
+            macfuse_open_cache_clean_write_release_seeded:
+                macfuse_open_cache_clean_write_release_seeded,
             sync_calls: payload_store_sync_data_calls,
             sync_deferred_calls: payload_store_sync_data_deferred_calls,
             sync_bytes: payload_store_sync_data_synced_bytes,
@@ -7550,6 +7561,7 @@ impl StudioVfs {
                     read_only_local_dirty_state: macfuse_open_cache_read_only_local_dirty_state,
                     read_only_generation_changed: macfuse_open_cache_read_only_generation_changed,
                     write_capable: macfuse_open_cache_write_capable,
+                    clean_write_release_seeded: macfuse_open_cache_clean_write_release_seeded,
                 }
             },
             fuse_async_write: self.state.fuse_async_write_snapshot.lock().clone(),

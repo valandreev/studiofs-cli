@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, hash_map::Entry as HashMapEntry};
 use std::ffi::{CStr, CString, OsStr};
 use std::mem::{self, MaybeUninit};
 use std::num::NonZeroUsize;
@@ -76,12 +76,47 @@ pub(crate) struct StudioVfsAdapter {
     readdir_cache_last_pruned: Mutex<Option<Instant>>,
     readdir_cache_ready: Condvar,
     open_cache_snapshots: Arc<ParkingMutex<LruCache<u64, MacFuseOpenCacheSnapshot>>>,
+    write_capable_state: ParkingMutex<WriteCapableState>,
     file_flags: ParkingMutex<HashMap<u64, u32>>,
     read_admission: Arc<Semaphore>,
     read_queue_byte_limit: u32,
     read_buffers: Arc<ReadBufferPool>,
     read_windows: Arc<ReadWindowStore>,
     read_diagnostics: Arc<AsyncReadDiagnostics>,
+}
+
+#[derive(Debug, Default)]
+struct WriteCapableState {
+    handles: HashMap<u64, u64>,
+    handle_counts: HashMap<u64, usize>,
+}
+
+impl WriteCapableState {
+    fn record_open(&mut self, ino: u64, file_handle: u64) {
+        self.handles.insert(file_handle, ino);
+        *self.handle_counts.entry(ino).or_default() += 1;
+    }
+
+    fn release_handle(&mut self, file_handle: u64) -> Option<u64> {
+        let write_ino = self.handles.remove(&file_handle)?;
+        match self.handle_counts.entry(write_ino) {
+            HashMapEntry::Occupied(mut entry) => {
+                let count = entry.get_mut();
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    entry.remove();
+                    Some(write_ino)
+                } else {
+                    None
+                }
+            }
+            HashMapEntry::Vacant(_) => Some(write_ino),
+        }
+    }
+
+    fn active_count(&self, ino: u64) -> usize {
+        self.handle_counts.get(&ino).copied().unwrap_or(0)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -727,6 +762,7 @@ impl StudioVfsAdapter {
             open_cache_snapshots: Arc::new(ParkingMutex::new(LruCache::new(
                 open_cache_snapshot_capacity(),
             ))),
+            write_capable_state: ParkingMutex::new(WriteCapableState::default()),
             file_flags: ParkingMutex::new(HashMap::new()),
             read_admission: Arc::new(Semaphore::new(read_queue_byte_limit as usize)),
             read_queue_byte_limit,
@@ -898,7 +934,7 @@ impl StudioVfsAdapter {
                 let keep_cache = if flag_policy.keep_cache {
                     self.keep_cache_for_current_generation(ino)
                 } else {
-                    self.clear_open_cache_snapshot(ino, "write_capable");
+                    self.record_write_capable_open(ino, fh);
                     self.vfs.record_macfuse_open_cache_decision(
                         VfsMacFuseOpenCacheDecision::WriteCapable,
                     );
@@ -914,6 +950,48 @@ impl StudioVfsAdapter {
     fn clear_open_cache_snapshot(&self, ino: u64, reason: &'static str) {
         self.open_cache_snapshots.lock().pop(&ino);
         debug!(ino, reason, "macFUSE open invalidates kernel cache");
+    }
+
+    fn record_write_capable_open(&self, ino: u64, file_handle: u64) {
+        {
+            let mut write_capable_state = self.write_capable_state.lock();
+            write_capable_state.record_open(ino, file_handle);
+            self.open_cache_snapshots.lock().pop(&ino);
+        }
+        debug!(
+            ino,
+            reason = "write_capable",
+            "macFUSE open invalidates kernel cache"
+        );
+    }
+
+    fn safe_open_cache_snapshot(&self, ino: u64) -> Option<MacFuseOpenCacheSnapshot> {
+        let Ok(attr) = self.vfs.getattr(ino) else {
+            return None;
+        };
+        if attr.kind != FileType::RegularFile
+            || attr.upload_state != UploadState::Ready
+            || attr.content_epoch != attr.committed_content_epoch
+            || attr.size != attr.committed_size
+        {
+            return None;
+        }
+        if self.vfs.inode_has_local_dirty_state(ino) {
+            return None;
+        }
+        let graph = match self.open_cache_graph_signature(ino, attr.size) {
+            Ok(graph) => graph,
+            Err(error) => {
+                debug!(
+                    ino,
+                    ?error,
+                    "macFUSE open cache could not read file graph signature"
+                );
+                return None;
+            }
+        };
+        let snapshot = MacFuseOpenCacheSnapshot::from_attr(&attr, graph)?;
+        Some(snapshot)
     }
 
     fn keep_cache_for_current_generation(&self, ino: u64) -> bool {
@@ -998,6 +1076,37 @@ impl StudioVfsAdapter {
             VfsMacFuseOpenCacheDecision::ReadOnlyGenerationChanged,
         );
         false
+    }
+
+    fn seed_open_cache_snapshot_after_clean_release(&self, ino: u64) {
+        let Some(snapshot) = self.safe_open_cache_snapshot(ino) else {
+            self.clear_open_cache_snapshot(ino, "clean_release_not_cacheable");
+            return;
+        };
+        let content_epoch = snapshot.content_epoch;
+        let size = snapshot.size;
+        let write_capable_state = self.write_capable_state.lock();
+        let mut snapshots = self.open_cache_snapshots.lock();
+        if write_capable_state.active_count(ino) > 0 {
+            snapshots.pop(&ino);
+            debug!(
+                ino,
+                reason = "active_write_capable",
+                "macFUSE kernel cache snapshot invalidated"
+            );
+            return;
+        }
+        snapshots.put(ino, snapshot);
+        self.vfs.record_macfuse_open_cache_decision(
+            VfsMacFuseOpenCacheDecision::CleanWriteReleaseSeeded,
+        );
+        debug!(
+            ino,
+            content_epoch,
+            size,
+            reason = "clean_write_release",
+            "macFUSE open cache snapshot seeded after clean write release"
+        );
     }
 
     fn open_cache_graph_signature(
@@ -1548,12 +1657,19 @@ impl StudioVfsAdapter {
 
     /// Release a file handle opened through this adapter.
     pub(crate) fn release(&self, _ino: u64, file_handle: u64) -> Result<(), i32> {
+        let seed_ino_after_last_write_handle =
+            self.write_capable_state.lock().release_handle(file_handle);
         let result = self
             .runtime_handle
-            .block_on(self.vfs.release_fh(file_handle))
+            .block_on(self.vfs.release_fh_with_outcome(file_handle))
             .map_err(|error| vfs_err_to_errno(&error));
         self.read_windows.invalidate_handle(file_handle);
-        result
+        if result.is_ok() {
+            if let Some(write_ino) = seed_ino_after_last_write_handle {
+                self.seed_open_cache_snapshot_after_clean_release(write_ino);
+            }
+        }
+        result.map(|_| ())
     }
 
     /// Read directory entries from VFS.
