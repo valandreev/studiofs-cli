@@ -76,7 +76,7 @@ pub(crate) struct StudioVfsAdapter {
     readdir_cache_last_pruned: Mutex<Option<Instant>>,
     readdir_cache_ready: Condvar,
     open_cache_snapshots: Arc<ParkingMutex<LruCache<u64, MacFuseOpenCacheSnapshot>>>,
-    write_capable_handles: ParkingMutex<HashSet<u64>>,
+    write_capable_handles: ParkingMutex<HashMap<u64, u64>>,
     file_flags: ParkingMutex<HashMap<u64, u32>>,
     read_admission: Arc<Semaphore>,
     read_queue_byte_limit: u32,
@@ -728,7 +728,7 @@ impl StudioVfsAdapter {
             open_cache_snapshots: Arc::new(ParkingMutex::new(LruCache::new(
                 open_cache_snapshot_capacity(),
             ))),
-            write_capable_handles: ParkingMutex::new(HashSet::new()),
+            write_capable_handles: ParkingMutex::new(HashMap::new()),
             file_flags: ParkingMutex::new(HashMap::new()),
             read_admission: Arc::new(Semaphore::new(read_queue_byte_limit as usize)),
             read_queue_byte_limit,
@@ -900,8 +900,7 @@ impl StudioVfsAdapter {
                 let keep_cache = if flag_policy.keep_cache {
                     self.keep_cache_for_current_generation(ino)
                 } else {
-                    self.write_capable_handles.lock().insert(fh);
-                    self.clear_open_cache_snapshot(ino, "write_capable");
+                    self.record_write_capable_open(ino, fh);
                     self.vfs.record_macfuse_open_cache_decision(
                         VfsMacFuseOpenCacheDecision::WriteCapable,
                     );
@@ -919,6 +918,17 @@ impl StudioVfsAdapter {
         debug!(ino, reason, "macFUSE open invalidates kernel cache");
     }
 
+    fn record_write_capable_open(&self, ino: u64, file_handle: u64) {
+        let mut write_capable_handles = self.write_capable_handles.lock();
+        write_capable_handles.insert(file_handle, ino);
+        self.open_cache_snapshots.lock().pop(&ino);
+        debug!(
+            ino,
+            reason = "write_capable",
+            "macFUSE open invalidates kernel cache"
+        );
+    }
+
     fn safe_open_cache_snapshot(&self, ino: u64) -> Option<MacFuseOpenCacheSnapshot> {
         let Ok(attr) = self.vfs.getattr(ino) else {
             return None;
@@ -930,6 +940,9 @@ impl StudioVfsAdapter {
         {
             return None;
         };
+        if self.vfs.inode_has_local_dirty_state(ino) {
+            return None;
+        }
         let graph = match self.open_cache_graph_signature(ino, attr.size) {
             Ok(graph) => graph,
             Err(error) => {
@@ -942,9 +955,6 @@ impl StudioVfsAdapter {
             }
         };
         let snapshot = MacFuseOpenCacheSnapshot::from_attr(&attr, graph)?;
-        if self.vfs.inode_has_local_dirty_state(ino) {
-            return None;
-        }
         Some(snapshot)
     }
 
@@ -1039,7 +1049,21 @@ impl StudioVfsAdapter {
         };
         let content_epoch = snapshot.content_epoch;
         let size = snapshot.size;
-        self.open_cache_snapshots.lock().put(ino, snapshot);
+        let write_capable_handles = self.write_capable_handles.lock();
+        let mut snapshots = self.open_cache_snapshots.lock();
+        if write_capable_handles
+            .values()
+            .any(|active_ino| *active_ino == ino)
+        {
+            snapshots.pop(&ino);
+            debug!(
+                ino,
+                reason = "active_write_capable",
+                "macFUSE open invalidates kernel cache"
+            );
+            return;
+        }
+        snapshots.put(ino, snapshot);
         self.vfs.record_macfuse_open_cache_decision(
             VfsMacFuseOpenCacheDecision::CleanWriteReleaseSeeded,
         );
@@ -1600,7 +1624,11 @@ impl StudioVfsAdapter {
 
     /// Release a file handle opened through this adapter.
     pub(crate) fn release(&self, ino: u64, file_handle: u64) -> Result<(), i32> {
-        let was_write_capable = self.write_capable_handles.lock().remove(&file_handle);
+        let was_write_capable = self
+            .write_capable_handles
+            .lock()
+            .remove(&file_handle)
+            .is_some();
         let result = self
             .runtime_handle
             .block_on(self.vfs.release_fh_with_outcome(file_handle))
