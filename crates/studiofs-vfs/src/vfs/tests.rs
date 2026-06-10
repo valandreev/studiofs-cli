@@ -2520,6 +2520,99 @@ fn epoch_finalizer_invalidates_kernel_when_same_size_sparse_graph_changes() {
 }
 
 #[test]
+fn epoch_finalizer_invalidates_kernel_when_local_matching_sparse_overlay_changes_same_size_graph() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) =
+        make_unstarted_test_vfs(&tmp, "graph-finalizer-local-sparse-same-size-graph");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(
+                1,
+                b"graph-finalizer-local-sparse-same-size-graph.bin",
+                0,
+                0,
+                0o644,
+            )
+            .expect("create test file");
+        let logical_size = 3 * 1024 * 1024_u64;
+        let tail_offset = logical_size - 256;
+        let tail_len = 128_u32;
+        let tail_start = u32::try_from(tail_offset).expect("tail offset fits in one chunk");
+        let tail_end = tail_start + tail_len;
+
+        let mut published_attr = meta.get_attr(attr.ino).expect("load created attr");
+        published_attr.size = logical_size;
+        published_attr.content_epoch = 1;
+        published_attr.upload_state = MetaUploadState::Updating;
+        meta.flush_regular_file_overlay_slices_with_attr(
+            attr.ino,
+            &[(
+                ChunkId(0),
+                vec![SliceRecord::new(
+                    SliceId(0),
+                    SliceOrder(0),
+                    SliceRange::new(tail_start, tail_end).expect("valid tail payload range"),
+                    PayloadRef::new_partial(70_001, tail_len),
+                )],
+            )],
+            Some(&published_attr),
+        )
+        .expect("stage published sparse tail payload");
+        assert!(
+            meta.mark_regular_file_overlay_object_uploaded_if_matches(attr.ino, 1, 70_001)
+                .expect("mark initial tail uploaded")
+        );
+        publish_current_file_graph(&meta, attr.ino, 1, &[70_001]);
+
+        let mut tombstone_attr = meta.get_attr(attr.ino).expect("load published attr");
+        tombstone_attr.content_epoch = tombstone_attr.content_epoch.saturating_add(1);
+        tombstone_attr.upload_state = MetaUploadState::Updating;
+        meta.flush_regular_file_overlay_slices_with_attr(
+            attr.ino,
+            &[(
+                ChunkId(0),
+                vec![SliceRecord::tombstone(
+                    SliceId(0),
+                    SliceOrder(0),
+                    SliceRange::new(tail_start, tail_end).expect("valid tail tombstone range"),
+                )],
+            )],
+            Some(&tombstone_attr),
+        )
+        .expect("stage same-size sparse tail tombstone");
+        let content_epoch = tombstone_attr.content_epoch;
+        vfs.state.incarnation.live_extent_records.lock().insert(
+            (attr.ino, 0),
+            ExtentRecordId {
+                object_id: 70_001,
+                content_epoch,
+            },
+        );
+        vfs.state.namespace.dirty_attrs.lock().remove(&attr.ino);
+        vfs.state.namespace.attr_read_cache.lock().remove(attr.ino);
+
+        let invalidator = Arc::new(RecordingKernelInvalidator::default());
+        vfs.set_kernel_invalidator(invalidator.clone());
+
+        let status =
+            super::commit::CommitCoordinator::finalize_inode_epoch(&vfs, attr.ino, content_epoch)
+                .await
+                .expect("finalize local matching same-size sparse replacement");
+        assert!(matches!(
+            status,
+            super::commit::EpochFinalizeStatus::Published
+        ));
+        assert_eq!(
+            invalidator.snapshot(),
+            vec![attr.ino],
+            "local matching sparse overlay publication can change cached bytes without changing EOF"
+        );
+    });
+}
+
+#[test]
 fn remote_ready_attr_superseding_local_dirty_state_invalidates_kernel_inode() {
     let tmp = TempDir::new().expect("tempdir");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "remote-ready-supersede-kernel-inval");

@@ -266,7 +266,7 @@ impl CommitCoordinator {
             && !restored_newer_dirty_attr;
         let publication_shrinks_visible_size = latest_attr.committed_size > latest_attr.size;
         let should_invalidate_kernel_data = if local_matching_dirty_publication {
-            publication_shrinks_visible_size
+            publication_shrinks_visible_size || meta.has_persisted_overlay
         } else {
             was_dirty_visible
                 || removed_cached_attr
