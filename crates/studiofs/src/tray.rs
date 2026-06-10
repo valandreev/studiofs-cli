@@ -180,6 +180,7 @@ mod supported {
         tooltip: MacTrayTooltip,
         #[cfg(target_os = "macos")]
         last_tray_rect: Option<tray_icon::Rect>,
+        #[cfg(target_os = "macos")]
         is_hovered: bool,
     }
 
@@ -197,6 +198,7 @@ mod supported {
                 tooltip: MacTrayTooltip::new(),
                 #[cfg(target_os = "macos")]
                 last_tray_rect: None,
+                #[cfg(target_os = "macos")]
                 is_hovered: false,
             }
         }
