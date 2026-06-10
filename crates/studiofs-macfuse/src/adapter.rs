@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, hash_map::Entry as HashMapEntry};
 use std::ffi::{CStr, CString, OsStr};
 use std::mem::{self, MaybeUninit};
 use std::num::NonZeroUsize;
@@ -76,14 +76,47 @@ pub(crate) struct StudioVfsAdapter {
     readdir_cache_last_pruned: Mutex<Option<Instant>>,
     readdir_cache_ready: Condvar,
     open_cache_snapshots: Arc<ParkingMutex<LruCache<u64, MacFuseOpenCacheSnapshot>>>,
-    write_capable_handles: ParkingMutex<HashMap<u64, u64>>,
-    write_capable_handle_counts: ParkingMutex<HashMap<u64, usize>>,
+    write_capable_state: ParkingMutex<WriteCapableState>,
     file_flags: ParkingMutex<HashMap<u64, u32>>,
     read_admission: Arc<Semaphore>,
     read_queue_byte_limit: u32,
     read_buffers: Arc<ReadBufferPool>,
     read_windows: Arc<ReadWindowStore>,
     read_diagnostics: Arc<AsyncReadDiagnostics>,
+}
+
+#[derive(Debug, Default)]
+struct WriteCapableState {
+    handles: HashMap<u64, u64>,
+    handle_counts: HashMap<u64, usize>,
+}
+
+impl WriteCapableState {
+    fn record_open(&mut self, ino: u64, file_handle: u64) {
+        self.handles.insert(file_handle, ino);
+        *self.handle_counts.entry(ino).or_default() += 1;
+    }
+
+    fn release_handle(&mut self, file_handle: u64) -> Option<u64> {
+        let write_ino = self.handles.remove(&file_handle)?;
+        match self.handle_counts.entry(write_ino) {
+            HashMapEntry::Occupied(mut entry) => {
+                let count = entry.get_mut();
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    entry.remove();
+                    Some(write_ino)
+                } else {
+                    None
+                }
+            }
+            HashMapEntry::Vacant(_) => Some(write_ino),
+        }
+    }
+
+    fn active_count(&self, ino: u64) -> usize {
+        self.handle_counts.get(&ino).copied().unwrap_or(0)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -729,8 +762,7 @@ impl StudioVfsAdapter {
             open_cache_snapshots: Arc::new(ParkingMutex::new(LruCache::new(
                 open_cache_snapshot_capacity(),
             ))),
-            write_capable_handles: ParkingMutex::new(HashMap::new()),
-            write_capable_handle_counts: ParkingMutex::new(HashMap::new()),
+            write_capable_state: ParkingMutex::new(WriteCapableState::default()),
             file_flags: ParkingMutex::new(HashMap::new()),
             read_admission: Arc::new(Semaphore::new(read_queue_byte_limit as usize)),
             read_queue_byte_limit,
@@ -921,11 +953,11 @@ impl StudioVfsAdapter {
     }
 
     fn record_write_capable_open(&self, ino: u64, file_handle: u64) {
-        let mut write_capable_handles = self.write_capable_handles.lock();
-        let mut write_capable_handle_counts = self.write_capable_handle_counts.lock();
-        write_capable_handles.insert(file_handle, ino);
-        *write_capable_handle_counts.entry(ino).or_default() += 1;
-        self.open_cache_snapshots.lock().pop(&ino);
+        {
+            let mut write_capable_state = self.write_capable_state.lock();
+            write_capable_state.record_open(ino, file_handle);
+            self.open_cache_snapshots.lock().pop(&ino);
+        }
         debug!(
             ino,
             reason = "write_capable",
@@ -1053,9 +1085,9 @@ impl StudioVfsAdapter {
         };
         let content_epoch = snapshot.content_epoch;
         let size = snapshot.size;
-        let write_capable_handle_counts = self.write_capable_handle_counts.lock();
+        let write_capable_state = self.write_capable_state.lock();
         let mut snapshots = self.open_cache_snapshots.lock();
-        if write_capable_handle_counts.get(&ino).copied().unwrap_or(0) > 0 {
+        if write_capable_state.active_count(ino) > 0 {
             snapshots.pop(&ino);
             debug!(
                 ino,
@@ -1625,26 +1657,8 @@ impl StudioVfsAdapter {
 
     /// Release a file handle opened through this adapter.
     pub(crate) fn release(&self, _ino: u64, file_handle: u64) -> Result<(), i32> {
-        let seed_ino_after_last_write_handle = {
-            let mut write_capable_handles = self.write_capable_handles.lock();
-            match write_capable_handles.remove(&file_handle) {
-                Some(write_ino) => {
-                    let mut write_capable_handle_counts = self.write_capable_handle_counts.lock();
-                    if let Some(count) = write_capable_handle_counts.get_mut(&write_ino) {
-                        *count = count.saturating_sub(1);
-                        if *count == 0 {
-                            write_capable_handle_counts.remove(&write_ino);
-                            Some(write_ino)
-                        } else {
-                            None
-                        }
-                    } else {
-                        Some(write_ino)
-                    }
-                }
-                None => None,
-            }
-        };
+        let seed_ino_after_last_write_handle =
+            self.write_capable_state.lock().release_handle(file_handle);
         let result = self
             .runtime_handle
             .block_on(self.vfs.release_fh_with_outcome(file_handle))
