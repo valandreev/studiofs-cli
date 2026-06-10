@@ -1664,10 +1664,10 @@ impl StudioVfsAdapter {
             .block_on(self.vfs.release_fh_with_outcome(file_handle))
             .map_err(|error| vfs_err_to_errno(&error));
         self.read_windows.invalidate_handle(file_handle);
-        if result.is_ok()
-            && let Some(write_ino) = seed_ino_after_last_write_handle
-        {
-            self.seed_open_cache_snapshot_after_clean_release(write_ino);
+        if result.is_ok() {
+            if let Some(write_ino) = seed_ino_after_last_write_handle {
+                self.seed_open_cache_snapshot_after_clean_release(write_ino);
+            }
         }
         result.map(|_| ())
     }
