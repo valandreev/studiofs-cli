@@ -77,6 +77,7 @@ pub(crate) struct StudioVfsAdapter {
     readdir_cache_ready: Condvar,
     open_cache_snapshots: Arc<ParkingMutex<LruCache<u64, MacFuseOpenCacheSnapshot>>>,
     write_capable_handles: ParkingMutex<HashMap<u64, u64>>,
+    write_capable_handle_counts: ParkingMutex<HashMap<u64, usize>>,
     file_flags: ParkingMutex<HashMap<u64, u32>>,
     read_admission: Arc<Semaphore>,
     read_queue_byte_limit: u32,
@@ -729,6 +730,7 @@ impl StudioVfsAdapter {
                 open_cache_snapshot_capacity(),
             ))),
             write_capable_handles: ParkingMutex::new(HashMap::new()),
+            write_capable_handle_counts: ParkingMutex::new(HashMap::new()),
             file_flags: ParkingMutex::new(HashMap::new()),
             read_admission: Arc::new(Semaphore::new(read_queue_byte_limit as usize)),
             read_queue_byte_limit,
@@ -920,7 +922,9 @@ impl StudioVfsAdapter {
 
     fn record_write_capable_open(&self, ino: u64, file_handle: u64) {
         let mut write_capable_handles = self.write_capable_handles.lock();
+        let mut write_capable_handle_counts = self.write_capable_handle_counts.lock();
         write_capable_handles.insert(file_handle, ino);
+        *write_capable_handle_counts.entry(ino).or_default() += 1;
         self.open_cache_snapshots.lock().pop(&ino);
         debug!(
             ino,
@@ -939,7 +943,7 @@ impl StudioVfsAdapter {
             || attr.size != attr.committed_size
         {
             return None;
-        };
+        }
         if self.vfs.inode_has_local_dirty_state(ino) {
             return None;
         }
@@ -1049,17 +1053,14 @@ impl StudioVfsAdapter {
         };
         let content_epoch = snapshot.content_epoch;
         let size = snapshot.size;
-        let write_capable_handles = self.write_capable_handles.lock();
+        let write_capable_handle_counts = self.write_capable_handle_counts.lock();
         let mut snapshots = self.open_cache_snapshots.lock();
-        if write_capable_handles
-            .values()
-            .any(|active_ino| *active_ino == ino)
-        {
+        if write_capable_handle_counts.get(&ino).copied().unwrap_or(0) > 0 {
             snapshots.pop(&ino);
             debug!(
                 ino,
                 reason = "active_write_capable",
-                "macFUSE open invalidates kernel cache"
+                "macFUSE kernel cache snapshot invalidated"
             );
             return;
         }
@@ -1623,22 +1624,36 @@ impl StudioVfsAdapter {
     }
 
     /// Release a file handle opened through this adapter.
-    pub(crate) fn release(&self, ino: u64, file_handle: u64) -> Result<(), i32> {
-        let was_write_capable = self
-            .write_capable_handles
-            .lock()
-            .remove(&file_handle)
-            .is_some();
+    pub(crate) fn release(&self, _ino: u64, file_handle: u64) -> Result<(), i32> {
+        let seed_ino_after_last_write_handle = {
+            let mut write_capable_handles = self.write_capable_handles.lock();
+            match write_capable_handles.remove(&file_handle) {
+                Some(write_ino) => {
+                    let mut write_capable_handle_counts = self.write_capable_handle_counts.lock();
+                    if let Some(count) = write_capable_handle_counts.get_mut(&write_ino) {
+                        *count = count.saturating_sub(1);
+                        if *count == 0 {
+                            write_capable_handle_counts.remove(&write_ino);
+                            Some(write_ino)
+                        } else {
+                            None
+                        }
+                    } else {
+                        Some(write_ino)
+                    }
+                }
+                None => None,
+            }
+        };
         let result = self
             .runtime_handle
             .block_on(self.vfs.release_fh_with_outcome(file_handle))
             .map_err(|error| vfs_err_to_errno(&error));
         self.read_windows.invalidate_handle(file_handle);
-        if let Ok(outcome) = &result
-            && was_write_capable
-            && outcome.closed_last_handle
+        if result.is_ok()
+            && let Some(write_ino) = seed_ino_after_last_write_handle
         {
-            self.seed_open_cache_snapshot_after_clean_release(ino);
+            self.seed_open_cache_snapshot_after_clean_release(write_ino);
         }
         result.map(|_| ())
     }
