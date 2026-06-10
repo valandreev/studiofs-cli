@@ -144,7 +144,7 @@ impl<'a> StartupReplayCoordinator<'a> {
             && attr.upload_state != MetaUploadState::Ready
             && attr.size == 0
             && attr.committed_size == 0
-            && attr.content_epoch == attr.committed_content_epoch
+            && attr.content_epoch == 0
             && attr.committed_content_epoch == 0
     }
 
@@ -405,8 +405,8 @@ impl<'a> StartupReplayCoordinator<'a> {
             return;
         }
 
+        let meta = self.vfs.sync_meta();
         for ino in &self.live_zero_size_unpublished_inodes {
-            let meta = self.vfs.sync_meta();
             let mut attr = match meta.get_attr(*ino) {
                 Ok(attr) => attr,
                 Err(MetaError::InodeNotFound(_)) => continue,
