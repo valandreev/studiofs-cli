@@ -127,18 +127,13 @@ struct MacFuseOpenCacheSnapshot {
 }
 
 impl MacFuseOpenCacheSnapshot {
-    fn from_locally_stable_attr(
-        attr: &InodeAttr,
-        graph: Vec<MacFuseOpenCacheGraphSpan>,
-    ) -> Option<Self> {
-        if attr.kind != FileType::RegularFile {
-            return None;
-        }
-        Some(Self {
+    fn from_locally_stable_attr(attr: &InodeAttr, graph: Vec<MacFuseOpenCacheGraphSpan>) -> Self {
+        debug_assert_eq!(attr.kind, FileType::RegularFile);
+        Self {
             content_epoch: attr.content_epoch,
             size: attr.size,
             graph,
-        })
+        }
     }
 }
 
@@ -1011,7 +1006,7 @@ impl StudioVfsAdapter {
             }
         };
         let kind = MacFuseOpenCacheSnapshotKind::from_attr(&attr);
-        let snapshot = MacFuseOpenCacheSnapshot::from_locally_stable_attr(&attr, graph)?;
+        let snapshot = MacFuseOpenCacheSnapshot::from_locally_stable_attr(&attr, graph);
         Some((snapshot, kind))
     }
 
@@ -1024,9 +1019,9 @@ impl StudioVfsAdapter {
             return false;
         };
         if attr.kind != FileType::RegularFile {
-            self.clear_open_cache_snapshot(ino, "not_fully_committed");
+            self.clear_open_cache_snapshot(ino, "not_regular_file");
             self.vfs.record_macfuse_open_cache_decision(
-                VfsMacFuseOpenCacheDecision::ReadOnlyNotFullyCommitted,
+                VfsMacFuseOpenCacheDecision::ReadOnlyNotRegularFile,
             );
             return false;
         };
@@ -1055,14 +1050,7 @@ impl StudioVfsAdapter {
             }
         };
         let kind = MacFuseOpenCacheSnapshotKind::from_attr(&attr);
-        let Some(snapshot) = MacFuseOpenCacheSnapshot::from_locally_stable_attr(&attr, graph)
-        else {
-            self.clear_open_cache_snapshot(ino, "not_fully_committed");
-            self.vfs.record_macfuse_open_cache_decision(
-                VfsMacFuseOpenCacheDecision::ReadOnlyNotFullyCommitted,
-            );
-            return false;
-        };
+        let snapshot = MacFuseOpenCacheSnapshot::from_locally_stable_attr(&attr, graph);
 
         let mut snapshots = self.open_cache_snapshots.lock();
         if snapshots
@@ -1704,7 +1692,10 @@ impl StudioVfsAdapter {
             .block_on(self.vfs.release_fh_with_outcome(file_handle))
             .map_err(|error| vfs_err_to_errno(&error));
         self.read_windows.invalidate_handle(file_handle);
-        if let (true, Some(write_ino)) = (result.is_ok(), seed_ino_after_last_write_handle) {
+        if result.is_err() {
+            return result.map(|_| ());
+        }
+        if let Some(write_ino) = seed_ino_after_last_write_handle {
             self.seed_open_cache_snapshot_after_clean_release(write_ino);
         }
         result.map(|_| ())

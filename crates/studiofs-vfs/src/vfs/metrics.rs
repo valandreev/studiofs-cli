@@ -239,8 +239,8 @@ pub enum VfsMacFuseOpenCacheDecision {
     ReadOnlyLocalStableKeep,
     /// Read-only open dropped cache because the inode state could not be read.
     ReadOnlyUnknownState,
-    /// Read-only open dropped cache because the inode is not fully committed.
-    ReadOnlyNotFullyCommitted,
+    /// Read-only open dropped cache because the inode is not a regular file.
+    ReadOnlyNotRegularFile,
     /// Read-only open dropped cache because the inode still has local dirty state.
     ReadOnlyLocalDirtyState,
     /// Read-only open dropped cache because this generation was not observed before.
@@ -269,8 +269,9 @@ pub struct VfsMacFuseOpenCacheStats {
     pub read_only_drop: u64,
     /// Drops because the inode state could not be read.
     pub read_only_unknown_state: u64,
-    /// Drops because the inode is not fully committed.
-    pub read_only_not_fully_committed: u64,
+    /// Drops because the inode is not a regular file.
+    #[serde(default, alias = "read_only_not_fully_committed")]
+    pub read_only_not_regular_file: u64,
     /// Drops because local dirty state is still present.
     pub read_only_local_dirty_state: u64,
     /// Drops because the current generation was not previously observed.

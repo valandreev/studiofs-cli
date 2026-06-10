@@ -2212,7 +2212,7 @@ struct MetricsState {
     macfuse_open_cache_read_only_keep: AtomicU64,
     macfuse_open_cache_read_only_local_stable_keep: AtomicU64,
     macfuse_open_cache_read_only_unknown_state: AtomicU64,
-    macfuse_open_cache_read_only_not_fully_committed: AtomicU64,
+    macfuse_open_cache_read_only_not_regular_file: AtomicU64,
     macfuse_open_cache_read_only_local_dirty_state: AtomicU64,
     macfuse_open_cache_read_only_generation_changed: AtomicU64,
     macfuse_open_cache_read_only_local_stable_generation_changed: AtomicU64,
@@ -2346,7 +2346,7 @@ impl MetricsState {
             macfuse_open_cache_read_only_keep: AtomicU64::new(0),
             macfuse_open_cache_read_only_local_stable_keep: AtomicU64::new(0),
             macfuse_open_cache_read_only_unknown_state: AtomicU64::new(0),
-            macfuse_open_cache_read_only_not_fully_committed: AtomicU64::new(0),
+            macfuse_open_cache_read_only_not_regular_file: AtomicU64::new(0),
             macfuse_open_cache_read_only_local_dirty_state: AtomicU64::new(0),
             macfuse_open_cache_read_only_generation_changed: AtomicU64::new(0),
             macfuse_open_cache_read_only_local_stable_generation_changed: AtomicU64::new(0),
@@ -2470,7 +2470,7 @@ impl MetricsState {
             macfuse_open_cache_read_only_keep,
             macfuse_open_cache_read_only_local_stable_keep,
             macfuse_open_cache_read_only_unknown_state,
-            macfuse_open_cache_read_only_not_fully_committed,
+            macfuse_open_cache_read_only_not_regular_file,
             macfuse_open_cache_read_only_local_dirty_state,
             macfuse_open_cache_read_only_generation_changed,
             macfuse_open_cache_read_only_local_stable_generation_changed,
@@ -6691,6 +6691,9 @@ impl StudioVfs {
     /// Record a macFUSE open-cache decision for mounted diagnostics.
     pub fn record_macfuse_open_cache_decision(&self, decision: VfsMacFuseOpenCacheDecision) {
         let metrics = &self.state.metrics;
+        // Local-stable counters refine the aggregate keep/drop/seed totals. The
+        // aggregate remains the canonical summary, while the subtype explains
+        // which decisions happened before remote publication.
         match decision {
             VfsMacFuseOpenCacheDecision::ReadOnlyKeep => {
                 metrics
@@ -6710,9 +6713,9 @@ impl StudioVfs {
                     .macfuse_open_cache_read_only_unknown_state
                     .fetch_add(1, Ordering::Relaxed);
             }
-            VfsMacFuseOpenCacheDecision::ReadOnlyNotFullyCommitted => {
+            VfsMacFuseOpenCacheDecision::ReadOnlyNotRegularFile => {
                 metrics
-                    .macfuse_open_cache_read_only_not_fully_committed
+                    .macfuse_open_cache_read_only_not_regular_file
                     .fetch_add(1, Ordering::Relaxed);
             }
             VfsMacFuseOpenCacheDecision::ReadOnlyLocalDirtyState => {
@@ -7054,7 +7057,7 @@ impl StudioVfs {
             macfuse_open_cache_read_only_local_stable_keep:
                 macfuse_open_cache_read_only_local_stable_keep,
             macfuse_open_cache_read_only_unknown_state: macfuse_open_cache_read_only_unknown_state,
-            macfuse_open_cache_read_only_not_fully_committed: macfuse_open_cache_read_only_not_fully_committed,
+            macfuse_open_cache_read_only_not_regular_file: macfuse_open_cache_read_only_not_regular_file,
             macfuse_open_cache_read_only_local_dirty_state: macfuse_open_cache_read_only_local_dirty_state,
             macfuse_open_cache_read_only_generation_changed: macfuse_open_cache_read_only_generation_changed,
             macfuse_open_cache_read_only_local_stable_generation_changed:
@@ -7585,7 +7588,7 @@ impl StudioVfs {
             },
             macfuse_open_cache: {
                 let read_only_drop = macfuse_open_cache_read_only_unknown_state
-                    .saturating_add(macfuse_open_cache_read_only_not_fully_committed)
+                    .saturating_add(macfuse_open_cache_read_only_not_regular_file)
                     .saturating_add(macfuse_open_cache_read_only_local_dirty_state)
                     .saturating_add(macfuse_open_cache_read_only_generation_changed);
                 VfsMacFuseOpenCacheStats {
@@ -7596,7 +7599,7 @@ impl StudioVfs {
                     read_only_local_stable_keep: macfuse_open_cache_read_only_local_stable_keep,
                     read_only_drop,
                     read_only_unknown_state: macfuse_open_cache_read_only_unknown_state,
-                    read_only_not_fully_committed: macfuse_open_cache_read_only_not_fully_committed,
+                    read_only_not_regular_file: macfuse_open_cache_read_only_not_regular_file,
                     read_only_local_dirty_state: macfuse_open_cache_read_only_local_dirty_state,
                     read_only_generation_changed: macfuse_open_cache_read_only_generation_changed,
                     read_only_local_stable_generation_changed:
