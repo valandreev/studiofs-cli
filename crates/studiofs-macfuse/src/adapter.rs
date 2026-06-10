@@ -77,7 +77,6 @@ pub(crate) struct StudioVfsAdapter {
     readdir_cache_ready: Condvar,
     open_cache_snapshots: Arc<ParkingMutex<LruCache<u64, MacFuseOpenCacheSnapshot>>>,
     write_capable_state: ParkingMutex<WriteCapableState>,
-    write_capable_active_counts: DashMap<u64, usize>,
     file_flags: ParkingMutex<HashMap<u64, u32>>,
     read_admission: Arc<Semaphore>,
     read_queue_byte_limit: u32,
@@ -123,6 +122,10 @@ impl WriteCapableState {
             ino: write_ino,
             last_for_inode,
         })
+    }
+
+    fn active_count(&self, ino: u64) -> usize {
+        self.handle_counts.get(&ino).copied().unwrap_or(0)
     }
 }
 
@@ -786,7 +789,6 @@ impl StudioVfsAdapter {
                 open_cache_snapshot_capacity(),
             ))),
             write_capable_state: ParkingMutex::new(WriteCapableState::default()),
-            write_capable_active_counts: DashMap::new(),
             file_flags: ParkingMutex::new(HashMap::new()),
             read_admission: Arc::new(Semaphore::new(read_queue_byte_limit as usize)),
             read_queue_byte_limit,
@@ -980,7 +982,6 @@ impl StudioVfsAdapter {
         {
             let mut write_capable_state = self.write_capable_state.lock();
             write_capable_state.record_open(ino, file_handle);
-            self.record_active_write_capable_handle(ino);
             self.open_cache_snapshots.lock().pop(&ino);
         }
         debug!(
@@ -990,28 +991,8 @@ impl StudioVfsAdapter {
         );
     }
 
-    fn record_active_write_capable_handle(&self, ino: u64) {
-        self.write_capable_active_counts
-            .entry(ino)
-            .and_modify(|count| *count += 1)
-            .or_insert(1);
-    }
-
-    fn release_active_write_capable_handle(&self, ino: u64) {
-        let Some(mut count) = self.write_capable_active_counts.get_mut(&ino) else {
-            return;
-        };
-        *count = count.saturating_sub(1);
-        if *count == 0 {
-            drop(count);
-            self.write_capable_active_counts.remove(&ino);
-        }
-    }
-
     fn has_active_write_capable_handles(&self, ino: u64) -> bool {
-        self.write_capable_active_counts
-            .get(&ino)
-            .is_some_and(|count| *count > 0)
+        self.write_capable_state.lock().active_count(ino) > 0
     }
 
     fn safe_open_cache_snapshot(
@@ -1726,9 +1707,6 @@ impl StudioVfsAdapter {
     /// Release a file handle opened through this adapter.
     pub(crate) fn release(&self, _ino: u64, file_handle: u64) -> Result<(), i32> {
         let released_write_handle = self.write_capable_state.lock().release_handle(file_handle);
-        if let Some(released) = released_write_handle {
-            self.release_active_write_capable_handle(released.ino);
-        }
         let result = self
             .runtime_handle
             .block_on(self.vfs.release_fh_with_outcome(file_handle))
