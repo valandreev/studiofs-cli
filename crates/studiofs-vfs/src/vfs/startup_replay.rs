@@ -122,7 +122,8 @@ impl<'a> StartupReplayCoordinator<'a> {
     }
 
     fn is_lost_unpublished_regular_upload(attr: &InodeAttr) -> bool {
-        attr.kind == FileType::RegularFile
+        attr.nlink == 0
+            && attr.kind == FileType::RegularFile
             && attr.upload_state != MetaUploadState::Ready
             && attr.committed_size == 0
             && attr.committed_content_epoch == 0
@@ -732,5 +733,37 @@ impl<'a> StartupReplayCoordinator<'a> {
             self.vfs
                 .cancel_pending_uploads_for_inodes(&self.quarantined_inodes);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn zero_size_unpublished_attr(nlink: u32) -> InodeAttr {
+        let mut attr = InodeAttr::new_file(42, 1, 0, 0, 0o644);
+        attr.upload_state = MetaUploadState::Uploading;
+        attr.nlink = nlink;
+        attr
+    }
+
+    #[test]
+    fn lost_unpublished_regular_upload_should_not_match_linked_zero_size_inode() {
+        let attr = zero_size_unpublished_attr(1);
+
+        assert!(
+            !StartupReplayCoordinator::is_lost_unpublished_regular_upload(&attr),
+            "startup replay must preserve linked zero-size unpublished inodes"
+        );
+    }
+
+    #[test]
+    fn lost_unpublished_regular_upload_should_match_unlinked_zero_size_inode() {
+        let attr = zero_size_unpublished_attr(0);
+
+        assert!(
+            StartupReplayCoordinator::is_lost_unpublished_regular_upload(&attr),
+            "startup replay should still clean up unlinked zero-size unpublished inodes"
+        );
     }
 }

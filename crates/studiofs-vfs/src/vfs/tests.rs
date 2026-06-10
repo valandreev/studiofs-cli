@@ -674,6 +674,7 @@ fn startup_replay_removes_lost_unpublished_upload_inode_without_payload_graph() 
     attr.content_epoch = 1;
     attr.committed_content_epoch = 0;
     attr.upload_state = MetaUploadState::Uploading;
+    attr.nlink = 0;
     meta.set_attr(&attr).expect("persist staged attr");
 
     vfs.cached_store()
@@ -720,6 +721,7 @@ fn startup_replay_removes_lost_unpublished_upload_inode_after_orphan_payload_cle
     attr.content_epoch = 1;
     attr.committed_content_epoch = 0;
     attr.upload_state = MetaUploadState::Uploading;
+    attr.nlink = 0;
     meta.set_attr(&attr).expect("persist staged attr");
 
     vfs.local_payload_backend()
