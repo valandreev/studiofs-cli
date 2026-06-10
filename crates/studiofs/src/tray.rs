@@ -25,10 +25,10 @@ mod supported {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread::JoinHandle;
     use std::time::{Duration, Instant};
-    #[cfg(target_os = "macos")]
-    use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
     #[cfg(not(target_os = "macos"))]
     use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+    #[cfg(target_os = "macos")]
+    use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
     use winit::application::ApplicationHandler;
     use winit::event::StartCause;
     use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
@@ -338,8 +338,10 @@ mod supported {
             }
 
             if let Some(tray_rect) = tray_rect {
-                self.tooltip
-                    .show(tray_rect, &self.tooltip_for(self.mode, self.pending_upload_bytes));
+                self.tooltip.show(
+                    tray_rect,
+                    &self.tooltip_for(self.mode, self.pending_upload_bytes),
+                );
             }
         }
     }
@@ -448,8 +450,7 @@ mod supported {
             let tray_height = f64::from(tray_rect.size.height) / scale_factor;
             let panel_width = panel.frame().size.width;
             let x = tray_x + (tray_width - panel_width) / 2.0;
-            let y =
-                primary_height - tray_y_top - tray_height - TOOLTIP_HEIGHT - TOOLTIP_GAP;
+            let y = primary_height - tray_y_top - tray_height - TOOLTIP_HEIGHT - TOOLTIP_GAP;
             panel.setFrame_display(
                 NSRect::new(NSPoint::new(x, y), NSSize::new(panel_width, TOOLTIP_HEIGHT)),
                 true,
@@ -483,9 +484,9 @@ mod supported {
                 NSWindowCollectionBehavior::CanJoinAllSpaces
                     | NSWindowCollectionBehavior::Transient,
             );
-            panel.setBackgroundColor(Some(
-                &NSColor::colorWithSRGBRed_green_blue_alpha(0.08, 0.08, 0.08, 0.92),
-            ));
+            panel.setBackgroundColor(Some(&NSColor::colorWithSRGBRed_green_blue_alpha(
+                0.08, 0.08, 0.08, 0.92,
+            )));
 
             let label = NSTextField::labelWithString(&NSString::new(), mtm);
             label.setFrame(NSRect::new(
