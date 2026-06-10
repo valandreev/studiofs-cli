@@ -1674,7 +1674,7 @@ mod tests {
     }
 
     #[test]
-    fn adapter_write_capable_open_clears_previous_kernel_cache_observation() {
+    fn adapter_clean_write_capable_release_seeds_kernel_cache_observation() {
         let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
             "macfuse-adapter-cache-write-open",
         )
@@ -1716,17 +1716,73 @@ mod tests {
             !write_open.keep_cache(),
             "write-capable open must not keep cache: {write_open:?}"
         );
+        assert!(
+            !adapter.has_open_cache_snapshot_for_test(attr.ino),
+            "active write-capable open must clear previous cache observation"
+        );
         adapter
             .release(attr.ino, write_open.file_handle())
             .expect("release write-capable handle");
+        assert!(
+            adapter.has_open_cache_snapshot_for_test(attr.ino),
+            "clean final write release should seed a safe cache observation"
+        );
 
         let read_after_write_open = adapter
             .open(attr.ino, libc::O_RDONLY)
             .expect("open read-only handle after write-capable open");
         assert!(
-            !read_after_write_open.keep_cache(),
-            "write-capable open must clear previous cache observation: {read_after_write_open:?}"
+            read_after_write_open.keep_cache(),
+            "read-only open after clean write release should keep cache: {read_after_write_open:?}"
         );
+        let cache_decisions = vfs.write_path_observability_snapshot().macfuse_open_cache;
+        assert_eq!(cache_decisions.clean_write_release_seeded, 1);
+        assert_eq!(cache_decisions.read_only_generation_changed, 1);
+        assert_eq!(cache_decisions.read_only_keep, 2);
+    }
+
+    #[test]
+    fn adapter_dirty_write_release_does_not_seed_kernel_cache_observation() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-adapter-cache-dirty-write-release",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"dirty-write-release.txt",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+
+        let writer = adapter
+            .open(attr.ino, libc::O_WRONLY)
+            .expect("open write-capable handle");
+        adapter
+            .write(attr.ino, writer.file_handle(), 0, b"dirty write")
+            .expect("write payload through macFUSE adapter");
+        adapter
+            .release(attr.ino, writer.file_handle())
+            .expect("release write-capable handle");
+
+        assert!(
+            !adapter.has_open_cache_snapshot_for_test(attr.ino),
+            "dirty or not-yet-fully-committed release must not seed kernel cache observation"
+        );
+        let read_after_dirty_write_open = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open read-only handle after dirty write release");
+        assert!(
+            !read_after_dirty_write_open.keep_cache(),
+            "read-only open after dirty write release must drop cache: {read_after_dirty_write_open:?}"
+        );
+        let cache_decisions = vfs.write_path_observability_snapshot().macfuse_open_cache;
+        assert_eq!(cache_decisions.clean_write_release_seeded, 0);
     }
 
     #[test]

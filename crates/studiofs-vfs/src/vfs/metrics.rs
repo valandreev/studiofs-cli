@@ -245,6 +245,8 @@ pub enum VfsMacFuseOpenCacheDecision {
     ReadOnlyGenerationChanged,
     /// Write-capable open intentionally disabled read-only cache retention.
     WriteCapable,
+    /// Clean final write-capable release seeded a cacheable generation snapshot.
+    CleanWriteReleaseSeeded,
 }
 
 /// macFUSE open-cache decision counters.
@@ -266,6 +268,9 @@ pub struct VfsMacFuseOpenCacheStats {
     pub read_only_generation_changed: u64,
     /// Write-capable opens that intentionally disabled keep-cache.
     pub write_capable: u64,
+    /// Clean final write-capable releases that seeded a cacheable generation snapshot.
+    #[serde(default)]
+    pub clean_write_release_seeded: u64,
 }
 
 /// Async FUSE write bridge diagnostics supplied by the FUSE adapter.
