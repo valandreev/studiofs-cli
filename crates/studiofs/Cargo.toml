@@ -55,7 +55,7 @@ studiofs-fuse.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 studiofs-macfuse.workspace = true
 objc2 = "0.6.4"
-objc2-app-kit = { version = "0.3.2", features = ["NSColor", "NSControl", "NSFont", "NSGraphics", "NSPanel", "NSScreen", "NSTextField", "NSView", "NSWindow"] }
+objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSColor", "NSControl", "NSFont", "NSGraphics", "NSPanel", "NSResponder", "NSRunningApplication", "NSScreen", "NSTextField", "NSView", "NSWindow"] }
 objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSGeometry", "NSString"] }
 
 [target.'cfg(unix)'.dependencies]

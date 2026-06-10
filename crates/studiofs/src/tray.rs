@@ -15,8 +15,9 @@ mod supported {
     use objc2::rc::Retained;
     #[cfg(target_os = "macos")]
     use objc2_app_kit::{
-        NSBackingStoreType, NSColor, NSFont, NSPanel, NSPopUpMenuWindowLevel, NSScreen,
-        NSTextField, NSView, NSWindowCollectionBehavior, NSWindowStyleMask,
+        NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSColor, NSFont, NSPanel,
+        NSPopUpMenuWindowLevel, NSScreen, NSTextField, NSView, NSWindowCollectionBehavior,
+        NSWindowStyleMask,
     };
     #[cfg(target_os = "macos")]
     use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
@@ -32,6 +33,8 @@ mod supported {
     use winit::application::ApplicationHandler;
     use winit::event::StartCause;
     use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+    #[cfg(target_os = "macos")]
+    use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
 
     #[cfg(target_os = "macos")]
     const TOOLTIP_MIN_WIDTH: f64 = 180.0;
@@ -567,7 +570,11 @@ mod supported {
             }
         };
 
-        let event_loop = match EventLoop::<TrayUserEvent>::with_user_event().build() {
+        let mut event_loop_builder = EventLoop::<TrayUserEvent>::with_user_event();
+        #[cfg(target_os = "macos")]
+        event_loop_builder.with_activation_policy(ActivationPolicy::Accessory);
+
+        let event_loop = match event_loop_builder.build() {
             Ok(event_loop) => event_loop,
             Err(error) => {
                 tracing::warn!(
@@ -577,6 +584,9 @@ mod supported {
                 return args.dispatch();
             }
         };
+
+        #[cfg(target_os = "macos")]
+        configure_macos_accessory_activation_policy();
 
         let proxy = event_loop.create_proxy();
         let stop = Arc::new(AtomicBool::new(false));
@@ -638,6 +648,19 @@ mod supported {
         match mount_handle.join() {
             Ok(result) => result,
             Err(_) => Err(anyhow::anyhow!("mount thread panicked")),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn configure_macos_accessory_activation_policy() {
+        let Some(mtm) = MainThreadMarker::new() else {
+            tracing::debug!("cannot set macOS accessory activation policy off the main thread");
+            return;
+        };
+
+        let app = NSApplication::sharedApplication(mtm);
+        if !app.setActivationPolicy(NSApplicationActivationPolicy::Accessory) {
+            tracing::warn!("failed to hide StudioFS mount process from the macOS Dock");
         }
     }
 
