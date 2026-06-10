@@ -1366,18 +1366,48 @@ impl UploadMetaPort for VfsUploadMetaPort {
                 Err(studiofs_meta::MetaError::InodeNotFound(_)) => return Ok(None),
                 Err(error) => return Err(error),
             };
-            if latest_attr.kind != FileType::RegularFile || latest_attr.size < end_offset {
+            if latest_attr.kind != FileType::RegularFile {
+                return Ok(None);
+            }
+            let can_restore_stale_sparse_growth =
+                latest_attr.size < end_offset && latest_attr.content_epoch < content_epoch;
+            if latest_attr.size < end_offset && !can_restore_stale_sparse_growth {
                 return Ok(None);
             }
 
             let spans = engine.lookup_regular_file_slices(ino, offset, payload_len)?;
-            let Some(chunk_slices) =
-                uploaded_object_reattach_slices(&spans, object_id, offset, payload_len, block_size)
-            else {
-                return Ok(None);
+            let chunk_slices = match uploaded_object_reattach_slices(
+                &spans,
+                object_id,
+                offset,
+                payload_len,
+                block_size,
+            ) {
+                Some(chunk_slices) => chunk_slices,
+                None if can_restore_stale_sparse_growth => {
+                    let mut chunk_slices = BTreeMap::new();
+                    append_uploaded_object_reattach_slices(
+                        &mut chunk_slices,
+                        object_id,
+                        offset,
+                        offset,
+                        end_offset,
+                        block_size,
+                    )
+                    .ok_or_else(|| {
+                        studiofs_meta::MetaError::Storage(
+                            "failed to rebuild stale sparse upload slices".to_string(),
+                        )
+                    })?;
+                    chunk_slices.into_iter().collect()
+                }
+                None => return Ok(None),
             };
 
             let mut rebased_attr = latest_attr;
+            if can_restore_stale_sparse_growth {
+                rebased_attr.size = rebased_attr.size.max(end_offset);
+            }
             let rebased_epoch = if content_epoch > rebased_attr.content_epoch {
                 content_epoch
             } else {
@@ -2755,6 +2785,52 @@ mod tests {
             meta.has_regular_file_overlay_object_if_matches(updating_attr.ino, 3, 6)
                 .expect("rebased overlay object present"),
             "retained stale upload must become Uploaded in the current overlay epoch"
+        );
+    }
+
+    #[test]
+    fn vfs_upload_meta_reattaches_stale_sparse_growth_over_older_short_attr() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "reattach-stale-sparse-growth");
+        let created = vfs
+            .create(1, b"reattach-stale-sparse-growth.bin", 0, 0, 0o644)
+            .expect("create sparse file");
+        let mut short_attr = created;
+        short_attr.size = 233;
+        short_attr.committed_size = short_attr.size;
+        short_attr.content_epoch = 1;
+        short_attr.committed_content_epoch = 1;
+        short_attr.upload_state = UploadState::Ready;
+        meta.set_attr(&short_attr)
+            .expect("seed older short published attr");
+
+        let port = VfsUploadMetaPort { vfs: vfs.clone() };
+        let object_id = 6;
+        let tail_offset = 1_048_569;
+        let tail_len = 262;
+        let rebased_epoch = rt
+            .block_on(port.reattach_uploaded_object_if_uncovered(
+                short_attr.ino,
+                2,
+                object_id,
+                tail_offset,
+                tail_len,
+                vfs.block_size,
+            ))
+            .expect("reattach stale sparse growth");
+
+        assert_eq!(
+            rebased_epoch,
+            Some(2),
+            "an uploaded sparse write from a newer epoch must restore EOF when an older attr won the race"
+        );
+        let attr = meta.get_attr(short_attr.ino).expect("load rebased attr");
+        assert_eq!(attr.size, tail_offset + tail_len);
+        assert_eq!(attr.content_epoch, 2);
+        assert!(
+            meta.has_regular_file_overlay_object_if_matches(short_attr.ino, 2, object_id)
+                .expect("rebased sparse object present"),
+            "stale sparse upload must be retained in the rebased overlay"
         );
     }
 

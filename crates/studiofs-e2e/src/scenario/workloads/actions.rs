@@ -6,6 +6,34 @@ static BOUNDED_MOUNTED_IO_POOL: OnceLock<BoundedMountedIoPool> = OnceLock::new()
 pub(in crate::scenario) static HOTSPOT_HELPER_TIMED_IO_ACTIVE_WORKERS: AtomicUsize =
     AtomicUsize::new(0);
 
+pub(in crate::scenario) fn payload_mismatch_detail(expected: &[u8], actual: &[u8]) -> String {
+    let first_diff = expected
+        .iter()
+        .zip(actual)
+        .position(|(expected, actual)| expected != actual)
+        .or_else(|| {
+            if expected.len() != actual.len() {
+                Some(expected.len().min(actual.len()))
+            } else {
+                None
+            }
+        });
+    let diff_detail = match first_diff {
+        Some(index) => format!(
+            "first_diff={index} expected_byte={:?} actual_byte={:?}",
+            expected.get(index),
+            actual.get(index)
+        ),
+        None => "first_diff=none".to_string(),
+    };
+
+    format!(
+        "expected_sha256={} actual_sha256={} {diff_detail}",
+        bytes_sha256(expected),
+        bytes_sha256(actual)
+    )
+}
+
 #[derive(Debug, Clone)]
 pub(in crate::scenario) struct BoundedMountedIoPool {
     active_workers: Arc<AtomicUsize>,
@@ -927,11 +955,13 @@ pub fn run_hotspot_op_helper(
                 Some(actual.len()),
             )?;
             if actual != expected {
+                let mismatch = payload_mismatch_detail(&expected, &actual);
                 anyhow::bail!(
-                    "read-exact mismatch for {}: expected {} bytes, read {} bytes",
+                    "read-exact mismatch for {}: expected {} bytes, read {} bytes; {}",
                     path.display(),
                     expected.len(),
-                    actual.len()
+                    actual.len(),
+                    mismatch
                 );
             }
         }
@@ -1015,12 +1045,14 @@ pub fn run_sparse_op_helper(
                 operation,
             )?;
             if actual != expected {
+                let mismatch = payload_mismatch_detail(&expected, &actual);
                 anyhow::bail!(
-                    "read-range-exact mismatch for {}@{}: expected {} bytes, read {} bytes",
+                    "read-range-exact mismatch for {}@{}: expected {} bytes, read {} bytes; {}",
                     path.display(),
                     offset,
                     expected.len(),
-                    actual.len()
+                    actual.len(),
+                    mismatch
                 );
             }
         }
@@ -1076,11 +1108,13 @@ pub fn run_sparse_op_helper(
                 Some(actual.len()),
             )?;
             if actual != expected {
+                let mismatch = payload_mismatch_detail(&expected, &actual);
                 anyhow::bail!(
-                    "read-all-exact mismatch for {}: expected {} bytes, read {} bytes",
+                    "read-all-exact mismatch for {}: expected {} bytes, read {} bytes; {}",
                     path.display(),
                     expected.len(),
-                    actual.len()
+                    actual.len(),
+                    mismatch
                 );
             }
         }

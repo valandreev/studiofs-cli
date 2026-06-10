@@ -211,6 +211,17 @@ fn sparse_helper_ops_cover_range_write_truncate_and_probes() {
 }
 
 #[test]
+fn sparse_helper_payload_mismatch_detail_reports_checksums_and_first_diff() {
+    let detail = payload_mismatch_detail(b"abcdef", b"abcxef");
+
+    assert!(detail.contains("expected_sha256="), "{detail}");
+    assert!(detail.contains("actual_sha256="), "{detail}");
+    assert!(detail.contains("first_diff=3"), "{detail}");
+    assert!(detail.contains("expected_byte=Some(100)"), "{detail}");
+    assert!(detail.contains("actual_byte=Some(120)"), "{detail}");
+}
+
+#[test]
 fn hotspot_helper_ops_cover_metadata_attribute_and_symlink_ops() {
     let temp = tempdir().unwrap();
     let mount = temp.path().join("mount");

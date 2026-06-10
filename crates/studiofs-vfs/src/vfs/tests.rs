@@ -3918,12 +3918,30 @@ fn explicit_flush_sparse_extend_retains_tail_after_head_publication() {
         let pending_after_extend = vfs
             .pending_uploads_for_inode(ino)
             .into_iter()
-            .map(|(offset, _, _)| offset)
+            .map(|(offset, _, content_epoch)| (offset, content_epoch))
             .collect::<BTreeSet<_>>();
+        let extended_attr = meta.get_attr(ino).expect("load extended attr");
         assert_eq!(
             pending_after_extend,
-            BTreeSet::from([tail_offset]),
-            "set_len after head publication must retain the sparse tail upload"
+            BTreeSet::from([(tail_offset, extended_attr.content_epoch)]),
+            "set_len after head publication must retain the sparse tail upload under the size-change epoch"
+        );
+
+        let (content_epoch, blocks) = mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+        assert_eq!(content_epoch, extended_attr.content_epoch);
+        publish_current_file_graph(&meta, ino, content_epoch, &blocks);
+
+        let published_attr = meta.get_attr(ino).expect("load published attr");
+        assert_eq!(published_attr.committed_size, logical_size);
+        let published_tail = meta
+            .lookup_regular_file_slices(ino, tail_offset, tail.len() as u64)
+            .expect("lookup published sparse tail")
+            .into_iter()
+            .filter_map(|span| span.payload)
+            .collect::<Vec<_>>();
+        assert!(
+            !published_tail.is_empty(),
+            "published graph after sparse extend must retain the post-prefix tail payload"
         );
 
         vfs.release_fh(grow_fh).await.expect("release grow writer");
