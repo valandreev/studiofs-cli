@@ -51,6 +51,7 @@ const MACFUSE_READ_INTERRUPTED_ERRNO: i32 = libc::EINTR;
 const MACOS_PROVENANCE_XATTR: &[u8] = b"com.apple.provenance";
 const MACOS_DS_STORE_NAME: &[u8] = b".DS_Store";
 const MACOS_UF_HIDDEN: u32 = 0x0000_8000;
+const WRITE_CAPABLE_STATE_SHARDS: usize = 32;
 #[cfg(not(test))]
 const MACFUSE_OPEN_CACHE_SNAPSHOT_LIMIT: usize = 8192;
 #[cfg(test)]
@@ -76,7 +77,7 @@ pub(crate) struct StudioVfsAdapter {
     readdir_cache_last_pruned: Mutex<Option<Instant>>,
     readdir_cache_ready: Condvar,
     open_cache_snapshots: Arc<ParkingMutex<LruCache<u64, MacFuseOpenCacheSnapshot>>>,
-    write_capable_state: ParkingMutex<WriteCapableState>,
+    write_capable_state: WriteCapableState,
     file_flags: ParkingMutex<HashMap<u64, u32>>,
     read_admission: Arc<Semaphore>,
     read_queue_byte_limit: u32,
@@ -85,10 +86,10 @@ pub(crate) struct StudioVfsAdapter {
     read_diagnostics: Arc<AsyncReadDiagnostics>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct WriteCapableState {
-    handles: HashMap<u64, u64>,
-    handle_counts: HashMap<u64, usize>,
+    handles: Box<[ParkingMutex<HashMap<u64, u64>>]>,
+    handle_counts: Box<[ParkingMutex<HashMap<u64, usize>>]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,15 +98,49 @@ struct ReleasedWriteCapableHandle {
     last_for_inode: bool,
 }
 
+impl Default for WriteCapableState {
+    fn default() -> Self {
+        Self {
+            handles: new_write_capable_shards(),
+            handle_counts: new_write_capable_shards(),
+        }
+    }
+}
+
 impl WriteCapableState {
-    fn record_open(&mut self, ino: u64, file_handle: u64) {
-        self.handles.insert(file_handle, ino);
-        *self.handle_counts.entry(ino).or_default() += 1;
+    fn record_open(&self, ino: u64, file_handle: u64) {
+        self.increment_count(ino);
+        let previous_ino = {
+            let mut handles = self.handle_shard(file_handle).lock();
+            handles.insert(file_handle, ino)
+        };
+        if let Some(previous_ino) = previous_ino {
+            self.decrement_count(previous_ino);
+        }
     }
 
-    fn release_handle(&mut self, file_handle: u64) -> Option<ReleasedWriteCapableHandle> {
-        let write_ino = self.handles.remove(&file_handle)?;
-        let last_for_inode = match self.handle_counts.entry(write_ino) {
+    fn release_handle(&self, file_handle: u64) -> Option<ReleasedWriteCapableHandle> {
+        let write_ino = {
+            let mut handles = self.handle_shard(file_handle).lock();
+            handles.remove(&file_handle)?
+        };
+        let last_for_inode = self.decrement_count(write_ino);
+        Some(ReleasedWriteCapableHandle {
+            ino: write_ino,
+            last_for_inode,
+        })
+    }
+
+    fn active_count(&self, ino: u64) -> usize {
+        self.count_shard(ino).lock().get(&ino).copied().unwrap_or(0)
+    }
+
+    fn increment_count(&self, ino: u64) {
+        *self.count_shard(ino).lock().entry(ino).or_default() += 1;
+    }
+
+    fn decrement_count(&self, ino: u64) -> bool {
+        match self.count_shard(ino).lock().entry(ino) {
             HashMapEntry::Occupied(mut entry) => {
                 let count = entry.get_mut();
                 *count = count.saturating_sub(1);
@@ -117,16 +152,27 @@ impl WriteCapableState {
                 }
             }
             HashMapEntry::Vacant(_) => true,
-        };
-        Some(ReleasedWriteCapableHandle {
-            ino: write_ino,
-            last_for_inode,
-        })
+        }
     }
 
-    fn active_count(&self, ino: u64) -> usize {
-        self.handle_counts.get(&ino).copied().unwrap_or(0)
+    fn handle_shard(&self, file_handle: u64) -> &ParkingMutex<HashMap<u64, u64>> {
+        &self.handles[write_capable_shard_index(file_handle)]
     }
+
+    fn count_shard(&self, ino: u64) -> &ParkingMutex<HashMap<u64, usize>> {
+        &self.handle_counts[write_capable_shard_index(ino)]
+    }
+}
+
+fn new_write_capable_shards<T>() -> Box<[ParkingMutex<HashMap<u64, T>>]> {
+    (0..WRITE_CAPABLE_STATE_SHARDS)
+        .map(|_| ParkingMutex::new(HashMap::new()))
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
+
+fn write_capable_shard_index(key: u64) -> usize {
+    key.wrapping_mul(0x9E37_79B9_7F4A_7C15) as usize % WRITE_CAPABLE_STATE_SHARDS
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -788,7 +834,7 @@ impl StudioVfsAdapter {
             open_cache_snapshots: Arc::new(ParkingMutex::new(LruCache::new(
                 open_cache_snapshot_capacity(),
             ))),
-            write_capable_state: ParkingMutex::new(WriteCapableState::default()),
+            write_capable_state: WriteCapableState::default(),
             file_flags: ParkingMutex::new(HashMap::new()),
             read_admission: Arc::new(Semaphore::new(read_queue_byte_limit as usize)),
             read_queue_byte_limit,
@@ -980,8 +1026,7 @@ impl StudioVfsAdapter {
 
     fn record_write_capable_open(&self, ino: u64, file_handle: u64) {
         {
-            let mut write_capable_state = self.write_capable_state.lock();
-            write_capable_state.record_open(ino, file_handle);
+            self.write_capable_state.record_open(ino, file_handle);
             self.open_cache_snapshots.lock().pop(&ino);
         }
         debug!(
@@ -992,7 +1037,7 @@ impl StudioVfsAdapter {
     }
 
     fn has_active_write_capable_handles(&self, ino: u64) -> bool {
-        self.write_capable_state.lock().active_count(ino) > 0
+        self.write_capable_state.active_count(ino) > 0
     }
 
     fn safe_open_cache_snapshot(
@@ -1706,7 +1751,7 @@ impl StudioVfsAdapter {
 
     /// Release a file handle opened through this adapter.
     pub(crate) fn release(&self, _ino: u64, file_handle: u64) -> Result<(), i32> {
-        let released_write_handle = self.write_capable_state.lock().release_handle(file_handle);
+        let released_write_handle = self.write_capable_state.release_handle(file_handle);
         let result = self
             .runtime_handle
             .block_on(self.vfs.release_fh_with_outcome(file_handle))
@@ -3623,6 +3668,34 @@ mod tests {
                 .is_some_and(|capacity| capacity >= 5),
             "rejected stale cache buffer should be returned to the reusable pool"
         );
+    }
+
+    #[test]
+    fn write_capable_state_allows_concurrent_per_inode_access_without_external_lock() {
+        let state = Arc::new(WriteCapableState::default());
+
+        std::thread::scope(|scope| {
+            for shard_index in 0..8 {
+                let state = Arc::clone(&state);
+                scope.spawn(move || {
+                    let ino = 10_000 + shard_index;
+                    let file_handle = 20_000 + shard_index;
+                    state.record_open(ino, file_handle);
+                    assert_eq!(state.active_count(ino), 1);
+                    let released = state
+                        .release_handle(file_handle)
+                        .expect("recorded handle should release");
+                    assert_eq!(
+                        released,
+                        ReleasedWriteCapableHandle {
+                            ino,
+                            last_for_inode: true,
+                        }
+                    );
+                    assert_eq!(state.active_count(ino), 0);
+                });
+            }
+        });
     }
 
     #[test]
