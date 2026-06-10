@@ -27,6 +27,7 @@ pub(super) struct StartupReplayCoordinator<'a> {
     valid_pending_uploads: HashSet<PendingUploadKey>,
     stale_pending_uploads: HashMap<PendingUploadKey, PendingUpload>,
     lost_unpublished_upload_inodes: HashSet<Ino>,
+    live_zero_size_unpublished_inodes: HashSet<Ino>,
     restored_live_extents: usize,
     replay_failures: u64,
     orphan_dirty_payloads_removed: u64,
@@ -63,6 +64,7 @@ impl<'a> StartupReplayCoordinator<'a> {
             valid_pending_uploads: HashSet::new(),
             stale_pending_uploads: HashMap::new(),
             lost_unpublished_upload_inodes: HashSet::new(),
+            live_zero_size_unpublished_inodes: HashSet::new(),
             restored_live_extents: 0,
             replay_failures: 0,
             orphan_dirty_payloads_removed: 0,
@@ -83,6 +85,10 @@ impl<'a> StartupReplayCoordinator<'a> {
         let has_pending_uploads = self.pending_catalog.has_inode(ino);
         if has_pending_uploads {
             self.seen_replay_inodes.insert(ino);
+        }
+        let is_live_zero_size_unpublished_draft = Self::is_live_zero_size_unpublished_draft(attr);
+        if is_live_zero_size_unpublished_draft {
+            self.live_zero_size_unpublished_inodes.insert(ino);
         }
         if !self.needs_scan(attr) && !has_pending_uploads {
             return;
@@ -109,6 +115,9 @@ impl<'a> StartupReplayCoordinator<'a> {
             self.lost_unpublished_upload_inodes.insert(ino);
             return;
         }
+        if graph_objects.is_empty() && is_live_zero_size_unpublished_draft {
+            return;
+        }
 
         if self.has_dirty_or_recovered_objects() {
             for graph_object in &graph_objects {
@@ -122,9 +131,20 @@ impl<'a> StartupReplayCoordinator<'a> {
     }
 
     fn is_lost_unpublished_regular_upload(attr: &InodeAttr) -> bool {
-        attr.kind == FileType::RegularFile
+        attr.nlink == 0
+            && attr.kind == FileType::RegularFile
             && attr.upload_state != MetaUploadState::Ready
             && attr.committed_size == 0
+            && attr.committed_content_epoch == 0
+    }
+
+    fn is_live_zero_size_unpublished_draft(attr: &InodeAttr) -> bool {
+        attr.nlink > 0
+            && attr.kind == FileType::RegularFile
+            && attr.upload_state != MetaUploadState::Ready
+            && attr.size == 0
+            && attr.committed_size == 0
+            && attr.content_epoch == 0
             && attr.committed_content_epoch == 0
     }
 
@@ -376,6 +396,44 @@ impl<'a> StartupReplayCoordinator<'a> {
             info!(
                 ino,
                 "startup recovery removed lost unpublished upload inode without durable payload graph"
+            );
+        }
+    }
+
+    fn mark_live_zero_size_unpublished_inodes_ready(&self) {
+        if self.live_zero_size_unpublished_inodes.is_empty() {
+            return;
+        }
+
+        let meta = self.vfs.sync_meta();
+        for ino in &self.live_zero_size_unpublished_inodes {
+            let mut attr = match meta.get_attr(*ino) {
+                Ok(attr) => attr,
+                Err(MetaError::InodeNotFound(_)) => continue,
+                Err(error) => {
+                    warn!(
+                        ino,
+                        error = %error,
+                        "startup recovery failed to load live zero-size unpublished inode"
+                    );
+                    continue;
+                }
+            };
+            if !Self::is_live_zero_size_unpublished_draft(&attr) {
+                continue;
+            }
+            attr.upload_state = MetaUploadState::Ready;
+            if let Err(error) = meta.set_attr(&attr) {
+                warn!(
+                    ino,
+                    error = %error,
+                    "startup recovery failed to mark live zero-size unpublished inode ready"
+                );
+                continue;
+            }
+            info!(
+                ino,
+                "startup recovery marked live zero-size unpublished inode ready"
             );
         }
     }
@@ -659,6 +717,7 @@ impl<'a> StartupReplayCoordinator<'a> {
         }
 
         self.remove_lost_unpublished_upload_inodes();
+        self.mark_live_zero_size_unpublished_inodes_ready();
         for (ino, content_epoch) in &self.pending_epoch_finalizations {
             self.vfs.queue_epoch_finalization(*ino, *content_epoch);
         }
@@ -732,5 +791,88 @@ impl<'a> StartupReplayCoordinator<'a> {
             self.vfs
                 .cancel_pending_uploads_for_inodes(&self.quarantined_inodes);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn zero_size_unpublished_attr(nlink: u32) -> InodeAttr {
+        let mut attr = InodeAttr::new_file(42, 1, 0, 0, 0o644);
+        attr.upload_state = MetaUploadState::Uploading;
+        attr.nlink = nlink;
+        attr
+    }
+
+    #[test]
+    fn live_zero_size_unpublished_draft_should_match_linked_inode() {
+        let attr = zero_size_unpublished_attr(1);
+
+        assert!(
+            StartupReplayCoordinator::is_live_zero_size_unpublished_draft(&attr),
+            "startup replay should restore linked zero-size unpublished drafts to ready"
+        );
+    }
+
+    #[test]
+    fn live_zero_size_unpublished_draft_should_match_hard_linked_inode() {
+        let attr = zero_size_unpublished_attr(2);
+
+        assert!(
+            StartupReplayCoordinator::is_live_zero_size_unpublished_draft(&attr),
+            "startup replay should restore hard-linked zero-size unpublished drafts to ready"
+        );
+    }
+
+    #[test]
+    fn live_zero_size_unpublished_draft_should_not_match_unlinked_inode() {
+        let attr = zero_size_unpublished_attr(0);
+
+        assert!(
+            !StartupReplayCoordinator::is_live_zero_size_unpublished_draft(&attr),
+            "startup replay should reserve deletion cleanup for unlinked zero-size unpublished inodes"
+        );
+    }
+
+    #[test]
+    fn live_zero_size_unpublished_draft_should_not_match_advanced_epoch() {
+        let mut attr = zero_size_unpublished_attr(1);
+        attr.content_epoch = attr.content_epoch.saturating_add(1);
+
+        assert!(
+            !StartupReplayCoordinator::is_live_zero_size_unpublished_draft(&attr),
+            "startup replay should leave advanced zero-size epochs on the finalizer path"
+        );
+    }
+
+    #[test]
+    fn lost_unpublished_regular_upload_should_not_match_linked_zero_size_inode() {
+        let attr = zero_size_unpublished_attr(1);
+
+        assert!(
+            !StartupReplayCoordinator::is_lost_unpublished_regular_upload(&attr),
+            "startup replay must preserve linked zero-size unpublished inodes"
+        );
+    }
+
+    #[test]
+    fn lost_unpublished_regular_upload_should_not_match_hard_linked_zero_size_inode() {
+        let attr = zero_size_unpublished_attr(2);
+
+        assert!(
+            !StartupReplayCoordinator::is_lost_unpublished_regular_upload(&attr),
+            "startup replay must preserve hard-linked zero-size unpublished inodes"
+        );
+    }
+
+    #[test]
+    fn lost_unpublished_regular_upload_should_match_unlinked_zero_size_inode() {
+        let attr = zero_size_unpublished_attr(0);
+
+        assert!(
+            StartupReplayCoordinator::is_lost_unpublished_regular_upload(&attr),
+            "startup replay should still clean up unlinked zero-size unpublished inodes"
+        );
     }
 }
