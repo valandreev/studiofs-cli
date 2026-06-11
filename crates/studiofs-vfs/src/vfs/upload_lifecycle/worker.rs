@@ -660,7 +660,7 @@ where
             }
         };
 
-        let payload_len = raw_payload.len() as u64;
+        let mut payload_len = raw_payload.len() as u64;
         if !remote_object_visible {
             match self
                 .remote
@@ -731,6 +731,16 @@ where
         let mut reconcile = self
             .reconcile_uploaded_object_metadata(op, payload_len)
             .await?;
+        if reconcile.is_none()
+            && remote_object_visible
+            && payload_len == 0
+            && let Some(cached_payload) = self.local_payloads.read_for_upload(op.object_id).await?
+        {
+            payload_len = cached_payload.len() as u64;
+            reconcile = self
+                .reconcile_uploaded_object_metadata(op, payload_len)
+                .await?;
+        }
         if reconcile.is_none() && !self.shutdown.uploader_shutdown_requested() {
             for _ in 0..POST_PUT_STALE_RECONCILE_ATTEMPTS {
                 let shutdown_token = self.shutdown.shutdown_token();
@@ -2296,6 +2306,9 @@ mod tests {
                 payload_len,
                 block_size,
             ));
+            if payload_len == 0 {
+                return Ok(None);
+            }
             let mut sequence = self.reattach_epoch_sequence.lock();
             if !sequence.is_empty() {
                 return Ok(sequence.remove(0));
@@ -2316,6 +2329,7 @@ mod tests {
         visibility_after_upload: Arc<Mutex<Option<RemoteVisibility>>>,
         upload_result: Arc<Mutex<Option<UploadPutOutcome>>>,
         remove_overlay_after_upload: Arc<Mutex<Option<(FakeMeta, Ino, u64)>>>,
+        remove_overlay_after_visibility: Arc<Mutex<Option<(FakeMeta, Ino, u64)>>>,
         advance_epoch_after_upload: Arc<Mutex<Option<(FakeMeta, Ino, u64)>>>,
         mark_deleted_after_upload: Arc<Mutex<Option<(FakeShutdown, Ino)>>>,
         cancel_token_after_upload: Arc<AtomicBool>,
@@ -2329,6 +2343,7 @@ mod tests {
                 visibility_after_upload: Arc::new(Mutex::new(Some(RemoteVisibility::Visible))),
                 upload_result: Arc::new(Mutex::new(Some(UploadPutOutcome::Uploaded))),
                 remove_overlay_after_upload: Arc::new(Mutex::new(None)),
+                remove_overlay_after_visibility: Arc::new(Mutex::new(None)),
                 advance_epoch_after_upload: Arc::new(Mutex::new(None)),
                 mark_deleted_after_upload: Arc::new(Mutex::new(None)),
                 cancel_token_after_upload: Arc::new(AtomicBool::new(false)),
@@ -2351,7 +2366,15 @@ mod tests {
             _fragment_keys: &[String],
             _cancel_token: &CancellationToken,
         ) -> RemoteVisibility {
-            *self.visibility.lock()
+            let visibility = *self.visibility.lock();
+            if matches!(visibility, RemoteVisibility::Visible)
+                && let Some((meta, ino, object_id)) =
+                    self.remove_overlay_after_visibility.lock().take()
+                && let Some(objects) = meta.overlay_objects.lock().get_mut(&ino)
+            {
+                objects.remove(&object_id);
+            }
+            visibility
         }
 
         async fn upload_fragments(
@@ -3352,6 +3375,64 @@ mod tests {
         assert_eq!(
             *policy.finalized_upload_epochs.lock(),
             vec![(op.ino, rebased_epoch)]
+        );
+    }
+
+    #[tokio::test]
+    async fn process_upload_rebases_remote_visible_retry_with_cached_payload_len() {
+        let (processor, coordinator, local_payloads, meta, remote, shutdown, policy) =
+            processor_fixture();
+        let op = PendingUpload {
+            offset: 1024,
+            retry_count: 1,
+            ..make_pending_upload()
+        };
+        let payload = Bytes::from_static(b"already uploaded retry payload");
+        let rebased_epoch = op.content_epoch + 1;
+        coordinator.pending_inodes.lock().insert(op.ino);
+        meta.attrs
+            .lock()
+            .insert(op.ino, Some(make_attr(op.ino, op.content_epoch)));
+        meta.overlay_objects
+            .lock()
+            .insert(op.ino, HashSet::from([op.object_id]));
+        local_payloads
+            .upload_reads
+            .lock()
+            .insert(op.object_id, Some(payload.clone()));
+        *remote.visibility.lock() = RemoteVisibility::Visible;
+        *remote.remove_overlay_after_visibility.lock() = Some((meta.clone(), op.ino, op.object_id));
+        *meta.reattach_epoch.lock() = Some(rebased_epoch);
+
+        let outcome = processor.process_upload(op.clone()).await;
+
+        assert_eq!(outcome, UploadOutcome::Completed);
+        assert_eq!(coordinator.completed.lock().as_slice(), &[op.object_id]);
+        assert_eq!(
+            meta.reattached_uploads.lock().as_slice(),
+            &[
+                (op.ino, op.content_epoch, op.object_id, op.offset, 0, 4096),
+                (
+                    op.ino,
+                    op.content_epoch,
+                    op.object_id,
+                    op.offset,
+                    payload.len() as u64,
+                    4096
+                )
+            ],
+            "remote-visible retry must recover payload length before stale reattach"
+        );
+        assert!(
+            meta.pending_deletions.lock().is_empty(),
+            "rebased remote-visible retry payload must not be orphaned"
+        );
+        assert_eq!(local_payloads.uploaded.lock().as_slice(), &[op.object_id]);
+        assert!(local_payloads.removed.lock().is_empty());
+        assert_eq!(shutdown.canceled_stale_after_put.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            policy.finalized_upload_epochs.lock().as_slice(),
+            &[(op.ino, rebased_epoch)]
         );
     }
 
