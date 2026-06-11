@@ -2549,9 +2549,9 @@ impl VfsState {
             fuse_async_read_snapshot: Mutex::new(VfsFuseAsyncReadSnapshot::default()),
             write_admission_governor: Mutex::new(WriteAdmissionGovernor::default()),
             sustained_write_streams: Mutex::new(HashMap::new()),
-            deferred_materialize_inflight: Mutex::new(HashMap::new()),
+            deferred_materialize_inflight: DeferredInodeGate::default(),
             deferred_materialize_reschedule_needed: Mutex::new(HashSet::new()),
-            deferred_release_inflight: Mutex::new(HashMap::new()),
+            deferred_release_inflight: DeferredInodeGate::default(),
         }
     }
 }
@@ -2583,12 +2583,9 @@ struct VfsState {
     write_admission_governor: Mutex<WriteAdmissionGovernor>,
     sustained_write_streams: Mutex<HashMap<Ino, SustainedWriteState>>,
     /// Tracks inodes that currently have a deferred materialization task
-    /// in-flight.  Used by `write_fh_with_deferred_materialize` to ensure
-    /// at most one background materialization per inode at a time, preventing
-    /// task explosion and fragmented-block races.  The inner `tokio::sync::Mutex`
-    /// is held by the background task while it runs; the flush / close path
-    /// acquires the same lock to wait for completion — no TOCTOU races.
-    deferred_materialize_inflight: Mutex<HashMap<Ino, Arc<tokio::sync::Mutex<()>>>>,
+    /// in-flight. The gate keeps synchronous registry access scoped away from
+    /// async waiting while preserving one background task per inode.
+    deferred_materialize_inflight: DeferredInodeGate,
     /// Inodes that received another write while their materializer was already
     /// in-flight. The finishing task consumes this flag and schedules one more
     /// pass if dirty writer-stack bytes remain.
@@ -2596,7 +2593,130 @@ struct VfsState {
     /// Tracks last-handle release barriers scheduled by WinFSP close callbacks.
     /// Foreground flush/fsync paths wait on this before reporting success so a
     /// close-deferred metadata commit cannot race an immediate explicit sync.
-    deferred_release_inflight: Mutex<HashMap<Ino, Arc<tokio::sync::Mutex<()>>>>,
+    deferred_release_inflight: DeferredInodeGate,
+}
+
+#[derive(Clone, Default)]
+struct DeferredInodeGate {
+    entries: Arc<Mutex<HashMap<Ino, Arc<tokio::sync::Mutex<()>>>>>,
+}
+
+impl DeferredInodeGate {
+    fn create_task_lock() -> (
+        Arc<tokio::sync::Mutex<()>>,
+        tokio::sync::OwnedMutexGuard<()>,
+    ) {
+        let task_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let guard = task_lock
+            .clone()
+            .try_lock_owned()
+            .expect("new deferred inode gate lock should be uncontended");
+        (task_lock, guard)
+    }
+
+    fn try_register(
+        &self,
+        ino: Ino,
+    ) -> Option<(DeferredInodeGateEntry, tokio::sync::OwnedMutexGuard<()>)> {
+        use std::collections::hash_map::Entry;
+
+        let mut entries = self.entries.lock();
+        match entries.entry(ino) {
+            Entry::Occupied(_) => None,
+            Entry::Vacant(entry) => {
+                let (task_lock, guard) = Self::create_task_lock();
+                entry.insert(Arc::clone(&task_lock));
+                Some((
+                    DeferredInodeGateEntry::new(self.clone(), ino, task_lock),
+                    guard,
+                ))
+            }
+        }
+    }
+
+    fn replace(&self, ino: Ino) -> (DeferredInodeGateEntry, tokio::sync::OwnedMutexGuard<()>) {
+        let (task_lock, guard) = Self::create_task_lock();
+        self.entries.lock().insert(ino, Arc::clone(&task_lock));
+        (
+            DeferredInodeGateEntry::new(self.clone(), ino, task_lock),
+            guard,
+        )
+    }
+
+    async fn wait(&self, ino: Ino) {
+        loop {
+            let task_lock = self.entries.lock().get(&ino).cloned();
+            let Some(task_lock) = task_lock else {
+                return;
+            };
+            let _guard = task_lock.lock().await;
+            let current = self.entries.lock().get(&ino).cloned();
+            if current
+                .as_ref()
+                .is_none_or(|current| Arc::ptr_eq(current, &task_lock))
+            {
+                return;
+            }
+        }
+    }
+
+    fn contains(&self, ino: Ino) -> bool {
+        self.entries.lock().contains_key(&ino)
+    }
+
+    fn replace_if_current(
+        &self,
+        current_entry: &DeferredInodeGateEntry,
+    ) -> Option<(DeferredInodeGateEntry, tokio::sync::OwnedMutexGuard<()>)> {
+        use std::collections::hash_map::Entry;
+
+        let mut entries = self.entries.lock();
+        match entries.entry(current_entry.ino) {
+            Entry::Occupied(mut entry) if Arc::ptr_eq(entry.get(), &current_entry.task_lock) => {
+                let (task_lock, guard) = Self::create_task_lock();
+                entry.insert(Arc::clone(&task_lock));
+                Some((
+                    DeferredInodeGateEntry::new(self.clone(), current_entry.ino, task_lock),
+                    guard,
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    fn finish(&self, ino: Ino, task_lock: &Arc<tokio::sync::Mutex<()>>) {
+        use std::collections::hash_map::Entry;
+
+        let mut entries = self.entries.lock();
+        match entries.entry(ino) {
+            Entry::Occupied(entry) if Arc::ptr_eq(entry.get(), task_lock) => {
+                entry.remove();
+            }
+            _ => {}
+        }
+    }
+}
+
+struct DeferredInodeGateEntry {
+    gate: DeferredInodeGate,
+    ino: Ino,
+    task_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl DeferredInodeGateEntry {
+    fn new(gate: DeferredInodeGate, ino: Ino, task_lock: Arc<tokio::sync::Mutex<()>>) -> Self {
+        Self {
+            gate,
+            ino,
+            task_lock,
+        }
+    }
+}
+
+impl Drop for DeferredInodeGateEntry {
+    fn drop(&mut self) {
+        self.gate.finish(self.ino, &self.task_lock);
+    }
 }
 
 #[derive(Clone)]
@@ -4176,11 +4296,7 @@ impl StudioVfs {
     fn inode_has_unmaterialized_overlay_for_finalize(&self, ino: Ino) -> bool {
         if self.has_pending_local_dirty_payloads_for_inode(ino)
             || self.state.writer_stack.has_dirty_writers(ino)
-            || self
-                .state
-                .deferred_materialize_inflight
-                .lock()
-                .contains_key(&ino)
+            || self.state.deferred_materialize_inflight.contains(ino)
         {
             return true;
         }
@@ -4391,11 +4507,7 @@ impl StudioVfs {
             && !has_pending_uploads
             && !self.has_pending_local_dirty_payloads_for_inode(ino)
             && !self.state.writer_stack.has_dirty_writers(ino)
-            && !self
-                .state
-                .deferred_materialize_inflight
-                .lock()
-                .contains_key(&ino)
+            && !self.state.deferred_materialize_inflight.contains(ino)
         {
             self.remove_live_extents_for_inode(ino);
             self.remove_pending_epoch_finalizations_for_inode(ino);

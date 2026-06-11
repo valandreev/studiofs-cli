@@ -151,7 +151,7 @@ impl StudioVfs {
                 "deleted_marker": self.state.upload.deleted_inodes.lock().contains(&ino),
                 "writer_stack_dirty_bytes": self.state.writer_stack.dirty_bytes_for_inode(ino),
                 "has_pending_local_dirty_payloads": self.has_pending_local_dirty_payloads_for_inode(ino),
-                "has_inflight_materialization": self.state.deferred_materialize_inflight.lock().contains_key(&ino),
+                "has_inflight_materialization": self.state.deferred_materialize_inflight.contains(ino),
             }),
         );
         // #endregion debug log

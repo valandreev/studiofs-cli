@@ -5159,11 +5159,11 @@ fn epoch_finalizer_defers_while_deferred_materialization_is_inflight() {
             "once zero-length slice-graph state is durable, only publication should remain"
         );
 
-        let task_lock = Arc::new(tokio::sync::Mutex::new(()));
-        vfs.state
+        let (entry, _guard) = vfs
+            .state
             .deferred_materialize_inflight
-            .lock()
-            .insert(attr.ino, Arc::clone(&task_lock));
+            .try_register(attr.ino)
+            .expect("test should reserve the deferred materialization gate");
 
         let status = super::commit::CommitCoordinator::finalize_inode_epoch(
             &vfs,
@@ -5177,10 +5177,7 @@ fn epoch_finalizer_defers_while_deferred_materialization_is_inflight() {
             "finalize must not race ahead of an in-flight deferred materialization task"
         );
 
-        vfs.state
-            .deferred_materialize_inflight
-            .lock()
-            .remove(&attr.ino);
+        drop(entry);
 
         let status = super::commit::CommitCoordinator::finalize_inode_epoch(
             &vfs,
@@ -7025,11 +7022,11 @@ fn opportunistic_deferred_write_rechecks_hard_pressure_without_inline_fallback()
             .file_session
             .enter_op(ino, FileSessionOperation::Write)
             .await;
-        let task_lock = Arc::new(tokio::sync::Mutex::new(()));
-        vfs.state
+        let (entry, _guard) = vfs
+            .state
             .deferred_materialize_inflight
-            .lock()
-            .insert(ino, Arc::clone(&task_lock));
+            .try_register(ino)
+            .expect("test should reserve the deferred materialization gate");
 
         let queued_vfs = Arc::clone(&vfs);
         let queued_write = tokio::spawn(async move {
@@ -7079,7 +7076,7 @@ fn opportunistic_deferred_write_rechecks_hard_pressure_without_inline_fallback()
             .await
             .expect("queued write task should not panic")
             .expect("queued write should stay deferred and complete");
-        vfs.state.deferred_materialize_inflight.lock().remove(&ino);
+        drop(entry);
 
         let snapshot = vfs.write_path_observability_snapshot();
         assert_eq!(
@@ -7124,10 +7121,11 @@ fn opportunistic_sustained_pre_drain_schedules_without_inline_materialization() 
                 Bytes::from(vec![0xCD; seeded_len]),
             )
             .expect("seed sustained writer-stack pressure");
-        vfs.state
+        let (entry, _guard) = vfs
+            .state
             .deferred_materialize_inflight
-            .lock()
-            .insert(ino, Arc::new(tokio::sync::Mutex::new(())));
+            .try_register(ino)
+            .expect("test should reserve the deferred materialization gate");
         let now = now_unix_millis();
         vfs.state.sustained_write_streams.lock().insert(
             ino,
@@ -7153,7 +7151,7 @@ fn opportunistic_sustained_pre_drain_schedules_without_inline_materialization() 
             "sustained pre-drain must not materialize buffered data inline on the foreground write"
         );
 
-        vfs.state.deferred_materialize_inflight.lock().remove(&ino);
+        drop(entry);
         vfs.release_fh(fh).await.unwrap();
     });
 }
@@ -7178,10 +7176,11 @@ fn deferred_write_keeps_writeback_path_when_soft_dirty_budget_is_full() {
             .unwrap();
 
         vfs.set_max_dirty_bytes(8);
-        vfs.state
+        let (entry, _guard) = vfs
+            .state
             .deferred_materialize_inflight
-            .lock()
-            .insert(ino, Arc::new(tokio::sync::Mutex::new(())));
+            .try_register(ino)
+            .expect("test should reserve the deferred materialization gate");
         vfs.state
             .writer_stack
             .write_bytes(
@@ -7211,7 +7210,7 @@ fn deferred_write_keeps_writeback_path_when_soft_dirty_budget_is_full() {
         )
         .await
         .expect("soft dirty budget should not force a synchronous writeback fallback");
-        vfs.state.deferred_materialize_inflight.lock().remove(&ino);
+        drop(entry);
 
         let snapshot = vfs.write_path_observability_snapshot();
         assert_eq!(
@@ -8785,12 +8784,11 @@ fn test_flush_fh_clean_skip_waits_for_deferred_release_but_not_file_session_gate
             .file_session
             .enter_op(ino, FileSessionOperation::Read)
             .await;
-        let task_lock = Arc::new(tokio::sync::Mutex::new(()));
-        let guard = task_lock.clone().lock_owned().await;
-        vfs.state
+        let (entry, guard) = vfs
+            .state
             .deferred_release_inflight
-            .lock()
-            .insert(ino, task_lock);
+            .try_register(ino)
+            .expect("test should reserve the deferred release gate");
 
         let flushing_vfs = Arc::clone(&vfs);
         let flush = tokio::spawn(async move { flushing_vfs.flush_fh_with_outcome(fh).await });
@@ -8801,7 +8799,7 @@ fn test_flush_fh_clean_skip_waits_for_deferred_release_but_not_file_session_gate
             "clean handle flush must still wait for an in-flight deferred release barrier"
         );
 
-        vfs.state.deferred_release_inflight.lock().remove(&ino);
+        drop(entry);
         drop(guard);
         let outcome = tokio::time::timeout(Duration::from_millis(100), flush)
             .await
@@ -10830,11 +10828,11 @@ fn deferred_materialization_reschedules_write_that_arrives_while_inflight_finish
             .unwrap();
         let ino = attr.ino;
         let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
-        let task_lock = Arc::new(tokio::sync::Mutex::new(()));
-        vfs.state
+        let (entry, _guard) = vfs
+            .state
             .deferred_materialize_inflight
-            .lock()
-            .insert(ino, Arc::clone(&task_lock));
+            .try_register(ino)
+            .expect("test should reserve the deferred materialization gate");
 
         let payload = vec![0xD4; vfs.block_size as usize];
         vfs.write_fh_with_deferred_materialize(
@@ -10855,7 +10853,7 @@ fn deferred_materialization_reschedules_write_that_arrives_while_inflight_finish
             "write should remain buffered until the finishing materializer reschedules"
         );
 
-        vfs.finish_deferred_materialization_task(ino, task_lock, true);
+        vfs.finish_deferred_materialization_task(entry, true);
 
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -10875,6 +10873,93 @@ fn deferred_materialization_reschedules_write_that_arrives_while_inflight_finish
 }
 
 #[test]
+fn deferred_inode_gate_waiter_does_not_hold_registry_lock_while_awaiting() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let gate = DeferredInodeGate::default();
+        let ino = 42;
+        let (entry, guard) = gate
+            .try_register(ino)
+            .expect("first registration should own the inode gate");
+
+        let waiting_gate = gate.clone();
+        let wait = tokio::spawn(async move {
+            waiting_gate.wait(ino).await;
+        });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !wait.is_finished(),
+            "waiter should block on the async per-inode guard"
+        );
+
+        let replacement = gate.try_register(ino);
+        assert!(
+            replacement.is_none(),
+            "waiter must not hold the synchronous registry lock while awaiting the per-inode guard"
+        );
+
+        drop(entry);
+        drop(guard);
+        wait.await.expect("wait task should not panic");
+    });
+}
+
+#[test]
+fn deferred_inode_gate_cleanup_only_removes_current_entry() {
+    let gate = DeferredInodeGate::default();
+    let ino = 43;
+    let (older_entry, _older_guard) = gate
+        .try_register(ino)
+        .expect("first registration should own the inode gate");
+    let (newer_entry, newer_guard) = gate.replace(ino);
+
+    drop(older_entry);
+    assert!(
+        gate.contains(ino),
+        "finishing a replaced entry must not remove the current inode gate"
+    );
+
+    drop(newer_guard);
+    drop(newer_entry);
+    assert!(
+        !gate.contains(ino),
+        "finishing the current entry should remove the inode gate"
+    );
+}
+
+#[test]
+fn deferred_inode_gate_entry_drop_removes_current_entry() {
+    let gate = DeferredInodeGate::default();
+    let ino = 44;
+    let (entry, _guard) = gate
+        .try_register(ino)
+        .expect("first registration should own the inode gate");
+
+    drop(entry);
+    assert!(
+        !gate.contains(ino),
+        "dropping the current entry must remove the inode gate even before the async guard is released"
+    );
+}
+
+#[test]
+fn deferred_inode_gate_wait_returns_when_guard_released_before_entry_cleanup() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let gate = DeferredInodeGate::default();
+        let ino = 45;
+        let (_entry, guard) = gate
+            .try_register(ino)
+            .expect("first registration should own the inode gate");
+
+        drop(guard);
+        tokio::time::timeout(Duration::from_millis(100), gate.wait(ino))
+            .await
+            .expect("wait should return when the current gate is unlocked but still registered");
+    });
+}
+
+#[test]
 fn strict_deferred_write_waits_for_inflight_materialization() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-301-strict-waits-inflight");
@@ -10885,12 +10970,11 @@ fn strict_deferred_write_waits_for_inflight_materialization() {
             .unwrap();
         let ino = attr.ino;
         let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
-        let task_lock = Arc::new(tokio::sync::Mutex::new(()));
-        let guard = task_lock.clone().lock_owned().await;
-        vfs.state
+        let (entry, guard) = vfs
+            .state
             .deferred_materialize_inflight
-            .lock()
-            .insert(ino, task_lock);
+            .try_register(ino)
+            .expect("test should reserve the deferred materialization gate");
 
         let strict_vfs = Arc::clone(&vfs);
         let strict_write = tokio::spawn(async move {
@@ -10911,8 +10995,8 @@ fn strict_deferred_write_waits_for_inflight_materialization() {
             "strict writes must wait until earlier deferred materialization leaves the inflight slot"
         );
 
+        drop(entry);
         drop(guard);
-        vfs.state.deferred_materialize_inflight.lock().remove(&ino);
         strict_write
             .await
             .expect("strict write task should not panic")
@@ -10933,12 +11017,11 @@ fn explicit_winfsp_flush_waits_for_deferred_last_handle_release_barrier() {
         let ino = attr.ino;
         let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
 
-        let task_lock = Arc::new(tokio::sync::Mutex::new(()));
-        let guard = task_lock.clone().lock_owned().await;
-        vfs.state
+        let (entry, guard) = vfs
+            .state
             .deferred_release_inflight
-            .lock()
-            .insert(ino, task_lock);
+            .try_register(ino)
+            .expect("test should reserve the deferred release gate");
 
         let flushing_vfs = Arc::clone(&vfs);
         let flush = tokio::spawn(async move {
@@ -10953,8 +11036,8 @@ fn explicit_winfsp_flush_waits_for_deferred_last_handle_release_barrier() {
             "explicit WinFSP flush must wait for an in-flight deferred last-handle release barrier before reporting sync success"
         );
 
+        drop(entry);
         drop(guard);
-        vfs.state.deferred_release_inflight.lock().remove(&ino);
         flush
             .await
             .expect("flush task should not panic")
@@ -10979,10 +11062,7 @@ fn deferred_release_barrier_replaces_older_inflight_marker() {
 
         drop(older);
         assert!(
-            vfs.state
-                .deferred_release_inflight
-                .lock()
-                .contains_key(&ino),
+            vfs.state.deferred_release_inflight.contains(ino),
             "dropping a replaced barrier must not remove the current marker"
         );
 
@@ -11001,10 +11081,7 @@ fn deferred_release_barrier_replaces_older_inflight_marker() {
         drop(newer);
         wait.await.expect("wait task should not panic");
         assert!(
-            !vfs.state
-                .deferred_release_inflight
-                .lock()
-                .contains_key(&ino),
+            !vfs.state.deferred_release_inflight.contains(ino),
             "dropping the current barrier guard must remove its marker"
         );
     });
@@ -11025,10 +11102,7 @@ fn deferred_release_ignored_entry_skips_release_barrier() {
         assert!(outcome.closed_last_handle);
         assert!(!outcome.flushed_local_dirty_state);
         assert!(
-            !vfs.state
-                .deferred_release_inflight
-                .lock()
-                .contains_key(&ino),
+            !vfs.state.deferred_release_inflight.contains(ino),
             "ignored entries should not register a deferred release barrier"
         );
     });
@@ -11074,12 +11148,11 @@ fn deferred_materialization_wait_tracks_rescheduled_marker() {
             .unwrap();
         let ino = attr.ino;
 
-        let older = Arc::new(tokio::sync::Mutex::new(()));
-        let older_guard = older.clone().lock_owned().await;
-        vfs.state
+        let (older_entry, older_guard) = vfs
+            .state
             .deferred_materialize_inflight
-            .lock()
-            .insert(ino, older);
+            .try_register(ino)
+            .expect("test should reserve the deferred materialization gate");
 
         let waiting_vfs = Arc::clone(&vfs);
         let wait = tokio::spawn(async move {
@@ -11094,12 +11167,11 @@ fn deferred_materialization_wait_tracks_rescheduled_marker() {
             "strict barriers must wait for the current materialization task"
         );
 
-        let newer = Arc::new(tokio::sync::Mutex::new(()));
-        let newer_guard = newer.clone().lock_owned().await;
-        vfs.state
+        let (newer_entry, newer_guard) = vfs
+            .state
             .deferred_materialize_inflight
-            .lock()
-            .insert(ino, newer);
+            .replace_if_current(&older_entry)
+            .expect("current materialization gate should be replaceable");
         drop(older_guard);
 
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -11108,8 +11180,8 @@ fn deferred_materialization_wait_tracks_rescheduled_marker() {
             "strict barriers must continue waiting when materialization reschedules another task"
         );
 
+        drop(newer_entry);
         drop(newer_guard);
-        vfs.state.deferred_materialize_inflight.lock().remove(&ino);
         wait.await.expect("wait task should not panic");
     });
 }
