@@ -842,7 +842,9 @@ this usually means Administrator privileges are required, or WinFSP must be conf
     // shutdown registry rejects a second active in-process WinFSP mount before this
     // handler can target the wrong mount sender.
     unsafe {
-        SetConsoleCtrlHandler(Some(ctrl_handler), 1);
+        if SetConsoleCtrlHandler(Some(ctrl_handler), 1) == 0 {
+            tracing::warn!("failed to register console control handler for WinFSP shutdown");
+        }
     }
     let _ = rx.recv(); // blocks
 
@@ -895,14 +897,12 @@ impl Drop for ShutdownRegistration {
 }
 
 fn shutdown_registry() -> &'static parking_lot::Mutex<ShutdownRegistry> {
-    static SHUTDOWN_REGISTRY: std::sync::OnceLock<parking_lot::Mutex<ShutdownRegistry>> =
-        std::sync::OnceLock::new();
-    SHUTDOWN_REGISTRY.get_or_init(|| {
+    static SHUTDOWN_REGISTRY: parking_lot::Mutex<ShutdownRegistry> =
         parking_lot::Mutex::new(ShutdownRegistry {
             next_id: 1,
             active: None,
-        })
-    })
+        });
+    &SHUTDOWN_REGISTRY
 }
 
 fn register_shutdown_sender(
@@ -1206,11 +1206,8 @@ mod tests {
 
     impl ShutdownRegistryTestGuard {
         fn new() -> Self {
-            static TEST_MUTEX: std::sync::OnceLock<parking_lot::Mutex<()>> =
-                std::sync::OnceLock::new();
-            let guard = TEST_MUTEX
-                .get_or_init(|| parking_lot::Mutex::new(()))
-                .lock();
+            static TEST_MUTEX: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+            let guard = TEST_MUTEX.lock();
             clear_shutdown_registry_for_test();
             Self { _guard: guard }
         }
