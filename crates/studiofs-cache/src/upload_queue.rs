@@ -55,6 +55,12 @@ struct PendingState {
     ino_counts: BTreeMap<Ino, usize>,
 }
 
+enum PendingSubmit {
+    New,
+    Updated(PendingUpload),
+    Ignored,
+}
+
 impl UploadQueue {
     /// Create a new upload queue.
     ///
@@ -96,17 +102,24 @@ impl UploadQueue {
             retry_count: 0,
         };
 
-        if !self.record_pending(op.clone()) {
-            debug!(
-                object_id,
-                ino, offset, content_epoch, "upload submit ignored: object already pending"
-            );
-            return;
-        }
-
-        self.pending_count.fetch_add(1, Ordering::Release);
-        if self.sender.send(op).is_err() && self.remove_pending(object_id) {
-            self.mark_done();
+        match self.record_pending_or_update(op.clone()) {
+            PendingSubmit::New => {
+                self.pending_count.fetch_add(1, Ordering::Release);
+                if self.sender.send(op).is_err() && self.remove_pending(object_id) {
+                    self.mark_done();
+                }
+            }
+            PendingSubmit::Updated(previous) => {
+                if self.sender.send(op.clone()).is_err() {
+                    self.restore_pending_if_current_matches(&op, previous);
+                }
+            }
+            PendingSubmit::Ignored => {
+                debug!(
+                    object_id,
+                    ino, offset, content_epoch, "upload submit ignored: object already pending"
+                );
+            }
         }
     }
 
@@ -237,16 +250,24 @@ impl UploadQueue {
         }
     }
 
-    fn record_pending(&self, op: PendingUpload) -> bool {
+    fn record_pending_or_update(&self, op: PendingUpload) -> PendingSubmit {
         let mut state = self.pending_state.lock();
-        if state.by_object.contains_key(&op.object_id) {
-            return false;
+        if let Some(current) = state.by_object.get_mut(&op.object_id) {
+            if current.ino == op.ino
+                && current.offset == op.offset
+                && op.content_epoch > current.content_epoch
+            {
+                let previous = current.clone();
+                *current = op;
+                return PendingSubmit::Updated(previous);
+            }
+            return PendingSubmit::Ignored;
         }
 
         let ino = op.ino;
         state.by_object.insert(op.object_id, op);
         *state.ino_counts.entry(ino).or_insert(0) += 1;
-        true
+        PendingSubmit::New
     }
 
     fn remove_pending(&self, object_id: u64) -> bool {
@@ -375,6 +396,35 @@ mod tests {
         let op = rx.recv().await.unwrap();
         assert_eq!(op.object_id, 77);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn duplicate_submit_updates_pending_upload_to_newer_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let (queue, mut rx) = UploadQueue::new(dir.path());
+
+        queue.submit(1, 1_048_569, 77, 2);
+        queue.submit(1, 1_048_569, 77, 3);
+
+        assert_eq!(queue.pending_count(), 1);
+        let stale = rx.recv().await.unwrap();
+        assert_eq!(stale.content_epoch, 2);
+        let updated = rx.recv().await.unwrap();
+        assert_eq!(updated.content_epoch, 3);
+
+        assert!(
+            !queue.cancel(&stale),
+            "stale worker op must not cancel the newer pending upload"
+        );
+        assert_eq!(queue.pending_count(), 1);
+
+        let pending = queue.snapshot_pending();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].object_id, 77);
+        assert_eq!(pending[0].content_epoch, 3);
+
+        assert!(queue.complete(&updated));
+        assert_eq!(queue.pending_count(), 0);
     }
 
     #[tokio::test]

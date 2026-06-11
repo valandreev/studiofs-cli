@@ -3908,6 +3908,11 @@ fn explicit_flush_sparse_extend_retains_tail_after_head_publication() {
             !vfs.live_extent_records_for_inode(ino).is_empty(),
             "tail flush after head publication must retain a live extent guard"
         );
+        let stale_tail_upload = vfs
+            .pending_uploads_snapshot()
+            .into_iter()
+            .find(|op| op.ino == ino && op.offset == tail_offset)
+            .expect("tail upload should be pending before sparse extend");
 
         let grow_fh = vfs
             .open_file(ino, OpenFlags::RDWR, false)
@@ -3925,6 +3930,22 @@ fn explicit_flush_sparse_extend_retains_tail_after_head_publication() {
             pending_after_extend,
             BTreeSet::from([(tail_offset, extended_attr.content_epoch)]),
             "set_len after head publication must retain the sparse tail upload under the size-change epoch"
+        );
+        assert_ne!(
+            stale_tail_upload.content_epoch, extended_attr.content_epoch,
+            "test setup must keep the pre-extend worker op stale"
+        );
+
+        vfs.cached_store().cancel_upload(&stale_tail_upload);
+        let pending_after_stale_cancel = vfs
+            .pending_uploads_for_inode(ino)
+            .into_iter()
+            .map(|(offset, _, content_epoch)| (offset, content_epoch))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            pending_after_stale_cancel,
+            BTreeSet::from([(tail_offset, extended_attr.content_epoch)]),
+            "stale pre-extend upload cancellation must not remove the requeued sparse tail"
         );
 
         let (content_epoch, blocks) = mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
