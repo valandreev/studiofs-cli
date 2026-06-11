@@ -4123,6 +4123,21 @@ fn explicit_flush_sparse_extend_retains_kernel_zero_filled_tail_write() {
             "set_len requeue must preserve the uploaded object's full length"
         );
 
+        let extended_attr = meta.get_attr(ino).expect("load extended attr");
+        let (content_epoch, blocks) = mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+        assert_eq!(content_epoch, extended_attr.content_epoch);
+        publish_current_file_graph(&meta, ino, content_epoch, &blocks);
+        let published_tail = meta
+            .lookup_regular_file_slices(ino, tail_offset, tail.len() as u64)
+            .expect("lookup published zero-filled tail")
+            .into_iter()
+            .filter_map(|span| span.payload)
+            .collect::<Vec<_>>();
+        assert!(
+            !published_tail.is_empty(),
+            "publishing the size-change epoch must retain the zero-filled sparse tail payload"
+        );
+
         vfs.release_fh(grow_fh).await.expect("release grow writer");
     });
 }
@@ -4966,6 +4981,13 @@ fn handle_backed_sparse_extend_publishes_logical_size_without_tail_payload() {
         assert_eq!(
             published_attr.committed_size, logical_size,
             "published sparse truncate-extend must expose the logical EOF to peers"
+        );
+        let published_tail = meta
+            .lookup_regular_file_slices(ino, tail_offset, tail.len() as u64)
+            .expect("resolve sparse tail payload");
+        assert!(
+            published_tail.iter().any(|span| span.payload.is_some()),
+            "published sparse truncate-extend must retain the written tail payload"
         );
         let hole = meta
             .lookup_regular_file_slices(

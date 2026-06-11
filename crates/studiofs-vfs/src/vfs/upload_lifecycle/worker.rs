@@ -2758,6 +2758,40 @@ mod tests {
             payload.length,
             u32::try_from(materialized_len - u64::from(prefix_len)).unwrap()
         );
+
+        assert!(
+            meta.publish_regular_file_overlay_to_base_if_matches(ready_attr.ino, 3)
+                .expect("publish rebased sparse upload")
+        );
+        let published_spans = meta
+            .lookup_regular_file_slices(ready_attr.ino, 0, materialized_len)
+            .expect("load published sparse graph");
+        assert!(
+            published_spans.iter().any(|span| {
+                span.source == ResolvedSliceSource::Base
+                    && span.range == SliceRange::new(0, prefix_len).expect("prefix range")
+                    && span
+                        .payload
+                        .as_ref()
+                        .is_some_and(|payload| payload.object_id == published_prefix_object)
+            }),
+            "publishing the rebased sparse upload must keep the original prefix object"
+        );
+        assert!(
+            published_spans.iter().any(|span| {
+                span.source == ResolvedSliceSource::Base
+                    && span.range
+                        == SliceRange::new(prefix_len, u32::try_from(materialized_len).unwrap())
+                            .expect("tail range")
+                    && span.payload.as_ref().is_some_and(|payload| {
+                        payload.object_id == materialized_upload_object
+                            && payload.offset == prefix_len
+                            && payload.length
+                                == u32::try_from(materialized_len - u64::from(prefix_len)).unwrap()
+                    })
+            }),
+            "publishing the rebased sparse upload must retain the uploaded tail object"
+        );
     }
 
     #[test]

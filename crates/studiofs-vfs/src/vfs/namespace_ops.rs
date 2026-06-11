@@ -320,6 +320,9 @@ impl StudioVfs {
                     attr.size,
                     attr.content_epoch,
                 );
+                if attr.size > old_attr.size {
+                    self.preserve_resolved_regular_file_graph_for_size_change(ino, attr.size)?;
+                }
             }
             self.finalize_truncate_cleanup(ino, truncate_mutation.as_ref());
             self.refresh_inode_incarnation_state_from_attr(ino, &attr);
@@ -531,6 +534,54 @@ impl StudioVfs {
             FileSessionOperation::Upload,
             "queued",
         );
+    }
+
+    fn preserve_resolved_regular_file_graph_for_size_change(
+        &self,
+        ino: Ino,
+        size: u64,
+    ) -> VfsResult<()> {
+        if size == 0 {
+            return Ok(());
+        }
+
+        let mut chunks = std::collections::BTreeMap::<ChunkId, Vec<SliceRecord>>::new();
+        for span in self.sync_meta().lookup_regular_file_slices(ino, 0, size)? {
+            match span.source {
+                ResolvedSliceSource::Base | ResolvedSliceSource::Hole => {}
+                ResolvedSliceSource::Overlay => {
+                    let Some(payload) = span.payload else {
+                        continue;
+                    };
+                    let mut slice =
+                        SliceRecord::new(SliceId(0), SliceOrder(0), span.range, payload);
+                    slice.payload_state = PayloadRefState::Uploaded;
+                    chunks.entry(span.chunk_id).or_default().push(slice);
+                }
+                ResolvedSliceSource::OverlayTombstone | ResolvedSliceSource::BaseTombstone => {
+                    chunks
+                        .entry(span.chunk_id)
+                        .or_default()
+                        .push(SliceRecord::tombstone(
+                            SliceId(0),
+                            SliceOrder(0),
+                            span.range,
+                        ));
+                }
+            }
+        }
+
+        if chunks.is_empty() {
+            return Ok(());
+        }
+
+        self.sync_meta()
+            .flush_regular_file_overlay_slices_with_attr(
+                ino,
+                &chunks.into_iter().collect::<Vec<_>>(),
+                None,
+            )?;
+        Ok(())
     }
 
     fn truncate_tombstone_slices(
