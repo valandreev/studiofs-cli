@@ -193,6 +193,138 @@ fn crash_replay_failure_writes_replayable_counterexample_artifact() {
 }
 
 #[test]
+fn crash_replay_rejects_unknown_planned_trace_operations() {
+    let artifact_dir = unique_temp_dir("sfs501-crash-replay-unknown-op");
+    std::fs::create_dir_all(&artifact_dir).expect("create artifact dir");
+
+    let report = run_crash_replay_suite_with_artifacts(
+        CrashReplaySuiteConfig {
+            scenario: "sfs501-crash-replay-unknown-op".to_string(),
+            seeds: vec![13],
+            families: vec![CrashReplayFamily::InjectedInvariantFailure],
+        },
+        &artifact_dir,
+    )
+    .expect("counterexample artifacts are written");
+
+    let artifact_path = report.failures[0]
+        .counterexample_artifact_path
+        .as_ref()
+        .expect("failure records its counterexample artifact path");
+    let mut artifact = read_crash_replay_counterexample(artifact_path)
+        .expect("counterexample artifact can be read");
+    let selected = artifact
+        .client_trace
+        .iter_mut()
+        .find(|record| record.kind == "scheduler_selected")
+        .expect("counterexample has scheduler selection");
+    selected.path = Some("future_crash_operation".to_string());
+    std::fs::write(
+        artifact_path,
+        serde_json::to_vec_pretty(&artifact).expect("serialize mutated artifact"),
+    )
+    .expect("rewrite mutated artifact");
+
+    let error = replay_crash_replay_counterexample(artifact_path)
+        .expect_err("unknown planned operation returns a scenario error");
+
+    match error {
+        CrashReplayArtifactError::DecodeTraceOperation(error) => {
+            assert_eq!(error.kind(), "future_crash_operation");
+            assert!(error.context().contains("sfs501-crash-replay-unknown-op"));
+            assert!(error.context().contains("step 4"));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn crash_replay_rejects_missing_planned_trace_operations() {
+    let artifact_dir = unique_temp_dir("sfs501-crash-replay-missing-op");
+    std::fs::create_dir_all(&artifact_dir).expect("create artifact dir");
+
+    let report = run_crash_replay_suite_with_artifacts(
+        CrashReplaySuiteConfig {
+            scenario: "sfs501-crash-replay-missing-op".to_string(),
+            seeds: vec![13],
+            families: vec![CrashReplayFamily::InjectedInvariantFailure],
+        },
+        &artifact_dir,
+    )
+    .expect("counterexample artifacts are written");
+
+    let artifact_path = report.failures[0]
+        .counterexample_artifact_path
+        .as_ref()
+        .expect("failure records its counterexample artifact path");
+    let mut artifact = read_crash_replay_counterexample(artifact_path)
+        .expect("counterexample artifact can be read");
+    let selected = artifact
+        .client_trace
+        .iter_mut()
+        .find(|record| record.kind == "scheduler_selected")
+        .expect("counterexample has scheduler selection");
+    selected.path = None;
+    std::fs::write(
+        artifact_path,
+        serde_json::to_vec_pretty(&artifact).expect("serialize mutated artifact"),
+    )
+    .expect("rewrite mutated artifact");
+
+    let error = replay_crash_replay_counterexample(artifact_path)
+        .expect_err("missing planned operation returns a scenario error");
+
+    match error {
+        CrashReplayArtifactError::DecodeTraceOperation(error) => {
+            assert_eq!(error.kind(), "missing planned operation kind");
+            assert!(error.context().contains("sfs501-crash-replay-missing-op"));
+            assert!(error.context().contains("step 4"));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn crash_replay_reports_artifact_operation_log_inconsistency() {
+    let artifact_dir = unique_temp_dir("sfs501-crash-replay-log-inconsistency");
+    std::fs::create_dir_all(&artifact_dir).expect("create artifact dir");
+
+    let report = run_crash_replay_suite_with_artifacts(
+        CrashReplaySuiteConfig {
+            scenario: "sfs501-crash-replay-log-inconsistency".to_string(),
+            seeds: vec![13],
+            families: vec![CrashReplayFamily::InjectedInvariantFailure],
+        },
+        &artifact_dir,
+    )
+    .expect("counterexample artifacts are written");
+
+    let artifact_path = report.failures[0]
+        .counterexample_artifact_path
+        .as_ref()
+        .expect("failure records its counterexample artifact path");
+    let mut artifact = read_crash_replay_counterexample(artifact_path)
+        .expect("counterexample artifact can be read");
+    artifact.operation_log.clear();
+    std::fs::write(
+        artifact_path,
+        serde_json::to_vec_pretty(&artifact).expect("serialize mutated artifact"),
+    )
+    .expect("rewrite mutated artifact");
+
+    let error = replay_crash_replay_counterexample(artifact_path)
+        .expect_err("inconsistent artifact operation log is rejected");
+
+    match error {
+        CrashReplayArtifactError::ReplayMismatch(message) => assert_eq!(
+            message,
+            "artifact client trace decodes to a different operation log than stored in the artifact"
+        ),
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
 fn counterexample_artifact_path_uses_unknown_for_empty_sanitized_scenarios() {
     let artifact_dir = unique_temp_dir("sfs339-empty-scenario-artifact");
     std::fs::create_dir_all(&artifact_dir).expect("create artifact dir");

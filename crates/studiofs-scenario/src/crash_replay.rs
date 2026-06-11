@@ -14,7 +14,7 @@ use crate::scheduler::{
     ScheduledEvent, SchedulerEventType, SchedulerTraceRecord, SimulationScheduler,
     simulation_stream_seed,
 };
-use crate::{ScenarioOperation, ScenarioOperationRecord};
+use crate::{ScenarioOperation, ScenarioOperationRecord, TraceOperationDecodeError};
 
 /// Constant $name.
 pub const CRASH_REPLAY_COUNTEREXAMPLE_SCHEMA_VERSION: u32 = 1;
@@ -222,6 +222,9 @@ pub enum CrashReplayArtifactError {
     #[error("counterexample replay did not reproduce: {0}")]
     /// Variant $name.
     ReplayMismatch(String),
+    #[error(transparent)]
+    /// Variant $name.
+    DecodeTraceOperation(#[from] TraceOperationDecodeError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -364,6 +367,8 @@ pub fn replay_crash_replay_counterexample(
     path: impl AsRef<Path>,
 ) -> Result<CrashReplayReplayReport, CrashReplayArtifactError> {
     let artifact = read_crash_replay_counterexample(path)?;
+    let artifact_operation_log =
+        operation_log_from_trace(&artifact.scenario, &artifact.client_trace)?;
     let run = run_family(&artifact.scenario, artifact.family, artifact.seed);
     let Some(failure) = run.failure else {
         return Err(CrashReplayArtifactError::ReplayMismatch(
@@ -382,9 +387,15 @@ pub fn replay_crash_replay_counterexample(
             "scheduler trace differed from artifact".to_string(),
         ));
     }
+    if artifact_operation_log != artifact.operation_log {
+        return Err(CrashReplayArtifactError::ReplayMismatch(
+            "artifact client trace decodes to a different operation log than stored in the artifact"
+                .to_string(),
+        ));
+    }
     if run.operation_log != artifact.operation_log {
         return Err(CrashReplayArtifactError::ReplayMismatch(
-            "operation log differed from artifact".to_string(),
+            "replay run operation log differed from artifact".to_string(),
         ));
     }
     if failure.trace != expected_trace {
@@ -510,7 +521,8 @@ impl CrashHarness {
         };
         let passed = failure.is_none();
         let final_snapshot = self.runtime.logical_snapshot();
-        let operation_log = operation_log_from_trace(&self.scenario, &self.trace);
+        let operation_log = operation_log_from_trace(&self.scenario, &self.trace)
+            .expect("crash replay harness emits decodable operation trace");
         let scheduler_trace = self.scheduler.trace().to_vec();
         FamilyRun {
             report: CrashReplaySeedReport {
@@ -664,7 +676,8 @@ impl CrashHarness {
                     .description
                     .as_deref()
                     .expect("crash event must have a trace description"),
-            );
+            )
+            .expect("scheduled crash operation uses known trace kind");
             selected.push(operation);
         }
         selected
@@ -739,13 +752,13 @@ impl PlannedCrashOp {
         }
     }
 
-    fn from_trace_kind(kind: &str) -> Self {
+    fn from_trace_kind(kind: &str) -> Option<Self> {
         match kind {
-            "restart_writer" => Self::RestartWriter,
-            "publish" => Self::Publish,
-            "restart_reader" => Self::RestartReader,
-            "foreign_apply" => Self::ForeignApply,
-            _ => panic!("unknown planned crash operation {kind}"),
+            "restart_writer" => Some(Self::RestartWriter),
+            "publish" => Some(Self::Publish),
+            "restart_reader" => Some(Self::RestartReader),
+            "foreign_apply" => Some(Self::ForeignApply),
+            _ => None,
         }
     }
 }
@@ -942,13 +955,16 @@ fn injected_invariant_failure(h: &mut CrashHarness) {
 fn operation_log_from_trace(
     scenario: &str,
     trace: &[CrashReplayTraceRecord],
-) -> Vec<ScenarioOperationRecord> {
+) -> Result<Vec<ScenarioOperationRecord>, TraceOperationDecodeError> {
     trace
         .iter()
         .map(|record| {
-            let mut operation =
-                ScenarioOperationRecord::new(scenario, record.step, operation_from_trace(record))
-                    .with_outcome(crate::OperationOutcome::Observed);
+            let mut operation = ScenarioOperationRecord::new(
+                scenario,
+                record.step,
+                operation_from_trace(scenario, record)?,
+            )
+            .with_outcome(crate::OperationOutcome::Observed);
             if let Some(client) = &record.client {
                 operation = operation.with_client(client.clone());
             }
@@ -958,18 +974,21 @@ fn operation_log_from_trace(
             for (key, value) in &record.metadata {
                 operation = operation.with_metadata(key.clone(), value.clone());
             }
-            operation
+            Ok(operation)
         })
         .collect()
 }
 
-fn operation_from_trace(record: &CrashReplayTraceRecord) -> ScenarioOperation {
+fn operation_from_trace(
+    scenario: &str,
+    record: &CrashReplayTraceRecord,
+) -> Result<ScenarioOperation, TraceOperationDecodeError> {
     match record.kind.as_str() {
-        "create_file" => ScenarioOperation::CreateFile {
+        "create_file" => Ok(ScenarioOperation::CreateFile {
             path: trace_path(record),
             bytes: None,
-        },
-        "write_file" => ScenarioOperation::Write {
+        }),
+        "write_file" => Ok(ScenarioOperation::Write {
             path: trace_path(record),
             offset: None,
             bytes: record
@@ -978,25 +997,42 @@ fn operation_from_trace(record: &CrashReplayTraceRecord) -> ScenarioOperation {
                 .and_then(|bytes| bytes.parse().ok())
                 .unwrap_or_default(),
             checksum_sha256: record.metadata.get("checksum_sha256").cloned(),
-        },
-        "local_durability_boundary" => ScenarioOperation::Flush {
+        }),
+        "local_durability_boundary" => Ok(ScenarioOperation::Flush {
             path: record.path.clone(),
-        },
-        "client_restarted" => ScenarioOperation::ClientRestart,
-        "upload_completed" => ScenarioOperation::ObjectStoreRecovery,
+        }),
+        "client_restarted" => Ok(ScenarioOperation::ClientRestart),
+        "upload_completed" => Ok(ScenarioOperation::ObjectStoreRecovery),
         "metadata_published" | "publish_attempted" | "publish_replayed" => {
-            ScenarioOperation::Fsync {
+            Ok(ScenarioOperation::Fsync {
                 path: trace_path(record),
-            }
+            })
         }
         "foreign_apply_completed" | "foreign_apply_attempted" | "foreign_apply_replayed" => {
-            ScenarioOperation::Wait {
+            Ok(ScenarioOperation::Wait {
                 checkpoint: record.kind.clone(),
-            }
+            })
         }
-        _ => ScenarioOperation::SchedulerCheckpoint {
+        "scheduler_selected" => {
+            let planned_kind = record.path.as_deref().ok_or_else(|| {
+                TraceOperationDecodeError::new(
+                    "missing planned operation kind",
+                    format!("crash replay scenario {scenario} step {}", record.step),
+                )
+            })?;
+            PlannedCrashOp::from_trace_kind(planned_kind).ok_or_else(|| {
+                TraceOperationDecodeError::new(
+                    planned_kind,
+                    format!("crash replay scenario {scenario} step {}", record.step),
+                )
+            })?;
+            Ok(ScenarioOperation::SchedulerCheckpoint {
+                name: record.kind.clone(),
+            })
+        }
+        _ => Ok(ScenarioOperation::SchedulerCheckpoint {
             name: record.kind.clone(),
-        },
+        }),
     }
 }
 
