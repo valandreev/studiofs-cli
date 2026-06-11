@@ -1547,11 +1547,14 @@ fn mounted_payload_readback_distinguishes_missing_path_from_empty_file() {
     let temp = tempdir().unwrap();
     let missing_path = temp.path().join("missing-empty.txt");
 
-    let err = wait_for_mounted_payload_readback(
+    let pool = BoundedMountedIoPool::new(1);
+    let err = wait_for_mounted_payload_readback_with_pool(
+        &pool,
         &missing_path,
         b"",
-        Duration::from_millis(10),
+        Duration::from_secs(1),
         Duration::from_millis(1),
+        Duration::from_secs(1),
     )
     .unwrap_err();
 
@@ -1559,6 +1562,26 @@ fn mounted_payload_readback_distinguishes_missing_path_from_empty_file() {
         matches!(&err, ScenarioError::Io(error) if error.kind() == io::ErrorKind::NotFound),
         "missing path with empty expected payload must not pass readback, got {err:?}"
     );
+}
+
+#[test]
+fn mounted_payload_readback_accepts_existing_empty_file() {
+    let temp = tempdir().unwrap();
+    let empty_path = temp.path().join("empty.txt");
+    std::fs::write(&empty_path, []).unwrap();
+
+    let pool = BoundedMountedIoPool::new(1);
+    let readback = wait_for_mounted_payload_readback_with_pool(
+        &pool,
+        &empty_path,
+        b"",
+        Duration::from_secs(1),
+        Duration::from_millis(1),
+        Duration::from_secs(1),
+    )
+    .unwrap();
+
+    assert!(readback.is_empty());
 }
 
 #[test]

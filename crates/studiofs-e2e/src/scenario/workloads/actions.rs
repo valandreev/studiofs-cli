@@ -132,7 +132,7 @@ impl Drop for BoundedMountedIoPermit {
     }
 }
 
-fn default_bounded_mounted_io_pool() -> &'static BoundedMountedIoPool {
+pub(in crate::scenario) fn default_bounded_mounted_io_pool() -> &'static BoundedMountedIoPool {
     BOUNDED_MOUNTED_IO_POOL
         .get_or_init(|| BoundedMountedIoPool::new(BOUNDED_MOUNTED_IO_MAX_WORKERS))
 }

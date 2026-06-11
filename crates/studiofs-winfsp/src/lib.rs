@@ -24,6 +24,8 @@ const DEFAULT_MAX_DISPATCHER_THREADS: u32 = 16;
 const DEFAULT_ALLOW_OPEN_IN_KERNEL_MODE: bool = true;
 const DEFAULT_FLUSH_AND_PURGE_ON_CLEANUP: bool = false;
 const DEFAULT_PERSISTENT_ACLS: bool = false;
+const WIN32_FALSE: i32 = 0;
+const WIN32_TRUE: i32 = 1;
 const DEFAULT_SECTORS_PER_ALLOCATION_UNIT: u16 =
     (DEFAULT_ALLOCATION_UNIT_SIZE / DEFAULT_SECTOR_SIZE as u32) as u16;
 static WINFSP_RUNTIME_DLL_LOAD: OnceLock<Result<(), String>> = OnceLock::new();
@@ -837,12 +839,11 @@ this usually means Administrator privileges are required, or WinFSP must be conf
         }
     }
 
-    *shutdown_tx().lock() = Some(tx);
-    // SAFETY: The handler function pointer is valid for the process lifetime and the
-    // process state is single-instance during mount, so passing it to WinFSP is valid.
-    unsafe {
-        SetConsoleCtrlHandler(Some(ctrl_handler), 1);
-    }
+    let _shutdown_registration = register_shutdown_sender(mount_point.clone(), tx)?;
+    // SAFETY: The handler function pointer is valid for the process lifetime. The
+    // shutdown registry rejects a second active in-process WinFSP mount before this
+    // handler can target the wrong mount sender.
+    let _console_ctrl_handler = ConsoleCtrlHandlerRegistration::register();
     let _ = rx.recv(); // blocks
 
     tracing::info!("unmounting StudioFS from {mount_point}");
@@ -864,16 +865,113 @@ this usually means Administrator privileges are required, or WinFSP must be conf
     Ok(())
 }
 
-fn shutdown_tx() -> &'static parking_lot::Mutex<Option<std::sync::mpsc::Sender<()>>> {
-    static SHUTDOWN_TX: std::sync::OnceLock<
-        parking_lot::Mutex<Option<std::sync::mpsc::Sender<()>>>,
-    > = std::sync::OnceLock::new();
-    SHUTDOWN_TX.get_or_init(|| parking_lot::Mutex::new(None))
+#[must_use = "if unused, the WinFSP console control handler will be immediately unregistered"]
+struct ConsoleCtrlHandlerRegistration {
+    registered: bool,
+}
+
+impl ConsoleCtrlHandlerRegistration {
+    fn register() -> Self {
+        // SAFETY: `ctrl_handler` has the documented Win32 callback ABI and does
+        // not capture state. Registering it with `TRUE` installs it for the
+        // current process until the matching unregister call in `Drop`.
+        let registered = unsafe { SetConsoleCtrlHandler(Some(ctrl_handler), WIN32_TRUE) != 0 };
+        if !registered {
+            tracing::warn!("failed to register console control handler for WinFSP shutdown");
+        }
+        Self { registered }
+    }
+}
+
+impl Drop for ConsoleCtrlHandlerRegistration {
+    fn drop(&mut self) {
+        if self.registered {
+            // SAFETY: This unregisters the same process-lifetime callback
+            // registered by `ConsoleCtrlHandlerRegistration::register`.
+            let unregistered =
+                unsafe { SetConsoleCtrlHandler(Some(ctrl_handler), WIN32_FALSE) != 0 };
+            if !unregistered {
+                tracing::warn!("failed to unregister console control handler for WinFSP shutdown");
+            }
+        }
+    }
+}
+
+struct ShutdownRegistry {
+    next_id: u64,
+    active: Option<ActiveShutdownSender>,
+}
+
+struct ActiveShutdownSender {
+    id: u64,
+    mount_point: String,
+    sender: std::sync::mpsc::Sender<()>,
+}
+
+#[derive(Debug)]
+struct ShutdownRegistration {
+    id: u64,
+}
+
+impl Drop for ShutdownRegistration {
+    fn drop(&mut self) {
+        let mut registry = shutdown_registry().lock();
+        if registry
+            .active
+            .as_ref()
+            .is_some_and(|active| active.id == self.id)
+        {
+            registry.active = None;
+        }
+    }
+}
+
+fn shutdown_registry() -> &'static parking_lot::Mutex<ShutdownRegistry> {
+    static SHUTDOWN_REGISTRY: parking_lot::Mutex<ShutdownRegistry> =
+        parking_lot::Mutex::new(ShutdownRegistry {
+            next_id: 1,
+            active: None,
+        });
+    &SHUTDOWN_REGISTRY
+}
+
+fn register_shutdown_sender(
+    mount_point: String,
+    sender: std::sync::mpsc::Sender<()>,
+) -> std::io::Result<ShutdownRegistration> {
+    let mut registry = shutdown_registry().lock();
+    if let Some(active) = registry.active.as_ref() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "WinFSP mount '{}' is already registered for process shutdown",
+                active.mount_point
+            ),
+        ));
+    }
+
+    let id = registry.next_id;
+    registry.next_id = registry.next_id.wrapping_add(1).max(1);
+    registry.active = Some(ActiveShutdownSender {
+        id,
+        mount_point,
+        sender,
+    });
+    Ok(ShutdownRegistration { id })
+}
+
+#[cfg(test)]
+fn clear_shutdown_registry_for_test() {
+    shutdown_registry().lock().active = None;
 }
 
 pub(crate) fn request_shutdown() {
-    let guard = shutdown_tx().lock();
-    if let Some(tx) = guard.as_ref() {
+    let tx = shutdown_registry()
+        .lock()
+        .active
+        .as_ref()
+        .map(|active| active.sender.clone());
+    if let Some(tx) = tx {
         let _ = tx.send(());
     }
 }
@@ -891,7 +989,7 @@ unsafe extern "system" {
 // We synchronously record shutdown intent and return `TRUE` to acknowledge handling.
 unsafe extern "system" fn ctrl_handler(_ctrl_type: u32) -> i32 {
     request_shutdown();
-    1 // TRUE — handled
+    WIN32_TRUE
 }
 
 #[cfg(test)]
@@ -901,9 +999,10 @@ mod tests {
         DEFAULT_DIR_INFO_TIMEOUT_MS, DEFAULT_FILE_INFO_TIMEOUT_MS,
         DEFAULT_FLUSH_AND_PURGE_ON_CLEANUP, DEFAULT_PERSISTENT_ACLS, DEFAULT_SECTOR_SIZE,
         DEFAULT_SECTORS_PER_ALLOCATION_UNIT, DEFAULT_VOLUME_INFO_TIMEOUT_MS, MountOptionError,
-        WinfspShutdownHost, canonical_drive_mount_point, default_dispatcher_threads,
-        is_drive_root_mount_point, mount_manager_mount_point, parse_mount_options,
-        remove_test_mount_option_env, set_test_mount_option_env, stop_host_before_vfs_shutdown,
+        WinfspShutdownHost, canonical_drive_mount_point, clear_shutdown_registry_for_test,
+        default_dispatcher_threads, is_drive_root_mount_point, mount_manager_mount_point,
+        parse_mount_options, register_shutdown_sender, remove_test_mount_option_env,
+        request_shutdown, set_test_mount_option_env, stop_host_before_vfs_shutdown,
         stop_host_before_vfs_shutdown_and_process_exit, winfsp_dll_stem_for_arch,
     };
     #[test]
@@ -1131,6 +1230,25 @@ mod tests {
         }
     }
 
+    struct ShutdownRegistryTestGuard {
+        _guard: parking_lot::MutexGuard<'static, ()>,
+    }
+
+    impl ShutdownRegistryTestGuard {
+        fn new() -> Self {
+            static TEST_MUTEX: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+            let guard = TEST_MUTEX.lock();
+            clear_shutdown_registry_for_test();
+            Self { _guard: guard }
+        }
+    }
+
+    impl Drop for ShutdownRegistryTestGuard {
+        fn drop(&mut self) {
+            clear_shutdown_registry_for_test();
+        }
+    }
+
     #[test]
     fn graceful_shutdown_stops_winfsp_host_before_vfs_shutdown() {
         let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
@@ -1171,6 +1289,51 @@ mod tests {
             ["host.stop", "vfs.shutdown", "host.drop"],
             "the foreground mount process must release the WinFSP host context after VFS shutdown"
         );
+    }
+
+    #[test]
+    fn shutdown_registration_rejects_second_active_mount_without_replacing_sender() {
+        let _guard = ShutdownRegistryTestGuard::new();
+        let (first_tx, first_rx) = std::sync::mpsc::channel();
+        let (second_tx, second_rx) = std::sync::mpsc::channel();
+        let first_registration =
+            register_shutdown_sender("Z:".to_string(), first_tx).expect("first mount registers");
+
+        let err = register_shutdown_sender("Y:".to_string(), second_tx)
+            .expect_err("second active mount must be rejected");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        request_shutdown();
+        assert_eq!(
+            first_rx.recv_timeout(std::time::Duration::from_millis(50)),
+            Ok(())
+        );
+        assert!(second_rx.try_recv().is_err());
+        drop(first_registration);
+    }
+
+    #[test]
+    fn shutdown_registration_cleanup_only_removes_its_own_sender() {
+        let _guard = ShutdownRegistryTestGuard::new();
+        let (first_tx, first_rx) = std::sync::mpsc::channel();
+        let first_registration =
+            register_shutdown_sender("Z:".to_string(), first_tx).expect("first mount registers");
+        drop(first_registration);
+        assert_eq!(
+            first_rx.recv_timeout(std::time::Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+        );
+
+        let (second_tx, second_rx) = std::sync::mpsc::channel();
+        let second_registration =
+            register_shutdown_sender("Y:".to_string(), second_tx).expect("slot cleaned up");
+
+        request_shutdown();
+        assert_eq!(
+            second_rx.recv_timeout(std::time::Duration::from_millis(50)),
+            Ok(())
+        );
+        drop(second_registration);
     }
 
     #[test]
