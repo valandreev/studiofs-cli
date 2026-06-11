@@ -484,9 +484,6 @@ impl StudioVfs {
         } else {
             None
         };
-        if next_task.is_none() {
-            entry.finish();
-        }
         let Some((next_entry, next_guard)) = next_task else {
             return;
         };
@@ -707,8 +704,8 @@ impl StudioVfs {
         let vfs = Arc::clone(self);
         let (barrier, guard) = self.register_deferred_release_barrier(ino);
         self.track_background_task(runtime.spawn(async move {
-            let _barrier = barrier;
             let _guard = guard;
+            let _barrier = barrier;
             tokio::time::sleep(Duration::from_millis(1)).await;
             let session = vfs
                 .state

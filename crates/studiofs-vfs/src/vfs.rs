@@ -2653,16 +2653,16 @@ impl DeferredInodeGate {
         &self,
         current_entry: &DeferredInodeGateEntry,
     ) -> Option<(DeferredInodeGateEntry, tokio::sync::OwnedMutexGuard<()>)> {
-        let task_lock = Arc::new(tokio::sync::Mutex::new(()));
-        let guard = task_lock
-            .clone()
-            .try_lock_owned()
-            .expect("new deferred inode gate lock should be uncontended");
         let mut entries = self.entries.lock();
         if entries
             .get(&current_entry.ino)
             .is_some_and(|current| Arc::ptr_eq(current, &current_entry.task_lock))
         {
+            let task_lock = Arc::new(tokio::sync::Mutex::new(()));
+            let guard = task_lock
+                .clone()
+                .try_lock_owned()
+                .expect("new deferred inode gate lock should be uncontended");
             entries.insert(current_entry.ino, Arc::clone(&task_lock));
             return Some((
                 DeferredInodeGateEntry::new(self.clone(), current_entry.ino, task_lock),
@@ -2699,6 +2699,12 @@ impl DeferredInodeGateEntry {
     }
 
     fn finish(&self) {
+        self.gate.finish(self.ino, &self.task_lock);
+    }
+}
+
+impl Drop for DeferredInodeGateEntry {
+    fn drop(&mut self) {
         self.gate.finish(self.ino, &self.task_lock);
     }
 }
