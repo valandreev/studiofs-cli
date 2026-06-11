@@ -2602,32 +2602,40 @@ struct DeferredInodeGate {
 }
 
 impl DeferredInodeGate {
+    fn create_task_lock() -> (
+        Arc<tokio::sync::Mutex<()>>,
+        tokio::sync::OwnedMutexGuard<()>,
+    ) {
+        let task_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let guard = task_lock
+            .clone()
+            .try_lock_owned()
+            .expect("new deferred inode gate lock should be uncontended");
+        (task_lock, guard)
+    }
+
     fn try_register(
         &self,
         ino: Ino,
     ) -> Option<(DeferredInodeGateEntry, tokio::sync::OwnedMutexGuard<()>)> {
+        use std::collections::hash_map::Entry;
+
         let mut entries = self.entries.lock();
-        if entries.contains_key(&ino) {
-            return None;
+        match entries.entry(ino) {
+            Entry::Occupied(_) => None,
+            Entry::Vacant(entry) => {
+                let (task_lock, guard) = Self::create_task_lock();
+                entry.insert(Arc::clone(&task_lock));
+                Some((
+                    DeferredInodeGateEntry::new(self.clone(), ino, task_lock),
+                    guard,
+                ))
+            }
         }
-        let task_lock = Arc::new(tokio::sync::Mutex::new(()));
-        let guard = task_lock
-            .clone()
-            .try_lock_owned()
-            .expect("new deferred inode gate lock should be uncontended");
-        entries.insert(ino, Arc::clone(&task_lock));
-        Some((
-            DeferredInodeGateEntry::new(self.clone(), ino, task_lock),
-            guard,
-        ))
     }
 
     fn replace(&self, ino: Ino) -> (DeferredInodeGateEntry, tokio::sync::OwnedMutexGuard<()>) {
-        let task_lock = Arc::new(tokio::sync::Mutex::new(()));
-        let guard = task_lock
-            .clone()
-            .try_lock_owned()
-            .expect("new deferred inode gate lock should be uncontended");
+        let (task_lock, guard) = Self::create_task_lock();
         self.entries.lock().insert(ino, Arc::clone(&task_lock));
         (
             DeferredInodeGateEntry::new(self.clone(), ino, task_lock),
@@ -2653,32 +2661,30 @@ impl DeferredInodeGate {
         &self,
         current_entry: &DeferredInodeGateEntry,
     ) -> Option<(DeferredInodeGateEntry, tokio::sync::OwnedMutexGuard<()>)> {
+        use std::collections::hash_map::Entry;
+
         let mut entries = self.entries.lock();
-        if entries
-            .get(&current_entry.ino)
-            .is_some_and(|current| Arc::ptr_eq(current, &current_entry.task_lock))
-        {
-            let task_lock = Arc::new(tokio::sync::Mutex::new(()));
-            let guard = task_lock
-                .clone()
-                .try_lock_owned()
-                .expect("new deferred inode gate lock should be uncontended");
-            entries.insert(current_entry.ino, Arc::clone(&task_lock));
-            return Some((
-                DeferredInodeGateEntry::new(self.clone(), current_entry.ino, task_lock),
-                guard,
-            ));
+        match entries.entry(current_entry.ino) {
+            Entry::Occupied(mut entry) if Arc::ptr_eq(entry.get(), &current_entry.task_lock) => {
+                let (task_lock, guard) = Self::create_task_lock();
+                entry.insert(Arc::clone(&task_lock));
+                Some((
+                    DeferredInodeGateEntry::new(self.clone(), current_entry.ino, task_lock),
+                    guard,
+                ))
+            }
+            _ => None,
         }
-        None
     }
 
     fn finish(&self, ino: Ino, task_lock: &Arc<tokio::sync::Mutex<()>>) {
+        use std::collections::hash_map::Entry;
+
         let mut entries = self.entries.lock();
-        if entries
-            .get(&ino)
-            .is_some_and(|current| Arc::ptr_eq(current, task_lock))
+        if let Entry::Occupied(entry) = entries.entry(ino)
+            && Arc::ptr_eq(entry.get(), task_lock)
         {
-            entries.remove(&ino);
+            entry.remove();
         }
     }
 }
@@ -2696,10 +2702,6 @@ impl DeferredInodeGateEntry {
             ino,
             task_lock,
         }
-    }
-
-    fn finish(&self) {
-        self.gate.finish(self.ino, &self.task_lock);
     }
 }
 

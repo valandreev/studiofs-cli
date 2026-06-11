@@ -17,23 +17,6 @@ use studiofs_meta::types::block_index_from_offset;
 
 const MAX_FLUSH_QUIESCE_PASSES: usize = 8;
 
-pub(super) struct DeferredReleaseBarrier {
-    vfs: Arc<StudioVfs>,
-    entry: DeferredInodeGateEntry,
-}
-
-impl DeferredReleaseBarrier {
-    fn new(vfs: Arc<StudioVfs>, entry: DeferredInodeGateEntry) -> Self {
-        Self { vfs, entry }
-    }
-}
-
-impl Drop for DeferredReleaseBarrier {
-    fn drop(&mut self) {
-        self.vfs.finish_deferred_release_barrier(&self.entry);
-    }
-}
-
 impl StudioVfs {
     /// Spawn a background task that replays landing-zone segments left from a previous run.
     ///
@@ -153,9 +136,9 @@ impl StudioVfs {
     }
 
     pub(super) fn register_deferred_release_barrier(
-        self: &Arc<Self>,
+        &self,
         ino: Ino,
-    ) -> (DeferredReleaseBarrier, tokio::sync::OwnedMutexGuard<()>) {
+    ) -> (DeferredInodeGateEntry, tokio::sync::OwnedMutexGuard<()>) {
         let replaced = self.state.deferred_release_inflight.contains(ino);
         let (entry, guard) = self.state.deferred_release_inflight.replace(ino);
         if replaced {
@@ -164,11 +147,7 @@ impl StudioVfs {
                 "replaced in-flight deferred last-handle release barrier"
             );
         }
-        (DeferredReleaseBarrier::new(Arc::clone(self), entry), guard)
-    }
-
-    fn finish_deferred_release_barrier(&self, entry: &DeferredInodeGateEntry) {
-        entry.finish();
+        (entry, guard)
     }
 
     fn observe_sustained_write_admission(
@@ -704,6 +683,8 @@ impl StudioVfs {
         let vfs = Arc::clone(self);
         let (barrier, guard) = self.register_deferred_release_barrier(ino);
         self.track_background_task(runtime.spawn(async move {
+            // Drop the registry entry before releasing the async guard so waiters cannot
+            // wake up and observe an unlocked but still-registered barrier.
             let _guard = guard;
             let _barrier = barrier;
             tokio::time::sleep(Duration::from_millis(1)).await;

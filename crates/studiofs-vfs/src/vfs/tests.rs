@@ -5177,7 +5177,7 @@ fn epoch_finalizer_defers_while_deferred_materialization_is_inflight() {
             "finalize must not race ahead of an in-flight deferred materialization task"
         );
 
-        entry.finish();
+        drop(entry);
 
         let status = super::commit::CommitCoordinator::finalize_inode_epoch(
             &vfs,
@@ -7076,7 +7076,7 @@ fn opportunistic_deferred_write_rechecks_hard_pressure_without_inline_fallback()
             .await
             .expect("queued write task should not panic")
             .expect("queued write should stay deferred and complete");
-        entry.finish();
+        drop(entry);
 
         let snapshot = vfs.write_path_observability_snapshot();
         assert_eq!(
@@ -7151,7 +7151,7 @@ fn opportunistic_sustained_pre_drain_schedules_without_inline_materialization() 
             "sustained pre-drain must not materialize buffered data inline on the foreground write"
         );
 
-        entry.finish();
+        drop(entry);
         vfs.release_fh(fh).await.unwrap();
     });
 }
@@ -7210,7 +7210,7 @@ fn deferred_write_keeps_writeback_path_when_soft_dirty_budget_is_full() {
         )
         .await
         .expect("soft dirty budget should not force a synchronous writeback fallback");
-        entry.finish();
+        drop(entry);
 
         let snapshot = vfs.write_path_observability_snapshot();
         assert_eq!(
@@ -8799,7 +8799,7 @@ fn test_flush_fh_clean_skip_waits_for_deferred_release_but_not_file_session_gate
             "clean handle flush must still wait for an in-flight deferred release barrier"
         );
 
-        entry.finish();
+        drop(entry);
         drop(guard);
         let outcome = tokio::time::timeout(Duration::from_millis(100), flush)
             .await
@@ -10898,7 +10898,7 @@ fn deferred_inode_gate_waiter_does_not_hold_registry_lock_while_awaiting() {
             "waiter must not hold the synchronous registry lock while awaiting the per-inode guard"
         );
 
-        entry.finish();
+        drop(entry);
         drop(guard);
         wait.await.expect("wait task should not panic");
     });
@@ -10913,14 +10913,14 @@ fn deferred_inode_gate_cleanup_only_removes_current_entry() {
         .expect("first registration should own the inode gate");
     let (newer_entry, newer_guard) = gate.replace(ino);
 
-    older_entry.finish();
+    drop(older_entry);
     assert!(
         gate.contains(ino),
         "finishing a replaced entry must not remove the current inode gate"
     );
 
     drop(newer_guard);
-    newer_entry.finish();
+    drop(newer_entry);
     assert!(
         !gate.contains(ino),
         "finishing the current entry should remove the inode gate"
@@ -10978,7 +10978,7 @@ fn strict_deferred_write_waits_for_inflight_materialization() {
             "strict writes must wait until earlier deferred materialization leaves the inflight slot"
         );
 
-        entry.finish();
+        drop(entry);
         drop(guard);
         strict_write
             .await
@@ -11019,7 +11019,7 @@ fn explicit_winfsp_flush_waits_for_deferred_last_handle_release_barrier() {
             "explicit WinFSP flush must wait for an in-flight deferred last-handle release barrier before reporting sync success"
         );
 
-        entry.finish();
+        drop(entry);
         drop(guard);
         flush
             .await
@@ -11163,7 +11163,7 @@ fn deferred_materialization_wait_tracks_rescheduled_marker() {
             "strict barriers must continue waiting when materialization reschedules another task"
         );
 
-        newer_entry.finish();
+        drop(newer_entry);
         drop(newer_guard);
         wait.await.expect("wait task should not panic");
     });
