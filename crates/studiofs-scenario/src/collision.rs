@@ -1,6 +1,7 @@
 //! Seeded namespace and file-version collision scenario suite.
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 use crate::client::SimulatedRuntime;
 use crate::invariant::{InvariantViolation, LogicalSnapshot, validate_logical_invariants};
@@ -138,6 +139,33 @@ pub struct CollisionTraceRecord {
     pub checksum_sha256: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("unknown deterministic trace operation {kind} while decoding {context}")]
+/// Error returned when a deterministic collision trace contains an unknown operation.
+pub struct TraceOperationDecodeError {
+    kind: String,
+    context: String,
+}
+
+impl TraceOperationDecodeError {
+    fn new(kind: impl Into<String>, context: impl Into<String>) -> Self {
+        Self {
+            kind: kind.into(),
+            context: context.into(),
+        }
+    }
+
+    /// Unknown trace operation kind.
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    /// Human-readable replay context for the malformed operation.
+    pub fn context(&self) -> &str {
+        &self.context
+    }
+}
+
 /// Function $name.
 pub fn run_collision_suite(config: CollisionSuiteConfig) -> CollisionSuiteReport {
     let mut family_reports = Vec::new();
@@ -203,7 +231,8 @@ impl FamilyHarness {
     fn finish(mut self) -> FamilyRun {
         let final_snapshot = self.runtime.logical_snapshot();
         let scheduler_trace = self.scheduler.trace().to_vec();
-        let operation_log = operation_log_from_trace(&self.scenario, &self.trace);
+        let operation_log = operation_log_from_trace(&self.scenario, &self.trace)
+            .expect("collision harness emits decodable operation trace");
         let failure = if self.family == CollisionFamily::InjectedInvariantFailure {
             Some(CollisionFailure {
                 scenario: self.scenario.clone(),
@@ -264,7 +293,8 @@ impl FamilyHarness {
             message: violation.message,
             trace: self.trace.clone(),
             scheduler_trace: self.scheduler.trace().to_vec(),
-            operation_log: operation_log_from_trace(&self.scenario, &self.trace),
+            operation_log: operation_log_from_trace(&self.scenario, &self.trace)
+                .expect("collision harness emits decodable operation trace"),
             final_snapshot: snapshot,
         }))
     }
@@ -392,7 +422,8 @@ impl FamilyHarness {
                     .description
                     .as_deref()
                     .expect("collision event must have a trace description"),
-            );
+            )
+            .expect("scheduled collision operation uses known trace kind");
             self.apply_planned(operation);
             selected.push(operation);
         }
@@ -577,39 +608,45 @@ impl FamilyHarness {
 fn operation_log_from_trace(
     scenario: &str,
     trace: &[CollisionTraceRecord],
-) -> Vec<ScenarioOperationRecord> {
+) -> Result<Vec<ScenarioOperationRecord>, TraceOperationDecodeError> {
     trace
         .iter()
         .map(|record| {
-            let mut operation =
-                ScenarioOperationRecord::new(scenario, record.step, operation_from_trace(record))
-                    .with_outcome(OperationOutcome::Observed);
+            let mut operation = ScenarioOperationRecord::new(
+                scenario,
+                record.step,
+                operation_from_trace(scenario, record)?,
+            )
+            .with_outcome(OperationOutcome::Observed);
             if let Some(client) = &record.client {
                 operation = operation.with_client(client.clone());
             }
             if let Some(path) = &record.path {
                 operation = operation.with_metadata("path", path.clone());
             }
-            operation
+            Ok(operation)
         })
         .collect()
 }
 
-fn operation_from_trace(record: &CollisionTraceRecord) -> ScenarioOperation {
+fn operation_from_trace(
+    scenario: &str,
+    record: &CollisionTraceRecord,
+) -> Result<ScenarioOperation, TraceOperationDecodeError> {
     match record.kind.as_str() {
-        "create_file" => ScenarioOperation::CreateFile {
+        "create_file" => Ok(ScenarioOperation::CreateFile {
             path: trace_path(record),
             bytes: None,
-        },
-        "create_dir" => ScenarioOperation::CreateDirectory {
+        }),
+        "create_dir" => Ok(ScenarioOperation::CreateDirectory {
             path: trace_path(record),
-        },
+        }),
         "alpha_rename"
         | "alpha_rename_rejected"
         | "beta_rename"
         | "beta_rename_rejected"
         | "beta_local_rename"
-        | "beta_local_rename_rejected" => ScenarioOperation::Rename {
+        | "beta_local_rename_rejected" => Ok(ScenarioOperation::Rename {
             from: record
                 .source_path
                 .clone()
@@ -618,23 +655,35 @@ fn operation_from_trace(record: &CollisionTraceRecord) -> ScenarioOperation {
                 .target_path
                 .clone()
                 .unwrap_or_else(|| trace_path(record)),
-        },
+        }),
         "alpha_unlink" | "alpha_unlink_rejected" | "beta_unlink" | "beta_unlink_rejected" => {
-            ScenarioOperation::Unlink {
+            Ok(ScenarioOperation::Unlink {
                 path: trace_path(record),
-            }
+            })
         }
-        "beta_append" | "beta_append_rejected" => ScenarioOperation::Append {
+        "beta_append" | "beta_append_rejected" => Ok(ScenarioOperation::Append {
             path: trace_path(record),
             bytes: record.bytes.unwrap_or_default(),
             checksum_sha256: record.checksum_sha256.clone(),
-        },
-        "publish_to_peer" | "published_to_peer" => ScenarioOperation::Fsync {
+        }),
+        "publish_to_peer" | "published_to_peer" => Ok(ScenarioOperation::Fsync {
             path: trace_path(record),
-        },
-        _ => ScenarioOperation::SchedulerCheckpoint {
+        }),
+        "scheduler_selected" => {
+            let planned_kind = trace_path(record);
+            PlannedCollisionOp::from_trace_kind(&planned_kind).map_err(|_| {
+                TraceOperationDecodeError::new(
+                    planned_kind,
+                    format!("collision replay scenario {scenario} step {}", record.step),
+                )
+            })?;
+            Ok(ScenarioOperation::SchedulerCheckpoint {
+                name: record.kind.clone(),
+            })
+        }
+        _ => Ok(ScenarioOperation::SchedulerCheckpoint {
             name: record.kind.clone(),
-        },
+        }),
     }
 }
 
@@ -713,23 +762,26 @@ impl PlannedCollisionOp {
         }
     }
 
-    fn from_trace_kind(kind: &str) -> Self {
+    fn from_trace_kind(kind: &str) -> Result<Self, TraceOperationDecodeError> {
         match kind {
-            "alpha_rename_to_alpha_win" => Self::AlphaRenameToAlphaWin,
-            "beta_rename_to_beta_win" => Self::BetaRenameToBetaWin,
-            "alpha_rename_to_kept" => Self::AlphaRenameToKept,
-            "alpha_unlink" => Self::AlphaUnlink,
-            "beta_unlink" => Self::BetaUnlink,
-            "beta_append" => Self::BetaAppend,
-            "alpha_overwrite" => Self::AlphaOverwrite,
-            "beta_stale_read" => Self::BetaStaleRead,
-            "alpha_rmdir" => Self::AlphaRmdir,
-            "beta_create_inside" => Self::BetaCreateInside,
-            "alpha_publish_metadata" => Self::AlphaPublishMetadata,
-            "beta_local_rename" => Self::BetaLocalRename,
-            "alpha_publish_v2" => Self::AlphaPublishV2,
-            "beta_foreign_apply" => Self::BetaForeignApply,
-            _ => panic!("unknown planned collision operation {kind}"),
+            "alpha_rename_to_alpha_win" => Ok(Self::AlphaRenameToAlphaWin),
+            "beta_rename_to_beta_win" => Ok(Self::BetaRenameToBetaWin),
+            "alpha_rename_to_kept" => Ok(Self::AlphaRenameToKept),
+            "alpha_unlink" => Ok(Self::AlphaUnlink),
+            "beta_unlink" => Ok(Self::BetaUnlink),
+            "beta_append" => Ok(Self::BetaAppend),
+            "alpha_overwrite" => Ok(Self::AlphaOverwrite),
+            "beta_stale_read" => Ok(Self::BetaStaleRead),
+            "alpha_rmdir" => Ok(Self::AlphaRmdir),
+            "beta_create_inside" => Ok(Self::BetaCreateInside),
+            "alpha_publish_metadata" => Ok(Self::AlphaPublishMetadata),
+            "beta_local_rename" => Ok(Self::BetaLocalRename),
+            "alpha_publish_v2" => Ok(Self::AlphaPublishV2),
+            "beta_foreign_apply" => Ok(Self::BetaForeignApply),
+            _ => Err(TraceOperationDecodeError::new(
+                kind,
+                "collision replay planned operation",
+            )),
         }
     }
 }
@@ -968,32 +1020,38 @@ mod tests {
     #[test]
     fn operation_from_trace_maps_actual_collision_trace_kinds() {
         assert_eq!(
-            operation_from_trace(&trace_record_with_paths(
-                "alpha_rename",
-                "alpha",
-                "alpha_win.txt",
-                "shared.txt",
-                "alpha_win.txt",
-            )),
+            operation_from_trace(
+                "sfs501-collision-test",
+                &trace_record_with_paths(
+                    "alpha_rename",
+                    "alpha",
+                    "alpha_win.txt",
+                    "shared.txt",
+                    "alpha_win.txt",
+                ),
+            )
+            .expect("known trace operation decodes"),
             ScenarioOperation::Rename {
                 from: "shared.txt".to_string(),
                 to: "alpha_win.txt".to_string(),
             }
         );
         assert_eq!(
-            operation_from_trace(&trace_record("beta_unlink_rejected", "beta", "shared.txt")),
+            operation_from_trace(
+                "sfs501-collision-test",
+                &trace_record("beta_unlink_rejected", "beta", "shared.txt"),
+            )
+            .expect("known trace operation decodes"),
             ScenarioOperation::Unlink {
                 path: "shared.txt".to_string(),
             }
         );
         assert_eq!(
-            operation_from_trace(&append_trace_record(
-                "beta_append",
-                "beta",
-                "shared.txt",
-                1,
-                "checksum-appended",
-            )),
+            operation_from_trace(
+                "sfs501-collision-test",
+                &append_trace_record("beta_append", "beta", "shared.txt", 1, "checksum-appended",),
+            )
+            .expect("known trace operation decodes"),
             ScenarioOperation::Append {
                 path: "shared.txt".to_string(),
                 bytes: 1,
@@ -1005,15 +1063,32 @@ mod tests {
     #[test]
     fn operation_from_trace_keeps_scheduler_events_as_checkpoints() {
         assert_eq!(
-            operation_from_trace(&trace_record(
-                "scheduler_selected",
-                "alpha",
-                "alpha_rename_to_alpha_win",
-            )),
+            operation_from_trace(
+                "sfs501-collision-test",
+                &trace_record("scheduler_selected", "alpha", "alpha_rename_to_alpha_win"),
+            )
+            .expect("known scheduler operation decodes"),
             ScenarioOperation::SchedulerCheckpoint {
                 name: "scheduler_selected".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn operation_log_from_trace_rejects_unknown_planned_collision_operations() {
+        let error = operation_log_from_trace(
+            "sfs501-collision-decode",
+            &[trace_record(
+                "scheduler_selected",
+                "alpha",
+                "future_collision_operation",
+            )],
+        )
+        .expect_err("unknown planned operation returns a scenario error");
+
+        assert_eq!(error.kind(), "future_collision_operation");
+        assert!(error.context().contains("sfs501-collision-decode"));
+        assert!(error.context().contains("step 1"));
     }
 
     fn trace_record(kind: &str, client: &str, path: &str) -> CollisionTraceRecord {
