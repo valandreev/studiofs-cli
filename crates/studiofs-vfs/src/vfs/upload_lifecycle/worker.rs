@@ -683,8 +683,9 @@ where
                 }
                 UploadPutOutcome::Failed(error) => return Err(error),
             }
+            let post_put_cancel_token = self.shutdown.shutdown_token();
             match self
-                .wait_for_uploaded_fragments_visible(op, &fragment_keys, upload_cancel_token)
+                .wait_for_uploaded_fragments_visible(op, &fragment_keys, &post_put_cancel_token)
                 .await
             {
                 RemoteVisibility::Visible => {}
@@ -719,9 +720,8 @@ where
             debug!(
                 object_id = op.object_id,
                 ino = op.ino,
-                "process_upload canceled: upload token canceled after remote put"
+                "process_upload continuing metadata reconciliation after post-PUT upload token cancellation"
             );
-            return Ok(SingleUploadOutcome::Shutdown);
         }
 
         let timestamp = SystemTime::now()
@@ -3003,7 +3003,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_upload_honors_supersede_cancel_after_remote_put_before_stale_cleanup() {
+    async fn process_upload_reconciles_supersede_cancel_after_remote_put() {
         let (processor, coordinator, local_payloads, meta, remote, shutdown, policy) =
             processor_fixture();
         let op = make_pending_upload();
@@ -3024,15 +3024,22 @@ mod tests {
             .await
             .expect("process upload");
 
-        assert_eq!(outcome, SingleUploadOutcome::Shutdown);
+        assert_eq!(outcome, SingleUploadOutcome::Completed);
         assert!(upload_cancel_token.is_cancelled());
-        assert!(coordinator.completed.lock().is_empty());
-        assert!(meta.uploaded_overlay_objects.lock().is_empty());
+        assert_eq!(coordinator.completed.lock().as_slice(), &[op.object_id]);
+        assert_eq!(
+            meta.uploaded_overlay_objects.lock().as_slice(),
+            &[(op.ino, op.content_epoch, op.object_id)],
+            "post-PUT supersede cancellation must still persist uploaded metadata"
+        );
         assert!(meta.pending_deletions.lock().is_empty());
-        assert!(local_payloads.uploaded.lock().is_empty());
+        assert_eq!(local_payloads.uploaded.lock().as_slice(), &[op.object_id]);
         assert!(local_payloads.removed.lock().is_empty());
         assert_eq!(shutdown.canceled_stale.load(Ordering::Relaxed), 0);
-        assert!(policy.finalized_upload_epochs.lock().is_empty());
+        assert_eq!(
+            policy.finalized_upload_epochs.lock().as_slice(),
+            &[(op.ino, op.content_epoch)]
+        );
     }
 
     #[tokio::test]
