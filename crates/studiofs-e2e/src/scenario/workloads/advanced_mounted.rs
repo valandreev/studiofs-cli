@@ -1811,7 +1811,25 @@ pub(in crate::scenario) fn wait_for_mounted_payload_readback(
             format!("readback {}", path.display()),
             probe_timeout,
         ) {
-            Ok(readback) if readback == payload => return Ok(readback),
+            Ok(readback) if readback == payload && !payload.is_empty() => return Ok(readback),
+            Ok(readback) if readback == payload => {
+                match bounded_mounted_metadata(
+                    path.to_path_buf(),
+                    format!("readback metadata {}", path.display()),
+                    probe_timeout,
+                ) {
+                    Ok(metadata) if metadata.is_file() => return Ok(readback),
+                    Ok(readback_metadata) => {
+                        return Err(ScenarioError::Io(io::Error::other(format!(
+                            "mounted payload readback expected file at {}, got metadata {:?}",
+                            path.display(),
+                            readback_metadata.file_type()
+                        ))));
+                    }
+                    Err(ScenarioError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
             Ok(readback) => last_readback = Some(readback),
             Err(ScenarioError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),

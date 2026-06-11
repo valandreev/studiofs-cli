@@ -1562,6 +1562,23 @@ fn mounted_payload_readback_distinguishes_missing_path_from_empty_file() {
 }
 
 #[test]
+fn mounted_payload_readback_accepts_existing_empty_file() {
+    let temp = tempdir().unwrap();
+    let empty_path = temp.path().join("empty.txt");
+    std::fs::write(&empty_path, []).unwrap();
+
+    let readback = wait_for_mounted_payload_readback(
+        &empty_path,
+        b"",
+        Duration::from_millis(10),
+        Duration::from_millis(1),
+    )
+    .unwrap();
+
+    assert!(readback.is_empty());
+}
+
+#[test]
 fn mounted_payload_readback_does_not_start_zero_millisecond_probe() {
     assert_eq!(
         mounted_payload_readback_probe_timeout(Duration::from_micros(500)),
