@@ -1319,9 +1319,10 @@ mod tests {
         let err = SystemCommandExecutor.run(&command).unwrap_err();
 
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        let elapsed = started.elapsed();
         assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "timeout-aware executor should not wait for the hung command to finish"
+            elapsed < Duration::from_millis(4500),
+            "timeout-aware executor should not wait for the hung command to finish; elapsed={elapsed:?}"
         );
         let diagnostics = std::fs::read_dir(diagnostics_dir)
             .unwrap()

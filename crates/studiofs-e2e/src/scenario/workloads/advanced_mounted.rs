@@ -1794,29 +1794,68 @@ pub(in crate::scenario) fn wait_for_mounted_payload_readback(
     timeout: Duration,
     poll_interval: Duration,
 ) -> Result<Vec<u8>, ScenarioError> {
+    wait_for_mounted_payload_readback_with_pool(
+        default_bounded_mounted_io_pool(),
+        path,
+        payload,
+        timeout,
+        poll_interval,
+        MOUNTED_WRITE_READBACK_TIMEOUT,
+    )
+}
+
+pub(in crate::scenario) fn wait_for_mounted_payload_readback_with_pool(
+    pool: &BoundedMountedIoPool,
+    path: &Path,
+    payload: &[u8],
+    timeout: Duration,
+    poll_interval: Duration,
+    max_probe_timeout: Duration,
+) -> Result<Vec<u8>, ScenarioError> {
     let deadline = Instant::now() + timeout;
     let mut last_readback = None;
+    let mut last_not_found = None;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let Some(probe_timeout) = mounted_payload_readback_probe_timeout(remaining) else {
-            return last_readback.ok_or_else(|| {
-                ScenarioError::Io(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("mounted payload readback did not find {}", path.display()),
-                ))
-            });
+        if remaining <= poll_interval {
+            if let Some(readback) = last_readback {
+                return Ok(readback);
+            }
+            if let Some(error) = last_not_found {
+                return Err(ScenarioError::Io(error));
+            }
+            return Err(ScenarioError::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("mounted payload readback did not find {}", path.display()),
+            )));
+        }
+        let Some(probe_timeout) =
+            mounted_payload_readback_probe_timeout_with_max(remaining, max_probe_timeout)
+        else {
+            if let Some(readback) = last_readback {
+                return Ok(readback);
+            }
+            if let Some(error) = last_not_found {
+                return Err(ScenarioError::Io(error));
+            }
+            return Err(ScenarioError::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("mounted payload readback did not find {}", path.display()),
+            )));
         };
-        match bounded_mounted_read(
-            path.to_path_buf(),
-            format!("readback {}", path.display()),
-            probe_timeout,
-        ) {
+        match pool.run(format!("readback {}", path.display()), probe_timeout, {
+            let path = path.to_path_buf();
+            move || fs::read(path)
+        }) {
             Ok(readback) if readback == payload && !payload.is_empty() => return Ok(readback),
             Ok(readback) if readback == payload => {
-                match bounded_mounted_metadata(
-                    path.to_path_buf(),
+                match pool.run(
                     format!("readback metadata {}", path.display()),
                     probe_timeout,
+                    {
+                        let path = path.to_path_buf();
+                        move || fs::metadata(path)
+                    },
                 ) {
                     Ok(metadata) if metadata.is_file() => return Ok(readback),
                     Ok(readback_metadata) => {
@@ -1831,28 +1870,42 @@ pub(in crate::scenario) fn wait_for_mounted_payload_readback(
                 }
             }
             Ok(readback) => last_readback = Some(readback),
-            Err(ScenarioError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(ScenarioError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                last_not_found = Some(error);
+            }
             Err(error) => return Err(error),
         }
         if Instant::now() >= deadline {
-            return last_readback.ok_or_else(|| {
-                ScenarioError::Io(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("mounted payload readback did not find {}", path.display()),
-                ))
-            });
+            if let Some(readback) = last_readback {
+                return Ok(readback);
+            }
+            if let Some(error) = last_not_found {
+                return Err(ScenarioError::Io(error));
+            }
+            return Err(ScenarioError::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("mounted payload readback did not find {}", path.display()),
+            )));
         }
         thread::sleep(poll_interval.max(Duration::from_millis(1)));
     }
 }
 
+#[cfg(test)]
 pub(in crate::scenario) fn mounted_payload_readback_probe_timeout(
     remaining: Duration,
+) -> Option<Duration> {
+    mounted_payload_readback_probe_timeout_with_max(remaining, MOUNTED_WRITE_READBACK_TIMEOUT)
+}
+
+fn mounted_payload_readback_probe_timeout_with_max(
+    remaining: Duration,
+    max_probe_timeout: Duration,
 ) -> Option<Duration> {
     if remaining < Duration::from_millis(1) {
         return None;
     }
-    Some(remaining.min(MOUNTED_WRITE_READBACK_TIMEOUT))
+    Some(remaining.min(max_probe_timeout))
 }
 
 pub(in crate::scenario) fn mounted_write_barrier_open_options() -> OpenOptions {
