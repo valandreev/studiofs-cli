@@ -1867,6 +1867,26 @@ mod tests {
     }
 
     #[cfg(windows)]
+    struct WindowsTestMountClaim {
+        mount_point: String,
+    }
+
+    #[cfg(windows)]
+    impl Drop for WindowsTestMountClaim {
+        fn drop(&mut self) {
+            if let Ok(mut claims) = windows_test_mount_claims().lock() {
+                claims.remove(&self.mount_point);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    std::thread_local! {
+        static WINDOWS_TEST_MOUNT_CLAIMS: std::cell::RefCell<Vec<WindowsTestMountClaim>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    #[cfg(windows)]
     fn windows_test_mount_point_is_available(mount_point: &str) -> bool {
         let drive_root = format!("{mount_point}\\");
         if Path::new(&drive_root).exists() {
@@ -1889,10 +1909,25 @@ mod tests {
             }
             if windows_test_mount_point_is_available(&mount_point) {
                 claims.insert(mount_point.clone());
+                WINDOWS_TEST_MOUNT_CLAIMS.with(|claims| {
+                    claims.borrow_mut().push(WindowsTestMountClaim {
+                        mount_point: mount_point.clone(),
+                    });
+                });
                 return mount_point;
             }
         }
         panic!("no free Windows drive letters available for mount-session tests");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_test_mount_point_reservations_do_not_accumulate_after_test_threads_exit() {
+        for _ in 0..32 {
+            std::thread::spawn(|| reserve_windows_test_mount_point(&[]))
+                .join()
+                .expect("test thread joins");
+        }
     }
 
     #[cfg(windows)]
