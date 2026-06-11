@@ -1861,9 +1861,9 @@ mod tests {
     }
 
     #[cfg(windows)]
-    fn windows_test_mount_claims() -> &'static Mutex<HashSet<String>> {
-        static CLAIMS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-        CLAIMS.get_or_init(|| Mutex::new(HashSet::new()))
+    fn windows_test_mount_claims() -> &'static parking_lot::Mutex<HashSet<String>> {
+        static CLAIMS: OnceLock<parking_lot::Mutex<HashSet<String>>> = OnceLock::new();
+        CLAIMS.get_or_init(|| parking_lot::Mutex::new(HashSet::new()))
     }
 
     #[cfg(windows)]
@@ -1904,9 +1904,7 @@ mod tests {
     #[cfg(windows)]
     impl Drop for WindowsTestMountClaim {
         fn drop(&mut self) {
-            if let Ok(mut claims) = windows_test_mount_claims().lock() {
-                claims.remove(&self.mount_point);
-            }
+            windows_test_mount_claims().lock().remove(&self.mount_point);
         }
     }
 
@@ -1921,9 +1919,7 @@ mod tests {
 
     #[cfg(windows)]
     fn reserve_windows_test_mount_point(excluded: &[&str]) -> WindowsTestMountClaim {
-        let mut claims = windows_test_mount_claims()
-            .lock()
-            .expect("lock claimed test mount points");
+        let mut claims = windows_test_mount_claims().lock();
         for letter in (b'D'..=b'Z').rev() {
             let mount_point = format!("{}:", char::from(letter));
             if claims.contains(&mount_point)
@@ -1952,6 +1948,27 @@ mod tests {
     #[cfg(windows)]
     fn startup_mount_point(_: &TempDir) -> WindowsTestMountClaim {
         reserve_windows_test_mount_point(&[])
+    }
+
+    trait TestMountPoint {
+        fn to_owned_mount_point(&self) -> String;
+    }
+
+    impl TestMountPoint for String {
+        fn to_owned_mount_point(&self) -> String {
+            self.clone()
+        }
+    }
+
+    #[cfg(windows)]
+    impl TestMountPoint for WindowsTestMountClaim {
+        fn to_owned_mount_point(&self) -> String {
+            self.as_str().to_owned()
+        }
+    }
+
+    fn mount_point_string(mount_point: &impl TestMountPoint) -> String {
+        mount_point.to_owned_mount_point()
     }
 
     fn mount_command(
@@ -1985,8 +2002,14 @@ mod tests {
         std::fs::create_dir_all(&meta_dir).expect("create meta dir");
         let mount_point = startup_mount_point(&temp);
         let plan = MountPlan::resolve(MountRequest {
-            command: mount_command(name, &meta_dir, Some(mount_point.to_string()), None, None),
-            settings_config: startup_settings_config(mount_point.to_string(), None, None),
+            command: mount_command(
+                name,
+                &meta_dir,
+                Some(mount_point_string(&mount_point)),
+                None,
+                None,
+            ),
+            settings_config: startup_settings_config(mount_point_string(&mount_point), None, None),
         })
         .expect("mount plan resolved");
         plan.base_cache_path
@@ -2093,11 +2116,11 @@ mod tests {
         std::fs::create_dir_all(&meta_dir).expect("create meta dir");
         let cli_mount_point = startup_mount_point(&temp);
         let settings_config =
-            startup_settings_config(cli_mount_point.to_string(), None, Some("64GB"));
+            startup_settings_config(mount_point_string(&cli_mount_point), None, Some("64GB"));
         let mut command = mount_command(
             "projectfs",
             &meta_dir,
-            Some(cli_mount_point.to_string()),
+            Some(mount_point_string(&cli_mount_point)),
             None,
             None,
         );
@@ -2149,12 +2172,12 @@ mod tests {
             command: mount_command(
                 "projectfs",
                 &meta_dir,
-                Some(cli_mount_point.to_string()),
+                Some(mount_point_string(&cli_mount_point)),
                 Some(cli_cache_dir.clone()),
                 Some("96GB"),
             ),
             settings_config: startup_settings_config(
-                settings_mount_point.to_string(),
+                mount_point_string(&settings_mount_point),
                 Some(configured_cache_dir),
                 Some("32GB"),
             ),
@@ -2260,7 +2283,7 @@ mod tests {
         let mut command = mount_command(
             "projectfs",
             &meta_dir,
-            Some(mount_point.to_string()),
+            Some(mount_point_string(&mount_point)),
             None,
             None,
         );
@@ -2268,7 +2291,11 @@ mod tests {
 
         let err = MountPlan::resolve(MountRequest {
             command,
-            settings_config: startup_settings_config(mount_point.to_string(), None, Some("64GB")),
+            settings_config: startup_settings_config(
+                mount_point_string(&mount_point),
+                None,
+                Some("64GB"),
+            ),
         })
         .expect_err("invalid endpoint should fail");
 
@@ -2284,7 +2311,7 @@ mod tests {
         let mut command = mount_command(
             "projectfs",
             &meta_dir,
-            Some(mount_point.to_string()),
+            Some(mount_point_string(&mount_point)),
             None,
             None,
         );
@@ -2292,7 +2319,11 @@ mod tests {
 
         MountPlan::resolve(MountRequest {
             command,
-            settings_config: startup_settings_config(mount_point.to_string(), None, Some("64GB")),
+            settings_config: startup_settings_config(
+                mount_point_string(&mount_point),
+                None,
+                Some("64GB"),
+            ),
         })
         .expect("explicit http endpoint should be accepted");
     }
@@ -2306,7 +2337,7 @@ mod tests {
         let mut command = mount_command(
             "projectfs",
             &meta_dir,
-            Some(mount_point.to_string()),
+            Some(mount_point_string(&mount_point)),
             None,
             Some("64GB"),
         );
@@ -2314,7 +2345,11 @@ mod tests {
 
         let plan = MountPlan::resolve(MountRequest {
             command,
-            settings_config: startup_settings_config(mount_point.to_string(), None, Some("64GB")),
+            settings_config: startup_settings_config(
+                mount_point_string(&mount_point),
+                None,
+                Some("64GB"),
+            ),
         })
         .expect("mount plan resolved");
 
@@ -2330,7 +2365,7 @@ mod tests {
         let mut command = mount_command(
             "projectfs",
             &meta_dir,
-            Some(mount_point.to_string()),
+            Some(mount_point_string(&mount_point)),
             None,
             Some("64GB"),
         );
@@ -2338,7 +2373,11 @@ mod tests {
 
         let plan = MountPlan::resolve(MountRequest {
             command,
-            settings_config: startup_settings_config(mount_point.to_string(), None, Some("64GB")),
+            settings_config: startup_settings_config(
+                mount_point_string(&mount_point),
+                None,
+                Some("64GB"),
+            ),
         })
         .expect("mount plan resolved");
 
@@ -2368,11 +2407,12 @@ mod tests {
         let (meta_dir, seed_engine, _format_info) = seed_mount_meta_db(&temp, "demo");
         drop(seed_engine);
         let mount_point = startup_mount_point(&temp);
-        let settings_config = startup_settings_config(mount_point.to_string(), None, Some("64MB"));
+        let settings_config =
+            startup_settings_config(mount_point_string(&mount_point), None, Some("64MB"));
         let command = mount_command(
             "demo",
             &meta_dir,
-            Some(mount_point.to_string()),
+            Some(mount_point_string(&mount_point)),
             None,
             Some("64MB"),
         );
@@ -2496,7 +2536,7 @@ mod tests {
         let mut command = mount_command(
             "demo",
             &meta_dir,
-            Some(mount_point.to_string()),
+            Some(mount_point_string(&mount_point)),
             Some(temp.path().join("cache")),
             Some("64GB"),
         );
@@ -2504,7 +2544,11 @@ mod tests {
 
         let prepared = MountPlan::resolve(MountRequest {
             command,
-            settings_config: startup_settings_config(mount_point.to_string(), None, Some("64GB")),
+            settings_config: startup_settings_config(
+                mount_point_string(&mount_point),
+                None,
+                Some("64GB"),
+            ),
         })
         .expect("mount plan resolved")
         .prepare(|| {
@@ -2547,7 +2591,7 @@ mod tests {
         let mut command = mount_command(
             "demo",
             &meta_dir,
-            Some(mount_point.to_string()),
+            Some(mount_point_string(&mount_point)),
             None,
             Some("64GB"),
         );
@@ -2555,7 +2599,11 @@ mod tests {
 
         let prepared = MountPlan::resolve(MountRequest {
             command,
-            settings_config: startup_settings_config(mount_point.to_string(), None, Some("64GB")),
+            settings_config: startup_settings_config(
+                mount_point_string(&mount_point),
+                None,
+                Some("64GB"),
+            ),
         })
         .expect("mount plan resolved")
         .prepare(|| {
@@ -2626,13 +2674,17 @@ mod tests {
         let command = mount_command(
             "demo",
             &meta_dir,
-            Some(mount_point.to_string()),
+            Some(mount_point_string(&mount_point)),
             Some(temp.path().join("cache")),
             Some("64GB"),
         );
         let prepared = MountPlan::resolve(MountRequest {
             command,
-            settings_config: startup_settings_config(mount_point.to_string(), None, Some("64GB")),
+            settings_config: startup_settings_config(
+                mount_point_string(&mount_point),
+                None,
+                Some("64GB"),
+            ),
         })
         .expect("mount plan resolved")
         .prepare(|| {
@@ -2667,11 +2719,15 @@ mod tests {
             command: mount_command(
                 "demo",
                 &meta_dir,
-                Some(mount_point.to_string()),
+                Some(mount_point_string(&mount_point)),
                 Some(temp.path().join("cache")),
                 Some("64GB"),
             ),
-            settings_config: startup_settings_config(mount_point.to_string(), None, Some("64GB")),
+            settings_config: startup_settings_config(
+                mount_point_string(&mount_point),
+                None,
+                Some("64GB"),
+            ),
         })
         .expect("mount plan resolved")
         .prepare(|| {
@@ -2753,7 +2809,7 @@ mod tests {
         let mut command = mount_command(
             "demo",
             &meta_dir,
-            Some(mount_point.to_string()),
+            Some(mount_point_string(&mount_point)),
             Some(temp.path().join("cache")),
             Some("64GB"),
         );
@@ -2761,7 +2817,11 @@ mod tests {
 
         let prepared = MountPlan::resolve(MountRequest {
             command,
-            settings_config: startup_settings_config(mount_point.to_string(), None, Some("64GB")),
+            settings_config: startup_settings_config(
+                mount_point_string(&mount_point),
+                None,
+                Some("64GB"),
+            ),
         })
         .expect("mount plan resolved")
         .prepare(|| {
@@ -3034,11 +3094,15 @@ mod tests {
             command: mount_command(
                 "demo",
                 &meta_dir,
-                Some(mount_point.to_string()),
+                Some(mount_point_string(&mount_point)),
                 Some(temp.path().join("cache")),
                 Some("64GB"),
             ),
-            settings_config: startup_settings_config(mount_point.to_string(), None, Some("64GB")),
+            settings_config: startup_settings_config(
+                mount_point_string(&mount_point),
+                None,
+                Some("64GB"),
+            ),
         })
         .expect("mount plan resolved")
         .prepare(|| {
@@ -3115,11 +3179,15 @@ mod tests {
             command: mount_command(
                 "demo",
                 &meta_dir,
-                Some(mount_point.to_string()),
+                Some(mount_point_string(&mount_point)),
                 Some(temp.path().join("cache")),
                 Some("64GB"),
             ),
-            settings_config: startup_settings_config(mount_point.to_string(), None, Some("64GB")),
+            settings_config: startup_settings_config(
+                mount_point_string(&mount_point),
+                None,
+                Some("64GB"),
+            ),
         })
         .expect("mount plan resolved")
         .prepare(|| {

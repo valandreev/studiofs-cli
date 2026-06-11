@@ -24,6 +24,8 @@ const DEFAULT_MAX_DISPATCHER_THREADS: u32 = 16;
 const DEFAULT_ALLOW_OPEN_IN_KERNEL_MODE: bool = true;
 const DEFAULT_FLUSH_AND_PURGE_ON_CLEANUP: bool = false;
 const DEFAULT_PERSISTENT_ACLS: bool = false;
+const WIN32_FALSE: i32 = 0;
+const WIN32_TRUE: i32 = 1;
 const DEFAULT_SECTORS_PER_ALLOCATION_UNIT: u16 =
     (DEFAULT_ALLOCATION_UNIT_SIZE / DEFAULT_SECTOR_SIZE as u32) as u16;
 static WINFSP_RUNTIME_DLL_LOAD: OnceLock<Result<(), String>> = OnceLock::new();
@@ -841,11 +843,7 @@ this usually means Administrator privileges are required, or WinFSP must be conf
     // SAFETY: The handler function pointer is valid for the process lifetime. The
     // shutdown registry rejects a second active in-process WinFSP mount before this
     // handler can target the wrong mount sender.
-    unsafe {
-        if SetConsoleCtrlHandler(Some(ctrl_handler), 1) == 0 {
-            tracing::warn!("failed to register console control handler for WinFSP shutdown");
-        }
-    }
+    let _console_ctrl_handler = ConsoleCtrlHandlerRegistration::register();
     let _ = rx.recv(); // blocks
 
     tracing::info!("unmounting StudioFS from {mount_point}");
@@ -865,6 +863,38 @@ this usually means Administrator privileges are required, or WinFSP must be conf
     });
 
     Ok(())
+}
+
+#[must_use = "if unused, the WinFSP console control handler will be immediately unregistered"]
+struct ConsoleCtrlHandlerRegistration {
+    registered: bool,
+}
+
+impl ConsoleCtrlHandlerRegistration {
+    fn register() -> Self {
+        // SAFETY: `ctrl_handler` has the documented Win32 callback ABI and does
+        // not capture state. Registering it with `TRUE` installs it for the
+        // current process until the matching unregister call in `Drop`.
+        let registered = unsafe { SetConsoleCtrlHandler(Some(ctrl_handler), WIN32_TRUE) != 0 };
+        if !registered {
+            tracing::warn!("failed to register console control handler for WinFSP shutdown");
+        }
+        Self { registered }
+    }
+}
+
+impl Drop for ConsoleCtrlHandlerRegistration {
+    fn drop(&mut self) {
+        if self.registered {
+            // SAFETY: This unregisters the same process-lifetime callback
+            // registered by `ConsoleCtrlHandlerRegistration::register`.
+            let unregistered =
+                unsafe { SetConsoleCtrlHandler(Some(ctrl_handler), WIN32_FALSE) != 0 };
+            if !unregistered {
+                tracing::warn!("failed to unregister console control handler for WinFSP shutdown");
+            }
+        }
+    }
 }
 
 struct ShutdownRegistry {
@@ -959,7 +989,7 @@ unsafe extern "system" {
 // We synchronously record shutdown intent and return `TRUE` to acknowledge handling.
 unsafe extern "system" fn ctrl_handler(_ctrl_type: u32) -> i32 {
     request_shutdown();
-    1 // TRUE — handled
+    WIN32_TRUE
 }
 
 #[cfg(test)]
