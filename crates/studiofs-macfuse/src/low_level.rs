@@ -16,17 +16,19 @@ use std::sync::{
     Arc, OnceLock,
     atomic::{AtomicUsize, Ordering},
 };
+use std::time::{Duration, Instant};
 
 use libc::{mode_t, off_t, size_t, stat, statvfs};
-use parking_lot::{Mutex as ParkingMutex, RwLock};
+use parking_lot::{Condvar, Mutex as ParkingMutex};
 use studiofs_vfs::KernelInvalidator;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
-use tracing::debug;
+use tracing::{debug, warn};
 
 const DEFAULT_FUSE_MAX_WRITE_BYTES: u32 = 16 * 1024 * 1024;
 const DEFAULT_FUSE_MAX_READAHEAD_BYTES: u32 = 16 * 1024 * 1024;
 pub(crate) const MACOS_FUSE_IOSIZE_BYTES: u32 = 1024 * 1024;
+const INVALIDATION_SHUTDOWN_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 static NEXT_INTERRUPT_KEY: AtomicUsize = AtomicUsize::new(1);
 // Interrupt callbacks can race with request reply/drop after macFUSE has
 // copied callback data out of its session lock. This registry keeps callback
@@ -709,34 +711,74 @@ struct MacFuseKernelInvalidator {
 
 #[derive(Debug)]
 struct SessionInvalidationState {
-    active: RwLock<bool>,
+    status: ParkingMutex<SessionInvalidationStatus>,
+    idle: Condvar,
+}
+
+#[derive(Debug)]
+struct SessionInvalidationStatus {
+    closed: bool,
+    active: usize,
+}
+
+struct SessionInvalidationGuard<'a> {
+    state: &'a SessionInvalidationState,
 }
 
 impl SessionInvalidationState {
     fn new() -> Self {
         Self {
-            active: RwLock::new(true),
+            status: ParkingMutex::new(SessionInvalidationStatus {
+                closed: false,
+                active: 0,
+            }),
+            idle: Condvar::new(),
         }
     }
 
-    fn begin_invalidation(&self) -> Option<parking_lot::RwLockReadGuard<'_, bool>> {
-        let guard = self.active.read();
-        (*guard).then_some(guard)
+    fn begin_invalidation(&self) -> Option<SessionInvalidationGuard<'_>> {
+        let mut status = self.status.lock();
+        if status.closed {
+            return None;
+        }
+        status.active += 1;
+        Some(SessionInvalidationGuard { state: self })
     }
 
-    fn begin_shutdown(&self) -> parking_lot::RwLockWriteGuard<'_, bool> {
-        let mut guard = self.active.write();
-        *guard = false;
-        guard
+    fn begin_shutdown(&self) {
+        self.status.lock().closed = true;
+    }
+
+    fn wait_for_idle(&self, timeout: Duration) -> bool {
+        let mut status = self.status.lock();
+        let deadline = Instant::now() + timeout;
+        while status.active > 0 {
+            if self.idle.wait_until(&mut status, deadline).timed_out() {
+                return status.active == 0;
+            }
+        }
+        true
+    }
+}
+
+impl Drop for SessionInvalidationGuard<'_> {
+    fn drop(&mut self) {
+        let mut status = self.state.status.lock();
+        status.active = status.active.saturating_sub(1);
+        if status.active == 0 {
+            self.state.idle.notify_all();
+        }
     }
 }
 
 // SAFETY: Invalidators may be cloned into VFS worker tasks, but every macFUSE
-// notify call must hold `state.active`. `Session::drop` takes the same gate,
-// flips it closed, and keeps it held until the channel/session are destroyed.
+// notify call must hold a counted `SessionInvalidationGuard`. `Session::drop`
+// closes the gate to new invalidations, waits for active guards only up to a
+// bounded timeout, and leaks the raw macFUSE handles instead of destroying them
+// while an FFI call may still be using the channel.
 unsafe impl Send for MacFuseKernelInvalidator {}
-// SAFETY: Concurrent invalidation calls are serialized with session teardown by
-// `state.active` and otherwise go through macFUSE's channel API.
+// SAFETY: Concurrent invalidation calls are counted against session teardown by
+// `state`; each call otherwise goes through macFUSE's channel API.
 unsafe impl Sync for MacFuseKernelInvalidator {}
 
 impl KernelInvalidator for MacFuseKernelInvalidator {
@@ -758,9 +800,9 @@ impl MacFuseKernelInvalidator {
             );
             return;
         };
-        // SAFETY: `channel` comes from a mounted macFUSE session. The invalidator
-        // holds the session invalidation gate, and `Session::drop` cannot detach
-        // or unmount the channel while that gate is held.
+        // SAFETY: `channel` comes from a mounted macFUSE session. The counted
+        // invalidation guard prevents `Session::drop` from destroying the raw
+        // handles while this FFI call may still use the channel.
         let result = unsafe {
             raw::fuse_lowlevel_notify_inval_inode(self.channel.as_ptr(), ino, offset, len)
         };
@@ -775,7 +817,17 @@ impl MacFuseKernelInvalidator {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        let _invalidation_gate = self.invalidation_state.begin_shutdown();
+        self.invalidation_state.begin_shutdown();
+        if !self
+            .invalidation_state
+            .wait_for_idle(INVALIDATION_SHUTDOWN_IDLE_TIMEOUT)
+        {
+            warn!(
+                "macFUSE session shutdown timed out waiting for active kernel invalidation; \
+                 leaking raw session handles to avoid use-after-free"
+            );
+            return;
+        }
         // SAFETY: `self.channel` was attached to `self.raw`; removing it before
         // unmount avoids leaving the session with a stale channel pointer.
         unsafe { raw::fuse_session_remove_chan(self.channel.as_ptr()) };
@@ -1282,7 +1334,7 @@ mod tests {
         let state = SessionInvalidationState::new();
         assert!(state.begin_invalidation().is_some());
 
-        drop(state.begin_shutdown());
+        state.begin_shutdown();
 
         assert!(
             state.begin_invalidation().is_none(),
@@ -1291,7 +1343,7 @@ mod tests {
     }
 
     #[test]
-    fn session_invalidation_state_shutdown_waits_for_active_invalidation() {
+    fn session_invalidation_state_shutdown_does_not_wait_for_active_invalidation() {
         let state = Arc::new(SessionInvalidationState::new());
         let active = state
             .begin_invalidation()
@@ -1299,31 +1351,31 @@ mod tests {
         let concurrent_active = state
             .begin_invalidation()
             .expect("concurrent invalidations should share the active session gate");
-        let (started_tx, started_rx) = mpsc::channel();
         let (closed_tx, closed_rx) = mpsc::channel();
         let shutdown_state = Arc::clone(&state);
 
         let shutdown = std::thread::spawn(move || {
-            started_tx.send(()).expect("signal shutdown start");
-            drop(shutdown_state.begin_shutdown());
-            closed_tx.send(()).expect("signal shutdown close");
+            let started = Instant::now();
+            shutdown_state.begin_shutdown();
+            closed_tx
+                .send(started.elapsed())
+                .expect("signal shutdown close");
         });
 
-        started_rx.recv().expect("shutdown thread started");
+        let elapsed = closed_rx
+            .recv_timeout(Duration::from_millis(50))
+            .expect("shutdown should close without waiting for active invalidation guards");
         assert!(
-            closed_rx.recv_timeout(Duration::from_millis(50)).is_err(),
-            "shutdown must wait for an in-flight invalidation guard"
+            elapsed < Duration::from_millis(50),
+            "shutdown should not block behind active invalidation guards"
+        );
+        assert!(
+            state.begin_invalidation().is_none(),
+            "closed sessions must reject invalidations even while older guards are alive"
         );
 
         drop(active);
-        assert!(
-            closed_rx.recv_timeout(Duration::from_millis(50)).is_err(),
-            "shutdown must wait for every in-flight invalidation guard"
-        );
         drop(concurrent_active);
-        closed_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("shutdown should close after active invalidation releases");
         shutdown.join().expect("shutdown thread should exit");
     }
 }
