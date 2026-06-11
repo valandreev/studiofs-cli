@@ -2650,6 +2650,13 @@ impl DeferredInodeGate {
                 return;
             };
             let _guard = task_lock.lock().await;
+            let current = self.entries.lock().get(&ino).cloned();
+            if current
+                .as_ref()
+                .is_none_or(|current| Arc::ptr_eq(current, &task_lock))
+            {
+                return;
+            }
         }
     }
 
@@ -2681,10 +2688,11 @@ impl DeferredInodeGate {
         use std::collections::hash_map::Entry;
 
         let mut entries = self.entries.lock();
-        if let Entry::Occupied(entry) = entries.entry(ino)
-            && Arc::ptr_eq(entry.get(), task_lock)
-        {
-            entry.remove();
+        match entries.entry(ino) {
+            Entry::Occupied(entry) if Arc::ptr_eq(entry.get(), task_lock) => {
+                entry.remove();
+            }
+            _ => {}
         }
     }
 }

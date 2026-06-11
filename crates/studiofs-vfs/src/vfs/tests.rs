@@ -10943,6 +10943,23 @@ fn deferred_inode_gate_entry_drop_removes_current_entry() {
 }
 
 #[test]
+fn deferred_inode_gate_wait_returns_when_guard_released_before_entry_cleanup() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let gate = DeferredInodeGate::default();
+        let ino = 45;
+        let (_entry, guard) = gate
+            .try_register(ino)
+            .expect("first registration should own the inode gate");
+
+        drop(guard);
+        tokio::time::timeout(Duration::from_millis(100), gate.wait(ino))
+            .await
+            .expect("wait should return when the current gate is unlocked but still registered");
+    });
+}
+
+#[test]
 fn strict_deferred_write_waits_for_inflight_materialization() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-301-strict-waits-inflight");
