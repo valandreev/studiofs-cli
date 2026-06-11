@@ -1938,11 +1938,24 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_test_mount_point_reservations_do_not_accumulate_after_test_threads_exit() {
+        let mut completed_reservations = 0;
         for _ in 0..32 {
-            std::thread::spawn(|| reserve_windows_test_mount_point(&[]))
-                .join()
-                .expect("test thread joins");
+            let mount_point = std::thread::spawn(|| {
+                let claim = reserve_windows_test_mount_point(&[]);
+                claim.as_ref().to_owned()
+            })
+            .join()
+            .expect("test thread joins");
+            assert!(
+                mount_point.ends_with(':'),
+                "reserved a Windows drive mount point"
+            );
+            completed_reservations += 1;
         }
+        assert_eq!(
+            completed_reservations, 32,
+            "test thread exit should release mount claims for reuse"
+        );
     }
 
     #[cfg(windows)]
