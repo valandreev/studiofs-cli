@@ -28,7 +28,7 @@ use tracing::{debug, warn};
 const DEFAULT_FUSE_MAX_WRITE_BYTES: u32 = 16 * 1024 * 1024;
 const DEFAULT_FUSE_MAX_READAHEAD_BYTES: u32 = 16 * 1024 * 1024;
 pub(crate) const MACOS_FUSE_IOSIZE_BYTES: u32 = 1024 * 1024;
-const INVALIDATION_SHUTDOWN_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
+const INVALIDATION_SHUTDOWN_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 static NEXT_INTERRUPT_KEY: AtomicUsize = AtomicUsize::new(1);
 // Interrupt callbacks can race with request reply/drop after macFUSE has
 // copied callback data out of its session lock. This registry keeps callback
@@ -764,9 +764,9 @@ impl SessionInvalidationState {
 impl Drop for SessionInvalidationGuard<'_> {
     fn drop(&mut self) {
         let mut status = self.state.status.lock();
-        status.active = status.active.saturating_sub(1);
+        status.active -= 1;
         if status.active == 0 {
-            self.state.idle.notify_all();
+            self.state.idle.notify_one();
         }
     }
 }
@@ -1377,5 +1377,49 @@ mod tests {
         drop(active);
         drop(concurrent_active);
         shutdown.join().expect("shutdown thread should exit");
+    }
+
+    #[test]
+    fn session_invalidation_state_wait_for_idle_waits_for_active_guard_to_drop() {
+        let state = Arc::new(SessionInvalidationState::new());
+        let active = state
+            .begin_invalidation()
+            .expect("invalidation should start while session is active");
+        let waiter_state = Arc::clone(&state);
+        let (waiting_tx, waiting_rx) = mpsc::channel();
+
+        let waiter = std::thread::spawn(move || {
+            waiting_tx.send(()).expect("signal waiter start");
+            waiter_state.wait_for_idle(Duration::from_secs(1))
+        });
+
+        waiting_rx.recv().expect("waiter should start");
+        std::thread::sleep(Duration::from_millis(10));
+        drop(active);
+
+        assert!(
+            waiter.join().expect("waiter thread should exit"),
+            "wait_for_idle should succeed once active invalidation guards drop"
+        );
+    }
+
+    #[test]
+    fn session_invalidation_state_wait_for_idle_times_out_while_guard_is_active() {
+        let state = SessionInvalidationState::new();
+        let active = state
+            .begin_invalidation()
+            .expect("invalidation should start while session is active");
+        let started = Instant::now();
+
+        assert!(
+            !state.wait_for_idle(Duration::from_millis(20)),
+            "wait_for_idle should time out while an invalidation guard is active"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(20),
+            "wait_for_idle should not return before the configured timeout"
+        );
+
+        drop(active);
     }
 }
