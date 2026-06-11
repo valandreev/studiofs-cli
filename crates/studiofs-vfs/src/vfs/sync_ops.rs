@@ -1,8 +1,8 @@
 use super::{
-    AccessLevel, DirtyAttrPersistPolicy, ExplicitFlushOutcome, FileSessionOperation, FileType,
-    FsyncOutcome, HandleReleaseContext, Ino, LastHandleReleaseAction, LocalSyncBarrierOutcome,
-    LocalSyncPolicy, MetaError, OpenFile, OpenFlags, ReleaseFhOutcome, StickyErrorPolicy,
-    StudioVfs, VfsResult,
+    AccessLevel, DeferredInodeGateEntry, DirtyAttrPersistPolicy, ExplicitFlushOutcome,
+    FileSessionOperation, FileType, FsyncOutcome, HandleReleaseContext, Ino,
+    LastHandleReleaseAction, LocalSyncBarrierOutcome, LocalSyncPolicy, MetaError, OpenFile,
+    OpenFlags, ReleaseFhOutcome, StickyErrorPolicy, StudioVfs, VfsResult,
 };
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -19,24 +19,18 @@ const MAX_FLUSH_QUIESCE_PASSES: usize = 8;
 
 pub(super) struct DeferredReleaseBarrier {
     vfs: Arc<StudioVfs>,
-    ino: Ino,
-    task_lock: Arc<tokio::sync::Mutex<()>>,
+    entry: DeferredInodeGateEntry,
 }
 
 impl DeferredReleaseBarrier {
-    fn new(vfs: Arc<StudioVfs>, ino: Ino, task_lock: Arc<tokio::sync::Mutex<()>>) -> Self {
-        Self {
-            vfs,
-            ino,
-            task_lock,
-        }
+    fn new(vfs: Arc<StudioVfs>, entry: DeferredInodeGateEntry) -> Self {
+        Self { vfs, entry }
     }
 }
 
 impl Drop for DeferredReleaseBarrier {
     fn drop(&mut self) {
-        self.vfs
-            .finish_deferred_release_barrier(self.ino, &self.task_lock);
+        self.vfs.finish_deferred_release_barrier(&self.entry);
     }
 }
 
@@ -151,66 +145,30 @@ impl StudioVfs {
     }
 
     pub(super) async fn wait_for_deferred_materialization_inflight(&self, ino: Ino) {
-        loop {
-            let task_lock = {
-                self.state
-                    .deferred_materialize_inflight
-                    .lock()
-                    .get(&ino)
-                    .cloned()
-            };
-            let Some(task_lock) = task_lock else {
-                return;
-            };
-            let _guard = task_lock.lock().await;
-        }
+        self.state.deferred_materialize_inflight.wait(ino).await;
     }
 
     pub(super) async fn wait_for_deferred_release_inflight(&self, ino: Ino) {
-        loop {
-            let task_lock = {
-                self.state
-                    .deferred_release_inflight
-                    .lock()
-                    .get(&ino)
-                    .cloned()
-            };
-            let Some(task_lock) = task_lock else {
-                return;
-            };
-            let _guard = task_lock.lock().await;
-        }
+        self.state.deferred_release_inflight.wait(ino).await;
     }
 
     pub(super) fn register_deferred_release_barrier(
         self: &Arc<Self>,
         ino: Ino,
     ) -> (DeferredReleaseBarrier, tokio::sync::OwnedMutexGuard<()>) {
-        let mut inflight = self.state.deferred_release_inflight.lock();
-        let task_lock = Arc::new(tokio::sync::Mutex::new(()));
-        let guard = Arc::clone(&task_lock)
-            .try_lock_owned()
-            .expect("new deferred release barrier lock should be uncontended");
-        if inflight.insert(ino, Arc::clone(&task_lock)).is_some() {
+        let replaced = self.state.deferred_release_inflight.contains(ino);
+        let (entry, guard) = self.state.deferred_release_inflight.replace(ino);
+        if replaced {
             debug!(
                 ino,
                 "replaced in-flight deferred last-handle release barrier"
             );
         }
-        (
-            DeferredReleaseBarrier::new(Arc::clone(self), ino, task_lock),
-            guard,
-        )
+        (DeferredReleaseBarrier::new(Arc::clone(self), entry), guard)
     }
 
-    fn finish_deferred_release_barrier(&self, ino: Ino, task_lock: &Arc<tokio::sync::Mutex<()>>) {
-        let mut inflight = self.state.deferred_release_inflight.lock();
-        if inflight
-            .get(&ino)
-            .is_some_and(|current| Arc::ptr_eq(current, task_lock))
-        {
-            inflight.remove(&ino);
-        }
+    fn finish_deferred_release_barrier(&self, entry: &DeferredInodeGateEntry) {
+        entry.finish();
     }
 
     fn observe_sustained_write_admission(
@@ -307,41 +265,28 @@ impl StudioVfs {
             return;
         }
 
-        let (task_lock, guard) = {
-            let mut inflight = self.state.deferred_materialize_inflight.lock();
-            match inflight.entry(ino) {
-                std::collections::hash_map::Entry::Occupied(_) => {
-                    if self.state.writer_stack.dirty_bytes_for_inode(ino) > 0 {
-                        self.state
-                            .deferred_materialize_reschedule_needed
-                            .lock()
-                            .insert(ino);
-                    }
-                    // #region debug log
-                    self.debug_write_probe(
-                        "H2",
-                        concat!(file!(), ":", line!()),
-                        "deferred materialization already inflight",
-                        serde_json::json!({
-                            "ino": ino,
-                            "per_inode_dirty_bytes": self.state.writer_stack.dirty_bytes_for_inode(ino),
-                            "total_dirty_bytes": self.state.writer_stack.total_dirty_bytes(),
-                            "open_count": self.handle_table.open_count(ino),
-                        }),
-                    );
-                    // #endregion debug log
-                    return;
-                }
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    let task_lock = Arc::new(tokio::sync::Mutex::new(()));
-                    let guard = task_lock
-                        .clone()
-                        .try_lock_owned()
-                        .expect("new deferred materialization task lock should be uncontended");
-                    entry.insert(Arc::clone(&task_lock));
-                    (task_lock, guard)
-                }
+        let Some((entry, guard)) = self.state.deferred_materialize_inflight.try_register(ino)
+        else {
+            if self.state.writer_stack.dirty_bytes_for_inode(ino) > 0 {
+                self.state
+                    .deferred_materialize_reschedule_needed
+                    .lock()
+                    .insert(ino);
             }
+            // #region debug log
+            self.debug_write_probe(
+                "H2",
+                concat!(file!(), ":", line!()),
+                "deferred materialization already inflight",
+                serde_json::json!({
+                    "ino": ino,
+                    "per_inode_dirty_bytes": self.state.writer_stack.dirty_bytes_for_inode(ino),
+                    "total_dirty_bytes": self.state.writer_stack.total_dirty_bytes(),
+                    "open_count": self.handle_table.open_count(ino),
+                }),
+            );
+            // #endregion debug log
+            return;
         };
         // #region debug log
         self.debug_write_probe(
@@ -356,17 +301,17 @@ impl StudioVfs {
             }),
         );
         // #endregion debug log
-        self.start_deferred_materialization_task(ino, task_lock, guard);
+        self.start_deferred_materialization_task(entry, guard);
     }
 
     fn start_deferred_materialization_task(
         self: &Arc<Self>,
-        ino: Ino,
-        task_lock: Arc<tokio::sync::Mutex<()>>,
+        entry: DeferredInodeGateEntry,
         guard: tokio::sync::OwnedMutexGuard<()>,
     ) {
         let vfs = Arc::clone(self);
         self.track_background_task(tokio::spawn(async move {
+            let ino = entry.ino;
             let mut allow_reschedule_on_exit = true;
             let mut no_progress_retries = 0usize;
             loop {
@@ -508,7 +453,7 @@ impl StudioVfs {
                 tokio::task::yield_now().await;
             }
 
-            vfs.finish_deferred_materialization_task(ino, task_lock, allow_reschedule_on_exit);
+            vfs.finish_deferred_materialization_task(entry, allow_reschedule_on_exit);
             drop(guard);
         }));
     }
@@ -519,10 +464,10 @@ impl StudioVfs {
     /// were observed while the task was running.
     pub(super) fn finish_deferred_materialization_task(
         self: &Arc<Self>,
-        ino: Ino,
-        task_lock: Arc<tokio::sync::Mutex<()>>,
+        entry: DeferredInodeGateEntry,
         allow_reschedule: bool,
     ) {
+        let ino = entry.ino;
         let reschedule_needed = self
             .state
             .deferred_materialize_reschedule_needed
@@ -533,32 +478,19 @@ impl StudioVfs {
             && !self.shutdown_requested()
             && self.state.writer_stack.dirty_bytes_for_inode(ino) > 0;
         let next_task = if should_reschedule {
-            let next_task_lock = Arc::new(tokio::sync::Mutex::new(()));
-            let next_guard = next_task_lock
-                .clone()
-                .try_lock_owned()
-                .expect("new deferred materialization task lock should be uncontended");
-            Some((next_task_lock, next_guard))
+            self.state
+                .deferred_materialize_inflight
+                .replace_if_current(&entry)
         } else {
             None
         };
-        {
-            let mut inflight = self.state.deferred_materialize_inflight.lock();
-            if inflight
-                .get(&ino)
-                .is_some_and(|current| Arc::ptr_eq(current, &task_lock))
-            {
-                if let Some((next_task_lock, _)) = &next_task {
-                    inflight.insert(ino, Arc::clone(next_task_lock));
-                } else {
-                    inflight.remove(&ino);
-                }
-            }
+        if next_task.is_none() {
+            entry.finish();
         }
-        let Some((next_task_lock, next_guard)) = next_task else {
+        let Some((next_entry, next_guard)) = next_task else {
             return;
         };
-        self.start_deferred_materialization_task(ino, next_task_lock, next_guard);
+        self.start_deferred_materialization_task(next_entry, next_guard);
     }
 
     /// Release a file handle.
