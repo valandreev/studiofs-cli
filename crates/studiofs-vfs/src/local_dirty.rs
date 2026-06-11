@@ -525,19 +525,40 @@ impl<'a> LocalDirtyFlushSession<'a> {
             return Ok(());
         }
 
-        let upload_ops: Vec<_> = pending_slices
-            .iter()
-            .flat_map(|(chunk_id, slices)| {
-                slices.iter().filter_map(|slice| {
-                    slice.object_id.map(|object_id| {
-                        let file_offset = studiofs_meta::schema::chunk_start_offset(
-                            studiofs_meta::schema::ChunkId(*chunk_id),
-                            studiofs_meta::schema::DEFAULT_CHUNK_SIZE,
-                        )
-                        .saturating_add(slice.range.start as u64);
-                        (self.ino, file_offset, object_id, content_epoch)
+        let mut upload_ops_by_object = std::collections::BTreeMap::<u64, (u64, u64, u64)>::new();
+        for (chunk_id, slices) in &pending_slices {
+            let chunk_start = studiofs_meta::schema::chunk_start_offset(
+                studiofs_meta::schema::ChunkId(*chunk_id),
+                studiofs_meta::schema::DEFAULT_CHUNK_SIZE,
+            );
+            for slice in slices {
+                let Some(object_id) = slice.object_id else {
+                    continue;
+                };
+                let file_offset = chunk_start.saturating_add(slice.range.start as u64);
+                let object_file_offset = file_offset.saturating_sub(u64::from(slice.object_offset));
+                let payload_end = file_offset.saturating_add(slice.len() as u64);
+                upload_ops_by_object
+                    .entry(object_id)
+                    .and_modify(|(offset, start, end)| {
+                        *offset = (*offset).min(file_offset);
+                        *start = (*start).min(object_file_offset);
+                        *end = (*end).max(payload_end);
                     })
-                })
+                    .or_insert((file_offset, object_file_offset, payload_end));
+            }
+        }
+        let upload_ops: Vec<_> = upload_ops_by_object
+            .iter()
+            .map(|(object_id, (offset, object_file_offset, payload_end))| {
+                (
+                    self.ino,
+                    *offset,
+                    *object_file_offset,
+                    *object_id,
+                    content_epoch,
+                    payload_end.saturating_sub(*object_file_offset),
+                )
             })
             .collect();
         if !upload_ops.is_empty() {

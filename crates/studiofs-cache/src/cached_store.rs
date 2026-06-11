@@ -743,24 +743,54 @@ impl CachedStore {
 
     /// Submits a single upload op to the upload queue and pins the object until terminal.
     pub fn submit_upload(&self, ino: u64, offset: u64, object_id: ObjectId, content_epoch: u64) {
+        let payload_len = self
+            .local_payload_backend
+            .object_stats(object_id)
+            .map(|stats| stats.payload_len)
+            .unwrap_or(0);
+        self.submit_upload_with_payload(ino, offset, offset, object_id, content_epoch, payload_len);
+    }
+
+    /// Submits a single upload op with explicit payload geometry.
+    pub fn submit_upload_with_payload(
+        &self,
+        ino: u64,
+        offset: u64,
+        object_file_offset: u64,
+        object_id: ObjectId,
+        content_epoch: u64,
+        payload_len: u64,
+    ) {
         self.pin(object_id);
-        self.upload_queue
-            .submit(ino, offset, object_id, content_epoch);
+        self.upload_queue.submit_with_payload(
+            ino,
+            offset,
+            object_file_offset,
+            object_id,
+            content_epoch,
+            payload_len,
+        );
         self.metrics
             .upload_queue
             .record_submit(self.upload_queue.pending_count());
     }
 
     /// Submits a batch of upload ops to the upload queue and pins all referenced objects.
-    pub fn submit_uploads_batch(&self, ops: &[(u64, u64, ObjectId, u64)]) {
+    pub fn submit_uploads_batch(&self, ops: &[(u64, u64, u64, ObjectId, u64, u64)]) {
         let first_pins = {
             let mut pinned = self.pinned.lock();
-            pinned.insert_many(ops.iter().map(|(_, _, object_id, _)| *object_id))
+            pinned.insert_many(ops.iter().map(|(_, _, _, object_id, _, _)| *object_id))
         };
         self.local_payload_backend.pin_batch(&first_pins);
-        for (ino, offset, object_id, content_epoch) in ops {
-            self.upload_queue
-                .submit(*ino, *offset, *object_id, *content_epoch);
+        for (ino, offset, object_file_offset, object_id, content_epoch, payload_len) in ops {
+            self.upload_queue.submit_with_payload(
+                *ino,
+                *offset,
+                *object_file_offset,
+                *object_id,
+                *content_epoch,
+                *payload_len,
+            );
             self.metrics
                 .upload_queue
                 .record_submit(self.upload_queue.pending_count());
@@ -867,7 +897,14 @@ impl CachedStore {
             .insert(object_id, saturating_u64_from_usize(payload_len));
         self.writer_counters.record_staged(payload_len);
         self.writer_counters.record_pending_upload(payload_len);
-        self.submit_upload(ino, offset, object_id, content_epoch);
+        self.submit_upload_with_payload(
+            ino,
+            offset,
+            offset,
+            object_id,
+            content_epoch,
+            saturating_u64_from_usize(payload_len),
+        );
     }
 
     fn record_upload_terminal(&self, object_id: ObjectId) -> u64 {

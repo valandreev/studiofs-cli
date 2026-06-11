@@ -314,7 +314,9 @@ mod tests {
             PendingUpload {
                 ino,
                 offset: block_offset,
+                object_file_offset: block_offset,
                 object_id: 101,
+                payload_len: 0,
                 content_epoch: 3,
                 created_unix_ms: 100,
                 not_before_unix_ms: 0,
@@ -323,7 +325,9 @@ mod tests {
             PendingUpload {
                 ino,
                 offset: block_offset,
+                object_file_offset: block_offset,
                 object_id: 202,
+                payload_len: 0,
                 content_epoch: 5,
                 created_unix_ms: 200,
                 not_before_unix_ms: 0,

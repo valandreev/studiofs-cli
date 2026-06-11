@@ -20,7 +20,7 @@ pub(super) struct StartupReplayCoordinator<'a> {
     quarantined_inodes: HashSet<Ino>,
     quarantined_object_ids: HashSet<u64>,
     removed_orphan_dirty_object_ids: HashSet<u64>,
-    replay_ops: Vec<(u64, u64, u64, u64)>,
+    replay_ops: Vec<(u64, u64, u64, u64, u64, u64)>,
     live_extents: HashMap<(Ino, u32), ExtentRecordId>,
     pending_epoch_finalizations: Vec<(Ino, u64)>,
     seen_replay_inodes: HashSet<Ino>,
@@ -40,6 +40,7 @@ struct StartupGraphObject {
     object_id: u64,
     payload_len: u64,
     absolute_offset: u64,
+    object_file_offset: u64,
 }
 
 impl<'a> StartupReplayCoordinator<'a> {
@@ -192,6 +193,7 @@ impl<'a> StartupReplayCoordinator<'a> {
                 object_id: block.object_id,
                 payload_len: u64::from(block.offset).saturating_add(u64::from(block.length)),
                 absolute_offset,
+                object_file_offset: absolute_offset.saturating_sub(u64::from(block.offset)),
             });
         }
         Ok(objects)
@@ -228,8 +230,10 @@ impl<'a> StartupReplayCoordinator<'a> {
         self.replay_ops.push((
             ino,
             graph_object.absolute_offset,
+            graph_object.object_file_offset,
             graph_object.object_id,
             content_epoch,
+            graph_object.payload_len,
         ));
         self.record_live_extent(
             ino,
@@ -658,7 +662,7 @@ impl<'a> StartupReplayCoordinator<'a> {
         let mut replayed_object_ids: Vec<_> = self
             .replay_ops
             .iter()
-            .map(|(_, _, object_id, _)| *object_id)
+            .map(|(_, _, _, object_id, _, _)| *object_id)
             .collect();
         replayed_object_ids.sort_unstable();
         replayed_object_ids.dedup();
@@ -673,7 +677,7 @@ impl<'a> StartupReplayCoordinator<'a> {
         let replayed_epochs: BTreeSet<_> = self
             .replay_ops
             .iter()
-            .map(|(ino, _, _, content_epoch)| (*ino, *content_epoch))
+            .map(|(ino, _, _, _, content_epoch, _)| (*ino, *content_epoch))
             .collect();
         self.vfs
             .state

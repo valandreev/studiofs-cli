@@ -23,8 +23,12 @@ pub struct PendingUpload {
     pub ino: Ino,
     /// File offset this payload object corresponds to.
     pub offset: u64,
+    /// File offset corresponding to byte 0 of the uploaded payload object.
+    pub object_file_offset: u64,
     /// Object ID (object ID).
     pub object_id: u64,
+    /// Uploaded payload length in bytes.
+    pub payload_len: u64,
     /// Monotonic content generation captured when the upload was queued.
     pub content_epoch: u64,
     /// Enqueue timestamp in unix milliseconds.
@@ -92,10 +96,25 @@ impl UploadQueue {
 
     /// Submit a new pending upload (hot path — non-blocking).
     pub fn submit(&self, ino: Ino, offset: u64, object_id: u64, content_epoch: u64) {
+        self.submit_with_payload(ino, offset, offset, object_id, content_epoch, 0);
+    }
+
+    /// Submit a pending upload with explicit uploaded-payload geometry.
+    pub fn submit_with_payload(
+        &self,
+        ino: Ino,
+        offset: u64,
+        object_file_offset: u64,
+        object_id: u64,
+        content_epoch: u64,
+        payload_len: u64,
+    ) {
         let op = PendingUpload {
             ino,
             offset,
+            object_file_offset,
             object_id,
+            payload_len,
             content_epoch,
             created_unix_ms: now_unix_ms(),
             not_before_unix_ms: 0,

@@ -187,7 +187,14 @@ impl UploadSubmissionPort for VfsUploadSubmitter<'_> {
         let mut live_extents = Vec::with_capacity(persisted_blocks.len());
         for block in persisted_blocks {
             let offset = u64::from(block.block_index).saturating_mul(self.vfs.block_size as u64);
-            submit_ops.push((ino, offset, block.object_id, content_epoch));
+            submit_ops.push((
+                ino,
+                offset,
+                offset,
+                block.object_id,
+                content_epoch,
+                block.len() as u64,
+            ));
             live_extents.push((ino, block.block_index, block.object_id, content_epoch));
         }
         self.vfs.record_live_extents(&live_extents);

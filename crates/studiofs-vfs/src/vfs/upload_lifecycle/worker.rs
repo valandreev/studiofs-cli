@@ -660,7 +660,11 @@ where
             }
         };
 
-        let mut payload_len = raw_payload.len() as u64;
+        let mut payload_len = if remote_object_visible {
+            op.payload_len
+        } else {
+            raw_payload.len() as u64
+        };
         if !remote_object_visible {
             match self
                 .remote
@@ -862,7 +866,7 @@ where
                 op.ino,
                 op.content_epoch,
                 op.object_id,
-                op.offset,
+                op.object_file_offset,
                 payload_len,
                 self.block_size,
             )
@@ -2906,7 +2910,9 @@ mod tests {
         PendingUpload {
             ino: 11,
             offset: 0,
+            object_file_offset: 0,
             object_id: 77,
+            payload_len: b"hello".len() as u64,
             content_epoch: 3,
             created_unix_ms: 0,
             not_before_unix_ms: 0,
@@ -3329,6 +3335,7 @@ mod tests {
             processor_fixture();
         let op = PendingUpload {
             offset: 1024,
+            object_file_offset: 1024,
             ..make_pending_upload()
         };
         let rebased_epoch = op.content_epoch + 1;
@@ -3382,12 +3389,14 @@ mod tests {
     async fn process_upload_rebases_remote_visible_retry_with_cached_payload_len() {
         let (processor, coordinator, local_payloads, meta, remote, shutdown, policy) =
             processor_fixture();
+        let payload = Bytes::from_static(b"already uploaded retry payload");
         let op = PendingUpload {
             offset: 1024,
+            object_file_offset: 1024,
+            payload_len: payload.len() as u64,
             retry_count: 1,
             ..make_pending_upload()
         };
-        let payload = Bytes::from_static(b"already uploaded retry payload");
         let rebased_epoch = op.content_epoch + 1;
         coordinator.pending_inodes.lock().insert(op.ino);
         meta.attrs
@@ -3410,22 +3419,74 @@ mod tests {
         assert_eq!(coordinator.completed.lock().as_slice(), &[op.object_id]);
         assert_eq!(
             meta.reattached_uploads.lock().as_slice(),
-            &[
-                (op.ino, op.content_epoch, op.object_id, op.offset, 0, 4096),
-                (
-                    op.ino,
-                    op.content_epoch,
-                    op.object_id,
-                    op.offset,
-                    payload.len() as u64,
-                    4096
-                )
-            ],
-            "remote-visible retry must recover payload length before stale reattach"
+            &[(
+                op.ino,
+                op.content_epoch,
+                op.object_id,
+                op.object_file_offset,
+                op.payload_len,
+                4096
+            )],
+            "remote-visible retry must use the queued payload geometry for stale reattach"
         );
         assert!(
             meta.pending_deletions.lock().is_empty(),
             "rebased remote-visible retry payload must not be orphaned"
+        );
+        assert_eq!(local_payloads.uploaded.lock().as_slice(), &[op.object_id]);
+        assert!(local_payloads.removed.lock().is_empty());
+        assert_eq!(shutdown.canceled_stale_after_put.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            policy.finalized_upload_epochs.lock().as_slice(),
+            &[(op.ino, rebased_epoch)]
+        );
+    }
+
+    #[tokio::test]
+    async fn process_upload_rebases_remote_visible_retry_after_local_payload_eviction() {
+        let (processor, coordinator, local_payloads, meta, remote, shutdown, policy) =
+            processor_fixture();
+        let op = PendingUpload {
+            offset: 1_048_569,
+            object_file_offset: 0,
+            payload_len: 1_048_831,
+            retry_count: 1,
+            ..make_pending_upload()
+        };
+        let rebased_epoch = op.content_epoch + 1;
+        coordinator.pending_inodes.lock().insert(op.ino);
+        meta.attrs
+            .lock()
+            .insert(op.ino, Some(make_attr(op.ino, op.content_epoch)));
+        meta.overlay_objects
+            .lock()
+            .insert(op.ino, HashSet::from([op.object_id]));
+        local_payloads
+            .upload_reads
+            .lock()
+            .insert(op.object_id, None);
+        *remote.visibility.lock() = RemoteVisibility::Visible;
+        *remote.remove_overlay_after_visibility.lock() = Some((meta.clone(), op.ino, op.object_id));
+        *meta.reattach_epoch.lock() = Some(rebased_epoch);
+
+        let outcome = processor.process_upload(op.clone()).await;
+
+        assert_eq!(outcome, UploadOutcome::Completed);
+        assert_eq!(
+            meta.reattached_uploads.lock().as_slice(),
+            &[(
+                op.ino,
+                op.content_epoch,
+                op.object_id,
+                op.object_file_offset,
+                op.payload_len,
+                4096
+            )],
+            "remote-visible retry must not depend on rereading an evicted local payload"
+        );
+        assert!(
+            meta.pending_deletions.lock().is_empty(),
+            "remote-visible payload with queued geometry must not be orphaned"
         );
         assert_eq!(local_payloads.uploaded.lock().as_slice(), &[op.object_id]);
         assert!(local_payloads.removed.lock().is_empty());
@@ -3669,7 +3730,9 @@ mod tests {
             ready.push_back(PendingUpload {
                 ino,
                 offset: 0,
+                object_file_offset: 0,
                 object_id,
+                payload_len: 0,
                 content_epoch: 1,
                 created_unix_ms: object_id,
                 not_before_unix_ms: 0,

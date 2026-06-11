@@ -586,7 +586,9 @@ fn startup_replay_does_not_override_current_epoch_live_extent_with_stale_pending
     let pending_uploads = vec![PendingUpload {
         ino,
         offset: 0,
+        object_file_offset: 0,
         object_id: 7001,
+        payload_len: 4096,
         content_epoch: 4,
         created_unix_ms: 100,
         not_before_unix_ms: 0,
@@ -873,7 +875,9 @@ fn startup_replay_keeps_metadata_live_extent_when_pending_upload_has_same_epoch(
     let pending_uploads = vec![PendingUpload {
         ino,
         offset: 0,
+        object_file_offset: 0,
         object_id: 7001,
+        payload_len: 4096,
         content_epoch: 5,
         created_unix_ms: 100,
         not_before_unix_ms: 0,
@@ -932,7 +936,9 @@ fn startup_replay_prefers_overlay_metadata_live_extent_over_base_for_same_epoch(
     let pending_uploads = vec![PendingUpload {
         ino,
         offset: 0,
+        object_file_offset: 0,
         object_id: 9002,
+        payload_len: 4096,
         content_epoch: 5,
         created_unix_ms: 100,
         not_before_unix_ms: 0,
@@ -4074,9 +4080,23 @@ fn explicit_flush_sparse_extend_retains_kernel_zero_filled_tail_write() {
             .expect("explicitly flush zero-filled sparse tail");
         vfs.release_fh(tail_fh).await.expect("release tail writer");
 
-        assert!(
-            !vfs.pending_uploads_for_inode(ino).is_empty(),
-            "zero-filled sparse tail write must leave upload work queued before set_len"
+        let tail_upload_before_extend = vfs
+            .pending_uploads_snapshot()
+            .into_iter()
+            .find(|op| op.ino == ino && op.payload_len == tail_offset + tail.len() as u64)
+            .expect("zero-filled sparse tail write must leave upload work queued before set_len");
+        assert_eq!(
+            tail_upload_before_extend.offset, 0,
+            "zero-filled write is queued from the start of the uploaded object"
+        );
+        assert_eq!(
+            tail_upload_before_extend.object_file_offset, 0,
+            "tail payload is embedded in a larger zero-filled object that starts at file offset 0"
+        );
+        assert_eq!(
+            tail_upload_before_extend.payload_len,
+            tail_offset + tail.len() as u64,
+            "queued upload must remember the full uploaded object length"
         );
 
         let grow_fh = vfs
@@ -4084,9 +4104,23 @@ fn explicit_flush_sparse_extend_retains_kernel_zero_filled_tail_write() {
             .expect("open grow writer");
         vfs.setattr_with_handle(Some(grow_fh), ino, SetattrArgs::size_only(logical_size))
             .expect("extend logical EOF");
-        assert!(
-            !vfs.pending_uploads_for_inode(ino).is_empty(),
-            "set_len must not drop upload work for a zero-filled sparse tail write"
+        let tail_upload_after_extend = vfs
+            .pending_uploads_snapshot()
+            .into_iter()
+            .find(|op| op.ino == ino && op.payload_len == tail_offset + tail.len() as u64)
+            .expect("set_len must not drop upload work for a zero-filled sparse tail write");
+        assert_eq!(
+            tail_upload_after_extend.offset, 0,
+            "set_len requeue must preserve the queued object extent offset"
+        );
+        assert_eq!(
+            tail_upload_after_extend.object_file_offset, 0,
+            "set_len requeue must preserve the uploaded object's file start"
+        );
+        assert_eq!(
+            tail_upload_after_extend.payload_len,
+            tail_offset + tail.len() as u64,
+            "set_len requeue must preserve the uploaded object's full length"
         );
 
         vfs.release_fh(grow_fh).await.expect("release grow writer");
@@ -5216,7 +5250,9 @@ fn zeroio_snapshot_reports_repeated_restart_replay_as_health_signal() {
     let pending_uploads = vec![PendingUpload {
         ino,
         offset: 0,
+        object_file_offset: 0,
         object_id: block.object_id,
+        payload_len: u64::from(block.length),
         content_epoch: attr.content_epoch,
         created_unix_ms: 100,
         not_before_unix_ms: 0,
