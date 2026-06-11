@@ -643,7 +643,12 @@ fn operation_from_trace(
             path: trace_path(record),
         }),
         "scheduler_selected" => {
-            let planned_kind = record.path.as_deref().unwrap_or_default();
+            let planned_kind = record.path.as_deref().ok_or_else(|| {
+                TraceOperationDecodeError::new(
+                    "missing planned operation kind",
+                    format!("collision replay scenario {scenario} step {}", record.step),
+                )
+            })?;
             PlannedCollisionOp::from_trace_kind(planned_kind).ok_or_else(|| {
                 TraceOperationDecodeError::new(
                     planned_kind,
@@ -1058,6 +1063,22 @@ mod tests {
 
         assert_eq!(error.kind(), "future_collision_operation");
         assert!(error.context().contains("sfs501-collision-decode"));
+        assert!(error.context().contains("step 1"));
+    }
+
+    #[test]
+    fn operation_log_from_trace_rejects_missing_planned_collision_operations() {
+        let error = operation_log_from_trace(
+            "sfs501-collision-missing-op",
+            &[CollisionTraceRecord {
+                path: None,
+                ..trace_record("scheduler_selected", "alpha", "ignored")
+            }],
+        )
+        .expect_err("missing planned operation returns a scenario error");
+
+        assert_eq!(error.kind(), "missing planned operation kind");
+        assert!(error.context().contains("sfs501-collision-missing-op"));
         assert!(error.context().contains("step 1"));
     }
 

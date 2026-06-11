@@ -387,11 +387,15 @@ pub fn replay_crash_replay_counterexample(
             "scheduler trace differed from artifact".to_string(),
         ));
     }
-    if artifact_operation_log != artifact.operation_log
-        || run.operation_log != artifact.operation_log
-    {
+    if artifact_operation_log != artifact.operation_log {
         return Err(CrashReplayArtifactError::ReplayMismatch(
-            "operation log differed from artifact".to_string(),
+            "artifact client trace decodes to a different operation log than stored in the artifact"
+                .to_string(),
+        ));
+    }
+    if run.operation_log != artifact.operation_log {
+        return Err(CrashReplayArtifactError::ReplayMismatch(
+            "replay run operation log differed from artifact".to_string(),
         ));
     }
     if failure.trace != expected_trace {
@@ -1010,7 +1014,12 @@ fn operation_from_trace(
             })
         }
         "scheduler_selected" => {
-            let planned_kind = record.path.as_deref().unwrap_or_default();
+            let planned_kind = record.path.as_deref().ok_or_else(|| {
+                TraceOperationDecodeError::new(
+                    "missing planned operation kind",
+                    format!("crash replay scenario {scenario} step {}", record.step),
+                )
+            })?;
             PlannedCrashOp::from_trace_kind(planned_kind).ok_or_else(|| {
                 TraceOperationDecodeError::new(
                     planned_kind,
