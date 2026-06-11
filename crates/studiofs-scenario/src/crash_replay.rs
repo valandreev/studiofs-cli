@@ -1010,8 +1010,8 @@ fn operation_from_trace(
             })
         }
         "scheduler_selected" => {
-            let planned_kind = trace_path(record);
-            PlannedCrashOp::from_trace_kind(&planned_kind).ok_or_else(|| {
+            let planned_kind = record.path.as_deref().unwrap_or_default();
+            PlannedCrashOp::from_trace_kind(planned_kind).ok_or_else(|| {
                 TraceOperationDecodeError::new(
                     planned_kind,
                     format!("crash replay scenario {scenario} step {}", record.step),
