@@ -17,6 +17,33 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// Error returned when a deterministic trace contains an unknown planned operation.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("unknown deterministic trace operation {kind} while decoding {context}")]
+pub struct TraceOperationDecodeError {
+    kind: String,
+    context: String,
+}
+
+impl TraceOperationDecodeError {
+    pub(crate) fn new(kind: impl Into<String>, context: impl Into<String>) -> Self {
+        Self {
+            kind: kind.into(),
+            context: context.into(),
+        }
+    }
+
+    /// Unknown trace operation kind.
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    /// Human-readable replay context for the malformed operation.
+    pub fn context(&self) -> &str {
+        &self.context
+    }
+}
+
 /// Constant $name.
 pub const SCENARIO_OPERATION_SCHEMA_VERSION: u32 = 1;
 

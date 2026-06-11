@@ -1,15 +1,15 @@
 //! Seeded namespace and file-version collision scenario suite.
 
-use serde::{Deserialize, Serialize};
-use thiserror::Error;
-
 use crate::client::SimulatedRuntime;
 use crate::invariant::{InvariantViolation, LogicalSnapshot, validate_logical_invariants};
 use crate::scheduler::{
     ScheduledEvent, SchedulerEventType, SchedulerTraceRecord, SimulationScheduler,
     simulation_stream_seed,
 };
-use crate::{OperationOutcome, ScenarioOperation, ScenarioOperationRecord};
+use crate::{
+    OperationOutcome, ScenarioOperation, ScenarioOperationRecord, TraceOperationDecodeError,
+};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 /// Struct $name.
@@ -137,33 +137,6 @@ pub struct CollisionTraceRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     /// Field $name.
     pub checksum_sha256: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-#[error("unknown deterministic trace operation {kind} while decoding {context}")]
-/// Error returned when a deterministic collision trace contains an unknown operation.
-pub struct TraceOperationDecodeError {
-    kind: String,
-    context: String,
-}
-
-impl TraceOperationDecodeError {
-    fn new(kind: impl Into<String>, context: impl Into<String>) -> Self {
-        Self {
-            kind: kind.into(),
-            context: context.into(),
-        }
-    }
-
-    /// Unknown trace operation kind.
-    pub fn kind(&self) -> &str {
-        &self.kind
-    }
-
-    /// Human-readable replay context for the malformed operation.
-    pub fn context(&self) -> &str {
-        &self.context
-    }
 }
 
 /// Function $name.
@@ -671,7 +644,7 @@ fn operation_from_trace(
         }),
         "scheduler_selected" => {
             let planned_kind = trace_path(record);
-            PlannedCollisionOp::from_trace_kind(&planned_kind).map_err(|_| {
+            PlannedCollisionOp::from_trace_kind(&planned_kind).ok_or_else(|| {
                 TraceOperationDecodeError::new(
                     planned_kind,
                     format!("collision replay scenario {scenario} step {}", record.step),
@@ -762,26 +735,23 @@ impl PlannedCollisionOp {
         }
     }
 
-    fn from_trace_kind(kind: &str) -> Result<Self, TraceOperationDecodeError> {
+    fn from_trace_kind(kind: &str) -> Option<Self> {
         match kind {
-            "alpha_rename_to_alpha_win" => Ok(Self::AlphaRenameToAlphaWin),
-            "beta_rename_to_beta_win" => Ok(Self::BetaRenameToBetaWin),
-            "alpha_rename_to_kept" => Ok(Self::AlphaRenameToKept),
-            "alpha_unlink" => Ok(Self::AlphaUnlink),
-            "beta_unlink" => Ok(Self::BetaUnlink),
-            "beta_append" => Ok(Self::BetaAppend),
-            "alpha_overwrite" => Ok(Self::AlphaOverwrite),
-            "beta_stale_read" => Ok(Self::BetaStaleRead),
-            "alpha_rmdir" => Ok(Self::AlphaRmdir),
-            "beta_create_inside" => Ok(Self::BetaCreateInside),
-            "alpha_publish_metadata" => Ok(Self::AlphaPublishMetadata),
-            "beta_local_rename" => Ok(Self::BetaLocalRename),
-            "alpha_publish_v2" => Ok(Self::AlphaPublishV2),
-            "beta_foreign_apply" => Ok(Self::BetaForeignApply),
-            _ => Err(TraceOperationDecodeError::new(
-                kind,
-                "collision replay planned operation",
-            )),
+            "alpha_rename_to_alpha_win" => Some(Self::AlphaRenameToAlphaWin),
+            "beta_rename_to_beta_win" => Some(Self::BetaRenameToBetaWin),
+            "alpha_rename_to_kept" => Some(Self::AlphaRenameToKept),
+            "alpha_unlink" => Some(Self::AlphaUnlink),
+            "beta_unlink" => Some(Self::BetaUnlink),
+            "beta_append" => Some(Self::BetaAppend),
+            "alpha_overwrite" => Some(Self::AlphaOverwrite),
+            "beta_stale_read" => Some(Self::BetaStaleRead),
+            "alpha_rmdir" => Some(Self::AlphaRmdir),
+            "beta_create_inside" => Some(Self::BetaCreateInside),
+            "alpha_publish_metadata" => Some(Self::AlphaPublishMetadata),
+            "beta_local_rename" => Some(Self::BetaLocalRename),
+            "alpha_publish_v2" => Some(Self::AlphaPublishV2),
+            "beta_foreign_apply" => Some(Self::BetaForeignApply),
+            _ => None,
         }
     }
 }

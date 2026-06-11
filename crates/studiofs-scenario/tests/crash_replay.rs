@@ -229,10 +229,10 @@ fn crash_replay_rejects_unknown_planned_trace_operations() {
         .expect_err("unknown planned operation returns a scenario error");
 
     match error {
-        CrashReplayArtifactError::DecodeTraceOperation { kind, context } => {
-            assert_eq!(kind, "future_crash_operation");
-            assert!(context.contains("sfs501-crash-replay-unknown-op"));
-            assert!(context.contains("step 4"));
+        CrashReplayArtifactError::DecodeTraceOperation(error) => {
+            assert_eq!(error.kind(), "future_crash_operation");
+            assert!(error.context().contains("sfs501-crash-replay-unknown-op"));
+            assert!(error.context().contains("step 4"));
         }
         other => panic!("unexpected error: {other:?}"),
     }

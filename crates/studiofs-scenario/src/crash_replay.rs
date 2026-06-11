@@ -14,7 +14,7 @@ use crate::scheduler::{
     ScheduledEvent, SchedulerEventType, SchedulerTraceRecord, SimulationScheduler,
     simulation_stream_seed,
 };
-use crate::{ScenarioOperation, ScenarioOperationRecord};
+use crate::{ScenarioOperation, ScenarioOperationRecord, TraceOperationDecodeError};
 
 /// Constant $name.
 pub const CRASH_REPLAY_COUNTEREXAMPLE_SCHEMA_VERSION: u32 = 1;
@@ -141,33 +141,6 @@ pub struct CrashReplayTraceRecord {
     pub metadata: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-#[error("unknown deterministic trace operation {kind} while decoding {context}")]
-/// Error returned when a deterministic crash replay trace contains an unknown operation.
-pub struct TraceOperationDecodeError {
-    kind: String,
-    context: String,
-}
-
-impl TraceOperationDecodeError {
-    fn new(kind: impl Into<String>, context: impl Into<String>) -> Self {
-        Self {
-            kind: kind.into(),
-            context: context.into(),
-        }
-    }
-
-    /// Unknown trace operation kind.
-    pub fn kind(&self) -> &str {
-        &self.kind
-    }
-
-    /// Human-readable replay context for the malformed operation.
-    pub fn context(&self) -> &str {
-        &self.context
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 /// Struct $name.
 pub struct CrashReplayCounterexampleArtifact {
@@ -249,23 +222,9 @@ pub enum CrashReplayArtifactError {
     #[error("counterexample replay did not reproduce: {0}")]
     /// Variant $name.
     ReplayMismatch(String),
-    #[error("unknown deterministic trace operation {kind} while decoding {context}")]
+    #[error(transparent)]
     /// Variant $name.
-    DecodeTraceOperation {
-        /// Unknown trace operation kind.
-        kind: String,
-        /// Human-readable replay context for the malformed operation.
-        context: String,
-    },
-}
-
-impl From<TraceOperationDecodeError> for CrashReplayArtifactError {
-    fn from(error: TraceOperationDecodeError) -> Self {
-        Self::DecodeTraceOperation {
-            kind: error.kind,
-            context: error.context,
-        }
-    }
+    DecodeTraceOperation(#[from] TraceOperationDecodeError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -789,16 +748,13 @@ impl PlannedCrashOp {
         }
     }
 
-    fn from_trace_kind(kind: &str) -> Result<Self, TraceOperationDecodeError> {
+    fn from_trace_kind(kind: &str) -> Option<Self> {
         match kind {
-            "restart_writer" => Ok(Self::RestartWriter),
-            "publish" => Ok(Self::Publish),
-            "restart_reader" => Ok(Self::RestartReader),
-            "foreign_apply" => Ok(Self::ForeignApply),
-            _ => Err(TraceOperationDecodeError::new(
-                kind,
-                "crash replay planned operation",
-            )),
+            "restart_writer" => Some(Self::RestartWriter),
+            "publish" => Some(Self::Publish),
+            "restart_reader" => Some(Self::RestartReader),
+            "foreign_apply" => Some(Self::ForeignApply),
+            _ => None,
         }
     }
 }
@@ -1055,7 +1011,7 @@ fn operation_from_trace(
         }
         "scheduler_selected" => {
             let planned_kind = trace_path(record);
-            PlannedCrashOp::from_trace_kind(&planned_kind).map_err(|_| {
+            PlannedCrashOp::from_trace_kind(&planned_kind).ok_or_else(|| {
                 TraceOperationDecodeError::new(
                     planned_kind,
                     format!("crash replay scenario {scenario} step {}", record.step),
