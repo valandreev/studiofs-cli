@@ -751,7 +751,8 @@ impl SessionInvalidationState {
 
     fn wait_for_idle(&self, timeout: Duration) -> bool {
         let mut status = self.status.lock();
-        let deadline = Instant::now() + timeout;
+        let now = Instant::now();
+        let deadline = now.checked_add(timeout).unwrap_or(now);
         while status.active > 0 {
             if self.idle.wait_until(&mut status, deadline).timed_out() {
                 return status.active == 0;
@@ -766,7 +767,7 @@ impl Drop for SessionInvalidationGuard<'_> {
         let mut status = self.state.status.lock();
         status.active -= 1;
         if status.active == 0 {
-            self.state.idle.notify_one();
+            self.state.idle.notify_all();
         }
     }
 }
@@ -1363,7 +1364,7 @@ mod tests {
         });
 
         let elapsed = closed_rx
-            .recv_timeout(Duration::from_millis(50))
+            .recv_timeout(Duration::from_secs(1))
             .expect("shutdown should close without waiting for active invalidation guards");
         assert!(
             elapsed < Duration::from_millis(50),
@@ -1386,21 +1387,26 @@ mod tests {
             .begin_invalidation()
             .expect("invalidation should start while session is active");
         let waiter_state = Arc::clone(&state);
-        let (waiting_tx, waiting_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
 
         let waiter = std::thread::spawn(move || {
-            waiting_tx.send(()).expect("signal waiter start");
-            waiter_state.wait_for_idle(Duration::from_secs(1))
+            let waited = waiter_state.wait_for_idle(Duration::from_secs(1));
+            result_tx.send(waited).expect("signal waiter result");
         });
 
-        waiting_rx.recv().expect("waiter should start");
-        std::thread::sleep(Duration::from_millis(10));
+        assert!(
+            result_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "wait_for_idle should remain blocked while an invalidation guard is active"
+        );
         drop(active);
 
         assert!(
-            waiter.join().expect("waiter thread should exit"),
+            result_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("wait_for_idle should finish after active guard drops"),
             "wait_for_idle should succeed once active invalidation guards drop"
         );
+        waiter.join().expect("waiter thread should exit");
     }
 
     #[test]
