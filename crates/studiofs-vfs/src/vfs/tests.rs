@@ -4376,6 +4376,80 @@ fn chunk_boundary_sparse_extend_requeues_retained_overlay_when_runtime_queue_is_
 }
 
 #[test]
+fn zero_filled_sparse_extend_requeues_retained_overlay_when_runtime_queue_is_empty() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) =
+        make_unstarted_test_vfs(&tmp, "zero-filled-sparse-extend-retains-overlay");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(
+                1,
+                b"zero-filled-sparse-extend-retains-overlay.bin",
+                0,
+                0,
+                0o644,
+            )
+            .expect("create sparse file");
+        let ino = attr.ino;
+        let head = vec![0xA1; 233];
+        let tail = vec![0xB2; 262];
+        let tail_offset = DEFAULT_CHUNK_SIZE as u64 - 7;
+        let logical_size = DEFAULT_CHUNK_SIZE as u64 * 2 + 123;
+
+        vfs.write(ino, 0, &head).await.expect("write sparse head");
+        vfs.flush(ino).await.expect("flush sparse head");
+        let (head_epoch, head_blocks) = mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+        publish_current_file_graph(&meta, ino, head_epoch, &head_blocks);
+
+        let mut zero_filled_tail = vec![0; tail_offset as usize];
+        zero_filled_tail.extend_from_slice(&tail);
+        vfs.write(ino, 0, &zero_filled_tail)
+            .await
+            .expect("write zero-filled sparse tail");
+        vfs.flush(ino).await.expect("flush zero-filled sparse tail");
+
+        let retained_objects = meta
+            .lookup_regular_file_slices(ino, 0, tail_offset + tail.len() as u64)
+            .expect("lookup retained overlay")
+            .into_iter()
+            .filter(|span| span.source == ResolvedSliceSource::Overlay)
+            .filter_map(|span| span.payload.map(|payload| payload.object_id))
+            .collect::<BTreeSet<_>>();
+        assert!(
+            retained_objects.len() > 1,
+            "setup should retain the fragmented zero-filled tail overlay objects"
+        );
+        let payload_epoch = meta.get_attr(ino).expect("load payload attr").content_epoch;
+
+        vfs.cancel_pending_uploads_for_inode(ino);
+        assert!(
+            vfs.pending_uploads_for_inode(ino).is_empty(),
+            "setup models the post-PUT window where the runtime queue is empty"
+        );
+
+        vfs.setattr(ino, SetattrArgs::size_only(logical_size))
+            .expect("extend logical EOF");
+
+        let extended_attr = meta.get_attr(ino).expect("load extended attr");
+        assert!(
+            extended_attr.content_epoch > payload_epoch,
+            "size growth over the zero-filled overlay must advance to a fresh content epoch"
+        );
+        let pending_object_ids = vfs
+            .pending_uploads_for_inode(ino)
+            .iter()
+            .map(|(_, object_id, _)| *object_id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            pending_object_ids, retained_objects,
+            "set_len must requeue retained zero-filled overlay objects"
+        );
+    });
+}
+
+#[test]
 fn nonzero_truncate_requeues_retained_overlay_uploads_with_new_epoch() {
     let tmp = TempDir::new().expect("tempdir");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "truncate-requeues-retained");
