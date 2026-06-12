@@ -13,7 +13,7 @@ use std::time::Instant;
 use buffers::{SendConstBuffer, SendMutBuffer};
 use futures::FutureExt;
 use handle_drain::{CallbackBarrierState, WinfspHandleDrainFacade};
-pub(crate) use invalidation::PreparedWinfspNotifications;
+pub(crate) use invalidation::PendingWinfspInvalidations;
 pub use invalidation::WinfspKernelInvalidator;
 #[cfg(test)]
 use invalidation::{
@@ -242,7 +242,7 @@ fn write_local_sync_policy_from_create_options(create_options: u32) -> LocalSync
 }
 
 fn should_disable_winfsp_file_cache(is_dir: bool, open_flags: OpenFlags) -> bool {
-    !is_dir && (open_flags == OpenFlags::RDONLY || open_flags_allow_write(open_flags))
+    !is_dir && open_flags_allow_write(open_flags)
 }
 
 fn should_disable_winfsp_file_cache_for_handle(handle: &StudioFileHandle) -> bool {
@@ -1816,7 +1816,7 @@ mod tests {
         FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
         FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE, FILE_READ_ATTRIBUTES_ACCESS,
         FILE_READ_DATA_ACCESS, FILE_WRITE_ATTRIBUTES_ACCESS, FILE_WRITE_DATA_ACCESS,
-        FileSizeCallbackAction, PreparedWinfspNotifications, READ_CONTROL_ACCESS,
+        FileSizeCallbackAction, PendingWinfspInvalidations, READ_CONTROL_ACCESS,
         STATUS_ACCESS_DENIED, STATUS_DATA_ERROR, STATUS_EA_TOO_LARGE, STATUS_INVALID_PARAMETER,
         STATUS_IO_TIMEOUT, STATUS_OBJECT_NAME_NOT_FOUND, SYNCHRONIZE_ACCESS, StudioFileHandle,
         StudioFsContext, WinfspKernelInvalidator, attr_to_file_info, build_basic_info_setattr_args,
@@ -2006,7 +2006,7 @@ mod tests {
     }
 
     #[test]
-    fn regular_file_read_handles_disable_winfsp_file_cache() {
+    fn read_handles_with_metadata_access_keep_winfsp_file_cache() {
         let read_metadata_access = FILE_READ_DATA_ACCESS
             | FILE_READ_ATTRIBUTES_ACCESS
             | FILE_WRITE_ATTRIBUTES_ACCESS
@@ -2016,16 +2016,12 @@ mod tests {
         let flags = open_flags_from_access(read_metadata_access, 0);
 
         assert_eq!(flags.bits(), OpenFlags::RDONLY.bits());
-        assert!(should_disable_winfsp_file_cache(false, flags));
-        assert!(
-            !should_disable_winfsp_file_cache(true, flags),
-            "directory handles should keep WinFSP metadata/cache behavior"
-        );
+        assert!(!should_disable_winfsp_file_cache(false, flags));
     }
 
     #[test]
     fn write_capable_file_handles_disable_winfsp_file_cache() {
-        assert!(should_disable_winfsp_file_cache(false, OpenFlags::RDONLY));
+        assert!(!should_disable_winfsp_file_cache(false, OpenFlags::RDONLY));
         assert!(should_disable_winfsp_file_cache(false, OpenFlags::WRONLY));
         assert!(should_disable_winfsp_file_cache(false, OpenFlags::RDWR));
         assert!(!should_disable_winfsp_file_cache(true, OpenFlags::WRONLY));
@@ -3695,23 +3691,17 @@ mod tests {
             .extend([beta.ino, alpha.ino, beta.ino, alpha.ino]);
 
         let first = <StudioFsContext as winfsp::notify::NotifyingFileSystemContext<
-            PreparedWinfspNotifications,
+            PendingWinfspInvalidations,
         >>::should_notify(&ctx)
-        .expect("prepared notifications");
-        assert_eq!(
-            first
-                .iter()
-                .map(|notification| notification.ino)
-                .collect::<Vec<_>>(),
-            vec![alpha.ino, beta.ino]
-        );
+        .expect("pending invalidations");
+        assert_eq!(first, vec![alpha.ino, beta.ino]);
         assert!(
             queue.lock().is_empty(),
             "queue should be drained after should_notify"
         );
 
         let second = <StudioFsContext as winfsp::notify::NotifyingFileSystemContext<
-            PreparedWinfspNotifications,
+            PendingWinfspInvalidations,
         >>::should_notify(&ctx);
         assert!(second.is_none());
     }
@@ -3730,17 +3720,11 @@ mod tests {
         let capacity_before = queue.lock().capacity();
 
         let drained = <StudioFsContext as winfsp::notify::NotifyingFileSystemContext<
-            PreparedWinfspNotifications,
+            PendingWinfspInvalidations,
         >>::should_notify(&ctx)
-        .expect("prepared notifications");
+        .expect("pending invalidations");
 
-        assert_eq!(
-            drained
-                .iter()
-                .map(|notification| notification.ino)
-                .collect::<Vec<_>>(),
-            vec![file.ino]
-        );
+        assert_eq!(drained, vec![file.ino]);
         assert!(
             queue.lock().capacity() >= capacity_before,
             "draining should preserve the queue allocation for future invalidations"

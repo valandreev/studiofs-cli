@@ -444,10 +444,10 @@ fn apply_volume_params(
     volume_params.file_info_timeout(options.file_info_timeout_ms);
     volume_params.dir_info_timeout(options.dir_info_timeout_ms);
     volume_params.volume_info_timeout(options.volume_info_timeout_ms);
-    // Keep WinFSP metadata timeouts configurable while regular file data handles
-    // opt out of the OS file cache at Create/Open time. The VFS owns payload
-    // caching and cross-client metadata invalidation; WinFSP file data caching
-    // can otherwise retain same-size remote overwrites after notifications.
+    // Keep WinFSP's cache-manager / fast-I/O path enabled by default. Tests or
+    // targeted multi-client invalidation runs can bound this with
+    // STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS.
+    // Write-capable handles still opt out of the OS file cache at Create/Open time.
     volume_params.flush_and_purge_on_cleanup(options.flush_and_purge_on_cleanup);
     Ok(())
 }
@@ -699,7 +699,7 @@ pub fn mount_and_serve(request: WinfspMountRequest) -> std::io::Result<()> {
     use studiofs_meta::Ino;
     use winfsp::host::{FileSystemHost, FileSystemParams, VolumeParams};
 
-    use crate::context::PreparedWinfspNotifications;
+    use crate::context::PendingWinfspInvalidations;
 
     ensure_winfsp_runtime_loaded()?;
 
@@ -750,7 +750,7 @@ pub fn mount_and_serve(request: WinfspMountRequest) -> std::io::Result<()> {
     // for metadata-driven invalidations. The const generic (250) is the
     // timer interval in milliseconds — short enough for snappy Explorer
     // refreshes, long enough to batch rapid sequences.
-    let mut host = FileSystemHost::new_with_timer_async::<PreparedWinfspNotifications, 250>(
+    let mut host = FileSystemHost::new_with_timer_async::<PendingWinfspInvalidations, 250>(
         FileSystemParams::default_params(volume_params),
         context,
     )
