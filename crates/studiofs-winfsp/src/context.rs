@@ -13,7 +13,7 @@ use std::time::Instant;
 use buffers::{SendConstBuffer, SendMutBuffer};
 use futures::FutureExt;
 use handle_drain::{CallbackBarrierState, WinfspHandleDrainFacade};
-pub(crate) use invalidation::PendingWinfspInvalidations;
+pub(crate) use invalidation::PreparedWinfspNotifications;
 pub use invalidation::WinfspKernelInvalidator;
 #[cfg(test)]
 use invalidation::{
@@ -1816,7 +1816,7 @@ mod tests {
         FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
         FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE, FILE_READ_ATTRIBUTES_ACCESS,
         FILE_READ_DATA_ACCESS, FILE_WRITE_ATTRIBUTES_ACCESS, FILE_WRITE_DATA_ACCESS,
-        FileSizeCallbackAction, PendingWinfspInvalidations, READ_CONTROL_ACCESS,
+        FileSizeCallbackAction, PreparedWinfspNotifications, READ_CONTROL_ACCESS,
         STATUS_ACCESS_DENIED, STATUS_DATA_ERROR, STATUS_EA_TOO_LARGE, STATUS_INVALID_PARAMETER,
         STATUS_IO_TIMEOUT, STATUS_OBJECT_NAME_NOT_FOUND, SYNCHRONIZE_ACCESS, StudioFileHandle,
         StudioFsContext, WinfspKernelInvalidator, attr_to_file_info, build_basic_info_setattr_args,
@@ -3691,17 +3691,23 @@ mod tests {
             .extend([beta.ino, alpha.ino, beta.ino, alpha.ino]);
 
         let first = <StudioFsContext as winfsp::notify::NotifyingFileSystemContext<
-            PendingWinfspInvalidations,
+            PreparedWinfspNotifications,
         >>::should_notify(&ctx)
-        .expect("pending invalidations");
-        assert_eq!(first, vec![alpha.ino, beta.ino]);
+        .expect("prepared notifications");
+        assert_eq!(
+            first
+                .iter()
+                .map(|notification| notification.ino)
+                .collect::<Vec<_>>(),
+            vec![alpha.ino, beta.ino]
+        );
         assert!(
             queue.lock().is_empty(),
             "queue should be drained after should_notify"
         );
 
         let second = <StudioFsContext as winfsp::notify::NotifyingFileSystemContext<
-            PendingWinfspInvalidations,
+            PreparedWinfspNotifications,
         >>::should_notify(&ctx);
         assert!(second.is_none());
     }
@@ -3720,11 +3726,17 @@ mod tests {
         let capacity_before = queue.lock().capacity();
 
         let drained = <StudioFsContext as winfsp::notify::NotifyingFileSystemContext<
-            PendingWinfspInvalidations,
+            PreparedWinfspNotifications,
         >>::should_notify(&ctx)
-        .expect("pending invalidations");
+        .expect("prepared notifications");
 
-        assert_eq!(drained, vec![file.ino]);
+        assert_eq!(
+            drained
+                .iter()
+                .map(|notification| notification.ino)
+                .collect::<Vec<_>>(),
+            vec![file.ino]
+        );
         assert!(
             queue.lock().capacity() >= capacity_before,
             "draining should preserve the queue allocation for future invalidations"

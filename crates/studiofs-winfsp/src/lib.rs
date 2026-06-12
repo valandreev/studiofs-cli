@@ -699,7 +699,7 @@ pub fn mount_and_serve(request: WinfspMountRequest) -> std::io::Result<()> {
     use studiofs_meta::Ino;
     use winfsp::host::{FileSystemHost, FileSystemParams, VolumeParams};
 
-    use crate::context::PendingWinfspInvalidations;
+    use crate::context::PreparedWinfspNotifications;
 
     ensure_winfsp_runtime_loaded()?;
 
@@ -750,7 +750,7 @@ pub fn mount_and_serve(request: WinfspMountRequest) -> std::io::Result<()> {
     // for metadata-driven invalidations. The const generic (250) is the
     // timer interval in milliseconds — short enough for snappy Explorer
     // refreshes, long enough to batch rapid sequences.
-    let mut host = FileSystemHost::new_with_timer_async::<PendingWinfspInvalidations, 250>(
+    let mut host = FileSystemHost::new_with_timer_async::<PreparedWinfspNotifications, 250>(
         FileSystemParams::default_params(volume_params),
         context,
     )
