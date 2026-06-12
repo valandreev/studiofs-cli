@@ -4032,6 +4032,109 @@ fn pending_sparse_slice_commit_rebases_when_size_growth_overtakes_flush() {
 }
 
 #[test]
+fn deferred_sparse_tail_rebases_when_size_growth_overtakes_materialization() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) =
+        make_unstarted_test_vfs(&tmp, "deferred-sparse-tail-rebases-after-size-growth");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(
+                1,
+                b"deferred-sparse-tail-rebases-after-size-growth.bin",
+                0,
+                0,
+                0o644,
+            )
+            .expect("create sparse file");
+        let ino = attr.ino;
+        let head = b"sparse-head";
+        let tail = vec![b't'; 258];
+        let tail_offset = 1_048_569u64;
+        let logical_size = 2_097_275u64;
+
+        let (entry, guard) = vfs
+            .state
+            .deferred_materialize_inflight
+            .try_register(ino)
+            .expect("test should hold deferred materialization before sparse writes");
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open sparse writer");
+        vfs.write_fh_with_deferred_materialize(fh, ino, 0, head, LocalSyncPolicy::Opportunistic)
+            .await
+            .expect("write sparse head");
+        vfs.write_fh_with_deferred_materialize(
+            fh,
+            ino,
+            tail_offset,
+            &tail,
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .expect("write sparse tail");
+        assert!(
+            vfs.pending_uploads_for_inode(ino).is_empty(),
+            "held deferred gate should keep sparse writes in the writer stack"
+        );
+
+        vfs.setattr_with_handle(Some(fh), ino, SetattrArgs::size_only(logical_size))
+            .expect("extend logical EOF before deferred sparse tail materializes");
+        let grown_attr = meta.get_attr(ino).expect("load grown attr");
+        assert_eq!(grown_attr.size, logical_size);
+
+        drop(guard);
+        vfs.finish_deferred_materialization_task(entry, true);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let pending_offsets = vfs
+                    .pending_uploads_for_inode(ino)
+                    .into_iter()
+                    .map(|(offset, _, content_epoch)| (offset, content_epoch))
+                    .collect::<BTreeSet<_>>();
+                if pending_offsets
+                    == BTreeSet::from([
+                        (0, grown_attr.content_epoch),
+                        (tail_offset, grown_attr.content_epoch),
+                    ])
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("deferred sparse payloads should rebase to the size-growth epoch");
+
+        let (content_epoch, blocks) = mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+        assert_eq!(content_epoch, grown_attr.content_epoch);
+        publish_current_file_graph(&meta, ino, content_epoch, &blocks);
+
+        let published_attr = meta.get_attr(ino).expect("load published attr");
+        assert_eq!(published_attr.committed_size, logical_size);
+        let published_offsets = meta
+            .lookup_regular_file_slices(ino, 0, logical_size)
+            .expect("lookup published sparse graph")
+            .into_iter()
+            .filter_map(|span| {
+                span.payload.map(|_| {
+                    chunk_start_offset(span.chunk_id, DEFAULT_CHUNK_SIZE)
+                        .saturating_add(span.range.start as u64)
+                })
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            published_offsets,
+            BTreeSet::from([0, tail_offset]),
+            "published sparse graph must retain payloads materialized after size growth"
+        );
+
+        vfs.release_fh(fh).await.expect("release sparse writer");
+    });
+}
+
+#[test]
 fn explicit_flush_sparse_extend_retains_kernel_zero_filled_tail_write() {
     let tmp = TempDir::new().expect("tempdir");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "explicit-flush-sparse-zero-filled-tail");
@@ -8610,6 +8713,28 @@ fn metadata_payload_diff_detects_removed_objects_for_retained_inode() {
             .get(&42)
             .is_some_and(|object_ids| object_ids.contains(&1002)),
         "payload diff must retain objects still referenced by the current snapshot"
+    );
+}
+
+#[test]
+fn metadata_payload_diff_marks_inodes_when_graph_object_set_changes() {
+    let previous = std::collections::HashMap::from([
+        (42, vec![1001, 1002]),
+        (77, vec![2001]),
+        (88, vec![3001]),
+    ]);
+    let current = std::collections::HashMap::from([
+        (42, vec![1001, 1002, 1003]),
+        (77, vec![2001]),
+        (99, vec![4001]),
+    ]);
+
+    let changed = StudioVfs::changed_metadata_payload_inodes(&previous, &current);
+
+    assert_eq!(
+        changed,
+        std::collections::HashSet::from([42, 88, 99]),
+        "metadata invalidation must drop kernel data for added, removed, or replaced payload graphs"
     );
 }
 

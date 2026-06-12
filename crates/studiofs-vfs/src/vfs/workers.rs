@@ -502,6 +502,24 @@ impl StudioVfs {
             .collect()
     }
 
+    pub(super) fn changed_metadata_payload_inodes(
+        previous: &HashMap<Ino, Vec<u64>>,
+        current: &HashMap<Ino, Vec<u64>>,
+    ) -> HashSet<Ino> {
+        let mut changed = HashSet::new();
+        for (ino, previous_object_ids) in previous {
+            if current.get(ino) != Some(previous_object_ids) {
+                changed.insert(*ino);
+            }
+        }
+        for ino in current.keys() {
+            if !previous.contains_key(ino) {
+                changed.insert(*ino);
+            }
+        }
+        changed
+    }
+
     pub(super) fn invalidate_kernel_inodes(&self, inodes: impl IntoIterator<Item = Ino>) {
         let Some(invalidator) = self.kernel_invalidator() else {
             return;
@@ -666,6 +684,10 @@ impl StudioVfs {
                 continue;
             };
 
+            let changed_payload_inodes = Self::changed_metadata_payload_inodes(
+                &last_payload_snapshot,
+                &current_snapshot.payloads,
+            );
             let removed_payloads =
                 Self::removed_metadata_payloads(&last_payload_snapshot, &current_snapshot.payloads);
             self.lazy_evict_removed_metadata_payloads(removed_payloads, &current_snapshot.inodes)
@@ -683,7 +705,12 @@ impl StudioVfs {
                 runtime_inodes,
             );
             self.invalidate_attr_read_cache(attr_cache_inodes.iter().copied());
-            self.invalidate_kernel_inodes(attr_cache_inodes.iter().copied());
+            self.invalidate_kernel_inodes(
+                attr_cache_inodes
+                    .iter()
+                    .copied()
+                    .chain(changed_payload_inodes.iter().copied()),
+            );
             if namespace_changed {
                 self.bump_namespace_epoch();
             }
