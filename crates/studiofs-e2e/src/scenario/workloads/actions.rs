@@ -1090,7 +1090,15 @@ pub fn run_sparse_op_helper(
                 None,
                 Some(expected.len()),
             )?;
-            let actual = read_sparse_file_with_progress(&path, progress, operation)?;
+            record_hotspot_helper_progress(
+                progress,
+                "before_read_all",
+                operation,
+                &path,
+                None,
+                None,
+            )?;
+            let actual = fs::read(&path)?;
             record_hotspot_helper_progress(
                 progress,
                 "after_read_all",
@@ -1660,7 +1668,7 @@ pub(in crate::scenario) fn read_sparse_range_with_progress(
         None,
         Some(len),
     )?;
-    let mut file = open_sparse_probe_file(path)?;
+    let mut file = fs::File::open(path)?;
     record_hotspot_helper_progress(
         progress,
         "after_open_sparse_read",
@@ -1691,42 +1699,6 @@ pub(in crate::scenario) fn read_sparse_range_with_progress(
         Some(len),
     )?;
     Ok(buffer)
-}
-
-pub(in crate::scenario) fn read_sparse_file_with_progress(
-    path: &Path,
-    progress: Option<&Path>,
-    operation: &str,
-) -> io::Result<Vec<u8>> {
-    record_hotspot_helper_progress(
-        progress,
-        "before_open_sparse_read_all",
-        operation,
-        path,
-        None,
-        None,
-    )?;
-    let mut file = open_sparse_probe_file(path)?;
-    record_hotspot_helper_progress(
-        progress,
-        "after_open_sparse_read_all",
-        operation,
-        path,
-        None,
-        None,
-    )?;
-    record_hotspot_helper_progress(progress, "before_read_all", operation, path, None, None)?;
-    let mut buffer = Vec::new();
-    file.read_to_end(&mut buffer)?;
-    Ok(buffer)
-}
-
-fn open_sparse_probe_file(path: &Path) -> io::Result<fs::File> {
-    // Sparse convergence probes must observe the current logical EOF after
-    // truncate/extend operations. On WinFSP, read-only opens can legitimately
-    // use the OS cache-manager path, so probe through a write-capable handle;
-    // the production WinFSP policy already marks those handles DisableCache.
-    OpenOptions::new().read(true).write(true).open(path)
 }
 
 pub(in crate::scenario) fn record_hotspot_helper_progress(

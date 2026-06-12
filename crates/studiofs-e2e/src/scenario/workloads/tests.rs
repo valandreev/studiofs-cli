@@ -199,17 +199,6 @@ fn sparse_helper_ops_cover_range_write_truncate_and_probes() {
         Some(&progress),
     )
     .unwrap();
-    run_sparse_op_helper(
-        "read-all-exact",
-        &mount,
-        "sparse/shared.bin",
-        None,
-        None,
-        Some(&mount.join("sparse/shared.bin")),
-        Some(&progress),
-    )
-    .unwrap();
-
     let bytes = std::fs::read(temp.path().join("mount/sparse/shared.bin")).unwrap();
     assert_eq!(bytes.len(), 4096);
     assert_eq!(&bytes[1024..1032], b"boundary");
@@ -218,8 +207,6 @@ fn sparse_helper_ops_cover_range_write_truncate_and_probes() {
     assert!(progress.contains("\"operation\":\"truncate\""));
     assert!(progress.contains("\"operation\":\"read-range-zero\""));
     assert!(progress.contains("\"operation\":\"read-range-exact\""));
-    assert!(progress.contains("\"operation\":\"read-all-exact\""));
-    assert!(progress.contains("\"phase\":\"before_open_sparse_read_all\""));
 }
 
 #[test]

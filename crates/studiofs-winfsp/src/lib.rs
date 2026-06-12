@@ -22,7 +22,7 @@ const DEFAULT_SECTOR_SIZE: u16 = 4096;
 const DEFAULT_ALLOCATION_UNIT_SIZE: u32 = 1024 * 1024;
 const DEFAULT_MAX_DISPATCHER_THREADS: u32 = 16;
 const DEFAULT_ALLOW_OPEN_IN_KERNEL_MODE: bool = true;
-const DEFAULT_FLUSH_AND_PURGE_ON_CLEANUP: bool = false;
+const DEFAULT_FLUSH_AND_PURGE_ON_CLEANUP: bool = true;
 const DEFAULT_PERSISTENT_ACLS: bool = false;
 const WIN32_FALSE: i32 = 0;
 const WIN32_TRUE: i32 = 1;
@@ -444,9 +444,9 @@ fn apply_volume_params(
     volume_params.file_info_timeout(options.file_info_timeout_ms);
     volume_params.dir_info_timeout(options.dir_info_timeout_ms);
     volume_params.volume_info_timeout(options.volume_info_timeout_ms);
-    // Keep WinFSP's cache-manager / fast-I/O path enabled by default. Tests or
-    // targeted multi-client invalidation runs can bound this with
-    // STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS.
+    // Keep WinFSP's cache-manager / fast-I/O path enabled for read-only opens,
+    // but purge cached file state when a modified handle is cleaned up so EOF
+    // transitions from truncate/set_len do not leak stale cached lengths.
     // Write-capable handles still opt out of the OS file cache at Create/Open time.
     volume_params.flush_and_purge_on_cleanup(options.flush_and_purge_on_cleanup);
     Ok(())
@@ -1119,11 +1119,11 @@ mod tests {
 
     #[test]
     fn parse_mount_options_allows_flush_and_purge_on_cleanup_override() {
-        set_test_mount_option_env("STUDIOFS_WINFSP_FLUSH_AND_PURGE_ON_CLEANUP", "1");
+        set_test_mount_option_env("STUDIOFS_WINFSP_FLUSH_AND_PURGE_ON_CLEANUP", "0");
 
         let opts = parse_mount_options("StudioFS").expect("options");
         assert!(
-            opts.flush_and_purge_on_cleanup,
+            !opts.flush_and_purge_on_cleanup,
             "WinFSP cleanup flush/purge override should be honored"
         );
 

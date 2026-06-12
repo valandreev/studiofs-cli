@@ -46,7 +46,7 @@ Path walks are centralized in VFS `NamespaceResolver`:
 | Dir info timeout | `1000 ms` by default. Override: `STUDIOFS_WINFSP_DIR_INFO_TIMEOUT_MS` (`-1`/`max` supported) |
 | Volume info timeout | `1000 ms` by default. Override: `STUDIOFS_WINFSP_VOLUME_INFO_TIMEOUT_MS` (`-1`/`max` supported) |
 | Allow open in kernel mode | Enabled by default. Override: `STUDIOFS_WINFSP_ALLOW_OPEN_IN_KERNEL_MODE` |
-| Flush/purge on cleanup | Disabled by default. Override: `STUDIOFS_WINFSP_FLUSH_AND_PURGE_ON_CLEANUP=1` |
+| Flush/purge on cleanup | Enabled by default to purge stale cached file state after modified handle cleanup. Override: `STUDIOFS_WINFSP_FLUSH_AND_PURGE_ON_CLEANUP=0` |
 | Case sensitive | Yes |
 | Unicode on disk | Yes |
 | Persistent ACLs | Yes |
@@ -55,12 +55,12 @@ Path walks are centralized in VFS `NamespaceResolver`:
 | Filesystem name | "StudioFS" |
 
 `STUDIOFS_WINFSP_SECTOR_SIZE` and `STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE` are the primary WinFSP bridge throughput geometry controls for local payload I/O.
-StudioFS disables WinFSP `FlushAndPurgeOnCleanup` by default to preserve the
-read cache between close callbacks. Write-capable file handles opt out of the
-WinFSP/Windows file cache at `Create`/`Open` time, while read-only handles keep
-the WinFSP cache-manager / fast-I/O path by default. Use a bounded
-`STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS` value only for targeted multi-client
-invalidation experiments.
+StudioFS enables WinFSP `FlushAndPurgeOnCleanup` by default so modified handle
+cleanup purges stale cached file state after EOF-changing operations.
+Write-capable file handles also opt out of the WinFSP/Windows file cache at
+`Create`/`Open` time, while read-only handles keep the WinFSP cache-manager /
+fast-I/O path by default. Use a bounded `STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS`
+value only for targeted multi-client invalidation experiments.
 
 Windows mount-point handling:
 - StudioFS requests Mount Manager drive syntax (`\\.\X:`) internally for drive-letter mounts.
@@ -114,11 +114,12 @@ WinFSP callback barrier semantics:
 - Explicit `flush(context=Some(..))` freezes/finishes dirty writer slices for
   the handle or inode through the cached-store pipeline.
 - `cleanup` with delete finalizes `unlink()` / `rmdir()` in the cleanup callback itself.
-- WinFSP `FlushAndPurgeOnCleanup` is disabled at the driver layer by default,
-  while write-capable handles set `Create.Opened.DisableCache` so writes bypass
-  the OS file cache. Read-only file caching keeps WinFSP cache-manager behavior
-  unless `STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS` is explicitly bounded for an
-  invalidation-focused run.
+- WinFSP `FlushAndPurgeOnCleanup` is enabled at the driver layer by default, so
+  modified handle cleanup can purge stale cached file state after truncate or
+  `set_len` updates. Write-capable handles set `Create.Opened.DisableCache` so
+  writes bypass the OS file cache. Read-only file caching keeps WinFSP
+  cache-manager behavior unless `STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS` is
+  explicitly bounded for an invalidation-focused run.
 - Non-delete `cleanup` callback handling in StudioFS is observational only; for real file handles it records that the callback happened, but any remaining writer state is deferred to a later explicit `flush` or the last-handle `close` / `release_fh()` path.
 - `fh == 0` contexts, such as directories, do not have a `release_fh()` fallback; they stay observational unless an explicit `flush` callback makes local state visible.
 - `close` is the release-path hook for WinFSP. It drains remaining local writer
